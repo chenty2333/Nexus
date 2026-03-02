@@ -26,4 +26,5 @@ result
 result-*
 
 # Documentation (local only)
-NexusOS.md
+docs/
+AGENTS.md

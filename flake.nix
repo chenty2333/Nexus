@@ -41,6 +41,12 @@
             cargo-llvm-cov
             cargo-watch
 
+            # Fuzz dependencies (libFuzzer toolchain)
+            llvmPackages.clang
+            llvmPackages.llvm
+            llvmPackages.lld
+            binutils
+
             # Build
             mold
 
