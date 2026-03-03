@@ -1,0 +1,22 @@
+[package]
+name = "axle-sync"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+
+[features]
+default = ["std"]
+std = []
+
+# Enable Loom model checking (host only).
+loom = ["std", "dep:loom"]
+
+[dependencies]
+# no deps by default
+
+[dependencies.loom]
+version = "0.7"
+optional = true
+
+[dev-dependencies]
+proptest = "1.4"

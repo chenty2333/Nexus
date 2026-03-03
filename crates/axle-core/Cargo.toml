@@ -1,0 +1,16 @@
+[package]
+name = "axle-core"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+
+[features]
+# Host tests use std by default; the kernel can depend on axle-core with `default-features = false`.
+default = ["std"]
+std = []
+
+[dependencies]
+# no external deps in the core contracts layer (keep it auditable)
+
+[dev-dependencies]
+proptest = "1.4"

@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/axle-core",
+  "crates/axle-sync",
+  "crates/axle-types",
+
+  # Tools (host binaries)
+  "tools/syscalls-gen",
+
+  # These crates are `no_std` and not built by the default host-only CI gates yet,
+  # but we keep them in the workspace so formatting and metadata stay coherent.
+  "kernel/axle-kernel",
+  "user/test-runner",
+]
+
+# CI currently lints/tests only the host-side contract crates (axle-core/axle-sync).
+# See `just xlint` and `just xtest`.

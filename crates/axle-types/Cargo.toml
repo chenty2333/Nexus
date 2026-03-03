@@ -1,0 +1,12 @@
+[package]
+name = "axle-types"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+description = "Zircon-compatible public types/constants for Axle/Nexus (no_std)."
+
+[features]
+default = []
+std = []
+
+[dependencies]
