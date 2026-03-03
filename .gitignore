@@ -26,5 +26,6 @@ result
 result-*
 
 # Documentation (local only)
-docs/
+references/
 AGENTS.md
+Cargo.lock

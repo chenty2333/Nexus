@@ -14,6 +14,7 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
 
+        # Single source of truth for the Rust toolchain in this repo.
         rustToolchain = pkgs.rust-bin.nightly.latest.default.override {
           extensions = [
             "rust-src"
