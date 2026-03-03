@@ -1,0 +1,12 @@
+[package]
+name = "syscalls-gen"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+description = "Generate Axle syscall bindings/dispatch from a TOML spec."
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
