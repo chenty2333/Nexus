@@ -68,11 +68,7 @@ impl<T: Copy, const N: usize> SpscRing<T, N> {
     fn inc(i: usize) -> usize {
         let n = N;
         let j = i + 1;
-        if j == n {
-            0
-        } else {
-            j
-        }
+        if j == n { 0 } else { j }
     }
 
     /// Try to push a value. Returns `Err(value)` if the ring is full.

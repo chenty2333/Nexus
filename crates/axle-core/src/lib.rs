@@ -33,7 +33,7 @@ pub use cspace::{CSpace, CSpaceError};
 pub use handle::{Handle, HandleError};
 pub use port::{Packet, PacketKind, Port, PortError, PortKey, WaitAsyncOptions, WaitableId};
 pub use revocation::{RevocationGroupId, RevocationGroupToken, RevocationManager, RevocationRef};
-pub use signals::{wait_one, Signals, WaitOne};
+pub use signals::{Signals, WaitOne, wait_one};
 pub use timer::{FakeClock, Time, TimerError, TimerId, TimerService};
 
 #[cfg(test)]

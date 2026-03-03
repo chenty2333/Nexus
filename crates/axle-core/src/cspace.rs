@@ -12,7 +12,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::capability::Capability;
-use crate::handle::{bump_tag, Handle, HandleError, HANDLE_MAX_SLOTS, HANDLE_TAG_RESERVED};
+use crate::handle::{HANDLE_MAX_SLOTS, HANDLE_TAG_RESERVED, Handle, HandleError, bump_tag};
 use crate::revocation::{RevocationGroupToken, RevocationManager, RevocationRef};
 
 #[derive(Clone, Copy, Debug)]
