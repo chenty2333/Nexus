@@ -50,6 +50,7 @@
 
             # Build
             mold
+            just
 
             # Virtualization
             qemu
