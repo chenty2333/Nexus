@@ -1,0 +1,16 @@
+[package]
+name = "axle-kernel"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+publish = false
+
+[dependencies]
+axle-core = { path = "../../crates/axle-core", default-features = false }
+axle-types = { path = "../../crates/axle-types", default-features = false }
+
+# Minimal logging helpers; can be replaced later with a richer kernel logger.
+spin = "0.9"
+
+[features]
+default = []

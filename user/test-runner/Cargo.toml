@@ -1,0 +1,12 @@
+[package]
+name = "nexus-test-runner"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+publish = false
+
+[dependencies]
+axle-types = { path = "../../crates/axle-types", default-features = false }
+
+[features]
+default = []
