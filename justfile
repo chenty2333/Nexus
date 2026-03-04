@@ -10,16 +10,17 @@ xlint:
 xtest:
   cargo test -p axle-types -p axle-core -p axle-sync
 
-# Aggregated host validation entrypoint.
-test-host:
+# Kernel test entrypoint (QEMU-based suites will be added here).
+test-kernel:
+  @echo "test-kernel: no kernel test suite wired yet"
+
+# Optional: run everything in the workspace (will include `no_std` crates once they compile).
+test-all:
   just check-syscalls
   just xlint
   just xtest
   just loom
-
-# Optional: run everything in the workspace (will include `no_std` crates once they compile).
-test-all:
-  just test-host
+  just test-kernel
 
 fmt:
   cargo fmt --all
