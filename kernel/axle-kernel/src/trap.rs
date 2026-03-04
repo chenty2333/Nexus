@@ -29,7 +29,18 @@ fn int80_self_test() {
     }
 
     // Port wait with an invalid handle must fail with BAD_HANDLE.
-    let bad_port_wait_status = run_int80(AXLE_SYS_PORT_WAIT as u64, [0, 0, 0, 0, 0, 0]);
+    let mut bad_wait_packet = zx_port_packet_t::default();
+    let bad_port_wait_status = run_int80(
+        AXLE_SYS_PORT_WAIT as u64,
+        [
+            0,
+            0,
+            (&mut bad_wait_packet as *mut zx_port_packet_t) as u64,
+            0,
+            0,
+            0,
+        ],
+    );
     if bad_port_wait_status != ZX_ERR_BAD_HANDLE {
         panic!(
             "int80 self-test failed: expected {}, got {} for bad AXLE_SYS_PORT_WAIT",
@@ -51,9 +62,17 @@ fn int80_self_test() {
     }
 
     // Empty wait should report SHOULD_WAIT.
+    let mut empty_wait_packet = zx_port_packet_t::default();
     let empty_wait_status = run_int80(
         AXLE_SYS_PORT_WAIT as u64,
-        [port_handle as u64, 0, 0, 0, 0, 0],
+        [
+            port_handle as u64,
+            0,
+            (&mut empty_wait_packet as *mut zx_port_packet_t) as u64,
+            0,
+            0,
+            0,
+        ],
     );
     if empty_wait_status != ZX_ERR_SHOULD_WAIT {
         panic!(
