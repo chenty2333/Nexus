@@ -5,18 +5,19 @@ default:
 
 # Host-only gates for Phase A (contracts).
 xlint:
-  cargo clippy -p axle-types -p axle-core -p axle-sync --all-targets -- -D warnings
+  cargo clippy -p axle-types -p axle-core -p axle-sync -p axle-conformance --all-targets -- -D warnings
 
 xtest:
-  cargo test -p axle-types -p axle-core -p axle-sync
+  cargo test -p axle-types -p axle-core -p axle-sync -p axle-conformance
 
-# Kernel test entrypoint (QEMU-based suites will be added here).
+# Kernel conformance gate.
 test-kernel:
-  @echo "test-kernel: no kernel test suite wired yet"
+  cargo run -p axle-conformance -- run --profile pr
 
 # Optional: run everything in the workspace (will include `no_std` crates once they compile).
 test-all:
   just check-syscalls
+  just fmt-check
   just xlint
   just xtest
   just loom

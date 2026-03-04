@@ -1,0 +1,4 @@
+include_tags = ["tier:quick"]
+exclude_tags = []
+include_ids = []
+exclude_ids = []

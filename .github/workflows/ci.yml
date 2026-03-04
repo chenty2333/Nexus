@@ -10,11 +10,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - name: syscall spec consistency
-        run: nix develop -c just check-syscalls
-      - name: fmt
-        run: nix develop -c just fmt-check
-      - name: clippy
-        run: nix develop -c just xlint
-      - name: tests
-        run: nix develop -c just xtest
+      - name: all gates
+        run: nix develop -c just test-all
