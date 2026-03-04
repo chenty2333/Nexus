@@ -10,9 +10,3 @@ axle-types = { path = "../../crates/axle-types", default-features = false }
 
 [features]
 default = []
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
