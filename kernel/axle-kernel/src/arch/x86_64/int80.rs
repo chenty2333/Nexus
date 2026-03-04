@@ -5,7 +5,6 @@
 //! - `rdi/rsi/rdx/r10/r8/r9` = args 0..5
 //! - return `zx_status_t` in `rax`
 
-use axle_types::status::ZX_ERR_BAD_SYSCALL;
 use axle_types::zx_status_t;
 
 core::arch::global_asm!(
@@ -121,7 +120,5 @@ pub fn entry_addr() -> usize {
 }
 
 extern "C" fn axle_int80_rust(frame: &mut TrapFrame) {
-    let _ = frame.syscall_nr();
-    let _ = frame.args();
-    frame.set_status(ZX_ERR_BAD_SYSCALL);
+    crate::syscall::invoke_from_trapframe(frame);
 }
