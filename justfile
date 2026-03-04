@@ -27,3 +27,8 @@ loom:
 # Syscall ABI generation (Phase A bootstrap).
 gen-syscalls:
   cargo run -p syscalls-gen -- syscalls/spec/syscalls.toml --out syscalls/generated
+
+# Ensure generated syscall ABI files are up to date with spec.
+check-syscalls:
+  just gen-syscalls
+  git diff --exit-code -- syscalls/generated/syscall_numbers.rs
