@@ -5,6 +5,8 @@
 //! This crate loads declarative scenarios/profiles and executes them as
 //! reproducible command-based conformance cases.
 
+pub mod contracts;
+pub mod elf;
 pub mod gc;
 pub mod model;
 pub mod report;

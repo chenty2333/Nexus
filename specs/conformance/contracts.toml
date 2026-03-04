@@ -1,0 +1,31 @@
+schema_version = 1
+
+[[contracts]]
+id = "must.syscall.bad_syscall_returns_bad_syscall"
+level = "must"
+description = "Unknown syscall number must return ZX_ERR_BAD_SYSCALL"
+
+[[contracts]]
+id = "must.handle.close_double_returns_bad_handle"
+level = "must"
+description = "Closing the same handle twice must return ZX_ERR_BAD_HANDLE on second close"
+
+[[contracts]]
+id = "must.port.wait_bad_handle_returns_bad_handle"
+level = "must"
+description = "zx_port_wait with invalid handle must return ZX_ERR_BAD_HANDLE"
+
+[[contracts]]
+id = "must.port.wait_empty_returns_should_wait"
+level = "must"
+description = "zx_port_wait on empty valid port must return ZX_ERR_SHOULD_WAIT"
+
+[[contracts]]
+id = "must.port.queue_wait_roundtrip_ok"
+level = "must"
+description = "zx_port_queue + zx_port_wait must roundtrip packet data"
+
+[[contracts]]
+id = "must.timer.set_cancel_ok"
+level = "must"
+description = "zx_timer_set and zx_timer_cancel must return ZX_OK for valid timer handle"

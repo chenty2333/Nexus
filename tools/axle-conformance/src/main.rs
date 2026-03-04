@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
+use axle_conformance::contracts::{build_coverage_report, load_contract_catalog};
 use axle_conformance::gc::prune_runs;
 use axle_conformance::model::{load_profile, load_scenarios};
 use axle_conformance::runner::{RunConfig, replay_from_snapshot, run_conformance};
@@ -34,6 +35,12 @@ enum Commands {
         /// Print PASS lines in addition to FAIL lines.
         #[arg(long)]
         verbose: bool,
+        /// Number of worker jobs for scenario execution.
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
+        /// Retry failed scenarios up to this count.
+        #[arg(long, default_value_t = 0)]
+        retries: u32,
     },
     /// List scenarios after applying filters.
     List {
@@ -56,6 +63,10 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         keep_runs: usize,
     },
+    /// Validate contract -> scenario mapping coverage.
+    CheckContracts,
+    /// Print contract -> scenario mapping table.
+    ListContracts,
 }
 
 fn main() {
@@ -75,6 +86,8 @@ fn real_main() -> Result<()> {
             tag_filters,
             keep_runs,
             verbose,
+            jobs,
+            retries,
         } => {
             let mut config = RunConfig::with_workspace_defaults();
             config.profile = profile.or(config.profile);
@@ -82,6 +95,8 @@ fn real_main() -> Result<()> {
             config.tag_filters = tag_filters;
             config.keep_runs = keep_runs;
             config.verbose = verbose;
+            config.jobs = jobs.max(1);
+            config.retries = retries;
 
             let summary = run_conformance(&config)?;
             if summary.fail > 0 {
@@ -133,6 +148,60 @@ fn real_main() -> Result<()> {
                 removed.len(),
                 keep_runs,
                 base.out_dir.display()
+            );
+            Ok(())
+        }
+        Commands::CheckContracts => {
+            let base = RunConfig::with_workspace_defaults();
+            let scenarios = load_scenarios(&base.scenarios_dir)?;
+            let catalog = load_contract_catalog(&base.contracts_file)?;
+            let report = build_coverage_report(&catalog, &scenarios);
+
+            if !report.unknown_contract_refs.is_empty() {
+                for (scenario_id, contract_id) in &report.unknown_contract_refs {
+                    println!(
+                        "unknown-contract-ref: scenario={} contract={}",
+                        scenario_id, contract_id
+                    );
+                }
+            }
+
+            if !report.uncovered_must.is_empty() {
+                for id in &report.uncovered_must {
+                    println!("uncovered-must: {}", id);
+                }
+            }
+
+            println!(
+                "contracts: total={} must={} covered_must={} unknown_refs={}",
+                report.total_contracts,
+                report.total_must,
+                report.covered_must,
+                report.unknown_contract_refs.len()
+            );
+
+            if !report.unknown_contract_refs.is_empty() || !report.uncovered_must.is_empty() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Commands::ListContracts => {
+            let base = RunConfig::with_workspace_defaults();
+            let scenarios = load_scenarios(&base.scenarios_dir)?;
+            let catalog = load_contract_catalog(&base.contracts_file)?;
+            let report = build_coverage_report(&catalog, &scenarios);
+
+            for contract in &catalog.contracts {
+                let scenario_list = report
+                    .mapping
+                    .get(&contract.id)
+                    .map(|v| v.join(","))
+                    .unwrap_or_default();
+                println!("{}\t{:?}\t{}", contract.id, contract.level, scenario_list);
+            }
+            println!(
+                "contracts: total={} must={} covered_must={}",
+                report.total_contracts, report.total_must, report.covered_must
             );
             Ok(())
         }

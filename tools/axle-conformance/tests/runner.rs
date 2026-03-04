@@ -14,6 +14,7 @@ fn run_conformance_writes_summary_and_reports_pass() {
 
     let scenarios_dir = ws.join("specs/conformance/scenarios");
     let profiles_dir = ws.join("specs/conformance/profiles");
+    let contracts_file = ws.join("specs/conformance/contracts.toml");
     write_file(
         &scenarios_dir.join("ok.toml"),
         r#"
@@ -23,12 +24,23 @@ timeout_ms = 1000
 command = ["sh", "-c", "echo pass"]
 expect = ["pass"]
 forbid = ["panic"]
+contracts = ["must.sample.pass"]
 "#,
     );
     write_file(
         &profiles_dir.join("pr.toml"),
         r#"
 include_tags = ["tier:quick"]
+"#,
+    );
+    write_file(
+        &contracts_file,
+        r#"
+schema_version = 1
+[[contracts]]
+id = "must.sample.pass"
+level = "must"
+description = "sample contract"
 "#,
     );
 
@@ -42,7 +54,10 @@ include_tags = ["tier:quick"]
         out_dir: out_dir.clone(),
         scenarios_dir,
         profiles_dir,
+        contracts_file,
         workspace_root: ws.to_path_buf(),
+        jobs: 1,
+        retries: 0,
     };
 
     let summary = run_conformance(&config).expect("run conformance");

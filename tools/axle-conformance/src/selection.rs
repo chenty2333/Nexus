@@ -80,6 +80,9 @@ mod tests {
             command: vec!["true".to_string()],
             expect: vec![],
             forbid: vec![],
+            contracts: vec![],
+            assertions: None,
+            elf_check: None,
         }
     }
 

@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use crate::elf::ElfCheckReport;
 
 /// Status of a single conformance case.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -13,12 +16,16 @@ pub enum CaseStatus {
 pub struct CaseReport {
     pub scenario_id: String,
     pub status: CaseStatus,
+    pub attempts: u32,
     pub duration_ms: u128,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub reason: Option<String>,
     pub missing_expect: Vec<String>,
     pub matched_forbid: Vec<String>,
+    pub parsed_metrics: BTreeMap<String, i64>,
+    pub assertion_mismatches: Vec<String>,
+    pub elf_check: Option<ElfCheckReport>,
     pub case_dir: String,
 }
 
@@ -40,6 +47,7 @@ pub struct RunSummary {
     pub total: usize,
     pub pass: usize,
     pub fail: usize,
+    pub flaky_pass: usize,
     pub duration_ms: u128,
     pub report_path: String,
     pub cases: Vec<CaseReport>,

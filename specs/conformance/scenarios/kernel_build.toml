@@ -1,6 +1,16 @@
-id = "kernel.qemu.int80.selftest"
-description = "Boot kernel directly with QEMU and assert int80 syscall self-test passes"
-tags = ["module:kernel", "tier:quick", "phase:bootstrap", "kind:qemu"]
+id = "kernel.pipeline.core_chain"
+description = "Core end-to-end chain: syscall entry -> dispatch -> object impl -> return"
+tags = [
+  "module:kernel",
+  "module:syscall",
+  "module:port",
+  "module:timer",
+  "module:handle",
+  "tier:quick",
+  "suite:pr",
+  "suite:nightly",
+  "kind:qemu",
+]
 timeout_ms = 180000
 command = [
   "sh",
@@ -9,3 +19,28 @@ command = [
 ]
 expect = ["trap: int80 self-test ok"]
 forbid = ["KERNEL PANIC"]
+contracts = [
+  "must.syscall.bad_syscall_returns_bad_syscall",
+  "must.handle.close_double_returns_bad_handle",
+  "must.port.wait_bad_handle_returns_bad_handle",
+  "must.port.wait_empty_returns_should_wait",
+  "must.port.queue_wait_roundtrip_ok",
+  "must.timer.set_cancel_ok",
+]
+
+[assertions.status_code]
+queue = 0
+wait = 0
+timer_set = 0
+timer_cancel = 0
+close = 0
+
+[assertions.error_code]
+unknown = -13
+bad_wait = -11
+empty_wait = -22
+close_again = -11
+
+[elf_check]
+path = "target/x86_64-unknown-none/debug/axle-kernel"
+require_xen_pvh_note = true

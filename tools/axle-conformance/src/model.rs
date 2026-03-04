@@ -9,6 +9,33 @@ fn default_timeout_ms() -> u64 {
     30_000
 }
 
+/// Optional ELF-level assertions for binary boot contracts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ElfCheckSpec {
+    /// Path relative to workspace root.
+    pub path: String,
+    /// Require Xen PVH entry note (type 18) to be present.
+    #[serde(default)]
+    pub require_xen_pvh_note: bool,
+}
+
+/// Structured assertions over parsed key=value metrics from run logs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AssertionsSpec {
+    /// Success-path status-like values.
+    #[serde(default)]
+    pub status_code: BTreeMap<String, i64>,
+    /// Error-code values.
+    #[serde(default)]
+    pub error_code: BTreeMap<String, i64>,
+    /// Signal-mask values.
+    #[serde(default)]
+    pub signal_mask: BTreeMap<String, i64>,
+    /// Packet field values.
+    #[serde(default)]
+    pub packet_fields: BTreeMap<String, i64>,
+}
+
 /// Declarative scenario contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioSpec {
@@ -31,6 +58,15 @@ pub struct ScenarioSpec {
     /// Tokens that must not appear in stdout/stderr concatenation.
     #[serde(default)]
     pub forbid: Vec<String>,
+    /// Mapped contract ids covered by this scenario.
+    #[serde(default)]
+    pub contracts: Vec<String>,
+    /// Optional structured assertions.
+    #[serde(default)]
+    pub assertions: Option<AssertionsSpec>,
+    /// Optional ELF contract checks.
+    #[serde(default)]
+    pub elf_check: Option<ElfCheckSpec>,
 }
 
 impl ScenarioSpec {
@@ -44,6 +80,14 @@ impl ScenarioSpec {
         }
         if self.timeout_ms == 0 {
             bail!("scenario '{}' timeout_ms must be > 0", self.id);
+        }
+        if self.contracts.iter().any(|c| c.trim().is_empty()) {
+            bail!("scenario '{}' has empty contract id", self.id);
+        }
+        if let Some(elf_check) = &self.elf_check
+            && elf_check.path.trim().is_empty()
+        {
+            bail!("scenario '{}' has empty elf_check.path", self.id);
         }
         Ok(())
     }
@@ -154,6 +198,9 @@ mod tests {
             command: vec!["echo".into(), "ok".into()],
             expect: vec![],
             forbid: vec![],
+            contracts: vec![],
+            assertions: None,
+            elf_check: None,
         };
 
         assert!(s.has_all_tags(&["module:port".into()]));

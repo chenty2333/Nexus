@@ -14,9 +14,14 @@ xtest:
 test-kernel:
   cargo run -p axle-conformance -- run --profile pr
 
+# Ensure contract catalog and scenario bindings remain complete.
+check-conformance-contracts:
+  cargo run -p axle-conformance -- check-contracts
+
 # Optional: run everything in the workspace (will include `no_std` crates once they compile).
 test-all:
   just check-syscalls
+  just check-conformance-contracts
   just fmt-check
   just xlint
   just xtest
