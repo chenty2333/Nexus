@@ -16,9 +16,3 @@ members = [
 
 # CI currently lints/tests only the host-side contract crates (axle-core/axle-sync).
 # See `just xlint` and `just xtest`.
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"

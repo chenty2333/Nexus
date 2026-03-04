@@ -76,11 +76,19 @@ impl fmt::Write for SerialPort {
 }
 
 unsafe fn outb(port: u16, val: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
+    // SAFETY: Caller must ensure `port` is a valid I/O port address.
+    // The `out` instruction is safe at CPL0 (kernel mode) on x86_64.
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
+    }
 }
 
 unsafe fn inb(port: u16) -> u8 {
     let mut v: u8;
-    core::arch::asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags));
+    // SAFETY: Caller must ensure `port` is a valid I/O port address.
+    // The `in` instruction is safe at CPL0 (kernel mode) on x86_64.
+    unsafe {
+        core::arch::asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags));
+    }
     v
 }
