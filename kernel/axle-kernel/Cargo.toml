@@ -11,6 +11,11 @@ axle-types = { path = "../../crates/axle-types", default-features = false }
 
 # Minimal logging helpers; can be replaced later with a richer kernel logger.
 spin = "0.9"
+x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
+raw-cpuid = "11"
+uart_16550 = "0.3"
+bitflags = "2.6"
+heapless = { version = "0.8", default-features = false }
 
 [features]
 default = []

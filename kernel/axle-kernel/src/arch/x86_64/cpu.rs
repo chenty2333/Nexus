@@ -1,4 +1,5 @@
 //! CPU helpers.
+use x86_64::instructions::hlt;
 
 /// Halt the CPU in a loop.
 pub fn halt_loop() -> ! {
@@ -9,6 +10,5 @@ pub fn halt_loop() -> ! {
 
 /// Execute a single HLT instruction.
 pub fn halt() {
-    // Safety: `hlt` is safe at CPL0; when interrupts are disabled this will just idle forever.
-    unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) }
+    hlt();
 }

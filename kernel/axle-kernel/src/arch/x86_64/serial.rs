@@ -1,94 +1,58 @@
-//! Minimal 16550 UART serial output on COM1 (0x3F8).
-//!
-//! This is enough for bring-up logs and the future userspace test runner.
+//! 16550 UART serial output on COM1 (0x3F8).
 
 use core::fmt;
+
 use spin::Mutex;
+use uart_16550::SerialPort;
 
 /// COM1 base port.
 const COM1: u16 = 0x3F8;
 
-static SERIAL: Mutex<SerialPort> = Mutex::new(SerialPort::new(COM1));
-
-pub fn init() {
-    SERIAL.lock().init();
-}
-
-pub fn _print(args: fmt::Arguments<'_>) {
-    use fmt::Write;
-    let _ = SERIAL.lock().write_fmt(args);
-}
-
-pub struct SerialPort {
-    base: u16,
+struct SerialState {
+    port: SerialPort,
     inited: bool,
 }
 
-impl SerialPort {
-    pub const fn new(base: u16) -> Self {
+impl SerialState {
+    fn new() -> Self {
+        // SAFETY: COM1 is a fixed legacy I/O port on x86 PC platforms.
+        // Access remains CPL0-only and is serialized via the global mutex.
+        let port = unsafe { SerialPort::new(COM1) };
         Self {
-            base,
+            port,
             inited: false,
         }
     }
 
-    pub fn init(&mut self) {
+    fn init_if_needed(&mut self) {
         if self.inited {
             return;
         }
-        unsafe {
-            outb(self.base + 1, 0x00); // disable interrupts
-            outb(self.base + 3, 0x80); // enable DLAB
-            outb(self.base + 0, 0x01); // divisor low  (115200 baud)
-            outb(self.base + 1, 0x00); // divisor high
-            outb(self.base + 3, 0x03); // 8N1
-            outb(self.base + 2, 0xC7); // enable FIFO, clear, 14-byte threshold
-            outb(self.base + 4, 0x0B); // IRQs enabled, RTS/DSR set
-        }
+        self.port.init();
         self.inited = true;
     }
+}
 
-    fn tx_ready(&self) -> bool {
-        unsafe { inb(self.base + 5) & 0x20 != 0 }
+static SERIAL: Mutex<Option<SerialState>> = Mutex::new(None);
+
+pub fn init() {
+    let mut guard = SERIAL.lock();
+    if guard.is_none() {
+        *guard = Some(SerialState::new());
     }
-
-    fn write_byte(&mut self, b: u8) {
-        while !self.tx_ready() {
-            core::hint::spin_loop();
-        }
-        unsafe { outb(self.base, b) }
+    if let Some(state) = guard.as_mut() {
+        state.init_if_needed();
     }
 }
 
-impl fmt::Write for SerialPort {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
-            match b {
-                b'\n' => {
-                    self.write_byte(b'\r');
-                    self.write_byte(b'\n');
-                }
-                _ => self.write_byte(b),
-            }
-        }
-        Ok(())
+pub fn _print(args: fmt::Arguments<'_>) {
+    use fmt::Write;
+    let mut guard = SERIAL.lock();
+    if guard.is_none() {
+        *guard = Some(SerialState::new());
     }
-}
-
-unsafe fn outb(port: u16, val: u8) {
-    // SAFETY: Caller must ensure `port` is a valid I/O port address.
-    // The `out` instruction is safe at CPL0 (kernel mode) on x86_64.
-    unsafe {
-        core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
+    if let Some(state) = guard.as_mut() {
+        state.init_if_needed();
+        let _ = state.port.write_fmt(args);
     }
-}
-
-unsafe fn inb(port: u16) -> u8 {
-    let mut v: u8;
-    // SAFETY: Caller must ensure `port` is a valid I/O port address.
-    // The `in` instruction is safe at CPL0 (kernel mode) on x86_64.
-    unsafe {
-        core::arch::asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags));
-    }
-    v
 }
