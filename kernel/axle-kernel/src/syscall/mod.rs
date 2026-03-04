@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_NOT_SUPPORTED};
+use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NOT_SUPPORTED, ZX_OK};
 use axle_types::syscall_numbers::{
     AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_TIMER_CANCEL,
@@ -45,6 +45,8 @@ const _ABI_TYPES_WITNESS: Option<(
 )> = None;
 
 pub fn init() {
+    crate::object::init();
+
     // Placeholder.
     //
     // Keep a reference so the compiler proves this module is wired to the shared
@@ -80,8 +82,15 @@ pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame) {
     frame.set_status(status);
 }
 
-fn sys_handle_close(_args: [u64; 6]) -> zx_status_t {
-    ZX_ERR_NOT_SUPPORTED
+fn sys_handle_close(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    match crate::object::close_handle(handle) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
 }
 
 fn sys_object_wait_one(_args: [u64; 6]) -> zx_status_t {
@@ -93,25 +102,89 @@ fn sys_object_wait_async(_args: [u64; 6]) -> zx_status_t {
 }
 
 fn sys_port_create(_args: [u64; 6]) -> zx_status_t {
-    ZX_ERR_NOT_SUPPORTED
+    let options = match u32::try_from(_args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+
+    let out_ptr = _args[1] as *mut zx_handle_t;
+    if out_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let h = match crate::object::create_port(options) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // SAFETY: for current bring-up we trust the caller-provided pointer; later
+    // phases will replace this with strict copyout validation.
+    unsafe {
+        out_ptr.write(h);
+    }
+    ZX_OK
 }
 
 fn sys_port_queue(_args: [u64; 6]) -> zx_status_t {
     ZX_ERR_NOT_SUPPORTED
 }
 
-fn sys_port_wait(_args: [u64; 6]) -> zx_status_t {
-    ZX_ERR_NOT_SUPPORTED
+fn sys_port_wait(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    match crate::object::ensure_port_handle(handle) {
+        Ok(()) => ZX_ERR_NOT_SUPPORTED,
+        Err(e) => e,
+    }
 }
 
-fn sys_timer_create(_args: [u64; 6]) -> zx_status_t {
-    ZX_ERR_NOT_SUPPORTED
+fn sys_timer_create(args: [u64; 6]) -> zx_status_t {
+    let options = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let clock_id = match u32::try_from(args[1]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let out_ptr = args[2] as *mut zx_handle_t;
+    if out_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let h = match crate::object::create_timer(options, clock_id) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // SAFETY: for current bring-up we trust the caller-provided pointer; later
+    // phases will replace this with strict copyout validation.
+    unsafe {
+        out_ptr.write(h);
+    }
+    ZX_OK
 }
 
-fn sys_timer_set(_args: [u64; 6]) -> zx_status_t {
-    ZX_ERR_NOT_SUPPORTED
+fn sys_timer_set(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    match crate::object::ensure_timer_handle(handle) {
+        Ok(()) => ZX_ERR_NOT_SUPPORTED,
+        Err(e) => e,
+    }
 }
 
-fn sys_timer_cancel(_args: [u64; 6]) -> zx_status_t {
-    ZX_ERR_NOT_SUPPORTED
+fn sys_timer_cancel(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    match crate::object::ensure_timer_handle(handle) {
+        Ok(()) => ZX_ERR_NOT_SUPPORTED,
+        Err(e) => e,
+    }
 }

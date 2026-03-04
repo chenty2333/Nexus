@@ -7,6 +7,8 @@
 #![no_main]
 
 mod arch;
+mod kalloc;
+mod object;
 mod smp;
 mod syscall;
 mod trap;
@@ -28,8 +30,8 @@ pub extern "C" fn _start() -> ! {
     kprintln!("(Phase B skeleton)");
 
     // TODO(B): install IDT, enable interrupts, init heap, bring up SMP, etc.
-    trap::init();
     syscall::init();
+    trap::init();
     smp::init();
 
     arch::cpu::halt_loop();
