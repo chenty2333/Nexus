@@ -10,9 +10,16 @@ xlint:
 xtest:
   cargo test -p axle-types -p axle-core -p axle-sync
 
+# Aggregated host validation entrypoint.
+test-host:
+  just check-syscalls
+  just xlint
+  just xtest
+  just loom
+
 # Optional: run everything in the workspace (will include `no_std` crates once they compile).
 test-all:
-  cargo test --workspace
+  just test-host
 
 fmt:
   cargo fmt --all
