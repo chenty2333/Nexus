@@ -1,6 +1,6 @@
 id = "kernel.port.queue_wait_roundtrip"
 description = "Port queue/wait user packet roundtrips successfully"
-tags = ["module:port", "tier:deep", "suite:nightly", "kind:qemu"]
+tags = ["module:port", "kind:qemu"]
 timeout_ms = 180000
 command = [
   "sh",

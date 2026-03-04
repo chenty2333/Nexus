@@ -1,6 +1,6 @@
 id = "kernel.port.wait_states"
 description = "Port wait returns BAD_HANDLE for invalid handle and SHOULD_WAIT for empty port"
-tags = ["module:port", "tier:deep", "suite:nightly", "kind:qemu"]
+tags = ["module:port", "kind:qemu"]
 timeout_ms = 180000
 command = [
   "sh",

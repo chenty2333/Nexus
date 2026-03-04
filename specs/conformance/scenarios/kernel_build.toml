@@ -6,9 +6,6 @@ tags = [
   "module:port",
   "module:timer",
   "module:handle",
-  "tier:quick",
-  "suite:pr",
-  "suite:nightly",
   "kind:qemu",
 ]
 timeout_ms = 180000

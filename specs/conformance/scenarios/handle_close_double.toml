@@ -1,6 +1,6 @@
 id = "kernel.handle.close_double"
 description = "Closing an already closed handle returns ZX_ERR_BAD_HANDLE"
-tags = ["module:handle", "tier:deep", "suite:nightly", "kind:qemu"]
+tags = ["module:handle", "kind:qemu"]
 timeout_ms = 180000
 command = [
   "sh",

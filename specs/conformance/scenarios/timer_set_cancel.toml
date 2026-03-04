@@ -1,6 +1,6 @@
 id = "kernel.timer.set_cancel"
 description = "Timer set/cancel returns ZX_OK on valid timer handle"
-tags = ["module:timer", "tier:deep", "suite:nightly", "kind:qemu"]
+tags = ["module:timer", "kind:qemu"]
 timeout_ms = 180000
 command = [
   "sh",

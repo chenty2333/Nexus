@@ -2,44 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow};
 
-use crate::model::{ProfileSpec, ScenarioSpec};
+use crate::model::ScenarioSpec;
 
-/// Apply profile and CLI filters to produce an ordered scenario list.
+/// Apply CLI filters to produce an ordered scenario list.
 pub fn select_scenarios(
     scenarios: &BTreeMap<String, ScenarioSpec>,
-    profile: Option<&ProfileSpec>,
     scenario_filters: &[String],
     tag_filters: &[String],
 ) -> Result<Vec<ScenarioSpec>> {
     let mut selected_ids: BTreeSet<String> = scenarios.keys().cloned().collect();
-
-    if let Some(p) = profile {
-        if !p.include_tags.is_empty() {
-            selected_ids.retain(|id| {
-                scenarios
-                    .get(id)
-                    .is_some_and(|scenario| scenario.has_any_tag(&p.include_tags))
-            });
-        }
-
-        for id in &p.include_ids {
-            if scenarios.contains_key(id) {
-                selected_ids.insert(id.clone());
-            }
-        }
-
-        if !p.exclude_tags.is_empty() {
-            selected_ids.retain(|id| {
-                scenarios
-                    .get(id)
-                    .is_some_and(|scenario| !scenario.has_any_tag(&p.exclude_tags))
-            });
-        }
-
-        for id in &p.exclude_ids {
-            selected_ids.remove(id);
-        }
-    }
 
     if !scenario_filters.is_empty() {
         for id in scenario_filters {
@@ -87,19 +58,12 @@ mod tests {
     }
 
     #[test]
-    fn profile_include_and_exclude_tags_work() {
+    fn scenario_filter_by_id_works() {
         let mut map = BTreeMap::new();
-        map.insert("a".into(), scenario("a", &["tier:quick", "module:port"]));
-        map.insert("b".into(), scenario("b", &["tier:slow", "module:timer"]));
+        map.insert("a".into(), scenario("a", &["module:port", "kind:qemu"]));
+        map.insert("b".into(), scenario("b", &["module:timer", "kind:qemu"]));
 
-        let profile = ProfileSpec {
-            include_tags: vec!["tier:quick".into()],
-            exclude_tags: vec!["module:timer".into()],
-            include_ids: vec![],
-            exclude_ids: vec![],
-        };
-
-        let out = select_scenarios(&map, Some(&profile), &[], &[]).expect("selection");
+        let out = select_scenarios(&map, &["a".into()], &[]).expect("selection");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "a");
     }
@@ -107,16 +71,11 @@ mod tests {
     #[test]
     fn cli_tag_filter_is_all_tags_match() {
         let mut map = BTreeMap::new();
-        map.insert("a".into(), scenario("a", &["module:port", "tier:quick"]));
+        map.insert("a".into(), scenario("a", &["module:port", "kind:qemu"]));
         map.insert("b".into(), scenario("b", &["module:port"]));
 
-        let out = select_scenarios(
-            &map,
-            None,
-            &[],
-            &["module:port".into(), "tier:quick".into()],
-        )
-        .expect("selection");
+        let out = select_scenarios(&map, &[], &["module:port".into(), "kind:qemu".into()])
+            .expect("selection");
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "a");

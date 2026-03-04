@@ -33,7 +33,6 @@ pub struct CaseReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub test_id: String,
-    pub profile: Option<String>,
     pub selected_scenarios: Vec<String>,
     pub scenario_filters: Vec<String>,
     pub tag_filters: Vec<String>,

@@ -1,4 +1,0 @@
-include_tags = ["suite:nightly"]
-exclude_tags = []
-include_ids = []
-exclude_ids = []

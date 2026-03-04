@@ -1,6 +1,6 @@
 id = "kernel.syscall.bad_syscall"
 description = "Unknown syscall number returns ZX_ERR_BAD_SYSCALL"
-tags = ["module:syscall", "tier:deep", "suite:nightly", "kind:qemu"]
+tags = ["module:syscall", "kind:qemu"]
 timeout_ms = 180000
 command = [
   "sh",

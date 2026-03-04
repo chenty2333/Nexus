@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use crate::contracts::{build_coverage_report, load_contract_catalog};
 use crate::elf::inspect_elf;
 use crate::gc::prune_runs;
-use crate::model::{load_profile, load_scenarios};
+use crate::model::load_scenarios;
 use crate::report::{CaseReport, CaseStatus, Manifest, RunSummary};
 use crate::selection::select_scenarios;
 use crate::test_id::new_test_id;
@@ -20,14 +20,12 @@ use crate::test_id::new_test_id;
 /// Conformance execution configuration.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    pub profile: Option<String>,
     pub scenario_filters: Vec<String>,
     pub tag_filters: Vec<String>,
     pub keep_runs: usize,
     pub verbose: bool,
     pub out_dir: PathBuf,
     pub scenarios_dir: PathBuf,
-    pub profiles_dir: PathBuf,
     pub contracts_file: PathBuf,
     pub workspace_root: PathBuf,
     pub jobs: usize,
@@ -40,14 +38,12 @@ impl RunConfig {
         let workspace_root = workspace_root_from_manifest_dir();
         let specs_root = workspace_root.join("specs").join("conformance");
         Self {
-            profile: Some("pr".to_string()),
             scenario_filters: Vec::new(),
             tag_filters: Vec::new(),
             keep_runs: 100,
             verbose: false,
             out_dir: workspace_root.join("target").join("axle-conformance"),
             scenarios_dir: specs_root.join("scenarios"),
-            profiles_dir: specs_root.join("profiles"),
             contracts_file: specs_root.join("contracts.toml"),
             workspace_root,
             jobs: 1,
@@ -72,18 +68,7 @@ pub fn run_conformance(config: &RunConfig) -> Result<RunSummary> {
             contract_id
         );
     }
-    let profile_spec = if let Some(profile_name) = &config.profile {
-        Some(load_profile(&config.profiles_dir, profile_name)?)
-    } else {
-        None
-    };
-
-    let selected = select_scenarios(
-        &scenarios,
-        profile_spec.as_ref(),
-        &config.scenario_filters,
-        &config.tag_filters,
-    )?;
+    let selected = select_scenarios(&scenarios, &config.scenario_filters, &config.tag_filters)?;
 
     if selected.is_empty() {
         bail!("selection produced zero scenarios");
@@ -99,15 +84,13 @@ pub fn run_conformance(config: &RunConfig) -> Result<RunSummary> {
         .with_context(|| format!("create cases dir {}", cases_dir.display()))?;
 
     println!(
-        "axle-conformance test-id={} profile={} total={}",
+        "axle-conformance test-id={} total={}",
         test_id,
-        config.profile.as_deref().unwrap_or("none"),
         selected.len()
     );
 
     let manifest = Manifest {
         test_id: test_id.clone(),
-        profile: config.profile.clone(),
         selected_scenarios: selected.iter().map(|s| s.id.clone()).collect(),
         scenario_filters: config.scenario_filters.clone(),
         tag_filters: config.tag_filters.clone(),
@@ -132,13 +115,12 @@ pub fn run_conformance(config: &RunConfig) -> Result<RunSummary> {
         planned.push((scenario.clone(), case_dir));
     }
 
-    let mut case_reports = execute_cases(
+    let case_reports = execute_cases(
         &planned,
         &config.workspace_root,
         config.jobs,
         config.retries,
     )?;
-    case_reports.sort_by(|a, b| a.scenario_id.cmp(&b.scenario_id));
 
     for report in &case_reports {
         if config.verbose || report.status == CaseStatus::Fail {
@@ -644,7 +626,6 @@ pub fn replay_from_snapshot(
 
     let manifest = Manifest {
         test_id: summary.test_id.clone(),
-        profile: None,
         selected_scenarios: vec![scenario.id],
         scenario_filters: vec![scenario_id.to_string()],
         tag_filters: vec![],

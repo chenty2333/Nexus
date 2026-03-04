@@ -44,7 +44,7 @@ pub struct ScenarioSpec {
     /// Optional short description for human readers.
     #[serde(default)]
     pub description: String,
-    /// Free-form labels such as `module:port` or `tier:quick`.
+    /// Free-form labels such as `module:port` or `kind:qemu`.
     #[serde(default)]
     pub tags: Vec<String>,
     /// Per-scenario timeout budget.
@@ -107,23 +107,6 @@ impl ScenarioSpec {
     }
 }
 
-/// Selection rules for a named profile.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProfileSpec {
-    /// Keep scenarios that contain at least one tag from this set.
-    #[serde(default)]
-    pub include_tags: Vec<String>,
-    /// Remove scenarios that contain any tag from this set.
-    #[serde(default)]
-    pub exclude_tags: Vec<String>,
-    /// Force include these scenario ids.
-    #[serde(default)]
-    pub include_ids: Vec<String>,
-    /// Force exclude these scenario ids.
-    #[serde(default)]
-    pub exclude_ids: Vec<String>,
-}
-
 fn collect_toml_files(root: &Path) -> Result<Vec<PathBuf>> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
@@ -174,16 +157,6 @@ pub fn load_scenarios(root: &Path) -> Result<BTreeMap<String, ScenarioSpec>> {
     Ok(out)
 }
 
-/// Load named profile from `<profiles_root>/<name>.toml`.
-pub fn load_profile(profiles_root: &Path, name: &str) -> Result<ProfileSpec> {
-    let path = profiles_root.join(format!("{name}.toml"));
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("read profile file {}", path.display()))?;
-    let profile: ProfileSpec =
-        toml::from_str(&raw).with_context(|| format!("parse profile file {}", path.display()))?;
-    Ok(profile)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,7 +166,7 @@ mod tests {
         let s = ScenarioSpec {
             id: "x".into(),
             description: String::new(),
-            tags: vec!["module:port".into(), "tier:quick".into()],
+            tags: vec!["module:port".into(), "kind:qemu".into()],
             timeout_ms: 100,
             command: vec!["echo".into(), "ok".into()],
             expect: vec![],
@@ -204,7 +177,7 @@ mod tests {
         };
 
         assert!(s.has_all_tags(&["module:port".into()]));
-        assert!(s.has_any_tag(&["tier:quick".into(), "tier:slow".into()]));
+        assert!(s.has_any_tag(&["kind:qemu".into(), "kind:host".into()]));
         assert!(!s.has_all_tags(&["module:timer".into()]));
     }
 }

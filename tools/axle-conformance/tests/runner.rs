@@ -13,24 +13,17 @@ fn run_conformance_writes_summary_and_reports_pass() {
     let ws = tmp.path();
 
     let scenarios_dir = ws.join("specs/conformance/scenarios");
-    let profiles_dir = ws.join("specs/conformance/profiles");
     let contracts_file = ws.join("specs/conformance/contracts.toml");
     write_file(
         &scenarios_dir.join("ok.toml"),
         r#"
 id = "sample.pass"
-tags = ["tier:quick", "module:sample"]
+tags = ["module:sample"]
 timeout_ms = 1000
 command = ["sh", "-c", "echo pass"]
 expect = ["pass"]
 forbid = ["panic"]
 contracts = ["must.sample.pass"]
-"#,
-    );
-    write_file(
-        &profiles_dir.join("pr.toml"),
-        r#"
-include_tags = ["tier:quick"]
 "#,
     );
     write_file(
@@ -46,14 +39,12 @@ description = "sample contract"
 
     let out_dir = ws.join("target/axle-conformance");
     let config = RunConfig {
-        profile: Some("pr".into()),
         scenario_filters: vec![],
         tag_filters: vec![],
         keep_runs: 100,
         verbose: false,
         out_dir: out_dir.clone(),
         scenarios_dir,
-        profiles_dir,
         contracts_file,
         workspace_root: ws.to_path_buf(),
         jobs: 1,
