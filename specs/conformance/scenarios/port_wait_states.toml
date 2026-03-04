@@ -7,7 +7,7 @@ command = [
   "-lc",
   "cargo build -p axle-kernel --target x86_64-unknown-none && timeout 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -no-shutdown -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; [ \"$code\" -eq 0 ] || [ \"$code\" -eq 124 ]"
 ]
-expect = ["trap: int80 self-test ok"]
+expect = ["runner: int80 smoke ok"]
 forbid = ["KERNEL PANIC"]
 contracts = [
   "must.port.wait_bad_handle_returns_bad_handle",

@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 axle-core = { path = "../../crates/axle-core", default-features = false }
 axle-types = { path = "../../crates/axle-types", default-features = false }
+nexus-test-runner = { path = "../../user/test-runner", default-features = false }
 
 # Minimal logging helpers; can be replaced later with a richer kernel logger.
 spin = "0.9"
