@@ -48,17 +48,28 @@ pub struct Packet {
     pub observed: Signals,
     /// For signal packets: merged trigger count (>= 1 for signal packets, 0 for user packets).
     pub count: u32,
+    /// For user packets: caller-provided status.
+    pub status: i32,
+    /// For user packets: raw 32-byte payload.
+    pub user: [u64; 4],
 }
 
 impl Packet {
     /// Create a user packet.
     pub fn user(key: PortKey) -> Self {
+        Self::user_with_data(key, 0, [0; 4])
+    }
+
+    /// Create a user packet with explicit status and payload.
+    pub fn user_with_data(key: PortKey, status: i32, user: [u64; 4]) -> Self {
         Self {
             key,
             kind: PacketKind::User,
             waitable: 0,
             observed: Signals::NONE,
             count: 0,
+            status,
+            user,
         }
     }
 
@@ -70,6 +81,8 @@ impl Packet {
             waitable,
             observed,
             count,
+            status: 0,
+            user: [0; 4],
         }
     }
 }

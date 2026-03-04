@@ -101,13 +101,13 @@ fn sys_object_wait_async(_args: [u64; 6]) -> zx_status_t {
     ZX_ERR_NOT_SUPPORTED
 }
 
-fn sys_port_create(_args: [u64; 6]) -> zx_status_t {
-    let options = match u32::try_from(_args[0]) {
+fn sys_port_create(args: [u64; 6]) -> zx_status_t {
+    let options = match u32::try_from(args[0]) {
         Ok(v) => v,
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
 
-    let out_ptr = _args[1] as *mut zx_handle_t;
+    let out_ptr = args[1] as *mut zx_handle_t;
     if out_ptr.is_null() {
         return ZX_ERR_INVALID_ARGS;
     }
@@ -125,8 +125,23 @@ fn sys_port_create(_args: [u64; 6]) -> zx_status_t {
     ZX_OK
 }
 
-fn sys_port_queue(_args: [u64; 6]) -> zx_status_t {
-    ZX_ERR_NOT_SUPPORTED
+fn sys_port_queue(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let packet_ptr = args[1] as *const zx_port_packet_t;
+    if packet_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    // SAFETY: for current bring-up we trust the caller-provided pointer; later
+    // phases will replace this with strict copyin validation.
+    let packet = unsafe { packet_ptr.read() };
+    match crate::object::queue_port_packet(handle, packet) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
 }
 
 fn sys_port_wait(args: [u64; 6]) -> zx_status_t {
@@ -134,8 +149,20 @@ fn sys_port_wait(args: [u64; 6]) -> zx_status_t {
         Ok(v) => v,
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
-    match crate::object::ensure_port_handle(handle) {
-        Ok(()) => ZX_ERR_NOT_SUPPORTED,
+    let out_ptr = args[2] as *mut zx_port_packet_t;
+    if out_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    match crate::object::wait_port_packet(handle) {
+        Ok(packet) => {
+            // SAFETY: for current bring-up we trust the caller-provided pointer; later
+            // phases will replace this with strict copyout validation.
+            unsafe {
+                out_ptr.write(packet);
+            }
+            ZX_OK
+        }
         Err(e) => e,
     }
 }
@@ -172,8 +199,10 @@ fn sys_timer_set(args: [u64; 6]) -> zx_status_t {
         Ok(v) => v,
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
-    match crate::object::ensure_timer_handle(handle) {
-        Ok(()) => ZX_ERR_NOT_SUPPORTED,
+    let deadline = args[1] as i64;
+    let slack = args[2] as i64;
+    match crate::object::timer_set(handle, deadline, slack) {
+        Ok(()) => ZX_OK,
         Err(e) => e,
     }
 }
@@ -183,8 +212,8 @@ fn sys_timer_cancel(args: [u64; 6]) -> zx_status_t {
         Ok(v) => v,
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
-    match crate::object::ensure_timer_handle(handle) {
-        Ok(()) => ZX_ERR_NOT_SUPPORTED,
+    match crate::object::timer_cancel(handle) {
+        Ok(()) => ZX_OK,
         Err(e) => e,
     }
 }
