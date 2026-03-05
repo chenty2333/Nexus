@@ -54,6 +54,9 @@ pub fn init(
     page_fault_handler: usize,
     gp_fault_handler: usize,
     double_fault_handler: usize,
+    timer_handler: usize,
+    apic_spurious_handler: usize,
+    apic_error_handler: usize,
 ) {
     let selector = current_cs();
 
@@ -78,7 +81,20 @@ pub fn init(
         IDT[14] = IdtEntry::new(page_fault_handler, selector, kernel_int_gate, 0);
         IDT[13] = IdtEntry::new(gp_fault_handler, selector, kernel_int_gate, 0);
         IDT[8] = IdtEntry::new(double_fault_handler, selector, kernel_int_gate, 1);
+
+        // Local APIC IRQs (kernel-only).
+        IDT[crate::arch::apic::TIMER_VECTOR] =
+            IdtEntry::new(timer_handler, selector, kernel_int_gate, 0);
+        IDT[crate::arch::apic::SPURIOUS_VECTOR] =
+            IdtEntry::new(apic_spurious_handler, selector, kernel_int_gate, 0);
+        IDT[crate::arch::apic::ERROR_VECTOR] =
+            IdtEntry::new(apic_error_handler, selector, kernel_int_gate, 0);
     }
+    load_idt();
+}
+
+/// Load the current static IDT on the calling CPU.
+pub fn load() {
     load_idt();
 }
 

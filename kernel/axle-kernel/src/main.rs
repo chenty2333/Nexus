@@ -12,6 +12,7 @@ mod kalloc;
 mod object;
 mod smp;
 mod syscall;
+mod time;
 mod trap;
 mod userspace;
 
@@ -31,11 +32,19 @@ pub extern "C" fn _start() -> ! {
     kprintln!("Axle kernel: hello from _start()");
     kprintln!("(Phase B skeleton)");
 
-    // TODO(B): install IDT, enable interrupts, init heap, bring up SMP, etc.
     syscall::init();
     trap::init();
+
+    // Hardware interrupt bring-up.
+    arch::pic::mask_all();
+    time::init();
+    arch::timer::init_bsp();
+
+    // Mutate bootstrap page tables (userspace map) before bringing up APs.
+    let user_entry = userspace::prepare();
+
     smp::init();
 
     // Bring-up bridge: execute conformance in ring3 (userspace) and report results via `int3`.
-    userspace::run();
+    userspace::enter(user_entry);
 }

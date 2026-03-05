@@ -192,6 +192,14 @@ impl TimerService {
         self.fire_due(clock.now())
     }
 
+    /// Fire due timers for an externally managed time source.
+    ///
+    /// This is the kernel-facing API: the kernel owns the monotonic clock and
+    /// calls `poll(now)` from a timer interrupt or scheduler tick.
+    pub fn poll(&mut self, now: Time) -> alloc::vec::Vec<TimerId> {
+        self.fire_due(now)
+    }
+
     /// Fire due timers for current time `now`.
     fn fire_due(&mut self, now: Time) -> alloc::vec::Vec<TimerId> {
         let mut fired = alloc::vec::Vec::new();

@@ -232,12 +232,13 @@ fn sys_port_wait(args: [u64; 6]) -> zx_status_t {
         Ok(v) => v,
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
+    let deadline = args[1] as i64;
     let out_ptr = args[2] as *mut zx_port_packet_t;
     if out_ptr.is_null() {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    match crate::object::wait_port_packet(handle) {
+    match crate::object::port_wait(handle, deadline) {
         Ok(packet) => {
             if let Err(e) = copyout(out_ptr, packet) {
                 return e;

@@ -11,5 +11,8 @@ pub fn init() {
         arch::fault::page_fault_entry_addr(),
         arch::fault::gp_fault_entry_addr(),
         arch::fault::double_fault_entry_addr(),
+        arch::timer::entry_addr(),
+        arch::apic::spurious_entry_addr(),
+        arch::apic::error_entry_addr(),
     );
 }

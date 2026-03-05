@@ -6,8 +6,8 @@ use alloc::collections::BTreeMap;
 
 use axle_core::handle::Handle;
 use axle_core::{
-    CSpace, CSpaceError, Capability, FakeClock, Packet, PacketKind, Port, PortError, Signals,
-    TimerError, TimerId, TimerService, WaitAsyncOptions,
+    CSpace, CSpaceError, Capability, Packet, PacketKind, Port, PortError, Signals, TimerError,
+    TimerId, TimerService, WaitAsyncOptions,
 };
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
@@ -54,7 +54,6 @@ struct KernelState {
     cspace: CSpace,
     objects: BTreeMap<u64, KernelObject>,
     next_object_id: u64,
-    clock: FakeClock,
     timers: TimerService,
 }
 
@@ -64,7 +63,6 @@ impl KernelState {
             cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
             objects: BTreeMap::new(),
             next_object_id: 1,
-            clock: FakeClock::new(),
             timers: TimerService::new(),
         }
     }
@@ -186,8 +184,9 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
                 // Re-arming clears `SIGNALED`, which affects EDGE-triggered observers.
                 let _ = notify_waitable_signals_changed(state, object_id);
 
-                // For bring-up we only have a fake clock; fire due timers at current time.
-                let fired = fire_due_timers(state);
+                // Fire immediately if the deadline is already in the past.
+                let now = crate::time::now_ns();
+                let fired = poll_due_timers_at(state, now);
                 for fired_object_id in fired {
                     let _ = notify_waitable_signals_changed(state, fired_object_id);
                 }
@@ -284,6 +283,31 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
     })
 }
 
+/// Wait for a packet on a port until `deadline`.
+///
+/// - `deadline == 0`: non-blocking poll; returns `ZX_ERR_SHOULD_WAIT` if empty.
+/// - `deadline == i64::MAX`: wait forever.
+pub fn port_wait(handle: zx_handle_t, deadline: i64) -> Result<zx_port_packet_t, zx_status_t> {
+    loop {
+        match wait_port_packet(handle) {
+            Ok(pkt) => return Ok(pkt),
+            Err(ZX_ERR_SHOULD_WAIT) => {
+                if deadline == 0 {
+                    return Err(ZX_ERR_SHOULD_WAIT);
+                }
+                let now = crate::time::now_ns();
+                if deadline != i64::MAX && deadline <= now {
+                    return Err(ZX_ERR_TIMED_OUT);
+                }
+
+                x86_64::instructions::interrupts::enable_and_hlt();
+                x86_64::instructions::interrupts::disable();
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Snapshot current signals for a waitable object.
 pub fn object_signals(handle: zx_handle_t) -> Result<zx_signals_t, zx_status_t> {
     with_state_mut(|state| {
@@ -294,11 +318,10 @@ pub fn object_signals(handle: zx_handle_t) -> Result<zx_signals_t, zx_status_t> 
 
 /// Wait for one of the specified signals on a waitable object.
 ///
-/// This is a Phase-B bring-up implementation:
-/// - It blocks by spinning in the kernel (no scheduler yet).
-/// - A fake clock is advanced to drive timer deadlines.
-/// - When timers fire, `wait_async` observers are notified and ports can receive
-///   signal packets.
+/// Sweet-spot bring-up implementation:
+/// - no scheduler yet, but the CPU sleeps (`sti; hlt`) instead of busy-waiting
+/// - monotonic time comes from `time::now_ns()`
+/// - timer deadlines are driven by a periodic APIC timer interrupt
 pub fn object_wait_one(
     handle: zx_handle_t,
     watched: zx_signals_t,
@@ -310,44 +333,39 @@ pub fn object_wait_one(
     }
 
     loop {
-        // Lock scope so we can drop it before spinning.
-        let mut guard = STATE.lock();
-        let state = guard.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
-        let object_id = state.lookup_object_id(handle)?;
+        // Lock scope so we can drop it before sleeping.
+        let observed = {
+            let mut guard = STATE.lock();
+            let state = guard.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            let object_id = state.lookup_object_id(handle)?;
+            signals_for_object_id(state, object_id)?
+        };
 
-        let observed = signals_for_object_id(state, object_id)?;
         if observed.intersects(watched) {
             return Ok((ZX_OK, observed.bits()));
         }
 
-        let now = state.clock.now();
-        if deadline <= now {
+        let now = crate::time::now_ns();
+        if deadline != i64::MAX && deadline <= now {
+            // Ensure we don't miss a timer that becomes due right at the timeout
+            // boundary (coarse periodic ticks can otherwise make this flaky).
+            on_tick();
+
+            let observed = {
+                let mut guard = STATE.lock();
+                let state = guard.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+                let object_id = state.lookup_object_id(handle)?;
+                signals_for_object_id(state, object_id)?
+            };
+            if observed.intersects(watched) {
+                return Ok((ZX_OK, observed.bits()));
+            }
             return Ok((ZX_ERR_TIMED_OUT, observed.bits()));
         }
 
-        // Drive time forward deterministically in bring-up.
-        //
-        // - For finite deadlines, advance straight to `deadline`.
-        // - For "infinite" waits, advance to the next timer deadline if any; otherwise spin.
-        let target = if deadline == i64::MAX {
-            match state.timers.next_deadline() {
-                Some(t) => t,
-                None => {
-                    drop(guard);
-                    core::hint::spin_loop();
-                    continue;
-                }
-            }
-        } else {
-            deadline
-        };
-
-        // Advance time and fire due timers.
-        let fired = fire_due_timers_at(state, target);
-        for fired_object_id in fired {
-            let _ = notify_waitable_signals_changed(state, fired_object_id);
-        }
-        // Loop to re-check observed signals after potential updates.
+        // Sleep until the next interrupt (timer tick, IPI, ...), then re-check.
+        x86_64::instructions::interrupts::enable_and_hlt();
+        x86_64::instructions::interrupts::disable();
     }
 }
 
@@ -400,6 +418,20 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
         state.cspace.close(h).map_err(map_lookup_error)?;
         Ok(())
     })
+}
+
+/// Called from the timer interrupt handler.
+///
+/// Fires due timers and notifies `wait_async` observers.
+pub fn on_tick() {
+    let _ = with_state_mut(|state| {
+        let now = crate::time::now_ns();
+        let fired = poll_due_timers_at(state, now);
+        for fired_object_id in fired {
+            let _ = notify_waitable_signals_changed(state, fired_object_id);
+        }
+        Ok(())
+    });
 }
 
 fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), zx_status_t> {
@@ -467,12 +499,8 @@ fn notify_waitable_signals_changed(
     Ok(())
 }
 
-fn fire_due_timers(state: &mut KernelState) -> alloc::vec::Vec<u64> {
-    fire_due_timers_at(state, state.clock.now())
-}
-
-fn fire_due_timers_at(state: &mut KernelState, new_time: i64) -> alloc::vec::Vec<u64> {
-    let fired = state.timers.advance_clock(&mut state.clock, new_time);
+fn poll_due_timers_at(state: &mut KernelState, now: i64) -> alloc::vec::Vec<u64> {
+    let fired = state.timers.poll(now);
     if fired.is_empty() {
         return alloc::vec::Vec::new();
     }

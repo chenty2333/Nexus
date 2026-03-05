@@ -4,6 +4,8 @@
 axle_user_prog_start:
 // rbx = shared base (USER_SHARED_VA)
 movabs $0x0000000100001000, %rbx
+// r12 = t0_ns baseline provided by the kernel (slot 511)
+mov 8*511(%rbx), %r12
 
 // Helper macro style:
 // - syscall nr in rax
@@ -266,20 +268,22 @@ mov %rax, 8*27(%rbx)
 mov (%rcx), %rax
 mov %rax, 8*28(%rbx)
 
-// timer_set(deadline=123456)
+// timer_set(deadline=t0+500ms)
 mov 0x218(%rbx), %rdi
-movabs $123456, %rsi
+mov %r12, %rsi
+add $500000000, %rsi
 xor %rdx, %rdx
 movabs $7, %rax
 int $0x80
 mov %rax, 8*29(%rbx)
 
-// object_wait_one(timer, TIMER_SIGNALED, deadline=123455, observed=&obs2) should time out
+// object_wait_one(timer, TIMER_SIGNALED, deadline=t0+200ms, observed=&obs2) should time out
 lea 0x230(%rbx), %rcx
 movq $0, (%rcx)
 mov 0x218(%rbx), %rdi
 movl $0x8, %esi
-movabs $123455, %rdx
+mov %r12, %rdx
+add $200000000, %rdx
 mov %rcx, %r10
 movabs $1, %rax
 int $0x80
@@ -287,12 +291,13 @@ mov %rax, 8*37(%rbx)
 mov (%rcx), %rax
 mov %rax, 8*38(%rbx)
 
-// object_wait_one(timer, TIMER_SIGNALED, deadline=123456, observed=&obs3) should be OK
+// object_wait_one(timer, TIMER_SIGNALED, deadline=t0+500ms, observed=&obs3) should be OK
 lea 0x238(%rbx), %rcx
 movq $0, (%rcx)
 mov 0x218(%rbx), %rdi
 movl $0x8, %esi
-movabs $123456, %rdx
+mov %r12, %rdx
+add $500000000, %rdx
 mov %rcx, %r10
 movabs $1, %rax
 int $0x80

@@ -76,6 +76,7 @@ const SLOT_WAIT_ONE_FUTURE_OK: usize = 39;
 const SLOT_WAIT_ONE_FUTURE_OK_OBS: usize = 40;
 
 const SLOT_MAX: usize = SLOT_WAIT_ONE_FUTURE_OK_OBS;
+const SLOT_T0_NS: usize = 511;
 
 #[repr(align(4096))]
 struct AlignedPage([u8; 4096]);
@@ -360,7 +361,7 @@ pub fn on_breakpoint() -> ! {
 }
 
 /// Enter ring3 and run the embedded userspace conformance program.
-pub fn run() -> ! {
+pub fn prepare() -> u64 {
     map_userspace_pages();
     let entry = try_load_user_program_from_qemu_loader().unwrap_or_else(|| {
         load_user_program_embedded();
@@ -372,7 +373,15 @@ pub fn run() -> ! {
     for i in 0..=SLOT_MAX {
         slots[i] = 0;
     }
+    // Provide a monotonic baseline so the runner can construct future deadlines
+    // without introducing a new syscall ABI.
+    slots[SLOT_T0_NS] = crate::time::now_ns() as u64;
 
+    entry
+}
+
+/// Enter ring3 at `entry` and run until the conformance runner exits via `int3`.
+pub fn enter(entry: u64) -> ! {
     let selectors = crate::arch::gdt::init();
 
     // SAFETY: we build a valid iret frame to transition to ring3 using the installed GDT selectors.
@@ -402,6 +411,12 @@ pub fn run() -> ! {
             options(noreturn),
         );
     }
+}
+
+/// Convenience wrapper (prepare + enter).
+pub fn run() -> ! {
+    let entry = prepare();
+    enter(entry)
 }
 
 // --- Embedded userspace program (one page) ---
