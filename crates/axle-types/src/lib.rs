@@ -37,11 +37,55 @@ pub struct zx_packet_user_t {
     pub u64: [u64; 4],
 }
 
+/// Zircon signal packet payload (32 bytes).
+///
+/// This corresponds to `zx_packet_signal_t` (used with `ZX_PKT_TYPE_SIGNAL_ONE`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct zx_packet_signal_t {
+    /// Watched signal mask that triggered the packet.
+    pub trigger: zx_signals_t,
+    /// Observed signals at the time of delivery.
+    pub observed: zx_signals_t,
+    /// Delivery count (merged on overflow in some port implementations).
+    pub count: u64,
+    /// Monotonic timestamp (when requested via wait-async options).
+    pub timestamp: zx_time_t,
+    /// Reserved.
+    pub reserved1: u64,
+}
+
+impl zx_packet_signal_t {
+    /// Encode into the raw 32-byte union payload shape (`zx_packet_user_t` view).
+    ///
+    /// This avoids Rust unions in the public ABI while preserving layout
+    /// compatibility with Zircon's `zx_port_packet_t` union.
+    pub const fn to_user(self) -> zx_packet_user_t {
+        let first = (self.trigger as u64) | ((self.observed as u64) << 32);
+        zx_packet_user_t {
+            u64: [first, self.count, self.timestamp as u64, self.reserved1],
+        }
+    }
+
+    /// Decode from the raw 32-byte union payload shape (`zx_packet_user_t` view).
+    pub const fn from_user(user: zx_packet_user_t) -> Self {
+        let first = user.u64[0];
+        Self {
+            trigger: first as zx_signals_t,
+            observed: (first >> 32) as zx_signals_t,
+            count: user.u64[1],
+            timestamp: user.u64[2] as zx_time_t,
+            reserved1: user.u64[3],
+        }
+    }
+}
+
 /// Zircon port packet (minimal Phase-B ABI shape).
 ///
 /// For bootstrap we model the user-packet path used by `zx_port_queue` and
 /// `zx_port_wait`. Additional packet variants can be added later without
-/// changing this baseline layout.
+/// changing this baseline layout: the `user` payload is the 32-byte union area
+/// used by Zircon (user packets, signal packets, etc).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct zx_port_packet_t {
@@ -56,6 +100,7 @@ pub struct zx_port_packet_t {
 }
 
 const _: [(); 32] = [(); core::mem::size_of::<zx_packet_user_t>()];
+const _: [(); 32] = [(); core::mem::size_of::<zx_packet_signal_t>()];
 const _: [(); 48] = [(); core::mem::size_of::<zx_port_packet_t>()];
 const _: [(); 8] = [(); core::mem::align_of::<zx_port_packet_t>()];
 
@@ -77,6 +122,22 @@ pub mod packet {
 
     /// User-defined packet (`zx_port_queue`).
     pub const ZX_PKT_TYPE_USER: zx_packet_type_t = 0;
+    /// Signal packet delivered by `zx_object_wait_async`.
+    pub const ZX_PKT_TYPE_SIGNAL_ONE: zx_packet_type_t = 1;
+}
+
+/// Options for `zx_object_wait_async`.
+///
+/// Values follow Zircon's `zircon/syscalls/port.h`.
+pub mod wait_async {
+    /// One-shot (default).
+    pub const ZX_WAIT_ASYNC_ONCE: u32 = 0;
+    /// Request monotonic timestamp in packets.
+    pub const ZX_WAIT_ASYNC_TIMESTAMP: u32 = 1;
+    /// Edge-triggered: only fire on transition from not-satisfied to satisfied.
+    pub const ZX_WAIT_ASYNC_EDGE: u32 = 2;
+    /// Request boot timestamp (not yet modeled by Axle).
+    pub const ZX_WAIT_ASYNC_BOOT_TIMESTAMP: u32 = 4;
 }
 
 /// Generated syscall numbers (ABI).
