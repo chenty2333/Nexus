@@ -9,6 +9,7 @@ pub mod idt;
 pub mod int80;
 pub mod log;
 pub mod pvh;
+pub mod qemu;
 pub mod serial;
 
 /// Early arch init (before heap/interrupts).

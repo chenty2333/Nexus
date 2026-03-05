@@ -308,7 +308,8 @@ fn shared_slots() -> &'static mut [u64] {
 pub fn on_breakpoint() -> ! {
     let slots = shared_slots();
     if slots[SLOT_OK] != 1 {
-        panic!("userspace: conformance reported failure (ok=0)");
+        crate::kprintln!("userspace: conformance reported failure (ok=0)");
+        crate::arch::qemu::exit_failure();
     }
 
     crate::kprintln!(
@@ -355,7 +356,7 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_TIMER_H]
     );
 
-    crate::arch::cpu::halt_loop();
+    crate::arch::qemu::exit_success();
 }
 
 /// Enter ring3 and run the embedded userspace conformance program.
