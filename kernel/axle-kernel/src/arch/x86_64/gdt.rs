@@ -27,12 +27,18 @@ pub struct Selectors {
 }
 
 const RING0_STACK_SIZE: u64 = 16 * 1024;
+const IST_STACK_SIZE: u64 = 16 * 1024;
 
 #[repr(align(16))]
 struct AlignedRing0Stack([u8; RING0_STACK_SIZE as usize]);
 
 // 16 KiB ring0 stack for ring3->ring0 transitions.
 static mut RING0_STACK: AlignedRing0Stack = AlignedRing0Stack([0; RING0_STACK_SIZE as usize]);
+
+#[repr(align(16))]
+struct AlignedIstStack([u8; IST_STACK_SIZE as usize]);
+
+static mut IST1_STACK: AlignedIstStack = AlignedIstStack([0; IST_STACK_SIZE as usize]);
 
 static TSS: Once<TaskStateSegment> = Once::new();
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
@@ -47,6 +53,11 @@ pub fn init() -> &'static Selectors {
         let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(RING0_STACK));
         let stack_end = stack_start + RING0_STACK_SIZE;
         tss.privilege_stack_table[0] = stack_end;
+
+        // IST1 for double fault. (IDT uses IST index 1, which maps to table[0].)
+        let ist_start = VirtAddr::from_ptr(core::ptr::addr_of!(IST1_STACK));
+        let ist_end = ist_start + IST_STACK_SIZE;
+        tss.interrupt_stack_table[0] = ist_end;
         tss
     });
 

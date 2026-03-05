@@ -3,6 +3,7 @@
 pub mod breakpoint;
 pub mod cpu;
 pub mod cpuid;
+pub mod fault;
 pub mod gdt;
 pub mod idt;
 pub mod int80;
