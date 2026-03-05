@@ -13,6 +13,7 @@ mod object;
 mod smp;
 mod syscall;
 mod trap;
+mod userspace;
 
 use core::panic::PanicInfo;
 
@@ -35,7 +36,6 @@ pub extern "C" fn _start() -> ! {
     trap::init();
     smp::init();
 
-    bringup::int80_conformance::run();
-
-    arch::cpu::halt_loop();
+    // Bring-up bridge: execute conformance in ring3 (userspace) and report results via `int3`.
+    userspace::run();
 }

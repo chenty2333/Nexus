@@ -75,16 +75,19 @@ pvh_gdt_ptr:
 
     .section .data.axle_pvh_pt, "aw"
     .align 4096
+    .global pvh_pml4
 pvh_pml4:
     .quad pvh_pdpt + 0x003
     .zero 4096 - 8
 
     .align 4096
+    .global pvh_pdpt
 pvh_pdpt:
     .quad pvh_pd + 0x003
     .zero 4096 - 8
 
     .align 4096
+    .global pvh_pd
 pvh_pd:
     .set pvh_i, 0
     .rept 512

@@ -11,7 +11,11 @@ use spin::Mutex;
 const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB bootstrap heap.
 
 static NEXT: Mutex<usize> = Mutex::new(0);
-static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+
+#[repr(align(4096))]
+struct AlignedHeap([u8; HEAP_SIZE]);
+
+static mut HEAP: AlignedHeap = AlignedHeap([0; HEAP_SIZE]);
 
 /// Global bootstrap allocator.
 pub struct BootstrapAllocator;
@@ -26,16 +30,18 @@ const fn align_up(v: usize, align: usize) -> usize {
 unsafe impl GlobalAlloc for BootstrapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut next = NEXT.lock();
-        let start = align_up(*next, layout.align());
-        let end = start.saturating_add(layout.size());
-        if end > HEAP_SIZE {
+        let heap_base = core::ptr::addr_of_mut!(HEAP) as usize;
+        let start_addr = align_up(heap_base.saturating_add(*next), layout.align());
+        let end_addr = start_addr.saturating_add(layout.size());
+        let heap_end = heap_base.saturating_add(HEAP_SIZE);
+        if end_addr > heap_end {
             return null_mut();
         }
 
-        *next = end;
+        *next = end_addr - heap_base;
 
-        // SAFETY: `start..end` was range-checked against the static heap bounds.
-        unsafe { (core::ptr::addr_of_mut!(HEAP) as *mut u8).add(start) }
+        // SAFETY: address range was checked against the static heap bounds.
+        start_addr as *mut u8
     }
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {

@@ -22,6 +22,7 @@ use axle_types::wait_async::{
 use axle_types::{
     zx_clock_t, zx_duration_t, zx_handle_t, zx_port_packet_t, zx_signals_t, zx_status_t, zx_time_t,
 };
+use core::mem::size_of;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
 pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 9] = [
@@ -85,6 +86,31 @@ pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame) {
     frame.set_status(status);
 }
 
+fn copyin<T: Copy>(ptr: *const T) -> Result<T, zx_status_t> {
+    if ptr.is_null() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if !crate::userspace::validate_user_ptr(ptr as u64, size_of::<T>()) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    // SAFETY: pointer validated to be within a mapped userspace page region.
+    unsafe { Ok(core::ptr::read_unaligned(ptr)) }
+}
+
+fn copyout<T: Copy>(ptr: *mut T, v: T) -> Result<(), zx_status_t> {
+    if ptr.is_null() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if !crate::userspace::validate_user_ptr(ptr as u64, size_of::<T>()) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    // SAFETY: pointer validated to be within a mapped userspace page region.
+    unsafe {
+        core::ptr::write_unaligned(ptr, v);
+    }
+    Ok(())
+}
+
 fn sys_handle_close(args: [u64; 6]) -> zx_status_t {
     let handle = match u32::try_from(args[0]) {
         Ok(v) => v,
@@ -124,8 +150,8 @@ fn sys_object_wait_one(_args: [u64; 6]) -> zx_status_t {
 
     // SAFETY: for current bring-up we trust the caller-provided pointer; later
     // phases will replace this with strict copyout validation.
-    unsafe {
-        observed_ptr.write(observed);
+    if let Err(e) = copyout(observed_ptr, observed) {
+        return e;
     }
 
     if (observed & signals) != 0 {
@@ -186,10 +212,8 @@ fn sys_port_create(args: [u64; 6]) -> zx_status_t {
         Err(e) => return e,
     };
 
-    // SAFETY: for current bring-up we trust the caller-provided pointer; later
-    // phases will replace this with strict copyout validation.
-    unsafe {
-        out_ptr.write(h);
+    if let Err(e) = copyout(out_ptr, h) {
+        return e;
     }
     ZX_OK
 }
@@ -204,9 +228,10 @@ fn sys_port_queue(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    // SAFETY: for current bring-up we trust the caller-provided pointer; later
-    // phases will replace this with strict copyin validation.
-    let packet = unsafe { packet_ptr.read() };
+    let packet = match copyin(packet_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     match crate::object::queue_port_packet(handle, packet) {
         Ok(()) => ZX_OK,
         Err(e) => e,
@@ -225,10 +250,8 @@ fn sys_port_wait(args: [u64; 6]) -> zx_status_t {
 
     match crate::object::wait_port_packet(handle) {
         Ok(packet) => {
-            // SAFETY: for current bring-up we trust the caller-provided pointer; later
-            // phases will replace this with strict copyout validation.
-            unsafe {
-                out_ptr.write(packet);
+            if let Err(e) = copyout(out_ptr, packet) {
+                return e;
             }
             ZX_OK
         }
@@ -255,10 +278,8 @@ fn sys_timer_create(args: [u64; 6]) -> zx_status_t {
         Err(e) => return e,
     };
 
-    // SAFETY: for current bring-up we trust the caller-provided pointer; later
-    // phases will replace this with strict copyout validation.
-    unsafe {
-        out_ptr.write(h);
+    if let Err(e) = copyout(out_ptr, h) {
+        return e;
     }
     ZX_OK
 }

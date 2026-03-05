@@ -1,7 +1,9 @@
 //! x86_64 architecture support (very early bring-up).
 
+pub mod breakpoint;
 pub mod cpu;
 pub mod cpuid;
+pub mod gdt;
 pub mod idt;
 pub mod int80;
 pub mod log;
@@ -13,4 +15,7 @@ pub fn init() {
     // Safe to call multiple times; serial init is idempotent.
     serial::init();
     cpuid::log_boot_cpu_info();
+
+    // Install a real GDT/TSS so ring3 can enter the kernel through the IDT.
+    let _ = gdt::init();
 }
