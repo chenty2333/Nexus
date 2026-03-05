@@ -44,6 +44,8 @@ pub struct Packet {
     pub kind: PacketKind,
     /// For signal packets: the object being observed.
     pub waitable: WaitableId,
+    /// For signal packets: watched signal mask that triggered this observer.
+    pub trigger: Signals,
     /// For signal packets: observed signals snapshot (often OR-merged on overflow).
     pub observed: Signals,
     /// For signal packets: merged trigger count (>= 1 for signal packets, 0 for user packets).
@@ -66,6 +68,7 @@ impl Packet {
             key,
             kind: PacketKind::User,
             waitable: 0,
+            trigger: Signals::NONE,
             observed: Signals::NONE,
             count: 0,
             status,
@@ -74,11 +77,18 @@ impl Packet {
     }
 
     /// Create a signal packet.
-    pub fn signal(key: PortKey, waitable: WaitableId, observed: Signals, count: u32) -> Self {
+    pub fn signal(
+        key: PortKey,
+        waitable: WaitableId,
+        trigger: Signals,
+        observed: Signals,
+        count: u32,
+    ) -> Self {
         Self {
             key,
             kind: PacketKind::Signal,
             waitable,
+            trigger,
             observed,
             count,
             status: 0,
@@ -110,6 +120,7 @@ pub enum PortError {
 #[derive(Clone, Copy, Debug)]
 struct PendingState {
     count: u32,
+    trigger: Signals,
     observed: Signals,
 }
 
@@ -165,6 +176,22 @@ impl Port {
     /// Returns `true` if there are no queued packets.
     pub fn is_empty(&self) -> bool {
         self.q.is_empty()
+    }
+
+    /// Current signal state for this port object.
+    ///
+    /// We follow Zircon's convention where ports become `READABLE` when at least
+    /// one packet is queued. `WRITABLE` reflects whether a user packet could be
+    /// queued without hitting backpressure.
+    pub fn signals(&self) -> Signals {
+        let mut s = Signals::NONE;
+        if !self.q.is_empty() {
+            s = s | Signals::OBJECT_READABLE;
+        }
+        if self.user_in_q < self.user_quota() && self.q.len() < self.capacity {
+            s = s | Signals::OBJECT_WRITABLE;
+        }
+        s
     }
 
     /// Queue capacity.
@@ -293,7 +320,12 @@ impl Port {
             };
 
             if fire {
-                self.enqueue_or_pending(k, current);
+                let trigger = self
+                    .observers
+                    .get(&k)
+                    .map(|obs| obs.watched)
+                    .unwrap_or(Signals::NONE);
+                self.enqueue_or_pending(k, trigger, current);
             }
         }
 
@@ -301,10 +333,10 @@ impl Port {
         self.flush_pending();
     }
 
-    fn enqueue_or_pending(&mut self, k: (WaitableId, PortKey), current: Signals) {
+    fn enqueue_or_pending(&mut self, k: (WaitableId, PortKey), trigger: Signals, current: Signals) {
         // If we have space, enqueue now (and remove observer) without borrowing it.
         if self.q.len() < self.capacity {
-            let pkt = Packet::signal(k.1, k.0, current, 1);
+            let pkt = Packet::signal(k.1, k.0, trigger, current, 1);
             self.q.push_back(pkt);
             // remove observer (one-shot).
             let _ = self.observers.remove(&k);
@@ -320,6 +352,7 @@ impl Port {
             None => {
                 obs.pending = Some(PendingState {
                     count: 1,
+                    trigger,
                     observed: current,
                 });
                 self.pending_order.push_back(k);
@@ -346,7 +379,7 @@ impl Port {
             };
 
             // Enqueue pending packet to the back (preserves FIFO among already queued packets).
-            let pkt = Packet::signal(k.1, k.0, p.observed, p.count);
+            let pkt = Packet::signal(k.1, k.0, p.trigger, p.observed, p.count);
             self.q.push_back(pkt);
 
             // Remove observer (one-shot completion).
