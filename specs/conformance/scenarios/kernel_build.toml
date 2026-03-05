@@ -30,12 +30,27 @@ queue = 0
 wait = 0
 timer_set = 0
 timer_cancel = 0
+timer_close = 0
 close = 0
 
 [assertions.error_code]
 unknown = -13
+close_invalid = -11
+port_create_bad_opts = -10
+port_create_null_out = -10
 bad_wait = -11
+port_wait_null_out = -10
 empty_wait = -22
+port_queue_null_pkt = -10
+port_queue_bad_type = -10
+timer_create_bad_opts = -10
+timer_create_bad_clock = -10
+timer_create_null_out = -10
+port_wait_wrong_type = -12
+port_queue_wrong_type = -12
+timer_set_wrong_type = -12
+timer_cancel_wrong_type = -12
+timer_close_again = -11
 close_again = -11
 
 [elf_check]
