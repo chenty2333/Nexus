@@ -6,8 +6,8 @@ use alloc::collections::BTreeMap;
 
 use axle_core::handle::Handle;
 use axle_core::{
-    CSpace, CSpaceError, Capability, FakeClock, Packet, PacketKind, Port, PortError, TimerError,
-    Signals, TimerId, TimerService, WaitAsyncOptions,
+    CSpace, CSpaceError, Capability, FakeClock, Packet, PacketKind, Port, PortError, Signals,
+    TimerError, TimerId, TimerService, WaitAsyncOptions,
 };
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
@@ -418,7 +418,9 @@ fn fire_due_timers(state: &mut KernelState) -> alloc::vec::Vec<u64> {
     let mut out = alloc::vec::Vec::new();
     for fired_id in fired {
         for (object_id, obj) in state.objects.iter() {
-            let KernelObject::Timer(t) = obj else { continue };
+            let KernelObject::Timer(t) = obj else {
+                continue;
+            };
             if t.timer_id == fired_id {
                 out.push(*object_id);
             }

@@ -10,11 +10,13 @@ use axle_types::status::{
     ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE, ZX_OK,
 };
 use axle_types::syscall_numbers::{
-    AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
-    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE,
-    AXLE_SYS_TIMER_SET,
+    AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
+    AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_TIMER_CANCEL,
+    AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET,
 };
-use axle_types::{zx_handle_t, zx_packet_signal_t, zx_packet_user_t, zx_port_packet_t, zx_signals_t, zx_status_t};
+use axle_types::{
+    zx_handle_t, zx_packet_signal_t, zx_packet_user_t, zx_port_packet_t, zx_signals_t, zx_status_t,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct Summary {
@@ -139,12 +141,27 @@ fn run_int80_conformance() -> Result<Summary, Failure> {
     let mut ignored_handle: zx_handle_t = 0;
     let port_create_bad_opts = run_int80(
         AXLE_SYS_PORT_CREATE as u64,
-        [1, (&mut ignored_handle as *mut zx_handle_t) as u64, 0, 0, 0, 0],
+        [
+            1,
+            (&mut ignored_handle as *mut zx_handle_t) as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
     );
-    expect("port_create_bad_opts", port_create_bad_opts, ZX_ERR_INVALID_ARGS)?;
+    expect(
+        "port_create_bad_opts",
+        port_create_bad_opts,
+        ZX_ERR_INVALID_ARGS,
+    )?;
 
     let port_create_null_out = run_int80(AXLE_SYS_PORT_CREATE as u64, [0, 0, 0, 0, 0, 0]);
-    expect("port_create_null_out", port_create_null_out, ZX_ERR_INVALID_ARGS)?;
+    expect(
+        "port_create_null_out",
+        port_create_null_out,
+        ZX_ERR_INVALID_ARGS,
+    )?;
 
     let mut bad_wait_packet = zx_port_packet_t::default();
     let bad_wait = run_int80(
@@ -171,7 +188,11 @@ fn run_int80_conformance() -> Result<Summary, Failure> {
     }
 
     let port_wait_null_out = run_int80(AXLE_SYS_PORT_WAIT as u64, [port_h as u64, 0, 0, 0, 0, 0]);
-    expect("port_wait_null_out", port_wait_null_out, ZX_ERR_INVALID_ARGS)?;
+    expect(
+        "port_wait_null_out",
+        port_wait_null_out,
+        ZX_ERR_INVALID_ARGS,
+    )?;
 
     let mut empty_wait_packet = zx_port_packet_t::default();
     let empty_wait = run_int80(
@@ -188,7 +209,11 @@ fn run_int80_conformance() -> Result<Summary, Failure> {
     expect("port_wait_empty", empty_wait, ZX_ERR_SHOULD_WAIT)?;
 
     let port_queue_null_pkt = run_int80(AXLE_SYS_PORT_QUEUE as u64, [port_h as u64, 0, 0, 0, 0, 0]);
-    expect("port_queue_null_pkt", port_queue_null_pkt, ZX_ERR_INVALID_ARGS)?;
+    expect(
+        "port_queue_null_pkt",
+        port_queue_null_pkt,
+        ZX_ERR_INVALID_ARGS,
+    )?;
 
     let bad_type_packet = zx_port_packet_t {
         key: 0,
@@ -207,7 +232,11 @@ fn run_int80_conformance() -> Result<Summary, Failure> {
             0,
         ],
     );
-    expect("port_queue_bad_type", port_queue_bad_type, ZX_ERR_INVALID_ARGS)?;
+    expect(
+        "port_queue_bad_type",
+        port_queue_bad_type,
+        ZX_ERR_INVALID_ARGS,
+    )?;
 
     let tx_packet = zx_port_packet_t {
         key: 0xAA55_AA55_AA55_AA55,
@@ -259,7 +288,11 @@ fn run_int80_conformance() -> Result<Summary, Failure> {
             0,
         ],
     );
-    expect("timer_create_bad_opts", timer_create_bad_opts, ZX_ERR_INVALID_ARGS)?;
+    expect(
+        "timer_create_bad_opts",
+        timer_create_bad_opts,
+        ZX_ERR_INVALID_ARGS,
+    )?;
 
     let timer_create_bad_clock = run_int80(
         AXLE_SYS_TIMER_CREATE as u64,
@@ -337,10 +370,7 @@ fn run_int80_conformance() -> Result<Summary, Failure> {
     expect("wait_async", wait_async, ZX_OK)?;
 
     // Bring-up: deadline <= 0 fires immediately (fake clock starts at 0).
-    let timer_set_immediate = run_int80(
-        AXLE_SYS_TIMER_SET as u64,
-        [timer_h as u64, 0, 0, 0, 0, 0],
-    );
+    let timer_set_immediate = run_int80(AXLE_SYS_TIMER_SET as u64, [timer_h as u64, 0, 0, 0, 0, 0]);
     expect("timer_set_immediate", timer_set_immediate, ZX_OK)?;
 
     let mut signal_packet = zx_port_packet_t::default();
@@ -402,7 +432,11 @@ fn run_int80_conformance() -> Result<Summary, Failure> {
             0,
         ],
     );
-    expect("port_wait_wrong_type", port_wait_wrong_type, ZX_ERR_WRONG_TYPE)?;
+    expect(
+        "port_wait_wrong_type",
+        port_wait_wrong_type,
+        ZX_ERR_WRONG_TYPE,
+    )?;
 
     let port_queue_wrong_type = run_int80(
         AXLE_SYS_PORT_QUEUE as u64,
@@ -451,15 +485,16 @@ fn run_int80_conformance() -> Result<Summary, Failure> {
     );
     expect("timer_cancel", timer_cancel, ZX_OK)?;
 
-    let timer_close = run_int80(AXLE_SYS_HANDLE_CLOSE as u64, [timer_h as u64, 0, 0, 0, 0, 0]);
+    let timer_close = run_int80(
+        AXLE_SYS_HANDLE_CLOSE as u64,
+        [timer_h as u64, 0, 0, 0, 0, 0],
+    );
     expect("timer_close", timer_close, ZX_OK)?;
-    let timer_close_again =
-        run_int80(AXLE_SYS_HANDLE_CLOSE as u64, [timer_h as u64, 0, 0, 0, 0, 0]);
-    expect(
-        "timer_close_again",
-        timer_close_again,
-        ZX_ERR_BAD_HANDLE,
-    )?;
+    let timer_close_again = run_int80(
+        AXLE_SYS_HANDLE_CLOSE as u64,
+        [timer_h as u64, 0, 0, 0, 0, 0],
+    );
+    expect("timer_close_again", timer_close_again, ZX_ERR_BAD_HANDLE)?;
 
     let close = run_int80(AXLE_SYS_HANDLE_CLOSE as u64, [port_h as u64, 0, 0, 0, 0, 0]);
     expect("handle_close", close, ZX_OK)?;

@@ -172,10 +172,18 @@ pub fn run_int80_conformance() -> Result<Int80ConformanceSummary, Int80Conforman
         ],
     );
     if wait_status != ZX_OK {
-        return Err(Int80ConformanceFailure::status("port_wait", ZX_OK, wait_status));
+        return Err(Int80ConformanceFailure::status(
+            "port_wait",
+            ZX_OK,
+            wait_status,
+        ));
     }
     if rx_packet != tx_packet {
-        return Err(Int80ConformanceFailure::value("port_roundtrip_packet", 1, 0));
+        return Err(Int80ConformanceFailure::value(
+            "port_roundtrip_packet",
+            1,
+            0,
+        ));
     }
 
     // Timer create should succeed and return a non-zero handle.
