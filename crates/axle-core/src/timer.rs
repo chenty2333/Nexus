@@ -162,6 +162,26 @@ impl TimerService {
             .ok_or(TimerError::NotFound)
     }
 
+    /// Earliest armed deadline among all timers, if any.
+    ///
+    /// This is useful for kernel-style "wait forever" implementations that
+    /// still need a wakeup source (e.g. to drive a fake clock in bring-up).
+    pub fn next_deadline(&mut self) -> Option<Time> {
+        while let Some(top) = self.heap.peek().copied() {
+            // Lazy skip: timer might have been re-armed, canceled, or deleted.
+            let Some(st) = self.timers.get(&top.id) else {
+                let _ = self.heap.pop();
+                continue;
+            };
+            if st.deadline != Some(top.deadline) {
+                let _ = self.heap.pop();
+                continue;
+            }
+            return Some(top.deadline);
+        }
+        None
+    }
+
     /// Advance time and return the list of timer ids that became signaled.
     pub fn advance_clock(
         &mut self,
