@@ -72,12 +72,17 @@ fn ap_stack_top(apic_id: usize) -> u64 {
 extern "C" fn ap_entry(apic_id: u64) -> ! {
     let apic_id_usize = apic_id as usize;
 
+    crate::arch::init_ap();
+
     if apic_id_usize < MAX_CPUS {
         AP_ONLINE[apic_id_usize].store(true, Ordering::Release);
     }
 
     crate::kprintln!("cpu{} online", apic_id);
-    crate::arch::cpu::halt_loop();
+
+    loop {
+        x86_64::instructions::interrupts::enable_and_hlt();
+    }
 }
 
 fn bootstrap_trampoline(cpu_count: usize) {

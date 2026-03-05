@@ -9,6 +9,7 @@ pub mod gdt;
 pub mod idt;
 pub mod int80;
 pub mod log;
+pub mod percpu;
 pub mod pic;
 pub mod pvh;
 pub mod qemu;
@@ -23,4 +24,15 @@ pub fn init() {
 
     // Install a real GDT/TSS so ring3 can enter the kernel through the IDT.
     let _ = gdt::init();
+    percpu::init();
+}
+
+/// Minimal AP init: load GDT/TSS/IDT, set per-CPU base, enable local APIC and
+/// keep its timer masked.
+pub fn init_ap() {
+    serial::init();
+    let _ = gdt::init();
+    idt::load();
+    percpu::init();
+    apic::init_ap();
 }
