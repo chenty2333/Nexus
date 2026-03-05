@@ -7,16 +7,17 @@ use alloc::collections::BTreeMap;
 use axle_core::handle::Handle;
 use axle_core::{
     CSpace, CSpaceError, Capability, FakeClock, Packet, PacketKind, Port, PortError, TimerError,
-    TimerId, TimerService,
+    Signals, TimerId, TimerService, WaitAsyncOptions,
 };
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
-use axle_types::packet::ZX_PKT_TYPE_USER;
+use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
 use axle_types::status::{
     ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL,
-    ZX_ERR_INVALID_ARGS, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
-    ZX_ERR_SHOULD_WAIT, ZX_ERR_WRONG_TYPE,
+    ZX_ERR_INVALID_ARGS, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND, ZX_ERR_SHOULD_WAIT,
+    ZX_ERR_WRONG_TYPE, ZX_OK,
 };
 use axle_types::{zx_clock_t, zx_handle_t, zx_packet_user_t, zx_port_packet_t, zx_status_t};
+use axle_types::{zx_packet_signal_t, zx_signals_t};
 use spin::Mutex;
 
 const CSPACE_MAX_SLOTS: u16 = 16_384;
@@ -171,17 +172,27 @@ pub fn ensure_timer_handle(handle: zx_handle_t) -> Result<(), zx_status_t> {
 pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let object_id = state.lookup_object_id(handle)?;
-        let timer = match state.objects.get(&object_id) {
-            Some(KernelObject::Timer(timer)) => timer,
+        let timer_id = match state.objects.get(&object_id) {
+            Some(KernelObject::Timer(timer)) => timer.timer_id,
             Some(KernelObject::Port(_)) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
 
-        let _ = state.clock.now();
         state
             .timers
-            .set(timer.timer_id, deadline)
+            .set(timer_id, deadline)
             .map_err(map_timer_error)
+            .and_then(|()| {
+                // Re-arming clears `SIGNALED`, which affects EDGE-triggered observers.
+                let _ = notify_waitable_signals_changed(state, object_id);
+
+                // For bring-up we only have a fake clock; fire due timers at current time.
+                let fired = fire_due_timers(state);
+                for fired_object_id in fired {
+                    let _ = notify_waitable_signals_changed(state, fired_object_id);
+                }
+                Ok(())
+            })
     })
 }
 
@@ -189,13 +200,20 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
 pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let object_id = state.lookup_object_id(handle)?;
-        let timer = match state.objects.get(&object_id) {
-            Some(KernelObject::Timer(timer)) => timer,
+        let timer_id = match state.objects.get(&object_id) {
+            Some(KernelObject::Timer(timer)) => timer.timer_id,
             Some(KernelObject::Port(_)) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
 
-        state.timers.cancel(timer.timer_id).map_err(map_timer_error)
+        state
+            .timers
+            .cancel(timer_id)
+            .map_err(map_timer_error)
+            .and_then(|()| {
+                let _ = notify_waitable_signals_changed(state, object_id);
+                Ok(())
+            })
     })
 }
 
@@ -207,14 +225,20 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
 
     with_state_mut(|state| {
         let object_id = state.lookup_object_id(handle)?;
-        let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
-        let port = match obj {
-            KernelObject::Port(port) => port,
-            KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
-        };
+        {
+            let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let port = match obj {
+                KernelObject::Port(port) => port,
+                KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
+            };
 
-        let pkt = Packet::user_with_data(packet.key, packet.status, packet.user.u64);
-        port.queue_user(pkt).map_err(map_port_error)
+            let pkt = Packet::user_with_data(packet.key, packet.status, packet.user.u64);
+            port.queue_user(pkt).map_err(map_port_error)?;
+        }
+
+        // Port queue state changed; notify async observers waiting on port readability/writability.
+        let _ = notify_waitable_signals_changed(state, object_id);
+        Ok(())
     })
 }
 
@@ -222,13 +246,18 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
 pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_status_t> {
     with_state_mut(|state| {
         let object_id = state.lookup_object_id(handle)?;
-        let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
-        let port = match obj {
-            KernelObject::Port(port) => port,
-            KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
+        let pkt = {
+            let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let port = match obj {
+                KernelObject::Port(port) => port,
+                KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
+            };
+            port.pop().map_err(map_port_error)?
         };
 
-        let pkt = port.pop().map_err(map_port_error)?;
+        // Port queue state changed; notify async observers waiting on port readability/writability.
+        let _ = notify_waitable_signals_changed(state, object_id);
+
         match pkt.kind {
             PacketKind::User => Ok(zx_port_packet_t {
                 key: pkt.key,
@@ -236,8 +265,68 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
                 status: pkt.status,
                 user: zx_packet_user_t { u64: pkt.user },
             }),
-            PacketKind::Signal => Err(ZX_ERR_NOT_SUPPORTED),
+            PacketKind::Signal => {
+                let sig = zx_packet_signal_t {
+                    trigger: pkt.trigger.bits(),
+                    observed: pkt.observed.bits(),
+                    count: pkt.count as u64,
+                    timestamp: 0,
+                    reserved1: 0,
+                };
+                Ok(zx_port_packet_t {
+                    key: pkt.key,
+                    type_: ZX_PKT_TYPE_SIGNAL_ONE,
+                    status: ZX_OK,
+                    user: sig.to_user(),
+                })
+            }
         }
+    })
+}
+
+/// Snapshot current signals for a waitable object.
+pub fn object_signals(handle: zx_handle_t) -> Result<zx_signals_t, zx_status_t> {
+    with_state_mut(|state| {
+        let object_id = state.lookup_object_id(handle)?;
+        signals_for_object_id(state, object_id).map(|s| s.bits())
+    })
+}
+
+/// Register a one-shot async wait and deliver a signal packet into `port` when fired.
+pub fn object_wait_async(
+    waitable: zx_handle_t,
+    port_handle: zx_handle_t,
+    key: u64,
+    signals: zx_signals_t,
+    edge_triggered: bool,
+) -> Result<(), zx_status_t> {
+    if signals == 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let waitable_id = state.lookup_object_id(waitable)?;
+        let port_id = state.lookup_object_id(port_handle)?;
+
+        let current = signals_for_object_id(state, waitable_id)?;
+
+        let opts = WaitAsyncOptions { edge_triggered };
+        let watched = Signals::from_bits(signals);
+
+        // Register observer on the port.
+        {
+            let obj = state.objects.get_mut(&port_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let port = match obj {
+                KernelObject::Port(port) => port,
+                KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
+            };
+            port.wait_async(waitable_id, key, watched, opts, current)
+                .map_err(map_port_error)?;
+        }
+
+        // Port queue may now contain a freshly enqueued signal packet (level-triggered immediate fire).
+        let _ = notify_waitable_signals_changed(state, port_id);
+        Ok(())
     })
 }
 
@@ -277,6 +366,65 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
             Err(ZX_ERR_WRONG_TYPE)
         }
     })
+}
+
+fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals, zx_status_t> {
+    let obj = state.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+    match obj {
+        KernelObject::Port(port) => Ok(port.signals()),
+        KernelObject::Timer(timer) => {
+            let signaled = state
+                .timers
+                .is_signaled(timer.timer_id)
+                .map_err(map_timer_error)?;
+            Ok(if signaled {
+                Signals::TIMER_SIGNALED
+            } else {
+                Signals::NONE
+            })
+        }
+    }
+}
+
+fn notify_waitable_signals_changed(
+    state: &mut KernelState,
+    waitable_id: u64,
+) -> Result<(), zx_status_t> {
+    let current = signals_for_object_id(state, waitable_id)?;
+
+    // Collect port ids first to avoid aliasing `state.objects` borrows.
+    let port_ids: alloc::vec::Vec<u64> = state
+        .objects
+        .iter()
+        .filter_map(|(id, obj)| matches!(obj, KernelObject::Port(_)).then_some(*id))
+        .collect();
+
+    for port_id in port_ids {
+        let Some(KernelObject::Port(port)) = state.objects.get_mut(&port_id) else {
+            continue;
+        };
+        port.on_signals_changed(waitable_id, current);
+    }
+    Ok(())
+}
+
+fn fire_due_timers(state: &mut KernelState) -> alloc::vec::Vec<u64> {
+    let now = state.clock.now();
+    let fired = state.timers.advance_clock(&mut state.clock, now);
+    if fired.is_empty() {
+        return alloc::vec::Vec::new();
+    }
+
+    let mut out = alloc::vec::Vec::new();
+    for fired_id in fired {
+        for (object_id, obj) in state.objects.iter() {
+            let KernelObject::Timer(t) = obj else { continue };
+            if t.timer_id == fired_id {
+                out.push(*object_id);
+            }
+        }
+    }
+    out
 }
 
 fn map_alloc_error(err: CSpaceError) -> zx_status_t {
