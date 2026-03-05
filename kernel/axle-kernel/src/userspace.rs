@@ -20,6 +20,14 @@ const USER_SHARED_VA: u64 = USER_CODE_VA + 0x1000;
 const USER_STACK_VA: u64 = USER_CODE_VA + 0x2000;
 const USER_STACK_TOP: u64 = USER_STACK_VA + 0x1000;
 
+// --- QEMU loader handoff for external userspace runner ELF ---
+//
+// Conformance harness uses `-device loader,file=...,addr=...` to drop the ELF bytes
+// into guest RAM, plus a second loader device to write the byte length.
+const USER_RUNNER_ELF_PADDR: u64 = 0x0100_0000;
+const USER_RUNNER_ELF_SIZE_PADDR: u64 = USER_RUNNER_ELF_PADDR - 8;
+const USER_RUNNER_ELF_MAX_BYTES: usize = 128 * 1024;
+
 // --- Shared summary slots (u64) written by userspace ---
 
 const SLOT_OK: usize = 0;
@@ -131,7 +139,7 @@ unsafe extern "C" {
     static axle_user_prog_end: u8;
 }
 
-fn load_user_program() {
+fn load_user_program_embedded() {
     // SAFETY: symbols are defined by `global_asm!` below and form a contiguous region.
     unsafe {
         let start = core::ptr::addr_of!(axle_user_prog_start);
@@ -149,6 +157,127 @@ fn load_user_program() {
         core::ptr::copy(src.as_ptr(), dst, len);
         core::ptr::write_bytes(dst.add(len), 0, 4096 - len);
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Ehdr {
+    e_ident: [u8; 16],
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Phdr {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
+
+fn try_load_user_program_from_qemu_loader() -> Option<u64> {
+    // SAFETY: conformance harness loads these bytes into identity-mapped RAM.
+    let size = unsafe { core::ptr::read_unaligned(USER_RUNNER_ELF_SIZE_PADDR as *const u64) };
+    if size == 0 || size as usize > USER_RUNNER_ELF_MAX_BYTES {
+        return None;
+    }
+
+    // SAFETY: we trust the loader-provided size bound above.
+    let blob =
+        unsafe { core::slice::from_raw_parts(USER_RUNNER_ELF_PADDR as *const u8, size as usize) };
+
+    if blob.len() < core::mem::size_of::<Elf64Ehdr>() {
+        return None;
+    }
+    if &blob[0..4] != b"\x7FELF" {
+        return None;
+    }
+
+    let ehdr = unsafe { core::ptr::read_unaligned(blob.as_ptr() as *const Elf64Ehdr) };
+    // 64-bit little-endian.
+    if ehdr.e_ident[4] != 2 || ehdr.e_ident[5] != 1 {
+        return None;
+    }
+    // ET_EXEC.
+    if ehdr.e_type != 2 {
+        return None;
+    }
+    // EM_X86_64.
+    if ehdr.e_machine != 0x3E {
+        return None;
+    }
+    if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
+        panic!("userspace: unexpected phdr size {}", ehdr.e_phentsize);
+    }
+
+    let phoff = ehdr.e_phoff as usize;
+    let phnum = ehdr.e_phnum as usize;
+    let phsize = phnum
+        .checked_mul(core::mem::size_of::<Elf64Phdr>())
+        .and_then(|n| n.checked_add(phoff))
+        .unwrap_or(usize::MAX);
+    if phsize > blob.len() {
+        panic!("userspace: phdr table out of range");
+    }
+
+    // Load PT_LOAD segments into the mapped user code page.
+    for i in 0..phnum {
+        let off = phoff + i * core::mem::size_of::<Elf64Phdr>();
+        let ph = unsafe { core::ptr::read_unaligned(blob.as_ptr().add(off) as *const Elf64Phdr) };
+        const PT_LOAD: u32 = 1;
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+
+        let file_off = ph.p_offset as usize;
+        let file_sz = ph.p_filesz as usize;
+        let mem_sz = ph.p_memsz as usize;
+
+        let file_end = file_off.checked_add(file_sz).unwrap_or(usize::MAX);
+        if file_end > blob.len() {
+            panic!("userspace: segment file range out of bounds");
+        }
+
+        let vaddr = ph.p_vaddr;
+        let vend = vaddr.checked_add(ph.p_memsz).unwrap_or(u64::MAX);
+        if vaddr < USER_CODE_VA || vend > USER_SHARED_VA {
+            panic!(
+                "userspace: segment vaddr out of range vaddr={:#x} memsz={:#x}",
+                vaddr, ph.p_memsz
+            );
+        }
+
+        // SAFETY: vaddr range is mapped by `map_userspace_pages()`.
+        unsafe {
+            let dst = vaddr as *mut u8;
+            core::ptr::copy_nonoverlapping(blob.as_ptr().add(file_off), dst, file_sz);
+            if mem_sz > file_sz {
+                core::ptr::write_bytes(dst.add(file_sz), 0, mem_sz - file_sz);
+            }
+        }
+    }
+
+    if ehdr.e_entry < USER_CODE_VA || ehdr.e_entry >= USER_SHARED_VA {
+        panic!("userspace: entry out of range {:#x}", ehdr.e_entry);
+    }
+
+    Some(ehdr.e_entry)
 }
 
 /// Validate a user pointer for a copyin/copyout of `len` bytes.
@@ -232,7 +361,10 @@ pub fn on_breakpoint() -> ! {
 /// Enter ring3 and run the embedded userspace conformance program.
 pub fn run() -> ! {
     map_userspace_pages();
-    load_user_program();
+    let entry = try_load_user_program_from_qemu_loader().unwrap_or_else(|| {
+        load_user_program_embedded();
+        USER_CODE_VA
+    });
 
     // Zero shared slots and set `ok=0` pessimistically.
     let slots = shared_slots();
@@ -249,7 +381,6 @@ pub fn run() -> ! {
         DS::set_reg(selectors.user_data);
         ES::set_reg(selectors.user_data);
 
-        let entry = USER_CODE_VA;
         let stack = USER_STACK_TOP;
         // Keep interrupts disabled during early bring-up. We only rely on software
         // traps (`int 0x80`, `int3`) and do not yet have handlers for hardware IRQs.
@@ -275,350 +406,7 @@ pub fn run() -> ! {
 // --- Embedded userspace program (one page) ---
 
 core::arch::global_asm!(
-    r#"
-    .section .text.axle_userprog, "ax"
-    .global axle_user_prog_start
-    .global axle_user_prog_end
-axle_user_prog_start:
-    // rbx = shared base (USER_SHARED_VA)
-    movabs $0x0000000100001000, %rbx
-
-    // Helper macro style:
-    // - syscall nr in rax
-    // - args in rdi,rsi,rdx,r10,r8,r9
-    // - store rax (status) to [rbx + slot*8]
-
-    // unknown syscall
-    movabs $0xffffffffffffffff, %rax
-    xor %rdi, %rdi
-    xor %rsi, %rsi
-    xor %rdx, %rdx
-    xor %r10, %r10
-    xor %r8, %r8
-    xor %r9, %r9
-    int $0x80
-    mov %rax, 8*1(%rbx)
-
-    // handle_close(invalid=0)
-    movabs $0, %rdi
-    movabs $0, %rax
-    int $0x80
-    mov %rax, 8*2(%rbx)
-
-    // port_create(bad opts=1, out=&ignored_handle)
-    lea 0x200(%rbx), %rsi
-    movl $1, %edi
-    movabs $3, %rax
-    int $0x80
-    mov %rax, 8*3(%rbx)
-
-    // port_create(null out)
-    xorl %edi, %edi
-    xorl %esi, %esi
-    movabs $3, %rax
-    int $0x80
-    mov %rax, 8*4(%rbx)
-
-    // port_wait(bad handle=0, out=&pkt)
-    lea 0x300(%rbx), %rdx
-    xor %rsi, %rsi
-    xor %rdi, %rdi
-    movabs $5, %rax
-    int $0x80
-    mov %rax, 8*5(%rbx)
-
-    // port_create(ok, out=&port_h)
-    lea 0x208(%rbx), %rsi
-    xorl %edi, %edi
-    movabs $3, %rax
-    int $0x80
-    mov 0x208(%rbx), %rcx
-    mov %rcx, 8*35(%rbx)
-
-    // port_wait(null out) with valid port
-    mov 0x208(%rbx), %rdi
-    xor %rsi, %rsi
-    xor %rdx, %rdx
-    movabs $5, %rax
-    int $0x80
-    mov %rax, 8*6(%rbx)
-
-    // port_wait(empty) with valid out
-    mov 0x208(%rbx), %rdi
-    xor %rsi, %rsi
-    lea 0x300(%rbx), %rdx
-    movabs $5, %rax
-    int $0x80
-    mov %rax, 8*7(%rbx)
-
-    // port_queue(null pkt)
-    mov 0x208(%rbx), %rdi
-    xor %rsi, %rsi
-    movabs $4, %rax
-    int $0x80
-    mov %rax, 8*8(%rbx)
-
-    // port_queue(bad type)
-    // bad_type_packet @ 0x400
-    lea 0x400(%rbx), %rsi
-    movabs $0, %rax
-    movabs $0, %rcx
-    mov %rcx, 0x00(%rsi)         // key=0
-    movl $1, 0x08(%rsi)          // type = ZX_PKT_TYPE_USER+1
-    movl $0, 0x0c(%rsi)          // status
-    // user payload zero
-    movq $0, 0x10(%rsi)
-    movq $0, 0x18(%rsi)
-    movq $0, 0x20(%rsi)
-    movq $0, 0x28(%rsi)
-
-    mov 0x208(%rbx), %rdi
-    movabs $4, %rax
-    int $0x80
-    mov %rax, 8*9(%rbx)
-
-    // tx_packet @ 0x440
-    lea 0x440(%rbx), %rsi
-    movabs $0xAA55AA55AA55AA55, %rcx
-    mov %rcx, 0x00(%rsi)         // key
-    movl $0, 0x08(%rsi)          // type = USER
-    movl $-123, 0x0c(%rsi)       // status
-    movabs $0x11, %rcx
-    mov %rcx, 0x10(%rsi)
-    movabs $0x22, %rcx
-    mov %rcx, 0x18(%rsi)
-    movabs $0x33, %rcx
-    mov %rcx, 0x20(%rsi)
-    movabs $0x44, %rcx
-    mov %rcx, 0x28(%rsi)
-
-    // port_queue(ok)
-    mov 0x208(%rbx), %rdi
-    movabs $4, %rax
-    int $0x80
-    mov %rax, 8*10(%rbx)
-
-    // port_wait(roundtrip) rx_packet @ 0x480
-    lea 0x480(%rbx), %rdx
-    mov 0x208(%rbx), %rdi
-    xor %rsi, %rsi
-    movabs $5, %rax
-    int $0x80
-    mov %rax, 8*11(%rbx)
-
-    // Compare rx_packet vs tx_packet (6 qwords)
-    lea 0x440(%rbx), %rsi
-    lea 0x480(%rbx), %rdi
-    mov $6, %rcx
-1:
-    mov (%rsi), %r8
-    mov (%rdi), %r9
-    cmp %r8, %r9
-    jne user_fail
-    add $8, %rsi
-    add $8, %rdi
-    loop 1b
-
-    // timer_create(bad opts=1)
-    lea 0x210(%rbx), %rdx
-    movl $1, %edi
-    movl $0, %esi                // ZX_CLOCK_MONOTONIC
-    movabs $6, %rax
-    int $0x80
-    mov %rax, 8*12(%rbx)
-
-    // timer_create(bad clock)
-    lea 0x210(%rbx), %rdx
-    xorl %edi, %edi
-    movl $1, %esi
-    movabs $6, %rax
-    int $0x80
-    mov %rax, 8*13(%rbx)
-
-    // timer_create(null out)
-    xorl %edi, %edi
-    xorl %esi, %esi
-    xorl %edx, %edx
-    movabs $6, %rax
-    int $0x80
-    mov %rax, 8*14(%rbx)
-
-    // timer_create(ok, out=&timer_h)
-    lea 0x218(%rbx), %rdx
-    xorl %edi, %edi
-    xorl %esi, %esi
-    movabs $6, %rax
-    int $0x80
-    mov 0x218(%rbx), %rcx
-    mov %rcx, 8*36(%rbx)
-
-    // port_wait(wrong type: handle=timer_h)
-    mov 0x218(%rbx), %rdi
-    xor %rsi, %rsi
-    lea 0x300(%rbx), %rdx
-    movabs $5, %rax
-    int $0x80
-    mov %rax, 8*15(%rbx)
-
-    // port_queue(wrong type: port=timer_h)
-    mov 0x218(%rbx), %rdi
-    lea 0x440(%rbx), %rsi
-    movabs $4, %rax
-    int $0x80
-    mov %rax, 8*16(%rbx)
-
-    // timer_set(wrong type: handle=port_h)
-    mov 0x208(%rbx), %rdi
-    movabs $123456, %rsi
-    xor %rdx, %rdx
-    movabs $7, %rax
-    int $0x80
-    mov %rax, 8*17(%rbx)
-
-    // timer_cancel(wrong type: handle=port_h)
-    mov 0x208(%rbx), %rdi
-    movabs $8, %rax
-    int $0x80
-    mov %rax, 8*18(%rbx)
-
-    // object_wait_one(timer, TIMER_SIGNALED, deadline=0, observed=&obs0)
-    lea 0x220(%rbx), %rcx
-    movq $0, (%rcx)
-    mov 0x218(%rbx), %rdi
-    movl $0x8, %esi              // ZX_TIMER_SIGNALED
-    xor %rdx, %rdx
-    mov %rcx, %r10
-    movabs $1, %rax
-    int $0x80
-    mov %rax, 8*19(%rbx)
-    mov (%rcx), %rax
-    mov %rax, 8*20(%rbx)
-
-    // object_wait_async(timer, port, key=0x1234, signals=TIMER_SIGNALED, options=0)
-    mov 0x218(%rbx), %rdi
-    mov 0x208(%rbx), %rsi
-    movabs $0x1234, %rdx
-    movl $0x8, %r10d
-    xorl %r8d, %r8d
-    movabs $2, %rax
-    int $0x80
-    mov %rax, 8*21(%rbx)
-
-    // timer_set_immediate(deadline=0)
-    mov 0x218(%rbx), %rdi
-    xor %rsi, %rsi
-    xor %rdx, %rdx
-    movabs $7, %rax
-    int $0x80
-    mov %rax, 8*22(%rbx)
-
-    // port_wait(signal packet) @ 0x4c0
-    lea 0x4c0(%rbx), %rdx
-    mov 0x208(%rbx), %rdi
-    xor %rsi, %rsi
-    movabs $5, %rax
-    int $0x80
-    mov %rax, 8*23(%rbx)
-
-    // Extract trigger/observed/count from signal packet payload.
-    // user.u64[0] at offset 0x10, count at 0x18
-    mov 0x4d0(%rbx), %rax        // first payload word
-    mov %eax, %ecx               // trigger (low 32)
-    shr $32, %rax
-    mov %eax, %edx               // observed (high 32)
-    mov %rcx, 8*24(%rbx)
-    mov %rdx, 8*25(%rbx)
-    mov 0x4d8(%rbx), %rax        // count
-    mov %rax, 8*26(%rbx)
-
-    // object_wait_one(timer, TIMER_SIGNALED, observed=&obs1) should be OK
-    lea 0x228(%rbx), %rcx
-    movq $0, (%rcx)
-    mov 0x218(%rbx), %rdi
-    movl $0x8, %esi
-    xor %rdx, %rdx
-    mov %rcx, %r10
-    movabs $1, %rax
-    int $0x80
-    mov %rax, 8*27(%rbx)
-    mov (%rcx), %rax
-    mov %rax, 8*28(%rbx)
-
-    // timer_set(deadline=123456)
-    mov 0x218(%rbx), %rdi
-    movabs $123456, %rsi
-    xor %rdx, %rdx
-    movabs $7, %rax
-    int $0x80
-    mov %rax, 8*29(%rbx)
-
-    // object_wait_one(timer, TIMER_SIGNALED, deadline=123455, observed=&obs2) should time out
-    lea 0x230(%rbx), %rcx
-    movq $0, (%rcx)
-    mov 0x218(%rbx), %rdi
-    movl $0x8, %esi
-    movabs $123455, %rdx
-    mov %rcx, %r10
-    movabs $1, %rax
-    int $0x80
-    mov %rax, 8*37(%rbx)
-    mov (%rcx), %rax
-    mov %rax, 8*38(%rbx)
-
-    // object_wait_one(timer, TIMER_SIGNALED, deadline=123456, observed=&obs3) should be OK
-    lea 0x238(%rbx), %rcx
-    movq $0, (%rcx)
-    mov 0x218(%rbx), %rdi
-    movl $0x8, %esi
-    movabs $123456, %rdx
-    mov %rcx, %r10
-    movabs $1, %rax
-    int $0x80
-    mov %rax, 8*39(%rbx)
-    mov (%rcx), %rax
-    mov %rax, 8*40(%rbx)
-
-    // timer_cancel
-    mov 0x218(%rbx), %rdi
-    movabs $8, %rax
-    int $0x80
-    mov %rax, 8*30(%rbx)
-
-    // timer_close
-    mov 0x218(%rbx), %rdi
-    movabs $0, %rax
-    int $0x80
-    mov %rax, 8*31(%rbx)
-
-    // timer_close_again
-    mov 0x218(%rbx), %rdi
-    movabs $0, %rax
-    int $0x80
-    mov %rax, 8*32(%rbx)
-
-    // handle_close(port_h)
-    mov 0x208(%rbx), %rdi
-    movabs $0, %rax
-    int $0x80
-    mov %rax, 8*33(%rbx)
-
-    // handle_close_again(port_h)
-    mov 0x208(%rbx), %rdi
-    movabs $0, %rax
-    int $0x80
-    mov %rax, 8*34(%rbx)
-
-    // ok=1
-    movq $1, 0x00(%rbx)
-    int3
-
-user_fail:
-    // ok=0 and exit via int3
-    movq $0, 0x00(%rbx)
-    int3
-
-axle_user_prog_end:
-    "#,
+    include_str!("../../../specs/conformance/runner/int80_conformance.S"),
     options(att_syntax)
 );
 
