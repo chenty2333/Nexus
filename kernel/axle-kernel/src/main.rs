@@ -7,6 +7,7 @@
 #![no_main]
 
 mod arch;
+mod bringup;
 mod kalloc;
 mod object;
 mod smp;
@@ -33,6 +34,8 @@ pub extern "C" fn _start() -> ! {
     syscall::init();
     trap::init();
     smp::init();
+
+    bringup::int80_conformance::run();
 
     arch::cpu::halt_loop();
 }
