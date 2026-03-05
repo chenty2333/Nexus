@@ -1,0 +1,18 @@
+id = "kernel.smp.ap_online_4"
+description = "SMP bring-up: APs come online under -smp 4 and BSP completes conformance run"
+tags = ["module:smp", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 4 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]",
+]
+expect = [
+  "cpu1 online",
+  "cpu2 online",
+  "cpu3 online",
+  "smp: requested cpu_count=4",
+  "kernel: int80 conformance ok",
+]
+forbid = ["KERNEL PANIC"]
+
