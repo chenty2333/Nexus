@@ -9,7 +9,7 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use nexus_test_runner::run_int80_smoke;
+use nexus_test_runner::run_int80_conformance;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -22,9 +22,9 @@ fn panic(_info: &PanicInfo) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     // In current bring-up this binary is not launched by the kernel yet.
-    // Keep the same smoke assertions callable here so userspace wiring can
+    // Keep the same conformance assertions callable here so userspace wiring can
     // reuse them without changing test semantics.
-    let _ = run_int80_smoke();
+    let _ = run_int80_conformance();
     loop {
         core::hint::spin_loop();
     }

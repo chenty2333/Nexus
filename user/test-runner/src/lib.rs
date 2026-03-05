@@ -1,4 +1,4 @@
-//! Shared smoke checks for the Nexus userspace test runner.
+//! Shared conformance checks for the Nexus userspace test runner.
 //!
 //! This module is `no_std` and can be called from early kernel bring-up as a
 //! temporary bridge until real userspace launch is wired.
@@ -14,9 +14,9 @@ use axle_types::syscall_numbers::{
 };
 use axle_types::{zx_handle_t, zx_packet_user_t, zx_port_packet_t, zx_status_t};
 
-/// Aggregate syscall statuses captured during the smoke run.
+/// Aggregate syscall statuses captured during the conformance run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SmokeSummary {
+pub struct Int80ConformanceSummary {
     pub unknown: zx_status_t,
     pub bad_wait: zx_status_t,
     pub empty_wait: zx_status_t,
@@ -30,15 +30,15 @@ pub struct SmokeSummary {
     pub timer_h: zx_handle_t,
 }
 
-/// Failure returned by [`run_int80_smoke`].
+/// Failure returned by [`run_int80_conformance`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SmokeFailure {
+pub struct Int80ConformanceFailure {
     pub step: &'static str,
     pub expected: i64,
     pub got: i64,
 }
 
-impl SmokeFailure {
+impl Int80ConformanceFailure {
     const fn status(step: &'static str, expected: zx_status_t, got: zx_status_t) -> Self {
         Self {
             step,
@@ -56,12 +56,12 @@ impl SmokeFailure {
     }
 }
 
-/// Run the bootstrap syscall smoke checks through `int 0x80`.
-pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
+/// Run the bootstrap syscall conformance checks through `int 0x80`.
+pub fn run_int80_conformance() -> Result<Int80ConformanceSummary, Int80ConformanceFailure> {
     // Unknown syscall id should fail with BAD_SYSCALL.
     let unknown_status = run_int80(u64::MAX, [0; 6]);
     if unknown_status != ZX_ERR_BAD_SYSCALL {
-        return Err(SmokeFailure::status(
+        return Err(Int80ConformanceFailure::status(
             "unknown_syscall",
             ZX_ERR_BAD_SYSCALL,
             unknown_status,
@@ -82,7 +82,7 @@ pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
         ],
     );
     if bad_port_wait_status != ZX_ERR_BAD_HANDLE {
-        return Err(SmokeFailure::status(
+        return Err(Int80ConformanceFailure::status(
             "port_wait_bad_handle",
             ZX_ERR_BAD_HANDLE,
             bad_port_wait_status,
@@ -96,14 +96,18 @@ pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
         [0, (&mut port_handle as *mut zx_handle_t) as u64, 0, 0, 0, 0],
     );
     if port_create_status != ZX_OK {
-        return Err(SmokeFailure::status(
+        return Err(Int80ConformanceFailure::status(
             "port_create_status",
             ZX_OK,
             port_create_status,
         ));
     }
     if port_handle == 0 {
-        return Err(SmokeFailure::value("port_create_handle_nonzero", 1, 0));
+        return Err(Int80ConformanceFailure::value(
+            "port_create_handle_nonzero",
+            1,
+            0,
+        ));
     }
 
     // Empty wait should report SHOULD_WAIT.
@@ -120,7 +124,7 @@ pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
         ],
     );
     if empty_wait_status != ZX_ERR_SHOULD_WAIT {
-        return Err(SmokeFailure::status(
+        return Err(Int80ConformanceFailure::status(
             "port_wait_empty",
             ZX_ERR_SHOULD_WAIT,
             empty_wait_status,
@@ -148,7 +152,11 @@ pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
         ],
     );
     if queue_status != ZX_OK {
-        return Err(SmokeFailure::status("port_queue", ZX_OK, queue_status));
+        return Err(Int80ConformanceFailure::status(
+            "port_queue",
+            ZX_OK,
+            queue_status,
+        ));
     }
 
     let mut rx_packet = zx_port_packet_t::default();
@@ -164,10 +172,10 @@ pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
         ],
     );
     if wait_status != ZX_OK {
-        return Err(SmokeFailure::status("port_wait", ZX_OK, wait_status));
+        return Err(Int80ConformanceFailure::status("port_wait", ZX_OK, wait_status));
     }
     if rx_packet != tx_packet {
-        return Err(SmokeFailure::value("port_roundtrip_packet", 1, 0));
+        return Err(Int80ConformanceFailure::value("port_roundtrip_packet", 1, 0));
     }
 
     // Timer create should succeed and return a non-zero handle.
@@ -184,14 +192,18 @@ pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
         ],
     );
     if timer_create_status != ZX_OK {
-        return Err(SmokeFailure::status(
+        return Err(Int80ConformanceFailure::status(
             "timer_create_status",
             ZX_OK,
             timer_create_status,
         ));
     }
     if timer_handle == 0 {
-        return Err(SmokeFailure::value("timer_create_handle_nonzero", 1, 0));
+        return Err(Int80ConformanceFailure::value(
+            "timer_create_handle_nonzero",
+            1,
+            0,
+        ));
     }
 
     let timer_set_status = run_int80(
@@ -199,7 +211,11 @@ pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
         [timer_handle as u64, 123_456, 0, 0, 0, 0],
     );
     if timer_set_status != ZX_OK {
-        return Err(SmokeFailure::status("timer_set", ZX_OK, timer_set_status));
+        return Err(Int80ConformanceFailure::status(
+            "timer_set",
+            ZX_OK,
+            timer_set_status,
+        ));
     }
 
     let timer_cancel_status = run_int80(
@@ -207,7 +223,7 @@ pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
         [timer_handle as u64, 0, 0, 0, 0, 0],
     );
     if timer_cancel_status != ZX_OK {
-        return Err(SmokeFailure::status(
+        return Err(Int80ConformanceFailure::status(
             "timer_cancel",
             ZX_OK,
             timer_cancel_status,
@@ -220,7 +236,11 @@ pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
         [port_handle as u64, 0, 0, 0, 0, 0],
     );
     if close_status != ZX_OK {
-        return Err(SmokeFailure::status("handle_close", ZX_OK, close_status));
+        return Err(Int80ConformanceFailure::status(
+            "handle_close",
+            ZX_OK,
+            close_status,
+        ));
     }
 
     let close_again_status = run_int80(
@@ -228,14 +248,14 @@ pub fn run_int80_smoke() -> Result<SmokeSummary, SmokeFailure> {
         [port_handle as u64, 0, 0, 0, 0, 0],
     );
     if close_again_status != ZX_ERR_BAD_HANDLE {
-        return Err(SmokeFailure::status(
+        return Err(Int80ConformanceFailure::status(
             "handle_close_again",
             ZX_ERR_BAD_HANDLE,
             close_again_status,
         ));
     }
 
-    Ok(SmokeSummary {
+    Ok(Int80ConformanceSummary {
         unknown: unknown_status,
         bad_wait: bad_port_wait_status,
         empty_wait: empty_wait_status,
