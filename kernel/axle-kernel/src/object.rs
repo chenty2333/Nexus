@@ -14,7 +14,7 @@ use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
 use axle_types::status::{
     ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL,
     ZX_ERR_INVALID_ARGS, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND, ZX_ERR_SHOULD_WAIT,
-    ZX_ERR_WRONG_TYPE, ZX_OK,
+    ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE, ZX_OK,
 };
 use axle_types::{zx_clock_t, zx_handle_t, zx_packet_user_t, zx_port_packet_t, zx_status_t};
 use axle_types::{zx_packet_signal_t, zx_signals_t};
@@ -292,6 +292,65 @@ pub fn object_signals(handle: zx_handle_t) -> Result<zx_signals_t, zx_status_t> 
     })
 }
 
+/// Wait for one of the specified signals on a waitable object.
+///
+/// This is a Phase-B bring-up implementation:
+/// - It blocks by spinning in the kernel (no scheduler yet).
+/// - A fake clock is advanced to drive timer deadlines.
+/// - When timers fire, `wait_async` observers are notified and ports can receive
+///   signal packets.
+pub fn object_wait_one(
+    handle: zx_handle_t,
+    watched: zx_signals_t,
+    deadline: i64,
+) -> Result<(zx_status_t, zx_signals_t), zx_status_t> {
+    let watched = Signals::from_bits(watched);
+    if watched.is_empty() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    loop {
+        // Lock scope so we can drop it before spinning.
+        let mut guard = STATE.lock();
+        let state = guard.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+        let object_id = state.lookup_object_id(handle)?;
+
+        let observed = signals_for_object_id(state, object_id)?;
+        if observed.intersects(watched) {
+            return Ok((ZX_OK, observed.bits()));
+        }
+
+        let now = state.clock.now();
+        if deadline <= now {
+            return Ok((ZX_ERR_TIMED_OUT, observed.bits()));
+        }
+
+        // Drive time forward deterministically in bring-up.
+        //
+        // - For finite deadlines, advance straight to `deadline`.
+        // - For "infinite" waits, advance to the next timer deadline if any; otherwise spin.
+        let target = if deadline == i64::MAX {
+            match state.timers.next_deadline() {
+                Some(t) => t,
+                None => {
+                    drop(guard);
+                    core::hint::spin_loop();
+                    continue;
+                }
+            }
+        } else {
+            deadline
+        };
+
+        // Advance time and fire due timers.
+        let fired = fire_due_timers_at(state, target);
+        for fired_object_id in fired {
+            let _ = notify_waitable_signals_changed(state, fired_object_id);
+        }
+        // Loop to re-check observed signals after potential updates.
+    }
+}
+
 /// Register a one-shot async wait and deliver a signal packet into `port` when fired.
 pub fn object_wait_async(
     waitable: zx_handle_t,
@@ -409,8 +468,11 @@ fn notify_waitable_signals_changed(
 }
 
 fn fire_due_timers(state: &mut KernelState) -> alloc::vec::Vec<u64> {
-    let now = state.clock.now();
-    let fired = state.timers.advance_clock(&mut state.clock, now);
+    fire_due_timers_at(state, state.clock.now())
+}
+
+fn fire_due_timers_at(state: &mut KernelState, new_time: i64) -> alloc::vec::Vec<u64> {
+    let fired = state.timers.advance_clock(&mut state.clock, new_time);
     if fired.is_empty() {
         return alloc::vec::Vec::new();
     }

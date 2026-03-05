@@ -131,7 +131,7 @@ fn sys_object_wait_one(_args: [u64; 6]) -> zx_status_t {
         Ok(v) => v,
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
-    let _deadline = _args[2] as i64;
+    let deadline = _args[2] as i64;
     let observed_ptr = _args[3] as *mut zx_signals_t;
     if observed_ptr.is_null() {
         return ZX_ERR_INVALID_ARGS;
@@ -140,25 +140,14 @@ fn sys_object_wait_one(_args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    // Bring-up semantics: level-triggered poll (no blocking yet).
-    // - If satisfied now, return `ZX_OK`.
-    // - Otherwise, behave like an immediate timeout and return `ZX_ERR_TIMED_OUT`.
-    let observed = match crate::object::object_signals(handle) {
+    let (status, observed) = match crate::object::object_wait_one(handle, signals, deadline) {
         Ok(v) => v,
         Err(e) => return e,
     };
-
-    // SAFETY: for current bring-up we trust the caller-provided pointer; later
-    // phases will replace this with strict copyout validation.
     if let Err(e) = copyout(observed_ptr, observed) {
         return e;
     }
-
-    if (observed & signals) != 0 {
-        ZX_OK
-    } else {
-        axle_types::status::ZX_ERR_TIMED_OUT
-    }
+    status
 }
 
 fn sys_object_wait_async(_args: [u64; 6]) -> zx_status_t {

@@ -62,8 +62,12 @@ const SLOT_CLOSE: usize = 33;
 const SLOT_CLOSE_AGAIN: usize = 34;
 const SLOT_PORT_H: usize = 35;
 const SLOT_TIMER_H: usize = 36;
+const SLOT_WAIT_ONE_FUTURE_TIMEOUT: usize = 37;
+const SLOT_WAIT_ONE_FUTURE_TIMEOUT_OBS: usize = 38;
+const SLOT_WAIT_ONE_FUTURE_OK: usize = 39;
+const SLOT_WAIT_ONE_FUTURE_OK_OBS: usize = 40;
 
-const SLOT_MAX: usize = SLOT_TIMER_H;
+const SLOT_MAX: usize = SLOT_WAIT_ONE_FUTURE_OK_OBS;
 
 #[repr(align(4096))]
 struct AlignedPage([u8; 4096]);
@@ -179,7 +183,7 @@ pub fn on_breakpoint() -> ! {
     }
 
     crate::kprintln!(
-        "kernel: int80 conformance ok (unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, bad_wait={}, port_wait_null_out={}, empty_wait={}, port_queue_null_pkt={}, port_queue_bad_type={}, queue={}, wait={}, timer_create_bad_opts={}, timer_create_bad_clock={}, timer_create_null_out={}, port_wait_wrong_type={}, port_queue_wrong_type={}, timer_set_wrong_type={}, timer_cancel_wrong_type={}, wait_one_unsignaled={}, wait_one_unsignaled_observed={}, wait_async={}, timer_set_immediate={}, wait_signal={}, signal_trigger={}, signal_observed={}, signal_count={}, wait_one_signaled={}, wait_one_signaled_observed={}, timer_set={}, timer_cancel={}, timer_close={}, timer_close_again={}, close={}, close_again={}, port_h={}, timer_h={})",
+        "kernel: int80 conformance ok (unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, bad_wait={}, port_wait_null_out={}, empty_wait={}, port_queue_null_pkt={}, port_queue_bad_type={}, queue={}, wait={}, timer_create_bad_opts={}, timer_create_bad_clock={}, timer_create_null_out={}, port_wait_wrong_type={}, port_queue_wrong_type={}, timer_set_wrong_type={}, timer_cancel_wrong_type={}, wait_one_unsignaled={}, wait_one_unsignaled_observed={}, wait_async={}, timer_set_immediate={}, wait_signal={}, signal_trigger={}, signal_observed={}, signal_count={}, wait_one_signaled={}, wait_one_signaled_observed={}, wait_one_future_timeout={}, wait_one_future_timeout_observed={}, wait_one_future_ok={}, wait_one_future_ok_observed={}, timer_set={}, timer_cancel={}, timer_close={}, timer_close_again={}, close={}, close_again={}, port_h={}, timer_h={})",
         slots[SLOT_UNKNOWN] as i64,
         slots[SLOT_CLOSE_INVALID] as i64,
         slots[SLOT_PORT_CREATE_BAD_OPTS] as i64,
@@ -208,6 +212,10 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_SIGNAL_COUNT],
         slots[SLOT_WAIT_ONE_SIGNALED] as i64,
         slots[SLOT_WAIT_ONE_SIGNALED_OBS] as i64,
+        slots[SLOT_WAIT_ONE_FUTURE_TIMEOUT] as i64,
+        slots[SLOT_WAIT_ONE_FUTURE_TIMEOUT_OBS] as i64,
+        slots[SLOT_WAIT_ONE_FUTURE_OK] as i64,
+        slots[SLOT_WAIT_ONE_FUTURE_OK_OBS] as i64,
         slots[SLOT_TIMER_SET] as i64,
         slots[SLOT_TIMER_CANCEL] as i64,
         slots[SLOT_TIMER_CLOSE] as i64,
@@ -543,6 +551,32 @@ axle_user_prog_start:
     movabs $7, %rax
     int $0x80
     mov %rax, 8*29(%rbx)
+
+    // object_wait_one(timer, TIMER_SIGNALED, deadline=123455, observed=&obs2) should time out
+    lea 0x230(%rbx), %rcx
+    movq $0, (%rcx)
+    mov 0x218(%rbx), %rdi
+    movl $0x8, %esi
+    movabs $123455, %rdx
+    mov %rcx, %r10
+    movabs $1, %rax
+    int $0x80
+    mov %rax, 8*37(%rbx)
+    mov (%rcx), %rax
+    mov %rax, 8*38(%rbx)
+
+    // object_wait_one(timer, TIMER_SIGNALED, deadline=123456, observed=&obs3) should be OK
+    lea 0x238(%rbx), %rcx
+    movq $0, (%rcx)
+    mov 0x218(%rbx), %rdi
+    movl $0x8, %esi
+    movabs $123456, %rdx
+    mov %rcx, %r10
+    movabs $1, %rax
+    int $0x80
+    mov %rax, 8*39(%rbx)
+    mov (%rcx), %rax
+    mov %rax, 8*40(%rbx)
 
     // timer_cancel
     mov 0x218(%rbx), %rdi

@@ -28,6 +28,7 @@ contracts = [
 [assertions.status_code]
 queue = 0
 wait = 0
+wait_one_future_ok = 0
 timer_set = 0
 timer_cancel = 0
 timer_close = 0
@@ -52,6 +53,11 @@ timer_set_wrong_type = -12
 timer_cancel_wrong_type = -12
 timer_close_again = -11
 close_again = -11
+wait_one_future_timeout = -21
+
+[assertions.signal_mask]
+wait_one_future_timeout_observed = 0
+wait_one_future_ok_observed = 8
 
 [elf_check]
 path = "target/x86_64-unknown-none/debug/axle-kernel"
