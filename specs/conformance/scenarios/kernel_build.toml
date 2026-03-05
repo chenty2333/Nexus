@@ -12,7 +12,7 @@ timeout_ms = 180000
 command = [
   "sh",
   "-c",
-  "cargo build -p axle-kernel --target x86_64-unknown-none && timeout 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -no-shutdown -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; [ \"$code\" -eq 0 ] || [ \"$code\" -eq 124 ]"
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -no-shutdown -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; [ \"$code\" -eq 0 ] || [ \"$code\" -eq 124 ]"
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]

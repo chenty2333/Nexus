@@ -3,13 +3,14 @@
 //! In later phases this binary will be loaded by the kernel and will exercise
 //! syscall conformance tests (especially MUST syscalls).
 //!
-//! For now we provide a skeleton that can be wired to the kernel's syscall ABI.
+//! For now this is a tiny `int 0x80` conformance runner intended to be loaded by
+//! the kernel bring-up path (ring3) and report results via the shared page +
+//! `int3`.
 
 #![no_std]
 #![no_main]
 
 use core::panic::PanicInfo;
-use nexus_test_runner::run_int80_conformance;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -18,14 +19,8 @@ fn panic(_info: &PanicInfo) -> ! {
     }
 }
 
-/// Userspace entry point.
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    // In current bring-up this binary is not launched by the kernel yet.
-    // Keep the same conformance assertions callable here so userspace wiring can
-    // reuse them without changing test semantics.
-    let _ = run_int80_conformance();
-    loop {
-        core::hint::spin_loop();
-    }
-}
+// Userspace entry point defined in assembly below.
+core::arch::global_asm!(
+    include_str!("../../../specs/conformance/runner/int80_conformance.S"),
+    options(att_syntax)
+);
