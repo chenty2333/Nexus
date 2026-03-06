@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
 use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_OK};
 use axle_types::syscall_numbers::{
     AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
@@ -177,9 +178,23 @@ fn sys_object_wait_async(_args: [u64; 6]) -> zx_status_t {
     if (options & !allowed) != 0 {
         return ZX_ERR_INVALID_ARGS;
     }
+    if (options & ZX_WAIT_ASYNC_TIMESTAMP) != 0 && (options & ZX_WAIT_ASYNC_BOOT_TIMESTAMP) != 0 {
+        return ZX_ERR_INVALID_ARGS;
+    }
 
-    let edge = (options & ZX_WAIT_ASYNC_EDGE) != 0;
-    match crate::object::object_wait_async(handle, port, key, signals, edge) {
+    let timestamp = if (options & ZX_WAIT_ASYNC_BOOT_TIMESTAMP) != 0 {
+        WaitAsyncTimestamp::Boot
+    } else if (options & ZX_WAIT_ASYNC_TIMESTAMP) != 0 {
+        WaitAsyncTimestamp::Monotonic
+    } else {
+        WaitAsyncTimestamp::None
+    };
+
+    let wait_options = WaitAsyncOptions {
+        edge_triggered: (options & ZX_WAIT_ASYNC_EDGE) != 0,
+        timestamp,
+    };
+    match crate::object::object_wait_async(handle, port, key, signals, wait_options) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }

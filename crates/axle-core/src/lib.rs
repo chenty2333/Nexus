@@ -31,7 +31,9 @@ pub mod timer;
 pub use capability::Capability;
 pub use cspace::{CSpace, CSpaceError};
 pub use handle::{Handle, HandleError};
-pub use port::{Packet, PacketKind, Port, PortError, PortKey, WaitAsyncOptions, WaitableId};
+pub use port::{
+    Packet, PacketKind, Port, PortError, PortKey, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId,
+};
 pub use revocation::{RevocationGroupId, RevocationGroupToken, RevocationManager, RevocationRef};
 pub use signals::{Signals, WaitOne, wait_one};
 pub use timer::{FakeClock, Time, TimerError, TimerId, TimerService};

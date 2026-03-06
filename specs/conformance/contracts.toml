@@ -34,3 +34,23 @@ description = "zx_timer_set and zx_timer_cancel must return ZX_OK for valid time
 id = "must.smp.ipi_ack_fixed_vector"
 level = "must"
 description = "BSP must be able to deliver a fixed-vector IPI to an AP (ack observed)"
+
+[[contracts]]
+id = "should.wait_async.timestamp_and_option_semantics"
+level = "should"
+description = "wait_async must reject invalid timestamp option combinations and emit non-zero timestamps when requested"
+
+[[contracts]]
+id = "should.wait_async.edge_requires_transition"
+level = "should"
+description = "EDGE wait_async must not fire for an already-satisfied object until a false->true transition occurs"
+
+[[contracts]]
+id = "should.port.kernel_reserve_allows_signal_delivery"
+level = "should"
+description = "A user-filled port must still admit kernel-generated signal packets through the reserved region"
+
+[[contracts]]
+id = "should.port.pending_merge_flushes_signal"
+level = "should"
+description = "Kernel-generated signal packets must merge while pending on a full port and flush once space is available"

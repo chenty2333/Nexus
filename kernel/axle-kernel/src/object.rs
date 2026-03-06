@@ -269,7 +269,7 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
                     trigger: pkt.trigger.bits(),
                     observed: pkt.observed.bits(),
                     count: pkt.count as u64,
-                    timestamp: 0,
+                    timestamp: pkt.timestamp,
                     reserved1: 0,
                 };
                 Ok(zx_port_packet_t {
@@ -375,7 +375,7 @@ pub fn object_wait_async(
     port_handle: zx_handle_t,
     key: u64,
     signals: zx_signals_t,
-    edge_triggered: bool,
+    options: WaitAsyncOptions,
 ) -> Result<(), zx_status_t> {
     if signals == 0 {
         return Err(ZX_ERR_INVALID_ARGS);
@@ -387,8 +387,8 @@ pub fn object_wait_async(
 
         let current = signals_for_object_id(state, waitable_id)?;
 
-        let opts = WaitAsyncOptions { edge_triggered };
         let watched = Signals::from_bits(signals);
+        let now = crate::time::now_ns();
 
         // Register observer on the port.
         {
@@ -397,7 +397,7 @@ pub fn object_wait_async(
                 KernelObject::Port(port) => port,
                 KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
             };
-            port.wait_async(waitable_id, key, watched, opts, current)
+            port.wait_async(waitable_id, key, watched, options, current, now)
                 .map_err(map_port_error)?;
         }
 
@@ -482,6 +482,7 @@ fn notify_waitable_signals_changed(
     waitable_id: u64,
 ) -> Result<(), zx_status_t> {
     let current = signals_for_object_id(state, waitable_id)?;
+    let now = crate::time::now_ns();
 
     // Collect port ids first to avoid aliasing `state.objects` borrows.
     let port_ids: alloc::vec::Vec<u64> = state
@@ -494,7 +495,7 @@ fn notify_waitable_signals_changed(
         let Some(KernelObject::Port(port)) = state.objects.get_mut(&port_id) else {
             continue;
         };
-        port.on_signals_changed(waitable_id, current);
+        port.on_signals_changed(waitable_id, current, now);
     }
     Ok(())
 }

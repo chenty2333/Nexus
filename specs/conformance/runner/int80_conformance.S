@@ -268,6 +268,132 @@ mov %rax, 8*27(%rbx)
 mov (%rcx), %rax
 mov %rax, 8*28(%rbx)
 
+// object_wait_async invalid options: TIMESTAMP | BOOT_TIMESTAMP => INVALID_ARGS
+mov 0x218(%rbx), %rdi
+mov 0x208(%rbx), %rsi
+movabs $0x2000, %rdx
+movl $0x8, %r10d
+movl $0x5, %r8d
+movabs $2, %rax
+int $0x80
+mov %rax, 8*41(%rbx)
+
+// timer_cancel to clear SIGNALED before timestamped wait_async
+mov 0x218(%rbx), %rdi
+movabs $8, %rax
+int $0x80
+
+// object_wait_async(timer, port, key=0x2001, options=TIMESTAMP)
+mov 0x218(%rbx), %rdi
+mov 0x208(%rbx), %rsi
+movabs $0x2001, %rdx
+movl $0x8, %r10d
+movl $0x1, %r8d
+movabs $2, %rax
+int $0x80
+mov %rax, 8*42(%rbx)
+
+// timer_set_immediate(deadline=0) for monotonic timestamp packet
+mov 0x218(%rbx), %rdi
+xor %rsi, %rsi
+xor %rdx, %rdx
+movabs $7, %rax
+int $0x80
+
+// port_wait(monotonic timestamp signal packet) @ 0x500
+lea 0x500(%rbx), %rdx
+mov 0x208(%rbx), %rdi
+xor %rsi, %rsi
+movabs $5, %rax
+int $0x80
+mov %rax, 8*43(%rbx)
+mov 0x520(%rbx), %rax
+mov %rax, 8*44(%rbx)
+movq $0, 8*45(%rbx)
+test %rax, %rax
+jz wait_async_ts_done
+cmp %r12, %rax
+jb wait_async_ts_done
+movq $1, 8*45(%rbx)
+wait_async_ts_done:
+
+// timer_cancel again to clear SIGNALED before boot-timestamped wait_async
+mov 0x218(%rbx), %rdi
+movabs $8, %rax
+int $0x80
+
+// object_wait_async(timer, port, key=0x2002, options=BOOT_TIMESTAMP)
+mov 0x218(%rbx), %rdi
+mov 0x208(%rbx), %rsi
+movabs $0x2002, %rdx
+movl $0x8, %r10d
+movl $0x4, %r8d
+movabs $2, %rax
+int $0x80
+mov %rax, 8*46(%rbx)
+
+// timer_set_immediate(deadline=0) for boot timestamp packet
+mov 0x218(%rbx), %rdi
+xor %rsi, %rsi
+xor %rdx, %rdx
+movabs $7, %rax
+int $0x80
+
+// port_wait(boot timestamp signal packet) @ 0x540
+lea 0x540(%rbx), %rdx
+mov 0x208(%rbx), %rdi
+xor %rsi, %rsi
+movabs $5, %rax
+int $0x80
+mov %rax, 8*47(%rbx)
+mov 0x560(%rbx), %rax
+mov %rax, 8*48(%rbx)
+movq $0, 8*49(%rbx)
+test %rax, %rax
+jz wait_async_boot_done
+cmp %r12, %rax
+jb wait_async_boot_done
+movq $1, 8*49(%rbx)
+wait_async_boot_done:
+
+// EDGE wait on already-signaled timer must not queue immediately.
+mov 0x218(%rbx), %rdi
+mov 0x208(%rbx), %rsi
+movabs $0x2222, %rdx
+movl $0x8, %r10d
+movl $0x2, %r8d
+movabs $2, %rax
+int $0x80
+mov %rax, 8*50(%rbx)
+
+// port_wait(non-blocking) should report SHOULD_WAIT because no edge transition happened yet.
+lea 0x580(%rbx), %rdx
+mov 0x208(%rbx), %rdi
+xor %rsi, %rsi
+movabs $5, %rax
+int $0x80
+mov %rax, 8*51(%rbx)
+
+// Clear then re-signal timer so the EDGE observer sees a false->true transition.
+mov 0x218(%rbx), %rdi
+movabs $8, %rax
+int $0x80
+
+mov 0x218(%rbx), %rdi
+xor %rsi, %rsi
+xor %rdx, %rdx
+movabs $7, %rax
+int $0x80
+
+lea 0x580(%rbx), %rdx
+mov 0x208(%rbx), %rdi
+xor %rsi, %rsi
+movabs $5, %rax
+int $0x80
+mov %rax, 8*52(%rbx)
+mov 0x580(%rbx), %rax
+mov %rax, 8*53(%rbx)
+
 // timer_set(deadline=t0+500ms)
 mov 0x218(%rbx), %rdi
 mov %r12, %rsi
@@ -304,6 +430,161 @@ int $0x80
 mov %rax, 8*39(%rbx)
 mov (%rcx), %rax
 mov %rax, 8*40(%rbx)
+
+// --- Port reserve test ----------------------------------------------------
+
+// port_create(ok, out=&reserve_port_h)
+lea 0x240(%rbx), %rsi
+xorl %edi, %edi
+movabs $3, %rax
+int $0x80
+
+// Fill user quota until port_queue returns SHOULD_WAIT.
+xor %r13, %r13
+reserve_fill_loop:
+mov 0x240(%rbx), %rdi
+lea 0x440(%rbx), %rsi
+movabs $4, %rax
+int $0x80
+test %rax, %rax
+jne reserve_fill_done
+inc %r13
+jmp reserve_fill_loop
+reserve_fill_done:
+mov %rax, 8*54(%rbx)
+
+// Timer is currently signaled; wait_async should enqueue into reserved slots.
+mov 0x218(%rbx), %rdi
+mov 0x240(%rbx), %rsi
+movabs $0x3001, %rdx
+movl $0x8, %r10d
+xorl %r8d, %r8d
+movabs $2, %rax
+int $0x80
+mov %rax, 8*55(%rbx)
+
+movq $0, 8*56(%rbx)
+movq $0, 8*57(%rbx)
+xor %r14, %r14
+reserve_drain_loop:
+mov 0x240(%rbx), %rdi
+xor %rsi, %rsi
+lea 0x5c0(%rbx), %rdx
+movabs $5, %rax
+int $0x80
+test %rax, %rax
+jne reserve_drain_done
+mov 0x5c8(%rbx), %eax
+cmp $1, %eax
+jne reserve_drain_next
+mov 0x5c0(%rbx), %rcx
+cmp $0x3001, %rcx
+jne reserve_drain_next
+mov %rax, 8*57(%rbx)
+cmp %r13, %r14
+jne reserve_drain_done
+movq $1, 8*56(%rbx)
+jmp reserve_drain_done
+reserve_drain_next:
+inc %r14
+jmp reserve_drain_loop
+reserve_drain_done:
+
+// --- Port pending-merge test ----------------------------------------------
+
+// port_create(ok, out=&pending_port_h)
+lea 0x248(%rbx), %rsi
+xorl %edi, %edi
+movabs $3, %rax
+int $0x80
+
+// Fill user quota on the pending port.
+pending_fill_user_loop:
+mov 0x248(%rbx), %rdi
+lea 0x440(%rbx), %rsi
+movabs $4, %rax
+int $0x80
+test %rax, %rax
+jne pending_fill_user_done
+jmp pending_fill_user_loop
+pending_fill_user_done:
+
+// Fill the reserved region with immediate signal packets (PORT_KERNEL_RESERVE = 16).
+xor %r14, %r14
+pending_fill_kernel_loop:
+cmp $16, %r14
+je pending_fill_kernel_done
+mov 0x218(%rbx), %rdi
+mov 0x248(%rbx), %rsi
+movabs $0x4100, %rdx
+add %r14, %rdx
+movl $0x8, %r10d
+xorl %r8d, %r8d
+movabs $2, %rax
+int $0x80
+inc %r14
+jmp pending_fill_kernel_loop
+pending_fill_kernel_done:
+
+// One more observer becomes pending because the queue is full.
+mov 0x218(%rbx), %rdi
+mov 0x248(%rbx), %rsi
+movabs $0x5000, %rdx
+movl $0x8, %r10d
+xorl %r8d, %r8d
+movabs $2, %rax
+int $0x80
+mov %rax, 8*58(%rbx)
+
+// Toggle the timer twice while the queue stays full; pending count should merge to 3 total.
+mov 0x218(%rbx), %rdi
+movabs $8, %rax
+int $0x80
+mov 0x218(%rbx), %rdi
+xor %rsi, %rsi
+xor %rdx, %rdx
+movabs $7, %rax
+int $0x80
+mov 0x218(%rbx), %rdi
+movabs $8, %rax
+int $0x80
+mov 0x218(%rbx), %rdi
+xor %rsi, %rsi
+xor %rdx, %rdx
+movabs $7, %rax
+int $0x80
+
+// Pop one packet so the pending signal can flush into the freed slot.
+mov 0x248(%rbx), %rdi
+xor %rsi, %rsi
+lea 0x600(%rbx), %rdx
+movabs $5, %rax
+int $0x80
+
+movq $0, 8*59(%rbx)
+movq $0, 8*60(%rbx)
+movq $0, 8*61(%rbx)
+pending_drain_loop:
+mov 0x248(%rbx), %rdi
+xor %rsi, %rsi
+lea 0x600(%rbx), %rdx
+movabs $5, %rax
+int $0x80
+mov %rax, 8*59(%rbx)
+test %rax, %rax
+jne pending_drain_done
+mov 0x600(%rbx), %rcx
+cmp $0x5000, %rcx
+jne pending_drain_loop
+mov 0x618(%rbx), %rax
+mov %rax, 8*60(%rbx)
+cmp $3, %rax
+jne pending_drain_done
+mov 0x608(%rbx), %eax
+cmp $1, %eax
+jne pending_drain_done
+movq $1, 8*61(%rbx)
+pending_drain_done:
 
 // timer_cancel
 mov 0x218(%rbx), %rdi

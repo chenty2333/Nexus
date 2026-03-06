@@ -74,8 +74,29 @@ const SLOT_WAIT_ONE_FUTURE_TIMEOUT: usize = 37;
 const SLOT_WAIT_ONE_FUTURE_TIMEOUT_OBS: usize = 38;
 const SLOT_WAIT_ONE_FUTURE_OK: usize = 39;
 const SLOT_WAIT_ONE_FUTURE_OK_OBS: usize = 40;
+const SLOT_WAIT_ASYNC_BAD_OPTIONS: usize = 41;
+const SLOT_WAIT_ASYNC_TS: usize = 42;
+const SLOT_WAIT_SIGNAL_TS: usize = 43;
+const SLOT_SIGNAL_TIMESTAMP: usize = 44;
+const SLOT_SIGNAL_TIMESTAMP_OK: usize = 45;
+const SLOT_WAIT_ASYNC_BOOT: usize = 46;
+const SLOT_WAIT_SIGNAL_BOOT: usize = 47;
+const SLOT_SIGNAL_BOOT_TIMESTAMP: usize = 48;
+const SLOT_SIGNAL_BOOT_TIMESTAMP_OK: usize = 49;
+const SLOT_EDGE_WAIT_ASYNC: usize = 50;
+const SLOT_EDGE_EMPTY_WAIT: usize = 51;
+const SLOT_EDGE_SIGNAL_WAIT: usize = 52;
+const SLOT_EDGE_SIGNAL_KEY: usize = 53;
+const SLOT_RESERVE_QUEUE_FULL: usize = 54;
+const SLOT_RESERVE_WAIT_ASYNC: usize = 55;
+const SLOT_RESERVE_SIGNAL_AFTER_USERS_OK: usize = 56;
+const SLOT_RESERVE_SIGNAL_TYPE: usize = 57;
+const SLOT_PENDING_WAIT_ASYNC: usize = 58;
+const SLOT_PENDING_SIGNAL_WAIT: usize = 59;
+const SLOT_PENDING_SIGNAL_COUNT: usize = 60;
+const SLOT_PENDING_MERGE_OK: usize = 61;
 
-const SLOT_MAX: usize = SLOT_WAIT_ONE_FUTURE_OK_OBS;
+const SLOT_MAX: usize = SLOT_PENDING_MERGE_OK;
 const SLOT_T0_NS: usize = 511;
 
 #[repr(align(4096))]
@@ -314,7 +335,7 @@ pub fn on_breakpoint() -> ! {
     }
 
     crate::kprintln!(
-        "kernel: int80 conformance ok (unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, bad_wait={}, port_wait_null_out={}, empty_wait={}, port_queue_null_pkt={}, port_queue_bad_type={}, queue={}, wait={}, timer_create_bad_opts={}, timer_create_bad_clock={}, timer_create_null_out={}, port_wait_wrong_type={}, port_queue_wrong_type={}, timer_set_wrong_type={}, timer_cancel_wrong_type={}, wait_one_unsignaled={}, wait_one_unsignaled_observed={}, wait_async={}, timer_set_immediate={}, wait_signal={}, signal_trigger={}, signal_observed={}, signal_count={}, wait_one_signaled={}, wait_one_signaled_observed={}, wait_one_future_timeout={}, wait_one_future_timeout_observed={}, wait_one_future_ok={}, wait_one_future_ok_observed={}, timer_set={}, timer_cancel={}, timer_close={}, timer_close_again={}, close={}, close_again={}, port_h={}, timer_h={})",
+        "kernel: int80 conformance ok (unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, bad_wait={}, port_wait_null_out={}, empty_wait={}, port_queue_null_pkt={}, port_queue_bad_type={}, queue={}, wait={}, timer_create_bad_opts={}, timer_create_bad_clock={}, timer_create_null_out={}, port_wait_wrong_type={}, port_queue_wrong_type={}, timer_set_wrong_type={}, timer_cancel_wrong_type={}, wait_one_unsignaled={}, wait_one_unsignaled_observed={}, wait_async={}, timer_set_immediate={}, wait_signal={}, signal_trigger={}, signal_observed={}, signal_count={}, wait_one_signaled={}, wait_one_signaled_observed={}, wait_one_future_timeout={}, wait_one_future_timeout_observed={}, wait_one_future_ok={}, wait_one_future_ok_observed={}, wait_async_bad_options={}, wait_async_ts={}, wait_signal_ts={}, signal_timestamp={}, signal_timestamp_ok={}, wait_async_boot={}, wait_signal_boot={}, signal_boot_timestamp={}, signal_boot_timestamp_ok={}, edge_wait_async={}, edge_empty_wait={}, edge_signal_wait={}, edge_signal_key={}, reserve_queue_full={}, reserve_wait_async={}, reserve_signal_after_users_ok={}, reserve_signal_type={}, pending_wait_async={}, pending_signal_wait={}, pending_signal_count={}, pending_merge_ok={}, timer_set={}, timer_cancel={}, timer_close={}, timer_close_again={}, close={}, close_again={}, port_h={}, timer_h={})",
         slots[SLOT_UNKNOWN] as i64,
         slots[SLOT_CLOSE_INVALID] as i64,
         slots[SLOT_PORT_CREATE_BAD_OPTS] as i64,
@@ -347,6 +368,27 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_WAIT_ONE_FUTURE_TIMEOUT_OBS] as i64,
         slots[SLOT_WAIT_ONE_FUTURE_OK] as i64,
         slots[SLOT_WAIT_ONE_FUTURE_OK_OBS] as i64,
+        slots[SLOT_WAIT_ASYNC_BAD_OPTIONS] as i64,
+        slots[SLOT_WAIT_ASYNC_TS] as i64,
+        slots[SLOT_WAIT_SIGNAL_TS] as i64,
+        slots[SLOT_SIGNAL_TIMESTAMP] as i64,
+        slots[SLOT_SIGNAL_TIMESTAMP_OK] as i64,
+        slots[SLOT_WAIT_ASYNC_BOOT] as i64,
+        slots[SLOT_WAIT_SIGNAL_BOOT] as i64,
+        slots[SLOT_SIGNAL_BOOT_TIMESTAMP] as i64,
+        slots[SLOT_SIGNAL_BOOT_TIMESTAMP_OK] as i64,
+        slots[SLOT_EDGE_WAIT_ASYNC] as i64,
+        slots[SLOT_EDGE_EMPTY_WAIT] as i64,
+        slots[SLOT_EDGE_SIGNAL_WAIT] as i64,
+        slots[SLOT_EDGE_SIGNAL_KEY] as i64,
+        slots[SLOT_RESERVE_QUEUE_FULL] as i64,
+        slots[SLOT_RESERVE_WAIT_ASYNC] as i64,
+        slots[SLOT_RESERVE_SIGNAL_AFTER_USERS_OK] as i64,
+        slots[SLOT_RESERVE_SIGNAL_TYPE] as i64,
+        slots[SLOT_PENDING_WAIT_ASYNC] as i64,
+        slots[SLOT_PENDING_SIGNAL_WAIT] as i64,
+        slots[SLOT_PENDING_SIGNAL_COUNT] as i64,
+        slots[SLOT_PENDING_MERGE_OK] as i64,
         slots[SLOT_TIMER_SET] as i64,
         slots[SLOT_TIMER_CANCEL] as i64,
         slots[SLOT_TIMER_CLOSE] as i64,

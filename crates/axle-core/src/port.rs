@@ -15,6 +15,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use crate::signals::Signals;
+use crate::timer::Time;
 
 /// Identifier for a waitable object.
 ///
@@ -50,6 +51,8 @@ pub struct Packet {
     pub observed: Signals,
     /// For signal packets: merged trigger count (>= 1 for signal packets, 0 for user packets).
     pub count: u32,
+    /// For signal packets: trigger timestamp; 0 when timestamp delivery was not requested.
+    pub timestamp: Time,
     /// For user packets: caller-provided status.
     pub status: i32,
     /// For user packets: raw 32-byte payload.
@@ -71,6 +74,7 @@ impl Packet {
             trigger: Signals::NONE,
             observed: Signals::NONE,
             count: 0,
+            timestamp: 0,
             status,
             user,
         }
@@ -83,6 +87,7 @@ impl Packet {
         trigger: Signals,
         observed: Signals,
         count: u32,
+        timestamp: Time,
     ) -> Self {
         Self {
             key,
@@ -91,10 +96,26 @@ impl Packet {
             trigger,
             observed,
             count,
+            timestamp,
             status: 0,
             user: [0; 4],
         }
     }
+}
+
+/// Timestamp mode requested for async wait packets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WaitAsyncTimestamp {
+    /// Do not include a timestamp in delivered packets.
+    #[default]
+    None,
+    /// Use the kernel monotonic timeline.
+    Monotonic,
+    /// Use the kernel boot timeline.
+    ///
+    /// In current bring-up Axle has no suspend/resume distinction yet, so boot
+    /// and monotonic time are sourced from the same monotonic clock.
+    Boot,
 }
 
 /// Options for an async wait.
@@ -104,6 +125,8 @@ pub struct WaitAsyncOptions {
     ///
     /// For level-triggered waits, packets can be delivered immediately if already satisfied.
     pub edge_triggered: bool,
+    /// Which timestamp mode to include in signal packets, if any.
+    pub timestamp: WaitAsyncTimestamp,
 }
 
 /// Errors for queue operations.
@@ -122,6 +145,7 @@ struct PendingState {
     count: u32,
     trigger: Signals,
     observed: Signals,
+    timestamp: Time,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -253,6 +277,7 @@ impl Port {
         watched: Signals,
         options: WaitAsyncOptions,
         current_signals: Signals,
+        current_time: Time,
     ) -> Result<(), PortError> {
         let k = (waitable, key);
         if self.observers.contains_key(&k) {
@@ -270,7 +295,7 @@ impl Port {
 
         // Level-triggered: if already satisfied, queue immediately.
         if satisfied && !options.edge_triggered {
-            self.on_signals_changed(waitable, current_signals);
+            self.on_signals_changed(waitable, current_signals, current_time);
         }
 
         Ok(())
@@ -292,7 +317,7 @@ impl Port {
     /// - evaluate observers for that waitable
     /// - enqueue signal packets when conditions fire
     /// - if full, mark observers as pending and merge repeated firings
-    pub fn on_signals_changed(&mut self, waitable: WaitableId, current: Signals) {
+    pub fn on_signals_changed(&mut self, waitable: WaitableId, current: Signals, now: Time) {
         // Collect matching keys first to avoid borrow checker issues.
         let keys: Vec<(WaitableId, PortKey)> = self
             .observers
@@ -325,7 +350,7 @@ impl Port {
                     .get(&k)
                     .map(|obs| obs.watched)
                     .unwrap_or(Signals::NONE);
-                self.enqueue_or_pending(k, trigger, current);
+                self.enqueue_or_pending(k, trigger, current, now);
             }
         }
 
@@ -333,10 +358,25 @@ impl Port {
         self.flush_pending();
     }
 
-    fn enqueue_or_pending(&mut self, k: (WaitableId, PortKey), trigger: Signals, current: Signals) {
+    fn enqueue_or_pending(
+        &mut self,
+        k: (WaitableId, PortKey),
+        trigger: Signals,
+        current: Signals,
+        now: Time,
+    ) {
+        let timestamp = self
+            .observers
+            .get(&k)
+            .map(|obs| match obs.options.timestamp {
+                WaitAsyncTimestamp::None => 0,
+                WaitAsyncTimestamp::Monotonic | WaitAsyncTimestamp::Boot => now,
+            })
+            .unwrap_or(0);
+
         // If we have space, enqueue now (and remove observer) without borrowing it.
         if self.q.len() < self.capacity {
-            let pkt = Packet::signal(k.1, k.0, trigger, current, 1);
+            let pkt = Packet::signal(k.1, k.0, trigger, current, 1, timestamp);
             self.q.push_back(pkt);
             // remove observer (one-shot).
             let _ = self.observers.remove(&k);
@@ -354,6 +394,7 @@ impl Port {
                     count: 1,
                     trigger,
                     observed: current,
+                    timestamp,
                 });
                 self.pending_order.push_back(k);
             }
@@ -379,7 +420,7 @@ impl Port {
             };
 
             // Enqueue pending packet to the back (preserves FIFO among already queued packets).
-            let pkt = Packet::signal(k.1, k.0, p.trigger, p.observed, p.count);
+            let pkt = Packet::signal(k.1, k.0, p.trigger, p.observed, p.count, p.timestamp);
             self.q.push_back(pkt);
 
             // Remove observer (one-shot completion).
@@ -415,10 +456,11 @@ mod tests {
             Signals::CHANNEL_READABLE,
             WaitAsyncOptions::default(),
             Signals::NONE,
+            11,
         )
         .unwrap();
 
-        port.on_signals_changed(42, Signals::CHANNEL_READABLE);
+        port.on_signals_changed(42, Signals::CHANNEL_READABLE, 12);
         assert_eq!(port.len(), 3);
         let p = port.pop().unwrap(); // user pkt 1
         assert_eq!(p.kind, PacketKind::User);
@@ -441,11 +483,12 @@ mod tests {
             Signals::CHANNEL_READABLE,
             WaitAsyncOptions::default(),
             Signals::NONE,
+            100,
         )
         .unwrap();
 
         // First firing enqueues (space available).
-        port.on_signals_changed(1, Signals::CHANNEL_READABLE);
+        port.on_signals_changed(1, Signals::CHANNEL_READABLE, 101);
         assert_eq!(port.len(), 1);
 
         // Re-arm another observer; then fill queue; then trigger multiple times -> pending merge.
@@ -455,12 +498,13 @@ mod tests {
             Signals::CHANNEL_READABLE,
             WaitAsyncOptions::default(),
             Signals::NONE,
+            200,
         )
         .unwrap();
 
         // Queue is full now, so triggers become pending.
-        port.on_signals_changed(1, Signals::CHANNEL_READABLE);
-        port.on_signals_changed(1, Signals::CHANNEL_READABLE);
+        port.on_signals_changed(1, Signals::CHANNEL_READABLE, 201);
+        port.on_signals_changed(1, Signals::CHANNEL_READABLE, 202);
 
         // Drain one packet, should flush pending into freed slot.
         let _ = port.pop().unwrap();
@@ -480,20 +524,82 @@ mod tests {
             Signals::CHANNEL_READABLE,
             WaitAsyncOptions {
                 edge_triggered: true,
+                timestamp: WaitAsyncTimestamp::None,
             },
             Signals::CHANNEL_READABLE, // already satisfied at arm time
+            300,
         )
         .unwrap();
 
         // Still satisfied: no transition, so no packet.
-        port.on_signals_changed(1, Signals::CHANNEL_READABLE);
+        port.on_signals_changed(1, Signals::CHANNEL_READABLE, 301);
         assert_eq!(port.len(), 0);
 
         // Clear then set: transition fires.
-        port.on_signals_changed(1, Signals::NONE);
-        port.on_signals_changed(1, Signals::CHANNEL_READABLE);
+        port.on_signals_changed(1, Signals::NONE, 302);
+        port.on_signals_changed(1, Signals::CHANNEL_READABLE, 303);
         assert_eq!(port.len(), 1);
         let pkt = port.pop().unwrap();
         assert_eq!(pkt.key, 99);
+    }
+
+    #[test]
+    fn timestamp_requested_is_recorded_on_delivery() {
+        let mut port = Port::new(4, 2);
+        port.wait_async(
+            5,
+            55,
+            Signals::TIMER_SIGNALED,
+            WaitAsyncOptions {
+                edge_triggered: false,
+                timestamp: WaitAsyncTimestamp::Monotonic,
+            },
+            Signals::NONE,
+            1000,
+        )
+        .unwrap();
+
+        port.on_signals_changed(5, Signals::TIMER_SIGNALED, 1234);
+        let pkt = port.pop().unwrap();
+        assert_eq!(pkt.kind, PacketKind::Signal);
+        assert_eq!(pkt.timestamp, 1234);
+    }
+
+    #[test]
+    fn pending_merge_keeps_first_timestamp() {
+        let mut port = Port::new(1, 1);
+        port.wait_async(
+            7,
+            77,
+            Signals::TIMER_SIGNALED,
+            WaitAsyncOptions {
+                edge_triggered: false,
+                timestamp: WaitAsyncTimestamp::Monotonic,
+            },
+            Signals::TIMER_SIGNALED,
+            10,
+        )
+        .unwrap();
+
+        port.wait_async(
+            7,
+            78,
+            Signals::TIMER_SIGNALED,
+            WaitAsyncOptions {
+                edge_triggered: false,
+                timestamp: WaitAsyncTimestamp::Monotonic,
+            },
+            Signals::NONE,
+            20,
+        )
+        .unwrap();
+
+        port.on_signals_changed(7, Signals::TIMER_SIGNALED, 21);
+        port.on_signals_changed(7, Signals::TIMER_SIGNALED, 22);
+
+        assert_eq!(port.pop().unwrap().timestamp, 10);
+        let pkt = port.pop().unwrap();
+        assert_eq!(pkt.timestamp, 21);
+        assert_eq!(pkt.count, 2);
     }
 }

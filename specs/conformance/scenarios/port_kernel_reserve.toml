@@ -1,0 +1,22 @@
+id = "kernel.port.kernel_reserve"
+description = "Kernel-generated signal packets must still arrive when user packets have filled the user quota"
+tags = ["module:kernel", "module:port", "module:wait", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.port.kernel_reserve_allows_signal_delivery"]
+
+[assertions.status_code]
+reserve_wait_async = 0
+
+[assertions.error_code]
+reserve_queue_full = -22
+
+[assertions.packet_fields]
+reserve_signal_after_users_ok = 1
+reserve_signal_type = 1

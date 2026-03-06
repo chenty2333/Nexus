@@ -137,7 +137,11 @@ pub mod wait_async {
     pub const ZX_WAIT_ASYNC_TIMESTAMP: u32 = 1;
     /// Edge-triggered: only fire on transition from not-satisfied to satisfied.
     pub const ZX_WAIT_ASYNC_EDGE: u32 = 2;
-    /// Request boot timestamp (not yet modeled by Axle).
+    /// Request boot timestamp in packets.
+    ///
+    /// In current bring-up Axle exposes the same underlying monotonic timeline
+    /// for both monotonic and boot timestamps because suspend/resume time
+    /// accounting has not been introduced yet.
     pub const ZX_WAIT_ASYNC_BOOT_TIMESTAMP: u32 = 4;
 }
 

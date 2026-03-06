@@ -1,0 +1,20 @@
+id = "kernel.port.pending_merge"
+description = "Pending kernel signal packets must merge and flush after a full port regains one free slot"
+tags = ["module:kernel", "module:port", "module:wait", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.port.pending_merge_flushes_signal"]
+
+[assertions.status_code]
+pending_wait_async = 0
+pending_signal_wait = 0
+
+[assertions.packet_fields]
+pending_signal_count = 3
+pending_merge_ok = 1
