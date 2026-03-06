@@ -205,6 +205,22 @@ impl VmoId {
     }
 }
 
+/// Kernel-global identity for one VMO.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GlobalVmoId(u64);
+
+impl GlobalVmoId {
+    /// Build from a raw non-zero id.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Raw numeric id.
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Identifier for a VMAR tracked by an address space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VmarId(u64);
@@ -231,6 +247,7 @@ pub enum VmoKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vmo {
     id: VmoId,
+    global_id: GlobalVmoId,
     kind: VmoKind,
     size_bytes: u64,
     frames: Vec<Option<FrameId>>,
@@ -240,6 +257,11 @@ impl Vmo {
     /// Stable id.
     pub const fn id(&self) -> VmoId {
         self.id
+    }
+
+    /// Kernel-global VMO identity.
+    pub const fn global_id(&self) -> GlobalVmoId {
+        self.global_id
     }
 
     /// Backing kind.
@@ -295,6 +317,7 @@ pub struct Vma {
     base: u64,
     len: u64,
     vmo_id: VmoId,
+    global_vmo_id: GlobalVmoId,
     vmo_offset: u64,
     perms: MappingPerms,
     max_perms: MappingPerms,
@@ -320,6 +343,11 @@ impl Vma {
     /// Backing VMO id.
     pub const fn vmo_id(self) -> VmoId {
         self.vmo_id
+    }
+
+    /// Kernel-global VMO identity.
+    pub const fn global_vmo_id(self) -> GlobalVmoId {
+        self.global_vmo_id
     }
 
     /// Offset into the backing VMO.
@@ -363,6 +391,7 @@ impl Vma {
 pub struct VmaLookup {
     vmar_id: VmarId,
     vmo_id: VmoId,
+    global_vmo_id: GlobalVmoId,
     vmo_kind: VmoKind,
     vmo_offset: u64,
     frame_id: Option<FrameId>,
@@ -382,6 +411,11 @@ impl VmaLookup {
     /// Backing VMO id.
     pub const fn vmo_id(self) -> VmoId {
         self.vmo_id
+    }
+
+    /// Kernel-global VMO identity.
+    pub const fn global_vmo_id(self) -> GlobalVmoId {
+        self.global_vmo_id
     }
 
     /// Backing VMO kind.
@@ -422,6 +456,45 @@ impl VmaLookup {
     /// Length of the containing mapping.
     pub const fn mapping_len(self) -> u64 {
         self.mapping_len
+    }
+}
+
+/// Stable futex key derived from VMA metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FutexKey {
+    /// Shared key backed by a globally-identified VMO and byte offset.
+    Shared {
+        /// Kernel-global VMO identity.
+        global_vmo_id: GlobalVmoId,
+        /// Byte offset of the futex word inside the VMO.
+        offset: u64,
+    },
+    /// Private fallback for anonymous mappings that lack a global identity.
+    PrivateAnonymous {
+        /// Owning process id.
+        process_id: u64,
+        /// Base address of the containing page.
+        page_base: u64,
+        /// Byte offset of the futex word inside the containing page.
+        byte_offset: u16,
+    },
+}
+
+impl FutexKey {
+    /// Build a futex key from resolved mapping metadata.
+    pub fn from_lookup(process_id: u64, user_addr: u64, lookup: VmaLookup) -> Self {
+        if lookup.global_vmo_id().raw() != 0 {
+            return Self::Shared {
+                global_vmo_id: lookup.global_vmo_id(),
+                offset: lookup.vmo_offset(),
+            };
+        }
+
+        Self::PrivateAnonymous {
+            process_id,
+            page_base: align_down(user_addr, PAGE_SIZE),
+            byte_offset: (user_addr & (PAGE_SIZE - 1)) as u16,
+        }
     }
 }
 
@@ -516,6 +589,7 @@ impl AddressSpace {
         &mut self,
         kind: VmoKind,
         size_bytes: u64,
+        global_id: GlobalVmoId,
     ) -> Result<VmoId, AddressSpaceError> {
         if size_bytes == 0 || !is_page_aligned(size_bytes) {
             return Err(AddressSpaceError::InvalidArgs);
@@ -525,6 +599,7 @@ impl AddressSpace {
         self.next_vmo_id = self.next_vmo_id.wrapping_add(1);
         self.vmos.push(Vmo {
             id,
+            global_id,
             kind,
             size_bytes,
             frames: alloc::vec![None; usize::try_from(size_bytes / PAGE_SIZE).unwrap_or(0)],
@@ -637,6 +712,7 @@ impl AddressSpace {
             base,
             len,
             vmo_id,
+            global_vmo_id: vmo.global_id(),
             vmo_offset,
             perms,
             max_perms,
@@ -774,6 +850,7 @@ impl AddressSpace {
         Some(VmaLookup {
             vmar_id: self.root.id,
             vmo_id: vma.vmo_id,
+            global_vmo_id: vma.global_vmo_id,
             vmo_kind: vmo.kind(),
             vmo_offset: resolved_offset,
             frame_id: vmo.frame_at_offset(resolved_offset),
@@ -800,6 +877,7 @@ impl AddressSpace {
         Some(VmaLookup {
             vmar_id: self.root.id,
             vmo_id: vma.vmo_id,
+            global_vmo_id: vma.global_vmo_id,
             vmo_kind: vmo.kind(),
             vmo_offset: resolved_offset,
             frame_id: vmo.frame_at_offset(resolved_offset),
@@ -927,14 +1005,22 @@ mod tests {
     const ROOT_BASE: u64 = 0x1_0000_0000;
     const ROOT_LEN: u64 = 0x4000;
 
+    fn global_vmo_id(raw: u64) -> GlobalVmoId {
+        GlobalVmoId::new(raw)
+    }
+
     fn sample_space() -> (AddressSpace, FrameTable, FrameId, FrameId) {
         let mut frames = FrameTable::new();
         let code_frame = frames.register_existing(0x20_000).unwrap();
         let data_frame = frames.register_existing(0x30_000).unwrap();
 
         let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
-        let code = space.create_vmo(VmoKind::Anonymous, PAGE_SIZE).unwrap();
-        let data = space.create_vmo(VmoKind::Anonymous, PAGE_SIZE).unwrap();
+        let code = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(1))
+            .unwrap();
+        let data = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(2))
+            .unwrap();
         space.bind_vmo_frame(code, 0, code_frame).unwrap();
         space.bind_vmo_frame(data, 0, data_frame).unwrap();
         space
@@ -973,6 +1059,7 @@ mod tests {
         let (space, frames, code_frame, _) = sample_space();
         let lookup = space.lookup(ROOT_BASE + 0x120).unwrap();
         assert_eq!(lookup.vmo_offset(), 0x120);
+        assert_eq!(lookup.global_vmo_id(), global_vmo_id(1));
         assert!(lookup.perms().contains(MappingPerms::EXECUTE));
         assert_eq!(lookup.mapping_base(), ROOT_BASE);
         assert_eq!(lookup.mapping_len(), PAGE_SIZE);
@@ -983,7 +1070,9 @@ mod tests {
     #[test]
     fn map_rejects_overlap_and_out_of_range() {
         let (mut space, mut frames, _, _) = sample_space();
-        let extra = space.create_vmo(VmoKind::Anonymous, PAGE_SIZE).unwrap();
+        let extra = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(3))
+            .unwrap();
         assert_eq!(
             space.map_fixed(
                 &mut frames,
@@ -1079,7 +1168,9 @@ mod tests {
     #[test]
     fn contains_range_can_span_adjacent_vmas() {
         let (mut space, mut frames, _, _) = sample_space();
-        let extra = space.create_vmo(VmoKind::Anonymous, PAGE_SIZE).unwrap();
+        let extra = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(4))
+            .unwrap();
         let extra_frame = frames.register_existing(0x40_000).unwrap();
         space.bind_vmo_frame(extra, 0, extra_frame).unwrap();
         space
@@ -1116,7 +1207,9 @@ mod tests {
         let shared = frames.register_existing(0x50_000).unwrap();
 
         let mut left = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
-        let left_vmo = left.create_vmo(VmoKind::Anonymous, PAGE_SIZE).unwrap();
+        let left_vmo = left
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(10))
+            .unwrap();
         left.bind_vmo_frame(left_vmo, 0, shared).unwrap();
         left.map_fixed(
             &mut frames,
@@ -1130,7 +1223,9 @@ mod tests {
         .unwrap();
 
         let mut right = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
-        let right_vmo = right.create_vmo(VmoKind::Anonymous, PAGE_SIZE).unwrap();
+        let right_vmo = right
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(11))
+            .unwrap();
         right.bind_vmo_frame(right_vmo, 0, shared).unwrap();
         right
             .map_fixed(
@@ -1157,7 +1252,13 @@ mod tests {
             let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
             let mut frames = FrameTable::new();
             for index in 0..slot_count {
-                let vmo = space.create_vmo(VmoKind::Anonymous, PAGE_SIZE).unwrap();
+                let vmo = space
+                    .create_vmo(
+                        VmoKind::Anonymous,
+                        PAGE_SIZE,
+                        global_vmo_id((index as u64) + 100),
+                    )
+                    .unwrap();
                 let frame = frames
                     .register_existing(0x1000_0000 + (index as u64 * PAGE_SIZE))
                     .unwrap();
@@ -1180,5 +1281,18 @@ mod tests {
                 prop_assert!(pair[0].base() + pair[0].len() <= pair[1].base());
             }
         }
+    }
+
+    #[test]
+    fn futex_key_prefers_global_vmo_identity() {
+        let (space, _, _, _) = sample_space();
+        let lookup = space.lookup(ROOT_BASE + 0x20).unwrap();
+        assert_eq!(
+            FutexKey::from_lookup(99, ROOT_BASE + 0x20, lookup),
+            FutexKey::Shared {
+                global_vmo_id: global_vmo_id(1),
+                offset: 0x20,
+            }
+        );
     }
 }

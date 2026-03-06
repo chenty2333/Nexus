@@ -21,6 +21,7 @@ use axle_types::status::{
 use axle_types::vm::{ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC};
 use axle_types::{
     zx_clock_t, zx_handle_t, zx_packet_user_t, zx_port_packet_t, zx_rights_t, zx_status_t,
+    zx_vaddr_t,
 };
 use axle_types::{zx_packet_signal_t, zx_signals_t};
 use spin::Mutex;
@@ -277,6 +278,13 @@ pub fn bootstrap_root_vmar_handle() -> Option<zx_handle_t> {
     Some(state.bootstrap_root_vmar_handle)
 }
 
+#[allow(dead_code)]
+pub(crate) fn resolve_current_futex_key(
+    user_addr: zx_vaddr_t,
+) -> Result<axle_mm::FutexKey, zx_status_t> {
+    with_state_mut(|state| state.kernel.resolve_current_futex_key(user_addr))
+}
+
 fn with_state_mut<T>(
     f: impl FnOnce(&mut KernelState) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
@@ -478,8 +486,11 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
     }
 
     with_state_mut(|state| {
-        let created = state.kernel.create_current_anonymous_vmo(size)?;
         let object_id = state.alloc_object_id();
+        let created = state
+            .kernel
+            .create_current_anonymous_vmo(size, axle_mm::GlobalVmoId::new(object_id))?;
+        debug_assert_eq!(created.global_vmo_id().raw(), object_id);
         state.objects.insert(
             object_id,
             KernelObject::Vmo(VmoObject {

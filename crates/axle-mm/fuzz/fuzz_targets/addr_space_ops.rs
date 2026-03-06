@@ -1,6 +1,6 @@
 #![no_main]
 
-use axle_mm::{AddressSpace, FrameTable, MappingPerms, PAGE_SIZE, VmoKind};
+use axle_mm::{AddressSpace, FrameTable, GlobalVmoId, MappingPerms, PAGE_SIZE, VmoKind};
 use libfuzzer_sys::fuzz_target;
 
 const ROOT_BASE: u64 = 0x1_0000_0000;
@@ -21,7 +21,9 @@ fuzz_target!(|data: &[u8]| {
                     1 => VmoKind::Physical,
                     _ => VmoKind::Contiguous,
                 };
-                vmos[slot] = space.create_vmo(kind, pages * PAGE_SIZE).ok();
+                vmos[slot] = space
+                    .create_vmo(kind, pages * PAGE_SIZE, GlobalVmoId::new((slot as u64) + 1))
+                    .ok();
             }
             1 => {
                 let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmos.len() as u8);

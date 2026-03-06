@@ -19,7 +19,7 @@ use axle_core::handle::Handle;
 use axle_core::{CSpace, CSpaceError, Capability, RevocationManager};
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameId, FrameTable,
-    MappingPerms, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
+    FutexKey, GlobalVmoId, MappingPerms, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
 };
 use axle_types::rights::{
     ZX_RIGHT_APPLY_PROFILE, ZX_RIGHT_DESTROY, ZX_RIGHT_DUPLICATE, ZX_RIGHT_ENUMERATE,
@@ -35,6 +35,7 @@ use axle_types::status::{
 };
 use axle_types::{zx_handle_t, zx_rights_t, zx_status_t};
 use bitflags::bitflags;
+use core::mem::size_of;
 
 const CSPACE_MAX_SLOTS: u16 = 16_384;
 const CSPACE_QUARANTINE_LEN: usize = 256;
@@ -42,6 +43,7 @@ const CSPACE_QUARANTINE_LEN: usize = 256;
 type ProcessId = u64;
 type ThreadId = u64;
 type AddressSpaceId = u64;
+type KernelVmoId = GlobalVmoId;
 
 bitflags! {
     /// Internal handle-rights model used by the bootstrap kernel.
@@ -138,6 +140,10 @@ impl CreatedVmo {
         self.vmo.id()
     }
 
+    pub(crate) fn global_vmo_id(&self) -> KernelVmoId {
+        self.vmo.global_id()
+    }
+
     pub(crate) fn size_bytes(&self) -> u64 {
         self.vmo.size_bytes()
     }
@@ -220,7 +226,7 @@ struct AddressSpace {
 }
 
 impl AddressSpace {
-    fn bootstrap(frames: &mut FrameTable) -> Self {
+    fn bootstrap(frames: &mut FrameTable, vmo_ids: [KernelVmoId; 3]) -> Self {
         let mut vm = VmAddressSpace::new(
             crate::userspace::USER_CODE_VA,
             crate::userspace::USER_REGION_BYTES,
@@ -228,7 +234,11 @@ impl AddressSpace {
         .expect("bootstrap address-space root must be valid");
 
         let code_vmo = vm
-            .create_vmo(VmoKind::Anonymous, crate::userspace::USER_CODE_BYTES)
+            .create_vmo(
+                VmoKind::Anonymous,
+                crate::userspace::USER_CODE_BYTES,
+                vmo_ids[0],
+            )
             .expect("bootstrap code vmo allocation must succeed");
         for page_index in 0..crate::userspace::USER_CODE_PAGE_COUNT {
             let code_frame = frames
@@ -253,7 +263,11 @@ impl AddressSpace {
         .expect("bootstrap code mapping must succeed");
 
         let shared_vmo = vm
-            .create_vmo(VmoKind::Anonymous, crate::userspace::USER_PAGE_BYTES)
+            .create_vmo(
+                VmoKind::Anonymous,
+                crate::userspace::USER_PAGE_BYTES,
+                vmo_ids[1],
+            )
             .expect("bootstrap shared vmo allocation must succeed");
         let shared_frame = frames
             .register_existing(crate::userspace::user_shared_page_paddr())
@@ -272,7 +286,11 @@ impl AddressSpace {
         .expect("bootstrap shared mapping must succeed");
 
         let stack_vmo = vm
-            .create_vmo(VmoKind::Anonymous, crate::userspace::USER_PAGE_BYTES)
+            .create_vmo(
+                VmoKind::Anonymous,
+                crate::userspace::USER_PAGE_BYTES,
+                vmo_ids[2],
+            )
             .expect("bootstrap stack vmo allocation must succeed");
         let stack_frame = frames
             .register_existing(crate::userspace::user_stack_page_paddr())
@@ -314,8 +332,11 @@ impl AddressSpace {
         &mut self,
         frames: &mut FrameTable,
         size: u64,
+        global_vmo_id: KernelVmoId,
     ) -> Result<Vmo, AddressSpaceError> {
-        let vmo_id = self.vm.create_vmo(VmoKind::Anonymous, size)?;
+        let vmo_id = self
+            .vm
+            .create_vmo(VmoKind::Anonymous, size, global_vmo_id)?;
         let page_count = usize::try_from(size / crate::userspace::USER_PAGE_BYTES)
             .map_err(|_| AddressSpaceError::InvalidArgs)?;
         for page_index in 0..page_count {
@@ -463,6 +484,7 @@ pub(crate) struct Kernel {
     #[allow(dead_code)]
     frames: FrameTable,
     revocations: RevocationManager,
+    next_global_vmo_id: u64,
     next_process_id: ProcessId,
     next_thread_id: ThreadId,
     next_address_space_id: AddressSpaceId,
@@ -472,19 +494,27 @@ pub(crate) struct Kernel {
 impl Kernel {
     /// Build the single-process bootstrap kernel model used by the current main branch.
     pub(crate) fn bootstrap() -> Self {
-        let mut frames = FrameTable::new();
-        let bootstrap_address_space = AddressSpace::bootstrap(&mut frames);
         let mut kernel = Self {
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
             address_spaces: BTreeMap::new(),
-            frames,
+            frames: FrameTable::new(),
             revocations: RevocationManager::new(),
+            next_global_vmo_id: 1,
             next_process_id: 1,
             next_thread_id: 1,
             next_address_space_id: 1,
             current_thread_id: 0,
         };
+        let bootstrap_vmo_ids = [
+            kernel.alloc_global_vmo_id(),
+            kernel.alloc_global_vmo_id(),
+            kernel.alloc_global_vmo_id(),
+        ];
+        let bootstrap_address_space = AddressSpace::bootstrap(
+            &mut kernel.frames,
+            bootstrap_vmo_ids,
+        );
 
         let address_space_id = kernel.alloc_address_space_id();
         kernel
@@ -565,6 +595,23 @@ impl Kernel {
         let process = self.current_process().ok()?;
         let address_space = self.address_spaces.get(&process.address_space_id)?;
         address_space.lookup_user_mapping(ptr, len)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resolve_current_futex_key(
+        &self,
+        user_addr: u64,
+    ) -> Result<FutexKey, zx_status_t> {
+        const FUTEX_WORD_BYTES: usize = size_of::<u32>();
+        if (user_addr & 0x3) != 0 || !self.validate_current_user_ptr(user_addr, FUTEX_WORD_BYTES) {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        let process_id = self.current_thread()?.process_id;
+        let lookup = self
+            .lookup_current_user_mapping(user_addr, FUTEX_WORD_BYTES)
+            .ok_or(ZX_ERR_INVALID_ARGS)?;
+        Ok(FutexKey::from_lookup(process_id, user_addr, lookup))
     }
 
     pub(crate) fn try_loan_current_user_pages(
@@ -675,6 +722,7 @@ impl Kernel {
     pub(crate) fn create_current_anonymous_vmo(
         &mut self,
         size: u64,
+        global_vmo_id: KernelVmoId,
     ) -> Result<CreatedVmo, zx_status_t> {
         let process_id = self.current_thread()?.process_id;
         let address_space_id = self.current_process()?.address_space_id;
@@ -683,7 +731,7 @@ impl Kernel {
             .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         let vmo = address_space
-            .create_anonymous_vmo(&mut self.frames, size)
+            .create_anonymous_vmo(&mut self.frames, size, global_vmo_id)
             .map_err(map_address_space_error)?;
         Ok(CreatedVmo {
             process_id,
@@ -855,6 +903,12 @@ impl Kernel {
         let id = self.next_address_space_id;
         self.next_address_space_id = self.next_address_space_id.wrapping_add(1);
         id
+    }
+
+    fn alloc_global_vmo_id(&mut self) -> KernelVmoId {
+        let id = self.next_global_vmo_id;
+        self.next_global_vmo_id = self.next_global_vmo_id.wrapping_add(1);
+        KernelVmoId::new(id)
     }
 
     fn current_thread(&self) -> Result<&Thread, zx_status_t> {
