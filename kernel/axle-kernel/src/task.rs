@@ -13,11 +13,12 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 use axle_core::handle::Handle;
 use axle_core::{CSpace, CSpaceError, Capability, RevocationManager};
 use axle_mm::{
-    AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameTable,
+    AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameId, FrameTable,
     MappingPerms, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
 };
 use axle_types::status::{
@@ -112,6 +113,33 @@ impl CreatedVmo {
 
     pub(crate) fn size_bytes(&self) -> u64 {
         self.vmo.size_bytes()
+    }
+}
+
+/// Pinned page run loaned from the current process into a kernel object.
+#[derive(Clone, Debug)]
+pub(crate) struct LoanedUserPages {
+    base: u64,
+    len: u32,
+    needs_cow: bool,
+    pages: Vec<FrameId>,
+}
+
+impl LoanedUserPages {
+    pub(crate) const fn base(&self) -> u64 {
+        self.base
+    }
+
+    pub(crate) const fn len(&self) -> u32 {
+        self.len
+    }
+
+    pub(crate) const fn needs_cow(&self) -> bool {
+        self.needs_cow
+    }
+
+    pub(crate) fn pages(&self) -> &[FrameId] {
+        &self.pages
     }
 }
 
@@ -321,6 +349,10 @@ impl AddressSpace {
     ) -> Result<CowFaultResolution, AddressSpaceError> {
         self.vm.resolve_cow_fault(frames, fault_va, new_frame_id)
     }
+
+    fn arm_copy_on_write(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
+        self.vm.mark_copy_on_write(base, len)
+    }
 }
 
 #[derive(Debug)]
@@ -460,6 +492,97 @@ impl Kernel {
         let process = self.current_process().ok()?;
         let address_space = self.address_spaces.get(&process.address_space_id)?;
         address_space.lookup_user_mapping(ptr, len)
+    }
+
+    pub(crate) fn try_loan_current_user_pages(
+        &mut self,
+        ptr: u64,
+        len: usize,
+    ) -> Result<Option<LoanedUserPages>, zx_status_t> {
+        if len == 0 {
+            return Ok(None);
+        }
+
+        let page_size = crate::userspace::USER_PAGE_BYTES;
+        let len_u64 = u64::try_from(len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if (ptr & (page_size - 1)) != 0 || (len_u64 & (page_size - 1)) != 0 {
+            return Ok(None);
+        }
+
+        let process = self.current_process()?;
+        let address_space_id = process.address_space_id;
+        let Some(lookup) = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.lookup_user_mapping(ptr, len))
+        else {
+            return Ok(None);
+        };
+
+        if lookup.vmo_kind() != VmoKind::Anonymous {
+            return Ok(None);
+        }
+
+        let page_count = len / (page_size as usize);
+        let mut pinned = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let page_va = ptr + (page_index as u64) * page_size;
+            let Some(page_lookup) = self
+                .address_spaces
+                .get(&address_space_id)
+                .and_then(|space| space.lookup_user_mapping(page_va, 1))
+            else {
+                self.unpin_loaned_pages_inner(&pinned);
+                return Ok(None);
+            };
+            let Some(frame_id) = page_lookup.frame_id() else {
+                self.unpin_loaned_pages_inner(&pinned);
+                return Ok(None);
+            };
+            self.frames
+                .pin(frame_id)
+                .map_err(|_| ZX_ERR_BAD_STATE)
+                .inspect_err(|_| self.unpin_loaned_pages_inner(&pinned))?;
+            pinned.push(frame_id);
+        }
+
+        let len_u32 = u32::try_from(len).map_err(|_| {
+            self.unpin_loaned_pages_inner(&pinned);
+            ZX_ERR_OUT_OF_RANGE
+        })?;
+        Ok(Some(LoanedUserPages {
+            base: ptr,
+            len: len_u32,
+            needs_cow: lookup.max_perms().contains(MappingPerms::WRITE),
+            pages: pinned,
+        }))
+    }
+
+    pub(crate) fn release_loaned_user_pages(&mut self, loaned: &LoanedUserPages) {
+        self.unpin_loaned_pages_inner(loaned.pages())
+    }
+
+    pub(crate) fn arm_loaned_user_pages_copy_on_write(
+        &mut self,
+        loaned: &LoanedUserPages,
+    ) -> Result<(), zx_status_t> {
+        if !loaned.needs_cow() {
+            return Ok(());
+        }
+
+        let process = self.current_process()?;
+        let address_space_id = process.address_space_id;
+        let len = u64::from(loaned.len());
+        {
+            let address_space = self
+                .address_spaces
+                .get_mut(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            address_space
+                .arm_copy_on_write(loaned.base(), len)
+                .map_err(map_address_space_error)?;
+        }
+        self.update_mapping_pages(address_space_id, loaned.base(), len)
     }
 
     pub(crate) fn current_root_vmar(&self) -> Result<RootVmarInfo, zx_status_t> {
@@ -742,6 +865,12 @@ impl Kernel {
             crate::arch::tlb::flush_page_global(va);
         }
         Ok(())
+    }
+
+    fn unpin_loaned_pages_inner(&mut self, pages: &[FrameId]) {
+        for &frame_id in pages {
+            let _ = self.frames.unpin(frame_id);
+        }
     }
 }
 

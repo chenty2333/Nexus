@@ -15,7 +15,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
 use axle_types::status::{
-    ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NOT_SUPPORTED, ZX_OK,
+    ZX_ERR_BAD_STATE, ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY,
+    ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_OK,
 };
 use axle_types::syscall_numbers::{
     AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
@@ -177,6 +178,41 @@ fn copyout_bytes(ptr: *mut u8, bytes: &[u8]) -> Result<(), zx_status_t> {
     // SAFETY: the userspace range was validated above and `bytes` is a valid source slice.
     let dst = unsafe { slice::from_raw_parts_mut(ptr, bytes.len()) };
     dst.copy_from_slice(bytes);
+    Ok(())
+}
+
+fn copyout_loaned_bytes(
+    ptr: *mut u8,
+    loaned: &crate::task::LoanedUserPages,
+) -> Result<(), zx_status_t> {
+    let len = usize::try_from(loaned.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    if len == 0 {
+        return Ok(());
+    }
+    if ptr.is_null() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if !crate::userspace::validate_user_ptr(ptr as u64, len) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    let page_size = crate::userspace::USER_PAGE_BYTES as usize;
+    let page_count = len / page_size;
+    if page_count != loaned.pages().len() {
+        return Err(ZX_ERR_BAD_STATE);
+    }
+
+    for (page_index, frame_id) in loaned.pages().iter().copied().enumerate() {
+        // SAFETY: the destination range was validated above, and bootstrap guest memory is
+        // identity mapped so the registered frame physical address is a readable kernel VA.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                frame_id.raw() as *const u8,
+                ptr.add(page_index * page_size),
+                page_size,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -543,11 +579,15 @@ fn sys_channel_write(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let bytes = match copyin_bytes(bytes_ptr, num_bytes) {
-        Ok(bytes) => bytes,
+    let payload = match crate::object::try_loan_current_user_pages(bytes_ptr as u64, num_bytes) {
+        Ok(Some(loaned)) => crate::object::ChannelPayload::Loaned(loaned),
+        Ok(None) => match copyin_bytes(bytes_ptr, num_bytes) {
+            Ok(bytes) => crate::object::ChannelPayload::Copied(bytes),
+            Err(e) => return e,
+        },
         Err(e) => return e,
     };
-    match crate::object::channel_write(handle, options, bytes, num_handles) {
+    match crate::object::channel_write(handle, options, payload, num_handles) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -595,13 +635,20 @@ fn sys_channel_read(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
             return status;
         }
     };
-    if let Err(e) = copyout_bytes(bytes_ptr, &message.bytes) {
+    let actual_bytes = message.actual_bytes;
+    let actual_handles = message.actual_handles;
+    let copy_result = match &message.payload {
+        crate::object::ChannelPayload::Copied(bytes) => copyout_bytes(bytes_ptr, bytes),
+        crate::object::ChannelPayload::Loaned(loaned) => copyout_loaned_bytes(bytes_ptr, loaned),
+    };
+    crate::object::release_channel_read_result(message);
+    if let Err(e) = copy_result {
         return e;
     }
-    if let Err(e) = copyout_optional(actual_bytes_ptr, message.actual_bytes) {
+    if let Err(e) = copyout_optional(actual_bytes_ptr, actual_bytes) {
         return e;
     }
-    if let Err(e) = copyout_optional(actual_handles_ptr, message.actual_handles) {
+    if let Err(e) = copyout_optional(actual_handles_ptr, actual_handles) {
         return e;
     }
     ZX_OK

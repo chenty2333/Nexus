@@ -569,6 +569,119 @@ channel_compare_done:
 	mov 0x798(%rbx), %rax
 	mov %rax, 8*108(%rbx)
 
+	// vmo_create(tx page for loan path)
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	lea 0x7a0(%rbx), %rdx
+	movabs $9, %rax
+	int $0x80
+	mov %rax, 8*109(%rbx)
+
+	// vmar_map(tx page @ USER_CODE_VA + 0x11000)
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x11000, %rdx
+	mov 0x7a0(%rbx), %r10
+	xor %r8d, %r8d
+	movabs $0x1000, %r9
+	lea 0x7a8(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*110(%rbx)
+
+	// vmo_create(rx page for loan readback)
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	lea 0x7b0(%rbx), %rdx
+	movabs $9, %rax
+	int $0x80
+	mov %rax, 8*111(%rbx)
+
+	// vmar_map(rx page @ USER_CODE_VA + 0x12000)
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x12000, %rdx
+	mov 0x7b0(%rbx), %r10
+	xor %r8d, %r8d
+	movabs $0x1000, %r9
+	lea 0x7b8(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*112(%rbx)
+
+	// channel_create(for loan path)
+	lea 0x7c0(%rbx), %rsi
+	lea 0x7c8(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $13, %rax
+	int $0x80
+	mov %rax, 8*113(%rbx)
+
+	// seed tx page with a known snapshot pattern
+	movabs $0x0000000100011000, %rcx
+	movabs $0x1122334455667788, %rax
+	mov %rax, 0x0(%rcx)
+	movabs $0x8877665544332211, %rax
+	mov %rax, 0x8(%rcx)
+
+	// channel_write(full page from tx page)
+	mov 0x7c0(%rbx), %rdi
+	xorl %esi, %esi
+	movabs $0x0000000100011000, %rdx
+	movl $4096, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*114(%rbx)
+
+	// mutate sender page after write; receiver must still observe the old snapshot
+	movabs $0x0000000100011000, %rcx
+	movabs $0x8899aabbccddeeff, %rax
+	mov %rax, 0x0(%rcx)
+
+	// channel_read(full page into rx page)
+	movq $0, 0x7d0(%rbx)
+	movq $0, 0x7d8(%rbx)
+	mov 0x7c8(%rbx), %rdi
+	xorl %esi, %esi
+	movabs $0x0000000100012000, %rdx
+	xorl %r10d, %r10d
+	movl $4096, %r8d
+	xorl %r9d, %r9d
+	lea 0x7d0(%rbx), %rax
+	lea 0x7d8(%rbx), %rcx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rcx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	mov %rax, 8*115(%rbx)
+	mov 0x7d0(%rbx), %rax
+	mov %rax, 8*116(%rbx)
+
+	// snapshot check: sender sees mutated bytes, receiver sees original bytes
+	movq $0, 8*117(%rbx)
+	movabs $0x0000000100011000, %rsi
+	movabs $0x0000000100012000, %rdi
+	mov (%rsi), %r8
+	mov (%rdi), %r9
+	movabs $0x8899aabbccddeeff, %rax
+	cmp %rax, %r8
+	jne channel_loan_snapshot_done
+	movabs $0x1122334455667788, %rax
+	cmp %rax, %r9
+	jne channel_loan_snapshot_done
+	movq $1, 8*117(%rbx)
+channel_loan_snapshot_done:
+
 	// port_wait(wrong type: handle=timer_h)
 	mov 0x698(%rbx), %rdi
 	xor %rsi, %rsi

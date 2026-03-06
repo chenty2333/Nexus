@@ -51,8 +51,14 @@ struct TimerObject {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum ChannelPayload {
+    Copied(Vec<u8>),
+    Loaned(crate::task::LoanedUserPages),
+}
+
+#[derive(Clone, Debug)]
 struct ChannelMessage {
-    bytes: Vec<u8>,
+    payload: ChannelPayload,
 }
 
 #[derive(Debug)]
@@ -79,6 +85,21 @@ impl ChannelEndpoint {
 
     fn writable_via_peer(&self, peer: &ChannelEndpoint) -> bool {
         !self.peer_closed && !peer.closed && peer.messages.len() < CHANNEL_CAPACITY
+    }
+}
+
+impl ChannelPayload {
+    fn actual_bytes(&self) -> Result<u32, zx_status_t> {
+        match self {
+            Self::Copied(bytes) => u32::try_from(bytes.len()).map_err(|_| ZX_ERR_BAD_STATE),
+            Self::Loaned(loaned) => Ok(loaned.len()),
+        }
+    }
+}
+
+impl ChannelMessage {
+    fn actual_bytes(&self) -> Result<u32, zx_status_t> {
+        self.payload.actual_bytes()
     }
 }
 
@@ -130,13 +151,13 @@ enum KernelObject {
 
 /// Result of a successful channel read.
 #[derive(Debug)]
-pub struct ChannelReadResult {
-    /// Message bytes copied out to userspace.
-    pub bytes: Vec<u8>,
+pub(crate) struct ChannelReadResult {
+    /// Dequeued payload.
+    pub(crate) payload: ChannelPayload,
     /// Number of bytes in the dequeued message.
-    pub actual_bytes: u32,
+    pub(crate) actual_bytes: u32,
     /// Number of transferred handles.
-    pub actual_handles: u32,
+    pub(crate) actual_handles: u32,
 }
 
 const USER_SIGNAL_MASK: Signals = Signals::USER_SIGNAL_0
@@ -310,6 +331,32 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
     })
 }
 
+fn release_channel_payload(state: &mut KernelState, payload: ChannelPayload) {
+    if let ChannelPayload::Loaned(loaned) = payload {
+        state.kernel.release_loaned_user_pages(&loaned);
+    }
+}
+
+fn release_channel_message(state: &mut KernelState, message: ChannelMessage) {
+    release_channel_payload(state, message.payload);
+}
+
+fn drain_channel_messages(
+    state: &mut KernelState,
+    messages: impl IntoIterator<Item = ChannelMessage>,
+) {
+    for message in messages {
+        release_channel_message(state, message);
+    }
+}
+
+pub(crate) fn try_loan_current_user_pages(
+    ptr: u64,
+    len: usize,
+) -> Result<Option<crate::task::LoanedUserPages>, zx_status_t> {
+    with_state_mut(|state| state.kernel.try_loan_current_user_pages(ptr, len))
+}
+
 /// Create an EventPair endpoint pair and return both handles.
 pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_status_t> {
     if options != 0 {
@@ -438,42 +485,133 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
 pub fn channel_write(
     handle: zx_handle_t,
     options: u32,
-    bytes: Vec<u8>,
+    payload: ChannelPayload,
     num_handles: u32,
 ) -> Result<(), zx_status_t> {
     if options != 0 {
+        let _ = with_state_mut(|state| {
+            release_channel_payload(state, payload);
+            Ok(())
+        });
         return Err(ZX_ERR_INVALID_ARGS);
     }
     if num_handles != 0 {
+        let _ = with_state_mut(|state| {
+            release_channel_payload(state, payload);
+            Ok(())
+        });
         return Err(ZX_ERR_NOT_SUPPORTED);
     }
 
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let mut payload = Some(payload);
+        let resolved = match state.lookup_handle(handle, crate::task::HandleRights::empty()) {
+            Ok(resolved) => resolved,
+            Err(status) => {
+                if let Some(payload) = payload.take() {
+                    release_channel_payload(state, payload);
+                }
+                return Err(status);
+            }
+        };
         let object_id = resolved.object_id();
         let peer_object_id = {
             let endpoint = match state.objects.get(&object_id) {
                 Some(KernelObject::Channel(endpoint)) => endpoint,
-                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-                None => return Err(ZX_ERR_BAD_HANDLE),
+                Some(_) => {
+                    if let Some(payload) = payload.take() {
+                        release_channel_payload(state, payload);
+                    }
+                    return Err(ZX_ERR_WRONG_TYPE);
+                }
+                None => {
+                    if let Some(payload) = payload.take() {
+                        release_channel_payload(state, payload);
+                    }
+                    return Err(ZX_ERR_BAD_HANDLE);
+                }
             };
-            require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
+            if let Err(status) = require_handle_rights(resolved, crate::task::HandleRights::WRITE) {
+                if let Some(payload) = payload.take() {
+                    release_channel_payload(state, payload);
+                }
+                return Err(status);
+            }
             endpoint.peer_object_id
         };
 
         {
-            let peer = match state.objects.get_mut(&peer_object_id) {
+            let peer = match state.objects.get(&peer_object_id) {
                 Some(KernelObject::Channel(peer)) => peer,
-                Some(_) => return Err(ZX_ERR_BAD_STATE),
-                None => return Err(ZX_ERR_PEER_CLOSED),
+                Some(_) => {
+                    if let Some(payload) = payload.take() {
+                        release_channel_payload(state, payload);
+                    }
+                    return Err(ZX_ERR_BAD_STATE);
+                }
+                None => {
+                    if let Some(payload) = payload.take() {
+                        release_channel_payload(state, payload);
+                    }
+                    return Err(ZX_ERR_PEER_CLOSED);
+                }
             };
             if peer.closed {
+                if let Some(payload) = payload.take() {
+                    release_channel_payload(state, payload);
+                }
                 return Err(ZX_ERR_PEER_CLOSED);
             }
             if peer.messages.len() >= CHANNEL_CAPACITY {
+                if let Some(payload) = payload.take() {
+                    release_channel_payload(state, payload);
+                }
                 return Err(ZX_ERR_SHOULD_WAIT);
             }
-            peer.messages.push_back(ChannelMessage { bytes });
+        }
+
+        if let Some(ChannelPayload::Loaned(loaned)) = payload.as_ref()
+            && let Err(status) = state.kernel.arm_loaned_user_pages_copy_on_write(loaned)
+        {
+            if let Some(payload) = payload.take() {
+                release_channel_payload(state, payload);
+            }
+            return Err(status);
+        }
+
+        let peer_status = {
+            let peer = match state.objects.get_mut(&peer_object_id) {
+                Some(KernelObject::Channel(peer)) => peer,
+                Some(_) => {
+                    if let Some(payload) = payload.take() {
+                        release_channel_payload(state, payload);
+                    }
+                    return Err(ZX_ERR_BAD_STATE);
+                }
+                None => {
+                    if let Some(payload) = payload.take() {
+                        release_channel_payload(state, payload);
+                    }
+                    return Err(ZX_ERR_PEER_CLOSED);
+                }
+            };
+            if peer.closed {
+                Some(ZX_ERR_PEER_CLOSED)
+            } else if peer.messages.len() >= CHANNEL_CAPACITY {
+                Some(ZX_ERR_SHOULD_WAIT)
+            } else {
+                let message = ChannelMessage {
+                    payload: payload.take().ok_or(ZX_ERR_BAD_STATE)?,
+                };
+                peer.messages.push_back(message);
+                None
+            }
+        };
+        if let Some(status) = peer_status {
+            if let Some(payload) = payload.take() {
+                release_channel_payload(state, payload);
+            }
+            return Err(status);
         }
 
         let _ = notify_waitable_signals_changed(state, object_id);
@@ -507,8 +645,7 @@ pub fn channel_read(
         };
         require_handle_rights(resolved, crate::task::HandleRights::READ).map_err(|e| (e, 0, 0))?;
         if let Some(message) = endpoint.messages.front() {
-            let actual_bytes =
-                u32::try_from(message.bytes.len()).map_err(|_| (ZX_ERR_BAD_STATE, 0, 0))?;
+            let actual_bytes = message.actual_bytes().map_err(|e| (e, 0, 0))?;
             if num_bytes < actual_bytes {
                 return Err((ZX_ERR_BUFFER_TOO_SMALL, actual_bytes, 0));
             }
@@ -531,16 +668,23 @@ pub fn channel_read(
             .pop_front()
             .ok_or((ZX_ERR_BAD_STATE, 0, 0))?
     };
-    let actual_bytes = u32::try_from(message.bytes.len()).map_err(|_| (ZX_ERR_BAD_STATE, 0, 0))?;
+    let actual_bytes = message.actual_bytes().map_err(|e| (e, 0, 0))?;
 
     let _ = notify_waitable_signals_changed(state, object_id);
     let _ = notify_waitable_signals_changed(state, peer_object_id);
 
     Ok(ChannelReadResult {
-        bytes: message.bytes,
+        payload: message.payload,
         actual_bytes,
         actual_handles: 0,
     })
+}
+
+pub(crate) fn release_channel_read_result(result: ChannelReadResult) {
+    let _ = with_state_mut(|state| {
+        release_channel_payload(state, result.payload);
+        Ok(())
+    });
 }
 
 /// Signal the peer side of an EventPair.
@@ -966,43 +1110,37 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
         let resolved = state.lookup_handle(raw, crate::task::HandleRights::empty())?;
         let object_id = resolved.object_id();
         let peer_link = match state.objects.get(&object_id) {
-            Some(KernelObject::Channel(endpoint)) => {
-                Some((ObjectKind::Channel, endpoint.peer_object_id))
-            }
-            Some(KernelObject::EventPair(endpoint)) => {
-                Some((ObjectKind::EventPair, endpoint.peer_object_id))
-            }
+            Some(KernelObject::Channel(endpoint)) => Some(endpoint.peer_object_id),
+            Some(KernelObject::EventPair(endpoint)) => Some(endpoint.peer_object_id),
             Some(_) => None,
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         state.close_handle(raw)?;
 
-        if let Some((kind, peer_object_id)) = peer_link {
-            match kind {
-                ObjectKind::Channel => {
-                    if let Some(KernelObject::Channel(endpoint)) = state.objects.get_mut(&object_id)
-                    {
-                        endpoint.closed = true;
-                    }
+        if let Some(peer_object_id) = peer_link {
+            let removed = state.objects.remove(&object_id);
+            match removed {
+                Some(KernelObject::Channel(mut endpoint)) => {
+                    endpoint.closed = true;
+                    let drained = endpoint.messages.drain(..).collect::<Vec<_>>();
+                    drain_channel_messages(state, drained);
                     if let Some(KernelObject::Channel(peer)) =
                         state.objects.get_mut(&peer_object_id)
                     {
                         peer.peer_closed = true;
                     }
                 }
-                ObjectKind::EventPair => {
-                    if let Some(KernelObject::EventPair(endpoint)) =
-                        state.objects.get_mut(&object_id)
-                    {
-                        endpoint.closed = true;
-                    }
+                Some(KernelObject::EventPair(_)) => {
                     if let Some(KernelObject::EventPair(peer)) =
                         state.objects.get_mut(&peer_object_id)
                     {
                         peer.peer_closed = true;
                     }
                 }
-                _ => {}
+                Some(other) => {
+                    state.objects.insert(object_id, other);
+                }
+                None => {}
             }
             let _ = notify_waitable_signals_changed(state, object_id);
             let _ = notify_waitable_signals_changed(state, peer_object_id);

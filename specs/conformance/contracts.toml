@@ -76,6 +76,11 @@ level = "should"
 description = "Closing one bootstrap channel endpoint should immediately expose PEER_CLOSED on the peer and reject further writes"
 
 [[contracts]]
+id = "should.channel.page_loan_snapshot_bootstrap"
+level = "should"
+description = "Page-aligned bootstrap channel writes should preserve the send-time snapshot even if the sender mutates its mapping before the peer reads"
+
+[[contracts]]
 id = "should.eventpair.signal_peer_bootstrap"
 level = "should"
 description = "Bootstrap eventpair create and signal_peer should drive peer user signals with stable error codes"
