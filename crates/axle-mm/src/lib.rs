@@ -1316,6 +1316,105 @@ impl AddressSpace {
         })
     }
 
+    /// Replace every page of one anonymous mapping with shared frames and arm it for COW.
+    pub fn replace_mapping_frames_copy_on_write(
+        &mut self,
+        frames: &mut FrameTable,
+        base: u64,
+        len: u64,
+        replacement_frames: &[FrameId],
+    ) -> Result<(), AddressSpaceError> {
+        validate_mapping_range(base, len)?;
+        let page_count =
+            usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
+        if replacement_frames.len() != page_count {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+
+        let index = self
+            .vmas
+            .iter()
+            .position(|vma| vma.base == base && vma.len == len)
+            .ok_or(AddressSpaceError::NotFound)?;
+        let vma = self.vmas[index];
+        if !vma.max_perms.contains(MappingPerms::WRITE) {
+            return Err(AddressSpaceError::PermissionIncrease);
+        }
+
+        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        if vmo.kind() != VmoKind::Anonymous {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+
+        let mut page_rebindings = Vec::with_capacity(page_count);
+        for (page_index, &new_frame_id) in replacement_frames.iter().enumerate() {
+            if !frames.contains(new_frame_id) {
+                return Err(AddressSpaceError::InvalidFrame);
+            }
+            let page_offset = vma
+                .vmo_offset
+                .checked_add((page_index as u64) * PAGE_SIZE)
+                .ok_or(AddressSpaceError::InvalidArgs)?;
+            let old_frame_id = vmo.frame_at_offset(page_offset);
+            if let Some(existing) = old_frame_id {
+                let state = frames
+                    .state(existing)
+                    .ok_or(AddressSpaceError::InvalidFrame)?;
+                if state.ref_count() == 0 {
+                    return Err(AddressSpaceError::FrameTable(FrameTableError::RefUnderflow));
+                }
+            }
+            page_rebindings.push((page_offset, old_frame_id, new_frame_id));
+        }
+
+        let mut incremented = Vec::new();
+        for &(_, old_frame_id, new_frame_id) in &page_rebindings {
+            if old_frame_id == Some(new_frame_id) {
+                continue;
+            }
+            if let Err(err) = frames.inc_ref(new_frame_id) {
+                for rollback in incremented {
+                    let _ = frames.dec_ref(rollback);
+                }
+                return Err(AddressSpaceError::FrameTable(err));
+            }
+            incremented.push(new_frame_id);
+        }
+
+        for &(_, old_frame_id, new_frame_id) in &page_rebindings {
+            let Some(old_frame_id) = old_frame_id else {
+                continue;
+            };
+            if old_frame_id == new_frame_id {
+                continue;
+            }
+            frames
+                .dec_ref(old_frame_id)
+                .map_err(AddressSpaceError::FrameTable)?;
+        }
+
+        for &(page_offset, old_frame_id, new_frame_id) in &page_rebindings {
+            if old_frame_id == Some(new_frame_id) {
+                continue;
+            }
+            self.rebind_vmo_frame(vma.vmo_id, page_offset, new_frame_id)?;
+        }
+
+        let vma = self
+            .vmas
+            .get_mut(index)
+            .ok_or(AddressSpaceError::NotFound)?;
+        vma.perms.remove(MappingPerms::WRITE);
+        vma.copy_on_write = true;
+        let _ = vma;
+        self.pte_meta.update_range(base, len, |meta| {
+            meta.tag = PteMetaTag::Present;
+            meta.logical_write = true;
+            meta.cow_shared = true;
+        })?;
+        Ok(())
+    }
+
     /// Resolve one virtual address to its backing VMO metadata.
     pub fn lookup(&self, va: u64) -> Option<VmaLookup> {
         let vma = self.vmas.iter().copied().find(|vma| vma.contains(va))?;
@@ -1897,6 +1996,47 @@ mod tests {
             PteMetaTag::Present
         );
         assert_eq!(frames.state(frame).unwrap().ref_count(), 1);
+    }
+
+    #[test]
+    fn replace_mapping_frames_copy_on_write_rebinds_shared_pages() {
+        let mut frames = FrameTable::new();
+        let original = frames.register_existing(0x91_000).unwrap();
+        let shared = frames.register_existing(0x92_000).unwrap();
+
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(22))
+            .unwrap();
+        space.bind_vmo_frame(vmo, 0, original).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        space
+            .replace_mapping_frames_copy_on_write(&mut frames, ROOT_BASE, PAGE_SIZE, &[shared])
+            .unwrap();
+
+        let lookup = space.lookup(ROOT_BASE).unwrap();
+        assert_eq!(lookup.frame_id(), Some(shared));
+        assert!(lookup.is_copy_on_write());
+        assert!(!lookup.perms().contains(MappingPerms::WRITE));
+
+        let meta = space.pte_meta(ROOT_BASE).unwrap();
+        assert_eq!(meta.tag(), PteMetaTag::Present);
+        assert!(meta.logical_write());
+        assert!(meta.cow_shared());
+
+        assert_eq!(frames.state(original).unwrap().ref_count(), 0);
+        assert_eq!(frames.state(shared).unwrap().ref_count(), 1);
     }
 
     #[test]

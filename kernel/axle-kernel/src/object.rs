@@ -75,15 +75,17 @@ struct ChannelMessage {
 #[derive(Debug)]
 struct ChannelEndpoint {
     peer_object_id: u64,
+    owner_address_space_id: u64,
     messages: VecDeque<ChannelMessage>,
     peer_closed: bool,
     closed: bool,
 }
 
 impl ChannelEndpoint {
-    fn new(peer_object_id: u64) -> Self {
+    fn new(peer_object_id: u64, owner_address_space_id: u64) -> Self {
         Self {
             peer_object_id,
+            owner_address_space_id,
             messages: VecDeque::new(),
             peer_closed: false,
             closed: false,
@@ -440,15 +442,19 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
     }
 
     with_state_mut(|state| {
+        let owner_address_space_id = state.kernel.current_root_vmar()?.address_space_id();
         let left_object_id = state.alloc_object_id();
         let right_object_id = state.alloc_object_id();
         state.objects.insert(
             left_object_id,
-            KernelObject::Channel(ChannelEndpoint::new(right_object_id)),
+            KernelObject::Channel(ChannelEndpoint::new(
+                right_object_id,
+                owner_address_space_id,
+            )),
         );
         state.objects.insert(
             right_object_id,
-            KernelObject::Channel(ChannelEndpoint::new(left_object_id)),
+            KernelObject::Channel(ChannelEndpoint::new(left_object_id, owner_address_space_id)),
         );
 
         let left_handle =
@@ -499,6 +505,13 @@ pub(crate) fn try_loan_current_user_pages(
     len: usize,
 ) -> Result<Option<crate::task::LoanedUserPages>, zx_status_t> {
     with_state_mut(|state| state.kernel.try_loan_current_user_pages(ptr, len))
+}
+
+pub(crate) fn try_remap_loaned_channel_read(
+    dst_base: u64,
+    loaned: &crate::task::LoanedUserPages,
+) -> Result<bool, zx_status_t> {
+    with_state_mut(|state| state.kernel.try_remap_loaned_channel_read(dst_base, loaned))
 }
 
 /// Create a new thread object in the target process and return a handle.
@@ -770,7 +783,7 @@ pub fn channel_write(
             endpoint.peer_object_id
         };
 
-        {
+        let receiver_address_space_id = {
             let peer = match state.objects.get(&peer_object_id) {
                 Some(KernelObject::Channel(peer)) => peer,
                 Some(_) => {
@@ -798,13 +811,16 @@ pub fn channel_write(
                 }
                 return Err(ZX_ERR_SHOULD_WAIT);
             }
-        }
+            peer.owner_address_space_id
+        };
 
-        if let Some(ChannelPayload::Loaned(loaned)) = payload.as_ref()
-            && let Err(status) = state.kernel.arm_loaned_user_pages_copy_on_write(loaned)
+        if let Some(ChannelPayload::Loaned(loaned)) = payload.as_mut()
+            && let Err(status) = state
+                .kernel
+                .prepare_loaned_channel_write(loaned, receiver_address_space_id)
         {
-            if let Some(payload) = payload.take() {
-                release_channel_payload(state, payload);
+            if let Some(released) = payload.take() {
+                release_channel_payload(state, released);
             }
             return Err(status);
         }

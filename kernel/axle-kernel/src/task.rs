@@ -321,6 +321,7 @@ impl PortWaiter {
 #[derive(Clone, Debug)]
 pub(crate) struct LoanedUserPages {
     address_space_id: AddressSpaceId,
+    receiver_address_space_id: Option<AddressSpaceId>,
     base: u64,
     len: u32,
     needs_cow: bool,
@@ -330,6 +331,10 @@ pub(crate) struct LoanedUserPages {
 impl LoanedUserPages {
     pub(crate) const fn address_space_id(&self) -> AddressSpaceId {
         self.address_space_id
+    }
+
+    pub(crate) const fn receiver_address_space_id(&self) -> Option<AddressSpaceId> {
+        self.receiver_address_space_id
     }
 
     pub(crate) const fn base(&self) -> u64 {
@@ -346,6 +351,10 @@ impl LoanedUserPages {
 
     pub(crate) fn pages(&self) -> &[FrameId] {
         &self.pages
+    }
+
+    fn bind_receiver_address_space(&mut self, address_space_id: AddressSpaceId) {
+        self.receiver_address_space_id = Some(address_space_id);
     }
 }
 
@@ -438,6 +447,27 @@ impl AddressSpaceTxSet {
             }
         }
         active.commit()
+    }
+}
+
+#[derive(Debug)]
+struct ChannelLoanTx {
+    tx_set: AddressSpaceTxSet,
+    sender_key: AddressSpaceTxKey,
+    receiver_key: AddressSpaceTxKey,
+}
+
+impl ChannelLoanTx {
+    fn sender_cursor_mut(&mut self) -> Option<&mut BootstrapTxCursor> {
+        self.tx_set.cursor_mut(self.sender_key)
+    }
+
+    fn receiver_cursor_mut(&mut self) -> Option<&mut BootstrapTxCursor> {
+        self.tx_set.cursor_mut(self.receiver_key)
+    }
+
+    fn commit(self) -> Result<(), PageTableError> {
+        self.tx_set.commit()
     }
 }
 
@@ -668,6 +698,17 @@ impl AddressSpace {
 
     fn arm_copy_on_write(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
         self.vm.mark_copy_on_write(base, len)
+    }
+
+    fn replace_mapping_frames_copy_on_write(
+        &mut self,
+        frames: &mut FrameTable,
+        base: u64,
+        len: u64,
+        replacement_frames: &[FrameId],
+    ) -> Result<(), AddressSpaceError> {
+        self.vm
+            .replace_mapping_frames_copy_on_write(frames, base, len, replacement_frames)
     }
 }
 
@@ -1044,6 +1085,7 @@ impl Kernel {
         })?;
         Ok(Some(LoanedUserPages {
             address_space_id,
+            receiver_address_space_id: None,
             base: ptr,
             len: len_u32,
             needs_cow: lookup.max_perms().contains(MappingPerms::WRITE),
@@ -1055,26 +1097,124 @@ impl Kernel {
         self.unpin_loaned_pages_inner(loaned.pages())
     }
 
-    pub(crate) fn arm_loaned_user_pages_copy_on_write(
+    pub(crate) fn prepare_loaned_channel_write(
         &mut self,
-        loaned: &LoanedUserPages,
+        loaned: &mut LoanedUserPages,
+        receiver_address_space_id: AddressSpaceId,
     ) -> Result<(), zx_status_t> {
         if !loaned.needs_cow() {
+            loaned.bind_receiver_address_space(receiver_address_space_id);
             return Ok(());
         }
 
-        let address_space_id = loaned.address_space_id();
         let len = u64::from(loaned.len());
+        let range = PageRange::new(loaned.base(), len).map_err(map_page_table_error)?;
+        let mut loan_tx = self.lock_channel_loan_tx(
+            loaned.address_space_id(),
+            range,
+            receiver_address_space_id,
+            range,
+        )?;
         {
             let address_space = self
                 .address_spaces
-                .get_mut(&address_space_id)
+                .get_mut(&loaned.address_space_id())
                 .ok_or(ZX_ERR_BAD_STATE)?;
             address_space
                 .arm_copy_on_write(loaned.base(), len)
                 .map_err(map_address_space_error)?;
         }
-        self.update_mapping_pages(address_space_id, loaned.base(), len)
+        loaned.bind_receiver_address_space(receiver_address_space_id);
+        let sender_cursor = loan_tx.sender_cursor_mut().ok_or(ZX_ERR_BAD_STATE)?;
+        self.sync_mapping_pages_locked(
+            loaned.address_space_id(),
+            loaned.base(),
+            len,
+            sender_cursor,
+        )?;
+        loan_tx.commit().map_err(map_page_table_error)
+    }
+
+    pub(crate) fn try_remap_loaned_channel_read(
+        &mut self,
+        dst_base: u64,
+        loaned: &LoanedUserPages,
+    ) -> Result<bool, zx_status_t> {
+        let Some(receiver_address_space_id) = loaned.receiver_address_space_id() else {
+            return Ok(false);
+        };
+
+        let len = u64::from(loaned.len());
+        if len == 0
+            || (dst_base & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
+            || (len & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
+        {
+            return Ok(false);
+        }
+
+        let current_address_space_id = self.current_process()?.address_space_id;
+        if current_address_space_id != receiver_address_space_id {
+            return Ok(false);
+        }
+
+        let receiver_lookup = self
+            .address_spaces
+            .get(&receiver_address_space_id)
+            .and_then(|space| space.lookup_user_mapping(dst_base, len as usize));
+        let Some(receiver_lookup) = receiver_lookup else {
+            return Ok(false);
+        };
+        if receiver_lookup.mapping_base() != dst_base
+            || receiver_lookup.mapping_len() != len
+            || receiver_lookup.vmo_kind() != VmoKind::Anonymous
+            || !receiver_lookup.max_perms().contains(MappingPerms::WRITE)
+        {
+            return Ok(false);
+        }
+
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if page_count != loaned.pages().len() {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        for page_index in 0..page_count {
+            let page_va = dst_base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            let meta = self
+                .address_spaces
+                .get(&receiver_address_space_id)
+                .and_then(|space| space.page_meta(page_va))
+                .ok_or(ZX_ERR_INVALID_ARGS)?;
+            if !meta.logical_write() {
+                return Ok(false);
+            }
+        }
+
+        let sender_range = PageRange::new(loaned.base(), len).map_err(map_page_table_error)?;
+        let receiver_range = PageRange::new(dst_base, len).map_err(map_page_table_error)?;
+        let mut loan_tx = self.lock_channel_loan_tx(
+            loaned.address_space_id(),
+            sender_range,
+            receiver_address_space_id,
+            receiver_range,
+        )?;
+        {
+            let receiver = self
+                .address_spaces
+                .get_mut(&receiver_address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            receiver
+                .replace_mapping_frames_copy_on_write(
+                    &mut self.frames,
+                    dst_base,
+                    len,
+                    loaned.pages(),
+                )
+                .map_err(map_address_space_error)?;
+        }
+        let receiver_cursor = loan_tx.receiver_cursor_mut().ok_or(ZX_ERR_BAD_STATE)?;
+        self.sync_mapping_pages_locked(receiver_address_space_id, dst_base, len, receiver_cursor)?;
+        loan_tx.commit().map_err(map_page_table_error)?;
+        Ok(true)
     }
 
     pub(crate) fn current_root_vmar(&self) -> Result<RootVmarInfo, zx_status_t> {
@@ -1691,6 +1831,36 @@ impl Kernel {
         Ok(tx_set)
     }
 
+    fn lock_channel_loan_tx(
+        &self,
+        sender_address_space_id: AddressSpaceId,
+        sender_range: PageRange,
+        receiver_address_space_id: AddressSpaceId,
+        receiver_range: PageRange,
+    ) -> Result<ChannelLoanTx, zx_status_t> {
+        if sender_address_space_id == receiver_address_space_id {
+            let combined_range =
+                merge_page_ranges(sender_range, receiver_range).map_err(map_page_table_error)?;
+            let request = AddressSpaceTxRequest::new(sender_address_space_id, combined_range);
+            let tx_set = self.lock_address_space_tx_set(&[request])?;
+            return Ok(ChannelLoanTx {
+                tx_set,
+                sender_key: request.key,
+                receiver_key: request.key,
+            });
+        }
+
+        let sender_request = AddressSpaceTxRequest::new(sender_address_space_id, sender_range);
+        let receiver_request =
+            AddressSpaceTxRequest::new(receiver_address_space_id, receiver_range);
+        let tx_set = self.lock_address_space_tx_set(&[sender_request, receiver_request])?;
+        Ok(ChannelLoanTx {
+            tx_set,
+            sender_key: sender_request.key,
+            receiver_key: receiver_request.key,
+        })
+    }
+
     fn clear_mapping_pages(
         &self,
         address_space_id: AddressSpaceId,
@@ -1788,14 +1958,25 @@ impl Kernel {
         base: u64,
         len: u64,
     ) -> Result<(), zx_status_t> {
-        let address_space = self
-            .address_spaces
-            .get(&address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
         let range = PageRange::new(base, len).map_err(map_page_table_error)?;
         let request = AddressSpaceTxRequest::new(address_space_id, range);
         let mut tx_set = self.lock_address_space_tx_set(&[request])?;
         let tx = tx_set.cursor_mut(request.key).ok_or(ZX_ERR_BAD_STATE)?;
+        self.sync_mapping_pages_locked(address_space_id, base, len, tx)?;
+        tx_set.commit().map_err(map_page_table_error)
+    }
+
+    fn sync_mapping_pages_locked(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+        tx: &mut BootstrapTxCursor,
+    ) -> Result<(), zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
         let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
             .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
         for page_index in 0..page_count {
@@ -1821,7 +2002,7 @@ impl Kernel {
                 }
             }
         }
-        tx_set.commit().map_err(map_page_table_error)
+        Ok(())
     }
 
     fn unpin_loaned_pages_inner(&mut self, pages: &[FrameId]) {
@@ -1829,6 +2010,13 @@ impl Kernel {
             let _ = self.frames.unpin(frame_id);
         }
     }
+}
+
+fn merge_page_ranges(left: PageRange, right: PageRange) -> Result<PageRange, PageTableError> {
+    let base = left.base().min(right.base());
+    let end = left.end().max(right.end());
+    let len = end.checked_sub(base).ok_or(PageTableError::InvalidArgs)?;
+    PageRange::new(base, len)
 }
 
 fn map_alloc_error(err: CSpaceError) -> zx_status_t {

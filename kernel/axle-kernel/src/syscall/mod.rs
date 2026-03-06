@@ -710,7 +710,13 @@ fn sys_channel_read(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
     let actual_handles = message.actual_handles;
     let copy_result = match &message.payload {
         crate::object::ChannelPayload::Copied(bytes) => copyout_bytes(bytes_ptr, bytes),
-        crate::object::ChannelPayload::Loaned(loaned) => copyout_loaned_bytes(bytes_ptr, loaned),
+        crate::object::ChannelPayload::Loaned(loaned) => {
+            match crate::object::try_remap_loaned_channel_read(bytes_ptr as u64, loaned) {
+                Ok(true) => Ok(()),
+                Ok(false) => copyout_loaned_bytes(bytes_ptr, loaned),
+                Err(e) => Err(e),
+            }
+        }
     };
     crate::object::release_channel_read_result(message);
     if let Err(e) = copy_result {
