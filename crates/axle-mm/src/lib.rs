@@ -481,6 +481,15 @@ pub enum FutexKey {
 }
 
 impl FutexKey {
+    /// Build a private anonymous fallback key from the current process and address.
+    pub fn private_anonymous(process_id: u64, user_addr: u64) -> Self {
+        Self::PrivateAnonymous {
+            process_id,
+            page_base: align_down(user_addr, PAGE_SIZE),
+            byte_offset: (user_addr & (PAGE_SIZE - 1)) as u16,
+        }
+    }
+
     /// Build a futex key from resolved mapping metadata.
     pub fn from_lookup(process_id: u64, user_addr: u64, lookup: VmaLookup) -> Self {
         if lookup.global_vmo_id().raw() != 0 {
@@ -490,11 +499,7 @@ impl FutexKey {
             };
         }
 
-        Self::PrivateAnonymous {
-            process_id,
-            page_base: align_down(user_addr, PAGE_SIZE),
-            byte_offset: (user_addr & (PAGE_SIZE - 1)) as u16,
-        }
+        Self::private_anonymous(process_id, user_addr)
     }
 }
 

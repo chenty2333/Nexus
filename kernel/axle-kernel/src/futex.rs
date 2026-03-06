@@ -63,6 +63,14 @@ impl FutexTable {
             .unwrap_or(ZX_KOID_INVALID)
     }
 
+    /// Return whether `thread_id` is currently queued on `key`.
+    pub(crate) fn is_waiter(&self, key: FutexKey, thread_id: u64) -> bool {
+        self.queues
+            .get(&key)
+            .map(|queue| queue.waiters.iter().any(|waiter| *waiter == thread_id))
+            .unwrap_or(false)
+    }
+
     /// Enqueue one waiter in FIFO order.
     pub(crate) fn enqueue_waiter(&mut self, key: FutexKey, thread_id: u64, owner_koid: zx_koid_t) {
         let queue = self.queues.entry(key).or_default();
@@ -105,7 +113,7 @@ impl FutexTable {
         }
         if single_owner {
             queue.owner_koid = new_owner_koid;
-        } else if !result.woken.is_empty() {
+        } else {
             queue.owner_koid = ZX_KOID_INVALID;
         }
         result.remaining = queue.waiters.len();
@@ -149,25 +157,17 @@ impl FutexTable {
                 moved.push_back(thread_id);
                 result.requeued += 1;
             }
-            if !result.woken.is_empty() {
-                source_queue.owner_koid = ZX_KOID_INVALID;
-            }
+            source_queue.owner_koid = ZX_KOID_INVALID;
             result.source_remaining = source_queue.waiters.len();
         }
 
-        if !moved.is_empty() {
+        {
             let target_queue = self.queues.entry(target).or_default();
-            if target_owner_koid != ZX_KOID_INVALID {
-                target_queue.owner_koid = target_owner_koid;
+            target_queue.owner_koid = target_owner_koid;
+            if !moved.is_empty() {
+                target_queue.waiters.extend(moved);
             }
-            target_queue.waiters.extend(moved);
             result.target_remaining = target_queue.waiters.len();
-        } else {
-            result.target_remaining = self
-                .queues
-                .get(&target)
-                .map(|queue| queue.waiters.len())
-                .unwrap_or(0);
         }
 
         self.gc_key(source);
@@ -246,5 +246,37 @@ mod tests {
         let WakeResult { woken, remaining } = table.wake(key, 2, 0, false);
         assert_eq!(woken, alloc::vec![2]);
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn wake_zero_clears_owner_even_without_waiters() {
+        let key = shared_key(7, 0x20);
+        let mut table = FutexTable::new();
+        table.enqueue_waiter(key, 1, 99);
+
+        let WakeResult { woken, remaining } = table.wake(key, 0, ZX_KOID_INVALID, false);
+        assert!(woken.is_empty());
+        assert_eq!(remaining, 1);
+        assert_eq!(table.owner(key), ZX_KOID_INVALID);
+    }
+
+    #[test]
+    fn requeue_sets_owner_even_without_moving_waiters() {
+        let source = shared_key(3, 0);
+        let target = shared_key(4, 0);
+        let mut table = FutexTable::new();
+
+        let RequeueResult {
+            woken,
+            requeued,
+            source_remaining,
+            target_remaining,
+        } = table.requeue(source, target, 0, 0, 55);
+
+        assert!(woken.is_empty());
+        assert_eq!(requeued, 0);
+        assert_eq!(source_remaining, 0);
+        assert_eq!(target_remaining, 0);
+        assert_eq!(table.owner(target), 55);
     }
 }

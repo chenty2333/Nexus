@@ -11,6 +11,8 @@ use axle_core::{
 };
 use axle_mm::{MappingPerms, VmarId, VmoId};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
+use axle_types::handle::ZX_HANDLE_INVALID;
+use axle_types::koid::ZX_KOID_INVALID;
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
 use axle_types::rights::{ZX_RIGHT_SAME_RIGHTS, ZX_RIGHTS_ALL};
 use axle_types::status::{
@@ -20,10 +22,11 @@ use axle_types::status::{
 };
 use axle_types::vm::{ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC};
 use axle_types::{
-    zx_clock_t, zx_handle_t, zx_koid_t, zx_packet_user_t, zx_port_packet_t, zx_rights_t,
-    zx_status_t, zx_vaddr_t,
+    zx_clock_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_packet_user_t, zx_port_packet_t,
+    zx_rights_t, zx_status_t, zx_vaddr_t,
 };
 use axle_types::{zx_packet_signal_t, zx_signals_t};
+use core::mem::size_of;
 use spin::Mutex;
 
 const PORT_CAPACITY: usize = 64;
@@ -312,6 +315,32 @@ pub fn bootstrap_self_thread_handle() -> Option<zx_handle_t> {
     let mut guard = STATE.lock();
     let state = guard.as_mut()?;
     Some(state.bootstrap_self_thread_handle)
+}
+
+/// Return the bootstrap current-thread koid.
+pub fn bootstrap_self_thread_koid() -> Option<zx_koid_t> {
+    let mut guard = STATE.lock();
+    let state = guard.as_mut()?;
+    state.kernel.current_thread_koid().ok()
+}
+
+#[allow(dead_code)]
+pub(crate) fn resolve_current_futex_key_relaxed(
+    user_addr: zx_vaddr_t,
+) -> Result<axle_mm::FutexKey, zx_status_t> {
+    with_state_mut(|state| state.kernel.resolve_current_futex_key_relaxed(user_addr))
+}
+
+fn read_current_futex_word(user_addr: zx_vaddr_t) -> Result<zx_futex_t, zx_status_t> {
+    if (user_addr & 0x3) != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if !crate::userspace::validate_user_ptr(user_addr, size_of::<zx_futex_t>()) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    let ptr = user_addr as *const zx_futex_t;
+    // SAFETY: the user range was validated above and the word is read-only here.
+    unsafe { Ok(core::ptr::read_unaligned(ptr)) }
 }
 
 #[allow(dead_code)]
@@ -924,6 +953,152 @@ pub fn vmar_protect(
             .kernel
             .protect_current_vmar(vmar.address_space_id, vmar.vmar_id, addr, len, perms)
     })
+}
+
+fn validate_futex_wait_owner(
+    state: &KernelState,
+    key: axle_mm::FutexKey,
+    owner_handle: zx_handle_t,
+) -> Result<zx_koid_t, zx_status_t> {
+    if owner_handle == ZX_HANDLE_INVALID {
+        return Ok(ZX_KOID_INVALID);
+    }
+    let resolved = state.lookup_handle(owner_handle, crate::task::HandleRights::empty())?;
+    let thread = match state.objects.get(&resolved.object_id()) {
+        Some(KernelObject::Thread(thread)) => *thread,
+        Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+        None => return Err(ZX_ERR_BAD_HANDLE),
+    };
+    let current = state.kernel.current_thread_info()?;
+    if thread.thread_id == current.thread_id()
+        || state
+            .kernel
+            .thread_is_waiting_on_futex(thread.thread_id, key)
+    {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    Ok(thread.koid)
+}
+
+fn validate_futex_requeue_owner(
+    state: &KernelState,
+    source: axle_mm::FutexKey,
+    target: axle_mm::FutexKey,
+    owner_handle: zx_handle_t,
+) -> Result<zx_koid_t, zx_status_t> {
+    if owner_handle == ZX_HANDLE_INVALID {
+        return Ok(ZX_KOID_INVALID);
+    }
+    let resolved = state.lookup_handle(owner_handle, crate::task::HandleRights::empty())?;
+    let thread = match state.objects.get(&resolved.object_id()) {
+        Some(KernelObject::Thread(thread)) => *thread,
+        Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+        None => return Err(ZX_ERR_BAD_HANDLE),
+    };
+    if state
+        .kernel
+        .thread_is_waiting_on_futex(thread.thread_id, source)
+        || state
+            .kernel
+            .thread_is_waiting_on_futex(thread.thread_id, target)
+    {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    Ok(thread.koid)
+}
+
+/// Wait on a futex word until another thread wakes it or the deadline expires.
+pub fn futex_wait(
+    value_ptr: zx_vaddr_t,
+    current_value: zx_futex_t,
+    new_futex_owner: zx_handle_t,
+    deadline: i64,
+) -> Result<(), zx_status_t> {
+    let observed = read_current_futex_word(value_ptr)?;
+    if observed != current_value {
+        return Err(ZX_ERR_BAD_STATE);
+    }
+    let key = resolve_current_futex_key(value_ptr)?;
+
+    with_state_mut(|state| {
+        let owner_koid = validate_futex_wait_owner(state, key, new_futex_owner)?;
+        state.kernel.enqueue_current_futex_wait(key, owner_koid)
+    })?;
+
+    loop {
+        let still_waiting = with_state_mut(|state| {
+            let current = state.kernel.current_thread_info()?;
+            Ok(state
+                .kernel
+                .thread_is_waiting_on_futex(current.thread_id(), key))
+        })?;
+        if !still_waiting {
+            return Ok(());
+        }
+
+        let now = crate::time::now_ns();
+        if deadline != i64::MAX && deadline <= now {
+            with_state_mut(|state| {
+                let _ = state.kernel.cancel_current_futex_wait()?;
+                Ok(())
+            })?;
+            return Err(ZX_ERR_TIMED_OUT);
+        }
+
+        x86_64::instructions::interrupts::enable_and_hlt();
+        x86_64::instructions::interrupts::disable();
+    }
+}
+
+/// Wake up to `wake_count` waiters from one futex.
+pub fn futex_wake(value_ptr: zx_vaddr_t, wake_count: u32) -> Result<(), zx_status_t> {
+    let key = resolve_current_futex_key_relaxed(value_ptr)?;
+    with_state_mut(|state| {
+        let _ =
+            state
+                .kernel
+                .wake_futex_waiters(key, wake_count as usize, ZX_KOID_INVALID, false)?;
+        Ok(())
+    })
+}
+
+/// Move waiters from one futex queue to another.
+pub fn futex_requeue(
+    value_ptr: zx_vaddr_t,
+    wake_count: u32,
+    current_value: zx_futex_t,
+    requeue_ptr: zx_vaddr_t,
+    requeue_count: u32,
+    new_requeue_owner: zx_handle_t,
+) -> Result<(), zx_status_t> {
+    let source_key = resolve_current_futex_key(value_ptr)?;
+    let target_key = resolve_current_futex_key(requeue_ptr)?;
+    if source_key == target_key {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    let observed = read_current_futex_word(value_ptr)?;
+    if observed != current_value {
+        return Err(ZX_ERR_BAD_STATE);
+    }
+
+    with_state_mut(|state| {
+        let owner_koid =
+            validate_futex_requeue_owner(state, source_key, target_key, new_requeue_owner)?;
+        let _ = state.kernel.requeue_futex_waiters(
+            source_key,
+            target_key,
+            wake_count as usize,
+            requeue_count as usize,
+            owner_koid,
+        )?;
+        Ok(())
+    })
+}
+
+/// Report the current futex owner koid, or `ZX_KOID_INVALID` when unlocked.
+pub fn futex_get_owner(value_ptr: zx_vaddr_t) -> Result<zx_koid_t, zx_status_t> {
+    let key = resolve_current_futex_key_relaxed(value_ptr)?;
+    with_state_mut(|state| Ok(state.kernel.futex_owner(key)))
 }
 
 /// Ensure a handle is valid and references a Port object.

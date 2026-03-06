@@ -99,3 +99,13 @@ description = "Bootstrap handle_duplicate and handle_replace should preserve obj
 id = "should.eventpair.signal_self_bootstrap"
 level = "should"
 description = "Bootstrap object_signal should drive local EventPair user signals and wait_async delivery with stable error codes"
+
+[[contracts]]
+id = "should.futex.wait_timeout_bootstrap"
+level = "should"
+description = "Bootstrap futex wait should report BAD_STATE on mismatched values, reject self-owner waits, and time out without retaining ownership"
+
+[[contracts]]
+id = "should.futex.requeue_owner_bootstrap"
+level = "should"
+description = "Bootstrap futex requeue/get_owner/wake should preserve owner metadata with stable error codes for same-key and wrong-type cases"

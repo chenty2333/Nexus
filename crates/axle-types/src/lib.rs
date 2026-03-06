@@ -22,6 +22,8 @@ pub type zx_signals_t = u32;
 pub type zx_rights_t = u32;
 /// Zircon kernel object id type.
 pub type zx_koid_t = u64;
+/// Zircon futex word type.
+pub type zx_futex_t = i32;
 /// Zircon absolute time / deadline type (monotonic nanoseconds).
 pub type zx_time_t = i64;
 /// Zircon duration / interval type (nanoseconds).

@@ -246,3 +246,49 @@ args = [
   { name = "clear_mask", ty = "zx_signals_t" },
   { name = "set_mask", ty = "zx_signals_t" },
 ]
+
+[[syscall]]
+name = "futex_wait"
+nr = 21
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "value_ptr", ty = "*const zx_futex_t" },
+  { name = "current_value", ty = "zx_futex_t" },
+  { name = "new_futex_owner", ty = "zx_handle_t" },
+  { name = "deadline", ty = "zx_time_t" },
+]
+
+[[syscall]]
+name = "futex_wake"
+nr = 22
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "value_ptr", ty = "*const zx_futex_t" },
+  { name = "wake_count", ty = "u32" },
+]
+
+[[syscall]]
+name = "futex_requeue"
+nr = 23
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "value_ptr", ty = "*const zx_futex_t" },
+  { name = "wake_count", ty = "u32" },
+  { name = "current_value", ty = "zx_futex_t" },
+  { name = "requeue_ptr", ty = "*const zx_futex_t" },
+  { name = "requeue_count", ty = "u32" },
+  { name = "new_requeue_owner", ty = "zx_handle_t" },
+]
+
+[[syscall]]
+name = "futex_get_owner"
+nr = 24
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "value_ptr", ty = "*const zx_futex_t" },
+  { name = "koid", ty = "*mut zx_koid_t" },
+]

@@ -44,3 +44,11 @@ pub const AXLE_SYS_HANDLE_DUPLICATE: SyscallNumber = 18;
 pub const AXLE_SYS_HANDLE_REPLACE: SyscallNumber = 19;
 /// Contract: SHOULD
 pub const AXLE_SYS_OBJECT_SIGNAL: SyscallNumber = 20;
+/// Contract: SHOULD
+pub const AXLE_SYS_FUTEX_WAIT: SyscallNumber = 21;
+/// Contract: SHOULD
+pub const AXLE_SYS_FUTEX_WAKE: SyscallNumber = 22;
+/// Contract: SHOULD
+pub const AXLE_SYS_FUTEX_REQUEUE: SyscallNumber = 23;
+/// Contract: SHOULD
+pub const AXLE_SYS_FUTEX_GET_OWNER: SyscallNumber = 24;

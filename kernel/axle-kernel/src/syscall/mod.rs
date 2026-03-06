@@ -20,7 +20,8 @@ use axle_types::status::{
 };
 use axle_types::syscall_numbers::{
     AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
-    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
+    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER, AXLE_SYS_FUTEX_REQUEUE,
+    AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
     AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER,
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
     AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE,
@@ -31,14 +32,14 @@ use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
 };
 use axle_types::{
-    zx_clock_t, zx_duration_t, zx_handle_t, zx_port_packet_t, zx_rights_t, zx_signals_t,
-    zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t,
+    zx_clock_t, zx_duration_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t,
+    zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t,
 };
 use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 21] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 25] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -60,6 +61,10 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 21] = [
     AXLE_SYS_HANDLE_DUPLICATE,
     AXLE_SYS_HANDLE_REPLACE,
     AXLE_SYS_OBJECT_SIGNAL,
+    AXLE_SYS_FUTEX_WAIT,
+    AXLE_SYS_FUTEX_WAKE,
+    AXLE_SYS_FUTEX_REQUEUE,
+    AXLE_SYS_FUTEX_GET_OWNER,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -113,6 +118,10 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_HANDLE_DUPLICATE => sys_handle_duplicate(args),
         AXLE_SYS_HANDLE_REPLACE => sys_handle_replace(args),
         AXLE_SYS_OBJECT_SIGNAL => sys_object_signal(args),
+        AXLE_SYS_FUTEX_WAIT => sys_futex_wait(args),
+        AXLE_SYS_FUTEX_WAKE => sys_futex_wake(args),
+        AXLE_SYS_FUTEX_REQUEUE => sys_futex_requeue(args),
+        AXLE_SYS_FUTEX_GET_OWNER => sys_futex_get_owner(args),
         _ => ZX_ERR_BAD_SYSCALL,
     }
 }
@@ -778,6 +787,89 @@ fn sys_object_signal(args: [u64; 6]) -> zx_status_t {
     };
 
     match crate::object::object_signal(handle, clear_mask, set_mask) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_futex_wait(args: [u64; 6]) -> zx_status_t {
+    let value_ptr = args[0];
+    let current_value_raw = match u32::try_from(args[1]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let current_value = current_value_raw as zx_futex_t;
+    let new_futex_owner = match u32::try_from(args[2]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let deadline = args[3] as zx_time_t;
+
+    match crate::object::futex_wait(value_ptr, current_value, new_futex_owner, deadline) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_futex_wake(args: [u64; 6]) -> zx_status_t {
+    let value_ptr = args[0];
+    let wake_count = match u32::try_from(args[1]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+
+    match crate::object::futex_wake(value_ptr, wake_count) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_futex_requeue(args: [u64; 6]) -> zx_status_t {
+    let value_ptr = args[0];
+    let wake_count = match u32::try_from(args[1]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let current_value_raw = match u32::try_from(args[2]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let current_value = current_value_raw as zx_futex_t;
+    let requeue_ptr = args[3];
+    let requeue_count = match u32::try_from(args[4]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let new_requeue_owner = match u32::try_from(args[5]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+
+    match crate::object::futex_requeue(
+        value_ptr,
+        wake_count,
+        current_value,
+        requeue_ptr,
+        requeue_count,
+        new_requeue_owner,
+    ) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_futex_get_owner(args: [u64; 6]) -> zx_status_t {
+    let value_ptr = args[0];
+    let koid_ptr = args[1] as *mut zx_koid_t;
+    if koid_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let koid = match crate::object::futex_get_owner(value_ptr) {
+        Ok(koid) => koid,
+        Err(e) => return e,
+    };
+    match copyout(koid_ptr, koid) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }

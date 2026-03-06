@@ -654,6 +654,41 @@ impl Kernel {
         Ok(FutexKey::from_lookup(process_id, user_addr, lookup))
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn resolve_current_futex_key_relaxed(
+        &self,
+        user_addr: u64,
+    ) -> Result<FutexKey, zx_status_t> {
+        const FUTEX_WORD_BYTES: usize = size_of::<u32>();
+        if (user_addr & 0x3) != 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let process_id = self.current_thread()?.process_id;
+        let process = self.current_process()?;
+        let address_space = self
+            .address_spaces
+            .get(&process.address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let root = address_space.root_vmar();
+        let range_end = user_addr
+            .checked_add(FUTEX_WORD_BYTES as u64)
+            .ok_or(ZX_ERR_INVALID_ARGS)?;
+        let root_end = root
+            .base()
+            .checked_add(root.len())
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if user_addr < root.base() || range_end > root_end {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        if !address_space.validate_user_ptr(user_addr, FUTEX_WORD_BYTES) {
+            return Ok(FutexKey::private_anonymous(process_id, user_addr));
+        }
+        let lookup = address_space
+            .lookup_user_mapping(user_addr, FUTEX_WORD_BYTES)
+            .ok_or(ZX_ERR_INVALID_ARGS)?;
+        Ok(FutexKey::from_lookup(process_id, user_addr, lookup))
+    }
+
     pub(crate) fn try_loan_current_user_pages(
         &mut self,
         ptr: u64,
@@ -866,6 +901,11 @@ impl Kernel {
     #[allow(dead_code)]
     pub(crate) fn futex_owner(&self, key: FutexKey) -> zx_koid_t {
         self.futexes.owner(key)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn thread_is_waiting_on_futex(&self, thread_id: ThreadId, key: FutexKey) -> bool {
+        self.futexes.is_waiter(key, thread_id)
     }
 
     #[allow(clippy::too_many_arguments)]

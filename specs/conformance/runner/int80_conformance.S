@@ -1228,6 +1228,120 @@ handle_duplicate_distinct_done:
 	mov 0x860(%rbx), %rax
 	mov %rax, 8*134(%rbx)
 
+	// bootstrap futex source/target words live in the mapped VMAR page.
+	movabs $0x0000000100010000, %r14
+	mov %r14, %r15
+	add $4, %r15
+	movl $0x1234, (%r14)
+	movl $0, (%r15)
+
+	// futex_wait(source, mismatched value) => BAD_STATE
+	mov %r14, %rdi
+	movl $0x5678, %esi
+	xorl %edx, %edx
+	xorl %r10d, %r10d
+	movabs $21, %rax
+	int $0x80
+	mov %rax, 8*136(%rbx)
+
+	// futex_wait(source, self-thread owner) => INVALID_ARGS
+	mov %r14, %rdi
+	movl $0x1234, %esi
+	mov 8*135(%rbx), %rdx
+	xorl %r10d, %r10d
+	movabs $21, %rax
+	int $0x80
+	mov %rax, 8*137(%rbx)
+
+	// futex_get_owner(source) => ZX_OK, owner=0
+	mov %r14, %rdi
+	lea 0x868(%rbx), %rsi
+	movabs $24, %rax
+	int $0x80
+	mov %rax, 8*139(%rbx)
+	mov 0x868(%rbx), %rax
+	mov %rax, 8*140(%rbx)
+
+	// futex_wait(source, invalid owner, deadline=0) => TIMED_OUT
+	mov %r14, %rdi
+	movl $0x1234, %esi
+	xorl %edx, %edx
+	xorl %r10d, %r10d
+	movabs $21, %rax
+	int $0x80
+	mov %rax, 8*138(%rbx)
+
+	// futex_get_owner(source) after timeout => ZX_OK, owner=0
+	mov %r14, %rdi
+	lea 0x870(%rbx), %rsi
+	movabs $24, %rax
+	int $0x80
+	mov %rax, 8*141(%rbx)
+	mov 0x870(%rbx), %rax
+	mov %rax, 8*142(%rbx)
+
+	// futex_requeue(source -> same source) => INVALID_ARGS
+	mov %r14, %rdi
+	xorl %esi, %esi
+	movl $0x1234, %edx
+	mov %r14, %r10
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $23, %rax
+	int $0x80
+	mov %rax, 8*143(%rbx)
+
+	// futex_requeue(source -> target, wrong-type owner=root_vmar) => WRONG_TYPE
+	mov %r14, %rdi
+	xorl %esi, %esi
+	movl $0x1234, %edx
+	mov %r15, %r10
+	xorl %r8d, %r8d
+	mov 8*62(%rbx), %r9
+	movabs $23, %rax
+	int $0x80
+	mov %rax, 8*144(%rbx)
+
+	// futex_requeue(source -> target, owner=self-thread) => ZX_OK
+	mov %r14, %rdi
+	xorl %esi, %esi
+	movl $0x1234, %edx
+	mov %r15, %r10
+	xorl %r8d, %r8d
+	mov 8*135(%rbx), %r9
+	movabs $23, %rax
+	int $0x80
+	mov %rax, 8*145(%rbx)
+
+	// futex_get_owner(target) => ZX_OK, owner matches bootstrap self koid
+	mov %r15, %rdi
+	lea 0x878(%rbx), %rsi
+	movabs $24, %rax
+	int $0x80
+	mov %rax, 8*146(%rbx)
+	movq $0, 8*147(%rbx)
+	mov 0x878(%rbx), %rax
+	cmp 8*151(%rbx), %rax
+	jne futex_owner_match_done
+	movq $1, 8*147(%rbx)
+futex_owner_match_done:
+
+	// futex_wake(target, 0) => ZX_OK and owner cleared
+	mov %r15, %rdi
+	xorl %esi, %esi
+	movabs $22, %rax
+	int $0x80
+	mov %rax, 8*148(%rbx)
+
+	// futex_get_owner(target) after wake => ZX_OK, owner=0
+	mov %r15, %rdi
+	lea 0x880(%rbx), %rsi
+	movabs $24, %rax
+	int $0x80
+	mov %rax, 8*149(%rbx)
+	mov 0x880(%rbx), %rax
+	mov %rax, 8*150(%rbx)
+
 	// timer_cancel
 	mov 0x698(%rbx), %rdi
 	movabs $8, %rax
