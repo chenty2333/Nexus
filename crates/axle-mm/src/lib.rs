@@ -40,6 +40,19 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// Relevant fault bits observed by the VM metadata layer.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PageFaultFlags: u8 {
+        /// Hardware reported the fault as present/protection rather than not-present.
+        const PRESENT = 1 << 0;
+        /// Faulting access attempted a write.
+        const WRITE = 1 << 1;
+        /// Fault originated from userspace.
+        const USER = 1 << 2;
+    }
+}
+
 /// Identifier for a registered physical frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameId(u64);
@@ -605,6 +618,24 @@ impl PteMeta {
     }
 }
 
+/// Metadata-driven classification for one page fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageFaultDecision {
+    /// Fault is not in scope for the userspace VM metadata layer.
+    Unhandled,
+    /// No metadata exists for the faulting virtual page.
+    Unmapped,
+    /// Fault hits an existing mapping but violates current protection state.
+    ProtectionViolation,
+    /// Fault should resolve through copy-on-write handling.
+    CopyOnWrite,
+    /// Fault is a non-present miss on a mapped page with the given metadata tag.
+    NotPresent {
+        /// Current metadata tag for the missing page.
+        tag: PteMetaTag,
+    },
+}
+
 #[derive(Debug)]
 struct PteMetaStore {
     base_vpn: u64,
@@ -890,6 +921,31 @@ impl AddressSpace {
     /// Return the current page metadata for one absolute virtual page number.
     pub fn pte_meta_for_vpn(&self, vpn: u64) -> Option<PteMeta> {
         self.pte_meta.meta_for_vpn(vpn)
+    }
+
+    /// Classify one page fault by consulting page metadata before any page-table action.
+    pub fn classify_page_fault(&self, fault_va: u64, flags: PageFaultFlags) -> PageFaultDecision {
+        if !flags.contains(PageFaultFlags::USER) {
+            return PageFaultDecision::Unhandled;
+        }
+
+        let Some(meta) = self.pte_meta(fault_va) else {
+            return PageFaultDecision::Unmapped;
+        };
+
+        if flags.contains(PageFaultFlags::PRESENT) {
+            if flags.contains(PageFaultFlags::WRITE)
+                && meta.cow_shared()
+                && meta.logical_write()
+                && matches!(meta.tag(), PteMetaTag::Present)
+            {
+                PageFaultDecision::CopyOnWrite
+            } else {
+                PageFaultDecision::ProtectionViolation
+            }
+        } else {
+            PageFaultDecision::NotPresent { tag: meta.tag() }
+        }
     }
 
     /// Bind a resident frame to one page of a VMO.
@@ -1609,6 +1665,56 @@ mod tests {
         assert!(resolved.logical_write());
         assert!(!resolved.cow_shared());
         assert_eq!(frames.state(data_frame).unwrap().ref_count(), 0);
+    }
+
+    #[test]
+    fn classify_page_fault_prefers_page_metadata() {
+        let (mut space, _, _, _) = sample_space();
+        let data_base = ROOT_BASE + PAGE_SIZE;
+
+        assert_eq!(
+            space.classify_page_fault(
+                data_base,
+                PageFaultFlags::PRESENT | PageFaultFlags::WRITE | PageFaultFlags::USER,
+            ),
+            PageFaultDecision::ProtectionViolation
+        );
+
+        space.mark_copy_on_write(data_base, PAGE_SIZE).unwrap();
+        assert_eq!(
+            space.classify_page_fault(
+                data_base + 0x44,
+                PageFaultFlags::PRESENT | PageFaultFlags::WRITE | PageFaultFlags::USER,
+            ),
+            PageFaultDecision::CopyOnWrite
+        );
+
+        assert_eq!(
+            space.classify_page_fault(data_base, PageFaultFlags::PRESENT | PageFaultFlags::USER,),
+            PageFaultDecision::ProtectionViolation
+        );
+        assert_eq!(
+            space.classify_page_fault(data_base, PageFaultFlags::PRESENT | PageFaultFlags::WRITE,),
+            PageFaultDecision::Unhandled
+        );
+        assert_eq!(
+            space.classify_page_fault(
+                ROOT_BASE + (3 * PAGE_SIZE),
+                PageFaultFlags::PRESENT | PageFaultFlags::WRITE | PageFaultFlags::USER,
+            ),
+            PageFaultDecision::Unmapped
+        );
+
+        space
+            .pte_meta
+            .update_range(data_base, PAGE_SIZE, |meta| meta.tag = PteMetaTag::LazyAnon)
+            .unwrap();
+        assert_eq!(
+            space.classify_page_fault(data_base, PageFaultFlags::USER),
+            PageFaultDecision::NotPresent {
+                tag: PteMetaTag::LazyAnon,
+            }
+        );
     }
 
     #[test]

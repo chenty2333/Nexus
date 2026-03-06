@@ -19,7 +19,8 @@ use axle_core::handle::Handle;
 use axle_core::{CSpace, CSpaceError, Capability, RevocationManager, Signals};
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameId, FrameTable,
-    FutexKey, GlobalVmoId, MappingPerms, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
+    FutexKey, GlobalVmoId, MappingPerms, PageFaultDecision, PageFaultFlags, VmaLookup, Vmar,
+    VmarId, Vmo, VmoId, VmoKind,
 };
 use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor};
 use axle_types::rights::{
@@ -489,6 +490,10 @@ impl AddressSpace {
 
     fn lookup_user_mapping(&self, ptr: u64, len: usize) -> Option<VmaLookup> {
         self.vm.lookup_range(ptr, len as u64)
+    }
+
+    fn classify_user_page_fault(&self, fault_va: u64, flags: PageFaultFlags) -> PageFaultDecision {
+        self.vm.classify_page_fault(fault_va, flags)
     }
 
     fn root_vmar(&self) -> Vmar {
@@ -1349,12 +1354,15 @@ impl Kernel {
     }
 
     pub(crate) fn handle_current_page_fault(&mut self, fault_va: u64, error: u64) -> bool {
-        const PF_PRESENT: u64 = 1 << 0;
-        const PF_WRITE: u64 = 1 << 1;
-        const PF_USER: u64 = 1 << 2;
-
-        if (error & (PF_PRESENT | PF_WRITE | PF_USER)) != (PF_PRESENT | PF_WRITE | PF_USER) {
-            return false;
+        let mut flags = PageFaultFlags::empty();
+        if error & (1 << 0) != 0 {
+            flags |= PageFaultFlags::PRESENT;
+        }
+        if error & (1 << 1) != 0 {
+            flags |= PageFaultFlags::WRITE;
+        }
+        if error & (1 << 2) != 0 {
+            flags |= PageFaultFlags::USER;
         }
 
         let process_id = match self.current_thread() {
@@ -1366,13 +1374,21 @@ impl Kernel {
             None => return false,
         };
 
+        let decision = match self.address_spaces.get(&address_space_id) {
+            Some(space) => space.classify_user_page_fault(fault_va, flags),
+            None => return false,
+        };
+        if decision != PageFaultDecision::CopyOnWrite {
+            return false;
+        }
+
         let lookup = match self
             .address_spaces
             .get(&address_space_id)
             .and_then(|space| space.lookup_user_mapping(fault_va, 1))
         {
-            Some(lookup) if lookup.is_copy_on_write() => lookup,
-            _ => return false,
+            Some(lookup) => lookup,
+            None => return false,
         };
 
         let old_frame_id = match lookup.frame_id() {
