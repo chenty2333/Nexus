@@ -12,7 +12,7 @@ fuzz_target!(|data: &[u8]| {
     let mut vmos = [None; 8];
 
     for chunk in data.chunks(8) {
-        match chunk.first().copied().unwrap_or(0) % 7 {
+        match chunk.first().copied().unwrap_or(0) % 9 {
             0 => {
                 let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmos.len() as u8);
                 let pages = u64::from((chunk.get(2).copied().unwrap_or(0) % 4) + 1);
@@ -67,6 +67,24 @@ fuzz_target!(|data: &[u8]| {
             5 => {
                 let page_index = u64::from(chunk.get(1).copied().unwrap_or(0) % 16);
                 let _ = space.lookup(ROOT_BASE + (page_index * PAGE_SIZE));
+            }
+            6 => {
+                let page_index = u64::from(chunk.get(1).copied().unwrap_or(0) % 16);
+                let _ = space.mark_copy_on_write(ROOT_BASE + (page_index * PAGE_SIZE), PAGE_SIZE);
+            }
+            7 => {
+                let page_index = u64::from(chunk.get(1).copied().unwrap_or(0) % 16);
+                let frame_addr =
+                    0x3000_0000 + (u64::from(chunk.get(2).copied().unwrap_or(0)) * PAGE_SIZE);
+                let frame_id = match frames.register_existing(frame_addr) {
+                    Ok(frame) => frame,
+                    Err(_) => continue,
+                };
+                let _ = space.resolve_cow_fault(
+                    &mut frames,
+                    ROOT_BASE + (page_index * PAGE_SIZE),
+                    frame_id,
+                );
             }
             _ => {
                 let frame_addr = 0x2000_0000 + (u64::from(chunk.get(1).copied().unwrap_or(0)) * PAGE_SIZE);

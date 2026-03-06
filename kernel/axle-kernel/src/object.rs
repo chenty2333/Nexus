@@ -143,6 +143,23 @@ pub fn validate_current_user_ptr(ptr: u64, len: usize) -> bool {
     state.validate_current_user_ptr(ptr, len)
 }
 
+/// Try to resolve a bootstrap user-mode page fault.
+pub fn handle_page_fault(cr2: u64, error: u64) -> bool {
+    const PF_PRESENT: u64 = 1 << 0;
+    const PF_WRITE: u64 = 1 << 1;
+    const PF_USER: u64 = 1 << 2;
+
+    if (error & (PF_PRESENT | PF_WRITE | PF_USER)) != (PF_PRESENT | PF_WRITE | PF_USER) {
+        return false;
+    }
+
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else {
+        return false;
+    };
+    state.kernel.handle_current_page_fault(cr2, error)
+}
+
 /// Create a new Timer object and return a handle.
 pub fn create_timer(options: u32, clock_id: zx_clock_t) -> Result<zx_handle_t, zx_status_t> {
     if options != 0 {

@@ -16,7 +16,10 @@ use alloc::collections::BTreeMap;
 
 use axle_core::handle::Handle;
 use axle_core::{CSpace, CSpaceError, Capability, RevocationManager};
-use axle_mm::{AddressSpace as VmAddressSpace, FrameTable, MappingPerms, VmaLookup, VmoKind};
+use axle_mm::{
+    AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameTable,
+    MappingPerms, VmaLookup, VmoKind,
+};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NO_RESOURCES,
 };
@@ -167,6 +170,11 @@ impl AddressSpace {
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
         )
         .expect("bootstrap stack mapping must succeed");
+        vm.mark_copy_on_write(
+            crate::userspace::USER_STACK_VA,
+            crate::userspace::USER_PAGE_BYTES,
+        )
+        .expect("bootstrap stack COW arm must succeed");
 
         Self { vm }
     }
@@ -177,6 +185,15 @@ impl AddressSpace {
 
     fn lookup_user_mapping(&self, ptr: u64, len: usize) -> Option<VmaLookup> {
         self.vm.lookup_range(ptr, len as u64)
+    }
+
+    fn resolve_cow_fault(
+        &mut self,
+        frames: &mut FrameTable,
+        fault_va: u64,
+        new_frame_id: axle_mm::FrameId,
+    ) -> Result<CowFaultResolution, AddressSpaceError> {
+        self.vm.resolve_cow_fault(frames, fault_va, new_frame_id)
     }
 }
 
@@ -317,6 +334,70 @@ impl Kernel {
         let process = self.current_process().ok()?;
         let address_space = self.address_spaces.get(&process.address_space_id)?;
         address_space.lookup_user_mapping(ptr, len)
+    }
+
+    pub(crate) fn handle_current_page_fault(&mut self, fault_va: u64, error: u64) -> bool {
+        const PF_PRESENT: u64 = 1 << 0;
+        const PF_WRITE: u64 = 1 << 1;
+        const PF_USER: u64 = 1 << 2;
+
+        if (error & (PF_PRESENT | PF_WRITE | PF_USER)) != (PF_PRESENT | PF_WRITE | PF_USER) {
+            return false;
+        }
+
+        let process_id = match self.current_thread() {
+            Ok(thread) => thread.process_id,
+            Err(_) => return false,
+        };
+        let address_space_id = match self.processes.get(&process_id) {
+            Some(process) => process.address_space_id,
+            None => return false,
+        };
+
+        let lookup = match self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.lookup_user_mapping(fault_va, 1))
+        {
+            Some(lookup) if lookup.is_copy_on_write() => lookup,
+            _ => return false,
+        };
+
+        let old_frame_id = match lookup.frame_id() {
+            Some(frame_id) => frame_id,
+            None => return false,
+        };
+
+        let new_frame_paddr = match crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw()) {
+            Some(paddr) => paddr,
+            None => return false,
+        };
+        let new_frame_id = match self.frames.register_existing(new_frame_paddr) {
+            Ok(frame_id) => frame_id,
+            Err(_) => return false,
+        };
+
+        let resolved = {
+            let Some(address_space) = self.address_spaces.get_mut(&address_space_id) else {
+                return false;
+            };
+            match address_space.resolve_cow_fault(&mut self.frames, fault_va, new_frame_id) {
+                Ok(resolution) => resolution,
+                Err(_) => return false,
+            }
+        };
+
+        if crate::userspace::install_user_page_frame(
+            resolved.fault_page_base(),
+            new_frame_paddr,
+            true,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        crate::arch::tlb::flush_page_global(resolved.fault_page_base());
+        true
     }
 
     fn alloc_process_id(&mut self) -> ProcessId {

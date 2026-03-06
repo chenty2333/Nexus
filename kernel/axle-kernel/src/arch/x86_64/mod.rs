@@ -16,6 +16,7 @@ pub mod pvh;
 pub mod qemu;
 pub mod serial;
 pub mod timer;
+pub mod tlb;
 
 /// Early arch init (before heap/interrupts).
 pub fn init() {

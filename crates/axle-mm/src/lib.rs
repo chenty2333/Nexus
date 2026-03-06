@@ -12,8 +12,9 @@
 //! - `VA -> (VMO, offset, perms, frame)` reverse lookup
 //! - bootstrap frame registration with mapping refcounts
 //! - frame pin / unpin accounting
+//! - VMA-granular copy-on-write metadata and fault resolution
 //!
-//! It still does **not** manage page tables or copy-on-write faults.
+//! It still does **not** manage page tables.
 
 extern crate alloc;
 
@@ -297,6 +298,7 @@ pub struct Vma {
     vmo_offset: u64,
     perms: MappingPerms,
     max_perms: MappingPerms,
+    copy_on_write: bool,
 }
 
 impl Vma {
@@ -335,6 +337,11 @@ impl Vma {
         self.max_perms
     }
 
+    /// Whether the mapping is armed for copy-on-write fault handling.
+    pub const fn is_copy_on_write(self) -> bool {
+        self.copy_on_write
+    }
+
     fn end(self) -> u64 {
         self.base + self.len
     }
@@ -361,6 +368,7 @@ pub struct VmaLookup {
     frame_id: Option<FrameId>,
     perms: MappingPerms,
     max_perms: MappingPerms,
+    copy_on_write: bool,
     mapping_base: u64,
     mapping_len: u64,
 }
@@ -401,6 +409,11 @@ impl VmaLookup {
         self.max_perms
     }
 
+    /// Whether the resolved mapping is currently armed for copy-on-write.
+    pub const fn is_copy_on_write(self) -> bool {
+        self.copy_on_write
+    }
+
     /// Base virtual address of the containing mapping.
     pub const fn mapping_base(self) -> u64 {
         self.mapping_base
@@ -433,6 +446,33 @@ pub enum AddressSpaceError {
     PermissionIncrease,
     /// Frame-table bookkeeping failed.
     FrameTable(FrameTableError),
+    /// The mapping is not currently armed for copy-on-write fault handling.
+    NotCopyOnWrite,
+}
+
+/// Result of resolving a copy-on-write fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CowFaultResolution {
+    fault_page_base: u64,
+    old_frame_id: FrameId,
+    new_frame_id: FrameId,
+}
+
+impl CowFaultResolution {
+    /// Base virtual address of the faulting page.
+    pub const fn fault_page_base(self) -> u64 {
+        self.fault_page_base
+    }
+
+    /// Frame that backed the mapping before the COW split.
+    pub const fn old_frame_id(self) -> FrameId {
+        self.old_frame_id
+    }
+
+    /// Frame installed for the writable private copy.
+    pub const fn new_frame_id(self) -> FrameId {
+        self.new_frame_id
+    }
 }
 
 /// Metadata-only address space with one root VMAR.
@@ -600,6 +640,7 @@ impl AddressSpace {
             vmo_offset,
             perms,
             max_perms,
+            copy_on_write: false,
         });
         self.vmas.sort_by_key(|vma| vma.base);
         Ok(())
@@ -658,6 +699,73 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Arm an existing mapping for copy-on-write handling.
+    pub fn mark_copy_on_write(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
+        validate_mapping_range(base, len)?;
+        let vma = self
+            .vmas
+            .iter_mut()
+            .find(|vma| vma.base == base && vma.len == len)
+            .ok_or(AddressSpaceError::NotFound)?;
+        if !vma.max_perms.contains(MappingPerms::WRITE) {
+            return Err(AddressSpaceError::PermissionIncrease);
+        }
+        vma.perms.remove(MappingPerms::WRITE);
+        vma.copy_on_write = true;
+        Ok(())
+    }
+
+    /// Resolve a write fault on a copy-on-write mapping by rebinding one page.
+    pub fn resolve_cow_fault(
+        &mut self,
+        frames: &mut FrameTable,
+        fault_va: u64,
+        new_frame_id: FrameId,
+    ) -> Result<CowFaultResolution, AddressSpaceError> {
+        if !frames.contains(new_frame_id) {
+            return Err(AddressSpaceError::InvalidFrame);
+        }
+
+        let index = self
+            .vmas
+            .iter()
+            .position(|vma| vma.contains(fault_va))
+            .ok_or(AddressSpaceError::NotFound)?;
+        let vma = self.vmas[index];
+        if !vma.copy_on_write {
+            return Err(AddressSpaceError::NotCopyOnWrite);
+        }
+
+        let page_base = align_down(fault_va, PAGE_SIZE);
+        let page_offset = vma.vmo_offset + (page_base - vma.base);
+        let old_frame_id = self
+            .vmo(vma.vmo_id)
+            .and_then(|vmo| vmo.frame_at_offset(page_offset))
+            .ok_or(AddressSpaceError::InvalidFrame)?;
+
+        frames
+            .inc_ref(new_frame_id)
+            .map_err(AddressSpaceError::FrameTable)?;
+        if let Err(err) = frames.dec_ref(old_frame_id) {
+            let _ = frames.dec_ref(new_frame_id);
+            return Err(AddressSpaceError::FrameTable(err));
+        }
+
+        self.rebind_vmo_frame(vma.vmo_id, page_offset, new_frame_id)?;
+        let vma = self
+            .vmas
+            .get_mut(index)
+            .ok_or(AddressSpaceError::NotFound)?;
+        vma.perms.insert(MappingPerms::WRITE);
+        vma.copy_on_write = false;
+
+        Ok(CowFaultResolution {
+            fault_page_base: page_base,
+            old_frame_id,
+            new_frame_id,
+        })
+    }
+
     /// Resolve one virtual address to its backing VMO metadata.
     pub fn lookup(&self, va: u64) -> Option<VmaLookup> {
         let vma = self.vmas.iter().copied().find(|vma| vma.contains(va))?;
@@ -671,6 +779,7 @@ impl AddressSpace {
             frame_id: vmo.frame_at_offset(resolved_offset),
             perms: vma.perms,
             max_perms: vma.max_perms,
+            copy_on_write: vma.copy_on_write,
             mapping_base: vma.base,
             mapping_len: vma.len,
         })
@@ -696,6 +805,7 @@ impl AddressSpace {
             frame_id: vmo.frame_at_offset(resolved_offset),
             perms: vma.perms,
             max_perms: vma.max_perms,
+            copy_on_write: vma.copy_on_write,
             mapping_base: vma.base,
             mapping_len: vma.len,
         })
@@ -731,6 +841,33 @@ impl AddressSpace {
             return false;
         };
         base >= self.root.base && end <= self.root.base + self.root.len
+    }
+
+    fn rebind_vmo_frame(
+        &mut self,
+        vmo_id: VmoId,
+        offset: u64,
+        frame_id: FrameId,
+    ) -> Result<(), AddressSpaceError> {
+        if !is_page_aligned(offset) {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+        let vmo = self
+            .vmos
+            .iter_mut()
+            .find(|candidate| candidate.id == vmo_id)
+            .ok_or(AddressSpaceError::InvalidVmo)?;
+        if offset >= vmo.size_bytes {
+            return Err(AddressSpaceError::OutOfRange);
+        }
+        let page_index =
+            usize::try_from(offset / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
+        let slot = vmo
+            .frames
+            .get_mut(page_index)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        *slot = Some(frame_id);
+        Ok(())
     }
 }
 
@@ -768,6 +905,10 @@ fn validate_lookup_range(base: u64, len: u64) -> Result<(), AddressSpaceError> {
 
 fn is_page_aligned(value: u64) -> bool {
     value & (PAGE_SIZE - 1) == 0
+}
+
+fn align_down(value: u64, align: u64) -> u64 {
+    value & !(align - 1)
 }
 
 fn overlaps(vma: Vma, base: u64, len: u64) -> bool {
@@ -907,6 +1048,32 @@ mod tests {
         space.unmap(&mut frames, data_base, PAGE_SIZE).unwrap();
         assert!(space.lookup(data_base).is_none());
         assert_eq!(frames.state(data_frame).unwrap().ref_count(), 0);
+    }
+
+    #[test]
+    fn resolve_cow_fault_rebinds_frame_and_restores_write() {
+        let (mut space, mut frames, _, data_frame) = sample_space();
+        let data_base = ROOT_BASE + PAGE_SIZE;
+        let replacement = frames.register_existing(0x60_000).unwrap();
+
+        space.mark_copy_on_write(data_base, PAGE_SIZE).unwrap();
+        let before = space.lookup(data_base).unwrap();
+        assert!(before.is_copy_on_write());
+        assert!(!before.perms().contains(MappingPerms::WRITE));
+
+        let resolved = space
+            .resolve_cow_fault(&mut frames, data_base + 0x80, replacement)
+            .unwrap();
+        assert_eq!(resolved.fault_page_base(), data_base);
+        assert_eq!(resolved.old_frame_id(), data_frame);
+        assert_eq!(resolved.new_frame_id(), replacement);
+
+        let after = space.lookup(data_base).unwrap();
+        assert_eq!(after.frame_id(), Some(replacement));
+        assert!(after.perms().contains(MappingPerms::WRITE));
+        assert!(!after.is_copy_on_write());
+        assert_eq!(frames.state(data_frame).unwrap().ref_count(), 0);
+        assert_eq!(frames.state(replacement).unwrap().ref_count(), 1);
     }
 
     #[test]

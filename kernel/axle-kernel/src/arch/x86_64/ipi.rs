@@ -1,20 +1,21 @@
-//! Fixed-vector IPI support (bring-up / conformance).
-//!
-//! We use this for a simple SMP sanity check:
-//! BSP sends a fixed-vector IPI to an AP, AP runs this handler and increments
-//! an ack counter, BSP observes the counter change.
+//! Fixed-vector IPI support (bring-up / conformance / TLB shootdown).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use raw_cpuid::CpuId;
+use spin::Mutex;
 
 use crate::arch::apic;
 
 pub const TEST_VECTOR: usize = 0x40;
+pub const TLB_SHOOTDOWN_VECTOR: usize = 0x41;
 
 const MAX_CPUS: usize = 16;
 
 static IPI_ACK_COUNT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static TLB_SHOOTDOWN_ACK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static TLB_SHOOTDOWN_PAGE: AtomicU64 = AtomicU64::new(0);
+static TLB_SHOOTDOWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Current ack counter value for `apic_id`.
 pub fn ack_count(apic_id: usize) -> u64 {
@@ -28,10 +29,10 @@ pub fn ack_count(apic_id: usize) -> u64 {
 
 core::arch::global_asm!(
     r#"
-    .global axle_ipi_test_entry
-    .type axle_ipi_test_entry, @function
-axle_ipi_test_entry:
-    // Save a conservative snapshot of registers.
+    .macro AXLE_IPI_ENTRY name, rust
+    .global \name
+    .type \name, @function
+\name:
     push r15
     push r14
     push r13
@@ -49,7 +50,7 @@ axle_ipi_test_entry:
     push rax
 
     mov rdi, rsp
-    call {rust_handler}
+    call \rust
 
     add rsp, 8
     pop rdi
@@ -67,18 +68,29 @@ axle_ipi_test_entry:
     pop r14
     pop r15
     iretq
-    .size axle_ipi_test_entry, .-axle_ipi_test_entry
+    .size \name, .-\name
+    .endm
+
+    AXLE_IPI_ENTRY axle_ipi_test_entry, {rust_test}
+    AXLE_IPI_ENTRY axle_ipi_tlb_entry, {rust_tlb}
     "#,
-    rust_handler = sym axle_ipi_test_rust,
+    rust_test = sym axle_ipi_test_rust,
+    rust_tlb = sym axle_ipi_tlb_rust,
 );
 
 unsafe extern "C" {
     fn axle_ipi_test_entry();
+    fn axle_ipi_tlb_entry();
 }
 
-/// Address of the IPI handler entry stub for IDT installation.
-pub fn entry_addr() -> usize {
+/// Address of the IPI test handler entry stub for IDT installation.
+pub fn test_entry_addr() -> usize {
     axle_ipi_test_entry as *const () as usize
+}
+
+/// Address of the TLB shootdown IPI handler entry stub for IDT installation.
+pub fn tlb_entry_addr() -> usize {
+    axle_ipi_tlb_entry as *const () as usize
 }
 
 extern "C" fn axle_ipi_test_rust(_frame: *const u8) {
@@ -93,4 +105,54 @@ extern "C" fn axle_ipi_test_rust(_frame: *const u8) {
     if apic_id < MAX_CPUS {
         let _ = IPI_ACK_COUNT[apic_id].fetch_add(1, Ordering::AcqRel);
     }
+}
+
+extern "C" fn axle_ipi_tlb_rust(_frame: *const u8) {
+    apic::eoi();
+
+    let apic_id = CpuId::new()
+        .get_feature_info()
+        .map(|fi| fi.initial_local_apic_id() as usize)
+        .unwrap_or(0);
+    let page = TLB_SHOOTDOWN_PAGE.load(Ordering::Acquire);
+    if page != 0 {
+        crate::arch::tlb::flush_page_local(page);
+    }
+
+    if apic_id < MAX_CPUS {
+        let _ = TLB_SHOOTDOWN_ACK[apic_id].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn tlb_ack_count(apic_id: usize) -> u64 {
+    if apic_id >= MAX_CPUS {
+        return 0;
+    }
+    TLB_SHOOTDOWN_ACK[apic_id].load(Ordering::Acquire)
+}
+
+pub fn shootdown_page(va: u64) {
+    let _guard = TLB_SHOOTDOWN_LOCK.lock();
+    TLB_SHOOTDOWN_PAGE.store(va, Ordering::Release);
+
+    let local_apic_id = apic::this_apic_id() as usize;
+    crate::smp::for_each_online_cpu(|apic_id| {
+        if apic_id == local_apic_id {
+            return;
+        }
+
+        let before = tlb_ack_count(apic_id);
+        apic::send_fixed_ipi(apic_id as u32, TLB_SHOOTDOWN_VECTOR as u8);
+
+        let start = crate::time::rdtsc();
+        let delta = crate::time::ns_to_tsc(250_000_000);
+        while tlb_ack_count(apic_id) == before {
+            core::hint::spin_loop();
+            if delta != 0 && crate::time::rdtsc().wrapping_sub(start) > delta {
+                break;
+            }
+        }
+    });
+
+    TLB_SHOOTDOWN_PAGE.store(0, Ordering::Release);
 }

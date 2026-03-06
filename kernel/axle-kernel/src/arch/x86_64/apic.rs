@@ -421,10 +421,7 @@ fn map_xapic_mmio(base: u64) {
         pvh_pdpt[pdpt_index] = pd_phys | (PTE_P | PTE_W);
         XAPIC_PD.0[pd_index] = base | (PTE_P | PTE_W | PTE_PS);
 
-        // Flush TLB by reloading CR3.
-        let cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+        crate::arch::tlb::flush_all_local();
     }
 }
 use core::cell::UnsafeCell;

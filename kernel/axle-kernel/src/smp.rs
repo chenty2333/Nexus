@@ -119,6 +119,15 @@ fn bootstrap_trampoline(cpu_count: usize) {
     }
 }
 
+pub fn for_each_online_cpu(mut f: impl FnMut(usize)) {
+    let bsp_id = crate::arch::apic::this_apic_id() as usize;
+    for apic_id in 0..MAX_CPUS {
+        if apic_id == bsp_id || AP_ONLINE[apic_id].load(Ordering::Acquire) {
+            f(apic_id);
+        }
+    }
+}
+
 pub fn init() {
     // Bring-up CPU enumeration: rely on CPUID's "max logical processors".
     let cpuid = CpuId::new();

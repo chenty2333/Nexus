@@ -14,6 +14,7 @@ pub fn init() {
         arch::timer::entry_addr(),
         arch::apic::spurious_entry_addr(),
         arch::apic::error_entry_addr(),
-        arch::ipi::entry_addr(),
+        arch::ipi::test_entry_addr(),
+        arch::ipi::tlb_entry_addr(),
     );
 }

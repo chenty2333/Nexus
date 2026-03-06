@@ -10,6 +10,9 @@
 //! - user pointer boundaries
 //! - ring3 -> ring0 transitions (TSS/RSP0)
 
+extern crate alloc;
+
+use alloc::alloc::{Layout, alloc_zeroed};
 use x86_64::instructions::segmentation::Segment;
 
 // --- Userspace virtual layout (in current single-address-space model) ---
@@ -140,6 +143,53 @@ pub(crate) fn user_stack_page_paddr() -> u64 {
     phys_of(core::ptr::addr_of!(USER_STACK_PAGE))
 }
 
+fn user_page_index(user_va: u64) -> Option<usize> {
+    if user_va < USER_CODE_VA || user_va >= (USER_CODE_VA + USER_REGION_BYTES) {
+        return None;
+    }
+    if user_va & (USER_PAGE_BYTES - 1) != 0 {
+        return None;
+    }
+    usize::try_from((user_va - USER_CODE_VA) / USER_PAGE_BYTES).ok()
+}
+
+pub(crate) fn alloc_bootstrap_cow_page(src_paddr: u64) -> Option<u64> {
+    let layout =
+        Layout::from_size_align(USER_PAGE_BYTES as usize, USER_PAGE_BYTES as usize).ok()?;
+    let dst = unsafe {
+        // SAFETY: the bootstrap allocator honors the requested alignment. The returned
+        // page stays owned by the kernel for the rest of bring-up.
+        alloc_zeroed(layout)
+    };
+    if dst.is_null() {
+        return None;
+    }
+
+    unsafe {
+        // SAFETY: both the source physical address and destination pointer are currently
+        // identity-mapped kernel addresses spanning one bootstrap page.
+        core::ptr::copy_nonoverlapping(src_paddr as *const u8, dst, USER_PAGE_BYTES as usize);
+    }
+    Some(dst as u64)
+}
+
+pub(crate) fn install_user_page_frame(user_va: u64, paddr: u64, writable: bool) -> Result<(), ()> {
+    if paddr & (USER_PAGE_BYTES - 1) != 0 {
+        return Err(());
+    }
+    let index = user_page_index(user_va).ok_or(())?;
+    let mut entry = paddr | (PTE_P | PTE_U);
+    if writable {
+        entry |= PTE_W;
+    }
+
+    unsafe {
+        // SAFETY: USER_PT is the active page table page for the fixed bootstrap user region.
+        USER_PT.0[index] = entry;
+    }
+    Ok(())
+}
+
 fn map_userspace_pages() {
     // SAFETY: early bring-up is single-core; page table mutation is serialized.
     unsafe {
@@ -160,12 +210,10 @@ fn map_userspace_pages() {
         // Map the three user pages.
         *user_pt.add(0) = phys_of(core::ptr::addr_of!(USER_CODE_PAGE)) | (PTE_P | PTE_W | PTE_U);
         *user_pt.add(1) = phys_of(core::ptr::addr_of!(USER_SHARED_PAGE)) | (PTE_P | PTE_W | PTE_U);
-        *user_pt.add(2) = phys_of(core::ptr::addr_of!(USER_STACK_PAGE)) | (PTE_P | PTE_W | PTE_U);
+        *user_pt.add(2) = phys_of(core::ptr::addr_of!(USER_STACK_PAGE)) | (PTE_P | PTE_U);
 
         // Flush TLB by reloading CR3.
-        let cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+        crate::arch::tlb::flush_all_local();
     }
 }
 

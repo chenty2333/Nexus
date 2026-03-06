@@ -35,11 +35,32 @@ axle_pf_entry:
     lea rsi, [rsp + {pushed}]
     mov rdx, cr2
     call {rust_pf}
+    test al, al
+    jnz 2f
 
-    // Should never return.
+    // Unhandled fault: halt.
 1:
     hlt
     jmp 1b
+
+2:
+    pop rax
+    pop rdi
+    pop rsi
+    pop rdx
+    pop r10
+    pop r8
+    pop r9
+    pop rcx
+    pop r11
+    pop rbp
+    pop rbx
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+    add rsp, 8
+    iretq
     .size axle_pf_entry, .-axle_pf_entry
 
     .global axle_gp_entry
@@ -156,8 +177,11 @@ extern "C" fn axle_page_fault_rust(
     _regs: &crate::arch::int80::TrapFrame,
     cpu: *const u64,
     cr2: u64,
-) -> ! {
+) -> bool {
     let (error, rip, cs, rflags, rsp_ss) = decode_cpu_frame_with_error_code(cpu);
+    if crate::object::handle_page_fault(cr2, error) {
+        return true;
+    }
     kprintln!(
         "#PF: rip={:#x} cs={:#x} rflags={:#x} err={:#x} cr2={:#x} from_user={} rsp_ss={:?}",
         rip,
