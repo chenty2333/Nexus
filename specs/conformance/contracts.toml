@@ -74,3 +74,13 @@ description = "Bootstrap channel create/write/read should preserve FIFO byte pay
 id = "should.channel.peer_closed_bootstrap"
 level = "should"
 description = "Closing one bootstrap channel endpoint should immediately expose PEER_CLOSED on the peer and reject further writes"
+
+[[contracts]]
+id = "should.eventpair.signal_peer_bootstrap"
+level = "should"
+description = "Bootstrap eventpair create and signal_peer should drive peer user signals with stable error codes"
+
+[[contracts]]
+id = "should.eventpair.peer_closed_bootstrap"
+level = "should"
+description = "Closing one bootstrap eventpair endpoint should immediately expose PEER_CLOSED on the peer"

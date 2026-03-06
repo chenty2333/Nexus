@@ -32,6 +32,8 @@ const DEFAULT_OBJECT_GENERATION: u32 = 0;
 pub enum ObjectKind {
     /// Channel endpoint object.
     Channel,
+    /// EventPair endpoint object.
+    EventPair,
     /// Port object.
     Port,
     /// Timer object.
@@ -80,6 +82,25 @@ impl ChannelEndpoint {
     }
 }
 
+#[derive(Debug)]
+struct EventPairEndpoint {
+    peer_object_id: u64,
+    user_signals: Signals,
+    peer_closed: bool,
+    closed: bool,
+}
+
+impl EventPairEndpoint {
+    fn new(peer_object_id: u64) -> Self {
+        Self {
+            peer_object_id,
+            user_signals: Signals::NONE,
+            peer_closed: false,
+            closed: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct VmoObject {
     process_id: u64,
@@ -100,6 +121,7 @@ struct VmarObject {
 #[derive(Debug)]
 enum KernelObject {
     Channel(ChannelEndpoint),
+    EventPair(EventPairEndpoint),
     Port(Port),
     Timer(TimerObject),
     Vmo(VmoObject),
@@ -116,6 +138,15 @@ pub struct ChannelReadResult {
     /// Number of transferred handles.
     pub actual_handles: u32,
 }
+
+const USER_SIGNAL_MASK: Signals = Signals::USER_SIGNAL_0
+    .union(Signals::USER_SIGNAL_1)
+    .union(Signals::USER_SIGNAL_2)
+    .union(Signals::USER_SIGNAL_3)
+    .union(Signals::USER_SIGNAL_4)
+    .union(Signals::USER_SIGNAL_5)
+    .union(Signals::USER_SIGNAL_6)
+    .union(Signals::USER_SIGNAL_7);
 
 #[derive(Debug)]
 struct KernelState {
@@ -266,6 +297,48 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
             };
         let right_handle =
             match state.alloc_handle_for_object(right_object_id, channel_default_rights()) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    let _ = state.close_handle(left_handle);
+                    let _ = state.objects.remove(&left_object_id);
+                    let _ = state.objects.remove(&right_object_id);
+                    return Err(e);
+                }
+            };
+
+        Ok((left_handle, right_handle))
+    })
+}
+
+/// Create an EventPair endpoint pair and return both handles.
+pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let left_object_id = state.alloc_object_id();
+        let right_object_id = state.alloc_object_id();
+        state.objects.insert(
+            left_object_id,
+            KernelObject::EventPair(EventPairEndpoint::new(right_object_id)),
+        );
+        state.objects.insert(
+            right_object_id,
+            KernelObject::EventPair(EventPairEndpoint::new(left_object_id)),
+        );
+
+        let left_handle =
+            match state.alloc_handle_for_object(left_object_id, eventpair_default_rights()) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    let _ = state.objects.remove(&left_object_id);
+                    let _ = state.objects.remove(&right_object_id);
+                    return Err(e);
+                }
+            };
+        let right_handle =
+            match state.alloc_handle_for_object(right_object_id, eventpair_default_rights()) {
                 Ok(handle) => handle,
                 Err(e) => {
                     let _ = state.close_handle(left_handle);
@@ -470,6 +543,47 @@ pub fn channel_read(
     })
 }
 
+/// Signal the peer side of an EventPair.
+pub fn object_signal_peer(
+    handle: zx_handle_t,
+    clear_mask: zx_signals_t,
+    set_mask: zx_signals_t,
+) -> Result<(), zx_status_t> {
+    let clear = Signals::from_bits(clear_mask);
+    let set = Signals::from_bits(set_mask);
+    if !clear.without(USER_SIGNAL_MASK).is_empty() || !set.without(USER_SIGNAL_MASK).is_empty() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let peer_object_id = {
+            let endpoint = match state.objects.get(&resolved.object_id()) {
+                Some(KernelObject::EventPair(endpoint)) => endpoint,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            require_handle_rights(resolved, crate::task::HandleRights::SIGNAL)?;
+            if endpoint.peer_closed {
+                return Err(ZX_ERR_PEER_CLOSED);
+            }
+            endpoint.peer_object_id
+        };
+
+        let peer = match state.objects.get_mut(&peer_object_id) {
+            Some(KernelObject::EventPair(peer)) => peer,
+            Some(_) => return Err(ZX_ERR_BAD_STATE),
+            None => return Err(ZX_ERR_PEER_CLOSED),
+        };
+        if peer.closed {
+            return Err(ZX_ERR_PEER_CLOSED);
+        }
+        peer.user_signals = peer.user_signals.without(clear).union(set);
+        let _ = notify_waitable_signals_changed(state, peer_object_id);
+        Ok(())
+    })
+}
+
 /// Map a VMO into a VMAR at an exact offset.
 #[allow(clippy::too_many_arguments)]
 pub fn vmar_map(
@@ -573,6 +687,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
         let timer_id = match state.objects.get(&object_id) {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
             Some(KernelObject::Channel(_))
+            | Some(KernelObject::EventPair(_))
             | Some(KernelObject::Port(_))
             | Some(KernelObject::Vmo(_))
             | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
@@ -607,6 +722,7 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
         let timer_id = match state.objects.get(&object_id) {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
             Some(KernelObject::Channel(_))
+            | Some(KernelObject::EventPair(_))
             | Some(KernelObject::Port(_))
             | Some(KernelObject::Vmo(_))
             | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
@@ -639,6 +755,7 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
             let port = match obj {
                 KernelObject::Port(port) => port,
                 KernelObject::Channel(_)
+                | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
                 | KernelObject::Vmo(_)
                 | KernelObject::Vmar(_) => {
@@ -667,6 +784,7 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
             let port = match obj {
                 KernelObject::Port(port) => port,
                 KernelObject::Channel(_)
+                | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
                 | KernelObject::Vmo(_)
                 | KernelObject::Vmar(_) => {
@@ -824,6 +942,7 @@ pub fn object_wait_async(
             let port = match obj {
                 KernelObject::Port(port) => port,
                 KernelObject::Channel(_)
+                | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
                 | KernelObject::Vmo(_)
                 | KernelObject::Vmar(_) => {
@@ -846,19 +965,44 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(raw, crate::task::HandleRights::empty())?;
         let object_id = resolved.object_id();
-        let peer_object_id = match state.objects.get(&object_id) {
-            Some(KernelObject::Channel(endpoint)) => Some(endpoint.peer_object_id),
+        let peer_link = match state.objects.get(&object_id) {
+            Some(KernelObject::Channel(endpoint)) => {
+                Some((ObjectKind::Channel, endpoint.peer_object_id))
+            }
+            Some(KernelObject::EventPair(endpoint)) => {
+                Some((ObjectKind::EventPair, endpoint.peer_object_id))
+            }
             Some(_) => None,
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         state.close_handle(raw)?;
 
-        if let Some(peer_object_id) = peer_object_id {
-            if let Some(KernelObject::Channel(endpoint)) = state.objects.get_mut(&object_id) {
-                endpoint.closed = true;
-            }
-            if let Some(KernelObject::Channel(peer)) = state.objects.get_mut(&peer_object_id) {
-                peer.peer_closed = true;
+        if let Some((kind, peer_object_id)) = peer_link {
+            match kind {
+                ObjectKind::Channel => {
+                    if let Some(KernelObject::Channel(endpoint)) = state.objects.get_mut(&object_id)
+                    {
+                        endpoint.closed = true;
+                    }
+                    if let Some(KernelObject::Channel(peer)) =
+                        state.objects.get_mut(&peer_object_id)
+                    {
+                        peer.peer_closed = true;
+                    }
+                }
+                ObjectKind::EventPair => {
+                    if let Some(KernelObject::EventPair(endpoint)) =
+                        state.objects.get_mut(&object_id)
+                    {
+                        endpoint.closed = true;
+                    }
+                    if let Some(KernelObject::EventPair(peer)) =
+                        state.objects.get_mut(&peer_object_id)
+                    {
+                        peer.peer_closed = true;
+                    }
+                }
+                _ => {}
             }
             let _ = notify_waitable_signals_changed(state, object_id);
             let _ = notify_waitable_signals_changed(state, peer_object_id);
@@ -896,6 +1040,15 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                     endpoint.closed,
                 );
                 ObjectKind::Channel
+            }
+            KernelObject::EventPair(endpoint) => {
+                let _ = (
+                    endpoint.peer_object_id,
+                    endpoint.user_signals.bits(),
+                    endpoint.peer_closed,
+                    endpoint.closed,
+                );
+                ObjectKind::EventPair
             }
             KernelObject::Port(port) => {
                 let _ = port.len();
@@ -952,6 +1105,13 @@ fn channel_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::WAIT
         | crate::task::HandleRights::READ
         | crate::task::HandleRights::WRITE
+}
+
+fn eventpair_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::WAIT
+        | crate::task::HandleRights::SIGNAL
 }
 
 fn port_default_rights() -> crate::task::HandleRights {
@@ -1042,6 +1202,13 @@ fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals,
                 if endpoint.writable_via_peer(peer) {
                     signals = signals | Signals::CHANNEL_WRITABLE;
                 }
+            }
+            Ok(signals)
+        }
+        KernelObject::EventPair(endpoint) => {
+            let mut signals = endpoint.user_signals;
+            if endpoint.peer_closed {
+                signals = signals | Signals::OBJECT_PEER_CLOSED;
             }
             Ok(signals)
         }

@@ -487,6 +487,88 @@ channel_compare_done:
 	mov 0x770(%rbx), %rax
 	mov %rax, 8*95(%rbx)
 
+	// eventpair_create(bad opts=1)
+	lea 0x780(%rbx), %rsi
+	lea 0x788(%rbx), %rdx
+	movl $1, %edi
+	movabs $16, %rax
+	int $0x80
+	mov %rax, 8*96(%rbx)
+
+	// eventpair_create(null out0)
+	xorl %edi, %edi
+	xorl %esi, %esi
+	lea 0x788(%rbx), %rdx
+	movabs $16, %rax
+	int $0x80
+	mov %rax, 8*97(%rbx)
+
+	// eventpair_create(null out1)
+	xorl %edi, %edi
+	lea 0x780(%rbx), %rsi
+	xorl %edx, %edx
+	movabs $16, %rax
+	int $0x80
+	mov %rax, 8*98(%rbx)
+
+	// eventpair_create(ok)
+	lea 0x780(%rbx), %rsi
+	lea 0x788(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $16, %rax
+	int $0x80
+	mov %rax, 8*99(%rbx)
+	mov 0x780(%rbx), %rcx
+	mov %rcx, 8*100(%rbx)
+	mov 0x788(%rbx), %rcx
+	mov %rcx, 8*101(%rbx)
+
+	// object_signal_peer(bad mask: PEER_CLOSED)
+	mov 0x780(%rbx), %rdi
+	movl $0x4, %esi
+	xorl %edx, %edx
+	movabs $17, %rax
+	int $0x80
+	mov %rax, 8*102(%rbx)
+
+	// object_signal_peer(set USER_SIGNAL_0 on peer)
+	mov 0x780(%rbx), %rdi
+	xorl %esi, %esi
+	movl $0x01000000, %edx
+	movabs $17, %rax
+	int $0x80
+	mov %rax, 8*103(%rbx)
+
+	// wait_one(h1, USER_SIGNAL_0)
+	lea 0x790(%rbx), %r10
+	movq $0, 0x790(%rbx)
+	mov 0x788(%rbx), %rdi
+	movl $0x01000000, %esi
+	xorl %edx, %edx
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*104(%rbx)
+	mov 0x790(%rbx), %rax
+	mov %rax, 8*105(%rbx)
+
+	// close peer h0
+	mov 0x780(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+	mov %rax, 8*106(%rbx)
+
+	// wait_one(h1, OBJECT_PEER_CLOSED)
+	lea 0x798(%rbx), %r10
+	movq $0, 0x798(%rbx)
+	mov 0x788(%rbx), %rdi
+	movl $0x4, %esi
+	xorl %edx, %edx
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*107(%rbx)
+	mov 0x798(%rbx), %rax
+	mov %rax, 8*108(%rbx)
+
 	// port_wait(wrong type: handle=timer_h)
 	mov 0x698(%rbx), %rdi
 	xor %rsi, %rsi

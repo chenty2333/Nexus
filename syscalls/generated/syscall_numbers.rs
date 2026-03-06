@@ -34,3 +34,7 @@ pub const AXLE_SYS_CHANNEL_CREATE: SyscallNumber = 13;
 pub const AXLE_SYS_CHANNEL_WRITE: SyscallNumber = 14;
 /// Contract: SHOULD
 pub const AXLE_SYS_CHANNEL_READ: SyscallNumber = 15;
+/// Contract: SHOULD
+pub const AXLE_SYS_EVENTPAIR_CREATE: SyscallNumber = 16;
+/// Contract: SHOULD
+pub const AXLE_SYS_OBJECT_SIGNAL_PEER: SyscallNumber = 17;

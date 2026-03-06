@@ -18,7 +18,8 @@ use axle_types::status::{
     ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NOT_SUPPORTED, ZX_OK,
 };
 use axle_types::syscall_numbers::{
-    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_HANDLE_CLOSE,
+    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
+    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_OBJECT_SIGNAL_PEER,
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
     AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE,
     AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
@@ -35,7 +36,7 @@ use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 16] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 18] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -52,6 +53,8 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 16] = [
     AXLE_SYS_CHANNEL_CREATE,
     AXLE_SYS_CHANNEL_WRITE,
     AXLE_SYS_CHANNEL_READ,
+    AXLE_SYS_EVENTPAIR_CREATE,
+    AXLE_SYS_OBJECT_SIGNAL_PEER,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -99,6 +102,8 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_CHANNEL_CREATE => sys_channel_create(args),
         AXLE_SYS_CHANNEL_WRITE => sys_channel_write(args),
         AXLE_SYS_CHANNEL_READ => ZX_ERR_NOT_SUPPORTED,
+        AXLE_SYS_EVENTPAIR_CREATE => sys_eventpair_create(args),
+        AXLE_SYS_OBJECT_SIGNAL_PEER => sys_object_signal_peer(args),
         _ => ZX_ERR_BAD_SYSCALL,
     }
 }
@@ -600,6 +605,55 @@ fn sys_channel_read(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
         return e;
     }
     ZX_OK
+}
+
+fn sys_eventpair_create(args: [u64; 6]) -> zx_status_t {
+    let options = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let out0_ptr = args[1] as *mut zx_handle_t;
+    let out1_ptr = args[2] as *mut zx_handle_t;
+    if out0_ptr.is_null() || out1_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if !crate::userspace::validate_user_ptr(out0_ptr as u64, size_of::<zx_handle_t>())
+        || !crate::userspace::validate_user_ptr(out1_ptr as u64, size_of::<zx_handle_t>())
+    {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let (out0, out1) = match crate::object::create_eventpair(options) {
+        Ok(handles) => handles,
+        Err(e) => return e,
+    };
+    if let Err(e) = copyout(out0_ptr, out0) {
+        return e;
+    }
+    if let Err(e) = copyout(out1_ptr, out1) {
+        return e;
+    }
+    ZX_OK
+}
+
+fn sys_object_signal_peer(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let clear_mask = match u32::try_from(args[1]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let set_mask = match u32::try_from(args[2]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+
+    match crate::object::object_signal_peer(handle, clear_mask, set_mask) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
 }
 
 fn align_up_page(value: u64) -> Option<u64> {

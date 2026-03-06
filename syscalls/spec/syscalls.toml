@@ -191,3 +191,25 @@ args = [
   { name = "actual_bytes", ty = "*mut u32" },
   { name = "actual_handles", ty = "*mut u32" },
 ]
+
+[[syscall]]
+name = "eventpair_create"
+nr = 16
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "options", ty = "u32" },
+  { name = "out0", ty = "*mut zx_handle_t" },
+  { name = "out1", ty = "*mut zx_handle_t" },
+]
+
+[[syscall]]
+name = "object_signal_peer"
+nr = 17
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+  { name = "clear_mask", ty = "zx_signals_t" },
+  { name = "set_mask", ty = "zx_signals_t" },
+]
