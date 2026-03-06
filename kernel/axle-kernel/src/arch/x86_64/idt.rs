@@ -57,6 +57,7 @@ pub fn init(
     timer_handler: usize,
     apic_spurious_handler: usize,
     apic_error_handler: usize,
+    ipi_test_handler: usize,
 ) {
     let selector = current_cs();
 
@@ -89,6 +90,10 @@ pub fn init(
             IdtEntry::new(apic_spurious_handler, selector, kernel_int_gate, 0);
         IDT[crate::arch::apic::ERROR_VECTOR] =
             IdtEntry::new(apic_error_handler, selector, kernel_int_gate, 0);
+
+        // Fixed-vector IPI used by SMP conformance. (Kernel-only.)
+        IDT[crate::arch::ipi::TEST_VECTOR] =
+            IdtEntry::new(ipi_test_handler, selector, kernel_int_gate, 0);
     }
     load_idt();
 }

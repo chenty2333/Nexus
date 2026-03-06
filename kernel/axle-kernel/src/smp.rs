@@ -169,4 +169,39 @@ pub fn init() {
     }
 
     crate::kprintln!("smp: requested cpu_count={}", cpu_count);
+
+    // Minimal SMP sanity check: BSP sends a fixed-vector IPI to one AP and
+    // waits for it to ack via the IPI handler.
+    if cpu_count > 1 {
+        let mut dest = None;
+        for apic_id in 0..cpu_count {
+            if apic_id != bsp_id {
+                dest = Some(apic_id);
+                break;
+            }
+        }
+
+        if let Some(dest) = dest {
+            let before = crate::arch::ipi::ack_count(dest);
+
+            crate::arch::apic::send_fixed_ipi(dest as u32, crate::arch::ipi::TEST_VECTOR as u8);
+
+            let start = crate::time::rdtsc();
+            let delta = crate::time::ns_to_tsc(250_000_000); // 250ms
+            while crate::arch::ipi::ack_count(dest) == before {
+                core::hint::spin_loop();
+                if delta != 0 && crate::time::rdtsc().wrapping_sub(start) > delta {
+                    break;
+                }
+            }
+
+            let ok = crate::arch::ipi::ack_count(dest) != before;
+            crate::kprintln!(
+                "smp: ipi_ack={} dest={} vector=0x{:02x}",
+                if ok { 1 } else { 0 },
+                dest,
+                crate::arch::ipi::TEST_VECTOR
+            );
+        }
+    }
 }

@@ -8,6 +8,7 @@ pub mod fault;
 pub mod gdt;
 pub mod idt;
 pub mod int80;
+pub mod ipi;
 pub mod log;
 pub mod percpu;
 pub mod pic;

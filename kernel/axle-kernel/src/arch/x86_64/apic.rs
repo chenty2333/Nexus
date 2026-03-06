@@ -58,6 +58,7 @@ static BSP_LAPIC: BspLapicCell = BspLapicCell(UnsafeCell::new(None));
 
 #[derive(Clone, Copy)]
 enum XapicIpiDeliveryMode {
+    Fixed = 0b000,
     Init = 0b101,
     StartUp = 0b110,
 }
@@ -239,6 +240,18 @@ pub fn send_startup_ipi(dest: u32, vector: u8) {
             lapic.send_sipi(vector, dest);
         }),
         _ => xapic_send_ipi(dest, XapicIpiDeliveryMode::StartUp, vector),
+    }
+}
+
+/// Send a fixed-vector IPI to `dest` APIC id.
+pub fn send_fixed_ipi(dest: u32, vector: u8) {
+    match APIC_MODE.load(Ordering::Relaxed) {
+        MODE_X2APIC => with_bsp_lapic(|lapic| unsafe {
+            // SAFETY: sending an IPI mutates the local APIC state. This is BSP-only
+            // and only used after APIC bring-up.
+            lapic.send_ipi(vector, dest);
+        }),
+        _ => xapic_send_ipi(dest, XapicIpiDeliveryMode::Fixed, vector),
     }
 }
 
