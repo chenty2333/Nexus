@@ -10,13 +10,19 @@
 
 #![allow(dead_code)]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
-use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NOT_SUPPORTED, ZX_OK};
+use axle_types::status::{
+    ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NOT_SUPPORTED, ZX_OK,
+};
 use axle_types::syscall_numbers::{
-    AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
-    AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_TIMER_CANCEL,
-    AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT,
-    AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE, SyscallNumber,
+    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_HANDLE_CLOSE,
+    AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
+    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE,
+    AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
+    AXLE_SYS_VMO_CREATE, SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -26,9 +32,10 @@ use axle_types::{
     zx_vaddr_t, zx_vm_option_t,
 };
 use core::mem::size_of;
+use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 13] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 16] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -42,6 +49,9 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 13] = [
     AXLE_SYS_VMAR_MAP,
     AXLE_SYS_VMAR_UNMAP,
     AXLE_SYS_VMAR_PROTECT,
+    AXLE_SYS_CHANNEL_CREATE,
+    AXLE_SYS_CHANNEL_WRITE,
+    AXLE_SYS_CHANNEL_READ,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -86,6 +96,9 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_VMAR_MAP => ZX_ERR_NOT_SUPPORTED,
         AXLE_SYS_VMAR_UNMAP => sys_vmar_unmap(args),
         AXLE_SYS_VMAR_PROTECT => sys_vmar_protect(args),
+        AXLE_SYS_CHANNEL_CREATE => sys_channel_create(args),
+        AXLE_SYS_CHANNEL_WRITE => sys_channel_write(args),
+        AXLE_SYS_CHANNEL_READ => ZX_ERR_NOT_SUPPORTED,
         _ => ZX_ERR_BAD_SYSCALL,
     }
 }
@@ -94,6 +107,7 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
 pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame, cpu_frame: *const u64) {
     let status = match u32::try_from(frame.syscall_nr()) {
         Ok(AXLE_SYS_VMAR_MAP) => sys_vmar_map(frame.args(), cpu_frame),
+        Ok(AXLE_SYS_CHANNEL_READ) => sys_channel_read(frame.args(), cpu_frame),
         Ok(nr) => dispatch_syscall(nr, frame.args()),
         Err(_) => ZX_ERR_BAD_SYSCALL,
     };
@@ -123,6 +137,49 @@ fn copyout<T: Copy>(ptr: *mut T, v: T) -> Result<(), zx_status_t> {
         core::ptr::write_unaligned(ptr, v);
     }
     Ok(())
+}
+
+fn copyin_bytes(ptr: *const u8, len: usize) -> Result<Vec<u8>, zx_status_t> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if !crate::userspace::validate_user_ptr(ptr as u64, len) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
+    out.resize(len, 0);
+    // SAFETY: the userspace range was validated above and `out` was sized to `len`.
+    let src = unsafe { slice::from_raw_parts(ptr, len) };
+    out.as_mut_slice().copy_from_slice(src);
+    Ok(out)
+}
+
+fn copyout_bytes(ptr: *mut u8, bytes: &[u8]) -> Result<(), zx_status_t> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if ptr.is_null() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if !crate::userspace::validate_user_ptr(ptr as u64, bytes.len()) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    // SAFETY: the userspace range was validated above and `bytes` is a valid source slice.
+    let dst = unsafe { slice::from_raw_parts_mut(ptr, bytes.len()) };
+    dst.copy_from_slice(bytes);
+    Ok(())
+}
+
+fn copyout_optional<T: Copy>(ptr: *mut T, value: T) -> Result<(), zx_status_t> {
+    if ptr.is_null() {
+        return Ok(());
+    }
+    copyout(ptr, value)
 }
 
 fn sys_handle_close(args: [u64; 6]) -> zx_status_t {
@@ -424,6 +481,125 @@ fn sys_vmar_protect(args: [u64; 6]) -> zx_status_t {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
+}
+
+fn sys_channel_create(args: [u64; 6]) -> zx_status_t {
+    let options = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let out0_ptr = args[1] as *mut zx_handle_t;
+    let out1_ptr = args[2] as *mut zx_handle_t;
+    if out0_ptr.is_null() || out1_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if !crate::userspace::validate_user_ptr(out0_ptr as u64, size_of::<zx_handle_t>())
+        || !crate::userspace::validate_user_ptr(out1_ptr as u64, size_of::<zx_handle_t>())
+    {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let (out0, out1) = match crate::object::create_channel(options) {
+        Ok(handles) => handles,
+        Err(e) => return e,
+    };
+    if let Err(e) = copyout(out0_ptr, out0) {
+        return e;
+    }
+    if let Err(e) = copyout(out1_ptr, out1) {
+        return e;
+    }
+    ZX_OK
+}
+
+fn sys_channel_write(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let options = match u32::try_from(args[1]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let bytes_ptr = args[2] as *const u8;
+    let num_bytes = match usize::try_from(args[3]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let handles_ptr = args[4] as *const zx_handle_t;
+    let num_handles = match u32::try_from(args[5]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    if num_bytes != 0 && bytes_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if num_handles != 0 && handles_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let bytes = match copyin_bytes(bytes_ptr, num_bytes) {
+        Ok(bytes) => bytes,
+        Err(e) => return e,
+    };
+    match crate::object::channel_write(handle, options, bytes, num_handles) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_channel_read(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let options = match u32::try_from(args[1]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let bytes_ptr = args[2] as *mut u8;
+    let handles_ptr = args[3] as *mut zx_handle_t;
+    let num_bytes = match u32::try_from(args[4]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let num_handles = match u32::try_from(args[5]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let actual_bytes_ptr = match extra_arg_u64(cpu_frame, 0) {
+        Ok(arg) => arg as *mut u32,
+        Err(e) => return e,
+    };
+    let actual_handles_ptr = match extra_arg_u64(cpu_frame, 1) {
+        Ok(arg) => arg as *mut u32,
+        Err(e) => return e,
+    };
+    if num_bytes != 0 && bytes_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if num_handles != 0 && handles_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let message = match crate::object::channel_read(handle, options, num_bytes, num_handles) {
+        Ok(message) => message,
+        Err((status, actual_bytes, actual_handles)) => {
+            let _ = copyout_optional(actual_bytes_ptr, actual_bytes);
+            let _ = copyout_optional(actual_handles_ptr, actual_handles);
+            return status;
+        }
+    };
+    if let Err(e) = copyout_bytes(bytes_ptr, &message.bytes) {
+        return e;
+    }
+    if let Err(e) = copyout_optional(actual_bytes_ptr, message.actual_bytes) {
+        return e;
+    }
+    if let Err(e) = copyout_optional(actual_handles_ptr, message.actual_handles) {
+        return e;
+    }
+    ZX_OK
 }
 
 fn align_up_page(value: u64) -> Option<u64> {

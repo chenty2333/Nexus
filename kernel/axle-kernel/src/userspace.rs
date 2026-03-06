@@ -18,11 +18,13 @@ use x86_64::instructions::segmentation::Segment;
 // --- Userspace virtual layout (in current single-address-space model) ---
 
 pub(crate) const USER_PAGE_BYTES: u64 = 0x1000;
+pub(crate) const USER_CODE_PAGE_COUNT: usize = 8;
+pub(crate) const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * USER_CODE_PAGE_COUNT as u64;
 pub(crate) const USER_REGION_BYTES: u64 = 0x20_0000;
 pub(crate) const USER_CODE_VA: u64 = 0x0000_0001_0000_0000; // 4 GiB
-pub(crate) const USER_SHARED_VA: u64 = USER_CODE_VA + USER_PAGE_BYTES;
-pub(crate) const USER_STACK_VA: u64 = USER_CODE_VA + (2 * USER_PAGE_BYTES);
-const USER_STACK_TOP: u64 = USER_STACK_VA + 0x1000;
+pub(crate) const USER_SHARED_VA: u64 = USER_CODE_VA + USER_CODE_BYTES;
+pub(crate) const USER_STACK_VA: u64 = USER_SHARED_VA + USER_PAGE_BYTES;
+const USER_STACK_TOP: u64 = USER_STACK_VA + USER_PAGE_BYTES;
 pub(crate) const USER_VM_TEST_VA: u64 = USER_CODE_VA + 0x10_000;
 
 // --- QEMU loader handoff for external userspace runner ELF ---
@@ -115,16 +117,37 @@ const SLOT_VMAR_PROTECT: usize = 73;
 const SLOT_VMAR_REPROTECT: usize = 74;
 const SLOT_VMAR_UNMAP: usize = 75;
 const SLOT_VMAR_REMAP: usize = 76;
+const SLOT_CHANNEL_CREATE_BAD_OPTS: usize = 77;
+const SLOT_CHANNEL_CREATE_NULL_OUT0: usize = 78;
+const SLOT_CHANNEL_CREATE_NULL_OUT1: usize = 79;
+const SLOT_CHANNEL_CREATE: usize = 80;
+const SLOT_CHANNEL_H0: usize = 81;
+const SLOT_CHANNEL_H1: usize = 82;
+const SLOT_CHANNEL_READ_EMPTY: usize = 83;
+const SLOT_CHANNEL_WRITE: usize = 84;
+const SLOT_CHANNEL_WAIT_READABLE: usize = 85;
+const SLOT_CHANNEL_WAIT_READABLE_OK: usize = 86;
+const SLOT_CHANNEL_READ: usize = 87;
+const SLOT_CHANNEL_READ_ACTUAL_BYTES: usize = 88;
+const SLOT_CHANNEL_READ_ACTUAL_HANDLES: usize = 89;
+const SLOT_CHANNEL_READ_MATCH: usize = 90;
+const SLOT_CHANNEL_CLOSE_PEER: usize = 91;
+const SLOT_CHANNEL_WRITE_PEER_CLOSED: usize = 92;
+const SLOT_CHANNEL_READ_PEER_CLOSED: usize = 93;
+const SLOT_CHANNEL_WAIT_PEER_CLOSED: usize = 94;
+const SLOT_CHANNEL_WAIT_PEER_CLOSED_OBS: usize = 95;
 
-const SLOT_MAX: usize = SLOT_VMAR_REMAP;
+const SLOT_MAX: usize = SLOT_CHANNEL_WAIT_PEER_CLOSED_OBS;
 const SLOT_T0_NS: usize = 511;
 
 #[repr(align(4096))]
+#[derive(Clone, Copy)]
 struct AlignedPage([u8; 4096]);
 #[repr(align(4096))]
 struct AlignedPageTable([u64; 512]);
 
-static mut USER_CODE_PAGE: AlignedPage = AlignedPage([0; 4096]);
+static mut USER_CODE_PAGES: [AlignedPage; USER_CODE_PAGE_COUNT] =
+    [AlignedPage([0; 4096]); USER_CODE_PAGE_COUNT];
 static mut USER_SHARED_PAGE: AlignedPage = AlignedPage([0; 4096]);
 static mut USER_STACK_PAGE: AlignedPage = AlignedPage([0; 4096]);
 
@@ -147,8 +170,9 @@ fn phys_of<T>(p: *const T) -> u64 {
     p as u64
 }
 
-pub(crate) fn user_code_page_paddr() -> u64 {
-    phys_of(core::ptr::addr_of!(USER_CODE_PAGE))
+pub(crate) fn user_code_page_paddr(index: usize) -> u64 {
+    assert!(index < USER_CODE_PAGE_COUNT);
+    phys_of(core::ptr::addr_of!(USER_CODE_PAGES)) + (index as u64) * USER_PAGE_BYTES
 }
 
 pub(crate) fn user_shared_page_paddr() -> u64 {
@@ -257,10 +281,14 @@ fn map_userspace_pages() {
         // USER_PD[0] -> USER_PT (maps VA 4GiB..4GiB+2MiB).
         *user_pd.add(0) = phys_of(core::ptr::addr_of!(USER_PT)) | (PTE_P | PTE_W | PTE_U);
 
-        // Map the three user pages.
-        *user_pt.add(0) = phys_of(core::ptr::addr_of!(USER_CODE_PAGE)) | (PTE_P | PTE_W | PTE_U);
-        *user_pt.add(1) = phys_of(core::ptr::addr_of!(USER_SHARED_PAGE)) | (PTE_P | PTE_W | PTE_U);
-        *user_pt.add(2) = phys_of(core::ptr::addr_of!(USER_STACK_PAGE)) | (PTE_P | PTE_U);
+        // Map the user code pages, followed by the shared page and stack page.
+        for index in 0..USER_CODE_PAGE_COUNT {
+            *user_pt.add(index) = user_code_page_paddr(index) | (PTE_P | PTE_W | PTE_U);
+        }
+        *user_pt.add(USER_CODE_PAGE_COUNT) =
+            phys_of(core::ptr::addr_of!(USER_SHARED_PAGE)) | (PTE_P | PTE_W | PTE_U);
+        *user_pt.add(USER_CODE_PAGE_COUNT + 1) =
+            phys_of(core::ptr::addr_of!(USER_STACK_PAGE)) | (PTE_P | PTE_U);
 
         // Flush TLB by reloading CR3.
         crate::arch::tlb::flush_all_local();
@@ -280,15 +308,18 @@ fn load_user_program_embedded() {
         let len = end.offset_from(start) as usize;
         let src = core::slice::from_raw_parts(start, len);
 
-        if len > 4096 {
-            panic!("userspace: program too large for one page (len={})", len);
+        if len > USER_CODE_BYTES as usize {
+            panic!(
+                "userspace: program too large for bootstrap code region (len={})",
+                len
+            );
         }
 
-        let dst = core::ptr::addr_of_mut!(USER_CODE_PAGE).cast::<u8>();
+        let dst = core::ptr::addr_of_mut!(USER_CODE_PAGES).cast::<u8>();
         // Use `ptr::copy` (memmove semantics) to avoid relying on non-overlap
         // across toolchain/linker layouts during bring-up.
         core::ptr::copy(src.as_ptr(), dst, len);
-        core::ptr::write_bytes(dst.add(len), 0, 4096 - len);
+        core::ptr::write_bytes(dst.add(len), 0, USER_CODE_BYTES as usize - len);
     }
 }
 
@@ -435,7 +466,7 @@ pub fn on_breakpoint() -> ! {
     }
 
     crate::kprintln!(
-        "kernel: int80 conformance ok (unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, bad_wait={}, port_wait_null_out={}, empty_wait={}, port_queue_null_pkt={}, port_queue_bad_type={}, queue={}, wait={}, timer_create_bad_opts={}, timer_create_bad_clock={}, timer_create_null_out={}, port_wait_wrong_type={}, port_queue_wrong_type={}, timer_set_wrong_type={}, timer_cancel_wrong_type={}, wait_one_unsignaled={}, wait_one_unsignaled_observed={}, wait_async={}, timer_set_immediate={}, wait_signal={}, signal_trigger={}, signal_observed={}, signal_count={}, wait_one_signaled={}, wait_one_signaled_observed={}, wait_one_future_timeout={}, wait_one_future_timeout_observed={}, wait_one_future_ok={}, wait_one_future_ok_observed={}, wait_async_bad_options={}, wait_async_ts={}, wait_signal_ts={}, signal_timestamp={}, signal_timestamp_ok={}, wait_async_boot={}, wait_signal_boot={}, signal_boot_timestamp={}, signal_boot_timestamp_ok={}, edge_wait_async={}, edge_empty_wait={}, edge_signal_wait={}, edge_signal_key={}, reserve_queue_full={}, reserve_wait_async={}, reserve_signal_after_users_ok={}, reserve_signal_type={}, pending_wait_async={}, pending_signal_wait={}, pending_signal_count={}, pending_merge_ok={}, vmo_create_bad_opts={}, vmo_create_null_out={}, vmo_create={}, vmar_map_bad_type={}, vmar_map_bad_opts={}, vmar_map={}, vmar_map_addr={}, vmar_map_write_ok={}, vmar_overlap={}, vmar_protect={}, vmar_reprotect={}, vmar_unmap={}, vmar_remap={}, timer_set={}, timer_cancel={}, timer_close={}, timer_close_again={}, close={}, close_again={}, root_vmar_h={}, port_h={}, timer_h={}, vmo_h={})",
+        "kernel: int80 conformance ok (unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, bad_wait={}, port_wait_null_out={}, empty_wait={}, port_queue_null_pkt={}, port_queue_bad_type={}, queue={}, wait={}, timer_create_bad_opts={}, timer_create_bad_clock={}, timer_create_null_out={}, port_wait_wrong_type={}, port_queue_wrong_type={}, timer_set_wrong_type={}, timer_cancel_wrong_type={}, wait_one_unsignaled={}, wait_one_unsignaled_observed={}, wait_async={}, timer_set_immediate={}, wait_signal={}, signal_trigger={}, signal_observed={}, signal_count={}, wait_one_signaled={}, wait_one_signaled_observed={}, wait_one_future_timeout={}, wait_one_future_timeout_observed={}, wait_one_future_ok={}, wait_one_future_ok_observed={}, wait_async_bad_options={}, wait_async_ts={}, wait_signal_ts={}, signal_timestamp={}, signal_timestamp_ok={}, wait_async_boot={}, wait_signal_boot={}, signal_boot_timestamp={}, signal_boot_timestamp_ok={}, edge_wait_async={}, edge_empty_wait={}, edge_signal_wait={}, edge_signal_key={}, reserve_queue_full={}, reserve_wait_async={}, reserve_signal_after_users_ok={}, reserve_signal_type={}, pending_wait_async={}, pending_signal_wait={}, pending_signal_count={}, pending_merge_ok={}, vmo_create_bad_opts={}, vmo_create_null_out={}, vmo_create={}, vmar_map_bad_type={}, vmar_map_bad_opts={}, vmar_map={}, vmar_map_addr={}, vmar_map_write_ok={}, vmar_overlap={}, vmar_protect={}, vmar_reprotect={}, vmar_unmap={}, vmar_remap={}, channel_create_bad_opts={}, channel_create_null_out0={}, channel_create_null_out1={}, channel_create={}, channel_read_empty={}, channel_write={}, channel_wait_readable={}, channel_wait_readable_ok={}, channel_read={}, channel_read_actual_bytes={}, channel_read_actual_handles={}, channel_read_match={}, channel_close_peer={}, channel_write_peer_closed={}, channel_read_peer_closed={}, channel_wait_peer_closed={}, channel_wait_peer_closed_observed={}, timer_set={}, timer_cancel={}, timer_close={}, timer_close_again={}, close={}, close_again={}, root_vmar_h={}, port_h={}, timer_h={}, vmo_h={}, channel_h0={}, channel_h1={})",
         slots[SLOT_UNKNOWN] as i64,
         slots[SLOT_CLOSE_INVALID] as i64,
         slots[SLOT_PORT_CREATE_BAD_OPTS] as i64,
@@ -502,6 +533,23 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_VMAR_REPROTECT] as i64,
         slots[SLOT_VMAR_UNMAP] as i64,
         slots[SLOT_VMAR_REMAP] as i64,
+        slots[SLOT_CHANNEL_CREATE_BAD_OPTS] as i64,
+        slots[SLOT_CHANNEL_CREATE_NULL_OUT0] as i64,
+        slots[SLOT_CHANNEL_CREATE_NULL_OUT1] as i64,
+        slots[SLOT_CHANNEL_CREATE] as i64,
+        slots[SLOT_CHANNEL_READ_EMPTY] as i64,
+        slots[SLOT_CHANNEL_WRITE] as i64,
+        slots[SLOT_CHANNEL_WAIT_READABLE] as i64,
+        slots[SLOT_CHANNEL_WAIT_READABLE_OK] as i64,
+        slots[SLOT_CHANNEL_READ] as i64,
+        slots[SLOT_CHANNEL_READ_ACTUAL_BYTES] as i64,
+        slots[SLOT_CHANNEL_READ_ACTUAL_HANDLES] as i64,
+        slots[SLOT_CHANNEL_READ_MATCH] as i64,
+        slots[SLOT_CHANNEL_CLOSE_PEER] as i64,
+        slots[SLOT_CHANNEL_WRITE_PEER_CLOSED] as i64,
+        slots[SLOT_CHANNEL_READ_PEER_CLOSED] as i64,
+        slots[SLOT_CHANNEL_WAIT_PEER_CLOSED] as i64,
+        slots[SLOT_CHANNEL_WAIT_PEER_CLOSED_OBS] as i64,
         slots[SLOT_TIMER_SET] as i64,
         slots[SLOT_TIMER_CANCEL] as i64,
         slots[SLOT_TIMER_CLOSE] as i64,
@@ -511,7 +559,9 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_ROOT_VMAR_H],
         slots[SLOT_PORT_H],
         slots[SLOT_TIMER_H],
-        slots[SLOT_VMO_H]
+        slots[SLOT_VMO_H],
+        slots[SLOT_CHANNEL_H0],
+        slots[SLOT_CHANNEL_H1]
     );
 
     crate::arch::qemu::exit_success();

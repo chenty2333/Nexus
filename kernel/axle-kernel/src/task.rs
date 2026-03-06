@@ -173,17 +173,23 @@ impl AddressSpace {
         .expect("bootstrap address-space root must be valid");
 
         let code_vmo = vm
-            .create_vmo(VmoKind::Anonymous, crate::userspace::USER_PAGE_BYTES)
+            .create_vmo(VmoKind::Anonymous, crate::userspace::USER_CODE_BYTES)
             .expect("bootstrap code vmo allocation must succeed");
-        let code_frame = frames
-            .register_existing(crate::userspace::user_code_page_paddr())
-            .expect("bootstrap code frame registration must succeed");
-        vm.bind_vmo_frame(code_vmo, 0, code_frame)
+        for page_index in 0..crate::userspace::USER_CODE_PAGE_COUNT {
+            let code_frame = frames
+                .register_existing(crate::userspace::user_code_page_paddr(page_index))
+                .expect("bootstrap code frame registration must succeed");
+            vm.bind_vmo_frame(
+                code_vmo,
+                (page_index as u64) * crate::userspace::USER_PAGE_BYTES,
+                code_frame,
+            )
             .expect("bootstrap code frame binding must succeed");
+        }
         vm.map_fixed(
             frames,
             crate::userspace::USER_CODE_VA,
-            crate::userspace::USER_PAGE_BYTES,
+            crate::userspace::USER_CODE_BYTES,
             code_vmo,
             0,
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::EXECUTE | MappingPerms::USER,

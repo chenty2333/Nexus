@@ -1,0 +1,30 @@
+id = "kernel.channel.roundtrip_bootstrap"
+description = "Bootstrap channel create/write/read preserves byte payloads and readable waits"
+tags = ["module:channel", "module:kernel", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.channel.create_write_read_bootstrap"]
+
+[assertions.status_code]
+channel_create = 0
+channel_write = 0
+channel_wait_readable = 0
+channel_read = 0
+
+[assertions.error_code]
+channel_create_bad_opts = -10
+channel_create_null_out0 = -10
+channel_create_null_out1 = -10
+channel_read_empty = -22
+
+[assertions.packet_fields]
+channel_wait_readable_ok = 1
+channel_read_actual_bytes = 16
+channel_read_actual_handles = 0
+channel_read_match = 1

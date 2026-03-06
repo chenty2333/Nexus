@@ -2,8 +2,8 @@
 .global axle_user_prog_start
 .global axle_user_prog_end
 axle_user_prog_start:
-// rbx = shared base (USER_SHARED_VA)
-movabs $0x0000000100001000, %rbx
+	// rbx = shared base (USER_SHARED_VA)
+	movabs $0x0000000100008000, %rbx
 // r12 = t0_ns baseline provided by the kernel (slot 511)
 mov 8*511(%rbx), %r12
 
@@ -301,10 +301,10 @@ movabs $11, %rax
 int $0x80
 mov %rax, 8*75(%rbx)
 
-// vmar_map(remap after unmap)
-mov 8*62(%rbx), %rdi
-movl $0x403, %esi
-movabs $0x10000, %rdx
+	// vmar_map(remap after unmap)
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x10000, %rdx
 mov 0x6d0(%rbx), %r10
 xor %r8, %r8
 movabs $0x1000, %r9
@@ -313,12 +313,183 @@ sub $8, %rsp
 mov %rax, (%rsp)
 movabs $10, %rax
 int $0x80
-add $8, %rsp
-mov %rax, 8*76(%rbx)
+	add $8, %rsp
+	mov %rax, 8*76(%rbx)
 
-// port_wait(wrong type: handle=timer_h)
-mov 0x698(%rbx), %rdi
-xor %rsi, %rsi
+	// channel_create(bad opts=1)
+	lea 0x700(%rbx), %rsi
+	lea 0x708(%rbx), %rdx
+	movl $1, %edi
+	movabs $13, %rax
+	int $0x80
+	mov %rax, 8*77(%rbx)
+
+	// channel_create(null out0)
+	xorl %edi, %edi
+	xorl %esi, %esi
+	lea 0x708(%rbx), %rdx
+	movabs $13, %rax
+	int $0x80
+	mov %rax, 8*78(%rbx)
+
+	// channel_create(null out1)
+	xorl %edi, %edi
+	lea 0x700(%rbx), %rsi
+	xorl %edx, %edx
+	movabs $13, %rax
+	int $0x80
+	mov %rax, 8*79(%rbx)
+
+	// channel_create(ok)
+	lea 0x700(%rbx), %rsi
+	lea 0x708(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $13, %rax
+	int $0x80
+	mov %rax, 8*80(%rbx)
+	mov 0x700(%rbx), %rcx
+	mov %rcx, 8*81(%rbx)
+	mov 0x708(%rbx), %rcx
+	mov %rcx, 8*82(%rbx)
+
+	// channel_read(empty)
+	mov 0x708(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x740(%rbx), %rdx
+	xorl %r10d, %r10d
+	movl $16, %r8d
+	xorl %r9d, %r9d
+	lea 0x758(%rbx), %rax
+	lea 0x760(%rbx), %rcx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rcx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	mov %rax, 8*83(%rbx)
+
+	// tx bytes @ 0x720
+	movabs $0x1122334455667788, %rax
+	mov %rax, 0x720(%rbx)
+	movabs $0x8877665544332211, %rax
+	mov %rax, 0x728(%rbx)
+
+	// channel_write(h0 -> h1)
+	mov 0x700(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x720(%rbx), %rdx
+	movl $16, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*84(%rbx)
+
+	// wait_one(h1, CHANNEL_READABLE)
+	lea 0x768(%rbx), %r10
+	movq $0, 0x768(%rbx)
+	mov 0x708(%rbx), %rdi
+	movl $0x1, %esi
+	xorl %edx, %edx
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*85(%rbx)
+	movq $0, 8*86(%rbx)
+	mov 0x768(%rbx), %rax
+	test $0x1, %rax
+	jz channel_wait_readable_done
+	movq $1, 8*86(%rbx)
+channel_wait_readable_done:
+
+	// channel_read(h1)
+	movq $0, 0x758(%rbx)
+	movq $0, 0x760(%rbx)
+	mov 0x708(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x740(%rbx), %rdx
+	xorl %r10d, %r10d
+	movl $16, %r8d
+	xorl %r9d, %r9d
+	lea 0x758(%rbx), %rax
+	lea 0x760(%rbx), %rcx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rcx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	mov %rax, 8*87(%rbx)
+	mov 0x758(%rbx), %rax
+	mov %rax, 8*88(%rbx)
+	mov 0x760(%rbx), %rax
+	mov %rax, 8*89(%rbx)
+	movq $0, 8*90(%rbx)
+	lea 0x720(%rbx), %rsi
+	lea 0x740(%rbx), %rdi
+	mov $2, %rcx
+channel_compare_loop:
+	mov (%rsi), %r8
+	mov (%rdi), %r9
+	cmp %r8, %r9
+	jne channel_compare_done
+	add $8, %rsi
+	add $8, %rdi
+	loop channel_compare_loop
+	movq $1, 8*90(%rbx)
+channel_compare_done:
+
+	// close peer h0
+	mov 0x700(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+	mov %rax, 8*91(%rbx)
+
+	// channel_write(peer closed on h1)
+	mov 0x708(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x720(%rbx), %rdx
+	movl $16, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*92(%rbx)
+
+	// channel_read(peer closed on empty h1)
+	movq $0, 0x758(%rbx)
+	movq $0, 0x760(%rbx)
+	mov 0x708(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x740(%rbx), %rdx
+	xorl %r10d, %r10d
+	movl $16, %r8d
+	xorl %r9d, %r9d
+	lea 0x758(%rbx), %rax
+	lea 0x760(%rbx), %rcx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rcx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	mov %rax, 8*93(%rbx)
+
+	// wait_one(h1, CHANNEL_PEER_CLOSED)
+	lea 0x770(%rbx), %r10
+	movq $0, 0x770(%rbx)
+	mov 0x708(%rbx), %rdi
+	movl $0x4, %esi
+	xorl %edx, %edx
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*94(%rbx)
+	mov 0x770(%rbx), %rax
+	mov %rax, 8*95(%rbx)
+
+	// port_wait(wrong type: handle=timer_h)
+	mov 0x698(%rbx), %rdi
+	xor %rsi, %rsi
 lea 0x300(%rbx), %rdx
 movabs $5, %rax
 int $0x80

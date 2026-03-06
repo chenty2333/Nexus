@@ -151,4 +151,43 @@ args = [
   { name = "len", ty = "u64" },
 ]
 
-# Channel will be added once the "page-borrow + COW" design is ready to implement.
+[[syscall]]
+name = "channel_create"
+nr = 13
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "options", ty = "u32" },
+  { name = "out0", ty = "*mut zx_handle_t" },
+  { name = "out1", ty = "*mut zx_handle_t" },
+]
+
+[[syscall]]
+name = "channel_write"
+nr = 14
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+  { name = "options", ty = "u32" },
+  { name = "bytes", ty = "*const u8" },
+  { name = "num_bytes", ty = "u32" },
+  { name = "handles", ty = "*const zx_handle_t" },
+  { name = "num_handles", ty = "u32" },
+]
+
+[[syscall]]
+name = "channel_read"
+nr = 15
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+  { name = "options", ty = "u32" },
+  { name = "bytes", ty = "*mut u8" },
+  { name = "handles", ty = "*mut zx_handle_t" },
+  { name = "num_bytes", ty = "u32" },
+  { name = "num_handles", ty = "u32" },
+  { name = "actual_bytes", ty = "*mut u32" },
+  { name = "actual_handles", ty = "*mut u32" },
+]

@@ -64,3 +64,13 @@ description = "zx_vmo_create must reject bad bootstrap arguments and return a no
 id = "should.vmar.map_protect_unmap_bootstrap"
 level = "should"
 description = "Root-VMAR bootstrap map/protect/unmap should support an explicit anonymous mapping lifecycle with stable error codes"
+
+[[contracts]]
+id = "should.channel.create_write_read_bootstrap"
+level = "should"
+description = "Bootstrap channel create/write/read should preserve FIFO byte payloads and readable signaling"
+
+[[contracts]]
+id = "should.channel.peer_closed_bootstrap"
+level = "should"
+description = "Closing one bootstrap channel endpoint should immediately expose PEER_CLOSED on the peer and reject further writes"

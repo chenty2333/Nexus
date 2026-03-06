@@ -28,3 +28,9 @@ pub const AXLE_SYS_VMAR_MAP: SyscallNumber = 10;
 pub const AXLE_SYS_VMAR_UNMAP: SyscallNumber = 11;
 /// Contract: SHOULD
 pub const AXLE_SYS_VMAR_PROTECT: SyscallNumber = 12;
+/// Contract: SHOULD
+pub const AXLE_SYS_CHANNEL_CREATE: SyscallNumber = 13;
+/// Contract: SHOULD
+pub const AXLE_SYS_CHANNEL_WRITE: SyscallNumber = 14;
+/// Contract: SHOULD
+pub const AXLE_SYS_CHANNEL_READ: SyscallNumber = 15;
