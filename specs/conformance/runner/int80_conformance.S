@@ -1342,6 +1342,68 @@ futex_owner_match_done:
 	mov 0x880(%rbx), %rax
 	mov %rax, 8*150(%rbx)
 
+	// vmo_create(thread stack page)
+	lea 0x888(%rbx), %rdx
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	movabs $9, %rax
+	int $0x80
+
+	// vmar_map(thread stack @ USER_CODE_VA + 0x13000)
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x13000, %rdx
+	mov 0x888(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x890(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+
+	// thread_create(self_process, NULL, 0, 0, &thread_h)
+	mov 8*300(%rbx), %rdi
+	xor %rsi, %rsi
+	xor %rdx, %rdx
+	xor %r10d, %r10d
+	lea 0x898(%rbx), %r8
+	movabs $25, %rax
+	int $0x80
+	mov %rax, 8*301(%rbx)
+
+	// thread_start(thread_h, thread_worker_entry, stack_top, source_futex, 0)
+	mov 0x898(%rbx), %rdi
+	lea thread_worker_entry(%rip), %rsi
+	mov 0x890(%rbx), %rdx
+	add $0x1000, %rdx
+	mov %r14, %r10
+	xor %r8, %r8
+	movabs $26, %rax
+	int $0x80
+	mov %rax, 8*302(%rbx)
+
+	// futex_wait(source, 0, INVALID, forever) -> child should wake us
+	movl $0, (%r14)
+	mov %r14, %rdi
+	xorl %esi, %esi
+	xorl %edx, %edx
+	movabs $0x7fffffffffffffff, %r10
+	movabs $21, %rax
+	int $0x80
+	mov %rax, 8*304(%rbx)
+
+	// resume check: child ran and futex word now equals 1
+	movq $0, 8*306(%rbx)
+	cmpq $1, 8*303(%rbx)
+	jne thread_resume_done
+	mov (%r14), %eax
+	cmpl $1, %eax
+	jne thread_resume_done
+	movq $1, 8*306(%rbx)
+thread_resume_done:
+
 	// timer_cancel
 	mov 0x698(%rbx), %rdi
 	movabs $8, %rax
@@ -1380,5 +1442,18 @@ user_fail:
 // ok=0 and exit via int3
 movq $0, 0x00(%rbx)
 int3
+
+thread_worker_entry:
+	movabs $0x0000000100008000, %rbx
+	movq $1, 8*303(%rbx)
+	movl $1, (%rdi)
+	mov %rdi, %rdi
+	movl $1, %esi
+	movabs $22, %rax
+	int $0x80
+	mov %rax, 8*305(%rbx)
+thread_worker_spin:
+	pause
+	jmp thread_worker_spin
 
 axle_user_prog_end:

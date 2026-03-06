@@ -192,8 +192,15 @@ const SLOT_FUTEX_WAKE_ZERO: usize = 148;
 const SLOT_FUTEX_GET_OWNER_WAKE: usize = 149;
 const SLOT_FUTEX_OWNER_WAKE: usize = 150;
 const SLOT_SELF_THREAD_KOID: usize = 151;
+const SLOT_SELF_PROCESS_H: usize = 300;
+const SLOT_THREAD_CREATE: usize = 301;
+const SLOT_THREAD_START: usize = 302;
+const SLOT_THREAD_CHILD_RAN: usize = 303;
+const SLOT_THREAD_FUTEX_WAIT: usize = 304;
+const SLOT_THREAD_WAKE_STATUS: usize = 305;
+const SLOT_THREAD_RESUMED: usize = 306;
 
-const SLOT_MAX: usize = SLOT_SELF_THREAD_KOID;
+const SLOT_MAX: usize = SLOT_THREAD_RESUMED;
 const SLOT_T0_NS: usize = 511;
 
 #[repr(align(4096))]
@@ -522,7 +529,7 @@ pub fn on_breakpoint() -> ! {
     }
 
     crate::kprintln!(
-        "kernel: int80 conformance ok (unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, bad_wait={}, port_wait_null_out={}, empty_wait={}, port_queue_null_pkt={}, port_queue_bad_type={}, queue={}, wait={}, timer_create_bad_opts={}, timer_create_bad_clock={}, timer_create_null_out={}, port_wait_wrong_type={}, port_queue_wrong_type={}, timer_set_wrong_type={}, timer_cancel_wrong_type={}, wait_one_unsignaled={}, wait_one_unsignaled_observed={}, wait_async={}, timer_set_immediate={}, wait_signal={}, signal_trigger={}, signal_observed={}, signal_count={}, wait_one_signaled={}, wait_one_signaled_observed={}, wait_one_future_timeout={}, wait_one_future_timeout_observed={}, wait_one_future_ok={}, wait_one_future_ok_observed={}, wait_async_bad_options={}, wait_async_ts={}, wait_signal_ts={}, signal_timestamp={}, signal_timestamp_ok={}, wait_async_boot={}, wait_signal_boot={}, signal_boot_timestamp={}, signal_boot_timestamp_ok={}, edge_wait_async={}, edge_empty_wait={}, edge_signal_wait={}, edge_signal_key={}, reserve_queue_full={}, reserve_wait_async={}, reserve_signal_after_users_ok={}, reserve_signal_type={}, pending_wait_async={}, pending_signal_wait={}, pending_signal_count={}, pending_merge_ok={}, vmo_create_bad_opts={}, vmo_create_null_out={}, vmo_create={}, vmar_map_bad_type={}, vmar_map_bad_opts={}, vmar_map={}, vmar_map_addr={}, vmar_map_write_ok={}, vmar_overlap={}, vmar_protect={}, vmar_reprotect={}, vmar_unmap={}, vmar_remap={}, channel_create_bad_opts={}, channel_create_null_out0={}, channel_create_null_out1={}, channel_create={}, channel_read_empty={}, channel_write={}, channel_wait_readable={}, channel_wait_readable_ok={}, channel_read={}, channel_read_actual_bytes={}, channel_read_actual_handles={}, channel_read_match={}, channel_close_peer={}, channel_write_peer_closed={}, channel_read_peer_closed={}, channel_wait_peer_closed={}, channel_wait_peer_closed_observed={}, eventpair_create_bad_opts={}, eventpair_create_null_out0={}, eventpair_create_null_out1={}, eventpair_create={}, eventpair_signal_bad_mask={}, eventpair_signal_peer={}, eventpair_wait_signal={}, eventpair_wait_signal_observed={}, eventpair_close_peer={}, eventpair_wait_peer_closed={}, eventpair_wait_peer_closed_observed={}, channel_loan_tx_vmo_create={}, channel_loan_tx_map={}, channel_loan_rx_vmo_create={}, channel_loan_rx_map={}, channel_loan_create={}, channel_loan_write={}, channel_loan_read={}, channel_loan_actual_bytes={}, channel_loan_snapshot_ok={}, handle_duplicate={}, handle_duplicate_distinct={}, handle_duplicate_signal={}, handle_duplicate_wait={}, handle_duplicate_wait_observed={}, handle_dup_reduced={}, handle_dup_reduced_denied={}, handle_replace={}, handle_replace_old_bad={}, handle_replace_signal={}, handle_replace_wait={}, handle_replace_wait_observed={}, object_signal_bad_mask={}, object_signal_wait_async={}, object_signal_self={}, object_signal_port_wait={}, object_signal_key={}, futex_wait_bad_state={}, futex_wait_self_owner={}, futex_wait_timeout={}, futex_get_owner_initial={}, futex_owner_initial={}, futex_get_owner_timeout={}, futex_owner_timeout={}, futex_requeue_same_key={}, futex_requeue_wrong_type={}, futex_requeue_ok={}, futex_get_owner_requeue={}, futex_owner_match_self={}, futex_wake_zero={}, futex_get_owner_wake={}, futex_owner_wake={}, timer_set={}, timer_cancel={}, timer_close={}, timer_close_again={}, close={}, close_again={}, root_vmar_h={}, port_h={}, timer_h={}, vmo_h={}, channel_h0={}, channel_h1={}, eventpair_h0={}, eventpair_h1={})",
+        "kernel: int80 conformance ok (unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, bad_wait={}, port_wait_null_out={}, empty_wait={}, port_queue_null_pkt={}, port_queue_bad_type={}, queue={}, wait={}, timer_create_bad_opts={}, timer_create_bad_clock={}, timer_create_null_out={}, port_wait_wrong_type={}, port_queue_wrong_type={}, timer_set_wrong_type={}, timer_cancel_wrong_type={}, wait_one_unsignaled={}, wait_one_unsignaled_observed={}, wait_async={}, timer_set_immediate={}, wait_signal={}, signal_trigger={}, signal_observed={}, signal_count={}, wait_one_signaled={}, wait_one_signaled_observed={}, wait_one_future_timeout={}, wait_one_future_timeout_observed={}, wait_one_future_ok={}, wait_one_future_ok_observed={}, wait_async_bad_options={}, wait_async_ts={}, wait_signal_ts={}, signal_timestamp={}, signal_timestamp_ok={}, wait_async_boot={}, wait_signal_boot={}, signal_boot_timestamp={}, signal_boot_timestamp_ok={}, edge_wait_async={}, edge_empty_wait={}, edge_signal_wait={}, edge_signal_key={}, reserve_queue_full={}, reserve_wait_async={}, reserve_signal_after_users_ok={}, reserve_signal_type={}, pending_wait_async={}, pending_signal_wait={}, pending_signal_count={}, pending_merge_ok={}, vmo_create_bad_opts={}, vmo_create_null_out={}, vmo_create={}, vmar_map_bad_type={}, vmar_map_bad_opts={}, vmar_map={}, vmar_map_addr={}, vmar_map_write_ok={}, vmar_overlap={}, vmar_protect={}, vmar_reprotect={}, vmar_unmap={}, vmar_remap={}, channel_create_bad_opts={}, channel_create_null_out0={}, channel_create_null_out1={}, channel_create={}, channel_read_empty={}, channel_write={}, channel_wait_readable={}, channel_wait_readable_ok={}, channel_read={}, channel_read_actual_bytes={}, channel_read_actual_handles={}, channel_read_match={}, channel_close_peer={}, channel_write_peer_closed={}, channel_read_peer_closed={}, channel_wait_peer_closed={}, channel_wait_peer_closed_observed={}, eventpair_create_bad_opts={}, eventpair_create_null_out0={}, eventpair_create_null_out1={}, eventpair_create={}, eventpair_signal_bad_mask={}, eventpair_signal_peer={}, eventpair_wait_signal={}, eventpair_wait_signal_observed={}, eventpair_close_peer={}, eventpair_wait_peer_closed={}, eventpair_wait_peer_closed_observed={}, channel_loan_tx_vmo_create={}, channel_loan_tx_map={}, channel_loan_rx_vmo_create={}, channel_loan_rx_map={}, channel_loan_create={}, channel_loan_write={}, channel_loan_read={}, channel_loan_actual_bytes={}, channel_loan_snapshot_ok={}, handle_duplicate={}, handle_duplicate_distinct={}, handle_duplicate_signal={}, handle_duplicate_wait={}, handle_duplicate_wait_observed={}, handle_dup_reduced={}, handle_dup_reduced_denied={}, handle_replace={}, handle_replace_old_bad={}, handle_replace_signal={}, handle_replace_wait={}, handle_replace_wait_observed={}, object_signal_bad_mask={}, object_signal_wait_async={}, object_signal_self={}, object_signal_port_wait={}, object_signal_key={}, futex_wait_bad_state={}, futex_wait_self_owner={}, futex_wait_timeout={}, futex_get_owner_initial={}, futex_owner_initial={}, futex_get_owner_timeout={}, futex_owner_timeout={}, futex_requeue_same_key={}, futex_requeue_wrong_type={}, futex_requeue_ok={}, futex_get_owner_requeue={}, futex_owner_match_self={}, futex_wake_zero={}, futex_get_owner_wake={}, futex_owner_wake={}, thread_create={}, thread_start={}, thread_child_ran={}, thread_futex_wait={}, thread_wake_status={}, thread_resumed={}, timer_set={}, timer_cancel={}, timer_close={}, timer_close_again={}, close={}, close_again={}, root_vmar_h={}, port_h={}, timer_h={}, vmo_h={}, channel_h0={}, channel_h1={}, eventpair_h0={}, eventpair_h1={})",
         slots[SLOT_UNKNOWN] as i64,
         slots[SLOT_CLOSE_INVALID] as i64,
         slots[SLOT_PORT_CREATE_BAD_OPTS] as i64,
@@ -658,6 +665,12 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_FUTEX_WAKE_ZERO] as i64,
         slots[SLOT_FUTEX_GET_OWNER_WAKE] as i64,
         slots[SLOT_FUTEX_OWNER_WAKE] as i64,
+        slots[SLOT_THREAD_CREATE] as i64,
+        slots[SLOT_THREAD_START] as i64,
+        slots[SLOT_THREAD_CHILD_RAN] as i64,
+        slots[SLOT_THREAD_FUTEX_WAIT] as i64,
+        slots[SLOT_THREAD_WAKE_STATUS] as i64,
+        slots[SLOT_THREAD_RESUMED] as i64,
         slots[SLOT_TIMER_SET] as i64,
         slots[SLOT_TIMER_CANCEL] as i64,
         slots[SLOT_TIMER_CLOSE] as i64,
@@ -696,6 +709,7 @@ pub fn prepare() -> u64 {
     slots[SLOT_ROOT_VMAR_H] = crate::object::bootstrap_root_vmar_handle().unwrap_or(0) as u64;
     slots[SLOT_SELF_THREAD_H] = crate::object::bootstrap_self_thread_handle().unwrap_or(0) as u64;
     slots[SLOT_SELF_THREAD_KOID] = crate::object::bootstrap_self_thread_koid().unwrap_or(0);
+    slots[SLOT_SELF_PROCESS_H] = crate::object::bootstrap_self_process_handle().unwrap_or(0) as u64;
 
     entry
 }

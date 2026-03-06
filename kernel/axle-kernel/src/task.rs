@@ -12,7 +12,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use axle_core::handle::Handle;
@@ -31,7 +31,7 @@ use axle_types::rights::{
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
     ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND,
-    ZX_ERR_OUT_OF_RANGE,
+    ZX_ERR_OUT_OF_RANGE, ZX_OK,
 };
 use axle_types::{zx_handle_t, zx_koid_t, zx_rights_t, zx_status_t};
 use bitflags::bitflags;
@@ -127,6 +127,98 @@ pub(crate) struct CurrentThreadInfo {
     koid: zx_koid_t,
 }
 
+/// Kernel-visible description of the bootstrap current process.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CurrentProcessInfo {
+    process_id: ProcessId,
+}
+
+impl CurrentProcessInfo {
+    pub(crate) const fn process_id(self) -> ProcessId {
+        self.process_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct UserContext {
+    trap: crate::arch::int80::TrapFrame,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+impl UserContext {
+    fn capture(
+        trap: &crate::arch::int80::TrapFrame,
+        cpu_frame: *const u64,
+    ) -> Result<Self, zx_status_t> {
+        if cpu_frame.is_null() {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        // SAFETY: `cpu_frame` points to the saved user IRET frame created by the CPU on a
+        // ring3->ring0 transition. The int80 entry path always provides RIP/CS/RFLAGS/RSP/SS.
+        let (rip, cs, rflags, rsp, ss) = unsafe {
+            (
+                *cpu_frame.add(0),
+                *cpu_frame.add(1),
+                *cpu_frame.add(2),
+                *cpu_frame.add(3),
+                *cpu_frame.add(4),
+            )
+        };
+        Ok(Self {
+            trap: *trap,
+            rip,
+            cs,
+            rflags,
+            rsp,
+            ss,
+        })
+    }
+
+    fn restore(
+        self,
+        trap: &mut crate::arch::int80::TrapFrame,
+        cpu_frame: *mut u64,
+    ) -> Result<(), zx_status_t> {
+        if cpu_frame.is_null() {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        *trap = self.trap;
+        // SAFETY: `cpu_frame` points to the mutable IRET frame for the in-flight trap return.
+        unsafe {
+            *cpu_frame.add(0) = self.rip;
+            *cpu_frame.add(1) = self.cs;
+            *cpu_frame.add(2) = self.rflags;
+            *cpu_frame.add(3) = self.rsp;
+            *cpu_frame.add(4) = self.ss;
+        }
+        Ok(())
+    }
+
+    fn with_status(mut self, status: zx_status_t) -> Self {
+        self.trap.set_status(status);
+        self
+    }
+
+    fn new_user_entry(entry: u64, stack: u64, arg0: u64, arg1: u64) -> Self {
+        let selectors = crate::arch::gdt::init();
+        let mut trap = crate::arch::int80::TrapFrame::default();
+        trap.rdi = arg0;
+        trap.rsi = arg1;
+        Self {
+            trap,
+            rip: entry,
+            cs: selectors.user_code.0 as u64,
+            rflags: 0x002,
+            rsp: stack,
+            ss: selectors.user_data.0 as u64,
+        }
+    }
+}
+
 impl CurrentThreadInfo {
     pub(crate) const fn process_id(self) -> ProcessId {
         self.process_id
@@ -173,6 +265,7 @@ impl CreatedVmo {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ThreadState {
+    New,
     Runnable,
     FutexWait { key: FutexKey },
 }
@@ -433,13 +526,15 @@ impl AddressSpace {
 
 #[derive(Debug)]
 struct Process {
+    koid: zx_koid_t,
     address_space_id: AddressSpaceId,
     cspace: CSpace,
 }
 
 impl Process {
-    fn bootstrap(address_space_id: AddressSpaceId) -> Self {
+    fn bootstrap(address_space_id: AddressSpaceId, koid: zx_koid_t) -> Self {
         Self {
+            koid,
             address_space_id,
             cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
         }
@@ -503,6 +598,8 @@ struct Thread {
     process_id: ProcessId,
     koid: zx_koid_t,
     state: ThreadState,
+    queued: bool,
+    context: Option<UserContext>,
 }
 
 /// Internal bootstrap kernel model.
@@ -514,6 +611,7 @@ pub(crate) struct Kernel {
     #[allow(dead_code)]
     frames: FrameTable,
     futexes: crate::futex::FutexTable,
+    run_queue: VecDeque<ThreadId>,
     revocations: RevocationManager,
     next_koid: zx_koid_t,
     next_global_vmo_id: u64,
@@ -521,6 +619,7 @@ pub(crate) struct Kernel {
     next_thread_id: ThreadId,
     next_address_space_id: AddressSpaceId,
     current_thread_id: ThreadId,
+    reschedule_requested: bool,
 }
 
 impl Kernel {
@@ -532,6 +631,7 @@ impl Kernel {
             address_spaces: BTreeMap::new(),
             frames: FrameTable::new(),
             futexes: crate::futex::FutexTable::new(),
+            run_queue: VecDeque::new(),
             revocations: RevocationManager::new(),
             next_koid: 1,
             next_global_vmo_id: 1,
@@ -539,6 +639,7 @@ impl Kernel {
             next_thread_id: 1,
             next_address_space_id: 1,
             current_thread_id: 0,
+            reschedule_requested: false,
         };
         let bootstrap_vmo_ids = [
             kernel.alloc_global_vmo_id(),
@@ -554,9 +655,11 @@ impl Kernel {
             .insert(address_space_id, bootstrap_address_space);
 
         let process_id = kernel.alloc_process_id();
-        kernel
-            .processes
-            .insert(process_id, Process::bootstrap(address_space_id));
+        let process_koid = kernel.alloc_koid();
+        kernel.processes.insert(
+            process_id,
+            Process::bootstrap(address_space_id, process_koid),
+        );
 
         let thread_id = kernel.alloc_thread_id();
         let thread_koid = kernel.alloc_koid();
@@ -566,6 +669,8 @@ impl Kernel {
                 process_id,
                 koid: thread_koid,
                 state: ThreadState::Runnable,
+                queued: false,
+                context: None,
             },
         );
         kernel.current_thread_id = thread_id;
@@ -803,6 +908,13 @@ impl Kernel {
         })
     }
 
+    pub(crate) fn current_process_info(&self) -> Result<CurrentProcessInfo, zx_status_t> {
+        let thread = self.current_thread()?;
+        Ok(CurrentProcessInfo {
+            process_id: thread.process_id,
+        })
+    }
+
     pub(crate) fn create_current_anonymous_vmo(
         &mut self,
         size: u64,
@@ -829,6 +941,49 @@ impl Kernel {
         Ok(self.current_thread()?.koid)
     }
 
+    pub(crate) fn current_process_koid(&self) -> Result<zx_koid_t, zx_status_t> {
+        Ok(self.current_process()?.koid)
+    }
+
+    pub(crate) fn capture_current_user_context(
+        &mut self,
+        trap: &crate::arch::int80::TrapFrame,
+        cpu_frame: *const u64,
+    ) -> Result<(), zx_status_t> {
+        let context = UserContext::capture(trap, cpu_frame)?;
+        let thread = self
+            .threads
+            .get_mut(&self.current_thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        thread.context = Some(context);
+        Ok(())
+    }
+
+    pub(crate) fn finish_syscall(
+        &mut self,
+        trap: &mut crate::arch::int80::TrapFrame,
+        cpu_frame: *mut u64,
+    ) -> Result<(), zx_status_t> {
+        match self.current_thread()?.state {
+            ThreadState::Runnable => {
+                self.capture_current_user_context(trap, cpu_frame.cast_const())?;
+                if self.reschedule_requested {
+                    self.reschedule_requested = false;
+                    if let Some(next_thread_id) = self.pop_runnable_thread() {
+                        self.enqueue_runnable_thread(self.current_thread_id)?;
+                        self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
+                    }
+                }
+                Ok(())
+            }
+            ThreadState::New => Err(ZX_ERR_BAD_STATE),
+            ThreadState::FutexWait { .. } => {
+                let next_thread_id = self.pop_runnable_thread().ok_or(ZX_ERR_BAD_STATE)?;
+                self.switch_to_thread(next_thread_id, trap, cpu_frame)
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn enqueue_current_futex_wait(
         &mut self,
@@ -843,6 +998,10 @@ impl Kernel {
         thread.state = ThreadState::FutexWait { key };
         self.futexes.enqueue_waiter(key, thread_id, owner_koid);
         Ok(())
+    }
+
+    pub(crate) fn can_block_current_thread(&self) -> bool {
+        !self.run_queue.is_empty()
     }
 
     #[allow(dead_code)]
@@ -868,8 +1027,7 @@ impl Kernel {
             .futexes
             .wake(key, wake_count, new_owner_koid, single_owner);
         for thread_id in result.woken {
-            let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-            thread.state = ThreadState::Runnable;
+            self.make_thread_runnable(thread_id, ZX_OK)?;
         }
         Ok(result.remaining)
     }
@@ -887,8 +1045,7 @@ impl Kernel {
             self.futexes
                 .requeue(source, target, wake_count, requeue_count, target_owner_koid);
         for thread_id in &result.woken {
-            let thread = self.threads.get_mut(thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-            thread.state = ThreadState::Runnable;
+            self.make_thread_runnable(*thread_id, ZX_OK)?;
         }
         for thread in self.threads.values_mut() {
             if matches!(thread.state, ThreadState::FutexWait { key } if key == source) {
@@ -906,6 +1063,51 @@ impl Kernel {
     #[allow(dead_code)]
     pub(crate) fn thread_is_waiting_on_futex(&self, thread_id: ThreadId, key: FutexKey) -> bool {
         self.futexes.is_waiter(key, thread_id)
+    }
+
+    pub(crate) fn create_thread(
+        &mut self,
+        process_id: ProcessId,
+    ) -> Result<(ThreadId, zx_koid_t), zx_status_t> {
+        if !self.processes.contains_key(&process_id) {
+            return Err(ZX_ERR_BAD_HANDLE);
+        }
+        let thread_id = self.alloc_thread_id();
+        let koid = self.alloc_koid();
+        self.threads.insert(
+            thread_id,
+            Thread {
+                process_id,
+                koid,
+                state: ThreadState::New,
+                queued: false,
+                context: None,
+            },
+        );
+        Ok((thread_id, koid))
+    }
+
+    pub(crate) fn start_thread(
+        &mut self,
+        thread_id: ThreadId,
+        entry: u64,
+        stack: u64,
+        arg0: u64,
+        arg1: u64,
+    ) -> Result<(), zx_status_t> {
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        if !matches!(thread.state, ThreadState::New) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.context = Some(UserContext::new_user_entry(entry, stack, arg0, arg1));
+        thread.state = ThreadState::Runnable;
+        let queued = thread.queued;
+        let thread_id_copy = thread_id;
+        let _ = thread;
+        if !queued {
+            self.enqueue_runnable_thread(thread_id_copy)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1099,6 +1301,68 @@ impl Kernel {
     fn current_process_mut(&mut self) -> Result<&mut Process, zx_status_t> {
         let process_id = self.current_thread()?.process_id;
         self.processes.get_mut(&process_id).ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    fn enqueue_runnable_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        if thread_id == self.current_thread_id {
+            return Ok(());
+        }
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if thread.queued || !matches!(thread.state, ThreadState::Runnable) {
+            return Ok(());
+        }
+        thread.queued = true;
+        self.run_queue.push_back(thread_id);
+        Ok(())
+    }
+
+    fn pop_runnable_thread(&mut self) -> Option<ThreadId> {
+        while let Some(thread_id) = self.run_queue.pop_front() {
+            let Some(thread) = self.threads.get_mut(&thread_id) else {
+                continue;
+            };
+            thread.queued = false;
+            if matches!(thread.state, ThreadState::Runnable) {
+                return Some(thread_id);
+            }
+        }
+        None
+    }
+
+    fn switch_to_thread(
+        &mut self,
+        thread_id: ThreadId,
+        trap: &mut crate::arch::int80::TrapFrame,
+        cpu_frame: *mut u64,
+    ) -> Result<(), zx_status_t> {
+        let context = self
+            .threads
+            .get(&thread_id)
+            .and_then(|thread| thread.context)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        context.restore(trap, cpu_frame)?;
+        self.current_thread_id = thread_id;
+        Ok(())
+    }
+
+    fn make_thread_runnable(
+        &mut self,
+        thread_id: ThreadId,
+        status: zx_status_t,
+    ) -> Result<(), zx_status_t> {
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let Some(context) = thread.context else {
+            return Err(ZX_ERR_BAD_STATE);
+        };
+        thread.context = Some(context.with_status(status));
+        thread.state = ThreadState::Runnable;
+        let was_current = thread_id == self.current_thread_id;
+        let _ = thread;
+        if !was_current {
+            self.enqueue_runnable_thread(thread_id)?;
+            self.reschedule_requested = true;
+        }
+        Ok(())
     }
 
     fn install_mapping_pages(

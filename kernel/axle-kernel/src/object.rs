@@ -37,6 +37,8 @@ const DEFAULT_OBJECT_GENERATION: u32 = 0;
 /// Kernel object kinds needed in current phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
+    /// Process object.
+    Process,
     /// Channel endpoint object.
     Channel,
     /// EventPair endpoint object.
@@ -155,8 +157,15 @@ struct ThreadObject {
     koid: zx_koid_t,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ProcessObject {
+    process_id: u64,
+    koid: zx_koid_t,
+}
+
 #[derive(Debug)]
 enum KernelObject {
+    Process(ProcessObject),
     Channel(ChannelEndpoint),
     EventPair(EventPairEndpoint),
     Port(Port),
@@ -192,6 +201,7 @@ struct KernelState {
     objects: BTreeMap<u64, KernelObject>,
     next_object_id: u64,
     timers: TimerService,
+    bootstrap_self_process_handle: zx_handle_t,
     bootstrap_root_vmar_handle: zx_handle_t,
     bootstrap_self_thread_handle: zx_handle_t,
 }
@@ -203,9 +213,30 @@ impl KernelState {
             objects: BTreeMap::new(),
             next_object_id: 1,
             timers: TimerService::new(),
+            bootstrap_self_process_handle: 0,
             bootstrap_root_vmar_handle: 0,
             bootstrap_self_thread_handle: 0,
         };
+
+        let process = state
+            .kernel
+            .current_process_info()
+            .expect("bootstrap current process must exist");
+        let process_koid = state
+            .kernel
+            .current_process_koid()
+            .expect("bootstrap current process koid must exist");
+        let object_id = state.alloc_object_id();
+        state.objects.insert(
+            object_id,
+            KernelObject::Process(ProcessObject {
+                process_id: process.process_id(),
+                koid: process_koid,
+            }),
+        );
+        state.bootstrap_self_process_handle = state
+            .alloc_handle_for_object(object_id, process_default_rights())
+            .expect("bootstrap self process handle allocation must succeed");
 
         let root = state
             .kernel
@@ -310,6 +341,13 @@ pub fn bootstrap_root_vmar_handle() -> Option<zx_handle_t> {
     Some(state.bootstrap_root_vmar_handle)
 }
 
+/// Return the bootstrap current-process handle seeded into the current process.
+pub fn bootstrap_self_process_handle() -> Option<zx_handle_t> {
+    let mut guard = STATE.lock();
+    let state = guard.as_mut()?;
+    Some(state.bootstrap_self_process_handle)
+}
+
 /// Return the bootstrap current-thread handle seeded into the current process.
 pub fn bootstrap_self_thread_handle() -> Option<zx_handle_t> {
     let mut guard = STATE.lock();
@@ -322,6 +360,20 @@ pub fn bootstrap_self_thread_koid() -> Option<zx_koid_t> {
     let mut guard = STATE.lock();
     let state = guard.as_mut()?;
     state.kernel.current_thread_koid().ok()
+}
+
+pub(crate) fn capture_current_user_context(
+    trap: &crate::arch::int80::TrapFrame,
+    cpu_frame: *const u64,
+) -> Result<(), zx_status_t> {
+    with_state_mut(|state| state.kernel.capture_current_user_context(trap, cpu_frame))
+}
+
+pub(crate) fn finish_syscall(
+    trap: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+) -> Result<(), zx_status_t> {
+    with_state_mut(|state| state.kernel.finish_syscall(trap, cpu_frame))
 }
 
 #[allow(dead_code)]
@@ -447,6 +499,82 @@ pub(crate) fn try_loan_current_user_pages(
     len: usize,
 ) -> Result<Option<crate::task::LoanedUserPages>, zx_status_t> {
     with_state_mut(|state| state.kernel.try_loan_current_user_pages(ptr, len))
+}
+
+/// Create a new thread object in the target process and return a handle.
+pub fn create_thread(
+    process_handle: zx_handle_t,
+    options: u32,
+) -> Result<zx_handle_t, zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved =
+            state.lookup_handle(process_handle, crate::task::HandleRights::MANAGE_THREAD)?;
+        let process = match state.objects.get(&resolved.object_id()) {
+            Some(KernelObject::Process(process)) => *process,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+
+        let (thread_id, koid) = state.kernel.create_thread(process.process_id)?;
+        let object_id = state.alloc_object_id();
+        state.objects.insert(
+            object_id,
+            KernelObject::Thread(ThreadObject {
+                process_id: process.process_id,
+                thread_id,
+                koid,
+            }),
+        );
+        match state.alloc_handle_for_object(object_id, thread_default_rights()) {
+            Ok(handle) => Ok(handle),
+            Err(err) => {
+                let _ = state.objects.remove(&object_id);
+                Err(err)
+            }
+        }
+    })
+}
+
+/// Start a previously created thread at one user entry point.
+pub fn start_thread(
+    thread_handle: zx_handle_t,
+    entry: zx_vaddr_t,
+    stack: zx_vaddr_t,
+    arg0: u64,
+    arg1: u64,
+) -> Result<(), zx_status_t> {
+    if entry == 0 || stack == 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved =
+            state.lookup_handle(thread_handle, crate::task::HandleRights::MANAGE_THREAD)?;
+        let thread = match state.objects.get(&resolved.object_id()) {
+            Some(KernelObject::Thread(thread)) => *thread,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+
+        if thread.process_id != state.kernel.current_process_info()?.process_id() {
+            return Err(ZX_ERR_ACCESS_DENIED);
+        }
+        if !state.validate_current_user_ptr(entry, 1) {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let stack_probe = stack.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
+        if !state.validate_current_user_ptr(stack_probe, 8) {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        state
+            .kernel
+            .start_thread(thread.thread_id, entry, stack, arg0, arg1)
+    })
 }
 
 /// Create an EventPair endpoint pair and return both handles.
@@ -1020,13 +1148,28 @@ pub fn futex_wait(
     }
     let key = resolve_current_futex_key(value_ptr)?;
 
-    with_state_mut(|state| {
+    let blocked_on_scheduler = with_state_mut(|state| {
         let owner_koid = validate_futex_wait_owner(state, key, new_futex_owner)?;
-        state.kernel.enqueue_current_futex_wait(key, owner_koid)
+        if deadline == i64::MAX && state.kernel.can_block_current_thread() {
+            state.kernel.enqueue_current_futex_wait(key, owner_koid)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     })?;
 
+    if blocked_on_scheduler {
+        return Ok(());
+    }
+
+    let mut registered = false;
     loop {
         let still_waiting = with_state_mut(|state| {
+            if !registered {
+                let owner_koid = validate_futex_wait_owner(state, key, new_futex_owner)?;
+                state.kernel.enqueue_current_futex_wait(key, owner_koid)?;
+                registered = true;
+            }
             let current = state.kernel.current_thread_info()?;
             Ok(state
                 .kernel
@@ -1120,7 +1263,8 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
         let object_id = resolved.object_id();
         let timer_id = match state.objects.get(&object_id) {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
-            Some(KernelObject::Channel(_))
+            Some(KernelObject::Process(_))
+            | Some(KernelObject::Channel(_))
             | Some(KernelObject::EventPair(_))
             | Some(KernelObject::Port(_))
             | Some(KernelObject::Thread(_))
@@ -1156,7 +1300,8 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
         let object_id = resolved.object_id();
         let timer_id = match state.objects.get(&object_id) {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
-            Some(KernelObject::Channel(_))
+            Some(KernelObject::Process(_))
+            | Some(KernelObject::Channel(_))
             | Some(KernelObject::EventPair(_))
             | Some(KernelObject::Port(_))
             | Some(KernelObject::Thread(_))
@@ -1190,7 +1335,8 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
             let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
             let port = match obj {
                 KernelObject::Port(port) => port,
-                KernelObject::Channel(_)
+                KernelObject::Process(_)
+                | KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
                 | KernelObject::Thread(_)
@@ -1220,7 +1366,8 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
             let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
             let port = match obj {
                 KernelObject::Port(port) => port,
-                KernelObject::Channel(_)
+                KernelObject::Process(_)
+                | KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
                 | KernelObject::Thread(_)
@@ -1379,7 +1526,8 @@ pub fn object_wait_async(
             let obj = state.objects.get_mut(&port_id).ok_or(ZX_ERR_BAD_HANDLE)?;
             let port = match obj {
                 KernelObject::Port(port) => port,
-                KernelObject::Channel(_)
+                KernelObject::Process(_)
+                | KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
                 | KernelObject::Thread(_)
@@ -1465,6 +1613,10 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
         let obj = state.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
 
         let kind = match obj {
+            KernelObject::Process(process) => {
+                let _ = (process.process_id, process.koid);
+                ObjectKind::Process
+            }
             KernelObject::Channel(endpoint) => {
                 let _ = (
                     endpoint.peer_object_id,
@@ -1560,6 +1712,15 @@ fn channel_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::WRITE
 }
 
+fn process_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::WAIT
+        | crate::task::HandleRights::INSPECT
+        | crate::task::HandleRights::MANAGE_PROCESS
+        | crate::task::HandleRights::MANAGE_THREAD
+}
+
 fn eventpair_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER
@@ -1652,6 +1813,7 @@ fn mapping_perms_from_options(
 fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals, zx_status_t> {
     let obj = state.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
     match obj {
+        KernelObject::Process(_) => Ok(Signals::NONE),
         KernelObject::Channel(endpoint) => {
             let mut signals = Signals::NONE;
             if endpoint.is_readable() {

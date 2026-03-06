@@ -109,3 +109,8 @@ description = "Bootstrap futex wait should report BAD_STATE on mismatched values
 id = "should.futex.requeue_owner_bootstrap"
 level = "should"
 description = "Bootstrap futex requeue/get_owner/wake should preserve owner metadata with stable error codes for same-key and wrong-type cases"
+
+[[contracts]]
+id = "should.thread.create_start_futex_wake_bootstrap"
+level = "should"
+description = "Bootstrap thread_create/thread_start should allow a second userspace thread to wake a futex wait through scheduler-backed handoff"

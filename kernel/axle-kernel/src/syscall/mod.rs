@@ -24,9 +24,9 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
     AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER,
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
-    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE,
-    AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
-    AXLE_SYS_VMO_CREATE, SyscallNumber,
+    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START,
+    AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_MAP,
+    AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE, SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -39,7 +39,7 @@ use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 25] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 27] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -65,6 +65,8 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 25] = [
     AXLE_SYS_FUTEX_WAKE,
     AXLE_SYS_FUTEX_REQUEUE,
     AXLE_SYS_FUTEX_GET_OWNER,
+    AXLE_SYS_THREAD_CREATE,
+    AXLE_SYS_THREAD_START,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -122,12 +124,15 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_FUTEX_WAKE => sys_futex_wake(args),
         AXLE_SYS_FUTEX_REQUEUE => sys_futex_requeue(args),
         AXLE_SYS_FUTEX_GET_OWNER => sys_futex_get_owner(args),
+        AXLE_SYS_THREAD_CREATE => sys_thread_create(args),
+        AXLE_SYS_THREAD_START => sys_thread_start(args),
         _ => ZX_ERR_BAD_SYSCALL,
     }
 }
 
 /// Dispatch a syscall from the architecture trap frame and write status back.
 pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame, cpu_frame: *const u64) {
+    let _ = crate::object::capture_current_user_context(frame, cpu_frame);
     let status = match u32::try_from(frame.syscall_nr()) {
         Ok(AXLE_SYS_VMAR_MAP) => sys_vmar_map(frame.args(), cpu_frame),
         Ok(AXLE_SYS_CHANNEL_READ) => sys_channel_read(frame.args(), cpu_frame),
@@ -135,6 +140,7 @@ pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame, cpu_fram
         Err(_) => ZX_ERR_BAD_SYSCALL,
     };
     frame.set_status(status);
+    let _ = crate::object::finish_syscall(frame, cpu_frame.cast_mut());
 }
 
 fn copyin<T: Copy>(ptr: *const T) -> Result<T, zx_status_t> {
@@ -870,6 +876,56 @@ fn sys_futex_get_owner(args: [u64; 6]) -> zx_status_t {
         Err(e) => return e,
     };
     match copyout(koid_ptr, koid) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_thread_create(args: [u64; 6]) -> zx_status_t {
+    let process = match u32::try_from(args[0]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let name_ptr = args[1] as *const u8;
+    let name_size = match usize::try_from(args[2]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let options = match u32::try_from(args[3]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let out_ptr = args[4] as *mut zx_handle_t;
+    if out_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if name_size != 0
+        && (name_ptr.is_null() || !crate::userspace::validate_user_ptr(name_ptr as u64, name_size))
+    {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let handle = match crate::object::create_thread(process, options) {
+        Ok(handle) => handle,
+        Err(e) => return e,
+    };
+    match copyout(out_ptr, handle) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_thread_start(args: [u64; 6]) -> zx_status_t {
+    let thread = match u32::try_from(args[0]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let entry = args[1];
+    let stack = args[2];
+    let arg1 = args[3];
+    let arg2 = args[4];
+
+    match crate::object::start_thread(thread, entry, stack, arg1, arg2) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }

@@ -292,3 +292,29 @@ args = [
   { name = "value_ptr", ty = "*const zx_futex_t" },
   { name = "koid", ty = "*mut zx_koid_t" },
 ]
+
+[[syscall]]
+name = "thread_create"
+nr = 25
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "process", ty = "zx_handle_t" },
+  { name = "name", ty = "*const u8" },
+  { name = "name_size", ty = "usize" },
+  { name = "options", ty = "u32" },
+  { name = "out", ty = "*mut zx_handle_t" },
+]
+
+[[syscall]]
+name = "thread_start"
+nr = 26
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "thread", ty = "zx_handle_t" },
+  { name = "entry", ty = "zx_vaddr_t" },
+  { name = "stack", ty = "zx_vaddr_t" },
+  { name = "arg1", ty = "u64" },
+  { name = "arg2", ty = "u64" },
+]
