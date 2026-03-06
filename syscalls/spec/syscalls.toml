@@ -102,4 +102,53 @@ args = [
   { name = "handle", ty = "zx_handle_t" },
 ]
 
+[[syscall]]
+name = "vmo_create"
+nr = 9
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "size", ty = "u64" },
+  { name = "options", ty = "zx_vm_option_t" },
+  { name = "out", ty = "*mut zx_handle_t" },
+]
+
+[[syscall]]
+name = "vmar_map"
+nr = 10
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "vmar", ty = "zx_handle_t" },
+  { name = "options", ty = "zx_vm_option_t" },
+  { name = "vmar_offset", ty = "u64" },
+  { name = "vmo", ty = "zx_handle_t" },
+  { name = "vmo_offset", ty = "u64" },
+  { name = "len", ty = "u64" },
+  { name = "mapped_addr", ty = "*mut zx_vaddr_t" },
+]
+
+[[syscall]]
+name = "vmar_unmap"
+nr = 11
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "vmar", ty = "zx_handle_t" },
+  { name = "addr", ty = "zx_vaddr_t" },
+  { name = "len", ty = "u64" },
+]
+
+[[syscall]]
+name = "vmar_protect"
+nr = 12
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "vmar", ty = "zx_handle_t" },
+  { name = "options", ty = "zx_vm_option_t" },
+  { name = "addr", ty = "zx_vaddr_t" },
+  { name = "len", ty = "u64" },
+]
+
 # Channel will be added once the "page-borrow + COW" design is ready to implement.

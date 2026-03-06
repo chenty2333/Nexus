@@ -20,3 +20,11 @@ pub const AXLE_SYS_TIMER_CREATE: SyscallNumber = 6;
 pub const AXLE_SYS_TIMER_SET: SyscallNumber = 7;
 /// Contract: MUST
 pub const AXLE_SYS_TIMER_CANCEL: SyscallNumber = 8;
+/// Contract: SHOULD
+pub const AXLE_SYS_VMO_CREATE: SyscallNumber = 9;
+/// Contract: SHOULD
+pub const AXLE_SYS_VMAR_MAP: SyscallNumber = 10;
+/// Contract: SHOULD
+pub const AXLE_SYS_VMAR_UNMAP: SyscallNumber = 11;
+/// Contract: SHOULD
+pub const AXLE_SYS_VMAR_PROTECT: SyscallNumber = 12;

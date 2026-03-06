@@ -3,6 +3,7 @@
 //! ABI contract locked in this phase:
 //! - `rax` = syscall number
 //! - `rdi/rsi/rdx/r10/r8/r9` = args 0..5
+//! - args 6+ (when needed) are read from the userspace stack by the trap handler
 //! - return `zx_status_t` in `rax`
 
 use axle_types::zx_status_t;
@@ -30,6 +31,7 @@ axle_int80_entry:
     push rax
 
     mov rdi, rsp
+    lea rsi, [rsp + 15*8]
     call {rust_handler}
 
     // Load syscall return status from frame->rax.
@@ -119,6 +121,6 @@ pub fn entry_addr() -> usize {
     axle_int80_entry as *const () as usize
 }
 
-extern "C" fn axle_int80_rust(frame: &mut TrapFrame) {
-    crate::syscall::invoke_from_trapframe(frame);
+extern "C" fn axle_int80_rust(frame: &mut TrapFrame, cpu_frame: *const u64) {
+    crate::syscall::invoke_from_trapframe(frame, cpu_frame);
 }

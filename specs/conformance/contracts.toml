@@ -54,3 +54,13 @@ description = "A user-filled port must still admit kernel-generated signal packe
 id = "should.port.pending_merge_flushes_signal"
 level = "should"
 description = "Kernel-generated signal packets must merge while pending on a full port and flush once space is available"
+
+[[contracts]]
+id = "should.vmo.create_bootstrap_anonymous"
+level = "should"
+description = "zx_vmo_create must reject bad bootstrap arguments and return a non-zero anonymous VMO handle on success"
+
+[[contracts]]
+id = "should.vmar.map_protect_unmap_bootstrap"
+level = "should"
+description = "Root-VMAR bootstrap map/protect/unmap should support an explicit anonymous mapping lifecycle with stable error codes"

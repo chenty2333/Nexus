@@ -26,6 +26,10 @@ pub type zx_duration_t = i64;
 pub type zx_clock_t = u32;
 /// Zircon packet type id.
 pub type zx_packet_type_t = u32;
+/// Zircon VM option bitmask type.
+pub type zx_vm_option_t = u32;
+/// Zircon virtual address type.
+pub type zx_vaddr_t = u64;
 
 /// Zircon user packet payload (32 bytes).
 ///
@@ -143,6 +147,22 @@ pub mod wait_async {
     /// for both monotonic and boot timestamps because suspend/resume time
     /// accounting has not been introduced yet.
     pub const ZX_WAIT_ASYNC_BOOT_TIMESTAMP: u32 = 4;
+}
+
+/// VM mapping and protection options.
+///
+/// Values follow Zircon's public VM option bits.
+pub mod vm {
+    use super::zx_vm_option_t;
+
+    /// Mapping/protection grants read access.
+    pub const ZX_VM_PERM_READ: zx_vm_option_t = 1 << 0;
+    /// Mapping/protection grants write access.
+    pub const ZX_VM_PERM_WRITE: zx_vm_option_t = 1 << 1;
+    /// Mapping/protection grants execute access.
+    pub const ZX_VM_PERM_EXECUTE: zx_vm_option_t = 1 << 2;
+    /// Map at an exact address (`vmar_offset` must be honored exactly).
+    pub const ZX_VM_SPECIFIC: zx_vm_option_t = 1 << 10;
 }
 
 /// Generated syscall numbers (ABI).

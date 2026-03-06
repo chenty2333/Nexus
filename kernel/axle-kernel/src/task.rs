@@ -18,10 +18,12 @@ use axle_core::handle::Handle;
 use axle_core::{CSpace, CSpaceError, Capability, RevocationManager};
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameTable,
-    MappingPerms, VmaLookup, VmoKind,
+    MappingPerms, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
 };
 use axle_types::status::{
-    ZX_ERR_ACCESS_DENIED, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NO_RESOURCES,
+    ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
+    ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND,
+    ZX_ERR_OUT_OF_RANGE,
 };
 use axle_types::{zx_handle_t, zx_status_t};
 use bitflags::bitflags;
@@ -55,6 +57,62 @@ pub(crate) struct ResolvedHandle {
     object_id: u64,
     rights: HandleRights,
     object_generation: u32,
+}
+
+/// Kernel-visible description of the bootstrap root VMAR handle target.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RootVmarInfo {
+    process_id: ProcessId,
+    address_space_id: AddressSpaceId,
+    vmar: Vmar,
+}
+
+impl RootVmarInfo {
+    pub(crate) const fn process_id(self) -> ProcessId {
+        self.process_id
+    }
+
+    pub(crate) const fn address_space_id(self) -> AddressSpaceId {
+        self.address_space_id
+    }
+
+    pub(crate) const fn vmar_id(self) -> VmarId {
+        self.vmar.id()
+    }
+
+    pub(crate) const fn base(self) -> u64 {
+        self.vmar.base()
+    }
+
+    pub(crate) const fn len(self) -> u64 {
+        self.vmar.len()
+    }
+}
+
+/// Kernel-visible description of one current-process VMO.
+#[derive(Clone, Debug)]
+pub(crate) struct CreatedVmo {
+    process_id: ProcessId,
+    address_space_id: AddressSpaceId,
+    vmo: Vmo,
+}
+
+impl CreatedVmo {
+    pub(crate) fn process_id(&self) -> ProcessId {
+        self.process_id
+    }
+
+    pub(crate) fn address_space_id(&self) -> AddressSpaceId {
+        self.address_space_id
+    }
+
+    pub(crate) fn vmo_id(&self) -> VmoId {
+        self.vmo.id()
+    }
+
+    pub(crate) fn size_bytes(&self) -> u64 {
+        self.vmo.size_bytes()
+    }
 }
 
 impl ResolvedHandle {
@@ -185,6 +243,68 @@ impl AddressSpace {
 
     fn lookup_user_mapping(&self, ptr: u64, len: usize) -> Option<VmaLookup> {
         self.vm.lookup_range(ptr, len as u64)
+    }
+
+    fn root_vmar(&self) -> Vmar {
+        self.vm.root_vmar()
+    }
+
+    fn create_anonymous_vmo(
+        &mut self,
+        frames: &mut FrameTable,
+        size: u64,
+    ) -> Result<Vmo, AddressSpaceError> {
+        let vmo_id = self.vm.create_vmo(VmoKind::Anonymous, size)?;
+        let page_count = usize::try_from(size / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| AddressSpaceError::InvalidArgs)?;
+        for page_index in 0..page_count {
+            let paddr = crate::userspace::alloc_bootstrap_zeroed_page().ok_or(
+                AddressSpaceError::FrameTable(axle_mm::FrameTableError::CountOverflow),
+            )?;
+            let frame_id = frames
+                .register_existing(paddr)
+                .map_err(AddressSpaceError::FrameTable)?;
+            self.vm.bind_vmo_frame(
+                vmo_id,
+                (page_index as u64) * crate::userspace::USER_PAGE_BYTES,
+                frame_id,
+            )?;
+        }
+        self.vm
+            .vmo(vmo_id)
+            .cloned()
+            .ok_or(AddressSpaceError::InvalidVmo)
+    }
+
+    fn map_vmo_fixed(
+        &mut self,
+        frames: &mut FrameTable,
+        base: u64,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+    ) -> Result<(), AddressSpaceError> {
+        self.vm
+            .map_fixed(frames, base, len, vmo_id, vmo_offset, perms, perms)
+    }
+
+    fn unmap(
+        &mut self,
+        frames: &mut FrameTable,
+        base: u64,
+        len: u64,
+    ) -> Result<(), AddressSpaceError> {
+        self.vm.unmap(frames, base, len)
+    }
+
+    fn protect(
+        &mut self,
+        base: u64,
+        len: u64,
+        new_perms: MappingPerms,
+    ) -> Result<(), AddressSpaceError> {
+        self.vm.protect(base, len, new_perms)
     }
 
     fn resolve_cow_fault(
@@ -336,6 +456,123 @@ impl Kernel {
         address_space.lookup_user_mapping(ptr, len)
     }
 
+    pub(crate) fn current_root_vmar(&self) -> Result<RootVmarInfo, zx_status_t> {
+        let thread = self.current_thread()?;
+        let process = self.current_process()?;
+        let address_space = self
+            .address_spaces
+            .get(&process.address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(RootVmarInfo {
+            process_id: thread.process_id,
+            address_space_id: process.address_space_id,
+            vmar: address_space.root_vmar(),
+        })
+    }
+
+    pub(crate) fn create_current_anonymous_vmo(
+        &mut self,
+        size: u64,
+    ) -> Result<CreatedVmo, zx_status_t> {
+        let process_id = self.current_thread()?.process_id;
+        let address_space_id = self.current_process()?.address_space_id;
+        let address_space = self
+            .address_spaces
+            .get_mut(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let vmo = address_space
+            .create_anonymous_vmo(&mut self.frames, size)
+            .map_err(map_address_space_error)?;
+        Ok(CreatedVmo {
+            process_id,
+            address_space_id,
+            vmo,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_current_vmo_into_vmar(
+        &mut self,
+        vmar_address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        vmo_address_space_id: AddressSpaceId,
+        vmo_id: VmoId,
+        vmar_offset: u64,
+        vmo_offset: u64,
+        len: u64,
+        perms: MappingPerms,
+    ) -> Result<u64, zx_status_t> {
+        if vmar_address_space_id != vmo_address_space_id {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+
+        let address_space = self
+            .address_spaces
+            .get_mut(&vmar_address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let root = address_space.root_vmar();
+        if root.id() != vmar_id {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        let mapped_addr = root
+            .base()
+            .checked_add(vmar_offset)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        address_space
+            .map_vmo_fixed(
+                &mut self.frames,
+                mapped_addr,
+                len,
+                vmo_id,
+                vmo_offset,
+                perms,
+            )
+            .map_err(map_address_space_error)?;
+        self.install_mapping_pages(vmar_address_space_id, mapped_addr, len)?;
+        Ok(mapped_addr)
+    }
+
+    pub(crate) fn unmap_current_vmar(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        addr: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get_mut(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if address_space.root_vmar().id() != vmar_id {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        address_space
+            .unmap(&mut self.frames, addr, len)
+            .map_err(map_address_space_error)?;
+        self.clear_mapping_pages(addr, len)
+    }
+
+    pub(crate) fn protect_current_vmar(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        addr: u64,
+        len: u64,
+        perms: MappingPerms,
+    ) -> Result<(), zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get_mut(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if address_space.root_vmar().id() != vmar_id {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        address_space
+            .protect(addr, len, perms)
+            .map_err(map_address_space_error)?;
+        self.update_mapping_pages(address_space_id, addr, len)
+    }
+
     pub(crate) fn handle_current_page_fault(&mut self, fault_va: u64, error: u64) -> bool {
         const PF_PRESENT: u64 = 1 << 0;
         const PF_WRITE: u64 = 1 << 1;
@@ -433,6 +670,73 @@ impl Kernel {
         let process_id = self.current_thread()?.process_id;
         self.processes.get_mut(&process_id).ok_or(ZX_ERR_BAD_STATE)
     }
+
+    fn install_mapping_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        for page_index in 0..page_count {
+            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            let lookup = address_space
+                .lookup_user_mapping(va, 1)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            let frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
+            crate::userspace::install_user_page_frame(
+                va,
+                frame_id.raw(),
+                lookup.perms().contains(MappingPerms::WRITE),
+            )
+            .map_err(|_| ZX_ERR_BAD_STATE)?;
+            crate::arch::tlb::flush_page_global(va);
+        }
+        Ok(())
+    }
+
+    fn clear_mapping_pages(&self, base: u64, len: u64) -> Result<(), zx_status_t> {
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        for page_index in 0..page_count {
+            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            crate::userspace::clear_user_page_frame(va).map_err(|_| ZX_ERR_BAD_STATE)?;
+            crate::arch::tlb::flush_page_global(va);
+        }
+        Ok(())
+    }
+
+    fn update_mapping_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        for page_index in 0..page_count {
+            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            let lookup = address_space
+                .lookup_user_mapping(va, 1)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            crate::userspace::set_user_page_writable(
+                va,
+                lookup.perms().contains(MappingPerms::WRITE),
+            )
+            .map_err(|_| ZX_ERR_BAD_STATE)?;
+            crate::arch::tlb::flush_page_global(va);
+        }
+        Ok(())
+    }
 }
 
 fn map_alloc_error(err: CSpaceError) -> zx_status_t {
@@ -445,4 +749,18 @@ fn map_alloc_error(err: CSpaceError) -> zx_status_t {
 
 fn map_lookup_error(_err: CSpaceError) -> zx_status_t {
     ZX_ERR_BAD_HANDLE
+}
+
+fn map_address_space_error(err: AddressSpaceError) -> zx_status_t {
+    match err {
+        AddressSpaceError::InvalidArgs => ZX_ERR_INVALID_ARGS,
+        AddressSpaceError::OutOfRange => ZX_ERR_OUT_OF_RANGE,
+        AddressSpaceError::InvalidVmo => ZX_ERR_NOT_FOUND,
+        AddressSpaceError::InvalidFrame => ZX_ERR_BAD_STATE,
+        AddressSpaceError::AlreadyBound | AddressSpaceError::Overlap => ZX_ERR_ALREADY_EXISTS,
+        AddressSpaceError::NotFound => ZX_ERR_NOT_FOUND,
+        AddressSpaceError::PermissionIncrease => ZX_ERR_ACCESS_DENIED,
+        AddressSpaceError::FrameTable(_) => ZX_ERR_NO_MEMORY,
+        AddressSpaceError::NotCopyOnWrite => ZX_ERR_BAD_STATE,
+    }
 }

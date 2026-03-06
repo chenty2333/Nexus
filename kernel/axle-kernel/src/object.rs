@@ -8,12 +8,15 @@ use axle_core::{
     Capability, Packet, PacketKind, Port, PortError, Signals, TimerError, TimerId, TimerService,
     WaitAsyncOptions,
 };
+use axle_mm::{MappingPerms, VmarId, VmoId};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
 use axle_types::status::{
     ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INVALID_ARGS,
-    ZX_ERR_NOT_FOUND, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE, ZX_OK,
+    ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT,
+    ZX_ERR_WRONG_TYPE, ZX_OK,
 };
+use axle_types::vm::{ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC};
 use axle_types::{zx_clock_t, zx_handle_t, zx_packet_user_t, zx_port_packet_t, zx_status_t};
 use axle_types::{zx_packet_signal_t, zx_signals_t};
 use spin::Mutex;
@@ -29,6 +32,10 @@ pub enum ObjectKind {
     Port,
     /// Timer object.
     Timer,
+    /// VMO object.
+    Vmo,
+    /// VMAR object.
+    Vmar,
 }
 
 #[derive(Debug)]
@@ -37,10 +44,29 @@ struct TimerObject {
     clock_id: zx_clock_t,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct VmoObject {
+    process_id: u64,
+    address_space_id: u64,
+    vmo_id: VmoId,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VmarObject {
+    process_id: u64,
+    address_space_id: u64,
+    vmar_id: VmarId,
+    base: u64,
+    len: u64,
+}
+
 #[derive(Debug)]
 enum KernelObject {
     Port(Port),
     Timer(TimerObject),
+    Vmo(VmoObject),
+    Vmar(VmarObject),
 }
 
 #[derive(Debug)]
@@ -49,16 +75,38 @@ struct KernelState {
     objects: BTreeMap<u64, KernelObject>,
     next_object_id: u64,
     timers: TimerService,
+    bootstrap_root_vmar_handle: zx_handle_t,
 }
 
 impl KernelState {
     fn new() -> Self {
-        Self {
+        let mut state = Self {
             kernel: crate::task::Kernel::bootstrap(),
             objects: BTreeMap::new(),
             next_object_id: 1,
             timers: TimerService::new(),
-        }
+            bootstrap_root_vmar_handle: 0,
+        };
+
+        let root = state
+            .kernel
+            .current_root_vmar()
+            .expect("bootstrap root VMAR must exist");
+        let object_id = state.alloc_object_id();
+        state.objects.insert(
+            object_id,
+            KernelObject::Vmar(VmarObject {
+                process_id: root.process_id(),
+                address_space_id: root.address_space_id(),
+                vmar_id: root.vmar_id(),
+                base: root.base(),
+                len: root.len(),
+            }),
+        );
+        state.bootstrap_root_vmar_handle = state
+            .alloc_handle_for_object(object_id, vmar_default_rights())
+            .expect("bootstrap root VMAR handle allocation must succeed");
+        state
     }
 
     fn alloc_object_id(&mut self) -> u64 {
@@ -101,6 +149,13 @@ pub fn init() {
     if guard.is_none() {
         *guard = Some(KernelState::new());
     }
+}
+
+/// Return the bootstrap root VMAR handle seeded into the current process.
+pub fn bootstrap_root_vmar_handle() -> Option<zx_handle_t> {
+    let mut guard = STATE.lock();
+    let state = guard.as_mut()?;
+    Some(state.bootstrap_root_vmar_handle)
 }
 
 fn with_state_mut<T>(
@@ -187,6 +242,118 @@ pub fn create_timer(options: u32, clock_id: zx_clock_t) -> Result<zx_handle_t, z
     })
 }
 
+/// Create an anonymous VMO and return a handle.
+pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let created = state.kernel.create_current_anonymous_vmo(size)?;
+        let object_id = state.alloc_object_id();
+        state.objects.insert(
+            object_id,
+            KernelObject::Vmo(VmoObject {
+                process_id: created.process_id(),
+                address_space_id: created.address_space_id(),
+                vmo_id: created.vmo_id(),
+                size_bytes: created.size_bytes(),
+            }),
+        );
+
+        match state.alloc_handle_for_object(object_id, vmo_default_rights()) {
+            Ok(h) => Ok(h),
+            Err(e) => {
+                let _ = state.objects.remove(&object_id);
+                Err(e)
+            }
+        }
+    })
+}
+
+/// Map a VMO into a VMAR at an exact offset.
+#[allow(clippy::too_many_arguments)]
+pub fn vmar_map(
+    vmar_handle: zx_handle_t,
+    options: u32,
+    vmar_offset: u64,
+    vmo_handle: zx_handle_t,
+    vmo_offset: u64,
+    len: u64,
+) -> Result<u64, zx_status_t> {
+    let perms = mapping_perms_from_options(options, true)?;
+
+    with_state_mut(|state| {
+        let resolved_vmar = state.lookup_handle(vmar_handle, crate::task::HandleRights::empty())?;
+        let resolved_vmo = state.lookup_handle(vmo_handle, crate::task::HandleRights::empty())?;
+        let vmar = match state.objects.get(&resolved_vmar.object_id()) {
+            Some(KernelObject::Vmar(vmar)) => *vmar,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        let vmo = match state.objects.get(&resolved_vmo.object_id()) {
+            Some(KernelObject::Vmo(vmo)) => *vmo,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+
+        require_vm_mapping_rights(resolved_vmar, perms)?;
+        require_vm_mapping_rights(resolved_vmo, perms)?;
+        let _ = vmo.size_bytes;
+        state.kernel.map_current_vmo_into_vmar(
+            vmar.address_space_id,
+            vmar.vmar_id,
+            vmo.address_space_id,
+            vmo.vmo_id,
+            vmar_offset,
+            vmo_offset,
+            len,
+            perms,
+        )
+    })
+}
+
+/// Unmap a previously installed VMAR range.
+pub fn vmar_unmap(vmar_handle: zx_handle_t, addr: u64, len: u64) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved_vmar = state.lookup_handle(vmar_handle, crate::task::HandleRights::empty())?;
+        let vmar = match state.objects.get(&resolved_vmar.object_id()) {
+            Some(KernelObject::Vmar(vmar)) => *vmar,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        let _ = (vmar.process_id, vmar.base, vmar.len);
+        require_handle_rights(resolved_vmar, crate::task::HandleRights::WRITE)?;
+        state
+            .kernel
+            .unmap_current_vmar(vmar.address_space_id, vmar.vmar_id, addr, len)
+    })
+}
+
+/// Change permissions on an existing VMAR range.
+pub fn vmar_protect(
+    vmar_handle: zx_handle_t,
+    options: u32,
+    addr: u64,
+    len: u64,
+) -> Result<(), zx_status_t> {
+    let perms = mapping_perms_from_options(options, false)?;
+
+    with_state_mut(|state| {
+        let resolved_vmar = state.lookup_handle(vmar_handle, crate::task::HandleRights::empty())?;
+        let vmar = match state.objects.get(&resolved_vmar.object_id()) {
+            Some(KernelObject::Vmar(vmar)) => *vmar,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        let _ = (vmar.process_id, vmar.base, vmar.len);
+        require_vm_mapping_rights(resolved_vmar, perms)?;
+        state
+            .kernel
+            .protect_current_vmar(vmar.address_space_id, vmar.vmar_id, addr, len, perms)
+    })
+}
+
 /// Ensure a handle is valid and references a Port object.
 #[allow(dead_code)]
 pub fn ensure_port_handle(handle: zx_handle_t) -> Result<(), zx_status_t> {
@@ -206,7 +373,9 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
         let object_id = resolved.object_id();
         let timer_id = match state.objects.get(&object_id) {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
-            Some(KernelObject::Port(_)) => return Err(ZX_ERR_WRONG_TYPE),
+            Some(KernelObject::Port(_))
+            | Some(KernelObject::Vmo(_))
+            | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
@@ -237,7 +406,9 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
         let object_id = resolved.object_id();
         let timer_id = match state.objects.get(&object_id) {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
-            Some(KernelObject::Port(_)) => return Err(ZX_ERR_WRONG_TYPE),
+            Some(KernelObject::Port(_))
+            | Some(KernelObject::Vmo(_))
+            | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
@@ -266,7 +437,9 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
             let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
             let port = match obj {
                 KernelObject::Port(port) => port,
-                KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
+                KernelObject::Timer(_) | KernelObject::Vmo(_) | KernelObject::Vmar(_) => {
+                    return Err(ZX_ERR_WRONG_TYPE);
+                }
             };
             require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
 
@@ -289,7 +462,9 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
             let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
             let port = match obj {
                 KernelObject::Port(port) => port,
-                KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
+                KernelObject::Timer(_) | KernelObject::Vmo(_) | KernelObject::Vmar(_) => {
+                    return Err(ZX_ERR_WRONG_TYPE);
+                }
             };
             require_handle_rights(resolved, crate::task::HandleRights::READ)?;
             port.pop().map_err(map_port_error)?
@@ -441,7 +616,9 @@ pub fn object_wait_async(
             let obj = state.objects.get_mut(&port_id).ok_or(ZX_ERR_BAD_HANDLE)?;
             let port = match obj {
                 KernelObject::Port(port) => port,
-                KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
+                KernelObject::Timer(_) | KernelObject::Vmo(_) | KernelObject::Vmar(_) => {
+                    return Err(ZX_ERR_WRONG_TYPE);
+                }
             };
             require_handle_rights(resolved_port, crate::task::HandleRights::WRITE)?;
             port.wait_async(waitable_id, key, watched, options, current, now)
@@ -492,6 +669,25 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                 let _ = timer.timer_id.raw();
                 ObjectKind::Timer
             }
+            KernelObject::Vmo(vmo) => {
+                let _ = (
+                    vmo.process_id,
+                    vmo.address_space_id,
+                    vmo.vmo_id.raw(),
+                    vmo.size_bytes,
+                );
+                ObjectKind::Vmo
+            }
+            KernelObject::Vmar(vmar) => {
+                let _ = (
+                    vmar.process_id,
+                    vmar.address_space_id,
+                    vmar.vmar_id.raw(),
+                    vmar.base,
+                    vmar.len,
+                );
+                ObjectKind::Vmar
+            }
         };
 
         if kind == expected {
@@ -528,6 +724,61 @@ fn timer_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::WRITE
 }
 
+fn vmo_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::READ
+        | crate::task::HandleRights::WRITE
+}
+
+fn vmar_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::READ
+        | crate::task::HandleRights::WRITE
+}
+
+fn require_vm_mapping_rights(
+    resolved: crate::task::ResolvedHandle,
+    perms: MappingPerms,
+) -> Result<(), zx_status_t> {
+    require_handle_rights(resolved, crate::task::HandleRights::READ)?;
+    if perms.contains(MappingPerms::WRITE) {
+        require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
+    }
+    Ok(())
+}
+
+fn mapping_perms_from_options(
+    options: u32,
+    require_specific: bool,
+) -> Result<MappingPerms, zx_status_t> {
+    let allowed = ZX_VM_PERM_READ
+        | ZX_VM_PERM_WRITE
+        | ZX_VM_PERM_EXECUTE
+        | if require_specific { ZX_VM_SPECIFIC } else { 0 };
+    if (options & !allowed) != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if require_specific && (options & ZX_VM_SPECIFIC) == 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if (options & ZX_VM_PERM_EXECUTE) != 0 {
+        return Err(ZX_ERR_NOT_SUPPORTED);
+    }
+    let has_read = (options & ZX_VM_PERM_READ) != 0;
+    let has_write = (options & ZX_VM_PERM_WRITE) != 0;
+    if !has_read {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    let mut perms = MappingPerms::READ | MappingPerms::USER;
+    if has_write {
+        perms |= MappingPerms::WRITE;
+    }
+    Ok(perms)
+}
+
 fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals, zx_status_t> {
     let obj = state.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
     match obj {
@@ -543,6 +794,7 @@ fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals,
                 Signals::NONE
             })
         }
+        KernelObject::Vmo(_) | KernelObject::Vmar(_) => Ok(Signals::NONE),
     }
 }
 
