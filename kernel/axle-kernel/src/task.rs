@@ -22,7 +22,7 @@ use axle_mm::{
     FutexKey, GlobalVmoId, LazyAnonFaultResolution, MappingPerms, PageFaultDecision,
     PageFaultFlags, PteMeta, PteMetaTag, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
 };
-use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor};
+use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor, TxSet};
 use axle_types::rights::{
     ZX_RIGHT_APPLY_PROFILE, ZX_RIGHT_DESTROY, ZX_RIGHT_DUPLICATE, ZX_RIGHT_ENUMERATE,
     ZX_RIGHT_EXECUTE, ZX_RIGHT_GET_POLICY, ZX_RIGHT_GET_PROPERTY, ZX_RIGHT_INSPECT,
@@ -320,6 +320,7 @@ impl PortWaiter {
 /// Pinned page run loaned from the current process into a kernel object.
 #[derive(Clone, Debug)]
 pub(crate) struct LoanedUserPages {
+    address_space_id: AddressSpaceId,
     base: u64,
     len: u32,
     needs_cow: bool,
@@ -327,6 +328,10 @@ pub(crate) struct LoanedUserPages {
 }
 
 impl LoanedUserPages {
+    pub(crate) const fn address_space_id(&self) -> AddressSpaceId {
+        self.address_space_id
+    }
+
     pub(crate) const fn base(&self) -> u64 {
         self.base
     }
@@ -341,6 +346,98 @@ impl LoanedUserPages {
 
     pub(crate) fn pages(&self) -> &[FrameId] {
         &self.pages
+    }
+}
+
+type BootstrapTxCursor = TxCursor<crate::page_table::LockedBootstrapUserPageTable>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AddressSpaceTxKey {
+    address_space_id: AddressSpaceId,
+    range_base: u64,
+}
+
+impl AddressSpaceTxKey {
+    const fn new(address_space_id: AddressSpaceId, range: PageRange) -> Self {
+        Self {
+            address_space_id,
+            range_base: range.base(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AddressSpaceTxRequest {
+    key: AddressSpaceTxKey,
+    range: PageRange,
+}
+
+impl AddressSpaceTxRequest {
+    fn new(address_space_id: AddressSpaceId, range: PageRange) -> Self {
+        Self {
+            key: AddressSpaceTxKey::new(address_space_id, range),
+            range,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum AddressSpaceTxParticipant {
+    Active {
+        key: AddressSpaceTxKey,
+        cursor: BootstrapTxCursor,
+    },
+    Deferred {
+        key: AddressSpaceTxKey,
+        range: PageRange,
+    },
+}
+
+#[derive(Debug, Default)]
+struct AddressSpaceTxSet {
+    participants: Vec<AddressSpaceTxParticipant>,
+}
+
+impl AddressSpaceTxSet {
+    fn push_active(
+        &mut self,
+        key: AddressSpaceTxKey,
+        cursor: BootstrapTxCursor,
+    ) -> Result<(), PageTableError> {
+        self.participants
+            .push(AddressSpaceTxParticipant::Active { key, cursor });
+        Ok(())
+    }
+
+    fn push_deferred(&mut self, key: AddressSpaceTxKey, range: PageRange) {
+        self.participants
+            .push(AddressSpaceTxParticipant::Deferred { key, range });
+    }
+
+    fn cursor_mut(&mut self, key: AddressSpaceTxKey) -> Option<&mut BootstrapTxCursor> {
+        self.participants
+            .iter_mut()
+            .find_map(|participant| match participant {
+                AddressSpaceTxParticipant::Active {
+                    key: participant_key,
+                    cursor,
+                } if *participant_key == key => Some(cursor),
+                _ => None,
+            })
+    }
+
+    fn commit(self) -> Result<(), PageTableError> {
+        let mut active = TxSet::new();
+        for participant in self.participants {
+            match participant {
+                AddressSpaceTxParticipant::Active { key, cursor } => active.push(key, cursor)?,
+                AddressSpaceTxParticipant::Deferred { key, range } => {
+                    let _ = key;
+                    let _ = range;
+                }
+            }
+        }
+        active.commit()
     }
 }
 
@@ -946,6 +1043,7 @@ impl Kernel {
             ZX_ERR_OUT_OF_RANGE
         })?;
         Ok(Some(LoanedUserPages {
+            address_space_id,
             base: ptr,
             len: len_u32,
             needs_cow: lookup.max_perms().contains(MappingPerms::WRITE),
@@ -965,8 +1063,7 @@ impl Kernel {
             return Ok(());
         }
 
-        let process = self.current_process()?;
-        let address_space_id = process.address_space_id;
+        let address_space_id = loaned.address_space_id();
         let len = u64::from(loaned.len());
         {
             let address_space = self
@@ -1373,7 +1470,7 @@ impl Kernel {
         address_space
             .unmap(&mut self.frames, addr, len)
             .map_err(map_address_space_error)?;
-        self.clear_mapping_pages(addr, len)
+        self.clear_mapping_pages(address_space_id, addr, len)
     }
 
     pub(crate) fn protect_current_vmar(
@@ -1553,10 +1650,57 @@ impl Kernel {
         self.sync_mapping_pages(address_space_id, base, len)
     }
 
-    fn clear_mapping_pages(&self, base: u64, len: u64) -> Result<(), zx_status_t> {
-        let mut page_table = crate::page_table::BootstrapUserPageTable;
+    fn lock_address_space_tx_set(
+        &self,
+        requests: &[AddressSpaceTxRequest],
+    ) -> Result<AddressSpaceTxSet, zx_status_t> {
+        let current_address_space_id = self.current_process()?.address_space_id;
+        let mut ordered = requests.to_vec();
+        ordered.sort_unstable_by_key(|request| request.key);
+
+        let mut tx_set = AddressSpaceTxSet::default();
+        let mut last_request: Option<AddressSpaceTxRequest> = None;
+        for request in ordered {
+            if let Some(previous) = last_request {
+                if previous.key == request.key {
+                    return Err(ZX_ERR_INVALID_ARGS);
+                }
+                if previous.key.address_space_id == request.key.address_space_id
+                    && previous.range.end() > request.range.base()
+                {
+                    return Err(ZX_ERR_INVALID_ARGS);
+                }
+            }
+
+            if request.key.address_space_id == current_address_space_id {
+                let mut page_table = crate::page_table::BootstrapUserPageTable;
+                let cursor = TxCursor::new(
+                    page_table
+                        .lock(request.range)
+                        .map_err(map_page_table_error)?,
+                );
+                tx_set
+                    .push_active(request.key, cursor)
+                    .map_err(map_page_table_error)?;
+            } else {
+                tx_set.push_deferred(request.key, request.range);
+            }
+
+            last_request = Some(request);
+        }
+        Ok(tx_set)
+    }
+
+    fn clear_mapping_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
         let range = PageRange::new(base, len).map_err(map_page_table_error)?;
-        let mut tx = TxCursor::new(page_table.lock(range).map_err(map_page_table_error)?);
+        let request = AddressSpaceTxRequest::new(address_space_id, range);
+        let mut tx_set = self.lock_address_space_tx_set(&[request])?;
+        let tx = tx_set.cursor_mut(request.key).ok_or(ZX_ERR_BAD_STATE)?;
         let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
             .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
         for page_index in 0..page_count {
@@ -1566,7 +1710,7 @@ impl Kernel {
                     .map_err(map_page_table_error)?;
             }
         }
-        tx.commit().map_err(map_page_table_error)
+        tx_set.commit().map_err(map_page_table_error)
     }
 
     fn update_mapping_pages(
@@ -1648,9 +1792,10 @@ impl Kernel {
             .address_spaces
             .get(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        let mut page_table = crate::page_table::BootstrapUserPageTable;
         let range = PageRange::new(base, len).map_err(map_page_table_error)?;
-        let mut tx = TxCursor::new(page_table.lock(range).map_err(map_page_table_error)?);
+        let request = AddressSpaceTxRequest::new(address_space_id, range);
+        let mut tx_set = self.lock_address_space_tx_set(&[request])?;
+        let tx = tx_set.cursor_mut(request.key).ok_or(ZX_ERR_BAD_STATE)?;
         let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
             .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
         for page_index in 0..page_count {
@@ -1676,7 +1821,7 @@ impl Kernel {
                 }
             }
         }
-        tx.commit().map_err(map_page_table_error)
+        tx_set.commit().map_err(map_page_table_error)
     }
 
     fn unpin_loaned_pages_inner(&mut self, pages: &[FrameId]) {

@@ -8,6 +8,10 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 /// Canonical base page size used by the bootstrap page-table layer.
 pub const PAGE_SIZE: u64 = 0x1000;
 
@@ -207,6 +211,73 @@ impl<L: PageTableLock> TxCursor<L> {
     }
 }
 
+#[derive(Debug)]
+struct TxSetEntry<K, L: PageTableLock> {
+    key: K,
+    cursor: TxCursor<L>,
+}
+
+/// Ordered set of page-table transaction cursors.
+///
+/// `TxSet` models the future "lock many address spaces/ranges in a global
+/// order" shape needed by cross-address-space VM operations such as page-loan.
+/// Callers must insert sessions in strictly increasing key order so lock
+/// acquisition order remains explicit and reviewable.
+#[derive(Debug)]
+pub struct TxSet<K, L: PageTableLock> {
+    entries: Vec<TxSetEntry<K, L>>,
+}
+
+impl<K: Ord, L: PageTableLock> TxSet<K, L> {
+    /// Build one empty ordered transaction set.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Whether the set contains no locked sessions.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Number of locked sessions in the set.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Insert one locked session in strictly increasing key order.
+    pub fn push(&mut self, key: K, cursor: TxCursor<L>) -> Result<(), PageTableError> {
+        if self.entries.last().is_some_and(|last| last.key >= key) {
+            return Err(PageTableError::InvalidArgs);
+        }
+        self.entries.push(TxSetEntry { key, cursor });
+        Ok(())
+    }
+
+    /// Return the cursor for one previously inserted key.
+    pub fn cursor_mut(&mut self, key: &K) -> Option<&mut TxCursor<L>> {
+        self.entries
+            .iter_mut()
+            .find(|entry| &entry.key == key)
+            .map(|entry| &mut entry.cursor)
+    }
+
+    /// Commit every locked session in reverse acquisition order.
+    pub fn commit(mut self) -> Result<(), PageTableError> {
+        while let Some(entry) = self.entries.pop() {
+            entry.cursor.commit()?;
+        }
+        Ok(())
+    }
+}
+
+impl<K: Ord, L: PageTableLock> Default for TxSet<K, L> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn validate_page_in_range(range: PageRange, va: u64) -> Result<(), PageTableError> {
     if !range.contains_page(va) {
         return Err(PageTableError::InvalidArgs);
@@ -242,15 +313,36 @@ extern crate std;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::rc::Rc;
     use std::vec;
     use std::vec::Vec;
 
-    #[derive(Default)]
     struct MockBackend {
+        id: u64,
         pages: BTreeMap<u64, PageMapping>,
         flushes: Vec<u64>,
         commits: usize,
+        commit_log: Rc<RefCell<Vec<u64>>>,
+    }
+
+    impl Default for MockBackend {
+        fn default() -> Self {
+            Self::new(0, Rc::new(RefCell::new(Vec::new())))
+        }
+    }
+
+    impl MockBackend {
+        fn new(id: u64, commit_log: Rc<RefCell<Vec<u64>>>) -> Self {
+            Self {
+                id,
+                pages: BTreeMap::new(),
+                flushes: Vec::new(),
+                commits: 0,
+                commit_log,
+            }
+        }
     }
 
     struct MockLock<'a> {
@@ -309,6 +401,7 @@ mod tests {
 
         fn commit(self) -> Result<(), PageTableError> {
             self.backend.commits += 1;
+            self.backend.commit_log.borrow_mut().push(self.backend.id);
             Ok(())
         }
     }
@@ -426,5 +519,47 @@ mod tests {
             Err(PageTableError::InvalidArgs)
         );
         assert_eq!(tx.query(PAGE_SIZE * 2), Err(PageTableError::InvalidArgs));
+    }
+
+    #[test]
+    fn tx_set_requires_strictly_increasing_keys() {
+        let range = PageRange::new(PAGE_SIZE, PAGE_SIZE).unwrap();
+        let commit_log = Rc::new(RefCell::new(Vec::new()));
+        let mut left = MockBackend::new(1, commit_log.clone());
+        let mut right = MockBackend::new(2, commit_log);
+        let mut tx_set = TxSet::new();
+
+        tx_set
+            .push(1_u64, TxCursor::new(left.lock(range).unwrap()))
+            .unwrap();
+        assert_eq!(
+            tx_set.push(1_u64, TxCursor::new(right.lock(range).unwrap())),
+            Err(PageTableError::InvalidArgs)
+        );
+    }
+
+    #[test]
+    fn tx_set_commits_locked_sessions_in_reverse_order() {
+        let range = PageRange::new(PAGE_SIZE, PAGE_SIZE).unwrap();
+        let commit_log = Rc::new(RefCell::new(Vec::new()));
+        let mut left = MockBackend::new(1, commit_log.clone());
+        let mut right = MockBackend::new(2, commit_log.clone());
+        let mut tx_set = TxSet::new();
+
+        tx_set
+            .push(1_u64, TxCursor::new(left.lock(range).unwrap()))
+            .unwrap();
+        tx_set
+            .push(2_u64, TxCursor::new(right.lock(range).unwrap()))
+            .unwrap();
+
+        assert_eq!(tx_set.len(), 2);
+        assert!(tx_set.cursor_mut(&1).is_some());
+
+        tx_set.commit().unwrap();
+
+        assert_eq!(*commit_log.borrow(), vec![2, 1]);
+        assert_eq!(left.commits, 1);
+        assert_eq!(right.commits, 1);
     }
 }

@@ -5,26 +5,22 @@ use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, PageTab
 pub(crate) struct BootstrapUserPageTable;
 
 #[derive(Debug)]
-pub(crate) struct LockedBootstrapUserPageTable<'a> {
-    page_table: &'a mut BootstrapUserPageTable,
+pub(crate) struct LockedBootstrapUserPageTable {
     range: PageRange,
 }
 
 impl PageTable for BootstrapUserPageTable {
     type Lock<'a>
-        = LockedBootstrapUserPageTable<'a>
+        = LockedBootstrapUserPageTable
     where
         Self: 'a;
 
     fn lock(&mut self, range: PageRange) -> Result<Self::Lock<'_>, PageTableError> {
-        Ok(LockedBootstrapUserPageTable {
-            page_table: self,
-            range,
-        })
+        Ok(LockedBootstrapUserPageTable { range })
     }
 }
 
-impl PageTableLock for LockedBootstrapUserPageTable<'_> {
+impl PageTableLock for LockedBootstrapUserPageTable {
     fn range(&self) -> PageRange {
         self.range
     }
@@ -56,7 +52,6 @@ impl PageTableLock for LockedBootstrapUserPageTable<'_> {
     }
 
     fn commit(self) -> Result<(), PageTableError> {
-        let _ = self.page_table;
         Ok(())
     }
 }
