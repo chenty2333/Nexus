@@ -633,10 +633,6 @@ impl AddressSpace {
         self.vm.pte_meta(fault_va)
     }
 
-    fn first_rmap_anchor_for_frame(&self, frame_id: FrameId) -> Option<ReverseMapAnchor> {
-        self.vm.first_rmap_anchor_for_frame(frame_id)
-    }
-
     fn page_base_for_rmap_anchor(&self, anchor: ReverseMapAnchor) -> Option<u64> {
         self.vm.page_base_for_rmap_anchor(anchor)
     }
@@ -1212,9 +1208,6 @@ impl Kernel {
                 return Ok(false);
             }
         }
-        let replaced_receiver_frames =
-            self.mapped_frames_in_range(receiver_address_space_id, dst_base, len)?;
-
         let sender_range = PageRange::new(loaned.base(), len).map_err(map_page_table_error)?;
         let receiver_range = PageRange::new(dst_base, len).map_err(map_page_table_error)?;
         let mut loan_tx = self.lock_channel_loan_tx(
@@ -1240,7 +1233,11 @@ impl Kernel {
         let receiver_cursor = loan_tx.receiver_cursor_mut().ok_or(ZX_ERR_BAD_STATE)?;
         self.sync_mapping_pages_locked(receiver_address_space_id, dst_base, len, receiver_cursor)?;
         loan_tx.commit().map_err(map_page_table_error)?;
-        self.refresh_frame_anchors(&replaced_receiver_frames)?;
+        if let Some(&source_frame_id) = loaned.pages().first() {
+            crate::userspace::record_vm_last_remap_source_rmap_count(
+                self.frame_mapping_count(source_frame_id),
+            );
+        }
         Ok(true)
     }
 
@@ -1635,7 +1632,6 @@ impl Kernel {
         addr: u64,
         len: u64,
     ) -> Result<(), zx_status_t> {
-        let affected_frames = self.mapped_frames_in_range(address_space_id, addr, len)?;
         let address_space = self
             .address_spaces
             .get_mut(&address_space_id)
@@ -1646,7 +1642,6 @@ impl Kernel {
         address_space
             .unmap(&mut self.frames, addr, len)
             .map_err(map_address_space_error)?;
-        self.refresh_frame_anchors(&affected_frames)?;
         self.clear_mapping_pages(address_space_id, addr, len)
     }
 
@@ -1959,7 +1954,6 @@ impl Kernel {
                 .resolve_cow_fault(&mut self.frames, fault_va, new_frame_id)
                 .map_err(map_address_space_error)?
         };
-        self.refresh_frame_anchors(&[resolved.old_frame_id(), resolved.new_frame_id()])?;
         self.sync_mapping_pages(
             address_space_id,
             resolved.fault_page_base(),
@@ -1967,6 +1961,10 @@ impl Kernel {
         )?;
         self.cow_fault_count = self.cow_fault_count.wrapping_add(1);
         crate::userspace::record_vm_cow_fault_count(self.cow_fault_count);
+        crate::userspace::record_vm_last_cow_rmap_counts(
+            self.frame_mapping_count(resolved.old_frame_id()),
+            self.frame_mapping_count(resolved.new_frame_id()),
+        );
         Ok(())
     }
 
@@ -1990,7 +1988,6 @@ impl Kernel {
                 .resolve_lazy_anon_fault(&mut self.frames, fault_va, new_frame_id)
                 .map_err(map_address_space_error)?
         };
-        self.refresh_frame_anchor(resolved.new_frame_id())?;
         self.sync_mapping_pages(
             address_space_id,
             resolved.fault_page_base(),
@@ -2051,67 +2048,34 @@ impl Kernel {
         Ok(())
     }
 
-    fn mapped_frames_in_range(
-        &self,
-        address_space_id: AddressSpaceId,
-        base: u64,
-        len: u64,
-    ) -> Result<Vec<FrameId>, zx_status_t> {
-        let address_space = self
-            .address_spaces
-            .get(&address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        let mut frames = Vec::with_capacity(page_count);
-        for page_index in 0..page_count {
-            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
-            let Some(frame_id) = address_space
-                .lookup_user_mapping(va, 1)
-                .and_then(|lookup| lookup.frame_id())
-            else {
-                continue;
-            };
-            push_unique_frame_id(&mut frames, frame_id);
-        }
-        Ok(frames)
-    }
-
-    fn resolve_frame_mapping(
+    fn resolve_frame_mappings(
         &self,
         frame_id: FrameId,
-    ) -> Option<(AddressSpaceId, ReverseMapAnchor, u64, VmaLookup)> {
-        let anchor = self.frames.state(frame_id)?.rmap_anchor()?;
-        let address_space_id = anchor.address_space_id().raw();
-        let address_space = self.address_spaces.get(&address_space_id)?;
-        let page_base = address_space.page_base_for_rmap_anchor(anchor)?;
-        let lookup = address_space.lookup_rmap_anchor(anchor)?;
-        (lookup.frame_id() == Some(frame_id)).then_some((
-            address_space_id,
-            anchor,
-            page_base,
-            lookup,
-        ))
+    ) -> Vec<(AddressSpaceId, ReverseMapAnchor, u64, VmaLookup)> {
+        let Some(anchors) = self.frames.rmap_anchors(frame_id) else {
+            return Vec::new();
+        };
+        let mut mappings = Vec::with_capacity(anchors.len());
+        for &anchor in anchors {
+            let address_space_id = anchor.address_space_id().raw();
+            let Some(address_space) = self.address_spaces.get(&address_space_id) else {
+                continue;
+            };
+            let Some(page_base) = address_space.page_base_for_rmap_anchor(anchor) else {
+                continue;
+            };
+            let Some(lookup) = address_space.lookup_rmap_anchor(anchor) else {
+                continue;
+            };
+            if lookup.frame_id() == Some(frame_id) {
+                mappings.push((address_space_id, anchor, page_base, lookup));
+            }
+        }
+        mappings
     }
 
-    fn refresh_frame_anchor(&mut self, frame_id: FrameId) -> Result<(), zx_status_t> {
-        if self.resolve_frame_mapping(frame_id).is_some() {
-            return Ok(());
-        }
-        let replacement = self
-            .address_spaces
-            .values()
-            .find_map(|address_space| address_space.first_rmap_anchor_for_frame(frame_id));
-        self.frames
-            .set_rmap_anchor(frame_id, replacement)
-            .map_err(|_| ZX_ERR_BAD_STATE)
-    }
-
-    fn refresh_frame_anchors(&mut self, frame_ids: &[FrameId]) -> Result<(), zx_status_t> {
-        for &frame_id in frame_ids {
-            self.refresh_frame_anchor(frame_id)?;
-        }
-        Ok(())
+    fn frame_mapping_count(&self, frame_id: FrameId) -> u64 {
+        u64::try_from(self.resolve_frame_mappings(frame_id).len()).unwrap_or(u64::MAX)
     }
 
     fn release_loaned_pages_inner(&mut self, pages: &[FrameId]) {
@@ -2119,12 +2083,6 @@ impl Kernel {
             let _ = self.frames.dec_loan(frame_id);
             let _ = self.frames.unpin(frame_id);
         }
-    }
-}
-
-fn push_unique_frame_id(frames: &mut Vec<FrameId>, frame_id: FrameId) {
-    if !frames.contains(&frame_id) {
-        frames.push(frame_id);
     }
 }
 

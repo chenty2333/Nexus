@@ -79,14 +79,14 @@ impl AddressSpaceId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FrameDescRecord {
     id: FrameId,
     ref_count: u32,
     map_count: u32,
     pin_count: u32,
     loan_count: u32,
-    rmap_anchor: Option<ReverseMapAnchor>,
+    rmap_anchors: Vec<ReverseMapAnchor>,
 }
 
 /// Snapshot of one frame descriptor.
@@ -98,6 +98,7 @@ pub struct FrameDesc {
     pin_count: u32,
     loan_count: u32,
     rmap_anchor: Option<ReverseMapAnchor>,
+    rmap_anchor_count: u32,
 }
 
 impl FrameDesc {
@@ -130,6 +131,11 @@ impl FrameDesc {
     pub const fn rmap_anchor(self) -> Option<ReverseMapAnchor> {
         self.rmap_anchor
     }
+
+    /// Total number of currently tracked reverse-mapping anchors for this frame.
+    pub const fn rmap_anchor_count(self) -> u32 {
+        self.rmap_anchor_count
+    }
 }
 
 /// Errors returned by frame-table operations.
@@ -149,6 +155,10 @@ pub enum FrameTableError {
     PinUnderflow,
     /// Loan count was decremented below zero.
     LoanUnderflow,
+    /// One mapping anchor was registered more than once for the same frame.
+    DuplicateAnchor,
+    /// One mapping anchor to remove was not present on the frame.
+    MissingAnchor,
 }
 
 /// Global physical-frame bookkeeping used by the bootstrap kernel.
@@ -178,7 +188,7 @@ impl FrameTable {
             map_count: 0,
             pin_count: 0,
             loan_count: 0,
-            rmap_anchor: None,
+            rmap_anchors: Vec::new(),
         });
         Ok(id)
     }
@@ -193,15 +203,23 @@ impl FrameTable {
         self.frames
             .iter()
             .find(|frame| frame.id == id)
-            .copied()
             .map(|frame| FrameDesc {
                 id: frame.id,
                 ref_count: frame.ref_count,
                 map_count: frame.map_count,
                 pin_count: frame.pin_count,
                 loan_count: frame.loan_count,
-                rmap_anchor: frame.rmap_anchor,
+                rmap_anchor: frame.rmap_anchors.first().copied(),
+                rmap_anchor_count: frame.rmap_anchors.len() as u32,
             })
+    }
+
+    /// Return the full reverse-mapping anchor set for one frame.
+    pub fn rmap_anchors(&self, id: FrameId) -> Option<&[ReverseMapAnchor]> {
+        self.frames
+            .iter()
+            .find(|frame| frame.id == id)
+            .map(|frame| frame.rmap_anchors.as_slice())
     }
 
     /// Increment the mapping count and total refcount for a registered frame.
@@ -226,11 +244,21 @@ impl FrameTable {
         id: FrameId,
         anchor: ReverseMapAnchor,
     ) -> Result<(), FrameTableError> {
-        self.inc_map(id)?;
         let frame = self.frame_mut(id)?;
-        if frame.rmap_anchor.is_none() {
-            frame.rmap_anchor = Some(anchor);
+        if frame.rmap_anchors.contains(&anchor) {
+            return Err(FrameTableError::DuplicateAnchor);
         }
+        let map_count = frame
+            .map_count
+            .checked_add(1)
+            .ok_or(FrameTableError::CountOverflow)?;
+        let ref_count = frame
+            .ref_count
+            .checked_add(1)
+            .ok_or(FrameTableError::CountOverflow)?;
+        frame.map_count = map_count;
+        frame.ref_count = ref_count;
+        frame.rmap_anchors.push(anchor);
         Ok(())
     }
 
@@ -250,26 +278,21 @@ impl FrameTable {
         &mut self,
         id: FrameId,
         removed_anchor: ReverseMapAnchor,
-        replacement_anchor: Option<ReverseMapAnchor>,
     ) -> Result<(), FrameTableError> {
-        self.dec_map(id)?;
         let frame = self.frame_mut(id)?;
-        if frame.map_count == 0 {
-            frame.rmap_anchor = None;
-        } else if frame.rmap_anchor == Some(removed_anchor) {
-            frame.rmap_anchor = replacement_anchor;
+        let Some(anchor_index) = frame
+            .rmap_anchors
+            .iter()
+            .position(|anchor| *anchor == removed_anchor)
+        else {
+            return Err(FrameTableError::MissingAnchor);
+        };
+        if frame.map_count == 0 || frame.ref_count == 0 {
+            return Err(FrameTableError::RefUnderflow);
         }
-        Ok(())
-    }
-
-    /// Replace the current reverse-mapping anchor without changing counts.
-    pub fn set_rmap_anchor(
-        &mut self,
-        id: FrameId,
-        anchor: Option<ReverseMapAnchor>,
-    ) -> Result<(), FrameTableError> {
-        let frame = self.frame_mut(id)?;
-        frame.rmap_anchor = anchor;
+        frame.map_count -= 1;
+        frame.ref_count -= 1;
+        frame.rmap_anchors.swap_remove(anchor_index);
         Ok(())
     }
 
@@ -1270,7 +1293,7 @@ impl AddressSpace {
             let anchor = self.make_rmap_anchor(map_id, page_index as u64);
             if let Err(err) = frames.map_frame(frame_id, anchor) {
                 for (rollback_frame, rollback_anchor) in incremented {
-                    let _ = frames.unmap_frame(rollback_frame, rollback_anchor, None);
+                    let _ = frames.unmap_frame(rollback_frame, rollback_anchor);
                 }
                 return Err(AddressSpaceError::FrameTable(err));
             }
@@ -1302,14 +1325,14 @@ impl AddressSpace {
             Ok(page_meta) => page_meta,
             Err(err) => {
                 for (rollback_frame, rollback_anchor) in incremented {
-                    let _ = frames.unmap_frame(rollback_frame, rollback_anchor, None);
+                    let _ = frames.unmap_frame(rollback_frame, rollback_anchor);
                 }
                 return Err(err);
             }
         };
         if let Err(err) = self.pte_meta.install_range(base, &page_meta) {
             for (rollback_frame, rollback_anchor) in incremented {
-                let _ = frames.unmap_frame(rollback_frame, rollback_anchor, None);
+                let _ = frames.unmap_frame(rollback_frame, rollback_anchor);
             }
             return Err(err);
         }
@@ -1345,10 +1368,8 @@ impl AddressSpace {
         }
         for (page_index, frame_id) in bound_frames.into_iter().enumerate() {
             let removed_anchor = self.make_rmap_anchor(vma.map_id, page_index as u64);
-            let replacement_anchor =
-                self.first_rmap_anchor_for_frame_excluding(frame_id, Some(vma.map_id));
             frames
-                .unmap_frame(frame_id, removed_anchor, replacement_anchor)
+                .unmap_frame(frame_id, removed_anchor)
                 .map_err(AddressSpaceError::FrameTable)?;
         }
         let removed = self.vmas.remove(index);
@@ -1449,7 +1470,7 @@ impl AddressSpace {
             .map_frame(new_frame_id, page_anchor)
             .map_err(AddressSpaceError::FrameTable)?;
         if let Err(err) = self.bind_vmo_frame(vma.vmo_id, page_offset, new_frame_id) {
-            let _ = frames.unmap_frame(new_frame_id, page_anchor, None);
+            let _ = frames.unmap_frame(new_frame_id, page_anchor);
             return Err(err);
         }
 
@@ -1496,13 +1517,12 @@ impl AddressSpace {
             .map_frame(new_frame_id, page_anchor)
             .map_err(AddressSpaceError::FrameTable)?;
         if let Err(err) = self.rebind_vmo_frame(vma.vmo_id, page_offset, new_frame_id) {
-            let _ = frames.unmap_frame(new_frame_id, page_anchor, None);
+            let _ = frames.unmap_frame(new_frame_id, page_anchor);
             return Err(err);
         }
-        let replacement_anchor = self.first_rmap_anchor_for_frame_excluding(old_frame_id, None);
-        if let Err(err) = frames.unmap_frame(old_frame_id, page_anchor, replacement_anchor) {
+        if let Err(err) = frames.unmap_frame(old_frame_id, page_anchor) {
             let _ = self.rebind_vmo_frame(vma.vmo_id, page_offset, old_frame_id);
-            let _ = frames.unmap_frame(new_frame_id, page_anchor, None);
+            let _ = frames.unmap_frame(new_frame_id, page_anchor);
             return Err(AddressSpaceError::FrameTable(err));
         }
         let vma = self
@@ -1594,7 +1614,7 @@ impl AddressSpace {
             }
             if let Err(err) = frames.map_frame(new_frame_id, page_anchor) {
                 for (rollback_frame, rollback_anchor) in incremented {
-                    let _ = frames.unmap_frame(rollback_frame, rollback_anchor, None);
+                    let _ = frames.unmap_frame(rollback_frame, rollback_anchor);
                 }
                 return Err(AddressSpaceError::FrameTable(err));
             }
@@ -1607,16 +1627,15 @@ impl AddressSpace {
             }
             if let Err(err) = self.rebind_vmo_frame(vma.vmo_id, page_offset, new_frame_id) {
                 for (rollback_frame, rollback_anchor) in incremented {
-                    let _ = frames.unmap_frame(rollback_frame, rollback_anchor, None);
+                    let _ = frames.unmap_frame(rollback_frame, rollback_anchor);
                 }
                 return Err(err);
             }
             let Some(old_frame_id) = old_frame_id else {
                 continue;
             };
-            let replacement_anchor = self.first_rmap_anchor_for_frame_excluding(old_frame_id, None);
             frames
-                .unmap_frame(old_frame_id, page_anchor, replacement_anchor)
+                .unmap_frame(old_frame_id, page_anchor)
                 .map_err(AddressSpaceError::FrameTable)?;
         }
 
@@ -2409,6 +2428,7 @@ mod tests {
         assert_eq!(initial.map_count(), 0);
         assert_eq!(initial.loan_count(), 0);
         assert_eq!(initial.rmap_anchor(), None);
+        assert_eq!(initial.rmap_anchor_count(), 0);
 
         frames.inc_map(frame).unwrap();
         frames.inc_map(frame).unwrap();
@@ -2419,6 +2439,7 @@ mod tests {
         assert_eq!(mapped.map_count(), 2);
         assert_eq!(mapped.loan_count(), 2);
         assert_eq!(mapped.rmap_anchor(), None);
+        assert_eq!(mapped.rmap_anchor_count(), 0);
 
         frames.dec_map(frame).unwrap();
         frames.dec_map(frame).unwrap();
@@ -2428,6 +2449,7 @@ mod tests {
         assert_eq!(unmapped.ref_count(), 0);
         assert_eq!(unmapped.map_count(), 0);
         assert_eq!(unmapped.loan_count(), 0);
+        assert_eq!(unmapped.rmap_anchor_count(), 0);
         assert_eq!(frames.dec_map(frame), Err(FrameTableError::RefUnderflow));
         assert_eq!(frames.dec_loan(frame), Err(FrameTableError::LoanUnderflow));
     }
@@ -2460,6 +2482,7 @@ mod tests {
             frames.state(shared).unwrap().rmap_anchor(),
             Some(first_anchor)
         );
+        assert_eq!(frames.state(shared).unwrap().rmap_anchor_count(), 1);
 
         space
             .map_fixed(
@@ -2481,6 +2504,14 @@ mod tests {
             frames.state(shared).unwrap().rmap_anchor(),
             Some(first_anchor)
         );
+        assert_eq!(frames.state(shared).unwrap().rmap_anchor_count(), 2);
+        assert_eq!(frames.rmap_anchors(shared).unwrap().len(), 2);
+        assert!(
+            frames
+                .rmap_anchors(shared)
+                .unwrap()
+                .contains(&second_anchor)
+        );
 
         space.unmap(&mut frames, ROOT_BASE, PAGE_SIZE).unwrap();
 
@@ -2488,6 +2519,7 @@ mod tests {
             frames.state(shared).unwrap().rmap_anchor(),
             Some(second_anchor)
         );
+        assert_eq!(frames.state(shared).unwrap().rmap_anchor_count(), 1);
     }
 
     #[test]
@@ -2551,7 +2583,8 @@ mod tests {
         let mut frames = FrameTable::new();
         let shared = frames.register_existing(0x50_000).unwrap();
 
-        let mut left = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let mut left =
+            AddressSpace::new_with_id(AddressSpaceId::new(40), ROOT_BASE, ROOT_LEN).unwrap();
         let left_vmo = left
             .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(10))
             .unwrap();
@@ -2567,7 +2600,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut right = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let mut right =
+            AddressSpace::new_with_id(AddressSpaceId::new(41), ROOT_BASE, ROOT_LEN).unwrap();
         let right_vmo = right
             .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(11))
             .unwrap();
@@ -2584,13 +2618,28 @@ mod tests {
             )
             .unwrap();
 
+        let left_anchor =
+            ReverseMapAnchor::new(left.id(), left.lookup(ROOT_BASE).unwrap().map_id(), 0);
+        let right_anchor = ReverseMapAnchor::new(
+            right.id(),
+            right.lookup(ROOT_BASE + PAGE_SIZE).unwrap().map_id(),
+            0,
+        );
         assert_eq!(frames.state(shared).unwrap().ref_count(), 2);
         assert_eq!(frames.state(shared).unwrap().map_count(), 2);
+        assert_eq!(frames.state(shared).unwrap().rmap_anchor_count(), 2);
+        assert!(frames.rmap_anchors(shared).unwrap().contains(&left_anchor));
+        assert!(frames.rmap_anchors(shared).unwrap().contains(&right_anchor));
         right
             .unmap(&mut frames, ROOT_BASE + PAGE_SIZE, PAGE_SIZE)
             .unwrap();
         assert_eq!(frames.state(shared).unwrap().ref_count(), 1);
         assert_eq!(frames.state(shared).unwrap().map_count(), 1);
+        assert_eq!(
+            frames.state(shared).unwrap().rmap_anchor(),
+            Some(left_anchor)
+        );
+        assert_eq!(frames.state(shared).unwrap().rmap_anchor_count(), 1);
     }
 
     proptest! {

@@ -176,8 +176,10 @@ Axle 仍需要一层 frame/page descriptor 维护：
 - descriptor 现在显式暴露 `map_count`
 - `loan_count` 已接入 channel page-loan 生命周期
 - frame descriptor 已开始维护一个最小 `rmap anchor`
-- anchor 现在已带上 `address_space_id`，kernel 也会在 `unmap/COW/remap-fill` 后做一次全局 refresh
-- 当前 anchor 仍然只是“一个已知 live mapping”的入口，还不是完整 reverse mapping；后续仍需要真正的 frame→mapping 集合
+- anchor 现在已带上 `address_space_id`
+- `FrameTable` 现在开始维护 per-frame 的 reverse-mapping anchor 集合，而不是只存一个 best-effort anchor
+- kernel 已能用这组 anchor 反查 live `(address_space, map_id, va)`，并把 channel `remap-fill -> COW split` 的映射基数打进 conformance telemetry
+- 当前实现仍不是完整的 rmap 数据结构：它能回答“这帧当前有哪些已知映射 anchor”，但还没有按 frame 做高效删除/区间查询/批量失效
 
 ### 4.5 TxCursor：唯一页表修改入口
 

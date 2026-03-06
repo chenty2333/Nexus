@@ -24,3 +24,6 @@ channel_loan_read = 0
 channel_loan_actual_bytes = 4096
 channel_loan_snapshot_ok = 1
 channel_loan_remap_cow_ok = 1
+vm_last_remap_source_rmap_count = 1
+vm_last_cow_old_rmap_count = 0
+vm_last_cow_new_rmap_count = 1

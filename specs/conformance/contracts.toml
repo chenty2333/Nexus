@@ -83,7 +83,7 @@ description = "Page-aligned bootstrap channel writes should preserve the send-ti
 [[contracts]]
 id = "should.channel.page_loan_remap_fill_cow_bootstrap"
 level = "should"
-description = "Page-aligned bootstrap channel remap-fill reads should trigger one receiver-side COW split on first write without corrupting the sender's private snapshot"
+description = "Page-aligned bootstrap channel remap-fill reads should trigger one receiver-side COW split on first write, preserve the sender snapshot, and keep reverse-mapping cardinality stable across the split"
 
 [[contracts]]
 id = "should.channel.close_read_order_bootstrap"
