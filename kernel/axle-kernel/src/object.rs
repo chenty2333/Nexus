@@ -1,13 +1,12 @@
-//! Minimal kernel object table + CSpace wiring (single-process bootstrap model).
+//! Minimal kernel object table wired through the bootstrap kernel/process model.
 
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
 
-use axle_core::handle::Handle;
 use axle_core::{
-    CSpace, CSpaceError, Capability, Packet, PacketKind, Port, PortError, Signals, TimerError,
-    TimerId, TimerService, WaitAsyncOptions,
+    Packet, PacketKind, Port, PortError, Signals, TimerError, TimerId, TimerService,
+    WaitAsyncOptions,
 };
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
@@ -19,11 +18,6 @@ use axle_types::status::{
 use axle_types::{zx_clock_t, zx_handle_t, zx_packet_user_t, zx_port_packet_t, zx_status_t};
 use axle_types::{zx_packet_signal_t, zx_signals_t};
 use spin::Mutex;
-
-const CSPACE_MAX_SLOTS: u16 = 16_384;
-const CSPACE_QUARANTINE_LEN: usize = 256;
-const DEFAULT_RIGHTS: u32 = u32::MAX;
-const DEFAULT_OBJECT_GENERATION: u32 = 0;
 
 const PORT_CAPACITY: usize = 64;
 const PORT_KERNEL_RESERVE: usize = 16;
@@ -51,7 +45,7 @@ enum KernelObject {
 
 #[derive(Debug)]
 struct KernelState {
-    cspace: CSpace,
+    kernel: crate::task::Kernel,
     objects: BTreeMap<u64, KernelObject>,
     next_object_id: u64,
     timers: TimerService,
@@ -60,7 +54,7 @@ struct KernelState {
 impl KernelState {
     fn new() -> Self {
         Self {
-            cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
+            kernel: crate::task::Kernel::bootstrap(),
             objects: BTreeMap::new(),
             next_object_id: 1,
             timers: TimerService::new(),
@@ -74,15 +68,19 @@ impl KernelState {
     }
 
     fn alloc_handle_for_object(&mut self, object_id: u64) -> Result<zx_handle_t, zx_status_t> {
-        let cap = Capability::new(object_id, DEFAULT_RIGHTS, DEFAULT_OBJECT_GENERATION);
-        let h = self.cspace.alloc(cap).map_err(map_alloc_error)?;
-        Ok(h.raw())
+        self.kernel.alloc_handle_for_current_process(object_id)
     }
 
     fn lookup_object_id(&self, raw: zx_handle_t) -> Result<u64, zx_status_t> {
-        let h = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
-        let cap = self.cspace.get(h).map_err(map_lookup_error)?;
-        Ok(cap.object_id())
+        self.kernel.lookup_current_object_id(raw)
+    }
+
+    fn close_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
+        self.kernel.close_current_handle(raw)
+    }
+
+    fn validate_current_user_ptr(&self, ptr: u64, len: usize) -> bool {
+        self.kernel.validate_current_user_ptr(ptr, len)
     }
 }
 
@@ -125,6 +123,15 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
             }
         }
     })
+}
+
+/// Validate a user pointer against the current thread's address-space policy.
+pub fn validate_current_user_ptr(ptr: u64, len: usize) -> bool {
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else {
+        return false;
+    };
+    state.validate_current_user_ptr(ptr, len)
 }
 
 /// Create a new Timer object and return a handle.
@@ -412,12 +419,7 @@ pub fn object_wait_async(
 /// This currently only updates CSpace state (slot free + tag bump).
 /// Object lifecycle finalization is deferred to later phases.
 pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
-    with_state_mut(|state| {
-        let h = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
-        let _ = state.cspace.get(h).map_err(map_lookup_error)?;
-        state.cspace.close(h).map_err(map_lookup_error)?;
-        Ok(())
-    })
+    with_state_mut(|state| state.close_handle(raw))
 }
 
 /// Called from the timer interrupt handler.
@@ -518,18 +520,6 @@ fn poll_due_timers_at(state: &mut KernelState, now: i64) -> alloc::vec::Vec<u64>
         }
     }
     out
-}
-
-fn map_alloc_error(err: CSpaceError) -> zx_status_t {
-    match err {
-        CSpaceError::NoSlots => ZX_ERR_NO_RESOURCES,
-        CSpaceError::Handle(_) => ZX_ERR_INTERNAL,
-        CSpaceError::BadHandle => ZX_ERR_BAD_HANDLE,
-    }
-}
-
-fn map_lookup_error(_err: CSpaceError) -> zx_status_t {
-    ZX_ERR_BAD_HANDLE
 }
 
 fn map_port_error(err: PortError) -> zx_status_t {

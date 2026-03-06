@@ -14,10 +14,11 @@ use x86_64::instructions::segmentation::Segment;
 
 // --- Userspace virtual layout (in current single-address-space model) ---
 
-const USER_REGION_BYTES: u64 = 0x3000;
-const USER_CODE_VA: u64 = 0x0000_0001_0000_0000; // 4 GiB
-const USER_SHARED_VA: u64 = USER_CODE_VA + 0x1000;
-const USER_STACK_VA: u64 = USER_CODE_VA + 0x2000;
+pub(crate) const USER_PAGE_BYTES: u64 = 0x1000;
+pub(crate) const USER_REGION_BYTES: u64 = 0x3000;
+pub(crate) const USER_CODE_VA: u64 = 0x0000_0001_0000_0000; // 4 GiB
+pub(crate) const USER_SHARED_VA: u64 = USER_CODE_VA + USER_PAGE_BYTES;
+pub(crate) const USER_STACK_VA: u64 = USER_CODE_VA + (2 * USER_PAGE_BYTES);
 const USER_STACK_TOP: u64 = USER_STACK_VA + 0x1000;
 
 // --- QEMU loader handoff for external userspace runner ELF ---
@@ -307,18 +308,7 @@ fn try_load_user_program_from_qemu_loader() -> Option<u64> {
 /// Bring-up rule: pointers must be fully contained within the mapped shared page
 /// or the mapped stack page (so the kernel never faults on bad pointers).
 pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
-    if len == 0 {
-        return false;
-    }
-    let len_u64 = len as u64;
-    let end = match ptr.checked_add(len_u64) {
-        Some(v) => v,
-        None => return false,
-    };
-
-    let in_shared = ptr >= USER_SHARED_VA && end <= (USER_SHARED_VA + 0x1000);
-    let in_stack = ptr >= USER_STACK_VA && end <= (USER_STACK_VA + 0x1000);
-    in_shared || in_stack
+    crate::object::validate_current_user_ptr(ptr, len)
 }
 
 fn shared_slots() -> &'static mut [u64] {

@@ -12,6 +12,7 @@ mod kalloc;
 mod object;
 mod smp;
 mod syscall;
+mod task;
 mod time;
 mod trap;
 mod userspace;
