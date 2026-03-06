@@ -150,6 +150,7 @@ fn copyin<T: Copy>(ptr: *const T) -> Result<T, zx_status_t> {
     if !crate::userspace::validate_user_ptr(ptr as u64, size_of::<T>()) {
         return Err(ZX_ERR_INVALID_ARGS);
     }
+    crate::userspace::ensure_user_range_resident(ptr as u64, size_of::<T>(), false)?;
     // SAFETY: pointer validated to be within a mapped userspace page region.
     unsafe { Ok(core::ptr::read_unaligned(ptr)) }
 }
@@ -161,6 +162,7 @@ fn copyout<T: Copy>(ptr: *mut T, v: T) -> Result<(), zx_status_t> {
     if !crate::userspace::validate_user_ptr(ptr as u64, size_of::<T>()) {
         return Err(ZX_ERR_INVALID_ARGS);
     }
+    crate::userspace::ensure_user_range_resident(ptr as u64, size_of::<T>(), true)?;
     // SAFETY: pointer validated to be within a mapped userspace page region.
     unsafe {
         core::ptr::write_unaligned(ptr, v);
@@ -178,6 +180,7 @@ fn copyin_bytes(ptr: *const u8, len: usize) -> Result<Vec<u8>, zx_status_t> {
     if !crate::userspace::validate_user_ptr(ptr as u64, len) {
         return Err(ZX_ERR_INVALID_ARGS);
     }
+    crate::userspace::ensure_user_range_resident(ptr as u64, len, false)?;
 
     let mut out = Vec::new();
     out.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
@@ -198,6 +201,7 @@ fn copyout_bytes(ptr: *mut u8, bytes: &[u8]) -> Result<(), zx_status_t> {
     if !crate::userspace::validate_user_ptr(ptr as u64, bytes.len()) {
         return Err(ZX_ERR_INVALID_ARGS);
     }
+    crate::userspace::ensure_user_range_resident(ptr as u64, bytes.len(), true)?;
     // SAFETY: the userspace range was validated above and `bytes` is a valid source slice.
     let dst = unsafe { slice::from_raw_parts_mut(ptr, bytes.len()) };
     dst.copy_from_slice(bytes);
@@ -218,6 +222,7 @@ fn copyout_loaned_bytes(
     if !crate::userspace::validate_user_ptr(ptr as u64, len) {
         return Err(ZX_ERR_INVALID_ARGS);
     }
+    crate::userspace::ensure_user_range_resident(ptr as u64, len, true)?;
 
     let page_size = crate::userspace::USER_PAGE_BYTES as usize;
     let page_count = len / page_size;

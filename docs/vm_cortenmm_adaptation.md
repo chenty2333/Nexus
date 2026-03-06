@@ -226,6 +226,12 @@ Axle 仍需要一层 frame/page descriptor 维护：
 - 再把 COW 从 `VMA.copy_on_write` 迁到页级 metadata
 - 最后再补 `not-present` fault 与 `LazyAnon`
 
+bootstrap 阶段还有一个实现细节需要明确：  
+由于当前仍是单地址空间 bring-up，kernel 自己对 user buffer 的 `copyin/copyout`
+不会带着 userspace `PF_USER` fault 语义回来。  
+因此在真正的多地址空间 fault-in 机制到位前，kernel 需要在直接访问 user range 前先做一次
+software prefault / ensure-resident，把 `LazyAnon` 页 materialize 掉，并在需要时先解 COW。
+
 ### PR5：page-loan 深化
 
 目标：

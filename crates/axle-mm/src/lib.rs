@@ -830,6 +830,25 @@ impl CowFaultResolution {
     }
 }
 
+/// Result of materializing one lazy anonymous page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LazyAnonFaultResolution {
+    fault_page_base: u64,
+    new_frame_id: FrameId,
+}
+
+impl LazyAnonFaultResolution {
+    /// Base virtual address of the materialized page.
+    pub const fn fault_page_base(self) -> u64 {
+        self.fault_page_base
+    }
+
+    /// Frame installed for the new anonymous page.
+    pub const fn new_frame_id(self) -> FrameId {
+        self.new_frame_id
+    }
+}
+
 /// Metadata-only address space with one root VMAR.
 #[derive(Debug)]
 pub struct AddressSpace {
@@ -977,6 +996,9 @@ impl AddressSpace {
             Some(_) => Ok(()),
             None => {
                 *slot = Some(frame_id);
+                let _ = slot;
+                let _ = vmo;
+                self.refresh_vmo_page_metadata(vmo_id, offset)?;
                 Ok(())
             }
         }
@@ -1175,6 +1197,54 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Materialize one lazy anonymous page by binding a newly allocated frame.
+    pub fn resolve_lazy_anon_fault(
+        &mut self,
+        frames: &mut FrameTable,
+        fault_va: u64,
+        new_frame_id: FrameId,
+    ) -> Result<LazyAnonFaultResolution, AddressSpaceError> {
+        if !frames.contains(new_frame_id) {
+            return Err(AddressSpaceError::InvalidFrame);
+        }
+
+        let page_base = align_down(fault_va, PAGE_SIZE);
+        let vma = self
+            .vmas
+            .iter()
+            .copied()
+            .find(|candidate| candidate.contains(page_base))
+            .ok_or(AddressSpaceError::NotFound)?;
+        let page_offset = vma.vmo_offset + (page_base - vma.base);
+        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        if vmo.kind() != VmoKind::Anonymous {
+            return Err(AddressSpaceError::NotFound);
+        }
+
+        let meta = self
+            .pte_meta(page_base)
+            .ok_or(AddressSpaceError::NotFound)?;
+        if meta.tag() != PteMetaTag::LazyAnon {
+            return Err(AddressSpaceError::NotFound);
+        }
+        if vmo.frame_at_offset(page_offset).is_some() {
+            return Err(AddressSpaceError::AlreadyBound);
+        }
+
+        frames
+            .inc_ref(new_frame_id)
+            .map_err(AddressSpaceError::FrameTable)?;
+        if let Err(err) = self.bind_vmo_frame(vma.vmo_id, page_offset, new_frame_id) {
+            let _ = frames.dec_ref(new_frame_id);
+            return Err(err);
+        }
+
+        Ok(LazyAnonFaultResolution {
+            fault_page_base: page_base,
+            new_frame_id,
+        })
+    }
+
     /// Resolve a write fault on a copy-on-write mapping by rebinding one page.
     pub fn resolve_cow_fault(
         &mut self,
@@ -1192,12 +1262,16 @@ impl AddressSpace {
             .position(|vma| vma.contains(fault_va))
             .ok_or(AddressSpaceError::NotFound)?;
         let vma = self.vmas[index];
-        if !vma.copy_on_write {
+        let page_base = align_down(fault_va, PAGE_SIZE);
+        let meta = self
+            .pte_meta(page_base)
+            .ok_or(AddressSpaceError::NotCopyOnWrite)?;
+        if !meta.cow_shared() || !meta.logical_write() || meta.tag() != PteMetaTag::Present {
             return Err(AddressSpaceError::NotCopyOnWrite);
         }
 
-        let page_base = align_down(fault_va, PAGE_SIZE);
         let page_offset = vma.vmo_offset + (page_base - vma.base);
+        let fault_page_delta = (page_offset - vma.vmo_offset) / PAGE_SIZE;
         let old_frame_id = self
             .vmo(vma.vmo_id)
             .and_then(|vmo| vmo.frame_at_offset(page_offset))
@@ -1223,9 +1297,17 @@ impl AddressSpace {
         let _ = vma;
         self.pte_meta
             .update_range(refresh_base, refresh_len, |meta| {
-                meta.logical_write = true;
-                meta.cow_shared = false;
+                if meta.page_delta == fault_page_delta {
+                    meta.logical_write = true;
+                    meta.cow_shared = false;
+                }
             })?;
+        let still_cow = self.mapping_has_cow_shared(refresh_base, refresh_len)?;
+        let vma = self
+            .vmas
+            .get_mut(index)
+            .ok_or(AddressSpaceError::NotFound)?;
+        vma.copy_on_write = still_cow;
 
         Ok(CowFaultResolution {
             fault_page_base: page_base,
@@ -1239,6 +1321,10 @@ impl AddressSpace {
         let vma = self.vmas.iter().copied().find(|vma| vma.contains(va))?;
         let vmo = self.vmo(vma.vmo_id)?;
         let resolved_offset = vma.vmo_offset + (va - vma.base);
+        let copy_on_write = self
+            .pte_meta(va)
+            .map(|meta| meta.cow_shared())
+            .unwrap_or(vma.copy_on_write);
         Some(VmaLookup {
             map_id: vma.map_id,
             vmar_id: self.root.id,
@@ -1249,7 +1335,7 @@ impl AddressSpace {
             frame_id: vmo.frame_at_offset(resolved_offset),
             perms: vma.perms,
             max_perms: vma.max_perms,
-            copy_on_write: vma.copy_on_write,
+            copy_on_write,
             mapping_base: vma.base,
             mapping_len: vma.len,
         })
@@ -1267,6 +1353,10 @@ impl AddressSpace {
             .find(|candidate| candidate.contains_range(base, len))?;
         let vmo = self.vmo(vma.vmo_id)?;
         let resolved_offset = vma.vmo_offset + (base - vma.base);
+        let copy_on_write = self
+            .pte_meta(base)
+            .map(|meta| meta.cow_shared())
+            .unwrap_or(vma.copy_on_write);
         Some(VmaLookup {
             map_id: vma.map_id,
             vmar_id: self.root.id,
@@ -1277,7 +1367,7 @@ impl AddressSpace {
             frame_id: vmo.frame_at_offset(resolved_offset),
             perms: vma.perms,
             max_perms: vma.max_perms,
-            copy_on_write: vma.copy_on_write,
+            copy_on_write,
             mapping_base: vma.base,
             mapping_len: vma.len,
         })
@@ -1319,6 +1409,54 @@ impl AddressSpace {
         let id = MapId(self.next_map_id);
         self.next_map_id = self.next_map_id.wrapping_add(1);
         id
+    }
+
+    fn refresh_vmo_page_metadata(
+        &mut self,
+        vmo_id: VmoId,
+        page_offset: u64,
+    ) -> Result<(), AddressSpaceError> {
+        if !is_page_aligned(page_offset) {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+        let vmo = self.vmo(vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        let tag = pte_meta_tag(vmo.kind(), vmo.frame_at_offset(page_offset));
+        let mut page_bases = Vec::new();
+        for vma in self
+            .vmas
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.vmo_id == vmo_id)
+        {
+            if page_offset < vma.vmo_offset || page_offset >= vma.vmo_offset + vma.len {
+                continue;
+            }
+            let page_delta = (page_offset - vma.vmo_offset) / PAGE_SIZE;
+            page_bases.push(vma.base + page_delta * PAGE_SIZE);
+        }
+        for page_base in page_bases {
+            if self.pte_meta(page_base).is_some() {
+                self.pte_meta
+                    .update_range(page_base, PAGE_SIZE, |meta| meta.tag = tag)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn mapping_has_cow_shared(&self, base: u64, len: u64) -> Result<bool, AddressSpaceError> {
+        validate_mapping_range(base, len)?;
+        let page_count =
+            usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
+        for page_index in 0..page_count {
+            let page_base = base + (page_index as u64) * PAGE_SIZE;
+            let meta = self
+                .pte_meta(page_base)
+                .ok_or(AddressSpaceError::NotFound)?;
+            if meta.cow_shared() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn build_pte_meta_range(&self, vma: Vma) -> Result<Vec<PteMeta>, AddressSpaceError> {
@@ -1369,6 +1507,9 @@ impl AddressSpace {
             .get_mut(page_index)
             .ok_or(AddressSpaceError::OutOfRange)?;
         *slot = Some(frame_id);
+        let _ = slot;
+        let _ = vmo;
+        self.refresh_vmo_page_metadata(vmo_id, offset)?;
         Ok(())
     }
 }
@@ -1425,6 +1566,7 @@ fn overlaps(vma: Vma, base: u64, len: u64) -> bool {
 fn pte_meta_tag(kind: VmoKind, frame_id: Option<FrameId>) -> PteMetaTag {
     match (kind, frame_id) {
         (VmoKind::Physical, Some(_)) => PteMetaTag::Phys,
+        (VmoKind::Anonymous, None) => PteMetaTag::LazyAnon,
         (_, Some(_)) => PteMetaTag::Present,
         _ => PteMetaTag::Reserved,
     }
@@ -1715,6 +1857,86 @@ mod tests {
                 tag: PteMetaTag::LazyAnon,
             }
         );
+    }
+
+    #[test]
+    fn resolve_lazy_anon_fault_materializes_page_and_updates_metadata() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let lazy = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(20))
+            .unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                lazy,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+        assert_eq!(
+            space.classify_page_fault(ROOT_BASE, PageFaultFlags::USER),
+            PageFaultDecision::NotPresent {
+                tag: PteMetaTag::LazyAnon,
+            }
+        );
+
+        let frame = frames.register_existing(0x90_000).unwrap();
+        let resolved = space
+            .resolve_lazy_anon_fault(&mut frames, ROOT_BASE + 0x10, frame)
+            .unwrap();
+
+        assert_eq!(resolved.fault_page_base(), ROOT_BASE);
+        assert_eq!(resolved.new_frame_id(), frame);
+        assert_eq!(space.lookup(ROOT_BASE).unwrap().frame_id(), Some(frame));
+        assert_eq!(
+            space.pte_meta(ROOT_BASE).unwrap().tag(),
+            PteMetaTag::Present
+        );
+        assert_eq!(frames.state(frame).unwrap().ref_count(), 1);
+    }
+
+    #[test]
+    fn lookup_reports_page_local_cow_state() {
+        let mut frames = FrameTable::new();
+        let left = frames.register_existing(0xa0_000).unwrap();
+        let right = frames.register_existing(0xb0_000).unwrap();
+        let replacement = frames.register_existing(0xc0_000).unwrap();
+
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE * 2, global_vmo_id(21))
+            .unwrap();
+        space.bind_vmo_frame(vmo, 0, left).unwrap();
+        space.bind_vmo_frame(vmo, PAGE_SIZE, right).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE * 2,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+        space.mark_copy_on_write(ROOT_BASE, PAGE_SIZE * 2).unwrap();
+
+        space
+            .resolve_cow_fault(&mut frames, ROOT_BASE + 0x80, replacement)
+            .unwrap();
+
+        assert!(!space.lookup(ROOT_BASE).unwrap().is_copy_on_write());
+        assert!(
+            space
+                .lookup(ROOT_BASE + PAGE_SIZE)
+                .unwrap()
+                .is_copy_on_write()
+        );
+        assert!(space.vmas()[0].is_copy_on_write());
     }
 
     #[test]

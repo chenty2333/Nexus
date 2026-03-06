@@ -628,16 +628,23 @@ pub fn validate_current_user_ptr(ptr: u64, len: usize) -> bool {
     state.validate_current_user_ptr(ptr, len)
 }
 
+/// Ensure the current thread's user range is resident before raw kernel access.
+pub fn ensure_current_user_range_resident(
+    ptr: u64,
+    len: usize,
+    for_write: bool,
+) -> Result<(), zx_status_t> {
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else {
+        return Err(ZX_ERR_BAD_STATE);
+    };
+    state
+        .kernel
+        .ensure_current_user_range_resident(ptr, len, for_write)
+}
+
 /// Try to resolve a bootstrap user-mode page fault.
 pub fn handle_page_fault(cr2: u64, error: u64) -> bool {
-    const PF_PRESENT: u64 = 1 << 0;
-    const PF_WRITE: u64 = 1 << 1;
-    const PF_USER: u64 = 1 << 2;
-
-    if (error & (PF_PRESENT | PF_WRITE | PF_USER)) != (PF_PRESENT | PF_WRITE | PF_USER) {
-        return false;
-    }
-
     let mut guard = STATE.lock();
     let Some(state) = guard.as_mut() else {
         return false;

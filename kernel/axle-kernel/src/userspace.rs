@@ -13,6 +13,7 @@
 extern crate alloc;
 
 use alloc::alloc::{Layout, alloc_zeroed};
+use axle_types::zx_status_t;
 use x86_64::instructions::segmentation::Segment;
 
 // --- Userspace virtual layout (in current single-address-space model) ---
@@ -551,6 +552,15 @@ fn try_load_user_program_from_qemu_loader() -> Option<u64> {
 /// or the mapped stack page (so the kernel never faults on bad pointers).
 pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     crate::object::validate_current_user_ptr(ptr, len)
+}
+
+/// Ensure a current-thread user range is resident before direct kernel access.
+pub fn ensure_user_range_resident(
+    ptr: u64,
+    len: usize,
+    for_write: bool,
+) -> Result<(), zx_status_t> {
+    crate::object::ensure_current_user_range_resident(ptr, len, for_write)
 }
 
 fn shared_slots() -> &'static mut [u64] {

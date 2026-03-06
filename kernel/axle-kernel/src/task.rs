@@ -19,8 +19,8 @@ use axle_core::handle::Handle;
 use axle_core::{CSpace, CSpaceError, Capability, RevocationManager, Signals};
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameId, FrameTable,
-    FutexKey, GlobalVmoId, MappingPerms, PageFaultDecision, PageFaultFlags, VmaLookup, Vmar,
-    VmarId, Vmo, VmoId, VmoKind,
+    FutexKey, GlobalVmoId, LazyAnonFaultResolution, MappingPerms, PageFaultDecision,
+    PageFaultFlags, PteMeta, PteMetaTag, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
 };
 use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor};
 use axle_types::rights::{
@@ -496,34 +496,23 @@ impl AddressSpace {
         self.vm.classify_page_fault(fault_va, flags)
     }
 
+    fn page_meta(&self, fault_va: u64) -> Option<PteMeta> {
+        self.vm.pte_meta(fault_va)
+    }
+
     fn root_vmar(&self) -> Vmar {
         self.vm.root_vmar()
     }
 
     fn create_anonymous_vmo(
         &mut self,
-        frames: &mut FrameTable,
+        _frames: &mut FrameTable,
         size: u64,
         global_vmo_id: KernelVmoId,
     ) -> Result<Vmo, AddressSpaceError> {
         let vmo_id = self
             .vm
             .create_vmo(VmoKind::Anonymous, size, global_vmo_id)?;
-        let page_count = usize::try_from(size / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| AddressSpaceError::InvalidArgs)?;
-        for page_index in 0..page_count {
-            let paddr = crate::userspace::alloc_bootstrap_zeroed_page().ok_or(
-                AddressSpaceError::FrameTable(axle_mm::FrameTableError::CountOverflow),
-            )?;
-            let frame_id = frames
-                .register_existing(paddr)
-                .map_err(AddressSpaceError::FrameTable)?;
-            self.vm.bind_vmo_frame(
-                vmo_id,
-                (page_index as u64) * crate::userspace::USER_PAGE_BYTES,
-                frame_id,
-            )?;
-        }
         self.vm
             .vmo(vmo_id)
             .cloned()
@@ -568,6 +557,16 @@ impl AddressSpace {
         new_frame_id: axle_mm::FrameId,
     ) -> Result<CowFaultResolution, AddressSpaceError> {
         self.vm.resolve_cow_fault(frames, fault_va, new_frame_id)
+    }
+
+    fn resolve_lazy_anon_fault(
+        &mut self,
+        frames: &mut FrameTable,
+        fault_va: u64,
+        new_frame_id: axle_mm::FrameId,
+    ) -> Result<LazyAnonFaultResolution, AddressSpaceError> {
+        self.vm
+            .resolve_lazy_anon_fault(frames, fault_va, new_frame_id)
     }
 
     fn arm_copy_on_write(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
@@ -783,6 +782,51 @@ impl Kernel {
             return false;
         };
         address_space.validate_user_ptr(ptr, len)
+    }
+
+    pub(crate) fn ensure_current_user_range_resident(
+        &mut self,
+        ptr: u64,
+        len: usize,
+        for_write: bool,
+    ) -> Result<(), zx_status_t> {
+        if len == 0 {
+            return Ok(());
+        }
+        if !self.validate_current_user_ptr(ptr, len) {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        let address_space_id = self.current_process()?.address_space_id;
+        let start = align_down_page(ptr);
+        let end = align_up_page(ptr.checked_add(len as u64).ok_or(ZX_ERR_OUT_OF_RANGE)?)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let mut page_va = start;
+        while page_va < end {
+            let meta = self
+                .address_spaces
+                .get(&address_space_id)
+                .and_then(|space| space.page_meta(page_va))
+                .ok_or(ZX_ERR_INVALID_ARGS)?;
+            if for_write && !meta.logical_write() {
+                return Err(ZX_ERR_ACCESS_DENIED);
+            }
+            match meta.tag() {
+                PteMetaTag::LazyAnon => {
+                    self.materialize_lazy_anon_page(address_space_id, page_va)?;
+                }
+                PteMetaTag::Present | PteMetaTag::Phys => {
+                    if for_write && meta.cow_shared() {
+                        self.resolve_copy_on_write_page(address_space_id, page_va)?;
+                    }
+                }
+                _ => return Err(ZX_ERR_BAD_STATE),
+            }
+            page_va = page_va
+                .checked_add(crate::userspace::USER_PAGE_BYTES)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        }
+        Ok(())
     }
 
     /// Resolve a current-thread userspace range back to its VMO mapping metadata.
@@ -1378,69 +1422,17 @@ impl Kernel {
             Some(space) => space.classify_user_page_fault(fault_va, flags),
             None => return false,
         };
-        if decision != PageFaultDecision::CopyOnWrite {
-            return false;
+        match decision {
+            PageFaultDecision::CopyOnWrite => self
+                .resolve_copy_on_write_page(address_space_id, fault_va)
+                .is_ok(),
+            PageFaultDecision::NotPresent {
+                tag: PteMetaTag::LazyAnon,
+            } => self
+                .materialize_lazy_anon_page(address_space_id, fault_va)
+                .is_ok(),
+            _ => false,
         }
-
-        let lookup = match self
-            .address_spaces
-            .get(&address_space_id)
-            .and_then(|space| space.lookup_user_mapping(fault_va, 1))
-        {
-            Some(lookup) => lookup,
-            None => return false,
-        };
-
-        let old_frame_id = match lookup.frame_id() {
-            Some(frame_id) => frame_id,
-            None => return false,
-        };
-
-        let new_frame_paddr = match crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw()) {
-            Some(paddr) => paddr,
-            None => return false,
-        };
-        let new_frame_id = match self.frames.register_existing(new_frame_paddr) {
-            Ok(frame_id) => frame_id,
-            Err(_) => return false,
-        };
-
-        let resolved = {
-            let Some(address_space) = self.address_spaces.get_mut(&address_space_id) else {
-                return false;
-            };
-            match address_space.resolve_cow_fault(&mut self.frames, fault_va, new_frame_id) {
-                Ok(resolution) => resolution,
-                Err(_) => return false,
-            }
-        };
-
-        let mut page_table = crate::page_table::BootstrapUserPageTable;
-        let range = match PageRange::new(
-            resolved.fault_page_base(),
-            crate::userspace::USER_PAGE_BYTES,
-        ) {
-            Ok(range) => range,
-            Err(_) => return false,
-        };
-        let mut tx = match page_table.lock(range) {
-            Ok(lock) => TxCursor::new(lock),
-            Err(_) => return false,
-        };
-        if tx
-            .map(
-                resolved.fault_page_base(),
-                crate::userspace::USER_PAGE_BYTES,
-                |_| PageMapping::new(new_frame_paddr, true),
-            )
-            .is_err()
-        {
-            return false;
-        }
-        if tx.commit().is_err() {
-            return false;
-        }
-        true
     }
 
     fn alloc_process_id(&mut self) -> ProcessId {
@@ -1558,33 +1550,95 @@ impl Kernel {
         base: u64,
         len: u64,
     ) -> Result<(), zx_status_t> {
-        let address_space = self
-            .address_spaces
-            .get(&address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        let mut page_table = crate::page_table::BootstrapUserPageTable;
-        let range = PageRange::new(base, len).map_err(map_page_table_error)?;
-        let mut tx = TxCursor::new(page_table.lock(range).map_err(map_page_table_error)?);
-        tx.map(base, len, |va| {
-            let lookup = address_space
-                .lookup_user_mapping(va, 1)
-                .ok_or(PageTableError::Backend)?;
-            let frame_id = lookup.frame_id().ok_or(PageTableError::Backend)?;
-            PageMapping::new(frame_id.raw(), lookup.perms().contains(MappingPerms::WRITE))
-        })
-        .map_err(map_page_table_error)?;
-        tx.commit().map_err(map_page_table_error)
+        self.sync_mapping_pages(address_space_id, base, len)
     }
 
     fn clear_mapping_pages(&self, base: u64, len: u64) -> Result<(), zx_status_t> {
         let mut page_table = crate::page_table::BootstrapUserPageTable;
         let range = PageRange::new(base, len).map_err(map_page_table_error)?;
         let mut tx = TxCursor::new(page_table.lock(range).map_err(map_page_table_error)?);
-        tx.unmap(base, len).map_err(map_page_table_error)?;
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        for page_index in 0..page_count {
+            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            if tx.query(va).map_err(map_page_table_error)?.is_some() {
+                tx.unmap(va, crate::userspace::USER_PAGE_BYTES)
+                    .map_err(map_page_table_error)?;
+            }
+        }
         tx.commit().map_err(map_page_table_error)
     }
 
     fn update_mapping_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
+        self.sync_mapping_pages(address_space_id, base, len)
+    }
+
+    fn resolve_copy_on_write_page(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        fault_va: u64,
+    ) -> Result<(), zx_status_t> {
+        let lookup = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.lookup_user_mapping(fault_va, 1))
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
+        let new_frame_paddr = crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw())
+            .ok_or(ZX_ERR_NO_MEMORY)?;
+        let new_frame_id = self
+            .frames
+            .register_existing(new_frame_paddr)
+            .map_err(|_| ZX_ERR_BAD_STATE)?;
+        let resolved = {
+            let address_space = self
+                .address_spaces
+                .get_mut(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            address_space
+                .resolve_cow_fault(&mut self.frames, fault_va, new_frame_id)
+                .map_err(map_address_space_error)?
+        };
+        self.sync_mapping_pages(
+            address_space_id,
+            resolved.fault_page_base(),
+            crate::userspace::USER_PAGE_BYTES,
+        )
+    }
+
+    fn materialize_lazy_anon_page(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        fault_va: u64,
+    ) -> Result<(), zx_status_t> {
+        let new_frame_paddr =
+            crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
+        let new_frame_id = self
+            .frames
+            .register_existing(new_frame_paddr)
+            .map_err(|_| ZX_ERR_BAD_STATE)?;
+        let resolved = {
+            let address_space = self
+                .address_spaces
+                .get_mut(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            address_space
+                .resolve_lazy_anon_fault(&mut self.frames, fault_va, new_frame_id)
+                .map_err(map_address_space_error)?
+        };
+        self.sync_mapping_pages(
+            address_space_id,
+            resolved.fault_page_base(),
+            crate::userspace::USER_PAGE_BYTES,
+        )
+    }
+
+    fn sync_mapping_pages(
         &self,
         address_space_id: AddressSpaceId,
         base: u64,
@@ -1597,13 +1651,31 @@ impl Kernel {
         let mut page_table = crate::page_table::BootstrapUserPageTable;
         let range = PageRange::new(base, len).map_err(map_page_table_error)?;
         let mut tx = TxCursor::new(page_table.lock(range).map_err(map_page_table_error)?);
-        tx.protect(base, len, |va| {
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        for page_index in 0..page_count {
+            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
             let lookup = address_space
                 .lookup_user_mapping(va, 1)
-                .ok_or(PageTableError::Backend)?;
-            Ok(lookup.perms().contains(MappingPerms::WRITE))
-        })
-        .map_err(map_page_table_error)?;
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            match lookup.frame_id() {
+                Some(frame_id) => {
+                    let mapping = PageMapping::new(
+                        frame_id.raw(),
+                        lookup.perms().contains(MappingPerms::WRITE),
+                    )
+                    .map_err(map_page_table_error)?;
+                    tx.map(va, crate::userspace::USER_PAGE_BYTES, |_| Ok(mapping))
+                        .map_err(map_page_table_error)?;
+                }
+                None => {
+                    if tx.query(va).map_err(map_page_table_error)?.is_some() {
+                        tx.unmap(va, crate::userspace::USER_PAGE_BYTES)
+                            .map_err(map_page_table_error)?;
+                    }
+                }
+            }
+        }
         tx.commit().map_err(map_page_table_error)
     }
 
@@ -1645,4 +1717,14 @@ fn map_page_table_error(err: PageTableError) -> zx_status_t {
         PageTableError::InvalidArgs => ZX_ERR_INVALID_ARGS,
         PageTableError::NotMapped | PageTableError::Backend => ZX_ERR_BAD_STATE,
     }
+}
+
+fn align_down_page(value: u64) -> u64 {
+    value & !(crate::userspace::USER_PAGE_BYTES - 1)
+}
+
+fn align_up_page(value: u64) -> Option<u64> {
+    value
+        .checked_add(crate::userspace::USER_PAGE_BYTES - 1)
+        .map(|rounded| rounded & !(crate::userspace::USER_PAGE_BYTES - 1))
 }
