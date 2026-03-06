@@ -75,17 +75,17 @@ struct ChannelMessage {
 #[derive(Debug)]
 struct ChannelEndpoint {
     peer_object_id: u64,
-    owner_address_space_id: u64,
+    owner_process_id: u64,
     messages: VecDeque<ChannelMessage>,
     peer_closed: bool,
     closed: bool,
 }
 
 impl ChannelEndpoint {
-    fn new(peer_object_id: u64, owner_address_space_id: u64) -> Self {
+    fn new(peer_object_id: u64, owner_process_id: u64) -> Self {
         Self {
             peer_object_id,
-            owner_address_space_id,
+            owner_process_id,
             messages: VecDeque::new(),
             peer_closed: false,
             closed: false,
@@ -442,19 +442,16 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
     }
 
     with_state_mut(|state| {
-        let owner_address_space_id = state.kernel.current_root_vmar()?.address_space_id();
+        let owner_process_id = state.kernel.current_process_info()?.process_id();
         let left_object_id = state.alloc_object_id();
         let right_object_id = state.alloc_object_id();
         state.objects.insert(
             left_object_id,
-            KernelObject::Channel(ChannelEndpoint::new(
-                right_object_id,
-                owner_address_space_id,
-            )),
+            KernelObject::Channel(ChannelEndpoint::new(right_object_id, owner_process_id)),
         );
         state.objects.insert(
             right_object_id,
-            KernelObject::Channel(ChannelEndpoint::new(left_object_id, owner_address_space_id)),
+            KernelObject::Channel(ChannelEndpoint::new(left_object_id, owner_process_id)),
         );
 
         let left_handle =
@@ -498,6 +495,15 @@ fn drain_channel_messages(
     for message in messages {
         release_channel_message(state, message);
     }
+}
+
+fn channel_endpoint_address_space_id(
+    state: &KernelState,
+    endpoint: &ChannelEndpoint,
+) -> Result<u64, zx_status_t> {
+    state
+        .kernel
+        .process_address_space_id(endpoint.owner_process_id)
 }
 
 pub(crate) fn try_loan_current_user_pages(
@@ -811,7 +817,7 @@ pub fn channel_write(
                 }
                 return Err(ZX_ERR_SHOULD_WAIT);
             }
-            peer.owner_address_space_id
+            channel_endpoint_address_space_id(state, peer)?
         };
 
         if let Some(ChannelPayload::Loaned(loaned)) = payload.as_mut()

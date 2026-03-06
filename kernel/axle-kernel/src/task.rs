@@ -1249,6 +1249,14 @@ impl Kernel {
         })
     }
 
+    /// Resolve the address space currently bound to `process_id`.
+    pub(crate) fn process_address_space_id(
+        &self,
+        process_id: ProcessId,
+    ) -> Result<AddressSpaceId, zx_status_t> {
+        Ok(self.process(process_id)?.address_space_id)
+    }
+
     pub(crate) fn create_current_anonymous_vmo(
         &mut self,
         size: u64,
@@ -1710,9 +1718,13 @@ impl Kernel {
             .ok_or(ZX_ERR_BAD_STATE)
     }
 
+    fn process(&self, process_id: ProcessId) -> Result<&Process, zx_status_t> {
+        self.processes.get(&process_id).ok_or(ZX_ERR_BAD_STATE)
+    }
+
     fn current_process(&self) -> Result<&Process, zx_status_t> {
         let process_id = self.current_thread()?.process_id;
-        self.processes.get(&process_id).ok_or(ZX_ERR_BAD_STATE)
+        self.process(process_id)
     }
 
     fn current_process_mut(&mut self) -> Result<&mut Process, zx_status_t> {
