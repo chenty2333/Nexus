@@ -170,6 +170,12 @@ Axle 仍需要一层 frame/page descriptor 维护：
 当前 `FrameTable` 已经有 `ref_count / pin_count`，自然的下一步是把它逐步演化成更接近
 `VmPageDesc` 的结构，而不是另起一套并行物理页元数据。
 
+当前实现状态（2026-03-07）：
+
+- `FrameTable` 已开始向 frame descriptor 形状演化
+- descriptor 现在显式暴露 `map_count`
+- `loan_count` / reverse-map anchor 已预留字段，但尚未驱动真实 loan/rmap 逻辑
+
 ### 4.5 TxCursor：唯一页表修改入口
 
 页表修改统一通过事务接口执行，例如：

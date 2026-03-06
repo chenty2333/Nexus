@@ -11,8 +11,7 @@
 //! - `Vmo` allocation and fixed mappings
 //! - coarse `MapRec` records for mapping control-plane identity
 //! - `VA -> (VMO, offset, perms, frame)` reverse lookup
-//! - bootstrap frame registration with mapping refcounts
-//! - frame pin / unpin accounting
+//! - bootstrap frame descriptors with ref / map / pin accounting
 //! - VMA-granular copy-on-write metadata and fault resolution
 //!
 //! It still does **not** manage page tables.
@@ -65,34 +64,55 @@ impl FrameId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FrameRecord {
+struct FrameDescRecord {
     id: FrameId,
     ref_count: u32,
+    map_count: u32,
     pin_count: u32,
+    loan_count: u32,
+    rmap_anchor: Option<ReverseMapAnchor>,
 }
 
-/// Snapshot of one frame's refcount and pin state.
+/// Snapshot of one frame descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrameState {
+pub struct FrameDesc {
     id: FrameId,
     ref_count: u32,
+    map_count: u32,
     pin_count: u32,
+    loan_count: u32,
+    rmap_anchor: Option<ReverseMapAnchor>,
 }
 
-impl FrameState {
+impl FrameDesc {
     /// Frame identifier.
     pub const fn id(self) -> FrameId {
         self.id
     }
 
-    /// Number of active mappings referencing this frame.
+    /// Total number of active references tracked for this frame.
     pub const fn ref_count(self) -> u32 {
         self.ref_count
+    }
+
+    /// Number of active mappings referencing this frame.
+    pub const fn map_count(self) -> u32 {
+        self.map_count
     }
 
     /// Number of active pins on this frame.
     pub const fn pin_count(self) -> u32 {
         self.pin_count
+    }
+
+    /// Number of active in-flight loans on this frame.
+    pub const fn loan_count(self) -> u32 {
+        self.loan_count
+    }
+
+    /// Reverse-mapping anchor reserved for future frame-to-mapping lookup.
+    pub const fn rmap_anchor(self) -> Option<ReverseMapAnchor> {
+        self.rmap_anchor
     }
 }
 
@@ -116,7 +136,7 @@ pub enum FrameTableError {
 /// Global physical-frame bookkeeping used by the bootstrap kernel.
 #[derive(Debug, Default)]
 pub struct FrameTable {
-    frames: Vec<FrameRecord>,
+    frames: Vec<FrameDescRecord>,
 }
 
 impl FrameTable {
@@ -134,10 +154,13 @@ impl FrameTable {
         if self.frames.iter().any(|frame| frame.id == id) {
             return Err(FrameTableError::AlreadyExists);
         }
-        self.frames.push(FrameRecord {
+        self.frames.push(FrameDescRecord {
             id,
             ref_count: 0,
+            map_count: 0,
             pin_count: 0,
+            loan_count: 0,
+            rmap_anchor: None,
         });
         Ok(id)
     }
@@ -147,20 +170,50 @@ impl FrameTable {
         self.frames.iter().any(|frame| frame.id == id)
     }
 
-    /// Snapshot the current state of one registered frame.
-    pub fn state(&self, id: FrameId) -> Option<FrameState> {
+    /// Snapshot the current descriptor state of one registered frame.
+    pub fn state(&self, id: FrameId) -> Option<FrameDesc> {
         self.frames
             .iter()
             .find(|frame| frame.id == id)
             .copied()
-            .map(|frame| FrameState {
+            .map(|frame| FrameDesc {
                 id: frame.id,
                 ref_count: frame.ref_count,
+                map_count: frame.map_count,
                 pin_count: frame.pin_count,
+                loan_count: frame.loan_count,
+                rmap_anchor: frame.rmap_anchor,
             })
     }
 
-    /// Increment the mapping refcount for a registered frame.
+    /// Increment the mapping count and total refcount for a registered frame.
+    pub fn inc_map(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+        let frame = self.frame_mut(id)?;
+        let map_count = frame
+            .map_count
+            .checked_add(1)
+            .ok_or(FrameTableError::CountOverflow)?;
+        let ref_count = frame
+            .ref_count
+            .checked_add(1)
+            .ok_or(FrameTableError::CountOverflow)?;
+        frame.map_count = map_count;
+        frame.ref_count = ref_count;
+        Ok(())
+    }
+
+    /// Decrement the mapping count and total refcount for a registered frame.
+    pub fn dec_map(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+        let frame = self.frame_mut(id)?;
+        if frame.map_count == 0 || frame.ref_count == 0 {
+            return Err(FrameTableError::RefUnderflow);
+        }
+        frame.map_count -= 1;
+        frame.ref_count -= 1;
+        Ok(())
+    }
+
+    /// Increment the total refcount for a registered frame.
     pub fn inc_ref(&mut self, id: FrameId) -> Result<(), FrameTableError> {
         let frame = self.frame_mut(id)?;
         frame.ref_count = frame
@@ -170,7 +223,7 @@ impl FrameTable {
         Ok(())
     }
 
-    /// Decrement the mapping refcount for a registered frame.
+    /// Decrement the total refcount for a registered frame.
     pub fn dec_ref(&mut self, id: FrameId) -> Result<(), FrameTableError> {
         let frame = self.frame_mut(id)?;
         if frame.ref_count == 0 {
@@ -200,7 +253,7 @@ impl FrameTable {
         Ok(())
     }
 
-    fn frame_mut(&mut self, id: FrameId) -> Result<&mut FrameRecord, FrameTableError> {
+    fn frame_mut(&mut self, id: FrameId) -> Result<&mut FrameDescRecord, FrameTableError> {
         self.frames
             .iter_mut()
             .find(|frame| frame.id == id)
@@ -254,6 +307,25 @@ impl MapId {
     /// Raw numeric id.
     pub const fn raw(self) -> u64 {
         self.0
+    }
+}
+
+/// Future frame-to-mapping reverse-lookup anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReverseMapAnchor {
+    map_id: MapId,
+    page_delta: u64,
+}
+
+impl ReverseMapAnchor {
+    /// Mapping record owning the anchor.
+    pub const fn map_id(self) -> MapId {
+        self.map_id
+    }
+
+    /// Page index within the mapping record.
+    pub const fn page_delta(self) -> u64 {
+        self.page_delta
     }
 }
 
@@ -1058,9 +1130,9 @@ impl AddressSpace {
 
         let mut incremented = Vec::with_capacity(bound_frames.len());
         for frame_id in bound_frames.iter().copied() {
-            if let Err(err) = frames.inc_ref(frame_id) {
+            if let Err(err) = frames.inc_map(frame_id) {
                 for rollback in incremented {
-                    let _ = frames.dec_ref(rollback);
+                    let _ = frames.dec_map(rollback);
                 }
                 return Err(AddressSpaceError::FrameTable(err));
             }
@@ -1093,14 +1165,14 @@ impl AddressSpace {
             Ok(page_meta) => page_meta,
             Err(err) => {
                 for rollback in incremented {
-                    let _ = frames.dec_ref(rollback);
+                    let _ = frames.dec_map(rollback);
                 }
                 return Err(err);
             }
         };
         if let Err(err) = self.pte_meta.install_range(base, &page_meta) {
             for rollback in incremented {
-                let _ = frames.dec_ref(rollback);
+                let _ = frames.dec_map(rollback);
             }
             return Err(err);
         }
@@ -1130,13 +1202,13 @@ impl AddressSpace {
             let state = frames
                 .state(frame_id)
                 .ok_or(AddressSpaceError::InvalidFrame)?;
-            if state.ref_count() == 0 {
+            if state.map_count() == 0 || state.ref_count() == 0 {
                 return Err(AddressSpaceError::FrameTable(FrameTableError::RefUnderflow));
             }
         }
         for frame_id in bound_frames {
             frames
-                .dec_ref(frame_id)
+                .dec_map(frame_id)
                 .map_err(AddressSpaceError::FrameTable)?;
         }
         let removed = self.vmas.remove(index);
@@ -1232,10 +1304,10 @@ impl AddressSpace {
         }
 
         frames
-            .inc_ref(new_frame_id)
+            .inc_map(new_frame_id)
             .map_err(AddressSpaceError::FrameTable)?;
         if let Err(err) = self.bind_vmo_frame(vma.vmo_id, page_offset, new_frame_id) {
-            let _ = frames.dec_ref(new_frame_id);
+            let _ = frames.dec_map(new_frame_id);
             return Err(err);
         }
 
@@ -1278,10 +1350,10 @@ impl AddressSpace {
             .ok_or(AddressSpaceError::InvalidFrame)?;
 
         frames
-            .inc_ref(new_frame_id)
+            .inc_map(new_frame_id)
             .map_err(AddressSpaceError::FrameTable)?;
-        if let Err(err) = frames.dec_ref(old_frame_id) {
-            let _ = frames.dec_ref(new_frame_id);
+        if let Err(err) = frames.dec_map(old_frame_id) {
+            let _ = frames.dec_map(new_frame_id);
             return Err(AddressSpaceError::FrameTable(err));
         }
 
@@ -1372,9 +1444,9 @@ impl AddressSpace {
             if old_frame_id == Some(new_frame_id) {
                 continue;
             }
-            if let Err(err) = frames.inc_ref(new_frame_id) {
+            if let Err(err) = frames.inc_map(new_frame_id) {
                 for rollback in incremented {
-                    let _ = frames.dec_ref(rollback);
+                    let _ = frames.dec_map(rollback);
                 }
                 return Err(AddressSpaceError::FrameTable(err));
             }
@@ -1389,7 +1461,7 @@ impl AddressSpace {
                 continue;
             }
             frames
-                .dec_ref(old_frame_id)
+                .dec_map(old_frame_id)
                 .map_err(AddressSpaceError::FrameTable)?;
         }
 
@@ -1753,6 +1825,7 @@ mod tests {
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::EXECUTE | MappingPerms::USER
         );
         assert_eq!(frames.state(code_frame).unwrap().ref_count(), 1);
+        assert_eq!(frames.state(code_frame).unwrap().map_count(), 1);
     }
 
     #[test]
@@ -1861,6 +1934,7 @@ mod tests {
         space.unmap(&mut frames, data_base, PAGE_SIZE).unwrap();
         assert!(space.lookup(data_base).is_none());
         assert_eq!(frames.state(data_frame).unwrap().ref_count(), 0);
+        assert_eq!(frames.state(data_frame).unwrap().map_count(), 0);
     }
 
     #[test]
@@ -1996,6 +2070,7 @@ mod tests {
             PteMetaTag::Present
         );
         assert_eq!(frames.state(frame).unwrap().ref_count(), 1);
+        assert_eq!(frames.state(frame).unwrap().map_count(), 1);
     }
 
     #[test]
@@ -2036,7 +2111,9 @@ mod tests {
         assert!(meta.cow_shared());
 
         assert_eq!(frames.state(original).unwrap().ref_count(), 0);
+        assert_eq!(frames.state(original).unwrap().map_count(), 0);
         assert_eq!(frames.state(shared).unwrap().ref_count(), 1);
+        assert_eq!(frames.state(shared).unwrap().map_count(), 1);
     }
 
     #[test]
@@ -2102,7 +2179,9 @@ mod tests {
         assert!(after.perms().contains(MappingPerms::WRITE));
         assert!(!after.is_copy_on_write());
         assert_eq!(frames.state(data_frame).unwrap().ref_count(), 0);
+        assert_eq!(frames.state(data_frame).unwrap().map_count(), 0);
         assert_eq!(frames.state(replacement).unwrap().ref_count(), 1);
+        assert_eq!(frames.state(replacement).unwrap().map_count(), 1);
     }
 
     #[test]
@@ -2139,6 +2218,33 @@ mod tests {
         frames.unpin(frame).unwrap();
         assert_eq!(frames.state(frame).unwrap().pin_count(), 0);
         assert_eq!(frames.unpin(frame), Err(FrameTableError::PinUnderflow));
+    }
+
+    #[test]
+    fn frame_desc_tracks_map_count_and_placeholders() {
+        let mut frames = FrameTable::new();
+        let frame = frames.register_existing(0xd0_000).unwrap();
+
+        let initial = frames.state(frame).unwrap();
+        assert_eq!(initial.ref_count(), 0);
+        assert_eq!(initial.map_count(), 0);
+        assert_eq!(initial.loan_count(), 0);
+        assert_eq!(initial.rmap_anchor(), None);
+
+        frames.inc_map(frame).unwrap();
+        frames.inc_map(frame).unwrap();
+        let mapped = frames.state(frame).unwrap();
+        assert_eq!(mapped.ref_count(), 2);
+        assert_eq!(mapped.map_count(), 2);
+        assert_eq!(mapped.loan_count(), 0);
+        assert_eq!(mapped.rmap_anchor(), None);
+
+        frames.dec_map(frame).unwrap();
+        frames.dec_map(frame).unwrap();
+        let unmapped = frames.state(frame).unwrap();
+        assert_eq!(unmapped.ref_count(), 0);
+        assert_eq!(unmapped.map_count(), 0);
+        assert_eq!(frames.dec_map(frame), Err(FrameTableError::RefUnderflow));
     }
 
     #[test]
@@ -2180,10 +2286,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(frames.state(shared).unwrap().ref_count(), 2);
+        assert_eq!(frames.state(shared).unwrap().map_count(), 2);
         right
             .unmap(&mut frames, ROOT_BASE + PAGE_SIZE, PAGE_SIZE)
             .unwrap();
         assert_eq!(frames.state(shared).unwrap().ref_count(), 1);
+        assert_eq!(frames.state(shared).unwrap().map_count(), 1);
     }
 
     proptest! {
