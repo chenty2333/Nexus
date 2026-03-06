@@ -1,0 +1,30 @@
+id = "kernel.channel.writable_recovery_bootstrap"
+description = "Bootstrap channel WRITABLE tracks peer queue pressure and peer close transitions"
+tags = ["module:channel", "module:kernel", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.channel.writable_recovery_bootstrap"]
+
+[assertions.status_code]
+channel_writable_recovery_create = 0
+channel_writable_recovery_fill = 0
+channel_writable_recovery_read = 0
+channel_writable_recovery_wait_restored = 0
+channel_writable_recovery_close = 0
+channel_writable_recovery_wait_closed = 0
+
+[assertions.error_code]
+channel_writable_recovery_full_write = -22
+channel_writable_recovery_wait_full = -21
+channel_writable_recovery_write_closed = -24
+
+[assertions.packet_fields]
+channel_writable_recovery_wait_full_observed = 0
+channel_writable_recovery_wait_restored_observed = 2
+channel_writable_recovery_wait_closed_observed = 4

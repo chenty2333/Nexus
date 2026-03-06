@@ -487,6 +487,219 @@ channel_compare_done:
 	mov 0x770(%rbx), %rax
 	mov %rax, 8*95(%rbx)
 
+	// channel_create(close/read ordering)
+	lea 0xC00(%rbx), %rsi
+	lea 0xC08(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $13, %rax
+	int $0x80
+	mov %rax, 8*318(%rbx)
+
+	// tx bytes @ 0x920
+	movabs $0x0102030405060708, %rax
+	mov %rax, 0xC20(%rbx)
+
+	// channel_write(h2 -> h3)
+	mov 0xC00(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0xC20(%rbx), %rdx
+	movl $8, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*319(%rbx)
+
+	// close sender h2 while receiver still has one unread message
+	mov 0xC00(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+	mov %rax, 8*320(%rbx)
+
+	// wait_one(h3, CHANNEL_READABLE | CHANNEL_PEER_CLOSED)
+	lea 0xC30(%rbx), %r10
+	movq $0, 0xC30(%rbx)
+	mov 0xC08(%rbx), %rdi
+	movl $0x5, %esi
+	xorl %edx, %edx
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*321(%rbx)
+	mov 0xC30(%rbx), %rax
+	mov %rax, 8*322(%rbx)
+
+	// channel_read(h3) should still return the queued message
+	movq $0, 0xC50(%rbx)
+	movq $0, 0xC58(%rbx)
+	mov 0xC08(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0xC40(%rbx), %rdx
+	xorl %r10d, %r10d
+	movl $8, %r8d
+	xorl %r9d, %r9d
+	lea 0xC50(%rbx), %rax
+	lea 0xC58(%rbx), %rcx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rcx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	mov %rax, 8*323(%rbx)
+	mov 0xC50(%rbx), %rax
+	mov %rax, 8*324(%rbx)
+	movq $0, 8*325(%rbx)
+	mov 0xC20(%rbx), %rax
+	mov 0xC40(%rbx), %rcx
+	cmp %rax, %rcx
+	jne channel_close_read_compare_done
+	movq $1, 8*325(%rbx)
+channel_close_read_compare_done:
+
+	// After draining the queue, only CHANNEL_PEER_CLOSED should remain.
+	lea 0xC60(%rbx), %r10
+	movq $0, 0xC60(%rbx)
+	mov 0xC08(%rbx), %rdi
+	movl $0x4, %esi
+	xorl %edx, %edx
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*326(%rbx)
+	mov 0xC60(%rbx), %rax
+	mov %rax, 8*327(%rbx)
+
+	// channel_read(peer closed on drained h3)
+	movq $0, 0xC50(%rbx)
+	movq $0, 0xC58(%rbx)
+	mov 0xC08(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0xC40(%rbx), %rdx
+	xorl %r10d, %r10d
+	movl $8, %r8d
+	xorl %r9d, %r9d
+	lea 0xC50(%rbx), %rax
+	lea 0xC58(%rbx), %rcx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rcx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	mov %rax, 8*328(%rbx)
+
+	// channel_create(writable recovery)
+	lea 0xC70(%rbx), %rsi
+	lea 0xC78(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $13, %rax
+	int $0x80
+	mov %rax, 8*329(%rbx)
+
+	// tx bytes @ 0x990
+	movabs $0x0f1e2d3c4b5a6978, %rax
+	mov %rax, 0xC90(%rbx)
+
+	// Fill the peer queue to CHANNEL_CAPACITY.
+	movq $64, 0xC88(%rbx)
+channel_writable_fill_loop:
+	mov 0xC88(%rbx), %rax
+	test %rax, %rax
+	jz channel_writable_fill_done
+	mov 0xC70(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0xC90(%rbx), %rdx
+	movl $8, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*330(%rbx)
+	decq 0xC88(%rbx)
+	jmp channel_writable_fill_loop
+channel_writable_fill_done:
+
+	// The next write should observe backpressure and fail with SHOULD_WAIT.
+	mov 0xC70(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0xC90(%rbx), %rdx
+	movl $8, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*331(%rbx)
+
+	// wait_one(h4, CHANNEL_WRITABLE) should time out while the peer queue is full.
+	lea 0xCA0(%rbx), %r10
+	movq $0, 0xCA0(%rbx)
+	mov 0xC70(%rbx), %rdi
+	movl $0x2, %esi
+	xorl %edx, %edx
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*332(%rbx)
+	mov 0xCA0(%rbx), %rax
+	mov %rax, 8*333(%rbx)
+
+	// channel_read(h5) frees one slot in the peer queue.
+	movq $0, 0xCC0(%rbx)
+	movq $0, 0xCC8(%rbx)
+	mov 0xC78(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0xCB0(%rbx), %rdx
+	xorl %r10d, %r10d
+	movl $8, %r8d
+	xorl %r9d, %r9d
+	lea 0xCC0(%rbx), %rax
+	lea 0xCC8(%rbx), %rcx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rcx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	mov %rax, 8*334(%rbx)
+
+	// wait_one(h4, CHANNEL_WRITABLE) should now succeed.
+	lea 0xCD0(%rbx), %r10
+	movq $0, 0xCD0(%rbx)
+	mov 0xC70(%rbx), %rdi
+	movl $0x2, %esi
+	xorl %edx, %edx
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*335(%rbx)
+	mov 0xCD0(%rbx), %rax
+	mov %rax, 8*336(%rbx)
+
+	// Closing the peer should leave only CHANNEL_PEER_CLOSED visible.
+	mov 0xC78(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+	mov %rax, 8*337(%rbx)
+
+	lea 0xCE0(%rbx), %r10
+	movq $0, 0xCE0(%rbx)
+	mov 0xC70(%rbx), %rdi
+	movl $0x6, %esi
+	xorl %edx, %edx
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*338(%rbx)
+	mov 0xCE0(%rbx), %rax
+	mov %rax, 8*339(%rbx)
+
+	// Further writes should fail with ZX_ERR_PEER_CLOSED, not SHOULD_WAIT.
+	mov 0xC70(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0xC90(%rbx), %rdx
+	movl $8, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*340(%rbx)
+
 	// eventpair_create(bad opts=1)
 	lea 0x780(%rbx), %rsi
 	lea 0x788(%rbx), %rdx
@@ -681,6 +894,31 @@ channel_compare_done:
 	jne channel_loan_snapshot_done
 	movq $1, 8*117(%rbx)
 channel_loan_snapshot_done:
+
+	// remap-fill COW check: receiver write should split privately without corrupting sender
+	mov 8*316(%rbx), %rax
+	mov %rax, 0x7e0(%rbx)
+	movabs $0x5566778899aabbcc, %rax
+	movabs $0x0000000100012000, %rcx
+	mov %rax, 0x0(%rcx)
+	movq $0, 8*317(%rbx)
+	mov 0x7e0(%rbx), %r8
+	mov 8*316(%rbx), %r9
+	lea 1(%r8), %r10
+	cmp %r10, %r9
+	jne channel_loan_remap_cow_done
+	movabs $0x0000000100011000, %rsi
+	movabs $0x0000000100012000, %rdi
+	mov (%rsi), %r8
+	mov (%rdi), %r9
+	movabs $0x8899aabbccddeeff, %rax
+	cmp %rax, %r8
+	jne channel_loan_remap_cow_done
+	movabs $0x5566778899aabbcc, %rax
+	cmp %rax, %r9
+	jne channel_loan_remap_cow_done
+	movq $1, 8*317(%rbx)
+channel_loan_remap_cow_done:
 
 	// port_wait(wrong type: handle=timer_h)
 	mov 0x698(%rbx), %rdi

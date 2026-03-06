@@ -801,6 +801,7 @@ pub(crate) struct Kernel {
     futexes: crate::futex::FutexTable,
     run_queue: VecDeque<ThreadId>,
     revocations: RevocationManager,
+    cow_fault_count: u64,
     next_koid: zx_koid_t,
     next_global_vmo_id: u64,
     next_process_id: ProcessId,
@@ -821,6 +822,7 @@ impl Kernel {
             futexes: crate::futex::FutexTable::new(),
             run_queue: VecDeque::new(),
             revocations: RevocationManager::new(),
+            cow_fault_count: 0,
             next_koid: 1,
             next_global_vmo_id: 1,
             next_process_id: 1,
@@ -1922,7 +1924,10 @@ impl Kernel {
             address_space_id,
             resolved.fault_page_base(),
             crate::userspace::USER_PAGE_BYTES,
-        )
+        )?;
+        self.cow_fault_count = self.cow_fault_count.wrapping_add(1);
+        crate::userspace::record_vm_cow_fault_count(self.cow_fault_count);
+        Ok(())
     }
 
     fn materialize_lazy_anon_page(
