@@ -15,20 +15,87 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 
 use axle_core::handle::Handle;
-use axle_core::{CSpace, CSpaceError, Capability};
+use axle_core::{CSpace, CSpaceError, Capability, RevocationManager};
 use axle_types::status::{
-    ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NO_RESOURCES,
+    ZX_ERR_ACCESS_DENIED, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NO_RESOURCES,
 };
 use axle_types::{zx_handle_t, zx_status_t};
+use bitflags::bitflags;
 
 const CSPACE_MAX_SLOTS: u16 = 16_384;
 const CSPACE_QUARANTINE_LEN: usize = 256;
-const DEFAULT_RIGHTS: u32 = u32::MAX;
-const DEFAULT_OBJECT_GENERATION: u32 = 0;
 
 type ProcessId = u64;
 type ThreadId = u64;
 type AddressSpaceId = u64;
+
+bitflags! {
+    /// Internal handle-rights model used by the bootstrap kernel.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct HandleRights: u32 {
+        const DUPLICATE = 1 << 0;
+        const TRANSFER = 1 << 1;
+        const WAIT = 1 << 2;
+        const READ = 1 << 3;
+        const WRITE = 1 << 4;
+        const SIGNAL = 1 << 5;
+    }
+}
+
+/// Full handle-resolution result used by the kernel object layer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolvedHandle {
+    process_id: ProcessId,
+    slot_index: u16,
+    slot_tag: u16,
+    object_id: u64,
+    rights: HandleRights,
+    object_generation: u32,
+}
+
+impl ResolvedHandle {
+    fn new(process_id: ProcessId, handle: Handle, cap: Capability) -> Result<Self, zx_status_t> {
+        let (slot_index, slot_tag) = handle.decode().map_err(|_| ZX_ERR_BAD_HANDLE)?;
+        Ok(Self {
+            process_id,
+            slot_index,
+            slot_tag,
+            object_id: cap.object_id(),
+            rights: HandleRights::from_bits_retain(cap.rights()),
+            object_generation: cap.generation(),
+        })
+    }
+
+    /// Owning process id.
+    pub(crate) const fn process_id(self) -> u64 {
+        self.process_id
+    }
+
+    /// CSpace slot index encoded in the handle.
+    pub(crate) const fn slot_index(self) -> u16 {
+        self.slot_index
+    }
+
+    /// CSpace slot ABA tag encoded in the handle.
+    pub(crate) const fn slot_tag(self) -> u16 {
+        self.slot_tag
+    }
+
+    /// Target object id from the resolved capability.
+    pub(crate) const fn object_id(self) -> u64 {
+        self.object_id
+    }
+
+    /// Rights bits carried by the resolved capability.
+    pub(crate) const fn rights(self) -> HandleRights {
+        self.rights
+    }
+
+    /// Capability generation carried by the resolved capability.
+    pub(crate) const fn object_generation(self) -> u32 {
+        self.object_generation
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct UserCopyRegion {
@@ -97,16 +164,23 @@ impl Process {
         }
     }
 
-    fn alloc_handle_for_object(&mut self, object_id: u64) -> Result<zx_handle_t, zx_status_t> {
-        let cap = Capability::new(object_id, DEFAULT_RIGHTS, DEFAULT_OBJECT_GENERATION);
+    fn alloc_handle_for_capability(&mut self, cap: Capability) -> Result<zx_handle_t, zx_status_t> {
         let handle = self.cspace.alloc(cap).map_err(map_alloc_error)?;
         Ok(handle.raw())
     }
 
-    fn lookup_object_id(&self, raw: zx_handle_t) -> Result<u64, zx_status_t> {
+    fn lookup_handle(
+        &self,
+        process_id: ProcessId,
+        raw: zx_handle_t,
+        revocations: &RevocationManager,
+    ) -> Result<ResolvedHandle, zx_status_t> {
         let handle = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
-        let cap = self.cspace.get(handle).map_err(map_lookup_error)?;
-        Ok(cap.object_id())
+        let cap = self
+            .cspace
+            .get_checked(handle, revocations)
+            .map_err(map_lookup_error)?;
+        ResolvedHandle::new(process_id, handle, cap)
     }
 
     fn close_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
@@ -128,6 +202,7 @@ pub(crate) struct Kernel {
     processes: BTreeMap<ProcessId, Process>,
     threads: BTreeMap<ThreadId, Thread>,
     address_spaces: BTreeMap<AddressSpaceId, AddressSpace>,
+    revocations: RevocationManager,
     next_process_id: ProcessId,
     next_thread_id: ThreadId,
     next_address_space_id: AddressSpaceId,
@@ -141,6 +216,7 @@ impl Kernel {
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
             address_spaces: BTreeMap::new(),
+            revocations: RevocationManager::new(),
             next_process_id: 1,
             next_thread_id: 1,
             next_address_space_id: 1,
@@ -165,14 +241,25 @@ impl Kernel {
 
     pub(crate) fn alloc_handle_for_current_process(
         &mut self,
-        object_id: u64,
+        cap: Capability,
     ) -> Result<zx_handle_t, zx_status_t> {
-        self.current_process_mut()?
-            .alloc_handle_for_object(object_id)
+        self.current_process_mut()?.alloc_handle_for_capability(cap)
     }
 
-    pub(crate) fn lookup_current_object_id(&self, raw: zx_handle_t) -> Result<u64, zx_status_t> {
-        self.current_process()?.lookup_object_id(raw)
+    /// Resolve the current process's handle into full capability metadata.
+    pub(crate) fn lookup_current_handle(
+        &self,
+        raw: zx_handle_t,
+        required_rights: HandleRights,
+    ) -> Result<ResolvedHandle, zx_status_t> {
+        let process_id = self.current_thread()?.process_id;
+        let resolved = self
+            .current_process()?
+            .lookup_handle(process_id, raw, &self.revocations)?;
+        if !resolved.rights().contains(required_rights) {
+            return Err(ZX_ERR_ACCESS_DENIED);
+        }
+        Ok(resolved)
     }
 
     pub(crate) fn close_current_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {

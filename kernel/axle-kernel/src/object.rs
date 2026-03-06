@@ -5,15 +5,14 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 
 use axle_core::{
-    Packet, PacketKind, Port, PortError, Signals, TimerError, TimerId, TimerService,
+    Capability, Packet, PacketKind, Port, PortError, Signals, TimerError, TimerId, TimerService,
     WaitAsyncOptions,
 };
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
 use axle_types::status::{
-    ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL,
-    ZX_ERR_INVALID_ARGS, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND, ZX_ERR_SHOULD_WAIT,
-    ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE, ZX_OK,
+    ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INVALID_ARGS,
+    ZX_ERR_NOT_FOUND, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE, ZX_OK,
 };
 use axle_types::{zx_clock_t, zx_handle_t, zx_packet_user_t, zx_port_packet_t, zx_status_t};
 use axle_types::{zx_packet_signal_t, zx_signals_t};
@@ -21,6 +20,7 @@ use spin::Mutex;
 
 const PORT_CAPACITY: usize = 64;
 const PORT_KERNEL_RESERVE: usize = 16;
+const DEFAULT_OBJECT_GENERATION: u32 = 0;
 
 /// Kernel object kinds needed in current phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,12 +67,21 @@ impl KernelState {
         id
     }
 
-    fn alloc_handle_for_object(&mut self, object_id: u64) -> Result<zx_handle_t, zx_status_t> {
-        self.kernel.alloc_handle_for_current_process(object_id)
+    fn alloc_handle_for_object(
+        &mut self,
+        object_id: u64,
+        rights: crate::task::HandleRights,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        let cap = Capability::new(object_id, rights.bits(), DEFAULT_OBJECT_GENERATION);
+        self.kernel.alloc_handle_for_current_process(cap)
     }
 
-    fn lookup_object_id(&self, raw: zx_handle_t) -> Result<u64, zx_status_t> {
-        self.kernel.lookup_current_object_id(raw)
+    fn lookup_handle(
+        &self,
+        raw: zx_handle_t,
+        required_rights: crate::task::HandleRights,
+    ) -> Result<crate::task::ResolvedHandle, zx_status_t> {
+        self.kernel.lookup_current_handle(raw, required_rights)
     }
 
     fn close_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
@@ -115,7 +124,7 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
             KernelObject::Port(Port::new(PORT_CAPACITY, PORT_KERNEL_RESERVE)),
         );
 
-        match state.alloc_handle_for_object(object_id) {
+        match state.alloc_handle_for_object(object_id, port_default_rights()) {
             Ok(h) => Ok(h),
             Err(e) => {
                 let _ = state.objects.remove(&object_id);
@@ -151,7 +160,7 @@ pub fn create_timer(options: u32, clock_id: zx_clock_t) -> Result<zx_handle_t, z
             KernelObject::Timer(TimerObject { timer_id, clock_id }),
         );
 
-        match state.alloc_handle_for_object(object_id) {
+        match state.alloc_handle_for_object(object_id, timer_default_rights()) {
             Ok(h) => Ok(h),
             Err(e) => {
                 let _ = state.objects.remove(&object_id);
@@ -176,12 +185,14 @@ pub fn ensure_timer_handle(handle: zx_handle_t) -> Result<(), zx_status_t> {
 /// Arm or re-arm a timer.
 pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
-        let object_id = state.lookup_object_id(handle)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let object_id = resolved.object_id();
         let timer_id = match state.objects.get(&object_id) {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
             Some(KernelObject::Port(_)) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
+        require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
 
         state
             .timers
@@ -205,12 +216,14 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
 /// Cancel a timer.
 pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
-        let object_id = state.lookup_object_id(handle)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let object_id = resolved.object_id();
         let timer_id = match state.objects.get(&object_id) {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
             Some(KernelObject::Port(_)) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
+        require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
 
         state
             .timers
@@ -230,13 +243,15 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
     }
 
     with_state_mut(|state| {
-        let object_id = state.lookup_object_id(handle)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let object_id = resolved.object_id();
         {
             let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
             let port = match obj {
                 KernelObject::Port(port) => port,
                 KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
             };
+            require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
 
             let pkt = Packet::user_with_data(packet.key, packet.status, packet.user.u64);
             port.queue_user(pkt).map_err(map_port_error)?;
@@ -251,13 +266,15 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
 /// Pop one packet from a port queue.
 pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_status_t> {
     with_state_mut(|state| {
-        let object_id = state.lookup_object_id(handle)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let object_id = resolved.object_id();
         let pkt = {
             let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
             let port = match obj {
                 KernelObject::Port(port) => port,
                 KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
             };
+            require_handle_rights(resolved, crate::task::HandleRights::READ)?;
             port.pop().map_err(map_port_error)?
         };
 
@@ -318,7 +335,8 @@ pub fn port_wait(handle: zx_handle_t, deadline: i64) -> Result<zx_port_packet_t,
 /// Snapshot current signals for a waitable object.
 pub fn object_signals(handle: zx_handle_t) -> Result<zx_signals_t, zx_status_t> {
     with_state_mut(|state| {
-        let object_id = state.lookup_object_id(handle)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
+        let object_id = resolved.object_id();
         signals_for_object_id(state, object_id).map(|s| s.bits())
     })
 }
@@ -344,7 +362,8 @@ pub fn object_wait_one(
         let observed = {
             let mut guard = STATE.lock();
             let state = guard.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
-            let object_id = state.lookup_object_id(handle)?;
+            let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
+            let object_id = resolved.object_id();
             signals_for_object_id(state, object_id)?
         };
 
@@ -361,7 +380,8 @@ pub fn object_wait_one(
             let observed = {
                 let mut guard = STATE.lock();
                 let state = guard.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
-                let object_id = state.lookup_object_id(handle)?;
+                let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
+                let object_id = resolved.object_id();
                 signals_for_object_id(state, object_id)?
             };
             if observed.intersects(watched) {
@@ -389,8 +409,10 @@ pub fn object_wait_async(
     }
 
     with_state_mut(|state| {
-        let waitable_id = state.lookup_object_id(waitable)?;
-        let port_id = state.lookup_object_id(port_handle)?;
+        let waitable = state.lookup_handle(waitable, crate::task::HandleRights::WAIT)?;
+        let resolved_port = state.lookup_handle(port_handle, crate::task::HandleRights::empty())?;
+        let waitable_id = waitable.object_id();
+        let port_id = resolved_port.object_id();
 
         let current = signals_for_object_id(state, waitable_id)?;
 
@@ -404,6 +426,7 @@ pub fn object_wait_async(
                 KernelObject::Port(port) => port,
                 KernelObject::Timer(_) => return Err(ZX_ERR_WRONG_TYPE),
             };
+            require_handle_rights(resolved_port, crate::task::HandleRights::WRITE)?;
             port.wait_async(waitable_id, key, watched, options, current, now)
                 .map_err(map_port_error)?;
         }
@@ -438,7 +461,8 @@ pub fn on_tick() {
 
 fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
-        let object_id = state.lookup_object_id(handle)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let object_id = resolved.object_id();
         let obj = state.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
 
         let kind = match obj {
@@ -459,6 +483,32 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
             Err(ZX_ERR_WRONG_TYPE)
         }
     })
+}
+
+fn require_handle_rights(
+    resolved: crate::task::ResolvedHandle,
+    required_rights: crate::task::HandleRights,
+) -> Result<(), zx_status_t> {
+    if resolved.rights().contains(required_rights) {
+        Ok(())
+    } else {
+        Err(axle_types::status::ZX_ERR_ACCESS_DENIED)
+    }
+}
+
+fn port_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::WAIT
+        | crate::task::HandleRights::READ
+        | crate::task::HandleRights::WRITE
+}
+
+fn timer_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::WAIT
+        | crate::task::HandleRights::WRITE
 }
 
 fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals, zx_status_t> {
