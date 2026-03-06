@@ -9,6 +9,7 @@
 
 #![no_std]
 #![deny(missing_docs)]
+#![forbid(unsafe_code)]
 #![allow(non_camel_case_types)]
 
 /// Zircon handle type (u32).
@@ -217,6 +218,51 @@ pub mod status {
     pub const ZX_ERR_UNAVAILABLE: zx_status_t = -28;
     /// Access denied.
     pub const ZX_ERR_ACCESS_DENIED: zx_status_t = -30;
+
+    /// I/O error.
+    pub const ZX_ERR_IO: zx_status_t = -40;
+    /// Device or peer refused the operation.
+    pub const ZX_ERR_IO_REFUSED: zx_status_t = -41;
+    /// Data integrity / checksum failure.
+    pub const ZX_ERR_IO_DATA_INTEGRITY: zx_status_t = -42;
+    /// Data loss.
+    pub const ZX_ERR_IO_DATA_LOSS: zx_status_t = -43;
+    /// Device not present.
+    pub const ZX_ERR_IO_NOT_PRESENT: zx_status_t = -44;
+    /// I/O overrun.
+    pub const ZX_ERR_IO_OVERRUN: zx_status_t = -45;
+    /// Missed I/O deadline.
+    pub const ZX_ERR_IO_MISSED_DEADLINE: zx_status_t = -46;
+    /// Invalid I/O request or payload.
+    pub const ZX_ERR_IO_INVALID: zx_status_t = -47;
+
+    /// Bad or malformed path.
+    pub const ZX_ERR_BAD_PATH: zx_status_t = -50;
+    /// Not a directory.
+    pub const ZX_ERR_NOT_DIR: zx_status_t = -51;
+    /// Not a regular file.
+    pub const ZX_ERR_NOT_FILE: zx_status_t = -52;
+    /// File too large.
+    pub const ZX_ERR_FILE_BIG: zx_status_t = -53;
+    /// No space left.
+    pub const ZX_ERR_NO_SPACE: zx_status_t = -54;
+    /// Directory not empty.
+    pub const ZX_ERR_NOT_EMPTY: zx_status_t = -55;
+
+    /// Protocol not supported.
+    pub const ZX_ERR_PROTOCOL_NOT_SUPPORTED: zx_status_t = -70;
+    /// Address unreachable.
+    pub const ZX_ERR_ADDRESS_UNREACHABLE: zx_status_t = -71;
+    /// Address already in use.
+    pub const ZX_ERR_ADDRESS_IN_USE: zx_status_t = -72;
+    /// Not connected.
+    pub const ZX_ERR_NOT_CONNECTED: zx_status_t = -73;
+    /// Connection refused.
+    pub const ZX_ERR_CONNECTION_REFUSED: zx_status_t = -74;
+    /// Connection reset.
+    pub const ZX_ERR_CONNECTION_RESET: zx_status_t = -75;
+    /// Connection aborted.
+    pub const ZX_ERR_CONNECTION_ABORTED: zx_status_t = -76;
 }
 
 /// Signals bitmask constants.

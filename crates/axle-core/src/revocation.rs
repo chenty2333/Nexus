@@ -171,6 +171,7 @@ impl RevocationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn revoke_invalidates_old_refs() {
@@ -201,5 +202,27 @@ mod tests {
         assert_eq!(tok2.id(), id);
         assert_ne!(tok2.generation, tok1.generation);
         mgr.revoke(tok2).unwrap();
+    }
+
+    proptest! {
+        #[test]
+        fn prop_only_latest_epoch_remains_live(revoke_count in 0u8..32) {
+            let mut mgr = RevocationManager::new();
+            let tok = mgr.create_group();
+            let mut refs = vec![mgr.snapshot(tok).unwrap()];
+
+            for _ in 0..revoke_count {
+                let previous = mgr.snapshot(tok).unwrap();
+                mgr.revoke(tok).unwrap();
+                prop_assert!(!mgr.is_live(previous));
+                refs.push(mgr.snapshot(tok).unwrap());
+            }
+
+            let latest = *refs.last().unwrap();
+            for r in refs.iter().copied().take(refs.len().saturating_sub(1)) {
+                prop_assert!(!mgr.is_live(r));
+            }
+            prop_assert!(mgr.is_live(latest));
+        }
     }
 }

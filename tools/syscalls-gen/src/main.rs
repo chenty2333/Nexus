@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Minimal syscall spec generator.
 //!
 //! This is intentionally small for Phase A.

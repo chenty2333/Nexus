@@ -26,6 +26,7 @@ test-all:
   just xlint
   just xtest
   just loom
+  just fuzz-smoke
   just test-kernel
 
 fmt:
@@ -37,6 +38,10 @@ fmt-check:
 # Loom runs are slower; enable only when you need concurrency-model checking.
 loom:
   cargo test -p axle-sync --features loom
+
+# Short libFuzzer smoke run for the host-side semantic core.
+fuzz-smoke:
+  cargo fuzz run cspace_ops --fuzz-dir crates/axle-core/fuzz -D --sanitizer none -- -max_total_time=5
 
 # Syscall ABI generation (Phase A bootstrap).
 gen-syscalls:

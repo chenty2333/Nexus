@@ -4,6 +4,7 @@
 //! temporary bridge until real userspace launch is wired.
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::packet::ZX_PKT_TYPE_USER;
@@ -279,23 +280,5 @@ pub fn run_int80_conformance() -> Result<Int80ConformanceSummary, Int80Conforman
 }
 
 fn run_int80(nr: u64, args: [u64; 6]) -> zx_status_t {
-    let ret_rax: u64;
-
-    // SAFETY: executes the 0x80 software interrupt ABI used by Axle's syscall
-    // entry path and captures the returned `zx_status_t` in `rax`.
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            inlateout("rax") nr => ret_rax,
-            in("rdi") args[0],
-            in("rsi") args[1],
-            in("rdx") args[2],
-            in("r10") args[3],
-            in("r8") args[4],
-            in("r9") args[5],
-            clobber_abi("sysv64"),
-        );
-    }
-
-    ret_rax as i32
+    axle_arch_x86_64::int80_syscall(nr, args)
 }

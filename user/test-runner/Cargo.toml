@@ -6,7 +6,11 @@ license = "Unlicense"
 publish = false
 
 [dependencies]
+axle-arch-x86_64 = { path = "../../crates/axle-arch-x86_64", default-features = false }
 axle-types = { path = "../../crates/axle-types", default-features = false }
+
+[build-dependencies]
+cc = "1"
 
 [features]
 default = []

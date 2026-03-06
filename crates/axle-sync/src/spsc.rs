@@ -124,6 +124,8 @@ impl<T: Copy, const N: usize> SpscRing<T, N> {
         }
 
         #[cfg(not(feature = "loom"))]
+        // SAFETY: only the producer writes to this slot, and the SPSC discipline
+        // guarantees the slot is free before publication.
         unsafe {
             (*self.buf[idx].get()).write(value);
         }
@@ -137,6 +139,8 @@ impl<T: Copy, const N: usize> SpscRing<T, N> {
         }
 
         #[cfg(not(feature = "loom"))]
+        // SAFETY: only the consumer reads from this slot, and the SPSC discipline
+        // guarantees the slot was fully initialized before `tail` advanced.
         unsafe {
             (*self.buf[idx].get()).as_ptr().read()
         }

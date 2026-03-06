@@ -6,9 +6,13 @@
 //! For now this is a tiny `int 0x80` conformance runner intended to be loaded by
 //! the kernel bring-up path (ring3) and report results via the shared page +
 //! `int3`.
+//!
+//! The `_start` entrypoint is assembled and linked by `build.rs`, keeping this
+//! crate itself free of Rust-level unsafe code.
 
 #![no_std]
 #![no_main]
+#![forbid(unsafe_code)]
 
 use core::panic::PanicInfo;
 
@@ -18,9 +22,3 @@ fn panic(_info: &PanicInfo) -> ! {
         core::hint::spin_loop();
     }
 }
-
-// Userspace entry point defined in assembly below.
-core::arch::global_asm!(
-    include_str!("../../../specs/conformance/runner/int80_conformance.S"),
-    options(att_syntax)
-);

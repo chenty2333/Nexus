@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/axle-arch-x86_64",
   "crates/axle-core",
   "crates/axle-sync",
   "crates/axle-types",
@@ -15,5 +16,6 @@ members = [
   "user/test-runner",
 ]
 
-# CI currently lints/tests only the host-side contract crates (axle-core/axle-sync).
+# CI runs `just test-all`; the narrower host-only gates remain useful during
+# inner-loop development.
 # See `just xlint` and `just xtest`.

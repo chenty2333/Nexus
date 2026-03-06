@@ -236,6 +236,7 @@ mod tests {
     use crate::handle::HANDLE_FIXED_BITS_MASK;
     use crate::handle::HANDLE_FIXED_BITS_VALUE;
     use crate::revocation::RevocationManager;
+    use proptest::prelude::*;
 
     #[test]
     fn alloc_lookup_close() {
@@ -313,5 +314,47 @@ mod tests {
             cs.get_checked(h2, &mgr).unwrap_err(),
             CSpaceError::BadHandle
         );
+    }
+
+    proptest! {
+        #[test]
+        fn prop_closed_handles_never_resolve(
+            ops in prop::collection::vec((0u8..3, any::<u16>(), any::<u64>(), any::<u32>()), 1..128)
+        ) {
+            let mut cs = CSpace::new(32, 4);
+            let mut active: Vec<Handle> = Vec::new();
+            let mut closed: Vec<Handle> = Vec::new();
+
+            for (kind, selector, object_id, rights) in ops {
+                match kind {
+                    0 => {
+                        if let Ok(h) = cs.alloc(Capability::new(object_id, rights, u32::from(selector))) {
+                            active.push(h);
+                        }
+                    }
+                    1 => {
+                        if !active.is_empty() {
+                            let idx = usize::from(selector) % active.len();
+                            let h = active.swap_remove(idx);
+                            prop_assert_eq!(cs.close(h), Ok(()));
+                            closed.push(h);
+                        }
+                    }
+                    2 => {
+                        if !active.is_empty() {
+                            let idx = usize::from(selector) % active.len();
+                            if let Ok(h) = cs.duplicate(active[idx]) {
+                                active.push(h);
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+
+                for &h in &closed {
+                    prop_assert_eq!(cs.get(h), Err(CSpaceError::BadHandle));
+                }
+            }
+        }
     }
 }

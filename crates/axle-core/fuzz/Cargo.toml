@@ -1,0 +1,25 @@
+[package]
+name = "axle-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.axle-core]
+path = ".."
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "cspace_ops"
+path = "fuzz_targets/cspace_ops.rs"
+test = false
+doc = false
+bench = false
