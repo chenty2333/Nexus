@@ -206,7 +206,7 @@ impl VmoId {
 }
 
 /// Kernel-global identity for one VMO.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GlobalVmoId(u64);
 
 impl GlobalVmoId {
@@ -460,7 +460,7 @@ impl VmaLookup {
 }
 
 /// Stable futex key derived from VMA metadata.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FutexKey {
     /// Shared key backed by a globally-identified VMO and byte offset.
     Shared {

@@ -175,8 +175,9 @@ const SLOT_OBJECT_SIGNAL_WAIT_ASYNC: usize = 131;
 const SLOT_OBJECT_SIGNAL_SELF: usize = 132;
 const SLOT_OBJECT_SIGNAL_PORT_WAIT: usize = 133;
 const SLOT_OBJECT_SIGNAL_KEY: usize = 134;
+const SLOT_SELF_THREAD_H: usize = 135;
 
-const SLOT_MAX: usize = SLOT_OBJECT_SIGNAL_KEY;
+const SLOT_MAX: usize = SLOT_SELF_THREAD_H;
 const SLOT_T0_NS: usize = 511;
 
 #[repr(align(4096))]
@@ -662,6 +663,7 @@ pub fn prepare() -> u64 {
     // without introducing a new syscall ABI.
     slots[SLOT_T0_NS] = crate::time::now_ns() as u64;
     slots[SLOT_ROOT_VMAR_H] = crate::object::bootstrap_root_vmar_handle().unwrap_or(0) as u64;
+    slots[SLOT_SELF_THREAD_H] = crate::object::bootstrap_self_thread_handle().unwrap_or(0) as u64;
 
     entry
 }

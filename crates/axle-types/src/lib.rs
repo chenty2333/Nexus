@@ -20,6 +20,8 @@ pub type zx_status_t = i32;
 pub type zx_signals_t = u32;
 /// Zircon rights bitmask type.
 pub type zx_rights_t = u32;
+/// Zircon kernel object id type.
+pub type zx_koid_t = u64;
 /// Zircon absolute time / deadline type (monotonic nanoseconds).
 pub type zx_time_t = i64;
 /// Zircon duration / interval type (nanoseconds).
@@ -266,6 +268,14 @@ pub mod handle {
     pub const ZX_HANDLE_FIXED_BITS_MASK: zx_handle_t = 0x3;
     /// The required value of the low 2 “fixed bits” for a valid handle.
     pub const ZX_HANDLE_FIXED_BITS_VALUE: zx_handle_t = 0x3;
+}
+
+/// Kernel object id constants.
+pub mod koid {
+    use super::zx_koid_t;
+
+    /// Invalid kernel object id.
+    pub const ZX_KOID_INVALID: zx_koid_t = 0;
 }
 
 /// Status / error codes.

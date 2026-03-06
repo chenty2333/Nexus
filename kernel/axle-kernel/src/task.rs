@@ -33,7 +33,7 @@ use axle_types::status::{
     ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND,
     ZX_ERR_OUT_OF_RANGE,
 };
-use axle_types::{zx_handle_t, zx_rights_t, zx_status_t};
+use axle_types::{zx_handle_t, zx_koid_t, zx_rights_t, zx_status_t};
 use bitflags::bitflags;
 use core::mem::size_of;
 
@@ -119,6 +119,28 @@ impl RootVmarInfo {
     }
 }
 
+/// Kernel-visible description of the bootstrap current thread.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CurrentThreadInfo {
+    process_id: ProcessId,
+    thread_id: ThreadId,
+    koid: zx_koid_t,
+}
+
+impl CurrentThreadInfo {
+    pub(crate) const fn process_id(self) -> ProcessId {
+        self.process_id
+    }
+
+    pub(crate) const fn thread_id(self) -> ThreadId {
+        self.thread_id
+    }
+
+    pub(crate) const fn koid(self) -> zx_koid_t {
+        self.koid
+    }
+}
+
 /// Kernel-visible description of one current-process VMO.
 #[derive(Clone, Debug)]
 pub(crate) struct CreatedVmo {
@@ -147,6 +169,12 @@ impl CreatedVmo {
     pub(crate) fn size_bytes(&self) -> u64 {
         self.vmo.size_bytes()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThreadState {
+    Runnable,
+    FutexWait { key: FutexKey },
 }
 
 /// Pinned page run loaned from the current process into a kernel object.
@@ -473,6 +501,8 @@ impl Process {
 #[derive(Debug)]
 struct Thread {
     process_id: ProcessId,
+    koid: zx_koid_t,
+    state: ThreadState,
 }
 
 /// Internal bootstrap kernel model.
@@ -483,7 +513,9 @@ pub(crate) struct Kernel {
     address_spaces: BTreeMap<AddressSpaceId, AddressSpace>,
     #[allow(dead_code)]
     frames: FrameTable,
+    futexes: crate::futex::FutexTable,
     revocations: RevocationManager,
+    next_koid: zx_koid_t,
     next_global_vmo_id: u64,
     next_process_id: ProcessId,
     next_thread_id: ThreadId,
@@ -499,7 +531,9 @@ impl Kernel {
             threads: BTreeMap::new(),
             address_spaces: BTreeMap::new(),
             frames: FrameTable::new(),
+            futexes: crate::futex::FutexTable::new(),
             revocations: RevocationManager::new(),
+            next_koid: 1,
             next_global_vmo_id: 1,
             next_process_id: 1,
             next_thread_id: 1,
@@ -511,10 +545,8 @@ impl Kernel {
             kernel.alloc_global_vmo_id(),
             kernel.alloc_global_vmo_id(),
         ];
-        let bootstrap_address_space = AddressSpace::bootstrap(
-            &mut kernel.frames,
-            bootstrap_vmo_ids,
-        );
+        let bootstrap_address_space =
+            AddressSpace::bootstrap(&mut kernel.frames, bootstrap_vmo_ids);
 
         let address_space_id = kernel.alloc_address_space_id();
         kernel
@@ -527,7 +559,15 @@ impl Kernel {
             .insert(process_id, Process::bootstrap(address_space_id));
 
         let thread_id = kernel.alloc_thread_id();
-        kernel.threads.insert(thread_id, Thread { process_id });
+        let thread_koid = kernel.alloc_koid();
+        kernel.threads.insert(
+            thread_id,
+            Thread {
+                process_id,
+                koid: thread_koid,
+                state: ThreadState::Runnable,
+            },
+        );
         kernel.current_thread_id = thread_id;
         kernel
     }
@@ -719,6 +759,15 @@ impl Kernel {
         })
     }
 
+    pub(crate) fn current_thread_info(&self) -> Result<CurrentThreadInfo, zx_status_t> {
+        let thread = self.current_thread()?;
+        Ok(CurrentThreadInfo {
+            process_id: thread.process_id,
+            thread_id: self.current_thread_id,
+            koid: thread.koid,
+        })
+    }
+
     pub(crate) fn create_current_anonymous_vmo(
         &mut self,
         size: u64,
@@ -738,6 +787,85 @@ impl Kernel {
             address_space_id,
             vmo,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn current_thread_koid(&self) -> Result<zx_koid_t, zx_status_t> {
+        Ok(self.current_thread()?.koid)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn enqueue_current_futex_wait(
+        &mut self,
+        key: FutexKey,
+        owner_koid: zx_koid_t,
+    ) -> Result<(), zx_status_t> {
+        let thread_id = self.current_thread_id;
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if !matches!(thread.state, ThreadState::Runnable) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.state = ThreadState::FutexWait { key };
+        self.futexes.enqueue_waiter(key, thread_id, owner_koid);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn cancel_current_futex_wait(&mut self) -> Result<bool, zx_status_t> {
+        let thread_id = self.current_thread_id;
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let ThreadState::FutexWait { key } = thread.state else {
+            return Ok(false);
+        };
+        thread.state = ThreadState::Runnable;
+        Ok(self.futexes.cancel_waiter(key, thread_id))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn wake_futex_waiters(
+        &mut self,
+        key: FutexKey,
+        wake_count: usize,
+        new_owner_koid: zx_koid_t,
+        single_owner: bool,
+    ) -> Result<usize, zx_status_t> {
+        let result = self
+            .futexes
+            .wake(key, wake_count, new_owner_koid, single_owner);
+        for thread_id in result.woken {
+            let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+            thread.state = ThreadState::Runnable;
+        }
+        Ok(result.remaining)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn requeue_futex_waiters(
+        &mut self,
+        source: FutexKey,
+        target: FutexKey,
+        wake_count: usize,
+        requeue_count: usize,
+        target_owner_koid: zx_koid_t,
+    ) -> Result<crate::futex::RequeueResult, zx_status_t> {
+        let result =
+            self.futexes
+                .requeue(source, target, wake_count, requeue_count, target_owner_koid);
+        for thread_id in &result.woken {
+            let thread = self.threads.get_mut(thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+            thread.state = ThreadState::Runnable;
+        }
+        for thread in self.threads.values_mut() {
+            if matches!(thread.state, ThreadState::FutexWait { key } if key == source) {
+                thread.state = ThreadState::FutexWait { key: target };
+            }
+        }
+        Ok(result)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn futex_owner(&self, key: FutexKey) -> zx_koid_t {
+        self.futexes.owner(key)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -896,6 +1024,12 @@ impl Kernel {
     fn alloc_thread_id(&mut self) -> ThreadId {
         let id = self.next_thread_id;
         self.next_thread_id = self.next_thread_id.wrapping_add(1);
+        id
+    }
+
+    fn alloc_koid(&mut self) -> zx_koid_t {
+        let id = self.next_koid;
+        self.next_koid = self.next_koid.wrapping_add(1);
         id
     }
 

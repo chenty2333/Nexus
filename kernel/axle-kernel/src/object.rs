@@ -20,8 +20,8 @@ use axle_types::status::{
 };
 use axle_types::vm::{ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC};
 use axle_types::{
-    zx_clock_t, zx_handle_t, zx_packet_user_t, zx_port_packet_t, zx_rights_t, zx_status_t,
-    zx_vaddr_t,
+    zx_clock_t, zx_handle_t, zx_koid_t, zx_packet_user_t, zx_port_packet_t, zx_rights_t,
+    zx_status_t, zx_vaddr_t,
 };
 use axle_types::{zx_packet_signal_t, zx_signals_t};
 use spin::Mutex;
@@ -46,6 +46,8 @@ pub enum ObjectKind {
     Vmo,
     /// VMAR object.
     Vmar,
+    /// Thread object.
+    Thread,
 }
 
 #[derive(Debug)]
@@ -143,6 +145,13 @@ struct VmarObject {
     len: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ThreadObject {
+    process_id: u64,
+    thread_id: u64,
+    koid: zx_koid_t,
+}
+
 #[derive(Debug)]
 enum KernelObject {
     Channel(ChannelEndpoint),
@@ -151,6 +160,7 @@ enum KernelObject {
     Timer(TimerObject),
     Vmo(VmoObject),
     Vmar(VmarObject),
+    Thread(ThreadObject),
 }
 
 /// Result of a successful channel read.
@@ -180,6 +190,7 @@ struct KernelState {
     next_object_id: u64,
     timers: TimerService,
     bootstrap_root_vmar_handle: zx_handle_t,
+    bootstrap_self_thread_handle: zx_handle_t,
 }
 
 impl KernelState {
@@ -190,6 +201,7 @@ impl KernelState {
             next_object_id: 1,
             timers: TimerService::new(),
             bootstrap_root_vmar_handle: 0,
+            bootstrap_self_thread_handle: 0,
         };
 
         let root = state
@@ -210,6 +222,23 @@ impl KernelState {
         state.bootstrap_root_vmar_handle = state
             .alloc_handle_for_object(object_id, vmar_default_rights())
             .expect("bootstrap root VMAR handle allocation must succeed");
+
+        let thread = state
+            .kernel
+            .current_thread_info()
+            .expect("bootstrap current thread must exist");
+        let object_id = state.alloc_object_id();
+        state.objects.insert(
+            object_id,
+            KernelObject::Thread(ThreadObject {
+                process_id: thread.process_id(),
+                thread_id: thread.thread_id(),
+                koid: thread.koid(),
+            }),
+        );
+        state.bootstrap_self_thread_handle = state
+            .alloc_handle_for_object(object_id, thread_default_rights())
+            .expect("bootstrap self thread handle allocation must succeed");
         state
     }
 
@@ -276,6 +305,13 @@ pub fn bootstrap_root_vmar_handle() -> Option<zx_handle_t> {
     let mut guard = STATE.lock();
     let state = guard.as_mut()?;
     Some(state.bootstrap_root_vmar_handle)
+}
+
+/// Return the bootstrap current-thread handle seeded into the current process.
+pub fn bootstrap_self_thread_handle() -> Option<zx_handle_t> {
+    let mut guard = STATE.lock();
+    let state = guard.as_mut()?;
+    Some(state.bootstrap_self_thread_handle)
 }
 
 #[allow(dead_code)]
@@ -912,6 +948,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
             Some(KernelObject::Channel(_))
             | Some(KernelObject::EventPair(_))
             | Some(KernelObject::Port(_))
+            | Some(KernelObject::Thread(_))
             | Some(KernelObject::Vmo(_))
             | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
@@ -947,6 +984,7 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
             Some(KernelObject::Channel(_))
             | Some(KernelObject::EventPair(_))
             | Some(KernelObject::Port(_))
+            | Some(KernelObject::Thread(_))
             | Some(KernelObject::Vmo(_))
             | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
@@ -980,6 +1018,7 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
                 KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
+                | KernelObject::Thread(_)
                 | KernelObject::Vmo(_)
                 | KernelObject::Vmar(_) => {
                     return Err(ZX_ERR_WRONG_TYPE);
@@ -1009,6 +1048,7 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
                 KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
+                | KernelObject::Thread(_)
                 | KernelObject::Vmo(_)
                 | KernelObject::Vmar(_) => {
                     return Err(ZX_ERR_WRONG_TYPE);
@@ -1167,6 +1207,7 @@ pub fn object_wait_async(
                 KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
+                | KernelObject::Thread(_)
                 | KernelObject::Vmo(_)
                 | KernelObject::Vmar(_) => {
                     return Err(ZX_ERR_WRONG_TYPE);
@@ -1295,6 +1336,10 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                 );
                 ObjectKind::Vmar
             }
+            KernelObject::Thread(thread) => {
+                let _ = (thread.process_id, thread.thread_id, thread.koid);
+                ObjectKind::Thread
+            }
         };
 
         if kind == expected {
@@ -1379,6 +1424,14 @@ fn vmar_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::MAP
 }
 
+fn thread_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::WAIT
+        | crate::task::HandleRights::INSPECT
+        | crate::task::HandleRights::MANAGE_THREAD
+}
+
 fn require_vm_mapping_rights(
     resolved: crate::task::ResolvedHandle,
     perms: MappingPerms,
@@ -1461,7 +1514,7 @@ fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals,
                 Signals::NONE
             })
         }
-        KernelObject::Vmo(_) | KernelObject::Vmar(_) => Ok(Signals::NONE),
+        KernelObject::Vmo(_) | KernelObject::Vmar(_) | KernelObject::Thread(_) => Ok(Signals::NONE),
     }
 }
 

@@ -8,6 +8,7 @@
 
 mod arch;
 mod bringup;
+mod futex;
 mod kalloc;
 mod object;
 mod smp;
