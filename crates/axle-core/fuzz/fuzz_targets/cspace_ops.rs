@@ -14,7 +14,7 @@ fuzz_target!(|data: &[u8]| {
             continue;
         }
 
-        match chunk[0] % 3 {
+        match chunk[0] % 5 {
             0 => {
                 let object_id = le_u64(chunk.get(0..8).unwrap_or(&[]));
                 let rights = le_u32(chunk.get(8..12).unwrap_or(&[]));
@@ -37,6 +37,30 @@ fuzz_target!(|data: &[u8]| {
                     let idx = usize::from(chunk.get(1).copied().unwrap_or(0)) % active.len();
                     if let Ok(h) = cs.duplicate(active[idx]) {
                         active.push(h);
+                    }
+                }
+            }
+            3 => {
+                if !active.is_empty() {
+                    let idx = usize::from(chunk.get(1).copied().unwrap_or(0)) % active.len();
+                    let rights = le_u32(chunk.get(8..12).unwrap_or(&[]));
+                    if let Ok(h) = cs.duplicate_derived(active[idx], rights) {
+                        active.push(h);
+                    }
+                }
+            }
+            4 => {
+                if !active.is_empty() {
+                    let idx = usize::from(chunk.get(1).copied().unwrap_or(0)) % active.len();
+                    let rights = le_u32(chunk.get(8..12).unwrap_or(&[]));
+                    let old = active.swap_remove(idx);
+                    match cs.replace_derived(old, rights) {
+                        Ok(h) => {
+                            active.push(h);
+                            closed.push(old);
+                        }
+                        Err(CSpaceError::BadHandle) => closed.push(old),
+                        Err(_) => {}
                     }
                 }
             }

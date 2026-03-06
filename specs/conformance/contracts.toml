@@ -89,3 +89,13 @@ description = "Bootstrap eventpair create and signal_peer should drive peer user
 id = "should.eventpair.peer_closed_bootstrap"
 level = "should"
 description = "Closing one bootstrap eventpair endpoint should immediately expose PEER_CLOSED on the peer"
+
+[[contracts]]
+id = "should.handle.duplicate_replace_bootstrap"
+level = "should"
+description = "Bootstrap handle_duplicate and handle_replace should preserve object identity while enforcing reduced rights and invalidating replaced handles"
+
+[[contracts]]
+id = "should.eventpair.signal_self_bootstrap"
+level = "should"
+description = "Bootstrap object_signal should drive local EventPair user signals and wait_async delivery with stable error codes"

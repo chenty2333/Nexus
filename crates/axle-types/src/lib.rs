@@ -18,6 +18,8 @@ pub type zx_handle_t = u32;
 pub type zx_status_t = i32;
 /// Zircon signals type (u32 bitmask).
 pub type zx_signals_t = u32;
+/// Zircon rights bitmask type.
+pub type zx_rights_t = u32;
 /// Zircon absolute time / deadline type (monotonic nanoseconds).
 pub type zx_time_t = i64;
 /// Zircon duration / interval type (nanoseconds).
@@ -163,6 +165,81 @@ pub mod vm {
     pub const ZX_VM_PERM_EXECUTE: zx_vm_option_t = 1 << 2;
     /// Map at an exact address (`vmar_offset` must be honored exactly).
     pub const ZX_VM_SPECIFIC: zx_vm_option_t = 1 << 10;
+}
+
+/// Zircon handle rights bit definitions.
+pub mod rights {
+    use super::zx_rights_t;
+
+    /// Duplicate the handle.
+    pub const ZX_RIGHT_DUPLICATE: zx_rights_t = 1u32 << 0;
+    /// Transfer the handle to another process.
+    pub const ZX_RIGHT_TRANSFER: zx_rights_t = 1u32 << 1;
+    /// Read from the object.
+    pub const ZX_RIGHT_READ: zx_rights_t = 1u32 << 2;
+    /// Write to the object.
+    pub const ZX_RIGHT_WRITE: zx_rights_t = 1u32 << 3;
+    /// Execute from the object.
+    pub const ZX_RIGHT_EXECUTE: zx_rights_t = 1u32 << 4;
+    /// Map the object into a VMAR.
+    pub const ZX_RIGHT_MAP: zx_rights_t = 1u32 << 5;
+    /// Read object properties.
+    pub const ZX_RIGHT_GET_PROPERTY: zx_rights_t = 1u32 << 6;
+    /// Set object properties.
+    pub const ZX_RIGHT_SET_PROPERTY: zx_rights_t = 1u32 << 7;
+    /// Enumerate children or related objects.
+    pub const ZX_RIGHT_ENUMERATE: zx_rights_t = 1u32 << 8;
+    /// Destroy the object.
+    pub const ZX_RIGHT_DESTROY: zx_rights_t = 1u32 << 9;
+    /// Set policy on the object.
+    pub const ZX_RIGHT_SET_POLICY: zx_rights_t = 1u32 << 10;
+    /// Get policy from the object.
+    pub const ZX_RIGHT_GET_POLICY: zx_rights_t = 1u32 << 11;
+    /// Set user signals on the object itself.
+    pub const ZX_RIGHT_SIGNAL: zx_rights_t = 1u32 << 12;
+    /// Set signals on the peer of a peered object.
+    pub const ZX_RIGHT_SIGNAL_PEER: zx_rights_t = 1u32 << 13;
+    /// Wait on the object.
+    pub const ZX_RIGHT_WAIT: zx_rights_t = 1u32 << 14;
+    /// Inspect the object.
+    pub const ZX_RIGHT_INSPECT: zx_rights_t = 1u32 << 15;
+    /// Manage a job.
+    pub const ZX_RIGHT_MANAGE_JOB: zx_rights_t = 1u32 << 16;
+    /// Manage a process.
+    pub const ZX_RIGHT_MANAGE_PROCESS: zx_rights_t = 1u32 << 17;
+    /// Manage a thread.
+    pub const ZX_RIGHT_MANAGE_THREAD: zx_rights_t = 1u32 << 18;
+    /// Apply a profile.
+    pub const ZX_RIGHT_APPLY_PROFILE: zx_rights_t = 1u32 << 19;
+
+    /// Basic transferable/duplicable/waitable rights.
+    pub const ZX_RIGHTS_BASIC: zx_rights_t =
+        ZX_RIGHT_TRANSFER | ZX_RIGHT_DUPLICATE | ZX_RIGHT_WAIT | ZX_RIGHT_INSPECT;
+    /// Read/write I/O rights.
+    pub const ZX_RIGHTS_IO: zx_rights_t = ZX_RIGHT_READ | ZX_RIGHT_WRITE;
+    /// Keep the same rights as the source handle when duplicating/replacing.
+    pub const ZX_RIGHT_SAME_RIGHTS: zx_rights_t = u32::MAX;
+    /// Mask of all currently defined right bits.
+    pub const ZX_RIGHTS_ALL: zx_rights_t = ZX_RIGHT_DUPLICATE
+        | ZX_RIGHT_TRANSFER
+        | ZX_RIGHT_READ
+        | ZX_RIGHT_WRITE
+        | ZX_RIGHT_EXECUTE
+        | ZX_RIGHT_MAP
+        | ZX_RIGHT_GET_PROPERTY
+        | ZX_RIGHT_SET_PROPERTY
+        | ZX_RIGHT_ENUMERATE
+        | ZX_RIGHT_DESTROY
+        | ZX_RIGHT_SET_POLICY
+        | ZX_RIGHT_GET_POLICY
+        | ZX_RIGHT_SIGNAL
+        | ZX_RIGHT_SIGNAL_PEER
+        | ZX_RIGHT_WAIT
+        | ZX_RIGHT_INSPECT
+        | ZX_RIGHT_MANAGE_JOB
+        | ZX_RIGHT_MANAGE_PROCESS
+        | ZX_RIGHT_MANAGE_THREAD
+        | ZX_RIGHT_APPLY_PROFILE;
 }
 
 /// Generated syscall numbers (ABI).

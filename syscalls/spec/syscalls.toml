@@ -213,3 +213,36 @@ args = [
   { name = "clear_mask", ty = "zx_signals_t" },
   { name = "set_mask", ty = "zx_signals_t" },
 ]
+
+[[syscall]]
+name = "handle_duplicate"
+nr = 18
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+  { name = "rights", ty = "zx_rights_t" },
+  { name = "out", ty = "*mut zx_handle_t" },
+]
+
+[[syscall]]
+name = "handle_replace"
+nr = 19
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+  { name = "rights", ty = "zx_rights_t" },
+  { name = "out", ty = "*mut zx_handle_t" },
+]
+
+[[syscall]]
+name = "object_signal"
+nr = 20
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+  { name = "clear_mask", ty = "zx_signals_t" },
+  { name = "set_mask", ty = "zx_signals_t" },
+]

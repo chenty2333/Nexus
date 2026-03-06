@@ -1092,10 +1092,146 @@ jne pending_drain_done
 movq $1, 8*61(%rbx)
 pending_drain_done:
 
-// timer_cancel
-mov 0x698(%rbx), %rdi
-movabs $8, %rax
-int $0x80
+	// eventpair_create(fresh pair for handle duplicate/replace + object_signal)
+	lea 0x820(%rbx), %rsi
+	lea 0x828(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $16, %rax
+	int $0x80
+
+	// handle_duplicate(h0, SAME_RIGHTS)
+	mov 0x820(%rbx), %rdi
+	movl $0xffffffff, %esi
+	lea 0x830(%rbx), %rdx
+	movabs $18, %rax
+	int $0x80
+	mov %rax, 8*118(%rbx)
+
+	// duplicated handle must be distinct and non-zero
+	movq $0, 8*119(%rbx)
+	mov 0x820(%rbx), %rsi
+	mov 0x830(%rbx), %rdi
+	test %rdi, %rdi
+	jz handle_duplicate_distinct_done
+	cmp %rsi, %rdi
+	je handle_duplicate_distinct_done
+	movq $1, 8*119(%rbx)
+handle_duplicate_distinct_done:
+
+	// object_signal(dup_h0, USER_SIGNAL_2)
+	mov 0x830(%rbx), %rdi
+	xorl %esi, %esi
+	movl $0x04000000, %edx
+	movabs $20, %rax
+	int $0x80
+	mov %rax, 8*120(%rbx)
+
+	// wait_one(orig_h0, USER_SIGNAL_2)
+	movq $0, 0x838(%rbx)
+	mov 0x820(%rbx), %rdi
+	movl $0x04000000, %esi
+	xorl %edx, %edx
+	lea 0x838(%rbx), %r10
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*121(%rbx)
+	mov 0x838(%rbx), %rax
+	mov %rax, 8*122(%rbx)
+
+	// handle_duplicate(h0, WAIT only)
+	mov 0x820(%rbx), %rdi
+	movl $0x4000, %esi
+	lea 0x840(%rbx), %rdx
+	movabs $18, %rax
+	int $0x80
+	mov %rax, 8*123(%rbx)
+
+	// object_signal(wait_only_dup, USER_SIGNAL_3) => ACCESS_DENIED
+	mov 0x840(%rbx), %rdi
+	xorl %esi, %esi
+	movl $0x08000000, %edx
+	movabs $20, %rax
+	int $0x80
+	mov %rax, 8*124(%rbx)
+
+	// handle_replace(h1, SAME_RIGHTS)
+	mov 0x828(%rbx), %rdi
+	movl $0xffffffff, %esi
+	lea 0x848(%rbx), %rdx
+	movabs $19, %rax
+	int $0x80
+	mov %rax, 8*125(%rbx)
+
+	// old h1 must be dead after replace
+	movq $0, 0x850(%rbx)
+	mov 0x828(%rbx), %rdi
+	movl $0x10000000, %esi
+	xorl %edx, %edx
+	lea 0x850(%rbx), %r10
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*126(%rbx)
+
+	// object_signal(new_h1, USER_SIGNAL_4)
+	mov 0x848(%rbx), %rdi
+	xorl %esi, %esi
+	movl $0x10000000, %edx
+	movabs $20, %rax
+	int $0x80
+	mov %rax, 8*127(%rbx)
+
+	// wait_one(new_h1, USER_SIGNAL_4)
+	movq $0, 0x850(%rbx)
+	mov 0x848(%rbx), %rdi
+	movl $0x10000000, %esi
+	xorl %edx, %edx
+	lea 0x850(%rbx), %r10
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*128(%rbx)
+	mov 0x850(%rbx), %rax
+	mov %rax, 8*129(%rbx)
+
+	// object_signal(bad mask: PEER_CLOSED)
+	mov 0x848(%rbx), %rdi
+	movl $0x4, %esi
+	xorl %edx, %edx
+	movabs $20, %rax
+	int $0x80
+	mov %rax, 8*130(%rbx)
+
+	// object_wait_async(new_h1, port_h, key=0x6001, USER_SIGNAL_5)
+	mov 0x848(%rbx), %rdi
+	mov 0x688(%rbx), %rsi
+	movabs $0x6001, %rdx
+	movl $0x20000000, %r10d
+	xorl %r8d, %r8d
+	movabs $2, %rax
+	int $0x80
+	mov %rax, 8*131(%rbx)
+
+	// object_signal(new_h1, USER_SIGNAL_5)
+	mov 0x848(%rbx), %rdi
+	xorl %esi, %esi
+	movl $0x20000000, %edx
+	movabs $20, %rax
+	int $0x80
+	mov %rax, 8*132(%rbx)
+
+	// port_wait(signal packet from object_signal)
+	mov 0x688(%rbx), %rdi
+	xor %rsi, %rsi
+	lea 0x860(%rbx), %rdx
+	movabs $5, %rax
+	int $0x80
+	mov %rax, 8*133(%rbx)
+	mov 0x860(%rbx), %rax
+	mov %rax, 8*134(%rbx)
+
+	// timer_cancel
+	mov 0x698(%rbx), %rdi
+	movabs $8, %rax
+	int $0x80
 mov %rax, 8*30(%rbx)
 
 // timer_close

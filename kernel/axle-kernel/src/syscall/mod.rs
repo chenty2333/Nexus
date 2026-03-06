@@ -20,7 +20,8 @@ use axle_types::status::{
 };
 use axle_types::syscall_numbers::{
     AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
-    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_OBJECT_SIGNAL_PEER,
+    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
+    AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER,
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
     AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE,
     AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
@@ -30,14 +31,14 @@ use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
 };
 use axle_types::{
-    zx_clock_t, zx_duration_t, zx_handle_t, zx_port_packet_t, zx_signals_t, zx_status_t, zx_time_t,
-    zx_vaddr_t, zx_vm_option_t,
+    zx_clock_t, zx_duration_t, zx_handle_t, zx_port_packet_t, zx_rights_t, zx_signals_t,
+    zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t,
 };
 use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 18] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 21] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -56,11 +57,15 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 18] = [
     AXLE_SYS_CHANNEL_READ,
     AXLE_SYS_EVENTPAIR_CREATE,
     AXLE_SYS_OBJECT_SIGNAL_PEER,
+    AXLE_SYS_HANDLE_DUPLICATE,
+    AXLE_SYS_HANDLE_REPLACE,
+    AXLE_SYS_OBJECT_SIGNAL,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
 const _ABI_TYPES_WITNESS: Option<(
     zx_handle_t,
+    zx_rights_t,
     zx_signals_t,
     zx_time_t,
     zx_duration_t,
@@ -105,6 +110,9 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_CHANNEL_READ => ZX_ERR_NOT_SUPPORTED,
         AXLE_SYS_EVENTPAIR_CREATE => sys_eventpair_create(args),
         AXLE_SYS_OBJECT_SIGNAL_PEER => sys_object_signal_peer(args),
+        AXLE_SYS_HANDLE_DUPLICATE => sys_handle_duplicate(args),
+        AXLE_SYS_HANDLE_REPLACE => sys_handle_replace(args),
+        AXLE_SYS_OBJECT_SIGNAL => sys_object_signal(args),
         _ => ZX_ERR_BAD_SYSCALL,
     }
 }
@@ -229,6 +237,58 @@ fn sys_handle_close(args: [u64; 6]) -> zx_status_t {
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
     match crate::object::close_handle(handle) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_handle_duplicate(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let rights = match u32::try_from(args[1]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let out_ptr = args[2] as *mut zx_handle_t;
+    if out_ptr.is_null()
+        || !crate::userspace::validate_user_ptr(out_ptr as u64, size_of::<zx_handle_t>())
+    {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let duplicated = match crate::object::duplicate_handle(handle, rights as zx_rights_t) {
+        Ok(new_handle) => new_handle,
+        Err(e) => return e,
+    };
+    match copyout(out_ptr, duplicated) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_handle_replace(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let rights = match u32::try_from(args[1]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let out_ptr = args[2] as *mut zx_handle_t;
+    if out_ptr.is_null()
+        || !crate::userspace::validate_user_ptr(out_ptr as u64, size_of::<zx_handle_t>())
+    {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let replaced = match crate::object::replace_handle(handle, rights as zx_rights_t) {
+        Ok(new_handle) => new_handle,
+        Err(e) => return e,
+    };
+    match copyout(out_ptr, replaced) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -698,6 +758,26 @@ fn sys_object_signal_peer(args: [u64; 6]) -> zx_status_t {
     };
 
     match crate::object::object_signal_peer(handle, clear_mask, set_mask) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_object_signal(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let clear_mask = match u32::try_from(args[1]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let set_mask = match u32::try_from(args[2]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+
+    match crate::object::object_signal(handle, clear_mask, set_mask) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }

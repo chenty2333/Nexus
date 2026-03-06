@@ -159,6 +159,39 @@ impl CSpace {
         self.alloc_entry(entry)
     }
 
+    /// Duplicate a handle while replacing the stored rights with a derived subset.
+    pub fn duplicate_derived(&mut self, h: Handle, rights: u32) -> Result<Handle, CSpaceError> {
+        let (idx, tag) = h.decode()?;
+        let slot = self.slots.get(idx as usize).ok_or(CSpaceError::BadHandle)?;
+        if slot.tag != tag {
+            return Err(CSpaceError::BadHandle);
+        }
+        let mut entry = slot.entry.ok_or(CSpaceError::BadHandle)?;
+        entry.cap = Capability::new(entry.cap.object_id(), rights, entry.cap.generation());
+        self.alloc_entry(entry)
+    }
+
+    /// Replace a handle in-place with a rights-derived version.
+    ///
+    /// The slot stays occupied, but its ABA tag is bumped so the old handle value
+    /// becomes invalid immediately.
+    pub fn replace_derived(&mut self, h: Handle, rights: u32) -> Result<Handle, CSpaceError> {
+        let (idx, tag) = h.decode()?;
+        let slot = self
+            .slots
+            .get_mut(idx as usize)
+            .ok_or(CSpaceError::BadHandle)?;
+        if slot.tag != tag {
+            return Err(CSpaceError::BadHandle);
+        }
+        let mut entry = slot.entry.ok_or(CSpaceError::BadHandle)?;
+        let new_tag = bump_tag(slot.tag);
+        entry.cap = Capability::new(entry.cap.object_id(), rights, entry.cap.generation());
+        slot.tag = new_tag;
+        slot.entry = Some(entry);
+        Handle::new(idx, new_tag).map_err(Into::into)
+    }
+
     /// Lookup a capability (by value copy) from a handle, without revocation checks.
     pub fn get(&self, h: Handle) -> Result<Capability, CSpaceError> {
         Ok(self.get_entry(h)?.cap)
@@ -316,10 +349,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn duplicate_derived_reduces_rights_and_keeps_revocation() {
+        let mut mgr = RevocationManager::new();
+        let grp = mgr.create_group();
+        let mut cs = CSpace::new(4, 0);
+
+        let cap = Capability::new(42, 0b1111, 9);
+        let h1 = cs.alloc_revocable(cap, &mgr, grp).unwrap();
+        let h2 = cs.duplicate_derived(h1, 0b0011).unwrap();
+
+        assert_eq!(cs.get_checked(h1, &mgr).unwrap(), cap);
+        assert_eq!(
+            cs.get_checked(h2, &mgr).unwrap(),
+            Capability::new(42, 0b0011, 9)
+        );
+
+        mgr.revoke(grp).unwrap();
+        assert_eq!(cs.get_checked(h1, &mgr), Err(CSpaceError::BadHandle));
+        assert_eq!(cs.get_checked(h2, &mgr), Err(CSpaceError::BadHandle));
+    }
+
+    #[test]
+    fn replace_derived_invalidates_old_handle() {
+        let mut cs = CSpace::new(4, 0);
+        let h1 = cs.alloc(Capability::new(7, 0b1111, 3)).unwrap();
+
+        let h2 = cs.replace_derived(h1, 0b0011).unwrap();
+
+        assert_eq!(cs.get(h1), Err(CSpaceError::BadHandle));
+        assert_eq!(cs.get(h2), Ok(Capability::new(7, 0b0011, 3)));
+    }
+
     proptest! {
         #[test]
         fn prop_closed_handles_never_resolve(
-            ops in prop::collection::vec((0u8..3, any::<u16>(), any::<u64>(), any::<u32>()), 1..128)
+            ops in prop::collection::vec((0u8..5, any::<u16>(), any::<u64>(), any::<u32>()), 1..128)
         ) {
             let mut cs = CSpace::new(32, 4);
             let mut active: Vec<Handle> = Vec::new();
@@ -345,6 +410,28 @@ mod tests {
                             let idx = usize::from(selector) % active.len();
                             if let Ok(h) = cs.duplicate(active[idx]) {
                                 active.push(h);
+                            }
+                        }
+                    }
+                    3 => {
+                        if !active.is_empty() {
+                            let idx = usize::from(selector) % active.len();
+                            if let Ok(h) = cs.duplicate_derived(active[idx], rights) {
+                                active.push(h);
+                            }
+                        }
+                    }
+                    4 => {
+                        if !active.is_empty() {
+                            let idx = usize::from(selector) % active.len();
+                            let h = active.swap_remove(idx);
+                            match cs.replace_derived(h, rights) {
+                                Ok(new_h) => {
+                                    active.push(new_h);
+                                    closed.push(h);
+                                }
+                                Err(CSpaceError::BadHandle) => closed.push(h),
+                                Err(_) => {}
                             }
                         }
                     }

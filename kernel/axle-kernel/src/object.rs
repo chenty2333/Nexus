@@ -12,13 +12,16 @@ use axle_core::{
 use axle_mm::{MappingPerms, VmarId, VmoId};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
+use axle_types::rights::{ZX_RIGHT_SAME_RIGHTS, ZX_RIGHTS_ALL};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
     ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
     ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE, ZX_OK,
 };
 use axle_types::vm::{ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC};
-use axle_types::{zx_clock_t, zx_handle_t, zx_packet_user_t, zx_port_packet_t, zx_status_t};
+use axle_types::{
+    zx_clock_t, zx_handle_t, zx_packet_user_t, zx_port_packet_t, zx_rights_t, zx_status_t,
+};
 use axle_types::{zx_packet_signal_t, zx_signals_t};
 use spin::Mutex;
 
@@ -234,6 +237,22 @@ impl KernelState {
 
     fn close_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
         self.kernel.close_current_handle(raw)
+    }
+
+    fn duplicate_handle(
+        &mut self,
+        raw: zx_handle_t,
+        rights: crate::task::HandleRights,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        self.kernel.duplicate_current_handle(raw, rights)
+    }
+
+    fn replace_handle(
+        &mut self,
+        raw: zx_handle_t,
+        rights: crate::task::HandleRights,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        self.kernel.replace_current_handle(raw, rights)
     }
 
     fn validate_current_user_ptr(&self, ptr: u64, len: usize) -> bool {
@@ -687,6 +706,55 @@ pub(crate) fn release_channel_read_result(result: ChannelReadResult) {
     });
 }
 
+/// Duplicate one handle, optionally dropping rights.
+pub fn duplicate_handle(
+    handle: zx_handle_t,
+    rights: zx_rights_t,
+) -> Result<zx_handle_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::DUPLICATE)?;
+        let derived_rights = normalize_requested_rights(resolved, rights)?;
+        state.duplicate_handle(handle, derived_rights)
+    })
+}
+
+/// Replace one handle with a new handle that carries equal-or-fewer rights.
+pub fn replace_handle(
+    handle: zx_handle_t,
+    rights: zx_rights_t,
+) -> Result<zx_handle_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::DUPLICATE)?;
+        let derived_rights = normalize_requested_rights(resolved, rights)?;
+        state.replace_handle(handle, derived_rights)
+    })
+}
+
+/// Signal the local side of an EventPair.
+pub fn object_signal(
+    handle: zx_handle_t,
+    clear_mask: zx_signals_t,
+    set_mask: zx_signals_t,
+) -> Result<(), zx_status_t> {
+    let clear = Signals::from_bits(clear_mask);
+    let set = Signals::from_bits(set_mask);
+    if !clear.without(USER_SIGNAL_MASK).is_empty() || !set.without(USER_SIGNAL_MASK).is_empty() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::SIGNAL)?;
+        let endpoint = match state.objects.get_mut(&resolved.object_id()) {
+            Some(KernelObject::EventPair(endpoint)) => endpoint,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        endpoint.user_signals = endpoint.user_signals.without(clear).union(set);
+        let _ = notify_waitable_signals_changed(state, resolved.object_id());
+        Ok(())
+    })
+}
+
 /// Signal the peer side of an EventPair.
 pub fn object_signal_peer(
     handle: zx_handle_t,
@@ -707,7 +775,7 @@ pub fn object_signal_peer(
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
             };
-            require_handle_rights(resolved, crate::task::HandleRights::SIGNAL)?;
+            require_handle_rights(resolved, crate::task::HandleRights::SIGNAL_PEER)?;
             if endpoint.peer_closed {
                 return Err(ZX_ERR_PEER_CLOSED);
             }
@@ -1237,6 +1305,22 @@ fn require_handle_rights(
     }
 }
 
+fn normalize_requested_rights(
+    resolved: crate::task::ResolvedHandle,
+    requested: zx_rights_t,
+) -> Result<crate::task::HandleRights, zx_status_t> {
+    if requested == ZX_RIGHT_SAME_RIGHTS {
+        return Ok(resolved.rights());
+    }
+    if (requested & !ZX_RIGHTS_ALL) != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if (requested & !resolved.rights().bits()) != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    Ok(crate::task::HandleRights::from_zx_rights(requested))
+}
+
 fn channel_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER
@@ -1250,6 +1334,7 @@ fn eventpair_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::WAIT
         | crate::task::HandleRights::SIGNAL
+        | crate::task::HandleRights::SIGNAL_PEER
 }
 
 fn port_default_rights() -> crate::task::HandleRights {
@@ -1272,6 +1357,7 @@ fn vmo_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::READ
         | crate::task::HandleRights::WRITE
+        | crate::task::HandleRights::MAP
 }
 
 fn vmar_default_rights() -> crate::task::HandleRights {
@@ -1279,12 +1365,14 @@ fn vmar_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::READ
         | crate::task::HandleRights::WRITE
+        | crate::task::HandleRights::MAP
 }
 
 fn require_vm_mapping_rights(
     resolved: crate::task::ResolvedHandle,
     perms: MappingPerms,
 ) -> Result<(), zx_status_t> {
+    require_handle_rights(resolved, crate::task::HandleRights::MAP)?;
     require_handle_rights(resolved, crate::task::HandleRights::READ)?;
     if perms.contains(MappingPerms::WRITE) {
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;

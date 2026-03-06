@@ -21,12 +21,19 @@ use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameId, FrameTable,
     MappingPerms, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
 };
+use axle_types::rights::{
+    ZX_RIGHT_APPLY_PROFILE, ZX_RIGHT_DESTROY, ZX_RIGHT_DUPLICATE, ZX_RIGHT_ENUMERATE,
+    ZX_RIGHT_EXECUTE, ZX_RIGHT_GET_POLICY, ZX_RIGHT_GET_PROPERTY, ZX_RIGHT_INSPECT,
+    ZX_RIGHT_MANAGE_JOB, ZX_RIGHT_MANAGE_PROCESS, ZX_RIGHT_MANAGE_THREAD, ZX_RIGHT_MAP,
+    ZX_RIGHT_READ, ZX_RIGHT_SET_POLICY, ZX_RIGHT_SET_PROPERTY, ZX_RIGHT_SIGNAL,
+    ZX_RIGHT_SIGNAL_PEER, ZX_RIGHT_TRANSFER, ZX_RIGHT_WAIT, ZX_RIGHT_WRITE,
+};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
     ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND,
     ZX_ERR_OUT_OF_RANGE,
 };
-use axle_types::{zx_handle_t, zx_status_t};
+use axle_types::{zx_handle_t, zx_rights_t, zx_status_t};
 use bitflags::bitflags;
 
 const CSPACE_MAX_SLOTS: u16 = 16_384;
@@ -40,12 +47,32 @@ bitflags! {
     /// Internal handle-rights model used by the bootstrap kernel.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct HandleRights: u32 {
-        const DUPLICATE = 1 << 0;
-        const TRANSFER = 1 << 1;
-        const WAIT = 1 << 2;
-        const READ = 1 << 3;
-        const WRITE = 1 << 4;
-        const SIGNAL = 1 << 5;
+        const DUPLICATE = ZX_RIGHT_DUPLICATE;
+        const TRANSFER = ZX_RIGHT_TRANSFER;
+        const READ = ZX_RIGHT_READ;
+        const WRITE = ZX_RIGHT_WRITE;
+        const EXECUTE = ZX_RIGHT_EXECUTE;
+        const MAP = ZX_RIGHT_MAP;
+        const GET_PROPERTY = ZX_RIGHT_GET_PROPERTY;
+        const SET_PROPERTY = ZX_RIGHT_SET_PROPERTY;
+        const ENUMERATE = ZX_RIGHT_ENUMERATE;
+        const DESTROY = ZX_RIGHT_DESTROY;
+        const SET_POLICY = ZX_RIGHT_SET_POLICY;
+        const GET_POLICY = ZX_RIGHT_GET_POLICY;
+        const SIGNAL = ZX_RIGHT_SIGNAL;
+        const SIGNAL_PEER = ZX_RIGHT_SIGNAL_PEER;
+        const WAIT = ZX_RIGHT_WAIT;
+        const INSPECT = ZX_RIGHT_INSPECT;
+        const MANAGE_JOB = ZX_RIGHT_MANAGE_JOB;
+        const MANAGE_PROCESS = ZX_RIGHT_MANAGE_PROCESS;
+        const MANAGE_THREAD = ZX_RIGHT_MANAGE_THREAD;
+        const APPLY_PROFILE = ZX_RIGHT_APPLY_PROFILE;
+    }
+}
+
+impl HandleRights {
+    pub(crate) const fn from_zx_rights(rights: zx_rights_t) -> Self {
+        Self::from_bits_retain(rights)
     }
 }
 
@@ -394,6 +421,32 @@ impl Process {
         self.cspace.close(handle).map_err(map_lookup_error)?;
         Ok(())
     }
+
+    fn duplicate_handle_derived(
+        &mut self,
+        raw: zx_handle_t,
+        rights: HandleRights,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        let handle = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
+        let duplicated = self
+            .cspace
+            .duplicate_derived(handle, rights.bits())
+            .map_err(map_alloc_error)?;
+        Ok(duplicated.raw())
+    }
+
+    fn replace_handle_derived(
+        &mut self,
+        raw: zx_handle_t,
+        rights: HandleRights,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        let handle = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
+        let replaced = self
+            .cspace
+            .replace_derived(handle, rights.bits())
+            .map_err(map_alloc_error)?;
+        Ok(replaced.raw())
+    }
 }
 
 #[derive(Debug)]
@@ -474,6 +527,26 @@ impl Kernel {
 
     pub(crate) fn close_current_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
         self.current_process_mut()?.close_handle(raw)
+    }
+
+    pub(crate) fn duplicate_current_handle(
+        &mut self,
+        raw: zx_handle_t,
+        rights: HandleRights,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        let _ = self.lookup_current_handle(raw, HandleRights::empty())?;
+        self.current_process_mut()?
+            .duplicate_handle_derived(raw, rights)
+    }
+
+    pub(crate) fn replace_current_handle(
+        &mut self,
+        raw: zx_handle_t,
+        rights: HandleRights,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        let _ = self.lookup_current_handle(raw, HandleRights::empty())?;
+        self.current_process_mut()?
+            .replace_handle_derived(raw, rights)
     }
 
     pub(crate) fn validate_current_user_ptr(&self, ptr: u64, len: usize) -> bool {
