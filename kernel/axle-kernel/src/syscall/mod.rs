@@ -327,14 +327,10 @@ fn sys_object_wait_one(_args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let (status, observed) = match crate::object::object_wait_one(handle, signals, deadline) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    if let Err(e) = copyout(observed_ptr, observed) {
-        return e;
+    match crate::object::object_wait_one(handle, signals, deadline, observed_ptr) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
     }
-    status
 }
 
 fn sys_object_wait_async(_args: [u64; 6]) -> zx_status_t {
@@ -439,13 +435,8 @@ fn sys_port_wait(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    match crate::object::port_wait(handle, deadline) {
-        Ok(packet) => {
-            if let Err(e) = copyout(out_ptr, packet) {
-                return e;
-            }
-            ZX_OK
-        }
+    match crate::object::port_wait(handle, deadline, out_ptr) {
+        Ok(()) => ZX_OK,
         Err(e) => e,
     }
 }

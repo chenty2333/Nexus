@@ -1,0 +1,23 @@
+id = "kernel.thread.scheduler_wait_paths_bootstrap"
+description = "Bootstrap worker thread drives wait_one and port_wait wakeups through the scheduler-backed handoff path"
+tags = ["module:thread", "module:wait", "module:port", "module:kernel", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.thread.scheduler_wait_paths_bootstrap"]
+
+[assertions.status_code]
+thread_wait_one = 0
+thread_signal_status = 0
+thread_port_wait = 0
+thread_port_queue_status = 0
+
+[assertions.packet_fields]
+thread_wait_one_observed = 1073741824
+thread_port_packet_key = 28673
+thread_port_packet_type = 0

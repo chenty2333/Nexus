@@ -1383,29 +1383,7 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
         // Port queue state changed; notify async observers waiting on port readability/writability.
         let _ = notify_waitable_signals_changed(state, object_id);
 
-        match pkt.kind {
-            PacketKind::User => Ok(zx_port_packet_t {
-                key: pkt.key,
-                type_: ZX_PKT_TYPE_USER,
-                status: pkt.status,
-                user: zx_packet_user_t { u64: pkt.user },
-            }),
-            PacketKind::Signal => {
-                let sig = zx_packet_signal_t {
-                    trigger: pkt.trigger.bits(),
-                    observed: pkt.observed.bits(),
-                    count: pkt.count as u64,
-                    timestamp: pkt.timestamp,
-                    reserved1: 0,
-                };
-                Ok(zx_port_packet_t {
-                    key: pkt.key,
-                    type_: ZX_PKT_TYPE_SIGNAL_ONE,
-                    status: ZX_OK,
-                    user: sig.to_user(),
-                })
-            }
-        }
+        Ok(port_packet_from_core(pkt))
     })
 }
 
@@ -1413,13 +1391,39 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
 ///
 /// - `deadline == 0`: non-blocking poll; returns `ZX_ERR_SHOULD_WAIT` if empty.
 /// - `deadline == i64::MAX`: wait forever.
-pub fn port_wait(handle: zx_handle_t, deadline: i64) -> Result<zx_port_packet_t, zx_status_t> {
+pub fn port_wait(
+    handle: zx_handle_t,
+    deadline: i64,
+    out_ptr: *mut zx_port_packet_t,
+) -> Result<(), zx_status_t> {
     loop {
         match wait_port_packet(handle) {
-            Ok(pkt) => return Ok(pkt),
+            Ok(pkt) => {
+                with_state_mut(|state| {
+                    state.kernel.copyout_thread_user(
+                        state.kernel.current_thread_info()?.thread_id(),
+                        out_ptr,
+                        pkt,
+                    )
+                })?;
+                return Ok(());
+            }
             Err(ZX_ERR_SHOULD_WAIT) => {
                 if deadline == 0 {
                     return Err(ZX_ERR_SHOULD_WAIT);
+                }
+                let blocked_on_scheduler = with_state_mut(|state| {
+                    let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
+                    let object_id = resolved.object_id();
+                    if deadline == i64::MAX && state.kernel.can_block_current_thread() {
+                        state.kernel.enqueue_current_port_wait(object_id, out_ptr)?;
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                })?;
+                if blocked_on_scheduler {
+                    return Ok(());
                 }
                 let now = crate::time::now_ns();
                 if deadline != i64::MAX && deadline <= now {
@@ -1453,25 +1457,35 @@ pub fn object_wait_one(
     handle: zx_handle_t,
     watched: zx_signals_t,
     deadline: i64,
-) -> Result<(zx_status_t, zx_signals_t), zx_status_t> {
+    observed_ptr: *mut zx_signals_t,
+) -> Result<(), zx_status_t> {
     let watched = Signals::from_bits(watched);
     if watched.is_empty() {
         return Err(ZX_ERR_INVALID_ARGS);
     }
 
     loop {
-        // Lock scope so we can drop it before sleeping.
-        let observed = {
+        {
             let mut guard = STATE.lock();
             let state = guard.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
             let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
             let object_id = resolved.object_id();
-            signals_for_object_id(state, object_id)?
+            let observed = signals_for_object_id(state, object_id)?;
+            if observed.intersects(watched) {
+                state.kernel.copyout_thread_user(
+                    state.kernel.current_thread_info()?.thread_id(),
+                    observed_ptr,
+                    observed.bits(),
+                )?;
+                return Ok(());
+            }
+            if deadline == i64::MAX && state.kernel.can_block_current_thread() {
+                state
+                    .kernel
+                    .enqueue_current_signal_wait(object_id, watched, observed_ptr)?;
+                return Ok(());
+            }
         };
-
-        if observed.intersects(watched) {
-            return Ok((ZX_OK, observed.bits()));
-        }
 
         let now = crate::time::now_ns();
         if deadline != i64::MAX && deadline <= now {
@@ -1486,10 +1500,17 @@ pub fn object_wait_one(
                 let object_id = resolved.object_id();
                 signals_for_object_id(state, object_id)?
             };
+            with_state_mut(|state| {
+                state.kernel.copyout_thread_user(
+                    state.kernel.current_thread_info()?.thread_id(),
+                    observed_ptr,
+                    observed.bits(),
+                )
+            })?;
             if observed.intersects(watched) {
-                return Ok((ZX_OK, observed.bits()));
+                return Ok(());
             }
-            return Ok((ZX_ERR_TIMED_OUT, observed.bits()));
+            return Err(ZX_ERR_TIMED_OUT);
         }
 
         // Sleep until the next interrupt (timer tick, IPI, ...), then re-check.
@@ -1861,6 +1882,7 @@ fn notify_waitable_signals_changed(
 ) -> Result<(), zx_status_t> {
     let current = signals_for_object_id(state, waitable_id)?;
     let now = crate::time::now_ns();
+    wake_signal_waiters(state, waitable_id, current)?;
 
     // Collect port ids first to avoid aliasing `state.objects` borrows.
     let port_ids: alloc::vec::Vec<u64> = state
@@ -1870,10 +1892,102 @@ fn notify_waitable_signals_changed(
         .collect();
 
     for port_id in port_ids {
-        let Some(KernelObject::Port(port)) = state.objects.get_mut(&port_id) else {
-            continue;
+        {
+            let Some(KernelObject::Port(port)) = state.objects.get_mut(&port_id) else {
+                continue;
+            };
+            port.on_signals_changed(waitable_id, current, now);
+        }
+        wake_port_waiters(state, port_id)?;
+    }
+    if matches!(state.objects.get(&waitable_id), Some(KernelObject::Port(_))) {
+        wake_port_waiters(state, waitable_id)?;
+    }
+    Ok(())
+}
+
+fn port_packet_from_core(pkt: Packet) -> zx_port_packet_t {
+    match pkt.kind {
+        PacketKind::User => zx_port_packet_t {
+            key: pkt.key,
+            type_: ZX_PKT_TYPE_USER,
+            status: pkt.status,
+            user: zx_packet_user_t { u64: pkt.user },
+        },
+        PacketKind::Signal => {
+            let sig = zx_packet_signal_t {
+                trigger: pkt.trigger.bits(),
+                observed: pkt.observed.bits(),
+                count: pkt.count as u64,
+                timestamp: pkt.timestamp,
+                reserved1: 0,
+            };
+            zx_port_packet_t {
+                key: pkt.key,
+                type_: ZX_PKT_TYPE_SIGNAL_ONE,
+                status: ZX_OK,
+                user: sig.to_user(),
+            }
+        }
+    }
+}
+
+fn wake_signal_waiters(
+    state: &mut KernelState,
+    waitable_id: u64,
+    current: Signals,
+) -> Result<(), zx_status_t> {
+    let waiters = state.kernel.signal_waiters_ready(waitable_id, current);
+    for waiter in waiters {
+        let status = match state.kernel.copyout_thread_user(
+            waiter.thread_id(),
+            waiter.observed_ptr(),
+            current.bits(),
+        ) {
+            Ok(()) => ZX_OK,
+            Err(err) => err,
         };
-        port.on_signals_changed(waitable_id, current, now);
+        state
+            .kernel
+            .make_thread_runnable(waiter.thread_id(), status)?;
+    }
+    Ok(())
+}
+
+fn wake_port_waiters(state: &mut KernelState, port_id: u64) -> Result<(), zx_status_t> {
+    let waiters = state.kernel.port_waiters(port_id);
+    if waiters.is_empty() {
+        return Ok(());
+    }
+
+    for waiter in waiters {
+        let packet = {
+            let Some(KernelObject::Port(port)) = state.objects.get_mut(&port_id) else {
+                return Err(ZX_ERR_BAD_STATE);
+            };
+            match port.pop() {
+                Ok(packet) => packet,
+                Err(PortError::ShouldWait) => break,
+                Err(err) => {
+                    state
+                        .kernel
+                        .make_thread_runnable(waiter.thread_id(), map_port_error(err))?;
+                    continue;
+                }
+            }
+        };
+        let packet = port_packet_from_core(packet);
+        let status =
+            match state
+                .kernel
+                .copyout_thread_user(waiter.thread_id(), waiter.packet_ptr(), packet)
+            {
+                Ok(()) => ZX_OK,
+                Err(err) => err,
+            };
+        state
+            .kernel
+            .make_thread_runnable(waiter.thread_id(), status)?;
     }
     Ok(())
 }

@@ -16,7 +16,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use axle_core::handle::Handle;
-use axle_core::{CSpace, CSpaceError, Capability, RevocationManager};
+use axle_core::{CSpace, CSpaceError, Capability, RevocationManager, Signals};
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameId, FrameTable,
     FutexKey, GlobalVmoId, MappingPerms, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
@@ -33,7 +33,9 @@ use axle_types::status::{
     ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND,
     ZX_ERR_OUT_OF_RANGE, ZX_OK,
 };
-use axle_types::{zx_handle_t, zx_koid_t, zx_rights_t, zx_status_t};
+use axle_types::{
+    zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t,
+};
 use bitflags::bitflags;
 use core::mem::size_of;
 
@@ -267,7 +269,50 @@ impl CreatedVmo {
 pub(crate) enum ThreadState {
     New,
     Runnable,
-    FutexWait { key: FutexKey },
+    FutexWait {
+        key: FutexKey,
+    },
+    SignalWait {
+        object_id: u64,
+        watched: Signals,
+        observed_ptr: u64,
+    },
+    PortWait {
+        port_object_id: u64,
+        packet_ptr: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SignalWaiter {
+    thread_id: ThreadId,
+    observed_ptr: u64,
+}
+
+impl SignalWaiter {
+    pub(crate) const fn thread_id(self) -> ThreadId {
+        self.thread_id
+    }
+
+    pub(crate) const fn observed_ptr(self) -> *mut zx_signals_t {
+        self.observed_ptr as *mut zx_signals_t
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PortWaiter {
+    thread_id: ThreadId,
+    packet_ptr: u64,
+}
+
+impl PortWaiter {
+    pub(crate) const fn thread_id(self) -> ThreadId {
+        self.thread_id
+    }
+
+    pub(crate) const fn packet_ptr(self) -> *mut zx_port_packet_t {
+        self.packet_ptr as *mut zx_port_packet_t
+    }
 }
 
 /// Pinned page run loaned from the current process into a kernel object.
@@ -945,6 +990,34 @@ impl Kernel {
         Ok(self.current_process()?.koid)
     }
 
+    pub(crate) fn copyout_thread_user<T: Copy>(
+        &self,
+        thread_id: ThreadId,
+        ptr: *mut T,
+        value: T,
+    ) -> Result<(), zx_status_t> {
+        if ptr.is_null() {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let process = self
+            .processes
+            .get(&thread.process_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let address_space = self
+            .address_spaces
+            .get(&process.address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if !address_space.validate_user_ptr(ptr as u64, size_of::<T>()) {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        // SAFETY: the pointer was validated against the target thread's userspace mapping.
+        unsafe {
+            core::ptr::write_unaligned(ptr, value);
+        }
+        Ok(())
+    }
+
     pub(crate) fn capture_current_user_context(
         &mut self,
         trap: &crate::arch::int80::TrapFrame,
@@ -970,14 +1043,16 @@ impl Kernel {
                 if self.reschedule_requested {
                     self.reschedule_requested = false;
                     if let Some(next_thread_id) = self.pop_runnable_thread() {
-                        self.enqueue_runnable_thread(self.current_thread_id)?;
+                        self.requeue_current_thread()?;
                         self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     }
                 }
                 Ok(())
             }
             ThreadState::New => Err(ZX_ERR_BAD_STATE),
-            ThreadState::FutexWait { .. } => {
+            ThreadState::FutexWait { .. }
+            | ThreadState::SignalWait { .. }
+            | ThreadState::PortWait { .. } => {
                 let next_thread_id = self.pop_runnable_thread().ok_or(ZX_ERR_BAD_STATE)?;
                 self.switch_to_thread(next_thread_id, trap, cpu_frame)
             }
@@ -1002,6 +1077,85 @@ impl Kernel {
 
     pub(crate) fn can_block_current_thread(&self) -> bool {
         !self.run_queue.is_empty()
+    }
+
+    pub(crate) fn enqueue_current_signal_wait(
+        &mut self,
+        object_id: u64,
+        watched: Signals,
+        observed_ptr: *mut zx_signals_t,
+    ) -> Result<(), zx_status_t> {
+        let thread = self
+            .threads
+            .get_mut(&self.current_thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if !matches!(thread.state, ThreadState::Runnable) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.state = ThreadState::SignalWait {
+            object_id,
+            watched,
+            observed_ptr: observed_ptr as u64,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn signal_waiters_ready(
+        &self,
+        object_id: u64,
+        current: Signals,
+    ) -> Vec<SignalWaiter> {
+        self.threads
+            .iter()
+            .filter_map(|(thread_id, thread)| match thread.state {
+                ThreadState::SignalWait {
+                    object_id: wait_object_id,
+                    watched,
+                    observed_ptr,
+                } if wait_object_id == object_id && current.intersects(watched) => {
+                    Some(SignalWaiter {
+                        thread_id: *thread_id,
+                        observed_ptr,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn enqueue_current_port_wait(
+        &mut self,
+        port_object_id: u64,
+        packet_ptr: *mut zx_port_packet_t,
+    ) -> Result<(), zx_status_t> {
+        let thread = self
+            .threads
+            .get_mut(&self.current_thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if !matches!(thread.state, ThreadState::Runnable) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.state = ThreadState::PortWait {
+            port_object_id,
+            packet_ptr: packet_ptr as u64,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn port_waiters(&self, port_object_id: u64) -> Vec<PortWaiter> {
+        self.threads
+            .iter()
+            .filter_map(|(thread_id, thread)| match thread.state {
+                ThreadState::PortWait {
+                    port_object_id: wait_port_object_id,
+                    packet_ptr,
+                } if wait_port_object_id == port_object_id => Some(PortWaiter {
+                    thread_id: *thread_id,
+                    packet_ptr,
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -1304,9 +1458,6 @@ impl Kernel {
     }
 
     fn enqueue_runnable_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
-        if thread_id == self.current_thread_id {
-            return Ok(());
-        }
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         if thread.queued || !matches!(thread.state, ThreadState::Runnable) {
             return Ok(());
@@ -1314,6 +1465,10 @@ impl Kernel {
         thread.queued = true;
         self.run_queue.push_back(thread_id);
         Ok(())
+    }
+
+    fn requeue_current_thread(&mut self) -> Result<(), zx_status_t> {
+        self.enqueue_runnable_thread(self.current_thread_id)
     }
 
     fn pop_runnable_thread(&mut self) -> Option<ThreadId> {
@@ -1345,7 +1500,7 @@ impl Kernel {
         Ok(())
     }
 
-    fn make_thread_runnable(
+    pub(crate) fn make_thread_runnable(
         &mut self,
         thread_id: ThreadId,
         status: zx_status_t,

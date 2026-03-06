@@ -900,22 +900,22 @@ mov %rax, 8*52(%rbx)
 mov 0x580(%rbx), %rax
 mov %rax, 8*53(%rbx)
 
-// timer_set(deadline=t0+500ms)
+// timer_set(deadline=t0+2s)
 mov 0x698(%rbx), %rdi
 mov %r12, %rsi
-add $500000000, %rsi
+add $2000000000, %rsi
 xor %rdx, %rdx
 movabs $7, %rax
 int $0x80
 mov %rax, 8*29(%rbx)
 
-// object_wait_one(timer, TIMER_SIGNALED, deadline=t0+200ms, observed=&obs2) should time out
+// object_wait_one(timer, TIMER_SIGNALED, deadline=t0+750ms, observed=&obs2) should time out
 lea 0x6b0(%rbx), %rcx
 movq $0, (%rcx)
 mov 0x698(%rbx), %rdi
 movl $0x8, %esi
 mov %r12, %rdx
-add $200000000, %rdx
+add $750000000, %rdx
 mov %rcx, %r10
 movabs $1, %rax
 int $0x80
@@ -923,13 +923,13 @@ mov %rax, 8*37(%rbx)
 mov (%rcx), %rax
 mov %rax, 8*38(%rbx)
 
-// object_wait_one(timer, TIMER_SIGNALED, deadline=t0+500ms, observed=&obs3) should be OK
+// object_wait_one(timer, TIMER_SIGNALED, deadline=t0+2s, observed=&obs3) should be OK
 lea 0x6b8(%rbx), %rcx
 movq $0, (%rcx)
 mov 0x698(%rbx), %rdi
 movl $0x8, %esi
 mov %r12, %rdx
-add $500000000, %rdx
+add $2000000000, %rdx
 mov %rcx, %r10
 movabs $1, %rax
 int $0x80
@@ -1386,6 +1386,8 @@ futex_owner_match_done:
 
 	// futex_wait(source, 0, INVALID, forever) -> child should wake us
 	movl $0, (%r14)
+	mov %r14, 8*308(%rbx)
+	movq $1, 8*307(%rbx)
 	mov %r14, %rdi
 	xorl %esi, %esi
 	xorl %edx, %edx
@@ -1403,6 +1405,43 @@ futex_owner_match_done:
 	jne thread_resume_done
 	movq $1, 8*306(%rbx)
 thread_resume_done:
+
+	// eventpair_create(fresh pair for threaded wait_one wake)
+	lea 0x8a0(%rbx), %rsi
+	lea 0x8a8(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $16, %rax
+	int $0x80
+
+	// command worker: signal peer on eventpair h1
+	mov 0x8a8(%rbx), %rax
+	mov %rax, 8*308(%rbx)
+	movq $2, 8*307(%rbx)
+	movq $0, 0x8b0(%rbx)
+	mov 0x8a0(%rbx), %rdi
+	movl $0x40000000, %esi
+	movabs $0x7fffffffffffffff, %rdx
+	lea 0x8b0(%rbx), %r10
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*309(%rbx)
+	mov 0x8b0(%rbx), %rax
+	mov %rax, 8*310(%rbx)
+
+	// command worker: queue a user packet into bootstrap port, then block on port_wait
+	mov 8*35(%rbx), %rax
+	mov %rax, 8*308(%rbx)
+	movq $3, 8*307(%rbx)
+	lea 0x8c0(%rbx), %rdx
+	mov 8*35(%rbx), %rdi
+	movabs $0x7fffffffffffffff, %rsi
+	movabs $5, %rax
+	int $0x80
+	mov %rax, 8*312(%rbx)
+	mov 0x8c0(%rbx), %rax
+	mov %rax, 8*313(%rbx)
+	mov 0x8c8(%rbx), %eax
+	mov %rax, 8*314(%rbx)
 
 	// timer_cancel
 	mov 0x698(%rbx), %rdi
@@ -1446,14 +1485,57 @@ int3
 thread_worker_entry:
 	movabs $0x0000000100008000, %rbx
 	movq $1, 8*303(%rbx)
+thread_worker_spin:
+	mov 8*307(%rbx), %rax
+	test %rax, %rax
+	jz thread_worker_spin_pause
+	cmp $1, %rax
+	je thread_worker_futex
+	cmp $2, %rax
+	je thread_worker_signal_peer
+	cmp $3, %rax
+	je thread_worker_queue_port
+	movq $0, 8*307(%rbx)
+thread_worker_spin_pause:
+	pause
+	jmp thread_worker_spin
+
+thread_worker_futex:
+	movq $0, 8*307(%rbx)
+	mov 8*308(%rbx), %rdi
 	movl $1, (%rdi)
-	mov %rdi, %rdi
 	movl $1, %esi
 	movabs $22, %rax
 	int $0x80
 	mov %rax, 8*305(%rbx)
-thread_worker_spin:
-	pause
+	jmp thread_worker_spin
+
+thread_worker_signal_peer:
+	movq $0, 8*307(%rbx)
+	mov 8*308(%rbx), %rdi
+	xorl %esi, %esi
+	movl $0x40000000, %edx
+	movabs $17, %rax
+	int $0x80
+	mov %rax, 8*311(%rbx)
+	jmp thread_worker_spin
+
+thread_worker_queue_port:
+	movq $0, 8*307(%rbx)
+	mov 8*308(%rbx), %rdi
+	lea 0x8e0(%rbx), %rsi
+	movabs $0x7001, %rax
+	mov %rax, 0x00(%rsi)
+	movl $0, 0x08(%rsi)
+	movl $0, 0x0c(%rsi)
+	movabs $0x55, %rax
+	mov %rax, 0x10(%rsi)
+	movq $0, 0x18(%rsi)
+	movq $0, 0x20(%rsi)
+	movq $0, 0x28(%rsi)
+	movabs $4, %rax
+	int $0x80
+	mov %rax, 8*315(%rbx)
 	jmp thread_worker_spin
 
 axle_user_prog_end:
