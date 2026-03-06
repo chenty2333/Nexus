@@ -5,10 +5,10 @@ default:
 
 # Host-only gates for Phase A (contracts).
 xlint:
-  cargo clippy -p axle-types -p axle-core -p axle-sync -p axle-conformance --all-targets -- -D warnings
+  cargo clippy -p axle-types -p axle-core -p axle-mm -p axle-sync -p axle-conformance --all-targets -- -D warnings
 
 xtest:
-  cargo test -p axle-types -p axle-core -p axle-sync -p axle-conformance
+  cargo test -p axle-types -p axle-core -p axle-mm -p axle-sync -p axle-conformance
 
 # Kernel conformance gate.
 test-kernel:
@@ -42,6 +42,7 @@ loom:
 # Short libFuzzer smoke run for the host-side semantic core.
 fuzz-smoke:
   cargo fuzz run cspace_ops --fuzz-dir crates/axle-core/fuzz -D --sanitizer none -- -max_total_time=5
+  cargo fuzz run addr_space_ops --fuzz-dir crates/axle-mm/fuzz -D --sanitizer none -- -max_total_time=5
 
 # Syscall ABI generation (Phase A bootstrap).
 gen-syscalls:

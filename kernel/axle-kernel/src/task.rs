@@ -16,6 +16,7 @@ use alloc::collections::BTreeMap;
 
 use axle_core::handle::Handle;
 use axle_core::{CSpace, CSpaceError, Capability, RevocationManager};
+use axle_mm::{AddressSpace as VmAddressSpace, MappingPerms, VmaLookup, VmoKind};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NO_RESOURCES,
 };
@@ -97,56 +98,67 @@ impl ResolvedHandle {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct UserCopyRegion {
-    start: u64,
-    len: u64,
-}
-
-impl UserCopyRegion {
-    const fn new(start: u64, len: u64) -> Self {
-        Self { start, len }
-    }
-
-    fn contains(self, ptr: u64, len: usize) -> bool {
-        if len == 0 {
-            return false;
-        }
-        let len_u64 = len as u64;
-        let end = match ptr.checked_add(len_u64) {
-            Some(v) => v,
-            None => return false,
-        };
-        ptr >= self.start && end <= self.start.saturating_add(self.len)
-    }
-}
-
 #[derive(Debug)]
 struct AddressSpace {
-    user_copy_regions: [UserCopyRegion; 2],
+    vm: VmAddressSpace,
 }
 
 impl AddressSpace {
     fn bootstrap() -> Self {
-        Self {
-            user_copy_regions: [
-                UserCopyRegion::new(
-                    crate::userspace::USER_SHARED_VA,
-                    crate::userspace::USER_PAGE_BYTES,
-                ),
-                UserCopyRegion::new(
-                    crate::userspace::USER_STACK_VA,
-                    crate::userspace::USER_PAGE_BYTES,
-                ),
-            ],
-        }
+        let mut vm = VmAddressSpace::new(
+            crate::userspace::USER_CODE_VA,
+            crate::userspace::USER_REGION_BYTES,
+        )
+        .expect("bootstrap address-space root must be valid");
+
+        let code_vmo = vm
+            .create_vmo(VmoKind::Anonymous, crate::userspace::USER_PAGE_BYTES)
+            .expect("bootstrap code vmo allocation must succeed");
+        vm.map_fixed(
+            crate::userspace::USER_CODE_VA,
+            crate::userspace::USER_PAGE_BYTES,
+            code_vmo,
+            0,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::EXECUTE | MappingPerms::USER,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::EXECUTE | MappingPerms::USER,
+        )
+        .expect("bootstrap code mapping must succeed");
+
+        let shared_vmo = vm
+            .create_vmo(VmoKind::Anonymous, crate::userspace::USER_PAGE_BYTES)
+            .expect("bootstrap shared vmo allocation must succeed");
+        vm.map_fixed(
+            crate::userspace::USER_SHARED_VA,
+            crate::userspace::USER_PAGE_BYTES,
+            shared_vmo,
+            0,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+        )
+        .expect("bootstrap shared mapping must succeed");
+
+        let stack_vmo = vm
+            .create_vmo(VmoKind::Anonymous, crate::userspace::USER_PAGE_BYTES)
+            .expect("bootstrap stack vmo allocation must succeed");
+        vm.map_fixed(
+            crate::userspace::USER_STACK_VA,
+            crate::userspace::USER_PAGE_BYTES,
+            stack_vmo,
+            0,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+        )
+        .expect("bootstrap stack mapping must succeed");
+
+        Self { vm }
     }
 
     fn validate_user_ptr(&self, ptr: u64, len: usize) -> bool {
-        self.user_copy_regions
-            .iter()
-            .copied()
-            .any(|region| region.contains(ptr, len))
+        self.vm.contains_range(ptr, len)
+    }
+
+    fn lookup_user_mapping(&self, ptr: u64, len: usize) -> Option<VmaLookup> {
+        self.vm.lookup_range(ptr, len as u64)
     }
 }
 
@@ -274,6 +286,14 @@ impl Kernel {
             return false;
         };
         address_space.validate_user_ptr(ptr, len)
+    }
+
+    /// Resolve a current-thread userspace range back to its VMO mapping metadata.
+    #[allow(dead_code)]
+    pub(crate) fn lookup_current_user_mapping(&self, ptr: u64, len: usize) -> Option<VmaLookup> {
+        let process = self.current_process().ok()?;
+        let address_space = self.address_spaces.get(&process.address_space_id)?;
+        address_space.lookup_user_mapping(ptr, len)
     }
 
     fn alloc_process_id(&mut self) -> ProcessId {

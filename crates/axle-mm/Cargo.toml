@@ -1,0 +1,15 @@
+[package]
+name = "axle-mm"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+bitflags = { version = "2.6", default-features = false }
+
+[dev-dependencies]
+proptest = "1.4"

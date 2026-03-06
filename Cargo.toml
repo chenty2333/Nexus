@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/axle-arch-x86_64",
   "crates/axle-core",
+  "crates/axle-mm",
   "crates/axle-sync",
   "crates/axle-types",
 
