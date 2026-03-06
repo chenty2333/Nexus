@@ -543,6 +543,168 @@ impl VmaLookup {
     }
 }
 
+/// Software page-metadata tag for one virtual page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PteMetaTag {
+    /// Mapped but not currently backed by a resident frame.
+    Reserved,
+    /// Anonymous page that should be allocated on first fault.
+    LazyAnon,
+    /// VMO-backed page that should be materialized on first fault.
+    LazyVmo,
+    /// Resident page backed by one concrete frame.
+    Present,
+    /// Resident state has been evicted to swap-like storage.
+    Swapped,
+    /// Fragment page used by loan/message plumbing.
+    LoanFrag,
+    /// Fixed physical mapping that should not participate in normal COW.
+    Phys,
+}
+
+/// Software shadow metadata for one `(address_space, vpn)` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PteMeta {
+    tag: PteMetaTag,
+    logical_write: bool,
+    cow_shared: bool,
+    pinned: bool,
+    map_id: MapId,
+    page_delta: u64,
+}
+
+impl PteMeta {
+    /// Metadata tag for the page.
+    pub const fn tag(self) -> PteMetaTag {
+        self.tag
+    }
+
+    /// Whether the mapping is semantically writable, independent of current PTE state.
+    pub const fn logical_write(self) -> bool {
+        self.logical_write
+    }
+
+    /// Whether the page currently participates in a shared COW view.
+    pub const fn cow_shared(self) -> bool {
+        self.cow_shared
+    }
+
+    /// Whether the page is currently pinned by an in-flight kernel path.
+    pub const fn pinned(self) -> bool {
+        self.pinned
+    }
+
+    /// Coarse mapping record that owns this page.
+    pub const fn map_id(self) -> MapId {
+        self.map_id
+    }
+
+    /// Page offset from the start of the owning coarse mapping.
+    pub const fn page_delta(self) -> u64 {
+        self.page_delta
+    }
+}
+
+#[derive(Debug)]
+struct PteMetaStore {
+    base_vpn: u64,
+    slots: Vec<Option<PteMeta>>,
+}
+
+impl PteMetaStore {
+    fn new(root_base: u64, root_len: u64) -> Result<Self, AddressSpaceError> {
+        if root_len == 0 || !is_page_aligned(root_base) || !is_page_aligned(root_len) {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+        let page_count =
+            usize::try_from(root_len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
+        Ok(Self {
+            base_vpn: vpn_of(root_base),
+            slots: alloc::vec![None; page_count],
+        })
+    }
+
+    fn meta(&self, va: u64) -> Option<PteMeta> {
+        let page_base = align_down(va, PAGE_SIZE);
+        self.meta_for_vpn(vpn_of(page_base))
+    }
+
+    fn meta_for_vpn(&self, vpn: u64) -> Option<PteMeta> {
+        let index = self.index_for_vpn(vpn).ok()?;
+        self.slots.get(index).copied().flatten()
+    }
+
+    fn install_range(&mut self, base: u64, metas: &[PteMeta]) -> Result<(), AddressSpaceError> {
+        if metas.is_empty() || !is_page_aligned(base) {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+        let start = self.index_for_vpn(vpn_of(base))?;
+        let end = start
+            .checked_add(metas.len())
+            .ok_or(AddressSpaceError::InvalidArgs)?;
+        let slots = self
+            .slots
+            .get_mut(start..end)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        for (slot, meta) in slots.iter_mut().zip(metas.iter().copied()) {
+            *slot = Some(meta);
+        }
+        Ok(())
+    }
+
+    fn clear_range(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
+        validate_mapping_range(base, len)?;
+        let page_count =
+            usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
+        let start = self.index_for_vpn(vpn_of(base))?;
+        let end = start
+            .checked_add(page_count)
+            .ok_or(AddressSpaceError::InvalidArgs)?;
+        let slots = self
+            .slots
+            .get_mut(start..end)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        for slot in slots {
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    fn update_range<F>(
+        &mut self,
+        base: u64,
+        len: u64,
+        mut update: F,
+    ) -> Result<(), AddressSpaceError>
+    where
+        F: FnMut(&mut PteMeta),
+    {
+        validate_mapping_range(base, len)?;
+        let page_count =
+            usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
+        let start = self.index_for_vpn(vpn_of(base))?;
+        let end = start
+            .checked_add(page_count)
+            .ok_or(AddressSpaceError::InvalidArgs)?;
+        let slots = self
+            .slots
+            .get_mut(start..end)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        for slot in slots {
+            let meta = slot.as_mut().ok_or(AddressSpaceError::NotFound)?;
+            update(meta);
+        }
+        Ok(())
+    }
+
+    fn index_for_vpn(&self, vpn: u64) -> Result<usize, AddressSpaceError> {
+        let relative = vpn
+            .checked_sub(self.base_vpn)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        usize::try_from(relative).map_err(|_| AddressSpaceError::InvalidArgs)
+    }
+}
+
 /// Stable futex key derived from VMA metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FutexKey {
@@ -643,6 +805,7 @@ pub struct AddressSpace {
     root: Vmar,
     vmos: Vec<Vmo>,
     map_recs: Vec<MapRec>,
+    pte_meta: PteMetaStore,
     vmas: Vec<Vma>,
     next_vmo_id: u64,
     next_map_id: u64,
@@ -666,6 +829,7 @@ impl AddressSpace {
             },
             vmos: Vec::new(),
             map_recs: Vec::new(),
+            pte_meta: PteMetaStore::new(root_base, root_len)?,
             vmas: Vec::new(),
             next_vmo_id: 1,
             next_map_id: 1,
@@ -716,6 +880,16 @@ impl AddressSpace {
             .iter()
             .copied()
             .find(|map_rec| map_rec.id == id)
+    }
+
+    /// Return the current page metadata for one virtual address, if mapped.
+    pub fn pte_meta(&self, va: u64) -> Option<PteMeta> {
+        self.pte_meta.meta(va)
+    }
+
+    /// Return the current page metadata for one absolute virtual page number.
+    pub fn pte_meta_for_vpn(&self, vpn: u64) -> Option<PteMeta> {
+        self.pte_meta.meta_for_vpn(vpn)
     }
 
     /// Bind a resident frame to one page of a VMO.
@@ -816,7 +990,7 @@ impl AddressSpace {
         }
 
         let map_id = self.alloc_map_id();
-        self.map_recs.push(MapRec {
+        let map_rec = MapRec {
             id: map_id,
             vmar_id: self.root.id,
             base,
@@ -825,8 +999,8 @@ impl AddressSpace {
             global_vmo_id,
             vmo_offset,
             max_perms,
-        });
-        self.vmas.push(Vma {
+        };
+        let vma = Vma {
             map_id,
             base,
             len,
@@ -836,7 +1010,24 @@ impl AddressSpace {
             perms,
             max_perms,
             copy_on_write: false,
-        });
+        };
+        let page_meta = match self.build_pte_meta_range(vma) {
+            Ok(page_meta) => page_meta,
+            Err(err) => {
+                for rollback in incremented {
+                    let _ = frames.dec_ref(rollback);
+                }
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.pte_meta.install_range(base, &page_meta) {
+            for rollback in incremented {
+                let _ = frames.dec_ref(rollback);
+            }
+            return Err(err);
+        }
+        self.map_recs.push(map_rec);
+        self.vmas.push(vma);
         self.vmas.sort_by_key(|vma| vma.base);
         Ok(())
     }
@@ -878,6 +1069,7 @@ impl AddressSpace {
         {
             self.map_recs.remove(map_index);
         }
+        self.pte_meta.clear_range(removed.base, removed.len)?;
         Ok(())
     }
 
@@ -898,6 +1090,11 @@ impl AddressSpace {
             return Err(AddressSpaceError::PermissionIncrease);
         }
         vma.perms = new_perms;
+        let logical_write = new_perms.contains(MappingPerms::WRITE);
+        let _ = vma;
+        self.pte_meta.update_range(base, len, |meta| {
+            meta.logical_write = logical_write;
+        })?;
         Ok(())
     }
 
@@ -914,6 +1111,11 @@ impl AddressSpace {
         }
         vma.perms.remove(MappingPerms::WRITE);
         vma.copy_on_write = true;
+        let _ = vma;
+        self.pte_meta.update_range(base, len, |meta| {
+            meta.logical_write = true;
+            meta.cow_shared = true;
+        })?;
         Ok(())
     }
 
@@ -960,6 +1162,14 @@ impl AddressSpace {
             .ok_or(AddressSpaceError::NotFound)?;
         vma.perms.insert(MappingPerms::WRITE);
         vma.copy_on_write = false;
+        let refresh_base = vma.base;
+        let refresh_len = vma.len;
+        let _ = vma;
+        self.pte_meta
+            .update_range(refresh_base, refresh_len, |meta| {
+                meta.logical_write = true;
+                meta.cow_shared = false;
+            })?;
 
         Ok(CowFaultResolution {
             fault_page_base: page_base,
@@ -1055,6 +1265,30 @@ impl AddressSpace {
         id
     }
 
+    fn build_pte_meta_range(&self, vma: Vma) -> Result<Vec<PteMeta>, AddressSpaceError> {
+        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        let page_count =
+            usize::try_from(vma.len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
+        let logical_write = vma.copy_on_write || vma.perms.contains(MappingPerms::WRITE);
+        let mut page_meta = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let page_delta = page_index as u64;
+            let page_offset = vma
+                .vmo_offset
+                .checked_add(page_delta * PAGE_SIZE)
+                .ok_or(AddressSpaceError::InvalidArgs)?;
+            page_meta.push(PteMeta {
+                tag: pte_meta_tag(vmo.kind(), vmo.frame_at_offset(page_offset)),
+                logical_write,
+                cow_shared: vma.copy_on_write,
+                pinned: false,
+                map_id: vma.map_id,
+                page_delta,
+            });
+        }
+        Ok(page_meta)
+    }
+
     fn rebind_vmo_frame(
         &mut self,
         vmo_id: VmoId,
@@ -1119,6 +1353,10 @@ fn is_page_aligned(value: u64) -> bool {
     value & (PAGE_SIZE - 1) == 0
 }
 
+const fn vpn_of(va: u64) -> u64 {
+    va / PAGE_SIZE
+}
+
 fn align_down(value: u64, align: u64) -> u64 {
     value & !(align - 1)
 }
@@ -1126,6 +1364,14 @@ fn align_down(value: u64, align: u64) -> u64 {
 fn overlaps(vma: Vma, base: u64, len: u64) -> bool {
     let end = base + len;
     base < vma.end() && end > vma.base
+}
+
+fn pte_meta_tag(kind: VmoKind, frame_id: Option<FrameId>) -> PteMetaTag {
+    match (kind, frame_id) {
+        (VmoKind::Physical, Some(_)) => PteMetaTag::Phys,
+        (_, Some(_)) => PteMetaTag::Present,
+        _ => PteMetaTag::Reserved,
+    }
 }
 
 #[cfg(test)]
@@ -1229,6 +1475,26 @@ mod tests {
     }
 
     #[test]
+    fn pte_meta_tracks_mapping_identity_and_lifecycle() {
+        let (mut space, mut frames, code_frame, _) = sample_space();
+        let meta = space.pte_meta(ROOT_BASE + 0x80).unwrap();
+        let lookup = space.lookup(ROOT_BASE + 0x80).unwrap();
+
+        assert_eq!(meta.map_id(), lookup.map_id());
+        assert_eq!(meta.page_delta(), 0);
+        assert_eq!(meta.tag(), PteMetaTag::Present);
+        assert!(meta.logical_write());
+        assert!(!meta.cow_shared());
+        assert_eq!(space.pte_meta_for_vpn(vpn_of(ROOT_BASE)).unwrap(), meta);
+        assert_eq!(frames.state(code_frame).unwrap().ref_count(), 1);
+
+        space.unmap(&mut frames, ROOT_BASE, PAGE_SIZE).unwrap();
+
+        assert!(space.pte_meta(ROOT_BASE).is_none());
+        assert!(space.pte_meta_for_vpn(vpn_of(ROOT_BASE)).is_none());
+    }
+
+    #[test]
     fn map_rejects_overlap_and_out_of_range() {
         let (mut space, mut frames, _, _) = sample_space();
         let extra = space
@@ -1297,6 +1563,51 @@ mod tests {
         );
         space.unmap(&mut frames, data_base, PAGE_SIZE).unwrap();
         assert!(space.lookup(data_base).is_none());
+        assert_eq!(frames.state(data_frame).unwrap().ref_count(), 0);
+    }
+
+    #[test]
+    fn pte_meta_follows_protect_and_cow_state() {
+        let (mut space, mut frames, _, data_frame) = sample_space();
+        let data_base = ROOT_BASE + PAGE_SIZE;
+
+        let initial = space.pte_meta(data_base).unwrap();
+        assert_eq!(initial.tag(), PteMetaTag::Present);
+        assert!(initial.logical_write());
+        assert!(!initial.cow_shared());
+
+        space
+            .protect(
+                data_base,
+                PAGE_SIZE,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+        let protected = space.pte_meta(data_base).unwrap();
+        assert!(!protected.logical_write());
+        assert!(!protected.cow_shared());
+
+        space
+            .protect(
+                data_base,
+                PAGE_SIZE,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+        space.mark_copy_on_write(data_base, PAGE_SIZE).unwrap();
+        let cow = space.pte_meta(data_base).unwrap();
+        assert_eq!(cow.tag(), PteMetaTag::Present);
+        assert!(cow.logical_write());
+        assert!(cow.cow_shared());
+
+        let replacement = frames.register_existing(0x70_000).unwrap();
+        space
+            .resolve_cow_fault(&mut frames, data_base + 0x88, replacement)
+            .unwrap();
+        let resolved = space.pte_meta(data_base).unwrap();
+        assert_eq!(resolved.tag(), PteMetaTag::Present);
+        assert!(resolved.logical_write());
+        assert!(!resolved.cow_shared());
         assert_eq!(frames.state(data_frame).unwrap().ref_count(), 0);
     }
 

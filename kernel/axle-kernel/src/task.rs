@@ -21,7 +21,7 @@ use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameId, FrameTable,
     FutexKey, GlobalVmoId, MappingPerms, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
 };
-use axle_page_table::{PageMapping, PageTableError, TxCursor};
+use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor};
 use axle_types::rights::{
     ZX_RIGHT_APPLY_PROFILE, ZX_RIGHT_DESTROY, ZX_RIGHT_DUPLICATE, ZX_RIGHT_ENUMERATE,
     ZX_RIGHT_EXECUTE, ZX_RIGHT_GET_POLICY, ZX_RIGHT_GET_PROPERTY, ZX_RIGHT_INSPECT,
@@ -1400,7 +1400,17 @@ impl Kernel {
         };
 
         let mut page_table = crate::page_table::BootstrapUserPageTable;
-        let mut tx = TxCursor::new(&mut page_table);
+        let range = match PageRange::new(
+            resolved.fault_page_base(),
+            crate::userspace::USER_PAGE_BYTES,
+        ) {
+            Ok(range) => range,
+            Err(_) => return false,
+        };
+        let mut tx = match page_table.lock(range) {
+            Ok(lock) => TxCursor::new(lock),
+            Err(_) => return false,
+        };
         if tx
             .map(
                 resolved.fault_page_base(),
@@ -1409,6 +1419,9 @@ impl Kernel {
             )
             .is_err()
         {
+            return false;
+        }
+        if tx.commit().is_err() {
             return false;
         }
         true
@@ -1534,7 +1547,8 @@ impl Kernel {
             .get(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         let mut page_table = crate::page_table::BootstrapUserPageTable;
-        let mut tx = TxCursor::new(&mut page_table);
+        let range = PageRange::new(base, len).map_err(map_page_table_error)?;
+        let mut tx = TxCursor::new(page_table.lock(range).map_err(map_page_table_error)?);
         tx.map(base, len, |va| {
             let lookup = address_space
                 .lookup_user_mapping(va, 1)
@@ -1542,13 +1556,16 @@ impl Kernel {
             let frame_id = lookup.frame_id().ok_or(PageTableError::Backend)?;
             PageMapping::new(frame_id.raw(), lookup.perms().contains(MappingPerms::WRITE))
         })
-        .map_err(map_page_table_error)
+        .map_err(map_page_table_error)?;
+        tx.commit().map_err(map_page_table_error)
     }
 
     fn clear_mapping_pages(&self, base: u64, len: u64) -> Result<(), zx_status_t> {
         let mut page_table = crate::page_table::BootstrapUserPageTable;
-        let mut tx = TxCursor::new(&mut page_table);
-        tx.unmap(base, len).map_err(map_page_table_error)
+        let range = PageRange::new(base, len).map_err(map_page_table_error)?;
+        let mut tx = TxCursor::new(page_table.lock(range).map_err(map_page_table_error)?);
+        tx.unmap(base, len).map_err(map_page_table_error)?;
+        tx.commit().map_err(map_page_table_error)
     }
 
     fn update_mapping_pages(
@@ -1562,14 +1579,16 @@ impl Kernel {
             .get(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         let mut page_table = crate::page_table::BootstrapUserPageTable;
-        let mut tx = TxCursor::new(&mut page_table);
+        let range = PageRange::new(base, len).map_err(map_page_table_error)?;
+        let mut tx = TxCursor::new(page_table.lock(range).map_err(map_page_table_error)?);
         tx.protect(base, len, |va| {
             let lookup = address_space
                 .lookup_user_mapping(va, 1)
                 .ok_or(PageTableError::Backend)?;
             Ok(lookup.perms().contains(MappingPerms::WRITE))
         })
-        .map_err(map_page_table_error)
+        .map_err(map_page_table_error)?;
+        tx.commit().map_err(map_page_table_error)
     }
 
     fn unpin_loaned_pages_inner(&mut self, pages: &[FrameId]) {

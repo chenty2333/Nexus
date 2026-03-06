@@ -1,10 +1,34 @@
-use axle_page_table::{PageMapping, PageTableBackend, PageTableError};
+use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, PageTableLock};
 
 /// Bootstrap backend over the fixed userspace `USER_PT` bridge.
 #[derive(Debug, Default)]
 pub(crate) struct BootstrapUserPageTable;
 
-impl PageTableBackend for BootstrapUserPageTable {
+#[derive(Debug)]
+pub(crate) struct LockedBootstrapUserPageTable<'a> {
+    page_table: &'a mut BootstrapUserPageTable,
+    range: PageRange,
+}
+
+impl PageTable for BootstrapUserPageTable {
+    type Lock<'a>
+        = LockedBootstrapUserPageTable<'a>
+    where
+        Self: 'a;
+
+    fn lock(&mut self, range: PageRange) -> Result<Self::Lock<'_>, PageTableError> {
+        Ok(LockedBootstrapUserPageTable {
+            page_table: self,
+            range,
+        })
+    }
+}
+
+impl PageTableLock for LockedBootstrapUserPageTable<'_> {
+    fn range(&self) -> PageRange {
+        self.range
+    }
+
     fn query_page(&mut self, va: u64) -> Result<Option<PageMapping>, PageTableError> {
         match crate::userspace::query_user_page_frame(va) {
             Ok(Some(frame)) => PageMapping::new(frame.paddr(), frame.writable()).map(Some),
@@ -28,6 +52,11 @@ impl PageTableBackend for BootstrapUserPageTable {
 
     fn flush_page(&mut self, va: u64) -> Result<(), PageTableError> {
         crate::arch::tlb::flush_page_global(va);
+        Ok(())
+    }
+
+    fn commit(self) -> Result<(), PageTableError> {
+        let _ = self.page_table;
         Ok(())
     }
 }
