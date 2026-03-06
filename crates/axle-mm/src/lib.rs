@@ -63,6 +63,22 @@ impl FrameId {
     }
 }
 
+/// Identifier for one VM metadata address space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AddressSpaceId(u64);
+
+impl AddressSpaceId {
+    /// Build an address-space identifier from one raw kernel-global id.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Raw numeric id.
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FrameDescRecord {
     id: FrameId,
@@ -246,6 +262,17 @@ impl FrameTable {
         Ok(())
     }
 
+    /// Replace the current reverse-mapping anchor without changing counts.
+    pub fn set_rmap_anchor(
+        &mut self,
+        id: FrameId,
+        anchor: Option<ReverseMapAnchor>,
+    ) -> Result<(), FrameTableError> {
+        let frame = self.frame_mut(id)?;
+        frame.rmap_anchor = anchor;
+        Ok(())
+    }
+
     /// Increment the total refcount for a registered frame.
     pub fn inc_ref(&mut self, id: FrameId) -> Result<(), FrameTableError> {
         let frame = self.frame_mut(id)?;
@@ -366,14 +393,24 @@ impl MapId {
 /// Future frame-to-mapping reverse-lookup anchor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReverseMapAnchor {
+    address_space_id: AddressSpaceId,
     map_id: MapId,
     page_delta: u64,
 }
 
 impl ReverseMapAnchor {
-    /// Build an anchor from a mapping id and page index.
-    pub const fn new(map_id: MapId, page_delta: u64) -> Self {
-        Self { map_id, page_delta }
+    /// Build an anchor from an address space, mapping id, and page index.
+    pub const fn new(address_space_id: AddressSpaceId, map_id: MapId, page_delta: u64) -> Self {
+        Self {
+            address_space_id,
+            map_id,
+            page_delta,
+        }
+    }
+
+    /// Address space owning the anchor.
+    pub const fn address_space_id(self) -> AddressSpaceId {
+        self.address_space_id
     }
 
     /// Mapping record owning the anchor.
@@ -982,6 +1019,7 @@ impl LazyAnonFaultResolution {
 /// Metadata-only address space with one root VMAR.
 #[derive(Debug)]
 pub struct AddressSpace {
+    id: AddressSpaceId,
     root: Vmar,
     vmos: Vec<Vmo>,
     map_recs: Vec<MapRec>,
@@ -994,6 +1032,15 @@ pub struct AddressSpace {
 impl AddressSpace {
     /// Create a new address space with a single root VMAR.
     pub fn new(root_base: u64, root_len: u64) -> Result<Self, AddressSpaceError> {
+        Self::new_with_id(AddressSpaceId::new(0), root_base, root_len)
+    }
+
+    /// Create a new address space with one explicit stable id.
+    pub fn new_with_id(
+        id: AddressSpaceId,
+        root_base: u64,
+        root_len: u64,
+    ) -> Result<Self, AddressSpaceError> {
         if root_len == 0 || !is_page_aligned(root_base) || !is_page_aligned(root_len) {
             return Err(AddressSpaceError::InvalidArgs);
         }
@@ -1002,6 +1049,7 @@ impl AddressSpace {
         };
 
         Ok(Self {
+            id,
             root: Vmar {
                 id: VmarId(1),
                 base: root_base,
@@ -1014,6 +1062,11 @@ impl AddressSpace {
             next_vmo_id: 1,
             next_map_id: 1,
         })
+    }
+
+    /// Stable address-space identifier.
+    pub const fn id(&self) -> AddressSpaceId {
+        self.id
     }
 
     /// Root VMAR metadata.
@@ -1060,6 +1113,31 @@ impl AddressSpace {
             .iter()
             .copied()
             .find(|map_rec| map_rec.id == id)
+    }
+
+    /// Return one live reverse-mapping anchor for a frame, if this address space currently maps it.
+    pub fn first_rmap_anchor_for_frame(&self, frame_id: FrameId) -> Option<ReverseMapAnchor> {
+        self.first_rmap_anchor_for_frame_excluding(frame_id, None)
+    }
+
+    /// Resolve one reverse-mapping anchor back to its exact virtual page base.
+    pub fn page_base_for_rmap_anchor(&self, anchor: ReverseMapAnchor) -> Option<u64> {
+        if anchor.address_space_id() != self.id {
+            return None;
+        }
+        let map_rec = self.map_record(anchor.map_id())?;
+        let page_offset = anchor.page_delta().checked_mul(PAGE_SIZE)?;
+        if page_offset >= map_rec.len() {
+            return None;
+        }
+        map_rec.base().checked_add(page_offset)
+    }
+
+    /// Resolve one reverse-mapping anchor back to its live mapping metadata.
+    pub fn lookup_rmap_anchor(&self, anchor: ReverseMapAnchor) -> Option<VmaLookup> {
+        let page_base = self.page_base_for_rmap_anchor(anchor)?;
+        let lookup = self.lookup(page_base)?;
+        (lookup.map_id() == anchor.map_id()).then_some(lookup)
     }
 
     /// Return the current page metadata for one virtual address, if mapped.
@@ -1189,7 +1267,7 @@ impl AddressSpace {
         let map_id = self.alloc_map_id();
         let mut incremented = Vec::with_capacity(bound_frames.len());
         for (page_index, frame_id) in bound_frames.iter().copied().enumerate() {
-            let anchor = ReverseMapAnchor::new(map_id, page_index as u64);
+            let anchor = self.make_rmap_anchor(map_id, page_index as u64);
             if let Err(err) = frames.map_frame(frame_id, anchor) {
                 for (rollback_frame, rollback_anchor) in incremented {
                     let _ = frames.unmap_frame(rollback_frame, rollback_anchor, None);
@@ -1266,7 +1344,7 @@ impl AddressSpace {
             }
         }
         for (page_index, frame_id) in bound_frames.into_iter().enumerate() {
-            let removed_anchor = ReverseMapAnchor::new(vma.map_id, page_index as u64);
+            let removed_anchor = self.make_rmap_anchor(vma.map_id, page_index as u64);
             let replacement_anchor =
                 self.first_rmap_anchor_for_frame_excluding(frame_id, Some(vma.map_id));
             frames
@@ -1351,7 +1429,7 @@ impl AddressSpace {
             .ok_or(AddressSpaceError::NotFound)?;
         let page_offset = vma.vmo_offset + (page_base - vma.base);
         let page_anchor =
-            ReverseMapAnchor::new(vma.map_id, (page_offset - vma.vmo_offset) / PAGE_SIZE);
+            self.make_rmap_anchor(vma.map_id, (page_offset - vma.vmo_offset) / PAGE_SIZE);
         let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
         if vmo.kind() != VmoKind::Anonymous {
             return Err(AddressSpaceError::NotFound);
@@ -1408,7 +1486,7 @@ impl AddressSpace {
 
         let page_offset = vma.vmo_offset + (page_base - vma.base);
         let fault_page_delta = (page_offset - vma.vmo_offset) / PAGE_SIZE;
-        let page_anchor = ReverseMapAnchor::new(vma.map_id, fault_page_delta);
+        let page_anchor = self.make_rmap_anchor(vma.map_id, fault_page_delta);
         let old_frame_id = self
             .vmo(vma.vmo_id)
             .and_then(|vmo| vmo.frame_at_offset(page_offset))
@@ -1496,7 +1574,7 @@ impl AddressSpace {
                 .vmo_offset
                 .checked_add((page_index as u64) * PAGE_SIZE)
                 .ok_or(AddressSpaceError::InvalidArgs)?;
-            let page_anchor = ReverseMapAnchor::new(vma.map_id, page_index as u64);
+            let page_anchor = self.make_rmap_anchor(vma.map_id, page_index as u64);
             let old_frame_id = vmo.frame_at_offset(page_offset);
             if let Some(existing) = old_frame_id {
                 let state = frames
@@ -1652,6 +1730,10 @@ impl AddressSpace {
         id
     }
 
+    fn make_rmap_anchor(&self, map_id: MapId, page_delta: u64) -> ReverseMapAnchor {
+        ReverseMapAnchor::new(self.id, map_id, page_delta)
+    }
+
     fn first_rmap_anchor_for_frame_excluding(
         &self,
         frame_id: FrameId,
@@ -1668,7 +1750,7 @@ impl AddressSpace {
             for page_delta in 0..page_count {
                 let page_offset = vma.vmo_offset + page_delta * PAGE_SIZE;
                 if vmo.frame_at_offset(page_offset) == Some(frame_id) {
-                    return Some(ReverseMapAnchor::new(vma.map_id, page_delta));
+                    return Some(self.make_rmap_anchor(vma.map_id, page_delta));
                 }
             }
         }
@@ -1921,7 +2003,7 @@ mod tests {
         assert_eq!(frames.state(code_frame).unwrap().map_count(), 1);
         assert_eq!(
             frames.state(code_frame).unwrap().rmap_anchor(),
-            Some(ReverseMapAnchor::new(lookup.map_id(), 0))
+            Some(ReverseMapAnchor::new(space.id(), lookup.map_id(), 0))
         );
     }
 
@@ -2372,7 +2454,8 @@ mod tests {
                 MappingPerms::READ | MappingPerms::USER,
             )
             .unwrap();
-        let first_anchor = ReverseMapAnchor::new(space.lookup(ROOT_BASE).unwrap().map_id(), 0);
+        let first_anchor =
+            ReverseMapAnchor::new(space.id(), space.lookup(ROOT_BASE).unwrap().map_id(), 0);
         assert_eq!(
             frames.state(shared).unwrap().rmap_anchor(),
             Some(first_anchor)
@@ -2389,8 +2472,11 @@ mod tests {
                 MappingPerms::READ | MappingPerms::USER,
             )
             .unwrap();
-        let second_anchor =
-            ReverseMapAnchor::new(space.lookup(ROOT_BASE + PAGE_SIZE).unwrap().map_id(), 0);
+        let second_anchor = ReverseMapAnchor::new(
+            space.id(),
+            space.lookup(ROOT_BASE + PAGE_SIZE).unwrap().map_id(),
+            0,
+        );
         assert_eq!(
             frames.state(shared).unwrap().rmap_anchor(),
             Some(first_anchor)
@@ -2401,6 +2487,62 @@ mod tests {
         assert_eq!(
             frames.state(shared).unwrap().rmap_anchor(),
             Some(second_anchor)
+        );
+    }
+
+    #[test]
+    fn lookup_rmap_anchor_resolves_with_explicit_address_space_id() {
+        let mut frames = FrameTable::new();
+        let shared = frames.register_existing(0xe1_000).unwrap();
+
+        let mut left =
+            AddressSpace::new_with_id(AddressSpaceId::new(10), ROOT_BASE, ROOT_LEN).unwrap();
+        let left_vmo = left
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(31))
+            .unwrap();
+        left.bind_vmo_frame(left_vmo, 0, shared).unwrap();
+        left.map_fixed(
+            &mut frames,
+            ROOT_BASE,
+            PAGE_SIZE,
+            left_vmo,
+            0,
+            MappingPerms::READ | MappingPerms::USER,
+            MappingPerms::READ | MappingPerms::USER,
+        )
+        .unwrap();
+
+        let mut right =
+            AddressSpace::new_with_id(AddressSpaceId::new(11), ROOT_BASE, ROOT_LEN).unwrap();
+        let right_vmo = right
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(32))
+            .unwrap();
+        right.bind_vmo_frame(right_vmo, 0, shared).unwrap();
+        right
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE + PAGE_SIZE,
+                PAGE_SIZE,
+                right_vmo,
+                0,
+                MappingPerms::READ | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+
+        let left_anchor = left.first_rmap_anchor_for_frame(shared).unwrap();
+        let right_anchor = right.first_rmap_anchor_for_frame(shared).unwrap();
+
+        assert_eq!(left_anchor.address_space_id(), left.id());
+        assert_eq!(right_anchor.address_space_id(), right.id());
+        assert!(left.lookup_rmap_anchor(right_anchor).is_none());
+        assert_eq!(
+            right.page_base_for_rmap_anchor(right_anchor),
+            Some(ROOT_BASE + PAGE_SIZE)
+        );
+        assert_eq!(
+            right.lookup_rmap_anchor(right_anchor).unwrap().frame_id(),
+            Some(shared)
         );
     }
 

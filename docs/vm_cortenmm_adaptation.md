@@ -176,7 +176,8 @@ Axle 仍需要一层 frame/page descriptor 维护：
 - descriptor 现在显式暴露 `map_count`
 - `loan_count` 已接入 channel page-loan 生命周期
 - frame descriptor 已开始维护一个最小 `rmap anchor`
-- 当前 anchor 只是“一个已知 live mapping”的入口，还不是完整 reverse mapping；跨 address space 的 replacement 仍待后续补全
+- anchor 现在已带上 `address_space_id`，kernel 也会在 `unmap/COW/remap-fill` 后做一次全局 refresh
+- 当前 anchor 仍然只是“一个已知 live mapping”的入口，还不是完整 reverse mapping；后续仍需要真正的 frame→mapping 集合
 
 ### 4.5 TxCursor：唯一页表修改入口
 
