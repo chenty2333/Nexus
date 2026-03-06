@@ -29,3 +29,8 @@ description = "zx_port_queue + zx_port_wait must roundtrip packet data"
 id = "must.timer.set_cancel_ok"
 level = "must"
 description = "zx_timer_set and zx_timer_cancel must return ZX_OK for valid timer handle"
+
+[[contracts]]
+id = "must.smp.ipi_ack_fixed_vector"
+level = "must"
+description = "BSP must be able to deliver a fixed-vector IPI to an AP (ack observed)"
