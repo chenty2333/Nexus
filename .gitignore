@@ -30,3 +30,7 @@ references/
 AGENTS.md
 Cargo.lock
 README.md
+
+# Fuzzing outputs
+**/fuzz/corpus/
+**/fuzz/artifacts/

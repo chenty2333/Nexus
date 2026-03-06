@@ -128,6 +128,18 @@ fn phys_of<T>(p: *const T) -> u64 {
     p as u64
 }
 
+pub(crate) fn user_code_page_paddr() -> u64 {
+    phys_of(core::ptr::addr_of!(USER_CODE_PAGE))
+}
+
+pub(crate) fn user_shared_page_paddr() -> u64 {
+    phys_of(core::ptr::addr_of!(USER_SHARED_PAGE))
+}
+
+pub(crate) fn user_stack_page_paddr() -> u64 {
+    phys_of(core::ptr::addr_of!(USER_STACK_PAGE))
+}
+
 fn map_userspace_pages() {
     // SAFETY: early bring-up is single-core; page table mutation is serialized.
     unsafe {

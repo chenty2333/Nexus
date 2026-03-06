@@ -16,7 +16,7 @@ use alloc::collections::BTreeMap;
 
 use axle_core::handle::Handle;
 use axle_core::{CSpace, CSpaceError, Capability, RevocationManager};
-use axle_mm::{AddressSpace as VmAddressSpace, MappingPerms, VmaLookup, VmoKind};
+use axle_mm::{AddressSpace as VmAddressSpace, FrameTable, MappingPerms, VmaLookup, VmoKind};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NO_RESOURCES,
 };
@@ -104,7 +104,7 @@ struct AddressSpace {
 }
 
 impl AddressSpace {
-    fn bootstrap() -> Self {
+    fn bootstrap(frames: &mut FrameTable) -> Self {
         let mut vm = VmAddressSpace::new(
             crate::userspace::USER_CODE_VA,
             crate::userspace::USER_REGION_BYTES,
@@ -114,7 +114,13 @@ impl AddressSpace {
         let code_vmo = vm
             .create_vmo(VmoKind::Anonymous, crate::userspace::USER_PAGE_BYTES)
             .expect("bootstrap code vmo allocation must succeed");
+        let code_frame = frames
+            .register_existing(crate::userspace::user_code_page_paddr())
+            .expect("bootstrap code frame registration must succeed");
+        vm.bind_vmo_frame(code_vmo, 0, code_frame)
+            .expect("bootstrap code frame binding must succeed");
         vm.map_fixed(
+            frames,
             crate::userspace::USER_CODE_VA,
             crate::userspace::USER_PAGE_BYTES,
             code_vmo,
@@ -127,7 +133,13 @@ impl AddressSpace {
         let shared_vmo = vm
             .create_vmo(VmoKind::Anonymous, crate::userspace::USER_PAGE_BYTES)
             .expect("bootstrap shared vmo allocation must succeed");
+        let shared_frame = frames
+            .register_existing(crate::userspace::user_shared_page_paddr())
+            .expect("bootstrap shared frame registration must succeed");
+        vm.bind_vmo_frame(shared_vmo, 0, shared_frame)
+            .expect("bootstrap shared frame binding must succeed");
         vm.map_fixed(
+            frames,
             crate::userspace::USER_SHARED_VA,
             crate::userspace::USER_PAGE_BYTES,
             shared_vmo,
@@ -140,7 +152,13 @@ impl AddressSpace {
         let stack_vmo = vm
             .create_vmo(VmoKind::Anonymous, crate::userspace::USER_PAGE_BYTES)
             .expect("bootstrap stack vmo allocation must succeed");
+        let stack_frame = frames
+            .register_existing(crate::userspace::user_stack_page_paddr())
+            .expect("bootstrap stack frame registration must succeed");
+        vm.bind_vmo_frame(stack_vmo, 0, stack_frame)
+            .expect("bootstrap stack frame binding must succeed");
         vm.map_fixed(
+            frames,
             crate::userspace::USER_STACK_VA,
             crate::userspace::USER_PAGE_BYTES,
             stack_vmo,
@@ -214,6 +232,8 @@ pub(crate) struct Kernel {
     processes: BTreeMap<ProcessId, Process>,
     threads: BTreeMap<ThreadId, Thread>,
     address_spaces: BTreeMap<AddressSpaceId, AddressSpace>,
+    #[allow(dead_code)]
+    frames: FrameTable,
     revocations: RevocationManager,
     next_process_id: ProcessId,
     next_thread_id: ThreadId,
@@ -224,10 +244,13 @@ pub(crate) struct Kernel {
 impl Kernel {
     /// Build the single-process bootstrap kernel model used by the current main branch.
     pub(crate) fn bootstrap() -> Self {
+        let mut frames = FrameTable::new();
+        let bootstrap_address_space = AddressSpace::bootstrap(&mut frames);
         let mut kernel = Self {
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
             address_spaces: BTreeMap::new(),
+            frames,
             revocations: RevocationManager::new(),
             next_process_id: 1,
             next_thread_id: 1,
@@ -238,7 +261,7 @@ impl Kernel {
         let address_space_id = kernel.alloc_address_space_id();
         kernel
             .address_spaces
-            .insert(address_space_id, AddressSpace::bootstrap());
+            .insert(address_space_id, bootstrap_address_space);
 
         let process_id = kernel.alloc_process_id();
         kernel

@@ -1,6 +1,6 @@
 #![no_main]
 
-use axle_mm::{AddressSpace, MappingPerms, PAGE_SIZE, VmoKind};
+use axle_mm::{AddressSpace, FrameTable, MappingPerms, PAGE_SIZE, VmoKind};
 use libfuzzer_sys::fuzz_target;
 
 const ROOT_BASE: u64 = 0x1_0000_0000;
@@ -8,10 +8,11 @@ const ROOT_LEN: u64 = 16 * PAGE_SIZE;
 
 fuzz_target!(|data: &[u8]| {
     let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+    let mut frames = FrameTable::new();
     let mut vmos = [None; 8];
 
     for chunk in data.chunks(8) {
-        match chunk.first().copied().unwrap_or(0) % 5 {
+        match chunk.first().copied().unwrap_or(0) % 7 {
             0 => {
                 let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmos.len() as u8);
                 let pages = u64::from((chunk.get(2).copied().unwrap_or(0) % 4) + 1);
@@ -27,10 +28,24 @@ fuzz_target!(|data: &[u8]| {
                 let Some(vmo_id) = vmos[slot] else {
                     continue;
                 };
+                let page_index = u64::from(chunk.get(2).copied().unwrap_or(0) % 4);
+                let frame_addr = 0x2000_0000 + (u64::from(chunk.get(3).copied().unwrap_or(0)) * PAGE_SIZE);
+                let frame_id = match frames.register_existing(frame_addr) {
+                    Ok(frame) => frame,
+                    Err(_) => continue,
+                };
+                let _ = space.bind_vmo_frame(vmo_id, page_index * PAGE_SIZE, frame_id);
+            }
+            2 => {
+                let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmos.len() as u8);
+                let Some(vmo_id) = vmos[slot] else {
+                    continue;
+                };
                 let page_index = u64::from(chunk.get(2).copied().unwrap_or(0) % 16);
                 let pages = u64::from((chunk.get(3).copied().unwrap_or(0) % 2) + 1);
                 let perms = decode_perms(chunk.get(4).copied().unwrap_or(0));
                 let _ = space.map_fixed(
+                    &mut frames,
                     ROOT_BASE + (page_index * PAGE_SIZE),
                     pages * PAGE_SIZE,
                     vmo_id,
@@ -39,19 +54,26 @@ fuzz_target!(|data: &[u8]| {
                     perms,
                 );
             }
-            2 => {
+            3 => {
                 let page_index = u64::from(chunk.get(1).copied().unwrap_or(0) % 16);
                 let pages = u64::from((chunk.get(2).copied().unwrap_or(0) % 2) + 1);
-                let _ = space.unmap(ROOT_BASE + (page_index * PAGE_SIZE), pages * PAGE_SIZE);
+                let _ = space.unmap(&mut frames, ROOT_BASE + (page_index * PAGE_SIZE), pages * PAGE_SIZE);
             }
-            3 => {
+            4 => {
                 let page_index = u64::from(chunk.get(1).copied().unwrap_or(0) % 16);
                 let perms = decode_perms(chunk.get(2).copied().unwrap_or(0));
                 let _ = space.protect(ROOT_BASE + (page_index * PAGE_SIZE), PAGE_SIZE, perms);
             }
-            _ => {
+            5 => {
                 let page_index = u64::from(chunk.get(1).copied().unwrap_or(0) % 16);
                 let _ = space.lookup(ROOT_BASE + (page_index * PAGE_SIZE));
+            }
+            _ => {
+                let frame_addr = 0x2000_0000 + (u64::from(chunk.get(1).copied().unwrap_or(0)) * PAGE_SIZE);
+                if let Ok(frame_id) = frames.register_existing(frame_addr) {
+                    let _ = frames.pin(frame_id);
+                    let _ = frames.unpin(frame_id);
+                }
             }
         }
     }

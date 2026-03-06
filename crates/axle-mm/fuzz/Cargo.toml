@@ -22,3 +22,10 @@ path = "fuzz_targets/addr_space_ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "frame_table_ops"
+path = "fuzz_targets/frame_table_ops.rs"
+test = false
+doc = false
+bench = false
