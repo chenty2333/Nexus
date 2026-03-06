@@ -1067,22 +1067,27 @@ impl Kernel {
                 .get(&address_space_id)
                 .and_then(|space| space.lookup_user_mapping(page_va, 1))
             else {
-                self.unpin_loaned_pages_inner(&pinned);
+                self.release_loaned_pages_inner(&pinned);
                 return Ok(None);
             };
             let Some(frame_id) = page_lookup.frame_id() else {
-                self.unpin_loaned_pages_inner(&pinned);
+                self.release_loaned_pages_inner(&pinned);
                 return Ok(None);
             };
             self.frames
                 .pin(frame_id)
                 .map_err(|_| ZX_ERR_BAD_STATE)
-                .inspect_err(|_| self.unpin_loaned_pages_inner(&pinned))?;
+                .inspect_err(|_| self.release_loaned_pages_inner(&pinned))?;
+            if let Err(_) = self.frames.inc_loan(frame_id) {
+                let _ = self.frames.unpin(frame_id);
+                self.release_loaned_pages_inner(&pinned);
+                return Err(ZX_ERR_BAD_STATE);
+            }
             pinned.push(frame_id);
         }
 
         let len_u32 = u32::try_from(len).map_err(|_| {
-            self.unpin_loaned_pages_inner(&pinned);
+            self.release_loaned_pages_inner(&pinned);
             ZX_ERR_OUT_OF_RANGE
         })?;
         Ok(Some(LoanedUserPages {
@@ -1096,7 +1101,7 @@ impl Kernel {
     }
 
     pub(crate) fn release_loaned_user_pages(&mut self, loaned: &LoanedUserPages) {
-        self.unpin_loaned_pages_inner(loaned.pages())
+        self.release_loaned_pages_inner(loaned.pages())
     }
 
     pub(crate) fn prepare_loaned_channel_write(
@@ -2022,8 +2027,9 @@ impl Kernel {
         Ok(())
     }
 
-    fn unpin_loaned_pages_inner(&mut self, pages: &[FrameId]) {
+    fn release_loaned_pages_inner(&mut self, pages: &[FrameId]) {
         for &frame_id in pages {
+            let _ = self.frames.dec_loan(frame_id);
             let _ = self.frames.unpin(frame_id);
         }
     }

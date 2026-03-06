@@ -131,6 +131,8 @@ pub enum FrameTableError {
     RefUnderflow,
     /// Pin count was decremented below zero.
     PinUnderflow,
+    /// Loan count was decremented below zero.
+    LoanUnderflow,
 }
 
 /// Global physical-frame bookkeeping used by the bootstrap kernel.
@@ -250,6 +252,26 @@ impl FrameTable {
             return Err(FrameTableError::PinUnderflow);
         }
         frame.pin_count -= 1;
+        Ok(())
+    }
+
+    /// Increment the in-flight loan count for a registered frame.
+    pub fn inc_loan(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+        let frame = self.frame_mut(id)?;
+        frame.loan_count = frame
+            .loan_count
+            .checked_add(1)
+            .ok_or(FrameTableError::CountOverflow)?;
+        Ok(())
+    }
+
+    /// Decrement the in-flight loan count for a registered frame.
+    pub fn dec_loan(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+        let frame = self.frame_mut(id)?;
+        if frame.loan_count == 0 {
+            return Err(FrameTableError::LoanUnderflow);
+        }
+        frame.loan_count -= 1;
         Ok(())
     }
 
@@ -2233,18 +2255,24 @@ mod tests {
 
         frames.inc_map(frame).unwrap();
         frames.inc_map(frame).unwrap();
+        frames.inc_loan(frame).unwrap();
+        frames.inc_loan(frame).unwrap();
         let mapped = frames.state(frame).unwrap();
         assert_eq!(mapped.ref_count(), 2);
         assert_eq!(mapped.map_count(), 2);
-        assert_eq!(mapped.loan_count(), 0);
+        assert_eq!(mapped.loan_count(), 2);
         assert_eq!(mapped.rmap_anchor(), None);
 
         frames.dec_map(frame).unwrap();
         frames.dec_map(frame).unwrap();
+        frames.dec_loan(frame).unwrap();
+        frames.dec_loan(frame).unwrap();
         let unmapped = frames.state(frame).unwrap();
         assert_eq!(unmapped.ref_count(), 0);
         assert_eq!(unmapped.map_count(), 0);
+        assert_eq!(unmapped.loan_count(), 0);
         assert_eq!(frames.dec_map(frame), Err(FrameTableError::RefUnderflow));
+        assert_eq!(frames.dec_loan(frame), Err(FrameTableError::LoanUnderflow));
     }
 
     #[test]

@@ -174,7 +174,8 @@ Axle 仍需要一层 frame/page descriptor 维护：
 
 - `FrameTable` 已开始向 frame descriptor 形状演化
 - descriptor 现在显式暴露 `map_count`
-- `loan_count` / reverse-map anchor 已预留字段，但尚未驱动真实 loan/rmap 逻辑
+- `loan_count` 已接入 channel page-loan 生命周期
+- reverse-map anchor 仍只是预留字段，尚未驱动真实 rmap 逻辑
 
 ### 4.5 TxCursor：唯一页表修改入口
 
