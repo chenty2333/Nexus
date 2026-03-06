@@ -4,6 +4,7 @@ members = [
   "crates/axle-arch-x86_64",
   "crates/axle-core",
   "crates/axle-mm",
+  "crates/axle-page-table",
   "crates/axle-sync",
   "crates/axle-types",
 

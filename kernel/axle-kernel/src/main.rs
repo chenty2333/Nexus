@@ -11,6 +11,7 @@ mod bringup;
 mod futex;
 mod kalloc;
 mod object;
+mod page_table;
 mod smp;
 mod syscall;
 mod task;

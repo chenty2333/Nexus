@@ -21,6 +21,7 @@ use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, CowFaultResolution, FrameId, FrameTable,
     FutexKey, GlobalVmoId, MappingPerms, VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
 };
+use axle_page_table::{PageMapping, PageTableError, TxCursor};
 use axle_types::rights::{
     ZX_RIGHT_APPLY_PROFILE, ZX_RIGHT_DESTROY, ZX_RIGHT_DUPLICATE, ZX_RIGHT_ENUMERATE,
     ZX_RIGHT_EXECUTE, ZX_RIGHT_GET_POLICY, ZX_RIGHT_GET_PROPERTY, ZX_RIGHT_INSPECT,
@@ -1398,16 +1399,18 @@ impl Kernel {
             }
         };
 
-        if crate::userspace::install_user_page_frame(
-            resolved.fault_page_base(),
-            new_frame_paddr,
-            true,
-        )
-        .is_err()
+        let mut page_table = crate::page_table::BootstrapUserPageTable;
+        let mut tx = TxCursor::new(&mut page_table);
+        if tx
+            .map(
+                resolved.fault_page_base(),
+                crate::userspace::USER_PAGE_BYTES,
+                |_| PageMapping::new(new_frame_paddr, true),
+            )
+            .is_err()
         {
             return false;
         }
-        crate::arch::tlb::flush_page_global(resolved.fault_page_base());
         true
     }
 
@@ -1530,34 +1533,22 @@ impl Kernel {
             .address_spaces
             .get(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        for page_index in 0..page_count {
-            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+        let mut page_table = crate::page_table::BootstrapUserPageTable;
+        let mut tx = TxCursor::new(&mut page_table);
+        tx.map(base, len, |va| {
             let lookup = address_space
                 .lookup_user_mapping(va, 1)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            let frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
-            crate::userspace::install_user_page_frame(
-                va,
-                frame_id.raw(),
-                lookup.perms().contains(MappingPerms::WRITE),
-            )
-            .map_err(|_| ZX_ERR_BAD_STATE)?;
-            crate::arch::tlb::flush_page_global(va);
-        }
-        Ok(())
+                .ok_or(PageTableError::Backend)?;
+            let frame_id = lookup.frame_id().ok_or(PageTableError::Backend)?;
+            PageMapping::new(frame_id.raw(), lookup.perms().contains(MappingPerms::WRITE))
+        })
+        .map_err(map_page_table_error)
     }
 
     fn clear_mapping_pages(&self, base: u64, len: u64) -> Result<(), zx_status_t> {
-        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        for page_index in 0..page_count {
-            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
-            crate::userspace::clear_user_page_frame(va).map_err(|_| ZX_ERR_BAD_STATE)?;
-            crate::arch::tlb::flush_page_global(va);
-        }
-        Ok(())
+        let mut page_table = crate::page_table::BootstrapUserPageTable;
+        let mut tx = TxCursor::new(&mut page_table);
+        tx.unmap(base, len).map_err(map_page_table_error)
     }
 
     fn update_mapping_pages(
@@ -1570,21 +1561,15 @@ impl Kernel {
             .address_spaces
             .get(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        for page_index in 0..page_count {
-            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+        let mut page_table = crate::page_table::BootstrapUserPageTable;
+        let mut tx = TxCursor::new(&mut page_table);
+        tx.protect(base, len, |va| {
             let lookup = address_space
                 .lookup_user_mapping(va, 1)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            crate::userspace::set_user_page_writable(
-                va,
-                lookup.perms().contains(MappingPerms::WRITE),
-            )
-            .map_err(|_| ZX_ERR_BAD_STATE)?;
-            crate::arch::tlb::flush_page_global(va);
-        }
-        Ok(())
+                .ok_or(PageTableError::Backend)?;
+            Ok(lookup.perms().contains(MappingPerms::WRITE))
+        })
+        .map_err(map_page_table_error)
     }
 
     fn unpin_loaned_pages_inner(&mut self, pages: &[FrameId]) {
@@ -1617,5 +1602,12 @@ fn map_address_space_error(err: AddressSpaceError) -> zx_status_t {
         AddressSpaceError::PermissionIncrease => ZX_ERR_ACCESS_DENIED,
         AddressSpaceError::FrameTable(_) => ZX_ERR_NO_MEMORY,
         AddressSpaceError::NotCopyOnWrite => ZX_ERR_BAD_STATE,
+    }
+}
+
+fn map_page_table_error(err: PageTableError) -> zx_status_t {
+    match err {
+        PageTableError::InvalidArgs => ZX_ERR_INVALID_ARGS,
+        PageTableError::NotMapped | PageTableError::Backend => ZX_ERR_BAD_STATE,
     }
 }

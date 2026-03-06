@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 axle-core = { path = "../../crates/axle-core", default-features = false }
 axle-mm = { path = "../../crates/axle-mm", default-features = false }
+axle-page-table = { path = "../../crates/axle-page-table", default-features = false }
 axle-types = { path = "../../crates/axle-types", default-features = false }
 
 # Minimal logging helpers; can be replaced later with a richer kernel logger.

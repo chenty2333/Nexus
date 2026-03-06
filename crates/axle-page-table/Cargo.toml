@@ -1,0 +1,8 @@
+[package]
+name = "axle-page-table"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+description = "Minimal page-table transaction core for Axle bootstrap mappings."
+
+[dependencies]

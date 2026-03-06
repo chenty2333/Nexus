@@ -5,10 +5,10 @@ default:
 
 # Host-only gates for Phase A (contracts).
 xlint:
-  cargo clippy -p axle-types -p axle-core -p axle-mm -p axle-sync -p axle-conformance --all-targets -- -D warnings
+  cargo clippy -p axle-types -p axle-core -p axle-mm -p axle-page-table -p axle-sync -p axle-conformance --all-targets -- -D warnings
 
 xtest:
-  cargo test -p axle-types -p axle-core -p axle-mm -p axle-sync -p axle-conformance
+  cargo test -p axle-types -p axle-core -p axle-mm -p axle-page-table -p axle-sync -p axle-conformance
 
 # Kernel conformance gate.
 test-kernel:

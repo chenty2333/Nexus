@@ -237,6 +237,22 @@ const PTE_P: u64 = 1 << 0;
 const PTE_W: u64 = 1 << 1;
 const PTE_U: u64 = 1 << 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UserPageFrame {
+    paddr: u64,
+    writable: bool,
+}
+
+impl UserPageFrame {
+    pub(crate) const fn paddr(self) -> u64 {
+        self.paddr
+    }
+
+    pub(crate) const fn writable(self) -> bool {
+        self.writable
+    }
+}
+
 fn phys_of<T>(p: *const T) -> u64 {
     // In the current PVH identity mapping, physical == virtual for kernel static data.
     p as u64
@@ -291,6 +307,19 @@ pub(crate) fn alloc_bootstrap_zeroed_page() -> Option<u64> {
         return None;
     }
     Some(dst as u64)
+}
+
+pub(crate) fn query_user_page_frame(user_va: u64) -> Result<Option<UserPageFrame>, ()> {
+    let index = user_page_index(user_va).ok_or(())?;
+    // SAFETY: USER_PT is the active page table page for the fixed bootstrap user region.
+    let entry = unsafe { USER_PT.0[index] };
+    if (entry & PTE_P) == 0 {
+        return Ok(None);
+    }
+    Ok(Some(UserPageFrame {
+        paddr: entry & !(USER_PAGE_BYTES - 1),
+        writable: (entry & PTE_W) != 0,
+    }))
 }
 
 pub(crate) fn install_user_page_frame(user_va: u64, paddr: u64, writable: bool) -> Result<(), ()> {
