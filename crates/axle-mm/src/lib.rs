@@ -9,6 +9,7 @@
 //!
 //! - bootstrap `AddressSpace` with a root VMAR
 //! - `Vmo` allocation and fixed mappings
+//! - coarse `MapRec` records for mapping control-plane identity
 //! - `VA -> (VMO, offset, perms, frame)` reverse lookup
 //! - bootstrap frame registration with mapping refcounts
 //! - frame pin / unpin accounting
@@ -232,6 +233,17 @@ impl VmarId {
     }
 }
 
+/// Identifier for one coarse mapping record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MapId(u64);
+
+impl MapId {
+    /// Raw numeric id.
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// VMO backing kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmoKind {
@@ -311,9 +323,70 @@ impl Vmar {
     }
 }
 
+/// Coarse mapping record linking VMAR control metadata to page-level state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapRec {
+    id: MapId,
+    vmar_id: VmarId,
+    base: u64,
+    len: u64,
+    vmo_id: VmoId,
+    global_vmo_id: GlobalVmoId,
+    vmo_offset: u64,
+    max_perms: MappingPerms,
+}
+
+impl MapRec {
+    /// Stable mapping identifier.
+    pub const fn id(self) -> MapId {
+        self.id
+    }
+
+    /// Owning VMAR id.
+    pub const fn vmar_id(self) -> VmarId {
+        self.vmar_id
+    }
+
+    /// Mapping base address.
+    pub const fn base(self) -> u64 {
+        self.base
+    }
+
+    /// Mapping span length in bytes.
+    pub const fn len(self) -> u64 {
+        self.len
+    }
+
+    /// Whether the mapping span is empty.
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Backing VMO id.
+    pub const fn vmo_id(self) -> VmoId {
+        self.vmo_id
+    }
+
+    /// Kernel-global VMO identity.
+    pub const fn global_vmo_id(self) -> GlobalVmoId {
+        self.global_vmo_id
+    }
+
+    /// Offset into the backing VMO.
+    pub const fn vmo_offset(self) -> u64 {
+        self.vmo_offset
+    }
+
+    /// Maximum allowed permissions for future `protect` operations.
+    pub const fn max_perms(self) -> MappingPerms {
+        self.max_perms
+    }
+}
+
 /// A single virtual-memory mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Vma {
+    map_id: MapId,
     base: u64,
     len: u64,
     vmo_id: VmoId,
@@ -325,6 +398,11 @@ pub struct Vma {
 }
 
 impl Vma {
+    /// Stable coarse mapping identifier.
+    pub const fn map_id(self) -> MapId {
+        self.map_id
+    }
+
     /// Mapping base address.
     pub const fn base(self) -> u64 {
         self.base
@@ -389,6 +467,7 @@ impl Vma {
 /// Result of resolving a virtual address back to its VMA and VMO metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmaLookup {
+    map_id: MapId,
     vmar_id: VmarId,
     vmo_id: VmoId,
     global_vmo_id: GlobalVmoId,
@@ -403,6 +482,11 @@ pub struct VmaLookup {
 }
 
 impl VmaLookup {
+    /// Stable coarse mapping identifier.
+    pub const fn map_id(self) -> MapId {
+        self.map_id
+    }
+
     /// Root VMAR containing the mapping.
     pub const fn vmar_id(self) -> VmarId {
         self.vmar_id
@@ -558,8 +642,10 @@ impl CowFaultResolution {
 pub struct AddressSpace {
     root: Vmar,
     vmos: Vec<Vmo>,
+    map_recs: Vec<MapRec>,
     vmas: Vec<Vma>,
     next_vmo_id: u64,
+    next_map_id: u64,
 }
 
 impl AddressSpace {
@@ -579,8 +665,10 @@ impl AddressSpace {
                 len: root_len,
             },
             vmos: Vec::new(),
+            map_recs: Vec::new(),
             vmas: Vec::new(),
             next_vmo_id: 1,
+            next_map_id: 1,
         })
     }
 
@@ -615,6 +703,19 @@ impl AddressSpace {
     /// Return metadata for a tracked VMO.
     pub fn vmo(&self, id: VmoId) -> Option<&Vmo> {
         self.vmos.iter().find(|vmo| vmo.id == id)
+    }
+
+    /// Return the current coarse mapping records in insertion order.
+    pub fn map_records(&self) -> &[MapRec] {
+        &self.map_recs
+    }
+
+    /// Return the coarse mapping record for one mapping id.
+    pub fn map_record(&self, id: MapId) -> Option<MapRec> {
+        self.map_recs
+            .iter()
+            .copied()
+            .find(|map_rec| map_rec.id == id)
     }
 
     /// Bind a resident frame to one page of a VMO.
@@ -695,6 +796,7 @@ impl AddressSpace {
             return Err(AddressSpaceError::Overlap);
         }
 
+        let global_vmo_id = vmo.global_id();
         let bound_frames = collect_bound_frames(vmo, vmo_offset, len);
         for frame_id in bound_frames.iter().copied() {
             if !frames.contains(frame_id) {
@@ -713,11 +815,23 @@ impl AddressSpace {
             incremented.push(frame_id);
         }
 
-        self.vmas.push(Vma {
+        let map_id = self.alloc_map_id();
+        self.map_recs.push(MapRec {
+            id: map_id,
+            vmar_id: self.root.id,
             base,
             len,
             vmo_id,
-            global_vmo_id: vmo.global_id(),
+            global_vmo_id,
+            vmo_offset,
+            max_perms,
+        });
+        self.vmas.push(Vma {
+            map_id,
+            base,
+            len,
+            vmo_id,
+            global_vmo_id,
             vmo_offset,
             perms,
             max_perms,
@@ -756,7 +870,14 @@ impl AddressSpace {
                 .dec_ref(frame_id)
                 .map_err(AddressSpaceError::FrameTable)?;
         }
-        self.vmas.remove(index);
+        let removed = self.vmas.remove(index);
+        if let Some(map_index) = self
+            .map_recs
+            .iter()
+            .position(|map_rec| map_rec.id == removed.map_id)
+        {
+            self.map_recs.remove(map_index);
+        }
         Ok(())
     }
 
@@ -853,6 +974,7 @@ impl AddressSpace {
         let vmo = self.vmo(vma.vmo_id)?;
         let resolved_offset = vma.vmo_offset + (va - vma.base);
         Some(VmaLookup {
+            map_id: vma.map_id,
             vmar_id: self.root.id,
             vmo_id: vma.vmo_id,
             global_vmo_id: vma.global_vmo_id,
@@ -880,6 +1002,7 @@ impl AddressSpace {
         let vmo = self.vmo(vma.vmo_id)?;
         let resolved_offset = vma.vmo_offset + (base - vma.base);
         Some(VmaLookup {
+            map_id: vma.map_id,
             vmar_id: self.root.id,
             vmo_id: vma.vmo_id,
             global_vmo_id: vma.global_vmo_id,
@@ -924,6 +1047,12 @@ impl AddressSpace {
             return false;
         };
         base >= self.root.base && end <= self.root.base + self.root.len
+    }
+
+    fn alloc_map_id(&mut self) -> MapId {
+        let id = MapId(self.next_map_id);
+        self.next_map_id = self.next_map_id.wrapping_add(1);
+        id
     }
 
     fn rebind_vmo_frame(
@@ -1063,13 +1192,40 @@ mod tests {
     fn lookup_reports_vmo_offset_perms_and_frame() {
         let (space, frames, code_frame, _) = sample_space();
         let lookup = space.lookup(ROOT_BASE + 0x120).unwrap();
+        let map_rec = space.map_record(lookup.map_id()).unwrap();
         assert_eq!(lookup.vmo_offset(), 0x120);
         assert_eq!(lookup.global_vmo_id(), global_vmo_id(1));
         assert!(lookup.perms().contains(MappingPerms::EXECUTE));
         assert_eq!(lookup.mapping_base(), ROOT_BASE);
         assert_eq!(lookup.mapping_len(), PAGE_SIZE);
         assert_eq!(lookup.frame_id(), Some(code_frame));
+        assert_eq!(map_rec.base(), ROOT_BASE);
+        assert_eq!(map_rec.len(), PAGE_SIZE);
+        assert_eq!(map_rec.vmar_id(), space.root_vmar().id());
+        assert_eq!(map_rec.vmo_id(), lookup.vmo_id());
+        assert_eq!(map_rec.global_vmo_id(), lookup.global_vmo_id());
+        assert_eq!(map_rec.vmo_offset(), 0);
+        assert_eq!(
+            map_rec.max_perms(),
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::EXECUTE | MappingPerms::USER
+        );
         assert_eq!(frames.state(code_frame).unwrap().ref_count(), 1);
+    }
+
+    #[test]
+    fn map_records_follow_mapping_lifecycle() {
+        let (mut space, mut frames, _, _) = sample_space();
+        let data_base = ROOT_BASE + PAGE_SIZE;
+        let lookup = space.lookup(data_base).unwrap();
+        let map_id = lookup.map_id();
+
+        assert_eq!(space.map_records().len(), 2);
+        assert_eq!(space.map_record(map_id).unwrap().base(), data_base);
+
+        space.unmap(&mut frames, data_base, PAGE_SIZE).unwrap();
+
+        assert!(space.map_record(map_id).is_none());
+        assert_eq!(space.map_records().len(), 1);
     }
 
     #[test]
