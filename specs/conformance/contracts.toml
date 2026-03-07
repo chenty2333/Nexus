@@ -141,6 +141,11 @@ level = "should"
 description = "Bootstrap process_create should yield a real child address space that can map shared VMOs and run a child thread"
 
 [[contracts]]
+id = "should.process.lazy_shared_vmo_bootstrap"
+level = "should"
+description = "Bootstrap parent/child shared anonymous VMO mappings should lazily fault through the global VMO path without splitting into distinct frames"
+
+[[contracts]]
 id = "should.vmar.allocate_child_bootstrap"
 level = "should"
 description = "Bootstrap zx_vmar_allocate/zx_vmar_destroy should support nested child VMARs, specific offsets, compact child policy, upper-limit placement, aligned placement, CAN_MAP_SPECIFIC ceilings, and recursive destroy cleanup"

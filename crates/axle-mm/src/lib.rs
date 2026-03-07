@@ -585,12 +585,20 @@ pub enum VmoKind {
     Contiguous,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VmoFaultPolicy {
+    LocalAnonymous,
+    GlobalBacked,
+    NonDemandPaged,
+}
+
 /// Metadata for a VMO tracked by the address space.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vmo {
     id: VmoId,
     global_id: GlobalVmoId,
     kind: VmoKind,
+    fault_policy: VmoFaultPolicy,
     size_bytes: u64,
     frames: Vec<Option<FrameId>>,
 }
@@ -625,6 +633,18 @@ impl Vmo {
     /// Snapshot every currently bound frame slot.
     pub fn frames(&self) -> &[Option<FrameId>] {
         &self.frames
+    }
+
+    fn missing_page_tag(&self) -> PteMetaTag {
+        match self.fault_policy {
+            VmoFaultPolicy::LocalAnonymous => PteMetaTag::LazyAnon,
+            VmoFaultPolicy::GlobalBacked => PteMetaTag::LazyVmo,
+            VmoFaultPolicy::NonDemandPaged => PteMetaTag::Reserved,
+        }
+    }
+
+    fn supports_copy_on_write(&self) -> bool {
+        matches!(self.kind, VmoKind::Anonymous)
     }
 }
 
@@ -1390,6 +1410,25 @@ impl LazyAnonFaultResolution {
     }
 }
 
+/// Result of binding one lazy VMO-backed page to a resident frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LazyVmoFaultResolution {
+    fault_page_base: u64,
+    frame_id: FrameId,
+}
+
+impl LazyVmoFaultResolution {
+    /// Base virtual address of the materialized page.
+    pub const fn fault_page_base(self) -> u64 {
+        self.fault_page_base
+    }
+
+    /// Frame that now backs the faulting page in this address space.
+    pub const fn frame_id(self) -> FrameId {
+        self.frame_id
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResolvedPageState {
     page_base: u64,
@@ -1675,6 +1714,7 @@ impl AddressSpace {
             id,
             global_id,
             kind,
+            fault_policy: vmo_fault_policy_for_create(kind),
             size_bytes,
             frames: alloc::vec![None; usize::try_from(size_bytes / PAGE_SIZE).unwrap_or(0)],
         });
@@ -1703,13 +1743,32 @@ impl AddressSpace {
         size_bytes: u64,
         global_id: GlobalVmoId,
     ) -> Result<VmoId, AddressSpaceError> {
-        if let Some(existing) = self.vmo_by_global_id(global_id) {
+        if let Some(existing) = self
+            .vmos
+            .iter_mut()
+            .find(|candidate| candidate.global_id == global_id)
+        {
             if existing.kind() != kind || existing.size_bytes() != size_bytes {
                 return Err(AddressSpaceError::InvalidArgs);
             }
+            existing.fault_policy = vmo_fault_policy_for_import(kind);
             return Ok(existing.id());
         }
-        self.create_vmo(kind, size_bytes, global_id)
+        if size_bytes == 0 || !is_page_aligned(size_bytes) {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+
+        let id = VmoId(self.next_vmo_id);
+        self.next_vmo_id = self.next_vmo_id.wrapping_add(1);
+        self.vmos.push(Vmo {
+            id,
+            global_id,
+            kind,
+            fault_policy: vmo_fault_policy_for_import(kind),
+            size_bytes,
+            frames: alloc::vec![None; usize::try_from(size_bytes / PAGE_SIZE).unwrap_or(0)],
+        });
+        Ok(id)
     }
 
     /// Return the current coarse mapping records in insertion order.
@@ -1785,12 +1844,16 @@ impl AddressSpace {
             return PageFaultDecision::Unmapped;
         };
         let meta = resolved.meta;
+        let Some(vmo) = self.vmo(resolved.vma.vmo_id) else {
+            return PageFaultDecision::Unmapped;
+        };
 
         if flags.contains(PageFaultFlags::PRESENT) {
             if flags.contains(PageFaultFlags::WRITE)
                 && meta.cow_shared()
                 && meta.logical_write()
                 && matches!(meta.tag(), PteMetaTag::Present)
+                && vmo.supports_copy_on_write()
             {
                 PageFaultDecision::CopyOnWrite
             } else {
@@ -1939,6 +2002,11 @@ impl AddressSpace {
                 return Err(AddressSpaceError::InvalidFrame);
             }
             page_frames.push(frame_id);
+        }
+        if matches!(vmo.kind(), VmoKind::Physical | VmoKind::Contiguous)
+            && page_frames.iter().any(Option::is_none)
+        {
+            return Err(AddressSpaceError::InvalidFrame);
         }
 
         let map_id = self.alloc_map_id();
@@ -2179,10 +2247,19 @@ impl AddressSpace {
     /// Arm an existing mapping for copy-on-write handling.
     pub fn mark_copy_on_write(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
         validate_mapping_range(base, len)?;
+        let index = self
+            .vmas
+            .iter()
+            .position(|vma| vma.base == base && vma.len == len)
+            .ok_or(AddressSpaceError::NotFound)?;
+        let vmo_id = self.vmas[index].vmo_id;
+        let vmo = self.vmo(vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        if !vmo.supports_copy_on_write() {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
         let vma = self
             .vmas
-            .iter_mut()
-            .find(|vma| vma.base == base && vma.len == len)
+            .get_mut(index)
             .ok_or(AddressSpaceError::NotFound)?;
         if !vma.max_perms.contains(MappingPerms::WRITE) {
             return Err(AddressSpaceError::PermissionIncrease);
@@ -2243,6 +2320,53 @@ impl AddressSpace {
         })
     }
 
+    /// Bind one lazy VMO-backed page to an already-chosen resident frame.
+    pub fn resolve_lazy_vmo_fault(
+        &mut self,
+        frames: &mut FrameTable,
+        fault_va: u64,
+        frame_id: FrameId,
+    ) -> Result<LazyVmoFaultResolution, AddressSpaceError> {
+        if !frames.contains(frame_id) {
+            return Err(AddressSpaceError::InvalidFrame);
+        }
+
+        let page_base = align_down(fault_va, PAGE_SIZE);
+        let resolved = self
+            .resolve_page_state(page_base)
+            .ok_or(AddressSpaceError::NotFound)?;
+        let vma = resolved.vma;
+        let page_offset = vma.vmo_offset + (page_base - vma.base);
+        let page_anchor = self.make_rmap_anchor(vma.map_id, resolved.page_delta);
+        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        if resolved.meta.tag() != PteMetaTag::LazyVmo {
+            return Err(AddressSpaceError::NotFound);
+        }
+        if let Some(existing) = vmo.frame_at_offset(page_offset) {
+            if existing != frame_id {
+                return Err(AddressSpaceError::AlreadyBound);
+            }
+            return Ok(LazyVmoFaultResolution {
+                fault_page_base: page_base,
+                frame_id,
+            });
+        }
+
+        let node_id = frames
+            .map_frame(frame_id, page_anchor)
+            .map_err(AddressSpaceError::FrameTable)?;
+        if let Err(err) = self.bind_vmo_frame(vma.vmo_id, page_offset, frame_id) {
+            let _ = frames.unmap_frame(frame_id, node_id);
+            return Err(err);
+        }
+        self.rmap_index.set_node(page_base, Some(node_id))?;
+
+        Ok(LazyVmoFaultResolution {
+            fault_page_base: page_base,
+            frame_id,
+        })
+    }
+
     /// Resolve a write fault on a copy-on-write mapping by rebinding one page.
     pub fn resolve_cow_fault(
         &mut self,
@@ -2262,6 +2386,10 @@ impl AddressSpace {
         let vma = resolved.vma;
         let meta = resolved.meta;
         if !meta.cow_shared() || !meta.logical_write() || meta.tag() != PteMetaTag::Present {
+            return Err(AddressSpaceError::NotCopyOnWrite);
+        }
+        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        if !vmo.supports_copy_on_write() {
             return Err(AddressSpaceError::NotCopyOnWrite);
         }
 
@@ -2627,7 +2755,7 @@ impl AddressSpace {
             return Err(AddressSpaceError::InvalidArgs);
         }
         let vmo = self.vmo(vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
-        let tag = pte_meta_tag(vmo.kind(), vmo.frame_at_offset(page_offset));
+        let tag = pte_meta_tag_for_vmo(vmo, vmo.frame_at_offset(page_offset));
         let mut page_bases = Vec::new();
         for vma in self
             .vmas
@@ -2679,7 +2807,7 @@ impl AddressSpace {
                 .checked_add(page_delta * PAGE_SIZE)
                 .ok_or(AddressSpaceError::InvalidArgs)?;
             page_meta.push(PteMeta {
-                tag: pte_meta_tag(vmo.kind(), vmo.frame_at_offset(page_offset)),
+                tag: pte_meta_tag_for_vmo(vmo, vmo.frame_at_offset(page_offset)),
                 logical_write,
                 cow_shared: vma.copy_on_write,
                 pinned: false,
@@ -3137,12 +3265,24 @@ fn ranges_overlap(left_base: u64, left_len: u64, right_base: u64, right_len: u64
     left_base < right_end && right_base < left_end
 }
 
-fn pte_meta_tag(kind: VmoKind, frame_id: Option<FrameId>) -> PteMetaTag {
-    match (kind, frame_id) {
-        (VmoKind::Physical, Some(_)) => PteMetaTag::Phys,
-        (VmoKind::Anonymous, None) => PteMetaTag::LazyAnon,
-        (_, Some(_)) => PteMetaTag::Present,
-        _ => PteMetaTag::Reserved,
+const fn vmo_fault_policy_for_create(kind: VmoKind) -> VmoFaultPolicy {
+    match kind {
+        VmoKind::Anonymous => VmoFaultPolicy::LocalAnonymous,
+        VmoKind::Physical | VmoKind::Contiguous => VmoFaultPolicy::NonDemandPaged,
+    }
+}
+
+const fn vmo_fault_policy_for_import(_kind: VmoKind) -> VmoFaultPolicy {
+    VmoFaultPolicy::GlobalBacked
+}
+
+fn pte_meta_tag_for_vmo(vmo: &Vmo, frame_id: Option<FrameId>) -> PteMetaTag {
+    match frame_id {
+        Some(_) if matches!(vmo.kind(), VmoKind::Physical | VmoKind::Contiguous) => {
+            PteMetaTag::Phys
+        }
+        Some(_) => PteMetaTag::Present,
+        None => vmo.missing_page_tag(),
     }
 }
 
@@ -3893,6 +4033,163 @@ mod tests {
         );
         assert_eq!(frames.state(frame).unwrap().ref_count(), 1);
         assert_eq!(frames.state(frame).unwrap().map_count(), 1);
+    }
+
+    #[test]
+    fn imported_anonymous_vmo_faults_as_lazy_vmo() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let shared = space
+            .import_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(120))
+            .unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                shared,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        assert_eq!(
+            space.classify_page_fault(ROOT_BASE, PageFaultFlags::USER),
+            PageFaultDecision::NotPresent {
+                tag: PteMetaTag::LazyVmo,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_lazy_vmo_fault_binds_existing_frame_and_updates_metadata() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let shared = space
+            .import_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(121))
+            .unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                shared,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        let frame = frames.register_existing(0x90_1000).unwrap();
+        let resolved = space
+            .resolve_lazy_vmo_fault(&mut frames, ROOT_BASE + 0x10, frame)
+            .unwrap();
+
+        assert_eq!(resolved.fault_page_base(), ROOT_BASE);
+        assert_eq!(resolved.frame_id(), frame);
+        assert_eq!(space.lookup(ROOT_BASE).unwrap().frame_id(), Some(frame));
+        assert_eq!(
+            space.pte_meta(ROOT_BASE).unwrap().tag(),
+            PteMetaTag::Present
+        );
+        assert_eq!(frames.state(frame).unwrap().ref_count(), 1);
+        assert_eq!(frames.state(frame).unwrap().map_count(), 1);
+    }
+
+    #[test]
+    fn non_anonymous_mappings_require_resident_frames() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let physical = space
+            .create_vmo(VmoKind::Physical, PAGE_SIZE, global_vmo_id(122))
+            .unwrap();
+        let contiguous = space
+            .create_vmo(VmoKind::Contiguous, PAGE_SIZE, global_vmo_id(123))
+            .unwrap();
+
+        assert_eq!(
+            space.map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                physical,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            ),
+            Err(AddressSpaceError::InvalidFrame)
+        );
+        assert_eq!(
+            space.map_fixed(
+                &mut frames,
+                ROOT_BASE + PAGE_SIZE,
+                PAGE_SIZE,
+                contiguous,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            ),
+            Err(AddressSpaceError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn mark_copy_on_write_rejects_non_copyable_vmos() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let physical = space
+            .create_vmo(VmoKind::Physical, PAGE_SIZE, global_vmo_id(124))
+            .unwrap();
+        let contiguous = space
+            .create_vmo(VmoKind::Contiguous, PAGE_SIZE, global_vmo_id(125))
+            .unwrap();
+        let phys_frame = frames.register_existing(0x90_2000).unwrap();
+        let contig_frame = frames.register_existing(0x90_3000).unwrap();
+        space.bind_vmo_frame(physical, 0, phys_frame).unwrap();
+        space.bind_vmo_frame(contiguous, 0, contig_frame).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                physical,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE + PAGE_SIZE,
+                PAGE_SIZE,
+                contiguous,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        assert_eq!(
+            space.mark_copy_on_write(ROOT_BASE, PAGE_SIZE),
+            Err(AddressSpaceError::InvalidArgs)
+        );
+        assert_eq!(
+            space.mark_copy_on_write(ROOT_BASE + PAGE_SIZE, PAGE_SIZE),
+            Err(AddressSpaceError::InvalidArgs)
+        );
+        assert_eq!(
+            space.classify_page_fault(
+                ROOT_BASE + PAGE_SIZE,
+                PageFaultFlags::PRESENT | PageFaultFlags::WRITE | PageFaultFlags::USER,
+            ),
+            PageFaultDecision::ProtectionViolation
+        );
+        assert_eq!(
+            space.pte_meta(ROOT_BASE + PAGE_SIZE).unwrap().tag(),
+            PteMetaTag::Phys
+        );
     }
 
     #[test]

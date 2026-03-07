@@ -16,7 +16,7 @@ fuzz_target!(|data: &[u8]| {
     let mut vmars: [Option<VmarId>; 8] = [None; 8];
 
     for chunk in data.chunks(8) {
-        match chunk.first().copied().unwrap_or(0) % 11 {
+        match chunk.first().copied().unwrap_or(0) % 13 {
             0 => {
                 let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmos.len() as u8);
                 let pages = u64::from((chunk.get(2).copied().unwrap_or(0) % 4) + 1);
@@ -25,9 +25,13 @@ fuzz_target!(|data: &[u8]| {
                     1 => VmoKind::Physical,
                     _ => VmoKind::Contiguous,
                 };
-                vmos[slot] = space
-                    .create_vmo(kind, pages * PAGE_SIZE, GlobalVmoId::new((slot as u64) + 1))
-                    .ok();
+                let global_id = GlobalVmoId::new((slot as u64) + 1);
+                let imported = (chunk.get(4).copied().unwrap_or(0) & 1) != 0;
+                vmos[slot] = if imported {
+                    space.import_vmo(kind, pages * PAGE_SIZE, global_id).ok()
+                } else {
+                    space.create_vmo(kind, pages * PAGE_SIZE, global_id).ok()
+                };
             }
             1 => {
                 let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmos.len() as u8);
@@ -143,6 +147,34 @@ fuzz_target!(|data: &[u8]| {
                 };
                 let _ = space.destroy_vmar(&mut frames, vmar_id);
                 vmars[slot] = None;
+            }
+            10 => {
+                let page_index = u64::from(chunk.get(1).copied().unwrap_or(0) % 16);
+                let frame_addr =
+                    0x3000_0000 + (u64::from(chunk.get(2).copied().unwrap_or(0)) * PAGE_SIZE);
+                let frame_id = match frames.register_existing(frame_addr) {
+                    Ok(frame) => frame,
+                    Err(_) => continue,
+                };
+                let _ = space.resolve_lazy_anon_fault(
+                    &mut frames,
+                    ROOT_BASE + (page_index * PAGE_SIZE),
+                    frame_id,
+                );
+            }
+            11 => {
+                let page_index = u64::from(chunk.get(1).copied().unwrap_or(0) % 16);
+                let frame_addr =
+                    0x3100_0000 + (u64::from(chunk.get(2).copied().unwrap_or(0)) * PAGE_SIZE);
+                let frame_id = match frames.register_existing(frame_addr) {
+                    Ok(frame) => frame,
+                    Err(_) => continue,
+                };
+                let _ = space.resolve_lazy_vmo_fault(
+                    &mut frames,
+                    ROOT_BASE + (page_index * PAGE_SIZE),
+                    frame_id,
+                );
             }
             _ => {
                 let frame_addr = 0x2000_0000 + (u64::from(chunk.get(1).copied().unwrap_or(0)) * PAGE_SIZE);

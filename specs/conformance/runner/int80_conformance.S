@@ -2048,6 +2048,28 @@ thread_resume_done:
 	movq $0, 0x0(%rcx)
 	movl $0, 0x8(%rcx)
 
+	// vmo_create(child lazy shared page, 0x1000)
+	lea 0x958(%rbx), %rdx
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	movabs $9, %rax
+	int $0x80
+
+	// parent root_vmar maps lazy shared page at USER_CODE_VA + 0x29000 (do not touch yet)
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x29000, %rdx
+	mov 0x958(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x960(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*383(%rbx)
+
 	// vmo_create(child stack page, 0x1000)
 	lea 0x930(%rbx), %rdx
 	movabs $0x1000, %rdi
@@ -2085,6 +2107,21 @@ thread_resume_done:
 	add $8, %rsp
 	mov %rax, 8*348(%rbx)
 
+	// child root_vmar maps lazy shared page at USER_CODE_VA + 0xa000
+	mov 0x908(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0xa000, %rdx
+	mov 0x958(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x968(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*384(%rbx)
+
 	// child root_vmar maps stack at USER_STACK_VA
 	mov 0x908(%rbx), %rdi
 	movl $0x403, %esi
@@ -2110,13 +2147,13 @@ thread_resume_done:
 	int $0x80
 	mov %rax, 8*350(%rbx)
 
-	// thread_start(child_thread, process_child_entry, USER_STACK_TOP, USER_SHARED_VA, 0)
+	// thread_start(child_thread, process_child_entry, USER_SHARED_VA, USER_CODE_VA + 0xa000)
 	mov 0x938(%rbx), %rdi
 	lea process_child_entry(%rip), %rsi
 	movabs $0x0000000100009000, %rdx
 	add $0x1000, %rdx
 	movabs $0x0000000100008000, %r10
-	xor %r8, %r8
+	movabs $0x000000010000a000, %r8
 	movabs $26, %rax
 	int $0x80
 	mov %rax, 8*351(%rbx)
@@ -2139,6 +2176,14 @@ thread_resume_done:
 	mov 0x928(%rbx), %rcx
 	mov (%rcx), %rax
 	mov %rax, 8*352(%rbx)
+	movq $0, 8*385(%rbx)
+	mov 0x960(%rbx), %rcx
+	mov (%rcx), %rax
+	movabs $0x1122334455667788, %rdx
+	cmp %rdx, %rax
+	jne process_lazy_shared_done
+	movq $1, 8*385(%rbx)
+process_lazy_shared_done:
 
 	// timer_cancel
 	mov 0x698(%rbx), %rdi
@@ -2249,6 +2294,9 @@ thread_worker_park:
 
 process_child_entry:
 	mov %rdi, %rbx
+	mov %rsi, %rcx
+	movabs $0x1122334455667788, %rax
+	mov %rax, 0x0(%rcx)
 	movq $1, 0x0(%rbx)
 	movl $1, 0x8(%rbx)
 	lea 0x8(%rbx), %rdi

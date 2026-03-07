@@ -20,8 +20,9 @@ use axle_core::{CSpace, CSpaceError, Capability, RevocationManager, Signals};
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
     CowFaultResolution, FrameId, FrameTable, FutexKey, GlobalVmoId, LazyAnonFaultResolution,
-    MapRec, MappingPerms, PageFaultDecision, PageFaultFlags, PteMeta, PteMetaTag, ReverseMapAnchor,
-    VmaLookup, Vmar, VmarAllocMode, VmarId, VmarPlacementPolicy, Vmo, VmoId, VmoKind,
+    LazyVmoFaultResolution, MapRec, MappingPerms, PageFaultDecision, PageFaultFlags, PteMeta,
+    PteMetaTag, ReverseMapAnchor, VmaLookup, Vmar, VmarAllocMode, VmarId, VmarPlacementPolicy, Vmo,
+    VmoId, VmoKind,
 };
 use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor, TxSet};
 use axle_types::rights::{
@@ -909,6 +910,15 @@ impl AddressSpace {
             .resolve_lazy_anon_fault(frames, fault_va, new_frame_id)
     }
 
+    fn resolve_lazy_vmo_fault(
+        &mut self,
+        frames: &mut FrameTable,
+        fault_va: u64,
+        frame_id: axle_mm::FrameId,
+    ) -> Result<LazyVmoFaultResolution, AddressSpaceError> {
+        self.vm.resolve_lazy_vmo_fault(frames, fault_va, frame_id)
+    }
+
     fn arm_copy_on_write(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
         self.vm.mark_copy_on_write(base, len)
     }
@@ -1190,11 +1200,15 @@ impl Kernel {
                 PteMetaTag::LazyAnon => {
                     self.materialize_lazy_anon_page(address_space_id, page_va)?;
                 }
-                PteMetaTag::Present | PteMetaTag::Phys => {
+                PteMetaTag::LazyVmo => {
+                    self.materialize_lazy_vmo_page(address_space_id, page_va)?;
+                }
+                PteMetaTag::Present => {
                     if for_write && meta.cow_shared() {
                         self.resolve_copy_on_write_page(address_space_id, page_va)?;
                     }
                 }
+                PteMetaTag::Phys => {}
                 _ => return Err(ZX_ERR_BAD_STATE),
             }
             page_va = page_va
@@ -1722,6 +1736,23 @@ impl Kernel {
         Ok(())
     }
 
+    fn global_vmo_frame(
+        &self,
+        global_vmo_id: KernelVmoId,
+        offset: u64,
+    ) -> Result<Option<FrameId>, zx_status_t> {
+        let global_vmo = self
+            .global_vmos
+            .get(&global_vmo_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        if offset & (crate::userspace::USER_PAGE_BYTES - 1) != 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let page_index = usize::try_from(offset / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        Ok(global_vmo.frames.get(page_index).copied().flatten())
+    }
+
     fn publish_address_space_frame_to_global_vmo(
         &mut self,
         address_space_id: AddressSpaceId,
@@ -2199,6 +2230,11 @@ impl Kernel {
             } => self
                 .materialize_lazy_anon_page(address_space_id, fault_va)
                 .is_ok(),
+            PageFaultDecision::NotPresent {
+                tag: PteMetaTag::LazyVmo,
+            } => self
+                .materialize_lazy_vmo_page(address_space_id, fault_va)
+                .is_ok(),
             _ => false,
         }
     }
@@ -2497,6 +2533,9 @@ impl Kernel {
             .get(&address_space_id)
             .and_then(|space| space.lookup_user_mapping(fault_va, 1))
             .ok_or(ZX_ERR_BAD_STATE)?;
+        if lookup.vmo_kind() != VmoKind::Anonymous {
+            return Err(ZX_ERR_BAD_STATE);
+        }
         let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
         let new_frame_paddr = crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw())
             .ok_or(ZX_ERR_NO_MEMORY)?;
@@ -2541,6 +2580,21 @@ impl Kernel {
         address_space_id: AddressSpaceId,
         fault_va: u64,
     ) -> Result<(), zx_status_t> {
+        if let Some(frame_id) = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.lookup_user_mapping(fault_va, 1))
+            .and_then(|lookup| lookup.frame_id())
+        {
+            self.sync_mapping_pages(
+                address_space_id,
+                align_down_page(fault_va),
+                crate::userspace::USER_PAGE_BYTES,
+            )?;
+            self.validate_frame_mapping_invariants(frame_id, "materialize_lazy_anon_page");
+            return Ok(());
+        }
+
         let new_frame_paddr =
             crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
         let new_frame_id = self
@@ -2565,7 +2619,75 @@ impl Kernel {
             address_space_id,
             resolved.fault_page_base(),
             crate::userspace::USER_PAGE_BYTES,
-        )
+        )?;
+        self.validate_frame_mapping_invariants(
+            resolved.new_frame_id(),
+            "materialize_lazy_anon_page",
+        );
+        Ok(())
+    }
+
+    fn materialize_lazy_vmo_page(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        fault_va: u64,
+    ) -> Result<(), zx_status_t> {
+        let lookup = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.lookup_user_mapping(fault_va, 1))
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if let Some(frame_id) = lookup.frame_id() {
+            self.sync_mapping_pages(
+                address_space_id,
+                align_down_page(fault_va),
+                crate::userspace::USER_PAGE_BYTES,
+            )?;
+            self.validate_frame_mapping_invariants(frame_id, "materialize_lazy_vmo_page");
+            return Ok(());
+        }
+
+        let page_base = align_down_page(fault_va);
+        let page_offset = lookup
+            .vmo_offset()
+            .checked_sub(lookup.vmo_offset() % crate::userspace::USER_PAGE_BYTES)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let frame_id = match self.global_vmo_frame(lookup.global_vmo_id(), page_offset)? {
+            Some(frame_id) => frame_id,
+            None => match lookup.vmo_kind() {
+                VmoKind::Anonymous => {
+                    let new_frame_paddr =
+                        crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
+                    let new_frame_id = self
+                        .frames
+                        .register_existing(new_frame_paddr)
+                        .map_err(|_| ZX_ERR_BAD_STATE)?;
+                    self.update_global_vmo_frame(
+                        lookup.global_vmo_id(),
+                        page_offset,
+                        new_frame_id,
+                    )?;
+                    new_frame_id
+                }
+                VmoKind::Physical | VmoKind::Contiguous => return Err(ZX_ERR_BAD_STATE),
+            },
+        };
+        let resolved = {
+            let address_space = self
+                .address_spaces
+                .get_mut(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            address_space
+                .resolve_lazy_vmo_fault(&mut self.frames, fault_va, frame_id)
+                .map_err(map_address_space_error)?
+        };
+        self.sync_mapping_pages(
+            address_space_id,
+            page_base,
+            crate::userspace::USER_PAGE_BYTES,
+        )?;
+        self.validate_frame_mapping_invariants(resolved.frame_id(), "materialize_lazy_vmo_page");
+        Ok(())
     }
 
     fn sync_mapping_pages(

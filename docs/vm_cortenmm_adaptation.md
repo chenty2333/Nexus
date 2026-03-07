@@ -35,12 +35,18 @@ external VM model.
   These records connect `VMAR` control metadata to page-local state without
   making `VMA` the long-term hot-path truth source.
 - Axle now has a software `PteMeta` plane keyed by `(address_space, vpn)`.
-  Fault classification, page-local COW state, and bootstrap `LazyAnon`
-  materialization already flow through this metadata layer.
+  Fault classification, page-local COW state, bootstrap `LazyAnon`, and
+  global-VMO-backed `LazyVmo` materialization already flow through this
+  metadata layer.
 - `PteMeta` ownership is now tightened through `MapRec`: page-local consumers
   resolve `(address_space, vmar_id, map_id)` through metadata first and only
   then recover mutable mapping state, which keeps child-VMAR identity explicit
   even on COW and destroy paths.
+- Global anonymous VMO aliases now fault through one shared `GlobalVmo` source
+  of truth instead of allocating per-address-space pages on first touch. The
+  child-process conformance path now covers this lazy shared-VMO case.
+- `Physical` and `Contiguous` VMO mappings now have explicit non-COW boundaries:
+  they must already be resident when mapped, and COW arming rejects them.
 - Axle's channel page-loan path now uses ordered cross-address-space
   transactions, sender-side COW arming, and a conservative bootstrap
   `remap-fill` fast path. Channel `close/read` and `WRITABLE` recovery behavior
