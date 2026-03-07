@@ -734,6 +734,21 @@ impl MapRec {
     pub const fn max_perms(self) -> MappingPerms {
         self.max_perms
     }
+
+    fn end(self) -> u64 {
+        self.base + self.len
+    }
+
+    fn contains_page(self, page_base: u64) -> bool {
+        page_base >= self.base && page_base < self.end()
+    }
+
+    fn contains_range(self, base: u64, len: u64) -> bool {
+        let Some(end) = base.checked_add(len) else {
+            return false;
+        };
+        base >= self.base && end <= self.end()
+    }
 }
 
 /// A single virtual-memory mapping.
@@ -814,18 +829,12 @@ impl Vma {
     fn contains(self, va: u64) -> bool {
         va >= self.base && va < self.end()
     }
-
-    fn contains_range(self, base: u64, len: u64) -> bool {
-        let Some(end) = base.checked_add(len) else {
-            return false;
-        };
-        base >= self.base && end <= self.end()
-    }
 }
 
 /// Result of resolving a virtual address back to its VMA and VMO metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmaLookup {
+    address_space_id: AddressSpaceId,
     map_id: MapId,
     vmar_id: VmarId,
     vmo_id: VmoId,
@@ -841,6 +850,11 @@ pub struct VmaLookup {
 }
 
 impl VmaLookup {
+    /// Owning address space containing the resolved mapping.
+    pub const fn address_space_id(self) -> AddressSpaceId {
+        self.address_space_id
+    }
+
     /// Stable coarse mapping identifier.
     pub const fn map_id(self) -> MapId {
         self.map_id
@@ -1330,6 +1344,16 @@ impl LazyAnonFaultResolution {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedPageState {
+    page_base: u64,
+    page_delta: u64,
+    meta: PteMeta,
+    map_rec: MapRec,
+    vma_index: usize,
+    vma: Vma,
+}
+
 /// Metadata-only address space with one root VMAR.
 #[derive(Debug)]
 pub struct AddressSpace {
@@ -1546,6 +1570,11 @@ impl AddressSpace {
             .find(|map_rec| map_rec.id == id)
     }
 
+    /// Resolve one virtual address back to its owning coarse mapping record.
+    pub fn map_record_for_va(&self, va: u64) -> Option<MapRec> {
+        self.resolve_page_state(va).map(|resolved| resolved.map_rec)
+    }
+
     fn rmap_node_at(&self, va: u64) -> Option<RmapNodeId> {
         self.rmap_index.node(va)
     }
@@ -1570,14 +1599,20 @@ impl AddressSpace {
 
     /// Resolve one reverse-mapping anchor back to its live mapping metadata.
     pub fn lookup_rmap_anchor(&self, anchor: ReverseMapAnchor) -> Option<VmaLookup> {
-        let page_base = self.page_base_for_rmap_anchor(anchor)?;
-        let lookup = self.lookup(page_base)?;
-        (lookup.map_id() == anchor.map_id()).then_some(lookup)
+        let resolved = self.resolve_page_state(self.page_base_for_rmap_anchor(anchor)?)?;
+        (resolved.map_rec.id() == anchor.map_id() && resolved.page_delta == anchor.page_delta())
+            .then(|| self.lookup_from_resolved_page(resolved, resolved.page_base))
+            .flatten()
     }
 
     /// Return the current page metadata for one virtual address, if mapped.
     pub fn pte_meta(&self, va: u64) -> Option<PteMeta> {
         self.pte_meta.meta(va)
+    }
+
+    /// Return the current page metadata after validating its coarse mapping ownership.
+    pub fn owned_pte_meta(&self, va: u64) -> Option<PteMeta> {
+        self.resolve_page_state(va).map(|resolved| resolved.meta)
     }
 
     /// Return the current page metadata for one absolute virtual page number.
@@ -1591,9 +1626,10 @@ impl AddressSpace {
             return PageFaultDecision::Unhandled;
         }
 
-        let Some(meta) = self.pte_meta(fault_va) else {
+        let Some(resolved) = self.resolve_page_state(fault_va) else {
             return PageFaultDecision::Unmapped;
         };
+        let meta = resolved.meta;
 
         if flags.contains(PageFaultFlags::PRESENT) {
             if flags.contains(PageFaultFlags::WRITE)
@@ -1983,23 +2019,18 @@ impl AddressSpace {
         }
 
         let page_base = align_down(fault_va, PAGE_SIZE);
-        let vma = self
-            .vmas
-            .iter()
-            .copied()
-            .find(|candidate| candidate.contains(page_base))
+        let resolved = self
+            .resolve_page_state(page_base)
             .ok_or(AddressSpaceError::NotFound)?;
+        let vma = resolved.vma;
         let page_offset = vma.vmo_offset + (page_base - vma.base);
-        let page_anchor =
-            self.make_rmap_anchor(vma.map_id, (page_offset - vma.vmo_offset) / PAGE_SIZE);
+        let page_anchor = self.make_rmap_anchor(vma.map_id, resolved.page_delta);
         let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
         if vmo.kind() != VmoKind::Anonymous {
             return Err(AddressSpaceError::NotFound);
         }
 
-        let meta = self
-            .pte_meta(page_base)
-            .ok_or(AddressSpaceError::NotFound)?;
+        let meta = resolved.meta;
         if meta.tag() != PteMetaTag::LazyAnon {
             return Err(AddressSpaceError::NotFound);
         }
@@ -2033,22 +2064,19 @@ impl AddressSpace {
             return Err(AddressSpaceError::InvalidFrame);
         }
 
-        let index = self
-            .vmas
-            .iter()
-            .position(|vma| vma.contains(fault_va))
-            .ok_or(AddressSpaceError::NotFound)?;
-        let vma = self.vmas[index];
         let page_base = align_down(fault_va, PAGE_SIZE);
-        let meta = self
-            .pte_meta(page_base)
+        let resolved = self
+            .resolve_page_state(page_base)
             .ok_or(AddressSpaceError::NotCopyOnWrite)?;
+        let index = resolved.vma_index;
+        let vma = resolved.vma;
+        let meta = resolved.meta;
         if !meta.cow_shared() || !meta.logical_write() || meta.tag() != PteMetaTag::Present {
             return Err(AddressSpaceError::NotCopyOnWrite);
         }
 
         let page_offset = vma.vmo_offset + (page_base - vma.base);
-        let fault_page_delta = (page_offset - vma.vmo_offset) / PAGE_SIZE;
+        let fault_page_delta = resolved.page_delta;
         let page_anchor = self.make_rmap_anchor(vma.map_id, fault_page_delta);
         let old_node_id = self
             .rmap_node_at(page_base)
@@ -2242,59 +2270,14 @@ impl AddressSpace {
 
     /// Resolve one virtual address to its backing VMO metadata.
     pub fn lookup(&self, va: u64) -> Option<VmaLookup> {
-        let vma = self.vmas.iter().copied().find(|vma| vma.contains(va))?;
-        let vmo = self.vmo(vma.vmo_id)?;
-        let resolved_offset = vma.vmo_offset + (va - vma.base);
-        let copy_on_write = self
-            .pte_meta(va)
-            .map(|meta| meta.cow_shared())
-            .unwrap_or(vma.copy_on_write);
-        Some(VmaLookup {
-            map_id: vma.map_id,
-            vmar_id: vma.vmar_id,
-            vmo_id: vma.vmo_id,
-            global_vmo_id: vma.global_vmo_id,
-            vmo_kind: vmo.kind(),
-            vmo_offset: resolved_offset,
-            frame_id: vmo.frame_at_offset(resolved_offset),
-            perms: vma.perms,
-            max_perms: vma.max_perms,
-            copy_on_write,
-            mapping_base: vma.base,
-            mapping_len: vma.len,
-        })
+        self.resolve_page_state(va)
+            .and_then(|resolved| self.lookup_from_resolved_page(resolved, va))
     }
 
     /// Resolve a virtual range if it is fully covered by a single VMA.
     pub fn lookup_range(&self, base: u64, len: u64) -> Option<VmaLookup> {
-        if validate_lookup_range(base, len).is_err() {
-            return None;
-        }
-        let vma = self
-            .vmas
-            .iter()
-            .copied()
-            .find(|candidate| candidate.contains_range(base, len))?;
-        let vmo = self.vmo(vma.vmo_id)?;
-        let resolved_offset = vma.vmo_offset + (base - vma.base);
-        let copy_on_write = self
-            .pte_meta(base)
-            .map(|meta| meta.cow_shared())
-            .unwrap_or(vma.copy_on_write);
-        Some(VmaLookup {
-            map_id: vma.map_id,
-            vmar_id: vma.vmar_id,
-            vmo_id: vma.vmo_id,
-            global_vmo_id: vma.global_vmo_id,
-            vmo_kind: vmo.kind(),
-            vmo_offset: resolved_offset,
-            frame_id: vmo.frame_at_offset(resolved_offset),
-            perms: vma.perms,
-            max_perms: vma.max_perms,
-            copy_on_write,
-            mapping_base: vma.base,
-            mapping_len: vma.len,
-        })
+        let resolved = self.resolve_range_state(base, len)?;
+        self.lookup_from_resolved_page(resolved, base)
     }
 
     /// Return whether the entire range is backed by contiguous VMAs.
@@ -2343,6 +2326,83 @@ impl AddressSpace {
 
     fn make_rmap_anchor(&self, map_id: MapId, page_delta: u64) -> ReverseMapAnchor {
         ReverseMapAnchor::new(self.id, map_id, page_delta)
+    }
+
+    fn lookup_from_resolved_page(&self, resolved: ResolvedPageState, va: u64) -> Option<VmaLookup> {
+        let vma = resolved.vma;
+        let vmo = self.vmo(vma.vmo_id)?;
+        let resolved_offset = vma.vmo_offset + (va - vma.base);
+        Some(VmaLookup {
+            address_space_id: self.id,
+            map_id: resolved.map_rec.id(),
+            vmar_id: resolved.map_rec.vmar_id(),
+            vmo_id: resolved.map_rec.vmo_id(),
+            global_vmo_id: resolved.map_rec.global_vmo_id(),
+            vmo_kind: vmo.kind(),
+            vmo_offset: resolved_offset,
+            frame_id: vmo.frame_at_offset(resolved_offset),
+            perms: vma.perms,
+            max_perms: resolved.map_rec.max_perms(),
+            copy_on_write: resolved.meta.cow_shared(),
+            mapping_base: resolved.map_rec.base(),
+            mapping_len: resolved.map_rec.len(),
+        })
+    }
+
+    fn resolve_page_state(&self, va: u64) -> Option<ResolvedPageState> {
+        let page_base = align_down(va, PAGE_SIZE);
+        let meta = self.pte_meta(page_base)?;
+        let map_rec = self.map_record(meta.map_id())?;
+        if !map_rec.contains_page(page_base) {
+            return None;
+        }
+        let page_delta = (page_base - map_rec.base()) / PAGE_SIZE;
+        if meta.page_delta() != page_delta {
+            return None;
+        }
+        let (vma_index, vma) = self
+            .vmas
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, candidate)| candidate.map_id == meta.map_id())?;
+        if vma.vmar_id != map_rec.vmar_id()
+            || vma.base != map_rec.base()
+            || vma.len != map_rec.len()
+            || vma.vmo_id != map_rec.vmo_id()
+            || vma.global_vmo_id != map_rec.global_vmo_id()
+            || vma.vmo_offset != map_rec.vmo_offset()
+            || vma.max_perms != map_rec.max_perms()
+            || !vma.contains(page_base)
+        {
+            return None;
+        }
+        Some(ResolvedPageState {
+            page_base,
+            page_delta,
+            meta,
+            map_rec,
+            vma_index,
+            vma,
+        })
+    }
+
+    fn resolve_range_state(&self, base: u64, len: u64) -> Option<ResolvedPageState> {
+        validate_lookup_range(base, len).ok()?;
+        let resolved = self.resolve_page_state(base)?;
+        if !resolved.map_rec.contains_range(base, len) {
+            return None;
+        }
+        let last_page = align_down(base + len - 1, PAGE_SIZE);
+        let mut page_base = align_down(base, PAGE_SIZE);
+        while page_base <= last_page {
+            let page = self.resolve_page_state(page_base)?;
+            if page.map_rec.id() != resolved.map_rec.id() || page.vma_index != resolved.vma_index {
+                return None;
+            }
+            page_base = page_base.checked_add(PAGE_SIZE)?;
+        }
+        Some(resolved)
     }
 
     fn first_rmap_anchor_for_frame_excluding(
@@ -2760,6 +2820,7 @@ mod tests {
         let (space, frames, code_frame, _) = sample_space();
         let lookup = space.lookup(ROOT_BASE + 0x120).unwrap();
         let map_rec = space.map_record(lookup.map_id()).unwrap();
+        assert_eq!(lookup.address_space_id(), space.id());
         assert_eq!(lookup.vmo_offset(), 0x120);
         assert_eq!(lookup.global_vmo_id(), global_vmo_id(1));
         assert!(lookup.perms().contains(MappingPerms::EXECUTE));
@@ -2812,8 +2873,10 @@ mod tests {
 
         let lookup = space.lookup(child.base()).unwrap();
         let map_rec = space.map_record(lookup.map_id()).unwrap();
+        assert_eq!(lookup.address_space_id(), space.id());
         assert_eq!(lookup.vmar_id(), child.id());
         assert_eq!(map_rec.vmar_id(), child.id());
+        assert_eq!(space.map_record_for_va(child.base()), Some(map_rec));
 
         assert_eq!(
             space
@@ -2863,6 +2926,8 @@ mod tests {
         assert_eq!(removed, vec![(child.base(), PAGE_SIZE)]);
         assert!(space.vmar(child.id()).is_none());
         assert!(space.lookup(child.base()).is_none());
+        assert!(space.map_record_for_va(child.base()).is_none());
+        assert!(space.pte_meta(child.base()).is_none());
 
         space
             .map_fixed(
@@ -2875,6 +2940,122 @@ mod tests {
                 MappingPerms::READ | MappingPerms::USER,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn child_vmar_page_local_cow_preserves_mapping_identity() {
+        let mut frames = FrameTable::new();
+        let original = frames.register_existing(0x42_000).unwrap();
+        let replacement = frames.register_existing(0x43_000).unwrap();
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(11))
+            .unwrap();
+        space.bind_vmo_frame(vmo, 0, original).unwrap();
+
+        let child = space
+            .allocate_subvmar_for_cpu(0, 2 * PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        space
+            .map_fixed_in_vmar(
+                &mut frames,
+                child.id(),
+                child.base(),
+                PAGE_SIZE,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+        let before = space.lookup(child.base()).unwrap();
+        space.mark_copy_on_write(child.base(), PAGE_SIZE).unwrap();
+        let resolved = space
+            .resolve_cow_fault(&mut frames, child.base() + 0x80, replacement)
+            .unwrap();
+        let after = space.lookup(child.base()).unwrap();
+        let map_rec = space.map_record(after.map_id()).unwrap();
+        assert_eq!(resolved.fault_page_base(), child.base());
+        assert_eq!(after.address_space_id(), space.id());
+        assert_eq!(after.map_id(), before.map_id());
+        assert_eq!(after.vmar_id(), child.id());
+        assert_eq!(after.frame_id(), Some(replacement));
+        assert!(!after.is_copy_on_write());
+        assert_eq!(map_rec.vmar_id(), child.id());
+        assert_eq!(space.map_record_for_va(child.base()), Some(map_rec));
+        assert_eq!(
+            space.pte_meta(child.base()).unwrap().map_id(),
+            after.map_id()
+        );
+        assert!(!space.pte_meta(child.base()).unwrap().cow_shared());
+    }
+
+    #[test]
+    fn mixed_root_and_child_mappings_keep_distinct_page_ownership() {
+        let mut frames = FrameTable::new();
+        let root_frame = frames.register_existing(0x44_000).unwrap();
+        let child_frame = frames.register_existing(0x45_000).unwrap();
+        let mut space = AddressSpace::new(ROOT_BASE, 0x8000_0000).unwrap();
+        let root_vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(12))
+            .unwrap();
+        let child_vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(13))
+            .unwrap();
+        space.bind_vmo_frame(root_vmo, 0, root_frame).unwrap();
+        space.bind_vmo_frame(child_vmo, 0, child_frame).unwrap();
+
+        let child = space
+            .allocate_subvmar_for_cpu(0, 2 * PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        let far_root_base = ROOT_BASE + 0x4000_0000;
+        space
+            .map_fixed(
+                &mut frames,
+                far_root_base,
+                PAGE_SIZE,
+                root_vmo,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+        space
+            .map_anywhere_in_vmar(
+                &mut frames,
+                child.id(),
+                PAGE_SIZE,
+                child_vmo,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                PAGE_SIZE,
+            )
+            .unwrap();
+
+        let root_lookup = space.lookup(far_root_base).unwrap();
+        let child_lookup = space.lookup(child.base()).unwrap();
+        assert_eq!(root_lookup.address_space_id(), space.id());
+        assert_eq!(child_lookup.address_space_id(), space.id());
+        assert_eq!(root_lookup.vmar_id(), space.root_vmar().id());
+        assert_eq!(child_lookup.vmar_id(), child.id());
+        assert_ne!(root_lookup.map_id(), child_lookup.map_id());
+        assert_eq!(
+            space.map_record_for_va(far_root_base).unwrap().vmar_id(),
+            space.root_vmar().id()
+        );
+        assert_eq!(
+            space.map_record_for_va(child.base()).unwrap().vmar_id(),
+            child.id()
+        );
+        assert_eq!(
+            space.pte_meta(far_root_base).unwrap().map_id(),
+            root_lookup.map_id()
+        );
+        assert_eq!(
+            space.pte_meta(child.base()).unwrap().map_id(),
+            child_lookup.map_id()
+        );
     }
 
     #[test]

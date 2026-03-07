@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use axle_page_table::{
     FlushOp, PageMapping, PageRange, PageTable, PageTableError, PageTableLock, ShootdownBatch,
@@ -471,6 +472,51 @@ impl UserPageTables {
 
     pub(crate) fn max_invalidate_epoch(&self) -> u64 {
         self.descs.lock().max_invalidate_epoch()
+    }
+
+    pub(crate) fn validate_descriptor_metadata_range(&self, base: u64, len: u64) -> bool {
+        let Ok(range) = PageRange::new(base, len) else {
+            return false;
+        };
+        let mut leaf_bases = BTreeSet::new();
+        let mut va = range.base();
+        while va < range.end() {
+            leaf_bases.insert(align_down_level(va, PtPageLevel::Pt));
+            let Some(next_va) = va.checked_add(axle_page_table::PAGE_SIZE) else {
+                return false;
+            };
+            va = next_va;
+        }
+
+        let descs = self.descs.lock();
+        let mut pd_bases = BTreeSet::new();
+        for leaf_base in leaf_bases {
+            let Some(leaf_desc) = descs.descriptor(PtPageLevel::Pt, leaf_base) else {
+                continue;
+            };
+            let expected_leaf = match uniform_leaf_template(leaf_desc.table_paddr()) {
+                Some(template) => PtMetaKind::Uniform(template),
+                None => PtMetaKind::Leaf,
+            };
+            if leaf_desc.meta_kind() != expected_leaf {
+                return false;
+            }
+            pd_bases.insert(align_down_level(leaf_base, PtPageLevel::Pd));
+        }
+
+        for pd_base in pd_bases {
+            let Some(pd_desc) = descs.descriptor(PtPageLevel::Pd, pd_base) else {
+                continue;
+            };
+            let expected_pd = match descs.uniform_template_for_pd(pd_base) {
+                Some(template) => PtMetaKind::Uniform(template),
+                None => PtMetaKind::Leaf,
+            };
+            if pd_desc.meta_kind() != expected_pd {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) fn activate(self) -> Result<(), PageTableError> {

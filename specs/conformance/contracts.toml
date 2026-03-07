@@ -149,3 +149,8 @@ description = "Bootstrap zx_vmar_allocate/zx_vmar_destroy should carve child VMA
 id = "should.vmar.far_range_bootstrap"
 level = "should"
 description = "Bootstrap VMAR mapping should support mappings far beyond the original 2 MiB bridge, including addresses that require a new top-level walk path"
+
+[[contracts]]
+id = "should.vmar.child_metadata_stability_bootstrap"
+level = "should"
+description = "Bootstrap child VMAR mappings should coexist with far root mappings without losing mapping identity, destroy cleanup, or sparse page-table metadata stability"

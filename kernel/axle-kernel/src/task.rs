@@ -20,7 +20,7 @@ use axle_core::{CSpace, CSpaceError, Capability, RevocationManager, Signals};
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
     CowFaultResolution, FrameId, FrameTable, FutexKey, GlobalVmoId, LazyAnonFaultResolution,
-    MappingPerms, PageFaultDecision, PageFaultFlags, PteMeta, PteMetaTag, ReverseMapAnchor,
+    MapRec, MappingPerms, PageFaultDecision, PageFaultFlags, PteMeta, PteMetaTag, ReverseMapAnchor,
     VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
 };
 use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor, TxSet};
@@ -395,9 +395,9 @@ impl LoanedUserPages {
 
 #[derive(Clone, Copy, Debug)]
 struct FrameMappingSnapshot {
-    address_space_id: AddressSpaceId,
     anchor: ReverseMapAnchor,
     page_base: u64,
+    map_rec: MapRec,
     lookup: VmaLookup,
 }
 
@@ -660,12 +660,9 @@ impl AddressSpace {
             crate::userspace::USER_PAGE_BYTES,
         )
         .expect("bootstrap stack COW arm must succeed");
-        debug_assert!(matches!(
-            page_tables
-                .descriptor(crate::page_table::PtPageLevel::Pt, crate::userspace::USER_CODE_VA)
-                .expect("bootstrap user pt descriptor must exist")
-                .meta_kind(),
-            crate::page_table::PtMetaKind::Uniform(template) if !template.present()
+        debug_assert!(page_tables.validate_descriptor_metadata_range(
+            crate::userspace::USER_CODE_VA,
+            crate::userspace::USER_CODE_BYTES,
         ));
 
         Self {
@@ -689,7 +686,7 @@ impl AddressSpace {
     }
 
     fn page_meta(&self, fault_va: u64) -> Option<PteMeta> {
-        self.vm.pte_meta(fault_va)
+        self.vm.owned_pte_meta(fault_va)
     }
 
     fn page_base_for_rmap_anchor(&self, anchor: ReverseMapAnchor) -> Option<u64> {
@@ -698,6 +695,14 @@ impl AddressSpace {
 
     fn lookup_rmap_anchor(&self, anchor: ReverseMapAnchor) -> Option<VmaLookup> {
         self.vm.lookup_rmap_anchor(anchor)
+    }
+
+    fn map_record(&self, id: axle_mm::MapId) -> Option<MapRec> {
+        self.vm.map_record(id)
+    }
+
+    fn map_record_for_va(&self, va: u64) -> Option<MapRec> {
+        self.vm.map_record_for_va(va)
     }
 
     fn snapshot_vmo(&self, global_vmo_id: KernelVmoId) -> Option<Vmo> {
@@ -742,6 +747,11 @@ impl AddressSpace {
 
     fn current_invalidate_epoch(&self) -> u64 {
         self.page_tables.max_invalidate_epoch()
+    }
+
+    fn validate_descriptor_metadata_range(&self, base: u64, len: u64) -> bool {
+        self.page_tables
+            .validate_descriptor_metadata_range(base, len)
     }
 
     fn note_cpu_active(&mut self, cpu_id: usize) {
@@ -1576,14 +1586,14 @@ impl Kernel {
             active_cpu_mask: 0,
             observed_tlb_epoch: [0; MAX_TRACKED_TLB_CPUS],
         };
-        debug_assert!(matches!(
+        debug_assert!(
             address_space
                 .page_tables
-                .descriptor(crate::page_table::PtPageLevel::Pt, crate::userspace::USER_CODE_VA)
-                .expect("child user pt descriptor must exist")
-                .meta_kind(),
-            crate::page_table::PtMetaKind::Uniform(template) if !template.present()
-        ));
+                .validate_descriptor_metadata_range(
+                    crate::userspace::USER_CODE_VA,
+                    crate::userspace::USER_CODE_BYTES,
+                )
+        );
         let root_vmar = address_space.root_vmar();
         self.address_spaces.insert(address_space_id, address_space);
 
@@ -2447,7 +2457,11 @@ impl Kernel {
                     .map_err(map_page_table_error)?;
             }
         }
-        tx_set.commit().map_err(map_page_table_error)
+        tx_set.commit().map_err(map_page_table_error)?;
+        if let Some(address_space) = self.address_spaces.get(&address_space_id) {
+            debug_assert!(address_space.validate_descriptor_metadata_range(base, len));
+        }
+        Ok(())
     }
 
     fn update_mapping_pages(
@@ -2551,7 +2565,11 @@ impl Kernel {
         let mut tx_set = self.lock_address_space_tx_set(&[request])?;
         let tx = tx_set.cursor_mut(request.key).ok_or(ZX_ERR_BAD_STATE)?;
         self.sync_mapping_pages_locked(address_space_id, base, len, tx)?;
-        tx_set.commit().map_err(map_page_table_error)
+        tx_set.commit().map_err(map_page_table_error)?;
+        if let Some(address_space) = self.address_spaces.get(&address_space_id) {
+            debug_assert!(address_space.validate_descriptor_metadata_range(base, len));
+        }
+        Ok(())
     }
 
     fn sync_mapping_pages_locked(
@@ -2625,8 +2643,8 @@ impl Kernel {
         };
         let mut mappings = Vec::with_capacity(anchors.len());
         for anchor in anchors {
-            let address_space_id = anchor.address_space_id().raw();
-            let Some(address_space) = self.address_spaces.get(&address_space_id) else {
+            let Some(address_space) = self.address_spaces.get(&anchor.address_space_id().raw())
+            else {
                 continue;
             };
             let Some(page_base) = address_space.page_base_for_rmap_anchor(anchor) else {
@@ -2635,11 +2653,17 @@ impl Kernel {
             let Some(lookup) = address_space.lookup_rmap_anchor(anchor) else {
                 continue;
             };
+            let Some(map_rec) = address_space
+                .map_record_for_va(page_base)
+                .or_else(|| address_space.map_record(lookup.map_id()))
+            else {
+                continue;
+            };
             if lookup.frame_id() == Some(frame_id) {
                 mappings.push(FrameMappingSnapshot {
-                    address_space_id,
                     anchor,
                     page_base,
+                    map_rec,
                     lookup,
                 });
             }
@@ -2673,16 +2697,23 @@ impl Kernel {
         );
         for mapping in &mappings {
             crate::kprintln!(
-                "kernel:   mapping aspace={} map={} va={:#x} vmo_offset={:#x} perms={:?} cow={} anchor_page={} anchor_map={}",
-                mapping.address_space_id,
-                mapping.lookup.map_id().raw(),
+                "kernel:   mapping aspace={} vmar={} map={} va={:#x} map_base={:#x} map_len={:#x} vmo_offset={:#x} perms={:?} cow={} anchor_page={} anchor_map={}",
+                mapping.lookup.address_space_id().raw(),
+                mapping.map_rec.vmar_id().raw(),
+                mapping.map_rec.id().raw(),
                 mapping.page_base,
+                mapping.map_rec.base(),
+                mapping.map_rec.len(),
                 mapping.lookup.vmo_offset(),
                 mapping.lookup.perms(),
                 mapping.lookup.is_copy_on_write(),
                 mapping.anchor.page_delta(),
                 mapping.anchor.map_id().raw(),
             );
+            debug_assert_eq!(mapping.lookup.vmar_id(), mapping.map_rec.vmar_id());
+            debug_assert_eq!(mapping.lookup.map_id(), mapping.map_rec.id());
+            debug_assert_eq!(mapping.lookup.mapping_base(), mapping.map_rec.base());
+            debug_assert_eq!(mapping.lookup.mapping_len(), mapping.map_rec.len());
         }
         debug_assert_eq!(state.map_count(), resolved_count);
         debug_assert_eq!(state.rmap_anchor_count(), resolved_count);

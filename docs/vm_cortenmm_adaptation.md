@@ -37,6 +37,10 @@ external VM model.
 - Axle now has a software `PteMeta` plane keyed by `(address_space, vpn)`.
   Fault classification, page-local COW state, and bootstrap `LazyAnon`
   materialization already flow through this metadata layer.
+- `PteMeta` ownership is now tightened through `MapRec`: page-local consumers
+  resolve `(address_space, vmar_id, map_id)` through metadata first and only
+  then recover mutable mapping state, which keeps child-VMAR identity explicit
+  even on COW and destroy paths.
 - Axle's channel page-loan path now uses ordered cross-address-space
   transactions, sender-side COW arming, and a conservative bootstrap
   `remap-fill` fast path. Channel `close/read` and `WRITABLE` recovery behavior
@@ -58,13 +62,18 @@ external VM model.
 - The kernel now has a direct internal `frame_mappings(frame_id)` snapshot
   helper, so diagnostics and invariants no longer need to manually rebuild
   `anchor -> address_space -> mapping` resolution at each call site.
+- Kernel diagnostics now dump frame mappings as `(address_space, vmar, map)`
+  identities, and child-VMAR destroy / far-range root mappings have a combined
+  conformance scenario to catch mixed control-plane/data-plane regressions.
 
 What is intentionally deferred for later work:
 
-- per-PT-page descriptors
-- upper-level uniform metadata
-- lazy TLB shootdown
-- a higher-efficiency reverse-mapping structure than the current anchor set
+- broader VMAR control-plane options (`child-of-child`, richer allocate flags,
+  ASLR policy, non-zero offsets)
+- more selective invalidation and shootdown strategies beyond the current
+  transaction-batched + epoch-lazy baseline
+- a more mature reverse-mapping consumer layer built on top of the current
+  arena-backed frame→mapping structure
 
 Per-core VA allocation is now present in `axle-mm` as an internal root-VMAR
 control-plane allocator. It hands out child-VMAR reservations through CPU-local
