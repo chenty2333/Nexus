@@ -1681,6 +1681,164 @@ thread_resume_done:
 	mov 0x8c8(%rbx), %eax
 	mov %rax, 8*314(%rbx)
 
+	// process_create(self_process, NULL, 0, 0, &child_process, &child_root_vmar)
+	mov 8*300(%rbx), %rdi
+	xor %rsi, %rsi
+	xor %rdx, %rdx
+	xor %r10d, %r10d
+	lea 0x900(%rbx), %r8
+	lea 0x908(%rbx), %r9
+	movabs $27, %rax
+	int $0x80
+	mov %rax, 8*344(%rbx)
+
+	// vmo_create(child code image, 0x8000)
+	lea 0x910(%rbx), %rdx
+	movabs $0x8000, %rdi
+	xorl %esi, %esi
+	movabs $9, %rax
+	int $0x80
+
+	// parent root_vmar maps code VMO at USER_CODE_VA + 0x20000
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x20000, %rdx
+	mov 0x910(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x8000, %r9
+	lea 0x918(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*345(%rbx)
+
+	// copy current runner code bytes into the shared code VMO
+	movabs $0x0000000100000000, %rsi
+	mov 0x918(%rbx), %rdi
+	movabs $0x8000, %rcx
+	rep movsb
+
+	// vmo_create(child shared page, 0x1000)
+	lea 0x920(%rbx), %rdx
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	movabs $9, %rax
+	int $0x80
+
+	// parent root_vmar maps shared page at USER_CODE_VA + 0x28000
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x28000, %rdx
+	mov 0x920(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x928(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*346(%rbx)
+
+	// materialize and initialize the shared page before importing it into the child
+	mov 0x928(%rbx), %rcx
+	movq $0, 0x0(%rcx)
+	movl $0, 0x8(%rcx)
+
+	// vmo_create(child stack page, 0x1000)
+	lea 0x930(%rbx), %rdx
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	movabs $9, %rax
+	int $0x80
+
+	// child root_vmar maps code at USER_CODE_VA
+	mov 0x908(%rbx), %rdi
+	movl $0x403, %esi
+	xor %rdx, %rdx
+	mov 0x910(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x8000, %r9
+	lea 0x940(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*347(%rbx)
+
+	// child root_vmar maps shared page at USER_SHARED_VA
+	mov 0x908(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x8000, %rdx
+	mov 0x920(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x948(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*348(%rbx)
+
+	// child root_vmar maps stack at USER_STACK_VA
+	mov 0x908(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x9000, %rdx
+	mov 0x930(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x950(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*349(%rbx)
+
+	// thread_create(child_process, NULL, 0, 0, &child_thread_h)
+	mov 0x900(%rbx), %rdi
+	xor %rsi, %rsi
+	xor %rdx, %rdx
+	xor %r10d, %r10d
+	lea 0x938(%rbx), %r8
+	movabs $25, %rax
+	int $0x80
+	mov %rax, 8*350(%rbx)
+
+	// thread_start(child_thread, process_child_entry, USER_STACK_TOP, USER_SHARED_VA, 0)
+	mov 0x938(%rbx), %rdi
+	lea process_child_entry(%rip), %rsi
+	movabs $0x0000000100009000, %rdx
+	add $0x1000, %rdx
+	movabs $0x0000000100008000, %r10
+	xor %r8, %r8
+	movabs $26, %rax
+	int $0x80
+	mov %rax, 8*351(%rbx)
+
+	// park the original bootstrap worker thread so the child process thread can run next
+	mov 0x928(%rbx), %rcx
+	lea 0xc(%rcx), %rax
+	mov %rax, 8*308(%rbx)
+	movq $4, 8*307(%rbx)
+
+	// wait on the shared futex word the child will wake
+	mov 0x928(%rbx), %rcx
+	lea 0x8(%rcx), %rdi
+	xorl %esi, %esi
+	xorl %edx, %edx
+	movabs $0x7fffffffffffffff, %r10
+	movabs $21, %rax
+	int $0x80
+	mov %rax, 8*353(%rbx)
+	mov 0x928(%rbx), %rcx
+	mov (%rcx), %rax
+	mov %rax, 8*352(%rbx)
+
 	// timer_cancel
 	mov 0x698(%rbx), %rdi
 	movabs $8, %rax
@@ -1733,6 +1891,8 @@ thread_worker_spin:
 	je thread_worker_signal_peer
 	cmp $3, %rax
 	je thread_worker_queue_port
+	cmp $4, %rax
+	je thread_worker_park
 	movq $0, 8*307(%rbx)
 thread_worker_spin_pause:
 	pause
@@ -1775,5 +1935,27 @@ thread_worker_queue_port:
 	int $0x80
 	mov %rax, 8*315(%rbx)
 	jmp thread_worker_spin
+
+thread_worker_park:
+	movq $0, 8*307(%rbx)
+	mov 8*308(%rbx), %rdi
+	xorl %esi, %esi
+	xorl %edx, %edx
+	movabs $0x7fffffffffffffff, %r10
+	movabs $21, %rax
+	int $0x80
+	jmp thread_worker_spin
+
+process_child_entry:
+	mov %rdi, %rbx
+	movq $1, 0x0(%rbx)
+	movl $1, 0x8(%rbx)
+	lea 0x8(%rbx), %rdi
+	movl $1, %esi
+	movabs $22, %rax
+	int $0x80
+process_child_spin:
+	pause
+	jmp process_child_spin
 
 axle_user_prog_end:

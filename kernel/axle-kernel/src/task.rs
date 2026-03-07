@@ -400,7 +400,7 @@ struct FrameMappingSnapshot {
     lookup: VmaLookup,
 }
 
-type BootstrapTxCursor = TxCursor<crate::page_table::LockedBootstrapUserPageTable>;
+type BootstrapTxCursor = TxCursor<crate::page_table::LockedUserPageTable>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct AddressSpaceTxKey {
@@ -560,6 +560,7 @@ impl ResolvedHandle {
 #[derive(Debug)]
 struct AddressSpace {
     vm: VmAddressSpace,
+    page_tables: crate::page_table::UserPageTables,
 }
 
 impl AddressSpace {
@@ -574,6 +575,8 @@ impl AddressSpace {
             crate::userspace::USER_REGION_BYTES,
         )
         .expect("bootstrap address-space root must be valid");
+        let page_tables = crate::page_table::UserPageTables::bootstrap_current()
+            .expect("bootstrap user page tables must exist");
 
         let code_vmo = vm
             .create_vmo(
@@ -655,7 +658,7 @@ impl AddressSpace {
         )
         .expect("bootstrap stack COW arm must succeed");
 
-        Self { vm }
+        Self { vm, page_tables }
     }
 
     fn validate_user_ptr(&self, ptr: u64, len: usize) -> bool {
@@ -688,6 +691,10 @@ impl AddressSpace {
 
     fn root_vmar(&self) -> Vmar {
         self.vm.root_vmar()
+    }
+
+    fn root_page_table(&self) -> crate::page_table::UserPageTables {
+        self.page_tables
     }
 
     fn create_anonymous_vmo(
@@ -1391,6 +1398,8 @@ impl Kernel {
                 crate::userspace::USER_REGION_BYTES,
             )
             .map_err(map_address_space_error)?,
+            page_tables: crate::page_table::UserPageTables::clone_current_kernel_template()
+                .map_err(map_page_table_error)?,
         };
         let root_vmar = address_space.root_vmar();
         self.address_spaces.insert(address_space_id, address_space);
@@ -2042,11 +2051,23 @@ impl Kernel {
         trap: &mut crate::arch::int80::TrapFrame,
         cpu_frame: *mut u64,
     ) -> Result<(), zx_status_t> {
+        let next_process_id = self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .process_id;
+        let next_address_space_id = self.process(next_process_id)?.address_space_id;
+        let next_page_tables = self
+            .address_spaces
+            .get(&next_address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .root_page_table();
         let context = self
             .threads
             .get(&thread_id)
             .and_then(|thread| thread.context)
             .ok_or(ZX_ERR_BAD_STATE)?;
+        next_page_tables.activate().map_err(map_page_table_error)?;
         context.restore(trap, cpu_frame)?;
         self.current_thread_id = thread_id;
         Ok(())
@@ -2085,7 +2106,6 @@ impl Kernel {
         &self,
         requests: &[AddressSpaceTxRequest],
     ) -> Result<AddressSpaceTxSet, zx_status_t> {
-        let current_address_space_id = self.current_process()?.address_space_id;
         let mut ordered = requests.to_vec();
         ordered.sort_unstable_by_key(|request| request.key);
 
@@ -2103,19 +2123,19 @@ impl Kernel {
                 }
             }
 
-            if request.key.address_space_id == current_address_space_id {
-                let mut page_table = crate::page_table::BootstrapUserPageTable;
-                let cursor = TxCursor::new(
-                    page_table
-                        .lock(request.range)
-                        .map_err(map_page_table_error)?,
-                );
-                tx_set
-                    .push_active(request.key, cursor)
-                    .map_err(map_page_table_error)?;
-            } else {
-                tx_set.push_deferred(request.key, request.range);
-            }
+            let mut page_table = self
+                .address_spaces
+                .get(&request.key.address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?
+                .root_page_table();
+            let cursor = TxCursor::new(
+                page_table
+                    .lock(request.range)
+                    .map_err(map_page_table_error)?,
+            );
+            tx_set
+                .push_active(request.key, cursor)
+                .map_err(map_page_table_error)?;
 
             last_request = Some(request);
         }
@@ -2252,6 +2272,11 @@ impl Kernel {
                 .resolve_lazy_anon_fault(&mut self.frames, fault_va, new_frame_id)
                 .map_err(map_address_space_error)?
         };
+        self.publish_address_space_frame_to_global_vmo(
+            address_space_id,
+            resolved.fault_page_base(),
+            resolved.new_frame_id(),
+        )?;
         self.sync_mapping_pages(
             address_space_id,
             resolved.fault_page_base(),
