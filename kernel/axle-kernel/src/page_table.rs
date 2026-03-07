@@ -466,7 +466,7 @@ impl PageTableLock for LockedUserPageTable {
         }
         for op in shootdown.ops() {
             match *op {
-                FlushOp::Page(va) => crate::arch::tlb::flush_page_global(va),
+                FlushOp::Page(va) => crate::arch::tlb::flush_page_local(va),
             }
         }
         Ok(())

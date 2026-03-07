@@ -737,7 +737,11 @@ pub fn handle_page_fault(cr2: u64, error: u64) -> bool {
     let Some(state) = guard.as_mut() else {
         return false;
     };
-    state.kernel.handle_current_page_fault(cr2, error)
+    let handled = state.kernel.handle_current_page_fault(cr2, error);
+    if handled {
+        let _ = state.kernel.sync_current_cpu_tlb_state();
+    }
+    handled
 }
 
 /// Create a new Timer object and return a handle.
@@ -1719,6 +1723,7 @@ pub fn on_tick() {
         for fired_object_id in fired {
             let _ = notify_waitable_signals_changed(state, fired_object_id);
         }
+        let _ = state.kernel.sync_current_cpu_tlb_state();
         Ok(())
     });
 }

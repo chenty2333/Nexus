@@ -21,6 +21,7 @@ pub fn flush_all_local() {
 }
 
 /// Flush one page locally and request remote CPUs to invalidate the same page.
+#[allow(dead_code)]
 pub fn flush_page_global(va: u64) {
     flush_page_local(va);
     crate::arch::ipi::shootdown_page(va);

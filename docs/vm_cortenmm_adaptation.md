@@ -20,6 +20,10 @@ external VM model.
 - The fixed `user_pd/user_pt` descriptors now classify the current 2 MiB user
   subtree as either `Uniform(template)` or `Leaf`, which is the first concrete
   upper-level uniform metadata hook for later generalization.
+- TLB invalidation is now lazy across CPUs: page-table commits still flush the
+  local active CPU immediately, but remote CPUs observe descriptor epochs and
+  catch up at kernel-return / scheduling boundaries instead of taking an eager
+  per-page IPI shootdown.
 - Axle now has stable coarse mapping identity through `MapId` and `MapRec`.
   These records connect `VMAR` control metadata to page-local state without
   making `VMA` the long-term hot-path truth source.

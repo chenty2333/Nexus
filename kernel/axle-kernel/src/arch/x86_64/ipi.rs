@@ -15,6 +15,7 @@ const MAX_CPUS: usize = 16;
 static IPI_ACK_COUNT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static TLB_SHOOTDOWN_ACK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static TLB_SHOOTDOWN_PAGE: AtomicU64 = AtomicU64::new(0);
+#[allow(dead_code)]
 static TLB_SHOOTDOWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Current ack counter value for `apic_id`.
@@ -124,6 +125,7 @@ extern "C" fn axle_ipi_tlb_rust(_frame: *const u8) {
     }
 }
 
+#[allow(dead_code)]
 fn tlb_ack_count(apic_id: usize) -> u64 {
     if apic_id >= MAX_CPUS {
         return 0;
@@ -131,6 +133,7 @@ fn tlb_ack_count(apic_id: usize) -> u64 {
     TLB_SHOOTDOWN_ACK[apic_id].load(Ordering::Acquire)
 }
 
+#[allow(dead_code)]
 pub fn shootdown_page(va: u64) {
     let _guard = TLB_SHOOTDOWN_LOCK.lock();
     TLB_SHOOTDOWN_PAGE.store(va, Ordering::Release);

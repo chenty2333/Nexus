@@ -44,6 +44,7 @@ use core::mem::size_of;
 
 const CSPACE_MAX_SLOTS: u16 = 16_384;
 const CSPACE_QUARANTINE_LEN: usize = 256;
+const MAX_TRACKED_TLB_CPUS: usize = 64;
 
 type ProcessId = u64;
 type ThreadId = u64;
@@ -561,6 +562,8 @@ impl ResolvedHandle {
 struct AddressSpace {
     vm: VmAddressSpace,
     page_tables: crate::page_table::UserPageTables,
+    active_cpu_mask: u64,
+    observed_tlb_epoch: [u64; MAX_TRACKED_TLB_CPUS],
 }
 
 impl AddressSpace {
@@ -662,7 +665,12 @@ impl AddressSpace {
             crate::page_table::PtMetaKind::Uniform(template) if !template.present()
         ));
 
-        Self { vm, page_tables }
+        Self {
+            vm,
+            page_tables,
+            active_cpu_mask: 0,
+            observed_tlb_epoch: [0; MAX_TRACKED_TLB_CPUS],
+        }
     }
 
     fn validate_user_ptr(&self, ptr: u64, len: usize) -> bool {
@@ -699,6 +707,45 @@ impl AddressSpace {
 
     fn root_page_table(&self) -> crate::page_table::UserPageTables {
         self.page_tables.clone()
+    }
+
+    fn current_invalidate_epoch(&self) -> u64 {
+        let descs = self.page_tables.descriptors();
+        core::cmp::max(
+            descs.user_pd().invalidate_epoch(),
+            descs.user_pt().invalidate_epoch(),
+        )
+    }
+
+    fn note_cpu_active(&mut self, cpu_id: usize) {
+        if cpu_id < u64::BITS as usize {
+            self.active_cpu_mask |= 1_u64 << cpu_id;
+        }
+    }
+
+    fn note_cpu_inactive(&mut self, cpu_id: usize) {
+        if cpu_id < u64::BITS as usize {
+            self.active_cpu_mask &= !(1_u64 << cpu_id);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn is_cpu_active(&self, cpu_id: usize) -> bool {
+        cpu_id < u64::BITS as usize && (self.active_cpu_mask & (1_u64 << cpu_id)) != 0
+    }
+
+    fn observe_tlb_epoch(&mut self, cpu_id: usize, epoch: u64) {
+        if cpu_id < MAX_TRACKED_TLB_CPUS {
+            self.observed_tlb_epoch[cpu_id] = epoch;
+        }
+    }
+
+    fn observed_tlb_epoch(&self, cpu_id: usize) -> u64 {
+        if cpu_id < MAX_TRACKED_TLB_CPUS {
+            self.observed_tlb_epoch[cpu_id]
+        } else {
+            0
+        }
     }
 
     fn create_anonymous_vmo(
@@ -940,6 +987,7 @@ impl Kernel {
         kernel
             .address_spaces
             .insert(address_space_id, bootstrap_address_space);
+        kernel.observe_cpu_tlb_epoch_for_address_space(address_space_id, kernel.current_cpu_id());
         for global_vmo_id in bootstrap_vmo_ids {
             kernel
                 .register_global_vmo_from_address_space(address_space_id, global_vmo_id)
@@ -1404,6 +1452,8 @@ impl Kernel {
             .map_err(map_address_space_error)?,
             page_tables: crate::page_table::UserPageTables::clone_current_kernel_template()
                 .map_err(map_page_table_error)?,
+            active_cpu_mask: 0,
+            observed_tlb_epoch: [0; MAX_TRACKED_TLB_CPUS],
         };
         debug_assert!(matches!(
             address_space.page_tables.descriptors().user_pt().meta_kind(),
@@ -1638,6 +1688,7 @@ impl Kernel {
                         self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     }
                 }
+                self.sync_current_cpu_tlb_state()?;
                 Ok(())
             }
             ThreadState::New => Err(ZX_ERR_BAD_STATE),
@@ -2006,6 +2057,10 @@ impl Kernel {
         KernelVmoId::new(id)
     }
 
+    fn current_cpu_id(&self) -> usize {
+        crate::arch::apic::this_apic_id() as usize
+    }
+
     fn current_thread(&self) -> Result<&Thread, zx_status_t> {
         self.threads
             .get(&self.current_thread_id)
@@ -2059,6 +2114,9 @@ impl Kernel {
         trap: &mut crate::arch::int80::TrapFrame,
         cpu_frame: *mut u64,
     ) -> Result<(), zx_status_t> {
+        let current_cpu_id = self.current_cpu_id();
+        let current_process_id = self.current_thread()?.process_id;
+        let current_address_space_id = self.process(current_process_id)?.address_space_id;
         let next_process_id = self
             .threads
             .get(&thread_id)
@@ -2076,9 +2134,47 @@ impl Kernel {
             .and_then(|thread| thread.context)
             .ok_or(ZX_ERR_BAD_STATE)?;
         next_page_tables.activate().map_err(map_page_table_error)?;
+        if current_address_space_id != next_address_space_id {
+            if let Some(current_address_space) =
+                self.address_spaces.get_mut(&current_address_space_id)
+            {
+                current_address_space.note_cpu_inactive(current_cpu_id);
+            }
+        }
+        self.observe_cpu_tlb_epoch_for_address_space(next_address_space_id, current_cpu_id);
         context.restore(trap, cpu_frame)?;
         self.current_thread_id = thread_id;
         Ok(())
+    }
+
+    pub(crate) fn sync_current_cpu_tlb_state(&mut self) -> Result<(), zx_status_t> {
+        let current_cpu_id = self.current_cpu_id();
+        let current_address_space_id = self.current_process()?.address_space_id;
+        let address_space = self
+            .address_spaces
+            .get_mut(&current_address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        address_space.note_cpu_active(current_cpu_id);
+        let target_epoch = address_space.current_invalidate_epoch();
+        if address_space.observed_tlb_epoch(current_cpu_id) >= target_epoch {
+            return Ok(());
+        }
+        crate::arch::tlb::flush_all_local();
+        address_space.observe_tlb_epoch(current_cpu_id, target_epoch);
+        Ok(())
+    }
+
+    fn observe_cpu_tlb_epoch_for_address_space(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        cpu_id: usize,
+    ) {
+        let Some(address_space) = self.address_spaces.get_mut(&address_space_id) else {
+            return;
+        };
+        address_space.note_cpu_active(cpu_id);
+        let target_epoch = address_space.current_invalidate_epoch();
+        address_space.observe_tlb_epoch(cpu_id, target_epoch);
     }
 
     pub(crate) fn make_thread_runnable(

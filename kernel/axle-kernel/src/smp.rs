@@ -119,6 +119,7 @@ fn bootstrap_trampoline(cpu_count: usize) {
     }
 }
 
+#[allow(dead_code)]
 pub fn for_each_online_cpu(mut f: impl FnMut(usize)) {
     let bsp_id = crate::arch::apic::this_apic_id() as usize;
     for apic_id in 0..MAX_CPUS {
