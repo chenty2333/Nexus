@@ -157,7 +157,7 @@ pub mod wait_async {
 
 /// VM mapping and protection options.
 ///
-/// Values follow Zircon's public VM option bits.
+/// VM option bits used by Axle's Zircon-style VM syscalls.
 pub mod vm {
     use super::zx_vm_option_t;
 
@@ -167,6 +167,8 @@ pub mod vm {
     pub const ZX_VM_PERM_WRITE: zx_vm_option_t = 1 << 1;
     /// Mapping/protection grants execute access.
     pub const ZX_VM_PERM_EXECUTE: zx_vm_option_t = 1 << 2;
+    /// Prefer compact placement instead of ASLR-style placement for non-specific VMAR allocation.
+    pub const ZX_VM_COMPACT: zx_vm_option_t = 1 << 3;
     /// Child VMAR may create readable mappings.
     pub const ZX_VM_CAN_MAP_READ: zx_vm_option_t = 1 << 11;
     /// Child VMAR may create writable mappings.
@@ -177,6 +179,28 @@ pub mod vm {
     pub const ZX_VM_SPECIFIC: zx_vm_option_t = 1 << 10;
     /// Child VMAR may create exact-address mappings.
     pub const ZX_VM_CAN_MAP_SPECIFIC: zx_vm_option_t = 1 << 14;
+    /// Bit position of the encoded VM alignment subfield.
+    pub const ZX_VM_ALIGN_BASE: u32 = 24;
+    /// Bit mask covering the encoded VM alignment subfield.
+    pub const ZX_VM_ALIGN_MASK: zx_vm_option_t = 0x1f << ZX_VM_ALIGN_BASE;
+    /// Request 4 KiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_4KB: zx_vm_option_t = 12 << ZX_VM_ALIGN_BASE;
+    /// Request 8 KiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_8KB: zx_vm_option_t = 13 << ZX_VM_ALIGN_BASE;
+    /// Request 16 KiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_16KB: zx_vm_option_t = 14 << ZX_VM_ALIGN_BASE;
+    /// Request 32 KiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_32KB: zx_vm_option_t = 15 << ZX_VM_ALIGN_BASE;
+    /// Request 64 KiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_64KB: zx_vm_option_t = 16 << ZX_VM_ALIGN_BASE;
+    /// Request 1 MiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_1MB: zx_vm_option_t = 20 << ZX_VM_ALIGN_BASE;
+    /// Request 2 MiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_2MB: zx_vm_option_t = 21 << ZX_VM_ALIGN_BASE;
+    /// Request 1 GiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_1GB: zx_vm_option_t = 30 << ZX_VM_ALIGN_BASE;
+    /// Request 4 GiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_4GB: zx_vm_option_t = 32 << ZX_VM_ALIGN_BASE;
 }
 
 /// Zircon handle rights bit definitions.

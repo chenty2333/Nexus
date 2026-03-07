@@ -1,5 +1,5 @@
 id = "kernel.vmar.allocate_child_bootstrap"
-description = "Bootstrap zx_vmar_allocate/zx_vmar_destroy should support nested child VMARs, specific offsets, basic ASLR placement, CAN_MAP_SPECIFIC ceilings, and recursive destroy cleanup"
+description = "Bootstrap zx_vmar_allocate/zx_vmar_destroy should support nested child VMARs, specific offsets, compact and aligned placement policy, CAN_MAP_SPECIFIC ceilings, and recursive destroy cleanup"
 tags = ["module:vmar", "module:vmo", "module:kernel", "kind:qemu"]
 timeout_ms = 180000
 command = [
@@ -24,6 +24,9 @@ vmar_destroy_remap = 0
 vmar_allocate_grandchild = 0
 vmar_allocate_grandchild_map = 0
 vmar_allocate_grandchild_aslr = 0
+vmar_allocate_grandchild_compact = 0
+vmar_allocate_align = 0
+vmar_allocate_specific_align_bad = -10
 
 [assertions.packet_fields]
 vmar_allocate_handle_ok = 1
@@ -33,3 +36,5 @@ vmar_allocate_nonspecific_match = 1
 vmar_allocate_grandchild_match = 1
 vmar_allocate_grandchild_map_match = 1
 vmar_allocate_grandchild_aslr_ok = 1
+vmar_allocate_grandchild_compact_match = 1
+vmar_allocate_align_ok = 1

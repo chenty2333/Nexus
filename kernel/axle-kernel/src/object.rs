@@ -9,7 +9,7 @@ use axle_core::{
     Capability, Packet, PacketKind, Port, PortError, Signals, TimerError, TimerId, TimerService,
     WaitAsyncOptions,
 };
-use axle_mm::{MappingPerms, VmarId};
+use axle_mm::{MappingPerms, VmarAllocMode, VmarId};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::koid::ZX_KOID_INVALID;
@@ -21,8 +21,9 @@ use axle_types::status::{
     ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE, ZX_OK,
 };
 use axle_types::vm::{
-    ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ, ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE,
-    ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
+    ZX_VM_ALIGN_BASE, ZX_VM_ALIGN_MASK, ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ,
+    ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE, ZX_VM_COMPACT, ZX_VM_PERM_EXECUTE,
+    ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
 };
 use axle_types::{
     zx_clock_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_packet_user_t, zx_port_packet_t,
@@ -161,7 +162,8 @@ struct VmarMappingRequest {
 #[derive(Clone, Copy, Debug)]
 struct VmarAllocateRequest {
     mapping_caps: VmarMappingCaps,
-    specific: bool,
+    align: u64,
+    mode: VmarAllocMode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1153,8 +1155,8 @@ pub fn vmar_allocate(
             parent.vmar_id,
             offset,
             len,
-            axle_mm::PAGE_SIZE,
-            request.specific,
+            request.align,
+            request.mode,
         )?;
         let object_id = state.alloc_object_id();
         state.objects.insert(
@@ -2129,22 +2131,47 @@ fn vmar_allocate_request_from_options(
     options: u32,
     offset: u64,
 ) -> Result<VmarAllocateRequest, zx_status_t> {
+    let align = vmar_allocate_align_from_options(options)?;
     let allowed = ZX_VM_CAN_MAP_READ
         | ZX_VM_CAN_MAP_WRITE
         | ZX_VM_CAN_MAP_EXECUTE
         | ZX_VM_CAN_MAP_SPECIFIC
-        | ZX_VM_SPECIFIC;
+        | ZX_VM_SPECIFIC
+        | ZX_VM_COMPACT
+        | ZX_VM_ALIGN_MASK;
     if (options & !allowed) != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
     let specific = (options & ZX_VM_SPECIFIC) != 0;
+    let compact = (options & ZX_VM_COMPACT) != 0;
+    if specific && compact {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
     if !specific && offset != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
     Ok(VmarAllocateRequest {
-        mapping_caps: vmar_mapping_caps_from_allocate_options(options & !ZX_VM_SPECIFIC)?,
-        specific,
+        mapping_caps: vmar_mapping_caps_from_allocate_options(
+            options & !(ZX_VM_SPECIFIC | ZX_VM_COMPACT | ZX_VM_ALIGN_MASK),
+        )?,
+        align,
+        mode: if specific {
+            VmarAllocMode::Specific
+        } else if compact {
+            VmarAllocMode::Compact
+        } else {
+            VmarAllocMode::Randomized
+        },
     })
+}
+
+fn vmar_allocate_align_from_options(options: u32) -> Result<u64, zx_status_t> {
+    let encoded = (options & ZX_VM_ALIGN_MASK) >> ZX_VM_ALIGN_BASE;
+    if encoded == 0 {
+        return Ok(axle_mm::PAGE_SIZE);
+    }
+    let align = 1_u64.checked_shl(encoded).ok_or(ZX_ERR_INVALID_ARGS)?;
+    Ok(core::cmp::max(axle_mm::PAGE_SIZE, align))
 }
 
 fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals, zx_status_t> {

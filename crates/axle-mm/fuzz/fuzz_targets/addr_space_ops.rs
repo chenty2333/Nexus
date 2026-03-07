@@ -1,6 +1,9 @@
 #![no_main]
 
-use axle_mm::{AddressSpace, FrameTable, GlobalVmoId, MappingPerms, PAGE_SIZE, VmarId, VmoKind};
+use axle_mm::{
+    AddressSpace, FrameTable, GlobalVmoId, MappingPerms, PAGE_SIZE, VmarAllocMode, VmarId,
+    VmoKind,
+};
 use libfuzzer_sys::fuzz_target;
 
 const ROOT_BASE: u64 = 0x1_0000_0000;
@@ -102,6 +105,7 @@ fuzz_target!(|data: &[u8]| {
                     vmars[parent_choice].unwrap_or(space.root_vmar().id())
                 };
                 let exact = (chunk.get(6).copied().unwrap_or(0) & 1) != 0;
+                let compact = (chunk.get(6).copied().unwrap_or(0) & 2) != 0;
                 let offset_pages = u64::from(chunk.get(7).copied().unwrap_or(0) % 4);
                 vmars[slot] = space
                     .allocate_subvmar(
@@ -110,7 +114,13 @@ fuzz_target!(|data: &[u8]| {
                         if exact { offset_pages * PAGE_SIZE } else { 0 },
                         pages * PAGE_SIZE,
                         align_pages * PAGE_SIZE,
-                        exact,
+                        if exact {
+                            VmarAllocMode::Specific
+                        } else if compact {
+                            VmarAllocMode::Compact
+                        } else {
+                            VmarAllocMode::Randomized
+                        },
                     )
                     .ok()
                     .map(|vmar| vmar.id());

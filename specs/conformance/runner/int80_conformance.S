@@ -342,7 +342,7 @@ mov %rax, (%rsp)
 	mov 8*62(%rbx), %rdi
 	movl $0x5800, %esi
 	xor %rdx, %rdx
-	movabs $0x2000, %r10
+	movabs $0x4000, %r10
 	lea 0x970(%rbx), %r8
 	lea 0x978(%rbx), %r9
 	movabs $28, %rax
@@ -491,6 +491,55 @@ vmar_allocate_grandchild_map_match_done:
 	jae vmar_allocate_grandchild_aslr_done
 	movq $1, 8*377(%rbx)
 vmar_allocate_grandchild_aslr_done:
+
+	// vmar_allocate(grandchild compact inside first child)
+	mov 0x970(%rbx), %rdi
+	movl $0x808, %esi
+	xor %rdx, %rdx
+	movabs $0x1000, %r10
+	lea 0x9e8(%rbx), %r8
+	lea 0x9f0(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	mov %rax, 8*378(%rbx)
+	movq $0, 8*379(%rbx)
+	mov 0x9f0(%rbx), %rax
+	mov 0x978(%rbx), %rdx
+	add $0x2000, %rdx
+	cmp %rdx, %rax
+	jne vmar_allocate_grandchild_compact_done
+	movq $1, 8*379(%rbx)
+vmar_allocate_grandchild_compact_done:
+
+	// vmar_allocate(root aligned 16KiB)
+	mov 8*62(%rbx), %rdi
+	movabs $0x0e000800, %rsi
+	xor %rdx, %rdx
+	movabs $0x1000, %r10
+	lea 0x9f8(%rbx), %r8
+	lea 0xa00(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	mov %rax, 8*380(%rbx)
+	movq $0, 8*381(%rbx)
+	mov 0xa00(%rbx), %rax
+	test $0x3fff, %rax
+	jnz vmar_allocate_align_done
+	test %rax, %rax
+	jz vmar_allocate_align_done
+	movq $1, 8*381(%rbx)
+vmar_allocate_align_done:
+
+	// vmar_allocate(root specific misaligned with 16KiB align) -> INVALID_ARGS
+	mov 8*62(%rbx), %rdi
+	movabs $0x0e000c00, %rsi
+	movabs $0x1000, %rdx
+	movabs $0x1000, %r10
+	lea 0xa08(%rbx), %r8
+	lea 0xa10(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	mov %rax, 8*382(%rbx)
 
 	// vmar_destroy(first child)
 	mov 0x970(%rbx), %rdi

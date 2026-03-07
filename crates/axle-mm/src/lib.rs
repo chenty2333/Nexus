@@ -669,6 +669,17 @@ impl Vmar {
     }
 }
 
+/// Placement policy for child VMAR allocation inside one parent range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmarAllocMode {
+    /// Require the returned child VMAR to start exactly at `parent.base + offset`.
+    Specific,
+    /// Prefer compact low-fragmentation placement near the parent's current cursor.
+    Compact,
+    /// Prefer ASLR-style placement within the parent, then wrap if needed.
+    Randomized,
+}
+
 const VA_MAGAZINE_BYTES: u64 = 0x20_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1476,7 +1487,14 @@ impl AddressSpace {
         len: u64,
         align: u64,
     ) -> Result<Vmar, AddressSpaceError> {
-        self.allocate_subvmar(cpu_id, self.root.vmar.id, 0, len, align, false)
+        self.allocate_subvmar(
+            cpu_id,
+            self.root.vmar.id,
+            0,
+            len,
+            align,
+            VmarAllocMode::Compact,
+        )
     }
 
     /// Allocate one child VMAR inside the given parent VMAR.
@@ -1487,7 +1505,7 @@ impl AddressSpace {
         offset: u64,
         len: u64,
         align: u64,
-        exact: bool,
+        mode: VmarAllocMode,
     ) -> Result<Vmar, AddressSpaceError> {
         let parent = self
             .vmar_record(parent_vmar_id)
@@ -1500,30 +1518,38 @@ impl AddressSpace {
             return Err(AddressSpaceError::InvalidArgs);
         }
 
-        if exact {
+        if mode == VmarAllocMode::Specific {
             let base = parent
                 .vmar
                 .base
                 .checked_add(offset)
                 .ok_or(AddressSpaceError::InvalidArgs)?;
+            if base & (align - 1) != 0 {
+                return Err(AddressSpaceError::InvalidArgs);
+            }
             return self.insert_child_vmar(cpu_id, parent_vmar_id, base, len);
         }
         if offset != 0 {
             return Err(AddressSpaceError::InvalidArgs);
         }
 
-        if parent_vmar_id == self.root.vmar.id
+        if mode == VmarAllocMode::Compact
+            && parent_vmar_id == self.root.vmar.id
             && let Some(base) = self.try_allocate_from_magazine(cpu_id, len, align)?
         {
             return self.insert_child_vmar(cpu_id, parent_vmar_id, base, len);
         }
 
-        let start_hint = self.allocation_start_hint(parent, cpu_id, len, align)?;
+        let start_hint = match mode {
+            VmarAllocMode::Specific => unreachable!("specific allocations return above"),
+            VmarAllocMode::Compact => self.compact_start_hint(parent),
+            VmarAllocMode::Randomized => self.allocation_start_hint(parent, cpu_id, len, align)?,
+        };
         let (base, gap_end) = self
             .find_free_gap_in_vmar_with_hint(parent_vmar_id, start_hint, len, align)
             .ok_or(AddressSpaceError::OutOfRange)?;
         let vmar = self.insert_child_vmar(cpu_id, parent_vmar_id, base, len)?;
-        if parent_vmar_id == self.root.vmar.id {
+        if mode == VmarAllocMode::Compact && parent_vmar_id == self.root.vmar.id {
             let cursor = base
                 .checked_add(len)
                 .ok_or(AddressSpaceError::InvalidArgs)?;
@@ -2631,6 +2657,10 @@ impl AddressSpace {
         self.aslr_start_hint(parent.vmar, cpu_id, len, align, usable_end)
     }
 
+    fn compact_start_hint(&self, parent: VmarRecord) -> u64 {
+        core::cmp::max(parent.vmar.base, parent.alloc_cursor)
+    }
+
     fn aslr_start_hint(
         &self,
         parent: Vmar,
@@ -3156,12 +3186,55 @@ mod tests {
             .allocate_subvmar_for_cpu(0, 4 * PAGE_SIZE, PAGE_SIZE)
             .unwrap();
         let grandchild = space
-            .allocate_subvmar(0, child.id(), PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, true)
+            .allocate_subvmar(
+                0,
+                child.id(),
+                PAGE_SIZE,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Specific,
+            )
             .unwrap();
 
         assert_eq!(grandchild.base(), child.base() + PAGE_SIZE);
         assert_eq!(grandchild.len(), PAGE_SIZE);
         assert!(child.contains_range(grandchild.base(), grandchild.len()));
+    }
+
+    #[test]
+    fn randomized_vmar_allocate_avoids_parent_base_when_slots_exist() {
+        let wide_root_len = VA_MAGAZINE_BYTES * 2;
+        let mut space = AddressSpace::new(ROOT_BASE, wide_root_len).unwrap();
+
+        let child = space
+            .allocate_subvmar(
+                0,
+                space.root_vmar().id(),
+                0,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Randomized,
+            )
+            .unwrap();
+        assert_ne!(child.base(), ROOT_BASE);
+        assert_eq!(child.base() % PAGE_SIZE, 0);
+    }
+
+    #[test]
+    fn specific_vmar_allocate_rejects_misaligned_alignment() {
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+
+        assert_eq!(
+            space.allocate_subvmar(
+                0,
+                space.root_vmar().id(),
+                PAGE_SIZE,
+                PAGE_SIZE,
+                4 * PAGE_SIZE,
+                VmarAllocMode::Specific,
+            ),
+            Err(AddressSpaceError::InvalidArgs)
+        );
     }
 
     #[test]
@@ -3178,7 +3251,14 @@ mod tests {
             .allocate_subvmar_for_cpu(0, 4 * PAGE_SIZE, PAGE_SIZE)
             .unwrap();
         let grandchild = space
-            .allocate_subvmar(0, child.id(), PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, true)
+            .allocate_subvmar(
+                0,
+                child.id(),
+                PAGE_SIZE,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Specific,
+            )
             .unwrap();
         space
             .map_fixed_in_vmar(
@@ -4019,6 +4099,37 @@ mod tests {
         assert!(allocated.base() >= ROOT_BASE + PAGE_SIZE);
         assert!(allocated.end() <= space.root_vmar().end());
         assert_eq!(allocated.len(), PAGE_SIZE);
+    }
+
+    #[test]
+    fn compact_vmar_allocate_tracks_parent_cursor() {
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let child = space
+            .allocate_subvmar_for_cpu(0, 4 * PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        let grandchild = space
+            .allocate_subvmar(
+                0,
+                child.id(),
+                PAGE_SIZE,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Specific,
+            )
+            .unwrap();
+        let compact = space
+            .allocate_subvmar(
+                0,
+                child.id(),
+                0,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Compact,
+            )
+            .unwrap();
+
+        assert_eq!(grandchild.base(), child.base() + PAGE_SIZE);
+        assert_eq!(compact.base(), child.base() + (2 * PAGE_SIZE));
     }
 
     #[test]

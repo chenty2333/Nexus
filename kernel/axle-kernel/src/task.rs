@@ -21,7 +21,7 @@ use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
     CowFaultResolution, FrameId, FrameTable, FutexKey, GlobalVmoId, LazyAnonFaultResolution,
     MapRec, MappingPerms, PageFaultDecision, PageFaultFlags, PteMeta, PteMetaTag, ReverseMapAnchor,
-    VmaLookup, Vmar, VmarId, Vmo, VmoId, VmoKind,
+    VmaLookup, Vmar, VmarAllocMode, VmarId, Vmo, VmoId, VmoKind,
 };
 use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor, TxSet};
 use axle_types::rights::{
@@ -724,10 +724,10 @@ impl AddressSpace {
         offset: u64,
         len: u64,
         align: u64,
-        exact: bool,
+        mode: VmarAllocMode,
     ) -> Result<Vmar, AddressSpaceError> {
         self.vm
-            .allocate_subvmar(cpu_id, parent_vmar_id, offset, len, align, exact)
+            .allocate_subvmar(cpu_id, parent_vmar_id, offset, len, align, mode)
     }
 
     fn destroy_vmar(
@@ -1482,7 +1482,7 @@ impl Kernel {
         offset: u64,
         len: u64,
         align: u64,
-        exact: bool,
+        mode: VmarAllocMode,
     ) -> Result<Vmar, zx_status_t> {
         let cpu_id = self.current_cpu_id();
         let address_space = self
@@ -1490,7 +1490,7 @@ impl Kernel {
             .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         address_space
-            .allocate_subvmar(cpu_id, parent_vmar_id, offset, len, align, exact)
+            .allocate_subvmar(cpu_id, parent_vmar_id, offset, len, align, mode)
             .map_err(map_address_space_error)
     }
 
