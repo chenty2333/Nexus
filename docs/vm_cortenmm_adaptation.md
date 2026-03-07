@@ -47,6 +47,10 @@ external VM model.
   child-process conformance path now covers this lazy shared-VMO case.
 - `Physical` and `Contiguous` VMO mappings now have explicit non-COW boundaries:
   they must already be resident when mapped, and COW arming rejects them.
+- VM resource governance has started to move under one accounting surface:
+  private COW pages and in-flight channel loan pages now keep current/peak
+  counters, quota-hit telemetry, and a bootstrap loan-page quota that returns
+  `ZX_ERR_SHOULD_WAIT` before channel queue capacity is exhausted.
 - Axle's channel page-loan path now uses ordered cross-address-space
   transactions, sender-side COW arming, and a conservative bootstrap
   `remap-fill` fast path. Channel `close/read` and `WRITABLE` recovery behavior

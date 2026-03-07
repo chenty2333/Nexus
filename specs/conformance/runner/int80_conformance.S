@@ -1221,6 +1221,102 @@ channel_loan_snapshot_done:
 	movq $1, 8*317(%rbx)
 channel_loan_remap_cow_done:
 
+	// channel page-loan quota: 32 in-flight full-page loans should exhaust before channel capacity
+	movq $0, 8*392(%rbx)
+	movabs $0x0000000100011000, %rcx
+	movabs $0x0badf00d0badf00d, %rax
+	mov %rax, 0x0(%rcx)
+
+	xorl %ecx, %ecx
+channel_loan_quota_fill_loop:
+	cmpl $32, %ecx
+	je channel_loan_quota_fill_done
+	mov 0x7c0(%rbx), %rdi
+	xorl %esi, %esi
+	movabs $0x0000000100011000, %rdx
+	movl $4096, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	test %rax, %rax
+	jne channel_loan_quota_fill_fail
+	incl %ecx
+	jmp channel_loan_quota_fill_loop
+
+channel_loan_quota_fill_done:
+	// one more write should hit the in-flight page quota before the channel queue fills
+	mov 0x7c0(%rbx), %rdi
+	xorl %esi, %esi
+	movabs $0x0000000100011000, %rdx
+	movl $4096, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*393(%rbx)
+
+	// one read should free quota headroom
+	movq $0, 0xe00(%rbx)
+	movq $0, 0xe08(%rbx)
+	mov 0x7c8(%rbx), %rdi
+	xorl %esi, %esi
+	movabs $0x0000000100012000, %rdx
+	xorl %r10d, %r10d
+	movl $4096, %r8d
+	xorl %r9d, %r9d
+	lea 0xe00(%rbx), %rax
+	lea 0xe08(%rbx), %rcx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rcx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	mov %rax, 8*394(%rbx)
+
+	// the next write should succeed again after one read releases loan quota
+	mov 0x7c0(%rbx), %rdi
+	xorl %esi, %esi
+	movabs $0x0000000100011000, %rdx
+	movl $4096, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*395(%rbx)
+
+	// drain any remaining quota-path messages so global in-flight loan count returns to zero
+	movl $32, %ecx
+channel_loan_quota_drain_loop:
+	test %ecx, %ecx
+	je channel_loan_quota_done
+	movq $0, 0xe00(%rbx)
+	movq $0, 0xe08(%rbx)
+	mov 0x7c8(%rbx), %rdi
+	xorl %esi, %esi
+	movabs $0x0000000100012000, %rdx
+	xorl %r10d, %r10d
+	movl $4096, %r8d
+	xorl %r9d, %r9d
+	lea 0xe00(%rbx), %rax
+	lea 0xe08(%rbx), %rdx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rdx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	test %rax, %rax
+	jne channel_loan_quota_done
+	decl %ecx
+	jmp channel_loan_quota_drain_loop
+
+channel_loan_quota_fill_fail:
+	mov %rax, 8*392(%rbx)
+
+channel_loan_quota_done:
+
 	// port_wait(wrong type: handle=timer_h)
 	mov 0x698(%rbx), %rdi
 	xor %rsi, %rsi

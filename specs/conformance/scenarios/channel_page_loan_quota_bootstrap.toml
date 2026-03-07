@@ -1,0 +1,25 @@
+id = "kernel.channel.page_loan_quota_bootstrap"
+description = "Bootstrap channel full-page page-loan writes should hit the in-flight loan-page quota before channel capacity, then recover after one read"
+tags = ["module:channel", "module:kernel", "module:mm", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.channel.page_loan_quota_bootstrap"]
+
+[assertions.status_code]
+channel_loan_quota_fill = 0
+channel_loan_quota_read = 0
+channel_loan_quota_write_recover = 0
+
+[assertions.error_code]
+channel_loan_quota_write_limit = -22
+
+[assertions.packet_fields]
+vm_inflight_loan_pages_current = 0
+vm_inflight_loan_pages_peak = 32
+vm_inflight_loan_quota_hits = 1

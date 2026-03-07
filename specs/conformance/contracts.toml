@@ -86,6 +86,11 @@ level = "should"
 description = "Page-aligned bootstrap channel remap-fill reads should trigger one receiver-side COW split on first write, preserve the sender snapshot, and keep reverse-mapping cardinality stable across the split"
 
 [[contracts]]
+id = "should.channel.page_loan_quota_bootstrap"
+level = "should"
+description = "Bootstrap full-page loan writes should respect the in-flight loan-page quota, return SHOULD_WAIT before channel capacity is exhausted, and recover after reads release quota"
+
+[[contracts]]
 id = "should.channel.close_read_order_bootstrap"
 level = "should"
 description = "Bootstrap channel reads should drain queued messages before surfacing PEER_CLOSED-only state, and READABLE may coexist with PEER_CLOSED"
