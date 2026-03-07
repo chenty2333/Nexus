@@ -2368,7 +2368,7 @@ impl Kernel {
             return Vec::new();
         };
         let mut mappings = Vec::with_capacity(anchors.len());
-        for &anchor in anchors {
+        for anchor in anchors {
             let address_space_id = anchor.address_space_id().raw();
             let Some(address_space) = self.address_spaces.get(&address_space_id) else {
                 continue;

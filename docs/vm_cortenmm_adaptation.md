@@ -28,6 +28,9 @@ external VM model.
 - Axle's physical-frame bookkeeping has been pushed toward a `VmPageDesc` shape.
   `FrameTable` now tracks `ref_count`, `map_count`, `pin_count`, `loan_count`,
   and a per-frame reverse-mapping anchor set.
+- That reverse-mapping set is now maintained through an arena-backed frame→node
+  structure plus an `(address_space, vpn)` side index, so add/remove paths no
+  longer rely on scanning a per-frame `Vec`.
 - The current reverse-mapping implementation is intentionally modest. It can
   answer "which known mappings currently point at this frame?" and the kernel
   uses it for `remap-fill -> COW split` telemetry and validation. It is useful
