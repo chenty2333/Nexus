@@ -408,7 +408,7 @@ vmar_allocate_map_match_done:
 	add $8, %rsp
 	mov %rax, 8*367(%rbx)
 
-	// vmar_map(child without CAN_MAP_SPECIFIC, non-specific) -> child base
+	// vmar_map(child without CAN_MAP_SPECIFIC, non-specific) -> somewhere inside child
 	mov 0x988(%rbx), %rdi
 	movl $0x3, %esi
 	xor %rdx, %rdx
@@ -424,8 +424,12 @@ vmar_allocate_map_match_done:
 	mov %rax, 8*368(%rbx)
 	movq $0, 8*369(%rbx)
 	mov 0x9a8(%rbx), %rax
-	cmp 0x990(%rbx), %rax
-	jne vmar_allocate_nonspecific_match_done
+	mov 0x990(%rbx), %rdx
+	cmp %rdx, %rax
+	jb vmar_allocate_nonspecific_match_done
+	add $0x3000, %rdx
+	cmp %rdx, %rax
+	jae vmar_allocate_nonspecific_match_done
 	movq $1, 8*369(%rbx)
 vmar_allocate_nonspecific_match_done:
 
@@ -469,10 +473,38 @@ vmar_allocate_grandchild_match_done:
 	movq $1, 8*375(%rbx)
 vmar_allocate_grandchild_map_match_done:
 
-	// vmar_allocate(grandchild non-specific inside child without CAN_MAP_SPECIFIC)
-	mov 0x988(%rbx), %rdi
+	// vmar_allocate(compact grandchild @ exact child offset 0x2000)
+	mov 0x970(%rbx), %rdi
+	movl $0x4c08, %esi
+	movabs $0x2000, %rdx
+	movabs $0x1000, %r10
+	lea 0x9e8(%rbx), %r8
+	lea 0x9f0(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	mov %rax, 8*378(%rbx)
+
+	// vmar_allocate(non-specific child inside compact grandchild) -> compact grandchild base
+	mov 0x9e8(%rbx), %rdi
 	movl $0x800, %esi
 	xor %rdx, %rdx
+	movabs $0x1000, %r10
+	lea 0xa18(%rbx), %r8
+	lea 0xa20(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	movq $0, 8*379(%rbx)
+	mov 0xa20(%rbx), %rax
+	mov 0x9f0(%rbx), %rdx
+	cmp %rdx, %rax
+	jne vmar_allocate_grandchild_compact_done
+	movq $1, 8*379(%rbx)
+vmar_allocate_grandchild_compact_done:
+
+	// vmar_allocate(grandchild upper limit inside first child) -> child base + 0x3000
+	mov 0x970(%rbx), %rdi
+	movl $0xa00, %esi
+	movabs $0x4000, %rdx
 	movabs $0x1000, %r10
 	lea 0x9d0(%rbx), %r8
 	lea 0x9d8(%rbx), %r9
@@ -481,35 +513,12 @@ vmar_allocate_grandchild_map_match_done:
 	mov %rax, 8*376(%rbx)
 	movq $0, 8*377(%rbx)
 	mov 0x9d8(%rbx), %rax
-	cmp 0x990(%rbx), %rax
-	je vmar_allocate_grandchild_aslr_done
-	mov 0x990(%rbx), %rdx
-	cmp %rdx, %rax
-	jb vmar_allocate_grandchild_aslr_done
+	mov 0x978(%rbx), %rdx
 	add $0x3000, %rdx
 	cmp %rdx, %rax
-	jae vmar_allocate_grandchild_aslr_done
+	jne vmar_allocate_upper_limit_done
 	movq $1, 8*377(%rbx)
-vmar_allocate_grandchild_aslr_done:
-
-	// vmar_allocate(grandchild compact inside first child)
-	mov 0x970(%rbx), %rdi
-	movl $0x808, %esi
-	xor %rdx, %rdx
-	movabs $0x1000, %r10
-	lea 0x9e8(%rbx), %r8
-	lea 0x9f0(%rbx), %r9
-	movabs $28, %rax
-	int $0x80
-	mov %rax, 8*378(%rbx)
-	movq $0, 8*379(%rbx)
-	mov 0x9f0(%rbx), %rax
-	mov 0x978(%rbx), %rdx
-	add $0x2000, %rdx
-	cmp %rdx, %rax
-	jne vmar_allocate_grandchild_compact_done
-	movq $1, 8*379(%rbx)
-vmar_allocate_grandchild_compact_done:
+vmar_allocate_upper_limit_done:
 
 	// vmar_allocate(root aligned 16KiB)
 	mov 8*62(%rbx), %rdi

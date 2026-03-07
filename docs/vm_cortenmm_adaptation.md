@@ -69,9 +69,10 @@ external VM model.
 What is intentionally deferred for later work:
 
 - richer VMAR control-plane options beyond the current nested-child baseline
-  (`offset != 0` still requires `ZX_VM_SPECIFIC`; compact placement and
-  alignment flags now work, but broader allocate flags and stronger ASLR policy
-  remain deferred)
+  (`offset != 0` still requires `ZX_VM_SPECIFIC` unless
+  `ZX_VM_OFFSET_IS_UPPER_LIMIT` is used; compact child policy, alignment flags,
+  and upper-limit placement now work, but broader allocate flags and stronger
+  per-process ASLR policy still remain deferred)
 - more selective invalidation and shootdown strategies beyond the current
   transaction-batched + epoch-lazy baseline
 - a more mature reverse-mapping consumer layer built on top of the current
@@ -81,12 +82,13 @@ Per-core VA allocation is now present in `axle-mm` as an internal root-VMAR
 control-plane allocator. It hands out child-VMAR reservations through CPU-local
 magazine hints, and the control-plane is now surfaced externally through
 `zx_vmar_allocate`. That path now supports nested child-of-child allocation,
-specific placement via `ZX_VM_SPECIFIC`, `ZX_VM_COMPACT` for denser placement,
+specific placement via `ZX_VM_SPECIFIC`, `ZX_VM_OFFSET_IS_UPPER_LIMIT` for
+bounded non-specific placement, `ZX_VM_COMPACT` as a compact child policy,
 alignment flags, and a simple non-specific ASLR-style placement policy inside
 the chosen parent VMAR. Child VMARs currently enforce `ZX_VM_CAN_MAP_*` /
 `ZX_VM_CAN_MAP_SPECIFIC` ceilings. Child VMARs also support recursive
-`zx_vmar_destroy`, and non-specific `zx_vmar_map` inside a child still does
-first-fit placement within that VMAR.
+`zx_vmar_destroy`, and non-specific `zx_vmar_map` now follows the child VMAR's
+placement policy instead of a hard-coded first-fit path.
 
 So the current state is: the correctness-oriented migration is largely in
 place, while the CortenMM-style performance package is still deferred.

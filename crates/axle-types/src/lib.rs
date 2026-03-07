@@ -169,6 +169,8 @@ pub mod vm {
     pub const ZX_VM_PERM_EXECUTE: zx_vm_option_t = 1 << 2;
     /// Prefer compact placement instead of ASLR-style placement for non-specific VMAR allocation.
     pub const ZX_VM_COMPACT: zx_vm_option_t = 1 << 3;
+    /// Interpret the supplied offset as an upper bound for non-specific VMAR allocation.
+    pub const ZX_VM_OFFSET_IS_UPPER_LIMIT: zx_vm_option_t = 1 << 9;
     /// Child VMAR may create readable mappings.
     pub const ZX_VM_CAN_MAP_READ: zx_vm_option_t = 1 << 11;
     /// Child VMAR may create writable mappings.
@@ -183,6 +185,10 @@ pub mod vm {
     pub const ZX_VM_ALIGN_BASE: u32 = 24;
     /// Bit mask covering the encoded VM alignment subfield.
     pub const ZX_VM_ALIGN_MASK: zx_vm_option_t = 0x1f << ZX_VM_ALIGN_BASE;
+    /// Request 1 KiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_1KB: zx_vm_option_t = 10 << ZX_VM_ALIGN_BASE;
+    /// Request 2 KiB alignment for non-specific VMAR allocation.
+    pub const ZX_VM_ALIGN_2KB: zx_vm_option_t = 11 << ZX_VM_ALIGN_BASE;
     /// Request 4 KiB alignment for non-specific VMAR allocation.
     pub const ZX_VM_ALIGN_4KB: zx_vm_option_t = 12 << ZX_VM_ALIGN_BASE;
     /// Request 8 KiB alignment for non-specific VMAR allocation.

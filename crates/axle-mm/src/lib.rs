@@ -680,6 +680,15 @@ pub enum VmarAllocMode {
     Randomized,
 }
 
+/// Default placement policy for non-specific allocations and mappings inside one VMAR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmarPlacementPolicy {
+    /// Keep later allocations and mappings close together.
+    Compact,
+    /// Preserve ASLR-style placement for later child allocations.
+    Randomized,
+}
+
 const VA_MAGAZINE_BYTES: u64 = 0x20_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -688,11 +697,29 @@ struct VaMagazine {
     end: u64,
 }
 
+fn mix_u64(value: u64) -> u64 {
+    let mut mixed = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^ (mixed >> 31)
+}
+
+fn initial_vmar_random_state(address_space_id: AddressSpaceId, vmar: Vmar) -> u64 {
+    mix_u64(
+        address_space_id.raw().rotate_left(13)
+            ^ vmar.id.raw().rotate_left(29)
+            ^ vmar.base.rotate_left(7)
+            ^ vmar.len.rotate_left(19),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VmarRecord {
     vmar: Vmar,
     parent_id: Option<VmarId>,
     alloc_cursor: u64,
+    placement_policy: VmarPlacementPolicy,
+    random_state: u64,
 }
 
 /// Coarse mapping record linking VMAR control metadata to page-level state.
@@ -1419,6 +1446,15 @@ impl AddressSpace {
                 },
                 parent_id: None,
                 alloc_cursor: root_base,
+                placement_policy: VmarPlacementPolicy::Randomized,
+                random_state: initial_vmar_random_state(
+                    id,
+                    Vmar {
+                        id: VmarId(1),
+                        base: root_base,
+                        len: root_len,
+                    },
+                ),
             },
             vmars: Vec::new(),
             vmos: Vec::new(),
@@ -1494,10 +1530,13 @@ impl AddressSpace {
             len,
             align,
             VmarAllocMode::Compact,
+            false,
+            VmarPlacementPolicy::Compact,
         )
     }
 
     /// Allocate one child VMAR inside the given parent VMAR.
+    #[allow(clippy::too_many_arguments)]
     pub fn allocate_subvmar(
         &mut self,
         cpu_id: usize,
@@ -1506,6 +1545,8 @@ impl AddressSpace {
         len: u64,
         align: u64,
         mode: VmarAllocMode,
+        offset_is_upper_limit: bool,
+        child_policy: VmarPlacementPolicy,
     ) -> Result<Vmar, AddressSpaceError> {
         let parent = self
             .vmar_record(parent_vmar_id)
@@ -1519,6 +1560,9 @@ impl AddressSpace {
         }
 
         if mode == VmarAllocMode::Specific {
+            if offset_is_upper_limit {
+                return Err(AddressSpaceError::InvalidArgs);
+            }
             let base = parent
                 .vmar
                 .base
@@ -1527,28 +1571,43 @@ impl AddressSpace {
             if base & (align - 1) != 0 {
                 return Err(AddressSpaceError::InvalidArgs);
             }
-            return self.insert_child_vmar(cpu_id, parent_vmar_id, base, len);
+            return self.insert_child_vmar(cpu_id, parent_vmar_id, base, len, child_policy);
         }
-        if offset != 0 {
+        if offset != 0 && !offset_is_upper_limit {
             return Err(AddressSpaceError::InvalidArgs);
         }
 
         if mode == VmarAllocMode::Compact
+            && !offset_is_upper_limit
             && parent_vmar_id == self.root.vmar.id
             && let Some(base) = self.try_allocate_from_magazine(cpu_id, len, align)?
         {
-            return self.insert_child_vmar(cpu_id, parent_vmar_id, base, len);
+            return self.insert_child_vmar(cpu_id, parent_vmar_id, base, len, child_policy);
         }
 
-        let start_hint = match mode {
-            VmarAllocMode::Specific => unreachable!("specific allocations return above"),
-            VmarAllocMode::Compact => self.compact_start_hint(parent),
-            VmarAllocMode::Randomized => self.allocation_start_hint(parent, cpu_id, len, align)?,
+        let search_end =
+            Self::search_end_for_allocation(parent.vmar, offset, len, offset_is_upper_limit)?;
+        let placement_parent = if Self::should_place_compact(parent, mode) {
+            VmarRecord {
+                placement_policy: VmarPlacementPolicy::Compact,
+                ..parent
+            }
+        } else {
+            parent
         };
+        let start_hint =
+            self.placement_start_hint(placement_parent, cpu_id, len, align, search_end)?;
         let (base, gap_end) = self
-            .find_free_gap_in_vmar_with_hint(parent_vmar_id, start_hint, len, align)
+            .find_free_gap_in_vmar_window_with_hint(
+                parent_vmar_id,
+                parent.vmar.base,
+                search_end,
+                start_hint,
+                len,
+                align,
+            )
             .ok_or(AddressSpaceError::OutOfRange)?;
-        let vmar = self.insert_child_vmar(cpu_id, parent_vmar_id, base, len)?;
+        let vmar = self.insert_child_vmar(cpu_id, parent_vmar_id, base, len, child_policy)?;
         if mode == VmarAllocMode::Compact && parent_vmar_id == self.root.vmar.id {
             let cursor = base
                 .checked_add(len)
@@ -1949,6 +2008,7 @@ impl AddressSpace {
         self.map_recs.push(map_rec);
         self.vmas.push(vma);
         self.vmas.sort_by_key(|vma| vma.base);
+        self.observe_mapping_placement(vmar_id, base, len);
         Ok(())
     }
 
@@ -1976,11 +2036,12 @@ impl AddressSpace {
         )
     }
 
-    /// Install one mapping into the first free range inside the given VMAR.
+    /// Install one non-specific mapping inside the given VMAR using its placement policy.
     #[allow(clippy::too_many_arguments)]
     pub fn map_anywhere_in_vmar(
         &mut self,
         frames: &mut FrameTable,
+        cpu_id: usize,
         vmar_id: VmarId,
         len: u64,
         vmo_id: VmoId,
@@ -1992,8 +2053,23 @@ impl AddressSpace {
         let vmar = self
             .vmar_record(vmar_id)
             .ok_or(AddressSpaceError::InvalidVmar)?;
+        let start_hint = match vmar.placement_policy {
+            VmarPlacementPolicy::Compact => self.compact_start_hint(vmar),
+            VmarPlacementPolicy::Randomized => vmar.vmar.base,
+        };
         let base = self
-            .find_free_gap_in_vmar_with_hint(vmar_id, vmar.vmar.base, len, align)
+            .find_free_gap_in_vmar_window_with_hint(
+                vmar_id,
+                vmar.vmar.base,
+                vmar.vmar.end(),
+                if vmar.placement_policy == VmarPlacementPolicy::Compact {
+                    start_hint
+                } else {
+                    self.allocation_start_hint(vmar, cpu_id, len, align, vmar.vmar.end())?
+                },
+                len,
+                align,
+            )
             .map(|(base, _)| base)
             .ok_or(AddressSpaceError::OutOfRange)?;
         self.map_fixed_in_vmar(
@@ -2644,32 +2720,44 @@ impl AddressSpace {
         cpu_id: usize,
         len: u64,
         align: u64,
+        window_end: u64,
     ) -> Result<u64, AddressSpaceError> {
-        let range_end = parent
-            .vmar
-            .base
-            .checked_add(parent.vmar.len)
-            .ok_or(AddressSpaceError::InvalidArgs)?;
-        let usable_end = range_end
+        let usable_end = window_end
             .checked_sub(len)
             .and_then(|end| end.checked_add(align))
             .ok_or(AddressSpaceError::OutOfRange)?;
-        self.aslr_start_hint(parent.vmar, cpu_id, len, align, usable_end)
+        self.aslr_start_hint(parent, cpu_id, len, align, usable_end)
     }
 
     fn compact_start_hint(&self, parent: VmarRecord) -> u64 {
         core::cmp::max(parent.vmar.base, parent.alloc_cursor)
     }
 
+    fn placement_start_hint(
+        &self,
+        parent: VmarRecord,
+        cpu_id: usize,
+        len: u64,
+        align: u64,
+        window_end: u64,
+    ) -> Result<u64, AddressSpaceError> {
+        match parent.placement_policy {
+            VmarPlacementPolicy::Compact => Ok(self.compact_start_hint(parent)),
+            VmarPlacementPolicy::Randomized => {
+                self.allocation_start_hint(parent, cpu_id, len, align, window_end)
+            }
+        }
+    }
+
     fn aslr_start_hint(
         &self,
-        parent: Vmar,
+        parent: VmarRecord,
         cpu_id: usize,
         len: u64,
         align: u64,
         usable_end: u64,
     ) -> Result<u64, AddressSpaceError> {
-        let candidate_min = parent.base;
+        let candidate_min = parent.vmar.base;
         if usable_end <= candidate_min {
             return Ok(candidate_min);
         }
@@ -2677,11 +2765,13 @@ impl AddressSpace {
             .checked_sub(candidate_min)
             .ok_or(AddressSpaceError::InvalidArgs)?;
         let slot_count = core::cmp::max(1, span / align);
-        let seed = self.id.raw().wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            ^ parent.id.raw().rotate_left(17)
-            ^ self.next_vmar_id.rotate_left(9)
-            ^ len.rotate_left(5)
-            ^ (cpu_id as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+        let seed = mix_u64(
+            parent.random_state
+                ^ len.rotate_left(5)
+                ^ align.rotate_left(11)
+                ^ parent.vmar.len.rotate_left(17)
+                ^ (cpu_id as u64).wrapping_mul(0x94d0_49bb_1331_11eb),
+        );
         let slot = if slot_count > 1 {
             1 + (seed % (slot_count - 1))
         } else {
@@ -2696,12 +2786,90 @@ impl AddressSpace {
         Ok(core::cmp::min(candidate, usable_end - align))
     }
 
+    fn observe_randomized_placement(&mut self, vmar_id: VmarId, base: u64, len: u64) {
+        if let Some(record) = self.vmar_record_mut(vmar_id)
+            && record.placement_policy == VmarPlacementPolicy::Randomized
+        {
+            record.random_state = mix_u64(
+                record.random_state
+                    ^ base.rotate_left(7)
+                    ^ len.rotate_left(19)
+                    ^ record.alloc_cursor.rotate_left(29),
+            );
+        }
+    }
+
+    fn observe_compact_cursor(&mut self, vmar_id: VmarId, base: u64, len: u64) {
+        if let Some(record) = self.vmar_record_mut(vmar_id)
+            && let Some(cursor) = base.checked_add(len)
+            && cursor > record.alloc_cursor
+        {
+            record.alloc_cursor = cursor;
+        }
+    }
+
+    fn observe_mapping_placement(&mut self, vmar_id: VmarId, base: u64, len: u64) {
+        self.observe_compact_cursor(vmar_id, base, len);
+        self.observe_randomized_placement(vmar_id, base, len);
+    }
+
+    fn search_end_for_allocation(
+        parent: Vmar,
+        offset: u64,
+        len: u64,
+        upper_limit: bool,
+    ) -> Result<u64, AddressSpaceError> {
+        if !upper_limit {
+            return Ok(parent.end());
+        }
+        let upper_bound = parent
+            .base
+            .checked_add(offset)
+            .ok_or(AddressSpaceError::InvalidArgs)?;
+        if upper_bound > parent.end() {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+        if upper_bound < parent.base.saturating_add(len) {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+        Ok(upper_bound)
+    }
+
+    fn find_free_gap_in_vmar_window_with_hint(
+        &self,
+        vmar_id: VmarId,
+        window_start: u64,
+        window_end: u64,
+        start_hint: u64,
+        len: u64,
+        align: u64,
+    ) -> Option<(u64, u64)> {
+        let clamped_start = start_hint.clamp(window_start, window_end);
+        self.find_free_gap_in_vmar_window(vmar_id, clamped_start, window_end, len, align)
+            .or_else(|| {
+                (clamped_start > window_start).then(|| {
+                    self.find_free_gap_in_vmar_window(
+                        vmar_id,
+                        window_start,
+                        clamped_start,
+                        len,
+                        align,
+                    )
+                })?
+            })
+    }
+
+    fn should_place_compact(parent: VmarRecord, mode: VmarAllocMode) -> bool {
+        mode == VmarAllocMode::Compact || parent.placement_policy == VmarPlacementPolicy::Compact
+    }
+
     fn insert_child_vmar(
         &mut self,
         cpu_id: usize,
         parent_id: VmarId,
         base: u64,
         len: u64,
+        placement_policy: VmarPlacementPolicy,
     ) -> Result<Vmar, AddressSpaceError> {
         if !self.range_is_free_in_vmar(parent_id, base, len) {
             return Err(AddressSpaceError::Overlap);
@@ -2715,6 +2883,8 @@ impl AddressSpace {
             vmar,
             parent_id: Some(parent_id),
             alloc_cursor: base,
+            placement_policy,
+            random_state: initial_vmar_random_state(self.id, vmar),
         });
         self.vmars.sort_by_key(|record| record.vmar.base);
         if parent_id == self.root.vmar.id
@@ -2733,23 +2903,8 @@ impl AddressSpace {
         {
             parent.alloc_cursor = cursor;
         }
+        self.observe_randomized_placement(parent_id, base, len);
         Ok(vmar)
-    }
-
-    fn find_free_gap_in_vmar_with_hint(
-        &self,
-        vmar_id: VmarId,
-        start: u64,
-        len: u64,
-        align: u64,
-    ) -> Option<(u64, u64)> {
-        let vmar = self.vmar(vmar_id)?;
-        self.find_free_gap_in_vmar_window(vmar_id, start.max(vmar.base()), vmar.end(), len, align)
-            .or_else(|| {
-                (start > vmar.base()).then(|| {
-                    self.find_free_gap_in_vmar_window(vmar_id, vmar.base(), start, len, align)
-                })?
-            })
     }
 
     fn occupied_root_ranges(&self) -> Vec<(u64, u64)> {
@@ -3147,6 +3302,7 @@ mod tests {
         let mapped = space
             .map_anywhere_in_vmar(
                 &mut frames,
+                0,
                 child.id(),
                 PAGE_SIZE,
                 vmo,
@@ -3193,6 +3349,8 @@ mod tests {
                 PAGE_SIZE,
                 PAGE_SIZE,
                 VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Randomized,
             )
             .unwrap();
 
@@ -3214,6 +3372,8 @@ mod tests {
                 PAGE_SIZE,
                 PAGE_SIZE,
                 VmarAllocMode::Randomized,
+                false,
+                VmarPlacementPolicy::Randomized,
             )
             .unwrap();
         assert_ne!(child.base(), ROOT_BASE);
@@ -3232,9 +3392,88 @@ mod tests {
                 PAGE_SIZE,
                 4 * PAGE_SIZE,
                 VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Randomized,
             ),
             Err(AddressSpaceError::InvalidArgs)
         );
+    }
+
+    #[test]
+    fn upper_limit_vmar_allocate_respects_parent_bound() {
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let child = space
+            .allocate_subvmar(
+                0,
+                space.root_vmar().id(),
+                8 * PAGE_SIZE,
+                4 * PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Randomized,
+            )
+            .unwrap();
+        let _reserved = space
+            .allocate_subvmar(
+                0,
+                child.id(),
+                PAGE_SIZE,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Randomized,
+            )
+            .unwrap();
+
+        let upper_limited = space
+            .allocate_subvmar(
+                0,
+                child.id(),
+                4 * PAGE_SIZE,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Randomized,
+                true,
+                VmarPlacementPolicy::Randomized,
+            )
+            .unwrap();
+
+        assert!(upper_limited.base() >= child.base());
+        assert!(upper_limited.end() <= child.base() + (4 * PAGE_SIZE));
+    }
+
+    #[test]
+    fn compact_child_policy_places_descendants_tightly() {
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let compact_child = space
+            .allocate_subvmar(
+                0,
+                space.root_vmar().id(),
+                16 * PAGE_SIZE,
+                4 * PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Compact,
+            )
+            .unwrap();
+
+        let nested = space
+            .allocate_subvmar(
+                0,
+                compact_child.id(),
+                0,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Randomized,
+                false,
+                VmarPlacementPolicy::Randomized,
+            )
+            .unwrap();
+
+        assert_eq!(nested.base(), compact_child.base());
     }
 
     #[test]
@@ -3258,6 +3497,8 @@ mod tests {
                 PAGE_SIZE,
                 PAGE_SIZE,
                 VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Randomized,
             )
             .unwrap();
         space
@@ -3373,6 +3614,7 @@ mod tests {
         space
             .map_anywhere_in_vmar(
                 &mut frames,
+                0,
                 child.id(),
                 PAGE_SIZE,
                 child_vmo,
@@ -4115,6 +4357,8 @@ mod tests {
                 PAGE_SIZE,
                 PAGE_SIZE,
                 VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Randomized,
             )
             .unwrap();
         let compact = space
@@ -4125,11 +4369,52 @@ mod tests {
                 PAGE_SIZE,
                 PAGE_SIZE,
                 VmarAllocMode::Compact,
+                false,
+                VmarPlacementPolicy::Compact,
             )
             .unwrap();
 
         assert_eq!(grandchild.base(), child.base() + PAGE_SIZE);
         assert_eq!(compact.base(), child.base() + (2 * PAGE_SIZE));
+    }
+
+    #[test]
+    fn compact_vmar_non_specific_map_uses_compact_cursor() {
+        let mut frames = FrameTable::new();
+        let frame = frames.register_existing(0x51_000).unwrap();
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(37))
+            .unwrap();
+        space.bind_vmo_frame(vmo, 0, frame).unwrap();
+
+        let compact_child = space
+            .allocate_subvmar(
+                0,
+                space.root_vmar().id(),
+                16 * PAGE_SIZE,
+                4 * PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Compact,
+            )
+            .unwrap();
+        let mapped = space
+            .map_anywhere_in_vmar(
+                &mut frames,
+                0,
+                compact_child.id(),
+                PAGE_SIZE,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::USER,
+                PAGE_SIZE,
+            )
+            .unwrap();
+
+        assert_eq!(mapped, compact_child.base());
     }
 
     #[test]

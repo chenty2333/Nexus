@@ -143,7 +143,7 @@ description = "Bootstrap process_create should yield a real child address space 
 [[contracts]]
 id = "should.vmar.allocate_child_bootstrap"
 level = "should"
-description = "Bootstrap zx_vmar_allocate/zx_vmar_destroy should support nested child VMARs, specific offsets, compact and aligned placement policy, CAN_MAP_SPECIFIC ceilings, and recursive destroy cleanup"
+description = "Bootstrap zx_vmar_allocate/zx_vmar_destroy should support nested child VMARs, specific offsets, compact child policy, upper-limit placement, aligned placement, CAN_MAP_SPECIFIC ceilings, and recursive destroy cleanup"
 
 [[contracts]]
 id = "should.vmar.far_range_bootstrap"

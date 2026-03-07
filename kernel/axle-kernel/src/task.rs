@@ -21,7 +21,7 @@ use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
     CowFaultResolution, FrameId, FrameTable, FutexKey, GlobalVmoId, LazyAnonFaultResolution,
     MapRec, MappingPerms, PageFaultDecision, PageFaultFlags, PteMeta, PteMetaTag, ReverseMapAnchor,
-    VmaLookup, Vmar, VmarAllocMode, VmarId, Vmo, VmoId, VmoKind,
+    VmaLookup, Vmar, VmarAllocMode, VmarId, VmarPlacementPolicy, Vmo, VmoId, VmoKind,
 };
 use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor, TxSet};
 use axle_types::rights::{
@@ -725,9 +725,19 @@ impl AddressSpace {
         len: u64,
         align: u64,
         mode: VmarAllocMode,
+        offset_is_upper_limit: bool,
+        child_policy: VmarPlacementPolicy,
     ) -> Result<Vmar, AddressSpaceError> {
-        self.vm
-            .allocate_subvmar(cpu_id, parent_vmar_id, offset, len, align, mode)
+        self.vm.allocate_subvmar(
+            cpu_id,
+            parent_vmar_id,
+            offset,
+            len,
+            align,
+            mode,
+            offset_is_upper_limit,
+            child_policy,
+        )
     }
 
     fn destroy_vmar(
@@ -840,6 +850,7 @@ impl AddressSpace {
     fn map_vmo_anywhere(
         &mut self,
         frames: &mut FrameTable,
+        cpu_id: usize,
         vmar_id: VmarId,
         len: u64,
         vmo_id: VmoId,
@@ -848,6 +859,7 @@ impl AddressSpace {
     ) -> Result<u64, AddressSpaceError> {
         self.vm.map_anywhere_in_vmar(
             frames,
+            cpu_id,
             vmar_id,
             len,
             vmo_id,
@@ -1483,6 +1495,8 @@ impl Kernel {
         len: u64,
         align: u64,
         mode: VmarAllocMode,
+        offset_is_upper_limit: bool,
+        child_policy: VmarPlacementPolicy,
     ) -> Result<Vmar, zx_status_t> {
         let cpu_id = self.current_cpu_id();
         let address_space = self
@@ -1490,7 +1504,16 @@ impl Kernel {
             .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         address_space
-            .allocate_subvmar(cpu_id, parent_vmar_id, offset, len, align, mode)
+            .allocate_subvmar(
+                cpu_id,
+                parent_vmar_id,
+                offset,
+                len,
+                align,
+                mode,
+                offset_is_upper_limit,
+                child_policy,
+            )
             .map_err(map_address_space_error)
     }
 
@@ -2077,6 +2100,7 @@ impl Kernel {
         len: u64,
         perms: MappingPerms,
     ) -> Result<u64, zx_status_t> {
+        let cpu_id = self.current_cpu_id();
         let local_vmo_id =
             self.import_global_vmo_into_address_space(vmar_address_space_id, global_vmo_id)?;
         let mapped_addr = {
@@ -2088,6 +2112,7 @@ impl Kernel {
             address_space
                 .map_vmo_anywhere(
                     &mut self.frames,
+                    cpu_id,
                     vmar_id,
                     len,
                     local_vmo_id,

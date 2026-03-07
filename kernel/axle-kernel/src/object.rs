@@ -9,7 +9,7 @@ use axle_core::{
     Capability, Packet, PacketKind, Port, PortError, Signals, TimerError, TimerId, TimerService,
     WaitAsyncOptions,
 };
-use axle_mm::{MappingPerms, VmarAllocMode, VmarId};
+use axle_mm::{MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::koid::ZX_KOID_INVALID;
@@ -22,8 +22,8 @@ use axle_types::status::{
 };
 use axle_types::vm::{
     ZX_VM_ALIGN_BASE, ZX_VM_ALIGN_MASK, ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ,
-    ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE, ZX_VM_COMPACT, ZX_VM_PERM_EXECUTE,
-    ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
+    ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE, ZX_VM_COMPACT, ZX_VM_OFFSET_IS_UPPER_LIMIT,
+    ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
 };
 use axle_types::{
     zx_clock_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_packet_user_t, zx_port_packet_t,
@@ -164,6 +164,8 @@ struct VmarAllocateRequest {
     mapping_caps: VmarMappingCaps,
     align: u64,
     mode: VmarAllocMode,
+    offset_is_upper_limit: bool,
+    child_policy: VmarPlacementPolicy,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1149,6 +1151,11 @@ pub fn vmar_allocate(
 
         require_vmar_control_rights(resolved_parent)?;
         require_vmar_child_mapping_caps(parent.mapping_caps, request.mapping_caps)?;
+        if (request.mode == VmarAllocMode::Specific || request.offset_is_upper_limit)
+            && !parent.mapping_caps.can_map_specific
+        {
+            return Err(ZX_ERR_ACCESS_DENIED);
+        }
 
         let child = state.kernel.allocate_subvmar(
             parent.address_space_id,
@@ -1157,6 +1164,8 @@ pub fn vmar_allocate(
             len,
             request.align,
             request.mode,
+            request.offset_is_upper_limit,
+            request.child_policy,
         )?;
         let object_id = state.alloc_object_id();
         state.objects.insert(
@@ -2137,30 +2146,40 @@ fn vmar_allocate_request_from_options(
         | ZX_VM_CAN_MAP_EXECUTE
         | ZX_VM_CAN_MAP_SPECIFIC
         | ZX_VM_SPECIFIC
+        | ZX_VM_OFFSET_IS_UPPER_LIMIT
         | ZX_VM_COMPACT
         | ZX_VM_ALIGN_MASK;
     if (options & !allowed) != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
     let specific = (options & ZX_VM_SPECIFIC) != 0;
+    let offset_is_upper_limit = (options & ZX_VM_OFFSET_IS_UPPER_LIMIT) != 0;
     let compact = (options & ZX_VM_COMPACT) != 0;
-    if specific && compact {
+    if specific && offset_is_upper_limit {
         return Err(ZX_ERR_INVALID_ARGS);
     }
-    if !specific && offset != 0 {
+    if !specific && !offset_is_upper_limit && offset != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
     Ok(VmarAllocateRequest {
         mapping_caps: vmar_mapping_caps_from_allocate_options(
-            options & !(ZX_VM_SPECIFIC | ZX_VM_COMPACT | ZX_VM_ALIGN_MASK),
+            options
+                & !(ZX_VM_SPECIFIC
+                    | ZX_VM_OFFSET_IS_UPPER_LIMIT
+                    | ZX_VM_COMPACT
+                    | ZX_VM_ALIGN_MASK),
         )?,
         align,
         mode: if specific {
             VmarAllocMode::Specific
-        } else if compact {
-            VmarAllocMode::Compact
         } else {
             VmarAllocMode::Randomized
+        },
+        offset_is_upper_limit,
+        child_policy: if compact {
+            VmarPlacementPolicy::Compact
+        } else {
+            VmarPlacementPolicy::Randomized
         },
     })
 }
