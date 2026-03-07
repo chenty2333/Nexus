@@ -15,11 +15,11 @@ use x86_64::structures::paging::{PageTable as X86PageTable, PageTableFlags, Phys
 pub(crate) enum PtPageLevel {
     /// PML4 root page.
     Pml4,
-    /// First user-visible PDPT page.
+    /// One PDPT page in the user half.
     Pdpt,
-    /// Fixed user-window PD page.
+    /// One PD page in the user half.
     Pd,
-    /// Fixed user-window PT leaf page.
+    /// One PT leaf page in the user half.
     Pt,
 }
 
@@ -58,11 +58,11 @@ pub(crate) enum PtMetaKind {
     None,
     /// Entire covered subtree shares one uniform metadata template.
     Uniform(PtMetaTemplate),
-    /// This descriptor is the fixed leaf PT that carries per-page metadata.
+    /// This descriptor is one leaf PT page that carries per-page metadata.
     Leaf,
 }
 
-/// Uniform metadata template for one fixed-shape page-table subtree.
+/// Uniform metadata template for one page-table subtree.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PtMetaTemplate {
@@ -89,7 +89,7 @@ impl PtMetaTemplate {
     }
 }
 
-/// Fixed-shape descriptor for one concrete x86_64 page-table page.
+/// Descriptor for one concrete x86_64 page-table page.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PtPageDesc {
@@ -155,12 +155,12 @@ impl UserPageTableDescSet {
         self.pdpt
     }
 
-    /// Fixed user-window PD descriptor.
+    /// Bootstrap user PD descriptor snapshot.
     pub(crate) const fn user_pd(self) -> PtPageDesc {
         self.user_pd
     }
 
-    /// Fixed user-window PT descriptor.
+    /// Bootstrap user PT descriptor snapshot.
     pub(crate) const fn user_pt(self) -> PtPageDesc {
         self.user_pt
     }
@@ -391,7 +391,7 @@ impl UserPageTables {
     }
 
     /// Create one fresh address-space root by cloning current kernel mappings and
-    /// installing a new user PD/PT subtree for the fixed bootstrap user window.
+    /// installing one bootstrap user PD/PT anchor under the wider logical user window.
     pub(crate) fn clone_current_kernel_template() -> Result<Self, PageTableError> {
         let (current_root_frame, _) = Cr3::read();
         let current_root_paddr = current_root_frame.start_address().as_u64();

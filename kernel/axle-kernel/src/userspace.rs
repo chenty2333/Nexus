@@ -21,8 +21,10 @@ use x86_64::instructions::segmentation::Segment;
 pub(crate) const USER_PAGE_BYTES: u64 = 0x1000;
 pub(crate) const USER_CODE_PAGE_COUNT: usize = 8;
 pub(crate) const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * USER_CODE_PAGE_COUNT as u64;
-pub(crate) const USER_REGION_BYTES: u64 = 0x20_0000;
 pub(crate) const USER_CODE_VA: u64 = 0x0000_0001_0000_0000; // 4 GiB
+pub(crate) const USER_WINDOW_TOP: u64 = 0x0000_8000_0000_0000; // lower canonical half limit
+pub(crate) const USER_REGION_BYTES: u64 = USER_WINDOW_TOP - USER_CODE_VA;
+const BOOTSTRAP_USER_PT_BYTES: u64 = USER_PAGE_BYTES * 512;
 pub(crate) const USER_SHARED_VA: u64 = USER_CODE_VA + USER_CODE_BYTES;
 pub(crate) const USER_STACK_VA: u64 = USER_SHARED_VA + USER_PAGE_BYTES;
 const USER_STACK_TOP: u64 = USER_STACK_VA + USER_PAGE_BYTES;
@@ -318,8 +320,8 @@ pub(crate) fn bootstrap_user_pt_paddr() -> u64 {
     phys_of(core::ptr::addr_of!(USER_PT))
 }
 
-fn user_page_index(user_va: u64) -> Option<usize> {
-    if user_va < USER_CODE_VA || user_va >= (USER_CODE_VA + USER_REGION_BYTES) {
+fn bootstrap_user_page_index(user_va: u64) -> Option<usize> {
+    if user_va < USER_CODE_VA || user_va >= (USER_CODE_VA + BOOTSTRAP_USER_PT_BYTES) {
         return None;
     }
     if user_va & (USER_PAGE_BYTES - 1) != 0 {
@@ -357,7 +359,7 @@ pub(crate) fn alloc_bootstrap_zeroed_page() -> Option<u64> {
 }
 
 pub(crate) fn query_user_page_frame(user_va: u64) -> Result<Option<UserPageFrame>, ()> {
-    let index = user_page_index(user_va).ok_or(())?;
+    let index = bootstrap_user_page_index(user_va).ok_or(())?;
     // SAFETY: USER_PT is the active page table page for the fixed bootstrap user region.
     let entry = unsafe { USER_PT.0[index] };
     if (entry & PTE_P) == 0 {
@@ -373,7 +375,7 @@ pub(crate) fn install_user_page_frame(user_va: u64, paddr: u64, writable: bool) 
     if paddr & (USER_PAGE_BYTES - 1) != 0 {
         return Err(());
     }
-    let index = user_page_index(user_va).ok_or(())?;
+    let index = bootstrap_user_page_index(user_va).ok_or(())?;
     let mut entry = paddr | (PTE_P | PTE_U);
     if writable {
         entry |= PTE_W;
@@ -387,7 +389,7 @@ pub(crate) fn install_user_page_frame(user_va: u64, paddr: u64, writable: bool) 
 }
 
 pub(crate) fn clear_user_page_frame(user_va: u64) -> Result<(), ()> {
-    let index = user_page_index(user_va).ok_or(())?;
+    let index = bootstrap_user_page_index(user_va).ok_or(())?;
     unsafe {
         // SAFETY: USER_PT is the active page table page for the fixed bootstrap user region.
         USER_PT.0[index] = 0;
@@ -396,7 +398,7 @@ pub(crate) fn clear_user_page_frame(user_va: u64) -> Result<(), ()> {
 }
 
 pub(crate) fn set_user_page_writable(user_va: u64, writable: bool) -> Result<(), ()> {
-    let index = user_page_index(user_va).ok_or(())?;
+    let index = bootstrap_user_page_index(user_va).ok_or(())?;
     unsafe {
         // SAFETY: USER_PT is the active page table page for the fixed bootstrap user region.
         let entry = &mut USER_PT.0[index];
@@ -426,7 +428,8 @@ fn map_userspace_pages() {
         // Install PDPT[4] -> USER_PD (maps VA 4GiB..5GiB).
         *pdpt.add(4) = phys_of(core::ptr::addr_of!(USER_PD)) | (PTE_P | PTE_W | PTE_U);
 
-        // USER_PD[0] -> USER_PT (maps VA 4GiB..4GiB+2MiB).
+        // USER_PD[0] -> USER_PT keeps the original 2 MiB bootstrap leaf wired in place.
+        // Wider user-space mappings are populated lazily by the per-address-space walker.
         *user_pd.add(0) = phys_of(core::ptr::addr_of!(USER_PT)) | (PTE_P | PTE_W | PTE_U);
 
         // Map the user code pages, followed by the shared page and stack page.

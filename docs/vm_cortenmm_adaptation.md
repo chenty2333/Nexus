@@ -20,6 +20,10 @@ external VM model.
 - The fixed `user_pd/user_pt` descriptors now classify the current 2 MiB user
   subtree as either `Uniform(template)` or `Leaf`, which is the first concrete
   upper-level uniform metadata hook for later generalization.
+- The x86_64 walker and metadata stores are now sparse and no longer tied to a
+  single fixed `USER_PT` leaf. The logical root VMAR spans the lower canonical
+  user half above `USER_CODE_VA`, while the original 2 MiB bootstrap `USER_PT`
+  remains only as an early wired-in bridge.
 - TLB invalidation is now lazy across CPUs: page-table commits still flush the
   local active CPU immediately, but remote CPUs observe descriptor epochs and
   catch up at kernel-return / scheduling boundaries instead of taking an eager
