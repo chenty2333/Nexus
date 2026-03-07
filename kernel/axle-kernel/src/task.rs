@@ -34,7 +34,7 @@ use axle_types::rights::{
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
     ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND,
-    ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_OK,
+    ZX_ERR_OUT_OF_RANGE, ZX_OK,
 };
 use axle_types::{
     zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t,
@@ -721,16 +721,13 @@ impl AddressSpace {
         &mut self,
         cpu_id: usize,
         parent_vmar_id: VmarId,
+        offset: u64,
         len: u64,
         align: u64,
+        exact: bool,
     ) -> Result<Vmar, AddressSpaceError> {
-        let Some(parent) = self.vm.vmar(parent_vmar_id) else {
-            return Err(AddressSpaceError::InvalidVmar);
-        };
-        if parent.id() != self.vm.root_vmar().id() {
-            return Err(AddressSpaceError::Busy);
-        }
-        self.vm.allocate_subvmar_for_cpu(cpu_id, len, align)
+        self.vm
+            .allocate_subvmar(cpu_id, parent_vmar_id, offset, len, align, exact)
     }
 
     fn destroy_vmar(
@@ -1482,20 +1479,18 @@ impl Kernel {
         &mut self,
         address_space_id: AddressSpaceId,
         parent_vmar_id: VmarId,
+        offset: u64,
         len: u64,
         align: u64,
+        exact: bool,
     ) -> Result<Vmar, zx_status_t> {
         let cpu_id = self.current_cpu_id();
         let address_space = self
             .address_spaces
             .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        let parent = address_space.vmar(parent_vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
-        if parent.id() != address_space.root_vmar().id() {
-            return Err(ZX_ERR_NOT_SUPPORTED);
-        }
         address_space
-            .allocate_subvmar(cpu_id, parent_vmar_id, len, align)
+            .allocate_subvmar(cpu_id, parent_vmar_id, offset, len, align, exact)
             .map_err(map_address_space_error)
     }
 
@@ -1515,13 +1510,7 @@ impl Kernel {
             if address_space.vmar(vmar_id).is_none() {
                 return Err(ZX_ERR_NOT_FOUND);
             }
-            address_space
-                .vm
-                .vmas()
-                .iter()
-                .filter(|vma| vma.vmar_id() == vmar_id)
-                .map(|vma| (vma.base(), vma.len()))
-                .collect::<Vec<_>>()
+            address_space.vm.mapped_ranges_in_vmar_subtree(vmar_id)
         };
 
         let mut affected_frames = Vec::new();

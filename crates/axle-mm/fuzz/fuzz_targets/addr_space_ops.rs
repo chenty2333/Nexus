@@ -94,8 +94,24 @@ fuzz_target!(|data: &[u8]| {
                 let cpu_id = usize::from(chunk.get(2).copied().unwrap_or(0) % 4);
                 let pages = u64::from((chunk.get(3).copied().unwrap_or(0) % 4) + 1);
                 let align_pages = 1_u64 << u64::from(chunk.get(4).copied().unwrap_or(0) % 3);
+                let parent_choice =
+                    usize::from(chunk.get(5).copied().unwrap_or(0) % (vmars.len() as u8 + 1));
+                let parent_vmar_id = if parent_choice == vmars.len() {
+                    space.root_vmar().id()
+                } else {
+                    vmars[parent_choice].unwrap_or(space.root_vmar().id())
+                };
+                let exact = (chunk.get(6).copied().unwrap_or(0) & 1) != 0;
+                let offset_pages = u64::from(chunk.get(7).copied().unwrap_or(0) % 4);
                 vmars[slot] = space
-                    .allocate_subvmar_for_cpu(cpu_id, pages * PAGE_SIZE, align_pages * PAGE_SIZE)
+                    .allocate_subvmar(
+                        cpu_id,
+                        parent_vmar_id,
+                        if exact { offset_pages * PAGE_SIZE } else { 0 },
+                        pages * PAGE_SIZE,
+                        align_pages * PAGE_SIZE,
+                        exact,
+                    )
                     .ok()
                     .map(|vmar| vmar.id());
             }

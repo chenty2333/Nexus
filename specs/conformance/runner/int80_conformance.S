@@ -386,7 +386,7 @@ vmar_allocate_map_match_done:
 	mov 8*62(%rbx), %rdi
 	movl $0x1800, %esi
 	xor %rdx, %rdx
-	movabs $0x1000, %r10
+	movabs $0x3000, %r10
 	lea 0x988(%rbx), %r8
 	lea 0x990(%rbx), %r9
 	movabs $28, %rax
@@ -429,6 +429,69 @@ vmar_allocate_map_match_done:
 	movq $1, 8*369(%rbx)
 vmar_allocate_nonspecific_match_done:
 
+	// vmar_allocate(grandchild @ exact child offset 0x1000)
+	mov 0x970(%rbx), %rdi
+	movl $0x4c00, %esi
+	movabs $0x1000, %rdx
+	movabs $0x1000, %r10
+	lea 0x9b8(%rbx), %r8
+	lea 0x9c0(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	mov %rax, 8*372(%rbx)
+	movq $0, 8*373(%rbx)
+	mov 0x9c0(%rbx), %rax
+	mov 0x978(%rbx), %rdx
+	add $0x1000, %rdx
+	cmp %rdx, %rax
+	jne vmar_allocate_grandchild_match_done
+	movq $1, 8*373(%rbx)
+vmar_allocate_grandchild_match_done:
+
+	// vmar_map(grandchild @ offset 0)
+	mov 0x9b8(%rbx), %rdi
+	movl $0x401, %esi
+	xor %rdx, %rdx
+	mov 0x6d0(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x9c8(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*374(%rbx)
+	movq $0, 8*375(%rbx)
+	mov 0x9c8(%rbx), %rax
+	cmp 0x9c0(%rbx), %rax
+	jne vmar_allocate_grandchild_map_match_done
+	movq $1, 8*375(%rbx)
+vmar_allocate_grandchild_map_match_done:
+
+	// vmar_allocate(grandchild non-specific inside child without CAN_MAP_SPECIFIC)
+	mov 0x988(%rbx), %rdi
+	movl $0x800, %esi
+	xor %rdx, %rdx
+	movabs $0x1000, %r10
+	lea 0x9d0(%rbx), %r8
+	lea 0x9d8(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	mov %rax, 8*376(%rbx)
+	movq $0, 8*377(%rbx)
+	mov 0x9d8(%rbx), %rax
+	cmp 0x990(%rbx), %rax
+	je vmar_allocate_grandchild_aslr_done
+	mov 0x990(%rbx), %rdx
+	cmp %rdx, %rax
+	jb vmar_allocate_grandchild_aslr_done
+	add $0x3000, %rdx
+	cmp %rdx, %rax
+	jae vmar_allocate_grandchild_aslr_done
+	movq $1, 8*377(%rbx)
+vmar_allocate_grandchild_aslr_done:
+
 	// vmar_destroy(first child)
 	mov 0x970(%rbx), %rdi
 	movabs $29, %rax
@@ -444,7 +507,7 @@ vmar_allocate_nonspecific_match_done:
 	mov 0x6d0(%rbx), %r10
 	xor %r8, %r8
 	movabs $0x1000, %r9
-	lea 0x9b0(%rbx), %rax
+	lea 0x9e0(%rbx), %rax
 	sub $8, %rsp
 	mov %rax, (%rsp)
 	movabs $10, %rax

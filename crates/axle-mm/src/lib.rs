@@ -19,6 +19,7 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
@@ -674,6 +675,13 @@ const VA_MAGAZINE_BYTES: u64 = 0x20_0000;
 struct VaMagazine {
     cursor: u64,
     end: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VmarRecord {
+    vmar: Vmar,
+    parent_id: Option<VmarId>,
+    alloc_cursor: u64,
 }
 
 /// Coarse mapping record linking VMAR control metadata to page-level state.
@@ -1358,8 +1366,8 @@ struct ResolvedPageState {
 #[derive(Debug)]
 pub struct AddressSpace {
     id: AddressSpaceId,
-    root: Vmar,
-    child_vmars: Vec<Vmar>,
+    root: VmarRecord,
+    vmars: Vec<VmarRecord>,
     vmos: Vec<Vmo>,
     map_recs: Vec<MapRec>,
     pte_meta: PteMetaStore,
@@ -1392,12 +1400,16 @@ impl AddressSpace {
 
         Ok(Self {
             id,
-            root: Vmar {
-                id: VmarId(1),
-                base: root_base,
-                len: root_len,
+            root: VmarRecord {
+                vmar: Vmar {
+                    id: VmarId(1),
+                    base: root_base,
+                    len: root_len,
+                },
+                parent_id: None,
+                alloc_cursor: root_base,
             },
-            child_vmars: Vec::new(),
+            vmars: Vec::new(),
             vmos: Vec::new(),
             map_recs: Vec::new(),
             pte_meta: PteMetaStore::new(root_base, root_len)?,
@@ -1417,23 +1429,44 @@ impl AddressSpace {
 
     /// Root VMAR metadata.
     pub const fn root_vmar(&self) -> Vmar {
-        self.root
+        self.root.vmar
     }
 
-    /// Child VMAR reservations currently carved out of the root range.
-    pub fn child_vmars(&self) -> &[Vmar] {
-        &self.child_vmars
+    /// Direct child VMAR reservations currently carved out of the root range.
+    pub fn child_vmars(&self) -> Vec<Vmar> {
+        self.vmars
+            .iter()
+            .filter(|record| record.parent_id == Some(self.root.vmar.id))
+            .map(|record| record.vmar)
+            .collect()
     }
 
     /// Lookup one VMAR by id.
     pub fn vmar(&self, id: VmarId) -> Option<Vmar> {
-        if self.root.id == id {
+        if self.root.vmar.id == id {
+            return Some(self.root.vmar);
+        }
+        self.vmars
+            .iter()
+            .map(|record| record.vmar)
+            .find(|candidate| candidate.id == id)
+    }
+
+    fn vmar_record(&self, id: VmarId) -> Option<VmarRecord> {
+        if self.root.vmar.id == id {
             return Some(self.root);
         }
-        self.child_vmars
+        self.vmars
             .iter()
             .copied()
-            .find(|candidate| candidate.id == id)
+            .find(|record| record.vmar.id == id)
+    }
+
+    fn vmar_record_mut(&mut self, id: VmarId) -> Option<&mut VmarRecord> {
+        if self.root.vmar.id == id {
+            return Some(&mut self.root);
+        }
+        self.vmars.iter_mut().find(|record| record.vmar.id == id)
     }
 
     /// Allocate one child VMAR out of the root address space using a CPU-local VA magazine.
@@ -1443,35 +1476,66 @@ impl AddressSpace {
         len: u64,
         align: u64,
     ) -> Result<Vmar, AddressSpaceError> {
-        validate_mapping_range(self.root.base, len)?;
+        self.allocate_subvmar(cpu_id, self.root.vmar.id, 0, len, align, false)
+    }
+
+    /// Allocate one child VMAR inside the given parent VMAR.
+    pub fn allocate_subvmar(
+        &mut self,
+        cpu_id: usize,
+        parent_vmar_id: VmarId,
+        offset: u64,
+        len: u64,
+        align: u64,
+        exact: bool,
+    ) -> Result<Vmar, AddressSpaceError> {
+        let parent = self
+            .vmar_record(parent_vmar_id)
+            .ok_or(AddressSpaceError::InvalidVmar)?;
+        validate_mapping_range(parent.vmar.base, len)?;
         if align == 0 || !align.is_power_of_two() || !is_page_aligned(align) {
             return Err(AddressSpaceError::InvalidArgs);
         }
-
-        if let Some(base) = self.try_allocate_from_magazine(cpu_id, len, align)? {
-            return self.insert_child_vmar(cpu_id, base, len);
+        if !is_page_aligned(offset) {
+            return Err(AddressSpaceError::InvalidArgs);
         }
 
-        let start_hint = self
-            .va_magazines
-            .get(&cpu_id)
-            .map(|magazine| magazine.cursor)
-            .unwrap_or(self.root.base);
+        if exact {
+            let base = parent
+                .vmar
+                .base
+                .checked_add(offset)
+                .ok_or(AddressSpaceError::InvalidArgs)?;
+            return self.insert_child_vmar(cpu_id, parent_vmar_id, base, len);
+        }
+        if offset != 0 {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+
+        if parent_vmar_id == self.root.vmar.id
+            && let Some(base) = self.try_allocate_from_magazine(cpu_id, len, align)?
+        {
+            return self.insert_child_vmar(cpu_id, parent_vmar_id, base, len);
+        }
+
+        let start_hint = self.allocation_start_hint(parent, cpu_id, len, align)?;
         let (base, gap_end) = self
-            .find_free_root_gap(start_hint, len, align)
+            .find_free_gap_in_vmar_with_hint(parent_vmar_id, start_hint, len, align)
             .ok_or(AddressSpaceError::OutOfRange)?;
-        let vmar = self.insert_child_vmar(cpu_id, base, len)?;
-        let cursor = base
-            .checked_add(len)
-            .ok_or(AddressSpaceError::InvalidArgs)?;
-        let preferred_end = base.saturating_add(VA_MAGAZINE_BYTES);
-        self.va_magazines.insert(
-            cpu_id,
-            VaMagazine {
-                cursor,
-                end: core::cmp::max(cursor, core::cmp::min(gap_end, preferred_end)),
-            },
-        );
+        let vmar = self.insert_child_vmar(cpu_id, parent_vmar_id, base, len)?;
+        if parent_vmar_id == self.root.vmar.id {
+            let cursor = base
+                .checked_add(len)
+                .ok_or(AddressSpaceError::InvalidArgs)?;
+            let preferred_end = base.saturating_add(VA_MAGAZINE_BYTES);
+            self.va_magazines.insert(
+                cpu_id,
+                VaMagazine {
+                    cursor,
+                    end: core::cmp::max(cursor, core::cmp::min(gap_end, preferred_end)),
+                },
+            );
+        }
         Ok(vmar)
     }
 
@@ -1481,25 +1545,31 @@ impl AddressSpace {
         frames: &mut FrameTable,
         id: VmarId,
     ) -> Result<Vec<(u64, u64)>, AddressSpaceError> {
-        if id == self.root.id {
+        if id == self.root.vmar.id {
             return Err(AddressSpaceError::Busy);
         }
-        let index = self
-            .child_vmars
-            .iter()
-            .position(|candidate| candidate.id == id)
-            .ok_or(AddressSpaceError::InvalidVmar)?;
+        if self.vmar_record(id).is_none() {
+            return Err(AddressSpaceError::InvalidVmar);
+        }
+        let subtree = self.collect_vmar_subtree_ids(id);
         let mut removed_ranges = self
             .vmas
             .iter()
-            .filter(|vma| vma.vmar_id == id)
+            .filter(|vma| subtree.contains(&vma.vmar_id))
             .map(|vma| (vma.base(), vma.len()))
             .collect::<Vec<_>>();
         removed_ranges.sort_by_key(|&(base, _)| base);
-        for (base, len) in removed_ranges.iter().copied() {
-            self.unmap_in_vmar(frames, id, base, len)?;
+        let removed_vmas = self
+            .vmas
+            .iter()
+            .filter(|vma| subtree.contains(&vma.vmar_id))
+            .map(|vma| (vma.vmar_id, vma.base(), vma.len()))
+            .collect::<Vec<_>>();
+        for (vmar_id, base, len) in removed_vmas {
+            self.unmap_in_vmar(frames, vmar_id, base, len)?;
         }
-        self.child_vmars.remove(index);
+        self.vmars
+            .retain(|record| !subtree.contains(&record.vmar.id));
         Ok(removed_ranges)
     }
 
@@ -1711,6 +1781,22 @@ impl AddressSpace {
             .collect()
     }
 
+    /// Return every mapped range currently owned by the given VMAR subtree.
+    pub fn mapped_ranges_in_vmar_subtree(&self, vmar_id: VmarId) -> Vec<(u64, u64)> {
+        if self.vmar_record(vmar_id).is_none() {
+            return Vec::new();
+        }
+        let subtree = self.collect_vmar_subtree_ids(vmar_id);
+        let mut ranges = self
+            .vmas
+            .iter()
+            .filter(|vma| subtree.contains(&vma.vmar_id))
+            .map(|vma| (vma.base(), vma.len()))
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|&(base, _)| base);
+        ranges
+    }
+
     /// Install a fixed mapping into one VMAR.
     #[allow(clippy::too_many_arguments)]
     pub fn map_fixed_in_vmar(
@@ -1751,9 +1837,7 @@ impl AddressSpace {
         {
             return Err(AddressSpaceError::Overlap);
         }
-        if self.child_vmars.iter().any(|existing| {
-            existing.id() != vmar_id && ranges_overlap(existing.base(), existing.len(), base, len)
-        }) {
+        if self.mapping_intersects_foreign_vmar(vmar_id, base, len) {
             return Err(AddressSpaceError::Overlap);
         }
 
@@ -1856,7 +1940,7 @@ impl AddressSpace {
     ) -> Result<(), AddressSpaceError> {
         self.map_fixed_in_vmar(
             frames,
-            self.root.id,
+            self.root.vmar.id,
             base,
             len,
             vmo_id,
@@ -1879,8 +1963,12 @@ impl AddressSpace {
         max_perms: MappingPerms,
         align: u64,
     ) -> Result<u64, AddressSpaceError> {
+        let vmar = self
+            .vmar_record(vmar_id)
+            .ok_or(AddressSpaceError::InvalidVmar)?;
         let base = self
-            .find_free_gap_in_vmar(vmar_id, len, align)
+            .find_free_gap_in_vmar_with_hint(vmar_id, vmar.vmar.base, len, align)
+            .map(|(base, _)| base)
             .ok_or(AddressSpaceError::OutOfRange)?;
         self.map_fixed_in_vmar(
             frames, vmar_id, base, len, vmo_id, vmo_offset, perms, max_perms,
@@ -1947,7 +2035,7 @@ impl AddressSpace {
         base: u64,
         len: u64,
     ) -> Result<(), AddressSpaceError> {
-        self.unmap_in_vmar(frames, self.root.id, base, len)
+        self.unmap_in_vmar(frames, self.root.vmar.id, base, len)
     }
 
     /// Change permissions on an existing mapping without changing its extent.
@@ -1983,7 +2071,7 @@ impl AddressSpace {
         len: u64,
         new_perms: MappingPerms,
     ) -> Result<(), AddressSpaceError> {
-        self.protect_in_vmar(self.root.id, base, len, new_perms)
+        self.protect_in_vmar(self.root.vmar.id, base, len, new_perms)
     }
 
     /// Arm an existing mapping for copy-on-write handling.
@@ -2309,7 +2397,7 @@ impl AddressSpace {
         let Some(end) = base.checked_add(len) else {
             return false;
         };
-        base >= self.root.base && end <= self.root.base + self.root.len
+        base >= self.root.vmar.base && end <= self.root.vmar.base + self.root.vmar.len
     }
 
     fn alloc_vmar_id(&mut self) -> VmarId {
@@ -2524,13 +2612,68 @@ impl AddressSpace {
         Ok(Some(base))
     }
 
+    fn allocation_start_hint(
+        &self,
+        parent: VmarRecord,
+        cpu_id: usize,
+        len: u64,
+        align: u64,
+    ) -> Result<u64, AddressSpaceError> {
+        let range_end = parent
+            .vmar
+            .base
+            .checked_add(parent.vmar.len)
+            .ok_or(AddressSpaceError::InvalidArgs)?;
+        let usable_end = range_end
+            .checked_sub(len)
+            .and_then(|end| end.checked_add(align))
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        self.aslr_start_hint(parent.vmar, cpu_id, len, align, usable_end)
+    }
+
+    fn aslr_start_hint(
+        &self,
+        parent: Vmar,
+        cpu_id: usize,
+        len: u64,
+        align: u64,
+        usable_end: u64,
+    ) -> Result<u64, AddressSpaceError> {
+        let candidate_min = parent.base;
+        if usable_end <= candidate_min {
+            return Ok(candidate_min);
+        }
+        let span = usable_end
+            .checked_sub(candidate_min)
+            .ok_or(AddressSpaceError::InvalidArgs)?;
+        let slot_count = core::cmp::max(1, span / align);
+        let seed = self.id.raw().wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ parent.id.raw().rotate_left(17)
+            ^ self.next_vmar_id.rotate_left(9)
+            ^ len.rotate_left(5)
+            ^ (cpu_id as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+        let slot = if slot_count > 1 {
+            1 + (seed % (slot_count - 1))
+        } else {
+            0
+        };
+        let candidate = candidate_min
+            .checked_add(
+                slot.checked_mul(align)
+                    .ok_or(AddressSpaceError::InvalidArgs)?,
+            )
+            .ok_or(AddressSpaceError::InvalidArgs)?;
+        Ok(core::cmp::min(candidate, usable_end - align))
+    }
+
     fn insert_child_vmar(
         &mut self,
         cpu_id: usize,
+        parent_id: VmarId,
         base: u64,
         len: u64,
     ) -> Result<Vmar, AddressSpaceError> {
-        if !self.root_range_is_free(base, len) {
+        if !self.range_is_free_in_vmar(parent_id, base, len) {
             return Err(AddressSpaceError::Overlap);
         }
         let vmar = Vmar {
@@ -2538,9 +2681,15 @@ impl AddressSpace {
             base,
             len,
         };
-        self.child_vmars.push(vmar);
-        self.child_vmars.sort_by_key(|candidate| candidate.base);
-        if let Some(magazine) = self.va_magazines.get_mut(&cpu_id) {
+        self.vmars.push(VmarRecord {
+            vmar,
+            parent_id: Some(parent_id),
+            alloc_cursor: base,
+        });
+        self.vmars.sort_by_key(|record| record.vmar.base);
+        if parent_id == self.root.vmar.id
+            && let Some(magazine) = self.va_magazines.get_mut(&cpu_id)
+        {
             let cursor = base
                 .checked_add(len)
                 .ok_or(AddressSpaceError::InvalidArgs)?;
@@ -2548,45 +2697,94 @@ impl AddressSpace {
                 magazine.cursor = cursor;
             }
         }
+        if let Some(parent) = self.vmar_record_mut(parent_id)
+            && let Some(cursor) = base.checked_add(len)
+            && cursor > parent.alloc_cursor
+        {
+            parent.alloc_cursor = cursor;
+        }
         Ok(vmar)
     }
 
-    fn find_free_root_gap(&self, start: u64, len: u64, align: u64) -> Option<(u64, u64)> {
-        self.find_free_root_gap_in_window(start.max(self.root.base), self.root.end(), len, align)
+    fn find_free_gap_in_vmar_with_hint(
+        &self,
+        vmar_id: VmarId,
+        start: u64,
+        len: u64,
+        align: u64,
+    ) -> Option<(u64, u64)> {
+        let vmar = self.vmar(vmar_id)?;
+        self.find_free_gap_in_vmar_window(vmar_id, start.max(vmar.base()), vmar.end(), len, align)
             .or_else(|| {
-                (start > self.root.base)
-                    .then(|| self.find_free_root_gap_in_window(self.root.base, start, len, align))?
+                (start > vmar.base()).then(|| {
+                    self.find_free_gap_in_vmar_window(vmar_id, vmar.base(), start, len, align)
+                })?
             })
     }
 
-    fn find_free_gap_in_vmar(&self, vmar_id: VmarId, len: u64, align: u64) -> Option<u64> {
-        let vmar = self.vmar(vmar_id)?;
-        let occupied = self.occupied_ranges_for_vmar(vmar_id);
-        let mut cursor = vmar.base();
-        for (occupied_base, occupied_end) in occupied {
-            if occupied_end <= cursor {
+    fn occupied_root_ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::with_capacity(self.vmas.len() + self.vmars.len());
+        ranges.extend(self.vmas.iter().map(|vma| (vma.base(), vma.end())));
+        ranges.extend(
+            self.vmars
+                .iter()
+                .map(|record| (record.vmar.base(), record.vmar.end())),
+        );
+        ranges.sort_by_key(|&(base, _)| base);
+
+        let mut merged = Vec::with_capacity(ranges.len());
+        for (base, end) in ranges {
+            if let Some((_, merged_end)) = merged.last_mut()
+                && base <= *merged_end
+            {
+                *merged_end = core::cmp::max(*merged_end, end);
                 continue;
             }
-            if occupied_base >= vmar.end() {
-                break;
-            }
-            let gap_end = core::cmp::min(occupied_base, vmar.end());
-            let candidate = align_up(cursor, align)?;
-            if candidate.checked_add(len)? <= gap_end {
-                return Some(candidate);
-            }
-            cursor = core::cmp::max(cursor, core::cmp::min(occupied_end, vmar.end()));
-            if cursor >= vmar.end() {
-                return None;
-            }
+            merged.push((base, end));
         }
-
-        let candidate = align_up(cursor, align)?;
-        (candidate.checked_add(len)? <= vmar.end()).then_some(candidate)
+        merged
     }
 
-    fn find_free_root_gap_in_window(
+    fn occupied_ranges_for_vmar(&self, vmar_id: VmarId) -> Vec<(u64, u64)> {
+        if vmar_id == self.root.vmar.id {
+            return self.occupied_root_ranges();
+        }
+        let Some(vmar) = self.vmar(vmar_id) else {
+            return Vec::new();
+        };
+        let mut ranges = self
+            .vmas
+            .iter()
+            .filter(|vma| vma.vmar_id == vmar_id)
+            .map(|vma| (vma.base(), vma.end()))
+            .collect::<Vec<_>>();
+        ranges.extend(
+            self.vmars
+                .iter()
+                .filter(|record| {
+                    record.vmar.id != vmar_id
+                        && vmar.contains_range(record.vmar.base(), record.vmar.len())
+                })
+                .map(|record| (record.vmar.base(), record.vmar.end())),
+        );
+        ranges.sort_by_key(|&(base, _)| base);
+        ranges
+    }
+
+    fn root_range_is_free(&self, base: u64, len: u64) -> bool {
+        self.root_contains(base, len)
+            && !self
+                .occupied_root_ranges()
+                .into_iter()
+                .any(|(occupied_base, occupied_end)| {
+                    let occupied_len = occupied_end - occupied_base;
+                    ranges_overlap(occupied_base, occupied_len, base, len)
+                })
+    }
+
+    fn find_free_gap_in_vmar_window(
         &self,
+        vmar_id: VmarId,
         start: u64,
         end: u64,
         len: u64,
@@ -2595,7 +2793,7 @@ impl AddressSpace {
         if start >= end {
             return None;
         }
-        let occupied = self.occupied_root_ranges();
+        let occupied = self.occupied_ranges_for_vmar(vmar_id);
         let mut cursor = start;
         for (occupied_base, occupied_end) in occupied {
             if occupied_end <= cursor {
@@ -2619,52 +2817,60 @@ impl AddressSpace {
         (candidate.checked_add(len)? <= end).then_some((candidate, end))
     }
 
-    fn occupied_root_ranges(&self) -> Vec<(u64, u64)> {
-        let mut ranges = Vec::with_capacity(self.vmas.len() + self.child_vmars.len());
-        ranges.extend(self.vmas.iter().map(|vma| (vma.base(), vma.end())));
-        ranges.extend(
-            self.child_vmars
-                .iter()
-                .map(|vmar| (vmar.base(), vmar.end())),
-        );
-        ranges.sort_by_key(|&(base, _)| base);
-
-        let mut merged = Vec::with_capacity(ranges.len());
-        for (base, end) in ranges {
-            if let Some((_, merged_end)) = merged.last_mut()
-                && base <= *merged_end
-            {
-                *merged_end = core::cmp::max(*merged_end, end);
-                continue;
-            }
-            merged.push((base, end));
-        }
-        merged
-    }
-
-    fn occupied_ranges_for_vmar(&self, vmar_id: VmarId) -> Vec<(u64, u64)> {
-        if vmar_id == self.root.id {
-            return self.occupied_root_ranges();
-        }
-        let mut ranges = self
-            .vmas
-            .iter()
-            .filter(|vma| vma.vmar_id == vmar_id)
-            .map(|vma| (vma.base(), vma.end()))
-            .collect::<Vec<_>>();
-        ranges.sort_by_key(|&(base, _)| base);
-        ranges
-    }
-
-    fn root_range_is_free(&self, base: u64, len: u64) -> bool {
-        self.root_contains(base, len)
-            && !self
-                .occupied_root_ranges()
-                .into_iter()
-                .any(|(occupied_base, occupied_end)| {
+    fn range_is_free_in_vmar(&self, vmar_id: VmarId, base: u64, len: u64) -> bool {
+        let Some(vmar) = self.vmar(vmar_id) else {
+            return false;
+        };
+        vmar.contains_range(base, len)
+            && !self.occupied_ranges_for_vmar(vmar_id).into_iter().any(
+                |(occupied_base, occupied_end)| {
                     let occupied_len = occupied_end - occupied_base;
                     ranges_overlap(occupied_base, occupied_len, base, len)
-                })
+                },
+            )
+    }
+
+    fn mapping_intersects_foreign_vmar(&self, target_vmar_id: VmarId, base: u64, len: u64) -> bool {
+        self.vmars.iter().any(|record| {
+            record.vmar.id != target_vmar_id
+                && !self.is_ancestor_vmar(record.vmar.id, target_vmar_id)
+                && ranges_overlap(record.vmar.base(), record.vmar.len(), base, len)
+        })
+    }
+
+    fn is_ancestor_vmar(&self, candidate_ancestor: VmarId, descendant: VmarId) -> bool {
+        let mut current = self
+            .vmar_record(descendant)
+            .and_then(|record| record.parent_id);
+        while let Some(parent_id) = current {
+            if parent_id == candidate_ancestor {
+                return true;
+            }
+            current = self
+                .vmar_record(parent_id)
+                .and_then(|record| record.parent_id);
+        }
+        false
+    }
+
+    fn collect_vmar_subtree_ids(&self, root_id: VmarId) -> Vec<VmarId> {
+        let mut ids = vec![root_id];
+        let mut cursor = 0;
+        while cursor < ids.len() {
+            let parent_id = ids[cursor];
+            for child in self
+                .vmars
+                .iter()
+                .filter(|record| record.parent_id == Some(parent_id))
+                .map(|record| record.vmar.id)
+            {
+                if !ids.contains(&child) {
+                    ids.push(child);
+                }
+            }
+            cursor += 1;
+        }
+        ids
     }
 
     fn rebind_vmo_frame(
@@ -2933,6 +3139,70 @@ mod tests {
             .map_fixed(
                 &mut frames,
                 child.base(),
+                PAGE_SIZE,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn nested_vmar_allocate_supports_specific_offsets() {
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+
+        let child = space
+            .allocate_subvmar_for_cpu(0, 4 * PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        let grandchild = space
+            .allocate_subvmar(0, child.id(), PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, true)
+            .unwrap();
+
+        assert_eq!(grandchild.base(), child.base() + PAGE_SIZE);
+        assert_eq!(grandchild.len(), PAGE_SIZE);
+        assert!(child.contains_range(grandchild.base(), grandchild.len()));
+    }
+
+    #[test]
+    fn destroy_vmar_recursively_removes_descendants() {
+        let mut frames = FrameTable::new();
+        let frame = frames.register_existing(0x41_1000).unwrap();
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(101))
+            .unwrap();
+        space.bind_vmo_frame(vmo, 0, frame).unwrap();
+
+        let child = space
+            .allocate_subvmar_for_cpu(0, 4 * PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        let grandchild = space
+            .allocate_subvmar(0, child.id(), PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, true)
+            .unwrap();
+        space
+            .map_fixed_in_vmar(
+                &mut frames,
+                grandchild.id(),
+                grandchild.base(),
+                PAGE_SIZE,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+
+        let removed = space.destroy_vmar(&mut frames, child.id()).unwrap();
+        assert_eq!(removed, vec![(grandchild.base(), PAGE_SIZE)]);
+        assert!(space.vmar(child.id()).is_none());
+        assert!(space.vmar(grandchild.id()).is_none());
+        assert!(space.lookup(grandchild.base()).is_none());
+
+        space
+            .map_fixed(
+                &mut frames,
+                grandchild.base(),
                 PAGE_SIZE,
                 vmo,
                 0,
@@ -3744,7 +4014,10 @@ mod tests {
         let allocated = space
             .allocate_subvmar_for_cpu(0, PAGE_SIZE, 2 * PAGE_SIZE)
             .unwrap();
-        assert_eq!(allocated.base(), ROOT_BASE + (2 * PAGE_SIZE));
+        assert_eq!(allocated.base() % (2 * PAGE_SIZE), 0);
+        assert_ne!(allocated.base(), ROOT_BASE);
+        assert!(allocated.base() >= ROOT_BASE + PAGE_SIZE);
+        assert!(allocated.end() <= space.root_vmar().end());
         assert_eq!(allocated.len(), PAGE_SIZE);
     }
 

@@ -159,6 +159,12 @@ struct VmarMappingRequest {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct VmarAllocateRequest {
+    mapping_caps: VmarMappingCaps,
+    specific: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct VmarObject {
     process_id: u64,
     address_space_id: u64,
@@ -1120,7 +1126,7 @@ pub fn object_signal_peer(
     })
 }
 
-/// Map a VMO into a VMAR at an exact offset.
+/// Allocate one child VMAR from an existing parent VMAR.
 #[allow(clippy::too_many_arguments)]
 pub fn vmar_allocate(
     parent_vmar_handle: zx_handle_t,
@@ -1128,10 +1134,7 @@ pub fn vmar_allocate(
     offset: u64,
     len: u64,
 ) -> Result<(zx_handle_t, u64), zx_status_t> {
-    if offset != 0 {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    let mapping_caps = vmar_mapping_caps_from_allocate_options(options)?;
+    let request = vmar_allocate_request_from_options(options, offset)?;
 
     with_state_mut(|state| {
         let resolved_parent =
@@ -1143,13 +1146,15 @@ pub fn vmar_allocate(
         };
 
         require_vmar_control_rights(resolved_parent)?;
-        require_vmar_child_mapping_caps(parent.mapping_caps, mapping_caps)?;
+        require_vmar_child_mapping_caps(parent.mapping_caps, request.mapping_caps)?;
 
         let child = state.kernel.allocate_subvmar(
             parent.address_space_id,
             parent.vmar_id,
+            offset,
             len,
             axle_mm::PAGE_SIZE,
+            request.specific,
         )?;
         let object_id = state.alloc_object_id();
         state.objects.insert(
@@ -1160,7 +1165,7 @@ pub fn vmar_allocate(
                 vmar_id: child.id(),
                 base: child.base(),
                 len: child.len(),
-                mapping_caps,
+                mapping_caps: request.mapping_caps,
             }),
         );
 
@@ -2117,6 +2122,28 @@ fn vmar_mapping_caps_from_allocate_options(options: u32) -> Result<VmarMappingCa
     Ok(VmarMappingCaps {
         max_perms,
         can_map_specific: (options & ZX_VM_CAN_MAP_SPECIFIC) != 0,
+    })
+}
+
+fn vmar_allocate_request_from_options(
+    options: u32,
+    offset: u64,
+) -> Result<VmarAllocateRequest, zx_status_t> {
+    let allowed = ZX_VM_CAN_MAP_READ
+        | ZX_VM_CAN_MAP_WRITE
+        | ZX_VM_CAN_MAP_EXECUTE
+        | ZX_VM_CAN_MAP_SPECIFIC
+        | ZX_VM_SPECIFIC;
+    if (options & !allowed) != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    let specific = (options & ZX_VM_SPECIFIC) != 0;
+    if !specific && offset != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    Ok(VmarAllocateRequest {
+        mapping_caps: vmar_mapping_caps_from_allocate_options(options & !ZX_VM_SPECIFIC)?,
+        specific,
     })
 }
 
