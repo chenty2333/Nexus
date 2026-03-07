@@ -36,10 +36,37 @@ pub(crate) enum PtPageLockKind {
 pub(crate) enum PtMetaKind {
     /// No page-local metadata is attached to this descriptor yet.
     None,
-    /// Reserved for future upper-level uniform metadata.
-    Uniform,
+    /// Entire covered subtree shares one uniform metadata template.
+    Uniform(PtMetaTemplate),
     /// This descriptor is the fixed leaf PT that carries per-page metadata.
     Leaf,
+}
+
+/// Uniform metadata template for one fixed-shape page-table subtree.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PtMetaTemplate {
+    present: bool,
+    writable: bool,
+    user_accessible: bool,
+}
+
+#[allow(dead_code)]
+impl PtMetaTemplate {
+    /// Whether every leaf entry in the covered subtree is present.
+    pub(crate) const fn present(self) -> bool {
+        self.present
+    }
+
+    /// Whether every leaf entry in the covered subtree is writable.
+    pub(crate) const fn writable(self) -> bool {
+        self.writable
+    }
+
+    /// Whether every leaf entry in the covered subtree is user accessible.
+    pub(crate) const fn user_accessible(self) -> bool {
+        self.user_accessible
+    }
 }
 
 /// Fixed-shape descriptor for one concrete x86_64 page-table page.
@@ -151,7 +178,20 @@ impl UserPageTableDescriptors {
             .any(|op| matches!(*op, FlushOp::Page(_)))
         {
             self.user_pt.invalidate_epoch = epoch;
+            self.user_pd.invalidate_epoch = epoch;
         }
+    }
+
+    fn refresh_uniform_metadata(&mut self, user_pt_paddr: u64) {
+        let uniform = uniform_leaf_template(user_pt_paddr);
+        self.user_pd.meta_kind = match uniform {
+            Some(template) => PtMetaKind::Uniform(template),
+            None => PtMetaKind::Leaf,
+        };
+        self.user_pt.meta_kind = match uniform {
+            Some(template) => PtMetaKind::Uniform(template),
+            None => PtMetaKind::Leaf,
+        };
     }
 }
 
@@ -184,7 +224,7 @@ impl UserPageTables {
         user_pd_paddr: u64,
         user_pt_paddr: u64,
     ) -> Arc<Mutex<UserPageTableDescriptors>> {
-        Arc::new(Mutex::new(UserPageTableDescriptors {
+        let mut descs = UserPageTableDescriptors {
             root: PtPageDesc {
                 level: PtPageLevel::Pml4,
                 table_paddr: root_paddr,
@@ -218,7 +258,9 @@ impl UserPageTables {
                 meta_kind: PtMetaKind::Leaf,
             },
             next_invalidate_epoch: 1,
-        }))
+        };
+        descs.refresh_uniform_metadata(user_pt_paddr);
+        Arc::new(Mutex::new(descs))
     }
 
     /// Bind the bootstrap address space to the already-active PVH root and static user tables.
@@ -414,7 +456,11 @@ impl PageTableLock for LockedUserPageTable {
     }
 
     fn commit(self, shootdown: ShootdownBatch) -> Result<(), PageTableError> {
-        self.tables.descs.lock().record_shootdown(&shootdown);
+        {
+            let mut descs = self.tables.descs.lock();
+            descs.record_shootdown(&shootdown);
+            descs.refresh_uniform_metadata(self.tables.user_pt_paddr);
+        }
         if !self.tables.is_active() {
             return Ok(());
         }
@@ -454,6 +500,25 @@ impl PageTableEntryAccessor {
 
 fn frame(paddr: u64) -> Result<PhysFrame<Size4KiB>, PageTableError> {
     PhysFrame::from_start_address(PhysAddr::new(paddr)).map_err(|_| PageTableError::InvalidArgs)
+}
+
+fn uniform_leaf_template(user_pt_paddr: u64) -> Option<PtMetaTemplate> {
+    let table = table(user_pt_paddr);
+    let mut entries = table.iter();
+    let first = entries.next()?;
+    let template = entry_meta_template(first);
+    entries
+        .all(|entry| entry_meta_template(entry) == template)
+        .then_some(template)
+}
+
+fn entry_meta_template(entry: &PageTableEntry) -> PtMetaTemplate {
+    let flags = entry.flags();
+    PtMetaTemplate {
+        present: flags.contains(PageTableFlags::PRESENT),
+        writable: flags.contains(PageTableFlags::WRITABLE),
+        user_accessible: flags.contains(PageTableFlags::USER_ACCESSIBLE),
+    }
 }
 
 fn user_page_index(va: u64) -> Result<usize, PageTableError> {

@@ -657,6 +657,10 @@ impl AddressSpace {
             crate::userspace::USER_PAGE_BYTES,
         )
         .expect("bootstrap stack COW arm must succeed");
+        debug_assert!(matches!(
+            page_tables.descriptors().user_pt().meta_kind(),
+            crate::page_table::PtMetaKind::Uniform(template) if !template.present()
+        ));
 
         Self { vm, page_tables }
     }
@@ -1401,6 +1405,10 @@ impl Kernel {
             page_tables: crate::page_table::UserPageTables::clone_current_kernel_template()
                 .map_err(map_page_table_error)?,
         };
+        debug_assert!(matches!(
+            address_space.page_tables.descriptors().user_pt().meta_kind(),
+            crate::page_table::PtMetaKind::Uniform(template) if !template.present()
+        ));
         let root_vmar = address_space.root_vmar();
         self.address_spaces.insert(address_space_id, address_space);
 

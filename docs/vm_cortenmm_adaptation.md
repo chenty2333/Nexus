@@ -17,6 +17,9 @@ external VM model.
 - The x86_64 backend now also carries a fixed-shape descriptor set for
   `root/pdpt/user_pd/user_pt`; only the leaf PT currently carries page-local
   metadata, and upper-level uniform metadata remains deferred.
+- The fixed `user_pd/user_pt` descriptors now classify the current 2 MiB user
+  subtree as either `Uniform(template)` or `Leaf`, which is the first concrete
+  upper-level uniform metadata hook for later generalization.
 - Axle now has stable coarse mapping identity through `MapId` and `MapRec`.
   These records connect `VMAR` control metadata to page-local state without
   making `VMA` the long-term hot-path truth source.
