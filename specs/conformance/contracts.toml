@@ -139,3 +139,8 @@ description = "Bootstrap worker threads should wake wait_one and port_wait throu
 id = "should.process.create_child_thread_bootstrap"
 level = "should"
 description = "Bootstrap process_create should yield a real child address space that can map shared VMOs and run a child thread"
+
+[[contracts]]
+id = "should.vmar.far_range_bootstrap"
+level = "should"
+description = "Bootstrap VMAR mapping should support mappings far beyond the original 2 MiB bridge, including addresses that require a new top-level walk path"

@@ -311,10 +311,54 @@ movabs $0x1000, %r9
 lea 0x6e0(%rbx), %rax
 sub $8, %rsp
 mov %rax, (%rsp)
-movabs $10, %rax
-int $0x80
+	movabs $10, %rax
+	int $0x80
 	add $8, %rsp
 	mov %rax, 8*76(%rbx)
+
+// vmo_create(far-range mapping)
+lea 0x6f0(%rbx), %rdx
+movabs $0x1000, %rdi
+xorl %esi, %esi
+movabs $9, %rax
+int $0x80
+mov %rax, 8*354(%rbx)
+
+// vmar_map(far-range, crosses old bootstrap window and PML4 boundary)
+mov 8*62(%rbx), %rdi
+movl $0x403, %esi
+movabs $0x0000008000010000, %rdx
+mov 0x6f0(%rbx), %r10
+xor %r8, %r8
+movabs $0x1000, %r9
+lea 0x6f8(%rbx), %rax
+sub $8, %rsp
+mov %rax, (%rsp)
+movabs $10, %rax
+int $0x80
+add $8, %rsp
+mov %rax, 8*355(%rbx)
+mov 0x6f8(%rbx), %rax
+mov %rax, 8*356(%rbx)
+
+// Write/read through the far mapped page.
+movabs $0x0000008100010000, %r13
+movabs $0x8877665544332211, %rax
+mov %rax, (%r13)
+mov (%r13), %rcx
+movq $0, 8*357(%rbx)
+cmp %rax, %rcx
+jne vmar_far_write_check_done
+movq $1, 8*357(%rbx)
+vmar_far_write_check_done:
+
+// vmar_unmap(far-range)
+mov 8*62(%rbx), %rdi
+movabs $0x0000008100010000, %rsi
+movabs $0x1000, %rdx
+movabs $11, %rax
+int $0x80
+mov %rax, 8*358(%rbx)
 
 	// channel_create(bad opts=1)
 	lea 0x700(%rbx), %rsi

@@ -24,6 +24,9 @@ external VM model.
   single fixed `USER_PT` leaf. The logical root VMAR spans the lower canonical
   user half above `USER_CODE_VA`, while the original 2 MiB bootstrap `USER_PT`
   remains only as an early wired-in bridge.
+- Bootstrap conformance now covers a far-range VMAR mapping that lands well
+  beyond the old 2 MiB bridge and crosses into a newly allocated upper page
+  table path.
 - TLB invalidation is now lazy across CPUs: page-table commits still flush the
   local active CPU immediately, but remote CPUs observe descriptor epochs and
   catch up at kernel-return / scheduling boundaries instead of taking an eager
