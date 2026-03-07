@@ -64,8 +64,12 @@ What is intentionally deferred for later work:
 - per-PT-page descriptors
 - upper-level uniform metadata
 - lazy TLB shootdown
-- per-core VA allocation
 - a higher-efficiency reverse-mapping structure than the current anchor set
+
+Per-core VA allocation is now present in `axle-mm` as an internal root-VMAR
+control-plane allocator. It hands out child-VMAR reservations through CPU-local
+magazine hints without changing current syscall behavior, which is still
+specific-address mapping only.
 
 So the current state is: the correctness-oriented migration is largely in
 place, while the CortenMM-style performance package is still deferred.

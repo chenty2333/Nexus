@@ -1,18 +1,19 @@
 #![no_main]
 
-use axle_mm::{AddressSpace, FrameTable, GlobalVmoId, MappingPerms, PAGE_SIZE, VmoKind};
+use axle_mm::{AddressSpace, FrameTable, GlobalVmoId, MappingPerms, PAGE_SIZE, VmarId, VmoKind};
 use libfuzzer_sys::fuzz_target;
 
 const ROOT_BASE: u64 = 0x1_0000_0000;
-const ROOT_LEN: u64 = 16 * PAGE_SIZE;
+const ROOT_LEN: u64 = 0x40_0000;
 
 fuzz_target!(|data: &[u8]| {
     let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
     let mut frames = FrameTable::new();
     let mut vmos = [None; 8];
+    let mut vmars: [Option<VmarId>; 8] = [None; 8];
 
     for chunk in data.chunks(8) {
-        match chunk.first().copied().unwrap_or(0) % 9 {
+        match chunk.first().copied().unwrap_or(0) % 11 {
             0 => {
                 let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmos.len() as u8);
                 let pages = u64::from((chunk.get(2).copied().unwrap_or(0) % 4) + 1);
@@ -88,6 +89,24 @@ fuzz_target!(|data: &[u8]| {
                     frame_id,
                 );
             }
+            8 => {
+                let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmars.len() as u8);
+                let cpu_id = usize::from(chunk.get(2).copied().unwrap_or(0) % 4);
+                let pages = u64::from((chunk.get(3).copied().unwrap_or(0) % 4) + 1);
+                let align_pages = 1_u64 << u64::from(chunk.get(4).copied().unwrap_or(0) % 3);
+                vmars[slot] = space
+                    .allocate_subvmar_for_cpu(cpu_id, pages * PAGE_SIZE, align_pages * PAGE_SIZE)
+                    .ok()
+                    .map(|vmar| vmar.id());
+            }
+            9 => {
+                let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmars.len() as u8);
+                let Some(vmar_id) = vmars[slot] else {
+                    continue;
+                };
+                let _ = space.destroy_vmar(vmar_id);
+                vmars[slot] = None;
+            }
             _ => {
                 let frame_addr = 0x2000_0000 + (u64::from(chunk.get(1).copied().unwrap_or(0)) * PAGE_SIZE);
                 if let Ok(frame_id) = frames.register_existing(frame_addr) {
@@ -100,6 +119,10 @@ fuzz_target!(|data: &[u8]| {
 
     let vmas = space.vmas();
     for pair in vmas.windows(2) {
+        assert!(pair[0].base() + pair[0].len() <= pair[1].base());
+    }
+    let vmars = space.child_vmars();
+    for pair in vmars.windows(2) {
         assert!(pair[0].base() + pair[0].len() <= pair[1].base());
     }
 });

@@ -2587,10 +2587,11 @@ fn map_address_space_error(err: AddressSpaceError) -> zx_status_t {
     match err {
         AddressSpaceError::InvalidArgs => ZX_ERR_INVALID_ARGS,
         AddressSpaceError::OutOfRange => ZX_ERR_OUT_OF_RANGE,
-        AddressSpaceError::InvalidVmo => ZX_ERR_NOT_FOUND,
+        AddressSpaceError::InvalidVmo | AddressSpaceError::InvalidVmar => ZX_ERR_NOT_FOUND,
         AddressSpaceError::InvalidFrame => ZX_ERR_BAD_STATE,
         AddressSpaceError::AlreadyBound | AddressSpaceError::Overlap => ZX_ERR_ALREADY_EXISTS,
         AddressSpaceError::NotFound => ZX_ERR_NOT_FOUND,
+        AddressSpaceError::Busy => ZX_ERR_BAD_STATE,
         AddressSpaceError::PermissionIncrease => ZX_ERR_ACCESS_DENIED,
         AddressSpaceError::FrameTable(_) => ZX_ERR_NO_MEMORY,
         AddressSpaceError::NotCopyOnWrite => ZX_ERR_BAD_STATE,
