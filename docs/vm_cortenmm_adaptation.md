@@ -1,8 +1,5 @@
 # VM CortenMM Adaptation
 
-This note supplements `references/Axle_v0.3.md` and
-`references/AxleKernel_Roadmap_v0.3.md`.
-
 Axle is borrowing CortenMM's internal structure, not its full end-state.
 The goal is to make page-table updates, page-local metadata, fault handling,
 COW, and page-loan share one coherent source of truth without changing Axle's
@@ -36,6 +33,9 @@ external VM model.
   uses it for `remap-fill -> COW split` telemetry and validation. It is useful
   and correct for the current bootstrap VM, but it is not yet the final
   high-efficiency reverse-mapping design.
+- The kernel now has a direct internal `frame_mappings(frame_id)` snapshot
+  helper, so diagnostics and invariants no longer need to manually rebuild
+  `anchor -> address_space -> mapping` resolution at each call site.
 
 What is intentionally deferred for later work:
 

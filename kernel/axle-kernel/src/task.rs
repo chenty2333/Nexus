@@ -359,6 +359,14 @@ impl LoanedUserPages {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FrameMappingSnapshot {
+    address_space_id: AddressSpaceId,
+    anchor: ReverseMapAnchor,
+    page_base: u64,
+    lookup: VmaLookup,
+}
+
 type BootstrapTxCursor = TxCursor<crate::page_table::LockedBootstrapUserPageTable>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1208,6 +1216,8 @@ impl Kernel {
                 return Ok(false);
             }
         }
+        let replaced_receiver_frames =
+            self.mapped_frames_in_range(receiver_address_space_id, dst_base, len)?;
         let sender_range = PageRange::new(loaned.base(), len).map_err(map_page_table_error)?;
         let receiver_range = PageRange::new(dst_base, len).map_err(map_page_table_error)?;
         let mut loan_tx = self.lock_channel_loan_tx(
@@ -1238,6 +1248,14 @@ impl Kernel {
                 self.frame_mapping_count(source_frame_id),
             );
         }
+        self.validate_frame_mapping_invariants_for(
+            loaned.pages(),
+            "try_remap_loaned_channel_read/source",
+        );
+        self.validate_frame_mapping_invariants_for(
+            &replaced_receiver_frames,
+            "try_remap_loaned_channel_read/receiver",
+        );
         Ok(true)
     }
 
@@ -1632,6 +1650,7 @@ impl Kernel {
         addr: u64,
         len: u64,
     ) -> Result<(), zx_status_t> {
+        let affected_frames = self.mapped_frames_in_range(address_space_id, addr, len)?;
         let address_space = self
             .address_spaces
             .get_mut(&address_space_id)
@@ -1642,7 +1661,9 @@ impl Kernel {
         address_space
             .unmap(&mut self.frames, addr, len)
             .map_err(map_address_space_error)?;
-        self.clear_mapping_pages(address_space_id, addr, len)
+        self.clear_mapping_pages(address_space_id, addr, len)?;
+        self.validate_frame_mapping_invariants_for(&affected_frames, "unmap_current_vmar");
+        Ok(())
     }
 
     pub(crate) fn protect_current_vmar(
@@ -1965,6 +1986,10 @@ impl Kernel {
             self.frame_mapping_count(resolved.old_frame_id()),
             self.frame_mapping_count(resolved.new_frame_id()),
         );
+        self.validate_frame_mapping_invariants_for(
+            &[resolved.old_frame_id(), resolved.new_frame_id()],
+            "resolve_copy_on_write_page",
+        );
         Ok(())
     }
 
@@ -2048,10 +2073,33 @@ impl Kernel {
         Ok(())
     }
 
-    fn resolve_frame_mappings(
+    fn mapped_frames_in_range(
         &self,
-        frame_id: FrameId,
-    ) -> Vec<(AddressSpaceId, ReverseMapAnchor, u64, VmaLookup)> {
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<Vec<FrameId>, zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let mut frames = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            let Some(frame_id) = address_space
+                .lookup_user_mapping(va, 1)
+                .and_then(|lookup| lookup.frame_id())
+            else {
+                continue;
+            };
+            push_unique_frame_id(&mut frames, frame_id);
+        }
+        Ok(frames)
+    }
+
+    fn frame_mappings(&self, frame_id: FrameId) -> Vec<FrameMappingSnapshot> {
         let Some(anchors) = self.frames.rmap_anchors(frame_id) else {
             return Vec::new();
         };
@@ -2068,14 +2116,66 @@ impl Kernel {
                 continue;
             };
             if lookup.frame_id() == Some(frame_id) {
-                mappings.push((address_space_id, anchor, page_base, lookup));
+                mappings.push(FrameMappingSnapshot {
+                    address_space_id,
+                    anchor,
+                    page_base,
+                    lookup,
+                });
             }
         }
         mappings
     }
 
     fn frame_mapping_count(&self, frame_id: FrameId) -> u64 {
-        u64::try_from(self.resolve_frame_mappings(frame_id).len()).unwrap_or(u64::MAX)
+        u64::try_from(self.frame_mappings(frame_id).len()).unwrap_or(u64::MAX)
+    }
+
+    fn validate_frame_mapping_invariants(&self, frame_id: FrameId, context: &str) {
+        let Some(state) = self.frames.state(frame_id) else {
+            return;
+        };
+        let mappings = self.frame_mappings(frame_id);
+        let resolved_count = mappings.len() as u32;
+        if state.map_count() == resolved_count && state.rmap_anchor_count() == resolved_count {
+            return;
+        }
+
+        crate::kprintln!(
+            "kernel: frame mapping invariant mismatch (context={}, frame={:#x}, map_count={}, anchor_count={}, resolved_count={}, loan_count={}, pin_count={})",
+            context,
+            frame_id.raw(),
+            state.map_count(),
+            state.rmap_anchor_count(),
+            resolved_count,
+            state.loan_count(),
+            state.pin_count(),
+        );
+        for mapping in &mappings {
+            crate::kprintln!(
+                "kernel:   mapping aspace={} map={} va={:#x} vmo_offset={:#x} perms={:?} cow={} anchor_page={} anchor_map={}",
+                mapping.address_space_id,
+                mapping.lookup.map_id().raw(),
+                mapping.page_base,
+                mapping.lookup.vmo_offset(),
+                mapping.lookup.perms(),
+                mapping.lookup.is_copy_on_write(),
+                mapping.anchor.page_delta(),
+                mapping.anchor.map_id().raw(),
+            );
+        }
+        debug_assert_eq!(state.map_count(), resolved_count);
+        debug_assert_eq!(state.rmap_anchor_count(), resolved_count);
+    }
+
+    fn validate_frame_mapping_invariants_for(&self, frame_ids: &[FrameId], context: &str) {
+        let mut unique = Vec::with_capacity(frame_ids.len());
+        for &frame_id in frame_ids {
+            push_unique_frame_id(&mut unique, frame_id);
+        }
+        for frame_id in unique {
+            self.validate_frame_mapping_invariants(frame_id, context);
+        }
     }
 
     fn release_loaned_pages_inner(&mut self, pages: &[FrameId]) {
@@ -2083,6 +2183,13 @@ impl Kernel {
             let _ = self.frames.dec_loan(frame_id);
             let _ = self.frames.unpin(frame_id);
         }
+        self.validate_frame_mapping_invariants_for(pages, "release_loaned_pages_inner");
+    }
+}
+
+fn push_unique_frame_id(frames: &mut Vec<FrameId>, frame_id: FrameId) {
+    if !frames.contains(&frame_id) {
+        frames.push(frame_id);
     }
 }
 
