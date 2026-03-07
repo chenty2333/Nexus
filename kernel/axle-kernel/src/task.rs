@@ -661,7 +661,10 @@ impl AddressSpace {
         )
         .expect("bootstrap stack COW arm must succeed");
         debug_assert!(matches!(
-            page_tables.descriptors().user_pt().meta_kind(),
+            page_tables
+                .descriptor(crate::page_table::PtPageLevel::Pt, crate::userspace::USER_CODE_VA)
+                .expect("bootstrap user pt descriptor must exist")
+                .meta_kind(),
             crate::page_table::PtMetaKind::Uniform(template) if !template.present()
         ));
 
@@ -710,11 +713,7 @@ impl AddressSpace {
     }
 
     fn current_invalidate_epoch(&self) -> u64 {
-        let descs = self.page_tables.descriptors();
-        core::cmp::max(
-            descs.user_pd().invalidate_epoch(),
-            descs.user_pt().invalidate_epoch(),
-        )
+        self.page_tables.max_invalidate_epoch()
     }
 
     fn note_cpu_active(&mut self, cpu_id: usize) {
@@ -1456,7 +1455,11 @@ impl Kernel {
             observed_tlb_epoch: [0; MAX_TRACKED_TLB_CPUS],
         };
         debug_assert!(matches!(
-            address_space.page_tables.descriptors().user_pt().meta_kind(),
+            address_space
+                .page_tables
+                .descriptor(crate::page_table::PtPageLevel::Pt, crate::userspace::USER_CODE_VA)
+                .expect("child user pt descriptor must exist")
+                .meta_kind(),
             crate::page_table::PtMetaKind::Uniform(template) if !template.present()
         ));
         let root_vmar = address_space.root_vmar();

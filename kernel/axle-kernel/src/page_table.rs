@@ -11,7 +11,7 @@ use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{PageTable as X86PageTable, PageTableFlags, PhysFrame, Size4KiB};
 
 /// Fixed page-table level for one x86_64 page-table page descriptor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PtPageLevel {
     /// PML4 root page.
     Pml4,
@@ -21,6 +21,26 @@ pub(crate) enum PtPageLevel {
     Pd,
     /// Fixed user-window PT leaf page.
     Pt,
+}
+
+impl PtPageLevel {
+    const fn child_level(self) -> Option<Self> {
+        match self {
+            Self::Pml4 => Some(Self::Pdpt),
+            Self::Pdpt => Some(Self::Pd),
+            Self::Pd => Some(Self::Pt),
+            Self::Pt => None,
+        }
+    }
+
+    const fn child_coverage_bytes(self) -> u64 {
+        match self {
+            Self::Pml4 => 1_u64 << 39,
+            Self::Pdpt => 1_u64 << 30,
+            Self::Pd => 1_u64 << 21,
+            Self::Pt => axle_page_table::PAGE_SIZE,
+        }
+    }
 }
 
 /// Current lock discipline for one page-table descriptor.
@@ -148,21 +168,29 @@ impl UserPageTableDescSet {
 
 #[allow(dead_code)]
 #[derive(Debug)]
-struct UserPageTableDescriptors {
-    root: PtPageDesc,
-    pdpt: PtPageDesc,
-    user_pd: PtPageDesc,
-    user_pt: PtPageDesc,
+struct PtDescriptorStore {
+    by_key: alloc::collections::BTreeMap<(PtPageLevel, u64), PtPageDesc>,
+    by_table_paddr: alloc::collections::BTreeMap<u64, (PtPageLevel, u64)>,
     next_invalidate_epoch: u64,
 }
 
-impl UserPageTableDescriptors {
+impl PtDescriptorStore {
     fn snapshot(&self) -> UserPageTableDescSet {
+        let user_pd_base = align_down_level(crate::userspace::USER_CODE_VA, PtPageLevel::Pd);
+        let user_pt_base = align_down_level(crate::userspace::USER_CODE_VA, PtPageLevel::Pt);
         UserPageTableDescSet {
-            root: self.root,
-            pdpt: self.pdpt,
-            user_pd: self.user_pd,
-            user_pt: self.user_pt,
+            root: self
+                .descriptor(PtPageLevel::Pml4, 0)
+                .expect("root descriptor must exist"),
+            pdpt: self
+                .descriptor(PtPageLevel::Pdpt, 0)
+                .expect("bootstrap pdpt descriptor must exist"),
+            user_pd: self
+                .descriptor(PtPageLevel::Pd, user_pd_base)
+                .expect("bootstrap user PD descriptor must exist"),
+            user_pt: self
+                .descriptor(PtPageLevel::Pt, user_pt_base)
+                .expect("bootstrap user PT descriptor must exist"),
         }
     }
 
@@ -172,26 +200,99 @@ impl UserPageTableDescriptors {
         }
         let epoch = self.next_invalidate_epoch;
         self.next_invalidate_epoch = self.next_invalidate_epoch.wrapping_add(1);
-        if shootdown
-            .ops()
-            .iter()
-            .any(|op| matches!(*op, FlushOp::Page(_)))
-        {
-            self.user_pt.invalidate_epoch = epoch;
-            self.user_pd.invalidate_epoch = epoch;
+        for op in shootdown.ops() {
+            match *op {
+                FlushOp::Page(va) => {
+                    let pt_base = align_down_level(va, PtPageLevel::Pt);
+                    let pd_base = align_down_level(va, PtPageLevel::Pd);
+                    self.update_invalidate_epoch(PtPageLevel::Pt, pt_base, epoch);
+                    self.update_invalidate_epoch(PtPageLevel::Pd, pd_base, epoch);
+                }
+            }
         }
     }
 
-    fn refresh_uniform_metadata(&mut self, user_pt_paddr: u64) {
-        let uniform = uniform_leaf_template(user_pt_paddr);
-        self.user_pd.meta_kind = match uniform {
+    fn upsert_descriptor(&mut self, desc: PtPageDesc) {
+        self.by_key.insert((desc.level, desc.va_base), desc);
+        self.by_table_paddr
+            .insert(desc.table_paddr, (desc.level, desc.va_base));
+    }
+
+    fn descriptor(&self, level: PtPageLevel, va_base: u64) -> Option<PtPageDesc> {
+        self.by_key.get(&(level, va_base)).copied()
+    }
+
+    fn descriptor_by_table_paddr(&self, table_paddr: u64) -> Option<PtPageDesc> {
+        let &(level, va_base) = self.by_table_paddr.get(&table_paddr)?;
+        self.descriptor(level, va_base)
+    }
+
+    fn update_invalidate_epoch(&mut self, level: PtPageLevel, va_base: u64, epoch: u64) {
+        if let Some(desc) = self.by_key.get_mut(&(level, va_base)) {
+            desc.invalidate_epoch = epoch;
+        }
+    }
+
+    fn max_invalidate_epoch(&self) -> u64 {
+        self.by_key
+            .values()
+            .map(|desc| desc.invalidate_epoch)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn refresh_uniform_metadata_for_leaf(&mut self, leaf_table_paddr: u64) {
+        let Some(leaf_desc) = self.descriptor_by_table_paddr(leaf_table_paddr) else {
+            return;
+        };
+        let Some(level) = Some(leaf_desc.level) else {
+            return;
+        };
+        if level != PtPageLevel::Pt {
+            return;
+        }
+        let uniform = uniform_leaf_template(leaf_table_paddr);
+        let mut leaf_updated = leaf_desc;
+        leaf_updated.meta_kind = match uniform {
             Some(template) => PtMetaKind::Uniform(template),
             None => PtMetaKind::Leaf,
         };
-        self.user_pt.meta_kind = match uniform {
+        self.upsert_descriptor(leaf_updated);
+
+        let parent_va_base = align_down_level(leaf_desc.va_base, PtPageLevel::Pd);
+        let mut parent = match self.descriptor(PtPageLevel::Pd, parent_va_base) {
+            Some(parent) => parent,
+            None => return,
+        };
+        parent.meta_kind = match self.uniform_template_for_pd(parent_va_base) {
             Some(template) => PtMetaKind::Uniform(template),
             None => PtMetaKind::Leaf,
         };
+        self.upsert_descriptor(parent);
+    }
+
+    fn uniform_template_for_pd(&self, pd_va_base: u64) -> Option<PtMetaTemplate> {
+        let mut template: Option<PtMetaTemplate> = None;
+        for slot in 0..512_u64 {
+            let child_va_base = pd_va_base + slot * PtPageLevel::Pd.child_coverage_bytes();
+            let child_meta = match self.descriptor(PtPageLevel::Pt, child_va_base) {
+                Some(desc) => match desc.meta_kind {
+                    PtMetaKind::Uniform(template) => template,
+                    _ => return None,
+                },
+                None => PtMetaTemplate {
+                    present: false,
+                    writable: false,
+                    user_accessible: true,
+                },
+            };
+            match template {
+                Some(current) if current != child_meta => return None,
+                Some(_) => {}
+                None => template = Some(child_meta),
+            }
+        }
+        template
     }
 }
 
@@ -202,7 +303,7 @@ pub(crate) struct UserPageTables {
     pdpt_paddr: u64,
     user_pd_paddr: u64,
     user_pt_paddr: u64,
-    descs: Arc<Mutex<UserPageTableDescriptors>>,
+    descs: Arc<Mutex<PtDescriptorStore>>,
 }
 
 /// Locked transaction view over one concrete x86_64 user page-table set.
@@ -231,43 +332,45 @@ impl UserPageTables {
         pdpt_paddr: u64,
         user_pd_paddr: u64,
         user_pt_paddr: u64,
-    ) -> Arc<Mutex<UserPageTableDescriptors>> {
-        let mut descs = UserPageTableDescriptors {
-            root: PtPageDesc {
-                level: PtPageLevel::Pml4,
-                table_paddr: root_paddr,
-                va_base: 0,
-                lock_kind: PtPageLockKind::TxSerialized,
-                invalidate_epoch: 0,
-                meta_kind: PtMetaKind::None,
-            },
-            pdpt: PtPageDesc {
-                level: PtPageLevel::Pdpt,
-                table_paddr: pdpt_paddr,
-                va_base: 0,
-                lock_kind: PtPageLockKind::TxSerialized,
-                invalidate_epoch: 0,
-                meta_kind: PtMetaKind::None,
-            },
-            user_pd: PtPageDesc {
-                level: PtPageLevel::Pd,
-                table_paddr: user_pd_paddr,
-                va_base: crate::userspace::USER_CODE_VA,
-                lock_kind: PtPageLockKind::TxSerialized,
-                invalidate_epoch: 0,
-                meta_kind: PtMetaKind::None,
-            },
-            user_pt: PtPageDesc {
-                level: PtPageLevel::Pt,
-                table_paddr: user_pt_paddr,
-                va_base: crate::userspace::USER_CODE_VA,
-                lock_kind: PtPageLockKind::TxSerialized,
-                invalidate_epoch: 0,
-                meta_kind: PtMetaKind::Leaf,
-            },
+    ) -> Arc<Mutex<PtDescriptorStore>> {
+        let mut descs = PtDescriptorStore {
+            by_key: alloc::collections::BTreeMap::new(),
+            by_table_paddr: alloc::collections::BTreeMap::new(),
             next_invalidate_epoch: 1,
         };
-        descs.refresh_uniform_metadata(user_pt_paddr);
+        descs.upsert_descriptor(PtPageDesc {
+            level: PtPageLevel::Pml4,
+            table_paddr: root_paddr,
+            va_base: 0,
+            lock_kind: PtPageLockKind::TxSerialized,
+            invalidate_epoch: 0,
+            meta_kind: PtMetaKind::None,
+        });
+        descs.upsert_descriptor(PtPageDesc {
+            level: PtPageLevel::Pdpt,
+            table_paddr: pdpt_paddr,
+            va_base: 0,
+            lock_kind: PtPageLockKind::TxSerialized,
+            invalidate_epoch: 0,
+            meta_kind: PtMetaKind::None,
+        });
+        descs.upsert_descriptor(PtPageDesc {
+            level: PtPageLevel::Pd,
+            table_paddr: user_pd_paddr,
+            va_base: align_down_level(crate::userspace::USER_CODE_VA, PtPageLevel::Pd),
+            lock_kind: PtPageLockKind::TxSerialized,
+            invalidate_epoch: 0,
+            meta_kind: PtMetaKind::Leaf,
+        });
+        descs.upsert_descriptor(PtPageDesc {
+            level: PtPageLevel::Pt,
+            table_paddr: user_pt_paddr,
+            va_base: align_down_level(crate::userspace::USER_CODE_VA, PtPageLevel::Pt),
+            lock_kind: PtPageLockKind::TxSerialized,
+            invalidate_epoch: 0,
+            meta_kind: PtMetaKind::Leaf,
+        });
+        descs.refresh_uniform_metadata_for_leaf(user_pt_paddr);
         Arc::new(Mutex::new(descs))
     }
 
@@ -362,6 +465,14 @@ impl UserPageTables {
         self.descriptor_set()
     }
 
+    pub(crate) fn descriptor(&self, level: PtPageLevel, va_base: u64) -> Option<PtPageDesc> {
+        self.descs.lock().descriptor(level, va_base)
+    }
+
+    pub(crate) fn max_invalidate_epoch(&self) -> u64 {
+        self.descs.lock().max_invalidate_epoch()
+    }
+
     pub(crate) fn activate(self) -> Result<(), PageTableError> {
         let frame = frame(self.root_paddr)?;
         unsafe {
@@ -379,12 +490,18 @@ impl UserPageTables {
 
     fn ensure_page_table_page(
         &mut self,
+        parent_level: PtPageLevel,
         parent_table_paddr: u64,
+        parent_va_base: u64,
         index: usize,
-    ) -> Result<u64, PageTableError> {
+    ) -> Result<(u64, u64), PageTableError> {
+        let child_level = parent_level
+            .child_level()
+            .ok_or(PageTableError::InvalidArgs)?;
+        let child_va_base = parent_va_base + index as u64 * parent_level.child_coverage_bytes();
         let entry = &mut table_mut(parent_table_paddr)[index];
         if entry.flags().contains(PageTableFlags::PRESENT) {
-            return Ok(entry.addr().as_u64());
+            return Ok((entry.addr().as_u64(), child_va_base));
         }
 
         let child_paddr =
@@ -392,7 +509,23 @@ impl UserPageTables {
         let flags =
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         entry.set_addr(PhysAddr::new(child_paddr), flags);
-        Ok(child_paddr)
+        self.descs.lock().upsert_descriptor(PtPageDesc {
+            level: child_level,
+            table_paddr: child_paddr,
+            va_base: child_va_base,
+            lock_kind: PtPageLockKind::TxSerialized,
+            invalidate_epoch: 0,
+            meta_kind: if child_level == PtPageLevel::Pt {
+                PtMetaKind::Uniform(PtMetaTemplate {
+                    present: false,
+                    writable: false,
+                    user_accessible: true,
+                })
+            } else {
+                PtMetaKind::None
+            },
+        });
+        Ok((child_paddr, child_va_base))
     }
 
     fn leaf_table_paddr(&self, va: u64) -> Result<Option<u64>, PageTableError> {
@@ -415,9 +548,12 @@ impl UserPageTables {
     fn ensure_leaf_table_paddr(&mut self, va: u64) -> Result<u64, PageTableError> {
         let indices = user_page_indices(va)?;
         let root_paddr = self.root_paddr;
-        let pdpt_paddr = self.ensure_page_table_page(root_paddr, indices.pml4)?;
-        let pd_paddr = self.ensure_page_table_page(pdpt_paddr, indices.pdpt)?;
-        let pt_paddr = self.ensure_page_table_page(pd_paddr, indices.pd)?;
+        let (pdpt_paddr, pdpt_va_base) =
+            self.ensure_page_table_page(PtPageLevel::Pml4, root_paddr, 0, indices.pml4)?;
+        let (pd_paddr, pd_va_base) =
+            self.ensure_page_table_page(PtPageLevel::Pdpt, pdpt_paddr, pdpt_va_base, indices.pdpt)?;
+        let (pt_paddr, _) =
+            self.ensure_page_table_page(PtPageLevel::Pd, pd_paddr, pd_va_base, indices.pd)?;
         if pd_paddr == self.user_pd_paddr && indices.pd == 0 {
             self.user_pt_paddr = pt_paddr;
         }
@@ -526,7 +662,21 @@ impl PageTableLock for LockedUserPageTable {
         {
             let mut descs = self.tables.descs.lock();
             descs.record_shootdown(&shootdown);
-            descs.refresh_uniform_metadata(self.tables.user_pt_paddr);
+            let mut refreshed_leafs = alloc::collections::BTreeSet::new();
+            for op in shootdown.ops() {
+                match *op {
+                    FlushOp::Page(va) => {
+                        if let Some(pt_desc) =
+                            descs.descriptor(PtPageLevel::Pt, align_down_level(va, PtPageLevel::Pt))
+                        {
+                            refreshed_leafs.insert(pt_desc.table_paddr());
+                        }
+                    }
+                }
+            }
+            for leaf_table_paddr in refreshed_leafs {
+                descs.refresh_uniform_metadata_for_leaf(leaf_table_paddr);
+            }
         }
         if !self.tables.is_active() {
             return Ok(());
@@ -586,6 +736,11 @@ fn entry_meta_template(entry: &PageTableEntry) -> PtMetaTemplate {
         writable: flags.contains(PageTableFlags::WRITABLE),
         user_accessible: flags.contains(PageTableFlags::USER_ACCESSIBLE),
     }
+}
+
+fn align_down_level(va: u64, level: PtPageLevel) -> u64 {
+    let coverage = level.child_coverage_bytes();
+    va & !(coverage - 1)
 }
 
 fn user_page_indices(va: u64) -> Result<PageWalkIndices, PageTableError> {
