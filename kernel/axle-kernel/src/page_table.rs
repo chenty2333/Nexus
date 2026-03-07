@@ -1,4 +1,6 @@
-use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, PageTableLock};
+use axle_page_table::{
+    FlushOp, PageMapping, PageRange, PageTable, PageTableError, PageTableLock, ShootdownBatch,
+};
 use x86_64::PhysAddr;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::page_table::PageTableEntry;
@@ -203,14 +205,15 @@ impl PageTableLock for LockedUserPageTable {
         Ok(())
     }
 
-    fn flush_page(&mut self, va: u64) -> Result<(), PageTableError> {
-        if self.tables.is_active() {
-            crate::arch::tlb::flush_page_global(va);
+    fn commit(self, shootdown: ShootdownBatch) -> Result<(), PageTableError> {
+        if !self.tables.is_active() {
+            return Ok(());
         }
-        Ok(())
-    }
-
-    fn commit(self) -> Result<(), PageTableError> {
+        for op in shootdown.ops() {
+            match *op {
+                FlushOp::Page(va) => crate::arch::tlb::flush_page_global(va),
+            }
+        }
         Ok(())
     }
 }

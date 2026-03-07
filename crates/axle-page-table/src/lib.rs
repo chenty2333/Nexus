@@ -3,6 +3,10 @@
 //! This crate provides a tiny, `no_std` transaction cursor that can drive
 //! bootstrap page-table backends while already exposing a future-shaped
 //! `lock(range) -> query/map/unmap/protect/commit` interface.
+//!
+//! Mutations record invalidation work into one `ShootdownBatch` and only publish
+//! it at `commit`, so callers already program against batched synchronization
+//! rather than per-page immediate flushes.
 
 #![no_std]
 #![deny(missing_docs)]
@@ -101,6 +105,49 @@ pub enum PageTableError {
     Backend,
 }
 
+/// One deferred invalidation operation to publish at transaction commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushOp {
+    /// Invalidate one page-aligned virtual page.
+    Page(u64),
+}
+
+/// Batched invalidation work collected during one transaction.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShootdownBatch {
+    ops: Vec<FlushOp>,
+}
+
+impl ShootdownBatch {
+    /// Build one empty invalidation batch.
+    pub fn new() -> Self {
+        Self { ops: Vec::new() }
+    }
+
+    /// Return the collected invalidation operations in insertion order.
+    pub fn ops(&self) -> &[FlushOp] {
+        &self.ops
+    }
+
+    /// Whether the batch contains no invalidation work.
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// Number of deferred invalidation operations in the batch.
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Record one page invalidation, deduplicating repeated entries.
+    pub fn invalidate_page(&mut self, va: u64) {
+        let op = FlushOp::Page(va);
+        if !self.ops.contains(&op) {
+            self.ops.push(op);
+        }
+    }
+}
+
 /// One locked page-table window.
 pub trait PageTableLock {
     /// Locked virtual-address window.
@@ -118,11 +165,8 @@ pub trait PageTableLock {
     /// Update writability on one mapped page.
     fn protect_page(&mut self, va: u64, writable: bool) -> Result<(), PageTableError>;
 
-    /// Flush one page from whatever TLB view this session manages.
-    fn flush_page(&mut self, va: u64) -> Result<(), PageTableError>;
-
     /// Finish the session and publish any deferred synchronization work.
-    fn commit(self) -> Result<(), PageTableError>;
+    fn commit(self, shootdown: ShootdownBatch) -> Result<(), PageTableError>;
 }
 
 /// Page-table object that can vend locked mutation sessions.
@@ -140,12 +184,16 @@ pub trait PageTable {
 #[derive(Debug)]
 pub struct TxCursor<L: PageTableLock> {
     lock: L,
+    shootdown: ShootdownBatch,
 }
 
 impl<L: PageTableLock> TxCursor<L> {
     /// Create a new cursor over one locked page-table session.
     pub fn new(lock: L) -> Self {
-        Self { lock }
+        Self {
+            lock,
+            shootdown: ShootdownBatch::new(),
+        }
     }
 
     /// Locked virtual-address window.
@@ -169,7 +217,7 @@ impl<L: PageTableLock> TxCursor<L> {
             let va = base + (page_index as u64) * PAGE_SIZE;
             let mapping = mapping_at(va)?;
             self.lock.map_page(va, mapping)?;
-            self.lock.flush_page(va)?;
+            self.shootdown.invalidate_page(va);
         }
         Ok(())
     }
@@ -180,7 +228,7 @@ impl<L: PageTableLock> TxCursor<L> {
         for page_index in 0..page_count {
             let va = base + (page_index as u64) * PAGE_SIZE;
             self.lock.unmap_page(va)?;
-            self.lock.flush_page(va)?;
+            self.shootdown.invalidate_page(va);
         }
         Ok(())
     }
@@ -200,14 +248,14 @@ impl<L: PageTableLock> TxCursor<L> {
             let va = base + (page_index as u64) * PAGE_SIZE;
             let writable = writable_at(va)?;
             self.lock.protect_page(va, writable)?;
-            self.lock.flush_page(va)?;
+            self.shootdown.invalidate_page(va);
         }
         Ok(())
     }
 
     /// Commit the current session.
     pub fn commit(self) -> Result<(), PageTableError> {
-        self.lock.commit()
+        self.lock.commit(self.shootdown)
     }
 }
 
@@ -394,13 +442,13 @@ mod tests {
             Ok(())
         }
 
-        fn flush_page(&mut self, va: u64) -> Result<(), PageTableError> {
-            self.backend.flushes.push(va);
-            Ok(())
-        }
-
-        fn commit(self) -> Result<(), PageTableError> {
+        fn commit(self, shootdown: ShootdownBatch) -> Result<(), PageTableError> {
             self.backend.commits += 1;
+            self.backend
+                .flushes
+                .extend(shootdown.ops().iter().map(|op| match *op {
+                    FlushOp::Page(va) => va,
+                }));
             self.backend.commit_log.borrow_mut().push(self.backend.id);
             Ok(())
         }
@@ -425,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn map_populates_each_page_and_flushes() {
+    fn map_populates_each_page_and_batches_flushes() {
         let mut backend = MockBackend::default();
         let range = PageRange::new(PAGE_SIZE, PAGE_SIZE * 2).unwrap();
         let mut tx = TxCursor::new(backend.lock(range).unwrap());
@@ -451,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn unmap_removes_each_page_and_flushes() {
+    fn unmap_removes_each_page_and_batches_flushes() {
         let mut backend = MockBackend::default();
         backend
             .pages
@@ -471,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn protect_updates_permissions_and_flushes() {
+    fn protect_updates_permissions_and_batches_flushes() {
         let mut backend = MockBackend::default();
         backend
             .pages
@@ -561,5 +609,22 @@ mod tests {
         assert_eq!(*commit_log.borrow(), vec![2, 1]);
         assert_eq!(left.commits, 1);
         assert_eq!(right.commits, 1);
+    }
+
+    #[test]
+    fn repeated_page_updates_deduplicate_shootdown_entries() {
+        let mut backend = MockBackend::default();
+        backend
+            .pages
+            .insert(PAGE_SIZE, PageMapping::new(0x20_000, false).unwrap());
+        let range = PageRange::new(PAGE_SIZE, PAGE_SIZE).unwrap();
+        let mut tx = TxCursor::new(backend.lock(range).unwrap());
+
+        tx.protect(PAGE_SIZE, PAGE_SIZE, |_| Ok(true)).unwrap();
+        tx.protect(PAGE_SIZE, PAGE_SIZE, |_| Ok(false)).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(backend.flushes, vec![PAGE_SIZE]);
+        assert_eq!(backend.commits, 1);
     }
 }

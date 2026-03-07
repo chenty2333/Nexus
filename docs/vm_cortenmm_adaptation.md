@@ -12,6 +12,8 @@ external VM model.
   interfaces shaped as `lock(range) -> query / map / unmap / protect / commit`.
   The current backend is still the bootstrap `USER_PT`, but the API shape is no
   longer tied to that implementation detail.
+- `TxCursor` now batches invalidation work until `commit`, so the transaction
+  boundary is also the current place where local TLB flush work is published.
 - Axle now has stable coarse mapping identity through `MapId` and `MapRec`.
   These records connect `VMAR` control metadata to page-local state without
   making `VMA` the long-term hot-path truth source.
