@@ -1,38 +1,239 @@
+extern crate alloc;
+
+use alloc::sync::Arc;
 use axle_page_table::{
     FlushOp, PageMapping, PageRange, PageTable, PageTableError, PageTableLock, ShootdownBatch,
 };
+use spin::Mutex;
 use x86_64::PhysAddr;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{PageTable as X86PageTable, PageTableFlags, PhysFrame, Size4KiB};
 
+/// Fixed page-table level for one x86_64 page-table page descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PtPageLevel {
+    /// PML4 root page.
+    Pml4,
+    /// First user-visible PDPT page.
+    Pdpt,
+    /// Fixed user-window PD page.
+    Pd,
+    /// Fixed user-window PT leaf page.
+    Pt,
+}
+
+/// Current lock discipline for one page-table descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PtPageLockKind {
+    /// Mutations are serialized by the surrounding transaction scaffolding.
+    TxSerialized,
+}
+
+/// Metadata layout kind attached to one page-table descriptor.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PtMetaKind {
+    /// No page-local metadata is attached to this descriptor yet.
+    None,
+    /// Reserved for future upper-level uniform metadata.
+    Uniform,
+    /// This descriptor is the fixed leaf PT that carries per-page metadata.
+    Leaf,
+}
+
+/// Fixed-shape descriptor for one concrete x86_64 page-table page.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PtPageDesc {
+    level: PtPageLevel,
+    table_paddr: u64,
+    va_base: u64,
+    lock_kind: PtPageLockKind,
+    invalidate_epoch: u64,
+    meta_kind: PtMetaKind,
+}
+
+#[allow(dead_code)]
+impl PtPageDesc {
+    /// Page-table level described by this descriptor.
+    pub(crate) const fn level(self) -> PtPageLevel {
+        self.level
+    }
+
+    /// Physical address of the concrete page-table page.
+    pub(crate) const fn table_paddr(self) -> u64 {
+        self.table_paddr
+    }
+
+    /// Lowest virtual address covered by this page-table page.
+    pub(crate) const fn va_base(self) -> u64 {
+        self.va_base
+    }
+
+    /// Current lock discipline for this page-table page.
+    pub(crate) const fn lock_kind(self) -> PtPageLockKind {
+        self.lock_kind
+    }
+
+    /// Most recent invalidation epoch recorded against this descriptor.
+    pub(crate) const fn invalidate_epoch(self) -> u64 {
+        self.invalidate_epoch
+    }
+
+    /// Current metadata attachment kind for this page-table page.
+    pub(crate) const fn meta_kind(self) -> PtMetaKind {
+        self.meta_kind
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UserPageTableDescSet {
+    root: PtPageDesc,
+    pdpt: PtPageDesc,
+    user_pd: PtPageDesc,
+    user_pt: PtPageDesc,
+}
+
+#[allow(dead_code)]
+impl UserPageTableDescSet {
+    /// PML4 descriptor.
+    pub(crate) const fn root(self) -> PtPageDesc {
+        self.root
+    }
+
+    /// PDPT descriptor.
+    pub(crate) const fn pdpt(self) -> PtPageDesc {
+        self.pdpt
+    }
+
+    /// Fixed user-window PD descriptor.
+    pub(crate) const fn user_pd(self) -> PtPageDesc {
+        self.user_pd
+    }
+
+    /// Fixed user-window PT descriptor.
+    pub(crate) const fn user_pt(self) -> PtPageDesc {
+        self.user_pt
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct UserPageTableDescriptors {
+    root: PtPageDesc,
+    pdpt: PtPageDesc,
+    user_pd: PtPageDesc,
+    user_pt: PtPageDesc,
+    next_invalidate_epoch: u64,
+}
+
+impl UserPageTableDescriptors {
+    fn snapshot(&self) -> UserPageTableDescSet {
+        UserPageTableDescSet {
+            root: self.root,
+            pdpt: self.pdpt,
+            user_pd: self.user_pd,
+            user_pt: self.user_pt,
+        }
+    }
+
+    fn record_shootdown(&mut self, shootdown: &ShootdownBatch) {
+        if shootdown.is_empty() {
+            return;
+        }
+        let epoch = self.next_invalidate_epoch;
+        self.next_invalidate_epoch = self.next_invalidate_epoch.wrapping_add(1);
+        if shootdown
+            .ops()
+            .iter()
+            .any(|op| matches!(*op, FlushOp::Page(_)))
+        {
+            self.user_pt.invalidate_epoch = epoch;
+        }
+    }
+}
+
 /// Concrete x86_64 page-table backing for one Axle address space.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct UserPageTables {
     root_paddr: u64,
     pdpt_paddr: u64,
     user_pd_paddr: u64,
     user_pt_paddr: u64,
+    descs: Arc<Mutex<UserPageTableDescriptors>>,
 }
 
 /// Locked transaction view over one concrete x86_64 user page-table set.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LockedUserPageTable {
     range: PageRange,
     tables: UserPageTables,
 }
 
 impl UserPageTables {
+    #[allow(dead_code)]
+    fn descriptor_set(&self) -> UserPageTableDescSet {
+        self.descs.lock().snapshot()
+    }
+
+    fn new_descriptors(
+        root_paddr: u64,
+        pdpt_paddr: u64,
+        user_pd_paddr: u64,
+        user_pt_paddr: u64,
+    ) -> Arc<Mutex<UserPageTableDescriptors>> {
+        Arc::new(Mutex::new(UserPageTableDescriptors {
+            root: PtPageDesc {
+                level: PtPageLevel::Pml4,
+                table_paddr: root_paddr,
+                va_base: 0,
+                lock_kind: PtPageLockKind::TxSerialized,
+                invalidate_epoch: 0,
+                meta_kind: PtMetaKind::None,
+            },
+            pdpt: PtPageDesc {
+                level: PtPageLevel::Pdpt,
+                table_paddr: pdpt_paddr,
+                va_base: 0,
+                lock_kind: PtPageLockKind::TxSerialized,
+                invalidate_epoch: 0,
+                meta_kind: PtMetaKind::None,
+            },
+            user_pd: PtPageDesc {
+                level: PtPageLevel::Pd,
+                table_paddr: user_pd_paddr,
+                va_base: crate::userspace::USER_CODE_VA,
+                lock_kind: PtPageLockKind::TxSerialized,
+                invalidate_epoch: 0,
+                meta_kind: PtMetaKind::None,
+            },
+            user_pt: PtPageDesc {
+                level: PtPageLevel::Pt,
+                table_paddr: user_pt_paddr,
+                va_base: crate::userspace::USER_CODE_VA,
+                lock_kind: PtPageLockKind::TxSerialized,
+                invalidate_epoch: 0,
+                meta_kind: PtMetaKind::Leaf,
+            },
+            next_invalidate_epoch: 1,
+        }))
+    }
+
     /// Bind the bootstrap address space to the already-active PVH root and static user tables.
     pub(crate) fn bootstrap_current() -> Result<Self, PageTableError> {
         let (root_frame, _) = Cr3::read();
         let root_paddr = root_frame.start_address().as_u64();
         let pdpt_paddr = table(root_paddr)[0].addr().as_u64();
+        let user_pd_paddr = crate::userspace::bootstrap_user_pd_paddr();
+        let user_pt_paddr = crate::userspace::bootstrap_user_pt_paddr();
         Ok(Self {
             root_paddr,
             pdpt_paddr,
-            user_pd_paddr: crate::userspace::bootstrap_user_pd_paddr(),
-            user_pt_paddr: crate::userspace::bootstrap_user_pt_paddr(),
+            user_pd_paddr,
+            user_pt_paddr,
+            descs: Self::new_descriptors(root_paddr, pdpt_paddr, user_pd_paddr, user_pt_paddr),
         })
     }
 
@@ -82,26 +283,33 @@ impl UserPageTables {
             pdpt_paddr,
             user_pd_paddr,
             user_pt_paddr,
+            descs: Self::new_descriptors(root_paddr, pdpt_paddr, user_pd_paddr, user_pt_paddr),
         })
     }
 
-    pub(crate) const fn root_paddr(self) -> u64 {
+    #[allow(dead_code)]
+    pub(crate) const fn root_paddr(&self) -> u64 {
         self.root_paddr
     }
 
     #[allow(dead_code)]
-    pub(crate) const fn pdpt_paddr(self) -> u64 {
+    pub(crate) const fn pdpt_paddr(&self) -> u64 {
         self.pdpt_paddr
     }
 
     #[allow(dead_code)]
-    pub(crate) const fn user_pd_paddr(self) -> u64 {
+    pub(crate) const fn user_pd_paddr(&self) -> u64 {
         self.user_pd_paddr
     }
 
     #[allow(dead_code)]
-    pub(crate) const fn user_pt_paddr(self) -> u64 {
+    pub(crate) const fn user_pt_paddr(&self) -> u64 {
         self.user_pt_paddr
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn descriptors(&self) -> UserPageTableDescSet {
+        self.descriptor_set()
     }
 
     pub(crate) fn activate(self) -> Result<(), PageTableError> {
@@ -148,7 +356,7 @@ impl PageTable for UserPageTables {
     fn lock(&mut self, range: PageRange) -> Result<Self::Lock<'_>, PageTableError> {
         Ok(LockedUserPageTable {
             range,
-            tables: *self,
+            tables: self.clone(),
         })
     }
 }
@@ -206,6 +414,7 @@ impl PageTableLock for LockedUserPageTable {
     }
 
     fn commit(self, shootdown: ShootdownBatch) -> Result<(), PageTableError> {
+        self.tables.descs.lock().record_shootdown(&shootdown);
         if !self.tables.is_active() {
             return Ok(());
         }

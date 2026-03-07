@@ -14,6 +14,9 @@ external VM model.
   longer tied to that implementation detail.
 - `TxCursor` now batches invalidation work until `commit`, so the transaction
   boundary is also the current place where local TLB flush work is published.
+- The x86_64 backend now also carries a fixed-shape descriptor set for
+  `root/pdpt/user_pd/user_pt`; only the leaf PT currently carries page-local
+  metadata, and upper-level uniform metadata remains deferred.
 - Axle now has stable coarse mapping identity through `MapId` and `MapRec`.
   These records connect `VMAR` control metadata to page-local state without
   making `VMA` the long-term hot-path truth source.

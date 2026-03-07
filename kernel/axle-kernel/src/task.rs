@@ -694,7 +694,7 @@ impl AddressSpace {
     }
 
     fn root_page_table(&self) -> crate::page_table::UserPageTables {
-        self.page_tables
+        self.page_tables.clone()
     }
 
     fn create_anonymous_vmo(
