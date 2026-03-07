@@ -318,3 +318,17 @@ args = [
   { name = "arg1", ty = "u64" },
   { name = "arg2", ty = "u64" },
 ]
+
+[[syscall]]
+name = "process_create"
+nr = 27
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "parent_process", ty = "zx_handle_t" },
+  { name = "name", ty = "*const u8" },
+  { name = "name_size", ty = "usize" },
+  { name = "options", ty = "u32" },
+  { name = "out_process", ty = "*mut zx_handle_t" },
+  { name = "out_vmar", ty = "*mut zx_handle_t" },
+]

@@ -9,7 +9,7 @@ use axle_core::{
     Capability, Packet, PacketKind, Port, PortError, Signals, TimerError, TimerId, TimerService,
     WaitAsyncOptions,
 };
-use axle_mm::{MappingPerms, VmarId, VmoId};
+use axle_mm::{MappingPerms, VmarId};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::koid::ZX_KOID_INVALID;
@@ -137,9 +137,9 @@ impl EventPairEndpoint {
 
 #[derive(Clone, Copy, Debug)]
 struct VmoObject {
-    process_id: u64,
-    address_space_id: u64,
-    vmo_id: VmoId,
+    creator_process_id: u64,
+    global_vmo_id: axle_mm::GlobalVmoId,
+    kind: axle_mm::VmoKind,
     size_bytes: u64,
 }
 
@@ -558,6 +558,73 @@ pub fn create_thread(
     })
 }
 
+/// Create a new process object plus its root VMAR and return both handles.
+pub fn create_process(
+    parent_process_handle: zx_handle_t,
+    options: u32,
+) -> Result<(zx_handle_t, zx_handle_t), zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(
+            parent_process_handle,
+            crate::task::HandleRights::MANAGE_PROCESS,
+        )?;
+        match state.objects.get(&resolved.object_id()) {
+            Some(KernelObject::Process(_)) => {}
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        }
+
+        let created = state.kernel.create_process()?;
+
+        let process_object_id = state.alloc_object_id();
+        state.objects.insert(
+            process_object_id,
+            KernelObject::Process(ProcessObject {
+                process_id: created.process_id(),
+                koid: created.koid(),
+            }),
+        );
+
+        let vmar_object_id = state.alloc_object_id();
+        state.objects.insert(
+            vmar_object_id,
+            KernelObject::Vmar(VmarObject {
+                process_id: created.process_id(),
+                address_space_id: created.address_space_id(),
+                vmar_id: created.root_vmar().id(),
+                base: created.root_vmar().base(),
+                len: created.root_vmar().len(),
+            }),
+        );
+
+        let process_handle =
+            match state.alloc_handle_for_object(process_object_id, process_default_rights()) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    let _ = state.objects.remove(&process_object_id);
+                    let _ = state.objects.remove(&vmar_object_id);
+                    return Err(err);
+                }
+            };
+        let root_vmar_handle =
+            match state.alloc_handle_for_object(vmar_object_id, vmar_default_rights()) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    let _ = state.close_handle(process_handle);
+                    let _ = state.objects.remove(&process_object_id);
+                    let _ = state.objects.remove(&vmar_object_id);
+                    return Err(err);
+                }
+            };
+
+        Ok((process_handle, root_vmar_handle))
+    })
+}
+
 /// Start a previously created thread at one user entry point.
 pub fn start_thread(
     thread_handle: zx_handle_t,
@@ -578,15 +645,17 @@ pub fn start_thread(
             Some(_) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
-
-        if thread.process_id != state.kernel.current_process_info()?.process_id() {
-            return Err(ZX_ERR_ACCESS_DENIED);
-        }
-        if !state.validate_current_user_ptr(entry, 1) {
+        if !state
+            .kernel
+            .validate_process_user_ptr(thread.process_id, entry, 1)
+        {
             return Err(ZX_ERR_INVALID_ARGS);
         }
         let stack_probe = stack.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
-        if !state.validate_current_user_ptr(stack_probe, 8) {
+        if !state
+            .kernel
+            .validate_process_user_ptr(thread.process_id, stack_probe, 8)
+        {
             return Err(ZX_ERR_INVALID_ARGS);
         }
 
@@ -713,9 +782,9 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
         state.objects.insert(
             object_id,
             KernelObject::Vmo(VmoObject {
-                process_id: created.process_id(),
-                address_space_id: created.address_space_id(),
-                vmo_id: created.vmo_id(),
+                creator_process_id: created.process_id(),
+                global_vmo_id: created.global_vmo_id(),
+                kind: axle_mm::VmoKind::Anonymous,
                 size_bytes: created.size_bytes(),
             }),
         );
@@ -1057,12 +1126,10 @@ pub fn vmar_map(
 
         require_vm_mapping_rights(resolved_vmar, perms)?;
         require_vm_mapping_rights(resolved_vmo, perms)?;
-        let _ = vmo.size_bytes;
         state.kernel.map_current_vmo_into_vmar(
             vmar.address_space_id,
             vmar.vmar_id,
-            vmo.address_space_id,
-            vmo.vmo_id,
+            vmo.global_vmo_id,
             vmar_offset,
             vmo_offset,
             len,
@@ -1696,9 +1763,9 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
             }
             KernelObject::Vmo(vmo) => {
                 let _ = (
-                    vmo.process_id,
-                    vmo.address_space_id,
-                    vmo.vmo_id.raw(),
+                    vmo.creator_process_id,
+                    vmo.global_vmo_id.raw(),
+                    matches!(vmo.kind, axle_mm::VmoKind::Anonymous),
                     vmo.size_bytes,
                 );
                 ObjectKind::Vmo

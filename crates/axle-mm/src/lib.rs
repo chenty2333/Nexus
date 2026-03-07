@@ -494,6 +494,11 @@ impl Vmo {
         let page_index = usize::try_from(offset / PAGE_SIZE).ok()?;
         self.frames.get(page_index).copied().flatten()
     }
+
+    /// Snapshot every currently bound frame slot.
+    pub fn frames(&self) -> &[Option<FrameId>] {
+        &self.frames
+    }
 }
 
 /// Root VMAR metadata.
@@ -1125,6 +1130,32 @@ impl AddressSpace {
         self.vmos.iter().find(|vmo| vmo.id == id)
     }
 
+    /// Return metadata for one tracked VMO by kernel-global identity.
+    pub fn vmo_by_global_id(&self, global_id: GlobalVmoId) -> Option<&Vmo> {
+        self.vmos.iter().find(|vmo| vmo.global_id == global_id)
+    }
+
+    /// Return the local VMO id for one kernel-global identity.
+    pub fn vmo_id_by_global_id(&self, global_id: GlobalVmoId) -> Option<VmoId> {
+        self.vmo_by_global_id(global_id).map(|vmo| vmo.id())
+    }
+
+    /// Import one kernel-global VMO description into this address space, or reuse an existing alias.
+    pub fn import_vmo(
+        &mut self,
+        kind: VmoKind,
+        size_bytes: u64,
+        global_id: GlobalVmoId,
+    ) -> Result<VmoId, AddressSpaceError> {
+        if let Some(existing) = self.vmo_by_global_id(global_id) {
+            if existing.kind() != kind || existing.size_bytes() != size_bytes {
+                return Err(AddressSpaceError::InvalidArgs);
+            }
+            return Ok(existing.id());
+        }
+        self.create_vmo(kind, size_bytes, global_id)
+    }
+
     /// Return the current coarse mapping records in insertion order.
     pub fn map_records(&self) -> &[MapRec] {
         &self.map_recs
@@ -1235,9 +1266,32 @@ impl AddressSpace {
         }
     }
 
+    /// Install or replace one VMO frame binding.
+    pub fn set_vmo_frame(
+        &mut self,
+        vmo_id: VmoId,
+        offset: u64,
+        frame_id: FrameId,
+    ) -> Result<(), AddressSpaceError> {
+        match self.bind_vmo_frame(vmo_id, offset, frame_id) {
+            Ok(()) => Ok(()),
+            Err(AddressSpaceError::AlreadyBound) => self.rebind_vmo_frame(vmo_id, offset, frame_id),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Return the current VMA list in ascending virtual-address order.
     pub fn vmas(&self) -> &[Vma] {
         &self.vmas
+    }
+
+    /// Return every mapped range currently backed by the given kernel-global VMO identity.
+    pub fn mapped_ranges_for_global_vmo(&self, global_id: GlobalVmoId) -> Vec<(u64, u64)> {
+        self.vmas
+            .iter()
+            .filter(|vma| vma.global_vmo_id == global_id)
+            .map(|vma| (vma.base(), vma.len()))
+            .collect()
     }
 
     /// Install a fixed mapping into the root VMAR.

@@ -268,6 +268,39 @@ impl CreatedVmo {
     }
 }
 
+#[derive(Clone, Debug)]
+struct GlobalVmo {
+    kind: VmoKind,
+    size_bytes: u64,
+    frames: Vec<Option<FrameId>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CreatedProcess {
+    process_id: ProcessId,
+    koid: zx_koid_t,
+    address_space_id: AddressSpaceId,
+    root_vmar: Vmar,
+}
+
+impl CreatedProcess {
+    pub(crate) const fn process_id(self) -> ProcessId {
+        self.process_id
+    }
+
+    pub(crate) const fn koid(self) -> zx_koid_t {
+        self.koid
+    }
+
+    pub(crate) const fn address_space_id(self) -> AddressSpaceId {
+        self.address_space_id
+    }
+
+    pub(crate) const fn root_vmar(self) -> Vmar {
+        self.root_vmar
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ThreadState {
     New,
@@ -649,6 +682,10 @@ impl AddressSpace {
         self.vm.lookup_rmap_anchor(anchor)
     }
 
+    fn snapshot_vmo(&self, global_vmo_id: KernelVmoId) -> Option<Vmo> {
+        self.vm.vmo_by_global_id(global_vmo_id).cloned()
+    }
+
     fn root_vmar(&self) -> Vmar {
         self.vm.root_vmar()
     }
@@ -666,6 +703,32 @@ impl AddressSpace {
             .vmo(vmo_id)
             .cloned()
             .ok_or(AddressSpaceError::InvalidVmo)
+    }
+
+    fn import_vmo_alias(
+        &mut self,
+        kind: VmoKind,
+        size: u64,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<VmoId, AddressSpaceError> {
+        self.vm.import_vmo(kind, size, global_vmo_id)
+    }
+
+    fn local_vmo_id(&self, global_vmo_id: KernelVmoId) -> Option<VmoId> {
+        self.vm.vmo_id_by_global_id(global_vmo_id)
+    }
+
+    fn set_vmo_frame(
+        &mut self,
+        vmo_id: VmoId,
+        offset: u64,
+        frame_id: FrameId,
+    ) -> Result<(), AddressSpaceError> {
+        self.vm.set_vmo_frame(vmo_id, offset, frame_id)
+    }
+
+    fn mapped_ranges_for_global_vmo(&self, global_vmo_id: KernelVmoId) -> Vec<(u64, u64)> {
+        self.vm.mapped_ranges_for_global_vmo(global_vmo_id)
     }
 
     fn map_vmo_fixed(
@@ -818,6 +881,7 @@ pub(crate) struct Kernel {
     processes: BTreeMap<ProcessId, Process>,
     threads: BTreeMap<ThreadId, Thread>,
     address_spaces: BTreeMap<AddressSpaceId, AddressSpace>,
+    global_vmos: BTreeMap<KernelVmoId, GlobalVmo>,
     #[allow(dead_code)]
     frames: FrameTable,
     futexes: crate::futex::FutexTable,
@@ -840,6 +904,7 @@ impl Kernel {
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
             address_spaces: BTreeMap::new(),
+            global_vmos: BTreeMap::new(),
             frames: FrameTable::new(),
             futexes: crate::futex::FutexTable::new(),
             run_queue: VecDeque::new(),
@@ -864,6 +929,11 @@ impl Kernel {
         kernel
             .address_spaces
             .insert(address_space_id, bootstrap_address_space);
+        for global_vmo_id in bootstrap_vmo_ids {
+            kernel
+                .register_global_vmo_from_address_space(address_space_id, global_vmo_id)
+                .expect("bootstrap global vmo seeding must succeed");
+        }
 
         let process_id = kernel.alloc_process_id();
         let process_koid = kernel.alloc_koid();
@@ -937,6 +1007,21 @@ impl Kernel {
 
     pub(crate) fn validate_current_user_ptr(&self, ptr: u64, len: usize) -> bool {
         let Ok(process) = self.current_process() else {
+            return false;
+        };
+        let Some(address_space) = self.address_spaces.get(&process.address_space_id) else {
+            return false;
+        };
+        address_space.validate_user_ptr(ptr, len)
+    }
+
+    pub(crate) fn validate_process_user_ptr(
+        &self,
+        process_id: ProcessId,
+        ptr: u64,
+        len: usize,
+    ) -> bool {
+        let Ok(process) = self.process(process_id) else {
             return false;
         };
         let Some(address_space) = self.address_spaces.get(&process.address_space_id) else {
@@ -1297,6 +1382,150 @@ impl Kernel {
         Ok(self.process(process_id)?.address_space_id)
     }
 
+    pub(crate) fn create_process(&mut self) -> Result<CreatedProcess, zx_status_t> {
+        let address_space_id = self.alloc_address_space_id();
+        let address_space = AddressSpace {
+            vm: VmAddressSpace::new_with_id(
+                VmAddressSpaceId::new(address_space_id),
+                crate::userspace::USER_CODE_VA,
+                crate::userspace::USER_REGION_BYTES,
+            )
+            .map_err(map_address_space_error)?,
+        };
+        let root_vmar = address_space.root_vmar();
+        self.address_spaces.insert(address_space_id, address_space);
+
+        let process_id = self.alloc_process_id();
+        let process_koid = self.alloc_koid();
+        self.processes.insert(
+            process_id,
+            Process::bootstrap(address_space_id, process_koid),
+        );
+
+        Ok(CreatedProcess {
+            process_id,
+            koid: process_koid,
+            address_space_id,
+            root_vmar,
+        })
+    }
+
+    fn register_global_vmo_from_address_space(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<(), zx_status_t> {
+        let snapshot = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.snapshot_vmo(global_vmo_id))
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        self.global_vmos.insert(
+            global_vmo_id,
+            GlobalVmo {
+                kind: snapshot.kind(),
+                size_bytes: snapshot.size_bytes(),
+                frames: snapshot.frames().to_vec(),
+            },
+        );
+        Ok(())
+    }
+
+    fn register_empty_global_vmo(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        kind: VmoKind,
+        size_bytes: u64,
+    ) -> Result<(), zx_status_t> {
+        if self.global_vmos.contains_key(&global_vmo_id) {
+            return Err(ZX_ERR_ALREADY_EXISTS);
+        }
+        let page_count = usize::try_from(size_bytes / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        self.global_vmos.insert(
+            global_vmo_id,
+            GlobalVmo {
+                kind,
+                size_bytes,
+                frames: alloc::vec![None; page_count],
+            },
+        );
+        Ok(())
+    }
+
+    fn import_global_vmo_into_address_space(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<VmoId, zx_status_t> {
+        let global_vmo = self
+            .global_vmos
+            .get(&global_vmo_id)
+            .cloned()
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        let address_space = self
+            .address_spaces
+            .get_mut(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let local_vmo_id = address_space
+            .import_vmo_alias(global_vmo.kind, global_vmo.size_bytes, global_vmo_id)
+            .map_err(map_address_space_error)?;
+        for (page_index, frame_id) in global_vmo.frames.iter().copied().enumerate() {
+            let Some(frame_id) = frame_id else {
+                continue;
+            };
+            address_space
+                .set_vmo_frame(
+                    local_vmo_id,
+                    (page_index as u64) * crate::userspace::USER_PAGE_BYTES,
+                    frame_id,
+                )
+                .map_err(map_address_space_error)?;
+        }
+        Ok(local_vmo_id)
+    }
+
+    fn update_global_vmo_frame(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        offset: u64,
+        frame_id: FrameId,
+    ) -> Result<(), zx_status_t> {
+        let global_vmo = self
+            .global_vmos
+            .get_mut(&global_vmo_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        if offset & (crate::userspace::USER_PAGE_BYTES - 1) != 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let page_index = usize::try_from(offset / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let slot = global_vmo
+            .frames
+            .get_mut(page_index)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        *slot = Some(frame_id);
+        Ok(())
+    }
+
+    fn publish_address_space_frame_to_global_vmo(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        fault_va: u64,
+        frame_id: FrameId,
+    ) -> Result<(), zx_status_t> {
+        let lookup = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.lookup_user_mapping(fault_va, 1))
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let page_offset = lookup
+            .vmo_offset()
+            .checked_sub(lookup.vmo_offset() % crate::userspace::USER_PAGE_BYTES)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        self.update_global_vmo_frame(lookup.global_vmo_id(), page_offset, frame_id)
+    }
+
     pub(crate) fn create_current_anonymous_vmo(
         &mut self,
         size: u64,
@@ -1304,13 +1533,21 @@ impl Kernel {
     ) -> Result<CreatedVmo, zx_status_t> {
         let process_id = self.current_thread()?.process_id;
         let address_space_id = self.current_process()?.address_space_id;
-        let address_space = self
+        self.register_empty_global_vmo(global_vmo_id, VmoKind::Anonymous, size)?;
+        let local_vmo_id =
+            match self.import_global_vmo_into_address_space(address_space_id, global_vmo_id) {
+                Ok(vmo_id) => vmo_id,
+                Err(err) => {
+                    let _ = self.global_vmos.remove(&global_vmo_id);
+                    return Err(err);
+                }
+            };
+        let vmo = self
             .address_spaces
-            .get_mut(&address_space_id)
+            .get(&address_space_id)
+            .and_then(|space| space.vm.vmo(local_vmo_id))
+            .cloned()
             .ok_or(ZX_ERR_BAD_STATE)?;
-        let vmo = address_space
-            .create_anonymous_vmo(&mut self.frames, size, global_vmo_id)
-            .map_err(map_address_space_error)?;
         Ok(CreatedVmo {
             process_id,
             address_space_id,
@@ -1606,17 +1843,14 @@ impl Kernel {
         &mut self,
         vmar_address_space_id: AddressSpaceId,
         vmar_id: VmarId,
-        vmo_address_space_id: AddressSpaceId,
-        vmo_id: VmoId,
+        global_vmo_id: KernelVmoId,
         vmar_offset: u64,
         vmo_offset: u64,
         len: u64,
         perms: MappingPerms,
     ) -> Result<u64, zx_status_t> {
-        if vmar_address_space_id != vmo_address_space_id {
-            return Err(ZX_ERR_BAD_STATE);
-        }
-
+        let local_vmo_id =
+            self.import_global_vmo_into_address_space(vmar_address_space_id, global_vmo_id)?;
         let address_space = self
             .address_spaces
             .get_mut(&vmar_address_space_id)
@@ -1634,7 +1868,7 @@ impl Kernel {
                 &mut self.frames,
                 mapped_addr,
                 len,
-                vmo_id,
+                local_vmo_id,
                 vmo_offset,
                 perms,
             )
@@ -1975,6 +2209,11 @@ impl Kernel {
                 .resolve_cow_fault(&mut self.frames, fault_va, new_frame_id)
                 .map_err(map_address_space_error)?
         };
+        self.publish_address_space_frame_to_global_vmo(
+            address_space_id,
+            resolved.fault_page_base(),
+            resolved.new_frame_id(),
+        )?;
         self.sync_mapping_pages(
             address_space_id,
             resolved.fault_page_base(),

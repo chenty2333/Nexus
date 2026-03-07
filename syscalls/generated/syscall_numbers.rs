@@ -56,3 +56,5 @@ pub const AXLE_SYS_FUTEX_GET_OWNER: SyscallNumber = 24;
 pub const AXLE_SYS_THREAD_CREATE: SyscallNumber = 25;
 /// Contract: SHOULD
 pub const AXLE_SYS_THREAD_START: SyscallNumber = 26;
+/// Contract: SHOULD
+pub const AXLE_SYS_PROCESS_CREATE: SyscallNumber = 27;
