@@ -735,19 +735,29 @@ impl AddressSpace {
         let shared_vmo = vm
             .create_vmo(
                 VmoKind::Anonymous,
-                crate::userspace::USER_PAGE_BYTES,
+                crate::userspace::USER_STACK_VA - crate::userspace::USER_SHARED_VA,
                 vmo_ids[1],
             )
             .expect("bootstrap shared vmo allocation must succeed");
-        let shared_frame = frames
-            .register_existing(crate::userspace::user_shared_page_paddr())
-            .expect("bootstrap shared frame registration must succeed");
-        vm.bind_vmo_frame(shared_vmo, 0, shared_frame)
+        for page_index in 0..((crate::userspace::USER_STACK_VA - crate::userspace::USER_SHARED_VA)
+            / crate::userspace::USER_PAGE_BYTES)
+        {
+            let shared_frame = frames
+                .register_existing(crate::userspace::user_shared_page_paddr(
+                    page_index as usize,
+                ))
+                .expect("bootstrap shared frame registration must succeed");
+            vm.bind_vmo_frame(
+                shared_vmo,
+                page_index * crate::userspace::USER_PAGE_BYTES,
+                shared_frame,
+            )
             .expect("bootstrap shared frame binding must succeed");
+        }
         vm.map_fixed(
             frames,
             crate::userspace::USER_SHARED_VA,
-            crate::userspace::USER_PAGE_BYTES,
+            crate::userspace::USER_STACK_VA - crate::userspace::USER_SHARED_VA,
             shared_vmo,
             0,
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
@@ -1327,53 +1337,30 @@ impl Kernel {
         address_space.validate_user_ptr(ptr, len)
     }
 
-    pub(crate) fn ensure_current_user_range_resident(
+    pub(crate) fn ensure_current_user_page_resident(
         &mut self,
-        ptr: u64,
-        len: usize,
+        page_va: u64,
         for_write: bool,
     ) -> Result<(), zx_status_t> {
-        if len == 0 {
-            return Ok(());
-        }
-        if !self.validate_current_user_ptr(ptr, len) {
-            return Err(ZX_ERR_INVALID_ARGS);
-        }
-
         let address_space_id = self.current_process()?.address_space_id;
-        let start = align_down_page(ptr);
-        let end = align_up_page(ptr.checked_add(len as u64).ok_or(ZX_ERR_OUT_OF_RANGE)?)
-            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-        let mut page_va = start;
-        while page_va < end {
-            let meta = self
-                .address_spaces
-                .get(&address_space_id)
-                .and_then(|space| space.page_meta(page_va))
-                .ok_or(ZX_ERR_INVALID_ARGS)?;
-            if for_write && !meta.logical_write() {
-                return Err(ZX_ERR_ACCESS_DENIED);
-            }
-            match meta.tag() {
-                PteMetaTag::LazyAnon => {
-                    self.materialize_lazy_anon_page(address_space_id, page_va)?;
-                }
-                PteMetaTag::LazyVmo => {
-                    self.materialize_lazy_vmo_page(address_space_id, page_va)?;
-                }
-                PteMetaTag::Present => {
-                    if for_write && meta.cow_shared() {
-                        self.resolve_copy_on_write_page(address_space_id, page_va)?;
-                    }
-                }
-                PteMetaTag::Phys => {}
-                _ => return Err(ZX_ERR_BAD_STATE),
-            }
-            page_va = page_va
-                .checked_add(crate::userspace::USER_PAGE_BYTES)
-                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let page_base = align_down_page(page_va);
+        let meta = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.page_meta(page_base))
+            .ok_or(ZX_ERR_INVALID_ARGS)?;
+        if for_write && !meta.logical_write() {
+            return Err(ZX_ERR_ACCESS_DENIED);
         }
-        Ok(())
+        match meta.tag() {
+            PteMetaTag::LazyAnon => self.materialize_lazy_anon_page(address_space_id, page_base),
+            PteMetaTag::LazyVmo => self.materialize_lazy_vmo_page(address_space_id, page_base),
+            PteMetaTag::Present if for_write && meta.cow_shared() => {
+                self.resolve_copy_on_write_page(address_space_id, page_base)
+            }
+            PteMetaTag::Present | PteMetaTag::Phys => Ok(()),
+            _ => Err(ZX_ERR_BAD_STATE),
+        }
     }
 
     /// Resolve a current-thread userspace range back to its VMO mapping metadata.
@@ -3252,10 +3239,4 @@ fn map_page_table_error(err: PageTableError) -> zx_status_t {
 
 fn align_down_page(value: u64) -> u64 {
     value & !(crate::userspace::USER_PAGE_BYTES - 1)
-}
-
-fn align_up_page(value: u64) -> Option<u64> {
-    value
-        .checked_add(crate::userspace::USER_PAGE_BYTES - 1)
-        .map(|rounded| rounded & !(crate::userspace::USER_PAGE_BYTES - 1))
 }

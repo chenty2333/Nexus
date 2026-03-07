@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::{
@@ -18,7 +19,8 @@ use axle_types::rights::{ZX_RIGHT_SAME_RIGHTS, ZX_RIGHTS_ALL};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
     ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
-    ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE, ZX_OK,
+    ZX_ERR_OUT_OF_RANGE, ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT,
+    ZX_ERR_WRONG_TYPE, ZX_OK,
 };
 use axle_types::vm::{
     ZX_VM_ALIGN_BASE, ZX_VM_ALIGN_MASK, ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ,
@@ -225,7 +227,7 @@ const USER_SIGNAL_MASK: Signals = Signals::USER_SIGNAL_0
 
 #[derive(Debug)]
 struct KernelState {
-    kernel: crate::task::Kernel,
+    kernel: Arc<Mutex<crate::task::Kernel>>,
     objects: BTreeMap<u64, KernelObject>,
     next_object_id: u64,
     timers: TimerService,
@@ -237,7 +239,7 @@ struct KernelState {
 impl KernelState {
     fn new() -> Self {
         let mut state = Self {
-            kernel: crate::task::Kernel::bootstrap(),
+            kernel: Arc::new(Mutex::new(crate::task::Kernel::bootstrap())),
             objects: BTreeMap::new(),
             next_object_id: 1,
             timers: TimerService::new(),
@@ -247,12 +249,10 @@ impl KernelState {
         };
 
         let process = state
-            .kernel
-            .current_process_info()
+            .with_kernel(|kernel| kernel.current_process_info())
             .expect("bootstrap current process must exist");
         let process_koid = state
-            .kernel
-            .current_process_koid()
+            .with_kernel(|kernel| kernel.current_process_koid())
             .expect("bootstrap current process koid must exist");
         let object_id = state.alloc_object_id();
         state.objects.insert(
@@ -267,8 +267,7 @@ impl KernelState {
             .expect("bootstrap self process handle allocation must succeed");
 
         let root = state
-            .kernel
-            .current_root_vmar()
+            .with_kernel(|kernel| kernel.current_root_vmar())
             .expect("bootstrap root VMAR must exist");
         let object_id = state.alloc_object_id();
         state.objects.insert(
@@ -287,8 +286,7 @@ impl KernelState {
             .expect("bootstrap root VMAR handle allocation must succeed");
 
         let thread = state
-            .kernel
-            .current_thread_info()
+            .with_kernel(|kernel| kernel.current_thread_info())
             .expect("bootstrap current thread must exist");
         let object_id = state.alloc_object_id();
         state.objects.insert(
@@ -311,13 +309,29 @@ impl KernelState {
         id
     }
 
+    fn with_kernel<T>(
+        &self,
+        f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
+    ) -> Result<T, zx_status_t> {
+        let kernel = self.kernel.lock();
+        f(&kernel)
+    }
+
+    fn with_kernel_mut<T>(
+        &self,
+        f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
+    ) -> Result<T, zx_status_t> {
+        let mut kernel = self.kernel.lock();
+        f(&mut kernel)
+    }
+
     fn alloc_handle_for_object(
         &mut self,
         object_id: u64,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
         let cap = Capability::new(object_id, rights.bits(), DEFAULT_OBJECT_GENERATION);
-        self.kernel.alloc_handle_for_current_process(cap)
+        self.with_kernel_mut(|kernel| kernel.alloc_handle_for_current_process(cap))
     }
 
     fn lookup_handle(
@@ -325,11 +339,11 @@ impl KernelState {
         raw: zx_handle_t,
         required_rights: crate::task::HandleRights,
     ) -> Result<crate::task::ResolvedHandle, zx_status_t> {
-        self.kernel.lookup_current_handle(raw, required_rights)
+        self.with_kernel(|kernel| kernel.lookup_current_handle(raw, required_rights))
     }
 
     fn close_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
-        self.kernel.close_current_handle(raw)
+        self.with_kernel_mut(|kernel| kernel.close_current_handle(raw))
     }
 
     fn duplicate_handle(
@@ -337,7 +351,7 @@ impl KernelState {
         raw: zx_handle_t,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
-        self.kernel.duplicate_current_handle(raw, rights)
+        self.with_kernel_mut(|kernel| kernel.duplicate_current_handle(raw, rights))
     }
 
     fn replace_handle(
@@ -345,11 +359,12 @@ impl KernelState {
         raw: zx_handle_t,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
-        self.kernel.replace_current_handle(raw, rights)
+        self.with_kernel_mut(|kernel| kernel.replace_current_handle(raw, rights))
     }
 
     fn validate_current_user_ptr(&self, ptr: u64, len: usize) -> bool {
-        self.kernel.validate_current_user_ptr(ptr, len)
+        self.with_kernel(|kernel| Ok(kernel.validate_current_user_ptr(ptr, len)))
+            .unwrap_or(false)
     }
 }
 
@@ -386,30 +401,28 @@ pub fn bootstrap_self_thread_handle() -> Option<zx_handle_t> {
 
 /// Return the bootstrap current-thread koid.
 pub fn bootstrap_self_thread_koid() -> Option<zx_koid_t> {
-    let mut guard = STATE.lock();
-    let state = guard.as_mut()?;
-    state.kernel.current_thread_koid().ok()
+    with_kernel(|kernel| kernel.current_thread_koid()).ok()
 }
 
 pub(crate) fn capture_current_user_context(
     trap: &crate::arch::int80::TrapFrame,
     cpu_frame: *const u64,
 ) -> Result<(), zx_status_t> {
-    with_state_mut(|state| state.kernel.capture_current_user_context(trap, cpu_frame))
+    with_kernel_mut(|kernel| kernel.capture_current_user_context(trap, cpu_frame))
 }
 
 pub(crate) fn finish_syscall(
     trap: &mut crate::arch::int80::TrapFrame,
     cpu_frame: *mut u64,
 ) -> Result<(), zx_status_t> {
-    with_state_mut(|state| state.kernel.finish_syscall(trap, cpu_frame))
+    with_kernel_mut(|kernel| kernel.finish_syscall(trap, cpu_frame))
 }
 
 #[allow(dead_code)]
 pub(crate) fn resolve_current_futex_key_relaxed(
     user_addr: zx_vaddr_t,
 ) -> Result<axle_mm::FutexKey, zx_status_t> {
-    with_state_mut(|state| state.kernel.resolve_current_futex_key_relaxed(user_addr))
+    with_kernel_mut(|kernel| kernel.resolve_current_futex_key_relaxed(user_addr))
 }
 
 fn read_current_futex_word(user_addr: zx_vaddr_t) -> Result<zx_futex_t, zx_status_t> {
@@ -428,7 +441,7 @@ fn read_current_futex_word(user_addr: zx_vaddr_t) -> Result<zx_futex_t, zx_statu
 pub(crate) fn resolve_current_futex_key(
     user_addr: zx_vaddr_t,
 ) -> Result<axle_mm::FutexKey, zx_status_t> {
-    with_state_mut(|state| state.kernel.resolve_current_futex_key(user_addr))
+    with_kernel_mut(|kernel| kernel.resolve_current_futex_key(user_addr))
 }
 
 fn with_state_mut<T>(
@@ -437,6 +450,28 @@ fn with_state_mut<T>(
     let mut guard = STATE.lock();
     let state = guard.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
     f(state)
+}
+
+fn kernel_handle() -> Result<Arc<Mutex<crate::task::Kernel>>, zx_status_t> {
+    let guard = STATE.lock();
+    let state = guard.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+    Ok(state.kernel.clone())
+}
+
+fn with_kernel_mut<T>(
+    f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    let kernel = kernel_handle()?;
+    let mut kernel = kernel.lock();
+    f(&mut kernel)
+}
+
+fn with_kernel<T>(
+    f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    let kernel = kernel_handle()?;
+    let kernel = kernel.lock();
+    f(&kernel)
 }
 
 /// Create a new Port object and return a handle.
@@ -469,7 +504,9 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
     }
 
     with_state_mut(|state| {
-        let owner_process_id = state.kernel.current_process_info()?.process_id();
+        let owner_process_id = state
+            .with_kernel(|kernel| kernel.current_process_info())?
+            .process_id();
         let left_object_id = state.alloc_object_id();
         let right_object_id = state.alloc_object_id();
         state.objects.insert(
@@ -507,7 +544,10 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
 
 fn release_channel_payload(state: &mut KernelState, payload: ChannelPayload) {
     if let ChannelPayload::Loaned(loaned) = payload {
-        state.kernel.release_loaned_user_pages(&loaned);
+        let _ = state.with_kernel_mut(|kernel| {
+            kernel.release_loaned_user_pages(&loaned);
+            Ok(())
+        });
     }
 }
 
@@ -528,23 +568,21 @@ fn channel_endpoint_address_space_id(
     state: &KernelState,
     endpoint: &ChannelEndpoint,
 ) -> Result<u64, zx_status_t> {
-    state
-        .kernel
-        .process_address_space_id(endpoint.owner_process_id)
+    state.with_kernel(|kernel| kernel.process_address_space_id(endpoint.owner_process_id))
 }
 
 pub(crate) fn try_loan_current_user_pages(
     ptr: u64,
     len: usize,
 ) -> Result<Option<crate::task::LoanedUserPages>, zx_status_t> {
-    with_state_mut(|state| state.kernel.try_loan_current_user_pages(ptr, len))
+    with_kernel_mut(|kernel| kernel.try_loan_current_user_pages(ptr, len))
 }
 
 pub(crate) fn try_remap_loaned_channel_read(
     dst_base: u64,
     loaned: &crate::task::LoanedUserPages,
 ) -> Result<bool, zx_status_t> {
-    with_state_mut(|state| state.kernel.try_remap_loaned_channel_read(dst_base, loaned))
+    with_kernel_mut(|kernel| kernel.try_remap_loaned_channel_read(dst_base, loaned))
 }
 
 /// Create a new thread object in the target process and return a handle.
@@ -565,7 +603,8 @@ pub fn create_thread(
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
 
-        let (thread_id, koid) = state.kernel.create_thread(process.process_id)?;
+        let (thread_id, koid) =
+            state.with_kernel_mut(|kernel| kernel.create_thread(process.process_id))?;
         let object_id = state.alloc_object_id();
         state.objects.insert(
             object_id,
@@ -605,7 +644,7 @@ pub fn create_process(
             None => return Err(ZX_ERR_BAD_HANDLE),
         }
 
-        let created = state.kernel.create_process()?;
+        let created = state.with_kernel_mut(|kernel| kernel.create_process())?;
 
         let process_object_id = state.alloc_object_id();
         state.objects.insert(
@@ -673,23 +712,21 @@ pub fn start_thread(
             Some(_) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
-        if !state
-            .kernel
-            .validate_process_user_ptr(thread.process_id, entry, 1)
-        {
+        if !state.with_kernel(|kernel| {
+            Ok(kernel.validate_process_user_ptr(thread.process_id, entry, 1))
+        })? {
             return Err(ZX_ERR_INVALID_ARGS);
         }
         let stack_probe = stack.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
-        if !state
-            .kernel
-            .validate_process_user_ptr(thread.process_id, stack_probe, 8)
-        {
+        if !state.with_kernel(|kernel| {
+            Ok(kernel.validate_process_user_ptr(thread.process_id, stack_probe, 8))
+        })? {
             return Err(ZX_ERR_INVALID_ARGS);
         }
 
-        state
-            .kernel
-            .start_thread(thread.thread_id, entry, stack, arg0, arg1)
+        state.with_kernel_mut(|kernel| {
+            kernel.start_thread(thread.thread_id, entry, stack, arg0, arg1)
+        })
     })
 }
 
@@ -737,11 +774,7 @@ pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_s
 
 /// Validate a user pointer against the current thread's address-space policy.
 pub fn validate_current_user_ptr(ptr: u64, len: usize) -> bool {
-    let mut guard = STATE.lock();
-    let Some(state) = guard.as_mut() else {
-        return false;
-    };
-    state.validate_current_user_ptr(ptr, len)
+    with_kernel(|kernel| Ok(kernel.validate_current_user_ptr(ptr, len))).unwrap_or(false)
 }
 
 /// Ensure the current thread's user range is resident before raw kernel access.
@@ -750,24 +783,41 @@ pub fn ensure_current_user_range_resident(
     len: usize,
     for_write: bool,
 ) -> Result<(), zx_status_t> {
-    let mut guard = STATE.lock();
-    let Some(state) = guard.as_mut() else {
-        return Err(ZX_ERR_BAD_STATE);
-    };
-    state
-        .kernel
-        .ensure_current_user_range_resident(ptr, len, for_write)
+    if len == 0 {
+        return Ok(());
+    }
+    if !with_kernel(|kernel| Ok(kernel.validate_current_user_ptr(ptr, len)))? {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    let page_bytes = crate::userspace::USER_PAGE_BYTES;
+    let start = ptr - (ptr % page_bytes);
+    let end = ptr
+        .checked_add(len as u64)
+        .and_then(|limit| {
+            let rem = limit % page_bytes;
+            if rem == 0 {
+                Some(limit)
+            } else {
+                limit.checked_add(page_bytes - rem)
+            }
+        })
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+
+    let mut page_va = start;
+    while page_va < end {
+        with_kernel_mut(|kernel| kernel.ensure_current_user_page_resident(page_va, for_write))?;
+        page_va = page_va.checked_add(page_bytes).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    }
+    Ok(())
 }
 
 /// Try to resolve a bootstrap user-mode page fault.
 pub fn handle_page_fault(cr2: u64, error: u64) -> bool {
-    let mut guard = STATE.lock();
-    let Some(state) = guard.as_mut() else {
-        return false;
-    };
-    let handled = state.kernel.handle_current_page_fault(cr2, error);
+    let handled =
+        with_kernel_mut(|kernel| Ok(kernel.handle_current_page_fault(cr2, error))).unwrap_or(false);
     if handled {
-        let _ = state.kernel.sync_current_cpu_tlb_state();
+        let _ = with_kernel_mut(|kernel| kernel.sync_current_cpu_tlb_state());
     }
     handled
 }
@@ -807,9 +857,9 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
 
     with_state_mut(|state| {
         let object_id = state.alloc_object_id();
-        let created = state
-            .kernel
-            .create_current_anonymous_vmo(size, axle_mm::GlobalVmoId::new(object_id))?;
+        let created = state.with_kernel_mut(|kernel| {
+            kernel.create_current_anonymous_vmo(size, axle_mm::GlobalVmoId::new(object_id))
+        })?;
         debug_assert_eq!(created.global_vmo_id().raw(), object_id);
         state.objects.insert(
             object_id,
@@ -922,9 +972,9 @@ pub fn channel_write(
         };
 
         if let Some(ChannelPayload::Loaned(loaned)) = payload.as_mut()
-            && let Err(status) = state
-                .kernel
-                .prepare_loaned_channel_write(loaned, receiver_address_space_id)
+            && let Err(status) = state.with_kernel_mut(|kernel| {
+                kernel.prepare_loaned_channel_write(loaned, receiver_address_space_id)
+            })
         {
             if let Some(released) = payload.take() {
                 release_channel_payload(state, released);
@@ -1157,16 +1207,18 @@ pub fn vmar_allocate(
             return Err(ZX_ERR_ACCESS_DENIED);
         }
 
-        let child = state.kernel.allocate_subvmar(
-            parent.address_space_id,
-            parent.vmar_id,
-            offset,
-            len,
-            request.align,
-            request.mode,
-            request.offset_is_upper_limit,
-            request.child_policy,
-        )?;
+        let child = state.with_kernel_mut(|kernel| {
+            kernel.allocate_subvmar(
+                parent.address_space_id,
+                parent.vmar_id,
+                offset,
+                len,
+                request.align,
+                request.mode,
+                request.offset_is_upper_limit,
+                request.child_policy,
+            )
+        })?;
         let object_id = state.alloc_object_id();
         state.objects.insert(
             object_id,
@@ -1184,9 +1236,9 @@ pub fn vmar_allocate(
             Ok(handle) => handle,
             Err(err) => {
                 let _ = state.objects.remove(&object_id);
-                let _ = state
-                    .kernel
-                    .destroy_vmar(parent.address_space_id, child.id());
+                let _ = state.with_kernel_mut(|kernel| {
+                    kernel.destroy_vmar(parent.address_space_id, child.id())
+                });
                 return Err(err);
             }
         };
@@ -1225,24 +1277,28 @@ pub fn vmar_map(
         require_vm_mapping_rights(resolved_vmo, request.perms)?;
         require_vmar_mapping_caps(vmar.mapping_caps, request.perms, request.specific)?;
         if request.specific {
-            state.kernel.map_current_vmo_into_vmar(
-                vmar.address_space_id,
-                vmar.vmar_id,
-                vmo.global_vmo_id,
-                vmar_offset,
-                vmo_offset,
-                len,
-                request.perms,
-            )
+            state.with_kernel_mut(|kernel| {
+                kernel.map_current_vmo_into_vmar(
+                    vmar.address_space_id,
+                    vmar.vmar_id,
+                    vmo.global_vmo_id,
+                    vmar_offset,
+                    vmo_offset,
+                    len,
+                    request.perms,
+                )
+            })
         } else {
-            state.kernel.map_current_vmo_into_vmar_anywhere(
-                vmar.address_space_id,
-                vmar.vmar_id,
-                vmo.global_vmo_id,
-                vmo_offset,
-                len,
-                request.perms,
-            )
+            state.with_kernel_mut(|kernel| {
+                kernel.map_current_vmo_into_vmar_anywhere(
+                    vmar.address_space_id,
+                    vmar.vmar_id,
+                    vmo.global_vmo_id,
+                    vmo_offset,
+                    len,
+                    request.perms,
+                )
+            })
         }
     })
 }
@@ -1257,9 +1313,7 @@ pub fn vmar_destroy(vmar_handle: zx_handle_t) -> Result<(), zx_status_t> {
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         require_vmar_control_rights(resolved_vmar)?;
-        state
-            .kernel
-            .destroy_vmar(vmar.address_space_id, vmar.vmar_id)?;
+        state.with_kernel_mut(|kernel| kernel.destroy_vmar(vmar.address_space_id, vmar.vmar_id))?;
         let _ = state.objects.remove(&resolved_vmar.object_id());
         Ok(())
     })
@@ -1276,9 +1330,9 @@ pub fn vmar_unmap(vmar_handle: zx_handle_t, addr: u64, len: u64) -> Result<(), z
         };
         let _ = (vmar.process_id, vmar.base, vmar.len);
         require_handle_rights(resolved_vmar, crate::task::HandleRights::WRITE)?;
-        state
-            .kernel
-            .unmap_current_vmar(vmar.address_space_id, vmar.vmar_id, addr, len)
+        state.with_kernel_mut(|kernel| {
+            kernel.unmap_current_vmar(vmar.address_space_id, vmar.vmar_id, addr, len)
+        })
     })
 }
 
@@ -1301,9 +1355,9 @@ pub fn vmar_protect(
         let _ = (vmar.process_id, vmar.base, vmar.len);
         require_vm_mapping_rights(resolved_vmar, perms)?;
         require_vmar_mapping_caps(vmar.mapping_caps, perms, false)?;
-        state
-            .kernel
-            .protect_current_vmar(vmar.address_space_id, vmar.vmar_id, addr, len, perms)
+        state.with_kernel_mut(|kernel| {
+            kernel.protect_current_vmar(vmar.address_space_id, vmar.vmar_id, addr, len, perms)
+        })
     })
 }
 
@@ -1321,11 +1375,10 @@ fn validate_futex_wait_owner(
         Some(_) => return Err(ZX_ERR_WRONG_TYPE),
         None => return Err(ZX_ERR_BAD_HANDLE),
     };
-    let current = state.kernel.current_thread_info()?;
+    let current = state.with_kernel(|kernel| kernel.current_thread_info())?;
     if thread.thread_id == current.thread_id()
         || state
-            .kernel
-            .thread_is_waiting_on_futex(thread.thread_id, key)
+            .with_kernel(|kernel| Ok(kernel.thread_is_waiting_on_futex(thread.thread_id, key)))?
     {
         return Err(ZX_ERR_INVALID_ARGS);
     }
@@ -1348,11 +1401,9 @@ fn validate_futex_requeue_owner(
         None => return Err(ZX_ERR_BAD_HANDLE),
     };
     if state
-        .kernel
-        .thread_is_waiting_on_futex(thread.thread_id, source)
+        .with_kernel(|kernel| Ok(kernel.thread_is_waiting_on_futex(thread.thread_id, source)))?
         || state
-            .kernel
-            .thread_is_waiting_on_futex(thread.thread_id, target)
+            .with_kernel(|kernel| Ok(kernel.thread_is_waiting_on_futex(thread.thread_id, target)))?
     {
         return Err(ZX_ERR_INVALID_ARGS);
     }
@@ -1374,8 +1425,10 @@ pub fn futex_wait(
 
     let blocked_on_scheduler = with_state_mut(|state| {
         let owner_koid = validate_futex_wait_owner(state, key, new_futex_owner)?;
-        if deadline == i64::MAX && state.kernel.can_block_current_thread() {
-            state.kernel.enqueue_current_futex_wait(key, owner_koid)?;
+        if deadline == i64::MAX
+            && state.with_kernel(|kernel| Ok(kernel.can_block_current_thread()))?
+        {
+            state.with_kernel_mut(|kernel| kernel.enqueue_current_futex_wait(key, owner_koid))?;
             Ok(true)
         } else {
             Ok(false)
@@ -1391,13 +1444,14 @@ pub fn futex_wait(
         let still_waiting = with_state_mut(|state| {
             if !registered {
                 let owner_koid = validate_futex_wait_owner(state, key, new_futex_owner)?;
-                state.kernel.enqueue_current_futex_wait(key, owner_koid)?;
+                state
+                    .with_kernel_mut(|kernel| kernel.enqueue_current_futex_wait(key, owner_koid))?;
                 registered = true;
             }
-            let current = state.kernel.current_thread_info()?;
-            Ok(state
-                .kernel
-                .thread_is_waiting_on_futex(current.thread_id(), key))
+            let current = state.with_kernel(|kernel| kernel.current_thread_info())?;
+            state.with_kernel(|kernel| {
+                Ok(kernel.thread_is_waiting_on_futex(current.thread_id(), key))
+            })
         })?;
         if !still_waiting {
             return Ok(());
@@ -1406,7 +1460,7 @@ pub fn futex_wait(
         let now = crate::time::now_ns();
         if deadline != i64::MAX && deadline <= now {
             with_state_mut(|state| {
-                let _ = state.kernel.cancel_current_futex_wait()?;
+                let _ = state.with_kernel_mut(|kernel| kernel.cancel_current_futex_wait())?;
                 Ok(())
             })?;
             return Err(ZX_ERR_TIMED_OUT);
@@ -1421,10 +1475,9 @@ pub fn futex_wait(
 pub fn futex_wake(value_ptr: zx_vaddr_t, wake_count: u32) -> Result<(), zx_status_t> {
     let key = resolve_current_futex_key_relaxed(value_ptr)?;
     with_state_mut(|state| {
-        let _ =
-            state
-                .kernel
-                .wake_futex_waiters(key, wake_count as usize, ZX_KOID_INVALID, false)?;
+        let _ = state.with_kernel_mut(|kernel| {
+            kernel.wake_futex_waiters(key, wake_count as usize, ZX_KOID_INVALID, false)
+        })?;
         Ok(())
     })
 }
@@ -1451,13 +1504,15 @@ pub fn futex_requeue(
     with_state_mut(|state| {
         let owner_koid =
             validate_futex_requeue_owner(state, source_key, target_key, new_requeue_owner)?;
-        let _ = state.kernel.requeue_futex_waiters(
-            source_key,
-            target_key,
-            wake_count as usize,
-            requeue_count as usize,
-            owner_koid,
-        )?;
+        let _ = state.with_kernel_mut(|kernel| {
+            kernel.requeue_futex_waiters(
+                source_key,
+                target_key,
+                wake_count as usize,
+                requeue_count as usize,
+                owner_koid,
+            )
+        })?;
         Ok(())
     })
 }
@@ -1465,7 +1520,7 @@ pub fn futex_requeue(
 /// Report the current futex owner koid, or `ZX_KOID_INVALID` when unlocked.
 pub fn futex_get_owner(value_ptr: zx_vaddr_t) -> Result<zx_koid_t, zx_status_t> {
     let key = resolve_current_futex_key_relaxed(value_ptr)?;
-    with_state_mut(|state| Ok(state.kernel.futex_owner(key)))
+    with_state_mut(|state| state.with_kernel(|kernel| Ok(kernel.futex_owner(key))))
 }
 
 /// Ensure a handle is valid and references a Port object.
@@ -1624,11 +1679,12 @@ pub fn port_wait(
         match wait_port_packet(handle) {
             Ok(pkt) => {
                 with_state_mut(|state| {
-                    state.kernel.copyout_thread_user(
-                        state.kernel.current_thread_info()?.thread_id(),
-                        out_ptr,
-                        pkt,
-                    )
+                    let thread_id = state
+                        .with_kernel(|kernel| kernel.current_thread_info())?
+                        .thread_id();
+                    state.with_kernel_mut(|kernel| {
+                        kernel.copyout_thread_user(thread_id, out_ptr, pkt)
+                    })
                 })?;
                 return Ok(());
             }
@@ -1639,8 +1695,12 @@ pub fn port_wait(
                 let blocked_on_scheduler = with_state_mut(|state| {
                     let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
                     let object_id = resolved.object_id();
-                    if deadline == i64::MAX && state.kernel.can_block_current_thread() {
-                        state.kernel.enqueue_current_port_wait(object_id, out_ptr)?;
+                    if deadline == i64::MAX
+                        && state.with_kernel(|kernel| Ok(kernel.can_block_current_thread()))?
+                    {
+                        state.with_kernel_mut(|kernel| {
+                            kernel.enqueue_current_port_wait(object_id, out_ptr)
+                        })?;
                         Ok(true)
                     } else {
                         Ok(false)
@@ -1696,17 +1756,20 @@ pub fn object_wait_one(
             let object_id = resolved.object_id();
             let observed = signals_for_object_id(state, object_id)?;
             if observed.intersects(watched) {
-                state.kernel.copyout_thread_user(
-                    state.kernel.current_thread_info()?.thread_id(),
-                    observed_ptr,
-                    observed.bits(),
-                )?;
+                let thread_id = state
+                    .with_kernel(|kernel| kernel.current_thread_info())?
+                    .thread_id();
+                state.with_kernel_mut(|kernel| {
+                    kernel.copyout_thread_user(thread_id, observed_ptr, observed.bits())
+                })?;
                 return Ok(());
             }
-            if deadline == i64::MAX && state.kernel.can_block_current_thread() {
-                state
-                    .kernel
-                    .enqueue_current_signal_wait(object_id, watched, observed_ptr)?;
+            if deadline == i64::MAX
+                && state.with_kernel(|kernel| Ok(kernel.can_block_current_thread()))?
+            {
+                state.with_kernel_mut(|kernel| {
+                    kernel.enqueue_current_signal_wait(object_id, watched, observed_ptr)
+                })?;
                 return Ok(());
             }
         };
@@ -1725,11 +1788,12 @@ pub fn object_wait_one(
                 signals_for_object_id(state, object_id)?
             };
             with_state_mut(|state| {
-                state.kernel.copyout_thread_user(
-                    state.kernel.current_thread_info()?.thread_id(),
-                    observed_ptr,
-                    observed.bits(),
-                )
+                let thread_id = state
+                    .with_kernel(|kernel| kernel.current_thread_info())?
+                    .thread_id();
+                state.with_kernel_mut(|kernel| {
+                    kernel.copyout_thread_user(thread_id, observed_ptr, observed.bits())
+                })
             })?;
             if observed.intersects(watched) {
                 return Ok(());
@@ -1847,7 +1911,7 @@ pub fn on_tick() {
         for fired_object_id in fired {
             let _ = notify_waitable_signals_changed(state, fired_object_id);
         }
-        let _ = state.kernel.sync_current_cpu_tlb_state();
+        let _ = state.with_kernel_mut(|kernel| kernel.sync_current_cpu_tlb_state());
         Ok(())
     });
 }
@@ -2299,25 +2363,22 @@ fn wake_signal_waiters(
     waitable_id: u64,
     current: Signals,
 ) -> Result<(), zx_status_t> {
-    let waiters = state.kernel.signal_waiters_ready(waitable_id, current);
+    let waiters =
+        state.with_kernel_mut(|kernel| Ok(kernel.signal_waiters_ready(waitable_id, current)))?;
     for waiter in waiters {
-        let status = match state.kernel.copyout_thread_user(
-            waiter.thread_id(),
-            waiter.observed_ptr(),
-            current.bits(),
-        ) {
+        let status = match state.with_kernel_mut(|kernel| {
+            kernel.copyout_thread_user(waiter.thread_id(), waiter.observed_ptr(), current.bits())
+        }) {
             Ok(()) => ZX_OK,
             Err(err) => err,
         };
-        state
-            .kernel
-            .make_thread_runnable(waiter.thread_id(), status)?;
+        state.with_kernel_mut(|kernel| kernel.make_thread_runnable(waiter.thread_id(), status))?;
     }
     Ok(())
 }
 
 fn wake_port_waiters(state: &mut KernelState, port_id: u64) -> Result<(), zx_status_t> {
-    let waiters = state.kernel.port_waiters(port_id);
+    let waiters = state.with_kernel_mut(|kernel| Ok(kernel.port_waiters(port_id)))?;
     if waiters.is_empty() {
         return Ok(());
     }
@@ -2331,25 +2392,21 @@ fn wake_port_waiters(state: &mut KernelState, port_id: u64) -> Result<(), zx_sta
                 Ok(packet) => packet,
                 Err(PortError::ShouldWait) => break,
                 Err(err) => {
-                    state
-                        .kernel
-                        .make_thread_runnable(waiter.thread_id(), map_port_error(err))?;
+                    state.with_kernel_mut(|kernel| {
+                        kernel.make_thread_runnable(waiter.thread_id(), map_port_error(err))
+                    })?;
                     continue;
                 }
             }
         };
         let packet = port_packet_from_core(packet);
-        let status =
-            match state
-                .kernel
-                .copyout_thread_user(waiter.thread_id(), waiter.packet_ptr(), packet)
-            {
-                Ok(()) => ZX_OK,
-                Err(err) => err,
-            };
-        state
-            .kernel
-            .make_thread_runnable(waiter.thread_id(), status)?;
+        let status = match state.with_kernel_mut(|kernel| {
+            kernel.copyout_thread_user(waiter.thread_id(), waiter.packet_ptr(), packet)
+        }) {
+            Ok(()) => ZX_OK,
+            Err(err) => err,
+        };
+        state.with_kernel_mut(|kernel| kernel.make_thread_runnable(waiter.thread_id(), status))?;
     }
     Ok(())
 }

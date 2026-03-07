@@ -45,6 +45,10 @@ external VM model.
 - Global anonymous VMO aliases now fault through one shared `GlobalVmo` source
   of truth instead of allocating per-address-space pages on first touch. The
   child-process conformance path now covers this lazy shared-VMO case.
+- Bootstrap user-range prefaulting no longer holds the object layer and kernel
+  locks across an entire multi-page range. It validates once, then resolves one
+  page at a time through the VM kernel path, which narrows the fault-critical
+  section before finer same-page serialization work.
 - `Physical` and `Contiguous` VMO mappings now have explicit non-COW boundaries:
   they must already be resident when mapped, and COW arming rejects them.
 - VM resource governance has started to move under one accounting surface:
