@@ -212,6 +212,14 @@ pub(crate) struct LockedUserPageTable {
     tables: UserPageTables,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageWalkIndices {
+    pml4: usize,
+    pdpt: usize,
+    pd: usize,
+    pt: usize,
+}
+
 impl UserPageTables {
     #[allow(dead_code)]
     fn descriptor_set(&self) -> UserPageTableDescSet {
@@ -369,23 +377,74 @@ impl UserPageTables {
         frame.start_address().as_u64() == self.root_paddr
     }
 
-    fn entry(&self, va: u64) -> Result<&PageTableEntryAccessor, PageTableError> {
-        let index = user_page_index(va)?;
-        Ok(unsafe {
-            // SAFETY: `user_pt_paddr` always points at one page-sized page table page owned by
-            // this address space. The index is range-checked against the fixed user window.
-            &*((&table(self.user_pt_paddr)[index]) as *const _ as *const PageTableEntryAccessor)
-        })
+    fn ensure_page_table_page(
+        &mut self,
+        parent_table_paddr: u64,
+        index: usize,
+    ) -> Result<u64, PageTableError> {
+        let entry = &mut table_mut(parent_table_paddr)[index];
+        if entry.flags().contains(PageTableFlags::PRESENT) {
+            return Ok(entry.addr().as_u64());
+        }
+
+        let child_paddr =
+            crate::userspace::alloc_bootstrap_zeroed_page().ok_or(PageTableError::Backend)?;
+        let flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        entry.set_addr(PhysAddr::new(child_paddr), flags);
+        Ok(child_paddr)
+    }
+
+    fn leaf_table_paddr(&self, va: u64) -> Result<Option<u64>, PageTableError> {
+        let indices = user_page_indices(va)?;
+        let root_entry = &table(self.root_paddr)[indices.pml4];
+        if !root_entry.flags().contains(PageTableFlags::PRESENT) {
+            return Ok(None);
+        }
+        let pdpt_entry = &table(root_entry.addr().as_u64())[indices.pdpt];
+        if !pdpt_entry.flags().contains(PageTableFlags::PRESENT) {
+            return Ok(None);
+        }
+        let pd_entry = &table(pdpt_entry.addr().as_u64())[indices.pd];
+        if !pd_entry.flags().contains(PageTableFlags::PRESENT) {
+            return Ok(None);
+        }
+        Ok(Some(pd_entry.addr().as_u64()))
+    }
+
+    fn ensure_leaf_table_paddr(&mut self, va: u64) -> Result<u64, PageTableError> {
+        let indices = user_page_indices(va)?;
+        let root_paddr = self.root_paddr;
+        let pdpt_paddr = self.ensure_page_table_page(root_paddr, indices.pml4)?;
+        let pd_paddr = self.ensure_page_table_page(pdpt_paddr, indices.pdpt)?;
+        let pt_paddr = self.ensure_page_table_page(pd_paddr, indices.pd)?;
+        if pd_paddr == self.user_pd_paddr && indices.pd == 0 {
+            self.user_pt_paddr = pt_paddr;
+        }
+        Ok(pt_paddr)
     }
 
     fn entry_mut(&mut self, va: u64) -> Result<&mut PageTableEntryAccessor, PageTableError> {
-        let index = user_page_index(va)?;
+        let indices = user_page_indices(va)?;
+        let pt_paddr = self.ensure_leaf_table_paddr(va)?;
         Ok(unsafe {
-            // SAFETY: `user_pt_paddr` always points at one page-sized page table page owned by
-            // this address space. The index is range-checked against the fixed user window.
-            &mut *((&mut table_mut(self.user_pt_paddr)[index]) as *mut _
-                as *mut PageTableEntryAccessor)
+            // SAFETY: `pt_paddr` points at one page-sized PT page owned by this address space.
+            &mut *((&mut table_mut(pt_paddr)[indices.pt]) as *mut _ as *mut PageTableEntryAccessor)
         })
+    }
+
+    fn existing_entry_mut(
+        &mut self,
+        va: u64,
+    ) -> Result<Option<&mut PageTableEntryAccessor>, PageTableError> {
+        let indices = user_page_indices(va)?;
+        let Some(pt_paddr) = self.leaf_table_paddr(va)? else {
+            return Ok(None);
+        };
+        Ok(Some(unsafe {
+            // SAFETY: `pt_paddr` points at an existing PT page reached through present ancestors.
+            &mut *((&mut table_mut(pt_paddr)[indices.pt]) as *mut _ as *mut PageTableEntryAccessor)
+        }))
     }
 }
 
@@ -409,7 +468,11 @@ impl PageTableLock for LockedUserPageTable {
     }
 
     fn query_page(&mut self, va: u64) -> Result<Option<PageMapping>, PageTableError> {
-        let entry = self.tables.entry(va)?;
+        let indices = user_page_indices(va)?;
+        let Some(pt_paddr) = self.tables.leaf_table_paddr(va)? else {
+            return Ok(None);
+        };
+        let entry = &table(pt_paddr)[indices.pt];
         if !entry.flags().contains(PageTableFlags::PRESENT) {
             return Ok(None);
         }
@@ -432,7 +495,9 @@ impl PageTableLock for LockedUserPageTable {
     }
 
     fn unmap_page(&mut self, va: u64) -> Result<(), PageTableError> {
-        let entry = self.tables.entry_mut(va)?;
+        let Some(entry) = self.tables.existing_entry_mut(va)? else {
+            return Err(PageTableError::NotMapped);
+        };
         if !entry.flags().contains(PageTableFlags::PRESENT) {
             return Err(PageTableError::NotMapped);
         }
@@ -441,7 +506,9 @@ impl PageTableLock for LockedUserPageTable {
     }
 
     fn protect_page(&mut self, va: u64, writable: bool) -> Result<(), PageTableError> {
-        let entry = self.tables.entry_mut(va)?;
+        let Some(entry) = self.tables.existing_entry_mut(va)? else {
+            return Err(PageTableError::NotMapped);
+        };
         if !entry.flags().contains(PageTableFlags::PRESENT) {
             return Err(PageTableError::NotMapped);
         }
@@ -521,7 +588,7 @@ fn entry_meta_template(entry: &PageTableEntry) -> PtMetaTemplate {
     }
 }
 
-fn user_page_index(va: u64) -> Result<usize, PageTableError> {
+fn user_page_indices(va: u64) -> Result<PageWalkIndices, PageTableError> {
     let base = crate::userspace::USER_CODE_VA;
     let len = crate::userspace::USER_REGION_BYTES;
     if va < base || va >= base.checked_add(len).ok_or(PageTableError::InvalidArgs)? {
@@ -530,8 +597,12 @@ fn user_page_index(va: u64) -> Result<usize, PageTableError> {
     if va & (crate::userspace::USER_PAGE_BYTES - 1) != 0 {
         return Err(PageTableError::InvalidArgs);
     }
-    usize::try_from((va - base) / crate::userspace::USER_PAGE_BYTES)
-        .map_err(|_| PageTableError::InvalidArgs)
+    Ok(PageWalkIndices {
+        pml4: ((va >> 39) & 0x1ff) as usize,
+        pdpt: ((va >> 30) & 0x1ff) as usize,
+        pd: ((va >> 21) & 0x1ff) as usize,
+        pt: ((va >> 12) & 0x1ff) as usize,
+    })
 }
 
 fn table(paddr: u64) -> &'static X86PageTable {

@@ -18,11 +18,13 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
 /// Canonical page size used by the metadata layer.
 pub const PAGE_SIZE: u64 = 0x1000;
+const PT_LEAF_PAGE_COUNT: u64 = 512;
 
 bitflags! {
     /// Mapping permissions carried by a VMA.
@@ -956,48 +958,85 @@ pub enum PageFaultDecision {
 }
 
 #[derive(Debug)]
-struct PteMetaStore {
+struct SparseLeafStore<T: Copy> {
     base_vpn: u64,
-    slots: Vec<Option<PteMeta>>,
+    page_count: u64,
+    leaves: BTreeMap<u64, Vec<Option<T>>>,
 }
 
-impl PteMetaStore {
+impl<T: Copy> SparseLeafStore<T> {
     fn new(root_base: u64, root_len: u64) -> Result<Self, AddressSpaceError> {
         if root_len == 0 || !is_page_aligned(root_base) || !is_page_aligned(root_len) {
             return Err(AddressSpaceError::InvalidArgs);
         }
-        let page_count =
-            usize::try_from(root_len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
         Ok(Self {
             base_vpn: vpn_of(root_base),
-            slots: alloc::vec![None; page_count],
+            page_count: root_len / PAGE_SIZE,
+            leaves: BTreeMap::new(),
         })
     }
 
-    fn meta(&self, va: u64) -> Option<PteMeta> {
-        let page_base = align_down(va, PAGE_SIZE);
-        self.meta_for_vpn(vpn_of(page_base))
+    fn get(&self, vpn: u64) -> Option<T> {
+        let (leaf_base_vpn, slot_index) = self.leaf_slot(vpn).ok()?;
+        self.leaves
+            .get(&leaf_base_vpn)?
+            .get(slot_index)
+            .copied()
+            .flatten()
     }
 
-    fn meta_for_vpn(&self, vpn: u64) -> Option<PteMeta> {
-        let index = self.index_for_vpn(vpn).ok()?;
-        self.slots.get(index).copied().flatten()
+    fn set(&mut self, vpn: u64, value: Option<T>) -> Result<(), AddressSpaceError> {
+        let (leaf_base_vpn, slot_index) = self.leaf_slot(vpn)?;
+        match value {
+            Some(value) => {
+                let leaf = self
+                    .leaves
+                    .entry(leaf_base_vpn)
+                    .or_insert_with(|| alloc::vec![None; PT_LEAF_PAGE_COUNT as usize]);
+                leaf[slot_index] = Some(value);
+            }
+            None => {
+                let mut remove_leaf = false;
+                if let Some(leaf) = self.leaves.get_mut(&leaf_base_vpn) {
+                    leaf[slot_index] = None;
+                    remove_leaf = leaf.iter().all(Option::is_none);
+                }
+                if remove_leaf {
+                    let _ = self.leaves.remove(&leaf_base_vpn);
+                }
+            }
+        }
+        Ok(())
     }
 
-    fn install_range(&mut self, base: u64, metas: &[PteMeta]) -> Result<(), AddressSpaceError> {
-        if metas.is_empty() || !is_page_aligned(base) {
+    fn install_dense_range(&mut self, base: u64, values: &[T]) -> Result<(), AddressSpaceError> {
+        if values.is_empty() || !is_page_aligned(base) {
             return Err(AddressSpaceError::InvalidArgs);
         }
-        let start = self.index_for_vpn(vpn_of(base))?;
-        let end = start
-            .checked_add(metas.len())
-            .ok_or(AddressSpaceError::InvalidArgs)?;
-        let slots = self
-            .slots
-            .get_mut(start..end)
-            .ok_or(AddressSpaceError::OutOfRange)?;
-        for (slot, meta) in slots.iter_mut().zip(metas.iter().copied()) {
-            *slot = Some(meta);
+        let page_count =
+            usize::try_from(self.range_page_count(base, values.len() as u64 * PAGE_SIZE)?)
+                .map_err(|_| AddressSpaceError::InvalidArgs)?;
+        for (page_index, value) in values.iter().copied().enumerate().take(page_count) {
+            let vpn = vpn_of(base + (page_index as u64) * PAGE_SIZE);
+            self.set(vpn, Some(value))?;
+        }
+        Ok(())
+    }
+
+    fn install_optional_range(
+        &mut self,
+        base: u64,
+        values: &[Option<T>],
+    ) -> Result<(), AddressSpaceError> {
+        if values.is_empty() || !is_page_aligned(base) {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+        let page_count =
+            usize::try_from(self.range_page_count(base, values.len() as u64 * PAGE_SIZE)?)
+                .map_err(|_| AddressSpaceError::InvalidArgs)?;
+        for (page_index, value) in values.iter().copied().enumerate().take(page_count) {
+            let vpn = vpn_of(base + (page_index as u64) * PAGE_SIZE);
+            self.set(vpn, value)?;
         }
         Ok(())
     }
@@ -1006,16 +1045,9 @@ impl PteMetaStore {
         validate_mapping_range(base, len)?;
         let page_count =
             usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
-        let start = self.index_for_vpn(vpn_of(base))?;
-        let end = start
-            .checked_add(page_count)
-            .ok_or(AddressSpaceError::InvalidArgs)?;
-        let slots = self
-            .slots
-            .get_mut(start..end)
-            .ok_or(AddressSpaceError::OutOfRange)?;
-        for slot in slots {
-            *slot = None;
+        for page_index in 0..page_count {
+            let vpn = vpn_of(base + (page_index as u64) * PAGE_SIZE);
+            self.set(vpn, None)?;
         }
         Ok(())
     }
@@ -1027,50 +1059,106 @@ impl PteMetaStore {
         mut update: F,
     ) -> Result<(), AddressSpaceError>
     where
-        F: FnMut(&mut PteMeta),
+        F: FnMut(&mut T),
     {
         validate_mapping_range(base, len)?;
         let page_count =
             usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
-        let start = self.index_for_vpn(vpn_of(base))?;
-        let end = start
-            .checked_add(page_count)
-            .ok_or(AddressSpaceError::InvalidArgs)?;
-        let slots = self
-            .slots
-            .get_mut(start..end)
-            .ok_or(AddressSpaceError::OutOfRange)?;
-        for slot in slots {
-            let meta = slot.as_mut().ok_or(AddressSpaceError::NotFound)?;
-            update(meta);
+        for page_index in 0..page_count {
+            let vpn = vpn_of(base + (page_index as u64) * PAGE_SIZE);
+            let (leaf_base_vpn, slot_index) = self.leaf_slot(vpn)?;
+            let leaf = self
+                .leaves
+                .get_mut(&leaf_base_vpn)
+                .ok_or(AddressSpaceError::NotFound)?;
+            let value = leaf[slot_index]
+                .as_mut()
+                .ok_or(AddressSpaceError::NotFound)?;
+            update(value);
         }
         Ok(())
     }
 
-    fn index_for_vpn(&self, vpn: u64) -> Result<usize, AddressSpaceError> {
+    fn leaf_slot(&self, vpn: u64) -> Result<(u64, usize), AddressSpaceError> {
         let relative = vpn
             .checked_sub(self.base_vpn)
             .ok_or(AddressSpaceError::OutOfRange)?;
-        usize::try_from(relative).map_err(|_| AddressSpaceError::InvalidArgs)
+        if relative >= self.page_count {
+            return Err(AddressSpaceError::OutOfRange);
+        }
+        let leaf_index = relative / PT_LEAF_PAGE_COUNT;
+        let slot_index = usize::try_from(relative % PT_LEAF_PAGE_COUNT)
+            .map_err(|_| AddressSpaceError::InvalidArgs)?;
+        let leaf_base_vpn = self.base_vpn + leaf_index * PT_LEAF_PAGE_COUNT;
+        Ok((leaf_base_vpn, slot_index))
+    }
+
+    fn range_page_count(&self, base: u64, len: u64) -> Result<u64, AddressSpaceError> {
+        validate_mapping_range(base, len)?;
+        let first_vpn = vpn_of(base);
+        let last_vpn = vpn_of(base + len - PAGE_SIZE);
+        let first_relative = first_vpn
+            .checked_sub(self.base_vpn)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let last_relative = last_vpn
+            .checked_sub(self.base_vpn)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        if last_relative >= self.page_count {
+            return Err(AddressSpaceError::OutOfRange);
+        }
+        last_relative
+            .checked_sub(first_relative)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(AddressSpaceError::InvalidArgs)
+    }
+}
+
+#[derive(Debug)]
+struct PteMetaStore {
+    leaves: SparseLeafStore<PteMeta>,
+}
+
+impl PteMetaStore {
+    fn new(root_base: u64, root_len: u64) -> Result<Self, AddressSpaceError> {
+        Ok(Self {
+            leaves: SparseLeafStore::new(root_base, root_len)?,
+        })
+    }
+
+    fn meta(&self, va: u64) -> Option<PteMeta> {
+        let page_base = align_down(va, PAGE_SIZE);
+        self.meta_for_vpn(vpn_of(page_base))
+    }
+
+    fn meta_for_vpn(&self, vpn: u64) -> Option<PteMeta> {
+        self.leaves.get(vpn)
+    }
+
+    fn install_range(&mut self, base: u64, metas: &[PteMeta]) -> Result<(), AddressSpaceError> {
+        self.leaves.install_dense_range(base, metas)
+    }
+
+    fn clear_range(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
+        self.leaves.clear_range(base, len)
+    }
+
+    fn update_range<F>(&mut self, base: u64, len: u64, update: F) -> Result<(), AddressSpaceError>
+    where
+        F: FnMut(&mut PteMeta),
+    {
+        self.leaves.update_range(base, len, update)
     }
 }
 
 #[derive(Debug)]
 struct RmapIndexStore {
-    base_vpn: u64,
-    slots: Vec<Option<RmapNodeId>>,
+    leaves: SparseLeafStore<RmapNodeId>,
 }
 
 impl RmapIndexStore {
     fn new(root_base: u64, root_len: u64) -> Result<Self, AddressSpaceError> {
-        if root_len == 0 || !is_page_aligned(root_base) || !is_page_aligned(root_len) {
-            return Err(AddressSpaceError::InvalidArgs);
-        }
-        let page_count =
-            usize::try_from(root_len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
         Ok(Self {
-            base_vpn: vpn_of(root_base),
-            slots: alloc::vec![None; page_count],
+            leaves: SparseLeafStore::new(root_base, root_len)?,
         })
     }
 
@@ -1080,8 +1168,7 @@ impl RmapIndexStore {
     }
 
     fn node_for_vpn(&self, vpn: u64) -> Option<RmapNodeId> {
-        let index = self.index_for_vpn(vpn).ok()?;
-        self.slots.get(index).copied().flatten()
+        self.leaves.get(vpn)
     }
 
     fn install_range(
@@ -1089,56 +1176,15 @@ impl RmapIndexStore {
         base: u64,
         nodes: &[Option<RmapNodeId>],
     ) -> Result<(), AddressSpaceError> {
-        if nodes.is_empty() || !is_page_aligned(base) {
-            return Err(AddressSpaceError::InvalidArgs);
-        }
-        let start = self.index_for_vpn(vpn_of(base))?;
-        let end = start
-            .checked_add(nodes.len())
-            .ok_or(AddressSpaceError::InvalidArgs)?;
-        let slots = self
-            .slots
-            .get_mut(start..end)
-            .ok_or(AddressSpaceError::OutOfRange)?;
-        for (slot, node_id) in slots.iter_mut().zip(nodes.iter().copied()) {
-            *slot = node_id;
-        }
-        Ok(())
+        self.leaves.install_optional_range(base, nodes)
     }
 
     fn clear_range(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
-        validate_mapping_range(base, len)?;
-        let page_count =
-            usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
-        let start = self.index_for_vpn(vpn_of(base))?;
-        let end = start
-            .checked_add(page_count)
-            .ok_or(AddressSpaceError::InvalidArgs)?;
-        let slots = self
-            .slots
-            .get_mut(start..end)
-            .ok_or(AddressSpaceError::OutOfRange)?;
-        for slot in slots {
-            *slot = None;
-        }
-        Ok(())
+        self.leaves.clear_range(base, len)
     }
 
     fn set_node(&mut self, va: u64, node_id: Option<RmapNodeId>) -> Result<(), AddressSpaceError> {
-        let index = self.index_for_vpn(vpn_of(align_down(va, PAGE_SIZE)))?;
-        let slot = self
-            .slots
-            .get_mut(index)
-            .ok_or(AddressSpaceError::OutOfRange)?;
-        *slot = node_id;
-        Ok(())
-    }
-
-    fn index_for_vpn(&self, vpn: u64) -> Result<usize, AddressSpaceError> {
-        let relative = vpn
-            .checked_sub(self.base_vpn)
-            .ok_or(AddressSpaceError::OutOfRange)?;
-        usize::try_from(relative).map_err(|_| AddressSpaceError::InvalidArgs)
+        self.leaves.set(vpn_of(align_down(va, PAGE_SIZE)), node_id)
     }
 }
 
@@ -2892,6 +2938,67 @@ mod tests {
         space.unmap(&mut frames, ROOT_BASE, PAGE_SIZE * 2).unwrap();
         assert_eq!(frames.state(late).unwrap().map_count(), 0);
         assert_eq!(frames.state(late).unwrap().rmap_anchor_count(), 0);
+    }
+
+    #[test]
+    fn sparse_metadata_allocates_per_leaf_page() {
+        let wide_len = PT_LEAF_PAGE_COUNT * PAGE_SIZE * 2;
+        let mut frames = FrameTable::new();
+        let near = frames.register_existing(0xe2_0000).unwrap();
+        let far = frames.register_existing(0xe2_1000).unwrap();
+
+        let mut space = AddressSpace::new(ROOT_BASE, wide_len).unwrap();
+        let near_vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(33))
+            .unwrap();
+        let far_vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(34))
+            .unwrap();
+        space.bind_vmo_frame(near_vmo, 0, near).unwrap();
+        space.bind_vmo_frame(far_vmo, 0, far).unwrap();
+
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                near_vmo,
+                0,
+                MappingPerms::READ | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE + PT_LEAF_PAGE_COUNT * PAGE_SIZE,
+                PAGE_SIZE,
+                far_vmo,
+                0,
+                MappingPerms::READ | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+
+        assert_eq!(space.pte_meta.leaves.leaves.len(), 2);
+        assert_eq!(space.rmap_index.leaves.leaves.len(), 2);
+
+        space
+            .unmap(
+                &mut frames,
+                ROOT_BASE + PT_LEAF_PAGE_COUNT * PAGE_SIZE,
+                PAGE_SIZE,
+            )
+            .unwrap();
+
+        assert_eq!(space.pte_meta.leaves.leaves.len(), 1);
+        assert_eq!(space.rmap_index.leaves.leaves.len(), 1);
+        assert!(space.lookup(ROOT_BASE).is_some());
+        assert!(
+            space
+                .lookup(ROOT_BASE + PT_LEAF_PAGE_COUNT * PAGE_SIZE)
+                .is_none()
+        );
     }
 
     #[test]
