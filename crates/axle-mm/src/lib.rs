@@ -659,6 +659,13 @@ impl Vmar {
     fn end(self) -> u64 {
         self.base + self.len
     }
+
+    fn contains_range(self, base: u64, len: u64) -> bool {
+        let Some(end) = base.checked_add(len) else {
+            return false;
+        };
+        base >= self.base && end <= self.end()
+    }
 }
 
 const VA_MAGAZINE_BYTES: u64 = 0x20_0000;
@@ -733,6 +740,7 @@ impl MapRec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Vma {
     map_id: MapId,
+    vmar_id: VmarId,
     base: u64,
     len: u64,
     vmo_id: VmoId,
@@ -747,6 +755,11 @@ impl Vma {
     /// Stable coarse mapping identifier.
     pub const fn map_id(self) -> MapId {
         self.map_id
+    }
+
+    /// Owning VMAR id.
+    pub const fn vmar_id(self) -> VmarId {
+        self.vmar_id
     }
 
     /// Mapping base address.
@@ -833,7 +846,7 @@ impl VmaLookup {
         self.map_id
     }
 
-    /// Root VMAR containing the mapping.
+    /// Owning VMAR containing the mapping.
     pub const fn vmar_id(self) -> VmarId {
         self.vmar_id
     }
@@ -1656,11 +1669,12 @@ impl AddressSpace {
             .collect()
     }
 
-    /// Install a fixed mapping into the root VMAR.
+    /// Install a fixed mapping into one VMAR.
     #[allow(clippy::too_many_arguments)]
-    pub fn map_fixed(
+    pub fn map_fixed_in_vmar(
         &mut self,
         frames: &mut FrameTable,
+        vmar_id: VmarId,
         base: u64,
         len: u64,
         vmo_id: VmoId,
@@ -1669,7 +1683,8 @@ impl AddressSpace {
         max_perms: MappingPerms,
     ) -> Result<(), AddressSpaceError> {
         validate_mapping_range(base, len)?;
-        if !max_perms.contains(perms) || !self.root_contains(base, len) {
+        let vmar = self.vmar(vmar_id).ok_or(AddressSpaceError::InvalidVmar)?;
+        if !max_perms.contains(perms) || !vmar.contains_range(base, len) {
             return Err(if !max_perms.contains(perms) {
                 AddressSpaceError::PermissionIncrease
             } else {
@@ -1694,11 +1709,9 @@ impl AddressSpace {
         {
             return Err(AddressSpaceError::Overlap);
         }
-        if self
-            .child_vmars
-            .iter()
-            .any(|existing| ranges_overlap(existing.base(), existing.len(), base, len))
-        {
+        if self.child_vmars.iter().any(|existing| {
+            existing.id() != vmar_id && ranges_overlap(existing.base(), existing.len(), base, len)
+        }) {
             return Err(AddressSpaceError::Overlap);
         }
 
@@ -1739,7 +1752,7 @@ impl AddressSpace {
 
         let map_rec = MapRec {
             id: map_id,
-            vmar_id: self.root.id,
+            vmar_id,
             base,
             len,
             vmo_id,
@@ -1749,6 +1762,7 @@ impl AddressSpace {
         };
         let vma = Vma {
             map_id,
+            vmar_id,
             base,
             len,
             vmo_id,
@@ -1786,10 +1800,35 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Remove an existing mapping.
-    pub fn unmap(
+    /// Install a fixed mapping into the root VMAR.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_fixed(
         &mut self,
         frames: &mut FrameTable,
+        base: u64,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        max_perms: MappingPerms,
+    ) -> Result<(), AddressSpaceError> {
+        self.map_fixed_in_vmar(
+            frames,
+            self.root.id,
+            base,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            max_perms,
+        )
+    }
+
+    /// Remove an existing mapping.
+    pub fn unmap_in_vmar(
+        &mut self,
+        frames: &mut FrameTable,
+        vmar_id: VmarId,
         base: u64,
         len: u64,
     ) -> Result<(), AddressSpaceError> {
@@ -1797,7 +1836,7 @@ impl AddressSpace {
         let index = self
             .vmas
             .iter()
-            .position(|vma| vma.base == base && vma.len == len)
+            .position(|vma| vma.vmar_id == vmar_id && vma.base == base && vma.len == len)
             .ok_or(AddressSpaceError::NotFound)?;
         let vma = self.vmas[index];
         let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
@@ -1837,9 +1876,20 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Change permissions on an existing mapping without changing its extent.
-    pub fn protect(
+    /// Remove an existing mapping from the root VMAR.
+    pub fn unmap(
         &mut self,
+        frames: &mut FrameTable,
+        base: u64,
+        len: u64,
+    ) -> Result<(), AddressSpaceError> {
+        self.unmap_in_vmar(frames, self.root.id, base, len)
+    }
+
+    /// Change permissions on an existing mapping without changing its extent.
+    pub fn protect_in_vmar(
+        &mut self,
+        vmar_id: VmarId,
         base: u64,
         len: u64,
         new_perms: MappingPerms,
@@ -1848,7 +1898,7 @@ impl AddressSpace {
         let vma = self
             .vmas
             .iter_mut()
-            .find(|vma| vma.base == base && vma.len == len)
+            .find(|vma| vma.vmar_id == vmar_id && vma.base == base && vma.len == len)
             .ok_or(AddressSpaceError::NotFound)?;
         if !vma.max_perms.contains(new_perms) {
             return Err(AddressSpaceError::PermissionIncrease);
@@ -1860,6 +1910,16 @@ impl AddressSpace {
             meta.logical_write = logical_write;
         })?;
         Ok(())
+    }
+
+    /// Change permissions on one existing root-VMAR mapping.
+    pub fn protect(
+        &mut self,
+        base: u64,
+        len: u64,
+        new_perms: MappingPerms,
+    ) -> Result<(), AddressSpaceError> {
+        self.protect_in_vmar(self.root.id, base, len, new_perms)
     }
 
     /// Arm an existing mapping for copy-on-write handling.
@@ -2163,7 +2223,7 @@ impl AddressSpace {
             .unwrap_or(vma.copy_on_write);
         Some(VmaLookup {
             map_id: vma.map_id,
-            vmar_id: self.root.id,
+            vmar_id: vma.vmar_id,
             vmo_id: vma.vmo_id,
             global_vmo_id: vma.global_vmo_id,
             vmo_kind: vmo.kind(),
@@ -2195,7 +2255,7 @@ impl AddressSpace {
             .unwrap_or(vma.copy_on_write);
         Some(VmaLookup {
             map_id: vma.map_id,
-            vmar_id: self.root.id,
+            vmar_id: vma.vmar_id,
             vmo_id: vma.vmo_id,
             global_vmo_id: vma.global_vmo_id,
             vmo_kind: vmo.kind(),
@@ -2654,6 +2714,54 @@ mod tests {
             frames.state(code_frame).unwrap().rmap_anchor(),
             Some(ReverseMapAnchor::new(space.id(), lookup.map_id(), 0))
         );
+    }
+
+    #[test]
+    fn child_vmar_mapping_preserves_vmar_identity() {
+        let mut frames = FrameTable::new();
+        let data_frame = frames.register_existing(0x40_000).unwrap();
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let data = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(9))
+            .unwrap();
+        space.bind_vmo_frame(data, 0, data_frame).unwrap();
+
+        let child = space
+            .allocate_subvmar_for_cpu(0, 2 * PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        space
+            .map_fixed_in_vmar(
+                &mut frames,
+                child.id(),
+                child.base(),
+                PAGE_SIZE,
+                data,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        let lookup = space.lookup(child.base()).unwrap();
+        let map_rec = space.map_record(lookup.map_id()).unwrap();
+        assert_eq!(lookup.vmar_id(), child.id());
+        assert_eq!(map_rec.vmar_id(), child.id());
+
+        assert_eq!(
+            space
+                .protect_in_vmar(
+                    space.root_vmar().id(),
+                    child.base(),
+                    PAGE_SIZE,
+                    MappingPerms::READ | MappingPerms::USER,
+                )
+                .unwrap_err(),
+            AddressSpaceError::NotFound
+        );
+        space
+            .unmap_in_vmar(&mut frames, child.id(), child.base(), PAGE_SIZE)
+            .unwrap();
+        assert!(space.lookup(child.base()).is_none());
     }
 
     #[test]

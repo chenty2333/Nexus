@@ -332,3 +332,17 @@ args = [
   { name = "out_process", ty = "*mut zx_handle_t" },
   { name = "out_vmar", ty = "*mut zx_handle_t" },
 ]
+
+[[syscall]]
+name = "vmar_allocate"
+nr = 28
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "parent_vmar", ty = "zx_handle_t" },
+  { name = "options", ty = "zx_vm_option_t" },
+  { name = "offset", ty = "u64" },
+  { name = "size", ty = "u64" },
+  { name = "out_child_vmar", ty = "*mut zx_handle_t" },
+  { name = "out_child_addr", ty = "*mut zx_vaddr_t" },
+]

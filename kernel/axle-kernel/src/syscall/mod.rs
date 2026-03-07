@@ -26,8 +26,8 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
     AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE, AXLE_SYS_THREAD_CREATE,
     AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET,
-    AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE,
-    SyscallNumber,
+    AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
+    AXLE_SYS_VMO_CREATE, SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -40,7 +40,7 @@ use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 28] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 29] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -69,6 +69,7 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 28] = [
     AXLE_SYS_THREAD_CREATE,
     AXLE_SYS_THREAD_START,
     AXLE_SYS_PROCESS_CREATE,
+    AXLE_SYS_VMAR_ALLOCATE,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -111,6 +112,7 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_TIMER_SET => sys_timer_set(args),
         AXLE_SYS_TIMER_CANCEL => sys_timer_cancel(args),
         AXLE_SYS_VMO_CREATE => sys_vmo_create(args),
+        AXLE_SYS_VMAR_ALLOCATE => sys_vmar_allocate(args),
         AXLE_SYS_VMAR_MAP => ZX_ERR_NOT_SUPPORTED,
         AXLE_SYS_VMAR_UNMAP => sys_vmar_unmap(args),
         AXLE_SYS_VMAR_PROTECT => sys_vmar_protect(args),
@@ -517,6 +519,45 @@ fn sys_vmo_create(args: [u64; 6]) -> zx_status_t {
         Err(e) => return e,
     };
     if let Err(e) = copyout(out_ptr, handle) {
+        return e;
+    }
+    ZX_OK
+}
+
+fn sys_vmar_allocate(args: [u64; 6]) -> zx_status_t {
+    let parent_vmar = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let options = match u32::try_from(args[1]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let offset = args[2];
+    let size = match align_up_page(args[3]) {
+        Some(len) if len != 0 => len,
+        _ => return ZX_ERR_INVALID_ARGS,
+    };
+    let out_child_vmar = args[4] as *mut zx_handle_t;
+    let out_child_addr = args[5] as *mut zx_vaddr_t;
+    if out_child_vmar.is_null() || out_child_addr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if !crate::userspace::validate_user_ptr(out_child_vmar as u64, size_of::<zx_handle_t>())
+        || !crate::userspace::validate_user_ptr(out_child_addr as u64, size_of::<zx_vaddr_t>())
+    {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let (child_vmar, child_addr) =
+        match crate::object::vmar_allocate(parent_vmar, options, offset, size) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+    if let Err(e) = copyout(out_child_vmar, child_vmar) {
+        return e;
+    }
+    if let Err(e) = copyout(out_child_addr, child_addr) {
         return e;
     }
     ZX_OK

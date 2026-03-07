@@ -68,13 +68,16 @@ What is intentionally deferred for later work:
 
 Per-core VA allocation is now present in `axle-mm` as an internal root-VMAR
 control-plane allocator. It hands out child-VMAR reservations through CPU-local
-magazine hints without changing current syscall behavior, which is still
-specific-address mapping only.
+magazine hints, and the control-plane is now surfaced externally through a
+minimal root-only `zx_vmar_allocate`. Child VMARs currently enforce
+`ZX_VM_CAN_MAP_*` / `ZX_VM_CAN_MAP_SPECIFIC` ceilings, while actual mappings
+inside them still use the existing `ZX_VM_SPECIFIC` path.
 
 So the current state is: the correctness-oriented migration is largely in
 place, while the CortenMM-style performance package is still deferred.
 
-This note does not change syscall ABI, handle encoding, rights semantics,
-signal semantics, or the external `VMAR` / `VMO` / `Channel` object model. If
-future VM work changes externally visible behavior, the roadmap documents should
-be updated first.
+Most of this note is still about internal structure. The externally visible VM
+change that has landed is `zx_vmar_allocate` for child-VMAR carve-out. Handle
+encoding, signal semantics, and the broader `VMAR` / `VMO` / `Channel` object
+model remain unchanged. If future VM work changes more external behavior, the
+roadmap documents should be updated first.

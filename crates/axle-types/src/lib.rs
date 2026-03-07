@@ -167,8 +167,16 @@ pub mod vm {
     pub const ZX_VM_PERM_WRITE: zx_vm_option_t = 1 << 1;
     /// Mapping/protection grants execute access.
     pub const ZX_VM_PERM_EXECUTE: zx_vm_option_t = 1 << 2;
+    /// Child VMAR may create readable mappings.
+    pub const ZX_VM_CAN_MAP_READ: zx_vm_option_t = 1 << 11;
+    /// Child VMAR may create writable mappings.
+    pub const ZX_VM_CAN_MAP_WRITE: zx_vm_option_t = 1 << 12;
+    /// Child VMAR may create executable mappings.
+    pub const ZX_VM_CAN_MAP_EXECUTE: zx_vm_option_t = 1 << 13;
     /// Map at an exact address (`vmar_offset` must be honored exactly).
     pub const ZX_VM_SPECIFIC: zx_vm_option_t = 1 << 10;
+    /// Child VMAR may create exact-address mappings.
+    pub const ZX_VM_CAN_MAP_SPECIFIC: zx_vm_option_t = 1 << 14;
 }
 
 /// Zircon handle rights bit definitions.

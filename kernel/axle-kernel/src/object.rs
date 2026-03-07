@@ -20,7 +20,10 @@ use axle_types::status::{
     ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
     ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE, ZX_OK,
 };
-use axle_types::vm::{ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC};
+use axle_types::vm::{
+    ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ, ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE,
+    ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
+};
 use axle_types::{
     zx_clock_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_packet_user_t, zx_port_packet_t,
     zx_rights_t, zx_status_t, zx_vaddr_t,
@@ -144,12 +147,19 @@ struct VmoObject {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct VmarMappingCaps {
+    max_perms: MappingPerms,
+    can_map_specific: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct VmarObject {
     process_id: u64,
     address_space_id: u64,
     vmar_id: VmarId,
     base: u64,
     len: u64,
+    mapping_caps: VmarMappingCaps,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -253,6 +263,7 @@ impl KernelState {
                 vmar_id: root.vmar_id(),
                 base: root.base(),
                 len: root.len(),
+                mapping_caps: root_vmar_mapping_caps(),
             }),
         );
         state.bootstrap_root_vmar_handle = state
@@ -598,6 +609,7 @@ pub fn create_process(
                 vmar_id: created.root_vmar().id(),
                 base: created.root_vmar().base(),
                 len: created.root_vmar().len(),
+                mapping_caps: root_vmar_mapping_caps(),
             }),
         );
 
@@ -1104,6 +1116,65 @@ pub fn object_signal_peer(
 
 /// Map a VMO into a VMAR at an exact offset.
 #[allow(clippy::too_many_arguments)]
+pub fn vmar_allocate(
+    parent_vmar_handle: zx_handle_t,
+    options: u32,
+    offset: u64,
+    len: u64,
+) -> Result<(zx_handle_t, u64), zx_status_t> {
+    if offset != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    let mapping_caps = vmar_mapping_caps_from_allocate_options(options)?;
+
+    with_state_mut(|state| {
+        let resolved_parent =
+            state.lookup_handle(parent_vmar_handle, crate::task::HandleRights::empty())?;
+        let parent = match state.objects.get(&resolved_parent.object_id()) {
+            Some(KernelObject::Vmar(vmar)) => *vmar,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+
+        require_vmar_control_rights(resolved_parent)?;
+        require_vmar_child_mapping_caps(parent.mapping_caps, mapping_caps)?;
+
+        let child = state.kernel.allocate_subvmar(
+            parent.address_space_id,
+            parent.vmar_id,
+            len,
+            axle_mm::PAGE_SIZE,
+        )?;
+        let object_id = state.alloc_object_id();
+        state.objects.insert(
+            object_id,
+            KernelObject::Vmar(VmarObject {
+                process_id: parent.process_id,
+                address_space_id: parent.address_space_id,
+                vmar_id: child.id(),
+                base: child.base(),
+                len: child.len(),
+                mapping_caps,
+            }),
+        );
+
+        let child_handle = match state.alloc_handle_for_object(object_id, vmar_default_rights()) {
+            Ok(handle) => handle,
+            Err(err) => {
+                let _ = state.objects.remove(&object_id);
+                let _ = state
+                    .kernel
+                    .destroy_vmar(parent.address_space_id, child.id());
+                return Err(err);
+            }
+        };
+
+        Ok((child_handle, child.base()))
+    })
+}
+
+/// Map a VMO into a VMAR at an exact offset.
+#[allow(clippy::too_many_arguments)]
 pub fn vmar_map(
     vmar_handle: zx_handle_t,
     options: u32,
@@ -1130,6 +1201,7 @@ pub fn vmar_map(
 
         require_vm_mapping_rights(resolved_vmar, perms)?;
         require_vm_mapping_rights(resolved_vmo, perms)?;
+        require_vmar_mapping_caps(vmar.mapping_caps, perms, true)?;
         state.kernel.map_current_vmo_into_vmar(
             vmar.address_space_id,
             vmar.vmar_id,
@@ -1177,6 +1249,7 @@ pub fn vmar_protect(
         };
         let _ = (vmar.process_id, vmar.base, vmar.len);
         require_vm_mapping_rights(resolved_vmar, perms)?;
+        require_vmar_mapping_caps(vmar.mapping_caps, perms, false)?;
         state
             .kernel
             .protect_current_vmar(vmar.address_space_id, vmar.vmar_id, addr, len, perms)
@@ -1782,6 +1855,8 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                     vmar.vmar_id.raw(),
                     vmar.base,
                     vmar.len,
+                    vmar.mapping_caps.max_perms.bits(),
+                    vmar.mapping_caps.can_map_specific,
                 );
                 ObjectKind::Vmar
             }
@@ -1882,6 +1957,16 @@ fn vmar_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::MAP
 }
 
+fn root_vmar_mapping_caps() -> VmarMappingCaps {
+    VmarMappingCaps {
+        max_perms: MappingPerms::READ
+            | MappingPerms::WRITE
+            | MappingPerms::EXECUTE
+            | MappingPerms::USER,
+        can_map_specific: true,
+    }
+}
+
 fn thread_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER
@@ -1898,6 +1983,38 @@ fn require_vm_mapping_rights(
     require_handle_rights(resolved, crate::task::HandleRights::READ)?;
     if perms.contains(MappingPerms::WRITE) {
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
+    }
+    Ok(())
+}
+
+fn require_vmar_control_rights(resolved: crate::task::ResolvedHandle) -> Result<(), zx_status_t> {
+    require_handle_rights(resolved, crate::task::HandleRights::MAP)?;
+    require_handle_rights(resolved, crate::task::HandleRights::WRITE)
+}
+
+fn require_vmar_mapping_caps(
+    caps: VmarMappingCaps,
+    perms: MappingPerms,
+    require_specific: bool,
+) -> Result<(), zx_status_t> {
+    if !caps.max_perms.contains(perms) {
+        return Err(ZX_ERR_ACCESS_DENIED);
+    }
+    if require_specific && !caps.can_map_specific {
+        return Err(ZX_ERR_ACCESS_DENIED);
+    }
+    Ok(())
+}
+
+fn require_vmar_child_mapping_caps(
+    parent: VmarMappingCaps,
+    requested: VmarMappingCaps,
+) -> Result<(), zx_status_t> {
+    if !parent.max_perms.contains(requested.max_perms) {
+        return Err(ZX_ERR_ACCESS_DENIED);
+    }
+    if requested.can_map_specific && !parent.can_map_specific {
+        return Err(ZX_ERR_ACCESS_DENIED);
     }
     Ok(())
 }
@@ -1930,6 +2047,30 @@ fn mapping_perms_from_options(
         perms |= MappingPerms::WRITE;
     }
     Ok(perms)
+}
+
+fn vmar_mapping_caps_from_allocate_options(options: u32) -> Result<VmarMappingCaps, zx_status_t> {
+    let allowed =
+        ZX_VM_CAN_MAP_READ | ZX_VM_CAN_MAP_WRITE | ZX_VM_CAN_MAP_EXECUTE | ZX_VM_CAN_MAP_SPECIFIC;
+    if (options & !allowed) != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if (options & ZX_VM_CAN_MAP_EXECUTE) != 0 {
+        return Err(ZX_ERR_NOT_SUPPORTED);
+    }
+
+    let mut max_perms = MappingPerms::USER;
+    if (options & ZX_VM_CAN_MAP_READ) != 0 {
+        max_perms |= MappingPerms::READ;
+    }
+    if (options & ZX_VM_CAN_MAP_WRITE) != 0 {
+        max_perms |= MappingPerms::WRITE;
+    }
+
+    Ok(VmarMappingCaps {
+        max_perms,
+        can_map_specific: (options & ZX_VM_CAN_MAP_SPECIFIC) != 0,
+    })
 }
 
 fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals, zx_status_t> {

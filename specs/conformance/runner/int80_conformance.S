@@ -316,6 +316,98 @@ mov %rax, (%rsp)
 	add $8, %rsp
 	mov %rax, 8*76(%rbx)
 
+	// vmar_allocate(wrong type: parent=timer_h)
+	mov 0x698(%rbx), %rdi
+	movl $0x5800, %esi
+	xor %rdx, %rdx
+	movabs $0x2000, %r10
+	lea 0x970(%rbx), %r8
+	lea 0x978(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	mov %rax, 8*359(%rbx)
+
+	// vmar_allocate(bad options: plain READ)
+	mov 8*62(%rbx), %rdi
+	movl $0x1, %esi
+	xor %rdx, %rdx
+	movabs $0x2000, %r10
+	lea 0x970(%rbx), %r8
+	lea 0x978(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	mov %rax, 8*360(%rbx)
+
+	// vmar_allocate(ok)
+	mov 8*62(%rbx), %rdi
+	movl $0x5800, %esi
+	xor %rdx, %rdx
+	movabs $0x2000, %r10
+	lea 0x970(%rbx), %r8
+	lea 0x978(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	mov %rax, 8*361(%rbx)
+	movq $0, 8*362(%rbx)
+	mov 0x970(%rbx), %rax
+	test %rax, %rax
+	jz vmar_allocate_handle_done
+	movq $1, 8*362(%rbx)
+vmar_allocate_handle_done:
+	movq $0, 8*363(%rbx)
+	mov 0x978(%rbx), %rax
+	test %rax, %rax
+	jz vmar_allocate_addr_done
+	movq $1, 8*363(%rbx)
+vmar_allocate_addr_done:
+
+	// vmar_map(child_vmar @ offset 0)
+	mov 0x970(%rbx), %rdi
+	movl $0x403, %esi
+	xor %rdx, %rdx
+	mov 0x6d0(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x980(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*364(%rbx)
+	movq $0, 8*365(%rbx)
+	mov 0x980(%rbx), %rax
+	cmp 0x978(%rbx), %rax
+	jne vmar_allocate_map_match_done
+	movq $1, 8*365(%rbx)
+vmar_allocate_map_match_done:
+
+	// vmar_allocate(ok without CAN_MAP_SPECIFIC)
+	mov 8*62(%rbx), %rdi
+	movl $0x1800, %esi
+	xor %rdx, %rdx
+	movabs $0x1000, %r10
+	lea 0x988(%rbx), %r8
+	lea 0x990(%rbx), %r9
+	movabs $28, %rax
+	int $0x80
+	mov %rax, 8*366(%rbx)
+
+	// vmar_map(child without CAN_MAP_SPECIFIC) -> ACCESS_DENIED
+	mov 0x988(%rbx), %rdi
+	movl $0x403, %esi
+	xor %rdx, %rdx
+	mov 0x6d0(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x9a0(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*367(%rbx)
+
 // vmo_create(far-range mapping)
 lea 0x6f0(%rbx), %rdx
 movabs $0x1000, %rdi

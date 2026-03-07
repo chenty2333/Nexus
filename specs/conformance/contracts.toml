@@ -141,6 +141,11 @@ level = "should"
 description = "Bootstrap process_create should yield a real child address space that can map shared VMOs and run a child thread"
 
 [[contracts]]
+id = "should.vmar.allocate_child_bootstrap"
+level = "should"
+description = "Bootstrap zx_vmar_allocate should carve child VMARs from the root VMAR, return stable child handles/addrs, and enforce CAN_MAP_SPECIFIC ceilings"
+
+[[contracts]]
 id = "should.vmar.far_range_bootstrap"
 level = "should"
 description = "Bootstrap VMAR mapping should support mappings far beyond the original 2 MiB bridge, including addresses that require a new top-level walk path"

@@ -1,0 +1,25 @@
+id = "kernel.vmar.allocate_child_bootstrap"
+description = "Bootstrap zx_vmar_allocate should create child VMAR handles, map through them, and enforce child CAN_MAP_SPECIFIC ceilings"
+tags = ["module:vmar", "module:vmo", "module:kernel", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.vmar.allocate_child_bootstrap"]
+
+[assertions.status_code]
+vmar_allocate_bad_type = -12
+vmar_allocate_bad_opts = -10
+vmar_allocate = 0
+vmar_allocate_map = 0
+vmar_allocate_no_specific = 0
+vmar_allocate_specific_denied = -30
+
+[assertions.packet_fields]
+vmar_allocate_handle_ok = 1
+vmar_allocate_addr_nonzero = 1
+vmar_allocate_map_match = 1
