@@ -728,8 +728,12 @@ impl AddressSpace {
         self.vm.allocate_subvmar_for_cpu(cpu_id, len, align)
     }
 
-    fn destroy_vmar(&mut self, vmar_id: VmarId) -> Result<(), AddressSpaceError> {
-        self.vm.destroy_vmar(vmar_id)
+    fn destroy_vmar(
+        &mut self,
+        frames: &mut FrameTable,
+        vmar_id: VmarId,
+    ) -> Result<Vec<(u64, u64)>, AddressSpaceError> {
+        self.vm.destroy_vmar(frames, vmar_id)
     }
 
     fn root_page_table(&self) -> crate::page_table::UserPageTables {
@@ -824,6 +828,27 @@ impl AddressSpace {
     ) -> Result<(), AddressSpaceError> {
         self.vm
             .map_fixed_in_vmar(frames, vmar_id, base, len, vmo_id, vmo_offset, perms, perms)
+    }
+
+    fn map_vmo_anywhere(
+        &mut self,
+        frames: &mut FrameTable,
+        vmar_id: VmarId,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+    ) -> Result<u64, AddressSpaceError> {
+        self.vm.map_anywhere_in_vmar(
+            frames,
+            vmar_id,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            perms,
+            axle_mm::PAGE_SIZE,
+        )
     }
 
     fn unmap(
@@ -1469,13 +1494,48 @@ impl Kernel {
         address_space_id: AddressSpaceId,
         vmar_id: VmarId,
     ) -> Result<(), zx_status_t> {
-        let address_space = self
-            .address_spaces
-            .get_mut(&address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        address_space
-            .destroy_vmar(vmar_id)
-            .map_err(map_address_space_error)
+        let affected_ranges = {
+            let address_space = self
+                .address_spaces
+                .get(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            if vmar_id == address_space.root_vmar().id() {
+                return Err(ZX_ERR_BAD_STATE);
+            }
+            if address_space.vmar(vmar_id).is_none() {
+                return Err(ZX_ERR_NOT_FOUND);
+            }
+            address_space
+                .vm
+                .vmas()
+                .iter()
+                .filter(|vma| vma.vmar_id() == vmar_id)
+                .map(|vma| (vma.base(), vma.len()))
+                .collect::<Vec<_>>()
+        };
+
+        let mut affected_frames = Vec::new();
+        for (base, len) in affected_ranges.iter().copied() {
+            let frames = self.mapped_frames_in_range(address_space_id, base, len)?;
+            for frame_id in frames {
+                push_unique_frame_id(&mut affected_frames, frame_id);
+            }
+        }
+
+        let cleared_ranges = {
+            let address_space = self
+                .address_spaces
+                .get_mut(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            address_space
+                .destroy_vmar(&mut self.frames, vmar_id)
+                .map_err(map_address_space_error)?
+        };
+        for (base, len) in cleared_ranges {
+            self.clear_mapping_pages(address_space_id, base, len)?;
+        }
+        self.validate_frame_mapping_invariants_for(&affected_frames, "destroy_vmar");
+        Ok(())
     }
 
     pub(crate) fn current_thread_info(&self) -> Result<CurrentThreadInfo, zx_status_t> {
@@ -2004,6 +2064,39 @@ impl Kernel {
                 perms,
             )
             .map_err(map_address_space_error)?;
+        self.install_mapping_pages(vmar_address_space_id, mapped_addr, len)?;
+        Ok(mapped_addr)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_current_vmo_into_vmar_anywhere(
+        &mut self,
+        vmar_address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        global_vmo_id: KernelVmoId,
+        vmo_offset: u64,
+        len: u64,
+        perms: MappingPerms,
+    ) -> Result<u64, zx_status_t> {
+        let local_vmo_id =
+            self.import_global_vmo_into_address_space(vmar_address_space_id, global_vmo_id)?;
+        let mapped_addr = {
+            let address_space = self
+                .address_spaces
+                .get_mut(&vmar_address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
+            address_space
+                .map_vmo_anywhere(
+                    &mut self.frames,
+                    vmar_id,
+                    len,
+                    local_vmo_id,
+                    vmo_offset,
+                    perms,
+                )
+                .map_err(map_address_space_error)?
+        };
         self.install_mapping_pages(vmar_address_space_id, mapped_addr, len)?;
         Ok(mapped_addr)
     }

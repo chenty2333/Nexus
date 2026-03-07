@@ -346,3 +346,12 @@ args = [
   { name = "out_child_vmar", ty = "*mut zx_handle_t" },
   { name = "out_child_addr", ty = "*mut zx_vaddr_t" },
 ]
+
+[[syscall]]
+name = "vmar_destroy"
+nr = 29
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "vmar", ty = "zx_handle_t" },
+]

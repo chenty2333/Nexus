@@ -1,5 +1,5 @@
 id = "kernel.vmar.allocate_child_bootstrap"
-description = "Bootstrap zx_vmar_allocate should create child VMAR handles, map through them, and enforce child CAN_MAP_SPECIFIC ceilings"
+description = "Bootstrap zx_vmar_allocate/zx_vmar_destroy should create child VMARs, support non-specific child placement, enforce CAN_MAP_SPECIFIC ceilings, and free ranges on destroy"
 tags = ["module:vmar", "module:vmo", "module:kernel", "kind:qemu"]
 timeout_ms = 180000
 command = [
@@ -18,8 +18,12 @@ vmar_allocate = 0
 vmar_allocate_map = 0
 vmar_allocate_no_specific = 0
 vmar_allocate_specific_denied = -30
+vmar_allocate_nonspecific_map = 0
+vmar_destroy = 0
+vmar_destroy_remap = 0
 
 [assertions.packet_fields]
 vmar_allocate_handle_ok = 1
 vmar_allocate_addr_nonzero = 1
 vmar_allocate_map_match = 1
+vmar_allocate_nonspecific_match = 1

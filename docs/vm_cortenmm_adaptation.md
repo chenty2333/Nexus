@@ -70,8 +70,9 @@ Per-core VA allocation is now present in `axle-mm` as an internal root-VMAR
 control-plane allocator. It hands out child-VMAR reservations through CPU-local
 magazine hints, and the control-plane is now surfaced externally through a
 minimal root-only `zx_vmar_allocate`. Child VMARs currently enforce
-`ZX_VM_CAN_MAP_*` / `ZX_VM_CAN_MAP_SPECIFIC` ceilings, while actual mappings
-inside them still use the existing `ZX_VM_SPECIFIC` path.
+`ZX_VM_CAN_MAP_*` / `ZX_VM_CAN_MAP_SPECIFIC` ceilings. Child VMARs also support
+recursive `zx_vmar_destroy`, and non-specific `zx_vmar_map` inside a child now
+does first-fit placement within that VMAR.
 
 So the current state is: the correctness-oriented migration is largely in
 place, while the CortenMM-style performance package is still deferred.

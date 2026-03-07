@@ -408,6 +408,50 @@ vmar_allocate_map_match_done:
 	add $8, %rsp
 	mov %rax, 8*367(%rbx)
 
+	// vmar_map(child without CAN_MAP_SPECIFIC, non-specific) -> child base
+	mov 0x988(%rbx), %rdi
+	movl $0x3, %esi
+	xor %rdx, %rdx
+	mov 0x6d0(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x9a8(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*368(%rbx)
+	movq $0, 8*369(%rbx)
+	mov 0x9a8(%rbx), %rax
+	cmp 0x990(%rbx), %rax
+	jne vmar_allocate_nonspecific_match_done
+	movq $1, 8*369(%rbx)
+vmar_allocate_nonspecific_match_done:
+
+	// vmar_destroy(first child)
+	mov 0x970(%rbx), %rdi
+	movabs $29, %rax
+	int $0x80
+	mov %rax, 8*370(%rbx)
+
+	// root vmar remaps destroyed child range
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	mov 0x978(%rbx), %rdx
+	movabs $0x0000000100000000, %rax
+	sub %rax, %rdx
+	mov 0x6d0(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x9b0(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*371(%rbx)
+
 // vmo_create(far-range mapping)
 lea 0x6f0(%rbx), %rdx
 movabs $0x1000, %rdi

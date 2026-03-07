@@ -153,6 +153,12 @@ struct VmarMappingCaps {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct VmarMappingRequest {
+    perms: MappingPerms,
+    specific: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct VmarObject {
     process_id: u64,
     address_space_id: u64,
@@ -1183,7 +1189,7 @@ pub fn vmar_map(
     vmo_offset: u64,
     len: u64,
 ) -> Result<u64, zx_status_t> {
-    let perms = mapping_perms_from_options(options, true)?;
+    let request = mapping_request_from_options(options, vmar_offset)?;
 
     with_state_mut(|state| {
         let resolved_vmar = state.lookup_handle(vmar_handle, crate::task::HandleRights::empty())?;
@@ -1199,18 +1205,47 @@ pub fn vmar_map(
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
 
-        require_vm_mapping_rights(resolved_vmar, perms)?;
-        require_vm_mapping_rights(resolved_vmo, perms)?;
-        require_vmar_mapping_caps(vmar.mapping_caps, perms, true)?;
-        state.kernel.map_current_vmo_into_vmar(
-            vmar.address_space_id,
-            vmar.vmar_id,
-            vmo.global_vmo_id,
-            vmar_offset,
-            vmo_offset,
-            len,
-            perms,
-        )
+        require_vm_mapping_rights(resolved_vmar, request.perms)?;
+        require_vm_mapping_rights(resolved_vmo, request.perms)?;
+        require_vmar_mapping_caps(vmar.mapping_caps, request.perms, request.specific)?;
+        if request.specific {
+            state.kernel.map_current_vmo_into_vmar(
+                vmar.address_space_id,
+                vmar.vmar_id,
+                vmo.global_vmo_id,
+                vmar_offset,
+                vmo_offset,
+                len,
+                request.perms,
+            )
+        } else {
+            state.kernel.map_current_vmo_into_vmar_anywhere(
+                vmar.address_space_id,
+                vmar.vmar_id,
+                vmo.global_vmo_id,
+                vmo_offset,
+                len,
+                request.perms,
+            )
+        }
+    })
+}
+
+/// Destroy one child VMAR and recursively unmap mappings inside it.
+pub fn vmar_destroy(vmar_handle: zx_handle_t) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved_vmar = state.lookup_handle(vmar_handle, crate::task::HandleRights::empty())?;
+        let vmar = match state.objects.get(&resolved_vmar.object_id()) {
+            Some(KernelObject::Vmar(vmar)) => *vmar,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        require_vmar_control_rights(resolved_vmar)?;
+        state
+            .kernel
+            .destroy_vmar(vmar.address_space_id, vmar.vmar_id)?;
+        let _ = state.objects.remove(&resolved_vmar.object_id());
+        Ok(())
     })
 }
 
@@ -2019,18 +2054,16 @@ fn require_vmar_child_mapping_caps(
     Ok(())
 }
 
-fn mapping_perms_from_options(
+fn mapping_request_from_options(
     options: u32,
-    require_specific: bool,
-) -> Result<MappingPerms, zx_status_t> {
-    let allowed = ZX_VM_PERM_READ
-        | ZX_VM_PERM_WRITE
-        | ZX_VM_PERM_EXECUTE
-        | if require_specific { ZX_VM_SPECIFIC } else { 0 };
+    vmar_offset: u64,
+) -> Result<VmarMappingRequest, zx_status_t> {
+    let allowed = ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_PERM_EXECUTE | ZX_VM_SPECIFIC;
     if (options & !allowed) != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
-    if require_specific && (options & ZX_VM_SPECIFIC) == 0 {
+    let specific = (options & ZX_VM_SPECIFIC) != 0;
+    if !specific && vmar_offset != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
     if (options & ZX_VM_PERM_EXECUTE) != 0 {
@@ -2046,7 +2079,21 @@ fn mapping_perms_from_options(
     if has_write {
         perms |= MappingPerms::WRITE;
     }
-    Ok(perms)
+    Ok(VmarMappingRequest { perms, specific })
+}
+
+fn mapping_perms_from_options(
+    options: u32,
+    require_specific: bool,
+) -> Result<MappingPerms, zx_status_t> {
+    if !require_specific && (options & ZX_VM_SPECIFIC) != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    let request = mapping_request_from_options(options, if require_specific { 1 } else { 0 })?;
+    if require_specific && !request.specific {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    Ok(request.perms)
 }
 
 fn vmar_mapping_caps_from_allocate_options(options: u32) -> Result<VmarMappingCaps, zx_status_t> {

@@ -104,7 +104,7 @@ fuzz_target!(|data: &[u8]| {
                 let Some(vmar_id) = vmars[slot] else {
                     continue;
                 };
-                let _ = space.destroy_vmar(vmar_id);
+                let _ = space.destroy_vmar(&mut frames, vmar_id);
                 vmars[slot] = None;
             }
             _ => {

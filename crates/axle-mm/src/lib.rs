@@ -1451,8 +1451,12 @@ impl AddressSpace {
         Ok(vmar)
     }
 
-    /// Destroy one previously allocated child VMAR reservation.
-    pub fn destroy_vmar(&mut self, id: VmarId) -> Result<(), AddressSpaceError> {
+    /// Destroy one child VMAR and recursively tear down mappings inside it.
+    pub fn destroy_vmar(
+        &mut self,
+        frames: &mut FrameTable,
+        id: VmarId,
+    ) -> Result<Vec<(u64, u64)>, AddressSpaceError> {
         if id == self.root.id {
             return Err(AddressSpaceError::Busy);
         }
@@ -1461,16 +1465,18 @@ impl AddressSpace {
             .iter()
             .position(|candidate| candidate.id == id)
             .ok_or(AddressSpaceError::InvalidVmar)?;
-        let vmar = self.child_vmars[index];
-        if self
+        let mut removed_ranges = self
             .vmas
             .iter()
-            .any(|vma| ranges_overlap(vma.base(), vma.len(), vmar.base(), vmar.len()))
-        {
-            return Err(AddressSpaceError::Busy);
+            .filter(|vma| vma.vmar_id == id)
+            .map(|vma| (vma.base(), vma.len()))
+            .collect::<Vec<_>>();
+        removed_ranges.sort_by_key(|&(base, _)| base);
+        for (base, len) in removed_ranges.iter().copied() {
+            self.unmap_in_vmar(frames, id, base, len)?;
         }
         self.child_vmars.remove(index);
-        Ok(())
+        Ok(removed_ranges)
     }
 
     /// Allocate a new VMO record.
@@ -1822,6 +1828,28 @@ impl AddressSpace {
             perms,
             max_perms,
         )
+    }
+
+    /// Install one mapping into the first free range inside the given VMAR.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_anywhere_in_vmar(
+        &mut self,
+        frames: &mut FrameTable,
+        vmar_id: VmarId,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        max_perms: MappingPerms,
+        align: u64,
+    ) -> Result<u64, AddressSpaceError> {
+        let base = self
+            .find_free_gap_in_vmar(vmar_id, len, align)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        self.map_fixed_in_vmar(
+            frames, vmar_id, base, len, vmo_id, vmo_offset, perms, max_perms,
+        )?;
+        Ok(base)
     }
 
     /// Remove an existing mapping.
@@ -2471,6 +2499,32 @@ impl AddressSpace {
             })
     }
 
+    fn find_free_gap_in_vmar(&self, vmar_id: VmarId, len: u64, align: u64) -> Option<u64> {
+        let vmar = self.vmar(vmar_id)?;
+        let occupied = self.occupied_ranges_for_vmar(vmar_id);
+        let mut cursor = vmar.base();
+        for (occupied_base, occupied_end) in occupied {
+            if occupied_end <= cursor {
+                continue;
+            }
+            if occupied_base >= vmar.end() {
+                break;
+            }
+            let gap_end = core::cmp::min(occupied_base, vmar.end());
+            let candidate = align_up(cursor, align)?;
+            if candidate.checked_add(len)? <= gap_end {
+                return Some(candidate);
+            }
+            cursor = core::cmp::max(cursor, core::cmp::min(occupied_end, vmar.end()));
+            if cursor >= vmar.end() {
+                return None;
+            }
+        }
+
+        let candidate = align_up(cursor, align)?;
+        (candidate.checked_add(len)? <= vmar.end()).then_some(candidate)
+    }
+
     fn find_free_root_gap_in_window(
         &self,
         start: u64,
@@ -2526,6 +2580,20 @@ impl AddressSpace {
             merged.push((base, end));
         }
         merged
+    }
+
+    fn occupied_ranges_for_vmar(&self, vmar_id: VmarId) -> Vec<(u64, u64)> {
+        if vmar_id == self.root.id {
+            return self.occupied_root_ranges();
+        }
+        let mut ranges = self
+            .vmas
+            .iter()
+            .filter(|vma| vma.vmar_id == vmar_id)
+            .map(|vma| (vma.base(), vma.end()))
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|&(base, _)| base);
+        ranges
     }
 
     fn root_range_is_free(&self, base: u64, len: u64) -> bool {
@@ -2762,6 +2830,51 @@ mod tests {
             .unmap_in_vmar(&mut frames, child.id(), child.base(), PAGE_SIZE)
             .unwrap();
         assert!(space.lookup(child.base()).is_none());
+    }
+
+    #[test]
+    fn child_vmar_non_specific_mapping_and_destroy_releases_range() {
+        let mut frames = FrameTable::new();
+        let frame = frames.register_existing(0x41_000).unwrap();
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(10))
+            .unwrap();
+        space.bind_vmo_frame(vmo, 0, frame).unwrap();
+
+        let child = space
+            .allocate_subvmar_for_cpu(0, 2 * PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        let mapped = space
+            .map_anywhere_in_vmar(
+                &mut frames,
+                child.id(),
+                PAGE_SIZE,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                PAGE_SIZE,
+            )
+            .unwrap();
+        assert_eq!(mapped, child.base());
+
+        let removed = space.destroy_vmar(&mut frames, child.id()).unwrap();
+        assert_eq!(removed, vec![(child.base(), PAGE_SIZE)]);
+        assert!(space.vmar(child.id()).is_none());
+        assert!(space.lookup(child.base()).is_none());
+
+        space
+            .map_fixed(
+                &mut frames,
+                child.base(),
+                PAGE_SIZE,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -3411,7 +3524,7 @@ mod tests {
             Err(AddressSpaceError::Overlap)
         );
 
-        space.destroy_vmar(reserved.id()).unwrap();
+        space.destroy_vmar(&mut frames, reserved.id()).unwrap();
         space
             .map_fixed(
                 &mut frames,

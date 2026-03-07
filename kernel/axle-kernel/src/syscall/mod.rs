@@ -26,8 +26,8 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
     AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE, AXLE_SYS_THREAD_CREATE,
     AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET,
-    AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
-    AXLE_SYS_VMO_CREATE, SyscallNumber,
+    AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT,
+    AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE, SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -40,7 +40,7 @@ use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 29] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 30] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -70,6 +70,7 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 29] = [
     AXLE_SYS_THREAD_START,
     AXLE_SYS_PROCESS_CREATE,
     AXLE_SYS_VMAR_ALLOCATE,
+    AXLE_SYS_VMAR_DESTROY,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -113,6 +114,7 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_TIMER_CANCEL => sys_timer_cancel(args),
         AXLE_SYS_VMO_CREATE => sys_vmo_create(args),
         AXLE_SYS_VMAR_ALLOCATE => sys_vmar_allocate(args),
+        AXLE_SYS_VMAR_DESTROY => sys_vmar_destroy(args),
         AXLE_SYS_VMAR_MAP => ZX_ERR_NOT_SUPPORTED,
         AXLE_SYS_VMAR_UNMAP => sys_vmar_unmap(args),
         AXLE_SYS_VMAR_PROTECT => sys_vmar_protect(args),
@@ -599,6 +601,17 @@ fn sys_vmar_map(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
         return e;
     }
     ZX_OK
+}
+
+fn sys_vmar_destroy(args: [u64; 6]) -> zx_status_t {
+    let vmar = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    match crate::object::vmar_destroy(vmar) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
 }
 
 fn sys_vmar_unmap(args: [u64; 6]) -> zx_status_t {
