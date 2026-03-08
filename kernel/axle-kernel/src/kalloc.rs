@@ -8,7 +8,7 @@ use core::ptr::null_mut;
 
 use spin::Mutex;
 
-const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB bootstrap heap.
+const HEAP_SIZE: usize = 8 * 1024 * 1024; // 8 MiB bootstrap heap.
 
 static NEXT: Mutex<usize> = Mutex::new(0);
 
