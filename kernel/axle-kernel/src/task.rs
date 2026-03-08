@@ -667,6 +667,33 @@ impl CreatedVmo {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct KernelVmoBacking {
+    global_vmo_id: KernelVmoId,
+    base_paddr: u64,
+    page_count: usize,
+    frame_ids: Vec<FrameId>,
+    size_bytes: u64,
+}
+
+impl KernelVmoBacking {
+    pub(crate) fn global_vmo_id(&self) -> KernelVmoId {
+        self.global_vmo_id
+    }
+
+    pub(crate) fn base_paddr(&self) -> u64 {
+        self.base_paddr
+    }
+
+    pub(crate) fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    pub(crate) fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+}
+
+#[derive(Clone, Debug)]
 struct GlobalVmo {
     kind: VmoKind,
     size_bytes: u64,
@@ -2053,6 +2080,98 @@ impl Kernel {
             address_space_id,
             root_vmar,
         })
+    }
+
+    pub(crate) fn allocate_global_vmo_id(&mut self) -> KernelVmoId {
+        self.with_vm_mut(|vm| vm.alloc_global_vmo_id())
+    }
+
+    pub(crate) fn create_kernel_vmo_backing(
+        &mut self,
+        size_bytes: u64,
+    ) -> Result<KernelVmoBacking, zx_status_t> {
+        if size_bytes == 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let page_size = crate::userspace::USER_PAGE_BYTES;
+        let rounded_size = size_bytes
+            .checked_add(page_size - 1)
+            .map(|value| value & !(page_size - 1))
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let page_count =
+            usize::try_from(rounded_size / page_size).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let global_vmo_id = self.allocate_global_vmo_id();
+        self.register_empty_global_vmo(global_vmo_id, VmoKind::Anonymous, rounded_size)?;
+
+        let Some(base_paddr) = crate::userspace::alloc_bootstrap_zeroed_pages(page_count) else {
+            let _ = self.with_vm_mut(|vm| vm.global_vmos.lock().remove(global_vmo_id));
+            return Err(ZX_ERR_NO_MEMORY);
+        };
+
+        let created = self.with_vm_mut(|vm| {
+            let mut frames = vm.frames.lock();
+            let mut global_vmos = vm.global_vmos.lock();
+            let mut frame_ids = Vec::with_capacity(page_count);
+            for page_index in 0..page_count {
+                let paddr = base_paddr + (page_index as u64) * page_size;
+                let frame_id = frames.register_existing(paddr).map_err(|err| match err {
+                    axle_mm::FrameTableError::InvalidArgs => ZX_ERR_INVALID_ARGS,
+                    axle_mm::FrameTableError::AlreadyExists => ZX_ERR_ALREADY_EXISTS,
+                    axle_mm::FrameTableError::NotFound
+                    | axle_mm::FrameTableError::CountOverflow
+                    | axle_mm::FrameTableError::RefUnderflow
+                    | axle_mm::FrameTableError::PinUnderflow
+                    | axle_mm::FrameTableError::LoanUnderflow
+                    | axle_mm::FrameTableError::MissingAnchor
+                    | axle_mm::FrameTableError::Busy => ZX_ERR_BAD_STATE,
+                })?;
+                if let Err(status) =
+                    global_vmos.update_frame(global_vmo_id, (page_index as u64) * page_size, frame_id)
+                {
+                    let _ = frames.unregister_existing(frame_id);
+                    return Err(status);
+                }
+                frame_ids.push(frame_id);
+            }
+            Ok(frame_ids)
+        });
+
+        let frame_ids = match created {
+            Ok(frame_ids) => frame_ids,
+            Err(status) => {
+                let _ = self.destroy_kernel_vmo_backing(KernelVmoBacking {
+                    global_vmo_id,
+                    base_paddr,
+                    page_count,
+                    frame_ids: Vec::new(),
+                    size_bytes: rounded_size,
+                });
+                return Err(status);
+            }
+        };
+
+        Ok(KernelVmoBacking {
+            global_vmo_id,
+            base_paddr,
+            page_count,
+            frame_ids,
+            size_bytes: rounded_size,
+        })
+    }
+
+    pub(crate) fn destroy_kernel_vmo_backing(
+        &mut self,
+        backing: KernelVmoBacking,
+    ) -> Result<(), zx_status_t> {
+        let _ = self.with_vm_mut(|vm| vm.global_vmos.lock().remove(backing.global_vmo_id));
+        self.with_vm_mut(|vm| {
+            let mut frames = vm.frames.lock();
+            for frame_id in backing.frame_ids.iter().copied() {
+                let _ = frames.unregister_existing(frame_id);
+            }
+        });
+        crate::userspace::free_bootstrap_pages(backing.base_paddr, backing.page_count);
+        Ok(())
     }
 
     fn register_global_vmo_from_address_space(

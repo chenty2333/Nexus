@@ -334,8 +334,12 @@ const SLOT_TASK_WAIT_PROCESS_TERMINATED: usize = 438;
 const SLOT_TASK_WAIT_PROCESS_TERMINATED_OBS: usize = 439;
 const SLOT_TASK_REAP_CLOSE_THREAD: usize = 440;
 const SLOT_TASK_REAP_CLOSE_PROCESS: usize = 441;
+const SLOT_PORT_WAIT_WRITABLE: usize = 442;
+const SLOT_PORT_WAIT_WRITABLE_OBS: usize = 443;
+const SLOT_PORT_WAIT_READABLE: usize = 444;
+const SLOT_PORT_WAIT_READABLE_OBS: usize = 445;
 
-const SLOT_MAX: usize = SLOT_TASK_REAP_CLOSE_PROCESS;
+const SLOT_MAX: usize = SLOT_PORT_WAIT_READABLE_OBS;
 const SLOT_T0_NS: usize = 511;
 
 #[repr(align(4096))]
@@ -433,8 +437,16 @@ pub(crate) fn alloc_bootstrap_cow_page(src_paddr: u64) -> Option<u64> {
 }
 
 pub(crate) fn alloc_bootstrap_zeroed_page() -> Option<u64> {
+    alloc_bootstrap_zeroed_pages(1)
+}
+
+pub(crate) fn alloc_bootstrap_zeroed_pages(page_count: usize) -> Option<u64> {
+    if page_count == 0 {
+        return None;
+    }
+    let total_bytes = USER_PAGE_BYTES.checked_mul(page_count as u64)?;
     let layout =
-        Layout::from_size_align(USER_PAGE_BYTES as usize, USER_PAGE_BYTES as usize).ok()?;
+        Layout::from_size_align(total_bytes as usize, USER_PAGE_BYTES as usize).ok()?;
     let dst = unsafe {
         // SAFETY: the bootstrap allocator honors the requested alignment. The returned
         // page stays owned by the kernel for the rest of bring-up.
@@ -447,20 +459,54 @@ pub(crate) fn alloc_bootstrap_zeroed_page() -> Option<u64> {
 }
 
 pub(crate) fn free_bootstrap_page(paddr: u64) {
-    if paddr == 0 || (paddr & (USER_PAGE_BYTES - 1)) != 0 {
+    free_bootstrap_pages(paddr, 1);
+}
+
+pub(crate) fn free_bootstrap_pages(paddr: u64, page_count: usize) {
+    if page_count == 0 || paddr == 0 || (paddr & (USER_PAGE_BYTES - 1)) != 0 {
         return;
     }
+    let Some(total_bytes) = USER_PAGE_BYTES.checked_mul(page_count as u64) else {
+        return;
+    };
     let Some(layout) =
-        Layout::from_size_align(USER_PAGE_BYTES as usize, USER_PAGE_BYTES as usize).ok()
+        Layout::from_size_align(total_bytes as usize, USER_PAGE_BYTES as usize).ok()
     else {
         return;
     };
     unsafe {
-        // SAFETY: `alloc_bootstrap_zeroed_page` and `alloc_bootstrap_cow_page` allocate one
-        // page with this exact layout from the same global allocator. This helper is only used
-        // to free pages that were prepared for a fault but never registered into the frame table.
+        // SAFETY: `alloc_bootstrap_zeroed_pages` and `alloc_bootstrap_cow_page` allocate
+        // aligned bootstrap-owned pages with this exact layout from the same global allocator.
+        // This helper is only used to free bootstrap pages that were not permanently handed to
+        // a live kernel mapping/object.
         dealloc(paddr as *mut u8, layout);
     }
+}
+
+pub(crate) fn write_bootstrap_value<T: Copy>(
+    base_paddr: u64,
+    byte_offset: usize,
+    value: &T,
+) -> Option<()> {
+    let dst = base_paddr.checked_add(byte_offset as u64)? as *mut T;
+    unsafe {
+        // SAFETY: callers only use bootstrap-owned contiguous allocations. `byte_offset`
+        // stays within the allocated backing store and `dst` therefore points into valid
+        // writable kernel memory. `write_unaligned` tolerates packet slots that are only
+        // naturally aligned to the port packet stride.
+        core::ptr::write_unaligned(dst, *value);
+    }
+    Some(())
+}
+
+pub(crate) fn read_bootstrap_value<T: Copy>(base_paddr: u64, byte_offset: usize) -> Option<T> {
+    let src = base_paddr.checked_add(byte_offset as u64)? as *const T;
+    Some(unsafe {
+        // SAFETY: callers only read values previously written into the same bootstrap-owned
+        // contiguous allocation. `read_unaligned` tolerates packet slots that are only
+        // naturally aligned to the port packet stride.
+        core::ptr::read_unaligned(src)
+    })
 }
 
 pub(crate) fn query_user_page_frame(user_va: u64) -> Result<Option<UserPageFrame>, ()> {
@@ -797,7 +843,7 @@ pub fn on_breakpoint() -> ! {
     }
 
     crate::kprintln!(
-        "kernel: int80 conformance ok (unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, bad_wait={}, port_wait_null_out={}, empty_wait={}, port_queue_null_pkt={}, port_queue_bad_type={}, queue={}, wait={}, timer_create_bad_opts={}, timer_create_bad_clock={}, timer_create_null_out={}, port_wait_wrong_type={}, port_queue_wrong_type={}, timer_set_wrong_type={}, timer_cancel_wrong_type={}, wait_one_unsignaled={}, wait_one_unsignaled_observed={}, wait_async={}, timer_set_immediate={}, wait_signal={}, signal_trigger={}, signal_observed={}, signal_count={}, wait_one_signaled={}, wait_one_signaled_observed={}, wait_one_future_timeout={}, wait_one_future_timeout_observed={}, wait_one_future_ok={}, wait_one_future_ok_observed={}, wait_async_bad_options={}, wait_async_ts={}, wait_signal_ts={}, signal_timestamp={}, signal_timestamp_ok={}, wait_async_boot={}, wait_signal_boot={}, signal_boot_timestamp={}, signal_boot_timestamp_ok={}, edge_wait_async={}, edge_empty_wait={}, edge_signal_wait={}, edge_signal_key={}, reserve_queue_full={}, reserve_wait_async={}, reserve_signal_after_users_ok={}, reserve_signal_type={}, pending_wait_async={}, pending_signal_wait={}, pending_signal_count={}, pending_merge_ok={}, vmo_create_bad_opts={}, vmo_create_null_out={}, vmo_create={}, vmar_map_bad_type={}, vmar_map_bad_opts={}, vmar_map={}, vmar_map_addr={}, vmar_map_write_ok={}, vmar_overlap={}, vmar_protect={}, vmar_reprotect={}, vmar_unmap={}, vmar_remap={}, channel_create_bad_opts={}, channel_create_null_out0={}, channel_create_null_out1={}, channel_create={}, channel_read_empty={}, channel_write={}, channel_wait_readable={}, channel_wait_readable_ok={}, channel_read={}, channel_read_actual_bytes={}, channel_read_actual_handles={}, channel_read_match={}, channel_close_peer={}, channel_write_peer_closed={}, channel_read_peer_closed={}, channel_wait_peer_closed={}, channel_wait_peer_closed_observed={}, eventpair_create_bad_opts={}, eventpair_create_null_out0={}, eventpair_create_null_out1={}, eventpair_create={}, eventpair_signal_bad_mask={}, eventpair_signal_peer={}, eventpair_wait_signal={}, eventpair_wait_signal_observed={}, eventpair_close_peer={}, eventpair_wait_peer_closed={}, eventpair_wait_peer_closed_observed={}, channel_loan_tx_vmo_create={}, channel_loan_tx_map={}, channel_loan_rx_vmo_create={}, channel_loan_rx_map={}, channel_loan_create={}, channel_loan_write={}, channel_loan_read={}, channel_loan_actual_bytes={}, channel_loan_snapshot_ok={}, handle_duplicate={}, handle_duplicate_distinct={}, handle_duplicate_signal={}, handle_duplicate_wait={}, handle_duplicate_wait_observed={}, handle_dup_reduced={}, handle_dup_reduced_denied={}, handle_replace={}, handle_replace_old_bad={}, handle_replace_signal={}, handle_replace_wait={}, handle_replace_wait_observed={}, object_signal_bad_mask={}, object_signal_wait_async={}, object_signal_self={}, object_signal_port_wait={}, object_signal_key={}, futex_wait_bad_state={}, futex_wait_self_owner={}, futex_wait_timeout={}, futex_get_owner_initial={}, futex_owner_initial={}, futex_get_owner_timeout={}, futex_owner_timeout={}, futex_requeue_same_key={}, futex_requeue_wrong_type={}, futex_requeue_ok={}, futex_get_owner_requeue={}, futex_owner_match_self={}, futex_wake_zero={}, futex_get_owner_wake={}, futex_owner_wake={}, channel_transfer_create={}, channel_transfer_eventpair_create={}, channel_transfer_write={}, channel_transfer_close_old={}, channel_transfer_read={}, channel_transfer_actual_bytes={}, channel_transfer_actual_handles={}, channel_transfer_signal={}, channel_transfer_wait={}, channel_transfer_wait_observed={}, task_kill_process={}, task_kill_thread_create_after={}, task_wait_thread_terminated={}, task_wait_thread_terminated_observed={}, task_wait_process_terminated={}, task_wait_process_terminated_observed={}, task_reap_close_thread={}, task_reap_close_process={}, task_suspend_process={}, task_suspend_token_present={}, task_suspend_close_token={}, task_suspend_resumed={}, task_suspend_held={}, thread_create={}, thread_start={}, thread_child_ran={}, thread_futex_wait={}, thread_wake_status={}, thread_resumed={}, thread_wait_one={}, thread_wait_one_observed={}, thread_signal_status={}, thread_port_wait={}, thread_port_packet_key={}, thread_port_packet_type={}, thread_port_queue_status={}, timer_set={}, timer_cancel={}, timer_close={}, timer_close_again={}, close={}, close_again={}, root_vmar_h={}, port_h={}, timer_h={}, vmo_h={}, channel_h0={}, channel_h1={}, eventpair_h0={}, eventpair_h1={}, channel_loan_remap_cow_ok={}, channel_loan_remap_source_rmap_count={}, vm_cow_fault_count={}, vm_last_remap_source_rmap_count={}, vm_last_cow_old_rmap_count={}, vm_last_cow_new_rmap_count={}, channel_close_read_create={}, channel_close_read_write={}, channel_close_read_close={}, channel_close_read_wait={}, channel_close_read_wait_observed={}, channel_close_read_status={}, channel_close_read_actual_bytes={}, channel_close_read_match={}, channel_close_drain_wait={}, channel_close_drain_wait_observed={}, channel_close_drain_read={}, channel_writable_recovery_create={}, channel_writable_recovery_fill={}, channel_writable_recovery_full_write={}, channel_writable_recovery_wait_full={}, channel_writable_recovery_wait_full_observed={}, channel_writable_recovery_read={}, channel_writable_recovery_wait_restored={}, channel_writable_recovery_wait_restored_observed={}, channel_writable_recovery_close={}, channel_writable_recovery_wait_closed={}, channel_writable_recovery_wait_closed_observed={}, channel_writable_recovery_write_closed={}, process_create={}, process_map_parent_code={}, process_map_parent_shared={}, process_map_child_code={}, process_map_child_shared={}, process_map_child_stack={}, process_thread_create={}, process_start={}, process_child_ran={}, process_parent_futex_wait={}, vmar_far_vmo_create={}, vmar_far_map={}, vmar_far_map_addr={}, vmar_far_write_ok={}, vmar_far_unmap={}, vmar_allocate_bad_type={}, vmar_allocate_bad_opts={}, vmar_allocate={}, vmar_allocate_handle_ok={}, vmar_allocate_addr_nonzero={}, vmar_allocate_map={}, vmar_allocate_map_match={}, vmar_allocate_no_specific={}, vmar_allocate_specific_denied={}, vmar_allocate_nonspecific_map={}, vmar_allocate_nonspecific_match={}, vmar_destroy={}, vmar_destroy_remap={}, vmar_allocate_grandchild={}, vmar_allocate_grandchild_match={}, vmar_allocate_grandchild_map={}, vmar_allocate_grandchild_map_match={}, vmar_allocate_upper_limit={}, vmar_allocate_upper_limit_match={}, vmar_allocate_grandchild_compact={}, vmar_allocate_grandchild_compact_match={}, vmar_allocate_align={}, vmar_allocate_align_ok={}, vmar_allocate_specific_align_bad={}, process_map_parent_lazy_shared={}, process_map_child_lazy_shared={}, process_lazy_shared_match={}, vm_private_cow_pages_current={}, vm_private_cow_pages_peak={}, vm_private_cow_quota_hits={}, vm_inflight_loan_pages_current={}, vm_inflight_loan_pages_peak={}, vm_inflight_loan_quota_hits={}, channel_loan_quota_fill={}, channel_loan_quota_write_limit={}, channel_loan_quota_read={}, channel_loan_quota_write_recover={}, vm_fault_leader_claims={}, vm_fault_wait_claims={}, vm_fault_wait_spin_loops={}, vm_fault_retry_total={}, vm_fault_commit_resolved={}, vm_fault_commit_retry={}, vm_fault_prepare_cow={}, vm_fault_prepare_lazy_anon={}, vm_fault_prepare_lazy_vmo_alloc={}, timer_wait_forever={}, timer_wait_forever_observed={}, vm_fault_local_wait_ok={}, vm_fault_shared_wait_ok={})",
+        "kernel: int80 conformance ok (unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, bad_wait={}, port_wait_null_out={}, empty_wait={}, port_queue_null_pkt={}, port_queue_bad_type={}, queue={}, wait={}, timer_create_bad_opts={}, timer_create_bad_clock={}, timer_create_null_out={}, port_wait_wrong_type={}, port_queue_wrong_type={}, timer_set_wrong_type={}, timer_cancel_wrong_type={}, wait_one_unsignaled={}, wait_one_unsignaled_observed={}, wait_async={}, timer_set_immediate={}, wait_signal={}, signal_trigger={}, signal_observed={}, signal_count={}, wait_one_signaled={}, wait_one_signaled_observed={}, wait_one_future_timeout={}, wait_one_future_timeout_observed={}, wait_one_future_ok={}, wait_one_future_ok_observed={}, wait_async_bad_options={}, wait_async_ts={}, wait_signal_ts={}, signal_timestamp={}, signal_timestamp_ok={}, wait_async_boot={}, wait_signal_boot={}, signal_boot_timestamp={}, signal_boot_timestamp_ok={}, edge_wait_async={}, edge_empty_wait={}, edge_signal_wait={}, edge_signal_key={}, reserve_queue_full={}, reserve_wait_async={}, reserve_signal_after_users_ok={}, reserve_signal_type={}, pending_wait_async={}, pending_signal_wait={}, pending_signal_count={}, pending_merge_ok={}, vmo_create_bad_opts={}, vmo_create_null_out={}, vmo_create={}, vmar_map_bad_type={}, vmar_map_bad_opts={}, vmar_map={}, vmar_map_addr={}, vmar_map_write_ok={}, vmar_overlap={}, vmar_protect={}, vmar_reprotect={}, vmar_unmap={}, vmar_remap={}, channel_create_bad_opts={}, channel_create_null_out0={}, channel_create_null_out1={}, channel_create={}, channel_read_empty={}, channel_write={}, channel_wait_readable={}, channel_wait_readable_ok={}, channel_read={}, channel_read_actual_bytes={}, channel_read_actual_handles={}, channel_read_match={}, channel_close_peer={}, channel_write_peer_closed={}, channel_read_peer_closed={}, channel_wait_peer_closed={}, channel_wait_peer_closed_observed={}, eventpair_create_bad_opts={}, eventpair_create_null_out0={}, eventpair_create_null_out1={}, eventpair_create={}, eventpair_signal_bad_mask={}, eventpair_signal_peer={}, eventpair_wait_signal={}, eventpair_wait_signal_observed={}, eventpair_close_peer={}, eventpair_wait_peer_closed={}, eventpair_wait_peer_closed_observed={}, channel_loan_tx_vmo_create={}, channel_loan_tx_map={}, channel_loan_rx_vmo_create={}, channel_loan_rx_map={}, channel_loan_create={}, channel_loan_write={}, channel_loan_read={}, channel_loan_actual_bytes={}, channel_loan_snapshot_ok={}, handle_duplicate={}, handle_duplicate_distinct={}, handle_duplicate_signal={}, handle_duplicate_wait={}, handle_duplicate_wait_observed={}, handle_dup_reduced={}, handle_dup_reduced_denied={}, handle_replace={}, handle_replace_old_bad={}, handle_replace_signal={}, handle_replace_wait={}, handle_replace_wait_observed={}, object_signal_bad_mask={}, object_signal_wait_async={}, object_signal_self={}, object_signal_port_wait={}, object_signal_key={}, futex_wait_bad_state={}, futex_wait_self_owner={}, futex_wait_timeout={}, futex_get_owner_initial={}, futex_owner_initial={}, futex_get_owner_timeout={}, futex_owner_timeout={}, futex_requeue_same_key={}, futex_requeue_wrong_type={}, futex_requeue_ok={}, futex_get_owner_requeue={}, futex_owner_match_self={}, futex_wake_zero={}, futex_get_owner_wake={}, futex_owner_wake={}, channel_transfer_create={}, channel_transfer_eventpair_create={}, channel_transfer_write={}, channel_transfer_close_old={}, channel_transfer_read={}, channel_transfer_actual_bytes={}, channel_transfer_actual_handles={}, channel_transfer_signal={}, channel_transfer_wait={}, channel_transfer_wait_observed={}, task_kill_process={}, task_kill_thread_create_after={}, task_wait_thread_terminated={}, task_wait_thread_terminated_observed={}, task_wait_process_terminated={}, task_wait_process_terminated_observed={}, task_reap_close_thread={}, task_reap_close_process={}, task_suspend_process={}, task_suspend_token_present={}, task_suspend_close_token={}, task_suspend_resumed={}, task_suspend_held={}, thread_create={}, thread_start={}, thread_child_ran={}, thread_futex_wait={}, thread_wake_status={}, thread_resumed={}, thread_wait_one={}, thread_wait_one_observed={}, thread_signal_status={}, thread_port_wait={}, thread_port_packet_key={}, thread_port_packet_type={}, thread_port_queue_status={}, timer_set={}, timer_cancel={}, timer_close={}, timer_close_again={}, close={}, close_again={}, root_vmar_h={}, port_h={}, timer_h={}, vmo_h={}, channel_h0={}, channel_h1={}, eventpair_h0={}, eventpair_h1={}, channel_loan_remap_cow_ok={}, channel_loan_remap_source_rmap_count={}, vm_cow_fault_count={}, vm_last_remap_source_rmap_count={}, vm_last_cow_old_rmap_count={}, vm_last_cow_new_rmap_count={}, channel_close_read_create={}, channel_close_read_write={}, channel_close_read_close={}, channel_close_read_wait={}, channel_close_read_wait_observed={}, channel_close_read_status={}, channel_close_read_actual_bytes={}, channel_close_read_match={}, channel_close_drain_wait={}, channel_close_drain_wait_observed={}, channel_close_drain_read={}, channel_writable_recovery_create={}, channel_writable_recovery_fill={}, channel_writable_recovery_full_write={}, channel_writable_recovery_wait_full={}, channel_writable_recovery_wait_full_observed={}, channel_writable_recovery_read={}, channel_writable_recovery_wait_restored={}, channel_writable_recovery_wait_restored_observed={}, channel_writable_recovery_close={}, channel_writable_recovery_wait_closed={}, channel_writable_recovery_wait_closed_observed={}, channel_writable_recovery_write_closed={}, process_create={}, process_map_parent_code={}, process_map_parent_shared={}, process_map_child_code={}, process_map_child_shared={}, process_map_child_stack={}, process_thread_create={}, process_start={}, process_child_ran={}, process_parent_futex_wait={}, vmar_far_vmo_create={}, vmar_far_map={}, vmar_far_map_addr={}, vmar_far_write_ok={}, vmar_far_unmap={}, vmar_allocate_bad_type={}, vmar_allocate_bad_opts={}, vmar_allocate={}, vmar_allocate_handle_ok={}, vmar_allocate_addr_nonzero={}, vmar_allocate_map={}, vmar_allocate_map_match={}, vmar_allocate_no_specific={}, vmar_allocate_specific_denied={}, vmar_allocate_nonspecific_map={}, vmar_allocate_nonspecific_match={}, vmar_destroy={}, vmar_destroy_remap={}, vmar_allocate_grandchild={}, vmar_allocate_grandchild_match={}, vmar_allocate_grandchild_map={}, vmar_allocate_grandchild_map_match={}, vmar_allocate_upper_limit={}, vmar_allocate_upper_limit_match={}, vmar_allocate_grandchild_compact={}, vmar_allocate_grandchild_compact_match={}, vmar_allocate_align={}, vmar_allocate_align_ok={}, vmar_allocate_specific_align_bad={}, process_map_parent_lazy_shared={}, process_map_child_lazy_shared={}, process_lazy_shared_match={}, vm_private_cow_pages_current={}, vm_private_cow_pages_peak={}, vm_private_cow_quota_hits={}, vm_inflight_loan_pages_current={}, vm_inflight_loan_pages_peak={}, vm_inflight_loan_quota_hits={}, channel_loan_quota_fill={}, channel_loan_quota_write_limit={}, channel_loan_quota_read={}, channel_loan_quota_write_recover={}, vm_fault_leader_claims={}, vm_fault_wait_claims={}, vm_fault_wait_spin_loops={}, vm_fault_retry_total={}, vm_fault_commit_resolved={}, vm_fault_commit_retry={}, vm_fault_prepare_cow={}, vm_fault_prepare_lazy_anon={}, vm_fault_prepare_lazy_vmo_alloc={}, timer_wait_forever={}, timer_wait_forever_observed={}, vm_fault_local_wait_ok={}, vm_fault_shared_wait_ok={}, port_wait_writable={}, port_wait_writable_observed={}, port_wait_readable={}, port_wait_readable_observed={})",
         slots[SLOT_UNKNOWN] as i64,
         slots[SLOT_CLOSE_INVALID] as i64,
         slots[SLOT_PORT_CREATE_BAD_OPTS] as i64,
@@ -1076,7 +1122,11 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_TIMER_WAIT_FOREVER] as i64,
         slots[SLOT_TIMER_WAIT_FOREVER_OBS] as i64,
         slots[SLOT_VM_FAULT_LOCAL_WAIT_OK] as i64,
-        slots[SLOT_VM_FAULT_SHARED_WAIT_OK] as i64
+        slots[SLOT_VM_FAULT_SHARED_WAIT_OK] as i64,
+        slots[SLOT_PORT_WAIT_WRITABLE] as i64,
+        slots[SLOT_PORT_WAIT_WRITABLE_OBS] as i64,
+        slots[SLOT_PORT_WAIT_READABLE] as i64,
+        slots[SLOT_PORT_WAIT_READABLE_OBS] as i64
     );
 
     crate::arch::qemu::exit_success();

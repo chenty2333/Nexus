@@ -12,6 +12,7 @@ mod futex;
 mod kalloc;
 mod object;
 mod page_table;
+mod port_queue;
 mod smp;
 mod syscall;
 mod task;

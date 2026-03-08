@@ -59,6 +59,19 @@ int $0x80
 mov 0x1688(%rbx), %rcx
 mov %rcx, 8*35(%rbx)
 
+// object_wait_one(port_h, OBJECT_WRITABLE, deadline=0, observed=&port_obs0)
+lea 0x13c0(%rbx), %rcx
+movq $0, (%rcx)
+mov 0x1688(%rbx), %rdi
+movl $0x2, %esi
+xor %rdx, %rdx
+mov %rcx, %r10
+movabs $1, %rax
+int $0x80
+mov %rax, 8*442(%rbx)
+mov (%rcx), %rax
+mov %rax, 8*443(%rbx)
+
 // port_wait(null out) with valid port
 mov 0x1688(%rbx), %rdi
 xor %rsi, %rsi
@@ -121,6 +134,19 @@ mov 0x1688(%rbx), %rdi
 movabs $4, %rax
 int $0x80
 mov %rax, 8*10(%rbx)
+
+// object_wait_one(port_h, OBJECT_READABLE, deadline=0, observed=&port_obs1)
+lea 0x13c8(%rbx), %rcx
+movq $0, (%rcx)
+mov 0x1688(%rbx), %rdi
+movl $0x1, %esi
+xor %rdx, %rdx
+mov %rcx, %r10
+movabs $1, %rax
+int $0x80
+mov %rax, 8*444(%rbx)
+mov (%rcx), %rax
+mov %rax, 8*445(%rbx)
 
 // port_wait(roundtrip) rx_packet @ 0x480
 lea 0x1480(%rbx), %rdx

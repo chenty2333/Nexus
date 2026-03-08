@@ -184,6 +184,8 @@ pub enum FrameTableError {
     LoanUnderflow,
     /// One mapping anchor to remove was not present on the frame.
     MissingAnchor,
+    /// Frame still has active refs, mappings, pins, loans, or reverse-map anchors.
+    Busy,
 }
 
 /// Global physical-frame bookkeeping used by the bootstrap kernel.
@@ -270,6 +272,23 @@ impl FrameTable {
             rmap_anchor_count: 0,
         });
         Ok(id)
+    }
+
+    /// Remove a previously registered frame that no longer has active users.
+    pub fn unregister_existing(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+        let index = self.frame_index(id)?;
+        let frame = self.frames.get(index).ok_or(FrameTableError::NotFound)?;
+        if frame.ref_count != 0
+            || frame.map_count != 0
+            || frame.pin_count != 0
+            || frame.loan_count != 0
+            || frame.rmap_head.is_some()
+            || frame.rmap_anchor_count != 0
+        {
+            return Err(FrameTableError::Busy);
+        }
+        let _ = self.frames.remove(index);
+        Ok(())
     }
 
     /// Return whether the frame id is known.
@@ -4361,6 +4380,17 @@ mod tests {
         frames.unpin(frame).unwrap();
         assert_eq!(frames.state(frame).unwrap().pin_count(), 0);
         assert_eq!(frames.unpin(frame), Err(FrameTableError::PinUnderflow));
+    }
+
+    #[test]
+    fn unregister_existing_requires_idle_frame() {
+        let mut frames = FrameTable::new();
+        let frame = frames.register_existing(0x20_000).unwrap();
+        frames.pin(frame).unwrap();
+        assert_eq!(frames.unregister_existing(frame), Err(FrameTableError::Busy));
+        frames.unpin(frame).unwrap();
+        frames.unregister_existing(frame).unwrap();
+        assert!(!frames.contains(frame));
     }
 
     #[test]

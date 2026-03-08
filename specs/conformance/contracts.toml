@@ -56,6 +56,11 @@ level = "should"
 description = "Kernel-generated signal packets must merge while pending on a full port and flush once space is available"
 
 [[contracts]]
+id = "should.port.readable_writable_bootstrap"
+level = "should"
+description = "Bootstrap ports should start WRITABLE, become READABLE after one queued packet, and report stable observed signal masks"
+
+[[contracts]]
 id = "should.vmo.create_bootstrap_anonymous"
 level = "should"
 description = "zx_vmo_create must reject bad bootstrap arguments and return a non-zero anonymous VMO handle on success"

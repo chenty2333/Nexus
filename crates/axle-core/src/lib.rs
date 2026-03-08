@@ -32,7 +32,8 @@ pub use capability::Capability;
 pub use cspace::{CSpace, CSpaceError, TransferredCap};
 pub use handle::{Handle, HandleError};
 pub use port::{
-    Packet, PacketKind, Port, PortError, PortKey, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId,
+    Packet, PacketKind, PacketQueue, Port, PortError, PortKey, PortState, VecPortQueue,
+    WaitAsyncOptions, WaitAsyncTimestamp, WaitableId,
 };
 pub use revocation::{RevocationGroupId, RevocationGroupToken, RevocationManager, RevocationRef};
 pub use signals::{Signals, WaitOne, wait_one};

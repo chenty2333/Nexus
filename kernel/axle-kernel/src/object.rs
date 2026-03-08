@@ -7,14 +7,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::{
-    Capability, Packet, PacketKind, Port, PortError, Signals, TimerError, TimerId, TimerService,
-    TransferredCap, WaitAsyncOptions,
+    Capability, Packet, PortError, Signals, TimerError, TimerId, TimerService, TransferredCap,
+    WaitAsyncOptions,
 };
 use axle_mm::{MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::koid::ZX_KOID_INVALID;
-use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
+use axle_types::packet::ZX_PKT_TYPE_USER;
 use axle_types::rights::{ZX_RIGHT_SAME_RIGHTS, ZX_RIGHTS_ALL};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
@@ -28,12 +28,14 @@ use axle_types::vm::{
     ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
 };
 use axle_types::{
-    zx_clock_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_packet_user_t, zx_port_packet_t,
-    zx_rights_t, zx_status_t, zx_vaddr_t,
+    zx_clock_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t, zx_status_t,
+    zx_vaddr_t,
 };
-use axle_types::{zx_packet_signal_t, zx_signals_t};
+use axle_types::zx_signals_t;
 use core::mem::size_of;
 use spin::Mutex;
+
+use crate::port_queue::{KernelPort, port_packet_from_core};
 
 const PORT_CAPACITY: usize = 64;
 const PORT_KERNEL_RESERVE: usize = 16;
@@ -222,7 +224,7 @@ enum KernelObject {
     SuspendToken(SuspendTokenObject),
     Channel(ChannelEndpoint),
     EventPair(EventPairEndpoint),
-    Port(Port),
+    Port(KernelPort),
     Timer(TimerObject),
     Vmo(VmoObject),
     Vmar(VmarObject),
@@ -669,15 +671,20 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
 
     with_state_mut(|state| {
         let object_id = state.alloc_object_id();
+        let port = state.with_kernel_mut(|kernel| {
+            KernelPort::new(kernel, PORT_CAPACITY, PORT_KERNEL_RESERVE)
+        })?;
         state.objects.insert(
             object_id,
-            KernelObject::Port(Port::new(PORT_CAPACITY, PORT_KERNEL_RESERVE)),
+            KernelObject::Port(port),
         );
 
         match state.alloc_handle_for_object(object_id, port_default_rights()) {
             Ok(h) => Ok(h),
             Err(e) => {
-                let _ = state.objects.remove(&object_id);
+                if let Some(KernelObject::Port(port)) = state.objects.remove(&object_id) {
+                    let _ = state.with_kernel_mut(|kernel| port.destroy(kernel));
+                }
                 Err(e)
             }
         }
@@ -1306,6 +1313,7 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
 
     with_state_mut(|state| {
         let object_id = state.alloc_object_id();
+        let global_vmo_id = state.with_kernel_mut(|kernel| Ok(kernel.allocate_global_vmo_id()))?;
         let (process_id, address_space_id) = state.with_core(|kernel| {
             let process = kernel.current_process_info()?;
             let address_space_id = kernel.process_address_space_id(process.process_id())?;
@@ -1316,10 +1324,9 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
                 process_id,
                 address_space_id,
                 size,
-                axle_mm::GlobalVmoId::new(object_id),
+                global_vmo_id,
             )
         })?;
-        debug_assert_eq!(created.global_vmo_id().raw(), object_id);
         state.objects.insert(
             object_id,
             KernelObject::Vmo(VmoObject {
@@ -2404,6 +2411,15 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
             let _ = notify_waitable_signals_changed(state, object_id);
             let _ = notify_waitable_signals_changed(state, peer_object_id);
         }
+        if matches!(state.objects.get(&object_id), Some(KernelObject::Port(_)))
+            && state.object_handle_count(object_id) == 0
+        {
+            let Some(KernelObject::Port(port)) = state.objects.remove(&object_id) else {
+                return Err(ZX_ERR_BAD_STATE);
+            };
+            state.forget_object_handle_refs(object_id);
+            state.with_kernel_mut(|kernel| port.destroy(kernel))?;
+        }
         sync_task_lifecycle(state)?;
         Ok(())
     })
@@ -2950,32 +2966,6 @@ fn notify_waitable_signals_changed(
         wake_port_waiters(state, waitable_id)?;
     }
     Ok(())
-}
-
-fn port_packet_from_core(pkt: Packet) -> zx_port_packet_t {
-    match pkt.kind {
-        PacketKind::User => zx_port_packet_t {
-            key: pkt.key,
-            type_: ZX_PKT_TYPE_USER,
-            status: pkt.status,
-            user: zx_packet_user_t { u64: pkt.user },
-        },
-        PacketKind::Signal => {
-            let sig = zx_packet_signal_t {
-                trigger: pkt.trigger.bits(),
-                observed: pkt.observed.bits(),
-                count: pkt.count as u64,
-                timestamp: pkt.timestamp,
-                reserved1: 0,
-            };
-            zx_port_packet_t {
-                key: pkt.key,
-                type_: ZX_PKT_TYPE_SIGNAL_ONE,
-                status: ZX_OK,
-                user: sig.to_user(),
-            }
-        }
-    }
 }
 
 fn wake_signal_waiters(

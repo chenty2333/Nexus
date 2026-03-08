@@ -140,6 +140,55 @@ pub enum PortError {
     NotFound,
 }
 
+/// Packet queue backend used by the port state machine.
+pub trait PacketQueue: core::fmt::Debug {
+    /// Number of queued packets currently stored.
+    fn len(&self) -> usize;
+
+    /// Returns `true` if no packets are queued.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Push one packet to the back of the queue.
+    ///
+    /// Returns the original packet when the backend cannot store it.
+    fn push_back(&mut self, pkt: Packet) -> Result<(), Packet>;
+
+    /// Pop one packet from the front of the queue.
+    fn pop_front(&mut self) -> Option<Packet>;
+}
+
+/// Default in-memory packet queue used by host tests and simple kernel bring-up.
+#[derive(Debug, Default)]
+pub struct VecPortQueue {
+    packets: VecDeque<Packet>,
+}
+
+impl VecPortQueue {
+    /// Create an empty queue with room for at least `capacity` packets.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            packets: VecDeque::with_capacity(capacity),
+        }
+    }
+}
+
+impl PacketQueue for VecPortQueue {
+    fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    fn push_back(&mut self, pkt: Packet) -> Result<(), Packet> {
+        self.packets.push_back(pkt);
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Option<Packet> {
+        self.packets.pop_front()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PendingState {
     count: u32,
@@ -158,11 +207,11 @@ struct Observer {
 
 /// A Zircon-like port with reservation + pending merge semantics.
 #[derive(Debug)]
-pub struct Port {
+pub struct PortState<Q: PacketQueue> {
     capacity: usize,
     kernel_reserve: usize,
 
-    q: VecDeque<Packet>,
+    q: Q,
     user_in_q: usize,
 
     // Observers indexed by (waitable,key).
@@ -171,12 +220,29 @@ pub struct Port {
     pending_order: VecDeque<(WaitableId, PortKey)>,
 }
 
+/// Default port semantic state backed by an in-memory queue.
+pub type Port = PortState<VecPortQueue>;
+
 impl Port {
-    /// Create a new port.
+    /// Create a new port backed by the default in-memory queue.
     ///
     /// - `capacity` is in packets.
     /// - `kernel_reserve` reserves that many packet slots for kernel-generated packets.
     pub fn new(capacity: usize, kernel_reserve: usize) -> Self {
+        Self::with_queue(
+            capacity,
+            kernel_reserve,
+            VecPortQueue::with_capacity(capacity),
+        )
+    }
+}
+
+impl<Q: PacketQueue> PortState<Q> {
+    /// Create a new port backed by `queue`.
+    ///
+    /// - `capacity` is in packets.
+    /// - `kernel_reserve` reserves that many packet slots for kernel-generated packets.
+    pub fn with_queue(capacity: usize, kernel_reserve: usize, queue: Q) -> Self {
         assert!(capacity > 0, "capacity must be non-zero");
         assert!(
             kernel_reserve <= capacity,
@@ -185,11 +251,16 @@ impl Port {
         Self {
             capacity,
             kernel_reserve,
-            q: VecDeque::new(),
+            q: queue,
             user_in_q: 0,
             observers: BTreeMap::new(),
             pending_order: VecDeque::new(),
         }
+    }
+
+    /// Consume the port and return its packet queue backend.
+    pub fn into_queue(self) -> Q {
+        self.q
     }
 
     /// Total packets currently queued.
@@ -243,7 +314,9 @@ impl Port {
         if self.q.len() >= self.capacity {
             return Err(PortError::ShouldWait);
         }
-        self.q.push_back(pkt);
+        if self.q.push_back(pkt).is_err() {
+            return Err(PortError::ShouldWait);
+        }
         self.user_in_q += 1;
         Ok(())
     }
@@ -377,7 +450,11 @@ impl Port {
         // If we have space, enqueue now (and remove observer) without borrowing it.
         if self.q.len() < self.capacity {
             let pkt = Packet::signal(k.1, k.0, trigger, current, 1, timestamp);
-            self.q.push_back(pkt);
+            let queued = self.q.push_back(pkt);
+            debug_assert!(queued.is_ok(), "port queue overflow after capacity pre-check");
+            if queued.is_err() {
+                return;
+            }
             // remove observer (one-shot).
             let _ = self.observers.remove(&k);
             return;
@@ -421,7 +498,12 @@ impl Port {
 
             // Enqueue pending packet to the back (preserves FIFO among already queued packets).
             let pkt = Packet::signal(k.1, k.0, p.trigger, p.observed, p.count, p.timestamp);
-            self.q.push_back(pkt);
+            let queued = self.q.push_back(pkt);
+            debug_assert!(queued.is_ok(), "port queue overflow while flushing pending packet");
+            if queued.is_err() {
+                self.pending_order.push_front(k);
+                break;
+            }
 
             // Remove observer (one-shot completion).
             let _ = self.observers.remove(&k);
