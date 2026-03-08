@@ -229,3 +229,18 @@ description = "Bootstrap STREAM sockets should reject unsupported creation/optio
 id = "should.socket.wait_async_bootstrap"
 level = "should"
 description = "Bootstrap STREAM sockets should integrate with object_wait_async so writes make a port wait readable and consumable through zx_port_wait"
+
+[[contracts]]
+id = "should.socket.wait_paths_bootstrap"
+level = "should"
+description = "Bootstrap STREAM sockets should support immediate WRITABLE async waits and keep wait semantics stable across duplicate-handle traffic"
+
+[[contracts]]
+id = "should.socket.duplicate_data_bootstrap"
+level = "should"
+description = "Bootstrap STREAM sockets should allow duplicated handles to keep read/write traffic alive after the original endpoint handle closes"
+
+[[contracts]]
+id = "should.socket.backpressure_stats_bootstrap"
+level = "should"
+description = "Bootstrap STREAM sockets should report stable short-write and would-block telemetry when the fixed-capacity buffer fills and drains"

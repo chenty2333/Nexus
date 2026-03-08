@@ -329,6 +329,18 @@ impl SocketCore {
     fn fully_closed(&self) -> bool {
         !self.open_a && !self.open_b
     }
+
+    fn buffered_bytes(&self) -> usize {
+        self.dir_ab.available_read() + self.dir_ba.available_read()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SocketTelemetrySnapshot {
+    pub(crate) current_buffered_bytes: u64,
+    pub(crate) peak_buffered_bytes: u64,
+    pub(crate) short_write_count: u64,
+    pub(crate) write_should_wait_count: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -435,6 +447,7 @@ struct KernelState {
     kernel: Arc<Mutex<crate::task::Kernel>>,
     objects: BTreeMap<u64, KernelObject>,
     socket_cores: BTreeMap<u64, SocketCore>,
+    socket_telemetry: SocketTelemetrySnapshot,
     object_handle_refs: BTreeMap<u64, usize>,
     next_object_id: u64,
     next_socket_core_id: u64,
@@ -450,6 +463,7 @@ impl KernelState {
             kernel: Arc::new(Mutex::new(crate::task::Kernel::bootstrap())),
             objects: BTreeMap::new(),
             socket_cores: BTreeMap::new(),
+            socket_telemetry: SocketTelemetrySnapshot::default(),
             object_handle_refs: BTreeMap::new(),
             next_object_id: 1,
             next_socket_core_id: 1,
@@ -511,6 +525,7 @@ impl KernelState {
         state.bootstrap_self_thread_handle = state
             .alloc_handle_for_object(object_id, thread_default_rights())
             .expect("bootstrap self thread handle allocation must succeed");
+
         state
     }
 
@@ -524,6 +539,42 @@ impl KernelState {
         let id = self.next_socket_core_id;
         self.next_socket_core_id = self.next_socket_core_id.wrapping_add(1);
         id
+    }
+
+    fn note_socket_write(&mut self, requested: usize, written: usize, buffered_after: usize) {
+        if written == 0 && requested != 0 {
+            self.socket_telemetry.write_should_wait_count = self
+                .socket_telemetry
+                .write_should_wait_count
+                .wrapping_add(1);
+            return;
+        }
+        if written < requested {
+            self.socket_telemetry.short_write_count =
+                self.socket_telemetry.short_write_count.wrapping_add(1);
+        }
+        self.socket_telemetry.current_buffered_bytes = self
+            .socket_telemetry
+            .current_buffered_bytes
+            .saturating_add(written as u64);
+        self.socket_telemetry.peak_buffered_bytes = self
+            .socket_telemetry
+            .peak_buffered_bytes
+            .max(buffered_after as u64);
+    }
+
+    fn note_socket_read(&mut self, consumed: usize) {
+        self.socket_telemetry.current_buffered_bytes = self
+            .socket_telemetry
+            .current_buffered_bytes
+            .saturating_sub(consumed as u64);
+    }
+
+    fn note_socket_core_drop(&mut self, core: &SocketCore) {
+        self.socket_telemetry.current_buffered_bytes = self
+            .socket_telemetry
+            .current_buffered_bytes
+            .saturating_sub(core.buffered_bytes() as u64);
     }
 
     fn with_core<T>(
@@ -703,6 +754,14 @@ pub fn bootstrap_self_thread_handle() -> Option<zx_handle_t> {
 /// Return the bootstrap current-thread koid.
 pub fn bootstrap_self_thread_koid() -> Option<zx_koid_t> {
     with_kernel(|kernel| kernel.current_thread_koid()).ok()
+}
+
+pub(crate) fn socket_telemetry_snapshot() -> SocketTelemetrySnapshot {
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else {
+        return SocketTelemetrySnapshot::default();
+    };
+    state.socket_telemetry
 }
 
 pub(crate) fn capture_current_user_context(
@@ -1652,13 +1711,26 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
         };
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
 
-        let written = {
+        let write_result = {
             let core = state
                 .socket_cores
                 .get_mut(&endpoint.core_id)
                 .ok_or(ZX_ERR_BAD_STATE)?;
-            core.write(endpoint.side, bytes)?
+            match core.write(endpoint.side, bytes) {
+                Ok(written) => Ok((written, core.buffered_bytes())),
+                Err(ZX_ERR_SHOULD_WAIT) => Err((ZX_ERR_SHOULD_WAIT, core.buffered_bytes())),
+                Err(e) => Err((e, core.buffered_bytes())),
+            }
         };
+        let (written, buffered_after) = match write_result {
+            Ok(result) => result,
+            Err((ZX_ERR_SHOULD_WAIT, buffered_after)) => {
+                state.note_socket_write(bytes.len(), 0, buffered_after);
+                return Err(ZX_ERR_SHOULD_WAIT);
+            }
+            Err((e, _)) => return Err(e),
+        };
+        state.note_socket_write(bytes.len(), written, buffered_after);
 
         let _ = notify_waitable_signals_changed(state, resolved.object_id());
         let _ = notify_waitable_signals_changed(state, endpoint.peer_object_id);
@@ -1692,6 +1764,7 @@ pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<
         };
 
         if !peek {
+            state.note_socket_read(bytes.len());
             let _ = notify_waitable_signals_changed(state, resolved.object_id());
             let _ = notify_waitable_signals_changed(state, endpoint.peer_object_id);
         }
@@ -2753,7 +2826,9 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
                         None => return Err(ZX_ERR_BAD_STATE),
                     };
                     if should_drop_core {
-                        let _ = state.socket_cores.remove(&endpoint.core_id);
+                        if let Some(core) = state.socket_cores.remove(&endpoint.core_id) {
+                            state.note_socket_core_drop(&core);
+                        }
                     }
                 }
                 Some(KernelObject::Channel(mut endpoint)) => {
