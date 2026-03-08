@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.channel.page_loan_snapshot_bootstrap"]
+contracts = ["must.channel.page_loan_snapshot_bootstrap"]
 
 [assertions.status_code]
 channel_loan_tx_vmo_create = 0

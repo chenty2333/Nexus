@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.port.kernel_reserve_allows_signal_delivery"]
+contracts = ["must.port.kernel_reserve_allows_signal_delivery"]
 
 [assertions.status_code]
 reserve_wait_async = 0

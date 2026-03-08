@@ -36,29 +36,29 @@ level = "must"
 description = "BSP must be able to deliver a fixed-vector IPI to an AP (ack observed)"
 
 [[contracts]]
-id = "should.wait_async.timestamp_and_option_semantics"
-level = "should"
+id = "must.wait_async.timestamp_and_option_semantics"
+level = "must"
 description = "wait_async must reject invalid timestamp option combinations and emit non-zero timestamps when requested"
 
 [[contracts]]
-id = "should.wait_async.edge_requires_transition"
-level = "should"
+id = "must.wait_async.edge_requires_transition"
+level = "must"
 description = "EDGE wait_async must not fire for an already-satisfied object until a false->true transition occurs"
 
 [[contracts]]
-id = "should.port.kernel_reserve_allows_signal_delivery"
-level = "should"
+id = "must.port.kernel_reserve_allows_signal_delivery"
+level = "must"
 description = "A user-filled port must still admit kernel-generated signal packets through the reserved region"
 
 [[contracts]]
-id = "should.port.pending_merge_flushes_signal"
-level = "should"
+id = "must.port.pending_merge_flushes_signal"
+level = "must"
 description = "Kernel-generated signal packets must merge while pending on a full port and flush once space is available"
 
 [[contracts]]
-id = "should.port.readable_writable_bootstrap"
-level = "should"
-description = "Bootstrap ports should start WRITABLE, become READABLE after one queued packet, and report stable observed signal masks"
+id = "must.port.readable_writable_bootstrap"
+level = "must"
+description = "Bootstrap ports must start WRITABLE, become READABLE after one queued packet, and report stable observed signal masks"
 
 [[contracts]]
 id = "should.vmo.create_bootstrap_anonymous"
@@ -71,19 +71,19 @@ level = "should"
 description = "Root-VMAR bootstrap map/protect/unmap should support an explicit anonymous mapping lifecycle with stable error codes"
 
 [[contracts]]
-id = "should.channel.create_write_read_bootstrap"
-level = "should"
-description = "Bootstrap channel create/write/read should preserve FIFO byte payloads and readable signaling"
+id = "must.channel.create_write_read_bootstrap"
+level = "must"
+description = "Bootstrap channel create/write/read must preserve FIFO byte payloads and readable signaling"
 
 [[contracts]]
-id = "should.channel.peer_closed_bootstrap"
-level = "should"
-description = "Closing one bootstrap channel endpoint should immediately expose PEER_CLOSED on the peer and reject further writes"
+id = "must.channel.peer_closed_bootstrap"
+level = "must"
+description = "Closing one bootstrap channel endpoint must immediately expose PEER_CLOSED on the peer and reject further writes"
 
 [[contracts]]
-id = "should.channel.page_loan_snapshot_bootstrap"
-level = "should"
-description = "Page-aligned bootstrap channel writes should preserve the send-time snapshot even if the sender mutates its mapping before the peer reads"
+id = "must.channel.page_loan_snapshot_bootstrap"
+level = "must"
+description = "Page-aligned bootstrap channel writes must preserve the send-time snapshot even if the sender mutates its mapping before the peer reads"
 
 [[contracts]]
 id = "should.channel.page_loan_remap_fill_cow_bootstrap"
@@ -96,19 +96,19 @@ level = "should"
 description = "Bootstrap full-page loan writes should respect the in-flight loan-page quota, return SHOULD_WAIT before channel capacity is exhausted, and recover after reads release quota"
 
 [[contracts]]
-id = "should.channel.close_read_order_bootstrap"
-level = "should"
-description = "Bootstrap channel reads should drain queued messages before surfacing PEER_CLOSED-only state, and READABLE may coexist with PEER_CLOSED"
+id = "must.channel.close_read_order_bootstrap"
+level = "must"
+description = "Bootstrap channel reads must drain queued messages before surfacing PEER_CLOSED-only state, and READABLE may coexist with PEER_CLOSED"
 
 [[contracts]]
-id = "should.channel.writable_recovery_bootstrap"
-level = "should"
-description = "Bootstrap channel WRITABLE should clear on full peer queues, recover after reads, and stay cleared once the peer closes"
+id = "must.channel.writable_recovery_bootstrap"
+level = "must"
+description = "Bootstrap channel WRITABLE must clear on full peer queues, recover after reads, and stay cleared once the peer closes"
 
 [[contracts]]
-id = "should.channel.handle_transfer_bootstrap"
-level = "should"
-description = "Bootstrap channel write/read should move transferred handles, invalidate the sender copy, and make the received handle immediately usable"
+id = "must.channel.handle_transfer_bootstrap"
+level = "must"
+description = "Bootstrap channel write/read must move transferred handles, invalidate the sender copy, and make the received handle immediately usable"
 
 [[contracts]]
 id = "should.eventpair.signal_peer_bootstrap"
@@ -196,9 +196,9 @@ level = "should"
 description = "An infinite wait_one on a timer should block through trap-exit and resume when the timer IRQ wakes the current thread"
 
 [[contracts]]
-id = "should.vm.same_page_fault_contention_bootstrap"
-level = "should"
-description = "Bootstrap same-page faults should serialize so only one leader materializes the page while local and shared contenders block and resume"
+id = "must.vm.same_page_fault_contention_bootstrap"
+level = "must"
+description = "Bootstrap same-page faults must serialize so only one leader materializes the page while local and shared contenders block and resume"
 
 [[contracts]]
 id = "should.vmo.read_write_resize_bootstrap"

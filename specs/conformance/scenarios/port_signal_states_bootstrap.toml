@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.port.readable_writable_bootstrap"]
+contracts = ["must.port.readable_writable_bootstrap"]
 
 [assertions.status_code]
 port_wait_writable = 0

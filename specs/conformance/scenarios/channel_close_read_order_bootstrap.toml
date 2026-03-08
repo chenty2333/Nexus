@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.channel.close_read_order_bootstrap"]
+contracts = ["must.channel.close_read_order_bootstrap"]
 
 [assertions.status_code]
 channel_close_read_create = 0

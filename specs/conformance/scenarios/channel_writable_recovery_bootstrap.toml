@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.channel.writable_recovery_bootstrap"]
+contracts = ["must.channel.writable_recovery_bootstrap"]
 
 [assertions.status_code]
 channel_writable_recovery_create = 0

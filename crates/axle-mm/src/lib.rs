@@ -5214,6 +5214,198 @@ mod tests {
         assert_eq!(frames.state(shared).unwrap().rmap_anchor_count(), 1);
     }
 
+    #[cfg(feature = "loom")]
+    struct LoomCowLoanModel {
+        space: AddressSpace,
+        frames: FrameTable,
+        base: u64,
+        shared: FrameId,
+        replacement: FrameId,
+    }
+
+    #[cfg(feature = "loom")]
+    impl LoomCowLoanModel {
+        fn new() -> Self {
+            let mut frames = FrameTable::new();
+            let shared = frames.register_existing(0x56_000).unwrap();
+            let replacement = frames.register_existing(0x57_000).unwrap();
+
+            let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+            let vmo = space
+                .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(200))
+                .unwrap();
+            space.bind_vmo_frame(vmo, 0, shared).unwrap();
+            space
+                .map_fixed(
+                    &mut frames,
+                    ROOT_BASE,
+                    PAGE_SIZE,
+                    vmo,
+                    0,
+                    MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                    MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                )
+                .unwrap();
+            space.mark_copy_on_write(ROOT_BASE, PAGE_SIZE).unwrap();
+
+            Self {
+                space,
+                frames,
+                base: ROOT_BASE,
+                shared,
+                replacement,
+            }
+        }
+
+        fn resolve_cow(&mut self) {
+            self.space
+                .resolve_cow_fault(&mut self.frames, self.base + 0x80, self.replacement)
+                .unwrap();
+        }
+
+        fn loan_shared_once(&mut self) {
+            self.frames.pin_and_inc_loan_many(&[self.shared]).unwrap();
+            self.frames.dec_loan_and_unpin_many(&[self.shared]);
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    struct LoomLazyFaultLoanModel {
+        space: AddressSpace,
+        frames: FrameTable,
+        base: u64,
+        shared: FrameId,
+    }
+
+    #[cfg(feature = "loom")]
+    impl LoomLazyFaultLoanModel {
+        fn new() -> Self {
+            let mut frames = FrameTable::new();
+            let shared = frames.register_existing(0x58_000).unwrap();
+
+            let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+            let vmo = space
+                .import_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(201))
+                .unwrap();
+            space
+                .map_fixed(
+                    &mut frames,
+                    ROOT_BASE,
+                    PAGE_SIZE,
+                    vmo,
+                    0,
+                    MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                    MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                )
+                .unwrap();
+
+            Self {
+                space,
+                frames,
+                base: ROOT_BASE,
+                shared,
+            }
+        }
+
+        fn resolve_fault(&mut self) {
+            self.space
+                .resolve_lazy_vmo_fault(&mut self.frames, self.base + 0x10, self.shared)
+                .unwrap();
+        }
+
+        fn loan_shared_once(&mut self) {
+            self.frames.pin_and_inc_loan_many(&[self.shared]).unwrap();
+            self.frames.dec_loan_and_unpin_many(&[self.shared]);
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    #[test]
+    fn loom_cow_fault_and_loan_release_preserve_frame_accounting() {
+        use loom::sync::{Arc, Mutex};
+        use loom::thread;
+
+        loom::model(|| {
+            let state = Arc::new(Mutex::new(LoomCowLoanModel::new()));
+
+            let resolve_state = Arc::clone(&state);
+            let resolve = thread::spawn(move || {
+                thread::yield_now();
+                let mut state = resolve_state.lock().unwrap();
+                state.resolve_cow();
+            });
+
+            let loan_state = Arc::clone(&state);
+            let loan = thread::spawn(move || {
+                let mut state = loan_state.lock().unwrap();
+                state.loan_shared_once();
+            });
+
+            resolve.join().unwrap();
+            loan.join().unwrap();
+
+            let state = state.lock().unwrap();
+            let lookup = state.space.lookup(state.base).unwrap();
+            assert_eq!(lookup.frame_id(), Some(state.replacement));
+            assert!(lookup.perms().contains(MappingPerms::WRITE));
+            assert!(!lookup.is_copy_on_write());
+
+            let shared = state.frames.state(state.shared).unwrap();
+            assert_eq!(shared.ref_count(), 0);
+            assert_eq!(shared.map_count(), 0);
+            assert_eq!(shared.pin_count(), 0);
+            assert_eq!(shared.loan_count(), 0);
+            assert_eq!(shared.rmap_anchor_count(), 0);
+
+            let replacement = state.frames.state(state.replacement).unwrap();
+            assert_eq!(replacement.ref_count(), 1);
+            assert_eq!(replacement.map_count(), 1);
+            assert_eq!(replacement.pin_count(), 0);
+            assert_eq!(replacement.loan_count(), 0);
+        });
+    }
+
+    #[cfg(feature = "loom")]
+    #[test]
+    fn loom_lazy_fault_and_loan_release_preserve_materialized_mapping() {
+        use loom::sync::{Arc, Mutex};
+        use loom::thread;
+
+        loom::model(|| {
+            let state = Arc::new(Mutex::new(LoomLazyFaultLoanModel::new()));
+
+            let fault_state = Arc::clone(&state);
+            let fault = thread::spawn(move || {
+                thread::yield_now();
+                let mut state = fault_state.lock().unwrap();
+                state.resolve_fault();
+            });
+
+            let loan_state = Arc::clone(&state);
+            let loan = thread::spawn(move || {
+                let mut state = loan_state.lock().unwrap();
+                state.loan_shared_once();
+            });
+
+            fault.join().unwrap();
+            loan.join().unwrap();
+
+            let state = state.lock().unwrap();
+            let lookup = state.space.lookup(state.base).unwrap();
+            assert_eq!(lookup.frame_id(), Some(state.shared));
+            assert_eq!(
+                state.space.pte_meta(state.base).unwrap().tag(),
+                PteMetaTag::Present
+            );
+
+            let shared = state.frames.state(state.shared).unwrap();
+            assert_eq!(shared.ref_count(), 1);
+            assert_eq!(shared.map_count(), 1);
+            assert_eq!(shared.pin_count(), 0);
+            assert_eq!(shared.loan_count(), 0);
+        });
+    }
+
     proptest! {
         #[test]
         fn prop_vmas_remain_sorted_and_non_overlapping(slot_count in 1usize..8) {

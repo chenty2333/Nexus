@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.channel.handle_transfer_bootstrap"]
+contracts = ["must.channel.handle_transfer_bootstrap"]
 
 [assertions.status_code]
 channel_transfer_create = 0

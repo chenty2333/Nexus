@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.port.pending_merge_flushes_signal"]
+contracts = ["must.port.pending_merge_flushes_signal"]
 
 [assertions.status_code]
 pending_wait_async = 0

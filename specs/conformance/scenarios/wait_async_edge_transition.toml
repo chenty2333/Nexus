@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.wait_async.edge_requires_transition"]
+contracts = ["must.wait_async.edge_requires_transition"]
 
 [assertions.status_code]
 edge_wait_async = 0

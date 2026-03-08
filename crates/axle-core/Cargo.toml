@@ -8,9 +8,14 @@ license = "Unlicense"
 # Host tests use std by default; the kernel can depend on axle-core with `default-features = false`.
 default = ["std"]
 std = []
+loom = ["std", "dep:loom"]
 
 [dependencies]
 # no external deps in the core contracts layer (keep it auditable)
+
+[dependencies.loom]
+version = "0.7"
+optional = true
 
 [dev-dependencies]
 proptest = "1.4"

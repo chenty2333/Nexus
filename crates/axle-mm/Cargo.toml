@@ -7,9 +7,14 @@ license = "Unlicense"
 [features]
 default = ["std"]
 std = []
+loom = ["std", "dep:loom"]
 
 [dependencies]
 bitflags = { version = "2.6", default-features = false }
+
+[dependencies.loom]
+version = "0.7"
+optional = true
 
 [dev-dependencies]
 proptest = "1.4"

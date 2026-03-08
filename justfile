@@ -38,6 +38,8 @@ fmt-check:
 # Loom runs are slower; enable only when you need concurrency-model checking.
 loom:
   cargo test -p axle-sync --features loom
+  cargo test -p axle-core --features loom
+  cargo test -p axle-mm --features loom
 
 # Short libFuzzer smoke run for the host-side semantic core.
 fuzz-smoke:

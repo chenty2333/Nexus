@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.vm.same_page_fault_contention_bootstrap"]
+contracts = ["must.vm.same_page_fault_contention_bootstrap"]
 
 [assertions.status_code]
 thread_create = 0

@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.wait_async.timestamp_and_option_semantics"]
+contracts = ["must.wait_async.timestamp_and_option_semantics"]
 
 [assertions.status_code]
 wait_async_ts = 0

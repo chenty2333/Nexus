@@ -690,4 +690,116 @@ mod tests {
         assert_eq!(pkt.timestamp, 21);
         assert_eq!(pkt.count, 2);
     }
+
+    #[cfg(feature = "loom")]
+    #[test]
+    fn loom_pending_signal_flush_preserves_one_shot_delivery() {
+        use loom::sync::{Arc, Mutex};
+        use loom::thread;
+
+        loom::model(|| {
+            let port = Arc::new(Mutex::new(Port::new(2, 1)));
+            {
+                let mut port = port.lock().unwrap();
+                port.queue_user(Packet::user(1)).unwrap();
+                port.wait_async(
+                    42,
+                    7,
+                    Signals::CHANNEL_READABLE,
+                    WaitAsyncOptions::default(),
+                    Signals::NONE,
+                    11,
+                )
+                .unwrap();
+            }
+
+            let producer_port = Arc::clone(&port);
+            let producer = thread::spawn(move || {
+                thread::yield_now();
+                let mut port = producer_port.lock().unwrap();
+                port.on_signals_changed(42, Signals::CHANNEL_READABLE, 12);
+                thread::yield_now();
+                port.on_signals_changed(42, Signals::CHANNEL_READABLE, 13);
+            });
+
+            let consumer_port = Arc::clone(&port);
+            let consumer = thread::spawn(move || {
+                thread::yield_now();
+                let mut port = consumer_port.lock().unwrap();
+                let pkt = port.pop().unwrap();
+                assert_eq!(pkt.kind, PacketKind::User);
+                assert_eq!(pkt.key, 1);
+            });
+
+            producer.join().unwrap();
+            consumer.join().unwrap();
+
+            let mut port = port.lock().unwrap();
+            assert_eq!(port.len(), 1);
+            let pkt = port.pop().unwrap();
+            assert_eq!(pkt.kind, PacketKind::Signal);
+            assert_eq!(pkt.waitable, 42);
+            assert_eq!(pkt.key, 7);
+            assert!(pkt.observed.intersects(Signals::CHANNEL_READABLE));
+            assert!(pkt.count >= 1);
+            assert_eq!(port.pop(), Err(PortError::ShouldWait));
+        });
+    }
+
+    #[cfg(feature = "loom")]
+    #[test]
+    fn loom_edge_wait_requires_real_transition_under_reordering() {
+        use loom::sync::{Arc, Mutex};
+        use loom::thread;
+
+        loom::model(|| {
+            let port = Arc::new(Mutex::new(Port::new(4, 2)));
+            {
+                let mut port = port.lock().unwrap();
+                port.wait_async(
+                    1,
+                    99,
+                    Signals::CHANNEL_READABLE,
+                    WaitAsyncOptions {
+                        edge_triggered: true,
+                        timestamp: WaitAsyncTimestamp::None,
+                    },
+                    Signals::CHANNEL_READABLE,
+                    300,
+                )
+                .unwrap();
+            }
+
+            let transition_port = Arc::clone(&port);
+            let transition = thread::spawn(move || {
+                {
+                    let mut port = transition_port.lock().unwrap();
+                    port.on_signals_changed(1, Signals::NONE, 301);
+                }
+                thread::yield_now();
+                {
+                    let mut port = transition_port.lock().unwrap();
+                    port.on_signals_changed(1, Signals::CHANNEL_READABLE, 302);
+                }
+            });
+
+            let steady_port = Arc::clone(&port);
+            let steady = thread::spawn(move || {
+                thread::yield_now();
+                let mut port = steady_port.lock().unwrap();
+                port.on_signals_changed(1, Signals::CHANNEL_READABLE, 303);
+            });
+
+            transition.join().unwrap();
+            steady.join().unwrap();
+
+            let mut port = port.lock().unwrap();
+            assert_eq!(port.len(), 1);
+            let pkt = port.pop().unwrap();
+            assert_eq!(pkt.kind, PacketKind::Signal);
+            assert_eq!(pkt.key, 99);
+            assert_eq!(pkt.count, 1);
+            assert_eq!(port.pop(), Err(PortError::ShouldWait));
+        });
+    }
 }
