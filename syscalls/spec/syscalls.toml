@@ -459,3 +459,16 @@ args = [
   { name = "buffer_size", ty = "usize" },
   { name = "actual", ty = "*mut usize" },
 ]
+
+[[syscall]]
+name = "ax_process_prepare_start"
+nr = 39
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "process", ty = "zx_handle_t" },
+  { name = "image_vmo", ty = "zx_handle_t" },
+  { name = "options", ty = "u32" },
+  { name = "out_entry", ty = "*mut zx_vaddr_t" },
+  { name = "out_stack", ty = "*mut zx_vaddr_t" },
+]

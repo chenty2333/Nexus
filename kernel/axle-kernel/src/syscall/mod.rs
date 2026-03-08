@@ -19,17 +19,18 @@ use axle_types::status::{
     ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_OK,
 };
 use axle_types::syscall_numbers::{
-    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
-    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER, AXLE_SYS_FUTEX_REQUEUE,
-    AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
-    AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER,
-    AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
-    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START,
-    AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE, AXLE_SYS_TASK_KILL,
-    AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL,
-    AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_DESTROY,
-    AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE,
-    AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE, SyscallNumber,
+    AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ,
+    AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER,
+    AXLE_SYS_FUTEX_REQUEUE, AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE,
+    AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL,
+    AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
+    AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE,
+    AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE,
+    AXLE_SYS_TASK_KILL, AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START,
+    AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE,
+    AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
+    AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE,
+    SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -42,7 +43,7 @@ use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 39] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 40] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -82,6 +83,7 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 39] = [
     AXLE_SYS_SOCKET_CREATE,
     AXLE_SYS_SOCKET_WRITE,
     AXLE_SYS_SOCKET_READ,
+    AXLE_SYS_AX_PROCESS_PREPARE_START,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -147,6 +149,7 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_THREAD_CREATE => sys_thread_create(args),
         AXLE_SYS_THREAD_START => sys_thread_start(args),
         AXLE_SYS_PROCESS_CREATE => sys_process_create(args),
+        AXLE_SYS_AX_PROCESS_PREPARE_START => sys_ax_process_prepare_start(args),
         AXLE_SYS_PROCESS_START => sys_process_start(args),
         AXLE_SYS_TASK_KILL => sys_task_kill(args),
         AXLE_SYS_TASK_SUSPEND => sys_task_suspend(args),
@@ -1300,6 +1303,38 @@ fn sys_process_start(args: [u64; 6]) -> zx_status_t {
     match crate::object::start_process(process, thread, entry, stack, arg_handle, arg2) {
         Ok(()) => ZX_OK,
         Err(e) => e,
+    }
+}
+
+fn sys_ax_process_prepare_start(args: [u64; 6]) -> zx_status_t {
+    let process = match u32::try_from(args[0]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let image_vmo = match u32::try_from(args[1]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let options = match u32::try_from(args[2]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let out_entry_ptr = args[3] as *mut zx_vaddr_t;
+    let out_stack_ptr = args[4] as *mut zx_vaddr_t;
+    if out_entry_ptr.is_null() || out_stack_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let prepared = match crate::object::prepare_process_start(process, image_vmo, options) {
+        Ok(prepared) => prepared,
+        Err(err) => return err,
+    };
+    if let Err(err) = copyout(out_entry_ptr, prepared.entry()) {
+        return err;
+    }
+    match copyout(out_stack_ptr, prepared.stack_top()) {
+        Ok(()) => ZX_OK,
+        Err(err) => err,
     }
 }
 

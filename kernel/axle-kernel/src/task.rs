@@ -772,6 +772,14 @@ pub(crate) const fn process_image_default_code_perms() -> MappingPerms {
     MappingPerms::READ.union(MappingPerms::EXECUTE)
 }
 
+fn align_up_user_page(value: u64) -> Result<u64, zx_status_t> {
+    let align = crate::userspace::USER_PAGE_BYTES;
+    value
+        .checked_add(align - 1)
+        .map(|rounded| rounded & !(align - 1))
+        .ok_or(ZX_ERR_OUT_OF_RANGE)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ImportedProcessImage {
     code_vmo: CreatedVmo,
@@ -1200,6 +1208,22 @@ impl CreatedProcess {
 
     pub(crate) const fn root_vmar(self) -> Vmar {
         self.root_vmar
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedProcessStart {
+    entry: u64,
+    stack_top: u64,
+}
+
+impl PreparedProcessStart {
+    pub(crate) const fn entry(self) -> u64 {
+        self.entry
+    }
+
+    pub(crate) const fn stack_top(self) -> u64 {
+        self.stack_top
     }
 }
 
@@ -3105,6 +3129,21 @@ impl Kernel {
         result
     }
 
+    pub(crate) fn prepare_process_start(
+        &mut self,
+        process_id: ProcessId,
+        global_vmo_id: KernelVmoId,
+        layout: &ProcessImageLayout,
+    ) -> Result<PreparedProcessStart, zx_status_t> {
+        let process = self.process(process_id)?;
+        if process.state != ProcessState::Created {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        self.with_vm_mut(|vm| {
+            vm.prepare_process_start(process_id, process.address_space_id, global_vmo_id, layout)
+        })
+    }
+
     pub(crate) fn kill_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
         self.request_thread_termination(thread_id)
     }
@@ -4779,6 +4818,98 @@ impl VmDomain {
             code_vmo,
             layout: crate::userspace::bootstrap_process_image_layout()
                 .unwrap_or_else(ProcessImageLayout::bootstrap_conformance),
+        })
+    }
+
+    fn map_existing_local_vmo_fixed(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        base: u64,
+        len: u64,
+        local_vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+    ) -> Result<(), zx_status_t> {
+        self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
+            address_space
+                .map_vmo_fixed(frames, vmar_id, base, len, local_vmo_id, vmo_offset, perms)
+                .map_err(map_address_space_error)
+        })?;
+        self.install_mapping_pages(address_space_id, base, len)?;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_process_start(
+        &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        global_vmo_id: KernelVmoId,
+        layout: &ProcessImageLayout,
+    ) -> Result<PreparedProcessStart, zx_status_t> {
+        let root_vmar_id = {
+            let address_space = self
+                .address_spaces
+                .get(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            let root = address_space.root_vmar();
+            root.id()
+        };
+
+        let local_vmo_id =
+            self.import_global_vmo_into_address_space(address_space_id, global_vmo_id)?;
+        if layout.segments().is_empty() {
+            self.map_existing_local_vmo_fixed(
+                address_space_id,
+                root_vmar_id,
+                layout.code_base(),
+                crate::userspace::USER_CODE_BYTES,
+                local_vmo_id,
+                0,
+                MappingPerms::READ
+                    | MappingPerms::WRITE
+                    | MappingPerms::EXECUTE
+                    | MappingPerms::USER,
+            )?;
+        } else {
+            for segment in layout.segments() {
+                let len = align_up_user_page(segment.mem_size_bytes())?;
+                if len == 0 {
+                    continue;
+                }
+                let perms = segment.perms() | MappingPerms::USER;
+                self.map_existing_local_vmo_fixed(
+                    address_space_id,
+                    root_vmar_id,
+                    segment.vaddr(),
+                    len,
+                    local_vmo_id,
+                    segment.vmo_offset(),
+                    perms,
+                )?;
+            }
+        }
+
+        let stack_global_vmo_id = self.alloc_global_vmo_id();
+        let stack_vmo = self.create_anonymous_vmo_for_address_space(
+            process_id,
+            address_space_id,
+            crate::userspace::USER_PAGE_BYTES,
+            stack_global_vmo_id,
+        )?;
+        self.map_existing_local_vmo_fixed(
+            address_space_id,
+            root_vmar_id,
+            crate::userspace::USER_STACK_VA,
+            crate::userspace::USER_PAGE_BYTES,
+            stack_vmo.vmo_id(),
+            0,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+        )?;
+
+        Ok(PreparedProcessStart {
+            entry: layout.entry(),
+            stack_top: crate::userspace::USER_STACK_VA + crate::userspace::USER_PAGE_BYTES,
         })
     }
 

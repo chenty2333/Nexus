@@ -2397,12 +2397,24 @@ local_fault_contention_done:
 	int $0x80
 	mov %rax, 8*344(%rbx)
 
-	// Prefer the kernel-seeded bootstrap code-image VMO; fall back to vmo_create+copy if absent.
+	// Prefer the kernel-seeded bootstrap code-image VMO and let the kernel install
+	// the process image + stack directly. Fall back to manual vmar_map bring-up if
+	// the code-image VMO is not available.
 	mov 8*506(%rbx), %rax
 	test %rax, %rax
 	je process_child_code_fallback
-	mov %rax, 0x1910(%rbx)
-	jmp process_child_code_ready
+
+	mov 0x1900(%rbx), %rdi
+	mov 8*506(%rbx), %rsi
+	xorl %edx, %edx
+	lea 0x1910(%rbx), %r10
+	lea 0x1918(%rbx), %r8
+	movabs $39, %rax
+	int $0x80
+	mov %rax, 8*347(%rbx)
+	movq $0, 8*345(%rbx)
+	movq $0, 8*349(%rbx)
+	jmp process_child_image_ready
 
 process_child_code_fallback:
 	// vmo_create(child code image, self_code_vmo_size)
@@ -2419,7 +2431,7 @@ process_child_code_fallback:
 	mov 0x1910(%rbx), %r10
 	xor %r8, %r8
 	mov 8*510(%rbx), %r9
-	lea 0x1918(%rbx), %rax
+	lea 0x1940(%rbx), %rax
 	sub $8, %rsp
 	mov %rax, (%rsp)
 	movabs $10, %rax
@@ -2429,28 +2441,53 @@ process_child_code_fallback:
 
 	// copy current runner code bytes into the shared code VMO
 	movabs $0x0000000100000000, %rsi
-	mov 0x1918(%rbx), %rdi
+	mov 0x1940(%rbx), %rdi
 	mov 8*510(%rbx), %rcx
 	rep movsb
-	jmp process_child_code_mapped
 
-process_child_code_ready:
-	// parent root_vmar maps the bootstrap pager-backed code-image VMO at USER_CODE_VA + 0x20000
-	mov 8*62(%rbx), %rdi
-	movl $0x401, %esi
-	movabs $0x20000, %rdx
+	// child root_vmar maps code at USER_CODE_VA
+	mov 0x1908(%rbx), %rdi
+	movl $0x403, %esi
+	xor %rdx, %rdx
 	mov 0x1910(%rbx), %r10
 	xor %r8, %r8
 	mov 8*510(%rbx), %r9
-	lea 0x1918(%rbx), %rax
+	lea 0x1948(%rbx), %rax
 	sub $8, %rsp
 	mov %rax, (%rsp)
 	movabs $10, %rax
 	int $0x80
 	add $8, %rsp
-	mov %rax, 8*345(%rbx)
+	mov %rax, 8*347(%rbx)
 
-process_child_code_mapped:
+	// vmo_create(child stack page, 0x1000)
+	lea 0x1930(%rbx), %rdx
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	movabs $9, %rax
+	int $0x80
+
+	// child root_vmar maps stack at USER_STACK_VA
+	mov 0x1908(%rbx), %rdi
+	movl $0x403, %esi
+	mov 8*510(%rbx), %rdx
+	add $0x2000, %rdx
+	mov 0x1930(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x1950(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*349(%rbx)
+	movabs $0x0000000100000000, %rax
+	add 8*510(%rbx), %rax
+	add $0x3000, %rax
+	mov %rax, 0x1918(%rbx)
+
+process_child_image_ready:
 
 	// vmo_create(child shared region, 0x2000)
 	lea 0x1920(%rbx), %rdx
@@ -2501,33 +2538,6 @@ process_child_code_mapped:
 	add $8, %rsp
 	mov %rax, 8*383(%rbx)
 
-	// vmo_create(child stack page, 0x1000)
-	lea 0x1930(%rbx), %rdx
-	movabs $0x1000, %rdi
-	xorl %esi, %esi
-	movabs $9, %rax
-	int $0x80
-
-	// child root_vmar maps code at USER_CODE_VA
-	mov 0x1908(%rbx), %rdi
-	mov 8*506(%rbx), %rax
-	test %rax, %rax
-	movl $0x403, %esi
-	je process_child_code_map
-	movl $0x401, %esi
-process_child_code_map:
-	xor %rdx, %rdx
-	mov 0x1910(%rbx), %r10
-	xor %r8, %r8
-	mov 8*510(%rbx), %r9
-	lea 0x1940(%rbx), %rax
-	sub $8, %rsp
-	mov %rax, (%rsp)
-	movabs $10, %rax
-	int $0x80
-	add $8, %rsp
-	mov %rax, 8*347(%rbx)
-
 	// child root_vmar maps shared region at USER_SHARED_VA
 	mov 0x1908(%rbx), %rdi
 	movl $0x403, %esi
@@ -2559,22 +2569,6 @@ process_child_code_map:
 	add $8, %rsp
 	mov %rax, 8*384(%rbx)
 
-	// child root_vmar maps stack at USER_STACK_VA
-	mov 0x1908(%rbx), %rdi
-	movl $0x403, %esi
-	mov 8*510(%rbx), %rdx
-	add $0x2000, %rdx
-	mov 0x1930(%rbx), %r10
-	xor %r8, %r8
-	movabs $0x1000, %r9
-	lea 0x1950(%rbx), %rax
-	sub $8, %rsp
-	mov %rax, (%rsp)
-	movabs $10, %rax
-	int $0x80
-	add $8, %rsp
-	mov %rax, 8*349(%rbx)
-
 	// thread_create(child_process, NULL, 0, 0, &child_thread_h)
 	mov 0x1900(%rbx), %rdi
 	xor %rsi, %rsi
@@ -2589,9 +2583,7 @@ process_child_code_map:
 	mov 0x1900(%rbx), %rdi
 	mov 0x1938(%rbx), %rsi
 	lea process_child_entry(%rip), %rdx
-	movabs $0x0000000100000000, %r10
-	add 8*510(%rbx), %r10
-	add $0x3000, %r10
+	mov 0x1918(%rbx), %r10
 	xor %r8d, %r8d
 	movabs $0x0000000100000000, %r9
 	add 8*510(%rbx), %r9

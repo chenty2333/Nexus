@@ -343,12 +343,13 @@ pub(crate) struct SocketTelemetrySnapshot {
     pub(crate) write_should_wait_count: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct VmoObject {
     creator_process_id: u64,
     global_vmo_id: axle_mm::GlobalVmoId,
     kind: axle_mm::VmoKind,
     size_bytes: u64,
+    image_layout: Option<crate::task::ProcessImageLayout>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -549,6 +550,7 @@ impl KernelState {
                     global_vmo_id: imported.code_vmo().global_vmo_id(),
                     kind: axle_mm::VmoKind::PagerBacked,
                     size_bytes: imported.code_vmo().size_bytes(),
+                    image_layout: Some(imported.layout()),
                 }),
             );
             state.bootstrap_self_code_vmo_handle = state
@@ -1256,6 +1258,42 @@ pub fn create_process(
     })
 }
 
+/// Install one internal process image into a newly created process and return start parameters.
+pub fn prepare_process_start(
+    process_handle: zx_handle_t,
+    image_vmo_handle: zx_handle_t,
+    options: u32,
+) -> Result<crate::task::PreparedProcessStart, zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved_process =
+            state.lookup_handle(process_handle, crate::task::HandleRights::MANAGE_PROCESS)?;
+        let process = match state.objects.get(&resolved_process.object_id()) {
+            Some(KernelObject::Process(process)) => *process,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+
+        let resolved_vmo = state.lookup_handle(
+            image_vmo_handle,
+            crate::task::HandleRights::READ | crate::task::HandleRights::MAP,
+        )?;
+        let image_vmo = match state.objects.get(&resolved_vmo.object_id()) {
+            Some(KernelObject::Vmo(vmo)) => vmo.clone(),
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        let layout = image_vmo.image_layout.ok_or(ZX_ERR_NOT_SUPPORTED)?;
+
+        state.with_kernel_mut(|kernel| {
+            kernel.prepare_process_start(process.process_id, image_vmo.global_vmo_id, &layout)
+        })
+    })
+}
+
 /// Start a previously created thread at one user entry point.
 pub fn start_thread(
     thread_handle: zx_handle_t,
@@ -1679,6 +1717,7 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
                 global_vmo_id: created.global_vmo_id(),
                 kind: axle_mm::VmoKind::Anonymous,
                 size_bytes: created.size_bytes(),
+                image_layout: None,
             }),
         );
 
@@ -1697,7 +1736,7 @@ pub fn vmo_read(handle: zx_handle_t, offset: u64, len: usize) -> Result<Vec<u8>,
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let vmo = match state.objects.get(&resolved.object_id()) {
-            Some(KernelObject::Vmo(vmo)) => *vmo,
+            Some(KernelObject::Vmo(vmo)) => vmo.clone(),
             Some(_) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
@@ -1711,7 +1750,7 @@ pub fn vmo_write(handle: zx_handle_t, offset: u64, bytes: &[u8]) -> Result<(), z
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let vmo = match state.objects.get(&resolved.object_id()) {
-            Some(KernelObject::Vmo(vmo)) => *vmo,
+            Some(KernelObject::Vmo(vmo)) => vmo.clone(),
             Some(_) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
@@ -1726,7 +1765,7 @@ pub fn vmo_set_size(handle: zx_handle_t, size: u64) -> Result<(), zx_status_t> {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let object_id = resolved.object_id();
         let vmo = match state.objects.get(&object_id) {
-            Some(KernelObject::Vmo(vmo)) => *vmo,
+            Some(KernelObject::Vmo(vmo)) => vmo.clone(),
             Some(_) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
@@ -2233,7 +2272,7 @@ pub fn vmar_map(
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         let vmo = match state.objects.get(&resolved_vmo.object_id()) {
-            Some(KernelObject::Vmo(vmo)) => *vmo,
+            Some(KernelObject::Vmo(vmo)) => vmo.clone(),
             Some(_) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
