@@ -550,7 +550,12 @@ impl KernelState {
                     global_vmo_id: imported.code_vmo().global_vmo_id(),
                     kind: axle_mm::VmoKind::PagerBacked,
                     size_bytes: imported.code_vmo().size_bytes(),
-                    image_layout: Some(imported.layout()),
+                    image_layout: Some(
+                        imported
+                            .layout()
+                            .rebased_for_loaded_image()
+                            .expect("bootstrap code image layout must rebase"),
+                    ),
                 }),
             );
             state.bootstrap_self_code_vmo_handle = state

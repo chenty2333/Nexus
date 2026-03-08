@@ -766,6 +766,31 @@ impl ProcessImageLayout {
     pub(crate) fn segments(&self) -> &[ProcessImageSegment] {
         self.segments.as_slice()
     }
+
+    pub(crate) fn rebased_for_loaded_image(&self) -> Result<Self, zx_status_t> {
+        let mut stored = heapless::Vec::new();
+        for segment in &self.segments {
+            let rebased_offset = segment
+                .vaddr()
+                .checked_sub(self.code_base)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            stored
+                .push(ProcessImageSegment::new(
+                    segment.vaddr(),
+                    rebased_offset,
+                    segment.file_size_bytes(),
+                    segment.mem_size_bytes(),
+                    segment.perms(),
+                ))
+                .map_err(|_| ZX_ERR_NO_RESOURCES)?;
+        }
+        Ok(Self {
+            code_base: self.code_base,
+            code_size_bytes: self.code_size_bytes,
+            entry: self.entry,
+            segments: stored,
+        })
+    }
 }
 
 pub(crate) const fn process_image_default_code_perms() -> MappingPerms {

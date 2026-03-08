@@ -113,8 +113,14 @@ external VM model.
   segment bytes through that same source path instead of indexing the whole raw
   blob directly. Separately, bootstrap now seeds one internal pager-backed
   code-image VMO for the already-loaded runner text image, and the child
-  process bootstrap path uses that VMO directly when mapping child code instead
-  of always doing `vmo_create + memcpy`.
+  process bootstrap path now relies on the `ax_process_prepare_start` loader
+  hook for child code + stack installation instead of keeping a second manual
+  `vmo_create + memcpy + vmar_map` fallback.
+  One subtle but important boundary is now explicit: the bootstrap code-image
+  VMO is a loaded-memory image, not a raw ELF file. The stored
+  `ProcessImageLayout` for that VMO therefore rebases segment offsets to
+  `{segment.vaddr - code_base}` before child installation, while raw
+  pager-file sources keep ELF file offsets.
   That bootstrap code-image path now also has an explicit internal
   `ProcessImageLayout` boundary with parsed `PT_LOAD` segment metadata, so the
   VM/object layers carry `{code_base, code_size, entry, segments[]}` instead
