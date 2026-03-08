@@ -1574,6 +1574,33 @@ mov %rax, 8*39(%rbx)
 mov (%rcx), %rax
 mov %rax, 8*40(%rbx)
 
+// timer_cancel to clear SIGNALED before an infinite wait path.
+mov 0x1698(%rbx), %rdi
+movabs $8, %rax
+int $0x80
+
+// timer_set(deadline=t0+4s) for an infinite wait that must block in trap-exit.
+mov 0x1698(%rbx), %rdi
+mov %r12, %rsi
+movabs $4000000000, %rax
+add %rax, %rsi
+xor %rdx, %rdx
+movabs $7, %rax
+int $0x80
+
+// object_wait_one(timer, TIMER_SIGNALED, deadline=INFINITE, observed=&obs4) should be OK
+lea 0xd70(%rbx), %rcx
+movq $0, (%rcx)
+mov 0x1698(%rbx), %rdi
+movl $0x8, %esi
+movabs $0x7fffffffffffffff, %rdx
+mov %rcx, %r10
+movabs $1, %rax
+int $0x80
+mov %rax, 8*429(%rbx)
+mov (%rcx), %rax
+mov %rax, 8*430(%rbx)
+
 // --- Port reserve test ----------------------------------------------------
 
 // port_create(ok, out=&reserve_port_h)

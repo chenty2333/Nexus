@@ -126,6 +126,12 @@ enum FaultPrepareKind {
     LazyVmoAlloc,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrapExitDisposition {
+    Complete,
+    BlockCurrent,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FaultTelemetry {
     leader_claims: u64,
@@ -2064,15 +2070,29 @@ impl Kernel {
         Ok(())
     }
 
-    pub(crate) fn finish_syscall(
+    fn restore_current_user_context(
         &mut self,
         trap: &mut crate::arch::int80::TrapFrame,
         cpu_frame: *mut u64,
     ) -> Result<(), zx_status_t> {
+        let context = self.current_thread()?.context.ok_or(ZX_ERR_BAD_STATE)?;
+        context.restore(trap, cpu_frame)
+    }
+
+    pub(crate) fn finish_syscall(
+        &mut self,
+        trap: &mut crate::arch::int80::TrapFrame,
+        cpu_frame: *mut u64,
+        resuming_blocked_current: bool,
+    ) -> Result<TrapExitDisposition, zx_status_t> {
         match self.current_thread()?.state {
             ThreadState::Runnable => {
-                self.capture_current_user_context(trap, cpu_frame.cast_const())?;
-                if self.reschedule_requested {
+                if resuming_blocked_current {
+                    self.restore_current_user_context(trap, cpu_frame)?;
+                } else {
+                    self.capture_current_user_context(trap, cpu_frame.cast_const())?;
+                }
+                if !resuming_blocked_current && self.reschedule_requested {
                     self.reschedule_requested = false;
                     if let Some(next_thread_id) = self.pop_runnable_thread() {
                         self.requeue_current_thread()?;
@@ -2080,14 +2100,18 @@ impl Kernel {
                     }
                 }
                 self.sync_current_cpu_tlb_state()?;
-                Ok(())
+                Ok(TrapExitDisposition::Complete)
             }
             ThreadState::New => Err(ZX_ERR_BAD_STATE),
             ThreadState::FutexWait { .. }
             | ThreadState::SignalWait { .. }
             | ThreadState::PortWait { .. } => {
-                let next_thread_id = self.pop_runnable_thread().ok_or(ZX_ERR_BAD_STATE)?;
-                self.switch_to_thread(next_thread_id, trap, cpu_frame)
+                if let Some(next_thread_id) = self.pop_runnable_thread() {
+                    self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
+                    Ok(TrapExitDisposition::Complete)
+                } else {
+                    Ok(TrapExitDisposition::BlockCurrent)
+                }
             }
         }
     }
@@ -2106,10 +2130,6 @@ impl Kernel {
         thread.state = ThreadState::FutexWait { key };
         self.futexes.enqueue_waiter(key, thread_id, owner_koid);
         Ok(())
-    }
-
-    pub(crate) fn can_block_current_thread(&self) -> bool {
-        !self.run_queue.is_empty()
     }
 
     pub(crate) fn enqueue_current_signal_wait(

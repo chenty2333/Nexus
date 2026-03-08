@@ -54,6 +54,11 @@ external VM model.
   kernel core lock. Scheduling, process/thread bookkeeping, and futex state are
   still under the core lock; VM state now has its own boundary ahead of more
   precise same-page fault serialization.
+- Trap-exit now has a common block primitive for scheduler-backed waits. An
+  infinite `futex_wait`, `object_wait_one`, or `port_wait` can mark the current
+  thread blocked even when there is no immediately runnable peer thread; trap
+  exit idles until the current thread becomes runnable again, then restores the
+  saved user context instead of re-capturing the blocked syscall frame.
 - Same-page fault serialization now has an explicit `FaultInFlight` table.
   Fault handling is split into three phases: classify and claim a leader,
   prepare heavy work outside the main VM lock, then re-enter VM to revalidate

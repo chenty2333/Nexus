@@ -164,3 +164,8 @@ description = "Bootstrap VMAR mapping should support mappings far beyond the ori
 id = "should.vmar.child_metadata_stability_bootstrap"
 level = "should"
 description = "Bootstrap child VMAR mappings should coexist with far root mappings without losing mapping identity, destroy cleanup, or sparse page-table metadata stability"
+
+[[contracts]]
+id = "should.timer.wait_forever_bootstrap"
+level = "should"
+description = "An infinite wait_one on a timer should block through trap-exit and resume when the timer IRQ wakes the current thread"

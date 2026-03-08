@@ -40,6 +40,11 @@ const PORT_KERNEL_RESERVE: usize = 16;
 const CHANNEL_CAPACITY: usize = 64;
 const DEFAULT_OBJECT_GENERATION: u32 = 0;
 
+enum TrapBlock<T> {
+    Ready(T),
+    BlockCurrent,
+}
+
 /// Kernel object kinds needed in current phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
@@ -438,7 +443,16 @@ pub(crate) fn finish_syscall(
     trap: &mut crate::arch::int80::TrapFrame,
     cpu_frame: *mut u64,
 ) -> Result<(), zx_status_t> {
-    with_kernel_mut(|kernel| kernel.finish_syscall(trap, cpu_frame))
+    run_trap_blocking(|resuming_blocked_current| {
+        with_kernel_mut(|kernel| {
+            kernel
+                .finish_syscall(trap, cpu_frame, resuming_blocked_current)
+                .map(|disposition| match disposition {
+                    crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(()),
+                    crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
+                })
+        })
+    })
 }
 
 #[allow(dead_code)]
@@ -535,6 +549,26 @@ fn with_kernel<T>(
     f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
     with_core(f)
+}
+
+fn block_current_trap_until_runnable() {
+    x86_64::instructions::interrupts::enable_and_hlt();
+    x86_64::instructions::interrupts::disable();
+}
+
+fn run_trap_blocking<T>(
+    mut f: impl FnMut(bool) -> Result<TrapBlock<T>, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    let mut resuming_blocked_current = false;
+    loop {
+        match f(resuming_blocked_current)? {
+            TrapBlock::Ready(value) => return Ok(value),
+            TrapBlock::BlockCurrent => {
+                resuming_blocked_current = true;
+                block_current_trap_until_runnable();
+            }
+        }
+    }
 }
 
 /// Create a new Port object and return a handle.
@@ -1530,9 +1564,7 @@ pub fn futex_wait(
 
     let blocked_on_scheduler = with_state_mut(|state| {
         let owner_koid = validate_futex_wait_owner(state, key, new_futex_owner)?;
-        if deadline == i64::MAX
-            && state.with_kernel(|kernel| Ok(kernel.can_block_current_thread()))?
-        {
+        if deadline == i64::MAX {
             state.with_kernel_mut(|kernel| kernel.enqueue_current_futex_wait(key, owner_koid))?;
             Ok(true)
         } else {
@@ -1800,9 +1832,7 @@ pub fn port_wait(
                 let blocked_on_scheduler = with_state_mut(|state| {
                     let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
                     let object_id = resolved.object_id();
-                    if deadline == i64::MAX
-                        && state.with_kernel(|kernel| Ok(kernel.can_block_current_thread()))?
-                    {
+                    if deadline == i64::MAX {
                         state.with_kernel_mut(|kernel| {
                             kernel.enqueue_current_port_wait(object_id, out_ptr)
                         })?;
@@ -1869,9 +1899,7 @@ pub fn object_wait_one(
                 })?;
                 return Ok(());
             }
-            if deadline == i64::MAX
-                && state.with_kernel(|kernel| Ok(kernel.can_block_current_thread()))?
-            {
+            if deadline == i64::MAX {
                 state.with_kernel_mut(|kernel| {
                     kernel.enqueue_current_signal_wait(object_id, watched, observed_ptr)
                 })?;
