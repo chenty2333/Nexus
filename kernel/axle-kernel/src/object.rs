@@ -50,6 +50,8 @@ enum TrapBlock<T> {
 pub enum ObjectKind {
     /// Process object.
     Process,
+    /// Suspend token object.
+    SuspendToken,
     /// Channel endpoint object.
     Channel,
     /// EventPair endpoint object.
@@ -203,9 +205,21 @@ struct ProcessObject {
     koid: zx_koid_t,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SuspendTarget {
+    Process { process_id: u64 },
+    Thread { thread_id: u64 },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SuspendTokenObject {
+    target: SuspendTarget,
+}
+
 #[derive(Debug)]
 enum KernelObject {
     Process(ProcessObject),
+    SuspendToken(SuspendTokenObject),
     Channel(ChannelEndpoint),
     EventPair(EventPairEndpoint),
     Port(Port),
@@ -934,6 +948,61 @@ pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
             Some(_) => Err(ZX_ERR_WRONG_TYPE),
             None => Err(ZX_ERR_BAD_HANDLE),
         }
+    })
+}
+
+/// Suspend one process or thread and return a token whose close resumes it.
+pub fn task_suspend(handle: zx_handle_t, out_token: *mut zx_handle_t) -> Result<(), zx_status_t> {
+    if out_token.is_null() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let target = match state.objects.get(&resolved.object_id()) {
+            Some(KernelObject::Process(process)) => {
+                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_PROCESS)?;
+                state.with_kernel_mut(|kernel| kernel.suspend_process(process.process_id))?;
+                SuspendTarget::Process {
+                    process_id: process.process_id,
+                }
+            }
+            Some(KernelObject::Thread(thread)) => {
+                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_THREAD)?;
+                state.with_kernel_mut(|kernel| kernel.suspend_thread(thread.thread_id))?;
+                SuspendTarget::Thread {
+                    thread_id: thread.thread_id,
+                }
+            }
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+
+        let object_id = state.alloc_object_id();
+        state.objects.insert(
+            object_id,
+            KernelObject::SuspendToken(SuspendTokenObject { target }),
+        );
+        let token_handle =
+            match state.alloc_handle_for_object(object_id, suspend_token_default_rights()) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    let _ = state.objects.remove(&object_id);
+                    let _ = match target {
+                        SuspendTarget::Process { process_id } => {
+                            state.with_kernel_mut(|kernel| kernel.resume_process(process_id))
+                        }
+                        SuspendTarget::Thread { thread_id } => {
+                            state.with_kernel_mut(|kernel| kernel.resume_thread(thread_id))
+                        }
+                    };
+                    return Err(err);
+                }
+            };
+        state.with_kernel_mut(|kernel| {
+            let thread_id = kernel.current_thread_info()?.thread_id();
+            kernel.copyout_thread_user(thread_id, out_token, token_handle)
+        })
     })
 }
 
@@ -1869,6 +1938,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
         let timer_id = match state.objects.get(&object_id) {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
             Some(KernelObject::Process(_))
+            | Some(KernelObject::SuspendToken(_))
             | Some(KernelObject::Channel(_))
             | Some(KernelObject::EventPair(_))
             | Some(KernelObject::Port(_))
@@ -1906,6 +1976,7 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
         let timer_id = match state.objects.get(&object_id) {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
             Some(KernelObject::Process(_))
+            | Some(KernelObject::SuspendToken(_))
             | Some(KernelObject::Channel(_))
             | Some(KernelObject::EventPair(_))
             | Some(KernelObject::Port(_))
@@ -1941,6 +2012,7 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
             let port = match obj {
                 KernelObject::Port(port) => port,
                 KernelObject::Process(_)
+                | KernelObject::SuspendToken(_)
                 | KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
@@ -1972,6 +2044,7 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
             let port = match obj {
                 KernelObject::Port(port) => port,
                 KernelObject::Process(_)
+                | KernelObject::SuspendToken(_)
                 | KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
@@ -2158,6 +2231,7 @@ pub fn object_wait_async(
             let port = match obj {
                 KernelObject::Port(port) => port,
                 KernelObject::Process(_)
+                | KernelObject::SuspendToken(_)
                 | KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
@@ -2189,7 +2263,23 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
             Some(_) => None,
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
+        let suspend_target = match state.objects.get(&object_id) {
+            Some(KernelObject::SuspendToken(token)) => Some(token.target),
+            _ => None,
+        };
         state.close_handle(raw)?;
+
+        if let Some(target) = suspend_target {
+            let _ = state.objects.remove(&object_id);
+            match target {
+                SuspendTarget::Process { process_id } => {
+                    state.with_kernel_mut(|kernel| kernel.resume_process(process_id))?;
+                }
+                SuspendTarget::Thread { thread_id } => {
+                    state.with_kernel_mut(|kernel| kernel.resume_thread(thread_id))?;
+                }
+            }
+        }
 
         if let Some(peer_object_id) = peer_link {
             let removed = state.objects.remove(&object_id);
@@ -2249,6 +2339,7 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                 let _ = (process.process_id, process.koid);
                 ObjectKind::Process
             }
+            KernelObject::SuspendToken(_) => ObjectKind::SuspendToken,
             KernelObject::Channel(endpoint) => {
                 let _ = (
                     endpoint.peer_object_id,
@@ -2353,6 +2444,10 @@ fn process_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::INSPECT
         | crate::task::HandleRights::MANAGE_PROCESS
         | crate::task::HandleRights::MANAGE_THREAD
+}
+
+fn suspend_token_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::empty()
 }
 
 fn eventpair_default_rights() -> crate::task::HandleRights {
@@ -2582,7 +2677,7 @@ fn vmar_allocate_align_from_options(options: u32) -> Result<u64, zx_status_t> {
 fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals, zx_status_t> {
     let obj = state.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
     match obj {
-        KernelObject::Process(_) => Ok(Signals::NONE),
+        KernelObject::Process(_) | KernelObject::SuspendToken(_) => Ok(Signals::NONE),
         KernelObject::Channel(endpoint) => {
             let mut signals = Signals::NONE;
             if endpoint.is_readable() {

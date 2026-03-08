@@ -378,3 +378,13 @@ ret = "zx_status_t"
 args = [
   { name = "handle", ty = "zx_handle_t" },
 ]
+
+[[syscall]]
+name = "task_suspend"
+nr = 32
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+  { name = "out_token", ty = "*mut zx_handle_t" },
+]

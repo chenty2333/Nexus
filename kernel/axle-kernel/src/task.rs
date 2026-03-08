@@ -791,6 +791,7 @@ impl CreatedProcess {
 pub(crate) enum ThreadState {
     New,
     Runnable,
+    Suspended,
     Killed,
     FutexWait {
         key: FutexKey,
@@ -1465,6 +1466,7 @@ struct Process {
     address_space_id: AddressSpaceId,
     cspace: CSpace,
     state: ProcessState,
+    suspend_tokens: u32,
 }
 
 impl Process {
@@ -1474,6 +1476,7 @@ impl Process {
             address_space_id,
             cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
             state: ProcessState::Started,
+            suspend_tokens: 0,
         }
     }
 
@@ -1483,6 +1486,7 @@ impl Process {
             address_space_id,
             cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
             state: ProcessState::Created,
+            suspend_tokens: 0,
         }
     }
 
@@ -1576,6 +1580,7 @@ struct Thread {
     state: ThreadState,
     queued: bool,
     context: Option<UserContext>,
+    suspend_tokens: u32,
 }
 
 /// Internal bootstrap kernel model.
@@ -1729,6 +1734,7 @@ impl Kernel {
                 state: ThreadState::Runnable,
                 queued: false,
                 context: None,
+                suspend_tokens: 0,
             },
         );
         kernel.current_thread_id = thread_id;
@@ -2242,7 +2248,7 @@ impl Kernel {
                 Ok(TrapExitDisposition::Complete)
             }
             ThreadState::New => Err(ZX_ERR_BAD_STATE),
-            ThreadState::Killed => {
+            ThreadState::Suspended | ThreadState::Killed => {
                 if let Some(next_thread_id) = self.pop_runnable_thread() {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     Ok(TrapExitDisposition::Complete)
@@ -2453,6 +2459,7 @@ impl Kernel {
                 state: ThreadState::New,
                 queued: false,
                 context: None,
+                suspend_tokens: 0,
             },
         );
         Ok((thread_id, koid))
@@ -2539,6 +2546,7 @@ impl Kernel {
             }
             ThreadState::New
             | ThreadState::Runnable
+            | ThreadState::Suspended
             | ThreadState::SignalWait { .. }
             | ThreadState::PortWait { .. } => {}
         }
@@ -2567,6 +2575,99 @@ impl Kernel {
             .collect::<Vec<_>>();
         for thread_id in thread_ids {
             self.kill_thread(thread_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn suspend_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        let process_id = self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .process_id;
+        let process = self.process(process_id)?;
+        if matches!(process.state, ProcessState::Created | ProcessState::Killed) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        if matches!(thread.state, ThreadState::New | ThreadState::Killed) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.suspend_tokens = thread.suspend_tokens.saturating_add(1);
+        if matches!(thread.state, ThreadState::Runnable) {
+            thread.state = ThreadState::Suspended;
+            thread.queued = false;
+        }
+        if thread_id == self.current_thread_id {
+            self.reschedule_requested = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resume_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        if thread.suspend_tokens == 0 {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.suspend_tokens -= 1;
+        let _ = thread;
+        self.maybe_resume_thread(thread_id)
+    }
+
+    pub(crate) fn suspend_process(&mut self, process_id: ProcessId) -> Result<(), zx_status_t> {
+        let process = self
+            .processes
+            .get_mut(&process_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        if matches!(process.state, ProcessState::Created | ProcessState::Killed) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        process.suspend_tokens = process.suspend_tokens.saturating_add(1);
+        process.state = ProcessState::Suspended;
+        let thread_ids = self
+            .threads
+            .iter()
+            .filter_map(|(thread_id, thread)| {
+                (thread.process_id == process_id).then_some(*thread_id)
+            })
+            .collect::<Vec<_>>();
+        for thread_id in thread_ids {
+            let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+            if matches!(thread.state, ThreadState::Runnable) {
+                thread.state = ThreadState::Suspended;
+                thread.queued = false;
+            }
+            if thread_id == self.current_thread_id {
+                self.reschedule_requested = true;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resume_process(&mut self, process_id: ProcessId) -> Result<(), zx_status_t> {
+        let process = self
+            .processes
+            .get_mut(&process_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        if process.suspend_tokens == 0 || process.state != ProcessState::Suspended {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        process.suspend_tokens -= 1;
+        if process.suspend_tokens == 0 {
+            process.state = ProcessState::Started;
+        }
+        let fully_resumed = process.state != ProcessState::Suspended;
+        let thread_ids = self
+            .threads
+            .iter()
+            .filter_map(|(thread_id, thread)| {
+                (thread.process_id == process_id).then_some(*thread_id)
+            })
+            .collect::<Vec<_>>();
+        if fully_resumed {
+            for thread_id in thread_ids {
+                self.maybe_resume_thread(thread_id)?;
+            }
         }
         Ok(())
     }
@@ -2695,6 +2796,33 @@ impl Kernel {
         self.processes.get_mut(&process_id).ok_or(ZX_ERR_BAD_STATE)
     }
 
+    fn thread_should_be_suspended(&self, thread_id: ThreadId) -> Result<bool, zx_status_t> {
+        let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if thread.suspend_tokens != 0 {
+            return Ok(true);
+        }
+        let process = self.process(thread.process_id)?;
+        Ok(process.state == ProcessState::Suspended)
+    }
+
+    fn maybe_resume_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        if self.thread_should_be_suspended(thread_id)? {
+            return Ok(());
+        }
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if !matches!(thread.state, ThreadState::Suspended) {
+            return Ok(());
+        }
+        thread.state = ThreadState::Runnable;
+        let queued = thread.queued;
+        let _ = thread;
+        if !queued {
+            self.enqueue_runnable_thread(thread_id)?;
+        }
+        self.reschedule_requested = true;
+        Ok(())
+    }
+
     fn enqueue_runnable_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         if thread.queued || !matches!(thread.state, ThreadState::Runnable) {
@@ -2774,10 +2902,14 @@ impl Kernel {
         thread_id: ThreadId,
         status: Option<zx_status_t>,
     ) -> Result<(), zx_status_t> {
-        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        if matches!(thread.state, ThreadState::Killed) {
+        if matches!(
+            self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?.state,
+            ThreadState::Killed
+        ) {
             return Ok(());
         }
+        let hold_suspended = self.thread_should_be_suspended(thread_id)?;
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         let Some(context) = thread.context else {
             return Err(ZX_ERR_BAD_STATE);
         };
@@ -2785,10 +2917,14 @@ impl Kernel {
             Some(status) => context.with_status(status),
             None => context,
         });
-        thread.state = ThreadState::Runnable;
+        thread.state = if hold_suspended {
+            ThreadState::Suspended
+        } else {
+            ThreadState::Runnable
+        };
         let was_current = thread_id == self.current_thread_id;
         let _ = thread;
-        if !was_current {
+        if !hold_suspended && !was_current {
             self.enqueue_runnable_thread(thread_id)?;
             self.reschedule_requested = true;
         }

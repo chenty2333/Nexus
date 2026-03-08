@@ -2576,6 +2576,8 @@ thread_worker_spin:
 	je thread_worker_park
 	cmp $5, %rax
 	je thread_worker_touch_page
+	cmp $6, %rax
+	je thread_worker_close_handle
 	movq $0, 8*403(%rbx)
 thread_worker_spin_pause:
 	pause
@@ -2621,11 +2623,21 @@ thread_worker_queue_port:
 
 thread_worker_park:
 	movq $0, 8*403(%rbx)
+	movl $1, 8*169(%rbx)
+	lea 8*169(%rbx), %rdi
+	movl $1, %esi
+	movabs $22, %rax
+	int $0x80
 	mov 8*404(%rbx), %rdi
 	xorl %esi, %esi
 	xorl %edx, %edx
 	movabs $0x7fffffffffffffff, %r10
 	movabs $21, %rax
+	int $0x80
+	movl $1, 8*167(%rbx)
+	lea 8*167(%rbx), %rdi
+	movl $1, %esi
+	movabs $22, %rax
 	int $0x80
 	jmp thread_worker_spin
 
@@ -2638,6 +2650,14 @@ thread_worker_touch_page:
 	movl $1, %esi
 	movabs $22, %rax
 	int $0x80
+	jmp thread_worker_spin
+
+thread_worker_close_handle:
+	movq $0, 8*403(%rbx)
+	mov 8*404(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+	mov %rax, 8*166(%rbx)
 	jmp thread_worker_spin
 
 process_child_entry:

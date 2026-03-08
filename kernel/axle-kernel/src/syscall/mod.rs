@@ -25,10 +25,10 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER,
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
     AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START,
-    AXLE_SYS_TASK_KILL, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL,
-    AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_DESTROY,
-    AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE,
-    SyscallNumber,
+    AXLE_SYS_TASK_KILL, AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START,
+    AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE,
+    AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
+    AXLE_SYS_VMO_CREATE, SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -41,7 +41,7 @@ use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 32] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 33] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -72,6 +72,7 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 32] = [
     AXLE_SYS_PROCESS_CREATE,
     AXLE_SYS_PROCESS_START,
     AXLE_SYS_TASK_KILL,
+    AXLE_SYS_TASK_SUSPEND,
     AXLE_SYS_VMAR_ALLOCATE,
     AXLE_SYS_VMAR_DESTROY,
 ];
@@ -138,6 +139,7 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_PROCESS_CREATE => sys_process_create(args),
         AXLE_SYS_PROCESS_START => sys_process_start(args),
         AXLE_SYS_TASK_KILL => sys_task_kill(args),
+        AXLE_SYS_TASK_SUSPEND => sys_task_suspend(args),
         _ => ZX_ERR_BAD_SYSCALL,
     }
 }
@@ -1134,6 +1136,19 @@ fn sys_task_kill(args: [u64; 6]) -> zx_status_t {
     };
 
     match crate::object::task_kill(handle) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_task_suspend(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let out_token = args[1] as *mut zx_handle_t;
+
+    match crate::object::task_suspend(handle, out_token) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }

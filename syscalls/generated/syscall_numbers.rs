@@ -66,3 +66,5 @@ pub const AXLE_SYS_VMAR_DESTROY: SyscallNumber = 29;
 pub const AXLE_SYS_PROCESS_START: SyscallNumber = 30;
 /// Contract: SHOULD
 pub const AXLE_SYS_TASK_KILL: SyscallNumber = 31;
+/// Contract: SHOULD
+pub const AXLE_SYS_TASK_SUSPEND: SyscallNumber = 32;
