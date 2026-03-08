@@ -2,13 +2,13 @@
 
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::{
     Capability, Packet, PacketKind, Port, PortError, Signals, TimerError, TimerId, TimerService,
-    WaitAsyncOptions,
+    TransferredCap, WaitAsyncOptions,
 };
 use axle_mm::{MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
@@ -81,6 +81,7 @@ pub(crate) enum ChannelPayload {
 #[derive(Clone, Debug)]
 struct ChannelMessage {
     payload: ChannelPayload,
+    handles: Vec<TransferredCap>,
 }
 
 #[derive(Debug)]
@@ -124,6 +125,10 @@ impl ChannelPayload {
 impl ChannelMessage {
     fn actual_bytes(&self) -> Result<u32, zx_status_t> {
         self.payload.actual_bytes()
+    }
+
+    fn actual_handles(&self) -> Result<u32, zx_status_t> {
+        u32::try_from(self.handles.len()).map_err(|_| ZX_ERR_BAD_STATE)
     }
 }
 
@@ -215,6 +220,8 @@ enum KernelObject {
 pub(crate) struct ChannelReadResult {
     /// Dequeued payload.
     pub(crate) payload: ChannelPayload,
+    /// Dequeued handles, installed into the current process.
+    pub(crate) handles: Vec<zx_handle_t>,
     /// Number of bytes in the dequeued message.
     pub(crate) actual_bytes: u32,
     /// Number of transferred handles.
@@ -393,6 +400,21 @@ impl KernelState {
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
         self.with_core_mut(|kernel| kernel.replace_current_handle(raw, rights))
+    }
+
+    fn snapshot_handle_for_transfer(
+        &self,
+        raw: zx_handle_t,
+        rights: crate::task::HandleRights,
+    ) -> Result<TransferredCap, zx_status_t> {
+        self.with_core(|kernel| kernel.snapshot_current_handle_for_transfer(raw, rights))
+    }
+
+    fn install_transferred_handle(
+        &mut self,
+        transferred: TransferredCap,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        self.with_core_mut(|kernel| kernel.install_handle_in_current_process(transferred))
     }
 }
 
@@ -1148,7 +1170,7 @@ pub fn channel_write(
     handle: zx_handle_t,
     options: u32,
     payload: ChannelPayload,
-    num_handles: u32,
+    handles: Vec<zx_handle_t>,
 ) -> Result<(), zx_status_t> {
     if options != 0 {
         let _ = with_state_mut(|state| {
@@ -1157,16 +1179,10 @@ pub fn channel_write(
         });
         return Err(ZX_ERR_INVALID_ARGS);
     }
-    if num_handles != 0 {
-        let _ = with_state_mut(|state| {
-            release_channel_payload(state, payload);
-            Ok(())
-        });
-        return Err(ZX_ERR_NOT_SUPPORTED);
-    }
 
     with_state_mut(|state| {
         let mut payload = Some(payload);
+        let mut transferred = Vec::new();
         let resolved = match state.lookup_handle(handle, crate::task::HandleRights::empty()) {
             Ok(resolved) => resolved,
             Err(status) => {
@@ -1244,6 +1260,25 @@ pub fn channel_write(
             return Err(status);
         }
 
+        let mut seen_handles = BTreeSet::new();
+        for raw in &handles {
+            if !seen_handles.insert(*raw) {
+                if let Some(released) = payload.take() {
+                    release_channel_payload(state, released);
+                }
+                return Err(ZX_ERR_INVALID_ARGS);
+            }
+            match state.snapshot_handle_for_transfer(*raw, crate::task::HandleRights::TRANSFER) {
+                Ok(entry) => transferred.push(entry),
+                Err(status) => {
+                    if let Some(released) = payload.take() {
+                        release_channel_payload(state, released);
+                    }
+                    return Err(status);
+                }
+            }
+        }
+
         let peer_status = {
             let peer = match state.objects.get_mut(&peer_object_id) {
                 Some(KernelObject::Channel(peer)) => peer,
@@ -1267,6 +1302,7 @@ pub fn channel_write(
             } else {
                 let message = ChannelMessage {
                     payload: payload.take().ok_or(ZX_ERR_BAD_STATE)?,
+                    handles: transferred,
                 };
                 peer.messages.push_back(message);
                 None
@@ -1277,6 +1313,10 @@ pub fn channel_write(
                 release_channel_payload(state, payload);
             }
             return Err(status);
+        }
+
+        for raw in handles {
+            state.close_handle(raw)?;
         }
 
         let _ = notify_waitable_signals_changed(state, object_id);
@@ -1290,7 +1330,7 @@ pub fn channel_read(
     handle: zx_handle_t,
     options: u32,
     num_bytes: u32,
-    _num_handles: u32,
+    num_handles: u32,
 ) -> Result<ChannelReadResult, (zx_status_t, u32, u32)> {
     if options != 0 {
         return Err((ZX_ERR_INVALID_ARGS, 0, 0));
@@ -1302,7 +1342,7 @@ pub fn channel_read(
         .lookup_handle(handle, crate::task::HandleRights::empty())
         .map_err(|e| (e, 0, 0))?;
     let object_id = resolved.object_id();
-    let peer_object_id = {
+    let (peer_object_id, transferred_handles) = {
         let endpoint = match state.objects.get(&object_id) {
             Some(KernelObject::Channel(endpoint)) => endpoint,
             Some(_) => return Err((ZX_ERR_WRONG_TYPE, 0, 0)),
@@ -1311,16 +1351,33 @@ pub fn channel_read(
         require_handle_rights(resolved, crate::task::HandleRights::READ).map_err(|e| (e, 0, 0))?;
         if let Some(message) = endpoint.messages.front() {
             let actual_bytes = message.actual_bytes().map_err(|e| (e, 0, 0))?;
+            let actual_handles = message.actual_handles().map_err(|e| (e, 0, 0))?;
             if num_bytes < actual_bytes {
-                return Err((ZX_ERR_BUFFER_TOO_SMALL, actual_bytes, 0));
+                return Err((ZX_ERR_BUFFER_TOO_SMALL, actual_bytes, actual_handles));
             }
+            if num_handles < actual_handles {
+                return Err((ZX_ERR_BUFFER_TOO_SMALL, actual_bytes, actual_handles));
+            }
+            (endpoint.peer_object_id, message.handles.clone())
         } else if endpoint.peer_closed {
             return Err((ZX_ERR_PEER_CLOSED, 0, 0));
         } else {
             return Err((ZX_ERR_SHOULD_WAIT, 0, 0));
         }
-        endpoint.peer_object_id
     };
+
+    let mut installed_handles = Vec::new();
+    for transferred in transferred_handles {
+        match state.install_transferred_handle(transferred) {
+            Ok(raw) => installed_handles.push(raw),
+            Err(status) => {
+                for raw in installed_handles {
+                    let _ = state.close_handle(raw);
+                }
+                return Err((status, 0, 0));
+            }
+        }
+    }
 
     let message = {
         let endpoint = match state.objects.get_mut(&object_id) {
@@ -1334,14 +1391,16 @@ pub fn channel_read(
             .ok_or((ZX_ERR_BAD_STATE, 0, 0))?
     };
     let actual_bytes = message.actual_bytes().map_err(|e| (e, 0, 0))?;
+    let actual_handles = message.actual_handles().map_err(|e| (e, 0, 0))?;
 
     let _ = notify_waitable_signals_changed(state, object_id);
     let _ = notify_waitable_signals_changed(state, peer_object_id);
 
     Ok(ChannelReadResult {
         payload: message.payload,
+        handles: installed_handles,
         actual_bytes,
-        actual_handles: 0,
+        actual_handles,
     })
 }
 

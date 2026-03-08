@@ -1,0 +1,26 @@
+id = "kernel.channel.handle_transfer_bootstrap"
+description = "Bootstrap channel write/read should transfer one handle, invalidate the sender copy, and allow the receiver to signal through the moved endpoint"
+tags = ["module:channel", "module:eventpair", "module:kernel", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.channel.handle_transfer_bootstrap"]
+
+[assertions.status_code]
+channel_transfer_create = 0
+channel_transfer_eventpair_create = 0
+channel_transfer_write = 0
+channel_transfer_close_old = -11
+channel_transfer_read = 0
+channel_transfer_signal = 0
+channel_transfer_wait = 0
+
+[assertions.packet_fields]
+channel_transfer_actual_bytes = 0
+channel_transfer_actual_handles = 1
+channel_transfer_wait_observed = 16777216

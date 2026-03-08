@@ -1001,6 +1001,82 @@ channel_writable_fill_done:
 	int $0x80
 	mov %rax, 8*340(%rbx)
 
+	// channel_create(handle transfer)
+	lea 0x1cf0(%rbx), %rsi
+	lea 0x1cf8(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $13, %rax
+	int $0x80
+	mov %rax, 8*152(%rbx)
+
+	// eventpair_create(handle transfer source)
+	lea 0x1d00(%rbx), %rsi
+	lea 0x1d08(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $16, %rax
+	int $0x80
+	mov %rax, 8*153(%rbx)
+
+	// channel_write(c6 -> c7, handles=[e0])
+	mov 0x1cf0(%rbx), %rdi
+	xorl %esi, %esi
+	xor %edx, %edx
+	xorl %r10d, %r10d
+	lea 0x1d00(%rbx), %r8
+	movl $1, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*154(%rbx)
+
+	// close(old e0) should report BAD_HANDLE after transfer
+	mov 0x1d00(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+	mov %rax, 8*155(%rbx)
+
+	// channel_read(c7, handles_out[1])
+	movq $0, 0x1d10(%rbx)
+	movq $0, 0x1d18(%rbx)
+	movq $0, 0x1d20(%rbx)
+	mov 0x1cf8(%rbx), %rdi
+	xorl %esi, %esi
+	xor %edx, %edx
+	lea 0x1d10(%rbx), %r10
+	xorl %r8d, %r8d
+	movl $1, %r9d
+	lea 0x1d18(%rbx), %rax
+	lea 0x1d20(%rbx), %rcx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rcx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	mov %rax, 8*156(%rbx)
+	mov 0x1d18(%rbx), %rax
+	mov %rax, 8*157(%rbx)
+	mov 0x1d20(%rbx), %rax
+	mov %rax, 8*158(%rbx)
+
+	// object_signal_peer(received_e0, USER_SIGNAL_0) should wake the retained peer e1
+	mov 0x1d10(%rbx), %rdi
+	xorl %esi, %esi
+	movl $0x01000000, %edx
+	movabs $17, %rax
+	int $0x80
+	mov %rax, 8*159(%rbx)
+
+	lea 0x1d28(%rbx), %r10
+	movq $0, 0x1d28(%rbx)
+	mov 0x1d08(%rbx), %rdi
+	movl $0x01000000, %esi
+	xorl %edx, %edx
+	movabs $1, %rax
+	int $0x80
+	mov %rax, 8*160(%rbx)
+	mov 0x1d28(%rbx), %rax
+	mov %rax, 8*161(%rbx)
+
 	// eventpair_create(bad opts=1)
 	lea 0x1780(%rbx), %rsi
 	lea 0x1788(%rbx), %rdx

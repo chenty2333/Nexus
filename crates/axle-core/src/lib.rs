@@ -29,7 +29,7 @@ pub mod signals;
 pub mod timer;
 
 pub use capability::Capability;
-pub use cspace::{CSpace, CSpaceError};
+pub use cspace::{CSpace, CSpaceError, TransferredCap};
 pub use handle::{Handle, HandleError};
 pub use port::{
     Packet, PacketKind, Port, PortError, PortKey, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId,

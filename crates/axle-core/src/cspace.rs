@@ -36,6 +36,20 @@ impl Slot {
     }
 }
 
+/// Capability payload staged outside a `CSpace` for transfer into another slot table.
+#[derive(Clone, Copy, Debug)]
+pub struct TransferredCap {
+    cap: Capability,
+    rev: Option<RevocationRef>,
+}
+
+impl TransferredCap {
+    /// Return the stored capability bits.
+    pub fn capability(self) -> Capability {
+        self.cap
+    }
+}
+
 /// Errors returned by CSpace operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CSpaceError {
@@ -190,6 +204,32 @@ impl CSpace {
         slot.tag = new_tag;
         slot.entry = Some(entry);
         Handle::new(idx, new_tag).map_err(Into::into)
+    }
+
+    /// Snapshot one live slot entry for transfer into another `CSpace`.
+    pub fn snapshot_checked(
+        &self,
+        h: Handle,
+        rev_mgr: &RevocationManager,
+    ) -> Result<TransferredCap, CSpaceError> {
+        let entry = self.get_entry(h)?;
+        if let Some(r) = entry.rev
+            && !rev_mgr.is_live(r)
+        {
+            return Err(CSpaceError::BadHandle);
+        }
+        Ok(TransferredCap {
+            cap: entry.cap,
+            rev: entry.rev,
+        })
+    }
+
+    /// Install one previously transferred capability into a fresh slot.
+    pub fn install_transfer(&mut self, transferred: TransferredCap) -> Result<Handle, CSpaceError> {
+        self.alloc_entry(CapEntry {
+            cap: transferred.cap,
+            rev: transferred.rev,
+        })
     }
 
     /// Lookup a capability (by value copy) from a handle, without revocation checks.
@@ -379,6 +419,32 @@ mod tests {
 
         assert_eq!(cs.get(h1), Err(CSpaceError::BadHandle));
         assert_eq!(cs.get(h2), Ok(Capability::new(7, 0b0011, 3)));
+    }
+
+    #[test]
+    fn snapshot_and_install_transfer_preserves_capability_and_revocation() {
+        let mut mgr = RevocationManager::new();
+        let grp = mgr.create_group();
+        let mut sender = CSpace::new(4, 0);
+        let mut receiver = CSpace::new(4, 0);
+
+        let cap = Capability::new(55, 0b1011, 7);
+        let sender_handle = sender.alloc_revocable(cap, &mgr, grp).unwrap();
+        let transferred = sender.snapshot_checked(sender_handle, &mgr).unwrap();
+        let receiver_handle = receiver.install_transfer(transferred).unwrap();
+
+        assert_eq!(sender.get_checked(sender_handle, &mgr), Ok(cap));
+        assert_eq!(receiver.get_checked(receiver_handle, &mgr), Ok(cap));
+
+        mgr.revoke(grp).unwrap();
+        assert_eq!(
+            sender.get_checked(sender_handle, &mgr),
+            Err(CSpaceError::BadHandle)
+        );
+        assert_eq!(
+            receiver.get_checked(receiver_handle, &mgr),
+            Err(CSpaceError::BadHandle)
+        );
     }
 
     proptest! {

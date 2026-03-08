@@ -200,6 +200,30 @@ fn copyin_bytes(ptr: *const u8, len: usize) -> Result<Vec<u8>, zx_status_t> {
     Ok(out)
 }
 
+fn copyin_handles(ptr: *const zx_handle_t, len: usize) -> Result<Vec<zx_handle_t>, zx_status_t> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes = len
+        .checked_mul(size_of::<zx_handle_t>())
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    if ptr.is_null() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if !crate::userspace::validate_user_ptr(ptr as u64, bytes) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    crate::userspace::ensure_user_range_resident(ptr as u64, bytes, false)?;
+
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
+    out.resize(len, 0);
+    // SAFETY: the userspace range was validated above and `out` was sized to `len`.
+    let src = unsafe { slice::from_raw_parts(ptr, len) };
+    out.as_mut_slice().copy_from_slice(src);
+    Ok(out)
+}
+
 fn copyout_bytes(ptr: *mut u8, bytes: &[u8]) -> Result<(), zx_status_t> {
     if bytes.is_empty() {
         return Ok(());
@@ -214,6 +238,27 @@ fn copyout_bytes(ptr: *mut u8, bytes: &[u8]) -> Result<(), zx_status_t> {
     // SAFETY: the userspace range was validated above and `bytes` is a valid source slice.
     let dst = unsafe { slice::from_raw_parts_mut(ptr, bytes.len()) };
     dst.copy_from_slice(bytes);
+    Ok(())
+}
+
+fn copyout_handles(ptr: *mut zx_handle_t, handles: &[zx_handle_t]) -> Result<(), zx_status_t> {
+    if handles.is_empty() {
+        return Ok(());
+    }
+    let bytes = handles
+        .len()
+        .checked_mul(size_of::<zx_handle_t>())
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    if ptr.is_null() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if !crate::userspace::validate_user_ptr(ptr as u64, bytes) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    crate::userspace::ensure_user_range_resident(ptr as u64, bytes, true)?;
+    // SAFETY: the userspace range was validated above and `handles` is a valid source slice.
+    let dst = unsafe { slice::from_raw_parts_mut(ptr, handles.len()) };
+    dst.copy_from_slice(handles);
     Ok(())
 }
 
@@ -708,6 +753,10 @@ fn sys_channel_write(args: [u64; 6]) -> zx_status_t {
     if num_handles != 0 && handles_ptr.is_null() {
         return ZX_ERR_INVALID_ARGS;
     }
+    let handles = match copyin_handles(handles_ptr, num_handles as usize) {
+        Ok(handles) => handles,
+        Err(e) => return e,
+    };
 
     let payload = match crate::object::try_loan_current_user_pages(bytes_ptr as u64, num_bytes) {
         Ok(Some(loaned)) => crate::object::ChannelPayload::Loaned(loaned),
@@ -717,7 +766,7 @@ fn sys_channel_write(args: [u64; 6]) -> zx_status_t {
         },
         Err(e) => return e,
     };
-    match crate::object::channel_write(handle, options, payload, num_handles) {
+    match crate::object::channel_write(handle, options, payload, handles) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -756,6 +805,23 @@ fn sys_channel_read(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
     if num_handles != 0 && handles_ptr.is_null() {
         return ZX_ERR_INVALID_ARGS;
     }
+    if num_handles != 0 {
+        let bytes = match usize::try_from(num_handles) {
+            Ok(count) => match count.checked_mul(size_of::<zx_handle_t>()) {
+                Some(bytes) => bytes,
+                None => return ZX_ERR_OUT_OF_RANGE,
+            },
+            Err(_) => return ZX_ERR_INVALID_ARGS,
+        };
+        if !crate::userspace::validate_user_ptr(handles_ptr as u64, bytes) {
+            return ZX_ERR_INVALID_ARGS;
+        }
+        if let Err(e) =
+            crate::userspace::ensure_user_range_resident(handles_ptr as u64, bytes, true)
+        {
+            return e;
+        }
+    }
 
     let message = match crate::object::channel_read(handle, options, num_bytes, num_handles) {
         Ok(message) => message,
@@ -767,6 +833,7 @@ fn sys_channel_read(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
     };
     let actual_bytes = message.actual_bytes;
     let actual_handles = message.actual_handles;
+    let transferred_handles = message.handles.clone();
     let copy_result = match &message.payload {
         crate::object::ChannelPayload::Copied(bytes) => copyout_bytes(bytes_ptr, bytes),
         crate::object::ChannelPayload::Loaned(loaned) => {
@@ -779,6 +846,9 @@ fn sys_channel_read(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
     };
     crate::object::release_channel_read_result(message);
     if let Err(e) = copy_result {
+        return e;
+    }
+    if let Err(e) = copyout_handles(handles_ptr, &transferred_handles) {
         return e;
     }
     if let Err(e) = copyout_optional(actual_bytes_ptr, actual_bytes) {

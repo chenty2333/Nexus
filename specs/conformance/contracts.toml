@@ -101,6 +101,11 @@ level = "should"
 description = "Bootstrap channel WRITABLE should clear on full peer queues, recover after reads, and stay cleared once the peer closes"
 
 [[contracts]]
+id = "should.channel.handle_transfer_bootstrap"
+level = "should"
+description = "Bootstrap channel write/read should move transferred handles, invalidate the sender copy, and make the received handle immediately usable"
+
+[[contracts]]
 id = "should.eventpair.signal_peer_bootstrap"
 level = "should"
 description = "Bootstrap eventpair create and signal_peer should drive peer user signals with stable error codes"

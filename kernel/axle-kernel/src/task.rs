@@ -17,7 +17,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::handle::Handle;
-use axle_core::{CSpace, CSpaceError, Capability, RevocationManager, Signals};
+use axle_core::{CSpace, CSpaceError, Capability, RevocationManager, Signals, TransferredCap};
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
     CowFaultResolution, FrameId, FrameTable, FutexKey, GlobalVmoId, LazyAnonFaultResolution,
@@ -1526,6 +1526,28 @@ impl Process {
             .map_err(map_alloc_error)?;
         Ok(replaced.raw())
     }
+
+    fn snapshot_handle_for_transfer(
+        &self,
+        raw: zx_handle_t,
+        revocations: &RevocationManager,
+    ) -> Result<TransferredCap, zx_status_t> {
+        let handle = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
+        self.cspace
+            .snapshot_checked(handle, revocations)
+            .map_err(map_lookup_error)
+    }
+
+    fn install_transferred_handle(
+        &mut self,
+        transferred: TransferredCap,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        let handle = self
+            .cspace
+            .install_transfer(transferred)
+            .map_err(map_alloc_error)?;
+        Ok(handle.raw())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1765,6 +1787,24 @@ impl Kernel {
         let _ = self.lookup_current_handle(raw, HandleRights::empty())?;
         self.current_process_mut()?
             .replace_handle_derived(raw, rights)
+    }
+
+    pub(crate) fn snapshot_current_handle_for_transfer(
+        &self,
+        raw: zx_handle_t,
+        required_rights: HandleRights,
+    ) -> Result<TransferredCap, zx_status_t> {
+        let _ = self.lookup_current_handle(raw, required_rights)?;
+        self.current_process()?
+            .snapshot_handle_for_transfer(raw, &self.revocations)
+    }
+
+    pub(crate) fn install_handle_in_current_process(
+        &mut self,
+        transferred: TransferredCap,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        self.current_process_mut()?
+            .install_transferred_handle(transferred)
     }
 
     pub(crate) fn validate_current_user_ptr(&self, ptr: u64, len: usize) -> bool {
