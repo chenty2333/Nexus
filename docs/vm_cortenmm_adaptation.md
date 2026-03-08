@@ -60,6 +60,10 @@ external VM model.
   and commit. Local `LazyAnon` / COW faults serialize on `(address_space,
   page_base)`, while shared `LazyVmo` faults serialize on `(global_vmo_id,
   page_offset)` so one shared page is materialized only once.
+- Fault contention telemetry is now exported through the bootstrap shared
+  summary slots. The kernel records leader/wait claims, spin loops, retries,
+  commit outcomes, and prepare counts for `COW`, `LazyAnon`, and `LazyVmo`
+  allocation paths before any finer VM lock splitting.
 - `Physical` and `Contiguous` VMO mappings now have explicit non-COW boundaries:
   they must already be resident when mapped, and COW arming rejects them.
 - VM resource governance has started to move under one accounting surface:

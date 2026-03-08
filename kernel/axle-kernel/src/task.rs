@@ -117,15 +117,37 @@ enum FaultClaim {
     Wait(FaultWaitToken),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultPrepareKind {
+    CopyOnWrite,
+    LazyAnon,
+    LazyVmoAlloc,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FaultTelemetry {
+    leader_claims: u64,
+    wait_claims: u64,
+    wait_spin_loops: u64,
+    retry_total: u64,
+    commit_resolved: u64,
+    commit_retry: u64,
+    prepare_cow: u64,
+    prepare_lazy_anon: u64,
+    prepare_lazy_vmo_alloc: u64,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct FaultTable {
     entries: BTreeMap<FaultInFlightKey, FaultEntry>,
+    telemetry: FaultTelemetry,
 }
 
 impl FaultTable {
     fn claim(&mut self, key: FaultInFlightKey) -> FaultClaim {
         match self.entries.get_mut(&key) {
             Some(entry) if entry.in_flight => {
+                self.telemetry.wait_claims = self.telemetry.wait_claims.wrapping_add(1);
                 entry.waiters = entry.waiters.saturating_add(1);
                 FaultClaim::Wait(FaultWaitToken {
                     key,
@@ -133,10 +155,12 @@ impl FaultTable {
                 })
             }
             Some(entry) => {
+                self.telemetry.leader_claims = self.telemetry.leader_claims.wrapping_add(1);
                 entry.in_flight = true;
                 FaultClaim::Leader
             }
             None => {
+                self.telemetry.leader_claims = self.telemetry.leader_claims.wrapping_add(1);
                 self.entries.insert(
                     key,
                     FaultEntry {
@@ -178,6 +202,38 @@ impl FaultTable {
         if !entry.in_flight && entry.waiters == 0 {
             let _ = self.entries.remove(&wait.key);
         }
+    }
+
+    fn record_wait_spin_loops(&mut self, loops: u64) {
+        self.telemetry.wait_spin_loops = self.telemetry.wait_spin_loops.wrapping_add(loops);
+    }
+
+    fn record_prepare(&mut self, kind: FaultPrepareKind) {
+        match kind {
+            FaultPrepareKind::CopyOnWrite => {
+                self.telemetry.prepare_cow = self.telemetry.prepare_cow.wrapping_add(1)
+            }
+            FaultPrepareKind::LazyAnon => {
+                self.telemetry.prepare_lazy_anon = self.telemetry.prepare_lazy_anon.wrapping_add(1)
+            }
+            FaultPrepareKind::LazyVmoAlloc => {
+                self.telemetry.prepare_lazy_vmo_alloc =
+                    self.telemetry.prepare_lazy_vmo_alloc.wrapping_add(1)
+            }
+        }
+    }
+
+    fn record_commit_resolved(&mut self) {
+        self.telemetry.commit_resolved = self.telemetry.commit_resolved.wrapping_add(1);
+    }
+
+    fn record_commit_retry(&mut self) {
+        self.telemetry.retry_total = self.telemetry.retry_total.wrapping_add(1);
+        self.telemetry.commit_retry = self.telemetry.commit_retry.wrapping_add(1);
+    }
+
+    fn telemetry(&self) -> FaultTelemetry {
+        self.telemetry
     }
 }
 
@@ -2531,7 +2587,43 @@ impl FaultPlan {
     }
 }
 
+fn record_fault_telemetry_snapshot(table: &Arc<Mutex<FaultTable>>) {
+    let telemetry = {
+        let table = table.lock();
+        table.telemetry()
+    };
+    crate::userspace::record_fault_contention_telemetry(
+        telemetry.leader_claims,
+        telemetry.wait_claims,
+        telemetry.wait_spin_loops,
+        telemetry.retry_total,
+        telemetry.commit_resolved,
+        telemetry.commit_retry,
+        telemetry.prepare_cow,
+        telemetry.prepare_lazy_anon,
+        telemetry.prepare_lazy_vmo_alloc,
+    );
+}
+
+fn update_fault_telemetry(table: &Arc<Mutex<FaultTable>>, f: impl FnOnce(&mut FaultTable)) {
+    {
+        let mut table = table.lock();
+        f(&mut table);
+    }
+    record_fault_telemetry_snapshot(table);
+}
+
+fn claim_fault(table: &Arc<Mutex<FaultTable>>, key: FaultInFlightKey) -> FaultClaim {
+    let claim = {
+        let mut table = table.lock();
+        table.claim(key)
+    };
+    record_fault_telemetry_snapshot(table);
+    claim
+}
+
 fn wait_for_fault_completion(table: &Arc<Mutex<FaultTable>>, wait: FaultWaitToken) {
+    let mut observed_spin_loops = 0_u64;
     loop {
         let completed = {
             let table = table.lock();
@@ -2540,17 +2632,40 @@ fn wait_for_fault_completion(table: &Arc<Mutex<FaultTable>>, wait: FaultWaitToke
         if completed {
             let mut table = table.lock();
             table.release_waiter(wait);
+            if observed_spin_loops != 0 {
+                table.record_wait_spin_loops(observed_spin_loops);
+            }
+            let telemetry = table.telemetry();
+            drop(table);
+            crate::userspace::record_fault_contention_telemetry(
+                telemetry.leader_claims,
+                telemetry.wait_claims,
+                telemetry.wait_spin_loops,
+                telemetry.retry_total,
+                telemetry.commit_resolved,
+                telemetry.commit_retry,
+                telemetry.prepare_cow,
+                telemetry.prepare_lazy_anon,
+                telemetry.prepare_lazy_vmo_alloc,
+            );
             return;
         }
         for _ in 0..FAULT_WAIT_SPIN_LOOPS {
             core::hint::spin_loop();
         }
+        observed_spin_loops = observed_spin_loops.wrapping_add(FAULT_WAIT_SPIN_LOOPS as u64);
     }
 }
 
-fn prepare_fault_work(plan: FaultPlan) -> Result<PreparedFaultWork, zx_status_t> {
+fn prepare_fault_work(
+    plan: FaultPlan,
+    fault_table: &Arc<Mutex<FaultTable>>,
+) -> Result<PreparedFaultWork, zx_status_t> {
     match plan {
         FaultPlan::CopyOnWrite { old_frame_id, .. } => {
+            update_fault_telemetry(fault_table, |table| {
+                table.record_prepare(FaultPrepareKind::CopyOnWrite);
+            });
             let new_frame_paddr = crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw())
                 .ok_or(ZX_ERR_NO_MEMORY)?;
             Ok(PreparedFaultWork::NewPage {
@@ -2558,6 +2673,9 @@ fn prepare_fault_work(plan: FaultPlan) -> Result<PreparedFaultWork, zx_status_t>
             })
         }
         FaultPlan::LazyAnon { .. } => {
+            update_fault_telemetry(fault_table, |table| {
+                table.record_prepare(FaultPrepareKind::LazyAnon);
+            });
             let new_frame_paddr =
                 crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
             Ok(PreparedFaultWork::NewPage {
@@ -2575,6 +2693,9 @@ fn prepare_fault_work(plan: FaultPlan) -> Result<PreparedFaultWork, zx_status_t>
             if vmo_kind != VmoKind::Anonymous {
                 return Err(ZX_ERR_BAD_STATE);
             }
+            update_fault_telemetry(fault_table, |table| {
+                table.record_prepare(FaultPrepareKind::LazyVmoAlloc);
+            });
             let new_frame_paddr =
                 crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
             Ok(PreparedFaultWork::NewPage {
@@ -2608,14 +2729,11 @@ pub(crate) fn ensure_user_page_resident_serialized(
             }
             FaultPlanResult::Unhandled => return Err(ZX_ERR_BAD_STATE),
             FaultPlanResult::Ready(plan) => {
-                let claim = {
-                    let mut faults = fault_handle.lock();
-                    faults.claim(plan.key())
-                };
+                let claim = claim_fault(&fault_handle, plan.key());
                 match claim {
                     FaultClaim::Leader => {
                         let guard = FaultLeaderGuard::new(fault_handle.clone(), plan.key());
-                        let mut prepared = prepare_fault_work(plan)?;
+                        let mut prepared = prepare_fault_work(plan, &fault_handle)?;
                         let outcome = {
                             let mut vm = vm_handle.lock();
                             vm.commit_prepared_fault(plan, &mut prepared)
@@ -2623,8 +2741,18 @@ pub(crate) fn ensure_user_page_resident_serialized(
                         prepared.release_unused();
                         guard.complete();
                         match outcome? {
-                            FaultCommitDisposition::Resolved => return Ok(()),
-                            FaultCommitDisposition::Retry => continue,
+                            FaultCommitDisposition::Resolved => {
+                                update_fault_telemetry(&fault_handle, |table| {
+                                    table.record_commit_resolved();
+                                });
+                                return Ok(());
+                            }
+                            FaultCommitDisposition::Retry => {
+                                update_fault_telemetry(&fault_handle, |table| {
+                                    table.record_commit_retry();
+                                });
+                                continue;
+                            }
                         }
                     }
                     FaultClaim::Wait(wait) => {
@@ -2662,14 +2790,11 @@ pub(crate) fn handle_page_fault_serialized(
             }
             FaultPlanResult::Unhandled => return false,
             FaultPlanResult::Ready(plan) => {
-                let claim = {
-                    let mut faults = fault_handle.lock();
-                    faults.claim(plan.key())
-                };
+                let claim = claim_fault(&fault_handle, plan.key());
                 match claim {
                     FaultClaim::Leader => {
                         let guard = FaultLeaderGuard::new(fault_handle.clone(), plan.key());
-                        let mut prepared = match prepare_fault_work(plan) {
+                        let mut prepared = match prepare_fault_work(plan, &fault_handle) {
                             Ok(prepared) => prepared,
                             Err(_) => return false,
                         };
@@ -2680,8 +2805,18 @@ pub(crate) fn handle_page_fault_serialized(
                         prepared.release_unused();
                         guard.complete();
                         match outcome {
-                            Ok(FaultCommitDisposition::Resolved) => return true,
-                            Ok(FaultCommitDisposition::Retry) => continue,
+                            Ok(FaultCommitDisposition::Resolved) => {
+                                update_fault_telemetry(&fault_handle, |table| {
+                                    table.record_commit_resolved();
+                                });
+                                return true;
+                            }
+                            Ok(FaultCommitDisposition::Retry) => {
+                                update_fault_telemetry(&fault_handle, |table| {
+                                    table.record_commit_retry();
+                                });
+                                continue;
+                            }
                             Err(_) => return false,
                         }
                     }
