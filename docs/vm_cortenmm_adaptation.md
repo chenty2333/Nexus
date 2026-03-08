@@ -115,6 +115,10 @@ external VM model.
   code-image VMO for the already-loaded runner text image, and the child
   process bootstrap path uses that VMO directly when mapping child code instead
   of always doing `vmo_create + memcpy`.
+  That bootstrap code-image path now also has an explicit internal
+  `ProcessImageLayout` boundary, so the VM/object layers carry `{code_base,
+  code_size, entry}` as image metadata instead of baking `0x8000` into every
+  caller.
   The first pager-backed step remains read-only and internal-only: a
   pager-backed `LazyVmo` can fault in one page from its source, `zx_vmo_read`
   can read directly from that source without materializing every page first,

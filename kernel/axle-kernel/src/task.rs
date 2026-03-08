@@ -668,6 +668,51 @@ impl CreatedVmo {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProcessImageLayout {
+    code_base: u64,
+    code_size_bytes: u64,
+    entry: u64,
+}
+
+impl ProcessImageLayout {
+    pub(crate) const fn bootstrap_conformance() -> Self {
+        Self {
+            code_base: crate::userspace::USER_CODE_VA,
+            code_size_bytes: crate::userspace::USER_CODE_BYTES,
+            entry: crate::userspace::USER_CODE_VA,
+        }
+    }
+
+    pub(crate) const fn code_base(self) -> u64 {
+        self.code_base
+    }
+
+    pub(crate) const fn code_size_bytes(self) -> u64 {
+        self.code_size_bytes
+    }
+
+    pub(crate) const fn entry(self) -> u64 {
+        self.entry
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ImportedProcessImage {
+    code_vmo: CreatedVmo,
+    layout: ProcessImageLayout,
+}
+
+impl ImportedProcessImage {
+    pub(crate) const fn layout(&self) -> ProcessImageLayout {
+        self.layout
+    }
+
+    pub(crate) const fn code_vmo(&self) -> &CreatedVmo {
+        &self.code_vmo
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct KernelVmoBacking {
     global_vmo_id: KernelVmoId,
@@ -4645,6 +4690,19 @@ impl VmDomain {
             process_id,
             address_space_id,
             vmo,
+        })
+    }
+
+    pub(crate) fn import_bootstrap_process_image_for_address_space(
+        &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+    ) -> Result<ImportedProcessImage, zx_status_t> {
+        let code_vmo =
+            self.import_bootstrap_user_code_vmo_for_address_space(process_id, address_space_id)?;
+        Ok(ImportedProcessImage {
+            code_vmo,
+            layout: ProcessImageLayout::bootstrap_conformance(),
         })
     }
 

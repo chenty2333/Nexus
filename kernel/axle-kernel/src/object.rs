@@ -456,6 +456,7 @@ struct KernelState {
     bootstrap_root_vmar_handle: zx_handle_t,
     bootstrap_self_thread_handle: zx_handle_t,
     bootstrap_self_code_vmo_handle: zx_handle_t,
+    bootstrap_process_image_layout: crate::task::ProcessImageLayout,
 }
 
 impl KernelState {
@@ -473,6 +474,8 @@ impl KernelState {
             bootstrap_root_vmar_handle: 0,
             bootstrap_self_thread_handle: 0,
             bootstrap_self_code_vmo_handle: 0,
+            bootstrap_process_image_layout: crate::task::ProcessImageLayout::bootstrap_conformance(
+            ),
         };
 
         let process = state
@@ -531,20 +534,21 @@ impl KernelState {
         let address_space_id = state
             .with_core(|kernel| kernel.process_address_space_id(process.process_id()))
             .expect("bootstrap current process address space must exist");
-        if let Ok(created) = state.with_vm_mut(|vm| {
-            vm.import_bootstrap_user_code_vmo_for_address_space(
+        if let Ok(imported) = state.with_vm_mut(|vm| {
+            vm.import_bootstrap_process_image_for_address_space(
                 process.process_id(),
                 address_space_id,
             )
         }) {
+            state.bootstrap_process_image_layout = imported.layout();
             let object_id = state.alloc_object_id();
             state.objects.insert(
                 object_id,
                 KernelObject::Vmo(VmoObject {
-                    creator_process_id: created.process_id(),
-                    global_vmo_id: created.global_vmo_id(),
+                    creator_process_id: imported.code_vmo().process_id(),
+                    global_vmo_id: imported.code_vmo().global_vmo_id(),
                     kind: axle_mm::VmoKind::PagerBacked,
-                    size_bytes: created.size_bytes(),
+                    size_bytes: imported.code_vmo().size_bytes(),
                 }),
             );
             state.bootstrap_self_code_vmo_handle = state
@@ -782,6 +786,13 @@ pub fn bootstrap_self_code_vmo_handle() -> Option<zx_handle_t> {
     let mut guard = STATE.lock();
     let state = guard.as_mut()?;
     (state.bootstrap_self_code_vmo_handle != 0).then_some(state.bootstrap_self_code_vmo_handle)
+}
+
+/// Return the bootstrap current-process image layout.
+pub fn bootstrap_process_image_layout() -> Option<crate::task::ProcessImageLayout> {
+    let mut guard = STATE.lock();
+    let state = guard.as_mut()?;
+    Some(state.bootstrap_process_image_layout)
 }
 
 /// Return the bootstrap current-thread koid.

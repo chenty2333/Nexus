@@ -403,7 +403,8 @@ const SLOT_SELF_CODE_VMO_H: usize = 506;
 const SLOT_BOOTSTRAP_HEAP_USED: usize = 507;
 const SLOT_BOOTSTRAP_HEAP_PEAK: usize = 508;
 const SLOT_BOOTSTRAP_HEAP_ALLOC_FAILS: usize = 509;
-const SLOT_MAX: usize = SLOT_BOOTSTRAP_HEAP_ALLOC_FAILS;
+const SLOT_SELF_CODE_VMO_SIZE: usize = 510;
+const SLOT_MAX: usize = SLOT_SELF_CODE_VMO_SIZE;
 const SLOT_T0_NS: usize = 511;
 
 #[repr(align(4096))]
@@ -1385,6 +1386,9 @@ pub fn prepare() -> u64 {
     slots[SLOT_SELF_PROCESS_H] = crate::object::bootstrap_self_process_handle().unwrap_or(0) as u64;
     slots[SLOT_SELF_CODE_VMO_H] =
         crate::object::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64;
+    slots[SLOT_SELF_CODE_VMO_SIZE] = crate::object::bootstrap_process_image_layout()
+        .map(|layout| layout.code_size_bytes())
+        .unwrap_or(USER_CODE_BYTES);
     slots[SLOT_BOOTSTRAP_HEAP_USED] = 0;
     slots[SLOT_BOOTSTRAP_HEAP_PEAK] = 0;
     slots[SLOT_BOOTSTRAP_HEAP_ALLOC_FAILS] = 0;

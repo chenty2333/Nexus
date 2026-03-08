@@ -2405,9 +2405,9 @@ local_fault_contention_done:
 	jmp process_child_code_ready
 
 process_child_code_fallback:
-	// vmo_create(child code image, 0x8000)
+	// vmo_create(child code image, self_code_vmo_size)
 	lea 0x1910(%rbx), %rdx
-	movabs $0x8000, %rdi
+	mov 8*510(%rbx), %rdi
 	xorl %esi, %esi
 	movabs $9, %rax
 	int $0x80
@@ -2418,7 +2418,7 @@ process_child_code_fallback:
 	movabs $0x20000, %rdx
 	mov 0x1910(%rbx), %r10
 	xor %r8, %r8
-	movabs $0x8000, %r9
+	mov 8*510(%rbx), %r9
 	lea 0x1918(%rbx), %rax
 	sub $8, %rsp
 	mov %rax, (%rsp)
@@ -2430,7 +2430,7 @@ process_child_code_fallback:
 	// copy current runner code bytes into the shared code VMO
 	movabs $0x0000000100000000, %rsi
 	mov 0x1918(%rbx), %rdi
-	movabs $0x8000, %rcx
+	mov 8*510(%rbx), %rcx
 	rep movsb
 	jmp process_child_code_mapped
 
@@ -2441,7 +2441,7 @@ process_child_code_ready:
 	movabs $0x20000, %rdx
 	mov 0x1910(%rbx), %r10
 	xor %r8, %r8
-	movabs $0x8000, %r9
+	mov 8*510(%rbx), %r9
 	lea 0x1918(%rbx), %rax
 	sub $8, %rsp
 	mov %rax, (%rsp)
@@ -2519,7 +2519,7 @@ process_child_code_map:
 	xor %rdx, %rdx
 	mov 0x1910(%rbx), %r10
 	xor %r8, %r8
-	movabs $0x8000, %r9
+	mov 8*510(%rbx), %r9
 	lea 0x1940(%rbx), %rax
 	sub $8, %rsp
 	mov %rax, (%rsp)
@@ -2531,7 +2531,7 @@ process_child_code_map:
 	// child root_vmar maps shared region at USER_SHARED_VA
 	mov 0x1908(%rbx), %rdi
 	movl $0x403, %esi
-	movabs $0x8000, %rdx
+	mov 8*510(%rbx), %rdx
 	mov 0x1920(%rbx), %r10
 	xor %r8, %r8
 	movabs $0x2000, %r9
@@ -2546,7 +2546,8 @@ process_child_code_map:
 	// child root_vmar maps lazy shared page at USER_CODE_VA + 0xb000
 	mov 0x1908(%rbx), %rdi
 	movl $0x403, %esi
-	movabs $0xb000, %rdx
+	mov 8*510(%rbx), %rdx
+	add $0x3000, %rdx
 	mov 0x1958(%rbx), %r10
 	xor %r8, %r8
 	movabs $0x1000, %r9
@@ -2561,7 +2562,8 @@ process_child_code_map:
 	// child root_vmar maps stack at USER_STACK_VA
 	mov 0x1908(%rbx), %rdi
 	movl $0x403, %esi
-	movabs $0xa000, %rdx
+	mov 8*510(%rbx), %rdx
+	add $0x2000, %rdx
 	mov 0x1930(%rbx), %r10
 	xor %r8, %r8
 	movabs $0x1000, %r9
@@ -2587,10 +2589,12 @@ process_child_code_map:
 	mov 0x1900(%rbx), %rdi
 	mov 0x1938(%rbx), %rsi
 	lea process_child_entry(%rip), %rdx
-	movabs $0x000000010000a000, %r10
-	add $0x1000, %r10
+	movabs $0x0000000100000000, %r10
+	add 8*510(%rbx), %r10
+	add $0x3000, %r10
 	xor %r8d, %r8d
-	movabs $0x0000000100008000, %r9
+	movabs $0x0000000100000000, %r9
+	add 8*510(%rbx), %r9
 	movabs $30, %rax
 	int $0x80
 	mov %rax, 8*351(%rbx)
