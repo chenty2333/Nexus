@@ -59,6 +59,8 @@ type ThreadId = u64;
 type AddressSpaceId = u64;
 type KernelVmoId = GlobalVmoId;
 
+static BOOTSTRAP_USER_RUNNER_SOURCE: Mutex<Option<PagerSourceHandle>> = Mutex::new(None);
+
 #[derive(Clone, Copy, Debug)]
 struct VmResourceLimits {
     max_private_cow_pages: Option<u64>,
@@ -2023,13 +2025,14 @@ impl Kernel {
         }
         if let Some(size_bytes) = crate::userspace::qemu_loader_user_runner_size() {
             let global_vmo_id = vm.alloc_global_vmo_id();
-            vm.register_pager_file_global_vmo(
-                global_vmo_id,
+            let source = PagerSourceHandle::new(FilePagerSource {
                 size_bytes,
-                crate::userspace::read_qemu_loader_user_runner_at,
-            )
-            .expect("bootstrap runner pager vmo registration must succeed");
+                read_at: crate::userspace::read_qemu_loader_user_runner_at,
+            });
+            vm.register_pager_source_handle(global_vmo_id, source.clone())
+                .expect("bootstrap runner pager vmo registration must succeed");
             vm.bootstrap_user_runner_global_vmo_id = Some(global_vmo_id);
+            *BOOTSTRAP_USER_RUNNER_SOURCE.lock() = Some(source);
         }
 
         let vm = Arc::new(Mutex::new(vm));
@@ -4233,9 +4236,23 @@ impl VmDomain {
         size_bytes: u64,
         read_at: PagerReadAtFn,
     ) -> Result<(), zx_status_t> {
+        self.register_pager_source_handle(
+            global_vmo_id,
+            PagerSourceHandle::new(FilePagerSource {
+                size_bytes,
+                read_at,
+            }),
+        )
+    }
+
+    fn register_pager_source_handle(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        source: PagerSourceHandle,
+    ) -> Result<(), zx_status_t> {
         self.global_vmos
             .lock()
-            .register_pager_file_source(global_vmo_id, size_bytes, read_at)
+            .register_pager_source(global_vmo_id, source)
     }
 
     pub(crate) fn bootstrap_user_runner_global_vmo_id(&self) -> Option<KernelVmoId> {
@@ -6107,6 +6124,25 @@ fn merge_page_ranges(left: PageRange, right: PageRange) -> Result<PageRange, Pag
     let end = left.end().max(right.end());
     let len = end.checked_sub(base).ok_or(PageTableError::InvalidArgs)?;
     PageRange::new(base, len)
+}
+
+pub(crate) fn bootstrap_user_runner_source_size() -> Option<u64> {
+    BOOTSTRAP_USER_RUNNER_SOURCE
+        .lock()
+        .as_ref()
+        .map(PagerSourceHandle::size_bytes)
+}
+
+pub(crate) fn read_bootstrap_user_runner_source_at(
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<(), zx_status_t> {
+    let source = BOOTSTRAP_USER_RUNNER_SOURCE
+        .lock()
+        .as_ref()
+        .cloned()
+        .ok_or(ZX_ERR_NOT_FOUND)?;
+    source.read_bytes(offset, dst)
 }
 
 fn map_alloc_error(err: CSpaceError) -> zx_status_t {

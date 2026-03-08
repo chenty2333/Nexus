@@ -109,7 +109,9 @@ external VM model.
   The first real file-like source is now wired to the QEMU loader runner ELF:
   bootstrap VM state seeds one internal pager-file VMO from that blob, ready to
   be imported into an address space without first copying the whole image into
-  anonymous backing.
+  anonymous backing. The bootstrap ELF loader now also reads ELF headers and
+  segment bytes through that same source path instead of indexing the whole raw
+  blob directly.
   The first pager-backed step remains read-only and internal-only: a
   pager-backed `LazyVmo` can fault in one page from its source, `zx_vmo_read`
   can read directly from that source without materializing every page first,
