@@ -2397,6 +2397,14 @@ local_fault_contention_done:
 	int $0x80
 	mov %rax, 8*344(%rbx)
 
+	// Prefer the kernel-seeded bootstrap code-image VMO; fall back to vmo_create+copy if absent.
+	mov 8*506(%rbx), %rax
+	test %rax, %rax
+	je process_child_code_fallback
+	mov %rax, 0x1910(%rbx)
+	jmp process_child_code_ready
+
+process_child_code_fallback:
 	// vmo_create(child code image, 0x8000)
 	lea 0x1910(%rbx), %rdx
 	movabs $0x8000, %rdi
@@ -2424,6 +2432,25 @@ local_fault_contention_done:
 	mov 0x1918(%rbx), %rdi
 	movabs $0x8000, %rcx
 	rep movsb
+	jmp process_child_code_mapped
+
+process_child_code_ready:
+	// parent root_vmar maps the bootstrap pager-backed code-image VMO at USER_CODE_VA + 0x20000
+	mov 8*62(%rbx), %rdi
+	movl $0x401, %esi
+	movabs $0x20000, %rdx
+	mov 0x1910(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x8000, %r9
+	lea 0x1918(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*345(%rbx)
+
+process_child_code_mapped:
 
 	// vmo_create(child shared region, 0x2000)
 	lea 0x1920(%rbx), %rdx
@@ -2483,7 +2510,12 @@ local_fault_contention_done:
 
 	// child root_vmar maps code at USER_CODE_VA
 	mov 0x1908(%rbx), %rdi
+	mov 8*506(%rbx), %rax
+	test %rax, %rax
 	movl $0x403, %esi
+	je process_child_code_map
+	movl $0x401, %esi
+process_child_code_map:
 	xor %rdx, %rdx
 	mov 0x1910(%rbx), %r10
 	xor %r8, %r8

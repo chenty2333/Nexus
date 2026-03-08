@@ -111,7 +111,10 @@ external VM model.
   be imported into an address space without first copying the whole image into
   anonymous backing. The bootstrap ELF loader now also reads ELF headers and
   segment bytes through that same source path instead of indexing the whole raw
-  blob directly.
+  blob directly. Separately, bootstrap now seeds one internal pager-backed
+  code-image VMO for the already-loaded runner text image, and the child
+  process bootstrap path uses that VMO directly when mapping child code instead
+  of always doing `vmo_create + memcpy`.
   The first pager-backed step remains read-only and internal-only: a
   pager-backed `LazyVmo` can fault in one page from its source, `zx_vmo_read`
   can read directly from that source without materializing every page first,

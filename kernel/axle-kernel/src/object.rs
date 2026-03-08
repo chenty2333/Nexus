@@ -455,6 +455,7 @@ struct KernelState {
     bootstrap_self_process_handle: zx_handle_t,
     bootstrap_root_vmar_handle: zx_handle_t,
     bootstrap_self_thread_handle: zx_handle_t,
+    bootstrap_self_code_vmo_handle: zx_handle_t,
 }
 
 impl KernelState {
@@ -471,6 +472,7 @@ impl KernelState {
             bootstrap_self_process_handle: 0,
             bootstrap_root_vmar_handle: 0,
             bootstrap_self_thread_handle: 0,
+            bootstrap_self_code_vmo_handle: 0,
         };
 
         let process = state
@@ -525,6 +527,30 @@ impl KernelState {
         state.bootstrap_self_thread_handle = state
             .alloc_handle_for_object(object_id, thread_default_rights())
             .expect("bootstrap self thread handle allocation must succeed");
+
+        let address_space_id = state
+            .with_core(|kernel| kernel.process_address_space_id(process.process_id()))
+            .expect("bootstrap current process address space must exist");
+        if let Ok(created) = state.with_vm_mut(|vm| {
+            vm.import_bootstrap_user_code_vmo_for_address_space(
+                process.process_id(),
+                address_space_id,
+            )
+        }) {
+            let object_id = state.alloc_object_id();
+            state.objects.insert(
+                object_id,
+                KernelObject::Vmo(VmoObject {
+                    creator_process_id: created.process_id(),
+                    global_vmo_id: created.global_vmo_id(),
+                    kind: axle_mm::VmoKind::PagerBacked,
+                    size_bytes: created.size_bytes(),
+                }),
+            );
+            state.bootstrap_self_code_vmo_handle = state
+                .alloc_handle_for_object(object_id, bootstrap_code_vmo_rights())
+                .expect("bootstrap self code vmo handle allocation must succeed");
+        }
 
         state
     }
@@ -749,6 +775,13 @@ pub fn bootstrap_self_thread_handle() -> Option<zx_handle_t> {
     let mut guard = STATE.lock();
     let state = guard.as_mut()?;
     Some(state.bootstrap_self_thread_handle)
+}
+
+/// Return the bootstrap current-process code-image VMO handle, if seeded.
+pub fn bootstrap_self_code_vmo_handle() -> Option<zx_handle_t> {
+    let mut guard = STATE.lock();
+    let state = guard.as_mut()?;
+    (state.bootstrap_self_code_vmo_handle != 0).then_some(state.bootstrap_self_code_vmo_handle)
 }
 
 /// Return the bootstrap current-thread koid.
@@ -3047,6 +3080,13 @@ fn vmo_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::READ
         | crate::task::HandleRights::WRITE
+        | crate::task::HandleRights::MAP
+}
+
+fn bootstrap_code_vmo_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::READ
         | crate::task::HandleRights::MAP
 }
 

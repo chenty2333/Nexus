@@ -400,7 +400,8 @@ const SLOT_SOCKET_SHORT_WRITES: usize = 502;
 const SLOT_SOCKET_WRITE_SHOULD_WAIT: usize = 503;
 const SLOT_SOCKET_DUP_WRITE_AFTER_CLOSE_ACTUAL: usize = 504;
 const SLOT_SOCKET_DUP_READ_AFTER_CLOSE_ACTUAL: usize = 505;
-const SLOT_MAX: usize = SLOT_SOCKET_DUP_READ_AFTER_CLOSE_ACTUAL;
+const SLOT_SELF_CODE_VMO_H: usize = 506;
+const SLOT_MAX: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_T0_NS: usize = 511;
 
 #[repr(align(4096))]
@@ -888,6 +889,29 @@ pub(crate) fn read_qemu_loader_user_runner_at(
     Ok(())
 }
 
+pub(crate) fn read_bootstrap_user_code_image_at(
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<(), zx_status_t> {
+    let end = offset
+        .checked_add(dst.len() as u64)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    if end > USER_CODE_BYTES {
+        return Err(ZX_ERR_OUT_OF_RANGE);
+    }
+    let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let end = usize::try_from(end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    // SAFETY: `USER_CODE_PAGES` is one contiguous static array covering `USER_CODE_BYTES`.
+    let src = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(USER_CODE_PAGES).cast::<u8>(),
+            USER_CODE_BYTES as usize,
+        )
+    };
+    dst.copy_from_slice(src.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?);
+    Ok(())
+}
+
 fn qemu_loader_user_runner_blob() -> Option<&'static [u8]> {
     // SAFETY: conformance harness loads these bytes into identity-mapped RAM.
     let size = unsafe { core::ptr::read_unaligned(USER_RUNNER_ELF_SIZE_PADDR as *const u64) };
@@ -1368,6 +1392,8 @@ pub fn prepare() -> u64 {
     slots[SLOT_SELF_THREAD_H] = crate::object::bootstrap_self_thread_handle().unwrap_or(0) as u64;
     slots[SLOT_SELF_THREAD_KOID] = crate::object::bootstrap_self_thread_koid().unwrap_or(0);
     slots[SLOT_SELF_PROCESS_H] = crate::object::bootstrap_self_process_handle().unwrap_or(0) as u64;
+    slots[SLOT_SELF_CODE_VMO_H] =
+        crate::object::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64;
 
     entry
 }
