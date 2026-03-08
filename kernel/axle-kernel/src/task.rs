@@ -2833,6 +2833,16 @@ impl Kernel {
         Ok(())
     }
 
+    fn enqueue_runnable_thread_front(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if thread.queued || !matches!(thread.state, ThreadState::Runnable) {
+            return Ok(());
+        }
+        thread.queued = true;
+        self.run_queue.push_front(thread_id);
+        Ok(())
+    }
+
     fn requeue_current_thread(&mut self) -> Result<(), zx_status_t> {
         self.enqueue_runnable_thread(self.current_thread_id)
     }
@@ -2902,10 +2912,8 @@ impl Kernel {
         thread_id: ThreadId,
         status: Option<zx_status_t>,
     ) -> Result<(), zx_status_t> {
-        if matches!(
-            self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?.state,
-            ThreadState::Killed
-        ) {
+        let previous_state = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?.state;
+        if matches!(previous_state, ThreadState::Killed) {
             return Ok(());
         }
         let hold_suspended = self.thread_should_be_suspended(thread_id)?;
@@ -2925,7 +2933,17 @@ impl Kernel {
         let was_current = thread_id == self.current_thread_id;
         let _ = thread;
         if !hold_suspended && !was_current {
-            self.enqueue_runnable_thread(thread_id)?;
+            if matches!(
+                previous_state,
+                ThreadState::FutexWait { .. }
+                    | ThreadState::SignalWait { .. }
+                    | ThreadState::PortWait { .. }
+                    | ThreadState::VmFaultWait { .. }
+            ) {
+                self.enqueue_runnable_thread_front(thread_id)?;
+            } else {
+                self.enqueue_runnable_thread(thread_id)?;
+            }
             self.reschedule_requested = true;
         }
         Ok(())

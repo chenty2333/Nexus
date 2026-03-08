@@ -2504,6 +2504,98 @@ shared_fault_wait_done:
 	movq $1, 8*433(%rbx)
 shared_fault_contention_done:
 
+	// vmo_create(suspend closer stack page)
+	lea 0x1db8(%rbx), %rdx
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	movabs $9, %rax
+	int $0x80
+
+	// vmar_map(suspend closer stack @ USER_CODE_VA + 0x15000)
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x15000, %rdx
+	mov 0x1db8(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x1dc0(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+
+	// thread_create(self_process, NULL, 0, 0, &suspend_closer_thread_h)
+	mov 8*396(%rbx), %rdi
+	xor %rsi, %rsi
+	xor %rdx, %rdx
+	xor %r10d, %r10d
+	lea 0x1dc8(%rbx), %r8
+	movabs $25, %rax
+	int $0x80
+
+	// thread_start(suspend closer, suspend_worker_entry, stack_top, &control_word, 0)
+	movq $0, 8*169(%rbx)
+	mov 0x1dc8(%rbx), %rdi
+	lea suspend_worker_entry(%rip), %rsi
+	mov 0x1dc0(%rbx), %rdx
+	add $0x1000, %rdx
+	lea 8*169(%rbx), %r10
+	xor %r8d, %r8d
+	movabs $26, %rax
+	int $0x80
+
+	// task_suspend(child_process, &token)
+	lea 0x1db0(%rbx), %rsi
+	mov 0x1900(%rbx), %rdi
+	movabs $32, %rax
+	int $0x80
+	mov %rax, 8*164(%rbx)
+	movq $0, 8*165(%rbx)
+	movq $-11, 8*166(%rbx)
+	movq $0, 8*167(%rbx)
+	movq $0, 8*168(%rbx)
+	mov 0x1db0(%rbx), %rax
+	test %rax, %rax
+	jz task_suspend_process_done
+	movq $1, 8*165(%rbx)
+
+	// queue child work while held; the response word must stay unchanged
+	mov 0x1928(%rbx), %rcx
+	movl $0, 0x10(%rcx)
+	movl $1, 0xc(%rcx)
+	mov $5000000, %r11d
+task_suspend_held_spin:
+	mov 0x10(%rcx), %eax
+	test %eax, %eax
+	jnz task_suspend_held_done
+	pause
+	dec %r11d
+	jnz task_suspend_held_spin
+	movq $1, 8*168(%rbx)
+task_suspend_held_done:
+
+	// wake the dedicated suspend closer, then block until the child wakes us
+	movq $1, 8*169(%rbx)
+	lea 8*169(%rbx), %rdi
+	movl $1, %esi
+	movabs $22, %rax
+	int $0x80
+	mov 0x1928(%rbx), %rcx
+	lea 0x10(%rcx), %rdi
+	xorl %esi, %esi
+	xorl %edx, %edx
+	movabs $0x7fffffffffffffff, %r10
+	movabs $21, %rax
+	int $0x80
+task_suspend_process_resumed:
+	mov 0x1928(%rbx), %rcx
+	mov 0x10(%rcx), %eax
+	cmpl $1, %eax
+	jne task_suspend_process_done
+	movq $1, 8*167(%rbx)
+task_suspend_process_done:
+
 	// timer_cancel
 	mov 0x1698(%rbx), %rdi
 	movabs $8, %rax
@@ -2692,5 +2784,21 @@ process_child_touch_shared_fault_page:
 	movabs $22, %rax
 	int $0x80
 	jmp process_child_spin
+
+suspend_worker_entry:
+	movabs $0x0000000100008000, %rbx
+	mov %rdi, %r12
+suspend_worker_wait:
+	xorl %esi, %esi
+	xorl %edx, %edx
+	movabs $0x7fffffffffffffff, %r10
+	movabs $21, %rax
+	int $0x80
+	movl $0, (%r12)
+	mov 0x1db0(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+	mov %rax, 8*166(%rbx)
+	jmp suspend_worker_wait
 
 axle_user_prog_end:

@@ -1,0 +1,20 @@
+id = "kernel.task.suspend_process_bootstrap"
+description = "Bootstrap task_suspend should keep a child process quiesced until its suspend token is closed"
+tags = ["module:task", "module:thread", "module:futex", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.task.suspend_process_bootstrap"]
+
+[assertions.status_code]
+task_suspend_process = 0
+
+[assertions.packet_fields]
+task_suspend_token_present = 1
+task_suspend_resumed = 1
+task_suspend_held = 1
