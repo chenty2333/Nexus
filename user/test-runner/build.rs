@@ -1,15 +1,30 @@
 fn main() {
-    println!("cargo:rerun-if-changed=linker.ld");
-    println!("cargo:rerun-if-changed=../../specs/conformance/runner/int80_conformance.S");
-    // Link the userspace runner at the fixed VA expected by the kernel bring-up
-    // mapping in `kernel/axle-kernel/src/userspace.rs`.
     let manifest_dir =
         std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root");
+    println!("cargo:rerun-if-changed=linker.ld");
+    println!("cargo:rerun-if-env-changed=AXLE_TEST_RUNNER_ASM");
+
+    // Link the userspace runner at the fixed VA expected by the kernel bring-up
+    // mapping in `kernel/axle-kernel/src/userspace.rs`.
     let script = manifest_dir.join("linker.ld");
     println!("cargo:rustc-link-arg=-T{}", script.display());
-    let asm = manifest_dir.join("../../specs/conformance/runner/int80_conformance.S");
+    let asm = std::env::var("AXLE_TEST_RUNNER_ASM")
+        .map(|value| {
+            let path = std::path::PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                workspace_root.join(path)
+            }
+        })
+        .unwrap_or_else(|_| workspace_root.join("specs/conformance/runner/int80_conformance.S"));
+    println!("cargo:rerun-if-changed={}", asm.display());
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let object = out_dir.join("int80_conformance.o");
+    let object = out_dir.join("conformance_runner.o");
 
     let compiler = cc::Build::new().get_compiler();
     let status = compiler

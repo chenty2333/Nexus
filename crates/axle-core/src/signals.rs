@@ -91,6 +91,13 @@ impl Signals {
     /// Channel peer closed.
     pub const CHANNEL_PEER_CLOSED: Signals = Signals::OBJECT_PEER_CLOSED;
 
+    /// Socket readable.
+    pub const SOCKET_READABLE: Signals = Signals::OBJECT_READABLE;
+    /// Socket writable.
+    pub const SOCKET_WRITABLE: Signals = Signals::OBJECT_WRITABLE;
+    /// Socket peer closed.
+    pub const SOCKET_PEER_CLOSED: Signals = Signals::OBJECT_PEER_CLOSED;
+
     /// Timer signaled.
     pub const TIMER_SIGNALED: Signals = Signals::OBJECT_SIGNALED;
 

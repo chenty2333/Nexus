@@ -16,6 +16,7 @@ use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::koid::ZX_KOID_INVALID;
 use axle_types::packet::ZX_PKT_TYPE_USER;
 use axle_types::rights::{ZX_RIGHT_SAME_RIGHTS, ZX_RIGHTS_ALL};
+use axle_types::socket::{ZX_SOCKET_DATAGRAM, ZX_SOCKET_PEEK, ZX_SOCKET_STREAM};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
     ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
@@ -40,6 +41,7 @@ use crate::port_queue::{KernelPort, port_packet_from_core};
 const PORT_CAPACITY: usize = 64;
 const PORT_KERNEL_RESERVE: usize = 16;
 const CHANNEL_CAPACITY: usize = 64;
+const SOCKET_STREAM_CAPACITY: usize = 4096;
 const DEFAULT_OBJECT_GENERATION: u32 = 0;
 
 enum TrapBlock<T> {
@@ -54,6 +56,8 @@ pub enum ObjectKind {
     Process,
     /// Suspend token object.
     SuspendToken,
+    /// Socket endpoint object.
+    Socket,
     /// Channel endpoint object.
     Channel,
     /// EventPair endpoint object.
@@ -155,6 +159,178 @@ impl EventPairEndpoint {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocketSide {
+    A,
+    B,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SocketEndpoint {
+    core_id: u64,
+    peer_object_id: u64,
+    side: SocketSide,
+}
+
+#[derive(Debug)]
+struct ByteRing {
+    buf: Vec<u8>,
+    head: usize,
+    len: usize,
+}
+
+impl ByteRing {
+    fn with_capacity(capacity: usize) -> Result<Self, zx_status_t> {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(capacity)
+            .map_err(|_| axle_types::status::ZX_ERR_NO_MEMORY)?;
+        buf.resize(capacity, 0);
+        Ok(Self {
+            buf,
+            head: 0,
+            len: 0,
+        })
+    }
+
+    fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn available_read(&self) -> usize {
+        self.len
+    }
+
+    fn available_write(&self) -> usize {
+        self.capacity().saturating_sub(self.len)
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> usize {
+        if bytes.is_empty() || self.available_write() == 0 {
+            return 0;
+        }
+        let written = bytes.len().min(self.available_write());
+        for (idx, byte) in bytes.iter().take(written).enumerate() {
+            let tail = (self.head + self.len + idx) % self.capacity();
+            self.buf[tail] = *byte;
+        }
+        self.len += written;
+        written
+    }
+
+    fn read(&mut self, len: usize, consume: bool) -> Result<Vec<u8>, zx_status_t> {
+        let to_copy = len.min(self.available_read());
+        let mut out = Vec::new();
+        out.try_reserve_exact(to_copy)
+            .map_err(|_| axle_types::status::ZX_ERR_NO_MEMORY)?;
+        for idx in 0..to_copy {
+            let at = (self.head + idx) % self.capacity();
+            out.push(self.buf[at]);
+        }
+        if consume {
+            self.head = (self.head + to_copy) % self.capacity();
+            self.len -= to_copy;
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug)]
+struct SocketCore {
+    dir_ab: ByteRing,
+    dir_ba: ByteRing,
+    open_a: bool,
+    open_b: bool,
+}
+
+impl SocketCore {
+    fn new_stream(capacity: usize) -> Result<Self, zx_status_t> {
+        Ok(Self {
+            dir_ab: ByteRing::with_capacity(capacity)?,
+            dir_ba: ByteRing::with_capacity(capacity)?,
+            open_a: true,
+            open_b: true,
+        })
+    }
+
+    fn signals_for(&self, side: SocketSide) -> Signals {
+        let (readable, writable, peer_open) = match side {
+            SocketSide::A => (
+                self.dir_ba.available_read() != 0,
+                self.dir_ab.available_write() != 0,
+                self.open_b,
+            ),
+            SocketSide::B => (
+                self.dir_ab.available_read() != 0,
+                self.dir_ba.available_write() != 0,
+                self.open_a,
+            ),
+        };
+        let mut signals = Signals::NONE;
+        if readable {
+            signals = signals | Signals::SOCKET_READABLE;
+        }
+        if peer_open && writable {
+            signals = signals | Signals::SOCKET_WRITABLE;
+        }
+        if !peer_open {
+            signals = signals | Signals::SOCKET_PEER_CLOSED;
+        }
+        signals
+    }
+
+    fn write(&mut self, side: SocketSide, bytes: &[u8]) -> Result<usize, zx_status_t> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let (queue, peer_open) = match side {
+            SocketSide::A => (&mut self.dir_ab, self.open_b),
+            SocketSide::B => (&mut self.dir_ba, self.open_a),
+        };
+        if !peer_open {
+            return Err(ZX_ERR_PEER_CLOSED);
+        }
+        let written = queue.write(bytes);
+        if written == 0 {
+            return Err(ZX_ERR_SHOULD_WAIT);
+        }
+        Ok(written)
+    }
+
+    fn read(
+        &mut self,
+        side: SocketSide,
+        len: usize,
+        consume: bool,
+    ) -> Result<Vec<u8>, zx_status_t> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let (queue, peer_open) = match side {
+            SocketSide::A => (&mut self.dir_ba, self.open_b),
+            SocketSide::B => (&mut self.dir_ab, self.open_a),
+        };
+        if queue.available_read() == 0 {
+            return Err(if peer_open {
+                ZX_ERR_SHOULD_WAIT
+            } else {
+                ZX_ERR_PEER_CLOSED
+            });
+        }
+        queue.read(len, consume)
+    }
+
+    fn close_side(&mut self, side: SocketSide) {
+        match side {
+            SocketSide::A => self.open_a = false,
+            SocketSide::B => self.open_b = false,
+        }
+    }
+
+    fn fully_closed(&self) -> bool {
+        !self.open_a && !self.open_b
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct VmoObject {
     creator_process_id: u64,
@@ -222,6 +398,7 @@ struct SuspendTokenObject {
 enum KernelObject {
     Process(ProcessObject),
     SuspendToken(SuspendTokenObject),
+    Socket(SocketEndpoint),
     Channel(ChannelEndpoint),
     EventPair(EventPairEndpoint),
     Port(KernelPort),
@@ -257,8 +434,10 @@ const USER_SIGNAL_MASK: Signals = Signals::USER_SIGNAL_0
 struct KernelState {
     kernel: Arc<Mutex<crate::task::Kernel>>,
     objects: BTreeMap<u64, KernelObject>,
+    socket_cores: BTreeMap<u64, SocketCore>,
     object_handle_refs: BTreeMap<u64, usize>,
     next_object_id: u64,
+    next_socket_core_id: u64,
     timers: TimerService,
     bootstrap_self_process_handle: zx_handle_t,
     bootstrap_root_vmar_handle: zx_handle_t,
@@ -270,8 +449,10 @@ impl KernelState {
         let mut state = Self {
             kernel: Arc::new(Mutex::new(crate::task::Kernel::bootstrap())),
             objects: BTreeMap::new(),
+            socket_cores: BTreeMap::new(),
             object_handle_refs: BTreeMap::new(),
             next_object_id: 1,
+            next_socket_core_id: 1,
             timers: TimerService::new(),
             bootstrap_self_process_handle: 0,
             bootstrap_root_vmar_handle: 0,
@@ -336,6 +517,12 @@ impl KernelState {
     fn alloc_object_id(&mut self) -> u64 {
         let id = self.next_object_id;
         self.next_object_id = self.next_object_id.wrapping_add(1);
+        id
+    }
+
+    fn alloc_socket_core_id(&mut self) -> u64 {
+        let id = self.next_socket_core_id;
+        self.next_socket_core_id = self.next_socket_core_id.wrapping_add(1);
         id
     }
 
@@ -685,6 +872,64 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
                 Err(e)
             }
         }
+    })
+}
+
+/// Create a socket endpoint pair and return both handles.
+pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_status_t> {
+    match options {
+        ZX_SOCKET_STREAM => {}
+        ZX_SOCKET_DATAGRAM => return Err(ZX_ERR_NOT_SUPPORTED),
+        _ => return Err(ZX_ERR_INVALID_ARGS),
+    }
+
+    with_state_mut(|state| {
+        let core_id = state.alloc_socket_core_id();
+        let core = SocketCore::new_stream(SOCKET_STREAM_CAPACITY)?;
+        state.socket_cores.insert(core_id, core);
+
+        let left_object_id = state.alloc_object_id();
+        let right_object_id = state.alloc_object_id();
+        state.objects.insert(
+            left_object_id,
+            KernelObject::Socket(SocketEndpoint {
+                core_id,
+                peer_object_id: right_object_id,
+                side: SocketSide::A,
+            }),
+        );
+        state.objects.insert(
+            right_object_id,
+            KernelObject::Socket(SocketEndpoint {
+                core_id,
+                peer_object_id: left_object_id,
+                side: SocketSide::B,
+            }),
+        );
+
+        let left_handle =
+            match state.alloc_handle_for_object(left_object_id, socket_default_rights()) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    let _ = state.objects.remove(&left_object_id);
+                    let _ = state.objects.remove(&right_object_id);
+                    let _ = state.socket_cores.remove(&core_id);
+                    return Err(err);
+                }
+            };
+        let right_handle =
+            match state.alloc_handle_for_object(right_object_id, socket_default_rights()) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    let _ = state.close_handle(left_handle);
+                    let _ = state.objects.remove(&left_object_id);
+                    let _ = state.objects.remove(&right_object_id);
+                    let _ = state.socket_cores.remove(&core_id);
+                    return Err(err);
+                }
+            };
+
+        Ok((left_handle, right_handle))
     })
 }
 
@@ -1392,6 +1637,68 @@ pub fn vmo_set_size(handle: zx_handle_t, size: u64) -> Result<(), zx_status_t> {
     })
 }
 
+/// Write bytes into one stream socket.
+pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<usize, zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let endpoint = match state.objects.get(&resolved.object_id()) {
+            Some(KernelObject::Socket(endpoint)) => *endpoint,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
+
+        let written = {
+            let core = state
+                .socket_cores
+                .get_mut(&endpoint.core_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            core.write(endpoint.side, bytes)?
+        };
+
+        let _ = notify_waitable_signals_changed(state, resolved.object_id());
+        let _ = notify_waitable_signals_changed(state, endpoint.peer_object_id);
+        Ok(written)
+    })
+}
+
+/// Read bytes from one stream socket.
+pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<u8>, zx_status_t> {
+    let peek = match options {
+        0 => false,
+        ZX_SOCKET_PEEK => true,
+        _ => return Err(ZX_ERR_INVALID_ARGS),
+    };
+
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let endpoint = match state.objects.get(&resolved.object_id()) {
+            Some(KernelObject::Socket(endpoint)) => *endpoint,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        require_handle_rights(resolved, crate::task::HandleRights::READ)?;
+
+        let bytes = {
+            let core = state
+                .socket_cores
+                .get_mut(&endpoint.core_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            core.read(endpoint.side, len, !peek)?
+        };
+
+        if !peek {
+            let _ = notify_waitable_signals_changed(state, resolved.object_id());
+            let _ = notify_waitable_signals_changed(state, endpoint.peer_object_id);
+        }
+        Ok(bytes)
+    })
+}
+
 /// Write one copied message into the peer side of a channel.
 pub fn channel_write(
     handle: zx_handle_t,
@@ -2070,6 +2377,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
             Some(KernelObject::Timer(timer)) => timer.timer_id,
             Some(KernelObject::Process(_))
             | Some(KernelObject::SuspendToken(_))
+            | Some(KernelObject::Socket(_))
             | Some(KernelObject::Channel(_))
             | Some(KernelObject::EventPair(_))
             | Some(KernelObject::Port(_))
@@ -2108,6 +2416,7 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
             Some(KernelObject::Timer(timer)) => timer.timer_id,
             Some(KernelObject::Process(_))
             | Some(KernelObject::SuspendToken(_))
+            | Some(KernelObject::Socket(_))
             | Some(KernelObject::Channel(_))
             | Some(KernelObject::EventPair(_))
             | Some(KernelObject::Port(_))
@@ -2144,6 +2453,7 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
                 KernelObject::Port(port) => port,
                 KernelObject::Process(_)
                 | KernelObject::SuspendToken(_)
+                | KernelObject::Socket(_)
                 | KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
@@ -2176,6 +2486,7 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
                 KernelObject::Port(port) => port,
                 KernelObject::Process(_)
                 | KernelObject::SuspendToken(_)
+                | KernelObject::Socket(_)
                 | KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
@@ -2363,6 +2674,7 @@ pub fn object_wait_async(
                 KernelObject::Port(port) => port,
                 KernelObject::Process(_)
                 | KernelObject::SuspendToken(_)
+                | KernelObject::Socket(_)
                 | KernelObject::Channel(_)
                 | KernelObject::EventPair(_)
                 | KernelObject::Timer(_)
@@ -2389,6 +2701,7 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
         let resolved = state.lookup_handle(raw, crate::task::HandleRights::empty())?;
         let object_id = resolved.object_id();
         let peer_link = match state.objects.get(&object_id) {
+            Some(KernelObject::Socket(endpoint)) => Some(endpoint.peer_object_id),
             Some(KernelObject::Channel(endpoint)) => Some(endpoint.peer_object_id),
             Some(KernelObject::EventPair(endpoint)) => Some(endpoint.peer_object_id),
             Some(_) => None,
@@ -2431,6 +2744,18 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
             let removed = state.objects.remove(&object_id);
             state.forget_object_handle_refs(object_id);
             match removed {
+                Some(KernelObject::Socket(endpoint)) => {
+                    let should_drop_core = match state.socket_cores.get_mut(&endpoint.core_id) {
+                        Some(core) => {
+                            core.close_side(endpoint.side);
+                            core.fully_closed()
+                        }
+                        None => return Err(ZX_ERR_BAD_STATE),
+                    };
+                    if should_drop_core {
+                        let _ = state.socket_cores.remove(&endpoint.core_id);
+                    }
+                }
                 Some(KernelObject::Channel(mut endpoint)) => {
                     endpoint.closed = true;
                     let drained = endpoint.messages.drain(..).collect::<Vec<_>>();
@@ -2497,6 +2822,10 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                 ObjectKind::Process
             }
             KernelObject::SuspendToken(_) => ObjectKind::SuspendToken,
+            KernelObject::Socket(endpoint) => {
+                let _ = (endpoint.core_id, endpoint.peer_object_id, endpoint.side);
+                ObjectKind::Socket
+            }
             KernelObject::Channel(endpoint) => {
                 let _ = (
                     endpoint.peer_object_id,
@@ -2587,6 +2916,14 @@ fn normalize_requested_rights(
 }
 
 fn channel_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::WAIT
+        | crate::task::HandleRights::READ
+        | crate::task::HandleRights::WRITE
+}
+
+fn socket_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::WAIT
@@ -2838,6 +3175,13 @@ fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals,
             state.with_kernel(|kernel| kernel.process_signals(process.process_id))
         }
         KernelObject::SuspendToken(_) => Ok(Signals::NONE),
+        KernelObject::Socket(endpoint) => {
+            let core = state
+                .socket_cores
+                .get(&endpoint.core_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            Ok(core.signals_for(endpoint.side))
+        }
         KernelObject::Channel(endpoint) => {
             let mut signals = Signals::NONE;
             if endpoint.is_readable() {

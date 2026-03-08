@@ -204,3 +204,18 @@ description = "Bootstrap same-page faults should serialize so only one leader ma
 id = "should.vmo.read_write_resize_bootstrap"
 level = "should"
 description = "Bootstrap VMO syscalls should support basic read/write, page-aligned grow/shrink, and reject shrinking a mapped tail or writing beyond the resized end"
+
+[[contracts]]
+id = "should.socket.stream_basics_bootstrap"
+level = "should"
+description = "Bootstrap STREAM sockets should support create, waitable readable/writable states, peek, read, peer-close signaling, and peer-closed read/write errors"
+
+[[contracts]]
+id = "should.socket.stream_backpressure_bootstrap"
+level = "should"
+description = "Bootstrap STREAM sockets should allow short writes under backpressure, return SHOULD_WAIT when full, and become writable again after the peer drains buffered bytes"
+
+[[contracts]]
+id = "should.socket.duplicate_peer_close_bootstrap"
+level = "should"
+description = "Bootstrap STREAM sockets should not report PEER_CLOSED while duplicated peer-end handles remain live, but should report it once the last duplicate closes"

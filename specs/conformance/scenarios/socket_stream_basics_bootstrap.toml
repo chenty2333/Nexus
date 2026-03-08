@@ -1,0 +1,31 @@
+id = "kernel.socket.stream_basics_bootstrap"
+description = "Bootstrap STREAM sockets should roundtrip bytes, support PEEK, expose readable/writable signals, and surface peer-closed behavior"
+tags = ["module:kernel", "module:socket", "module:signals", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "AXLE_TEST_RUNNER_ASM=specs/conformance/runner/socket_conformance.S cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.socket.stream_basics_bootstrap"]
+
+[assertions.status_code]
+socket_create = 0
+socket_wait_writable = 0
+socket_write = 0
+socket_wait_readable = 0
+socket_peek = 0
+socket_read = 0
+socket_close_peer = 0
+socket_wait_peer_closed = 0
+socket_write_peer_closed = -24
+socket_read_peer_closed = -24
+
+[assertions.packet_fields]
+socket_wait_writable_observed = 2
+socket_wait_readable_observed = 3
+socket_peek_match = 1
+socket_read_match = 1
+socket_wait_peer_closed_observed = 4

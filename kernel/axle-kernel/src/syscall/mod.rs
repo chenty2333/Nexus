@@ -25,11 +25,11 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER,
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
     AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START,
-    AXLE_SYS_TASK_KILL, AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START,
-    AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE,
-    AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
-    AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE,
-    SyscallNumber,
+    AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE, AXLE_SYS_TASK_KILL,
+    AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL,
+    AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_DESTROY,
+    AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE,
+    AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE, SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -42,7 +42,7 @@ use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 36] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 39] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -79,6 +79,9 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 36] = [
     AXLE_SYS_VMO_READ,
     AXLE_SYS_VMO_WRITE,
     AXLE_SYS_VMO_SET_SIZE,
+    AXLE_SYS_SOCKET_CREATE,
+    AXLE_SYS_SOCKET_WRITE,
+    AXLE_SYS_SOCKET_READ,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -147,6 +150,9 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_PROCESS_START => sys_process_start(args),
         AXLE_SYS_TASK_KILL => sys_task_kill(args),
         AXLE_SYS_TASK_SUSPEND => sys_task_suspend(args),
+        AXLE_SYS_SOCKET_CREATE => sys_socket_create(args),
+        AXLE_SYS_SOCKET_WRITE => sys_socket_write(args),
+        AXLE_SYS_SOCKET_READ => sys_socket_read(args),
         _ => ZX_ERR_BAD_SYSCALL,
     }
 }
@@ -636,6 +642,100 @@ fn sys_vmo_set_size(args: [u64; 6]) -> zx_status_t {
     };
     let size = args[1];
     match crate::object::vmo_set_size(handle, size) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_socket_create(args: [u64; 6]) -> zx_status_t {
+    let options = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let out0_ptr = args[1] as *mut zx_handle_t;
+    let out1_ptr = args[2] as *mut zx_handle_t;
+    if out0_ptr.is_null() || out1_ptr.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if !crate::userspace::validate_user_ptr(out0_ptr as u64, size_of::<zx_handle_t>())
+        || !crate::userspace::validate_user_ptr(out1_ptr as u64, size_of::<zx_handle_t>())
+    {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let (out0, out1) = match crate::object::create_socket(options) {
+        Ok(handles) => handles,
+        Err(e) => return e,
+    };
+    if let Err(e) = copyout(out0_ptr, out0) {
+        return e;
+    }
+    if let Err(e) = copyout(out1_ptr, out1) {
+        return e;
+    }
+    ZX_OK
+}
+
+fn sys_socket_write(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let options = match u32::try_from(args[1]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let buffer = args[2] as *const u8;
+    let buffer_size = match usize::try_from(args[3]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_OUT_OF_RANGE,
+    };
+    let actual_ptr = args[4] as *mut usize;
+    if buffer_size != 0 && buffer.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let bytes = match copyin_bytes(buffer, buffer_size) {
+        Ok(bytes) => bytes,
+        Err(e) => return e,
+    };
+    let actual = match crate::object::socket_write(handle, options, &bytes) {
+        Ok(actual) => actual,
+        Err(e) => return e,
+    };
+    match copyout_optional(actual_ptr, actual) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_socket_read(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let options = match u32::try_from(args[1]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let buffer = args[2] as *mut u8;
+    let buffer_size = match usize::try_from(args[3]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_OUT_OF_RANGE,
+    };
+    let actual_ptr = args[4] as *mut usize;
+    if buffer.is_null() {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    let bytes = match crate::object::socket_read(handle, options, buffer_size) {
+        Ok(bytes) => bytes,
+        Err(e) => return e,
+    };
+    if let Err(e) = copyout_bytes(buffer, &bytes) {
+        return e;
+    }
+    match copyout_optional(actual_ptr, bytes.len()) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }

@@ -74,3 +74,9 @@ pub const AXLE_SYS_VMO_READ: SyscallNumber = 33;
 pub const AXLE_SYS_VMO_WRITE: SyscallNumber = 34;
 /// Contract: SHOULD
 pub const AXLE_SYS_VMO_SET_SIZE: SyscallNumber = 35;
+/// Contract: SHOULD
+pub const AXLE_SYS_SOCKET_CREATE: SyscallNumber = 36;
+/// Contract: SHOULD
+pub const AXLE_SYS_SOCKET_WRITE: SyscallNumber = 37;
+/// Contract: SHOULD
+pub const AXLE_SYS_SOCKET_READ: SyscallNumber = 38;

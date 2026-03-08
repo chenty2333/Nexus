@@ -155,6 +155,16 @@ pub mod wait_async {
     pub const ZX_WAIT_ASYNC_BOOT_TIMESTAMP: u32 = 4;
 }
 
+/// Socket creation/read options.
+pub mod socket {
+    /// Stream socket.
+    pub const ZX_SOCKET_STREAM: u32 = 0;
+    /// Datagram socket.
+    pub const ZX_SOCKET_DATAGRAM: u32 = 1;
+    /// Peek without consuming bytes from the socket.
+    pub const ZX_SOCKET_PEEK: u32 = 1;
+}
+
 /// VM mapping and protection options.
 ///
 /// VM option bits used by Axle's Zircon-style VM syscalls.
@@ -465,6 +475,13 @@ pub mod signals {
     pub const ZX_CHANNEL_WRITABLE: zx_signals_t = ZX_OBJECT_WRITABLE;
     /// Channel peer closed.
     pub const ZX_CHANNEL_PEER_CLOSED: zx_signals_t = ZX_OBJECT_PEER_CLOSED;
+
+    /// Socket readable.
+    pub const ZX_SOCKET_READABLE: zx_signals_t = ZX_OBJECT_READABLE;
+    /// Socket writable.
+    pub const ZX_SOCKET_WRITABLE: zx_signals_t = ZX_OBJECT_WRITABLE;
+    /// Socket peer closed.
+    pub const ZX_SOCKET_PEER_CLOSED: zx_signals_t = ZX_OBJECT_PEER_CLOSED;
 
     /// Timer signaled.
     pub const ZX_TIMER_SIGNALED: zx_signals_t = ZX_OBJECT_SIGNALED;
