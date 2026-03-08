@@ -106,6 +106,8 @@ struct FaultEntry {
     completed_epoch: u64,
     spin_waiters: u32,
     blocked_waiters: BTreeSet<ThreadId>,
+    leader_thread: Option<ThreadId>,
+    leader_paused_for_test: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,7 +125,8 @@ enum FaultClaim {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FaultBlockingClaim {
     Leader,
-    Wait,
+    LeaderResume,
+    Wait { wake_leader: Option<ThreadId> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +186,8 @@ impl FaultTable {
                         completed_epoch: 0,
                         spin_waiters: 0,
                         blocked_waiters: BTreeSet::new(),
+                        leader_thread: None,
+                        leader_paused_for_test: false,
                     },
                 );
                 FaultClaim::Leader
@@ -192,14 +197,25 @@ impl FaultTable {
 
     fn claim_blocking(&mut self, key: FaultInFlightKey, thread_id: ThreadId) -> FaultBlockingClaim {
         match self.entries.get_mut(&key) {
+            Some(entry) if entry.in_flight && entry.leader_thread == Some(thread_id) => {
+                FaultBlockingClaim::LeaderResume
+            }
             Some(entry) if entry.in_flight => {
                 self.telemetry.wait_claims = self.telemetry.wait_claims.wrapping_add(1);
                 let _ = entry.blocked_waiters.insert(thread_id);
-                FaultBlockingClaim::Wait
+                let wake_leader = if entry.leader_paused_for_test {
+                    entry.leader_paused_for_test = false;
+                    entry.leader_thread
+                } else {
+                    None
+                };
+                FaultBlockingClaim::Wait { wake_leader }
             }
             Some(entry) => {
                 self.telemetry.leader_claims = self.telemetry.leader_claims.wrapping_add(1);
                 entry.in_flight = true;
+                entry.leader_thread = Some(thread_id);
+                entry.leader_paused_for_test = false;
                 FaultBlockingClaim::Leader
             }
             None => {
@@ -211,6 +227,8 @@ impl FaultTable {
                         completed_epoch: 0,
                         spin_waiters: 0,
                         blocked_waiters: BTreeSet::new(),
+                        leader_thread: Some(thread_id),
+                        leader_paused_for_test: false,
                     },
                 );
                 FaultBlockingClaim::Leader
@@ -226,10 +244,20 @@ impl FaultTable {
         entry.completed_epoch = entry.completed_epoch.wrapping_add(1);
         let blocked_waiters = entry.blocked_waiters.iter().copied().collect::<Vec<_>>();
         entry.blocked_waiters.clear();
+        entry.leader_thread = None;
+        entry.leader_paused_for_test = false;
         if entry.spin_waiters == 0 && entry.blocked_waiters.is_empty() {
             let _ = self.entries.remove(&key);
         }
         blocked_waiters
+    }
+
+    fn pause_leader_for_test(&mut self, key: FaultInFlightKey, thread_id: ThreadId) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if entry.in_flight && entry.leader_thread == Some(thread_id) {
+                entry.leader_paused_for_test = true;
+            }
+        }
     }
 
     fn observe_completion(&self, wait: FaultWaitToken) -> bool {
@@ -2612,6 +2640,10 @@ impl Kernel {
         self.make_thread_runnable_inner(thread_id, None)
     }
 
+    pub(crate) fn request_reschedule(&mut self) {
+        self.reschedule_requested = true;
+    }
+
     fn install_mapping_pages(
         &self,
         address_space_id: AddressSpaceId,
@@ -2756,7 +2788,10 @@ enum FaultCommitDisposition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PageFaultSerializedResult {
     Handled,
-    BlockCurrent { key: FaultInFlightKey },
+    BlockCurrent {
+        key: FaultInFlightKey,
+        wake_thread: Option<ThreadId>,
+    },
     Unhandled,
 }
 
@@ -2862,6 +2897,18 @@ fn claim_blocking_fault(
     claim
 }
 
+fn pause_fault_leader_for_test(
+    table: &Arc<Mutex<FaultTable>>,
+    key: FaultInFlightKey,
+    thread_id: ThreadId,
+) {
+    {
+        let mut table = table.lock();
+        table.pause_leader_for_test(key, thread_id);
+    }
+    record_fault_telemetry_snapshot(table);
+}
+
 fn complete_fault(table: &Arc<Mutex<FaultTable>>, key: FaultInFlightKey) -> Vec<ThreadId> {
     let waiters = {
         let mut table = table.lock();
@@ -2884,6 +2931,10 @@ fn wake_fault_waiters(kernel_handle: &Arc<Mutex<Kernel>>, waiters: Vec<ThreadId>
     for thread_id in waiters {
         let _ = kernel.make_thread_runnable_preserving_context(thread_id);
     }
+}
+
+fn should_pause_fault_leader_for_test() -> bool {
+    crate::userspace::consume_vm_fault_leader_pause_hook()
 }
 
 fn wait_for_fault_completion(table: &Arc<Mutex<FaultTable>>, wait: FaultWaitToken) {
@@ -3073,6 +3124,13 @@ pub(crate) fn handle_page_fault_serialized(
                 let claim = claim_blocking_fault(&fault_handle, plan.key(), thread_id);
                 match claim {
                     FaultBlockingClaim::Leader => {
+                        if should_pause_fault_leader_for_test() {
+                            pause_fault_leader_for_test(&fault_handle, plan.key(), thread_id);
+                            return PageFaultSerializedResult::BlockCurrent {
+                                key: plan.key(),
+                                wake_thread: None,
+                            };
+                        }
                         let key = plan.key();
                         let guard = FaultLeaderGuard::new(fault_handle.clone(), key);
                         let mut prepared =
@@ -3103,8 +3161,42 @@ pub(crate) fn handle_page_fault_serialized(
                             Err(_) => return PageFaultSerializedResult::Unhandled,
                         }
                     }
-                    FaultBlockingClaim::Wait => {
-                        return PageFaultSerializedResult::BlockCurrent { key: plan.key() };
+                    FaultBlockingClaim::LeaderResume => {
+                        let key = plan.key();
+                        let guard = FaultLeaderGuard::new(fault_handle.clone(), key);
+                        let mut prepared =
+                            match prepare_fault_work(plan, &fault_handle, &global_vmo_store) {
+                                Ok(prepared) => prepared,
+                                Err(_) => return PageFaultSerializedResult::Unhandled,
+                            };
+                        let outcome = {
+                            let mut vm = vm_handle.lock();
+                            vm.commit_prepared_fault(plan, &mut prepared)
+                        };
+                        prepared.release_unused();
+                        let waiters = guard.complete();
+                        wake_fault_waiters(&kernel_handle, waiters);
+                        match outcome {
+                            Ok(FaultCommitDisposition::Resolved) => {
+                                update_fault_telemetry(&fault_handle, |table| {
+                                    table.record_commit_resolved();
+                                });
+                                return PageFaultSerializedResult::Handled;
+                            }
+                            Ok(FaultCommitDisposition::Retry) => {
+                                update_fault_telemetry(&fault_handle, |table| {
+                                    table.record_commit_retry();
+                                });
+                                continue;
+                            }
+                            Err(_) => return PageFaultSerializedResult::Unhandled,
+                        }
+                    }
+                    FaultBlockingClaim::Wait { wake_leader } => {
+                        return PageFaultSerializedResult::BlockCurrent {
+                            key: plan.key(),
+                            wake_thread: wake_leader,
+                        };
                     }
                 }
             }

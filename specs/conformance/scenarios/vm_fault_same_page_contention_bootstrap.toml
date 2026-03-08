@@ -1,0 +1,24 @@
+id = "kernel.vm.fault_same_page_contention_bootstrap"
+description = "Bootstrap local and shared same-page fault contention should block behind one leader and resume after the leader publishes the page"
+tags = ["module:mm", "module:process", "module:thread", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.vm.same_page_fault_contention_bootstrap"]
+
+[assertions.status_code]
+thread_create = 0
+thread_start = 0
+thread_futex_wait = 0
+process_create = 0
+process_thread_start = 0
+process_parent_futex_wait = 0
+
+[assertions.packet_fields]
+vm_fault_local_wait_ok = 1
+vm_fault_shared_wait_ok = 1

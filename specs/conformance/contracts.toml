@@ -169,3 +169,8 @@ description = "Bootstrap child VMAR mappings should coexist with far root mappin
 id = "should.timer.wait_forever_bootstrap"
 level = "should"
 description = "An infinite wait_one on a timer should block through trap-exit and resume when the timer IRQ wakes the current thread"
+
+[[contracts]]
+id = "should.vm.same_page_fault_contention_bootstrap"
+level = "should"
+description = "Bootstrap same-page faults should serialize so only one leader materializes the page while local and shared contenders block and resume"

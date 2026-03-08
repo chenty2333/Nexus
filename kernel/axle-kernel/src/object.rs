@@ -936,6 +936,10 @@ pub fn handle_page_fault(
     cr2: u64,
     error: u64,
 ) -> bool {
+    // SAFETY: x86_64 faults with an error code place that code at `cpu_frame[0]`,
+    // followed by the user IRET frame {rip, cs, rflags, rsp, ss}. The generic
+    // trap-exit/context helpers expect a pointer to the first IRET slot.
+    let user_cpu_frame = unsafe { cpu_frame.add(1) };
     let vm = match vm_handle() {
         Ok(vm) => vm,
         Err(_) => return false,
@@ -951,12 +955,12 @@ pub fn handle_page_fault(
     run_trap_blocking(|resuming_blocked_current| {
         if resuming_blocked_current {
             return with_kernel_mut(|kernel| {
-                kernel.finish_trap_exit(trap, cpu_frame, true).map(
-                    |disposition| match disposition {
+                kernel
+                    .finish_trap_exit(trap, user_cpu_frame, true)
+                    .map(|disposition| match disposition {
                         crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(true),
                         crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
-                    },
-                )
+                    })
             });
         }
 
@@ -987,12 +991,15 @@ pub fn handle_page_fault(
                 Ok(TrapBlock::Ready(true))
             }
             crate::task::PageFaultSerializedResult::Unhandled => Ok(TrapBlock::Ready(false)),
-            crate::task::PageFaultSerializedResult::BlockCurrent { key } => {
+            crate::task::PageFaultSerializedResult::BlockCurrent { key, wake_thread } => {
                 with_kernel_mut(|kernel| {
-                    kernel.capture_current_user_context(trap, cpu_frame.cast_const())?;
+                    kernel.capture_current_user_context(trap, user_cpu_frame.cast_const())?;
                     kernel.enqueue_current_fault_wait(key)?;
+                    if let Some(thread_id) = wake_thread {
+                        kernel.make_thread_runnable_preserving_context(thread_id)?;
+                    }
                     kernel
-                        .finish_trap_exit(trap, cpu_frame, false)
+                        .finish_trap_exit(trap, user_cpu_frame, false)
                         .map(|disposition| match disposition {
                             crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(true),
                             crate::task::TrapExitDisposition::BlockCurrent => {

@@ -2107,6 +2107,58 @@ thread_resume_done:
 	mov 0x18c8(%rbx), %eax
 	mov %rax, 8*410(%rbx)
 
+	// --- same-page fault contention: local same-aspace LazyAnon --------------
+
+	// vmo_create(local contention page, 0x1000)
+	lea 0x1970(%rbx), %rdx
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	movabs $9, %rax
+	int $0x80
+
+	// parent root_vmar maps local contention page at USER_CODE_VA + 0x32000
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x32000, %rdx
+	mov 0x1970(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x1978(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+
+	// arm one-shot fault-leader pause, command worker to touch the same page, then fault it here
+	mov 8*421(%rbx), %rax
+	mov %rax, 0x1980(%rbx)
+	movq $0, 8*432(%rbx)
+	movq $0, 8*434(%rbx)
+	movq $1, 8*431(%rbx)
+	mov 0x1978(%rbx), %rax
+	mov %rax, 8*404(%rbx)
+	movq $5, 8*403(%rbx)
+	mov 0x1978(%rbx), %rcx
+	mov (%rcx), %rax
+
+	mov 8*434(%rbx), %eax
+	cmpl $1, %eax
+	je local_fault_wait_done
+	lea 8*434(%rbx), %rdi
+	xorl %esi, %esi
+	xorl %edx, %edx
+	movabs $0x7fffffffffffffff, %r10
+	movabs $21, %rax
+	int $0x80
+local_fault_wait_done:
+	mov 8*421(%rbx), %rax
+	sub 0x1980(%rbx), %rax
+	cmp $1, %rax
+	jb local_fault_contention_done
+	movq $1, 8*432(%rbx)
+local_fault_contention_done:
+
 	// process_create(self_process, NULL, 0, 0, &child_process, &child_root_vmar)
 	mov 8*396(%rbx), %rdi
 	xor %rsi, %rsi
@@ -2310,6 +2362,71 @@ thread_resume_done:
 	movq $1, 8*385(%rbx)
 process_lazy_shared_done:
 
+	// --- same-page fault contention: shared LazyVmo across address spaces ----
+
+	// vmo_create(shared contention page, 0x1000)
+	lea 0x1988(%rbx), %rdx
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	movabs $9, %rax
+	int $0x80
+
+	// parent root_vmar maps shared contention page at USER_CODE_VA + 0x2c000
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x2c000, %rdx
+	mov 0x1988(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x1990(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+
+	// child root_vmar maps the same VMO at USER_CODE_VA + 0xc000
+	mov 0x1908(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0xc000, %rdx
+	mov 0x1988(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x1998(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+
+	mov 8*421(%rbx), %rax
+	mov %rax, 0x19a0(%rbx)
+	movq $0, 8*433(%rbx)
+	mov 0x1928(%rbx), %rcx
+	movl $0, 0x10(%rcx)
+	movl $1, 0xc(%rcx)
+	movq $1, 8*431(%rbx)
+	mov 0x1990(%rbx), %rcx
+	mov (%rcx), %rax
+
+	mov 0x1928(%rbx), %rcx
+	mov 0x10(%rcx), %eax
+	cmpl $1, %eax
+	je shared_fault_wait_done
+	lea 0x10(%rcx), %rdi
+	xorl %esi, %esi
+	xorl %edx, %edx
+	movabs $0x7fffffffffffffff, %r10
+	movabs $21, %rax
+	int $0x80
+shared_fault_wait_done:
+	mov 8*421(%rbx), %rax
+	sub 0x19a0(%rbx), %rax
+	cmp $1, %rax
+	jb shared_fault_contention_done
+	movq $1, 8*433(%rbx)
+shared_fault_contention_done:
+
 	// timer_cancel
 	mov 0x1698(%rbx), %rdi
 	movabs $8, %rax
@@ -2364,6 +2481,8 @@ thread_worker_spin:
 	je thread_worker_queue_port
 	cmp $4, %rax
 	je thread_worker_park
+	cmp $5, %rax
+	je thread_worker_touch_page
 	movq $0, 8*403(%rbx)
 thread_worker_spin_pause:
 	pause
@@ -2417,6 +2536,17 @@ thread_worker_park:
 	int $0x80
 	jmp thread_worker_spin
 
+thread_worker_touch_page:
+	movq $0, 8*403(%rbx)
+	mov 8*404(%rbx), %rcx
+	mov (%rcx), %rax
+	movl $1, 8*434(%rbx)
+	lea 8*434(%rbx), %rdi
+	movl $1, %esi
+	movabs $22, %rax
+	int $0x80
+	jmp thread_worker_spin
+
 process_child_entry:
 	mov %rdi, %rbx
 	mov %rsi, %rcx
@@ -2429,7 +2559,25 @@ process_child_entry:
 	movabs $22, %rax
 	int $0x80
 process_child_spin:
+	mov 0xc(%rbx), %eax
+	test %eax, %eax
+	jz process_child_spin_pause
+	cmp $1, %eax
+	je process_child_touch_shared_fault_page
+	movl $0, 0xc(%rbx)
+process_child_spin_pause:
 	pause
+	jmp process_child_spin
+
+process_child_touch_shared_fault_page:
+	movl $0, 0xc(%rbx)
+	movabs $0x000000010000c000, %rdx
+	mov (%rdx), %rax
+	movl $1, 0x10(%rbx)
+	lea 0x10(%rbx), %rdi
+	movl $1, %esi
+	movabs $22, %rax
+	int $0x80
 	jmp process_child_spin
 
 axle_user_prog_end:

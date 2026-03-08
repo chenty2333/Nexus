@@ -71,6 +71,10 @@ external VM model.
   the saved fault context once the leader completes. User-pointer prefault paths
   still use the simpler spin-and-retry fallback because they run inside an
   in-flight syscall body rather than a restartable trap exit.
+- Bootstrap fault-contention coverage now uses a test-only one-shot
+  leader-pause hook so the single-current-thread bootstrap scheduler can force
+  both local `(address_space, page)` contention and shared
+  `(global_vmo_id, page_offset)` contention deterministically.
 - Fault contention telemetry is now exported through the bootstrap shared
   summary slots. The kernel records leader/wait claims, spin loops, retries,
   commit outcomes, and prepare counts for `COW`, `LazyAnon`, and `LazyVmo`
