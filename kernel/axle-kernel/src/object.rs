@@ -27,11 +27,11 @@ use axle_types::vm::{
     ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE, ZX_VM_COMPACT, ZX_VM_OFFSET_IS_UPPER_LIMIT,
     ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
 };
+use axle_types::zx_signals_t;
 use axle_types::{
     zx_clock_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t, zx_status_t,
     zx_vaddr_t,
 };
-use axle_types::zx_signals_t;
 use core::mem::size_of;
 use spin::Mutex;
 
@@ -674,10 +674,7 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
         let port = state.with_kernel_mut(|kernel| {
             KernelPort::new(kernel, PORT_CAPACITY, PORT_KERNEL_RESERVE)
         })?;
-        state.objects.insert(
-            object_id,
-            KernelObject::Port(port),
-        );
+        state.objects.insert(object_id, KernelObject::Port(port));
 
         match state.alloc_handle_for_object(object_id, port_default_rights()) {
             Ok(h) => Ok(h),
@@ -1344,6 +1341,54 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
                 Err(e)
             }
         }
+    })
+}
+
+/// Read bytes from one VMO into a kernel-owned buffer.
+pub fn vmo_read(handle: zx_handle_t, offset: u64, len: usize) -> Result<Vec<u8>, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let vmo = match state.objects.get(&resolved.object_id()) {
+            Some(KernelObject::Vmo(vmo)) => *vmo,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        require_handle_rights(resolved, crate::task::HandleRights::READ)?;
+        state.with_vm_mut(|vm| vm.read_vmo_bytes(vmo.global_vmo_id, offset, len))
+    })
+}
+
+/// Write bytes into one VMO from a kernel-owned buffer.
+pub fn vmo_write(handle: zx_handle_t, offset: u64, bytes: &[u8]) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let vmo = match state.objects.get(&resolved.object_id()) {
+            Some(KernelObject::Vmo(vmo)) => *vmo,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
+        state.with_vm_mut(|vm| vm.write_vmo_bytes(vmo.global_vmo_id, offset, bytes))
+    })
+}
+
+/// Resize one VMO.
+pub fn vmo_set_size(handle: zx_handle_t, size: u64) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let object_id = resolved.object_id();
+        let vmo = match state.objects.get(&object_id) {
+            Some(KernelObject::Vmo(vmo)) => *vmo,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
+        state.with_vm_mut(|vm| vm.set_vmo_size(vmo.global_vmo_id, size))?;
+        let Some(KernelObject::Vmo(vmo)) = state.objects.get_mut(&object_id) else {
+            return Err(ZX_ERR_BAD_STATE);
+        };
+        vmo.size_bytes = size;
+        Ok(())
     })
 }
 

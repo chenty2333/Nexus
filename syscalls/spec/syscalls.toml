@@ -388,3 +388,37 @@ args = [
   { name = "handle", ty = "zx_handle_t" },
   { name = "out_token", ty = "*mut zx_handle_t" },
 ]
+
+[[syscall]]
+name = "vmo_read"
+nr = 33
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+  { name = "buffer", ty = "*mut u8" },
+  { name = "offset", ty = "u64" },
+  { name = "buffer_size", ty = "usize" },
+]
+
+[[syscall]]
+name = "vmo_write"
+nr = 34
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+  { name = "buffer", ty = "*const u8" },
+  { name = "offset", ty = "u64" },
+  { name = "buffer_size", ty = "usize" },
+]
+
+[[syscall]]
+name = "vmo_set_size"
+nr = 35
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+  { name = "size", ty = "u64" },
+]

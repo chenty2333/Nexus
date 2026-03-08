@@ -16,7 +16,7 @@ fuzz_target!(|data: &[u8]| {
     let mut vmars: [Option<VmarId>; 8] = [None; 8];
 
     for chunk in data.chunks(8) {
-        match chunk.first().copied().unwrap_or(0) % 13 {
+        match chunk.first().copied().unwrap_or(0) % 14 {
             0 => {
                 let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmos.len() as u8);
                 let pages = u64::from((chunk.get(2).copied().unwrap_or(0) % 4) + 1);
@@ -175,6 +175,14 @@ fuzz_target!(|data: &[u8]| {
                     ROOT_BASE + (page_index * PAGE_SIZE),
                     frame_id,
                 );
+            }
+            12 => {
+                let slot = usize::from(chunk.get(1).copied().unwrap_or(0) % vmos.len() as u8);
+                let Some(vmo_id) = vmos[slot] else {
+                    continue;
+                };
+                let pages = u64::from((chunk.get(2).copied().unwrap_or(0) % 4) + 1);
+                let _ = space.resize_vmo(vmo_id, pages * PAGE_SIZE);
             }
             _ => {
                 let frame_addr = 0x2000_0000 + (u64::from(chunk.get(1).copied().unwrap_or(0)) * PAGE_SIZE);

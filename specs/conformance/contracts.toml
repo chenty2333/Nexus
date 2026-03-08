@@ -199,3 +199,8 @@ description = "An infinite wait_one on a timer should block through trap-exit an
 id = "should.vm.same_page_fault_contention_bootstrap"
 level = "should"
 description = "Bootstrap same-page faults should serialize so only one leader materializes the page while local and shared contenders block and resume"
+
+[[contracts]]
+id = "should.vmo.read_write_resize_bootstrap"
+level = "should"
+description = "Bootstrap VMO syscalls should support basic read/write, page-aligned grow/shrink, and reject shrinking a mapped tail or writing beyond the resized end"

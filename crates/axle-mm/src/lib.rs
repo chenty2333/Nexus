@@ -628,6 +628,54 @@ pub enum VmoKind {
     Contiguous,
 }
 
+impl VmoKind {
+    /// Whether kernel byte-oriented `read` / `write` operations are allowed.
+    pub const fn supports_kernel_read_write(self) -> bool {
+        matches!(self, Self::Anonymous | Self::Contiguous)
+    }
+
+    /// Whether the VMO can change size after creation.
+    pub const fn supports_resize(self) -> bool {
+        matches!(self, Self::Anonymous)
+    }
+
+    /// Whether mappings of this VMO may be armed for copy-on-write.
+    pub const fn supports_copy_on_write(self) -> bool {
+        matches!(self, Self::Anonymous)
+    }
+
+    /// Whether mappings of this VMO may participate in page-loan transfer.
+    pub const fn supports_page_loan(self) -> bool {
+        matches!(self, Self::Anonymous)
+    }
+
+    /// Whether mappings of this VMO require a resident frame before mapping/faulting.
+    pub const fn requires_resident_frames(self) -> bool {
+        matches!(self, Self::Physical | Self::Contiguous)
+    }
+
+    const fn fault_policy_for_create(self) -> VmoFaultPolicy {
+        match self {
+            Self::Anonymous => VmoFaultPolicy::LocalAnonymous,
+            Self::Physical | Self::Contiguous => VmoFaultPolicy::NonDemandPaged,
+        }
+    }
+
+    const fn fault_policy_for_import(self) -> VmoFaultPolicy {
+        match self {
+            Self::Anonymous => VmoFaultPolicy::GlobalBacked,
+            Self::Physical | Self::Contiguous => VmoFaultPolicy::NonDemandPaged,
+        }
+    }
+
+    const fn resident_pte_tag(self) -> PteMetaTag {
+        match self {
+            Self::Anonymous => PteMetaTag::Present,
+            Self::Physical | Self::Contiguous => PteMetaTag::Phys,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VmoFaultPolicy {
     LocalAnonymous,
@@ -687,7 +735,7 @@ impl Vmo {
     }
 
     fn supports_copy_on_write(&self) -> bool {
-        matches!(self.kind, VmoKind::Anonymous)
+        self.kind.supports_copy_on_write()
     }
 }
 
@@ -1777,6 +1825,60 @@ impl AddressSpace {
     /// Return the local VMO id for one kernel-global identity.
     pub fn vmo_id_by_global_id(&self, global_id: GlobalVmoId) -> Option<VmoId> {
         self.vmo_by_global_id(global_id).map(|vmo| vmo.id())
+    }
+
+    /// Validate whether one tracked VMO can be resized to `new_size_bytes`.
+    pub fn validate_vmo_resize(
+        &self,
+        vmo_id: VmoId,
+        new_size_bytes: u64,
+    ) -> Result<(), AddressSpaceError> {
+        if new_size_bytes == 0 || !is_page_aligned(new_size_bytes) {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+
+        let vmo = self.vmo(vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        if new_size_bytes >= vmo.size_bytes() {
+            return Ok(());
+        }
+
+        for vma in self.vmas.iter().filter(|vma| vma.vmo_id == vmo_id) {
+            let Some(mapped_end) = vma.vmo_offset.checked_add(vma.len) else {
+                return Err(AddressSpaceError::InvalidArgs);
+            };
+            if mapped_end > new_size_bytes {
+                return Err(AddressSpaceError::Busy);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resize one tracked VMO and return resident frames dropped from the truncated tail.
+    pub fn resize_vmo(
+        &mut self,
+        vmo_id: VmoId,
+        new_size_bytes: u64,
+    ) -> Result<Vec<FrameId>, AddressSpaceError> {
+        self.validate_vmo_resize(vmo_id, new_size_bytes)?;
+
+        let new_page_count = usize::try_from(new_size_bytes / PAGE_SIZE)
+            .map_err(|_| AddressSpaceError::InvalidArgs)?;
+        let vmo = self
+            .vmos
+            .iter_mut()
+            .find(|candidate| candidate.id == vmo_id)
+            .ok_or(AddressSpaceError::InvalidVmo)?;
+        let mut dropped = Vec::new();
+        if new_page_count < vmo.frames.len() {
+            dropped.extend(vmo.frames[new_page_count..].iter().flatten().copied());
+        }
+        vmo.size_bytes = new_size_bytes;
+        vmo.frames.truncate(new_page_count);
+        if new_page_count > vmo.frames.len() {
+            vmo.frames.resize(new_page_count, None);
+        }
+        Ok(dropped)
     }
 
     /// Import one kernel-global VMO description into this address space, or reuse an existing alias.
@@ -3309,22 +3411,16 @@ fn ranges_overlap(left_base: u64, left_len: u64, right_base: u64, right_len: u64
 }
 
 const fn vmo_fault_policy_for_create(kind: VmoKind) -> VmoFaultPolicy {
-    match kind {
-        VmoKind::Anonymous => VmoFaultPolicy::LocalAnonymous,
-        VmoKind::Physical | VmoKind::Contiguous => VmoFaultPolicy::NonDemandPaged,
-    }
+    kind.fault_policy_for_create()
 }
 
-const fn vmo_fault_policy_for_import(_kind: VmoKind) -> VmoFaultPolicy {
-    VmoFaultPolicy::GlobalBacked
+const fn vmo_fault_policy_for_import(kind: VmoKind) -> VmoFaultPolicy {
+    kind.fault_policy_for_import()
 }
 
 fn pte_meta_tag_for_vmo(vmo: &Vmo, frame_id: Option<FrameId>) -> PteMetaTag {
     match frame_id {
-        Some(_) if matches!(vmo.kind(), VmoKind::Physical | VmoKind::Contiguous) => {
-            PteMetaTag::Phys
-        }
-        Some(_) => PteMetaTag::Present,
+        Some(_) => vmo.kind().resident_pte_tag(),
         None => vmo.missing_page_tag(),
     }
 }
@@ -4178,6 +4274,47 @@ mod tests {
     }
 
     #[test]
+    fn vmo_kind_policy_matrix_matches_contract() {
+        assert!(VmoKind::Anonymous.supports_kernel_read_write());
+        assert!(VmoKind::Anonymous.supports_resize());
+        assert!(VmoKind::Anonymous.supports_copy_on_write());
+        assert!(VmoKind::Anonymous.supports_page_loan());
+        assert!(!VmoKind::Anonymous.requires_resident_frames());
+
+        assert!(!VmoKind::Physical.supports_kernel_read_write());
+        assert!(!VmoKind::Physical.supports_resize());
+        assert!(!VmoKind::Physical.supports_copy_on_write());
+        assert!(!VmoKind::Physical.supports_page_loan());
+        assert!(VmoKind::Physical.requires_resident_frames());
+
+        assert!(VmoKind::Contiguous.supports_kernel_read_write());
+        assert!(!VmoKind::Contiguous.supports_resize());
+        assert!(!VmoKind::Contiguous.supports_copy_on_write());
+        assert!(!VmoKind::Contiguous.supports_page_loan());
+        assert!(VmoKind::Contiguous.requires_resident_frames());
+    }
+
+    #[test]
+    fn imported_non_demand_vmos_keep_reserved_fault_policy() {
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let physical = space
+            .import_vmo(VmoKind::Physical, PAGE_SIZE, global_vmo_id(129))
+            .unwrap();
+        let contiguous = space
+            .import_vmo(VmoKind::Contiguous, PAGE_SIZE, global_vmo_id(130))
+            .unwrap();
+
+        assert_eq!(
+            space.vmo(physical).unwrap().missing_page_tag(),
+            PteMetaTag::Reserved
+        );
+        assert_eq!(
+            space.vmo(contiguous).unwrap().missing_page_tag(),
+            PteMetaTag::Reserved
+        );
+    }
+
+    #[test]
     fn mark_copy_on_write_rejects_non_copyable_vmos() {
         let mut frames = FrameTable::new();
         let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
@@ -4233,6 +4370,134 @@ mod tests {
             space.pte_meta(ROOT_BASE + PAGE_SIZE).unwrap().tag(),
             PteMetaTag::Phys
         );
+    }
+
+    #[test]
+    fn resident_non_demand_mappings_allow_protect() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let physical = space
+            .create_vmo(VmoKind::Physical, PAGE_SIZE, global_vmo_id(131))
+            .unwrap();
+        let contiguous = space
+            .create_vmo(VmoKind::Contiguous, PAGE_SIZE, global_vmo_id(132))
+            .unwrap();
+        let phys_frame = frames.register_existing(0x90_4000).unwrap();
+        let contig_frame = frames.register_existing(0x90_5000).unwrap();
+        space.bind_vmo_frame(physical, 0, phys_frame).unwrap();
+        space.bind_vmo_frame(contiguous, 0, contig_frame).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                physical,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE + PAGE_SIZE,
+                PAGE_SIZE,
+                contiguous,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        space
+            .protect(
+                ROOT_BASE,
+                PAGE_SIZE,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+        space
+            .protect(
+                ROOT_BASE + PAGE_SIZE,
+                PAGE_SIZE,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+
+        let physical_meta = space.pte_meta(ROOT_BASE).unwrap();
+        let contiguous_meta = space.pte_meta(ROOT_BASE + PAGE_SIZE).unwrap();
+        assert_eq!(physical_meta.tag(), PteMetaTag::Phys);
+        assert_eq!(contiguous_meta.tag(), PteMetaTag::Phys);
+        assert!(!physical_meta.logical_write());
+        assert!(!contiguous_meta.logical_write());
+    }
+
+    #[test]
+    fn resize_vmo_grow_preserves_existing_frames() {
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(126))
+            .unwrap();
+        let frame = FrameId(0x90_4000);
+        space.bind_vmo_frame(vmo, 0, frame).unwrap();
+
+        let dropped = space.resize_vmo(vmo, PAGE_SIZE * 2).unwrap();
+
+        assert!(dropped.is_empty());
+        let vmo = space.vmo(vmo).unwrap();
+        assert_eq!(vmo.size_bytes(), PAGE_SIZE * 2);
+        assert_eq!(vmo.frame_at_offset(0), Some(frame));
+        assert_eq!(vmo.frame_at_offset(PAGE_SIZE), None);
+    }
+
+    #[test]
+    fn resize_vmo_rejects_truncating_live_mapping_tail() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE * 2, global_vmo_id(127))
+            .unwrap();
+
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE * 2,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+
+        assert_eq!(
+            space.validate_vmo_resize(vmo, PAGE_SIZE),
+            Err(AddressSpaceError::Busy)
+        );
+        assert_eq!(
+            space.resize_vmo(vmo, PAGE_SIZE),
+            Err(AddressSpaceError::Busy)
+        );
+    }
+
+    #[test]
+    fn resize_vmo_shrink_returns_truncated_tail_frames() {
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE * 2, global_vmo_id(128))
+            .unwrap();
+        let keep = FrameId(0x90_5000);
+        let drop = FrameId(0x90_6000);
+        space.bind_vmo_frame(vmo, 0, keep).unwrap();
+        space.bind_vmo_frame(vmo, PAGE_SIZE, drop).unwrap();
+
+        let dropped = space.resize_vmo(vmo, PAGE_SIZE).unwrap();
+
+        assert_eq!(dropped, vec![drop]);
+        let vmo = space.vmo(vmo).unwrap();
+        assert_eq!(vmo.size_bytes(), PAGE_SIZE);
+        assert_eq!(vmo.frame_at_offset(0), Some(keep));
+        assert_eq!(vmo.frame_at_offset(PAGE_SIZE), None);
     }
 
     #[test]
@@ -4387,7 +4652,10 @@ mod tests {
         let mut frames = FrameTable::new();
         let frame = frames.register_existing(0x20_000).unwrap();
         frames.pin(frame).unwrap();
-        assert_eq!(frames.unregister_existing(frame), Err(FrameTableError::Busy));
+        assert_eq!(
+            frames.unregister_existing(frame),
+            Err(FrameTableError::Busy)
+        );
         frames.unpin(frame).unwrap();
         frames.unregister_existing(frame).unwrap();
         assert!(!frames.contains(frame));

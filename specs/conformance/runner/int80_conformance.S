@@ -342,6 +342,131 @@ mov %rax, (%rsp)
 	add $8, %rsp
 	mov %rax, 8*76(%rbx)
 
+	// vmo_create(vmo read/write/resize target, 0x1000)
+	lea 0x1e20(%rbx), %rdx
+	movabs $0x1000, %rdi
+	xorl %esi, %esi
+	movabs $9, %rax
+	int $0x80
+	mov %rax, 8*446(%rbx)
+
+	// prepare write buffer
+	movabs $0x8877665544332211, %rax
+	mov %rax, 0x1e40(%rbx)
+	movabs $0x0fedcba987654321, %rax
+	mov %rax, 0x1e48(%rbx)
+
+	// vmo_write(handle, write_buf, 0x100, 16)
+	mov 0x1e20(%rbx), %rdi
+	lea 0x1e40(%rbx), %rsi
+	movabs $0x100, %rdx
+	movabs $16, %r10
+	movabs $34, %rax
+	int $0x80
+	mov %rax, 8*447(%rbx)
+
+	// vmo_read(handle, read_buf, 0x100, 16)
+	movq $0, 0x1e60(%rbx)
+	movq $0, 0x1e68(%rbx)
+	mov 0x1e20(%rbx), %rdi
+	lea 0x1e60(%rbx), %rsi
+	movabs $0x100, %rdx
+	movabs $16, %r10
+	movabs $33, %rax
+	int $0x80
+	mov %rax, 8*448(%rbx)
+	movq $0, 8*449(%rbx)
+	lea 0x1e40(%rbx), %rsi
+	lea 0x1e60(%rbx), %rdi
+	mov $2, %rcx
+1:
+	mov (%rsi), %r8
+	mov (%rdi), %r9
+	cmp %r8, %r9
+	jne vmo_read_match_done
+	add $8, %rsi
+	add $8, %rdi
+	loop 1b
+	movq $1, 8*449(%rbx)
+vmo_read_match_done:
+
+	// vmo_set_size(grow to 0x2000)
+	mov 0x1e20(%rbx), %rdi
+	movabs $0x2000, %rsi
+	movabs $35, %rax
+	int $0x80
+	mov %rax, 8*450(%rbx)
+
+	// vmar_map(grown VMO @ USER_CODE_VA + 0x17000, len=0x2000)
+	mov 8*62(%rbx), %rdi
+	movl $0x403, %esi
+	movabs $0x17000, %rdx
+	mov 0x1e20(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x2000, %r9
+	lea 0x1e80(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*451(%rbx)
+
+	// vmo_write(second page after grow)
+	mov 0x1e20(%rbx), %rdi
+	lea 0x1e40(%rbx), %rsi
+	movabs $0x1000, %rdx
+	movabs $16, %r10
+	movabs $34, %rax
+	int $0x80
+	movq $0, 8*452(%rbx)
+	test %rax, %rax
+	jne vmo_set_size_map_match_done
+	movabs $0x0000000100017000, %r13
+	add $0x1000, %r13
+	lea 0x1e40(%rbx), %rsi
+	mov $2, %rcx
+2:
+	mov (%rsi), %r8
+	mov (%r13), %r9
+	cmp %r8, %r9
+	jne vmo_set_size_map_match_done
+	add $8, %rsi
+	add $8, %r13
+	loop 2b
+	movq $1, 8*452(%rbx)
+vmo_set_size_map_match_done:
+
+	// vmo_set_size(shrink while mapped) -> BAD_STATE
+	mov 0x1e20(%rbx), %rdi
+	movabs $0x1000, %rsi
+	movabs $35, %rax
+	int $0x80
+	mov %rax, 8*453(%rbx)
+
+	// vmar_unmap(grown VMO range)
+	mov 8*62(%rbx), %rdi
+	movabs $0x0000000100017000, %rsi
+	movabs $0x2000, %rdx
+	movabs $11, %rax
+	int $0x80
+
+	// vmo_set_size(shrink to 0x1000) -> OK
+	mov 0x1e20(%rbx), %rdi
+	movabs $0x1000, %rsi
+	movabs $35, %rax
+	int $0x80
+	mov %rax, 8*454(%rbx)
+
+	// vmo_write(offset == new end) -> OUT_OF_RANGE
+	mov 0x1e20(%rbx), %rdi
+	lea 0x1e40(%rbx), %rsi
+	movabs $0x1000, %rdx
+	movabs $16, %r10
+	movabs $34, %rax
+	int $0x80
+	mov %rax, 8*455(%rbx)
+
 	// vmar_allocate(wrong type: parent=timer_h)
 	mov 0x1698(%rbx), %rdi
 	movl $0x5800, %esi

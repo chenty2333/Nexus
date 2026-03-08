@@ -28,7 +28,8 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_TASK_KILL, AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START,
     AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE,
     AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
-    AXLE_SYS_VMO_CREATE, SyscallNumber,
+    AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE,
+    SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -41,7 +42,7 @@ use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 33] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 36] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -75,6 +76,9 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 33] = [
     AXLE_SYS_TASK_SUSPEND,
     AXLE_SYS_VMAR_ALLOCATE,
     AXLE_SYS_VMAR_DESTROY,
+    AXLE_SYS_VMO_READ,
+    AXLE_SYS_VMO_WRITE,
+    AXLE_SYS_VMO_SET_SIZE,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -117,6 +121,9 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_TIMER_SET => sys_timer_set(args),
         AXLE_SYS_TIMER_CANCEL => sys_timer_cancel(args),
         AXLE_SYS_VMO_CREATE => sys_vmo_create(args),
+        AXLE_SYS_VMO_READ => sys_vmo_read(args),
+        AXLE_SYS_VMO_WRITE => sys_vmo_write(args),
+        AXLE_SYS_VMO_SET_SIZE => sys_vmo_set_size(args),
         AXLE_SYS_VMAR_ALLOCATE => sys_vmar_allocate(args),
         AXLE_SYS_VMAR_DESTROY => sys_vmar_destroy(args),
         AXLE_SYS_VMAR_MAP => ZX_ERR_NOT_SUPPORTED,
@@ -576,6 +583,62 @@ fn sys_vmo_create(args: [u64; 6]) -> zx_status_t {
         return e;
     }
     ZX_OK
+}
+
+fn sys_vmo_read(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let buffer = args[1] as *mut u8;
+    let offset = args[2];
+    let buffer_size = match usize::try_from(args[3]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_OUT_OF_RANGE,
+    };
+
+    let bytes = match crate::object::vmo_read(handle, offset, buffer_size) {
+        Ok(bytes) => bytes,
+        Err(e) => return e,
+    };
+    match copyout_bytes(buffer, &bytes) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_vmo_write(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let buffer = args[1] as *const u8;
+    let offset = args[2];
+    let buffer_size = match usize::try_from(args[3]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_OUT_OF_RANGE,
+    };
+
+    let bytes = match copyin_bytes(buffer, buffer_size) {
+        Ok(bytes) => bytes,
+        Err(e) => return e,
+    };
+    match crate::object::vmo_write(handle, offset, &bytes) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_vmo_set_size(args: [u64; 6]) -> zx_status_t {
+    let handle = match u32::try_from(args[0]) {
+        Ok(v) => v,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let size = args[1];
+    match crate::object::vmo_set_size(handle, size) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
 }
 
 fn sys_vmar_allocate(args: [u64; 6]) -> zx_status_t {

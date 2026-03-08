@@ -36,7 +36,7 @@ use axle_types::rights::{
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
     ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NO_RESOURCES, ZX_ERR_NOT_FOUND,
-    ZX_ERR_OUT_OF_RANGE, ZX_ERR_SHOULD_WAIT, ZX_OK,
+    ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_ERR_SHOULD_WAIT, ZX_OK,
 };
 use axle_types::{
     zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t,
@@ -695,9 +695,59 @@ impl KernelVmoBacking {
 
 #[derive(Clone, Debug)]
 struct GlobalVmo {
-    kind: VmoKind,
     size_bytes: u64,
-    frames: Vec<Option<FrameId>>,
+    source: VmoBackingSource,
+}
+
+#[derive(Clone, Debug)]
+enum VmoBackingSource {
+    Anonymous { frames: Vec<Option<FrameId>> },
+    Physical { frames: Vec<Option<FrameId>> },
+    Contiguous { frames: Vec<Option<FrameId>> },
+    PagerStub { page_count: usize },
+}
+
+impl VmoBackingSource {
+    fn from_kind(kind: VmoKind, page_count: usize) -> Self {
+        match kind {
+            VmoKind::Anonymous => Self::Anonymous {
+                frames: alloc::vec![None; page_count],
+            },
+            VmoKind::Physical => Self::Physical {
+                frames: alloc::vec![None; page_count],
+            },
+            VmoKind::Contiguous => Self::Contiguous {
+                frames: alloc::vec![None; page_count],
+            },
+        }
+    }
+
+    fn kind(&self) -> VmoKind {
+        match self {
+            Self::Anonymous { .. } => VmoKind::Anonymous,
+            Self::Physical { .. } => VmoKind::Physical,
+            Self::Contiguous { .. } => VmoKind::Contiguous,
+            Self::PagerStub { .. } => VmoKind::Anonymous,
+        }
+    }
+
+    fn frames(&self) -> &[Option<FrameId>] {
+        match self {
+            Self::Anonymous { frames }
+            | Self::Physical { frames }
+            | Self::Contiguous { frames } => frames,
+            Self::PagerStub { .. } => &[],
+        }
+    }
+
+    fn frames_mut(&mut self) -> Option<&mut Vec<Option<FrameId>>> {
+        match self {
+            Self::Anonymous { frames }
+            | Self::Physical { frames }
+            | Self::Contiguous { frames } => Some(frames),
+            Self::PagerStub { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -706,15 +756,27 @@ struct GlobalVmoStore {
 }
 
 impl GlobalVmoStore {
+    fn page_count_for_size(size_bytes: u64) -> Result<usize, zx_status_t> {
+        if size_bytes == 0 || (size_bytes & (crate::userspace::USER_PAGE_BYTES - 1)) != 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        usize::try_from(size_bytes / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)
+    }
+
     fn register_snapshot(&mut self, global_vmo_id: KernelVmoId, snapshot: &Vmo) {
         self.entries.insert(
             global_vmo_id,
             GlobalVmo {
-                kind: snapshot.kind(),
                 size_bytes: snapshot.size_bytes(),
-                frames: snapshot.frames().to_vec(),
+                source: VmoBackingSource::from_kind(snapshot.kind(), snapshot.frames().len()),
             },
         );
+        if let Some(global_vmo) = self.entries.get_mut(&global_vmo_id) {
+            if let Some(frames) = global_vmo.source.frames_mut() {
+                *frames = snapshot.frames().to_vec();
+            }
+        }
     }
 
     fn register_empty(
@@ -726,14 +788,12 @@ impl GlobalVmoStore {
         if self.entries.contains_key(&global_vmo_id) {
             return Err(ZX_ERR_ALREADY_EXISTS);
         }
-        let page_count = usize::try_from(size_bytes / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let page_count = Self::page_count_for_size(size_bytes)?;
         self.entries.insert(
             global_vmo_id,
             GlobalVmo {
-                kind,
                 size_bytes,
-                frames: alloc::vec![None; page_count],
+                source: VmoBackingSource::from_kind(kind, page_count),
             },
         );
         Ok(())
@@ -750,6 +810,29 @@ impl GlobalVmoStore {
             .ok_or(ZX_ERR_BAD_HANDLE)
     }
 
+    fn resize(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        new_size_bytes: u64,
+    ) -> Result<Vec<FrameId>, zx_status_t> {
+        let new_page_count = Self::page_count_for_size(new_size_bytes)?;
+        let global_vmo = self
+            .entries
+            .get_mut(&global_vmo_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        let mut dropped = Vec::new();
+        let frames = global_vmo.source.frames_mut().ok_or(ZX_ERR_NOT_SUPPORTED)?;
+        if new_page_count < frames.len() {
+            dropped.extend(frames[new_page_count..].iter().flatten().copied());
+        }
+        global_vmo.size_bytes = new_size_bytes;
+        frames.truncate(new_page_count);
+        if new_page_count > frames.len() {
+            frames.resize(new_page_count, None);
+        }
+        Ok(dropped)
+    }
+
     fn frame(
         &self,
         global_vmo_id: KernelVmoId,
@@ -761,7 +844,12 @@ impl GlobalVmoStore {
         }
         let page_index = usize::try_from(offset / crate::userspace::USER_PAGE_BYTES)
             .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        Ok(global_vmo.frames.get(page_index).copied().flatten())
+        Ok(global_vmo
+            .source
+            .frames()
+            .get(page_index)
+            .copied()
+            .flatten())
     }
 
     fn update_frame(
@@ -779,10 +867,8 @@ impl GlobalVmoStore {
         }
         let page_index = usize::try_from(offset / crate::userspace::USER_PAGE_BYTES)
             .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        let slot = global_vmo
-            .frames
-            .get_mut(page_index)
-            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let frames = global_vmo.source.frames_mut().ok_or(ZX_ERR_NOT_SUPPORTED)?;
+        let slot = frames.get_mut(page_index).ok_or(ZX_ERR_OUT_OF_RANGE)?;
         *slot = Some(frame_id);
         Ok(())
     }
@@ -1348,6 +1434,28 @@ impl AddressSpace {
 
     fn local_vmo_id(&self, global_vmo_id: KernelVmoId) -> Option<VmoId> {
         self.vm.vmo_id_by_global_id(global_vmo_id)
+    }
+
+    fn validate_vmo_resize(
+        &self,
+        global_vmo_id: KernelVmoId,
+        new_size: u64,
+    ) -> Result<(), AddressSpaceError> {
+        let Some(vmo_id) = self.local_vmo_id(global_vmo_id) else {
+            return Ok(());
+        };
+        self.vm.validate_vmo_resize(vmo_id, new_size)
+    }
+
+    fn resize_vmo(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        new_size: u64,
+    ) -> Result<Vec<FrameId>, AddressSpaceError> {
+        let Some(vmo_id) = self.local_vmo_id(global_vmo_id) else {
+            return Ok(Vec::new());
+        };
+        self.vm.resize_vmo(vmo_id, new_size)
     }
 
     fn set_vmo_frame(
@@ -2125,9 +2233,11 @@ impl Kernel {
                     | axle_mm::FrameTableError::MissingAnchor
                     | axle_mm::FrameTableError::Busy => ZX_ERR_BAD_STATE,
                 })?;
-                if let Err(status) =
-                    global_vmos.update_frame(global_vmo_id, (page_index as u64) * page_size, frame_id)
-                {
+                if let Err(status) = global_vmos.update_frame(
+                    global_vmo_id,
+                    (page_index as u64) * page_size,
+                    frame_id,
+                ) {
                     let _ = frames.unregister_existing(frame_id);
                     return Err(status);
                 }
@@ -3897,9 +4007,13 @@ impl VmDomain {
             .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         let local_vmo_id = address_space
-            .import_vmo_alias(global_vmo.kind, global_vmo.size_bytes, global_vmo_id)
+            .import_vmo_alias(
+                global_vmo.source.kind(),
+                global_vmo.size_bytes,
+                global_vmo_id,
+            )
             .map_err(map_address_space_error)?;
-        for (page_index, frame_id) in global_vmo.frames.iter().copied().enumerate() {
+        for (page_index, frame_id) in global_vmo.source.frames().iter().copied().enumerate() {
             let Some(frame_id) = frame_id else {
                 continue;
             };
@@ -4156,6 +4270,175 @@ impl VmDomain {
         })
     }
 
+    pub(crate) fn read_vmo_bytes(
+        &self,
+        global_vmo_id: KernelVmoId,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, zx_status_t> {
+        let snapshot = self.global_vmos.lock().snapshot(global_vmo_id)?;
+        if !snapshot.source.kind().supports_kernel_read_write() {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        validate_vmo_io_range(snapshot.size_bytes, offset, len)?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
+        out.resize(len, 0);
+
+        let page_bytes = crate::userspace::USER_PAGE_BYTES as usize;
+        let mut copied = 0usize;
+        while copied < len {
+            let absolute = offset
+                .checked_add(copied as u64)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let page_index = usize::try_from(absolute / crate::userspace::USER_PAGE_BYTES)
+                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+            let page_byte_offset = usize::try_from(absolute % crate::userspace::USER_PAGE_BYTES)
+                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+            let chunk_len = core::cmp::min(page_bytes - page_byte_offset, len - copied);
+            let dst = &mut out[copied..copied + chunk_len];
+            match snapshot.source.frames().get(page_index).copied().flatten() {
+                Some(frame_id) => {
+                    crate::userspace::read_bootstrap_bytes(frame_id.raw(), page_byte_offset, dst)
+                        .ok_or(ZX_ERR_BAD_STATE)?;
+                }
+                None if snapshot.source.kind() == VmoKind::Anonymous => {
+                    dst.fill(0);
+                }
+                None => return Err(ZX_ERR_BAD_STATE),
+            }
+            copied += chunk_len;
+        }
+
+        Ok(out)
+    }
+
+    pub(crate) fn write_vmo_bytes(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), zx_status_t> {
+        let snapshot = self.global_vmos.lock().snapshot(global_vmo_id)?;
+        if !snapshot.source.kind().supports_kernel_read_write() {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        validate_vmo_io_range(snapshot.size_bytes, offset, bytes.len())?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let page_bytes = crate::userspace::USER_PAGE_BYTES as usize;
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let absolute = offset
+                .checked_add(written as u64)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let page_offset = absolute
+                .checked_sub(absolute % crate::userspace::USER_PAGE_BYTES)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let page_byte_offset = usize::try_from(absolute % crate::userspace::USER_PAGE_BYTES)
+                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+            let chunk_len = core::cmp::min(page_bytes - page_byte_offset, bytes.len() - written);
+            let frame_id = match self.global_vmo_frame(global_vmo_id, page_offset)? {
+                Some(frame_id) => frame_id,
+                None => match snapshot.source.kind() {
+                    VmoKind::Anonymous => {
+                        let mut prepared = PreparedFaultWork::NewPage {
+                            paddr: crate::userspace::alloc_bootstrap_zeroed_page()
+                                .ok_or(ZX_ERR_NO_MEMORY)?,
+                        };
+                        let frame_id = self.ensure_global_vmo_frame(
+                            global_vmo_id,
+                            page_offset,
+                            &mut prepared,
+                        )?;
+                        prepared.release_unused();
+                        frame_id
+                    }
+                    VmoKind::Physical | VmoKind::Contiguous => return Err(ZX_ERR_BAD_STATE),
+                },
+            };
+            crate::userspace::write_bootstrap_bytes(
+                frame_id.raw(),
+                page_byte_offset,
+                &bytes[written..written + chunk_len],
+            )
+            .ok_or(ZX_ERR_BAD_STATE)?;
+            written += chunk_len;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn set_vmo_size(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        new_size: u64,
+    ) -> Result<u64, zx_status_t> {
+        if new_size == 0 || (new_size & (crate::userspace::USER_PAGE_BYTES - 1)) != 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        let snapshot = self.global_vmos.lock().snapshot(global_vmo_id)?;
+        if !snapshot.source.kind().supports_resize() {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        if new_size == snapshot.size_bytes {
+            return Ok(new_size);
+        }
+
+        for address_space in self.address_spaces.values() {
+            address_space
+                .validate_vmo_resize(global_vmo_id, new_size)
+                .map_err(map_address_space_error)?;
+        }
+
+        let dropped = if new_size < snapshot.size_bytes {
+            let new_page_count = usize::try_from(new_size / crate::userspace::USER_PAGE_BYTES)
+                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+            snapshot.source.frames()[new_page_count..]
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for frame_id in &dropped {
+            let state = self
+                .with_frames(|frames| frames.state(*frame_id))
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            if state.ref_count() != 0
+                || state.map_count() != 0
+                || state.pin_count() != 0
+                || state.loan_count() != 0
+            {
+                return Err(ZX_ERR_BAD_STATE);
+            }
+        }
+
+        let dropped = self.global_vmos.lock().resize(global_vmo_id, new_size)?;
+        for address_space in self.address_spaces.values_mut() {
+            let _ = address_space
+                .resize_vmo(global_vmo_id, new_size)
+                .map_err(map_address_space_error)?;
+        }
+        for frame_id in dropped {
+            self.with_frames_mut(|frames| {
+                frames
+                    .unregister_existing(frame_id)
+                    .map_err(|_| ZX_ERR_BAD_STATE)
+            })?;
+            crate::userspace::free_bootstrap_page(frame_id.raw());
+        }
+        Ok(new_size)
+    }
+
     pub(crate) fn allocate_subvmar(
         &mut self,
         address_space_id: AddressSpaceId,
@@ -4277,7 +4560,7 @@ impl VmDomain {
             return Ok(None);
         };
 
-        if lookup.vmo_kind() != VmoKind::Anonymous {
+        if !lookup.vmo_kind().supports_page_loan() {
             return Ok(None);
         }
 
@@ -5479,6 +5762,16 @@ fn map_alloc_error(err: CSpaceError) -> zx_status_t {
 
 fn map_lookup_error(_err: CSpaceError) -> zx_status_t {
     ZX_ERR_BAD_HANDLE
+}
+
+fn validate_vmo_io_range(size_bytes: u64, offset: u64, len: usize) -> Result<(), zx_status_t> {
+    let end = offset
+        .checked_add(u64::try_from(len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    if end > size_bytes {
+        return Err(ZX_ERR_OUT_OF_RANGE);
+    }
+    Ok(())
 }
 
 fn map_address_space_error(err: AddressSpaceError) -> zx_status_t {

@@ -90,6 +90,21 @@ external VM model.
   splitting.
 - `Physical` and `Contiguous` VMO mappings now have explicit non-COW boundaries:
   they must already be resident when mapped, and COW arming rejects them.
+- VMO object semantics have started to catch up with the fault path: bootstrap
+  `zx_vmo_read` / `zx_vmo_write` now operate on the shared global VMO backing,
+  anonymous writes materialize missing pages on demand, and
+  `zx_vmo_set_size` supports page-aligned grow/shrink for anonymous VMOs while
+  rejecting shrink across live mapped tails. `Physical` / `Contiguous` VMOs
+  remain non-demand-paged and reject resize. The kind-to-operation matrix is now
+  explicit: `Physical` rejects kernel byte I/O and page-loan, `Contiguous`
+  allows kernel byte I/O but still rejects resize/COW/loan, and imported
+  `Physical` / `Contiguous` aliases stay non-demand-paged instead of degrading
+  into `LazyVmo`.
+- The global VMO backing path now has a first backing-source split instead of
+  treating every VMO as just `{kind, frames[]}`: `Anonymous`, `Physical`,
+  `Contiguous`, and a stub `Pager` variant now live behind one internal
+  `VmoBackingSource` enum. This does not yet add pager-backed VMOs, but it gives
+  the next step a cleaner place to hang pager/file-backed policy.
 - VM resource governance has started to move under one accounting surface:
   private COW pages and in-flight channel loan pages now keep current/peak
   counters, quota-hit telemetry, and a bootstrap loan-page quota that returns

@@ -68,3 +68,9 @@ pub const AXLE_SYS_PROCESS_START: SyscallNumber = 30;
 pub const AXLE_SYS_TASK_KILL: SyscallNumber = 31;
 /// Contract: SHOULD
 pub const AXLE_SYS_TASK_SUSPEND: SyscallNumber = 32;
+/// Contract: SHOULD
+pub const AXLE_SYS_VMO_READ: SyscallNumber = 33;
+/// Contract: SHOULD
+pub const AXLE_SYS_VMO_WRITE: SyscallNumber = 34;
+/// Contract: SHOULD
+pub const AXLE_SYS_VMO_SET_SIZE: SyscallNumber = 35;
