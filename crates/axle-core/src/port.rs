@@ -451,7 +451,10 @@ impl<Q: PacketQueue> PortState<Q> {
         if self.q.len() < self.capacity {
             let pkt = Packet::signal(k.1, k.0, trigger, current, 1, timestamp);
             let queued = self.q.push_back(pkt);
-            debug_assert!(queued.is_ok(), "port queue overflow after capacity pre-check");
+            debug_assert!(
+                queued.is_ok(),
+                "port queue overflow after capacity pre-check"
+            );
             if queued.is_err() {
                 return;
             }
@@ -499,7 +502,10 @@ impl<Q: PacketQueue> PortState<Q> {
             // Enqueue pending packet to the back (preserves FIFO among already queued packets).
             let pkt = Packet::signal(k.1, k.0, p.trigger, p.observed, p.count, p.timestamp);
             let queued = self.q.push_back(pkt);
-            debug_assert!(queued.is_ok(), "port queue overflow while flushing pending packet");
+            debug_assert!(
+                queued.is_ok(),
+                "port queue overflow while flushing pending packet"
+            );
             if queued.is_err() {
                 self.pending_order.push_front(k);
                 break;

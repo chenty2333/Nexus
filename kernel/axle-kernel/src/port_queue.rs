@@ -52,8 +52,7 @@ impl KernelPortQueue {
             return Err(pkt);
         };
         let raw = port_packet_from_core(pkt);
-        crate::userspace::write_bootstrap_value(self.backing.base_paddr(), offset, &raw)
-            .ok_or(pkt)
+        crate::userspace::write_bootstrap_value(self.backing.base_paddr(), offset, &raw).ok_or(pkt)
     }
 
     fn read_slot(&self, slot: usize) -> Option<Packet> {
@@ -147,12 +146,7 @@ impl KernelPort {
         )
     }
 
-    pub(crate) fn on_signals_changed(
-        &mut self,
-        waitable: WaitableId,
-        current: Signals,
-        now: i64,
-    ) {
+    pub(crate) fn on_signals_changed(&mut self, waitable: WaitableId, current: Signals, now: i64) {
         self.state.on_signals_changed(waitable, current, now);
     }
 }
