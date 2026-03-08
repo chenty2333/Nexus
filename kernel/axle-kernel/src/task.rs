@@ -1906,6 +1906,7 @@ struct Thread {
 pub(crate) struct VmDomain {
     address_spaces: BTreeMap<AddressSpaceId, AddressSpace>,
     global_vmos: Arc<Mutex<GlobalVmoStore>>,
+    bootstrap_user_runner_global_vmo_id: Option<KernelVmoId>,
     #[allow(dead_code)]
     frames: Arc<Mutex<FrameTable>>,
     cow_fault_count: u64,
@@ -1988,6 +1989,7 @@ impl Kernel {
         let mut vm = VmDomain {
             address_spaces: BTreeMap::new(),
             global_vmos: Arc::new(Mutex::new(GlobalVmoStore::default())),
+            bootstrap_user_runner_global_vmo_id: None,
             frames: Arc::new(Mutex::new(FrameTable::new())),
             cow_fault_count: 0,
             vm_private_cow_pages_current: 0,
@@ -2018,6 +2020,16 @@ impl Kernel {
         for global_vmo_id in bootstrap_vmo_ids {
             vm.register_global_vmo_from_address_space(address_space_id, global_vmo_id)
                 .expect("bootstrap global vmo seeding must succeed");
+        }
+        if let Some(size_bytes) = crate::userspace::qemu_loader_user_runner_size() {
+            let global_vmo_id = vm.alloc_global_vmo_id();
+            vm.register_pager_file_global_vmo(
+                global_vmo_id,
+                size_bytes,
+                crate::userspace::read_qemu_loader_user_runner_at,
+            )
+            .expect("bootstrap runner pager vmo registration must succeed");
+            vm.bootstrap_user_runner_global_vmo_id = Some(global_vmo_id);
         }
 
         let vm = Arc::new(Mutex::new(vm));
@@ -4226,6 +4238,10 @@ impl VmDomain {
             .register_pager_file_source(global_vmo_id, size_bytes, read_at)
     }
 
+    pub(crate) fn bootstrap_user_runner_global_vmo_id(&self) -> Option<KernelVmoId> {
+        self.bootstrap_user_runner_global_vmo_id
+    }
+
     fn import_global_vmo_into_address_space(
         &mut self,
         address_space_id: AddressSpaceId,
@@ -4546,6 +4562,29 @@ impl VmDomain {
                     return Err(err);
                 }
             };
+        let vmo = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.vm.vmo(local_vmo_id))
+            .cloned()
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(CreatedVmo {
+            process_id,
+            address_space_id,
+            vmo,
+        })
+    }
+
+    pub(crate) fn import_bootstrap_user_runner_vmo_for_address_space(
+        &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+    ) -> Result<CreatedVmo, zx_status_t> {
+        let global_vmo_id = self
+            .bootstrap_user_runner_global_vmo_id
+            .ok_or(ZX_ERR_NOT_FOUND)?;
+        let local_vmo_id =
+            self.import_global_vmo_into_address_space(address_space_id, global_vmo_id)?;
         let vmo = self
             .address_spaces
             .get(&address_space_id)

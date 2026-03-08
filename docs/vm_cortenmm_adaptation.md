@@ -106,6 +106,10 @@ external VM model.
   `VmoBackingSource` enum. Pager-backed sources now hang off an internal
   `PagerSourceHandle` instead of a raw byte slice, so the current static-bytes
   source and a future file/pager source share one read/materialize interface.
+  The first real file-like source is now wired to the QEMU loader runner ELF:
+  bootstrap VM state seeds one internal pager-file VMO from that blob, ready to
+  be imported into an address space without first copying the whole image into
+  anonymous backing.
   The first pager-backed step remains read-only and internal-only: a
   pager-backed `LazyVmo` can fault in one page from its source, `zx_vmo_read`
   can read directly from that source without materializing every page first,
