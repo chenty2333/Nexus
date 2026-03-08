@@ -587,6 +587,94 @@ struct GlobalVmo {
     frames: Vec<Option<FrameId>>,
 }
 
+#[derive(Debug, Default)]
+struct GlobalVmoStore {
+    entries: BTreeMap<KernelVmoId, GlobalVmo>,
+}
+
+impl GlobalVmoStore {
+    fn register_snapshot(&mut self, global_vmo_id: KernelVmoId, snapshot: &Vmo) {
+        self.entries.insert(
+            global_vmo_id,
+            GlobalVmo {
+                kind: snapshot.kind(),
+                size_bytes: snapshot.size_bytes(),
+                frames: snapshot.frames().to_vec(),
+            },
+        );
+    }
+
+    fn register_empty(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        kind: VmoKind,
+        size_bytes: u64,
+    ) -> Result<(), zx_status_t> {
+        if self.entries.contains_key(&global_vmo_id) {
+            return Err(ZX_ERR_ALREADY_EXISTS);
+        }
+        let page_count = usize::try_from(size_bytes / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        self.entries.insert(
+            global_vmo_id,
+            GlobalVmo {
+                kind,
+                size_bytes,
+                frames: alloc::vec![None; page_count],
+            },
+        );
+        Ok(())
+    }
+
+    fn remove(&mut self, global_vmo_id: KernelVmoId) -> Option<GlobalVmo> {
+        self.entries.remove(&global_vmo_id)
+    }
+
+    fn snapshot(&self, global_vmo_id: KernelVmoId) -> Result<GlobalVmo, zx_status_t> {
+        self.entries
+            .get(&global_vmo_id)
+            .cloned()
+            .ok_or(ZX_ERR_BAD_HANDLE)
+    }
+
+    fn frame(
+        &self,
+        global_vmo_id: KernelVmoId,
+        offset: u64,
+    ) -> Result<Option<FrameId>, zx_status_t> {
+        let global_vmo = self.entries.get(&global_vmo_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        if offset & (crate::userspace::USER_PAGE_BYTES - 1) != 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let page_index = usize::try_from(offset / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        Ok(global_vmo.frames.get(page_index).copied().flatten())
+    }
+
+    fn update_frame(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        offset: u64,
+        frame_id: FrameId,
+    ) -> Result<(), zx_status_t> {
+        let global_vmo = self
+            .entries
+            .get_mut(&global_vmo_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        if offset & (crate::userspace::USER_PAGE_BYTES - 1) != 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let page_index = usize::try_from(offset / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let slot = global_vmo
+            .frames
+            .get_mut(page_index)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        *slot = Some(frame_id);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CreatedProcess {
     process_id: ProcessId,
@@ -1363,9 +1451,9 @@ struct Thread {
 #[derive(Debug)]
 pub(crate) struct VmDomain {
     address_spaces: BTreeMap<AddressSpaceId, AddressSpace>,
-    global_vmos: BTreeMap<KernelVmoId, GlobalVmo>,
+    global_vmos: Arc<Mutex<GlobalVmoStore>>,
     #[allow(dead_code)]
-    frames: FrameTable,
+    frames: Arc<Mutex<FrameTable>>,
     cow_fault_count: u64,
     vm_private_cow_pages_current: u64,
     vm_private_cow_pages_peak: u64,
@@ -1394,6 +1482,38 @@ pub(crate) struct Kernel {
 }
 
 impl VmDomain {
+    fn global_vmo_store(&self) -> Arc<Mutex<GlobalVmoStore>> {
+        Arc::clone(&self.global_vmos)
+    }
+
+    fn frame_table(&self) -> Arc<Mutex<FrameTable>> {
+        Arc::clone(&self.frames)
+    }
+
+    fn with_frames<R>(&self, f: impl FnOnce(&FrameTable) -> R) -> R {
+        let frames = self.frames.lock();
+        f(&frames)
+    }
+
+    fn with_frames_mut<R>(&self, f: impl FnOnce(&mut FrameTable) -> R) -> R {
+        let mut frames = self.frames.lock();
+        f(&mut frames)
+    }
+
+    fn with_address_space_frames_mut<R>(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        f: impl FnOnce(&mut AddressSpace, &mut FrameTable) -> Result<R, zx_status_t>,
+    ) -> Result<R, zx_status_t> {
+        let frames_handle = self.frame_table();
+        let address_space = self
+            .address_spaces
+            .get_mut(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let mut frames = frames_handle.lock();
+        f(address_space, &mut frames)
+    }
+
     fn alloc_address_space_id(&mut self) -> AddressSpaceId {
         let id = self.next_address_space_id;
         self.next_address_space_id = self.next_address_space_id.wrapping_add(1);
@@ -1412,8 +1532,8 @@ impl Kernel {
     pub(crate) fn bootstrap() -> Self {
         let mut vm = VmDomain {
             address_spaces: BTreeMap::new(),
-            global_vmos: BTreeMap::new(),
-            frames: FrameTable::new(),
+            global_vmos: Arc::new(Mutex::new(GlobalVmoStore::default())),
+            frames: Arc::new(Mutex::new(FrameTable::new())),
             cow_fault_count: 0,
             vm_private_cow_pages_current: 0,
             vm_private_cow_pages_peak: 0,
@@ -1430,8 +1550,10 @@ impl Kernel {
             vm.alloc_global_vmo_id(),
         ];
         let address_space_id = vm.alloc_address_space_id();
-        let bootstrap_address_space =
-            AddressSpace::bootstrap(address_space_id, &mut vm.frames, bootstrap_vmo_ids);
+        let bootstrap_address_space = {
+            let mut frames = vm.frames.lock();
+            AddressSpace::bootstrap(address_space_id, &mut frames, bootstrap_vmo_ids)
+        };
         vm.address_spaces
             .insert(address_space_id, bootstrap_address_space);
         vm.observe_cpu_tlb_epoch_for_address_space(
@@ -2573,7 +2695,6 @@ enum FaultPlan {
         global_vmo_id: KernelVmoId,
         page_offset: u64,
         vmo_kind: VmoKind,
-        needs_allocation: bool,
     },
 }
 
@@ -2622,6 +2743,11 @@ fn claim_fault(table: &Arc<Mutex<FaultTable>>, key: FaultInFlightKey) -> FaultCl
     claim
 }
 
+fn clone_global_vmo_store(vm_handle: &Arc<Mutex<VmDomain>>) -> Arc<Mutex<GlobalVmoStore>> {
+    let vm = vm_handle.lock();
+    vm.global_vmo_store()
+}
+
 fn wait_for_fault_completion(table: &Arc<Mutex<FaultTable>>, wait: FaultWaitToken) {
     let mut observed_spin_loops = 0_u64;
     loop {
@@ -2660,6 +2786,7 @@ fn wait_for_fault_completion(table: &Arc<Mutex<FaultTable>>, wait: FaultWaitToke
 fn prepare_fault_work(
     plan: FaultPlan,
     fault_table: &Arc<Mutex<FaultTable>>,
+    global_vmo_store: &Arc<Mutex<GlobalVmoStore>>,
 ) -> Result<PreparedFaultWork, zx_status_t> {
     match plan {
         FaultPlan::CopyOnWrite { old_frame_id, .. } => {
@@ -2684,10 +2811,15 @@ fn prepare_fault_work(
         }
         FaultPlan::LazyVmo {
             vmo_kind,
-            needs_allocation,
+            global_vmo_id,
+            page_offset,
             ..
         } => {
-            if !needs_allocation {
+            if global_vmo_store
+                .lock()
+                .frame(global_vmo_id, page_offset)?
+                .is_some()
+            {
                 return Ok(PreparedFaultWork::None);
             }
             if vmo_kind != VmoKind::Anonymous {
@@ -2712,6 +2844,7 @@ pub(crate) fn ensure_user_page_resident_serialized(
     page_va: u64,
     for_write: bool,
 ) -> Result<(), zx_status_t> {
+    let global_vmo_store = clone_global_vmo_store(&vm_handle);
     loop {
         let plan = {
             let vm = vm_handle.lock();
@@ -2733,7 +2866,8 @@ pub(crate) fn ensure_user_page_resident_serialized(
                 match claim {
                     FaultClaim::Leader => {
                         let guard = FaultLeaderGuard::new(fault_handle.clone(), plan.key());
-                        let mut prepared = prepare_fault_work(plan, &fault_handle)?;
+                        let mut prepared =
+                            prepare_fault_work(plan, &fault_handle, &global_vmo_store)?;
                         let outcome = {
                             let mut vm = vm_handle.lock();
                             vm.commit_prepared_fault(plan, &mut prepared)
@@ -2772,6 +2906,7 @@ pub(crate) fn handle_page_fault_serialized(
     fault_va: u64,
     error: u64,
 ) -> bool {
+    let global_vmo_store = clone_global_vmo_store(&vm_handle);
     loop {
         let plan = {
             let vm = vm_handle.lock();
@@ -2794,10 +2929,11 @@ pub(crate) fn handle_page_fault_serialized(
                 match claim {
                     FaultClaim::Leader => {
                         let guard = FaultLeaderGuard::new(fault_handle.clone(), plan.key());
-                        let mut prepared = match prepare_fault_work(plan, &fault_handle) {
-                            Ok(prepared) => prepared,
-                            Err(_) => return false,
-                        };
+                        let mut prepared =
+                            match prepare_fault_work(plan, &fault_handle, &global_vmo_store) {
+                                Ok(prepared) => prepared,
+                                Err(_) => return false,
+                            };
                         let outcome = {
                             let mut vm = vm_handle.lock();
                             vm.commit_prepared_fault(plan, &mut prepared)
@@ -2902,14 +3038,9 @@ impl VmDomain {
             .get(&address_space_id)
             .and_then(|space| space.snapshot_vmo(global_vmo_id))
             .ok_or(ZX_ERR_BAD_STATE)?;
-        self.global_vmos.insert(
-            global_vmo_id,
-            GlobalVmo {
-                kind: snapshot.kind(),
-                size_bytes: snapshot.size_bytes(),
-                frames: snapshot.frames().to_vec(),
-            },
-        );
+        self.global_vmos
+            .lock()
+            .register_snapshot(global_vmo_id, &snapshot);
         Ok(())
     }
 
@@ -2919,20 +3050,9 @@ impl VmDomain {
         kind: VmoKind,
         size_bytes: u64,
     ) -> Result<(), zx_status_t> {
-        if self.global_vmos.contains_key(&global_vmo_id) {
-            return Err(ZX_ERR_ALREADY_EXISTS);
-        }
-        let page_count = usize::try_from(size_bytes / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        self.global_vmos.insert(
-            global_vmo_id,
-            GlobalVmo {
-                kind,
-                size_bytes,
-                frames: alloc::vec![None; page_count],
-            },
-        );
-        Ok(())
+        self.global_vmos
+            .lock()
+            .register_empty(global_vmo_id, kind, size_bytes)
     }
 
     fn import_global_vmo_into_address_space(
@@ -2940,11 +3060,7 @@ impl VmDomain {
         address_space_id: AddressSpaceId,
         global_vmo_id: KernelVmoId,
     ) -> Result<VmoId, zx_status_t> {
-        let global_vmo = self
-            .global_vmos
-            .get(&global_vmo_id)
-            .cloned()
-            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        let global_vmo = self.global_vmos.lock().snapshot(global_vmo_id)?;
         let address_space = self
             .address_spaces
             .get_mut(&address_space_id)
@@ -2973,21 +3089,9 @@ impl VmDomain {
         offset: u64,
         frame_id: FrameId,
     ) -> Result<(), zx_status_t> {
-        let global_vmo = self
-            .global_vmos
-            .get_mut(&global_vmo_id)
-            .ok_or(ZX_ERR_BAD_HANDLE)?;
-        if offset & (crate::userspace::USER_PAGE_BYTES - 1) != 0 {
-            return Err(ZX_ERR_INVALID_ARGS);
-        }
-        let page_index = usize::try_from(offset / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        let slot = global_vmo
-            .frames
-            .get_mut(page_index)
-            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-        *slot = Some(frame_id);
-        Ok(())
+        self.global_vmos
+            .lock()
+            .update_frame(global_vmo_id, offset, frame_id)
     }
 
     fn global_vmo_frame(
@@ -2995,16 +3099,7 @@ impl VmDomain {
         global_vmo_id: KernelVmoId,
         offset: u64,
     ) -> Result<Option<FrameId>, zx_status_t> {
-        let global_vmo = self
-            .global_vmos
-            .get(&global_vmo_id)
-            .ok_or(ZX_ERR_BAD_HANDLE)?;
-        if offset & (crate::userspace::USER_PAGE_BYTES - 1) != 0 {
-            return Err(ZX_ERR_INVALID_ARGS);
-        }
-        let page_index = usize::try_from(offset / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        Ok(global_vmo.frames.get(page_index).copied().flatten())
+        self.global_vmos.lock().frame(global_vmo_id, offset)
     }
 
     fn record_vm_resource_telemetry(&self) {
@@ -3181,7 +3276,7 @@ impl VmDomain {
             match self.import_global_vmo_into_address_space(address_space_id, global_vmo_id) {
                 Ok(vmo_id) => vmo_id,
                 Err(err) => {
-                    let _ = self.global_vmos.remove(&global_vmo_id);
+                    let _ = self.global_vmos.lock().remove(global_vmo_id);
                     return Err(err);
                 }
             };
@@ -3255,15 +3350,12 @@ impl VmDomain {
             }
         }
 
-        let cleared_ranges = {
-            let address_space = self
-                .address_spaces
-                .get_mut(&address_space_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            address_space
-                .destroy_vmar(&mut self.frames, vmar_id)
-                .map_err(map_address_space_error)?
-        };
+        let cleared_ranges =
+            self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
+                address_space
+                    .destroy_vmar(frames, vmar_id)
+                    .map_err(map_address_space_error)
+            })?;
         for (base, len) in cleared_ranges {
             self.clear_private_cow_range(address_space_id, base, len);
             self.clear_mapping_pages(address_space_id, base, len)?;
@@ -3345,12 +3437,19 @@ impl VmDomain {
 
         let mut pinned = Vec::with_capacity(page_count);
         for frame_id in resident_pages.iter().copied() {
-            self.frames
-                .pin(frame_id)
+            if self
+                .with_frames_mut(|frames| frames.pin(frame_id))
                 .map_err(|_| ZX_ERR_BAD_STATE)
-                .inspect_err(|_| self.release_pinned_loan_frames(&pinned))?;
-            if self.frames.inc_loan(frame_id).is_err() {
-                let _ = self.frames.unpin(frame_id);
+                .inspect_err(|_| self.release_pinned_loan_frames(&pinned))
+                .is_err()
+            {
+                return Err(ZX_ERR_BAD_STATE);
+            }
+            if self
+                .with_frames_mut(|frames| frames.inc_loan(frame_id))
+                .is_err()
+            {
+                let _ = self.with_frames_mut(|frames| frames.unpin(frame_id));
                 self.release_pinned_loan_frames(&pinned);
                 return Err(ZX_ERR_BAD_STATE);
             }
@@ -3482,20 +3581,11 @@ impl VmDomain {
             receiver_address_space_id,
             receiver_range,
         )?;
-        {
-            let receiver = self
-                .address_spaces
-                .get_mut(&receiver_address_space_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
+        self.with_address_space_frames_mut(receiver_address_space_id, |receiver, frames| {
             receiver
-                .replace_mapping_frames_copy_on_write(
-                    &mut self.frames,
-                    dst_base,
-                    len,
-                    loaned.pages(),
-                )
-                .map_err(map_address_space_error)?;
-        }
+                .replace_mapping_frames_copy_on_write(frames, dst_base, len, loaned.pages())
+                .map_err(map_address_space_error)
+        })?;
         self.clear_private_cow_range(receiver_address_space_id, dst_base, len);
         let receiver_cursor = loan_tx.receiver_cursor_mut().ok_or(ZX_ERR_BAD_STATE)?;
         self.sync_mapping_pages_locked(receiver_address_space_id, dst_base, len, receiver_cursor)?;
@@ -3529,6 +3619,7 @@ impl VmDomain {
     ) -> Result<u64, zx_status_t> {
         let local_vmo_id =
             self.import_global_vmo_into_address_space(address_space_id, global_vmo_id)?;
+        let frames_handle = self.frame_table();
         let mapped_addr = {
             let address_space = self
                 .address_spaces
@@ -3541,24 +3632,28 @@ impl VmDomain {
                         .base()
                         .checked_add(vmar_offset)
                         .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-                    address_space
-                        .map_vmo_fixed(
-                            &mut self.frames,
-                            vmar_id,
-                            mapped_addr,
-                            len,
-                            local_vmo_id,
-                            vmo_offset,
-                            perms,
-                        )
-                        .map_err(map_address_space_error)?;
+                    {
+                        let mut frames = frames_handle.lock();
+                        address_space
+                            .map_vmo_fixed(
+                                &mut frames,
+                                vmar_id,
+                                mapped_addr,
+                                len,
+                                local_vmo_id,
+                                vmo_offset,
+                                perms,
+                            )
+                            .map_err(map_address_space_error)?;
+                    }
                     mapped_addr
                 }
                 None => {
                     let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
+                    let mut frames = frames_handle.lock();
                     address_space
                         .map_vmo_anywhere(
-                            &mut self.frames,
+                            &mut frames,
                             cpu_id,
                             vmar_id,
                             len,
@@ -3582,14 +3677,18 @@ impl VmDomain {
         len: u64,
     ) -> Result<(), zx_status_t> {
         let affected_frames = self.mapped_frames_in_range(address_space_id, addr, len)?;
+        let frames_handle = self.frame_table();
         let address_space = self
             .address_spaces
             .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
-        address_space
-            .unmap(&mut self.frames, vmar_id, addr, len)
-            .map_err(map_address_space_error)?;
+        {
+            let mut frames = frames_handle.lock();
+            address_space
+                .unmap(&mut frames, vmar_id, addr, len)
+                .map_err(map_address_space_error)?;
+        }
         self.clear_private_cow_range(address_space_id, addr, len);
         self.clear_mapping_pages(address_space_id, addr, len)?;
         self.validate_frame_mapping_invariants_for(&affected_frames, "unmap_current_vmar");
@@ -3668,9 +3767,6 @@ impl VmDomain {
             .vmo_offset()
             .checked_sub(lookup.vmo_offset() % crate::userspace::USER_PAGE_BYTES)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        let needs_allocation = self
-            .global_vmo_frame(lookup.global_vmo_id(), page_offset)?
-            .is_none();
         Ok(FaultPlan::LazyVmo {
             key: FaultInFlightKey::SharedVmoPage {
                 global_vmo_id: lookup.global_vmo_id(),
@@ -3681,7 +3777,6 @@ impl VmDomain {
             global_vmo_id: lookup.global_vmo_id(),
             page_offset,
             vmo_kind: lookup.vmo_kind(),
-            needs_allocation,
         })
     }
 
@@ -3819,19 +3914,21 @@ impl VmDomain {
                 let reserve_private =
                     self.try_reserve_private_cow_page(address_space_id, page_base)?;
                 let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
-                let new_frame_id = self
-                    .frames
-                    .register_existing(new_frame_paddr)
-                    .map_err(|_| ZX_ERR_BAD_STATE)?;
-                let resolved = {
-                    let address_space = self
-                        .address_spaces
-                        .get_mut(&address_space_id)
-                        .ok_or(ZX_ERR_BAD_STATE)?;
-                    address_space
-                        .resolve_cow_fault(&mut self.frames, page_base, new_frame_id)
-                        .map_err(map_address_space_error)?
+                let frames_handle = self.frame_table();
+                let new_frame_id = {
+                    let mut frames = frames_handle.lock();
+                    frames
+                        .register_existing(new_frame_paddr)
+                        .map_err(|_| ZX_ERR_BAD_STATE)?
                 };
+                let resolved = self.with_address_space_frames_mut(
+                    address_space_id,
+                    |address_space, frames| {
+                        address_space
+                            .resolve_cow_fault(frames, page_base, new_frame_id)
+                            .map_err(map_address_space_error)
+                    },
+                )?;
                 self.publish_address_space_frame_to_global_vmo(
                     address_space_id,
                     resolved.fault_page_base(),
@@ -3885,19 +3982,21 @@ impl VmDomain {
                     return Ok(FaultCommitDisposition::Retry);
                 }
                 let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
-                let new_frame_id = self
-                    .frames
-                    .register_existing(new_frame_paddr)
-                    .map_err(|_| ZX_ERR_BAD_STATE)?;
-                let resolved = {
-                    let address_space = self
-                        .address_spaces
-                        .get_mut(&address_space_id)
-                        .ok_or(ZX_ERR_BAD_STATE)?;
-                    address_space
-                        .resolve_lazy_anon_fault(&mut self.frames, page_base, new_frame_id)
-                        .map_err(map_address_space_error)?
+                let frames_handle = self.frame_table();
+                let new_frame_id = {
+                    let mut frames = frames_handle.lock();
+                    frames
+                        .register_existing(new_frame_paddr)
+                        .map_err(|_| ZX_ERR_BAD_STATE)?
                 };
+                let resolved = self.with_address_space_frames_mut(
+                    address_space_id,
+                    |address_space, frames| {
+                        address_space
+                            .resolve_lazy_anon_fault(frames, page_base, new_frame_id)
+                            .map_err(map_address_space_error)
+                    },
+                )?;
                 self.publish_address_space_frame_to_global_vmo(
                     address_space_id,
                     resolved.fault_page_base(),
@@ -3959,23 +4058,25 @@ impl VmDomain {
                     Some(frame_id) => frame_id,
                     None => {
                         let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
-                        let new_frame_id = self
-                            .frames
-                            .register_existing(new_frame_paddr)
-                            .map_err(|_| ZX_ERR_BAD_STATE)?;
+                        let frames_handle = self.frame_table();
+                        let new_frame_id = {
+                            let mut frames = frames_handle.lock();
+                            frames
+                                .register_existing(new_frame_paddr)
+                                .map_err(|_| ZX_ERR_BAD_STATE)?
+                        };
                         self.update_global_vmo_frame(global_vmo_id, page_offset, new_frame_id)?;
                         new_frame_id
                     }
                 };
-                let resolved = {
-                    let address_space = self
-                        .address_spaces
-                        .get_mut(&address_space_id)
-                        .ok_or(ZX_ERR_BAD_STATE)?;
-                    address_space
-                        .resolve_lazy_vmo_fault(&mut self.frames, page_base, frame_id)
-                        .map_err(map_address_space_error)?
-                };
+                let resolved = self.with_address_space_frames_mut(
+                    address_space_id,
+                    |address_space, frames| {
+                        address_space
+                            .resolve_lazy_vmo_fault(frames, page_base, frame_id)
+                            .map_err(map_address_space_error)
+                    },
+                )?;
                 self.sync_mapping_pages(
                     address_space_id,
                     page_base,
@@ -4294,19 +4395,19 @@ impl VmDomain {
         let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
         let new_frame_paddr = crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw())
             .ok_or(ZX_ERR_NO_MEMORY)?;
-        let new_frame_id = self
-            .frames
-            .register_existing(new_frame_paddr)
-            .map_err(|_| ZX_ERR_BAD_STATE)?;
-        let resolved = {
-            let address_space = self
-                .address_spaces
-                .get_mut(&address_space_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            address_space
-                .resolve_cow_fault(&mut self.frames, fault_va, new_frame_id)
-                .map_err(map_address_space_error)?
+        let frames_handle = self.frame_table();
+        let new_frame_id = {
+            let mut frames = frames_handle.lock();
+            frames
+                .register_existing(new_frame_paddr)
+                .map_err(|_| ZX_ERR_BAD_STATE)?
         };
+        let resolved =
+            self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
+                address_space
+                    .resolve_cow_fault(frames, fault_va, new_frame_id)
+                    .map_err(map_address_space_error)
+            })?;
         self.publish_address_space_frame_to_global_vmo(
             address_space_id,
             resolved.fault_page_base(),
@@ -4355,19 +4456,19 @@ impl VmDomain {
 
         let new_frame_paddr =
             crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
-        let new_frame_id = self
-            .frames
-            .register_existing(new_frame_paddr)
-            .map_err(|_| ZX_ERR_BAD_STATE)?;
-        let resolved = {
-            let address_space = self
-                .address_spaces
-                .get_mut(&address_space_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            address_space
-                .resolve_lazy_anon_fault(&mut self.frames, fault_va, new_frame_id)
-                .map_err(map_address_space_error)?
+        let frames_handle = self.frame_table();
+        let new_frame_id = {
+            let mut frames = frames_handle.lock();
+            frames
+                .register_existing(new_frame_paddr)
+                .map_err(|_| ZX_ERR_BAD_STATE)?
         };
+        let resolved =
+            self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
+                address_space
+                    .resolve_lazy_anon_fault(frames, fault_va, new_frame_id)
+                    .map_err(map_address_space_error)
+            })?;
         self.publish_address_space_frame_to_global_vmo(
             address_space_id,
             resolved.fault_page_base(),
@@ -4416,10 +4517,13 @@ impl VmDomain {
                 VmoKind::Anonymous => {
                     let new_frame_paddr =
                         crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
-                    let new_frame_id = self
-                        .frames
-                        .register_existing(new_frame_paddr)
-                        .map_err(|_| ZX_ERR_BAD_STATE)?;
+                    let frames_handle = self.frame_table();
+                    let new_frame_id = {
+                        let mut frames = frames_handle.lock();
+                        frames
+                            .register_existing(new_frame_paddr)
+                            .map_err(|_| ZX_ERR_BAD_STATE)?
+                    };
                     self.update_global_vmo_frame(
                         lookup.global_vmo_id(),
                         page_offset,
@@ -4430,15 +4534,12 @@ impl VmDomain {
                 VmoKind::Physical | VmoKind::Contiguous => return Err(ZX_ERR_BAD_STATE),
             },
         };
-        let resolved = {
-            let address_space = self
-                .address_spaces
-                .get_mut(&address_space_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            address_space
-                .resolve_lazy_vmo_fault(&mut self.frames, fault_va, frame_id)
-                .map_err(map_address_space_error)?
-        };
+        let resolved =
+            self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
+                address_space
+                    .resolve_lazy_vmo_fault(frames, fault_va, frame_id)
+                    .map_err(map_address_space_error)
+            })?;
         self.sync_mapping_pages(
             address_space_id,
             page_base,
@@ -4449,7 +4550,7 @@ impl VmDomain {
     }
 
     fn frame_mappings(&self, frame_id: FrameId) -> Vec<FrameMappingSnapshot> {
-        let Some(anchors) = self.frames.rmap_anchors(frame_id) else {
+        let Some(anchors) = self.with_frames(|frames| frames.rmap_anchors(frame_id)) else {
             return Vec::new();
         };
         let mut mappings = Vec::with_capacity(anchors.len());
@@ -4487,7 +4588,7 @@ impl VmDomain {
     }
 
     fn validate_frame_mapping_invariants(&self, frame_id: FrameId, context: &str) {
-        let Some(state) = self.frames.state(frame_id) else {
+        let Some(state) = self.with_frames(|frames| frames.state(frame_id)) else {
             return;
         };
         let mappings = self.frame_mappings(frame_id);
@@ -4542,8 +4643,8 @@ impl VmDomain {
 
     fn release_pinned_loan_frames(&mut self, pages: &[FrameId]) {
         for &frame_id in pages {
-            let _ = self.frames.dec_loan(frame_id);
-            let _ = self.frames.unpin(frame_id);
+            let _ = self.with_frames_mut(|frames| frames.dec_loan(frame_id));
+            let _ = self.with_frames_mut(|frames| frames.unpin(frame_id));
         }
     }
 

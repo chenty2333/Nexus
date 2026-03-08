@@ -64,6 +64,15 @@ external VM model.
   summary slots. The kernel records leader/wait claims, spin loops, retries,
   commit outcomes, and prepare counts for `COW`, `LazyAnon`, and `LazyVmo`
   allocation paths before any finer VM lock splitting.
+- Shared `GlobalVmo` state is no longer stored directly in the main `VmDomain`
+  map. It now sits behind a dedicated `GlobalVmoStore` mutex, and the `LazyVmo`
+  path only touches it for slot snapshot/revalidate/publish while heavy fault
+  work remains outside the main VM lock.
+- Physical frame state is likewise no longer embedded directly as a plain field
+  inside `VmDomain`. `FrameTable` now sits behind its own mutex-backed store so
+  mapping mutation, COW, lazy fault materialization, and loan pin/loan-count
+  updates already have a distinct boundary ahead of any finer frame-side lock
+  splitting.
 - `Physical` and `Contiguous` VMO mappings now have explicit non-COW boundaries:
   they must already be resident when mapped, and COW arming rejects them.
 - VM resource governance has started to move under one accounting surface:
