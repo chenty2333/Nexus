@@ -65,6 +65,12 @@ external VM model.
   and commit. Local `LazyAnon` / COW faults serialize on `(address_space,
   page_base)`, while shared `LazyVmo` faults serialize on `(global_vmo_id,
   page_offset)` so one shared page is materialized only once.
+- Trap-driven page-fault waiters now reuse the same blocked trap-exit primitive
+  as scheduler-backed wait syscalls. A contending fault can park the current
+  thread in `VmFaultWait`, switch to another runnable thread, and later resume
+  the saved fault context once the leader completes. User-pointer prefault paths
+  still use the simpler spin-and-retry fallback because they run inside an
+  in-flight syscall body rather than a restartable trap exit.
 - Fault contention telemetry is now exported through the bootstrap shared
   summary slots. The kernel records leader/wait claims, spin loops, retries,
   commit outcomes, and prepare counts for `COW`, `LazyAnon`, and `LazyVmo`

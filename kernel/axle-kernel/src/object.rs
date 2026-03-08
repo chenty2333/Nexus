@@ -446,7 +446,7 @@ pub(crate) fn finish_syscall(
     run_trap_blocking(|resuming_blocked_current| {
         with_kernel_mut(|kernel| {
             kernel
-                .finish_syscall(trap, cpu_frame, resuming_blocked_current)
+                .finish_trap_exit(trap, cpu_frame, resuming_blocked_current)
                 .map(|disposition| match disposition {
                     crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(()),
                     crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
@@ -930,7 +930,12 @@ pub fn ensure_current_user_range_resident(
 }
 
 /// Try to resolve a bootstrap user-mode page fault.
-pub fn handle_page_fault(cr2: u64, error: u64) -> bool {
+pub fn handle_page_fault(
+    trap: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+    cr2: u64,
+    error: u64,
+) -> bool {
     let vm = match vm_handle() {
         Ok(vm) => vm,
         Err(_) => return false,
@@ -939,28 +944,66 @@ pub fn handle_page_fault(cr2: u64, error: u64) -> bool {
         Ok(faults) => faults,
         Err(_) => return false,
     };
-    let handled = with_core(|kernel| {
-        let process = kernel.current_process_info()?;
-        kernel.process_address_space_id(process.process_id())
-    })
-    .map(|address_space_id| {
-        crate::task::handle_page_fault_serialized(vm, faults, address_space_id, cr2, error)
-    })
-    .unwrap_or(false);
-    if handled {
-        let cpu_id = crate::arch::apic::this_apic_id() as usize;
-        let _ = with_core(|kernel| {
+    let kernel = match kernel_handle() {
+        Ok(kernel) => kernel,
+        Err(_) => return false,
+    };
+    run_trap_blocking(|resuming_blocked_current| {
+        if resuming_blocked_current {
+            return with_kernel_mut(|kernel| {
+                kernel.finish_trap_exit(trap, cpu_frame, true).map(
+                    |disposition| match disposition {
+                        crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(true),
+                        crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
+                    },
+                )
+            });
+        }
+
+        let (thread_id, address_space_id) = with_core(|kernel| {
             let process = kernel.current_process_info()?;
-            kernel.process_address_space_id(process.process_id())
-        })
-        .and_then(|address_space_id| {
-            with_vm_mut(|vm| {
-                let _ = vm.sync_current_cpu_tlb_state(address_space_id, cpu_id);
-                Ok(())
-            })
-        });
-    }
-    handled
+            let thread = kernel.current_thread_info()?;
+            Ok((
+                thread.thread_id(),
+                kernel.process_address_space_id(process.process_id())?,
+            ))
+        })?;
+
+        match crate::task::handle_page_fault_serialized(
+            kernel.clone(),
+            vm.clone(),
+            faults.clone(),
+            address_space_id,
+            thread_id,
+            cr2,
+            error,
+        ) {
+            crate::task::PageFaultSerializedResult::Handled => {
+                let cpu_id = crate::arch::apic::this_apic_id() as usize;
+                let _ = with_vm_mut(|vm| {
+                    let _ = vm.sync_current_cpu_tlb_state(address_space_id, cpu_id);
+                    Ok(())
+                });
+                Ok(TrapBlock::Ready(true))
+            }
+            crate::task::PageFaultSerializedResult::Unhandled => Ok(TrapBlock::Ready(false)),
+            crate::task::PageFaultSerializedResult::BlockCurrent { key } => {
+                with_kernel_mut(|kernel| {
+                    kernel.capture_current_user_context(trap, cpu_frame.cast_const())?;
+                    kernel.enqueue_current_fault_wait(key)?;
+                    kernel
+                        .finish_trap_exit(trap, cpu_frame, false)
+                        .map(|disposition| match disposition {
+                            crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(true),
+                            crate::task::TrapExitDisposition::BlockCurrent => {
+                                TrapBlock::BlockCurrent
+                            }
+                        })
+                })
+            }
+        }
+    })
+    .unwrap_or(false)
 }
 
 /// Create a new Timer object and return a handle.

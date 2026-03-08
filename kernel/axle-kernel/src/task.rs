@@ -100,11 +100,12 @@ pub(crate) enum FaultInFlightKey {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FaultEntry {
     in_flight: bool,
     completed_epoch: u64,
-    waiters: u32,
+    spin_waiters: u32,
+    blocked_waiters: BTreeSet<ThreadId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +118,12 @@ struct FaultWaitToken {
 enum FaultClaim {
     Leader,
     Wait(FaultWaitToken),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultBlockingClaim {
+    Leader,
+    Wait,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,7 +163,7 @@ impl FaultTable {
         match self.entries.get_mut(&key) {
             Some(entry) if entry.in_flight => {
                 self.telemetry.wait_claims = self.telemetry.wait_claims.wrapping_add(1);
-                entry.waiters = entry.waiters.saturating_add(1);
+                entry.spin_waiters = entry.spin_waiters.saturating_add(1);
                 FaultClaim::Wait(FaultWaitToken {
                     key,
                     observed_epoch: entry.completed_epoch,
@@ -174,7 +181,8 @@ impl FaultTable {
                     FaultEntry {
                         in_flight: true,
                         completed_epoch: 0,
-                        waiters: 0,
+                        spin_waiters: 0,
+                        blocked_waiters: BTreeSet::new(),
                     },
                 );
                 FaultClaim::Leader
@@ -182,15 +190,46 @@ impl FaultTable {
         }
     }
 
-    fn complete(&mut self, key: FaultInFlightKey) {
+    fn claim_blocking(&mut self, key: FaultInFlightKey, thread_id: ThreadId) -> FaultBlockingClaim {
+        match self.entries.get_mut(&key) {
+            Some(entry) if entry.in_flight => {
+                self.telemetry.wait_claims = self.telemetry.wait_claims.wrapping_add(1);
+                let _ = entry.blocked_waiters.insert(thread_id);
+                FaultBlockingClaim::Wait
+            }
+            Some(entry) => {
+                self.telemetry.leader_claims = self.telemetry.leader_claims.wrapping_add(1);
+                entry.in_flight = true;
+                FaultBlockingClaim::Leader
+            }
+            None => {
+                self.telemetry.leader_claims = self.telemetry.leader_claims.wrapping_add(1);
+                self.entries.insert(
+                    key,
+                    FaultEntry {
+                        in_flight: true,
+                        completed_epoch: 0,
+                        spin_waiters: 0,
+                        blocked_waiters: BTreeSet::new(),
+                    },
+                );
+                FaultBlockingClaim::Leader
+            }
+        }
+    }
+
+    fn complete(&mut self, key: FaultInFlightKey) -> Vec<ThreadId> {
         let Some(entry) = self.entries.get_mut(&key) else {
-            return;
+            return Vec::new();
         };
         entry.in_flight = false;
         entry.completed_epoch = entry.completed_epoch.wrapping_add(1);
-        if entry.waiters == 0 {
+        let blocked_waiters = entry.blocked_waiters.iter().copied().collect::<Vec<_>>();
+        entry.blocked_waiters.clear();
+        if entry.spin_waiters == 0 && entry.blocked_waiters.is_empty() {
             let _ = self.entries.remove(&key);
         }
+        blocked_waiters
     }
 
     fn observe_completion(&self, wait: FaultWaitToken) -> bool {
@@ -204,10 +243,10 @@ impl FaultTable {
         let Some(entry) = self.entries.get_mut(&wait.key) else {
             return;
         };
-        if entry.waiters > 0 {
-            entry.waiters -= 1;
+        if entry.spin_waiters > 0 {
+            entry.spin_waiters -= 1;
         }
-        if !entry.in_flight && entry.waiters == 0 {
+        if !entry.in_flight && entry.spin_waiters == 0 && entry.blocked_waiters.is_empty() {
             let _ = self.entries.remove(&wait.key);
         }
     }
@@ -261,12 +300,13 @@ impl FaultLeaderGuard {
         }
     }
 
-    fn complete(mut self) {
+    fn complete(mut self) -> Vec<ThreadId> {
         if self.active {
-            let mut table = self.table.lock();
-            table.complete(self.key);
+            let waiters = complete_fault(&self.table, self.key);
             self.active = false;
+            return waiters;
         }
+        Vec::new()
     }
 }
 
@@ -276,7 +316,7 @@ impl Drop for FaultLeaderGuard {
             return;
         }
         let mut table = self.table.lock();
-        table.complete(self.key);
+        let _ = table.complete(self.key);
         self.active = false;
     }
 }
@@ -724,6 +764,9 @@ pub(crate) enum ThreadState {
     PortWait {
         port_object_id: u64,
         packet_ptr: u64,
+    },
+    VmFaultWait {
+        key: FaultInFlightKey,
     },
 }
 
@@ -2079,7 +2122,7 @@ impl Kernel {
         context.restore(trap, cpu_frame)
     }
 
-    pub(crate) fn finish_syscall(
+    pub(crate) fn finish_trap_exit(
         &mut self,
         trap: &mut crate::arch::int80::TrapFrame,
         cpu_frame: *mut u64,
@@ -2105,7 +2148,8 @@ impl Kernel {
             ThreadState::New => Err(ZX_ERR_BAD_STATE),
             ThreadState::FutexWait { .. }
             | ThreadState::SignalWait { .. }
-            | ThreadState::PortWait { .. } => {
+            | ThreadState::PortWait { .. }
+            | ThreadState::VmFaultWait { .. } => {
                 if let Some(next_thread_id) = self.pop_runnable_thread() {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     Ok(TrapExitDisposition::Complete)
@@ -2150,6 +2194,21 @@ impl Kernel {
             watched,
             observed_ptr: observed_ptr as u64,
         };
+        Ok(())
+    }
+
+    pub(crate) fn enqueue_current_fault_wait(
+        &mut self,
+        key: FaultInFlightKey,
+    ) -> Result<(), zx_status_t> {
+        let thread = self
+            .threads
+            .get_mut(&self.current_thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if !matches!(thread.state, ThreadState::Runnable) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.state = ThreadState::VmFaultWait { key };
         Ok(())
     }
 
@@ -2515,16 +2574,19 @@ impl Kernel {
         self.with_vm_mut(|vm| vm.observe_cpu_tlb_epoch_for_address_space(address_space_id, cpu_id));
     }
 
-    pub(crate) fn make_thread_runnable(
+    fn make_thread_runnable_inner(
         &mut self,
         thread_id: ThreadId,
-        status: zx_status_t,
+        status: Option<zx_status_t>,
     ) -> Result<(), zx_status_t> {
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         let Some(context) = thread.context else {
             return Err(ZX_ERR_BAD_STATE);
         };
-        thread.context = Some(context.with_status(status));
+        thread.context = Some(match status {
+            Some(status) => context.with_status(status),
+            None => context,
+        });
         thread.state = ThreadState::Runnable;
         let was_current = thread_id == self.current_thread_id;
         let _ = thread;
@@ -2533,6 +2595,21 @@ impl Kernel {
             self.reschedule_requested = true;
         }
         Ok(())
+    }
+
+    pub(crate) fn make_thread_runnable(
+        &mut self,
+        thread_id: ThreadId,
+        status: zx_status_t,
+    ) -> Result<(), zx_status_t> {
+        self.make_thread_runnable_inner(thread_id, Some(status))
+    }
+
+    pub(crate) fn make_thread_runnable_preserving_context(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<(), zx_status_t> {
+        self.make_thread_runnable_inner(thread_id, None)
     }
 
     fn install_mapping_pages(
@@ -2677,6 +2754,13 @@ enum FaultCommitDisposition {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageFaultSerializedResult {
+    Handled,
+    BlockCurrent { key: FaultInFlightKey },
+    Unhandled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PreparedFaultWork {
     None,
     NewPage { paddr: u64 },
@@ -2765,9 +2849,41 @@ fn claim_fault(table: &Arc<Mutex<FaultTable>>, key: FaultInFlightKey) -> FaultCl
     claim
 }
 
+fn claim_blocking_fault(
+    table: &Arc<Mutex<FaultTable>>,
+    key: FaultInFlightKey,
+    thread_id: ThreadId,
+) -> FaultBlockingClaim {
+    let claim = {
+        let mut table = table.lock();
+        table.claim_blocking(key, thread_id)
+    };
+    record_fault_telemetry_snapshot(table);
+    claim
+}
+
+fn complete_fault(table: &Arc<Mutex<FaultTable>>, key: FaultInFlightKey) -> Vec<ThreadId> {
+    let waiters = {
+        let mut table = table.lock();
+        table.complete(key)
+    };
+    record_fault_telemetry_snapshot(table);
+    waiters
+}
+
 fn clone_global_vmo_store(vm_handle: &Arc<Mutex<VmDomain>>) -> Arc<Mutex<GlobalVmoStore>> {
     let vm = vm_handle.lock();
     vm.global_vmo_store()
+}
+
+fn wake_fault_waiters(kernel_handle: &Arc<Mutex<Kernel>>, waiters: Vec<ThreadId>) {
+    if waiters.is_empty() {
+        return;
+    }
+    let mut kernel = kernel_handle.lock();
+    for thread_id in waiters {
+        let _ = kernel.make_thread_runnable_preserving_context(thread_id);
+    }
 }
 
 fn wait_for_fault_completion(table: &Arc<Mutex<FaultTable>>, wait: FaultWaitToken) {
@@ -2922,12 +3038,14 @@ pub(crate) fn ensure_user_page_resident_serialized(
 }
 
 pub(crate) fn handle_page_fault_serialized(
+    kernel_handle: Arc<Mutex<Kernel>>,
     vm_handle: Arc<Mutex<VmDomain>>,
     fault_handle: Arc<Mutex<FaultTable>>,
     address_space_id: AddressSpaceId,
+    thread_id: ThreadId,
     fault_va: u64,
     error: u64,
-) -> bool {
+) -> PageFaultSerializedResult {
     let global_vmo_store = clone_global_vmo_store(&vm_handle);
     loop {
         let plan = {
@@ -2937,37 +3055,44 @@ pub(crate) fn handle_page_fault_serialized(
         match plan {
             FaultPlanResult::Satisfied => {
                 let vm = vm_handle.lock();
-                return vm
+                return if vm
                     .sync_mapping_pages(
                         address_space_id,
                         align_down_page(fault_va),
                         crate::userspace::USER_PAGE_BYTES,
                     )
-                    .is_ok();
+                    .is_ok()
+                {
+                    PageFaultSerializedResult::Handled
+                } else {
+                    PageFaultSerializedResult::Unhandled
+                };
             }
-            FaultPlanResult::Unhandled => return false,
+            FaultPlanResult::Unhandled => return PageFaultSerializedResult::Unhandled,
             FaultPlanResult::Ready(plan) => {
-                let claim = claim_fault(&fault_handle, plan.key());
+                let claim = claim_blocking_fault(&fault_handle, plan.key(), thread_id);
                 match claim {
-                    FaultClaim::Leader => {
-                        let guard = FaultLeaderGuard::new(fault_handle.clone(), plan.key());
+                    FaultBlockingClaim::Leader => {
+                        let key = plan.key();
+                        let guard = FaultLeaderGuard::new(fault_handle.clone(), key);
                         let mut prepared =
                             match prepare_fault_work(plan, &fault_handle, &global_vmo_store) {
                                 Ok(prepared) => prepared,
-                                Err(_) => return false,
+                                Err(_) => return PageFaultSerializedResult::Unhandled,
                             };
                         let outcome = {
                             let mut vm = vm_handle.lock();
                             vm.commit_prepared_fault(plan, &mut prepared)
                         };
                         prepared.release_unused();
-                        guard.complete();
+                        let waiters = guard.complete();
+                        wake_fault_waiters(&kernel_handle, waiters);
                         match outcome {
                             Ok(FaultCommitDisposition::Resolved) => {
                                 update_fault_telemetry(&fault_handle, |table| {
                                     table.record_commit_resolved();
                                 });
-                                return true;
+                                return PageFaultSerializedResult::Handled;
                             }
                             Ok(FaultCommitDisposition::Retry) => {
                                 update_fault_telemetry(&fault_handle, |table| {
@@ -2975,12 +3100,11 @@ pub(crate) fn handle_page_fault_serialized(
                                 });
                                 continue;
                             }
-                            Err(_) => return false,
+                            Err(_) => return PageFaultSerializedResult::Unhandled,
                         }
                     }
-                    FaultClaim::Wait(wait) => {
-                        wait_for_fault_completion(&fault_handle, wait);
-                        continue;
+                    FaultBlockingClaim::Wait => {
+                        return PageFaultSerializedResult::BlockCurrent { key: plan.key() };
                     }
                 }
             }

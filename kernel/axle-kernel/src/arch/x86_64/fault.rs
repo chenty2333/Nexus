@@ -174,12 +174,12 @@ fn decode_cpu_frame_with_error_code(cpu: *const u64) -> (u64, u64, u64, u64, Opt
 }
 
 extern "C" fn axle_page_fault_rust(
-    _regs: &crate::arch::int80::TrapFrame,
-    cpu: *const u64,
+    regs: &mut crate::arch::int80::TrapFrame,
+    cpu: *mut u64,
     cr2: u64,
 ) -> bool {
-    let (error, rip, cs, rflags, rsp_ss) = decode_cpu_frame_with_error_code(cpu);
-    if crate::object::handle_page_fault(cr2, error) {
+    let (error, rip, cs, rflags, rsp_ss) = decode_cpu_frame_with_error_code(cpu.cast_const());
+    if crate::object::handle_page_fault(regs, cpu, cr2, error) {
         return true;
     }
     kprintln!(
