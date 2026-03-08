@@ -2632,6 +2632,24 @@ movabs $31, %rax
 int $0x80
 mov %rax, 8*162(%rbx)
 
+// wait_one(child_thread, ZX_TASK_TERMINATED)
+mov 0x1938(%rbx), %rdi
+movl $0x8, %esi
+movabs $0x7fffffffffffffff, %rdx
+lea 8*437(%rbx), %r10
+movabs $1, %rax
+int $0x80
+mov %rax, 8*436(%rbx)
+
+// wait_one(child_process, ZX_TASK_TERMINATED)
+mov 0x1900(%rbx), %rdi
+movl $0x8, %esi
+movabs $0x7fffffffffffffff, %rdx
+lea 8*439(%rbx), %r10
+movabs $1, %rax
+int $0x80
+mov %rax, 8*438(%rbx)
+
 // thread_create(child_process) after kill => BAD_STATE
 mov 0x1900(%rbx), %rdi
 xor %rsi, %rsi
@@ -2641,6 +2659,18 @@ lea 0x1da0(%rbx), %r8
 movabs $25, %rax
 int $0x80
 mov %rax, 8*163(%rbx)
+
+// handle_close(child_thread_h) after termination
+mov 0x1938(%rbx), %rdi
+movabs $0, %rax
+int $0x80
+mov %rax, 8*440(%rbx)
+
+// handle_close(child_process_h) after termination
+mov 0x1900(%rbx), %rdi
+movabs $0, %rax
+int $0x80
+mov %rax, 8*441(%rbx)
 
 // ok=1
 movq $1, 0x00(%rbx)

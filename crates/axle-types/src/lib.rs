@@ -468,4 +468,7 @@ pub mod signals {
 
     /// Timer signaled.
     pub const ZX_TIMER_SIGNALED: zx_signals_t = ZX_OBJECT_SIGNALED;
+
+    /// Task terminated.
+    pub const ZX_TASK_TERMINATED: zx_signals_t = ZX_OBJECT_SIGNALED;
 }

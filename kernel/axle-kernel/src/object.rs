@@ -255,6 +255,7 @@ const USER_SIGNAL_MASK: Signals = Signals::USER_SIGNAL_0
 struct KernelState {
     kernel: Arc<Mutex<crate::task::Kernel>>,
     objects: BTreeMap<u64, KernelObject>,
+    object_handle_refs: BTreeMap<u64, usize>,
     next_object_id: u64,
     timers: TimerService,
     bootstrap_self_process_handle: zx_handle_t,
@@ -267,6 +268,7 @@ impl KernelState {
         let mut state = Self {
             kernel: Arc::new(Mutex::new(crate::task::Kernel::bootstrap())),
             objects: BTreeMap::new(),
+            object_handle_refs: BTreeMap::new(),
             next_object_id: 1,
             timers: TimerService::new(),
             bootstrap_self_process_handle: 0,
@@ -385,7 +387,12 @@ impl KernelState {
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
         let cap = Capability::new(object_id, rights.bits(), DEFAULT_OBJECT_GENERATION);
-        self.with_core_mut(|kernel| kernel.alloc_handle_for_current_process(cap))
+        let handle = self.with_core_mut(|kernel| kernel.alloc_handle_for_current_process(cap))?;
+        self.object_handle_refs
+            .entry(object_id)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        Ok(handle)
     }
 
     fn lookup_handle(
@@ -397,7 +404,12 @@ impl KernelState {
     }
 
     fn close_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
-        self.with_core_mut(|kernel| kernel.close_current_handle(raw))
+        let object_id = self
+            .lookup_handle(raw, crate::task::HandleRights::empty())?
+            .object_id();
+        self.with_core_mut(|kernel| kernel.close_current_handle(raw))?;
+        self.decrement_object_handle_ref(object_id);
+        Ok(())
     }
 
     fn duplicate_handle(
@@ -405,7 +417,15 @@ impl KernelState {
         raw: zx_handle_t,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
-        self.with_core_mut(|kernel| kernel.duplicate_current_handle(raw, rights))
+        let object_id = self
+            .lookup_handle(raw, crate::task::HandleRights::empty())?
+            .object_id();
+        let handle = self.with_core_mut(|kernel| kernel.duplicate_current_handle(raw, rights))?;
+        self.object_handle_refs
+            .entry(object_id)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        Ok(handle)
     }
 
     fn replace_handle(
@@ -428,7 +448,35 @@ impl KernelState {
         &mut self,
         transferred: TransferredCap,
     ) -> Result<zx_handle_t, zx_status_t> {
-        self.with_core_mut(|kernel| kernel.install_handle_in_current_process(transferred))
+        let object_id = transferred.capability().object_id();
+        let handle =
+            self.with_core_mut(|kernel| kernel.install_handle_in_current_process(transferred))?;
+        self.object_handle_refs
+            .entry(object_id)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        Ok(handle)
+    }
+
+    fn object_handle_count(&self, object_id: u64) -> usize {
+        self.object_handle_refs
+            .get(&object_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn forget_object_handle_refs(&mut self, object_id: u64) {
+        let _ = self.object_handle_refs.remove(&object_id);
+    }
+
+    fn decrement_object_handle_ref(&mut self, object_id: u64) {
+        match self.object_handle_refs.get_mut(&object_id) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                self.object_handle_refs.remove(&object_id);
+            }
+            None => {}
+        }
     }
 }
 
@@ -480,13 +528,19 @@ pub(crate) fn finish_syscall(
     cpu_frame: *mut u64,
 ) -> Result<(), zx_status_t> {
     run_trap_blocking(|resuming_blocked_current| {
-        with_kernel_mut(|kernel| {
-            kernel
-                .finish_trap_exit(trap, cpu_frame, resuming_blocked_current)
-                .map(|disposition| match disposition {
-                    crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(()),
-                    crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
-                })
+        with_state_mut(|state| {
+            let disposition = state.with_kernel_mut(|kernel| {
+                kernel.finish_trap_exit(trap, cpu_frame, resuming_blocked_current)
+            })?;
+            let lifecycle_dirty =
+                state.with_kernel_mut(|kernel| Ok(kernel.take_task_lifecycle_dirty()))?;
+            if lifecycle_dirty {
+                sync_task_lifecycle(state)?;
+            }
+            Ok(match disposition {
+                crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(()),
+                crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
+            })
         })
     })
 }
@@ -684,7 +738,24 @@ fn release_channel_payload(state: &mut KernelState, payload: ChannelPayload) {
     }
 }
 
+fn retain_transferred_handles(state: &mut KernelState, handles: &[TransferredCap]) {
+    for transferred in handles {
+        state
+            .object_handle_refs
+            .entry(transferred.capability().object_id())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+}
+
+fn release_transferred_handles(state: &mut KernelState, handles: &[TransferredCap]) {
+    for transferred in handles {
+        state.decrement_object_handle_ref(transferred.capability().object_id());
+    }
+}
+
 fn release_channel_message(state: &mut KernelState, message: ChannelMessage) {
+    release_transferred_handles(state, &message.handles);
     release_channel_payload(state, message.payload);
 }
 
@@ -936,7 +1007,7 @@ pub fn start_process(
 pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        match state.objects.get(&resolved.object_id()) {
+        let result = match state.objects.get(&resolved.object_id()) {
             Some(KernelObject::Process(process)) => {
                 require_handle_rights(resolved, crate::task::HandleRights::MANAGE_PROCESS)?;
                 state.with_kernel_mut(|kernel| kernel.kill_process(process.process_id))
@@ -947,7 +1018,9 @@ pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
             }
             Some(_) => Err(ZX_ERR_WRONG_TYPE),
             None => Err(ZX_ERR_BAD_HANDLE),
-        }
+        };
+        result?;
+        sync_task_lifecycle(state)
     })
 }
 
@@ -1125,13 +1198,19 @@ pub fn handle_page_fault(
     };
     run_trap_blocking(|resuming_blocked_current| {
         if resuming_blocked_current {
-            return with_kernel_mut(|kernel| {
-                kernel
-                    .finish_trap_exit(trap, user_cpu_frame, true)
-                    .map(|disposition| match disposition {
-                        crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(true),
-                        crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
-                    })
+            return with_state_mut(|state| {
+                let disposition = state.with_kernel_mut(|kernel| {
+                    kernel.finish_trap_exit(trap, user_cpu_frame, true)
+                })?;
+                let lifecycle_dirty =
+                    state.with_kernel_mut(|kernel| Ok(kernel.take_task_lifecycle_dirty()))?;
+                if lifecycle_dirty {
+                    sync_task_lifecycle(state)?;
+                }
+                Ok(match disposition {
+                    crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(true),
+                    crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
+                })
             });
         }
 
@@ -1169,14 +1248,22 @@ pub fn handle_page_fault(
                     if let Some(thread_id) = wake_thread {
                         kernel.make_thread_runnable_preserving_context(thread_id)?;
                     }
-                    kernel
-                        .finish_trap_exit(trap, user_cpu_frame, false)
-                        .map(|disposition| match disposition {
+                    let disposition = kernel.finish_trap_exit(trap, user_cpu_frame, false)?;
+                    let lifecycle_dirty = kernel.take_task_lifecycle_dirty();
+                    Ok((disposition, lifecycle_dirty))
+                })
+                .and_then(|(disposition, lifecycle_dirty)| {
+                    with_state_mut(|state| {
+                        if lifecycle_dirty {
+                            sync_task_lifecycle(state)?;
+                        }
+                        Ok(match disposition {
                             crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(true),
                             crate::task::TrapExitDisposition::BlockCurrent => {
                                 TrapBlock::BlockCurrent
                             }
                         })
+                    })
                 })
             }
         }
@@ -1367,40 +1454,31 @@ pub fn channel_write(
             }
         }
 
-        let peer_status = {
-            let peer = match state.objects.get_mut(&peer_object_id) {
-                Some(KernelObject::Channel(peer)) => peer,
-                Some(_) => {
-                    if let Some(payload) = payload.take() {
-                        release_channel_payload(state, payload);
-                    }
-                    return Err(ZX_ERR_BAD_STATE);
-                }
-                None => {
-                    if let Some(payload) = payload.take() {
-                        release_channel_payload(state, payload);
-                    }
-                    return Err(ZX_ERR_PEER_CLOSED);
-                }
-            };
-            if peer.closed {
-                Some(ZX_ERR_PEER_CLOSED)
-            } else if peer.messages.len() >= CHANNEL_CAPACITY {
+        let peer_status = match state.objects.get(&peer_object_id) {
+            Some(KernelObject::Channel(peer)) if peer.closed => Some(ZX_ERR_PEER_CLOSED),
+            Some(KernelObject::Channel(peer)) if peer.messages.len() >= CHANNEL_CAPACITY => {
                 Some(ZX_ERR_SHOULD_WAIT)
-            } else {
-                let message = ChannelMessage {
-                    payload: payload.take().ok_or(ZX_ERR_BAD_STATE)?,
-                    handles: transferred,
-                };
-                peer.messages.push_back(message);
-                None
             }
+            Some(KernelObject::Channel(_)) => None,
+            Some(_) => Some(ZX_ERR_BAD_STATE),
+            None => Some(ZX_ERR_PEER_CLOSED),
         };
         if let Some(status) = peer_status {
             if let Some(payload) = payload.take() {
                 release_channel_payload(state, payload);
             }
             return Err(status);
+        }
+
+        retain_transferred_handles(state, &transferred);
+        let message = ChannelMessage {
+            payload: payload.take().ok_or(ZX_ERR_BAD_STATE)?,
+            handles: transferred,
+        };
+        match state.objects.get_mut(&peer_object_id) {
+            Some(KernelObject::Channel(peer)) => peer.messages.push_back(message),
+            Some(_) => return Err(ZX_ERR_BAD_STATE),
+            None => return Err(ZX_ERR_PEER_CLOSED),
         }
 
         for raw in handles {
@@ -1480,6 +1558,7 @@ pub fn channel_read(
     };
     let actual_bytes = message.actual_bytes().map_err(|e| (e, 0, 0))?;
     let actual_handles = message.actual_handles().map_err(|e| (e, 0, 0))?;
+    release_transferred_handles(state, &message.handles);
 
     let _ = notify_waitable_signals_changed(state, object_id);
     let _ = notify_waitable_signals_changed(state, peer_object_id);
@@ -2269,20 +2348,36 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
         };
         state.close_handle(raw)?;
 
-        if let Some(target) = suspend_target {
+        if let Some(target) = suspend_target
+            && state.object_handle_count(object_id) == 0
+        {
             let _ = state.objects.remove(&object_id);
+            state.forget_object_handle_refs(object_id);
             match target {
                 SuspendTarget::Process { process_id } => {
-                    state.with_kernel_mut(|kernel| kernel.resume_process(process_id))?;
+                    if let Err(status) =
+                        state.with_kernel_mut(|kernel| kernel.resume_process(process_id))
+                        && status != ZX_ERR_BAD_STATE
+                    {
+                        return Err(status);
+                    }
                 }
                 SuspendTarget::Thread { thread_id } => {
-                    state.with_kernel_mut(|kernel| kernel.resume_thread(thread_id))?;
+                    if let Err(status) =
+                        state.with_kernel_mut(|kernel| kernel.resume_thread(thread_id))
+                        && status != ZX_ERR_BAD_STATE
+                    {
+                        return Err(status);
+                    }
                 }
             }
         }
 
-        if let Some(peer_object_id) = peer_link {
+        if let Some(peer_object_id) = peer_link
+            && state.object_handle_count(object_id) == 0
+        {
             let removed = state.objects.remove(&object_id);
+            state.forget_object_handle_refs(object_id);
             match removed {
                 Some(KernelObject::Channel(mut endpoint)) => {
                     endpoint.closed = true;
@@ -2309,6 +2404,7 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
             let _ = notify_waitable_signals_changed(state, object_id);
             let _ = notify_waitable_signals_changed(state, peer_object_id);
         }
+        sync_task_lifecycle(state)?;
         Ok(())
     })
 }
@@ -2677,7 +2773,10 @@ fn vmar_allocate_align_from_options(options: u32) -> Result<u64, zx_status_t> {
 fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals, zx_status_t> {
     let obj = state.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
     match obj {
-        KernelObject::Process(_) | KernelObject::SuspendToken(_) => Ok(Signals::NONE),
+        KernelObject::Process(process) => {
+            state.with_kernel(|kernel| kernel.process_signals(process.process_id))
+        }
+        KernelObject::SuspendToken(_) => Ok(Signals::NONE),
         KernelObject::Channel(endpoint) => {
             let mut signals = Signals::NONE;
             if endpoint.is_readable() {
@@ -2715,8 +2814,112 @@ fn signals_for_object_id(state: &KernelState, object_id: u64) -> Result<Signals,
                 Signals::NONE
             })
         }
-        KernelObject::Vmo(_) | KernelObject::Vmar(_) | KernelObject::Thread(_) => Ok(Signals::NONE),
+        KernelObject::Thread(thread) => {
+            state.with_kernel(|kernel| kernel.thread_signals(thread.thread_id))
+        }
+        KernelObject::Vmo(_) | KernelObject::Vmar(_) => Ok(Signals::NONE),
     }
+}
+
+fn task_object_ids(state: &KernelState) -> Vec<u64> {
+    state
+        .objects
+        .iter()
+        .filter_map(|(object_id, object)| {
+            matches!(object, KernelObject::Process(_) | KernelObject::Thread(_))
+                .then_some(*object_id)
+        })
+        .collect()
+}
+
+fn process_object_handle_count(state: &KernelState, process_id: u64) -> usize {
+    state
+        .objects
+        .iter()
+        .filter_map(|(object_id, object)| match object {
+            KernelObject::Process(process) if process.process_id == process_id => {
+                Some(state.object_handle_count(*object_id))
+            }
+            _ => None,
+        })
+        .sum()
+}
+
+fn maybe_reap_process_record(state: &mut KernelState, process_id: u64) -> Result<(), zx_status_t> {
+    if process_object_handle_count(state, process_id) != 0 {
+        return Ok(());
+    }
+    let can_reap = match state.with_kernel(|kernel| kernel.can_reap_process(process_id)) {
+        Ok(can_reap) => can_reap,
+        Err(ZX_ERR_BAD_HANDLE) => return Ok(()),
+        Err(status) => return Err(status),
+    };
+    if can_reap {
+        state.with_kernel_mut(|kernel| kernel.reap_process(process_id))?;
+    }
+    Ok(())
+}
+
+fn reap_terminated_task_objects(state: &mut KernelState) -> Result<(), zx_status_t> {
+    loop {
+        let thread_reaps = state
+            .objects
+            .iter()
+            .filter_map(|(object_id, object)| match object {
+                KernelObject::Thread(thread)
+                    if state.object_handle_count(*object_id) == 0
+                        && state
+                            .with_kernel(|kernel| kernel.thread_is_terminated(thread.thread_id))
+                            .unwrap_or(false) =>
+                {
+                    Some((*object_id, thread.thread_id, thread.process_id))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let process_reaps = state
+            .objects
+            .iter()
+            .filter_map(|(object_id, object)| match object {
+                KernelObject::Process(process)
+                    if state.object_handle_count(*object_id) == 0
+                        && state
+                            .with_kernel(|kernel| kernel.process_is_terminated(process.process_id))
+                            .unwrap_or(false) =>
+                {
+                    Some((*object_id, process.process_id))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        if thread_reaps.is_empty() && process_reaps.is_empty() {
+            break;
+        }
+
+        for (object_id, thread_id, process_id) in thread_reaps {
+            let _ = state.objects.remove(&object_id);
+            state.forget_object_handle_refs(object_id);
+            let _ = state.with_kernel_mut(|kernel| kernel.reap_thread(thread_id))?;
+            maybe_reap_process_record(state, process_id)?;
+        }
+
+        for (object_id, process_id) in process_reaps {
+            let _ = state.objects.remove(&object_id);
+            state.forget_object_handle_refs(object_id);
+            maybe_reap_process_record(state, process_id)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn sync_task_lifecycle(state: &mut KernelState) -> Result<(), zx_status_t> {
+    for object_id in task_object_ids(state) {
+        let _ = notify_waitable_signals_changed(state, object_id);
+    }
+    reap_terminated_task_objects(state)
 }
 
 fn notify_waitable_signals_changed(

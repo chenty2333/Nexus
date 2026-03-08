@@ -93,6 +93,9 @@ impl Signals {
 
     /// Timer signaled.
     pub const TIMER_SIGNALED: Signals = Signals::OBJECT_SIGNALED;
+
+    /// Task terminated.
+    pub const TASK_TERMINATED: Signals = Signals::OBJECT_SIGNALED;
 }
 
 impl core::ops::BitOr for Signals {

@@ -792,7 +792,8 @@ pub(crate) enum ThreadState {
     New,
     Runnable,
     Suspended,
-    Killed,
+    TerminationPending,
+    Terminated,
     FutexWait {
         key: FutexKey,
     },
@@ -1570,7 +1571,8 @@ enum ProcessState {
     Created,
     Started,
     Suspended,
-    Killed,
+    Terminating,
+    Terminated,
 }
 
 #[derive(Debug)]
@@ -1613,6 +1615,7 @@ pub(crate) struct Kernel {
     next_thread_id: ThreadId,
     current_thread_id: ThreadId,
     reschedule_requested: bool,
+    task_lifecycle_dirty: bool,
     faults: Arc<Mutex<FaultTable>>,
     vm: Arc<Mutex<VmDomain>>,
 }
@@ -1714,6 +1717,7 @@ impl Kernel {
             next_thread_id: 1,
             current_thread_id: 0,
             reschedule_requested: false,
+            task_lifecycle_dirty: false,
             faults,
             vm,
         };
@@ -2248,7 +2252,17 @@ impl Kernel {
                 Ok(TrapExitDisposition::Complete)
             }
             ThreadState::New => Err(ZX_ERR_BAD_STATE),
-            ThreadState::Suspended | ThreadState::Killed => {
+            ThreadState::TerminationPending => {
+                let thread_id = self.current_thread_id;
+                self.finalize_thread_termination(thread_id)?;
+                if let Some(next_thread_id) = self.pop_runnable_thread() {
+                    self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
+                    Ok(TrapExitDisposition::Complete)
+                } else {
+                    Ok(TrapExitDisposition::BlockCurrent)
+                }
+            }
+            ThreadState::Suspended | ThreadState::Terminated => {
                 if let Some(next_thread_id) = self.pop_runnable_thread() {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     Ok(TrapExitDisposition::Complete)
@@ -2446,7 +2460,10 @@ impl Kernel {
         process_id: ProcessId,
     ) -> Result<(ThreadId, zx_koid_t), zx_status_t> {
         let process = self.process(process_id)?;
-        if process.state == ProcessState::Killed {
+        if matches!(
+            process.state,
+            ProcessState::Terminating | ProcessState::Terminated
+        ) {
             return Err(ZX_ERR_BAD_STATE);
         }
         let thread_id = self.alloc_thread_id();
@@ -2534,30 +2551,7 @@ impl Kernel {
     }
 
     pub(crate) fn kill_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
-        let state = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?.state;
-        match state {
-            ThreadState::Killed => return Ok(()),
-            ThreadState::FutexWait { key } => {
-                let _ = self.futexes.cancel_waiter(key, thread_id);
-            }
-            ThreadState::VmFaultWait { key } => {
-                let mut faults = self.faults.lock();
-                faults.remove_blocked_waiter(key, thread_id);
-            }
-            ThreadState::New
-            | ThreadState::Runnable
-            | ThreadState::Suspended
-            | ThreadState::SignalWait { .. }
-            | ThreadState::PortWait { .. } => {}
-        }
-
-        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        thread.state = ThreadState::Killed;
-        thread.queued = false;
-        if thread_id == self.current_thread_id {
-            self.reschedule_requested = true;
-        }
-        Ok(())
+        self.request_thread_termination(thread_id)
     }
 
     pub(crate) fn kill_process(&mut self, process_id: ProcessId) -> Result<(), zx_status_t> {
@@ -2565,7 +2559,13 @@ impl Kernel {
             .processes
             .get_mut(&process_id)
             .ok_or(ZX_ERR_BAD_HANDLE)?;
-        process.state = ProcessState::Killed;
+        if matches!(
+            process.state,
+            ProcessState::Terminating | ProcessState::Terminated
+        ) {
+            return Ok(());
+        }
+        process.state = ProcessState::Terminating;
         let thread_ids = self
             .threads
             .iter()
@@ -2574,8 +2574,9 @@ impl Kernel {
             })
             .collect::<Vec<_>>();
         for thread_id in thread_ids {
-            self.kill_thread(thread_id)?;
+            self.request_thread_termination(thread_id)?;
         }
+        self.maybe_finalize_process_termination(process_id)?;
         Ok(())
     }
 
@@ -2586,11 +2587,17 @@ impl Kernel {
             .ok_or(ZX_ERR_BAD_HANDLE)?
             .process_id;
         let process = self.process(process_id)?;
-        if matches!(process.state, ProcessState::Created | ProcessState::Killed) {
+        if matches!(
+            process.state,
+            ProcessState::Created | ProcessState::Terminating | ProcessState::Terminated
+        ) {
             return Err(ZX_ERR_BAD_STATE);
         }
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
-        if matches!(thread.state, ThreadState::New | ThreadState::Killed) {
+        if matches!(
+            thread.state,
+            ThreadState::New | ThreadState::TerminationPending | ThreadState::Terminated
+        ) {
             return Err(ZX_ERR_BAD_STATE);
         }
         thread.suspend_tokens = thread.suspend_tokens.saturating_add(1);
@@ -2619,7 +2626,10 @@ impl Kernel {
             .processes
             .get_mut(&process_id)
             .ok_or(ZX_ERR_BAD_HANDLE)?;
-        if matches!(process.state, ProcessState::Created | ProcessState::Killed) {
+        if matches!(
+            process.state,
+            ProcessState::Created | ProcessState::Terminating | ProcessState::Terminated
+        ) {
             return Err(ZX_ERR_BAD_STATE);
         }
         process.suspend_tokens = process.suspend_tokens.saturating_add(1);
@@ -2670,6 +2680,68 @@ impl Kernel {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn thread_is_terminated(&self, thread_id: ThreadId) -> Result<bool, zx_status_t> {
+        let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        Ok(matches!(thread.state, ThreadState::Terminated))
+    }
+
+    pub(crate) fn process_is_terminated(&self, process_id: ProcessId) -> Result<bool, zx_status_t> {
+        let process = self.processes.get(&process_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        Ok(matches!(process.state, ProcessState::Terminated))
+    }
+
+    pub(crate) fn thread_signals(&self, thread_id: ThreadId) -> Result<Signals, zx_status_t> {
+        Ok(if self.thread_is_terminated(thread_id)? {
+            Signals::TASK_TERMINATED
+        } else {
+            Signals::NONE
+        })
+    }
+
+    pub(crate) fn process_signals(&self, process_id: ProcessId) -> Result<Signals, zx_status_t> {
+        Ok(if self.process_is_terminated(process_id)? {
+            Signals::TASK_TERMINATED
+        } else {
+            Signals::NONE
+        })
+    }
+
+    pub(crate) fn reap_thread(&mut self, thread_id: ThreadId) -> Result<ProcessId, zx_status_t> {
+        let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        if !matches!(thread.state, ThreadState::Terminated) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        if thread_id == self.current_thread_id {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        let process_id = thread.process_id;
+        let _ = self.threads.remove(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(process_id)
+    }
+
+    pub(crate) fn can_reap_process(&self, process_id: ProcessId) -> Result<bool, zx_status_t> {
+        let process = self.processes.get(&process_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        if !matches!(process.state, ProcessState::Terminated) {
+            return Ok(false);
+        }
+        Ok(self
+            .threads
+            .values()
+            .all(|thread| thread.process_id != process_id))
+    }
+
+    pub(crate) fn reap_process(&mut self, process_id: ProcessId) -> Result<(), zx_status_t> {
+        if !self.can_reap_process(process_id)? {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        let _ = self.processes.remove(&process_id).ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(())
+    }
+
+    pub(crate) fn take_task_lifecycle_dirty(&mut self) -> bool {
+        core::mem::take(&mut self.task_lifecycle_dirty)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2805,6 +2877,81 @@ impl Kernel {
         Ok(process.state == ProcessState::Suspended)
     }
 
+    fn request_thread_termination(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        let state = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?.state;
+        match state {
+            ThreadState::TerminationPending | ThreadState::Terminated => return Ok(()),
+            ThreadState::FutexWait { key } => {
+                let _ = self.futexes.cancel_waiter(key, thread_id);
+            }
+            ThreadState::VmFaultWait { key } => {
+                let mut faults = self.faults.lock();
+                faults.remove_blocked_waiter(key, thread_id);
+            }
+            ThreadState::New
+            | ThreadState::Runnable
+            | ThreadState::Suspended
+            | ThreadState::SignalWait { .. }
+            | ThreadState::PortWait { .. } => {}
+        }
+
+        if thread_id == self.current_thread_id {
+            let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+            thread.state = ThreadState::TerminationPending;
+            thread.queued = false;
+            self.reschedule_requested = true;
+            return Ok(());
+        }
+
+        self.finalize_thread_termination(thread_id)
+    }
+
+    fn finalize_thread_termination(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        let process_id = self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .process_id;
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if matches!(thread.state, ThreadState::Terminated) {
+            return Ok(());
+        }
+        thread.state = ThreadState::Terminated;
+        thread.queued = false;
+        thread.context = None;
+        self.task_lifecycle_dirty = true;
+        if thread_id == self.current_thread_id {
+            self.reschedule_requested = true;
+        }
+        self.maybe_finalize_process_termination(process_id)?;
+        Ok(())
+    }
+
+    fn maybe_finalize_process_termination(
+        &mut self,
+        process_id: ProcessId,
+    ) -> Result<(), zx_status_t> {
+        let all_threads_terminated = self
+            .threads
+            .values()
+            .filter(|thread| thread.process_id == process_id)
+            .all(|thread| matches!(thread.state, ThreadState::Terminated));
+        let process = self
+            .processes
+            .get_mut(&process_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        if all_threads_terminated
+            && !matches!(
+                process.state,
+                ProcessState::Created | ProcessState::Terminated
+            )
+        {
+            process.state = ProcessState::Terminated;
+            self.task_lifecycle_dirty = true;
+        }
+        Ok(())
+    }
+
     fn maybe_resume_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
         if self.thread_should_be_suspended(thread_id)? {
             return Ok(());
@@ -2913,7 +3060,10 @@ impl Kernel {
         status: Option<zx_status_t>,
     ) -> Result<(), zx_status_t> {
         let previous_state = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?.state;
-        if matches!(previous_state, ThreadState::Killed) {
+        if matches!(
+            previous_state,
+            ThreadState::TerminationPending | ThreadState::Terminated
+        ) {
             return Ok(());
         }
         let hold_suspended = self.thread_should_be_suspended(thread_id)?;

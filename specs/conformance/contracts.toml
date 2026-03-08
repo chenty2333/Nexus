@@ -156,6 +156,11 @@ level = "should"
 description = "Bootstrap task_kill should terminate a child process so subsequent thread creation against it fails with BAD_STATE"
 
 [[contracts]]
+id = "should.task.terminated_wait_bootstrap"
+level = "should"
+description = "Bootstrap task termination should become observable via wait_one on child thread/process handles, and closing those terminated handles should succeed cleanly"
+
+[[contracts]]
 id = "should.task.suspend_process_bootstrap"
 level = "should"
 description = "Bootstrap task_suspend should return a suspend token, keep a child process quiesced while the token is open, and resume it once the token closes"
