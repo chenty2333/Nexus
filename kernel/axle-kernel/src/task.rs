@@ -699,6 +699,91 @@ struct GlobalVmo {
     source: VmoBackingSource,
 }
 
+type PagerReadAtFn = fn(offset: u64, dst: &mut [u8]) -> Result<(), zx_status_t>;
+
+trait PagerReadOnlySource: Send + Sync {
+    fn size_bytes(&self) -> u64;
+
+    fn read_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), zx_status_t>;
+
+    fn materialize_page(&self, page_offset: u64, dst_paddr: u64) -> Result<(), zx_status_t> {
+        let mut scratch = alloc::vec![0; crate::userspace::USER_PAGE_BYTES as usize];
+        self.read_bytes(page_offset, &mut scratch)?;
+        crate::userspace::write_bootstrap_bytes(dst_paddr, 0, &scratch).ok_or(ZX_ERR_BAD_STATE)
+    }
+}
+
+#[derive(Clone)]
+struct PagerSourceHandle(Arc<dyn PagerReadOnlySource>);
+
+impl core::fmt::Debug for PagerSourceHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PagerSourceHandle(..)")
+    }
+}
+
+impl PagerSourceHandle {
+    fn new(source: impl PagerReadOnlySource + 'static) -> Self {
+        Self(Arc::new(source))
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.0.size_bytes()
+    }
+
+    fn read_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), zx_status_t> {
+        self.0.read_bytes(offset, dst)
+    }
+
+    fn materialize_page(&self, page_offset: u64, dst_paddr: u64) -> Result<(), zx_status_t> {
+        self.0.materialize_page(page_offset, dst_paddr)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StaticPagerSource {
+    bytes: &'static [u8],
+}
+
+impl PagerReadOnlySource for StaticPagerSource {
+    fn size_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn read_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), zx_status_t> {
+        let end = offset
+            .checked_add(dst.len() as u64)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let end = usize::try_from(end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let src = self.bytes.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        dst.copy_from_slice(src);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FilePagerSource {
+    size_bytes: u64,
+    read_at: PagerReadAtFn,
+}
+
+impl PagerReadOnlySource for FilePagerSource {
+    fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    fn read_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), zx_status_t> {
+        let end = offset
+            .checked_add(dst.len() as u64)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        if end > self.size_bytes {
+            return Err(ZX_ERR_OUT_OF_RANGE);
+        }
+        (self.read_at)(offset, dst)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum VmoBackingSource {
     Anonymous {
@@ -712,13 +797,13 @@ enum VmoBackingSource {
     },
     PagerReadOnly {
         frames: Vec<Option<FrameId>>,
-        bytes: &'static [u8],
+        source: PagerSourceHandle,
     },
 }
 
 impl VmoBackingSource {
-    fn from_kind(kind: VmoKind, page_count: usize) -> Self {
-        match kind {
+    fn from_kind(kind: VmoKind, page_count: usize) -> Result<Self, zx_status_t> {
+        Ok(match kind {
             VmoKind::Anonymous => Self::Anonymous {
                 frames: alloc::vec![None; page_count],
             },
@@ -728,11 +813,8 @@ impl VmoBackingSource {
             VmoKind::Contiguous => Self::Contiguous {
                 frames: alloc::vec![None; page_count],
             },
-            VmoKind::PagerBacked => Self::PagerReadOnly {
-                frames: alloc::vec![None; page_count],
-                bytes: &[],
-            },
-        }
+            VmoKind::PagerBacked => return Err(ZX_ERR_INVALID_ARGS),
+        })
     }
 
     fn kind(&self) -> VmoKind {
@@ -764,14 +846,8 @@ impl VmoBackingSource {
 
     fn read_bytes_into(&self, offset: u64, dst: &mut [u8]) -> Result<bool, zx_status_t> {
         match self {
-            Self::PagerReadOnly { bytes, .. } => {
-                let end = offset
-                    .checked_add(dst.len() as u64)
-                    .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-                let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-                let end = usize::try_from(end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-                let src = bytes.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?;
-                dst.copy_from_slice(src);
+            Self::PagerReadOnly { source, .. } => {
+                source.read_bytes(offset, dst)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -780,13 +856,8 @@ impl VmoBackingSource {
 
     fn materialize_page_into(&self, page_offset: u64, dst_paddr: u64) -> Result<bool, zx_status_t> {
         match self {
-            Self::PagerReadOnly { bytes, .. } => {
-                let page_size = crate::userspace::USER_PAGE_BYTES as usize;
-                let start = usize::try_from(page_offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-                let end = start.checked_add(page_size).ok_or(ZX_ERR_OUT_OF_RANGE)?;
-                let src = bytes.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?;
-                crate::userspace::write_bootstrap_bytes(dst_paddr, 0, src)
-                    .ok_or(ZX_ERR_BAD_STATE)?;
+            Self::PagerReadOnly { source, .. } => {
+                source.materialize_page(page_offset, dst_paddr)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -808,12 +879,16 @@ impl GlobalVmoStore {
             .map_err(|_| ZX_ERR_OUT_OF_RANGE)
     }
 
-    fn register_snapshot(&mut self, global_vmo_id: KernelVmoId, snapshot: &Vmo) {
+    fn register_snapshot(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        snapshot: &Vmo,
+    ) -> Result<(), zx_status_t> {
         self.entries.insert(
             global_vmo_id,
             GlobalVmo {
                 size_bytes: snapshot.size_bytes(),
-                source: VmoBackingSource::from_kind(snapshot.kind(), snapshot.frames().len()),
+                source: VmoBackingSource::from_kind(snapshot.kind(), snapshot.frames().len())?,
             },
         );
         if let Some(global_vmo) = self.entries.get_mut(&global_vmo_id) {
@@ -821,6 +896,7 @@ impl GlobalVmoStore {
                 *frames = snapshot.frames().to_vec();
             }
         }
+        Ok(())
     }
 
     fn register_empty(
@@ -837,7 +913,30 @@ impl GlobalVmoStore {
             global_vmo_id,
             GlobalVmo {
                 size_bytes,
-                source: VmoBackingSource::from_kind(kind, page_count),
+                source: VmoBackingSource::from_kind(kind, page_count)?,
+            },
+        );
+        Ok(())
+    }
+
+    fn register_pager_source(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        source: PagerSourceHandle,
+    ) -> Result<(), zx_status_t> {
+        if self.entries.contains_key(&global_vmo_id) {
+            return Err(ZX_ERR_ALREADY_EXISTS);
+        }
+        let size_bytes = source.size_bytes();
+        let page_count = Self::page_count_for_size(size_bytes)?;
+        self.entries.insert(
+            global_vmo_id,
+            GlobalVmo {
+                size_bytes,
+                source: VmoBackingSource::PagerReadOnly {
+                    frames: alloc::vec![None; page_count],
+                    source,
+                },
             },
         );
         Ok(())
@@ -848,22 +947,25 @@ impl GlobalVmoStore {
         global_vmo_id: KernelVmoId,
         bytes: &'static [u8],
     ) -> Result<(), zx_status_t> {
-        if self.entries.contains_key(&global_vmo_id) {
-            return Err(ZX_ERR_ALREADY_EXISTS);
-        }
-        let size_bytes = u64::try_from(bytes.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        let page_count = Self::page_count_for_size(size_bytes)?;
-        self.entries.insert(
+        self.register_pager_source(
             global_vmo_id,
-            GlobalVmo {
+            PagerSourceHandle::new(StaticPagerSource { bytes }),
+        )
+    }
+
+    fn register_pager_file_source(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        size_bytes: u64,
+        read_at: PagerReadAtFn,
+    ) -> Result<(), zx_status_t> {
+        self.register_pager_source(
+            global_vmo_id,
+            PagerSourceHandle::new(FilePagerSource {
                 size_bytes,
-                source: VmoBackingSource::PagerReadOnly {
-                    frames: alloc::vec![None; page_count],
-                    bytes,
-                },
-            },
-        );
-        Ok(())
+                read_at,
+            }),
+        )
     }
 
     fn remove(&mut self, global_vmo_id: KernelVmoId) -> Option<GlobalVmo> {
@@ -4088,7 +4190,7 @@ impl VmDomain {
             .ok_or(ZX_ERR_BAD_STATE)?;
         self.global_vmos
             .lock()
-            .register_snapshot(global_vmo_id, &snapshot);
+            .register_snapshot(global_vmo_id, &snapshot)?;
         Ok(())
     }
 
@@ -4111,6 +4213,17 @@ impl VmDomain {
         self.global_vmos
             .lock()
             .register_pager_read_only(global_vmo_id, bytes)
+    }
+
+    fn register_pager_file_global_vmo(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        size_bytes: u64,
+        read_at: PagerReadAtFn,
+    ) -> Result<(), zx_status_t> {
+        self.global_vmos
+            .lock()
+            .register_pager_file_source(global_vmo_id, size_bytes, read_at)
     }
 
     fn import_global_vmo_into_address_space(
@@ -4395,6 +4508,36 @@ impl VmDomain {
         global_vmo_id: KernelVmoId,
     ) -> Result<CreatedVmo, zx_status_t> {
         self.register_pager_backed_global_vmo(global_vmo_id, bytes)?;
+        let local_vmo_id =
+            match self.import_global_vmo_into_address_space(address_space_id, global_vmo_id) {
+                Ok(vmo_id) => vmo_id,
+                Err(err) => {
+                    let _ = self.global_vmos.lock().remove(global_vmo_id);
+                    return Err(err);
+                }
+            };
+        let vmo = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.vm.vmo(local_vmo_id))
+            .cloned()
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(CreatedVmo {
+            process_id,
+            address_space_id,
+            vmo,
+        })
+    }
+
+    pub(crate) fn create_pager_file_vmo_for_address_space(
+        &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        size_bytes: u64,
+        read_at: PagerReadAtFn,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<CreatedVmo, zx_status_t> {
+        self.register_pager_file_global_vmo(global_vmo_id, size_bytes, read_at)?;
         let local_vmo_id =
             match self.import_global_vmo_into_address_space(address_space_id, global_vmo_id) {
                 Ok(vmo_id) => vmo_id,
