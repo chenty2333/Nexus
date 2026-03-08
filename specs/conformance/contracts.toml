@@ -151,6 +151,11 @@ level = "should"
 description = "Bootstrap process_create/process_start should yield a real child address space that can map shared VMOs and run a child thread"
 
 [[contracts]]
+id = "should.task.kill_process_bootstrap"
+level = "should"
+description = "Bootstrap task_kill should terminate a child process so subsequent thread creation against it fails with BAD_STATE"
+
+[[contracts]]
 id = "should.process.lazy_shared_vmo_bootstrap"
 level = "should"
 description = "Bootstrap parent/child shared anonymous VMO mappings should lazily fault through the global VMO path without splitting into distinct frames"

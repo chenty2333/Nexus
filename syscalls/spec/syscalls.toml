@@ -369,3 +369,12 @@ args = [
   { name = "arg_handle", ty = "zx_handle_t" },
   { name = "arg2", ty = "u64" },
 ]
+
+[[syscall]]
+name = "task_kill"
+nr = 31
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "handle", ty = "zx_handle_t" },
+]

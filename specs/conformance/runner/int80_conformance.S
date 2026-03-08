@@ -2534,6 +2534,22 @@ movabs $0, %rax
 int $0x80
 mov %rax, 8*34(%rbx)
 
+// task_kill(child_process)
+mov 0x1900(%rbx), %rdi
+movabs $31, %rax
+int $0x80
+mov %rax, 8*162(%rbx)
+
+// thread_create(child_process) after kill => BAD_STATE
+mov 0x1900(%rbx), %rdi
+xor %rsi, %rsi
+xor %rdx, %rdx
+xor %r10d, %r10d
+lea 0x1da0(%rbx), %r8
+movabs $25, %rax
+int $0x80
+mov %rax, 8*163(%rbx)
+
 // ok=1
 movq $1, 0x00(%rbx)
 int3

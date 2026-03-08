@@ -918,6 +918,25 @@ pub fn start_process(
     })
 }
 
+/// Kill one process or thread handle with minimal bootstrap semantics.
+pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        match state.objects.get(&resolved.object_id()) {
+            Some(KernelObject::Process(process)) => {
+                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_PROCESS)?;
+                state.with_kernel_mut(|kernel| kernel.kill_process(process.process_id))
+            }
+            Some(KernelObject::Thread(thread)) => {
+                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_THREAD)?;
+                state.with_kernel_mut(|kernel| kernel.kill_thread(thread.thread_id))
+            }
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        }
+    })
+}
+
 /// Create an EventPair endpoint pair and return both handles.
 pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_status_t> {
     if options != 0 {

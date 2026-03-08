@@ -279,6 +279,16 @@ impl FaultTable {
         }
     }
 
+    fn remove_blocked_waiter(&mut self, key: FaultInFlightKey, thread_id: ThreadId) {
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return;
+        };
+        let _ = entry.blocked_waiters.remove(&thread_id);
+        if !entry.in_flight && entry.spin_waiters == 0 && entry.blocked_waiters.is_empty() {
+            let _ = self.entries.remove(&key);
+        }
+    }
+
     fn record_wait_spin_loops(&mut self, loops: u64) {
         self.telemetry.wait_spin_loops = self.telemetry.wait_spin_loops.wrapping_add(loops);
     }
@@ -781,6 +791,7 @@ impl CreatedProcess {
 pub(crate) enum ThreadState {
     New,
     Runnable,
+    Killed,
     FutexWait {
         key: FutexKey,
     },
@@ -2231,6 +2242,14 @@ impl Kernel {
                 Ok(TrapExitDisposition::Complete)
             }
             ThreadState::New => Err(ZX_ERR_BAD_STATE),
+            ThreadState::Killed => {
+                if let Some(next_thread_id) = self.pop_runnable_thread() {
+                    self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
+                    Ok(TrapExitDisposition::Complete)
+                } else {
+                    Ok(TrapExitDisposition::BlockCurrent)
+                }
+            }
             ThreadState::FutexWait { .. }
             | ThreadState::SignalWait { .. }
             | ThreadState::PortWait { .. }
@@ -2420,8 +2439,9 @@ impl Kernel {
         &mut self,
         process_id: ProcessId,
     ) -> Result<(ThreadId, zx_koid_t), zx_status_t> {
-        if !self.processes.contains_key(&process_id) {
-            return Err(ZX_ERR_BAD_HANDLE);
+        let process = self.process(process_id)?;
+        if process.state == ProcessState::Killed {
+            return Err(ZX_ERR_BAD_STATE);
         }
         let thread_id = self.alloc_thread_id();
         let koid = self.alloc_koid();
@@ -2504,6 +2524,51 @@ impl Kernel {
             process.state = ProcessState::Created;
         }
         result
+    }
+
+    pub(crate) fn kill_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        let state = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?.state;
+        match state {
+            ThreadState::Killed => return Ok(()),
+            ThreadState::FutexWait { key } => {
+                let _ = self.futexes.cancel_waiter(key, thread_id);
+            }
+            ThreadState::VmFaultWait { key } => {
+                let mut faults = self.faults.lock();
+                faults.remove_blocked_waiter(key, thread_id);
+            }
+            ThreadState::New
+            | ThreadState::Runnable
+            | ThreadState::SignalWait { .. }
+            | ThreadState::PortWait { .. } => {}
+        }
+
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        thread.state = ThreadState::Killed;
+        thread.queued = false;
+        if thread_id == self.current_thread_id {
+            self.reschedule_requested = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn kill_process(&mut self, process_id: ProcessId) -> Result<(), zx_status_t> {
+        let process = self
+            .processes
+            .get_mut(&process_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        process.state = ProcessState::Killed;
+        let thread_ids = self
+            .threads
+            .iter()
+            .filter_map(|(thread_id, thread)| {
+                (thread.process_id == process_id).then_some(*thread_id)
+            })
+            .collect::<Vec<_>>();
+        for thread_id in thread_ids {
+            self.kill_thread(thread_id)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2710,6 +2775,9 @@ impl Kernel {
         status: Option<zx_status_t>,
     ) -> Result<(), zx_status_t> {
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if matches!(thread.state, ThreadState::Killed) {
+            return Ok(());
+        }
         let Some(context) = thread.context else {
             return Err(ZX_ERR_BAD_STATE);
         };
