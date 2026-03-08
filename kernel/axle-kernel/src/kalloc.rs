@@ -5,15 +5,21 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use heapless::Vec;
 use spin::Mutex;
 
 const HEAP_SIZE: usize = 8 * 1024 * 1024; // 8 MiB bootstrap heap.
+const LATE_HEAP_INITIAL_PAGES: usize = 256; // 1 MiB.
+const LATE_HEAP_GROW_PAGES: usize = 64; // 256 KiB.
+const MAX_LATE_ARENAS: usize = 64;
+const MAX_LATE_FREE_RANGES: usize = 1024;
 
 static NEXT: Mutex<usize> = Mutex::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LATE_HEAP_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[repr(align(4096))]
 struct AlignedHeap([u8; HEAP_SIZE]);
@@ -41,6 +47,223 @@ pub(crate) fn bootstrap_heap_stats() -> BootstrapHeapStats {
     }
 }
 
+pub(crate) fn bootstrap_heap_region() -> (u64, u64) {
+    let base = core::ptr::addr_of!(HEAP) as u64;
+    (base, base + HEAP_SIZE as u64)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LateHeapStats {
+    pub(crate) arena_bytes: usize,
+    pub(crate) free_bytes: usize,
+    pub(crate) peak_used_bytes: usize,
+    pub(crate) alloc_fail_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HeapRange {
+    base: usize,
+    len: usize,
+}
+
+impl HeapRange {
+    const fn end(self) -> usize {
+        self.base + self.len
+    }
+}
+
+#[derive(Debug)]
+struct LateHeap {
+    initialized: bool,
+    arenas: Vec<HeapRange, MAX_LATE_ARENAS>,
+    free: Vec<HeapRange, MAX_LATE_FREE_RANGES>,
+    arena_bytes: usize,
+    free_bytes: usize,
+    peak_used_bytes: usize,
+    alloc_fail_count: usize,
+}
+
+impl LateHeap {
+    const fn new() -> Self {
+        Self {
+            initialized: false,
+            arenas: Vec::new(),
+            free: Vec::new(),
+            arena_bytes: 0,
+            free_bytes: 0,
+            peak_used_bytes: 0,
+            alloc_fail_count: 0,
+        }
+    }
+
+    fn init(&mut self, arena_base: usize, arena_len: usize) -> bool {
+        if self.initialized {
+            return true;
+        }
+        if !self.add_arena(arena_base, arena_len) {
+            self.alloc_fail_count = self.alloc_fail_count.saturating_add(1);
+            return false;
+        }
+        self.initialized = true;
+        true
+    }
+
+    fn alloc(&mut self, layout: Layout) -> Option<*mut u8> {
+        let size = layout.size().max(1);
+        for index in 0..self.free.len() {
+            let range = self.free[index];
+            let start = align_up(range.base, layout.align());
+            let end = start.checked_add(size)?;
+            if end > range.end() {
+                continue;
+            }
+
+            let left = start - range.base;
+            let right = range.end() - end;
+            self.free.remove(index);
+            if right != 0 {
+                if self
+                    .free
+                    .insert(
+                        index,
+                        HeapRange {
+                            base: end,
+                            len: right,
+                        },
+                    )
+                    .is_err()
+                {
+                    self.alloc_fail_count = self.alloc_fail_count.saturating_add(1);
+                    let _ = self.insert_free_range(range);
+                    return None;
+                }
+            }
+            if left != 0 {
+                if self
+                    .free
+                    .insert(
+                        index,
+                        HeapRange {
+                            base: range.base,
+                            len: left,
+                        },
+                    )
+                    .is_err()
+                {
+                    self.alloc_fail_count = self.alloc_fail_count.saturating_add(1);
+                    let _ = self.insert_free_range(range);
+                    return None;
+                }
+            }
+
+            self.free_bytes = self.free_bytes.saturating_sub(size);
+            self.peak_used_bytes = self.peak_used_bytes.max(self.arena_bytes - self.free_bytes);
+            return Some(start as *mut u8);
+        }
+        self.alloc_fail_count = self.alloc_fail_count.saturating_add(1);
+        None
+    }
+
+    fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
+        let size = layout.size().max(1);
+        let base = ptr as usize;
+        let _ = self.insert_free_range(HeapRange { base, len: size });
+        self.free_bytes = self.free_bytes.saturating_add(size).min(self.arena_bytes);
+    }
+
+    fn add_arena(&mut self, arena_base: usize, arena_len: usize) -> bool {
+        let arena = HeapRange {
+            base: arena_base,
+            len: arena_len,
+        };
+        if self.arenas.push(arena).is_err() {
+            return false;
+        }
+        if self.insert_free_range(arena).is_err() {
+            let _ = self.arenas.pop();
+            return false;
+        }
+        self.arena_bytes = self.arena_bytes.saturating_add(arena_len);
+        self.free_bytes = self.free_bytes.saturating_add(arena_len);
+        true
+    }
+
+    fn contains(&self, ptr: *mut u8) -> bool {
+        let addr = ptr as usize;
+        self.arenas
+            .iter()
+            .copied()
+            .any(|arena| addr >= arena.base && addr < arena.end())
+    }
+
+    fn stats(&self) -> LateHeapStats {
+        LateHeapStats {
+            arena_bytes: self.arena_bytes,
+            free_bytes: self.free_bytes,
+            peak_used_bytes: self.peak_used_bytes,
+            alloc_fail_count: self.alloc_fail_count,
+        }
+    }
+
+    fn insert_free_range(&mut self, mut range: HeapRange) -> Result<(), ()> {
+        if range.len == 0 {
+            return Ok(());
+        }
+
+        let mut insert_at = 0;
+        while insert_at < self.free.len() && self.free[insert_at].base < range.base {
+            insert_at += 1;
+        }
+
+        if insert_at > 0 {
+            let prev = self.free[insert_at - 1];
+            if prev.end() >= range.base {
+                range.base = prev.base;
+                range.len = prev.end().max(range.end()) - range.base;
+                self.free.remove(insert_at - 1);
+                insert_at -= 1;
+            }
+        }
+
+        while insert_at < self.free.len() {
+            let next = self.free[insert_at];
+            if next.base > range.end() {
+                break;
+            }
+            range.base = range.base.min(next.base);
+            range.len = next.end().max(range.end()) - range.base;
+            self.free.remove(insert_at);
+        }
+
+        self.free.insert(insert_at, range).map_err(|_| ())
+    }
+}
+
+static LATE_HEAP: Mutex<LateHeap> = Mutex::new(LateHeap::new());
+
+pub(crate) fn late_heap_stats() -> LateHeapStats {
+    LATE_HEAP.lock().stats()
+}
+
+pub(crate) fn init_late_heap() {
+    if LATE_HEAP_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+
+    let arena_base = crate::pmm::alloc_pages(LATE_HEAP_INITIAL_PAGES)
+        .expect("kalloc: failed to allocate initial PMM-backed late heap arena");
+    let arena_len =
+        usize::try_from(crate::userspace::USER_PAGE_BYTES * LATE_HEAP_INITIAL_PAGES as u64)
+            .expect("kalloc: late heap arena length overflow");
+
+    let mut heap = LATE_HEAP.lock();
+    assert!(
+        heap.init(arena_base as usize, arena_len),
+        "kalloc: failed to initialize late heap metadata"
+    );
+    LATE_HEAP_ENABLED.store(true, Ordering::Release);
+}
+
 #[global_allocator]
 static GLOBAL_ALLOCATOR: BootstrapAllocator = BootstrapAllocator;
 
@@ -50,6 +273,12 @@ const fn align_up(v: usize, align: usize) -> usize {
 
 unsafe impl GlobalAlloc for BootstrapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if LATE_HEAP_ENABLED.load(Ordering::Acquire) {
+            if let Some(ptr) = alloc_from_late_heap(layout) {
+                return ptr;
+            }
+        }
+
         let mut next = NEXT.lock();
         let heap_base = core::ptr::addr_of_mut!(HEAP) as usize;
         let start_addr = align_up(heap_base.saturating_add(*next), layout.align());
@@ -75,7 +304,39 @@ unsafe impl GlobalAlloc for BootstrapAllocator {
         start_addr as *mut u8
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // no-op for bootstrap bump allocator
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if !LATE_HEAP_ENABLED.load(Ordering::Acquire) {
+            return;
+        }
+
+        let mut heap = LATE_HEAP.lock();
+        if heap.contains(ptr) {
+            heap.dealloc(ptr, layout);
+        }
     }
+}
+
+fn alloc_from_late_heap(layout: Layout) -> Option<*mut u8> {
+    {
+        let mut heap = LATE_HEAP.lock();
+        if let Some(ptr) = heap.alloc(layout) {
+            return Some(ptr);
+        }
+    }
+
+    let min_bytes = layout
+        .size()
+        .max(crate::userspace::USER_PAGE_BYTES as usize * LATE_HEAP_GROW_PAGES);
+    let page_bytes = crate::userspace::USER_PAGE_BYTES as usize;
+    let grow_pages = (min_bytes + (page_bytes - 1)) / page_bytes;
+    let arena_base = crate::pmm::alloc_pages(grow_pages)?;
+    let arena_len = page_bytes.checked_mul(grow_pages)?;
+
+    let mut heap = LATE_HEAP.lock();
+    if !heap.add_arena(arena_base as usize, arena_len) {
+        crate::pmm::free_pages(arena_base, grow_pages);
+        heap.alloc_fail_count = heap.alloc_fail_count.saturating_add(1);
+        return None;
+    }
+    heap.alloc(layout)
 }

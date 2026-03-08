@@ -12,6 +12,7 @@ mod futex;
 mod kalloc;
 mod object;
 mod page_table;
+mod pmm;
 mod port_queue;
 mod smp;
 mod syscall;
@@ -32,6 +33,8 @@ fn panic(info: &PanicInfo) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     arch::init();
+    pmm::init();
+    kalloc::init_late_heap();
 
     kprintln!("Axle kernel: hello from _start()");
     kprintln!("(Phase B skeleton)");

@@ -127,6 +127,18 @@ external VM model.
   transactions, sender-side COW arming, and a conservative bootstrap
   `remap-fill` fast path. Channel `close/read` and `WRITABLE` recovery behavior
   is covered by conformance tests.
+- Bootstrap page allocation is no longer borrowing from the global Rust bump
+  heap. Early page consumers (page tables, COW pages, pager materialization,
+  bootstrap kernel VMO backing) now allocate from a small PVH-memmap-backed
+  PMM that manages the identity-mapped low RAM window directly. That removes
+  page-sized allocations from the metadata heap and makes `free_bootstrap_page`
+  / `free_bootstrap_pages` real frees instead of no-op bookkeeping.
+- The kernel allocator now has an early/late split: boot still starts on the
+  fixed 8 MiB bump heap, but after PVH memory-map discovery the kernel cuts
+  over to a PMM-backed reclaiming late heap for `Vec` / `BTreeMap` / `Arc` /
+  handle-table metadata. Early bump allocations stay pinned; late allocations
+  are reusable. Bootstrap heap telemetry remains exported so regressions still
+  show how much early heap was consumed before the cutover.
 - Channel ownership no longer depends on a create-time address-space snapshot.
   Endpoints resolve the owner through `process_id -> address_space_id` at use
   time, which removes one bootstrap-only assumption from the loan/remap path.

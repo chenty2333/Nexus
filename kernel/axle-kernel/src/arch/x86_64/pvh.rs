@@ -23,6 +23,8 @@ global_asm!(
 axle_pvh_entry32:
     cli
 
+    movl %ebx, axle_pvh_start_info_paddr
+
     movl $pvh_pml4, %eax
     movl %eax, %cr3
 
@@ -100,6 +102,102 @@ pvh_pd:
 axle_pvh_stack:
     .space 32768
 axle_pvh_stack_top:
+
+    .section .data.axle_pvh_boot, "aw"
+    .align 8
+    .global axle_pvh_start_info_paddr
+axle_pvh_start_info_paddr:
+    .quad 0
 "#,
     options(att_syntax)
 );
+
+unsafe extern "C" {
+    static axle_pvh_start_info_paddr: u64;
+}
+
+/// Xen PVH boot `start_info`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HvmStartInfo {
+    pub(crate) magic: u32,
+    pub(crate) version: u32,
+    pub(crate) flags: u32,
+    pub(crate) nr_modules: u32,
+    pub(crate) modlist_paddr: u64,
+    pub(crate) cmdline_paddr: u64,
+    pub(crate) rsdp_paddr: u64,
+    pub(crate) memmap_paddr: u64,
+    pub(crate) memmap_entries: u32,
+    pub(crate) _reserved: u32,
+}
+
+/// Xen PVH memory-map entry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HvmMemmapEntry {
+    pub(crate) addr: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) entry_type: u32,
+    pub(crate) _reserved: u32,
+}
+
+/// Xen PVH module-list entry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HvmModlistEntry {
+    pub(crate) paddr: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) cmdline_paddr: u64,
+    pub(crate) _reserved: u64,
+}
+
+pub(crate) const HVM_MEMMAP_TYPE_RAM: u32 = 1;
+
+pub(crate) fn start_info_paddr() -> u64 {
+    unsafe {
+        // SAFETY: the PVH entry stub stores the bootloader-provided physical address in this
+        // static before transferring control to Rust `_start`.
+        core::ptr::read_volatile(core::ptr::addr_of!(axle_pvh_start_info_paddr))
+    }
+}
+
+pub(crate) fn start_info() -> Option<&'static HvmStartInfo> {
+    let paddr = start_info_paddr();
+    if paddr == 0 {
+        return None;
+    }
+    Some(unsafe {
+        // SAFETY: PVH guarantees `start_info_paddr` points to a valid `hvm_start_info`
+        // structure in identity-mapped low memory for the duration of early boot.
+        &*(paddr as *const HvmStartInfo)
+    })
+}
+
+pub(crate) fn memmap_entries(start: &HvmStartInfo) -> &'static [HvmMemmapEntry] {
+    if start.memmap_entries == 0 || start.memmap_paddr == 0 {
+        return &[];
+    }
+    unsafe {
+        // SAFETY: the PVH `start_info` describes a contiguous memory-map table that remains
+        // valid in identity-mapped low memory during kernel bring-up.
+        core::slice::from_raw_parts(
+            start.memmap_paddr as *const HvmMemmapEntry,
+            start.memmap_entries as usize,
+        )
+    }
+}
+
+pub(crate) fn modules(start: &HvmStartInfo) -> &'static [HvmModlistEntry] {
+    if start.nr_modules == 0 || start.modlist_paddr == 0 {
+        return &[];
+    }
+    unsafe {
+        // SAFETY: the PVH `start_info` describes a contiguous module list that remains valid
+        // in identity-mapped low memory during kernel bring-up.
+        core::slice::from_raw_parts(
+            start.modlist_paddr as *const HvmModlistEntry,
+            start.nr_modules as usize,
+        )
+    }
+}

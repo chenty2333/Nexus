@@ -12,7 +12,6 @@
 
 extern crate alloc;
 
-use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use alloc::vec::Vec;
 use axle_types::status::{ZX_ERR_NOT_FOUND, ZX_ERR_OUT_OF_RANGE};
 use axle_types::zx_status_t;
@@ -509,17 +508,7 @@ pub(crate) fn alloc_bootstrap_zeroed_pages(page_count: usize) -> Option<u64> {
     if page_count == 0 {
         return None;
     }
-    let total_bytes = USER_PAGE_BYTES.checked_mul(page_count as u64)?;
-    let layout = Layout::from_size_align(total_bytes as usize, USER_PAGE_BYTES as usize).ok()?;
-    let dst = unsafe {
-        // SAFETY: the bootstrap allocator honors the requested alignment. The returned
-        // page stays owned by the kernel for the rest of bring-up.
-        alloc_zeroed(layout)
-    };
-    if dst.is_null() {
-        return None;
-    }
-    Some(dst as u64)
+    crate::pmm::alloc_zeroed_pages(page_count)
 }
 
 pub(crate) fn free_bootstrap_page(paddr: u64) {
@@ -530,20 +519,7 @@ pub(crate) fn free_bootstrap_pages(paddr: u64, page_count: usize) {
     if page_count == 0 || paddr == 0 || (paddr & (USER_PAGE_BYTES - 1)) != 0 {
         return;
     }
-    let Some(total_bytes) = USER_PAGE_BYTES.checked_mul(page_count as u64) else {
-        return;
-    };
-    let Some(layout) = Layout::from_size_align(total_bytes as usize, USER_PAGE_BYTES as usize).ok()
-    else {
-        return;
-    };
-    unsafe {
-        // SAFETY: `alloc_bootstrap_zeroed_pages` and `alloc_bootstrap_cow_page` allocate
-        // aligned bootstrap-owned pages with this exact layout from the same global allocator.
-        // This helper is only used to free bootstrap pages that were not permanently handed to
-        // a live kernel mapping/object.
-        dealloc(paddr as *mut u8, layout);
-    }
+    crate::pmm::free_pages(paddr, page_count);
 }
 
 pub(crate) fn write_bootstrap_value<T: Copy>(
