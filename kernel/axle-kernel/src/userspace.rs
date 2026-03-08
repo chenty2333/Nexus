@@ -389,7 +389,8 @@ const SLOT_SOCKET_WAIT_ASYNC_PORT_WAIT: usize = 491;
 const SLOT_SOCKET_WAIT_ASYNC_KEY: usize = 492;
 const SLOT_SOCKET_WAIT_ASYNC_TYPE: usize = 493;
 const SLOT_SOCKET_WAIT_ASYNC_OBSERVED: usize = 494;
-const SLOT_MAX: usize = SLOT_SOCKET_WAIT_ASYNC_OBSERVED;
+const SLOT_BOOTSTRAP_RUNNER_VMO_H: usize = 495;
+const SLOT_MAX: usize = SLOT_BOOTSTRAP_RUNNER_VMO_H;
 const SLOT_T0_NS: usize = 511;
 
 #[repr(align(4096))]
@@ -845,7 +846,11 @@ fn read_bootstrap_user_runner_bytes(offset: u64, len: usize) -> Option<Vec<u8>> 
 }
 
 pub(crate) fn qemu_loader_user_runner_size() -> Option<u64> {
-    qemu_loader_user_runner_blob().and_then(|blob| u64::try_from(blob.len()).ok())
+    let blob_len =
+        qemu_loader_user_runner_blob().and_then(|blob| u64::try_from(blob.len()).ok())?;
+    let page = USER_PAGE_BYTES;
+    let padded = blob_len.checked_add(page - 1)? & !(page - 1);
+    Some(padded)
 }
 
 pub(crate) fn read_qemu_loader_user_runner_at(
@@ -853,13 +858,23 @@ pub(crate) fn read_qemu_loader_user_runner_at(
     dst: &mut [u8],
 ) -> Result<(), zx_status_t> {
     let blob = qemu_loader_user_runner_blob().ok_or(ZX_ERR_NOT_FOUND)?;
+    let padded_size = qemu_loader_user_runner_size().ok_or(ZX_ERR_NOT_FOUND)?;
     let end = offset
         .checked_add(dst.len() as u64)
         .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    if end > padded_size {
+        return Err(ZX_ERR_OUT_OF_RANGE);
+    }
+    dst.fill(0);
+    let actual_end = core::cmp::min(end, blob.len() as u64);
+    if actual_end <= offset {
+        return Ok(());
+    }
     let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-    let end = usize::try_from(end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-    let src = blob.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?;
-    dst.copy_from_slice(src);
+    let actual_end = usize::try_from(actual_end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let len = actual_end - start;
+    let src = blob.get(start..actual_end).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    dst[..len].copy_from_slice(src);
     Ok(())
 }
 
@@ -1327,6 +1342,8 @@ pub fn prepare() -> u64 {
     slots[SLOT_SELF_THREAD_H] = crate::object::bootstrap_self_thread_handle().unwrap_or(0) as u64;
     slots[SLOT_SELF_THREAD_KOID] = crate::object::bootstrap_self_thread_koid().unwrap_or(0);
     slots[SLOT_SELF_PROCESS_H] = crate::object::bootstrap_self_process_handle().unwrap_or(0) as u64;
+    slots[SLOT_BOOTSTRAP_RUNNER_VMO_H] =
+        crate::object::bootstrap_runner_vmo_handle().unwrap_or(0) as u64;
 
     entry
 }

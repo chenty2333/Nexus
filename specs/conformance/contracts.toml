@@ -219,3 +219,13 @@ description = "Bootstrap STREAM sockets should allow short writes under backpres
 id = "should.socket.duplicate_peer_close_bootstrap"
 level = "should"
 description = "Bootstrap STREAM sockets should not report PEER_CLOSED while duplicated peer-end handles remain live, but should report it once the last duplicate closes"
+
+[[contracts]]
+id = "should.socket.options_args_bootstrap"
+level = "should"
+description = "Bootstrap STREAM sockets should reject unsupported creation/options combinations, allow zero-byte null writes, reject null read buffers, and allow reads with a null actual pointer"
+
+[[contracts]]
+id = "should.socket.wait_async_bootstrap"
+level = "should"
+description = "Bootstrap STREAM sockets should integrate with object_wait_async so writes make a port wait readable and consumable through zx_port_wait"

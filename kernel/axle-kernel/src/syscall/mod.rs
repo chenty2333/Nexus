@@ -695,6 +695,17 @@ fn sys_socket_write(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
+    if buffer_size == 0 {
+        let actual = match crate::object::socket_write(handle, options, &[]) {
+            Ok(actual) => actual,
+            Err(e) => return e,
+        };
+        return match copyout_optional(actual_ptr, actual) {
+            Ok(()) => ZX_OK,
+            Err(e) => e,
+        };
+    }
+
     let bytes = match copyin_bytes(buffer, buffer_size) {
         Ok(bytes) => bytes,
         Err(e) => return e,

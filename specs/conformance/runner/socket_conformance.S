@@ -275,6 +275,138 @@ socket_read_cmp:
 	cmp $0, 8*480(%rbx)
 	jne user_fail
 
+	// socket_create(DATAGRAM, ...) => NOT_SUPPORTED
+	lea 0x1490(%rbx), %rsi
+	lea 0x1498(%rbx), %rdx
+	movl $1, %edi
+	movabs $36, %rax
+	int $0x80
+	mov %rax, 8*482(%rbx)
+
+	// socket_create(invalid options=2, ...) => INVALID_ARGS
+	lea 0x1490(%rbx), %rsi
+	lea 0x1498(%rbx), %rdx
+	movl $2, %edi
+	movabs $36, %rax
+	int $0x80
+	mov %rax, 8*483(%rbx)
+
+	// create stream pair for option/null-pointer edge cases
+	lea 0x14a0(%rbx), %rsi
+	lea 0x14a8(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $36, %rax
+	int $0x80
+	test %rax, %rax
+	jne user_fail
+
+	// socket_write(sock_args0, 0, NULL, 0, NULL) => OK
+	mov 0x14a0(%rbx), %rdi
+	xorl %esi, %esi
+	xor %edx, %edx
+	xor %r10d, %r10d
+	xor %r8d, %r8d
+	movabs $37, %rax
+	int $0x80
+	mov %rax, 8*484(%rbx)
+
+	// socket_read(sock_args1, 0, NULL, 1, &actual) => INVALID_ARGS
+	mov 0x14a8(%rbx), %rdi
+	xorl %esi, %esi
+	xor %edx, %edx
+	movabs $1, %r10
+	lea 0x14b0(%rbx), %r8
+	movabs $38, %rax
+	int $0x80
+	mov %rax, 8*485(%rbx)
+
+	// socket_write(sock_args0, invalid options=1, buf, 1, &actual) => INVALID_ARGS
+	mov 0x14a0(%rbx), %rdi
+	movl $1, %esi
+	lea 0x1100(%rbx), %rdx
+	movabs $1, %r10
+	lea 0x14b8(%rbx), %r8
+	movabs $37, %rax
+	int $0x80
+	mov %rax, 8*486(%rbx)
+
+	// socket_read(sock_args1, invalid options=2, buf, 1, &actual) => INVALID_ARGS
+	mov 0x14a8(%rbx), %rdi
+	movl $2, %esi
+	lea 0x1180(%rbx), %rdx
+	movabs $1, %r10
+	lea 0x14c0(%rbx), %r8
+	movabs $38, %rax
+	int $0x80
+	mov %rax, 8*487(%rbx)
+
+	// write one byte then read it back with actual == NULL
+	mov 0x14a0(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x1100(%rbx), %rdx
+	movabs $1, %r10
+	lea 0x14c8(%rbx), %r8
+	movabs $37, %rax
+	int $0x80
+	test %rax, %rax
+	jne user_fail
+	mov 0x14a8(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x1180(%rbx), %rdx
+	movabs $1, %r10
+	xor %r8d, %r8d
+	movabs $38, %rax
+	int $0x80
+	mov %rax, 8*488(%rbx)
+
+	// wait_async socket readable -> port packet
+	lea 0x14d0(%rbx), %rsi
+	xorl %edi, %edi
+	movabs $3, %rax
+	int $0x80
+	test %rax, %rax
+	jne user_fail
+
+	lea 0x14d8(%rbx), %rsi
+	lea 0x14e0(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $36, %rax
+	int $0x80
+	test %rax, %rax
+	jne user_fail
+
+	mov 0x14e0(%rbx), %rdi
+	mov 0x14d0(%rbx), %rsi
+	movabs $0x7001, %rdx
+	movl $0x1, %r10d
+	xorl %r8d, %r8d
+	movabs $2, %rax
+	int $0x80
+	mov %rax, 8*489(%rbx)
+
+	mov 0x14d8(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x1100(%rbx), %rdx
+	movabs $1, %r10
+	lea 0x14e8(%rbx), %r8
+	movabs $37, %rax
+	int $0x80
+	mov %rax, 8*490(%rbx)
+
+	mov 0x14d0(%rbx), %rdi
+	xor %rsi, %rsi
+	lea 0x1500(%rbx), %rdx
+	movabs $5, %rax
+	int $0x80
+	mov %rax, 8*491(%rbx)
+	mov 0x1500(%rbx), %rax
+	mov %rax, 8*492(%rbx)
+	mov 0x1508(%rbx), %rax
+	mov %rax, 8*493(%rbx)
+	mov 0x1510(%rbx), %rax
+	shr $32, %rax
+	mov %rax, 8*494(%rbx)
+
 	movq $1, 0x00(%rbx)
 	int3
 

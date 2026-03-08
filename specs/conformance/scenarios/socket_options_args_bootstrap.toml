@@ -1,0 +1,21 @@
+id = "kernel.socket.options_args_bootstrap"
+description = "Bootstrap STREAM sockets should enforce creation and pointer/options edge cases"
+tags = ["module:kernel", "module:socket", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "AXLE_TEST_RUNNER_ASM=specs/conformance/runner/socket_conformance.S cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.socket.options_args_bootstrap"]
+
+[assertions.status_code]
+socket_create_datagram = -2
+socket_create_bad_opts = -10
+socket_write_zero_null = 0
+socket_read_bad_null = -10
+socket_write_bad_opts = -10
+socket_read_bad_opts = -10
+socket_read_actual_null = 0
