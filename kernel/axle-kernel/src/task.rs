@@ -3435,26 +3435,9 @@ impl VmDomain {
             resident_pages.push(frame_id);
         }
 
-        let mut pinned = Vec::with_capacity(page_count);
-        for frame_id in resident_pages.iter().copied() {
-            if self
-                .with_frames_mut(|frames| frames.pin(frame_id))
-                .map_err(|_| ZX_ERR_BAD_STATE)
-                .inspect_err(|_| self.release_pinned_loan_frames(&pinned))
-                .is_err()
-            {
-                return Err(ZX_ERR_BAD_STATE);
-            }
-            if self
-                .with_frames_mut(|frames| frames.inc_loan(frame_id))
-                .is_err()
-            {
-                let _ = self.with_frames_mut(|frames| frames.unpin(frame_id));
-                self.release_pinned_loan_frames(&pinned);
-                return Err(ZX_ERR_BAD_STATE);
-            }
-            pinned.push(frame_id);
-        }
+        self.with_frames_mut(|frames| frames.pin_and_inc_loan_many(&resident_pages))
+            .map_err(|_| ZX_ERR_BAD_STATE)?;
+        let pinned = resident_pages;
         self.try_reserve_inflight_loan_pages(
             address_space_id,
             u64::try_from(page_count).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
@@ -3914,16 +3897,12 @@ impl VmDomain {
                 let reserve_private =
                     self.try_reserve_private_cow_page(address_space_id, page_base)?;
                 let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
-                let frames_handle = self.frame_table();
-                let new_frame_id = {
-                    let mut frames = frames_handle.lock();
-                    frames
-                        .register_existing(new_frame_paddr)
-                        .map_err(|_| ZX_ERR_BAD_STATE)?
-                };
                 let resolved = self.with_address_space_frames_mut(
                     address_space_id,
                     |address_space, frames| {
+                        let new_frame_id = frames
+                            .register_existing(new_frame_paddr)
+                            .map_err(|_| ZX_ERR_BAD_STATE)?;
                         address_space
                             .resolve_cow_fault(frames, page_base, new_frame_id)
                             .map_err(map_address_space_error)
@@ -3982,16 +3961,12 @@ impl VmDomain {
                     return Ok(FaultCommitDisposition::Retry);
                 }
                 let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
-                let frames_handle = self.frame_table();
-                let new_frame_id = {
-                    let mut frames = frames_handle.lock();
-                    frames
-                        .register_existing(new_frame_paddr)
-                        .map_err(|_| ZX_ERR_BAD_STATE)?
-                };
                 let resolved = self.with_address_space_frames_mut(
                     address_space_id,
                     |address_space, frames| {
+                        let new_frame_id = frames
+                            .register_existing(new_frame_paddr)
+                            .map_err(|_| ZX_ERR_BAD_STATE)?;
                         address_space
                             .resolve_lazy_anon_fault(frames, page_base, new_frame_id)
                             .map_err(map_address_space_error)
@@ -4395,15 +4370,11 @@ impl VmDomain {
         let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
         let new_frame_paddr = crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw())
             .ok_or(ZX_ERR_NO_MEMORY)?;
-        let frames_handle = self.frame_table();
-        let new_frame_id = {
-            let mut frames = frames_handle.lock();
-            frames
-                .register_existing(new_frame_paddr)
-                .map_err(|_| ZX_ERR_BAD_STATE)?
-        };
         let resolved =
             self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
+                let new_frame_id = frames
+                    .register_existing(new_frame_paddr)
+                    .map_err(|_| ZX_ERR_BAD_STATE)?;
                 address_space
                     .resolve_cow_fault(frames, fault_va, new_frame_id)
                     .map_err(map_address_space_error)
@@ -4456,15 +4427,11 @@ impl VmDomain {
 
         let new_frame_paddr =
             crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
-        let frames_handle = self.frame_table();
-        let new_frame_id = {
-            let mut frames = frames_handle.lock();
-            frames
-                .register_existing(new_frame_paddr)
-                .map_err(|_| ZX_ERR_BAD_STATE)?
-        };
         let resolved =
             self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
+                let new_frame_id = frames
+                    .register_existing(new_frame_paddr)
+                    .map_err(|_| ZX_ERR_BAD_STATE)?;
                 address_space
                     .resolve_lazy_anon_fault(frames, fault_va, new_frame_id)
                     .map_err(map_address_space_error)
@@ -4642,10 +4609,7 @@ impl VmDomain {
     }
 
     fn release_pinned_loan_frames(&mut self, pages: &[FrameId]) {
-        for &frame_id in pages {
-            let _ = self.with_frames_mut(|frames| frames.dec_loan(frame_id));
-            let _ = self.with_frames_mut(|frames| frames.unpin(frame_id));
-        }
+        self.with_frames_mut(|frames| frames.dec_loan_and_unpin_many(pages));
     }
 
     fn release_loaned_pages_inner(&mut self, address_space_id: AddressSpaceId, pages: &[FrameId]) {

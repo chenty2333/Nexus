@@ -476,6 +476,30 @@ impl FrameTable {
         Ok(())
     }
 
+    /// Pin and mark multiple frames as in-flight loans atomically with rollback on failure.
+    pub fn pin_and_inc_loan_many(&mut self, ids: &[FrameId]) -> Result<(), FrameTableError> {
+        for (applied, &id) in ids.iter().enumerate() {
+            if let Err(err) = self.pin(id) {
+                self.dec_loan_and_unpin_many(&ids[..applied]);
+                return Err(err);
+            }
+            if let Err(err) = self.inc_loan(id) {
+                let _ = self.unpin(id);
+                self.dec_loan_and_unpin_many(&ids[..applied]);
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop in-flight loan pins for multiple frames.
+    pub fn dec_loan_and_unpin_many(&mut self, ids: &[FrameId]) {
+        for &id in ids {
+            let _ = self.dec_loan(id);
+            let _ = self.unpin(id);
+        }
+    }
+
     fn frame_mut(&mut self, id: FrameId) -> Result<&mut FrameDescRecord, FrameTableError> {
         self.frames
             .iter_mut()
@@ -4337,6 +4361,33 @@ mod tests {
         frames.unpin(frame).unwrap();
         assert_eq!(frames.state(frame).unwrap().pin_count(), 0);
         assert_eq!(frames.unpin(frame), Err(FrameTableError::PinUnderflow));
+    }
+
+    #[test]
+    fn frame_batch_loan_helpers_update_counts_and_rollback() {
+        let mut frames = FrameTable::new();
+        let frame0 = frames.register_existing(0x21_000).unwrap();
+        let frame1 = frames.register_existing(0x22_000).unwrap();
+
+        frames.pin_and_inc_loan_many(&[frame0, frame1]).unwrap();
+        assert_eq!(frames.state(frame0).unwrap().pin_count(), 1);
+        assert_eq!(frames.state(frame0).unwrap().loan_count(), 1);
+        assert_eq!(frames.state(frame1).unwrap().pin_count(), 1);
+        assert_eq!(frames.state(frame1).unwrap().loan_count(), 1);
+
+        frames.dec_loan_and_unpin_many(&[frame0, frame1]);
+        assert_eq!(frames.state(frame0).unwrap().pin_count(), 0);
+        assert_eq!(frames.state(frame0).unwrap().loan_count(), 0);
+        assert_eq!(frames.state(frame1).unwrap().pin_count(), 0);
+        assert_eq!(frames.state(frame1).unwrap().loan_count(), 0);
+
+        let missing = FrameId(0x23_000);
+        assert_eq!(
+            frames.pin_and_inc_loan_many(&[frame0, missing]),
+            Err(FrameTableError::NotFound)
+        );
+        assert_eq!(frames.state(frame0).unwrap().pin_count(), 0);
+        assert_eq!(frames.state(frame0).unwrap().loan_count(), 0);
     }
 
     #[test]
