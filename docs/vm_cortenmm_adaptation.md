@@ -100,9 +100,17 @@ external VM model.
 - The kernel now has a direct internal `frame_mappings(frame_id)` snapshot
   helper, so diagnostics and invariants no longer need to manually rebuild
   `anchor -> address_space -> mapping` resolution at each call site.
+- Detailed frame-mapping invariant walks are now off the hot path in normal
+  release builds. They stay enabled under `debug_assertions` or the explicit
+  `vm-diagnostics` kernel feature, so the diagnostic surface remains available
+  without paying the full cost on every fault, COW, or loan path.
 - Kernel diagnostics now dump frame mappings as `(address_space, vmar, map)`
   identities, and child-VMAR destroy / far-range root mappings have a combined
   conformance scenario to catch mixed control-plane/data-plane regressions.
+- The `LazyVmo` materialization path now uses dedicated helpers to
+  `ensure_global_vmo_frame(...)` and `bind_lazy_vmo_frame(...)`, which keeps
+  the `GlobalVmoStore` touchpoints narrow and leaves `address_space + frames`
+  binding on the main VM side.
 
 What is intentionally deferred for later work:
 

@@ -22,3 +22,4 @@ x2apic = { version = "0.5", default-features = false }
 
 [features]
 default = []
+vm-diagnostics = []

@@ -51,6 +51,8 @@ const MAX_TRACKED_TLB_CPUS: usize = 64;
 const DEFAULT_MAX_INFLIGHT_LOAN_PAGES: Option<u64> = Some(32);
 const DEFAULT_MAX_PRIVATE_COW_PAGES: Option<u64> = None;
 const FAULT_WAIT_SPIN_LOOPS: usize = 256;
+const VM_FRAME_DIAGNOSTICS_ENABLED: bool =
+    cfg!(debug_assertions) || cfg!(feature = "vm-diagnostics");
 
 type ProcessId = u64;
 type ThreadId = u64;
@@ -3264,6 +3266,38 @@ impl VmDomain {
         self.update_global_vmo_frame(lookup.global_vmo_id(), page_offset, frame_id)
     }
 
+    fn ensure_global_vmo_frame(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        page_offset: u64,
+        prepared: &mut PreparedFaultWork,
+    ) -> Result<FrameId, zx_status_t> {
+        if let Some(frame_id) = self.global_vmo_frame(global_vmo_id, page_offset)? {
+            return Ok(frame_id);
+        }
+        let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
+        let new_frame_id = self.with_frames_mut(|frames| {
+            frames
+                .register_existing(new_frame_paddr)
+                .map_err(|_| ZX_ERR_BAD_STATE)
+        })?;
+        self.update_global_vmo_frame(global_vmo_id, page_offset, new_frame_id)?;
+        Ok(new_frame_id)
+    }
+
+    fn bind_lazy_vmo_frame(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+        frame_id: FrameId,
+    ) -> Result<LazyVmoFaultResolution, zx_status_t> {
+        self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
+            address_space
+                .resolve_lazy_vmo_fault(frames, page_base, frame_id)
+                .map_err(map_address_space_error)
+        })
+    }
+
     pub(crate) fn create_anonymous_vmo_for_address_space(
         &mut self,
         process_id: ProcessId,
@@ -4029,29 +4063,9 @@ impl VmDomain {
                 if meta.tag() != PteMetaTag::LazyVmo {
                     return Ok(FaultCommitDisposition::Retry);
                 }
-                let frame_id = match self.global_vmo_frame(global_vmo_id, page_offset)? {
-                    Some(frame_id) => frame_id,
-                    None => {
-                        let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
-                        let frames_handle = self.frame_table();
-                        let new_frame_id = {
-                            let mut frames = frames_handle.lock();
-                            frames
-                                .register_existing(new_frame_paddr)
-                                .map_err(|_| ZX_ERR_BAD_STATE)?
-                        };
-                        self.update_global_vmo_frame(global_vmo_id, page_offset, new_frame_id)?;
-                        new_frame_id
-                    }
-                };
-                let resolved = self.with_address_space_frames_mut(
-                    address_space_id,
-                    |address_space, frames| {
-                        address_space
-                            .resolve_lazy_vmo_fault(frames, page_base, frame_id)
-                            .map_err(map_address_space_error)
-                    },
-                )?;
+                let frame_id =
+                    self.ensure_global_vmo_frame(global_vmo_id, page_offset, prepared)?;
+                let resolved = self.bind_lazy_vmo_frame(address_space_id, page_base, frame_id)?;
                 self.sync_mapping_pages(
                     address_space_id,
                     page_base,
@@ -4478,35 +4492,20 @@ impl VmDomain {
             .vmo_offset()
             .checked_sub(lookup.vmo_offset() % crate::userspace::USER_PAGE_BYTES)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        let frame_id = match self.global_vmo_frame(lookup.global_vmo_id(), page_offset)? {
-            Some(frame_id) => frame_id,
+        let mut prepared = match self.global_vmo_frame(lookup.global_vmo_id(), page_offset)? {
+            Some(_) => PreparedFaultWork::None,
             None => match lookup.vmo_kind() {
-                VmoKind::Anonymous => {
-                    let new_frame_paddr =
-                        crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
-                    let frames_handle = self.frame_table();
-                    let new_frame_id = {
-                        let mut frames = frames_handle.lock();
-                        frames
-                            .register_existing(new_frame_paddr)
-                            .map_err(|_| ZX_ERR_BAD_STATE)?
-                    };
-                    self.update_global_vmo_frame(
-                        lookup.global_vmo_id(),
-                        page_offset,
-                        new_frame_id,
-                    )?;
-                    new_frame_id
-                }
+                VmoKind::Anonymous => PreparedFaultWork::NewPage {
+                    paddr: crate::userspace::alloc_bootstrap_zeroed_page()
+                        .ok_or(ZX_ERR_NO_MEMORY)?,
+                },
                 VmoKind::Physical | VmoKind::Contiguous => return Err(ZX_ERR_BAD_STATE),
             },
         };
-        let resolved =
-            self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
-                address_space
-                    .resolve_lazy_vmo_fault(frames, fault_va, frame_id)
-                    .map_err(map_address_space_error)
-            })?;
+        let frame_id =
+            self.ensure_global_vmo_frame(lookup.global_vmo_id(), page_offset, &mut prepared)?;
+        let resolved = self.bind_lazy_vmo_frame(address_space_id, page_base, frame_id)?;
+        prepared.release_unused();
         self.sync_mapping_pages(
             address_space_id,
             page_base,
@@ -4555,6 +4554,9 @@ impl VmDomain {
     }
 
     fn validate_frame_mapping_invariants(&self, frame_id: FrameId, context: &str) {
+        if !VM_FRAME_DIAGNOSTICS_ENABLED {
+            return;
+        }
         let Some(state) = self.with_frames(|frames| frames.state(frame_id)) else {
             return;
         };
@@ -4599,6 +4601,9 @@ impl VmDomain {
     }
 
     fn validate_frame_mapping_invariants_for(&self, frame_ids: &[FrameId], context: &str) {
+        if !VM_FRAME_DIAGNOSTICS_ENABLED {
+            return;
+        }
         let mut unique = Vec::with_capacity(frame_ids.len());
         for &frame_id in frame_ids {
             push_unique_frame_id(&mut unique, frame_id);
