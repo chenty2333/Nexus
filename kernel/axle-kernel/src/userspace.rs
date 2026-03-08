@@ -13,7 +13,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use axle_types::status::{ZX_ERR_NOT_FOUND, ZX_ERR_OUT_OF_RANGE};
+use axle_types::status::{ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NOT_FOUND, ZX_ERR_OUT_OF_RANGE};
 use axle_types::zx_status_t;
 use x86_64::instructions::segmentation::Segment;
 
@@ -732,28 +732,51 @@ struct Elf64Phdr {
 }
 
 fn try_load_user_program_from_qemu_loader() -> Option<u64> {
+    let layout = bootstrap_process_image_layout()?;
+    load_bootstrap_process_image_into_current_mapping(&layout).ok()
+}
+
+fn load_bootstrap_process_image_into_current_mapping(
+    layout: &crate::task::ProcessImageLayout,
+) -> Result<u64, zx_status_t> {
+    for segment in layout.segments() {
+        let file_sz =
+            usize::try_from(segment.file_size_bytes()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let mem_sz = usize::try_from(segment.mem_size_bytes()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let file_bytes = read_bootstrap_user_runner_bytes(segment.vmo_offset(), file_sz)
+            .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
+
+        unsafe {
+            // SAFETY: `bootstrap_process_image_layout()` only returns segments whose virtual
+            // ranges lie inside the bootstrap user code window already mapped by
+            // `map_userspace_pages()`.
+            let dst = segment.vaddr() as *mut u8;
+            core::ptr::copy_nonoverlapping(file_bytes.as_ptr(), dst, file_sz);
+            if mem_sz > file_sz {
+                core::ptr::write_bytes(dst.add(file_sz), 0, mem_sz - file_sz);
+            }
+        }
+    }
+
+    Ok(layout.entry())
+}
+
+pub(crate) fn bootstrap_process_image_layout() -> Option<crate::task::ProcessImageLayout> {
     let image_size =
         crate::task::bootstrap_user_runner_source_size().or_else(qemu_loader_user_runner_size)?;
     if image_size < core::mem::size_of::<Elf64Ehdr>() as u64 {
         return None;
     }
     let ehdr_bytes = read_bootstrap_user_runner_bytes(0, core::mem::size_of::<Elf64Ehdr>())?;
-
     if &ehdr_bytes[0..4] != b"\x7FELF" {
         return None;
     }
 
     let ehdr = unsafe { core::ptr::read_unaligned(ehdr_bytes.as_ptr() as *const Elf64Ehdr) };
-    // 64-bit little-endian.
     if ehdr.e_ident[4] != 2 || ehdr.e_ident[5] != 1 {
         return None;
     }
-    // ET_EXEC.
-    if ehdr.e_type != 2 {
-        return None;
-    }
-    // EM_X86_64.
-    if ehdr.e_machine != 0x3E {
+    if ehdr.e_type != 2 || ehdr.e_machine != 0x3E {
         return None;
     }
     if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
@@ -772,7 +795,9 @@ fn try_load_user_program_from_qemu_loader() -> Option<u64> {
     let ph_table =
         read_bootstrap_user_runner_bytes(ehdr.e_phoff, phnum * core::mem::size_of::<Elf64Phdr>())?;
 
-    // Load PT_LOAD segments into the mapped user code page.
+    let mut segments = Vec::new();
+    let mut min_vaddr = u64::MAX;
+    let mut max_vend = 0u64;
     for i in 0..phnum {
         let off = i * core::mem::size_of::<Elf64Phdr>();
         let ph =
@@ -782,12 +807,8 @@ fn try_load_user_program_from_qemu_loader() -> Option<u64> {
             continue;
         }
 
-        let file_off = ph.p_offset as usize;
-        let file_sz = ph.p_filesz as usize;
-        let mem_sz = ph.p_memsz as usize;
-
-        let file_end = file_off.checked_add(file_sz).unwrap_or(usize::MAX);
-        if u64::try_from(file_end).ok()? > image_size {
+        let file_end = ph.p_offset.checked_add(ph.p_filesz).unwrap_or(u64::MAX);
+        if file_end > image_size {
             panic!("userspace: segment file range out of bounds");
         }
 
@@ -800,29 +821,41 @@ fn try_load_user_program_from_qemu_loader() -> Option<u64> {
             );
         }
 
-        let file_bytes =
-            read_bootstrap_user_runner_bytes(ph.p_offset, file_sz).unwrap_or_else(|| {
-                panic!(
-                    "userspace: segment file read failed off={:#x} len={:#x}",
-                    ph.p_offset, ph.p_filesz
-                )
-            });
-
-        // SAFETY: vaddr range is mapped by `map_userspace_pages()`.
-        unsafe {
-            let dst = vaddr as *mut u8;
-            core::ptr::copy_nonoverlapping(file_bytes.as_ptr(), dst, file_sz);
-            if mem_sz > file_sz {
-                core::ptr::write_bytes(dst.add(file_sz), 0, mem_sz - file_sz);
-            }
+        let mut perms = crate::task::process_image_default_code_perms();
+        if (ph.p_flags & 0x2) != 0 {
+            perms |= axle_mm::MappingPerms::WRITE;
         }
+        let segment = crate::task::ProcessImageSegment::new(
+            vaddr,
+            ph.p_offset,
+            ph.p_filesz,
+            ph.p_memsz,
+            perms,
+        );
+        segments.push(segment);
+        min_vaddr = min_vaddr.min(vaddr);
+        max_vend = max_vend.max(vend);
     }
 
-    if ehdr.e_entry < USER_CODE_VA || ehdr.e_entry >= USER_SHARED_VA {
+    if segments.is_empty() {
+        return None;
+    }
+    if ehdr.e_entry < min_vaddr || ehdr.e_entry >= max_vend {
         panic!("userspace: entry out of range {:#x}", ehdr.e_entry);
     }
 
-    Some(ehdr.e_entry)
+    let code_base = min_vaddr;
+    let code_size_bytes = align_up(
+        max_vend.checked_sub(code_base).unwrap_or(0),
+        USER_PAGE_BYTES,
+    );
+    crate::task::ProcessImageLayout::with_segments(
+        code_base,
+        code_size_bytes,
+        ehdr.e_entry,
+        &segments,
+    )
+    .ok()
 }
 
 fn read_bootstrap_user_runner_bytes(offset: u64, len: usize) -> Option<Vec<u8>> {
@@ -842,6 +875,10 @@ pub(crate) fn qemu_loader_user_runner_size() -> Option<u64> {
     let page = USER_PAGE_BYTES;
     let padded = blob_len.checked_add(page - 1)? & !(page - 1);
     Some(padded)
+}
+
+const fn align_up(value: u64, align: u64) -> u64 {
+    (value + (align - 1)) & !(align - 1)
 }
 
 pub(crate) fn read_qemu_loader_user_runner_at(
@@ -1386,9 +1423,10 @@ pub fn prepare() -> u64 {
     slots[SLOT_SELF_PROCESS_H] = crate::object::bootstrap_self_process_handle().unwrap_or(0) as u64;
     slots[SLOT_SELF_CODE_VMO_H] =
         crate::object::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64;
-    slots[SLOT_SELF_CODE_VMO_SIZE] = crate::object::bootstrap_process_image_layout()
-        .map(|layout| layout.code_size_bytes())
-        .unwrap_or(USER_CODE_BYTES);
+    // Keep the exported bootstrap code-image VMO span stable for the runner ABI. The parsed
+    // image layout is an internal loader detail; the bootstrap code window is still the legacy
+    // fixed-size mapping.
+    slots[SLOT_SELF_CODE_VMO_SIZE] = USER_CODE_BYTES;
     slots[SLOT_BOOTSTRAP_HEAP_USED] = 0;
     slots[SLOT_BOOTSTRAP_HEAP_PEAK] = 0;
     slots[SLOT_BOOTSTRAP_HEAP_ALLOC_FAILS] = 0;

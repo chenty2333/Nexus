@@ -669,32 +669,107 @@ impl CreatedVmo {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct ProcessImageSegment {
+    vaddr: u64,
+    vmo_offset: u64,
+    file_size_bytes: u64,
+    mem_size_bytes: u64,
+    perms: MappingPerms,
+}
+
+impl ProcessImageSegment {
+    pub(crate) const fn new(
+        vaddr: u64,
+        vmo_offset: u64,
+        file_size_bytes: u64,
+        mem_size_bytes: u64,
+        perms: MappingPerms,
+    ) -> Self {
+        Self {
+            vaddr,
+            vmo_offset,
+            file_size_bytes,
+            mem_size_bytes,
+            perms,
+        }
+    }
+
+    pub(crate) const fn vaddr(self) -> u64 {
+        self.vaddr
+    }
+
+    pub(crate) const fn vmo_offset(self) -> u64 {
+        self.vmo_offset
+    }
+
+    pub(crate) const fn file_size_bytes(self) -> u64 {
+        self.file_size_bytes
+    }
+
+    pub(crate) const fn mem_size_bytes(self) -> u64 {
+        self.mem_size_bytes
+    }
+
+    pub(crate) const fn perms(self) -> MappingPerms {
+        self.perms
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ProcessImageLayout {
     code_base: u64,
     code_size_bytes: u64,
     entry: u64,
+    segments: heapless::Vec<ProcessImageSegment, 4>,
 }
 
 impl ProcessImageLayout {
-    pub(crate) const fn bootstrap_conformance() -> Self {
+    pub(crate) fn bootstrap_conformance() -> Self {
         Self {
             code_base: crate::userspace::USER_CODE_VA,
             code_size_bytes: crate::userspace::USER_CODE_BYTES,
             entry: crate::userspace::USER_CODE_VA,
+            segments: heapless::Vec::new(),
         }
     }
 
-    pub(crate) const fn code_base(self) -> u64 {
+    pub(crate) fn with_segments(
+        code_base: u64,
+        code_size_bytes: u64,
+        entry: u64,
+        segments: &[ProcessImageSegment],
+    ) -> Result<Self, zx_status_t> {
+        let mut stored = heapless::Vec::new();
+        for segment in segments {
+            stored.push(*segment).map_err(|_| ZX_ERR_NO_RESOURCES)?;
+        }
+        Ok(Self {
+            code_base,
+            code_size_bytes,
+            entry,
+            segments: stored,
+        })
+    }
+
+    pub(crate) fn code_base(&self) -> u64 {
         self.code_base
     }
 
-    pub(crate) const fn code_size_bytes(self) -> u64 {
+    pub(crate) fn code_size_bytes(&self) -> u64 {
         self.code_size_bytes
     }
 
-    pub(crate) const fn entry(self) -> u64 {
+    pub(crate) fn entry(&self) -> u64 {
         self.entry
     }
+
+    pub(crate) fn segments(&self) -> &[ProcessImageSegment] {
+        self.segments.as_slice()
+    }
+}
+
+pub(crate) const fn process_image_default_code_perms() -> MappingPerms {
+    MappingPerms::READ.union(MappingPerms::EXECUTE)
 }
 
 #[derive(Clone, Debug)]
@@ -704,8 +779,8 @@ pub(crate) struct ImportedProcessImage {
 }
 
 impl ImportedProcessImage {
-    pub(crate) const fn layout(&self) -> ProcessImageLayout {
-        self.layout
+    pub(crate) fn layout(&self) -> ProcessImageLayout {
+        self.layout.clone()
     }
 
     pub(crate) const fn code_vmo(&self) -> &CreatedVmo {
@@ -4702,7 +4777,8 @@ impl VmDomain {
             self.import_bootstrap_user_code_vmo_for_address_space(process_id, address_space_id)?;
         Ok(ImportedProcessImage {
             code_vmo,
-            layout: ProcessImageLayout::bootstrap_conformance(),
+            layout: crate::userspace::bootstrap_process_image_layout()
+                .unwrap_or_else(ProcessImageLayout::bootstrap_conformance),
         })
     }
 

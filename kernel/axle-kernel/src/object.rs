@@ -792,7 +792,7 @@ pub fn bootstrap_self_code_vmo_handle() -> Option<zx_handle_t> {
 pub fn bootstrap_process_image_layout() -> Option<crate::task::ProcessImageLayout> {
     let mut guard = STATE.lock();
     let state = guard.as_mut()?;
-    Some(state.bootstrap_process_image_layout)
+    Some(state.bootstrap_process_image_layout.clone())
 }
 
 /// Return the bootstrap current-thread koid.
