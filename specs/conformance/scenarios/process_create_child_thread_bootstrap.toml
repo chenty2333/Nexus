@@ -1,5 +1,5 @@
 id = "kernel.process.create_child_thread_bootstrap"
-description = "Bootstrap process_create builds a child address space, maps shared VMOs into it, and starts a child thread that wakes the parent"
+description = "Bootstrap process_create/process_start builds a child address space, maps shared VMOs into it, and starts a child thread that wakes the parent"
 tags = ["module:process", "module:thread", "module:vmar", "module:vmo", "kind:qemu"]
 timeout_ms = 180000
 command = [
@@ -19,7 +19,7 @@ process_map_child_code = 0
 process_map_child_shared = 0
 process_map_child_stack = 0
 process_thread_create = 0
-process_thread_start = 0
+process_start = 0
 process_parent_futex_wait = 0
 
 [assertions.packet_fields]

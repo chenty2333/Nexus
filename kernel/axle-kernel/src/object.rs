@@ -835,6 +835,67 @@ pub fn start_thread(
     })
 }
 
+/// Start a newly created process by starting one thread in its address space.
+pub fn start_process(
+    process_handle: zx_handle_t,
+    thread_handle: zx_handle_t,
+    entry: zx_vaddr_t,
+    stack: zx_vaddr_t,
+    arg_handle: zx_handle_t,
+    arg1: u64,
+) -> Result<(), zx_status_t> {
+    if entry == 0 || stack == 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if arg_handle != ZX_HANDLE_INVALID {
+        return Err(ZX_ERR_NOT_SUPPORTED);
+    }
+
+    with_state_mut(|state| {
+        let resolved_process =
+            state.lookup_handle(process_handle, crate::task::HandleRights::MANAGE_PROCESS)?;
+        let process = match state.objects.get(&resolved_process.object_id()) {
+            Some(KernelObject::Process(process)) => *process,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+
+        let resolved_thread =
+            state.lookup_handle(thread_handle, crate::task::HandleRights::MANAGE_THREAD)?;
+        let thread = match state.objects.get(&resolved_thread.object_id()) {
+            Some(KernelObject::Thread(thread)) => *thread,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        if thread.process_id != process.process_id {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+
+        if !state.with_kernel(|kernel| {
+            Ok(kernel.validate_process_user_ptr(process.process_id, entry, 1))
+        })? {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let stack_probe = stack.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
+        if !state.with_kernel(|kernel| {
+            Ok(kernel.validate_process_user_ptr(process.process_id, stack_probe, 8))
+        })? {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        state.with_kernel_mut(|kernel| {
+            kernel.start_process(
+                process.process_id,
+                thread.thread_id,
+                entry,
+                stack,
+                arg_handle as u64,
+                arg1,
+            )
+        })
+    })
+}
+
 /// Create an EventPair endpoint pair and return both handles.
 pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_status_t> {
     if options != 0 {

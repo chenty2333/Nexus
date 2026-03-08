@@ -2324,14 +2324,15 @@ local_fault_contention_done:
 	int $0x80
 	mov %rax, 8*350(%rbx)
 
-	// thread_start(child_thread, process_child_entry, USER_SHARED_VA, USER_CODE_VA + 0xb000)
-	mov 0x1938(%rbx), %rdi
-	lea process_child_entry(%rip), %rsi
-	movabs $0x000000010000a000, %rdx
-	add $0x1000, %rdx
-	movabs $0x0000000100008000, %r10
-	movabs $0x000000010000b000, %r8
-	movabs $26, %rax
+	// process_start(child_process, child_thread, process_child_entry, USER_STACK_TOP, ZX_HANDLE_INVALID, USER_SHARED_VA)
+	mov 0x1900(%rbx), %rdi
+	mov 0x1938(%rbx), %rsi
+	lea process_child_entry(%rip), %rdx
+	movabs $0x000000010000a000, %r10
+	add $0x1000, %r10
+	xor %r8d, %r8d
+	movabs $0x0000000100008000, %r9
+	movabs $30, %rax
 	int $0x80
 	mov %rax, 8*351(%rbx)
 
@@ -2548,8 +2549,8 @@ thread_worker_touch_page:
 	jmp thread_worker_spin
 
 process_child_entry:
-	mov %rdi, %rbx
-	mov %rsi, %rcx
+	mov %rsi, %rbx
+	movabs $0x000000010000b000, %rcx
 	movabs $0x1122334455667788, %rax
 	mov %rax, 0x0(%rcx)
 	movq $1, 0x0(%rbx)

@@ -15,7 +15,7 @@ contracts = ["should.process.lazy_shared_vmo_bootstrap"]
 process_create = 0
 process_map_parent_lazy_shared = 0
 process_map_child_lazy_shared = 0
-process_thread_start = 0
+process_start = 0
 process_parent_futex_wait = 0
 
 [assertions.packet_fields]

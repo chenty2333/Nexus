@@ -24,10 +24,10 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
     AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER,
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
-    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE, AXLE_SYS_THREAD_CREATE,
-    AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET,
-    AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT,
-    AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE, SyscallNumber,
+    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START,
+    AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE,
+    AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP,
+    AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE, SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -40,7 +40,7 @@ use core::mem::size_of;
 use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 30] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 31] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -69,6 +69,7 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 30] = [
     AXLE_SYS_THREAD_CREATE,
     AXLE_SYS_THREAD_START,
     AXLE_SYS_PROCESS_CREATE,
+    AXLE_SYS_PROCESS_START,
     AXLE_SYS_VMAR_ALLOCATE,
     AXLE_SYS_VMAR_DESTROY,
 ];
@@ -133,6 +134,7 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_THREAD_CREATE => sys_thread_create(args),
         AXLE_SYS_THREAD_START => sys_thread_start(args),
         AXLE_SYS_PROCESS_CREATE => sys_process_create(args),
+        AXLE_SYS_PROCESS_START => sys_process_start(args),
         _ => ZX_ERR_BAD_SYSCALL,
     }
 }
@@ -1024,6 +1026,29 @@ fn sys_process_create(args: [u64; 6]) -> zx_status_t {
         return e;
     }
     match copyout(out_vmar_ptr, root_vmar_handle) {
+        Ok(()) => ZX_OK,
+        Err(e) => e,
+    }
+}
+
+fn sys_process_start(args: [u64; 6]) -> zx_status_t {
+    let process = match u32::try_from(args[0]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let thread = match u32::try_from(args[1]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let entry = args[2];
+    let stack = args[3];
+    let arg_handle = match u32::try_from(args[4]) {
+        Ok(value) => value,
+        Err(_) => return ZX_ERR_INVALID_ARGS,
+    };
+    let arg2 = args[5];
+
+    match crate::object::start_process(process, thread, entry, stack, arg_handle, arg2) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }

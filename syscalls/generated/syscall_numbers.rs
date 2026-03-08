@@ -62,3 +62,5 @@ pub const AXLE_SYS_PROCESS_CREATE: SyscallNumber = 27;
 pub const AXLE_SYS_VMAR_ALLOCATE: SyscallNumber = 28;
 /// Contract: SHOULD
 pub const AXLE_SYS_VMAR_DESTROY: SyscallNumber = 29;
+/// Contract: SHOULD
+pub const AXLE_SYS_PROCESS_START: SyscallNumber = 30;

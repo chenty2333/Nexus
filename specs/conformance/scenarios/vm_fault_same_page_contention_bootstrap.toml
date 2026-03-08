@@ -16,7 +16,7 @@ thread_create = 0
 thread_start = 0
 thread_futex_wait = 0
 process_create = 0
-process_thread_start = 0
+process_start = 0
 process_parent_futex_wait = 0
 
 [assertions.packet_fields]

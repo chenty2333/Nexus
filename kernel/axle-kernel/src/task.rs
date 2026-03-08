@@ -1453,6 +1453,7 @@ struct Process {
     koid: zx_koid_t,
     address_space_id: AddressSpaceId,
     cspace: CSpace,
+    state: ProcessState,
 }
 
 impl Process {
@@ -1461,6 +1462,16 @@ impl Process {
             koid,
             address_space_id,
             cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
+            state: ProcessState::Started,
+        }
+    }
+
+    fn created(address_space_id: AddressSpaceId, koid: zx_koid_t) -> Self {
+        Self {
+            koid,
+            address_space_id,
+            cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
+            state: ProcessState::Created,
         }
     }
 
@@ -1515,6 +1526,14 @@ impl Process {
             .map_err(map_alloc_error)?;
         Ok(replaced.raw())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessState {
+    Created,
+    Started,
+    Suspended,
+    Killed,
 }
 
 #[derive(Debug)]
@@ -1964,10 +1983,8 @@ impl Kernel {
 
         let process_id = self.alloc_process_id();
         let process_koid = self.alloc_koid();
-        self.processes.insert(
-            process_id,
-            Process::bootstrap(address_space_id, process_koid),
-        );
+        self.processes
+            .insert(process_id, Process::created(address_space_id, process_koid));
 
         Ok(CreatedProcess {
             process_id,
@@ -2389,6 +2406,15 @@ impl Kernel {
         arg0: u64,
         arg1: u64,
     ) -> Result<(), zx_status_t> {
+        let process_id = self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .process_id;
+        let process = self.process(process_id)?;
+        if process.state != ProcessState::Started {
+            return Err(ZX_ERR_BAD_STATE);
+        }
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
         if !matches!(thread.state, ThreadState::New) {
             return Err(ZX_ERR_BAD_STATE);
@@ -2402,6 +2428,42 @@ impl Kernel {
             self.enqueue_runnable_thread(thread_id_copy)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn start_process(
+        &mut self,
+        process_id: ProcessId,
+        thread_id: ThreadId,
+        entry: u64,
+        stack: u64,
+        arg0: u64,
+        arg1: u64,
+    ) -> Result<(), zx_status_t> {
+        let thread_process_id = self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .process_id;
+        if thread_process_id != process_id {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        let process = self
+            .processes
+            .get_mut(&process_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        if process.state != ProcessState::Created {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        process.state = ProcessState::Started;
+        let result = self.start_thread(thread_id, entry, stack, arg0, arg1);
+        if result.is_err() {
+            let process = self
+                .processes
+                .get_mut(&process_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            process.state = ProcessState::Created;
+        }
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
