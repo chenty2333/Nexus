@@ -309,7 +309,7 @@ impl KernelState {
         id
     }
 
-    fn with_kernel<T>(
+    fn with_core<T>(
         &self,
         f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
     ) -> Result<T, zx_status_t> {
@@ -317,12 +317,40 @@ impl KernelState {
         f(&kernel)
     }
 
-    fn with_kernel_mut<T>(
+    fn with_core_mut<T>(
         &self,
         f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
     ) -> Result<T, zx_status_t> {
         let mut kernel = self.kernel.lock();
         f(&mut kernel)
+    }
+
+    fn vm_handle(&self) -> Result<Arc<Mutex<crate::task::VmDomain>>, zx_status_t> {
+        let kernel = self.kernel.lock();
+        Ok(kernel.vm_handle())
+    }
+
+    fn with_vm_mut<T>(
+        &self,
+        f: impl FnOnce(&mut crate::task::VmDomain) -> Result<T, zx_status_t>,
+    ) -> Result<T, zx_status_t> {
+        let vm = self.vm_handle()?;
+        let mut vm = vm.lock();
+        f(&mut vm)
+    }
+
+    fn with_kernel<T>(
+        &self,
+        f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
+    ) -> Result<T, zx_status_t> {
+        self.with_core(f)
+    }
+
+    fn with_kernel_mut<T>(
+        &self,
+        f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
+    ) -> Result<T, zx_status_t> {
+        self.with_core_mut(f)
     }
 
     fn alloc_handle_for_object(
@@ -331,7 +359,7 @@ impl KernelState {
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
         let cap = Capability::new(object_id, rights.bits(), DEFAULT_OBJECT_GENERATION);
-        self.with_kernel_mut(|kernel| kernel.alloc_handle_for_current_process(cap))
+        self.with_core_mut(|kernel| kernel.alloc_handle_for_current_process(cap))
     }
 
     fn lookup_handle(
@@ -339,11 +367,11 @@ impl KernelState {
         raw: zx_handle_t,
         required_rights: crate::task::HandleRights,
     ) -> Result<crate::task::ResolvedHandle, zx_status_t> {
-        self.with_kernel(|kernel| kernel.lookup_current_handle(raw, required_rights))
+        self.with_core(|kernel| kernel.lookup_current_handle(raw, required_rights))
     }
 
     fn close_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
-        self.with_kernel_mut(|kernel| kernel.close_current_handle(raw))
+        self.with_core_mut(|kernel| kernel.close_current_handle(raw))
     }
 
     fn duplicate_handle(
@@ -351,7 +379,7 @@ impl KernelState {
         raw: zx_handle_t,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
-        self.with_kernel_mut(|kernel| kernel.duplicate_current_handle(raw, rights))
+        self.with_core_mut(|kernel| kernel.duplicate_current_handle(raw, rights))
     }
 
     fn replace_handle(
@@ -359,12 +387,7 @@ impl KernelState {
         raw: zx_handle_t,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
-        self.with_kernel_mut(|kernel| kernel.replace_current_handle(raw, rights))
-    }
-
-    fn validate_current_user_ptr(&self, ptr: u64, len: usize) -> bool {
-        self.with_kernel(|kernel| Ok(kernel.validate_current_user_ptr(ptr, len)))
-            .unwrap_or(false)
+        self.with_core_mut(|kernel| kernel.replace_current_handle(raw, rights))
     }
 }
 
@@ -458,7 +481,13 @@ fn kernel_handle() -> Result<Arc<Mutex<crate::task::Kernel>>, zx_status_t> {
     Ok(state.kernel.clone())
 }
 
-fn with_kernel_mut<T>(
+fn vm_handle() -> Result<Arc<Mutex<crate::task::VmDomain>>, zx_status_t> {
+    let kernel = kernel_handle()?;
+    let kernel = kernel.lock();
+    Ok(kernel.vm_handle())
+}
+
+fn with_core_mut<T>(
     f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
     let kernel = kernel_handle()?;
@@ -466,12 +495,40 @@ fn with_kernel_mut<T>(
     f(&mut kernel)
 }
 
-fn with_kernel<T>(
+fn with_core<T>(
     f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
     let kernel = kernel_handle()?;
     let kernel = kernel.lock();
     f(&kernel)
+}
+
+fn with_vm_mut<T>(
+    f: impl FnOnce(&mut crate::task::VmDomain) -> Result<T, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    let vm = vm_handle()?;
+    let mut vm = vm.lock();
+    f(&mut vm)
+}
+
+fn with_vm<T>(
+    f: impl FnOnce(&crate::task::VmDomain) -> Result<T, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    let vm = vm_handle()?;
+    let vm = vm.lock();
+    f(&vm)
+}
+
+fn with_kernel_mut<T>(
+    f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    with_core_mut(f)
+}
+
+fn with_kernel<T>(
+    f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    with_core(f)
 }
 
 /// Create a new Port object and return a handle.
@@ -544,8 +601,8 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
 
 fn release_channel_payload(state: &mut KernelState, payload: ChannelPayload) {
     if let ChannelPayload::Loaned(loaned) = payload {
-        let _ = state.with_kernel_mut(|kernel| {
-            kernel.release_loaned_user_pages(&loaned);
+        let _ = state.with_vm_mut(|vm| {
+            vm.release_loaned_user_pages(&loaned);
             Ok(())
         });
     }
@@ -568,21 +625,29 @@ fn channel_endpoint_address_space_id(
     state: &KernelState,
     endpoint: &ChannelEndpoint,
 ) -> Result<u64, zx_status_t> {
-    state.with_kernel(|kernel| kernel.process_address_space_id(endpoint.owner_process_id))
+    state.with_core(|kernel| kernel.process_address_space_id(endpoint.owner_process_id))
 }
 
 pub(crate) fn try_loan_current_user_pages(
     ptr: u64,
     len: usize,
 ) -> Result<Option<crate::task::LoanedUserPages>, zx_status_t> {
-    with_kernel_mut(|kernel| kernel.try_loan_current_user_pages(ptr, len))
+    let address_space_id = with_core(|kernel| {
+        let process = kernel.current_process_info()?;
+        kernel.process_address_space_id(process.process_id())
+    })?;
+    with_vm_mut(|vm| vm.try_loan_user_pages(address_space_id, ptr, len))
 }
 
 pub(crate) fn try_remap_loaned_channel_read(
     dst_base: u64,
     loaned: &crate::task::LoanedUserPages,
 ) -> Result<bool, zx_status_t> {
-    with_kernel_mut(|kernel| kernel.try_remap_loaned_channel_read(dst_base, loaned))
+    let address_space_id = with_core(|kernel| {
+        let process = kernel.current_process_info()?;
+        kernel.process_address_space_id(process.process_id())
+    })?;
+    with_vm_mut(|vm| vm.try_remap_loaned_channel_read(address_space_id, dst_base, loaned))
 }
 
 /// Create a new thread object in the target process and return a handle.
@@ -786,7 +851,11 @@ pub fn ensure_current_user_range_resident(
     if len == 0 {
         return Ok(());
     }
-    if !with_kernel(|kernel| Ok(kernel.validate_current_user_ptr(ptr, len)))? {
+    let address_space_id = with_core(|kernel| {
+        let process = kernel.current_process_info()?;
+        kernel.process_address_space_id(process.process_id())
+    })?;
+    if !with_vm(|vm| Ok(vm.validate_user_ptr(address_space_id, ptr, len)))? {
         return Err(ZX_ERR_INVALID_ARGS);
     }
 
@@ -806,7 +875,7 @@ pub fn ensure_current_user_range_resident(
 
     let mut page_va = start;
     while page_va < end {
-        with_kernel_mut(|kernel| kernel.ensure_current_user_page_resident(page_va, for_write))?;
+        with_vm_mut(|vm| vm.ensure_user_page_resident(address_space_id, page_va, for_write))?;
         page_va = page_va.checked_add(page_bytes).ok_or(ZX_ERR_OUT_OF_RANGE)?;
     }
     Ok(())
@@ -814,10 +883,26 @@ pub fn ensure_current_user_range_resident(
 
 /// Try to resolve a bootstrap user-mode page fault.
 pub fn handle_page_fault(cr2: u64, error: u64) -> bool {
-    let handled =
-        with_kernel_mut(|kernel| Ok(kernel.handle_current_page_fault(cr2, error))).unwrap_or(false);
+    let handled = with_core(|kernel| {
+        let process = kernel.current_process_info()?;
+        kernel.process_address_space_id(process.process_id())
+    })
+    .and_then(|address_space_id| {
+        with_vm_mut(|vm| Ok(vm.handle_page_fault(address_space_id, cr2, error)))
+    })
+    .unwrap_or(false);
     if handled {
-        let _ = with_kernel_mut(|kernel| kernel.sync_current_cpu_tlb_state());
+        let cpu_id = crate::arch::apic::this_apic_id() as usize;
+        let _ = with_core(|kernel| {
+            let process = kernel.current_process_info()?;
+            kernel.process_address_space_id(process.process_id())
+        })
+        .and_then(|address_space_id| {
+            with_vm_mut(|vm| {
+                let _ = vm.sync_current_cpu_tlb_state(address_space_id, cpu_id);
+                Ok(())
+            })
+        });
     }
     handled
 }
@@ -857,8 +942,18 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
 
     with_state_mut(|state| {
         let object_id = state.alloc_object_id();
-        let created = state.with_kernel_mut(|kernel| {
-            kernel.create_current_anonymous_vmo(size, axle_mm::GlobalVmoId::new(object_id))
+        let (process_id, address_space_id) = state.with_core(|kernel| {
+            let process = kernel.current_process_info()?;
+            let address_space_id = kernel.process_address_space_id(process.process_id())?;
+            Ok((process.process_id(), address_space_id))
+        })?;
+        let created = state.with_vm_mut(|vm| {
+            vm.create_anonymous_vmo_for_address_space(
+                process_id,
+                address_space_id,
+                size,
+                axle_mm::GlobalVmoId::new(object_id),
+            )
         })?;
         debug_assert_eq!(created.global_vmo_id().raw(), object_id);
         state.objects.insert(
@@ -972,8 +1067,8 @@ pub fn channel_write(
         };
 
         if let Some(ChannelPayload::Loaned(loaned)) = payload.as_mut()
-            && let Err(status) = state.with_kernel_mut(|kernel| {
-                kernel.prepare_loaned_channel_write(loaned, receiver_address_space_id)
+            && let Err(status) = state.with_vm_mut(|vm| {
+                vm.prepare_loaned_channel_write(loaned, receiver_address_space_id)
             })
         {
             if let Some(released) = payload.take() {
@@ -1207,9 +1302,11 @@ pub fn vmar_allocate(
             return Err(ZX_ERR_ACCESS_DENIED);
         }
 
-        let child = state.with_kernel_mut(|kernel| {
-            kernel.allocate_subvmar(
+        let cpu_id = crate::arch::apic::this_apic_id() as usize;
+        let child = state.with_vm_mut(|vm| {
+            vm.allocate_subvmar(
                 parent.address_space_id,
+                cpu_id,
                 parent.vmar_id,
                 offset,
                 len,
@@ -1236,9 +1333,8 @@ pub fn vmar_allocate(
             Ok(handle) => handle,
             Err(err) => {
                 let _ = state.objects.remove(&object_id);
-                let _ = state.with_kernel_mut(|kernel| {
-                    kernel.destroy_vmar(parent.address_space_id, child.id())
-                });
+                let _ =
+                    state.with_vm_mut(|vm| vm.destroy_vmar(parent.address_space_id, child.id()));
                 return Err(err);
             }
         };
@@ -1276,30 +1372,19 @@ pub fn vmar_map(
         require_vm_mapping_rights(resolved_vmar, request.perms)?;
         require_vm_mapping_rights(resolved_vmo, request.perms)?;
         require_vmar_mapping_caps(vmar.mapping_caps, request.perms, request.specific)?;
-        if request.specific {
-            state.with_kernel_mut(|kernel| {
-                kernel.map_current_vmo_into_vmar(
-                    vmar.address_space_id,
-                    vmar.vmar_id,
-                    vmo.global_vmo_id,
-                    vmar_offset,
-                    vmo_offset,
-                    len,
-                    request.perms,
-                )
-            })
-        } else {
-            state.with_kernel_mut(|kernel| {
-                kernel.map_current_vmo_into_vmar_anywhere(
-                    vmar.address_space_id,
-                    vmar.vmar_id,
-                    vmo.global_vmo_id,
-                    vmo_offset,
-                    len,
-                    request.perms,
-                )
-            })
-        }
+        let cpu_id = crate::arch::apic::this_apic_id() as usize;
+        state.with_vm_mut(|vm| {
+            vm.map_vmo_into_vmar(
+                vmar.address_space_id,
+                cpu_id,
+                vmar.vmar_id,
+                vmo.global_vmo_id,
+                request.specific.then_some(vmar_offset),
+                vmo_offset,
+                len,
+                request.perms,
+            )
+        })
     })
 }
 
@@ -1313,7 +1398,7 @@ pub fn vmar_destroy(vmar_handle: zx_handle_t) -> Result<(), zx_status_t> {
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         require_vmar_control_rights(resolved_vmar)?;
-        state.with_kernel_mut(|kernel| kernel.destroy_vmar(vmar.address_space_id, vmar.vmar_id))?;
+        state.with_vm_mut(|vm| vm.destroy_vmar(vmar.address_space_id, vmar.vmar_id))?;
         let _ = state.objects.remove(&resolved_vmar.object_id());
         Ok(())
     })
@@ -1330,9 +1415,7 @@ pub fn vmar_unmap(vmar_handle: zx_handle_t, addr: u64, len: u64) -> Result<(), z
         };
         let _ = (vmar.process_id, vmar.base, vmar.len);
         require_handle_rights(resolved_vmar, crate::task::HandleRights::WRITE)?;
-        state.with_kernel_mut(|kernel| {
-            kernel.unmap_current_vmar(vmar.address_space_id, vmar.vmar_id, addr, len)
-        })
+        state.with_vm_mut(|vm| vm.unmap_vmar(vmar.address_space_id, vmar.vmar_id, addr, len))
     })
 }
 
@@ -1355,8 +1438,8 @@ pub fn vmar_protect(
         let _ = (vmar.process_id, vmar.base, vmar.len);
         require_vm_mapping_rights(resolved_vmar, perms)?;
         require_vmar_mapping_caps(vmar.mapping_caps, perms, false)?;
-        state.with_kernel_mut(|kernel| {
-            kernel.protect_current_vmar(vmar.address_space_id, vmar.vmar_id, addr, len, perms)
+        state.with_vm_mut(|vm| {
+            vm.protect_vmar(vmar.address_space_id, vmar.vmar_id, addr, len, perms)
         })
     })
 }

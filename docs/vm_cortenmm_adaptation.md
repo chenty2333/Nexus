@@ -49,6 +49,11 @@ external VM model.
   locks across an entire multi-page range. It validates once, then resolves one
   page at a time through the VM kernel path, which narrows the fault-critical
   section before finer same-page serialization work.
+- The object layer now enters VM through a separate `VmDomain` lock domain
+  instead of running fault / prefault / VMAR / page-loan work under the main
+  kernel core lock. Scheduling, process/thread bookkeeping, and futex state are
+  still under the core lock; VM state now has its own boundary ahead of more
+  precise same-page fault serialization.
 - `Physical` and `Contiguous` VMO mappings now have explicit non-COW boundaries:
   they must already be resident when mapped, and COW arming rejects them.
 - VM resource governance has started to move under one accounting surface:

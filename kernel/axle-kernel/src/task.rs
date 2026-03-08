@@ -13,6 +13,7 @@
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::handle::Handle;
@@ -42,6 +43,7 @@ use axle_types::{
 };
 use bitflags::bitflags;
 use core::mem::size_of;
+use spin::Mutex;
 
 const CSPACE_MAX_SLOTS: u16 = 16_384;
 const CSPACE_QUARANTINE_LEN: usize = 256;
@@ -1171,16 +1173,11 @@ struct Thread {
 
 /// Internal bootstrap kernel model.
 #[derive(Debug)]
-pub(crate) struct Kernel {
-    processes: BTreeMap<ProcessId, Process>,
-    threads: BTreeMap<ThreadId, Thread>,
+pub(crate) struct VmDomain {
     address_spaces: BTreeMap<AddressSpaceId, AddressSpace>,
     global_vmos: BTreeMap<KernelVmoId, GlobalVmo>,
     #[allow(dead_code)]
     frames: FrameTable,
-    futexes: crate::futex::FutexTable,
-    run_queue: VecDeque<ThreadId>,
-    revocations: RevocationManager,
     cow_fault_count: u64,
     vm_private_cow_pages_current: u64,
     vm_private_cow_pages_peak: u64,
@@ -1188,27 +1185,46 @@ pub(crate) struct Kernel {
     vm_inflight_loan_pages_peak: u64,
     vm_private_cow_quota_hits: u64,
     vm_inflight_loan_quota_hits: u64,
-    next_koid: zx_koid_t,
     next_global_vmo_id: u64,
+    next_address_space_id: AddressSpaceId,
+}
+
+#[derive(Debug)]
+pub(crate) struct Kernel {
+    processes: BTreeMap<ProcessId, Process>,
+    threads: BTreeMap<ThreadId, Thread>,
+    futexes: crate::futex::FutexTable,
+    run_queue: VecDeque<ThreadId>,
+    revocations: RevocationManager,
+    next_koid: zx_koid_t,
     next_process_id: ProcessId,
     next_thread_id: ThreadId,
-    next_address_space_id: AddressSpaceId,
     current_thread_id: ThreadId,
     reschedule_requested: bool,
+    vm: Arc<Mutex<VmDomain>>,
+}
+
+impl VmDomain {
+    fn alloc_address_space_id(&mut self) -> AddressSpaceId {
+        let id = self.next_address_space_id;
+        self.next_address_space_id = self.next_address_space_id.wrapping_add(1);
+        id
+    }
+
+    fn alloc_global_vmo_id(&mut self) -> KernelVmoId {
+        let id = self.next_global_vmo_id;
+        self.next_global_vmo_id = self.next_global_vmo_id.wrapping_add(1);
+        KernelVmoId::new(id)
+    }
 }
 
 impl Kernel {
     /// Build the single-process bootstrap kernel model used by the current main branch.
     pub(crate) fn bootstrap() -> Self {
-        let mut kernel = Self {
-            processes: BTreeMap::new(),
-            threads: BTreeMap::new(),
+        let mut vm = VmDomain {
             address_spaces: BTreeMap::new(),
             global_vmos: BTreeMap::new(),
             frames: FrameTable::new(),
-            futexes: crate::futex::FutexTable::new(),
-            run_queue: VecDeque::new(),
-            revocations: RevocationManager::new(),
             cow_fault_count: 0,
             vm_private_cow_pages_current: 0,
             vm_private_cow_pages_peak: 0,
@@ -1216,32 +1232,42 @@ impl Kernel {
             vm_inflight_loan_pages_peak: 0,
             vm_private_cow_quota_hits: 0,
             vm_inflight_loan_quota_hits: 0,
-            next_koid: 1,
             next_global_vmo_id: 1,
-            next_process_id: 1,
-            next_thread_id: 1,
             next_address_space_id: 1,
-            current_thread_id: 0,
-            reschedule_requested: false,
         };
         let bootstrap_vmo_ids = [
-            kernel.alloc_global_vmo_id(),
-            kernel.alloc_global_vmo_id(),
-            kernel.alloc_global_vmo_id(),
+            vm.alloc_global_vmo_id(),
+            vm.alloc_global_vmo_id(),
+            vm.alloc_global_vmo_id(),
         ];
-        let address_space_id = kernel.alloc_address_space_id();
+        let address_space_id = vm.alloc_address_space_id();
         let bootstrap_address_space =
-            AddressSpace::bootstrap(address_space_id, &mut kernel.frames, bootstrap_vmo_ids);
-        kernel
-            .address_spaces
+            AddressSpace::bootstrap(address_space_id, &mut vm.frames, bootstrap_vmo_ids);
+        vm.address_spaces
             .insert(address_space_id, bootstrap_address_space);
-        kernel.observe_cpu_tlb_epoch_for_address_space(address_space_id, kernel.current_cpu_id());
+        vm.observe_cpu_tlb_epoch_for_address_space(
+            address_space_id,
+            crate::arch::apic::this_apic_id() as usize,
+        );
         for global_vmo_id in bootstrap_vmo_ids {
-            kernel
-                .register_global_vmo_from_address_space(address_space_id, global_vmo_id)
+            vm.register_global_vmo_from_address_space(address_space_id, global_vmo_id)
                 .expect("bootstrap global vmo seeding must succeed");
         }
 
+        let vm = Arc::new(Mutex::new(vm));
+        let mut kernel = Self {
+            processes: BTreeMap::new(),
+            threads: BTreeMap::new(),
+            futexes: crate::futex::FutexTable::new(),
+            run_queue: VecDeque::new(),
+            revocations: RevocationManager::new(),
+            next_koid: 1,
+            next_process_id: 1,
+            next_thread_id: 1,
+            current_thread_id: 0,
+            reschedule_requested: false,
+            vm,
+        };
         let process_id = kernel.alloc_process_id();
         let process_koid = kernel.alloc_koid();
         kernel.processes.insert(
@@ -1263,6 +1289,20 @@ impl Kernel {
         );
         kernel.current_thread_id = thread_id;
         kernel
+    }
+
+    pub(crate) fn vm_handle(&self) -> Arc<Mutex<VmDomain>> {
+        self.vm.clone()
+    }
+
+    fn with_vm<T>(&self, f: impl FnOnce(&VmDomain) -> T) -> T {
+        let vm = self.vm.lock();
+        f(&vm)
+    }
+
+    fn with_vm_mut<T>(&self, f: impl FnOnce(&mut VmDomain) -> T) -> T {
+        let mut vm = self.vm.lock();
+        f(&mut vm)
     }
 
     pub(crate) fn alloc_handle_for_current_process(
@@ -1316,10 +1356,12 @@ impl Kernel {
         let Ok(process) = self.current_process() else {
             return false;
         };
-        let Some(address_space) = self.address_spaces.get(&process.address_space_id) else {
-            return false;
-        };
-        address_space.validate_user_ptr(ptr, len)
+        self.with_vm(|vm| {
+            vm.address_spaces
+                .get(&process.address_space_id)
+                .map(|address_space| address_space.validate_user_ptr(ptr, len))
+                .unwrap_or(false)
+        })
     }
 
     pub(crate) fn validate_process_user_ptr(
@@ -1331,10 +1373,12 @@ impl Kernel {
         let Ok(process) = self.process(process_id) else {
             return false;
         };
-        let Some(address_space) = self.address_spaces.get(&process.address_space_id) else {
-            return false;
-        };
-        address_space.validate_user_ptr(ptr, len)
+        self.with_vm(|vm| {
+            vm.address_spaces
+                .get(&process.address_space_id)
+                .map(|address_space| address_space.validate_user_ptr(ptr, len))
+                .unwrap_or(false)
+        })
     }
 
     pub(crate) fn ensure_current_user_page_resident(
@@ -1343,32 +1387,18 @@ impl Kernel {
         for_write: bool,
     ) -> Result<(), zx_status_t> {
         let address_space_id = self.current_process()?.address_space_id;
-        let page_base = align_down_page(page_va);
-        let meta = self
-            .address_spaces
-            .get(&address_space_id)
-            .and_then(|space| space.page_meta(page_base))
-            .ok_or(ZX_ERR_INVALID_ARGS)?;
-        if for_write && !meta.logical_write() {
-            return Err(ZX_ERR_ACCESS_DENIED);
-        }
-        match meta.tag() {
-            PteMetaTag::LazyAnon => self.materialize_lazy_anon_page(address_space_id, page_base),
-            PteMetaTag::LazyVmo => self.materialize_lazy_vmo_page(address_space_id, page_base),
-            PteMetaTag::Present if for_write && meta.cow_shared() => {
-                self.resolve_copy_on_write_page(address_space_id, page_base)
-            }
-            PteMetaTag::Present | PteMetaTag::Phys => Ok(()),
-            _ => Err(ZX_ERR_BAD_STATE),
-        }
+        self.with_vm_mut(|vm| vm.ensure_user_page_resident(address_space_id, page_va, for_write))
     }
 
     /// Resolve a current-thread userspace range back to its VMO mapping metadata.
     #[allow(dead_code)]
     pub(crate) fn lookup_current_user_mapping(&self, ptr: u64, len: usize) -> Option<VmaLookup> {
         let process = self.current_process().ok()?;
-        let address_space = self.address_spaces.get(&process.address_space_id)?;
-        address_space.lookup_user_mapping(ptr, len)
+        self.with_vm(|vm| {
+            vm.address_spaces
+                .get(&process.address_space_id)
+                .and_then(|address_space| address_space.lookup_user_mapping(ptr, len))
+        })
     }
 
     #[allow(dead_code)]
@@ -1399,28 +1429,30 @@ impl Kernel {
         }
         let process_id = self.current_thread()?.process_id;
         let process = self.current_process()?;
-        let address_space = self
-            .address_spaces
-            .get(&process.address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        let root = address_space.root_vmar();
-        let range_end = user_addr
-            .checked_add(FUTEX_WORD_BYTES as u64)
-            .ok_or(ZX_ERR_INVALID_ARGS)?;
-        let root_end = root
-            .base()
-            .checked_add(root.len())
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        if user_addr < root.base() || range_end > root_end {
-            return Err(ZX_ERR_INVALID_ARGS);
-        }
-        if !address_space.validate_user_ptr(user_addr, FUTEX_WORD_BYTES) {
-            return Ok(FutexKey::private_anonymous(process_id, user_addr));
-        }
-        let lookup = address_space
-            .lookup_user_mapping(user_addr, FUTEX_WORD_BYTES)
-            .ok_or(ZX_ERR_INVALID_ARGS)?;
-        Ok(FutexKey::from_lookup(process_id, user_addr, lookup))
+        self.with_vm(|vm| {
+            let address_space = vm
+                .address_spaces
+                .get(&process.address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            let root = address_space.root_vmar();
+            let range_end = user_addr
+                .checked_add(FUTEX_WORD_BYTES as u64)
+                .ok_or(ZX_ERR_INVALID_ARGS)?;
+            let root_end = root
+                .base()
+                .checked_add(root.len())
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            if user_addr < root.base() || range_end > root_end {
+                return Err(ZX_ERR_INVALID_ARGS);
+            }
+            if !address_space.validate_user_ptr(user_addr, FUTEX_WORD_BYTES) {
+                return Ok(FutexKey::private_anonymous(process_id, user_addr));
+            }
+            let lookup = address_space
+                .lookup_user_mapping(user_addr, FUTEX_WORD_BYTES)
+                .ok_or(ZX_ERR_INVALID_ARGS)?;
+            Ok(FutexKey::from_lookup(process_id, user_addr, lookup))
+        })
     }
 
     pub(crate) fn try_loan_current_user_pages(
@@ -1428,82 +1460,12 @@ impl Kernel {
         ptr: u64,
         len: usize,
     ) -> Result<Option<LoanedUserPages>, zx_status_t> {
-        if len == 0 {
-            return Ok(None);
-        }
-
-        let page_size = crate::userspace::USER_PAGE_BYTES;
-        let len_u64 = u64::try_from(len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        if (ptr & (page_size - 1)) != 0 || (len_u64 & (page_size - 1)) != 0 {
-            return Ok(None);
-        }
-
-        let process = self.current_process()?;
-        let address_space_id = process.address_space_id;
-        let Some(lookup) = self
-            .address_spaces
-            .get(&address_space_id)
-            .and_then(|space| space.lookup_user_mapping(ptr, len))
-        else {
-            return Ok(None);
-        };
-
-        if lookup.vmo_kind() != VmoKind::Anonymous {
-            return Ok(None);
-        }
-
-        let page_count = len / (page_size as usize);
-        let mut resident_pages = Vec::with_capacity(page_count);
-        for page_index in 0..page_count {
-            let page_va = ptr + (page_index as u64) * page_size;
-            let Some(page_lookup) = self
-                .address_spaces
-                .get(&address_space_id)
-                .and_then(|space| space.lookup_user_mapping(page_va, 1))
-            else {
-                return Ok(None);
-            };
-            let Some(frame_id) = page_lookup.frame_id() else {
-                return Ok(None);
-            };
-            resident_pages.push(frame_id);
-        }
-
-        let mut pinned = Vec::with_capacity(page_count);
-        for frame_id in resident_pages.iter().copied() {
-            self.frames
-                .pin(frame_id)
-                .map_err(|_| ZX_ERR_BAD_STATE)
-                .inspect_err(|_| self.release_pinned_loan_frames(&pinned))?;
-            if let Err(_) = self.frames.inc_loan(frame_id) {
-                let _ = self.frames.unpin(frame_id);
-                self.release_pinned_loan_frames(&pinned);
-                return Err(ZX_ERR_BAD_STATE);
-            }
-            pinned.push(frame_id);
-        }
-        self.try_reserve_inflight_loan_pages(
-            address_space_id,
-            u64::try_from(page_count).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
-        )
-        .inspect_err(|_| self.release_pinned_loan_frames(&pinned))?;
-
-        let len_u32 = u32::try_from(len).map_err(|_| {
-            self.release_loaned_pages_inner(address_space_id, &pinned);
-            ZX_ERR_OUT_OF_RANGE
-        })?;
-        Ok(Some(LoanedUserPages {
-            address_space_id,
-            receiver_address_space_id: None,
-            base: ptr,
-            len: len_u32,
-            needs_cow: lookup.max_perms().contains(MappingPerms::WRITE),
-            pages: pinned,
-        }))
+        let address_space_id = self.current_process()?.address_space_id;
+        self.with_vm_mut(|vm| vm.try_loan_user_pages(address_space_id, ptr, len))
     }
 
     pub(crate) fn release_loaned_user_pages(&mut self, loaned: &LoanedUserPages) {
-        self.release_loaned_pages_inner(loaned.address_space_id(), loaned.pages())
+        self.with_vm_mut(|vm| vm.release_loaned_user_pages(loaned))
     }
 
     pub(crate) fn prepare_loaned_channel_write(
@@ -1511,38 +1473,7 @@ impl Kernel {
         loaned: &mut LoanedUserPages,
         receiver_address_space_id: AddressSpaceId,
     ) -> Result<(), zx_status_t> {
-        if !loaned.needs_cow() {
-            loaned.bind_receiver_address_space(receiver_address_space_id);
-            return Ok(());
-        }
-
-        let len = u64::from(loaned.len());
-        let range = PageRange::new(loaned.base(), len).map_err(map_page_table_error)?;
-        let mut loan_tx = self.lock_channel_loan_tx(
-            loaned.address_space_id(),
-            range,
-            receiver_address_space_id,
-            range,
-        )?;
-        {
-            let address_space = self
-                .address_spaces
-                .get_mut(&loaned.address_space_id())
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            address_space
-                .arm_copy_on_write(loaned.base(), len)
-                .map_err(map_address_space_error)?;
-        }
-        self.clear_private_cow_range(loaned.address_space_id(), loaned.base(), len);
-        loaned.bind_receiver_address_space(receiver_address_space_id);
-        let sender_cursor = loan_tx.sender_cursor_mut().ok_or(ZX_ERR_BAD_STATE)?;
-        self.sync_mapping_pages_locked(
-            loaned.address_space_id(),
-            loaned.base(),
-            len,
-            sender_cursor,
-        )?;
-        loan_tx.commit().map_err(map_page_table_error)
+        self.with_vm_mut(|vm| vm.prepare_loaned_channel_write(loaned, receiver_address_space_id))
     }
 
     pub(crate) fn try_remap_loaned_channel_read(
@@ -1550,109 +1481,25 @@ impl Kernel {
         dst_base: u64,
         loaned: &LoanedUserPages,
     ) -> Result<bool, zx_status_t> {
-        let Some(receiver_address_space_id) = loaned.receiver_address_space_id() else {
-            return Ok(false);
-        };
-
-        let len = u64::from(loaned.len());
-        if len == 0
-            || (dst_base & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
-            || (len & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
-        {
-            return Ok(false);
-        }
-
         let current_address_space_id = self.current_process()?.address_space_id;
-        if current_address_space_id != receiver_address_space_id {
-            return Ok(false);
-        }
-
-        let receiver_lookup = self
-            .address_spaces
-            .get(&receiver_address_space_id)
-            .and_then(|space| space.lookup_user_mapping(dst_base, len as usize));
-        let Some(receiver_lookup) = receiver_lookup else {
-            return Ok(false);
-        };
-        if receiver_lookup.mapping_base() != dst_base
-            || receiver_lookup.mapping_len() != len
-            || receiver_lookup.vmo_kind() != VmoKind::Anonymous
-            || !receiver_lookup.max_perms().contains(MappingPerms::WRITE)
-        {
-            return Ok(false);
-        }
-
-        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        if page_count != loaned.pages().len() {
-            return Err(ZX_ERR_BAD_STATE);
-        }
-        for page_index in 0..page_count {
-            let page_va = dst_base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
-            let meta = self
-                .address_spaces
-                .get(&receiver_address_space_id)
-                .and_then(|space| space.page_meta(page_va))
-                .ok_or(ZX_ERR_INVALID_ARGS)?;
-            if !meta.logical_write() {
-                return Ok(false);
-            }
-        }
-        let replaced_receiver_frames =
-            self.mapped_frames_in_range(receiver_address_space_id, dst_base, len)?;
-        let sender_range = PageRange::new(loaned.base(), len).map_err(map_page_table_error)?;
-        let receiver_range = PageRange::new(dst_base, len).map_err(map_page_table_error)?;
-        let mut loan_tx = self.lock_channel_loan_tx(
-            loaned.address_space_id(),
-            sender_range,
-            receiver_address_space_id,
-            receiver_range,
-        )?;
-        {
-            let receiver = self
-                .address_spaces
-                .get_mut(&receiver_address_space_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            receiver
-                .replace_mapping_frames_copy_on_write(
-                    &mut self.frames,
-                    dst_base,
-                    len,
-                    loaned.pages(),
-                )
-                .map_err(map_address_space_error)?;
-        }
-        self.clear_private_cow_range(receiver_address_space_id, dst_base, len);
-        let receiver_cursor = loan_tx.receiver_cursor_mut().ok_or(ZX_ERR_BAD_STATE)?;
-        self.sync_mapping_pages_locked(receiver_address_space_id, dst_base, len, receiver_cursor)?;
-        loan_tx.commit().map_err(map_page_table_error)?;
-        if let Some(&source_frame_id) = loaned.pages().first() {
-            crate::userspace::record_vm_last_remap_source_rmap_count(
-                self.frame_mapping_count(source_frame_id),
-            );
-        }
-        self.validate_frame_mapping_invariants_for(
-            loaned.pages(),
-            "try_remap_loaned_channel_read/source",
-        );
-        self.validate_frame_mapping_invariants_for(
-            &replaced_receiver_frames,
-            "try_remap_loaned_channel_read/receiver",
-        );
-        Ok(true)
+        self.with_vm_mut(|vm| {
+            vm.try_remap_loaned_channel_read(current_address_space_id, dst_base, loaned)
+        })
     }
 
     pub(crate) fn current_root_vmar(&self) -> Result<RootVmarInfo, zx_status_t> {
         let thread = self.current_thread()?;
         let process = self.current_process()?;
-        let address_space = self
-            .address_spaces
-            .get(&process.address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        Ok(RootVmarInfo {
-            process_id: thread.process_id,
-            address_space_id: process.address_space_id,
-            vmar: address_space.root_vmar(),
+        self.with_vm(|vm| {
+            let address_space = vm
+                .address_spaces
+                .get(&process.address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            Ok(RootVmarInfo {
+                process_id: thread.process_id,
+                address_space_id: process.address_space_id,
+                vmar: address_space.root_vmar(),
+            })
         })
     }
 
@@ -1668,12 +1515,9 @@ impl Kernel {
         child_policy: VmarPlacementPolicy,
     ) -> Result<Vmar, zx_status_t> {
         let cpu_id = self.current_cpu_id();
-        let address_space = self
-            .address_spaces
-            .get_mut(&address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        address_space
-            .allocate_subvmar(
+        self.with_vm_mut(|vm| {
+            vm.allocate_subvmar(
+                address_space_id,
                 cpu_id,
                 parent_vmar_id,
                 offset,
@@ -1683,7 +1527,7 @@ impl Kernel {
                 offset_is_upper_limit,
                 child_policy,
             )
-            .map_err(map_address_space_error)
+        })
     }
 
     pub(crate) fn destroy_vmar(
@@ -1691,43 +1535,7 @@ impl Kernel {
         address_space_id: AddressSpaceId,
         vmar_id: VmarId,
     ) -> Result<(), zx_status_t> {
-        let affected_ranges = {
-            let address_space = self
-                .address_spaces
-                .get(&address_space_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            if vmar_id == address_space.root_vmar().id() {
-                return Err(ZX_ERR_BAD_STATE);
-            }
-            if address_space.vmar(vmar_id).is_none() {
-                return Err(ZX_ERR_NOT_FOUND);
-            }
-            address_space.vm.mapped_ranges_in_vmar_subtree(vmar_id)
-        };
-
-        let mut affected_frames = Vec::new();
-        for (base, len) in affected_ranges.iter().copied() {
-            let frames = self.mapped_frames_in_range(address_space_id, base, len)?;
-            for frame_id in frames {
-                push_unique_frame_id(&mut affected_frames, frame_id);
-            }
-        }
-
-        let cleared_ranges = {
-            let address_space = self
-                .address_spaces
-                .get_mut(&address_space_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            address_space
-                .destroy_vmar(&mut self.frames, vmar_id)
-                .map_err(map_address_space_error)?
-        };
-        for (base, len) in cleared_ranges {
-            self.clear_private_cow_range(address_space_id, base, len);
-            self.clear_mapping_pages(address_space_id, base, len)?;
-        }
-        self.validate_frame_mapping_invariants_for(&affected_frames, "destroy_vmar");
-        Ok(())
+        self.with_vm_mut(|vm| vm.destroy_vmar(address_space_id, vmar_id))
     }
 
     pub(crate) fn current_thread_info(&self) -> Result<CurrentThreadInfo, zx_status_t> {
@@ -1755,6 +1563,802 @@ impl Kernel {
     }
 
     pub(crate) fn create_process(&mut self) -> Result<CreatedProcess, zx_status_t> {
+        let (address_space_id, root_vmar) =
+            self.with_vm_mut(|vm| vm.create_process_address_space())?;
+
+        let process_id = self.alloc_process_id();
+        let process_koid = self.alloc_koid();
+        self.processes.insert(
+            process_id,
+            Process::bootstrap(address_space_id, process_koid),
+        );
+
+        Ok(CreatedProcess {
+            process_id,
+            koid: process_koid,
+            address_space_id,
+            root_vmar,
+        })
+    }
+
+    fn register_global_vmo_from_address_space(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm_mut(|vm| {
+            vm.register_global_vmo_from_address_space(address_space_id, global_vmo_id)
+        })
+    }
+
+    fn register_empty_global_vmo(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        kind: VmoKind,
+        size_bytes: u64,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm_mut(|vm| vm.register_empty_global_vmo(global_vmo_id, kind, size_bytes))
+    }
+
+    fn import_global_vmo_into_address_space(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<VmoId, zx_status_t> {
+        self.with_vm_mut(|vm| {
+            vm.import_global_vmo_into_address_space(address_space_id, global_vmo_id)
+        })
+    }
+
+    fn update_global_vmo_frame(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        offset: u64,
+        frame_id: FrameId,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm_mut(|vm| vm.update_global_vmo_frame(global_vmo_id, offset, frame_id))
+    }
+
+    fn global_vmo_frame(
+        &self,
+        global_vmo_id: KernelVmoId,
+        offset: u64,
+    ) -> Result<Option<FrameId>, zx_status_t> {
+        self.with_vm(|vm| vm.global_vmo_frame(global_vmo_id, offset))
+    }
+
+    fn record_vm_resource_telemetry(&self) {
+        self.with_vm(|vm| vm.record_vm_resource_telemetry())
+    }
+
+    fn log_vm_quota_exceeded(
+        &self,
+        address_space_id: AddressSpaceId,
+        exceeded: VmQuotaExceeded,
+        context: &str,
+    ) {
+        self.with_vm(|vm| vm.log_vm_quota_exceeded(address_space_id, exceeded, context))
+    }
+
+    fn try_reserve_private_cow_page(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+    ) -> Result<bool, zx_status_t> {
+        self.with_vm_mut(|vm| vm.try_reserve_private_cow_page(address_space_id, page_base))
+    }
+
+    fn commit_private_cow_page(&mut self, address_space_id: AddressSpaceId, page_base: u64) {
+        self.with_vm_mut(|vm| vm.commit_private_cow_page(address_space_id, page_base));
+    }
+
+    fn clear_private_cow_range(&mut self, address_space_id: AddressSpaceId, base: u64, len: u64) {
+        self.with_vm_mut(|vm| vm.clear_private_cow_range(address_space_id, base, len));
+    }
+
+    fn try_reserve_inflight_loan_pages(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        pages: u64,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm_mut(|vm| vm.try_reserve_inflight_loan_pages(address_space_id, pages))
+    }
+
+    fn release_inflight_loan_pages(&mut self, address_space_id: AddressSpaceId, pages: u64) {
+        self.with_vm_mut(|vm| vm.release_inflight_loan_pages(address_space_id, pages));
+    }
+
+    fn publish_address_space_frame_to_global_vmo(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        fault_va: u64,
+        frame_id: FrameId,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm_mut(|vm| {
+            vm.publish_address_space_frame_to_global_vmo(address_space_id, fault_va, frame_id)
+        })
+    }
+
+    pub(crate) fn create_current_anonymous_vmo(
+        &mut self,
+        size: u64,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<CreatedVmo, zx_status_t> {
+        let process_id = self.current_thread()?.process_id;
+        let address_space_id = self.current_process()?.address_space_id;
+        self.with_vm_mut(|vm| {
+            vm.create_anonymous_vmo_for_address_space(
+                process_id,
+                address_space_id,
+                size,
+                global_vmo_id,
+            )
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn current_thread_koid(&self) -> Result<zx_koid_t, zx_status_t> {
+        Ok(self.current_thread()?.koid)
+    }
+
+    pub(crate) fn current_process_koid(&self) -> Result<zx_koid_t, zx_status_t> {
+        Ok(self.current_process()?.koid)
+    }
+
+    pub(crate) fn copyout_thread_user<T: Copy>(
+        &self,
+        thread_id: ThreadId,
+        ptr: *mut T,
+        value: T,
+    ) -> Result<(), zx_status_t> {
+        if ptr.is_null() {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let process = self
+            .processes
+            .get(&thread.process_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if !self.with_vm(|vm| {
+            vm.validate_user_ptr(process.address_space_id, ptr as u64, size_of::<T>())
+        }) {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        // SAFETY: the pointer was validated against the target thread's userspace mapping.
+        unsafe {
+            core::ptr::write_unaligned(ptr, value);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capture_current_user_context(
+        &mut self,
+        trap: &crate::arch::int80::TrapFrame,
+        cpu_frame: *const u64,
+    ) -> Result<(), zx_status_t> {
+        let context = UserContext::capture(trap, cpu_frame)?;
+        let thread = self
+            .threads
+            .get_mut(&self.current_thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        thread.context = Some(context);
+        Ok(())
+    }
+
+    pub(crate) fn finish_syscall(
+        &mut self,
+        trap: &mut crate::arch::int80::TrapFrame,
+        cpu_frame: *mut u64,
+    ) -> Result<(), zx_status_t> {
+        match self.current_thread()?.state {
+            ThreadState::Runnable => {
+                self.capture_current_user_context(trap, cpu_frame.cast_const())?;
+                if self.reschedule_requested {
+                    self.reschedule_requested = false;
+                    if let Some(next_thread_id) = self.pop_runnable_thread() {
+                        self.requeue_current_thread()?;
+                        self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
+                    }
+                }
+                self.sync_current_cpu_tlb_state()?;
+                Ok(())
+            }
+            ThreadState::New => Err(ZX_ERR_BAD_STATE),
+            ThreadState::FutexWait { .. }
+            | ThreadState::SignalWait { .. }
+            | ThreadState::PortWait { .. } => {
+                let next_thread_id = self.pop_runnable_thread().ok_or(ZX_ERR_BAD_STATE)?;
+                self.switch_to_thread(next_thread_id, trap, cpu_frame)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn enqueue_current_futex_wait(
+        &mut self,
+        key: FutexKey,
+        owner_koid: zx_koid_t,
+    ) -> Result<(), zx_status_t> {
+        let thread_id = self.current_thread_id;
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if !matches!(thread.state, ThreadState::Runnable) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.state = ThreadState::FutexWait { key };
+        self.futexes.enqueue_waiter(key, thread_id, owner_koid);
+        Ok(())
+    }
+
+    pub(crate) fn can_block_current_thread(&self) -> bool {
+        !self.run_queue.is_empty()
+    }
+
+    pub(crate) fn enqueue_current_signal_wait(
+        &mut self,
+        object_id: u64,
+        watched: Signals,
+        observed_ptr: *mut zx_signals_t,
+    ) -> Result<(), zx_status_t> {
+        let thread = self
+            .threads
+            .get_mut(&self.current_thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if !matches!(thread.state, ThreadState::Runnable) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.state = ThreadState::SignalWait {
+            object_id,
+            watched,
+            observed_ptr: observed_ptr as u64,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn signal_waiters_ready(
+        &self,
+        object_id: u64,
+        current: Signals,
+    ) -> Vec<SignalWaiter> {
+        self.threads
+            .iter()
+            .filter_map(|(thread_id, thread)| match thread.state {
+                ThreadState::SignalWait {
+                    object_id: wait_object_id,
+                    watched,
+                    observed_ptr,
+                } if wait_object_id == object_id && current.intersects(watched) => {
+                    Some(SignalWaiter {
+                        thread_id: *thread_id,
+                        observed_ptr,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn enqueue_current_port_wait(
+        &mut self,
+        port_object_id: u64,
+        packet_ptr: *mut zx_port_packet_t,
+    ) -> Result<(), zx_status_t> {
+        let thread = self
+            .threads
+            .get_mut(&self.current_thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if !matches!(thread.state, ThreadState::Runnable) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.state = ThreadState::PortWait {
+            port_object_id,
+            packet_ptr: packet_ptr as u64,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn port_waiters(&self, port_object_id: u64) -> Vec<PortWaiter> {
+        self.threads
+            .iter()
+            .filter_map(|(thread_id, thread)| match thread.state {
+                ThreadState::PortWait {
+                    port_object_id: wait_port_object_id,
+                    packet_ptr,
+                } if wait_port_object_id == port_object_id => Some(PortWaiter {
+                    thread_id: *thread_id,
+                    packet_ptr,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn cancel_current_futex_wait(&mut self) -> Result<bool, zx_status_t> {
+        let thread_id = self.current_thread_id;
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let ThreadState::FutexWait { key } = thread.state else {
+            return Ok(false);
+        };
+        thread.state = ThreadState::Runnable;
+        Ok(self.futexes.cancel_waiter(key, thread_id))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn wake_futex_waiters(
+        &mut self,
+        key: FutexKey,
+        wake_count: usize,
+        new_owner_koid: zx_koid_t,
+        single_owner: bool,
+    ) -> Result<usize, zx_status_t> {
+        let result = self
+            .futexes
+            .wake(key, wake_count, new_owner_koid, single_owner);
+        for thread_id in result.woken {
+            self.make_thread_runnable(thread_id, ZX_OK)?;
+        }
+        Ok(result.remaining)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn requeue_futex_waiters(
+        &mut self,
+        source: FutexKey,
+        target: FutexKey,
+        wake_count: usize,
+        requeue_count: usize,
+        target_owner_koid: zx_koid_t,
+    ) -> Result<crate::futex::RequeueResult, zx_status_t> {
+        let result =
+            self.futexes
+                .requeue(source, target, wake_count, requeue_count, target_owner_koid);
+        for thread_id in &result.woken {
+            self.make_thread_runnable(*thread_id, ZX_OK)?;
+        }
+        for thread in self.threads.values_mut() {
+            if matches!(thread.state, ThreadState::FutexWait { key } if key == source) {
+                thread.state = ThreadState::FutexWait { key: target };
+            }
+        }
+        Ok(result)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn futex_owner(&self, key: FutexKey) -> zx_koid_t {
+        self.futexes.owner(key)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn thread_is_waiting_on_futex(&self, thread_id: ThreadId, key: FutexKey) -> bool {
+        self.futexes.is_waiter(key, thread_id)
+    }
+
+    pub(crate) fn create_thread(
+        &mut self,
+        process_id: ProcessId,
+    ) -> Result<(ThreadId, zx_koid_t), zx_status_t> {
+        if !self.processes.contains_key(&process_id) {
+            return Err(ZX_ERR_BAD_HANDLE);
+        }
+        let thread_id = self.alloc_thread_id();
+        let koid = self.alloc_koid();
+        self.threads.insert(
+            thread_id,
+            Thread {
+                process_id,
+                koid,
+                state: ThreadState::New,
+                queued: false,
+                context: None,
+            },
+        );
+        Ok((thread_id, koid))
+    }
+
+    pub(crate) fn start_thread(
+        &mut self,
+        thread_id: ThreadId,
+        entry: u64,
+        stack: u64,
+        arg0: u64,
+        arg1: u64,
+    ) -> Result<(), zx_status_t> {
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        if !matches!(thread.state, ThreadState::New) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.context = Some(UserContext::new_user_entry(entry, stack, arg0, arg1));
+        thread.state = ThreadState::Runnable;
+        let queued = thread.queued;
+        let thread_id_copy = thread_id;
+        let _ = thread;
+        if !queued {
+            self.enqueue_runnable_thread(thread_id_copy)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_current_vmo_into_vmar(
+        &mut self,
+        vmar_address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        global_vmo_id: KernelVmoId,
+        vmar_offset: u64,
+        vmo_offset: u64,
+        len: u64,
+        perms: MappingPerms,
+    ) -> Result<u64, zx_status_t> {
+        self.with_vm_mut(|vm| {
+            vm.map_vmo_into_vmar(
+                vmar_address_space_id,
+                self.current_cpu_id(),
+                vmar_id,
+                global_vmo_id,
+                Some(vmar_offset),
+                vmo_offset,
+                len,
+                perms,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_current_vmo_into_vmar_anywhere(
+        &mut self,
+        vmar_address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        global_vmo_id: KernelVmoId,
+        vmo_offset: u64,
+        len: u64,
+        perms: MappingPerms,
+    ) -> Result<u64, zx_status_t> {
+        self.with_vm_mut(|vm| {
+            vm.map_vmo_into_vmar(
+                vmar_address_space_id,
+                self.current_cpu_id(),
+                vmar_id,
+                global_vmo_id,
+                None,
+                vmo_offset,
+                len,
+                perms,
+            )
+        })
+    }
+
+    pub(crate) fn unmap_current_vmar(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        addr: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm_mut(|vm| vm.unmap_vmar(address_space_id, vmar_id, addr, len))
+    }
+
+    pub(crate) fn protect_current_vmar(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        addr: u64,
+        len: u64,
+        perms: MappingPerms,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm_mut(|vm| vm.protect_vmar(address_space_id, vmar_id, addr, len, perms))
+    }
+
+    pub(crate) fn handle_current_page_fault(&mut self, fault_va: u64, error: u64) -> bool {
+        let process_id = match self.current_thread() {
+            Ok(thread) => thread.process_id,
+            Err(_) => return false,
+        };
+        let address_space_id = match self.processes.get(&process_id) {
+            Some(process) => process.address_space_id,
+            None => return false,
+        };
+        self.with_vm_mut(|vm| vm.handle_page_fault(address_space_id, fault_va, error))
+    }
+
+    fn alloc_process_id(&mut self) -> ProcessId {
+        let id = self.next_process_id;
+        self.next_process_id = self.next_process_id.wrapping_add(1);
+        id
+    }
+
+    fn alloc_thread_id(&mut self) -> ThreadId {
+        let id = self.next_thread_id;
+        self.next_thread_id = self.next_thread_id.wrapping_add(1);
+        id
+    }
+
+    fn alloc_koid(&mut self) -> zx_koid_t {
+        let id = self.next_koid;
+        self.next_koid = self.next_koid.wrapping_add(1);
+        id
+    }
+
+    fn current_cpu_id(&self) -> usize {
+        crate::arch::apic::this_apic_id() as usize
+    }
+
+    fn current_thread(&self) -> Result<&Thread, zx_status_t> {
+        self.threads
+            .get(&self.current_thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    fn process(&self, process_id: ProcessId) -> Result<&Process, zx_status_t> {
+        self.processes.get(&process_id).ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    fn current_process(&self) -> Result<&Process, zx_status_t> {
+        let process_id = self.current_thread()?.process_id;
+        self.process(process_id)
+    }
+
+    fn current_process_mut(&mut self) -> Result<&mut Process, zx_status_t> {
+        let process_id = self.current_thread()?.process_id;
+        self.processes.get_mut(&process_id).ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    fn enqueue_runnable_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if thread.queued || !matches!(thread.state, ThreadState::Runnable) {
+            return Ok(());
+        }
+        thread.queued = true;
+        self.run_queue.push_back(thread_id);
+        Ok(())
+    }
+
+    fn requeue_current_thread(&mut self) -> Result<(), zx_status_t> {
+        self.enqueue_runnable_thread(self.current_thread_id)
+    }
+
+    fn pop_runnable_thread(&mut self) -> Option<ThreadId> {
+        while let Some(thread_id) = self.run_queue.pop_front() {
+            let Some(thread) = self.threads.get_mut(&thread_id) else {
+                continue;
+            };
+            thread.queued = false;
+            if matches!(thread.state, ThreadState::Runnable) {
+                return Some(thread_id);
+            }
+        }
+        None
+    }
+
+    fn switch_to_thread(
+        &mut self,
+        thread_id: ThreadId,
+        trap: &mut crate::arch::int80::TrapFrame,
+        cpu_frame: *mut u64,
+    ) -> Result<(), zx_status_t> {
+        let current_cpu_id = self.current_cpu_id();
+        let current_process_id = self.current_thread()?.process_id;
+        let current_address_space_id = self.process(current_process_id)?.address_space_id;
+        let next_process_id = self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .process_id;
+        let next_address_space_id = self.process(next_process_id)?.address_space_id;
+        let next_page_tables = self.with_vm(|vm| vm.root_page_table(next_address_space_id))?;
+        let context = self
+            .threads
+            .get(&thread_id)
+            .and_then(|thread| thread.context)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        next_page_tables.activate().map_err(map_page_table_error)?;
+        if current_address_space_id != next_address_space_id {
+            self.with_vm_mut(|vm| vm.note_cpu_inactive(current_address_space_id, current_cpu_id));
+        }
+        self.observe_cpu_tlb_epoch_for_address_space(next_address_space_id, current_cpu_id);
+        context.restore(trap, cpu_frame)?;
+        self.current_thread_id = thread_id;
+        Ok(())
+    }
+
+    pub(crate) fn sync_current_cpu_tlb_state(&mut self) -> Result<(), zx_status_t> {
+        let current_cpu_id = self.current_cpu_id();
+        let current_address_space_id = self.current_process()?.address_space_id;
+        self.with_vm_mut(|vm| {
+            vm.sync_current_cpu_tlb_state(current_address_space_id, current_cpu_id)
+        })
+    }
+
+    fn observe_cpu_tlb_epoch_for_address_space(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        cpu_id: usize,
+    ) {
+        self.with_vm_mut(|vm| vm.observe_cpu_tlb_epoch_for_address_space(address_space_id, cpu_id));
+    }
+
+    pub(crate) fn make_thread_runnable(
+        &mut self,
+        thread_id: ThreadId,
+        status: zx_status_t,
+    ) -> Result<(), zx_status_t> {
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let Some(context) = thread.context else {
+            return Err(ZX_ERR_BAD_STATE);
+        };
+        thread.context = Some(context.with_status(status));
+        thread.state = ThreadState::Runnable;
+        let was_current = thread_id == self.current_thread_id;
+        let _ = thread;
+        if !was_current {
+            self.enqueue_runnable_thread(thread_id)?;
+            self.reschedule_requested = true;
+        }
+        Ok(())
+    }
+
+    fn install_mapping_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm(|vm| vm.install_mapping_pages(address_space_id, base, len))
+    }
+
+    fn lock_address_space_tx_set(
+        &self,
+        requests: &[AddressSpaceTxRequest],
+    ) -> Result<AddressSpaceTxSet, zx_status_t> {
+        self.with_vm(|vm| vm.lock_address_space_tx_set(requests))
+    }
+
+    fn lock_channel_loan_tx(
+        &self,
+        sender_address_space_id: AddressSpaceId,
+        sender_range: PageRange,
+        receiver_address_space_id: AddressSpaceId,
+        receiver_range: PageRange,
+    ) -> Result<ChannelLoanTx, zx_status_t> {
+        self.with_vm(|vm| {
+            vm.lock_channel_loan_tx(
+                sender_address_space_id,
+                sender_range,
+                receiver_address_space_id,
+                receiver_range,
+            )
+        })
+    }
+
+    fn clear_mapping_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm(|vm| vm.clear_mapping_pages(address_space_id, base, len))
+    }
+
+    fn update_mapping_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm(|vm| vm.update_mapping_pages(address_space_id, base, len))
+    }
+
+    fn resolve_copy_on_write_page(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        fault_va: u64,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm_mut(|vm| vm.resolve_copy_on_write_page(address_space_id, fault_va))
+    }
+
+    fn materialize_lazy_anon_page(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        fault_va: u64,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm_mut(|vm| vm.materialize_lazy_anon_page(address_space_id, fault_va))
+    }
+
+    fn materialize_lazy_vmo_page(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        fault_va: u64,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm_mut(|vm| vm.materialize_lazy_vmo_page(address_space_id, fault_va))
+    }
+
+    fn sync_mapping_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm(|vm| vm.sync_mapping_pages(address_space_id, base, len))
+    }
+
+    fn sync_mapping_pages_locked(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+        tx: &mut BootstrapTxCursor,
+    ) -> Result<(), zx_status_t> {
+        self.with_vm(|vm| vm.sync_mapping_pages_locked(address_space_id, base, len, tx))
+    }
+
+    fn mapped_frames_in_range(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<Vec<FrameId>, zx_status_t> {
+        self.with_vm(|vm| vm.mapped_frames_in_range(address_space_id, base, len))
+    }
+
+    fn frame_mappings(&self, frame_id: FrameId) -> Vec<FrameMappingSnapshot> {
+        self.with_vm(|vm| vm.frame_mappings(frame_id))
+    }
+
+    fn frame_mapping_count(&self, frame_id: FrameId) -> u64 {
+        self.with_vm(|vm| vm.frame_mapping_count(frame_id))
+    }
+
+    fn validate_frame_mapping_invariants(&self, frame_id: FrameId, context: &str) {
+        self.with_vm(|vm| vm.validate_frame_mapping_invariants(frame_id, context))
+    }
+
+    fn validate_frame_mapping_invariants_for(&self, frame_ids: &[FrameId], context: &str) {
+        self.with_vm(|vm| vm.validate_frame_mapping_invariants_for(frame_ids, context))
+    }
+
+    fn release_pinned_loan_frames(&mut self, pages: &[FrameId]) {
+        self.with_vm_mut(|vm| vm.release_pinned_loan_frames(pages))
+    }
+
+    fn release_loaned_pages_inner(&mut self, address_space_id: AddressSpaceId, pages: &[FrameId]) {
+        self.with_vm_mut(|vm| vm.release_loaned_pages_inner(address_space_id, pages))
+    }
+}
+
+impl VmDomain {
+    pub(crate) fn validate_user_ptr(
+        &self,
+        address_space_id: AddressSpaceId,
+        ptr: u64,
+        len: usize,
+    ) -> bool {
+        self.address_spaces
+            .get(&address_space_id)
+            .map(|address_space| address_space.validate_user_ptr(ptr, len))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn lookup_user_mapping(
+        &self,
+        address_space_id: AddressSpaceId,
+        ptr: u64,
+        len: usize,
+    ) -> Option<VmaLookup> {
+        self.address_spaces
+            .get(&address_space_id)
+            .and_then(|address_space| address_space.lookup_user_mapping(ptr, len))
+    }
+
+    pub(crate) fn root_vmar(&self, address_space_id: AddressSpaceId) -> Result<Vmar, zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(address_space.root_vmar())
+    }
+
+    pub(crate) fn create_process_address_space(
+        &mut self,
+    ) -> Result<(AddressSpaceId, Vmar), zx_status_t> {
         let address_space_id = self.alloc_address_space_id();
         let address_space = AddressSpace {
             vm: VmAddressSpace::new_with_id(
@@ -1779,20 +2383,7 @@ impl Kernel {
         );
         let root_vmar = address_space.root_vmar();
         self.address_spaces.insert(address_space_id, address_space);
-
-        let process_id = self.alloc_process_id();
-        let process_koid = self.alloc_koid();
-        self.processes.insert(
-            process_id,
-            Process::bootstrap(address_space_id, process_koid),
-        );
-
-        Ok(CreatedProcess {
-            process_id,
-            koid: process_koid,
-            address_space_id,
-            root_vmar,
-        })
+        Ok((address_space_id, root_vmar))
     }
 
     fn register_global_vmo_from_address_space(
@@ -2072,13 +2663,13 @@ impl Kernel {
         self.update_global_vmo_frame(lookup.global_vmo_id(), page_offset, frame_id)
     }
 
-    pub(crate) fn create_current_anonymous_vmo(
+    pub(crate) fn create_anonymous_vmo_for_address_space(
         &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
         size: u64,
         global_vmo_id: KernelVmoId,
     ) -> Result<CreatedVmo, zx_status_t> {
-        let process_id = self.current_thread()?.process_id;
-        let address_space_id = self.current_process()?.address_space_id;
         self.register_empty_global_vmo(global_vmo_id, VmoKind::Anonymous, size)?;
         let local_vmo_id =
             match self.import_global_vmo_into_address_space(address_space_id, global_vmo_id) {
@@ -2101,363 +2692,383 @@ impl Kernel {
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn current_thread_koid(&self) -> Result<zx_koid_t, zx_status_t> {
-        Ok(self.current_thread()?.koid)
-    }
-
-    pub(crate) fn current_process_koid(&self) -> Result<zx_koid_t, zx_status_t> {
-        Ok(self.current_process()?.koid)
-    }
-
-    pub(crate) fn copyout_thread_user<T: Copy>(
-        &self,
-        thread_id: ThreadId,
-        ptr: *mut T,
-        value: T,
-    ) -> Result<(), zx_status_t> {
-        if ptr.is_null() {
-            return Err(ZX_ERR_INVALID_ARGS);
-        }
-        let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        let process = self
-            .processes
-            .get(&thread.process_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
+    pub(crate) fn allocate_subvmar(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        cpu_id: usize,
+        parent_vmar_id: VmarId,
+        offset: u64,
+        len: u64,
+        align: u64,
+        mode: VmarAllocMode,
+        offset_is_upper_limit: bool,
+        child_policy: VmarPlacementPolicy,
+    ) -> Result<Vmar, zx_status_t> {
         let address_space = self
             .address_spaces
-            .get(&process.address_space_id)
+            .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        if !address_space.validate_user_ptr(ptr as u64, size_of::<T>()) {
-            return Err(ZX_ERR_INVALID_ARGS);
-        }
-        // SAFETY: the pointer was validated against the target thread's userspace mapping.
-        unsafe {
-            core::ptr::write_unaligned(ptr, value);
-        }
-        Ok(())
+        address_space
+            .allocate_subvmar(
+                cpu_id,
+                parent_vmar_id,
+                offset,
+                len,
+                align,
+                mode,
+                offset_is_upper_limit,
+                child_policy,
+            )
+            .map_err(map_address_space_error)
     }
 
-    pub(crate) fn capture_current_user_context(
+    pub(crate) fn destroy_vmar(
         &mut self,
-        trap: &crate::arch::int80::TrapFrame,
-        cpu_frame: *const u64,
+        address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
     ) -> Result<(), zx_status_t> {
-        let context = UserContext::capture(trap, cpu_frame)?;
-        let thread = self
-            .threads
-            .get_mut(&self.current_thread_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        thread.context = Some(context);
-        Ok(())
-    }
-
-    pub(crate) fn finish_syscall(
-        &mut self,
-        trap: &mut crate::arch::int80::TrapFrame,
-        cpu_frame: *mut u64,
-    ) -> Result<(), zx_status_t> {
-        match self.current_thread()?.state {
-            ThreadState::Runnable => {
-                self.capture_current_user_context(trap, cpu_frame.cast_const())?;
-                if self.reschedule_requested {
-                    self.reschedule_requested = false;
-                    if let Some(next_thread_id) = self.pop_runnable_thread() {
-                        self.requeue_current_thread()?;
-                        self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
-                    }
-                }
-                self.sync_current_cpu_tlb_state()?;
-                Ok(())
+        let affected_ranges = {
+            let address_space = self
+                .address_spaces
+                .get(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            if vmar_id == address_space.root_vmar().id() {
+                return Err(ZX_ERR_BAD_STATE);
             }
-            ThreadState::New => Err(ZX_ERR_BAD_STATE),
-            ThreadState::FutexWait { .. }
-            | ThreadState::SignalWait { .. }
-            | ThreadState::PortWait { .. } => {
-                let next_thread_id = self.pop_runnable_thread().ok_or(ZX_ERR_BAD_STATE)?;
-                self.switch_to_thread(next_thread_id, trap, cpu_frame)
+            if address_space.vmar(vmar_id).is_none() {
+                return Err(ZX_ERR_NOT_FOUND);
+            }
+            address_space.vm.mapped_ranges_in_vmar_subtree(vmar_id)
+        };
+
+        let mut affected_frames = Vec::new();
+        for (base, len) in affected_ranges.iter().copied() {
+            let frames = self.mapped_frames_in_range(address_space_id, base, len)?;
+            for frame_id in frames {
+                push_unique_frame_id(&mut affected_frames, frame_id);
             }
         }
-    }
 
-    #[allow(dead_code)]
-    pub(crate) fn enqueue_current_futex_wait(
-        &mut self,
-        key: FutexKey,
-        owner_koid: zx_koid_t,
-    ) -> Result<(), zx_status_t> {
-        let thread_id = self.current_thread_id;
-        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        if !matches!(thread.state, ThreadState::Runnable) {
-            return Err(ZX_ERR_BAD_STATE);
-        }
-        thread.state = ThreadState::FutexWait { key };
-        self.futexes.enqueue_waiter(key, thread_id, owner_koid);
-        Ok(())
-    }
-
-    pub(crate) fn can_block_current_thread(&self) -> bool {
-        !self.run_queue.is_empty()
-    }
-
-    pub(crate) fn enqueue_current_signal_wait(
-        &mut self,
-        object_id: u64,
-        watched: Signals,
-        observed_ptr: *mut zx_signals_t,
-    ) -> Result<(), zx_status_t> {
-        let thread = self
-            .threads
-            .get_mut(&self.current_thread_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        if !matches!(thread.state, ThreadState::Runnable) {
-            return Err(ZX_ERR_BAD_STATE);
-        }
-        thread.state = ThreadState::SignalWait {
-            object_id,
-            watched,
-            observed_ptr: observed_ptr as u64,
+        let cleared_ranges = {
+            let address_space = self
+                .address_spaces
+                .get_mut(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            address_space
+                .destroy_vmar(&mut self.frames, vmar_id)
+                .map_err(map_address_space_error)?
         };
-        Ok(())
-    }
-
-    pub(crate) fn signal_waiters_ready(
-        &self,
-        object_id: u64,
-        current: Signals,
-    ) -> Vec<SignalWaiter> {
-        self.threads
-            .iter()
-            .filter_map(|(thread_id, thread)| match thread.state {
-                ThreadState::SignalWait {
-                    object_id: wait_object_id,
-                    watched,
-                    observed_ptr,
-                } if wait_object_id == object_id && current.intersects(watched) => {
-                    Some(SignalWaiter {
-                        thread_id: *thread_id,
-                        observed_ptr,
-                    })
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub(crate) fn enqueue_current_port_wait(
-        &mut self,
-        port_object_id: u64,
-        packet_ptr: *mut zx_port_packet_t,
-    ) -> Result<(), zx_status_t> {
-        let thread = self
-            .threads
-            .get_mut(&self.current_thread_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        if !matches!(thread.state, ThreadState::Runnable) {
-            return Err(ZX_ERR_BAD_STATE);
+        for (base, len) in cleared_ranges {
+            self.clear_private_cow_range(address_space_id, base, len);
+            self.clear_mapping_pages(address_space_id, base, len)?;
         }
-        thread.state = ThreadState::PortWait {
-            port_object_id,
-            packet_ptr: packet_ptr as u64,
-        };
+        self.validate_frame_mapping_invariants_for(&affected_frames, "destroy_vmar");
         Ok(())
     }
 
-    pub(crate) fn port_waiters(&self, port_object_id: u64) -> Vec<PortWaiter> {
-        self.threads
-            .iter()
-            .filter_map(|(thread_id, thread)| match thread.state {
-                ThreadState::PortWait {
-                    port_object_id: wait_port_object_id,
-                    packet_ptr,
-                } if wait_port_object_id == port_object_id => Some(PortWaiter {
-                    thread_id: *thread_id,
-                    packet_ptr,
-                }),
-                _ => None,
-            })
-            .collect()
+    pub(crate) fn ensure_user_page_resident(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        page_va: u64,
+        for_write: bool,
+    ) -> Result<(), zx_status_t> {
+        let page_base = align_down_page(page_va);
+        let meta = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.page_meta(page_base))
+            .ok_or(ZX_ERR_INVALID_ARGS)?;
+        if for_write && !meta.logical_write() {
+            return Err(ZX_ERR_ACCESS_DENIED);
+        }
+        match meta.tag() {
+            PteMetaTag::LazyAnon => self.materialize_lazy_anon_page(address_space_id, page_base),
+            PteMetaTag::LazyVmo => self.materialize_lazy_vmo_page(address_space_id, page_base),
+            PteMetaTag::Present if for_write && meta.cow_shared() => {
+                self.resolve_copy_on_write_page(address_space_id, page_base)
+            }
+            PteMetaTag::Present | PteMetaTag::Phys => Ok(()),
+            _ => Err(ZX_ERR_BAD_STATE),
+        }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn cancel_current_futex_wait(&mut self) -> Result<bool, zx_status_t> {
-        let thread_id = self.current_thread_id;
-        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        let ThreadState::FutexWait { key } = thread.state else {
+    pub(crate) fn try_loan_user_pages(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        ptr: u64,
+        len: usize,
+    ) -> Result<Option<LoanedUserPages>, zx_status_t> {
+        if len == 0 {
+            return Ok(None);
+        }
+
+        let page_size = crate::userspace::USER_PAGE_BYTES;
+        let len_u64 = u64::try_from(len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if (ptr & (page_size - 1)) != 0 || (len_u64 & (page_size - 1)) != 0 {
+            return Ok(None);
+        }
+
+        let Some(lookup) = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.lookup_user_mapping(ptr, len))
+        else {
+            return Ok(None);
+        };
+
+        if lookup.vmo_kind() != VmoKind::Anonymous {
+            return Ok(None);
+        }
+
+        let page_count = len / (page_size as usize);
+        let mut resident_pages = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let page_va = ptr + (page_index as u64) * page_size;
+            let Some(page_lookup) = self
+                .address_spaces
+                .get(&address_space_id)
+                .and_then(|space| space.lookup_user_mapping(page_va, 1))
+            else {
+                return Ok(None);
+            };
+            let Some(frame_id) = page_lookup.frame_id() else {
+                return Ok(None);
+            };
+            resident_pages.push(frame_id);
+        }
+
+        let mut pinned = Vec::with_capacity(page_count);
+        for frame_id in resident_pages.iter().copied() {
+            self.frames
+                .pin(frame_id)
+                .map_err(|_| ZX_ERR_BAD_STATE)
+                .inspect_err(|_| self.release_pinned_loan_frames(&pinned))?;
+            if self.frames.inc_loan(frame_id).is_err() {
+                let _ = self.frames.unpin(frame_id);
+                self.release_pinned_loan_frames(&pinned);
+                return Err(ZX_ERR_BAD_STATE);
+            }
+            pinned.push(frame_id);
+        }
+        self.try_reserve_inflight_loan_pages(
+            address_space_id,
+            u64::try_from(page_count).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+        )
+        .inspect_err(|_| self.release_pinned_loan_frames(&pinned))?;
+
+        let len_u32 = u32::try_from(len).map_err(|_| {
+            self.release_loaned_pages_inner(address_space_id, &pinned);
+            ZX_ERR_OUT_OF_RANGE
+        })?;
+        Ok(Some(LoanedUserPages {
+            address_space_id,
+            receiver_address_space_id: None,
+            base: ptr,
+            len: len_u32,
+            needs_cow: lookup.max_perms().contains(MappingPerms::WRITE),
+            pages: pinned,
+        }))
+    }
+
+    pub(crate) fn release_loaned_user_pages(&mut self, loaned: &LoanedUserPages) {
+        self.release_loaned_pages_inner(loaned.address_space_id(), loaned.pages())
+    }
+
+    pub(crate) fn prepare_loaned_channel_write(
+        &mut self,
+        loaned: &mut LoanedUserPages,
+        receiver_address_space_id: AddressSpaceId,
+    ) -> Result<(), zx_status_t> {
+        if !loaned.needs_cow() {
+            loaned.bind_receiver_address_space(receiver_address_space_id);
+            return Ok(());
+        }
+
+        let len = u64::from(loaned.len());
+        let range = PageRange::new(loaned.base(), len).map_err(map_page_table_error)?;
+        let mut loan_tx = self.lock_channel_loan_tx(
+            loaned.address_space_id(),
+            range,
+            receiver_address_space_id,
+            range,
+        )?;
+        {
+            let address_space = self
+                .address_spaces
+                .get_mut(&loaned.address_space_id())
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            address_space
+                .arm_copy_on_write(loaned.base(), len)
+                .map_err(map_address_space_error)?;
+        }
+        self.clear_private_cow_range(loaned.address_space_id(), loaned.base(), len);
+        loaned.bind_receiver_address_space(receiver_address_space_id);
+        let sender_cursor = loan_tx.sender_cursor_mut().ok_or(ZX_ERR_BAD_STATE)?;
+        self.sync_mapping_pages_locked(
+            loaned.address_space_id(),
+            loaned.base(),
+            len,
+            sender_cursor,
+        )?;
+        loan_tx.commit().map_err(map_page_table_error)
+    }
+
+    pub(crate) fn try_remap_loaned_channel_read(
+        &mut self,
+        current_address_space_id: AddressSpaceId,
+        dst_base: u64,
+        loaned: &LoanedUserPages,
+    ) -> Result<bool, zx_status_t> {
+        let Some(receiver_address_space_id) = loaned.receiver_address_space_id() else {
             return Ok(false);
         };
-        thread.state = ThreadState::Runnable;
-        Ok(self.futexes.cancel_waiter(key, thread_id))
-    }
 
-    #[allow(dead_code)]
-    pub(crate) fn wake_futex_waiters(
-        &mut self,
-        key: FutexKey,
-        wake_count: usize,
-        new_owner_koid: zx_koid_t,
-        single_owner: bool,
-    ) -> Result<usize, zx_status_t> {
-        let result = self
-            .futexes
-            .wake(key, wake_count, new_owner_koid, single_owner);
-        for thread_id in result.woken {
-            self.make_thread_runnable(thread_id, ZX_OK)?;
+        let len = u64::from(loaned.len());
+        if len == 0
+            || (dst_base & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
+            || (len & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
+        {
+            return Ok(false);
         }
-        Ok(result.remaining)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn requeue_futex_waiters(
-        &mut self,
-        source: FutexKey,
-        target: FutexKey,
-        wake_count: usize,
-        requeue_count: usize,
-        target_owner_koid: zx_koid_t,
-    ) -> Result<crate::futex::RequeueResult, zx_status_t> {
-        let result =
-            self.futexes
-                .requeue(source, target, wake_count, requeue_count, target_owner_koid);
-        for thread_id in &result.woken {
-            self.make_thread_runnable(*thread_id, ZX_OK)?;
+        if current_address_space_id != receiver_address_space_id {
+            return Ok(false);
         }
-        for thread in self.threads.values_mut() {
-            if matches!(thread.state, ThreadState::FutexWait { key } if key == source) {
-                thread.state = ThreadState::FutexWait { key: target };
-            }
+
+        let receiver_lookup = self
+            .address_spaces
+            .get(&receiver_address_space_id)
+            .and_then(|space| space.lookup_user_mapping(dst_base, len as usize));
+        let Some(receiver_lookup) = receiver_lookup else {
+            return Ok(false);
+        };
+        if receiver_lookup.mapping_base() != dst_base
+            || receiver_lookup.mapping_len() != len
+            || receiver_lookup.vmo_kind() != VmoKind::Anonymous
+            || !receiver_lookup.max_perms().contains(MappingPerms::WRITE)
+        {
+            return Ok(false);
         }
-        Ok(result)
-    }
 
-    #[allow(dead_code)]
-    pub(crate) fn futex_owner(&self, key: FutexKey) -> zx_koid_t {
-        self.futexes.owner(key)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn thread_is_waiting_on_futex(&self, thread_id: ThreadId, key: FutexKey) -> bool {
-        self.futexes.is_waiter(key, thread_id)
-    }
-
-    pub(crate) fn create_thread(
-        &mut self,
-        process_id: ProcessId,
-    ) -> Result<(ThreadId, zx_koid_t), zx_status_t> {
-        if !self.processes.contains_key(&process_id) {
-            return Err(ZX_ERR_BAD_HANDLE);
-        }
-        let thread_id = self.alloc_thread_id();
-        let koid = self.alloc_koid();
-        self.threads.insert(
-            thread_id,
-            Thread {
-                process_id,
-                koid,
-                state: ThreadState::New,
-                queued: false,
-                context: None,
-            },
-        );
-        Ok((thread_id, koid))
-    }
-
-    pub(crate) fn start_thread(
-        &mut self,
-        thread_id: ThreadId,
-        entry: u64,
-        stack: u64,
-        arg0: u64,
-        arg1: u64,
-    ) -> Result<(), zx_status_t> {
-        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
-        if !matches!(thread.state, ThreadState::New) {
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if page_count != loaned.pages().len() {
             return Err(ZX_ERR_BAD_STATE);
         }
-        thread.context = Some(UserContext::new_user_entry(entry, stack, arg0, arg1));
-        thread.state = ThreadState::Runnable;
-        let queued = thread.queued;
-        let thread_id_copy = thread_id;
-        let _ = thread;
-        if !queued {
-            self.enqueue_runnable_thread(thread_id_copy)?;
+        for page_index in 0..page_count {
+            let page_va = dst_base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            let meta = self
+                .address_spaces
+                .get(&receiver_address_space_id)
+                .and_then(|space| space.page_meta(page_va))
+                .ok_or(ZX_ERR_INVALID_ARGS)?;
+            if !meta.logical_write() {
+                return Ok(false);
+            }
         }
-        Ok(())
+
+        let replaced_receiver_frames =
+            self.mapped_frames_in_range(receiver_address_space_id, dst_base, len)?;
+        let sender_range = PageRange::new(loaned.base(), len).map_err(map_page_table_error)?;
+        let receiver_range = PageRange::new(dst_base, len).map_err(map_page_table_error)?;
+        let mut loan_tx = self.lock_channel_loan_tx(
+            loaned.address_space_id(),
+            sender_range,
+            receiver_address_space_id,
+            receiver_range,
+        )?;
+        {
+            let receiver = self
+                .address_spaces
+                .get_mut(&receiver_address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            receiver
+                .replace_mapping_frames_copy_on_write(
+                    &mut self.frames,
+                    dst_base,
+                    len,
+                    loaned.pages(),
+                )
+                .map_err(map_address_space_error)?;
+        }
+        self.clear_private_cow_range(receiver_address_space_id, dst_base, len);
+        let receiver_cursor = loan_tx.receiver_cursor_mut().ok_or(ZX_ERR_BAD_STATE)?;
+        self.sync_mapping_pages_locked(receiver_address_space_id, dst_base, len, receiver_cursor)?;
+        loan_tx.commit().map_err(map_page_table_error)?;
+        if let Some(&source_frame_id) = loaned.pages().first() {
+            crate::userspace::record_vm_last_remap_source_rmap_count(
+                self.frame_mapping_count(source_frame_id),
+            );
+        }
+        self.validate_frame_mapping_invariants_for(
+            loaned.pages(),
+            "try_remap_loaned_channel_read/source",
+        );
+        self.validate_frame_mapping_invariants_for(
+            &replaced_receiver_frames,
+            "try_remap_loaned_channel_read/receiver",
+        );
+        Ok(true)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn map_current_vmo_into_vmar(
+    pub(crate) fn map_vmo_into_vmar(
         &mut self,
-        vmar_address_space_id: AddressSpaceId,
+        address_space_id: AddressSpaceId,
+        cpu_id: usize,
         vmar_id: VmarId,
         global_vmo_id: KernelVmoId,
-        vmar_offset: u64,
+        fixed_vmar_offset: Option<u64>,
         vmo_offset: u64,
         len: u64,
         perms: MappingPerms,
     ) -> Result<u64, zx_status_t> {
         let local_vmo_id =
-            self.import_global_vmo_into_address_space(vmar_address_space_id, global_vmo_id)?;
-        let address_space = self
-            .address_spaces
-            .get_mut(&vmar_address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        let vmar = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
-        let mapped_addr = vmar
-            .base()
-            .checked_add(vmar_offset)
-            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-        address_space
-            .map_vmo_fixed(
-                &mut self.frames,
-                vmar_id,
-                mapped_addr,
-                len,
-                local_vmo_id,
-                vmo_offset,
-                perms,
-            )
-            .map_err(map_address_space_error)?;
-        self.install_mapping_pages(vmar_address_space_id, mapped_addr, len)?;
-        Ok(mapped_addr)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn map_current_vmo_into_vmar_anywhere(
-        &mut self,
-        vmar_address_space_id: AddressSpaceId,
-        vmar_id: VmarId,
-        global_vmo_id: KernelVmoId,
-        vmo_offset: u64,
-        len: u64,
-        perms: MappingPerms,
-    ) -> Result<u64, zx_status_t> {
-        let cpu_id = self.current_cpu_id();
-        let local_vmo_id =
-            self.import_global_vmo_into_address_space(vmar_address_space_id, global_vmo_id)?;
+            self.import_global_vmo_into_address_space(address_space_id, global_vmo_id)?;
         let mapped_addr = {
             let address_space = self
                 .address_spaces
-                .get_mut(&vmar_address_space_id)
+                .get_mut(&address_space_id)
                 .ok_or(ZX_ERR_BAD_STATE)?;
-            let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
-            address_space
-                .map_vmo_anywhere(
-                    &mut self.frames,
-                    cpu_id,
-                    vmar_id,
-                    len,
-                    local_vmo_id,
-                    vmo_offset,
-                    perms,
-                )
-                .map_err(map_address_space_error)?
+            match fixed_vmar_offset {
+                Some(vmar_offset) => {
+                    let vmar = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
+                    let mapped_addr = vmar
+                        .base()
+                        .checked_add(vmar_offset)
+                        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+                    address_space
+                        .map_vmo_fixed(
+                            &mut self.frames,
+                            vmar_id,
+                            mapped_addr,
+                            len,
+                            local_vmo_id,
+                            vmo_offset,
+                            perms,
+                        )
+                        .map_err(map_address_space_error)?;
+                    mapped_addr
+                }
+                None => {
+                    let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
+                    address_space
+                        .map_vmo_anywhere(
+                            &mut self.frames,
+                            cpu_id,
+                            vmar_id,
+                            len,
+                            local_vmo_id,
+                            vmo_offset,
+                            perms,
+                        )
+                        .map_err(map_address_space_error)?
+                }
+            }
         };
-        self.install_mapping_pages(vmar_address_space_id, mapped_addr, len)?;
+        self.install_mapping_pages(address_space_id, mapped_addr, len)?;
         Ok(mapped_addr)
     }
 
-    pub(crate) fn unmap_current_vmar(
+    pub(crate) fn unmap_vmar(
         &mut self,
         address_space_id: AddressSpaceId,
         vmar_id: VmarId,
@@ -2479,7 +3090,7 @@ impl Kernel {
         Ok(())
     }
 
-    pub(crate) fn protect_current_vmar(
+    pub(crate) fn protect_vmar(
         &mut self,
         address_space_id: AddressSpaceId,
         vmar_id: VmarId,
@@ -2498,7 +3109,12 @@ impl Kernel {
         self.update_mapping_pages(address_space_id, addr, len)
     }
 
-    pub(crate) fn handle_current_page_fault(&mut self, fault_va: u64, error: u64) -> bool {
+    pub(crate) fn handle_page_fault(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        fault_va: u64,
+        error: u64,
+    ) -> bool {
         let mut flags = PageFaultFlags::empty();
         if error & (1 << 0) != 0 {
             flags |= PageFaultFlags::PRESENT;
@@ -2509,15 +3125,6 @@ impl Kernel {
         if error & (1 << 2) != 0 {
             flags |= PageFaultFlags::USER;
         }
-
-        let process_id = match self.current_thread() {
-            Ok(thread) => thread.process_id,
-            Err(_) => return false,
-        };
-        let address_space_id = match self.processes.get(&process_id) {
-            Some(process) => process.address_space_id,
-            None => return false,
-        };
 
         let decision = match self.address_spaces.get(&address_space_id) {
             Some(space) => space.classify_user_page_fault(fault_va, flags),
@@ -2541,140 +3148,22 @@ impl Kernel {
         }
     }
 
-    fn alloc_process_id(&mut self) -> ProcessId {
-        let id = self.next_process_id;
-        self.next_process_id = self.next_process_id.wrapping_add(1);
-        id
-    }
-
-    fn alloc_thread_id(&mut self) -> ThreadId {
-        let id = self.next_thread_id;
-        self.next_thread_id = self.next_thread_id.wrapping_add(1);
-        id
-    }
-
-    fn alloc_koid(&mut self) -> zx_koid_t {
-        let id = self.next_koid;
-        self.next_koid = self.next_koid.wrapping_add(1);
-        id
-    }
-
-    fn alloc_address_space_id(&mut self) -> AddressSpaceId {
-        let id = self.next_address_space_id;
-        self.next_address_space_id = self.next_address_space_id.wrapping_add(1);
-        id
-    }
-
-    fn alloc_global_vmo_id(&mut self) -> KernelVmoId {
-        let id = self.next_global_vmo_id;
-        self.next_global_vmo_id = self.next_global_vmo_id.wrapping_add(1);
-        KernelVmoId::new(id)
-    }
-
-    fn current_cpu_id(&self) -> usize {
-        crate::arch::apic::this_apic_id() as usize
-    }
-
-    fn current_thread(&self) -> Result<&Thread, zx_status_t> {
-        self.threads
-            .get(&self.current_thread_id)
-            .ok_or(ZX_ERR_BAD_STATE)
-    }
-
-    fn process(&self, process_id: ProcessId) -> Result<&Process, zx_status_t> {
-        self.processes.get(&process_id).ok_or(ZX_ERR_BAD_STATE)
-    }
-
-    fn current_process(&self) -> Result<&Process, zx_status_t> {
-        let process_id = self.current_thread()?.process_id;
-        self.process(process_id)
-    }
-
-    fn current_process_mut(&mut self) -> Result<&mut Process, zx_status_t> {
-        let process_id = self.current_thread()?.process_id;
-        self.processes.get_mut(&process_id).ok_or(ZX_ERR_BAD_STATE)
-    }
-
-    fn enqueue_runnable_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
-        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        if thread.queued || !matches!(thread.state, ThreadState::Runnable) {
-            return Ok(());
-        }
-        thread.queued = true;
-        self.run_queue.push_back(thread_id);
-        Ok(())
-    }
-
-    fn requeue_current_thread(&mut self) -> Result<(), zx_status_t> {
-        self.enqueue_runnable_thread(self.current_thread_id)
-    }
-
-    fn pop_runnable_thread(&mut self) -> Option<ThreadId> {
-        while let Some(thread_id) = self.run_queue.pop_front() {
-            let Some(thread) = self.threads.get_mut(&thread_id) else {
-                continue;
-            };
-            thread.queued = false;
-            if matches!(thread.state, ThreadState::Runnable) {
-                return Some(thread_id);
-            }
-        }
-        None
-    }
-
-    fn switch_to_thread(
+    pub(crate) fn sync_current_cpu_tlb_state(
         &mut self,
-        thread_id: ThreadId,
-        trap: &mut crate::arch::int80::TrapFrame,
-        cpu_frame: *mut u64,
+        address_space_id: AddressSpaceId,
+        cpu_id: usize,
     ) -> Result<(), zx_status_t> {
-        let current_cpu_id = self.current_cpu_id();
-        let current_process_id = self.current_thread()?.process_id;
-        let current_address_space_id = self.process(current_process_id)?.address_space_id;
-        let next_process_id = self
-            .threads
-            .get(&thread_id)
-            .ok_or(ZX_ERR_BAD_STATE)?
-            .process_id;
-        let next_address_space_id = self.process(next_process_id)?.address_space_id;
-        let next_page_tables = self
-            .address_spaces
-            .get(&next_address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?
-            .root_page_table();
-        let context = self
-            .threads
-            .get(&thread_id)
-            .and_then(|thread| thread.context)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        next_page_tables.activate().map_err(map_page_table_error)?;
-        if current_address_space_id != next_address_space_id {
-            if let Some(current_address_space) =
-                self.address_spaces.get_mut(&current_address_space_id)
-            {
-                current_address_space.note_cpu_inactive(current_cpu_id);
-            }
-        }
-        self.observe_cpu_tlb_epoch_for_address_space(next_address_space_id, current_cpu_id);
-        context.restore(trap, cpu_frame)?;
-        self.current_thread_id = thread_id;
-        Ok(())
-    }
-
-    pub(crate) fn sync_current_cpu_tlb_state(&mut self) -> Result<(), zx_status_t> {
-        let current_cpu_id = self.current_cpu_id();
-        let current_address_space_id = self.current_process()?.address_space_id;
         let address_space = self
             .address_spaces
-            .get_mut(&current_address_space_id)
+            .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        address_space.note_cpu_active(current_cpu_id);
+        address_space.note_cpu_active(cpu_id);
         let target_epoch = address_space.current_invalidate_epoch();
-        if address_space.observed_tlb_epoch(current_cpu_id) >= target_epoch {
+        if address_space.observed_tlb_epoch(cpu_id) >= target_epoch {
             return Ok(());
         }
         crate::arch::tlb::flush_all_local();
-        address_space.observe_tlb_epoch(current_cpu_id, target_epoch);
+        address_space.observe_tlb_epoch(cpu_id, target_epoch);
         Ok(())
     }
 
@@ -2691,27 +3180,51 @@ impl Kernel {
         address_space.observe_tlb_epoch(cpu_id, target_epoch);
     }
 
-    pub(crate) fn make_thread_runnable(
-        &mut self,
-        thread_id: ThreadId,
-        status: zx_status_t,
+    fn root_page_table(
+        &self,
+        address_space_id: AddressSpaceId,
+    ) -> Result<crate::page_table::UserPageTables, zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(address_space.root_page_table())
+    }
+
+    fn note_cpu_inactive(&mut self, address_space_id: AddressSpaceId, cpu_id: usize) {
+        if let Some(address_space) = self.address_spaces.get_mut(&address_space_id) {
+            address_space.note_cpu_inactive(cpu_id);
+        }
+    }
+
+    fn sync_mapping_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
     ) -> Result<(), zx_status_t> {
-        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        let Some(context) = thread.context else {
-            return Err(ZX_ERR_BAD_STATE);
-        };
-        thread.context = Some(context.with_status(status));
-        thread.state = ThreadState::Runnable;
-        let was_current = thread_id == self.current_thread_id;
-        let _ = thread;
-        if !was_current {
-            self.enqueue_runnable_thread(thread_id)?;
-            self.reschedule_requested = true;
+        let range = PageRange::new(base, len).map_err(map_page_table_error)?;
+        let request = AddressSpaceTxRequest::new(address_space_id, range);
+        let mut tx_set = self.lock_address_space_tx_set(&[request])?;
+        let tx = tx_set.cursor_mut(request.key).ok_or(ZX_ERR_BAD_STATE)?;
+        self.sync_mapping_pages_locked(address_space_id, base, len, tx)?;
+        tx_set.commit().map_err(map_page_table_error)?;
+        if let Some(address_space) = self.address_spaces.get(&address_space_id) {
+            debug_assert!(address_space.validate_descriptor_metadata_range(base, len));
         }
         Ok(())
     }
 
     fn install_mapping_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<(), zx_status_t> {
+        self.sync_mapping_pages(address_space_id, base, len)
+    }
+
+    fn update_mapping_pages(
         &self,
         address_space_id: AddressSpaceId,
         base: u64,
@@ -2816,13 +3329,69 @@ impl Kernel {
         Ok(())
     }
 
-    fn update_mapping_pages(
+    fn sync_mapping_pages_locked(
         &self,
         address_space_id: AddressSpaceId,
         base: u64,
         len: u64,
+        tx: &mut BootstrapTxCursor,
     ) -> Result<(), zx_status_t> {
-        self.sync_mapping_pages(address_space_id, base, len)
+        let address_space = self
+            .address_spaces
+            .get(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        for page_index in 0..page_count {
+            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            let lookup = address_space
+                .lookup_user_mapping(va, 1)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            match lookup.frame_id() {
+                Some(frame_id) => {
+                    let mapping = PageMapping::new(
+                        frame_id.raw(),
+                        lookup.perms().contains(MappingPerms::WRITE),
+                    )
+                    .map_err(map_page_table_error)?;
+                    tx.map(va, crate::userspace::USER_PAGE_BYTES, |_| Ok(mapping))
+                        .map_err(map_page_table_error)?;
+                }
+                None => {
+                    if tx.query(va).map_err(map_page_table_error)?.is_some() {
+                        tx.unmap(va, crate::userspace::USER_PAGE_BYTES)
+                            .map_err(map_page_table_error)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn mapped_frames_in_range(
+        &self,
+        address_space_id: AddressSpaceId,
+        base: u64,
+        len: u64,
+    ) -> Result<Vec<FrameId>, zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let mut frames = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            let Some(frame_id) = address_space
+                .lookup_user_mapping(va, 1)
+                .and_then(|lookup| lookup.frame_id())
+            else {
+                continue;
+            };
+            push_unique_frame_id(&mut frames, frame_id);
+        }
+        Ok(frames)
     }
 
     fn resolve_copy_on_write_page(
@@ -2996,89 +3565,6 @@ impl Kernel {
         )?;
         self.validate_frame_mapping_invariants(resolved.frame_id(), "materialize_lazy_vmo_page");
         Ok(())
-    }
-
-    fn sync_mapping_pages(
-        &self,
-        address_space_id: AddressSpaceId,
-        base: u64,
-        len: u64,
-    ) -> Result<(), zx_status_t> {
-        let range = PageRange::new(base, len).map_err(map_page_table_error)?;
-        let request = AddressSpaceTxRequest::new(address_space_id, range);
-        let mut tx_set = self.lock_address_space_tx_set(&[request])?;
-        let tx = tx_set.cursor_mut(request.key).ok_or(ZX_ERR_BAD_STATE)?;
-        self.sync_mapping_pages_locked(address_space_id, base, len, tx)?;
-        tx_set.commit().map_err(map_page_table_error)?;
-        if let Some(address_space) = self.address_spaces.get(&address_space_id) {
-            debug_assert!(address_space.validate_descriptor_metadata_range(base, len));
-        }
-        Ok(())
-    }
-
-    fn sync_mapping_pages_locked(
-        &self,
-        address_space_id: AddressSpaceId,
-        base: u64,
-        len: u64,
-        tx: &mut BootstrapTxCursor,
-    ) -> Result<(), zx_status_t> {
-        let address_space = self
-            .address_spaces
-            .get(&address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        for page_index in 0..page_count {
-            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
-            let lookup = address_space
-                .lookup_user_mapping(va, 1)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            match lookup.frame_id() {
-                Some(frame_id) => {
-                    let mapping = PageMapping::new(
-                        frame_id.raw(),
-                        lookup.perms().contains(MappingPerms::WRITE),
-                    )
-                    .map_err(map_page_table_error)?;
-                    tx.map(va, crate::userspace::USER_PAGE_BYTES, |_| Ok(mapping))
-                        .map_err(map_page_table_error)?;
-                }
-                None => {
-                    if tx.query(va).map_err(map_page_table_error)?.is_some() {
-                        tx.unmap(va, crate::userspace::USER_PAGE_BYTES)
-                            .map_err(map_page_table_error)?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn mapped_frames_in_range(
-        &self,
-        address_space_id: AddressSpaceId,
-        base: u64,
-        len: u64,
-    ) -> Result<Vec<FrameId>, zx_status_t> {
-        let address_space = self
-            .address_spaces
-            .get(&address_space_id)
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
-            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        let mut frames = Vec::with_capacity(page_count);
-        for page_index in 0..page_count {
-            let va = base + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
-            let Some(frame_id) = address_space
-                .lookup_user_mapping(va, 1)
-                .and_then(|lookup| lookup.frame_id())
-            else {
-                continue;
-            };
-            push_unique_frame_id(&mut frames, frame_id);
-        }
-        Ok(frames)
     }
 
     fn frame_mappings(&self, frame_id: FrameId) -> Vec<FrameMappingSnapshot> {
