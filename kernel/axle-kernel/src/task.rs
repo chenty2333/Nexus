@@ -50,6 +50,7 @@ const CSPACE_QUARANTINE_LEN: usize = 256;
 const MAX_TRACKED_TLB_CPUS: usize = 64;
 const DEFAULT_MAX_INFLIGHT_LOAN_PAGES: Option<u64> = Some(32);
 const DEFAULT_MAX_PRIVATE_COW_PAGES: Option<u64> = None;
+const FAULT_WAIT_SPIN_LOOPS: usize = 256;
 
 type ProcessId = u64;
 type ThreadId = u64;
@@ -83,6 +84,137 @@ struct VmResourceState {
     limits: VmResourceLimits,
     private_cow_pages: BTreeSet<u64>,
     stats: VmResourceStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FaultInFlightKey {
+    LocalPage {
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+    },
+    SharedVmoPage {
+        global_vmo_id: KernelVmoId,
+        page_offset: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FaultEntry {
+    in_flight: bool,
+    completed_epoch: u64,
+    waiters: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FaultWaitToken {
+    key: FaultInFlightKey,
+    observed_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultClaim {
+    Leader,
+    Wait(FaultWaitToken),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FaultTable {
+    entries: BTreeMap<FaultInFlightKey, FaultEntry>,
+}
+
+impl FaultTable {
+    fn claim(&mut self, key: FaultInFlightKey) -> FaultClaim {
+        match self.entries.get_mut(&key) {
+            Some(entry) if entry.in_flight => {
+                entry.waiters = entry.waiters.saturating_add(1);
+                FaultClaim::Wait(FaultWaitToken {
+                    key,
+                    observed_epoch: entry.completed_epoch,
+                })
+            }
+            Some(entry) => {
+                entry.in_flight = true;
+                FaultClaim::Leader
+            }
+            None => {
+                self.entries.insert(
+                    key,
+                    FaultEntry {
+                        in_flight: true,
+                        completed_epoch: 0,
+                        waiters: 0,
+                    },
+                );
+                FaultClaim::Leader
+            }
+        }
+    }
+
+    fn complete(&mut self, key: FaultInFlightKey) {
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return;
+        };
+        entry.in_flight = false;
+        entry.completed_epoch = entry.completed_epoch.wrapping_add(1);
+        if entry.waiters == 0 {
+            let _ = self.entries.remove(&key);
+        }
+    }
+
+    fn observe_completion(&self, wait: FaultWaitToken) -> bool {
+        match self.entries.get(&wait.key) {
+            None => true,
+            Some(entry) => !entry.in_flight && entry.completed_epoch != wait.observed_epoch,
+        }
+    }
+
+    fn release_waiter(&mut self, wait: FaultWaitToken) {
+        let Some(entry) = self.entries.get_mut(&wait.key) else {
+            return;
+        };
+        if entry.waiters > 0 {
+            entry.waiters -= 1;
+        }
+        if !entry.in_flight && entry.waiters == 0 {
+            let _ = self.entries.remove(&wait.key);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FaultLeaderGuard {
+    table: Arc<Mutex<FaultTable>>,
+    key: FaultInFlightKey,
+    active: bool,
+}
+
+impl FaultLeaderGuard {
+    fn new(table: Arc<Mutex<FaultTable>>, key: FaultInFlightKey) -> Self {
+        Self {
+            table,
+            key,
+            active: true,
+        }
+    }
+
+    fn complete(mut self) {
+        if self.active {
+            let mut table = self.table.lock();
+            table.complete(self.key);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for FaultLeaderGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut table = self.table.lock();
+        table.complete(self.key);
+        self.active = false;
+    }
 }
 
 impl VmResourceState {
@@ -1201,6 +1333,7 @@ pub(crate) struct Kernel {
     next_thread_id: ThreadId,
     current_thread_id: ThreadId,
     reschedule_requested: bool,
+    faults: Arc<Mutex<FaultTable>>,
     vm: Arc<Mutex<VmDomain>>,
 }
 
@@ -1255,6 +1388,7 @@ impl Kernel {
         }
 
         let vm = Arc::new(Mutex::new(vm));
+        let faults = Arc::new(Mutex::new(FaultTable::default()));
         let mut kernel = Self {
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
@@ -1266,6 +1400,7 @@ impl Kernel {
             next_thread_id: 1,
             current_thread_id: 0,
             reschedule_requested: false,
+            faults,
             vm,
         };
         let process_id = kernel.alloc_process_id();
@@ -1293,6 +1428,10 @@ impl Kernel {
 
     pub(crate) fn vm_handle(&self) -> Arc<Mutex<VmDomain>> {
         self.vm.clone()
+    }
+
+    pub(crate) fn fault_handle(&self) -> Arc<Mutex<FaultTable>> {
+        self.faults.clone()
     }
 
     fn with_vm<T>(&self, f: impl FnOnce(&VmDomain) -> T) -> T {
@@ -2324,6 +2463,238 @@ impl Kernel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultPlanResult {
+    Satisfied,
+    Ready(FaultPlan),
+    Unhandled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultCommitDisposition {
+    Resolved,
+    Retry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedFaultWork {
+    None,
+    NewPage { paddr: u64 },
+}
+
+impl PreparedFaultWork {
+    fn take_page_paddr(&mut self) -> Option<u64> {
+        match core::mem::replace(self, Self::None) {
+            Self::None => None,
+            Self::NewPage { paddr } => Some(paddr),
+        }
+    }
+
+    fn release_unused(self) {
+        if let Self::NewPage { paddr } = self {
+            crate::userspace::free_bootstrap_page(paddr);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultPlan {
+    CopyOnWrite {
+        key: FaultInFlightKey,
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+        old_frame_id: FrameId,
+    },
+    LazyAnon {
+        key: FaultInFlightKey,
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+    },
+    LazyVmo {
+        key: FaultInFlightKey,
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+        global_vmo_id: KernelVmoId,
+        page_offset: u64,
+        vmo_kind: VmoKind,
+        needs_allocation: bool,
+    },
+}
+
+impl FaultPlan {
+    const fn key(self) -> FaultInFlightKey {
+        match self {
+            Self::CopyOnWrite { key, .. }
+            | Self::LazyAnon { key, .. }
+            | Self::LazyVmo { key, .. } => key,
+        }
+    }
+}
+
+fn wait_for_fault_completion(table: &Arc<Mutex<FaultTable>>, wait: FaultWaitToken) {
+    loop {
+        let completed = {
+            let table = table.lock();
+            table.observe_completion(wait)
+        };
+        if completed {
+            let mut table = table.lock();
+            table.release_waiter(wait);
+            return;
+        }
+        for _ in 0..FAULT_WAIT_SPIN_LOOPS {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+fn prepare_fault_work(plan: FaultPlan) -> Result<PreparedFaultWork, zx_status_t> {
+    match plan {
+        FaultPlan::CopyOnWrite { old_frame_id, .. } => {
+            let new_frame_paddr = crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw())
+                .ok_or(ZX_ERR_NO_MEMORY)?;
+            Ok(PreparedFaultWork::NewPage {
+                paddr: new_frame_paddr,
+            })
+        }
+        FaultPlan::LazyAnon { .. } => {
+            let new_frame_paddr =
+                crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
+            Ok(PreparedFaultWork::NewPage {
+                paddr: new_frame_paddr,
+            })
+        }
+        FaultPlan::LazyVmo {
+            vmo_kind,
+            needs_allocation,
+            ..
+        } => {
+            if !needs_allocation {
+                return Ok(PreparedFaultWork::None);
+            }
+            if vmo_kind != VmoKind::Anonymous {
+                return Err(ZX_ERR_BAD_STATE);
+            }
+            let new_frame_paddr =
+                crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
+            Ok(PreparedFaultWork::NewPage {
+                paddr: new_frame_paddr,
+            })
+        }
+    }
+}
+
+pub(crate) fn ensure_user_page_resident_serialized(
+    vm_handle: Arc<Mutex<VmDomain>>,
+    fault_handle: Arc<Mutex<FaultTable>>,
+    address_space_id: AddressSpaceId,
+    page_va: u64,
+    for_write: bool,
+) -> Result<(), zx_status_t> {
+    loop {
+        let plan = {
+            let vm = vm_handle.lock();
+            vm.plan_resident_fault(address_space_id, page_va, for_write)?
+        };
+        match plan {
+            FaultPlanResult::Satisfied => {
+                let vm = vm_handle.lock();
+                vm.sync_mapping_pages(
+                    address_space_id,
+                    align_down_page(page_va),
+                    crate::userspace::USER_PAGE_BYTES,
+                )?;
+                return Ok(());
+            }
+            FaultPlanResult::Unhandled => return Err(ZX_ERR_BAD_STATE),
+            FaultPlanResult::Ready(plan) => {
+                let claim = {
+                    let mut faults = fault_handle.lock();
+                    faults.claim(plan.key())
+                };
+                match claim {
+                    FaultClaim::Leader => {
+                        let guard = FaultLeaderGuard::new(fault_handle.clone(), plan.key());
+                        let mut prepared = prepare_fault_work(plan)?;
+                        let outcome = {
+                            let mut vm = vm_handle.lock();
+                            vm.commit_prepared_fault(plan, &mut prepared)
+                        };
+                        prepared.release_unused();
+                        guard.complete();
+                        match outcome? {
+                            FaultCommitDisposition::Resolved => return Ok(()),
+                            FaultCommitDisposition::Retry => continue,
+                        }
+                    }
+                    FaultClaim::Wait(wait) => {
+                        wait_for_fault_completion(&fault_handle, wait);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn handle_page_fault_serialized(
+    vm_handle: Arc<Mutex<VmDomain>>,
+    fault_handle: Arc<Mutex<FaultTable>>,
+    address_space_id: AddressSpaceId,
+    fault_va: u64,
+    error: u64,
+) -> bool {
+    loop {
+        let plan = {
+            let vm = vm_handle.lock();
+            vm.plan_trap_fault(address_space_id, fault_va, error)
+        };
+        match plan {
+            FaultPlanResult::Satisfied => {
+                let vm = vm_handle.lock();
+                return vm
+                    .sync_mapping_pages(
+                        address_space_id,
+                        align_down_page(fault_va),
+                        crate::userspace::USER_PAGE_BYTES,
+                    )
+                    .is_ok();
+            }
+            FaultPlanResult::Unhandled => return false,
+            FaultPlanResult::Ready(plan) => {
+                let claim = {
+                    let mut faults = fault_handle.lock();
+                    faults.claim(plan.key())
+                };
+                match claim {
+                    FaultClaim::Leader => {
+                        let guard = FaultLeaderGuard::new(fault_handle.clone(), plan.key());
+                        let mut prepared = match prepare_fault_work(plan) {
+                            Ok(prepared) => prepared,
+                            Err(_) => return false,
+                        };
+                        let outcome = {
+                            let mut vm = vm_handle.lock();
+                            vm.commit_prepared_fault(plan, &mut prepared)
+                        };
+                        prepared.release_unused();
+                        guard.complete();
+                        match outcome {
+                            Ok(FaultCommitDisposition::Resolved) => return true,
+                            Ok(FaultCommitDisposition::Retry) => continue,
+                            Err(_) => return false,
+                        }
+                    }
+                    FaultClaim::Wait(wait) => {
+                        wait_for_fault_completion(&fault_handle, wait);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl VmDomain {
     pub(crate) fn validate_user_ptr(
         &self,
@@ -3107,6 +3478,381 @@ impl VmDomain {
             .protect(vmar_id, addr, len, perms)
             .map_err(map_address_space_error)?;
         self.update_mapping_pages(address_space_id, addr, len)
+    }
+
+    fn mapping_access_satisfied(
+        &self,
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+        for_write: bool,
+    ) -> bool {
+        self.address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.lookup_user_mapping(page_base, 1))
+            .and_then(|lookup| lookup.frame_id().map(|frame_id| (lookup, frame_id)))
+            .map(|(lookup, _)| !for_write || lookup.perms().contains(MappingPerms::WRITE))
+            .unwrap_or(false)
+    }
+
+    fn build_copy_on_write_plan(
+        &self,
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+    ) -> Result<FaultPlan, zx_status_t> {
+        let lookup = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.lookup_user_mapping(page_base, 1))
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if lookup.vmo_kind() != VmoKind::Anonymous {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(FaultPlan::CopyOnWrite {
+            key: FaultInFlightKey::LocalPage {
+                address_space_id,
+                page_base,
+            },
+            address_space_id,
+            page_base,
+            old_frame_id,
+        })
+    }
+
+    fn build_lazy_vmo_plan(
+        &self,
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+    ) -> Result<FaultPlan, zx_status_t> {
+        let lookup = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.lookup_user_mapping(page_base, 1))
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let page_offset = lookup
+            .vmo_offset()
+            .checked_sub(lookup.vmo_offset() % crate::userspace::USER_PAGE_BYTES)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let needs_allocation = self
+            .global_vmo_frame(lookup.global_vmo_id(), page_offset)?
+            .is_none();
+        Ok(FaultPlan::LazyVmo {
+            key: FaultInFlightKey::SharedVmoPage {
+                global_vmo_id: lookup.global_vmo_id(),
+                page_offset,
+            },
+            address_space_id,
+            page_base,
+            global_vmo_id: lookup.global_vmo_id(),
+            page_offset,
+            vmo_kind: lookup.vmo_kind(),
+            needs_allocation,
+        })
+    }
+
+    fn plan_resident_fault(
+        &self,
+        address_space_id: AddressSpaceId,
+        page_va: u64,
+        for_write: bool,
+    ) -> Result<FaultPlanResult, zx_status_t> {
+        let page_base = align_down_page(page_va);
+        let meta = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.page_meta(page_base))
+            .ok_or(ZX_ERR_INVALID_ARGS)?;
+        if for_write && !meta.logical_write() {
+            return Err(ZX_ERR_ACCESS_DENIED);
+        }
+        if self.mapping_access_satisfied(address_space_id, page_base, for_write) {
+            return Ok(FaultPlanResult::Satisfied);
+        }
+        match meta.tag() {
+            PteMetaTag::LazyAnon => Ok(FaultPlanResult::Ready(FaultPlan::LazyAnon {
+                key: FaultInFlightKey::LocalPage {
+                    address_space_id,
+                    page_base,
+                },
+                address_space_id,
+                page_base,
+            })),
+            PteMetaTag::LazyVmo => Ok(FaultPlanResult::Ready(
+                self.build_lazy_vmo_plan(address_space_id, page_base)?,
+            )),
+            PteMetaTag::Present if for_write && meta.cow_shared() => Ok(FaultPlanResult::Ready(
+                self.build_copy_on_write_plan(address_space_id, page_base)?,
+            )),
+            PteMetaTag::Present | PteMetaTag::Phys => Ok(FaultPlanResult::Satisfied),
+            _ => Err(ZX_ERR_BAD_STATE),
+        }
+    }
+
+    fn plan_trap_fault(
+        &self,
+        address_space_id: AddressSpaceId,
+        fault_va: u64,
+        error: u64,
+    ) -> FaultPlanResult {
+        let page_base = align_down_page(fault_va);
+        let mut flags = PageFaultFlags::empty();
+        if error & (1 << 0) != 0 {
+            flags |= PageFaultFlags::PRESENT;
+        }
+        if error & (1 << 1) != 0 {
+            flags |= PageFaultFlags::WRITE;
+        }
+        if error & (1 << 2) != 0 {
+            flags |= PageFaultFlags::USER;
+        }
+
+        let decision = match self.address_spaces.get(&address_space_id) {
+            Some(space) => space.classify_user_page_fault(fault_va, flags),
+            None => return FaultPlanResult::Unhandled,
+        };
+        match decision {
+            PageFaultDecision::CopyOnWrite => self
+                .build_copy_on_write_plan(address_space_id, page_base)
+                .map(FaultPlanResult::Ready)
+                .unwrap_or(FaultPlanResult::Unhandled),
+            PageFaultDecision::NotPresent {
+                tag: PteMetaTag::LazyAnon,
+            } => FaultPlanResult::Ready(FaultPlan::LazyAnon {
+                key: FaultInFlightKey::LocalPage {
+                    address_space_id,
+                    page_base,
+                },
+                address_space_id,
+                page_base,
+            }),
+            PageFaultDecision::NotPresent {
+                tag: PteMetaTag::LazyVmo,
+            } => self
+                .build_lazy_vmo_plan(address_space_id, page_base)
+                .map(FaultPlanResult::Ready)
+                .unwrap_or(FaultPlanResult::Unhandled),
+            _ if self.mapping_access_satisfied(
+                address_space_id,
+                page_base,
+                flags.contains(PageFaultFlags::WRITE),
+            ) =>
+            {
+                FaultPlanResult::Satisfied
+            }
+            _ => FaultPlanResult::Unhandled,
+        }
+    }
+
+    fn commit_prepared_fault(
+        &mut self,
+        plan: FaultPlan,
+        prepared: &mut PreparedFaultWork,
+    ) -> Result<FaultCommitDisposition, zx_status_t> {
+        match plan {
+            FaultPlan::CopyOnWrite {
+                address_space_id,
+                page_base,
+                old_frame_id,
+                ..
+            } => {
+                if self.mapping_access_satisfied(address_space_id, page_base, true) {
+                    self.sync_mapping_pages(
+                        address_space_id,
+                        page_base,
+                        crate::userspace::USER_PAGE_BYTES,
+                    )?;
+                    return Ok(FaultCommitDisposition::Resolved);
+                }
+                let lookup = self
+                    .address_spaces
+                    .get(&address_space_id)
+                    .and_then(|space| space.lookup_user_mapping(page_base, 1))
+                    .ok_or(ZX_ERR_BAD_STATE)?;
+                if lookup.vmo_kind() != VmoKind::Anonymous
+                    || lookup.frame_id() != Some(old_frame_id)
+                {
+                    return Ok(FaultCommitDisposition::Retry);
+                }
+                let meta = self
+                    .address_spaces
+                    .get(&address_space_id)
+                    .and_then(|space| space.page_meta(page_base))
+                    .ok_or(ZX_ERR_BAD_STATE)?;
+                if !meta.cow_shared() {
+                    return Ok(FaultCommitDisposition::Retry);
+                }
+                let reserve_private =
+                    self.try_reserve_private_cow_page(address_space_id, page_base)?;
+                let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
+                let new_frame_id = self
+                    .frames
+                    .register_existing(new_frame_paddr)
+                    .map_err(|_| ZX_ERR_BAD_STATE)?;
+                let resolved = {
+                    let address_space = self
+                        .address_spaces
+                        .get_mut(&address_space_id)
+                        .ok_or(ZX_ERR_BAD_STATE)?;
+                    address_space
+                        .resolve_cow_fault(&mut self.frames, page_base, new_frame_id)
+                        .map_err(map_address_space_error)?
+                };
+                self.publish_address_space_frame_to_global_vmo(
+                    address_space_id,
+                    resolved.fault_page_base(),
+                    resolved.new_frame_id(),
+                )?;
+                self.sync_mapping_pages(
+                    address_space_id,
+                    resolved.fault_page_base(),
+                    crate::userspace::USER_PAGE_BYTES,
+                )?;
+                if reserve_private {
+                    self.commit_private_cow_page(address_space_id, resolved.fault_page_base());
+                }
+                self.cow_fault_count = self.cow_fault_count.wrapping_add(1);
+                crate::userspace::record_vm_cow_fault_count(self.cow_fault_count);
+                crate::userspace::record_vm_last_cow_rmap_counts(
+                    self.frame_mapping_count(resolved.old_frame_id()),
+                    self.frame_mapping_count(resolved.new_frame_id()),
+                );
+                self.validate_frame_mapping_invariants_for(
+                    &[resolved.old_frame_id(), resolved.new_frame_id()],
+                    "resolve_copy_on_write_page",
+                );
+                Ok(FaultCommitDisposition::Resolved)
+            }
+            FaultPlan::LazyAnon {
+                address_space_id,
+                page_base,
+                ..
+            } => {
+                if let Some(frame_id) = self
+                    .address_spaces
+                    .get(&address_space_id)
+                    .and_then(|space| space.lookup_user_mapping(page_base, 1))
+                    .and_then(|lookup| lookup.frame_id())
+                {
+                    self.sync_mapping_pages(
+                        address_space_id,
+                        page_base,
+                        crate::userspace::USER_PAGE_BYTES,
+                    )?;
+                    self.validate_frame_mapping_invariants(frame_id, "materialize_lazy_anon_page");
+                    return Ok(FaultCommitDisposition::Resolved);
+                }
+                let meta = self
+                    .address_spaces
+                    .get(&address_space_id)
+                    .and_then(|space| space.page_meta(page_base))
+                    .ok_or(ZX_ERR_BAD_STATE)?;
+                if meta.tag() != PteMetaTag::LazyAnon {
+                    return Ok(FaultCommitDisposition::Retry);
+                }
+                let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
+                let new_frame_id = self
+                    .frames
+                    .register_existing(new_frame_paddr)
+                    .map_err(|_| ZX_ERR_BAD_STATE)?;
+                let resolved = {
+                    let address_space = self
+                        .address_spaces
+                        .get_mut(&address_space_id)
+                        .ok_or(ZX_ERR_BAD_STATE)?;
+                    address_space
+                        .resolve_lazy_anon_fault(&mut self.frames, page_base, new_frame_id)
+                        .map_err(map_address_space_error)?
+                };
+                self.publish_address_space_frame_to_global_vmo(
+                    address_space_id,
+                    resolved.fault_page_base(),
+                    resolved.new_frame_id(),
+                )?;
+                self.sync_mapping_pages(
+                    address_space_id,
+                    resolved.fault_page_base(),
+                    crate::userspace::USER_PAGE_BYTES,
+                )?;
+                self.validate_frame_mapping_invariants(
+                    resolved.new_frame_id(),
+                    "materialize_lazy_anon_page",
+                );
+                Ok(FaultCommitDisposition::Resolved)
+            }
+            FaultPlan::LazyVmo {
+                address_space_id,
+                page_base,
+                global_vmo_id,
+                page_offset,
+                ..
+            } => {
+                if let Some(frame_id) = self
+                    .address_spaces
+                    .get(&address_space_id)
+                    .and_then(|space| space.lookup_user_mapping(page_base, 1))
+                    .and_then(|lookup| lookup.frame_id())
+                {
+                    self.sync_mapping_pages(
+                        address_space_id,
+                        page_base,
+                        crate::userspace::USER_PAGE_BYTES,
+                    )?;
+                    self.validate_frame_mapping_invariants(frame_id, "materialize_lazy_vmo_page");
+                    return Ok(FaultCommitDisposition::Resolved);
+                }
+                let lookup = self
+                    .address_spaces
+                    .get(&address_space_id)
+                    .and_then(|space| space.lookup_user_mapping(page_base, 1))
+                    .ok_or(ZX_ERR_BAD_STATE)?;
+                let current_page_offset = lookup
+                    .vmo_offset()
+                    .checked_sub(lookup.vmo_offset() % crate::userspace::USER_PAGE_BYTES)
+                    .ok_or(ZX_ERR_BAD_STATE)?;
+                if lookup.global_vmo_id() != global_vmo_id || current_page_offset != page_offset {
+                    return Ok(FaultCommitDisposition::Retry);
+                }
+                let meta = self
+                    .address_spaces
+                    .get(&address_space_id)
+                    .and_then(|space| space.page_meta(page_base))
+                    .ok_or(ZX_ERR_BAD_STATE)?;
+                if meta.tag() != PteMetaTag::LazyVmo {
+                    return Ok(FaultCommitDisposition::Retry);
+                }
+                let frame_id = match self.global_vmo_frame(global_vmo_id, page_offset)? {
+                    Some(frame_id) => frame_id,
+                    None => {
+                        let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
+                        let new_frame_id = self
+                            .frames
+                            .register_existing(new_frame_paddr)
+                            .map_err(|_| ZX_ERR_BAD_STATE)?;
+                        self.update_global_vmo_frame(global_vmo_id, page_offset, new_frame_id)?;
+                        new_frame_id
+                    }
+                };
+                let resolved = {
+                    let address_space = self
+                        .address_spaces
+                        .get_mut(&address_space_id)
+                        .ok_or(ZX_ERR_BAD_STATE)?;
+                    address_space
+                        .resolve_lazy_vmo_fault(&mut self.frames, page_base, frame_id)
+                        .map_err(map_address_space_error)?
+                };
+                self.sync_mapping_pages(
+                    address_space_id,
+                    page_base,
+                    crate::userspace::USER_PAGE_BYTES,
+                )?;
+                self.validate_frame_mapping_invariants(
+                    resolved.frame_id(),
+                    "materialize_lazy_vmo_page",
+                );
+                Ok(FaultCommitDisposition::Resolved)
+            }
+        }
     }
 
     pub(crate) fn handle_page_fault(

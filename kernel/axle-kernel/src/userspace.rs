@@ -12,7 +12,7 @@
 
 extern crate alloc;
 
-use alloc::alloc::{Layout, alloc_zeroed};
+use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use axle_types::zx_status_t;
 use x86_64::instructions::segmentation::Segment;
 
@@ -404,6 +404,23 @@ pub(crate) fn alloc_bootstrap_zeroed_page() -> Option<u64> {
         return None;
     }
     Some(dst as u64)
+}
+
+pub(crate) fn free_bootstrap_page(paddr: u64) {
+    if paddr == 0 || (paddr & (USER_PAGE_BYTES - 1)) != 0 {
+        return;
+    }
+    let Some(layout) =
+        Layout::from_size_align(USER_PAGE_BYTES as usize, USER_PAGE_BYTES as usize).ok()
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: `alloc_bootstrap_zeroed_page` and `alloc_bootstrap_cow_page` allocate one
+        // page with this exact layout from the same global allocator. This helper is only used
+        // to free pages that were prepared for a fault but never registered into the frame table.
+        dealloc(paddr as *mut u8, layout);
+    }
 }
 
 pub(crate) fn query_user_page_frame(user_va: u64) -> Result<Option<UserPageFrame>, ()> {

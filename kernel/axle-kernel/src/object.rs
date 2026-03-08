@@ -487,6 +487,12 @@ fn vm_handle() -> Result<Arc<Mutex<crate::task::VmDomain>>, zx_status_t> {
     Ok(kernel.vm_handle())
 }
 
+fn fault_handle() -> Result<Arc<Mutex<crate::task::FaultTable>>, zx_status_t> {
+    let kernel = kernel_handle()?;
+    let kernel = kernel.lock();
+    Ok(kernel.fault_handle())
+}
+
 fn with_core_mut<T>(
     f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
@@ -855,6 +861,8 @@ pub fn ensure_current_user_range_resident(
         let process = kernel.current_process_info()?;
         kernel.process_address_space_id(process.process_id())
     })?;
+    let vm = vm_handle()?;
+    let faults = fault_handle()?;
     if !with_vm(|vm| Ok(vm.validate_user_ptr(address_space_id, ptr, len)))? {
         return Err(ZX_ERR_INVALID_ARGS);
     }
@@ -875,7 +883,13 @@ pub fn ensure_current_user_range_resident(
 
     let mut page_va = start;
     while page_va < end {
-        with_vm_mut(|vm| vm.ensure_user_page_resident(address_space_id, page_va, for_write))?;
+        crate::task::ensure_user_page_resident_serialized(
+            vm.clone(),
+            faults.clone(),
+            address_space_id,
+            page_va,
+            for_write,
+        )?;
         page_va = page_va.checked_add(page_bytes).ok_or(ZX_ERR_OUT_OF_RANGE)?;
     }
     Ok(())
@@ -883,12 +897,20 @@ pub fn ensure_current_user_range_resident(
 
 /// Try to resolve a bootstrap user-mode page fault.
 pub fn handle_page_fault(cr2: u64, error: u64) -> bool {
+    let vm = match vm_handle() {
+        Ok(vm) => vm,
+        Err(_) => return false,
+    };
+    let faults = match fault_handle() {
+        Ok(faults) => faults,
+        Err(_) => return false,
+    };
     let handled = with_core(|kernel| {
         let process = kernel.current_process_info()?;
         kernel.process_address_space_id(process.process_id())
     })
-    .and_then(|address_space_id| {
-        with_vm_mut(|vm| Ok(vm.handle_page_fault(address_space_id, cr2, error)))
+    .map(|address_space_id| {
+        crate::task::handle_page_fault_serialized(vm, faults, address_space_id, cr2, error)
     })
     .unwrap_or(false);
     if handled {

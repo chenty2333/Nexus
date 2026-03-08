@@ -54,6 +54,12 @@ external VM model.
   kernel core lock. Scheduling, process/thread bookkeeping, and futex state are
   still under the core lock; VM state now has its own boundary ahead of more
   precise same-page fault serialization.
+- Same-page fault serialization now has an explicit `FaultInFlight` table.
+  Fault handling is split into three phases: classify and claim a leader,
+  prepare heavy work outside the main VM lock, then re-enter VM to revalidate
+  and commit. Local `LazyAnon` / COW faults serialize on `(address_space,
+  page_base)`, while shared `LazyVmo` faults serialize on `(global_vmo_id,
+  page_offset)` so one shared page is materialized only once.
 - `Physical` and `Contiguous` VMO mappings now have explicit non-COW boundaries:
   they must already be resident when mapped, and COW arming rejects them.
 - VM resource governance has started to move under one accounting surface:
