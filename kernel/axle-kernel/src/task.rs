@@ -701,10 +701,19 @@ struct GlobalVmo {
 
 #[derive(Clone, Debug)]
 enum VmoBackingSource {
-    Anonymous { frames: Vec<Option<FrameId>> },
-    Physical { frames: Vec<Option<FrameId>> },
-    Contiguous { frames: Vec<Option<FrameId>> },
-    PagerStub { page_count: usize },
+    Anonymous {
+        frames: Vec<Option<FrameId>>,
+    },
+    Physical {
+        frames: Vec<Option<FrameId>>,
+    },
+    Contiguous {
+        frames: Vec<Option<FrameId>>,
+    },
+    PagerReadOnly {
+        frames: Vec<Option<FrameId>>,
+        bytes: &'static [u8],
+    },
 }
 
 impl VmoBackingSource {
@@ -719,6 +728,10 @@ impl VmoBackingSource {
             VmoKind::Contiguous => Self::Contiguous {
                 frames: alloc::vec![None; page_count],
             },
+            VmoKind::PagerBacked => Self::PagerReadOnly {
+                frames: alloc::vec![None; page_count],
+                bytes: &[],
+            },
         }
     }
 
@@ -727,7 +740,7 @@ impl VmoBackingSource {
             Self::Anonymous { .. } => VmoKind::Anonymous,
             Self::Physical { .. } => VmoKind::Physical,
             Self::Contiguous { .. } => VmoKind::Contiguous,
-            Self::PagerStub { .. } => VmoKind::Anonymous,
+            Self::PagerReadOnly { .. } => VmoKind::PagerBacked,
         }
     }
 
@@ -735,8 +748,8 @@ impl VmoBackingSource {
         match self {
             Self::Anonymous { frames }
             | Self::Physical { frames }
-            | Self::Contiguous { frames } => frames,
-            Self::PagerStub { .. } => &[],
+            | Self::Contiguous { frames }
+            | Self::PagerReadOnly { frames, .. } => frames,
         }
     }
 
@@ -744,8 +757,39 @@ impl VmoBackingSource {
         match self {
             Self::Anonymous { frames }
             | Self::Physical { frames }
-            | Self::Contiguous { frames } => Some(frames),
-            Self::PagerStub { .. } => None,
+            | Self::Contiguous { frames }
+            | Self::PagerReadOnly { frames, .. } => Some(frames),
+        }
+    }
+
+    fn read_bytes_into(&self, offset: u64, dst: &mut [u8]) -> Result<bool, zx_status_t> {
+        match self {
+            Self::PagerReadOnly { bytes, .. } => {
+                let end = offset
+                    .checked_add(dst.len() as u64)
+                    .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+                let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+                let end = usize::try_from(end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+                let src = bytes.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+                dst.copy_from_slice(src);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn materialize_page_into(&self, page_offset: u64, dst_paddr: u64) -> Result<bool, zx_status_t> {
+        match self {
+            Self::PagerReadOnly { bytes, .. } => {
+                let page_size = crate::userspace::USER_PAGE_BYTES as usize;
+                let start = usize::try_from(page_offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+                let end = start.checked_add(page_size).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+                let src = bytes.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+                crate::userspace::write_bootstrap_bytes(dst_paddr, 0, src)
+                    .ok_or(ZX_ERR_BAD_STATE)?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 }
@@ -794,6 +838,29 @@ impl GlobalVmoStore {
             GlobalVmo {
                 size_bytes,
                 source: VmoBackingSource::from_kind(kind, page_count),
+            },
+        );
+        Ok(())
+    }
+
+    fn register_pager_read_only(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        bytes: &'static [u8],
+    ) -> Result<(), zx_status_t> {
+        if self.entries.contains_key(&global_vmo_id) {
+            return Err(ZX_ERR_ALREADY_EXISTS);
+        }
+        let size_bytes = u64::try_from(bytes.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let page_count = Self::page_count_for_size(size_bytes)?;
+        self.entries.insert(
+            global_vmo_id,
+            GlobalVmo {
+                size_bytes,
+                source: VmoBackingSource::PagerReadOnly {
+                    frames: alloc::vec![None; page_count],
+                    bytes,
+                },
             },
         );
         Ok(())
@@ -871,6 +938,18 @@ impl GlobalVmoStore {
         let slot = frames.get_mut(page_index).ok_or(ZX_ERR_OUT_OF_RANGE)?;
         *slot = Some(frame_id);
         Ok(())
+    }
+
+    fn materialize_page_into(
+        &self,
+        global_vmo_id: KernelVmoId,
+        page_offset: u64,
+        dst_paddr: u64,
+    ) -> Result<bool, zx_status_t> {
+        let global_vmo = self.entries.get(&global_vmo_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        global_vmo
+            .source
+            .materialize_page_into(page_offset, dst_paddr)
     }
 }
 
@@ -3714,17 +3793,45 @@ fn prepare_fault_work(
             {
                 return Ok(PreparedFaultWork::None);
             }
-            if vmo_kind != VmoKind::Anonymous {
-                return Err(ZX_ERR_BAD_STATE);
+            match vmo_kind {
+                VmoKind::Anonymous => {
+                    update_fault_telemetry(fault_table, |table| {
+                        table.record_prepare(FaultPrepareKind::LazyVmoAlloc);
+                    });
+                    let new_frame_paddr =
+                        crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
+                    Ok(PreparedFaultWork::NewPage {
+                        paddr: new_frame_paddr,
+                    })
+                }
+                VmoKind::PagerBacked => {
+                    update_fault_telemetry(fault_table, |table| {
+                        table.record_prepare(FaultPrepareKind::LazyVmoAlloc);
+                    });
+                    let new_frame_paddr =
+                        crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
+                    let materialized = global_vmo_store.lock().materialize_page_into(
+                        global_vmo_id,
+                        page_offset,
+                        new_frame_paddr,
+                    );
+                    match materialized {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            crate::userspace::free_bootstrap_page(new_frame_paddr);
+                            return Err(ZX_ERR_BAD_STATE);
+                        }
+                        Err(err) => {
+                            crate::userspace::free_bootstrap_page(new_frame_paddr);
+                            return Err(err);
+                        }
+                    }
+                    Ok(PreparedFaultWork::NewPage {
+                        paddr: new_frame_paddr,
+                    })
+                }
+                VmoKind::Physical | VmoKind::Contiguous => Err(ZX_ERR_BAD_STATE),
             }
-            update_fault_telemetry(fault_table, |table| {
-                table.record_prepare(FaultPrepareKind::LazyVmoAlloc);
-            });
-            let new_frame_paddr =
-                crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
-            Ok(PreparedFaultWork::NewPage {
-                paddr: new_frame_paddr,
-            })
         }
     }
 }
@@ -3994,6 +4101,16 @@ impl VmDomain {
         self.global_vmos
             .lock()
             .register_empty(global_vmo_id, kind, size_bytes)
+    }
+
+    fn register_pager_backed_global_vmo(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        bytes: &'static [u8],
+    ) -> Result<(), zx_status_t> {
+        self.global_vmos
+            .lock()
+            .register_pager_read_only(global_vmo_id, bytes)
     }
 
     fn import_global_vmo_into_address_space(
@@ -4270,6 +4387,35 @@ impl VmDomain {
         })
     }
 
+    pub(crate) fn create_pager_backed_vmo_for_address_space(
+        &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        bytes: &'static [u8],
+        global_vmo_id: KernelVmoId,
+    ) -> Result<CreatedVmo, zx_status_t> {
+        self.register_pager_backed_global_vmo(global_vmo_id, bytes)?;
+        let local_vmo_id =
+            match self.import_global_vmo_into_address_space(address_space_id, global_vmo_id) {
+                Ok(vmo_id) => vmo_id,
+                Err(err) => {
+                    let _ = self.global_vmos.lock().remove(global_vmo_id);
+                    return Err(err);
+                }
+            };
+        let vmo = self
+            .address_spaces
+            .get(&address_space_id)
+            .and_then(|space| space.vm.vmo(local_vmo_id))
+            .cloned()
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(CreatedVmo {
+            process_id,
+            address_space_id,
+            vmo,
+        })
+    }
+
     pub(crate) fn read_vmo_bytes(
         &self,
         global_vmo_id: KernelVmoId,
@@ -4277,7 +4423,7 @@ impl VmDomain {
         len: usize,
     ) -> Result<Vec<u8>, zx_status_t> {
         let snapshot = self.global_vmos.lock().snapshot(global_vmo_id)?;
-        if !snapshot.source.kind().supports_kernel_read_write() {
+        if !snapshot.source.kind().supports_kernel_read() {
             return Err(ZX_ERR_NOT_SUPPORTED);
         }
         validate_vmo_io_range(snapshot.size_bytes, offset, len)?;
@@ -4309,7 +4455,11 @@ impl VmDomain {
                 None if snapshot.source.kind() == VmoKind::Anonymous => {
                     dst.fill(0);
                 }
-                None => return Err(ZX_ERR_BAD_STATE),
+                None => {
+                    if !snapshot.source.read_bytes_into(absolute, dst)? {
+                        return Err(ZX_ERR_BAD_STATE);
+                    }
+                }
             }
             copied += chunk_len;
         }
@@ -4324,7 +4474,7 @@ impl VmDomain {
         bytes: &[u8],
     ) -> Result<(), zx_status_t> {
         let snapshot = self.global_vmos.lock().snapshot(global_vmo_id)?;
-        if !snapshot.source.kind().supports_kernel_read_write() {
+        if !snapshot.source.kind().supports_kernel_write() {
             return Err(ZX_ERR_NOT_SUPPORTED);
         }
         validate_vmo_io_range(snapshot.size_bytes, offset, bytes.len())?;
@@ -4360,7 +4510,9 @@ impl VmDomain {
                         prepared.release_unused();
                         frame_id
                     }
-                    VmoKind::Physical | VmoKind::Contiguous => return Err(ZX_ERR_BAD_STATE),
+                    VmoKind::Physical | VmoKind::Contiguous | VmoKind::PagerBacked => {
+                        return Err(ZX_ERR_BAD_STATE);
+                    }
                 },
             };
             crate::userspace::write_bootstrap_bytes(
@@ -5611,6 +5763,29 @@ impl VmDomain {
                     paddr: crate::userspace::alloc_bootstrap_zeroed_page()
                         .ok_or(ZX_ERR_NO_MEMORY)?,
                 },
+                VmoKind::PagerBacked => {
+                    let new_frame_paddr =
+                        crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
+                    let materialized = self.global_vmos.lock().materialize_page_into(
+                        lookup.global_vmo_id(),
+                        page_offset,
+                        new_frame_paddr,
+                    );
+                    match materialized {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            crate::userspace::free_bootstrap_page(new_frame_paddr);
+                            return Err(ZX_ERR_BAD_STATE);
+                        }
+                        Err(err) => {
+                            crate::userspace::free_bootstrap_page(new_frame_paddr);
+                            return Err(err);
+                        }
+                    }
+                    PreparedFaultWork::NewPage {
+                        paddr: new_frame_paddr,
+                    }
+                }
                 VmoKind::Physical | VmoKind::Contiguous => return Err(ZX_ERR_BAD_STATE),
             },
         };

@@ -626,11 +626,18 @@ pub enum VmoKind {
     Physical,
     /// Physically-contiguous memory.
     Contiguous,
+    /// Read-only pager-backed memory populated on demand from one external source.
+    PagerBacked,
 }
 
 impl VmoKind {
-    /// Whether kernel byte-oriented `read` / `write` operations are allowed.
-    pub const fn supports_kernel_read_write(self) -> bool {
+    /// Whether kernel byte-oriented `read` operations are allowed.
+    pub const fn supports_kernel_read(self) -> bool {
+        matches!(self, Self::Anonymous | Self::Contiguous | Self::PagerBacked)
+    }
+
+    /// Whether kernel byte-oriented `write` operations are allowed.
+    pub const fn supports_kernel_write(self) -> bool {
         matches!(self, Self::Anonymous | Self::Contiguous)
     }
 
@@ -658,19 +665,20 @@ impl VmoKind {
         match self {
             Self::Anonymous => VmoFaultPolicy::LocalAnonymous,
             Self::Physical | Self::Contiguous => VmoFaultPolicy::NonDemandPaged,
+            Self::PagerBacked => VmoFaultPolicy::GlobalBacked,
         }
     }
 
     const fn fault_policy_for_import(self) -> VmoFaultPolicy {
         match self {
-            Self::Anonymous => VmoFaultPolicy::GlobalBacked,
+            Self::Anonymous | Self::PagerBacked => VmoFaultPolicy::GlobalBacked,
             Self::Physical | Self::Contiguous => VmoFaultPolicy::NonDemandPaged,
         }
     }
 
     const fn resident_pte_tag(self) -> PteMetaTag {
         match self {
-            Self::Anonymous => PteMetaTag::Present,
+            Self::Anonymous | Self::PagerBacked => PteMetaTag::Present,
             Self::Physical | Self::Contiguous => PteMetaTag::Phys,
         }
     }
@@ -4275,23 +4283,33 @@ mod tests {
 
     #[test]
     fn vmo_kind_policy_matrix_matches_contract() {
-        assert!(VmoKind::Anonymous.supports_kernel_read_write());
+        assert!(VmoKind::Anonymous.supports_kernel_read());
+        assert!(VmoKind::Anonymous.supports_kernel_write());
         assert!(VmoKind::Anonymous.supports_resize());
         assert!(VmoKind::Anonymous.supports_copy_on_write());
         assert!(VmoKind::Anonymous.supports_page_loan());
         assert!(!VmoKind::Anonymous.requires_resident_frames());
 
-        assert!(!VmoKind::Physical.supports_kernel_read_write());
+        assert!(!VmoKind::Physical.supports_kernel_read());
+        assert!(!VmoKind::Physical.supports_kernel_write());
         assert!(!VmoKind::Physical.supports_resize());
         assert!(!VmoKind::Physical.supports_copy_on_write());
         assert!(!VmoKind::Physical.supports_page_loan());
         assert!(VmoKind::Physical.requires_resident_frames());
 
-        assert!(VmoKind::Contiguous.supports_kernel_read_write());
+        assert!(VmoKind::Contiguous.supports_kernel_read());
+        assert!(VmoKind::Contiguous.supports_kernel_write());
         assert!(!VmoKind::Contiguous.supports_resize());
         assert!(!VmoKind::Contiguous.supports_copy_on_write());
         assert!(!VmoKind::Contiguous.supports_page_loan());
         assert!(VmoKind::Contiguous.requires_resident_frames());
+
+        assert!(VmoKind::PagerBacked.supports_kernel_read());
+        assert!(!VmoKind::PagerBacked.supports_kernel_write());
+        assert!(!VmoKind::PagerBacked.supports_resize());
+        assert!(!VmoKind::PagerBacked.supports_copy_on_write());
+        assert!(!VmoKind::PagerBacked.supports_page_loan());
+        assert!(!VmoKind::PagerBacked.requires_resident_frames());
     }
 
     #[test]
@@ -4311,6 +4329,19 @@ mod tests {
         assert_eq!(
             space.vmo(contiguous).unwrap().missing_page_tag(),
             PteMetaTag::Reserved
+        );
+    }
+
+    #[test]
+    fn imported_pager_backed_vmo_keeps_lazy_vmo_fault_policy() {
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let pager = space
+            .import_vmo(VmoKind::PagerBacked, PAGE_SIZE, global_vmo_id(133))
+            .unwrap();
+
+        assert_eq!(
+            space.vmo(pager).unwrap().missing_page_tag(),
+            PteMetaTag::LazyVmo
         );
     }
 

@@ -102,9 +102,12 @@ external VM model.
   into `LazyVmo`.
 - The global VMO backing path now has a first backing-source split instead of
   treating every VMO as just `{kind, frames[]}`: `Anonymous`, `Physical`,
-  `Contiguous`, and a stub `Pager` variant now live behind one internal
-  `VmoBackingSource` enum. This does not yet add pager-backed VMOs, but it gives
-  the next step a cleaner place to hang pager/file-backed policy.
+  `Contiguous`, and `PagerBacked` now live behind one internal
+  `VmoBackingSource` enum. The first pager-backed step is read-only and
+  internal-only: a pager-backed `LazyVmo` can fault in one page from its
+  backing bytes, `zx_vmo_read` can read directly from that backing without
+  materializing every page first, and `zx_vmo_write` / `zx_vmo_set_size`
+  remain rejected for that kind.
 - VM resource governance has started to move under one accounting surface:
   private COW pages and in-flight channel loan pages now keep current/peak
   counters, quota-hit telemetry, and a bootstrap loan-page quota that returns
