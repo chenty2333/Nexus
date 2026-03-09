@@ -567,7 +567,7 @@ impl VmFacade {
         address_space_id: AddressSpaceId,
         dst_base: u64,
         loaned: &LoanedUserPages,
-    ) -> Result<(bool, TlbCommitReq), zx_status_t> {
+    ) -> Result<LoanRemapResult, zx_status_t> {
         self.with_domain_mut(|vm| {
             vm.try_remap_loaned_channel_read(address_space_id, dst_base, loaned)
         })
@@ -1308,6 +1308,14 @@ pub(crate) struct VmoResizeResult {
 }
 
 impl VmoResizeResult {
+    fn from_retire_plan(new_size: u64, plan: FrameRetirePlan) -> Self {
+        Self {
+            new_size,
+            retired_frames: plan.retired_frames,
+            barrier_address_spaces: plan.barrier_address_spaces,
+        }
+    }
+
     pub(crate) const fn new_size(&self) -> u64 {
         self.new_size
     }
@@ -1318,6 +1326,76 @@ impl VmoResizeResult {
 
     pub(crate) fn barrier_address_spaces(&self) -> &[AddressSpaceId] {
         &self.barrier_address_spaces
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FrameRetirePlan {
+    retired_frames: Vec<RetiredFrame>,
+    barrier_address_spaces: Vec<AddressSpaceId>,
+}
+
+impl FrameRetirePlan {
+    fn new(retired_frames: Vec<RetiredFrame>, transition_barriers: &[AddressSpaceId]) -> Self {
+        let mut barrier_address_spaces = Vec::new();
+        if !retired_frames.is_empty() {
+            for &address_space_id in transition_barriers {
+                push_unique_address_space_id(&mut barrier_address_spaces, address_space_id);
+            }
+        }
+        Self {
+            retired_frames,
+            barrier_address_spaces,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.retired_frames.is_empty()
+    }
+
+    pub(crate) fn retired_frames(&self) -> &[RetiredFrame] {
+        &self.retired_frames
+    }
+
+    pub(crate) fn barrier_address_spaces(&self) -> &[AddressSpaceId] {
+        &self.barrier_address_spaces
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LoanRemapResult {
+    remapped: bool,
+    tlb_commit: TlbCommitReq,
+    retire_plan: FrameRetirePlan,
+}
+
+impl LoanRemapResult {
+    fn not_remapped(address_space_id: AddressSpaceId) -> Self {
+        Self {
+            remapped: false,
+            tlb_commit: TlbCommitReq::relaxed(address_space_id),
+            retire_plan: FrameRetirePlan::default(),
+        }
+    }
+
+    fn remapped(address_space_id: AddressSpaceId, retire_plan: FrameRetirePlan) -> Self {
+        Self {
+            remapped: true,
+            tlb_commit: TlbCommitReq::strict(address_space_id),
+            retire_plan,
+        }
+    }
+
+    pub(crate) fn did_remap(&self) -> bool {
+        self.remapped
+    }
+
+    pub(crate) fn tlb_commit(&self) -> TlbCommitReq {
+        self.tlb_commit
+    }
+
+    pub(crate) fn retire_plan(&self) -> &FrameRetirePlan {
+        &self.retire_plan
     }
 }
 
@@ -3123,15 +3201,21 @@ impl Kernel {
         loaned: &LoanedUserPages,
     ) -> Result<bool, zx_status_t> {
         let current_address_space_id = self.current_process()?.address_space_id;
-        let (remapped, req) = self.with_vm_mut(|vm| {
+        let remap = self.with_vm_mut(|vm| {
             vm.try_remap_loaned_channel_read(current_address_space_id, dst_base, loaned)
         })?;
         self.vm.apply_tlb_commit_reqs(
             self.current_cpu_id(),
             Some(current_address_space_id),
-            &[req],
+            &[remap.tlb_commit()],
         )?;
-        Ok(remapped)
+        if !remap.retire_plan().is_empty() {
+            self.retire_bootstrap_frames_after_quiescence_current(
+                remap.retire_plan().barrier_address_spaces(),
+                remap.retire_plan().retired_frames(),
+            )?;
+        }
+        Ok(remap.did_remap())
     }
 
     pub(crate) fn current_root_vmar(&self) -> Result<RootVmarInfo, zx_status_t> {
@@ -3310,16 +3394,13 @@ impl Kernel {
         &mut self,
         backing: KernelVmoBacking,
     ) -> Result<(), zx_status_t> {
-        let barrier_address_spaces =
-            self.with_vm(|vm| vm.address_space_ids_importing_global_vmo(backing.global_vmo_id));
+        let retire_plan =
+            self.with_vm(|vm| vm.build_required_frame_retire_plan(&backing.frame_ids, &[]))?;
         let _ = self.with_vm_mut(|vm| vm.global_vmos.lock().remove(backing.global_vmo_id));
-        let retired = backing
-            .frame_ids
-            .iter()
-            .copied()
-            .map(RetiredFrame::bootstrap_page)
-            .collect::<Vec<_>>();
-        self.retire_bootstrap_frames_after_quiescence_current(&barrier_address_spaces, &retired)?;
+        self.retire_bootstrap_frames_after_quiescence_current(
+            retire_plan.barrier_address_spaces(),
+            retire_plan.retired_frames(),
+        )?;
         Ok(())
     }
 
@@ -5788,45 +5869,14 @@ impl VmDomain {
                 .map_err(map_address_space_error)?;
         }
 
-        let dropped = if new_size < snapshot.size_bytes {
-            let new_page_count = usize::try_from(new_size / crate::userspace::USER_PAGE_BYTES)
-                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-            snapshot.source.frames()[new_page_count..]
-                .iter()
-                .flatten()
-                .copied()
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        for frame_id in &dropped {
-            let state = self
-                .with_frames(|frames| frames.state(*frame_id))
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            if state.ref_count() != 0
-                || state.map_count() != 0
-                || state.pin_count() != 0
-                || state.loan_count() != 0
-            {
-                return Err(ZX_ERR_BAD_STATE);
-            }
-        }
-
-        let barrier_address_spaces = self.address_space_ids_importing_global_vmo(global_vmo_id);
         let dropped = self.global_vmos.lock().resize(global_vmo_id, new_size)?;
         for address_space in self.address_spaces.values_mut() {
             let _ = address_space
                 .resize_vmo(global_vmo_id, new_size)
                 .map_err(map_address_space_error)?;
         }
-        Ok(VmoResizeResult {
-            new_size,
-            retired_frames: dropped
-                .into_iter()
-                .map(RetiredFrame::bootstrap_page)
-                .collect(),
-            barrier_address_spaces,
-        })
+        let retire_plan = self.build_required_frame_retire_plan(&dropped, &[])?;
+        Ok(VmoResizeResult::from_retire_plan(new_size, retire_plan))
     }
 
     fn set_local_vmo_size(
@@ -5860,26 +5910,8 @@ impl VmDomain {
                     .map_err(map_address_space_error)
             },
         )?;
-        for frame_id in &dropped {
-            let state = self
-                .with_frames(|frames| frames.state(*frame_id))
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            if state.ref_count() != 0
-                || state.map_count() != 0
-                || state.pin_count() != 0
-                || state.loan_count() != 0
-            {
-                return Err(ZX_ERR_BAD_STATE);
-            }
-        }
-        Ok(VmoResizeResult {
-            new_size,
-            retired_frames: dropped
-                .into_iter()
-                .map(RetiredFrame::bootstrap_page)
-                .collect(),
-            barrier_address_spaces: alloc::vec![owner_address_space_id],
-        })
+        let retire_plan = self.build_required_frame_retire_plan(&dropped, &[])?;
+        Ok(VmoResizeResult::from_retire_plan(new_size, retire_plan))
     }
 
     pub(crate) fn set_vmo_size(
@@ -6132,9 +6164,9 @@ impl VmDomain {
         current_address_space_id: AddressSpaceId,
         dst_base: u64,
         loaned: &LoanedUserPages,
-    ) -> Result<(bool, TlbCommitReq), zx_status_t> {
+    ) -> Result<LoanRemapResult, zx_status_t> {
         let Some(receiver_address_space_id) = loaned.receiver_address_space_id() else {
-            return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
+            return Ok(LoanRemapResult::not_remapped(current_address_space_id));
         };
 
         let len = u64::from(loaned.len());
@@ -6142,10 +6174,10 @@ impl VmDomain {
             || (dst_base & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
             || (len & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
         {
-            return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
+            return Ok(LoanRemapResult::not_remapped(current_address_space_id));
         }
         if current_address_space_id != receiver_address_space_id {
-            return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
+            return Ok(LoanRemapResult::not_remapped(current_address_space_id));
         }
 
         let receiver_lookup = self
@@ -6153,14 +6185,14 @@ impl VmDomain {
             .get(&receiver_address_space_id)
             .and_then(|space| space.lookup_user_mapping(dst_base, len as usize));
         let Some(receiver_lookup) = receiver_lookup else {
-            return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
+            return Ok(LoanRemapResult::not_remapped(current_address_space_id));
         };
         if receiver_lookup.mapping_base() != dst_base
             || receiver_lookup.mapping_len() != len
             || receiver_lookup.vmo_kind() != VmoKind::Anonymous
             || !receiver_lookup.max_perms().contains(MappingPerms::WRITE)
         {
-            return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
+            return Ok(LoanRemapResult::not_remapped(current_address_space_id));
         }
 
         let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
@@ -6176,7 +6208,7 @@ impl VmDomain {
                 .and_then(|space| space.page_meta(page_va))
                 .ok_or(ZX_ERR_INVALID_ARGS)?;
             if !meta.logical_write() {
-                return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
+                return Ok(LoanRemapResult::not_remapped(current_address_space_id));
             }
         }
 
@@ -6212,7 +6244,14 @@ impl VmDomain {
             &replaced_receiver_frames,
             "try_remap_loaned_channel_read/receiver",
         );
-        Ok((true, TlbCommitReq::strict(current_address_space_id)))
+        let retire_plan = self.build_optional_frame_retire_plan(
+            &replaced_receiver_frames,
+            &[receiver_address_space_id],
+        );
+        Ok(LoanRemapResult::remapped(
+            current_address_space_id,
+            retire_plan,
+        ))
     }
 
     pub(crate) fn map_vmo_into_vmar(
@@ -7225,6 +7264,93 @@ impl VmDomain {
         Ok(())
     }
 
+    fn build_required_frame_retire_plan(
+        &self,
+        frame_ids: &[FrameId],
+        transition_barriers: &[AddressSpaceId],
+    ) -> Result<FrameRetirePlan, zx_status_t> {
+        self.build_required_frame_retire_plan_after_ref_release(frame_ids, transition_barriers, 0)
+    }
+
+    fn build_required_frame_retire_plan_after_ref_release(
+        &self,
+        frame_ids: &[FrameId],
+        transition_barriers: &[AddressSpaceId],
+        released_ref_count: u32,
+    ) -> Result<FrameRetirePlan, zx_status_t> {
+        let mut retired_frames = Vec::new();
+        let mut unique = Vec::with_capacity(frame_ids.len());
+        for &frame_id in frame_ids {
+            push_unique_frame_id(&mut unique, frame_id);
+        }
+        for frame_id in unique {
+            let state = self
+                .with_frames(|frames| frames.state(frame_id))
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            let mappings = self.frame_mappings(frame_id);
+            let remaining_refs = state
+                .ref_count()
+                .checked_sub(released_ref_count)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            if remaining_refs != 0
+                || state.map_count() != 0
+                || state.pin_count() != 0
+                || state.loan_count() != 0
+                || state.rmap_anchor_count() != 0
+                || !mappings.is_empty()
+            {
+                return Err(ZX_ERR_BAD_STATE);
+            }
+            retired_frames.push(RetiredFrame::bootstrap_page(frame_id));
+        }
+        Ok(FrameRetirePlan::new(retired_frames, transition_barriers))
+    }
+
+    fn build_optional_frame_retire_plan(
+        &self,
+        frame_ids: &[FrameId],
+        transition_barriers: &[AddressSpaceId],
+    ) -> FrameRetirePlan {
+        let mut retired_frames = Vec::new();
+        let mut unique = Vec::with_capacity(frame_ids.len());
+        for &frame_id in frame_ids {
+            push_unique_frame_id(&mut unique, frame_id);
+        }
+        for frame_id in unique {
+            let Some(state) = self.with_frames(|frames| frames.state(frame_id)) else {
+                continue;
+            };
+            let mappings = self.frame_mappings(frame_id);
+            if state.ref_count() == 0
+                && state.map_count() == 0
+                && state.pin_count() == 0
+                && state.loan_count() == 0
+                && state.rmap_anchor_count() == 0
+                && mappings.is_empty()
+            {
+                retired_frames.push(RetiredFrame::bootstrap_page(frame_id));
+            }
+        }
+        FrameRetirePlan::new(retired_frames, transition_barriers)
+    }
+
+    fn execute_frame_retire_plan_now(&mut self, plan: &FrameRetirePlan) -> Result<(), zx_status_t> {
+        if !plan.barrier_address_spaces().is_empty() {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        for retired in plan.retired_frames() {
+            self.with_frames_mut(|frames| {
+                frames
+                    .unregister_existing(retired.frame_id())
+                    .map_err(|_| ZX_ERR_BAD_STATE)
+            })?;
+        }
+        for retired in plan.retired_frames() {
+            crate::userspace::free_bootstrap_page(retired.frame_id().raw());
+        }
+        Ok(())
+    }
+
     fn frame_mappings(&self, frame_id: FrameId) -> Vec<FrameMappingSnapshot> {
         let Some(anchors) = self.with_frames(|frames| frames.rmap_anchors(frame_id)) else {
             return Vec::new();
@@ -7333,12 +7459,24 @@ impl VmDomain {
         self.with_frames_mut(|frames| loan.release(frames));
         self.release_inflight_loan_pages(address_space_id, budget_pages);
         self.validate_frame_mapping_invariants_for(&frame_ids, "release_loaned_pages_inner");
+        let retire_plan = self.build_optional_frame_retire_plan(&frame_ids, &[]);
+        debug_assert!(retire_plan.barrier_address_spaces().is_empty());
+        let _ = self.execute_frame_retire_plan_now(&retire_plan);
     }
 }
 
 fn push_unique_frame_id(frames: &mut Vec<FrameId>, frame_id: FrameId) {
     if !frames.contains(&frame_id) {
         frames.push(frame_id);
+    }
+}
+
+fn push_unique_address_space_id(
+    address_space_ids: &mut Vec<AddressSpaceId>,
+    address_space_id: AddressSpaceId,
+) {
+    if !address_space_ids.contains(&address_space_id) {
+        address_space_ids.push(address_space_id);
     }
 }
 

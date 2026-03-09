@@ -322,11 +322,17 @@ pub(crate) fn try_remap_loaned_channel_read(
             let process = kernel.current_process_info()?;
             kernel.process_address_space_id(process.process_id())
         })?;
-        let (remapped, tlb_commit) = state.with_vm_mut(|vm| {
+        let remap = state.with_vm_mut(|vm| {
             vm.try_remap_loaned_channel_read(address_space_id, dst_base, loaned)
         })?;
-        state.apply_tlb_commit_reqs(&[tlb_commit])?;
-        Ok(remapped)
+        state.apply_tlb_commit_reqs(&[remap.tlb_commit()])?;
+        if !remap.retire_plan().is_empty() {
+            state.retire_bootstrap_frames_after_quiescence(
+                remap.retire_plan().barrier_address_spaces(),
+                remap.retire_plan().retired_frames(),
+            )?;
+        }
+        Ok(remap.did_remap())
     })
 }
 
