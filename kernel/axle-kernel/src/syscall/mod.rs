@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
 use axle_types::status::{
     ZX_ERR_BAD_STATE, ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY,
-    ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_OK,
+    ZX_ERR_OUT_OF_RANGE, ZX_OK,
 };
 use axle_types::syscall_numbers::{
     AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ,
@@ -100,6 +100,54 @@ const _ABI_TYPES_WITNESS: Option<(
     zx_status_t,
 )> = None;
 
+#[derive(Clone, Copy, Debug)]
+enum PostAction {
+    FinishTrapExit { cpu_frame: *mut u64 },
+}
+
+#[derive(Debug, Default)]
+struct SyscallCtx {
+    extra_args_cpu_frame: Option<*const u64>,
+    post_actions: Vec<PostAction>,
+}
+
+impl SyscallCtx {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn from_trapframe(frame: &crate::arch::int80::TrapFrame, cpu_frame: *const u64) -> Self {
+        let _ = crate::object::capture_current_user_context(frame, cpu_frame);
+        let mut ctx = Self {
+            extra_args_cpu_frame: Some(cpu_frame),
+            post_actions: Vec::new(),
+        };
+        ctx.push_post_action(PostAction::FinishTrapExit {
+            cpu_frame: cpu_frame.cast_mut(),
+        });
+        ctx
+    }
+
+    fn push_post_action(&mut self, action: PostAction) {
+        self.post_actions.push(action);
+    }
+
+    fn extra_arg_u64(&self, index: usize) -> Result<u64, zx_status_t> {
+        let cpu_frame = self.extra_args_cpu_frame.ok_or(ZX_ERR_INVALID_ARGS)?;
+        extra_arg_u64(cpu_frame, index)
+    }
+
+    fn finish(self, frame: &mut crate::arch::int80::TrapFrame) {
+        for action in self.post_actions {
+            match action {
+                PostAction::FinishTrapExit { cpu_frame } => {
+                    let _ = crate::object::finish_syscall(frame, cpu_frame);
+                }
+            }
+        }
+    }
+}
+
 pub fn init() {
     crate::object::init();
 
@@ -115,6 +163,15 @@ pub fn init() {
 /// Unknown numbers return `ZX_ERR_BAD_SYSCALL`.
 /// Known-but-not-yet-implemented syscalls return `ZX_ERR_NOT_SUPPORTED`.
 pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
+    let mut ctx = SyscallCtx::new();
+    dispatch_syscall_with_ctx(&mut ctx, nr, args)
+}
+
+fn dispatch_syscall_with_ctx(
+    ctx: &mut SyscallCtx,
+    nr: SyscallNumber,
+    args: [u64; 6],
+) -> zx_status_t {
     match nr {
         AXLE_SYS_HANDLE_CLOSE => sys_handle_close(args),
         AXLE_SYS_OBJECT_WAIT_ONE => sys_object_wait_one(args),
@@ -131,12 +188,12 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
         AXLE_SYS_VMO_SET_SIZE => sys_vmo_set_size(args),
         AXLE_SYS_VMAR_ALLOCATE => sys_vmar_allocate(args),
         AXLE_SYS_VMAR_DESTROY => sys_vmar_destroy(args),
-        AXLE_SYS_VMAR_MAP => ZX_ERR_NOT_SUPPORTED,
+        AXLE_SYS_VMAR_MAP => sys_vmar_map(ctx, args),
         AXLE_SYS_VMAR_UNMAP => sys_vmar_unmap(args),
         AXLE_SYS_VMAR_PROTECT => sys_vmar_protect(args),
         AXLE_SYS_CHANNEL_CREATE => sys_channel_create(args),
         AXLE_SYS_CHANNEL_WRITE => sys_channel_write(args),
-        AXLE_SYS_CHANNEL_READ => ZX_ERR_NOT_SUPPORTED,
+        AXLE_SYS_CHANNEL_READ => sys_channel_read(ctx, args),
         AXLE_SYS_EVENTPAIR_CREATE => sys_eventpair_create(args),
         AXLE_SYS_OBJECT_SIGNAL_PEER => sys_object_signal_peer(args),
         AXLE_SYS_HANDLE_DUPLICATE => sys_handle_duplicate(args),
@@ -162,15 +219,13 @@ pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
 
 /// Dispatch a syscall from the architecture trap frame and write status back.
 pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame, cpu_frame: *const u64) {
-    let _ = crate::object::capture_current_user_context(frame, cpu_frame);
+    let mut ctx = SyscallCtx::from_trapframe(frame, cpu_frame);
     let status = match u32::try_from(frame.syscall_nr()) {
-        Ok(AXLE_SYS_VMAR_MAP) => sys_vmar_map(frame.args(), cpu_frame),
-        Ok(AXLE_SYS_CHANNEL_READ) => sys_channel_read(frame.args(), cpu_frame),
-        Ok(nr) => dispatch_syscall(nr, frame.args()),
+        Ok(nr) => dispatch_syscall_with_ctx(&mut ctx, nr, frame.args()),
         Err(_) => ZX_ERR_BAD_SYSCALL,
     };
     frame.set_status(status);
-    let _ = crate::object::finish_syscall(frame, cpu_frame.cast_mut());
+    ctx.finish(frame);
 }
 
 fn copyin<T: Copy>(ptr: *const T) -> Result<T, zx_status_t> {
@@ -353,7 +408,7 @@ fn sys_handle_duplicate(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let duplicated = match crate::object::duplicate_handle(handle, rights as zx_rights_t) {
+    let duplicated = match crate::object::handle::duplicate_handle(handle, rights as zx_rights_t) {
         Ok(new_handle) => new_handle,
         Err(e) => return e,
     };
@@ -379,7 +434,7 @@ fn sys_handle_replace(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let replaced = match crate::object::replace_handle(handle, rights as zx_rights_t) {
+    let replaced = match crate::object::handle::replace_handle(handle, rights as zx_rights_t) {
         Ok(new_handle) => new_handle,
         Err(e) => return e,
     };
@@ -407,7 +462,7 @@ fn sys_object_wait_one(_args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    match crate::object::object_wait_one(handle, signals, deadline, observed_ptr) {
+    match crate::wait::object_wait_one(handle, signals, deadline, observed_ptr) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -456,7 +511,7 @@ fn sys_object_wait_async(_args: [u64; 6]) -> zx_status_t {
         edge_triggered: (options & ZX_WAIT_ASYNC_EDGE) != 0,
         timestamp,
     };
-    match crate::object::object_wait_async(handle, port, key, signals, wait_options) {
+    match crate::wait::object_wait_async(handle, port, key, signals, wait_options) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -498,7 +553,7 @@ fn sys_port_queue(args: [u64; 6]) -> zx_status_t {
         Ok(v) => v,
         Err(e) => return e,
     };
-    match crate::object::queue_port_packet(handle, packet) {
+    match crate::wait::queue_port_packet(handle, packet) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -515,7 +570,7 @@ fn sys_port_wait(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    match crate::object::port_wait(handle, deadline, out_ptr) {
+    match crate::wait::port_wait(handle, deadline, out_ptr) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -584,7 +639,7 @@ fn sys_vmo_create(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let handle = match crate::object::create_vmo(size, options) {
+    let handle = match crate::object::vm::create_vmo(size, options) {
         Ok(handle) => handle,
         Err(e) => return e,
     };
@@ -606,7 +661,7 @@ fn sys_vmo_read(args: [u64; 6]) -> zx_status_t {
         Err(_) => return ZX_ERR_OUT_OF_RANGE,
     };
 
-    let bytes = match crate::object::vmo_read(handle, offset, buffer_size) {
+    let bytes = match crate::object::vm::vmo_read(handle, offset, buffer_size) {
         Ok(bytes) => bytes,
         Err(e) => return e,
     };
@@ -632,7 +687,7 @@ fn sys_vmo_write(args: [u64; 6]) -> zx_status_t {
         Ok(bytes) => bytes,
         Err(e) => return e,
     };
-    match crate::object::vmo_write(handle, offset, &bytes) {
+    match crate::object::vm::vmo_write(handle, offset, &bytes) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -644,7 +699,7 @@ fn sys_vmo_set_size(args: [u64; 6]) -> zx_status_t {
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
     let size = args[1];
-    match crate::object::vmo_set_size(handle, size) {
+    match crate::object::vm::vmo_set_size(handle, size) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -666,7 +721,7 @@ fn sys_socket_create(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let (out0, out1) = match crate::object::create_socket(options) {
+    let (out0, out1) = match crate::object::transport::create_socket(options) {
         Ok(handles) => handles,
         Err(e) => return e,
     };
@@ -699,7 +754,7 @@ fn sys_socket_write(args: [u64; 6]) -> zx_status_t {
     }
 
     if buffer_size == 0 {
-        let actual = match crate::object::socket_write(handle, options, &[]) {
+        let actual = match crate::object::transport::socket_write(handle, options, &[]) {
             Ok(actual) => actual,
             Err(e) => return e,
         };
@@ -713,7 +768,7 @@ fn sys_socket_write(args: [u64; 6]) -> zx_status_t {
         Ok(bytes) => bytes,
         Err(e) => return e,
     };
-    let actual = match crate::object::socket_write(handle, options, &bytes) {
+    let actual = match crate::object::transport::socket_write(handle, options, &bytes) {
         Ok(actual) => actual,
         Err(e) => return e,
     };
@@ -742,7 +797,7 @@ fn sys_socket_read(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let bytes = match crate::object::socket_read(handle, options, buffer_size) {
+    let bytes = match crate::object::transport::socket_read(handle, options, buffer_size) {
         Ok(bytes) => bytes,
         Err(e) => return e,
     };
@@ -781,7 +836,7 @@ fn sys_vmar_allocate(args: [u64; 6]) -> zx_status_t {
     }
 
     let (child_vmar, child_addr) =
-        match crate::object::vmar_allocate(parent_vmar, options, offset, size) {
+        match crate::object::vm::vmar_allocate(parent_vmar, options, offset, size) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -794,7 +849,7 @@ fn sys_vmar_allocate(args: [u64; 6]) -> zx_status_t {
     ZX_OK
 }
 
-fn sys_vmar_map(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
+fn sys_vmar_map(ctx: &mut SyscallCtx, args: [u64; 6]) -> zx_status_t {
     let vmar = match u32::try_from(args[0]) {
         Ok(v) => v,
         Err(_) => return ZX_ERR_INVALID_ARGS,
@@ -813,7 +868,7 @@ fn sys_vmar_map(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
         Some(len) if len != 0 => len,
         _ => return ZX_ERR_INVALID_ARGS,
     };
-    let mapped_addr_ptr = match extra_arg_u64(cpu_frame, 0) {
+    let mapped_addr_ptr = match ctx.extra_arg_u64(0) {
         Ok(arg) => arg as *mut zx_vaddr_t,
         Err(e) => return e,
     };
@@ -822,7 +877,7 @@ fn sys_vmar_map(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
     }
 
     let mapped_addr =
-        match crate::object::vmar_map(vmar, options, vmar_offset, vmo, vmo_offset, len) {
+        match crate::object::vm::vmar_map(vmar, options, vmar_offset, vmo, vmo_offset, len) {
             Ok(addr) => addr,
             Err(e) => return e,
         };
@@ -837,7 +892,7 @@ fn sys_vmar_destroy(args: [u64; 6]) -> zx_status_t {
         Ok(v) => v,
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
-    match crate::object::vmar_destroy(vmar) {
+    match crate::object::vm::vmar_destroy(vmar) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -854,7 +909,7 @@ fn sys_vmar_unmap(args: [u64; 6]) -> zx_status_t {
         _ => return ZX_ERR_INVALID_ARGS,
     };
 
-    match crate::object::vmar_unmap(vmar, addr, len) {
+    match crate::object::vm::vmar_unmap(vmar, addr, len) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -875,7 +930,7 @@ fn sys_vmar_protect(args: [u64; 6]) -> zx_status_t {
         _ => return ZX_ERR_INVALID_ARGS,
     };
 
-    match crate::object::vmar_protect(vmar, options, addr, len) {
+    match crate::object::vm::vmar_protect(vmar, options, addr, len) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -897,7 +952,7 @@ fn sys_channel_create(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let (out0, out1) = match crate::object::create_channel(options) {
+    let (out0, out1) = match crate::object::transport::create_channel(options) {
         Ok(handles) => handles,
         Err(e) => return e,
     };
@@ -940,21 +995,22 @@ fn sys_channel_write(args: [u64; 6]) -> zx_status_t {
         Err(e) => return e,
     };
 
-    let payload = match crate::object::try_loan_current_user_pages(bytes_ptr as u64, num_bytes) {
-        Ok(Some(loaned)) => crate::object::ChannelPayload::Loaned(loaned),
-        Ok(None) => match copyin_bytes(bytes_ptr, num_bytes) {
-            Ok(bytes) => crate::object::ChannelPayload::Copied(bytes),
+    let payload =
+        match crate::object::transport::try_loan_current_user_pages(bytes_ptr as u64, num_bytes) {
+            Ok(Some(loaned)) => crate::object::ChannelPayload::Loaned(loaned),
+            Ok(None) => match copyin_bytes(bytes_ptr, num_bytes) {
+                Ok(bytes) => crate::object::ChannelPayload::Copied(bytes),
+                Err(e) => return e,
+            },
             Err(e) => return e,
-        },
-        Err(e) => return e,
-    };
-    match crate::object::channel_write(handle, options, payload, handles) {
+        };
+    match crate::object::transport::channel_write(handle, options, payload, handles) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
 }
 
-fn sys_channel_read(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
+fn sys_channel_read(ctx: &mut SyscallCtx, args: [u64; 6]) -> zx_status_t {
     let handle = match u32::try_from(args[0]) {
         Ok(v) => v,
         Err(_) => return ZX_ERR_INVALID_ARGS,
@@ -973,11 +1029,11 @@ fn sys_channel_read(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
         Ok(v) => v,
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
-    let actual_bytes_ptr = match extra_arg_u64(cpu_frame, 0) {
+    let actual_bytes_ptr = match ctx.extra_arg_u64(0) {
         Ok(arg) => arg as *mut u32,
         Err(e) => return e,
     };
-    let actual_handles_ptr = match extra_arg_u64(cpu_frame, 1) {
+    let actual_handles_ptr = match ctx.extra_arg_u64(1) {
         Ok(arg) => arg as *mut u32,
         Err(e) => return e,
     };
@@ -1005,28 +1061,30 @@ fn sys_channel_read(args: [u64; 6], cpu_frame: *const u64) -> zx_status_t {
         }
     }
 
-    let message = match crate::object::channel_read(handle, options, num_bytes, num_handles) {
-        Ok(message) => message,
-        Err((status, actual_bytes, actual_handles)) => {
-            let _ = copyout_optional(actual_bytes_ptr, actual_bytes);
-            let _ = copyout_optional(actual_handles_ptr, actual_handles);
-            return status;
-        }
-    };
+    let message =
+        match crate::object::transport::channel_read(handle, options, num_bytes, num_handles) {
+            Ok(message) => message,
+            Err((status, actual_bytes, actual_handles)) => {
+                let _ = copyout_optional(actual_bytes_ptr, actual_bytes);
+                let _ = copyout_optional(actual_handles_ptr, actual_handles);
+                return status;
+            }
+        };
     let actual_bytes = message.actual_bytes;
     let actual_handles = message.actual_handles;
     let transferred_handles = message.handles.clone();
     let copy_result = match &message.payload {
         crate::object::ChannelPayload::Copied(bytes) => copyout_bytes(bytes_ptr, bytes),
         crate::object::ChannelPayload::Loaned(loaned) => {
-            match crate::object::try_remap_loaned_channel_read(bytes_ptr as u64, loaned) {
+            match crate::object::transport::try_remap_loaned_channel_read(bytes_ptr as u64, loaned)
+            {
                 Ok(true) => Ok(()),
                 Ok(false) => copyout_loaned_bytes(bytes_ptr, loaned),
                 Err(e) => Err(e),
             }
         }
     };
-    crate::object::release_channel_read_result(message);
+    crate::object::transport::release_channel_read_result(message);
     if let Err(e) = copy_result {
         return e;
     }
@@ -1218,7 +1276,7 @@ fn sys_thread_create(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let handle = match crate::object::create_thread(process, options) {
+    let handle = match crate::object::process::create_thread(process, options) {
         Ok(handle) => handle,
         Err(e) => return e,
     };
@@ -1238,7 +1296,7 @@ fn sys_thread_start(args: [u64; 6]) -> zx_status_t {
     let arg1 = args[3];
     let arg2 = args[4];
 
-    match crate::object::start_thread(thread, entry, stack, arg1, arg2) {
+    match crate::object::process::start_thread(thread, entry, stack, arg1, arg2) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -1270,7 +1328,7 @@ fn sys_process_create(args: [u64; 6]) -> zx_status_t {
     }
 
     let (process_handle, root_vmar_handle) =
-        match crate::object::create_process(parent_process, options) {
+        match crate::object::process::create_process(parent_process, options) {
             Ok(handles) => handles,
             Err(e) => return e,
         };
@@ -1300,7 +1358,7 @@ fn sys_process_start(args: [u64; 6]) -> zx_status_t {
     };
     let arg2 = args[5];
 
-    match crate::object::start_process(process, thread, entry, stack, arg_handle, arg2) {
+    match crate::object::process::start_process(process, thread, entry, stack, arg_handle, arg2) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -1325,7 +1383,8 @@ fn sys_ax_process_prepare_start(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let prepared = match crate::object::prepare_process_start(process, image_vmo, options) {
+    let prepared = match crate::object::process::prepare_process_start(process, image_vmo, options)
+    {
         Ok(prepared) => prepared,
         Err(err) => return err,
     };
@@ -1344,7 +1403,7 @@ fn sys_task_kill(args: [u64; 6]) -> zx_status_t {
         Err(_) => return ZX_ERR_INVALID_ARGS,
     };
 
-    match crate::object::task_kill(handle) {
+    match crate::object::process::task_kill(handle) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -1357,7 +1416,7 @@ fn sys_task_suspend(args: [u64; 6]) -> zx_status_t {
     };
     let out_token = args[1] as *mut zx_handle_t;
 
-    match crate::object::task_suspend(handle, out_token) {
+    match crate::object::process::task_suspend(handle, out_token) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }

@@ -8,6 +8,7 @@
 
 mod arch;
 mod bringup;
+mod fault;
 mod futex;
 mod kalloc;
 mod object;
@@ -20,6 +21,7 @@ mod task;
 mod time;
 mod trap;
 mod userspace;
+mod wait;
 
 use core::panic::PanicInfo;
 

@@ -54,7 +54,7 @@ fn arm_next_tick() {
 /// Called from the timer interrupt handler.
 fn on_tick() {
     crate::time::on_tick();
-    crate::object::on_tick();
+    crate::wait::on_tick();
 }
 
 // --- IDT entry stub ---

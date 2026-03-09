@@ -945,7 +945,7 @@ fn qemu_loader_user_runner_blob() -> Option<&'static [u8]> {
 /// Bring-up rule: pointers must be fully contained within the mapped shared region
 /// or the mapped stack page (so the kernel never faults on bad pointers).
 pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
-    crate::object::validate_current_user_ptr(ptr, len)
+    crate::fault::validate_current_user_ptr(ptr, len)
 }
 
 /// Ensure a current-thread user range is resident before direct kernel access.
@@ -954,7 +954,7 @@ pub fn ensure_user_range_resident(
     len: usize,
     for_write: bool,
 ) -> Result<(), zx_status_t> {
-    crate::object::ensure_current_user_range_resident(ptr, len, for_write)
+    crate::fault::ensure_current_user_range_resident(ptr, len, for_write)
 }
 
 fn shared_slots() -> &'static mut [u64] {
@@ -1033,7 +1033,7 @@ pub fn on_breakpoint() -> ! {
         crate::kprintln!("userspace: conformance reported failure (ok=0)");
         crate::arch::qemu::exit_failure();
     }
-    let socket_stats = crate::object::socket_telemetry_snapshot();
+    let socket_stats = crate::object::transport::socket_telemetry_snapshot();
     slots[SLOT_SOCKET_BUFFERED_CURRENT] = socket_stats.current_buffered_bytes;
     slots[SLOT_SOCKET_BUFFERED_PEAK] = socket_stats.peak_buffered_bytes;
     slots[SLOT_SOCKET_SHORT_WRITES] = socket_stats.short_write_count;
@@ -1417,12 +1417,15 @@ pub fn prepare() -> u64 {
     // Provide a monotonic baseline so the runner can construct future deadlines
     // without introducing a new syscall ABI.
     slots[SLOT_T0_NS] = crate::time::now_ns() as u64;
-    slots[SLOT_ROOT_VMAR_H] = crate::object::bootstrap_root_vmar_handle().unwrap_or(0) as u64;
-    slots[SLOT_SELF_THREAD_H] = crate::object::bootstrap_self_thread_handle().unwrap_or(0) as u64;
-    slots[SLOT_SELF_THREAD_KOID] = crate::object::bootstrap_self_thread_koid().unwrap_or(0);
-    slots[SLOT_SELF_PROCESS_H] = crate::object::bootstrap_self_process_handle().unwrap_or(0) as u64;
+    slots[SLOT_ROOT_VMAR_H] = crate::object::vm::bootstrap_root_vmar_handle().unwrap_or(0) as u64;
+    slots[SLOT_SELF_THREAD_H] =
+        crate::object::process::bootstrap_self_thread_handle().unwrap_or(0) as u64;
+    slots[SLOT_SELF_THREAD_KOID] =
+        crate::object::process::bootstrap_self_thread_koid().unwrap_or(0);
+    slots[SLOT_SELF_PROCESS_H] =
+        crate::object::process::bootstrap_self_process_handle().unwrap_or(0) as u64;
     slots[SLOT_SELF_CODE_VMO_H] =
-        crate::object::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64;
+        crate::object::vm::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64;
     // Keep the exported bootstrap code-image VMO span stable for the runner ABI. The parsed
     // image layout is an internal loader detail; the bootstrap code window is still the legacy
     // fixed-size mapping.

@@ -179,7 +179,7 @@ extern "C" fn axle_page_fault_rust(
     cr2: u64,
 ) -> bool {
     let (error, rip, cs, rflags, rsp_ss) = decode_cpu_frame_with_error_code(cpu.cast_const());
-    if crate::object::handle_page_fault(regs, cpu, cr2, error) {
+    if crate::fault::handle_page_fault(regs, cpu, cr2, error) {
         return true;
     }
     kprintln!(
