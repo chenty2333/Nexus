@@ -69,6 +69,29 @@ impl KernelState {
         transferred: TransferredCap,
     ) -> Result<zx_handle_t, zx_status_t> {
         let object_id = transferred.capability().object_id();
+        let current_process_id = self.with_core(|kernel| {
+            kernel
+                .current_process_info()
+                .map(|process| process.process_id())
+        })?;
+        let vmo_to_promote = match self.objects.get(&object_id) {
+            Some(KernelObject::Vmo(vmo))
+                if matches!(vmo.backing_scope(), VmoBackingScope::LocalPrivate { .. })
+                    && vmo.creator_process_id() != current_process_id =>
+            {
+                Some(vmo.clone())
+            }
+            _ => None,
+        };
+        if let Some(vmo) = vmo_to_promote {
+            let promoted = self.with_vm_mut(|vm| vm.promote_vmo_object_to_shared(&vmo))?;
+            if promoted {
+                let Some(KernelObject::Vmo(vmo_object)) = self.objects.get_mut(&object_id) else {
+                    return Err(ZX_ERR_BAD_STATE);
+                };
+                vmo_object.backing_scope = VmoBackingScope::GlobalShared;
+            }
+        }
         let handle =
             self.with_core_mut(|kernel| kernel.install_handle_in_current_process(transferred))?;
         self.object_handle_refs

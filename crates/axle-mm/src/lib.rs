@@ -723,6 +723,11 @@ impl Vmo {
         self.size_bytes
     }
 
+    /// Whether faults for missing pages in this VMO resolve through a shared/global backing.
+    pub const fn is_global_backed(&self) -> bool {
+        matches!(self.fault_policy, VmoFaultPolicy::GlobalBacked)
+    }
+
     /// Return the bound frame for the given byte offset, if one is resident.
     pub fn frame_at_offset(&self, offset: u64) -> Option<FrameId> {
         let page_index = usize::try_from(offset / PAGE_SIZE).ok()?;
@@ -923,11 +928,7 @@ pub struct Vma {
     vmar_id: VmarId,
     base: u64,
     len: u64,
-    vmo_id: VmoId,
-    global_vmo_id: GlobalVmoId,
-    vmo_offset: u64,
     perms: MappingPerms,
-    max_perms: MappingPerms,
     copy_on_write: bool,
 }
 
@@ -957,29 +958,9 @@ impl Vma {
         self.len == 0
     }
 
-    /// Backing VMO id.
-    pub const fn vmo_id(self) -> VmoId {
-        self.vmo_id
-    }
-
-    /// Kernel-global VMO identity.
-    pub const fn global_vmo_id(self) -> GlobalVmoId {
-        self.global_vmo_id
-    }
-
-    /// Offset into the backing VMO.
-    pub const fn vmo_offset(self) -> u64 {
-        self.vmo_offset
-    }
-
     /// Current mapping permissions.
     pub const fn perms(self) -> MappingPerms {
         self.perms
-    }
-
-    /// Maximum allowed permissions for future `protect` operations.
-    pub const fn max_perms(self) -> MappingPerms {
-        self.max_perms
     }
 
     /// Whether the mapping is armed for copy-on-write fault handling.
@@ -1010,6 +991,7 @@ pub struct VmaLookup {
     perms: MappingPerms,
     max_perms: MappingPerms,
     copy_on_write: bool,
+    global_backed: bool,
     mapping_base: u64,
     mapping_len: u64,
 }
@@ -1068,6 +1050,11 @@ impl VmaLookup {
     /// Whether the resolved mapping is currently armed for copy-on-write.
     pub const fn is_copy_on_write(self) -> bool {
         self.copy_on_write
+    }
+
+    /// Whether missing pages for this mapping fault through a shared/global backing source.
+    pub const fn is_global_backed(self) -> bool {
+        self.global_backed
     }
 
     /// Base virtual address of the containing mapping.
@@ -1425,7 +1412,7 @@ impl FutexKey {
 
     /// Build a futex key from resolved mapping metadata.
     pub fn from_lookup(process_id: u64, user_addr: u64, lookup: VmaLookup) -> Self {
-        if lookup.global_vmo_id().raw() != 0 {
+        if lookup.is_global_backed() {
             return Self::Shared {
                 global_vmo_id: lookup.global_vmo_id(),
                 offset: lookup.vmo_offset(),
@@ -1850,8 +1837,14 @@ impl AddressSpace {
             return Ok(());
         }
 
-        for vma in self.vmas.iter().filter(|vma| vma.vmo_id == vmo_id) {
-            let Some(mapped_end) = vma.vmo_offset.checked_add(vma.len) else {
+        for vma in &self.vmas {
+            let Some(map_rec) = self.map_record(vma.map_id) else {
+                continue;
+            };
+            if map_rec.vmo_id() != vmo_id {
+                continue;
+            }
+            let Some(mapped_end) = map_rec.vmo_offset().checked_add(map_rec.len()) else {
                 return Err(AddressSpaceError::InvalidArgs);
             };
             if mapped_end > new_size_bytes {
@@ -1904,8 +1897,15 @@ impl AddressSpace {
             if existing.kind() != kind || existing.size_bytes() != size_bytes {
                 return Err(AddressSpaceError::InvalidArgs);
             }
-            existing.fault_policy = vmo_fault_policy_for_import(kind);
-            return Ok(existing.id());
+            let id = existing.id();
+            let next_policy = vmo_fault_policy_for_import(kind);
+            let changed = existing.fault_policy != next_policy;
+            existing.fault_policy = next_policy;
+            let _ = existing;
+            if changed {
+                self.refresh_all_vmo_page_metadata(id)?;
+            }
+            return Ok(id);
         }
         if size_bytes == 0 || !is_page_aligned(size_bytes) {
             return Err(AddressSpaceError::InvalidArgs);
@@ -1922,6 +1922,18 @@ impl AddressSpace {
             frames: alloc::vec![None; usize::try_from(size_bytes / PAGE_SIZE).unwrap_or(0)],
         });
         Ok(id)
+    }
+
+    fn refresh_all_vmo_page_metadata(&mut self, vmo_id: VmoId) -> Result<(), AddressSpaceError> {
+        let page_count = self
+            .vmo(vmo_id)
+            .ok_or(AddressSpaceError::InvalidVmo)?
+            .frames()
+            .len();
+        for page_index in 0..page_count {
+            self.refresh_vmo_page_metadata(vmo_id, (page_index as u64) * PAGE_SIZE)?;
+        }
+        Ok(())
     }
 
     /// Return the current coarse mapping records in insertion order.
@@ -1997,7 +2009,7 @@ impl AddressSpace {
             return PageFaultDecision::Unmapped;
         };
         let meta = resolved.meta;
-        let Some(vmo) = self.vmo(resolved.vma.vmo_id) else {
+        let Some(vmo) = self.vmo(resolved.map_rec.vmo_id()) else {
             return PageFaultDecision::Unmapped;
         };
 
@@ -2068,6 +2080,82 @@ impl AddressSpace {
         }
     }
 
+    /// Attach one newly materialized VMO page to every existing mapping alias of that page.
+    pub fn materialize_vmo_page_aliases(
+        &mut self,
+        frames: &mut FrameTable,
+        vmo_id: VmoId,
+        page_offset: u64,
+        frame_id: FrameId,
+    ) -> Result<Vec<u64>, AddressSpaceError> {
+        if !is_page_aligned(page_offset) {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+        let vmo = self.vmo(vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        if vmo.frame_at_offset(page_offset) != Some(frame_id) {
+            return Err(AddressSpaceError::InvalidFrame);
+        }
+
+        let mut page_targets = Vec::new();
+        let mut installed = Vec::new();
+        for vma in self.vmas.iter().copied() {
+            let Some(map_rec) = self.map_record(vma.map_id) else {
+                continue;
+            };
+            if map_rec.vmo_id() != vmo_id {
+                continue;
+            }
+            if page_offset < map_rec.vmo_offset()
+                || page_offset >= map_rec.vmo_offset() + map_rec.len()
+            {
+                continue;
+            }
+
+            let page_delta = (page_offset - map_rec.vmo_offset()) / PAGE_SIZE;
+            let page_base = vma.base + page_delta * PAGE_SIZE;
+            page_targets.push((vma.map_id, page_delta, page_base));
+        }
+
+        let mut page_bases = Vec::with_capacity(page_targets.len());
+        for (map_id, page_delta, page_base) in page_targets {
+            page_bases.push(page_base);
+            if self.rmap_node_at(page_base).is_some() {
+                continue;
+            }
+
+            let anchor = self.make_rmap_anchor(map_id, page_delta);
+            let node_id = match frames.map_frame(frame_id, anchor) {
+                Ok(node_id) => node_id,
+                Err(err) => {
+                    for (rollback_base, rollback_node) in installed {
+                        let _ = self.rmap_index.set_node(rollback_base, None);
+                        let _ = frames.unmap_frame(frame_id, rollback_node);
+                    }
+                    return Err(AddressSpaceError::FrameTable(err));
+                }
+            };
+            if let Err(err) = self.rmap_index.set_node(page_base, Some(node_id)) {
+                let _ = frames.unmap_frame(frame_id, node_id);
+                for (rollback_base, rollback_node) in installed {
+                    let _ = self.rmap_index.set_node(rollback_base, None);
+                    let _ = frames.unmap_frame(frame_id, rollback_node);
+                }
+                return Err(err);
+            }
+            installed.push((page_base, node_id));
+        }
+
+        if let Err(err) = self.refresh_vmo_page_metadata(vmo_id, page_offset) {
+            for (rollback_base, rollback_node) in installed {
+                let _ = self.rmap_index.set_node(rollback_base, None);
+                let _ = frames.unmap_frame(frame_id, rollback_node);
+            }
+            return Err(err);
+        }
+
+        Ok(page_bases)
+    }
+
     /// Return the current VMA list in ascending virtual-address order.
     pub fn vmas(&self) -> &[Vma] {
         &self.vmas
@@ -2075,10 +2163,11 @@ impl AddressSpace {
 
     /// Return every mapped range currently backed by the given kernel-global VMO identity.
     pub fn mapped_ranges_for_global_vmo(&self, global_id: GlobalVmoId) -> Vec<(u64, u64)> {
-        self.vmas
+        self.map_recs
             .iter()
-            .filter(|vma| vma.global_vmo_id == global_id)
-            .map(|vma| (vma.base(), vma.len()))
+            .copied()
+            .filter(|map_rec| map_rec.global_vmo_id() == global_id)
+            .map(|map_rec| (map_rec.base(), map_rec.len()))
             .collect()
     }
 
@@ -2089,10 +2178,11 @@ impl AddressSpace {
         }
         let subtree = self.collect_vmar_subtree_ids(vmar_id);
         let mut ranges = self
-            .vmas
+            .map_recs
             .iter()
-            .filter(|vma| subtree.contains(&vma.vmar_id))
-            .map(|vma| (vma.base(), vma.len()))
+            .copied()
+            .filter(|map_rec| subtree.contains(&map_rec.vmar_id()))
+            .map(|map_rec| (map_rec.base(), map_rec.len()))
             .collect::<Vec<_>>();
         ranges.sort_by_key(|&(base, _)| base);
         ranges
@@ -2197,14 +2287,10 @@ impl AddressSpace {
             vmar_id,
             base,
             len,
-            vmo_id,
-            global_vmo_id,
-            vmo_offset,
             perms,
-            max_perms,
             copy_on_write: false,
         };
-        let page_meta = match self.build_pte_meta_range(vma) {
+        let page_meta = match self.build_pte_meta_range(map_rec, vma) {
             Ok(page_meta) => page_meta,
             Err(err) => {
                 for (rollback_frame, rollback_anchor) in incremented {
@@ -2314,12 +2400,17 @@ impl AddressSpace {
             .position(|vma| vma.vmar_id == vmar_id && vma.base == base && vma.len == len)
             .ok_or(AddressSpaceError::NotFound)?;
         let vma = self.vmas[index];
-        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        let map_rec = self
+            .map_record(vma.map_id)
+            .ok_or(AddressSpaceError::NotFound)?;
+        let vmo = self
+            .vmo(map_rec.vmo_id())
+            .ok_or(AddressSpaceError::InvalidVmo)?;
         let page_count =
             usize::try_from(vma.len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
         for page_index in 0..page_count {
             let page_base = vma.base + (page_index as u64) * PAGE_SIZE;
-            let page_offset = vma.vmo_offset + (page_index as u64) * PAGE_SIZE;
+            let page_offset = map_rec.vmo_offset() + (page_index as u64) * PAGE_SIZE;
             let Some(frame_id) = vmo.frame_at_offset(page_offset) else {
                 continue;
             };
@@ -2370,14 +2461,21 @@ impl AddressSpace {
         new_perms: MappingPerms,
     ) -> Result<(), AddressSpaceError> {
         validate_mapping_range(base, len)?;
+        let index = self
+            .vmas
+            .iter()
+            .find(|vma| vma.vmar_id == vmar_id && vma.base == base && vma.len == len)
+            .map(|vma| vma.map_id)
+            .ok_or(AddressSpaceError::NotFound)?;
+        let map_rec = self.map_record(index).ok_or(AddressSpaceError::NotFound)?;
+        if !map_rec.max_perms().contains(new_perms) {
+            return Err(AddressSpaceError::PermissionIncrease);
+        }
         let vma = self
             .vmas
             .iter_mut()
-            .find(|vma| vma.vmar_id == vmar_id && vma.base == base && vma.len == len)
+            .find(|vma| vma.map_id == index)
             .ok_or(AddressSpaceError::NotFound)?;
-        if !vma.max_perms.contains(new_perms) {
-            return Err(AddressSpaceError::PermissionIncrease);
-        }
         vma.perms = new_perms;
         let logical_write = new_perms.contains(MappingPerms::WRITE);
         let _ = vma;
@@ -2405,8 +2503,12 @@ impl AddressSpace {
             .iter()
             .position(|vma| vma.base == base && vma.len == len)
             .ok_or(AddressSpaceError::NotFound)?;
-        let vmo_id = self.vmas[index].vmo_id;
-        let vmo = self.vmo(vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        let map_rec = self
+            .map_record(self.vmas[index].map_id)
+            .ok_or(AddressSpaceError::NotFound)?;
+        let vmo = self
+            .vmo(map_rec.vmo_id())
+            .ok_or(AddressSpaceError::InvalidVmo)?;
         if !vmo.supports_copy_on_write() {
             return Err(AddressSpaceError::InvalidArgs);
         }
@@ -2414,7 +2516,7 @@ impl AddressSpace {
             .vmas
             .get_mut(index)
             .ok_or(AddressSpaceError::NotFound)?;
-        if !vma.max_perms.contains(MappingPerms::WRITE) {
+        if !map_rec.max_perms().contains(MappingPerms::WRITE) {
             return Err(AddressSpaceError::PermissionIncrease);
         }
         vma.perms.remove(MappingPerms::WRITE);
@@ -2443,9 +2545,11 @@ impl AddressSpace {
             .resolve_page_state(page_base)
             .ok_or(AddressSpaceError::NotFound)?;
         let vma = resolved.vma;
-        let page_offset = vma.vmo_offset + (page_base - vma.base);
+        let page_offset = resolved.map_rec.vmo_offset() + (page_base - resolved.map_rec.base());
         let page_anchor = self.make_rmap_anchor(vma.map_id, resolved.page_delta);
-        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        let vmo = self
+            .vmo(resolved.map_rec.vmo_id())
+            .ok_or(AddressSpaceError::InvalidVmo)?;
         if vmo.kind() != VmoKind::Anonymous {
             return Err(AddressSpaceError::NotFound);
         }
@@ -2461,7 +2565,8 @@ impl AddressSpace {
         let node_id = frames
             .map_frame(new_frame_id, page_anchor)
             .map_err(AddressSpaceError::FrameTable)?;
-        if let Err(err) = self.bind_vmo_frame(vma.vmo_id, page_offset, new_frame_id) {
+        if let Err(err) = self.bind_vmo_frame(resolved.map_rec.vmo_id(), page_offset, new_frame_id)
+        {
             let _ = frames.unmap_frame(new_frame_id, node_id);
             return Err(err);
         }
@@ -2489,9 +2594,11 @@ impl AddressSpace {
             .resolve_page_state(page_base)
             .ok_or(AddressSpaceError::NotFound)?;
         let vma = resolved.vma;
-        let page_offset = vma.vmo_offset + (page_base - vma.base);
+        let page_offset = resolved.map_rec.vmo_offset() + (page_base - resolved.map_rec.base());
         let page_anchor = self.make_rmap_anchor(vma.map_id, resolved.page_delta);
-        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        let vmo = self
+            .vmo(resolved.map_rec.vmo_id())
+            .ok_or(AddressSpaceError::InvalidVmo)?;
         if resolved.meta.tag() != PteMetaTag::LazyVmo {
             return Err(AddressSpaceError::NotFound);
         }
@@ -2508,7 +2615,7 @@ impl AddressSpace {
         let node_id = frames
             .map_frame(frame_id, page_anchor)
             .map_err(AddressSpaceError::FrameTable)?;
-        if let Err(err) = self.bind_vmo_frame(vma.vmo_id, page_offset, frame_id) {
+        if let Err(err) = self.bind_vmo_frame(resolved.map_rec.vmo_id(), page_offset, frame_id) {
             let _ = frames.unmap_frame(frame_id, node_id);
             return Err(err);
         }
@@ -2537,16 +2644,19 @@ impl AddressSpace {
             .ok_or(AddressSpaceError::NotCopyOnWrite)?;
         let index = resolved.vma_index;
         let vma = resolved.vma;
+        let map_rec = resolved.map_rec;
         let meta = resolved.meta;
         if !meta.cow_shared() || !meta.logical_write() || meta.tag() != PteMetaTag::Present {
             return Err(AddressSpaceError::NotCopyOnWrite);
         }
-        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        let vmo = self
+            .vmo(map_rec.vmo_id())
+            .ok_or(AddressSpaceError::InvalidVmo)?;
         if !vmo.supports_copy_on_write() {
             return Err(AddressSpaceError::NotCopyOnWrite);
         }
 
-        let page_offset = vma.vmo_offset + (page_base - vma.base);
+        let page_offset = map_rec.vmo_offset() + (page_base - map_rec.base());
         let fault_page_delta = resolved.page_delta;
         let page_anchor = self.make_rmap_anchor(vma.map_id, fault_page_delta);
         let old_node_id = self
@@ -2555,20 +2665,20 @@ impl AddressSpace {
                 FrameTableError::MissingAnchor,
             ))?;
         let old_frame_id = self
-            .vmo(vma.vmo_id)
+            .vmo(map_rec.vmo_id())
             .and_then(|vmo| vmo.frame_at_offset(page_offset))
             .ok_or(AddressSpaceError::InvalidFrame)?;
 
         let new_node_id = frames
             .map_frame(new_frame_id, page_anchor)
             .map_err(AddressSpaceError::FrameTable)?;
-        if let Err(err) = self.rebind_vmo_frame(vma.vmo_id, page_offset, new_frame_id) {
+        if let Err(err) = self.rebind_vmo_frame(map_rec.vmo_id(), page_offset, new_frame_id) {
             let _ = frames.unmap_frame(new_frame_id, new_node_id);
             return Err(err);
         }
         self.rmap_index.set_node(page_base, Some(new_node_id))?;
         if let Err(err) = frames.unmap_frame(old_frame_id, old_node_id) {
-            let _ = self.rebind_vmo_frame(vma.vmo_id, page_offset, old_frame_id);
+            let _ = self.rebind_vmo_frame(map_rec.vmo_id(), page_offset, old_frame_id);
             let _ = self.rmap_index.set_node(page_base, Some(old_node_id));
             let _ = frames.unmap_frame(new_frame_id, new_node_id);
             return Err(AddressSpaceError::FrameTable(err));
@@ -2624,11 +2734,16 @@ impl AddressSpace {
             .position(|vma| vma.base == base && vma.len == len)
             .ok_or(AddressSpaceError::NotFound)?;
         let vma = self.vmas[index];
-        if !vma.max_perms.contains(MappingPerms::WRITE) {
+        let map_rec = self
+            .map_record(vma.map_id)
+            .ok_or(AddressSpaceError::NotFound)?;
+        if !map_rec.max_perms().contains(MappingPerms::WRITE) {
             return Err(AddressSpaceError::PermissionIncrease);
         }
 
-        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+        let vmo = self
+            .vmo(map_rec.vmo_id())
+            .ok_or(AddressSpaceError::InvalidVmo)?;
         if vmo.kind() != VmoKind::Anonymous {
             return Err(AddressSpaceError::InvalidArgs);
         }
@@ -2638,8 +2753,8 @@ impl AddressSpace {
             if !frames.contains(new_frame_id) {
                 return Err(AddressSpaceError::InvalidFrame);
             }
-            let page_offset = vma
-                .vmo_offset
+            let page_offset = map_rec
+                .vmo_offset()
                 .checked_add((page_index as u64) * PAGE_SIZE)
                 .ok_or(AddressSpaceError::InvalidArgs)?;
             let page_anchor = self.make_rmap_anchor(vma.map_id, page_index as u64);
@@ -2698,13 +2813,14 @@ impl AddressSpace {
                 .iter()
                 .find_map(|&(frame_id, node_id, page_anchor, _)| {
                     (frame_id == new_frame_id
-                        && page_anchor.page_delta() == (page_offset - vma.vmo_offset) / PAGE_SIZE)
+                        && page_anchor.page_delta()
+                            == (page_offset - map_rec.vmo_offset()) / PAGE_SIZE)
                         .then_some(node_id)
                 })
                 .ok_or(AddressSpaceError::FrameTable(
                     FrameTableError::MissingAnchor,
                 ))?;
-            if let Err(err) = self.rebind_vmo_frame(vma.vmo_id, page_offset, new_frame_id) {
+            if let Err(err) = self.rebind_vmo_frame(map_rec.vmo_id(), page_offset, new_frame_id) {
                 for (rollback_frame, rollback_node, _, _) in incremented {
                     let _ = frames.unmap_frame(rollback_frame, rollback_node);
                 }
@@ -2801,8 +2917,8 @@ impl AddressSpace {
 
     fn lookup_from_resolved_page(&self, resolved: ResolvedPageState, va: u64) -> Option<VmaLookup> {
         let vma = resolved.vma;
-        let vmo = self.vmo(vma.vmo_id)?;
-        let resolved_offset = vma.vmo_offset + (va - vma.base);
+        let vmo = self.vmo(resolved.map_rec.vmo_id())?;
+        let resolved_offset = resolved.map_rec.vmo_offset() + (va - resolved.map_rec.base());
         Some(VmaLookup {
             address_space_id: self.id,
             map_id: resolved.map_rec.id(),
@@ -2815,6 +2931,7 @@ impl AddressSpace {
             perms: vma.perms,
             max_perms: resolved.map_rec.max_perms(),
             copy_on_write: resolved.meta.cow_shared(),
+            global_backed: vmo.is_global_backed(),
             mapping_base: resolved.map_rec.base(),
             mapping_len: resolved.map_rec.len(),
         })
@@ -2840,10 +2957,6 @@ impl AddressSpace {
         if vma.vmar_id != map_rec.vmar_id()
             || vma.base != map_rec.base()
             || vma.len != map_rec.len()
-            || vma.vmo_id != map_rec.vmo_id()
-            || vma.global_vmo_id != map_rec.global_vmo_id()
-            || vma.vmo_offset != map_rec.vmo_offset()
-            || vma.max_perms != map_rec.max_perms()
             || !vma.contains(page_base)
         {
             return None;
@@ -2885,12 +2998,15 @@ impl AddressSpace {
             if excluded_map_id == Some(vma.map_id) {
                 continue;
             }
-            let Some(vmo) = self.vmo(vma.vmo_id) else {
+            let Some(map_rec) = self.map_record(vma.map_id) else {
+                continue;
+            };
+            let Some(vmo) = self.vmo(map_rec.vmo_id()) else {
                 continue;
             };
             let page_count = vma.len / PAGE_SIZE;
             for page_delta in 0..page_count {
-                let page_offset = vma.vmo_offset + page_delta * PAGE_SIZE;
+                let page_offset = map_rec.vmo_offset() + page_delta * PAGE_SIZE;
                 if vmo.frame_at_offset(page_offset) == Some(frame_id) {
                     return Some(self.make_rmap_anchor(vma.map_id, page_delta));
                 }
@@ -2910,16 +3026,19 @@ impl AddressSpace {
         let vmo = self.vmo(vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
         let tag = pte_meta_tag_for_vmo(vmo, vmo.frame_at_offset(page_offset));
         let mut page_bases = Vec::new();
-        for vma in self
-            .vmas
-            .iter()
-            .copied()
-            .filter(|candidate| candidate.vmo_id == vmo_id)
-        {
-            if page_offset < vma.vmo_offset || page_offset >= vma.vmo_offset + vma.len {
+        for vma in self.vmas.iter().copied().filter(|candidate| {
+            self.map_record(candidate.map_id)
+                .is_some_and(|map_rec| map_rec.vmo_id() == vmo_id)
+        }) {
+            let Some(map_rec) = self.map_record(vma.map_id) else {
+                continue;
+            };
+            if page_offset < map_rec.vmo_offset()
+                || page_offset >= map_rec.vmo_offset() + map_rec.len()
+            {
                 continue;
             }
-            let page_delta = (page_offset - vma.vmo_offset) / PAGE_SIZE;
+            let page_delta = (page_offset - map_rec.vmo_offset()) / PAGE_SIZE;
             page_bases.push(vma.base + page_delta * PAGE_SIZE);
         }
         for page_base in page_bases {
@@ -2947,16 +3066,22 @@ impl AddressSpace {
         Ok(false)
     }
 
-    fn build_pte_meta_range(&self, vma: Vma) -> Result<Vec<PteMeta>, AddressSpaceError> {
-        let vmo = self.vmo(vma.vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+    fn build_pte_meta_range(
+        &self,
+        map_rec: MapRec,
+        vma: Vma,
+    ) -> Result<Vec<PteMeta>, AddressSpaceError> {
+        let vmo = self
+            .vmo(map_rec.vmo_id())
+            .ok_or(AddressSpaceError::InvalidVmo)?;
         let page_count =
             usize::try_from(vma.len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
         let logical_write = vma.copy_on_write || vma.perms.contains(MappingPerms::WRITE);
         let mut page_meta = Vec::with_capacity(page_count);
         for page_index in 0..page_count {
             let page_delta = page_index as u64;
-            let page_offset = vma
-                .vmo_offset
+            let page_offset = map_rec
+                .vmo_offset()
                 .checked_add(page_delta * PAGE_SIZE)
                 .ok_or(AddressSpaceError::InvalidArgs)?;
             page_meta.push(PteMeta {
@@ -2964,7 +3089,7 @@ impl AddressSpace {
                 logical_write,
                 cow_shared: vma.copy_on_write,
                 pinned: false,
-                map_id: vma.map_id,
+                map_id: map_rec.id(),
                 page_delta,
             });
         }
@@ -4245,6 +4370,45 @@ mod tests {
     }
 
     #[test]
+    fn materialize_vmo_page_aliases_attaches_post_bind_frames_to_existing_mappings() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE * 2, global_vmo_id(204))
+            .unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE * 2,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        let frame = frames.register_existing(0x1000_3000).unwrap();
+        space.bind_vmo_frame(vmo, PAGE_SIZE, frame).unwrap();
+        let updated = space
+            .materialize_vmo_page_aliases(&mut frames, vmo, PAGE_SIZE, frame)
+            .unwrap();
+
+        assert_eq!(updated, vec![ROOT_BASE + PAGE_SIZE]);
+        assert_eq!(
+            space.lookup(ROOT_BASE + PAGE_SIZE).unwrap().frame_id(),
+            Some(frame)
+        );
+        assert!(space.rmap_node_at(ROOT_BASE + PAGE_SIZE).is_some());
+        assert_eq!(frames.state(frame).unwrap().ref_count(), 1);
+        assert_eq!(frames.state(frame).unwrap().map_count(), 1);
+
+        space.unmap(&mut frames, ROOT_BASE, PAGE_SIZE * 2).unwrap();
+        assert_eq!(frames.state(frame).unwrap().ref_count(), 0);
+        assert_eq!(frames.state(frame).unwrap().map_count(), 0);
+    }
+
+    #[test]
     fn non_anonymous_mappings_require_resident_frames() {
         let mut frames = FrameTable::new();
         let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
@@ -4529,6 +4693,43 @@ mod tests {
         assert_eq!(vmo.size_bytes(), PAGE_SIZE);
         assert_eq!(vmo.frame_at_offset(0), Some(keep));
         assert_eq!(vmo.frame_at_offset(PAGE_SIZE), None);
+    }
+
+    #[test]
+    fn resize_vmo_allows_shrink_after_tail_mapping_is_unmapped() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(203))
+            .unwrap();
+        let tail_base = ROOT_BASE + PAGE_SIZE;
+
+        space.resize_vmo(vmo, PAGE_SIZE * 2).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                tail_base,
+                PAGE_SIZE,
+                vmo,
+                PAGE_SIZE,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        assert_eq!(
+            space.validate_vmo_resize(vmo, PAGE_SIZE),
+            Err(AddressSpaceError::Busy)
+        );
+
+        space.unmap(&mut frames, tail_base, PAGE_SIZE).unwrap();
+
+        assert_eq!(space.validate_vmo_resize(vmo, PAGE_SIZE), Ok(()));
+        assert_eq!(
+            space.resize_vmo(vmo, PAGE_SIZE).unwrap(),
+            Vec::<FrameId>::new()
+        );
+        assert_eq!(space.vmo(vmo).unwrap().size_bytes(), PAGE_SIZE);
     }
 
     #[test]
@@ -5463,14 +5664,46 @@ mod tests {
     }
 
     #[test]
-    fn futex_key_prefers_global_vmo_identity() {
+    fn futex_key_uses_private_identity_for_local_anonymous_vmo() {
         let (space, _, _, _) = sample_space();
         let lookup = space.lookup(ROOT_BASE + 0x20).unwrap();
         assert_eq!(
             FutexKey::from_lookup(99, ROOT_BASE + 0x20, lookup),
+            FutexKey::PrivateAnonymous {
+                process_id: 99,
+                page_base: ROOT_BASE,
+                byte_offset: 0x20,
+            }
+        );
+    }
+
+    #[test]
+    fn futex_key_uses_shared_identity_for_imported_anonymous_vmo() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let shared = space
+            .import_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(202))
+            .unwrap();
+        let frame = frames.register_existing(0x1000_2000).unwrap();
+        space.bind_vmo_frame(shared, 0, frame).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                shared,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        let lookup = space.lookup(ROOT_BASE + 0x24).unwrap();
+        assert_eq!(
+            FutexKey::from_lookup(99, ROOT_BASE + 0x24, lookup),
             FutexKey::Shared {
-                global_vmo_id: global_vmo_id(1),
-                offset: 0x20,
+                global_vmo_id: global_vmo_id(202),
+                offset: 0x24,
             }
         );
     }

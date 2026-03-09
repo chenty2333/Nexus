@@ -41,6 +41,10 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
             KernelObject::Vmo(VmoObject {
                 creator_process_id: created.process_id(),
                 global_vmo_id: created.global_vmo_id(),
+                backing_scope: VmoBackingScope::LocalPrivate {
+                    owner_address_space_id: created.address_space_id(),
+                    local_vmo_id: created.vmo_id(),
+                },
                 kind: axle_mm::VmoKind::Anonymous,
                 size_bytes: created.size_bytes(),
                 image_layout: None,
@@ -67,7 +71,7 @@ pub fn vmo_read(handle: zx_handle_t, offset: u64, len: usize) -> Result<Vec<u8>,
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         require_handle_rights(resolved, crate::task::HandleRights::READ)?;
-        state.with_vm_mut(|vm| vm.read_vmo_bytes(vmo.global_vmo_id, offset, len))
+        state.with_vm_mut(|vm| vm.read_vmo_bytes(&vmo, offset, len))
     })
 }
 
@@ -81,7 +85,7 @@ pub fn vmo_write(handle: zx_handle_t, offset: u64, bytes: &[u8]) -> Result<(), z
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
-        state.with_vm_mut(|vm| vm.write_vmo_bytes(vmo.global_vmo_id, offset, bytes))
+        state.with_vm_mut(|vm| vm.write_vmo_bytes(&vmo, offset, bytes))
     })
 }
 
@@ -96,7 +100,7 @@ pub fn vmo_set_size(handle: zx_handle_t, size: u64) -> Result<(), zx_status_t> {
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
-        let resized = state.with_vm_mut(|vm| vm.set_vmo_size(vmo.global_vmo_id, size))?;
+        let resized = state.with_vm_mut(|vm| vm.set_vmo_size(&vmo, size))?;
         state.retire_bootstrap_frames_after_quiescence(
             resized.barrier_address_spaces(),
             resized.retired_frames(),
@@ -208,13 +212,31 @@ pub fn vmar_map(
         require_vm_mapping_rights(resolved_vmar, request.perms)?;
         require_vm_mapping_rights(resolved_vmo, request.perms)?;
         require_vmar_mapping_caps(vmar.mapping_caps, request.perms, request.specific)?;
+        let mut vmo = vmo;
+        if let VmoBackingScope::LocalPrivate {
+            owner_address_space_id,
+            ..
+        } = vmo.backing_scope
+            && owner_address_space_id != vmar.address_space_id
+        {
+            let promoted = state.with_vm_mut(|vm| vm.promote_vmo_object_to_shared(&vmo))?;
+            if promoted {
+                let Some(KernelObject::Vmo(vmo_object)) =
+                    state.objects.get_mut(&resolved_vmo.object_id())
+                else {
+                    return Err(ZX_ERR_BAD_STATE);
+                };
+                vmo_object.backing_scope = VmoBackingScope::GlobalShared;
+                vmo.backing_scope = VmoBackingScope::GlobalShared;
+            }
+        }
         let cpu_id = crate::arch::apic::this_apic_id() as usize;
         let (mapped_addr, tlb_commit) = state.with_vm_mut(|vm| {
-            vm.map_vmo_into_vmar(
+            vm.map_vmo_object_into_vmar(
                 vmar.address_space_id,
                 cpu_id,
                 vmar.vmar_id,
-                vmo.global_vmo_id,
+                &vmo,
                 request.specific.then_some(vmar_offset),
                 vmo_offset,
                 len,

@@ -344,13 +344,37 @@ pub(crate) struct SocketTelemetrySnapshot {
     pub(crate) write_should_wait_count: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum VmoBackingScope {
+    LocalPrivate {
+        owner_address_space_id: u64,
+        local_vmo_id: axle_mm::VmoId,
+    },
+    GlobalShared,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct VmoObject {
     creator_process_id: u64,
     global_vmo_id: axle_mm::GlobalVmoId,
+    backing_scope: VmoBackingScope,
     kind: axle_mm::VmoKind,
     size_bytes: u64,
     image_layout: Option<crate::task::ProcessImageLayout>,
+}
+
+impl VmoObject {
+    pub(crate) const fn creator_process_id(&self) -> u64 {
+        self.creator_process_id
+    }
+
+    pub(crate) const fn global_vmo_id(&self) -> axle_mm::GlobalVmoId {
+        self.global_vmo_id
+    }
+
+    pub(crate) const fn backing_scope(&self) -> VmoBackingScope {
+        self.backing_scope
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -549,6 +573,7 @@ impl KernelState {
                 KernelObject::Vmo(VmoObject {
                     creator_process_id: imported.code_vmo().process_id(),
                     global_vmo_id: imported.code_vmo().global_vmo_id(),
+                    backing_scope: VmoBackingScope::GlobalShared,
                     kind: axle_mm::VmoKind::PagerBacked,
                     size_bytes: imported.code_vmo().size_bytes(),
                     image_layout: Some(
@@ -1304,6 +1329,7 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                 let _ = (
                     vmo.creator_process_id,
                     vmo.global_vmo_id.raw(),
+                    matches!(vmo.backing_scope, VmoBackingScope::GlobalShared),
                     matches!(vmo.kind, axle_mm::VmoKind::Anonymous),
                     vmo.size_bytes,
                 );
