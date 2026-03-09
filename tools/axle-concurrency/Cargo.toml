@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+axle-conformance = { path = "../axle-conformance" }
 axle-core = { path = "../../crates/axle-core" }
 axle-mm = { path = "../../crates/axle-mm" }
 axle-types = { path = "../../crates/axle-types" }

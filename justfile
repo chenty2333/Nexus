@@ -45,6 +45,10 @@ loom:
 concurrency-smoke:
   cargo run -p axle-concurrency -- smoke --iterations 64 --max-steps 32
 
+concurrency-qemu-smoke:
+  cargo run -p axle-concurrency -- smoke --iterations 8 --max-steps 24
+  cargo run -p axle-concurrency -- qemu-triage --limit 1
+
 # Short libFuzzer smoke run for the host-side semantic core.
 fuzz-smoke:
   cargo fuzz run cspace_ops --fuzz-dir crates/axle-core/fuzz -D --sanitizer none -- -max_total_time=5

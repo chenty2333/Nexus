@@ -4,4 +4,5 @@
 
 pub mod corpus;
 pub mod model;
+pub mod qemu;
 pub mod seed;
