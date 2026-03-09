@@ -162,9 +162,9 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
 }
 
 pub(super) fn release_channel_payload(state: &mut KernelState, payload: ChannelPayload) {
-    if let ChannelPayload::Loaned(loaned) = payload {
+    if let Some(loaned) = payload.loaned_body() {
         let _ = state.with_vm_mut(|vm| {
-            vm.release_loaned_user_pages(&loaned);
+            vm.release_loaned_user_pages(loaned);
             Ok(())
         });
     }
@@ -429,7 +429,7 @@ pub fn channel_write(
             channel_endpoint_address_space_id(state, peer)?
         };
 
-        if let Some(ChannelPayload::Loaned(loaned)) = payload.as_mut() {
+        if let Some(loaned) = payload.as_mut().and_then(ChannelPayload::loaned_body_mut) {
             match state.with_vm_mut(|vm| {
                 vm.prepare_loaned_channel_write(loaned, receiver_address_space_id)
             }) {

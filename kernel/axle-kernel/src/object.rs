@@ -82,9 +82,18 @@ pub(crate) struct TimerObject {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct FragmentedChannelPayload {
+    pub(crate) head: Vec<u8>,
+    pub(crate) body: Option<crate::task::LoanedUserPages>,
+    pub(crate) tail: Vec<u8>,
+    pub(crate) len: u32,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum ChannelPayload {
     Copied(Vec<u8>),
     Loaned(crate::task::LoanedUserPages),
+    Fragmented(FragmentedChannelPayload),
 }
 
 #[derive(Clone, Debug)]
@@ -123,10 +132,27 @@ impl ChannelEndpoint {
 }
 
 impl ChannelPayload {
-    fn actual_bytes(&self) -> Result<u32, zx_status_t> {
+    pub(crate) fn actual_bytes(&self) -> Result<u32, zx_status_t> {
         match self {
             Self::Copied(bytes) => u32::try_from(bytes.len()).map_err(|_| ZX_ERR_BAD_STATE),
             Self::Loaned(loaned) => Ok(loaned.len()),
+            Self::Fragmented(payload) => Ok(payload.len),
+        }
+    }
+
+    pub(crate) fn loaned_body_mut(&mut self) -> Option<&mut crate::task::LoanedUserPages> {
+        match self {
+            Self::Loaned(loaned) => Some(loaned),
+            Self::Fragmented(payload) => payload.body.as_mut(),
+            Self::Copied(_) => None,
+        }
+    }
+
+    pub(crate) fn loaned_body(&self) -> Option<&crate::task::LoanedUserPages> {
+        match self {
+            Self::Loaned(loaned) => Some(loaned),
+            Self::Fragmented(payload) => payload.body.as_ref(),
+            Self::Copied(_) => None,
         }
     }
 }

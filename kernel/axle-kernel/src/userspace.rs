@@ -745,16 +745,13 @@ fn load_bootstrap_process_image_into_current_mapping(
         let mem_sz = usize::try_from(segment.mem_size_bytes()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
         let file_bytes = read_bootstrap_user_runner_bytes(segment.vmo_offset(), file_sz)
             .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
-
-        unsafe {
-            // SAFETY: `bootstrap_process_image_layout()` only returns segments whose virtual
-            // ranges lie inside the bootstrap user code window already mapped by
-            // `map_userspace_pages()`.
-            let dst = segment.vaddr() as *mut u8;
-            core::ptr::copy_nonoverlapping(file_bytes.as_ptr(), dst, file_sz);
-            if mem_sz > file_sz {
-                core::ptr::write_bytes(dst.add(file_sz), 0, mem_sz - file_sz);
-            }
+        crate::copy::write_current_mapping_bytes(segment.vaddr(), &file_bytes);
+        if mem_sz > file_sz {
+            let zero_base = segment
+                .vaddr()
+                .checked_add(file_sz as u64)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            crate::copy::zero_current_mapping_bytes(zero_base, mem_sz - file_sz);
         }
     }
 
@@ -893,7 +890,7 @@ pub(crate) fn read_qemu_loader_user_runner_at(
     if end > padded_size {
         return Err(ZX_ERR_OUT_OF_RANGE);
     }
-    dst.fill(0);
+    crate::copy::zero_fill(dst);
     let actual_end = core::cmp::min(end, blob.len() as u64);
     if actual_end <= offset {
         return Ok(());
@@ -902,8 +899,7 @@ pub(crate) fn read_qemu_loader_user_runner_at(
     let actual_end = usize::try_from(actual_end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
     let len = actual_end - start;
     let src = blob.get(start..actual_end).ok_or(ZX_ERR_OUT_OF_RANGE)?;
-    dst[..len].copy_from_slice(src);
-    Ok(())
+    crate::copy::copy_kernel_bytes(&mut dst[..len], src)
 }
 
 pub(crate) fn read_bootstrap_user_code_image_at(
@@ -925,8 +921,7 @@ pub(crate) fn read_bootstrap_user_code_image_at(
             USER_CODE_BYTES as usize,
         )
     };
-    dst.copy_from_slice(src.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?);
-    Ok(())
+    crate::copy::copy_kernel_bytes(dst, src.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?)
 }
 
 fn qemu_loader_user_runner_blob() -> Option<&'static [u8]> {
@@ -955,6 +950,80 @@ pub fn ensure_user_range_resident(
     for_write: bool,
 ) -> Result<(), zx_status_t> {
     crate::fault::ensure_current_user_range_resident(ptr, len, for_write)
+}
+
+/// Copy bytes from a validated and resident current-process user range into a kernel buffer.
+pub(crate) fn read_validated_user_bytes(ptr: u64, dst: &mut [u8]) {
+    if dst.is_empty() {
+        return;
+    }
+    unsafe {
+        // SAFETY: callers validate the current-process user range and make it resident before
+        // calling this helper. `dst` is a valid writable kernel slice for `dst.len()` bytes.
+        core::ptr::copy_nonoverlapping(ptr as *const u8, dst.as_mut_ptr(), dst.len());
+    }
+}
+
+/// Copy bytes from a kernel slice into a validated and resident current-process user range.
+pub(crate) fn write_validated_user_bytes(ptr: u64, src: &[u8]) {
+    if src.is_empty() {
+        return;
+    }
+    unsafe {
+        // SAFETY: callers validate the current-process user range and make it resident before
+        // calling this helper. `src` is a valid readable kernel slice for `src.len()` bytes.
+        core::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, src.len());
+    }
+}
+
+/// Zero-fill a validated and resident current-process user range.
+pub(crate) fn zero_validated_user_bytes(ptr: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    unsafe {
+        // SAFETY: callers validate the current-process user range and make it resident before
+        // calling this helper. The destination region is writable for `len` bytes.
+        core::ptr::write_bytes(ptr as *mut u8, 0, len);
+    }
+}
+
+/// Copy bytes from one bootstrap-backed frame into a validated and resident user range.
+pub(crate) fn copy_bootstrap_frame_into_validated_user(dst_ptr: u64, src_paddr: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    unsafe {
+        // SAFETY: callers validate the current-process user destination and make it resident
+        // before calling this helper. Bootstrap guest memory is identity-mapped, so `src_paddr`
+        // is directly readable as a kernel virtual address for `len` bytes.
+        core::ptr::copy_nonoverlapping(src_paddr as *const u8, dst_ptr as *mut u8, len);
+    }
+}
+
+/// Copy bytes into the currently mapped bootstrap user window without extra validation.
+pub(crate) fn write_current_mapping_bytes(dst_ptr: u64, src: &[u8]) {
+    if src.is_empty() {
+        return;
+    }
+    unsafe {
+        // SAFETY: callers only use this helper for bootstrap process image ranges already mapped
+        // into the current address space, so the destination range is writable for `src.len()`
+        // bytes.
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr as *mut u8, src.len());
+    }
+}
+
+/// Zero-fill bytes in the currently mapped bootstrap user window without extra validation.
+pub(crate) fn zero_current_mapping_bytes(dst_ptr: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    unsafe {
+        // SAFETY: callers only use this helper for bootstrap process image ranges already mapped
+        // into the current address space, so the destination range is writable for `len` bytes.
+        core::ptr::write_bytes(dst_ptr as *mut u8, 0, len);
+    }
 }
 
 fn shared_slots() -> &'static mut [u64] {

@@ -786,7 +786,7 @@ trait PagerReadOnlySource: Send + Sync {
     fn materialize_page(&self, page_offset: u64, dst_paddr: u64) -> Result<(), zx_status_t> {
         let mut scratch = alloc::vec![0; crate::userspace::USER_PAGE_BYTES as usize];
         self.read_bytes(page_offset, &mut scratch)?;
-        crate::userspace::write_bootstrap_bytes(dst_paddr, 0, &scratch).ok_or(ZX_ERR_BAD_STATE)
+        crate::copy::write_bootstrap_frame_bytes(dst_paddr, 0, &scratch)
     }
 }
 
@@ -834,8 +834,7 @@ impl PagerReadOnlySource for StaticPagerSource {
         let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
         let end = usize::try_from(end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
         let src = self.bytes.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?;
-        dst.copy_from_slice(src);
-        Ok(())
+        crate::copy::copy_kernel_bytes(dst, src)
     }
 }
 
@@ -4997,11 +4996,10 @@ impl VmDomain {
             let dst = &mut out[copied..copied + chunk_len];
             match snapshot.source.frames().get(page_index).copied().flatten() {
                 Some(frame_id) => {
-                    crate::userspace::read_bootstrap_bytes(frame_id.raw(), page_byte_offset, dst)
-                        .ok_or(ZX_ERR_BAD_STATE)?;
+                    crate::copy::read_bootstrap_frame_bytes(frame_id.raw(), page_byte_offset, dst)?;
                 }
                 None if snapshot.source.kind() == VmoKind::Anonymous => {
-                    dst.fill(0);
+                    crate::copy::zero_fill(dst);
                 }
                 None => {
                     if !snapshot.source.read_bytes_into(absolute, dst)? {
@@ -5049,10 +5047,9 @@ impl VmDomain {
             let dst = &mut out[copied..copied + chunk_len];
             match snapshot.frames().get(page_index).copied().flatten() {
                 Some(frame_id) => {
-                    crate::userspace::read_bootstrap_bytes(frame_id.raw(), page_byte_offset, dst)
-                        .ok_or(ZX_ERR_BAD_STATE)?;
+                    crate::copy::read_bootstrap_frame_bytes(frame_id.raw(), page_byte_offset, dst)?;
                 }
-                None if snapshot.kind() == VmoKind::Anonymous => dst.fill(0),
+                None if snapshot.kind() == VmoKind::Anonymous => crate::copy::zero_fill(dst),
                 None => return Err(ZX_ERR_BAD_STATE),
             }
             copied += chunk_len;
@@ -5127,12 +5124,11 @@ impl VmDomain {
                     }
                 },
             };
-            crate::userspace::write_bootstrap_bytes(
+            crate::copy::write_bootstrap_frame_bytes(
                 frame_id.raw(),
                 page_byte_offset,
                 &bytes[written..written + chunk_len],
-            )
-            .ok_or(ZX_ERR_BAD_STATE)?;
+            )?;
             written += chunk_len;
         }
 
@@ -5190,12 +5186,11 @@ impl VmDomain {
                 }
                 None => return Err(ZX_ERR_BAD_STATE),
             };
-            crate::userspace::write_bootstrap_bytes(
+            crate::copy::write_bootstrap_frame_bytes(
                 frame_id.raw(),
                 page_byte_offset,
                 &bytes[written..written + chunk_len],
-            )
-            .ok_or(ZX_ERR_BAD_STATE)?;
+            )?;
             written += chunk_len;
         }
 

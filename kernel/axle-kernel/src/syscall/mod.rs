@@ -14,10 +14,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
-use axle_types::status::{
-    ZX_ERR_BAD_STATE, ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY,
-    ZX_ERR_OUT_OF_RANGE, ZX_OK,
-};
+use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_OUT_OF_RANGE, ZX_OK};
 use axle_types::syscall_numbers::{
     AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ,
     AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER,
@@ -40,7 +37,6 @@ use axle_types::{
     zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t,
 };
 use core::mem::size_of;
-use core::slice;
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
 pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 40] = [
@@ -229,149 +225,34 @@ pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame, cpu_fram
 }
 
 fn copyin<T: Copy>(ptr: *const T) -> Result<T, zx_status_t> {
-    if ptr.is_null() {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    if !crate::userspace::validate_user_ptr(ptr as u64, size_of::<T>()) {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    crate::userspace::ensure_user_range_resident(ptr as u64, size_of::<T>(), false)?;
-    // SAFETY: pointer validated to be within a mapped userspace page region.
-    unsafe { Ok(core::ptr::read_unaligned(ptr)) }
+    crate::copy::copyin_value(ptr)
 }
 
 fn copyout<T: Copy>(ptr: *mut T, v: T) -> Result<(), zx_status_t> {
-    if ptr.is_null() {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    if !crate::userspace::validate_user_ptr(ptr as u64, size_of::<T>()) {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    crate::userspace::ensure_user_range_resident(ptr as u64, size_of::<T>(), true)?;
-    // SAFETY: pointer validated to be within a mapped userspace page region.
-    unsafe {
-        core::ptr::write_unaligned(ptr, v);
-    }
-    Ok(())
+    crate::copy::copyout_value(ptr, v)
 }
 
 fn copyin_bytes(ptr: *const u8, len: usize) -> Result<Vec<u8>, zx_status_t> {
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    if ptr.is_null() {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    if !crate::userspace::validate_user_ptr(ptr as u64, len) {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    crate::userspace::ensure_user_range_resident(ptr as u64, len, false)?;
-
-    let mut out = Vec::new();
-    out.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
-    out.resize(len, 0);
-    // SAFETY: the userspace range was validated above and `out` was sized to `len`.
-    let src = unsafe { slice::from_raw_parts(ptr, len) };
-    out.as_mut_slice().copy_from_slice(src);
-    Ok(out)
+    crate::copy::copyin_bytes(ptr, len)
 }
 
 fn copyin_handles(ptr: *const zx_handle_t, len: usize) -> Result<Vec<zx_handle_t>, zx_status_t> {
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    let bytes = len
-        .checked_mul(size_of::<zx_handle_t>())
-        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-    if ptr.is_null() {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    if !crate::userspace::validate_user_ptr(ptr as u64, bytes) {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    crate::userspace::ensure_user_range_resident(ptr as u64, bytes, false)?;
-
-    let mut out = Vec::new();
-    out.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
-    out.resize(len, 0);
-    // SAFETY: the userspace range was validated above and `out` was sized to `len`.
-    let src = unsafe { slice::from_raw_parts(ptr, len) };
-    out.as_mut_slice().copy_from_slice(src);
-    Ok(out)
+    crate::copy::copyin_handles(ptr, len)
 }
 
 fn copyout_bytes(ptr: *mut u8, bytes: &[u8]) -> Result<(), zx_status_t> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    if ptr.is_null() {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    if !crate::userspace::validate_user_ptr(ptr as u64, bytes.len()) {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    crate::userspace::ensure_user_range_resident(ptr as u64, bytes.len(), true)?;
-    // SAFETY: the userspace range was validated above and `bytes` is a valid source slice.
-    let dst = unsafe { slice::from_raw_parts_mut(ptr, bytes.len()) };
-    dst.copy_from_slice(bytes);
-    Ok(())
+    crate::copy::copyout_bytes(ptr, bytes)
 }
 
 fn copyout_handles(ptr: *mut zx_handle_t, handles: &[zx_handle_t]) -> Result<(), zx_status_t> {
-    if handles.is_empty() {
-        return Ok(());
-    }
-    let bytes = handles
-        .len()
-        .checked_mul(size_of::<zx_handle_t>())
-        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-    if ptr.is_null() {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    if !crate::userspace::validate_user_ptr(ptr as u64, bytes) {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    crate::userspace::ensure_user_range_resident(ptr as u64, bytes, true)?;
-    // SAFETY: the userspace range was validated above and `handles` is a valid source slice.
-    let dst = unsafe { slice::from_raw_parts_mut(ptr, handles.len()) };
-    dst.copy_from_slice(handles);
-    Ok(())
+    crate::copy::copyout_handles(ptr, handles)
 }
 
 fn copyout_loaned_bytes(
     ptr: *mut u8,
     loaned: &crate::task::LoanedUserPages,
 ) -> Result<(), zx_status_t> {
-    let len = usize::try_from(loaned.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-    if len == 0 {
-        return Ok(());
-    }
-    if ptr.is_null() {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    if !crate::userspace::validate_user_ptr(ptr as u64, len) {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-    crate::userspace::ensure_user_range_resident(ptr as u64, len, true)?;
-
-    let page_size = crate::userspace::USER_PAGE_BYTES as usize;
-    let page_count = len / page_size;
-    if page_count != loaned.pages().len() {
-        return Err(ZX_ERR_BAD_STATE);
-    }
-
-    for (page_index, frame_id) in loaned.pages().iter().copied().enumerate() {
-        // SAFETY: the destination range was validated above, and bootstrap guest memory is
-        // identity mapped so the registered frame physical address is a readable kernel VA.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                frame_id.raw() as *const u8,
-                ptr.add(page_index * page_size),
-                page_size,
-            );
-        }
-    }
-    Ok(())
+    crate::copy::copyout_loaned_bytes(ptr, loaned)
 }
 
 fn copyout_optional<T: Copy>(ptr: *mut T, value: T) -> Result<(), zx_status_t> {
@@ -661,11 +542,7 @@ fn sys_vmo_read(args: [u64; 6]) -> zx_status_t {
         Err(_) => return ZX_ERR_OUT_OF_RANGE,
     };
 
-    let bytes = match crate::object::vm::vmo_read(handle, offset, buffer_size) {
-        Ok(bytes) => bytes,
-        Err(e) => return e,
-    };
-    match copyout_bytes(buffer, &bytes) {
+    match crate::copy::vmo_read_to_user(handle, offset, buffer, buffer_size) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -683,11 +560,7 @@ fn sys_vmo_write(args: [u64; 6]) -> zx_status_t {
         Err(_) => return ZX_ERR_OUT_OF_RANGE,
     };
 
-    let bytes = match copyin_bytes(buffer, buffer_size) {
-        Ok(bytes) => bytes,
-        Err(e) => return e,
-    };
-    match crate::object::vm::vmo_write(handle, offset, &bytes) {
+    match crate::copy::vmo_write_from_user(handle, offset, buffer, buffer_size) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -754,7 +627,7 @@ fn sys_socket_write(args: [u64; 6]) -> zx_status_t {
     }
 
     if buffer_size == 0 {
-        let actual = match crate::object::transport::socket_write(handle, options, &[]) {
+        let actual = match crate::copy::socket_write_from_user(handle, options, buffer, 0) {
             Ok(actual) => actual,
             Err(e) => return e,
         };
@@ -764,11 +637,7 @@ fn sys_socket_write(args: [u64; 6]) -> zx_status_t {
         };
     }
 
-    let bytes = match copyin_bytes(buffer, buffer_size) {
-        Ok(bytes) => bytes,
-        Err(e) => return e,
-    };
-    let actual = match crate::object::transport::socket_write(handle, options, &bytes) {
+    let actual = match crate::copy::socket_write_from_user(handle, options, buffer, buffer_size) {
         Ok(actual) => actual,
         Err(e) => return e,
     };
@@ -797,14 +666,11 @@ fn sys_socket_read(args: [u64; 6]) -> zx_status_t {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    let bytes = match crate::object::transport::socket_read(handle, options, buffer_size) {
-        Ok(bytes) => bytes,
+    let actual = match crate::copy::socket_read_to_user(handle, options, buffer, buffer_size) {
+        Ok(actual) => actual,
         Err(e) => return e,
     };
-    if let Err(e) = copyout_bytes(buffer, &bytes) {
-        return e;
-    }
-    match copyout_optional(actual_ptr, bytes.len()) {
+    match copyout_optional(actual_ptr, actual) {
         Ok(()) => ZX_OK,
         Err(e) => e,
     }
@@ -995,15 +861,10 @@ fn sys_channel_write(args: [u64; 6]) -> zx_status_t {
         Err(e) => return e,
     };
 
-    let payload =
-        match crate::object::transport::try_loan_current_user_pages(bytes_ptr as u64, num_bytes) {
-            Ok(Some(loaned)) => crate::object::ChannelPayload::Loaned(loaned),
-            Ok(None) => match copyin_bytes(bytes_ptr, num_bytes) {
-                Ok(bytes) => crate::object::ChannelPayload::Copied(bytes),
-                Err(e) => return e,
-            },
-            Err(e) => return e,
-        };
+    let payload = match crate::copy::prepare_channel_write_payload(bytes_ptr, num_bytes) {
+        Ok(payload) => payload,
+        Err(e) => return e,
+    };
     match crate::object::transport::channel_write(handle, options, payload, handles) {
         Ok(()) => ZX_OK,
         Err(e) => e,
@@ -1073,17 +934,7 @@ fn sys_channel_read(ctx: &mut SyscallCtx, args: [u64; 6]) -> zx_status_t {
     let actual_bytes = message.actual_bytes;
     let actual_handles = message.actual_handles;
     let transferred_handles = message.handles.clone();
-    let copy_result = match &message.payload {
-        crate::object::ChannelPayload::Copied(bytes) => copyout_bytes(bytes_ptr, bytes),
-        crate::object::ChannelPayload::Loaned(loaned) => {
-            match crate::object::transport::try_remap_loaned_channel_read(bytes_ptr as u64, loaned)
-            {
-                Ok(true) => Ok(()),
-                Ok(false) => copyout_loaned_bytes(bytes_ptr, loaned),
-                Err(e) => Err(e),
-            }
-        }
-    };
+    let copy_result = crate::copy::write_channel_payload_to_user(bytes_ptr, &message.payload);
     crate::object::transport::release_channel_read_result(message);
     if let Err(e) = copy_result {
         return e;

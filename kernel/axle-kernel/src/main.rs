@@ -8,6 +8,7 @@
 
 mod arch;
 mod bringup;
+mod copy;
 mod fault;
 mod futex;
 mod kalloc;
