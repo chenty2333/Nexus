@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::{
-    Capability, PortError, Signals, TimerError, TimerId, TimerService, TransferredCap,
+    Capability, ObserverRegistry, PortError, Signals, TimerError, TimerId, TransferredCap,
 };
 use axle_mm::{MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
@@ -503,7 +503,8 @@ pub(crate) struct KernelState {
     object_handle_refs: BTreeMap<u64, usize>,
     next_object_id: u64,
     next_socket_core_id: u64,
-    pub(crate) timers: TimerService,
+    pub(crate) observers: ObserverRegistry,
+    timer_object_ids: BTreeMap<TimerId, u64>,
     bootstrap_self_process_handle: zx_handle_t,
     bootstrap_root_vmar_handle: zx_handle_t,
     bootstrap_self_thread_handle: zx_handle_t,
@@ -521,7 +522,8 @@ impl KernelState {
             object_handle_refs: BTreeMap::new(),
             next_object_id: 1,
             next_socket_core_id: 1,
-            timers: TimerService::new(),
+            observers: ObserverRegistry::new(),
+            timer_object_ids: BTreeMap::new(),
             bootstrap_self_process_handle: 0,
             bootstrap_root_vmar_handle: 0,
             bootstrap_self_thread_handle: 0,
@@ -622,6 +624,18 @@ impl KernelState {
         let id = self.next_object_id;
         self.next_object_id = self.next_object_id.wrapping_add(1);
         id
+    }
+
+    fn note_timer_object(&mut self, timer_id: TimerId, object_id: u64) {
+        let _ = self.timer_object_ids.insert(timer_id, object_id);
+    }
+
+    fn forget_timer_object(&mut self, timer_id: TimerId) {
+        let _ = self.timer_object_ids.remove(&timer_id);
+    }
+
+    fn timer_object_id(&self, timer_id: TimerId) -> Option<u64> {
+        self.timer_object_ids.get(&timer_id).copied()
     }
 
     fn with_core<T>(
@@ -919,17 +933,24 @@ pub fn create_timer(options: u32, clock_id: zx_clock_t) -> Result<zx_handle_t, z
     }
 
     with_state_mut(|state| {
-        let timer_id = state.timers.create_timer();
+        let timer_id = state.with_kernel_mut(|kernel| Ok(kernel.create_timer_object()))?;
         let object_id = state.alloc_object_id();
         state.objects.insert(
             object_id,
             KernelObject::Timer(TimerObject { timer_id, clock_id }),
         );
+        state.note_timer_object(timer_id, object_id);
 
         match state.alloc_handle_for_object(object_id, handle::timer_default_rights()) {
             Ok(h) => Ok(h),
             Err(e) => {
                 let _ = state.objects.remove(&object_id);
+                state.forget_timer_object(timer_id);
+                let _ = state.with_kernel_mut(|kernel| {
+                    kernel
+                        .destroy_timer_object(timer_id)
+                        .map_err(map_timer_error)
+                });
                 Err(e)
             }
         }
@@ -956,8 +977,7 @@ pub fn object_signal(
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         endpoint.user_signals = endpoint.user_signals.without(clear).union(set);
-        let _ = crate::wait::notify_waitable_signals_changed(state, resolved.object_id());
-        Ok(())
+        publish_object_signals(state, resolved.object_id())
     })
 }
 
@@ -997,8 +1017,7 @@ pub fn object_signal_peer(
             return Err(ZX_ERR_PEER_CLOSED);
         }
         peer.user_signals = peer.user_signals.without(clear).union(set);
-        let _ = crate::wait::notify_waitable_signals_changed(state, peer_object_id);
-        Ok(())
+        publish_object_signals(state, peer_object_id)
     })
 }
 
@@ -1168,22 +1187,20 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
         };
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
 
-        state
-            .timers
-            .set(timer_id, deadline)
-            .map_err(map_timer_error)
-            .and_then(|()| {
-                // Re-arming clears `SIGNALED`, which affects EDGE-triggered observers.
-                let _ = crate::wait::notify_waitable_signals_changed(state, object_id);
-
-                // Fire immediately if the deadline is already in the past.
-                let now = crate::time::now_ns();
-                let fired = crate::wait::poll_due_timers_at(state, now);
-                for fired_object_id in fired {
-                    let _ = crate::wait::notify_waitable_signals_changed(state, fired_object_id);
-                }
-                Ok(())
-            })
+        let now = crate::time::now_ns();
+        let current = state.with_kernel_mut(|kernel| {
+            kernel
+                .set_timer_object(timer_id, deadline, now)
+                .map(|fired| {
+                    if fired {
+                        Signals::TIMER_SIGNALED
+                    } else {
+                        Signals::NONE
+                    }
+                })
+                .map_err(map_timer_error)
+        })?;
+        crate::wait::publish_signals_changed(state, object_id, current)
     })
 }
 
@@ -1207,14 +1224,12 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
         };
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
 
-        state
-            .timers
-            .cancel(timer_id)
-            .map_err(map_timer_error)
-            .and_then(|()| {
-                let _ = crate::wait::notify_waitable_signals_changed(state, object_id);
-                Ok(())
-            })
+        state.with_kernel_mut(|kernel| {
+            kernel
+                .cancel_timer_object(timer_id)
+                .map_err(map_timer_error)
+        })?;
+        crate::wait::publish_signals_changed(state, object_id, Signals::NONE)
     })
 }
 
@@ -1252,6 +1267,7 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
         if let Some(peer_object_id) = peer_link
             && state.object_handle_count(object_id) == 0
         {
+            state.observers.remove_waitable(object_id);
             let removed = state.objects.remove(&object_id);
             state.forget_object_handle_refs(object_id);
             match removed {
@@ -1291,12 +1307,17 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
                 }
                 None => {}
             }
-            let _ = crate::wait::notify_waitable_signals_changed(state, object_id);
-            let _ = crate::wait::notify_waitable_signals_changed(state, peer_object_id);
+            if let Err(status) = publish_object_signals(state, peer_object_id)
+                && status != ZX_ERR_BAD_HANDLE
+            {
+                return Err(status);
+            }
         }
         if matches!(state.objects.get(&object_id), Some(KernelObject::Port(_)))
             && state.object_handle_count(object_id) == 0
         {
+            state.observers.remove_port(object_id);
+            state.observers.remove_waitable(object_id);
             let Some(KernelObject::Port(port)) = state.objects.remove(&object_id) else {
                 return Err(ZX_ERR_BAD_STATE);
             };
@@ -1398,6 +1419,22 @@ pub(crate) fn require_handle_rights(
     }
 }
 
+pub(crate) fn publish_object_signals(
+    state: &mut KernelState,
+    object_id: u64,
+) -> Result<(), zx_status_t> {
+    let current = signals_for_object_id(state, object_id)?;
+    crate::wait::publish_signals_changed(state, object_id, current)
+}
+
+pub(crate) fn publish_timer_fired(
+    state: &mut KernelState,
+    timer_id: TimerId,
+) -> Result<(), zx_status_t> {
+    let object_id = state.timer_object_id(timer_id).ok_or(ZX_ERR_BAD_STATE)?;
+    crate::wait::publish_signals_changed(state, object_id, Signals::TIMER_SIGNALED)
+}
+
 pub(crate) fn signals_for_object_id(
     state: &KernelState,
     object_id: u64,
@@ -1420,10 +1457,11 @@ pub(crate) fn signals_for_object_id(
         }
         KernelObject::Port(port) => Ok(port.signals()),
         KernelObject::Timer(timer) => {
-            let signaled = state
-                .timers
-                .is_signaled(timer.timer_id)
-                .map_err(map_timer_error)?;
+            let signaled = state.with_kernel(|kernel| {
+                kernel
+                    .timer_object_signaled(timer.timer_id)
+                    .map_err(map_timer_error)
+            })?;
             Ok(if signaled {
                 Signals::TIMER_SIGNALED
             } else {

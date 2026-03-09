@@ -337,8 +337,8 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
         };
         state.note_socket_write(bytes.len(), written, buffered_after);
 
-        let _ = crate::wait::notify_waitable_signals_changed(state, resolved.object_id());
-        let _ = crate::wait::notify_waitable_signals_changed(state, endpoint.peer_object_id);
+        let _ = publish_object_signals(state, resolved.object_id());
+        let _ = publish_object_signals(state, endpoint.peer_object_id);
         Ok(written)
     })
 }
@@ -370,8 +370,8 @@ pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<
 
         if !peek {
             state.note_socket_read(bytes.len());
-            let _ = crate::wait::notify_waitable_signals_changed(state, resolved.object_id());
-            let _ = crate::wait::notify_waitable_signals_changed(state, endpoint.peer_object_id);
+            let _ = publish_object_signals(state, resolved.object_id());
+            let _ = publish_object_signals(state, endpoint.peer_object_id);
         }
         Ok(bytes)
     })
@@ -532,8 +532,8 @@ pub fn channel_write(
             state.close_handle(raw)?;
         }
 
-        let _ = crate::wait::notify_waitable_signals_changed(state, object_id);
-        let _ = crate::wait::notify_waitable_signals_changed(state, peer_object_id);
+        let _ = publish_object_signals(state, object_id);
+        let _ = publish_object_signals(state, peer_object_id);
         Ok(())
     })
 }
@@ -604,8 +604,8 @@ pub fn channel_read(
     let actual_handles = message.actual_handles().map_err(|e| (e, 0, 0))?;
     release_transferred_handles(state, &message.handles);
 
-    let _ = crate::wait::notify_waitable_signals_changed(state, object_id);
-    let _ = crate::wait::notify_waitable_signals_changed(state, peer_object_id);
+    let _ = publish_object_signals(state, object_id);
+    let _ = publish_object_signals(state, peer_object_id);
 
     Ok(ChannelReadResult {
         payload: message.payload,

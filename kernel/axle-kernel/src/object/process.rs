@@ -369,6 +369,7 @@ pub(super) fn close_suspend_token(
     if state.object_handle_count(object_id) != 0 {
         return Ok(());
     }
+    state.observers.remove_waitable(object_id);
     let _ = state.objects.remove(&object_id);
     state.forget_object_handle_refs(object_id);
     match target {
@@ -468,6 +469,7 @@ fn reap_terminated_task_objects(state: &mut KernelState) -> Result<(), zx_status
         }
 
         for (object_id, thread_id, process_id) in thread_reaps {
+            state.observers.remove_waitable(object_id);
             let _ = state.objects.remove(&object_id);
             state.forget_object_handle_refs(object_id);
             let _ = state.with_kernel_mut(|kernel| kernel.reap_thread(thread_id))?;
@@ -475,6 +477,7 @@ fn reap_terminated_task_objects(state: &mut KernelState) -> Result<(), zx_status
         }
 
         for (object_id, process_id) in process_reaps {
+            state.observers.remove_waitable(object_id);
             let _ = state.objects.remove(&object_id);
             state.forget_object_handle_refs(object_id);
             maybe_reap_process_record(state, process_id)?;
@@ -486,7 +489,7 @@ fn reap_terminated_task_objects(state: &mut KernelState) -> Result<(), zx_status
 
 pub(crate) fn sync_task_lifecycle(state: &mut KernelState) -> Result<(), zx_status_t> {
     for object_id in task_object_ids(state) {
-        let _ = crate::wait::notify_waitable_signals_changed(state, object_id);
+        let _ = publish_object_signals(state, object_id);
     }
     reap_terminated_task_objects(state)
 }

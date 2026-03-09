@@ -1,18 +1,15 @@
-//! Port: event queue used by `wait_async` and user packets.
+//! Port queue semantics used by user packets and reactor-delivered signal packets.
 //!
-//! This is a host-testable semantic model with **explicit** overflow rules:
+//! This is a host-testable semantic model with explicit overflow rules:
 //! - A Port has a fixed `capacity` in packets.
 //! - `kernel_reserve` enforces that user packets cannot consume the last N slots,
 //!   preventing starvation of kernel-generated packets.
-//! - Kernel-generated packets (from async waits) are never silently dropped. If the
-//!   queue is full they become **pending**, and repeated triggers are **merged**
-//!   (`count++`, `observed |= ...`).
+//! - Kernel-generated packets are admitted up to total capacity.
 //!
-//! This is intentionally *not* tied to a particular sleep/wakeup mechanism; it is a
-//! pure state machine suitable for conformance tests.
+//! Async wait observer state lives in `observer.rs`; `PortState` is only the packet
+//! queue and readiness surface.
 
-use alloc::collections::{BTreeMap, VecDeque};
-use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 
 use crate::signals::Signals;
 use crate::timer::Time;
@@ -129,12 +126,12 @@ pub struct WaitAsyncOptions {
     pub timestamp: WaitAsyncTimestamp,
 }
 
-/// Errors for queue operations.
+/// Errors used by port queue and observer operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortError {
     /// Queue is full for this operation and the caller should wait and retry.
     ShouldWait,
-    /// Async wait already exists for (waitable,key) pair.
+    /// Async wait already exists for a given registration key.
     AlreadyExists,
     /// Cancel requested for a non-existent wait.
     NotFound,
@@ -190,49 +187,15 @@ impl PacketQueue for VecPortQueue {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PendingState {
-    count: u32,
-    trigger: Signals,
-    observed: Signals,
-    timestamp: Time,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Observer {
-    watched: Signals,
-    options: WaitAsyncOptions,
-    last_satisfied: bool,
-    pending: Option<PendingState>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ObserverRegistration {
-    waitable: WaitableId,
-    key: PortKey,
-}
-
-impl ObserverRegistration {
-    const fn new(waitable: WaitableId, key: PortKey) -> Self {
-        Self { waitable, key }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 struct KernelReserveTicket;
 
-/// A Zircon-like port with reservation + pending merge semantics.
+/// A Zircon-like port queue with reservation semantics.
 #[derive(Debug)]
 pub struct PortState<Q: PacketQueue> {
     capacity: usize,
     kernel_reserve: usize,
-
     q: Q,
     user_in_q: usize,
-
-    // Observers indexed by (waitable,key).
-    observers: BTreeMap<ObserverRegistration, Observer>,
-    // Pending observer order (FIFO by first overflow).
-    pending_order: VecDeque<ObserverRegistration>,
 }
 
 /// Default port semantic state backed by an in-memory queue.
@@ -268,8 +231,6 @@ impl<Q: PacketQueue> PortState<Q> {
             kernel_reserve,
             q: queue,
             user_in_q: 0,
-            observers: BTreeMap::new(),
-            pending_order: VecDeque::new(),
         }
     }
 
@@ -340,10 +301,20 @@ impl<Q: PacketQueue> PortState<Q> {
         Ok(())
     }
 
-    /// Pop one packet (non-blocking).
+    /// Queue one kernel-generated packet.
     ///
-    /// After popping, this will opportunistically flush pending kernel packets
-    /// into newly freed space.
+    /// Kernel packets can consume the reserved portion of the queue but still
+    /// cannot exceed total capacity.
+    pub fn queue_kernel(&mut self, pkt: Packet) -> Result<(), PortError> {
+        debug_assert_ne!(pkt.kind, PacketKind::User);
+        let _ticket = self.reserve_kernel_slot().ok_or(PortError::ShouldWait)?;
+        if self.q.push_back(pkt).is_err() {
+            return Err(PortError::ShouldWait);
+        }
+        Ok(())
+    }
+
+    /// Pop one packet (non-blocking).
     pub fn pop(&mut self) -> Result<Packet, PortError> {
         let Some(pkt) = self.q.pop_front() else {
             return Err(PortError::ShouldWait);
@@ -352,199 +323,7 @@ impl<Q: PacketQueue> PortState<Q> {
             debug_assert!(self.user_in_q > 0);
             self.user_in_q -= 1;
         }
-        self.flush_pending();
         Ok(pkt)
-    }
-
-    /// Register an async wait on a waitable.
-    ///
-    /// This is one-shot: when the condition fires and a packet is delivered, the observer is removed.
-    ///
-    /// If `edge_triggered` is `false` and the condition is already satisfied, an immediate packet
-    /// is queued (or becomes pending if full).
-    pub fn wait_async(
-        &mut self,
-        waitable: WaitableId,
-        key: PortKey,
-        watched: Signals,
-        options: WaitAsyncOptions,
-        current_signals: Signals,
-        current_time: Time,
-    ) -> Result<(), PortError> {
-        let k = ObserverRegistration::new(waitable, key);
-        if self.observers.contains_key(&k) {
-            return Err(PortError::AlreadyExists);
-        }
-
-        let satisfied = current_signals.intersects(watched);
-        let obs = Observer {
-            watched,
-            options,
-            last_satisfied: satisfied,
-            pending: None,
-        };
-        self.observers.insert(k, obs);
-
-        // Level-triggered: if already satisfied, queue immediately.
-        if satisfied && !options.edge_triggered {
-            self.on_signals_changed(waitable, current_signals, current_time);
-        }
-
-        Ok(())
-    }
-
-    /// Cancel an async wait.
-    pub fn cancel(&mut self, waitable: WaitableId, key: PortKey) -> Result<(), PortError> {
-        let k = ObserverRegistration::new(waitable, key);
-        if self.observers.remove(&k).is_none() {
-            return Err(PortError::NotFound);
-        }
-        // If it was pending, it'll be cleaned up lazily when flushing.
-        Ok(())
-    }
-
-    /// Notify the port that a waitable's signals have changed to `current`.
-    ///
-    /// This will:
-    /// - evaluate observers for that waitable
-    /// - enqueue signal packets when conditions fire
-    /// - if full, mark observers as pending and merge repeated firings
-    pub fn on_signals_changed(&mut self, waitable: WaitableId, current: Signals, now: Time) {
-        // Collect matching keys first to avoid borrow checker issues.
-        let keys: Vec<ObserverRegistration> = self
-            .observers
-            .range(
-                ObserverRegistration::new(waitable, 0)
-                    ..=ObserverRegistration::new(waitable, u64::MAX),
-            )
-            .map(|(k, _)| *k)
-            .collect();
-
-        for k in keys {
-            let fire = {
-                let Some(obs) = self.observers.get_mut(&k) else {
-                    continue;
-                };
-
-                let satisfied = current.intersects(obs.watched);
-                let fire = if obs.options.edge_triggered {
-                    // Edge: only on false->true transition.
-                    !obs.last_satisfied && satisfied
-                } else {
-                    // Level: any time it's satisfied (one-shot means it should fire once).
-                    satisfied
-                };
-
-                obs.last_satisfied = satisfied;
-                fire
-            };
-
-            if fire {
-                let trigger = self
-                    .observers
-                    .get(&k)
-                    .map(|obs| obs.watched)
-                    .unwrap_or(Signals::NONE);
-                self.enqueue_or_pending(k, trigger, current, now);
-            }
-        }
-
-        // Try flushing pending too (in case signals changed when we already have space).
-        self.flush_pending();
-    }
-
-    fn enqueue_or_pending(
-        &mut self,
-        k: ObserverRegistration,
-        trigger: Signals,
-        current: Signals,
-        now: Time,
-    ) {
-        let timestamp = self
-            .observers
-            .get(&k)
-            .map(|obs| match obs.options.timestamp {
-                WaitAsyncTimestamp::None => 0,
-                WaitAsyncTimestamp::Monotonic | WaitAsyncTimestamp::Boot => now,
-            })
-            .unwrap_or(0);
-
-        // If we have space, enqueue now (and remove observer) without borrowing it.
-        if let Some(ticket) = self.reserve_kernel_slot() {
-            let _ = ticket;
-            let pkt = Packet::signal(k.key, k.waitable, trigger, current, 1, timestamp);
-            let queued = self.q.push_back(pkt);
-            debug_assert!(
-                queued.is_ok(),
-                "port queue overflow after capacity pre-check"
-            );
-            if queued.is_err() {
-                return;
-            }
-            // remove observer (one-shot).
-            let _ = self.observers.remove(&k);
-            return;
-        }
-
-        // Otherwise, become/merge pending.
-        let Some(obs) = self.observers.get_mut(&k) else {
-            return;
-        };
-
-        match &mut obs.pending {
-            None => {
-                obs.pending = Some(PendingState {
-                    count: 1,
-                    trigger,
-                    observed: current,
-                    timestamp,
-                });
-                self.pending_order.push_back(k);
-            }
-            Some(p) => {
-                p.count = p.count.saturating_add(1);
-                p.observed = p.observed | current;
-            }
-        }
-    }
-
-    fn flush_pending(&mut self) {
-        while self.q.len() < self.capacity {
-            let Some(k) = self.pending_order.pop_front() else {
-                break;
-            };
-
-            // The observer might have been canceled or already delivered.
-            let Some(obs) = self.observers.get(&k).copied() else {
-                continue;
-            };
-            let Some(p) = obs.pending else {
-                continue;
-            };
-
-            // Enqueue pending packet to the back (preserves FIFO among already queued packets).
-            let _ticket = KernelReserveTicket;
-            let pkt = Packet::signal(
-                k.key,
-                k.waitable,
-                p.trigger,
-                p.observed,
-                p.count,
-                p.timestamp,
-            );
-            let queued = self.q.push_back(pkt);
-            debug_assert!(
-                queued.is_ok(),
-                "port queue overflow while flushing pending packet"
-            );
-            if queued.is_err() {
-                self.pending_order.push_front(k);
-                break;
-            }
-
-            // Remove observer (one-shot completion).
-            let _ = self.observers.remove(&k);
-        }
     }
 }
 
@@ -554,7 +333,7 @@ mod tests {
 
     #[test]
     fn user_quota_enforces_kernel_reserve() {
-        let mut port = Port::new(4, 2); // user quota = 2
+        let mut port = Port::new(4, 2);
         port.queue_user(Packet::user(1)).unwrap();
         port.queue_user(Packet::user(2)).unwrap();
         assert_eq!(port.queue_user(Packet::user(3)), Err(PortError::ShouldWait));
@@ -562,275 +341,46 @@ mod tests {
     }
 
     #[test]
-    fn kernel_event_can_still_queue_when_user_quota_full() {
+    fn kernel_packet_can_use_reserved_slot() {
         let mut port = Port::new(4, 2);
         port.queue_user(Packet::user(1)).unwrap();
         port.queue_user(Packet::user(2)).unwrap();
         assert_eq!(port.len(), 2);
-
-        // Register async wait; a kernel event should be able to enqueue into reserved slots.
-        port.wait_async(
-            42,
+        port.queue_kernel(Packet::signal(
             7,
+            42,
             Signals::CHANNEL_READABLE,
-            WaitAsyncOptions::default(),
-            Signals::NONE,
-            11,
-        )
+            Signals::CHANNEL_READABLE,
+            1,
+            12,
+        ))
         .unwrap();
-
-        port.on_signals_changed(42, Signals::CHANNEL_READABLE, 12);
         assert_eq!(port.len(), 3);
-        let p = port.pop().unwrap(); // user pkt 1
-        assert_eq!(p.kind, PacketKind::User);
-        let p = port.pop().unwrap(); // user pkt 2
-        assert_eq!(p.kind, PacketKind::User);
-        let p = port.pop().unwrap(); // signal pkt
-        assert_eq!(p.kind, PacketKind::Signal);
-        assert_eq!(p.waitable, 42);
-        assert_eq!(p.key, 7);
-        assert!(p.observed.intersects(Signals::CHANNEL_READABLE));
     }
 
     #[test]
-    fn pending_merge_and_flush() {
-        // capacity 1, reserve 1 => user quota 0. We'll only test kernel packets.
-        let mut port = Port::new(1, 1);
-        port.wait_async(
-            1,
+    fn kernel_packet_still_obeys_total_capacity() {
+        let mut port = Port::new(2, 1);
+        port.queue_user(Packet::user(1)).unwrap();
+        port.queue_kernel(Packet::signal(
+            2,
             10,
-            Signals::CHANNEL_READABLE,
-            WaitAsyncOptions::default(),
-            Signals::NONE,
-            100,
-        )
-        .unwrap();
-
-        // First firing enqueues (space available).
-        port.on_signals_changed(1, Signals::CHANNEL_READABLE, 101);
-        assert_eq!(port.len(), 1);
-
-        // Re-arm another observer; then fill queue; then trigger multiple times -> pending merge.
-        port.wait_async(
-            1,
-            11,
-            Signals::CHANNEL_READABLE,
-            WaitAsyncOptions::default(),
-            Signals::NONE,
-            200,
-        )
-        .unwrap();
-
-        // Queue is full now, so triggers become pending.
-        port.on_signals_changed(1, Signals::CHANNEL_READABLE, 201);
-        port.on_signals_changed(1, Signals::CHANNEL_READABLE, 202);
-
-        // Drain one packet, should flush pending into freed slot.
-        let _ = port.pop().unwrap();
-        assert_eq!(port.len(), 1);
-        let pkt = port.pop().unwrap();
-        assert_eq!(pkt.kind, PacketKind::Signal);
-        assert_eq!(pkt.key, 11);
-        assert!(pkt.count >= 1);
-    }
-
-    #[test]
-    fn edge_triggered_requires_transition() {
-        let mut port = Port::new(4, 2);
-        port.wait_async(
+            Signals::TIMER_SIGNALED,
+            Signals::TIMER_SIGNALED,
             1,
             99,
-            Signals::CHANNEL_READABLE,
-            WaitAsyncOptions {
-                edge_triggered: true,
-                timestamp: WaitAsyncTimestamp::None,
-            },
-            Signals::CHANNEL_READABLE, // already satisfied at arm time
-            300,
-        )
+        ))
         .unwrap();
-
-        // Still satisfied: no transition, so no packet.
-        port.on_signals_changed(1, Signals::CHANNEL_READABLE, 301);
-        assert_eq!(port.len(), 0);
-
-        // Clear then set: transition fires.
-        port.on_signals_changed(1, Signals::NONE, 302);
-        port.on_signals_changed(1, Signals::CHANNEL_READABLE, 303);
-        assert_eq!(port.len(), 1);
-        let pkt = port.pop().unwrap();
-        assert_eq!(pkt.key, 99);
-    }
-
-    #[test]
-    fn timestamp_requested_is_recorded_on_delivery() {
-        let mut port = Port::new(4, 2);
-        port.wait_async(
-            5,
-            55,
-            Signals::TIMER_SIGNALED,
-            WaitAsyncOptions {
-                edge_triggered: false,
-                timestamp: WaitAsyncTimestamp::Monotonic,
-            },
-            Signals::NONE,
-            1000,
-        )
-        .unwrap();
-
-        port.on_signals_changed(5, Signals::TIMER_SIGNALED, 1234);
-        let pkt = port.pop().unwrap();
-        assert_eq!(pkt.kind, PacketKind::Signal);
-        assert_eq!(pkt.timestamp, 1234);
-    }
-
-    #[test]
-    fn pending_merge_keeps_first_timestamp() {
-        let mut port = Port::new(1, 1);
-        port.wait_async(
-            7,
-            77,
-            Signals::TIMER_SIGNALED,
-            WaitAsyncOptions {
-                edge_triggered: false,
-                timestamp: WaitAsyncTimestamp::Monotonic,
-            },
-            Signals::TIMER_SIGNALED,
-            10,
-        )
-        .unwrap();
-
-        port.wait_async(
-            7,
-            78,
-            Signals::TIMER_SIGNALED,
-            WaitAsyncOptions {
-                edge_triggered: false,
-                timestamp: WaitAsyncTimestamp::Monotonic,
-            },
-            Signals::NONE,
-            20,
-        )
-        .unwrap();
-
-        port.on_signals_changed(7, Signals::TIMER_SIGNALED, 21);
-        port.on_signals_changed(7, Signals::TIMER_SIGNALED, 22);
-
-        assert_eq!(port.pop().unwrap().timestamp, 10);
-        let pkt = port.pop().unwrap();
-        assert_eq!(pkt.timestamp, 21);
-        assert_eq!(pkt.count, 2);
-    }
-
-    #[cfg(feature = "loom")]
-    #[test]
-    fn loom_pending_signal_flush_preserves_one_shot_delivery() {
-        use loom::sync::{Arc, Mutex};
-        use loom::thread;
-
-        loom::model(|| {
-            let port = Arc::new(Mutex::new(Port::new(2, 1)));
-            {
-                let mut port = port.lock().unwrap();
-                port.queue_user(Packet::user(1)).unwrap();
-                port.wait_async(
-                    42,
-                    7,
-                    Signals::CHANNEL_READABLE,
-                    WaitAsyncOptions::default(),
-                    Signals::NONE,
-                    11,
-                )
-                .unwrap();
-            }
-
-            let producer_port = Arc::clone(&port);
-            let producer = thread::spawn(move || {
-                thread::yield_now();
-                let mut port = producer_port.lock().unwrap();
-                port.on_signals_changed(42, Signals::CHANNEL_READABLE, 12);
-                thread::yield_now();
-                port.on_signals_changed(42, Signals::CHANNEL_READABLE, 13);
-            });
-
-            let consumer_port = Arc::clone(&port);
-            let consumer = thread::spawn(move || {
-                thread::yield_now();
-                let mut port = consumer_port.lock().unwrap();
-                let pkt = port.pop().unwrap();
-                assert_eq!(pkt.kind, PacketKind::User);
-                assert_eq!(pkt.key, 1);
-            });
-
-            producer.join().unwrap();
-            consumer.join().unwrap();
-
-            let mut port = port.lock().unwrap();
-            assert_eq!(port.len(), 1);
-            let pkt = port.pop().unwrap();
-            assert_eq!(pkt.kind, PacketKind::Signal);
-            assert_eq!(pkt.waitable, 42);
-            assert_eq!(pkt.key, 7);
-            assert!(pkt.observed.intersects(Signals::CHANNEL_READABLE));
-            assert!(pkt.count >= 1);
-            assert_eq!(port.pop(), Err(PortError::ShouldWait));
-        });
-    }
-
-    #[cfg(feature = "loom")]
-    #[test]
-    fn loom_edge_wait_requires_real_transition_under_reordering() {
-        use loom::sync::{Arc, Mutex};
-        use loom::thread;
-
-        loom::model(|| {
-            let port = Arc::new(Mutex::new(Port::new(4, 2)));
-            {
-                let mut port = port.lock().unwrap();
-                port.wait_async(
-                    1,
-                    99,
-                    Signals::CHANNEL_READABLE,
-                    WaitAsyncOptions {
-                        edge_triggered: true,
-                        timestamp: WaitAsyncTimestamp::None,
-                    },
-                    Signals::CHANNEL_READABLE,
-                    300,
-                )
-                .unwrap();
-            }
-
-            let transition_port = Arc::clone(&port);
-            let transition = thread::spawn(move || {
-                {
-                    let mut port = transition_port.lock().unwrap();
-                    port.on_signals_changed(1, Signals::NONE, 301);
-                }
-                thread::yield_now();
-                {
-                    let mut port = transition_port.lock().unwrap();
-                    port.on_signals_changed(1, Signals::CHANNEL_READABLE, 302);
-                }
-            });
-
-            let steady_port = Arc::clone(&port);
-            let steady = thread::spawn(move || {
-                thread::yield_now();
-                let mut port = steady_port.lock().unwrap();
-                port.on_signals_changed(1, Signals::CHANNEL_READABLE, 303);
-            });
-
-            transition.join().unwrap();
-            steady.join().unwrap();
-
-            let mut port = port.lock().unwrap();
-            assert_eq!(port.len(), 1);
-            let pkt = port.pop().unwrap();
-            assert_eq!(pkt.kind, PacketKind::Signal);
-            assert_eq!(pkt.key, 99);
-            assert_eq!(pkt.count, 1);
-            assert_eq!(port.pop(), Err(PortError::ShouldWait));
-        });
+        assert_eq!(
+            port.queue_kernel(Packet::signal(
+                3,
+                10,
+                Signals::TIMER_SIGNALED,
+                Signals::TIMER_SIGNALED,
+                1,
+                100,
+            )),
+            Err(PortError::ShouldWait)
+        );
     }
 }

@@ -1,9 +1,6 @@
 extern crate alloc;
 
-use axle_core::{
-    Packet, PacketKind, PacketQueue, PortError, PortKey, PortState, Signals, WaitAsyncOptions,
-    WaitableId,
-};
+use axle_core::{Packet, PacketKind, PacketQueue, PortError, PortState, Signals};
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
 use axle_types::status::ZX_OK;
 use axle_types::{zx_packet_signal_t, zx_port_packet_t, zx_status_t};
@@ -127,27 +124,8 @@ impl KernelPort {
         self.state.pop()
     }
 
-    pub(crate) fn wait_async(
-        &mut self,
-        waitable: WaitableId,
-        key: PortKey,
-        watched: Signals,
-        options: WaitAsyncOptions,
-        current_signals: Signals,
-        current_time: i64,
-    ) -> Result<(), PortError> {
-        self.state.wait_async(
-            waitable,
-            key,
-            watched,
-            options,
-            current_signals,
-            current_time,
-        )
-    }
-
-    pub(crate) fn on_signals_changed(&mut self, waitable: WaitableId, current: Signals, now: i64) {
-        self.state.on_signals_changed(waitable, current, now);
+    pub(crate) fn queue_kernel(&mut self, pkt: Packet) -> Result<(), PortError> {
+        self.state.queue_kernel(pkt)
     }
 }
 

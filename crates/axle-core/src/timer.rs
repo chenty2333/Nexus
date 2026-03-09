@@ -15,6 +15,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::collections::BinaryHeap;
+use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 /// A monotonic timestamp in nanoseconds.
@@ -227,6 +228,324 @@ impl TimerService {
     }
 }
 
+/// Identifier for one blocked wait deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WaitDeadlineId {
+    thread_id: u64,
+    seq: u64,
+}
+
+impl WaitDeadlineId {
+    /// Create one wait-deadline id.
+    pub const fn new(thread_id: u64, seq: u64) -> Self {
+        Self { thread_id, seq }
+    }
+
+    /// Owning thread id.
+    pub const fn thread_id(self) -> u64 {
+        self.thread_id
+    }
+
+    /// Wait-sequence discriminator.
+    pub const fn seq(self) -> u64 {
+        self.seq
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ReactorEntryKind {
+    Timer(TimerId),
+    Wait(WaitDeadlineId),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReactorHeapEntry {
+    deadline: Time,
+    slot: usize,
+    kind: ReactorEntryKind,
+}
+
+impl PartialEq for ReactorHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.slot == other.slot && self.kind == other.kind
+    }
+}
+
+impl Eq for ReactorHeapEntry {}
+
+impl PartialOrd for ReactorHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReactorHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.slot.cmp(&self.slot))
+            .then_with(|| other.kind.cmp(&self.kind))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReactorTimerState {
+    deadline: Option<Time>,
+    signaled: bool,
+    slot: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WaitDeadlineState {
+    deadline: Time,
+    slot: usize,
+}
+
+/// One due event returned by the unified reactor timer backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReactorTimerEvent {
+    /// One kernel timer object became signaled.
+    TimerFired(TimerId),
+    /// One blocked wait deadline expired.
+    WaitExpired(WaitDeadlineId),
+}
+
+/// Lightweight telemetry for the unified timer backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReactorTimerStats {
+    /// Object timers currently armed.
+    pub armed_timers: usize,
+    /// Wait deadlines currently armed.
+    pub armed_waits: usize,
+    /// Peak total armed entries.
+    pub peak_armed_total: usize,
+    /// Number of timer-object firings produced so far.
+    pub timer_fire_count: u64,
+    /// Number of wait-deadline expirations produced so far.
+    pub wait_expire_count: u64,
+    /// Number of explicit cancels processed so far.
+    pub cancel_count: u64,
+}
+
+/// Unified timer backend for timer objects and wait deadlines.
+#[derive(Debug)]
+pub struct ReactorTimerCore {
+    next_timer_id: u64,
+    timers: BTreeMap<TimerId, ReactorTimerState>,
+    waits: BTreeMap<WaitDeadlineId, WaitDeadlineState>,
+    slots: Vec<BinaryHeap<ReactorHeapEntry>>,
+    stats: ReactorTimerStats,
+}
+
+impl ReactorTimerCore {
+    /// Create a core with `slot_count` deadline heaps.
+    pub fn new(slot_count: usize) -> Self {
+        assert!(slot_count > 0, "slot_count must be non-zero");
+        Self {
+            next_timer_id: 0,
+            timers: BTreeMap::new(),
+            waits: BTreeMap::new(),
+            slots: (0..slot_count).map(|_| BinaryHeap::new()).collect(),
+            stats: ReactorTimerStats::default(),
+        }
+    }
+
+    fn slot_for_cpu(&self, cpu_id: usize) -> usize {
+        cpu_id.min(self.slots.len().saturating_sub(1))
+    }
+
+    fn note_population_change(&mut self) {
+        let total = self.stats.armed_timers + self.stats.armed_waits;
+        self.stats.peak_armed_total = self.stats.peak_armed_total.max(total);
+    }
+
+    /// Create a new timer-object id.
+    pub fn create_timer(&mut self) -> TimerId {
+        let id = TimerId(self.next_timer_id);
+        self.next_timer_id = self.next_timer_id.wrapping_add(1);
+        self.timers.insert(
+            id,
+            ReactorTimerState {
+                deadline: None,
+                signaled: false,
+                slot: 0,
+            },
+        );
+        id
+    }
+
+    /// Remove one timer object from the backend.
+    pub fn remove_timer(&mut self, id: TimerId) -> Result<(), TimerError> {
+        let Some(state) = self.timers.remove(&id) else {
+            return Err(TimerError::NotFound);
+        };
+        if state.deadline.is_some() {
+            self.stats.armed_timers = self.stats.armed_timers.saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    /// Arm or re-arm a timer object on the slot owned by `cpu_id`.
+    pub fn set_timer(
+        &mut self,
+        id: TimerId,
+        cpu_id: usize,
+        deadline: Time,
+        now: Time,
+    ) -> Result<bool, TimerError> {
+        let slot = self.slot_for_cpu(cpu_id);
+        let was_armed = self
+            .timers
+            .get(&id)
+            .map(|state| state.deadline.is_some())
+            .ok_or(TimerError::NotFound)?;
+        if !was_armed {
+            self.stats.armed_timers += 1;
+            self.note_population_change();
+        }
+        let Some(state) = self.timers.get_mut(&id) else {
+            return Err(TimerError::NotFound);
+        };
+        state.deadline = Some(deadline);
+        state.signaled = false;
+        state.slot = slot;
+        if deadline <= now {
+            state.deadline = None;
+            state.signaled = true;
+            self.stats.armed_timers = self.stats.armed_timers.saturating_sub(1);
+            self.stats.timer_fire_count = self.stats.timer_fire_count.saturating_add(1);
+            return Ok(true);
+        }
+        self.slots[slot].push(ReactorHeapEntry {
+            deadline,
+            slot,
+            kind: ReactorEntryKind::Timer(id),
+        });
+        Ok(false)
+    }
+
+    /// Cancel one timer object.
+    pub fn cancel_timer(&mut self, id: TimerId) -> Result<(), TimerError> {
+        let Some(state) = self.timers.get_mut(&id) else {
+            return Err(TimerError::NotFound);
+        };
+        if state.deadline.take().is_some() {
+            self.stats.armed_timers = self.stats.armed_timers.saturating_sub(1);
+            self.stats.cancel_count = self.stats.cancel_count.saturating_add(1);
+        }
+        state.signaled = false;
+        Ok(())
+    }
+
+    /// Whether a timer object is currently signaled.
+    pub fn is_timer_signaled(&self, id: TimerId) -> Result<bool, TimerError> {
+        self.timers
+            .get(&id)
+            .map(|state| state.signaled)
+            .ok_or(TimerError::NotFound)
+    }
+
+    /// Arm or re-arm one blocked wait deadline.
+    pub fn arm_wait_deadline(&mut self, cpu_id: usize, id: WaitDeadlineId, deadline: Time) {
+        let slot = self.slot_for_cpu(cpu_id);
+        if self
+            .waits
+            .insert(id, WaitDeadlineState { deadline, slot })
+            .is_none()
+        {
+            self.stats.armed_waits += 1;
+            self.note_population_change();
+        }
+        self.slots[slot].push(ReactorHeapEntry {
+            deadline,
+            slot,
+            kind: ReactorEntryKind::Wait(id),
+        });
+    }
+
+    /// Cancel one blocked wait deadline.
+    pub fn cancel_wait_deadline(&mut self, id: WaitDeadlineId) {
+        if self.waits.remove(&id).is_some() {
+            self.stats.armed_waits = self.stats.armed_waits.saturating_sub(1);
+            self.stats.cancel_count = self.stats.cancel_count.saturating_add(1);
+        }
+    }
+
+    /// Poll one CPU slot and return all due events.
+    pub fn poll_slot(&mut self, cpu_id: usize, now: Time) -> alloc::vec::Vec<ReactorTimerEvent> {
+        let slot = self.slot_for_cpu(cpu_id);
+        let mut due = alloc::vec::Vec::new();
+        self.poll_slot_inner(slot, now, &mut due);
+        due
+    }
+
+    /// Poll every slot and return all due events.
+    pub fn poll_all(&mut self, now: Time) -> alloc::vec::Vec<ReactorTimerEvent> {
+        let mut due = alloc::vec::Vec::new();
+        for slot in 0..self.slots.len() {
+            self.poll_slot_inner(slot, now, &mut due);
+        }
+        due
+    }
+
+    /// Current telemetry snapshot.
+    pub const fn stats(&self) -> ReactorTimerStats {
+        self.stats
+    }
+
+    fn poll_slot_inner(
+        &mut self,
+        slot: usize,
+        now: Time,
+        out: &mut alloc::vec::Vec<ReactorTimerEvent>,
+    ) {
+        loop {
+            let entry = {
+                let Some(heap) = self.slots.get_mut(slot) else {
+                    return;
+                };
+                let Some(entry) = heap.peek().copied() else {
+                    return;
+                };
+                if entry.deadline > now {
+                    return;
+                }
+                let _ = heap.pop();
+                entry
+            };
+
+            match entry.kind {
+                ReactorEntryKind::Timer(id) => {
+                    let Some(state) = self.timers.get_mut(&id) else {
+                        continue;
+                    };
+                    if state.deadline != Some(entry.deadline) || state.slot != entry.slot {
+                        continue;
+                    }
+                    state.deadline = None;
+                    state.signaled = true;
+                    self.stats.armed_timers = self.stats.armed_timers.saturating_sub(1);
+                    self.stats.timer_fire_count = self.stats.timer_fire_count.saturating_add(1);
+                    out.push(ReactorTimerEvent::TimerFired(id));
+                }
+                ReactorEntryKind::Wait(id) => {
+                    let Some(state) = self.waits.get(&id).copied() else {
+                        continue;
+                    };
+                    if state.deadline != entry.deadline || state.slot != entry.slot {
+                        continue;
+                    }
+                    let _ = self.waits.remove(&id);
+                    self.stats.armed_waits = self.stats.armed_waits.saturating_sub(1);
+                    self.stats.wait_expire_count = self.stats.wait_expire_count.saturating_add(1);
+                    out.push(ReactorTimerEvent::WaitExpired(id));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +592,62 @@ mod tests {
 
         let fired = svc.advance_clock(&mut clock, 10);
         assert_eq!(fired, alloc::vec![t]);
+    }
+
+    #[test]
+    fn reactor_timer_core_fires_object_timers() {
+        let mut core = ReactorTimerCore::new(2);
+        let timer = core.create_timer();
+        assert!(!core.set_timer(timer, 1, 10, 0).unwrap());
+        assert!(!core.is_timer_signaled(timer).unwrap());
+        assert!(core.poll_slot(0, 10).is_empty());
+        let due = core.poll_slot(1, 10);
+        assert_eq!(due, alloc::vec![ReactorTimerEvent::TimerFired(timer)]);
+        assert!(core.is_timer_signaled(timer).unwrap());
+    }
+
+    #[test]
+    fn reactor_timer_core_cancels_wait_deadlines() {
+        let mut core = ReactorTimerCore::new(4);
+        let wait = WaitDeadlineId::new(7, 11);
+        core.arm_wait_deadline(3, wait, 20);
+        core.cancel_wait_deadline(wait);
+        assert!(core.poll_slot(3, 20).is_empty());
+    }
+
+    #[test]
+    fn reactor_timer_core_polls_all_slots() {
+        let mut core = ReactorTimerCore::new(2);
+        let timer = core.create_timer();
+        let wait = WaitDeadlineId::new(9, 2);
+        assert!(!core.set_timer(timer, 0, 5, 0).unwrap());
+        core.arm_wait_deadline(1, wait, 5);
+        let due = core.poll_all(5);
+        assert_eq!(due.len(), 2);
+        assert!(due.contains(&ReactorTimerEvent::TimerFired(timer)));
+        assert!(due.contains(&ReactorTimerEvent::WaitExpired(wait)));
+        let stats = core.stats();
+        assert_eq!(stats.timer_fire_count, 1);
+        assert_eq!(stats.wait_expire_count, 1);
+    }
+
+    #[test]
+    fn reactor_timer_core_can_fire_timer_immediately() {
+        let mut core = ReactorTimerCore::new(1);
+        let timer = core.create_timer();
+        assert!(core.set_timer(timer, 0, 5, 5).unwrap());
+        assert!(core.is_timer_signaled(timer).unwrap());
+        assert!(core.poll_all(5).is_empty());
+    }
+
+    #[test]
+    fn reactor_timer_core_removes_armed_timer() {
+        let mut core = ReactorTimerCore::new(1);
+        let timer = core.create_timer();
+        assert!(!core.set_timer(timer, 0, 10, 0).unwrap());
+        core.remove_timer(timer).unwrap();
+        assert!(core.poll_all(10).is_empty());
+        let stats = core.stats();
+        assert_eq!(stats.armed_timers, 0);
     }
 }

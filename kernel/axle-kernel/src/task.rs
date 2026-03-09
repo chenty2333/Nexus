@@ -12,12 +12,15 @@
 
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::handle::Handle;
-use axle_core::{CSpace, CSpaceError, Capability, RevocationManager, Signals, TransferredCap};
+use axle_core::{
+    CSpace, CSpaceError, Capability, ReactorTimerCore, ReactorTimerEvent, RevocationManager,
+    Signals, TimerError, TimerId, TransferredCap, WaitDeadlineId,
+};
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
     CowFaultResolution, FrameId, FrameTable, FutexKey, GlobalVmoId, LazyAnonFaultResolution,
@@ -42,7 +45,6 @@ use axle_types::{
     zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t,
 };
 use bitflags::bitflags;
-use core::cmp::Ordering;
 use core::mem::size_of;
 use spin::Mutex;
 
@@ -269,29 +271,6 @@ impl WaitNode {
     fn clear(&mut self) {
         self.registration = None;
         self.deadline = None;
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct WaitTimerEntry {
-    deadline: i64,
-    thread_id: ThreadId,
-    seq: u64,
-}
-
-impl Ord for WaitTimerEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .deadline
-            .cmp(&self.deadline)
-            .then_with(|| other.thread_id.cmp(&self.thread_id))
-            .then_with(|| other.seq.cmp(&self.seq))
-    }
-}
-
-impl PartialOrd for WaitTimerEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -1303,6 +1282,18 @@ impl ExpiredWait {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct ReactorPollResult {
+    fired_timers: Vec<TimerId>,
+    expired_waits: Vec<ExpiredWait>,
+}
+
+impl ReactorPollResult {
+    pub(crate) fn into_parts(self) -> (Vec<TimerId>, Vec<ExpiredWait>) {
+        (self.fired_timers, self.expired_waits)
+    }
+}
+
 /// Pinned page run loaned from the current process into a kernel object.
 #[derive(Debug)]
 #[must_use = "loaned user pages must be explicitly released"]
@@ -2156,7 +2147,7 @@ pub(crate) struct Kernel {
     futexes: crate::futex::FutexTable,
     signal_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
     port_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
-    wait_timers: Vec<BinaryHeap<WaitTimerEntry>>,
+    reactor_timers: ReactorTimerCore,
     run_queue: VecDeque<ThreadId>,
     revocations: RevocationManager,
     next_koid: zx_koid_t,
@@ -2311,53 +2302,36 @@ impl VmDomain {
 }
 
 impl Kernel {
-    fn new_wait_timer_heaps() -> Vec<BinaryHeap<WaitTimerEntry>> {
-        (0..crate::smp::max_cpus())
-            .map(|_| BinaryHeap::new())
-            .collect()
+    fn cancel_wait_deadline(&mut self, thread_id: ThreadId, seq: u64) {
+        self.reactor_timers
+            .cancel_wait_deadline(WaitDeadlineId::new(thread_id, seq));
     }
 
-    fn wait_timer_cpu_slot(&self, cpu_id: usize) -> usize {
-        cpu_id.min(self.wait_timers.len().saturating_sub(1))
+    pub(crate) fn create_timer_object(&mut self) -> TimerId {
+        self.reactor_timers.create_timer()
     }
 
-    fn expire_waits_in_cpu_slot(
+    pub(crate) fn destroy_timer_object(&mut self, timer_id: TimerId) -> Result<(), TimerError> {
+        self.reactor_timers.remove_timer(timer_id)
+    }
+
+    pub(crate) fn set_timer_object(
         &mut self,
-        cpu_slot: usize,
+        timer_id: TimerId,
+        deadline: i64,
         now: i64,
-        expired: &mut Vec<ExpiredWait>,
-    ) {
-        loop {
-            let entry = {
-                let Some(heap) = self.wait_timers.get_mut(cpu_slot) else {
-                    return;
-                };
-                let Some(entry) = heap.peek().copied() else {
-                    return;
-                };
-                if entry.deadline > now {
-                    return;
-                }
-                let _ = heap.pop();
-                entry
-            };
+    ) -> Result<bool, TimerError> {
+        let cpu_id = self.current_cpu_id();
+        self.reactor_timers
+            .set_timer(timer_id, cpu_id, deadline, now)
+    }
 
-            let Some(thread) = self.threads.get(&entry.thread_id) else {
-                continue;
-            };
-            if thread.wait.seq != entry.seq || thread.wait.deadline != Some(entry.deadline) {
-                continue;
-            }
-            let Some(registration) = self.take_wait_registration_if_seq(entry.thread_id, entry.seq)
-            else {
-                continue;
-            };
-            self.remove_wait_source_membership(entry.thread_id, registration);
-            expired.push(ExpiredWait {
-                thread_id: entry.thread_id,
-                registration,
-            });
-        }
+    pub(crate) fn cancel_timer_object(&mut self, timer_id: TimerId) -> Result<(), TimerError> {
+        self.reactor_timers.cancel_timer(timer_id)
+    }
+
+    pub(crate) fn timer_object_signaled(&self, timer_id: TimerId) -> Result<bool, TimerError> {
+        self.reactor_timers.is_timer_signaled(timer_id)
     }
 
     /// Build the single-process bootstrap kernel model used by the current main branch.
@@ -2426,7 +2400,7 @@ impl Kernel {
             futexes: crate::futex::FutexTable::new(),
             signal_waiters: BTreeMap::new(),
             port_waiters: BTreeMap::new(),
-            wait_timers: Self::new_wait_timer_heaps(),
+            reactor_timers: ReactorTimerCore::new(crate::smp::max_cpus()),
             run_queue: VecDeque::new(),
             revocations: RevocationManager::new(),
             next_koid: 1,
@@ -3188,20 +3162,34 @@ impl Kernel {
         thread_id: ThreadId,
         seq: u64,
     ) -> Option<WaitRegistration> {
-        let thread = self.threads.get_mut(&thread_id)?;
-        if thread.wait.seq != seq {
-            return None;
+        let (registration, had_deadline) = {
+            let thread = self.threads.get_mut(&thread_id)?;
+            if thread.wait.seq != seq {
+                return None;
+            }
+            let registration = thread.wait.registration?;
+            let had_deadline = thread.wait.deadline.is_some();
+            thread.wait.clear();
+            (registration, had_deadline)
+        };
+        if had_deadline {
+            self.cancel_wait_deadline(thread_id, seq);
         }
-        let registration = thread.wait.registration?;
-        thread.wait.clear();
         Some(registration)
     }
 
     fn take_wait_registration(&mut self, thread_id: ThreadId) -> Option<(u64, WaitRegistration)> {
-        let thread = self.threads.get_mut(&thread_id)?;
-        let registration = thread.wait.registration?;
-        let seq = thread.wait.seq;
-        thread.wait.clear();
+        let (seq, registration, had_deadline) = {
+            let thread = self.threads.get_mut(&thread_id)?;
+            let registration = thread.wait.registration?;
+            let seq = thread.wait.seq;
+            let had_deadline = thread.wait.deadline.is_some();
+            thread.wait.clear();
+            (seq, registration, had_deadline)
+        };
+        if had_deadline {
+            self.cancel_wait_deadline(thread_id, seq);
+        }
         Some((seq, registration))
     }
 
@@ -3222,12 +3210,11 @@ impl Kernel {
         };
         self.enqueue_wait_source(thread_id, registration);
         if let Some(deadline) = deadline {
-            let cpu_slot = self.wait_timer_cpu_slot(self.current_cpu_id());
-            self.wait_timers[cpu_slot].push(WaitTimerEntry {
+            self.reactor_timers.arm_wait_deadline(
+                self.current_cpu_id(),
+                WaitDeadlineId::new(thread_id, seq),
                 deadline,
-                thread_id,
-                seq,
-            });
+            );
         }
         Ok(())
     }
@@ -3318,19 +3305,40 @@ impl Kernel {
         Ok(true)
     }
 
-    pub(crate) fn expire_waits_for_tick(&mut self, now: i64) -> Vec<ExpiredWait> {
-        let mut expired = Vec::new();
-        if crate::arch::timer::ticks_all_cpus() {
-            let cpu_slot = self.wait_timer_cpu_slot(self.current_cpu_id());
-            self.expire_waits_in_cpu_slot(cpu_slot, now, &mut expired);
-            return expired;
-        }
+    pub(crate) fn poll_reactor(&mut self, now: i64) -> ReactorPollResult {
+        let mut result = ReactorPollResult::default();
+        let due = if crate::arch::timer::ticks_all_cpus() {
+            self.reactor_timers.poll_slot(self.current_cpu_id(), now)
+        } else {
+            self.reactor_timers.poll_all(now)
+        };
 
-        for cpu_slot in 0..self.wait_timers.len() {
-            self.expire_waits_in_cpu_slot(cpu_slot, now, &mut expired);
+        for event in due {
+            match event {
+                ReactorTimerEvent::TimerFired(timer_id) => {
+                    result.fired_timers.push(timer_id);
+                }
+                ReactorTimerEvent::WaitExpired(wait_id) => {
+                    let Some(thread) = self.threads.get(&wait_id.thread_id()) else {
+                        continue;
+                    };
+                    if thread.wait.seq != wait_id.seq() {
+                        continue;
+                    }
+                    let Some(registration) =
+                        self.take_wait_registration_if_seq(wait_id.thread_id(), wait_id.seq())
+                    else {
+                        continue;
+                    };
+                    self.remove_wait_source_membership(wait_id.thread_id(), registration);
+                    result.expired_waits.push(ExpiredWait {
+                        thread_id: wait_id.thread_id(),
+                        registration,
+                    });
+                }
+            }
         }
-
-        expired
+        result
     }
 
     fn update_wait_registration(

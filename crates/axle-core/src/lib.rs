@@ -23,6 +23,7 @@ extern crate alloc;
 pub mod capability;
 pub mod cspace;
 pub mod handle;
+pub mod observer;
 pub mod port;
 pub mod revocation;
 pub mod signals;
@@ -31,13 +32,17 @@ pub mod timer;
 pub use capability::Capability;
 pub use cspace::{CSpace, CSpaceError, TransferredCap};
 pub use handle::{Handle, HandleError};
+pub use observer::{ObserverPortId, ObserverRegistry, WaitAsyncRegistration};
 pub use port::{
     Packet, PacketKind, PacketQueue, Port, PortError, PortKey, PortState, VecPortQueue,
     WaitAsyncOptions, WaitAsyncTimestamp, WaitableId,
 };
 pub use revocation::{RevocationGroupId, RevocationGroupToken, RevocationManager, RevocationRef};
 pub use signals::{Signals, WaitOne, wait_one};
-pub use timer::{FakeClock, Time, TimerError, TimerId, TimerService};
+pub use timer::{
+    FakeClock, ReactorTimerCore, ReactorTimerEvent, ReactorTimerStats, Time, TimerError, TimerId,
+    TimerService, WaitDeadlineId,
+};
 
 #[cfg(test)]
 extern crate std;
