@@ -3,9 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use axle_conformance::contracts::{ConcurrencyObservation, ConcurrencySystem};
 
 use crate::model::RunObservation;
-use crate::seed::ConcurrentSeed;
+use crate::seed::{ConcurrentSeed, SystemKind};
 
 /// One retained interesting seed plus its observation summary.
 #[derive(Clone, Debug)]
@@ -93,6 +94,26 @@ impl Corpus {
         &self.retained
     }
 
+    /// Aggregate retained-seed coverage into the contract-level concurrency view.
+    pub fn contract_observations(&self) -> BTreeMap<ConcurrencySystem, ConcurrencyObservation> {
+        let mut out = BTreeMap::new();
+        for retained in &self.retained {
+            let entry = out
+                .entry(map_system(retained.seed.system))
+                .or_insert_with(ConcurrencyObservation::default);
+            entry
+                .hook_classes
+                .extend(retained.observation.hook_classes.iter().copied());
+            entry
+                .state_projections
+                .extend(retained.observation.state_projections.iter().copied());
+            if let Some(kind) = retained.observation.failure_kind.as_ref() {
+                let _ = entry.failure_kinds.insert(kind.clone());
+            }
+        }
+        out
+    }
+
     /// Pick one retained parent according to the current predictor.
     pub fn pick_parent(&self, round: usize) -> Option<&RetainedSeed> {
         if self.retained.is_empty() {
@@ -128,12 +149,21 @@ impl Corpus {
     }
 }
 
+fn map_system(system: SystemKind) -> ConcurrencySystem {
+    match system {
+        SystemKind::WaitPortTimer => ConcurrencySystem::WaitPortTimer,
+        SystemKind::FutexFault => ConcurrencySystem::FutexFault,
+        SystemKind::ChannelHandle => ConcurrencySystem::ChannelHandle,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
     use super::*;
     use crate::seed::ConcurrentSeed;
+    use axle_conformance::contracts::{ConcurrencyHookClass, ConcurrencyStateProjection};
 
     #[test]
     fn corpus_keeps_new_state_signature_even_without_new_edges() {
@@ -177,5 +207,35 @@ mod tests {
 
         let parent = corpus.pick_parent(0).unwrap();
         assert!(parent.predicted_score >= corpus.retained()[0].predicted_score);
+    }
+
+    #[test]
+    fn contract_observations_aggregate_retained_seed_hits() {
+        let temp = tempdir().unwrap();
+        let mut corpus = Corpus::new();
+        let seed = ConcurrentSeed::base_corpus(32).remove(0);
+        let mut obs = RunObservation::default();
+        obs.edge_hits.insert("edge:a".into());
+        obs.hook_classes
+            .insert(ConcurrencyHookClass::SignalUpdatedBeforeWake);
+        obs.state_signatures.insert(1);
+        obs.state_projections
+            .insert(ConcurrencyStateProjection::WaitPortTimerPortQueue);
+        obs.failure_kind = Some("hang.wait_port_timer".into());
+        assert!(corpus.consider(temp.path(), seed, obs).unwrap());
+
+        let observations = corpus.contract_observations();
+        let system = observations.get(&ConcurrencySystem::WaitPortTimer).unwrap();
+        assert!(
+            system
+                .hook_classes
+                .contains(&ConcurrencyHookClass::SignalUpdatedBeforeWake)
+        );
+        assert!(
+            system
+                .state_projections
+                .contains(&ConcurrencyStateProjection::WaitPortTimerPortQueue)
+        );
+        assert!(system.failure_kinds.contains("hang.wait_port_timer"));
     }
 }

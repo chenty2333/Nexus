@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 
+use axle_conformance::contracts::{ConcurrencyHookClass, ConcurrencyStateProjection};
 use axle_core::{
     FakeClock, ObserverRegistry, PacketKind, Port, PortError, Signals, Time, TimerId, TimerService,
     WaitAsyncOptions, WaitAsyncRegistration, WaitAsyncTimestamp, WaitOne, wait_one,
@@ -20,8 +21,12 @@ const PORT_OBSERVER_ID: u64 = 1;
 pub struct RunObservation {
     /// Semantic edge/block coverage hits.
     pub edge_hits: BTreeSet<String>,
+    /// Stable semantic hook classes reached during replay.
+    pub hook_classes: BTreeSet<ConcurrencyHookClass>,
     /// Abstract state signatures reached during replay.
     pub state_signatures: BTreeSet<u64>,
+    /// Stable abstract state projections reached during replay.
+    pub state_projections: BTreeSet<ConcurrencyStateProjection>,
     /// Failure kind for invariant failure or hang.
     pub failure_kind: Option<String>,
     /// Human-readable event log for replay/debugging.
@@ -166,6 +171,7 @@ impl HookRuntime {
         observation
             .edge_hits
             .insert(format!("hook:{hook:?}:actor:{actor:?}"));
+        observation.hook_classes.insert(map_hook_class(hook));
         observation
             .events
             .push(format!("actor={actor:?} hook={hook:?}"));
@@ -207,6 +213,24 @@ impl HookRuntime {
         let prefer = self.prefer_other_once;
         self.prefer_other_once = false;
         prefer
+    }
+}
+
+const fn map_hook_class(hook: HookId) -> ConcurrencyHookClass {
+    match hook {
+        HookId::WaiterLinked => ConcurrencyHookClass::WaiterLinked,
+        HookId::SignalUpdatedBeforeWake => ConcurrencyHookClass::SignalUpdatedBeforeWake,
+        HookId::PortReserveExhausted => ConcurrencyHookClass::PortReserveExhausted,
+        HookId::TimerBeforeFire => ConcurrencyHookClass::TimerBeforeFire,
+        HookId::FutexRequeueBeforeMove => ConcurrencyHookClass::FutexRequeueBeforeMove,
+        HookId::FutexRequeueAfterMove => ConcurrencyHookClass::FutexRequeueAfterMove,
+        HookId::FaultLeaderClaimed => ConcurrencyHookClass::FaultLeaderClaimed,
+        HookId::FaultHeavyPrepareBeforeCommit => {
+            ConcurrencyHookClass::FaultHeavyPrepareBeforeCommit
+        }
+        HookId::FaultTxBeforeCommit => ConcurrencyHookClass::FaultTxBeforeCommit,
+        HookId::ChannelCloseBeforeReadDrain => ConcurrencyHookClass::ChannelCloseBeforeReadDrain,
+        HookId::HandleReplaceBeforePublish => ConcurrencyHookClass::HandleReplaceBeforePublish,
     }
 }
 
@@ -753,6 +777,27 @@ impl<'a> WaitPortTimerRunner<'a> {
             .filter_map(|timer| self.timers.is_signaled(*timer).ok())
             .filter(|signaled| *signaled)
             .count();
+        if blocked_count != 0 {
+            self.observation
+                .state_projections
+                .insert(ConcurrencyStateProjection::WaitPortTimerBlockedWaiters);
+        }
+        if !self.port.is_empty() || !self.port.signals().is_empty() || self.async_registrations != 0
+        {
+            self.observation
+                .state_projections
+                .insert(ConcurrencyStateProjection::WaitPortTimerPortQueue);
+        }
+        if timer_signaled != 0 {
+            self.observation
+                .state_projections
+                .insert(ConcurrencyStateProjection::WaitPortTimerTimerSignals);
+        }
+        if signal_summary != 0 {
+            self.observation
+                .state_projections
+                .insert(ConcurrencyStateProjection::WaitPortTimerObjectSignals);
+        }
         let state = (
             blocked_count,
             blocked_signal,
@@ -1229,6 +1274,22 @@ impl<'a> FutexFaultRunner<'a> {
             .keys()
             .filter(|key| self.futex.owner(**key) != ZX_KOID_INVALID)
             .count();
+        if blocked_futex != 0 || futex_hist.iter().any(|count| *count != 0) {
+            self.observation
+                .state_projections
+                .insert(ConcurrencyStateProjection::FutexFaultWaitQueues);
+        }
+        if blocked_fault != 0 || fault_waiters != 0 || fault_leaders != 0 || !self.faults.is_empty()
+        {
+            self.observation
+                .state_projections
+                .insert(ConcurrencyStateProjection::FutexFaultInflightShape);
+        }
+        if owners != 0 {
+            self.observation
+                .state_projections
+                .insert(ConcurrencyStateProjection::FutexFaultOwnership);
+        }
         let state = (
             blocked_futex,
             blocked_fault,
@@ -1649,6 +1710,31 @@ impl<'a> ChannelHandleRunner<'a> {
             .iter()
             .map(|slot| slot.map(|state| state.endpoint).unwrap_or(usize::MAX))
             .collect::<Vec<_>>();
+        if blocked_readable != 0 || blocked_peer_closed != 0 {
+            self.observation
+                .state_projections
+                .insert(ConcurrencyStateProjection::ChannelHandleWaiters);
+        }
+        if self
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.incoming_messages != 0 || endpoint.peer_closed)
+        {
+            self.observation
+                .state_projections
+                .insert(ConcurrencyStateProjection::ChannelHandleEndpoints);
+        }
+        if live_slots != 2
+            || self
+                .handles
+                .iter()
+                .enumerate()
+                .any(|(idx, slot)| !matches!(slot, Some(state) if state.endpoint == idx))
+        {
+            self.observation
+                .state_projections
+                .insert(ConcurrencyStateProjection::ChannelHandleHandleTable);
+        }
         let state = (
             blocked_readable,
             blocked_peer_closed,
@@ -1677,7 +1763,9 @@ mod tests {
         let seed = ConcurrentSeed::base_corpus(32).remove(0);
         let observation = run_seed(&seed);
         assert!(!observation.edge_hits.is_empty());
+        assert!(!observation.hook_classes.is_empty());
         assert!(!observation.state_signatures.is_empty());
+        assert!(!observation.state_projections.is_empty());
     }
 
     #[test]
@@ -1685,7 +1773,9 @@ mod tests {
         let seed = ConcurrentSeed::base_corpus(32).remove(3);
         let observation = run_seed(&seed);
         assert!(!observation.edge_hits.is_empty());
+        assert!(!observation.hook_classes.is_empty());
         assert!(!observation.state_signatures.is_empty());
+        assert!(!observation.state_projections.is_empty());
     }
 
     #[test]
@@ -1693,6 +1783,8 @@ mod tests {
         let seed = ConcurrentSeed::base_corpus(32).remove(4);
         let observation = run_seed(&seed);
         assert!(!observation.edge_hits.is_empty());
+        assert!(!observation.hook_classes.is_empty());
         assert!(!observation.state_signatures.is_empty());
+        assert!(!observation.state_projections.is_empty());
     }
 }

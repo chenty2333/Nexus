@@ -8,6 +8,7 @@ use axle_concurrency::corpus::Corpus;
 use axle_concurrency::model::run_seed;
 use axle_concurrency::qemu::replay_seed_via_qemu;
 use axle_concurrency::seed::ConcurrentSeed;
+use axle_conformance::contracts::{build_concurrency_coverage_report, load_contract_catalog};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -153,6 +154,47 @@ fn smoke(iterations: usize, max_steps: u16, out_dir: Option<PathBuf>) -> Result<
             seed.path.display()
         );
     }
+
+    let catalog = load_contract_catalog(&contracts_file())?;
+    let contract_report =
+        build_concurrency_coverage_report(&catalog, &corpus.contract_observations());
+    let report_path = out_dir.join("contract-coverage.json");
+    fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
+    fs::write(&report_path, serde_json::to_vec_pretty(&contract_report)?)
+        .with_context(|| format!("write {}", report_path.display()))?;
+    println!(
+        "concurrency-contracts: seeded={} covered={} missing_hooks={} missing_states={} missing_failures={} report={}",
+        contract_report.total_seeded_contracts,
+        contract_report.covered_seeded_contracts,
+        contract_report.uncovered_hooks.len(),
+        contract_report.uncovered_states.len(),
+        contract_report.uncovered_failures.len(),
+        report_path.display()
+    );
+    for gap in &contract_report.uncovered_hooks {
+        println!(
+            "uncovered-concurrency-hook: contract={} system={} hook={}",
+            gap.contract_id,
+            gap.system.as_str(),
+            gap.hook_class.as_str()
+        );
+    }
+    for gap in &contract_report.uncovered_states {
+        println!(
+            "uncovered-concurrency-state: contract={} system={} state={}",
+            gap.contract_id,
+            gap.system.as_str(),
+            gap.state_projection.as_str()
+        );
+    }
+    for gap in &contract_report.uncovered_failures {
+        println!(
+            "uncovered-concurrency-failure: contract={} system={} failure={}",
+            gap.contract_id,
+            gap.system.as_str(),
+            gap.failure_kind
+        );
+    }
     Ok(())
 }
 
@@ -258,4 +300,11 @@ fn default_host_corpus_dir() -> PathBuf {
         .join("target")
         .join("axle-concurrency")
         .join("host-corpus")
+}
+
+fn contracts_file() -> PathBuf {
+    workspace_root()
+        .join("specs")
+        .join("conformance")
+        .join("contracts.toml")
 }

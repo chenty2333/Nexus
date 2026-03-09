@@ -34,6 +34,9 @@ schema_version = 1
 id = "must.sample.pass"
 level = "must"
 description = "sample contract"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "sample runner fixture"
 "#,
     );
 

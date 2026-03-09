@@ -4,61 +4,106 @@ schema_version = 1
 id = "must.syscall.bad_syscall_returns_bad_syscall"
 level = "must"
 description = "Unknown syscall number must return ZX_ERR_BAD_SYSCALL"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "syscall surface contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "must.handle.close_double_returns_bad_handle"
 level = "must"
 description = "Closing the same handle twice must return ZX_ERR_BAD_HANDLE on second close"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "handle ABI surface contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "must.port.wait_bad_handle_returns_bad_handle"
 level = "must"
 description = "zx_port_wait with invalid handle must return ZX_ERR_BAD_HANDLE"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "invalid-handle syscall surface contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "must.port.wait_empty_returns_should_wait"
 level = "must"
 description = "zx_port_wait on empty valid port must return ZX_ERR_SHOULD_WAIT"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "single-threaded syscall surface contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "must.port.queue_wait_roundtrip_ok"
 level = "must"
 description = "zx_port_queue + zx_port_wait must roundtrip packet data"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "user-packet roundtrip contract; the concurrent harness models signal-packet traffic only"
 
 [[contracts]]
 id = "must.timer.set_cancel_ok"
 level = "must"
 description = "zx_timer_set and zx_timer_cancel must return ZX_OK for valid timer handle"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "syscall return-code contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "must.smp.ipi_ack_fixed_vector"
 level = "must"
 description = "BSP must be able to deliver a fixed-vector IPI to an AP (ack observed)"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "SMP arch contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "must.wait_async.timestamp_and_option_semantics"
 level = "must"
 description = "wait_async must reject invalid timestamp option combinations and emit non-zero timestamps when requested"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "timestamp-option validation is a syscall/API contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "must.wait_async.edge_requires_transition"
 level = "must"
 description = "EDGE wait_async must not fire for an already-satisfied object until a false->true transition occurs"
+[contracts.concurrency]
+mode = "seeded"
+system = "wait_port_timer"
+hook_classes = ["waiter_linked", "signal_updated_before_wake"]
+state_projections = ["wait_port_timer_blocked_waiters", "wait_port_timer_object_signals"]
+expected_failure_kinds = ["hang.wait_port_timer", "hang.step_budget"]
 
 [[contracts]]
 id = "must.port.kernel_reserve_allows_signal_delivery"
 level = "must"
 description = "A user-filled port must still admit kernel-generated signal packets through the reserved region"
+[contracts.concurrency]
+mode = "seeded"
+system = "wait_port_timer"
+hook_classes = ["waiter_linked", "port_reserve_exhausted", "signal_updated_before_wake"]
+state_projections = ["wait_port_timer_port_queue", "wait_port_timer_object_signals"]
+expected_failure_kinds = ["invariant.port_overflow", "hang.wait_port_timer"]
 
 [[contracts]]
 id = "must.port.pending_merge_flushes_signal"
 level = "must"
 description = "Kernel-generated signal packets must merge while pending on a full port and flush once space is available"
+[contracts.concurrency]
+mode = "seeded"
+system = "wait_port_timer"
+hook_classes = ["waiter_linked", "signal_updated_before_wake", "port_reserve_exhausted"]
+state_projections = ["wait_port_timer_port_queue", "wait_port_timer_object_signals"]
+expected_failure_kinds = ["invariant.port_overflow", "hang.wait_port_timer"]
 
 [[contracts]]
 id = "must.port.readable_writable_bootstrap"
 level = "must"
 description = "Bootstrap ports must start WRITABLE, become READABLE after one queued packet, and report stable observed signal masks"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "bootstrap port signal-state contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "should.vmo.create_bootstrap_anonymous"
@@ -69,21 +114,39 @@ description = "zx_vmo_create must reject bad bootstrap arguments and return a no
 id = "must.vmar.map_protect_unmap_bootstrap"
 level = "must"
 description = "Root-VMAR bootstrap map/protect/unmap must commit an explicit anonymous mapping lifecycle with stable error codes and post-return visibility for the calling thread"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "VMAR syscall and TLB visibility contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "must.channel.create_write_read_bootstrap"
 level = "must"
 description = "Bootstrap channel create/write/read must preserve FIFO byte payloads and readable signaling"
+[contracts.concurrency]
+mode = "seeded"
+system = "channel_handle"
+hook_classes = ["waiter_linked"]
+state_projections = ["channel_handle_waiters", "channel_handle_endpoints"]
+expected_failure_kinds = ["hang.channel_handle", "budget_exhausted.channel_handle"]
 
 [[contracts]]
 id = "must.channel.peer_closed_bootstrap"
 level = "must"
 description = "Closing one bootstrap channel endpoint must immediately expose PEER_CLOSED on the peer and reject further writes"
+[contracts.concurrency]
+mode = "seeded"
+system = "channel_handle"
+hook_classes = ["waiter_linked", "channel_close_before_read_drain"]
+state_projections = ["channel_handle_waiters", "channel_handle_endpoints"]
+expected_failure_kinds = ["hang.channel_handle", "budget_exhausted.channel_handle"]
 
 [[contracts]]
 id = "must.channel.page_loan_snapshot_bootstrap"
 level = "must"
 description = "Page-aligned bootstrap channel writes must preserve the send-time snapshot even if the sender mutates its mapping before the peer reads"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "page-loan snapshot contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "should.channel.page_loan_remap_fill_cow_bootstrap"
@@ -99,16 +162,28 @@ description = "Bootstrap full-page loan writes should respect the in-flight loan
 id = "must.channel.close_read_order_bootstrap"
 level = "must"
 description = "Bootstrap channel reads must drain queued messages before surfacing PEER_CLOSED-only state, and READABLE may coexist with PEER_CLOSED"
+[contracts.concurrency]
+mode = "seeded"
+system = "channel_handle"
+hook_classes = ["channel_close_before_read_drain", "waiter_linked"]
+state_projections = ["channel_handle_waiters", "channel_handle_endpoints"]
+expected_failure_kinds = ["hang.channel_handle", "budget_exhausted.channel_handle"]
 
 [[contracts]]
 id = "must.channel.writable_recovery_bootstrap"
 level = "must"
 description = "Bootstrap channel WRITABLE must clear on full peer queues, recover after reads, and stay cleared once the peer closes"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "channel backpressure/writable contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "must.channel.handle_transfer_bootstrap"
 level = "must"
 description = "Bootstrap channel write/read must move transferred handles, invalidate the sender copy, and make the received handle immediately usable"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "handle-transfer contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
 id = "should.eventpair.signal_peer_bootstrap"
@@ -199,6 +274,12 @@ description = "An infinite wait_one on a timer should block through trap-exit an
 id = "must.vm.same_page_fault_contention_bootstrap"
 level = "must"
 description = "Bootstrap same-page faults must serialize so only one leader materializes the page while local and shared contenders block and resume"
+[contracts.concurrency]
+mode = "seeded"
+system = "futex_fault"
+hook_classes = ["fault_leader_claimed", "fault_heavy_prepare_before_commit", "fault_tx_before_commit"]
+state_projections = ["futex_fault_inflight_shape"]
+expected_failure_kinds = ["hang.futex_fault", "hang.step_budget", "invariant.futex_waiter_lost"]
 
 [[contracts]]
 id = "should.vmo.read_write_resize_bootstrap"
