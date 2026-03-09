@@ -199,6 +199,43 @@ pub(crate) fn telemetry_snapshot() -> CopyTelemetrySnapshot {
     TELEMETRY.lock().snapshot
 }
 
+fn probe_user_bytes(ptr: u64, len: usize) -> Result<(), zx_status_t> {
+    if len == 0 {
+        return Ok(());
+    }
+    if ptr == 0 || !crate::userspace::validate_user_ptr(ptr, len) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    Ok(())
+}
+
+pub(crate) fn probe_write_value<T>(ptr: *mut T) -> Result<(), zx_status_t> {
+    probe_user_bytes(ptr as u64, size_of::<T>())
+}
+
+pub(crate) fn probe_read_bytes(ptr: *const u8, len: usize) -> Result<(), zx_status_t> {
+    probe_user_bytes(ptr as u64, len)
+}
+
+pub(crate) fn probe_resident_write_bytes(ptr: *mut u8, len: usize) -> Result<(), zx_status_t> {
+    if len == 0 {
+        return Ok(());
+    }
+    let ctx = UserCopyCtx::current()?;
+    ctx.validate_write(ptr as u64, len)?;
+    Ok(())
+}
+
+pub(crate) fn probe_write_handles(ptr: *mut zx_handle_t, len: usize) -> Result<(), zx_status_t> {
+    if len == 0 {
+        return Ok(());
+    }
+    let byte_len = len
+        .checked_mul(size_of::<zx_handle_t>())
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    probe_resident_write_bytes(ptr.cast::<u8>(), byte_len)
+}
+
 pub(crate) fn copyin_value<T: Copy>(ptr: *const T) -> Result<T, zx_status_t> {
     if ptr.is_null() {
         return Err(ZX_ERR_INVALID_ARGS);
