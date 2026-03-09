@@ -6,7 +6,7 @@ impl KernelState {
         object_id: u64,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
-        let cap = Capability::new(object_id, rights.bits(), DEFAULT_OBJECT_GENERATION);
+        let cap = self.capability_for_object(object_id, rights);
         let handle = self.with_core_mut(|kernel| kernel.alloc_handle_for_current_process(cap))?;
         self.with_registry_mut(|registry| {
             registry

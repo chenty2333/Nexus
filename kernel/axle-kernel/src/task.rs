@@ -55,7 +55,6 @@ pub(crate) use fault::{FaultInFlightKey, FaultTable};
 
 const CSPACE_MAX_SLOTS: u16 = 16_384;
 const CSPACE_QUARANTINE_LEN: usize = 256;
-const MAX_TRACKED_TLB_CPUS: usize = 64;
 const DEFAULT_MAX_INFLIGHT_LOAN_PAGES: Option<u64> = Some(32);
 const DEFAULT_MAX_PRIVATE_COW_PAGES: Option<u64> = None;
 const FAULT_WAIT_SPIN_LOOPS: usize = 256;
@@ -2133,12 +2132,113 @@ impl ResolvedHandle {
     }
 }
 
+const TLB_CPU_TRACKER_CAPACITY: usize = u64::BITS as usize;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TrackedTlbCpuSet {
+    mask: u64,
+}
+
+impl TrackedTlbCpuSet {
+    fn insert(&mut self, cpu_id: usize) {
+        if cpu_id < TLB_CPU_TRACKER_CAPACITY {
+            self.mask |= 1_u64 << cpu_id;
+        }
+    }
+
+    fn remove(&mut self, cpu_id: usize) {
+        if cpu_id < TLB_CPU_TRACKER_CAPACITY {
+            self.mask &= !(1_u64 << cpu_id);
+        }
+    }
+
+    fn contains(&self, cpu_id: usize) -> bool {
+        cpu_id < TLB_CPU_TRACKER_CAPACITY && (self.mask & (1_u64 << cpu_id)) != 0
+    }
+
+    fn iter(self) -> impl Iterator<Item = usize> {
+        (0..TLB_CPU_TRACKER_CAPACITY).filter(move |&cpu_id| self.contains(cpu_id))
+    }
+}
+
+#[derive(Debug)]
+struct TlbCpuTracker {
+    active: TrackedTlbCpuSet,
+    observed_epoch: [u64; TLB_CPU_TRACKER_CAPACITY],
+}
+
+impl Default for TlbCpuTracker {
+    fn default() -> Self {
+        Self {
+            active: TrackedTlbCpuSet::default(),
+            observed_epoch: [0; TLB_CPU_TRACKER_CAPACITY],
+        }
+    }
+}
+
+impl TlbCpuTracker {
+    fn note_active(&mut self, cpu_id: usize) {
+        self.active.insert(cpu_id);
+    }
+
+    fn note_inactive(&mut self, cpu_id: usize) {
+        self.active.remove(cpu_id);
+    }
+
+    #[allow(dead_code)]
+    fn is_active(&self, cpu_id: usize) -> bool {
+        self.active.contains(cpu_id)
+    }
+
+    fn note_observed_epoch(&mut self, cpu_id: usize, epoch: u64) {
+        if cpu_id < TLB_CPU_TRACKER_CAPACITY {
+            self.observed_epoch[cpu_id] = epoch;
+        }
+    }
+
+    fn observed_epoch(&self, cpu_id: usize) -> u64 {
+        if cpu_id < TLB_CPU_TRACKER_CAPACITY {
+            self.observed_epoch[cpu_id]
+        } else {
+            0
+        }
+    }
+
+    fn plan_strict_sync(
+        &mut self,
+        current_cpu_id: usize,
+        current_cpu_active: bool,
+        target_epoch: u64,
+    ) -> TlbCpuSyncShape {
+        if current_cpu_active {
+            self.note_active(current_cpu_id);
+        }
+        let local_needs_flush =
+            current_cpu_active && self.observed_epoch(current_cpu_id) < target_epoch;
+        let remote_cpus = self
+            .active
+            .iter()
+            .filter(|&cpu_id| cpu_id != current_cpu_id)
+            .filter(|&cpu_id| self.observed_epoch(cpu_id) < target_epoch)
+            .collect();
+        TlbCpuSyncShape {
+            local_needs_flush,
+            remote_cpus,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TlbCpuSyncShape {
+    local_needs_flush: bool,
+    remote_cpus: Vec<usize>,
+}
+
 #[derive(Debug)]
 struct AddressSpace {
     vm: VmAddressSpace,
     page_tables: crate::page_table::UserPageTables,
-    active_cpu_mask: u64,
-    observed_tlb_epoch: [u64; MAX_TRACKED_TLB_CPUS],
+    tlb_cpus: TlbCpuTracker,
     vm_resources: VmResourceState,
 }
 
@@ -2254,8 +2354,7 @@ impl AddressSpace {
         Self {
             vm,
             page_tables,
-            active_cpu_mask: 0,
-            observed_tlb_epoch: [0; MAX_TRACKED_TLB_CPUS],
+            tlb_cpus: TlbCpuTracker::default(),
             vm_resources: VmResourceState::new(),
         }
     }
@@ -2349,38 +2448,34 @@ impl AddressSpace {
     }
 
     fn note_cpu_active(&mut self, cpu_id: usize) {
-        if cpu_id < u64::BITS as usize {
-            self.active_cpu_mask |= 1_u64 << cpu_id;
-        }
+        self.tlb_cpus.note_active(cpu_id);
     }
 
     fn note_cpu_inactive(&mut self, cpu_id: usize) {
-        if cpu_id < u64::BITS as usize {
-            self.active_cpu_mask &= !(1_u64 << cpu_id);
-        }
+        self.tlb_cpus.note_inactive(cpu_id);
     }
 
     #[allow(dead_code)]
     fn is_cpu_active(&self, cpu_id: usize) -> bool {
-        cpu_id < u64::BITS as usize && (self.active_cpu_mask & (1_u64 << cpu_id)) != 0
-    }
-
-    fn active_cpu_mask(&self) -> u64 {
-        self.active_cpu_mask
+        self.tlb_cpus.is_active(cpu_id)
     }
 
     fn observe_tlb_epoch(&mut self, cpu_id: usize, epoch: u64) {
-        if cpu_id < MAX_TRACKED_TLB_CPUS {
-            self.observed_tlb_epoch[cpu_id] = epoch;
-        }
+        self.tlb_cpus.note_observed_epoch(cpu_id, epoch);
     }
 
     fn observed_tlb_epoch(&self, cpu_id: usize) -> u64 {
-        if cpu_id < MAX_TRACKED_TLB_CPUS {
-            self.observed_tlb_epoch[cpu_id]
-        } else {
-            0
-        }
+        self.tlb_cpus.observed_epoch(cpu_id)
+    }
+
+    fn plan_tlb_sync(
+        &mut self,
+        current_cpu_id: usize,
+        current_cpu_active: bool,
+    ) -> TlbCpuSyncShape {
+        let target_epoch = self.current_invalidate_epoch();
+        self.tlb_cpus
+            .plan_strict_sync(current_cpu_id, current_cpu_active, target_epoch)
     }
 
     fn create_anonymous_vmo(
@@ -2830,23 +2925,9 @@ impl VmDomain {
             .address_spaces
             .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        if current_cpu_active {
-            address_space.note_cpu_active(current_cpu_id);
-        }
         let target_epoch = address_space.current_invalidate_epoch();
-        let local_needs_flush =
-            current_cpu_active && address_space.observed_tlb_epoch(current_cpu_id) < target_epoch;
-        let mut remote_cpus = Vec::new();
-        let active_cpu_mask = address_space.active_cpu_mask();
-        for cpu_id in 0..u64::BITS as usize {
-            if cpu_id == current_cpu_id || (active_cpu_mask & (1_u64 << cpu_id)) == 0 {
-                continue;
-            }
-            if address_space.observed_tlb_epoch(cpu_id) < target_epoch {
-                remote_cpus.push(cpu_id);
-            }
-        }
-        if !local_needs_flush && remote_cpus.is_empty() {
+        let sync_shape = address_space.plan_tlb_sync(current_cpu_id, current_cpu_active);
+        if !sync_shape.local_needs_flush && sync_shape.remote_cpus.is_empty() {
             return Ok(None);
         }
         Ok(Some(StrictTlbSyncPlan {
@@ -2854,8 +2935,8 @@ impl VmDomain {
             target_epoch,
             current_cpu_id,
             current_cpu_active,
-            local_needs_flush,
-            remote_cpus,
+            local_needs_flush: sync_shape.local_needs_flush,
+            remote_cpus: sync_shape.remote_cpus,
         }))
     }
 
@@ -4845,8 +4926,7 @@ impl VmDomain {
             .map_err(map_address_space_error)?,
             page_tables: crate::page_table::UserPageTables::clone_current_kernel_template()
                 .map_err(map_page_table_error)?,
-            active_cpu_mask: 0,
-            observed_tlb_epoch: [0; MAX_TRACKED_TLB_CPUS],
+            tlb_cpus: TlbCpuTracker::default(),
             vm_resources: VmResourceState::new(),
         };
         debug_assert!(

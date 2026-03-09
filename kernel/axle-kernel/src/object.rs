@@ -41,7 +41,6 @@ const PORT_CAPACITY: usize = 64;
 const PORT_KERNEL_RESERVE: usize = 16;
 const CHANNEL_CAPACITY: usize = 64;
 const SOCKET_STREAM_CAPACITY: usize = 4096;
-const DEFAULT_OBJECT_GENERATION: u32 = 0;
 const BOOTSTRAP_REACTOR_CPU_COUNT: usize = 16;
 
 pub(crate) enum TrapBlock<T> {
@@ -494,10 +493,43 @@ const USER_SIGNAL_MASK: Signals = Signals::USER_SIGNAL_0
     .union(Signals::USER_SIGNAL_7);
 
 #[derive(Debug)]
+struct ObjectIdentityAllocator {
+    next_object_id: u64,
+}
+
+impl ObjectIdentityAllocator {
+    const NON_REUSED_OBJECT_GENERATION: u32 = 0;
+
+    fn new() -> Self {
+        Self { next_object_id: 1 }
+    }
+
+    fn alloc(&mut self) -> u64 {
+        let id = self.next_object_id;
+        self.next_object_id = self.next_object_id.wrapping_add(1);
+        id
+    }
+
+    fn capability_for_object(&self, object_id: u64, rights: u32) -> Capability {
+        Capability::new(
+            object_id,
+            rights,
+            Self::generation_for_allocated_object(object_id),
+        )
+    }
+
+    const fn generation_for_allocated_object(_object_id: u64) -> u32 {
+        // Current contract: object ids are monotonic and never recycled, so the
+        // capability generation field stays at zero until reuse semantics exist.
+        Self::NON_REUSED_OBJECT_GENERATION
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct ObjectRegistry {
     pub(crate) objects: BTreeMap<u64, KernelObject>,
     object_handle_refs: BTreeMap<u64, usize>,
-    next_object_id: u64,
+    identities: ObjectIdentityAllocator,
     timer_object_ids: BTreeMap<TimerId, u64>,
     bootstrap_self_process_handle: zx_handle_t,
     bootstrap_root_vmar_handle: zx_handle_t,
@@ -511,7 +543,7 @@ impl ObjectRegistry {
         Self {
             objects: BTreeMap::new(),
             object_handle_refs: BTreeMap::new(),
-            next_object_id: 1,
+            identities: ObjectIdentityAllocator::new(),
             timer_object_ids: BTreeMap::new(),
             bootstrap_self_process_handle: 0,
             bootstrap_root_vmar_handle: 0,
@@ -704,9 +736,19 @@ impl KernelState {
 
     fn alloc_object_id(&self) -> u64 {
         let mut registry = self.registry.lock();
-        let id = registry.next_object_id;
-        registry.next_object_id = registry.next_object_id.wrapping_add(1);
-        id
+        registry.identities.alloc()
+    }
+
+    fn capability_for_object(
+        &self,
+        object_id: u64,
+        rights: crate::task::HandleRights,
+    ) -> Capability {
+        let registry = self.registry.lock();
+        debug_assert!(registry.objects.contains_key(&object_id));
+        registry
+            .identities
+            .capability_for_object(object_id, rights.bits())
     }
 
     fn note_timer_object(&self, timer_id: TimerId, object_id: u64) {
