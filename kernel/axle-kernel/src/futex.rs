@@ -27,6 +27,8 @@ pub(crate) struct WakeResult {
 pub(crate) struct RequeueResult {
     /// Waiters woken in FIFO order from the source queue.
     pub(crate) woken: Vec<u64>,
+    /// Waiters moved in FIFO order to the target queue.
+    pub(crate) requeued_waiters: Vec<u64>,
     /// Number of waiters moved to the target queue.
     pub(crate) requeued: usize,
     /// Remaining waiter count on the source queue.
@@ -133,6 +135,7 @@ impl FutexTable {
         if source == target {
             let wake = self.wake(source, wake_count, target_owner_koid, false);
             return RequeueResult {
+                requeued_waiters: Vec::new(),
                 requeued: 0,
                 source_remaining: wake.remaining,
                 target_remaining: wake.remaining,
@@ -155,6 +158,7 @@ impl FutexTable {
                     break;
                 };
                 moved.push_back(thread_id);
+                result.requeued_waiters.push(thread_id);
                 result.requeued += 1;
             }
             source_queue.owner_koid = ZX_KOID_INVALID;
@@ -223,12 +227,14 @@ mod tests {
 
         let RequeueResult {
             woken,
+            requeued_waiters,
             requeued,
             source_remaining,
             target_remaining,
         } = table.requeue(source, target, 1, 2, 88);
 
         assert_eq!(woken, alloc::vec![1]);
+        assert_eq!(requeued_waiters, alloc::vec![2, 3]);
         assert_eq!(requeued, 2);
         assert_eq!(source_remaining, 0);
         assert_eq!(target_remaining, 2);
@@ -268,12 +274,14 @@ mod tests {
 
         let RequeueResult {
             woken,
+            requeued_waiters,
             requeued,
             source_remaining,
             target_remaining,
         } = table.requeue(source, target, 0, 0, 55);
 
         assert!(woken.is_empty());
+        assert!(requeued_waiters.is_empty());
         assert_eq!(requeued, 0);
         assert_eq!(source_remaining, 0);
         assert_eq!(target_remaining, 0);

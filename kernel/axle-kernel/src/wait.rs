@@ -15,12 +15,6 @@ use axle_types::{zx_handle_t, zx_port_packet_t, zx_signals_t, zx_status_t};
 use crate::object::{self, KernelObject};
 use crate::port_queue::port_packet_from_core;
 
-enum WaitOutcome {
-    Ready,
-    Blocked,
-    Pending,
-}
-
 /// Queue a user packet into a port.
 pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Result<(), zx_status_t> {
     if packet.type_ != ZX_PKT_TYPE_USER {
@@ -96,53 +90,99 @@ pub fn port_wait(
     deadline: i64,
     out_ptr: *mut zx_port_packet_t,
 ) -> Result<(), zx_status_t> {
-    loop {
-        match wait_port_packet(handle) {
-            Ok(pkt) => {
-                object::with_state_mut(|state| {
-                    let thread_id = state
-                        .with_kernel(|kernel| kernel.current_thread_info())?
-                        .thread_id();
-                    state.with_kernel_mut(|kernel| {
-                        kernel.copyout_thread_user(thread_id, out_ptr, pkt)
-                    })
+    object::with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let object_id = resolved.object_id();
+        let thread_id = state
+            .with_kernel(|kernel| kernel.current_thread_info())?
+            .thread_id();
+        let packet = {
+            let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let port = match obj {
+                KernelObject::Port(port) => port,
+                KernelObject::Process(_)
+                | KernelObject::SuspendToken(_)
+                | KernelObject::Socket(_)
+                | KernelObject::Channel(_)
+                | KernelObject::EventPair(_)
+                | KernelObject::Timer(_)
+                | KernelObject::Thread(_)
+                | KernelObject::Vmo(_)
+                | KernelObject::Vmar(_) => {
+                    return Err(ZX_ERR_WRONG_TYPE);
+                }
+            };
+            object::require_handle_rights(resolved, crate::task::HandleRights::READ)?;
+            port.pop()
+        };
+
+        match packet {
+            Ok(packet) => {
+                let packet = port_packet_from_core(packet);
+                state.with_kernel_mut(|kernel| {
+                    kernel.copyout_thread_user(thread_id, out_ptr, packet)
                 })?;
-                return Ok(());
+                let _ = notify_waitable_signals_changed(state, object_id);
+                Ok(())
             }
-            Err(ZX_ERR_SHOULD_WAIT) => {
+            Err(PortError::ShouldWait) => {
                 if deadline == 0 {
                     return Err(ZX_ERR_SHOULD_WAIT);
                 }
-                let outcome = object::with_state_mut(|state| {
-                    let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
-                    let object_id = resolved.object_id();
-                    if deadline == i64::MAX {
-                        state.with_kernel_mut(|kernel| {
-                            kernel.block_current(crate::task::WaitRegistration::Port {
-                                port_object_id: object_id,
-                                packet_ptr: out_ptr,
-                            })
-                        })?;
-                        return Ok(WaitOutcome::Blocked);
+                object::require_handle_rights(resolved, crate::task::HandleRights::WAIT)?;
+                let deadline = if deadline == i64::MAX {
+                    None
+                } else {
+                    let now = crate::time::now_ns();
+                    if deadline <= now {
+                        let _ = on_tick_locked(state);
+                        let packet = {
+                            let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+                            let port = match obj {
+                                KernelObject::Port(port) => port,
+                                KernelObject::Process(_)
+                                | KernelObject::SuspendToken(_)
+                                | KernelObject::Socket(_)
+                                | KernelObject::Channel(_)
+                                | KernelObject::EventPair(_)
+                                | KernelObject::Timer(_)
+                                | KernelObject::Thread(_)
+                                | KernelObject::Vmo(_)
+                                | KernelObject::Vmar(_) => {
+                                    return Err(ZX_ERR_WRONG_TYPE);
+                                }
+                            };
+                            port.pop()
+                        };
+                        return match packet {
+                            Ok(packet) => {
+                                let packet = port_packet_from_core(packet);
+                                state.with_kernel_mut(|kernel| {
+                                    kernel.copyout_thread_user(thread_id, out_ptr, packet)
+                                })?;
+                                let _ = notify_waitable_signals_changed(state, object_id);
+                                Ok(())
+                            }
+                            Err(PortError::ShouldWait) => Err(ZX_ERR_TIMED_OUT),
+                            Err(err) => Err(object::map_port_error(err)),
+                        };
                     }
-                    Ok(WaitOutcome::Pending)
+                    Some(deadline)
+                };
+                state.with_kernel_mut(|kernel| {
+                    kernel.park_current(
+                        crate::task::WaitRegistration::Port {
+                            port_object_id: object_id,
+                            packet_ptr: out_ptr as u64,
+                        },
+                        deadline,
+                    )
                 })?;
-                match outcome {
-                    WaitOutcome::Blocked => return Ok(()),
-                    WaitOutcome::Ready => return Ok(()),
-                    WaitOutcome::Pending => {}
-                }
-                let now = crate::time::now_ns();
-                if deadline != i64::MAX && deadline <= now {
-                    return Err(ZX_ERR_TIMED_OUT);
-                }
-
-                x86_64::instructions::interrupts::enable_and_hlt();
-                x86_64::instructions::interrupts::disable();
+                Ok(())
             }
-            Err(e) => return Err(e),
+            Err(err) => Err(object::map_port_error(err)),
         }
-    }
+    })
 }
 
 /// Wait for one of the specified signals on a waitable object.
@@ -157,55 +197,25 @@ pub fn object_wait_one(
         return Err(ZX_ERR_INVALID_ARGS);
     }
 
-    loop {
-        let outcome = object::with_state_mut(|state| {
-            let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
-            let object_id = resolved.object_id();
-            let observed = object::signals_for_object_id(state, object_id)?;
-            if observed.intersects(watched) {
-                let thread_id = state
-                    .with_kernel(|kernel| kernel.current_thread_info())?
-                    .thread_id();
-                state.with_kernel_mut(|kernel| {
-                    kernel.copyout_thread_user(thread_id, observed_ptr, observed.bits())
-                })?;
-                return Ok(WaitOutcome::Ready);
-            }
-            if deadline == i64::MAX {
-                state.with_kernel_mut(|kernel| {
-                    kernel.block_current(crate::task::WaitRegistration::Signal {
-                        object_id,
-                        watched,
-                        observed_ptr,
-                    })
-                })?;
-                return Ok(WaitOutcome::Blocked);
-            }
-            Ok(WaitOutcome::Pending)
-        })?;
-        match outcome {
-            WaitOutcome::Ready | WaitOutcome::Blocked => return Ok(()),
-            WaitOutcome::Pending => {}
+    object::with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
+        let object_id = resolved.object_id();
+        let observed = object::signals_for_object_id(state, object_id)?;
+        let thread_id = state
+            .with_kernel(|kernel| kernel.current_thread_info())?
+            .thread_id();
+        if observed.intersects(watched) {
+            state.with_kernel_mut(|kernel| {
+                kernel.copyout_thread_user(thread_id, observed_ptr, observed.bits())
+            })?;
+            return Ok(());
         }
 
-        let now = crate::time::now_ns();
-        if deadline != i64::MAX && deadline <= now {
-            // Ensure we don't miss a timer that becomes due right at the timeout
-            // boundary (coarse periodic ticks can otherwise make this flaky).
-            on_tick();
-
-            let observed = object::with_state_mut(|state| {
-                let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
-                let object_id = resolved.object_id();
-                object::signals_for_object_id(state, object_id)
-            })?;
-            object::with_state_mut(|state| {
-                let thread_id = state
-                    .with_kernel(|kernel| kernel.current_thread_info())?
-                    .thread_id();
-                state.with_kernel_mut(|kernel| {
-                    kernel.copyout_thread_user(thread_id, observed_ptr, observed.bits())
-                })
+        if deadline != i64::MAX && deadline <= crate::time::now_ns() {
+            let _ = on_tick_locked(state);
+            let observed = object::signals_for_object_id(state, object_id)?;
+            state.with_kernel_mut(|kernel| {
+                kernel.copyout_thread_user(thread_id, observed_ptr, observed.bits())
             })?;
             if observed.intersects(watched) {
                 return Ok(());
@@ -213,9 +223,35 @@ pub fn object_wait_one(
             return Err(ZX_ERR_TIMED_OUT);
         }
 
-        x86_64::instructions::interrupts::enable_and_hlt();
-        x86_64::instructions::interrupts::disable();
+        let deadline = if deadline == i64::MAX {
+            None
+        } else {
+            Some(deadline)
+        };
+        state.with_kernel_mut(|kernel| {
+            kernel.park_current(
+                crate::task::WaitRegistration::Signal {
+                    object_id,
+                    watched,
+                    observed_ptr: observed_ptr as u64,
+                },
+                deadline,
+            )
+        })?;
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn sleep_until(deadline: i64) -> Result<(), zx_status_t> {
+    if deadline <= crate::time::now_ns() {
+        return Ok(());
     }
+    object::with_state_mut(|state| {
+        state.with_kernel_mut(|kernel| {
+            kernel.park_current(crate::task::WaitRegistration::Sleep, Some(deadline))
+        })
+    })
 }
 
 /// Register a one-shot async wait and deliver a signal packet into `port` when fired.
@@ -270,15 +306,18 @@ pub fn object_wait_async(
 ///
 /// Fires due timers and notifies `wait_async` observers.
 pub fn on_tick() {
-    let _ = object::with_state_mut(|state| {
-        let now = crate::time::now_ns();
-        let fired = poll_due_timers_at(state, now);
-        for fired_object_id in fired {
-            let _ = notify_waitable_signals_changed(state, fired_object_id);
-        }
-        let _ = state.with_kernel_mut(|kernel| kernel.sync_current_cpu_tlb_state());
-        Ok(())
-    });
+    let _ = object::with_state_mut(|state| on_tick_locked(state));
+}
+
+fn on_tick_locked(state: &mut object::KernelState) -> Result<(), zx_status_t> {
+    let now = crate::time::now_ns();
+    let fired = poll_due_timers_at(state, now);
+    for fired_object_id in fired {
+        let _ = notify_waitable_signals_changed(state, fired_object_id);
+    }
+    wake_expired_waits(state, now)?;
+    let _ = state.with_kernel_mut(|kernel| kernel.sync_current_cpu_tlb_state());
+    Ok(())
 }
 
 pub(crate) fn notify_waitable_signals_changed(
@@ -325,7 +364,12 @@ fn wake_signal_waiters(
             Err(err) => err,
         };
         state.with_kernel_mut(|kernel| {
-            kernel.wake_thread(waiter.thread_id(), crate::task::WakeReason::Status(status))
+            let _ = kernel.complete_waiter(
+                waiter.thread_id(),
+                waiter.seq(),
+                crate::task::WakeReason::Status(status),
+            )?;
+            Ok(())
         })?;
     }
     Ok(())
@@ -347,10 +391,12 @@ fn wake_port_waiters(state: &mut object::KernelState, port_id: u64) -> Result<()
                 Err(PortError::ShouldWait) => break,
                 Err(err) => {
                     state.with_kernel_mut(|kernel| {
-                        kernel.wake_thread(
+                        let _ = kernel.complete_waiter(
                             waiter.thread_id(),
+                            waiter.seq(),
                             crate::task::WakeReason::Status(object::map_port_error(err)),
-                        )
+                        )?;
+                        Ok(())
                     })?;
                     continue;
                 }
@@ -364,8 +410,78 @@ fn wake_port_waiters(state: &mut object::KernelState, port_id: u64) -> Result<()
             Err(err) => err,
         };
         state.with_kernel_mut(|kernel| {
-            kernel.wake_thread(waiter.thread_id(), crate::task::WakeReason::Status(status))
+            let _ = kernel.complete_waiter(
+                waiter.thread_id(),
+                waiter.seq(),
+                crate::task::WakeReason::Status(status),
+            )?;
+            Ok(())
         })?;
+    }
+    Ok(())
+}
+
+fn wake_expired_waits(state: &mut object::KernelState, now: i64) -> Result<(), zx_status_t> {
+    let expired = state.with_kernel_mut(|kernel| Ok(kernel.expire_waits(now)))?;
+    for expired_wait in expired {
+        let thread_id = expired_wait.thread_id();
+        let reason = match expired_wait.registration() {
+            crate::task::WaitRegistration::Sleep => crate::task::WakeReason::Status(ZX_OK),
+            crate::task::WaitRegistration::Signal {
+                object_id,
+                watched,
+                observed_ptr,
+            } => {
+                let observed = object::signals_for_object_id(state, object_id)?;
+                let status = match state.with_kernel_mut(|kernel| {
+                    kernel.copyout_thread_user(
+                        thread_id,
+                        observed_ptr as *mut zx_signals_t,
+                        observed.bits(),
+                    )
+                }) {
+                    Ok(()) if observed.intersects(watched) => ZX_OK,
+                    Ok(()) => ZX_ERR_TIMED_OUT,
+                    Err(err) => err,
+                };
+                crate::task::WakeReason::Status(status)
+            }
+            crate::task::WaitRegistration::Port {
+                port_object_id,
+                packet_ptr,
+            } => {
+                let packet = {
+                    let Some(KernelObject::Port(port)) = state.objects.get_mut(&port_object_id)
+                    else {
+                        return Err(ZX_ERR_BAD_STATE);
+                    };
+                    port.pop()
+                };
+                let status = match packet {
+                    Ok(packet) => {
+                        let packet = port_packet_from_core(packet);
+                        match state.with_kernel_mut(|kernel| {
+                            kernel.copyout_thread_user(
+                                thread_id,
+                                packet_ptr as *mut zx_port_packet_t,
+                                packet,
+                            )
+                        }) {
+                            Ok(()) => ZX_OK,
+                            Err(err) => err,
+                        }
+                    }
+                    Err(PortError::ShouldWait) => ZX_ERR_TIMED_OUT,
+                    Err(err) => object::map_port_error(err),
+                };
+                crate::task::WakeReason::Status(status)
+            }
+            crate::task::WaitRegistration::Futex { .. }
+            | crate::task::WaitRegistration::VmFault { .. } => {
+                crate::task::WakeReason::Status(ZX_ERR_TIMED_OUT)
+            }
+        };
+        state.with_kernel_mut(|kernel| kernel.wake_thread(thread_id, reason))?;
     }
     Ok(())
 }

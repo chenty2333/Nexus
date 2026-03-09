@@ -12,7 +12,7 @@
 
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -42,6 +42,7 @@ use axle_types::{
     zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t,
 };
 use bitflags::bitflags;
+use core::cmp::Ordering;
 use core::mem::size_of;
 use spin::Mutex;
 
@@ -101,8 +102,9 @@ pub(crate) enum TrapExitDisposition {
     BlockCurrent,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WaitRegistration {
+    Sleep,
     Futex {
         key: FutexKey,
         owner_koid: zx_koid_t,
@@ -110,15 +112,83 @@ pub(crate) enum WaitRegistration {
     Signal {
         object_id: u64,
         watched: Signals,
-        observed_ptr: *mut zx_signals_t,
+        observed_ptr: u64,
     },
     Port {
         port_object_id: u64,
-        packet_ptr: *mut zx_port_packet_t,
+        packet_ptr: u64,
     },
     VmFault {
         key: FaultInFlightKey,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitSourceKey {
+    Signals(u64),
+    PortReadable(u64),
+    Futex(FutexKey),
+    Fault(FaultInFlightKey),
+    None,
+}
+
+impl WaitRegistration {
+    const fn source_key(self) -> WaitSourceKey {
+        match self {
+            Self::Sleep => WaitSourceKey::None,
+            Self::Futex { key, .. } => WaitSourceKey::Futex(key),
+            Self::Signal { object_id, .. } => WaitSourceKey::Signals(object_id),
+            Self::Port { port_object_id, .. } => WaitSourceKey::PortReadable(port_object_id),
+            Self::VmFault { key } => WaitSourceKey::Fault(key),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WaitNode {
+    seq: u64,
+    registration: Option<WaitRegistration>,
+    deadline: Option<i64>,
+}
+
+impl WaitNode {
+    fn arm(&mut self, registration: WaitRegistration, deadline: Option<i64>) -> u64 {
+        self.seq = self.seq.wrapping_add(1);
+        if self.seq == 0 {
+            self.seq = 1;
+        }
+        self.registration = Some(registration);
+        self.deadline = deadline;
+        self.seq
+    }
+
+    fn clear(&mut self) {
+        self.registration = None;
+        self.deadline = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WaitTimerEntry {
+    deadline: i64,
+    thread_id: ThreadId,
+    seq: u64,
+}
+
+impl Ord for WaitTimerEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.thread_id.cmp(&self.thread_id))
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialOrd for WaitTimerEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1025,32 +1095,23 @@ pub(crate) enum ThreadState {
     Suspended,
     TerminationPending,
     Terminated,
-    FutexWait {
-        key: FutexKey,
-    },
-    SignalWait {
-        object_id: u64,
-        watched: Signals,
-        observed_ptr: u64,
-    },
-    PortWait {
-        port_object_id: u64,
-        packet_ptr: u64,
-    },
-    VmFaultWait {
-        key: FaultInFlightKey,
-    },
+    Blocked { source: WaitSourceKey },
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SignalWaiter {
     thread_id: ThreadId,
+    seq: u64,
     observed_ptr: u64,
 }
 
 impl SignalWaiter {
     pub(crate) const fn thread_id(self) -> ThreadId {
         self.thread_id
+    }
+
+    pub(crate) const fn seq(self) -> u64 {
+        self.seq
     }
 
     pub(crate) const fn observed_ptr(self) -> *mut zx_signals_t {
@@ -1061,6 +1122,7 @@ impl SignalWaiter {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PortWaiter {
     thread_id: ThreadId,
+    seq: u64,
     packet_ptr: u64,
 }
 
@@ -1069,8 +1131,28 @@ impl PortWaiter {
         self.thread_id
     }
 
+    pub(crate) const fn seq(self) -> u64 {
+        self.seq
+    }
+
     pub(crate) const fn packet_ptr(self) -> *mut zx_port_packet_t {
         self.packet_ptr as *mut zx_port_packet_t
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExpiredWait {
+    thread_id: ThreadId,
+    registration: WaitRegistration,
+}
+
+impl ExpiredWait {
+    pub(crate) const fn thread_id(self) -> ThreadId {
+        self.thread_id
+    }
+
+    pub(crate) const fn registration(self) -> WaitRegistration {
+        self.registration
     }
 }
 
@@ -1834,6 +1916,7 @@ struct Thread {
     koid: zx_koid_t,
     state: ThreadState,
     queued: bool,
+    wait: WaitNode,
     context: Option<UserContext>,
     suspend_tokens: u32,
 }
@@ -1863,6 +1946,9 @@ pub(crate) struct Kernel {
     processes: BTreeMap<ProcessId, Process>,
     threads: BTreeMap<ThreadId, Thread>,
     futexes: crate::futex::FutexTable,
+    signal_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
+    port_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
+    wait_timers: BinaryHeap<WaitTimerEntry>,
     run_queue: VecDeque<ThreadId>,
     revocations: RevocationManager,
     next_koid: zx_koid_t,
@@ -1986,6 +2072,9 @@ impl Kernel {
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
             futexes: crate::futex::FutexTable::new(),
+            signal_waiters: BTreeMap::new(),
+            port_waiters: BTreeMap::new(),
+            wait_timers: BinaryHeap::new(),
             run_queue: VecDeque::new(),
             revocations: RevocationManager::new(),
             next_koid: 1,
@@ -2013,6 +2102,7 @@ impl Kernel {
                 koid: thread_koid,
                 state: ThreadState::Runnable,
                 queued: false,
+                wait: WaitNode::default(),
                 context: None,
                 suspend_tokens: 0,
             },
@@ -2640,10 +2730,7 @@ impl Kernel {
                     Ok(TrapExitDisposition::BlockCurrent)
                 }
             }
-            ThreadState::FutexWait { .. }
-            | ThreadState::SignalWait { .. }
-            | ThreadState::PortWait { .. }
-            | ThreadState::VmFaultWait { .. } => {
+            ThreadState::Blocked { .. } => {
                 if let Some(next_thread_id) = self.pop_runnable_thread() {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     Ok(TrapExitDisposition::Complete)
@@ -2654,45 +2741,136 @@ impl Kernel {
         }
     }
 
+    fn push_signal_waiter(&mut self, object_id: u64, thread_id: ThreadId) {
+        self.signal_waiters
+            .entry(object_id)
+            .or_default()
+            .push_back(thread_id);
+    }
+
+    fn remove_signal_waiter(&mut self, object_id: u64, thread_id: ThreadId) {
+        let should_remove = if let Some(waiters) = self.signal_waiters.get_mut(&object_id) {
+            waiters.retain(|waiter| *waiter != thread_id);
+            waiters.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            let _ = self.signal_waiters.remove(&object_id);
+        }
+    }
+
+    fn push_port_waiter(&mut self, port_object_id: u64, thread_id: ThreadId) {
+        self.port_waiters
+            .entry(port_object_id)
+            .or_default()
+            .push_back(thread_id);
+    }
+
+    fn remove_port_waiter(&mut self, port_object_id: u64, thread_id: ThreadId) {
+        let should_remove = if let Some(waiters) = self.port_waiters.get_mut(&port_object_id) {
+            waiters.retain(|waiter| *waiter != thread_id);
+            waiters.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            let _ = self.port_waiters.remove(&port_object_id);
+        }
+    }
+
+    fn enqueue_wait_source(&mut self, thread_id: ThreadId, registration: WaitRegistration) {
+        match registration {
+            WaitRegistration::Sleep => {}
+            WaitRegistration::Signal { object_id, .. } => {
+                self.push_signal_waiter(object_id, thread_id)
+            }
+            WaitRegistration::Port { port_object_id, .. } => {
+                self.push_port_waiter(port_object_id, thread_id)
+            }
+            WaitRegistration::Futex { key, owner_koid } => {
+                self.futexes.enqueue_waiter(key, thread_id, owner_koid)
+            }
+            WaitRegistration::VmFault { .. } => {}
+        }
+    }
+
+    fn remove_wait_source_membership(
+        &mut self,
+        thread_id: ThreadId,
+        registration: WaitRegistration,
+    ) {
+        match registration {
+            WaitRegistration::Sleep => {}
+            WaitRegistration::Signal { object_id, .. } => {
+                self.remove_signal_waiter(object_id, thread_id)
+            }
+            WaitRegistration::Port { port_object_id, .. } => {
+                self.remove_port_waiter(port_object_id, thread_id)
+            }
+            WaitRegistration::Futex { key, .. } => {
+                let _ = self.futexes.cancel_waiter(key, thread_id);
+            }
+            WaitRegistration::VmFault { key } => {
+                let mut faults = self.faults.lock();
+                faults.remove_blocked_waiter(key, thread_id);
+            }
+        }
+    }
+
+    fn take_wait_registration_if_seq(
+        &mut self,
+        thread_id: ThreadId,
+        seq: u64,
+    ) -> Option<WaitRegistration> {
+        let thread = self.threads.get_mut(&thread_id)?;
+        if thread.wait.seq != seq {
+            return None;
+        }
+        let registration = thread.wait.registration?;
+        thread.wait.clear();
+        Some(registration)
+    }
+
+    fn take_wait_registration(&mut self, thread_id: ThreadId) -> Option<(u64, WaitRegistration)> {
+        let thread = self.threads.get_mut(&thread_id)?;
+        let registration = thread.wait.registration?;
+        let seq = thread.wait.seq;
+        thread.wait.clear();
+        Some((seq, registration))
+    }
+
+    pub(crate) fn park_current(
+        &mut self,
+        registration: WaitRegistration,
+        deadline: Option<i64>,
+    ) -> Result<(), zx_status_t> {
+        let thread_id = self.current_thread_id;
+        let source = registration.source_key();
+        let seq = {
+            let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+            if !matches!(thread.state, ThreadState::Runnable) {
+                return Err(ZX_ERR_BAD_STATE);
+            }
+            thread.state = ThreadState::Blocked { source };
+            thread.wait.arm(registration, deadline)
+        };
+        self.enqueue_wait_source(thread_id, registration);
+        if let Some(deadline) = deadline {
+            self.wait_timers.push(WaitTimerEntry {
+                deadline,
+                thread_id,
+                seq,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn block_current(
         &mut self,
         registration: WaitRegistration,
     ) -> Result<(), zx_status_t> {
-        let thread_id = self.current_thread_id;
-        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        if !matches!(thread.state, ThreadState::Runnable) {
-            return Err(ZX_ERR_BAD_STATE);
-        }
-        match registration {
-            WaitRegistration::Futex { key, owner_koid } => {
-                thread.state = ThreadState::FutexWait { key };
-                self.futexes.enqueue_waiter(key, thread_id, owner_koid);
-            }
-            WaitRegistration::Signal {
-                object_id,
-                watched,
-                observed_ptr,
-            } => {
-                thread.state = ThreadState::SignalWait {
-                    object_id,
-                    watched,
-                    observed_ptr: observed_ptr as u64,
-                };
-            }
-            WaitRegistration::Port {
-                port_object_id,
-                packet_ptr,
-            } => {
-                thread.state = ThreadState::PortWait {
-                    port_object_id,
-                    packet_ptr: packet_ptr as u64,
-                };
-            }
-            WaitRegistration::VmFault { key } => {
-                thread.state = ThreadState::VmFaultWait { key };
-            }
-        }
-        Ok(())
+        self.park_current(registration, None)
     }
 
     pub(crate) fn signal_waiters_ready(
@@ -2700,49 +2878,123 @@ impl Kernel {
         object_id: u64,
         current: Signals,
     ) -> Vec<SignalWaiter> {
-        self.threads
+        let Some(waiters) = self.signal_waiters.get(&object_id) else {
+            return Vec::new();
+        };
+        waiters
             .iter()
-            .filter_map(|(thread_id, thread)| match thread.state {
-                ThreadState::SignalWait {
-                    object_id: wait_object_id,
-                    watched,
-                    observed_ptr,
-                } if wait_object_id == object_id && current.intersects(watched) => {
-                    Some(SignalWaiter {
-                        thread_id: *thread_id,
+            .filter_map(|thread_id| {
+                let thread = self.threads.get(thread_id)?;
+                match thread.wait.registration {
+                    Some(WaitRegistration::Signal {
+                        object_id: wait_object_id,
+                        watched,
                         observed_ptr,
-                    })
+                    }) if wait_object_id == object_id && current.intersects(watched) => {
+                        Some(SignalWaiter {
+                            thread_id: *thread_id,
+                            seq: thread.wait.seq,
+                            observed_ptr: observed_ptr as u64,
+                        })
+                    }
+                    _ => None,
                 }
-                _ => None,
             })
             .collect()
     }
 
     pub(crate) fn port_waiters(&self, port_object_id: u64) -> Vec<PortWaiter> {
-        self.threads
+        let Some(waiters) = self.port_waiters.get(&port_object_id) else {
+            return Vec::new();
+        };
+        waiters
             .iter()
-            .filter_map(|(thread_id, thread)| match thread.state {
-                ThreadState::PortWait {
-                    port_object_id: wait_port_object_id,
-                    packet_ptr,
-                } if wait_port_object_id == port_object_id => Some(PortWaiter {
-                    thread_id: *thread_id,
-                    packet_ptr,
-                }),
-                _ => None,
+            .filter_map(|thread_id| {
+                let thread = self.threads.get(thread_id)?;
+                match thread.wait.registration {
+                    Some(WaitRegistration::Port {
+                        port_object_id: wait_port_object_id,
+                        packet_ptr,
+                    }) if wait_port_object_id == port_object_id => Some(PortWaiter {
+                        thread_id: *thread_id,
+                        seq: thread.wait.seq,
+                        packet_ptr: packet_ptr as u64,
+                    }),
+                    _ => None,
+                }
             })
             .collect()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn cancel_current_futex_wait(&mut self) -> Result<bool, zx_status_t> {
-        let thread_id = self.current_thread_id;
-        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        let ThreadState::FutexWait { key } = thread.state else {
+    pub(crate) fn complete_waiter(
+        &mut self,
+        thread_id: ThreadId,
+        seq: u64,
+        reason: WakeReason,
+    ) -> Result<bool, zx_status_t> {
+        let Some(registration) = self.take_wait_registration_if_seq(thread_id, seq) else {
             return Ok(false);
         };
-        thread.state = ThreadState::Runnable;
-        Ok(self.futexes.cancel_waiter(key, thread_id))
+        self.remove_wait_source_membership(thread_id, registration);
+        self.wake_thread(thread_id, reason)?;
+        Ok(true)
+    }
+
+    pub(crate) fn complete_waiter_source_removed(
+        &mut self,
+        thread_id: ThreadId,
+        reason: WakeReason,
+    ) -> Result<bool, zx_status_t> {
+        let Some((_, _registration)) = self.take_wait_registration(thread_id) else {
+            return Ok(false);
+        };
+        self.wake_thread(thread_id, reason)?;
+        Ok(true)
+    }
+
+    pub(crate) fn expire_waits(&mut self, now: i64) -> Vec<ExpiredWait> {
+        let mut expired = Vec::new();
+        while let Some(entry) = self.wait_timers.peek().copied() {
+            if entry.deadline > now {
+                break;
+            }
+            let _ = self.wait_timers.pop();
+            let Some(thread) = self.threads.get(&entry.thread_id) else {
+                continue;
+            };
+            if thread.wait.seq != entry.seq || thread.wait.deadline != Some(entry.deadline) {
+                continue;
+            }
+            let Some(registration) = self.take_wait_registration_if_seq(entry.thread_id, entry.seq)
+            else {
+                continue;
+            };
+            self.remove_wait_source_membership(entry.thread_id, registration);
+            expired.push(ExpiredWait {
+                thread_id: entry.thread_id,
+                registration,
+            });
+        }
+        expired
+    }
+
+    fn update_wait_registration(
+        &mut self,
+        thread_id: ThreadId,
+        registration: WaitRegistration,
+    ) -> Result<bool, zx_status_t> {
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let Some(current) = thread.wait.registration else {
+            return Ok(false);
+        };
+        if !matches!(current, WaitRegistration::Futex { .. }) {
+            return Ok(false);
+        }
+        thread.wait.registration = Some(registration);
+        thread.state = ThreadState::Blocked {
+            source: registration.source_key(),
+        };
+        Ok(true)
     }
 
     #[allow(dead_code)]
@@ -2757,7 +3009,7 @@ impl Kernel {
             .futexes
             .wake(key, wake_count, new_owner_koid, single_owner);
         for thread_id in result.woken {
-            self.wake_thread(thread_id, WakeReason::Status(ZX_OK))?;
+            let _ = self.complete_waiter_source_removed(thread_id, WakeReason::Status(ZX_OK))?;
         }
         Ok(result.remaining)
     }
@@ -2775,12 +3027,16 @@ impl Kernel {
             self.futexes
                 .requeue(source, target, wake_count, requeue_count, target_owner_koid);
         for thread_id in &result.woken {
-            self.wake_thread(*thread_id, WakeReason::Status(ZX_OK))?;
+            let _ = self.complete_waiter_source_removed(*thread_id, WakeReason::Status(ZX_OK))?;
         }
-        for thread in self.threads.values_mut() {
-            if matches!(thread.state, ThreadState::FutexWait { key } if key == source) {
-                thread.state = ThreadState::FutexWait { key: target };
-            }
+        for thread_id in &result.requeued_waiters {
+            let _ = self.update_wait_registration(
+                *thread_id,
+                WaitRegistration::Futex {
+                    key: target,
+                    owner_koid: target_owner_koid,
+                },
+            )?;
         }
         Ok(result)
     }
@@ -2792,7 +3048,12 @@ impl Kernel {
 
     #[allow(dead_code)]
     pub(crate) fn thread_is_waiting_on_futex(&self, thread_id: ThreadId, key: FutexKey) -> bool {
-        self.futexes.is_waiter(key, thread_id)
+        self.threads
+            .get(&thread_id)
+            .and_then(|thread| thread.wait.registration)
+            .is_some_and(|registration| {
+                matches!(registration, WaitRegistration::Futex { key: wait_key, .. } if wait_key == key)
+            })
     }
 
     pub(crate) fn create_thread(
@@ -2815,6 +3076,7 @@ impl Kernel {
                 koid,
                 state: ThreadState::New,
                 queued: false,
+                wait: WaitNode::default(),
                 context: None,
                 suspend_tokens: 0,
             },
@@ -3236,18 +3498,12 @@ impl Kernel {
         let state = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?.state;
         match state {
             ThreadState::TerminationPending | ThreadState::Terminated => return Ok(()),
-            ThreadState::FutexWait { key } => {
-                let _ = self.futexes.cancel_waiter(key, thread_id);
+            ThreadState::Blocked { .. } => {
+                if let Some((_, registration)) = self.take_wait_registration(thread_id) {
+                    self.remove_wait_source_membership(thread_id, registration);
+                }
             }
-            ThreadState::VmFaultWait { key } => {
-                let mut faults = self.faults.lock();
-                faults.remove_blocked_waiter(key, thread_id);
-            }
-            ThreadState::New
-            | ThreadState::Runnable
-            | ThreadState::Suspended
-            | ThreadState::SignalWait { .. }
-            | ThreadState::PortWait { .. } => {}
+            ThreadState::New | ThreadState::Runnable | ThreadState::Suspended => {}
         }
 
         if thread_id == self.current_thread_id {
@@ -3438,13 +3694,7 @@ impl Kernel {
         let was_current = thread_id == self.current_thread_id;
         let _ = thread;
         if !hold_suspended && !was_current {
-            if matches!(
-                previous_state,
-                ThreadState::FutexWait { .. }
-                    | ThreadState::SignalWait { .. }
-                    | ThreadState::PortWait { .. }
-                    | ThreadState::VmFaultWait { .. }
-            ) {
+            if matches!(previous_state, ThreadState::Blocked { .. }) {
                 self.enqueue_runnable_thread_front(thread_id)?;
             } else {
                 self.enqueue_runnable_thread(thread_id)?;

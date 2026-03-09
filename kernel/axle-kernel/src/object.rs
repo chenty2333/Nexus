@@ -982,54 +982,25 @@ pub fn futex_wait(
         return Err(ZX_ERR_BAD_STATE);
     }
     let key = resolve_current_futex_key(value_ptr)?;
-
-    let blocked_on_scheduler = with_state_mut(|state| {
+    with_state_mut(|state| {
         let owner_koid = validate_futex_wait_owner(state, key, new_futex_owner)?;
-        if deadline == i64::MAX {
-            state.with_kernel_mut(|kernel| {
-                kernel.block_current(crate::task::WaitRegistration::Futex { key, owner_koid })
-            })?;
-            Ok(true)
+        let deadline = if deadline == i64::MAX {
+            None
         } else {
-            Ok(false)
-        }
-    })?;
-
-    if blocked_on_scheduler {
-        return Ok(());
-    }
-
-    let mut registered = false;
-    loop {
-        let still_waiting = with_state_mut(|state| {
-            if !registered {
-                let owner_koid = validate_futex_wait_owner(state, key, new_futex_owner)?;
-                state.with_kernel_mut(|kernel| {
-                    kernel.block_current(crate::task::WaitRegistration::Futex { key, owner_koid })
-                })?;
-                registered = true;
+            let now = crate::time::now_ns();
+            if deadline <= now {
+                return Err(ZX_ERR_TIMED_OUT);
             }
-            let current = state.with_kernel(|kernel| kernel.current_thread_info())?;
-            state.with_kernel(|kernel| {
-                Ok(kernel.thread_is_waiting_on_futex(current.thread_id(), key))
-            })
-        })?;
-        if !still_waiting {
-            return Ok(());
-        }
-
-        let now = crate::time::now_ns();
-        if deadline != i64::MAX && deadline <= now {
-            with_state_mut(|state| {
-                let _ = state.with_kernel_mut(|kernel| kernel.cancel_current_futex_wait())?;
-                Ok(())
-            })?;
-            return Err(ZX_ERR_TIMED_OUT);
-        }
-
-        x86_64::instructions::interrupts::enable_and_hlt();
-        x86_64::instructions::interrupts::disable();
-    }
+            Some(deadline)
+        };
+        state.with_kernel_mut(|kernel| {
+            kernel.park_current(
+                crate::task::WaitRegistration::Futex { key, owner_koid },
+                deadline,
+            )
+        })
+    })?;
+    Ok(())
 }
 
 /// Wake up to `wake_count` waiters from one futex.

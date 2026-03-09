@@ -41,3 +41,6 @@ pub use timer::{FakeClock, Time, TimerError, TimerId, TimerService};
 
 #[cfg(test)]
 extern crate std;
+
+#[cfg(all(test, feature = "loom"))]
+mod wait_core_loom;

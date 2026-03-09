@@ -423,7 +423,7 @@ fn wake_fault_waiters(kernel_handle: &Arc<Mutex<Kernel>>, waiters: Vec<ThreadId>
     }
     let mut kernel = kernel_handle.lock();
     for thread_id in waiters {
-        let _ = kernel.wake_thread(thread_id, WakeReason::PreserveContext);
+        let _ = kernel.complete_waiter_source_removed(thread_id, WakeReason::PreserveContext);
     }
 }
 

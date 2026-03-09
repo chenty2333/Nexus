@@ -155,7 +155,7 @@ pub fn handle_page_fault(
                 let (disposition, lifecycle_dirty) = {
                     let mut kernel = kernel.lock();
                     kernel.capture_current_user_context(trap, user_cpu_frame.cast_const())?;
-                    kernel.block_current(crate::task::WaitRegistration::VmFault { key })?;
+                    kernel.park_current(crate::task::WaitRegistration::VmFault { key }, None)?;
                     if let Some(thread_id) = wake_thread {
                         kernel.wake_thread(thread_id, crate::task::WakeReason::PreserveContext)?;
                     }
