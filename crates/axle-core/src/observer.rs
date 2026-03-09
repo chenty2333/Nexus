@@ -213,15 +213,11 @@ impl ObserverRegistry {
     where
         F: FnMut(ObserverPortId, Packet) -> bool,
     {
-        loop {
-            let Some(reg) = self
-                .pending_order_by_port
-                .get_mut(&port)
-                .and_then(VecDeque::pop_front)
-            else {
-                break;
-            };
-
+        while let Some(reg) = self
+            .pending_order_by_port
+            .get_mut(&port)
+            .and_then(VecDeque::pop_front)
+        {
             let Some(observer) = self.observers.get(&reg).copied() else {
                 continue;
             };
