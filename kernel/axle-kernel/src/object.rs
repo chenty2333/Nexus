@@ -603,6 +603,36 @@ impl KernelState {
         f(&mut vm)
     }
 
+    fn current_address_space_id(&self) -> Option<crate::task::AddressSpaceId> {
+        self.with_core(|kernel| kernel.current_address_space_id())
+            .ok()
+    }
+
+    fn apply_tlb_commit_reqs(&self, reqs: &[crate::task::TlbCommitReq]) -> Result<(), zx_status_t> {
+        let vm = self.vm_handle()?;
+        crate::task::apply_tlb_commit_reqs(
+            &vm,
+            crate::arch::apic::this_apic_id() as usize,
+            self.current_address_space_id(),
+            reqs,
+        )
+    }
+
+    fn retire_bootstrap_frames_after_quiescence(
+        &self,
+        barrier_address_spaces: &[crate::task::AddressSpaceId],
+        retired_frames: &[crate::task::RetiredFrame],
+    ) -> Result<(), zx_status_t> {
+        let vm = self.vm_handle()?;
+        crate::task::retire_bootstrap_frames_after_quiescence(
+            &vm,
+            crate::arch::apic::this_apic_id() as usize,
+            self.current_address_space_id(),
+            barrier_address_spaces,
+            retired_frames,
+        )
+    }
+
     pub(crate) fn with_kernel<T>(
         &self,
         f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,

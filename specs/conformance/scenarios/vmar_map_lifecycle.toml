@@ -9,7 +9,7 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.vmar.map_protect_unmap_bootstrap"]
+contracts = ["must.vmar.map_protect_unmap_bootstrap"]
 
 [assertions.status_code]
 vmar_map = 0

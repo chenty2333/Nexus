@@ -66,9 +66,9 @@ level = "should"
 description = "zx_vmo_create must reject bad bootstrap arguments and return a non-zero anonymous VMO handle on success"
 
 [[contracts]]
-id = "should.vmar.map_protect_unmap_bootstrap"
-level = "should"
-description = "Root-VMAR bootstrap map/protect/unmap should support an explicit anonymous mapping lifecycle with stable error codes"
+id = "must.vmar.map_protect_unmap_bootstrap"
+level = "must"
+description = "Root-VMAR bootstrap map/protect/unmap must commit an explicit anonymous mapping lifecycle with stable error codes and post-return visibility for the calling thread"
 
 [[contracts]]
 id = "must.channel.create_write_read_bootstrap"

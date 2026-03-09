@@ -96,11 +96,15 @@ pub fn vmo_set_size(handle: zx_handle_t, size: u64) -> Result<(), zx_status_t> {
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
-        state.with_vm_mut(|vm| vm.set_vmo_size(vmo.global_vmo_id, size))?;
+        let resized = state.with_vm_mut(|vm| vm.set_vmo_size(vmo.global_vmo_id, size))?;
+        state.retire_bootstrap_frames_after_quiescence(
+            resized.barrier_address_spaces(),
+            resized.retired_frames(),
+        )?;
         let Some(KernelObject::Vmo(vmo)) = state.objects.get_mut(&object_id) else {
             return Err(ZX_ERR_BAD_STATE);
         };
-        vmo.size_bytes = size;
+        vmo.size_bytes = resized.new_size();
         Ok(())
     })
 }
@@ -165,7 +169,8 @@ pub fn vmar_allocate(
                 Err(err) => {
                     let _ = state.objects.remove(&object_id);
                     let _ = state
-                        .with_vm_mut(|vm| vm.destroy_vmar(parent.address_space_id, child.id()));
+                        .with_vm_mut(|vm| vm.destroy_vmar(parent.address_space_id, child.id()))
+                        .map(|_| ());
                     return Err(err);
                 }
             };
@@ -204,7 +209,7 @@ pub fn vmar_map(
         require_vm_mapping_rights(resolved_vmo, request.perms)?;
         require_vmar_mapping_caps(vmar.mapping_caps, request.perms, request.specific)?;
         let cpu_id = crate::arch::apic::this_apic_id() as usize;
-        state.with_vm_mut(|vm| {
+        let (mapped_addr, tlb_commit) = state.with_vm_mut(|vm| {
             vm.map_vmo_into_vmar(
                 vmar.address_space_id,
                 cpu_id,
@@ -215,7 +220,9 @@ pub fn vmar_map(
                 len,
                 request.perms,
             )
-        })
+        })?;
+        state.apply_tlb_commit_reqs(&[tlb_commit])?;
+        Ok(mapped_addr)
     })
 }
 
@@ -229,7 +236,9 @@ pub fn vmar_destroy(vmar_handle: zx_handle_t) -> Result<(), zx_status_t> {
             None => return Err(ZX_ERR_BAD_HANDLE),
         };
         require_vmar_control_rights(resolved_vmar)?;
-        state.with_vm_mut(|vm| vm.destroy_vmar(vmar.address_space_id, vmar.vmar_id))?;
+        let tlb_commit =
+            state.with_vm_mut(|vm| vm.destroy_vmar(vmar.address_space_id, vmar.vmar_id))?;
+        state.apply_tlb_commit_reqs(&[tlb_commit])?;
         let _ = state.objects.remove(&resolved_vmar.object_id());
         Ok(())
     })
@@ -246,7 +255,9 @@ pub fn vmar_unmap(vmar_handle: zx_handle_t, addr: u64, len: u64) -> Result<(), z
         };
         let _ = (vmar.process_id, vmar.base, vmar.len);
         require_handle_rights(resolved_vmar, crate::task::HandleRights::WRITE)?;
-        state.with_vm_mut(|vm| vm.unmap_vmar(vmar.address_space_id, vmar.vmar_id, addr, len))
+        let tlb_commit = state
+            .with_vm_mut(|vm| vm.unmap_vmar(vmar.address_space_id, vmar.vmar_id, addr, len))?;
+        state.apply_tlb_commit_reqs(&[tlb_commit])
     })
 }
 
@@ -269,9 +280,10 @@ pub fn vmar_protect(
         let _ = (vmar.process_id, vmar.base, vmar.len);
         require_vm_mapping_rights(resolved_vmar, perms)?;
         require_vmar_mapping_caps(vmar.mapping_caps, perms, false)?;
-        state.with_vm_mut(|vm| {
+        let tlb_commit = state.with_vm_mut(|vm| {
             vm.protect_vmar(vmar.address_space_id, vmar.vmar_id, addr, len, perms)
-        })
+        })?;
+        state.apply_tlb_commit_reqs(&[tlb_commit])
     })
 }
 

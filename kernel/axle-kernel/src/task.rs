@@ -62,8 +62,72 @@ const VM_FRAME_DIAGNOSTICS_ENABLED: bool =
 
 type ProcessId = u64;
 type ThreadId = u64;
-type AddressSpaceId = u64;
+pub(crate) type AddressSpaceId = u64;
 type KernelVmoId = GlobalVmoId;
+
+/// TLB synchronization class attached to one committed VM mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitClass {
+    Relaxed,
+    Strict,
+}
+
+/// Post-commit TLB synchronization requirement for one address space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TlbCommitReq {
+    address_space_id: AddressSpaceId,
+    class: CommitClass,
+}
+
+impl TlbCommitReq {
+    pub(crate) const fn relaxed(address_space_id: AddressSpaceId) -> Self {
+        Self {
+            address_space_id,
+            class: CommitClass::Relaxed,
+        }
+    }
+
+    pub(crate) const fn strict(address_space_id: AddressSpaceId) -> Self {
+        Self {
+            address_space_id,
+            class: CommitClass::Strict,
+        }
+    }
+
+    pub(crate) const fn address_space_id(self) -> AddressSpaceId {
+        self.address_space_id
+    }
+
+    pub(crate) const fn class(self) -> CommitClass {
+        self.class
+    }
+}
+
+/// One bootstrap frame that must not be recycled until the relevant TLB state is quiescent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetiredFrame {
+    frame_id: FrameId,
+}
+
+impl RetiredFrame {
+    pub(crate) const fn bootstrap_page(frame_id: FrameId) -> Self {
+        Self { frame_id }
+    }
+
+    pub(crate) const fn frame_id(self) -> FrameId {
+        self.frame_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StrictTlbSyncPlan {
+    address_space_id: AddressSpaceId,
+    target_epoch: u64,
+    current_cpu_id: usize,
+    current_cpu_active: bool,
+    local_needs_flush: bool,
+    remote_cpus: Vec<usize>,
+}
 
 static BOOTSTRAP_USER_RUNNER_SOURCE: Mutex<Option<PagerSourceHandle>> = Mutex::new(None);
 
@@ -681,6 +745,28 @@ impl KernelVmoBacking {
 
     pub(crate) fn size_bytes(&self) -> u64 {
         self.size_bytes
+    }
+}
+
+/// Result of resizing one VMO, including any frames that must be retired before reuse.
+#[derive(Clone, Debug)]
+pub(crate) struct VmoResizeResult {
+    new_size: u64,
+    retired_frames: Vec<RetiredFrame>,
+    barrier_address_spaces: Vec<AddressSpaceId>,
+}
+
+impl VmoResizeResult {
+    pub(crate) const fn new_size(&self) -> u64 {
+        self.new_size
+    }
+
+    pub(crate) fn retired_frames(&self) -> &[RetiredFrame] {
+        &self.retired_frames
+    }
+
+    pub(crate) fn barrier_address_spaces(&self) -> &[AddressSpaceId] {
+        &self.barrier_address_spaces
     }
 }
 
@@ -1594,6 +1680,10 @@ impl AddressSpace {
         cpu_id < u64::BITS as usize && (self.active_cpu_mask & (1_u64 << cpu_id)) != 0
     }
 
+    fn active_cpu_mask(&self) -> u64 {
+        self.active_cpu_mask
+    }
+
     fn observe_tlb_epoch(&mut self, cpu_id: usize, epoch: u64) {
         if cpu_id < MAX_TRACKED_TLB_CPUS {
             self.observed_tlb_epoch[cpu_id] = epoch;
@@ -1669,6 +1759,10 @@ impl AddressSpace {
 
     fn mapped_ranges_for_global_vmo(&self, global_vmo_id: KernelVmoId) -> Vec<(u64, u64)> {
         self.vm.mapped_ranges_for_global_vmo(global_vmo_id)
+    }
+
+    fn imports_global_vmo(&self, global_vmo_id: KernelVmoId) -> bool {
+        self.local_vmo_id(global_vmo_id).is_some()
     }
 
     fn map_vmo_fixed(
@@ -1992,6 +2086,101 @@ impl VmDomain {
             .ok_or(ZX_ERR_BAD_STATE)?;
         let mut frames = frames_handle.lock();
         f(address_space, &mut frames)
+    }
+
+    fn address_space_ids_importing_global_vmo(
+        &self,
+        global_vmo_id: KernelVmoId,
+    ) -> Vec<AddressSpaceId> {
+        self.address_spaces
+            .iter()
+            .filter_map(|(&address_space_id, address_space)| {
+                address_space
+                    .imports_global_vmo(global_vmo_id)
+                    .then_some(address_space_id)
+            })
+            .collect()
+    }
+
+    fn protect_requires_strict_sync(
+        &self,
+        address_space_id: AddressSpaceId,
+        addr: u64,
+        len: u64,
+        new_perms: MappingPerms,
+    ) -> Result<bool, zx_status_t> {
+        if new_perms.contains(MappingPerms::WRITE) {
+            return Ok(false);
+        }
+        let address_space = self
+            .address_spaces
+            .get(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        for page_index in 0..page_count {
+            let va = addr + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            if address_space
+                .lookup_user_mapping(va, 1)
+                .is_some_and(|lookup| lookup.perms().contains(MappingPerms::WRITE))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn plan_strict_tlb_sync(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        current_cpu_id: usize,
+        current_cpu_active: bool,
+    ) -> Result<Option<StrictTlbSyncPlan>, zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get_mut(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if current_cpu_active {
+            address_space.note_cpu_active(current_cpu_id);
+        }
+        let target_epoch = address_space.current_invalidate_epoch();
+        let local_needs_flush =
+            current_cpu_active && address_space.observed_tlb_epoch(current_cpu_id) < target_epoch;
+        let mut remote_cpus = Vec::new();
+        let active_cpu_mask = address_space.active_cpu_mask();
+        for cpu_id in 0..u64::BITS as usize {
+            if cpu_id == current_cpu_id || (active_cpu_mask & (1_u64 << cpu_id)) == 0 {
+                continue;
+            }
+            if address_space.observed_tlb_epoch(cpu_id) < target_epoch {
+                remote_cpus.push(cpu_id);
+            }
+        }
+        if !local_needs_flush && remote_cpus.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(StrictTlbSyncPlan {
+            address_space_id,
+            target_epoch,
+            current_cpu_id,
+            current_cpu_active,
+            local_needs_flush,
+            remote_cpus,
+        }))
+    }
+
+    fn complete_strict_tlb_sync(&mut self, plan: &StrictTlbSyncPlan) -> Result<(), zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get_mut(&plan.address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if plan.current_cpu_active {
+            address_space.observe_tlb_epoch(plan.current_cpu_id, plan.target_epoch);
+        }
+        for &cpu_id in &plan.remote_cpus {
+            address_space.observe_tlb_epoch(cpu_id, plan.target_epoch);
+        }
+        Ok(())
     }
 
     fn alloc_address_space_id(&mut self) -> AddressSpaceId {
@@ -2364,7 +2553,14 @@ impl Kernel {
         loaned: &mut LoanedUserPages,
         receiver_address_space_id: AddressSpaceId,
     ) -> Result<(), zx_status_t> {
-        self.with_vm_mut(|vm| vm.prepare_loaned_channel_write(loaned, receiver_address_space_id))
+        let req = self
+            .with_vm_mut(|vm| vm.prepare_loaned_channel_write(loaned, receiver_address_space_id))?;
+        apply_tlb_commit_reqs(
+            &self.vm,
+            self.current_cpu_id(),
+            self.current_address_space_id().ok(),
+            &[req],
+        )
     }
 
     pub(crate) fn try_remap_loaned_channel_read(
@@ -2373,9 +2569,16 @@ impl Kernel {
         loaned: &LoanedUserPages,
     ) -> Result<bool, zx_status_t> {
         let current_address_space_id = self.current_process()?.address_space_id;
-        self.with_vm_mut(|vm| {
+        let (remapped, req) = self.with_vm_mut(|vm| {
             vm.try_remap_loaned_channel_read(current_address_space_id, dst_base, loaned)
-        })
+        })?;
+        apply_tlb_commit_reqs(
+            &self.vm,
+            self.current_cpu_id(),
+            Some(current_address_space_id),
+            &[req],
+        )?;
+        Ok(remapped)
     }
 
     pub(crate) fn current_root_vmar(&self) -> Result<RootVmarInfo, zx_status_t> {
@@ -2426,7 +2629,13 @@ impl Kernel {
         address_space_id: AddressSpaceId,
         vmar_id: VmarId,
     ) -> Result<(), zx_status_t> {
-        self.with_vm_mut(|vm| vm.destroy_vmar(address_space_id, vmar_id))
+        let req = self.with_vm_mut(|vm| vm.destroy_vmar(address_space_id, vmar_id))?;
+        apply_tlb_commit_reqs(
+            &self.vm,
+            self.current_cpu_id(),
+            self.current_address_space_id().ok(),
+            &[req],
+        )
     }
 
     pub(crate) fn current_thread_info(&self) -> Result<CurrentThreadInfo, zx_status_t> {
@@ -2553,14 +2762,22 @@ impl Kernel {
         &mut self,
         backing: KernelVmoBacking,
     ) -> Result<(), zx_status_t> {
+        let barrier_address_spaces =
+            self.with_vm(|vm| vm.address_space_ids_importing_global_vmo(backing.global_vmo_id));
         let _ = self.with_vm_mut(|vm| vm.global_vmos.lock().remove(backing.global_vmo_id));
-        self.with_vm_mut(|vm| {
-            let mut frames = vm.frames.lock();
-            for frame_id in backing.frame_ids.iter().copied() {
-                let _ = frames.unregister_existing(frame_id);
-            }
-        });
-        crate::userspace::free_bootstrap_pages(backing.base_paddr, backing.page_count);
+        let retired = backing
+            .frame_ids
+            .iter()
+            .copied()
+            .map(RetiredFrame::bootstrap_page)
+            .collect::<Vec<_>>();
+        retire_bootstrap_frames_after_quiescence(
+            &self.vm,
+            self.current_cpu_id(),
+            self.current_address_space_id().ok(),
+            &barrier_address_spaces,
+            &retired,
+        )?;
         Ok(())
     }
 
@@ -3411,7 +3628,7 @@ impl Kernel {
         len: u64,
         perms: MappingPerms,
     ) -> Result<u64, zx_status_t> {
-        self.with_vm_mut(|vm| {
+        let (mapped, req) = self.with_vm_mut(|vm| {
             vm.map_vmo_into_vmar(
                 vmar_address_space_id,
                 self.current_cpu_id(),
@@ -3422,7 +3639,14 @@ impl Kernel {
                 len,
                 perms,
             )
-        })
+        })?;
+        apply_tlb_commit_reqs(
+            &self.vm,
+            self.current_cpu_id(),
+            self.current_address_space_id().ok(),
+            &[req],
+        )?;
+        Ok(mapped)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3435,7 +3659,7 @@ impl Kernel {
         len: u64,
         perms: MappingPerms,
     ) -> Result<u64, zx_status_t> {
-        self.with_vm_mut(|vm| {
+        let (mapped, req) = self.with_vm_mut(|vm| {
             vm.map_vmo_into_vmar(
                 vmar_address_space_id,
                 self.current_cpu_id(),
@@ -3446,7 +3670,14 @@ impl Kernel {
                 len,
                 perms,
             )
-        })
+        })?;
+        apply_tlb_commit_reqs(
+            &self.vm,
+            self.current_cpu_id(),
+            self.current_address_space_id().ok(),
+            &[req],
+        )?;
+        Ok(mapped)
     }
 
     pub(crate) fn unmap_current_vmar(
@@ -3456,7 +3687,13 @@ impl Kernel {
         addr: u64,
         len: u64,
     ) -> Result<(), zx_status_t> {
-        self.with_vm_mut(|vm| vm.unmap_vmar(address_space_id, vmar_id, addr, len))
+        let req = self.with_vm_mut(|vm| vm.unmap_vmar(address_space_id, vmar_id, addr, len))?;
+        apply_tlb_commit_reqs(
+            &self.vm,
+            self.current_cpu_id(),
+            self.current_address_space_id().ok(),
+            &[req],
+        )
     }
 
     pub(crate) fn protect_current_vmar(
@@ -3467,7 +3704,14 @@ impl Kernel {
         len: u64,
         perms: MappingPerms,
     ) -> Result<(), zx_status_t> {
-        self.with_vm_mut(|vm| vm.protect_vmar(address_space_id, vmar_id, addr, len, perms))
+        let req =
+            self.with_vm_mut(|vm| vm.protect_vmar(address_space_id, vmar_id, addr, len, perms))?;
+        apply_tlb_commit_reqs(
+            &self.vm,
+            self.current_cpu_id(),
+            self.current_address_space_id().ok(),
+            &[req],
+        )
     }
 
     pub(crate) fn handle_current_page_fault(&mut self, fault_va: u64, error: u64) -> bool {
@@ -3704,6 +3948,10 @@ impl Kernel {
         self.with_vm_mut(|vm| vm.observe_cpu_tlb_epoch_for_address_space(address_space_id, cpu_id));
     }
 
+    pub(crate) fn current_address_space_id(&self) -> Result<AddressSpaceId, zx_status_t> {
+        Ok(self.current_process()?.address_space_id)
+    }
+
     fn make_thread_runnable_inner(
         &mut self,
         thread_id: ThreadId,
@@ -3884,6 +4132,80 @@ impl Kernel {
     fn release_loaned_pages_inner(&mut self, address_space_id: AddressSpaceId, pages: &[FrameId]) {
         self.with_vm_mut(|vm| vm.release_loaned_pages_inner(address_space_id, pages))
     }
+}
+
+/// Apply one or more committed TLB requirements against the current CPU and any tracked
+/// active peer CPUs for the affected address spaces.
+pub(crate) fn apply_tlb_commit_reqs(
+    vm_handle: &Arc<Mutex<VmDomain>>,
+    current_cpu_id: usize,
+    current_address_space_id: Option<AddressSpaceId>,
+    reqs: &[TlbCommitReq],
+) -> Result<(), zx_status_t> {
+    let mut strict_address_spaces = BTreeSet::new();
+    for req in reqs {
+        if req.class() == CommitClass::Strict {
+            strict_address_spaces.insert(req.address_space_id());
+        }
+    }
+
+    for address_space_id in strict_address_spaces {
+        let current_cpu_active = current_address_space_id == Some(address_space_id);
+        let plan = {
+            let mut vm = vm_handle.lock();
+            vm.plan_strict_tlb_sync(address_space_id, current_cpu_id, current_cpu_active)?
+        };
+        let Some(plan) = plan else {
+            continue;
+        };
+
+        if plan.local_needs_flush {
+            crate::arch::tlb::flush_all_local();
+        }
+        if !plan.remote_cpus.is_empty() {
+            crate::arch::ipi::shootdown_all(&plan.remote_cpus);
+        }
+
+        let mut vm = vm_handle.lock();
+        vm.complete_strict_tlb_sync(&plan)?;
+    }
+
+    Ok(())
+}
+
+/// Retire bootstrap frames only after every relevant address space has crossed the required
+/// TLB quiescent boundary for strict reuse safety.
+pub(crate) fn retire_bootstrap_frames_after_quiescence(
+    vm_handle: &Arc<Mutex<VmDomain>>,
+    current_cpu_id: usize,
+    current_address_space_id: Option<AddressSpaceId>,
+    barrier_address_spaces: &[AddressSpaceId],
+    retired_frames: &[RetiredFrame],
+) -> Result<(), zx_status_t> {
+    if retired_frames.is_empty() {
+        return Ok(());
+    }
+
+    let mut reqs = Vec::with_capacity(barrier_address_spaces.len());
+    for &address_space_id in barrier_address_spaces {
+        reqs.push(TlbCommitReq::strict(address_space_id));
+    }
+    apply_tlb_commit_reqs(vm_handle, current_cpu_id, current_address_space_id, &reqs)?;
+
+    {
+        let vm = vm_handle.lock();
+        for retired in retired_frames {
+            vm.with_frames_mut(|frames| {
+                frames
+                    .unregister_existing(retired.frame_id())
+                    .map_err(|_| ZX_ERR_BAD_STATE)
+            })?;
+        }
+    }
+    for retired in retired_frames {
+        crate::userspace::free_bootstrap_page(retired.frame_id().raw());
+    }
+    Ok(())
 }
 
 impl VmDomain {
@@ -4614,7 +4936,7 @@ impl VmDomain {
         &mut self,
         global_vmo_id: KernelVmoId,
         new_size: u64,
-    ) -> Result<u64, zx_status_t> {
+    ) -> Result<VmoResizeResult, zx_status_t> {
         if new_size == 0 || (new_size & (crate::userspace::USER_PAGE_BYTES - 1)) != 0 {
             return Err(ZX_ERR_INVALID_ARGS);
         }
@@ -4624,7 +4946,11 @@ impl VmDomain {
             return Err(ZX_ERR_NOT_SUPPORTED);
         }
         if new_size == snapshot.size_bytes {
-            return Ok(new_size);
+            return Ok(VmoResizeResult {
+                new_size,
+                retired_frames: Vec::new(),
+                barrier_address_spaces: Vec::new(),
+            });
         }
 
         for address_space in self.address_spaces.values() {
@@ -4657,21 +4983,21 @@ impl VmDomain {
             }
         }
 
+        let barrier_address_spaces = self.address_space_ids_importing_global_vmo(global_vmo_id);
         let dropped = self.global_vmos.lock().resize(global_vmo_id, new_size)?;
         for address_space in self.address_spaces.values_mut() {
             let _ = address_space
                 .resize_vmo(global_vmo_id, new_size)
                 .map_err(map_address_space_error)?;
         }
-        for frame_id in dropped {
-            self.with_frames_mut(|frames| {
-                frames
-                    .unregister_existing(frame_id)
-                    .map_err(|_| ZX_ERR_BAD_STATE)
-            })?;
-            crate::userspace::free_bootstrap_page(frame_id.raw());
-        }
-        Ok(new_size)
+        Ok(VmoResizeResult {
+            new_size,
+            retired_frames: dropped
+                .into_iter()
+                .map(RetiredFrame::bootstrap_page)
+                .collect(),
+            barrier_address_spaces,
+        })
     }
 
     pub(crate) fn allocate_subvmar(
@@ -4708,7 +5034,7 @@ impl VmDomain {
         &mut self,
         address_space_id: AddressSpaceId,
         vmar_id: VmarId,
-    ) -> Result<(), zx_status_t> {
+    ) -> Result<TlbCommitReq, zx_status_t> {
         let affected_ranges = {
             let address_space = self
                 .address_spaces
@@ -4742,7 +5068,11 @@ impl VmDomain {
             self.clear_mapping_pages(address_space_id, base, len)?;
         }
         self.validate_frame_mapping_invariants_for(&affected_frames, "destroy_vmar");
-        Ok(())
+        Ok(if affected_ranges.is_empty() {
+            TlbCommitReq::relaxed(address_space_id)
+        } else {
+            TlbCommitReq::strict(address_space_id)
+        })
     }
 
     pub(crate) fn ensure_user_page_resident(
@@ -4847,10 +5177,10 @@ impl VmDomain {
         &mut self,
         loaned: &mut LoanedUserPages,
         receiver_address_space_id: AddressSpaceId,
-    ) -> Result<(), zx_status_t> {
+    ) -> Result<TlbCommitReq, zx_status_t> {
         if !loaned.needs_cow() {
             loaned.bind_receiver_address_space(receiver_address_space_id);
-            return Ok(());
+            return Ok(TlbCommitReq::relaxed(loaned.address_space_id()));
         }
 
         let len = u64::from(loaned.len());
@@ -4879,7 +5209,8 @@ impl VmDomain {
             len,
             sender_cursor,
         )?;
-        loan_tx.commit().map_err(map_page_table_error)
+        loan_tx.commit().map_err(map_page_table_error)?;
+        Ok(TlbCommitReq::strict(loaned.address_space_id()))
     }
 
     pub(crate) fn try_remap_loaned_channel_read(
@@ -4887,9 +5218,9 @@ impl VmDomain {
         current_address_space_id: AddressSpaceId,
         dst_base: u64,
         loaned: &LoanedUserPages,
-    ) -> Result<bool, zx_status_t> {
+    ) -> Result<(bool, TlbCommitReq), zx_status_t> {
         let Some(receiver_address_space_id) = loaned.receiver_address_space_id() else {
-            return Ok(false);
+            return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
         };
 
         let len = u64::from(loaned.len());
@@ -4897,10 +5228,10 @@ impl VmDomain {
             || (dst_base & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
             || (len & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
         {
-            return Ok(false);
+            return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
         }
         if current_address_space_id != receiver_address_space_id {
-            return Ok(false);
+            return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
         }
 
         let receiver_lookup = self
@@ -4908,14 +5239,14 @@ impl VmDomain {
             .get(&receiver_address_space_id)
             .and_then(|space| space.lookup_user_mapping(dst_base, len as usize));
         let Some(receiver_lookup) = receiver_lookup else {
-            return Ok(false);
+            return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
         };
         if receiver_lookup.mapping_base() != dst_base
             || receiver_lookup.mapping_len() != len
             || receiver_lookup.vmo_kind() != VmoKind::Anonymous
             || !receiver_lookup.max_perms().contains(MappingPerms::WRITE)
         {
-            return Ok(false);
+            return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
         }
 
         let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
@@ -4931,7 +5262,7 @@ impl VmDomain {
                 .and_then(|space| space.page_meta(page_va))
                 .ok_or(ZX_ERR_INVALID_ARGS)?;
             if !meta.logical_write() {
-                return Ok(false);
+                return Ok((false, TlbCommitReq::relaxed(current_address_space_id)));
             }
         }
 
@@ -4967,7 +5298,7 @@ impl VmDomain {
             &replaced_receiver_frames,
             "try_remap_loaned_channel_read/receiver",
         );
-        Ok(true)
+        Ok((true, TlbCommitReq::strict(current_address_space_id)))
     }
 
     pub(crate) fn map_vmo_into_vmar(
@@ -4980,7 +5311,7 @@ impl VmDomain {
         vmo_offset: u64,
         len: u64,
         perms: MappingPerms,
-    ) -> Result<u64, zx_status_t> {
+    ) -> Result<(u64, TlbCommitReq), zx_status_t> {
         let local_vmo_id =
             self.import_global_vmo_into_address_space(address_space_id, global_vmo_id)?;
         let frames_handle = self.frame_table();
@@ -5030,7 +5361,7 @@ impl VmDomain {
             }
         };
         self.install_mapping_pages(address_space_id, mapped_addr, len)?;
-        Ok(mapped_addr)
+        Ok((mapped_addr, TlbCommitReq::relaxed(address_space_id)))
     }
 
     pub(crate) fn unmap_vmar(
@@ -5039,7 +5370,7 @@ impl VmDomain {
         vmar_id: VmarId,
         addr: u64,
         len: u64,
-    ) -> Result<(), zx_status_t> {
+    ) -> Result<TlbCommitReq, zx_status_t> {
         let affected_frames = self.mapped_frames_in_range(address_space_id, addr, len)?;
         let frames_handle = self.frame_table();
         let address_space = self
@@ -5056,7 +5387,7 @@ impl VmDomain {
         self.clear_private_cow_range(address_space_id, addr, len);
         self.clear_mapping_pages(address_space_id, addr, len)?;
         self.validate_frame_mapping_invariants_for(&affected_frames, "unmap_current_vmar");
-        Ok(())
+        Ok(TlbCommitReq::strict(address_space_id))
     }
 
     pub(crate) fn protect_vmar(
@@ -5066,7 +5397,8 @@ impl VmDomain {
         addr: u64,
         len: u64,
         perms: MappingPerms,
-    ) -> Result<(), zx_status_t> {
+    ) -> Result<TlbCommitReq, zx_status_t> {
+        let strict = self.protect_requires_strict_sync(address_space_id, addr, len, perms)?;
         let address_space = self
             .address_spaces
             .get_mut(&address_space_id)
@@ -5075,7 +5407,12 @@ impl VmDomain {
         address_space
             .protect(vmar_id, addr, len, perms)
             .map_err(map_address_space_error)?;
-        self.update_mapping_pages(address_space_id, addr, len)
+        self.update_mapping_pages(address_space_id, addr, len)?;
+        Ok(if strict {
+            TlbCommitReq::strict(address_space_id)
+        } else {
+            TlbCommitReq::relaxed(address_space_id)
+        })
     }
 
     fn mapping_access_satisfied(
@@ -5241,7 +5578,7 @@ impl VmDomain {
         &mut self,
         plan: FaultPlan,
         prepared: &mut PreparedFaultWork,
-    ) -> Result<FaultCommitDisposition, zx_status_t> {
+    ) -> Result<(FaultCommitDisposition, TlbCommitReq), zx_status_t> {
         match plan {
             FaultPlan::CopyOnWrite {
                 address_space_id,
@@ -5255,7 +5592,10 @@ impl VmDomain {
                         page_base,
                         crate::userspace::USER_PAGE_BYTES,
                     )?;
-                    return Ok(FaultCommitDisposition::Resolved);
+                    return Ok((
+                        FaultCommitDisposition::Resolved,
+                        TlbCommitReq::relaxed(address_space_id),
+                    ));
                 }
                 let lookup = self
                     .address_spaces
@@ -5265,7 +5605,10 @@ impl VmDomain {
                 if lookup.vmo_kind() != VmoKind::Anonymous
                     || lookup.frame_id() != Some(old_frame_id)
                 {
-                    return Ok(FaultCommitDisposition::Retry);
+                    return Ok((
+                        FaultCommitDisposition::Retry,
+                        TlbCommitReq::relaxed(address_space_id),
+                    ));
                 }
                 let meta = self
                     .address_spaces
@@ -5273,7 +5616,10 @@ impl VmDomain {
                     .and_then(|space| space.page_meta(page_base))
                     .ok_or(ZX_ERR_BAD_STATE)?;
                 if !meta.cow_shared() {
-                    return Ok(FaultCommitDisposition::Retry);
+                    return Ok((
+                        FaultCommitDisposition::Retry,
+                        TlbCommitReq::relaxed(address_space_id),
+                    ));
                 }
                 let reserve_private =
                     self.try_reserve_private_cow_page(address_space_id, page_base)?;
@@ -5312,7 +5658,10 @@ impl VmDomain {
                     &[resolved.old_frame_id(), resolved.new_frame_id()],
                     "resolve_copy_on_write_page",
                 );
-                Ok(FaultCommitDisposition::Resolved)
+                Ok((
+                    FaultCommitDisposition::Resolved,
+                    TlbCommitReq::relaxed(address_space_id),
+                ))
             }
             FaultPlan::LazyAnon {
                 address_space_id,
@@ -5331,7 +5680,10 @@ impl VmDomain {
                         crate::userspace::USER_PAGE_BYTES,
                     )?;
                     self.validate_frame_mapping_invariants(frame_id, "materialize_lazy_anon_page");
-                    return Ok(FaultCommitDisposition::Resolved);
+                    return Ok((
+                        FaultCommitDisposition::Resolved,
+                        TlbCommitReq::relaxed(address_space_id),
+                    ));
                 }
                 let meta = self
                     .address_spaces
@@ -5339,7 +5691,10 @@ impl VmDomain {
                     .and_then(|space| space.page_meta(page_base))
                     .ok_or(ZX_ERR_BAD_STATE)?;
                 if meta.tag() != PteMetaTag::LazyAnon {
-                    return Ok(FaultCommitDisposition::Retry);
+                    return Ok((
+                        FaultCommitDisposition::Retry,
+                        TlbCommitReq::relaxed(address_space_id),
+                    ));
                 }
                 let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
                 let resolved = self.with_address_space_frames_mut(
@@ -5367,7 +5722,10 @@ impl VmDomain {
                     resolved.new_frame_id(),
                     "materialize_lazy_anon_page",
                 );
-                Ok(FaultCommitDisposition::Resolved)
+                Ok((
+                    FaultCommitDisposition::Resolved,
+                    TlbCommitReq::relaxed(address_space_id),
+                ))
             }
             FaultPlan::LazyVmo {
                 address_space_id,
@@ -5388,7 +5746,10 @@ impl VmDomain {
                         crate::userspace::USER_PAGE_BYTES,
                     )?;
                     self.validate_frame_mapping_invariants(frame_id, "materialize_lazy_vmo_page");
-                    return Ok(FaultCommitDisposition::Resolved);
+                    return Ok((
+                        FaultCommitDisposition::Resolved,
+                        TlbCommitReq::relaxed(address_space_id),
+                    ));
                 }
                 let lookup = self
                     .address_spaces
@@ -5400,7 +5761,10 @@ impl VmDomain {
                     .checked_sub(lookup.vmo_offset() % crate::userspace::USER_PAGE_BYTES)
                     .ok_or(ZX_ERR_BAD_STATE)?;
                 if lookup.global_vmo_id() != global_vmo_id || current_page_offset != page_offset {
-                    return Ok(FaultCommitDisposition::Retry);
+                    return Ok((
+                        FaultCommitDisposition::Retry,
+                        TlbCommitReq::relaxed(address_space_id),
+                    ));
                 }
                 let meta = self
                     .address_spaces
@@ -5408,7 +5772,10 @@ impl VmDomain {
                     .and_then(|space| space.page_meta(page_base))
                     .ok_or(ZX_ERR_BAD_STATE)?;
                 if meta.tag() != PteMetaTag::LazyVmo {
-                    return Ok(FaultCommitDisposition::Retry);
+                    return Ok((
+                        FaultCommitDisposition::Retry,
+                        TlbCommitReq::relaxed(address_space_id),
+                    ));
                 }
                 let frame_id =
                     self.ensure_global_vmo_frame(global_vmo_id, page_offset, prepared)?;
@@ -5422,7 +5789,10 @@ impl VmDomain {
                     resolved.frame_id(),
                     "materialize_lazy_vmo_page",
                 );
-                Ok(FaultCommitDisposition::Resolved)
+                Ok((
+                    FaultCommitDisposition::Resolved,
+                    TlbCommitReq::relaxed(address_space_id),
+                ))
             }
         }
     }

@@ -256,11 +256,17 @@ pub(crate) fn try_remap_loaned_channel_read(
     dst_base: u64,
     loaned: &crate::task::LoanedUserPages,
 ) -> Result<bool, zx_status_t> {
-    let address_space_id = with_core(|kernel| {
-        let process = kernel.current_process_info()?;
-        kernel.process_address_space_id(process.process_id())
-    })?;
-    with_vm_mut(|vm| vm.try_remap_loaned_channel_read(address_space_id, dst_base, loaned))
+    with_state_mut(|state| {
+        let address_space_id = state.with_core(|kernel| {
+            let process = kernel.current_process_info()?;
+            kernel.process_address_space_id(process.process_id())
+        })?;
+        let (remapped, tlb_commit) = state.with_vm_mut(|vm| {
+            vm.try_remap_loaned_channel_read(address_space_id, dst_base, loaned)
+        })?;
+        state.apply_tlb_commit_reqs(&[tlb_commit])?;
+        Ok(remapped)
+    })
 }
 
 /// Write bytes into one stream socket.
@@ -423,15 +429,25 @@ pub fn channel_write(
             channel_endpoint_address_space_id(state, peer)?
         };
 
-        if let Some(ChannelPayload::Loaned(loaned)) = payload.as_mut()
-            && let Err(status) = state.with_vm_mut(|vm| {
+        if let Some(ChannelPayload::Loaned(loaned)) = payload.as_mut() {
+            match state.with_vm_mut(|vm| {
                 vm.prepare_loaned_channel_write(loaned, receiver_address_space_id)
-            })
-        {
-            if let Some(released) = payload.take() {
-                release_channel_payload(state, released);
+            }) {
+                Ok(tlb_commit) => {
+                    if let Err(status) = state.apply_tlb_commit_reqs(&[tlb_commit]) {
+                        if let Some(released) = payload.take() {
+                            release_channel_payload(state, released);
+                        }
+                        return Err(status);
+                    }
+                }
+                Err(status) => {
+                    if let Some(released) = payload.take() {
+                        release_channel_payload(state, released);
+                    }
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         let mut seen_handles = BTreeSet::new();

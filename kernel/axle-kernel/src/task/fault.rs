@@ -585,7 +585,14 @@ pub(crate) fn ensure_user_page_resident_serialized(
                         };
                         prepared.release_unused();
                         guard.complete();
-                        match outcome? {
+                        let (disposition, tlb_commit) = outcome?;
+                        crate::task::apply_tlb_commit_reqs(
+                            &vm_handle,
+                            crate::arch::apic::this_apic_id() as usize,
+                            Some(address_space_id),
+                            &[tlb_commit],
+                        )?;
+                        match disposition {
                             FaultCommitDisposition::Resolved => {
                                 update_fault_telemetry(&fault_handle, |table| {
                                     table.record_commit_resolved();
@@ -668,13 +675,23 @@ pub(crate) fn handle_page_fault_serialized(
                         let waiters = guard.complete();
                         wake_fault_waiters(&kernel_handle, waiters);
                         match outcome {
-                            Ok(FaultCommitDisposition::Resolved) => {
+                            Ok((FaultCommitDisposition::Resolved, tlb_commit)) => {
+                                if crate::task::apply_tlb_commit_reqs(
+                                    &vm_handle,
+                                    crate::arch::apic::this_apic_id() as usize,
+                                    Some(address_space_id),
+                                    &[tlb_commit],
+                                )
+                                .is_err()
+                                {
+                                    return PageFaultSerializedResult::Unhandled;
+                                }
                                 update_fault_telemetry(&fault_handle, |table| {
                                     table.record_commit_resolved();
                                 });
                                 return PageFaultSerializedResult::Handled;
                             }
-                            Ok(FaultCommitDisposition::Retry) => {
+                            Ok((FaultCommitDisposition::Retry, _)) => {
                                 update_fault_telemetry(&fault_handle, |table| {
                                     table.record_commit_retry();
                                 });
@@ -699,13 +716,23 @@ pub(crate) fn handle_page_fault_serialized(
                         let waiters = guard.complete();
                         wake_fault_waiters(&kernel_handle, waiters);
                         match outcome {
-                            Ok(FaultCommitDisposition::Resolved) => {
+                            Ok((FaultCommitDisposition::Resolved, tlb_commit)) => {
+                                if crate::task::apply_tlb_commit_reqs(
+                                    &vm_handle,
+                                    crate::arch::apic::this_apic_id() as usize,
+                                    Some(address_space_id),
+                                    &[tlb_commit],
+                                )
+                                .is_err()
+                                {
+                                    return PageFaultSerializedResult::Unhandled;
+                                }
                                 update_fault_telemetry(&fault_handle, |table| {
                                     table.record_commit_resolved();
                                 });
                                 return PageFaultSerializedResult::Handled;
                             }
-                            Ok(FaultCommitDisposition::Retry) => {
+                            Ok((FaultCommitDisposition::Retry, _)) => {
                                 update_fault_telemetry(&fault_handle, |table| {
                                     table.record_commit_retry();
                                 });
