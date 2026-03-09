@@ -422,7 +422,7 @@ fn wake_port_waiters(state: &mut object::KernelState, port_id: u64) -> Result<()
 }
 
 fn wake_expired_waits(state: &mut object::KernelState, now: i64) -> Result<(), zx_status_t> {
-    let expired = state.with_kernel_mut(|kernel| Ok(kernel.expire_waits(now)))?;
+    let expired = state.with_kernel_mut(|kernel| Ok(kernel.expire_waits_for_tick(now)))?;
     for expired_wait in expired {
         let thread_id = expired_wait.thread_id();
         let reason = match expired_wait.registration() {

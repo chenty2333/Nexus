@@ -38,6 +38,11 @@ pub fn init_bsp() {
     }
 }
 
+/// Current bring-up shape: only the BSP drives periodic timer interrupts.
+pub const fn ticks_all_cpus() -> bool {
+    false
+}
+
 fn arm_next_tick() {
     let now = crate::time::rdtsc();
     let delta = crate::time::ns_to_tsc(TICK_NS);

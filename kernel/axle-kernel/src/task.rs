@@ -1948,7 +1948,7 @@ pub(crate) struct Kernel {
     futexes: crate::futex::FutexTable,
     signal_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
     port_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
-    wait_timers: BinaryHeap<WaitTimerEntry>,
+    wait_timers: Vec<BinaryHeap<WaitTimerEntry>>,
     run_queue: VecDeque<ThreadId>,
     revocations: RevocationManager,
     next_koid: zx_koid_t,
@@ -2008,6 +2008,55 @@ impl VmDomain {
 }
 
 impl Kernel {
+    fn new_wait_timer_heaps() -> Vec<BinaryHeap<WaitTimerEntry>> {
+        (0..crate::smp::max_cpus())
+            .map(|_| BinaryHeap::new())
+            .collect()
+    }
+
+    fn wait_timer_cpu_slot(&self, cpu_id: usize) -> usize {
+        cpu_id.min(self.wait_timers.len().saturating_sub(1))
+    }
+
+    fn expire_waits_in_cpu_slot(
+        &mut self,
+        cpu_slot: usize,
+        now: i64,
+        expired: &mut Vec<ExpiredWait>,
+    ) {
+        loop {
+            let entry = {
+                let Some(heap) = self.wait_timers.get_mut(cpu_slot) else {
+                    return;
+                };
+                let Some(entry) = heap.peek().copied() else {
+                    return;
+                };
+                if entry.deadline > now {
+                    return;
+                }
+                let _ = heap.pop();
+                entry
+            };
+
+            let Some(thread) = self.threads.get(&entry.thread_id) else {
+                continue;
+            };
+            if thread.wait.seq != entry.seq || thread.wait.deadline != Some(entry.deadline) {
+                continue;
+            }
+            let Some(registration) = self.take_wait_registration_if_seq(entry.thread_id, entry.seq)
+            else {
+                continue;
+            };
+            self.remove_wait_source_membership(entry.thread_id, registration);
+            expired.push(ExpiredWait {
+                thread_id: entry.thread_id,
+                registration,
+            });
+        }
+    }
+
     /// Build the single-process bootstrap kernel model used by the current main branch.
     pub(crate) fn bootstrap() -> Self {
         let mut vm = VmDomain {
@@ -2074,7 +2123,7 @@ impl Kernel {
             futexes: crate::futex::FutexTable::new(),
             signal_waiters: BTreeMap::new(),
             port_waiters: BTreeMap::new(),
-            wait_timers: BinaryHeap::new(),
+            wait_timers: Self::new_wait_timer_heaps(),
             run_queue: VecDeque::new(),
             revocations: RevocationManager::new(),
             next_koid: 1,
@@ -2857,7 +2906,8 @@ impl Kernel {
         };
         self.enqueue_wait_source(thread_id, registration);
         if let Some(deadline) = deadline {
-            self.wait_timers.push(WaitTimerEntry {
+            let cpu_slot = self.wait_timer_cpu_slot(self.current_cpu_id());
+            self.wait_timers[cpu_slot].push(WaitTimerEntry {
                 deadline,
                 thread_id,
                 seq,
@@ -2952,29 +3002,18 @@ impl Kernel {
         Ok(true)
     }
 
-    pub(crate) fn expire_waits(&mut self, now: i64) -> Vec<ExpiredWait> {
+    pub(crate) fn expire_waits_for_tick(&mut self, now: i64) -> Vec<ExpiredWait> {
         let mut expired = Vec::new();
-        while let Some(entry) = self.wait_timers.peek().copied() {
-            if entry.deadline > now {
-                break;
-            }
-            let _ = self.wait_timers.pop();
-            let Some(thread) = self.threads.get(&entry.thread_id) else {
-                continue;
-            };
-            if thread.wait.seq != entry.seq || thread.wait.deadline != Some(entry.deadline) {
-                continue;
-            }
-            let Some(registration) = self.take_wait_registration_if_seq(entry.thread_id, entry.seq)
-            else {
-                continue;
-            };
-            self.remove_wait_source_membership(entry.thread_id, registration);
-            expired.push(ExpiredWait {
-                thread_id: entry.thread_id,
-                registration,
-            });
+        if crate::arch::timer::ticks_all_cpus() {
+            let cpu_slot = self.wait_timer_cpu_slot(self.current_cpu_id());
+            self.expire_waits_in_cpu_slot(cpu_slot, now, &mut expired);
+            return expired;
         }
+
+        for cpu_slot in 0..self.wait_timers.len() {
+            self.expire_waits_in_cpu_slot(cpu_slot, now, &mut expired);
+        }
+
         expired
     }
 

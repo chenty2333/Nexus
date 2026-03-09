@@ -13,6 +13,10 @@ const TRAMPOLINE_PADDR: u64 = 0x7000;
 const MAX_CPUS: usize = 16; // must match `ap_trampoline_params` in assembly
 const AP_STACK_SIZE: usize = 16 * 1024;
 
+pub const fn max_cpus() -> usize {
+    MAX_CPUS
+}
+
 #[repr(C)]
 struct ApTrampolineParams {
     cr3: u64,
