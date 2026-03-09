@@ -1,0 +1,18 @@
+[package]
+name = "axle-concurrency"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+axle-core = { path = "../../crates/axle-core" }
+axle-mm = { path = "../../crates/axle-mm" }
+axle-types = { path = "../../crates/axle-types" }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.20"

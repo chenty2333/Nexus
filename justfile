@@ -5,10 +5,10 @@ default:
 
 # Host-only gates for Phase A (contracts).
 xlint:
-  cargo clippy -p axle-types -p axle-core -p axle-mm -p axle-page-table -p axle-sync -p axle-conformance --all-targets -- -D warnings
+  cargo clippy -p axle-types -p axle-core -p axle-mm -p axle-page-table -p axle-sync -p axle-conformance -p axle-concurrency --all-targets -- -D warnings
 
 xtest:
-  cargo test -p axle-types -p axle-core -p axle-mm -p axle-page-table -p axle-sync -p axle-conformance
+  cargo test -p axle-types -p axle-core -p axle-mm -p axle-page-table -p axle-sync -p axle-conformance -p axle-concurrency
 
 # Kernel conformance gate.
 test-kernel:
@@ -27,6 +27,7 @@ test-all:
   just xtest
   just loom
   just fuzz-smoke
+  just concurrency-smoke
   just test-kernel
 
 fmt:
@@ -40,6 +41,9 @@ loom:
   cargo test -p axle-sync --features loom
   cargo test -p axle-core --features loom
   cargo test -p axle-mm --features loom
+
+concurrency-smoke:
+  cargo run -p axle-concurrency -- smoke --iterations 64 --max-steps 32
 
 # Short libFuzzer smoke run for the host-side semantic core.
 fuzz-smoke:
