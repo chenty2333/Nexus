@@ -162,7 +162,7 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
 }
 
 pub(super) fn release_channel_payload(state: &mut KernelState, payload: ChannelPayload) {
-    if let Some(loaned) = payload.loaned_body() {
+    if let Some(loaned) = payload.into_loaned_body() {
         let _ = state.with_vm_mut(|vm| {
             vm.release_loaned_user_pages(loaned);
             Ok(())
@@ -189,6 +189,38 @@ fn release_transferred_handles(state: &mut KernelState, handles: &[TransferredCa
 fn release_channel_message(state: &mut KernelState, message: ChannelMessage) {
     release_transferred_handles(state, &message.handles);
     release_channel_payload(state, message.payload);
+}
+
+struct HandleInstallBatch<'a> {
+    state: &'a mut KernelState,
+    installed: Vec<zx_handle_t>,
+}
+
+impl<'a> HandleInstallBatch<'a> {
+    fn new(state: &'a mut KernelState) -> Self {
+        Self {
+            state,
+            installed: Vec::new(),
+        }
+    }
+
+    fn install(&mut self, transferred: TransferredCap) -> Result<(), zx_status_t> {
+        let raw = self.state.install_transferred_handle(transferred)?;
+        self.installed.push(raw);
+        Ok(())
+    }
+
+    fn commit(mut self) -> Vec<zx_handle_t> {
+        core::mem::take(&mut self.installed)
+    }
+}
+
+impl Drop for HandleInstallBatch<'_> {
+    fn drop(&mut self) {
+        for raw in self.installed.drain(..) {
+            let _ = self.state.close_handle(raw);
+        }
+    }
 }
 
 pub(super) fn drain_channel_messages(
@@ -547,18 +579,15 @@ pub fn channel_read(
         }
     };
 
-    let mut installed_handles = Vec::new();
-    for transferred in transferred_handles {
-        match state.install_transferred_handle(transferred) {
-            Ok(raw) => installed_handles.push(raw),
-            Err(status) => {
-                for raw in installed_handles {
-                    let _ = state.close_handle(raw);
-                }
-                return Err((status, 0, 0));
-            }
+    let installed_handles = {
+        let mut installs = HandleInstallBatch::new(state);
+        for transferred in transferred_handles {
+            installs
+                .install(transferred)
+                .map_err(|status| (status, 0, 0))?;
         }
-    }
+        installs.commit()
+    };
 
     let message = {
         let endpoint = match state.objects.get_mut(&object_id) {

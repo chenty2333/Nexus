@@ -205,6 +205,21 @@ struct Observer {
     pending: Option<PendingState>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ObserverRegistration {
+    waitable: WaitableId,
+    key: PortKey,
+}
+
+impl ObserverRegistration {
+    const fn new(waitable: WaitableId, key: PortKey) -> Self {
+        Self { waitable, key }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KernelReserveTicket;
+
 /// A Zircon-like port with reservation + pending merge semantics.
 #[derive(Debug)]
 pub struct PortState<Q: PacketQueue> {
@@ -215,9 +230,9 @@ pub struct PortState<Q: PacketQueue> {
     user_in_q: usize,
 
     // Observers indexed by (waitable,key).
-    observers: BTreeMap<(WaitableId, PortKey), Observer>,
+    observers: BTreeMap<ObserverRegistration, Observer>,
     // Pending observer order (FIFO by first overflow).
-    pending_order: VecDeque<(WaitableId, PortKey)>,
+    pending_order: VecDeque<ObserverRegistration>,
 }
 
 /// Default port semantic state backed by an in-memory queue.
@@ -303,6 +318,10 @@ impl<Q: PacketQueue> PortState<Q> {
         self.capacity - self.kernel_reserve
     }
 
+    fn reserve_kernel_slot(&self) -> Option<KernelReserveTicket> {
+        (self.q.len() < self.capacity).then_some(KernelReserveTicket)
+    }
+
     /// Queue a user packet.
     ///
     /// Returns `ShouldWait` if the user quota is exhausted or the queue is full.
@@ -352,7 +371,7 @@ impl<Q: PacketQueue> PortState<Q> {
         current_signals: Signals,
         current_time: Time,
     ) -> Result<(), PortError> {
-        let k = (waitable, key);
+        let k = ObserverRegistration::new(waitable, key);
         if self.observers.contains_key(&k) {
             return Err(PortError::AlreadyExists);
         }
@@ -376,7 +395,7 @@ impl<Q: PacketQueue> PortState<Q> {
 
     /// Cancel an async wait.
     pub fn cancel(&mut self, waitable: WaitableId, key: PortKey) -> Result<(), PortError> {
-        let k = (waitable, key);
+        let k = ObserverRegistration::new(waitable, key);
         if self.observers.remove(&k).is_none() {
             return Err(PortError::NotFound);
         }
@@ -392,9 +411,12 @@ impl<Q: PacketQueue> PortState<Q> {
     /// - if full, mark observers as pending and merge repeated firings
     pub fn on_signals_changed(&mut self, waitable: WaitableId, current: Signals, now: Time) {
         // Collect matching keys first to avoid borrow checker issues.
-        let keys: Vec<(WaitableId, PortKey)> = self
+        let keys: Vec<ObserverRegistration> = self
             .observers
-            .range((waitable, 0)..=(waitable, u64::MAX))
+            .range(
+                ObserverRegistration::new(waitable, 0)
+                    ..=ObserverRegistration::new(waitable, u64::MAX),
+            )
             .map(|(k, _)| *k)
             .collect();
 
@@ -433,7 +455,7 @@ impl<Q: PacketQueue> PortState<Q> {
 
     fn enqueue_or_pending(
         &mut self,
-        k: (WaitableId, PortKey),
+        k: ObserverRegistration,
         trigger: Signals,
         current: Signals,
         now: Time,
@@ -448,8 +470,9 @@ impl<Q: PacketQueue> PortState<Q> {
             .unwrap_or(0);
 
         // If we have space, enqueue now (and remove observer) without borrowing it.
-        if self.q.len() < self.capacity {
-            let pkt = Packet::signal(k.1, k.0, trigger, current, 1, timestamp);
+        if let Some(ticket) = self.reserve_kernel_slot() {
+            let _ = ticket;
+            let pkt = Packet::signal(k.key, k.waitable, trigger, current, 1, timestamp);
             let queued = self.q.push_back(pkt);
             debug_assert!(
                 queued.is_ok(),
@@ -500,7 +523,15 @@ impl<Q: PacketQueue> PortState<Q> {
             };
 
             // Enqueue pending packet to the back (preserves FIFO among already queued packets).
-            let pkt = Packet::signal(k.1, k.0, p.trigger, p.observed, p.count, p.timestamp);
+            let _ticket = KernelReserveTicket;
+            let pkt = Packet::signal(
+                k.key,
+                k.waitable,
+                p.trigger,
+                p.observed,
+                p.count,
+                p.timestamp,
+            );
             let queued = self.q.push_back(pkt);
             debug_assert!(
                 queued.is_ok(),

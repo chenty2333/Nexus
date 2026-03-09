@@ -21,9 +21,9 @@ use axle_core::{CSpace, CSpaceError, Capability, RevocationManager, Signals, Tra
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
     CowFaultResolution, FrameId, FrameTable, FutexKey, GlobalVmoId, LazyAnonFaultResolution,
-    LazyVmoFaultResolution, MapRec, MappingPerms, PageFaultDecision, PageFaultFlags, PteMeta,
-    PteMetaTag, ReverseMapAnchor, VmaLookup, Vmar, VmarAllocMode, VmarId, VmarPlacementPolicy, Vmo,
-    VmoId, VmoKind,
+    LazyVmoFaultResolution, LoanToken, MapRec, MappingPerms, PageFaultDecision, PageFaultFlags,
+    PteMeta, PteMetaTag, ReverseMapAnchor, VmaLookup, Vmar, VmarAllocMode, VmarId,
+    VmarPlacementPolicy, Vmo, VmoId, VmoKind,
 };
 use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor, TxSet};
 use axle_types::rights::{
@@ -157,7 +157,47 @@ enum VmQuotaExceeded {
 struct VmResourceState {
     limits: VmResourceLimits,
     private_cow_pages: BTreeSet<u64>,
+    private_cow_pending: BTreeSet<u64>,
     stats: VmResourceStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CowReservationState {
+    AlreadyTracked,
+    Reserved,
+}
+
+#[derive(Debug)]
+#[must_use = "COW reservations must be explicitly committed or released"]
+struct CowReservation {
+    address_space_id: AddressSpaceId,
+    page_base: u64,
+    state: CowReservationState,
+}
+
+impl CowReservation {
+    fn commit(mut self, vm: &mut VmDomain) {
+        if matches!(self.state, CowReservationState::Reserved) {
+            vm.commit_private_cow_page(self.address_space_id, self.page_base);
+            self.state = CowReservationState::AlreadyTracked;
+        }
+    }
+
+    fn release(mut self, vm: &mut VmDomain) {
+        if matches!(self.state, CowReservationState::Reserved) {
+            vm.rollback_private_cow_page_reservation(self.address_space_id, self.page_base);
+            self.state = CowReservationState::AlreadyTracked;
+        }
+    }
+}
+
+impl Drop for CowReservation {
+    fn drop(&mut self) {
+        debug_assert!(
+            !matches!(self.state, CowReservationState::Reserved),
+            "CowReservation dropped without explicit commit or release"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,6 +309,7 @@ impl VmResourceState {
                 max_inflight_loan_pages: DEFAULT_MAX_INFLIGHT_LOAN_PAGES,
             },
             private_cow_pages: BTreeSet::new(),
+            private_cow_pending: BTreeSet::new(),
             stats: VmResourceStats::default(),
         }
     }
@@ -277,23 +318,38 @@ impl VmResourceState {
         self.stats
     }
 
-    fn try_reserve_private_cow_page(&mut self, page_base: u64) -> Result<bool, VmQuotaExceeded> {
-        if self.private_cow_pages.contains(&page_base) {
-            return Ok(false);
+    fn try_reserve_private_cow_page(
+        &mut self,
+        page_base: u64,
+    ) -> Result<CowReservationState, VmQuotaExceeded> {
+        if self.private_cow_pages.contains(&page_base)
+            || self.private_cow_pending.contains(&page_base)
+        {
+            return Ok(CowReservationState::AlreadyTracked);
         }
+        let reserved_pages = self.private_cow_pending.len() as u64;
         if let Some(limit) = self.limits.max_private_cow_pages
-            && self.stats.current_private_cow_pages >= limit
+            && self
+                .stats
+                .current_private_cow_pages
+                .saturating_add(reserved_pages)
+                >= limit
         {
             self.stats.private_cow_quota_hits = self.stats.private_cow_quota_hits.wrapping_add(1);
             return Err(VmQuotaExceeded::PrivateCowPages {
                 limit,
-                current: self.stats.current_private_cow_pages,
+                current: self
+                    .stats
+                    .current_private_cow_pages
+                    .saturating_add(reserved_pages),
             });
         }
-        Ok(true)
+        let _ = self.private_cow_pending.insert(page_base);
+        Ok(CowReservationState::Reserved)
     }
 
     fn commit_private_cow_page(&mut self, page_base: u64) -> bool {
+        let _ = self.private_cow_pending.remove(&page_base);
         if !self.private_cow_pages.insert(page_base) {
             return false;
         }
@@ -306,6 +362,10 @@ impl VmResourceState {
         true
     }
 
+    fn rollback_private_cow_page_reservation(&mut self, page_base: u64) -> bool {
+        self.private_cow_pending.remove(&page_base)
+    }
+
     fn clear_private_cow_range(&mut self, base: u64, len: u64) -> u64 {
         let Some(end) = base.checked_add(len) else {
             return 0;
@@ -315,6 +375,8 @@ impl VmResourceState {
         for page_base in removed {
             let _ = self.private_cow_pages.remove(&page_base);
         }
+        self.private_cow_pending
+            .retain(|page_base| *page_base < base || *page_base >= end);
         self.stats.current_private_cow_pages = self
             .stats
             .current_private_cow_pages
@@ -1242,14 +1304,16 @@ impl ExpiredWait {
 }
 
 /// Pinned page run loaned from the current process into a kernel object.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+#[must_use = "loaned user pages must be explicitly released"]
 pub(crate) struct LoanedUserPages {
     address_space_id: AddressSpaceId,
     receiver_address_space_id: Option<AddressSpaceId>,
     base: u64,
     len: u32,
     needs_cow: bool,
-    pages: Vec<FrameId>,
+    budget_pages: u64,
+    loan: LoanToken,
 }
 
 impl LoanedUserPages {
@@ -1274,11 +1338,54 @@ impl LoanedUserPages {
     }
 
     pub(crate) fn pages(&self) -> &[FrameId] {
-        &self.pages
+        self.loan.frame_ids()
     }
 
     fn bind_receiver_address_space(&mut self, address_space_id: AddressSpaceId) {
         self.receiver_address_space_id = Some(address_space_id);
+    }
+
+    fn release(self, vm: &mut VmDomain) {
+        vm.release_loaned_pages_inner(self.address_space_id, self.budget_pages, self.loan);
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "loan reservations must be explicitly released or committed into LoanedUserPages"]
+struct InflightLoanReservation {
+    address_space_id: AddressSpaceId,
+    pages: u64,
+    active: bool,
+}
+
+impl InflightLoanReservation {
+    fn commit(mut self, base: u64, len: u32, needs_cow: bool, loan: LoanToken) -> LoanedUserPages {
+        self.active = false;
+        LoanedUserPages {
+            address_space_id: self.address_space_id,
+            receiver_address_space_id: None,
+            base,
+            len,
+            needs_cow,
+            budget_pages: self.pages,
+            loan,
+        }
+    }
+
+    fn release(mut self, vm: &mut VmDomain) {
+        if self.active {
+            vm.release_inflight_loan_pages(self.address_space_id, self.pages);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for InflightLoanReservation {
+    fn drop(&mut self) {
+        debug_assert!(
+            !self.active,
+            "InflightLoanReservation dropped without explicit release or commit"
+        );
     }
 }
 
@@ -1864,12 +1971,20 @@ impl AddressSpace {
             .replace_mapping_frames_copy_on_write(frames, base, len, replacement_frames)
     }
 
-    fn try_reserve_private_cow_page(&mut self, page_base: u64) -> Result<bool, VmQuotaExceeded> {
+    fn try_reserve_private_cow_page(
+        &mut self,
+        page_base: u64,
+    ) -> Result<CowReservationState, VmQuotaExceeded> {
         self.vm_resources.try_reserve_private_cow_page(page_base)
     }
 
     fn commit_private_cow_page(&mut self, page_base: u64) -> bool {
         self.vm_resources.commit_private_cow_page(page_base)
+    }
+
+    fn rollback_private_cow_page_reservation(&mut self, page_base: u64) -> bool {
+        self.vm_resources
+            .rollback_private_cow_page_reservation(page_base)
     }
 
     fn clear_private_cow_range(&mut self, base: u64, len: u64) -> u64 {
@@ -2543,7 +2658,7 @@ impl Kernel {
         self.with_vm_mut(|vm| vm.try_loan_user_pages(address_space_id, ptr, len))
     }
 
-    pub(crate) fn release_loaned_user_pages(&mut self, loaned: &LoanedUserPages) {
+    pub(crate) fn release_loaned_user_pages(&mut self, loaned: LoanedUserPages) {
         self.with_vm_mut(|vm| vm.release_loaned_user_pages(loaned))
     }
 
@@ -2839,28 +2954,24 @@ impl Kernel {
         self.with_vm(|vm| vm.log_vm_quota_exceeded(address_space_id, exceeded, context))
     }
 
-    fn try_reserve_private_cow_page(
+    fn reserve_private_cow_page(
         &mut self,
         address_space_id: AddressSpaceId,
         page_base: u64,
-    ) -> Result<bool, zx_status_t> {
-        self.with_vm_mut(|vm| vm.try_reserve_private_cow_page(address_space_id, page_base))
-    }
-
-    fn commit_private_cow_page(&mut self, address_space_id: AddressSpaceId, page_base: u64) {
-        self.with_vm_mut(|vm| vm.commit_private_cow_page(address_space_id, page_base));
+    ) -> Result<CowReservation, zx_status_t> {
+        self.with_vm_mut(|vm| vm.reserve_private_cow_page(address_space_id, page_base))
     }
 
     fn clear_private_cow_range(&mut self, address_space_id: AddressSpaceId, base: u64, len: u64) {
         self.with_vm_mut(|vm| vm.clear_private_cow_range(address_space_id, base, len));
     }
 
-    fn try_reserve_inflight_loan_pages(
+    fn reserve_inflight_loan_pages(
         &mut self,
         address_space_id: AddressSpaceId,
         pages: u64,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm_mut(|vm| vm.try_reserve_inflight_loan_pages(address_space_id, pages))
+    ) -> Result<InflightLoanReservation, zx_status_t> {
+        self.with_vm_mut(|vm| vm.reserve_inflight_loan_pages(address_space_id, pages))
     }
 
     fn release_inflight_loan_pages(&mut self, address_space_id: AddressSpaceId, pages: u64) {
@@ -4112,14 +4223,6 @@ impl Kernel {
     fn validate_frame_mapping_invariants_for(&self, frame_ids: &[FrameId], context: &str) {
         self.with_vm(|vm| vm.validate_frame_mapping_invariants_for(frame_ids, context))
     }
-
-    fn release_pinned_loan_frames(&mut self, pages: &[FrameId]) {
-        self.with_vm_mut(|vm| vm.release_pinned_loan_frames(pages))
-    }
-
-    fn release_loaned_pages_inner(&mut self, address_space_id: AddressSpaceId, pages: &[FrameId]) {
-        self.with_vm_mut(|vm| vm.release_loaned_pages_inner(address_space_id, pages))
-    }
 }
 
 /// Apply one or more committed TLB requirements against the current CPU and any tracked
@@ -4480,11 +4583,11 @@ impl VmDomain {
         }
     }
 
-    fn try_reserve_private_cow_page(
+    fn reserve_private_cow_page(
         &mut self,
         address_space_id: AddressSpaceId,
         page_base: u64,
-    ) -> Result<bool, zx_status_t> {
+    ) -> Result<CowReservation, zx_status_t> {
         let reservation = {
             let address_space = self
                 .address_spaces
@@ -4493,7 +4596,11 @@ impl VmDomain {
             address_space.try_reserve_private_cow_page(page_base)
         };
         match reservation {
-            Ok(reserved) => Ok(reserved),
+            Ok(state) => Ok(CowReservation {
+                address_space_id,
+                page_base,
+                state,
+            }),
             Err(exceeded) => {
                 self.vm_private_cow_quota_hits = self.vm_private_cow_quota_hits.wrapping_add(1);
                 self.record_vm_resource_telemetry();
@@ -4519,6 +4626,21 @@ impl VmDomain {
         self.record_vm_resource_telemetry();
     }
 
+    fn rollback_private_cow_page_reservation(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+    ) {
+        let rolled_back = self
+            .address_spaces
+            .get_mut(&address_space_id)
+            .map(|address_space| address_space.rollback_private_cow_page_reservation(page_base))
+            .unwrap_or(false);
+        if rolled_back {
+            self.record_vm_resource_telemetry();
+        }
+    }
+
     fn clear_private_cow_range(&mut self, address_space_id: AddressSpaceId, base: u64, len: u64) {
         let removed = self
             .address_spaces
@@ -4533,11 +4655,11 @@ impl VmDomain {
         self.record_vm_resource_telemetry();
     }
 
-    fn try_reserve_inflight_loan_pages(
+    fn reserve_inflight_loan_pages(
         &mut self,
         address_space_id: AddressSpaceId,
         pages: u64,
-    ) -> Result<(), zx_status_t> {
+    ) -> Result<InflightLoanReservation, zx_status_t> {
         let reservation = {
             let address_space = self
                 .address_spaces
@@ -4566,6 +4688,11 @@ impl VmDomain {
                 Err(ZX_ERR_SHOULD_WAIT)
             }
         }
+        .map(|()| InflightLoanReservation {
+            address_space_id,
+            pages,
+            active: true,
+        })
     }
 
     fn release_inflight_loan_pages(&mut self, address_space_id: AddressSpaceId, pages: u64) {
@@ -5497,31 +5624,47 @@ impl VmDomain {
             resident_pages.push(frame_id);
         }
 
-        self.with_frames_mut(|frames| frames.pin_and_inc_loan_many(&resident_pages))
+        let pin = self
+            .with_frames_mut(|frames| frames.pin_many(&resident_pages))
             .map_err(|_| ZX_ERR_BAD_STATE)?;
-        let pinned = resident_pages;
-        self.try_reserve_inflight_loan_pages(
+        let budget = match self.reserve_inflight_loan_pages(
             address_space_id,
             u64::try_from(page_count).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
-        )
-        .inspect_err(|_| self.release_pinned_loan_frames(&pinned))?;
+        ) {
+            Ok(budget) => budget,
+            Err(status) => {
+                self.with_frames_mut(|frames| pin.release(frames));
+                return Err(status);
+            }
+        };
+        let loan = match self.with_frames_mut(|frames| pin.into_loan(frames)) {
+            Ok(loan) => loan,
+            Err(_) => {
+                budget.release(self);
+                return Err(ZX_ERR_BAD_STATE);
+            }
+        };
 
-        let len_u32 = u32::try_from(len).map_err(|_| {
-            self.release_loaned_pages_inner(address_space_id, &pinned);
-            ZX_ERR_OUT_OF_RANGE
-        })?;
-        Ok(Some(LoanedUserPages {
-            address_space_id,
-            receiver_address_space_id: None,
-            base: ptr,
-            len: len_u32,
-            needs_cow: lookup.max_perms().contains(MappingPerms::WRITE),
-            pages: pinned,
-        }))
+        let len_u32 = match u32::try_from(len) {
+            Ok(len_u32) => len_u32,
+            Err(_) => {
+                let frame_ids = loan.frame_ids().to_vec();
+                self.with_frames_mut(|frames| loan.release(frames));
+                budget.release(self);
+                self.validate_frame_mapping_invariants_for(&frame_ids, "try_loan_user_pages");
+                return Err(ZX_ERR_OUT_OF_RANGE);
+            }
+        };
+        Ok(Some(budget.commit(
+            ptr,
+            len_u32,
+            lookup.max_perms().contains(MappingPerms::WRITE),
+            loan,
+        )))
     }
 
-    pub(crate) fn release_loaned_user_pages(&mut self, loaned: &LoanedUserPages) {
-        self.release_loaned_pages_inner(loaned.address_space_id(), loaned.pages())
+    pub(crate) fn release_loaned_user_pages(&mut self, loaned: LoanedUserPages) {
+        loaned.release(self)
     }
 
     pub(crate) fn prepare_loaned_channel_write(
@@ -6034,28 +6177,34 @@ impl VmDomain {
                         TlbCommitReq::relaxed(address_space_id),
                     ));
                 }
-                let reserve_private =
-                    self.try_reserve_private_cow_page(address_space_id, page_base)?;
-                let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
-                let resolved = self.with_address_space_frames_mut(
-                    address_space_id,
-                    |address_space, frames| {
+                let reserve_private = self.reserve_private_cow_page(address_space_id, page_base)?;
+                let cow_result = (|| {
+                    let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
+                    self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
                         let new_frame_id = frames
                             .register_existing(new_frame_paddr)
                             .map_err(|_| ZX_ERR_BAD_STATE)?;
                         address_space
                             .resolve_cow_fault(frames, page_base, new_frame_id)
                             .map_err(map_address_space_error)
-                    },
-                )?;
-                self.sync_mapping_pages(
+                    })
+                })();
+                let resolved = match cow_result {
+                    Ok(resolved) => resolved,
+                    Err(status) => {
+                        reserve_private.release(self);
+                        return Err(status);
+                    }
+                };
+                if let Err(status) = self.sync_mapping_pages(
                     address_space_id,
                     resolved.fault_page_base(),
                     crate::userspace::USER_PAGE_BYTES,
-                )?;
-                if reserve_private {
-                    self.commit_private_cow_page(address_space_id, resolved.fault_page_base());
+                ) {
+                    reserve_private.release(self);
+                    return Err(status);
                 }
+                reserve_private.commit(self);
                 self.cow_fault_count = self.cow_fault_count.wrapping_add(1);
                 crate::userspace::record_vm_cow_fault_count(self.cow_fault_count);
                 crate::userspace::record_vm_last_cow_rmap_counts(
@@ -6491,20 +6640,19 @@ impl VmDomain {
         fault_va: u64,
     ) -> Result<(), zx_status_t> {
         let fault_page_base = align_down_page(fault_va);
-        let reserve_private =
-            self.try_reserve_private_cow_page(address_space_id, fault_page_base)?;
-        let lookup = self
-            .address_spaces
-            .get(&address_space_id)
-            .and_then(|space| space.lookup_user_mapping(fault_va, 1))
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        if lookup.vmo_kind() != VmoKind::Anonymous {
-            return Err(ZX_ERR_BAD_STATE);
-        }
-        let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
-        let new_frame_paddr = crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw())
-            .ok_or(ZX_ERR_NO_MEMORY)?;
-        let resolved =
+        let reserve_private = self.reserve_private_cow_page(address_space_id, fault_page_base)?;
+        let cow_result = (|| {
+            let lookup = self
+                .address_spaces
+                .get(&address_space_id)
+                .and_then(|space| space.lookup_user_mapping(fault_va, 1))
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            if lookup.vmo_kind() != VmoKind::Anonymous {
+                return Err(ZX_ERR_BAD_STATE);
+            }
+            let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
+            let new_frame_paddr = crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw())
+                .ok_or(ZX_ERR_NO_MEMORY)?;
             self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
                 let new_frame_id = frames
                     .register_existing(new_frame_paddr)
@@ -6512,15 +6660,24 @@ impl VmDomain {
                 address_space
                     .resolve_cow_fault(frames, fault_va, new_frame_id)
                     .map_err(map_address_space_error)
-            })?;
-        self.sync_mapping_pages(
+            })
+        })();
+        let resolved = match cow_result {
+            Ok(resolved) => resolved,
+            Err(status) => {
+                reserve_private.release(self);
+                return Err(status);
+            }
+        };
+        if let Err(status) = self.sync_mapping_pages(
             address_space_id,
             resolved.fault_page_base(),
             crate::userspace::USER_PAGE_BYTES,
-        )?;
-        if reserve_private {
-            self.commit_private_cow_page(address_space_id, resolved.fault_page_base());
+        ) {
+            reserve_private.release(self);
+            return Err(status);
         }
+        reserve_private.commit(self);
         self.cow_fault_count = self.cow_fault_count.wrapping_add(1);
         crate::userspace::record_vm_cow_fault_count(self.cow_fault_count);
         crate::userspace::record_vm_last_cow_rmap_counts(
@@ -6746,17 +6903,16 @@ impl VmDomain {
         }
     }
 
-    fn release_pinned_loan_frames(&mut self, pages: &[FrameId]) {
-        self.with_frames_mut(|frames| frames.dec_loan_and_unpin_many(pages));
-    }
-
-    fn release_loaned_pages_inner(&mut self, address_space_id: AddressSpaceId, pages: &[FrameId]) {
-        self.release_pinned_loan_frames(pages);
-        self.release_inflight_loan_pages(
-            address_space_id,
-            u64::try_from(pages.len()).unwrap_or(u64::MAX),
-        );
-        self.validate_frame_mapping_invariants_for(pages, "release_loaned_pages_inner");
+    fn release_loaned_pages_inner(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        budget_pages: u64,
+        loan: LoanToken,
+    ) {
+        let frame_ids = loan.frame_ids().to_vec();
+        self.with_frames_mut(|frames| loan.release(frames));
+        self.release_inflight_loan_pages(address_space_id, budget_pages);
+        self.validate_frame_mapping_invariants_for(&frame_ids, "release_loaned_pages_inner");
     }
 }
 

@@ -187,8 +187,9 @@ fuzz_target!(|data: &[u8]| {
             _ => {
                 let frame_addr = 0x2000_0000 + (u64::from(chunk.get(1).copied().unwrap_or(0)) * PAGE_SIZE);
                 if let Ok(frame_id) = frames.register_existing(frame_addr) {
-                    let _ = frames.pin(frame_id);
-                    let _ = frames.unpin(frame_id);
+                    if let Ok(pin) = frames.pin_frame(frame_id) {
+                        pin.release(&mut frames);
+                    }
                 }
             }
         }

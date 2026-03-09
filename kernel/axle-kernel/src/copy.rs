@@ -439,7 +439,11 @@ pub(crate) fn copyout_loaned_bytes(
     ptr: *mut u8,
     loaned: &LoanedUserPages,
 ) -> Result<(), zx_status_t> {
-    write_channel_payload_to_user(ptr, &ChannelPayload::Loaned(loaned.clone()))
+    let span = UserCopyCtx::current()?.validate_write(
+        ptr as u64,
+        usize::try_from(loaned.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+    )?;
+    copyout_loaned_to_span(span, 0, loaned)
 }
 
 pub(crate) fn prepare_channel_write_payload(

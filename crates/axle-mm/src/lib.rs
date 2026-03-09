@@ -165,6 +165,109 @@ impl FrameDesc {
     }
 }
 
+/// Owned reference to one frame-table refcount increment.
+#[derive(Debug)]
+#[must_use = "frame references must be explicitly released"]
+pub struct FrameRef {
+    frame_id: Option<FrameId>,
+}
+
+impl FrameRef {
+    /// Borrow the owned frame identifier.
+    pub const fn frame_id(&self) -> Option<FrameId> {
+        self.frame_id
+    }
+
+    /// Release this reference back into the frame table.
+    pub fn release(mut self, frames: &mut FrameTable) -> Result<(), FrameTableError> {
+        if let Some(frame_id) = self.frame_id.take() {
+            frames.dec_ref(frame_id)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FrameRef {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.frame_id.is_none(),
+            "FrameRef dropped without explicit release"
+        );
+    }
+}
+
+/// Owned pin over one or more registered frames.
+#[derive(Debug)]
+#[must_use = "pin tokens must be explicitly released or converted into a loan"]
+pub struct PinToken {
+    frame_ids: Option<Vec<FrameId>>,
+}
+
+impl PinToken {
+    /// Borrow the pinned frames.
+    pub fn frame_ids(&self) -> &[FrameId] {
+        self.frame_ids.as_deref().unwrap_or(&[])
+    }
+
+    /// Convert this pin into one in-flight loan over the same frames.
+    pub fn into_loan(mut self, frames: &mut FrameTable) -> Result<LoanToken, FrameTableError> {
+        let frame_ids = self.frame_ids.take().unwrap_or_default();
+        if let Err(err) = frames.inc_loan_many(&frame_ids) {
+            frames.release_pins(&frame_ids);
+            return Err(err);
+        }
+        Ok(LoanToken {
+            frame_ids: Some(frame_ids),
+        })
+    }
+
+    /// Release this pin without creating a loan.
+    pub fn release(mut self, frames: &mut FrameTable) {
+        if let Some(frame_ids) = self.frame_ids.take() {
+            frames.release_pins(&frame_ids);
+        }
+    }
+}
+
+impl Drop for PinToken {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.frame_ids.is_none(),
+            "PinToken dropped without explicit release"
+        );
+    }
+}
+
+/// Owned in-flight loan over one or more registered frames.
+#[derive(Debug)]
+#[must_use = "loan tokens must be explicitly released"]
+pub struct LoanToken {
+    frame_ids: Option<Vec<FrameId>>,
+}
+
+impl LoanToken {
+    /// Borrow the loaned frames.
+    pub fn frame_ids(&self) -> &[FrameId] {
+        self.frame_ids.as_deref().unwrap_or(&[])
+    }
+
+    /// Release the loan and its underlying pins.
+    pub fn release(mut self, frames: &mut FrameTable) {
+        if let Some(frame_ids) = self.frame_ids.take() {
+            frames.release_loans(&frame_ids);
+        }
+    }
+}
+
+impl Drop for LoanToken {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.frame_ids.is_none(),
+            "LoanToken dropped without explicit release"
+        );
+    }
+}
+
 /// Errors returned by frame-table operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameTableError {
@@ -435,8 +538,32 @@ impl FrameTable {
         Ok(())
     }
 
+    /// Acquire one owned frame reference.
+    pub fn acquire_frame_ref(&mut self, id: FrameId) -> Result<FrameRef, FrameTableError> {
+        self.inc_ref(id)?;
+        Ok(FrameRef { frame_id: Some(id) })
+    }
+
+    /// Acquire one owned pin over a single frame.
+    pub fn pin_frame(&mut self, id: FrameId) -> Result<PinToken, FrameTableError> {
+        self.pin_many(&[id])
+    }
+
+    /// Acquire one owned pin over multiple frames, rolling back on failure.
+    pub fn pin_many(&mut self, ids: &[FrameId]) -> Result<PinToken, FrameTableError> {
+        for (applied, &id) in ids.iter().enumerate() {
+            if let Err(err) = self.pin(id) {
+                self.release_pins(&ids[..applied]);
+                return Err(err);
+            }
+        }
+        Ok(PinToken {
+            frame_ids: Some(ids.to_vec()),
+        })
+    }
+
     /// Increment the total refcount for a registered frame.
-    pub fn inc_ref(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+    fn inc_ref(&mut self, id: FrameId) -> Result<(), FrameTableError> {
         let frame = self.frame_mut(id)?;
         frame.ref_count = frame
             .ref_count
@@ -446,7 +573,7 @@ impl FrameTable {
     }
 
     /// Decrement the total refcount for a registered frame.
-    pub fn dec_ref(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+    fn dec_ref(&mut self, id: FrameId) -> Result<(), FrameTableError> {
         let frame = self.frame_mut(id)?;
         if frame.ref_count == 0 {
             return Err(FrameTableError::RefUnderflow);
@@ -456,7 +583,7 @@ impl FrameTable {
     }
 
     /// Pin a registered frame.
-    pub fn pin(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+    fn pin(&mut self, id: FrameId) -> Result<(), FrameTableError> {
         let frame = self.frame_mut(id)?;
         frame.pin_count = frame
             .pin_count
@@ -466,7 +593,7 @@ impl FrameTable {
     }
 
     /// Unpin a previously pinned frame.
-    pub fn unpin(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+    fn unpin(&mut self, id: FrameId) -> Result<(), FrameTableError> {
         let frame = self.frame_mut(id)?;
         if frame.pin_count == 0 {
             return Err(FrameTableError::PinUnderflow);
@@ -476,7 +603,7 @@ impl FrameTable {
     }
 
     /// Increment the in-flight loan count for a registered frame.
-    pub fn inc_loan(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+    fn inc_loan(&mut self, id: FrameId) -> Result<(), FrameTableError> {
         let frame = self.frame_mut(id)?;
         frame.loan_count = frame
             .loan_count
@@ -486,7 +613,7 @@ impl FrameTable {
     }
 
     /// Decrement the in-flight loan count for a registered frame.
-    pub fn dec_loan(&mut self, id: FrameId) -> Result<(), FrameTableError> {
+    fn dec_loan(&mut self, id: FrameId) -> Result<(), FrameTableError> {
         let frame = self.frame_mut(id)?;
         if frame.loan_count == 0 {
             return Err(FrameTableError::LoanUnderflow);
@@ -495,24 +622,30 @@ impl FrameTable {
         Ok(())
     }
 
-    /// Pin and mark multiple frames as in-flight loans atomically with rollback on failure.
-    pub fn pin_and_inc_loan_many(&mut self, ids: &[FrameId]) -> Result<(), FrameTableError> {
+    fn inc_loan_many(&mut self, ids: &[FrameId]) -> Result<(), FrameTableError> {
         for (applied, &id) in ids.iter().enumerate() {
-            if let Err(err) = self.pin(id) {
-                self.dec_loan_and_unpin_many(&ids[..applied]);
-                return Err(err);
-            }
             if let Err(err) = self.inc_loan(id) {
-                let _ = self.unpin(id);
-                self.dec_loan_and_unpin_many(&ids[..applied]);
+                self.release_loans_only(&ids[..applied]);
                 return Err(err);
             }
         }
         Ok(())
     }
 
+    fn release_pins(&mut self, ids: &[FrameId]) {
+        for &id in ids {
+            let _ = self.unpin(id);
+        }
+    }
+
+    fn release_loans_only(&mut self, ids: &[FrameId]) {
+        for &id in ids {
+            let _ = self.dec_loan(id);
+        }
+    }
+
     /// Drop in-flight loan pins for multiple frames.
-    pub fn dec_loan_and_unpin_many(&mut self, ids: &[FrameId]) {
+    fn release_loans(&mut self, ids: &[FrameId]) {
         for &id in ids {
             let _ = self.dec_loan(id);
             let _ = self.unpin(id);
@@ -4899,23 +5032,29 @@ mod tests {
         let frame0 = frames.register_existing(0x21_000).unwrap();
         let frame1 = frames.register_existing(0x22_000).unwrap();
 
-        frames.pin_and_inc_loan_many(&[frame0, frame1]).unwrap();
+        let loan = frames
+            .pin_many(&[frame0, frame1])
+            .unwrap()
+            .into_loan(&mut frames)
+            .unwrap();
         assert_eq!(frames.state(frame0).unwrap().pin_count(), 1);
         assert_eq!(frames.state(frame0).unwrap().loan_count(), 1);
         assert_eq!(frames.state(frame1).unwrap().pin_count(), 1);
         assert_eq!(frames.state(frame1).unwrap().loan_count(), 1);
 
-        frames.dec_loan_and_unpin_many(&[frame0, frame1]);
+        loan.release(&mut frames);
         assert_eq!(frames.state(frame0).unwrap().pin_count(), 0);
         assert_eq!(frames.state(frame0).unwrap().loan_count(), 0);
         assert_eq!(frames.state(frame1).unwrap().pin_count(), 0);
         assert_eq!(frames.state(frame1).unwrap().loan_count(), 0);
 
         let missing = FrameId(0x23_000);
-        assert_eq!(
-            frames.pin_and_inc_loan_many(&[frame0, missing]),
+        assert!(matches!(
+            frames
+                .pin_many(&[frame0, missing])
+                .and_then(|pin| pin.into_loan(&mut frames)),
             Err(FrameTableError::NotFound)
-        );
+        ));
         assert_eq!(frames.state(frame0).unwrap().pin_count(), 0);
         assert_eq!(frames.state(frame0).unwrap().loan_count(), 0);
     }
@@ -4934,26 +5073,35 @@ mod tests {
 
         frames.inc_map(frame).unwrap();
         frames.inc_map(frame).unwrap();
-        frames.inc_loan(frame).unwrap();
-        frames.inc_loan(frame).unwrap();
+        let loan0 = frames
+            .pin_frame(frame)
+            .unwrap()
+            .into_loan(&mut frames)
+            .unwrap();
+        let loan1 = frames
+            .pin_frame(frame)
+            .unwrap()
+            .into_loan(&mut frames)
+            .unwrap();
         let mapped = frames.state(frame).unwrap();
         assert_eq!(mapped.ref_count(), 2);
         assert_eq!(mapped.map_count(), 2);
         assert_eq!(mapped.loan_count(), 2);
         assert_eq!(mapped.rmap_anchor(), None);
         assert_eq!(mapped.rmap_anchor_count(), 0);
+        assert_eq!(mapped.pin_count(), 2);
 
         frames.dec_map(frame).unwrap();
         frames.dec_map(frame).unwrap();
-        frames.dec_loan(frame).unwrap();
-        frames.dec_loan(frame).unwrap();
+        loan0.release(&mut frames);
+        loan1.release(&mut frames);
         let unmapped = frames.state(frame).unwrap();
         assert_eq!(unmapped.ref_count(), 0);
         assert_eq!(unmapped.map_count(), 0);
         assert_eq!(unmapped.loan_count(), 0);
         assert_eq!(unmapped.rmap_anchor_count(), 0);
         assert_eq!(frames.dec_map(frame), Err(FrameTableError::RefUnderflow));
-        assert_eq!(frames.dec_loan(frame), Err(FrameTableError::LoanUnderflow));
+        assert_eq!(unmapped.pin_count(), 0);
     }
 
     #[test]
@@ -5465,8 +5613,13 @@ mod tests {
         }
 
         fn loan_shared_once(&mut self) {
-            self.frames.pin_and_inc_loan_many(&[self.shared]).unwrap();
-            self.frames.dec_loan_and_unpin_many(&[self.shared]);
+            let loan = self
+                .frames
+                .pin_many(&[self.shared])
+                .unwrap()
+                .into_loan(&mut self.frames)
+                .unwrap();
+            loan.release(&mut self.frames);
         }
     }
 
@@ -5515,8 +5668,13 @@ mod tests {
         }
 
         fn loan_shared_once(&mut self) {
-            self.frames.pin_and_inc_loan_many(&[self.shared]).unwrap();
-            self.frames.dec_loan_and_unpin_many(&[self.shared]);
+            let loan = self
+                .frames
+                .pin_many(&[self.shared])
+                .unwrap()
+                .into_loan(&mut self.frames)
+                .unwrap();
+            loan.release(&mut self.frames);
         }
     }
 

@@ -81,7 +81,7 @@ pub(crate) struct TimerObject {
     clock_id: zx_clock_t,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct FragmentedChannelPayload {
     pub(crate) head: Vec<u8>,
     pub(crate) body: Option<crate::task::LoanedUserPages>,
@@ -89,14 +89,14 @@ pub(crate) struct FragmentedChannelPayload {
     pub(crate) len: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum ChannelPayload {
     Copied(Vec<u8>),
     Loaned(crate::task::LoanedUserPages),
     Fragmented(FragmentedChannelPayload),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ChannelMessage {
     payload: ChannelPayload,
     handles: Vec<TransferredCap>,
@@ -148,10 +148,10 @@ impl ChannelPayload {
         }
     }
 
-    pub(crate) fn loaned_body(&self) -> Option<&crate::task::LoanedUserPages> {
+    pub(crate) fn into_loaned_body(self) -> Option<crate::task::LoanedUserPages> {
         match self {
             Self::Loaned(loaned) => Some(loaned),
-            Self::Fragmented(payload) => payload.body.as_ref(),
+            Self::Fragmented(payload) => payload.body,
             Self::Copied(_) => None,
         }
     }
