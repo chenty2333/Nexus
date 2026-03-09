@@ -2,16 +2,20 @@ use super::*;
 
 impl KernelState {
     pub(super) fn alloc_handle_for_object(
-        &mut self,
+        &self,
         object_id: u64,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
         let cap = Capability::new(object_id, rights.bits(), DEFAULT_OBJECT_GENERATION);
         let handle = self.with_core_mut(|kernel| kernel.alloc_handle_for_current_process(cap))?;
-        self.object_handle_refs
-            .entry(object_id)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
+        self.with_registry_mut(|registry| {
+            registry
+                .object_handle_refs
+                .entry(object_id)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            Ok(())
+        })?;
         Ok(handle)
     }
 
@@ -23,7 +27,7 @@ impl KernelState {
         self.with_core(|kernel| kernel.lookup_current_handle(raw, required_rights))
     }
 
-    pub(super) fn close_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
+    pub(super) fn close_handle(&self, raw: zx_handle_t) -> Result<(), zx_status_t> {
         let object_id = self
             .lookup_handle(raw, crate::task::HandleRights::empty())?
             .object_id();
@@ -33,7 +37,7 @@ impl KernelState {
     }
 
     pub(super) fn duplicate_handle(
-        &mut self,
+        &self,
         raw: zx_handle_t,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
@@ -41,15 +45,19 @@ impl KernelState {
             .lookup_handle(raw, crate::task::HandleRights::empty())?
             .object_id();
         let handle = self.with_core_mut(|kernel| kernel.duplicate_current_handle(raw, rights))?;
-        self.object_handle_refs
-            .entry(object_id)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
+        self.with_registry_mut(|registry| {
+            registry
+                .object_handle_refs
+                .entry(object_id)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            Ok(())
+        })?;
         Ok(handle)
     }
 
     pub(super) fn replace_handle(
-        &mut self,
+        &self,
         raw: zx_handle_t,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
@@ -65,7 +73,7 @@ impl KernelState {
     }
 
     pub(super) fn install_transferred_handle(
-        &mut self,
+        &self,
         transferred: TransferredCap,
     ) -> Result<zx_handle_t, zx_status_t> {
         let object_id = transferred.capability().object_id();
@@ -74,49 +82,62 @@ impl KernelState {
                 .current_process_info()
                 .map(|process| process.process_id())
         })?;
-        let vmo_to_promote = match self.objects.get(&object_id) {
-            Some(KernelObject::Vmo(vmo))
-                if matches!(vmo.backing_scope(), VmoBackingScope::LocalPrivate { .. })
-                    && vmo.creator_process_id() != current_process_id =>
-            {
-                Some(vmo.clone())
-            }
-            _ => None,
-        };
+        let vmo_to_promote = self.with_registry(|registry| {
+            Ok(match registry.objects.get(&object_id) {
+                Some(KernelObject::Vmo(vmo))
+                    if matches!(vmo.backing_scope(), VmoBackingScope::LocalPrivate { .. })
+                        && vmo.creator_process_id() != current_process_id =>
+                {
+                    Some(vmo.clone())
+                }
+                _ => None,
+            })
+        })?;
         if let Some(vmo) = vmo_to_promote {
             let promoted = self.with_vm_mut(|vm| vm.promote_vmo_object_to_shared(&vmo))?;
             if promoted {
-                let Some(KernelObject::Vmo(vmo_object)) = self.objects.get_mut(&object_id) else {
-                    return Err(ZX_ERR_BAD_STATE);
-                };
-                vmo_object.backing_scope = VmoBackingScope::GlobalShared;
+                self.with_registry_mut(|registry| {
+                    let Some(KernelObject::Vmo(vmo_object)) = registry.objects.get_mut(&object_id)
+                    else {
+                        return Err(ZX_ERR_BAD_STATE);
+                    };
+                    vmo_object.backing_scope = VmoBackingScope::GlobalShared;
+                    Ok(())
+                })?;
             }
         }
         let handle =
             self.with_core_mut(|kernel| kernel.install_handle_in_current_process(transferred))?;
-        self.object_handle_refs
-            .entry(object_id)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
+        self.with_registry_mut(|registry| {
+            registry
+                .object_handle_refs
+                .entry(object_id)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            Ok(())
+        })?;
         Ok(handle)
     }
 
     pub(super) fn object_handle_count(&self, object_id: u64) -> usize {
-        self.object_handle_refs
+        self.registry
+            .lock()
+            .object_handle_refs
             .get(&object_id)
             .copied()
             .unwrap_or(0)
     }
 
-    pub(super) fn forget_object_handle_refs(&mut self, object_id: u64) {
-        let _ = self.object_handle_refs.remove(&object_id);
+    pub(super) fn forget_object_handle_refs(&self, object_id: u64) {
+        let _ = self.registry.lock().object_handle_refs.remove(&object_id);
     }
 
-    pub(super) fn decrement_object_handle_ref(&mut self, object_id: u64) {
-        match self.object_handle_refs.get_mut(&object_id) {
+    pub(super) fn decrement_object_handle_ref(&self, object_id: u64) {
+        let mut registry = self.registry.lock();
+        match registry.object_handle_refs.get_mut(&object_id) {
             Some(count) if *count > 1 => *count -= 1,
             Some(_) => {
-                self.object_handle_refs.remove(&object_id);
+                registry.object_handle_refs.remove(&object_id);
             }
             None => {}
         }

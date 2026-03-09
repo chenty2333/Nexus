@@ -154,11 +154,7 @@ impl UserCopyCtx {
 
     fn try_pin_read(&self, ptr: u64, len: usize) -> Result<Option<LoanedUserPages>, zx_status_t> {
         let kernel = crate::object::kernel_handle()?;
-        let vm = {
-            let kernel = kernel.lock();
-            kernel.vm_handle()
-        };
-        let mut vm = vm.lock();
+        let vm = { kernel.lock().vm_handle() };
         vm.try_loan_user_pages(self.address_space_id, ptr, len)
     }
 }

@@ -16,47 +16,97 @@ use axle_types::{zx_handle_t, zx_port_packet_t, zx_signals_t, zx_status_t};
 use crate::object::{self, KernelObject};
 use crate::port_queue::port_packet_from_core;
 
-fn queue_kernel_signal_packet(
-    objects: &mut alloc::collections::BTreeMap<u64, KernelObject>,
-    port_id: u64,
-    packet: Packet,
-) -> bool {
-    let Some(KernelObject::Port(port)) = objects.get_mut(&port_id) else {
-        return false;
-    };
-    port.queue_kernel(packet).is_ok()
+fn queue_kernel_signal_packet(state: &object::KernelState, port_id: u64, packet: Packet) -> bool {
+    state
+        .with_registry_mut(|registry| {
+            let Some(KernelObject::Port(port)) = registry.objects.get_mut(&port_id) else {
+                return Ok(false);
+            };
+            Ok(port.queue_kernel(packet).is_ok())
+        })
+        .unwrap_or(false)
 }
 
 fn pop_port_packet_locked(
-    state: &mut object::KernelState,
+    state: &object::KernelState,
     port_id: u64,
 ) -> Result<Packet, zx_status_t> {
-    let packet = {
-        let Some(KernelObject::Port(port)) = state.objects.get_mut(&port_id) else {
+    let packet = state.with_registry_mut(|registry| {
+        let Some(KernelObject::Port(port)) = registry.objects.get_mut(&port_id) else {
             return Err(ZX_ERR_BAD_STATE);
         };
-        port.pop().map_err(object::map_port_error)?
-    };
-    let (objects, observers) = (&mut state.objects, &mut state.observers);
-    observers.flush_port(port_id, |target_port_id, pending| {
-        queue_kernel_signal_packet(objects, target_port_id, pending)
-    });
+        port.pop().map_err(object::map_port_error)
+    })?;
+    state.with_reactor_mut(|reactor| {
+        reactor
+            .observers_mut()
+            .flush_port(port_id, |target_port_id, pending| {
+                queue_kernel_signal_packet(state, target_port_id, pending)
+            });
+        Ok(())
+    })?;
     Ok(packet)
 }
 
 fn port_current_signals(state: &object::KernelState, port_id: u64) -> Result<Signals, zx_status_t> {
-    let Some(KernelObject::Port(port)) = state.objects.get(&port_id) else {
-        return Err(ZX_ERR_BAD_STATE);
-    };
-    Ok(port.signals())
+    state.with_registry(|registry| {
+        let Some(KernelObject::Port(port)) = registry.objects.get(&port_id) else {
+            return Err(ZX_ERR_BAD_STATE);
+        };
+        Ok(port.signals())
+    })
 }
 
 fn publish_port_signals_changed(
-    state: &mut object::KernelState,
+    state: &object::KernelState,
     port_id: u64,
 ) -> Result<(), zx_status_t> {
     let current = port_current_signals(state, port_id)?;
     publish_signals_changed(state, port_id, current)
+}
+
+fn require_port_object(state: &object::KernelState, object_id: u64) -> Result<(), zx_status_t> {
+    state.with_registry(|registry| {
+        let obj = registry.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        match obj {
+            KernelObject::Port(_) => Ok(()),
+            KernelObject::Process(_)
+            | KernelObject::SuspendToken(_)
+            | KernelObject::Socket(_)
+            | KernelObject::Channel(_)
+            | KernelObject::EventPair(_)
+            | KernelObject::Timer(_)
+            | KernelObject::Thread(_)
+            | KernelObject::Vmo(_)
+            | KernelObject::Vmar(_) => Err(ZX_ERR_WRONG_TYPE),
+        }
+    })
+}
+
+fn queue_user_port_packet(
+    state: &object::KernelState,
+    object_id: u64,
+    packet: Packet,
+) -> Result<(), zx_status_t> {
+    state.with_registry_mut(|registry| {
+        let obj = registry
+            .objects
+            .get_mut(&object_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        let port = match obj {
+            KernelObject::Port(port) => port,
+            KernelObject::Process(_)
+            | KernelObject::SuspendToken(_)
+            | KernelObject::Socket(_)
+            | KernelObject::Channel(_)
+            | KernelObject::EventPair(_)
+            | KernelObject::Timer(_)
+            | KernelObject::Thread(_)
+            | KernelObject::Vmo(_)
+            | KernelObject::Vmar(_) => return Err(ZX_ERR_WRONG_TYPE),
+        };
+        port.queue_user(packet).map_err(object::map_port_error)
+    })
 }
 
 /// Queue a user packet into a port.
@@ -68,27 +118,9 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
     object::with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let object_id = resolved.object_id();
-        {
-            let obj = state.objects.get_mut(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
-            let port = match obj {
-                KernelObject::Port(port) => port,
-                KernelObject::Process(_)
-                | KernelObject::SuspendToken(_)
-                | KernelObject::Socket(_)
-                | KernelObject::Channel(_)
-                | KernelObject::EventPair(_)
-                | KernelObject::Timer(_)
-                | KernelObject::Thread(_)
-                | KernelObject::Vmo(_)
-                | KernelObject::Vmar(_) => {
-                    return Err(ZX_ERR_WRONG_TYPE);
-                }
-            };
-            object::require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
-
-            let pkt = Packet::user_with_data(packet.key, packet.status, packet.user.u64);
-            port.queue_user(pkt).map_err(object::map_port_error)?;
-        }
+        object::require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
+        let pkt = Packet::user_with_data(packet.key, packet.status, packet.user.u64);
+        queue_user_port_packet(state, object_id, pkt)?;
 
         publish_port_signals_changed(state, object_id)
     })
@@ -99,21 +131,7 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
     object::with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let object_id = resolved.object_id();
-        {
-            let obj = state.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
-            match obj {
-                KernelObject::Port(_) => {}
-                KernelObject::Process(_)
-                | KernelObject::SuspendToken(_)
-                | KernelObject::Socket(_)
-                | KernelObject::Channel(_)
-                | KernelObject::EventPair(_)
-                | KernelObject::Timer(_)
-                | KernelObject::Thread(_)
-                | KernelObject::Vmo(_)
-                | KernelObject::Vmar(_) => return Err(ZX_ERR_WRONG_TYPE),
-            }
-        }
+        require_port_object(state, object_id)?;
         object::require_handle_rights(resolved, crate::task::HandleRights::READ)?;
         let pkt = pop_port_packet_locked(state, object_id)?;
         publish_port_signals_changed(state, object_id)?;
@@ -136,21 +154,7 @@ pub fn port_wait(
         let thread_id = state
             .with_kernel(|kernel| kernel.current_thread_info())?
             .thread_id();
-        {
-            let obj = state.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
-            match obj {
-                KernelObject::Port(_) => {}
-                KernelObject::Process(_)
-                | KernelObject::SuspendToken(_)
-                | KernelObject::Socket(_)
-                | KernelObject::Channel(_)
-                | KernelObject::EventPair(_)
-                | KernelObject::Timer(_)
-                | KernelObject::Thread(_)
-                | KernelObject::Vmo(_)
-                | KernelObject::Vmar(_) => return Err(ZX_ERR_WRONG_TYPE),
-            }
-        }
+        require_port_object(state, object_id)?;
         object::require_handle_rights(resolved, crate::task::HandleRights::READ)?;
         let packet = pop_port_packet_locked(state, object_id);
 
@@ -295,39 +299,27 @@ pub fn object_wait_async(
         let watched = Signals::from_bits(signals);
         let now = crate::time::now_ns();
 
-        {
-            let obj = state.objects.get(&port_id).ok_or(ZX_ERR_BAD_HANDLE)?;
-            match obj {
-                KernelObject::Port(_) => {}
-                KernelObject::Process(_)
-                | KernelObject::SuspendToken(_)
-                | KernelObject::Socket(_)
-                | KernelObject::Channel(_)
-                | KernelObject::EventPair(_)
-                | KernelObject::Timer(_)
-                | KernelObject::Thread(_)
-                | KernelObject::Vmo(_)
-                | KernelObject::Vmar(_) => return Err(ZX_ERR_WRONG_TYPE),
-            }
-        }
+        require_port_object(state, port_id)?;
         object::require_handle_rights(resolved_port, crate::task::HandleRights::WRITE)?;
-        let (objects, observers) = (&mut state.objects, &mut state.observers);
-        observers
-            .wait_async(
-                WaitAsyncRegistration {
-                    port: port_id,
-                    waitable: waitable_id,
-                    key,
-                    watched,
-                    options,
-                },
-                current,
-                now,
-                |target_port_id, packet| {
-                    queue_kernel_signal_packet(objects, target_port_id, packet)
-                },
-            )
-            .map_err(object::map_port_error)?;
+        state.with_reactor_mut(|reactor| {
+            reactor
+                .observers_mut()
+                .wait_async(
+                    WaitAsyncRegistration {
+                        port: port_id,
+                        waitable: waitable_id,
+                        key,
+                        watched,
+                        options,
+                    },
+                    current,
+                    now,
+                    |target_port_id, packet| {
+                        queue_kernel_signal_packet(state, target_port_id, packet)
+                    },
+                )
+                .map_err(object::map_port_error)
+        })?;
 
         publish_port_signals_changed(state, port_id)
     })
@@ -340,7 +332,7 @@ pub fn on_tick() {
     let _ = object::with_state_mut(|state| on_tick_locked(state));
 }
 
-fn on_tick_locked(state: &mut object::KernelState) -> Result<(), zx_status_t> {
+fn on_tick_locked(state: &object::KernelState) -> Result<(), zx_status_t> {
     let now = crate::time::now_ns();
     let polled = state.with_kernel_mut(|kernel| Ok(kernel.poll_reactor(now)))?;
     let (fired_timers, expired_waits) = polled.into_parts();
@@ -353,7 +345,7 @@ fn on_tick_locked(state: &mut object::KernelState) -> Result<(), zx_status_t> {
 }
 
 pub(crate) fn publish_signals_changed(
-    state: &mut object::KernelState,
+    state: &object::KernelState,
     waitable_id: u64,
     current: Signals,
 ) -> Result<(), zx_status_t> {
@@ -365,17 +357,21 @@ pub(crate) fn publish_signals_changed(
         let now = crate::time::now_ns();
         wake_signal_waiters(state, current_waitable_id, current)?;
 
-        let changed_ports = {
-            let (objects, observers) = (&mut state.objects, &mut state.observers);
-            observers.on_signals_changed(current_waitable_id, current, now, |port_id, packet| {
-                queue_kernel_signal_packet(objects, port_id, packet)
-            })
-        };
+        let changed_ports = state.with_reactor_mut(|reactor| {
+            Ok(reactor.observers_mut().on_signals_changed(
+                current_waitable_id,
+                current,
+                now,
+                |port_id, packet| queue_kernel_signal_packet(state, port_id, packet),
+            ))
+        })?;
 
-        if matches!(
-            state.objects.get(&current_waitable_id),
-            Some(KernelObject::Port(_))
-        ) {
+        if state.with_registry(|registry| {
+            Ok(matches!(
+                registry.objects.get(&current_waitable_id),
+                Some(KernelObject::Port(_))
+            ))
+        })? {
             wake_port_waiters(state, current_waitable_id)?;
             let refreshed = port_current_signals(state, current_waitable_id)?;
             if refreshed != current && queued.insert(current_waitable_id) {
@@ -394,7 +390,7 @@ pub(crate) fn publish_signals_changed(
 }
 
 fn wake_signal_waiters(
-    state: &mut object::KernelState,
+    state: &object::KernelState,
     waitable_id: u64,
     current: Signals,
 ) -> Result<(), zx_status_t> {
@@ -419,7 +415,7 @@ fn wake_signal_waiters(
     Ok(())
 }
 
-fn wake_port_waiters(state: &mut object::KernelState, port_id: u64) -> Result<(), zx_status_t> {
+fn wake_port_waiters(state: &object::KernelState, port_id: u64) -> Result<(), zx_status_t> {
     let waiters = state.with_kernel_mut(|kernel| Ok(kernel.port_waiters(port_id)))?;
     if waiters.is_empty() {
         return Ok(());
@@ -461,7 +457,7 @@ fn wake_port_waiters(state: &mut object::KernelState, port_id: u64) -> Result<()
 }
 
 fn wake_expired_waits(
-    state: &mut object::KernelState,
+    state: &object::KernelState,
     expired: Vec<crate::task::ExpiredWait>,
 ) -> Result<(), zx_status_t> {
     for expired_wait in expired {

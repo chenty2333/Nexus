@@ -1,6 +1,6 @@
 use super::*;
 
-impl KernelState {
+impl TransportCore {
     pub(super) fn alloc_socket_core_id(&mut self) -> u64 {
         let id = self.next_socket_core_id;
         self.next_socket_core_id = self.next_socket_core_id.wrapping_add(1);
@@ -50,11 +50,8 @@ impl KernelState {
 }
 
 pub(crate) fn socket_telemetry_snapshot() -> SocketTelemetrySnapshot {
-    let mut guard = STATE.lock();
-    let Some(state) = guard.as_mut() else {
-        return SocketTelemetrySnapshot::default();
-    };
-    state.socket_telemetry
+    with_state_mut(|state| state.with_transport(|transport| Ok(transport.socket_telemetry)))
+        .unwrap_or_default()
 }
 
 /// Create a socket endpoint pair and return both handles.
@@ -66,36 +63,48 @@ pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_stat
     }
 
     with_state_mut(|state| {
-        let core_id = state.alloc_socket_core_id();
+        let core_id = state.with_transport_mut(|transport| Ok(transport.alloc_socket_core_id()))?;
         let core = SocketCore::new_stream(SOCKET_STREAM_CAPACITY)?;
-        state.socket_cores.insert(core_id, core);
+        state.with_transport_mut(|transport| {
+            transport.socket_cores.insert(core_id, core);
+            Ok(())
+        })?;
 
         let left_object_id = state.alloc_object_id();
         let right_object_id = state.alloc_object_id();
-        state.objects.insert(
-            left_object_id,
-            KernelObject::Socket(SocketEndpoint {
-                core_id,
-                peer_object_id: right_object_id,
-                side: SocketSide::A,
-            }),
-        );
-        state.objects.insert(
-            right_object_id,
-            KernelObject::Socket(SocketEndpoint {
-                core_id,
-                peer_object_id: left_object_id,
-                side: SocketSide::B,
-            }),
-        );
+        state.with_registry_mut(|registry| {
+            registry.objects.insert(
+                left_object_id,
+                KernelObject::Socket(SocketEndpoint {
+                    core_id,
+                    peer_object_id: right_object_id,
+                    side: SocketSide::A,
+                }),
+            );
+            registry.objects.insert(
+                right_object_id,
+                KernelObject::Socket(SocketEndpoint {
+                    core_id,
+                    peer_object_id: left_object_id,
+                    side: SocketSide::B,
+                }),
+            );
+            Ok(())
+        })?;
 
         let left_handle =
             match state.alloc_handle_for_object(left_object_id, handle::socket_default_rights()) {
                 Ok(handle) => handle,
                 Err(err) => {
-                    let _ = state.objects.remove(&left_object_id);
-                    let _ = state.objects.remove(&right_object_id);
-                    let _ = state.socket_cores.remove(&core_id);
+                    let _ = state.with_registry_mut(|registry| {
+                        let _ = registry.objects.remove(&left_object_id);
+                        let _ = registry.objects.remove(&right_object_id);
+                        Ok(())
+                    });
+                    let _ = state.with_transport_mut(|transport| {
+                        let _ = transport.socket_cores.remove(&core_id);
+                        Ok(())
+                    });
                     return Err(err);
                 }
             };
@@ -104,9 +113,15 @@ pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_stat
                 Ok(handle) => handle,
                 Err(err) => {
                     let _ = state.close_handle(left_handle);
-                    let _ = state.objects.remove(&left_object_id);
-                    let _ = state.objects.remove(&right_object_id);
-                    let _ = state.socket_cores.remove(&core_id);
+                    let _ = state.with_registry_mut(|registry| {
+                        let _ = registry.objects.remove(&left_object_id);
+                        let _ = registry.objects.remove(&right_object_id);
+                        Ok(())
+                    });
+                    let _ = state.with_transport_mut(|transport| {
+                        let _ = transport.socket_cores.remove(&core_id);
+                        Ok(())
+                    });
                     return Err(err);
                 }
             };
@@ -127,21 +142,27 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
             .process_id();
         let left_object_id = state.alloc_object_id();
         let right_object_id = state.alloc_object_id();
-        state.objects.insert(
-            left_object_id,
-            KernelObject::Channel(ChannelEndpoint::new(right_object_id, owner_process_id)),
-        );
-        state.objects.insert(
-            right_object_id,
-            KernelObject::Channel(ChannelEndpoint::new(left_object_id, owner_process_id)),
-        );
+        state.with_registry_mut(|registry| {
+            registry.objects.insert(
+                left_object_id,
+                KernelObject::Channel(ChannelEndpoint::new(right_object_id, owner_process_id)),
+            );
+            registry.objects.insert(
+                right_object_id,
+                KernelObject::Channel(ChannelEndpoint::new(left_object_id, owner_process_id)),
+            );
+            Ok(())
+        })?;
 
         let left_handle =
             match state.alloc_handle_for_object(left_object_id, handle::channel_default_rights()) {
                 Ok(handle) => handle,
                 Err(e) => {
-                    let _ = state.objects.remove(&left_object_id);
-                    let _ = state.objects.remove(&right_object_id);
+                    let _ = state.with_registry_mut(|registry| {
+                        let _ = registry.objects.remove(&left_object_id);
+                        let _ = registry.objects.remove(&right_object_id);
+                        Ok(())
+                    });
                     return Err(e);
                 }
             };
@@ -151,8 +172,11 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
             Ok(handle) => handle,
             Err(e) => {
                 let _ = state.close_handle(left_handle);
-                let _ = state.objects.remove(&left_object_id);
-                let _ = state.objects.remove(&right_object_id);
+                let _ = state.with_registry_mut(|registry| {
+                    let _ = registry.objects.remove(&left_object_id);
+                    let _ = registry.objects.remove(&right_object_id);
+                    Ok(())
+                });
                 return Err(e);
             }
         };
@@ -161,7 +185,7 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
     })
 }
 
-pub(super) fn release_channel_payload(state: &mut KernelState, payload: ChannelPayload) {
+pub(super) fn release_channel_payload(state: &KernelState, payload: ChannelPayload) {
     if let Some(loaned) = payload.into_loaned_body() {
         let _ = state.with_vm_mut(|vm| {
             vm.release_loaned_user_pages(loaned);
@@ -170,34 +194,37 @@ pub(super) fn release_channel_payload(state: &mut KernelState, payload: ChannelP
     }
 }
 
-fn retain_transferred_handles(state: &mut KernelState, handles: &[TransferredCap]) {
+fn retain_transferred_handles(state: &KernelState, handles: &[TransferredCap]) {
     for transferred in handles {
-        state
-            .object_handle_refs
-            .entry(transferred.capability().object_id())
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
+        let _ = state.with_registry_mut(|registry| {
+            registry
+                .object_handle_refs
+                .entry(transferred.capability().object_id())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            Ok(())
+        });
     }
 }
 
-fn release_transferred_handles(state: &mut KernelState, handles: &[TransferredCap]) {
+fn release_transferred_handles(state: &KernelState, handles: &[TransferredCap]) {
     for transferred in handles {
         state.decrement_object_handle_ref(transferred.capability().object_id());
     }
 }
 
-fn release_channel_message(state: &mut KernelState, message: ChannelMessage) {
+fn release_channel_message(state: &KernelState, message: ChannelMessage) {
     release_transferred_handles(state, &message.handles);
     release_channel_payload(state, message.payload);
 }
 
 struct HandleInstallBatch<'a> {
-    state: &'a mut KernelState,
+    state: &'a KernelState,
     installed: Vec<zx_handle_t>,
 }
 
 impl<'a> HandleInstallBatch<'a> {
-    fn new(state: &'a mut KernelState) -> Self {
+    fn new(state: &'a KernelState) -> Self {
         Self {
             state,
             installed: Vec::new(),
@@ -224,7 +251,7 @@ impl Drop for HandleInstallBatch<'_> {
 }
 
 pub(super) fn drain_channel_messages(
-    state: &mut KernelState,
+    state: &KernelState,
     messages: impl IntoIterator<Item = ChannelMessage>,
 ) {
     for message in messages {
@@ -244,14 +271,14 @@ pub(super) fn transport_signals(
     object: &KernelObject,
 ) -> Option<Result<Signals, zx_status_t>> {
     match object {
-        KernelObject::Socket(endpoint) => {
-            let core = state
+        KernelObject::Socket(endpoint) => Some(state.with_transport(|transport| {
+            let core = transport
                 .socket_cores
                 .get(&endpoint.core_id)
-                .ok_or(ZX_ERR_BAD_STATE);
-            Some(core.map(|core| core.signals_for(endpoint.side)))
-        }
-        KernelObject::Channel(endpoint) => {
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            Ok(core.signals_for(endpoint.side))
+        })),
+        KernelObject::Channel(endpoint) => Some(state.with_registry(|registry| {
             let mut signals = Signals::NONE;
             if endpoint.is_readable() {
                 signals = signals | Signals::CHANNEL_READABLE;
@@ -259,16 +286,16 @@ pub(super) fn transport_signals(
             if endpoint.peer_closed {
                 signals = signals | Signals::CHANNEL_PEER_CLOSED;
             } else {
-                let peer = match state.objects.get(&endpoint.peer_object_id) {
+                let peer = match registry.objects.get(&endpoint.peer_object_id) {
                     Some(KernelObject::Channel(peer)) => peer,
-                    Some(_) | None => return Some(Err(ZX_ERR_BAD_STATE)),
+                    _ => return Err(ZX_ERR_BAD_STATE),
                 };
                 if endpoint.writable_via_peer(peer) {
                     signals = signals | Signals::CHANNEL_WRITABLE;
                 }
             }
-            Some(Ok(signals))
-        }
+            Ok(signals)
+        })),
         _ => None,
     }
 }
@@ -281,7 +308,9 @@ pub(crate) fn try_loan_current_user_pages(
         let process = kernel.current_process_info()?;
         kernel.process_address_space_id(process.process_id())
     })?;
-    with_vm_mut(|vm| vm.try_loan_user_pages(address_space_id, ptr, len))
+    with_state_mut(|state| {
+        state.with_vm_mut(|vm| vm.try_loan_user_pages(address_space_id, ptr, len))
+    })
 }
 
 pub(crate) fn try_remap_loaned_channel_read(
@@ -309,33 +338,42 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
 
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let endpoint = match state.objects.get(&resolved.object_id()) {
-            Some(KernelObject::Socket(endpoint)) => *endpoint,
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
+        let endpoint =
+            state.with_registry(
+                |registry| match registry.objects.get(&resolved.object_id()) {
+                    Some(KernelObject::Socket(endpoint)) => Ok(*endpoint),
+                    Some(_) => Err(ZX_ERR_WRONG_TYPE),
+                    None => Err(ZX_ERR_BAD_HANDLE),
+                },
+            )?;
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
 
-        let write_result = {
-            let core = state
+        let write_result = state.with_transport_mut(|transport| {
+            let core = transport
                 .socket_cores
                 .get_mut(&endpoint.core_id)
                 .ok_or(ZX_ERR_BAD_STATE)?;
-            match core.write(endpoint.side, bytes) {
+            Ok(match core.write(endpoint.side, bytes) {
                 Ok(written) => Ok((written, core.buffered_bytes())),
                 Err(ZX_ERR_SHOULD_WAIT) => Err((ZX_ERR_SHOULD_WAIT, core.buffered_bytes())),
                 Err(e) => Err((e, core.buffered_bytes())),
-            }
-        };
+            })
+        })?;
         let (written, buffered_after) = match write_result {
             Ok(result) => result,
             Err((ZX_ERR_SHOULD_WAIT, buffered_after)) => {
-                state.note_socket_write(bytes.len(), 0, buffered_after);
+                let _ = state.with_transport_mut(|transport| {
+                    transport.note_socket_write(bytes.len(), 0, buffered_after);
+                    Ok(())
+                });
                 return Err(ZX_ERR_SHOULD_WAIT);
             }
             Err((e, _)) => return Err(e),
         };
-        state.note_socket_write(bytes.len(), written, buffered_after);
+        state.with_transport_mut(|transport| {
+            transport.note_socket_write(bytes.len(), written, buffered_after);
+            Ok(())
+        })?;
 
         let _ = publish_object_signals(state, resolved.object_id());
         let _ = publish_object_signals(state, endpoint.peer_object_id);
@@ -353,23 +391,29 @@ pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<
 
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let endpoint = match state.objects.get(&resolved.object_id()) {
-            Some(KernelObject::Socket(endpoint)) => *endpoint,
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
+        let endpoint =
+            state.with_registry(
+                |registry| match registry.objects.get(&resolved.object_id()) {
+                    Some(KernelObject::Socket(endpoint)) => Ok(*endpoint),
+                    Some(_) => Err(ZX_ERR_WRONG_TYPE),
+                    None => Err(ZX_ERR_BAD_HANDLE),
+                },
+            )?;
         require_handle_rights(resolved, crate::task::HandleRights::READ)?;
 
-        let bytes = {
-            let core = state
+        let bytes = state.with_transport_mut(|transport| {
+            let core = transport
                 .socket_cores
                 .get_mut(&endpoint.core_id)
                 .ok_or(ZX_ERR_BAD_STATE)?;
-            core.read(endpoint.side, len, !peek)?
-        };
+            core.read(endpoint.side, len, !peek)
+        })?;
 
         if !peek {
-            state.note_socket_read(bytes.len());
+            state.with_transport_mut(|transport| {
+                transport.note_socket_read(bytes.len());
+                Ok(())
+            })?;
             let _ = publish_object_signals(state, resolved.object_id());
             let _ = publish_object_signals(state, endpoint.peer_object_id);
         }
@@ -406,59 +450,68 @@ pub fn channel_write(
         };
         let object_id = resolved.object_id();
         let peer_object_id = {
-            let endpoint = match state.objects.get(&object_id) {
-                Some(KernelObject::Channel(endpoint)) => endpoint,
-                Some(_) => {
-                    if let Some(payload) = payload.take() {
-                        release_channel_payload(state, payload);
+            let peer_object_id =
+                match state.with_registry(|registry| match registry.objects.get(&object_id) {
+                    Some(KernelObject::Channel(endpoint)) => Ok(endpoint.peer_object_id),
+                    Some(_) => Err(ZX_ERR_WRONG_TYPE),
+                    None => Err(ZX_ERR_BAD_HANDLE),
+                }) {
+                    Ok(peer_object_id) => peer_object_id,
+                    Err(status) => {
+                        if let Some(payload) = payload.take() {
+                            release_channel_payload(state, payload);
+                        }
+                        return Err(status);
                     }
-                    return Err(ZX_ERR_WRONG_TYPE);
-                }
-                None => {
-                    if let Some(payload) = payload.take() {
-                        release_channel_payload(state, payload);
-                    }
-                    return Err(ZX_ERR_BAD_HANDLE);
-                }
-            };
+                };
             if let Err(status) = require_handle_rights(resolved, crate::task::HandleRights::WRITE) {
                 if let Some(payload) = payload.take() {
                     release_channel_payload(state, payload);
                 }
                 return Err(status);
             }
-            endpoint.peer_object_id
+            peer_object_id
         };
 
         let receiver_address_space_id = {
-            let peer = match state.objects.get(&peer_object_id) {
-                Some(KernelObject::Channel(peer)) => peer,
-                Some(_) => {
-                    if let Some(payload) = payload.take() {
-                        release_channel_payload(state, payload);
+            let (peer_closed, peer_len, owner_process_id) =
+                match state.with_registry(|registry| match registry.objects.get(&peer_object_id) {
+                    Some(KernelObject::Channel(peer)) => {
+                        Ok((peer.closed, peer.messages.len(), peer.owner_process_id))
                     }
-                    return Err(ZX_ERR_BAD_STATE);
-                }
-                None => {
-                    if let Some(payload) = payload.take() {
-                        release_channel_payload(state, payload);
+                    Some(_) => Err(ZX_ERR_BAD_STATE),
+                    None => Err(ZX_ERR_PEER_CLOSED),
+                }) {
+                    Ok(peer_state) => peer_state,
+                    Err(status) => {
+                        if let Some(payload) = payload.take() {
+                            release_channel_payload(state, payload);
+                        }
+                        return Err(status);
                     }
-                    return Err(ZX_ERR_PEER_CLOSED);
-                }
-            };
-            if peer.closed {
+                };
+            if peer_closed {
                 if let Some(payload) = payload.take() {
                     release_channel_payload(state, payload);
                 }
                 return Err(ZX_ERR_PEER_CLOSED);
             }
-            if peer.messages.len() >= CHANNEL_CAPACITY {
+            if peer_len >= CHANNEL_CAPACITY {
                 if let Some(payload) = payload.take() {
                     release_channel_payload(state, payload);
                 }
                 return Err(ZX_ERR_SHOULD_WAIT);
             }
-            channel_endpoint_address_space_id(state, peer)?
+            let peer = ChannelEndpoint::new(peer_object_id, owner_process_id);
+            match channel_endpoint_address_space_id(state, &peer) {
+                Ok(address_space_id) => address_space_id,
+                Err(status) => {
+                    if let Some(payload) = payload.take() {
+                        release_channel_payload(state, payload);
+                    }
+                    return Err(status);
+                }
+            }
         };
 
         if let Some(loaned) = payload.as_mut().and_then(ChannelPayload::loaned_body_mut) {
@@ -501,15 +554,17 @@ pub fn channel_write(
             }
         }
 
-        let peer_status = match state.objects.get(&peer_object_id) {
-            Some(KernelObject::Channel(peer)) if peer.closed => Some(ZX_ERR_PEER_CLOSED),
-            Some(KernelObject::Channel(peer)) if peer.messages.len() >= CHANNEL_CAPACITY => {
-                Some(ZX_ERR_SHOULD_WAIT)
-            }
-            Some(KernelObject::Channel(_)) => None,
-            Some(_) => Some(ZX_ERR_BAD_STATE),
-            None => Some(ZX_ERR_PEER_CLOSED),
-        };
+        let peer_status = state.with_registry(|registry| {
+            Ok(match registry.objects.get(&peer_object_id) {
+                Some(KernelObject::Channel(peer)) if peer.closed => Some(ZX_ERR_PEER_CLOSED),
+                Some(KernelObject::Channel(peer)) if peer.messages.len() >= CHANNEL_CAPACITY => {
+                    Some(ZX_ERR_SHOULD_WAIT)
+                }
+                Some(KernelObject::Channel(_)) => None,
+                Some(_) => Some(ZX_ERR_BAD_STATE),
+                None => Some(ZX_ERR_PEER_CLOSED),
+            })
+        })?;
         if let Some(status) = peer_status {
             if let Some(payload) = payload.take() {
                 release_channel_payload(state, payload);
@@ -522,11 +577,14 @@ pub fn channel_write(
             payload: payload.take().ok_or(ZX_ERR_BAD_STATE)?,
             handles: transferred,
         };
-        match state.objects.get_mut(&peer_object_id) {
-            Some(KernelObject::Channel(peer)) => peer.messages.push_back(message),
-            Some(_) => return Err(ZX_ERR_BAD_STATE),
-            None => return Err(ZX_ERR_PEER_CLOSED),
-        }
+        state.with_registry_mut(|registry| {
+            match registry.objects.get_mut(&peer_object_id) {
+                Some(KernelObject::Channel(peer)) => peer.messages.push_back(message),
+                Some(_) => return Err(ZX_ERR_BAD_STATE),
+                None => return Err(ZX_ERR_PEER_CLOSED),
+            }
+            Ok(())
+        })?;
 
         for raw in handles {
             state.close_handle(raw)?;
@@ -549,35 +607,39 @@ pub fn channel_read(
         return Err((ZX_ERR_INVALID_ARGS, 0, 0));
     }
 
-    let mut guard = STATE.lock();
-    let state = guard.as_mut().ok_or((ZX_ERR_BAD_STATE, 0, 0))?;
+    let state = state().map_err(|e| (e, 0, 0))?;
     let resolved = state
         .lookup_handle(handle, crate::task::HandleRights::empty())
         .map_err(|e| (e, 0, 0))?;
     let object_id = resolved.object_id();
-    let (peer_object_id, transferred_handles) = {
-        let endpoint = match state.objects.get(&object_id) {
-            Some(KernelObject::Channel(endpoint)) => endpoint,
-            Some(_) => return Err((ZX_ERR_WRONG_TYPE, 0, 0)),
-            None => return Err((ZX_ERR_BAD_HANDLE, 0, 0)),
-        };
-        require_handle_rights(resolved, crate::task::HandleRights::READ).map_err(|e| (e, 0, 0))?;
-        if let Some(message) = endpoint.messages.front() {
-            let actual_bytes = message.actual_bytes().map_err(|e| (e, 0, 0))?;
-            let actual_handles = message.actual_handles().map_err(|e| (e, 0, 0))?;
-            if num_bytes < actual_bytes {
-                return Err((ZX_ERR_BUFFER_TOO_SMALL, actual_bytes, actual_handles));
-            }
-            if num_handles < actual_handles {
-                return Err((ZX_ERR_BUFFER_TOO_SMALL, actual_bytes, actual_handles));
-            }
-            (endpoint.peer_object_id, message.handles.clone())
-        } else if endpoint.peer_closed {
-            return Err((ZX_ERR_PEER_CLOSED, 0, 0));
-        } else {
-            return Err((ZX_ERR_SHOULD_WAIT, 0, 0));
-        }
-    };
+    require_handle_rights(resolved, crate::task::HandleRights::READ).map_err(|e| (e, 0, 0))?;
+    let (peer_object_id, transferred_handles, actual_bytes, actual_handles) = state
+        .with_registry(|registry| {
+            let endpoint = match registry.objects.get(&object_id) {
+                Some(KernelObject::Channel(endpoint)) => endpoint,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            let Some(message) = endpoint.messages.front() else {
+                return Err(if endpoint.peer_closed {
+                    ZX_ERR_PEER_CLOSED
+                } else {
+                    ZX_ERR_SHOULD_WAIT
+                });
+            };
+            let actual_bytes = message.actual_bytes()?;
+            let actual_handles = message.actual_handles()?;
+            Ok((
+                endpoint.peer_object_id,
+                message.handles.clone(),
+                actual_bytes,
+                actual_handles,
+            ))
+        })
+        .map_err(|status| (status, 0, 0))?;
+    if num_bytes < actual_bytes || num_handles < actual_handles {
+        return Err((ZX_ERR_BUFFER_TOO_SMALL, actual_bytes, actual_handles));
+    }
 
     let installed_handles = {
         let mut installs = HandleInstallBatch::new(state);
@@ -589,19 +651,16 @@ pub fn channel_read(
         installs.commit()
     };
 
-    let message = {
-        let endpoint = match state.objects.get_mut(&object_id) {
-            Some(KernelObject::Channel(endpoint)) => endpoint,
-            Some(_) => return Err((ZX_ERR_WRONG_TYPE, 0, 0)),
-            None => return Err((ZX_ERR_BAD_HANDLE, 0, 0)),
-        };
-        endpoint
-            .messages
-            .pop_front()
-            .ok_or((ZX_ERR_BAD_STATE, 0, 0))?
-    };
-    let actual_bytes = message.actual_bytes().map_err(|e| (e, 0, 0))?;
-    let actual_handles = message.actual_handles().map_err(|e| (e, 0, 0))?;
+    let message = state
+        .with_registry_mut(|registry| {
+            let endpoint = match registry.objects.get_mut(&object_id) {
+                Some(KernelObject::Channel(endpoint)) => endpoint,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            endpoint.messages.pop_front().ok_or(ZX_ERR_BAD_STATE)
+        })
+        .map_err(|status| (status, 0, 0))?;
     release_transferred_handles(state, &message.handles);
 
     let _ = publish_object_signals(state, object_id);

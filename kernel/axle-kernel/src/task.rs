@@ -18,8 +18,8 @@ use alloc::vec::Vec;
 
 use axle_core::handle::Handle;
 use axle_core::{
-    CSpace, CSpaceError, Capability, ReactorTimerCore, ReactorTimerEvent, RevocationManager,
-    Signals, TimerError, TimerId, TransferredCap, WaitDeadlineId,
+    CSpace, CSpaceError, Capability, ObserverRegistry, ReactorTimerCore, ReactorTimerEvent,
+    RevocationManager, Signals, TimerError, TimerId, TransferredCap, WaitDeadlineId,
 };
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
@@ -271,6 +271,516 @@ impl WaitNode {
     fn clear(&mut self) {
         self.registration = None;
         self.deadline = None;
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Reactor {
+    observers: ObserverRegistry,
+    signal_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
+    port_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
+    timers: ReactorTimerCore,
+}
+
+impl Reactor {
+    pub(crate) fn new(cpu_count: usize) -> Self {
+        Self {
+            observers: ObserverRegistry::new(),
+            signal_waiters: BTreeMap::new(),
+            port_waiters: BTreeMap::new(),
+            timers: ReactorTimerCore::new(cpu_count),
+        }
+    }
+
+    pub(crate) fn observers(&self) -> &ObserverRegistry {
+        &self.observers
+    }
+
+    pub(crate) fn observers_mut(&mut self) -> &mut ObserverRegistry {
+        &mut self.observers
+    }
+
+    pub(crate) fn remove_port(&mut self, port_id: u64) {
+        self.observers.remove_port(port_id);
+        let _ = self.port_waiters.remove(&port_id);
+    }
+
+    pub(crate) fn remove_waitable(&mut self, waitable_id: u64) {
+        self.observers.remove_waitable(waitable_id);
+        let _ = self.signal_waiters.remove(&waitable_id);
+    }
+
+    fn push_signal_waiter(&mut self, object_id: u64, thread_id: ThreadId) {
+        self.signal_waiters
+            .entry(object_id)
+            .or_default()
+            .push_back(thread_id);
+    }
+
+    fn remove_signal_waiter(&mut self, object_id: u64, thread_id: ThreadId) {
+        let should_remove = if let Some(waiters) = self.signal_waiters.get_mut(&object_id) {
+            waiters.retain(|waiter| *waiter != thread_id);
+            waiters.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            let _ = self.signal_waiters.remove(&object_id);
+        }
+    }
+
+    fn push_port_waiter(&mut self, port_object_id: u64, thread_id: ThreadId) {
+        self.port_waiters
+            .entry(port_object_id)
+            .or_default()
+            .push_back(thread_id);
+    }
+
+    fn remove_port_waiter(&mut self, port_object_id: u64, thread_id: ThreadId) {
+        let should_remove = if let Some(waiters) = self.port_waiters.get_mut(&port_object_id) {
+            waiters.retain(|waiter| *waiter != thread_id);
+            waiters.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            let _ = self.port_waiters.remove(&port_object_id);
+        }
+    }
+
+    fn enqueue_wait_source(&mut self, thread_id: ThreadId, registration: WaitRegistration) {
+        match registration {
+            WaitRegistration::Signal { object_id, .. } => {
+                self.push_signal_waiter(object_id, thread_id)
+            }
+            WaitRegistration::Port { port_object_id, .. } => {
+                self.push_port_waiter(port_object_id, thread_id)
+            }
+            WaitRegistration::Sleep
+            | WaitRegistration::Futex { .. }
+            | WaitRegistration::VmFault { .. } => {}
+        }
+    }
+
+    fn remove_wait_source_membership(
+        &mut self,
+        thread_id: ThreadId,
+        registration: WaitRegistration,
+    ) {
+        match registration {
+            WaitRegistration::Signal { object_id, .. } => {
+                self.remove_signal_waiter(object_id, thread_id)
+            }
+            WaitRegistration::Port { port_object_id, .. } => {
+                self.remove_port_waiter(port_object_id, thread_id)
+            }
+            WaitRegistration::Sleep
+            | WaitRegistration::Futex { .. }
+            | WaitRegistration::VmFault { .. } => {}
+        }
+    }
+
+    fn cancel_wait_deadline(&mut self, thread_id: ThreadId, seq: u64) {
+        self.timers
+            .cancel_wait_deadline(WaitDeadlineId::new(thread_id, seq));
+    }
+
+    fn arm_wait_deadline(&mut self, cpu_id: usize, thread_id: ThreadId, seq: u64, deadline: i64) {
+        self.timers
+            .arm_wait_deadline(cpu_id, WaitDeadlineId::new(thread_id, seq), deadline);
+    }
+
+    fn signal_waiter_thread_ids(&self, object_id: u64) -> Vec<ThreadId> {
+        self.signal_waiters
+            .get(&object_id)
+            .map(|waiters| waiters.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn port_waiter_thread_ids(&self, port_object_id: u64) -> Vec<ThreadId> {
+        self.port_waiters
+            .get(&port_object_id)
+            .map(|waiters| waiters.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn create_timer_object(&mut self) -> TimerId {
+        self.timers.create_timer()
+    }
+
+    pub(crate) fn destroy_timer_object(&mut self, timer_id: TimerId) -> Result<(), TimerError> {
+        self.timers.remove_timer(timer_id)
+    }
+
+    pub(crate) fn set_timer_object(
+        &mut self,
+        timer_id: TimerId,
+        cpu_id: usize,
+        deadline: i64,
+        now: i64,
+    ) -> Result<bool, TimerError> {
+        self.timers.set_timer(timer_id, cpu_id, deadline, now)
+    }
+
+    pub(crate) fn cancel_timer_object(&mut self, timer_id: TimerId) -> Result<(), TimerError> {
+        self.timers.cancel_timer(timer_id)
+    }
+
+    pub(crate) fn timer_object_signaled(&self, timer_id: TimerId) -> Result<bool, TimerError> {
+        self.timers.is_timer_signaled(timer_id)
+    }
+
+    pub(crate) fn poll(&mut self, current_cpu_id: usize, now: i64) -> Vec<ReactorTimerEvent> {
+        if crate::arch::timer::ticks_all_cpus() {
+            self.timers.poll_slot(current_cpu_id, now)
+        } else {
+            self.timers.poll_all(now)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct VmFacade {
+    domain: Arc<Mutex<VmDomain>>,
+    faults: Arc<Mutex<FaultTable>>,
+}
+
+impl VmFacade {
+    pub(crate) fn bootstrap() -> (Arc<Self>, AddressSpaceId) {
+        let mut vm = VmDomain {
+            address_spaces: BTreeMap::new(),
+            global_vmos: Arc::new(Mutex::new(GlobalVmoStore::default())),
+            bootstrap_user_runner_global_vmo_id: None,
+            bootstrap_user_code_global_vmo_id: None,
+            frames: Arc::new(Mutex::new(FrameTable::new())),
+            cow_fault_count: 0,
+            vm_private_cow_pages_current: 0,
+            vm_private_cow_pages_peak: 0,
+            vm_inflight_loan_pages_current: 0,
+            vm_inflight_loan_pages_peak: 0,
+            vm_private_cow_quota_hits: 0,
+            vm_inflight_loan_quota_hits: 0,
+            next_global_vmo_id: 1,
+            next_address_space_id: 1,
+        };
+        let bootstrap_vmo_ids = [
+            vm.alloc_global_vmo_id(),
+            vm.alloc_global_vmo_id(),
+            vm.alloc_global_vmo_id(),
+        ];
+        let address_space_id = vm.alloc_address_space_id();
+        let bootstrap_address_space = {
+            let mut frames = vm.frames.lock();
+            AddressSpace::bootstrap(address_space_id, &mut frames, bootstrap_vmo_ids)
+        };
+        vm.address_spaces
+            .insert(address_space_id, bootstrap_address_space);
+        vm.observe_cpu_tlb_epoch_for_address_space(
+            address_space_id,
+            crate::arch::apic::this_apic_id() as usize,
+        );
+        for global_vmo_id in bootstrap_vmo_ids {
+            vm.register_global_vmo_from_address_space(address_space_id, global_vmo_id)
+                .expect("bootstrap global vmo seeding must succeed");
+        }
+        let bootstrap_code_global_vmo_id = vm.alloc_global_vmo_id();
+        vm.register_pager_file_global_vmo(
+            bootstrap_code_global_vmo_id,
+            crate::userspace::USER_CODE_BYTES,
+            crate::userspace::read_bootstrap_user_code_image_at,
+        )
+        .expect("bootstrap code pager vmo registration must succeed");
+        vm.bootstrap_user_code_global_vmo_id = Some(bootstrap_code_global_vmo_id);
+        if let Some(size_bytes) = crate::userspace::qemu_loader_user_runner_size() {
+            let global_vmo_id = vm.alloc_global_vmo_id();
+            let source = PagerSourceHandle::new(FilePagerSource {
+                size_bytes,
+                read_at: crate::userspace::read_qemu_loader_user_runner_at,
+            });
+            vm.register_pager_source_handle(global_vmo_id, source.clone())
+                .expect("bootstrap runner pager vmo registration must succeed");
+            vm.bootstrap_user_runner_global_vmo_id = Some(global_vmo_id);
+            *BOOTSTRAP_USER_RUNNER_SOURCE.lock() = Some(source);
+        }
+
+        (
+            Arc::new(Self {
+                domain: Arc::new(Mutex::new(vm)),
+                faults: Arc::new(Mutex::new(FaultTable::default())),
+            }),
+            address_space_id,
+        )
+    }
+
+    pub(crate) fn domain_handle(&self) -> Arc<Mutex<VmDomain>> {
+        self.domain.clone()
+    }
+
+    pub(crate) fn fault_handle(&self) -> Arc<Mutex<FaultTable>> {
+        self.faults.clone()
+    }
+
+    pub(crate) fn with_domain<T>(&self, f: impl FnOnce(&VmDomain) -> T) -> T {
+        let domain = self.domain.lock();
+        f(&domain)
+    }
+
+    pub(crate) fn with_domain_mut<T>(&self, f: impl FnOnce(&mut VmDomain) -> T) -> T {
+        let mut domain = self.domain.lock();
+        f(&mut domain)
+    }
+
+    pub(crate) fn validate_user_ptr(
+        &self,
+        address_space_id: AddressSpaceId,
+        ptr: u64,
+        len: usize,
+    ) -> bool {
+        self.with_domain(|vm| vm.validate_user_ptr(address_space_id, ptr, len))
+    }
+
+    pub(crate) fn try_loan_user_pages(
+        &self,
+        address_space_id: AddressSpaceId,
+        ptr: u64,
+        len: usize,
+    ) -> Result<Option<LoanedUserPages>, zx_status_t> {
+        self.with_domain_mut(|vm| vm.try_loan_user_pages(address_space_id, ptr, len))
+    }
+
+    pub(crate) fn release_loaned_user_pages(&self, loaned: LoanedUserPages) {
+        self.with_domain_mut(|vm| vm.release_loaned_user_pages(loaned));
+    }
+
+    pub(crate) fn prepare_loaned_channel_write(
+        &self,
+        loaned: &mut LoanedUserPages,
+        receiver_address_space_id: AddressSpaceId,
+    ) -> Result<TlbCommitReq, zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.prepare_loaned_channel_write(loaned, receiver_address_space_id)
+        })
+    }
+
+    pub(crate) fn try_remap_loaned_channel_read(
+        &self,
+        address_space_id: AddressSpaceId,
+        dst_base: u64,
+        loaned: &LoanedUserPages,
+    ) -> Result<(bool, TlbCommitReq), zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.try_remap_loaned_channel_read(address_space_id, dst_base, loaned)
+        })
+    }
+
+    pub(crate) fn import_bootstrap_process_image_for_address_space(
+        &self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+    ) -> Result<ImportedProcessImage, zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.import_bootstrap_process_image_for_address_space(process_id, address_space_id)
+        })
+    }
+
+    pub(crate) fn apply_tlb_commit_reqs(
+        &self,
+        current_cpu_id: usize,
+        current_address_space_id: Option<AddressSpaceId>,
+        reqs: &[TlbCommitReq],
+    ) -> Result<(), zx_status_t> {
+        apply_tlb_commit_reqs(&self.domain, current_cpu_id, current_address_space_id, reqs)
+    }
+
+    pub(crate) fn retire_bootstrap_frames_after_quiescence(
+        &self,
+        current_cpu_id: usize,
+        current_address_space_id: Option<AddressSpaceId>,
+        barrier_address_spaces: &[AddressSpaceId],
+        retired_frames: &[RetiredFrame],
+    ) -> Result<(), zx_status_t> {
+        retire_bootstrap_frames_after_quiescence(
+            &self.domain,
+            current_cpu_id,
+            current_address_space_id,
+            barrier_address_spaces,
+            retired_frames,
+        )
+    }
+
+    pub(crate) fn create_anonymous_vmo_for_address_space(
+        &self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        size: u64,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<CreatedVmo, zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.create_anonymous_vmo_for_address_space(
+                process_id,
+                address_space_id,
+                size,
+                global_vmo_id,
+            )
+        })
+    }
+
+    pub(crate) fn read_vmo_bytes(
+        &self,
+        vmo: &crate::object::VmoObject,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, zx_status_t> {
+        self.with_domain(|vm| vm.read_vmo_bytes(vmo, offset, len))
+    }
+
+    pub(crate) fn write_vmo_bytes(
+        &self,
+        vmo: &crate::object::VmoObject,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), zx_status_t> {
+        self.with_domain_mut(|vm| vm.write_vmo_bytes(vmo, offset, bytes))
+    }
+
+    pub(crate) fn set_vmo_size(
+        &self,
+        vmo: &crate::object::VmoObject,
+        new_size: u64,
+    ) -> Result<VmoResizeResult, zx_status_t> {
+        self.with_domain_mut(|vm| vm.set_vmo_size(vmo, new_size))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn allocate_subvmar(
+        &self,
+        address_space_id: AddressSpaceId,
+        cpu_id: usize,
+        parent_vmar_id: VmarId,
+        offset: u64,
+        len: u64,
+        align: u64,
+        mode: VmarAllocMode,
+        offset_is_upper_limit: bool,
+        child_policy: VmarPlacementPolicy,
+    ) -> Result<Vmar, zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.allocate_subvmar(
+                address_space_id,
+                cpu_id,
+                parent_vmar_id,
+                offset,
+                len,
+                align,
+                mode,
+                offset_is_upper_limit,
+                child_policy,
+            )
+        })
+    }
+
+    pub(crate) fn destroy_vmar(
+        &self,
+        address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+    ) -> Result<TlbCommitReq, zx_status_t> {
+        self.with_domain_mut(|vm| vm.destroy_vmar(address_space_id, vmar_id))
+    }
+
+    pub(crate) fn promote_vmo_object_to_shared(
+        &self,
+        vmo: &crate::object::VmoObject,
+    ) -> Result<bool, zx_status_t> {
+        self.with_domain_mut(|vm| vm.promote_vmo_object_to_shared(vmo))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_vmo_object_into_vmar(
+        &self,
+        address_space_id: AddressSpaceId,
+        cpu_id: usize,
+        vmar_id: VmarId,
+        vmo: &crate::object::VmoObject,
+        fixed_vmar_offset: Option<u64>,
+        vmo_offset: u64,
+        len: u64,
+        perms: MappingPerms,
+    ) -> Result<(u64, TlbCommitReq), zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.map_vmo_object_into_vmar(
+                address_space_id,
+                cpu_id,
+                vmar_id,
+                vmo,
+                fixed_vmar_offset,
+                vmo_offset,
+                len,
+                perms,
+            )
+        })
+    }
+
+    pub(crate) fn unmap_vmar(
+        &self,
+        address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        addr: u64,
+        len: u64,
+    ) -> Result<TlbCommitReq, zx_status_t> {
+        self.with_domain_mut(|vm| vm.unmap_vmar(address_space_id, vmar_id, addr, len))
+    }
+
+    pub(crate) fn protect_vmar(
+        &self,
+        address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        addr: u64,
+        len: u64,
+        perms: MappingPerms,
+    ) -> Result<TlbCommitReq, zx_status_t> {
+        self.with_domain_mut(|vm| vm.protect_vmar(address_space_id, vmar_id, addr, len, perms))
+    }
+
+    pub(crate) fn sync_current_cpu_tlb_state(
+        &self,
+        address_space_id: AddressSpaceId,
+        cpu_id: usize,
+    ) -> Result<(), zx_status_t> {
+        self.with_domain_mut(|vm| vm.sync_current_cpu_tlb_state(address_space_id, cpu_id))
+    }
+
+    pub(crate) fn ensure_user_page_resident_serialized(
+        &self,
+        address_space_id: AddressSpaceId,
+        page_va: u64,
+        for_write: bool,
+    ) -> Result<(), zx_status_t> {
+        crate::task::fault::ensure_user_page_resident_serialized(
+            self.domain.clone(),
+            self.faults.clone(),
+            address_space_id,
+            page_va,
+            for_write,
+        )
+    }
+
+    pub(crate) fn handle_page_fault_serialized(
+        &self,
+        kernel_handle: Arc<Mutex<Kernel>>,
+        address_space_id: AddressSpaceId,
+        thread_id: ThreadId,
+        fault_va: u64,
+        error: u64,
+    ) -> crate::task::fault::PageFaultSerializedResult {
+        crate::task::fault::handle_page_fault_serialized(
+            kernel_handle,
+            self.domain.clone(),
+            self.faults.clone(),
+            address_space_id,
+            thread_id,
+            fault_va,
+            error,
+        )
     }
 }
 
@@ -2145,9 +2655,7 @@ pub(crate) struct Kernel {
     processes: BTreeMap<ProcessId, Process>,
     threads: BTreeMap<ThreadId, Thread>,
     futexes: crate::futex::FutexTable,
-    signal_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
-    port_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
-    reactor_timers: ReactorTimerCore,
+    reactor: Arc<Mutex<Reactor>>,
     run_queue: VecDeque<ThreadId>,
     revocations: RevocationManager,
     next_koid: zx_koid_t,
@@ -2156,8 +2664,7 @@ pub(crate) struct Kernel {
     current_thread_id: ThreadId,
     reschedule_requested: bool,
     task_lifecycle_dirty: bool,
-    faults: Arc<Mutex<FaultTable>>,
-    vm: Arc<Mutex<VmDomain>>,
+    vm: Arc<VmFacade>,
 }
 
 impl VmDomain {
@@ -2303,16 +2810,15 @@ impl VmDomain {
 
 impl Kernel {
     fn cancel_wait_deadline(&mut self, thread_id: ThreadId, seq: u64) {
-        self.reactor_timers
-            .cancel_wait_deadline(WaitDeadlineId::new(thread_id, seq));
+        self.reactor.lock().cancel_wait_deadline(thread_id, seq);
     }
 
     pub(crate) fn create_timer_object(&mut self) -> TimerId {
-        self.reactor_timers.create_timer()
+        self.reactor.lock().create_timer_object()
     }
 
     pub(crate) fn destroy_timer_object(&mut self, timer_id: TimerId) -> Result<(), TimerError> {
-        self.reactor_timers.remove_timer(timer_id)
+        self.reactor.lock().destroy_timer_object(timer_id)
     }
 
     pub(crate) fn set_timer_object(
@@ -2322,85 +2828,30 @@ impl Kernel {
         now: i64,
     ) -> Result<bool, TimerError> {
         let cpu_id = self.current_cpu_id();
-        self.reactor_timers
-            .set_timer(timer_id, cpu_id, deadline, now)
+        self.reactor
+            .lock()
+            .set_timer_object(timer_id, cpu_id, deadline, now)
     }
 
     pub(crate) fn cancel_timer_object(&mut self, timer_id: TimerId) -> Result<(), TimerError> {
-        self.reactor_timers.cancel_timer(timer_id)
+        self.reactor.lock().cancel_timer_object(timer_id)
     }
 
     pub(crate) fn timer_object_signaled(&self, timer_id: TimerId) -> Result<bool, TimerError> {
-        self.reactor_timers.is_timer_signaled(timer_id)
+        self.reactor.lock().timer_object_signaled(timer_id)
     }
 
     /// Build the single-process bootstrap kernel model used by the current main branch.
-    pub(crate) fn bootstrap() -> Self {
-        let mut vm = VmDomain {
-            address_spaces: BTreeMap::new(),
-            global_vmos: Arc::new(Mutex::new(GlobalVmoStore::default())),
-            bootstrap_user_runner_global_vmo_id: None,
-            bootstrap_user_code_global_vmo_id: None,
-            frames: Arc::new(Mutex::new(FrameTable::new())),
-            cow_fault_count: 0,
-            vm_private_cow_pages_current: 0,
-            vm_private_cow_pages_peak: 0,
-            vm_inflight_loan_pages_current: 0,
-            vm_inflight_loan_pages_peak: 0,
-            vm_private_cow_quota_hits: 0,
-            vm_inflight_loan_quota_hits: 0,
-            next_global_vmo_id: 1,
-            next_address_space_id: 1,
-        };
-        let bootstrap_vmo_ids = [
-            vm.alloc_global_vmo_id(),
-            vm.alloc_global_vmo_id(),
-            vm.alloc_global_vmo_id(),
-        ];
-        let address_space_id = vm.alloc_address_space_id();
-        let bootstrap_address_space = {
-            let mut frames = vm.frames.lock();
-            AddressSpace::bootstrap(address_space_id, &mut frames, bootstrap_vmo_ids)
-        };
-        vm.address_spaces
-            .insert(address_space_id, bootstrap_address_space);
-        vm.observe_cpu_tlb_epoch_for_address_space(
-            address_space_id,
-            crate::arch::apic::this_apic_id() as usize,
-        );
-        for global_vmo_id in bootstrap_vmo_ids {
-            vm.register_global_vmo_from_address_space(address_space_id, global_vmo_id)
-                .expect("bootstrap global vmo seeding must succeed");
-        }
-        let bootstrap_code_global_vmo_id = vm.alloc_global_vmo_id();
-        vm.register_pager_file_global_vmo(
-            bootstrap_code_global_vmo_id,
-            crate::userspace::USER_CODE_BYTES,
-            crate::userspace::read_bootstrap_user_code_image_at,
-        )
-        .expect("bootstrap code-image pager vmo registration must succeed");
-        vm.bootstrap_user_code_global_vmo_id = Some(bootstrap_code_global_vmo_id);
-        if let Some(size_bytes) = crate::userspace::qemu_loader_user_runner_size() {
-            let global_vmo_id = vm.alloc_global_vmo_id();
-            let source = PagerSourceHandle::new(FilePagerSource {
-                size_bytes,
-                read_at: crate::userspace::read_qemu_loader_user_runner_at,
-            });
-            vm.register_pager_source_handle(global_vmo_id, source.clone())
-                .expect("bootstrap runner pager vmo registration must succeed");
-            vm.bootstrap_user_runner_global_vmo_id = Some(global_vmo_id);
-            *BOOTSTRAP_USER_RUNNER_SOURCE.lock() = Some(source);
-        }
-
-        let vm = Arc::new(Mutex::new(vm));
-        let faults = Arc::new(Mutex::new(FaultTable::default()));
+    pub(crate) fn bootstrap(
+        vm: Arc<VmFacade>,
+        reactor: Arc<Mutex<Reactor>>,
+        address_space_id: AddressSpaceId,
+    ) -> Self {
         let mut kernel = Self {
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
             futexes: crate::futex::FutexTable::new(),
-            signal_waiters: BTreeMap::new(),
-            port_waiters: BTreeMap::new(),
-            reactor_timers: ReactorTimerCore::new(crate::smp::max_cpus()),
+            reactor,
             run_queue: VecDeque::new(),
             revocations: RevocationManager::new(),
             next_koid: 1,
@@ -2409,7 +2860,6 @@ impl Kernel {
             current_thread_id: 0,
             reschedule_requested: false,
             task_lifecycle_dirty: false,
-            faults,
             vm,
         };
         let process_id = kernel.alloc_process_id();
@@ -2437,22 +2887,43 @@ impl Kernel {
         kernel
     }
 
-    pub(crate) fn vm_handle(&self) -> Arc<Mutex<VmDomain>> {
+    pub(crate) fn vm_handle(&self) -> Arc<VmFacade> {
         self.vm.clone()
     }
 
-    pub(crate) fn fault_handle(&self) -> Arc<Mutex<FaultTable>> {
-        self.faults.clone()
-    }
-
     fn with_vm<T>(&self, f: impl FnOnce(&VmDomain) -> T) -> T {
-        let vm = self.vm.lock();
-        f(&vm)
+        self.vm.with_domain(f)
     }
 
     fn with_vm_mut<T>(&self, f: impl FnOnce(&mut VmDomain) -> T) -> T {
-        let mut vm = self.vm.lock();
-        f(&mut vm)
+        self.vm.with_domain_mut(f)
+    }
+
+    fn with_faults_mut<T>(&self, f: impl FnOnce(&mut FaultTable) -> T) -> T {
+        let faults = self.vm.fault_handle();
+        let mut faults = faults.lock();
+        f(&mut faults)
+    }
+
+    fn apply_tlb_commit_reqs_current(&self, reqs: &[TlbCommitReq]) -> Result<(), zx_status_t> {
+        self.vm.apply_tlb_commit_reqs(
+            self.current_cpu_id(),
+            self.current_address_space_id().ok(),
+            reqs,
+        )
+    }
+
+    fn retire_bootstrap_frames_after_quiescence_current(
+        &self,
+        barrier_address_spaces: &[AddressSpaceId],
+        retired_frames: &[RetiredFrame],
+    ) -> Result<(), zx_status_t> {
+        self.vm.retire_bootstrap_frames_after_quiescence(
+            self.current_cpu_id(),
+            self.current_address_space_id().ok(),
+            barrier_address_spaces,
+            retired_frames,
+        )
     }
 
     pub(crate) fn alloc_handle_for_current_process(
@@ -2643,12 +3114,7 @@ impl Kernel {
     ) -> Result<(), zx_status_t> {
         let req = self
             .with_vm_mut(|vm| vm.prepare_loaned_channel_write(loaned, receiver_address_space_id))?;
-        apply_tlb_commit_reqs(
-            &self.vm,
-            self.current_cpu_id(),
-            self.current_address_space_id().ok(),
-            &[req],
-        )
+        self.apply_tlb_commit_reqs_current(&[req])
     }
 
     pub(crate) fn try_remap_loaned_channel_read(
@@ -2660,8 +3126,7 @@ impl Kernel {
         let (remapped, req) = self.with_vm_mut(|vm| {
             vm.try_remap_loaned_channel_read(current_address_space_id, dst_base, loaned)
         })?;
-        apply_tlb_commit_reqs(
-            &self.vm,
+        self.vm.apply_tlb_commit_reqs(
             self.current_cpu_id(),
             Some(current_address_space_id),
             &[req],
@@ -2718,12 +3183,7 @@ impl Kernel {
         vmar_id: VmarId,
     ) -> Result<(), zx_status_t> {
         let req = self.with_vm_mut(|vm| vm.destroy_vmar(address_space_id, vmar_id))?;
-        apply_tlb_commit_reqs(
-            &self.vm,
-            self.current_cpu_id(),
-            self.current_address_space_id().ok(),
-            &[req],
-        )
+        self.apply_tlb_commit_reqs_current(&[req])
     }
 
     pub(crate) fn current_thread_info(&self) -> Result<CurrentThreadInfo, zx_status_t> {
@@ -2859,13 +3319,7 @@ impl Kernel {
             .copied()
             .map(RetiredFrame::bootstrap_page)
             .collect::<Vec<_>>();
-        retire_bootstrap_frames_after_quiescence(
-            &self.vm,
-            self.current_cpu_id(),
-            self.current_address_space_id().ok(),
-            &barrier_address_spaces,
-            &retired,
-        )?;
+        self.retire_bootstrap_frames_after_quiescence_current(&barrier_address_spaces, &retired)?;
         Ok(())
     }
 
@@ -3081,41 +3535,25 @@ impl Kernel {
     }
 
     fn push_signal_waiter(&mut self, object_id: u64, thread_id: ThreadId) {
-        self.signal_waiters
-            .entry(object_id)
-            .or_default()
-            .push_back(thread_id);
+        self.reactor.lock().push_signal_waiter(object_id, thread_id);
     }
 
     fn remove_signal_waiter(&mut self, object_id: u64, thread_id: ThreadId) {
-        let should_remove = if let Some(waiters) = self.signal_waiters.get_mut(&object_id) {
-            waiters.retain(|waiter| *waiter != thread_id);
-            waiters.is_empty()
-        } else {
-            false
-        };
-        if should_remove {
-            let _ = self.signal_waiters.remove(&object_id);
-        }
+        self.reactor
+            .lock()
+            .remove_signal_waiter(object_id, thread_id);
     }
 
     fn push_port_waiter(&mut self, port_object_id: u64, thread_id: ThreadId) {
-        self.port_waiters
-            .entry(port_object_id)
-            .or_default()
-            .push_back(thread_id);
+        self.reactor
+            .lock()
+            .push_port_waiter(port_object_id, thread_id);
     }
 
     fn remove_port_waiter(&mut self, port_object_id: u64, thread_id: ThreadId) {
-        let should_remove = if let Some(waiters) = self.port_waiters.get_mut(&port_object_id) {
-            waiters.retain(|waiter| *waiter != thread_id);
-            waiters.is_empty()
-        } else {
-            false
-        };
-        if should_remove {
-            let _ = self.port_waiters.remove(&port_object_id);
-        }
+        self.reactor
+            .lock()
+            .remove_port_waiter(port_object_id, thread_id);
     }
 
     fn enqueue_wait_source(&mut self, thread_id: ThreadId, registration: WaitRegistration) {
@@ -3151,8 +3589,9 @@ impl Kernel {
                 let _ = self.futexes.cancel_waiter(key, thread_id);
             }
             WaitRegistration::VmFault { key } => {
-                let mut faults = self.faults.lock();
-                faults.remove_blocked_waiter(key, thread_id);
+                self.with_faults_mut(|faults| {
+                    faults.remove_blocked_waiter(key, thread_id);
+                });
             }
         }
     }
@@ -3210,11 +3649,9 @@ impl Kernel {
         };
         self.enqueue_wait_source(thread_id, registration);
         if let Some(deadline) = deadline {
-            self.reactor_timers.arm_wait_deadline(
-                self.current_cpu_id(),
-                WaitDeadlineId::new(thread_id, seq),
-                deadline,
-            );
+            self.reactor
+                .lock()
+                .arm_wait_deadline(self.current_cpu_id(), thread_id, seq, deadline);
         }
         Ok(())
     }
@@ -3231,10 +3668,9 @@ impl Kernel {
         object_id: u64,
         current: Signals,
     ) -> Vec<SignalWaiter> {
-        let Some(waiters) = self.signal_waiters.get(&object_id) else {
-            return Vec::new();
-        };
-        waiters
+        self.reactor
+            .lock()
+            .signal_waiter_thread_ids(object_id)
             .iter()
             .filter_map(|thread_id| {
                 let thread = self.threads.get(thread_id)?;
@@ -3257,10 +3693,9 @@ impl Kernel {
     }
 
     pub(crate) fn port_waiters(&self, port_object_id: u64) -> Vec<PortWaiter> {
-        let Some(waiters) = self.port_waiters.get(&port_object_id) else {
-            return Vec::new();
-        };
-        waiters
+        self.reactor
+            .lock()
+            .port_waiter_thread_ids(port_object_id)
             .iter()
             .filter_map(|thread_id| {
                 let thread = self.threads.get(thread_id)?;
@@ -3298,20 +3733,17 @@ impl Kernel {
         thread_id: ThreadId,
         reason: WakeReason,
     ) -> Result<bool, zx_status_t> {
-        let Some((_, _registration)) = self.take_wait_registration(thread_id) else {
+        let Some((_, registration)) = self.take_wait_registration(thread_id) else {
             return Ok(false);
         };
+        self.remove_wait_source_membership(thread_id, registration);
         self.wake_thread(thread_id, reason)?;
         Ok(true)
     }
 
     pub(crate) fn poll_reactor(&mut self, now: i64) -> ReactorPollResult {
         let mut result = ReactorPollResult::default();
-        let due = if crate::arch::timer::ticks_all_cpus() {
-            self.reactor_timers.poll_slot(self.current_cpu_id(), now)
-        } else {
-            self.reactor_timers.poll_all(now)
-        };
+        let due = self.reactor.lock().poll(self.current_cpu_id(), now);
 
         for event in due {
             match event {
@@ -3747,12 +4179,7 @@ impl Kernel {
                 perms,
             )
         })?;
-        apply_tlb_commit_reqs(
-            &self.vm,
-            self.current_cpu_id(),
-            self.current_address_space_id().ok(),
-            &[req],
-        )?;
+        self.apply_tlb_commit_reqs_current(&[req])?;
         Ok(mapped)
     }
 
@@ -3778,12 +4205,7 @@ impl Kernel {
                 perms,
             )
         })?;
-        apply_tlb_commit_reqs(
-            &self.vm,
-            self.current_cpu_id(),
-            self.current_address_space_id().ok(),
-            &[req],
-        )?;
+        self.apply_tlb_commit_reqs_current(&[req])?;
         Ok(mapped)
     }
 
@@ -3795,12 +4217,7 @@ impl Kernel {
         len: u64,
     ) -> Result<(), zx_status_t> {
         let req = self.with_vm_mut(|vm| vm.unmap_vmar(address_space_id, vmar_id, addr, len))?;
-        apply_tlb_commit_reqs(
-            &self.vm,
-            self.current_cpu_id(),
-            self.current_address_space_id().ok(),
-            &[req],
-        )
+        self.apply_tlb_commit_reqs_current(&[req])
     }
 
     pub(crate) fn protect_current_vmar(
@@ -3813,12 +4230,7 @@ impl Kernel {
     ) -> Result<(), zx_status_t> {
         let req =
             self.with_vm_mut(|vm| vm.protect_vmar(address_space_id, vmar_id, addr, len, perms))?;
-        apply_tlb_commit_reqs(
-            &self.vm,
-            self.current_cpu_id(),
-            self.current_address_space_id().ok(),
-            &[req],
-        )
+        self.apply_tlb_commit_reqs_current(&[req])
     }
 
     pub(crate) fn handle_current_page_fault(&mut self, fault_va: u64, error: u64) -> bool {

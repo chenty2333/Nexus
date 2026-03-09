@@ -8,17 +8,11 @@ use spin::Mutex;
 use axle_types::status::{ZX_ERR_INVALID_ARGS, ZX_ERR_OUT_OF_RANGE};
 use axle_types::zx_status_t;
 
-fn kernel_vm_and_fault_handles(
+fn kernel_vm_handle(
     kernel: &Arc<Mutex<crate::task::Kernel>>,
-) -> Result<
-    (
-        Arc<Mutex<crate::task::VmDomain>>,
-        Arc<Mutex<crate::task::fault::FaultTable>>,
-    ),
-    zx_status_t,
-> {
+) -> Result<Arc<crate::task::VmFacade>, zx_status_t> {
     let kernel = kernel.lock();
-    Ok((kernel.vm_handle(), kernel.fault_handle()))
+    Ok(kernel.vm_handle())
 }
 
 /// Validate a user pointer against the current thread's address-space policy.
@@ -41,14 +35,14 @@ pub fn ensure_current_user_range_resident(
     }
 
     let kernel = crate::object::kernel_handle()?;
-    let (address_space_id, vm, faults) = {
+    let (address_space_id, vm) = {
         let kernel = kernel.lock();
         let process = kernel.current_process_info()?;
         let address_space_id = kernel.process_address_space_id(process.process_id())?;
-        (address_space_id, kernel.vm_handle(), kernel.fault_handle())
+        (address_space_id, kernel.vm_handle())
     };
 
-    if !vm.lock().validate_user_ptr(address_space_id, ptr, len) {
+    if !vm.validate_user_ptr(address_space_id, ptr, len) {
         return Err(ZX_ERR_INVALID_ARGS);
     }
 
@@ -68,13 +62,7 @@ pub fn ensure_current_user_range_resident(
 
     let mut page_va = start;
     while page_va < end {
-        crate::task::fault::ensure_user_page_resident_serialized(
-            vm.clone(),
-            faults.clone(),
-            address_space_id,
-            page_va,
-            for_write,
-        )?;
+        vm.ensure_user_page_resident_serialized(address_space_id, page_va, for_write)?;
         page_va = page_va.checked_add(page_bytes).ok_or(ZX_ERR_OUT_OF_RANGE)?;
     }
     Ok(())
@@ -95,8 +83,8 @@ pub fn handle_page_fault(
         Ok(kernel) => kernel,
         Err(_) => return false,
     };
-    let (vm, faults) = match kernel_vm_and_fault_handles(&kernel) {
-        Ok(handles) => handles,
+    let vm = match kernel_vm_handle(&kernel) {
+        Ok(vm) => vm,
         Err(_) => return false,
     };
 
@@ -132,10 +120,8 @@ pub fn handle_page_fault(
             ))
         }?;
 
-        match crate::task::fault::handle_page_fault_serialized(
+        match vm.handle_page_fault_serialized(
             kernel.clone(),
-            vm.clone(),
-            faults.clone(),
             address_space_id,
             thread_id,
             cr2,
@@ -143,9 +129,7 @@ pub fn handle_page_fault(
         ) {
             crate::task::fault::PageFaultSerializedResult::Handled => {
                 let cpu_id = crate::arch::apic::this_apic_id() as usize;
-                let _ = vm
-                    .lock()
-                    .sync_current_cpu_tlb_state(address_space_id, cpu_id);
+                let _ = vm.sync_current_cpu_tlb_state(address_space_id, cpu_id);
                 Ok(crate::object::TrapBlock::Ready(true))
             }
             crate::task::fault::PageFaultSerializedResult::Unhandled => {

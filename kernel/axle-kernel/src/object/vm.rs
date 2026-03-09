@@ -2,16 +2,23 @@ use super::*;
 
 /// Return the bootstrap root VMAR handle seeded into the current process.
 pub fn bootstrap_root_vmar_handle() -> Option<zx_handle_t> {
-    let mut guard = STATE.lock();
-    let state = guard.as_mut()?;
-    Some(state.bootstrap_root_vmar_handle)
+    with_state_mut(|state| {
+        state.with_registry(|registry| Ok(Some(registry.bootstrap_root_vmar_handle)))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Return the bootstrap current-process code-image VMO handle, if seeded.
 pub fn bootstrap_self_code_vmo_handle() -> Option<zx_handle_t> {
-    let mut guard = STATE.lock();
-    let state = guard.as_mut()?;
-    (state.bootstrap_self_code_vmo_handle != 0).then_some(state.bootstrap_self_code_vmo_handle)
+    with_state_mut(|state| {
+        state.with_registry(|registry| {
+            Ok((registry.bootstrap_self_code_vmo_handle != 0)
+                .then_some(registry.bootstrap_self_code_vmo_handle))
+        })
+    })
+    .ok()
+    .flatten()
 }
 
 /// Create an anonymous VMO and return a handle.
@@ -36,25 +43,28 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
                 global_vmo_id,
             )
         })?;
-        state.objects.insert(
-            object_id,
-            KernelObject::Vmo(VmoObject {
-                creator_process_id: created.process_id(),
-                global_vmo_id: created.global_vmo_id(),
-                backing_scope: VmoBackingScope::LocalPrivate {
-                    owner_address_space_id: created.address_space_id(),
-                    local_vmo_id: created.vmo_id(),
-                },
-                kind: axle_mm::VmoKind::Anonymous,
-                size_bytes: created.size_bytes(),
-                image_layout: None,
-            }),
-        );
+        state.with_objects_mut(|objects| {
+            objects.insert(
+                object_id,
+                KernelObject::Vmo(VmoObject {
+                    creator_process_id: created.process_id(),
+                    global_vmo_id: created.global_vmo_id(),
+                    backing_scope: VmoBackingScope::LocalPrivate {
+                        owner_address_space_id: created.address_space_id(),
+                        local_vmo_id: created.vmo_id(),
+                    },
+                    kind: axle_mm::VmoKind::Anonymous,
+                    size_bytes: created.size_bytes(),
+                    image_layout: None,
+                }),
+            );
+            Ok(())
+        })?;
 
         match state.alloc_handle_for_object(object_id, handle::vmo_default_rights()) {
             Ok(h) => Ok(h),
             Err(e) => {
-                let _ = state.objects.remove(&object_id);
+                let _ = state.with_objects_mut(|objects| Ok(objects.remove(&object_id)));
                 Err(e)
             }
         }
@@ -65,11 +75,13 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
 pub fn vmo_read(handle: zx_handle_t, offset: u64, len: usize) -> Result<Vec<u8>, zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let vmo = match state.objects.get(&resolved.object_id()) {
-            Some(KernelObject::Vmo(vmo)) => vmo.clone(),
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
+        let vmo = state.with_objects(|objects| {
+            Ok(match objects.get(&resolved.object_id()) {
+                Some(KernelObject::Vmo(vmo)) => vmo.clone(),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
         require_handle_rights(resolved, crate::task::HandleRights::READ)?;
         state.with_vm_mut(|vm| vm.read_vmo_bytes(&vmo, offset, len))
     })
@@ -79,11 +91,13 @@ pub fn vmo_read(handle: zx_handle_t, offset: u64, len: usize) -> Result<Vec<u8>,
 pub fn vmo_write(handle: zx_handle_t, offset: u64, bytes: &[u8]) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let vmo = match state.objects.get(&resolved.object_id()) {
-            Some(KernelObject::Vmo(vmo)) => vmo.clone(),
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
+        let vmo = state.with_objects(|objects| {
+            Ok(match objects.get(&resolved.object_id()) {
+                Some(KernelObject::Vmo(vmo)) => vmo.clone(),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
         state.with_vm_mut(|vm| vm.write_vmo_bytes(&vmo, offset, bytes))
     })
@@ -94,21 +108,26 @@ pub fn vmo_set_size(handle: zx_handle_t, size: u64) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let object_id = resolved.object_id();
-        let vmo = match state.objects.get(&object_id) {
-            Some(KernelObject::Vmo(vmo)) => vmo.clone(),
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
+        let vmo = state.with_objects(|objects| {
+            Ok(match objects.get(&object_id) {
+                Some(KernelObject::Vmo(vmo)) => vmo.clone(),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
         let resized = state.with_vm_mut(|vm| vm.set_vmo_size(&vmo, size))?;
         state.retire_bootstrap_frames_after_quiescence(
             resized.barrier_address_spaces(),
             resized.retired_frames(),
         )?;
-        let Some(KernelObject::Vmo(vmo)) = state.objects.get_mut(&object_id) else {
-            return Err(ZX_ERR_BAD_STATE);
-        };
-        vmo.size_bytes = resized.new_size();
+        state.with_objects_mut(|objects| {
+            let Some(KernelObject::Vmo(vmo)) = objects.get_mut(&object_id) else {
+                return Err(ZX_ERR_BAD_STATE);
+            };
+            vmo.size_bytes = resized.new_size();
+            Ok(())
+        })?;
         Ok(())
     })
 }
@@ -126,11 +145,13 @@ pub fn vmar_allocate(
     with_state_mut(|state| {
         let resolved_parent =
             state.lookup_handle(parent_vmar_handle, crate::task::HandleRights::empty())?;
-        let parent = match state.objects.get(&resolved_parent.object_id()) {
-            Some(KernelObject::Vmar(vmar)) => *vmar,
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
+        let parent = state.with_objects(|objects| {
+            Ok(match objects.get(&resolved_parent.object_id()) {
+                Some(KernelObject::Vmar(vmar)) => *vmar,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
 
         require_vmar_control_rights(resolved_parent)?;
         require_vmar_child_mapping_caps(parent.mapping_caps, request.mapping_caps)?;
@@ -155,23 +176,26 @@ pub fn vmar_allocate(
             )
         })?;
         let object_id = state.alloc_object_id();
-        state.objects.insert(
-            object_id,
-            KernelObject::Vmar(VmarObject {
-                process_id: parent.process_id,
-                address_space_id: parent.address_space_id,
-                vmar_id: child.id(),
-                base: child.base(),
-                len: child.len(),
-                mapping_caps: request.mapping_caps,
-            }),
-        );
+        state.with_objects_mut(|objects| {
+            objects.insert(
+                object_id,
+                KernelObject::Vmar(VmarObject {
+                    process_id: parent.process_id,
+                    address_space_id: parent.address_space_id,
+                    vmar_id: child.id(),
+                    base: child.base(),
+                    len: child.len(),
+                    mapping_caps: request.mapping_caps,
+                }),
+            );
+            Ok(())
+        })?;
 
         let child_handle =
             match state.alloc_handle_for_object(object_id, handle::vmar_default_rights()) {
                 Ok(handle) => handle,
                 Err(err) => {
-                    let _ = state.objects.remove(&object_id);
+                    let _ = state.with_objects_mut(|objects| Ok(objects.remove(&object_id)));
                     let _ = state
                         .with_vm_mut(|vm| vm.destroy_vmar(parent.address_space_id, child.id()))
                         .map(|_| ());
@@ -198,16 +222,20 @@ pub fn vmar_map(
     with_state_mut(|state| {
         let resolved_vmar = state.lookup_handle(vmar_handle, crate::task::HandleRights::empty())?;
         let resolved_vmo = state.lookup_handle(vmo_handle, crate::task::HandleRights::empty())?;
-        let vmar = match state.objects.get(&resolved_vmar.object_id()) {
-            Some(KernelObject::Vmar(vmar)) => *vmar,
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
-        let vmo = match state.objects.get(&resolved_vmo.object_id()) {
-            Some(KernelObject::Vmo(vmo)) => vmo.clone(),
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
+        let vmar = state.with_objects(|objects| {
+            Ok(match objects.get(&resolved_vmar.object_id()) {
+                Some(KernelObject::Vmar(vmar)) => *vmar,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+        let vmo = state.with_objects(|objects| {
+            Ok(match objects.get(&resolved_vmo.object_id()) {
+                Some(KernelObject::Vmo(vmo)) => vmo.clone(),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
 
         require_vm_mapping_rights(resolved_vmar, request.perms)?;
         require_vm_mapping_rights(resolved_vmo, request.perms)?;
@@ -221,12 +249,15 @@ pub fn vmar_map(
         {
             let promoted = state.with_vm_mut(|vm| vm.promote_vmo_object_to_shared(&vmo))?;
             if promoted {
-                let Some(KernelObject::Vmo(vmo_object)) =
-                    state.objects.get_mut(&resolved_vmo.object_id())
-                else {
-                    return Err(ZX_ERR_BAD_STATE);
-                };
-                vmo_object.backing_scope = VmoBackingScope::GlobalShared;
+                state.with_objects_mut(|objects| {
+                    let Some(KernelObject::Vmo(vmo_object)) =
+                        objects.get_mut(&resolved_vmo.object_id())
+                    else {
+                        return Err(ZX_ERR_BAD_STATE);
+                    };
+                    vmo_object.backing_scope = VmoBackingScope::GlobalShared;
+                    Ok(())
+                })?;
                 vmo.backing_scope = VmoBackingScope::GlobalShared;
             }
         }
@@ -252,16 +283,21 @@ pub fn vmar_map(
 pub fn vmar_destroy(vmar_handle: zx_handle_t) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let resolved_vmar = state.lookup_handle(vmar_handle, crate::task::HandleRights::empty())?;
-        let vmar = match state.objects.get(&resolved_vmar.object_id()) {
-            Some(KernelObject::Vmar(vmar)) => *vmar,
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
+        let vmar = state.with_objects(|objects| {
+            Ok(match objects.get(&resolved_vmar.object_id()) {
+                Some(KernelObject::Vmar(vmar)) => *vmar,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
         require_vmar_control_rights(resolved_vmar)?;
         let tlb_commit =
             state.with_vm_mut(|vm| vm.destroy_vmar(vmar.address_space_id, vmar.vmar_id))?;
         state.apply_tlb_commit_reqs(&[tlb_commit])?;
-        let _ = state.objects.remove(&resolved_vmar.object_id());
+        state.with_objects_mut(|objects| {
+            let _ = objects.remove(&resolved_vmar.object_id());
+            Ok(())
+        })?;
         Ok(())
     })
 }
@@ -270,11 +306,13 @@ pub fn vmar_destroy(vmar_handle: zx_handle_t) -> Result<(), zx_status_t> {
 pub fn vmar_unmap(vmar_handle: zx_handle_t, addr: u64, len: u64) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let resolved_vmar = state.lookup_handle(vmar_handle, crate::task::HandleRights::empty())?;
-        let vmar = match state.objects.get(&resolved_vmar.object_id()) {
-            Some(KernelObject::Vmar(vmar)) => *vmar,
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
+        let vmar = state.with_objects(|objects| {
+            Ok(match objects.get(&resolved_vmar.object_id()) {
+                Some(KernelObject::Vmar(vmar)) => *vmar,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
         let _ = (vmar.process_id, vmar.base, vmar.len);
         require_handle_rights(resolved_vmar, crate::task::HandleRights::WRITE)?;
         let tlb_commit = state
@@ -294,11 +332,13 @@ pub fn vmar_protect(
 
     with_state_mut(|state| {
         let resolved_vmar = state.lookup_handle(vmar_handle, crate::task::HandleRights::empty())?;
-        let vmar = match state.objects.get(&resolved_vmar.object_id()) {
-            Some(KernelObject::Vmar(vmar)) => *vmar,
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
-        };
+        let vmar = state.with_objects(|objects| {
+            Ok(match objects.get(&resolved_vmar.object_id()) {
+                Some(KernelObject::Vmar(vmar)) => *vmar,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
         let _ = (vmar.process_id, vmar.base, vmar.len);
         require_vm_mapping_rights(resolved_vmar, perms)?;
         require_vmar_mapping_caps(vmar.mapping_caps, perms, false)?;
