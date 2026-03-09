@@ -7,6 +7,8 @@ pub enum SystemKind {
     WaitPortTimer,
     /// Futex/fault contention interactions.
     FutexFault,
+    /// Channel/handle lifecycle and signal interactions.
+    ChannelHandle,
 }
 
 /// Stable semantic hook ids used by schedule hints and replay.
@@ -30,6 +32,10 @@ pub enum HookId {
     FaultHeavyPrepareBeforeCommit,
     /// Fault leader is about to publish commit and wake waiters.
     FaultTxBeforeCommit,
+    /// Channel close won the race before the peer drained readable data.
+    ChannelCloseBeforeReadDrain,
+    /// Handle replacement is about to publish the new handle slot.
+    HandleReplaceBeforePublish,
 }
 
 /// Logical schedule hint attached to a semantic hook.
@@ -129,6 +135,31 @@ pub enum FutexFaultOp {
     AdvanceTime { ticks: u8 },
 }
 
+/// One channel/handle operation in a concurrent seed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChannelHandleOp {
+    /// Write a tiny payload through one channel handle slot.
+    ChannelWrite { handle: u8, bytes: u8 },
+    /// Read one message from one channel handle slot.
+    ChannelRead { handle: u8 },
+    /// Close one handle slot.
+    ChannelClose { handle: u8 },
+    /// Wait until one handle slot becomes readable.
+    WaitReadable {
+        handle: u8,
+        deadline_ticks: Option<u8>,
+    },
+    /// Wait until one handle slot observes peer closed.
+    WaitPeerClosed {
+        handle: u8,
+        deadline_ticks: Option<u8>,
+    },
+    /// Duplicate one handle slot into another slot.
+    HandleDuplicate { handle: u8, dst: u8 },
+    /// Replace one handle slot into another slot.
+    HandleReplace { handle: u8, dst: u8 },
+}
+
 /// One actor operation.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProgramOp {
@@ -136,6 +167,8 @@ pub enum ProgramOp {
     Wait(WaitOp),
     /// Futex/fault operation.
     FutexFault(FutexFaultOp),
+    /// Channel/handle operation.
+    ChannelHandle(ChannelHandleOp),
 }
 
 /// Concurrent two-actor seed with schedule hints and replay metadata.
@@ -226,6 +259,51 @@ impl ConcurrentSeed {
                     SchedHint::PauseThread(HookId::FaultLeaderClaimed, 1),
                     SchedHint::YieldHere(HookId::FaultHeavyPrepareBeforeCommit),
                 ],
+            },
+            Self {
+                replay: ReplayMeta::new(0x3001, max_steps),
+                system: SystemKind::ChannelHandle,
+                program_a: vec![
+                    ProgramOp::ChannelHandle(ChannelHandleOp::ChannelWrite {
+                        handle: 0,
+                        bytes: 8,
+                    }),
+                    ProgramOp::ChannelHandle(ChannelHandleOp::ChannelClose { handle: 0 }),
+                ],
+                program_b: vec![
+                    ProgramOp::ChannelHandle(ChannelHandleOp::WaitReadable {
+                        handle: 1,
+                        deadline_ticks: Some(4),
+                    }),
+                    ProgramOp::ChannelHandle(ChannelHandleOp::ChannelRead { handle: 1 }),
+                    ProgramOp::ChannelHandle(ChannelHandleOp::WaitPeerClosed {
+                        handle: 1,
+                        deadline_ticks: Some(4),
+                    }),
+                ],
+                hints: vec![SchedHint::YieldHere(HookId::ChannelCloseBeforeReadDrain)],
+            },
+            Self {
+                replay: ReplayMeta::new(0x3002, max_steps),
+                system: SystemKind::ChannelHandle,
+                program_a: vec![
+                    ProgramOp::ChannelHandle(ChannelHandleOp::HandleDuplicate {
+                        handle: 0,
+                        dst: 2,
+                    }),
+                    ProgramOp::ChannelHandle(ChannelHandleOp::HandleReplace { handle: 2, dst: 3 }),
+                ],
+                program_b: vec![
+                    ProgramOp::ChannelHandle(ChannelHandleOp::WaitPeerClosed {
+                        handle: 1,
+                        deadline_ticks: Some(2),
+                    }),
+                    ProgramOp::ChannelHandle(ChannelHandleOp::ChannelClose { handle: 0 }),
+                ],
+                hints: vec![SchedHint::PauseThread(
+                    HookId::HandleReplaceBeforePublish,
+                    1,
+                )],
             },
         ]
     }
@@ -338,11 +416,39 @@ fn random_op(system: SystemKind, rng: &mut SeedRng) -> ProgramOp {
                 ticks: 1 + (rng.next_u8() % 3),
             },
         }),
+        SystemKind::ChannelHandle => ProgramOp::ChannelHandle(match rng.next_u8() % 7 {
+            0 => ChannelHandleOp::ChannelWrite {
+                handle: rng.next_u8() % 4,
+                bytes: 1 + (rng.next_u8() % 16),
+            },
+            1 => ChannelHandleOp::ChannelRead {
+                handle: rng.next_u8() % 4,
+            },
+            2 => ChannelHandleOp::ChannelClose {
+                handle: rng.next_u8() % 4,
+            },
+            3 => ChannelHandleOp::WaitReadable {
+                handle: rng.next_u8() % 4,
+                deadline_ticks: maybe_deadline(rng),
+            },
+            4 => ChannelHandleOp::WaitPeerClosed {
+                handle: rng.next_u8() % 4,
+                deadline_ticks: maybe_deadline(rng),
+            },
+            5 => ChannelHandleOp::HandleDuplicate {
+                handle: rng.next_u8() % 4,
+                dst: rng.next_u8() % 4,
+            },
+            _ => ChannelHandleOp::HandleReplace {
+                handle: rng.next_u8() % 4,
+                dst: rng.next_u8() % 4,
+            },
+        }),
     }
 }
 
 fn random_hint(rng: &mut SeedRng) -> SchedHint {
-    let hook = match rng.next_u8() % 9 {
+    let hook = match rng.next_u8() % 11 {
         0 => HookId::WaiterLinked,
         1 => HookId::SignalUpdatedBeforeWake,
         2 => HookId::PortReserveExhausted,
@@ -351,7 +457,9 @@ fn random_hint(rng: &mut SeedRng) -> SchedHint {
         5 => HookId::FutexRequeueAfterMove,
         6 => HookId::FaultLeaderClaimed,
         7 => HookId::FaultHeavyPrepareBeforeCommit,
-        _ => HookId::FaultTxBeforeCommit,
+        8 => HookId::FaultTxBeforeCommit,
+        9 => HookId::ChannelCloseBeforeReadDrain,
+        _ => HookId::HandleReplaceBeforePublish,
     };
     match rng.next_u8() % 4 {
         0 => SchedHint::YieldHere(hook),

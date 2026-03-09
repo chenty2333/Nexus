@@ -122,11 +122,10 @@ fn smoke(iterations: usize, max_steps: u16, out_dir: Option<PathBuf>) -> Result<
     }
 
     for round in 0..iterations {
-        let parent = if corpus.retained().is_empty() {
-            &base[round % base.len()]
-        } else {
-            &corpus.retained()[round % corpus.retained().len()].seed
-        };
+        let parent = corpus
+            .pick_parent(round)
+            .map(|retained| &retained.seed)
+            .unwrap_or(&base[round % base.len()]);
         let child = parent.mutated(0x5eed_0000_u64.wrapping_add(round as u64));
         let observation = run_seed(&child);
         if corpus
@@ -145,11 +144,12 @@ fn smoke(iterations: usize, max_steps: u16, out_dir: Option<PathBuf>) -> Result<
     );
     for seed in corpus.retained().iter().take(8) {
         println!(
-            "seed={} failure={:?} edges={} states={} path={}",
+            "seed={} failure={:?} edges={} states={} score={:.3} path={}",
             seed.id,
             seed.observation.failure_kind,
             seed.observation.edge_hits.len(),
             seed.observation.state_signatures.len(),
+            seed.predicted_score,
             seed.path.display()
         );
     }
@@ -177,11 +177,12 @@ fn replay(seed_path: PathBuf) -> Result<()> {
 fn qemu_replay(seed_path: PathBuf, verbose: bool, retries: u32, keep_runs: usize) -> Result<()> {
     let report = replay_seed_via_qemu(&seed_path, verbose, retries, keep_runs)?;
     println!(
-        "qemu-replay: seed={} scenarios={} pass={} fail={} report={}",
+        "qemu-replay: seed={} asm={} pass={} fail={} exit={:?} report={}",
         report.seed_path.display(),
-        report.scenarios.join(","),
+        report.runner_asm_path.display(),
         report.summary.pass,
         report.summary.fail,
+        report.exit_code,
         report.summary.report_path
     );
     Ok(())
@@ -233,9 +234,9 @@ fn qemu_triage(
             fail += 1;
         }
         println!(
-            "triage: seed={} scenarios={} pass={} fail={} saved={}",
+            "triage: seed={} asm={} pass={} fail={} saved={}",
             report.seed_path.display(),
-            report.scenarios.join(","),
+            report.runner_asm_path.display(),
             report.summary.pass,
             report.summary.fail,
             report_path.display()

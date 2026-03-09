@@ -8,7 +8,9 @@ use axle_core::{
 use axle_mm::{FutexKey, GlobalVmoId};
 use axle_types::koid::ZX_KOID_INVALID;
 
-use crate::seed::{ConcurrentSeed, FutexFaultOp, HookId, ProgramOp, SchedHint, SystemKind, WaitOp};
+use crate::seed::{
+    ChannelHandleOp, ConcurrentSeed, FutexFaultOp, HookId, ProgramOp, SchedHint, SystemKind, WaitOp,
+};
 
 const TIMER_WAITABLE_BASE: u64 = 0x10;
 
@@ -218,6 +220,7 @@ pub fn run_seed(seed: &ConcurrentSeed) -> RunObservation {
     match seed.system {
         SystemKind::WaitPortTimer => WaitPortTimerRunner::new(seed).run(),
         SystemKind::FutexFault => FutexFaultRunner::new(seed).run(),
+        SystemKind::ChannelHandle => ChannelHandleRunner::new(seed).run(),
     }
 }
 
@@ -337,6 +340,10 @@ impl<'a> WaitPortTimerRunner<'a> {
         match op {
             ProgramOp::Wait(op) => self.run_wait_op(actor_id, op),
             ProgramOp::FutexFault(_) => {
+                self.observation.failure_kind = Some("invalid.seed.system_mismatch".into());
+                StepDisposition::Progress
+            }
+            ProgramOp::ChannelHandle(_) => {
                 self.observation.failure_kind = Some("invalid.seed.system_mismatch".into());
                 StepDisposition::Progress
             }
@@ -959,6 +966,10 @@ impl<'a> FutexFaultRunner<'a> {
                 self.observation.failure_kind = Some("invalid.seed.system_mismatch".into());
                 StepDisposition::Progress
             }
+            ProgramOp::ChannelHandle(_) => {
+                self.observation.failure_kind = Some("invalid.seed.system_mismatch".into());
+                StepDisposition::Progress
+            }
         }
     }
 
@@ -1211,6 +1222,417 @@ fn shared_key(id: u8) -> FutexKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelBlockedWait {
+    Readable { slot: u8, deadline: Option<u64> },
+    PeerClosed { slot: u8, deadline: Option<u64> },
+}
+
+#[derive(Clone, Debug, Default)]
+struct ChannelActorState {
+    pc: usize,
+    blocked: Option<ChannelBlockedWait>,
+    pause_turns: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChannelHandleState {
+    endpoint: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct EndpointState {
+    incoming_messages: usize,
+    peer_closed: bool,
+    live_handles: usize,
+}
+
+struct ChannelHandleRunner<'a> {
+    seed: &'a ConcurrentSeed,
+    actors: [ChannelActorState; 2],
+    current_actor: ActorId,
+    hooks: HookRuntime,
+    observation: RunObservation,
+    now: u64,
+    handles: [Option<ChannelHandleState>; 4],
+    endpoints: [EndpointState; 2],
+}
+
+impl<'a> ChannelHandleRunner<'a> {
+    fn new(seed: &'a ConcurrentSeed) -> Self {
+        let mut endpoints = [EndpointState::default(), EndpointState::default()];
+        endpoints[0].live_handles = 1;
+        endpoints[1].live_handles = 1;
+        Self {
+            seed,
+            actors: [ChannelActorState::default(), ChannelActorState::default()],
+            current_actor: ActorId::A,
+            hooks: HookRuntime::new(&seed.hints),
+            observation: RunObservation::default(),
+            now: 0,
+            handles: [
+                Some(ChannelHandleState { endpoint: 0 }),
+                Some(ChannelHandleState { endpoint: 1 }),
+                None,
+                None,
+            ],
+            endpoints,
+        }
+    }
+
+    fn run(mut self) -> RunObservation {
+        self.snapshot_state();
+        let budget = usize::from(self.seed.replay.max_steps.max(1));
+        for _ in 0..budget {
+            if self.is_done() {
+                return self.finish();
+            }
+            self.service_deadlines();
+            let actor = self.current_actor;
+            let progress = self.step_actor(actor);
+            if progress == StepDisposition::NoProgress {
+                let other = actor.other();
+                if self.step_actor(other) == StepDisposition::NoProgress {
+                    self.service_deadlines();
+                    if self.actors.iter().all(|state| state.blocked.is_some()) {
+                        self.observation.failure_kind = Some("hang.channel_handle".into());
+                        self.observation.events.push("hang:channel_handle".into());
+                        return self.finish();
+                    }
+                } else {
+                    self.current_actor = other;
+                }
+            }
+            if self.hooks.should_prefer_other() {
+                self.current_actor = self.current_actor.other();
+            }
+            self.now = self.now.saturating_add(1);
+            self.snapshot_state();
+        }
+        self.observation.failure_kind = Some("budget_exhausted.channel_handle".into());
+        self.finish()
+    }
+
+    fn is_done(&self) -> bool {
+        let a_done =
+            self.actors[0].pc >= self.seed.program_a.len() && self.actors[0].blocked.is_none();
+        let b_done =
+            self.actors[1].pc >= self.seed.program_b.len() && self.actors[1].blocked.is_none();
+        a_done && b_done
+    }
+
+    fn finish(mut self) -> RunObservation {
+        if self.observation.failure_kind.is_none() {
+            self.observation.events.push(format!(
+                "done:channel_handle now={} live={} queues={}/{}",
+                self.now,
+                self.handles.iter().flatten().count(),
+                self.endpoints[0].incoming_messages,
+                self.endpoints[1].incoming_messages
+            ));
+        }
+        self.observation
+    }
+
+    fn program_for(&self, actor: ActorId) -> &[ProgramOp] {
+        match actor {
+            ActorId::A => &self.seed.program_a,
+            ActorId::B => &self.seed.program_b,
+        }
+    }
+
+    fn step_actor(&mut self, actor_id: ActorId) -> StepDisposition {
+        let actor_index = actor_id.index();
+        if self.actors[actor_index].pause_turns > 0 {
+            self.actors[actor_index].pause_turns -= 1;
+            return StepDisposition::Progress;
+        }
+        if self.actors[actor_index].blocked.is_some() {
+            return StepDisposition::NoProgress;
+        }
+        let pc = self.actors[actor_index].pc;
+        let Some(op) = self.program_for(actor_id).get(pc).copied() else {
+            return StepDisposition::NoProgress;
+        };
+        self.actors[actor_index].pc += 1;
+        let ProgramOp::ChannelHandle(op) = op else {
+            self.observation.failure_kind = Some("invalid.seed.channel_handle".into());
+            return StepDisposition::Progress;
+        };
+        self.execute_channel_op(actor_id, op)
+    }
+
+    fn execute_channel_op(&mut self, actor_id: ActorId, op: ChannelHandleOp) -> StepDisposition {
+        match op {
+            ChannelHandleOp::ChannelWrite { handle, bytes } => {
+                let Some(state) = self.handle_state(handle) else {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("channel.invalid_write:slot:{handle}"));
+                    return StepDisposition::Progress;
+                };
+                let peer = state.endpoint ^ 1;
+                if self.endpoints[peer].live_handles == 0 {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("channel.write_peer_closed:slot:{handle}"));
+                    return StepDisposition::Progress;
+                }
+                let was_empty = self.endpoints[peer].incoming_messages == 0;
+                self.endpoints[peer].incoming_messages += 1;
+                self.observation
+                    .edge_hits
+                    .insert(format!("channel.write:actor:{actor_id:?}:bytes:{bytes}"));
+                if was_empty {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("channel.empty_to_nonempty:endpoint:{peer}"));
+                }
+                self.wake_channel_waiters(peer);
+                StepDisposition::Progress
+            }
+            ChannelHandleOp::ChannelRead { handle } => {
+                let Some(state) = self.handle_state(handle) else {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("channel.invalid_read:slot:{handle}"));
+                    return StepDisposition::Progress;
+                };
+                let endpoint = state.endpoint;
+                if self.endpoints[endpoint].incoming_messages == 0 {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("channel.read_empty:slot:{handle}"));
+                } else {
+                    self.endpoints[endpoint].incoming_messages -= 1;
+                    self.observation
+                        .edge_hits
+                        .insert(format!("channel.read:actor:{actor_id:?}:slot:{handle}"));
+                }
+                StepDisposition::Progress
+            }
+            ChannelHandleOp::ChannelClose { handle } => {
+                if let Some(state) = self.handle_state(handle) {
+                    let peer = state.endpoint ^ 1;
+                    if self.endpoints[peer].incoming_messages != 0 {
+                        let directive = self.hooks.hit(
+                            actor_id,
+                            HookId::ChannelCloseBeforeReadDrain,
+                            &mut self.observation,
+                        );
+                        self.actors[actor_id.index()].pause_turns = directive.pause_turns;
+                    }
+                }
+                self.close_handle_slot(handle);
+                StepDisposition::Progress
+            }
+            ChannelHandleOp::WaitReadable {
+                handle,
+                deadline_ticks,
+            } => {
+                let Some(state) = self.handle_state(handle) else {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("wait.readable.invalid:slot:{handle}"));
+                    return StepDisposition::Progress;
+                };
+                let endpoint = state.endpoint;
+                if self.endpoints[endpoint].incoming_messages != 0 {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("wait.readable.hit:slot:{handle}"));
+                    return StepDisposition::Progress;
+                }
+                self.actors[actor_id.index()].blocked = Some(ChannelBlockedWait::Readable {
+                    slot: handle,
+                    deadline: deadline_ticks.map(|ticks| self.now + u64::from(ticks)),
+                });
+                let directive =
+                    self.hooks
+                        .hit(actor_id, HookId::WaiterLinked, &mut self.observation);
+                self.actors[actor_id.index()].pause_turns = directive.pause_turns;
+                StepDisposition::Progress
+            }
+            ChannelHandleOp::WaitPeerClosed {
+                handle,
+                deadline_ticks,
+            } => {
+                let Some(state) = self.handle_state(handle) else {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("wait.peer_closed.invalid:slot:{handle}"));
+                    return StepDisposition::Progress;
+                };
+                let endpoint = state.endpoint;
+                if self.endpoints[endpoint].peer_closed {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("wait.peer_closed.hit:slot:{handle}"));
+                    return StepDisposition::Progress;
+                }
+                self.actors[actor_id.index()].blocked = Some(ChannelBlockedWait::PeerClosed {
+                    slot: handle,
+                    deadline: deadline_ticks.map(|ticks| self.now + u64::from(ticks)),
+                });
+                let directive =
+                    self.hooks
+                        .hit(actor_id, HookId::WaiterLinked, &mut self.observation);
+                self.actors[actor_id.index()].pause_turns = directive.pause_turns;
+                StepDisposition::Progress
+            }
+            ChannelHandleOp::HandleDuplicate { handle, dst } => {
+                let Some(state) = self.handle_state(handle) else {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("handle.duplicate.invalid:src:{handle}"));
+                    return StepDisposition::Progress;
+                };
+                self.close_handle_slot(dst);
+                self.endpoints[state.endpoint].live_handles += 1;
+                self.handles[usize::from(dst)] = Some(state);
+                self.observation
+                    .edge_hits
+                    .insert(format!("handle.duplicate:{handle}->{dst}"));
+                StepDisposition::Progress
+            }
+            ChannelHandleOp::HandleReplace { handle, dst } => {
+                let Some(state) = self.handle_state(handle) else {
+                    self.observation
+                        .edge_hits
+                        .insert(format!("handle.replace.invalid:src:{handle}"));
+                    return StepDisposition::Progress;
+                };
+                let directive = self.hooks.hit(
+                    actor_id,
+                    HookId::HandleReplaceBeforePublish,
+                    &mut self.observation,
+                );
+                self.actors[actor_id.index()].pause_turns = directive.pause_turns;
+                if handle != dst {
+                    self.close_handle_slot(dst);
+                }
+                self.handles[usize::from(handle)] = None;
+                self.handles[usize::from(dst)] = Some(state);
+                self.observation
+                    .edge_hits
+                    .insert(format!("handle.replace:{handle}->{dst}"));
+                if handle == dst {
+                    self.observation
+                        .edge_hits
+                        .insert("handle.replace.same_slot".into());
+                }
+                StepDisposition::Progress
+            }
+        }
+    }
+
+    fn service_deadlines(&mut self) {
+        for actor_id in [ActorId::A, ActorId::B] {
+            let blocked = self.actors[actor_id.index()].blocked;
+            match blocked {
+                Some(ChannelBlockedWait::Readable { deadline, .. })
+                | Some(ChannelBlockedWait::PeerClosed { deadline, .. })
+                    if deadline.is_some_and(|deadline| self.now >= deadline) =>
+                {
+                    self.actors[actor_id.index()].blocked = None;
+                    self.observation
+                        .edge_hits
+                        .insert(format!("timeout:channel:actor:{actor_id:?}"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn wake_channel_waiters(&mut self, endpoint: usize) {
+        for actor_id in [ActorId::A, ActorId::B] {
+            let blocked = self.actors[actor_id.index()].blocked;
+            match blocked {
+                Some(ChannelBlockedWait::Readable { slot, .. })
+                    if self.handle_state(slot).is_some_and(|state| {
+                        state.endpoint == endpoint
+                            && self.endpoints[endpoint].incoming_messages != 0
+                    }) =>
+                {
+                    self.actors[actor_id.index()].blocked = None;
+                    self.observation
+                        .edge_hits
+                        .insert(format!("wake.channel.readable:actor:{actor_id:?}"));
+                }
+                Some(ChannelBlockedWait::PeerClosed { slot, .. })
+                    if self.handle_state(slot).is_some_and(|state| {
+                        state.endpoint == endpoint && self.endpoints[endpoint].peer_closed
+                    }) =>
+                {
+                    self.actors[actor_id.index()].blocked = None;
+                    self.observation
+                        .edge_hits
+                        .insert(format!("wake.channel.peer_closed:actor:{actor_id:?}"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn close_handle_slot(&mut self, handle: u8) {
+        let Some(state) = self.handles[usize::from(handle)].take() else {
+            return;
+        };
+        let endpoint = state.endpoint;
+        if self.endpoints[endpoint].live_handles != 0 {
+            self.endpoints[endpoint].live_handles -= 1;
+        }
+        if self.endpoints[endpoint].live_handles == 0 {
+            let peer = endpoint ^ 1;
+            self.endpoints[peer].peer_closed = true;
+            self.wake_channel_waiters(peer);
+        }
+        self.observation
+            .edge_hits
+            .insert(format!("handle.close:slot:{handle}:endpoint:{endpoint}"));
+    }
+
+    fn handle_state(&self, handle: u8) -> Option<ChannelHandleState> {
+        self.handles.get(usize::from(handle)).copied().flatten()
+    }
+
+    fn snapshot_state(&mut self) {
+        let blocked_readable = self
+            .actors
+            .iter()
+            .filter(|actor| matches!(actor.blocked, Some(ChannelBlockedWait::Readable { .. })))
+            .count();
+        let blocked_peer_closed = self
+            .actors
+            .iter()
+            .filter(|actor| matches!(actor.blocked, Some(ChannelBlockedWait::PeerClosed { .. })))
+            .count();
+        let live_slots = self.handles.iter().flatten().count();
+        let endpoint_summary = (
+            self.endpoints[0].incoming_messages,
+            self.endpoints[0].peer_closed,
+            self.endpoints[0].live_handles,
+            self.endpoints[1].incoming_messages,
+            self.endpoints[1].peer_closed,
+            self.endpoints[1].live_handles,
+        );
+        let handle_summary = self
+            .handles
+            .iter()
+            .map(|slot| slot.map(|state| state.endpoint).unwrap_or(usize::MAX))
+            .collect::<Vec<_>>();
+        let state = (
+            blocked_readable,
+            blocked_peer_closed,
+            live_slots,
+            endpoint_summary,
+            handle_summary,
+            self.now,
+        );
+        self.observation.state_signatures.insert(hash_value(&state));
+    }
+}
+
 fn hash_value(value: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -1233,6 +1655,14 @@ mod tests {
     #[test]
     fn futex_fault_seed_produces_edges_and_states() {
         let seed = ConcurrentSeed::base_corpus(32).remove(3);
+        let observation = run_seed(&seed);
+        assert!(!observation.edge_hits.is_empty());
+        assert!(!observation.state_signatures.is_empty());
+    }
+
+    #[test]
+    fn channel_handle_seed_produces_edges_and_states() {
+        let seed = ConcurrentSeed::base_corpus(32).remove(4);
         let observation = run_seed(&seed);
         assert!(!observation.edge_hits.is_empty());
         assert!(!observation.state_signatures.is_empty());
