@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 
 use axle_core::{
-    FakeClock, PacketKind, Port, PortError, Signals, Time, TimerId, TimerService, WaitAsyncOptions,
-    WaitAsyncTimestamp, WaitOne, wait_one,
+    FakeClock, ObserverRegistry, PacketKind, Port, PortError, Signals, Time, TimerId, TimerService,
+    WaitAsyncOptions, WaitAsyncRegistration, WaitAsyncTimestamp, WaitOne, wait_one,
 };
 use axle_mm::{FutexKey, GlobalVmoId};
 use axle_types::koid::ZX_KOID_INVALID;
@@ -13,6 +13,7 @@ use crate::seed::{
 };
 
 const TIMER_WAITABLE_BASE: u64 = 0x10;
+const PORT_OBSERVER_ID: u64 = 1;
 
 /// Observation summary for one concurrent seed replay.
 #[derive(Clone, Debug, Default)]
@@ -231,6 +232,7 @@ struct WaitPortTimerRunner<'a> {
     hooks: HookRuntime,
     observation: RunObservation,
     port: Port,
+    observers: ObserverRegistry,
     clock: FakeClock,
     timers: TimerService,
     timer_slots: [TimerId; 2],
@@ -250,6 +252,7 @@ impl<'a> WaitPortTimerRunner<'a> {
             hooks: HookRuntime::new(&seed.hints),
             observation: RunObservation::default(),
             port: Port::new(4, 1),
+            observers: ObserverRegistry::new(),
             clock: FakeClock::new(),
             timers,
             timer_slots,
@@ -445,16 +448,25 @@ impl<'a> WaitPortTimerRunner<'a> {
                     .unwrap_or(Signals::NONE);
                 let watched = self.signal_bits(bits);
                 let before_len = self.port.len();
-                match self.port.wait_async(
-                    waitable_id,
-                    u64::from(key),
-                    watched,
-                    WaitAsyncOptions {
-                        edge_triggered: edge,
-                        timestamp: WaitAsyncTimestamp::Monotonic,
+                let observers = &mut self.observers;
+                let port = &mut self.port;
+                match observers.wait_async(
+                    WaitAsyncRegistration {
+                        port: PORT_OBSERVER_ID,
+                        waitable: waitable_id,
+                        key: u64::from(key),
+                        watched,
+                        options: WaitAsyncOptions {
+                            edge_triggered: edge,
+                            timestamp: WaitAsyncTimestamp::Monotonic,
+                        },
                     },
                     current,
                     self.clock.now(),
+                    |port_id, packet| {
+                        debug_assert_eq!(port_id, PORT_OBSERVER_ID);
+                        port.queue_kernel(packet).is_ok()
+                    },
                 ) {
                     Ok(()) => {
                         self.async_registrations = self.async_registrations.saturating_add(1);
@@ -481,6 +493,7 @@ impl<'a> WaitPortTimerRunner<'a> {
                         self.actors[actor_id.index()].last_result = match packet.kind {
                             PacketKind::Signal | PacketKind::User => ActorResult::Ok,
                         };
+                        self.flush_pending_port_packets();
                     }
                     Err(PortError::ShouldWait) => {
                         let deadline =
@@ -602,8 +615,13 @@ impl<'a> WaitPortTimerRunner<'a> {
         }
 
         let before_len = self.port.len();
-        self.port
-            .on_signals_changed(waitable, current, self.clock.now());
+        let observers = &mut self.observers;
+        let port = &mut self.port;
+        let changed_ports =
+            observers.on_signals_changed(waitable, current, self.clock.now(), |port_id, packet| {
+                debug_assert_eq!(port_id, PORT_OBSERVER_ID);
+                port.queue_kernel(packet).is_ok()
+            });
         if before_len == self.port.capacity() && self.port.len() == before_len {
             let _ = self.hooks.hit(
                 ActorId::A,
@@ -611,7 +629,7 @@ impl<'a> WaitPortTimerRunner<'a> {
                 &mut self.observation,
             );
         }
-        if before_len == 0 && !self.port.is_empty() {
+        if before_len == 0 && changed_ports.contains(&PORT_OBSERVER_ID) {
             self.observation
                 .edge_hits
                 .insert("port:empty_to_nonempty".into());
@@ -633,6 +651,7 @@ impl<'a> WaitPortTimerRunner<'a> {
             return;
         };
         let _ = self.port.pop();
+        self.flush_pending_port_packets();
         self.actors[actor_id.index()].blocked = None;
         self.actors[actor_id.index()].last_result = ActorResult::Woken;
         self.observation
@@ -657,6 +676,15 @@ impl<'a> WaitPortTimerRunner<'a> {
                 _ => {}
             }
         }
+    }
+
+    fn flush_pending_port_packets(&mut self) {
+        let observers = &mut self.observers;
+        let port = &mut self.port;
+        observers.flush_port(PORT_OBSERVER_ID, |port_id, packet| {
+            debug_assert_eq!(port_id, PORT_OBSERVER_ID);
+            port.queue_kernel(packet).is_ok()
+        });
     }
 
     fn service_delayed_timers(&mut self) {
