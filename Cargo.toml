@@ -7,6 +7,8 @@ members = [
   "crates/axle-page-table",
   "crates/axle-sync",
   "crates/axle-types",
+  "crates/libzircon",
+  "crates/nexus-rt",
 
   # Tools (host binaries)
   "tools/syscalls-gen",

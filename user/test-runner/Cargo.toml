@@ -8,6 +8,8 @@ publish = false
 [dependencies]
 axle-arch-x86_64 = { path = "../../crates/axle-arch-x86_64", default-features = false }
 axle-types = { path = "../../crates/axle-types", default-features = false }
+libzircon = { path = "../../crates/libzircon", default-features = false }
+nexus-rt = { path = "../../crates/nexus-rt", default-features = false }
 
 [build-dependencies]
 cc = "1"

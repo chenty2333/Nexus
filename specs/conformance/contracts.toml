@@ -389,3 +389,19 @@ description = "Bootstrap STREAM sockets should allow duplicated handles to keep 
 id = "should.socket.backpressure_stats_bootstrap"
 level = "should"
 description = "Bootstrap STREAM sockets should report stable short-write and would-block telemetry when the fixed-capacity buffer fills and drains"
+
+[[contracts]]
+id = "must.runtime.libzircon_bootstrap"
+level = "must"
+description = "Phase-three bootstrap userspace must expose a thin libzircon wrapper layer that can drive port, channel, timer, and handle-close syscalls from Rust ring3 code without handwritten per-syscall assembly"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "bootstrap userspace runtime gate; exercised by a dedicated QEMU ring3 scenario"
+
+[[contracts]]
+id = "must.runtime.reactor_bootstrap"
+level = "must"
+description = "Phase-three bootstrap userspace must provide a single-thread reactor that routes wait_async signal packets from channel and timer objects through port_wait without busy-waiting"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "bootstrap userspace runtime gate; exercised by a dedicated QEMU ring3 scenario"

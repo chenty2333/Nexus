@@ -114,15 +114,17 @@ depends on: C3, A1
 
 ### F. Zircon-compatible runtime `[ ]`
 
-#### F1. thin `libzircon`
+#### F1. thin `libzircon` `[x]`
 
-= userspace `zx_*` stubs, ABI types/struct glue, syscall wrappers, low-logic mapping onto Axle  
+= userspace `zx_*` stubs, ABI types/struct glue, syscall wrappers, low-logic mapping onto Axle
+= current tree now has a shared `libzircon` crate wrapping the bootstrap `int 0x80` ABI, including the current stack-extended `channel_read` calling convention
 depends on: Axle syscall/object semantics being stable enough to wrap cleanly
 
-#### F2. async/reactor base
+#### F2. async/reactor base `[x]`
 
 = event loop built on port/timer/channel semantics  
-= enough runtime glue for non-busy async waiting and dispatch  
+= enough runtime glue for non-busy async waiting and dispatch
+= current tree now has a minimal `nexus-rt` single-thread reactor plus a ring3 Rust smoke that drives channel-readable and timer-signaled delivery through one port
 depends on: F1
 
 #### F3. FIDL runtime / bindings

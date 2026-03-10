@@ -438,7 +438,31 @@ const SLOT_CHANNEL_WAIT_ASYNC_PORT_WAIT_CLOSED: usize = 539;
 const SLOT_CHANNEL_WAIT_ASYNC_CLOSED_KEY: usize = 540;
 const SLOT_CHANNEL_WAIT_ASYNC_CLOSED_TYPE: usize = 541;
 const SLOT_CHANNEL_WAIT_ASYNC_CLOSED_OBSERVED: usize = 542;
-const SLOT_MAX: usize = SLOT_CHANNEL_WAIT_ASYNC_CLOSED_OBSERVED;
+const SLOT_RUNTIME_FAILURE_STEP: usize = 543;
+const SLOT_RUNTIME_PORT_CREATE: usize = 544;
+const SLOT_RUNTIME_CHANNEL_CREATE: usize = 545;
+const SLOT_RUNTIME_TIMER_CREATE: usize = 546;
+const SLOT_RUNTIME_ARM_CHANNEL: usize = 547;
+const SLOT_RUNTIME_CHANNEL_WRITE: usize = 548;
+const SLOT_RUNTIME_WAIT_CHANNEL: usize = 549;
+const SLOT_RUNTIME_CHANNEL_EVENT_KEY: usize = 550;
+const SLOT_RUNTIME_CHANNEL_EVENT_TYPE: usize = 551;
+const SLOT_RUNTIME_CHANNEL_EVENT_OBSERVED: usize = 552;
+const SLOT_RUNTIME_CHANNEL_READ: usize = 553;
+const SLOT_RUNTIME_CHANNEL_ACTUAL_BYTES: usize = 554;
+const SLOT_RUNTIME_CHANNEL_MATCH: usize = 555;
+const SLOT_RUNTIME_ARM_TIMER: usize = 556;
+const SLOT_RUNTIME_TIMER_SET: usize = 557;
+const SLOT_RUNTIME_WAIT_TIMER: usize = 558;
+const SLOT_RUNTIME_TIMER_EVENT_KEY: usize = 559;
+const SLOT_RUNTIME_TIMER_EVENT_TYPE: usize = 560;
+const SLOT_RUNTIME_TIMER_EVENT_OBSERVED: usize = 561;
+const SLOT_RUNTIME_TIMER_CANCEL: usize = 562;
+const SLOT_RUNTIME_CLOSE_TX: usize = 563;
+const SLOT_RUNTIME_CLOSE_RX: usize = 564;
+const SLOT_RUNTIME_CLOSE_TIMER: usize = 565;
+const SLOT_RUNTIME_CLOSE_PORT: usize = 566;
+const SLOT_MAX: usize = SLOT_RUNTIME_CLOSE_PORT;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1564,6 +1588,34 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_CHANNEL_WAIT_ASYNC_CLOSED_KEY] as i64,
         slots[SLOT_CHANNEL_WAIT_ASYNC_CLOSED_TYPE] as i64,
         slots[SLOT_CHANNEL_WAIT_ASYNC_CLOSED_OBSERVED] as i64
+    );
+
+    crate::kprintln!(
+        "kernel: userspace runtime reactor (failure_step={}, port_create={}, channel_create={}, timer_create={}, arm_channel={}, channel_write={}, wait_channel={}, channel_event_key={}, channel_event_type={}, channel_event_observed={}, channel_read={}, channel_actual_bytes={}, channel_match={}, arm_timer={}, timer_set={}, wait_timer={}, timer_event_key={}, timer_event_type={}, timer_event_observed={}, timer_cancel={}, close_tx={}, close_rx={}, close_timer={}, close_port={})",
+        slots[SLOT_RUNTIME_FAILURE_STEP],
+        slots[SLOT_RUNTIME_PORT_CREATE] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_CREATE] as i64,
+        slots[SLOT_RUNTIME_TIMER_CREATE] as i64,
+        slots[SLOT_RUNTIME_ARM_CHANNEL] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_WRITE] as i64,
+        slots[SLOT_RUNTIME_WAIT_CHANNEL] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_EVENT_KEY],
+        slots[SLOT_RUNTIME_CHANNEL_EVENT_TYPE],
+        slots[SLOT_RUNTIME_CHANNEL_EVENT_OBSERVED],
+        slots[SLOT_RUNTIME_CHANNEL_READ] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_ACTUAL_BYTES],
+        slots[SLOT_RUNTIME_CHANNEL_MATCH],
+        slots[SLOT_RUNTIME_ARM_TIMER] as i64,
+        slots[SLOT_RUNTIME_TIMER_SET] as i64,
+        slots[SLOT_RUNTIME_WAIT_TIMER] as i64,
+        slots[SLOT_RUNTIME_TIMER_EVENT_KEY],
+        slots[SLOT_RUNTIME_TIMER_EVENT_TYPE],
+        slots[SLOT_RUNTIME_TIMER_EVENT_OBSERVED],
+        slots[SLOT_RUNTIME_TIMER_CANCEL] as i64,
+        slots[SLOT_RUNTIME_CLOSE_TX] as i64,
+        slots[SLOT_RUNTIME_CLOSE_RX] as i64,
+        slots[SLOT_RUNTIME_CLOSE_TIMER] as i64,
+        slots[SLOT_RUNTIME_CLOSE_PORT] as i64
     );
 
     crate::arch::qemu::exit_success();

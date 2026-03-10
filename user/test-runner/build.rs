@@ -7,11 +7,22 @@ fn main() {
         .expect("workspace root");
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=AXLE_TEST_RUNNER_ASM");
+    println!("cargo:rerun-if-env-changed=AXLE_TEST_RUNNER_RUST_ENTRY");
+    println!("cargo:rustc-check-cfg=cfg(axle_test_runner_rust_entry, values(\"reactor_smoke\"))");
 
     // Link the userspace runner at the fixed VA expected by the kernel bring-up
     // mapping in `kernel/axle-kernel/src/userspace.rs`.
     let script = manifest_dir.join("linker.ld");
     println!("cargo:rustc-link-arg=-T{}", script.display());
+    if let Ok(entry) = std::env::var("AXLE_TEST_RUNNER_RUST_ENTRY") {
+        match entry.as_str() {
+            "reactor_smoke" => {
+                println!("cargo:rustc-cfg=axle_test_runner_rust_entry=\"{entry}\"");
+            }
+            _ => panic!("unsupported AXLE_TEST_RUNNER_RUST_ENTRY={entry}"),
+        }
+        return;
+    }
     let asm = std::env::var("AXLE_TEST_RUNNER_ASM")
         .map(|value| {
             let path = std::path::PathBuf::from(value);

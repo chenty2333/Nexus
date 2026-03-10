@@ -1,0 +1,14 @@
+id = "kernel.runtime.reactor_bootstrap"
+description = "Bootstrap ring3 Rust userspace should drive a thin libzircon wrapper and a port-backed reactor over channel and timer signal delivery"
+tags = ["kernel", "runtime", "reactor", "bootstrap"]
+
+command = [
+  "bash",
+  "-c",
+  "cargo build -p axle-kernel --target x86_64-unknown-none && AXLE_TEST_RUNNER_RUST_ENTRY=reactor_smoke RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+
+contracts = [
+  "must.runtime.libzircon_bootstrap",
+  "must.runtime.reactor_bootstrap",
+]

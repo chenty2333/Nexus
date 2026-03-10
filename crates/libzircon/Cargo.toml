@@ -1,0 +1,10 @@
+[package]
+name = "libzircon"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+publish = false
+
+[dependencies]
+axle-arch-x86_64 = { path = "../axle-arch-x86_64", default-features = false }
+axle-types = { path = "../axle-types", default-features = false }

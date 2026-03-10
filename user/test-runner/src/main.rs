@@ -7,14 +7,28 @@
 //! the kernel bring-up path (ring3) and report results via the shared page +
 //! `int3`.
 //!
-//! The `_start` entrypoint is assembled and linked by `build.rs`, keeping this
-//! crate itself free of Rust-level unsafe code.
+//! The default `_start` entrypoint is assembled and linked by `build.rs`.
+//! Selected smoke scenarios can swap in a Rust-defined entry symbol instead.
 
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
+#![cfg_attr(
+    not(axle_test_runner_rust_entry = "reactor_smoke"),
+    forbid(unsafe_code)
+)]
+#![cfg_attr(
+    axle_test_runner_rust_entry = "reactor_smoke",
+    deny(unsafe_op_in_unsafe_fn)
+)]
+#![cfg_attr(
+    axle_test_runner_rust_entry = "reactor_smoke",
+    deny(clippy::undocumented_unsafe_blocks)
+)]
 
 use core::panic::PanicInfo;
+
+#[cfg(axle_test_runner_rust_entry = "reactor_smoke")]
+mod reactor_smoke;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

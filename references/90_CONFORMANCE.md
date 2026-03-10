@@ -61,6 +61,9 @@ Main just targets include:
 - Bootstrap channel coverage now also includes one async-signal gate:
   - `CHANNEL_WRITABLE` recovery through `wait_async` + `port_wait`
   - `CHANNEL_PEER_CLOSED` delivery through the same path without stale writable republish
+- Bootstrap userspace runtime coverage now also includes one Phase-3 gate:
+  - Rust ring3 code using `libzircon` can drive channel, timer, port, and handle-close syscalls without handwritten per-syscall assembly
+  - `nexus-rt` can dispatch one channel-readable event and one timer-signaled event through a single port-backed reactor
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return
@@ -97,6 +100,10 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - shared `stdout.log` / `stderr.log` and group-level result metadata now live under each run's
     `groups/` subtree
 - Most kernel scenarios build the kernel plus the current userspace runner, boot QEMU, and treat the printed summary line as the stable observable contract.
+- The runtime/reactor bootstrap scenario is the first case where the userspace runner entrypoint itself is defined in Rust instead of a standalone hand-written `.S` payload.
+- Because that Rust runner is still linked at the long-standing bootstrap userspace VA above 4 GiB,
+  the scenario builds `nexus-test-runner` with `RUSTFLAGS='-C code-model=large'` instead of
+  changing the whole `x86_64-unknown-none` target configuration.
 - Some bootstrap channel metrics currently come from a second structured summary line rather than
   the main `int80 conformance ok (...)` line.
   - the fragmented channel payload scenario uses this to report both remap-path and fallback-copy
