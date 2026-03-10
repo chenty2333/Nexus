@@ -3,8 +3,8 @@
 //! This is intentionally tiny: boot -> serial -> halt.
 //! The goal is to provide a concrete place for BSP init, SMP bring-up, and syscall/trap scaffolding.
 
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
 mod arch;
 mod bringup;
@@ -24,8 +24,10 @@ mod trap;
 mod userspace;
 mod wait;
 
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Use the minimal serial logger even in panic.
@@ -33,6 +35,7 @@ fn panic(info: &PanicInfo) -> ! {
     arch::cpu::halt_loop();
 }
 
+#[cfg(not(test))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     arch::init();

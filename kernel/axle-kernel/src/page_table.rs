@@ -69,6 +69,7 @@ pub(crate) enum PtMetaKind {
 pub(crate) struct PtMetaTemplate {
     present: bool,
     writable: bool,
+    executable: bool,
     user_accessible: bool,
 }
 
@@ -82,6 +83,11 @@ impl PtMetaTemplate {
     /// Whether every leaf entry in the covered subtree is writable.
     pub(crate) const fn writable(self) -> bool {
         self.writable
+    }
+
+    /// Whether every leaf entry in the covered subtree is executable.
+    pub(crate) const fn executable(self) -> bool {
+        self.executable
     }
 
     /// Whether every leaf entry in the covered subtree is user accessible.
@@ -284,6 +290,7 @@ impl PtDescriptorStore {
                 None => PtMetaTemplate {
                     present: false,
                     writable: false,
+                    executable: false,
                     user_accessible: true,
                 },
             };
@@ -565,6 +572,7 @@ impl UserPageTables {
                 PtMetaKind::Uniform(PtMetaTemplate {
                     present: false,
                     writable: false,
+                    executable: false,
                     user_accessible: true,
                 })
             } else {
@@ -658,9 +666,10 @@ impl PageTableLock for LockedUserPageTable {
         if !entry.flags().contains(PageTableFlags::PRESENT) {
             return Ok(None);
         }
-        PageMapping::new(
+        PageMapping::with_perms(
             entry.addr().as_u64(),
             entry.flags().contains(PageTableFlags::WRITABLE),
+            !entry.flags().contains(PageTableFlags::NO_EXECUTE),
         )
         .map(Some)
     }
@@ -669,6 +678,9 @@ impl PageTableLock for LockedUserPageTable {
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         if mapping.writable() {
             flags |= PageTableFlags::WRITABLE;
+        }
+        if !mapping.executable() {
+            flags |= PageTableFlags::NO_EXECUTE;
         }
         self.tables
             .entry_mut(va)?
@@ -687,7 +699,12 @@ impl PageTableLock for LockedUserPageTable {
         Ok(())
     }
 
-    fn protect_page(&mut self, va: u64, writable: bool) -> Result<(), PageTableError> {
+    fn protect_page(
+        &mut self,
+        va: u64,
+        writable: bool,
+        executable: bool,
+    ) -> Result<(), PageTableError> {
         let Some(entry) = self.tables.existing_entry_mut(va)? else {
             return Err(PageTableError::NotMapped);
         };
@@ -699,6 +716,11 @@ impl PageTableLock for LockedUserPageTable {
             flags |= PageTableFlags::WRITABLE;
         } else {
             flags.remove(PageTableFlags::WRITABLE);
+        }
+        if executable {
+            flags.remove(PageTableFlags::NO_EXECUTE);
+        } else {
+            flags |= PageTableFlags::NO_EXECUTE;
         }
         entry.set_flags(flags);
         Ok(())
@@ -780,6 +802,7 @@ fn entry_meta_template(entry: &PageTableEntry) -> PtMetaTemplate {
     PtMetaTemplate {
         present: flags.contains(PageTableFlags::PRESENT),
         writable: flags.contains(PageTableFlags::WRITABLE),
+        executable: !flags.contains(PageTableFlags::NO_EXECUTE),
         user_accessible: flags.contains(PageTableFlags::USER_ACCESSIBLE),
     }
 }

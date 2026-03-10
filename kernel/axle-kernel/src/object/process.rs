@@ -180,7 +180,9 @@ pub fn prepare_process_start(
 
         let resolved_vmo = state.lookup_handle(
             image_vmo_handle,
-            crate::task::HandleRights::READ | crate::task::HandleRights::MAP,
+            crate::task::HandleRights::READ
+                | crate::task::HandleRights::EXECUTE
+                | crate::task::HandleRights::MAP,
         )?;
         let image_vmo = state.with_objects(|objects| {
             Ok(match objects.get(resolved_vmo.object_key()) {
@@ -220,13 +222,23 @@ pub fn start_thread(
             })
         })?;
         if !state.with_kernel(|kernel| {
-            Ok(kernel.validate_process_user_ptr(thread.process_id, entry, 1))
+            Ok(kernel.validate_process_user_mapping_perms(
+                thread.process_id,
+                entry,
+                1,
+                MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER,
+            ))
         })? {
             return Err(ZX_ERR_INVALID_ARGS);
         }
         let stack_probe = stack.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
         if !state.with_kernel(|kernel| {
-            Ok(kernel.validate_process_user_ptr(thread.process_id, stack_probe, 8))
+            Ok(kernel.validate_process_user_mapping_perms(
+                thread.process_id,
+                stack_probe,
+                8,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            ))
         })? {
             return Err(ZX_ERR_INVALID_ARGS);
         }
@@ -248,9 +260,6 @@ pub fn start_process(
 ) -> Result<(), zx_status_t> {
     if entry == 0 || stack == 0 {
         return Err(ZX_ERR_INVALID_ARGS);
-    }
-    if arg_handle != ZX_HANDLE_INVALID {
-        return Err(ZX_ERR_NOT_SUPPORTED);
     }
 
     with_state_mut(|state| {
@@ -278,28 +287,102 @@ pub fn start_process(
         }
 
         if !state.with_kernel(|kernel| {
-            Ok(kernel.validate_process_user_ptr(process.process_id, entry, 1))
+            Ok(kernel.validate_process_user_mapping_perms(
+                process.process_id,
+                entry,
+                1,
+                MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER,
+            ))
         })? {
             return Err(ZX_ERR_INVALID_ARGS);
         }
         let stack_probe = stack.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
         if !state.with_kernel(|kernel| {
-            Ok(kernel.validate_process_user_ptr(process.process_id, stack_probe, 8))
+            Ok(kernel.validate_process_user_mapping_perms(
+                process.process_id,
+                stack_probe,
+                8,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            ))
         })? {
             return Err(ZX_ERR_INVALID_ARGS);
         }
 
-        state.with_kernel_mut(|kernel| {
-            kernel.start_process(
-                process.process_id,
-                thread.thread_id,
-                entry,
-                stack,
-                arg_handle as u64,
-                arg1,
-            )
-        })
+        start_process_with_transferred_arg_handle(
+            state,
+            process.process_id,
+            thread.thread_id,
+            entry,
+            stack,
+            arg_handle,
+            arg1,
+        )
     })
+}
+
+fn install_start_arg_handle(
+    state: &KernelState,
+    process_id: u64,
+    arg_handle: zx_handle_t,
+) -> Result<zx_handle_t, zx_status_t> {
+    if arg_handle == ZX_HANDLE_INVALID {
+        return Ok(ZX_HANDLE_INVALID);
+    }
+
+    let transferred =
+        state.snapshot_handle_for_transfer(arg_handle, crate::task::HandleRights::TRANSFER)?;
+    state.install_transferred_handle_in_process(process_id, transferred)
+}
+
+fn rollback_start_arg_handle(
+    state: &KernelState,
+    process_id: u64,
+    child_arg_handle: zx_handle_t,
+) -> Result<(), zx_status_t> {
+    if child_arg_handle == ZX_HANDLE_INVALID {
+        return Ok(());
+    }
+
+    let resolved = state.resolve_handle_raw_in_process(process_id, child_arg_handle)?;
+    let object_key = resolved.object_key();
+    let action = state.with_objects(|objects| {
+        Ok(objects
+            .get(object_key)
+            .map(close_handle_action_for_live_object)
+            .unwrap_or(CloseHandleAction::None))
+    })?;
+    state.close_handle_in_process(process_id, child_arg_handle)?;
+    if state.object_handle_count(object_key) == 0 {
+        finalize_last_handle_close(state, object_key, action)?;
+    }
+    Ok(())
+}
+
+fn start_process_with_transferred_arg_handle(
+    state: &KernelState,
+    process_id: u64,
+    thread_id: u64,
+    entry: zx_vaddr_t,
+    stack: zx_vaddr_t,
+    arg_handle: zx_handle_t,
+    arg1: u64,
+) -> Result<(), zx_status_t> {
+    let child_arg_handle = install_start_arg_handle(state, process_id, arg_handle)?;
+    let result = state.with_kernel_mut(|kernel| {
+        kernel.start_process(
+            process_id,
+            thread_id,
+            entry,
+            stack,
+            child_arg_handle as u64,
+            arg1,
+        )
+    });
+    if let Err(status) = result {
+        rollback_start_arg_handle(state, process_id, child_arg_handle)?;
+        return Err(status);
+    }
+    Ok(())
 }
 
 /// Kill one process or thread handle with minimal bootstrap semantics.
@@ -331,6 +414,83 @@ pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
         }
         sync_task_lifecycle(state)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        install_start_arg_handle, rollback_start_arg_handle,
+        start_process_with_transferred_arg_handle,
+    };
+    use crate::object::KernelState;
+    use axle_types::handle::ZX_HANDLE_INVALID;
+    use axle_types::status::ZX_ERR_BAD_HANDLE;
+
+    fn bootstrap_self_process_handle(state: &KernelState) -> axle_types::zx_handle_t {
+        state
+            .with_registry(|registry| Ok(registry.bootstrap_self_process_handle))
+            .expect("bootstrap self process handle")
+    }
+
+    #[test]
+    fn start_arg_handle_installs_into_child_process() {
+        let state = KernelState::new();
+        let child = state
+            .with_kernel_mut(|kernel| kernel.create_process())
+            .expect("create child process");
+        let parent_handle = bootstrap_self_process_handle(&state);
+        let object_key = state
+            .resolve_handle_raw(parent_handle)
+            .expect("resolve parent handle")
+            .object_key();
+
+        let child_handle = install_start_arg_handle(&state, child.process_id(), parent_handle)
+            .expect("install arg handle in child");
+
+        assert_ne!(child_handle, ZX_HANDLE_INVALID);
+        assert_eq!(state.object_handle_count(object_key), 2);
+        let resolved = state
+            .resolve_handle_raw_in_process(child.process_id(), child_handle)
+            .expect("resolve child handle");
+        assert_eq!(resolved.object_key(), object_key);
+
+        rollback_start_arg_handle(&state, child.process_id(), child_handle)
+            .expect("rollback installed child handle");
+        assert_eq!(state.object_handle_count(object_key), 1);
+        assert_eq!(
+            state
+                .resolve_handle_raw_in_process(child.process_id(), child_handle)
+                .expect_err("child handle must be gone"),
+            ZX_ERR_BAD_HANDLE
+        );
+    }
+
+    #[test]
+    fn start_process_rolls_back_installed_arg_handle_on_kernel_failure() {
+        let state = KernelState::new();
+        let child = state
+            .with_kernel_mut(|kernel| kernel.create_process())
+            .expect("create child process");
+        let parent_handle = bootstrap_self_process_handle(&state);
+        let object_key = state
+            .resolve_handle_raw(parent_handle)
+            .expect("resolve parent handle")
+            .object_key();
+
+        let status = start_process_with_transferred_arg_handle(
+            &state,
+            child.process_id(),
+            u64::MAX,
+            0x1000,
+            0x2000,
+            parent_handle,
+            0,
+        )
+        .expect_err("kernel start_process should fail for missing thread");
+
+        assert_eq!(status, ZX_ERR_BAD_HANDLE);
+        assert_eq!(state.object_handle_count(object_key), 1);
+    }
 }
 
 /// Suspend one process or thread and return a token whose close resumes it.

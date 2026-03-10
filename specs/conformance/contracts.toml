@@ -135,6 +135,14 @@ mode = "not_applicable"
 reason = "VMAR syscall and TLB visibility contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
+id = "must.vm.strict_tlb_visibility_phase1"
+level = "must"
+description = "Phase-one strict VM commits must complete required TLB invalidation before syscall return or frame reuse for map/protect/unmap, execute install/change, writable-to-readonly snapshot transitions, and remaps that replace live frames"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "strict TLB visibility is a VM/TLB syscall-return contract exercised in QEMU scenarios; the host-side concurrent harness does not model shootdown completion"
+
+[[contracts]]
 id = "must.channel.create_write_read_bootstrap"
 level = "must"
 description = "Bootstrap channel create/write/read must preserve FIFO byte payloads and readable signaling"
@@ -242,9 +250,33 @@ level = "should"
 description = "Bootstrap worker threads should wake wait_one and port_wait through the scheduler-backed handoff path"
 
 [[contracts]]
+id = "must.scheduler.l0_per_cpu_wake_phase1"
+level = "must"
+description = "Phase-one L0 scheduler must drive wait/futex/port/timer completions across CPUs via per-CPU runnable state, remote wakeup, and reschedule IPIs without relying on one global run queue"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "per-CPU scheduler topology and reschedule IPIs are exercised in QEMU/SMP scenarios; the host-side concurrent harness does not model CPU-local run queues"
+
+[[contracts]]
 id = "should.process.create_child_thread_bootstrap"
 level = "should"
 description = "Bootstrap process_create/process_start should yield a real child address space that can map shared VMOs and run a child thread"
+
+[[contracts]]
+id = "must.process.generic_launch_phase1"
+level = "must"
+description = "Phase-one process_start must keep the current ABI while accepting a non-invalid arg_handle, using the generic image-launch path, and allowing child launch/exit/reap without bootstrap-only launch semantics"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "generic launch is a process/image ABI contract exercised in QEMU scenarios; the host-side concurrent harness does not model userspace image bring-up"
+
+[[contracts]]
+id = "must.vm.execute_mapping_phase1"
+level = "must"
+description = "Phase-one VMAR map/protect must surface ZX_VM_PERM_EXECUTE and ZX_VM_CAN_MAP_EXECUTE, enforce execute-cap checks, and reject process/thread start entries that are not executable user mappings"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "execute-cap and launch-entry validation are QEMU/VM syscall contracts; the host-side concurrent harness does not currently model executable mappings"
 
 [[contracts]]
 id = "should.task.kill_process_bootstrap"

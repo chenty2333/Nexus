@@ -193,8 +193,10 @@ impl FutexTable {
 
 #[cfg(test)]
 mod tests {
+    use super::alloc::vec;
     use super::{FutexTable, RequeueResult, WakeResult};
     use axle_mm::{FutexKey, GlobalVmoId};
+    use axle_types::koid::ZX_KOID_INVALID;
 
     fn shared_key(id: u64, offset: u64) -> FutexKey {
         FutexKey::Shared {
@@ -211,7 +213,7 @@ mod tests {
         table.enqueue_waiter(key, 12, 500);
 
         let WakeResult { woken, remaining } = table.wake(key, 1, 0, false);
-        assert_eq!(woken, alloc::vec![11]);
+        assert_eq!(woken, vec![11]);
         assert_eq!(remaining, 1);
         assert_eq!(table.owner(key), 0);
     }
@@ -233,8 +235,8 @@ mod tests {
             target_remaining,
         } = table.requeue(source, target, 1, 2, 88);
 
-        assert_eq!(woken, alloc::vec![1]);
-        assert_eq!(requeued_waiters, alloc::vec![2, 3]);
+        assert_eq!(woken, vec![1]);
+        assert_eq!(requeued_waiters, vec![2, 3]);
         assert_eq!(requeued, 2);
         assert_eq!(source_remaining, 0);
         assert_eq!(target_remaining, 2);
@@ -250,7 +252,7 @@ mod tests {
 
         assert!(table.cancel_waiter(key, 1));
         let WakeResult { woken, remaining } = table.wake(key, 2, 0, false);
-        assert_eq!(woken, alloc::vec![2]);
+        assert_eq!(woken, vec![2]);
         assert_eq!(remaining, 0);
     }
 

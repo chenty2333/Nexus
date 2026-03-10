@@ -1,5 +1,7 @@
 //! x86_64 architecture support (very early bring-up).
 
+use x86_64::registers::model_specific::{Efer, EferFlags};
+
 pub mod apic;
 pub mod breakpoint;
 pub mod cpu;
@@ -23,6 +25,7 @@ pub fn init() {
     // Safe to call multiple times; serial init is idempotent.
     serial::init();
     cpuid::log_boot_cpu_info();
+    enable_no_execute();
 
     // Install a real GDT/TSS so ring3 can enter the kernel through the IDT.
     let _ = gdt::init();
@@ -33,8 +36,18 @@ pub fn init() {
 /// keep its timer masked.
 pub fn init_ap() {
     serial::init();
+    enable_no_execute();
     let _ = gdt::init();
     idt::load();
     percpu::init();
     apic::init_ap();
+}
+
+fn enable_no_execute() {
+    // SAFETY: enabling NXE only turns on hardware interpretation of the NX bit
+    // in page-table entries while preserving the rest of EFER. Axle already
+    // runs in long mode before calling this helper.
+    unsafe {
+        Efer::update(|flags| flags.insert(EferFlags::NO_EXECUTE_ENABLE));
+    }
 }

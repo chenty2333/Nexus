@@ -1,12 +1,29 @@
 use super::*;
 
 impl KernelState {
+    fn current_process_id(&self) -> Result<u64, zx_status_t> {
+        self.with_core(|kernel| {
+            kernel
+                .current_process_info()
+                .map(|process| process.process_id())
+        })
+    }
+
     pub(super) fn resolve_handle_raw(
         &self,
         raw: zx_handle_t,
     ) -> Result<crate::task::ResolvedHandle, zx_status_t> {
+        let process_id = self.current_process_id()?;
+        self.resolve_handle_raw_in_process(process_id, raw)
+    }
+
+    pub(super) fn resolve_handle_raw_in_process(
+        &self,
+        process_id: u64,
+        raw: zx_handle_t,
+    ) -> Result<crate::task::ResolvedHandle, zx_status_t> {
         self.with_core(|kernel| {
-            kernel.lookup_current_handle(raw, crate::task::HandleRights::empty())
+            kernel.lookup_handle_in_process(process_id, raw, crate::task::HandleRights::empty())
         })
     }
 
@@ -41,8 +58,19 @@ impl KernelState {
     }
 
     pub(super) fn close_handle(&self, raw: zx_handle_t) -> Result<(), zx_status_t> {
-        let object_key = self.resolve_handle_raw(raw)?.object_key();
-        self.with_core_mut(|kernel| kernel.close_current_handle(raw))?;
+        let process_id = self.current_process_id()?;
+        self.close_handle_in_process(process_id, raw)
+    }
+
+    pub(super) fn close_handle_in_process(
+        &self,
+        process_id: u64,
+        raw: zx_handle_t,
+    ) -> Result<(), zx_status_t> {
+        let object_key = self
+            .resolve_handle_raw_in_process(process_id, raw)?
+            .object_key();
+        self.with_core_mut(|kernel| kernel.close_handle_in_process(process_id, raw))?;
         self.decrement_object_handle_ref(object_key);
         Ok(())
     }
@@ -81,17 +109,21 @@ impl KernelState {
         &self,
         transferred: TransferredCap,
     ) -> Result<zx_handle_t, zx_status_t> {
+        let process_id = self.current_process_id()?;
+        self.install_transferred_handle_in_process(process_id, transferred)
+    }
+
+    pub(super) fn install_transferred_handle_in_process(
+        &self,
+        process_id: u64,
+        transferred: TransferredCap,
+    ) -> Result<zx_handle_t, zx_status_t> {
         let object_key = transferred.capability().object_key();
-        let current_process_id = self.with_core(|kernel| {
-            kernel
-                .current_process_info()
-                .map(|process| process.process_id())
-        })?;
         let vmo_to_promote = self.with_registry(|registry| {
             Ok(match registry.get(object_key) {
                 Some(KernelObject::Vmo(vmo))
                     if matches!(vmo.backing_scope(), VmoBackingScope::LocalPrivate { .. })
-                        && vmo.creator_process_id() != current_process_id =>
+                        && vmo.creator_process_id() != process_id =>
                 {
                     Some(vmo.clone())
                 }
@@ -111,7 +143,7 @@ impl KernelState {
             }
         }
         let handle =
-            self.with_core_mut(|kernel| kernel.install_handle_in_current_process(transferred))?;
+            self.with_core_mut(|kernel| kernel.install_handle_in_process(process_id, transferred))?;
         self.with_registry_mut(|registry| registry.increment_handle_ref(object_key))?;
         Ok(handle)
     }
@@ -224,6 +256,7 @@ pub(super) fn vmo_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::READ
         | crate::task::HandleRights::WRITE
+        | crate::task::HandleRights::EXECUTE
         | crate::task::HandleRights::MAP
 }
 
@@ -231,6 +264,7 @@ pub(super) fn bootstrap_code_vmo_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::READ
+        | crate::task::HandleRights::EXECUTE
         | crate::task::HandleRights::MAP
 }
 
@@ -239,6 +273,7 @@ pub(super) fn vmar_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::READ
         | crate::task::HandleRights::WRITE
+        | crate::task::HandleRights::EXECUTE
         | crate::task::HandleRights::MAP
 }
 

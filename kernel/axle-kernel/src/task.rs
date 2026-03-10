@@ -2290,8 +2290,8 @@ impl AddressSpace {
             crate::userspace::USER_CODE_BYTES,
             code_vmo,
             0,
-            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::EXECUTE | MappingPerms::USER,
-            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::EXECUTE | MappingPerms::USER,
+            process_image_default_code_perms() | MappingPerms::USER,
+            process_image_default_code_perms() | MappingPerms::USER,
         )
         .expect("bootstrap code mapping must succeed");
 
@@ -2903,7 +2903,7 @@ impl VmDomain {
         len: u64,
         new_perms: MappingPerms,
     ) -> Result<bool, zx_status_t> {
-        if new_perms.contains(MappingPerms::WRITE) {
+        if new_perms.contains(MappingPerms::WRITE) && !new_perms.contains(MappingPerms::EXECUTE) {
             return Ok(false);
         }
         let address_space = self
@@ -2916,7 +2916,12 @@ impl VmDomain {
             let va = addr + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
             if address_space
                 .lookup_user_mapping(va, 1)
-                .is_some_and(|lookup| lookup.perms().contains(MappingPerms::WRITE))
+                .is_some_and(|lookup| {
+                    (lookup.perms().contains(MappingPerms::WRITE)
+                        && !new_perms.contains(MappingPerms::WRITE))
+                        || (lookup.perms().contains(MappingPerms::EXECUTE)
+                            != new_perms.contains(MappingPerms::EXECUTE))
+                })
             {
                 return Ok(true);
             }
@@ -3108,9 +3113,18 @@ impl Kernel {
         required_rights: HandleRights,
     ) -> Result<ResolvedHandle, zx_status_t> {
         let process_id = self.current_thread()?.process_id;
-        let resolved = self
-            .current_process()?
-            .lookup_handle(process_id, raw, &self.revocations)?;
+        self.lookup_handle_in_process(process_id, raw, required_rights)
+    }
+
+    pub(crate) fn lookup_handle_in_process(
+        &self,
+        process_id: ProcessId,
+        raw: zx_handle_t,
+        required_rights: HandleRights,
+    ) -> Result<ResolvedHandle, zx_status_t> {
+        let resolved =
+            self.process(process_id)?
+                .lookup_handle(process_id, raw, &self.revocations)?;
         if !resolved.rights().contains(required_rights) {
             return Err(ZX_ERR_ACCESS_DENIED);
         }
@@ -3118,7 +3132,16 @@ impl Kernel {
     }
 
     pub(crate) fn close_current_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
-        self.current_process_mut()?.close_handle(raw)
+        let process_id = self.current_thread()?.process_id;
+        self.close_handle_in_process(process_id, raw)
+    }
+
+    pub(crate) fn close_handle_in_process(
+        &mut self,
+        process_id: ProcessId,
+        raw: zx_handle_t,
+    ) -> Result<(), zx_status_t> {
+        self.process_mut(process_id)?.close_handle(raw)
     }
 
     pub(crate) fn duplicate_current_handle(
@@ -3155,7 +3178,16 @@ impl Kernel {
         &mut self,
         transferred: TransferredCap,
     ) -> Result<zx_handle_t, zx_status_t> {
-        self.current_process_mut()?
+        let process_id = self.current_thread()?.process_id;
+        self.install_handle_in_process(process_id, transferred)
+    }
+
+    pub(crate) fn install_handle_in_process(
+        &mut self,
+        process_id: ProcessId,
+        transferred: TransferredCap,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        self.process_mut(process_id)?
             .install_transferred_handle(transferred)
     }
 
@@ -3185,6 +3217,22 @@ impl Kernel {
                 .get(&process.address_space_id)
                 .map(|address_space| address_space.validate_user_ptr(ptr, len))
                 .unwrap_or(false)
+        })
+    }
+
+    pub(crate) fn validate_process_user_mapping_perms(
+        &self,
+        process_id: ProcessId,
+        ptr: u64,
+        len: usize,
+        required: MappingPerms,
+    ) -> bool {
+        let Ok(process) = self.process(process_id) else {
+            return false;
+        };
+        self.with_vm(|vm| {
+            vm.lookup_user_mapping(process.address_space_id, ptr, len)
+                .is_some_and(|lookup| mapping_satisfies_required_perms(lookup, required))
         })
     }
 
@@ -4069,6 +4117,20 @@ impl Kernel {
         if process.state != ProcessState::Started {
             return Err(ZX_ERR_BAD_STATE);
         }
+        let stack_probe = stack.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
+        if !self.validate_process_user_mapping_perms(
+            process_id,
+            entry,
+            1,
+            MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER,
+        ) || !self.validate_process_user_mapping_perms(
+            process_id,
+            stack_probe,
+            8,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+        ) {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
         if !matches!(thread.state, ThreadState::New) {
             return Err(ZX_ERR_BAD_STATE);
@@ -4100,6 +4162,20 @@ impl Kernel {
             .process_id;
         if thread_process_id != process_id {
             return Err(ZX_ERR_BAD_STATE);
+        }
+        let stack_probe = stack.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
+        if !self.validate_process_user_mapping_perms(
+            process_id,
+            entry,
+            1,
+            MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER,
+        ) || !self.validate_process_user_mapping_perms(
+            process_id,
+            stack_probe,
+            8,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+        ) {
+            return Err(ZX_ERR_INVALID_ARGS);
         }
         let process = self
             .processes
@@ -4457,6 +4533,10 @@ impl Kernel {
 
     fn current_process_mut(&mut self) -> Result<&mut Process, zx_status_t> {
         let process_id = self.current_thread()?.process_id;
+        self.process_mut(process_id)
+    }
+
+    fn process_mut(&mut self, process_id: ProcessId) -> Result<&mut Process, zx_status_t> {
         self.processes.get_mut(&process_id).ok_or(ZX_ERR_BAD_STATE)
     }
 
@@ -5524,10 +5604,7 @@ impl VmDomain {
                 crate::userspace::USER_CODE_BYTES,
                 local_vmo_id,
                 0,
-                MappingPerms::READ
-                    | MappingPerms::WRITE
-                    | MappingPerms::EXECUTE
-                    | MappingPerms::USER,
+                process_image_default_code_perms() | MappingPerms::USER,
             )?;
         } else {
             for segment in layout.segments() {
@@ -6405,7 +6482,14 @@ impl VmDomain {
             }
         };
         self.install_mapping_pages(address_space_id, mapped_addr, len)?;
-        Ok((mapped_addr, TlbCommitReq::relaxed(address_space_id)))
+        Ok((
+            mapped_addr,
+            if perms.contains(MappingPerms::EXECUTE) {
+                TlbCommitReq::strict(address_space_id)
+            } else {
+                TlbCommitReq::relaxed(address_space_id)
+            },
+        ))
     }
 
     pub(crate) fn map_vmo_object_into_vmar(
@@ -6467,7 +6551,14 @@ impl VmDomain {
             }
         };
         self.install_mapping_pages(address_space_id, mapped_addr, len)?;
-        Ok((mapped_addr, TlbCommitReq::relaxed(address_space_id)))
+        Ok((
+            mapped_addr,
+            if perms.contains(MappingPerms::EXECUTE) {
+                TlbCommitReq::strict(address_space_id)
+            } else {
+                TlbCommitReq::relaxed(address_space_id)
+            },
+        ))
     }
 
     pub(crate) fn unmap_vmar(
@@ -7139,9 +7230,10 @@ impl VmDomain {
                 .ok_or(ZX_ERR_BAD_STATE)?;
             match lookup.frame_id() {
                 Some(frame_id) => {
-                    let mapping = PageMapping::new(
+                    let mapping = PageMapping::with_perms(
                         frame_id.raw(),
                         lookup.perms().contains(MappingPerms::WRITE),
+                        lookup.perms().contains(MappingPerms::EXECUTE),
                     )
                     .map_err(map_page_table_error)?;
                     tx.map(va, crate::userspace::USER_PAGE_BYTES, |_| Ok(mapping))
@@ -7639,6 +7731,25 @@ fn map_page_table_error(err: PageTableError) -> zx_status_t {
         PageTableError::InvalidArgs => ZX_ERR_INVALID_ARGS,
         PageTableError::NotMapped | PageTableError::Backend => ZX_ERR_BAD_STATE,
     }
+}
+
+fn mapping_satisfies_required_perms(lookup: VmaLookup, required: MappingPerms) -> bool {
+    if required.contains(MappingPerms::READ) && !lookup.perms().contains(MappingPerms::READ) {
+        return false;
+    }
+    if required.contains(MappingPerms::USER) && !lookup.perms().contains(MappingPerms::USER) {
+        return false;
+    }
+    if required.contains(MappingPerms::EXECUTE) && !lookup.perms().contains(MappingPerms::EXECUTE) {
+        return false;
+    }
+    if required.contains(MappingPerms::WRITE)
+        && !(lookup.perms().contains(MappingPerms::WRITE)
+            || (lookup.is_copy_on_write() && lookup.max_perms().contains(MappingPerms::WRITE)))
+    {
+        return false;
+    }
+    true
 }
 
 fn align_down_page(value: u64) -> u64 {

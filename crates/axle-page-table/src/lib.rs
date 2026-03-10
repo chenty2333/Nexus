@@ -72,15 +72,29 @@ impl PageRange {
 pub struct PageMapping {
     paddr: u64,
     writable: bool,
+    executable: bool,
 }
 
 impl PageMapping {
     /// Build one page mapping from a page-aligned physical address.
-    pub fn new(paddr: u64, writable: bool) -> Result<Self, PageTableError> {
+    pub fn new(paddr: u64, writable: bool, executable: bool) -> Result<Self, PageTableError> {
+        Self::with_perms(paddr, writable, executable)
+    }
+
+    /// Build one page mapping from a page-aligned physical address with explicit permissions.
+    pub fn with_perms(
+        paddr: u64,
+        writable: bool,
+        executable: bool,
+    ) -> Result<Self, PageTableError> {
         if !is_page_aligned(paddr) {
             return Err(PageTableError::InvalidArgs);
         }
-        Ok(Self { paddr, writable })
+        Ok(Self {
+            paddr,
+            writable,
+            executable,
+        })
     }
 
     /// Backing physical address.
@@ -91,6 +105,11 @@ impl PageMapping {
     /// Whether the mapping should be writable.
     pub const fn writable(self) -> bool {
         self.writable
+    }
+
+    /// Whether the mapping should be executable.
+    pub const fn executable(self) -> bool {
+        self.executable
     }
 }
 
@@ -162,8 +181,13 @@ pub trait PageTableLock {
     /// Remove one mapped page.
     fn unmap_page(&mut self, va: u64) -> Result<(), PageTableError>;
 
-    /// Update writability on one mapped page.
-    fn protect_page(&mut self, va: u64, writable: bool) -> Result<(), PageTableError>;
+    /// Update write and execute permissions on one mapped page.
+    fn protect_page(
+        &mut self,
+        va: u64,
+        writable: bool,
+        executable: bool,
+    ) -> Result<(), PageTableError>;
 
     /// Finish the session and publish any deferred synchronization work.
     fn commit(self, shootdown: ShootdownBatch) -> Result<(), PageTableError>;
@@ -233,21 +257,16 @@ impl<L: PageTableLock> TxCursor<L> {
         Ok(())
     }
 
-    /// Update writability for every page in one aligned range.
-    pub fn protect<F>(
-        &mut self,
-        base: u64,
-        len: u64,
-        mut writable_at: F,
-    ) -> Result<(), PageTableError>
+    /// Update write and execute permissions for every page in one aligned range.
+    pub fn protect<F>(&mut self, base: u64, len: u64, mut perms_at: F) -> Result<(), PageTableError>
     where
-        F: FnMut(u64) -> Result<bool, PageTableError>,
+        F: FnMut(u64) -> Result<(bool, bool), PageTableError>,
     {
         let page_count = validate_subrange(self.range(), base, len)?;
         for page_index in 0..page_count {
             let va = base + (page_index as u64) * PAGE_SIZE;
-            let writable = writable_at(va)?;
-            self.lock.protect_page(va, writable)?;
+            let (writable, executable) = perms_at(va)?;
+            self.lock.protect_page(va, writable, executable)?;
             self.shootdown.invalidate_page(va);
         }
         Ok(())
@@ -434,11 +453,16 @@ mod tests {
             Ok(())
         }
 
-        fn protect_page(&mut self, va: u64, writable: bool) -> Result<(), PageTableError> {
+        fn protect_page(
+            &mut self,
+            va: u64,
+            writable: bool,
+            executable: bool,
+        ) -> Result<(), PageTableError> {
             let Some(mapping) = self.backend.pages.get_mut(&va) else {
                 return Err(PageTableError::NotMapped);
             };
-            *mapping = PageMapping::new(mapping.paddr(), writable)?;
+            *mapping = PageMapping::new(mapping.paddr(), writable, executable)?;
             Ok(())
         }
 
@@ -459,13 +483,13 @@ mod tests {
         let mut backend = MockBackend::default();
         backend
             .pages
-            .insert(PAGE_SIZE, PageMapping::new(0x20_000, true).unwrap());
+            .insert(PAGE_SIZE, PageMapping::new(0x20_000, true, false).unwrap());
         let range = PageRange::new(PAGE_SIZE, PAGE_SIZE * 2).unwrap();
         let mut tx = TxCursor::new(backend.lock(range).unwrap());
 
         assert_eq!(
             tx.query(PAGE_SIZE).unwrap(),
-            Some(PageMapping::new(0x20_000, true).unwrap())
+            Some(PageMapping::new(0x20_000, true, false).unwrap())
         );
         assert_eq!(tx.query(PAGE_SIZE * 2).unwrap(), None);
         tx.commit().unwrap();
@@ -480,7 +504,11 @@ mod tests {
 
         tx.map(PAGE_SIZE, PAGE_SIZE * 2, |va| {
             let page_index = (va / PAGE_SIZE) - 1;
-            PageMapping::new(0x40_000 + (page_index * PAGE_SIZE), page_index == 0)
+            PageMapping::new(
+                0x40_000 + (page_index * PAGE_SIZE),
+                page_index == 0,
+                page_index != 0,
+            )
         })
         .unwrap();
         tx.commit().unwrap();
@@ -490,11 +518,11 @@ mod tests {
         assert_eq!(backend.commits, 1);
         assert_eq!(
             backend.pages.get(&PAGE_SIZE).copied().unwrap(),
-            PageMapping::new(0x40_000, true).unwrap()
+            PageMapping::new(0x40_000, true, false).unwrap()
         );
         assert_eq!(
             backend.pages.get(&(PAGE_SIZE * 2)).copied().unwrap(),
-            PageMapping::new(0x41_000, false).unwrap()
+            PageMapping::new(0x41_000, false, true).unwrap()
         );
     }
 
@@ -503,10 +531,11 @@ mod tests {
         let mut backend = MockBackend::default();
         backend
             .pages
-            .insert(PAGE_SIZE, PageMapping::new(0x20_000, true).unwrap());
-        backend
-            .pages
-            .insert(PAGE_SIZE * 2, PageMapping::new(0x30_000, false).unwrap());
+            .insert(PAGE_SIZE, PageMapping::new(0x20_000, true, true).unwrap());
+        backend.pages.insert(
+            PAGE_SIZE * 2,
+            PageMapping::new(0x30_000, false, false).unwrap(),
+        );
         let range = PageRange::new(PAGE_SIZE, PAGE_SIZE * 2).unwrap();
         let mut tx = TxCursor::new(backend.lock(range).unwrap());
 
@@ -523,24 +552,27 @@ mod tests {
         let mut backend = MockBackend::default();
         backend
             .pages
-            .insert(PAGE_SIZE, PageMapping::new(0x20_000, false).unwrap());
-        backend
-            .pages
-            .insert(PAGE_SIZE * 2, PageMapping::new(0x30_000, false).unwrap());
+            .insert(PAGE_SIZE, PageMapping::new(0x20_000, false, false).unwrap());
+        backend.pages.insert(
+            PAGE_SIZE * 2,
+            PageMapping::new(0x30_000, false, true).unwrap(),
+        );
         let range = PageRange::new(PAGE_SIZE, PAGE_SIZE * 2).unwrap();
         let mut tx = TxCursor::new(backend.lock(range).unwrap());
 
-        tx.protect(PAGE_SIZE, PAGE_SIZE * 2, |va| Ok(va == PAGE_SIZE * 2))
-            .unwrap();
+        tx.protect(PAGE_SIZE, PAGE_SIZE * 2, |va| {
+            Ok((va == PAGE_SIZE * 2, va == PAGE_SIZE))
+        })
+        .unwrap();
         tx.commit().unwrap();
 
         assert_eq!(
             backend.pages.get(&PAGE_SIZE).copied().unwrap(),
-            PageMapping::new(0x20_000, false).unwrap()
+            PageMapping::new(0x20_000, false, true).unwrap()
         );
         assert_eq!(
             backend.pages.get(&(PAGE_SIZE * 2)).copied().unwrap(),
-            PageMapping::new(0x30_000, true).unwrap()
+            PageMapping::new(0x30_000, true, false).unwrap()
         );
         assert_eq!(backend.flushes, vec![PAGE_SIZE, PAGE_SIZE * 2]);
         assert_eq!(backend.commits, 1);
@@ -554,7 +586,7 @@ mod tests {
 
         assert_eq!(
             tx.map(PAGE_SIZE + 1, PAGE_SIZE, |_| PageMapping::new(
-                0x20_000, true
+                0x20_000, true, false
             ),),
             Err(PageTableError::InvalidArgs)
         );
@@ -563,7 +595,7 @@ mod tests {
             Err(PageTableError::InvalidArgs)
         );
         assert_eq!(
-            tx.protect(PAGE_SIZE, 0, |_| Ok(false)),
+            tx.protect(PAGE_SIZE, 0, |_| Ok((false, false))),
             Err(PageTableError::InvalidArgs)
         );
         assert_eq!(tx.query(PAGE_SIZE * 2), Err(PageTableError::InvalidArgs));
@@ -616,12 +648,14 @@ mod tests {
         let mut backend = MockBackend::default();
         backend
             .pages
-            .insert(PAGE_SIZE, PageMapping::new(0x20_000, false).unwrap());
+            .insert(PAGE_SIZE, PageMapping::new(0x20_000, false, false).unwrap());
         let range = PageRange::new(PAGE_SIZE, PAGE_SIZE).unwrap();
         let mut tx = TxCursor::new(backend.lock(range).unwrap());
 
-        tx.protect(PAGE_SIZE, PAGE_SIZE, |_| Ok(true)).unwrap();
-        tx.protect(PAGE_SIZE, PAGE_SIZE, |_| Ok(false)).unwrap();
+        tx.protect(PAGE_SIZE, PAGE_SIZE, |_| Ok((true, true)))
+            .unwrap();
+        tx.protect(PAGE_SIZE, PAGE_SIZE, |_| Ok((false, false)))
+            .unwrap();
         tx.commit().unwrap();
 
         assert_eq!(backend.flushes, vec![PAGE_SIZE]);

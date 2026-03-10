@@ -366,6 +366,9 @@ fn require_vm_mapping_rights(
     if perms.contains(MappingPerms::WRITE) {
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
     }
+    if perms.contains(MappingPerms::EXECUTE) {
+        require_handle_rights(resolved, crate::task::HandleRights::EXECUTE)?;
+    }
     Ok(())
 }
 
@@ -413,11 +416,9 @@ fn mapping_request_from_options(
     if !specific && vmar_offset != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
-    if (options & ZX_VM_PERM_EXECUTE) != 0 {
-        return Err(ZX_ERR_NOT_SUPPORTED);
-    }
     let has_read = (options & ZX_VM_PERM_READ) != 0;
     let has_write = (options & ZX_VM_PERM_WRITE) != 0;
+    let has_execute = (options & ZX_VM_PERM_EXECUTE) != 0;
     if !has_read {
         return Err(ZX_ERR_INVALID_ARGS);
     }
@@ -425,6 +426,9 @@ fn mapping_request_from_options(
     let mut perms = MappingPerms::READ | MappingPerms::USER;
     if has_write {
         perms |= MappingPerms::WRITE;
+    }
+    if has_execute {
+        perms |= MappingPerms::EXECUTE;
     }
     Ok(VmarMappingRequest { perms, specific })
 }
@@ -449,16 +453,15 @@ fn vmar_mapping_caps_from_allocate_options(options: u32) -> Result<VmarMappingCa
     if (options & !allowed) != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
-    if (options & ZX_VM_CAN_MAP_EXECUTE) != 0 {
-        return Err(ZX_ERR_NOT_SUPPORTED);
-    }
-
     let mut max_perms = MappingPerms::USER;
     if (options & ZX_VM_CAN_MAP_READ) != 0 {
         max_perms |= MappingPerms::READ;
     }
     if (options & ZX_VM_CAN_MAP_WRITE) != 0 {
         max_perms |= MappingPerms::WRITE;
+    }
+    if (options & ZX_VM_CAN_MAP_EXECUTE) != 0 {
+        max_perms |= MappingPerms::EXECUTE;
     }
 
     Ok(VmarMappingCaps {
@@ -522,4 +525,54 @@ fn vmar_allocate_align_from_options(options: u32) -> Result<u64, zx_status_t> {
     }
     let align = 1_u64.checked_shl(encoded).ok_or(ZX_ERR_INVALID_ARGS)?;
     Ok(core::cmp::max(axle_mm::PAGE_SIZE, align))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapping_request_allows_execute_permissions() {
+        let request = mapping_request_from_options(ZX_VM_PERM_READ | ZX_VM_PERM_EXECUTE, 0)
+            .expect("read+execute mapping request should decode");
+
+        assert_eq!(
+            request.perms,
+            MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER
+        );
+        assert!(!request.specific);
+    }
+
+    #[test]
+    fn protect_decode_preserves_execute_permissions() {
+        let perms = mapping_perms_from_options(ZX_VM_PERM_READ | ZX_VM_PERM_EXECUTE, false)
+            .expect("protect decode should keep execute");
+
+        assert_eq!(
+            perms,
+            MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER
+        );
+    }
+
+    #[test]
+    fn child_vmar_caps_allow_execute() {
+        let caps = vmar_mapping_caps_from_allocate_options(
+            ZX_VM_CAN_MAP_READ | ZX_VM_CAN_MAP_EXECUTE | ZX_VM_CAN_MAP_SPECIFIC,
+        )
+        .expect("execute child caps should decode");
+
+        assert_eq!(
+            caps.max_perms,
+            MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER
+        );
+        assert!(caps.can_map_specific);
+    }
+
+    #[test]
+    fn execute_without_read_remains_invalid() {
+        assert_eq!(
+            mapping_request_from_options(ZX_VM_PERM_EXECUTE, 0),
+            Err(ZX_ERR_INVALID_ARGS)
+        );
+    }
 }

@@ -1,0 +1,20 @@
+id = "kernel.vm.execute_mapping_phase1"
+description = "Phase-one execute-mapping gate: child launch must still reach executable user code through the normal image path"
+tags = ["module:mm", "module:process", "module:vmar", "module:vmo", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok"]
+forbid = ["KERNEL PANIC"]
+contracts = ["must.vm.execute_mapping_phase1"]
+
+[assertions.status_code]
+process_map_child_code = 0
+process_thread_create = 0
+process_start = 0
+
+[assertions.packet_fields]
+process_child_ran = 1
