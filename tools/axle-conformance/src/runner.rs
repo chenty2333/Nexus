@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -12,8 +13,8 @@ use anyhow::{Context, Result, bail};
 use crate::contracts::{build_coverage_report, load_contract_catalog};
 use crate::elf::inspect_elf;
 use crate::gc::prune_runs;
-use crate::model::load_scenarios;
-use crate::report::{CaseReport, CaseStatus, Manifest, RunSummary};
+use crate::model::{ScenarioSpec, load_scenarios};
+use crate::report::{CaseReport, CaseStatus, GroupReport, Manifest, RunSummary};
 use crate::selection::select_scenarios;
 use crate::test_id::new_test_id;
 
@@ -52,6 +53,45 @@ impl RunConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PlannedCase {
+    index: usize,
+    scenario: ScenarioSpec,
+    case_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct CommandGroupPlan {
+    group_id: String,
+    command: Vec<String>,
+    timeout_ms: u64,
+    members: Vec<PlannedCase>,
+    group_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CommandGroupSpec {
+    group_id: String,
+    command: Vec<String>,
+    scenario_ids: Vec<String>,
+    timeout_ms: u64,
+}
+
+#[derive(Debug)]
+struct CommandRunResult {
+    duration_ms: u128,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    combined: String,
+    parsed_metrics: BTreeMap<String, i64>,
+}
+
+#[derive(Debug)]
+struct GroupExecutionOutput {
+    group_report: GroupReport,
+    case_reports: Vec<(usize, PathBuf, CaseReport)>,
+}
+
 /// Run selected conformance scenarios and write structured reports.
 pub fn run_conformance(config: &RunConfig) -> Result<RunSummary> {
     fs::create_dir_all(&config.out_dir)
@@ -80,13 +120,20 @@ pub fn run_conformance(config: &RunConfig) -> Result<RunSummary> {
     let test_id = new_test_id();
     let run_dir = config.out_dir.join(&test_id);
     let cases_dir = run_dir.join("cases");
+    let groups_dir = run_dir.join("groups");
     fs::create_dir_all(&cases_dir)
         .with_context(|| format!("create cases dir {}", cases_dir.display()))?;
+    fs::create_dir_all(&groups_dir)
+        .with_context(|| format!("create groups dir {}", groups_dir.display()))?;
+
+    let planned_cases = prepare_planned_cases(&selected, &cases_dir)?;
+    let planned_groups = build_command_groups(&planned_cases, &groups_dir)?;
 
     println!(
-        "axle-conformance test-id={} total={}",
+        "axle-conformance test-id={} total={} groups={}",
         test_id,
-        selected.len()
+        selected.len(),
+        planned_groups.len()
     );
 
     let manifest = Manifest {
@@ -100,23 +147,9 @@ pub fn run_conformance(config: &RunConfig) -> Result<RunSummary> {
     write_json(&run_dir.join("manifest.json"), &manifest)?;
 
     let run_start = Instant::now();
-    let mut planned = Vec::with_capacity(selected.len());
-    for scenario in &selected {
-        let case_dir_name = sanitize_case_dir_name(&scenario.id);
-        let case_dir = cases_dir.join(&case_dir_name);
-        fs::create_dir_all(&case_dir)
-            .with_context(|| format!("create case dir {}", case_dir.display()))?;
-        write_json(&case_dir.join("scenario.json"), scenario)?;
-        fs::write(
-            case_dir.join("command.txt"),
-            render_command(&scenario.command),
-        )
-        .with_context(|| format!("write command file for scenario '{}'", scenario.id))?;
-        planned.push((scenario.clone(), case_dir));
-    }
-
-    let case_reports = execute_cases(
-        &planned,
+    let (case_reports, group_reports) = execute_groups(
+        &planned_groups,
+        planned_cases.len(),
         &config.workspace_root,
         config.jobs,
         config.retries,
@@ -163,6 +196,7 @@ pub fn run_conformance(config: &RunConfig) -> Result<RunSummary> {
         flaky_pass,
         duration_ms,
         report_path: run_dir.join("summary.json").display().to_string(),
+        groups: group_reports,
         cases: case_reports,
     };
 
@@ -176,147 +210,319 @@ pub fn run_conformance(config: &RunConfig) -> Result<RunSummary> {
     Ok(summary)
 }
 
-fn execute_cases(
-    planned: &[(crate::model::ScenarioSpec, PathBuf)],
+fn prepare_planned_cases(selected: &[ScenarioSpec], cases_dir: &Path) -> Result<Vec<PlannedCase>> {
+    let mut planned = Vec::with_capacity(selected.len());
+    for (index, scenario) in selected.iter().cloned().enumerate() {
+        let case_dir_name = sanitize_case_dir_name(&scenario.id);
+        let case_dir = cases_dir.join(&case_dir_name);
+        fs::create_dir_all(&case_dir)
+            .with_context(|| format!("create case dir {}", case_dir.display()))?;
+        write_json(&case_dir.join("scenario.json"), &scenario)?;
+        fs::write(
+            case_dir.join("command.txt"),
+            render_command(&scenario.command),
+        )
+        .with_context(|| format!("write command file for scenario '{}'", scenario.id))?;
+        planned.push(PlannedCase {
+            index,
+            scenario,
+            case_dir,
+        });
+    }
+    Ok(planned)
+}
+
+fn build_command_groups(
+    planned_cases: &[PlannedCase],
+    groups_dir: &Path,
+) -> Result<Vec<CommandGroupPlan>> {
+    let mut grouped: BTreeMap<Vec<String>, Vec<PlannedCase>> = BTreeMap::new();
+    for planned_case in planned_cases.iter().cloned() {
+        grouped
+            .entry(planned_case.scenario.command.clone())
+            .or_default()
+            .push(planned_case);
+    }
+
+    let mut plans = Vec::with_capacity(grouped.len());
+    for (group_index, (command, members)) in grouped.into_iter().enumerate() {
+        let group_id = format!(
+            "group-{group_index:03}-{:016x}",
+            command_fingerprint(&command)
+        );
+        let group_dir = groups_dir.join(&group_id);
+        fs::create_dir_all(&group_dir)
+            .with_context(|| format!("create group dir {}", group_dir.display()))?;
+
+        let timeout_ms = members
+            .iter()
+            .map(|member| member.scenario.timeout_ms)
+            .max()
+            .unwrap_or(1);
+        let spec = CommandGroupSpec {
+            group_id: group_id.clone(),
+            command: command.clone(),
+            scenario_ids: members
+                .iter()
+                .map(|member| member.scenario.id.clone())
+                .collect(),
+            timeout_ms,
+        };
+        write_json(&group_dir.join("group.json"), &spec)?;
+        fs::write(group_dir.join("command.txt"), render_command(&command))
+            .with_context(|| format!("write command file for group '{}'", group_id))?;
+
+        plans.push(CommandGroupPlan {
+            group_id,
+            command,
+            timeout_ms,
+            members,
+            group_dir,
+        });
+    }
+
+    Ok(plans)
+}
+
+fn execute_groups(
+    planned_groups: &[CommandGroupPlan],
+    total_cases: usize,
     workspace_root: &Path,
     jobs: usize,
     retries: u32,
-) -> Result<Vec<CaseReport>> {
-    if planned.is_empty() {
-        return Ok(Vec::new());
+) -> Result<(Vec<CaseReport>, Vec<GroupReport>)> {
+    if planned_groups.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
     }
 
-    let jobs = jobs.max(1).min(planned.len());
+    let jobs = jobs.max(1).min(planned_groups.len());
+    let mut ordered = Vec::with_capacity(planned_groups.len());
+
     if jobs == 1 {
-        let mut out = Vec::with_capacity(planned.len());
-        for (scenario, case_dir) in planned {
-            let report = run_case_with_retries(scenario, case_dir, workspace_root, retries)?;
-            write_json(&case_dir.join("result.json"), &report)?;
-            out.push(report);
+        for planned_group in planned_groups {
+            ordered.push(run_group_with_retries(
+                planned_group,
+                workspace_root,
+                retries,
+            )?);
         }
-        return Ok(out);
-    }
+    } else {
+        let tasks: Vec<_> = planned_groups
+            .iter()
+            .enumerate()
+            .map(|(idx, planned_group)| (idx, planned_group.clone()))
+            .collect();
+        let task_rx = Arc::new(Mutex::new(tasks.into_iter()));
+        let (result_tx, result_rx) = mpsc::channel();
+        let workspace_root = Arc::new(workspace_root.to_path_buf());
 
-    let tasks: Vec<_> = planned
-        .iter()
-        .enumerate()
-        .map(|(idx, (scenario, case_dir))| (idx, scenario.clone(), case_dir.clone()))
-        .collect();
-    let task_rx = Arc::new(Mutex::new(tasks.into_iter()));
-    let (result_tx, result_rx) = mpsc::channel();
-    let workspace_root = Arc::new(workspace_root.to_path_buf());
+        let mut workers = Vec::with_capacity(jobs);
+        for _ in 0..jobs {
+            let task_rx = Arc::clone(&task_rx);
+            let result_tx = result_tx.clone();
+            let workspace_root = Arc::clone(&workspace_root);
 
-    let mut workers = Vec::with_capacity(jobs);
-    for _ in 0..jobs {
-        let task_rx = Arc::clone(&task_rx);
-        let result_tx = result_tx.clone();
-        let workspace_root = Arc::clone(&workspace_root);
+            workers.push(thread::spawn(move || {
+                loop {
+                    let next = {
+                        let mut guard = task_rx.lock().expect("task mutex poisoned");
+                        guard.next()
+                    };
+                    let Some((idx, planned_group)) = next else {
+                        break;
+                    };
 
-        workers.push(thread::spawn(move || {
-            loop {
-                let next = {
-                    let mut guard = task_rx.lock().expect("task mutex poisoned");
-                    guard.next()
-                };
-                let Some((idx, scenario, case_dir)) = next else {
-                    break;
-                };
+                    let result = run_group_with_retries(&planned_group, &workspace_root, retries);
+                    let _ = result_tx.send((idx, result));
+                }
+            }));
+        }
+        drop(result_tx);
 
-                let result = run_case_with_retries(&scenario, &case_dir, &workspace_root, retries);
-                let _ = result_tx.send((idx, case_dir, result));
+        let mut gathered: Vec<Option<GroupExecutionOutput>> =
+            (0..planned_groups.len()).map(|_| None).collect();
+        for _ in 0..planned_groups.len() {
+            let (idx, result) = result_rx
+                .recv()
+                .context("receive group result from worker thread")?;
+            gathered[idx] = Some(result?);
+        }
+
+        for worker in workers {
+            let _ = worker.join();
+        }
+
+        for entry in gathered {
+            match entry {
+                Some(output) => ordered.push(output),
+                None => bail!("missing group report from worker"),
             }
-        }));
-    }
-    drop(result_tx);
-
-    let mut ordered: Vec<Option<CaseReport>> = vec![None; planned.len()];
-    for _ in 0..planned.len() {
-        let (idx, case_dir, result) = result_rx
-            .recv()
-            .context("receive case result from worker thread")?;
-        let report = result?;
-        write_json(&case_dir.join("result.json"), &report)?;
-        ordered[idx] = Some(report);
-    }
-
-    for worker in workers {
-        let _ = worker.join();
-    }
-
-    let mut out = Vec::with_capacity(planned.len());
-    for entry in ordered {
-        match entry {
-            Some(report) => out.push(report),
-            None => bail!("missing case report from worker"),
         }
     }
-    Ok(out)
+
+    let mut case_reports: Vec<Option<CaseReport>> = (0..total_cases).map(|_| None).collect();
+    let mut group_reports = Vec::with_capacity(ordered.len());
+    for output in ordered {
+        persist_group_execution(&output)?;
+        group_reports.push(output.group_report.clone());
+        for (case_index, _, report) in output.case_reports {
+            case_reports[case_index] = Some(report);
+        }
+    }
+
+    let mut ordered_cases = Vec::with_capacity(total_cases);
+    for entry in case_reports {
+        match entry {
+            Some(report) => ordered_cases.push(report),
+            None => bail!("missing case report from grouped execution"),
+        }
+    }
+
+    Ok((ordered_cases, group_reports))
 }
 
-fn run_case_with_retries(
-    scenario: &crate::model::ScenarioSpec,
-    case_dir: &Path,
+fn persist_group_execution(output: &GroupExecutionOutput) -> Result<()> {
+    let group_dir = PathBuf::from(&output.group_report.group_dir);
+    write_json(&group_dir.join("result.json"), &output.group_report)?;
+    for (_, case_dir, report) in &output.case_reports {
+        write_json(&case_dir.join("result.json"), report)?;
+    }
+    Ok(())
+}
+
+fn run_group_with_retries(
+    planned_group: &CommandGroupPlan,
     workspace_root: &Path,
     retries: u32,
-) -> Result<CaseReport> {
+) -> Result<GroupExecutionOutput> {
     let max_attempts = retries.saturating_add(1);
-    let mut last = None;
+    let mut selected_reports: Vec<Option<CaseReport>> =
+        (0..planned_group.members.len()).map(|_| None).collect();
+    let mut attempts_executed = 0;
+    let mut total_duration_ms = 0;
+    let mut last_attempt_duration_ms = 0;
+    let mut last_exit_code = None;
+    let mut last_timed_out = false;
 
     for attempt in 1..=max_attempts {
         let attempt_dir = if max_attempts > 1 {
-            case_dir.join(format!("attempt-{attempt}"))
+            planned_group.group_dir.join(format!("attempt-{attempt}"))
         } else {
-            case_dir.to_path_buf()
+            planned_group.group_dir.clone()
         };
         fs::create_dir_all(&attempt_dir)
             .with_context(|| format!("create attempt dir {}", attempt_dir.display()))?;
 
-        let mut report = run_case(scenario, &attempt_dir, workspace_root)?;
-        report.attempts = attempt;
-        last = Some(report.clone());
+        let run = run_group_command(
+            &planned_group.command,
+            workspace_root,
+            planned_group.timeout_ms,
+            &attempt_dir,
+            &planned_group.group_id,
+        )?;
 
-        if report.status == CaseStatus::Pass {
-            return Ok(report);
+        attempts_executed = attempt;
+        total_duration_ms += run.duration_ms;
+        last_attempt_duration_ms = run.duration_ms;
+        last_exit_code = run.exit_code;
+        last_timed_out = run.timed_out;
+
+        for (member_index, member) in planned_group.members.iter().enumerate() {
+            let report =
+                evaluate_scenario_attempt(member, planned_group, &run, workspace_root, attempt);
+            match selected_reports[member_index].as_ref() {
+                Some(existing) if existing.status == CaseStatus::Pass => {}
+                _ => selected_reports[member_index] = Some(report),
+            }
+        }
+
+        if selected_reports.iter().all(|report| {
+            report
+                .as_ref()
+                .is_some_and(|report| report.status == CaseStatus::Pass)
+        }) {
+            break;
         }
     }
 
-    last.context("missing report after retries")
+    let status = if selected_reports.iter().all(|report| {
+        report
+            .as_ref()
+            .is_some_and(|report| report.status == CaseStatus::Pass)
+    }) {
+        CaseStatus::Pass
+    } else {
+        CaseStatus::Fail
+    };
+
+    let scenario_ids = planned_group
+        .members
+        .iter()
+        .map(|member| member.scenario.id.clone())
+        .collect();
+    let group_report = GroupReport {
+        group_id: planned_group.group_id.clone(),
+        status,
+        attempts: attempts_executed,
+        duration_ms: total_duration_ms,
+        last_attempt_duration_ms,
+        exit_code: last_exit_code,
+        timed_out: last_timed_out,
+        command: planned_group.command.clone(),
+        scenario_ids,
+        group_dir: planned_group.group_dir.display().to_string(),
+    };
+
+    let mut case_reports = Vec::with_capacity(planned_group.members.len());
+    for (member_index, member) in planned_group.members.iter().enumerate() {
+        let report = selected_reports[member_index].take().with_context(|| {
+            format!("missing case report for scenario '{}'", member.scenario.id)
+        })?;
+        case_reports.push((member.index, member.case_dir.clone(), report));
+    }
+
+    Ok(GroupExecutionOutput {
+        group_report,
+        case_reports,
+    })
 }
 
-fn run_case(
-    scenario: &crate::model::ScenarioSpec,
-    case_dir: &Path,
+fn run_group_command(
+    command: &[String],
     workspace_root: &Path,
-) -> Result<CaseReport> {
-    let stdout_path = case_dir.join("stdout.log");
-    let stderr_path = case_dir.join("stderr.log");
+    timeout_ms: u64,
+    output_dir: &Path,
+    group_id: &str,
+) -> Result<CommandRunResult> {
+    let stdout_path = output_dir.join("stdout.log");
+    let stderr_path = output_dir.join("stderr.log");
 
     let stdout_file = File::create(&stdout_path)
         .with_context(|| format!("create stdout log {}", stdout_path.display()))?;
     let stderr_file = File::create(&stderr_path)
         .with_context(|| format!("create stderr log {}", stderr_path.display()))?;
 
-    let mut command = Command::new(&scenario.command[0]);
-    command
-        .args(&scenario.command[1..])
+    let mut process = Command::new(&command[0]);
+    process
+        .args(&command[1..])
         .current_dir(workspace_root)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
 
     let start = Instant::now();
 
-    let mut child = command
+    let mut child = process
         .spawn()
-        .with_context(|| format!("spawn scenario '{}'", scenario.id))?;
+        .with_context(|| format!("spawn command group '{}'", group_id))?;
 
-    let timeout = Duration::from_millis(scenario.timeout_ms);
+    let timeout = Duration::from_millis(timeout_ms);
     let mut exit_code = None;
     let mut timed_out = false;
 
     loop {
         if let Some(status) = child
             .try_wait()
-            .with_context(|| format!("wait scenario '{}'", scenario.id))?
+            .with_context(|| format!("wait command group '{}'", group_id))?
         {
             exit_code = status.code();
             break;
@@ -329,35 +535,52 @@ fn run_case(
             break;
         }
 
-        std::thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(10));
     }
 
     let stdout_text = fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr_text = fs::read_to_string(&stderr_path).unwrap_or_default();
     let combined = format!("{stdout_text}\n{stderr_text}");
+    let parsed_metrics = parse_kv_metrics(&combined);
+
+    Ok(CommandRunResult {
+        duration_ms: start.elapsed().as_millis(),
+        exit_code,
+        timed_out,
+        combined,
+        parsed_metrics,
+    })
+}
+
+fn evaluate_scenario_attempt(
+    planned_case: &PlannedCase,
+    planned_group: &CommandGroupPlan,
+    run: &CommandRunResult,
+    workspace_root: &Path,
+    attempt: u32,
+) -> CaseReport {
+    let scenario = &planned_case.scenario;
+    let scenario_timed_out = run.timed_out || run.duration_ms > u128::from(scenario.timeout_ms);
 
     let missing_expect: Vec<String> = scenario
         .expect
         .iter()
-        .filter(|needle| !combined.contains(needle.as_str()))
+        .filter(|needle| !run.combined.contains(needle.as_str()))
         .cloned()
         .collect();
-
     let matched_forbid: Vec<String> = scenario
         .forbid
         .iter()
-        .filter(|needle| combined.contains(needle.as_str()))
+        .filter(|needle| run.combined.contains(needle.as_str()))
         .cloned()
         .collect();
-    let parsed_metrics = parse_kv_metrics(&combined);
-    let assertion_mismatches = evaluate_assertions(scenario, &parsed_metrics);
+    let assertion_mismatches = evaluate_assertions(scenario, &run.parsed_metrics);
 
     let mut reason = None;
-
-    if timed_out {
+    if scenario_timed_out {
         reason = Some("timeout".to_string());
-    } else if exit_code.unwrap_or(1) != 0 {
-        reason = Some(format!("non_zero_exit({})", exit_code.unwrap_or(-1)));
+    } else if run.exit_code.unwrap_or(1) != 0 {
+        reason = Some(format!("non_zero_exit({})", run.exit_code.unwrap_or(-1)));
     } else if !missing_expect.is_empty() {
         reason = Some(format!("missing_expect({})", missing_expect.join(",")));
     } else if !matched_forbid.is_empty() {
@@ -396,21 +619,23 @@ fn run_case(
         CaseStatus::Pass
     };
 
-    Ok(CaseReport {
+    CaseReport {
         scenario_id: scenario.id.clone(),
+        group_id: planned_group.group_id.clone(),
         status,
-        attempts: 1,
-        duration_ms: start.elapsed().as_millis(),
-        exit_code,
-        timed_out,
+        attempts: attempt,
+        duration_ms: run.duration_ms,
+        exit_code: run.exit_code,
+        timed_out: scenario_timed_out,
         reason,
         missing_expect,
         matched_forbid,
-        parsed_metrics,
+        parsed_metrics: run.parsed_metrics.clone(),
         assertion_mismatches,
         elf_check,
-        case_dir: case_dir.display().to_string(),
-    })
+        group_dir: planned_group.group_dir.display().to_string(),
+        case_dir: planned_case.case_dir.display().to_string(),
+    }
 }
 
 fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -435,6 +660,12 @@ fn sanitize_case_dir_name(id: &str) -> String {
             }
         })
         .collect()
+}
+
+fn command_fingerprint(command: &[String]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    command.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn render_command(command: &[String]) -> String {
@@ -493,7 +724,7 @@ fn parse_i64(raw: &str) -> Option<i64> {
 }
 
 fn evaluate_assertions(
-    scenario: &crate::model::ScenarioSpec,
+    scenario: &ScenarioSpec,
     parsed_metrics: &BTreeMap<String, i64>,
 ) -> Vec<String> {
     let Some(assertions) = &scenario.assertions else {
@@ -570,63 +801,86 @@ pub fn replay_from_snapshot(
 
     let raw = fs::read_to_string(&scenario_path)
         .with_context(|| format!("read snapshot scenario {}", scenario_path.display()))?;
-    let scenario: crate::model::ScenarioSpec =
+    let scenario: ScenarioSpec =
         serde_json::from_str(&raw).with_context(|| format!("parse {}", scenario_path.display()))?;
     scenario.validate()?;
 
     let replay_id = new_test_id();
     let run_dir = config.out_dir.join(&replay_id);
     let cases_dir = run_dir.join("cases");
+    let groups_dir = run_dir.join("groups");
     fs::create_dir_all(&cases_dir)
-        .with_context(|| format!("create replay case dir {}", cases_dir.display()))?;
+        .with_context(|| format!("create replay cases dir {}", cases_dir.display()))?;
+    fs::create_dir_all(&groups_dir)
+        .with_context(|| format!("create replay groups dir {}", groups_dir.display()))?;
 
     println!(
         "axle-conformance test-id={} replay-from={} scenario={}",
         replay_id, run_id, scenario_id
     );
 
-    let case_dir = cases_dir.join(sanitize_case_dir_name(&scenario.id));
-    fs::create_dir_all(&case_dir)
-        .with_context(|| format!("create replay scenario dir {}", case_dir.display()))?;
-    write_json(&case_dir.join("scenario.json"), &scenario)?;
-    fs::write(
-        case_dir.join("command.txt"),
-        render_command(&scenario.command),
-    )
-    .with_context(|| format!("write replay command for scenario '{}'", scenario.id))?;
+    let selected = vec![scenario];
+    let planned_cases = prepare_planned_cases(&selected, &cases_dir)?;
+    let planned_groups = build_command_groups(&planned_cases, &groups_dir)?;
 
     let started_unix_ms = now_unix_ms();
-    let report =
-        run_case_with_retries(&scenario, &case_dir, &config.workspace_root, config.retries)?;
-    write_json(&case_dir.join("result.json"), &report)?;
+    let run_start = Instant::now();
+    let (case_reports, group_reports) = execute_groups(
+        &planned_groups,
+        planned_cases.len(),
+        &config.workspace_root,
+        1,
+        config.retries,
+    )?;
 
-    if report.status == CaseStatus::Fail {
-        let reason = report
-            .reason
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        println!("[FAIL] {} reason={}", report.scenario_id, reason);
-    } else if config.verbose {
-        println!("[PASS] {} {}ms", report.scenario_id, report.duration_ms);
+    for report in &case_reports {
+        if report.status == CaseStatus::Fail {
+            let reason = report
+                .reason
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            println!("[FAIL] {} reason={}", report.scenario_id, reason);
+        } else if config.verbose {
+            let suffix = if report.attempts > 1 {
+                format!(" attempts={}", report.attempts)
+            } else {
+                String::new()
+            };
+            println!(
+                "[PASS] {} {}ms{}",
+                report.scenario_id, report.duration_ms, suffix
+            );
+        }
     }
 
-    let pass = usize::from(report.status == CaseStatus::Pass);
-    let fail = usize::from(report.status == CaseStatus::Fail);
+    let pass = case_reports
+        .iter()
+        .filter(|report| report.status == CaseStatus::Pass)
+        .count();
+    let fail = case_reports.len().saturating_sub(pass);
+    let flaky_pass = case_reports
+        .iter()
+        .filter(|report| report.status == CaseStatus::Pass && report.attempts > 1)
+        .count();
 
     let summary = RunSummary {
-        test_id: replay_id,
-        total: 1,
+        test_id: replay_id.clone(),
+        total: case_reports.len(),
         pass,
         fail,
-        flaky_pass: usize::from(report.status == CaseStatus::Pass && report.attempts > 1),
-        duration_ms: report.duration_ms,
+        flaky_pass,
+        duration_ms: run_start.elapsed().as_millis(),
         report_path: run_dir.join("summary.json").display().to_string(),
-        cases: vec![report],
+        groups: group_reports,
+        cases: case_reports,
     };
 
     let manifest = Manifest {
-        test_id: summary.test_id.clone(),
-        selected_scenarios: vec![scenario.id],
+        test_id: replay_id,
+        selected_scenarios: selected
+            .iter()
+            .map(|scenario| scenario.id.clone())
+            .collect(),
         scenario_filters: vec![scenario_id.to_string()],
         tag_filters: vec![],
         started_unix_ms,
@@ -648,6 +902,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_groups_collapse_identical_commands() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cases_dir = tmp.path().join("cases");
+        let groups_dir = tmp.path().join("groups");
+        fs::create_dir_all(&cases_dir).expect("mkdir cases");
+        fs::create_dir_all(&groups_dir).expect("mkdir groups");
+
+        let selected = vec![
+            ScenarioSpec {
+                id: "sample.one".into(),
+                description: String::new(),
+                tags: vec![],
+                timeout_ms: 100,
+                command: vec!["true".into()],
+                expect: vec![],
+                forbid: vec![],
+                contracts: vec![],
+                assertions: None,
+                elf_check: None,
+            },
+            ScenarioSpec {
+                id: "sample.two".into(),
+                description: String::new(),
+                tags: vec![],
+                timeout_ms: 100,
+                command: vec!["true".into()],
+                expect: vec![],
+                forbid: vec![],
+                contracts: vec![],
+                assertions: None,
+                elf_check: None,
+            },
+        ];
+
+        let planned_cases = prepare_planned_cases(&selected, &cases_dir).expect("planned cases");
+        let groups = build_command_groups(&planned_cases, &groups_dir).expect("group plans");
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members.len(), 2);
+    }
+
+    #[test]
     fn parse_kv_metrics_handles_decimal_and_hex() {
         let m = parse_kv_metrics("a=1 b=-2 c=0x10 d=-0x20 x=nope");
         assert_eq!(m.get("a"), Some(&1));
@@ -659,7 +955,7 @@ mod tests {
 
     #[test]
     fn evaluate_assertions_reports_missing_and_mismatch() {
-        let scenario = crate::model::ScenarioSpec {
+        let scenario = ScenarioSpec {
             id: "s".into(),
             description: String::new(),
             tags: vec![],

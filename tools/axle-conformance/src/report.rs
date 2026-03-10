@@ -15,6 +15,7 @@ pub enum CaseStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseReport {
     pub scenario_id: String,
+    pub group_id: String,
     pub status: CaseStatus,
     pub attempts: u32,
     pub duration_ms: u128,
@@ -26,7 +27,23 @@ pub struct CaseReport {
     pub parsed_metrics: BTreeMap<String, i64>,
     pub assertion_mismatches: Vec<String>,
     pub elf_check: Option<ElfCheckReport>,
+    pub group_dir: String,
     pub case_dir: String,
+}
+
+/// Detailed per-command-group outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupReport {
+    pub group_id: String,
+    pub status: CaseStatus,
+    pub attempts: u32,
+    pub duration_ms: u128,
+    pub last_attempt_duration_ms: u128,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub command: Vec<String>,
+    pub scenario_ids: Vec<String>,
+    pub group_dir: String,
 }
 
 /// Run manifest for reproducibility.
@@ -49,5 +66,6 @@ pub struct RunSummary {
     pub flaky_pass: usize,
     pub duration_ms: u128,
     pub report_path: String,
+    pub groups: Vec<GroupReport>,
     pub cases: Vec<CaseReport>,
 }

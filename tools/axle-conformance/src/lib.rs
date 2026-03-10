@@ -15,5 +15,5 @@ pub mod selection;
 pub mod test_id;
 
 pub use model::ScenarioSpec;
-pub use report::{CaseReport, CaseStatus, Manifest, RunSummary};
+pub use report::{CaseReport, CaseStatus, GroupReport, Manifest, RunSummary};
 pub use runner::{RunConfig, run_conformance};
