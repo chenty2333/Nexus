@@ -22,7 +22,7 @@ use x86_64::instructions::segmentation::Segment;
 // --- Userspace virtual layout (in current single-address-space model) ---
 
 pub(crate) const USER_PAGE_BYTES: u64 = 0x1000;
-pub(crate) const USER_CODE_PAGE_COUNT: usize = 8;
+pub(crate) const USER_CODE_PAGE_COUNT: usize = 128;
 const USER_SHARED_PAGE_COUNT: usize = 2;
 pub(crate) const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * USER_CODE_PAGE_COUNT as u64;
 const USER_SHARED_BYTES: u64 = USER_PAGE_BYTES * USER_SHARED_PAGE_COUNT as u64;
@@ -41,7 +41,9 @@ pub(crate) const USER_VM_TEST_VA: u64 = USER_CODE_VA + 0x10_000;
 // into guest RAM, plus a second loader device to write the byte length.
 const USER_RUNNER_ELF_PADDR: u64 = 0x0100_0000;
 const USER_RUNNER_ELF_SIZE_PADDR: u64 = USER_RUNNER_ELF_PADDR - 8;
-const USER_RUNNER_ELF_MAX_BYTES: usize = 128 * 1024;
+// Raw QEMU loader input is the full ELF file, including debug sections in
+// dev builds. Keep this bound separate from the mapped code window size.
+const USER_RUNNER_ELF_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 // --- Shared summary slots (u64) written by userspace ---
 
@@ -439,30 +441,41 @@ const SLOT_CHANNEL_WAIT_ASYNC_CLOSED_KEY: usize = 540;
 const SLOT_CHANNEL_WAIT_ASYNC_CLOSED_TYPE: usize = 541;
 const SLOT_CHANNEL_WAIT_ASYNC_CLOSED_OBSERVED: usize = 542;
 const SLOT_RUNTIME_FAILURE_STEP: usize = 543;
-const SLOT_RUNTIME_PORT_CREATE: usize = 544;
-const SLOT_RUNTIME_CHANNEL_CREATE: usize = 545;
-const SLOT_RUNTIME_TIMER_CREATE: usize = 546;
-const SLOT_RUNTIME_ARM_CHANNEL: usize = 547;
-const SLOT_RUNTIME_CHANNEL_WRITE: usize = 548;
-const SLOT_RUNTIME_WAIT_CHANNEL: usize = 549;
-const SLOT_RUNTIME_CHANNEL_EVENT_KEY: usize = 550;
-const SLOT_RUNTIME_CHANNEL_EVENT_TYPE: usize = 551;
-const SLOT_RUNTIME_CHANNEL_EVENT_OBSERVED: usize = 552;
-const SLOT_RUNTIME_CHANNEL_READ: usize = 553;
-const SLOT_RUNTIME_CHANNEL_ACTUAL_BYTES: usize = 554;
-const SLOT_RUNTIME_CHANNEL_MATCH: usize = 555;
-const SLOT_RUNTIME_ARM_TIMER: usize = 556;
-const SLOT_RUNTIME_TIMER_SET: usize = 557;
-const SLOT_RUNTIME_WAIT_TIMER: usize = 558;
-const SLOT_RUNTIME_TIMER_EVENT_KEY: usize = 559;
-const SLOT_RUNTIME_TIMER_EVENT_TYPE: usize = 560;
-const SLOT_RUNTIME_TIMER_EVENT_OBSERVED: usize = 561;
-const SLOT_RUNTIME_TIMER_CANCEL: usize = 562;
-const SLOT_RUNTIME_CLOSE_TX: usize = 563;
-const SLOT_RUNTIME_CLOSE_RX: usize = 564;
-const SLOT_RUNTIME_CLOSE_TIMER: usize = 565;
-const SLOT_RUNTIME_CLOSE_PORT: usize = 566;
-const SLOT_MAX: usize = SLOT_RUNTIME_CLOSE_PORT;
+const SLOT_RUNTIME_DISPATCHER_CREATE: usize = 544;
+const SLOT_RUNTIME_REG_CREATE_FIRST: usize = 545;
+const SLOT_RUNTIME_REG_CANCEL_FIRST: usize = 546;
+const SLOT_RUNTIME_REG_CREATE_SECOND: usize = 547;
+const SLOT_RUNTIME_REG_SLOT_REUSED: usize = 548;
+const SLOT_RUNTIME_REG_GEN_ADVANCED: usize = 549;
+const SLOT_RUNTIME_CHANNEL_CREATE: usize = 550;
+const SLOT_RUNTIME_CHANNEL_SEED_WRITE: usize = 551;
+const SLOT_RUNTIME_CHANNEL_RECV: usize = 552;
+const SLOT_RUNTIME_CHANNEL_RECV_ACTUAL_BYTES: usize = 553;
+const SLOT_RUNTIME_CHANNEL_RECV_MATCH: usize = 554;
+const SLOT_RUNTIME_SLEEP_CREATE: usize = 555;
+const SLOT_RUNTIME_SLEEP_WAIT: usize = 556;
+const SLOT_RUNTIME_CHANNEL_CALL_CREATE: usize = 557;
+const SLOT_RUNTIME_CHANNEL_CALL_SERVER_SPAWN: usize = 558;
+const SLOT_RUNTIME_CHANNEL_CALL_SERVER_RECV: usize = 559;
+const SLOT_RUNTIME_CHANNEL_CALL_SERVER_MATCH: usize = 560;
+const SLOT_RUNTIME_CHANNEL_CALL_SERVER_REPLY: usize = 561;
+const SLOT_RUNTIME_CHANNEL_CALL: usize = 562;
+const SLOT_RUNTIME_CHANNEL_CALL_ACTUAL_BYTES: usize = 563;
+const SLOT_RUNTIME_CHANNEL_CALL_MATCH: usize = 564;
+const SLOT_RUNTIME_SOCKET_CREATE: usize = 565;
+const SLOT_RUNTIME_SOCKET_SEED_WRITE: usize = 566;
+const SLOT_RUNTIME_SOCKET_WAIT_READABLE: usize = 567;
+const SLOT_RUNTIME_SOCKET_WAIT_OBSERVED: usize = 568;
+const SLOT_RUNTIME_SOCKET_READ: usize = 569;
+const SLOT_RUNTIME_SOCKET_READ_ACTUAL_BYTES: usize = 570;
+const SLOT_RUNTIME_SOCKET_READ_MATCH: usize = 571;
+const SLOT_RUNTIME_CLOSE_SEED_TX: usize = 572;
+const SLOT_RUNTIME_CLOSE_SEED_RX: usize = 573;
+const SLOT_RUNTIME_CLOSE_CALL_CLIENT: usize = 574;
+const SLOT_RUNTIME_CLOSE_CALL_SERVER: usize = 575;
+const SLOT_RUNTIME_CLOSE_SOCKET_TX: usize = 576;
+const SLOT_RUNTIME_CLOSE_SOCKET_RX: usize = 577;
+const SLOT_MAX: usize = SLOT_RUNTIME_CLOSE_SOCKET_RX;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1591,31 +1604,42 @@ pub fn on_breakpoint() -> ! {
     );
 
     crate::kprintln!(
-        "kernel: userspace runtime reactor (failure_step={}, port_create={}, channel_create={}, timer_create={}, arm_channel={}, channel_write={}, wait_channel={}, channel_event_key={}, channel_event_type={}, channel_event_observed={}, channel_read={}, channel_actual_bytes={}, channel_match={}, arm_timer={}, timer_set={}, wait_timer={}, timer_event_key={}, timer_event_type={}, timer_event_observed={}, timer_cancel={}, close_tx={}, close_rx={}, close_timer={}, close_port={})",
+        "kernel: userspace runtime dispatcher (failure_step={}, dispatcher_create={}, reg_create_first={}, reg_cancel_first={}, reg_create_second={}, reg_slot_reused={}, reg_generation_advanced={}, channel_create={}, channel_seed_write={}, channel_recv={}, channel_recv_actual_bytes={}, channel_recv_match={}, sleep_create={}, sleep_wait={}, channel_call_create={}, channel_call_server_spawn={}, channel_call_server_recv={}, channel_call_server_match={}, channel_call_server_reply={}, channel_call={}, channel_call_actual_bytes={}, channel_call_match={}, socket_create={}, socket_seed_write={}, socket_wait_readable={}, socket_wait_observed={}, socket_read={}, socket_read_actual_bytes={}, socket_read_match={}, close_seed_tx={}, close_seed_rx={}, close_call_client={}, close_call_server={}, close_socket_tx={}, close_socket_rx={})",
         slots[SLOT_RUNTIME_FAILURE_STEP],
-        slots[SLOT_RUNTIME_PORT_CREATE] as i64,
+        slots[SLOT_RUNTIME_DISPATCHER_CREATE] as i64,
+        slots[SLOT_RUNTIME_REG_CREATE_FIRST] as i64,
+        slots[SLOT_RUNTIME_REG_CANCEL_FIRST] as i64,
+        slots[SLOT_RUNTIME_REG_CREATE_SECOND] as i64,
+        slots[SLOT_RUNTIME_REG_SLOT_REUSED],
+        slots[SLOT_RUNTIME_REG_GEN_ADVANCED],
         slots[SLOT_RUNTIME_CHANNEL_CREATE] as i64,
-        slots[SLOT_RUNTIME_TIMER_CREATE] as i64,
-        slots[SLOT_RUNTIME_ARM_CHANNEL] as i64,
-        slots[SLOT_RUNTIME_CHANNEL_WRITE] as i64,
-        slots[SLOT_RUNTIME_WAIT_CHANNEL] as i64,
-        slots[SLOT_RUNTIME_CHANNEL_EVENT_KEY],
-        slots[SLOT_RUNTIME_CHANNEL_EVENT_TYPE],
-        slots[SLOT_RUNTIME_CHANNEL_EVENT_OBSERVED],
-        slots[SLOT_RUNTIME_CHANNEL_READ] as i64,
-        slots[SLOT_RUNTIME_CHANNEL_ACTUAL_BYTES],
-        slots[SLOT_RUNTIME_CHANNEL_MATCH],
-        slots[SLOT_RUNTIME_ARM_TIMER] as i64,
-        slots[SLOT_RUNTIME_TIMER_SET] as i64,
-        slots[SLOT_RUNTIME_WAIT_TIMER] as i64,
-        slots[SLOT_RUNTIME_TIMER_EVENT_KEY],
-        slots[SLOT_RUNTIME_TIMER_EVENT_TYPE],
-        slots[SLOT_RUNTIME_TIMER_EVENT_OBSERVED],
-        slots[SLOT_RUNTIME_TIMER_CANCEL] as i64,
-        slots[SLOT_RUNTIME_CLOSE_TX] as i64,
-        slots[SLOT_RUNTIME_CLOSE_RX] as i64,
-        slots[SLOT_RUNTIME_CLOSE_TIMER] as i64,
-        slots[SLOT_RUNTIME_CLOSE_PORT] as i64
+        slots[SLOT_RUNTIME_CHANNEL_SEED_WRITE] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_RECV] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_RECV_ACTUAL_BYTES],
+        slots[SLOT_RUNTIME_CHANNEL_RECV_MATCH],
+        slots[SLOT_RUNTIME_SLEEP_CREATE] as i64,
+        slots[SLOT_RUNTIME_SLEEP_WAIT] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_CALL_CREATE] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_CALL_SERVER_SPAWN] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_CALL_SERVER_RECV] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_CALL_SERVER_MATCH],
+        slots[SLOT_RUNTIME_CHANNEL_CALL_SERVER_REPLY] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_CALL] as i64,
+        slots[SLOT_RUNTIME_CHANNEL_CALL_ACTUAL_BYTES],
+        slots[SLOT_RUNTIME_CHANNEL_CALL_MATCH],
+        slots[SLOT_RUNTIME_SOCKET_CREATE] as i64,
+        slots[SLOT_RUNTIME_SOCKET_SEED_WRITE] as i64,
+        slots[SLOT_RUNTIME_SOCKET_WAIT_READABLE] as i64,
+        slots[SLOT_RUNTIME_SOCKET_WAIT_OBSERVED],
+        slots[SLOT_RUNTIME_SOCKET_READ] as i64,
+        slots[SLOT_RUNTIME_SOCKET_READ_ACTUAL_BYTES],
+        slots[SLOT_RUNTIME_SOCKET_READ_MATCH],
+        slots[SLOT_RUNTIME_CLOSE_SEED_TX] as i64,
+        slots[SLOT_RUNTIME_CLOSE_SEED_RX] as i64,
+        slots[SLOT_RUNTIME_CLOSE_CALL_CLIENT] as i64,
+        slots[SLOT_RUNTIME_CLOSE_CALL_SERVER] as i64,
+        slots[SLOT_RUNTIME_CLOSE_SOCKET_TX] as i64,
+        slots[SLOT_RUNTIME_CLOSE_SOCKET_RX] as i64
     );
 
     crate::arch::qemu::exit_success();

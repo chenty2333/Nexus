@@ -449,6 +449,11 @@ pub(crate) struct VmFacade {
 
 impl VmFacade {
     pub(crate) fn bootstrap() -> (Arc<Self>, AddressSpaceId) {
+        let bootstrap_layout = crate::userspace::bootstrap_process_image_layout()
+            .unwrap_or_else(ProcessImageLayout::bootstrap_conformance);
+        let bootstrap_loaded_layout = bootstrap_layout
+            .rebased_for_loaded_image()
+            .unwrap_or_else(|_| ProcessImageLayout::bootstrap_conformance());
         let mut vm = VmDomain {
             address_spaces: BTreeMap::new(),
             global_vmos: Arc::new(Mutex::new(GlobalVmoStore::default())),
@@ -473,7 +478,12 @@ impl VmFacade {
         let address_space_id = vm.alloc_address_space_id();
         let bootstrap_address_space = {
             let mut frames = vm.frames.lock();
-            AddressSpace::bootstrap(address_space_id, &mut frames, bootstrap_vmo_ids)
+            AddressSpace::bootstrap(
+                address_space_id,
+                &mut frames,
+                bootstrap_vmo_ids,
+                &bootstrap_loaded_layout,
+            )
         };
         vm.address_spaces
             .insert(address_space_id, bootstrap_address_space);
@@ -2441,6 +2451,7 @@ impl AddressSpace {
         address_space_id: AddressSpaceId,
         frames: &mut FrameTable,
         vmo_ids: [KernelVmoId; 3],
+        layout: &ProcessImageLayout,
     ) -> Self {
         let mut vm = VmAddressSpace::new_with_id(
             VmAddressSpaceId::new(address_space_id),
@@ -2469,16 +2480,37 @@ impl AddressSpace {
             )
             .expect("bootstrap code frame binding must succeed");
         }
-        vm.map_fixed(
-            frames,
-            crate::userspace::USER_CODE_VA,
-            crate::userspace::USER_CODE_BYTES,
-            code_vmo,
-            0,
-            process_image_default_code_perms() | MappingPerms::USER,
-            process_image_default_code_perms() | MappingPerms::USER,
-        )
-        .expect("bootstrap code mapping must succeed");
+        if layout.segments().is_empty() {
+            vm.map_fixed(
+                frames,
+                crate::userspace::USER_CODE_VA,
+                crate::userspace::USER_CODE_BYTES,
+                code_vmo,
+                0,
+                process_image_default_code_perms() | MappingPerms::USER,
+                process_image_default_code_perms() | MappingPerms::USER,
+            )
+            .expect("bootstrap code mapping must succeed");
+        } else {
+            for segment in layout.segments() {
+                let len = align_up_user_page(segment.mem_size_bytes())
+                    .expect("bootstrap segment length must page-align");
+                if len == 0 {
+                    continue;
+                }
+                let perms = segment.perms() | MappingPerms::USER;
+                vm.map_fixed(
+                    frames,
+                    segment.vaddr(),
+                    len,
+                    code_vmo,
+                    segment.vmo_offset(),
+                    perms,
+                    perms,
+                )
+                .expect("bootstrap code segment mapping must succeed");
+            }
+        }
 
         let shared_vmo = vm
             .create_vmo(

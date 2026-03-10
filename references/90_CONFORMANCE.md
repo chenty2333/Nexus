@@ -62,8 +62,12 @@ Main just targets include:
   - `CHANNEL_WRITABLE` recovery through `wait_async` + `port_wait`
   - `CHANNEL_PEER_CLOSED` delivery through the same path without stale writable republish
 - Bootstrap userspace runtime coverage now also includes one Phase-3 gate:
-  - Rust ring3 code using `libzircon` can drive channel, timer, port, and handle-close syscalls without handwritten per-syscall assembly
-  - `nexus-rt` can dispatch one channel-readable event and one timer-signaled event through a single port-backed reactor
+  - Rust ring3 code using `libzircon` can drive channel, socket, timer, port, and handle-close syscalls without handwritten per-syscall assembly
+  - `nexus-rt` now exercises a single-thread dispatcher/executor shape:
+    - generation-safe signal registration ids
+    - one dispatcher timer instead of one kernel timer per sleep future
+    - task wakeups routed through user packets on the dispatcher port
+    - async channel receive/call and socket readiness paths
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return
@@ -101,9 +105,16 @@ This makes contract coverage part of the repo workflow, not just informal docume
     `groups/` subtree
 - Most kernel scenarios build the kernel plus the current userspace runner, boot QEMU, and treat the printed summary line as the stable observable contract.
 - The runtime/reactor bootstrap scenario is the first case where the userspace runner entrypoint itself is defined in Rust instead of a standalone hand-written `.S` payload.
+- That scenario now asserts structured dispatcher metrics instead of relying only on process exit:
+  - registration slot reuse with generation advance after cancel
+  - channel receive and channel call/reply correctness
+  - sleep completion through one dispatcher timer
+  - socket readiness and follow-on read correctness
 - Because that Rust runner is still linked at the long-standing bootstrap userspace VA above 4 GiB,
   the scenario builds `nexus-test-runner` with `RUSTFLAGS='-C code-model=large'` instead of
   changing the whole `x86_64-unknown-none` target configuration.
+- The bootstrap code window above 4 GiB is wider than the early 32 KiB bring-up shape so the
+  runtime dispatcher runner and its shared summary pages no longer overlap in the fixed mapping.
 - Some bootstrap channel metrics currently come from a second structured summary line rather than
   the main `int80 conformance ok (...)` line.
   - the fragmented channel payload scenario uses this to report both remap-path and fallback-copy

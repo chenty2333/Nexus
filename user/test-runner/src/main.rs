@@ -25,11 +25,21 @@
     deny(clippy::undocumented_unsafe_blocks)
 )]
 
+#[cfg(axle_test_runner_rust_entry = "reactor_smoke")]
+extern crate alloc;
+
 use core::panic::PanicInfo;
 
 #[cfg(axle_test_runner_rust_entry = "reactor_smoke")]
 mod reactor_smoke;
 
+#[cfg(axle_test_runner_rust_entry = "reactor_smoke")]
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    reactor_smoke::report_panic()
+}
+
+#[cfg(not(axle_test_runner_rust_entry = "reactor_smoke"))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {

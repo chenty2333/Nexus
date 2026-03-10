@@ -29,8 +29,8 @@ use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::syscall_numbers::{
     AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
-    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE,
-    AXLE_SYS_TIMER_SET,
+    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ,
+    AXLE_SYS_SOCKET_WRITE, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET,
 };
 
 /// Infinite deadline used by blocking wait syscalls.
@@ -244,6 +244,67 @@ pub fn zx_channel_read(
             num_handles as u64,
             actual_bytes as u64,
             actual_handles as u64,
+        ],
+    )
+}
+
+/// Create a socket pair.
+pub fn zx_socket_create(
+    options: u32,
+    out0: &mut zx_handle_t,
+    out1: &mut zx_handle_t,
+) -> zx_status_t {
+    int80_call(
+        AXLE_SYS_SOCKET_CREATE as u64,
+        [
+            options as u64,
+            out0 as *mut zx_handle_t as u64,
+            out1 as *mut zx_handle_t as u64,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Write bytes into a socket.
+pub fn zx_socket_write(
+    handle: zx_handle_t,
+    options: u32,
+    bytes: *const u8,
+    len: usize,
+    actual: *mut usize,
+) -> zx_status_t {
+    int80_call(
+        AXLE_SYS_SOCKET_WRITE as u64,
+        [
+            handle as u64,
+            options as u64,
+            bytes as u64,
+            len as u64,
+            actual as u64,
+            0,
+        ],
+    )
+}
+
+/// Read bytes from a socket.
+pub fn zx_socket_read(
+    handle: zx_handle_t,
+    options: u32,
+    bytes: *mut u8,
+    len: usize,
+    actual: *mut usize,
+) -> zx_status_t {
+    int80_call(
+        AXLE_SYS_SOCKET_READ as u64,
+        [
+            handle as u64,
+            options as u64,
+            bytes as u64,
+            len as u64,
+            actual as u64,
+            0,
         ],
     )
 }

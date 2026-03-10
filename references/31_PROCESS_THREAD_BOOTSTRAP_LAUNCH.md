@@ -43,6 +43,8 @@ Current bootstrap userspace code may come from:
 The bootstrap address space is prewired enough to exercise real VM behavior early:
 
 - code and shared windows are mapped into the fixed bootstrap userspace range
+- the fixed bootstrap code window is now wide enough for the Rust dispatcher/executor runner,
+  so the shared summary pages sit above the loaded image instead of overlapping it
 - the bootstrap stack is marked COW so the first write exercises the fault/COW path
 
 ## Process creation model

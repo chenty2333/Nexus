@@ -1,6 +1,6 @@
 id = "kernel.runtime.reactor_bootstrap"
-description = "Bootstrap ring3 Rust userspace should drive a thin libzircon wrapper and a port-backed reactor over channel and timer signal delivery"
-tags = ["kernel", "runtime", "reactor", "bootstrap"]
+description = "Bootstrap ring3 Rust userspace should drive a thin libzircon wrapper plus a single-thread dispatcher/executor over channel, socket, registration, and sleep paths"
+tags = ["kernel", "runtime", "reactor", "dispatcher", "bootstrap"]
 
 command = [
   "bash",
@@ -12,3 +12,44 @@ contracts = [
   "must.runtime.libzircon_bootstrap",
   "must.runtime.reactor_bootstrap",
 ]
+
+expect = ["kernel: userspace runtime dispatcher"]
+forbid = ["KERNEL PANIC"]
+
+[assertions.status_code]
+dispatcher_create = 0
+reg_create_first = 0
+reg_cancel_first = 0
+reg_create_second = 0
+channel_create = 0
+channel_seed_write = 0
+channel_recv = 0
+sleep_create = 0
+sleep_wait = 0
+channel_call_create = 0
+channel_call_server_spawn = 0
+channel_call_server_recv = 0
+channel_call_server_reply = 0
+channel_call = 0
+socket_create = 0
+socket_seed_write = 0
+socket_wait_readable = 0
+socket_read = 0
+close_seed_tx = 0
+close_seed_rx = 0
+close_call_client = 0
+close_call_server = 0
+close_socket_tx = 0
+close_socket_rx = 0
+
+[assertions.packet_fields]
+failure_step = 0
+reg_slot_reused = 1
+reg_generation_advanced = 1
+channel_recv_actual_bytes = 5
+channel_recv_match = 1
+channel_call_server_match = 1
+channel_call_actual_bytes = 4
+channel_call_match = 1
+socket_read_actual_bytes = 4
+socket_read_match = 1

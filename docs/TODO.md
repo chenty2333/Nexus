@@ -124,7 +124,12 @@ depends on: Axle syscall/object semantics being stable enough to wrap cleanly
 
 = event loop built on port/timer/channel semantics  
 = enough runtime glue for non-busy async waiting and dispatch
-= current tree now has a minimal `nexus-rt` single-thread reactor plus a ring3 Rust smoke that drives channel-readable and timer-signaled delivery through one port
+= current tree now has a single-thread `nexus-rt` dispatcher/executor:
+  - one port
+  - one dispatcher timer object
+  - generation-safe signal registrations
+  - task wakeups routed through `zx_port_queue`
+  - `Sleep`, `OnSignals`, `AsyncChannelRecv/Call`, and `AsyncSocketReadiness`
 depends on: F1
 
 #### F3. FIDL runtime / bindings

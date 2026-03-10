@@ -14,6 +14,7 @@ fn main() {
     // mapping in `kernel/axle-kernel/src/userspace.rs`.
     let script = manifest_dir.join("linker.ld");
     println!("cargo:rustc-link-arg=-T{}", script.display());
+    println!("cargo:rustc-link-arg=-no-pie");
     if let Ok(entry) = std::env::var("AXLE_TEST_RUNNER_RUST_ENTRY") {
         match entry.as_str() {
             "reactor_smoke" => {

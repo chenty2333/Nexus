@@ -401,7 +401,7 @@ reason = "bootstrap userspace runtime gate; exercised by a dedicated QEMU ring3 
 [[contracts]]
 id = "must.runtime.reactor_bootstrap"
 level = "must"
-description = "Phase-three bootstrap userspace must provide a single-thread reactor that routes wait_async signal packets from channel and timer objects through port_wait without busy-waiting"
+description = "Phase-three bootstrap userspace must provide a single-thread dispatcher/executor with generation-safe signal registrations, one dispatcher timer, and non-busy channel/socket/timer progress"
 [contracts.concurrency]
 mode = "not_applicable"
 reason = "bootstrap userspace runtime gate; exercised by a dedicated QEMU ring3 scenario"
