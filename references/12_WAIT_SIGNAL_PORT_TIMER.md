@@ -51,6 +51,9 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
 - Async observer authority now lives in `axle_core::ObserverRegistry`.
 - The registry owns registration uniqueness, reverse indexing by `waitable_id`, edge/level rules,
   and pending-overflow merge behavior.
+- Observer cleanup now eagerly removes pending-overflow entries when one registration is canceled or
+  when the watched object is destroyed.
+  It no longer relies on later `flush_port()` calls to lazily skip stale pending registrations.
 - Reactor observer keys are generation-aware `ObjectKey`s, so retained async state stays tied to
   one object incarnation even after numeric object ids are recycled.
 - Delivery complexity is now proportional to the observing ports of one waitable, not the total

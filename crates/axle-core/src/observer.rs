@@ -320,8 +320,25 @@ impl ObserverRegistry {
         }
     }
 
+    fn remove_pending_registration(&mut self, reg: ObserverRegistration) {
+        let should_remove_port = if let Some(queue) = self.pending_order_by_port.get_mut(&reg.port)
+        {
+            queue.retain(|queued| *queued != reg);
+            queue.is_empty()
+        } else {
+            false
+        };
+
+        if should_remove_port {
+            let _ = self.pending_order_by_port.remove(&reg.port);
+        }
+    }
+
     fn remove_observer(&mut self, reg: ObserverRegistration) -> Option<Observer> {
         let removed = self.observers.remove(&reg)?;
+        if removed.pending.is_some() {
+            self.remove_pending_registration(reg);
+        }
         self.maybe_forget_port_waitable(reg.port, reg.waitable);
         Some(removed)
     }
@@ -375,6 +392,13 @@ impl ObserverRegistry {
             }
         }
         false
+    }
+
+    #[cfg(test)]
+    fn pending_count_for_port(&self, port: ObserverPortId) -> usize {
+        self.pending_order_by_port
+            .get(&port)
+            .map_or(0, VecDeque::len)
     }
 }
 
@@ -574,5 +598,143 @@ mod tests {
             queue(&mut port, packet)
         });
         assert_eq!(port.pop(), Err(PortError::ShouldWait));
+    }
+
+    #[test]
+    fn cancel_pending_registration_cleans_pending_queue() {
+        let mut registry = ObserverRegistry::new();
+        let mut port = Port::new(1, 1);
+
+        registry
+            .wait_async(
+                WaitAsyncRegistration {
+                    port: key(10),
+                    waitable: key(1),
+                    key: 10,
+                    watched: Signals::CHANNEL_READABLE,
+                    options: WaitAsyncOptions::default(),
+                },
+                Signals::NONE,
+                10,
+                |_, packet| queue(&mut port, packet),
+            )
+            .unwrap();
+        registry
+            .wait_async(
+                WaitAsyncRegistration {
+                    port: key(10),
+                    waitable: key(2),
+                    key: 11,
+                    watched: Signals::CHANNEL_READABLE,
+                    options: WaitAsyncOptions::default(),
+                },
+                Signals::NONE,
+                11,
+                |_, packet| queue(&mut port, packet),
+            )
+            .unwrap();
+
+        registry.on_signals_changed(key(1), Signals::CHANNEL_READABLE, 12, |_, packet| {
+            queue(&mut port, packet)
+        });
+        registry.on_signals_changed(key(2), Signals::CHANNEL_READABLE, 13, |_, packet| {
+            queue(&mut port, packet)
+        });
+        assert_eq!(registry.pending_count_for_port(key(10)), 1);
+
+        registry.cancel(key(10), key(2), 11).unwrap();
+        assert_eq!(registry.pending_count_for_port(key(10)), 0);
+    }
+
+    #[test]
+    fn remove_waitable_cleans_pending_queue() {
+        let mut registry = ObserverRegistry::new();
+        let mut port = Port::new(1, 1);
+
+        registry
+            .wait_async(
+                WaitAsyncRegistration {
+                    port: key(10),
+                    waitable: key(1),
+                    key: 10,
+                    watched: Signals::CHANNEL_READABLE,
+                    options: WaitAsyncOptions::default(),
+                },
+                Signals::NONE,
+                10,
+                |_, packet| queue(&mut port, packet),
+            )
+            .unwrap();
+        registry
+            .wait_async(
+                WaitAsyncRegistration {
+                    port: key(10),
+                    waitable: key(2),
+                    key: 11,
+                    watched: Signals::CHANNEL_READABLE,
+                    options: WaitAsyncOptions::default(),
+                },
+                Signals::NONE,
+                11,
+                |_, packet| queue(&mut port, packet),
+            )
+            .unwrap();
+
+        registry.on_signals_changed(key(1), Signals::CHANNEL_READABLE, 12, |_, packet| {
+            queue(&mut port, packet)
+        });
+        registry.on_signals_changed(key(2), Signals::CHANNEL_READABLE, 13, |_, packet| {
+            queue(&mut port, packet)
+        });
+        assert_eq!(registry.pending_count_for_port(key(10)), 1);
+
+        registry.remove_waitable(key(2));
+        assert_eq!(registry.pending_count_for_port(key(10)), 0);
+    }
+
+    #[test]
+    fn remove_port_cleans_pending_queue() {
+        let mut registry = ObserverRegistry::new();
+        let mut port = Port::new(1, 1);
+
+        registry
+            .wait_async(
+                WaitAsyncRegistration {
+                    port: key(10),
+                    waitable: key(1),
+                    key: 10,
+                    watched: Signals::CHANNEL_READABLE,
+                    options: WaitAsyncOptions::default(),
+                },
+                Signals::NONE,
+                10,
+                |_, packet| queue(&mut port, packet),
+            )
+            .unwrap();
+        registry
+            .wait_async(
+                WaitAsyncRegistration {
+                    port: key(10),
+                    waitable: key(2),
+                    key: 11,
+                    watched: Signals::CHANNEL_READABLE,
+                    options: WaitAsyncOptions::default(),
+                },
+                Signals::NONE,
+                11,
+                |_, packet| queue(&mut port, packet),
+            )
+            .unwrap();
+
+        registry.on_signals_changed(key(1), Signals::CHANNEL_READABLE, 12, |_, packet| {
+            queue(&mut port, packet)
+        });
+        registry.on_signals_changed(key(2), Signals::CHANNEL_READABLE, 13, |_, packet| {
+            queue(&mut port, packet)
+        });
+        assert_eq!(registry.pending_count_for_port(key(10)), 1);
+
+        registry.remove_port(key(10));
+        assert_eq!(registry.pending_count_for_port(key(10)), 0);
     }
 }
