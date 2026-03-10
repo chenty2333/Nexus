@@ -334,11 +334,7 @@ pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
 }
 
 /// Suspend one process or thread and return a token whose close resumes it.
-pub fn task_suspend(handle: zx_handle_t, out_token: *mut zx_handle_t) -> Result<(), zx_status_t> {
-    if out_token.is_null() {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
-
+pub fn task_suspend(handle: zx_handle_t) -> Result<zx_handle_t, zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let target = state.with_objects(|objects| {
@@ -389,10 +385,7 @@ pub fn task_suspend(handle: zx_handle_t, out_token: *mut zx_handle_t) -> Result<
                 return Err(err);
             }
         };
-        state.with_kernel_mut(|kernel| {
-            let thread_id = kernel.current_thread_info()?.thread_id();
-            kernel.copyout_thread_user(thread_id, out_token, token_handle)
-        })
+        Ok(token_handle)
     })
 }
 

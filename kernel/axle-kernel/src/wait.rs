@@ -16,6 +16,58 @@ use axle_types::{zx_handle_t, zx_port_packet_t, zx_signals_t, zx_status_t};
 use crate::object::{self, KernelObject};
 use crate::port_queue::port_packet_from_core;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UserSignalsSink(u64);
+
+impl UserSignalsSink {
+    pub(crate) fn new(ptr: *mut zx_signals_t) -> Result<Self, zx_status_t> {
+        if ptr.is_null() {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        Ok(Self(ptr as u64))
+    }
+
+    pub(crate) const fn ptr(self) -> *mut zx_signals_t {
+        self.0 as *mut zx_signals_t
+    }
+
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UserPortPacketSink(u64);
+
+impl UserPortPacketSink {
+    pub(crate) fn new(ptr: *mut zx_port_packet_t) -> Result<Self, zx_status_t> {
+        if ptr.is_null() {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        Ok(Self(ptr as u64))
+    }
+
+    pub(crate) const fn ptr(self) -> *mut zx_port_packet_t {
+        self.0 as *mut zx_port_packet_t
+    }
+
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitOneOutcome {
+    Completed { observed: zx_signals_t },
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PortWaitOutcome {
+    Completed { packet: zx_port_packet_t },
+    Blocked,
+}
+
 fn queue_kernel_signal_packet(
     state: &object::KernelState,
     port_key: ObjectKey,
@@ -153,14 +205,11 @@ pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_stat
 pub fn port_wait(
     handle: zx_handle_t,
     deadline: i64,
-    out_ptr: *mut zx_port_packet_t,
-) -> Result<(), zx_status_t> {
+    sink: UserPortPacketSink,
+) -> Result<PortWaitOutcome, zx_status_t> {
     object::with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let object_key = resolved.object_key();
-        let thread_id = state
-            .with_kernel(|kernel| kernel.current_thread_info())?
-            .thread_id();
         require_port_object(state, object_key)?;
         object::require_handle_rights(resolved, crate::task::HandleRights::READ)?;
         let packet = pop_port_packet_locked(state, object_key);
@@ -168,10 +217,8 @@ pub fn port_wait(
         match packet {
             Ok(packet) => {
                 let packet = port_packet_from_core(packet);
-                state.with_kernel_mut(|kernel| {
-                    kernel.copyout_thread_user(thread_id, out_ptr, packet)
-                })?;
-                publish_port_signals_changed(state, object_key)
+                publish_port_signals_changed(state, object_key)?;
+                Ok(PortWaitOutcome::Completed { packet })
             }
             Err(ZX_ERR_SHOULD_WAIT) => {
                 if deadline == 0 {
@@ -188,10 +235,8 @@ pub fn port_wait(
                         return match packet {
                             Ok(packet) => {
                                 let packet = port_packet_from_core(packet);
-                                state.with_kernel_mut(|kernel| {
-                                    kernel.copyout_thread_user(thread_id, out_ptr, packet)
-                                })?;
-                                publish_port_signals_changed(state, object_key)
+                                publish_port_signals_changed(state, object_key)?;
+                                Ok(PortWaitOutcome::Completed { packet })
                             }
                             Err(ZX_ERR_SHOULD_WAIT) => Err(ZX_ERR_TIMED_OUT),
                             Err(err) => Err(err),
@@ -203,12 +248,12 @@ pub fn port_wait(
                     kernel.park_current(
                         crate::task::WaitRegistration::Port {
                             port_object: object_key,
-                            packet_ptr: out_ptr as u64,
+                            packet_ptr: sink.raw(),
                         },
                         deadline,
                     )
                 })?;
-                Ok(())
+                Ok(PortWaitOutcome::Blocked)
             }
             Err(err) => Err(err),
         }
@@ -220,8 +265,8 @@ pub fn object_wait_one(
     handle: zx_handle_t,
     watched: zx_signals_t,
     deadline: i64,
-    observed_ptr: *mut zx_signals_t,
-) -> Result<(), zx_status_t> {
+    sink: UserSignalsSink,
+) -> Result<WaitOneOutcome, zx_status_t> {
     let watched = Signals::from_bits(watched);
     if watched.is_empty() {
         return Err(ZX_ERR_INVALID_ARGS);
@@ -231,24 +276,19 @@ pub fn object_wait_one(
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
         let object_key = resolved.object_key();
         let observed = object::signals_for_object_id(state, object_key)?;
-        let thread_id = state
-            .with_kernel(|kernel| kernel.current_thread_info())?
-            .thread_id();
         if observed.intersects(watched) {
-            state.with_kernel_mut(|kernel| {
-                kernel.copyout_thread_user(thread_id, observed_ptr, observed.bits())
-            })?;
-            return Ok(());
+            return Ok(WaitOneOutcome::Completed {
+                observed: observed.bits(),
+            });
         }
 
         if deadline != i64::MAX && deadline <= crate::time::now_ns() {
             let _ = on_tick_locked(state);
             let observed = object::signals_for_object_id(state, object_key)?;
-            state.with_kernel_mut(|kernel| {
-                kernel.copyout_thread_user(thread_id, observed_ptr, observed.bits())
-            })?;
             if observed.intersects(watched) {
-                return Ok(());
+                return Ok(WaitOneOutcome::Completed {
+                    observed: observed.bits(),
+                });
             }
             return Err(ZX_ERR_TIMED_OUT);
         }
@@ -263,12 +303,12 @@ pub fn object_wait_one(
                 crate::task::WaitRegistration::Signal {
                     object_key,
                     watched,
-                    observed_ptr: observed_ptr as u64,
+                    observed_ptr: sink.raw(),
                 },
                 deadline,
             )
         })?;
-        Ok(())
+        Ok(WaitOneOutcome::Blocked)
     })
 }
 
@@ -342,11 +382,16 @@ pub fn on_tick() {
 fn on_tick_locked(state: &object::KernelState) -> Result<(), zx_status_t> {
     let now = crate::time::now_ns();
     let polled = state.with_kernel_mut(|kernel| Ok(kernel.poll_reactor(now)))?;
-    let (fired_timers, expired_waits) = polled.into_parts();
-    for timer_id in fired_timers {
-        object::publish_timer_fired(state, timer_id)?;
+    for event in polled.into_events() {
+        match event {
+            crate::task::ReactorPollEvent::TimerFired(timer_id) => {
+                object::publish_timer_fired(state, timer_id)?;
+            }
+            crate::task::ReactorPollEvent::WaitExpired(expired_wait) => {
+                wake_expired_waits(state, alloc::vec![expired_wait])?;
+            }
+        }
     }
-    wake_expired_waits(state, expired_waits)?;
     let _ = state.with_kernel_mut(|kernel| kernel.sync_current_cpu_tlb_state());
     Ok(())
 }

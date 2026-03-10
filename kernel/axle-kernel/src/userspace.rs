@@ -1487,9 +1487,6 @@ pub fn prepare() -> u64 {
     for i in 0..=SLOT_MAX {
         slots[i] = 0;
     }
-    // Provide a monotonic baseline so the runner can construct future deadlines
-    // without introducing a new syscall ABI.
-    slots[SLOT_T0_NS] = crate::time::now_ns() as u64;
     slots[SLOT_ROOT_VMAR_H] = crate::object::vm::bootstrap_root_vmar_handle().unwrap_or(0) as u64;
     slots[SLOT_SELF_THREAD_H] =
         crate::object::process::bootstrap_self_thread_handle().unwrap_or(0) as u64;
@@ -1512,6 +1509,9 @@ pub fn prepare() -> u64 {
 
 /// Enter ring3 at `entry` and run until the conformance runner exits via `int3`.
 pub fn enter(entry: u64) -> ! {
+    // Provide the runner baseline as late as possible so "future deadline" checks are relative
+    // to actual ring3 start, not earlier bootstrap work like SMP bring-up.
+    shared_slots()[SLOT_T0_NS] = crate::time::now_ns() as u64;
     let selectors = crate::arch::gdt::init();
 
     // SAFETY: we build a valid iret frame to transition to ring3 using the installed GDT selectors.

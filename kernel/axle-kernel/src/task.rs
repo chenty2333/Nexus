@@ -1871,14 +1871,19 @@ impl ExpiredWait {
 
 #[derive(Debug, Default)]
 pub(crate) struct ReactorPollResult {
-    fired_timers: Vec<TimerId>,
-    expired_waits: Vec<ExpiredWait>,
+    events: Vec<ReactorPollEvent>,
 }
 
 impl ReactorPollResult {
-    pub(crate) fn into_parts(self) -> (Vec<TimerId>, Vec<ExpiredWait>) {
-        (self.fired_timers, self.expired_waits)
+    pub(crate) fn into_events(self) -> Vec<ReactorPollEvent> {
+        self.events
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum ReactorPollEvent {
+    TimerFired(TimerId),
+    WaitExpired(ExpiredWait),
 }
 
 /// Pinned page run loaned from the current process into a kernel object.
@@ -3914,7 +3919,7 @@ impl Kernel {
         for event in due {
             match event {
                 ReactorTimerEvent::TimerFired(timer_id) => {
-                    result.fired_timers.push(timer_id);
+                    result.events.push(ReactorPollEvent::TimerFired(timer_id));
                 }
                 ReactorTimerEvent::WaitExpired(wait_id) => {
                     let Some(thread) = self.threads.get(&wait_id.thread_id()) else {
@@ -3929,10 +3934,12 @@ impl Kernel {
                         continue;
                     };
                     self.remove_wait_source_membership(wait_id.thread_id(), registration);
-                    result.expired_waits.push(ExpiredWait {
-                        thread_id: wait_id.thread_id(),
-                        registration,
-                    });
+                    result
+                        .events
+                        .push(ReactorPollEvent::WaitExpired(ExpiredWait {
+                            thread_id: wait_id.thread_id(),
+                            registration,
+                        }));
                 }
             }
         }

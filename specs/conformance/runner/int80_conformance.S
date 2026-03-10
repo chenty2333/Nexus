@@ -1728,6 +1728,14 @@ jb wait_async_boot_done
 movq $1, 8*49(%rbx)
 wait_async_boot_done:
 
+// Refresh the monotonic baseline for the later future-deadline waits. The
+// original slot-511 baseline is taken near ring3 entry, but this conformance
+// program has grown enough that the later 750ms/2s checks need a fresher
+// reference point.
+mov 8*44(%rbx), %rax
+test %rax, %rax
+cmovnz %rax, %r12
+
 // EDGE wait on already-signaled timer must not queue immediately.
 mov 0x1698(%rbx), %rdi
 mov 0x1688(%rbx), %rsi
