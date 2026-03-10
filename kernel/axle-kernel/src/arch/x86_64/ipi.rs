@@ -1,4 +1,4 @@
-//! Fixed-vector IPI support (bring-up / conformance / TLB shootdown).
+//! Fixed-vector IPI support (bring-up / conformance / TLB shootdown / reschedule).
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -9,6 +9,7 @@ use crate::arch::apic;
 
 pub const TEST_VECTOR: usize = 0x40;
 pub const TLB_SHOOTDOWN_VECTOR: usize = 0x41;
+pub const RESCHEDULE_VECTOR: usize = 0x42;
 
 const MAX_CPUS: usize = 16;
 
@@ -79,14 +80,17 @@ core::arch::global_asm!(
 
     AXLE_IPI_ENTRY axle_ipi_test_entry, {rust_test}
     AXLE_IPI_ENTRY axle_ipi_tlb_entry, {rust_tlb}
+    AXLE_IPI_ENTRY axle_ipi_reschedule_entry, {rust_resched}
     "#,
     rust_test = sym axle_ipi_test_rust,
     rust_tlb = sym axle_ipi_tlb_rust,
+    rust_resched = sym axle_ipi_reschedule_rust,
 );
 
 unsafe extern "C" {
     fn axle_ipi_test_entry();
     fn axle_ipi_tlb_entry();
+    fn axle_ipi_reschedule_entry();
 }
 
 /// Address of the IPI test handler entry stub for IDT installation.
@@ -97,6 +101,11 @@ pub fn test_entry_addr() -> usize {
 /// Address of the TLB shootdown IPI handler entry stub for IDT installation.
 pub fn tlb_entry_addr() -> usize {
     axle_ipi_tlb_entry as *const () as usize
+}
+
+/// Address of the reschedule IPI handler entry stub for IDT installation.
+pub fn reschedule_entry_addr() -> usize {
+    axle_ipi_reschedule_entry as *const () as usize
 }
 
 extern "C" fn axle_ipi_test_rust(_frame: *const u8) {
@@ -134,6 +143,12 @@ extern "C" fn axle_ipi_tlb_rust(_frame: *const u8) {
     if apic_id < MAX_CPUS {
         let _ = TLB_SHOOTDOWN_ACK[apic_id].fetch_add(1, Ordering::AcqRel);
     }
+}
+
+extern "C" fn axle_ipi_reschedule_rust(_frame: *const u8) {
+    // The waking CPU updates scheduler state before sending this IPI.
+    // The target CPU only needs an interrupt to break out of `hlt`/trap blocking.
+    apic::eoi();
 }
 
 #[allow(dead_code)]
@@ -196,4 +211,12 @@ pub fn shootdown_all(apic_ids: &[usize]) {
     }
 
     TLB_SHOOTDOWN_MODE.store(TLB_MODE_NONE, Ordering::Release);
+}
+
+/// Send one reschedule IPI to `apic_id`.
+pub fn send_reschedule(apic_id: usize) {
+    if apic_id >= MAX_CPUS {
+        return;
+    }
+    apic::send_fixed_ipi(apic_id as u32, RESCHEDULE_VECTOR as u8);
 }

@@ -1280,6 +1280,23 @@ pub(crate) fn run_trap_blocking<T>(
     }
 }
 
+pub(crate) fn run_current_cpu_idle_loop() -> ! {
+    loop {
+        match with_state_mut(|state| {
+            let lifecycle_dirty =
+                state.with_kernel_mut(|kernel| Ok(kernel.take_task_lifecycle_dirty()))?;
+            if lifecycle_dirty {
+                process::sync_task_lifecycle(state)?;
+            }
+            state.with_kernel_mut(|kernel| kernel.take_current_cpu_idle_context())
+        }) {
+            Ok(Some(context)) => context.enter(),
+            Ok(None) => block_current_trap_until_runnable(),
+            Err(status) => panic!("idle loop failed: {status}"),
+        }
+    }
+}
+
 /// Create a new Port object and return a handle.
 pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
     if options != 0 {

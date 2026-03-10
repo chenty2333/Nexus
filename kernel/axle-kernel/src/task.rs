@@ -47,6 +47,7 @@ use axle_types::{
 };
 use bitflags::bitflags;
 use core::mem::size_of;
+use raw_cpuid::CpuId;
 use spin::Mutex;
 
 pub(crate) mod fault;
@@ -994,6 +995,7 @@ impl CurrentProcessInfo {
     }
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct UserContext {
     trap: crate::arch::int80::TrapFrame,
@@ -1072,6 +1074,58 @@ impl UserContext {
             ss: selectors.user_data.0 as u64,
         }
     }
+
+    pub(crate) fn enter(self) -> ! {
+        use x86_64::instructions::segmentation::{DS, ES, Segment};
+
+        let selectors = crate::arch::gdt::init();
+        // SAFETY: Axle installs the user data selector in the current GDT before entering ring3.
+        unsafe {
+            DS::set_reg(selectors.user_data);
+            ES::set_reg(selectors.user_data);
+        }
+
+        // SAFETY: `UserContext` stores a complete ring3 register and IRET frame snapshot. The
+        // entry helper restores those registers verbatim and finishes with `iretq`.
+        unsafe {
+            axle_enter_user_context(core::ptr::addr_of!(self));
+        }
+    }
+}
+
+core::arch::global_asm!(
+    r#"
+    .global axle_enter_user_context
+    .type axle_enter_user_context, @function
+axle_enter_user_context:
+    push QWORD PTR [rdi + 152]
+    push QWORD PTR [rdi + 144]
+    push QWORD PTR [rdi + 136]
+    push QWORD PTR [rdi + 128]
+    push QWORD PTR [rdi + 120]
+
+    mov rax, [rdi + 0]
+    mov rsi, [rdi + 16]
+    mov rdx, [rdi + 24]
+    mov r10, [rdi + 32]
+    mov r8, [rdi + 40]
+    mov r9, [rdi + 48]
+    mov rcx, [rdi + 56]
+    mov r11, [rdi + 64]
+    mov rbp, [rdi + 72]
+    mov rbx, [rdi + 80]
+    mov r12, [rdi + 88]
+    mov r13, [rdi + 96]
+    mov r14, [rdi + 104]
+    mov r15, [rdi + 112]
+    mov rdi, [rdi + 8]
+    iretq
+    .size axle_enter_user_context, .-axle_enter_user_context
+    "#
+);
+
+unsafe extern "C" {
+    fn axle_enter_user_context(context: *const UserContext) -> !;
 }
 
 impl CurrentThreadInfo {
@@ -2806,10 +2860,19 @@ struct Thread {
     process_id: ProcessId,
     koid: zx_koid_t,
     state: ThreadState,
-    queued: bool,
+    queued_on_cpu: Option<usize>,
+    last_cpu: usize,
     wait: WaitNode,
     context: Option<UserContext>,
     suspend_tokens: u32,
+}
+
+#[derive(Debug, Default)]
+struct CpuSchedulerState {
+    run_queue: VecDeque<ThreadId>,
+    current_thread_id: Option<ThreadId>,
+    reschedule_requested: bool,
+    online: bool,
 }
 
 /// Internal bootstrap kernel model.
@@ -2838,13 +2901,11 @@ pub(crate) struct Kernel {
     threads: BTreeMap<ThreadId, Thread>,
     futexes: crate::futex::FutexTable,
     reactor: Arc<Mutex<Reactor>>,
-    run_queue: VecDeque<ThreadId>,
+    cpu_schedulers: BTreeMap<usize, CpuSchedulerState>,
     revocations: RevocationManager,
     next_koid: zx_koid_t,
     next_process_id: ProcessId,
     next_thread_id: ThreadId,
-    current_thread_id: ThreadId,
-    reschedule_requested: bool,
     task_lifecycle_dirty: bool,
     vm: Arc<VmFacade>,
 }
@@ -2982,6 +3043,13 @@ impl VmDomain {
 }
 
 impl Kernel {
+    fn bootstrap_cpu_id() -> usize {
+        CpuId::new()
+            .get_feature_info()
+            .map(|fi| fi.initial_local_apic_id() as usize)
+            .unwrap_or(0)
+    }
+
     fn cancel_wait_deadline(&mut self, thread_id: ThreadId, seq: u64) {
         self.reactor.lock().cancel_wait_deadline(thread_id, seq);
     }
@@ -3025,16 +3093,15 @@ impl Kernel {
             threads: BTreeMap::new(),
             futexes: crate::futex::FutexTable::new(),
             reactor,
-            run_queue: VecDeque::new(),
+            cpu_schedulers: BTreeMap::new(),
             revocations: RevocationManager::new(),
             next_koid: 1,
             next_process_id: 1,
             next_thread_id: 1,
-            current_thread_id: 0,
-            reschedule_requested: false,
             task_lifecycle_dirty: false,
             vm,
         };
+        let bootstrap_cpu_id = Self::bootstrap_cpu_id();
         let process_id = kernel.alloc_process_id();
         let process_koid = kernel.alloc_koid();
         kernel.processes.insert(
@@ -3050,13 +3117,22 @@ impl Kernel {
                 process_id,
                 koid: thread_koid,
                 state: ThreadState::Runnable,
-                queued: false,
+                queued_on_cpu: None,
+                last_cpu: bootstrap_cpu_id,
                 wait: WaitNode::default(),
                 context: None,
                 suspend_tokens: 0,
             },
         );
-        kernel.current_thread_id = thread_id;
+        kernel.cpu_schedulers.insert(
+            bootstrap_cpu_id,
+            CpuSchedulerState {
+                run_queue: VecDeque::new(),
+                current_thread_id: Some(thread_id),
+                reschedule_requested: false,
+                online: true,
+            },
+        );
         kernel
     }
 
@@ -3412,7 +3488,7 @@ impl Kernel {
         let thread = self.current_thread()?;
         Ok(CurrentThreadInfo {
             process_id: thread.process_id,
-            thread_id: self.current_thread_id,
+            thread_id: self.current_thread_id()?,
             koid: thread.koid,
         })
     }
@@ -3683,9 +3759,10 @@ impl Kernel {
         cpu_frame: *const u64,
     ) -> Result<(), zx_status_t> {
         let context = UserContext::capture(trap, cpu_frame)?;
+        let current_thread_id = self.current_thread_id()?;
         let thread = self
             .threads
-            .get_mut(&self.current_thread_id)
+            .get_mut(&current_thread_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         thread.context = Some(context);
         Ok(())
@@ -3706,6 +3783,7 @@ impl Kernel {
         cpu_frame: *mut u64,
         resuming_blocked_current: bool,
     ) -> Result<TrapExitDisposition, zx_status_t> {
+        let current_cpu_id = self.current_cpu_id();
         match self.current_thread()?.state {
             ThreadState::Runnable => {
                 if resuming_blocked_current {
@@ -3713,8 +3791,7 @@ impl Kernel {
                 } else {
                     self.capture_current_user_context(trap, cpu_frame.cast_const())?;
                 }
-                if !resuming_blocked_current && self.reschedule_requested {
-                    self.reschedule_requested = false;
+                if !resuming_blocked_current && self.take_reschedule_requested(current_cpu_id) {
                     if let Some(next_thread_id) = self.pop_runnable_thread() {
                         self.requeue_current_thread()?;
                         self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
@@ -3725,7 +3802,7 @@ impl Kernel {
             }
             ThreadState::New => Err(ZX_ERR_BAD_STATE),
             ThreadState::TerminationPending => {
-                let thread_id = self.current_thread_id;
+                let thread_id = self.current_thread_id()?;
                 self.finalize_thread_termination(thread_id)?;
                 if let Some(next_thread_id) = self.pop_runnable_thread() {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
@@ -3856,7 +3933,7 @@ impl Kernel {
         registration: WaitRegistration,
         deadline: Option<i64>,
     ) -> Result<(), zx_status_t> {
-        let thread_id = self.current_thread_id;
+        let thread_id = self.current_thread_id()?;
         let source = registration.source_key();
         let seq = {
             let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
@@ -4085,13 +4162,15 @@ impl Kernel {
         }
         let thread_id = self.alloc_thread_id();
         let koid = self.alloc_koid();
+        let current_cpu_id = self.current_cpu_id();
         self.threads.insert(
             thread_id,
             Thread {
                 process_id,
                 koid,
                 state: ThreadState::New,
-                queued: false,
+                queued_on_cpu: None,
+                last_cpu: current_cpu_id,
                 wait: WaitNode::default(),
                 context: None,
                 suspend_tokens: 0,
@@ -4137,11 +4216,12 @@ impl Kernel {
         }
         thread.context = Some(UserContext::new_user_entry(entry, stack, arg0, arg1));
         thread.state = ThreadState::Runnable;
-        let queued = thread.queued;
+        let queued = thread.queued_on_cpu.is_some();
         let thread_id_copy = thread_id;
         let _ = thread;
         if !queued {
-            self.enqueue_runnable_thread(thread_id_copy)?;
+            let target_cpu = self.choose_wake_cpu(thread_id_copy);
+            self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
         }
         Ok(())
     }
@@ -4254,6 +4334,7 @@ impl Kernel {
         ) {
             return Err(ZX_ERR_BAD_STATE);
         }
+        let running_cpu_id = self.running_cpu_for_thread(thread_id);
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
         if matches!(
             thread.state,
@@ -4264,10 +4345,11 @@ impl Kernel {
         thread.suspend_tokens = thread.suspend_tokens.saturating_add(1);
         if matches!(thread.state, ThreadState::Runnable) {
             thread.state = ThreadState::Suspended;
-            thread.queued = false;
+            thread.queued_on_cpu = None;
         }
-        if thread_id == self.current_thread_id {
-            self.reschedule_requested = true;
+        let _ = thread;
+        if let Some(cpu_id) = running_cpu_id {
+            self.request_reschedule_on_cpu(cpu_id);
         }
         Ok(())
     }
@@ -4303,13 +4385,15 @@ impl Kernel {
             })
             .collect::<Vec<_>>();
         for thread_id in thread_ids {
+            let running_cpu_id = self.running_cpu_for_thread(thread_id);
             let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
             if matches!(thread.state, ThreadState::Runnable) {
                 thread.state = ThreadState::Suspended;
-                thread.queued = false;
+                thread.queued_on_cpu = None;
             }
-            if thread_id == self.current_thread_id {
-                self.reschedule_requested = true;
+            let _ = thread;
+            if let Some(cpu_id) = running_cpu_id {
+                self.request_reschedule_on_cpu(cpu_id);
             }
         }
         Ok(())
@@ -4374,7 +4458,7 @@ impl Kernel {
         if !matches!(thread.state, ThreadState::Terminated) {
             return Err(ZX_ERR_BAD_STATE);
         }
-        if thread_id == self.current_thread_id {
+        if self.running_cpu_for_thread(thread_id).is_some() {
             return Err(ZX_ERR_BAD_STATE);
         }
         let process_id = thread.process_id;
@@ -4512,13 +4596,105 @@ impl Kernel {
         id
     }
 
+    fn cpu_scheduler(&self, cpu_id: usize) -> Result<&CpuSchedulerState, zx_status_t> {
+        self.cpu_schedulers.get(&cpu_id).ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    fn cpu_scheduler_mut(&mut self, cpu_id: usize) -> &mut CpuSchedulerState {
+        self.cpu_schedulers.entry(cpu_id).or_default()
+    }
+
+    fn current_cpu_scheduler(&self) -> Result<&CpuSchedulerState, zx_status_t> {
+        self.cpu_scheduler(self.current_cpu_id())
+    }
+
+    fn current_cpu_scheduler_mut(&mut self) -> &mut CpuSchedulerState {
+        let cpu_id = self.current_cpu_id();
+        self.cpu_scheduler_mut(cpu_id)
+    }
+
+    fn current_thread_id(&self) -> Result<ThreadId, zx_status_t> {
+        self.current_cpu_scheduler()?
+            .current_thread_id
+            .ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    fn current_thread_matches(&self, thread_id: ThreadId) -> bool {
+        self.current_thread_id()
+            .is_ok_and(|current_thread_id| current_thread_id == thread_id)
+    }
+
+    fn running_cpu_for_thread(&self, thread_id: ThreadId) -> Option<usize> {
+        self.cpu_schedulers.iter().find_map(|(&cpu_id, scheduler)| {
+            (scheduler.current_thread_id == Some(thread_id)).then_some(cpu_id)
+        })
+    }
+
+    fn cpu_is_online(&self, cpu_id: usize) -> bool {
+        self.cpu_schedulers
+            .get(&cpu_id)
+            .is_some_and(|scheduler| scheduler.online)
+    }
+
+    fn cpu_is_idle(&self, cpu_id: usize) -> bool {
+        self.cpu_schedulers.get(&cpu_id).is_some_and(|scheduler| {
+            scheduler.online
+                && scheduler.current_thread_id.is_none()
+                && scheduler.run_queue.is_empty()
+        })
+    }
+
+    pub(crate) fn mark_cpu_online(&mut self, cpu_id: usize) {
+        self.cpu_scheduler_mut(cpu_id).online = true;
+    }
+
+    fn request_reschedule_on_cpu(&mut self, cpu_id: usize) {
+        self.cpu_scheduler_mut(cpu_id).reschedule_requested = true;
+        if cpu_id != self.current_cpu_id() && self.cpu_is_online(cpu_id) {
+            crate::arch::ipi::send_reschedule(cpu_id);
+        }
+    }
+
+    fn take_reschedule_requested(&mut self, cpu_id: usize) -> bool {
+        core::mem::take(&mut self.cpu_scheduler_mut(cpu_id).reschedule_requested)
+    }
+
+    fn choose_wake_cpu(&self, thread_id: ThreadId) -> usize {
+        let current_cpu_id = self.current_cpu_id();
+        if let Some(running_cpu_id) = self.running_cpu_for_thread(thread_id) {
+            return running_cpu_id;
+        }
+        if self.cpu_is_online(current_cpu_id) {
+            return current_cpu_id;
+        }
+        let preferred_cpu = self
+            .threads
+            .get(&thread_id)
+            .map(|thread| thread.last_cpu)
+            .unwrap_or(current_cpu_id);
+        if self.cpu_is_online(preferred_cpu) && self.cpu_is_idle(preferred_cpu) {
+            return preferred_cpu;
+        }
+        if let Some((&idle_cpu_id, _)) = self.cpu_schedulers.iter().find(|(_, scheduler)| {
+            scheduler.online
+                && scheduler.current_thread_id.is_none()
+                && scheduler.run_queue.is_empty()
+        }) {
+            return idle_cpu_id;
+        }
+        if self.cpu_is_online(preferred_cpu) {
+            return preferred_cpu;
+        }
+        current_cpu_id
+    }
+
     fn current_cpu_id(&self) -> usize {
         crate::arch::apic::this_apic_id() as usize
     }
 
     fn current_thread(&self) -> Result<&Thread, zx_status_t> {
         self.threads
-            .get(&self.current_thread_id)
+            .get(&self.current_thread_id()?)
             .ok_or(ZX_ERR_BAD_STATE)
     }
 
@@ -4561,11 +4737,12 @@ impl Kernel {
             ThreadState::New | ThreadState::Runnable | ThreadState::Suspended => {}
         }
 
-        if thread_id == self.current_thread_id {
+        if let Some(cpu_id) = self.running_cpu_for_thread(thread_id) {
             let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
             thread.state = ThreadState::TerminationPending;
-            thread.queued = false;
-            self.reschedule_requested = true;
+            thread.queued_on_cpu = None;
+            let _ = thread;
+            self.request_reschedule_on_cpu(cpu_id);
             return Ok(());
         }
 
@@ -4578,16 +4755,18 @@ impl Kernel {
             .get(&thread_id)
             .ok_or(ZX_ERR_BAD_HANDLE)?
             .process_id;
+        let running_cpu_id = self.running_cpu_for_thread(thread_id);
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         if matches!(thread.state, ThreadState::Terminated) {
             return Ok(());
         }
         thread.state = ThreadState::Terminated;
-        thread.queued = false;
+        thread.queued_on_cpu = None;
         thread.context = None;
         self.task_lifecycle_dirty = true;
-        if thread_id == self.current_thread_id {
-            self.reschedule_requested = true;
+        let _ = thread;
+        if let Some(cpu_id) = running_cpu_id {
+            self.request_reschedule_on_cpu(cpu_id);
         }
         self.maybe_finalize_process_termination(process_id)?;
         Ok(())
@@ -4622,66 +4801,111 @@ impl Kernel {
         if self.thread_should_be_suspended(thread_id)? {
             return Ok(());
         }
+        let running_cpu_id = self.running_cpu_for_thread(thread_id);
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         if !matches!(thread.state, ThreadState::Suspended) {
             return Ok(());
         }
         thread.state = ThreadState::Runnable;
-        let queued = thread.queued;
+        let queued_on_cpu = thread.queued_on_cpu;
         let _ = thread;
-        if !queued {
-            self.enqueue_runnable_thread(thread_id)?;
+        if let Some(cpu_id) = running_cpu_id {
+            self.request_reschedule_on_cpu(cpu_id);
+            return Ok(());
         }
-        self.reschedule_requested = true;
+        if let Some(cpu_id) = queued_on_cpu {
+            self.request_reschedule_on_cpu(cpu_id);
+            return Ok(());
+        }
+        let target_cpu = self.choose_wake_cpu(thread_id);
+        self.enqueue_runnable_thread_on_cpu(thread_id, target_cpu)?;
+        self.request_reschedule_on_cpu(target_cpu);
         Ok(())
     }
 
     fn enqueue_runnable_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        self.enqueue_runnable_thread_on_cpu(thread_id, self.current_cpu_id())
+    }
+
+    fn enqueue_runnable_thread_on_cpu(
+        &mut self,
+        thread_id: ThreadId,
+        cpu_id: usize,
+    ) -> Result<(), zx_status_t> {
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        if thread.queued || !matches!(thread.state, ThreadState::Runnable) {
+        if thread.queued_on_cpu.is_some() || !matches!(thread.state, ThreadState::Runnable) {
             return Ok(());
         }
-        thread.queued = true;
-        self.run_queue.push_back(thread_id);
+        thread.queued_on_cpu = Some(cpu_id);
+        let _ = thread;
+        self.cpu_scheduler_mut(cpu_id)
+            .run_queue
+            .push_back(thread_id);
         Ok(())
     }
 
     fn enqueue_runnable_thread_front(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        self.enqueue_runnable_thread_front_on_cpu(thread_id, self.current_cpu_id())
+    }
+
+    fn enqueue_runnable_thread_front_on_cpu(
+        &mut self,
+        thread_id: ThreadId,
+        cpu_id: usize,
+    ) -> Result<(), zx_status_t> {
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
-        if thread.queued || !matches!(thread.state, ThreadState::Runnable) {
+        if thread.queued_on_cpu.is_some() || !matches!(thread.state, ThreadState::Runnable) {
             return Ok(());
         }
-        thread.queued = true;
-        self.run_queue.push_front(thread_id);
+        thread.queued_on_cpu = Some(cpu_id);
+        let _ = thread;
+        self.cpu_scheduler_mut(cpu_id)
+            .run_queue
+            .push_front(thread_id);
         Ok(())
     }
 
     fn requeue_current_thread(&mut self) -> Result<(), zx_status_t> {
-        self.enqueue_runnable_thread(self.current_thread_id)
+        let thread_id = self.current_thread_id()?;
+        self.enqueue_runnable_thread_on_cpu(thread_id, self.current_cpu_id())
     }
 
     fn pop_runnable_thread(&mut self) -> Option<ThreadId> {
-        while let Some(thread_id) = self.run_queue.pop_front() {
+        let current_cpu_id = self.current_cpu_id();
+        loop {
+            let thread_id = self
+                .cpu_scheduler_mut(current_cpu_id)
+                .run_queue
+                .pop_front()?;
             let Some(thread) = self.threads.get_mut(&thread_id) else {
                 continue;
             };
-            thread.queued = false;
+            if thread.queued_on_cpu != Some(current_cpu_id) {
+                continue;
+            }
+            thread.queued_on_cpu = None;
             if matches!(thread.state, ThreadState::Runnable) {
                 return Some(thread_id);
             }
         }
-        None
     }
 
-    fn switch_to_thread(
+    fn activate_thread_on_current_cpu(
         &mut self,
         thread_id: ThreadId,
-        trap: &mut crate::arch::int80::TrapFrame,
-        cpu_frame: *mut u64,
-    ) -> Result<(), zx_status_t> {
+    ) -> Result<UserContext, zx_status_t> {
         let current_cpu_id = self.current_cpu_id();
-        let current_process_id = self.current_thread()?.process_id;
-        let current_address_space_id = self.process(current_process_id)?.address_space_id;
+        let previous_thread_id = self.current_cpu_scheduler()?.current_thread_id;
+        let current_address_space_id = if let Some(current_thread_id) = previous_thread_id {
+            let process_id = self
+                .threads
+                .get(&current_thread_id)
+                .ok_or(ZX_ERR_BAD_STATE)?
+                .process_id;
+            Some(self.process(process_id)?.address_space_id)
+        } else {
+            None
+        };
         let next_process_id = self
             .threads
             .get(&thread_id)
@@ -4691,16 +4915,48 @@ impl Kernel {
         let next_page_tables = self.with_vm(|vm| vm.root_page_table(next_address_space_id))?;
         let context = self
             .threads
-            .get(&thread_id)
-            .and_then(|thread| thread.context)
+            .get_mut(&thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .context
             .ok_or(ZX_ERR_BAD_STATE)?;
         next_page_tables.activate().map_err(map_page_table_error)?;
-        if current_address_space_id != next_address_space_id {
-            self.with_vm_mut(|vm| vm.note_cpu_inactive(current_address_space_id, current_cpu_id));
+        if let Some(current_address_space_id) = current_address_space_id {
+            if current_address_space_id != next_address_space_id {
+                self.with_vm_mut(|vm| {
+                    vm.note_cpu_inactive(current_address_space_id, current_cpu_id)
+                });
+            }
         }
         self.observe_cpu_tlb_epoch_for_address_space(next_address_space_id, current_cpu_id);
+        self.current_cpu_scheduler_mut().current_thread_id = Some(thread_id);
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        thread.last_cpu = current_cpu_id;
+        Ok(context)
+    }
+
+    pub(crate) fn take_current_cpu_idle_context(
+        &mut self,
+    ) -> Result<Option<UserContext>, zx_status_t> {
+        let current_cpu_id = self.current_cpu_id();
+        self.mark_cpu_online(current_cpu_id);
+        if self.current_cpu_scheduler()?.current_thread_id.is_some() {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        let _ = self.take_reschedule_requested(current_cpu_id);
+        let Some(thread_id) = self.pop_runnable_thread() else {
+            return Ok(None);
+        };
+        self.activate_thread_on_current_cpu(thread_id).map(Some)
+    }
+
+    fn switch_to_thread(
+        &mut self,
+        thread_id: ThreadId,
+        trap: &mut crate::arch::int80::TrapFrame,
+        cpu_frame: *mut u64,
+    ) -> Result<(), zx_status_t> {
+        let context = self.activate_thread_on_current_cpu(thread_id)?;
         context.restore(trap, cpu_frame)?;
-        self.current_thread_id = thread_id;
         Ok(())
     }
 
@@ -4737,6 +4993,7 @@ impl Kernel {
             return Ok(());
         }
         let hold_suspended = self.thread_should_be_suspended(thread_id)?;
+        let running_cpu_id = self.running_cpu_for_thread(thread_id);
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         let Some(context) = thread.context else {
             return Err(ZX_ERR_BAD_STATE);
@@ -4750,15 +5007,31 @@ impl Kernel {
         } else {
             ThreadState::Runnable
         };
-        let was_current = thread_id == self.current_thread_id;
+        if hold_suspended {
+            thread.queued_on_cpu = None;
+        }
+        let queued_on_cpu = thread.queued_on_cpu;
         let _ = thread;
-        if !hold_suspended && !was_current {
-            if matches!(previous_state, ThreadState::Blocked { .. }) {
-                self.enqueue_runnable_thread_front(thread_id)?;
-            } else {
-                self.enqueue_runnable_thread(thread_id)?;
+        if hold_suspended {
+            if let Some(cpu_id) = running_cpu_id {
+                self.request_reschedule_on_cpu(cpu_id);
             }
-            self.reschedule_requested = true;
+            return Ok(());
+        }
+        if let Some(cpu_id) = running_cpu_id {
+            self.request_reschedule_on_cpu(cpu_id);
+            return Ok(());
+        }
+        if queued_on_cpu.is_none() {
+            let target_cpu = self.choose_wake_cpu(thread_id);
+            if matches!(previous_state, ThreadState::Blocked { .. }) {
+                self.enqueue_runnable_thread_front_on_cpu(thread_id, target_cpu)?;
+            } else {
+                self.enqueue_runnable_thread_on_cpu(thread_id, target_cpu)?;
+            }
+            self.request_reschedule_on_cpu(target_cpu);
+        } else if let Some(cpu_id) = queued_on_cpu {
+            self.request_reschedule_on_cpu(cpu_id);
         }
         Ok(())
     }
@@ -4775,7 +5048,7 @@ impl Kernel {
     }
 
     pub(crate) fn request_reschedule(&mut self) {
-        self.reschedule_requested = true;
+        self.request_reschedule_on_cpu(self.current_cpu_id());
     }
 
     fn install_mapping_pages(

@@ -16,5 +16,6 @@ pub fn init() {
         arch::apic::error_entry_addr(),
         arch::ipi::test_entry_addr(),
         arch::ipi::tlb_entry_addr(),
+        arch::ipi::reschedule_entry_addr(),
     );
 }

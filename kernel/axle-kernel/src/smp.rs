@@ -84,9 +84,7 @@ extern "C" fn ap_entry(apic_id: u64) -> ! {
 
     crate::kprintln!("cpu{} online", apic_id);
 
-    loop {
-        x86_64::instructions::interrupts::enable_and_hlt();
-    }
+    crate::object::run_current_cpu_idle_loop()
 }
 
 fn bootstrap_trampoline(cpu_count: usize) {

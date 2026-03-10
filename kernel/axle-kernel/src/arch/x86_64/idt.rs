@@ -59,6 +59,7 @@ pub fn init(
     apic_error_handler: usize,
     ipi_test_handler: usize,
     ipi_tlb_handler: usize,
+    ipi_reschedule_handler: usize,
 ) {
     let selector = current_cs();
 
@@ -97,6 +98,8 @@ pub fn init(
             IdtEntry::new(ipi_test_handler, selector, kernel_int_gate, 0);
         IDT[crate::arch::ipi::TLB_SHOOTDOWN_VECTOR] =
             IdtEntry::new(ipi_tlb_handler, selector, kernel_int_gate, 0);
+        IDT[crate::arch::ipi::RESCHEDULE_VECTOR] =
+            IdtEntry::new(ipi_reschedule_handler, selector, kernel_int_gate, 0);
     }
     load_idt();
 }
