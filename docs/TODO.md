@@ -81,10 +81,11 @@ depends on: existing epoch/shootdown base
 
 ### D. IPC Mainline Completion `[~]`
 
-#### D1. Channel scatter page-loan `[ ]`
+#### D1. Channel scatter page-loan `[~]`
 
 = complete the roadmap design beyond the current full-page fast path  
-= head/tail fragment pages, body full-page loan, mixed descriptor format, mixed remap/copy read path  
+= bootstrap mixed head/body/tail remap/copy coverage now exists, and sender-side aligned body loan no longer requires an exact standalone mapping
+= remaining work: fragment pages, a more reusable scatter descriptor, and broader runtime stress/hardening
 depends on: existing full-page loan, pin/refcount/loan accounting, COW support
 
 #### D2. Channel race hardening `[~]`

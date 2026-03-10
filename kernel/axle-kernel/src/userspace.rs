@@ -406,8 +406,23 @@ const SLOT_BOOTSTRAP_HEAP_USED: usize = 507;
 const SLOT_BOOTSTRAP_HEAP_PEAK: usize = 508;
 const SLOT_BOOTSTRAP_HEAP_ALLOC_FAILS: usize = 509;
 const SLOT_SELF_CODE_VMO_SIZE: usize = 510;
-const SLOT_MAX: usize = SLOT_SELF_CODE_VMO_SIZE;
 const SLOT_T0_NS: usize = 511;
+const SLOT_CHANNEL_FRAGMENTED_CREATE: usize = 512;
+const SLOT_CHANNEL_FRAGMENTED_TX_VMO_CREATE: usize = 513;
+const SLOT_CHANNEL_FRAGMENTED_TX_MAP: usize = 514;
+const SLOT_CHANNEL_FRAGMENTED_RX_REMAP_VMO_CREATE: usize = 515;
+const SLOT_CHANNEL_FRAGMENTED_RX_REMAP_MAP: usize = 516;
+const SLOT_CHANNEL_FRAGMENTED_RX_COPY_VMO_CREATE: usize = 517;
+const SLOT_CHANNEL_FRAGMENTED_RX_COPY_MAP: usize = 518;
+const SLOT_CHANNEL_FRAGMENTED_WRITE_REMAP: usize = 519;
+const SLOT_CHANNEL_FRAGMENTED_READ_REMAP: usize = 520;
+const SLOT_CHANNEL_FRAGMENTED_ACTUAL_BYTES_REMAP: usize = 521;
+const SLOT_CHANNEL_FRAGMENTED_MATCH_REMAP: usize = 522;
+const SLOT_CHANNEL_FRAGMENTED_WRITE_COPY: usize = 523;
+const SLOT_CHANNEL_FRAGMENTED_READ_COPY: usize = 524;
+const SLOT_CHANNEL_FRAGMENTED_ACTUAL_BYTES_COPY: usize = 525;
+const SLOT_CHANNEL_FRAGMENTED_MATCH_COPY: usize = 526;
+const SLOT_MAX: usize = SLOT_CHANNEL_FRAGMENTED_MATCH_COPY;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1054,9 +1069,9 @@ pub(crate) fn zero_current_mapping_bytes(dst_ptr: u64, len: usize) {
 }
 
 fn shared_slots() -> &'static mut [u64] {
-    // SAFETY: the first shared page is always mapped and 8-byte aligned; we only use it after
-    // mapping.
-    unsafe { core::slice::from_raw_parts_mut(USER_SHARED_VA as *mut u64, 512) }
+    // SAFETY: the bootstrap shared region is two contiguous shared pages mapped at USER_SHARED_VA
+    // and 8-byte aligned; we only use it after mapping.
+    unsafe { core::slice::from_raw_parts_mut(USER_SHARED_VA as *mut u64, 1024) }
 }
 
 pub(crate) fn record_vm_cow_fault_count(count: u64) {
@@ -1496,6 +1511,25 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_SOCKET_DUP_READ_AFTER_CLOSE_ACTUAL] as i64
     );
 
+    crate::kprintln!(
+        "kernel: channel fragmented payload (channel_fragmented_create={}, channel_fragmented_tx_vmo_create={}, channel_fragmented_tx_map={}, channel_fragmented_rx_remap_vmo_create={}, channel_fragmented_rx_remap_map={}, channel_fragmented_rx_copy_vmo_create={}, channel_fragmented_rx_copy_map={}, channel_fragmented_write_remap={}, channel_fragmented_read_remap={}, channel_fragmented_actual_bytes_remap={}, channel_fragmented_match_remap={}, channel_fragmented_write_copy={}, channel_fragmented_read_copy={}, channel_fragmented_actual_bytes_copy={}, channel_fragmented_match_copy={})",
+        slots[SLOT_CHANNEL_FRAGMENTED_CREATE] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_TX_VMO_CREATE] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_TX_MAP] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_RX_REMAP_VMO_CREATE] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_RX_REMAP_MAP] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_RX_COPY_VMO_CREATE] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_RX_COPY_MAP] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_WRITE_REMAP] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_READ_REMAP] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_ACTUAL_BYTES_REMAP] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_MATCH_REMAP] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_WRITE_COPY] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_READ_COPY] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_ACTUAL_BYTES_COPY] as i64,
+        slots[SLOT_CHANNEL_FRAGMENTED_MATCH_COPY] as i64
+    );
+
     crate::arch::qemu::exit_success();
 }
 
@@ -1582,5 +1616,5 @@ core::arch::global_asm!(
     options(att_syntax)
 );
 
-// Compile-time witness: slot indices must fit in one page of u64 slots.
-const _: () = assert!(SLOT_MAX < 512);
+// Compile-time witness: slot indices must fit in the shared two-page u64 slot window.
+const _: () = assert!(SLOT_MAX < 1024);

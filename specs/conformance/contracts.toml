@@ -173,6 +173,14 @@ mode = "not_applicable"
 reason = "page-loan snapshot contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
+id = "must.channel.fragmented_payload_bootstrap"
+level = "must"
+description = "Bootstrap fragmented channel payloads must preserve mixed head/body/tail bytes across both exact-body remap reads and fallback-copy reads"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "fragmented channel loan/read contract; not modeled by the host-side concurrent harness"
+
+[[contracts]]
 id = "should.channel.page_loan_remap_fill_cow_bootstrap"
 level = "should"
 description = "Page-aligned bootstrap channel remap-fill reads should trigger one receiver-side COW split on first write, preserve the sender snapshot, and keep reverse-mapping cardinality stable across the split"

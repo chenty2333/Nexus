@@ -1,0 +1,31 @@
+id = "kernel.channel.fragmented_payload_bootstrap"
+description = "Bootstrap fragmented channel payloads preserve mixed head/body/tail bytes across exact-body remap and fallback-copy reads"
+tags = ["module:channel", "module:kernel", "module:mm", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok", "kernel: channel fragmented payload"]
+forbid = ["KERNEL PANIC"]
+contracts = ["must.channel.fragmented_payload_bootstrap"]
+
+[assertions.status_code]
+channel_fragmented_create = 0
+channel_fragmented_tx_vmo_create = 0
+channel_fragmented_tx_map = 0
+channel_fragmented_rx_remap_vmo_create = 0
+channel_fragmented_rx_remap_map = 0
+channel_fragmented_rx_copy_vmo_create = 0
+channel_fragmented_rx_copy_map = 0
+channel_fragmented_write_remap = 0
+channel_fragmented_read_remap = 0
+channel_fragmented_write_copy = 0
+channel_fragmented_read_copy = 0
+
+[assertions.packet_fields]
+channel_fragmented_actual_bytes_remap = 8192
+channel_fragmented_match_remap = 1
+channel_fragmented_actual_bytes_copy = 8192
+channel_fragmented_match_copy = 1

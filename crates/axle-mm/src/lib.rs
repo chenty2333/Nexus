@@ -2628,37 +2628,41 @@ impl AddressSpace {
         self.protect_in_vmar(self.root.vmar.id, base, len, new_perms)
     }
 
-    /// Arm an existing mapping for copy-on-write handling.
+    /// Arm an existing mapped range for copy-on-write handling.
     pub fn mark_copy_on_write(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
         validate_mapping_range(base, len)?;
-        let index = self
-            .vmas
-            .iter()
-            .position(|vma| vma.base == base && vma.len == len)
-            .ok_or(AddressSpaceError::NotFound)?;
-        let map_rec = self
-            .map_record(self.vmas[index].map_id)
-            .ok_or(AddressSpaceError::NotFound)?;
-        let vmo = self
-            .vmo(map_rec.vmo_id())
-            .ok_or(AddressSpaceError::InvalidVmo)?;
-        if !vmo.supports_copy_on_write() {
-            return Err(AddressSpaceError::InvalidArgs);
+        let page_count =
+            usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
+        let mut touched_vma_indices = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let page_base = base + (page_index as u64) * PAGE_SIZE;
+            let resolved = self
+                .resolve_page_state(page_base)
+                .ok_or(AddressSpaceError::NotFound)?;
+            let vmo = self
+                .vmo(resolved.map_rec.vmo_id())
+                .ok_or(AddressSpaceError::InvalidVmo)?;
+            if !vmo.supports_copy_on_write() {
+                return Err(AddressSpaceError::InvalidArgs);
+            }
+            if !resolved.map_rec.max_perms().contains(MappingPerms::WRITE) {
+                return Err(AddressSpaceError::PermissionIncrease);
+            }
+            if !touched_vma_indices.contains(&resolved.vma_index) {
+                touched_vma_indices.push(resolved.vma_index);
+            }
         }
-        let vma = self
-            .vmas
-            .get_mut(index)
-            .ok_or(AddressSpaceError::NotFound)?;
-        if !map_rec.max_perms().contains(MappingPerms::WRITE) {
-            return Err(AddressSpaceError::PermissionIncrease);
-        }
-        vma.perms.remove(MappingPerms::WRITE);
-        vma.copy_on_write = true;
-        let _ = vma;
         self.pte_meta.update_range(base, len, |meta| {
             meta.logical_write = true;
             meta.cow_shared = true;
         })?;
+        for index in touched_vma_indices {
+            let vma = self
+                .vmas
+                .get_mut(index)
+                .ok_or(AddressSpaceError::NotFound)?;
+            vma.copy_on_write = true;
+        }
         Ok(())
     }
 
@@ -3052,6 +3056,10 @@ impl AddressSpace {
         let vma = resolved.vma;
         let vmo = self.vmo(resolved.map_rec.vmo_id())?;
         let resolved_offset = resolved.map_rec.vmo_offset() + (va - resolved.map_rec.base());
+        let mut perms = vma.perms;
+        if !resolved.meta.logical_write() || resolved.meta.cow_shared() {
+            perms.remove(MappingPerms::WRITE);
+        }
         Some(VmaLookup {
             address_space_id: self.id,
             map_id: resolved.map_rec.id(),
@@ -3061,7 +3069,7 @@ impl AddressSpace {
             vmo_kind: vmo.kind(),
             vmo_offset: resolved_offset,
             frame_id: vmo.frame_at_offset(resolved_offset),
-            perms: vma.perms,
+            perms,
             max_perms: resolved.map_rec.max_perms(),
             copy_on_write: resolved.meta.cow_shared(),
             global_backed: vmo.is_global_backed(),
@@ -4945,6 +4953,54 @@ mod tests {
                 .unwrap()
                 .is_copy_on_write()
         );
+        assert!(space.vmas()[0].is_copy_on_write());
+    }
+
+    #[test]
+    fn mark_copy_on_write_accepts_subrange_of_larger_mapping() {
+        let mut frames = FrameTable::new();
+        let left = frames.register_existing(0xd0_000).unwrap();
+        let middle = frames.register_existing(0xe0_000).unwrap();
+        let right = frames.register_existing(0xf0_000).unwrap();
+
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE * 3, global_vmo_id(23))
+            .unwrap();
+        space.bind_vmo_frame(vmo, 0, left).unwrap();
+        space.bind_vmo_frame(vmo, PAGE_SIZE, middle).unwrap();
+        space.bind_vmo_frame(vmo, PAGE_SIZE * 2, right).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE * 3,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        space
+            .mark_copy_on_write(ROOT_BASE + PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+
+        let left_lookup = space.lookup(ROOT_BASE).unwrap();
+        assert!(!left_lookup.is_copy_on_write());
+        assert!(left_lookup.perms().contains(MappingPerms::WRITE));
+
+        let middle_lookup = space.lookup(ROOT_BASE + PAGE_SIZE).unwrap();
+        assert!(middle_lookup.is_copy_on_write());
+        assert!(!middle_lookup.perms().contains(MappingPerms::WRITE));
+
+        let right_lookup = space.lookup(ROOT_BASE + PAGE_SIZE * 2).unwrap();
+        assert!(!right_lookup.is_copy_on_write());
+        assert!(right_lookup.perms().contains(MappingPerms::WRITE));
+
+        let middle_meta = space.pte_meta(ROOT_BASE + PAGE_SIZE).unwrap();
+        assert!(middle_meta.logical_write());
+        assert!(middle_meta.cow_shared());
         assert!(space.vmas()[0].is_copy_on_write());
     }
 

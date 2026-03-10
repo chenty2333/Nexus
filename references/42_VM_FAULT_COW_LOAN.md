@@ -110,6 +110,9 @@ This keeps post-bind kernel I/O on VMO pages consistent with later unmap / resiz
   - reserves in-flight loan quota through one typed reservation
   - prepares sender/receiver address-space transaction state
   - arms sender-side COW and receiver-side remap behavior
+- Sender-side COW arming now works page-locally across the aligned loaned body range.
+  - the body no longer needs to be its own standalone mapping as long as the aligned page range is
+    fully covered by writable anonymous pages
 - The resulting loaned-page object is now a consuming ownership token.
   - frame pins and loan counts are no longer released through naked `dec_loan/unpin` pairs
   - releasing a channel payload consumes the loan object and tears down both the frame loan and the
@@ -118,6 +121,9 @@ This keeps post-bind kernel I/O on VMO pages consistent with later unmap / resiz
   - remap the loaned pages into the receiver buffer fast path
   - or fall back to a copy-fill path through the same internal copy service
 - Receiver-side remap is intentionally strict and expects a compatible writable anonymous destination mapping.
+  - for fragmented payloads, the remapped body still expects an exact anonymous destination-body
+    mapping span
+  - ordinary contiguous receiver buffers continue to work through the fallback-copy path
 - When remap replaces an existing anonymous destination frame, reverse-map now decides whether that
   replaced frame can retire immediately after the strict barrier or must stay alive for other
   mappings.
@@ -134,6 +140,9 @@ The current page-loan path is still not the full scatter design from the roadmap
 - head/tail fragments: supported as copied fragments, but not yet as dedicated fragment-page objects
 - mixed scatter descriptor: partially present through fragmented channel payloads, but not yet a general reusable VM scatter descriptor
 - Loaning is currently anonymous-only, resident-only, and page-granular.
+- Fragmented sender bodies can now be loaned out of subranges inside a larger anonymous mapping,
+  but receiver-side remap is still stricter than the fallback path and has not been generalized to
+  every compatible destination shape.
 
 This is the main gap between the current channel VM path and the intended final design.
 
