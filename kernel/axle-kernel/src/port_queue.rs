@@ -162,7 +162,7 @@ fn packet_from_port_packet(raw: zx_port_packet_t) -> Option<Packet> {
             let sig = zx_packet_signal_t::from_user(raw.user);
             Some(Packet::signal(
                 raw.key,
-                0,
+                0.into(),
                 Signals::from_bits(sig.trigger),
                 Signals::from_bits(sig.observed),
                 u32::try_from(sig.count).ok()?,

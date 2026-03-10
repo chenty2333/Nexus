@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use axle_core::{Packet, Signals, WaitAsyncOptions, WaitAsyncRegistration};
+use axle_core::{ObjectKey, Packet, Signals, WaitAsyncOptions, WaitAsyncRegistration};
 use axle_types::packet::ZX_PKT_TYPE_USER;
 use axle_types::status::{
     ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INVALID_ARGS, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT,
@@ -16,10 +16,14 @@ use axle_types::{zx_handle_t, zx_port_packet_t, zx_signals_t, zx_status_t};
 use crate::object::{self, KernelObject};
 use crate::port_queue::port_packet_from_core;
 
-fn queue_kernel_signal_packet(state: &object::KernelState, port_id: u64, packet: Packet) -> bool {
+fn queue_kernel_signal_packet(
+    state: &object::KernelState,
+    port_key: ObjectKey,
+    packet: Packet,
+) -> bool {
     state
         .with_registry_mut(|registry| {
-            let Some(KernelObject::Port(port)) = registry.objects.get_mut(&port_id) else {
+            let Some(KernelObject::Port(port)) = registry.get_mut(port_key) else {
                 return Ok(false);
             };
             Ok(port.queue_kernel(packet).is_ok())
@@ -29,10 +33,10 @@ fn queue_kernel_signal_packet(state: &object::KernelState, port_id: u64, packet:
 
 fn pop_port_packet_locked(
     state: &object::KernelState,
-    port_id: u64,
+    port_key: ObjectKey,
 ) -> Result<Packet, zx_status_t> {
     let packet = state.with_registry_mut(|registry| {
-        let Some(KernelObject::Port(port)) = registry.objects.get_mut(&port_id) else {
+        let Some(KernelObject::Port(port)) = registry.get_mut(port_key) else {
             return Err(ZX_ERR_BAD_STATE);
         };
         port.pop().map_err(object::map_port_error)
@@ -40,7 +44,7 @@ fn pop_port_packet_locked(
     state.with_reactor_mut(|reactor| {
         reactor
             .observers_mut()
-            .flush_port(port_id, |target_port_id, pending| {
+            .flush_port(port_key, |target_port_id, pending| {
                 queue_kernel_signal_packet(state, target_port_id, pending)
             });
         Ok(())
@@ -48,9 +52,12 @@ fn pop_port_packet_locked(
     Ok(packet)
 }
 
-fn port_current_signals(state: &object::KernelState, port_id: u64) -> Result<Signals, zx_status_t> {
+fn port_current_signals(
+    state: &object::KernelState,
+    port_key: ObjectKey,
+) -> Result<Signals, zx_status_t> {
     state.with_registry(|registry| {
-        let Some(KernelObject::Port(port)) = registry.objects.get(&port_id) else {
+        let Some(KernelObject::Port(port)) = registry.get(port_key) else {
             return Err(ZX_ERR_BAD_STATE);
         };
         Ok(port.signals())
@@ -59,15 +66,18 @@ fn port_current_signals(state: &object::KernelState, port_id: u64) -> Result<Sig
 
 fn publish_port_signals_changed(
     state: &object::KernelState,
-    port_id: u64,
+    port_key: ObjectKey,
 ) -> Result<(), zx_status_t> {
-    let current = port_current_signals(state, port_id)?;
-    publish_signals_changed(state, port_id, current)
+    let current = port_current_signals(state, port_key)?;
+    publish_signals_changed(state, port_key, current)
 }
 
-fn require_port_object(state: &object::KernelState, object_id: u64) -> Result<(), zx_status_t> {
+fn require_port_object(
+    state: &object::KernelState,
+    object_key: ObjectKey,
+) -> Result<(), zx_status_t> {
     state.with_registry(|registry| {
-        let obj = registry.objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        let obj = registry.get(object_key).ok_or(ZX_ERR_BAD_HANDLE)?;
         match obj {
             KernelObject::Port(_) => Ok(()),
             KernelObject::Process(_)
@@ -85,14 +95,11 @@ fn require_port_object(state: &object::KernelState, object_id: u64) -> Result<()
 
 fn queue_user_port_packet(
     state: &object::KernelState,
-    object_id: u64,
+    object_key: ObjectKey,
     packet: Packet,
 ) -> Result<(), zx_status_t> {
     state.with_registry_mut(|registry| {
-        let obj = registry
-            .objects
-            .get_mut(&object_id)
-            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        let obj = registry.get_mut(object_key).ok_or(ZX_ERR_BAD_HANDLE)?;
         let port = match obj {
             KernelObject::Port(port) => port,
             KernelObject::Process(_)
@@ -117,12 +124,12 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
 
     object::with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let object_id = resolved.object_id();
+        let object_key = resolved.object_key();
         object::require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
         let pkt = Packet::user_with_data(packet.key, packet.status, packet.user.u64);
-        queue_user_port_packet(state, object_id, pkt)?;
+        queue_user_port_packet(state, object_key, pkt)?;
 
-        publish_port_signals_changed(state, object_id)
+        publish_port_signals_changed(state, object_key)
     })
 }
 
@@ -130,11 +137,11 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
 pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_status_t> {
     object::with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let object_id = resolved.object_id();
-        require_port_object(state, object_id)?;
+        let object_key = resolved.object_key();
+        require_port_object(state, object_key)?;
         object::require_handle_rights(resolved, crate::task::HandleRights::READ)?;
-        let pkt = pop_port_packet_locked(state, object_id)?;
-        publish_port_signals_changed(state, object_id)?;
+        let pkt = pop_port_packet_locked(state, object_key)?;
+        publish_port_signals_changed(state, object_key)?;
         Ok(port_packet_from_core(pkt))
     })
 }
@@ -150,13 +157,13 @@ pub fn port_wait(
 ) -> Result<(), zx_status_t> {
     object::with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let object_id = resolved.object_id();
+        let object_key = resolved.object_key();
         let thread_id = state
             .with_kernel(|kernel| kernel.current_thread_info())?
             .thread_id();
-        require_port_object(state, object_id)?;
+        require_port_object(state, object_key)?;
         object::require_handle_rights(resolved, crate::task::HandleRights::READ)?;
-        let packet = pop_port_packet_locked(state, object_id);
+        let packet = pop_port_packet_locked(state, object_key);
 
         match packet {
             Ok(packet) => {
@@ -164,7 +171,7 @@ pub fn port_wait(
                 state.with_kernel_mut(|kernel| {
                     kernel.copyout_thread_user(thread_id, out_ptr, packet)
                 })?;
-                publish_port_signals_changed(state, object_id)
+                publish_port_signals_changed(state, object_key)
             }
             Err(ZX_ERR_SHOULD_WAIT) => {
                 if deadline == 0 {
@@ -177,14 +184,14 @@ pub fn port_wait(
                     let now = crate::time::now_ns();
                     if deadline <= now {
                         let _ = on_tick_locked(state);
-                        let packet = pop_port_packet_locked(state, object_id);
+                        let packet = pop_port_packet_locked(state, object_key);
                         return match packet {
                             Ok(packet) => {
                                 let packet = port_packet_from_core(packet);
                                 state.with_kernel_mut(|kernel| {
                                     kernel.copyout_thread_user(thread_id, out_ptr, packet)
                                 })?;
-                                publish_port_signals_changed(state, object_id)
+                                publish_port_signals_changed(state, object_key)
                             }
                             Err(ZX_ERR_SHOULD_WAIT) => Err(ZX_ERR_TIMED_OUT),
                             Err(err) => Err(err),
@@ -195,7 +202,7 @@ pub fn port_wait(
                 state.with_kernel_mut(|kernel| {
                     kernel.park_current(
                         crate::task::WaitRegistration::Port {
-                            port_object_id: object_id,
+                            port_object: object_key,
                             packet_ptr: out_ptr as u64,
                         },
                         deadline,
@@ -222,8 +229,8 @@ pub fn object_wait_one(
 
     object::with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
-        let object_id = resolved.object_id();
-        let observed = object::signals_for_object_id(state, object_id)?;
+        let object_key = resolved.object_key();
+        let observed = object::signals_for_object_id(state, object_key)?;
         let thread_id = state
             .with_kernel(|kernel| kernel.current_thread_info())?
             .thread_id();
@@ -236,7 +243,7 @@ pub fn object_wait_one(
 
         if deadline != i64::MAX && deadline <= crate::time::now_ns() {
             let _ = on_tick_locked(state);
-            let observed = object::signals_for_object_id(state, object_id)?;
+            let observed = object::signals_for_object_id(state, object_key)?;
             state.with_kernel_mut(|kernel| {
                 kernel.copyout_thread_user(thread_id, observed_ptr, observed.bits())
             })?;
@@ -254,7 +261,7 @@ pub fn object_wait_one(
         state.with_kernel_mut(|kernel| {
             kernel.park_current(
                 crate::task::WaitRegistration::Signal {
-                    object_id,
+                    object_key,
                     watched,
                     observed_ptr: observed_ptr as u64,
                 },
@@ -292,22 +299,22 @@ pub fn object_wait_async(
     object::with_state_mut(|state| {
         let waitable = state.lookup_handle(waitable, crate::task::HandleRights::WAIT)?;
         let resolved_port = state.lookup_handle(port_handle, crate::task::HandleRights::empty())?;
-        let waitable_id = waitable.object_id();
-        let port_id = resolved_port.object_id();
+        let waitable_key = waitable.object_key();
+        let port_key = resolved_port.object_key();
 
-        let current = object::signals_for_object_id(state, waitable_id)?;
+        let current = object::signals_for_object_id(state, waitable_key)?;
         let watched = Signals::from_bits(signals);
         let now = crate::time::now_ns();
 
-        require_port_object(state, port_id)?;
+        require_port_object(state, port_key)?;
         object::require_handle_rights(resolved_port, crate::task::HandleRights::WRITE)?;
         state.with_reactor_mut(|reactor| {
             reactor
                 .observers_mut()
                 .wait_async(
                     WaitAsyncRegistration {
-                        port: port_id,
-                        waitable: waitable_id,
+                        port: port_key,
+                        waitable: waitable_key,
                         key,
                         watched,
                         options,
@@ -321,7 +328,7 @@ pub fn object_wait_async(
                 .map_err(object::map_port_error)
         })?;
 
-        publish_port_signals_changed(state, port_id)
+        publish_port_signals_changed(state, port_key)
     })
 }
 
@@ -346,20 +353,20 @@ fn on_tick_locked(state: &object::KernelState) -> Result<(), zx_status_t> {
 
 pub(crate) fn publish_signals_changed(
     state: &object::KernelState,
-    waitable_id: u64,
+    waitable_key: ObjectKey,
     current: Signals,
 ) -> Result<(), zx_status_t> {
-    let mut pending = VecDeque::from([(waitable_id, current)]);
-    let mut queued = BTreeSet::from([waitable_id]);
+    let mut pending = VecDeque::from([(waitable_key, current)]);
+    let mut queued = BTreeSet::from([waitable_key]);
 
-    while let Some((current_waitable_id, current)) = pending.pop_front() {
-        let _ = queued.remove(&current_waitable_id);
+    while let Some((current_waitable_key, current)) = pending.pop_front() {
+        let _ = queued.remove(&current_waitable_key);
         let now = crate::time::now_ns();
-        wake_signal_waiters(state, current_waitable_id, current)?;
+        wake_signal_waiters(state, current_waitable_key, current)?;
 
         let changed_ports = state.with_reactor_mut(|reactor| {
             Ok(reactor.observers_mut().on_signals_changed(
-                current_waitable_id,
+                current_waitable_key,
                 current,
                 now,
                 |port_id, packet| queue_kernel_signal_packet(state, port_id, packet),
@@ -368,14 +375,14 @@ pub(crate) fn publish_signals_changed(
 
         if state.with_registry(|registry| {
             Ok(matches!(
-                registry.objects.get(&current_waitable_id),
+                registry.get(current_waitable_key),
                 Some(KernelObject::Port(_))
             ))
         })? {
-            wake_port_waiters(state, current_waitable_id)?;
-            let refreshed = port_current_signals(state, current_waitable_id)?;
-            if refreshed != current && queued.insert(current_waitable_id) {
-                pending.push_back((current_waitable_id, refreshed));
+            wake_port_waiters(state, current_waitable_key)?;
+            let refreshed = port_current_signals(state, current_waitable_key)?;
+            if refreshed != current && queued.insert(current_waitable_key) {
+                pending.push_back((current_waitable_key, refreshed));
             }
         }
 
@@ -391,11 +398,11 @@ pub(crate) fn publish_signals_changed(
 
 fn wake_signal_waiters(
     state: &object::KernelState,
-    waitable_id: u64,
+    waitable_key: ObjectKey,
     current: Signals,
 ) -> Result<(), zx_status_t> {
     let waiters =
-        state.with_kernel_mut(|kernel| Ok(kernel.signal_waiters_ready(waitable_id, current)))?;
+        state.with_kernel_mut(|kernel| Ok(kernel.signal_waiters_ready(waitable_key, current)))?;
     for waiter in waiters {
         let status = match state.with_kernel_mut(|kernel| {
             kernel.copyout_thread_user(waiter.thread_id(), waiter.observed_ptr(), current.bits())
@@ -415,14 +422,14 @@ fn wake_signal_waiters(
     Ok(())
 }
 
-fn wake_port_waiters(state: &object::KernelState, port_id: u64) -> Result<(), zx_status_t> {
-    let waiters = state.with_kernel_mut(|kernel| Ok(kernel.port_waiters(port_id)))?;
+fn wake_port_waiters(state: &object::KernelState, port_key: ObjectKey) -> Result<(), zx_status_t> {
+    let waiters = state.with_kernel_mut(|kernel| Ok(kernel.port_waiters(port_key)))?;
     if waiters.is_empty() {
         return Ok(());
     }
 
     for waiter in waiters {
-        let packet = match pop_port_packet_locked(state, port_id) {
+        let packet = match pop_port_packet_locked(state, port_key) {
             Ok(packet) => packet,
             Err(ZX_ERR_SHOULD_WAIT) => break,
             Err(err) => {
@@ -465,11 +472,11 @@ fn wake_expired_waits(
         let reason = match expired_wait.registration() {
             crate::task::WaitRegistration::Sleep => crate::task::WakeReason::Status(ZX_OK),
             crate::task::WaitRegistration::Signal {
-                object_id,
+                object_key,
                 watched,
                 observed_ptr,
             } => {
-                let observed = object::signals_for_object_id(state, object_id)?;
+                let observed = object::signals_for_object_id(state, object_key)?;
                 let status = match state.with_kernel_mut(|kernel| {
                     kernel.copyout_thread_user(
                         thread_id,
@@ -484,10 +491,10 @@ fn wake_expired_waits(
                 crate::task::WakeReason::Status(status)
             }
             crate::task::WaitRegistration::Port {
-                port_object_id,
+                port_object,
                 packet_ptr,
             } => {
-                let packet = pop_port_packet_locked(state, port_object_id);
+                let packet = pop_port_packet_locked(state, port_object);
                 let status = match packet {
                     Ok(packet) => {
                         let packet = port_packet_from_core(packet);
@@ -501,7 +508,7 @@ fn wake_expired_waits(
                             Ok(()) => ZX_OK,
                             Err(err) => err,
                         };
-                        let _ = publish_port_signals_changed(state, port_object_id);
+                        let _ = publish_port_signals_changed(state, port_object);
                         status
                     }
                     Err(ZX_ERR_SHOULD_WAIT) => ZX_ERR_TIMED_OUT,

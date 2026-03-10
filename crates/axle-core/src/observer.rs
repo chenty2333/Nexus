@@ -13,12 +13,13 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
+use crate::capability::ObjectKey;
 use crate::port::{Packet, PortError, PortKey, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId};
 use crate::signals::Signals;
 use crate::timer::Time;
 
 /// Identifier of one observing port.
-pub type ObserverPortId = u64;
+pub type ObserverPortId = ObjectKey;
 
 /// One async wait registration request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,11 +69,11 @@ impl ObserverRegistration {
     }
 
     const fn min_for_waitable(waitable: WaitableId) -> Self {
-        Self::new(waitable, 0, 0)
+        Self::new(waitable, ObjectKey::INVALID, 0)
     }
 
     const fn max_for_waitable(waitable: WaitableId) -> Self {
-        Self::new(waitable, u64::MAX, u64::MAX)
+        Self::new(waitable, ObjectKey::new(u64::MAX, u32::MAX), u64::MAX)
     }
 
     const fn min_for_port_pair(waitable: WaitableId, port: ObserverPortId) -> Self {
@@ -382,6 +383,10 @@ mod tests {
     use super::*;
     use crate::port::{PacketKind, Port};
 
+    fn key(id: u64) -> ObjectKey {
+        id.into()
+    }
+
     fn queue(port: &mut Port, packet: Packet) -> bool {
         port.queue_kernel(packet).is_ok()
     }
@@ -394,8 +399,8 @@ mod tests {
         registry
             .wait_async(
                 WaitAsyncRegistration {
-                    port: 10,
-                    waitable: 42,
+                    port: key(10),
+                    waitable: key(42),
                     key: 7,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -408,7 +413,7 @@ mod tests {
 
         let pkt = port.pop().unwrap();
         assert_eq!(pkt.kind, PacketKind::Signal);
-        assert_eq!(pkt.waitable, 42);
+        assert_eq!(pkt.waitable, key(42));
         assert_eq!(pkt.key, 7);
         assert_eq!(port.pop(), Err(PortError::ShouldWait));
     }
@@ -421,8 +426,8 @@ mod tests {
         registry
             .wait_async(
                 WaitAsyncRegistration {
-                    port: 10,
-                    waitable: 1,
+                    port: key(10),
+                    waitable: key(1),
                     key: 10,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -432,7 +437,7 @@ mod tests {
                 |_, packet| queue(&mut port, packet),
             )
             .unwrap();
-        registry.on_signals_changed(1, Signals::CHANNEL_READABLE, 101, |_, packet| {
+        registry.on_signals_changed(key(1), Signals::CHANNEL_READABLE, 101, |_, packet| {
             queue(&mut port, packet)
         });
         assert_eq!(port.len(), 1);
@@ -440,8 +445,8 @@ mod tests {
         registry
             .wait_async(
                 WaitAsyncRegistration {
-                    port: 10,
-                    waitable: 1,
+                    port: key(10),
+                    waitable: key(1),
                     key: 11,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions {
@@ -454,16 +459,16 @@ mod tests {
                 |_, packet| queue(&mut port, packet),
             )
             .unwrap();
-        registry.on_signals_changed(1, Signals::CHANNEL_READABLE, 201, |_, packet| {
+        registry.on_signals_changed(key(1), Signals::CHANNEL_READABLE, 201, |_, packet| {
             queue(&mut port, packet)
         });
-        registry.on_signals_changed(1, Signals::CHANNEL_READABLE, 202, |_, packet| {
+        registry.on_signals_changed(key(1), Signals::CHANNEL_READABLE, 202, |_, packet| {
             queue(&mut port, packet)
         });
 
         let first = port.pop().unwrap();
         assert_eq!(first.key, 10);
-        registry.flush_port(10, |_, packet| queue(&mut port, packet));
+        registry.flush_port(key(10), |_, packet| queue(&mut port, packet));
         let merged = port.pop().unwrap();
         assert_eq!(merged.kind, PacketKind::Signal);
         assert_eq!(merged.key, 11);
@@ -480,8 +485,8 @@ mod tests {
         registry
             .wait_async(
                 WaitAsyncRegistration {
-                    port: 10,
-                    waitable: 1,
+                    port: key(10),
+                    waitable: key(1),
                     key: 33,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions {
@@ -496,8 +501,10 @@ mod tests {
             .unwrap();
         assert_eq!(port.pop(), Err(PortError::ShouldWait));
 
-        registry.on_signals_changed(1, Signals::NONE, 301, |_, packet| queue(&mut port, packet));
-        registry.on_signals_changed(1, Signals::CHANNEL_READABLE, 302, |_, packet| {
+        registry.on_signals_changed(key(1), Signals::NONE, 301, |_, packet| {
+            queue(&mut port, packet)
+        });
+        registry.on_signals_changed(key(1), Signals::CHANNEL_READABLE, 302, |_, packet| {
             queue(&mut port, packet)
         });
 
@@ -515,8 +522,8 @@ mod tests {
         registry
             .wait_async(
                 WaitAsyncRegistration {
-                    port: 10,
-                    waitable: 5,
+                    port: key(10),
+                    waitable: key(5),
                     key: 9,
                     watched: Signals::TIMER_SIGNALED,
                     options: WaitAsyncOptions::default(),
@@ -529,8 +536,8 @@ mod tests {
         assert_eq!(
             registry.wait_async(
                 WaitAsyncRegistration {
-                    port: 10,
-                    waitable: 5,
+                    port: key(10),
+                    waitable: key(5),
                     key: 9,
                     watched: Signals::TIMER_SIGNALED,
                     options: WaitAsyncOptions::default(),
@@ -551,8 +558,8 @@ mod tests {
         registry
             .wait_async(
                 WaitAsyncRegistration {
-                    port: 10,
-                    waitable: 7,
+                    port: key(10),
+                    waitable: key(7),
                     key: 1,
                     watched: Signals::TIMER_SIGNALED,
                     options: WaitAsyncOptions::default(),
@@ -562,8 +569,8 @@ mod tests {
                 |_, packet| queue(&mut port, packet),
             )
             .unwrap();
-        registry.remove_port(10);
-        registry.on_signals_changed(7, Signals::TIMER_SIGNALED, 1, |_, packet| {
+        registry.remove_port(key(10));
+        registry.on_signals_changed(key(7), Signals::TIMER_SIGNALED, 1, |_, packet| {
             queue(&mut port, packet)
         });
         assert_eq!(port.pop(), Err(PortError::ShouldWait));

@@ -723,6 +723,8 @@ vmar_allocate_align_done:
 	int $0x80
 	add $8, %rsp
 	mov %rax, 8*371(%rbx)
+	mov 0x1970(%rbx), %rax
+	mov %rax, 0x1a30(%rbx)
 
 // vmo_create(far-range mapping)
 lea 0x16f0(%rbx), %rdx
@@ -2540,6 +2542,27 @@ process_child_image_ready:
 	jne process_lazy_shared_done
 	movq $1, 8*385(%rbx)
 process_lazy_shared_done:
+
+	// vmar_map(destroyed child handle) should now report BAD_HANDLE.
+	mov 0x1a30(%rbx), %rdi
+	movl $0x403, %esi
+	xor %edx, %edx
+	mov 0x16d0(%rbx), %r10
+	xor %r8, %r8
+	movabs $0x1000, %r9
+	lea 0x1a28(%rbx), %rax
+	sub $8, %rsp
+	mov %rax, (%rsp)
+	movabs $10, %rax
+	int $0x80
+	add $8, %rsp
+	mov %rax, 8*506(%rbx)
+
+	// handle_close(destroyed child handle) should still succeed once.
+	mov 0x1a30(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+	mov %rax, 8*511(%rbx)
 
 	// --- same-page fault contention: shared LazyVmo across address spaces ----
 

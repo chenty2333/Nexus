@@ -11,13 +11,15 @@
 
 use alloc::collections::VecDeque;
 
+use crate::capability::ObjectKey;
 use crate::signals::Signals;
 use crate::timer::Time;
 
-/// Identifier for a waitable object.
+/// Identifier for one waitable object incarnation.
 ///
-/// In kernel this corresponds to a global object id / koid. In host tests we just use `u64`.
-pub type WaitableId = u64;
+/// In kernel this corresponds to `(object_id, generation)`. Host tests may keep the generation at
+/// zero when they do not model slot reuse.
+pub type WaitableId = ObjectKey;
 
 /// Key associated with a port packet (Zircon's `key` field).
 pub type PortKey = u64;
@@ -67,7 +69,7 @@ impl Packet {
         Self {
             key,
             kind: PacketKind::User,
-            waitable: 0,
+            waitable: ObjectKey::INVALID,
             trigger: Signals::NONE,
             observed: Signals::NONE,
             count: 0,
@@ -348,7 +350,7 @@ mod tests {
         assert_eq!(port.len(), 2);
         port.queue_kernel(Packet::signal(
             7,
-            42,
+            42.into(),
             Signals::CHANNEL_READABLE,
             Signals::CHANNEL_READABLE,
             1,
@@ -364,7 +366,7 @@ mod tests {
         port.queue_user(Packet::user(1)).unwrap();
         port.queue_kernel(Packet::signal(
             2,
-            10,
+            10.into(),
             Signals::TIMER_SIGNALED,
             Signals::TIMER_SIGNALED,
             1,
@@ -374,7 +376,7 @@ mod tests {
         assert_eq!(
             port.queue_kernel(Packet::signal(
                 3,
-                10,
+                10.into(),
                 Signals::TIMER_SIGNALED,
                 Signals::TIMER_SIGNALED,
                 1,

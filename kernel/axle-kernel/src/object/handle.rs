@@ -1,21 +1,23 @@
 use super::*;
 
 impl KernelState {
+    pub(super) fn resolve_handle_raw(
+        &self,
+        raw: zx_handle_t,
+    ) -> Result<crate::task::ResolvedHandle, zx_status_t> {
+        self.with_core(|kernel| {
+            kernel.lookup_current_handle(raw, crate::task::HandleRights::empty())
+        })
+    }
+
     pub(super) fn alloc_handle_for_object(
         &self,
-        object_id: u64,
+        object_key: ObjectKey,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
-        let cap = self.capability_for_object(object_id, rights);
+        let cap = self.capability_for_object(object_key, rights);
         let handle = self.with_core_mut(|kernel| kernel.alloc_handle_for_current_process(cap))?;
-        self.with_registry_mut(|registry| {
-            registry
-                .object_handle_refs
-                .entry(object_id)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            Ok(())
-        })?;
+        self.with_registry_mut(|registry| registry.increment_handle_ref(object_key))?;
         Ok(handle)
     }
 
@@ -24,15 +26,24 @@ impl KernelState {
         raw: zx_handle_t,
         required_rights: crate::task::HandleRights,
     ) -> Result<crate::task::ResolvedHandle, zx_status_t> {
-        self.with_core(|kernel| kernel.lookup_current_handle(raw, required_rights))
+        let resolved = self.with_core(|kernel| {
+            kernel.lookup_current_handle(raw, crate::task::HandleRights::empty())
+        })?;
+        self.with_registry(|registry| {
+            if registry.get(resolved.object_key()).is_some() {
+                Ok(())
+            } else {
+                Err(ZX_ERR_BAD_HANDLE)
+            }
+        })?;
+        require_handle_rights(resolved, required_rights)?;
+        Ok(resolved)
     }
 
     pub(super) fn close_handle(&self, raw: zx_handle_t) -> Result<(), zx_status_t> {
-        let object_id = self
-            .lookup_handle(raw, crate::task::HandleRights::empty())?
-            .object_id();
+        let object_key = self.resolve_handle_raw(raw)?.object_key();
         self.with_core_mut(|kernel| kernel.close_current_handle(raw))?;
-        self.decrement_object_handle_ref(object_id);
+        self.decrement_object_handle_ref(object_key);
         Ok(())
     }
 
@@ -41,18 +52,11 @@ impl KernelState {
         raw: zx_handle_t,
         rights: crate::task::HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
-        let object_id = self
+        let object_key = self
             .lookup_handle(raw, crate::task::HandleRights::empty())?
-            .object_id();
+            .object_key();
         let handle = self.with_core_mut(|kernel| kernel.duplicate_current_handle(raw, rights))?;
-        self.with_registry_mut(|registry| {
-            registry
-                .object_handle_refs
-                .entry(object_id)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            Ok(())
-        })?;
+        self.with_registry_mut(|registry| registry.increment_handle_ref(object_key))?;
         Ok(handle)
     }
 
@@ -69,6 +73,7 @@ impl KernelState {
         raw: zx_handle_t,
         rights: crate::task::HandleRights,
     ) -> Result<TransferredCap, zx_status_t> {
+        let _ = self.lookup_handle(raw, rights)?;
         self.with_core(|kernel| kernel.snapshot_current_handle_for_transfer(raw, rights))
     }
 
@@ -76,14 +81,14 @@ impl KernelState {
         &self,
         transferred: TransferredCap,
     ) -> Result<zx_handle_t, zx_status_t> {
-        let object_id = transferred.capability().object_id();
+        let object_key = transferred.capability().object_key();
         let current_process_id = self.with_core(|kernel| {
             kernel
                 .current_process_info()
                 .map(|process| process.process_id())
         })?;
         let vmo_to_promote = self.with_registry(|registry| {
-            Ok(match registry.objects.get(&object_id) {
+            Ok(match registry.get(object_key) {
                 Some(KernelObject::Vmo(vmo))
                     if matches!(vmo.backing_scope(), VmoBackingScope::LocalPrivate { .. })
                         && vmo.creator_process_id() != current_process_id =>
@@ -97,8 +102,7 @@ impl KernelState {
             let promoted = self.with_vm_mut(|vm| vm.promote_vmo_object_to_shared(&vmo))?;
             if promoted {
                 self.with_registry_mut(|registry| {
-                    let Some(KernelObject::Vmo(vmo_object)) = registry.objects.get_mut(&object_id)
-                    else {
+                    let Some(KernelObject::Vmo(vmo_object)) = registry.get_mut(object_key) else {
                         return Err(ZX_ERR_BAD_STATE);
                     };
                     vmo_object.backing_scope = VmoBackingScope::GlobalShared;
@@ -108,39 +112,18 @@ impl KernelState {
         }
         let handle =
             self.with_core_mut(|kernel| kernel.install_handle_in_current_process(transferred))?;
-        self.with_registry_mut(|registry| {
-            registry
-                .object_handle_refs
-                .entry(object_id)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            Ok(())
-        })?;
+        self.with_registry_mut(|registry| registry.increment_handle_ref(object_key))?;
         Ok(handle)
     }
 
-    pub(super) fn object_handle_count(&self, object_id: u64) -> usize {
-        self.registry
-            .lock()
-            .object_handle_refs
-            .get(&object_id)
-            .copied()
-            .unwrap_or(0)
+    pub(super) fn object_handle_count(&self, object_key: ObjectKey) -> usize {
+        self.registry.lock().handle_refcount(object_key)
     }
 
-    pub(super) fn forget_object_handle_refs(&self, object_id: u64) {
-        let _ = self.registry.lock().object_handle_refs.remove(&object_id);
-    }
+    pub(super) fn forget_object_handle_refs(&self, _object_key: ObjectKey) {}
 
-    pub(super) fn decrement_object_handle_ref(&self, object_id: u64) {
-        let mut registry = self.registry.lock();
-        match registry.object_handle_refs.get_mut(&object_id) {
-            Some(count) if *count > 1 => *count -= 1,
-            Some(_) => {
-                registry.object_handle_refs.remove(&object_id);
-            }
-            None => {}
-        }
+    pub(super) fn decrement_object_handle_ref(&self, object_key: ObjectKey) {
+        self.registry.lock().decrement_handle_ref(object_key);
     }
 }
 

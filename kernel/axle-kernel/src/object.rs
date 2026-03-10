@@ -11,7 +11,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use axle_core::{Capability, PortError, Signals, TimerError, TimerId, TransferredCap};
+use axle_core::{Capability, ObjectKey, PortError, Signals, TimerError, TimerId, TransferredCap};
 use axle_mm::{MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
@@ -102,7 +102,7 @@ struct ChannelMessage {
 
 #[derive(Debug)]
 pub(crate) struct ChannelEndpoint {
-    peer_object_id: u64,
+    peer_object: ObjectKey,
     owner_process_id: u64,
     messages: VecDeque<ChannelMessage>,
     peer_closed: bool,
@@ -110,9 +110,9 @@ pub(crate) struct ChannelEndpoint {
 }
 
 impl ChannelEndpoint {
-    fn new(peer_object_id: u64, owner_process_id: u64) -> Self {
+    fn new(peer_object: ObjectKey, owner_process_id: u64) -> Self {
         Self {
-            peer_object_id,
+            peer_object,
             owner_process_id,
             messages: VecDeque::new(),
             peer_closed: false,
@@ -167,16 +167,16 @@ impl ChannelMessage {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EventPairEndpoint {
-    peer_object_id: u64,
+    peer_object: ObjectKey,
     user_signals: Signals,
     peer_closed: bool,
     closed: bool,
 }
 
 impl EventPairEndpoint {
-    fn new(peer_object_id: u64) -> Self {
+    fn new(peer_object: ObjectKey) -> Self {
         Self {
-            peer_object_id,
+            peer_object,
             user_signals: Signals::NONE,
             peer_closed: false,
             closed: false,
@@ -193,7 +193,7 @@ enum SocketSide {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SocketEndpoint {
     core_id: u64,
-    peer_object_id: u64,
+    peer_object: ObjectKey,
     side: SocketSide,
 }
 
@@ -492,45 +492,39 @@ const USER_SIGNAL_MASK: Signals = Signals::USER_SIGNAL_0
     .union(Signals::USER_SIGNAL_6)
     .union(Signals::USER_SIGNAL_7);
 
-#[derive(Debug)]
-struct ObjectIdentityAllocator {
-    next_object_id: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectSlotState {
+    Live,
+    Dying,
+    Retired,
 }
 
-impl ObjectIdentityAllocator {
-    const NON_REUSED_OBJECT_GENERATION: u32 = 0;
+#[derive(Debug)]
+struct ObjectSlot {
+    generation: u32,
+    state: ObjectSlotState,
+    handle_refcount: usize,
+    kernel_refcount: usize,
+    payload: Option<KernelObject>,
+}
 
-    fn new() -> Self {
-        Self { next_object_id: 1 }
-    }
-
-    fn alloc(&mut self) -> u64 {
-        let id = self.next_object_id;
-        self.next_object_id = self.next_object_id.wrapping_add(1);
-        id
-    }
-
-    fn capability_for_object(&self, object_id: u64, rights: u32) -> Capability {
-        Capability::new(
-            object_id,
-            rights,
-            Self::generation_for_allocated_object(object_id),
-        )
-    }
-
-    const fn generation_for_allocated_object(_object_id: u64) -> u32 {
-        // Current contract: object ids are monotonic and never recycled, so the
-        // capability generation field stays at zero until reuse semantics exist.
-        Self::NON_REUSED_OBJECT_GENERATION
+impl ObjectSlot {
+    fn reserved_live(generation: u32) -> Self {
+        Self {
+            generation,
+            state: ObjectSlotState::Live,
+            handle_refcount: 0,
+            kernel_refcount: 0,
+            payload: None,
+        }
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct ObjectRegistry {
-    pub(crate) objects: BTreeMap<u64, KernelObject>,
-    object_handle_refs: BTreeMap<u64, usize>,
-    identities: ObjectIdentityAllocator,
-    timer_object_ids: BTreeMap<TimerId, u64>,
+    slots: Vec<ObjectSlot>,
+    free_slots: VecDeque<usize>,
+    timer_object_ids: BTreeMap<TimerId, ObjectKey>,
     bootstrap_self_process_handle: zx_handle_t,
     bootstrap_root_vmar_handle: zx_handle_t,
     bootstrap_self_thread_handle: zx_handle_t,
@@ -541,9 +535,8 @@ pub(crate) struct ObjectRegistry {
 impl ObjectRegistry {
     fn new() -> Self {
         Self {
-            objects: BTreeMap::new(),
-            object_handle_refs: BTreeMap::new(),
-            identities: ObjectIdentityAllocator::new(),
+            slots: Vec::new(),
+            free_slots: VecDeque::new(),
             timer_object_ids: BTreeMap::new(),
             bootstrap_self_process_handle: 0,
             bootstrap_root_vmar_handle: 0,
@@ -552,6 +545,255 @@ impl ObjectRegistry {
             bootstrap_process_image_layout: crate::task::ProcessImageLayout::bootstrap_conformance(
             ),
         }
+    }
+
+    fn slot_index(object_id: u64) -> Option<usize> {
+        usize::try_from(object_id.checked_sub(1)?).ok()
+    }
+
+    fn key_matches(slot: &ObjectSlot, key: ObjectKey) -> bool {
+        slot.generation == key.generation()
+    }
+
+    fn object_key_for_slot(index: usize, slot: &ObjectSlot) -> Option<ObjectKey> {
+        let object_id = u64::try_from(index.checked_add(1)?).ok()?;
+        Some(ObjectKey::new(object_id, slot.generation))
+    }
+
+    fn reserve_object_key(&mut self) -> ObjectKey {
+        if let Some(index) = self.free_slots.pop_front() {
+            let slot = &mut self.slots[index];
+            debug_assert!(matches!(slot.state, ObjectSlotState::Retired));
+            debug_assert!(slot.payload.is_none());
+            debug_assert_eq!(slot.handle_refcount, 0);
+            debug_assert_eq!(slot.kernel_refcount, 0);
+            *slot = ObjectSlot::reserved_live(slot.generation);
+            return Self::object_key_for_slot(index, slot)
+                .expect("retired slot index must encode to object key");
+        }
+
+        let generation = 0;
+        self.slots.push(ObjectSlot::reserved_live(generation));
+        let index = self
+            .slots
+            .len()
+            .checked_sub(1)
+            .expect("pushed slot must leave one index");
+        Self::object_key_for_slot(index, &self.slots[index])
+            .expect("new slot index must encode to object key")
+    }
+
+    fn publish_reserved_object(
+        &mut self,
+        key: ObjectKey,
+        object: KernelObject,
+    ) -> Result<(), zx_status_t> {
+        let slot = self.slot_any_mut(key).ok_or(ZX_ERR_BAD_HANDLE)?;
+        if !matches!(slot.state, ObjectSlotState::Live) {
+            return Err(ZX_ERR_BAD_HANDLE);
+        }
+        if slot.payload.is_some() {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        slot.payload = Some(object);
+        Ok(())
+    }
+
+    fn discard_reserved_object(&mut self, key: ObjectKey) {
+        let Some(index) = Self::slot_index(key.object_id()) else {
+            return;
+        };
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        if !Self::key_matches(slot, key)
+            || !matches!(slot.state, ObjectSlotState::Live)
+            || slot.payload.is_some()
+        {
+            return;
+        }
+        slot.state = ObjectSlotState::Dying;
+        self.maybe_retire(index);
+    }
+
+    pub(crate) fn get(&self, key: ObjectKey) -> Option<&KernelObject> {
+        self.slot_live(key)?.payload.as_ref()
+    }
+
+    pub(crate) fn get_mut(&mut self, key: ObjectKey) -> Option<&mut KernelObject> {
+        self.slot_mut_live(key)?.payload.as_mut()
+    }
+
+    fn get_any(&self, key: ObjectKey) -> Option<&KernelObject> {
+        self.slot_any(key)?.payload.as_ref()
+    }
+
+    fn get_any_mut(&mut self, key: ObjectKey) -> Option<&mut KernelObject> {
+        self.slot_any_mut(key)?.payload.as_mut()
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        key: ObjectKey,
+        object: KernelObject,
+    ) -> Result<(), zx_status_t> {
+        self.publish_reserved_object(key, object)
+    }
+
+    pub(crate) fn remove(&mut self, key: ObjectKey) -> Option<KernelObject> {
+        let index = Self::slot_index(key.object_id())?;
+        let slot = self.slot_any_mut(key)?;
+        let payload = slot.payload.take()?;
+        slot.state = ObjectSlotState::Dying;
+        self.maybe_retire(index);
+        Some(payload)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (ObjectKey, &KernelObject)> {
+        self.iter_live()
+    }
+
+    fn live_key_for_object_id(&self, object_id: u64) -> Option<ObjectKey> {
+        let slot = self.slots.get(Self::slot_index(object_id)?)?;
+        if !matches!(slot.state, ObjectSlotState::Live) || slot.payload.is_none() {
+            return None;
+        }
+        Self::object_key_for_slot(Self::slot_index(object_id)?, slot)
+    }
+
+    fn capability_for_object(
+        &self,
+        key: ObjectKey,
+        rights: crate::task::HandleRights,
+    ) -> Capability {
+        Capability::new(key.object_id(), rights.bits(), key.generation())
+    }
+
+    fn begin_logical_destroy(&mut self, key: ObjectKey) -> Result<KernelObject, zx_status_t> {
+        let slot = self.slot_mut_live(key).ok_or(ZX_ERR_BAD_HANDLE)?;
+        slot.state = ObjectSlotState::Dying;
+        slot.payload.take().ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    fn finish_logical_destroy(&mut self, key: ObjectKey) {
+        let Some(index) = Self::slot_index(key.object_id()) else {
+            return;
+        };
+        let Some(slot) = self.slots.get(index) else {
+            return;
+        };
+        if !Self::key_matches(slot, key) {
+            return;
+        }
+        self.maybe_retire(index);
+    }
+
+    fn increment_handle_ref(&mut self, key: ObjectKey) -> Result<(), zx_status_t> {
+        let slot = self.slot_any_mut(key).ok_or(ZX_ERR_BAD_HANDLE)?;
+        slot.handle_refcount = slot.handle_refcount.saturating_add(1);
+        Ok(())
+    }
+
+    fn decrement_handle_ref(&mut self, key: ObjectKey) {
+        let Some(index) = Self::slot_index(key.object_id()) else {
+            return;
+        };
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        if !Self::key_matches(slot, key) {
+            return;
+        }
+        if slot.handle_refcount != 0 {
+            slot.handle_refcount -= 1;
+        }
+        self.maybe_retire(index);
+    }
+
+    pub(crate) fn handle_refcount(&self, key: ObjectKey) -> usize {
+        self.slot_any(key)
+            .map(|slot| slot.handle_refcount)
+            .unwrap_or(0)
+    }
+
+    fn retain_kernel_ref(&mut self, key: ObjectKey) -> Result<(), zx_status_t> {
+        let slot = self.slot_any_mut(key).ok_or(ZX_ERR_BAD_HANDLE)?;
+        slot.kernel_refcount = slot.kernel_refcount.saturating_add(1);
+        Ok(())
+    }
+
+    fn release_kernel_ref(&mut self, key: ObjectKey) {
+        let Some(index) = Self::slot_index(key.object_id()) else {
+            return;
+        };
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        if !Self::key_matches(slot, key) {
+            return;
+        }
+        if slot.kernel_refcount != 0 {
+            slot.kernel_refcount -= 1;
+        }
+        self.maybe_retire(index);
+    }
+
+    fn iter_live(&self) -> impl Iterator<Item = (ObjectKey, &KernelObject)> {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            if !matches!(slot.state, ObjectSlotState::Live) {
+                return None;
+            }
+            let payload = slot.payload.as_ref()?;
+            Some((Self::object_key_for_slot(index, slot)?, payload))
+        })
+    }
+
+    fn slot_live(&self, key: ObjectKey) -> Option<&ObjectSlot> {
+        let slot = self.slot_any(key)?;
+        if !matches!(slot.state, ObjectSlotState::Live) || slot.payload.is_none() {
+            return None;
+        }
+        Some(slot)
+    }
+
+    fn slot_mut_live(&mut self, key: ObjectKey) -> Option<&mut ObjectSlot> {
+        let slot = self.slot_any_mut(key)?;
+        if !matches!(slot.state, ObjectSlotState::Live) || slot.payload.is_none() {
+            return None;
+        }
+        Some(slot)
+    }
+
+    fn slot_any(&self, key: ObjectKey) -> Option<&ObjectSlot> {
+        let slot = self.slots.get(Self::slot_index(key.object_id())?)?;
+        if !Self::key_matches(slot, key) || matches!(slot.state, ObjectSlotState::Retired) {
+            return None;
+        }
+        Some(slot)
+    }
+
+    fn slot_any_mut(&mut self, key: ObjectKey) -> Option<&mut ObjectSlot> {
+        let slot = self.slots.get_mut(Self::slot_index(key.object_id())?)?;
+        if !Self::key_matches(slot, key) || matches!(slot.state, ObjectSlotState::Retired) {
+            return None;
+        }
+        Some(slot)
+    }
+
+    fn maybe_retire(&mut self, index: usize) {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        if !matches!(slot.state, ObjectSlotState::Dying)
+            || slot.payload.is_some()
+            || slot.handle_refcount != 0
+            || slot.kernel_refcount != 0
+        {
+            return;
+        }
+        slot.state = ObjectSlotState::Retired;
+        slot.generation = slot.generation.wrapping_add(1);
+        self.free_slots.push_back(index);
     }
 }
 
@@ -606,13 +848,13 @@ impl KernelState {
         let process_object_id = state.alloc_object_id();
         state
             .with_registry_mut(|registry| {
-                registry.objects.insert(
+                registry.insert(
                     process_object_id,
                     KernelObject::Process(ProcessObject {
                         process_id: process.process_id(),
                         koid: process_koid,
                     }),
-                );
+                )?;
                 Ok(())
             })
             .expect("bootstrap process object insert must succeed");
@@ -632,7 +874,7 @@ impl KernelState {
         let root_vmar_object_id = state.alloc_object_id();
         state
             .with_registry_mut(|registry| {
-                registry.objects.insert(
+                registry.insert(
                     root_vmar_object_id,
                     KernelObject::Vmar(VmarObject {
                         process_id: root.process_id(),
@@ -642,7 +884,7 @@ impl KernelState {
                         len: root.len(),
                         mapping_caps: vm::root_vmar_mapping_caps(),
                     }),
-                );
+                )?;
                 Ok(())
             })
             .expect("bootstrap root vmar object insert must succeed");
@@ -662,14 +904,14 @@ impl KernelState {
         let thread_object_id = state.alloc_object_id();
         state
             .with_registry_mut(|registry| {
-                registry.objects.insert(
+                registry.insert(
                     thread_object_id,
                     KernelObject::Thread(ThreadObject {
                         process_id: thread.process_id(),
                         thread_id: thread.thread_id(),
                         koid: thread.koid(),
                     }),
-                );
+                )?;
                 Ok(())
             })
             .expect("bootstrap thread object insert must succeed");
@@ -701,7 +943,7 @@ impl KernelState {
             let code_vmo_object_id = state.alloc_object_id();
             state
                 .with_registry_mut(|registry| {
-                    registry.objects.insert(
+                    registry.insert(
                         code_vmo_object_id,
                         KernelObject::Vmo(VmoObject {
                             creator_process_id: imported.code_vmo().process_id(),
@@ -716,7 +958,7 @@ impl KernelState {
                                     .expect("bootstrap code image layout must rebase"),
                             ),
                         }),
-                    );
+                    )?;
                     Ok(())
                 })
                 .expect("bootstrap code vmo object insert must succeed");
@@ -734,34 +976,61 @@ impl KernelState {
         state
     }
 
-    fn alloc_object_id(&self) -> u64 {
+    fn reserve_object_key(&self) -> ObjectKey {
         let mut registry = self.registry.lock();
-        registry.identities.alloc()
+        registry.reserve_object_key()
+    }
+
+    fn alloc_object_id(&self) -> ObjectKey {
+        self.reserve_object_key()
+    }
+
+    fn publish_reserved_object(
+        &self,
+        key: ObjectKey,
+        object: KernelObject,
+    ) -> Result<(), zx_status_t> {
+        self.with_registry_mut(|registry| registry.publish_reserved_object(key, object))
+    }
+
+    fn discard_reserved_object(&self, key: ObjectKey) {
+        self.registry.lock().discard_reserved_object(key);
     }
 
     fn capability_for_object(
         &self,
-        object_id: u64,
+        key: ObjectKey,
         rights: crate::task::HandleRights,
     ) -> Capability {
         let registry = self.registry.lock();
-        debug_assert!(registry.objects.contains_key(&object_id));
-        registry
-            .identities
-            .capability_for_object(object_id, rights.bits())
+        debug_assert!(registry.get(key).is_some());
+        registry.capability_for_object(key, rights)
     }
 
-    fn note_timer_object(&self, timer_id: TimerId, object_id: u64) {
-        let mut registry = self.registry.lock();
-        let _ = registry.timer_object_ids.insert(timer_id, object_id);
+    fn begin_logical_destroy(&self, key: ObjectKey) -> Result<KernelObject, zx_status_t> {
+        self.with_registry_mut(|registry| registry.begin_logical_destroy(key))
+    }
+
+    fn finish_logical_destroy(&self, key: ObjectKey) {
+        self.registry.lock().finish_logical_destroy(key);
+    }
+
+    fn note_timer_object(&self, timer_id: TimerId, key: ObjectKey) -> Result<(), zx_status_t> {
+        self.with_registry_mut(|registry| {
+            registry.retain_kernel_ref(key)?;
+            let _ = registry.timer_object_ids.insert(timer_id, key);
+            Ok(())
+        })
     }
 
     fn forget_timer_object(&self, timer_id: TimerId) {
         let mut registry = self.registry.lock();
-        let _ = registry.timer_object_ids.remove(&timer_id);
+        if let Some(key) = registry.timer_object_ids.remove(&timer_id) {
+            registry.release_kernel_ref(key);
+        }
     }
 
-    fn timer_object_id(&self, timer_id: TimerId) -> Option<u64> {
+    fn timer_object_key(&self, timer_id: TimerId) -> Option<ObjectKey> {
         self.registry
             .lock()
             .timer_object_ids
@@ -787,16 +1056,16 @@ impl KernelState {
 
     pub(crate) fn with_objects<T>(
         &self,
-        f: impl FnOnce(&BTreeMap<u64, KernelObject>) -> Result<T, zx_status_t>,
+        f: impl FnOnce(&ObjectRegistry) -> Result<T, zx_status_t>,
     ) -> Result<T, zx_status_t> {
-        self.with_registry(|registry| f(&registry.objects))
+        self.with_registry(f)
     }
 
     pub(crate) fn with_objects_mut<T>(
         &self,
-        f: impl FnOnce(&mut BTreeMap<u64, KernelObject>) -> Result<T, zx_status_t>,
+        f: impl FnOnce(&mut ObjectRegistry) -> Result<T, zx_status_t>,
     ) -> Result<T, zx_status_t> {
-        self.with_registry_mut(|registry| f(&mut registry.objects))
+        self.with_registry_mut(f)
     }
 
     pub(crate) fn with_transport<T>(
@@ -1023,7 +1292,7 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
             KernelPort::new(kernel, PORT_CAPACITY, PORT_KERNEL_RESERVE)
         })?;
         state.with_objects_mut(|objects| {
-            objects.insert(object_id, KernelObject::Port(port));
+            objects.insert(object_id, KernelObject::Port(port))?;
             Ok(())
         })?;
 
@@ -1031,7 +1300,7 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
             Ok(h) => Ok(h),
             Err(e) => {
                 if let Some(KernelObject::Port(port)) =
-                    state.with_objects_mut(|objects| Ok(objects.remove(&object_id)))?
+                    state.with_objects_mut(|objects| Ok(objects.remove(object_id)))?
                 {
                     let _ = state.with_kernel_mut(|kernel| port.destroy(kernel));
                 }
@@ -1054,11 +1323,11 @@ pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_s
             objects.insert(
                 left_object_id,
                 KernelObject::EventPair(EventPairEndpoint::new(right_object_id)),
-            );
+            )?;
             objects.insert(
                 right_object_id,
                 KernelObject::EventPair(EventPairEndpoint::new(left_object_id)),
-            );
+            )?;
             Ok(())
         })?;
 
@@ -1068,8 +1337,8 @@ pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_s
             Ok(handle) => handle,
             Err(e) => {
                 let _ = state.with_objects_mut(|objects| {
-                    let _ = objects.remove(&left_object_id);
-                    let _ = objects.remove(&right_object_id);
+                    let _ = objects.remove(left_object_id);
+                    let _ = objects.remove(right_object_id);
                     Ok(())
                 });
                 return Err(e);
@@ -1082,8 +1351,8 @@ pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_s
             Err(e) => {
                 let _ = state.close_handle(left_handle);
                 let _ = state.with_objects_mut(|objects| {
-                    let _ = objects.remove(&left_object_id);
-                    let _ = objects.remove(&right_object_id);
+                    let _ = objects.remove(left_object_id);
+                    let _ = objects.remove(right_object_id);
                     Ok(())
                 });
                 return Err(e);
@@ -1110,15 +1379,15 @@ pub fn create_timer(options: u32, clock_id: zx_clock_t) -> Result<zx_handle_t, z
             objects.insert(
                 object_id,
                 KernelObject::Timer(TimerObject { timer_id, clock_id }),
-            );
+            )?;
             Ok(())
         })?;
-        state.note_timer_object(timer_id, object_id);
+        state.note_timer_object(timer_id, object_id)?;
 
         match state.alloc_handle_for_object(object_id, handle::timer_default_rights()) {
             Ok(h) => Ok(h),
             Err(e) => {
-                let _ = state.with_objects_mut(|objects| Ok(objects.remove(&object_id)));
+                let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
                 state.forget_timer_object(timer_id);
                 let _ = state.with_kernel_mut(|kernel| {
                     kernel
@@ -1146,7 +1415,7 @@ pub fn object_signal(
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::SIGNAL)?;
         state.with_objects_mut(|objects| {
-            let endpoint = match objects.get_mut(&resolved.object_id()) {
+            let endpoint = match objects.get_mut(resolved.object_key()) {
                 Some(KernelObject::EventPair(endpoint)) => endpoint,
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
@@ -1154,7 +1423,7 @@ pub fn object_signal(
             endpoint.user_signals = endpoint.user_signals.without(clear).union(set);
             Ok(())
         })?;
-        publish_object_signals(state, resolved.object_id())
+        publish_object_signals(state, resolved.object_key())
     })
 }
 
@@ -1172,11 +1441,11 @@ pub fn object_signal_peer(
 
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let peer_object_id = {
-            let (peer_object_id, peer_closed) = state.with_objects(|objects| {
-                Ok(match objects.get(&resolved.object_id()) {
+        let peer_object = {
+            let (peer_object, peer_closed) = state.with_objects(|objects| {
+                Ok(match objects.get(resolved.object_key()) {
                     Some(KernelObject::EventPair(endpoint)) => {
-                        (endpoint.peer_object_id, endpoint.peer_closed)
+                        (endpoint.peer_object, endpoint.peer_closed)
                     }
                     Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                     None => return Err(ZX_ERR_BAD_HANDLE),
@@ -1186,11 +1455,11 @@ pub fn object_signal_peer(
             if peer_closed {
                 return Err(ZX_ERR_PEER_CLOSED);
             }
-            peer_object_id
+            peer_object
         };
 
         state.with_objects_mut(|objects| {
-            let peer = match objects.get_mut(&peer_object_id) {
+            let peer = match objects.get_mut(peer_object) {
                 Some(KernelObject::EventPair(peer)) => peer,
                 Some(_) => return Err(ZX_ERR_BAD_STATE),
                 None => return Err(ZX_ERR_PEER_CLOSED),
@@ -1201,7 +1470,7 @@ pub fn object_signal_peer(
             peer.user_signals = peer.user_signals.without(clear).union(set);
             Ok(())
         })?;
-        publish_object_signals(state, peer_object_id)
+        publish_object_signals(state, peer_object)
     })
 }
 
@@ -1215,7 +1484,7 @@ fn validate_futex_wait_owner(
     }
     let resolved = state.lookup_handle(owner_handle, crate::task::HandleRights::empty())?;
     let thread = state.with_objects(|objects| {
-        Ok(match objects.get(&resolved.object_id()) {
+        Ok(match objects.get(resolved.object_key()) {
             Some(KernelObject::Thread(thread)) => *thread,
             Some(_) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
@@ -1242,7 +1511,7 @@ fn validate_futex_requeue_owner(
     }
     let resolved = state.lookup_handle(owner_handle, crate::task::HandleRights::empty())?;
     let thread = state.with_objects(|objects| {
-        Ok(match objects.get(&resolved.object_id()) {
+        Ok(match objects.get(resolved.object_key()) {
             Some(KernelObject::Thread(thread)) => *thread,
             Some(_) => return Err(ZX_ERR_WRONG_TYPE),
             None => return Err(ZX_ERR_BAD_HANDLE),
@@ -1359,9 +1628,9 @@ pub fn ensure_timer_handle(handle: zx_handle_t) -> Result<(), zx_status_t> {
 pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let object_id = resolved.object_id();
+        let object_key = resolved.object_key();
         let timer_id = state.with_objects(|objects| {
-            Ok(match objects.get(&object_id) {
+            Ok(match objects.get(object_key) {
                 Some(KernelObject::Timer(timer)) => timer.timer_id,
                 Some(KernelObject::Process(_))
                 | Some(KernelObject::SuspendToken(_))
@@ -1390,7 +1659,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
                 })
                 .map_err(map_timer_error)
         })?;
-        crate::wait::publish_signals_changed(state, object_id, current)
+        crate::wait::publish_signals_changed(state, object_key, current)
     })
 }
 
@@ -1398,9 +1667,9 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
 pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let object_id = resolved.object_id();
+        let object_key = resolved.object_key();
         let timer_id = state.with_objects(|objects| {
-            Ok(match objects.get(&object_id) {
+            Ok(match objects.get(object_key) {
                 Some(KernelObject::Timer(timer)) => timer.timer_id,
                 Some(KernelObject::Process(_))
                 | Some(KernelObject::SuspendToken(_))
@@ -1421,7 +1690,7 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
                 .cancel_timer_object(timer_id)
                 .map_err(map_timer_error)
         })?;
-        crate::wait::publish_signals_changed(state, object_id, Signals::NONE)
+        crate::wait::publish_signals_changed(state, object_key, Signals::NONE)
     })
 }
 
@@ -1429,119 +1698,201 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
 pub fn object_signals(handle: zx_handle_t) -> Result<zx_signals_t, zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
-        let object_id = resolved.object_id();
-        signals_for_object_id(state, object_id).map(|s| s.bits())
+        let object_key = resolved.object_key();
+        signals_for_object_id(state, object_key).map(|s| s.bits())
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CloseHandleAction {
+    None,
+    SuspendToken { target: SuspendTarget },
+    Socket { peer_object: ObjectKey },
+    Channel { peer_object: ObjectKey },
+    EventPair { peer_object: ObjectKey },
+    Port,
+    Timer,
+    Vmo,
+    Vmar,
+}
+
+fn close_handle_action_for_live_object(object: &KernelObject) -> CloseHandleAction {
+    match object {
+        KernelObject::SuspendToken(token) => CloseHandleAction::SuspendToken {
+            target: token.target,
+        },
+        KernelObject::Socket(endpoint) => CloseHandleAction::Socket {
+            peer_object: endpoint.peer_object,
+        },
+        KernelObject::Channel(endpoint) => CloseHandleAction::Channel {
+            peer_object: endpoint.peer_object,
+        },
+        KernelObject::EventPair(endpoint) => CloseHandleAction::EventPair {
+            peer_object: endpoint.peer_object,
+        },
+        KernelObject::Port(_) => CloseHandleAction::Port,
+        KernelObject::Timer(_) => CloseHandleAction::Timer,
+        KernelObject::Vmo(_) => CloseHandleAction::Vmo,
+        KernelObject::Vmar(_) => CloseHandleAction::Vmar,
+        KernelObject::Process(_) | KernelObject::Thread(_) => CloseHandleAction::None,
+    }
+}
+
+fn finalize_last_handle_close(
+    state: &KernelState,
+    object_key: ObjectKey,
+    action: CloseHandleAction,
+) -> Result<(), zx_status_t> {
+    match action {
+        CloseHandleAction::None => Ok(()),
+        CloseHandleAction::SuspendToken { target } => {
+            process::close_suspend_token(state, object_key, target)
+        }
+        CloseHandleAction::Socket { peer_object } => {
+            state.with_reactor_mut(|reactor| {
+                reactor.remove_waitable(object_key);
+                Ok(())
+            })?;
+            let removed = state.begin_logical_destroy(object_key)?;
+            let result = match removed {
+                KernelObject::Socket(endpoint) => state.with_transport_mut(|transport| {
+                    let should_drop_core = match transport.socket_cores.get_mut(&endpoint.core_id) {
+                        Some(core) => {
+                            core.close_side(endpoint.side);
+                            core.fully_closed()
+                        }
+                        None => return Err(ZX_ERR_BAD_STATE),
+                    };
+                    if should_drop_core
+                        && let Some(core) = transport.socket_cores.remove(&endpoint.core_id)
+                    {
+                        transport.note_socket_core_drop(&core);
+                    }
+                    Ok(())
+                }),
+                _ => Err(ZX_ERR_BAD_STATE),
+            };
+            state.finish_logical_destroy(object_key);
+            result?;
+            if let Err(status) = publish_object_signals(state, peer_object)
+                && status != ZX_ERR_BAD_HANDLE
+            {
+                return Err(status);
+            }
+            Ok(())
+        }
+        CloseHandleAction::Channel { peer_object } => {
+            state.with_reactor_mut(|reactor| {
+                reactor.remove_waitable(object_key);
+                Ok(())
+            })?;
+            let removed = state.begin_logical_destroy(object_key)?;
+            let result = match removed {
+                KernelObject::Channel(mut endpoint) => {
+                    endpoint.closed = true;
+                    let drained = endpoint.messages.drain(..).collect::<Vec<_>>();
+                    transport::drain_channel_messages(state, drained);
+                    state.with_objects_mut(|objects| {
+                        if let Some(KernelObject::Channel(peer)) = objects.get_mut(peer_object) {
+                            peer.peer_closed = true;
+                        }
+                        Ok(())
+                    })
+                }
+                _ => Err(ZX_ERR_BAD_STATE),
+            };
+            state.finish_logical_destroy(object_key);
+            result?;
+            if let Err(status) = publish_object_signals(state, peer_object)
+                && status != ZX_ERR_BAD_HANDLE
+            {
+                return Err(status);
+            }
+            Ok(())
+        }
+        CloseHandleAction::EventPair { peer_object } => {
+            state.with_reactor_mut(|reactor| {
+                reactor.remove_waitable(object_key);
+                Ok(())
+            })?;
+            let removed = state.begin_logical_destroy(object_key)?;
+            let result = match removed {
+                KernelObject::EventPair(_) => state.with_objects_mut(|objects| {
+                    if let Some(KernelObject::EventPair(peer)) = objects.get_mut(peer_object) {
+                        peer.peer_closed = true;
+                    }
+                    Ok(())
+                }),
+                _ => Err(ZX_ERR_BAD_STATE),
+            };
+            state.finish_logical_destroy(object_key);
+            result?;
+            if let Err(status) = publish_object_signals(state, peer_object)
+                && status != ZX_ERR_BAD_HANDLE
+            {
+                return Err(status);
+            }
+            Ok(())
+        }
+        CloseHandleAction::Port => {
+            state.with_reactor_mut(|reactor| {
+                reactor.remove_port(object_key);
+                reactor.remove_waitable(object_key);
+                Ok(())
+            })?;
+            let removed = state.begin_logical_destroy(object_key)?;
+            let result = match removed {
+                KernelObject::Port(port) => state.with_kernel_mut(|kernel| port.destroy(kernel)),
+                _ => Err(ZX_ERR_BAD_STATE),
+            };
+            state.finish_logical_destroy(object_key);
+            result
+        }
+        CloseHandleAction::Timer => {
+            state.with_reactor_mut(|reactor| {
+                reactor.remove_waitable(object_key);
+                Ok(())
+            })?;
+            let removed = state.begin_logical_destroy(object_key)?;
+            let timer_id = match removed {
+                KernelObject::Timer(timer) => timer.timer_id,
+                _ => {
+                    state.finish_logical_destroy(object_key);
+                    return Err(ZX_ERR_BAD_STATE);
+                }
+            };
+            state.forget_timer_object(timer_id);
+            let result = state.with_kernel_mut(|kernel| {
+                kernel
+                    .destroy_timer_object(timer_id)
+                    .map_err(map_timer_error)
+            });
+            state.finish_logical_destroy(object_key);
+            result
+        }
+        CloseHandleAction::Vmo | CloseHandleAction::Vmar => {
+            let _ = state.begin_logical_destroy(object_key)?;
+            state.finish_logical_destroy(object_key);
+            Ok(())
+        }
+    }
 }
 
 /// Close a handle in CSpace and apply minimal object-specific side effects.
 pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(raw, crate::task::HandleRights::empty())?;
-        let object_id = resolved.object_id();
-        let (peer_link, suspend_target) = state.with_objects(|objects| {
-            let object = objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
-            let peer_link = match object {
-                KernelObject::Socket(endpoint) => Some(endpoint.peer_object_id),
-                KernelObject::Channel(endpoint) => Some(endpoint.peer_object_id),
-                KernelObject::EventPair(endpoint) => Some(endpoint.peer_object_id),
-                _ => None,
-            };
-            let suspend_target = match object {
-                KernelObject::SuspendToken(token) => Some(token.target),
-                _ => None,
-            };
-            Ok((peer_link, suspend_target))
+        let resolved = state.resolve_handle_raw(raw)?;
+        let object_key = resolved.object_key();
+        let action = state.with_objects(|objects| {
+            Ok(objects
+                .get(object_key)
+                .map(close_handle_action_for_live_object)
+                .unwrap_or(CloseHandleAction::None))
         })?;
         state.close_handle(raw)?;
 
-        if let Some(target) = suspend_target {
-            process::close_suspend_token(state, object_id, target)?;
-        }
-
-        if let Some(peer_object_id) = peer_link
-            && state.object_handle_count(object_id) == 0
-        {
-            state.with_reactor_mut(|reactor| {
-                reactor.remove_waitable(object_id);
-                Ok(())
-            })?;
-            let removed = state.with_objects_mut(|objects| Ok(objects.remove(&object_id)))?;
-            state.forget_object_handle_refs(object_id);
-            match removed {
-                Some(KernelObject::Socket(endpoint)) => {
-                    state.with_transport_mut(|transport| {
-                        let should_drop_core =
-                            match transport.socket_cores.get_mut(&endpoint.core_id) {
-                                Some(core) => {
-                                    core.close_side(endpoint.side);
-                                    core.fully_closed()
-                                }
-                                None => return Err(ZX_ERR_BAD_STATE),
-                            };
-                        if should_drop_core
-                            && let Some(core) = transport.socket_cores.remove(&endpoint.core_id)
-                        {
-                            transport.note_socket_core_drop(&core);
-                        }
-                        Ok(())
-                    })?;
-                }
-                Some(KernelObject::Channel(mut endpoint)) => {
-                    endpoint.closed = true;
-                    let drained = endpoint.messages.drain(..).collect::<Vec<_>>();
-                    transport::drain_channel_messages(state, drained);
-                    let _ = state.with_objects_mut(|objects| {
-                        if let Some(KernelObject::Channel(peer)) = objects.get_mut(&peer_object_id)
-                        {
-                            peer.peer_closed = true;
-                        }
-                        Ok(())
-                    });
-                }
-                Some(KernelObject::EventPair(_)) => {
-                    let _ = state.with_objects_mut(|objects| {
-                        if let Some(KernelObject::EventPair(peer)) =
-                            objects.get_mut(&peer_object_id)
-                        {
-                            peer.peer_closed = true;
-                        }
-                        Ok(())
-                    });
-                }
-                Some(other) => {
-                    state.with_objects_mut(|objects| {
-                        objects.insert(object_id, other);
-                        Ok(())
-                    })?;
-                }
-                None => {}
-            }
-            if let Err(status) = publish_object_signals(state, peer_object_id)
-                && status != ZX_ERR_BAD_HANDLE
-            {
-                return Err(status);
-            }
-        }
-        if state.with_objects(|objects| {
-            Ok(matches!(
-                objects.get(&object_id),
-                Some(KernelObject::Port(_))
-            ))
-        })? && state.object_handle_count(object_id) == 0
-        {
-            state.with_reactor_mut(|reactor| {
-                reactor.remove_port(object_id);
-                reactor.remove_waitable(object_id);
-                Ok(())
-            })?;
-            let Some(KernelObject::Port(port)) =
-                state.with_objects_mut(|objects| Ok(objects.remove(&object_id)))?
-            else {
-                return Err(ZX_ERR_BAD_STATE);
-            };
-            state.forget_object_handle_refs(object_id);
-            state.with_kernel_mut(|kernel| port.destroy(kernel))?;
+        if state.object_handle_count(object_key) == 0 {
+            finalize_last_handle_close(state, object_key, action)?;
         }
         sync_task_lifecycle(state)?;
         Ok(())
@@ -1551,9 +1902,9 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
 fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let object_id = resolved.object_id();
+        let object_key = resolved.object_key();
         let kind = state.with_objects(|objects| {
-            let obj = objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let obj = objects.get(object_key).ok_or(ZX_ERR_BAD_HANDLE)?;
             Ok(match obj {
                 KernelObject::Process(process) => {
                     let _ = (process.process_id, process.koid);
@@ -1561,12 +1912,12 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                 }
                 KernelObject::SuspendToken(_) => ObjectKind::SuspendToken,
                 KernelObject::Socket(endpoint) => {
-                    let _ = (endpoint.core_id, endpoint.peer_object_id, endpoint.side);
+                    let _ = (endpoint.core_id, endpoint.peer_object, endpoint.side);
                     ObjectKind::Socket
                 }
                 KernelObject::Channel(endpoint) => {
                     let _ = (
-                        endpoint.peer_object_id,
+                        endpoint.peer_object,
                         endpoint.messages.len(),
                         endpoint.peer_closed,
                         endpoint.closed,
@@ -1575,7 +1926,7 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                 }
                 KernelObject::EventPair(endpoint) => {
                     let _ = (
-                        endpoint.peer_object_id,
+                        endpoint.peer_object,
                         endpoint.user_signals.bits(),
                         endpoint.peer_closed,
                         endpoint.closed,
@@ -1641,26 +1992,26 @@ pub(crate) fn require_handle_rights(
 
 pub(crate) fn publish_object_signals(
     state: &KernelState,
-    object_id: u64,
+    object_key: ObjectKey,
 ) -> Result<(), zx_status_t> {
-    let current = signals_for_object_id(state, object_id)?;
-    crate::wait::publish_signals_changed(state, object_id, current)
+    let current = signals_for_object_id(state, object_key)?;
+    crate::wait::publish_signals_changed(state, object_key, current)
 }
 
 pub(crate) fn publish_timer_fired(
     state: &KernelState,
     timer_id: TimerId,
 ) -> Result<(), zx_status_t> {
-    let object_id = state.timer_object_id(timer_id).ok_or(ZX_ERR_BAD_STATE)?;
-    crate::wait::publish_signals_changed(state, object_id, Signals::TIMER_SIGNALED)
+    let object_key = state.timer_object_key(timer_id).ok_or(ZX_ERR_BAD_STATE)?;
+    crate::wait::publish_signals_changed(state, object_key, Signals::TIMER_SIGNALED)
 }
 
 pub(crate) fn signals_for_object_id(
     state: &KernelState,
-    object_id: u64,
+    object_key: ObjectKey,
 ) -> Result<Signals, zx_status_t> {
     state.with_objects(|objects| {
-        let obj = objects.get(&object_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        let obj = objects.get(object_key).ok_or(ZX_ERR_BAD_HANDLE)?;
         match obj {
             KernelObject::Process(process) => {
                 state.with_kernel(|kernel| kernel.process_signals(process.process_id))
@@ -1683,7 +2034,7 @@ pub(crate) fn signals_for_object_id(
                 if endpoint.peer_closed {
                     signals = signals | Signals::CHANNEL_PEER_CLOSED;
                 } else {
-                    let peer = match objects.get(&endpoint.peer_object_id) {
+                    let peer = match objects.get(endpoint.peer_object) {
                         Some(KernelObject::Channel(peer)) => peer,
                         _ => return Err(ZX_ERR_BAD_STATE),
                     };

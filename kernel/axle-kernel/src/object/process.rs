@@ -45,7 +45,7 @@ pub fn create_thread(
         let resolved =
             state.lookup_handle(process_handle, crate::task::HandleRights::MANAGE_THREAD)?;
         let process = state.with_objects(|objects| {
-            Ok(match objects.get(&resolved.object_id()) {
+            Ok(match objects.get(resolved.object_key()) {
                 Some(KernelObject::Process(process)) => *process,
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
@@ -63,13 +63,13 @@ pub fn create_thread(
                     thread_id,
                     koid,
                 }),
-            );
+            )?;
             Ok(())
         })?;
         match state.alloc_handle_for_object(object_id, handle::thread_default_rights()) {
             Ok(handle) => Ok(handle),
             Err(err) => {
-                let _ = state.with_objects_mut(|objects| Ok(objects.remove(&object_id)));
+                let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
                 Err(err)
             }
         }
@@ -90,7 +90,7 @@ pub fn create_process(
             parent_process_handle,
             crate::task::HandleRights::MANAGE_PROCESS,
         )?;
-        state.with_objects(|objects| match objects.get(&resolved.object_id()) {
+        state.with_objects(|objects| match objects.get(resolved.object_key()) {
             Some(KernelObject::Process(_)) => Ok(()),
             Some(_) => Err(ZX_ERR_WRONG_TYPE),
             None => Err(ZX_ERR_BAD_HANDLE),
@@ -106,7 +106,7 @@ pub fn create_process(
                     process_id: created.process_id(),
                     koid: created.koid(),
                 }),
-            );
+            )?;
             Ok(())
         })?;
 
@@ -122,7 +122,7 @@ pub fn create_process(
                     len: created.root_vmar().len(),
                     mapping_caps: vm::root_vmar_mapping_caps(),
                 }),
-            );
+            )?;
             Ok(())
         })?;
 
@@ -132,8 +132,8 @@ pub fn create_process(
             Ok(handle) => handle,
             Err(err) => {
                 let _ = state.with_objects_mut(|objects| {
-                    let _ = objects.remove(&process_object_id);
-                    let _ = objects.remove(&vmar_object_id);
+                    let _ = objects.remove(process_object_id);
+                    let _ = objects.remove(vmar_object_id);
                     Ok(())
                 });
                 return Err(err);
@@ -145,8 +145,8 @@ pub fn create_process(
                 Err(err) => {
                     let _ = state.close_handle(process_handle);
                     let _ = state.with_objects_mut(|objects| {
-                        let _ = objects.remove(&process_object_id);
-                        let _ = objects.remove(&vmar_object_id);
+                        let _ = objects.remove(process_object_id);
+                        let _ = objects.remove(vmar_object_id);
                         Ok(())
                     });
                     return Err(err);
@@ -171,7 +171,7 @@ pub fn prepare_process_start(
         let resolved_process =
             state.lookup_handle(process_handle, crate::task::HandleRights::MANAGE_PROCESS)?;
         let process = state.with_objects(|objects| {
-            Ok(match objects.get(&resolved_process.object_id()) {
+            Ok(match objects.get(resolved_process.object_key()) {
                 Some(KernelObject::Process(process)) => *process,
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
@@ -183,7 +183,7 @@ pub fn prepare_process_start(
             crate::task::HandleRights::READ | crate::task::HandleRights::MAP,
         )?;
         let image_vmo = state.with_objects(|objects| {
-            Ok(match objects.get(&resolved_vmo.object_id()) {
+            Ok(match objects.get(resolved_vmo.object_key()) {
                 Some(KernelObject::Vmo(vmo)) => vmo.clone(),
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
@@ -213,7 +213,7 @@ pub fn start_thread(
         let resolved =
             state.lookup_handle(thread_handle, crate::task::HandleRights::MANAGE_THREAD)?;
         let thread = state.with_objects(|objects| {
-            Ok(match objects.get(&resolved.object_id()) {
+            Ok(match objects.get(resolved.object_key()) {
                 Some(KernelObject::Thread(thread)) => *thread,
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
@@ -257,7 +257,7 @@ pub fn start_process(
         let resolved_process =
             state.lookup_handle(process_handle, crate::task::HandleRights::MANAGE_PROCESS)?;
         let process = state.with_objects(|objects| {
-            Ok(match objects.get(&resolved_process.object_id()) {
+            Ok(match objects.get(resolved_process.object_key()) {
                 Some(KernelObject::Process(process)) => *process,
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
@@ -267,7 +267,7 @@ pub fn start_process(
         let resolved_thread =
             state.lookup_handle(thread_handle, crate::task::HandleRights::MANAGE_THREAD)?;
         let thread = state.with_objects(|objects| {
-            Ok(match objects.get(&resolved_thread.object_id()) {
+            Ok(match objects.get(resolved_thread.object_key()) {
                 Some(KernelObject::Thread(thread)) => *thread,
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
@@ -312,7 +312,7 @@ pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
 
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let target = state.with_objects(|objects| {
-            Ok(match objects.get(&resolved.object_id()) {
+            Ok(match objects.get(resolved.object_key()) {
                 Some(KernelObject::Process(process)) => KillTarget::Process(process.process_id),
                 Some(KernelObject::Thread(thread)) => KillTarget::Thread(thread.thread_id),
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
@@ -342,7 +342,7 @@ pub fn task_suspend(handle: zx_handle_t, out_token: *mut zx_handle_t) -> Result<
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let target = state.with_objects(|objects| {
-            Ok(match objects.get(&resolved.object_id()) {
+            Ok(match objects.get(resolved.object_key()) {
                 Some(KernelObject::Process(process)) => SuspendTarget::Process {
                     process_id: process.process_id,
                 },
@@ -369,7 +369,7 @@ pub fn task_suspend(handle: zx_handle_t, out_token: *mut zx_handle_t) -> Result<
             objects.insert(
                 object_id,
                 KernelObject::SuspendToken(SuspendTokenObject { target }),
-            );
+            )?;
             Ok(())
         })?;
         let token_handle = match state
@@ -377,7 +377,7 @@ pub fn task_suspend(handle: zx_handle_t, out_token: *mut zx_handle_t) -> Result<
         {
             Ok(handle) => handle,
             Err(err) => {
-                let _ = state.with_objects_mut(|objects| Ok(objects.remove(&object_id)));
+                let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
                 let _ = match target {
                     SuspendTarget::Process { process_id } => {
                         state.with_kernel_mut(|kernel| kernel.resume_process(process_id))
@@ -413,49 +413,43 @@ pub(super) fn task_signals(
 
 pub(super) fn close_suspend_token(
     state: &KernelState,
-    object_id: u64,
+    object_key: ObjectKey,
     target: SuspendTarget,
 ) -> Result<(), zx_status_t> {
-    if state.object_handle_count(object_id) != 0 {
+    if state.object_handle_count(object_key) != 0 {
         return Ok(());
     }
     state.with_reactor_mut(|reactor| {
-        reactor.remove_waitable(object_id);
+        reactor.remove_waitable(object_key);
         Ok(())
     })?;
-    state.with_objects_mut(|objects| {
-        let _ = objects.remove(&object_id);
-        Ok(())
-    })?;
-    state.forget_object_handle_refs(object_id);
-    match target {
+    let _ = state.begin_logical_destroy(object_key)?;
+    let result = match target {
         SuspendTarget::Process { process_id } => {
-            if let Err(status) = state.with_kernel_mut(|kernel| kernel.resume_process(process_id))
-                && status != ZX_ERR_BAD_STATE
-            {
-                return Err(status);
+            match state.with_kernel_mut(|kernel| kernel.resume_process(process_id)) {
+                Ok(()) | Err(ZX_ERR_BAD_STATE) => Ok(()),
+                Err(status) => Err(status),
             }
         }
         SuspendTarget::Thread { thread_id } => {
-            if let Err(status) = state.with_kernel_mut(|kernel| kernel.resume_thread(thread_id))
-                && status != ZX_ERR_BAD_STATE
-            {
-                return Err(status);
+            match state.with_kernel_mut(|kernel| kernel.resume_thread(thread_id)) {
+                Ok(()) | Err(ZX_ERR_BAD_STATE) => Ok(()),
+                Err(status) => Err(status),
             }
         }
-    }
-    Ok(())
+    };
+    state.finish_logical_destroy(object_key);
+    result
 }
 
-fn task_object_ids(state: &KernelState) -> Vec<u64> {
+fn task_object_ids(state: &KernelState) -> Vec<ObjectKey> {
     state
         .with_registry(|registry| {
             Ok(registry
-                .objects
                 .iter()
-                .filter_map(|(object_id, object)| {
+                .filter_map(|(object_key, object)| {
                     matches!(object, KernelObject::Process(_) | KernelObject::Thread(_))
-                        .then_some(*object_id)
+                        .then_some(object_key)
                 })
                 .collect())
         })
@@ -466,16 +460,11 @@ fn process_object_handle_count(state: &KernelState, process_id: u64) -> usize {
     state
         .with_registry(|registry| {
             Ok(registry
-                .objects
                 .iter()
-                .filter_map(|(object_id, object)| match object {
-                    KernelObject::Process(process) if process.process_id == process_id => Some(
-                        registry
-                            .object_handle_refs
-                            .get(object_id)
-                            .copied()
-                            .unwrap_or(0),
-                    ),
+                .filter_map(|(object_key, object)| match object {
+                    KernelObject::Process(process) if process.process_id == process_id => {
+                        Some(registry.handle_refcount(object_key))
+                    }
                     _ => None,
                 })
                 .sum())
@@ -502,36 +491,20 @@ fn reap_terminated_task_objects(state: &KernelState) -> Result<(), zx_status_t> 
     loop {
         let (thread_candidates, process_candidates) = state.with_registry(|registry| {
             let thread_candidates = registry
-                .objects
                 .iter()
-                .filter_map(|(object_id, object)| match object {
-                    KernelObject::Thread(thread)
-                        if registry
-                            .object_handle_refs
-                            .get(object_id)
-                            .copied()
-                            .unwrap_or(0)
-                            == 0 =>
-                    {
-                        Some((*object_id, thread.thread_id, thread.process_id))
+                .filter_map(|(object_key, object)| match object {
+                    KernelObject::Thread(thread) if registry.handle_refcount(object_key) == 0 => {
+                        Some((object_key, thread.thread_id, thread.process_id))
                     }
                     _ => None,
                 })
                 .collect::<Vec<_>>();
 
             let process_candidates = registry
-                .objects
                 .iter()
-                .filter_map(|(object_id, object)| match object {
-                    KernelObject::Process(process)
-                        if registry
-                            .object_handle_refs
-                            .get(object_id)
-                            .copied()
-                            .unwrap_or(0)
-                            == 0 =>
-                    {
-                        Some((*object_id, process.process_id))
+                .filter_map(|(object_key, object)| match object {
+                    KernelObject::Process(process) if registry.handle_refcount(object_key) == 0 => {
+                        Some((object_key, process.process_id))
                     }
                     _ => None,
                 })
@@ -571,10 +544,9 @@ fn reap_terminated_task_objects(state: &KernelState) -> Result<(), zx_status_t> 
                 Ok(())
             })?;
             state.with_objects_mut(|objects| {
-                let _ = objects.remove(&object_id);
+                let _ = objects.remove(object_id);
                 Ok(())
             })?;
-            state.forget_object_handle_refs(object_id);
             let _ = state.with_kernel_mut(|kernel| kernel.reap_thread(thread_id))?;
             maybe_reap_process_record(state, process_id)?;
         }
@@ -588,10 +560,9 @@ fn reap_terminated_task_objects(state: &KernelState) -> Result<(), zx_status_t> 
                 Ok(())
             })?;
             state.with_objects_mut(|objects| {
-                let _ = objects.remove(&object_id);
+                let _ = objects.remove(object_id);
                 Ok(())
             })?;
-            state.forget_object_handle_refs(object_id);
             maybe_reap_process_record(state, process_id)?;
         }
     }

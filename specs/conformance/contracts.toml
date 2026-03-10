@@ -17,6 +17,22 @@ mode = "not_applicable"
 reason = "handle ABI surface contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
+id = "must.handle.logical_destroy_stales_lookup"
+level = "must"
+description = "After logical destroy, ordinary handle use must return ZX_ERR_BAD_HANDLE for the stale handle"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "handle/object lifetime contract exercised through syscall scenarios, not the host-side concurrent harness"
+
+[[contracts]]
+id = "must.handle.close_logically_destroyed_handle_ok"
+level = "must"
+description = "handle_close must succeed once on a logically destroyed handle so the last stale reference can drain"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "handle/object lifetime contract exercised through syscall scenarios, not the host-side concurrent harness"
+
+[[contracts]]
 id = "must.port.wait_bad_handle_returns_bad_handle"
 level = "must"
 description = "zx_port_wait with invalid handle must return ZX_ERR_BAD_HANDLE"

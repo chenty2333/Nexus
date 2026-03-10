@@ -18,8 +18,9 @@ use alloc::vec::Vec;
 
 use axle_core::handle::Handle;
 use axle_core::{
-    CSpace, CSpaceError, Capability, ObserverRegistry, ReactorTimerCore, ReactorTimerEvent,
-    RevocationManager, Signals, TimerError, TimerId, TransferredCap, WaitDeadlineId,
+    CSpace, CSpaceError, Capability, ObjectKey, ObserverRegistry, ReactorTimerCore,
+    ReactorTimerEvent, RevocationManager, Signals, TimerError, TimerId, TransferredCap,
+    WaitDeadlineId,
 };
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
@@ -215,12 +216,12 @@ pub(crate) enum WaitRegistration {
         owner_koid: zx_koid_t,
     },
     Signal {
-        object_id: u64,
+        object_key: ObjectKey,
         watched: Signals,
         observed_ptr: u64,
     },
     Port {
-        port_object_id: u64,
+        port_object: ObjectKey,
         packet_ptr: u64,
     },
     VmFault {
@@ -230,8 +231,8 @@ pub(crate) enum WaitRegistration {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WaitSourceKey {
-    Signals(u64),
-    PortReadable(u64),
+    Signals(ObjectKey),
+    PortReadable(ObjectKey),
     Futex(FutexKey),
     Fault(FaultInFlightKey),
     None,
@@ -242,8 +243,8 @@ impl WaitRegistration {
         match self {
             Self::Sleep => WaitSourceKey::None,
             Self::Futex { key, .. } => WaitSourceKey::Futex(key),
-            Self::Signal { object_id, .. } => WaitSourceKey::Signals(object_id),
-            Self::Port { port_object_id, .. } => WaitSourceKey::PortReadable(port_object_id),
+            Self::Signal { object_key, .. } => WaitSourceKey::Signals(object_key),
+            Self::Port { port_object, .. } => WaitSourceKey::PortReadable(port_object),
             Self::VmFault { key } => WaitSourceKey::Fault(key),
         }
     }
@@ -276,8 +277,8 @@ impl WaitNode {
 #[derive(Debug)]
 pub(crate) struct Reactor {
     observers: ObserverRegistry,
-    signal_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
-    port_waiters: BTreeMap<u64, VecDeque<ThreadId>>,
+    signal_waiters: BTreeMap<ObjectKey, VecDeque<ThreadId>>,
+    port_waiters: BTreeMap<ObjectKey, VecDeque<ThreadId>>,
     timers: ReactorTimerCore,
 }
 
@@ -299,61 +300,61 @@ impl Reactor {
         &mut self.observers
     }
 
-    pub(crate) fn remove_port(&mut self, port_id: u64) {
-        self.observers.remove_port(port_id);
-        let _ = self.port_waiters.remove(&port_id);
+    pub(crate) fn remove_port(&mut self, port_key: ObjectKey) {
+        self.observers.remove_port(port_key);
+        let _ = self.port_waiters.remove(&port_key);
     }
 
-    pub(crate) fn remove_waitable(&mut self, waitable_id: u64) {
-        self.observers.remove_waitable(waitable_id);
-        let _ = self.signal_waiters.remove(&waitable_id);
+    pub(crate) fn remove_waitable(&mut self, waitable_key: ObjectKey) {
+        self.observers.remove_waitable(waitable_key);
+        let _ = self.signal_waiters.remove(&waitable_key);
     }
 
-    fn push_signal_waiter(&mut self, object_id: u64, thread_id: ThreadId) {
+    fn push_signal_waiter(&mut self, object_key: ObjectKey, thread_id: ThreadId) {
         self.signal_waiters
-            .entry(object_id)
+            .entry(object_key)
             .or_default()
             .push_back(thread_id);
     }
 
-    fn remove_signal_waiter(&mut self, object_id: u64, thread_id: ThreadId) {
-        let should_remove = if let Some(waiters) = self.signal_waiters.get_mut(&object_id) {
+    fn remove_signal_waiter(&mut self, object_key: ObjectKey, thread_id: ThreadId) {
+        let should_remove = if let Some(waiters) = self.signal_waiters.get_mut(&object_key) {
             waiters.retain(|waiter| *waiter != thread_id);
             waiters.is_empty()
         } else {
             false
         };
         if should_remove {
-            let _ = self.signal_waiters.remove(&object_id);
+            let _ = self.signal_waiters.remove(&object_key);
         }
     }
 
-    fn push_port_waiter(&mut self, port_object_id: u64, thread_id: ThreadId) {
+    fn push_port_waiter(&mut self, port_object: ObjectKey, thread_id: ThreadId) {
         self.port_waiters
-            .entry(port_object_id)
+            .entry(port_object)
             .or_default()
             .push_back(thread_id);
     }
 
-    fn remove_port_waiter(&mut self, port_object_id: u64, thread_id: ThreadId) {
-        let should_remove = if let Some(waiters) = self.port_waiters.get_mut(&port_object_id) {
+    fn remove_port_waiter(&mut self, port_object: ObjectKey, thread_id: ThreadId) {
+        let should_remove = if let Some(waiters) = self.port_waiters.get_mut(&port_object) {
             waiters.retain(|waiter| *waiter != thread_id);
             waiters.is_empty()
         } else {
             false
         };
         if should_remove {
-            let _ = self.port_waiters.remove(&port_object_id);
+            let _ = self.port_waiters.remove(&port_object);
         }
     }
 
     fn enqueue_wait_source(&mut self, thread_id: ThreadId, registration: WaitRegistration) {
         match registration {
-            WaitRegistration::Signal { object_id, .. } => {
-                self.push_signal_waiter(object_id, thread_id)
+            WaitRegistration::Signal { object_key, .. } => {
+                self.push_signal_waiter(object_key, thread_id)
             }
-            WaitRegistration::Port { port_object_id, .. } => {
-                self.push_port_waiter(port_object_id, thread_id)
+            WaitRegistration::Port { port_object, .. } => {
+                self.push_port_waiter(port_object, thread_id)
             }
             WaitRegistration::Sleep
             | WaitRegistration::Futex { .. }
@@ -367,11 +368,11 @@ impl Reactor {
         registration: WaitRegistration,
     ) {
         match registration {
-            WaitRegistration::Signal { object_id, .. } => {
-                self.remove_signal_waiter(object_id, thread_id)
+            WaitRegistration::Signal { object_key, .. } => {
+                self.remove_signal_waiter(object_key, thread_id)
             }
-            WaitRegistration::Port { port_object_id, .. } => {
-                self.remove_port_waiter(port_object_id, thread_id)
+            WaitRegistration::Port { port_object, .. } => {
+                self.remove_port_waiter(port_object, thread_id)
             }
             WaitRegistration::Sleep
             | WaitRegistration::Futex { .. }
@@ -389,16 +390,16 @@ impl Reactor {
             .arm_wait_deadline(cpu_id, WaitDeadlineId::new(thread_id, seq), deadline);
     }
 
-    fn signal_waiter_thread_ids(&self, object_id: u64) -> Vec<ThreadId> {
+    fn signal_waiter_thread_ids(&self, object_key: ObjectKey) -> Vec<ThreadId> {
         self.signal_waiters
-            .get(&object_id)
+            .get(&object_key)
             .map(|waiters| waiters.iter().copied().collect())
             .unwrap_or_default()
     }
 
-    fn port_waiter_thread_ids(&self, port_object_id: u64) -> Vec<ThreadId> {
+    fn port_waiter_thread_ids(&self, port_object: ObjectKey) -> Vec<ThreadId> {
         self.port_waiters
-            .get(&port_object_id)
+            .get(&port_object)
             .map(|waiters| waiters.iter().copied().collect())
             .unwrap_or_default()
     }
@@ -939,9 +940,8 @@ pub(crate) struct ResolvedHandle {
     process_id: ProcessId,
     slot_index: u16,
     slot_tag: u16,
-    object_id: u64,
+    object_key: ObjectKey,
     rights: HandleRights,
-    object_generation: u32,
 }
 
 /// Kernel-visible description of the bootstrap root VMAR handle target.
@@ -2095,9 +2095,8 @@ impl ResolvedHandle {
             process_id,
             slot_index,
             slot_tag,
-            object_id: cap.object_id(),
+            object_key: cap.object_key(),
             rights: HandleRights::from_bits_retain(cap.rights()),
-            object_generation: cap.generation(),
         })
     }
 
@@ -2118,7 +2117,12 @@ impl ResolvedHandle {
 
     /// Target object id from the resolved capability.
     pub(crate) const fn object_id(self) -> u64 {
-        self.object_id
+        self.object_key.object_id()
+    }
+
+    /// Target object identity from the resolved capability.
+    pub(crate) const fn object_key(self) -> ObjectKey {
+        self.object_key
     }
 
     /// Rights bits carried by the resolved capability.
@@ -2128,7 +2132,7 @@ impl ResolvedHandle {
 
     /// Capability generation carried by the resolved capability.
     pub(crate) const fn object_generation(self) -> u32 {
-        self.object_generation
+        self.object_key.generation()
     }
 }
 
@@ -3696,36 +3700,36 @@ impl Kernel {
         }
     }
 
-    fn push_signal_waiter(&mut self, object_id: u64, thread_id: ThreadId) {
-        self.reactor.lock().push_signal_waiter(object_id, thread_id);
-    }
-
-    fn remove_signal_waiter(&mut self, object_id: u64, thread_id: ThreadId) {
+    fn push_signal_waiter(&mut self, object_key: ObjectKey, thread_id: ThreadId) {
         self.reactor
             .lock()
-            .remove_signal_waiter(object_id, thread_id);
+            .push_signal_waiter(object_key, thread_id);
     }
 
-    fn push_port_waiter(&mut self, port_object_id: u64, thread_id: ThreadId) {
+    fn remove_signal_waiter(&mut self, object_key: ObjectKey, thread_id: ThreadId) {
         self.reactor
             .lock()
-            .push_port_waiter(port_object_id, thread_id);
+            .remove_signal_waiter(object_key, thread_id);
     }
 
-    fn remove_port_waiter(&mut self, port_object_id: u64, thread_id: ThreadId) {
+    fn push_port_waiter(&mut self, port_object: ObjectKey, thread_id: ThreadId) {
+        self.reactor.lock().push_port_waiter(port_object, thread_id);
+    }
+
+    fn remove_port_waiter(&mut self, port_object: ObjectKey, thread_id: ThreadId) {
         self.reactor
             .lock()
-            .remove_port_waiter(port_object_id, thread_id);
+            .remove_port_waiter(port_object, thread_id);
     }
 
     fn enqueue_wait_source(&mut self, thread_id: ThreadId, registration: WaitRegistration) {
         match registration {
             WaitRegistration::Sleep => {}
-            WaitRegistration::Signal { object_id, .. } => {
-                self.push_signal_waiter(object_id, thread_id)
+            WaitRegistration::Signal { object_key, .. } => {
+                self.push_signal_waiter(object_key, thread_id)
             }
-            WaitRegistration::Port { port_object_id, .. } => {
-                self.push_port_waiter(port_object_id, thread_id)
+            WaitRegistration::Port { port_object, .. } => {
+                self.push_port_waiter(port_object, thread_id)
             }
             WaitRegistration::Futex { key, owner_koid } => {
                 self.futexes.enqueue_waiter(key, thread_id, owner_koid)
@@ -3741,11 +3745,11 @@ impl Kernel {
     ) {
         match registration {
             WaitRegistration::Sleep => {}
-            WaitRegistration::Signal { object_id, .. } => {
-                self.remove_signal_waiter(object_id, thread_id)
+            WaitRegistration::Signal { object_key, .. } => {
+                self.remove_signal_waiter(object_key, thread_id)
             }
-            WaitRegistration::Port { port_object_id, .. } => {
-                self.remove_port_waiter(port_object_id, thread_id)
+            WaitRegistration::Port { port_object, .. } => {
+                self.remove_port_waiter(port_object, thread_id)
             }
             WaitRegistration::Futex { key, .. } => {
                 let _ = self.futexes.cancel_waiter(key, thread_id);
@@ -3827,21 +3831,21 @@ impl Kernel {
 
     pub(crate) fn signal_waiters_ready(
         &self,
-        object_id: u64,
+        object_key: ObjectKey,
         current: Signals,
     ) -> Vec<SignalWaiter> {
         self.reactor
             .lock()
-            .signal_waiter_thread_ids(object_id)
+            .signal_waiter_thread_ids(object_key)
             .iter()
             .filter_map(|thread_id| {
                 let thread = self.threads.get(thread_id)?;
                 match thread.wait.registration {
                     Some(WaitRegistration::Signal {
-                        object_id: wait_object_id,
+                        object_key: wait_object_key,
                         watched,
                         observed_ptr,
-                    }) if wait_object_id == object_id && current.intersects(watched) => {
+                    }) if wait_object_key == object_key && current.intersects(watched) => {
                         Some(SignalWaiter {
                             thread_id: *thread_id,
                             seq: thread.wait.seq,
@@ -3854,18 +3858,18 @@ impl Kernel {
             .collect()
     }
 
-    pub(crate) fn port_waiters(&self, port_object_id: u64) -> Vec<PortWaiter> {
+    pub(crate) fn port_waiters(&self, port_object: ObjectKey) -> Vec<PortWaiter> {
         self.reactor
             .lock()
-            .port_waiter_thread_ids(port_object_id)
+            .port_waiter_thread_ids(port_object)
             .iter()
             .filter_map(|thread_id| {
                 let thread = self.threads.get(thread_id)?;
                 match thread.wait.registration {
                     Some(WaitRegistration::Port {
-                        port_object_id: wait_port_object_id,
+                        port_object: wait_port_object,
                         packet_ptr,
-                    }) if wait_port_object_id == port_object_id => Some(PortWaiter {
+                    }) if wait_port_object == port_object => Some(PortWaiter {
                         thread_id: *thread_id,
                         seq: thread.wait.seq,
                         packet_ptr: packet_ptr as u64,

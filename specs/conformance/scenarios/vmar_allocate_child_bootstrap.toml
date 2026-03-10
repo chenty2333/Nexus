@@ -9,7 +9,11 @@ command = [
 ]
 expect = ["kernel: int80 conformance ok"]
 forbid = ["KERNEL PANIC"]
-contracts = ["should.vmar.allocate_child_bootstrap"]
+contracts = [
+  "should.vmar.allocate_child_bootstrap",
+  "must.handle.logical_destroy_stales_lookup",
+  "must.handle.close_logically_destroyed_handle_ok",
+]
 
 [assertions.status_code]
 vmar_allocate_bad_type = -12
@@ -27,6 +31,10 @@ vmar_allocate_upper_limit = 0
 vmar_allocate_grandchild_compact = 0
 vmar_allocate_align = 0
 vmar_allocate_specific_align_bad = -10
+vmar_destroy_stale_close = 0
+
+[assertions.error_code]
+vmar_destroy_stale_map = -11
 
 [assertions.packet_fields]
 vmar_allocate_handle_ok = 1

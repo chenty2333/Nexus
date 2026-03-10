@@ -29,7 +29,7 @@ pub mod revocation;
 pub mod signals;
 pub mod timer;
 
-pub use capability::Capability;
+pub use capability::{Capability, ObjectKey};
 pub use cspace::{CSpace, CSpaceError, TransferredCap};
 pub use handle::{Handle, HandleError};
 pub use observer::{ObserverPortId, ObserverRegistry, WaitAsyncRegistration};

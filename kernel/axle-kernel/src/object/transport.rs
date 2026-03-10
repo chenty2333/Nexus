@@ -73,22 +73,22 @@ pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_stat
         let left_object_id = state.alloc_object_id();
         let right_object_id = state.alloc_object_id();
         state.with_registry_mut(|registry| {
-            registry.objects.insert(
+            registry.insert(
                 left_object_id,
                 KernelObject::Socket(SocketEndpoint {
                     core_id,
-                    peer_object_id: right_object_id,
+                    peer_object: right_object_id,
                     side: SocketSide::A,
                 }),
-            );
-            registry.objects.insert(
+            )?;
+            registry.insert(
                 right_object_id,
                 KernelObject::Socket(SocketEndpoint {
                     core_id,
-                    peer_object_id: left_object_id,
+                    peer_object: left_object_id,
                     side: SocketSide::B,
                 }),
-            );
+            )?;
             Ok(())
         })?;
 
@@ -97,8 +97,8 @@ pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_stat
                 Ok(handle) => handle,
                 Err(err) => {
                     let _ = state.with_registry_mut(|registry| {
-                        let _ = registry.objects.remove(&left_object_id);
-                        let _ = registry.objects.remove(&right_object_id);
+                        let _ = registry.remove(left_object_id);
+                        let _ = registry.remove(right_object_id);
                         Ok(())
                     });
                     let _ = state.with_transport_mut(|transport| {
@@ -114,8 +114,8 @@ pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_stat
                 Err(err) => {
                     let _ = state.close_handle(left_handle);
                     let _ = state.with_registry_mut(|registry| {
-                        let _ = registry.objects.remove(&left_object_id);
-                        let _ = registry.objects.remove(&right_object_id);
+                        let _ = registry.remove(left_object_id);
+                        let _ = registry.remove(right_object_id);
                         Ok(())
                     });
                     let _ = state.with_transport_mut(|transport| {
@@ -143,14 +143,14 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
         let left_object_id = state.alloc_object_id();
         let right_object_id = state.alloc_object_id();
         state.with_registry_mut(|registry| {
-            registry.objects.insert(
+            registry.insert(
                 left_object_id,
                 KernelObject::Channel(ChannelEndpoint::new(right_object_id, owner_process_id)),
-            );
-            registry.objects.insert(
+            )?;
+            registry.insert(
                 right_object_id,
                 KernelObject::Channel(ChannelEndpoint::new(left_object_id, owner_process_id)),
-            );
+            )?;
             Ok(())
         })?;
 
@@ -159,8 +159,8 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
                 Ok(handle) => handle,
                 Err(e) => {
                     let _ = state.with_registry_mut(|registry| {
-                        let _ = registry.objects.remove(&left_object_id);
-                        let _ = registry.objects.remove(&right_object_id);
+                        let _ = registry.remove(left_object_id);
+                        let _ = registry.remove(right_object_id);
                         Ok(())
                     });
                     return Err(e);
@@ -173,8 +173,8 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
             Err(e) => {
                 let _ = state.close_handle(left_handle);
                 let _ = state.with_registry_mut(|registry| {
-                    let _ = registry.objects.remove(&left_object_id);
-                    let _ = registry.objects.remove(&right_object_id);
+                    let _ = registry.remove(left_object_id);
+                    let _ = registry.remove(right_object_id);
                     Ok(())
                 });
                 return Err(e);
@@ -197,19 +197,14 @@ pub(super) fn release_channel_payload(state: &KernelState, payload: ChannelPaylo
 fn retain_transferred_handles(state: &KernelState, handles: &[TransferredCap]) {
     for transferred in handles {
         let _ = state.with_registry_mut(|registry| {
-            registry
-                .object_handle_refs
-                .entry(transferred.capability().object_id())
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            Ok(())
+            registry.increment_handle_ref(transferred.capability().object_key())
         });
     }
 }
 
 fn release_transferred_handles(state: &KernelState, handles: &[TransferredCap]) {
     for transferred in handles {
-        state.decrement_object_handle_ref(transferred.capability().object_id());
+        state.decrement_object_handle_ref(transferred.capability().object_key());
     }
 }
 
@@ -286,7 +281,7 @@ pub(super) fn transport_signals(
             if endpoint.peer_closed {
                 signals = signals | Signals::CHANNEL_PEER_CLOSED;
             } else {
-                let peer = match registry.objects.get(&endpoint.peer_object_id) {
+                let peer = match registry.get(endpoint.peer_object) {
                     Some(KernelObject::Channel(peer)) => peer,
                     _ => return Err(ZX_ERR_BAD_STATE),
                 };
@@ -345,13 +340,11 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let endpoint =
-            state.with_registry(
-                |registry| match registry.objects.get(&resolved.object_id()) {
-                    Some(KernelObject::Socket(endpoint)) => Ok(*endpoint),
-                    Some(_) => Err(ZX_ERR_WRONG_TYPE),
-                    None => Err(ZX_ERR_BAD_HANDLE),
-                },
-            )?;
+            state.with_registry(|registry| match registry.get(resolved.object_key()) {
+                Some(KernelObject::Socket(endpoint)) => Ok(*endpoint),
+                Some(_) => Err(ZX_ERR_WRONG_TYPE),
+                None => Err(ZX_ERR_BAD_HANDLE),
+            })?;
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
 
         let write_result = state.with_transport_mut(|transport| {
@@ -381,8 +374,8 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
             Ok(())
         })?;
 
-        let _ = publish_object_signals(state, resolved.object_id());
-        let _ = publish_object_signals(state, endpoint.peer_object_id);
+        let _ = publish_object_signals(state, resolved.object_key());
+        let _ = publish_object_signals(state, endpoint.peer_object);
         Ok(written)
     })
 }
@@ -398,13 +391,11 @@ pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let endpoint =
-            state.with_registry(
-                |registry| match registry.objects.get(&resolved.object_id()) {
-                    Some(KernelObject::Socket(endpoint)) => Ok(*endpoint),
-                    Some(_) => Err(ZX_ERR_WRONG_TYPE),
-                    None => Err(ZX_ERR_BAD_HANDLE),
-                },
-            )?;
+            state.with_registry(|registry| match registry.get(resolved.object_key()) {
+                Some(KernelObject::Socket(endpoint)) => Ok(*endpoint),
+                Some(_) => Err(ZX_ERR_WRONG_TYPE),
+                None => Err(ZX_ERR_BAD_HANDLE),
+            })?;
         require_handle_rights(resolved, crate::task::HandleRights::READ)?;
 
         let bytes = state.with_transport_mut(|transport| {
@@ -420,8 +411,8 @@ pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<
                 transport.note_socket_read(bytes.len());
                 Ok(())
             })?;
-            let _ = publish_object_signals(state, resolved.object_id());
-            let _ = publish_object_signals(state, endpoint.peer_object_id);
+            let _ = publish_object_signals(state, resolved.object_key());
+            let _ = publish_object_signals(state, endpoint.peer_object);
         }
         Ok(bytes)
     })
@@ -454,11 +445,11 @@ pub fn channel_write(
                 return Err(status);
             }
         };
-        let object_id = resolved.object_id();
+        let object_id = resolved.object_key();
         let peer_object_id = {
             let peer_object_id =
-                match state.with_registry(|registry| match registry.objects.get(&object_id) {
-                    Some(KernelObject::Channel(endpoint)) => Ok(endpoint.peer_object_id),
+                match state.with_registry(|registry| match registry.get(object_id) {
+                    Some(KernelObject::Channel(endpoint)) => Ok(endpoint.peer_object),
                     Some(_) => Err(ZX_ERR_WRONG_TYPE),
                     None => Err(ZX_ERR_BAD_HANDLE),
                 }) {
@@ -481,7 +472,7 @@ pub fn channel_write(
 
         let receiver_address_space_id = {
             let (peer_closed, peer_len, owner_process_id) =
-                match state.with_registry(|registry| match registry.objects.get(&peer_object_id) {
+                match state.with_registry(|registry| match registry.get(peer_object_id) {
                     Some(KernelObject::Channel(peer)) => {
                         Ok((peer.closed, peer.messages.len(), peer.owner_process_id))
                     }
@@ -561,7 +552,7 @@ pub fn channel_write(
         }
 
         let peer_status = state.with_registry(|registry| {
-            Ok(match registry.objects.get(&peer_object_id) {
+            Ok(match registry.get(peer_object_id) {
                 Some(KernelObject::Channel(peer)) if peer.closed => Some(ZX_ERR_PEER_CLOSED),
                 Some(KernelObject::Channel(peer)) if peer.messages.len() >= CHANNEL_CAPACITY => {
                     Some(ZX_ERR_SHOULD_WAIT)
@@ -584,7 +575,7 @@ pub fn channel_write(
             handles: transferred,
         };
         state.with_registry_mut(|registry| {
-            match registry.objects.get_mut(&peer_object_id) {
+            match registry.get_mut(peer_object_id) {
                 Some(KernelObject::Channel(peer)) => peer.messages.push_back(message),
                 Some(_) => return Err(ZX_ERR_BAD_STATE),
                 None => return Err(ZX_ERR_PEER_CLOSED),
@@ -617,11 +608,11 @@ pub fn channel_read(
     let resolved = state
         .lookup_handle(handle, crate::task::HandleRights::empty())
         .map_err(|e| (e, 0, 0))?;
-    let object_id = resolved.object_id();
+    let object_id = resolved.object_key();
     require_handle_rights(resolved, crate::task::HandleRights::READ).map_err(|e| (e, 0, 0))?;
     let (peer_object_id, transferred_handles, actual_bytes, actual_handles) = state
         .with_registry(|registry| {
-            let endpoint = match registry.objects.get(&object_id) {
+            let endpoint = match registry.get(object_id) {
                 Some(KernelObject::Channel(endpoint)) => endpoint,
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
@@ -636,7 +627,7 @@ pub fn channel_read(
             let actual_bytes = message.actual_bytes()?;
             let actual_handles = message.actual_handles()?;
             Ok((
-                endpoint.peer_object_id,
+                endpoint.peer_object,
                 message.handles.clone(),
                 actual_bytes,
                 actual_handles,
@@ -659,7 +650,7 @@ pub fn channel_read(
 
     let message = state
         .with_registry_mut(|registry| {
-            let endpoint = match registry.objects.get_mut(&object_id) {
+            let endpoint = match registry.get_mut(object_id) {
                 Some(KernelObject::Channel(endpoint)) => endpoint,
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
