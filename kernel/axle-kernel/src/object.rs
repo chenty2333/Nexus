@@ -1196,6 +1196,35 @@ pub(crate) fn finish_syscall(
     })
 }
 
+pub(crate) fn finish_timer_interrupt(
+    trap: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+) -> Result<(), zx_status_t> {
+    run_trap_blocking(|resuming_blocked_current| {
+        with_state_mut(|state| {
+            let disposition = state.with_kernel_mut(|kernel| {
+                if !resuming_blocked_current {
+                    kernel.note_current_cpu_timer_tick(crate::time::now_ns())?;
+                }
+                kernel.finish_trap_exit(trap, cpu_frame, resuming_blocked_current)
+            })?;
+            let lifecycle_dirty =
+                state.with_kernel_mut(|kernel| Ok(kernel.take_task_lifecycle_dirty()))?;
+            if lifecycle_dirty {
+                process::sync_task_lifecycle(state)?;
+            }
+            Ok(match disposition {
+                crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(()),
+                crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
+            })
+        })
+    })
+}
+
+pub(crate) fn timer_interrupt_requires_trap_exit(now: i64) -> Result<bool, zx_status_t> {
+    with_kernel_mut(|kernel| kernel.timer_interrupt_requires_trap_exit(now))
+}
+
 #[allow(dead_code)]
 pub(crate) fn resolve_current_futex_key_relaxed(
     user_addr: zx_vaddr_t,

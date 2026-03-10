@@ -191,11 +191,23 @@ pub fn prepare_process_start(
                 None => return Err(ZX_ERR_BAD_HANDLE),
             })
         })?;
-        let layout = image_vmo.image_layout.ok_or(ZX_ERR_NOT_SUPPORTED)?;
+        let layout = resolve_process_image_layout(state, &image_vmo)?;
 
         state.with_kernel_mut(|kernel| {
             kernel.prepare_process_start(process.process_id, image_vmo.global_vmo_id, &layout)
         })
+    })
+}
+
+fn resolve_process_image_layout(
+    state: &KernelState,
+    image_vmo: &VmoObject,
+) -> Result<crate::task::ProcessImageLayout, zx_status_t> {
+    if let Some(layout) = image_vmo.image_layout.clone() {
+        return Ok(layout);
+    }
+    crate::userspace::parse_elf_process_image_layout(image_vmo.size_bytes, |offset, len| {
+        state.with_vm_mut(|vm| vm.read_vmo_bytes(image_vmo, offset, len))
     })
 }
 

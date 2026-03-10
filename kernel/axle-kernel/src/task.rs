@@ -60,6 +60,7 @@ const CSPACE_QUARANTINE_LEN: usize = 256;
 const DEFAULT_MAX_INFLIGHT_LOAN_PAGES: Option<u64> = Some(32);
 const DEFAULT_MAX_PRIVATE_COW_PAGES: Option<u64> = None;
 const FAULT_WAIT_SPIN_LOOPS: usize = 256;
+const DEFAULT_TIME_SLICE_NS: i64 = 4_000_000;
 const VM_FRAME_DIAGNOSTICS_ENABLED: bool =
     cfg!(debug_assertions) || cfg!(feature = "vm-diagnostics");
 
@@ -1069,7 +1070,7 @@ impl UserContext {
             trap,
             rip: entry,
             cs: selectors.user_code.0 as u64,
-            rflags: 0x002,
+            rflags: 0x202,
             rsp: stack,
             ss: selectors.user_data.0 as u64,
         }
@@ -1219,12 +1220,42 @@ impl ProcessImageSegment {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProcessImageElfInfo {
+    phdr_vaddr: u64,
+    phent: u16,
+    phnum: u16,
+}
+
+impl ProcessImageElfInfo {
+    pub(crate) const fn new(phdr_vaddr: u64, phent: u16, phnum: u16) -> Self {
+        Self {
+            phdr_vaddr,
+            phent,
+            phnum,
+        }
+    }
+
+    pub(crate) const fn phdr_vaddr(self) -> u64 {
+        self.phdr_vaddr
+    }
+
+    pub(crate) const fn phent(self) -> u16 {
+        self.phent
+    }
+
+    pub(crate) const fn phnum(self) -> u16 {
+        self.phnum
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessImageLayout {
     code_base: u64,
     code_size_bytes: u64,
     entry: u64,
-    segments: heapless::Vec<ProcessImageSegment, 4>,
+    elf: Option<ProcessImageElfInfo>,
+    segments: heapless::Vec<ProcessImageSegment, 16>,
 }
 
 impl ProcessImageLayout {
@@ -1233,6 +1264,7 @@ impl ProcessImageLayout {
             code_base: crate::userspace::USER_CODE_VA,
             code_size_bytes: crate::userspace::USER_CODE_BYTES,
             entry: crate::userspace::USER_CODE_VA,
+            elf: None,
             segments: heapless::Vec::new(),
         }
     }
@@ -1243,6 +1275,16 @@ impl ProcessImageLayout {
         entry: u64,
         segments: &[ProcessImageSegment],
     ) -> Result<Self, zx_status_t> {
+        Self::with_segments_and_elf(code_base, code_size_bytes, entry, segments, None)
+    }
+
+    pub(crate) fn with_segments_and_elf(
+        code_base: u64,
+        code_size_bytes: u64,
+        entry: u64,
+        segments: &[ProcessImageSegment],
+        elf: Option<ProcessImageElfInfo>,
+    ) -> Result<Self, zx_status_t> {
         let mut stored = heapless::Vec::new();
         for segment in segments {
             stored.push(*segment).map_err(|_| ZX_ERR_NO_RESOURCES)?;
@@ -1251,6 +1293,7 @@ impl ProcessImageLayout {
             code_base,
             code_size_bytes,
             entry,
+            elf,
             segments: stored,
         })
     }
@@ -1269,6 +1312,10 @@ impl ProcessImageLayout {
 
     pub(crate) fn segments(&self) -> &[ProcessImageSegment] {
         self.segments.as_slice()
+    }
+
+    pub(crate) const fn elf(&self) -> Option<ProcessImageElfInfo> {
+        self.elf
     }
 
     pub(crate) fn rebased_for_loaded_image(&self) -> Result<Self, zx_status_t> {
@@ -1292,6 +1339,7 @@ impl ProcessImageLayout {
             code_base: self.code_base,
             code_size_bytes: self.code_size_bytes,
             entry: self.entry,
+            elf: self.elf,
             segments: stored,
         })
     }
@@ -1301,12 +1349,95 @@ pub(crate) const fn process_image_default_code_perms() -> MappingPerms {
     MappingPerms::READ.union(MappingPerms::EXECUTE)
 }
 
+const STACK_ARGV0: &[u8] = b"axle-child\0";
+const AT_NULL: u64 = 0;
+const AT_PHDR: u64 = 3;
+const AT_PHENT: u64 = 4;
+const AT_PHNUM: u64 = 5;
+const AT_PAGESZ: u64 = 6;
+const AT_ENTRY: u64 = 9;
+
 fn align_up_user_page(value: u64) -> Result<u64, zx_status_t> {
     let align = crate::userspace::USER_PAGE_BYTES;
     value
         .checked_add(align - 1)
         .map(|rounded| rounded & !(align - 1))
         .ok_or(ZX_ERR_OUT_OF_RANGE)
+}
+
+fn build_process_start_stack_image(
+    stack_base: u64,
+    stack_len: u64,
+    layout: &ProcessImageLayout,
+) -> Result<(u64, u64, Vec<u8>), zx_status_t> {
+    let stack_len_usize = usize::try_from(stack_len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let mut auxv = Vec::new();
+    auxv.try_reserve_exact(6).map_err(|_| ZX_ERR_NO_MEMORY)?;
+    auxv.push((AT_PAGESZ, crate::userspace::USER_PAGE_BYTES));
+    auxv.push((AT_ENTRY, layout.entry()));
+    if let Some(elf) = layout.elf() {
+        auxv.push((AT_PHDR, elf.phdr_vaddr()));
+        auxv.push((AT_PHENT, u64::from(elf.phent())));
+        auxv.push((AT_PHNUM, u64::from(elf.phnum())));
+    }
+    auxv.push((AT_NULL, 0));
+
+    let mut words = Vec::new();
+    let word_count = 4usize
+        .checked_add(auxv.len().checked_mul(2).ok_or(ZX_ERR_OUT_OF_RANGE)?)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    words
+        .try_reserve_exact(word_count)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+
+    let mut cursor = stack_len_usize;
+    cursor = cursor
+        .checked_sub(STACK_ARGV0.len())
+        .ok_or(ZX_ERR_NO_MEMORY)?;
+    let argv0_offset = cursor;
+    let argv0_ptr = stack_base
+        .checked_add(u64::try_from(argv0_offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+
+    words.push(1);
+    words.push(argv0_ptr);
+    words.push(0);
+    words.push(0);
+    for (key, value) in auxv {
+        words.push(key);
+        words.push(value);
+    }
+
+    let words_bytes = words
+        .len()
+        .checked_mul(size_of::<u64>())
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    cursor = cursor.checked_sub(words_bytes).ok_or(ZX_ERR_NO_MEMORY)?;
+    cursor &= !0xFusize;
+
+    let total_bytes = stack_len_usize
+        .checked_sub(cursor)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    let mut image = Vec::new();
+    image
+        .try_reserve_exact(total_bytes)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    image.resize(total_bytes, 0);
+
+    for (index, word) in words.iter().enumerate() {
+        let start = index * size_of::<u64>();
+        image[start..start + size_of::<u64>()].copy_from_slice(&word.to_ne_bytes());
+    }
+    let string_offset = argv0_offset
+        .checked_sub(cursor)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    image[string_offset..string_offset + STACK_ARGV0.len()].copy_from_slice(STACK_ARGV0);
+
+    let stack_pointer = stack_base
+        .checked_add(u64::try_from(cursor).map_err(|_| ZX_ERR_OUT_OF_RANGE)?)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    let stack_vmo_offset = u64::try_from(cursor).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    Ok((stack_pointer, stack_vmo_offset, image))
 }
 
 #[derive(Clone, Debug)]
@@ -2862,6 +2993,7 @@ struct Thread {
     state: ThreadState,
     queued_on_cpu: Option<usize>,
     last_cpu: usize,
+    runtime_ns: u64,
     wait: WaitNode,
     context: Option<UserContext>,
     suspend_tokens: u32,
@@ -2872,6 +3004,8 @@ struct CpuSchedulerState {
     run_queue: VecDeque<ThreadId>,
     current_thread_id: Option<ThreadId>,
     reschedule_requested: bool,
+    current_runtime_started_ns: Option<i64>,
+    slice_deadline_ns: Option<i64>,
     online: bool,
 }
 
@@ -3119,6 +3253,7 @@ impl Kernel {
                 state: ThreadState::Runnable,
                 queued_on_cpu: None,
                 last_cpu: bootstrap_cpu_id,
+                runtime_ns: 0,
                 wait: WaitNode::default(),
                 context: None,
                 suspend_tokens: 0,
@@ -3130,6 +3265,8 @@ impl Kernel {
                 run_queue: VecDeque::new(),
                 current_thread_id: Some(thread_id),
                 reschedule_requested: false,
+                current_runtime_started_ns: Some(crate::time::now_ns()),
+                slice_deadline_ns: crate::time::now_ns().checked_add(DEFAULT_TIME_SLICE_NS),
                 online: true,
             },
         );
@@ -3784,10 +3921,15 @@ impl Kernel {
         resuming_blocked_current: bool,
     ) -> Result<TrapExitDisposition, zx_status_t> {
         let current_cpu_id = self.current_cpu_id();
+        let now = self.current_cpu_now_ns();
+        if !resuming_blocked_current {
+            self.account_current_runtime_until(now)?;
+        }
         match self.current_thread()?.state {
             ThreadState::Runnable => {
                 if resuming_blocked_current {
                     self.restore_current_user_context(trap, cpu_frame)?;
+                    self.arm_current_slice_from(now);
                 } else {
                     self.capture_current_user_context(trap, cpu_frame.cast_const())?;
                 }
@@ -3803,6 +3945,7 @@ impl Kernel {
             ThreadState::New => Err(ZX_ERR_BAD_STATE),
             ThreadState::TerminationPending => {
                 let thread_id = self.current_thread_id()?;
+                self.clear_current_slice_state();
                 self.finalize_thread_termination(thread_id)?;
                 if let Some(next_thread_id) = self.pop_runnable_thread() {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
@@ -3812,6 +3955,7 @@ impl Kernel {
                 }
             }
             ThreadState::Suspended | ThreadState::Terminated => {
+                self.clear_current_slice_state();
                 if let Some(next_thread_id) = self.pop_runnable_thread() {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     Ok(TrapExitDisposition::Complete)
@@ -3820,6 +3964,7 @@ impl Kernel {
                 }
             }
             ThreadState::Blocked { .. } => {
+                self.clear_current_slice_state();
                 if let Some(next_thread_id) = self.pop_runnable_thread() {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     Ok(TrapExitDisposition::Complete)
@@ -4171,6 +4316,7 @@ impl Kernel {
                 state: ThreadState::New,
                 queued_on_cpu: None,
                 last_cpu: current_cpu_id,
+                runtime_ns: 0,
                 wait: WaitNode::default(),
                 context: None,
                 suspend_tokens: 0,
@@ -4692,6 +4838,74 @@ impl Kernel {
         crate::arch::apic::this_apic_id() as usize
     }
 
+    fn current_cpu_now_ns(&self) -> i64 {
+        crate::time::now_ns()
+    }
+
+    fn arm_current_slice_from(&mut self, now: i64) {
+        let scheduler = self.current_cpu_scheduler_mut();
+        scheduler.current_runtime_started_ns = Some(now);
+        scheduler.slice_deadline_ns = now.checked_add(DEFAULT_TIME_SLICE_NS);
+    }
+
+    fn clear_current_slice_state(&mut self) {
+        let scheduler = self.current_cpu_scheduler_mut();
+        scheduler.current_runtime_started_ns = None;
+        scheduler.slice_deadline_ns = None;
+    }
+
+    fn account_current_runtime_until(&mut self, now: i64) -> Result<(), zx_status_t> {
+        let current_thread_id = self.current_thread_id()?;
+        let scheduler = self.current_cpu_scheduler_mut();
+        let Some(started_ns) = scheduler.current_runtime_started_ns else {
+            scheduler.current_runtime_started_ns = Some(now);
+            return Ok(());
+        };
+        let elapsed_ns = now.saturating_sub(started_ns).max(0) as u64;
+        scheduler.current_runtime_started_ns = Some(now);
+        let thread = self
+            .threads
+            .get_mut(&current_thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        thread.runtime_ns = thread.runtime_ns.saturating_add(elapsed_ns);
+        Ok(())
+    }
+
+    pub(crate) fn note_current_cpu_timer_tick(&mut self, now: i64) -> Result<(), zx_status_t> {
+        let scheduler = self.current_cpu_scheduler_mut();
+        if scheduler.current_thread_id.is_none() {
+            scheduler.current_runtime_started_ns = None;
+            scheduler.slice_deadline_ns = None;
+            return Ok(());
+        }
+        let _ = scheduler;
+        self.account_current_runtime_until(now)?;
+        if self
+            .current_cpu_scheduler()?
+            .slice_deadline_ns
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.current_cpu_scheduler_mut().slice_deadline_ns =
+                now.checked_add(DEFAULT_TIME_SLICE_NS);
+            self.request_reschedule_on_cpu(self.current_cpu_id());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn timer_interrupt_requires_trap_exit(
+        &mut self,
+        now: i64,
+    ) -> Result<bool, zx_status_t> {
+        self.note_current_cpu_timer_tick(now)?;
+        if self.current_cpu_scheduler()?.reschedule_requested {
+            return Ok(true);
+        }
+        Ok(!matches!(
+            self.current_thread()?.state,
+            ThreadState::Runnable
+        ))
+    }
+
     fn current_thread(&self) -> Result<&Thread, zx_status_t> {
         self.threads
             .get(&self.current_thread_id()?)
@@ -4929,6 +5143,7 @@ impl Kernel {
         }
         self.observe_cpu_tlb_epoch_for_address_space(next_address_space_id, current_cpu_id);
         self.current_cpu_scheduler_mut().current_thread_id = Some(thread_id);
+        self.arm_current_slice_from(self.current_cpu_now_ns());
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         thread.last_cpu = current_cpu_id;
         Ok(context)
@@ -5914,10 +6129,21 @@ impl VmDomain {
             0,
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
         )?;
+        let (stack_pointer, stack_vmo_offset, stack_image) = build_process_start_stack_image(
+            crate::userspace::USER_STACK_VA,
+            crate::userspace::USER_PAGE_BYTES,
+            layout,
+        )?;
+        self.write_local_vmo_bytes(
+            address_space_id,
+            stack_vmo.vmo_id(),
+            stack_vmo_offset,
+            &stack_image,
+        )?;
 
         Ok(PreparedProcessStart {
             entry: layout.entry(),
-            stack_top: crate::userspace::USER_STACK_VA + crate::userspace::USER_PAGE_BYTES,
+            stack_top: stack_pointer,
         })
     }
 

@@ -1,0 +1,148 @@
+# 42 - fault / COW / loan
+
+Part of the Axle VM subsystem.
+
+See also:
+- `11_SYSCALL_DISPATCH.md` - trap-facing VMAR map and channel read special cases
+- `12_WAIT_SIGNAL_PORT_TIMER.md` - blocked fault wait behavior
+- `32_SCHEDULER_LIFECYCLE.md` - fault-induced blocking and wake transitions
+- `34_IPC_CHANNEL.md` - channel page-loan integration
+- `40_VM.md` - VM index
+- `41_VM_VMO_VMAR.md` - VMO / VMAR metadata and mapping control plane
+- `43_VM_EXEC_PAGER_DEVICE_VM.md` - neighboring incomplete VM work
+- `90_CONFORMANCE.md` - scenarios that exercise these paths
+
+## Scope
+
+This file describes the current page-fault, copy-on-write, and channel page-loan behavior in the repository.
+
+## Fault classification
+
+- `axle-mm::AddressSpace::classify_page_fault()` distinguishes:
+  - unmapped faults
+  - protection violations
+  - copy-on-write faults
+  - lazy anonymous faults
+  - lazy VMO-backed faults
+- Per-page metadata (`PteMeta`) is the main source of truth for that classification.
+
+## Fault serialization
+
+- The kernel maintains a `FaultTable` keyed by either:
+  - one local page in one address space
+  - one shared VMO page
+- The first claimant becomes the leader for that fault key.
+- Trap-path contenders block through the same parked wait-core machinery used by signal / port /
+  futex waits, with source `Fault(key)`.
+- Resident-range helper contention still uses a local spin/retry helper in the non-trap path.
+- Completion wakes waiters and advances an epoch-like completion counter for the in-flight fault record.
+
+This is the current mechanism that prevents duplicate materialization or inconsistent COW races on the same page.
+
+- Trap-facing page-fault handling and current-process user-range residency checks now enter through
+  a dedicated kernel fault bridge, instead of living in the object layer.
+
+## COW behavior
+
+- Anonymous writable mappings can enter a shared COW state.
+- The COW-sharing arm is treated as the dangerous step for stale writable translations.
+- The later fault-side install of one private page is currently treated as a relaxed commit:
+  it must be visible to the faulting thread before user return, but it is not the global
+  strict-sync boundary by itself.
+- On a write fault:
+  - a private page reservation token is acquired
+  - a new frame is allocated and populated
+  - the local mapping becomes writable on the new frame
+  - reverse-map and resource-accounting state is updated
+- The reservation is now a typed internal token rather than one bool carried across the whole fault
+  path.
+  - commit consumes the token
+  - early error paths explicitly release it
+  - quota accounting now tracks pending reservations separately from committed private COW pages
+- VM resource tracking records:
+  - current and peak private COW pages
+  - current and peak in-flight loan pages
+  - quota-hit counters
+- COW is currently an anonymous-memory path, not a general path for physical, contiguous, or pager-backed mappings.
+
+## Lazy materialization
+
+- Private lazy anonymous pages allocate on first fault and stay local to the owning address space by default.
+- They no longer publish every newly materialized page into shared/global backing as a side effect.
+- Shared/global anonymous aliases and imported VMOs still fault through the shared/global backing source.
+- Lazy VMO-backed pages bind to a shared/global source frame on first fault.
+- Pager-backed global VMOs materialize through the kernel's pager source abstraction.
+- Kernel VMO byte I/O can also materialize anonymous pages.
+  When that happens for a page that is already mapped somewhere, the kernel now attaches the new
+  frame to existing mapping aliases:
+  - reverse-map nodes are installed
+  - frame map/ref counts are updated
+  - page tables are refreshed from the software VM truth
+
+This keeps post-bind kernel I/O on VMO pages consistent with later unmap / resize / fault paths.
+
+## Reverse-map consumers
+
+- Reverse-map is now part of the retirement mechanism, not only validation / telemetry.
+- VMO shrink no longer barriers every importer or owner address space by default.
+  - after truncation, the kernel retires dropped tail frames only if reverse-map resolution and
+    frame accounting agree that they have no remaining mappings, refs, pins, or loans
+  - exact frame reuse safety is therefore keyed to the dropped frame set, not to the full set of
+    VMO importers
+- The same retire planner now also runs after mapping replacement and loan teardown:
+  - receiver-side loan remap can retire old destination frames that lost their final mapping
+  - releasing a loan token can retire orphaned source frames whose final non-VM reference just
+    disappeared
+- Strict TLB synchronization is still used where the current operation changed one mapping.
+  - for example, receiver-side remap retires old frames only after the receiver address space has
+    crossed the strict barrier for that remap
+
+## Channel page-loan
+
+- Channel write can avoid copying when the payload is page-aligned and spans full pages.
+- Mixed-shape buffers now use the kernel copy service to split:
+  - copied head bytes
+  - optional loaned full-page body
+  - copied tail bytes
+- The current fast path:
+  - validates sender pages
+  - acquires pinned-frame ownership tokens
+  - reserves in-flight loan quota through one typed reservation
+  - prepares sender/receiver address-space transaction state
+  - arms sender-side COW and receiver-side remap behavior
+- The resulting loaned-page object is now a consuming ownership token.
+  - frame pins and loan counts are no longer released through naked `dec_loan/unpin` pairs
+  - releasing a channel payload consumes the loan object and tears down both the frame loan and the
+    in-flight loan budget
+- Channel read can either:
+  - remap the loaned pages into the receiver buffer fast path
+  - or fall back to a copy-fill path through the same internal copy service
+- Receiver-side remap is intentionally strict and expects a compatible writable anonymous destination mapping.
+- When remap replaces an existing anonymous destination frame, reverse-map now decides whether that
+  replaced frame can retire immediately after the strict barrier or must stay alive for other
+  mappings.
+- Sender-side loan preparation now treats the COW arm as a strict commit surface, because stale
+  writable translations would break the snapshot guarantee.
+- When the loan object is later released, the kernel also checks whether any of the loaned source
+  frames became fully orphaned and can now retire.
+
+## Important current limitation
+
+The current page-loan path is still not the full scatter design from the roadmap.
+
+- full-page aligned body: supported
+- head/tail fragments: supported as copied fragments, but not yet as dedicated fragment-page objects
+- mixed scatter descriptor: partially present through fragmented channel payloads, but not yet a general reusable VM scatter descriptor
+- Loaning is currently anonymous-only, resident-only, and page-granular.
+
+This is the main gap between the current channel VM path and the intended final design.
+
+## Current limitations
+
+- Fault serialization now lives in a dedicated kernel fault slice, but it still depends on `VmDomain`
+  planning / commit internals and bootstrap page-allocation helpers.
+- The current strict TLB path can flush active peer CPUs and now runs on top of the phase-one
+  per-CPU scheduler / incoming-wake substrate, but it is still not the final scalability shape for
+  a future multi-core shared-address-space execution model.
+- Physical / contiguous VMOs are not part of the normal fault-on-demand userspace object flow.
+- Loan behavior depends on anonymous/shared-user mappings and is not yet generalized to every future VMO kind.

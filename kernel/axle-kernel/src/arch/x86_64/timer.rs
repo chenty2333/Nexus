@@ -14,6 +14,7 @@ const IA32_TSC_DEADLINE: u32 = 0x6E0;
 // 1ms tick is enough to avoid busy-waiting and keep conformance stable.
 const TICK_NS: u64 = 1_000_000;
 
+static TICKS_ALL_CPUS: AtomicBool = AtomicBool::new(false);
 static USE_TSC_DEADLINE: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the BSP local APIC + a periodic timer interrupt.
@@ -23,6 +24,7 @@ pub fn init_bsp() {
         .is_some_and(|fi| fi.has_tsc_deadline());
 
     USE_TSC_DEADLINE.store(tsc_deadline, Ordering::Relaxed);
+    TICKS_ALL_CPUS.store(tsc_deadline, Ordering::Relaxed);
 
     apic::init_bsp();
 
@@ -38,9 +40,27 @@ pub fn init_bsp() {
     }
 }
 
-/// Current bring-up shape: only the BSP drives periodic timer interrupts.
-pub const fn ticks_all_cpus() -> bool {
-    false
+/// Initialize an AP local timer using the same per-CPU periodic wakeup contract as the BSP.
+pub fn init_ap() {
+    let tsc_deadline = CpuId::new()
+        .get_feature_info()
+        .is_some_and(|fi| fi.has_tsc_deadline());
+
+    crate::arch::apic::init_ap(tsc_deadline);
+
+    if tsc_deadline {
+        USE_TSC_DEADLINE.store(true, Ordering::Relaxed);
+        TICKS_ALL_CPUS.store(true, Ordering::Relaxed);
+        arm_next_tick();
+    } else {
+        crate::kprintln!("timer: AP local scheduler tick disabled without TSC-deadline support");
+    }
+}
+
+/// Phase-one scheduler shape: every online CPU receives a local tick when the hardware exposes
+/// a reliable deadline timer; otherwise the BSP remains the coarse fallback time source.
+pub fn ticks_all_cpus() -> bool {
+    TICKS_ALL_CPUS.load(Ordering::Relaxed)
 }
 
 fn arm_next_tick() {
@@ -87,8 +107,11 @@ axle_timer_entry:
     push rax
 
     mov rdi, rsp
+    lea rsi, [rsp + 15*8]
     call {rust_handler}
 
+    // Restore the interrupted/trap-updated rax before returning to user mode.
+    mov rax, [rsp + 0]
     add rsp, 8
     pop rdi
     pop rsi
@@ -119,10 +142,24 @@ pub fn entry_addr() -> usize {
     axle_timer_entry as *const () as usize
 }
 
-extern "C" fn axle_timer_rust(_frame: *const u8) {
+extern "C" fn axle_timer_rust(frame: &mut crate::arch::int80::TrapFrame, cpu_frame: *mut u64) {
     // Acknowledge first, then drive higher-level timer logic.
     apic::eoi();
     on_tick();
+
+    let from_user = if cpu_frame.is_null() {
+        false
+    } else {
+        // SAFETY: the timer stub passes the pointer to the CPU-saved IRET frame. Reading the CS
+        // slot is valid for both kernel- and user-origin interrupts.
+        unsafe { (*cpu_frame.add(1) & 0b11) == 0b11 }
+    };
+    if from_user {
+        let now = crate::time::now_ns();
+        if crate::object::timer_interrupt_requires_trap_exit(now).unwrap_or(false) {
+            let _ = crate::object::finish_timer_interrupt(frame, cpu_frame);
+        }
+    }
 
     if USE_TSC_DEADLINE.load(Ordering::Relaxed) {
         arm_next_tick();

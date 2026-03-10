@@ -13,7 +13,9 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use axle_types::status::{ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NOT_FOUND, ZX_ERR_OUT_OF_RANGE};
+use axle_types::status::{
+    ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE,
+};
 use axle_types::zx_status_t;
 use x86_64::instructions::segmentation::Segment;
 
@@ -760,26 +762,29 @@ fn load_bootstrap_process_image_into_current_mapping(
     Ok(layout.entry())
 }
 
-pub(crate) fn bootstrap_process_image_layout() -> Option<crate::task::ProcessImageLayout> {
-    let image_size =
-        crate::task::bootstrap_user_runner_source_size().or_else(qemu_loader_user_runner_size)?;
+pub(crate) fn parse_elf_process_image_layout(
+    image_size: u64,
+    mut read_bytes: impl FnMut(u64, usize) -> Result<Vec<u8>, zx_status_t>,
+) -> Result<crate::task::ProcessImageLayout, zx_status_t> {
     if image_size < core::mem::size_of::<Elf64Ehdr>() as u64 {
-        return None;
+        return Err(ZX_ERR_NOT_SUPPORTED);
     }
-    let ehdr_bytes = read_bootstrap_user_runner_bytes(0, core::mem::size_of::<Elf64Ehdr>())?;
+    let ehdr_bytes = read_bytes(0, core::mem::size_of::<Elf64Ehdr>())?;
     if &ehdr_bytes[0..4] != b"\x7FELF" {
-        return None;
+        return Err(ZX_ERR_NOT_SUPPORTED);
     }
 
+    // SAFETY: the buffer is at least one ELF header long and we only read a plain old data
+    // struct from it without assuming alignment.
     let ehdr = unsafe { core::ptr::read_unaligned(ehdr_bytes.as_ptr() as *const Elf64Ehdr) };
     if ehdr.e_ident[4] != 2 || ehdr.e_ident[5] != 1 {
-        return None;
+        return Err(ZX_ERR_NOT_SUPPORTED);
     }
     if ehdr.e_type != 2 || ehdr.e_machine != 0x3E {
-        return None;
+        return Err(ZX_ERR_NOT_SUPPORTED);
     }
     if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
-        panic!("userspace: unexpected phdr size {}", ehdr.e_phentsize);
+        return Err(ZX_ERR_NOT_SUPPORTED);
     }
 
     let phoff = ehdr.e_phoff as usize;
@@ -788,17 +793,19 @@ pub(crate) fn bootstrap_process_image_layout() -> Option<crate::task::ProcessIma
         .checked_mul(core::mem::size_of::<Elf64Phdr>())
         .and_then(|n| n.checked_add(phoff))
         .unwrap_or(usize::MAX);
-    if u64::try_from(phsize).ok()? > image_size {
-        panic!("userspace: phdr table out of range");
+    if u64::try_from(phsize).map_err(|_| ZX_ERR_OUT_OF_RANGE)? > image_size {
+        return Err(ZX_ERR_NOT_SUPPORTED);
     }
-    let ph_table =
-        read_bootstrap_user_runner_bytes(ehdr.e_phoff, phnum * core::mem::size_of::<Elf64Phdr>())?;
+    let ph_table = read_bytes(ehdr.e_phoff, phnum * core::mem::size_of::<Elf64Phdr>())?;
 
     let mut segments = Vec::new();
     let mut min_vaddr = u64::MAX;
     let mut max_vend = 0u64;
+    let mut phdr_vaddr = None;
     for i in 0..phnum {
         let off = i * core::mem::size_of::<Elf64Phdr>();
+        // SAFETY: `off` stays within the already-fetched program-header table and the target
+        // type is a plain old data ELF header.
         let ph =
             unsafe { core::ptr::read_unaligned(ph_table.as_ptr().add(off) as *const Elf64Phdr) };
         const PT_LOAD: u32 = 1;
@@ -808,16 +815,16 @@ pub(crate) fn bootstrap_process_image_layout() -> Option<crate::task::ProcessIma
 
         let file_end = ph.p_offset.checked_add(ph.p_filesz).unwrap_or(u64::MAX);
         if file_end > image_size {
-            panic!("userspace: segment file range out of bounds");
+            return Err(ZX_ERR_NOT_SUPPORTED);
         }
 
         let vaddr = ph.p_vaddr;
         let vend = vaddr.checked_add(ph.p_memsz).unwrap_or(u64::MAX);
         if vaddr < USER_CODE_VA || vend > USER_SHARED_VA {
-            panic!(
-                "userspace: segment vaddr out of range vaddr={:#x} memsz={:#x}",
-                vaddr, ph.p_memsz
-            );
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        if (vaddr & (USER_PAGE_BYTES - 1)) != (ph.p_offset & (USER_PAGE_BYTES - 1)) {
+            return Err(ZX_ERR_NOT_SUPPORTED);
         }
 
         let mut perms = crate::task::process_image_default_code_perms();
@@ -834,13 +841,20 @@ pub(crate) fn bootstrap_process_image_layout() -> Option<crate::task::ProcessIma
         segments.push(segment);
         min_vaddr = min_vaddr.min(vaddr);
         max_vend = max_vend.max(vend);
+        let phdr_end = ehdr
+            .e_phoff
+            .checked_add((phnum as u64) * (core::mem::size_of::<Elf64Phdr>() as u64))
+            .unwrap_or(u64::MAX);
+        if phdr_vaddr.is_none() && ehdr.e_phoff >= ph.p_offset && phdr_end <= file_end {
+            phdr_vaddr = ph.p_vaddr.checked_add(ehdr.e_phoff - ph.p_offset);
+        }
     }
 
     if segments.is_empty() {
-        return None;
+        return Err(ZX_ERR_NOT_SUPPORTED);
     }
     if ehdr.e_entry < min_vaddr || ehdr.e_entry >= max_vend {
-        panic!("userspace: entry out of range {:#x}", ehdr.e_entry);
+        return Err(ZX_ERR_NOT_SUPPORTED);
     }
 
     let code_base = min_vaddr;
@@ -848,12 +862,23 @@ pub(crate) fn bootstrap_process_image_layout() -> Option<crate::task::ProcessIma
         max_vend.checked_sub(code_base).unwrap_or(0),
         USER_PAGE_BYTES,
     );
-    crate::task::ProcessImageLayout::with_segments(
+    crate::task::ProcessImageLayout::with_segments_and_elf(
         code_base,
         code_size_bytes,
         ehdr.e_entry,
         &segments,
+        phdr_vaddr.map(|vaddr| {
+            crate::task::ProcessImageElfInfo::new(vaddr, ehdr.e_phentsize, ehdr.e_phnum)
+        }),
     )
+}
+
+pub(crate) fn bootstrap_process_image_layout() -> Option<crate::task::ProcessImageLayout> {
+    let image_size =
+        crate::task::bootstrap_user_runner_source_size().or_else(qemu_loader_user_runner_size)?;
+    parse_elf_process_image_layout(image_size, |offset, len| {
+        read_bootstrap_user_runner_bytes(offset, len).ok_or(ZX_ERR_IO_DATA_INTEGRITY)
+    })
     .ok()
 }
 
@@ -1522,8 +1547,9 @@ pub fn enter(entry: u64) -> ! {
         ES::set_reg(selectors.user_data);
 
         let stack = USER_STACK_TOP;
-        // Keep interrupts disabled during early bring-up. We only rely on software
-        // traps (`int 0x80`, `int3`) and do not yet have handlers for hardware IRQs.
+        // The bootstrap ring3 bridge still enters outside the generic scheduler/launch path, so
+        // keep IF masked here. Threads started through `start_thread()` / `start_process()`
+        // receive IF=1 via `UserContext::new_user_entry()`.
         let rflags: u64 = 0x002; // bit1 set, IF=0
 
         core::arch::asm!(

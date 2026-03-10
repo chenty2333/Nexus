@@ -17,6 +17,7 @@ use x86_64::registers::model_specific::Msr;
 pub const TIMER_VECTOR: usize = 0x20;
 pub const ERROR_VECTOR: usize = 0x21;
 pub const SPURIOUS_VECTOR: usize = 0xFF;
+const PERIODIC_TIMER_INITIAL: u32 = 5_000_000;
 
 const XAPIC_ICR_LOW_OFF: u64 = 0x300;
 const XAPIC_ICR_HIGH_OFF: u64 = 0x310;
@@ -86,9 +87,9 @@ pub fn init_bsp() {
     };
     let timer_initial = if matches!(timer_mode, TimerMode::Periodic) {
         // Without calibration the APIC timer frequency is model-dependent.
-        // Keep a moderate tick so conformance waits don't burn too much CPU in
-        // TCG, while still being frequent enough for deadline ordering tests.
-        100_000
+        // Bias toward a coarse tick: it is enough for phase-one timeouts/slicing while keeping
+        // QEMU/TCG from spending most of its time in the timer ISR.
+        PERIODIC_TIMER_INITIAL
     } else {
         0
     };
@@ -131,15 +132,15 @@ pub fn init_bsp() {
     unsafe { *BSP_LAPIC.0.get() = Some(lapic) }
 }
 
-/// Enable x2APIC on an AP and keep its local timer disabled.
-pub fn init_ap() {
+/// Enable x2APIC on an AP and optionally leave its local timer running.
+pub fn init_ap(enable_timer: bool) {
     let timer_mode = if cpu_has_tsc_deadline() {
         TimerMode::TscDeadline
     } else {
         TimerMode::Periodic
     };
     let timer_initial = if matches!(timer_mode, TimerMode::Periodic) {
-        100_000
+        PERIODIC_TIMER_INITIAL
     } else {
         0
     };
@@ -173,7 +174,9 @@ pub fn init_ap() {
     // SAFETY: CPU-local register programming during AP bring-up.
     unsafe {
         lapic.enable();
-        lapic.disable_timer();
+        if !enable_timer {
+            lapic.disable_timer();
+        }
     }
 }
 

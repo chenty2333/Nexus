@@ -32,15 +32,15 @@ pub fn init() {
     percpu::init();
 }
 
-/// Minimal AP init: load GDT/TSS/IDT, set per-CPU base, enable local APIC and
-/// keep its timer masked.
+/// Minimal AP init: load GDT/TSS/IDT, set per-CPU base, enable local APIC, and
+/// arm the CPU-local scheduler tick.
 pub fn init_ap() {
     serial::init();
     enable_no_execute();
     let _ = gdt::init();
     idt::load();
     percpu::init();
-    apic::init_ap();
+    timer::init_ap();
 }
 
 fn enable_no_execute() {

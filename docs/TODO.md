@@ -21,16 +21,16 @@ Current rough status:
 
 ### A. Scheduler / Execution Model `[~]`
 
-#### A1. per-CPU L0 scheduler `[ ]`
+#### A1. per-CPU L0 scheduler follow-on `[~]`
 
-= replace the current bootstrap/global scheduling shape with real per-CPU scheduling  
-= one runqueue per CPU, remote wakeup, reschedule IPI, unified blocked/runnable states, basic preemption/time slicing  
+= phase-one per-CPU runnable ownership, remote wakeup, reschedule IPI, unified blocked/runnable states, and basic preemption/time slicing have landed
+= remaining work is scheduler policy follow-on: load balancing, richer fairness/accounting, lock-granularity cleanup, and L1 handoff points
 depends on: existing SMP bring-up, thread/process model, wait/futex/port blocking paths
 
-#### A2. generic userspace launch `[~]`
+#### A2. generic userspace launch follow-on `[~]`
 
-= move from the current special-case bootstrap runner path to a reusable process launch path  
-= generic ELF loader, init/service launcher, `process_start(arg_handle)` support, less runner-specific code in bring-up  
+= phase-one generic image launch, `process_start(arg_handle)`, and executable child start have landed
+= remaining work is broader launcher coverage: fuller ELF support, init/service launch, and less bootstrap-specific bring-up for the very first userspace entry
 depends on: A1, C1
 
 #### A3. user-mode L1 scheduler `[ ]`
@@ -55,10 +55,10 @@ depends on: B1, A2
 
 ### C. VM Mainline Completion `[~]`
 
-#### C1. Execute VM / code mappings `[ ]`
+#### C1. Execute VM / code mappings follow-on `[~]`
 
-= complete executable mapping support and code-start rules  
-= `ZX_VM_PERM_EXECUTE`, `ZX_VM_CAN_MAP_EXECUTE`, NX/X permission flow, launch-time validation for executable user mappings  
+= phase-one executable mapping support and launch-time validation have landed
+= remaining work is broader ecosystem coverage around pager/file-backed execution and additional hardening/tests
 depends on: existing page-table, VMAR, VMO, loader path
 
 #### C2. pager-backed / file-backed VMO externalization `[~]`
@@ -75,8 +75,8 @@ depends on: C1, B2
 
 #### C4. TLB / invalidate hardening `[~]`
 
-= make invalidation and shootdown behavior less bootstrap-like and more scalable  
-= stronger active-CPU tracking, finer shootdown policy, better batching, stronger SMP correctness tests  
+= phase-one strict visibility and active-peer shootdown support have landed
+= remaining work is scalability: finer active-CPU tracking, better batching, and stronger SMP correctness tests
 depends on: existing epoch/shootdown base
 
 ### D. IPC Mainline Completion `[~]`
@@ -197,19 +197,17 @@ full shape will also depend on: H
 
 If the immediate goal is "move toward Starnix with the least detour", the rough path is:
 
-1. A1 per-CPU scheduler
-2. A2 generic userspace launch
-3. C1 executable VM support
-4. D1/D2 channel completion and hardening
-5. F1 thin `libzircon`
-6. F2 async runtime
-7. G minimal component framework
-8. I minimal fd/I/O stack
-9. J initial Starnix runner and Linux adaptation work
+1. D1/D2 channel completion and hardening
+2. F1 thin `libzircon`
+3. F2 async runtime
+4. G minimal component framework
+5. I minimal fd/I/O stack
+6. J initial Starnix runner and Linux adaptation work
 
 ## Notes For Agents
 
-- A1 and A2 are foundational even if they do not look flashy.
+- The first substrate-closing pass is in; the next priorities are the outer runtime layers and
+  remaining IPC hardening.
 - B1/B2 are not the shortest path to a demo, but delaying them too far can create later refactors.
 - C3 and E2 matter more for DFv2 than for the earliest Starnix-facing work.
 - D1 is one of the main remaining gaps between the current channel implementation and the full roadmap design.
