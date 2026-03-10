@@ -422,7 +422,23 @@ const SLOT_CHANNEL_FRAGMENTED_WRITE_COPY: usize = 523;
 const SLOT_CHANNEL_FRAGMENTED_READ_COPY: usize = 524;
 const SLOT_CHANNEL_FRAGMENTED_ACTUAL_BYTES_COPY: usize = 525;
 const SLOT_CHANNEL_FRAGMENTED_MATCH_COPY: usize = 526;
-const SLOT_MAX: usize = SLOT_CHANNEL_FRAGMENTED_MATCH_COPY;
+const SLOT_CHANNEL_WAIT_ASYNC_PORT_CREATE: usize = 527;
+const SLOT_CHANNEL_WAIT_ASYNC_CREATE: usize = 528;
+const SLOT_CHANNEL_WAIT_ASYNC_FILL: usize = 529;
+const SLOT_CHANNEL_WAIT_ASYNC_FULL_WRITE: usize = 530;
+const SLOT_CHANNEL_WAIT_ASYNC_ARM_WRITABLE: usize = 531;
+const SLOT_CHANNEL_WAIT_ASYNC_READ: usize = 532;
+const SLOT_CHANNEL_WAIT_ASYNC_PORT_WAIT_WRITABLE: usize = 533;
+const SLOT_CHANNEL_WAIT_ASYNC_WRITABLE_KEY: usize = 534;
+const SLOT_CHANNEL_WAIT_ASYNC_WRITABLE_TYPE: usize = 535;
+const SLOT_CHANNEL_WAIT_ASYNC_WRITABLE_OBSERVED: usize = 536;
+const SLOT_CHANNEL_WAIT_ASYNC_ARM_PEER_CLOSED: usize = 537;
+const SLOT_CHANNEL_WAIT_ASYNC_CLOSE_PEER: usize = 538;
+const SLOT_CHANNEL_WAIT_ASYNC_PORT_WAIT_CLOSED: usize = 539;
+const SLOT_CHANNEL_WAIT_ASYNC_CLOSED_KEY: usize = 540;
+const SLOT_CHANNEL_WAIT_ASYNC_CLOSED_TYPE: usize = 541;
+const SLOT_CHANNEL_WAIT_ASYNC_CLOSED_OBSERVED: usize = 542;
+const SLOT_MAX: usize = SLOT_CHANNEL_WAIT_ASYNC_CLOSED_OBSERVED;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1528,6 +1544,26 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_CHANNEL_FRAGMENTED_READ_COPY] as i64,
         slots[SLOT_CHANNEL_FRAGMENTED_ACTUAL_BYTES_COPY] as i64,
         slots[SLOT_CHANNEL_FRAGMENTED_MATCH_COPY] as i64
+    );
+
+    crate::kprintln!(
+        "kernel: channel wait_async signals (channel_wait_async_port_create={}, channel_wait_async_create={}, channel_wait_async_fill={}, channel_wait_async_full_write={}, channel_wait_async_arm_writable={}, channel_wait_async_read={}, channel_wait_async_port_wait_writable={}, channel_wait_async_writable_key={}, channel_wait_async_writable_type={}, channel_wait_async_writable_observed={}, channel_wait_async_arm_peer_closed={}, channel_wait_async_close_peer={}, channel_wait_async_port_wait_closed={}, channel_wait_async_closed_key={}, channel_wait_async_closed_type={}, channel_wait_async_closed_observed={})",
+        slots[SLOT_CHANNEL_WAIT_ASYNC_PORT_CREATE] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_CREATE] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_FILL] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_FULL_WRITE] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_ARM_WRITABLE] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_READ] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_PORT_WAIT_WRITABLE] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_WRITABLE_KEY] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_WRITABLE_TYPE] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_WRITABLE_OBSERVED] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_ARM_PEER_CLOSED] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_CLOSE_PEER] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_PORT_WAIT_CLOSED] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_CLOSED_KEY] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_CLOSED_TYPE] as i64,
+        slots[SLOT_CHANNEL_WAIT_ASYNC_CLOSED_OBSERVED] as i64
     );
 
     crate::arch::qemu::exit_success();

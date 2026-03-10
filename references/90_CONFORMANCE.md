@@ -58,6 +58,9 @@ Main just targets include:
 - Bootstrap channel coverage now also includes one fragmented mixed-payload gate:
   - one exact-body remap read shape
   - one fallback-copy read shape
+- Bootstrap channel coverage now also includes one async-signal gate:
+  - `CHANNEL_WRITABLE` recovery through `wait_async` + `port_wait`
+  - `CHANNEL_PEER_CLOSED` delivery through the same path without stale writable republish
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return
@@ -160,9 +163,10 @@ The current tree still carries some bootstrap testing infrastructure in both pla
 - Conformance coverage is strongest for the current bootstrap syscall surface, not for future subsystem families that are still missing.
 - Some bring-up tests still depend on special bootstrap userspace plumbing.
 - Loom coverage now extends beyond `axle-sync` into:
-  - host-side `axle-core` port/wait_async ordering
   - host-side `axle-core` wait-core winner races (`wake/timeout/cancel/requeue`)
   - host-side `axle-mm` fault/loan accounting models
+- `axle-core` port/observer lifecycle and backpressure are currently covered by host unit tests and
+  QEMU conformance, not loom state-space exploration.
 - A local Stage-3 timer-backend profile currently does not justify replacing the binary-heap
   deadline backend with a wheel:
   - `BinaryHeap` push/pop churn stayed in the tens-of-nanoseconds range in a synthetic host-side

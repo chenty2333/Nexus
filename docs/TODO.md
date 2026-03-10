@@ -73,25 +73,27 @@ depends on: existing lazy-VMO materialization path
 = Physical/MMIO VMO, Contiguous/DMA-capable memory, DMA grant or `DmaContext`, IOMMU-facing isolation hooks  
 depends on: C1, B2
 
-#### C4. TLB / invalidate hardening `[~]`
+#### C4. TLB / invalidate hardening `[x]`
 
-= phase-one strict visibility and active-peer shootdown support have landed
-= remaining work is scalability: finer active-CPU tracking, better batching, and stronger SMP correctness tests
+= strict visibility and active-peer shootdown support have landed
+= shootdown ack timeout now fails the strict commit instead of silently advancing observed epochs
+= current remaining work is scalability-only follow-up: finer active-CPU tracking and better batching
 depends on: existing epoch/shootdown base
 
-### D. IPC Mainline Completion `[~]`
+### D. IPC Mainline Completion `[x]`
 
-#### D1. Channel scatter page-loan `[~]`
+#### D1. Channel scatter page-loan `[x]`
 
-= complete the roadmap design beyond the current full-page fast path  
 = bootstrap mixed head/body/tail remap/copy coverage now exists, and sender-side aligned body loan no longer requires an exact standalone mapping
-= remaining work: fragment pages, a more reusable scatter descriptor, and broader runtime stress/hardening
+= fragmented payload remap/copy, snapshot preservation, receiver-side remap COW, and quota recovery are now all contracted
+= future fragment-page objects or a more reusable scatter descriptor are deferred generalization work, not a runtime blocker
 depends on: existing full-page loan, pin/refcount/loan accounting, COW support
 
-#### D2. Channel race hardening `[~]`
+#### D2. Channel race hardening `[x]`
 
-= make channel cleanup and concurrency behavior robust enough for broader runtime use  
-= close/cancel/read/write race cleanup, quota/telemetry refinement, more stress coverage, more differential-style validation  
+= channel cleanup and concurrency behavior are now contracted far enough for bootstrap runtime use
+= close/read ordering, WRITABLE recovery, and channel wait_async/port_wait signal delivery now have explicit regression coverage
+= broader differential fuzz/stress remains ongoing hardening work rather than an open correctness gate
 depends on: D1
 
 ### E. Object Family Expansion `[~]`

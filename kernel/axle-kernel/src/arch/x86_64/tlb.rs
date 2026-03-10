@@ -1,5 +1,7 @@
 //! Minimal TLB maintenance helpers for bootstrap page-table mutation.
 
+use axle_types::zx_status_t;
+
 /// Flush one virtual address from the current CPU's TLB.
 pub fn flush_page_local(va: u64) {
     unsafe {
@@ -22,7 +24,7 @@ pub fn flush_all_local() {
 
 /// Flush one page locally and request remote CPUs to invalidate the same page.
 #[allow(dead_code)]
-pub fn flush_page_global(va: u64) {
+pub fn flush_page_global(va: u64) -> Result<(), zx_status_t> {
     flush_page_local(va);
-    crate::arch::ipi::shootdown_page(va);
+    crate::arch::ipi::shootdown_page(va)
 }

@@ -47,6 +47,10 @@ Each endpoint's inbound queue is currently capped at `64` messages.
 - `CHANNEL_PEER_CLOSED` when the peer endpoint is gone
 
 These are computed from endpoint state and participate in both `wait_one` and `wait_async`.
+- Bootstrap conformance now covers both direct waits and port-delivered async signal packets:
+  - `CHANNEL_WRITABLE` recovery after one peer read reopens queue headroom
+  - `CHANNEL_PEER_CLOSED` delivery after peer teardown
+  - no stale `CHANNEL_WRITABLE` republish after peer close
 
 ## Write path
 
@@ -95,3 +99,6 @@ These are computed from endpoint state and participate in both `wait_one` and `w
 - Receiver-side fragmented remap is still stricter than the fallback path.
   - the loaned body currently expects a compatible exact anonymous destination mapping span
   - a normal contiguous user buffer still works, but it takes the copy-fill path instead of remap
+- The current runtime-grade contract is centered on the existing mixed `head/body/tail` design.
+  Dedicated fragment-page objects or a reusable general scatter descriptor are still later
+  generalization work, not part of the current bootstrap/runtime gate.

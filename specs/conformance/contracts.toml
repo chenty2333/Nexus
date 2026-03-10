@@ -210,6 +210,14 @@ mode = "not_applicable"
 reason = "channel backpressure/writable contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
+id = "must.channel.wait_async_signal_bootstrap"
+level = "must"
+description = "Bootstrap channel wait_async and port_wait must deliver WRITABLE recovery and PEER_CLOSED transitions with stable signal packets and no stale WRITABLE republish after peer close"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "channel signal delivery through kernel ports is exercised by QEMU bootstrap scenarios, not the current host-side concurrent harness"
+
+[[contracts]]
 id = "must.channel.handle_transfer_bootstrap"
 level = "must"
 description = "Bootstrap channel write/read must move transferred handles, invalidate the sender copy, and make the received handle immediately usable"

@@ -1,0 +1,34 @@
+id = "kernel.channel.wait_async_signal_bootstrap"
+description = "Bootstrap channels should deliver WRITABLE recovery and PEER_CLOSED packets through wait_async and port_wait"
+tags = ["module:channel", "module:kernel", "module:signals", "module:port", "kind:qemu"]
+timeout_ms = 180000
+command = [
+  "sh",
+  "-c",
+  "cargo build -p axle-kernel -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+expect = ["kernel: int80 conformance ok", "kernel: channel wait_async signals"]
+forbid = ["KERNEL PANIC"]
+contracts = ["must.channel.wait_async_signal_bootstrap"]
+
+[assertions.status_code]
+channel_wait_async_port_create = 0
+channel_wait_async_create = 0
+channel_wait_async_fill = 0
+channel_wait_async_arm_writable = 0
+channel_wait_async_read = 0
+channel_wait_async_port_wait_writable = 0
+channel_wait_async_arm_peer_closed = 0
+channel_wait_async_close_peer = 0
+channel_wait_async_port_wait_closed = 0
+
+[assertions.error_code]
+channel_wait_async_full_write = -22
+
+[assertions.packet_fields]
+channel_wait_async_writable_key = 28929
+channel_wait_async_writable_type = 1
+channel_wait_async_writable_observed = 2
+channel_wait_async_closed_key = 28930
+channel_wait_async_closed_type = 1
+channel_wait_async_closed_observed = 4

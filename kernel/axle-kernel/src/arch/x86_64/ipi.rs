@@ -2,6 +2,8 @@
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+use axle_types::status::ZX_ERR_TIMED_OUT;
+use axle_types::zx_status_t;
 use raw_cpuid::CpuId;
 use spin::Mutex;
 
@@ -160,13 +162,17 @@ fn tlb_ack_count(apic_id: usize) -> u64 {
 }
 
 #[allow(dead_code)]
-pub fn shootdown_page(va: u64) {
+pub fn shootdown_page(va: u64) -> Result<(), zx_status_t> {
     let _guard = TLB_SHOOTDOWN_LOCK.lock();
     TLB_SHOOTDOWN_MODE.store(TLB_MODE_PAGE, Ordering::Release);
     TLB_SHOOTDOWN_PAGE.store(va, Ordering::Release);
 
+    let mut result = Ok(());
     let local_apic_id = apic::this_apic_id() as usize;
     crate::smp::for_each_online_cpu(|apic_id| {
+        if result.is_err() {
+            return;
+        }
         if apic_id == local_apic_id {
             return;
         }
@@ -179,6 +185,11 @@ pub fn shootdown_page(va: u64) {
         while tlb_ack_count(apic_id) == before {
             core::hint::spin_loop();
             if delta != 0 && crate::time::rdtsc().wrapping_sub(start) > delta {
+                crate::kprintln!(
+                    "ipi: page shootdown timed out waiting for cpu{} ack",
+                    apic_id
+                );
+                result = Err(ZX_ERR_TIMED_OUT);
                 break;
             }
         }
@@ -186,14 +197,19 @@ pub fn shootdown_page(va: u64) {
 
     TLB_SHOOTDOWN_PAGE.store(0, Ordering::Release);
     TLB_SHOOTDOWN_MODE.store(TLB_MODE_NONE, Ordering::Release);
+    result
 }
 
-pub fn shootdown_all(apic_ids: &[usize]) {
+pub fn shootdown_all(apic_ids: &[usize]) -> Result<(), zx_status_t> {
     let _guard = TLB_SHOOTDOWN_LOCK.lock();
     TLB_SHOOTDOWN_MODE.store(TLB_MODE_FULL, Ordering::Release);
     TLB_SHOOTDOWN_PAGE.store(0, Ordering::Release);
 
+    let mut result = Ok(());
     for &apic_id in apic_ids {
+        if result.is_err() {
+            break;
+        }
         if apic_id == apic::this_apic_id() as usize {
             continue;
         }
@@ -205,12 +221,18 @@ pub fn shootdown_all(apic_ids: &[usize]) {
         while tlb_ack_count(apic_id) == before {
             core::hint::spin_loop();
             if delta != 0 && crate::time::rdtsc().wrapping_sub(start) > delta {
+                crate::kprintln!(
+                    "ipi: full shootdown timed out waiting for cpu{} ack",
+                    apic_id
+                );
+                result = Err(ZX_ERR_TIMED_OUT);
                 break;
             }
         }
     }
 
     TLB_SHOOTDOWN_MODE.store(TLB_MODE_NONE, Ordering::Release);
+    result
 }
 
 /// Send one reschedule IPI to `apic_id`.

@@ -1154,6 +1154,128 @@ channel_writable_fill_done:
 	int $0x80
 	mov %rax, 8*340(%rbx)
 
+	// port_create(channel wait_async)
+	lea 0x1d30(%rbx), %rsi
+	xorl %edi, %edi
+	movabs $3, %rax
+	int $0x80
+	mov %rax, 8*527(%rbx)
+
+	// channel_create(channel wait_async)
+	lea 0x1d38(%rbx), %rsi
+	lea 0x1d40(%rbx), %rdx
+	xorl %edi, %edi
+	movabs $13, %rax
+	int $0x80
+	mov %rax, 8*528(%rbx)
+
+	// tx bytes @ 0x1d48
+	movabs $0x1122334455667788, %rax
+	mov %rax, 0x1d48(%rbx)
+
+	// Fill the peer queue to CHANNEL_CAPACITY so WRITABLE clears.
+	movq $64, 0x1d50(%rbx)
+channel_wait_async_fill_loop:
+	mov 0x1d50(%rbx), %rax
+	test %rax, %rax
+	jz channel_wait_async_fill_done
+	mov 0x1d38(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x1d48(%rbx), %rdx
+	movl $8, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*529(%rbx)
+	decq 0x1d50(%rbx)
+	jmp channel_wait_async_fill_loop
+channel_wait_async_fill_done:
+
+	// The next write should fail with SHOULD_WAIT while the peer queue stays full.
+	mov 0x1d38(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x1d48(%rbx), %rdx
+	movl $8, %r10d
+	xorl %r8d, %r8d
+	xorl %r9d, %r9d
+	movabs $14, %rax
+	int $0x80
+	mov %rax, 8*530(%rbx)
+
+	// wait_async(tx, port, key=0x7101, CHANNEL_WRITABLE)
+	mov 0x1d38(%rbx), %rdi
+	mov 0x1d30(%rbx), %rsi
+	movabs $0x7101, %rdx
+	movl $0x2, %r10d
+	xorl %r8d, %r8d
+	movabs $2, %rax
+	int $0x80
+	mov %rax, 8*531(%rbx)
+
+	// channel_read(rx) frees one slot and should publish one WRITABLE packet.
+	movq $0, 0x1d58(%rbx)
+	movq $0, 0x1d60(%rbx)
+	mov 0x1d40(%rbx), %rdi
+	xorl %esi, %esi
+	lea 0x1d68(%rbx), %rdx
+	xorl %r10d, %r10d
+	movl $8, %r8d
+	xorl %r9d, %r9d
+	lea 0x1d58(%rbx), %rax
+	lea 0x1d60(%rbx), %rcx
+	sub $16, %rsp
+	mov %rax, 0(%rsp)
+	mov %rcx, 8(%rsp)
+	movabs $15, %rax
+	int $0x80
+	add $16, %rsp
+	mov %rax, 8*532(%rbx)
+
+	// port_wait(port) should now return one signal packet with WRITABLE observed.
+	mov 0x1d30(%rbx), %rdi
+	xor %esi, %esi
+	lea 0x1d70(%rbx), %rdx
+	movabs $5, %rax
+	int $0x80
+	mov %rax, 8*533(%rbx)
+	mov 0x1d70(%rbx), %rax
+	mov %rax, 8*534(%rbx)
+	mov 0x1d78(%rbx), %rax
+	mov %rax, 8*535(%rbx)
+	mov 0x1d80(%rbx), %rax
+	shr $32, %rax
+	mov %rax, 8*536(%rbx)
+
+	// Re-arm for CHANNEL_PEER_CLOSED and make sure close does not republish stale WRITABLE.
+	mov 0x1d38(%rbx), %rdi
+	mov 0x1d30(%rbx), %rsi
+	movabs $0x7102, %rdx
+	movl $0x4, %r10d
+	xorl %r8d, %r8d
+	movabs $2, %rax
+	int $0x80
+	mov %rax, 8*537(%rbx)
+
+	mov 0x1d40(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+	mov %rax, 8*538(%rbx)
+
+	mov 0x1d30(%rbx), %rdi
+	xor %esi, %esi
+	lea 0x1d88(%rbx), %rdx
+	movabs $5, %rax
+	int $0x80
+	mov %rax, 8*539(%rbx)
+	mov 0x1d88(%rbx), %rax
+	mov %rax, 8*540(%rbx)
+	mov 0x1d90(%rbx), %rax
+	mov %rax, 8*541(%rbx)
+	mov 0x1d98(%rbx), %rax
+	shr $32, %rax
+	mov %rax, 8*542(%rbx)
+
 	// channel_create(handle transfer)
 	lea 0x1cf0(%rbx), %rsi
 	lea 0x1cf8(%rbx), %rdx

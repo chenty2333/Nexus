@@ -96,6 +96,9 @@ This keeps post-bind kernel I/O on VMO pages consistent with later unmap / resiz
 - Strict TLB synchronization is still used where the current operation changed one mapping.
   - for example, receiver-side remap retires old frames only after the receiver address space has
     crossed the strict barrier for that remap
+- Strict shootdown is now fail-closed.
+  - if one remote CPU does not acknowledge the required invalidate before the timeout window, the
+    kernel returns an error and does not mark that CPU's epoch as observed for the strict commit
 
 ## Channel page-loan
 
@@ -151,7 +154,9 @@ This is the main gap between the current channel VM path and the intended final 
 - Fault serialization now lives in a dedicated kernel fault slice, but it still depends on `VmDomain`
   planning / commit internals and bootstrap page-allocation helpers.
 - The current strict TLB path can flush active peer CPUs and now runs on top of the phase-one
-  per-CPU scheduler / incoming-wake substrate, but it is still not the final scalability shape for
-  a future multi-core shared-address-space execution model.
+  per-CPU scheduler / incoming-wake substrate.
+  - the correctness gate is now fail-closed
+  - the remaining gap is scalability shape for a future multi-core shared-address-space execution
+    model, not silent success on missed shootdown ack
 - Physical / contiguous VMOs are not part of the normal fault-on-demand userspace object flow.
 - Loan behavior depends on anonymous/shared-user mappings and is not yet generalized to every future VMO kind.

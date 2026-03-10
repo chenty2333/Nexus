@@ -5415,7 +5415,7 @@ pub(crate) fn apply_tlb_commit_reqs(
             crate::arch::tlb::flush_all_local();
         }
         if !plan.remote_cpus.is_empty() {
-            crate::arch::ipi::shootdown_all(&plan.remote_cpus);
+            crate::arch::ipi::shootdown_all(&plan.remote_cpus)?;
         }
 
         let mut vm = vm_handle.lock();

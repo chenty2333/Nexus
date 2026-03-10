@@ -66,6 +66,8 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
 - Signal producers now publish `(waitable_id, current_signals)` directly into the reactor path.
   The wait slice no longer pulls current signal snapshots from the global object table during
   async delivery.
+- Bootstrap conformance now explicitly covers both timer/object waits and transport-object delivery
+  through this path, including channel `WRITABLE` recovery and `PEER_CLOSED` packets.
 
 ## Port model
 
