@@ -9,6 +9,7 @@ members = [
   "crates/axle-types",
   "crates/libzircon",
   "crates/nexus-component",
+  "crates/nexus-io",
   "crates/nexus-rt",
 
   # Tools (host binaries)

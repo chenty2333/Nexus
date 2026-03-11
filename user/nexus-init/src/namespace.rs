@@ -6,6 +6,7 @@ use axle_types::status::{ZX_ERR_INVALID_ARGS, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_N
 use axle_types::{zx_handle_t, zx_status_t, zx_time_t};
 use libzircon::zx_channel_write;
 use nexus_component::{CapabilityKind, ComponentDecl, DirectoryOpenRequest, NamespaceEntry};
+use nexus_io::{NamespaceTrie, normalize_namespace_path};
 
 use crate::lifecycle::{read_channel_blocking, read_channel_fixed, wait_for_channel_readable};
 use crate::{ECHO_PROTOCOL_NAME, MAX_SMALL_CHANNEL_BYTES, MAX_SMALL_CHANNEL_HANDLES};
@@ -40,6 +41,7 @@ pub(crate) fn build_namespace_entries(
     registry: &mut CapabilityRegistry,
 ) -> Result<Vec<NamespaceEntry>, zx_status_t> {
     let mut entries = Vec::new();
+    let mut trie = NamespaceTrie::new();
     for use_decl in &decl.uses {
         match use_decl.kind {
             CapabilityKind::Protocol | CapabilityKind::Directory => {
@@ -47,8 +49,10 @@ pub(crate) fn build_namespace_entries(
                     return Err(ZX_ERR_INVALID_ARGS);
                 };
                 let handle = registry.take_protocol(&use_decl.source_name)?;
+                let normalized = normalize_namespace_path(path)?;
+                trie.insert(normalized.as_str(), handle)?;
                 entries.push(NamespaceEntry {
-                    path: path.clone(),
+                    path: normalized,
                     handle,
                 });
             }

@@ -206,9 +206,18 @@ depends on: C3, E2, G
 
 ### I. I/O Stack `[ ]`
 
-#### I1. zxio/fdio-like fd abstraction
+#### I1. zxio/fdio-like fd abstraction `[~]`
 
 = bridge channel/protocol objects into fd-shaped userspace APIs
+= the current tree now has a dedicated `crates/nexus-io` userspace crate with:
+  - `FdOps`
+  - `FdTable`
+  - `WaitSpec`
+  - `OpenFlags` / `FdFlags` / read-only `VmoFlags`
+  - `RemoteFile` / `RemoteDir` / `SocketFd` / `PipeFd` / `StdioFd` / `PseudoNodeFd`
+= `FdTable` already separates per-fd state from shared open-file-description state
+= `nexus-init` now uses the shared namespace path normalizer and mount registry
+  shape from `nexus-io` instead of an ad-hoc path container
 
 #### I2. namespace / VFS / pipe / socket glue
 

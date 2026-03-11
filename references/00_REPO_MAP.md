@@ -86,6 +86,8 @@ At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` is the only intentional `draft` b
 - `crates/axle-arch-x86_64` - userspace-side x86_64 ABI glue and syscall entry helpers
 - `crates/libzircon` - thin `zx_*` userspace wrappers over the current Axle `int 0x80` ABI
 - `crates/nexus-component` - minimal component declaration IR, resolver result shape, bootstrap-channel start payloads, and tiny lifecycle/directory messages
+- `crates/nexus-io` - early userspace fd/namespace substrate: `FdOps`, `FdTable`,
+  `WaitSpec`, handle-backed fd wrappers, and longest-prefix `NamespaceTrie`
 - `crates/nexus-rt` - single-thread userspace dispatcher/executor built on one port, one dispatcher timer, generation-safe signal registrations, and async channel/socket helpers
 - `kernel/axle-kernel` - live kernel integration layer
 - `user/nexus-init` - extracted bootstrap `nexus-init` root manager plus shared
