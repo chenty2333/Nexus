@@ -8,6 +8,14 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+use alloc::vec;
+use alloc::vec::Vec;
+use core::ptr;
+
+pub use nexus_component;
+
 pub use axle_types::clock;
 pub use axle_types::handle;
 pub use axle_types::koid;
@@ -26,6 +34,8 @@ pub use axle_types::{
 };
 
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
+use axle_types::handle::ZX_HANDLE_INVALID;
+use axle_types::status::{ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NO_MEMORY};
 use axle_types::syscall_numbers::{
     AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
@@ -246,6 +256,92 @@ pub fn zx_channel_read(
             actual_handles as u64,
         ],
     )
+}
+
+/// Read the next channel message into freshly allocated byte and handle vectors.
+pub fn zx_channel_read_alloc(
+    handle: zx_handle_t,
+    options: u32,
+) -> Result<(Vec<u8>, Vec<zx_handle_t>), zx_status_t> {
+    loop {
+        let mut actual_bytes = 0u32;
+        let mut actual_handles = 0u32;
+        let probe = zx_channel_read(
+            handle,
+            options,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+            0,
+            &mut actual_bytes,
+            &mut actual_handles,
+        );
+        if probe != ZX_ERR_BUFFER_TOO_SMALL && probe != status::ZX_OK {
+            return Err(probe);
+        }
+
+        let byte_len = usize::try_from(actual_bytes).map_err(|_| status::ZX_ERR_OUT_OF_RANGE)?;
+        let handle_len =
+            usize::try_from(actual_handles).map_err(|_| status::ZX_ERR_OUT_OF_RANGE)?;
+
+        let mut bytes = vec![0u8; byte_len];
+        let mut handles = vec![ZX_HANDLE_INVALID; handle_len];
+        let status = zx_channel_read(
+            handle,
+            options,
+            if bytes.is_empty() {
+                ptr::null_mut()
+            } else {
+                bytes.as_mut_ptr()
+            },
+            if handles.is_empty() {
+                ptr::null_mut()
+            } else {
+                handles.as_mut_ptr()
+            },
+            actual_bytes,
+            actual_handles,
+            &mut actual_bytes,
+            &mut actual_handles,
+        );
+        if status == ZX_ERR_BUFFER_TOO_SMALL {
+            continue;
+        }
+        if status != status::ZX_OK {
+            return Err(status);
+        }
+        bytes.truncate(usize::try_from(actual_bytes).map_err(|_| status::ZX_ERR_OUT_OF_RANGE)?);
+        handles.truncate(usize::try_from(actual_handles).map_err(|_| status::ZX_ERR_OUT_OF_RANGE)?);
+        return Ok((bytes, handles));
+    }
+}
+
+/// Bootstrap-channel helpers for component-manager style process startup.
+pub mod bootstrap {
+    use nexus_component::{CodecError, ComponentStartInfo};
+
+    use super::*;
+
+    fn map_codec_error(error: CodecError) -> zx_status_t {
+        match error {
+            CodecError::UnexpectedEof
+            | CodecError::InvalidMagic
+            | CodecError::UnsupportedVersion(_)
+            | CodecError::InvalidTag { .. }
+            | CodecError::InvalidUtf8
+            | CodecError::TrailingBytes
+            | CodecError::HandleCountMismatch { .. } => ZX_ERR_IO_DATA_INTEGRITY,
+            CodecError::LengthOverflow => ZX_ERR_NO_MEMORY,
+        }
+    }
+
+    /// Read and decode one `ComponentStartInfo` message from a bootstrap channel.
+    pub fn read_component_start_info(
+        bootstrap_channel: zx_handle_t,
+    ) -> Result<ComponentStartInfo, zx_status_t> {
+        let (bytes, handles) = zx_channel_read_alloc(bootstrap_channel, 0)?;
+        ComponentStartInfo::decode_channel_message(&bytes, &handles).map_err(map_codec_error)
+    }
 }
 
 /// Create a socket pair.

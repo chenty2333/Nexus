@@ -111,6 +111,10 @@ The first generic-launch contract is now implemented without changing syscall si
 ## Current limitations
 
 - Generic init/service launching above the raw process API is not done yet.
+- The phase-three component-manager contract is now frozen around that raw process API:
+  `process_start(arg_handle)` is treated as "child bootstrap channel", and the
+  higher-level start payload moves over that channel instead of adding new
+  process-start syscall arguments.
 - The initial BSP ring3 entry still comes from bootstrap-specific bring-up plumbing, even though
   child process launch now uses the generic path.
 - The current ELF parser is intentionally narrow:

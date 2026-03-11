@@ -8,12 +8,14 @@ members = [
   "crates/axle-sync",
   "crates/axle-types",
   "crates/libzircon",
+  "crates/nexus-component",
   "crates/nexus-rt",
 
   # Tools (host binaries)
   "tools/syscalls-gen",
   "tools/axle-conformance",
   "tools/axle-concurrency",
+  "tools/nexus-manifestc",
 
   # These crates are `no_std` and not built by the default host-only CI gates yet,
   # but we keep them in the workspace so formatting and metadata stay coherent.

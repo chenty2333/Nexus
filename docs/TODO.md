@@ -138,21 +138,31 @@ depends on: F1
 = transport, encoding/decoding, async binding support  
 depends on: F2
 
-### G. Component Framework `[ ]`
+### G. Component Framework `[~]`
 
-#### G1. runner abstraction
+#### G1. runner abstraction `[~]`
 
-= a generic process/component launch interface
+= round-one launch contracts are now frozen:
+  - shared `ComponentDecl` binary IR
+  - shared `ResolvedComponent` shape
+  - bootstrap-channel `ComponentStartInfo`
+  - minimal controller and outgoing-directory request messages
+= remaining work is the live `ElfRunner` and manager wiring on top of those contracts
 
 #### G2. capability routing
 
 = structured capability passing and restriction between components
 
-#### G3. init / service manager / minimal resolver
+#### G3. init / service manager / minimal resolver `[~]`
 
-= enough system topology to start and connect core services
+= round-one groundwork is in:
+  - host-side manifest compiler for the minimal component IR
+  - unified resolver shape for `boot://`, `pkg://`, and `local://`
+  - in-memory resolver table that hides scheme-specific details from runners
+= remaining work is the first real `nexus-init` / service-manager topology loop:
+  namespace assembly, eager bring-up, controller handling, and lazy-start follow-on
 
-depends on: F1-F3, A2, B2
+depends on: F1-F2, A2
 
 ### H. Driver Framework `[ ]`
 
