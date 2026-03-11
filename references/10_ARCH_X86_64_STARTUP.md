@@ -93,12 +93,14 @@ This is a deliberate bootstrap path, not yet a final fast syscall mechanism.
 Current stack contract:
 
 - ring3 -> ring0 syscalls enter on the per-CPU `RSP0` stack
-- timer, APIC, breakpoint, and fixed-vector IPI entry use one per-CPU IRQ IST
+- timer, APIC, breakpoint, and fixed-vector IPI entry stay on the current kernel stack
 - `#PF` / `#GP` use a separate per-CPU fault IST
 - `#DF` keeps its own dedicated IST
 
-Splitting the IRQ and fault ISTs avoids a fault taken during IRQ/IPI handling from resetting `rsp`
-back onto the live IRQ-stack top and overwriting the in-flight interrupt frame.
+Axle previously used a shared IRQ IST for timer/IPI/breakpoint entry, but that shape breaks once a
+blocked trap path re-enables interrupts and idles: a nested IRQ would reset `rsp` back to the same
+IST top and corrupt the suspended return chain. Keeping regular IRQ/IPI entry on the current kernel
+stack preserves nested interrupt frames, while `#PF` / `#GP` still keep a dedicated fault IST.
 
 ## Current limitations
 

@@ -78,16 +78,11 @@ pub fn init(
     // SAFETY: we are in single-core early bring-up; mutating the static IDT table is serialized.
     unsafe {
         IDT[0x80] = IdtEntry::new(int80_handler, selector, user_callable_int_gate, 0);
-        IDT[3] = IdtEntry::new(
-            breakpoint_handler,
-            selector,
-            user_callable_int_gate,
-            crate::arch::gdt::IST_IRQ_INDEX,
-        );
+        IDT[3] = IdtEntry::new(breakpoint_handler, selector, user_callable_int_gate, 0);
 
         // Fault handlers (kernel-only). Keep double fault on IST1 and use a separate fault IST
-        // for #PF/#GP so a fault taken during IRQ/IPI handling does not reset `rsp` back onto the
-        // live IRQ stack top.
+        // for #PF/#GP so a fault taken during blocked kernel work does not reuse the current
+        // kernel stack top.
         IDT[14] = IdtEntry::new(
             page_fault_handler,
             selector,
@@ -107,45 +102,23 @@ pub fn init(
             crate::arch::gdt::IST_DOUBLE_FAULT_INDEX,
         );
 
-        // Local APIC IRQs (kernel-only).
-        IDT[crate::arch::apic::TIMER_VECTOR] = IdtEntry::new(
-            timer_handler,
-            selector,
-            kernel_int_gate,
-            crate::arch::gdt::IST_IRQ_INDEX,
-        );
-        IDT[crate::arch::apic::SPURIOUS_VECTOR] = IdtEntry::new(
-            apic_spurious_handler,
-            selector,
-            kernel_int_gate,
-            crate::arch::gdt::IST_IRQ_INDEX,
-        );
-        IDT[crate::arch::apic::ERROR_VECTOR] = IdtEntry::new(
-            apic_error_handler,
-            selector,
-            kernel_int_gate,
-            crate::arch::gdt::IST_IRQ_INDEX,
-        );
+        // Local APIC IRQs (kernel-only). Keep them on the current kernel stack: trap/syscall
+        // paths may re-enable interrupts while blocked, and re-entering a shared IRQ IST would
+        // reset `rsp` back to that IST top and corrupt the suspended return chain.
+        IDT[crate::arch::apic::TIMER_VECTOR] =
+            IdtEntry::new(timer_handler, selector, kernel_int_gate, 0);
+        IDT[crate::arch::apic::SPURIOUS_VECTOR] =
+            IdtEntry::new(apic_spurious_handler, selector, kernel_int_gate, 0);
+        IDT[crate::arch::apic::ERROR_VECTOR] =
+            IdtEntry::new(apic_error_handler, selector, kernel_int_gate, 0);
 
         // Fixed-vector IPI used by SMP conformance. (Kernel-only.)
-        IDT[crate::arch::ipi::TEST_VECTOR] = IdtEntry::new(
-            ipi_test_handler,
-            selector,
-            kernel_int_gate,
-            crate::arch::gdt::IST_IRQ_INDEX,
-        );
-        IDT[crate::arch::ipi::TLB_SHOOTDOWN_VECTOR] = IdtEntry::new(
-            ipi_tlb_handler,
-            selector,
-            kernel_int_gate,
-            crate::arch::gdt::IST_IRQ_INDEX,
-        );
-        IDT[crate::arch::ipi::RESCHEDULE_VECTOR] = IdtEntry::new(
-            ipi_reschedule_handler,
-            selector,
-            kernel_int_gate,
-            crate::arch::gdt::IST_IRQ_INDEX,
-        );
+        IDT[crate::arch::ipi::TEST_VECTOR] =
+            IdtEntry::new(ipi_test_handler, selector, kernel_int_gate, 0);
+        IDT[crate::arch::ipi::TLB_SHOOTDOWN_VECTOR] =
+            IdtEntry::new(ipi_tlb_handler, selector, kernel_int_gate, 0);
+        IDT[crate::arch::ipi::RESCHEDULE_VECTOR] =
+            IdtEntry::new(ipi_reschedule_handler, selector, kernel_int_gate, 0);
     }
     load_idt();
 }

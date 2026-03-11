@@ -34,7 +34,6 @@ const MAX_CPUS: usize = 16;
 const RING0_STACK_SIZE: u64 = 16 * 1024;
 const IST_STACK_SIZE: u64 = 16 * 1024;
 pub const IST_DOUBLE_FAULT_INDEX: u8 = 1;
-pub const IST_IRQ_INDEX: u8 = 2;
 pub const IST_FAULT_INDEX: u8 = 3;
 
 #[repr(align(16))]
@@ -50,8 +49,6 @@ static mut RING0_STACKS: [AlignedRing0Stack; MAX_CPUS] =
 struct AlignedIstStack([u8; IST_STACK_SIZE as usize]);
 
 static mut IST1_STACKS: [AlignedIstStack; MAX_CPUS] =
-    [AlignedIstStack([0; IST_STACK_SIZE as usize]); MAX_CPUS];
-static mut IST2_STACKS: [AlignedIstStack; MAX_CPUS] =
     [AlignedIstStack([0; IST_STACK_SIZE as usize]); MAX_CPUS];
 static mut IST3_STACKS: [AlignedIstStack; MAX_CPUS] =
     [AlignedIstStack([0; IST_STACK_SIZE as usize]); MAX_CPUS];
@@ -88,16 +85,8 @@ fn init_cpu(cpu: usize) -> &'static Selectors {
         let ist_start = unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(IST1_STACKS[cpu])) };
         let ist_end = ist_start + IST_STACK_SIZE;
         tss.interrupt_stack_table[0] = ist_end;
-        // IST2 isolates regular IRQ/IPI entry from the fixed RSP0 stack used by ring3->ring0
-        // syscalls. This avoids timer/IPI frames scribbling over a blocked trap's live return
-        // chain on `RSP0`.
-        let irq_ist_start = unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(IST2_STACKS[cpu])) };
-        let irq_ist_end = irq_ist_start + IST_STACK_SIZE;
-        tss.interrupt_stack_table[1] = irq_ist_end;
-
-        // Keep faults on a separate IST from IRQ/IPI entry. Reusing one IST slot for both means
-        // a fault taken while already handling an interrupt can reset `rsp` back to the same
-        // stack top and overwrite the live interrupt frame.
+        // Keep faults on a dedicated IST so a #PF/#GP taken while already handling kernel work
+        // does not reuse the current kernel stack top.
         let fault_ist_start = unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(IST3_STACKS[cpu])) };
         let fault_ist_end = fault_ist_start + IST_STACK_SIZE;
         tss.interrupt_stack_table[2] = fault_ist_end;
