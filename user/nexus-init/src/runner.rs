@@ -15,8 +15,8 @@ use nexus_component::{
     ResolvedComponent,
 };
 
+use crate::STARTUP_HANDLE_COMPONENT_STATUS;
 use crate::resolver::lookup_use_decl;
-use crate::{SELF_BINARY_PATH, STARTUP_HANDLE_COMPONENT_STATUS};
 
 #[allow(dead_code)]
 pub(crate) struct RunningComponent {
@@ -60,10 +60,32 @@ impl RunnerRegistry {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
+pub(crate) struct BootImageCatalog {
+    images: Vec<(String, zx_handle_t)>,
+}
+
+impl BootImageCatalog {
+    pub(crate) fn new() -> Self {
+        Self { images: Vec::new() }
+    }
+
+    pub(crate) fn insert(&mut self, binary_path: &str, image_vmo: zx_handle_t) {
+        self.images.push((String::from(binary_path), image_vmo));
+    }
+
+    fn image_vmo(&self, binary_path: &str) -> Option<zx_handle_t> {
+        self.images
+            .iter()
+            .find(|(path, _)| path == binary_path)
+            .map(|(_, handle)| *handle)
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct ElfRunner {
     pub(crate) parent_process: zx_handle_t,
-    pub(crate) image_vmo: zx_handle_t,
+    pub(crate) boot_images: BootImageCatalog,
 }
 
 impl ElfRunner {
@@ -77,9 +99,10 @@ impl ElfRunner {
         if component.decl.program.runner != "elf" {
             return Err(ZX_ERR_NOT_SUPPORTED);
         }
-        if component.decl.program.binary != SELF_BINARY_PATH {
-            return Err(ZX_ERR_NOT_FOUND);
-        }
+        let image_vmo = self
+            .boot_images
+            .image_vmo(component.decl.program.binary.as_str())
+            .ok_or(ZX_ERR_NOT_FOUND)?;
 
         let mut process = ZX_HANDLE_INVALID;
         let mut root_vmar = ZX_HANDLE_INVALID;
@@ -99,7 +122,7 @@ impl ElfRunner {
         let mut ignored_entry = 0u64;
         let mut stack = 0u64;
         let status =
-            ax_process_prepare_start(process, self.image_vmo, 0, &mut ignored_entry, &mut stack);
+            ax_process_prepare_start(process, image_vmo, 0, &mut ignored_entry, &mut stack);
         if status != ZX_OK {
             let _ = zx_handle_close(thread);
             let _ = zx_handle_close(root_vmar);

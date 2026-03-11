@@ -65,8 +65,9 @@ At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` is the only intentional `draft` b
 
 - `crates/` - shared Rust crates for host-testable semantic cores and low-level support
 - `kernel/` - the `axle-kernel` `no_std` kernel crate
-- `user/` - userspace binaries such as the bootstrap test runner and the
-  extracted `nexus-init` root-manager binary
+- `user/` - userspace binaries such as the bootstrap test runner, the
+  extracted `nexus-init` root-manager binary, and minimal component smoke
+  children (`echo-provider`, `echo-client`, `controller-worker`)
 - `tools/` - host-side utilities such as syscall generation and conformance running
 - `syscalls/` - syscall spec and generated ABI number tables
 - `specs/` - conformance contracts, scenarios, and runner assembly payloads
@@ -87,11 +88,17 @@ At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` is the only intentional `draft` b
 - `crates/nexus-component` - minimal component declaration IR, resolver result shape, bootstrap-channel start payloads, and tiny lifecycle/directory messages
 - `crates/nexus-rt` - single-thread userspace dispatcher/executor built on one port, one dispatcher timer, generation-safe signal registrations, and async channel/socket helpers
 - `kernel/axle-kernel` - live kernel integration layer
-- `user/nexus-init` - extracted bootstrap `nexus-init` root manager plus the
-  current self-image child-role scaffolding used by component conformance
+- `user/nexus-init` - extracted bootstrap `nexus-init` root manager plus shared
+  manager/runtime logic reused by the minimal component smoke binaries
+- `user/echo-provider` - dedicated bootstrap component binary for the routed
+  echo protocol provider
+- `user/echo-client` - dedicated bootstrap component binary for the routed echo
+  protocol client
+- `user/controller-worker` - dedicated bootstrap component binary for minimal
+  `Stop` / `Kill` lifecycle coverage
 - `user/test-runner` - ring3 conformance runner loaded at the fixed bootstrap userspace VA with a
-  widened bootstrap code window for the Rust dispatcher runtime; component smoke
-  now delegates into `user/nexus-init`
+  widened bootstrap code window for the Rust dispatcher runtime; the
+  `component_smoke` entry is now only a thin wrapper into `user/nexus-init`
 - `tools/syscalls-gen` - generator for `syscalls/generated/syscall_numbers.rs`
 - `tools/axle-conformance` - host-side conformance runner, coverage checker, and replay tool
 - `tools/axle-concurrency` - host-side concurrent seed runner for schedule hints, semantic edge coverage, and state signatures
@@ -134,6 +141,8 @@ At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` is the only intentional `draft` b
 - `kernel/axle-kernel` should be read when you need the live bootstrap integration, trap behavior, object wiring, or page-table interaction.
 - `user/test-runner` plus `specs/conformance/runner/*.S` describe what the current ring3 bootstrap workload actually runs.
 - `user/test-runner` can also build a Rust-defined entry path when `AXLE_TEST_RUNNER_RUST_ENTRY=reactor_smoke` is set; that path now exercises the Phase-3 dispatcher/executor runtime instead of only the thinner reactor layer.
+- `user/nexus-init` plus the dedicated `user/echo-*` / `user/controller-worker`
+  binaries describe the current minimal component-manager bring-up workload.
 - `references/` is the current-state documentation layer; `docs/` is lower-authority working material.
 
 ## Reference map

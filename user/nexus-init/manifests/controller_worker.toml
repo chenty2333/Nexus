@@ -3,6 +3,6 @@ startup = "eager"
 
 [program]
 runner = "elf"
-binary = "bin/nexus-self"
+binary = "bin/controller-worker"
 args = ["controller-worker"]
 env = []

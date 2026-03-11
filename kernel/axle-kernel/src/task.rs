@@ -637,6 +637,25 @@ impl VmFacade {
         })
     }
 
+    pub(crate) fn create_pager_file_vmo_for_address_space(
+        &self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        size_bytes: u64,
+        read_at: fn(u64, &mut [u8]) -> Result<(), zx_status_t>,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<CreatedVmo, zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.create_pager_file_vmo_for_address_space(
+                process_id,
+                address_space_id,
+                size_bytes,
+                read_at,
+                global_vmo_id,
+            )
+        })
+    }
+
     pub(crate) fn read_vmo_bytes(
         &self,
         vmo: &crate::object::VmoObject,

@@ -20,6 +20,9 @@ members = [
   # These crates are `no_std` and not built by the default host-only CI gates yet,
   # but we keep them in the workspace so formatting and metadata stay coherent.
   "kernel/axle-kernel",
+  "user/controller-worker",
+  "user/echo-client",
+  "user/echo-provider",
   "user/nexus-init",
   "user/test-runner",
 ]

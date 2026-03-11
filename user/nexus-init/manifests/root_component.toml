@@ -3,7 +3,7 @@ startup = "eager"
 
 [program]
 runner = "elf"
-binary = "bin/nexus-self"
+binary = "bin/nexus-init"
 args = ["nexus-init"]
 env = []
 

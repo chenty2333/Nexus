@@ -148,14 +148,16 @@ depends on: F2
   - bootstrap-channel `ComponentStartInfo`
   - minimal controller and outgoing-directory request messages
 = round-two eager-topology gate is now in:
-  - `ElfRunner` can launch eager child components from the bootstrap image
+  - `ElfRunner` can launch eager child components from boot-backed ELF images
   - child startup flows through the bootstrap channel and per-component namespace assembly
   - the manager can observe `OnTerminated` controller events from those children
 = the current tree now also has an extracted `user/nexus-init` package so the
   root manager no longer lives only inside `component_smoke.rs`
-= remaining work is lazy-start and fuller lifecycle hardening on top of that wiring
-  - the minimal round-three lifecycle gate is `Stop/Kill` plus `OnTerminated` controller events
-  - raw task-handle termination waiting remains covered by the kernel task suite, not by the component-manager smoke
+= the current tree now also boots dedicated `echo-provider`, `echo-client`, and
+  `controller-worker` binaries instead of reusing one self image for child roles
+= remaining work is productizing that runner shape into the formal system startup path
+  - boot resolver / runner lookup should become built-in capability providers in `nexus-init`
+  - raw task-handle termination waiting remains covered by the kernel task suite, not by the component-manager layer
 
 #### G2. capability routing
 
@@ -172,9 +174,14 @@ depends on: F2
   - static `/svc` assembly for one routed protocol
   - eager bring-up of provider/client children
   - controller-event collection back into the manager
-= the current tree now carries that manager logic in `user/nexus-init`, while
-  bootstrap conformance still reuses the same self-image child-role path
-= remaining work is lazy-start, resolver/runner capability lookup cleanup, and lifecycle controls
+= round-three bootstrap lifecycle coverage is now in:
+  - one lazy provider is launched on first `/svc` use
+  - `Stop` / `Kill` requests flow through the controller channel
+= the current tree now carries that manager logic in `user/nexus-init` and
+  boots dedicated child binaries for provider/client/worker roles
+= remaining work is the formal root startup path and built-in capability-provider cleanup
+  - boot resolver wiring should come from the real root manifest path, not only the conformance shape
+  - runner/resolver lookup should stay at the component layer instead of leaking back to raw task waits
 
 depends on: F1-F2, A2
 

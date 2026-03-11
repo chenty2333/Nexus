@@ -38,6 +38,12 @@ Current bootstrap userspace code may come from:
 - embedded user-code bytes
 - a QEMU loader-provided blob
 
+The current component bootstrap path also seeds extra boot-backed code-image
+VMOs for the dedicated `echo-provider`, `echo-client`, and
+`controller-worker` binaries. The kernel exports those VMO handles through the
+fixed bootstrap shared-page slot table so `nexus-init` can pick a child image
+by manifest `program.binary` path instead of only reusing its own image.
+
 `userspace.rs` contains the current image-loading and bootstrap page-population helpers.
 
 The bootstrap address space is prewired enough to exercise real VM behavior early:
@@ -77,6 +83,9 @@ The bootstrap address space is prewired enough to exercise real VM behavior earl
 
 - The current kernel already has `ProcessImageLayout` and `ProcessImageSegment`.
 - Imported bootstrap code VMOs can carry one image layout for later child-process setup.
+- The current bootstrap registry can also publish pager-backed code-image VMOs
+  for additional boot-loaded component binaries so generic child launch can use
+  the same `prepare_process_start()` path as the root manager.
 - VMOs without embedded layout metadata may now be parsed directly as ELF64 ET_EXEC images and
   converted into the same `ProcessImageLayout`.
 - Generic launch now builds one minimal SysV-style startup stack image containing:
@@ -118,8 +127,9 @@ The first generic-launch contract is now implemented without changing syscall si
   higher-level start payload moves over that channel instead of adding new
   process-start syscall arguments.
 - The current eager-topology component smoke already exercises that contract:
-  `nexus-init` launches eager children by sending `ComponentStartInfo` over the
-  bootstrap channel and then observing controller events from the started child.
+  `nexus-init` launches dedicated boot-backed child images by sending
+  `ComponentStartInfo` over the bootstrap channel and then observing controller
+  events from the started child.
 - The initial BSP ring3 entry still comes from bootstrap-specific bring-up plumbing, even though
   child process launch now uses the generic path.
 - The current ELF parser is intentionally narrow:

@@ -41,8 +41,28 @@ pub(crate) const USER_VM_TEST_VA: u64 = USER_CODE_VA + 0x10_000;
 //
 // Conformance harness uses `-device loader,file=...,addr=...` to drop the ELF bytes
 // into guest RAM, plus a second loader device to write the byte length.
-const USER_RUNNER_ELF_PADDR: u64 = 0x0100_0000;
-const USER_RUNNER_ELF_SIZE_PADDR: u64 = USER_RUNNER_ELF_PADDR - 8;
+#[derive(Clone, Copy)]
+struct QemuLoaderImage {
+    paddr: u64,
+    size_paddr: u64,
+}
+
+const USER_RUNNER_IMAGE: QemuLoaderImage = QemuLoaderImage {
+    paddr: 0x0100_0000,
+    size_paddr: 0x0100_0000 - 8,
+};
+const ECHO_PROVIDER_IMAGE: QemuLoaderImage = QemuLoaderImage {
+    paddr: 0x0140_0000,
+    size_paddr: 0x0140_0000 - 8,
+};
+const ECHO_CLIENT_IMAGE: QemuLoaderImage = QemuLoaderImage {
+    paddr: 0x0180_0000,
+    size_paddr: 0x0180_0000 - 8,
+};
+const CONTROLLER_WORKER_IMAGE: QemuLoaderImage = QemuLoaderImage {
+    paddr: 0x01c0_0000,
+    size_paddr: 0x01c0_0000 - 8,
+};
 // Raw QEMU loader input is the full ELF file, including debug sections in
 // dev builds. Keep this bound separate from the mapped code window size.
 const USER_RUNNER_ELF_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -503,7 +523,10 @@ const SLOT_COMPONENT_PROVIDER_STAGE: usize = 600;
 const SLOT_COMPONENT_PROVIDER_STATUS: usize = 601;
 const SLOT_COMPONENT_CLIENT_STAGE: usize = 602;
 const SLOT_COMPONENT_CLIENT_STATUS: usize = 603;
-const SLOT_MAX: usize = SLOT_COMPONENT_CLIENT_STATUS;
+const SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H: usize = 604;
+const SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H: usize = 605;
+const SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H: usize = 606;
+const SLOT_MAX: usize = SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -995,8 +1018,23 @@ fn read_bootstrap_user_runner_bytes(offset: u64, len: usize) -> Option<Vec<u8>> 
 }
 
 pub(crate) fn qemu_loader_user_runner_size() -> Option<u64> {
-    let blob_len =
-        qemu_loader_user_runner_blob().and_then(|blob| u64::try_from(blob.len()).ok())?;
+    qemu_loader_image_size(USER_RUNNER_IMAGE)
+}
+
+pub(crate) fn qemu_loader_echo_provider_size() -> Option<u64> {
+    qemu_loader_image_size(ECHO_PROVIDER_IMAGE)
+}
+
+pub(crate) fn qemu_loader_echo_client_size() -> Option<u64> {
+    qemu_loader_image_size(ECHO_CLIENT_IMAGE)
+}
+
+pub(crate) fn qemu_loader_controller_worker_size() -> Option<u64> {
+    qemu_loader_image_size(CONTROLLER_WORKER_IMAGE)
+}
+
+fn qemu_loader_image_size(image: QemuLoaderImage) -> Option<u64> {
+    let blob_len = qemu_loader_image_blob(image).and_then(|blob| u64::try_from(blob.len()).ok())?;
     let page = USER_PAGE_BYTES;
     let padded = blob_len.checked_add(page - 1)? & !(page - 1);
     Some(padded)
@@ -1010,8 +1048,37 @@ pub(crate) fn read_qemu_loader_user_runner_at(
     offset: u64,
     dst: &mut [u8],
 ) -> Result<(), zx_status_t> {
-    let blob = qemu_loader_user_runner_blob().ok_or(ZX_ERR_NOT_FOUND)?;
-    let padded_size = qemu_loader_user_runner_size().ok_or(ZX_ERR_NOT_FOUND)?;
+    read_qemu_loader_image_at(USER_RUNNER_IMAGE, offset, dst)
+}
+
+pub(crate) fn read_qemu_loader_echo_provider_at(
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<(), zx_status_t> {
+    read_qemu_loader_image_at(ECHO_PROVIDER_IMAGE, offset, dst)
+}
+
+pub(crate) fn read_qemu_loader_echo_client_at(
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<(), zx_status_t> {
+    read_qemu_loader_image_at(ECHO_CLIENT_IMAGE, offset, dst)
+}
+
+pub(crate) fn read_qemu_loader_controller_worker_at(
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<(), zx_status_t> {
+    read_qemu_loader_image_at(CONTROLLER_WORKER_IMAGE, offset, dst)
+}
+
+fn read_qemu_loader_image_at(
+    image: QemuLoaderImage,
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<(), zx_status_t> {
+    let blob = qemu_loader_image_blob(image).ok_or(ZX_ERR_NOT_FOUND)?;
+    let padded_size = qemu_loader_image_size(image).ok_or(ZX_ERR_NOT_FOUND)?;
     let end = offset
         .checked_add(dst.len() as u64)
         .ok_or(ZX_ERR_OUT_OF_RANGE)?;
@@ -1052,15 +1119,15 @@ pub(crate) fn read_bootstrap_user_code_image_at(
     crate::copy::copy_kernel_bytes(dst, src.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?)
 }
 
-fn qemu_loader_user_runner_blob() -> Option<&'static [u8]> {
+fn qemu_loader_image_blob(image: QemuLoaderImage) -> Option<&'static [u8]> {
     // SAFETY: conformance harness loads these bytes into identity-mapped RAM.
-    let size = unsafe { core::ptr::read_unaligned(USER_RUNNER_ELF_SIZE_PADDR as *const u64) };
+    let size = unsafe { core::ptr::read_unaligned(image.size_paddr as *const u64) };
     if size == 0 || size as usize > USER_RUNNER_ELF_MAX_BYTES {
         return None;
     }
 
     // SAFETY: we trust the loader-provided size bound above.
-    Some(unsafe { core::slice::from_raw_parts(USER_RUNNER_ELF_PADDR as *const u8, size as usize) })
+    Some(unsafe { core::slice::from_raw_parts(image.paddr as *const u8, size as usize) })
 }
 
 /// Validate a user pointer for a copyin/copyout of `len` bytes.
@@ -1851,6 +1918,12 @@ pub fn prepare() -> u64 {
         crate::object::process::bootstrap_self_process_handle().unwrap_or(0) as u64;
     slots[SLOT_SELF_CODE_VMO_H] =
         crate::object::vm::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64;
+    slots[SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H] =
+        crate::object::vm::bootstrap_echo_provider_code_vmo_handle().unwrap_or(0) as u64;
+    slots[SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H] =
+        crate::object::vm::bootstrap_echo_client_code_vmo_handle().unwrap_or(0) as u64;
+    slots[SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H] =
+        crate::object::vm::bootstrap_controller_worker_code_vmo_handle().unwrap_or(0) as u64;
     // Keep the exported bootstrap code-image VMO span stable for the runner ABI. The parsed
     // image layout is an internal loader detail; the bootstrap code window is still the legacy
     // fixed-size mapping.

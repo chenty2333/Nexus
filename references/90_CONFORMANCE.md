@@ -122,11 +122,17 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - channel receive and channel call/reply correctness
   - sleep completion through one dispatcher timer
   - socket readiness and follow-on read correctness
-- The eager component-topology bootstrap scenario is the first case where that Rust runner also plays
-  a minimal `nexus-init` / `ElfRunner` role instead of just a leaf test process.
-- Because that Rust runner is still linked at the long-standing bootstrap userspace VA above 4 GiB,
-  the scenario builds `nexus-test-runner` with `RUSTFLAGS='-C code-model=large'` instead of
-  changing the whole `x86_64-unknown-none` target configuration.
+- The eager component-topology bootstrap scenario is the first case where the
+  component gate boots a dedicated `nexus-init` / `ElfRunner` root manager
+  instead of reusing `nexus-test-runner` as both harness and manager.
+- That component gate now boots a dedicated `nexus-init` image plus separate
+  `echo-provider`, `echo-client`, and `controller-worker` ELFs through QEMU
+  loader slots, rather than having `nexus-test-runner` impersonate every role
+  from one self image.
+- Because those dedicated userspace binaries are still linked at the
+  long-standing bootstrap userspace VA above 4 GiB, the component scenarios
+  build them with `RUSTFLAGS='-C code-model=large'` instead of changing the
+  whole `x86_64-unknown-none` target configuration.
 - The bootstrap code window above 4 GiB is wider than the early 32 KiB bring-up shape so the
   runtime dispatcher runner and its shared summary pages no longer overlap in the fixed mapping.
 - Some bootstrap channel metrics currently come from a second structured summary line rather than

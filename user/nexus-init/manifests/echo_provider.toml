@@ -3,7 +3,7 @@ startup = "eager"
 
 [program]
 runner = "elf"
-binary = "bin/nexus-self"
+binary = "bin/echo-provider"
 args = ["echo-provider"]
 env = []
 

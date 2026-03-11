@@ -529,6 +529,9 @@ pub(crate) struct ObjectRegistry {
     bootstrap_root_vmar_handle: zx_handle_t,
     bootstrap_self_thread_handle: zx_handle_t,
     bootstrap_self_code_vmo_handle: zx_handle_t,
+    bootstrap_echo_provider_code_vmo_handle: zx_handle_t,
+    bootstrap_echo_client_code_vmo_handle: zx_handle_t,
+    bootstrap_controller_worker_code_vmo_handle: zx_handle_t,
     bootstrap_process_image_layout: crate::task::ProcessImageLayout,
 }
 
@@ -542,6 +545,9 @@ impl ObjectRegistry {
             bootstrap_root_vmar_handle: 0,
             bootstrap_self_thread_handle: 0,
             bootstrap_self_code_vmo_handle: 0,
+            bootstrap_echo_provider_code_vmo_handle: 0,
+            bootstrap_echo_client_code_vmo_handle: 0,
+            bootstrap_controller_worker_code_vmo_handle: 0,
             bootstrap_process_image_layout: crate::task::ProcessImageLayout::bootstrap_conformance(
             ),
         }
@@ -972,6 +978,74 @@ impl KernelState {
                 })
                 .expect("bootstrap code vmo handle publish must succeed");
         }
+
+        let bootstrap_component_images = [
+            (
+                crate::userspace::qemu_loader_echo_provider_size as fn() -> Option<u64>,
+                crate::userspace::read_qemu_loader_echo_provider_at
+                    as fn(u64, &mut [u8]) -> Result<(), zx_status_t>,
+            ),
+            (
+                crate::userspace::qemu_loader_echo_client_size as fn() -> Option<u64>,
+                crate::userspace::read_qemu_loader_echo_client_at
+                    as fn(u64, &mut [u8]) -> Result<(), zx_status_t>,
+            ),
+            (
+                crate::userspace::qemu_loader_controller_worker_size as fn() -> Option<u64>,
+                crate::userspace::read_qemu_loader_controller_worker_at
+                    as fn(u64, &mut [u8]) -> Result<(), zx_status_t>,
+            ),
+        ];
+        let mut bootstrap_component_handles = [0; 3];
+        for (index, (size_fn, read_at)) in bootstrap_component_images.iter().enumerate() {
+            let Some(size_bytes) = size_fn() else {
+                continue;
+            };
+            let global_vmo_id = state
+                .with_kernel_mut(|kernel| Ok(kernel.allocate_global_vmo_id()))
+                .expect("bootstrap component image global VMO id allocation must succeed");
+            let imported = state
+                .with_vm_mut(|vm| {
+                    vm.create_pager_file_vmo_for_address_space(
+                        process.process_id(),
+                        address_space_id,
+                        size_bytes,
+                        *read_at,
+                        global_vmo_id,
+                    )
+                })
+                .expect("bootstrap component image VMO import must succeed");
+            let object_id = state.alloc_object_id();
+            state
+                .with_registry_mut(|registry| {
+                    registry.insert(
+                        object_id,
+                        KernelObject::Vmo(VmoObject {
+                            creator_process_id: imported.process_id(),
+                            global_vmo_id: imported.global_vmo_id(),
+                            backing_scope: VmoBackingScope::GlobalShared,
+                            kind: axle_mm::VmoKind::PagerBacked,
+                            size_bytes: imported.size_bytes(),
+                            image_layout: None,
+                        }),
+                    )?;
+                    Ok(())
+                })
+                .expect("bootstrap component image VMO object insert must succeed");
+            let handle = state
+                .alloc_handle_for_object(object_id, handle::bootstrap_code_vmo_rights())
+                .expect("bootstrap component image VMO handle allocation must succeed");
+            bootstrap_component_handles[index] = handle;
+        }
+        state
+            .with_registry_mut(|registry| {
+                registry.bootstrap_echo_provider_code_vmo_handle = bootstrap_component_handles[0];
+                registry.bootstrap_echo_client_code_vmo_handle = bootstrap_component_handles[1];
+                registry.bootstrap_controller_worker_code_vmo_handle =
+                    bootstrap_component_handles[2];
+                Ok(())
+            })
+            .expect("bootstrap component image handle publish must succeed");
 
         state
     }

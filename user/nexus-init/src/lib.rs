@@ -36,12 +36,15 @@ use crate::namespace::{
 use crate::resolver::{
     ResolverRegistry, decode_resolved_component, resolve_root_child, resolve_with_realm,
 };
-use crate::runner::{ElfRunner, RunnerRegistry};
+use crate::runner::{BootImageCatalog, ElfRunner, RunnerRegistry};
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0010_0000;
 const SLOT_OK: usize = 0;
 const SLOT_SELF_PROCESS_H: usize = 396;
 const SLOT_SELF_CODE_VMO_H: usize = 506;
+const SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H: usize = 604;
+const SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H: usize = 605;
+const SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H: usize = 606;
 
 const SLOT_COMPONENT_FAILURE_STEP: usize = 578;
 const SLOT_COMPONENT_RESOLVE_ROOT: usize = 579;
@@ -92,7 +95,10 @@ const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
 pub(crate) const CHILD_ROLE_CONTROLLER_WORKER: &str = "controller-worker";
-pub(crate) const SELF_BINARY_PATH: &str = "bin/nexus-self";
+pub(crate) const ROOT_BINARY_PATH: &str = "bin/nexus-init";
+pub(crate) const PROVIDER_BINARY_PATH: &str = "bin/echo-provider";
+pub(crate) const CLIENT_BINARY_PATH: &str = "bin/echo-client";
+pub(crate) const CONTROLLER_WORKER_BINARY_PATH: &str = "bin/controller-worker";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -198,18 +204,7 @@ struct ComponentSummary {
 }
 
 pub fn program_start(bootstrap_channel: zx_handle_t, arg1: u64) -> ! {
-    if bootstrap_channel != ZX_HANDLE_INVALID
-        && matches!(
-            arg1,
-            CHILD_MARKER_PROVIDER | CHILD_MARKER_CLIENT | CHILD_MARKER_CONTROLLER_WORKER
-        )
-    {
-        ROLE.store(ROLE_CHILD, Ordering::Relaxed);
-        run_child_component(bootstrap_channel, arg1);
-        loop {
-            core::hint::spin_loop();
-        }
-    }
+    let _ = (bootstrap_channel, arg1);
     ROLE.store(ROLE_ROOT, Ordering::Relaxed);
     let mut summary = ComponentSummary::default();
     let status = run_component_manager_smoke(&mut summary);
@@ -231,6 +226,71 @@ pub fn report_panic() -> ! {
     }
 }
 
+/// Start the dedicated `echo-provider` component image.
+pub fn echo_provider_program_start(bootstrap_channel: zx_handle_t) -> ! {
+    run_dedicated_child_component(
+        bootstrap_channel,
+        MinimalRole::Provider,
+        CHILD_MARKER_PROVIDER,
+    )
+}
+
+/// Start the dedicated `echo-client` component image.
+pub fn echo_client_program_start(bootstrap_channel: zx_handle_t) -> ! {
+    run_dedicated_child_component(bootstrap_channel, MinimalRole::Client, CHILD_MARKER_CLIENT)
+}
+
+/// Start the dedicated `controller-worker` component image.
+pub fn controller_worker_program_start(bootstrap_channel: zx_handle_t) -> ! {
+    run_dedicated_child_component(
+        bootstrap_channel,
+        MinimalRole::ControllerWorker,
+        CHILD_MARKER_CONTROLLER_WORKER,
+    )
+}
+
+/// Report a panic from one dedicated child component image.
+pub fn child_report_panic() -> ! {
+    ROLE.store(ROLE_CHILD, Ordering::Relaxed);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn build_runner_registry(parent_process: zx_handle_t) -> Result<RunnerRegistry, zx_status_t> {
+    let mut runners = RunnerRegistry::new();
+    runners.insert_elf(
+        "elf",
+        ElfRunner {
+            parent_process,
+            boot_images: build_boot_image_catalog()?,
+        },
+    );
+    Ok(runners)
+}
+
+fn build_boot_image_catalog() -> Result<BootImageCatalog, zx_status_t> {
+    let self_code_vmo = read_slot(SLOT_SELF_CODE_VMO_H) as zx_handle_t;
+    let provider_image_vmo = read_slot(SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H) as zx_handle_t;
+    let client_image_vmo = read_slot(SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H) as zx_handle_t;
+    let controller_worker_image_vmo =
+        read_slot(SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H) as zx_handle_t;
+    if self_code_vmo == ZX_HANDLE_INVALID
+        || provider_image_vmo == ZX_HANDLE_INVALID
+        || client_image_vmo == ZX_HANDLE_INVALID
+        || controller_worker_image_vmo == ZX_HANDLE_INVALID
+    {
+        return Err(ZX_ERR_INTERNAL);
+    }
+
+    let mut images = BootImageCatalog::new();
+    images.insert(ROOT_BINARY_PATH, self_code_vmo);
+    images.insert(PROVIDER_BINARY_PATH, provider_image_vmo);
+    images.insert(CLIENT_BINARY_PATH, client_image_vmo);
+    images.insert(CONTROLLER_WORKER_BINARY_PATH, controller_worker_image_vmo);
+    Ok(images)
+}
+
 fn run_component_manager_smoke(summary: &mut ComponentSummary) -> i32 {
     match SmokeMode::current() {
         SmokeMode::Eager => run_component_manager_eager_smoke(summary),
@@ -241,8 +301,7 @@ fn run_component_manager_smoke(summary: &mut ComponentSummary) -> i32 {
 fn run_component_manager_eager_smoke(summary: &mut ComponentSummary) -> i32 {
     *summary = ComponentSummary::default();
     let parent_process = read_slot(SLOT_SELF_PROCESS_H) as zx_handle_t;
-    let self_code_vmo = read_slot(SLOT_SELF_CODE_VMO_H) as zx_handle_t;
-    if parent_process == ZX_HANDLE_INVALID || self_code_vmo == ZX_HANDLE_INVALID {
+    if parent_process == ZX_HANDLE_INVALID {
         summary.failure_step = STEP_RESOLVE_ROOT;
         summary.resolve_root = ZX_ERR_INTERNAL as i64;
         return 1;
@@ -326,14 +385,14 @@ fn run_component_manager_eager_smoke(summary: &mut ComponentSummary) -> i32 {
         }
     };
 
-    let mut runners = RunnerRegistry::new();
-    runners.insert_elf(
-        "elf",
-        ElfRunner {
-            parent_process,
-            image_vmo: self_code_vmo,
-        },
-    );
+    let runners = match build_runner_registry(parent_process) {
+        Ok(runners) => runners,
+        Err(status) => {
+            summary.resolve_root = status as i64;
+            summary.failure_step = STEP_RESOLVE_ROOT;
+            return 1;
+        }
+    };
     let mut capability_registry = CapabilityRegistry::new();
     let mut outgoing_client = ZX_HANDLE_INVALID;
     let mut outgoing_server = ZX_HANDLE_INVALID;
@@ -431,8 +490,7 @@ fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
     *summary = ComponentSummary::default();
     write_slot(SLOT_COMPONENT_FAILURE_STEP, 101);
     let parent_process = read_slot(SLOT_SELF_PROCESS_H) as zx_handle_t;
-    let self_code_vmo = read_slot(SLOT_SELF_CODE_VMO_H) as zx_handle_t;
-    if parent_process == ZX_HANDLE_INVALID || self_code_vmo == ZX_HANDLE_INVALID {
+    if parent_process == ZX_HANDLE_INVALID {
         summary.failure_step = STEP_RESOLVE_ROOT;
         summary.resolve_root = ZX_ERR_INTERNAL as i64;
         return 1;
@@ -544,14 +602,14 @@ fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
             }
         };
 
-    let mut runners = RunnerRegistry::new();
-    runners.insert_elf(
-        "elf",
-        ElfRunner {
-            parent_process,
-            image_vmo: self_code_vmo,
-        },
-    );
+    let runners = match build_runner_registry(parent_process) {
+        Ok(runners) => runners,
+        Err(status) => {
+            summary.failure_step = STEP_RESOLVE_ROOT;
+            summary.resolve_root = status as i64;
+            return 1;
+        }
+    };
     write_slot(SLOT_COMPONENT_FAILURE_STEP, 105);
     let mut stop_worker = if matches!(stop_startup, StartupMode::Eager) {
         write_slot(SLOT_COMPONENT_FAILURE_STEP, 106);
@@ -754,15 +812,24 @@ fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
     0
 }
 
-fn run_child_component(bootstrap_channel: zx_handle_t, child_marker: u64) {
+fn run_dedicated_child_component(
+    bootstrap_channel: zx_handle_t,
+    expected_role: MinimalRole,
+    child_marker: u64,
+) -> ! {
+    ROLE.store(ROLE_CHILD, Ordering::Relaxed);
     record_child_stage(child_marker, 1, ZX_OK);
-    let return_code = run_child_component_inner(bootstrap_channel, child_marker);
-    if return_code < 0 {
-        return;
+    let _ = run_dedicated_child_component_inner(bootstrap_channel, expected_role, child_marker);
+    loop {
+        core::hint::spin_loop();
     }
 }
 
-fn run_child_component_inner(bootstrap_channel: zx_handle_t, child_marker: u64) -> i64 {
+fn run_dedicated_child_component_inner(
+    bootstrap_channel: zx_handle_t,
+    expected_role: MinimalRole,
+    child_marker: u64,
+) -> i64 {
     let start_info = match read_component_start_info_minimal(bootstrap_channel) {
         Ok(start_info) => start_info,
         Err(status) => {
@@ -770,11 +837,15 @@ fn run_child_component_inner(bootstrap_channel: zx_handle_t, child_marker: u64) 
             return 1;
         }
     };
+    if start_info.role != expected_role {
+        record_child_stage(child_marker, 2, ZX_ERR_BAD_STATE);
+        return 1;
+    }
     record_child_stage(child_marker, 3, ZX_OK);
     let status_channel = start_info.status;
     let controller = start_info.controller;
 
-    let code = match start_info.role {
+    let code = match expected_role {
         MinimalRole::Provider => run_echo_provider(&start_info),
         MinimalRole::Client => run_echo_client(&start_info),
         MinimalRole::ControllerWorker => run_controller_worker(&start_info),
