@@ -22,17 +22,19 @@ use x86_64::instructions::segmentation::Segment;
 // --- Userspace virtual layout (in current single-address-space model) ---
 
 pub(crate) const USER_PAGE_BYTES: u64 = 0x1000;
-pub(crate) const USER_CODE_PAGE_COUNT: usize = 128;
+pub(crate) const USER_CODE_PAGE_COUNT: usize = 256;
 const USER_SHARED_PAGE_COUNT: usize = 2;
+pub(crate) const USER_STACK_PAGE_COUNT: usize = 16;
 pub(crate) const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * USER_CODE_PAGE_COUNT as u64;
 const USER_SHARED_BYTES: u64 = USER_PAGE_BYTES * USER_SHARED_PAGE_COUNT as u64;
+pub(crate) const USER_STACK_BYTES: u64 = USER_PAGE_BYTES * USER_STACK_PAGE_COUNT as u64;
 pub(crate) const USER_CODE_VA: u64 = 0x0000_0001_0000_0000; // 4 GiB
 pub(crate) const USER_WINDOW_TOP: u64 = 0x0000_8000_0000_0000; // lower canonical half limit
 pub(crate) const USER_REGION_BYTES: u64 = USER_WINDOW_TOP - USER_CODE_VA;
 const BOOTSTRAP_USER_PT_BYTES: u64 = USER_PAGE_BYTES * 512;
 pub(crate) const USER_SHARED_VA: u64 = USER_CODE_VA + USER_CODE_BYTES;
 pub(crate) const USER_STACK_VA: u64 = USER_SHARED_VA + USER_SHARED_BYTES;
-const USER_STACK_TOP: u64 = USER_STACK_VA + USER_PAGE_BYTES;
+const USER_STACK_TOP: u64 = USER_STACK_VA + USER_STACK_BYTES;
 pub(crate) const USER_VM_TEST_VA: u64 = USER_CODE_VA + 0x10_000;
 
 // --- QEMU loader handoff for external userspace runner ELF ---
@@ -487,16 +489,16 @@ const SLOT_COMPONENT_PROVIDER_EVENT_READ: usize = 586;
 const SLOT_COMPONENT_PROVIDER_EVENT_CODE: usize = 587;
 const SLOT_COMPONENT_CLIENT_EVENT_READ: usize = 588;
 const SLOT_COMPONENT_CLIENT_EVENT_CODE: usize = 589;
-const SLOT_COMPONENT_KILL_PROVIDER: usize = 590;
-const SLOT_COMPONENT_KILL_CLIENT: usize = 591;
-const SLOT_COMPONENT_WAIT_PROVIDER: usize = 592;
-const SLOT_COMPONENT_WAIT_PROVIDER_OBS: usize = 593;
-const SLOT_COMPONENT_WAIT_CLIENT: usize = 594;
-const SLOT_COMPONENT_WAIT_CLIENT_OBS: usize = 595;
-const SLOT_COMPONENT_CLOSE_PROVIDER_PROCESS: usize = 596;
-const SLOT_COMPONENT_CLOSE_PROVIDER_CONTROLLER: usize = 597;
-const SLOT_COMPONENT_CLOSE_CLIENT_PROCESS: usize = 598;
-const SLOT_COMPONENT_CLOSE_CLIENT_CONTROLLER: usize = 599;
+const SLOT_COMPONENT_LAZY_PROVIDER_PRELAUNCH: usize = 590;
+const SLOT_COMPONENT_LAZY_PROVIDER_ROUTE_LAUNCH: usize = 591;
+const SLOT_COMPONENT_STOP_REQUEST: usize = 592;
+const SLOT_COMPONENT_STOP_EVENT_READ: usize = 593;
+const SLOT_COMPONENT_STOP_EVENT_CODE: usize = 594;
+const SLOT_COMPONENT_STOP_WAIT_OBSERVED: usize = 595;
+const SLOT_COMPONENT_KILL_REQUEST: usize = 596;
+const SLOT_COMPONENT_KILL_EVENT_READ: usize = 597;
+const SLOT_COMPONENT_KILL_EVENT_CODE: usize = 598;
+const SLOT_COMPONENT_KILL_WAIT_OBSERVED: usize = 599;
 const SLOT_COMPONENT_PROVIDER_STAGE: usize = 600;
 const SLOT_COMPONENT_PROVIDER_STATUS: usize = 601;
 const SLOT_COMPONENT_CLIENT_STAGE: usize = 602;
@@ -515,7 +517,8 @@ static mut USER_CODE_PAGES: [AlignedPage; USER_CODE_PAGE_COUNT] =
     [AlignedPage([0; 4096]); USER_CODE_PAGE_COUNT];
 static mut USER_SHARED_PAGES: [AlignedPage; USER_SHARED_PAGE_COUNT] =
     [AlignedPage([0; 4096]); USER_SHARED_PAGE_COUNT];
-static mut USER_STACK_PAGE: AlignedPage = AlignedPage([0; 4096]);
+static mut USER_STACK_PAGES: [AlignedPage; USER_STACK_PAGE_COUNT] =
+    [AlignedPage([0; 4096]); USER_STACK_PAGE_COUNT];
 
 static mut USER_PD: AlignedPageTable = AlignedPageTable([0; 512]);
 static mut USER_PT: AlignedPageTable = AlignedPageTable([0; 512]);
@@ -563,8 +566,10 @@ pub(crate) fn user_shared_page_paddr(index: usize) -> u64 {
     phys_of(page)
 }
 
-pub(crate) fn user_stack_page_paddr() -> u64 {
-    phys_of(core::ptr::addr_of!(USER_STACK_PAGE))
+pub(crate) fn user_stack_page_paddr(index: usize) -> u64 {
+    assert!(index < USER_STACK_PAGE_COUNT);
+    let page = unsafe { core::ptr::addr_of!(USER_STACK_PAGES[index]) };
+    phys_of(page)
 }
 
 pub(crate) fn bootstrap_user_pd_paddr() -> u64 {
@@ -761,8 +766,10 @@ fn map_userspace_pages() {
             *user_pt.add(USER_CODE_PAGE_COUNT + index) =
                 phys_of(core::ptr::addr_of!(USER_SHARED_PAGES[index])) | (PTE_P | PTE_W | PTE_U);
         }
-        *user_pt.add(USER_CODE_PAGE_COUNT + USER_SHARED_PAGE_COUNT) =
-            phys_of(core::ptr::addr_of!(USER_STACK_PAGE)) | (PTE_P | PTE_U);
+        for index in 0..USER_STACK_PAGE_COUNT {
+            *user_pt.add(USER_CODE_PAGE_COUNT + USER_SHARED_PAGE_COUNT + index) =
+                user_stack_page_paddr(index) | (PTE_P | PTE_U);
+        }
 
         // Flush TLB by reloading CR3.
         crate::arch::tlb::flush_all_local();
@@ -1061,6 +1068,9 @@ fn qemu_loader_user_runner_blob() -> Option<&'static [u8]> {
 /// Bring-up rule: pointers must be fully contained within the mapped shared region
 /// or the mapped stack page (so the kernel never faults on bad pointers).
 pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
+    if bootstrap_user_window_contains(ptr, len) {
+        return true;
+    }
     crate::fault::validate_current_user_ptr(ptr, len)
 }
 
@@ -1070,6 +1080,9 @@ pub fn ensure_user_range_resident(
     len: usize,
     for_write: bool,
 ) -> Result<(), zx_status_t> {
+    if bootstrap_user_window_contains(ptr, len) {
+        return Ok(());
+    }
     crate::fault::ensure_current_user_range_resident(ptr, len, for_write)
 }
 
@@ -1148,16 +1161,29 @@ pub(crate) fn zero_current_mapping_bytes(dst_ptr: u64, len: usize) {
 }
 
 fn shared_slots() -> &'static mut [u64] {
-    // SAFETY: USER_SHARED_PAGES is one contiguous backing array for the bootstrap
-    // shared-summary window, aligned to 4096 bytes and therefore also to 8 bytes.
-    // Kernel-side telemetry must address that backing directly instead of relying on
-    // whichever userspace CR3 happens to be current.
+    // SAFETY: the bootstrap ring3 bridge summary window is backed by the static
+    // `USER_SHARED_PAGES` array. The bootstrap runner reads and writes the same
+    // backing pages through its user mapping, but kernel-side telemetry must not
+    // depend on the current thread's address space also mapping `USER_SHARED_VA`.
+    // Component and child process faults can arrive while a different address
+    // space is active; reaching through the user VA there would fault in-kernel.
     unsafe {
         core::slice::from_raw_parts_mut(
-            core::ptr::addr_of_mut!(USER_SHARED_PAGES).cast::<u64>(),
+            core::ptr::addr_of_mut!(USER_SHARED_PAGES) as *mut u64,
             (USER_SHARED_PAGE_COUNT * 4096) / core::mem::size_of::<u64>(),
         )
     }
+}
+
+fn bootstrap_user_window_contains(ptr: u64, len: usize) -> bool {
+    if len == 0 {
+        return ptr >= USER_CODE_VA && ptr < USER_STACK_TOP;
+    }
+    let end = match ptr.checked_add(len as u64) {
+        Some(end) => end,
+        None => return false,
+    };
+    ptr >= USER_CODE_VA && end <= USER_STACK_TOP && ptr < end
 }
 
 pub(crate) fn record_vm_cow_fault_count(count: u64) {
@@ -1223,12 +1249,71 @@ pub(crate) fn consume_vm_fault_leader_pause_hook() -> bool {
     true
 }
 
+pub(crate) fn component_summary_snapshot() -> Option<(u64, i64, i64, i64, i64, i64)> {
+    let slots = shared_slots();
+    let failure_step = slots[SLOT_COMPONENT_FAILURE_STEP];
+    let resolve_root = slots[SLOT_COMPONENT_RESOLVE_ROOT] as i64;
+    let provider_launch = slots[SLOT_COMPONENT_PROVIDER_LAUNCH] as i64;
+    let client_launch = slots[SLOT_COMPONENT_CLIENT_LAUNCH] as i64;
+    let stop_request = slots[SLOT_COMPONENT_STOP_REQUEST] as i64;
+    let kill_request = slots[SLOT_COMPONENT_KILL_REQUEST] as i64;
+    if failure_step == 0
+        && resolve_root == 0
+        && provider_launch == 0
+        && client_launch == 0
+        && stop_request == 0
+        && kill_request == 0
+    {
+        return None;
+    }
+    Some((
+        failure_step,
+        resolve_root,
+        provider_launch,
+        client_launch,
+        stop_request,
+        kill_request,
+    ))
+}
+
 /// Called by the breakpoint handler to print the userspace-produced summary.
-pub fn on_breakpoint() -> ! {
+pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
     let slots = shared_slots();
     if slots[SLOT_OK] != 1 {
+        let (trap_rax, trap_rbx, trap_rip) = if frame.is_null() {
+            (0, 0, 0)
+        } else {
+            // SAFETY: the breakpoint entry path passes a valid pointer to a saved register frame
+            // with the same layout as `int80::TrapFrame`.
+            let frame = unsafe { &*frame };
+            (frame.rax as i64, frame.rbx, frame.rcx)
+        };
         crate::kprintln!(
-            "userspace: conformance reported failure (ok=0, component_failure_step={}, provider_stage={}, provider_status={}, client_stage={}, client_status={}, provider_event_read={}, provider_event_code={}, client_event_read={}, client_event_code={})",
+            "userspace: conformance reported failure (ok=0, trap_rax={}, trap_rbx={:#x}, trap_rcx={:#x}, unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, queue={}, wait={}, port_wait_readable={}, port_wait_readable_observed={}, t0_ns={}, tx=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}], rx=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}], component_failure_step={}, provider_stage={}, provider_status={}, client_stage={}, client_status={}, provider_event_read={}, provider_event_code={}, client_event_read={}, client_event_code={}, stop_request={}, stop_event_read={}, stop_event_code={}, stop_wait_observed={}, kill_request={}, kill_event_read={}, kill_event_code={}, kill_wait_observed={})",
+            trap_rax,
+            trap_rbx,
+            trap_rip,
+            slots[SLOT_UNKNOWN] as i64,
+            slots[SLOT_CLOSE_INVALID] as i64,
+            slots[SLOT_PORT_CREATE_BAD_OPTS] as i64,
+            slots[SLOT_PORT_CREATE_NULL_OUT] as i64,
+            slots[SLOT_QUEUE] as i64,
+            slots[SLOT_WAIT] as i64,
+            slots[SLOT_PORT_WAIT_READABLE] as i64,
+            slots[SLOT_PORT_WAIT_READABLE_OBS],
+            slots[SLOT_T0_NS],
+            slots[648],
+            slots[649],
+            slots[650],
+            slots[651],
+            slots[652],
+            slots[653],
+            slots[656],
+            slots[657],
+            slots[658],
+            slots[659],
+            slots[660],
+            slots[661],
             slots[SLOT_COMPONENT_FAILURE_STEP],
             slots[SLOT_COMPONENT_PROVIDER_STAGE],
             slots[SLOT_COMPONENT_PROVIDER_STATUS] as i64,
@@ -1237,7 +1322,32 @@ pub fn on_breakpoint() -> ! {
             slots[SLOT_COMPONENT_PROVIDER_EVENT_READ] as i64,
             slots[SLOT_COMPONENT_PROVIDER_EVENT_CODE] as i64,
             slots[SLOT_COMPONENT_CLIENT_EVENT_READ] as i64,
-            slots[SLOT_COMPONENT_CLIENT_EVENT_CODE] as i64
+            slots[SLOT_COMPONENT_CLIENT_EVENT_CODE] as i64,
+            slots[SLOT_COMPONENT_STOP_REQUEST] as i64,
+            slots[SLOT_COMPONENT_STOP_EVENT_READ] as i64,
+            slots[SLOT_COMPONENT_STOP_EVENT_CODE] as i64,
+            slots[SLOT_COMPONENT_STOP_WAIT_OBSERVED],
+            slots[SLOT_COMPONENT_KILL_REQUEST] as i64,
+            slots[SLOT_COMPONENT_KILL_EVENT_READ] as i64,
+            slots[SLOT_COMPONENT_KILL_EVENT_CODE] as i64,
+            slots[SLOT_COMPONENT_KILL_WAIT_OBSERVED]
+        );
+        crate::kprintln!(
+            "userspace: early slots queue={} wait={} tx=[{:016x} {:016x} {:016x} {:016x} {:016x} {:016x}] rx=[{:016x} {:016x} {:016x} {:016x} {:016x} {:016x}]",
+            slots[SLOT_QUEUE] as i64,
+            slots[SLOT_WAIT] as i64,
+            slots[136],
+            slots[137],
+            slots[138],
+            slots[139],
+            slots[140],
+            slots[141],
+            slots[144],
+            slots[145],
+            slots[146],
+            slots[147],
+            slots[148],
+            slots[149],
         );
         crate::arch::qemu::exit_failure();
     }
@@ -1648,7 +1758,7 @@ pub fn on_breakpoint() -> ! {
     );
 
     crate::kprintln!(
-        "kernel: userspace runtime dispatcher (failure_step={}, dispatcher_create={}, reg_create_first={}, reg_cancel_first={}, reg_create_second={}, reg_slot_reused={}, reg_generation_advanced={}, channel_create={}, channel_seed_write={}, channel_recv={}, channel_recv_actual_bytes={}, channel_recv_match={}, sleep_create={}, sleep_wait={}, channel_call_create={}, channel_call_server_spawn={}, channel_call_server_recv={}, channel_call_server_match={}, channel_call_server_reply={}, channel_call={}, channel_call_actual_bytes={}, channel_call_match={}, socket_create={}, socket_seed_write={}, socket_wait_readable={}, socket_wait_observed={}, socket_read={}, socket_read_actual_bytes={}, socket_read_match={}, close_seed_tx={}, close_seed_rx={}, close_call_client={}, close_call_server={}, close_socket_tx={}, close_socket_rx={})",
+        "kernel: userspace runtime dispatcher (rt_failure_step={}, rt_dispatcher_create={}, rt_reg_create_first={}, rt_reg_cancel_first={}, rt_reg_create_second={}, rt_reg_slot_reused={}, rt_reg_generation_advanced={}, rt_channel_create={}, rt_channel_seed_write={}, rt_channel_recv={}, rt_channel_recv_actual_bytes={}, rt_channel_recv_match={}, rt_sleep_create={}, rt_sleep_wait={}, rt_channel_call_create={}, rt_channel_call_server_spawn={}, rt_channel_call_server_recv={}, rt_channel_call_server_match={}, rt_channel_call_server_reply={}, rt_channel_call={}, rt_channel_call_actual_bytes={}, rt_channel_call_match={}, rt_socket_create={}, rt_socket_seed_write={}, rt_socket_wait_readable={}, rt_socket_wait_observed={}, rt_socket_read={}, rt_socket_read_actual_bytes={}, rt_socket_read_match={}, rt_close_seed_tx={}, rt_close_seed_rx={}, rt_close_call_client={}, rt_close_call_server={}, rt_close_socket_tx={}, rt_close_socket_rx={})",
         slots[SLOT_RUNTIME_FAILURE_STEP],
         slots[SLOT_RUNTIME_DISPATCHER_CREATE] as i64,
         slots[SLOT_RUNTIME_REG_CREATE_FIRST] as i64,
@@ -1687,7 +1797,7 @@ pub fn on_breakpoint() -> ! {
     );
 
     crate::kprintln!(
-        "kernel: component manager bootstrap (failure_step={}, resolve_root={}, resolve_provider={}, resolve_client={}, provider_outgoing_pair={}, provider_launch={}, client_route={}, client_launch={}, provider_event_read={}, provider_event_code={}, client_event_read={}, client_event_code={}, provider_stage={}, provider_status={}, client_stage={}, client_status={})",
+        "kernel: component manager bootstrap (failure_step={}, resolve_root={}, resolve_provider={}, resolve_client={}, provider_outgoing_pair={}, provider_launch={}, client_route={}, client_launch={}, provider_event_read={}, provider_event_code={}, client_event_read={}, client_event_code={}, lazy_provider_prelaunch={}, lazy_provider_route_launch={}, stop_request={}, stop_event_read={}, stop_event_code={}, stop_wait_observed={}, kill_request={}, kill_event_read={}, kill_event_code={}, kill_wait_observed={}, provider_stage={}, provider_status={}, client_stage={}, client_status={})",
         slots[SLOT_COMPONENT_FAILURE_STEP],
         slots[SLOT_COMPONENT_RESOLVE_ROOT] as i64,
         slots[SLOT_COMPONENT_RESOLVE_PROVIDER] as i64,
@@ -1700,6 +1810,16 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_COMPONENT_PROVIDER_EVENT_CODE] as i64,
         slots[SLOT_COMPONENT_CLIENT_EVENT_READ] as i64,
         slots[SLOT_COMPONENT_CLIENT_EVENT_CODE] as i64,
+        slots[SLOT_COMPONENT_LAZY_PROVIDER_PRELAUNCH] as i64,
+        slots[SLOT_COMPONENT_LAZY_PROVIDER_ROUTE_LAUNCH] as i64,
+        slots[SLOT_COMPONENT_STOP_REQUEST] as i64,
+        slots[SLOT_COMPONENT_STOP_EVENT_READ] as i64,
+        slots[SLOT_COMPONENT_STOP_EVENT_CODE] as i64,
+        slots[SLOT_COMPONENT_STOP_WAIT_OBSERVED],
+        slots[SLOT_COMPONENT_KILL_REQUEST] as i64,
+        slots[SLOT_COMPONENT_KILL_EVENT_READ] as i64,
+        slots[SLOT_COMPONENT_KILL_EVENT_CODE] as i64,
+        slots[SLOT_COMPONENT_KILL_WAIT_OBSERVED],
         slots[SLOT_COMPONENT_PROVIDER_STAGE],
         slots[SLOT_COMPONENT_PROVIDER_STATUS] as i64,
         slots[SLOT_COMPONENT_CLIENT_STAGE],

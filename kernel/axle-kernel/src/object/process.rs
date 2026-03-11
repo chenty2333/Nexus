@@ -152,7 +152,6 @@ pub fn create_process(
                     return Err(err);
                 }
             };
-
         Ok((process_handle, root_vmar_handle))
     })
 }

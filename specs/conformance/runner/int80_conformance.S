@@ -3,7 +3,7 @@
 .global axle_user_prog_end
 axle_user_prog_start:
 	// rbx = shared base (USER_SHARED_VA)
-	movabs $0x0000000100008000, %rbx
+	movabs $0x0000000100100000, %rbx
 // r12 = t0_ns baseline provided by the kernel (slot 511)
 mov 8*511(%rbx), %r12
 
@@ -2759,20 +2759,20 @@ local_fault_contention_done:
 
 process_child_image_ready:
 
-	// vmo_create(child shared region, 0x2000)
+	// vmo_create(child shared control region, 0x1000)
 	lea 0x1920(%rbx), %rdx
-	movabs $0x2000, %rdi
+	movabs $0x1000, %rdi
 	xorl %esi, %esi
 	movabs $9, %rax
 	int $0x80
 
-	// parent root_vmar maps shared region at USER_CODE_VA + 0x28000
+	// parent root_vmar maps shared control region at USER_CODE_VA + 0x28000
 	mov 8*62(%rbx), %rdi
 	movl $0x403, %esi
 	movabs $0x28000, %rdx
 	mov 0x1920(%rbx), %r10
 	xor %r8, %r8
-	movabs $0x2000, %r9
+	movabs $0x1000, %r9
 	lea 0x1928(%rbx), %rax
 	sub $8, %rsp
 	mov %rax, (%rsp)
@@ -2808,13 +2808,13 @@ process_child_image_ready:
 	add $8, %rsp
 	mov %rax, 8*383(%rbx)
 
-	// child root_vmar maps shared region at USER_SHARED_VA
+	// child root_vmar maps shared control region at USER_SHARED_VA
 	mov 0x1908(%rbx), %rdi
 	movl $0x403, %esi
 	mov 8*510(%rbx), %rdx
 	mov 0x1920(%rbx), %r10
 	xor %r8, %r8
-	movabs $0x2000, %r9
+	movabs $0x1000, %r9
 	lea 0x1948(%rbx), %rax
 	sub $8, %rsp
 	mov %rax, (%rsp)
@@ -2823,11 +2823,11 @@ process_child_image_ready:
 	add $8, %rsp
 	mov %rax, 8*348(%rbx)
 
-	// child root_vmar maps lazy shared page at USER_CODE_VA + 0xb000
+	// child root_vmar maps lazy shared page at USER_SHARED_VA + 0x1000
 	mov 0x1908(%rbx), %rdi
 	movl $0x403, %esi
 	mov 8*510(%rbx), %rdx
-	add $0x3000, %rdx
+	add $0x1000, %rdx
 	mov 0x1958(%rbx), %r10
 	xor %r8, %r8
 	movabs $0x1000, %r9
@@ -3152,7 +3152,7 @@ movq $0, 0x00(%rbx)
 int3
 
 thread_worker_entry:
-	movabs $0x0000000100008000, %rbx
+	movabs $0x0000000100100000, %rbx
 	movq $1, 8*399(%rbx)
 thread_worker_spin:
 	mov 8*403(%rbx), %rax
@@ -3254,7 +3254,7 @@ thread_worker_close_handle:
 
 process_child_entry:
 	mov %rsi, %rbx
-	movabs $0x000000010000b000, %rcx
+	lea 0x1000(%rbx), %rcx
 	movabs $0x1122334455667788, %rax
 	mov %rax, 0x0(%rcx)
 	movq $1, 0x0(%rbx)
@@ -3286,7 +3286,7 @@ process_child_touch_shared_fault_page:
 	jmp process_child_spin
 
 suspend_worker_entry:
-	movabs $0x0000000100008000, %rbx
+	movabs $0x0000000100100000, %rbx
 	mov %rdi, %r12
 suspend_worker_wait:
 	xorl %esi, %esi

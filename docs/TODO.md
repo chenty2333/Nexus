@@ -152,6 +152,8 @@ depends on: F2
   - child startup flows through the bootstrap channel and per-component namespace assembly
   - the manager can observe `OnTerminated` controller events from those children
 = remaining work is lazy-start and fuller lifecycle hardening on top of that wiring
+  - the minimal round-three lifecycle gate is `Stop/Kill` plus `OnTerminated` controller events
+  - raw task-handle termination waiting remains covered by the kernel task suite, not by the component-manager smoke
 
 #### G2. capability routing
 

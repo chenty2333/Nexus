@@ -11,13 +11,16 @@ fn main() {
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=AXLE_TEST_RUNNER_ASM");
     println!("cargo:rerun-if-env-changed=AXLE_TEST_RUNNER_RUST_ENTRY");
+    println!("cargo:rerun-if-env-changed=AXLE_COMPONENT_SMOKE_MODE");
     println!(
         "cargo:rustc-check-cfg=cfg(axle_test_runner_rust_entry, values(\"reactor_smoke\", \"component_smoke\"))"
     );
     for manifest in [
         "root_component.toml",
+        "root_component_round3.toml",
         "echo_provider.toml",
         "echo_client.toml",
+        "controller_worker.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -28,8 +31,10 @@ fn main() {
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     for (input, output) in [
         ("root_component.toml", "root_component.nxcd"),
+        ("root_component_round3.toml", "root_component_round3.nxcd"),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
+        ("controller_worker.toml", "controller_worker.nxcd"),
     ] {
         let source_path = manifests_dir.join(input);
         let source = fs::read_to_string(&source_path)
@@ -52,6 +57,9 @@ fn main() {
             }
             "component_smoke" => {
                 println!("cargo:rustc-cfg=axle_test_runner_rust_entry=\"{entry}\"");
+                let mode = std::env::var("AXLE_COMPONENT_SMOKE_MODE")
+                    .unwrap_or_else(|_| String::from("eager"));
+                println!("cargo:rustc-env=AXLE_COMPONENT_SMOKE_MODE={mode}");
             }
             _ => panic!("unsupported AXLE_TEST_RUNNER_RUST_ENTRY={entry}"),
         }

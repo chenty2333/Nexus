@@ -1,4 +1,4 @@
-url = "boot://root"
+url = "boot://root-round3"
 startup = "eager"
 
 [program]
@@ -18,9 +18,19 @@ name = "elf"
 [[children]]
 name = "echo_provider"
 url = "boot://echo-provider"
-startup = "eager"
+startup = "lazy"
 
 [[children]]
 name = "echo_client"
 url = "boot://echo-client"
+startup = "eager"
+
+[[children]]
+name = "stop_worker"
+url = "boot://controller-worker"
+startup = "eager"
+
+[[children]]
+name = "kill_worker"
+url = "boot://controller-worker"
 startup = "eager"

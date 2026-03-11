@@ -15,7 +15,7 @@ use libzircon::{
 };
 use nexus_rt::Dispatcher;
 
-const USER_SHARED_BASE: u64 = 0x0000_0001_0008_0000;
+const USER_SHARED_BASE: u64 = 0x0000_0001_0010_0000;
 
 const SLOT_OK: usize = 0;
 const SLOT_T0_NS: usize = 511;
@@ -84,7 +84,7 @@ const HEAP_BYTES: usize = 256 * 1024;
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
 
-static HEAP: HeapStorage = HeapStorage([0; HEAP_BYTES]);
+static mut HEAP: HeapStorage = HeapStorage([0; HEAP_BYTES]);
 static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct BumpAllocator;
@@ -116,7 +116,10 @@ unsafe impl GlobalAlloc for BumpAllocator {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    let base = HEAP.0.as_ptr() as usize;
+                    // SAFETY: `HEAP` is the dedicated backing storage for this bump allocator.
+                    // Allocation is serialized by the atomic bump pointer, and callers only
+                    // receive disjoint regions within this static buffer.
+                    let base = unsafe { core::ptr::addr_of_mut!(HEAP.0).cast::<u8>() as usize };
                     return (base + aligned) as *mut u8;
                 }
                 Err(observed) => current = observed,

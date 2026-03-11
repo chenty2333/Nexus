@@ -59,6 +59,6 @@ pub fn entry_addr() -> usize {
     axle_breakpoint_entry as *const () as usize
 }
 
-extern "C" fn axle_breakpoint_rust(_frame: *const u8) {
-    crate::userspace::on_breakpoint()
+extern "C" fn axle_breakpoint_rust(frame: *const u8) {
+    crate::userspace::on_breakpoint(frame.cast::<crate::arch::int80::TrapFrame>())
 }

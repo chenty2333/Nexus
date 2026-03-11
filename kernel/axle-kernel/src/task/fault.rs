@@ -37,6 +37,7 @@ enum FaultClaim {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FaultBlockingClaim {
     Leader,
+    LeaderPaused,
     LeaderResume,
     Wait { wake_leader: Option<ThreadId> },
 }
@@ -385,22 +386,16 @@ fn claim_blocking_fault(
 ) -> FaultBlockingClaim {
     let claim = {
         let mut table = table.lock();
-        table.claim_blocking(key, thread_id)
+        let claim = table.claim_blocking(key, thread_id);
+        if matches!(claim, FaultBlockingClaim::Leader) && should_pause_fault_leader_for_test() {
+            table.pause_leader_for_test(key, thread_id);
+            FaultBlockingClaim::LeaderPaused
+        } else {
+            claim
+        }
     };
     record_fault_telemetry_snapshot(table);
     claim
-}
-
-fn pause_fault_leader_for_test(
-    table: &Arc<Mutex<FaultTable>>,
-    key: FaultInFlightKey,
-    thread_id: ThreadId,
-) {
-    {
-        let mut table = table.lock();
-        table.pause_leader_for_test(key, thread_id);
-    }
-    record_fault_telemetry_snapshot(table);
 }
 
 fn complete_fault(table: &Arc<Mutex<FaultTable>>, key: FaultInFlightKey) -> Vec<ThreadId> {
@@ -653,13 +648,6 @@ pub(crate) fn handle_page_fault_serialized(
                 let claim = claim_blocking_fault(&fault_handle, plan.key(), thread_id);
                 match claim {
                     FaultBlockingClaim::Leader => {
-                        if should_pause_fault_leader_for_test() {
-                            pause_fault_leader_for_test(&fault_handle, plan.key(), thread_id);
-                            return PageFaultSerializedResult::BlockCurrent {
-                                key: plan.key(),
-                                wake_thread: None,
-                            };
-                        }
                         let key = plan.key();
                         let guard = FaultLeaderGuard::new(fault_handle.clone(), key);
                         let mut prepared =
@@ -745,6 +733,12 @@ pub(crate) fn handle_page_fault_serialized(
                         return PageFaultSerializedResult::BlockCurrent {
                             key: plan.key(),
                             wake_thread: wake_leader,
+                        };
+                    }
+                    FaultBlockingClaim::LeaderPaused => {
+                        return PageFaultSerializedResult::BlockCurrent {
+                            key: plan.key(),
+                            wake_thread: None,
                         };
                     }
                 }

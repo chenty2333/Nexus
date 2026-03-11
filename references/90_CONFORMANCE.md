@@ -72,6 +72,10 @@ Main just targets include:
   - a minimal `nexus-init` can resolve a root manifest and launch eager ELF children
   - one protocol route through `/svc` is exercised end-to-end
   - child `OnTerminated` controller events are observed back in the manager
+- The round-three component gate extends that with lazy lifecycle coverage:
+  - one provider is lazy-started on first routed `/svc` open
+  - `Stop` / `Kill` controller requests are exercised through the minimal component-manager path
+  - `OnTerminated` controller events, not raw task-handle waits, are the lifecycle contract at this layer
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return
@@ -108,6 +112,10 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - shared `stdout.log` / `stderr.log` and group-level result metadata now live under each run's
     `groups/` subtree
 - Most kernel scenarios build the kernel plus the current userspace runner, boot QEMU, and treat the printed summary line as the stable observable contract.
+- QEMU scenarios that boot `nexus-test-runner` now copy the built runner binary to one unique temp
+  path per command-group attempt before launching QEMU.
+  - this avoids cross-group contamination when the same Cargo target is rebuilt concurrently with
+    different entrypoint or assembly payload environment variables
 - The runtime/reactor bootstrap scenario is the first case where the userspace runner entrypoint itself is defined in Rust instead of a standalone hand-written `.S` payload.
 - That scenario now asserts structured dispatcher metrics instead of relying only on process exit:
   - registration slot reuse with generation advance after cancel

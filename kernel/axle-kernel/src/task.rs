@@ -2549,19 +2549,25 @@ impl AddressSpace {
         let stack_vmo = vm
             .create_vmo(
                 VmoKind::Anonymous,
-                crate::userspace::USER_PAGE_BYTES,
+                crate::userspace::USER_STACK_BYTES,
                 vmo_ids[2],
             )
             .expect("bootstrap stack vmo allocation must succeed");
-        let stack_frame = frames
-            .register_existing(crate::userspace::user_stack_page_paddr())
-            .expect("bootstrap stack frame registration must succeed");
-        vm.bind_vmo_frame(stack_vmo, 0, stack_frame)
+        for page_index in 0..crate::userspace::USER_STACK_PAGE_COUNT {
+            let stack_frame = frames
+                .register_existing(crate::userspace::user_stack_page_paddr(page_index))
+                .expect("bootstrap stack frame registration must succeed");
+            vm.bind_vmo_frame(
+                stack_vmo,
+                (page_index as u64) * crate::userspace::USER_PAGE_BYTES,
+                stack_frame,
+            )
             .expect("bootstrap stack frame binding must succeed");
+        }
         vm.map_fixed(
             frames,
             crate::userspace::USER_STACK_VA,
-            crate::userspace::USER_PAGE_BYTES,
+            crate::userspace::USER_STACK_BYTES,
             stack_vmo,
             0,
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
@@ -2570,7 +2576,7 @@ impl AddressSpace {
         .expect("bootstrap stack mapping must succeed");
         vm.mark_copy_on_write(
             crate::userspace::USER_STACK_VA,
-            crate::userspace::USER_PAGE_BYTES,
+            crate::userspace::USER_STACK_BYTES,
         )
         .expect("bootstrap stack COW arm must succeed");
         debug_assert!(page_tables.validate_descriptor_metadata_range(

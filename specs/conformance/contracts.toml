@@ -413,3 +413,11 @@ description = "Phase-three minimal nexus-init plus ElfRunner should resolve a ro
 [contracts.concurrency]
 mode = "not_applicable"
 reason = "minimal component-manager bootstrap gate; exercised by a dedicated QEMU ring3 scenario"
+
+[[contracts]]
+id = "must.component.lazy_lifecycle_bootstrap"
+level = "must"
+description = "Phase-three minimal nexus-init should resolve children through resolver capability lookup, lazy-start a routed provider, drive Stop/Kill controller requests, and observe `OnTerminated` controller events for those lifecycle-controlled children"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "bootstrap component-manager lifecycle gate; exercised by a dedicated QEMU ring3 scenario"

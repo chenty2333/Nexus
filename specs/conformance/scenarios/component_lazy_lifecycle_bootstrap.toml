@@ -1,0 +1,40 @@
+id = "kernel.component.lazy_lifecycle_bootstrap"
+description = "Bootstrap ring3 Rust userspace should resolve children through capability lookup, lazy-start one provider on first `/svc` route, and drive minimal Stop/Kill controller lifecycle for eager workers"
+tags = ["kernel", "component", "runner", "resolver", "lifecycle", "bootstrap"]
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/component-round3 && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && AXLE_TEST_RUNNER_RUST_ENTRY=component_smoke AXLE_COMPONENT_SMOKE_MODE=round3 RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none --target-dir \"$target_dir\" && runner_src=\"$target_dir/x86_64-unknown-none/debug/nexus-test-runner\" && runner=$(mktemp /tmp/nexus-test-runner-XXXXXX) && cp \"$runner_src\" \"$runner\" && size=$(stat -c%s \"$runner\") && timeout --foreground 12s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+
+contracts = [
+  "must.component.lazy_lifecycle_bootstrap",
+]
+
+expect = ["kernel: component manager bootstrap"]
+forbid = ["KERNEL PANIC"]
+
+[assertions.status_code]
+resolve_root = 0
+resolve_provider = 0
+resolve_client = 0
+provider_outgoing_pair = 0
+provider_launch = 0
+client_route = 0
+client_launch = 0
+provider_event_read = 0
+client_event_read = 0
+lazy_provider_route_launch = 0
+stop_request = 0
+stop_event_read = 0
+kill_request = 0
+kill_event_read = 0
+
+[assertions.packet_fields]
+failure_step = 0
+provider_event_code = 0
+client_event_code = 0
+lazy_provider_prelaunch = 0
+stop_event_code = 0
+kill_event_code = 137

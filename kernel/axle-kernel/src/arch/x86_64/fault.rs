@@ -201,8 +201,9 @@ extern "C" fn axle_gp_fault_rust(
     _unused: u64,
 ) -> ! {
     let (error, rip, cs, rflags, rsp_ss) = decode_cpu_frame_with_error_code(cpu);
+    let component = crate::userspace::component_summary_snapshot();
     kprintln!(
-        "#GP: rip={:#x} cs={:#x} rflags={:#x} err={:#x} from_user={} rsp_ss={:?} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}",
+        "#GP: rip={:#x} cs={:#x} rflags={:#x} err={:#x} from_user={} rsp_ss={:?} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} component={:?}",
         rip,
         cs,
         rflags,
@@ -218,6 +219,7 @@ extern "C" fn axle_gp_fault_rust(
         regs.r9,
         regs.r10,
         regs.r11,
+        component,
     );
     arch::cpu::halt_loop();
 }
