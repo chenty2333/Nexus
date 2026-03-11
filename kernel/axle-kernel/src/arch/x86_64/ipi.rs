@@ -61,6 +61,7 @@ core::arch::global_asm!(
     mov rdi, rsp
     call \rust
 
+    mov rax, [rsp + 0]
     add rsp, 8
     pop rdi
     pop rsi
@@ -82,7 +83,48 @@ core::arch::global_asm!(
 
     AXLE_IPI_ENTRY axle_ipi_test_entry, {rust_test}
     AXLE_IPI_ENTRY axle_ipi_tlb_entry, {rust_tlb}
-    AXLE_IPI_ENTRY axle_ipi_reschedule_entry, {rust_resched}
+
+    .global axle_ipi_reschedule_entry
+    .type axle_ipi_reschedule_entry, @function
+axle_ipi_reschedule_entry:
+    push r15
+    push r14
+    push r13
+    push r12
+    push rbx
+    push rbp
+    push r11
+    push rcx
+    push r9
+    push r8
+    push r10
+    push rdx
+    push rsi
+    push rdi
+    push rax
+
+    mov rdi, rsp
+    lea rsi, [rsp + 15*8]
+    call {rust_resched}
+
+    mov rax, [rsp + 0]
+    add rsp, 8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop r10
+    pop r8
+    pop r9
+    pop rcx
+    pop r11
+    pop rbp
+    pop rbx
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+    iretq
+    .size axle_ipi_reschedule_entry, .-axle_ipi_reschedule_entry
     "#,
     rust_test = sym axle_ipi_test_rust,
     rust_tlb = sym axle_ipi_tlb_rust,
@@ -147,10 +189,21 @@ extern "C" fn axle_ipi_tlb_rust(_frame: *const u8) {
     }
 }
 
-extern "C" fn axle_ipi_reschedule_rust(_frame: *const u8) {
+extern "C" fn axle_ipi_reschedule_rust(
+    frame: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+) {
     // The waking CPU updates scheduler state before sending this IPI.
-    // The target CPU only needs an interrupt to break out of `hlt`/trap blocking.
+    // If this hit user mode, turn it into an immediate trap-exit so the target CPU can observe
+    // `reschedule_requested` without waiting for a later syscall or timer edge.
     apic::eoi();
+    if cpu_frame.is_null() {
+        return;
+    }
+    let from_user = unsafe { (*cpu_frame.add(1) & 0b11) == 0b11 };
+    if from_user {
+        let _ = crate::object::finish_reschedule_interrupt(frame, cpu_frame);
+    }
 }
 
 #[allow(dead_code)]

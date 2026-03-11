@@ -24,7 +24,7 @@ pub fn init_bsp() {
         .is_some_and(|fi| fi.has_tsc_deadline());
 
     USE_TSC_DEADLINE.store(tsc_deadline, Ordering::Relaxed);
-    TICKS_ALL_CPUS.store(tsc_deadline, Ordering::Relaxed);
+    TICKS_ALL_CPUS.store(true, Ordering::Relaxed);
 
     apic::init_bsp();
 
@@ -46,19 +46,18 @@ pub fn init_ap() {
         .get_feature_info()
         .is_some_and(|fi| fi.has_tsc_deadline());
 
-    crate::arch::apic::init_ap(tsc_deadline);
+    crate::arch::apic::init_ap(true);
 
     if tsc_deadline {
         USE_TSC_DEADLINE.store(true, Ordering::Relaxed);
-        TICKS_ALL_CPUS.store(true, Ordering::Relaxed);
         arm_next_tick();
-    } else {
-        crate::kprintln!("timer: AP local scheduler tick disabled without TSC-deadline support");
     }
+    TICKS_ALL_CPUS.store(true, Ordering::Relaxed);
 }
 
-/// Phase-one scheduler shape: every online CPU receives a local tick when the hardware exposes
-/// a reliable deadline timer; otherwise the BSP remains the coarse fallback time source.
+/// Phase-one scheduler shape: every online CPU receives a local tick. TSC-deadline is preferred,
+/// but a coarse periodic APIC timer is still good enough to preserve basic time slicing and wake
+/// processing on fallback hardware.
 pub fn ticks_all_cpus() -> bool {
     TICKS_ALL_CPUS.load(Ordering::Relaxed)
 }
@@ -145,7 +144,6 @@ pub fn entry_addr() -> usize {
 extern "C" fn axle_timer_rust(frame: &mut crate::arch::int80::TrapFrame, cpu_frame: *mut u64) {
     // Acknowledge first, then drive higher-level timer logic.
     apic::eoi();
-    on_tick();
 
     let from_user = if cpu_frame.is_null() {
         false
@@ -154,11 +152,11 @@ extern "C" fn axle_timer_rust(frame: &mut crate::arch::int80::TrapFrame, cpu_fra
         // slot is valid for both kernel- and user-origin interrupts.
         unsafe { (*cpu_frame.add(1) & 0b11) == 0b11 }
     };
-    if from_user {
-        let now = crate::time::now_ns();
-        if crate::object::timer_interrupt_requires_trap_exit(now).unwrap_or(false) {
-            let _ = crate::object::finish_timer_interrupt(frame, cpu_frame);
-        }
+    on_tick();
+    let now = crate::time::now_ns();
+    let needs_trap_exit = crate::object::timer_interrupt_requires_trap_exit(now).unwrap_or(false);
+    if from_user && needs_trap_exit {
+        let _ = crate::object::finish_timer_interrupt(frame, cpu_frame);
     }
 
     if USE_TSC_DEADLINE.load(Ordering::Relaxed) {

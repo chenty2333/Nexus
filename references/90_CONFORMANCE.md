@@ -68,6 +68,10 @@ Main just targets include:
     - one dispatcher timer instead of one kernel timer per sleep future
     - task wakeups routed through user packets on the dispatcher port
     - async channel receive/call and socket readiness paths
+- Component-framework bootstrap coverage now also includes one eager-topology gate:
+  - a minimal `nexus-init` can resolve a root manifest and launch eager ELF children
+  - one protocol route through `/svc` is exercised end-to-end
+  - child `OnTerminated` controller events are observed back in the manager
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return
@@ -110,6 +114,8 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - channel receive and channel call/reply correctness
   - sleep completion through one dispatcher timer
   - socket readiness and follow-on read correctness
+- The eager component-topology bootstrap scenario is the first case where that Rust runner also plays
+  a minimal `nexus-init` / `ElfRunner` role instead of just a leaf test process.
 - Because that Rust runner is still linked at the long-standing bootstrap userspace VA above 4 GiB,
   the scenario builds `nexus-test-runner` with `RUSTFLAGS='-C code-model=large'` instead of
   changing the whole `x86_64-unknown-none` target configuration.

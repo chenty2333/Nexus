@@ -1,0 +1,32 @@
+id = "kernel.component.eager_topology_bootstrap"
+description = "Bootstrap ring3 Rust userspace should run a minimal nexus-init plus ElfRunner/service-manager loop that launches eager child components from the bootstrap image, routes one protocol through `/svc`, and collects their `OnTerminated` controller events"
+tags = ["kernel", "component", "runner", "resolver", "bootstrap"]
+
+command = [
+  "bash",
+  "-c",
+  "cargo build -p axle-kernel --target x86_64-unknown-none && AXLE_TEST_RUNNER_RUST_ENTRY=component_smoke RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none && runner=target/x86_64-unknown-none/debug/nexus-test-runner && size=$(stat -c%s \"$runner\") && timeout --foreground 8s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x1000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x0fffff8 -kernel target/x86_64-unknown-none/debug/axle-kernel; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+
+contracts = [
+  "must.component.eager_topology_bootstrap",
+]
+
+expect = ["kernel: component manager bootstrap"]
+forbid = ["KERNEL PANIC"]
+
+[assertions.status_code]
+resolve_root = 0
+resolve_provider = 0
+resolve_client = 0
+provider_outgoing_pair = 0
+provider_launch = 0
+client_route = 0
+client_launch = 0
+provider_event_read = 0
+client_event_read = 0
+
+[assertions.packet_fields]
+failure_step = 0
+provider_event_code = 0
+client_event_code = 0

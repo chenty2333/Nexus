@@ -28,6 +28,7 @@ axle_breakpoint_entry:
     call {rust_handler}
 
     // If the Rust handler returns, restore context and continue.
+    mov rax, [rsp + 0]
     add rsp, 8
     pop rdi
     pop rsi

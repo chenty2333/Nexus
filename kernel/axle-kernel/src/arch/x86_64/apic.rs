@@ -317,6 +317,7 @@ axle_apic_spurious_entry:
     mov rdi, rsp
     call {rust_handler}
 
+    mov rax, [rsp + 0]
     add rsp, 8
     pop rdi
     pop rsi
@@ -363,6 +364,7 @@ axle_apic_error_entry:
     mov rdi, rsp
     call {rust_handler}
 
+    mov rax, [rsp + 0]
     add rsp, 8
     pop rdi
     pop rsi

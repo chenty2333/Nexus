@@ -1221,6 +1221,28 @@ pub(crate) fn finish_timer_interrupt(
     })
 }
 
+pub(crate) fn finish_reschedule_interrupt(
+    trap: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+) -> Result<(), zx_status_t> {
+    run_trap_blocking(|resuming_blocked_current| {
+        with_state_mut(|state| {
+            let disposition = state.with_kernel_mut(|kernel| {
+                kernel.finish_trap_exit(trap, cpu_frame, resuming_blocked_current)
+            })?;
+            let lifecycle_dirty =
+                state.with_kernel_mut(|kernel| Ok(kernel.take_task_lifecycle_dirty()))?;
+            if lifecycle_dirty {
+                process::sync_task_lifecycle(state)?;
+            }
+            Ok(match disposition {
+                crate::task::TrapExitDisposition::Complete => TrapBlock::Ready(()),
+                crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
+            })
+        })
+    })
+}
+
 pub(crate) fn timer_interrupt_requires_trap_exit(now: i64) -> Result<bool, zx_status_t> {
     with_kernel_mut(|kernel| kernel.timer_interrupt_requires_trap_exit(now))
 }

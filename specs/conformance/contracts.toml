@@ -405,3 +405,11 @@ description = "Phase-three bootstrap userspace must provide a single-thread disp
 [contracts.concurrency]
 mode = "not_applicable"
 reason = "bootstrap userspace runtime gate; exercised by a dedicated QEMU ring3 scenario"
+
+[[contracts]]
+id = "must.component.eager_topology_bootstrap"
+level = "must"
+description = "Phase-three minimal nexus-init plus ElfRunner should resolve a root manifest, launch eager child components from the bootstrap code image, route one protocol through `/svc`, and collect `OnTerminated` controller events from those children"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "minimal component-manager bootstrap gate; exercised by a dedicated QEMU ring3 scenario"

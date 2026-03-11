@@ -196,19 +196,28 @@ extern "C" fn axle_page_fault_rust(
 }
 
 extern "C" fn axle_gp_fault_rust(
-    _regs: &crate::arch::int80::TrapFrame,
+    regs: &crate::arch::int80::TrapFrame,
     cpu: *const u64,
     _unused: u64,
 ) -> ! {
     let (error, rip, cs, rflags, rsp_ss) = decode_cpu_frame_with_error_code(cpu);
     kprintln!(
-        "#GP: rip={:#x} cs={:#x} rflags={:#x} err={:#x} from_user={} rsp_ss={:?}",
+        "#GP: rip={:#x} cs={:#x} rflags={:#x} err={:#x} from_user={} rsp_ss={:?} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}",
         rip,
         cs,
         rflags,
         error,
         (cs & 0b11) == 0b11,
-        rsp_ss
+        rsp_ss,
+        regs.rax,
+        regs.rdi,
+        regs.rsi,
+        regs.rdx,
+        regs.rcx,
+        regs.r8,
+        regs.r9,
+        regs.r10,
+        regs.r11,
     );
     arch::cpu::halt_loop();
 }

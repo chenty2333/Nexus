@@ -147,7 +147,11 @@ depends on: F2
   - shared `ResolvedComponent` shape
   - bootstrap-channel `ComponentStartInfo`
   - minimal controller and outgoing-directory request messages
-= remaining work is the live `ElfRunner` and manager wiring on top of those contracts
+= round-two eager-topology gate is now in:
+  - `ElfRunner` can launch eager child components from the bootstrap image
+  - child startup flows through the bootstrap channel and per-component namespace assembly
+  - the manager can observe `OnTerminated` controller events from those children
+= remaining work is lazy-start and fuller lifecycle hardening on top of that wiring
 
 #### G2. capability routing
 
@@ -159,8 +163,12 @@ depends on: F2
   - host-side manifest compiler for the minimal component IR
   - unified resolver shape for `boot://`, `pkg://`, and `local://`
   - in-memory resolver table that hides scheme-specific details from runners
-= remaining work is the first real `nexus-init` / service-manager topology loop:
-  namespace assembly, eager bring-up, controller handling, and lazy-start follow-on
+= round-two topology loop is now in:
+  - root manifest resolve
+  - static `/svc` assembly for one routed protocol
+  - eager bring-up of provider/client children
+  - controller-event collection back into the manager
+= remaining work is lazy-start, resolver/runner capability lookup cleanup, and lifecycle controls
 
 depends on: F1-F2, A2
 

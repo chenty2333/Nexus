@@ -13,25 +13,45 @@
 #![no_std]
 #![no_main]
 #![cfg_attr(
-    not(axle_test_runner_rust_entry = "reactor_smoke"),
+    all(
+        not(axle_test_runner_rust_entry = "reactor_smoke"),
+        not(axle_test_runner_rust_entry = "component_smoke")
+    ),
     forbid(unsafe_code)
 )]
 #![cfg_attr(
-    axle_test_runner_rust_entry = "reactor_smoke",
+    any(
+        axle_test_runner_rust_entry = "reactor_smoke",
+        axle_test_runner_rust_entry = "component_smoke"
+    ),
     deny(unsafe_op_in_unsafe_fn)
 )]
 #![cfg_attr(
-    axle_test_runner_rust_entry = "reactor_smoke",
+    any(
+        axle_test_runner_rust_entry = "reactor_smoke",
+        axle_test_runner_rust_entry = "component_smoke"
+    ),
     deny(clippy::undocumented_unsafe_blocks)
 )]
 
-#[cfg(axle_test_runner_rust_entry = "reactor_smoke")]
+#[cfg(any(
+    axle_test_runner_rust_entry = "reactor_smoke",
+    axle_test_runner_rust_entry = "component_smoke"
+))]
 extern crate alloc;
 
 use core::panic::PanicInfo;
 
+#[cfg(axle_test_runner_rust_entry = "component_smoke")]
+mod component_smoke;
 #[cfg(axle_test_runner_rust_entry = "reactor_smoke")]
 mod reactor_smoke;
+
+#[cfg(axle_test_runner_rust_entry = "component_smoke")]
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    component_smoke::report_panic()
+}
 
 #[cfg(axle_test_runner_rust_entry = "reactor_smoke")]
 #[panic_handler]
@@ -39,7 +59,10 @@ fn panic(_info: &PanicInfo) -> ! {
     reactor_smoke::report_panic()
 }
 
-#[cfg(not(axle_test_runner_rust_entry = "reactor_smoke"))]
+#[cfg(all(
+    not(axle_test_runner_rust_entry = "reactor_smoke"),
+    not(axle_test_runner_rust_entry = "component_smoke")
+))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {

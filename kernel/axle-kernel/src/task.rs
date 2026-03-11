@@ -1360,6 +1360,7 @@ pub(crate) const fn process_image_default_code_perms() -> MappingPerms {
 }
 
 const STACK_ARGV0: &[u8] = b"axle-child\0";
+const PROCESS_START_STACK_BYTES: u64 = crate::userspace::USER_PAGE_BYTES * 16;
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
@@ -3910,14 +3911,41 @@ impl Kernel {
             .processes
             .get(&thread.process_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        if !self.with_vm(|vm| {
-            vm.validate_user_ptr(process.address_space_id, ptr as u64, size_of::<T>())
-        }) {
+        let len = size_of::<T>();
+        if !self.with_vm(|vm| vm.validate_user_ptr(process.address_space_id, ptr as u64, len)) {
             return Err(ZX_ERR_INVALID_ARGS);
         }
-        // SAFETY: the pointer was validated against the target thread's userspace mapping.
-        unsafe {
-            core::ptr::write_unaligned(ptr, value);
+
+        if len == 0 {
+            return Ok(());
+        }
+
+        let page_bytes = crate::userspace::USER_PAGE_BYTES as usize;
+        // SAFETY: `value` is an in-register copy owned by this function. Reinterpreting its
+        // bytes for immediate copyout is sound because `T: Copy` and we never outlive `value`.
+        let src = unsafe { core::slice::from_raw_parts((&value as *const T).cast::<u8>(), len) };
+        let mut written = 0usize;
+        while written < len {
+            let dst_addr = (ptr as u64)
+                .checked_add(written as u64)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let page_base = dst_addr - (dst_addr % crate::userspace::USER_PAGE_BYTES);
+            self.with_vm_mut(|vm| {
+                vm.ensure_user_page_resident(process.address_space_id, page_base, true)
+            })?;
+            let lookup = self
+                .with_vm(|vm| vm.lookup_user_mapping(process.address_space_id, page_base, 1))
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            let frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
+            let page_offset =
+                usize::try_from(dst_addr - page_base).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+            let chunk_len = core::cmp::min(page_bytes - page_offset, len - written);
+            crate::copy::write_bootstrap_frame_bytes(
+                frame_id.raw(),
+                page_offset,
+                &src[written..written + chunk_len],
+            )?;
+            written += chunk_len;
         }
         Ok(())
     }
@@ -3996,6 +4024,9 @@ impl Kernel {
                 }
             }
             ThreadState::Blocked { .. } => {
+                if !resuming_blocked_current {
+                    self.capture_current_user_context(trap, cpu_frame.cast_const())?;
+                }
                 self.clear_current_slice_state();
                 if let Some(next_thread_id) = self.pop_runnable_thread() {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
@@ -4400,6 +4431,7 @@ impl Kernel {
         if !queued {
             let target_cpu = self.choose_wake_cpu(thread_id_copy);
             self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
+            self.request_reschedule_on_cpu(target_cpu);
         }
         Ok(())
     }
@@ -4842,9 +4874,6 @@ impl Kernel {
         if let Some(running_cpu_id) = self.running_cpu_for_thread(thread_id) {
             return running_cpu_id;
         }
-        if self.cpu_is_online(current_cpu_id) {
-            return current_cpu_id;
-        }
         let preferred_cpu = self
             .threads
             .get(&thread_id)
@@ -4862,6 +4891,9 @@ impl Kernel {
         }
         if self.cpu_is_online(preferred_cpu) {
             return preferred_cpu;
+        }
+        if self.cpu_is_online(current_cpu_id) {
+            return current_cpu_id;
         }
         current_cpu_id
     }
@@ -6133,15 +6165,48 @@ impl VmDomain {
                     continue;
                 }
                 let perms = segment.perms() | MappingPerms::USER;
-                self.map_existing_local_vmo_fixed(
-                    address_space_id,
-                    root_vmar_id,
-                    segment.vaddr(),
-                    len,
-                    local_vmo_id,
-                    segment.vmo_offset(),
-                    perms,
-                )?;
+                if perms.contains(MappingPerms::WRITE) {
+                    let private_global_vmo_id = self.alloc_global_vmo_id();
+                    let private_vmo = self.create_anonymous_vmo_for_address_space(
+                        process_id,
+                        address_space_id,
+                        len,
+                        private_global_vmo_id,
+                    )?;
+                    self.map_existing_local_vmo_fixed(
+                        address_space_id,
+                        root_vmar_id,
+                        segment.vaddr(),
+                        len,
+                        private_vmo.vmo_id(),
+                        0,
+                        perms,
+                    )?;
+                    if segment.file_size_bytes() != 0 {
+                        let bytes = self.read_shared_vmo_bytes(
+                            global_vmo_id,
+                            segment.vmo_offset(),
+                            usize::try_from(segment.file_size_bytes())
+                                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                        )?;
+                        self.write_local_vmo_bytes(
+                            address_space_id,
+                            private_vmo.vmo_id(),
+                            0,
+                            &bytes,
+                        )?;
+                    }
+                } else {
+                    self.map_existing_local_vmo_fixed(
+                        address_space_id,
+                        root_vmar_id,
+                        segment.vaddr(),
+                        len,
+                        local_vmo_id,
+                        segment.vmo_offset(),
+                        perms,
+                    )?;
+                }
             }
         }
 
@@ -6149,21 +6214,21 @@ impl VmDomain {
         let stack_vmo = self.create_anonymous_vmo_for_address_space(
             process_id,
             address_space_id,
-            crate::userspace::USER_PAGE_BYTES,
+            PROCESS_START_STACK_BYTES,
             stack_global_vmo_id,
         )?;
         self.map_existing_local_vmo_fixed(
             address_space_id,
             root_vmar_id,
             crate::userspace::USER_STACK_VA,
-            crate::userspace::USER_PAGE_BYTES,
+            PROCESS_START_STACK_BYTES,
             stack_vmo.vmo_id(),
             0,
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
         )?;
         let (stack_pointer, stack_vmo_offset, stack_image) = build_process_start_stack_image(
             crate::userspace::USER_STACK_VA,
-            crate::userspace::USER_PAGE_BYTES,
+            PROCESS_START_STACK_BYTES,
             layout,
         )?;
         self.write_local_vmo_bytes(

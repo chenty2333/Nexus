@@ -90,6 +90,16 @@ This is a deliberate bootstrap path, not yet a final fast syscall mechanism.
 - TLB IPI
 - reschedule IPI
 
+Current stack contract:
+
+- ring3 -> ring0 syscalls enter on the per-CPU `RSP0` stack
+- timer, APIC, breakpoint, and fixed-vector IPI entry use one per-CPU IRQ IST
+- `#PF` / `#GP` use a separate per-CPU fault IST
+- `#DF` keeps its own dedicated IST
+
+Splitting the IRQ and fault ISTs avoids a fault taken during IRQ/IPI handling from resetting `rsp`
+back onto the live IRQ-stack top and overwriting the in-flight interrupt frame.
+
 ## Current limitations
 
 - The architecture layer is x86_64-only today.

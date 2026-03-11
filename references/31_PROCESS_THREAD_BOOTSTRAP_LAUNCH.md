@@ -84,6 +84,8 @@ The bootstrap address space is prewired enough to exercise real VM behavior earl
   - one synthetic `argv[0]`
   - empty `envp`
   - a small `auxv` set including `AT_PAGESZ`, `AT_ENTRY`, and ELF program-header metadata when available
+- Generic child launch currently reserves one fixed multi-page initial stack window
+  (currently 16 pages) above `USER_STACK_VA`; it is intentionally not yet a grow-on-demand stack.
 
 ## Phase-one gate contract
 
@@ -115,6 +117,9 @@ The first generic-launch contract is now implemented without changing syscall si
   `process_start(arg_handle)` is treated as "child bootstrap channel", and the
   higher-level start payload moves over that channel instead of adding new
   process-start syscall arguments.
+- The current eager-topology component smoke already exercises that contract:
+  `nexus-init` launches eager children by sending `ComponentStartInfo` over the
+  bootstrap channel and then observing controller events from the started child.
 - The initial BSP ring3 entry still comes from bootstrap-specific bring-up plumbing, even though
   child process launch now uses the generic path.
 - The current ELF parser is intentionally narrow:

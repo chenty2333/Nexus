@@ -1,0 +1,14 @@
+url = "boot://echo-provider"
+startup = "eager"
+
+[program]
+runner = "elf"
+binary = "bin/nexus-self"
+args = ["echo-provider"]
+env = []
+
+[[exposes]]
+kind = "protocol"
+source = "self"
+name = "nexus.echo.Echo"
+as = "nexus.echo.Echo"

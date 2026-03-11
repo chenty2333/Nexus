@@ -475,7 +475,33 @@ const SLOT_RUNTIME_CLOSE_CALL_CLIENT: usize = 574;
 const SLOT_RUNTIME_CLOSE_CALL_SERVER: usize = 575;
 const SLOT_RUNTIME_CLOSE_SOCKET_TX: usize = 576;
 const SLOT_RUNTIME_CLOSE_SOCKET_RX: usize = 577;
-const SLOT_MAX: usize = SLOT_RUNTIME_CLOSE_SOCKET_RX;
+const SLOT_COMPONENT_FAILURE_STEP: usize = 578;
+const SLOT_COMPONENT_RESOLVE_ROOT: usize = 579;
+const SLOT_COMPONENT_RESOLVE_PROVIDER: usize = 580;
+const SLOT_COMPONENT_RESOLVE_CLIENT: usize = 581;
+const SLOT_COMPONENT_PROVIDER_OUTGOING_PAIR: usize = 582;
+const SLOT_COMPONENT_PROVIDER_LAUNCH: usize = 583;
+const SLOT_COMPONENT_CLIENT_ROUTE: usize = 584;
+const SLOT_COMPONENT_CLIENT_LAUNCH: usize = 585;
+const SLOT_COMPONENT_PROVIDER_EVENT_READ: usize = 586;
+const SLOT_COMPONENT_PROVIDER_EVENT_CODE: usize = 587;
+const SLOT_COMPONENT_CLIENT_EVENT_READ: usize = 588;
+const SLOT_COMPONENT_CLIENT_EVENT_CODE: usize = 589;
+const SLOT_COMPONENT_KILL_PROVIDER: usize = 590;
+const SLOT_COMPONENT_KILL_CLIENT: usize = 591;
+const SLOT_COMPONENT_WAIT_PROVIDER: usize = 592;
+const SLOT_COMPONENT_WAIT_PROVIDER_OBS: usize = 593;
+const SLOT_COMPONENT_WAIT_CLIENT: usize = 594;
+const SLOT_COMPONENT_WAIT_CLIENT_OBS: usize = 595;
+const SLOT_COMPONENT_CLOSE_PROVIDER_PROCESS: usize = 596;
+const SLOT_COMPONENT_CLOSE_PROVIDER_CONTROLLER: usize = 597;
+const SLOT_COMPONENT_CLOSE_CLIENT_PROCESS: usize = 598;
+const SLOT_COMPONENT_CLOSE_CLIENT_CONTROLLER: usize = 599;
+const SLOT_COMPONENT_PROVIDER_STAGE: usize = 600;
+const SLOT_COMPONENT_PROVIDER_STATUS: usize = 601;
+const SLOT_COMPONENT_CLIENT_STAGE: usize = 602;
+const SLOT_COMPONENT_CLIENT_STATUS: usize = 603;
+const SLOT_MAX: usize = SLOT_COMPONENT_CLIENT_STATUS;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1122,9 +1148,16 @@ pub(crate) fn zero_current_mapping_bytes(dst_ptr: u64, len: usize) {
 }
 
 fn shared_slots() -> &'static mut [u64] {
-    // SAFETY: the bootstrap shared region is two contiguous shared pages mapped at USER_SHARED_VA
-    // and 8-byte aligned; we only use it after mapping.
-    unsafe { core::slice::from_raw_parts_mut(USER_SHARED_VA as *mut u64, 1024) }
+    // SAFETY: USER_SHARED_PAGES is one contiguous backing array for the bootstrap
+    // shared-summary window, aligned to 4096 bytes and therefore also to 8 bytes.
+    // Kernel-side telemetry must address that backing directly instead of relying on
+    // whichever userspace CR3 happens to be current.
+    unsafe {
+        core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(USER_SHARED_PAGES).cast::<u64>(),
+            (USER_SHARED_PAGE_COUNT * 4096) / core::mem::size_of::<u64>(),
+        )
+    }
 }
 
 pub(crate) fn record_vm_cow_fault_count(count: u64) {
@@ -1194,7 +1227,18 @@ pub(crate) fn consume_vm_fault_leader_pause_hook() -> bool {
 pub fn on_breakpoint() -> ! {
     let slots = shared_slots();
     if slots[SLOT_OK] != 1 {
-        crate::kprintln!("userspace: conformance reported failure (ok=0)");
+        crate::kprintln!(
+            "userspace: conformance reported failure (ok=0, component_failure_step={}, provider_stage={}, provider_status={}, client_stage={}, client_status={}, provider_event_read={}, provider_event_code={}, client_event_read={}, client_event_code={})",
+            slots[SLOT_COMPONENT_FAILURE_STEP],
+            slots[SLOT_COMPONENT_PROVIDER_STAGE],
+            slots[SLOT_COMPONENT_PROVIDER_STATUS] as i64,
+            slots[SLOT_COMPONENT_CLIENT_STAGE],
+            slots[SLOT_COMPONENT_CLIENT_STATUS] as i64,
+            slots[SLOT_COMPONENT_PROVIDER_EVENT_READ] as i64,
+            slots[SLOT_COMPONENT_PROVIDER_EVENT_CODE] as i64,
+            slots[SLOT_COMPONENT_CLIENT_EVENT_READ] as i64,
+            slots[SLOT_COMPONENT_CLIENT_EVENT_CODE] as i64
+        );
         crate::arch::qemu::exit_failure();
     }
     let socket_stats = crate::object::transport::socket_telemetry_snapshot();
@@ -1640,6 +1684,26 @@ pub fn on_breakpoint() -> ! {
         slots[SLOT_RUNTIME_CLOSE_CALL_SERVER] as i64,
         slots[SLOT_RUNTIME_CLOSE_SOCKET_TX] as i64,
         slots[SLOT_RUNTIME_CLOSE_SOCKET_RX] as i64
+    );
+
+    crate::kprintln!(
+        "kernel: component manager bootstrap (failure_step={}, resolve_root={}, resolve_provider={}, resolve_client={}, provider_outgoing_pair={}, provider_launch={}, client_route={}, client_launch={}, provider_event_read={}, provider_event_code={}, client_event_read={}, client_event_code={}, provider_stage={}, provider_status={}, client_stage={}, client_status={})",
+        slots[SLOT_COMPONENT_FAILURE_STEP],
+        slots[SLOT_COMPONENT_RESOLVE_ROOT] as i64,
+        slots[SLOT_COMPONENT_RESOLVE_PROVIDER] as i64,
+        slots[SLOT_COMPONENT_RESOLVE_CLIENT] as i64,
+        slots[SLOT_COMPONENT_PROVIDER_OUTGOING_PAIR] as i64,
+        slots[SLOT_COMPONENT_PROVIDER_LAUNCH] as i64,
+        slots[SLOT_COMPONENT_CLIENT_ROUTE] as i64,
+        slots[SLOT_COMPONENT_CLIENT_LAUNCH] as i64,
+        slots[SLOT_COMPONENT_PROVIDER_EVENT_READ] as i64,
+        slots[SLOT_COMPONENT_PROVIDER_EVENT_CODE] as i64,
+        slots[SLOT_COMPONENT_CLIENT_EVENT_READ] as i64,
+        slots[SLOT_COMPONENT_CLIENT_EVENT_CODE] as i64,
+        slots[SLOT_COMPONENT_PROVIDER_STAGE],
+        slots[SLOT_COMPONENT_PROVIDER_STATUS] as i64,
+        slots[SLOT_COMPONENT_CLIENT_STAGE],
+        slots[SLOT_COMPONENT_CLIENT_STATUS] as i64
     );
 
     crate::arch::qemu::exit_success();
