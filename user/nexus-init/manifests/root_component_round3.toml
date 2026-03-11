@@ -1,0 +1,36 @@
+url = "boot://root-round3"
+startup = "eager"
+
+[program]
+runner = "elf"
+binary = "bin/nexus-self"
+args = ["nexus-init"]
+env = []
+
+[[use]]
+kind = "resolver"
+name = "boot-resolver"
+
+[[use]]
+kind = "runner"
+name = "elf"
+
+[[children]]
+name = "echo_provider"
+url = "boot://echo-provider"
+startup = "lazy"
+
+[[children]]
+name = "echo_client"
+url = "boot://echo-client"
+startup = "eager"
+
+[[children]]
+name = "stop_worker"
+url = "boot://controller-worker"
+startup = "eager"
+
+[[children]]
+name = "kill_worker"
+url = "boot://controller-worker"
+startup = "eager"

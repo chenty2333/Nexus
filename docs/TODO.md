@@ -151,6 +151,8 @@ depends on: F2
   - `ElfRunner` can launch eager child components from the bootstrap image
   - child startup flows through the bootstrap channel and per-component namespace assembly
   - the manager can observe `OnTerminated` controller events from those children
+= the current tree now also has an extracted `user/nexus-init` package so the
+  root manager no longer lives only inside `component_smoke.rs`
 = remaining work is lazy-start and fuller lifecycle hardening on top of that wiring
   - the minimal round-three lifecycle gate is `Stop/Kill` plus `OnTerminated` controller events
   - raw task-handle termination waiting remains covered by the kernel task suite, not by the component-manager smoke
@@ -170,6 +172,8 @@ depends on: F2
   - static `/svc` assembly for one routed protocol
   - eager bring-up of provider/client children
   - controller-event collection back into the manager
+= the current tree now carries that manager logic in `user/nexus-init`, while
+  bootstrap conformance still reuses the same self-image child-role path
 = remaining work is lazy-start, resolver/runner capability lookup cleanup, and lifecycle controls
 
 depends on: F1-F2, A2

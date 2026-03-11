@@ -1,0 +1,13 @@
+url = "boot://echo-client"
+startup = "eager"
+
+[program]
+runner = "elf"
+binary = "bin/nexus-self"
+args = ["echo-client"]
+env = []
+
+[[use]]
+kind = "protocol"
+name = "nexus.echo.Echo"
+path = "/svc"

@@ -1,20 +1,21 @@
 [package]
-name = "nexus-test-runner"
+name = "nexus-init"
 version = "0.1.0"
 edition = "2024"
 license = "Unlicense"
 publish = false
+
+[lib]
+name = "nexus_init"
+path = "src/lib.rs"
 
 [dependencies]
 axle-arch-x86_64 = { path = "../../crates/axle-arch-x86_64", default-features = false }
 axle-types = { path = "../../crates/axle-types", default-features = false }
 libzircon = { path = "../../crates/libzircon", default-features = false }
 nexus-component = { path = "../../crates/nexus-component", default-features = false }
-nexus-init = { path = "../nexus-init", default-features = false }
-nexus-rt = { path = "../../crates/nexus-rt", default-features = false }
 
 [build-dependencies]
-cc = "1"
 nexus-manifestc = { path = "../../tools/nexus-manifestc" }
 
 [features]

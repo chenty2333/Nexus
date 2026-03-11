@@ -1,0 +1,8 @@
+url = "boot://controller-worker"
+startup = "eager"
+
+[program]
+runner = "elf"
+binary = "bin/nexus-self"
+args = ["controller-worker"]
+env = []
