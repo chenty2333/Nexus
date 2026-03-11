@@ -129,6 +129,9 @@ This makes contract coverage part of the repo workflow, not just informal docume
   `echo-provider`, `echo-client`, and `controller-worker` ELFs through QEMU
   loader slots, rather than having `nexus-test-runner` impersonate every role
   from one self image.
+- The eager and lazy component scenarios now rebuild the same `nexus-init`
+  binary with different root-manifest URLs via `NEXUS_INIT_ROOT_URL`; topology
+  selection is no longer driven by a separate smoke-mode branch in the manager.
 - Because those dedicated userspace binaries are still linked at the
   long-standing bootstrap userspace VA above 4 GiB, the component scenarios
   build them with `RUSTFLAGS='-C code-model=large'` instead of changing the

@@ -140,7 +140,7 @@ depends on: F2
 
 ### G. Component Framework `[~]`
 
-#### G1. runner abstraction `[~]`
+#### G1. runner abstraction `[x]`
 
 = round-one launch contracts are now frozen:
   - shared `ComponentDecl` binary IR
@@ -155,15 +155,17 @@ depends on: F2
   root manager no longer lives only inside `component_smoke.rs`
 = the current tree now also boots dedicated `echo-provider`, `echo-client`, and
   `controller-worker` binaries instead of reusing one self image for child roles
-= remaining work is productizing that runner shape into the formal system startup path
-  - boot resolver / runner lookup should become built-in capability providers in `nexus-init`
-  - raw task-handle termination waiting remains covered by the kernel task suite, not by the component-manager layer
+= the current root-manager path now resolves one boot root URL through a built-in
+  `boot-resolver` provider and validates child `runner = "elf"` lookup against
+  the built-in runner registry in `nexus-init`
+= raw task-handle termination waiting remains covered by the kernel task suite,
+  not by the component-manager layer
 
 #### G2. capability routing
 
 = structured capability passing and restriction between components
 
-#### G3. init / service manager / minimal resolver `[~]`
+#### G3. init / service manager / minimal resolver `[x]`
 
 = round-one groundwork is in:
   - host-side manifest compiler for the minimal component IR
@@ -179,9 +181,10 @@ depends on: F2
   - `Stop` / `Kill` requests flow through the controller channel
 = the current tree now carries that manager logic in `user/nexus-init` and
   boots dedicated child binaries for provider/client/worker roles
-= remaining work is the formal root startup path and built-in capability-provider cleanup
-  - boot resolver wiring should come from the real root manifest path, not only the conformance shape
-  - runner/resolver lookup should stay at the component layer instead of leaking back to raw task waits
+= the formal root startup path now comes from one boot-selected root URL
+  resolved by `nexus-init` through the built-in boot resolver
+= eager and lazy topologies now use the same `nexus-init` binary and component
+  lifecycle path; the root manifest, not a smoke-mode branch, decides startup behavior
 
 depends on: F1-F2, A2
 

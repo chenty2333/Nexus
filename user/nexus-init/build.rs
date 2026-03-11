@@ -6,7 +6,7 @@ fn main() {
     let manifests_dir = manifest_dir.join("manifests");
 
     println!("cargo:rerun-if-changed=linker.ld");
-    println!("cargo:rerun-if-env-changed=AXLE_COMPONENT_SMOKE_MODE");
+    println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
     for manifest in [
         "root_component.toml",
         "root_component_round3.toml",
@@ -42,7 +42,7 @@ fn main() {
     let script = manifest_dir.join("linker.ld");
     println!("cargo:rustc-link-arg=-T{}", script.display());
     println!("cargo:rustc-link-arg=-no-pie");
-
-    let mode = std::env::var("AXLE_COMPONENT_SMOKE_MODE").unwrap_or_else(|_| String::from("eager"));
-    println!("cargo:rustc-env=AXLE_COMPONENT_SMOKE_MODE={mode}");
+    let root_url =
+        std::env::var("NEXUS_INIT_ROOT_URL").unwrap_or_else(|_| String::from("boot://root"));
+    println!("cargo:rustc-env=NEXUS_INIT_ROOT_URL={root_url}");
 }

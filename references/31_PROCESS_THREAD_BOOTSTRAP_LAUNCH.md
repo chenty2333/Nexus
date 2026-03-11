@@ -126,6 +126,9 @@ The first generic-launch contract is now implemented without changing syscall si
   `process_start(arg_handle)` is treated as "child bootstrap channel", and the
   higher-level start payload moves over that channel instead of adding new
   process-start syscall arguments.
+- The current `nexus-init` root manager now chooses one root manifest URL at
+  build/boot configuration time and resolves it through the built-in
+  `boot-resolver` provider before launching child components.
 - The current eager-topology component smoke already exercises that contract:
   `nexus-init` launches dedicated boot-backed child images by sending
   `ComponentStartInfo` over the bootstrap channel and then observing controller

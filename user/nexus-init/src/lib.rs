@@ -18,10 +18,12 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axle_types::handle::ZX_HANDLE_INVALID;
-use axle_types::status::{ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_OK};
+use axle_types::status::{ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NOT_FOUND, ZX_OK};
 use axle_types::{zx_handle_t, zx_status_t};
 use libzircon::{ZX_TIME_INFINITE, zx_channel_create, zx_channel_write, zx_handle_close};
-use nexus_component::{ControllerRequest, NamespaceEntry, ResolverRecord, StartupMode};
+use nexus_component::{
+    ControllerRequest, NamespaceEntry, ResolvedComponent, ResolverRecord, StartupMode,
+};
 
 use crate::lifecycle::{
     MinimalRole, read_component_start_info_minimal, read_controller_event_blocking,
@@ -95,6 +97,7 @@ const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
 pub(crate) const CHILD_ROLE_CONTROLLER_WORKER: &str = "controller-worker";
+const ROOT_COMPONENT_URL: &str = env!("NEXUS_INIT_ROOT_URL");
 pub(crate) const ROOT_BINARY_PATH: &str = "bin/nexus-init";
 pub(crate) const PROVIDER_BINARY_PATH: &str = "bin/echo-provider";
 pub(crate) const CLIENT_BINARY_PATH: &str = "bin/echo-client";
@@ -118,21 +121,6 @@ const HEAP_BYTES: usize = 256 * 1024;
 static mut HEAP: HeapStorage = HeapStorage([0; HEAP_BYTES]);
 static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
 static ROLE: AtomicUsize = AtomicUsize::new(ROLE_NONE);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SmokeMode {
-    Eager,
-    Round3,
-}
-
-impl SmokeMode {
-    fn current() -> Self {
-        match option_env!("AXLE_COMPONENT_SMOKE_MODE") {
-            Some("round3") => Self::Round3,
-            _ => Self::Eager,
-        }
-    }
-}
 
 struct BumpAllocator;
 
@@ -207,7 +195,7 @@ pub fn program_start(bootstrap_channel: zx_handle_t, arg1: u64) -> ! {
     let _ = (bootstrap_channel, arg1);
     ROLE.store(ROLE_ROOT, Ordering::Relaxed);
     let mut summary = ComponentSummary::default();
-    let status = run_component_manager_smoke(&mut summary);
+    let status = run_component_manager(&mut summary);
     write_summary(&summary);
     write_slot(SLOT_OK, u64::from(status == 0));
     axle_arch_x86_64::debug_break()
@@ -291,14 +279,55 @@ fn build_boot_image_catalog() -> Result<BootImageCatalog, zx_status_t> {
     Ok(images)
 }
 
-fn run_component_manager_smoke(summary: &mut ComponentSummary) -> i32 {
-    match SmokeMode::current() {
-        SmokeMode::Eager => run_component_manager_eager_smoke(summary),
-        SmokeMode::Round3 => run_component_manager_round3_smoke(summary),
+fn build_resolver_registry() -> Result<ResolverRegistry, zx_status_t> {
+    let mut resolvers = ResolverRegistry::new();
+    for bytes in [
+        ROOT_DECL_EAGER_BYTES,
+        ROOT_DECL_ROUND3_BYTES,
+        PROVIDER_DECL_BYTES,
+        CLIENT_DECL_BYTES,
+        CONTROLLER_WORKER_DECL_BYTES,
+    ] {
+        let component = decode_resolved_component(bytes)?;
+        resolvers
+            .insert_record(
+                "boot-resolver",
+                ResolverRecord {
+                    url: component.decl.url.clone(),
+                    resolved: component,
+                },
+            )
+            .map_err(|_| ZX_ERR_INTERNAL)?;
+    }
+    Ok(resolvers)
+}
+
+fn root_seed_bytes() -> Result<&'static [u8], zx_status_t> {
+    match ROOT_COMPONENT_URL {
+        "boot://root" => Ok(ROOT_DECL_EAGER_BYTES),
+        "boot://root-round3" => Ok(ROOT_DECL_ROUND3_BYTES),
+        _ => Err(ZX_ERR_NOT_FOUND),
     }
 }
 
-fn run_component_manager_eager_smoke(summary: &mut ComponentSummary) -> i32 {
+fn resolve_root_component(resolvers: &ResolverRegistry) -> Result<ResolvedComponent, zx_status_t> {
+    let root_seed = decode_resolved_component(root_seed_bytes()?)?;
+    resolve_with_realm(&root_seed.decl, resolvers, root_seed.decl.url.as_str())
+}
+
+fn resolve_optional_root_child(
+    root: &ResolvedComponent,
+    resolvers: &ResolverRegistry,
+    name: &str,
+) -> Result<Option<(ResolvedComponent, StartupMode)>, zx_status_t> {
+    match resolve_root_child(root, resolvers, name) {
+        Ok(component) => Ok(Some(component)),
+        Err(ZX_ERR_NOT_FOUND) => Ok(None),
+        Err(status) => Err(status),
+    }
+}
+
+fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
     *summary = ComponentSummary::default();
     let parent_process = read_slot(SLOT_SELF_PROCESS_H) as zx_handle_t;
     if parent_process == ZX_HANDLE_INVALID {
@@ -307,259 +336,19 @@ fn run_component_manager_eager_smoke(summary: &mut ComponentSummary) -> i32 {
         return 1;
     }
 
-    let root_seed = match decode_resolved_component(ROOT_DECL_EAGER_BYTES) {
+    let resolvers = match build_resolver_registry() {
+        Ok(resolvers) => resolvers,
+        Err(status) => {
+            summary.failure_step = STEP_RESOLVE_ROOT;
+            summary.resolve_root = status as i64;
+            return 1;
+        }
+    };
+    let root = match resolve_root_component(&resolvers) {
         Ok(component) => {
             summary.resolve_root = ZX_OK as i64;
             component
         }
-        Err(status) => {
-            summary.resolve_root = status as i64;
-            summary.failure_step = STEP_RESOLVE_ROOT;
-            return 1;
-        }
-    };
-    let provider = match decode_resolved_component(PROVIDER_DECL_BYTES) {
-        Ok(component) => {
-            summary.resolve_provider = ZX_OK as i64;
-            component
-        }
-        Err(status) => {
-            summary.resolve_provider = status as i64;
-            summary.failure_step = STEP_RESOLVE_PROVIDER;
-            return 1;
-        }
-    };
-    let client = match decode_resolved_component(CLIENT_DECL_BYTES) {
-        Ok(component) => {
-            summary.resolve_client = ZX_OK as i64;
-            component
-        }
-        Err(status) => {
-            summary.resolve_client = status as i64;
-            summary.failure_step = STEP_RESOLVE_PROVIDER;
-            return 1;
-        }
-    };
-
-    let mut resolvers = ResolverRegistry::new();
-    for component in [&root_seed, &provider, &client] {
-        if resolvers
-            .insert_record(
-                "boot-resolver",
-                ResolverRecord {
-                    url: component.decl.url.clone(),
-                    resolved: component.clone(),
-                },
-            )
-            .is_err()
-        {
-            summary.resolve_root = ZX_ERR_INTERNAL as i64;
-            summary.failure_step = STEP_RESOLVE_ROOT;
-            return 1;
-        }
-    }
-
-    let root = match resolve_with_realm(&root_seed.decl, &resolvers, root_seed.decl.url.as_str()) {
-        Ok(component) => component,
-        Err(status) => {
-            summary.resolve_root = status as i64;
-            summary.failure_step = STEP_RESOLVE_ROOT;
-            return 1;
-        }
-    };
-    let (provider, _provider_startup) = match resolve_root_child(&root, &resolvers, "echo_provider")
-    {
-        Ok(component) => component,
-        Err(status) => {
-            summary.resolve_provider = status as i64;
-            summary.failure_step = STEP_RESOLVE_PROVIDER;
-            return 1;
-        }
-    };
-    let (client, _client_startup) = match resolve_root_child(&root, &resolvers, "echo_client") {
-        Ok(component) => component,
-        Err(status) => {
-            summary.resolve_client = status as i64;
-            summary.failure_step = STEP_RESOLVE_PROVIDER;
-            return 1;
-        }
-    };
-
-    let runners = match build_runner_registry(parent_process) {
-        Ok(runners) => runners,
-        Err(status) => {
-            summary.resolve_root = status as i64;
-            summary.failure_step = STEP_RESOLVE_ROOT;
-            return 1;
-        }
-    };
-    let mut capability_registry = CapabilityRegistry::new();
-    let mut outgoing_client = ZX_HANDLE_INVALID;
-    let mut outgoing_server = ZX_HANDLE_INVALID;
-    let status = zx_channel_create(0, &mut outgoing_client, &mut outgoing_server);
-    if status != ZX_OK {
-        summary.provider_outgoing_pair = status as i64;
-        summary.failure_step = STEP_PROVIDER_OUTGOING_PAIR;
-        return 1;
-    }
-    summary.provider_outgoing_pair = ZX_OK as i64;
-    publish_protocols(&provider.decl, &mut capability_registry, outgoing_client);
-
-    let client_namespace = match build_namespace_entries(&client.decl, &mut capability_registry) {
-        Ok(entries) => {
-            summary.client_route = ZX_OK as i64;
-            entries
-        }
-        Err(status) => {
-            summary.client_route = status as i64;
-            summary.failure_step = STEP_CLIENT_ROUTE;
-            return 1;
-        }
-    };
-
-    let client_running = match runners.launch(
-        &root.decl,
-        &client,
-        client_namespace,
-        None,
-        CHILD_MARKER_CLIENT,
-    ) {
-        Ok(running) => {
-            summary.client_launch = ZX_OK as i64;
-            running
-        }
-        Err(status) => {
-            summary.client_launch = status as i64;
-            summary.failure_step = STEP_CLIENT_LAUNCH;
-            return 1;
-        }
-    };
-
-    let provider_running = match runners.launch(
-        &root.decl,
-        &provider,
-        Vec::new(),
-        Some(outgoing_server),
-        CHILD_MARKER_PROVIDER,
-    ) {
-        Ok(running) => {
-            summary.provider_launch = ZX_OK as i64;
-            running
-        }
-        Err(status) => {
-            summary.provider_launch = status as i64;
-            summary.failure_step = STEP_PROVIDER_LAUNCH;
-            return 1;
-        }
-    };
-
-    match read_controller_event_blocking(client_running.controller, ZX_TIME_INFINITE) {
-        Ok(return_code) => {
-            summary.client_event_read = ZX_OK as i64;
-            summary.client_event_code = return_code;
-            if return_code != 0 {
-                summary.failure_step = read_slot(SLOT_COMPONENT_FAILURE_STEP);
-                return 1;
-            }
-        }
-        Err(status) => {
-            summary.client_event_read = status as i64;
-            summary.failure_step = read_slot(SLOT_COMPONENT_FAILURE_STEP);
-            return 1;
-        }
-    }
-    match read_controller_event_blocking(provider_running.controller, ZX_TIME_INFINITE) {
-        Ok(return_code) => {
-            summary.provider_event_read = ZX_OK as i64;
-            summary.provider_event_code = return_code;
-            if return_code != 0 {
-                summary.failure_step = read_slot(SLOT_COMPONENT_FAILURE_STEP);
-                return 1;
-            }
-        }
-        Err(status) => {
-            summary.provider_event_read = status as i64;
-            summary.failure_step = read_slot(SLOT_COMPONENT_FAILURE_STEP);
-            return 1;
-        }
-    }
-    0
-}
-
-fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
-    *summary = ComponentSummary::default();
-    write_slot(SLOT_COMPONENT_FAILURE_STEP, 101);
-    let parent_process = read_slot(SLOT_SELF_PROCESS_H) as zx_handle_t;
-    if parent_process == ZX_HANDLE_INVALID {
-        summary.failure_step = STEP_RESOLVE_ROOT;
-        summary.resolve_root = ZX_ERR_INTERNAL as i64;
-        return 1;
-    }
-
-    let root_seed = match decode_resolved_component(ROOT_DECL_ROUND3_BYTES) {
-        Ok(component) => {
-            summary.resolve_root = ZX_OK as i64;
-            write_slot(SLOT_COMPONENT_FAILURE_STEP, 102);
-            component
-        }
-        Err(status) => {
-            summary.resolve_root = status as i64;
-            summary.failure_step = STEP_RESOLVE_ROOT;
-            return 1;
-        }
-    };
-    let provider_seed = match decode_resolved_component(PROVIDER_DECL_BYTES) {
-        Ok(component) => {
-            summary.resolve_provider = ZX_OK as i64;
-            write_slot(SLOT_COMPONENT_FAILURE_STEP, 103);
-            component
-        }
-        Err(status) => {
-            summary.resolve_provider = status as i64;
-            summary.failure_step = STEP_RESOLVE_PROVIDER;
-            return 1;
-        }
-    };
-    let client_seed = match decode_resolved_component(CLIENT_DECL_BYTES) {
-        Ok(component) => {
-            summary.resolve_client = ZX_OK as i64;
-            write_slot(SLOT_COMPONENT_FAILURE_STEP, 104);
-            component
-        }
-        Err(status) => {
-            summary.resolve_client = status as i64;
-            summary.failure_step = STEP_RESOLVE_PROVIDER;
-            return 1;
-        }
-    };
-    let worker_seed = match decode_resolved_component(CONTROLLER_WORKER_DECL_BYTES) {
-        Ok(component) => component,
-        Err(status) => {
-            summary.failure_step = STEP_RESOLVE_ROOT;
-            summary.resolve_root = status as i64;
-            return 1;
-        }
-    };
-
-    let mut resolvers = ResolverRegistry::new();
-    for component in [&root_seed, &provider_seed, &client_seed, &worker_seed] {
-        if resolvers
-            .insert_record(
-                "boot-resolver",
-                ResolverRecord {
-                    url: component.decl.url.clone(),
-                    resolved: component.clone(),
-                },
-            )
-            .is_err()
-        {
-            summary.failure_step = STEP_RESOLVE_ROOT;
-            summary.resolve_root = ZX_ERR_INTERNAL as i64;
-            return 1;
-        }
-    }
-    let root = match resolve_with_realm(&root_seed.decl, &resolvers, root_seed.decl.url.as_str()) {
-        Ok(component) => component,
         Err(status) => {
             summary.failure_step = STEP_RESOLVE_ROOT;
             summary.resolve_root = status as i64;
@@ -568,7 +357,10 @@ fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
     };
     let (provider, provider_startup) = match resolve_root_child(&root, &resolvers, "echo_provider")
     {
-        Ok(component) => component,
+        Ok(component) => {
+            summary.resolve_provider = ZX_OK as i64;
+            component
+        }
         Err(status) => {
             summary.failure_step = STEP_RESOLVE_PROVIDER;
             summary.resolve_provider = status as i64;
@@ -576,31 +368,16 @@ fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
         }
     };
     let (client, _client_startup) = match resolve_root_child(&root, &resolvers, "echo_client") {
-        Ok(component) => component,
+        Ok(component) => {
+            summary.resolve_client = ZX_OK as i64;
+            component
+        }
         Err(status) => {
             summary.failure_step = STEP_RESOLVE_PROVIDER;
             summary.resolve_client = status as i64;
             return 1;
         }
     };
-    let (stop_worker_decl, stop_startup) =
-        match resolve_root_child(&root, &resolvers, "stop_worker") {
-            Ok(component) => component,
-            Err(status) => {
-                summary.failure_step = STEP_PROVIDER_LAUNCH;
-                summary.provider_launch = status as i64;
-                return 1;
-            }
-        };
-    let (kill_worker_decl, kill_startup) =
-        match resolve_root_child(&root, &resolvers, "kill_worker") {
-            Ok(component) => component,
-            Err(status) => {
-                summary.failure_step = STEP_CLIENT_LAUNCH;
-                summary.client_launch = status as i64;
-                return 1;
-            }
-        };
 
     let runners = match build_runner_registry(parent_process) {
         Ok(runners) => runners,
@@ -610,17 +387,133 @@ fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
             return 1;
         }
     };
-    write_slot(SLOT_COMPONENT_FAILURE_STEP, 105);
-    let mut stop_worker = if matches!(stop_startup, StartupMode::Eager) {
-        write_slot(SLOT_COMPONENT_FAILURE_STEP, 106);
+
+    if root.decl.url == "boot://root" {
+        let mut capability_registry = CapabilityRegistry::new();
+        let mut outgoing_client = ZX_HANDLE_INVALID;
+        let mut outgoing_server = ZX_HANDLE_INVALID;
+        let status = zx_channel_create(0, &mut outgoing_client, &mut outgoing_server);
+        if status != ZX_OK {
+            summary.provider_outgoing_pair = status as i64;
+            summary.failure_step = STEP_PROVIDER_OUTGOING_PAIR;
+            return 1;
+        }
+        summary.provider_outgoing_pair = ZX_OK as i64;
+        publish_protocols(&provider.decl, &mut capability_registry, outgoing_client);
+
+        let client_namespace = match build_namespace_entries(&client.decl, &mut capability_registry)
+        {
+            Ok(entries) => {
+                summary.client_route = ZX_OK as i64;
+                entries
+            }
+            Err(status) => {
+                summary.client_route = status as i64;
+                summary.failure_step = STEP_CLIENT_ROUTE;
+                return 1;
+            }
+        };
+
+        let client_running = match runners.launch(
+            &root.decl,
+            &client,
+            client_namespace,
+            None,
+            CHILD_MARKER_CLIENT,
+        ) {
+            Ok(running) => {
+                summary.client_launch = ZX_OK as i64;
+                running
+            }
+            Err(status) => {
+                summary.client_launch = status as i64;
+                summary.failure_step = STEP_CLIENT_LAUNCH;
+                return 1;
+            }
+        };
+
+        let provider_running = match runners.launch(
+            &root.decl,
+            &provider,
+            Vec::new(),
+            Some(outgoing_server),
+            CHILD_MARKER_PROVIDER,
+        ) {
+            Ok(running) => {
+                summary.provider_launch = ZX_OK as i64;
+                running
+            }
+            Err(status) => {
+                summary.provider_launch = status as i64;
+                summary.failure_step = STEP_PROVIDER_LAUNCH;
+                return 1;
+            }
+        };
+
+        match read_controller_event_blocking(client_running.controller, ZX_TIME_INFINITE) {
+            Ok(return_code) => {
+                summary.client_event_read = ZX_OK as i64;
+                summary.client_event_code = return_code;
+                if return_code != 0 {
+                    summary.failure_step = read_slot(SLOT_COMPONENT_FAILURE_STEP);
+                    return 1;
+                }
+            }
+            Err(status) => {
+                summary.client_event_read = status as i64;
+                summary.failure_step = read_slot(SLOT_COMPONENT_FAILURE_STEP);
+                return 1;
+            }
+        }
+        match read_controller_event_blocking(provider_running.controller, ZX_TIME_INFINITE) {
+            Ok(return_code) => {
+                summary.provider_event_read = ZX_OK as i64;
+                summary.provider_event_code = return_code;
+                if return_code != 0 {
+                    summary.failure_step = read_slot(SLOT_COMPONENT_FAILURE_STEP);
+                    return 1;
+                }
+            }
+            Err(status) => {
+                summary.provider_event_read = status as i64;
+                summary.failure_step = read_slot(SLOT_COMPONENT_FAILURE_STEP);
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    let stop_worker_decl = match resolve_optional_root_child(&root, &resolvers, "stop_worker") {
+        Ok(component) => component,
+        Err(status) => {
+            summary.failure_step = STEP_PROVIDER_LAUNCH;
+            summary.provider_launch = status as i64;
+            return 1;
+        }
+    };
+    let kill_worker_decl = match resolve_optional_root_child(&root, &resolvers, "kill_worker") {
+        Ok(component) => component,
+        Err(status) => {
+            summary.failure_step = STEP_CLIENT_LAUNCH;
+            summary.client_launch = status as i64;
+            return 1;
+        }
+    };
+
+    let mut stop_worker = if let Some((component, startup)) = stop_worker_decl {
+        if !matches!(startup, StartupMode::Eager) {
+            summary.failure_step = STEP_PROVIDER_LAUNCH;
+            summary.provider_launch = ZX_ERR_BAD_STATE as i64;
+            return 1;
+        }
         match runners.launch(
             &root.decl,
-            &stop_worker_decl,
+            &component,
             Vec::new(),
             None,
             CHILD_MARKER_CONTROLLER_WORKER,
         ) {
-            Ok(running) => running,
+            Ok(running) => Some(running),
             Err(status) => {
                 summary.failure_step = STEP_PROVIDER_LAUNCH;
                 summary.provider_launch = status as i64;
@@ -628,20 +521,22 @@ fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
             }
         }
     } else {
-        summary.failure_step = STEP_PROVIDER_LAUNCH;
-        summary.provider_launch = ZX_ERR_BAD_STATE as i64;
-        return 1;
+        None
     };
-    let mut kill_worker = if matches!(kill_startup, StartupMode::Eager) {
-        write_slot(SLOT_COMPONENT_FAILURE_STEP, 107);
+    let mut kill_worker = if let Some((component, startup)) = kill_worker_decl {
+        if !matches!(startup, StartupMode::Eager) {
+            summary.failure_step = STEP_CLIENT_LAUNCH;
+            summary.client_launch = ZX_ERR_BAD_STATE as i64;
+            return 1;
+        }
         match runners.launch(
             &root.decl,
-            &kill_worker_decl,
+            &component,
             Vec::new(),
             None,
             CHILD_MARKER_CONTROLLER_WORKER,
         ) {
-            Ok(running) => running,
+            Ok(running) => Some(running),
             Err(status) => {
                 summary.failure_step = STEP_CLIENT_LAUNCH;
                 summary.client_launch = status as i64;
@@ -649,100 +544,164 @@ fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
             }
         }
     } else {
-        summary.failure_step = STEP_CLIENT_LAUNCH;
-        summary.client_launch = ZX_ERR_BAD_STATE as i64;
-        return 1;
+        None
     };
 
-    let mut svc_client = ZX_HANDLE_INVALID;
-    let mut svc_server = ZX_HANDLE_INVALID;
-    let status = zx_channel_create(0, &mut svc_client, &mut svc_server);
-    if status != ZX_OK {
-        summary.client_route = status as i64;
-        summary.failure_step = STEP_CLIENT_ROUTE;
-        return 1;
-    }
-    summary.client_route = ZX_OK as i64;
     summary.lazy_provider_prelaunch = i64::from(matches!(provider_startup, StartupMode::Eager));
 
-    let client_running = match runners.launch(
-        &root.decl,
-        &client,
-        vec![NamespaceEntry {
-            path: String::from(SVC_NAMESPACE_PATH),
-            handle: svc_client,
-        }],
-        None,
-        CHILD_MARKER_CLIENT,
-    ) {
-        Ok(running) => {
-            summary.client_launch = ZX_OK as i64;
-            write_slot(SLOT_COMPONENT_FAILURE_STEP, 108);
-            running
-        }
-        Err(status) => {
-            summary.client_launch = status as i64;
-            summary.failure_step = STEP_CLIENT_LAUNCH;
+    let (client_running, provider_running) = if matches!(provider_startup, StartupMode::Eager) {
+        let mut capability_registry = CapabilityRegistry::new();
+        let mut outgoing_client = ZX_HANDLE_INVALID;
+        let mut outgoing_server = ZX_HANDLE_INVALID;
+        let status = zx_channel_create(0, &mut outgoing_client, &mut outgoing_server);
+        if status != ZX_OK {
+            summary.provider_outgoing_pair = status as i64;
+            summary.failure_step = STEP_PROVIDER_OUTGOING_PAIR;
             return 1;
         }
-    };
+        summary.provider_outgoing_pair = ZX_OK as i64;
+        publish_protocols(&provider.decl, &mut capability_registry, outgoing_client);
 
-    let open_request = match read_directory_open_request_blocking(svc_server, ZX_TIME_INFINITE) {
-        Ok(request) => request,
-        Err(status) => {
+        let client_namespace = match build_namespace_entries(&client.decl, &mut capability_registry)
+        {
+            Ok(entries) => {
+                summary.client_route = ZX_OK as i64;
+                entries
+            }
+            Err(status) => {
+                summary.client_route = status as i64;
+                summary.failure_step = STEP_CLIENT_ROUTE;
+                return 1;
+            }
+        };
+
+        let client_running = match runners.launch(
+            &root.decl,
+            &client,
+            client_namespace,
+            None,
+            CHILD_MARKER_CLIENT,
+        ) {
+            Ok(running) => {
+                summary.client_launch = ZX_OK as i64;
+                running
+            }
+            Err(status) => {
+                summary.client_launch = status as i64;
+                summary.failure_step = STEP_CLIENT_LAUNCH;
+                return 1;
+            }
+        };
+
+        let provider_running = match runners.launch(
+            &root.decl,
+            &provider,
+            Vec::new(),
+            Some(outgoing_server),
+            CHILD_MARKER_PROVIDER,
+        ) {
+            Ok(running) => {
+                summary.provider_launch = ZX_OK as i64;
+                running
+            }
+            Err(status) => {
+                summary.provider_launch = status as i64;
+                summary.failure_step = STEP_PROVIDER_LAUNCH;
+                return 1;
+            }
+        };
+
+        (client_running, provider_running)
+    } else {
+        let mut svc_client = ZX_HANDLE_INVALID;
+        let mut svc_server = ZX_HANDLE_INVALID;
+        let status = zx_channel_create(0, &mut svc_client, &mut svc_server);
+        if status != ZX_OK {
             summary.client_route = status as i64;
             summary.failure_step = STEP_CLIENT_ROUTE;
             return 1;
         }
-    };
+        summary.client_route = ZX_OK as i64;
 
-    let mut provider_outgoing_client = ZX_HANDLE_INVALID;
-    let mut provider_outgoing_server = ZX_HANDLE_INVALID;
-    let status = zx_channel_create(
-        0,
-        &mut provider_outgoing_client,
-        &mut provider_outgoing_server,
-    );
-    if status != ZX_OK {
-        summary.provider_outgoing_pair = status as i64;
-        summary.failure_step = STEP_PROVIDER_OUTGOING_PAIR;
-        return 1;
-    }
-    summary.provider_outgoing_pair = ZX_OK as i64;
+        let client_running = match runners.launch(
+            &root.decl,
+            &client,
+            vec![NamespaceEntry {
+                path: String::from(SVC_NAMESPACE_PATH),
+                handle: svc_client,
+            }],
+            None,
+            CHILD_MARKER_CLIENT,
+        ) {
+            Ok(running) => {
+                summary.client_launch = ZX_OK as i64;
+                running
+            }
+            Err(status) => {
+                summary.client_launch = status as i64;
+                summary.failure_step = STEP_CLIENT_LAUNCH;
+                return 1;
+            }
+        };
 
-    let provider_running = match runners.launch(
-        &root.decl,
-        &provider,
-        Vec::new(),
-        Some(provider_outgoing_server),
-        CHILD_MARKER_PROVIDER,
-    ) {
-        Ok(running) => {
-            summary.provider_launch = ZX_OK as i64;
-            summary.lazy_provider_route_launch = ZX_OK as i64;
-            write_slot(SLOT_COMPONENT_FAILURE_STEP, 109);
-            running
-        }
-        Err(status) => {
-            summary.provider_launch = status as i64;
-            summary.lazy_provider_route_launch = status as i64;
-            summary.failure_step = STEP_PROVIDER_LAUNCH;
+        let open_request = match read_directory_open_request_blocking(svc_server, ZX_TIME_INFINITE)
+        {
+            Ok(request) => request,
+            Err(status) => {
+                summary.client_route = status as i64;
+                summary.failure_step = STEP_CLIENT_ROUTE;
+                return 1;
+            }
+        };
+
+        let mut provider_outgoing_client = ZX_HANDLE_INVALID;
+        let mut provider_outgoing_server = ZX_HANDLE_INVALID;
+        let status = zx_channel_create(
+            0,
+            &mut provider_outgoing_client,
+            &mut provider_outgoing_server,
+        );
+        if status != ZX_OK {
+            summary.provider_outgoing_pair = status as i64;
+            summary.failure_step = STEP_PROVIDER_OUTGOING_PAIR;
             return 1;
         }
-    };
+        summary.provider_outgoing_pair = ZX_OK as i64;
 
-    let status = forward_directory_open_request(provider_outgoing_client, open_request);
-    if status != ZX_OK {
-        summary.client_route = status as i64;
-        summary.failure_step = STEP_CLIENT_ROUTE;
-        return 1;
-    }
+        let provider_running = match runners.launch(
+            &root.decl,
+            &provider,
+            Vec::new(),
+            Some(provider_outgoing_server),
+            CHILD_MARKER_PROVIDER,
+        ) {
+            Ok(running) => {
+                summary.provider_launch = ZX_OK as i64;
+                summary.lazy_provider_route_launch = ZX_OK as i64;
+                running
+            }
+            Err(status) => {
+                summary.provider_launch = status as i64;
+                summary.lazy_provider_route_launch = status as i64;
+                summary.failure_step = STEP_PROVIDER_LAUNCH;
+                return 1;
+            }
+        };
+
+        let status = forward_directory_open_request(provider_outgoing_client, open_request);
+        if status != ZX_OK {
+            summary.client_route = status as i64;
+            summary.failure_step = STEP_CLIENT_ROUTE;
+            return 1;
+        }
+
+        (client_running, provider_running)
+    };
 
     match read_controller_event_blocking(client_running.controller, ZX_TIME_INFINITE) {
         Ok(return_code) => {
             summary.client_event_read = ZX_OK as i64;
             summary.client_event_code = return_code;
-            write_slot(SLOT_COMPONENT_FAILURE_STEP, 110);
             if return_code != 0 {
                 summary.failure_step = STEP_CLIENT_EVENT;
                 return 1;
@@ -758,7 +717,6 @@ fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
         Ok(return_code) => {
             summary.provider_event_read = ZX_OK as i64;
             summary.provider_event_code = return_code;
-            write_slot(SLOT_COMPONENT_FAILURE_STEP, 111);
             if return_code != 0 {
                 summary.failure_step = STEP_PROVIDER_EVENT;
                 return 1;
@@ -771,43 +729,34 @@ fn run_component_manager_round3_smoke(summary: &mut ComponentSummary) -> i32 {
         }
     }
 
-    write_slot(SLOT_COMPONENT_FAILURE_STEP, 112);
-
-    write_slot(SLOT_COMPONENT_FAILURE_STEP, 120);
-    match run_controller_lifecycle_step(&mut stop_worker, ControllerRequest::Stop) {
-        Ok(code) => {
-            summary.stop_request = ZX_OK as i64;
-            summary.stop_event_read = ZX_OK as i64;
-            summary.stop_event_code = code;
-            write_slot(SLOT_COMPONENT_STOP_REQUEST, ZX_OK as u64);
-            write_slot(SLOT_COMPONENT_STOP_EVENT_READ, ZX_OK as u64);
-            write_slot(SLOT_COMPONENT_STOP_EVENT_CODE, code as u64);
-        }
-        Err(status) => {
-            summary.stop_request = status as i64;
-            summary.failure_step = read_slot(SLOT_COMPONENT_FAILURE_STEP);
-            return 1;
+    if let Some(component) = stop_worker.as_mut() {
+        match run_controller_lifecycle_step(component, ControllerRequest::Stop) {
+            Ok(code) => {
+                summary.stop_request = ZX_OK as i64;
+                summary.stop_event_read = ZX_OK as i64;
+                summary.stop_event_code = code;
+            }
+            Err(status) => {
+                summary.stop_request = status as i64;
+                summary.failure_step = STEP_PROVIDER_EVENT;
+                return 1;
+            }
         }
     }
-    write_slot(SLOT_COMPONENT_FAILURE_STEP, 113);
-
-    write_slot(SLOT_COMPONENT_FAILURE_STEP, 130);
-    match run_controller_lifecycle_step(&mut kill_worker, ControllerRequest::Kill) {
-        Ok(code) => {
-            summary.kill_request = ZX_OK as i64;
-            summary.kill_event_read = ZX_OK as i64;
-            summary.kill_event_code = code;
-            write_slot(SLOT_COMPONENT_KILL_REQUEST, ZX_OK as u64);
-            write_slot(SLOT_COMPONENT_KILL_EVENT_READ, ZX_OK as u64);
-            write_slot(SLOT_COMPONENT_KILL_EVENT_CODE, code as u64);
-        }
-        Err(status) => {
-            summary.kill_request = status as i64;
-            summary.failure_step = read_slot(SLOT_COMPONENT_FAILURE_STEP);
-            return 1;
+    if let Some(component) = kill_worker.as_mut() {
+        match run_controller_lifecycle_step(component, ControllerRequest::Kill) {
+            Ok(code) => {
+                summary.kill_request = ZX_OK as i64;
+                summary.kill_event_read = ZX_OK as i64;
+                summary.kill_event_code = code;
+            }
+            Err(status) => {
+                summary.kill_request = status as i64;
+                summary.failure_step = STEP_CLIENT_EVENT;
+                return 1;
+            }
         }
     }
-    write_slot(SLOT_COMPONENT_FAILURE_STEP, 114);
 
     0
 }
