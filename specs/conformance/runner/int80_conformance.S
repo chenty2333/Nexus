@@ -2626,6 +2626,9 @@ futex_owner_match_done:
 	movl $0, (%r14)
 	mov %r14, 8*404(%rbx)
 	movq $1, 8*403(%rbx)
+	mov (%r14), %eax
+	test %eax, %eax
+	jnz thread_futex_wait_done
 	mov %r14, %rdi
 	xorl %esi, %esi
 	xorl %edx, %edx
@@ -2633,6 +2636,14 @@ futex_owner_match_done:
 	movabs $21, %rax
 	int $0x80
 	mov %rax, 8*400(%rbx)
+	cmpq $-20, 8*400(%rbx)
+	jne thread_futex_wait_recorded
+	mov (%r14), %eax
+	cmpl $1, %eax
+	jne thread_futex_wait_recorded
+thread_futex_wait_done:
+	movq $0, 8*400(%rbx)
+thread_futex_wait_recorded:
 
 	// resume check: child ran and futex word now equals 1
 	movq $0, 8*402(%rbx)
@@ -2869,6 +2880,9 @@ process_child_image_ready:
 
 	// wait on the shared futex word the child will wake
 	mov 0x1928(%rbx), %rcx
+	mov 0x8(%rcx), %eax
+	test %eax, %eax
+	jnz process_parent_futex_wait_done
 	lea 0x8(%rcx), %rdi
 	xorl %esi, %esi
 	xorl %edx, %edx
@@ -2876,6 +2890,15 @@ process_child_image_ready:
 	movabs $21, %rax
 	int $0x80
 	mov %rax, 8*353(%rbx)
+	cmpq $-20, 8*353(%rbx)
+	jne process_parent_futex_wait_recorded
+	mov 0x1928(%rbx), %rcx
+	mov 0x8(%rcx), %eax
+	cmpl $1, %eax
+	jne process_parent_futex_wait_recorded
+process_parent_futex_wait_done:
+	movq $0, 8*353(%rbx)
+process_parent_futex_wait_recorded:
 	mov 0x1928(%rbx), %rcx
 	mov (%rcx), %rax
 	mov %rax, 8*352(%rbx)
