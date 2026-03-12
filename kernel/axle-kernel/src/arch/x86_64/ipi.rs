@@ -13,7 +13,7 @@ pub const TEST_VECTOR: usize = 0x40;
 pub const TLB_SHOOTDOWN_VECTOR: usize = 0x41;
 pub const RESCHEDULE_VECTOR: usize = 0x42;
 
-const MAX_CPUS: usize = 16;
+const MAX_CPUS: usize = super::MAX_APIC_IDS;
 
 static IPI_ACK_COUNT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static TLB_SHOOTDOWN_ACK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];

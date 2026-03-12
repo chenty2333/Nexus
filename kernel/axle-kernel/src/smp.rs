@@ -5,12 +5,13 @@
 //! - bring up APs (trampoline + per-CPU stack)
 //! - per-CPU data + IPI
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use raw_cpuid::CpuId;
 
 const TRAMPOLINE_PADDR: u64 = 0x7000;
-const MAX_CPUS: usize = 16; // must match `ap_trampoline_params` in assembly
+const MAX_CPUS: usize = crate::arch::MAX_CPUS;
+const MAX_APIC_IDS: usize = crate::arch::MAX_APIC_IDS; // must match `ap_trampoline_params` in assembly
 const AP_STACK_SIZE: usize = 16 * 1024;
 
 pub const fn max_cpus() -> usize {
@@ -21,7 +22,7 @@ pub const fn max_cpus() -> usize {
 struct ApTrampolineParams {
     cr3: u64,
     entry: u64,
-    stacks: [u64; MAX_CPUS],
+    stacks: [u64; MAX_APIC_IDS],
 }
 
 #[repr(align(16))]
@@ -30,7 +31,10 @@ struct AlignedApStack([u8; AP_STACK_SIZE]);
 
 static mut AP_STACKS: [AlignedApStack; MAX_CPUS] = [AlignedApStack([0; AP_STACK_SIZE]); MAX_CPUS];
 
-static AP_ONLINE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+static AP_ONLINE: [AtomicBool; MAX_APIC_IDS] = [const { AtomicBool::new(false) }; MAX_APIC_IDS];
+static APIC_ID_TO_SLOT: [AtomicUsize; MAX_APIC_IDS] =
+    [const { AtomicUsize::new(usize::MAX) }; MAX_APIC_IDS];
+static NEXT_CPU_SLOT: AtomicUsize = AtomicUsize::new(1);
 
 core::arch::global_asm!(
     include_str!("arch/x86_64/ap_trampoline.S"),
@@ -67,27 +71,30 @@ fn delay_us(us: u64) {
     }
 }
 
-fn ap_stack_top(apic_id: usize) -> u64 {
-    // SAFETY: AP_STACKS is a static backing store; APIC ids are clamped to MAX_CPUS.
-    let base = unsafe { core::ptr::addr_of!(AP_STACKS[apic_id]) as u64 };
+fn ap_stack_top(slot: usize) -> u64 {
+    // SAFETY: AP_STACKS is a static backing store; slots are clamped to MAX_CPUS.
+    let base = unsafe { core::ptr::addr_of!(AP_STACKS[slot]) as u64 };
     base + (AP_STACK_SIZE as u64)
 }
 
 extern "C" fn ap_entry(apic_id: u64) -> ! {
     let apic_id_usize = apic_id as usize;
+    let cpu_slot = register_apic_slot(apic_id_usize);
 
     crate::arch::init_ap();
 
-    if apic_id_usize < MAX_CPUS {
-        AP_ONLINE[apic_id_usize].store(true, Ordering::Release);
+    if apic_id_usize < MAX_APIC_IDS
+        && AP_ONLINE[apic_id_usize]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        crate::kprintln!("cpu{} online", cpu_slot);
     }
-
-    crate::kprintln!("cpu{} online", apic_id);
 
     crate::object::run_current_cpu_idle_loop()
 }
 
-fn bootstrap_trampoline(cpu_count: usize) {
+fn bootstrap_trampoline() {
     let src_start = core::ptr::addr_of!(ap_trampoline_start) as usize;
     let src_end = core::ptr::addr_of!(ap_trampoline_end) as usize;
     let len = src_end.saturating_sub(src_start);
@@ -110,21 +117,71 @@ fn bootstrap_trampoline(cpu_count: usize) {
         core::ptr::write_volatile(&mut (*params_ptr).cr3, cr3);
         core::ptr::write_volatile(&mut (*params_ptr).entry, entry);
 
-        for apic_id in 0..MAX_CPUS {
-            let sp = if apic_id < cpu_count {
-                ap_stack_top(apic_id)
-            } else {
-                0
-            };
-            core::ptr::write_volatile(&mut (*params_ptr).stacks[apic_id], sp);
+        for apic_id in 0..MAX_APIC_IDS {
+            core::ptr::write_volatile(&mut (*params_ptr).stacks[apic_id], 0);
         }
     }
+}
+
+fn install_trampoline_stack(candidate_apic_id: usize, stack_top: u64) {
+    let src_start = core::ptr::addr_of!(ap_trampoline_start) as usize;
+    let params_off = (core::ptr::addr_of!(ap_trampoline_params) as usize).saturating_sub(src_start);
+    let params_ptr = (TRAMPOLINE_PADDR as usize + params_off) as *mut ApTrampolineParams;
+    // SAFETY: the trampoline params live in the copied low-memory page, and BSP-only bring-up
+    // mutates one candidate slot before sending INIT/SIPI to that APIC id.
+    unsafe {
+        core::ptr::write_volatile(&mut (*params_ptr).stacks[candidate_apic_id], stack_top);
+    }
+}
+
+fn online_ap_count() -> usize {
+    AP_ONLINE
+        .iter()
+        .filter(|online| online.load(Ordering::Acquire))
+        .count()
+}
+
+pub fn cpu_slot_for_apic_id(apic_id: usize) -> Option<usize> {
+    (apic_id < MAX_APIC_IDS)
+        .then(|| APIC_ID_TO_SLOT[apic_id].load(Ordering::Acquire))
+        .filter(|slot| *slot != usize::MAX)
+}
+
+fn register_apic_slot(apic_id: usize) -> usize {
+    assert!(
+        apic_id < MAX_APIC_IDS,
+        "smp: apic_id {} exceeds MAX_APIC_IDS",
+        apic_id
+    );
+    if let Some(slot) = cpu_slot_for_apic_id(apic_id) {
+        return slot;
+    }
+
+    let slot = NEXT_CPU_SLOT.fetch_add(1, Ordering::AcqRel);
+    assert!(slot < MAX_CPUS, "smp: cpu slot {} exceeds MAX_CPUS", slot);
+    match APIC_ID_TO_SLOT[apic_id].compare_exchange(
+        usize::MAX,
+        slot,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => slot,
+        Err(existing) if existing != usize::MAX => existing,
+        Err(_) => unreachable!("compare_exchange returned sentinel after allocation"),
+    }
+}
+
+fn first_online_apic_id() -> Option<usize> {
+    AP_ONLINE
+        .iter()
+        .enumerate()
+        .find_map(|(apic_id, online)| online.load(Ordering::Acquire).then_some(apic_id))
 }
 
 #[allow(dead_code)]
 pub fn for_each_online_cpu(mut f: impl FnMut(usize)) {
     let bsp_id = crate::arch::apic::this_apic_id() as usize;
-    for apic_id in 0..MAX_CPUS {
+    for apic_id in 0..MAX_APIC_IDS {
         if apic_id == bsp_id || AP_ONLINE[apic_id].load(Ordering::Acquire) {
             f(apic_id);
         }
@@ -144,56 +201,69 @@ pub fn init() {
     cpu_count = cpu_count.min(MAX_CPUS);
 
     let bsp_id = crate::arch::apic::this_apic_id() as usize;
+    assert!(
+        bsp_id < MAX_APIC_IDS,
+        "smp: bsp apic_id {} exceeds MAX_APIC_IDS",
+        bsp_id
+    );
+    NEXT_CPU_SLOT.store(1, Ordering::Release);
+    for online in &AP_ONLINE {
+        online.store(false, Ordering::Release);
+    }
+    for slot in &APIC_ID_TO_SLOT {
+        slot.store(usize::MAX, Ordering::Release);
+    }
+    APIC_ID_TO_SLOT[bsp_id].store(0, Ordering::Release);
 
-    bootstrap_trampoline(cpu_count);
+    bootstrap_trampoline();
 
     let sipi_vector = (TRAMPOLINE_PADDR / 4096) as u8;
 
-    for apic_id in 0..cpu_count {
-        if apic_id == bsp_id {
+    let target_ap_count = cpu_count.saturating_sub(1);
+    let mut next_stack_slot = 0usize;
+    for candidate_apic_id in 0..MAX_APIC_IDS {
+        if next_stack_slot >= target_ap_count {
+            break;
+        }
+        if candidate_apic_id == bsp_id {
             continue;
         }
 
-        crate::arch::apic::send_init_ipi(apic_id as u32);
+        install_trampoline_stack(candidate_apic_id, ap_stack_top(next_stack_slot));
+
+        crate::arch::apic::send_init_ipi(candidate_apic_id as u32);
         delay_us(10_000);
 
-        crate::arch::apic::send_startup_ipi(apic_id as u32, sipi_vector);
+        crate::arch::apic::send_startup_ipi(candidate_apic_id as u32, sipi_vector);
         delay_us(200);
-        crate::arch::apic::send_startup_ipi(apic_id as u32, sipi_vector);
+        crate::arch::apic::send_startup_ipi(candidate_apic_id as u32, sipi_vector);
         delay_us(200);
-    }
-
-    // Wait for APs.
-    for apic_id in 0..cpu_count {
-        if apic_id == bsp_id {
-            continue;
-        }
-
         let mut spins = 0u64;
-        while !AP_ONLINE[apic_id].load(Ordering::Acquire) {
+        while !AP_ONLINE[candidate_apic_id].load(Ordering::Acquire) {
             core::hint::spin_loop();
             spins = spins.wrapping_add(1);
-            if spins > 50_000_000 {
-                crate::kprintln!("smp: cpu{} did not come online", apic_id);
+            if spins > 10_000_000 {
                 break;
             }
+        }
+        if AP_ONLINE[candidate_apic_id].load(Ordering::Acquire) {
+            next_stack_slot += 1;
         }
     }
 
     crate::kprintln!("smp: requested cpu_count={}", cpu_count);
+    if online_ap_count() < target_ap_count {
+        crate::kprintln!(
+            "smp: online_ap_count={} target_ap_count={}",
+            online_ap_count(),
+            target_ap_count
+        );
+    }
 
     // Minimal SMP sanity check: BSP sends a fixed-vector IPI to one AP and
     // waits for it to ack via the IPI handler.
     if cpu_count > 1 {
-        let mut dest = None;
-        for apic_id in 0..cpu_count {
-            if apic_id != bsp_id {
-                dest = Some(apic_id);
-                break;
-            }
-        }
-
-        if let Some(dest) = dest {
+        if let Some(dest) = first_online_apic_id() {
             let before = crate::arch::ipi::ack_count(dest);
 
             crate::arch::apic::send_fixed_ipi(dest as u32, crate::arch::ipi::TEST_VECTOR as u8);

@@ -2,6 +2,9 @@
 
 use x86_64::registers::model_specific::{Efer, EferFlags};
 
+pub const MAX_CPUS: usize = 16;
+pub const MAX_APIC_IDS: usize = 256;
+
 pub mod apic;
 pub mod breakpoint;
 pub mod cpu;

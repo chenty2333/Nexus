@@ -74,6 +74,12 @@ This is a deliberate bootstrap path, not yet a final fast syscall mechanism.
   - local APIC init
 - After APs come online, they enter the kernel's idle scheduler loop.
 - The BSP performs a simple fixed-vector IPI acknowledgement test during bring-up.
+- The BSP no longer assumes that APIC ids are the contiguous range `1..cpu_count-1`.
+  Instead, it keeps one raw-APIC-id trampoline stack table, probes candidate APIC ids until the
+  requested AP count comes online, and lets AP-local code translate raw APIC ids onto the kernel's
+  bounded logical CPU slots for per-CPU stack/TSS state.
+- Bring-up logs still print `cpu1`, `cpu2`, ... in logical-CPU order even when the raw APIC ids
+  used for INIT/SIPI or IPI delivery are sparse.
 
 ## Current interrupt / exception wiring
 

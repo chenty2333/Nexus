@@ -77,6 +77,8 @@ Processes currently move through states such as:
 - Suspending a process or thread produces suspend-token-backed state.
 - Terminated thread/process objects expose `TASK_TERMINATED` signals.
 - Reaping removes fully terminated task records once object and handle state allow it.
+- Lifecycle sync may run from trap-exit or idle-loop paths on different CPUs, so zero-handle task
+  object reaping is intentionally idempotent against already-reaped kernel task records.
 
 ## SMP status
 
@@ -84,6 +86,9 @@ Processes currently move through states such as:
 - Fixed-vector test IPI, TLB IPI, and reschedule IPI paths exist.
 - APs now enter the scheduler's idle loop after `init_ap()`, rather than staying in a pure
   `hlt` bring-up loop.
+- The AP bring-up path no longer depends on raw APIC ids being `0..cpu_count-1`; the kernel keeps
+  raw APIC ids for transport/IPI routing while mapping AP-local stack/TSS state onto bounded
+  logical CPU slots.
 - The system now has a real per-CPU L0 runnable topology, but it is still not the final scheduler
   architecture.
 

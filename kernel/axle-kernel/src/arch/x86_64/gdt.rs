@@ -30,7 +30,7 @@ pub struct Selectors {
     pub tss: SegmentSelector,
 }
 
-const MAX_CPUS: usize = 16;
+const MAX_CPUS: usize = super::MAX_CPUS;
 const RING0_STACK_SIZE: u64 = 16 * 1024;
 const IST_STACK_SIZE: u64 = 16 * 1024;
 pub const IST_DOUBLE_FAULT_INDEX: u8 = 1;
@@ -66,11 +66,19 @@ pub fn init() -> &'static Selectors {
         .get_feature_info()
         .map(|fi| fi.initial_local_apic_id() as usize)
         .unwrap_or(0);
-    init_cpu(apic_id)
+    init_cpu(
+        crate::smp::cpu_slot_for_apic_id(apic_id).unwrap_or(0),
+        apic_id,
+    )
 }
 
-fn init_cpu(cpu: usize) -> &'static Selectors {
-    assert!(cpu < MAX_CPUS, "gdt: apic_id {} exceeds MAX_CPUS", cpu);
+fn init_cpu(cpu: usize, apic_id: usize) -> &'static Selectors {
+    assert!(
+        cpu < MAX_CPUS,
+        "gdt: cpu_slot {} exceeds MAX_CPUS (apic_id={})",
+        cpu,
+        apic_id
+    );
 
     let tss = TSS[cpu].call_once(|| {
         let mut tss = TaskStateSegment::new();

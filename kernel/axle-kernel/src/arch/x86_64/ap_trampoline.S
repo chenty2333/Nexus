@@ -127,8 +127,8 @@ ap_trampoline_params:
     .quad 0
     // u64 entry
     .quad 0
-    // stacks[16] (filled by BSP; indexed by APIC id)
-    .rept 16
+    // stacks[256] (filled by BSP; indexed by APIC id)
+    .rept 256
       .quad 0
     .endr
 
