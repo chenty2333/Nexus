@@ -1,4 +1,5 @@
 use super::*;
+use axle_types::ax_guest_x64_regs_t;
 use axle_types::status::ZX_ERR_OUT_OF_RANGE;
 
 /// Return the bootstrap current-process handle seeded into the current process.
@@ -243,13 +244,35 @@ pub fn prepare_linux_exec(
                 | crate::task::HandleRights::EXECUTE
                 | crate::task::HandleRights::MAP,
         )?;
-        let image_vmo = state.with_objects(|objects| {
+        let mut image_vmo = state.with_objects(|objects| {
             Ok(match objects.get(resolved_vmo.object_key()) {
                 Some(KernelObject::Vmo(vmo)) => vmo.clone(),
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
             })
         })?;
+        let target_address_space_id =
+            state.with_kernel(|kernel| kernel.process_address_space_id(process.process_id))?;
+        if let VmoBackingScope::LocalPrivate {
+            owner_address_space_id,
+            ..
+        } = image_vmo.backing_scope
+            && owner_address_space_id != target_address_space_id
+        {
+            let promoted = state.with_vm_mut(|vm| vm.promote_vmo_object_to_shared(&image_vmo))?;
+            if promoted {
+                state.with_objects_mut(|objects| {
+                    let Some(KernelObject::Vmo(vmo_object)) =
+                        objects.get_mut(resolved_vmo.object_key())
+                    else {
+                        return Err(ZX_ERR_BAD_STATE);
+                    };
+                    vmo_object.backing_scope = VmoBackingScope::GlobalShared;
+                    Ok(())
+                })?;
+                image_vmo.backing_scope = VmoBackingScope::GlobalShared;
+            }
+        }
         let layout = resolve_process_image_layout(state, &image_vmo)?;
         state.with_kernel_mut(|kernel| {
             kernel.prepare_linux_process_start(
@@ -326,6 +349,31 @@ pub fn start_thread(
     })
 }
 
+/// Start a previously created thread from a full guest x86_64 register snapshot.
+pub fn start_thread_guest(
+    thread_handle: zx_handle_t,
+    regs: &ax_guest_x64_regs_t,
+    options: u32,
+) -> Result<(), zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved =
+            state.lookup_handle(thread_handle, crate::task::HandleRights::MANAGE_THREAD)?;
+        let thread = state.with_objects(|objects| {
+            Ok(match objects.get(resolved.object_key()) {
+                Some(KernelObject::Thread(thread)) => *thread,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+
+        state.with_kernel_mut(|kernel| kernel.start_thread_guest(thread.thread_id, regs))
+    })
+}
+
 /// Start a newly created process by starting one thread in its address space.
 pub fn start_process(
     process_handle: zx_handle_t,
@@ -394,6 +442,47 @@ pub fn start_process(
             arg_handle,
             arg1,
         )
+    })
+}
+
+/// Start a newly created process from a full guest x86_64 register snapshot.
+pub fn start_process_guest(
+    process_handle: zx_handle_t,
+    thread_handle: zx_handle_t,
+    regs: &ax_guest_x64_regs_t,
+    options: u32,
+) -> Result<(), zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved_process =
+            state.lookup_handle(process_handle, crate::task::HandleRights::MANAGE_PROCESS)?;
+        let process = state.with_objects(|objects| {
+            Ok(match objects.get(resolved_process.object_key()) {
+                Some(KernelObject::Process(process)) => *process,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+
+        let resolved_thread =
+            state.lookup_handle(thread_handle, crate::task::HandleRights::MANAGE_THREAD)?;
+        let thread = state.with_objects(|objects| {
+            Ok(match objects.get(resolved_thread.object_key()) {
+                Some(KernelObject::Thread(thread)) => *thread,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+        if thread.process_id != process.process_id {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+
+        state.with_kernel_mut(|kernel| {
+            kernel.start_process_guest(process.process_id, thread.thread_id, regs)
+        })
     })
 }
 

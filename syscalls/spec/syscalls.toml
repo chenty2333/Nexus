@@ -536,3 +536,26 @@ args = [
   { name = "buffer", ty = "*const u8" },
   { name = "len", ty = "usize" },
 ]
+
+[[syscall]]
+name = "ax_process_start_guest"
+nr = 45
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "process", ty = "zx_handle_t" },
+  { name = "thread", ty = "zx_handle_t" },
+  { name = "regs", ty = "*const ax_guest_x64_regs_t" },
+  { name = "options", ty = "u32" },
+]
+
+[[syscall]]
+name = "ax_thread_start_guest"
+nr = 46
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "thread", ty = "zx_handle_t" },
+  { name = "regs", ty = "*const ax_guest_x64_regs_t" },
+  { name = "options", ty = "u32" },
+]

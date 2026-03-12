@@ -22,7 +22,7 @@ use x86_64::instructions::segmentation::Segment;
 // --- Userspace virtual layout (in current single-address-space model) ---
 
 pub(crate) const USER_PAGE_BYTES: u64 = 0x1000;
-pub(crate) const USER_CODE_PAGE_COUNT: usize = 256;
+pub(crate) const USER_CODE_PAGE_COUNT: usize = 448;
 const USER_SHARED_PAGE_COUNT: usize = 2;
 pub(crate) const USER_STACK_PAGE_COUNT: usize = 16;
 pub(crate) const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * USER_CODE_PAGE_COUNT as u64;
@@ -31,7 +31,13 @@ pub(crate) const USER_STACK_BYTES: u64 = USER_PAGE_BYTES * USER_STACK_PAGE_COUNT
 pub(crate) const USER_CODE_VA: u64 = 0x0000_0001_0000_0000; // 4 GiB
 pub(crate) const USER_WINDOW_TOP: u64 = 0x0000_8000_0000_0000; // lower canonical half limit
 pub(crate) const USER_REGION_BYTES: u64 = USER_WINDOW_TOP - USER_CODE_VA;
-const BOOTSTRAP_USER_PT_BYTES: u64 = USER_PAGE_BYTES * 512;
+const BOOTSTRAP_USER_PT_ENTRY_COUNT: usize = 512;
+const BOOTSTRAP_USER_PAGE_COUNT: usize =
+    USER_CODE_PAGE_COUNT + USER_SHARED_PAGE_COUNT + USER_STACK_PAGE_COUNT;
+pub(crate) const BOOTSTRAP_USER_PT_COUNT: usize =
+    BOOTSTRAP_USER_PAGE_COUNT.div_ceil(BOOTSTRAP_USER_PT_ENTRY_COUNT);
+pub(crate) const BOOTSTRAP_USER_PT_BYTES: u64 =
+    USER_PAGE_BYTES * BOOTSTRAP_USER_PT_ENTRY_COUNT as u64;
 pub(crate) const USER_SHARED_VA: u64 = USER_CODE_VA + USER_CODE_BYTES;
 pub(crate) const USER_STACK_VA: u64 = USER_SHARED_VA + USER_SHARED_BYTES;
 const USER_STACK_TOP: u64 = USER_STACK_VA + USER_STACK_BYTES;
@@ -52,28 +58,28 @@ const USER_RUNNER_IMAGE: QemuLoaderImage = QemuLoaderImage {
     size_paddr: 0x0100_0000 - 8,
 };
 const ECHO_PROVIDER_IMAGE: QemuLoaderImage = QemuLoaderImage {
-    paddr: 0x0180_0000,
-    size_paddr: 0x0180_0000 - 8,
-};
-const ECHO_CLIENT_IMAGE: QemuLoaderImage = QemuLoaderImage {
     paddr: 0x0200_0000,
     size_paddr: 0x0200_0000 - 8,
 };
-const CONTROLLER_WORKER_IMAGE: QemuLoaderImage = QemuLoaderImage {
-    paddr: 0x0280_0000,
-    size_paddr: 0x0280_0000 - 8,
-};
-const STARNIX_KERNEL_IMAGE: QemuLoaderImage = QemuLoaderImage {
+const ECHO_CLIENT_IMAGE: QemuLoaderImage = QemuLoaderImage {
     paddr: 0x0300_0000,
     size_paddr: 0x0300_0000 - 8,
 };
+const CONTROLLER_WORKER_IMAGE: QemuLoaderImage = QemuLoaderImage {
+    paddr: 0x0400_0000,
+    size_paddr: 0x0400_0000 - 8,
+};
+const STARNIX_KERNEL_IMAGE: QemuLoaderImage = QemuLoaderImage {
+    paddr: 0x0500_0000,
+    size_paddr: 0x0500_0000 - 8,
+};
 const LINUX_HELLO_IMAGE: QemuLoaderImage = QemuLoaderImage {
-    paddr: 0x0380_0000,
-    size_paddr: 0x0380_0000 - 8,
+    paddr: 0x0600_0000,
+    size_paddr: 0x0600_0000 - 8,
 };
 // Raw QEMU loader input is the full ELF file, including debug sections in
 // dev builds. Keep this bound separate from the mapped code window size.
-const USER_RUNNER_ELF_MAX_BYTES: usize = 8 * 1024 * 1024;
+const USER_RUNNER_ELF_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 // --- Shared summary slots (u64) written by userspace ---
 
@@ -544,6 +550,7 @@ const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 #[derive(Clone, Copy)]
 struct AlignedPage([u8; 4096]);
 #[repr(align(4096))]
+#[derive(Clone, Copy)]
 struct AlignedPageTable([u64; 512]);
 
 static mut USER_CODE_PAGES: [AlignedPage; USER_CODE_PAGE_COUNT] =
@@ -554,7 +561,8 @@ static mut USER_STACK_PAGES: [AlignedPage; USER_STACK_PAGE_COUNT] =
     [AlignedPage([0; 4096]); USER_STACK_PAGE_COUNT];
 
 static mut USER_PD: AlignedPageTable = AlignedPageTable([0; 512]);
-static mut USER_PT: AlignedPageTable = AlignedPageTable([0; 512]);
+static mut USER_PTS: [AlignedPageTable; BOOTSTRAP_USER_PT_COUNT] =
+    [AlignedPageTable([0; 512]); BOOTSTRAP_USER_PT_COUNT];
 
 // PVH boot page tables (identity-mapped, used as the active CR3).
 unsafe extern "C" {
@@ -609,18 +617,36 @@ pub(crate) fn bootstrap_user_pd_paddr() -> u64 {
     phys_of(core::ptr::addr_of!(USER_PD))
 }
 
-pub(crate) fn bootstrap_user_pt_paddr() -> u64 {
-    phys_of(core::ptr::addr_of!(USER_PT))
+pub(crate) fn bootstrap_user_pt_paddrs() -> [u64; BOOTSTRAP_USER_PT_COUNT] {
+    core::array::from_fn(user_pt_paddr)
 }
 
-fn bootstrap_user_page_index(user_va: u64) -> Option<usize> {
-    if user_va < USER_CODE_VA || user_va >= (USER_CODE_VA + BOOTSTRAP_USER_PT_BYTES) {
+pub(crate) fn bootstrap_user_pt_paddr(index: usize) -> u64 {
+    user_pt_paddr(index)
+}
+
+fn user_pt_paddr(index: usize) -> u64 {
+    assert!(index < BOOTSTRAP_USER_PT_COUNT);
+    let pt = unsafe {
+        // SAFETY: callers only request one fixed bootstrap PT slot. Reading the address of one
+        // static table page does not mutate the bootstrap mapping state.
+        core::ptr::addr_of!(USER_PTS[index])
+    };
+    phys_of(pt)
+}
+
+fn bootstrap_user_page_slot(user_va: u64) -> Option<(usize, usize)> {
+    if user_va < USER_CODE_VA || user_va >= USER_STACK_TOP {
         return None;
     }
     if user_va & (USER_PAGE_BYTES - 1) != 0 {
         return None;
     }
-    usize::try_from((user_va - USER_CODE_VA) / USER_PAGE_BYTES).ok()
+    let page_index = usize::try_from((user_va - USER_CODE_VA) / USER_PAGE_BYTES).ok()?;
+    Some((
+        page_index / BOOTSTRAP_USER_PT_ENTRY_COUNT,
+        page_index % BOOTSTRAP_USER_PT_ENTRY_COUNT,
+    ))
 }
 
 pub(crate) fn alloc_bootstrap_cow_page(src_paddr: u64) -> Option<u64> {
@@ -718,9 +744,9 @@ pub(crate) fn read_bootstrap_bytes(
 }
 
 pub(crate) fn query_user_page_frame(user_va: u64) -> Result<Option<UserPageFrame>, ()> {
-    let index = bootstrap_user_page_index(user_va).ok_or(())?;
-    // SAFETY: USER_PT is the active page table page for the fixed bootstrap user region.
-    let entry = unsafe { USER_PT.0[index] };
+    let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
+    // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
+    let entry = unsafe { USER_PTS[pt_index].0[entry_index] };
     if (entry & PTE_P) == 0 {
         return Ok(None);
     }
@@ -734,33 +760,33 @@ pub(crate) fn install_user_page_frame(user_va: u64, paddr: u64, writable: bool) 
     if paddr & (USER_PAGE_BYTES - 1) != 0 {
         return Err(());
     }
-    let index = bootstrap_user_page_index(user_va).ok_or(())?;
+    let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
     let mut entry = paddr | (PTE_P | PTE_U);
     if writable {
         entry |= PTE_W;
     }
 
     unsafe {
-        // SAFETY: USER_PT is the active page table page for the fixed bootstrap user region.
-        USER_PT.0[index] = entry;
+        // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
+        USER_PTS[pt_index].0[entry_index] = entry;
     }
     Ok(())
 }
 
 pub(crate) fn clear_user_page_frame(user_va: u64) -> Result<(), ()> {
-    let index = bootstrap_user_page_index(user_va).ok_or(())?;
+    let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
     unsafe {
-        // SAFETY: USER_PT is the active page table page for the fixed bootstrap user region.
-        USER_PT.0[index] = 0;
+        // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
+        USER_PTS[pt_index].0[entry_index] = 0;
     }
     Ok(())
 }
 
 pub(crate) fn set_user_page_writable(user_va: u64, writable: bool) -> Result<(), ()> {
-    let index = bootstrap_user_page_index(user_va).ok_or(())?;
+    let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
     unsafe {
-        // SAFETY: USER_PT is the active page table page for the fixed bootstrap user region.
-        let entry = &mut USER_PT.0[index];
+        // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
+        let entry = &mut USER_PTS[pt_index].0[entry_index];
         if (*entry & PTE_P) == 0 {
             return Err(());
         }
@@ -774,12 +800,24 @@ pub(crate) fn set_user_page_writable(user_va: u64, writable: bool) -> Result<(),
 }
 
 fn map_userspace_pages() {
+    fn install_bootstrap_pte(page_index: usize, paddr: u64, writable: bool) {
+        let pt_index = page_index / BOOTSTRAP_USER_PT_ENTRY_COUNT;
+        let entry_index = page_index % BOOTSTRAP_USER_PT_ENTRY_COUNT;
+        let mut entry = paddr | (PTE_P | PTE_U);
+        if writable {
+            entry |= PTE_W;
+        }
+        unsafe {
+            // SAFETY: early bring-up is single-core; bootstrap page tables are only mutated here.
+            USER_PTS[pt_index].0[entry_index] = entry;
+        }
+    }
+
     // SAFETY: early bring-up is single-core; page table mutation is serialized.
     unsafe {
         let pml4 = core::ptr::addr_of_mut!(pvh_pml4).cast::<u64>();
         let pdpt = core::ptr::addr_of_mut!(pvh_pdpt).cast::<u64>();
         let user_pd = core::ptr::addr_of_mut!(USER_PD).cast::<u64>();
-        let user_pt = core::ptr::addr_of_mut!(USER_PT).cast::<u64>();
 
         // Allow user mappings under PML4[0] by setting U=1 at the top level.
         *pml4.add(0) |= PTE_U;
@@ -787,21 +825,27 @@ fn map_userspace_pages() {
         // Install PDPT[4] -> USER_PD (maps VA 4GiB..5GiB).
         *pdpt.add(4) = phys_of(core::ptr::addr_of!(USER_PD)) | (PTE_P | PTE_W | PTE_U);
 
-        // USER_PD[0] -> USER_PT keeps the original 2 MiB bootstrap leaf wired in place.
-        // Wider user-space mappings are populated lazily by the per-address-space walker.
-        *user_pd.add(0) = phys_of(core::ptr::addr_of!(USER_PT)) | (PTE_P | PTE_W | PTE_U);
+        for index in 0..BOOTSTRAP_USER_PT_COUNT {
+            *user_pd.add(index) = user_pt_paddr(index) | (PTE_P | PTE_W | PTE_U);
+        }
 
         // Map the user code pages, followed by the shared region and stack page.
         for index in 0..USER_CODE_PAGE_COUNT {
-            *user_pt.add(index) = user_code_page_paddr(index) | (PTE_P | PTE_W | PTE_U);
+            install_bootstrap_pte(index, user_code_page_paddr(index), true);
         }
         for index in 0..USER_SHARED_PAGE_COUNT {
-            *user_pt.add(USER_CODE_PAGE_COUNT + index) =
-                phys_of(core::ptr::addr_of!(USER_SHARED_PAGES[index])) | (PTE_P | PTE_W | PTE_U);
+            install_bootstrap_pte(
+                USER_CODE_PAGE_COUNT + index,
+                phys_of(core::ptr::addr_of!(USER_SHARED_PAGES[index])),
+                true,
+            );
         }
         for index in 0..USER_STACK_PAGE_COUNT {
-            *user_pt.add(USER_CODE_PAGE_COUNT + USER_SHARED_PAGE_COUNT + index) =
-                user_stack_page_paddr(index) | (PTE_P | PTE_U);
+            install_bootstrap_pte(
+                USER_CODE_PAGE_COUNT + USER_SHARED_PAGE_COUNT + index,
+                user_stack_page_paddr(index),
+                false,
+            );
         }
 
         // Flush TLB by reloading CR3.
@@ -869,9 +913,16 @@ struct Elf64Phdr {
     p_align: u64,
 }
 
-fn try_load_user_program_from_qemu_loader() -> Option<u64> {
-    let layout = bootstrap_process_image_layout()?;
-    load_bootstrap_process_image_into_current_mapping(&layout).ok()
+fn try_load_user_program_from_qemu_loader() -> Result<Option<u64>, zx_status_t> {
+    let Some(image_size) =
+        crate::task::bootstrap_user_runner_source_size().or_else(qemu_loader_user_runner_size)
+    else {
+        return Ok(None);
+    };
+    let layout = parse_elf_process_image_layout(image_size, |offset, len| {
+        read_bootstrap_user_runner_bytes(offset, len).ok_or(ZX_ERR_IO_DATA_INTEGRITY)
+    })?;
+    load_bootstrap_process_image_into_current_mapping(&layout).map(Some)
 }
 
 fn load_bootstrap_process_image_into_current_mapping(
@@ -1948,10 +1999,20 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
 /// Enter ring3 and run the embedded userspace conformance program.
 pub fn prepare() -> u64 {
     map_userspace_pages();
-    let entry = try_load_user_program_from_qemu_loader().unwrap_or_else(|| {
-        load_user_program_embedded();
-        USER_CODE_VA
-    });
+    let entry = match try_load_user_program_from_qemu_loader() {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            load_user_program_embedded();
+            USER_CODE_VA
+        }
+        Err(status) => {
+            crate::kprintln!(
+                "userspace: bootstrap runner import failed status={}",
+                status
+            );
+            panic!("userspace: bootstrap runner import failed");
+        }
+    };
 
     // Zero shared slots and set `ok=0` pessimistically.
     let slots = shared_slots();

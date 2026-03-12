@@ -3,7 +3,7 @@
 .global axle_user_prog_end
 axle_user_prog_start:
 	// rbx = shared base (USER_SHARED_VA)
-	movabs $0x0000000100100000, %rbx
+	movabs $0x00000001001c0000, %rbx
 // r12 = t0_ns baseline provided by the kernel (slot 511)
 mov 8*511(%rbx), %r12
 
@@ -3175,7 +3175,7 @@ movq $0, 0x00(%rbx)
 int3
 
 thread_worker_entry:
-	movabs $0x0000000100100000, %rbx
+	movabs $0x00000001001c0000, %rbx
 	movq $1, 8*399(%rbx)
 thread_worker_spin:
 	mov 8*403(%rbx), %rax
@@ -3309,7 +3309,7 @@ process_child_touch_shared_fault_page:
 	jmp process_child_spin
 
 suspend_worker_entry:
-	movabs $0x0000000100100000, %rbx
+	movabs $0x00000001001c0000, %rbx
 	mov %rdi, %r12
 suspend_worker_wait:
 	xorl %esi, %esi

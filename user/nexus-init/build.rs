@@ -10,24 +10,28 @@ fn main() {
     let linux_hello_source = manifest_dir.join("../linux-hello/hello.S");
     let linux_fd_smoke_source = manifest_dir.join("../linux-fd-smoke/fd_smoke.S");
     let linux_round2_source = manifest_dir.join("../linux-round2-smoke/round2_smoke.S");
+    let linux_round3_source = manifest_dir.join("../linux-round3-smoke/round3_smoke.S");
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
     println!("cargo:rerun-if-changed={}", linux_hello_source.display());
     println!("cargo:rerun-if-changed={}", linux_fd_smoke_source.display());
     println!("cargo:rerun-if-changed={}", linux_round2_source.display());
+    println!("cargo:rerun-if-changed={}", linux_round3_source.display());
     for manifest in [
         "root_component.toml",
         "root_component_round3.toml",
         "root_component_starnix.toml",
         "root_component_starnix_fd.toml",
         "root_component_starnix_round2.toml",
+        "root_component_starnix_round3.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
         "linux_hello.toml",
         "linux_fd_smoke.toml",
         "linux_round2_smoke.toml",
+        "linux_round3_smoke.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -48,12 +52,17 @@ fn main() {
             "root_component_starnix_round2.toml",
             "root_component_starnix_round2.nxcd",
         ),
+        (
+            "root_component_starnix_round3.toml",
+            "root_component_starnix_round3.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
         ("linux_hello.toml", "linux_hello.nxcd"),
         ("linux_fd_smoke.toml", "linux_fd_smoke.nxcd"),
         ("linux_round2_smoke.toml", "linux_round2_smoke.nxcd"),
+        ("linux_round3_smoke.toml", "linux_round3_smoke.nxcd"),
     ] {
         let source_path = manifests_dir.join(input);
         let source = fs::read_to_string(&source_path)
@@ -67,6 +76,7 @@ fn main() {
     build_linux_hello(&linux_hello_source, &out_dir);
     build_linux_binary(&linux_fd_smoke_source, &out_dir.join("linux-fd-smoke"));
     build_linux_binary(&linux_round2_source, &out_dir.join("linux-round2-smoke"));
+    build_linux_binary(&linux_round3_source, &out_dir.join("linux-round3-smoke"));
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
         // Link the bootstrap userspace binary at the fixed VA currently
@@ -77,6 +87,27 @@ fn main() {
     }
     let root_url =
         std::env::var("NEXUS_INIT_ROOT_URL").unwrap_or_else(|_| String::from("boot://root"));
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_hello)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_fd)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round2)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round3)");
+    match root_url.as_str() {
+        "boot://root-starnix" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
+        }
+        "boot://root-starnix-fd" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_fd");
+        }
+        "boot://root-starnix-round2" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_round2");
+        }
+        "boot://root-starnix-round3" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_round3");
+        }
+        _ => {}
+    }
     println!("cargo:rustc-env=NEXUS_INIT_ROOT_URL={root_url}");
 }
 

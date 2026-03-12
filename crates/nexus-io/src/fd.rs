@@ -283,7 +283,7 @@ impl fmt::Debug for FdEntry {
 }
 
 /// Userspace-owned fd table.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FdTable {
     entries: Vec<Option<FdEntry>>,
     next_description_id: u64,

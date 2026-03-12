@@ -96,6 +96,14 @@ Main just targets include:
   - read-only file-backed `mmap` through `FdOps::as_vmo()` / `GetVmo`
   - the supervisor keeps one Linux-side `LinuxMm` / map-tree control plane while continuing to
     rely on Axle VMAR/VMO syscalls for the real mapping work
+- The Round-3 Starnix bootstrap scenario now closes the minimal task/process loop:
+  - `clone(CLONE_THREAD)`
+  - `fork`
+  - `execve`
+  - `wait4`
+  - zombie reap and reparent-to-root behavior
+  - the guest still sees stable Linux task identity even when `execve` swaps the underlying Axle
+    carrier process/thread resources
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

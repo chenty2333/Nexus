@@ -4214,6 +4214,28 @@ impl Kernel {
         Ok(())
     }
 
+    fn validate_thread_guest_start_regs(
+        &self,
+        process_id: ProcessId,
+        regs: &ax_guest_x64_regs_t,
+    ) -> Result<(), zx_status_t> {
+        let stack_probe = regs.rsp.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
+        if !self.validate_process_user_mapping_perms(
+            process_id,
+            regs.rip,
+            1,
+            MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER,
+        ) || !self.validate_process_user_mapping_perms(
+            process_id,
+            stack_probe,
+            8,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+        ) {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        Ok(())
+    }
+
     fn restore_current_user_context(
         &mut self,
         trap: &mut crate::arch::int80::TrapFrame,
@@ -4685,6 +4707,39 @@ impl Kernel {
         Ok(())
     }
 
+    pub(crate) fn start_thread_guest(
+        &mut self,
+        thread_id: ThreadId,
+        regs: &ax_guest_x64_regs_t,
+    ) -> Result<(), zx_status_t> {
+        let process_id = self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .process_id;
+        let process = self.process(process_id)?;
+        if process.state != ProcessState::Started {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        self.validate_thread_guest_start_regs(process_id, regs)?;
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        if !matches!(thread.state, ThreadState::New) {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        thread.context =
+            Some(UserContext::new_user_entry(regs.rip, regs.rsp, 0, 0).with_guest_x64_regs(*regs));
+        thread.state = ThreadState::Runnable;
+        let queued = thread.queued_on_cpu.is_some();
+        let thread_id_copy = thread_id;
+        let _ = thread;
+        if !queued {
+            let target_cpu = self.choose_wake_cpu(thread_id_copy);
+            self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
+            self.request_reschedule_on_cpu(target_cpu);
+        }
+        Ok(())
+    }
+
     pub(crate) fn start_process(
         &mut self,
         process_id: ProcessId,
@@ -4725,6 +4780,40 @@ impl Kernel {
         }
         process.state = ProcessState::Started;
         let result = self.start_thread(thread_id, entry, stack, arg0, arg1);
+        if result.is_err() {
+            let process = self
+                .processes
+                .get_mut(&process_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            process.state = ProcessState::Created;
+        }
+        result
+    }
+
+    pub(crate) fn start_process_guest(
+        &mut self,
+        process_id: ProcessId,
+        thread_id: ThreadId,
+        regs: &ax_guest_x64_regs_t,
+    ) -> Result<(), zx_status_t> {
+        let thread_process_id = self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .process_id;
+        if thread_process_id != process_id {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        self.validate_thread_guest_start_regs(process_id, regs)?;
+        let process = self
+            .processes
+            .get_mut(&process_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        if process.state != ProcessState::Created {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        process.state = ProcessState::Started;
+        let result = self.start_thread_guest(thread_id, regs);
         if result.is_err() {
             let process = self
                 .processes

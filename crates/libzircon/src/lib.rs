@@ -29,10 +29,10 @@ pub use axle_types::syscall_numbers;
 pub use axle_types::vm;
 pub use axle_types::wait_async;
 pub use axle_types::{
-    ax_guest_stop_state_t, ax_linux_exec_spec_header_t, zx_clock_t, zx_duration_t, zx_futex_t,
-    zx_handle_t, zx_koid_t, zx_packet_signal_t, zx_packet_type_t, zx_packet_user_t,
-    zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t,
-    zx_vm_option_t,
+    ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_spec_header_t, zx_clock_t,
+    zx_duration_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_packet_signal_t, zx_packet_type_t,
+    zx_packet_user_t, zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t, zx_time_t,
+    zx_vaddr_t, zx_vm_option_t,
 };
 
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
@@ -42,7 +42,8 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
     AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
     AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
-    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_HANDLE_CLOSE,
+    AXLE_SYS_AX_PROCESS_START_GUEST, AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_CHANNEL_CREATE,
+    AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE,
     AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE,
@@ -679,6 +680,45 @@ pub fn ax_guest_session_write_memory(
                 buffer.as_ptr() as u64
             },
             buffer.len() as u64,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Start one newly created process from a full guest x86_64 register snapshot.
+pub fn ax_process_start_guest(
+    process: zx_handle_t,
+    thread: zx_handle_t,
+    regs: &ax_guest_x64_regs_t,
+    options: u32,
+) -> zx_status_t {
+    int80_call(
+        AXLE_SYS_AX_PROCESS_START_GUEST as u64,
+        [
+            process as u64,
+            thread as u64,
+            regs as *const ax_guest_x64_regs_t as u64,
+            options as u64,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Start one newly created thread from a full guest x86_64 register snapshot.
+pub fn ax_thread_start_guest(
+    thread: zx_handle_t,
+    regs: &ax_guest_x64_regs_t,
+    options: u32,
+) -> zx_status_t {
+    int80_call(
+        AXLE_SYS_AX_THREAD_START_GUEST as u64,
+        [
+            thread as u64,
+            regs as *const ax_guest_x64_regs_t as u64,
+            options as u64,
+            0,
             0,
             0,
         ],

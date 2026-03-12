@@ -310,7 +310,7 @@ pub(crate) struct UserPageTables {
     root_paddr: u64,
     pdpt_paddr: u64,
     user_pd_paddr: u64,
-    user_pt_paddr: u64,
+    user_pt_paddrs: [u64; crate::userspace::BOOTSTRAP_USER_PT_COUNT],
     descs: Arc<Mutex<PtDescriptorStore>>,
 }
 
@@ -339,7 +339,7 @@ impl UserPageTables {
         root_paddr: u64,
         pdpt_paddr: u64,
         user_pd_paddr: u64,
-        user_pt_paddr: u64,
+        user_pt_paddrs: &[u64; crate::userspace::BOOTSTRAP_USER_PT_COUNT],
     ) -> Arc<Mutex<PtDescriptorStore>> {
         let mut descs = PtDescriptorStore {
             by_key: alloc::collections::BTreeMap::new(),
@@ -370,15 +370,21 @@ impl UserPageTables {
             invalidate_epoch: 0,
             meta_kind: PtMetaKind::Leaf,
         });
-        descs.upsert_descriptor(PtPageDesc {
-            level: PtPageLevel::Pt,
-            table_paddr: user_pt_paddr,
-            va_base: align_down_level(crate::userspace::USER_CODE_VA, PtPageLevel::Pt),
-            lock_kind: PtPageLockKind::TxSerialized,
-            invalidate_epoch: 0,
-            meta_kind: PtMetaKind::Leaf,
-        });
-        descs.refresh_uniform_metadata_for_leaf(user_pt_paddr);
+        for (index, user_pt_paddr) in user_pt_paddrs.iter().copied().enumerate() {
+            descs.upsert_descriptor(PtPageDesc {
+                level: PtPageLevel::Pt,
+                table_paddr: user_pt_paddr,
+                va_base: align_down_level(
+                    crate::userspace::USER_CODE_VA
+                        + (index as u64 * crate::userspace::BOOTSTRAP_USER_PT_BYTES),
+                    PtPageLevel::Pt,
+                ),
+                lock_kind: PtPageLockKind::TxSerialized,
+                invalidate_epoch: 0,
+                meta_kind: PtMetaKind::Leaf,
+            });
+            descs.refresh_uniform_metadata_for_leaf(user_pt_paddr);
+        }
         Arc::new(Mutex::new(descs))
     }
 
@@ -388,13 +394,13 @@ impl UserPageTables {
         let root_paddr = root_frame.start_address().as_u64();
         let pdpt_paddr = table(root_paddr)[0].addr().as_u64();
         let user_pd_paddr = crate::userspace::bootstrap_user_pd_paddr();
-        let user_pt_paddr = crate::userspace::bootstrap_user_pt_paddr();
+        let user_pt_paddrs = crate::userspace::bootstrap_user_pt_paddrs();
         Ok(Self {
             root_paddr,
             pdpt_paddr,
             user_pd_paddr,
-            user_pt_paddr,
-            descs: Self::new_descriptors(root_paddr, pdpt_paddr, user_pd_paddr, user_pt_paddr),
+            user_pt_paddrs,
+            descs: Self::new_descriptors(root_paddr, pdpt_paddr, user_pd_paddr, &user_pt_paddrs),
         })
     }
 
@@ -413,8 +419,11 @@ impl UserPageTables {
             crate::userspace::alloc_bootstrap_zeroed_page().ok_or(PageTableError::Backend)?;
         let user_pd_paddr =
             crate::userspace::alloc_bootstrap_zeroed_page().ok_or(PageTableError::Backend)?;
-        let user_pt_paddr =
-            crate::userspace::alloc_bootstrap_zeroed_page().ok_or(PageTableError::Backend)?;
+        let mut user_pt_paddrs = [0u64; crate::userspace::BOOTSTRAP_USER_PT_COUNT];
+        for user_pt_paddr in &mut user_pt_paddrs {
+            *user_pt_paddr =
+                crate::userspace::alloc_bootstrap_zeroed_page().ok_or(PageTableError::Backend)?;
+        }
 
         unsafe {
             // SAFETY: all page-table pages are allocated as page-sized, page-aligned, identity-
@@ -437,14 +446,17 @@ impl UserPageTables {
         let user_table_flags =
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         table_mut(pdpt_paddr)[4].set_addr(PhysAddr::new(user_pd_paddr), user_table_flags);
-        table_mut(user_pd_paddr)[0].set_addr(PhysAddr::new(user_pt_paddr), user_table_flags);
+        for (index, user_pt_paddr) in user_pt_paddrs.iter().copied().enumerate() {
+            table_mut(user_pd_paddr)[index]
+                .set_addr(PhysAddr::new(user_pt_paddr), user_table_flags);
+        }
 
         Ok(Self {
             root_paddr,
             pdpt_paddr,
             user_pd_paddr,
-            user_pt_paddr,
-            descs: Self::new_descriptors(root_paddr, pdpt_paddr, user_pd_paddr, user_pt_paddr),
+            user_pt_paddrs,
+            descs: Self::new_descriptors(root_paddr, pdpt_paddr, user_pd_paddr, &user_pt_paddrs),
         })
     }
 
@@ -465,7 +477,7 @@ impl UserPageTables {
 
     #[allow(dead_code)]
     pub(crate) const fn user_pt_paddr(&self) -> u64 {
-        self.user_pt_paddr
+        self.user_pt_paddrs[0]
     }
 
     #[allow(dead_code)]
@@ -608,8 +620,8 @@ impl UserPageTables {
             self.ensure_page_table_page(PtPageLevel::Pdpt, pdpt_paddr, pdpt_va_base, indices.pdpt)?;
         let (pt_paddr, _) =
             self.ensure_page_table_page(PtPageLevel::Pd, pd_paddr, pd_va_base, indices.pd)?;
-        if pd_paddr == self.user_pd_paddr && indices.pd == 0 {
-            self.user_pt_paddr = pt_paddr;
+        if pd_paddr == self.user_pd_paddr && indices.pd < self.user_pt_paddrs.len() {
+            self.user_pt_paddrs[indices.pd] = pt_paddr;
         }
         Ok(pt_paddr)
     }

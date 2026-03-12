@@ -45,7 +45,12 @@ use crate::resolver::{ResolverRegistry, resolve_root_child};
 use crate::runner::{ElfRunner, RunnerRegistry, StarnixRunner};
 use crate::services::{BootAssetEntry, BootstrapNamespace, run_socket_fd_smoke, run_tmpfs_smoke};
 
-const USER_SHARED_BASE: u64 = 0x0000_0001_0010_0000;
+// Keep this bootstrap shared-slot VA in sync with
+// `kernel/axle-kernel/src/userspace.rs`.
+const USER_PAGE_BYTES: u64 = 0x1000;
+const USER_CODE_PAGE_COUNT: u64 = 448;
+const USER_CODE_BASE: u64 = 0x0000_0001_0000_0000;
+const USER_SHARED_BASE: u64 = USER_CODE_BASE + (USER_PAGE_BYTES * USER_CODE_PAGE_COUNT);
 const SLOT_OK: usize = 0;
 const SLOT_SELF_PROCESS_H: usize = 396;
 const SLOT_SELF_CODE_VMO_H: usize = 506;
@@ -107,21 +112,53 @@ const ROOT_DECL_STARNIX_ROUND2_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_round2.nxcd"
 ));
+const ROOT_DECL_STARNIX_ROUND3_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_round3.nxcd"
+));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/controller_worker.nxcd"));
+#[cfg(nexus_init_embed_starnix_hello)]
 const LINUX_HELLO_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linux_hello.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_hello))]
+const LINUX_HELLO_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_fd)]
 const LINUX_FD_SMOKE_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_fd_smoke.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_fd))]
+const LINUX_FD_SMOKE_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round2)]
 pub(crate) const LINUX_ROUND2_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_round2_smoke.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_round2))]
+pub(crate) const LINUX_ROUND2_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round3)]
+pub(crate) const LINUX_ROUND3_DECL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux_round3_smoke.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_round3))]
+pub(crate) const LINUX_ROUND3_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_hello)]
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
+#[cfg(not(nexus_init_embed_starnix_hello))]
+pub(crate) const LINUX_HELLO_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_fd)]
 pub(crate) const LINUX_FD_SMOKE_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-fd-smoke"));
+#[cfg(not(nexus_init_embed_starnix_fd))]
+pub(crate) const LINUX_FD_SMOKE_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round2)]
 pub(crate) const LINUX_ROUND2_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-round2-smoke"));
+#[cfg(not(nexus_init_embed_starnix_round2))]
+pub(crate) const LINUX_ROUND2_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round3)]
+pub(crate) const LINUX_ROUND3_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-round3-smoke"));
+#[cfg(not(nexus_init_embed_starnix_round3))]
+pub(crate) const LINUX_ROUND3_BYTES: &[u8] = &[];
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
@@ -135,6 +172,7 @@ pub(crate) const STARNIX_KERNEL_BINARY_PATH: &str = "bin/starnix-kernel";
 pub(crate) const LINUX_HELLO_BINARY_PATH: &str = "bin/linux-hello";
 pub(crate) const LINUX_FD_SMOKE_BINARY_PATH: &str = "bin/linux-fd-smoke";
 pub(crate) const LINUX_ROUND2_BINARY_PATH: &str = "bin/linux-round2-smoke";
+pub(crate) const LINUX_ROUND3_BINARY_PATH: &str = "bin/linux-round3-smoke";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -153,11 +191,12 @@ pub(crate) const MAX_SMALL_CHANNEL_HANDLES: usize = 1;
 const STARNIX_HELLO_EXPECTED_STDOUT: &[u8] = b"hello from linux-hello\n";
 const STARNIX_FD_SMOKE_EXPECTED_STDOUT: &[u8] = b"pipe\nsock\n";
 const STARNIX_ROUND2_EXPECTED_STDOUT: &[u8] = b"round2 ok\n";
+const STARNIX_ROUND3_EXPECTED_STDOUT: &[u8] = b"hello from linux-hello\nround3 ok\n";
 
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
 
-const HEAP_BYTES: usize = 256 * 1024;
+const HEAP_BYTES: usize = 512 * 1024;
 static mut HEAP: HeapStorage = HeapStorage([0; HEAP_BYTES]);
 static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
 static ROLE: AtomicUsize = AtomicUsize::new(ROLE_NONE);
@@ -337,18 +376,30 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             self_code_vmo
         },
     ));
-    assets.push(BootAssetEntry::bytes(
-        LINUX_HELLO_BINARY_PATH,
-        LINUX_HELLO_BYTES,
-    ));
-    assets.push(BootAssetEntry::bytes(
-        LINUX_FD_SMOKE_BINARY_PATH,
-        LINUX_FD_SMOKE_BYTES,
-    ));
-    assets.push(BootAssetEntry::bytes(
-        LINUX_ROUND2_BINARY_PATH,
-        LINUX_ROUND2_BYTES,
-    ));
+    if !LINUX_HELLO_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_HELLO_BINARY_PATH,
+            LINUX_HELLO_BYTES,
+        ));
+    }
+    if !LINUX_FD_SMOKE_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_FD_SMOKE_BINARY_PATH,
+            LINUX_FD_SMOKE_BYTES,
+        ));
+    }
+    if !LINUX_ROUND2_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND2_BINARY_PATH,
+            LINUX_ROUND2_BYTES,
+        ));
+    }
+    if !LINUX_ROUND3_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND3_BINARY_PATH,
+            LINUX_ROUND3_BYTES,
+        ));
+    }
     assets.push(BootAssetEntry::bytes(
         "manifests/root.nxcd",
         ROOT_DECL_EAGER_BYTES,
@@ -370,17 +421,33 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         ROOT_DECL_STARNIX_ROUND2_BYTES,
     ));
     assets.push(BootAssetEntry::bytes(
-        "manifests/linux-hello.nxcd",
-        LINUX_HELLO_DECL_BYTES,
+        "manifests/root-starnix-round3.nxcd",
+        ROOT_DECL_STARNIX_ROUND3_BYTES,
     ));
-    assets.push(BootAssetEntry::bytes(
-        "manifests/linux-fd-smoke.nxcd",
-        LINUX_FD_SMOKE_DECL_BYTES,
-    ));
-    assets.push(BootAssetEntry::bytes(
-        "manifests/linux-round2-smoke.nxcd",
-        LINUX_ROUND2_DECL_BYTES,
-    ));
+    if !LINUX_HELLO_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-hello.nxcd",
+            LINUX_HELLO_DECL_BYTES,
+        ));
+    }
+    if !LINUX_FD_SMOKE_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-fd-smoke.nxcd",
+            LINUX_FD_SMOKE_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND2_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round2-smoke.nxcd",
+            LINUX_ROUND2_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND3_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round3-smoke.nxcd",
+            LINUX_ROUND3_DECL_BYTES,
+        ));
+    }
     assets.push(BootAssetEntry::bytes(
         "manifests/echo-provider.nxcd",
         PROVIDER_DECL_BYTES,
@@ -473,7 +540,6 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             return 1;
         }
     };
-
     let runners = match build_runner_registry(parent_process, bootstrap_namespace.boot_root()) {
         Ok(runners) => runners,
         Err(status) => {
@@ -510,6 +576,16 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             &runners,
             "linux_round2_smoke",
             STARNIX_ROUND2_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-round3" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_round3_smoke",
+            STARNIX_ROUND3_EXPECTED_STDOUT,
             summary,
         );
     }

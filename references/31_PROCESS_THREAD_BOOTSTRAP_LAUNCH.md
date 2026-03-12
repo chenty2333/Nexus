@@ -129,9 +129,10 @@ The first generic-launch contract is now implemented without changing syscall si
   ABI now exposes one fixed header plus appended stack-image bytes. The kernel maps the ELF image
   using the normal process-image layout path and installs the caller-provided Linux stack image
   into the fixed startup stack VMO.
-- The current Round-1 Starnix bootstrap path is the first consumer of that helper: the userspace
-  executive prepares one Linux stack image, calls `ax_process_prepare_linux_exec()`, then starts
-  the target thread with the returned entry and stack pointer.
+- The current Starnix bootstrap and minimal `execve()` paths are the first consumers of that
+  helper: the userspace executive prepares one Linux stack image, calls
+  `ax_process_prepare_linux_exec()`, then starts the target thread with the returned entry and
+  stack pointer.
 - `ProcessImageLayout` is the common launch artifact for:
   - bootstrap image import
   - internal code-image VMOs
@@ -177,5 +178,5 @@ The first generic-launch contract is now implemented without changing syscall si
 - The startup stack image is intentionally minimal today and does not yet carry the eventual full
   launcher-provided `argv` / `environ` contract.
 - Linux exec-prepare currently supports one fixed startup stack VMO and an opaque v1 exec-spec
-  header plus appended stack-image bytes; it is enough for the Round-1 Starnix bootstrap path but
-  is not yet the final `execve()` replacement contract.
+  header plus appended stack-image bytes; it is enough for the current bootstrap and minimal
+  `execve()` replacement path but is not yet the final long-term contract.

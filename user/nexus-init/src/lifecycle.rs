@@ -4,14 +4,15 @@ use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::signals::{ZX_CHANNEL_PEER_CLOSED, ZX_CHANNEL_READABLE};
 use axle_types::status::{ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_SHOULD_WAIT, ZX_OK};
 use axle_types::{zx_handle_t, zx_status_t, zx_time_t};
-use libzircon::{ZX_TIME_INFINITE, zx_channel_read, zx_channel_write, zx_object_wait_one};
+use libzircon::{
+    ZX_TIME_INFINITE, zx_channel_read, zx_channel_read_alloc, zx_channel_write, zx_object_wait_one,
+};
 use nexus_component::{ComponentStartInfo, ControllerEvent, ControllerRequest};
 
 use crate::runner::RunningComponent;
 use crate::{
     CHILD_ROLE_CLIENT, CHILD_ROLE_CONTROLLER_WORKER, CHILD_ROLE_PROVIDER,
-    MAX_BOOTSTRAP_MESSAGE_BYTES, MAX_BOOTSTRAP_MESSAGE_HANDLES, MAX_SMALL_CHANNEL_HANDLES,
-    STARTUP_HANDLE_COMPONENT_STATUS, SVC_NAMESPACE_PATH,
+    MAX_SMALL_CHANNEL_HANDLES, STARTUP_HANDLE_COMPONENT_STATUS, SVC_NAMESPACE_PATH,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -33,15 +34,9 @@ pub(crate) struct MinimalStartInfo {
 pub(crate) fn read_component_start_info_minimal(
     bootstrap_channel: zx_handle_t,
 ) -> Result<MinimalStartInfo, zx_status_t> {
-    let mut bytes = [0u8; MAX_BOOTSTRAP_MESSAGE_BYTES];
-    let mut handles = [ZX_HANDLE_INVALID; MAX_BOOTSTRAP_MESSAGE_HANDLES];
-    let (actual_bytes, actual_handles) =
-        read_channel_blocking(bootstrap_channel, &mut bytes, &mut handles)?;
-    let start_info = ComponentStartInfo::decode_channel_message(
-        &bytes[..actual_bytes],
-        &handles[..actual_handles],
-    )
-    .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
+    let (bytes, handles) = read_channel_alloc_blocking(bootstrap_channel)?;
+    let start_info = ComponentStartInfo::decode_channel_message(&bytes, &handles)
+        .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
     minimal_start_info_from_component(start_info)
 }
 
@@ -133,6 +128,18 @@ pub(crate) fn read_channel_blocking(
 ) -> Result<(usize, usize), zx_status_t> {
     loop {
         match read_channel_fixed(handle, bytes, handles) {
+            Ok(message) => return Ok(message),
+            Err(ZX_ERR_SHOULD_WAIT) => wait_for_channel_readable(handle, ZX_TIME_INFINITE)?,
+            Err(status) => return Err(status),
+        }
+    }
+}
+
+pub(crate) fn read_channel_alloc_blocking(
+    handle: zx_handle_t,
+) -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<zx_handle_t>), zx_status_t> {
+    loop {
+        match zx_channel_read_alloc(handle, 0) {
             Ok(message) => return Ok(message),
             Err(ZX_ERR_SHOULD_WAIT) => wait_for_channel_readable(handle, ZX_TIME_INFINITE)?,
             Err(status) => return Err(status),
