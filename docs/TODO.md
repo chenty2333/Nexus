@@ -256,6 +256,41 @@ depends on: C3, E2, G
 
 depends on: F, H, E1
 
+### K. DataFS-prep `[~]`
+
+#### K1. reference model / crash checker scaffolding `[~]`
+
+= freeze the first DataFS design constraints before the real filesystem exists
+= the current tree now has:
+  - `crates/nexus-fs-model`
+  - `tools/datafs-check`
+= `nexus-fs-model` now carries:
+  - one object/inode reference model
+  - logical journal records for begin / mutation / commit / checkpoint
+  - state transitions for `rename` / `link` / `unlink` / `fsync`
+  - reserved recovery metadata for `session_id`, open-file-description identity,
+    and reconnect intent
+  - one transport reservation layer for channel RPC first and shared-ring later
+= `datafs-check` now carries:
+  - scenario exploration
+  - fault injection
+  - crash-state replay
+  - journal / state invariant reporting
+= the frozen v1 shape is now:
+  - userspace FS service
+  - single volume
+  - extent-based regular files
+  - indexed directories
+  - logical metadata journal
+  - checksum + checkpoint
+  - minimal fsck-style invariant checker
+  - read-only `GetVmo`
+  - no writable `mmap`
+= real on-disk DataFS implementation, allocator policy, writeback, and recovery
+  execution are still not in tree
+
+depends on: I
+
 ### J. Starnix `[ ]`
 
 #### J1. starnix runner

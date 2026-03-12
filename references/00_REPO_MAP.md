@@ -11,6 +11,7 @@ See also:
 - `30_PROCESS_THREAD.md`
 - `33_IPC.md`
 - `40_VM.md`
+- `44_DATAFS_PREP_MODEL.md`
 - `90_CONFORMANCE.md`
 - `AxleKernel_Roadmap_v0.3.md`
 - `Axle_v0.3.md`
@@ -57,9 +58,13 @@ Index-style files can be shorter, but they should still point to the split docum
 - `41_VM_VMO_VMAR.md` - working
 - `42_VM_FAULT_COW_LOAN.md` - working
 - `43_VM_EXEC_PAGER_DEVICE_VM.md` - draft
+- `44_DATAFS_PREP_MODEL.md` - draft
 - `90_CONFORMANCE.md` - working
 
-At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` is the only intentional `draft` because it mainly covers incomplete or not-yet-stable VM surfaces. The rest of the leaf references should be treated as `working` current-state docs.
+At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` and
+`44_DATAFS_PREP_MODEL.md` are the intentional `draft` references because they
+mainly cover incomplete or not-yet-stable VM / storage-prep surfaces. The rest
+of the leaf references should be treated as `working` current-state docs.
 
 ## Top-level directories
 
@@ -86,6 +91,11 @@ At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` is the only intentional `draft` b
 - `crates/axle-arch-x86_64` - userspace-side x86_64 ABI glue and syscall entry helpers
 - `crates/libzircon` - thin `zx_*` userspace wrappers over the current Axle `int 0x80` ABI
 - `crates/nexus-component` - minimal component declaration IR, resolver result shape, bootstrap-channel start payloads, and tiny lifecycle/directory messages
+- `crates/nexus-fs-proto` - shared filesystem wire contract: identities, open
+  flags, `GetVmo`, and routed directory/file operations used by `nexus-io` and
+  the bootstrap service stack
+- `crates/nexus-fs-model` - host-side DataFS-prep reference model over metadata
+  state transitions, logical journaling, crash invariants, and replay
 - `crates/nexus-io` - early userspace fd/namespace substrate: `FdOps`, `FdTable`,
   `WaitSpec`, handle-backed fd wrappers, longest-prefix `NamespaceTrie`, and
   one `ProcessNamespace` helper for logical-root / `cwd` path walk
@@ -113,6 +123,8 @@ At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` is the only intentional `draft` b
   - also owns retained-seed QEMU replay:
     - direct guest-side seed runner generation first
     - scenario-bundle fallback when direct replay does not converge
+- `tools/datafs-check` - host-side DataFS-prep explorer, fault injector, and
+  crash-replay checker built on `nexus-fs-model`
 - `tools/nexus-manifestc` - host-side compiler for the minimal Nexus component manifest text format
 
 ## Key entry points
@@ -131,6 +143,7 @@ At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` is the only intentional `draft` b
 - Syscall number generation: `tools/syscalls-gen/src/main.rs`
 - Conformance CLI: `tools/axle-conformance/src/main.rs`
 - Concurrent seed CLI: `tools/axle-concurrency/src/main.rs`
+- DataFS-prep checker CLI: `tools/datafs-check/src/main.rs`
 - Manifest compiler CLI: `tools/nexus-manifestc/src/main.rs`
 
 ## Build and test entry points
@@ -179,6 +192,9 @@ Read these next depending on subsystem:
 - `41_VM_VMO_VMAR.md`
 - `42_VM_FAULT_COW_LOAN.md`
 - `43_VM_EXEC_PAGER_DEVICE_VM.md`
+
+- Storage-prep:
+- `44_DATAFS_PREP_MODEL.md`
 
 - Testing:
 - `90_CONFORMANCE.md`

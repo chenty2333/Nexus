@@ -10,6 +10,7 @@ See also:
 - `40_VM.md` - VM index
 - `41_VM_VMO_VMAR.md` - current VMO / VMAR control plane
 - `42_VM_FAULT_COW_LOAN.md` - fault and COW mechanics that neighbor this work
+- `44_DATAFS_PREP_MODEL.md` - host-side storage-model constraints for read-only `GetVmo` and later recovery work
 
 ## Scope
 
@@ -79,6 +80,8 @@ What is not complete yet:
 - pager-backed VMOs are not yet a normal user-facing VMO object contract
 - there is no external pager object or full file-backed VMO interface
 - write/resize semantics for pager-backed objects are not public contracts yet
+- DataFS-prep only freezes read-only `GetVmo` and recovery/model constraints on
+  the host side; it does not yet provide a real writable file-backed VMO path
 
 ## Device-facing VM primitives
 

@@ -7,6 +7,7 @@ members = [
   "crates/axle-page-table",
   "crates/axle-sync",
   "crates/nexus-fs-proto",
+  "crates/nexus-fs-model",
   "crates/axle-types",
   "crates/libzircon",
   "crates/nexus-component",
@@ -18,6 +19,7 @@ members = [
   "tools/axle-conformance",
   "tools/axle-concurrency",
   "tools/nexus-manifestc",
+  "tools/datafs-check",
 
   # These crates are `no_std` and not built by the default host-only CI gates yet,
   # but we keep them in the workspace so formatting and metadata stay coherent.
