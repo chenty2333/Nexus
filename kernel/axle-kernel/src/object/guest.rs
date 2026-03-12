@@ -169,6 +169,28 @@ pub fn read_guest_memory(
     })
 }
 
+/// Copy kernel-owned bytes into one supervised guest session's userspace memory.
+pub fn write_guest_memory(
+    session_handle: zx_handle_t,
+    guest_addr: u64,
+    bytes: &[u8],
+) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(session_handle, crate::task::HandleRights::WRITE)?;
+        let object_key = resolved.object_key();
+        let session = state.with_objects(|objects| {
+            Ok(match objects.get(object_key) {
+                Some(KernelObject::GuestSession(session)) => session.clone(),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+        state.with_kernel_mut(|kernel| {
+            kernel.write_thread_user_bytes(session.thread_id, guest_addr, bytes)
+        })
+    })
+}
+
 pub(crate) fn handle_invalid_opcode_trap(
     state: &KernelState,
     trap: &mut crate::arch::int80::TrapFrame,

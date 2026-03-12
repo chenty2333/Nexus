@@ -1,0 +1,8 @@
+url = "boot://linux-round2-smoke"
+startup = "eager"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-round2-smoke"
+args = ["linux-round2-smoke"]
+env = []

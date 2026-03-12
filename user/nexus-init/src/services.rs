@@ -75,6 +75,30 @@ impl BootstrapNamespace {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalFdMetadataKind {
+    Directory,
+    RegularFile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalFdMetadata {
+    pub(crate) kind: LocalFdMetadataKind,
+    pub(crate) size_bytes: u64,
+}
+
+pub(crate) fn local_fd_metadata(fd: &dyn FdOps) -> Option<LocalFdMetadata> {
+    if fd.as_any().downcast_ref::<LocalDirFd>().is_some() {
+        return Some(LocalFdMetadata {
+            kind: LocalFdMetadataKind::Directory,
+            size_bytes: 4096,
+        });
+    }
+    fd.as_any()
+        .downcast_ref::<LocalFileFd>()
+        .map(LocalFileFd::metadata)
+}
+
 pub(crate) fn run_tmpfs_smoke(namespace: &ProcessNamespace) -> Result<(), zx_status_t> {
     let tmp = namespace.open(
         "/tmp/bootstrap-note",
@@ -349,6 +373,17 @@ impl LocalFileFd {
         match &self.backing {
             LocalFileBacking::ReadOnly(file) => file.bytes.unwrap_or(&[]).to_vec(),
             LocalFileBacking::Mutable(file) => file.bytes.lock().clone(),
+        }
+    }
+
+    fn metadata(&self) -> LocalFdMetadata {
+        let size_bytes = match &self.backing {
+            LocalFileBacking::ReadOnly(file) => file.bytes.unwrap_or(&[]).len() as u64,
+            LocalFileBacking::Mutable(file) => file.bytes.lock().len() as u64,
+        };
+        LocalFdMetadata {
+            kind: LocalFdMetadataKind::RegularFile,
+            size_bytes,
         }
     }
 }

@@ -90,3 +90,5 @@ pub const AXLE_SYS_AX_GUEST_SESSION_CREATE: SyscallNumber = 41;
 pub const AXLE_SYS_AX_GUEST_SESSION_RESUME: SyscallNumber = 42;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY: SyscallNumber = 43;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY: SyscallNumber = 44;

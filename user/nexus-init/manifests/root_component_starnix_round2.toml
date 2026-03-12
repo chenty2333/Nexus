@@ -1,0 +1,25 @@
+url = "boot://root-starnix-round2"
+startup = "eager"
+
+[program]
+runner = "elf"
+binary = "bin/nexus-init"
+args = ["nexus-init"]
+env = []
+
+[[use]]
+kind = "resolver"
+name = "boot-resolver"
+
+[[use]]
+kind = "runner"
+name = "elf"
+
+[[use]]
+kind = "runner"
+name = "starnix"
+
+[[children]]
+name = "linux_round2_smoke"
+url = "boot://linux-round2-smoke"
+startup = "eager"

@@ -8,18 +8,26 @@ fn main() {
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let manifests_dir = manifest_dir.join("manifests");
     let linux_hello_source = manifest_dir.join("../linux-hello/hello.S");
+    let linux_fd_smoke_source = manifest_dir.join("../linux-fd-smoke/fd_smoke.S");
+    let linux_round2_source = manifest_dir.join("../linux-round2-smoke/round2_smoke.S");
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
     println!("cargo:rerun-if-changed={}", linux_hello_source.display());
+    println!("cargo:rerun-if-changed={}", linux_fd_smoke_source.display());
+    println!("cargo:rerun-if-changed={}", linux_round2_source.display());
     for manifest in [
         "root_component.toml",
         "root_component_round3.toml",
         "root_component_starnix.toml",
+        "root_component_starnix_fd.toml",
+        "root_component_starnix_round2.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
         "linux_hello.toml",
+        "linux_fd_smoke.toml",
+        "linux_round2_smoke.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -32,10 +40,20 @@ fn main() {
         ("root_component.toml", "root_component.nxcd"),
         ("root_component_round3.toml", "root_component_round3.nxcd"),
         ("root_component_starnix.toml", "root_component_starnix.nxcd"),
+        (
+            "root_component_starnix_fd.toml",
+            "root_component_starnix_fd.nxcd",
+        ),
+        (
+            "root_component_starnix_round2.toml",
+            "root_component_starnix_round2.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
         ("linux_hello.toml", "linux_hello.nxcd"),
+        ("linux_fd_smoke.toml", "linux_fd_smoke.nxcd"),
+        ("linux_round2_smoke.toml", "linux_round2_smoke.nxcd"),
     ] {
         let source_path = manifests_dir.join(input);
         let source = fs::read_to_string(&source_path)
@@ -47,6 +65,8 @@ fn main() {
     }
 
     build_linux_hello(&linux_hello_source, &out_dir);
+    build_linux_binary(&linux_fd_smoke_source, &out_dir.join("linux-fd-smoke"));
+    build_linux_binary(&linux_round2_source, &out_dir.join("linux-round2-smoke"));
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
         // Link the bootstrap userspace binary at the fixed VA currently
@@ -61,7 +81,10 @@ fn main() {
 }
 
 fn build_linux_hello(source: &Path, out_dir: &Path) {
-    let output = out_dir.join("linux-hello");
+    build_linux_binary(source, &out_dir.join("linux-hello"));
+}
+
+fn build_linux_binary(source: &Path, output: &Path) {
     let clang = std::env::var("CLANG").unwrap_or_else(|_| String::from("clang"));
     let status = Command::new(&clang)
         .arg("--target=x86_64-unknown-linux-gnu")
@@ -75,7 +98,7 @@ fn build_linux_hello(source: &Path, out_dir: &Path) {
         .arg("-Wl,--build-id=none")
         .arg("-Wl,--image-base=0x100000000")
         .arg("-o")
-        .arg(&output)
+        .arg(output)
         .arg(source)
         .status()
         .unwrap_or_else(|err| panic!("spawn {clang}: {err}"));

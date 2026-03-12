@@ -40,14 +40,15 @@ use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::status::{ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NO_MEMORY};
 use axle_types::syscall_numbers::{
     AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
-    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
-    AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ,
-    AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
-    AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
-    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START,
-    AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE, AXLE_SYS_TASK_KILL,
-    AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE,
-    AXLE_SYS_TIMER_SET, AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_READ, AXLE_SYS_VMO_WRITE,
+    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
+    AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
+    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_HANDLE_CLOSE,
+    AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
+    AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE,
+    AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE,
+    AXLE_SYS_TASK_KILL, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL,
+    AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_READ,
+    AXLE_SYS_VMO_WRITE,
 };
 
 /// Infinite deadline used by blocking wait syscalls.
@@ -653,6 +654,29 @@ pub fn ax_guest_session_read_memory(
                 ptr::null_mut::<u8>() as u64
             } else {
                 buffer.as_mut_ptr() as u64
+            },
+            buffer.len() as u64,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Copy kernel-owned bytes into one supervised guest session's userspace memory.
+pub fn ax_guest_session_write_memory(
+    session: zx_handle_t,
+    guest_addr: u64,
+    buffer: &[u8],
+) -> zx_status_t {
+    int80_call(
+        AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY as u64,
+        [
+            session as u64,
+            guest_addr,
+            if buffer.is_empty() {
+                ptr::null::<u8>() as u64
+            } else {
+                buffer.as_ptr() as u64
             },
             buffer.len() as u64,
             0,

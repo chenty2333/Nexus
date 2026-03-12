@@ -524,3 +524,15 @@ args = [
   { name = "buffer", ty = "*mut u8" },
   { name = "len", ty = "usize" },
 ]
+
+[[syscall]]
+name = "ax_guest_session_write_memory"
+nr = 44
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "session", ty = "zx_handle_t" },
+  { name = "guest_addr", ty = "u64" },
+  { name = "buffer", ty = "*const u8" },
+  { name = "len", ty = "usize" },
+]

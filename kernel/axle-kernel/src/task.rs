@@ -4063,6 +4063,50 @@ impl Kernel {
         Ok(out)
     }
 
+    pub(crate) fn write_thread_user_bytes(
+        &mut self,
+        thread_id: ThreadId,
+        ptr: u64,
+        bytes: &[u8],
+    ) -> Result<(), zx_status_t> {
+        let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let process = self
+            .processes
+            .get(&thread.process_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let len = bytes.len();
+        if len == 0 {
+            return Ok(());
+        }
+        if !self.with_vm(|vm| vm.validate_user_ptr(process.address_space_id, ptr, len)) {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        let page_bytes = crate::userspace::USER_PAGE_BYTES as usize;
+        let mut written = 0usize;
+        while written < len {
+            let dst_addr = ptr.checked_add(written as u64).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let page_base = dst_addr - (dst_addr % crate::userspace::USER_PAGE_BYTES);
+            self.with_vm_mut(|vm| {
+                vm.ensure_user_page_resident(process.address_space_id, page_base, true)
+            })?;
+            let lookup = self
+                .with_vm(|vm| vm.lookup_user_mapping(process.address_space_id, page_base, 1))
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            let frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
+            let page_offset =
+                usize::try_from(dst_addr - page_base).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+            let chunk_len = core::cmp::min(page_bytes - page_offset, len - written);
+            crate::copy::write_bootstrap_frame_bytes(
+                frame_id.raw(),
+                page_offset,
+                &bytes[written..written + chunk_len],
+            )?;
+            written += chunk_len;
+        }
+        Ok(())
+    }
+
     pub(crate) fn copyout_thread_user<T: Copy>(
         &self,
         thread_id: ThreadId,

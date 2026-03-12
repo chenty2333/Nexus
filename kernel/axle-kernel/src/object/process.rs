@@ -778,8 +778,13 @@ fn reap_terminated_task_objects(state: &KernelState) -> Result<(), zx_status_t> 
                 let _ = objects.remove(object_id);
                 Ok(())
             })?;
-            let _ = state.with_kernel_mut(|kernel| kernel.reap_thread(thread_id))?;
-            maybe_reap_process_record(state, process_id)?;
+            // Lifecycle sync runs opportunistically on multiple CPUs, so another CPU may have
+            // already reaped the kernel thread record after we built this zero-handle snapshot.
+            match state.with_kernel_mut(|kernel| kernel.reap_thread(thread_id)) {
+                Ok(reaped_process_id) => maybe_reap_process_record(state, reaped_process_id)?,
+                Err(ZX_ERR_BAD_HANDLE) => maybe_reap_process_record(state, process_id)?,
+                Err(status) => return Err(status),
+            }
         }
 
         for (object_id, process_id) in process_reaps {

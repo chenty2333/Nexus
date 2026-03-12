@@ -81,6 +81,21 @@ Main just targets include:
   - a brand-new child thread must not be opportunistically migrated to an unrelated idle AP before
     its first runnable handoff has respected its preferred / creator CPU
   - the scenario explicitly forbids a kernel `#GP` during that launch path
+- The first Round-2 Starnix fd scenario now extends that same bootstrap path with one narrow
+  Linux-fd slice:
+  - `read` / `write` / `close`
+  - `pipe2`
+  - `socketpair(AF_UNIX, SOCK_STREAM)`
+  - the guest path relies on the generic guest-session memory read/write helpers rather than on a
+    Linux-specific kernel syscall mode
+- The comprehensive Round-2 Starnix bootstrap scenario now closes the intended single-process
+  task/mm/fs/socket loop:
+  - `openat` / `fstat` / `newfstatat` / `getdents64`
+  - `brk`
+  - anonymous `mmap` / `mprotect` / `munmap`
+  - read-only file-backed `mmap` through `FdOps::as_vmo()` / `GetVmo`
+  - the supervisor keeps one Linux-side `LinuxMm` / map-tree control plane while continuing to
+    rely on Axle VMAR/VMO syscalls for the real mapping work
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

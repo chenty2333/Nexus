@@ -17,19 +17,19 @@ use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
 use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_OUT_OF_RANGE, ZX_OK};
 use axle_types::syscall_numbers::{
     AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
-    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
-    AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ,
-    AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER,
-    AXLE_SYS_FUTEX_REQUEUE, AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE,
-    AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL,
-    AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
-    AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE,
-    AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE,
-    AXLE_SYS_TASK_KILL, AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START,
-    AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE,
-    AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
-    AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE,
-    SyscallNumber,
+    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
+    AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
+    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
+    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER, AXLE_SYS_FUTEX_REQUEUE,
+    AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
+    AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER,
+    AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
+    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START,
+    AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE, AXLE_SYS_TASK_KILL,
+    AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL,
+    AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_DESTROY,
+    AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE,
+    AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE, SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -40,7 +40,7 @@ use axle_types::{
 };
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 44] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 45] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -85,6 +85,7 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 44] = [
     AXLE_SYS_AX_GUEST_SESSION_CREATE,
     AXLE_SYS_AX_GUEST_SESSION_RESUME,
     AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
+    AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -2371,6 +2372,47 @@ typed_syscall!(
 const AX_GUEST_SESSION_READ_MEMORY_DISPATCH: SyscallDispatch =
     SyscallDispatch::new(ax_guest_session_read_memory_entry);
 
+#[derive(Debug)]
+struct GuestSessionWriteMemoryRequest {
+    session: zx_handle_t,
+    guest_addr: u64,
+    bytes: Vec<u8>,
+}
+
+fn decode_ax_guest_session_write_memory(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<GuestSessionWriteMemoryRequest, NoWriteback>, zx_status_t> {
+    let len = ctx.arg_usize_or(args, 3, ZX_ERR_OUT_OF_RANGE)?;
+    Ok(DecodedSyscall::new(
+        GuestSessionWriteMemoryRequest {
+            session: ctx.arg_handle(args, 0)?,
+            guest_addr: args[1],
+            bytes: decode_input_bytes(ctx.arg_const_ptr::<u8>(args, 2), len)?,
+        },
+        NoWriteback,
+    ))
+}
+
+fn run_ax_guest_session_write_memory(
+    req: GuestSessionWriteMemoryRequest,
+) -> Result<(), zx_status_t> {
+    crate::object::guest::write_guest_memory(req.session, req.guest_addr, &req.bytes)
+}
+
+typed_syscall!(
+    AX_GUEST_SESSION_WRITE_MEMORY_TYPED,
+    ax_guest_session_write_memory_entry,
+    GuestSessionWriteMemoryRequest,
+    NoWriteback,
+    (),
+    decode_ax_guest_session_write_memory,
+    run_ax_guest_session_write_memory,
+    writeback_noop
+);
+const AX_GUEST_SESSION_WRITE_MEMORY_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_guest_session_write_memory_entry);
+
 fn decode_task_kill(
     ctx: &mut SyscallCtx,
     args: [u64; 6],
@@ -2464,6 +2506,7 @@ fn syscall_dispatch(nr: SyscallNumber) -> Option<&'static SyscallDispatch> {
         AXLE_SYS_AX_GUEST_SESSION_CREATE => Some(&AX_GUEST_SESSION_CREATE_DISPATCH),
         AXLE_SYS_AX_GUEST_SESSION_RESUME => Some(&AX_GUEST_SESSION_RESUME_DISPATCH),
         AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY => Some(&AX_GUEST_SESSION_READ_MEMORY_DISPATCH),
+        AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY => Some(&AX_GUEST_SESSION_WRITE_MEMORY_DISPATCH),
         AXLE_SYS_TASK_KILL => Some(&TASK_KILL_DISPATCH),
         AXLE_SYS_TASK_SUSPEND => Some(&TASK_SUSPEND_DISPATCH),
         _ => None,

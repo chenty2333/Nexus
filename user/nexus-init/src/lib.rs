@@ -101,13 +101,27 @@ const ROOT_DECL_ROUND3_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/root_component_round3.nxcd"));
 const ROOT_DECL_STARNIX_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/root_component_starnix.nxcd"));
+const ROOT_DECL_STARNIX_FD_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/root_component_starnix_fd.nxcd"));
+const ROOT_DECL_STARNIX_ROUND2_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_round2.nxcd"
+));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/controller_worker.nxcd"));
 const LINUX_HELLO_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linux_hello.nxcd"));
+const LINUX_FD_SMOKE_DECL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux_fd_smoke.nxcd"));
+pub(crate) const LINUX_ROUND2_DECL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux_round2_smoke.nxcd"));
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
+pub(crate) const LINUX_FD_SMOKE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-fd-smoke"));
+pub(crate) const LINUX_ROUND2_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-round2-smoke"));
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
@@ -119,6 +133,8 @@ pub(crate) const CLIENT_BINARY_PATH: &str = "bin/echo-client";
 pub(crate) const CONTROLLER_WORKER_BINARY_PATH: &str = "bin/controller-worker";
 pub(crate) const STARNIX_KERNEL_BINARY_PATH: &str = "bin/starnix-kernel";
 pub(crate) const LINUX_HELLO_BINARY_PATH: &str = "bin/linux-hello";
+pub(crate) const LINUX_FD_SMOKE_BINARY_PATH: &str = "bin/linux-fd-smoke";
+pub(crate) const LINUX_ROUND2_BINARY_PATH: &str = "bin/linux-round2-smoke";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -135,6 +151,8 @@ pub(crate) const MAX_BOOTSTRAP_MESSAGE_HANDLES: usize = 8;
 pub(crate) const MAX_SMALL_CHANNEL_BYTES: usize = 128;
 pub(crate) const MAX_SMALL_CHANNEL_HANDLES: usize = 1;
 const STARNIX_HELLO_EXPECTED_STDOUT: &[u8] = b"hello from linux-hello\n";
+const STARNIX_FD_SMOKE_EXPECTED_STDOUT: &[u8] = b"pipe\nsock\n";
+const STARNIX_ROUND2_EXPECTED_STDOUT: &[u8] = b"round2 ok\n";
 
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
@@ -324,6 +342,14 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         LINUX_HELLO_BYTES,
     ));
     assets.push(BootAssetEntry::bytes(
+        LINUX_FD_SMOKE_BINARY_PATH,
+        LINUX_FD_SMOKE_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_ROUND2_BINARY_PATH,
+        LINUX_ROUND2_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
         "manifests/root.nxcd",
         ROOT_DECL_EAGER_BYTES,
     ));
@@ -336,8 +362,24 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         ROOT_DECL_STARNIX_BYTES,
     ));
     assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-fd.nxcd",
+        ROOT_DECL_STARNIX_FD_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-round2.nxcd",
+        ROOT_DECL_STARNIX_ROUND2_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
         "manifests/linux-hello.nxcd",
         LINUX_HELLO_DECL_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/linux-fd-smoke.nxcd",
+        LINUX_FD_SMOKE_DECL_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/linux-round2-smoke.nxcd",
+        LINUX_ROUND2_DECL_BYTES,
     ));
     assets.push(BootAssetEntry::bytes(
         "manifests/echo-provider.nxcd",
@@ -442,93 +484,34 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
     };
 
     if root.decl.url == "boot://root-starnix" {
-        let (linux_hello, _startup) = match resolve_root_child(&root, &resolvers, "linux_hello") {
-            Ok(component) => {
-                summary.resolve_provider = ZX_OK as i64;
-                write_summary(summary);
-                component
-            }
-            Err(status) => {
-                summary.failure_step = STEP_RESOLVE_PROVIDER;
-                summary.resolve_provider = status as i64;
-                return 1;
-            }
-        };
-        let running = match runners.launch(
-            &root.decl,
-            &linux_hello,
-            Vec::new(),
-            None,
-            CHILD_MARKER_STARNIX_KERNEL,
-        ) {
-            Ok(running) => {
-                summary.provider_launch = ZX_OK as i64;
-                write_summary(summary);
-                running
-            }
-            Err(status) => {
-                summary.failure_step = STEP_PROVIDER_LAUNCH;
-                summary.provider_launch = status as i64;
-                return 1;
-            }
-        };
-        let return_code = match read_controller_event_blocking(running.controller, ZX_TIME_INFINITE)
-        {
-            Ok(return_code) => {
-                summary.provider_event_read = ZX_OK as i64;
-                summary.provider_event_code = return_code;
-                return_code
-            }
-            Err(status) => {
-                summary.failure_step = STEP_PROVIDER_EVENT;
-                summary.provider_event_read = status as i64;
-                let _ = zx_handle_close(running.status);
-                let _ = zx_handle_close(running.controller);
-                if let Some(stdout) = running.stdout {
-                    let _ = zx_handle_close(stdout);
-                }
-                return 1;
-            }
-        };
-        let stdout = match running.stdout {
-            Some(stdout) => stdout,
-            None => {
-                summary.failure_step = STEP_STARNIX_STDOUT;
-                let _ = zx_handle_close(running.status);
-                let _ = zx_handle_close(running.controller);
-                return 1;
-            }
-        };
-        match read_socket_to_end(stdout) {
-            Ok(bytes) => {
-                if return_code != 0 {
-                    summary.failure_step = STEP_PROVIDER_EVENT;
-                    let _ = zx_handle_close(stdout);
-                    let _ = zx_handle_close(running.status);
-                    let _ = zx_handle_close(running.controller);
-                    return 1;
-                }
-                if bytes != STARNIX_HELLO_EXPECTED_STDOUT {
-                    summary.failure_step = STEP_STARNIX_STDOUT;
-                    let _ = zx_handle_close(stdout);
-                    let _ = zx_handle_close(running.status);
-                    let _ = zx_handle_close(running.controller);
-                    return 1;
-                }
-            }
-            Err(status) => {
-                summary.failure_step = STEP_STARNIX_STDOUT;
-                summary.client_route = status as i64;
-                let _ = zx_handle_close(stdout);
-                let _ = zx_handle_close(running.status);
-                let _ = zx_handle_close(running.controller);
-                return 1;
-            }
-        }
-        let _ = zx_handle_close(stdout);
-        let _ = zx_handle_close(running.status);
-        let _ = zx_handle_close(running.controller);
-        return 0;
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_hello",
+            STARNIX_HELLO_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-fd" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_fd_smoke",
+            STARNIX_FD_SMOKE_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-round2" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_round2_smoke",
+            STARNIX_ROUND2_EXPECTED_STDOUT,
+            summary,
+        );
     }
 
     let (provider, provider_startup) = match resolve_root_child(&root, &resolvers, "echo_provider")
@@ -952,6 +935,102 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         }
     }
 
+    0
+}
+
+fn run_starnix_root_child(
+    root: &ResolvedComponent,
+    resolvers: &ResolverRegistry,
+    runners: &RunnerRegistry,
+    child_name: &str,
+    expected_stdout: &[u8],
+    summary: &mut ComponentSummary,
+) -> i32 {
+    let (child, _startup) = match resolve_root_child(root, resolvers, child_name) {
+        Ok(component) => {
+            summary.resolve_provider = ZX_OK as i64;
+            write_summary(summary);
+            component
+        }
+        Err(status) => {
+            summary.failure_step = STEP_RESOLVE_PROVIDER;
+            summary.resolve_provider = status as i64;
+            return 1;
+        }
+    };
+    let running = match runners.launch(
+        &root.decl,
+        &child,
+        Vec::new(),
+        None,
+        CHILD_MARKER_STARNIX_KERNEL,
+    ) {
+        Ok(running) => {
+            summary.provider_launch = ZX_OK as i64;
+            write_summary(summary);
+            running
+        }
+        Err(status) => {
+            summary.failure_step = STEP_PROVIDER_LAUNCH;
+            summary.provider_launch = status as i64;
+            return 1;
+        }
+    };
+    let return_code = match read_controller_event_blocking(running.controller, ZX_TIME_INFINITE) {
+        Ok(return_code) => {
+            summary.provider_event_read = ZX_OK as i64;
+            summary.provider_event_code = return_code;
+            return_code
+        }
+        Err(status) => {
+            summary.failure_step = STEP_PROVIDER_EVENT;
+            summary.provider_event_read = status as i64;
+            let _ = zx_handle_close(running.status);
+            let _ = zx_handle_close(running.controller);
+            if let Some(stdout) = running.stdout {
+                let _ = zx_handle_close(stdout);
+            }
+            return 1;
+        }
+    };
+    let stdout = match running.stdout {
+        Some(stdout) => stdout,
+        None => {
+            summary.failure_step = STEP_STARNIX_STDOUT;
+            let _ = zx_handle_close(running.status);
+            let _ = zx_handle_close(running.controller);
+            return 1;
+        }
+    };
+    match read_socket_to_end(stdout) {
+        Ok(bytes) => {
+            if return_code != 0 {
+                summary.failure_step = STEP_PROVIDER_EVENT;
+                let _ = zx_handle_close(stdout);
+                let _ = zx_handle_close(running.status);
+                let _ = zx_handle_close(running.controller);
+                return 1;
+            }
+            if bytes != expected_stdout {
+                summary.failure_step = STEP_STARNIX_STDOUT;
+                let _ = zx_handle_close(stdout);
+                let _ = zx_handle_close(running.status);
+                let _ = zx_handle_close(running.controller);
+                return 1;
+            }
+        }
+        Err(status) => {
+            summary.failure_step = STEP_STARNIX_STDOUT;
+            summary.client_route = status as i64;
+            let _ = zx_handle_close(stdout);
+            let _ = zx_handle_close(running.status);
+            let _ = zx_handle_close(running.controller);
+            return 1;
+        }
+    }
+    let _ = zx_handle_close(stdout);
+    let _ = zx_handle_close(running.status);
+    let _ = zx_handle_close(running.controller);
     0
 }
 
