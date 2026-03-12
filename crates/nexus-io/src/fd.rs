@@ -12,6 +12,7 @@ use axle_types::status::{
 };
 use axle_types::{zx_handle_t, zx_signals_t, zx_status_t};
 use bitflags::bitflags;
+use core::any::Any;
 use core::fmt;
 use core::sync::atomic::{AtomicU32, Ordering};
 use libzircon::{
@@ -19,9 +20,9 @@ use libzircon::{
     zx_socket_write,
 };
 use nexus_fs_proto::{
-    CloneRequest, CloseRequest, CodecError, DescribeResponse, GetVmoRequest, GetVmoResponse,
-    NodeDescriptor, NodeKind, ObjectIdentity, OpenRequest, ReadRequest, ReadResponse, WriteRequest,
-    WriteResponse,
+    CloneRequest, CloseRequest, CodecError, DescribeResponse, DirEntryRecord, GetVmoRequest,
+    GetVmoResponse, NodeDescriptor, NodeKind, ObjectIdentity, OpenRequest, ReadDirRequest,
+    ReadDirResponse, ReadRequest, ReadResponse, WriteRequest, WriteResponse,
 };
 
 /// POSIX-shaped file descriptor number.
@@ -132,7 +133,10 @@ pub enum DirectoryEntryKind {
 }
 
 /// fd-shaped operations for one open file description.
-pub trait FdOps: Send + Sync {
+pub trait FdOps: Any + Send + Sync {
+    /// Type-erased view used for same-filesystem coordination operations.
+    fn as_any(&self) -> &dyn Any;
+
     /// Read bytes into `buffer`, returning the number of bytes read.
     fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t>;
 
@@ -160,9 +164,42 @@ pub trait FdOps: Send + Sync {
         Err(ZX_ERR_NOT_SUPPORTED)
     }
 
+    /// Enumerate child entries when this object behaves like a directory.
+    fn readdir(&self) -> Result<Vec<DirectoryEntry>, zx_status_t> {
+        Err(ZX_ERR_NOT_DIR)
+    }
+
     /// Open one relative path beneath this object when it behaves like a directory.
     fn openat(&self, path: &str, flags: OpenFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
         let _ = (path, flags);
+        Err(ZX_ERR_NOT_DIR)
+    }
+
+    /// Remove one relative path beneath this directory.
+    fn unlinkat(&self, path: &str) -> Result<(), zx_status_t> {
+        let _ = path;
+        Err(ZX_ERR_NOT_DIR)
+    }
+
+    /// Create one additional hard link beneath `target_dir`.
+    fn linkat(
+        &self,
+        src_path: &str,
+        target_dir: &dyn FdOps,
+        target_path: &str,
+    ) -> Result<(), zx_status_t> {
+        let _ = (src_path, target_dir, target_path);
+        Err(ZX_ERR_NOT_DIR)
+    }
+
+    /// Rename one relative path beneath this directory into `target_dir`.
+    fn renameat(
+        &self,
+        src_path: &str,
+        target_dir: &dyn FdOps,
+        target_path: &str,
+    ) -> Result<(), zx_status_t> {
+        let _ = (src_path, target_dir, target_path);
         Err(ZX_ERR_NOT_DIR)
     }
 }
@@ -362,6 +399,70 @@ impl FdTable {
             .as_vmo(flags)
     }
 
+    /// Read one full directory listing from `fd`.
+    pub fn readdir(&self, fd: RawFd) -> Result<Vec<DirectoryEntry>, zx_status_t> {
+        self.get(fd)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .description()
+            .ops()
+            .readdir()
+    }
+
+    /// Remove one relative path beneath directory `fd`.
+    pub fn unlinkat(&self, fd: RawFd, path: &str) -> Result<(), zx_status_t> {
+        self.get(fd)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .description()
+            .ops()
+            .unlinkat(path)
+    }
+
+    /// Rename one relative path from `src_fd` into `dst_fd`.
+    pub fn renameat(
+        &self,
+        src_fd: RawFd,
+        src_path: &str,
+        dst_fd: RawFd,
+        dst_path: &str,
+    ) -> Result<(), zx_status_t> {
+        let src = Arc::clone(
+            self.get(src_fd)
+                .ok_or(ZX_ERR_BAD_HANDLE)?
+                .description()
+                .ops(),
+        );
+        let dst = Arc::clone(
+            self.get(dst_fd)
+                .ok_or(ZX_ERR_BAD_HANDLE)?
+                .description()
+                .ops(),
+        );
+        src.renameat(src_path, dst.as_ref(), dst_path)
+    }
+
+    /// Create one additional hard link from `src_fd/src_path` into `dst_fd/dst_path`.
+    pub fn linkat(
+        &self,
+        src_fd: RawFd,
+        src_path: &str,
+        dst_fd: RawFd,
+        dst_path: &str,
+    ) -> Result<(), zx_status_t> {
+        let src = Arc::clone(
+            self.get(src_fd)
+                .ok_or(ZX_ERR_BAD_HANDLE)?
+                .description()
+                .ops(),
+        );
+        let dst = Arc::clone(
+            self.get(dst_fd)
+                .ok_or(ZX_ERR_BAD_HANDLE)?
+                .description()
+                .ops(),
+        );
+        src.linkat(src_path, dst.as_ref(), dst_path)
+    }
+
     /// Duplicate one fd so both entries reference the same open description.
     pub fn duplicate(&mut self, fd: RawFd, new_flags: FdFlags) -> Result<RawFd, zx_status_t> {
         let entry = self.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?.clone();
@@ -481,6 +582,10 @@ impl RemoteFile {
 }
 
 impl FdOps for RemoteFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
         let handle = checked_channel_handle(self.node.handle())?;
         let request = ReadRequest {
@@ -585,6 +690,10 @@ impl RemoteDir {
 }
 
 impl FdOps for RemoteDir {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
         Err(ZX_ERR_NOT_SUPPORTED)
     }
@@ -611,6 +720,26 @@ impl FdOps for RemoteDir {
 
     fn wait_interest(&self) -> Option<WaitSpec> {
         Some(self.node.wait_interest)
+    }
+
+    fn readdir(&self) -> Result<Vec<DirectoryEntry>, zx_status_t> {
+        let handle = checked_channel_handle(self.node.handle())?;
+        let request = ReadDirRequest {
+            object: self.node.descriptor.identity,
+            flags: 0,
+        };
+        write_encoded_message(handle, request.encode_channel_message())?;
+        let (bytes, handles) = read_channel_message(handle)?;
+        let response =
+            ReadDirResponse::decode_channel_message(&bytes, &handles).map_err(map_codec_error)?;
+        if response.status != ZX_OK {
+            return Err(response.status);
+        }
+        Ok(response
+            .entries
+            .into_iter()
+            .map(map_dir_entry_record)
+            .collect())
     }
 
     fn openat(&self, path: &str, flags: OpenFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
@@ -671,6 +800,10 @@ impl SocketFd {
 }
 
 impl FdOps for SocketFd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
         let handle = self.handle.get();
         if handle == ZX_HANDLE_INVALID {
@@ -737,6 +870,10 @@ impl PipeFd {
 }
 
 impl FdOps for PipeFd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
         self.inner.read(buffer)
     }
@@ -785,6 +922,10 @@ impl StdioFd {
 }
 
 impl FdOps for StdioFd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
         Err(ZX_ERR_NOT_SUPPORTED)
     }
@@ -824,6 +965,10 @@ impl PseudoNodeFd {
 }
 
 impl FdOps for PseudoNodeFd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
         Err(ZX_ERR_NOT_SUPPORTED)
     }
@@ -918,9 +1063,6 @@ fn normalize_remote_path(path: &str) -> Result<String, zx_status_t> {
     }
     let mut normalized = String::new();
     for component in path.split('/').filter(|component| !component.is_empty()) {
-        if matches!(component, "." | "..") {
-            return Err(ZX_ERR_BAD_PATH);
-        }
         if !normalized.is_empty() {
             normalized.push('/');
         }
@@ -930,6 +1072,19 @@ fn normalize_remote_path(path: &str) -> Result<String, zx_status_t> {
         return Err(ZX_ERR_BAD_PATH);
     }
     Ok(normalized)
+}
+
+fn map_dir_entry_record(entry: DirEntryRecord) -> DirectoryEntry {
+    DirectoryEntry {
+        name: entry.name,
+        kind: match entry.kind {
+            NodeKind::File => DirectoryEntryKind::File,
+            NodeKind::Directory => DirectoryEntryKind::Directory,
+            NodeKind::Service => DirectoryEntryKind::Service,
+            NodeKind::Socket => DirectoryEntryKind::Socket,
+            NodeKind::Pseudo => DirectoryEntryKind::Unknown,
+        },
+    }
 }
 
 fn write_encoded_message(
@@ -1048,6 +1203,7 @@ mod tests {
     use alloc::sync::Arc;
     use axle_types::status::{ZX_ERR_BAD_PATH, ZX_ERR_NOT_SUPPORTED};
     use axle_types::zx_status_t;
+    use core::any::Any;
     use std::sync::{Mutex, MutexGuard};
 
     #[derive(Default)]
@@ -1072,6 +1228,10 @@ mod tests {
     }
 
     impl FdOps for MockFd {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
             Err(ZX_ERR_NOT_SUPPORTED)
         }
@@ -1193,10 +1353,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_dirs_reject_dot_segments_before_touching_kernel() {
+    fn remote_dirs_preserve_dot_segments_for_server_side_path_walk() {
         let dir = RemoteDir::new(axle_types::handle::ZX_HANDLE_INVALID);
         let result = dir.openat("svc/../echo", OpenFlags::READABLE);
-        assert_eq!(result.err(), Some(ZX_ERR_BAD_PATH));
+        assert_eq!(result.err(), Some(axle_types::status::ZX_ERR_BAD_HANDLE));
     }
 
     #[allow(dead_code)]

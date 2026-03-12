@@ -218,6 +218,10 @@ depends on: C3, E2, G
 = `FdTable` already separates per-fd state from shared open-file-description state
 = `nexus-init` now uses the shared namespace path normalizer and mount registry
   shape from `nexus-io` instead of an ad-hoc path container
+= `nexus-io` now also carries:
+  - directory enumeration through `readdir`
+  - path-based link / rename / unlink hooks on directory-shaped `FdOps`
+  - one `ProcessNamespace` helper with `cwd` / logical-root path walk
 
 #### I2. namespace / VFS / pipe / socket glue `[~]`
 
@@ -231,6 +235,13 @@ depends on: C3, E2, G
   shared `FdOps` / namespace layer instead of private in-memory image tables
 = `PipeFd` and `SocketFd` already wrap current kernel socket objects, and the
   bootstrap manager now exercises them through one small smoke path
+= the bootstrap namespace path layer now has:
+  - lexical `cwd` / logical-root path walk
+  - full relative-path handling for the local `/boot` / `/pkg` / `/tmp` mounts
+  - directory enumeration for both local directories and routed remote `/svc`
+  - basic local link / rename / unlink semantics on the tmpfs-style writable tree
+  - read-only `GetVmo` for boot/package files, including byte-backed assets that
+    now synthesize cached VMOs on demand
 
 #### I3. filesystem and network services `[~]`
 
@@ -240,6 +251,8 @@ depends on: C3, E2, G
   - tiny tmpfs-style writable file service shape for runtime scratch
   - one routed `svcfs`-style directory path exercised by the component smoke
   - pipe/socket glue still stands directly on current kernel socket objects
+= package/resource-style boot assets can now participate in the same read-only
+  file / `GetVmo` path as the boot-backed ELF images
 
 depends on: F, H, E1
 

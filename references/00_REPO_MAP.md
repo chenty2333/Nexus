@@ -87,14 +87,17 @@ At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` is the only intentional `draft` b
 - `crates/libzircon` - thin `zx_*` userspace wrappers over the current Axle `int 0x80` ABI
 - `crates/nexus-component` - minimal component declaration IR, resolver result shape, bootstrap-channel start payloads, and tiny lifecycle/directory messages
 - `crates/nexus-io` - early userspace fd/namespace substrate: `FdOps`, `FdTable`,
-  `WaitSpec`, handle-backed fd wrappers, and longest-prefix `NamespaceTrie`
+  `WaitSpec`, handle-backed fd wrappers, longest-prefix `NamespaceTrie`, and
+  one `ProcessNamespace` helper for logical-root / `cwd` path walk
 - `crates/nexus-rt` - single-thread userspace dispatcher/executor built on one port, one dispatcher timer, generation-safe signal registrations, and async channel/socket helpers
 - `kernel/axle-kernel` - live kernel integration layer
 - `user/nexus-init` - extracted bootstrap `nexus-init` root manager plus shared
   manager/runtime logic reused by the minimal component smoke binaries;
   now also owns the current bootstrap `/boot` / `/pkg` / `/tmp` service tree
   and the built-in boot resolver / ELF runner glue that consumes it through
-  `nexus-io`
+  `nexus-io`; the local service tree now supports directory enumeration,
+  basic tmpfs-style link/rename/unlink, and read-only `GetVmo` for both seeded
+  boot image VMOs and byte-backed package/resource assets
 - `user/echo-provider` - dedicated bootstrap component binary for the routed
   echo protocol provider
 - `user/echo-client` - dedicated bootstrap component binary for the routed echo

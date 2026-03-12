@@ -25,7 +25,7 @@ use axle_types::status::{ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NOT_FOUND, ZX
 use axle_types::{zx_handle_t, zx_status_t};
 use libzircon::{ZX_TIME_INFINITE, zx_channel_create, zx_handle_close};
 use nexus_component::{ControllerRequest, NamespaceEntry, ResolvedComponent, StartupMode};
-use nexus_io::{FdFlags, FdOps, FdTable, NamespaceTrie, OpenFlags, RemoteDir, open_namespace_path};
+use nexus_io::{FdFlags, FdOps, FdTable, OpenFlags, ProcessNamespace, RemoteDir};
 
 use crate::fs::{
     proxy_directory_requests_until_peer_closed, read_directory_request_for_launch,
@@ -872,18 +872,18 @@ fn run_echo_client(start_info: &lifecycle::MinimalStartInfo) -> i32 {
         Err(_) => return 12,
     };
 
-    let mut namespace = NamespaceTrie::<Arc<dyn FdOps>>::new();
+    let mut mounts = nexus_io::NamespaceTrie::<Arc<dyn FdOps>>::new();
     let svc_mount = match fd_table.get(svc_fd) {
         Some(entry) => Arc::clone(entry.description().ops()),
         None => return 14,
     };
-    if namespace.insert(SVC_NAMESPACE_PATH, svc_mount).is_err() {
+    if mounts.insert(SVC_NAMESPACE_PATH, svc_mount).is_err() {
         return 15;
     }
+    let namespace = ProcessNamespace::new(mounts);
     record_child_stage(CHILD_MARKER_CLIENT, 5, ZX_OK);
 
-    let echo = match open_namespace_path(
-        &namespace,
+    let echo = match namespace.open(
         "/svc/nexus.echo.Echo",
         OpenFlags::READABLE | OpenFlags::WRITABLE,
     ) {

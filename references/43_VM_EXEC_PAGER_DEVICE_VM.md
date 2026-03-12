@@ -68,6 +68,11 @@ Current state:
   - embedded bytes
   - QEMU loader-provided blobs
 - Global VMO state can materialize pager-backed pages on fault.
+- The bootstrap userspace service tree can now hand out read-only `GetVmo`
+  handles for boot/package files:
+  - seeded boot-loaded ELF images reuse the imported pager-backed code VMOs
+  - byte-backed assets such as compiled manifests synthesize one cached VMO on
+    first request and duplicate that handle for later callers
 
 What is not complete yet:
 

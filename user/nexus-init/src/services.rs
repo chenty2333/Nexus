@@ -1,21 +1,25 @@
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::any::Any;
 
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::rights::ZX_RIGHT_SAME_RIGHTS;
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_PATH,
     ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_IO_DATA_INTEGRITY,
-    ZX_ERR_NOT_DIR, ZX_ERR_NOT_FILE, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED, ZX_OK,
+    ZX_ERR_NOT_DIR, ZX_ERR_NOT_EMPTY, ZX_ERR_NOT_FILE, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
+    ZX_OK,
 };
-use axle_types::syscall_numbers::AXLE_SYS_HANDLE_DUPLICATE;
+use axle_types::syscall_numbers::{
+    AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_WRITE,
+};
 use axle_types::{zx_handle_t, zx_rights_t, zx_status_t};
-use libzircon::zx_socket_create;
+use libzircon::{zx_handle_close, zx_socket_create};
 use nexus_io::{
-    FdFlags, FdOps, FdTable, NamespaceTrie, OpenFlags, PipeFd, SeekOrigin, SocketFd, VmoFlags,
-    open_namespace_path,
+    DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFlags, PipeFd,
+    ProcessNamespace, SeekOrigin, SocketFd, VmoFlags,
 };
 use spin::Mutex;
 
@@ -45,20 +49,20 @@ impl BootAssetEntry {
 
 pub(crate) struct BootstrapNamespace {
     boot_root: Arc<dyn FdOps>,
-    namespace: NamespaceTrie<Arc<dyn FdOps>>,
+    namespace: ProcessNamespace,
 }
 
 impl BootstrapNamespace {
     pub(crate) fn build(boot_assets: &[BootAssetEntry]) -> Result<Self, zx_status_t> {
         let boot_root = build_boot_root(boot_assets)?;
         let tmp_root = new_tmp_root();
-        let mut namespace = NamespaceTrie::<Arc<dyn FdOps>>::new();
+        let mut namespace = nexus_io::NamespaceTrie::<Arc<dyn FdOps>>::new();
         namespace.insert("/boot", Arc::clone(&boot_root))?;
         namespace.insert("/pkg", Arc::clone(&boot_root))?;
         namespace.insert("/tmp", tmp_root)?;
         Ok(Self {
             boot_root,
-            namespace,
+            namespace: ProcessNamespace::new(namespace),
         })
     }
 
@@ -66,16 +70,13 @@ impl BootstrapNamespace {
         Arc::clone(&self.boot_root)
     }
 
-    pub(crate) fn namespace(&self) -> &NamespaceTrie<Arc<dyn FdOps>> {
+    pub(crate) fn namespace(&self) -> &ProcessNamespace {
         &self.namespace
     }
 }
 
-pub(crate) fn run_tmpfs_smoke(
-    namespace: &NamespaceTrie<Arc<dyn FdOps>>,
-) -> Result<(), zx_status_t> {
-    let tmp = open_namespace_path(
-        namespace,
+pub(crate) fn run_tmpfs_smoke(namespace: &ProcessNamespace) -> Result<(), zx_status_t> {
+    let tmp = namespace.open(
         "/tmp/bootstrap-note",
         OpenFlags::READABLE | OpenFlags::WRITABLE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
     )?;
@@ -152,7 +153,7 @@ fn insert_boot_asset(
     root: &Arc<LocalDirectoryNode>,
     entry: &BootAssetEntry,
 ) -> Result<(), zx_status_t> {
-    let components = split_local_path(entry.path)?;
+    let components = split_boot_asset_path(entry.path)?;
     let (leaf_name, parents) = components.split_last().ok_or(ZX_ERR_BAD_PATH)?;
     let mut directory = Arc::clone(root);
     for component in parents {
@@ -176,6 +177,10 @@ impl LocalDirFd {
 }
 
 impl FdOps for LocalDirFd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
         Err(ZX_ERR_NOT_FILE)
     }
@@ -200,8 +205,12 @@ impl FdOps for LocalDirFd {
         None
     }
 
+    fn readdir(&self) -> Result<Vec<DirectoryEntry>, zx_status_t> {
+        Ok(self.node.list_entries())
+    }
+
     fn openat(&self, path: &str, flags: OpenFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
-        let components = split_local_path(path)?;
+        let components = split_local_walk_path(path, true)?;
         if components.is_empty() {
             return self.clone_fd(FdFlags::empty());
         }
@@ -209,33 +218,114 @@ impl FdOps for LocalDirFd {
         let mut directory = Arc::clone(&self.node);
         for (index, component) in components.iter().enumerate() {
             let last = index + 1 == components.len();
-            if last {
-                if let Some(existing) = directory.child(component) {
-                    if flags.contains(OpenFlags::TRUNCATE) {
-                        truncate_local_node(&existing)?;
+            match component {
+                LocalWalkComponent::Current => {
+                    if last {
+                        return Ok(Arc::new(Self::new(directory)));
                     }
-                    return wrap_local_node(existing);
                 }
-                if directory.read_only || !flags.contains(OpenFlags::CREATE) {
-                    return Err(ZX_ERR_NOT_FOUND);
+                LocalWalkComponent::Parent => {
+                    directory = directory.parent_or_self();
+                    if last {
+                        return Ok(Arc::new(Self::new(directory)));
+                    }
                 }
-                if flags.contains(OpenFlags::DIRECTORY) {
-                    return Err(ZX_ERR_NOT_SUPPORTED);
+                LocalWalkComponent::Name(component) if last => {
+                    if let Some(existing) = directory.child(component) {
+                        if flags.contains(OpenFlags::DIRECTORY)
+                            && !matches!(existing.as_ref(), LocalNode::Directory(_))
+                        {
+                            return Err(ZX_ERR_NOT_DIR);
+                        }
+                        if flags.contains(OpenFlags::TRUNCATE) {
+                            truncate_local_node(&existing)?;
+                        }
+                        return wrap_local_node(existing);
+                    }
+                    if directory.read_only || !flags.contains(OpenFlags::CREATE) {
+                        return Err(ZX_ERR_NOT_FOUND);
+                    }
+                    if flags.contains(OpenFlags::DIRECTORY) {
+                        return Err(ZX_ERR_NOT_SUPPORTED);
+                    }
+                    let created = Arc::new(LocalNode::MutableFile(Arc::new(
+                        LocalMutableFileNode::default(),
+                    )));
+                    directory.insert_child(component, Arc::clone(&created))?;
+                    return wrap_local_node(created);
                 }
-                let created = Arc::new(LocalNode::MutableFile(Arc::new(
-                    LocalMutableFileNode::default(),
-                )));
-                directory.insert_child(component, Arc::clone(&created))?;
-                return wrap_local_node(created);
+                LocalWalkComponent::Name(component) => {
+                    let Some(child) = directory.child(component) else {
+                        return Err(ZX_ERR_NOT_FOUND);
+                    };
+                    directory = child.directory_node()?;
+                }
             }
-
-            let Some(child) = directory.child(component) else {
-                return Err(ZX_ERR_NOT_FOUND);
-            };
-            directory = child.directory_node()?;
         }
 
         Err(ZX_ERR_INTERNAL)
+    }
+
+    fn unlinkat(&self, path: &str) -> Result<(), zx_status_t> {
+        let (parent, leaf) = resolve_local_parent_and_leaf(&self.node, path)?;
+        if parent.read_only {
+            return Err(ZX_ERR_ACCESS_DENIED);
+        }
+        let removed = parent.remove_child(leaf)?;
+        if let LocalNode::Directory(directory) = removed.as_ref()
+            && !directory.is_empty()
+        {
+            parent.insert_existing_child(leaf, removed)?;
+            return Err(ZX_ERR_NOT_EMPTY);
+        }
+        Ok(())
+    }
+
+    fn linkat(
+        &self,
+        src_path: &str,
+        target_dir: &dyn FdOps,
+        target_path: &str,
+    ) -> Result<(), zx_status_t> {
+        let Some(target_dir) = target_dir.as_any().downcast_ref::<LocalDirFd>() else {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        };
+        let source = resolve_local_existing_node(&self.node, src_path)?;
+        if matches!(source.as_ref(), LocalNode::Directory(_)) {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        let (target_parent, target_leaf) =
+            resolve_local_parent_and_leaf(&target_dir.node, target_path)?;
+        if target_parent.read_only {
+            return Err(ZX_ERR_ACCESS_DENIED);
+        }
+        target_parent.insert_existing_child(target_leaf, source)
+    }
+
+    fn renameat(
+        &self,
+        src_path: &str,
+        target_dir: &dyn FdOps,
+        target_path: &str,
+    ) -> Result<(), zx_status_t> {
+        let Some(target_dir) = target_dir.as_any().downcast_ref::<LocalDirFd>() else {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        };
+        let (source_parent, source_leaf) = resolve_local_parent_and_leaf(&self.node, src_path)?;
+        let (target_parent, target_leaf) =
+            resolve_local_parent_and_leaf(&target_dir.node, target_path)?;
+        if source_parent.read_only || target_parent.read_only {
+            return Err(ZX_ERR_ACCESS_DENIED);
+        }
+        let node = source_parent.remove_child(source_leaf)?;
+        if let Err(status) = target_parent.insert_existing_child(target_leaf, Arc::clone(&node)) {
+            source_parent.insert_existing_child(source_leaf, node)?;
+            return Err(status);
+        }
+        if let LocalNode::Directory(directory) = node.as_ref() {
+            directory.set_parent(Some(Arc::downgrade(&target_parent)));
+        }
+        Ok(())
     }
 }
 
@@ -264,6 +354,10 @@ impl LocalFileFd {
 }
 
 impl FdOps for LocalFileFd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
         let bytes = self.read_all();
         let actual = bytes.len().min(buffer.len());
@@ -305,8 +399,7 @@ impl FdOps for LocalFileFd {
         }
         match &self.backing {
             LocalFileBacking::ReadOnly(file) => file
-                .vmo
-                .ok_or(ZX_ERR_NOT_SUPPORTED)
+                .get_or_create_vmo()
                 .and_then(|handle| duplicate_handle(handle, ZX_RIGHT_SAME_RIGHTS)),
             LocalFileBacking::Mutable(_) => Err(ZX_ERR_NOT_SUPPORTED),
         }
@@ -332,6 +425,7 @@ impl LocalNode {
 #[derive(Debug)]
 struct LocalDirectoryNode {
     read_only: bool,
+    parent: Mutex<Option<Weak<LocalDirectoryNode>>>,
     children: Mutex<BTreeMap<String, Arc<LocalNode>>>,
 }
 
@@ -339,28 +433,80 @@ impl LocalDirectoryNode {
     fn new(read_only: bool) -> Self {
         Self {
             read_only,
+            parent: Mutex::new(None),
             children: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn set_parent(&self, parent: Option<Weak<LocalDirectoryNode>>) {
+        *self.parent.lock() = parent;
+    }
+
+    fn parent_or_self(self: &Arc<Self>) -> Arc<Self> {
+        self.parent
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| Arc::clone(self))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.children.lock().is_empty()
+    }
+
+    fn list_entries(&self) -> Vec<DirectoryEntry> {
+        self.children
+            .lock()
+            .iter()
+            .map(|(name, node)| DirectoryEntry {
+                name: name.clone(),
+                kind: match node.as_ref() {
+                    LocalNode::Directory(_) => DirectoryEntryKind::Directory,
+                    LocalNode::ReadOnlyFile(_) | LocalNode::MutableFile(_) => {
+                        DirectoryEntryKind::File
+                    }
+                },
+            })
+            .collect()
     }
 
     fn child(&self, name: &str) -> Option<Arc<LocalNode>> {
         self.children.lock().get(name).cloned()
     }
 
-    fn insert_child(&self, name: &str, node: Arc<LocalNode>) -> Result<(), zx_status_t> {
+    fn insert_child(self: &Arc<Self>, name: &str, node: Arc<LocalNode>) -> Result<(), zx_status_t> {
         let mut children = self.children.lock();
         if children.contains_key(name) {
             return Err(ZX_ERR_ALREADY_EXISTS);
+        }
+        if let LocalNode::Directory(directory) = node.as_ref() {
+            directory.set_parent(Some(Arc::downgrade(self)));
         }
         children.insert(name.to_string(), node);
         Ok(())
     }
 
-    fn ensure_directory(&self, name: &str) -> Result<Arc<LocalDirectoryNode>, zx_status_t> {
+    fn insert_existing_child(
+        self: &Arc<Self>,
+        name: &str,
+        node: Arc<LocalNode>,
+    ) -> Result<(), zx_status_t> {
+        self.insert_child(name, node)
+    }
+
+    fn remove_child(&self, name: &str) -> Result<Arc<LocalNode>, zx_status_t> {
+        self.children.lock().remove(name).ok_or(ZX_ERR_NOT_FOUND)
+    }
+
+    fn ensure_directory(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Result<Arc<LocalDirectoryNode>, zx_status_t> {
         if let Some(existing) = self.child(name) {
             return existing.directory_node();
         }
         let directory = Arc::new(LocalDirectoryNode::new(self.read_only));
+        directory.set_parent(Some(Arc::downgrade(self)));
         self.insert_child(name, Arc::new(LocalNode::Directory(Arc::clone(&directory))))?;
         Ok(directory)
     }
@@ -369,12 +515,25 @@ impl LocalDirectoryNode {
 #[derive(Debug)]
 struct LocalReadOnlyFileNode {
     bytes: Option<&'static [u8]>,
-    vmo: Option<zx_handle_t>,
+    cached_vmo: Mutex<Option<zx_handle_t>>,
 }
 
 impl LocalReadOnlyFileNode {
     fn new(bytes: Option<&'static [u8]>, vmo: Option<zx_handle_t>) -> Self {
-        Self { bytes, vmo }
+        Self {
+            bytes,
+            cached_vmo: Mutex::new(vmo),
+        }
+    }
+
+    fn get_or_create_vmo(&self) -> Result<zx_handle_t, zx_status_t> {
+        if let Some(handle) = *self.cached_vmo.lock() {
+            return Ok(handle);
+        }
+        let bytes = self.bytes.unwrap_or(&[]);
+        let handle = create_vmo_with_bytes(bytes)?;
+        *self.cached_vmo.lock() = Some(handle);
+        Ok(handle)
     }
 }
 
@@ -406,7 +565,14 @@ fn wrap_local_node(node: Arc<LocalNode>) -> Result<Arc<dyn FdOps>, zx_status_t> 
     }
 }
 
-fn split_local_path(path: &str) -> Result<Vec<&str>, zx_status_t> {
+#[derive(Clone, Copy)]
+enum LocalWalkComponent<'a> {
+    Current,
+    Parent,
+    Name(&'a str),
+}
+
+fn split_boot_asset_path(path: &str) -> Result<Vec<&str>, zx_status_t> {
     if path.is_empty() || path.starts_with('/') {
         return Err(ZX_ERR_BAD_PATH);
     }
@@ -421,6 +587,90 @@ fn split_local_path(path: &str) -> Result<Vec<&str>, zx_status_t> {
         return Err(ZX_ERR_BAD_PATH);
     }
     Ok(components)
+}
+
+fn split_local_walk_path(
+    path: &str,
+    allow_empty: bool,
+) -> Result<Vec<LocalWalkComponent<'_>>, zx_status_t> {
+    if path.starts_with('/') {
+        return Err(ZX_ERR_BAD_PATH);
+    }
+    if path.is_empty() {
+        return if allow_empty {
+            Ok(Vec::new())
+        } else {
+            Err(ZX_ERR_BAD_PATH)
+        };
+    }
+    let mut components = Vec::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        components.push(match component {
+            "." => LocalWalkComponent::Current,
+            ".." => LocalWalkComponent::Parent,
+            _ => LocalWalkComponent::Name(component),
+        });
+    }
+    if components.is_empty() && !allow_empty {
+        return Err(ZX_ERR_BAD_PATH);
+    }
+    Ok(components)
+}
+
+fn resolve_local_existing_node(
+    start: &Arc<LocalDirectoryNode>,
+    path: &str,
+) -> Result<Arc<LocalNode>, zx_status_t> {
+    let components = split_local_walk_path(path, false)?;
+    let mut directory = Arc::clone(start);
+    for (index, component) in components.iter().enumerate() {
+        let last = index + 1 == components.len();
+        match component {
+            LocalWalkComponent::Current => {
+                if last {
+                    return Ok(Arc::new(LocalNode::Directory(directory)));
+                }
+            }
+            LocalWalkComponent::Parent => {
+                directory = directory.parent_or_self();
+                if last {
+                    return Ok(Arc::new(LocalNode::Directory(directory)));
+                }
+            }
+            LocalWalkComponent::Name(name) if last => {
+                return directory.child(name).ok_or(ZX_ERR_NOT_FOUND);
+            }
+            LocalWalkComponent::Name(name) => {
+                let child = directory.child(name).ok_or(ZX_ERR_NOT_FOUND)?;
+                directory = child.directory_node()?;
+            }
+        }
+    }
+    Err(ZX_ERR_BAD_PATH)
+}
+
+fn resolve_local_parent_and_leaf<'a>(
+    start: &Arc<LocalDirectoryNode>,
+    path: &'a str,
+) -> Result<(Arc<LocalDirectoryNode>, &'a str), zx_status_t> {
+    let components = split_local_walk_path(path, false)?;
+    let mut directory = Arc::clone(start);
+    let mut leaf = None;
+    for (index, component) in components.iter().enumerate() {
+        let last = index + 1 == components.len();
+        match component {
+            LocalWalkComponent::Current if last => return Err(ZX_ERR_BAD_PATH),
+            LocalWalkComponent::Current => {}
+            LocalWalkComponent::Parent if last => return Err(ZX_ERR_BAD_PATH),
+            LocalWalkComponent::Parent => directory = directory.parent_or_self(),
+            LocalWalkComponent::Name(name) if last => leaf = Some(*name),
+            LocalWalkComponent::Name(name) => {
+                let child = directory.child(name).ok_or(ZX_ERR_NOT_FOUND)?;
+                directory = child.directory_node()?;
+            }
+        }
+    }
+    Ok((directory, leaf.ok_or(ZX_ERR_BAD_PATH)?))
 }
 
 fn duplicate_handle(handle: zx_handle_t, rights: zx_rights_t) -> Result<zx_handle_t, zx_status_t> {
@@ -446,11 +696,41 @@ fn duplicate_handle(handle: zx_handle_t, rights: zx_rights_t) -> Result<zx_handl
     }
 }
 
+fn create_vmo_with_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
+    let mut handle = ZX_HANDLE_INVALID;
+    let size = bytes.len().max(1) as u64;
+    let status = axle_arch_x86_64::int80_syscall(
+        AXLE_SYS_VMO_CREATE as u64,
+        [size, 0, &mut handle as *mut zx_handle_t as u64, 0, 0, 0],
+    );
+    if status != ZX_OK {
+        return Err(status);
+    }
+    if !bytes.is_empty() {
+        let status = axle_arch_x86_64::int80_syscall(
+            AXLE_SYS_VMO_WRITE as u64,
+            [
+                handle as u64,
+                bytes.as_ptr() as u64,
+                0,
+                bytes.len() as u64,
+                0,
+                0,
+            ],
+        );
+        if status != ZX_OK {
+            let _ = zx_handle_close(handle);
+            return Err(status);
+        }
+    }
+    Ok(handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BootAssetEntry, BootstrapNamespace};
     use alloc::vec;
-    use nexus_io::{FdTable, OpenFlags, open_namespace_path};
+    use nexus_io::{FdTable, OpenFlags};
 
     #[test]
     fn boot_namespace_reads_manifest_assets() {
@@ -460,22 +740,18 @@ mod tests {
         ])
         .expect("build boot namespace");
 
-        let root = open_namespace_path(
-            namespace.namespace(),
-            "/boot/manifests/root.nxcd",
-            OpenFlags::READABLE,
-        )
-        .expect("open root manifest");
+        let root = namespace
+            .namespace()
+            .open("/boot/manifests/root.nxcd", OpenFlags::READABLE)
+            .expect("open root manifest");
         let mut bytes = [0u8; 16];
         let actual = root.read(&mut bytes).expect("read manifest");
         assert_eq!(&bytes[..actual], b"root");
 
-        let pkg = open_namespace_path(
-            namespace.namespace(),
-            "/pkg/manifests/echo-client.nxcd",
-            OpenFlags::READABLE,
-        )
-        .expect("open /pkg alias");
+        let pkg = namespace
+            .namespace()
+            .open("/pkg/manifests/echo-client.nxcd", OpenFlags::READABLE)
+            .expect("open /pkg alias");
         let actual = pkg.read(&mut bytes).expect("read manifest alias");
         assert_eq!(&bytes[..actual], b"client");
     }
@@ -487,12 +763,13 @@ mod tests {
                 .expect("build namespace");
 
         let mut table = FdTable::new();
-        let file = open_namespace_path(
-            namespace.namespace(),
-            "/tmp/state.bin",
-            OpenFlags::READABLE | OpenFlags::WRITABLE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
-        )
-        .expect("open tmp file");
+        let file = namespace
+            .namespace()
+            .open(
+                "/tmp/state.bin",
+                OpenFlags::READABLE | OpenFlags::WRITABLE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            )
+            .expect("open tmp file");
         let fd = table
             .open(
                 file,
@@ -509,5 +786,52 @@ mod tests {
         let mut read_back = [0u8; 8];
         let actual = table.read(fd, &mut read_back).expect("read tmp file");
         assert_eq!(&read_back[..actual], payload.as_slice());
+    }
+
+    #[test]
+    fn tmpfs_supports_readdir_link_rename_and_unlink() {
+        let namespace =
+            BootstrapNamespace::build(&[BootAssetEntry::bytes("manifests/root.nxcd", b"root")])
+                .expect("build namespace");
+
+        let source = namespace
+            .namespace()
+            .open(
+                "/tmp/original.txt",
+                OpenFlags::READABLE | OpenFlags::WRITABLE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            )
+            .expect("create source");
+        source.write(b"hello").expect("write source");
+
+        namespace
+            .namespace()
+            .link("/tmp/original.txt", "/tmp/linked.txt")
+            .expect("link file");
+        namespace
+            .namespace()
+            .rename("/tmp/linked.txt", "/tmp/renamed.txt")
+            .expect("rename file");
+
+        let entries = namespace
+            .namespace()
+            .readdir("/tmp")
+            .expect("readdir tmpfs");
+        assert!(entries.iter().any(|entry| entry.name == "original.txt"));
+        assert!(entries.iter().any(|entry| entry.name == "renamed.txt"));
+
+        namespace
+            .namespace()
+            .unlink("/tmp/original.txt")
+            .expect("unlink original");
+        namespace
+            .namespace()
+            .unlink("/tmp/renamed.txt")
+            .expect("unlink renamed");
+
+        let entries = namespace
+            .namespace()
+            .readdir("/tmp")
+            .expect("readdir tmpfs after cleanup");
+        assert!(entries.is_empty());
     }
 }

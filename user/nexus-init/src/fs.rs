@@ -7,9 +7,9 @@ use axle_types::status::{
 use axle_types::{zx_handle_t, zx_status_t};
 use libzircon::{ZX_TIME_INFINITE, zx_channel_read_alloc, zx_channel_write};
 use nexus_fs_proto::{
-    CloneRequest, CloseRequest, DescribeResponse, FsMessageKind, GetVmoRequest, GetVmoResponse,
-    NodeDescriptor, NodeKind, ObjectIdentity, OpenRequest, ReadRequest, ReadResponse, WriteRequest,
-    WriteResponse, decode_message_kind,
+    CloneRequest, CloseRequest, DescribeResponse, DirEntryRecord, FsMessageKind, GetVmoRequest,
+    GetVmoResponse, NodeDescriptor, NodeKind, ObjectIdentity, OpenRequest, ReadDirRequest,
+    ReadDirResponse, ReadRequest, ReadResponse, WriteRequest, WriteResponse, decode_message_kind,
 };
 use nexus_io::OpenFlags;
 
@@ -78,13 +78,23 @@ fn serve_directory(
                 let request = OpenRequest::decode_channel_message(&bytes, &handles)
                     .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
                 ensure_identity(request.object, descriptor.identity)?;
-                if request.path != ECHO_PROTOCOL_NAME {
+                if !echo_service_path_matches(request.path.as_str()) {
                     return Err(ZX_ERR_BAD_STATE);
                 }
                 let file_descriptor =
                     file_descriptor_for_directory(descriptor.identity.open_file_id, request.flags)?;
                 send_describe(request.opened_object, file_descriptor)?;
                 serve_file(request.opened_object, file_descriptor, echo_bytes)?;
+            }
+            FsMessageKind::ReadDirRequest => {
+                let request = ReadDirRequest::decode_channel_message(&bytes, &handles)
+                    .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
+                ensure_identity(request.object, descriptor.identity)?;
+                send_readdir_response(
+                    handle,
+                    ZX_OK,
+                    &[DirEntryRecord::new(ECHO_PROTOCOL_NAME, NodeKind::Service)],
+                )?;
             }
             FsMessageKind::CloneRequest => {
                 let request = CloneRequest::decode_channel_message(&bytes, &handles)
@@ -267,6 +277,21 @@ fn send_get_vmo_response(
     )
 }
 
+fn send_readdir_response(
+    handle: zx_handle_t,
+    status: zx_status_t,
+    entries: &[DirEntryRecord],
+) -> Result<(), zx_status_t> {
+    write_message(
+        handle,
+        ReadDirResponse {
+            status,
+            entries: entries.to_vec(),
+        }
+        .encode_channel_message(),
+    )
+}
+
 fn write_message(
     handle: zx_handle_t,
     message: nexus_fs_proto::EncodedMessage,
@@ -328,4 +353,21 @@ fn read_message_polling(handle: zx_handle_t) -> Result<Option<ChannelMessage>, z
             Err(status) => return Err(status),
         }
     }
+}
+
+fn echo_service_path_matches(path: &str) -> bool {
+    let mut depth = 0usize;
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        match component {
+            "." => {}
+            ".." => {
+                depth = depth.saturating_sub(1);
+            }
+            component if component == ECHO_PROTOCOL_NAME => {
+                depth = depth.saturating_add(1);
+            }
+            _ => return false,
+        }
+    }
+    depth == 1
 }

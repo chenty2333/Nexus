@@ -173,6 +173,37 @@ impl NodeDescriptor {
     }
 }
 
+/// One directory entry returned by a remote directory listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntryRecord {
+    /// Entry name relative to the listed directory.
+    pub name: String,
+    /// Concrete node kind for the entry.
+    pub kind: NodeKind,
+}
+
+impl DirEntryRecord {
+    /// Build one directory entry record.
+    pub fn new(name: impl Into<String>, kind: NodeKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+        }
+    }
+
+    fn encode(&self, writer: &mut Writer) {
+        writer.write_string(&self.name);
+        writer.write_u8(self.kind.encode());
+    }
+
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            name: reader.read_string()?,
+            kind: NodeKind::decode(reader.read_u8()?)?,
+        })
+    }
+}
+
 /// Describe the object bound to a fresh channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DescribeResponse {
@@ -214,6 +245,99 @@ impl DescribeResponse {
         };
         reader.finish()?;
         Ok(response)
+    }
+}
+
+/// Read directory entries from one remote directory object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadDirRequest {
+    /// Identity of the directory being listed.
+    pub object: ObjectIdentity,
+    /// Request flags. Version one reserves this field.
+    pub flags: u32,
+}
+
+impl ReadDirRequest {
+    /// Encode this request into one channel message.
+    pub fn encode_channel_message(&self) -> EncodedMessage {
+        let mut writer = Writer::new();
+        write_message_header(&mut writer, FsMessageKind::ReadDirRequest);
+        self.object.encode(&mut writer);
+        writer.write_u32(self.flags);
+        EncodedMessage {
+            bytes: writer.finish(),
+            handles: Vec::new(),
+        }
+    }
+
+    /// Decode this request from one channel message.
+    pub fn decode_channel_message(
+        bytes: &[u8],
+        handles: &[zx_handle_t],
+    ) -> Result<Self, CodecError> {
+        if !handles.is_empty() {
+            return Err(CodecError::HandleCountMismatch {
+                expected: 0,
+                actual: handles.len(),
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        expect_message_header(&mut reader, FsMessageKind::ReadDirRequest)?;
+        let request = Self {
+            object: ObjectIdentity::decode(&mut reader)?,
+            flags: reader.read_u32()?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// Result of a remote directory listing call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadDirResponse {
+    /// Completion status.
+    pub status: zx_status_t,
+    /// Directory entries returned by the server.
+    pub entries: Vec<DirEntryRecord>,
+}
+
+impl ReadDirResponse {
+    /// Encode this response into one channel message.
+    pub fn encode_channel_message(&self) -> EncodedMessage {
+        let mut writer = Writer::new();
+        write_message_header(&mut writer, FsMessageKind::ReadDirResponse);
+        writer.write_i32(self.status);
+        writer.write_len(self.entries.len());
+        for entry in &self.entries {
+            entry.encode(&mut writer);
+        }
+        EncodedMessage {
+            bytes: writer.finish(),
+            handles: Vec::new(),
+        }
+    }
+
+    /// Decode this response from one channel message.
+    pub fn decode_channel_message(
+        bytes: &[u8],
+        handles: &[zx_handle_t],
+    ) -> Result<Self, CodecError> {
+        if !handles.is_empty() {
+            return Err(CodecError::HandleCountMismatch {
+                expected: 0,
+                actual: handles.len(),
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        expect_message_header(&mut reader, FsMessageKind::ReadDirResponse)?;
+        let status = reader.read_i32()?;
+        let entry_count = reader.read_len()?;
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            entries.push(DirEntryRecord::decode(&mut reader)?);
+        }
+        reader.finish()?;
+        Ok(Self { status, entries })
     }
 }
 
@@ -646,6 +770,10 @@ impl GetVmoResponse {
 pub enum FsMessageKind {
     /// `DescribeResponse`
     DescribeResponse,
+    /// `ReadDirRequest`
+    ReadDirRequest,
+    /// `ReadDirResponse`
+    ReadDirResponse,
     /// `OpenRequest`
     OpenRequest,
     /// `CloneRequest`
@@ -670,30 +798,34 @@ impl FsMessageKind {
     fn encode(self) -> u8 {
         match self {
             Self::DescribeResponse => 1,
-            Self::OpenRequest => 2,
-            Self::CloneRequest => 3,
-            Self::ReadRequest => 4,
-            Self::ReadResponse => 5,
-            Self::WriteRequest => 6,
-            Self::WriteResponse => 7,
-            Self::CloseRequest => 8,
-            Self::GetVmoRequest => 9,
-            Self::GetVmoResponse => 10,
+            Self::ReadDirRequest => 2,
+            Self::ReadDirResponse => 3,
+            Self::OpenRequest => 4,
+            Self::CloneRequest => 5,
+            Self::ReadRequest => 6,
+            Self::ReadResponse => 7,
+            Self::WriteRequest => 8,
+            Self::WriteResponse => 9,
+            Self::CloseRequest => 10,
+            Self::GetVmoRequest => 11,
+            Self::GetVmoResponse => 12,
         }
     }
 
     fn decode(value: u8) -> Result<Self, CodecError> {
         match value {
             1 => Ok(Self::DescribeResponse),
-            2 => Ok(Self::OpenRequest),
-            3 => Ok(Self::CloneRequest),
-            4 => Ok(Self::ReadRequest),
-            5 => Ok(Self::ReadResponse),
-            6 => Ok(Self::WriteRequest),
-            7 => Ok(Self::WriteResponse),
-            8 => Ok(Self::CloseRequest),
-            9 => Ok(Self::GetVmoRequest),
-            10 => Ok(Self::GetVmoResponse),
+            2 => Ok(Self::ReadDirRequest),
+            3 => Ok(Self::ReadDirResponse),
+            4 => Ok(Self::OpenRequest),
+            5 => Ok(Self::CloneRequest),
+            6 => Ok(Self::ReadRequest),
+            7 => Ok(Self::ReadResponse),
+            8 => Ok(Self::WriteRequest),
+            9 => Ok(Self::WriteResponse),
+            10 => Ok(Self::CloseRequest),
+            11 => Ok(Self::GetVmoRequest),
+            12 => Ok(Self::GetVmoResponse),
             value => Err(CodecError::InvalidTag {
                 field: "message_kind",
                 value,
@@ -976,5 +1108,29 @@ mod tests {
         let decoded =
             GetVmoResponse::decode_channel_message(&encoded.bytes, &encoded.handles).expect("ok");
         assert_eq!(decoded, without_handle);
+    }
+
+    #[test]
+    fn readdir_messages_round_trip() {
+        let request = ReadDirRequest {
+            object: ObjectIdentity::new(11, 22, 33),
+            flags: 7,
+        };
+        let encoded = request.encode_channel_message();
+        let decoded =
+            ReadDirRequest::decode_channel_message(&encoded.bytes, &encoded.handles).expect("ok");
+        assert_eq!(decoded, request);
+
+        let response = ReadDirResponse {
+            status: 0,
+            entries: alloc::vec![
+                DirEntryRecord::new("manifests", NodeKind::Directory),
+                DirEntryRecord::new("root.nxcd", NodeKind::File),
+            ],
+        };
+        let encoded = response.encode_channel_message();
+        let decoded =
+            ReadDirResponse::decode_channel_message(&encoded.bytes, &encoded.handles).expect("ok");
+        assert_eq!(decoded, response);
     }
 }

@@ -46,6 +46,9 @@ by manifest `program.binary` path instead of only reusing its own image.
 `nexus-init` now turns those seeded VMOs plus its compiled manifest blobs into
 one local `/boot` asset tree, and both the built-in boot resolver and
 `ElfRunner` consume that tree through the shared `FdOps` / namespace layer.
+That local namespace layer now also carries one logical-root / `cwd` path-walk
+helper and exposes read-only `GetVmo` handles for both the seeded code-image
+VMOs and byte-backed boot/package assets such as compiled manifests.
 
 `userspace.rs` contains the current image-loading and bootstrap page-population helpers.
 
