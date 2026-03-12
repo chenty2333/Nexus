@@ -3,7 +3,7 @@
 .global axle_user_prog_end
 axle_user_prog_start:
 	// rbx = shared base (USER_SHARED_VA)
-	movabs $0x00000001001c0000, %rbx
+	movabs $0x0000000100400000, %rbx
 // r12 = t0_ns baseline provided by the kernel (slot 511)
 mov 8*511(%rbx), %r12
 
@@ -1587,7 +1587,7 @@ channel_loan_remap_cow_done:
 
 	mov 8*62(%rbx), %rdi
 	movl $0x403, %esi
-	movabs $0x400000, %rdx
+	movabs $0x420000, %rdx
 	mov 0x1100(%rbx), %r10
 	xor %r8d, %r8d
 	movabs $0x3000, %r9
@@ -1609,7 +1609,7 @@ channel_loan_remap_cow_done:
 
 	mov 8*62(%rbx), %rdi
 	movl $0x403, %esi
-	movabs $0x404000, %rdx
+	movabs $0x424000, %rdx
 	mov 0x1110(%rbx), %r10
 	xor %r8d, %r8d
 	movabs $0x1000, %r9
@@ -1623,7 +1623,7 @@ channel_loan_remap_cow_done:
 
 	mov 8*62(%rbx), %rdi
 	movl $0x403, %esi
-	movabs $0x405000, %rdx
+	movabs $0x425000, %rdx
 	mov 0x1110(%rbx), %r10
 	movabs $0x1000, %r8
 	movabs $0x1000, %r9
@@ -1637,7 +1637,7 @@ channel_loan_remap_cow_done:
 
 	mov 8*62(%rbx), %rdi
 	movl $0x403, %esi
-	movabs $0x406000, %rdx
+	movabs $0x426000, %rdx
 	mov 0x1110(%rbx), %r10
 	movabs $0x2000, %r8
 	movabs $0x1000, %r9
@@ -1649,7 +1649,7 @@ channel_loan_remap_cow_done:
 	add $8, %rsp
 	mov %rax, 8*516(%rbx)
 
-	// rx copy VMO + one contiguous 3-page mapping @ USER_CODE_VA + 0x408000
+	// rx copy VMO + one contiguous 3-page mapping @ USER_CODE_VA + 0x428000
 	movabs $0x3000, %rdi
 	xorl %esi, %esi
 	lea 0x1130(%rbx), %rdx
@@ -1659,7 +1659,7 @@ channel_loan_remap_cow_done:
 
 	mov 8*62(%rbx), %rdi
 	movl $0x403, %esi
-	movabs $0x408000, %rdx
+	movabs $0x428000, %rdx
 	mov 0x1130(%rbx), %r10
 	xor %r8d, %r8d
 	movabs $0x3000, %r9
@@ -1680,20 +1680,20 @@ channel_loan_remap_cow_done:
 	mov %rax, 8*512(%rbx)
 
 	// seed head/body/tail samples across a fragmented [head|body|tail] layout
-	movabs $0x0000000100400008, %rcx
+movabs $0x0000000100420008, %rcx
 	movabs $0x1213141516171819, %rax
 	mov %rax, 0x0(%rcx)
-	movabs $0x0000000100401000, %rcx
+movabs $0x0000000100421000, %rcx
 	movabs $0x2324252627282908, %rax
 	mov %rax, 0x0(%rcx)
-	movabs $0x0000000100402000, %rcx
+movabs $0x0000000100422000, %rcx
 	movabs $0x45464748494a4b08, %rax
 	mov %rax, 0x0(%rcx)
 
 	// remap-friendly readback into [page][page][page], buffer ptr = base + 8
 	mov 0x1140(%rbx), %rdi
 	xorl %esi, %esi
-	movabs $0x0000000100400008, %rdx
+movabs $0x0000000100420008, %rdx
 	movl $8192, %r10d
 	xorl %r8d, %r8d
 	xorl %r9d, %r9d
@@ -1705,7 +1705,7 @@ channel_loan_remap_cow_done:
 	movq $0, 0x1158(%rbx)
 	mov 0x1148(%rbx), %rdi
 	xorl %esi, %esi
-	movabs $0x0000000100404008, %rdx
+movabs $0x0000000100424008, %rdx
 	xorl %r10d, %r10d
 	movl $8192, %r8d
 	xorl %r9d, %r9d
@@ -1721,8 +1721,8 @@ channel_loan_remap_cow_done:
 	mov 0x1150(%rbx), %rax
 	mov %rax, 8*521(%rbx)
 	movq $0, 8*522(%rbx)
-	movabs $0x0000000100404008, %rsi
-	movabs $0x0000000100405000, %rdi
+movabs $0x0000000100424008, %rsi
+movabs $0x0000000100425000, %rdi
 	mov (%rsi), %r8
 	mov (%rdi), %r9
 	movabs $0x1213141516171819, %rax
@@ -1731,7 +1731,7 @@ channel_loan_remap_cow_done:
 	movabs $0x2324252627282908, %rax
 	cmp %rax, %r9
 	jne channel_fragmented_copy_write
-	movabs $0x0000000100406000, %rdi
+movabs $0x0000000100426000, %rdi
 	mov (%rdi), %r9
 	movabs $0x45464748494a4b08, %rax
 	cmp %rax, %r9
@@ -1742,7 +1742,7 @@ channel_fragmented_copy_write:
 	// fallback-copy readback into one contiguous 3-page mapping, buffer ptr = page-aligned base
 	mov 0x1140(%rbx), %rdi
 	xorl %esi, %esi
-	movabs $0x0000000100400008, %rdx
+movabs $0x0000000100420008, %rdx
 	movl $8192, %r10d
 	xorl %r8d, %r8d
 	xorl %r9d, %r9d
@@ -1754,7 +1754,7 @@ channel_fragmented_copy_write:
 	movq $0, 0x1168(%rbx)
 	mov 0x1148(%rbx), %rdi
 	xorl %esi, %esi
-	movabs $0x0000000100408000, %rdx
+movabs $0x0000000100428000, %rdx
 	xorl %r10d, %r10d
 	movl $8192, %r8d
 	xorl %r9d, %r9d
@@ -1770,8 +1770,8 @@ channel_fragmented_copy_write:
 	mov 0x1160(%rbx), %rax
 	mov %rax, 8*525(%rbx)
 	movq $0, 8*526(%rbx)
-	movabs $0x0000000100408000, %rsi
-	movabs $0x0000000100408ff8, %rdi
+movabs $0x0000000100428000, %rsi
+movabs $0x0000000100428ff8, %rdi
 	mov (%rsi), %r8
 	mov (%rdi), %r9
 	movabs $0x1213141516171819, %rax
@@ -1780,7 +1780,7 @@ channel_fragmented_copy_write:
 	movabs $0x2324252627282908, %rax
 	cmp %rax, %r9
 	jne channel_fragmented_done
-	movabs $0x0000000100409ff8, %rdi
+movabs $0x0000000100429ff8, %rdi
 	mov (%rdi), %r9
 	movabs $0x45464748494a4b08, %rax
 	cmp %rax, %r9
@@ -3175,7 +3175,7 @@ movq $0, 0x00(%rbx)
 int3
 
 thread_worker_entry:
-	movabs $0x00000001001c0000, %rbx
+	movabs $0x0000000100400000, %rbx
 	movq $1, 8*399(%rbx)
 thread_worker_spin:
 	mov 8*403(%rbx), %rax
@@ -3309,7 +3309,7 @@ process_child_touch_shared_fault_page:
 	jmp process_child_spin
 
 suspend_worker_entry:
-	movabs $0x00000001001c0000, %rbx
+	movabs $0x0000000100400000, %rbx
 	mov %rdi, %r12
 suspend_worker_wait:
 	xorl %esi, %esi

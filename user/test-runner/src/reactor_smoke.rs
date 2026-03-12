@@ -15,7 +15,7 @@ use libzircon::{
 };
 use nexus_rt::Dispatcher;
 
-const USER_SHARED_BASE: u64 = 0x0000_0001_001c_0000;
+const USER_SHARED_BASE: u64 = 0x0000_0001_0040_0000;
 
 const SLOT_OK: usize = 0;
 const SLOT_T0_NS: usize = 511;

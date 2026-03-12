@@ -30,20 +30,19 @@ use axle_types::{
     ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_spec_header_t, zx_handle_t,
     zx_status_t,
 };
-use libax::ax_object_wait_async;
+use libax::{AX_TIME_INFINITE, ax_object_wait_async, ax_object_wait_one};
 use libzircon::{
-    ZX_TIME_INFINITE, ax_guest_session_create, ax_guest_session_read_memory,
-    ax_guest_session_resume, ax_guest_session_write_memory, ax_guest_stop_state_read,
-    ax_guest_stop_state_write, ax_linux_exec_spec_blob, ax_process_prepare_linux_exec,
-    ax_process_start_guest, ax_thread_start_guest, zx_handle_close, zx_handle_duplicate,
-    zx_packet_user_t, zx_port_create, zx_port_packet_t, zx_port_queue, zx_port_wait,
-    zx_process_create, zx_socket_create, zx_status_result, zx_task_kill, zx_thread_create,
-    zx_vmo_create,
+    ax_guest_session_create, ax_guest_session_read_memory, ax_guest_session_resume,
+    ax_guest_session_write_memory, ax_guest_stop_state_read, ax_guest_stop_state_write,
+    ax_linux_exec_spec_blob, ax_process_prepare_linux_exec, ax_process_start_guest,
+    ax_thread_start_guest, zx_handle_close, zx_handle_duplicate, zx_packet_user_t, zx_port_create,
+    zx_port_packet_t, zx_port_queue, zx_port_wait, zx_process_create, zx_socket_create,
+    zx_status_result, zx_task_kill, zx_thread_create, zx_vmo_create,
 };
 use nexus_component::{ComponentStartInfo, NumberedHandle};
 use nexus_io::{
-    DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFlags, PipeFd, PseudoNodeFd,
-    SocketFd, WaitSpec,
+    DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFileDescription, OpenFlags,
+    PipeFd, PseudoNodeFd, SocketFd, WaitSpec,
 };
 
 use crate::lifecycle::{read_channel_alloc_blocking, send_controller_event, send_status_event};
@@ -54,7 +53,8 @@ use crate::{
     LINUX_ROUND2_BYTES, LINUX_ROUND2_DECL_BYTES, LINUX_ROUND3_BINARY_PATH, LINUX_ROUND3_BYTES,
     LINUX_ROUND3_DECL_BYTES, LINUX_ROUND4_FUTEX_BINARY_PATH, LINUX_ROUND4_FUTEX_BYTES,
     LINUX_ROUND4_FUTEX_DECL_BYTES, LINUX_ROUND4_SIGNAL_BINARY_PATH, LINUX_ROUND4_SIGNAL_BYTES,
-    LINUX_ROUND4_SIGNAL_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
+    LINUX_ROUND4_SIGNAL_DECL_BYTES, LINUX_ROUND5_EPOLL_BINARY_PATH, LINUX_ROUND5_EPOLL_BYTES,
+    LINUX_ROUND5_EPOLL_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
     STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
     STARTUP_HANDLE_STARNIX_STDOUT,
 };
@@ -62,7 +62,7 @@ use crate::{
 const USER_PAGE_BYTES: u64 = 0x1000;
 // Keep this Linux guest bootstrap layout in sync with
 // `kernel/axle-kernel/src/userspace.rs`.
-const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * 448;
+const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * 1024;
 const USER_SHARED_BYTES: u64 = USER_PAGE_BYTES * 2;
 const USER_STACK_BYTES: u64 = USER_PAGE_BYTES * 16;
 const USER_CODE_VA: u64 = 0x0000_0001_0000_0000;
@@ -92,6 +92,8 @@ const LINUX_SYSCALL_FORK: u64 = 57;
 const LINUX_SYSCALL_EXECVE: u64 = 59;
 const LINUX_SYSCALL_WAIT4: u64 = 61;
 const LINUX_SYSCALL_KILL: u64 = 62;
+const LINUX_SYSCALL_EPOLL_WAIT: u64 = 232;
+const LINUX_SYSCALL_EPOLL_CTL: u64 = 233;
 const LINUX_SYSCALL_GETTID: u64 = 186;
 const LINUX_SYSCALL_FUTEX: u64 = 202;
 const LINUX_SYSCALL_TGKILL: u64 = 234;
@@ -99,6 +101,7 @@ const LINUX_SYSCALL_GETDENTS64: u64 = 217;
 const LINUX_SYSCALL_EXIT: u64 = 60;
 const LINUX_SYSCALL_OPENAT: u64 = 257;
 const LINUX_SYSCALL_NEWFSTATAT: u64 = 262;
+const LINUX_SYSCALL_EPOLL_CREATE1: u64 = 291;
 const LINUX_SYSCALL_EXIT_GROUP: u64 = 231;
 const LINUX_SYSCALL_PIPE2: u64 = 293;
 const LINUX_AF_UNIX: u64 = 1;
@@ -135,6 +138,17 @@ const LINUX_FUTEX_WAKE: u64 = 1;
 const LINUX_FUTEX_REQUEUE: u64 = 3;
 const LINUX_FUTEX_PRIVATE_FLAG: u64 = 0x80;
 const LINUX_FUTEX_CLOCK_REALTIME: u64 = 0x100;
+const LINUX_EPOLL_CTL_ADD: i32 = 1;
+const LINUX_EPOLL_CTL_DEL: i32 = 2;
+const LINUX_EPOLL_CTL_MOD: i32 = 3;
+const LINUX_EPOLLIN: u32 = 0x001;
+const LINUX_EPOLLOUT: u32 = 0x004;
+const LINUX_EPOLLERR: u32 = 0x008;
+const LINUX_EPOLLHUP: u32 = 0x010;
+const LINUX_EPOLLONESHOT: u32 = 1 << 30;
+const LINUX_EPOLLET: u32 = 1 << 31;
+const LINUX_EPOLL_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_EPOLL_EVENT_BYTES: usize = 12;
 const LINUX_DT_UNKNOWN: u8 = 0;
 const LINUX_DT_DIR: u8 = 4;
 const LINUX_DT_REG: u8 = 8;
@@ -345,6 +359,33 @@ enum LinuxFutexKey {
     Private { tgid: i32, addr: u64 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct LinuxFileDescriptionKey(usize);
+
+#[derive(Clone, Copy)]
+struct LinuxEpollEvent {
+    events: u32,
+    data: u64,
+}
+
+struct EpollEntry {
+    description: Arc<OpenFileDescription>,
+    interest: u32,
+    data: u64,
+    wait_interest: Option<WaitSpec>,
+    packet_key: Option<u64>,
+    disabled: bool,
+    queued_events: u32,
+    observer_armed: bool,
+}
+
+struct EpollInstance {
+    entries: BTreeMap<LinuxFileDescriptionKey, EpollEntry>,
+    ready_list: VecDeque<LinuxFileDescriptionKey>,
+    ready_set: BTreeSet<LinuxFileDescriptionKey>,
+    waiting_tasks: VecDeque<i32>,
+}
+
 enum TaskState {
     Running,
     Waiting(WaitState),
@@ -365,6 +406,11 @@ enum WaitKind {
     Futex {
         key: LinuxFutexKey,
     },
+    Epoll {
+        epoll_key: LinuxFileDescriptionKey,
+        events_addr: u64,
+        maxevents: usize,
+    },
     FdRead {
         fd: i32,
         buf: u64,
@@ -382,7 +428,7 @@ enum WaitKind {
 impl WaitState {
     const fn packet_key(self) -> Option<u64> {
         match self.kind {
-            WaitKind::Wait4 { .. } | WaitKind::Futex { .. } => None,
+            WaitKind::Wait4 { .. } | WaitKind::Futex { .. } | WaitKind::Epoll { .. } => None,
             WaitKind::FdRead { packet_key, .. } | WaitKind::FdWrite { packet_key, .. } => {
                 Some(packet_key)
             }
@@ -392,21 +438,40 @@ impl WaitState {
     const fn wait4_target_pid(self) -> Option<i32> {
         match self.kind {
             WaitKind::Wait4 { target_pid, .. } => Some(target_pid),
-            WaitKind::Futex { .. } | WaitKind::FdRead { .. } | WaitKind::FdWrite { .. } => None,
+            WaitKind::Futex { .. }
+            | WaitKind::Epoll { .. }
+            | WaitKind::FdRead { .. }
+            | WaitKind::FdWrite { .. } => None,
         }
     }
 
     const fn wait4_status_addr(self) -> Option<u64> {
         match self.kind {
             WaitKind::Wait4 { status_addr, .. } => Some(status_addr),
-            WaitKind::Futex { .. } | WaitKind::FdRead { .. } | WaitKind::FdWrite { .. } => None,
+            WaitKind::Futex { .. }
+            | WaitKind::Epoll { .. }
+            | WaitKind::FdRead { .. }
+            | WaitKind::FdWrite { .. } => None,
         }
     }
 
     const fn futex_key(self) -> Option<LinuxFutexKey> {
         match self.kind {
             WaitKind::Futex { key } => Some(key),
-            WaitKind::Wait4 { .. } | WaitKind::FdRead { .. } | WaitKind::FdWrite { .. } => None,
+            WaitKind::Wait4 { .. }
+            | WaitKind::Epoll { .. }
+            | WaitKind::FdRead { .. }
+            | WaitKind::FdWrite { .. } => None,
+        }
+    }
+
+    const fn epoll_key(self) -> Option<LinuxFileDescriptionKey> {
+        match self.kind {
+            WaitKind::Epoll { epoll_key, .. } => Some(epoll_key),
+            WaitKind::Wait4 { .. }
+            | WaitKind::Futex { .. }
+            | WaitKind::FdRead { .. }
+            | WaitKind::FdWrite { .. } => None,
         }
     }
 }
@@ -471,6 +536,8 @@ struct StarnixKernel {
     tasks: BTreeMap<i32, LinuxTask>,
     groups: BTreeMap<i32, LinuxThreadGroup>,
     futex_waiters: BTreeMap<LinuxFutexKey, VecDeque<i32>>,
+    epolls: BTreeMap<LinuxFileDescriptionKey, EpollInstance>,
+    epoll_packets: BTreeMap<u64, (LinuxFileDescriptionKey, LinuxFileDescriptionKey)>,
 }
 
 struct PreparedProcessCarrier {
@@ -502,6 +569,17 @@ impl PreparedProcessCarrier {
     }
 }
 
+impl EpollInstance {
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            ready_list: VecDeque::new(),
+            ready_set: BTreeSet::new(),
+            waiting_tasks: VecDeque::new(),
+        }
+    }
+}
+
 impl StarnixKernel {
     fn new(
         parent_process: zx_handle_t,
@@ -523,6 +601,8 @@ impl StarnixKernel {
             tasks,
             groups,
             futex_waiters: BTreeMap::new(),
+            epolls: BTreeMap::new(),
+            epoll_packets: BTreeMap::new(),
         }
     }
 
@@ -571,6 +651,24 @@ impl StarnixKernel {
     fn cancel_task_wait(&mut self, task_id: i32, wait: WaitState) {
         if let Some(key) = wait.futex_key() {
             self.remove_task_from_futex_queue(task_id, key);
+        }
+        if let Some(epoll_key) = wait.epoll_key() {
+            let remove_key = match self.epolls.get_mut(&epoll_key) {
+                Some(instance) => {
+                    if let Some(index) = instance
+                        .waiting_tasks
+                        .iter()
+                        .position(|queued| *queued == task_id)
+                    {
+                        let _ = instance.waiting_tasks.remove(index);
+                    }
+                    instance.entries.is_empty() && instance.waiting_tasks.is_empty()
+                }
+                None => false,
+            };
+            if remove_key {
+                let _ = self.epolls.remove(&epoll_key);
+            }
         }
     }
 
@@ -653,6 +751,326 @@ impl StarnixKernel {
         Ok(woke)
     }
 
+    fn queue_epoll_ready(
+        &mut self,
+        epoll_key: LinuxFileDescriptionKey,
+        target_key: LinuxFileDescriptionKey,
+        ready: u32,
+    ) {
+        let Some(instance) = self.epolls.get_mut(&epoll_key) else {
+            return;
+        };
+        let Some(entry) = instance.entries.get_mut(&target_key) else {
+            return;
+        };
+        if entry.disabled {
+            return;
+        }
+        let filtered = filter_epoll_ready_events(entry.interest, ready);
+        if filtered == 0 {
+            return;
+        }
+        entry.queued_events |= filtered;
+        if instance.ready_set.insert(target_key) {
+            instance.ready_list.push_back(target_key);
+        }
+    }
+
+    fn pop_ready_epoll_target(
+        &mut self,
+        epoll_key: LinuxFileDescriptionKey,
+    ) -> Option<LinuxFileDescriptionKey> {
+        loop {
+            let next = {
+                let instance = self.epolls.get_mut(&epoll_key)?;
+                instance.ready_list.pop_front()
+            };
+            let Some(target_key) = next else {
+                if let Some(instance) = self.epolls.get_mut(&epoll_key) {
+                    instance.ready_set.clear();
+                }
+                return None;
+            };
+            if let Some(instance) = self.epolls.get_mut(&epoll_key) {
+                instance.ready_set.remove(&target_key);
+                if instance.entries.contains_key(&target_key) {
+                    return Some(target_key);
+                }
+            }
+        }
+    }
+
+    fn arm_epoll_entry(
+        &mut self,
+        epoll_key: LinuxFileDescriptionKey,
+        target_key: LinuxFileDescriptionKey,
+    ) -> Result<(), zx_status_t> {
+        let (wait_interest, packet_key, disabled, observer_armed) = {
+            let instance = self.epolls.get(&epoll_key).ok_or(ZX_ERR_BAD_STATE)?;
+            let entry = instance.entries.get(&target_key).ok_or(ZX_ERR_BAD_STATE)?;
+            (
+                entry.wait_interest,
+                entry.packet_key,
+                entry.disabled,
+                entry.observer_armed,
+            )
+        };
+        if disabled || observer_armed {
+            return Ok(());
+        }
+        let Some(wait_interest) = wait_interest else {
+            return Ok(());
+        };
+        let Some(packet_key) = packet_key else {
+            return Ok(());
+        };
+        let status = ax_object_wait_async(
+            wait_interest.handle(),
+            self.port,
+            packet_key,
+            wait_interest.signals(),
+            axle_types::wait_async::AX_WAIT_ASYNC_EDGE,
+        );
+        zx_status_result(status)?;
+        let instance = self.epolls.get_mut(&epoll_key).ok_or(ZX_ERR_BAD_STATE)?;
+        let entry = instance
+            .entries
+            .get_mut(&target_key)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        entry.observer_armed = true;
+        Ok(())
+    }
+
+    fn sample_epoll_ready_mask(&self, entry: &EpollEntry) -> u32 {
+        if let Some(wait_interest) = entry.wait_interest {
+            let mut observed = 0;
+            match ax_object_wait_one(
+                wait_interest.handle(),
+                wait_interest.signals(),
+                0,
+                &mut observed,
+            ) {
+                ZX_OK => map_wait_signals_to_epoll(observed),
+                axle_types::status::AX_ERR_TIMED_OUT => 0,
+                _ => LINUX_EPOLLERR | LINUX_EPOLLHUP,
+            }
+        } else {
+            match stat_metadata_for_ops(entry.description.ops().as_ref()) {
+                Ok(_) => LINUX_EPOLLIN | LINUX_EPOLLOUT,
+                Err(_) => 0,
+            }
+        }
+    }
+
+    fn handle_epoll_ready_packet(
+        &mut self,
+        epoll_key: LinuxFileDescriptionKey,
+        target_key: LinuxFileDescriptionKey,
+    ) -> Result<(), zx_status_t> {
+        {
+            let instance = self.epolls.get_mut(&epoll_key).ok_or(ZX_ERR_BAD_STATE)?;
+            let entry = instance
+                .entries
+                .get_mut(&target_key)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            entry.observer_armed = false;
+        }
+        let ready = {
+            let instance = self.epolls.get(&epoll_key).ok_or(ZX_ERR_BAD_STATE)?;
+            let entry = instance.entries.get(&target_key).ok_or(ZX_ERR_BAD_STATE)?;
+            self.sample_epoll_ready_mask(entry)
+        };
+        self.queue_epoll_ready(epoll_key, target_key, ready);
+        self.wake_one_epoll_waiter(epoll_key)
+    }
+
+    fn wake_one_epoll_waiter(
+        &mut self,
+        epoll_key: LinuxFileDescriptionKey,
+    ) -> Result<(), zx_status_t> {
+        loop {
+            let task_id = {
+                let Some(instance) = self.epolls.get_mut(&epoll_key) else {
+                    return Ok(());
+                };
+                instance.waiting_tasks.pop_front()
+            };
+            let Some(task_id) = task_id else {
+                return Ok(());
+            };
+            let Some(task) = self.tasks.get(&task_id) else {
+                continue;
+            };
+            if !matches!(task.state, TaskState::Waiting(wait) if wait.epoll_key() == Some(epoll_key))
+            {
+                continue;
+            }
+            return self.resume_epoll_waiter(task_id, epoll_key);
+        }
+    }
+
+    fn collect_epoll_events(
+        &mut self,
+        epoll_key: LinuxFileDescriptionKey,
+        maxevents: usize,
+    ) -> Result<Vec<LinuxEpollEvent>, zx_status_t> {
+        let mut events = Vec::new();
+        let mut requeue_after = Vec::new();
+        events
+            .try_reserve_exact(maxevents)
+            .map_err(|_| ZX_ERR_NO_MEMORY)?;
+        requeue_after
+            .try_reserve_exact(maxevents)
+            .map_err(|_| ZX_ERR_NO_MEMORY)?;
+        while events.len() < maxevents {
+            let Some(target_key) = self.pop_ready_epoll_target(epoll_key) else {
+                break;
+            };
+            let (event, requeue_level, rearm) = {
+                let instance = self.epolls.get_mut(&epoll_key).ok_or(ZX_ERR_BAD_STATE)?;
+                let entry = instance
+                    .entries
+                    .get_mut(&target_key)
+                    .ok_or(ZX_ERR_BAD_STATE)?;
+                let event = LinuxEpollEvent {
+                    events: entry.queued_events,
+                    data: entry.data,
+                };
+                entry.queued_events = 0;
+                if (entry.interest & LINUX_EPOLLONESHOT) != 0 {
+                    entry.disabled = true;
+                }
+                (
+                    event,
+                    (entry.interest & LINUX_EPOLLET) == 0 && !entry.disabled,
+                    !entry.disabled,
+                )
+            };
+            events.push(event);
+            if requeue_level {
+                requeue_after.push(target_key);
+            }
+            if rearm {
+                self.arm_epoll_entry(epoll_key, target_key)?;
+            }
+        }
+        for target_key in requeue_after {
+            let ready = {
+                let instance = self.epolls.get(&epoll_key).ok_or(ZX_ERR_BAD_STATE)?;
+                let entry = instance.entries.get(&target_key).ok_or(ZX_ERR_BAD_STATE)?;
+                self.sample_epoll_ready_mask(entry)
+            };
+            self.queue_epoll_ready(epoll_key, target_key, ready);
+        }
+        Ok(events)
+    }
+
+    fn refresh_level_triggered_epoll_ready(
+        &mut self,
+        epoll_key: LinuxFileDescriptionKey,
+    ) -> Result<(), zx_status_t> {
+        let mut targets = Vec::new();
+        {
+            let instance = self.epolls.get(&epoll_key).ok_or(ZX_ERR_BAD_STATE)?;
+            targets
+                .try_reserve_exact(instance.entries.len())
+                .map_err(|_| ZX_ERR_NO_MEMORY)?;
+            for (target_key, entry) in &instance.entries {
+                if (entry.interest & LINUX_EPOLLET) == 0 && !entry.disabled {
+                    targets.push(*target_key);
+                }
+            }
+        }
+        for target_key in targets {
+            let ready = {
+                let instance = self.epolls.get(&epoll_key).ok_or(ZX_ERR_BAD_STATE)?;
+                let entry = instance.entries.get(&target_key).ok_or(ZX_ERR_BAD_STATE)?;
+                self.sample_epoll_ready_mask(entry)
+            };
+            if ready == 0 {
+                let instance = self.epolls.get_mut(&epoll_key).ok_or(ZX_ERR_BAD_STATE)?;
+                if let Some(entry) = instance.entries.get_mut(&target_key) {
+                    entry.queued_events = 0;
+                }
+                instance.ready_set.remove(&target_key);
+                instance.ready_list.retain(|queued| *queued != target_key);
+            } else {
+                self.queue_epoll_ready(epoll_key, target_key, ready);
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_epoll_wait(
+        &mut self,
+        task_id: i32,
+        epoll_key: LinuxFileDescriptionKey,
+        events_addr: u64,
+        maxevents: usize,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<bool, zx_status_t> {
+        self.refresh_level_triggered_epoll_ready(epoll_key)?;
+        let events = self.collect_epoll_events(epoll_key, maxevents)?;
+        if events.is_empty() {
+            return Ok(false);
+        }
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let bytes = encode_epoll_events(&events)?;
+        match write_guest_bytes(session, events_addr, &bytes) {
+            Ok(()) => {
+                complete_syscall(
+                    stop_state,
+                    u64::try_from(events.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                )?;
+                Ok(true)
+            }
+            Err(status) => {
+                complete_syscall(
+                    stop_state,
+                    linux_errno(map_guest_write_status_to_errno(status)),
+                )?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn resume_epoll_waiter(
+        &mut self,
+        task_id: i32,
+        epoll_key: LinuxFileDescriptionKey,
+    ) -> Result<(), zx_status_t> {
+        let (events_addr, maxevents, sidecar) = {
+            let task = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
+            let TaskState::Waiting(wait) = task.state else {
+                return Err(ZX_ERR_BAD_STATE);
+            };
+            let WaitKind::Epoll {
+                epoll_key: waiting_key,
+                events_addr,
+                maxevents,
+            } = wait.kind
+            else {
+                return Err(ZX_ERR_BAD_STATE);
+            };
+            if waiting_key != epoll_key {
+                return Err(ZX_ERR_BAD_STATE);
+            }
+            (events_addr, maxevents, task.carrier.sidecar_vmo)
+        };
+
+        let mut stop_state = ax_guest_stop_state_read(sidecar)?;
+        if !self.complete_epoll_wait(task_id, epoll_key, events_addr, maxevents, &mut stop_state)? {
+            return Ok(());
+        }
+        self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Running;
+        self.writeback_and_resume(task_id, &stop_state)
+    }
+
     fn task_id_for_packet_key(&self, packet_key: u64) -> Option<i32> {
         self.tasks
             .iter()
@@ -685,7 +1103,7 @@ impl StarnixKernel {
                 return status;
             }
             let mut packet = zx_port_packet_t::default();
-            let wait_status = zx_port_wait(self.port, ZX_TIME_INFINITE, &mut packet);
+            let wait_status = zx_port_wait(self.port, AX_TIME_INFINITE, &mut packet);
             if wait_status != ZX_OK {
                 return map_status_to_return_code(wait_status);
             }
@@ -739,13 +1157,22 @@ impl StarnixKernel {
                 }
                 ZX_PKT_TYPE_SIGNAL_ONE => {
                     let Some(task_id) = self.waiting_task_id_for_packet_key(packet.key) else {
+                        if let Some((epoll_key, target_key)) =
+                            self.epoll_packets.get(&packet.key).copied()
+                        {
+                            if let Err(status) =
+                                self.handle_epoll_ready_packet(epoll_key, target_key)
+                            {
+                                return map_status_to_return_code(status);
+                            }
+                        }
                         continue;
                     };
                     if let Err(status) = self.retry_waiting_task(task_id, &mut stdout) {
                         return map_status_to_return_code(status);
                     }
                 }
-                _ => return map_status_to_return_code(ZX_ERR_BAD_STATE),
+                _ => return map_status_to_return_code(ZX_ERR_NOT_SUPPORTED),
             }
         }
     }
@@ -771,6 +1198,9 @@ impl StarnixKernel {
             LINUX_SYSCALL_GETPID => self.sys_getpid(task_id, stop_state),
             LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
             LINUX_SYSCALL_FUTEX => self.sys_futex(task_id, stop_state),
+            LINUX_SYSCALL_EPOLL_WAIT => self.sys_epoll_wait(task_id, stop_state),
+            LINUX_SYSCALL_EPOLL_CTL => self.sys_epoll_ctl(task_id, stop_state),
+            LINUX_SYSCALL_EPOLL_CREATE1 => self.sys_epoll_create1(task_id, stop_state),
             LINUX_SYSCALL_RT_SIGACTION => self.sys_rt_sigaction(task_id, stop_state),
             LINUX_SYSCALL_RT_SIGPROCMASK => self.sys_rt_sigprocmask(task_id, stop_state),
             LINUX_SYSCALL_RT_SIGRETURN => self.sys_rt_sigreturn(task_id, stop_state),
@@ -1488,6 +1918,7 @@ impl StarnixKernel {
             SyscallAction::LeaveStopped => match wait.kind {
                 WaitKind::Wait4 { .. } => Ok(()),
                 WaitKind::Futex { .. } => Ok(()),
+                WaitKind::Epoll { .. } => Ok(()),
                 WaitKind::FdRead { fd, buf, len, .. } => {
                     self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
                         TaskState::Running;
@@ -1626,6 +2057,248 @@ impl StarnixKernel {
                 Ok(SyscallAction::Resume)
             }
         }
+    }
+
+    fn sys_epoll_create1(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let flags = stop_state.regs.rdi;
+        if flags != 0 && flags != LINUX_EPOLL_CLOEXEC {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let fd = {
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            let fd_flags = if flags == LINUX_EPOLL_CLOEXEC {
+                FdFlags::CLOEXEC
+            } else {
+                FdFlags::empty()
+            };
+            resources.fd_table.open(
+                Arc::new(PseudoNodeFd::new(None)),
+                OpenFlags::READABLE,
+                fd_flags,
+            )
+        };
+        match fd {
+            Ok(fd) => {
+                let epoll_key = {
+                    let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                    let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+                    let entry = resources.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+                    file_description_key(entry.description())
+                };
+                self.epolls.insert(epoll_key, EpollInstance::new());
+                complete_syscall(stop_state, fd as u64)?;
+            }
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+            }
+        }
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_epoll_ctl(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let epfd = i32::try_from(stop_state.regs.rdi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let op = stop_state.regs.rsi as u32 as i32;
+        let fd = i32::try_from(stop_state.regs.rdx).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let event_addr = stop_state.regs.r10;
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+
+        let (epoll_key, target_description, raw_wait_interest) = {
+            let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            let epoll_entry = resources.fd_table.get(epfd).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let epoll_key = file_description_key(epoll_entry.description());
+            let target_entry = resources.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+            (
+                epoll_key,
+                Arc::clone(target_entry.description()),
+                resources.fd_table.wait_interest(fd)?,
+            )
+        };
+        if !self.epolls.contains_key(&epoll_key) {
+            complete_syscall(stop_state, linux_errno(LINUX_EBADF))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let target_key = file_description_key(&target_description);
+        if target_key == epoll_key || self.epolls.contains_key(&target_key) {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        match op {
+            LINUX_EPOLL_CTL_ADD | LINUX_EPOLL_CTL_MOD => {
+                if event_addr == 0 {
+                    complete_syscall(stop_state, linux_errno(LINUX_EFAULT))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                let event = match read_guest_epoll_event(session, event_addr) {
+                    Ok(event) => event,
+                    Err(status) => {
+                        complete_syscall(
+                            stop_state,
+                            linux_errno(map_guest_memory_status_to_errno(status)),
+                        )?;
+                        return Ok(SyscallAction::Resume);
+                    }
+                };
+                let unsupported = event.events
+                    & !(LINUX_EPOLLIN
+                        | LINUX_EPOLLOUT
+                        | LINUX_EPOLLERR
+                        | LINUX_EPOLLHUP
+                        | LINUX_EPOLLONESHOT
+                        | LINUX_EPOLLET);
+                if unsupported != 0 {
+                    complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                let wait_interest = raw_wait_interest
+                    .map(|interest| filter_epoll_wait_interest(interest, event.events));
+                let exists = self
+                    .epolls
+                    .get(&epoll_key)
+                    .ok_or(ZX_ERR_BAD_STATE)?
+                    .entries
+                    .contains_key(&target_key);
+                if op == LINUX_EPOLL_CTL_ADD && exists {
+                    complete_syscall(stop_state, linux_errno(LINUX_EEXIST))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                if op == LINUX_EPOLL_CTL_MOD && !exists {
+                    complete_syscall(stop_state, linux_errno(LINUX_ENOENT))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                if let Some(instance) = self.epolls.get_mut(&epoll_key) {
+                    if let Some(old) = instance.entries.remove(&target_key)
+                        && let Some(packet_key) = old.packet_key
+                    {
+                        let _ = self.epoll_packets.remove(&packet_key);
+                    }
+                    instance.ready_set.remove(&target_key);
+                    instance.ready_list.retain(|queued| *queued != target_key);
+                }
+                let packet_key = if wait_interest.is_some() {
+                    Some(self.alloc_packet_key()?)
+                } else {
+                    None
+                };
+                if let Some(packet_key) = packet_key {
+                    self.epoll_packets
+                        .insert(packet_key, (epoll_key, target_key));
+                }
+                let entry = EpollEntry {
+                    description: target_description,
+                    interest: event.events,
+                    data: event.data,
+                    wait_interest,
+                    packet_key,
+                    disabled: false,
+                    queued_events: 0,
+                    observer_armed: false,
+                };
+                self.epolls
+                    .get_mut(&epoll_key)
+                    .ok_or(ZX_ERR_BAD_STATE)?
+                    .entries
+                    .insert(target_key, entry);
+                let ready = {
+                    let instance = self.epolls.get(&epoll_key).ok_or(ZX_ERR_BAD_STATE)?;
+                    let entry = instance.entries.get(&target_key).ok_or(ZX_ERR_BAD_STATE)?;
+                    self.sample_epoll_ready_mask(entry)
+                };
+                self.queue_epoll_ready(epoll_key, target_key, ready);
+                self.arm_epoll_entry(epoll_key, target_key)?;
+                self.wake_one_epoll_waiter(epoll_key)?;
+                complete_syscall(stop_state, 0)?;
+            }
+            LINUX_EPOLL_CTL_DEL => {
+                let Some(instance) = self.epolls.get_mut(&epoll_key) else {
+                    return Err(ZX_ERR_BAD_STATE);
+                };
+                let Some(old) = instance.entries.remove(&target_key) else {
+                    complete_syscall(stop_state, linux_errno(LINUX_ENOENT))?;
+                    return Ok(SyscallAction::Resume);
+                };
+                if let Some(packet_key) = old.packet_key {
+                    let _ = self.epoll_packets.remove(&packet_key);
+                }
+                instance.ready_set.remove(&target_key);
+                instance.ready_list.retain(|queued| *queued != target_key);
+                complete_syscall(stop_state, 0)?;
+            }
+            _ => {
+                complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            }
+        }
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_epoll_wait(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let epfd = i32::try_from(stop_state.regs.rdi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let events_addr = stop_state.regs.rsi;
+        let maxevents = usize::try_from(stop_state.regs.rdx).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let timeout = stop_state.regs.r10 as u32 as i32;
+        if maxevents == 0 || timeout < -1 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let epoll_key = {
+            let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            let epoll_entry = resources.fd_table.get(epfd).ok_or(ZX_ERR_BAD_HANDLE)?;
+            file_description_key(epoll_entry.description())
+        };
+        if !self.epolls.contains_key(&epoll_key) {
+            complete_syscall(stop_state, linux_errno(LINUX_EBADF))?;
+            return Ok(SyscallAction::Resume);
+        }
+        if self.complete_epoll_wait(task_id, epoll_key, events_addr, maxevents, stop_state)? {
+            return Ok(SyscallAction::Resume);
+        }
+        if timeout == 0 {
+            complete_syscall(stop_state, 0)?;
+            return Ok(SyscallAction::Resume);
+        }
+        if timeout != -1 {
+            complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let wait = WaitState {
+            restartable: true,
+            kind: WaitKind::Epoll {
+                epoll_key,
+                events_addr,
+                maxevents,
+            },
+        };
+        self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Waiting(wait);
+        self.epolls
+            .get_mut(&epoll_key)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .waiting_tasks
+            .push_back(task_id);
+        self.deliver_or_interrupt_wait(task_id, wait, stop_state)
     }
 
     fn sys_rt_sigprocmask(
@@ -2630,6 +3303,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-round3-smoke") => Some(LINUX_ROUND3_BYTES),
         Some("linux-round4-futex-smoke") => Some(LINUX_ROUND4_FUTEX_BYTES),
         Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BYTES),
+        Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BYTES),
         Some(_) => None,
     }
 }
@@ -2642,6 +3316,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-round3-smoke") => Some(LINUX_ROUND3_BINARY_PATH),
         Some("linux-round4-futex-smoke") => Some(LINUX_ROUND4_FUTEX_BINARY_PATH),
         Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BINARY_PATH),
+        Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -3134,6 +3809,79 @@ fn complete_syscall(
         .checked_add(AX_GUEST_X64_SYSCALL_INSN_LEN)
         .ok_or(ZX_ERR_INVALID_ARGS)?;
     Ok(())
+}
+
+fn file_description_key(description: &Arc<OpenFileDescription>) -> LinuxFileDescriptionKey {
+    LinuxFileDescriptionKey(Arc::as_ptr(description) as usize)
+}
+
+fn map_wait_signals_to_epoll(signals: u32) -> u32 {
+    let mut events = 0u32;
+    if (signals & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE)) != 0 {
+        events |= LINUX_EPOLLIN;
+    }
+    if (signals & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE)) != 0 {
+        events |= LINUX_EPOLLOUT;
+    }
+    if (signals & (ZX_CHANNEL_PEER_CLOSED | ZX_SOCKET_PEER_CLOSED)) != 0 {
+        events |= LINUX_EPOLLHUP;
+    }
+    events
+}
+
+fn filter_epoll_ready_events(interest: u32, ready: u32) -> u32 {
+    let requested = interest & (LINUX_EPOLLIN | LINUX_EPOLLOUT);
+    (ready & requested) | (ready & (LINUX_EPOLLERR | LINUX_EPOLLHUP))
+}
+
+fn filter_epoll_wait_interest(interest: WaitSpec, epoll_interest: u32) -> WaitSpec {
+    let peer_closed = ZX_CHANNEL_PEER_CLOSED | ZX_SOCKET_PEER_CLOSED;
+    let mut signals = 0;
+    if (epoll_interest & LINUX_EPOLLIN) != 0 {
+        signals |= interest.signals() & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE);
+    }
+    if (epoll_interest & LINUX_EPOLLOUT) != 0 {
+        signals |= interest.signals() & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE);
+    }
+    if signals != 0 || (epoll_interest & LINUX_EPOLLHUP) != 0 {
+        signals |= interest.signals() & peer_closed;
+    }
+    WaitSpec::new(interest.handle(), signals)
+}
+
+fn read_guest_epoll_event(session: zx_handle_t, addr: u64) -> Result<LinuxEpollEvent, zx_status_t> {
+    let bytes = read_guest_bytes(session, addr, LINUX_EPOLL_EVENT_BYTES)?;
+    let raw = bytes
+        .get(..LINUX_EPOLL_EVENT_BYTES)
+        .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
+    Ok(LinuxEpollEvent {
+        events: u32::from_ne_bytes(raw[0..4].try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?),
+        data: u64::from_ne_bytes(
+            raw[4..12]
+                .try_into()
+                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+        ),
+    })
+}
+
+fn encode_epoll_events(events: &[LinuxEpollEvent]) -> Result<Vec<u8>, zx_status_t> {
+    let total = events
+        .len()
+        .checked_mul(LINUX_EPOLL_EVENT_BYTES)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    bytes.resize(total, 0);
+    for (index, event) in events.iter().enumerate() {
+        let start = index
+            .checked_mul(LINUX_EPOLL_EVENT_BYTES)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        bytes[start..start + 4].copy_from_slice(&event.events.to_ne_bytes());
+        bytes[start + 4..start + 12].copy_from_slice(&event.data.to_ne_bytes());
+    }
+    Ok(bytes)
 }
 
 fn filter_wait_interest(interest: WaitSpec, op: FdWaitOp) -> WaitSpec {
@@ -4133,6 +4881,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND4_SIGNAL_BYTES,
         ));
     }
+    if !LINUX_ROUND5_EPOLL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND5_EPOLL_BINARY_PATH,
+            LINUX_ROUND5_EPOLL_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -4167,6 +4921,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round4-signal-smoke.nxcd",
             LINUX_ROUND4_SIGNAL_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND5_EPOLL_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round5-epoll-smoke.nxcd",
+            LINUX_ROUND5_EPOLL_DECL_BYTES,
         ));
     }
     let bootstrap = BootstrapNamespace::build(&assets)?;

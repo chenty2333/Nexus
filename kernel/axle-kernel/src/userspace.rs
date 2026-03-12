@@ -22,7 +22,7 @@ use x86_64::instructions::segmentation::Segment;
 // --- Userspace virtual layout (in current single-address-space model) ---
 
 pub(crate) const USER_PAGE_BYTES: u64 = 0x1000;
-pub(crate) const USER_CODE_PAGE_COUNT: usize = 448;
+pub(crate) const USER_CODE_PAGE_COUNT: usize = 1024;
 const USER_SHARED_PAGE_COUNT: usize = 2;
 pub(crate) const USER_STACK_PAGE_COUNT: usize = 16;
 pub(crate) const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * USER_CODE_PAGE_COUNT as u64;
@@ -54,8 +54,8 @@ struct QemuLoaderImage {
 }
 
 const USER_RUNNER_IMAGE: QemuLoaderImage = QemuLoaderImage {
-    paddr: 0x0100_0000,
-    size_paddr: 0x0100_0000 - 8,
+    paddr: 0x0700_0000,
+    size_paddr: 0x0700_0000 - 8,
 };
 const ECHO_PROVIDER_IMAGE: QemuLoaderImage = QemuLoaderImage {
     paddr: 0x0200_0000,

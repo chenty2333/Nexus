@@ -54,10 +54,12 @@ VMOs and byte-backed boot/package assets such as compiled manifests.
 
 The current QEMU loader layout for the component bootstrap path is:
 
-- `nexus-init` at `0x0100_0000`
-- `echo-provider` at `0x0180_0000`
-- `echo-client` at `0x0200_0000`
-- `controller-worker` at `0x0280_0000`
+- root runner image at `0x0700_0000`
+- `echo-provider` at `0x0200_0000`
+- `echo-client` at `0x0300_0000`
+- `controller-worker` at `0x0400_0000`
+- `starnix-kernel` payload at `0x0500_0000`
+- `linux-hello` payload at `0x0600_0000`
 
 The kernel bootstrap PMM reserved floor now also tracks the observed end of
 that loader-backed image span so those raw ELF bytes are not recycled as free
@@ -68,8 +70,12 @@ Rust component binaries still import successfully in dev builds.
 The bootstrap address space is prewired enough to exercise real VM behavior early:
 
 - code and shared windows are mapped into the fixed bootstrap userspace range
-- the fixed bootstrap code window is now wide enough for the Rust dispatcher/executor runner,
-  so the shared summary pages sit above the loaded image instead of overlapping it
+- the fixed bootstrap code window now spans 4 MiB above 4 GiB, which keeps the
+  current Rust dispatcher/component/Starnix manager images below the shared
+  summary pages instead of overlapping them
+- the root runner staging slot now lives above the auxiliary component payload
+  slots so that the larger bootstrap code backing arrays do not clobber the
+  raw QEMU loader image before it is imported
 - the bootstrap stack is marked COW so the first write exercises the fault/COW path
 
 ## Process creation model

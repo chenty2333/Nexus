@@ -119,6 +119,9 @@ The Starnix executive is a userspace semantic layer. It owns:
   - `EpollInstance`
   - `EpollEntry`
   - ready lists / poll masks
+  - wait registrations filtered down to the requested readiness direction so
+    edge-triggered pipe/socket entries do not get masked by unrelated always-on
+    writable bits from the native transport
 
 Linux identities must never be treated as the same thing as Axle
 `process_id`/`thread_id`/`koid`.

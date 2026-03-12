@@ -191,8 +191,13 @@ This makes contract coverage part of the repo workflow, not just informal docume
   round-two version because the dedicated Rust ELFs outgrew the older 4 MiB
   gaps, and the kernel bootstrap PMM reserved floor now follows that loader
   span instead of assuming a fixed 32 MiB ceiling is always sufficient.
-- The bootstrap code window above 4 GiB is wider than the early 32 KiB bring-up shape so the
-  runtime dispatcher runner and its shared summary pages no longer overlap in the fixed mapping.
+- The root bootstrap runner now stages at `0x0700_0000` instead of the old
+  `0x0100_0000` slot because the fixed 4 MiB bootstrap code backing lives in
+  the same low-RAM identity map during bring-up; the higher slot keeps the raw
+  QEMU loader image from being overwritten before the loader imports it.
+- The bootstrap code window above 4 GiB now spans 4 MiB, which keeps the
+  runtime dispatcher runner, current `nexus-init` manager images, and the
+  shared summary pages from overlapping in the fixed bootstrap mapping.
 - Some bootstrap channel metrics currently come from a second structured summary line rather than
   the main `int80 conformance ok (...)` line.
   - the fragmented channel payload scenario uses this to report both remap-path and fallback-copy
