@@ -63,6 +63,14 @@ const CONTROLLER_WORKER_IMAGE: QemuLoaderImage = QemuLoaderImage {
     paddr: 0x0280_0000,
     size_paddr: 0x0280_0000 - 8,
 };
+const STARNIX_KERNEL_IMAGE: QemuLoaderImage = QemuLoaderImage {
+    paddr: 0x0300_0000,
+    size_paddr: 0x0300_0000 - 8,
+};
+const LINUX_HELLO_IMAGE: QemuLoaderImage = QemuLoaderImage {
+    paddr: 0x0380_0000,
+    size_paddr: 0x0380_0000 - 8,
+};
 // Raw QEMU loader input is the full ELF file, including debug sections in
 // dev builds. Keep this bound separate from the mapped code window size.
 const USER_RUNNER_ELF_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -526,7 +534,9 @@ const SLOT_COMPONENT_CLIENT_STATUS: usize = 603;
 const SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H: usize = 604;
 const SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H: usize = 605;
 const SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H: usize = 606;
-const SLOT_MAX: usize = SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H;
+const SLOT_BOOT_IMAGE_STARNIX_KERNEL_VMO_H: usize = 607;
+const SLOT_BOOT_IMAGE_LINUX_HELLO_VMO_H: usize = 608;
+const SLOT_MAX: usize = SLOT_BOOT_IMAGE_LINUX_HELLO_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1033,6 +1043,14 @@ pub(crate) fn qemu_loader_controller_worker_size() -> Option<u64> {
     qemu_loader_image_size(CONTROLLER_WORKER_IMAGE)
 }
 
+pub(crate) fn qemu_loader_starnix_kernel_size() -> Option<u64> {
+    qemu_loader_image_size(STARNIX_KERNEL_IMAGE)
+}
+
+pub(crate) fn qemu_loader_linux_hello_size() -> Option<u64> {
+    qemu_loader_image_size(LINUX_HELLO_IMAGE)
+}
+
 fn qemu_loader_image_size(image: QemuLoaderImage) -> Option<u64> {
     let blob_len = qemu_loader_image_blob(image).and_then(|blob| u64::try_from(blob.len()).ok())?;
     let page = USER_PAGE_BYTES;
@@ -1046,6 +1064,8 @@ pub(crate) fn qemu_loader_reserved_floor() -> u64 {
         ECHO_PROVIDER_IMAGE,
         ECHO_CLIENT_IMAGE,
         CONTROLLER_WORKER_IMAGE,
+        STARNIX_KERNEL_IMAGE,
+        LINUX_HELLO_IMAGE,
     ]
     .into_iter()
     .filter_map(|image| {
@@ -1085,6 +1105,20 @@ pub(crate) fn read_qemu_loader_controller_worker_at(
     dst: &mut [u8],
 ) -> Result<(), zx_status_t> {
     read_qemu_loader_image_at(CONTROLLER_WORKER_IMAGE, offset, dst)
+}
+
+pub(crate) fn read_qemu_loader_starnix_kernel_at(
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<(), zx_status_t> {
+    read_qemu_loader_image_at(STARNIX_KERNEL_IMAGE, offset, dst)
+}
+
+pub(crate) fn read_qemu_loader_linux_hello_at(
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<(), zx_status_t> {
+    read_qemu_loader_image_at(LINUX_HELLO_IMAGE, offset, dst)
 }
 
 fn read_qemu_loader_image_at(
@@ -1939,6 +1973,10 @@ pub fn prepare() -> u64 {
         crate::object::vm::bootstrap_echo_client_code_vmo_handle().unwrap_or(0) as u64;
     slots[SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H] =
         crate::object::vm::bootstrap_controller_worker_code_vmo_handle().unwrap_or(0) as u64;
+    slots[SLOT_BOOT_IMAGE_STARNIX_KERNEL_VMO_H] =
+        crate::object::vm::bootstrap_starnix_kernel_code_vmo_handle().unwrap_or(0) as u64;
+    slots[SLOT_BOOT_IMAGE_LINUX_HELLO_VMO_H] =
+        crate::object::vm::bootstrap_linux_hello_code_vmo_handle().unwrap_or(0) as u64;
     // Keep the exported bootstrap code-image VMO span stable for the runner ABI. The parsed
     // image layout is an internal loader detail; the bootstrap code window is still the legacy
     // fixed-size mapping.

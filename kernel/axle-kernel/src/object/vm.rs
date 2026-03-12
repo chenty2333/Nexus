@@ -57,6 +57,30 @@ pub fn bootstrap_controller_worker_code_vmo_handle() -> Option<zx_handle_t> {
     .flatten()
 }
 
+/// Return the bootstrap `starnix-kernel` code-image VMO handle, if seeded.
+pub fn bootstrap_starnix_kernel_code_vmo_handle() -> Option<zx_handle_t> {
+    with_state_mut(|state| {
+        state.with_registry(|registry| {
+            Ok((registry.bootstrap_starnix_kernel_code_vmo_handle != 0)
+                .then_some(registry.bootstrap_starnix_kernel_code_vmo_handle))
+        })
+    })
+    .ok()
+    .flatten()
+}
+
+/// Return the bootstrap Linux `hello` image VMO handle, if seeded.
+pub fn bootstrap_linux_hello_code_vmo_handle() -> Option<zx_handle_t> {
+    with_state_mut(|state| {
+        state.with_registry(|registry| {
+            Ok((registry.bootstrap_linux_hello_code_vmo_handle != 0)
+                .then_some(registry.bootstrap_linux_hello_code_vmo_handle))
+        })
+    })
+    .ok()
+    .flatten()
+}
+
 /// Create an anonymous VMO and return a handle.
 pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
     if options != 0 {

@@ -37,6 +37,220 @@ pub type zx_vm_option_t = u32;
 /// Zircon virtual address type.
 pub type zx_vaddr_t = u64;
 
+/// Guest stop state for one supervised guest thread.
+///
+/// The v1 ABI uses an explicit sidecar byte layout rather than a shared Rust
+/// union or direct typed mapping so both kernel and userspace can read/write
+/// the state without introducing `unsafe`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ax_guest_x64_regs_t {
+    /// `rax`
+    pub rax: u64,
+    /// `rdi`
+    pub rdi: u64,
+    /// `rsi`
+    pub rsi: u64,
+    /// `rdx`
+    pub rdx: u64,
+    /// `r10`
+    pub r10: u64,
+    /// `r8`
+    pub r8: u64,
+    /// `r9`
+    pub r9: u64,
+    /// `rcx`
+    pub rcx: u64,
+    /// `r11`
+    pub r11: u64,
+    /// `rbx`
+    pub rbx: u64,
+    /// `rbp`
+    pub rbp: u64,
+    /// `r12`
+    pub r12: u64,
+    /// `r13`
+    pub r13: u64,
+    /// `r14`
+    pub r14: u64,
+    /// `r15`
+    pub r15: u64,
+    /// `rip`
+    pub rip: u64,
+    /// `rsp`
+    pub rsp: u64,
+    /// `rflags`
+    pub rflags: u64,
+}
+
+impl ax_guest_x64_regs_t {
+    /// Number of encoded bytes in one register snapshot.
+    pub const BYTE_LEN: usize = 18 * core::mem::size_of::<u64>();
+
+    fn encode_into(self, out: &mut [u8]) -> bool {
+        if out.len() < Self::BYTE_LEN {
+            return false;
+        }
+        let mut offset = 0usize;
+        for value in [
+            self.rax,
+            self.rdi,
+            self.rsi,
+            self.rdx,
+            self.r10,
+            self.r8,
+            self.r9,
+            self.rcx,
+            self.r11,
+            self.rbx,
+            self.rbp,
+            self.r12,
+            self.r13,
+            self.r14,
+            self.r15,
+            self.rip,
+            self.rsp,
+            self.rflags,
+        ] {
+            write_u64_le(out, offset, value);
+            offset += core::mem::size_of::<u64>();
+        }
+        true
+    }
+
+    fn decode_from(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::BYTE_LEN {
+            return None;
+        }
+        let mut offset = 0usize;
+        let mut next = || {
+            let value = read_u64_le(bytes, offset)?;
+            offset += core::mem::size_of::<u64>();
+            Some(value)
+        };
+        Some(Self {
+            rax: next()?,
+            rdi: next()?,
+            rsi: next()?,
+            rdx: next()?,
+            r10: next()?,
+            r8: next()?,
+            r9: next()?,
+            rcx: next()?,
+            r11: next()?,
+            rbx: next()?,
+            rbp: next()?,
+            r12: next()?,
+            r13: next()?,
+            r14: next()?,
+            r15: next()?,
+            rip: next()?,
+            rsp: next()?,
+            rflags: next()?,
+        })
+    }
+}
+
+/// Sidecar state written by the kernel when a supervised guest thread stops.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ax_guest_stop_state_t {
+    /// ABI version of this sidecar layout.
+    pub version: u32,
+    /// Guest architecture id.
+    pub arch: u16,
+    /// Stop reason for this snapshot.
+    pub stop_reason: u16,
+    /// Monotonic stop sequence issued by the kernel for this guest session.
+    pub stop_seq: u64,
+    /// Saved architectural register state.
+    pub regs: ax_guest_x64_regs_t,
+}
+
+impl ax_guest_stop_state_t {
+    /// Number of encoded bytes in one v1 stop-state snapshot.
+    pub const BYTE_LEN: usize = 4 + 2 + 2 + 8 + ax_guest_x64_regs_t::BYTE_LEN;
+
+    /// Encode into a fixed little-endian sidecar image.
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut out = [0u8; Self::BYTE_LEN];
+        write_u32_le(&mut out, 0, self.version);
+        write_u16_le(&mut out, 4, self.arch);
+        write_u16_le(&mut out, 6, self.stop_reason);
+        write_u64_le(&mut out, 8, self.stop_seq);
+        let _ = self.regs.encode_into(&mut out[16..]);
+        out
+    }
+
+    /// Decode one fixed sidecar image.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::BYTE_LEN {
+            return None;
+        }
+        Some(Self {
+            version: read_u32_le(bytes, 0)?,
+            arch: read_u16_le(bytes, 4)?,
+            stop_reason: read_u16_le(bytes, 6)?,
+            stop_seq: read_u64_le(bytes, 8)?,
+            regs: ax_guest_x64_regs_t::decode_from(&bytes[16..16 + ax_guest_x64_regs_t::BYTE_LEN])?,
+        })
+    }
+}
+
+/// Header for the opaque `ax_process_prepare_linux_exec` specification blob.
+///
+/// The full blob is:
+/// - this header
+/// - followed immediately by `stack_bytes_len` bytes of stack image data
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ax_linux_exec_spec_header_t {
+    /// Exec-spec ABI version.
+    pub version: u32,
+    /// Reserved for future flags.
+    pub flags: u32,
+    /// Userspace entry point.
+    pub entry: u64,
+    /// Initial userspace stack pointer.
+    pub stack_pointer: u64,
+    /// Offset within the fixed startup stack VMO where `stack_bytes` begin.
+    pub stack_vmo_offset: u64,
+    /// Number of bytes that follow this header in the exec-spec blob.
+    pub stack_bytes_len: u64,
+}
+
+impl ax_linux_exec_spec_header_t {
+    /// Encoded byte size of the v1 header.
+    pub const BYTE_LEN: usize = 40;
+
+    /// Encode into the fixed little-endian header form.
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut out = [0u8; Self::BYTE_LEN];
+        write_u32_le(&mut out, 0, self.version);
+        write_u32_le(&mut out, 4, self.flags);
+        write_u64_le(&mut out, 8, self.entry);
+        write_u64_le(&mut out, 16, self.stack_pointer);
+        write_u64_le(&mut out, 24, self.stack_vmo_offset);
+        write_u64_le(&mut out, 32, self.stack_bytes_len);
+        out
+    }
+
+    /// Decode from the prefix of one exec-spec blob.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::BYTE_LEN {
+            return None;
+        }
+        Some(Self {
+            version: read_u32_le(bytes, 0)?,
+            flags: read_u32_le(bytes, 4)?,
+            entry: read_u64_le(bytes, 8)?,
+            stack_pointer: read_u64_le(bytes, 16)?,
+            stack_vmo_offset: read_u64_le(bytes, 24)?,
+            stack_bytes_len: read_u64_le(bytes, 32)?,
+        })
+    }
+}
+
 /// Zircon user packet payload (32 bytes).
 ///
 /// We use a 4x u64 layout to keep the payload naturally 8-byte aligned
@@ -219,6 +433,20 @@ pub mod vm {
     pub const ZX_VM_ALIGN_4GB: zx_vm_option_t = 32 << ZX_VM_ALIGN_BASE;
 }
 
+/// Guest-supervision and Linux exec helper constants.
+pub mod guest {
+    /// x86_64 guest architecture id.
+    pub const AX_GUEST_ARCH_X86_64: u16 = 1;
+    /// x86_64 guest stop due to one `syscall` instruction trap.
+    pub const AX_GUEST_STOP_REASON_X64_SYSCALL: u16 = 1;
+    /// ABI version for the v1 stop-state sidecar.
+    pub const AX_GUEST_STOP_STATE_V1: u32 = 1;
+    /// Length in bytes of one x86_64 `syscall` instruction.
+    pub const AX_GUEST_X64_SYSCALL_INSN_LEN: u64 = 2;
+    /// ABI version for the v1 Linux exec specification header.
+    pub const AX_LINUX_EXEC_SPEC_V1: u32 = 1;
+}
+
 /// Zircon handle rights bit definitions.
 pub mod rights {
     use super::zx_rights_t;
@@ -318,6 +546,42 @@ pub mod handle {
     pub const ZX_HANDLE_FIXED_BITS_MASK: zx_handle_t = 0x3;
     /// The required value of the low 2 “fixed bits” for a valid handle.
     pub const ZX_HANDLE_FIXED_BITS_VALUE: zx_handle_t = 0x3;
+}
+
+fn write_u16_le(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + core::mem::size_of::<u16>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + core::mem::size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64_le(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + core::mem::size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(core::mem::size_of::<u16>())?;
+    let slice = bytes.get(offset..end)?;
+    let mut array = [0u8; core::mem::size_of::<u16>()];
+    array.copy_from_slice(slice);
+    Some(u16::from_le_bytes(array))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(core::mem::size_of::<u32>())?;
+    let slice = bytes.get(offset..end)?;
+    let mut array = [0u8; core::mem::size_of::<u32>()];
+    array.copy_from_slice(slice);
+    Some(u32::from_le_bytes(array))
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(core::mem::size_of::<u64>())?;
+    let slice = bytes.get(offset..end)?;
+    let mut array = [0u8; core::mem::size_of::<u64>()];
+    array.copy_from_slice(slice);
+    Some(u64::from_le_bytes(array))
 }
 
 /// Kernel object id constants.

@@ -43,7 +43,8 @@ use axle_types::status::{
     ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_ERR_SHOULD_WAIT, ZX_OK,
 };
 use axle_types::{
-    zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t,
+    ax_guest_x64_regs_t, ax_linux_exec_spec_header_t, zx_handle_t, zx_koid_t, zx_port_packet_t,
+    zx_rights_t, zx_signals_t, zx_status_t,
 };
 use bitflags::bitflags;
 use core::mem::size_of;
@@ -1090,6 +1091,51 @@ impl UserContext {
         self
     }
 
+    pub(crate) fn to_guest_x64_regs(self) -> ax_guest_x64_regs_t {
+        ax_guest_x64_regs_t {
+            rax: self.trap.rax,
+            rdi: self.trap.rdi,
+            rsi: self.trap.rsi,
+            rdx: self.trap.rdx,
+            r10: self.trap.r10,
+            r8: self.trap.r8,
+            r9: self.trap.r9,
+            rcx: self.trap.rcx,
+            r11: self.trap.r11,
+            rbx: self.trap.rbx,
+            rbp: self.trap.rbp,
+            r12: self.trap.r12,
+            r13: self.trap.r13,
+            r14: self.trap.r14,
+            r15: self.trap.r15,
+            rip: self.rip,
+            rsp: self.rsp,
+            rflags: self.rflags,
+        }
+    }
+
+    pub(crate) fn with_guest_x64_regs(mut self, regs: ax_guest_x64_regs_t) -> Self {
+        self.trap.rax = regs.rax;
+        self.trap.rdi = regs.rdi;
+        self.trap.rsi = regs.rsi;
+        self.trap.rdx = regs.rdx;
+        self.trap.r10 = regs.r10;
+        self.trap.r8 = regs.r8;
+        self.trap.r9 = regs.r9;
+        self.trap.rcx = regs.rcx;
+        self.trap.r11 = regs.r11;
+        self.trap.rbx = regs.rbx;
+        self.trap.rbp = regs.rbp;
+        self.trap.r12 = regs.r12;
+        self.trap.r13 = regs.r13;
+        self.trap.r14 = regs.r14;
+        self.trap.r15 = regs.r15;
+        self.rip = regs.rip;
+        self.rsp = regs.rsp;
+        self.rflags = regs.rflags;
+        self
+    }
+
     fn new_user_entry(entry: u64, stack: u64, arg0: u64, arg1: u64) -> Self {
         let selectors = crate::arch::gdt::init();
         let mut trap = crate::arch::int80::TrapFrame::default();
@@ -1399,7 +1445,7 @@ fn build_process_start_stack_image(
     stack_base: u64,
     stack_len: u64,
     layout: &ProcessImageLayout,
-) -> Result<(u64, u64, Vec<u8>), zx_status_t> {
+) -> Result<PreparedStackImage, zx_status_t> {
     let stack_len_usize = usize::try_from(stack_len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
     let mut auxv = Vec::new();
     auxv.try_reserve_exact(6).map_err(|_| ZX_ERR_NO_MEMORY)?;
@@ -1467,7 +1513,45 @@ fn build_process_start_stack_image(
         .checked_add(u64::try_from(cursor).map_err(|_| ZX_ERR_OUT_OF_RANGE)?)
         .ok_or(ZX_ERR_OUT_OF_RANGE)?;
     let stack_vmo_offset = u64::try_from(cursor).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-    Ok((stack_pointer, stack_vmo_offset, image))
+    Ok(PreparedStackImage {
+        stack_pointer,
+        stack_vmo_offset,
+        image,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct PreparedStackImage {
+    stack_pointer: u64,
+    stack_vmo_offset: u64,
+    image: Vec<u8>,
+}
+
+fn validate_linux_exec_stack_spec(
+    header: ax_linux_exec_spec_header_t,
+    stack_image: &[u8],
+) -> Result<(), zx_status_t> {
+    if header.stack_bytes_len != stack_image.len() as u64 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if header.stack_pointer == 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    let stack_end = header
+        .stack_vmo_offset
+        .checked_add(header.stack_bytes_len)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    if stack_end > PROCESS_START_STACK_BYTES {
+        return Err(ZX_ERR_OUT_OF_RANGE);
+    }
+    let stack_base = crate::userspace::USER_STACK_VA;
+    let stack_limit = stack_base
+        .checked_add(PROCESS_START_STACK_BYTES)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    if header.stack_pointer < stack_base || header.stack_pointer > stack_limit {
+        return Err(ZX_ERR_OUT_OF_RANGE);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -3918,8 +4002,65 @@ impl Kernel {
         Ok(self.current_thread()?.koid)
     }
 
+    pub(crate) fn current_thread_guest_x64_regs(
+        &self,
+    ) -> Result<axle_types::ax_guest_x64_regs_t, zx_status_t> {
+        Ok(self
+            .current_thread()?
+            .context
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .to_guest_x64_regs())
+    }
+
     pub(crate) fn current_process_koid(&self) -> Result<zx_koid_t, zx_status_t> {
         Ok(self.current_process()?.koid)
+    }
+
+    pub(crate) fn read_thread_user_bytes(
+        &mut self,
+        thread_id: ThreadId,
+        ptr: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, zx_status_t> {
+        let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let process = self
+            .processes
+            .get(&thread.process_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        if !self.with_vm(|vm| vm.validate_user_ptr(process.address_space_id, ptr, len)) {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
+        out.resize(len, 0);
+
+        let page_bytes = crate::userspace::USER_PAGE_BYTES as usize;
+        let mut copied = 0usize;
+        while copied < len {
+            let src_addr = ptr.checked_add(copied as u64).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let page_base = src_addr - (src_addr % crate::userspace::USER_PAGE_BYTES);
+            self.with_vm_mut(|vm| {
+                vm.ensure_user_page_resident(process.address_space_id, page_base, false)
+            })?;
+            let lookup = self
+                .with_vm(|vm| vm.lookup_user_mapping(process.address_space_id, page_base, 1))
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            let frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
+            let page_offset =
+                usize::try_from(src_addr - page_base).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+            let chunk_len = core::cmp::min(page_bytes - page_offset, len - copied);
+            crate::copy::read_bootstrap_frame_bytes(
+                frame_id.raw(),
+                page_offset,
+                &mut out[copied..copied + chunk_len],
+            )?;
+            copied += chunk_len;
+        }
+        Ok(out)
     }
 
     pub(crate) fn copyout_thread_user<T: Copy>(
@@ -3987,6 +4128,45 @@ impl Kernel {
             .get_mut(&current_thread_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         thread.context = Some(context);
+        Ok(())
+    }
+
+    pub(crate) fn thread_user_context(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<UserContext, zx_status_t> {
+        self.threads
+            .get(&thread_id)
+            .and_then(|thread| thread.context)
+            .ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    pub(crate) fn thread_state(&self, thread_id: ThreadId) -> Result<ThreadState, zx_status_t> {
+        Ok(self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?.state)
+    }
+
+    pub(crate) fn thread_wait_registration(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<Option<WaitRegistration>, zx_status_t> {
+        Ok(self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .wait
+            .registration)
+    }
+
+    pub(crate) fn replace_thread_guest_context(
+        &mut self,
+        thread_id: ThreadId,
+        regs: &ax_guest_x64_regs_t,
+    ) -> Result<(), zx_status_t> {
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let Some(context) = thread.context else {
+            return Err(ZX_ERR_BAD_STATE);
+        };
+        thread.context = Some(context.with_guest_x64_regs(*regs));
         Ok(())
     }
 
@@ -4526,6 +4706,30 @@ impl Kernel {
         })
     }
 
+    pub(crate) fn prepare_linux_process_start(
+        &mut self,
+        process_id: ProcessId,
+        global_vmo_id: KernelVmoId,
+        layout: &ProcessImageLayout,
+        exec_spec: ax_linux_exec_spec_header_t,
+        stack_image: &[u8],
+    ) -> Result<PreparedProcessStart, zx_status_t> {
+        let process = self.process(process_id)?;
+        if process.state != ProcessState::Created {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        self.with_vm_mut(|vm| {
+            vm.prepare_linux_process_start(
+                process_id,
+                process.address_space_id,
+                global_vmo_id,
+                layout,
+                exec_spec,
+                stack_image,
+            )
+        })
+    }
+
     pub(crate) fn kill_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
         self.request_thread_termination(thread_id)
     }
@@ -4904,7 +5108,13 @@ impl Kernel {
             .get(&thread_id)
             .map(|thread| thread.last_cpu)
             .unwrap_or(current_cpu_id);
+        // Preserve first-run and wakeup affinity before considering arbitrary idle CPUs.
+        // Brand-new threads inherit the creator CPU as `last_cpu`; preferring that CPU avoids
+        // remote-first activation on an unrelated AP before the thread has ever executed.
         if self.cpu_is_online(preferred_cpu) && self.cpu_is_idle(preferred_cpu) {
+            return preferred_cpu;
+        }
+        if self.cpu_is_online(preferred_cpu) {
             return preferred_cpu;
         }
         if let Some((&idle_cpu_id, _)) = self.cpu_schedulers.iter().find(|(_, scheduler)| {
@@ -4913,9 +5123,6 @@ impl Kernel {
                 && scheduler.run_queue.is_empty()
         }) {
             return idle_cpu_id;
-        }
-        if self.cpu_is_online(preferred_cpu) {
-            return preferred_cpu;
         }
         if self.cpu_is_online(current_cpu_id) {
             return current_cpu_id;
@@ -6162,6 +6369,56 @@ impl VmDomain {
         global_vmo_id: KernelVmoId,
         layout: &ProcessImageLayout,
     ) -> Result<PreparedProcessStart, zx_status_t> {
+        let stack = build_process_start_stack_image(
+            crate::userspace::USER_STACK_VA,
+            PROCESS_START_STACK_BYTES,
+            layout,
+        )?;
+        self.prepare_process_start_with_stack_image(
+            process_id,
+            address_space_id,
+            global_vmo_id,
+            layout,
+            layout.entry(),
+            stack.stack_pointer,
+            stack.stack_vmo_offset,
+            &stack.image,
+        )
+    }
+
+    pub(crate) fn prepare_linux_process_start(
+        &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        global_vmo_id: KernelVmoId,
+        layout: &ProcessImageLayout,
+        exec_spec: ax_linux_exec_spec_header_t,
+        stack_image: &[u8],
+    ) -> Result<PreparedProcessStart, zx_status_t> {
+        validate_linux_exec_stack_spec(exec_spec, stack_image)?;
+        self.prepare_process_start_with_stack_image(
+            process_id,
+            address_space_id,
+            global_vmo_id,
+            layout,
+            exec_spec.entry,
+            exec_spec.stack_pointer,
+            exec_spec.stack_vmo_offset,
+            stack_image,
+        )
+    }
+
+    fn prepare_process_start_with_stack_image(
+        &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        global_vmo_id: KernelVmoId,
+        layout: &ProcessImageLayout,
+        entry: u64,
+        stack_pointer: u64,
+        stack_vmo_offset: u64,
+        stack_image: &[u8],
+    ) -> Result<PreparedProcessStart, zx_status_t> {
         let root_vmar_id = {
             let address_space = self
                 .address_spaces
@@ -6185,7 +6442,17 @@ impl VmDomain {
             )?;
         } else {
             for segment in layout.segments() {
-                let len = align_up_user_page(segment.mem_size_bytes())?;
+                let map_base = segment.vaddr() & !(crate::userspace::USER_PAGE_BYTES - 1);
+                let map_offset = segment.vmo_offset() & !(crate::userspace::USER_PAGE_BYTES - 1);
+                let page_delta = segment
+                    .vaddr()
+                    .checked_sub(map_base)
+                    .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+                let len = align_up_user_page(
+                    page_delta
+                        .checked_add(segment.mem_size_bytes())
+                        .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+                )?;
                 if len == 0 {
                     continue;
                 }
@@ -6201,7 +6468,7 @@ impl VmDomain {
                     self.map_existing_local_vmo_fixed(
                         address_space_id,
                         root_vmar_id,
-                        segment.vaddr(),
+                        map_base,
                         len,
                         private_vmo.vmo_id(),
                         0,
@@ -6217,7 +6484,7 @@ impl VmDomain {
                         self.write_local_vmo_bytes(
                             address_space_id,
                             private_vmo.vmo_id(),
-                            0,
+                            page_delta,
                             &bytes,
                         )?;
                     }
@@ -6225,10 +6492,10 @@ impl VmDomain {
                     self.map_existing_local_vmo_fixed(
                         address_space_id,
                         root_vmar_id,
-                        segment.vaddr(),
+                        map_base,
                         len,
                         local_vmo_id,
-                        segment.vmo_offset(),
+                        map_offset,
                         perms,
                     )?;
                 }
@@ -6251,20 +6518,15 @@ impl VmDomain {
             0,
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
         )?;
-        let (stack_pointer, stack_vmo_offset, stack_image) = build_process_start_stack_image(
-            crate::userspace::USER_STACK_VA,
-            PROCESS_START_STACK_BYTES,
-            layout,
-        )?;
         self.write_local_vmo_bytes(
             address_space_id,
             stack_vmo.vmo_id(),
             stack_vmo_offset,
-            &stack_image,
+            stack_image,
         )?;
 
         Ok(PreparedProcessStart {
-            entry: layout.entry(),
+            entry,
             stack_top: stack_pointer,
         })
     }

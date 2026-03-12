@@ -228,6 +228,13 @@ pub(super) fn suspend_token_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::empty()
 }
 
+pub(super) fn guest_session_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::READ
+        | crate::task::HandleRights::WRITE
+}
+
 pub(super) fn eventpair_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER

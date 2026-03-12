@@ -27,6 +27,9 @@ This file describes the current task-state, scheduler, kill, suspend, and reap b
   - one local runtime-accounting window plus slice deadline
   - an `online` bit used by wakeup targeting
 - Wakeup targeting is now CPU-aware, but scheduling policy is still intentionally simple.
+- Wakeup targeting now honors a thread's preferred / last CPU before opportunistically handing work
+  to some other idle CPU. New threads inherit the creator CPU as that preferred CPU, so first-run
+  launch no longer migrates a brand-new thread to an unrelated idle AP before it has ever run.
 - Basic local time slicing and runtime accounting now exist, but there is still no finished fairness
   or load-balancing policy layer.
 
@@ -109,8 +112,8 @@ The first "non-bootstrap substrate" scheduler contract is now implemented.
 ## Current limitations
 
 - Blocked current execution still relies on `sti; hlt` when the current CPU has no runnable work.
-- `start_thread()` enqueues new work but does not force an immediate handoff; without time slicing,
-  first-run latency still depends on the current thread reaching a scheduling boundary.
+- `start_thread()` still does not force an immediate handoff; without time slicing, first-run
+  latency still depends on the creator CPU reaching a scheduling boundary.
 - Cross-CPU load balancing and work stealing do not exist yet.
 - Scheduler fairness is still simple fixed-slice FIFO/RR rather than a richer policy such as
   weighted fairness or vruntime tracking.

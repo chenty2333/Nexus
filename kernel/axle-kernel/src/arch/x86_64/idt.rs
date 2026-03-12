@@ -51,6 +51,7 @@ static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 pub fn init(
     int80_handler: usize,
     breakpoint_handler: usize,
+    invalid_opcode_handler: usize,
     page_fault_handler: usize,
     gp_fault_handler: usize,
     double_fault_handler: usize,
@@ -79,6 +80,12 @@ pub fn init(
     unsafe {
         IDT[0x80] = IdtEntry::new(int80_handler, selector, user_callable_int_gate, 0);
         IDT[3] = IdtEntry::new(breakpoint_handler, selector, user_callable_int_gate, 0);
+        IDT[6] = IdtEntry::new(
+            invalid_opcode_handler,
+            selector,
+            kernel_int_gate,
+            crate::arch::gdt::IST_FAULT_INDEX,
+        );
 
         // Fault handlers (kernel-only). Keep double fault on IST1 and use a separate fault IST
         // for #PF/#GP so a fault taken during blocked kernel work does not reuse the current

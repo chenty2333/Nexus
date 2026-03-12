@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub(crate) mod guest;
 pub(crate) mod handle;
 pub(crate) mod process;
 pub(crate) mod transport;
@@ -65,6 +66,8 @@ pub enum ObjectKind {
     Port,
     /// Timer object.
     Timer,
+    /// Supervised guest-session object.
+    GuestSession,
     /// VMO object.
     Vmo,
     /// VMAR object.
@@ -456,10 +459,21 @@ pub(crate) struct SuspendTokenObject {
     target: SuspendTarget,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct GuestSessionObject {
+    thread_id: u64,
+    sidecar_vmo: VmoObject,
+    port_object: ObjectKey,
+    packet_key: u64,
+    stop_seq: u64,
+    stopped_seq: Option<u64>,
+}
+
 #[derive(Debug)]
 pub(crate) enum KernelObject {
     Process(ProcessObject),
     SuspendToken(SuspendTokenObject),
+    GuestSession(GuestSessionObject),
     Socket(SocketEndpoint),
     Channel(ChannelEndpoint),
     EventPair(EventPairEndpoint),
@@ -525,6 +539,7 @@ pub(crate) struct ObjectRegistry {
     slots: Vec<ObjectSlot>,
     free_slots: VecDeque<usize>,
     timer_object_ids: BTreeMap<TimerId, ObjectKey>,
+    guest_session_thread_ids: BTreeMap<u64, ObjectKey>,
     bootstrap_self_process_handle: zx_handle_t,
     bootstrap_root_vmar_handle: zx_handle_t,
     bootstrap_self_thread_handle: zx_handle_t,
@@ -532,6 +547,8 @@ pub(crate) struct ObjectRegistry {
     bootstrap_echo_provider_code_vmo_handle: zx_handle_t,
     bootstrap_echo_client_code_vmo_handle: zx_handle_t,
     bootstrap_controller_worker_code_vmo_handle: zx_handle_t,
+    bootstrap_starnix_kernel_code_vmo_handle: zx_handle_t,
+    bootstrap_linux_hello_code_vmo_handle: zx_handle_t,
     bootstrap_process_image_layout: crate::task::ProcessImageLayout,
 }
 
@@ -541,6 +558,7 @@ impl ObjectRegistry {
             slots: Vec::new(),
             free_slots: VecDeque::new(),
             timer_object_ids: BTreeMap::new(),
+            guest_session_thread_ids: BTreeMap::new(),
             bootstrap_self_process_handle: 0,
             bootstrap_root_vmar_handle: 0,
             bootstrap_self_thread_handle: 0,
@@ -548,6 +566,8 @@ impl ObjectRegistry {
             bootstrap_echo_provider_code_vmo_handle: 0,
             bootstrap_echo_client_code_vmo_handle: 0,
             bootstrap_controller_worker_code_vmo_handle: 0,
+            bootstrap_starnix_kernel_code_vmo_handle: 0,
+            bootstrap_linux_hello_code_vmo_handle: 0,
             bootstrap_process_image_layout: crate::task::ProcessImageLayout::bootstrap_conformance(
             ),
         }
@@ -995,8 +1015,18 @@ impl KernelState {
                 crate::userspace::read_qemu_loader_controller_worker_at
                     as fn(u64, &mut [u8]) -> Result<(), zx_status_t>,
             ),
+            (
+                crate::userspace::qemu_loader_starnix_kernel_size as fn() -> Option<u64>,
+                crate::userspace::read_qemu_loader_starnix_kernel_at
+                    as fn(u64, &mut [u8]) -> Result<(), zx_status_t>,
+            ),
+            (
+                crate::userspace::qemu_loader_linux_hello_size as fn() -> Option<u64>,
+                crate::userspace::read_qemu_loader_linux_hello_at
+                    as fn(u64, &mut [u8]) -> Result<(), zx_status_t>,
+            ),
         ];
-        let mut bootstrap_component_handles = [0; 3];
+        let mut bootstrap_component_handles = [0; 5];
         for (index, (size_fn, read_at)) in bootstrap_component_images.iter().enumerate() {
             let Some(size_bytes) = size_fn() else {
                 continue;
@@ -1043,6 +1073,8 @@ impl KernelState {
                 registry.bootstrap_echo_client_code_vmo_handle = bootstrap_component_handles[1];
                 registry.bootstrap_controller_worker_code_vmo_handle =
                     bootstrap_component_handles[2];
+                registry.bootstrap_starnix_kernel_code_vmo_handle = bootstrap_component_handles[3];
+                registry.bootstrap_linux_hello_code_vmo_handle = bootstrap_component_handles[4];
                 Ok(())
             })
             .expect("bootstrap component image handle publish must succeed");
@@ -1097,9 +1129,24 @@ impl KernelState {
         })
     }
 
+    fn note_guest_session(&self, thread_id: u64, key: ObjectKey) -> Result<(), zx_status_t> {
+        self.with_registry_mut(|registry| {
+            registry.retain_kernel_ref(key)?;
+            let _ = registry.guest_session_thread_ids.insert(thread_id, key);
+            Ok(())
+        })
+    }
+
     fn forget_timer_object(&self, timer_id: TimerId) {
         let mut registry = self.registry.lock();
         if let Some(key) = registry.timer_object_ids.remove(&timer_id) {
+            registry.release_kernel_ref(key);
+        }
+    }
+
+    fn forget_guest_session(&self, thread_id: u64) {
+        let mut registry = self.registry.lock();
+        if let Some(key) = registry.guest_session_thread_ids.remove(&thread_id) {
             registry.release_kernel_ref(key);
         }
     }
@@ -1109,6 +1156,14 @@ impl KernelState {
             .lock()
             .timer_object_ids
             .get(&timer_id)
+            .copied()
+    }
+
+    fn guest_session_key(&self, thread_id: u64) -> Option<ObjectKey> {
+        self.registry
+            .lock()
+            .guest_session_thread_ids
+            .get(&thread_id)
             .copied()
     }
 
@@ -1776,6 +1831,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
                 Some(KernelObject::Timer(timer)) => timer.timer_id,
                 Some(KernelObject::Process(_))
                 | Some(KernelObject::SuspendToken(_))
+                | Some(KernelObject::GuestSession(_))
                 | Some(KernelObject::Socket(_))
                 | Some(KernelObject::Channel(_))
                 | Some(KernelObject::EventPair(_))
@@ -1815,6 +1871,7 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
                 Some(KernelObject::Timer(timer)) => timer.timer_id,
                 Some(KernelObject::Process(_))
                 | Some(KernelObject::SuspendToken(_))
+                | Some(KernelObject::GuestSession(_))
                 | Some(KernelObject::Socket(_))
                 | Some(KernelObject::Channel(_))
                 | Some(KernelObject::EventPair(_))
@@ -1849,6 +1906,7 @@ pub fn object_signals(handle: zx_handle_t) -> Result<zx_signals_t, zx_status_t> 
 enum CloseHandleAction {
     None,
     SuspendToken { target: SuspendTarget },
+    GuestSession { thread_id: u64 },
     Socket { peer_object: ObjectKey },
     Channel { peer_object: ObjectKey },
     EventPair { peer_object: ObjectKey },
@@ -1862,6 +1920,9 @@ fn close_handle_action_for_live_object(object: &KernelObject) -> CloseHandleActi
     match object {
         KernelObject::SuspendToken(token) => CloseHandleAction::SuspendToken {
             target: token.target,
+        },
+        KernelObject::GuestSession(session) => CloseHandleAction::GuestSession {
+            thread_id: session.thread_id,
         },
         KernelObject::Socket(endpoint) => CloseHandleAction::Socket {
             peer_object: endpoint.peer_object,
@@ -1889,6 +1950,28 @@ fn finalize_last_handle_close(
         CloseHandleAction::None => Ok(()),
         CloseHandleAction::SuspendToken { target } => {
             process::close_suspend_token(state, object_key, target)
+        }
+        CloseHandleAction::GuestSession { thread_id } => {
+            let removed = state.begin_logical_destroy(object_key)?;
+            let result = match removed {
+                KernelObject::GuestSession(session) => {
+                    state.forget_guest_session(thread_id);
+                    let kill_status = state.with_kernel_mut(|kernel| kernel.kill_thread(thread_id));
+                    if let Err(status) = kill_status
+                        && status != ZX_ERR_BAD_HANDLE
+                        && status != ZX_ERR_BAD_STATE
+                    {
+                        return Err(status);
+                    }
+                    if session.stopped_seq.is_some() || kill_status.is_ok() {
+                        process::sync_task_lifecycle(state)?;
+                    }
+                    Ok(())
+                }
+                _ => Err(ZX_ERR_BAD_STATE),
+            };
+            state.finish_logical_destroy(object_key);
+            result
         }
         CloseHandleAction::Socket { peer_object } => {
             state.with_reactor_mut(|reactor| {
@@ -2053,6 +2136,17 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                     ObjectKind::Process
                 }
                 KernelObject::SuspendToken(_) => ObjectKind::SuspendToken,
+                KernelObject::GuestSession(session) => {
+                    let _ = (
+                        session.thread_id,
+                        session.sidecar_vmo.global_vmo_id().raw(),
+                        session.port_object.object_id(),
+                        session.packet_key,
+                        session.stop_seq,
+                        session.stopped_seq,
+                    );
+                    ObjectKind::GuestSession
+                }
                 KernelObject::Socket(endpoint) => {
                     let _ = (endpoint.core_id, endpoint.peer_object, endpoint.side);
                     ObjectKind::Socket
@@ -2161,6 +2255,7 @@ pub(crate) fn signals_for_object_id(
             KernelObject::Thread(thread) => {
                 state.with_kernel(|kernel| kernel.thread_signals(thread.thread_id))
             }
+            KernelObject::GuestSession(_) => Ok(Signals::NONE),
             KernelObject::Socket(endpoint) => state.with_transport(|transport| {
                 let core = transport
                     .socket_cores

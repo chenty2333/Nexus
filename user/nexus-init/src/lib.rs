@@ -12,6 +12,7 @@ mod namespace;
 mod resolver;
 mod runner;
 mod services;
+mod starnix;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -21,9 +22,12 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axle_types::handle::ZX_HANDLE_INVALID;
+use axle_types::signals::{ZX_SOCKET_PEER_CLOSED, ZX_SOCKET_READABLE};
 use axle_types::status::{ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NOT_FOUND, ZX_OK};
 use axle_types::{zx_handle_t, zx_status_t};
-use libzircon::{ZX_TIME_INFINITE, zx_channel_create, zx_handle_close};
+use libzircon::{
+    ZX_TIME_INFINITE, zx_channel_create, zx_handle_close, zx_object_wait_one, zx_socket_read,
+};
 use nexus_component::{ControllerRequest, NamespaceEntry, ResolvedComponent, StartupMode};
 use nexus_io::{FdFlags, FdOps, FdTable, OpenFlags, ProcessNamespace, RemoteDir};
 
@@ -38,7 +42,7 @@ use crate::lifecycle::{
 };
 use crate::namespace::{CapabilityRegistry, build_namespace_entries, publish_protocols};
 use crate::resolver::{ResolverRegistry, resolve_root_child};
-use crate::runner::{ElfRunner, RunnerRegistry};
+use crate::runner::{ElfRunner, RunnerRegistry, StarnixRunner};
 use crate::services::{BootAssetEntry, BootstrapNamespace, run_socket_fd_smoke, run_tmpfs_smoke};
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0010_0000;
@@ -48,6 +52,7 @@ const SLOT_SELF_CODE_VMO_H: usize = 506;
 const SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H: usize = 604;
 const SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H: usize = 605;
 const SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H: usize = 606;
+const SLOT_BOOT_IMAGE_STARNIX_KERNEL_VMO_H: usize = 607;
 
 const SLOT_COMPONENT_FAILURE_STEP: usize = 578;
 const SLOT_COMPONENT_RESOLVE_ROOT: usize = 579;
@@ -83,6 +88,7 @@ const STEP_CLIENT_EVENT: u64 = 8;
 const STEP_BOOTSTRAP_NAMESPACE: u64 = 9;
 const STEP_TMPFS_SMOKE: u64 = 10;
 const STEP_SOCKET_SMOKE: u64 = 11;
+const STEP_STARNIX_STDOUT: u64 = 12;
 const STEP_ROOT_PANIC: u64 = u64::MAX;
 
 const ROLE_NONE: usize = 0;
@@ -93,10 +99,15 @@ const ROOT_DECL_EAGER_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/root_component.nxcd"));
 const ROOT_DECL_ROUND3_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/root_component_round3.nxcd"));
+const ROOT_DECL_STARNIX_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/root_component_starnix.nxcd"));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/controller_worker.nxcd"));
+const LINUX_HELLO_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linux_hello.nxcd"));
+pub(crate) const LINUX_HELLO_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
@@ -106,17 +117,24 @@ pub(crate) const ROOT_BINARY_PATH: &str = "bin/nexus-init";
 pub(crate) const PROVIDER_BINARY_PATH: &str = "bin/echo-provider";
 pub(crate) const CLIENT_BINARY_PATH: &str = "bin/echo-client";
 pub(crate) const CONTROLLER_WORKER_BINARY_PATH: &str = "bin/controller-worker";
+pub(crate) const STARNIX_KERNEL_BINARY_PATH: &str = "bin/starnix-kernel";
+pub(crate) const LINUX_HELLO_BINARY_PATH: &str = "bin/linux-hello";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
 pub(crate) const CHILD_MARKER_PROVIDER: u64 = 0x4e58_4300_0000_0001;
 pub(crate) const CHILD_MARKER_CLIENT: u64 = 0x4e58_4300_0000_0002;
 pub(crate) const CHILD_MARKER_CONTROLLER_WORKER: u64 = 0x4e58_4300_0000_0003;
+pub(crate) const CHILD_MARKER_STARNIX_KERNEL: u64 = 0x4e58_4300_0000_0004;
 pub(crate) const STARTUP_HANDLE_COMPONENT_STATUS: u32 = 1;
+pub(crate) const STARTUP_HANDLE_STARNIX_IMAGE_VMO: u32 = 2;
+pub(crate) const STARTUP_HANDLE_STARNIX_PARENT_PROCESS: u32 = 3;
+pub(crate) const STARTUP_HANDLE_STARNIX_STDOUT: u32 = 4;
 pub(crate) const MAX_BOOTSTRAP_MESSAGE_BYTES: usize = 512;
 pub(crate) const MAX_BOOTSTRAP_MESSAGE_HANDLES: usize = 8;
 pub(crate) const MAX_SMALL_CHANNEL_BYTES: usize = 128;
 pub(crate) const MAX_SMALL_CHANNEL_HANDLES: usize = 1;
+const STARNIX_HELLO_EXPECTED_STDOUT: &[u8] = b"hello from linux-hello\n";
 
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
@@ -196,7 +214,11 @@ struct ComponentSummary {
 }
 
 pub fn program_start(bootstrap_channel: zx_handle_t, arg1: u64) -> ! {
-    let _ = (bootstrap_channel, arg1);
+    if arg1 == CHILD_MARKER_STARNIX_KERNEL {
+        ROLE.store(ROLE_CHILD, Ordering::Relaxed);
+        starnix::starnix_kernel_program_start(bootstrap_channel);
+    }
+    let _ = bootstrap_channel;
     ROLE.store(ROLE_ROOT, Ordering::Relaxed);
     let mut summary = ComponentSummary {
         failure_step: STEP_RESOLVE_ROOT,
@@ -263,6 +285,13 @@ fn build_runner_registry(
         "elf",
         ElfRunner {
             parent_process,
+            boot_root: Arc::clone(&boot_root),
+        },
+    );
+    runners.insert_starnix(
+        "starnix",
+        StarnixRunner {
+            parent_process,
             boot_root,
         },
     );
@@ -275,28 +304,70 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     let client_image_vmo = read_slot(SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H) as zx_handle_t;
     let controller_worker_image_vmo =
         read_slot(SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H) as zx_handle_t;
-    if self_code_vmo == ZX_HANDLE_INVALID
-        || provider_image_vmo == ZX_HANDLE_INVALID
-        || client_image_vmo == ZX_HANDLE_INVALID
-        || controller_worker_image_vmo == ZX_HANDLE_INVALID
-    {
+    let starnix_kernel_image_vmo = read_slot(SLOT_BOOT_IMAGE_STARNIX_KERNEL_VMO_H) as zx_handle_t;
+    if self_code_vmo == ZX_HANDLE_INVALID {
         return Err(ZX_ERR_INTERNAL);
     }
 
-    BootstrapNamespace::build(&[
-        BootAssetEntry::vmo(ROOT_BINARY_PATH, self_code_vmo),
-        BootAssetEntry::vmo(PROVIDER_BINARY_PATH, provider_image_vmo),
-        BootAssetEntry::vmo(CLIENT_BINARY_PATH, client_image_vmo),
-        BootAssetEntry::vmo(CONTROLLER_WORKER_BINARY_PATH, controller_worker_image_vmo),
-        BootAssetEntry::bytes("manifests/root.nxcd", ROOT_DECL_EAGER_BYTES),
-        BootAssetEntry::bytes("manifests/root-round3.nxcd", ROOT_DECL_ROUND3_BYTES),
-        BootAssetEntry::bytes("manifests/echo-provider.nxcd", PROVIDER_DECL_BYTES),
-        BootAssetEntry::bytes("manifests/echo-client.nxcd", CLIENT_DECL_BYTES),
-        BootAssetEntry::bytes(
-            "manifests/controller-worker.nxcd",
-            CONTROLLER_WORKER_DECL_BYTES,
-        ),
-    ])
+    let mut assets = Vec::new();
+    assets.push(BootAssetEntry::vmo(ROOT_BINARY_PATH, self_code_vmo));
+    assets.push(BootAssetEntry::vmo(
+        STARNIX_KERNEL_BINARY_PATH,
+        if starnix_kernel_image_vmo != ZX_HANDLE_INVALID {
+            starnix_kernel_image_vmo
+        } else {
+            self_code_vmo
+        },
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_HELLO_BINARY_PATH,
+        LINUX_HELLO_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root.nxcd",
+        ROOT_DECL_EAGER_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-round3.nxcd",
+        ROOT_DECL_ROUND3_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix.nxcd",
+        ROOT_DECL_STARNIX_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/linux-hello.nxcd",
+        LINUX_HELLO_DECL_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/echo-provider.nxcd",
+        PROVIDER_DECL_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/echo-client.nxcd",
+        CLIENT_DECL_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/controller-worker.nxcd",
+        CONTROLLER_WORKER_DECL_BYTES,
+    ));
+    if provider_image_vmo != ZX_HANDLE_INVALID {
+        assets.push(BootAssetEntry::vmo(
+            PROVIDER_BINARY_PATH,
+            provider_image_vmo,
+        ));
+    }
+    if client_image_vmo != ZX_HANDLE_INVALID {
+        assets.push(BootAssetEntry::vmo(CLIENT_BINARY_PATH, client_image_vmo));
+    }
+    if controller_worker_image_vmo != ZX_HANDLE_INVALID {
+        assets.push(BootAssetEntry::vmo(
+            CONTROLLER_WORKER_BINARY_PATH,
+            controller_worker_image_vmo,
+        ));
+    }
+
+    BootstrapNamespace::build(&assets)
 }
 
 fn build_resolver_registry(boot_root: Arc<dyn FdOps>) -> ResolverRegistry {
@@ -360,6 +431,106 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             return 1;
         }
     };
+
+    let runners = match build_runner_registry(parent_process, bootstrap_namespace.boot_root()) {
+        Ok(runners) => runners,
+        Err(status) => {
+            summary.failure_step = STEP_RESOLVE_ROOT;
+            summary.resolve_root = status as i64;
+            return 1;
+        }
+    };
+
+    if root.decl.url == "boot://root-starnix" {
+        let (linux_hello, _startup) = match resolve_root_child(&root, &resolvers, "linux_hello") {
+            Ok(component) => {
+                summary.resolve_provider = ZX_OK as i64;
+                write_summary(summary);
+                component
+            }
+            Err(status) => {
+                summary.failure_step = STEP_RESOLVE_PROVIDER;
+                summary.resolve_provider = status as i64;
+                return 1;
+            }
+        };
+        let running = match runners.launch(
+            &root.decl,
+            &linux_hello,
+            Vec::new(),
+            None,
+            CHILD_MARKER_STARNIX_KERNEL,
+        ) {
+            Ok(running) => {
+                summary.provider_launch = ZX_OK as i64;
+                write_summary(summary);
+                running
+            }
+            Err(status) => {
+                summary.failure_step = STEP_PROVIDER_LAUNCH;
+                summary.provider_launch = status as i64;
+                return 1;
+            }
+        };
+        let return_code = match read_controller_event_blocking(running.controller, ZX_TIME_INFINITE)
+        {
+            Ok(return_code) => {
+                summary.provider_event_read = ZX_OK as i64;
+                summary.provider_event_code = return_code;
+                return_code
+            }
+            Err(status) => {
+                summary.failure_step = STEP_PROVIDER_EVENT;
+                summary.provider_event_read = status as i64;
+                let _ = zx_handle_close(running.status);
+                let _ = zx_handle_close(running.controller);
+                if let Some(stdout) = running.stdout {
+                    let _ = zx_handle_close(stdout);
+                }
+                return 1;
+            }
+        };
+        let stdout = match running.stdout {
+            Some(stdout) => stdout,
+            None => {
+                summary.failure_step = STEP_STARNIX_STDOUT;
+                let _ = zx_handle_close(running.status);
+                let _ = zx_handle_close(running.controller);
+                return 1;
+            }
+        };
+        match read_socket_to_end(stdout) {
+            Ok(bytes) => {
+                if return_code != 0 {
+                    summary.failure_step = STEP_PROVIDER_EVENT;
+                    let _ = zx_handle_close(stdout);
+                    let _ = zx_handle_close(running.status);
+                    let _ = zx_handle_close(running.controller);
+                    return 1;
+                }
+                if bytes != STARNIX_HELLO_EXPECTED_STDOUT {
+                    summary.failure_step = STEP_STARNIX_STDOUT;
+                    let _ = zx_handle_close(stdout);
+                    let _ = zx_handle_close(running.status);
+                    let _ = zx_handle_close(running.controller);
+                    return 1;
+                }
+            }
+            Err(status) => {
+                summary.failure_step = STEP_STARNIX_STDOUT;
+                summary.client_route = status as i64;
+                let _ = zx_handle_close(stdout);
+                let _ = zx_handle_close(running.status);
+                let _ = zx_handle_close(running.controller);
+                return 1;
+            }
+        }
+        let _ = zx_handle_close(stdout);
+        let _ = zx_handle_close(running.status);
+        let _ = zx_handle_close(running.controller);
+        return 0;
+    }
+
     let (provider, provider_startup) = match resolve_root_child(&root, &resolvers, "echo_provider")
     {
         Ok(component) => {
@@ -382,15 +553,6 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         Err(status) => {
             summary.failure_step = STEP_RESOLVE_PROVIDER;
             summary.resolve_client = status as i64;
-            return 1;
-        }
-    };
-
-    let runners = match build_runner_registry(parent_process, bootstrap_namespace.boot_root()) {
-        Ok(runners) => runners,
-        Err(status) => {
-            summary.failure_step = STEP_RESOLVE_ROOT;
-            summary.resolve_root = status as i64;
             return 1;
         }
     };
@@ -791,6 +953,42 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
     }
 
     0
+}
+
+fn read_socket_to_end(handle: zx_handle_t) -> Result<Vec<u8>, zx_status_t> {
+    let mut out = Vec::new();
+    let mut scratch = [0u8; 128];
+    loop {
+        let mut actual = 0usize;
+        let status = zx_socket_read(handle, 0, scratch.as_mut_ptr(), scratch.len(), &mut actual);
+        if status == ZX_OK {
+            out.extend_from_slice(&scratch[..actual]);
+            continue;
+        }
+        if status == axle_types::status::ZX_ERR_SHOULD_WAIT {
+            let mut observed = 0;
+            let wait_status = zx_object_wait_one(
+                handle,
+                ZX_SOCKET_READABLE | ZX_SOCKET_PEER_CLOSED,
+                ZX_TIME_INFINITE,
+                &mut observed,
+            );
+            if wait_status != ZX_OK {
+                return Err(wait_status);
+            }
+            if (observed & ZX_SOCKET_READABLE) != 0 {
+                continue;
+            }
+            if (observed & ZX_SOCKET_PEER_CLOSED) != 0 {
+                return Ok(out);
+            }
+            return Err(axle_types::status::ZX_ERR_BAD_STATE);
+        }
+        if status == axle_types::status::ZX_ERR_PEER_CLOSED {
+            return Ok(out);
+        }
+        return Err(status);
+    }
 }
 
 fn run_dedicated_child_component(

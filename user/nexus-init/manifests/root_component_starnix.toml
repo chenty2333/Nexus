@@ -1,0 +1,25 @@
+url = "boot://root-starnix"
+startup = "eager"
+
+[program]
+runner = "elf"
+binary = "bin/nexus-init"
+args = ["nexus-init"]
+env = []
+
+[[use]]
+kind = "resolver"
+name = "boot-resolver"
+
+[[use]]
+kind = "runner"
+name = "elf"
+
+[[use]]
+kind = "runner"
+name = "starnix"
+
+[[children]]
+name = "linux_hello"
+url = "boot://linux-hello"
+startup = "eager"

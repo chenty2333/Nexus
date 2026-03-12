@@ -134,6 +134,7 @@ fn require_port_object(
             KernelObject::Port(_) => Ok(()),
             KernelObject::Process(_)
             | KernelObject::SuspendToken(_)
+            | KernelObject::GuestSession(_)
             | KernelObject::Socket(_)
             | KernelObject::Channel(_)
             | KernelObject::EventPair(_)
@@ -156,6 +157,7 @@ fn queue_user_port_packet(
             KernelObject::Port(port) => port,
             KernelObject::Process(_)
             | KernelObject::SuspendToken(_)
+            | KernelObject::GuestSession(_)
             | KernelObject::Socket(_)
             | KernelObject::Channel(_)
             | KernelObject::EventPair(_)

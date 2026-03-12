@@ -81,6 +81,7 @@ This is a deliberate bootstrap path, not yet a final fast syscall mechanism.
 
 - syscall entry
 - breakpoint
+- invalid opcode
 - page fault
 - general protection fault
 - double fault
@@ -95,6 +96,7 @@ Current stack contract:
 - ring3 -> ring0 syscalls enter on the per-CPU `RSP0` stack
 - timer, APIC, breakpoint, and fixed-vector IPI entry stay on the current kernel stack
 - `#PF` / `#GP` use a separate per-CPU fault IST
+- `#UD` currently also uses the fault IST because supervised guest-stop v1 is trap-driven
 - `#DF` keeps its own dedicated IST
 
 Axle previously used a shared IRQ IST for timer/IPI/breakpoint entry, but that shape breaks once a
@@ -106,6 +108,10 @@ stack preserves nested interrupt frames, while `#PF` / `#GP` still keep a dedica
 
 - The architecture layer is x86_64-only today.
 - The syscall mechanism is `int 0x80`, not yet a later optimized path.
+- `EFER.SCE` still remains disabled. Round-1 supervised guest execution uses ordinary
+  trap/exception handoff instead: an x86_64 guest thread bound to a guest session can execute
+  `syscall`, take `#UD`, and let the kernel hand the stop to a userspace supervisor through the
+  generic guest-session sidecar + port path.
 - The initial userspace model still uses a fixed bootstrap window and special bootstrap assumptions.
 - Ring3 is entered through bootstrap state rather than a fully general process-loader path.
 - AP local timers are enabled after `init_ap()` when TSC-deadline hardware is available; otherwise

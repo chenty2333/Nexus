@@ -1,0 +1,8 @@
+url = "boot://linux-hello"
+startup = "eager"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-hello"
+args = ["linux-hello"]
+env = []

@@ -1,4 +1,5 @@
 use super::*;
+use axle_types::status::ZX_ERR_OUT_OF_RANGE;
 
 /// Return the bootstrap current-process handle seeded into the current process.
 pub fn bootstrap_self_process_handle() -> Option<zx_handle_t> {
@@ -196,6 +197,71 @@ pub fn prepare_process_start(
             kernel.prepare_process_start(process.process_id, image_vmo.global_vmo_id, &layout)
         })
     })
+}
+
+/// Reserve one Linux-flavored exec-prepare helper without overloading the generic launch path.
+pub fn prepare_linux_exec(
+    process_handle: zx_handle_t,
+    image_vmo_handle: zx_handle_t,
+    options: u32,
+    exec_spec: &[u8],
+) -> Result<crate::task::PreparedProcessStart, zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    let header =
+        axle_types::ax_linux_exec_spec_header_t::decode(exec_spec).ok_or(ZX_ERR_INVALID_ARGS)?;
+    let stack_bytes_len =
+        usize::try_from(header.stack_bytes_len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let stack_image = exec_spec
+        .get(
+            axle_types::ax_linux_exec_spec_header_t::BYTE_LEN
+                ..axle_types::ax_linux_exec_spec_header_t::BYTE_LEN
+                    .checked_add(stack_bytes_len)
+                    .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+        )
+        .ok_or(ZX_ERR_INVALID_ARGS)?;
+    if header.version != axle_types::guest::AX_LINUX_EXEC_SPEC_V1 || header.flags != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    let prepared = with_state_mut(|state| {
+        let resolved_process =
+            state.lookup_handle(process_handle, crate::task::HandleRights::MANAGE_PROCESS)?;
+        let process = state.with_objects(|objects| {
+            Ok(match objects.get(resolved_process.object_key()) {
+                Some(KernelObject::Process(process)) => *process,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+
+        let resolved_vmo = state.lookup_handle(
+            image_vmo_handle,
+            crate::task::HandleRights::READ
+                | crate::task::HandleRights::EXECUTE
+                | crate::task::HandleRights::MAP,
+        )?;
+        let image_vmo = state.with_objects(|objects| {
+            Ok(match objects.get(resolved_vmo.object_key()) {
+                Some(KernelObject::Vmo(vmo)) => vmo.clone(),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+        let layout = resolve_process_image_layout(state, &image_vmo)?;
+        state.with_kernel_mut(|kernel| {
+            kernel.prepare_linux_process_start(
+                process.process_id,
+                image_vmo.global_vmo_id,
+                &layout,
+                header,
+                stack_image,
+            )
+        })
+    })?;
+    Ok(prepared)
 }
 
 fn resolve_process_image_layout(
@@ -703,6 +769,7 @@ fn reap_terminated_task_objects(state: &KernelState) -> Result<(), zx_status_t> 
             if state.object_handle_count(object_id) != 0 {
                 continue;
             }
+            state.forget_guest_session(thread_id);
             state.with_reactor_mut(|reactor| {
                 reactor.remove_waitable(object_id);
                 Ok(())

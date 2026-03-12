@@ -82,3 +82,11 @@ pub const AXLE_SYS_SOCKET_WRITE: SyscallNumber = 37;
 pub const AXLE_SYS_SOCKET_READ: SyscallNumber = 38;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_PROCESS_PREPARE_START: SyscallNumber = 39;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC: SyscallNumber = 40;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_GUEST_SESSION_CREATE: SyscallNumber = 41;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_GUEST_SESSION_RESUME: SyscallNumber = 42;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY: SyscallNumber = 43;

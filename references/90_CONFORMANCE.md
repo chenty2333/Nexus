@@ -76,6 +76,11 @@ Main just targets include:
   - one provider is lazy-started on first routed `/svc` open
   - `Stop` / `Kill` controller requests are exercised through the minimal component-manager path
   - `OnTerminated` controller events, not raw task-handle waits, are the lifecycle contract at this layer
+- The Round-1 Starnix bootstrap scenario also runs under `-smp 2` and now acts as one regression
+  guard for the scheduler's first-run child-launch path:
+  - a brand-new child thread must not be opportunistically migrated to an unrelated idle AP before
+    its first runnable handoff has respected its preferred / creator CPU
+  - the scenario explicitly forbids a kernel `#GP` during that launch path
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

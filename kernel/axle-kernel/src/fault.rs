@@ -165,3 +165,22 @@ pub fn handle_page_fault(
     })
     .unwrap_or(false)
 }
+
+/// Try to route one user-mode invalid-opcode trap into the generic guest-stop
+/// supervision path.
+pub fn handle_invalid_opcode(
+    trap: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+) -> bool {
+    crate::object::run_trap_blocking(|resuming_blocked_current| {
+        crate::object::with_state_mut(|state| {
+            crate::object::guest::handle_invalid_opcode_trap(
+                state,
+                trap,
+                cpu_frame,
+                resuming_blocked_current,
+            )
+        })
+    })
+    .unwrap_or(false)
+}

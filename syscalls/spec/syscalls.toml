@@ -472,3 +472,55 @@ args = [
   { name = "out_entry", ty = "*mut zx_vaddr_t" },
   { name = "out_stack", ty = "*mut zx_vaddr_t" },
 ]
+
+[[syscall]]
+name = "ax_process_prepare_linux_exec"
+nr = 40
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "process", ty = "zx_handle_t" },
+  { name = "image_vmo", ty = "zx_handle_t" },
+  { name = "options", ty = "u32" },
+  { name = "spec_bytes", ty = "*const u8" },
+  { name = "spec_len", ty = "usize" },
+  { name = "out_entry", ty = "*mut zx_vaddr_t" },
+  { name = "out_stack", ty = "*mut zx_vaddr_t" },
+]
+
+[[syscall]]
+name = "ax_guest_session_create"
+nr = 41
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "thread", ty = "zx_handle_t" },
+  { name = "sidecar_vmo", ty = "zx_handle_t" },
+  { name = "port", ty = "zx_handle_t" },
+  { name = "key", ty = "u64" },
+  { name = "options", ty = "u32" },
+  { name = "out_session", ty = "*mut zx_handle_t" },
+]
+
+[[syscall]]
+name = "ax_guest_session_resume"
+nr = 42
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "session", ty = "zx_handle_t" },
+  { name = "stop_seq", ty = "u64" },
+  { name = "options", ty = "u32" },
+]
+
+[[syscall]]
+name = "ax_guest_session_read_memory"
+nr = 43
+should = true
+ret = "zx_status_t"
+args = [
+  { name = "session", ty = "zx_handle_t" },
+  { name = "guest_addr", ty = "u64" },
+  { name = "buffer", ty = "*mut u8" },
+  { name = "len", ty = "usize" },
+]

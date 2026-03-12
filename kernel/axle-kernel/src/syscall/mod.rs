@@ -16,6 +16,8 @@ use alloc::vec::Vec;
 use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
 use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_OUT_OF_RANGE, ZX_OK};
 use axle_types::syscall_numbers::{
+    AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
+    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
     AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ,
     AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER,
     AXLE_SYS_FUTEX_REQUEUE, AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE,
@@ -38,7 +40,7 @@ use axle_types::{
 };
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 40] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 44] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -79,6 +81,10 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 40] = [
     AXLE_SYS_SOCKET_WRITE,
     AXLE_SYS_SOCKET_READ,
     AXLE_SYS_AX_PROCESS_PREPARE_START,
+    AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
+    AXLE_SYS_AX_GUEST_SESSION_CREATE,
+    AXLE_SYS_AX_GUEST_SESSION_RESUME,
+    AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -2141,6 +2147,14 @@ const PROCESS_START_DISPATCH: SyscallDispatch = SyscallDispatch::new(process_sta
 
 type PrepareStartRequest = (zx_handle_t, zx_handle_t, u32);
 
+#[derive(Debug)]
+struct PrepareLinuxExecRequest {
+    process: zx_handle_t,
+    image_vmo: zx_handle_t,
+    options: u32,
+    exec_spec: Vec<u8>,
+}
+
 fn decode_ax_process_prepare_start(
     ctx: &mut SyscallCtx,
     args: [u64; 6],
@@ -2179,6 +2193,183 @@ typed_syscall!(
 );
 const AX_PROCESS_PREPARE_START_DISPATCH: SyscallDispatch =
     SyscallDispatch::new(ax_process_prepare_start_entry);
+
+fn decode_ax_process_prepare_linux_exec(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<
+    DecodedSyscall<PrepareLinuxExecRequest, (OutValue<zx_vaddr_t>, OutValue<zx_vaddr_t>)>,
+    zx_status_t,
+> {
+    let spec_len = ctx.arg_usize_or(args, 4, ZX_ERR_OUT_OF_RANGE)?;
+    let spec_bytes = ctx.arg_const_ptr::<u8>(args, 3);
+    if spec_len != 0 && spec_bytes.is_null() {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    Ok(DecodedSyscall::new(
+        PrepareLinuxExecRequest {
+            process: ctx.arg_handle(args, 0)?,
+            image_vmo: ctx.arg_handle(args, 1)?,
+            options: ctx.arg_u32(args, 2)?,
+            exec_spec: decode_input_bytes(spec_bytes, spec_len)?,
+        },
+        (
+            ctx.decode_out_value::<zx_vaddr_t>(args, 5)?,
+            ctx.decode_extra_out_value::<zx_vaddr_t>(0)?,
+        ),
+    ))
+}
+
+fn run_ax_process_prepare_linux_exec(
+    req: PrepareLinuxExecRequest,
+) -> Result<crate::task::PreparedProcessStart, zx_status_t> {
+    crate::object::process::prepare_linux_exec(
+        req.process,
+        req.image_vmo,
+        req.options,
+        &req.exec_spec,
+    )
+}
+
+typed_syscall!(
+    AX_PROCESS_PREPARE_LINUX_EXEC_TYPED,
+    ax_process_prepare_linux_exec_entry,
+    PrepareLinuxExecRequest,
+    (OutValue<zx_vaddr_t>, OutValue<zx_vaddr_t>),
+    crate::task::PreparedProcessStart,
+    decode_ax_process_prepare_linux_exec,
+    run_ax_process_prepare_linux_exec,
+    writeback_vaddr_pair
+);
+const AX_PROCESS_PREPARE_LINUX_EXEC_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_process_prepare_linux_exec_entry);
+
+#[derive(Clone, Copy, Debug)]
+struct GuestSessionCreateRequest {
+    thread: zx_handle_t,
+    sidecar_vmo: zx_handle_t,
+    port: zx_handle_t,
+    key: u64,
+    options: u32,
+}
+
+fn decode_ax_guest_session_create(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<GuestSessionCreateRequest, OutValue<zx_handle_t>>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        GuestSessionCreateRequest {
+            thread: ctx.arg_handle(args, 0)?,
+            sidecar_vmo: ctx.arg_handle(args, 1)?,
+            port: ctx.arg_handle(args, 2)?,
+            key: args[3],
+            options: ctx.arg_u32(args, 4)?,
+        },
+        ctx.decode_out_value::<zx_handle_t>(args, 5)?,
+    ))
+}
+
+fn run_ax_guest_session_create(req: GuestSessionCreateRequest) -> Result<zx_handle_t, zx_status_t> {
+    crate::object::guest::create_guest_session(
+        req.thread,
+        req.sidecar_vmo,
+        req.port,
+        req.key,
+        req.options,
+    )
+}
+
+typed_syscall!(
+    AX_GUEST_SESSION_CREATE_TYPED,
+    ax_guest_session_create_entry,
+    GuestSessionCreateRequest,
+    OutValue<zx_handle_t>,
+    zx_handle_t,
+    decode_ax_guest_session_create,
+    run_ax_guest_session_create,
+    writeback_handle
+);
+const AX_GUEST_SESSION_CREATE_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_guest_session_create_entry);
+
+type GuestSessionResumeRequest = (zx_handle_t, u64, u32);
+
+fn decode_ax_guest_session_resume(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<GuestSessionResumeRequest, NoWriteback>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        (ctx.arg_handle(args, 0)?, args[1], ctx.arg_u32(args, 2)?),
+        NoWriteback,
+    ))
+}
+
+fn run_ax_guest_session_resume(req: GuestSessionResumeRequest) -> Result<(), zx_status_t> {
+    crate::object::guest::resume_guest_session(req.0, req.1, req.2)
+}
+
+typed_syscall!(
+    AX_GUEST_SESSION_RESUME_TYPED,
+    ax_guest_session_resume_entry,
+    GuestSessionResumeRequest,
+    NoWriteback,
+    (),
+    decode_ax_guest_session_resume,
+    run_ax_guest_session_resume,
+    writeback_noop
+);
+const AX_GUEST_SESSION_RESUME_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_guest_session_resume_entry);
+
+#[derive(Debug)]
+struct GuestSessionReadMemoryRequest {
+    session: zx_handle_t,
+    guest_addr: u64,
+    len: usize,
+}
+
+fn decode_ax_guest_session_read_memory(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<GuestSessionReadMemoryRequest, UserWriteBytes>, zx_status_t> {
+    let len = ctx.arg_usize_or(args, 3, ZX_ERR_OUT_OF_RANGE)?;
+    let out = ctx.decode_user_write_bytes(ctx.arg_ptr::<u8>(args, 2), len)?;
+    Ok(DecodedSyscall::new(
+        GuestSessionReadMemoryRequest {
+            session: ctx.arg_handle(args, 0)?,
+            guest_addr: args[1],
+            len,
+        },
+        out,
+    ))
+}
+
+fn run_ax_guest_session_read_memory(
+    req: GuestSessionReadMemoryRequest,
+) -> Result<Vec<u8>, zx_status_t> {
+    crate::object::guest::read_guest_memory(req.session, req.guest_addr, req.len)
+}
+
+fn writeback_ax_guest_session_read_memory(
+    _ctx: &mut SyscallCtx,
+    out: UserWriteBytes,
+    bytes: Vec<u8>,
+) -> Result<(), zx_status_t> {
+    write_user_bytes(out, &bytes)
+}
+
+typed_syscall!(
+    AX_GUEST_SESSION_READ_MEMORY_TYPED,
+    ax_guest_session_read_memory_entry,
+    GuestSessionReadMemoryRequest,
+    UserWriteBytes,
+    Vec<u8>,
+    decode_ax_guest_session_read_memory,
+    run_ax_guest_session_read_memory,
+    writeback_ax_guest_session_read_memory
+);
+const AX_GUEST_SESSION_READ_MEMORY_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_guest_session_read_memory_entry);
 
 fn decode_task_kill(
     ctx: &mut SyscallCtx,
@@ -2269,6 +2460,10 @@ fn syscall_dispatch(nr: SyscallNumber) -> Option<&'static SyscallDispatch> {
         AXLE_SYS_PROCESS_CREATE => Some(&PROCESS_CREATE_DISPATCH),
         AXLE_SYS_PROCESS_START => Some(&PROCESS_START_DISPATCH),
         AXLE_SYS_AX_PROCESS_PREPARE_START => Some(&AX_PROCESS_PREPARE_START_DISPATCH),
+        AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC => Some(&AX_PROCESS_PREPARE_LINUX_EXEC_DISPATCH),
+        AXLE_SYS_AX_GUEST_SESSION_CREATE => Some(&AX_GUEST_SESSION_CREATE_DISPATCH),
+        AXLE_SYS_AX_GUEST_SESSION_RESUME => Some(&AX_GUEST_SESSION_RESUME_DISPATCH),
+        AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY => Some(&AX_GUEST_SESSION_READ_MEMORY_DISPATCH),
         AXLE_SYS_TASK_KILL => Some(&TASK_KILL_DISPATCH),
         AXLE_SYS_TASK_SUSPEND => Some(&TASK_SUSPEND_DISPATCH),
         _ => None,

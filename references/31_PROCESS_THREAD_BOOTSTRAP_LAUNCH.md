@@ -107,6 +107,9 @@ The bootstrap address space is prewired enough to exercise real VM behavior earl
   the same `prepare_process_start()` path as the root manager.
 - VMOs without embedded layout metadata may now be parsed directly as ELF64 ET_EXEC images and
   converted into the same `ProcessImageLayout`.
+- Direct ELF layout parsing now accepts non-page-aligned `PT_LOAD` segments as long as
+  `p_vaddr % PAGE_SIZE == p_offset % PAGE_SIZE`; the kernel maps the page-aligned coverage and
+  preserves the intra-page delta when copying private writable segments.
 - Generic launch now builds one minimal SysV-style startup stack image containing:
   - `argc`
   - one synthetic `argv[0]`
@@ -120,6 +123,15 @@ The bootstrap address space is prewired enough to exercise real VM behavior earl
 The first generic-launch contract is now implemented without changing syscall signatures.
 
 - `prepare_process_start()` plus `start_process()` define the generic image-launch path.
+- `ax_process_prepare_linux_exec()` is now a separate Linux / Starnix-facing launch helper so the
+  generic path does not accumulate Linux `argv` / `envp` / `auxv` / vDSO policy.
+- The current v1 contract keeps the blob intentionally opaque at the syscall layer, but the shared
+  ABI now exposes one fixed header plus appended stack-image bytes. The kernel maps the ELF image
+  using the normal process-image layout path and installs the caller-provided Linux stack image
+  into the fixed startup stack VMO.
+- The current Round-1 Starnix bootstrap path is the first consumer of that helper: the userspace
+  executive prepares one Linux stack image, calls `ax_process_prepare_linux_exec()`, then starts
+  the target thread with the returned entry and stack pointer.
 - `ProcessImageLayout` is the common launch artifact for:
   - bootstrap image import
   - internal code-image VMOs
@@ -164,3 +176,6 @@ The first generic-launch contract is now implemented without changing syscall si
   - ET_EXEC
 - The startup stack image is intentionally minimal today and does not yet carry the eventual full
   launcher-provided `argv` / `environ` contract.
+- Linux exec-prepare currently supports one fixed startup stack VMO and an opaque v1 exec-spec
+  header plus appended stack-image bytes; it is enough for the Round-1 Starnix bootstrap path but
+  is not yet the final `execve()` replacement contract.

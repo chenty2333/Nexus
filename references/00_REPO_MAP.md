@@ -12,6 +12,7 @@ See also:
 - `33_IPC.md`
 - `40_VM.md`
 - `44_DATAFS_PREP_MODEL.md`
+- `50_STARNIX_EXEC_MODEL.md`
 - `90_CONFORMANCE.md`
 - `AxleKernel_Roadmap_v0.3.md`
 - `Axle_v0.3.md`
@@ -59,12 +60,15 @@ Index-style files can be shorter, but they should still point to the split docum
 - `42_VM_FAULT_COW_LOAN.md` - working
 - `43_VM_EXEC_PAGER_DEVICE_VM.md` - draft
 - `44_DATAFS_PREP_MODEL.md` - draft
+- `50_STARNIX_EXEC_MODEL.md` - draft
 - `90_CONFORMANCE.md` - working
 
 At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` and
 `44_DATAFS_PREP_MODEL.md` are the intentional `draft` references because they
-mainly cover incomplete or not-yet-stable VM / storage-prep surfaces. The rest
-of the leaf references should be treated as `working` current-state docs.
+mainly cover incomplete or not-yet-stable VM / storage-prep surfaces.
+`50_STARNIX_EXEC_MODEL.md` is also intentionally `draft` because it freezes the
+round-0 Starnix substrate / executive boundary ahead of implementation. The
+rest of the leaf references should be treated as `working` current-state docs.
 
 ## Top-level directories
 
@@ -195,6 +199,9 @@ Read these next depending on subsystem:
 
 - Storage-prep:
 - `44_DATAFS_PREP_MODEL.md`
+
+- Starnix / Linux adaptation:
+- `50_STARNIX_EXEC_MODEL.md`
 
 - Testing:
 - `90_CONFORMANCE.md`
