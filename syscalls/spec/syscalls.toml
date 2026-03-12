@@ -4,39 +4,39 @@
 # - syscall names
 # - (optional) syscall numbers
 # - argument/return ABI surface (types as strings for now)
-# - contract level (MUST/SHOULD/MAY) for Zircon-compat personality
+# - contract level (MUST/SHOULD/MAY) for the native Axle personality
 
 [[syscall]]
 name = "handle_close"
 nr = 0
 must = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
 ]
 
 [[syscall]]
 name = "object_wait_one"
 nr = 1
 must = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
-  { name = "signals", ty = "zx_signals_t" },
-  { name = "deadline", ty = "zx_time_t" },
-  { name = "observed", ty = "*mut zx_signals_t" },
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "signals", ty = "ax_signals_t" },
+  { name = "deadline", ty = "ax_time_t" },
+  { name = "observed", ty = "*mut ax_signals_t" },
 ]
 
 [[syscall]]
 name = "object_wait_async"
 nr = 2
 must = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
-  { name = "port", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "port", ty = "ax_handle_t" },
   { name = "key", ty = "u64" },
-  { name = "signals", ty = "zx_signals_t" },
+  { name = "signals", ty = "ax_signals_t" },
   { name = "options", ty = "u32" },
 ]
 
@@ -44,98 +44,98 @@ args = [
 name = "port_create"
 nr = 3
 must = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
   { name = "options", ty = "u32" },
-  { name = "out", ty = "*mut zx_handle_t" },
+  { name = "out", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "port_queue"
 nr = 4
 must = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "port", ty = "zx_handle_t" },
-  { name = "packet", ty = "*const zx_port_packet_t" },
+  { name = "port", ty = "ax_handle_t" },
+  { name = "packet", ty = "*const ax_port_packet_t" },
 ]
 
 [[syscall]]
 name = "port_wait"
 nr = 5
 must = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "port", ty = "zx_handle_t" },
-  { name = "deadline", ty = "zx_time_t" },
-  { name = "packet", ty = "*mut zx_port_packet_t" },
+  { name = "port", ty = "ax_handle_t" },
+  { name = "deadline", ty = "ax_time_t" },
+  { name = "packet", ty = "*mut ax_port_packet_t" },
 ]
 
 [[syscall]]
 name = "timer_create"
 nr = 6
 must = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
   { name = "options", ty = "u32" },
-  { name = "clock_id", ty = "zx_clock_t" },
-  { name = "out", ty = "*mut zx_handle_t" },
+  { name = "clock_id", ty = "ax_clock_t" },
+  { name = "out", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "timer_set"
 nr = 7
 must = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
-  { name = "deadline", ty = "zx_time_t" },
-  { name = "slack", ty = "zx_duration_t" },
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "deadline", ty = "ax_time_t" },
+  { name = "slack", ty = "ax_duration_t" },
 ]
 
 [[syscall]]
 name = "timer_cancel"
 nr = 8
 must = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
 ]
 
 [[syscall]]
 name = "vmo_create"
 nr = 9
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
   { name = "size", ty = "u64" },
-  { name = "options", ty = "zx_vm_option_t" },
-  { name = "out", ty = "*mut zx_handle_t" },
+  { name = "options", ty = "ax_vm_option_t" },
+  { name = "out", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "vmar_map"
 nr = 10
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "vmar", ty = "zx_handle_t" },
-  { name = "options", ty = "zx_vm_option_t" },
+  { name = "vmar", ty = "ax_handle_t" },
+  { name = "options", ty = "ax_vm_option_t" },
   { name = "vmar_offset", ty = "u64" },
-  { name = "vmo", ty = "zx_handle_t" },
+  { name = "vmo", ty = "ax_handle_t" },
   { name = "vmo_offset", ty = "u64" },
   { name = "len", ty = "u64" },
-  { name = "mapped_addr", ty = "*mut zx_vaddr_t" },
+  { name = "mapped_addr", ty = "*mut ax_vaddr_t" },
 ]
 
 [[syscall]]
 name = "vmar_unmap"
 nr = 11
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "vmar", ty = "zx_handle_t" },
-  { name = "addr", ty = "zx_vaddr_t" },
+  { name = "vmar", ty = "ax_handle_t" },
+  { name = "addr", ty = "ax_vaddr_t" },
   { name = "len", ty = "u64" },
 ]
 
@@ -143,11 +143,11 @@ args = [
 name = "vmar_protect"
 nr = 12
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "vmar", ty = "zx_handle_t" },
-  { name = "options", ty = "zx_vm_option_t" },
-  { name = "addr", ty = "zx_vaddr_t" },
+  { name = "vmar", ty = "ax_handle_t" },
+  { name = "options", ty = "ax_vm_option_t" },
+  { name = "addr", ty = "ax_vaddr_t" },
   { name = "len", ty = "u64" },
 ]
 
@@ -155,24 +155,24 @@ args = [
 name = "channel_create"
 nr = 13
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
   { name = "options", ty = "u32" },
-  { name = "out0", ty = "*mut zx_handle_t" },
-  { name = "out1", ty = "*mut zx_handle_t" },
+  { name = "out0", ty = "*mut ax_handle_t" },
+  { name = "out1", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "channel_write"
 nr = 14
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
   { name = "options", ty = "u32" },
   { name = "bytes", ty = "*const u8" },
   { name = "num_bytes", ty = "u32" },
-  { name = "handles", ty = "*const zx_handle_t" },
+  { name = "handles", ty = "*const ax_handle_t" },
   { name = "num_handles", ty = "u32" },
 ]
 
@@ -180,12 +180,12 @@ args = [
 name = "channel_read"
 nr = 15
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
   { name = "options", ty = "u32" },
   { name = "bytes", ty = "*mut u8" },
-  { name = "handles", ty = "*mut zx_handle_t" },
+  { name = "handles", ty = "*mut ax_handle_t" },
   { name = "num_bytes", ty = "u32" },
   { name = "num_handles", ty = "u32" },
   { name = "actual_bytes", ty = "*mut u32" },
@@ -196,76 +196,76 @@ args = [
 name = "eventpair_create"
 nr = 16
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
   { name = "options", ty = "u32" },
-  { name = "out0", ty = "*mut zx_handle_t" },
-  { name = "out1", ty = "*mut zx_handle_t" },
+  { name = "out0", ty = "*mut ax_handle_t" },
+  { name = "out1", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "object_signal_peer"
 nr = 17
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
-  { name = "clear_mask", ty = "zx_signals_t" },
-  { name = "set_mask", ty = "zx_signals_t" },
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "clear_mask", ty = "ax_signals_t" },
+  { name = "set_mask", ty = "ax_signals_t" },
 ]
 
 [[syscall]]
 name = "handle_duplicate"
 nr = 18
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
-  { name = "rights", ty = "zx_rights_t" },
-  { name = "out", ty = "*mut zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "rights", ty = "ax_rights_t" },
+  { name = "out", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "handle_replace"
 nr = 19
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
-  { name = "rights", ty = "zx_rights_t" },
-  { name = "out", ty = "*mut zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "rights", ty = "ax_rights_t" },
+  { name = "out", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "object_signal"
 nr = 20
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
-  { name = "clear_mask", ty = "zx_signals_t" },
-  { name = "set_mask", ty = "zx_signals_t" },
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "clear_mask", ty = "ax_signals_t" },
+  { name = "set_mask", ty = "ax_signals_t" },
 ]
 
 [[syscall]]
 name = "futex_wait"
 nr = 21
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "value_ptr", ty = "*const zx_futex_t" },
-  { name = "current_value", ty = "zx_futex_t" },
-  { name = "new_futex_owner", ty = "zx_handle_t" },
-  { name = "deadline", ty = "zx_time_t" },
+  { name = "value_ptr", ty = "*const ax_futex_t" },
+  { name = "current_value", ty = "ax_futex_t" },
+  { name = "new_futex_owner", ty = "ax_handle_t" },
+  { name = "deadline", ty = "ax_time_t" },
 ]
 
 [[syscall]]
 name = "futex_wake"
 nr = 22
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "value_ptr", ty = "*const zx_futex_t" },
+  { name = "value_ptr", ty = "*const ax_futex_t" },
   { name = "wake_count", ty = "u32" },
 ]
 
@@ -273,48 +273,48 @@ args = [
 name = "futex_requeue"
 nr = 23
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "value_ptr", ty = "*const zx_futex_t" },
+  { name = "value_ptr", ty = "*const ax_futex_t" },
   { name = "wake_count", ty = "u32" },
-  { name = "current_value", ty = "zx_futex_t" },
-  { name = "requeue_ptr", ty = "*const zx_futex_t" },
+  { name = "current_value", ty = "ax_futex_t" },
+  { name = "requeue_ptr", ty = "*const ax_futex_t" },
   { name = "requeue_count", ty = "u32" },
-  { name = "new_requeue_owner", ty = "zx_handle_t" },
+  { name = "new_requeue_owner", ty = "ax_handle_t" },
 ]
 
 [[syscall]]
 name = "futex_get_owner"
 nr = 24
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "value_ptr", ty = "*const zx_futex_t" },
-  { name = "koid", ty = "*mut zx_koid_t" },
+  { name = "value_ptr", ty = "*const ax_futex_t" },
+  { name = "koid", ty = "*mut ax_koid_t" },
 ]
 
 [[syscall]]
 name = "thread_create"
 nr = 25
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "process", ty = "zx_handle_t" },
+  { name = "process", ty = "ax_handle_t" },
   { name = "name", ty = "*const u8" },
   { name = "name_size", ty = "usize" },
   { name = "options", ty = "u32" },
-  { name = "out", ty = "*mut zx_handle_t" },
+  { name = "out", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "thread_start"
 nr = 26
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "thread", ty = "zx_handle_t" },
-  { name = "entry", ty = "zx_vaddr_t" },
-  { name = "stack", ty = "zx_vaddr_t" },
+  { name = "thread", ty = "ax_handle_t" },
+  { name = "entry", ty = "ax_vaddr_t" },
+  { name = "stack", ty = "ax_vaddr_t" },
   { name = "arg1", ty = "u64" },
   { name = "arg2", ty = "u64" },
 ]
@@ -323,50 +323,50 @@ args = [
 name = "process_create"
 nr = 27
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "parent_process", ty = "zx_handle_t" },
+  { name = "parent_process", ty = "ax_handle_t" },
   { name = "name", ty = "*const u8" },
   { name = "name_size", ty = "usize" },
   { name = "options", ty = "u32" },
-  { name = "out_process", ty = "*mut zx_handle_t" },
-  { name = "out_vmar", ty = "*mut zx_handle_t" },
+  { name = "out_process", ty = "*mut ax_handle_t" },
+  { name = "out_vmar", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "vmar_allocate"
 nr = 28
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "parent_vmar", ty = "zx_handle_t" },
-  { name = "options", ty = "zx_vm_option_t" },
+  { name = "parent_vmar", ty = "ax_handle_t" },
+  { name = "options", ty = "ax_vm_option_t" },
   { name = "offset", ty = "u64" },
   { name = "size", ty = "u64" },
-  { name = "out_child_vmar", ty = "*mut zx_handle_t" },
-  { name = "out_child_addr", ty = "*mut zx_vaddr_t" },
+  { name = "out_child_vmar", ty = "*mut ax_handle_t" },
+  { name = "out_child_addr", ty = "*mut ax_vaddr_t" },
 ]
 
 [[syscall]]
 name = "vmar_destroy"
 nr = 29
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "vmar", ty = "zx_handle_t" },
+  { name = "vmar", ty = "ax_handle_t" },
 ]
 
 [[syscall]]
 name = "process_start"
 nr = 30
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "process", ty = "zx_handle_t" },
-  { name = "thread", ty = "zx_handle_t" },
-  { name = "entry", ty = "zx_vaddr_t" },
-  { name = "stack", ty = "zx_vaddr_t" },
-  { name = "arg_handle", ty = "zx_handle_t" },
+  { name = "process", ty = "ax_handle_t" },
+  { name = "thread", ty = "ax_handle_t" },
+  { name = "entry", ty = "ax_vaddr_t" },
+  { name = "stack", ty = "ax_vaddr_t" },
+  { name = "arg_handle", ty = "ax_handle_t" },
   { name = "arg2", ty = "u64" },
 ]
 
@@ -374,28 +374,28 @@ args = [
 name = "task_kill"
 nr = 31
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
 ]
 
 [[syscall]]
 name = "task_suspend"
 nr = 32
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
-  { name = "out_token", ty = "*mut zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "out_token", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "vmo_read"
 nr = 33
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
   { name = "buffer", ty = "*mut u8" },
   { name = "offset", ty = "u64" },
   { name = "buffer_size", ty = "usize" },
@@ -405,9 +405,9 @@ args = [
 name = "vmo_write"
 nr = 34
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
   { name = "buffer", ty = "*const u8" },
   { name = "offset", ty = "u64" },
   { name = "buffer_size", ty = "usize" },
@@ -417,9 +417,9 @@ args = [
 name = "vmo_set_size"
 nr = 35
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
   { name = "size", ty = "u64" },
 ]
 
@@ -427,20 +427,20 @@ args = [
 name = "socket_create"
 nr = 36
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
   { name = "options", ty = "u32" },
-  { name = "out0", ty = "*mut zx_handle_t" },
-  { name = "out1", ty = "*mut zx_handle_t" },
+  { name = "out0", ty = "*mut ax_handle_t" },
+  { name = "out1", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "socket_write"
 nr = 37
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
   { name = "options", ty = "u32" },
   { name = "buffer", ty = "*const u8" },
   { name = "buffer_size", ty = "usize" },
@@ -451,9 +451,9 @@ args = [
 name = "socket_read"
 nr = 38
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "handle", ty = "zx_handle_t" },
+  { name = "handle", ty = "ax_handle_t" },
   { name = "options", ty = "u32" },
   { name = "buffer", ty = "*mut u8" },
   { name = "buffer_size", ty = "usize" },
@@ -464,51 +464,51 @@ args = [
 name = "ax_process_prepare_start"
 nr = 39
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "process", ty = "zx_handle_t" },
-  { name = "image_vmo", ty = "zx_handle_t" },
+  { name = "process", ty = "ax_handle_t" },
+  { name = "image_vmo", ty = "ax_handle_t" },
   { name = "options", ty = "u32" },
-  { name = "out_entry", ty = "*mut zx_vaddr_t" },
-  { name = "out_stack", ty = "*mut zx_vaddr_t" },
+  { name = "out_entry", ty = "*mut ax_vaddr_t" },
+  { name = "out_stack", ty = "*mut ax_vaddr_t" },
 ]
 
 [[syscall]]
 name = "ax_process_prepare_linux_exec"
 nr = 40
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "process", ty = "zx_handle_t" },
-  { name = "image_vmo", ty = "zx_handle_t" },
+  { name = "process", ty = "ax_handle_t" },
+  { name = "image_vmo", ty = "ax_handle_t" },
   { name = "options", ty = "u32" },
   { name = "spec_bytes", ty = "*const u8" },
   { name = "spec_len", ty = "usize" },
-  { name = "out_entry", ty = "*mut zx_vaddr_t" },
-  { name = "out_stack", ty = "*mut zx_vaddr_t" },
+  { name = "out_entry", ty = "*mut ax_vaddr_t" },
+  { name = "out_stack", ty = "*mut ax_vaddr_t" },
 ]
 
 [[syscall]]
 name = "ax_guest_session_create"
 nr = 41
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "thread", ty = "zx_handle_t" },
-  { name = "sidecar_vmo", ty = "zx_handle_t" },
-  { name = "port", ty = "zx_handle_t" },
+  { name = "thread", ty = "ax_handle_t" },
+  { name = "sidecar_vmo", ty = "ax_handle_t" },
+  { name = "port", ty = "ax_handle_t" },
   { name = "key", ty = "u64" },
   { name = "options", ty = "u32" },
-  { name = "out_session", ty = "*mut zx_handle_t" },
+  { name = "out_session", ty = "*mut ax_handle_t" },
 ]
 
 [[syscall]]
 name = "ax_guest_session_resume"
 nr = 42
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "session", ty = "zx_handle_t" },
+  { name = "session", ty = "ax_handle_t" },
   { name = "stop_seq", ty = "u64" },
   { name = "options", ty = "u32" },
 ]
@@ -517,9 +517,9 @@ args = [
 name = "ax_guest_session_read_memory"
 nr = 43
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "session", ty = "zx_handle_t" },
+  { name = "session", ty = "ax_handle_t" },
   { name = "guest_addr", ty = "u64" },
   { name = "buffer", ty = "*mut u8" },
   { name = "len", ty = "usize" },
@@ -529,9 +529,9 @@ args = [
 name = "ax_guest_session_write_memory"
 nr = 44
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "session", ty = "zx_handle_t" },
+  { name = "session", ty = "ax_handle_t" },
   { name = "guest_addr", ty = "u64" },
   { name = "buffer", ty = "*const u8" },
   { name = "len", ty = "usize" },
@@ -541,10 +541,10 @@ args = [
 name = "ax_process_start_guest"
 nr = 45
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "process", ty = "zx_handle_t" },
-  { name = "thread", ty = "zx_handle_t" },
+  { name = "process", ty = "ax_handle_t" },
+  { name = "thread", ty = "ax_handle_t" },
   { name = "regs", ty = "*const ax_guest_x64_regs_t" },
   { name = "options", ty = "u32" },
 ]
@@ -553,9 +553,9 @@ args = [
 name = "ax_thread_start_guest"
 nr = 46
 should = true
-ret = "zx_status_t"
+ret = "ax_status_t"
 args = [
-  { name = "thread", ty = "zx_handle_t" },
+  { name = "thread", ty = "ax_handle_t" },
   { name = "regs", ty = "*const ax_guest_x64_regs_t" },
   { name = "options", ty = "u32" },
 ]

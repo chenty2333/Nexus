@@ -9,6 +9,7 @@ members = [
   "crates/nexus-fs-proto",
   "crates/nexus-fs-model",
   "crates/axle-types",
+  "crates/libax",
   "crates/libzircon",
   "crates/nexus-component",
   "crates/nexus-io",

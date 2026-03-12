@@ -87,13 +87,14 @@ rest of the leaf references should be treated as `working` current-state docs.
 
 ## Workspace crates
 
-- `crates/axle-types` - shared ABI types, constants, and Zircon-style definitions
+- `crates/axle-types` - shared native `ax_*` UAPI types/constants plus frozen `zx_*` compat aliases
 - `crates/axle-core` - host-testable core semantics: handles, CSpace, revocation, signals, ports, timers
 - `crates/axle-mm` - VM metadata core: VMO, VMAR, VMA, frame metadata, fault metadata
 - `crates/axle-page-table` - page-table transaction and mapping support
 - `crates/axle-sync` - synchronization primitives such as the SPSC queue
 - `crates/axle-arch-x86_64` - userspace-side x86_64 ABI glue and syscall entry helpers
-- `crates/libzircon` - thin `zx_*` userspace wrappers over the current Axle `int 0x80` ABI
+- `crates/libax` - thin native `ax_*` userspace facade; today it bridges into the frozen `libzircon` compat wrappers while the kernel/user ABI migrates
+- `crates/libzircon` - frozen `zx_*` compat wrappers over the current Axle `int 0x80` ABI
 - `crates/nexus-component` - minimal component declaration IR, resolver result shape, bootstrap-channel start payloads, and tiny lifecycle/directory messages
 - `crates/nexus-fs-proto` - shared filesystem wire contract: identities, open
   flags, `GetVmo`, and routed directory/file operations used by `nexus-io` and

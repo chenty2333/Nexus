@@ -3,7 +3,7 @@ name = "axle-types"
 version = "0.1.0"
 edition = "2024"
 license = "Unlicense"
-description = "Zircon-compatible public types/constants for Axle/Nexus (no_std)."
+description = "Public UAPI types/constants for Axle/Nexus plus frozen Zircon-compat aliases (no_std)."
 
 [features]
 default = []

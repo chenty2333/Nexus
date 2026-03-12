@@ -118,6 +118,8 @@ depends on: C3, A1
 
 = userspace `zx_*` stubs, ABI types/struct glue, syscall wrappers, low-logic mapping onto Axle
 = current tree now has a shared `libzircon` crate wrapping the bootstrap `int 0x80` ABI, including the current stack-extended `channel_read` calling convention
+= `libzircon` is now a frozen compat personality rather than the long-term native UAPI
+= a new `libax` crate is the native facade for future userspace work; today it bridges into `libzircon` while handle/codec internals are migrated
 depends on: Axle syscall/object semantics being stable enough to wrap cleanly
 
 #### F2. async/reactor base `[x]`

@@ -1,0 +1,10 @@
+[package]
+name = "libax"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+publish = false
+
+[dependencies]
+axle-types = { path = "../axle-types", default-features = false }
+libzircon = { path = "../libzircon", default-features = false }
