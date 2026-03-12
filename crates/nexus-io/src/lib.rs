@@ -26,5 +26,6 @@ pub use crate::fd::{
     SeekOrigin, SocketFd, StdioFd, VmoFlags, WaitSpec,
 };
 pub use crate::namespace::{
-    NamespaceEntry, NamespaceMatch, NamespaceTrie, normalize_namespace_path,
+    NamespaceEntry, NamespaceMatch, NamespaceTrie, normalize_namespace_path, open_namespace_path,
 };
+pub use nexus_fs_proto::{NodeDescriptor, NodeKind, ObjectIdentity};

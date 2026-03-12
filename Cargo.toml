@@ -6,6 +6,7 @@ members = [
   "crates/axle-mm",
   "crates/axle-page-table",
   "crates/axle-sync",
+  "crates/nexus-fs-proto",
   "crates/axle-types",
   "crates/libzircon",
   "crates/nexus-component",

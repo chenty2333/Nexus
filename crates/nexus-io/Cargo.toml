@@ -9,6 +9,7 @@ publish = false
 axle-types = { path = "../axle-types", default-features = false }
 bitflags = { version = "2.6", default-features = false }
 libzircon = { path = "../libzircon", default-features = false }
+nexus-fs-proto = { path = "../nexus-fs-proto", default-features = false }
 
 [features]
 default = []

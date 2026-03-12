@@ -14,6 +14,7 @@ axle-arch-x86_64 = { path = "../../crates/axle-arch-x86_64", default-features = 
 axle-types = { path = "../../crates/axle-types", default-features = false }
 libzircon = { path = "../../crates/libzircon", default-features = false }
 nexus-component = { path = "../../crates/nexus-component", default-features = false }
+nexus-fs-proto = { path = "../../crates/nexus-fs-proto", default-features = false }
 nexus-io = { path = "../../crates/nexus-io", default-features = false }
 
 [build-dependencies]

@@ -6,12 +6,14 @@
 
 extern crate alloc;
 
+mod fs;
 mod lifecycle;
 mod namespace;
 mod resolver;
 mod runner;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
@@ -20,21 +22,22 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::status::{ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NOT_FOUND, ZX_OK};
 use axle_types::{zx_handle_t, zx_status_t};
-use libzircon::{ZX_TIME_INFINITE, zx_channel_create, zx_channel_write, zx_handle_close};
+use libzircon::{ZX_TIME_INFINITE, zx_channel_create, zx_handle_close};
 use nexus_component::{
     ControllerRequest, NamespaceEntry, ResolvedComponent, ResolverRecord, StartupMode,
 };
+use nexus_io::{FdFlags, FdOps, FdTable, NamespaceTrie, OpenFlags, RemoteDir, open_namespace_path};
 
+use crate::fs::{
+    proxy_directory_requests_until_peer_closed, read_directory_request_for_launch,
+    root_directory_descriptor, run_echo_fs_provider,
+};
 use crate::lifecycle::{
     MinimalRole, read_component_start_info_minimal, read_controller_event_blocking,
     read_controller_request_blocking, run_controller_lifecycle_step, send_controller_event,
     send_status_event,
 };
-use crate::namespace::{
-    CapabilityRegistry, build_namespace_entries, encode_directory_open_request_minimal,
-    forward_directory_open_request, publish_protocols, read_directory_open_request_blocking,
-    read_directory_open_request_minimal,
-};
+use crate::namespace::{CapabilityRegistry, build_namespace_entries, publish_protocols};
 use crate::resolver::{
     ResolverRegistry, decode_resolved_component, resolve_root_child, resolve_with_realm,
 };
@@ -195,6 +198,9 @@ pub fn program_start(bootstrap_channel: zx_handle_t, arg1: u64) -> ! {
     let _ = (bootstrap_channel, arg1);
     ROLE.store(ROLE_ROOT, Ordering::Relaxed);
     let mut summary = ComponentSummary::default();
+    summary.failure_step = STEP_RESOLVE_ROOT;
+    write_summary(&summary);
+    summary.failure_step = 0;
     let status = run_component_manager(&mut summary);
     write_summary(&summary);
     write_slot(SLOT_OK, u64::from(status == 0));
@@ -347,6 +353,7 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
     let root = match resolve_root_component(&resolvers) {
         Ok(component) => {
             summary.resolve_root = ZX_OK as i64;
+            write_summary(summary);
             component
         }
         Err(status) => {
@@ -359,6 +366,7 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
     {
         Ok(component) => {
             summary.resolve_provider = ZX_OK as i64;
+            write_summary(summary);
             component
         }
         Err(status) => {
@@ -370,6 +378,7 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
     let (client, _client_startup) = match resolve_root_child(&root, &resolvers, "echo_client") {
         Ok(component) => {
             summary.resolve_client = ZX_OK as i64;
+            write_summary(summary);
             component
         }
         Err(status) => {
@@ -396,38 +405,23 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         if status != ZX_OK {
             summary.provider_outgoing_pair = status as i64;
             summary.failure_step = STEP_PROVIDER_OUTGOING_PAIR;
+            write_summary(summary);
             return 1;
         }
         summary.provider_outgoing_pair = ZX_OK as i64;
+        write_summary(summary);
         publish_protocols(&provider.decl, &mut capability_registry, outgoing_client);
 
         let client_namespace = match build_namespace_entries(&client.decl, &mut capability_registry)
         {
             Ok(entries) => {
                 summary.client_route = ZX_OK as i64;
+                write_summary(summary);
                 entries
             }
             Err(status) => {
                 summary.client_route = status as i64;
                 summary.failure_step = STEP_CLIENT_ROUTE;
-                return 1;
-            }
-        };
-
-        let client_running = match runners.launch(
-            &root.decl,
-            &client,
-            client_namespace,
-            None,
-            CHILD_MARKER_CLIENT,
-        ) {
-            Ok(running) => {
-                summary.client_launch = ZX_OK as i64;
-                running
-            }
-            Err(status) => {
-                summary.client_launch = status as i64;
-                summary.failure_step = STEP_CLIENT_LAUNCH;
                 return 1;
             }
         };
@@ -441,11 +435,31 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         ) {
             Ok(running) => {
                 summary.provider_launch = ZX_OK as i64;
+                write_summary(summary);
                 running
             }
             Err(status) => {
                 summary.provider_launch = status as i64;
                 summary.failure_step = STEP_PROVIDER_LAUNCH;
+                return 1;
+            }
+        };
+
+        let client_running = match runners.launch(
+            &root.decl,
+            &client,
+            client_namespace,
+            None,
+            CHILD_MARKER_CLIENT,
+        ) {
+            Ok(running) => {
+                summary.client_launch = ZX_OK as i64;
+                write_summary(summary);
+                running
+            }
+            Err(status) => {
+                summary.client_launch = status as i64;
+                summary.failure_step = STEP_CLIENT_LAUNCH;
                 return 1;
             }
         };
@@ -557,38 +571,23 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         if status != ZX_OK {
             summary.provider_outgoing_pair = status as i64;
             summary.failure_step = STEP_PROVIDER_OUTGOING_PAIR;
+            write_summary(summary);
             return 1;
         }
         summary.provider_outgoing_pair = ZX_OK as i64;
+        write_summary(summary);
         publish_protocols(&provider.decl, &mut capability_registry, outgoing_client);
 
         let client_namespace = match build_namespace_entries(&client.decl, &mut capability_registry)
         {
             Ok(entries) => {
                 summary.client_route = ZX_OK as i64;
+                write_summary(summary);
                 entries
             }
             Err(status) => {
                 summary.client_route = status as i64;
                 summary.failure_step = STEP_CLIENT_ROUTE;
-                return 1;
-            }
-        };
-
-        let client_running = match runners.launch(
-            &root.decl,
-            &client,
-            client_namespace,
-            None,
-            CHILD_MARKER_CLIENT,
-        ) {
-            Ok(running) => {
-                summary.client_launch = ZX_OK as i64;
-                running
-            }
-            Err(status) => {
-                summary.client_launch = status as i64;
-                summary.failure_step = STEP_CLIENT_LAUNCH;
                 return 1;
             }
         };
@@ -602,11 +601,31 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         ) {
             Ok(running) => {
                 summary.provider_launch = ZX_OK as i64;
+                write_summary(summary);
                 running
             }
             Err(status) => {
                 summary.provider_launch = status as i64;
                 summary.failure_step = STEP_PROVIDER_LAUNCH;
+                return 1;
+            }
+        };
+
+        let client_running = match runners.launch(
+            &root.decl,
+            &client,
+            client_namespace,
+            None,
+            CHILD_MARKER_CLIENT,
+        ) {
+            Ok(running) => {
+                summary.client_launch = ZX_OK as i64;
+                write_summary(summary);
+                running
+            }
+            Err(status) => {
+                summary.client_launch = status as i64;
+                summary.failure_step = STEP_CLIENT_LAUNCH;
                 return 1;
             }
         };
@@ -619,9 +638,11 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         if status != ZX_OK {
             summary.client_route = status as i64;
             summary.failure_step = STEP_CLIENT_ROUTE;
+            write_summary(summary);
             return 1;
         }
         summary.client_route = ZX_OK as i64;
+        write_summary(summary);
 
         let client_running = match runners.launch(
             &root.decl,
@@ -635,6 +656,7 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         ) {
             Ok(running) => {
                 summary.client_launch = ZX_OK as i64;
+                write_summary(summary);
                 running
             }
             Err(status) => {
@@ -644,9 +666,13 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             }
         };
 
-        let open_request = match read_directory_open_request_blocking(svc_server, ZX_TIME_INFINITE)
-        {
-            Ok(request) => request,
+        let first_request = match read_directory_request_for_launch(svc_server) {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                summary.client_route = ZX_ERR_BAD_STATE as i64;
+                summary.failure_step = STEP_CLIENT_ROUTE;
+                return 1;
+            }
             Err(status) => {
                 summary.client_route = status as i64;
                 summary.failure_step = STEP_CLIENT_ROUTE;
@@ -664,9 +690,11 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         if status != ZX_OK {
             summary.provider_outgoing_pair = status as i64;
             summary.failure_step = STEP_PROVIDER_OUTGOING_PAIR;
+            write_summary(summary);
             return 1;
         }
         summary.provider_outgoing_pair = ZX_OK as i64;
+        write_summary(summary);
 
         let provider_running = match runners.launch(
             &root.decl,
@@ -678,6 +706,7 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             Ok(running) => {
                 summary.provider_launch = ZX_OK as i64;
                 summary.lazy_provider_route_launch = ZX_OK as i64;
+                write_summary(summary);
                 running
             }
             Err(status) => {
@@ -688,12 +717,17 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             }
         };
 
-        let status = forward_directory_open_request(provider_outgoing_client, open_request);
-        if status != ZX_OK {
+        if let Err(status) = proxy_directory_requests_until_peer_closed(
+            svc_server,
+            provider_outgoing_client,
+            Some(first_request),
+        ) {
             summary.client_route = status as i64;
             summary.failure_step = STEP_CLIENT_ROUTE;
             return 1;
         }
+        let _ = zx_handle_close(provider_outgoing_client);
+        let _ = zx_handle_close(svc_server);
 
         (client_running, provider_running)
     };
@@ -816,102 +850,77 @@ fn run_echo_provider(start_info: &lifecycle::MinimalStartInfo) -> i32 {
     let Some(outgoing) = start_info.outgoing else {
         return 1;
     };
-    let (path_matches, object) = match read_directory_open_request_minimal(outgoing) {
-        Ok(request) => request,
-        Err(_) => return 1,
-    };
     record_child_stage(CHILD_MARKER_PROVIDER, 5, ZX_OK);
-    if !path_matches {
-        let _ = zx_handle_close(object);
-        return 1;
+    let code = run_echo_fs_provider(outgoing, ECHO_REQUEST);
+    if code == 0 {
+        record_child_stage(CHILD_MARKER_PROVIDER, 6, ZX_OK);
     }
-    let mut bytes = [0u8; MAX_SMALL_CHANNEL_BYTES];
-    let mut handles = [ZX_HANDLE_INVALID; MAX_SMALL_CHANNEL_HANDLES];
-    let (actual_bytes, actual_handles) =
-        match lifecycle::read_channel_blocking(object, &mut bytes, &mut handles) {
-            Ok(message) => message,
-            Err(_) => {
-                return 1;
-            }
-        };
-    record_child_stage(CHILD_MARKER_PROVIDER, 6, ZX_OK);
-    if actual_handles != 0 || &bytes[..actual_bytes] != ECHO_REQUEST {
-        return 1;
-    }
-    let status = zx_channel_write(
-        object,
-        0,
-        bytes.as_ptr(),
-        actual_bytes as u32,
-        core::ptr::null(),
-        0,
-    );
-    if status == ZX_OK { 0 } else { 1 }
+    code
 }
 
 fn run_echo_client(start_info: &lifecycle::MinimalStartInfo) -> i32 {
     record_child_stage(CHILD_MARKER_CLIENT, 4, ZX_OK);
     let svc = match start_info.svc {
         Some(handle) => handle,
-        None => return 1,
+        None => return 11,
+    };
+    let mut fd_table = FdTable::new();
+    let svc_fd = match fd_table.open(
+        Arc::new(RemoteDir::from_descriptor(svc, root_directory_descriptor())),
+        OpenFlags::READABLE | OpenFlags::DIRECTORY,
+        FdFlags::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return 12,
     };
 
-    let mut client_end = ZX_HANDLE_INVALID;
-    let mut server_end = ZX_HANDLE_INVALID;
-    if zx_channel_create(0, &mut client_end, &mut server_end) != ZX_OK {
-        return 1;
-    }
-    let mut open_bytes = [0u8; MAX_SMALL_CHANNEL_BYTES];
-    let open_len =
-        match encode_directory_open_request_minimal(&mut open_bytes, ECHO_PROTOCOL_NAME, 0) {
-            Ok(len) => len,
-            Err(_) => {
-                let _ = zx_handle_close(client_end);
-                let _ = zx_handle_close(server_end);
-                return 1;
-            }
-        };
-    let mut open_handles = [server_end];
-    let status = zx_channel_write(
-        svc,
-        0,
-        open_bytes.as_ptr(),
-        open_len as u32,
-        open_handles.as_mut_ptr(),
-        1,
-    );
-    if status != ZX_OK {
-        let _ = zx_handle_close(client_end);
-        return 1;
+    let mut namespace = NamespaceTrie::<Arc<dyn FdOps>>::new();
+    let svc_mount = match fd_table.get(svc_fd) {
+        Some(entry) => Arc::clone(entry.description().ops()),
+        None => return 14,
+    };
+    if namespace.insert(SVC_NAMESPACE_PATH, svc_mount).is_err() {
+        return 15;
     }
     record_child_stage(CHILD_MARKER_CLIENT, 5, ZX_OK);
 
-    let status = zx_channel_write(
-        client_end,
-        0,
-        ECHO_REQUEST.as_ptr(),
-        ECHO_REQUEST.len() as u32,
-        core::ptr::null(),
-        0,
-    );
-    if status != ZX_OK {
-        let _ = zx_handle_close(client_end);
-        return 1;
-    }
-    record_child_stage(CHILD_MARKER_CLIENT, 6, ZX_OK);
+    let echo = match open_namespace_path(
+        &namespace,
+        "/svc/nexus.echo.Echo",
+        OpenFlags::READABLE | OpenFlags::WRITABLE,
+    ) {
+        Ok(ops) => ops,
+        Err(_) => return 16,
+    };
+    let echo_fd = match fd_table.open(
+        echo,
+        OpenFlags::READABLE | OpenFlags::WRITABLE,
+        FdFlags::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return 17,
+    };
+    let echo_clone_fd = match fd_table.clone_fd(echo_fd, FdFlags::empty()) {
+        Ok(fd) => fd,
+        Err(_) => return 18,
+    };
 
-    let mut reply = [0u8; MAX_SMALL_CHANNEL_BYTES];
-    let mut handles = [ZX_HANDLE_INVALID; MAX_SMALL_CHANNEL_HANDLES];
-    let (reply_len, handle_count) =
-        match lifecycle::read_channel_blocking(client_end, &mut reply, &mut handles) {
-            Ok(message) => message,
-            Err(_) => {
-                return 1;
-            }
-        };
-    if handle_count != 0 || &reply[..reply_len] != ECHO_REQUEST {
-        return 1;
+    if fd_table.write(echo_clone_fd, ECHO_REQUEST).is_err() {
+        return 19;
     }
+    let mut reply = [0u8; MAX_SMALL_CHANNEL_BYTES];
+    let reply_len = match fd_table.read(echo_clone_fd, &mut reply) {
+        Ok(actual) => actual,
+        Err(_) => return 20,
+    };
+    record_child_stage(CHILD_MARKER_CLIENT, 6, ZX_OK);
+    if &reply[..reply_len] != ECHO_REQUEST {
+        return 21;
+    }
+
+    let _ = fd_table.close(echo_clone_fd);
+    let _ = fd_table.close(echo_fd);
+    let _ = fd_table.close(svc_fd);
     0
 }
 

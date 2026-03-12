@@ -7,13 +7,22 @@ use axle_types::signals::{
     ZX_SOCKET_READABLE, ZX_SOCKET_WRITABLE,
 };
 use axle_types::status::{
-    ZX_ERR_BAD_HANDLE, ZX_ERR_NOT_DIR, ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_OK,
+    ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_PATH, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NOT_DIR,
+    ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_ERR_SHOULD_WAIT, ZX_OK,
 };
 use axle_types::{zx_handle_t, zx_signals_t, zx_status_t};
 use bitflags::bitflags;
 use core::fmt;
 use core::sync::atomic::{AtomicU32, Ordering};
-use libzircon::{zx_handle_close, zx_socket_read, zx_socket_write};
+use libzircon::{
+    zx_channel_create, zx_channel_read_alloc, zx_channel_write, zx_handle_close, zx_socket_read,
+    zx_socket_write,
+};
+use nexus_fs_proto::{
+    CloneRequest, CloseRequest, CodecError, DescribeResponse, GetVmoRequest, GetVmoResponse,
+    NodeDescriptor, NodeKind, ObjectIdentity, OpenRequest, ReadRequest, ReadResponse, WriteRequest,
+    WriteResponse,
+};
 
 /// POSIX-shaped file descriptor number.
 pub type RawFd = i32;
@@ -290,6 +299,69 @@ impl FdTable {
         self.entries.get(fd_index(fd)?).and_then(Option::as_ref)
     }
 
+    /// Read from one fd.
+    pub fn read(&self, fd: RawFd, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
+        self.get(fd)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .description()
+            .ops()
+            .read(buffer)
+    }
+
+    /// Write to one fd.
+    pub fn write(&self, fd: RawFd, buffer: &[u8]) -> Result<usize, zx_status_t> {
+        self.get(fd)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .description()
+            .ops()
+            .write(buffer)
+    }
+
+    /// Seek one fd.
+    pub fn seek(&self, fd: RawFd, origin: SeekOrigin, offset: i64) -> Result<u64, zx_status_t> {
+        self.get(fd)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .description()
+            .ops()
+            .seek(origin, offset)
+    }
+
+    /// Open one relative path beneath an fd that behaves like a directory.
+    pub fn openat(
+        &mut self,
+        fd: RawFd,
+        path: &str,
+        open_flags: OpenFlags,
+        fd_flags: FdFlags,
+    ) -> Result<RawFd, zx_status_t> {
+        let opened = self
+            .get(fd)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .description()
+            .ops()
+            .openat(path, open_flags)?;
+        self.open(opened, open_flags, fd_flags)
+    }
+
+    /// Return readiness interest for one fd when supported.
+    pub fn wait_interest(&self, fd: RawFd) -> Result<Option<WaitSpec>, zx_status_t> {
+        Ok(self
+            .get(fd)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .description()
+            .ops()
+            .wait_interest())
+    }
+
+    /// Request a read-only VMO from one fd when supported.
+    pub fn as_vmo(&self, fd: RawFd, flags: VmoFlags) -> Result<zx_handle_t, zx_status_t> {
+        self.get(fd)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .description()
+            .ops()
+            .as_vmo(flags)
+    }
+
     /// Duplicate one fd so both entries reference the same open description.
     pub fn duplicate(&mut self, fd: RawFd, new_flags: FdFlags) -> Result<RawFd, zx_status_t> {
         let entry = self.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?.clone();
@@ -350,18 +422,18 @@ impl FdTable {
     }
 }
 
-/// Channel-backed placeholder for a remote file protocol.
 #[derive(Debug)]
-pub struct RemoteFile {
+struct RemoteNode {
     handle: OwnedHandle,
+    descriptor: NodeDescriptor,
     wait_interest: WaitSpec,
 }
 
-impl RemoteFile {
-    /// Wrap one remote file channel.
-    pub fn new(handle: zx_handle_t) -> Self {
+impl RemoteNode {
+    fn new(handle: zx_handle_t, descriptor: NodeDescriptor) -> Self {
         Self {
             handle: OwnedHandle::new(handle),
+            descriptor,
             wait_interest: WaitSpec::new(
                 handle,
                 ZX_CHANNEL_READABLE | ZX_CHANNEL_WRITABLE | ZX_CHANNEL_PEER_CLOSED,
@@ -369,19 +441,80 @@ impl RemoteFile {
         }
     }
 
+    fn handle(&self) -> zx_handle_t {
+        self.handle.get()
+    }
+
+    fn descriptor(&self) -> NodeDescriptor {
+        self.descriptor
+    }
+}
+
+/// Channel-backed remote file or service endpoint.
+#[derive(Debug)]
+pub struct RemoteFile {
+    node: RemoteNode,
+}
+
+impl RemoteFile {
+    /// Wrap one remote file channel using the default bootstrap descriptor.
+    pub fn new(handle: zx_handle_t) -> Self {
+        Self::from_descriptor(handle, default_remote_file_descriptor())
+    }
+
+    /// Wrap one remote file channel with an explicit descriptor.
+    pub fn from_descriptor(handle: zx_handle_t, descriptor: NodeDescriptor) -> Self {
+        Self {
+            node: RemoteNode::new(handle, descriptor),
+        }
+    }
+
     /// Borrow the underlying channel handle.
     pub fn handle(&self) -> zx_handle_t {
-        self.handle.get()
+        self.node.handle()
+    }
+
+    /// Borrow the remote descriptor carried by this handle.
+    pub fn descriptor(&self) -> NodeDescriptor {
+        self.node.descriptor()
     }
 }
 
 impl FdOps for RemoteFile {
-    fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
-        Err(ZX_ERR_NOT_SUPPORTED)
+    fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
+        let handle = checked_channel_handle(self.node.handle())?;
+        let request = ReadRequest {
+            object: self.node.descriptor.identity,
+            flags: 0,
+            max_bytes: u32::try_from(buffer.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+        };
+        write_encoded_message(handle, request.encode_channel_message())?;
+        let (bytes, handles) = read_channel_message(handle)?;
+        let response =
+            ReadResponse::decode_channel_message(&bytes, &handles).map_err(map_codec_error)?;
+        if response.status != ZX_OK {
+            return Err(response.status);
+        }
+        let actual = response.bytes.len().min(buffer.len());
+        buffer[..actual].copy_from_slice(&response.bytes[..actual]);
+        Ok(actual)
     }
 
-    fn write(&self, _buffer: &[u8]) -> Result<usize, zx_status_t> {
-        Err(ZX_ERR_NOT_SUPPORTED)
+    fn write(&self, buffer: &[u8]) -> Result<usize, zx_status_t> {
+        let handle = checked_channel_handle(self.node.handle())?;
+        let request = WriteRequest {
+            object: self.node.descriptor.identity,
+            flags: 0,
+            bytes: buffer.to_vec(),
+        };
+        write_encoded_message(handle, request.encode_channel_message())?;
+        let (bytes, handles) = read_channel_message(handle)?;
+        let response =
+            WriteResponse::decode_channel_message(&bytes, &handles).map_err(map_codec_error)?;
+        if response.status != ZX_OK {
+            return Err(response.status);
+        }
+        Ok(response.actual as usize)
     }
 
     fn seek(&self, _origin: SeekOrigin, _offset: i64) -> Result<u64, zx_status_t> {
@@ -389,40 +522,65 @@ impl FdOps for RemoteFile {
     }
 
     fn close(&self) -> Result<(), zx_status_t> {
-        self.handle.close_once()
+        close_remote_channel(
+            self.node.handle(),
+            self.node.descriptor.identity,
+            &self.node.handle,
+        )
     }
 
     fn clone_fd(&self, _flags: FdFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
-        Err(ZX_ERR_NOT_SUPPORTED)
+        clone_remote_object(self.node.handle(), self.node.descriptor)
     }
 
     fn wait_interest(&self) -> Option<WaitSpec> {
-        Some(self.wait_interest)
+        Some(self.node.wait_interest)
+    }
+
+    fn as_vmo(&self, flags: VmoFlags) -> Result<zx_handle_t, zx_status_t> {
+        let handle = checked_channel_handle(self.node.handle())?;
+        let request = GetVmoRequest {
+            object: self.node.descriptor.identity,
+            flags: flags.bits(),
+        };
+        write_encoded_message(handle, request.encode_channel_message())?;
+        let (bytes, handles) = read_channel_message(handle)?;
+        let response =
+            GetVmoResponse::decode_channel_message(&bytes, &handles).map_err(map_codec_error)?;
+        if response.status != ZX_OK {
+            return Err(response.status);
+        }
+        response.vmo.ok_or(ZX_ERR_IO_DATA_INTEGRITY)
     }
 }
 
-/// Channel-backed placeholder for a remote directory protocol.
+/// Channel-backed remote directory protocol.
 #[derive(Debug)]
 pub struct RemoteDir {
-    handle: OwnedHandle,
-    wait_interest: WaitSpec,
+    node: RemoteNode,
 }
 
 impl RemoteDir {
-    /// Wrap one remote directory channel.
+    /// Wrap one remote directory channel using the default bootstrap root descriptor.
     pub fn new(handle: zx_handle_t) -> Self {
+        Self::from_descriptor(handle, default_remote_dir_descriptor())
+    }
+
+    /// Wrap one remote directory channel with an explicit descriptor.
+    pub fn from_descriptor(handle: zx_handle_t, descriptor: NodeDescriptor) -> Self {
         Self {
-            handle: OwnedHandle::new(handle),
-            wait_interest: WaitSpec::new(
-                handle,
-                ZX_CHANNEL_READABLE | ZX_CHANNEL_WRITABLE | ZX_CHANNEL_PEER_CLOSED,
-            ),
+            node: RemoteNode::new(handle, descriptor),
         }
     }
 
     /// Borrow the underlying channel handle.
     pub fn handle(&self) -> zx_handle_t {
-        self.handle.get()
+        self.node.handle()
+    }
+
+    /// Borrow the remote descriptor carried by this handle.
+    pub fn descriptor(&self) -> NodeDescriptor {
+        self.node.descriptor()
     }
 }
 
@@ -440,15 +598,50 @@ impl FdOps for RemoteDir {
     }
 
     fn close(&self) -> Result<(), zx_status_t> {
-        self.handle.close_once()
+        close_remote_channel(
+            self.node.handle(),
+            self.node.descriptor.identity,
+            &self.node.handle,
+        )
     }
 
     fn clone_fd(&self, _flags: FdFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
-        Err(ZX_ERR_NOT_SUPPORTED)
+        clone_remote_object(self.node.handle(), self.node.descriptor)
     }
 
     fn wait_interest(&self) -> Option<WaitSpec> {
-        Some(self.wait_interest)
+        Some(self.node.wait_interest)
+    }
+
+    fn openat(&self, path: &str, flags: OpenFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
+        let normalized = normalize_remote_path(path)?;
+        let handle = checked_channel_handle(self.node.handle())?;
+
+        let mut opened_client = ZX_HANDLE_INVALID;
+        let mut opened_server = ZX_HANDLE_INVALID;
+        let status = zx_channel_create(0, &mut opened_client, &mut opened_server);
+        if status != ZX_OK {
+            return Err(status);
+        }
+
+        let request = OpenRequest {
+            object: self.node.descriptor.identity,
+            flags: flags.bits(),
+            path: normalized,
+            opened_object: opened_server,
+        };
+        if let Err(status) = write_encoded_message(handle, request.encode_channel_message()) {
+            let _ = zx_handle_close(opened_client);
+            return Err(status);
+        }
+
+        match receive_described_remote_object(opened_client) {
+            Ok(opened) => Ok(opened),
+            Err(status) => {
+                let _ = zx_handle_close(opened_client);
+                Err(status)
+            }
+        }
     }
 }
 
@@ -691,8 +884,159 @@ impl Drop for OwnedHandle {
     }
 }
 
+fn default_remote_dir_descriptor() -> NodeDescriptor {
+    NodeDescriptor::new(
+        ObjectIdentity::new(1, 1, 1),
+        (OpenFlags::READABLE | OpenFlags::DIRECTORY).bits(),
+        NodeKind::Directory,
+    )
+}
+
+fn default_remote_file_descriptor() -> NodeDescriptor {
+    NodeDescriptor::new(
+        ObjectIdentity::new(1, 2, 2),
+        (OpenFlags::READABLE | OpenFlags::WRITABLE).bits(),
+        NodeKind::File,
+    )
+}
+
 fn fd_index(fd: RawFd) -> Option<usize> {
     usize::try_from(fd).ok()
+}
+
+fn checked_channel_handle(handle: zx_handle_t) -> Result<zx_handle_t, zx_status_t> {
+    if handle == ZX_HANDLE_INVALID {
+        Err(ZX_ERR_BAD_HANDLE)
+    } else {
+        Ok(handle)
+    }
+}
+
+fn normalize_remote_path(path: &str) -> Result<String, zx_status_t> {
+    if path.is_empty() || path.starts_with('/') {
+        return Err(ZX_ERR_BAD_PATH);
+    }
+    let mut normalized = String::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        if matches!(component, "." | "..") {
+            return Err(ZX_ERR_BAD_PATH);
+        }
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
+    }
+    if normalized.is_empty() {
+        return Err(ZX_ERR_BAD_PATH);
+    }
+    Ok(normalized)
+}
+
+fn write_encoded_message(
+    handle: zx_handle_t,
+    message: nexus_fs_proto::EncodedMessage,
+) -> Result<(), zx_status_t> {
+    let status = zx_channel_write(
+        handle,
+        0,
+        message.bytes.as_ptr(),
+        message.bytes.len() as u32,
+        if message.handles.is_empty() {
+            core::ptr::null()
+        } else {
+            message.handles.as_ptr()
+        },
+        message.handles.len() as u32,
+    );
+    if status == ZX_OK { Ok(()) } else { Err(status) }
+}
+
+fn read_channel_message(handle: zx_handle_t) -> Result<(Vec<u8>, Vec<zx_handle_t>), zx_status_t> {
+    loop {
+        match zx_channel_read_alloc(handle, 0) {
+            Ok(message) => return Ok(message),
+            Err(ZX_ERR_SHOULD_WAIT) => core::hint::spin_loop(),
+            Err(status) => return Err(status),
+        }
+    }
+}
+
+fn map_codec_error(_error: CodecError) -> zx_status_t {
+    ZX_ERR_IO_DATA_INTEGRITY
+}
+
+fn receive_described_remote_object(
+    opened_client: zx_handle_t,
+) -> Result<Arc<dyn FdOps>, zx_status_t> {
+    let (bytes, handles) = read_channel_message(opened_client)?;
+    let describe =
+        DescribeResponse::decode_channel_message(&bytes, &handles).map_err(map_codec_error)?;
+    if describe.status != ZX_OK {
+        return Err(describe.status);
+    }
+    wrap_remote_object(opened_client, describe.descriptor)
+}
+
+fn wrap_remote_object(
+    handle: zx_handle_t,
+    descriptor: NodeDescriptor,
+) -> Result<Arc<dyn FdOps>, zx_status_t> {
+    let wrapped: Arc<dyn FdOps> = match descriptor.kind {
+        NodeKind::Directory => Arc::new(RemoteDir::from_descriptor(handle, descriptor)),
+        NodeKind::File | NodeKind::Service | NodeKind::Socket | NodeKind::Pseudo => {
+            Arc::new(RemoteFile::from_descriptor(handle, descriptor))
+        }
+    };
+    Ok(wrapped)
+}
+
+fn clone_remote_object(
+    handle: zx_handle_t,
+    descriptor: NodeDescriptor,
+) -> Result<Arc<dyn FdOps>, zx_status_t> {
+    let handle = checked_channel_handle(handle)?;
+    let mut cloned_client = ZX_HANDLE_INVALID;
+    let mut cloned_server = ZX_HANDLE_INVALID;
+    let status = zx_channel_create(0, &mut cloned_client, &mut cloned_server);
+    if status != ZX_OK {
+        return Err(status);
+    }
+
+    let request = CloneRequest {
+        object: descriptor.identity,
+        flags: descriptor.flags,
+        cloned_object: cloned_server,
+    };
+    if let Err(status) = write_encoded_message(handle, request.encode_channel_message()) {
+        let _ = zx_handle_close(cloned_client);
+        return Err(status);
+    }
+
+    match receive_described_remote_object(cloned_client) {
+        Ok(cloned) => Ok(cloned),
+        Err(status) => {
+            let _ = zx_handle_close(cloned_client);
+            Err(status)
+        }
+    }
+}
+
+fn close_remote_channel(
+    handle: zx_handle_t,
+    identity: ObjectIdentity,
+    owned: &OwnedHandle,
+) -> Result<(), zx_status_t> {
+    if handle != ZX_HANDLE_INVALID {
+        let _ = write_encoded_message(
+            handle,
+            CloseRequest {
+                object: identity,
+                flags: 0,
+            }
+            .encode_channel_message(),
+        );
+    }
+    owned.close_once()
 }
 
 #[cfg(test)]
@@ -702,7 +1046,7 @@ mod tests {
     };
     use alloc::string::String;
     use alloc::sync::Arc;
-    use axle_types::status::ZX_ERR_NOT_SUPPORTED;
+    use axle_types::status::{ZX_ERR_BAD_PATH, ZX_ERR_NOT_SUPPORTED};
     use axle_types::zx_status_t;
     use std::sync::{Mutex, MutexGuard};
 
@@ -752,6 +1096,13 @@ mod tests {
 
         fn wait_interest(&self) -> Option<WaitSpec> {
             None
+        }
+
+        fn openat(&self, path: &str, _flags: OpenFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
+            Ok(Arc::new(Self::new(
+                if path == "child" { "child" } else { self.name },
+                self.state.clone(),
+            )))
         }
     }
 
@@ -803,6 +1154,23 @@ mod tests {
     }
 
     #[test]
+    fn table_openat_uses_directory_operations() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut table = FdTable::new();
+        let dir_fd = table
+            .open(
+                Arc::new(MockFd::new("dir", state)),
+                OpenFlags::DIRECTORY | OpenFlags::READABLE,
+                FdFlags::empty(),
+            )
+            .expect("dir open");
+        let child_fd = table
+            .openat(dir_fd, "child", OpenFlags::READABLE, FdFlags::empty())
+            .expect("openat should succeed");
+        assert!(table.get(child_fd).is_some());
+    }
+
+    #[test]
     fn close_rejects_unknown_fd() {
         let mut table = FdTable::new();
         assert!(table.close(99).is_err());
@@ -818,10 +1186,17 @@ mod tests {
     }
 
     #[test]
-    fn remote_dirs_default_to_not_dir_open_until_rpc_glue_lands() {
+    fn remote_dirs_reject_absolute_paths_before_touching_kernel() {
         let dir = RemoteDir::new(axle_types::handle::ZX_HANDLE_INVALID);
-        let result = dir.openat("child", OpenFlags::READABLE);
-        assert_eq!(result.err(), Some(axle_types::status::ZX_ERR_NOT_DIR));
+        let result = dir.openat("/child", OpenFlags::READABLE);
+        assert_eq!(result.err(), Some(ZX_ERR_BAD_PATH));
+    }
+
+    #[test]
+    fn remote_dirs_reject_dot_segments_before_touching_kernel() {
+        let dir = RemoteDir::new(axle_types::handle::ZX_HANDLE_INVALID);
+        let result = dir.openat("svc/../echo", OpenFlags::READABLE);
+        assert_eq!(result.err(), Some(ZX_ERR_BAD_PATH));
     }
 
     #[allow(dead_code)]

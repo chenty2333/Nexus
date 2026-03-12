@@ -1,8 +1,11 @@
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use axle_types::status::{ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_PATH, ZX_ERR_NOT_FOUND};
 use axle_types::zx_status_t;
+
+use crate::fd::{FdOps, OpenFlags};
 
 /// Normalize one absolute namespace path.
 ///
@@ -156,6 +159,23 @@ impl<T> NamespaceTrie<T> {
     }
 }
 
+/// Open `path` through one client namespace using longest-prefix dispatch.
+pub fn open_namespace_path(
+    namespace: &NamespaceTrie<Arc<dyn FdOps>>,
+    path: &str,
+    flags: OpenFlags,
+) -> Result<Arc<dyn FdOps>, zx_status_t> {
+    let matched = namespace.resolve(path)?;
+    if matched.relative_path().is_empty() {
+        Ok(Arc::clone(matched.entry().target()))
+    } else {
+        matched
+            .entry()
+            .target()
+            .openat(matched.relative_path(), flags)
+    }
+}
+
 fn candidate_prefixes(path: &str) -> Vec<String> {
     let mut prefixes = Vec::new();
     let mut current = String::from("/");
@@ -186,8 +206,12 @@ fn strip_prefix<'a>(path: &'a str, prefix: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
-    use super::{NamespaceEntry, NamespaceTrie, normalize_namespace_path};
+    use super::{NamespaceEntry, NamespaceTrie, normalize_namespace_path, open_namespace_path};
+    use crate::fd::{FdFlags, FdOps, OpenFlags, SeekOrigin, WaitSpec};
+    use alloc::string::{String, ToString};
+    use alloc::sync::Arc;
     use axle_types::status::{ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_PATH, ZX_ERR_NOT_FOUND};
+    use axle_types::zx_status_t;
 
     #[test]
     fn normalizes_absolute_paths() {
@@ -256,5 +280,78 @@ mod tests {
         let entry = NamespaceEntry::new("//pkg///bin/", 7u32).expect("entry should normalize");
         assert_eq!(entry.path(), "/pkg/bin");
         assert_eq!(*entry.target(), 7u32);
+    }
+
+    struct MockDir;
+
+    impl FdOps for MockDir {
+        fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
+            unreachable!("directory read is not used in this test")
+        }
+
+        fn write(&self, _buffer: &[u8]) -> Result<usize, zx_status_t> {
+            unreachable!("directory write is not used in this test")
+        }
+
+        fn seek(&self, _origin: SeekOrigin, _offset: i64) -> Result<u64, zx_status_t> {
+            unreachable!("directory seek is not used in this test")
+        }
+
+        fn close(&self) -> Result<(), zx_status_t> {
+            Ok(())
+        }
+
+        fn clone_fd(&self, _flags: FdFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
+            Ok(Arc::new(Self))
+        }
+
+        fn wait_interest(&self) -> Option<WaitSpec> {
+            None
+        }
+
+        fn openat(&self, path: &str, _flags: OpenFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
+            Ok(Arc::new(MockFile(path.to_string())))
+        }
+    }
+
+    struct MockFile(String);
+
+    impl FdOps for MockFile {
+        fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
+            unreachable!("file read is not used in this test")
+        }
+
+        fn write(&self, _buffer: &[u8]) -> Result<usize, zx_status_t> {
+            unreachable!("file write is not used in this test")
+        }
+
+        fn seek(&self, _origin: SeekOrigin, _offset: i64) -> Result<u64, zx_status_t> {
+            unreachable!("file seek is not used in this test")
+        }
+
+        fn close(&self) -> Result<(), zx_status_t> {
+            Ok(())
+        }
+
+        fn clone_fd(&self, _flags: FdFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
+            Ok(Arc::new(Self(self.0.clone())))
+        }
+
+        fn wait_interest(&self) -> Option<WaitSpec> {
+            None
+        }
+    }
+
+    #[test]
+    fn open_namespace_path_dispatches_to_mount_target() {
+        let mut trie = NamespaceTrie::<Arc<dyn FdOps>>::new();
+        trie.insert("/svc", Arc::new(MockDir)).expect("insert /svc");
+
+        let opened = open_namespace_path(&trie, "/svc/nexus.echo.Echo", OpenFlags::READABLE)
+            .expect("namespace open should succeed");
+        let cloned = opened
+            .clone_fd(FdFlags::empty())
+            .expect("clone should preserve the opened target");
+        assert!(cloned.wait_interest().is_none());
     }
 }
