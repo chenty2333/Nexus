@@ -76,7 +76,7 @@ pub fn zx_status_result(status: zx_status_t) -> Result<(), zx_status_t> {
 
 /// Close a handle.
 pub fn zx_handle_close(handle: zx_handle_t) -> zx_status_t {
-    int80_call(AXLE_SYS_HANDLE_CLOSE as u64, [handle as u64, 0, 0, 0, 0, 0])
+    int80_call(AXLE_SYS_HANDLE_CLOSE as u64, [handle, 0, 0, 0, 0, 0])
 }
 
 /// Duplicate a handle into the current process.
@@ -88,7 +88,7 @@ pub fn zx_handle_duplicate(
     int80_call(
         AXLE_SYS_HANDLE_DUPLICATE as u64,
         [
-            handle as u64,
+            handle,
             rights as u64,
             out as *mut zx_handle_t as u64,
             0,
@@ -108,7 +108,7 @@ pub fn zx_object_wait_one(
     int80_call(
         AXLE_SYS_OBJECT_WAIT_ONE as u64,
         [
-            handle as u64,
+            handle,
             signals as u64,
             deadline as u64,
             observed as *mut zx_signals_t as u64,
@@ -128,14 +128,7 @@ pub fn zx_object_wait_async(
 ) -> zx_status_t {
     int80_call(
         AXLE_SYS_OBJECT_WAIT_ASYNC as u64,
-        [
-            handle as u64,
-            port as u64,
-            key,
-            signals as u64,
-            options as u64,
-            0,
-        ],
+        [handle, port, key, signals as u64, options as u64, 0],
     )
 }
 
@@ -151,14 +144,7 @@ pub fn zx_port_create(options: u32, out: &mut zx_handle_t) -> zx_status_t {
 pub fn zx_port_queue(port: zx_handle_t, packet: &zx_port_packet_t) -> zx_status_t {
     int80_call(
         AXLE_SYS_PORT_QUEUE as u64,
-        [
-            port as u64,
-            packet as *const zx_port_packet_t as u64,
-            0,
-            0,
-            0,
-            0,
-        ],
+        [port, packet as *const zx_port_packet_t as u64, 0, 0, 0, 0],
     )
 }
 
@@ -171,7 +157,7 @@ pub fn zx_port_wait(
     int80_call(
         AXLE_SYS_PORT_WAIT as u64,
         [
-            port as u64,
+            port,
             deadline as u64,
             packet as *mut zx_port_packet_t as u64,
             0,
@@ -205,13 +191,13 @@ pub fn zx_timer_create_monotonic(options: u32, out: &mut zx_handle_t) -> zx_stat
 pub fn zx_timer_set(handle: zx_handle_t, deadline: zx_time_t, slack: zx_duration_t) -> zx_status_t {
     int80_call(
         AXLE_SYS_TIMER_SET as u64,
-        [handle as u64, deadline as u64, slack as u64, 0, 0, 0],
+        [handle, deadline as u64, slack as u64, 0, 0, 0],
     )
 }
 
 /// Cancel a timer.
 pub fn zx_timer_cancel(handle: zx_handle_t) -> zx_status_t {
-    int80_call(AXLE_SYS_TIMER_CANCEL as u64, [handle as u64, 0, 0, 0, 0, 0])
+    int80_call(AXLE_SYS_TIMER_CANCEL as u64, [handle, 0, 0, 0, 0, 0])
 }
 
 /// Create a channel pair.
@@ -245,7 +231,7 @@ pub fn zx_channel_write(
     int80_call(
         AXLE_SYS_CHANNEL_WRITE as u64,
         [
-            handle as u64,
+            handle,
             options as u64,
             bytes as u64,
             num_bytes as u64,
@@ -274,7 +260,7 @@ pub fn zx_channel_read(
     int80_call8(
         AXLE_SYS_CHANNEL_READ as u64,
         [
-            handle as u64,
+            handle,
             options as u64,
             bytes as u64,
             handles as u64,
@@ -402,7 +388,7 @@ pub fn zx_socket_write(
     int80_call(
         AXLE_SYS_SOCKET_WRITE as u64,
         [
-            handle as u64,
+            handle,
             options as u64,
             bytes as u64,
             len as u64,
@@ -423,7 +409,7 @@ pub fn zx_socket_read(
     int80_call(
         AXLE_SYS_SOCKET_READ as u64,
         [
-            handle as u64,
+            handle,
             options as u64,
             bytes as u64,
             len as u64,
@@ -453,7 +439,7 @@ pub fn zx_vmo_read(handle: zx_handle_t, bytes: &mut [u8], offset: u64) -> zx_sta
     int80_call(
         AXLE_SYS_VMO_READ as u64,
         [
-            handle as u64,
+            handle,
             if bytes.is_empty() {
                 ptr::null_mut::<u8>() as u64
             } else {
@@ -472,7 +458,7 @@ pub fn zx_vmo_write(handle: zx_handle_t, bytes: &[u8], offset: u64) -> zx_status
     int80_call(
         AXLE_SYS_VMO_WRITE as u64,
         [
-            handle as u64,
+            handle,
             if bytes.is_empty() {
                 ptr::null::<u8>() as u64
             } else {
@@ -496,7 +482,7 @@ pub fn zx_process_create(
     int80_call(
         AXLE_SYS_PROCESS_CREATE as u64,
         [
-            parent_process as u64,
+            parent_process,
             0,
             0,
             options as u64,
@@ -515,7 +501,7 @@ pub fn zx_thread_create(
     int80_call(
         AXLE_SYS_THREAD_CREATE as u64,
         [
-            process as u64,
+            process,
             0,
             0,
             options as u64,
@@ -536,14 +522,7 @@ pub fn zx_process_start(
 ) -> zx_status_t {
     int80_call(
         AXLE_SYS_PROCESS_START as u64,
-        [
-            process as u64,
-            thread as u64,
-            entry,
-            stack,
-            arg_handle as u64,
-            arg1,
-        ],
+        [process, thread, entry, stack, arg_handle, arg1],
     )
 }
 
@@ -557,7 +536,7 @@ pub fn zx_thread_start(
 ) -> zx_status_t {
     int80_call(
         AXLE_SYS_THREAD_START as u64,
-        [thread as u64, entry, stack, arg0, arg1, 0],
+        [thread, entry, stack, arg0, arg1, 0],
     )
 }
 
@@ -572,8 +551,8 @@ pub fn ax_process_prepare_start(
     int80_call(
         AXLE_SYS_AX_PROCESS_PREPARE_START as u64,
         [
-            process as u64,
-            image_vmo as u64,
+            process,
+            image_vmo,
             options as u64,
             out_entry as *mut u64 as u64,
             out_stack as *mut u64 as u64,
@@ -594,8 +573,8 @@ pub fn ax_process_prepare_linux_exec(
     int80_call8(
         AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC as u64,
         [
-            process as u64,
-            image_vmo as u64,
+            process,
+            image_vmo,
             options as u64,
             if exec_spec.is_empty() {
                 ptr::null::<u8>() as u64
@@ -622,9 +601,9 @@ pub fn ax_guest_session_create(
     int80_call(
         AXLE_SYS_AX_GUEST_SESSION_CREATE as u64,
         [
-            thread as u64,
-            sidecar_vmo as u64,
-            port as u64,
+            thread,
+            sidecar_vmo,
+            port,
             key,
             options as u64,
             out_session as *mut zx_handle_t as u64,
@@ -636,7 +615,7 @@ pub fn ax_guest_session_create(
 pub fn ax_guest_session_resume(session: zx_handle_t, stop_seq: u64, options: u32) -> zx_status_t {
     int80_call(
         AXLE_SYS_AX_GUEST_SESSION_RESUME as u64,
-        [session as u64, stop_seq, options as u64, 0, 0, 0],
+        [session, stop_seq, options as u64, 0, 0, 0],
     )
 }
 
@@ -649,7 +628,7 @@ pub fn ax_guest_session_read_memory(
     int80_call(
         AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY as u64,
         [
-            session as u64,
+            session,
             guest_addr,
             if buffer.is_empty() {
                 ptr::null_mut::<u8>() as u64
@@ -672,7 +651,7 @@ pub fn ax_guest_session_write_memory(
     int80_call(
         AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY as u64,
         [
-            session as u64,
+            session,
             guest_addr,
             if buffer.is_empty() {
                 ptr::null::<u8>() as u64
@@ -696,8 +675,8 @@ pub fn ax_process_start_guest(
     int80_call(
         AXLE_SYS_AX_PROCESS_START_GUEST as u64,
         [
-            process as u64,
-            thread as u64,
+            process,
+            thread,
             regs as *const ax_guest_x64_regs_t as u64,
             options as u64,
             0,
@@ -715,7 +694,7 @@ pub fn ax_thread_start_guest(
     int80_call(
         AXLE_SYS_AX_THREAD_START_GUEST as u64,
         [
-            thread as u64,
+            thread,
             regs as *const ax_guest_x64_regs_t as u64,
             options as u64,
             0,
@@ -727,7 +706,7 @@ pub fn ax_thread_start_guest(
 
 /// Kill a process or thread carrier.
 pub fn zx_task_kill(handle: zx_handle_t) -> zx_status_t {
-    int80_call(AXLE_SYS_TASK_KILL as u64, [handle as u64, 0, 0, 0, 0, 0])
+    int80_call(AXLE_SYS_TASK_KILL as u64, [handle, 0, 0, 0, 0, 0])
 }
 
 /// Build one opaque Linux exec-spec blob from the shared fixed header plus

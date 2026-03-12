@@ -56,7 +56,7 @@ pub(crate) mod fault;
 use fault::{FaultCommitDisposition, FaultPlan, FaultPlanResult, PreparedFaultWork};
 pub(crate) use fault::{FaultInFlightKey, FaultTable};
 
-const CSPACE_MAX_SLOTS: u16 = 16_384;
+const CSPACE_MAX_SLOTS: u32 = 16_384;
 const CSPACE_QUARANTINE_LEN: usize = 256;
 const DEFAULT_MAX_INFLIGHT_LOAN_PAGES: Option<u64> = Some(32);
 const DEFAULT_MAX_PRIVATE_COW_PAGES: Option<u64> = None;
@@ -970,8 +970,8 @@ impl HandleRights {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResolvedHandle {
     process_id: ProcessId,
-    slot_index: u16,
-    slot_tag: u16,
+    slot_index: u32,
+    slot_tag: u32,
     object_key: ObjectKey,
     rights: HandleRights,
 }
@@ -2410,12 +2410,12 @@ impl ResolvedHandle {
     }
 
     /// CSpace slot index encoded in the handle.
-    pub(crate) const fn slot_index(self) -> u16 {
+    pub(crate) const fn slot_index(self) -> u32 {
         self.slot_index
     }
 
     /// CSpace slot ABA tag encoded in the handle.
-    pub(crate) const fn slot_tag(self) -> u16 {
+    pub(crate) const fn slot_tag(self) -> u32 {
         self.slot_tag
     }
 

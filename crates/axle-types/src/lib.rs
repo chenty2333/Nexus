@@ -17,10 +17,9 @@
 
 /// Native Axle handle type.
 ///
-/// This is intentionally wider than the current frozen legacy `zx_handle_t`.
-/// Today the live kernel/userland handle space still fits within the low 32
-/// bits; the upper bits are reserved so future native handle-codec work can
-/// grow without changing the public `ax_*` type surface again.
+/// The live kernel/user handle codec is now native 64-bit. Source-level
+/// `zx_handle_t` compatibility remains as an alias of this type, but the old
+/// 32-bit live handle width has been retired.
 pub type ax_handle_t = u64;
 /// Native Axle status/error type.
 pub type ax_status_t = i32;
@@ -45,8 +44,13 @@ pub type ax_vm_option_t = u32;
 /// Native Axle virtual address type.
 pub type ax_vaddr_t = u64;
 
-/// Frozen Zircon-compat handle type (u32).
-pub type zx_handle_t = u32;
+/// Frozen Zircon-compat handle name.
+///
+/// The old 32-bit live handle width has been retired. `zx_handle_t` now remains
+/// only as a source-level compatibility alias over the native 64-bit handle
+/// width so legacy code can continue compiling while the repository migrates
+/// away from `zx_*` naming.
+pub type zx_handle_t = ax_handle_t;
 /// Frozen Zircon-compat status/error type (i32).
 pub type zx_status_t = i32;
 /// Frozen Zircon-compat signals type (u32 bitmask).
@@ -706,13 +710,11 @@ pub mod handle {
     /// Invalid handle value.
     pub const ZX_HANDLE_INVALID: zx_handle_t = AX_HANDLE_INVALID as zx_handle_t;
 
-    /// Mask for the two low “fixed bits” of a Zircon handle.
+    /// Legacy mask for the retired 32-bit handle codec's low fixed bits.
     ///
-    /// Zircon guarantees the low 2 bits of a valid handle are always 1, so
-    /// applications may use those bits for tagging as long as they restore them
-    /// before calling into the kernel.
+    /// Native 64-bit Axle handles do not provide any fixed low-bit guarantee.
     pub const ZX_HANDLE_FIXED_BITS_MASK: zx_handle_t = 0x3;
-    /// The required value of the low 2 “fixed bits” for a valid handle.
+    /// Legacy fixed-bit value from the retired 32-bit handle codec.
     pub const ZX_HANDLE_FIXED_BITS_VALUE: zx_handle_t = 0x3;
 }
 

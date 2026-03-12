@@ -330,7 +330,7 @@ impl SyscallCtx {
     }
 
     fn arg_handle(&self, args: [u64; 6], index: usize) -> Result<zx_handle_t, zx_status_t> {
-        self.arg_u32(args, index)
+        Ok(args[index])
     }
 
     fn arg_u32(&self, args: [u64; 6], index: usize) -> Result<u32, zx_status_t> {
@@ -1889,7 +1889,7 @@ typed_syscall!(
 );
 const OBJECT_SIGNAL_DISPATCH: SyscallDispatch = SyscallDispatch::new(object_signal_entry);
 
-type FutexWaitRequest = (u64, zx_futex_t, u32, zx_time_t);
+type FutexWaitRequest = (u64, zx_futex_t, zx_handle_t, zx_time_t);
 
 fn decode_futex_wait(
     ctx: &mut SyscallCtx,
@@ -1899,7 +1899,7 @@ fn decode_futex_wait(
         (
             args[0],
             ctx.arg_u32(args, 1)? as zx_futex_t,
-            ctx.arg_u32(args, 2)?,
+            ctx.arg_handle(args, 2)?,
             args[3] as zx_time_t,
         ),
         NoWriteback,
@@ -1950,7 +1950,7 @@ typed_syscall!(
 );
 const FUTEX_WAKE_DISPATCH: SyscallDispatch = SyscallDispatch::new(futex_wake_entry);
 
-type FutexRequeueRequest = (u64, u32, zx_futex_t, u64, u32, u32);
+type FutexRequeueRequest = (u64, u32, zx_futex_t, u64, u32, zx_handle_t);
 
 fn decode_futex_requeue(
     ctx: &mut SyscallCtx,
@@ -1963,7 +1963,7 @@ fn decode_futex_requeue(
             ctx.arg_u32(args, 2)? as zx_futex_t,
             args[3],
             ctx.arg_u32(args, 4)?,
-            ctx.arg_u32(args, 5)?,
+            ctx.arg_handle(args, 5)?,
         ),
         NoWriteback,
     ))

@@ -1,122 +1,90 @@
-//! Zircon-compatible 32-bit handle encoding for userland.
+//! Native 64-bit handle encoding for userland.
 //!
-//! Design constraints (aligned with Zircon expectations):
-//! - `ZX_HANDLE_INVALID` is **0**.
-//! - Any valid handle must have **lowest 2 bits == 1** (0b11), enabling fast validity checks.
-//! - Remaining 30 bits encode `index + tag` (ABA protection).
-//!
-//! Default bit split:
-//! - index: 14 bits (0..16383 slots per process)
-//! - tag:   16 bits (slot generation / ABA tag)
-//! - low 2 bits fixed to 1.
+//! Current live shape:
+//! - `0` is always invalid.
+//! - handles are encoded as `[slot_index:32][slot_tag:32]`.
+//! - `slot_tag == 0` is reserved and never allocated, so stale zero-filled
+//!   memory cannot masquerade as a live handle.
 
-/// Raw user-visible handle type (compatible with `zx_handle_t`).
-pub type RawHandle = u32;
+/// Raw user-visible handle type.
+pub type RawHandle = u64;
 
-/// Zircon invalid handle value.
-pub const ZX_HANDLE_INVALID: RawHandle = 0;
-
-/// Low bits must be 0b11 for valid handles.
-pub const HANDLE_FIXED_BITS_MASK: RawHandle = 0b11;
-/// Low bits value for valid handles.
-pub const HANDLE_FIXED_BITS_VALUE: RawHandle = 0b11;
-
-/// Slot index bits (I).
-pub const HANDLE_INDEX_BITS: u32 = 14;
-/// Slot tag bits (G).
-pub const HANDLE_TAG_BITS: u32 = 16;
+/// Invalid handle value.
+pub const HANDLE_INVALID: RawHandle = 0;
 
 /// Reserved tag value (reject on lookup; never allocate).
-pub const HANDLE_TAG_RESERVED: u16 = 0xFFFF;
+pub const HANDLE_TAG_RESERVED: u32 = 0;
 
-/// Max slots addressable by the handle encoding.
-pub const HANDLE_MAX_SLOTS: u16 = (1u32 << HANDLE_INDEX_BITS) as u16;
+/// Max slots addressable by the live handle encoding.
+pub const HANDLE_MAX_SLOTS: u32 = u32::MAX;
 
-const TAG_MASK: u32 = (1u32 << HANDLE_TAG_BITS) - 1;
-
-/// A validated, Zircon-compatible handle.
+/// A validated native handle.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Handle(RawHandle);
 
 impl core::fmt::Debug for Handle {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Handle({:#010x})", self.0)
+        write!(f, "Handle({:#018x})", self.0)
     }
 }
 
 /// Errors related to handle encoding/decoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandleError {
-    /// The handle is 0 (ZX_HANDLE_INVALID).
+    /// The handle is zero (`HANDLE_INVALID`).
     InvalidZero,
-    /// Low fixed bits are not 0b11.
-    InvalidFixedBits,
-    /// Index is out of range for the chosen bit split.
-    IndexOutOfRange,
-    /// Tag is reserved and must never be used for real handles.
+    /// Tag value `0` is reserved and never represents a live handle.
     ReservedTag,
 }
 
 impl Handle {
-    /// Create a handle from `(index, tag)` using the Zircon-style encoding.
-    pub fn new(index: u16, tag: u16) -> Result<Self, HandleError> {
-        if index >= HANDLE_MAX_SLOTS {
-            return Err(HandleError::IndexOutOfRange);
-        }
+    /// Create a handle from `(slot_index, slot_tag)` using the native 64-bit encoding.
+    pub const fn new(index: u32, tag: u32) -> Result<Self, HandleError> {
         if tag == HANDLE_TAG_RESERVED {
             return Err(HandleError::ReservedTag);
         }
-        let encoded: u32 = ((index as u32) << HANDLE_TAG_BITS) | (tag as u32);
-        let raw: u32 = (encoded << 2) | HANDLE_FIXED_BITS_VALUE;
-        if raw == ZX_HANDLE_INVALID {
-            // Should be impossible given fixed bits == 0b11, but keep it defensive.
+        let raw = ((index as u64) << 32) | (tag as u64);
+        if raw == HANDLE_INVALID {
             return Err(HandleError::InvalidZero);
         }
         Ok(Self(raw))
     }
 
     /// Wrap a raw value (validates it).
-    pub fn from_raw(raw: RawHandle) -> Result<Self, HandleError> {
-        let h = Self(raw);
-        // Validate by decoding
-        let _ = h.decode()?;
-        Ok(h)
+    pub const fn from_raw(raw: RawHandle) -> Result<Self, HandleError> {
+        let handle = Self(raw);
+        match handle.decode() {
+            Ok(_) => Ok(handle),
+            Err(err) => Err(err),
+        }
     }
 
-    /// Get the raw 32-bit value.
+    /// Get the raw 64-bit value.
     pub const fn raw(self) -> RawHandle {
         self.0
     }
 
-    /// Decode into `(index, tag)` with validation.
-    pub fn decode(self) -> Result<(u16, u16), HandleError> {
-        if self.0 == ZX_HANDLE_INVALID {
+    /// Decode into `(slot_index, slot_tag)` with validation.
+    pub const fn decode(self) -> Result<(u32, u32), HandleError> {
+        if self.0 == HANDLE_INVALID {
             return Err(HandleError::InvalidZero);
         }
-        if (self.0 & HANDLE_FIXED_BITS_MASK) != HANDLE_FIXED_BITS_VALUE {
-            return Err(HandleError::InvalidFixedBits);
-        }
-        let encoded = self.0 >> 2; // 30-bit
-        let tag = (encoded & TAG_MASK) as u16;
-        let index = (encoded >> HANDLE_TAG_BITS) as u16;
-
-        if index >= HANDLE_MAX_SLOTS {
-            return Err(HandleError::IndexOutOfRange);
-        }
+        let index = (self.0 >> 32) as u32;
+        let tag = self.0 as u32;
         if tag == HANDLE_TAG_RESERVED {
             return Err(HandleError::ReservedTag);
         }
         Ok((index, tag))
     }
 
-    /// Fast check for obvious invalid values (does not fully validate index/tag).
+    /// Fast check for obvious invalid values.
     pub const fn is_obviously_invalid(self) -> bool {
-        self.0 == ZX_HANDLE_INVALID || (self.0 & HANDLE_FIXED_BITS_MASK) != HANDLE_FIXED_BITS_VALUE
+        self.0 == HANDLE_INVALID || (self.0 as u32) == HANDLE_TAG_RESERVED
     }
 }
 
 /// Increment a slot tag, skipping the reserved value.
-pub(crate) const fn bump_tag(mut tag: u16) -> u16 {
+pub(crate) const fn bump_tag(mut tag: u32) -> u32 {
     tag = tag.wrapping_add(1);
     if tag == HANDLE_TAG_RESERVED {
         tag = tag.wrapping_add(1);
@@ -131,7 +99,6 @@ mod tests {
     #[test]
     fn handle_roundtrip() {
         let h = Handle::new(42, 7).unwrap();
-        assert_eq!(h.raw() & HANDLE_FIXED_BITS_MASK, HANDLE_FIXED_BITS_VALUE);
         let (i, g) = h.decode().unwrap();
         assert_eq!(i, 42);
         assert_eq!(g, 7);
@@ -143,21 +110,17 @@ mod tests {
     }
 
     #[test]
-    fn reject_bad_fixed_bits() {
-        // low 2 bits != 0b11
-        let raw = 0x1234_5678u32 & !0b11;
+    fn reject_reserved_tag() {
+        assert_eq!(Handle::new(1, 0).unwrap_err(), HandleError::ReservedTag);
         assert_eq!(
-            Handle::from_raw(raw).unwrap_err(),
-            HandleError::InvalidFixedBits
+            Handle::from_raw(5u64 << 32).unwrap_err(),
+            HandleError::ReservedTag
         );
     }
 
     #[test]
     fn bump_tag_skips_reserved() {
-        assert_eq!(bump_tag(0xFFFD), 0xFFFE);
-        // 0xFFFE -> 0xFFFF (reserved) -> 0x0000
-        assert_eq!(bump_tag(0xFFFE), 0x0000);
-        // reserved itself should never be stored, but bumping it should also move away.
-        assert_eq!(bump_tag(0xFFFF), 0x0000);
+        assert_eq!(bump_tag(0), 1);
+        assert_eq!(bump_tag(u32::MAX), 1);
     }
 }

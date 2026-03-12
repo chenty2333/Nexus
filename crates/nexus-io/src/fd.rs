@@ -14,7 +14,7 @@ use axle_types::{zx_handle_t, zx_signals_t, zx_status_t};
 use bitflags::bitflags;
 use core::any::Any;
 use core::fmt;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use libzircon::{
     zx_channel_create, zx_channel_read_alloc, zx_channel_write, zx_handle_close, zx_socket_read,
     zx_socket_write,
@@ -996,13 +996,13 @@ impl FdOps for PseudoNodeFd {
 
 #[derive(Debug)]
 struct OwnedHandle {
-    handle: AtomicU32,
+    handle: AtomicU64,
 }
 
 impl OwnedHandle {
     fn new(handle: zx_handle_t) -> Self {
         Self {
-            handle: AtomicU32::new(handle),
+            handle: AtomicU64::new(handle),
         }
     }
 

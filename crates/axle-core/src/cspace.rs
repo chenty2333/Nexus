@@ -12,7 +12,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::capability::Capability;
-use crate::handle::{HANDLE_MAX_SLOTS, HANDLE_TAG_RESERVED, Handle, HandleError, bump_tag};
+use crate::handle::{HANDLE_TAG_RESERVED, Handle, HandleError, bump_tag};
 use crate::revocation::{RevocationGroupToken, RevocationManager, RevocationRef};
 
 #[derive(Clone, Copy, Debug)]
@@ -24,7 +24,7 @@ struct CapEntry {
 #[derive(Clone, Copy, Debug)]
 struct Slot {
     entry: Option<CapEntry>,
-    tag: u16,
+    tag: u32,
 }
 
 impl Slot {
@@ -69,14 +69,14 @@ impl From<HandleError> for CSpaceError {
 
 /// Per-process capability space.
 ///
-/// - Index space is bounded by the handle encoding (default: 14 bits => 16384).
+/// - Index space is bounded by the handle encoding.
 /// - We store slots densely and grow on demand.
 pub struct CSpace {
     slots: Vec<Slot>,
-    free_fifo: VecDeque<u16>,
-    quarantine_fifo: VecDeque<u16>,
+    free_fifo: VecDeque<u32>,
+    quarantine_fifo: VecDeque<u32>,
     quarantine_len: usize,
-    max_slots: u16,
+    max_slots: u32,
 }
 
 impl core::fmt::Debug for CSpace {
@@ -94,10 +94,9 @@ impl core::fmt::Debug for CSpace {
 impl CSpace {
     /// Create a new CSpace.
     ///
-    /// - `max_slots` must be <= `HANDLE_MAX_SLOTS` (14-bit index by default).
+    /// - `max_slots` is a policy knob for this `CSpace`.
     /// - `quarantine_len` keeps the most recently freed slots out of the free list.
-    pub fn new(max_slots: u16, quarantine_len: usize) -> Self {
-        assert!(max_slots <= HANDLE_MAX_SLOTS);
+    pub fn new(max_slots: u32, quarantine_len: usize) -> Self {
         Self {
             slots: Vec::new(),
             free_fifo: VecDeque::new(),
@@ -116,8 +115,8 @@ impl CSpace {
         // Prefer old-free slots (FIFO).
         let idx = if let Some(i) = self.free_fifo.pop_front() {
             i
-        } else if (self.slots.len() as u16) < self.max_slots {
-            let i = self.slots.len() as u16;
+        } else if self.slots.len() < self.max_slots as usize {
+            let i = u32::try_from(self.slots.len()).map_err(|_| CSpaceError::NoSlots)?;
             self.slots.push(Slot::empty());
             i
         } else if let Some(i) = self.quarantine_fifo.pop_front() {
@@ -127,7 +126,7 @@ impl CSpace {
             return Err(CSpaceError::NoSlots);
         };
 
-        let slot = &mut self.slots[idx as usize];
+        let slot = &mut self.slots[usize::try_from(idx).map_err(|_| CSpaceError::NoSlots)?];
         debug_assert!(slot.entry.is_none());
 
         // Defensive: reserved tag should never be used.
@@ -165,7 +164,10 @@ impl CSpace {
     /// Duplicate a handle (same capability fields, same revocation association).
     pub fn duplicate(&mut self, h: Handle) -> Result<Handle, CSpaceError> {
         let (idx, tag) = h.decode()?;
-        let slot = self.slots.get(idx as usize).ok_or(CSpaceError::BadHandle)?;
+        let slot = self
+            .slots
+            .get(usize::try_from(idx).map_err(|_| CSpaceError::BadHandle)?)
+            .ok_or(CSpaceError::BadHandle)?;
         if slot.tag != tag {
             return Err(CSpaceError::BadHandle);
         }
@@ -176,7 +178,10 @@ impl CSpace {
     /// Duplicate a handle while replacing the stored rights with a derived subset.
     pub fn duplicate_derived(&mut self, h: Handle, rights: u32) -> Result<Handle, CSpaceError> {
         let (idx, tag) = h.decode()?;
-        let slot = self.slots.get(idx as usize).ok_or(CSpaceError::BadHandle)?;
+        let slot = self
+            .slots
+            .get(usize::try_from(idx).map_err(|_| CSpaceError::BadHandle)?)
+            .ok_or(CSpaceError::BadHandle)?;
         if slot.tag != tag {
             return Err(CSpaceError::BadHandle);
         }
@@ -193,7 +198,7 @@ impl CSpace {
         let (idx, tag) = h.decode()?;
         let slot = self
             .slots
-            .get_mut(idx as usize)
+            .get_mut(usize::try_from(idx).map_err(|_| CSpaceError::BadHandle)?)
             .ok_or(CSpaceError::BadHandle)?;
         if slot.tag != tag {
             return Err(CSpaceError::BadHandle);
@@ -254,7 +259,10 @@ impl CSpace {
 
     fn get_entry(&self, h: Handle) -> Result<CapEntry, CSpaceError> {
         let (idx, tag) = h.decode()?;
-        let slot = self.slots.get(idx as usize).ok_or(CSpaceError::BadHandle)?;
+        let slot = self
+            .slots
+            .get(usize::try_from(idx).map_err(|_| CSpaceError::BadHandle)?)
+            .ok_or(CSpaceError::BadHandle)?;
         if slot.tag != tag {
             return Err(CSpaceError::BadHandle);
         }
@@ -268,7 +276,7 @@ impl CSpace {
         let (idx, tag) = h.decode()?;
         let slot = self
             .slots
-            .get_mut(idx as usize)
+            .get_mut(usize::try_from(idx).map_err(|_| CSpaceError::BadHandle)?)
             .ok_or(CSpaceError::BadHandle)?;
 
         if slot.tag != tag || slot.entry.is_none() {
@@ -306,8 +314,6 @@ impl CSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handle::HANDLE_FIXED_BITS_MASK;
-    use crate::handle::HANDLE_FIXED_BITS_VALUE;
     use crate::revocation::RevocationManager;
     use proptest::prelude::*;
 
@@ -317,7 +323,6 @@ mod tests {
         let cap = Capability::new(1, 0xAA55, 7);
 
         let h = cs.alloc(cap).unwrap();
-        assert_eq!(h.raw() & HANDLE_FIXED_BITS_MASK, HANDLE_FIXED_BITS_VALUE);
 
         let got = cs.get(h).unwrap();
         assert_eq!(got, cap);
