@@ -1,5 +1,5 @@
 id = "kernel.starnix.round4_signal_bootstrap"
-description = "Bootstrap starnix userspace should close the current Round 4 signal slice: getpid/gettid, rt_sigaction, rt_sigprocmask, kill/tgkill, rt_sigreturn, and wait4 interruption with EINTR/SA_RESTART"
+description = "Bootstrap starnix userspace should close the current Round 4 signal slice: getpid/gettid, rt_sigaction, rt_sigprocmask, kill/tgkill, rt_sigreturn, and interruptible wait4/pipe-read paths with EINTR/SA_RESTART"
 tags = ["kernel", "component", "starnix", "runner", "signal", "kill", "tgkill", "wait4", "restart"]
 timeout_ms = 180000
 

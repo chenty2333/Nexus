@@ -413,12 +413,17 @@ forcing every syscall through one uniform RPC layer.
   - `rt_sigprocmask`
   - `kill` / `tgkill`
   - signal dequeue and default/ignore delivery checks at the syscall-resume boundary
-  - no userspace signal-handler trampoline yet
-  - no interruptible waits / restart blocks yet
+  - one minimal userspace signal-handler trampoline path via `rt_sigreturn`
+  - interruptible waits now cover `wait4` and blocking pipe-backed `read`
+  - baseline `EINTR` / `SA_RESTART` behavior now exists for those wait paths
+  - no restart blocks / `sigaltstack` yet
   - no epoll model yet
 - `fork` currently clones the Linux-side control plane and eagerly copies the
   writable guest image/stack regions into a fresh carrier address space. It
   does not yet use the future generic MM clone helper or fork-style COW.
+- `fork` clones Linux fd tables by sharing `FileDescription` identity across
+  parent and child. Closing one side must not tear down the underlying
+  description until the last cross-table reference is gone.
 - `execve` already preserves Linux task identity while replacing carrier and
   address-space resources, but later rounds still need the remaining Linux
   process semantics such as signal reset and `CLOEXEC` cleanup.

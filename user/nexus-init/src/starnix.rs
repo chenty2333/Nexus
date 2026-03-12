@@ -7,8 +7,12 @@ use axle_types::guest::{
     AX_GUEST_STOP_REASON_X64_SYSCALL, AX_GUEST_X64_SYSCALL_INSN_LEN, AX_LINUX_EXEC_SPEC_V1,
 };
 use axle_types::handle::ZX_HANDLE_INVALID;
-use axle_types::packet::ZX_PKT_TYPE_USER;
+use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
 use axle_types::rights::ZX_RIGHT_SAME_RIGHTS;
+use axle_types::signals::{
+    ZX_CHANNEL_PEER_CLOSED, ZX_CHANNEL_READABLE, ZX_CHANNEL_WRITABLE, ZX_SOCKET_PEER_CLOSED,
+    ZX_SOCKET_READABLE, ZX_SOCKET_WRITABLE,
+};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_PATH,
     ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_IO_DATA_INTEGRITY,
@@ -26,18 +30,20 @@ use axle_types::{
     ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_spec_header_t, zx_handle_t,
     zx_status_t,
 };
+use libax::ax_object_wait_async;
 use libzircon::{
     ZX_TIME_INFINITE, ax_guest_session_create, ax_guest_session_read_memory,
     ax_guest_session_resume, ax_guest_session_write_memory, ax_guest_stop_state_read,
     ax_guest_stop_state_write, ax_linux_exec_spec_blob, ax_process_prepare_linux_exec,
     ax_process_start_guest, ax_thread_start_guest, zx_handle_close, zx_handle_duplicate,
-    zx_port_create, zx_port_packet_t, zx_port_wait, zx_process_create, zx_socket_create,
-    zx_status_result, zx_task_kill, zx_thread_create, zx_vmo_create,
+    zx_packet_user_t, zx_port_create, zx_port_packet_t, zx_port_queue, zx_port_wait,
+    zx_process_create, zx_socket_create, zx_status_result, zx_task_kill, zx_thread_create,
+    zx_vmo_create,
 };
 use nexus_component::{ComponentStartInfo, NumberedHandle};
 use nexus_io::{
     DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFlags, PipeFd, PseudoNodeFd,
-    SocketFd,
+    SocketFd, WaitSpec,
 };
 
 use crate::lifecycle::{read_channel_alloc_blocking, send_controller_event, send_status_event};
@@ -65,6 +71,8 @@ const LINUX_HEAP_VMO_BYTES: u64 = 16 * 1024 * 1024;
 const LINUX_MMAP_REGION_BYTES: u64 = 64 * 1024 * 1024;
 const STARNIX_GUEST_PACKET_KEY_BASE: u64 = 0x5354_4e58_0000_0001;
 const STARNIX_GUEST_PACKET_KEY: u64 = STARNIX_GUEST_PACKET_KEY_BASE;
+const STARNIX_SIGNAL_WAKE_PACKET_KEY: u64 = 0x5354_4e58_ffff_0001;
+const STARNIX_WAIT_WAKE_KIND_SIGNAL: u64 = 1;
 const LINUX_SYSCALL_READ: u64 = 0;
 const LINUX_SYSCALL_WRITE: u64 = 1;
 const LINUX_SYSCALL_CLOSE: u64 = 3;
@@ -326,14 +334,82 @@ struct TaskCarrier {
 
 enum TaskState {
     Running,
-    Waiting(WaitRequest),
+    Waiting(WaitState),
 }
 
 #[derive(Clone, Copy)]
-struct WaitRequest {
-    target_pid: i32,
-    status_addr: u64,
+struct WaitState {
     restartable: bool,
+    kind: WaitKind,
+}
+
+#[derive(Clone, Copy)]
+enum WaitKind {
+    Wait4 {
+        target_pid: i32,
+        status_addr: u64,
+    },
+    FdRead {
+        fd: i32,
+        buf: u64,
+        len: usize,
+        packet_key: u64,
+    },
+    FdWrite {
+        fd: i32,
+        buf: u64,
+        len: usize,
+        packet_key: u64,
+    },
+}
+
+impl WaitState {
+    const fn packet_key(self) -> Option<u64> {
+        match self.kind {
+            WaitKind::Wait4 { .. } => None,
+            WaitKind::FdRead { packet_key, .. } | WaitKind::FdWrite { packet_key, .. } => {
+                Some(packet_key)
+            }
+        }
+    }
+
+    const fn wait4_target_pid(self) -> Option<i32> {
+        match self.kind {
+            WaitKind::Wait4 { target_pid, .. } => Some(target_pid),
+            WaitKind::FdRead { .. } | WaitKind::FdWrite { .. } => None,
+        }
+    }
+
+    const fn wait4_status_addr(self) -> Option<u64> {
+        match self.kind {
+            WaitKind::Wait4 { status_addr, .. } => Some(status_addr),
+            WaitKind::FdRead { .. } | WaitKind::FdWrite { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FdWaitPolicy {
+    nonblock: bool,
+    wait_interest: Option<WaitSpec>,
+}
+
+enum ReadAttempt {
+    Ready { bytes: Vec<u8>, actual: usize },
+    WouldBlock(FdWaitPolicy),
+    Err(zx_status_t),
+}
+
+enum WriteAttempt {
+    Ready(usize),
+    WouldBlock(FdWaitPolicy),
+    Err(zx_status_t),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FdWaitOp {
+    Read,
+    Write,
 }
 
 struct LinuxTask {
@@ -446,6 +522,25 @@ impl StarnixKernel {
             .find_map(|(tid, task)| (task.carrier.packet_key == packet_key).then_some(*tid))
     }
 
+    fn waiting_task_id_for_packet_key(&self, packet_key: u64) -> Option<i32> {
+        self.tasks.iter().find_map(|(tid, task)| match task.state {
+            TaskState::Waiting(wait) if wait.packet_key() == Some(packet_key) => Some(*tid),
+            TaskState::Running | TaskState::Waiting(_) => None,
+        })
+    }
+
+    fn queue_wait_signal_wake(&self, task_id: i32) -> Result<(), zx_status_t> {
+        let packet = zx_port_packet_t {
+            key: STARNIX_SIGNAL_WAKE_PACKET_KEY,
+            type_: ZX_PKT_TYPE_USER,
+            status: 0,
+            user: zx_packet_user_t {
+                u64: [STARNIX_WAIT_WAKE_KIND_SIGNAL, task_id as u64, 0, 0],
+            },
+        };
+        zx_status_result(zx_port_queue(self.port, &packet))
+    }
+
     fn run(&mut self) -> i32 {
         let mut stdout = Vec::new();
         loop {
@@ -457,57 +552,63 @@ impl StarnixKernel {
             if wait_status != ZX_OK {
                 return map_status_to_return_code(wait_status);
             }
-            if packet.type_ != ZX_PKT_TYPE_USER {
-                return map_status_to_return_code(ZX_ERR_BAD_STATE);
-            }
-            let Some(task_id) = self.task_id_for_packet_key(packet.key) else {
-                return map_status_to_return_code(ZX_ERR_BAD_STATE);
-            };
-            let reason = packet.user.u64[1] as u16;
-            if reason != AX_GUEST_STOP_REASON_X64_SYSCALL {
-                return map_status_to_return_code(ZX_ERR_NOT_SUPPORTED);
-            }
-            let sidecar = self
-                .tasks
-                .get(&task_id)
-                .map(|task| task.carrier.sidecar_vmo);
-            let Some(sidecar) = sidecar else {
-                return map_status_to_return_code(ZX_ERR_BAD_STATE);
-            };
-            let mut stop_state = match ax_guest_stop_state_read(sidecar) {
-                Ok(stop_state) => stop_state,
-                Err(status) => return map_status_to_return_code(status),
-            };
-            let action = match self.handle_syscall(task_id, &mut stop_state, &mut stdout) {
-                Ok(action) => action,
-                Err(status) => return map_status_to_return_code(status),
-            };
-            let action = match self.apply_signal_delivery(task_id, action, &mut stop_state) {
-                Ok(action) => action,
-                Err(status) => return map_status_to_return_code(status),
-            };
-            match action {
-                SyscallAction::Resume => {
-                    if let Err(status) = self.writeback_and_resume(task_id, &stop_state) {
+            match packet.type_ {
+                ZX_PKT_TYPE_USER => {
+                    if packet.key == STARNIX_SIGNAL_WAKE_PACKET_KEY
+                        && packet.user.u64[0] == STARNIX_WAIT_WAKE_KIND_SIGNAL
+                    {
+                        let task_id =
+                            i32::try_from(packet.user.u64[1]).map_err(|_| ZX_ERR_BAD_STATE);
+                        let Ok(task_id) = task_id else {
+                            return map_status_to_return_code(ZX_ERR_BAD_STATE);
+                        };
+                        if let Err(status) = self.retry_waiting_task(task_id, &mut stdout) {
+                            return map_status_to_return_code(status);
+                        }
+                        continue;
+                    }
+                    if let Some(task_id) = self.waiting_task_id_for_packet_key(packet.key) {
+                        if let Err(status) = self.retry_waiting_task(task_id, &mut stdout) {
+                            return map_status_to_return_code(status);
+                        }
+                        continue;
+                    }
+                    let Some(task_id) = self.task_id_for_packet_key(packet.key) else {
+                        return map_status_to_return_code(ZX_ERR_BAD_STATE);
+                    };
+                    let reason = packet.user.u64[1] as u16;
+                    if reason != AX_GUEST_STOP_REASON_X64_SYSCALL {
+                        return map_status_to_return_code(ZX_ERR_NOT_SUPPORTED);
+                    }
+                    let sidecar = self
+                        .tasks
+                        .get(&task_id)
+                        .map(|task| task.carrier.sidecar_vmo);
+                    let Some(sidecar) = sidecar else {
+                        return map_status_to_return_code(ZX_ERR_BAD_STATE);
+                    };
+                    let mut stop_state = match ax_guest_stop_state_read(sidecar) {
+                        Ok(stop_state) => stop_state,
+                        Err(status) => return map_status_to_return_code(status),
+                    };
+                    let action = match self.handle_syscall(task_id, &mut stop_state, &mut stdout) {
+                        Ok(action) => action,
+                        Err(status) => return map_status_to_return_code(status),
+                    };
+                    if let Err(status) = self.complete_task_action(task_id, action, &mut stop_state)
+                    {
                         return map_status_to_return_code(status);
                     }
                 }
-                SyscallAction::LeaveStopped => {}
-                SyscallAction::TaskExit(code) => {
-                    if let Err(status) = self.exit_task(task_id, code) {
+                ZX_PKT_TYPE_SIGNAL_ONE => {
+                    let Some(task_id) = self.waiting_task_id_for_packet_key(packet.key) else {
+                        continue;
+                    };
+                    if let Err(status) = self.retry_waiting_task(task_id, &mut stdout) {
                         return map_status_to_return_code(status);
                     }
                 }
-                SyscallAction::GroupExit(code) => {
-                    if let Err(status) = self.exit_group(task_id, code) {
-                        return map_status_to_return_code(status);
-                    }
-                }
-                SyscallAction::GroupSignalExit(signal) => {
-                    if let Err(status) = self.exit_group_from_signal(task_id, signal) {
-                        return map_status_to_return_code(status);
-                    }
-                }
+                _ => return map_status_to_return_code(ZX_ERR_BAD_STATE),
             }
         }
     }
@@ -528,6 +629,8 @@ impl StarnixKernel {
         stdout: &mut Vec<u8>,
     ) -> Result<SyscallAction, zx_status_t> {
         match stop_state.regs.rax {
+            LINUX_SYSCALL_READ => self.sys_read(task_id, stop_state),
+            LINUX_SYSCALL_WRITE => self.sys_write(task_id, stop_state, stdout),
             LINUX_SYSCALL_GETPID => self.sys_getpid(task_id, stop_state),
             LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
             LINUX_SYSCALL_RT_SIGACTION => self.sys_rt_sigaction(task_id, stop_state),
@@ -589,6 +692,22 @@ impl StarnixKernel {
         }
     }
 
+    fn complete_task_action(
+        &mut self,
+        task_id: i32,
+        action: SyscallAction,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<(), zx_status_t> {
+        let action = self.apply_signal_delivery(task_id, action, stop_state)?;
+        match action {
+            SyscallAction::Resume => self.writeback_and_resume(task_id, stop_state),
+            SyscallAction::LeaveStopped => Ok(()),
+            SyscallAction::TaskExit(code) => self.exit_task(task_id, code),
+            SyscallAction::GroupExit(code) => self.exit_group(task_id, code),
+            SyscallAction::GroupSignalExit(signal) => self.exit_group_from_signal(task_id, signal),
+        }
+    }
+
     fn writeback_and_resume(
         &self,
         task_id: i32,
@@ -612,10 +731,13 @@ impl StarnixKernel {
         let TaskState::Waiting(ref wait) = task.state else {
             return Err(ZX_ERR_BAD_STATE);
         };
-        if wait.status_addr != 0 {
+        let Some(status_addr) = wait.wait4_status_addr() else {
+            return Err(ZX_ERR_BAD_STATE);
+        };
+        if status_addr != 0 {
             write_guest_bytes(
                 task.carrier.session_handle,
-                wait.status_addr,
+                status_addr,
                 &status.to_ne_bytes(),
             )?;
         }
@@ -651,7 +773,9 @@ impl StarnixKernel {
                 let task = self.tasks.get(task_id)?;
                 match task.state {
                     TaskState::Waiting(ref wait)
-                        if Self::wait_matches(wait.target_pid, child_tgid) =>
+                        if wait.wait4_target_pid().is_some_and(|target_pid| {
+                            Self::wait_matches(target_pid, child_tgid)
+                        }) =>
                     {
                         Some(*task_id)
                     }
@@ -827,7 +951,7 @@ impl StarnixKernel {
     fn deliver_or_interrupt_wait(
         &mut self,
         task_id: i32,
-        wait: WaitRequest,
+        wait: WaitState,
         stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
         loop {
@@ -891,12 +1015,18 @@ impl StarnixKernel {
         let waiting = self
             .tasks
             .iter()
-            .filter_map(|(task_id, task)| {
-                matches!(task.state, TaskState::Waiting(_)).then_some(*task_id)
+            .filter_map(|(task_id, task)| match task.state {
+                TaskState::Waiting(wait) => Some((*task_id, wait)),
+                TaskState::Running => None,
             })
             .collect::<Vec<_>>();
-        for task_id in waiting {
-            if self.tasks.contains_key(&task_id) {
+        for (task_id, wait) in waiting {
+            if !self.tasks.contains_key(&task_id) {
+                continue;
+            }
+            if wait.packet_key().is_some() {
+                self.queue_wait_signal_wake(task_id)?;
+            } else {
                 self.interrupt_waiting_task(task_id)?;
             }
         }
@@ -993,6 +1123,242 @@ impl StarnixKernel {
         }
         task.signals.pending |= bit;
         Ok(0)
+    }
+
+    fn fd_wait_policy(&self, task_id: i32, fd: i32) -> Result<FdWaitPolicy, zx_status_t> {
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let resources = self
+            .groups
+            .get(&tgid)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .resources
+            .as_ref()
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        let entry = resources.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+        Ok(FdWaitPolicy {
+            nonblock: entry.description().flags().contains(OpenFlags::NONBLOCK),
+            wait_interest: resources.fd_table.wait_interest(fd)?,
+        })
+    }
+
+    fn fd_wait_policy_for_op(
+        &self,
+        task_id: i32,
+        fd: i32,
+        op: FdWaitOp,
+    ) -> Result<FdWaitPolicy, zx_status_t> {
+        let mut policy = self.fd_wait_policy(task_id, fd)?;
+        policy.wait_interest = policy.wait_interest.and_then(|interest| {
+            let filtered = filter_wait_interest(interest, op);
+            (filtered.signals() != 0).then_some(filtered)
+        });
+        Ok(policy)
+    }
+
+    fn arm_fd_wait(
+        &mut self,
+        task_id: i32,
+        wait: WaitState,
+        wait_interest: WaitSpec,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let status = ax_object_wait_async(
+            wait_interest.handle(),
+            self.port,
+            wait.packet_key().ok_or(ZX_ERR_BAD_STATE)?,
+            wait_interest.signals(),
+            0,
+        );
+        zx_status_result(status)?;
+        self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Waiting(wait);
+        self.deliver_or_interrupt_wait(task_id, wait, stop_state)
+    }
+
+    fn sys_read(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let fd = i32::try_from(stop_state.regs.rdi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let buf = stop_state.regs.rsi;
+        let len = usize::try_from(stop_state.regs.rdx).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let wait_policy = self.fd_wait_policy_for_op(task_id, fd, FdWaitOp::Read)?;
+
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
+        bytes.resize(len, 0);
+        let attempt = {
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            match resources.fd_table.read(fd, &mut bytes) {
+                Ok(actual) => ReadAttempt::Ready { bytes, actual },
+                Err(ZX_ERR_SHOULD_WAIT) => ReadAttempt::WouldBlock(wait_policy),
+                Err(ZX_ERR_PEER_CLOSED) => ReadAttempt::Ready { bytes, actual: 0 },
+                Err(status) => ReadAttempt::Err(status),
+            }
+        };
+
+        match attempt {
+            ReadAttempt::Ready { bytes, actual } => {
+                let result = match write_guest_bytes(session, buf, &bytes[..actual]) {
+                    Ok(()) => u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                    Err(status) => linux_errno(map_guest_write_status_to_errno(status)),
+                };
+                complete_syscall(stop_state, result)?;
+                Ok(SyscallAction::Resume)
+            }
+            ReadAttempt::WouldBlock(policy) => {
+                if policy.nonblock || policy.wait_interest.is_none() {
+                    complete_syscall(stop_state, linux_errno(LINUX_EAGAIN))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                let packet_key = self.alloc_packet_key()?;
+                let wait = WaitState {
+                    restartable: true,
+                    kind: WaitKind::FdRead {
+                        fd,
+                        buf,
+                        len,
+                        packet_key,
+                    },
+                };
+                self.arm_fd_wait(
+                    task_id,
+                    wait,
+                    policy.wait_interest.ok_or(ZX_ERR_BAD_STATE)?,
+                    stop_state,
+                )
+            }
+            ReadAttempt::Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                Ok(SyscallAction::Resume)
+            }
+        }
+    }
+
+    fn sys_write(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+        stdout: &mut Vec<u8>,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let fd = i32::try_from(stop_state.regs.rdi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let buf = stop_state.regs.rsi;
+        let len = usize::try_from(stop_state.regs.rdx).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let bytes = match read_guest_bytes(session, buf, len) {
+            Ok(bytes) => bytes,
+            Err(status) => {
+                complete_syscall(
+                    stop_state,
+                    linux_errno(map_guest_memory_status_to_errno(status)),
+                )?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let wait_policy = self.fd_wait_policy_for_op(task_id, fd, FdWaitOp::Write)?;
+        let attempt = {
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            match resources.fd_table.write(fd, &bytes) {
+                Ok(actual) => WriteAttempt::Ready(actual),
+                Err(ZX_ERR_SHOULD_WAIT) => WriteAttempt::WouldBlock(wait_policy),
+                Err(status) => WriteAttempt::Err(status),
+            }
+        };
+
+        match attempt {
+            WriteAttempt::Ready(actual) => {
+                if fd == 1 || fd == 2 {
+                    stdout.extend_from_slice(&bytes[..actual]);
+                }
+                complete_syscall(
+                    stop_state,
+                    u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                )?;
+                Ok(SyscallAction::Resume)
+            }
+            WriteAttempt::WouldBlock(policy) => {
+                if policy.nonblock || policy.wait_interest.is_none() {
+                    complete_syscall(stop_state, linux_errno(LINUX_EAGAIN))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                let packet_key = self.alloc_packet_key()?;
+                let wait = WaitState {
+                    restartable: true,
+                    kind: WaitKind::FdWrite {
+                        fd,
+                        buf,
+                        len,
+                        packet_key,
+                    },
+                };
+                self.arm_fd_wait(
+                    task_id,
+                    wait,
+                    policy.wait_interest.ok_or(ZX_ERR_BAD_STATE)?,
+                    stop_state,
+                )
+            }
+            WriteAttempt::Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                Ok(SyscallAction::Resume)
+            }
+        }
+    }
+
+    fn retry_waiting_task(
+        &mut self,
+        task_id: i32,
+        stdout: &mut Vec<u8>,
+    ) -> Result<(), zx_status_t> {
+        let Some(task) = self.tasks.get(&task_id) else {
+            return Ok(());
+        };
+        let TaskState::Waiting(wait) = task.state else {
+            return Ok(());
+        };
+
+        let mut stop_state = ax_guest_stop_state_read(task.carrier.sidecar_vmo)?;
+        match self.deliver_or_interrupt_wait(task_id, wait, &mut stop_state)? {
+            SyscallAction::Resume => self.writeback_and_resume(task_id, &stop_state),
+            SyscallAction::LeaveStopped => match wait.kind {
+                WaitKind::Wait4 { .. } => Ok(()),
+                WaitKind::FdRead { fd, buf, len, .. } => {
+                    self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
+                        TaskState::Running;
+                    stop_state.regs.rdi = fd as u64;
+                    stop_state.regs.rsi = buf;
+                    stop_state.regs.rdx = len as u64;
+                    let action = self.sys_read(task_id, &mut stop_state)?;
+                    self.complete_task_action(task_id, action, &mut stop_state)
+                }
+                WaitKind::FdWrite { fd, buf, len, .. } => {
+                    self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
+                        TaskState::Running;
+                    stop_state.regs.rdi = fd as u64;
+                    stop_state.regs.rsi = buf;
+                    stop_state.regs.rdx = len as u64;
+                    let action = self.sys_write(task_id, &mut stop_state, stdout)?;
+                    self.complete_task_action(task_id, action, &mut stop_state)
+                }
+            },
+            SyscallAction::GroupSignalExit(signal) => self.exit_group_from_signal(task_id, signal),
+            SyscallAction::TaskExit(_) | SyscallAction::GroupExit(_) => Err(ZX_ERR_BAD_STATE),
+        }
     }
 
     fn sys_getpid(
@@ -1692,10 +2058,12 @@ impl StarnixKernel {
             return Ok(SyscallAction::Resume);
         }
 
-        let wait = WaitRequest {
-            target_pid,
-            status_addr,
+        let wait = WaitState {
             restartable: true,
+            kind: WaitKind::Wait4 {
+                target_pid,
+                status_addr,
+            },
         };
         self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Waiting(wait);
         self.deliver_or_interrupt_wait(task_id, wait, stop_state)
@@ -2508,6 +2876,19 @@ fn complete_syscall(
         .checked_add(AX_GUEST_X64_SYSCALL_INSN_LEN)
         .ok_or(ZX_ERR_INVALID_ARGS)?;
     Ok(())
+}
+
+fn filter_wait_interest(interest: WaitSpec, op: FdWaitOp) -> WaitSpec {
+    let peer_closed = ZX_CHANNEL_PEER_CLOSED | ZX_SOCKET_PEER_CLOSED;
+    let signals = match op {
+        FdWaitOp::Read => {
+            interest.signals() & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE | peer_closed)
+        }
+        FdWaitOp::Write => {
+            interest.signals() & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE | peer_closed)
+        }
+    };
+    WaitSpec::new(interest.handle(), signals)
 }
 
 fn linux_signal_is_valid(signal: i32) -> bool {

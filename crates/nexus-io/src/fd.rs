@@ -486,12 +486,10 @@ impl FdTable {
         let Some(entry) = slot.take() else {
             return Err(ZX_ERR_BAD_HANDLE);
         };
-        let last_fd_for_description = self.entries.iter().all(|existing| {
-            existing
-                .as_ref()
-                .map(|candidate| !Arc::ptr_eq(candidate.description(), entry.description()))
-                .unwrap_or(true)
-        });
+        // Open-file-description identity can be shared across duplicated entries
+        // and across fork-cloned fd tables, so the close decision must follow the
+        // shared `Arc<OpenFileDescription>` lifetime rather than only this table.
+        let last_fd_for_description = Arc::strong_count(entry.description()) == 1;
         if last_fd_for_description {
             entry.description.ops().close()?;
         }
@@ -1289,6 +1287,26 @@ mod tests {
         assert_eq!(state.lock().expect("state poisoned").closes, 0);
 
         table.close(fd1).expect("last close should succeed");
+        assert_eq!(state.lock().expect("state poisoned").closes, 1);
+    }
+
+    #[test]
+    fn fork_cloned_tables_keep_shared_descriptions_alive_until_last_close() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut parent = FdTable::new();
+        let fd = parent
+            .open(
+                Arc::new(MockFd::new("shared", state.clone())),
+                OpenFlags::READABLE | OpenFlags::WRITABLE,
+                FdFlags::empty(),
+            )
+            .expect("open should succeed");
+        let mut child = parent.clone();
+
+        parent.close(fd).expect("parent close should succeed");
+        assert_eq!(state.lock().expect("state poisoned").closes, 0);
+
+        child.close(fd).expect("child close should succeed");
         assert_eq!(state.lock().expect("state poisoned").closes, 1);
     }
 
