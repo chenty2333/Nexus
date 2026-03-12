@@ -115,6 +115,14 @@ Main just targets include:
   - `wait4` restart when the installed action carries `SA_RESTART`
   - blocking pipe-backed `read` interruption with `EINTR`
   - blocking pipe-backed `read` restart when the installed action carries `SA_RESTART`
+- The current Round-4 Starnix futex scenario now closes the first futex-hybrid slice:
+  - `FUTEX_WAIT_PRIVATE`
+  - `FUTEX_WAKE_PRIVATE`
+  - `FUTEX_REQUEUE_PRIVATE`
+  - waiters are Linux tasks parked in the userspace executive rather than the
+    supervisor thread itself
+  - this gate intentionally excludes timeout, bitset, and shared-futex identity
+    semantics, which remain later Round-4 work
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

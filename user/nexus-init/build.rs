@@ -11,6 +11,8 @@ fn main() {
     let linux_fd_smoke_source = manifest_dir.join("../linux-fd-smoke/fd_smoke.S");
     let linux_round2_source = manifest_dir.join("../linux-round2-smoke/round2_smoke.S");
     let linux_round3_source = manifest_dir.join("../linux-round3-smoke/round3_smoke.S");
+    let linux_round4_futex_source =
+        manifest_dir.join("../linux-round4-futex-smoke/round4_futex_smoke.S");
     let linux_round4_signal_source =
         manifest_dir.join("../linux-round4-signal-smoke/round4_signal_smoke.S");
 
@@ -22,6 +24,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", linux_round3_source.display());
     println!(
         "cargo:rerun-if-changed={}",
+        linux_round4_futex_source.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         linux_round4_signal_source.display()
     );
     for manifest in [
@@ -31,6 +37,7 @@ fn main() {
         "root_component_starnix_fd.toml",
         "root_component_starnix_round2.toml",
         "root_component_starnix_round3.toml",
+        "root_component_starnix_round4_futex.toml",
         "root_component_starnix_round4_signal.toml",
         "echo_provider.toml",
         "echo_client.toml",
@@ -39,6 +46,7 @@ fn main() {
         "linux_fd_smoke.toml",
         "linux_round2_smoke.toml",
         "linux_round3_smoke.toml",
+        "linux_round4_futex_smoke.toml",
         "linux_round4_signal_smoke.toml",
     ] {
         println!(
@@ -65,6 +73,10 @@ fn main() {
             "root_component_starnix_round3.nxcd",
         ),
         (
+            "root_component_starnix_round4_futex.toml",
+            "root_component_starnix_round4_futex.nxcd",
+        ),
+        (
             "root_component_starnix_round4_signal.toml",
             "root_component_starnix_round4_signal.nxcd",
         ),
@@ -75,6 +87,10 @@ fn main() {
         ("linux_fd_smoke.toml", "linux_fd_smoke.nxcd"),
         ("linux_round2_smoke.toml", "linux_round2_smoke.nxcd"),
         ("linux_round3_smoke.toml", "linux_round3_smoke.nxcd"),
+        (
+            "linux_round4_futex_smoke.toml",
+            "linux_round4_futex_smoke.nxcd",
+        ),
         (
             "linux_round4_signal_smoke.toml",
             "linux_round4_signal_smoke.nxcd",
@@ -94,6 +110,10 @@ fn main() {
     build_linux_binary(&linux_round2_source, &out_dir.join("linux-round2-smoke"));
     build_linux_binary(&linux_round3_source, &out_dir.join("linux-round3-smoke"));
     build_linux_binary(
+        &linux_round4_futex_source,
+        &out_dir.join("linux-round4-futex-smoke"),
+    );
+    build_linux_binary(
         &linux_round4_signal_source,
         &out_dir.join("linux-round4-signal-smoke"),
     );
@@ -111,6 +131,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_fd)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round2)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round3)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round4_futex)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round4_signal)");
     match root_url.as_str() {
         "boot://root-starnix" => {
@@ -126,6 +147,9 @@ fn main() {
         "boot://root-starnix-round3" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_round3");
+        }
+        "boot://root-starnix-round4-futex" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_round4_futex");
         }
         "boot://root-starnix-round4-signal" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_round4_signal");

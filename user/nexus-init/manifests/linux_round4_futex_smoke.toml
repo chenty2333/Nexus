@@ -1,0 +1,8 @@
+url = "boot://linux-round4-futex-smoke"
+startup = "eager"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-round4-futex-smoke"
+args = ["linux-round4-futex-smoke"]
+env = []

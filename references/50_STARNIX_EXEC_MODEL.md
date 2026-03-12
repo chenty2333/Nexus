@@ -57,6 +57,13 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - minimal caught-signal delivery via user handler + restorer + `rt_sigreturn`
   - interruptible `wait4`
   - baseline `EINTR` / `SA_RESTART` behavior for that wait path
+  - interruptible blocking pipe-backed `read`
+- the current Round-4 futex bootstrap slice now also has:
+  - Linux `FUTEX_WAIT_PRIVATE`
+  - Linux `FUTEX_WAKE_PRIVATE`
+  - Linux `FUTEX_REQUEUE_PRIVATE`
+  - guest-task futex parking kept in the Starnix executive while the carrier
+    thread remains stopped at the supervised syscall boundary
 
 ## Frozen architectural split
 
@@ -354,6 +361,15 @@ Futex support is hybrid:
 
 Shared futex identity should continue to align with Axle's shared/global VMO
 truth rather than any Linux-only VMA tree.
+
+The current in-tree Round-4 futex slice is intentionally narrower than the
+full model above:
+
+- the executive directly owns the live wait queues for supervised Linux tasks
+- only `FUTEX_*_PRIVATE` wait/wake/requeue is implemented so far
+- timeout, bitset, and restart-block policy are still deferred
+- a future generic Axle helper may later let the supervisor park a guest carrier
+  on the kernel futex substrate without blocking the supervisor thread itself
 
 ### Epoll model
 
