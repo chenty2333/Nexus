@@ -170,7 +170,7 @@ depends on: F2
 = round-one groundwork is in:
   - host-side manifest compiler for the minimal component IR
   - unified resolver shape for `boot://`, `pkg://`, and `local://`
-  - in-memory resolver table that hides scheme-specific details from runners
+  - boot-backed manifest loading through the built-in `boot-resolver`
 = round-two topology loop is now in:
   - root manifest resolve
   - static `/svc` assembly for one routed protocol
@@ -204,7 +204,7 @@ depends on: F1-F2, A2
 
 depends on: C3, E2, G
 
-### I. I/O Stack `[ ]`
+### I. I/O Stack `[~]`
 
 #### I1. zxio/fdio-like fd abstraction `[~]`
 
@@ -219,13 +219,27 @@ depends on: C3, E2, G
 = `nexus-init` now uses the shared namespace path normalizer and mount registry
   shape from `nexus-io` instead of an ad-hoc path container
 
-#### I2. namespace / VFS / pipe / socket glue
+#### I2. namespace / VFS / pipe / socket glue `[~]`
 
 = the core glue layer that makes filesystem and socket use practical
+= the current tree now carries one minimal bootstrap namespace/service shape in
+  `user/nexus-init`:
+  - local read-only `/boot` and `/pkg` mounts backed by boot assets
+  - local writable `/tmp` backed by one tiny in-process tmpfs-style tree
+  - routed `/svc` still carried by remote directory handles and the shared FS protocol
+= the current `boot-resolver` and `ElfRunner` now consume `/boot` through the
+  shared `FdOps` / namespace layer instead of private in-memory image tables
+= `PipeFd` and `SocketFd` already wrap current kernel socket objects, and the
+  bootstrap manager now exercises them through one small smoke path
 
-#### I3. filesystem and network services
+#### I3. filesystem and network services `[~]`
 
 = the service side needed for meaningful program execution
+= the current bootstrap service stack is intentionally minimal:
+  - read-only boot asset service shape for binaries and compiled manifests
+  - tiny tmpfs-style writable file service shape for runtime scratch
+  - one routed `svcfs`-style directory path exercised by the component smoke
+  - pipe/socket glue still stands directly on current kernel socket objects
 
 depends on: F, H, E1
 

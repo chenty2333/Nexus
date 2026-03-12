@@ -11,6 +11,7 @@ mod lifecycle;
 mod namespace;
 mod resolver;
 mod runner;
+mod services;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -23,9 +24,7 @@ use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::status::{ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NOT_FOUND, ZX_OK};
 use axle_types::{zx_handle_t, zx_status_t};
 use libzircon::{ZX_TIME_INFINITE, zx_channel_create, zx_handle_close};
-use nexus_component::{
-    ControllerRequest, NamespaceEntry, ResolvedComponent, ResolverRecord, StartupMode,
-};
+use nexus_component::{ControllerRequest, NamespaceEntry, ResolvedComponent, StartupMode};
 use nexus_io::{FdFlags, FdOps, FdTable, NamespaceTrie, OpenFlags, RemoteDir, open_namespace_path};
 
 use crate::fs::{
@@ -38,10 +37,9 @@ use crate::lifecycle::{
     send_status_event,
 };
 use crate::namespace::{CapabilityRegistry, build_namespace_entries, publish_protocols};
-use crate::resolver::{
-    ResolverRegistry, decode_resolved_component, resolve_root_child, resolve_with_realm,
-};
-use crate::runner::{BootImageCatalog, ElfRunner, RunnerRegistry};
+use crate::resolver::{ResolverRegistry, resolve_root_child};
+use crate::runner::{ElfRunner, RunnerRegistry};
+use crate::services::{BootAssetEntry, BootstrapNamespace, run_socket_fd_smoke, run_tmpfs_smoke};
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0010_0000;
 const SLOT_OK: usize = 0;
@@ -82,6 +80,9 @@ const STEP_CLIENT_ROUTE: u64 = 5;
 const STEP_CLIENT_LAUNCH: u64 = 6;
 const STEP_PROVIDER_EVENT: u64 = 7;
 const STEP_CLIENT_EVENT: u64 = 8;
+const STEP_BOOTSTRAP_NAMESPACE: u64 = 9;
+const STEP_TMPFS_SMOKE: u64 = 10;
+const STEP_SOCKET_SMOKE: u64 = 11;
 const STEP_ROOT_PANIC: u64 = u64::MAX;
 
 const ROLE_NONE: usize = 0;
@@ -197,8 +198,10 @@ struct ComponentSummary {
 pub fn program_start(bootstrap_channel: zx_handle_t, arg1: u64) -> ! {
     let _ = (bootstrap_channel, arg1);
     ROLE.store(ROLE_ROOT, Ordering::Relaxed);
-    let mut summary = ComponentSummary::default();
-    summary.failure_step = STEP_RESOLVE_ROOT;
+    let mut summary = ComponentSummary {
+        failure_step: STEP_RESOLVE_ROOT,
+        ..ComponentSummary::default()
+    };
     write_summary(&summary);
     summary.failure_step = 0;
     let status = run_component_manager(&mut summary);
@@ -251,19 +254,22 @@ pub fn child_report_panic() -> ! {
     }
 }
 
-fn build_runner_registry(parent_process: zx_handle_t) -> Result<RunnerRegistry, zx_status_t> {
+fn build_runner_registry(
+    parent_process: zx_handle_t,
+    boot_root: Arc<dyn FdOps>,
+) -> Result<RunnerRegistry, zx_status_t> {
     let mut runners = RunnerRegistry::new();
     runners.insert_elf(
         "elf",
         ElfRunner {
             parent_process,
-            boot_images: build_boot_image_catalog()?,
+            boot_root,
         },
     );
     Ok(runners)
 }
 
-fn build_boot_image_catalog() -> Result<BootImageCatalog, zx_status_t> {
+fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     let self_code_vmo = read_slot(SLOT_SELF_CODE_VMO_H) as zx_handle_t;
     let provider_image_vmo = read_slot(SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H) as zx_handle_t;
     let client_image_vmo = read_slot(SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H) as zx_handle_t;
@@ -277,48 +283,28 @@ fn build_boot_image_catalog() -> Result<BootImageCatalog, zx_status_t> {
         return Err(ZX_ERR_INTERNAL);
     }
 
-    let mut images = BootImageCatalog::new();
-    images.insert(ROOT_BINARY_PATH, self_code_vmo);
-    images.insert(PROVIDER_BINARY_PATH, provider_image_vmo);
-    images.insert(CLIENT_BINARY_PATH, client_image_vmo);
-    images.insert(CONTROLLER_WORKER_BINARY_PATH, controller_worker_image_vmo);
-    Ok(images)
+    BootstrapNamespace::build(&[
+        BootAssetEntry::vmo(ROOT_BINARY_PATH, self_code_vmo),
+        BootAssetEntry::vmo(PROVIDER_BINARY_PATH, provider_image_vmo),
+        BootAssetEntry::vmo(CLIENT_BINARY_PATH, client_image_vmo),
+        BootAssetEntry::vmo(CONTROLLER_WORKER_BINARY_PATH, controller_worker_image_vmo),
+        BootAssetEntry::bytes("manifests/root.nxcd", ROOT_DECL_EAGER_BYTES),
+        BootAssetEntry::bytes("manifests/root-round3.nxcd", ROOT_DECL_ROUND3_BYTES),
+        BootAssetEntry::bytes("manifests/echo-provider.nxcd", PROVIDER_DECL_BYTES),
+        BootAssetEntry::bytes("manifests/echo-client.nxcd", CLIENT_DECL_BYTES),
+        BootAssetEntry::bytes(
+            "manifests/controller-worker.nxcd",
+            CONTROLLER_WORKER_DECL_BYTES,
+        ),
+    ])
 }
 
-fn build_resolver_registry() -> Result<ResolverRegistry, zx_status_t> {
-    let mut resolvers = ResolverRegistry::new();
-    for bytes in [
-        ROOT_DECL_EAGER_BYTES,
-        ROOT_DECL_ROUND3_BYTES,
-        PROVIDER_DECL_BYTES,
-        CLIENT_DECL_BYTES,
-        CONTROLLER_WORKER_DECL_BYTES,
-    ] {
-        let component = decode_resolved_component(bytes)?;
-        resolvers
-            .insert_record(
-                "boot-resolver",
-                ResolverRecord {
-                    url: component.decl.url.clone(),
-                    resolved: component,
-                },
-            )
-            .map_err(|_| ZX_ERR_INTERNAL)?;
-    }
-    Ok(resolvers)
-}
-
-fn root_seed_bytes() -> Result<&'static [u8], zx_status_t> {
-    match ROOT_COMPONENT_URL {
-        "boot://root" => Ok(ROOT_DECL_EAGER_BYTES),
-        "boot://root-round3" => Ok(ROOT_DECL_ROUND3_BYTES),
-        _ => Err(ZX_ERR_NOT_FOUND),
-    }
+fn build_resolver_registry(boot_root: Arc<dyn FdOps>) -> ResolverRegistry {
+    ResolverRegistry::new(boot_root)
 }
 
 fn resolve_root_component(resolvers: &ResolverRegistry) -> Result<ResolvedComponent, zx_status_t> {
-    let root_seed = decode_resolved_component(root_seed_bytes()?)?;
-    resolve_with_realm(&root_seed.decl, resolvers, root_seed.decl.url.as_str())
+    resolvers.resolve("boot-resolver", ROOT_COMPONENT_URL)
 }
 
 fn resolve_optional_root_child(
@@ -342,14 +328,26 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         return 1;
     }
 
-    let resolvers = match build_resolver_registry() {
-        Ok(resolvers) => resolvers,
+    let bootstrap_namespace = match build_bootstrap_namespace() {
+        Ok(namespace) => namespace,
         Err(status) => {
-            summary.failure_step = STEP_RESOLVE_ROOT;
+            summary.failure_step = STEP_BOOTSTRAP_NAMESPACE;
             summary.resolve_root = status as i64;
             return 1;
         }
     };
+    if let Err(status) = run_tmpfs_smoke(bootstrap_namespace.namespace()) {
+        summary.failure_step = STEP_TMPFS_SMOKE;
+        summary.resolve_root = status as i64;
+        return 1;
+    }
+    if let Err(status) = run_socket_fd_smoke() {
+        summary.failure_step = STEP_SOCKET_SMOKE;
+        summary.resolve_root = status as i64;
+        return 1;
+    }
+
+    let resolvers = build_resolver_registry(bootstrap_namespace.boot_root());
     let root = match resolve_root_component(&resolvers) {
         Ok(component) => {
             summary.resolve_root = ZX_OK as i64;
@@ -388,7 +386,7 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
         }
     };
 
-    let runners = match build_runner_registry(parent_process) {
+    let runners = match build_runner_registry(parent_process, bootstrap_namespace.boot_root()) {
         Ok(runners) => runners,
         Err(status) => {
             summary.failure_step = STEP_RESOLVE_ROOT;

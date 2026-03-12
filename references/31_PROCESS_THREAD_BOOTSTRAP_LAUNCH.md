@@ -43,8 +43,24 @@ VMOs for the dedicated `echo-provider`, `echo-client`, and
 `controller-worker` binaries. The kernel exports those VMO handles through the
 fixed bootstrap shared-page slot table so `nexus-init` can pick a child image
 by manifest `program.binary` path instead of only reusing its own image.
+`nexus-init` now turns those seeded VMOs plus its compiled manifest blobs into
+one local `/boot` asset tree, and both the built-in boot resolver and
+`ElfRunner` consume that tree through the shared `FdOps` / namespace layer.
 
 `userspace.rs` contains the current image-loading and bootstrap page-population helpers.
+
+The current QEMU loader layout for the component bootstrap path is:
+
+- `nexus-init` at `0x0100_0000`
+- `echo-provider` at `0x0180_0000`
+- `echo-client` at `0x0200_0000`
+- `controller-worker` at `0x0280_0000`
+
+The kernel bootstrap PMM reserved floor now also tracks the observed end of
+that loader-backed image span so those raw ELF bytes are not recycled as free
+RAM before the pager-backed bootstrap VMOs are created. The current raw
+loader-file bound is also wider than the earlier 4 MiB shape so the larger
+Rust component binaries still import successfully in dev builds.
 
 The bootstrap address space is prewired enough to exercise real VM behavior early:
 
@@ -129,6 +145,9 @@ The first generic-launch contract is now implemented without changing syscall si
 - The current `nexus-init` root manager now chooses one root manifest URL at
   build/boot configuration time and resolves it through the built-in
   `boot-resolver` provider before launching child components.
+- The built-in `boot-resolver` no longer reads from one in-memory resolver
+  table; it now opens compiled manifests from the local `/boot/manifests/*`
+  tree.
 - The current eager-topology component smoke already exercises that contract:
   `nexus-init` launches dedicated boot-backed child images by sending
   `ComponentStartInfo` over the bootstrap channel and then observing controller

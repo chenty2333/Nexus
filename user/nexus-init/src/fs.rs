@@ -15,6 +15,9 @@ use nexus_io::OpenFlags;
 
 use crate::ECHO_PROTOCOL_NAME;
 use crate::lifecycle::wait_for_channel_readable;
+
+type ChannelMessage = (Vec<u8>, Vec<zx_handle_t>);
+
 const FS_SESSION_ID: u64 = 1;
 const ROOT_NODE_ID: u64 = 1;
 const ROOT_OPEN_FILE_ID: u64 = 1;
@@ -42,7 +45,7 @@ pub(crate) fn run_echo_fs_provider(outgoing: zx_handle_t, echo_bytes: &[u8]) -> 
 pub(crate) fn proxy_directory_requests_until_peer_closed(
     client_directory: zx_handle_t,
     provider_directory: zx_handle_t,
-    first_message: Option<(Vec<u8>, Vec<zx_handle_t>)>,
+    first_message: Option<ChannelMessage>,
 ) -> Result<(), zx_status_t> {
     if let Some((bytes, handles)) = first_message {
         forward_raw_message(provider_directory, &bytes, &handles)?;
@@ -57,7 +60,7 @@ pub(crate) fn proxy_directory_requests_until_peer_closed(
 
 pub(crate) fn read_directory_request_for_launch(
     handle: zx_handle_t,
-) -> Result<Option<(Vec<u8>, Vec<zx_handle_t>)>, zx_status_t> {
+) -> Result<Option<ChannelMessage>, zx_status_t> {
     read_message_waiting(handle)
 }
 
@@ -303,9 +306,7 @@ fn forward_raw_message(
     if status == ZX_OK { Ok(()) } else { Err(status) }
 }
 
-fn read_message_waiting(
-    handle: zx_handle_t,
-) -> Result<Option<(Vec<u8>, Vec<zx_handle_t>)>, zx_status_t> {
+fn read_message_waiting(handle: zx_handle_t) -> Result<Option<ChannelMessage>, zx_status_t> {
     match wait_for_channel_readable(handle, ZX_TIME_INFINITE) {
         Ok(()) => {}
         Err(ZX_ERR_PEER_CLOSED) => return Ok(None),
@@ -318,9 +319,7 @@ fn read_message_waiting(
     }
 }
 
-fn read_message_polling(
-    handle: zx_handle_t,
-) -> Result<Option<(Vec<u8>, Vec<zx_handle_t>)>, zx_status_t> {
+fn read_message_polling(handle: zx_handle_t) -> Result<Option<ChannelMessage>, zx_status_t> {
     loop {
         match zx_channel_read_alloc(handle, 0) {
             Ok(message) => return Ok(Some(message)),

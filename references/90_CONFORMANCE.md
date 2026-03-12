@@ -132,10 +132,18 @@ This makes contract coverage part of the repo workflow, not just informal docume
 - The eager and lazy component scenarios now rebuild the same `nexus-init`
   binary with different root-manifest URLs via `NEXUS_INIT_ROOT_URL`; topology
   selection is no longer driven by a separate smoke-mode branch in the manager.
+- Those component scenarios now also exercise the current bootstrap `/boot`
+  asset tree indirectly:
+  - the built-in boot resolver opens compiled manifests from `/boot/manifests`
+  - `ElfRunner` opens `/boot/bin/*` objects and requests read-only executable VMOs
 - Because those dedicated userspace binaries are still linked at the
   long-standing bootstrap userspace VA above 4 GiB, the component scenarios
   build them with `RUSTFLAGS='-C code-model=large'` instead of changing the
   whole `x86_64-unknown-none` target configuration.
+- The component scenarios now use wider QEMU loader spacing than the first
+  round-two version because the dedicated Rust ELFs outgrew the older 4 MiB
+  gaps, and the kernel bootstrap PMM reserved floor now follows that loader
+  span instead of assuming a fixed 32 MiB ceiling is always sufficient.
 - The bootstrap code window above 4 GiB is wider than the early 32 KiB bring-up shape so the
   runtime dispatcher runner and its shared summary pages no longer overlap in the fixed mapping.
 - Some bootstrap channel metrics currently come from a second structured summary line rather than

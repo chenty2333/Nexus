@@ -1,4 +1,5 @@
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -14,6 +15,7 @@ use nexus_component::{
     CapabilityKind, ComponentDecl, ComponentStartInfo, NamespaceEntry, NumberedHandle,
     ResolvedComponent,
 };
+use nexus_io::{FdOps, OpenFlags, VmoFlags};
 
 use crate::STARTUP_HANDLE_COMPONENT_STATUS;
 use crate::resolver::lookup_use_decl;
@@ -61,31 +63,9 @@ impl RunnerRegistry {
 }
 
 #[derive(Clone)]
-pub(crate) struct BootImageCatalog {
-    images: Vec<(String, zx_handle_t)>,
-}
-
-impl BootImageCatalog {
-    pub(crate) fn new() -> Self {
-        Self { images: Vec::new() }
-    }
-
-    pub(crate) fn insert(&mut self, binary_path: &str, image_vmo: zx_handle_t) {
-        self.images.push((String::from(binary_path), image_vmo));
-    }
-
-    fn image_vmo(&self, binary_path: &str) -> Option<zx_handle_t> {
-        self.images
-            .iter()
-            .find(|(path, _)| path == binary_path)
-            .map(|(_, handle)| *handle)
-    }
-}
-
-#[derive(Clone)]
 pub(crate) struct ElfRunner {
     pub(crate) parent_process: zx_handle_t,
-    pub(crate) boot_images: BootImageCatalog,
+    pub(crate) boot_root: Arc<dyn FdOps>,
 }
 
 impl ElfRunner {
@@ -99,10 +79,17 @@ impl ElfRunner {
         if component.decl.program.runner != "elf" {
             return Err(ZX_ERR_NOT_SUPPORTED);
         }
-        let image_vmo = self
-            .boot_images
-            .image_vmo(component.decl.program.binary.as_str())
-            .ok_or(ZX_ERR_NOT_FOUND)?;
+        let image = self
+            .boot_root
+            .openat(component.decl.program.binary.as_str(), OpenFlags::READABLE)
+            .map_err(|status| {
+                if status == axle_types::status::ZX_ERR_NOT_DIR {
+                    ZX_ERR_NOT_FOUND
+                } else {
+                    status
+                }
+            })?;
+        let image_vmo = image.as_vmo(VmoFlags::READ | VmoFlags::EXECUTE)?;
 
         let mut process = ZX_HANDLE_INVALID;
         let mut root_vmar = ZX_HANDLE_INVALID;

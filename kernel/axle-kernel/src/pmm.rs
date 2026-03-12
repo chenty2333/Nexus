@@ -228,6 +228,10 @@ pub(crate) fn stats() -> BootstrapPageAllocatorStats {
 
 fn bootstrap_reserved_floor(start: &crate::arch::pvh::HvmStartInfo) -> u64 {
     let mut reserved = BOOTSTRAP_RESERVED_FLOOR;
+    reserved = reserved.max(align_up(
+        crate::userspace::qemu_loader_reserved_floor(),
+        PAGE_BYTES,
+    ));
 
     let (heap_base, heap_end) = crate::kalloc::bootstrap_heap_region();
     reserved = reserved.max(align_up(heap_end.max(heap_base), PAGE_BYTES));

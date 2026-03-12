@@ -91,7 +91,10 @@ At the moment, `43_VM_EXEC_PAGER_DEVICE_VM.md` is the only intentional `draft` b
 - `crates/nexus-rt` - single-thread userspace dispatcher/executor built on one port, one dispatcher timer, generation-safe signal registrations, and async channel/socket helpers
 - `kernel/axle-kernel` - live kernel integration layer
 - `user/nexus-init` - extracted bootstrap `nexus-init` root manager plus shared
-  manager/runtime logic reused by the minimal component smoke binaries
+  manager/runtime logic reused by the minimal component smoke binaries;
+  now also owns the current bootstrap `/boot` / `/pkg` / `/tmp` service tree
+  and the built-in boot resolver / ELF runner glue that consumes it through
+  `nexus-io`
 - `user/echo-provider` - dedicated bootstrap component binary for the routed
   echo protocol provider
 - `user/echo-client` - dedicated bootstrap component binary for the routed echo

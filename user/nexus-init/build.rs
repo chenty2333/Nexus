@@ -37,11 +37,13 @@ fn main() {
             .unwrap_or_else(|err| panic!("write {}: {err}", out_dir.join(output).display()));
     }
 
-    // Link the bootstrap userspace binary at the fixed VA currently expected by
-    // the kernel's early userspace loader.
-    let script = manifest_dir.join("linker.ld");
-    println!("cargo:rustc-link-arg=-T{}", script.display());
-    println!("cargo:rustc-link-arg=-no-pie");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
+        // Link the bootstrap userspace binary at the fixed VA currently
+        // expected by the kernel's early userspace loader.
+        let script = manifest_dir.join("linker.ld");
+        println!("cargo:rustc-link-arg=-T{}", script.display());
+        println!("cargo:rustc-link-arg=-no-pie");
+    }
     let root_url =
         std::env::var("NEXUS_INIT_ROOT_URL").unwrap_or_else(|_| String::from("boot://root"));
     println!("cargo:rustc-env=NEXUS_INIT_ROOT_URL={root_url}");

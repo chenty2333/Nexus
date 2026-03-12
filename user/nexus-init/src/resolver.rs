@@ -1,40 +1,21 @@
-use alloc::string::String;
-use alloc::vec::Vec;
+use alloc::format;
+use alloc::sync::Arc;
 
 use axle_types::status::{
-    ZX_ERR_INVALID_ARGS, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
+    ZX_ERR_BAD_STATE, ZX_ERR_INVALID_ARGS, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NOT_FOUND,
+    ZX_ERR_NOT_SUPPORTED,
 };
 use axle_types::zx_status_t;
-use nexus_component::{
-    CapabilityKind, ComponentDecl, ResolvedComponent, ResolverRecord, ResolverTable, StartupMode,
-    UseDecl,
-};
+use nexus_component::{CapabilityKind, ComponentDecl, ResolvedComponent, StartupMode, UseDecl};
+use nexus_io::{FdOps, OpenFlags};
 
 pub(crate) struct ResolverRegistry {
-    tables: Vec<(String, ResolverTable)>,
+    boot_root: Arc<dyn FdOps>,
 }
 
 impl ResolverRegistry {
-    pub(crate) fn new() -> Self {
-        Self { tables: Vec::new() }
-    }
-
-    pub(crate) fn insert_record(
-        &mut self,
-        capability_name: &str,
-        record: ResolverRecord,
-    ) -> Result<(), ()> {
-        if let Some((_, table)) = self
-            .tables
-            .iter_mut()
-            .find(|(name, _)| name == capability_name)
-        {
-            return table.insert(record).map_err(|_| ());
-        }
-        let mut table = ResolverTable::new();
-        table.insert(record).map_err(|_| ())?;
-        self.tables.push((String::from(capability_name), table));
-        Ok(())
+    pub(crate) fn new(boot_root: Arc<dyn FdOps>) -> Self {
+        Self { boot_root }
     }
 
     pub(crate) fn resolve(
@@ -42,13 +23,17 @@ impl ResolverRegistry {
         capability_name: &str,
         url: &str,
     ) -> Result<ResolvedComponent, zx_status_t> {
-        let table = self
-            .tables
-            .iter()
-            .find(|(name, _)| name == capability_name)
-            .map(|(_, table)| table)
-            .ok_or(ZX_ERR_NOT_FOUND)?;
-        table.resolve(url).map_err(map_resolve_error)
+        if capability_name != "boot-resolver" {
+            return Err(ZX_ERR_NOT_FOUND);
+        }
+        let path = boot_manifest_path(url)?;
+        let manifest = self.boot_root.openat(path.as_str(), OpenFlags::READABLE)?;
+        let mut bytes = [0u8; 4096];
+        let actual = manifest.read(&mut bytes)?;
+        if actual == 0 {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        decode_resolved_component(&bytes[..actual])
     }
 }
 
@@ -115,4 +100,14 @@ fn map_resolve_error(error: nexus_component::ResolveError) -> zx_status_t {
         nexus_component::ResolveError::UnsupportedScheme => ZX_ERR_NOT_SUPPORTED,
         nexus_component::ResolveError::NotFound => ZX_ERR_NOT_FOUND,
     }
+}
+
+fn boot_manifest_path(url: &str) -> Result<alloc::string::String, zx_status_t> {
+    let name = url
+        .strip_prefix("boot://")
+        .ok_or_else(|| map_resolve_error(nexus_component::ResolveError::UnsupportedScheme))?;
+    if name.is_empty() || name.contains('/') {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    Ok(format!("manifests/{name}.nxcd"))
 }

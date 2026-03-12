@@ -52,20 +52,20 @@ const USER_RUNNER_IMAGE: QemuLoaderImage = QemuLoaderImage {
     size_paddr: 0x0100_0000 - 8,
 };
 const ECHO_PROVIDER_IMAGE: QemuLoaderImage = QemuLoaderImage {
-    paddr: 0x0140_0000,
-    size_paddr: 0x0140_0000 - 8,
-};
-const ECHO_CLIENT_IMAGE: QemuLoaderImage = QemuLoaderImage {
     paddr: 0x0180_0000,
     size_paddr: 0x0180_0000 - 8,
 };
+const ECHO_CLIENT_IMAGE: QemuLoaderImage = QemuLoaderImage {
+    paddr: 0x0200_0000,
+    size_paddr: 0x0200_0000 - 8,
+};
 const CONTROLLER_WORKER_IMAGE: QemuLoaderImage = QemuLoaderImage {
-    paddr: 0x01c0_0000,
-    size_paddr: 0x01c0_0000 - 8,
+    paddr: 0x0280_0000,
+    size_paddr: 0x0280_0000 - 8,
 };
 // Raw QEMU loader input is the full ELF file, including debug sections in
 // dev builds. Keep this bound separate from the mapped code window size.
-const USER_RUNNER_ELF_MAX_BYTES: usize = 4 * 1024 * 1024;
+const USER_RUNNER_ELF_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 // --- Shared summary slots (u64) written by userspace ---
 
@@ -1038,6 +1038,21 @@ fn qemu_loader_image_size(image: QemuLoaderImage) -> Option<u64> {
     let page = USER_PAGE_BYTES;
     let padded = blob_len.checked_add(page - 1)? & !(page - 1);
     Some(padded)
+}
+
+pub(crate) fn qemu_loader_reserved_floor() -> u64 {
+    [
+        USER_RUNNER_IMAGE,
+        ECHO_PROVIDER_IMAGE,
+        ECHO_CLIENT_IMAGE,
+        CONTROLLER_WORKER_IMAGE,
+    ]
+    .into_iter()
+    .filter_map(|image| {
+        qemu_loader_image_size(image).and_then(|size| image.paddr.checked_add(size))
+    })
+    .max()
+    .unwrap_or(0)
 }
 
 const fn align_up(value: u64, align: u64) -> u64 {
