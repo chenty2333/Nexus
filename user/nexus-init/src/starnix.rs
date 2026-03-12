@@ -74,6 +74,7 @@ const LINUX_SYSCALL_MPROTECT: u64 = 10;
 const LINUX_SYSCALL_MUNMAP: u64 = 11;
 const LINUX_SYSCALL_RT_SIGACTION: u64 = 13;
 const LINUX_SYSCALL_RT_SIGPROCMASK: u64 = 14;
+const LINUX_SYSCALL_RT_SIGRETURN: u64 = 15;
 const LINUX_SYSCALL_BRK: u64 = 12;
 const LINUX_SYSCALL_GETPID: u64 = 39;
 const LINUX_SYSCALL_SOCKETPAIR: u64 = 53;
@@ -129,6 +130,7 @@ const LINUX_S_IFREG: u32 = 0o100000;
 const LINUX_S_IFSOCK: u32 = 0o140000;
 const LINUX_STAT_STRUCT_BYTES: usize = 144;
 const LINUX_PATH_MAX: usize = 4096;
+const LINUX_EINTR: i32 = 4;
 const LINUX_EIO: i32 = 5;
 const LINUX_EBADF: i32 = 9;
 const LINUX_EAGAIN: i32 = 11;
@@ -150,6 +152,8 @@ const LINUX_SIG_UNBLOCK: u64 = 1;
 const LINUX_SIG_SETMASK: u64 = 2;
 const LINUX_SIG_DFL: u64 = 0;
 const LINUX_SIG_IGN: u64 = 1;
+const LINUX_SA_RESTORER: u64 = 0x0400_0000;
+const LINUX_SA_RESTART: u64 = 0x1000_0000;
 const LINUX_SIGKILL: i32 = 9;
 const LINUX_SIGCHLD: i32 = 17;
 const LINUX_SIGSTOP: i32 = 19;
@@ -239,6 +243,7 @@ enum SyscallAction {
 enum SignalDeliveryAction {
     Ignore,
     Terminate,
+    Catch(LinuxSigAction),
 }
 
 struct ExecutiveState {
@@ -306,6 +311,12 @@ struct TaskSignals {
 }
 
 #[derive(Clone, Copy)]
+struct ActiveSignalFrame {
+    restore_regs: ax_guest_x64_regs_t,
+    previous_blocked: u64,
+}
+
+#[derive(Clone, Copy)]
 struct TaskCarrier {
     thread_handle: zx_handle_t,
     session_handle: zx_handle_t,
@@ -318,9 +329,11 @@ enum TaskState {
     Waiting(WaitRequest),
 }
 
+#[derive(Clone, Copy)]
 struct WaitRequest {
     target_pid: i32,
     status_addr: u64,
+    restartable: bool,
 }
 
 struct LinuxTask {
@@ -329,6 +342,7 @@ struct LinuxTask {
     carrier: TaskCarrier,
     state: TaskState,
     signals: TaskSignals,
+    active_signal: Option<ActiveSignalFrame>,
 }
 
 enum ThreadGroupState {
@@ -468,7 +482,7 @@ impl StarnixKernel {
                 Ok(action) => action,
                 Err(status) => return map_status_to_return_code(status),
             };
-            let action = match self.apply_signal_delivery(task_id, action) {
+            let action = match self.apply_signal_delivery(task_id, action, &mut stop_state) {
                 Ok(action) => action,
                 Err(status) => return map_status_to_return_code(status),
             };
@@ -518,6 +532,7 @@ impl StarnixKernel {
             LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
             LINUX_SYSCALL_RT_SIGACTION => self.sys_rt_sigaction(task_id, stop_state),
             LINUX_SYSCALL_RT_SIGPROCMASK => self.sys_rt_sigprocmask(task_id, stop_state),
+            LINUX_SYSCALL_RT_SIGRETURN => self.sys_rt_sigreturn(task_id, stop_state),
             LINUX_SYSCALL_CLONE => self.sys_clone(task_id, stop_state),
             LINUX_SYSCALL_FORK => self.sys_fork(task_id, stop_state),
             LINUX_SYSCALL_EXECVE => self.sys_execve(task_id, stop_state),
@@ -542,16 +557,35 @@ impl StarnixKernel {
         &mut self,
         task_id: i32,
         action: SyscallAction,
+        stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
         if !matches!(action, SyscallAction::Resume) {
             return Ok(action);
         }
-        let Some(signal) = self.take_deliverable_signal(task_id)? else {
-            return Ok(action);
-        };
-        match self.signal_delivery_action(task_id, signal)? {
-            SignalDeliveryAction::Ignore => Ok(SyscallAction::Resume),
-            SignalDeliveryAction::Terminate => Ok(SyscallAction::GroupSignalExit(signal)),
+        loop {
+            let Some(signal) = self.take_deliverable_signal(task_id)? else {
+                return Ok(action);
+            };
+            match self.signal_delivery_action(task_id, signal)? {
+                SignalDeliveryAction::Ignore => {}
+                SignalDeliveryAction::Terminate => {
+                    return Ok(SyscallAction::GroupSignalExit(signal));
+                }
+                SignalDeliveryAction::Catch(sigaction) => {
+                    let restore_regs = stop_state.regs;
+                    self.install_signal_frame(
+                        task_id,
+                        signal,
+                        sigaction,
+                        stop_state,
+                        ActiveSignalFrame {
+                            restore_regs,
+                            previous_blocked: self.task_signal_mask(task_id)?,
+                        },
+                    )?;
+                    return Ok(SyscallAction::Resume);
+                }
+            }
         }
     }
 
@@ -748,6 +782,127 @@ impl StarnixKernel {
             .ok_or(ZX_ERR_BAD_STATE)
     }
 
+    fn install_signal_frame(
+        &mut self,
+        task_id: i32,
+        signal: i32,
+        action: LinuxSigAction,
+        stop_state: &mut ax_guest_stop_state_t,
+        frame: ActiveSignalFrame,
+    ) -> Result<(), zx_status_t> {
+        let signal_bit = linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let stack_pointer = stop_state
+            .regs
+            .rsp
+            .checked_sub(8)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        write_guest_bytes(session, stack_pointer, &action.restorer.to_ne_bytes())?;
+
+        let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if task.active_signal.is_some() {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        let mut blocked = frame.previous_blocked | action.mask;
+        if (action.flags & LINUX_SA_RESTORER) == 0 || action.restorer == 0 {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        blocked |= signal_bit;
+        task.signals.blocked = normalize_signal_mask(blocked);
+        task.active_signal = Some(frame);
+
+        stop_state.regs.rsp = stack_pointer;
+        stop_state.regs.rip = action.handler;
+        stop_state.regs.rdi = signal as u64;
+        stop_state.regs.rsi = 0;
+        stop_state.regs.rdx = 0;
+        Ok(())
+    }
+
+    fn deliver_or_interrupt_wait(
+        &mut self,
+        task_id: i32,
+        wait: WaitRequest,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        loop {
+            let Some(signal) = self.take_deliverable_signal(task_id)? else {
+                return Ok(SyscallAction::LeaveStopped);
+            };
+            match self.signal_delivery_action(task_id, signal)? {
+                SignalDeliveryAction::Ignore => {}
+                SignalDeliveryAction::Terminate => {
+                    if let Some(task) = self.tasks.get_mut(&task_id) {
+                        task.state = TaskState::Running;
+                    }
+                    return Ok(SyscallAction::GroupSignalExit(signal));
+                }
+                SignalDeliveryAction::Catch(sigaction) => {
+                    let previous_blocked = self.task_signal_mask(task_id)?;
+                    let mut restore_regs = stop_state.regs;
+                    if !wait.restartable || (sigaction.flags & LINUX_SA_RESTART) == 0 {
+                        complete_syscall(stop_state, linux_errno(LINUX_EINTR))?;
+                        restore_regs = stop_state.regs;
+                    }
+                    self.install_signal_frame(
+                        task_id,
+                        signal,
+                        sigaction,
+                        stop_state,
+                        ActiveSignalFrame {
+                            restore_regs,
+                            previous_blocked,
+                        },
+                    )?;
+                    if let Some(task) = self.tasks.get_mut(&task_id) {
+                        task.state = TaskState::Running;
+                    }
+                    return Ok(SyscallAction::Resume);
+                }
+            }
+        }
+    }
+
+    fn interrupt_waiting_task(&mut self, task_id: i32) -> Result<(), zx_status_t> {
+        let Some(task) = self.tasks.get(&task_id) else {
+            return Ok(());
+        };
+        let TaskState::Waiting(wait) = &task.state else {
+            return Ok(());
+        };
+        let wait = *wait;
+
+        let sidecar = task.carrier.sidecar_vmo;
+        let mut stop_state = ax_guest_stop_state_read(sidecar)?;
+        match self.deliver_or_interrupt_wait(task_id, wait, &mut stop_state)? {
+            SyscallAction::Resume => self.writeback_and_resume(task_id, &stop_state),
+            SyscallAction::LeaveStopped => Ok(()),
+            SyscallAction::GroupSignalExit(signal) => self.exit_group_from_signal(task_id, signal),
+            _ => Err(ZX_ERR_BAD_STATE),
+        }
+    }
+
+    fn service_pending_waiters(&mut self) -> Result<(), zx_status_t> {
+        let waiting = self
+            .tasks
+            .iter()
+            .filter_map(|(task_id, task)| {
+                matches!(task.state, TaskState::Waiting(_)).then_some(*task_id)
+            })
+            .collect::<Vec<_>>();
+        for task_id in waiting {
+            if self.tasks.contains_key(&task_id) {
+                self.interrupt_waiting_task(task_id)?;
+            }
+        }
+        Ok(())
+    }
+
     fn take_deliverable_signal(&mut self, task_id: i32) -> Result<Option<i32>, zx_status_t> {
         let blocked = self.task_signal_mask(task_id)?;
         let task_pending = self
@@ -801,7 +956,7 @@ impl StarnixKernel {
                     Ok(SignalDeliveryAction::Terminate)
                 }
             }
-            _ => Err(ZX_ERR_NOT_SUPPORTED),
+            _ => Ok(SignalDeliveryAction::Catch(action)),
         }
     }
 
@@ -978,8 +1133,16 @@ impl StarnixKernel {
                     return Ok(SyscallAction::Resume);
                 }
             };
-            if action.handler != LINUX_SIG_DFL && action.handler != LINUX_SIG_IGN {
+            let supported_flags = LINUX_SA_RESTORER | LINUX_SA_RESTART;
+            if (action.flags & !supported_flags) != 0 {
                 complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?;
+                return Ok(SyscallAction::Resume);
+            }
+            if action.handler != LINUX_SIG_DFL
+                && action.handler != LINUX_SIG_IGN
+                && ((action.flags & LINUX_SA_RESTORER) == 0 || action.restorer == 0)
+            {
+                complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
                 return Ok(SyscallAction::Resume);
             }
             let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
@@ -997,6 +1160,21 @@ impl StarnixKernel {
         Ok(SyscallAction::Resume)
     }
 
+    fn sys_rt_sigreturn(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let Some(frame) = task.active_signal.take() else {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        };
+        task.signals.blocked = frame.previous_blocked;
+        stop_state.regs = frame.restore_regs;
+        Ok(SyscallAction::Resume)
+    }
+
     fn sys_kill(
         &mut self,
         stop_state: &mut ax_guest_stop_state_t,
@@ -1008,6 +1186,7 @@ impl StarnixKernel {
         } else {
             self.queue_signal_to_group(pid, signal)?
         };
+        self.service_pending_waiters()?;
         complete_syscall(stop_state, result)?;
         Ok(SyscallAction::Resume)
     }
@@ -1024,6 +1203,7 @@ impl StarnixKernel {
         } else {
             self.queue_signal_to_task(tgid, tid, signal)?
         };
+        self.service_pending_waiters()?;
         complete_syscall(stop_state, result)?;
         Ok(SyscallAction::Resume)
     }
@@ -1114,6 +1294,7 @@ impl StarnixKernel {
                     blocked: parent_blocked,
                     pending: 0,
                 },
+                active_signal: None,
             },
         );
         self.groups
@@ -1272,6 +1453,7 @@ impl StarnixKernel {
                     blocked: parent_blocked,
                     pending: 0,
                 },
+                active_signal: None,
             },
         );
         self.groups.insert(
@@ -1432,6 +1614,7 @@ impl StarnixKernel {
             let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
             let old_carrier = task.carrier;
             task.carrier = new_carrier;
+            task.active_signal = None;
             old_carrier
         };
         let old_resources = {
@@ -1509,12 +1692,13 @@ impl StarnixKernel {
             return Ok(SyscallAction::Resume);
         }
 
-        self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
-            TaskState::Waiting(WaitRequest {
-                target_pid,
-                status_addr,
-            });
-        Ok(SyscallAction::LeaveStopped)
+        let wait = WaitRequest {
+            target_pid,
+            status_addr,
+            restartable: true,
+        };
+        self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Waiting(wait);
+        self.deliver_or_interrupt_wait(task_id, wait, stop_state)
     }
 }
 
@@ -1630,6 +1814,7 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         carrier,
         state: TaskState::Running,
         signals: TaskSignals::default(),
+        active_signal: None,
     };
     let mut task_ids = BTreeSet::new();
     task_ids.insert(1);

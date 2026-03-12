@@ -104,12 +104,15 @@ Main just targets include:
   - zombie reap and reparent-to-root behavior
   - the guest still sees stable Linux task identity even when `execve` swaps the underlying Axle
     carrier process/thread resources
-- The first Round-4 Starnix signal scenario now closes one pure-executive signal slice:
+- The current Round-4 Starnix signal scenario now closes the current pure-executive signal slice:
   - `getpid` / `gettid`
-  - `rt_sigaction` with `SIG_DFL` / `SIG_IGN`
+  - `rt_sigaction` with `SIG_DFL`, `SIG_IGN`, and one minimal caught-handler path
   - `rt_sigprocmask`
   - `kill` / `tgkill`
-  - signal dequeue and ignore/default delivery on the syscall-resume boundary
+  - signal dequeue and delivery on the syscall-resume boundary
+  - `rt_sigreturn`
+  - `wait4` interruption with `EINTR`
+  - `wait4` restart when the installed action carries `SA_RESTART`
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return
