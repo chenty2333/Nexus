@@ -116,6 +116,10 @@ const ROOT_DECL_STARNIX_ROUND3_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_round3.nxcd"
 ));
+const ROOT_DECL_STARNIX_ROUND4_SIGNAL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_round4_signal.nxcd"
+));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
@@ -139,6 +143,11 @@ pub(crate) const LINUX_ROUND3_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_round3_smoke.nxcd"));
 #[cfg(not(nexus_init_embed_starnix_round3))]
 pub(crate) const LINUX_ROUND3_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round4_signal)]
+pub(crate) const LINUX_ROUND4_SIGNAL_DECL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux_round4_signal_smoke.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_round4_signal))]
+pub(crate) const LINUX_ROUND4_SIGNAL_DECL_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_hello)]
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
@@ -159,6 +168,11 @@ pub(crate) const LINUX_ROUND3_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-round3-smoke"));
 #[cfg(not(nexus_init_embed_starnix_round3))]
 pub(crate) const LINUX_ROUND3_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round4_signal)]
+pub(crate) const LINUX_ROUND4_SIGNAL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-round4-signal-smoke"));
+#[cfg(not(nexus_init_embed_starnix_round4_signal))]
+pub(crate) const LINUX_ROUND4_SIGNAL_BYTES: &[u8] = &[];
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
@@ -173,6 +187,7 @@ pub(crate) const LINUX_HELLO_BINARY_PATH: &str = "bin/linux-hello";
 pub(crate) const LINUX_FD_SMOKE_BINARY_PATH: &str = "bin/linux-fd-smoke";
 pub(crate) const LINUX_ROUND2_BINARY_PATH: &str = "bin/linux-round2-smoke";
 pub(crate) const LINUX_ROUND3_BINARY_PATH: &str = "bin/linux-round3-smoke";
+pub(crate) const LINUX_ROUND4_SIGNAL_BINARY_PATH: &str = "bin/linux-round4-signal-smoke";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -192,6 +207,7 @@ const STARNIX_HELLO_EXPECTED_STDOUT: &[u8] = b"hello from linux-hello\n";
 const STARNIX_FD_SMOKE_EXPECTED_STDOUT: &[u8] = b"pipe\nsock\n";
 const STARNIX_ROUND2_EXPECTED_STDOUT: &[u8] = b"round2 ok\n";
 const STARNIX_ROUND3_EXPECTED_STDOUT: &[u8] = b"hello from linux-hello\nround3 ok\n";
+const STARNIX_ROUND4_SIGNAL_EXPECTED_STDOUT: &[u8] = b"round4 signal ok\n";
 
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
@@ -400,6 +416,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             LINUX_ROUND3_BYTES,
         ));
     }
+    if !LINUX_ROUND4_SIGNAL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND4_SIGNAL_BINARY_PATH,
+            LINUX_ROUND4_SIGNAL_BYTES,
+        ));
+    }
     assets.push(BootAssetEntry::bytes(
         "manifests/root.nxcd",
         ROOT_DECL_EAGER_BYTES,
@@ -424,6 +446,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         "manifests/root-starnix-round3.nxcd",
         ROOT_DECL_STARNIX_ROUND3_BYTES,
     ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-round4-signal.nxcd",
+        ROOT_DECL_STARNIX_ROUND4_SIGNAL_BYTES,
+    ));
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -446,6 +472,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round3-smoke.nxcd",
             LINUX_ROUND3_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND4_SIGNAL_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round4-signal-smoke.nxcd",
+            LINUX_ROUND4_SIGNAL_DECL_BYTES,
         ));
     }
     assets.push(BootAssetEntry::bytes(
@@ -586,6 +618,16 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             &runners,
             "linux_round3_smoke",
             STARNIX_ROUND3_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-round4-signal" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_round4_signal_smoke",
+            STARNIX_ROUND4_SIGNAL_EXPECTED_STDOUT,
             summary,
         );
     }

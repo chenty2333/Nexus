@@ -46,8 +46,10 @@ use crate::{
     LINUX_FD_SMOKE_BINARY_PATH, LINUX_FD_SMOKE_BYTES, LINUX_FD_SMOKE_DECL_BYTES,
     LINUX_HELLO_BINARY_PATH, LINUX_HELLO_BYTES, LINUX_HELLO_DECL_BYTES, LINUX_ROUND2_BINARY_PATH,
     LINUX_ROUND2_BYTES, LINUX_ROUND2_DECL_BYTES, LINUX_ROUND3_BINARY_PATH, LINUX_ROUND3_BYTES,
-    LINUX_ROUND3_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS, STARTUP_HANDLE_STARNIX_IMAGE_VMO,
-    STARTUP_HANDLE_STARNIX_PARENT_PROCESS, STARTUP_HANDLE_STARNIX_STDOUT,
+    LINUX_ROUND3_DECL_BYTES, LINUX_ROUND4_SIGNAL_BINARY_PATH, LINUX_ROUND4_SIGNAL_BYTES,
+    LINUX_ROUND4_SIGNAL_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
+    STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
+    STARTUP_HANDLE_STARNIX_STDOUT,
 };
 
 const USER_PAGE_BYTES: u64 = 0x1000;
@@ -70,12 +72,18 @@ const LINUX_SYSCALL_FSTAT: u64 = 5;
 const LINUX_SYSCALL_MMAP: u64 = 9;
 const LINUX_SYSCALL_MPROTECT: u64 = 10;
 const LINUX_SYSCALL_MUNMAP: u64 = 11;
+const LINUX_SYSCALL_RT_SIGACTION: u64 = 13;
+const LINUX_SYSCALL_RT_SIGPROCMASK: u64 = 14;
 const LINUX_SYSCALL_BRK: u64 = 12;
+const LINUX_SYSCALL_GETPID: u64 = 39;
 const LINUX_SYSCALL_SOCKETPAIR: u64 = 53;
 const LINUX_SYSCALL_CLONE: u64 = 56;
 const LINUX_SYSCALL_FORK: u64 = 57;
 const LINUX_SYSCALL_EXECVE: u64 = 59;
 const LINUX_SYSCALL_WAIT4: u64 = 61;
+const LINUX_SYSCALL_KILL: u64 = 62;
+const LINUX_SYSCALL_GETTID: u64 = 186;
+const LINUX_SYSCALL_TGKILL: u64 = 234;
 const LINUX_SYSCALL_GETDENTS64: u64 = 217;
 const LINUX_SYSCALL_EXIT: u64 = 60;
 const LINUX_SYSCALL_OPENAT: u64 = 257;
@@ -125,6 +133,7 @@ const LINUX_EIO: i32 = 5;
 const LINUX_EBADF: i32 = 9;
 const LINUX_EAGAIN: i32 = 11;
 const LINUX_EACCES: i32 = 13;
+const LINUX_ESRCH: i32 = 3;
 const LINUX_EFAULT: i32 = 14;
 const LINUX_EEXIST: i32 = 17;
 const LINUX_ENOENT: i32 = 2;
@@ -136,6 +145,16 @@ const LINUX_EPIPE: i32 = 32;
 const LINUX_ENOSYS: i32 = 38;
 const LINUX_ENODEV: i32 = 19;
 const LINUX_ECHILD: i32 = 10;
+const LINUX_SIG_BLOCK: u64 = 0;
+const LINUX_SIG_UNBLOCK: u64 = 1;
+const LINUX_SIG_SETMASK: u64 = 2;
+const LINUX_SIG_DFL: u64 = 0;
+const LINUX_SIG_IGN: u64 = 1;
+const LINUX_SIGKILL: i32 = 9;
+const LINUX_SIGCHLD: i32 = 17;
+const LINUX_SIGSTOP: i32 = 19;
+const LINUX_SIGNAL_SET_BYTES: usize = 8;
+const LINUX_SIGACTION_BYTES: usize = 32;
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
@@ -214,6 +233,12 @@ enum SyscallAction {
     LeaveStopped,
     TaskExit(i32),
     GroupExit(i32),
+    GroupSignalExit(i32),
+}
+
+enum SignalDeliveryAction {
+    Ignore,
+    Terminate,
 }
 
 struct ExecutiveState {
@@ -266,6 +291,20 @@ struct TaskImage {
     writable_ranges: Vec<LinuxWritableRange>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct LinuxSigAction {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TaskSignals {
+    blocked: u64,
+    pending: u64,
+}
+
 #[derive(Clone, Copy)]
 struct TaskCarrier {
     thread_handle: zx_handle_t,
@@ -289,6 +328,7 @@ struct LinuxTask {
     tgid: i32,
     carrier: TaskCarrier,
     state: TaskState,
+    signals: TaskSignals,
 }
 
 enum ThreadGroupState {
@@ -303,6 +343,8 @@ struct LinuxThreadGroup {
     child_tgids: BTreeSet<i32>,
     task_ids: BTreeSet<i32>,
     state: ThreadGroupState,
+    shared_pending: u64,
+    sigactions: BTreeMap<i32, LinuxSigAction>,
     image: Option<TaskImage>,
     resources: Option<ExecutiveState>,
 }
@@ -426,6 +468,10 @@ impl StarnixKernel {
                 Ok(action) => action,
                 Err(status) => return map_status_to_return_code(status),
             };
+            let action = match self.apply_signal_delivery(task_id, action) {
+                Ok(action) => action,
+                Err(status) => return map_status_to_return_code(status),
+            };
             match action {
                 SyscallAction::Resume => {
                     if let Err(status) = self.writeback_and_resume(task_id, &stop_state) {
@@ -440,6 +486,11 @@ impl StarnixKernel {
                 }
                 SyscallAction::GroupExit(code) => {
                     if let Err(status) = self.exit_group(task_id, code) {
+                        return map_status_to_return_code(status);
+                    }
+                }
+                SyscallAction::GroupSignalExit(signal) => {
+                    if let Err(status) = self.exit_group_from_signal(task_id, signal) {
                         return map_status_to_return_code(status);
                     }
                 }
@@ -463,10 +514,16 @@ impl StarnixKernel {
         stdout: &mut Vec<u8>,
     ) -> Result<SyscallAction, zx_status_t> {
         match stop_state.regs.rax {
+            LINUX_SYSCALL_GETPID => self.sys_getpid(task_id, stop_state),
+            LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
+            LINUX_SYSCALL_RT_SIGACTION => self.sys_rt_sigaction(task_id, stop_state),
+            LINUX_SYSCALL_RT_SIGPROCMASK => self.sys_rt_sigprocmask(task_id, stop_state),
             LINUX_SYSCALL_CLONE => self.sys_clone(task_id, stop_state),
             LINUX_SYSCALL_FORK => self.sys_fork(task_id, stop_state),
             LINUX_SYSCALL_EXECVE => self.sys_execve(task_id, stop_state),
             LINUX_SYSCALL_WAIT4 => self.sys_wait4(task_id, stop_state),
+            LINUX_SYSCALL_KILL => self.sys_kill(stop_state),
+            LINUX_SYSCALL_TGKILL => self.sys_tgkill(stop_state),
             _ => {
                 let session = self
                     .tasks
@@ -478,6 +535,23 @@ impl StarnixKernel {
                 let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
                 emulate_common_syscall(session, stop_state, resources, stdout)
             }
+        }
+    }
+
+    fn apply_signal_delivery(
+        &mut self,
+        task_id: i32,
+        action: SyscallAction,
+    ) -> Result<SyscallAction, zx_status_t> {
+        if !matches!(action, SyscallAction::Resume) {
+            return Ok(action);
+        }
+        let Some(signal) = self.take_deliverable_signal(task_id)? else {
+            return Ok(action);
+        };
+        match self.signal_delivery_action(task_id, signal)? {
+            SignalDeliveryAction::Ignore => Ok(SyscallAction::Resume),
+            SignalDeliveryAction::Terminate => Ok(SyscallAction::GroupSignalExit(signal)),
         }
     }
 
@@ -568,8 +642,12 @@ impl StarnixKernel {
         Ok(())
     }
 
-    fn finalize_group_exit(&mut self, tgid: i32, code: i32) -> Result<(), zx_status_t> {
-        let wait_status = (code & 0xff) << 8;
+    fn finalize_group_zombie(
+        &mut self,
+        tgid: i32,
+        wait_status: i32,
+        exit_code: i32,
+    ) -> Result<(), zx_status_t> {
         let child_tgids = self
             .groups
             .get(&tgid)
@@ -598,15 +676,50 @@ impl StarnixKernel {
             drop(resources);
         }
         group.image = None;
+        group.shared_pending = 0;
         group.state = ThreadGroupState::Zombie {
             wait_status,
-            exit_code: code,
+            exit_code,
         };
         self.maybe_wake_parent_waiter(tgid, wait_status)
     }
 
+    fn finalize_group_exit(&mut self, tgid: i32, code: i32) -> Result<(), zx_status_t> {
+        let wait_status = (code & 0xff) << 8;
+        self.finalize_group_zombie(tgid, wait_status, code)
+    }
+
+    fn finalize_group_signal_exit(&mut self, tgid: i32, signal: i32) -> Result<(), zx_status_t> {
+        let wait_status = signal & 0x7f;
+        let exit_code = 128 + signal;
+        self.finalize_group_zombie(tgid, wait_status, exit_code)
+    }
+
+    fn remove_group_tasks(&mut self, tgid: i32) -> Result<(), zx_status_t> {
+        let task_ids = self
+            .groups
+            .get(&tgid)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .task_ids
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for member_id in &task_ids {
+            if let Some(task) = self.tasks.remove(member_id) {
+                task.carrier.kill_and_close();
+            }
+        }
+        self.groups
+            .get_mut(&tgid)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .task_ids
+            .clear();
+        Ok(())
+    }
+
     fn exit_task(&mut self, task_id: i32, code: i32) -> Result<(), zx_status_t> {
         let task = self.tasks.remove(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
+        task.carrier.kill_and_close();
         let tgid = task.tgid;
         let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
         group.task_ids.remove(&task_id);
@@ -618,20 +731,301 @@ impl StarnixKernel {
 
     fn exit_group(&mut self, task_id: i32, code: i32) -> Result<(), zx_status_t> {
         let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
-        let task_ids = self
+        self.remove_group_tasks(tgid)?;
+        self.finalize_group_exit(tgid, code)
+    }
+
+    fn exit_group_from_signal(&mut self, task_id: i32, signal: i32) -> Result<(), zx_status_t> {
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        self.remove_group_tasks(tgid)?;
+        self.finalize_group_signal_exit(tgid, signal)
+    }
+
+    fn task_signal_mask(&self, task_id: i32) -> Result<u64, zx_status_t> {
+        self.tasks
+            .get(&task_id)
+            .map(|task| task.signals.blocked)
+            .ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    fn take_deliverable_signal(&mut self, task_id: i32) -> Result<Option<i32>, zx_status_t> {
+        let blocked = self.task_signal_mask(task_id)?;
+        let task_pending = self
+            .tasks
+            .get(&task_id)
+            .map(|task| task.signals.pending & !blocked)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if let Some(signal) = lowest_signal(task_pending) {
+            if let Some(task) = self.tasks.get_mut(&task_id) {
+                task.signals.pending &= !linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
+            }
+            return Ok(Some(signal));
+        }
+
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let shared_pending = self
+            .groups
+            .get(&tgid)
+            .map(|group| group.shared_pending & !blocked)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if let Some(signal) = lowest_signal(shared_pending) {
+            if let Some(group) = self.groups.get_mut(&tgid) {
+                group.shared_pending &= !linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
+            }
+            return Ok(Some(signal));
+        }
+
+        Ok(None)
+    }
+
+    fn signal_delivery_action(
+        &self,
+        task_id: i32,
+        signal: i32,
+    ) -> Result<SignalDeliveryAction, zx_status_t> {
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let action = self
             .groups
             .get(&tgid)
             .ok_or(ZX_ERR_BAD_STATE)?
-            .task_ids
-            .iter()
+            .sigactions
+            .get(&signal)
             .copied()
-            .collect::<Vec<_>>();
-        for member_id in task_ids {
-            let _ = self.tasks.remove(&member_id);
+            .unwrap_or_default();
+        match action.handler {
+            LINUX_SIG_IGN => Ok(SignalDeliveryAction::Ignore),
+            LINUX_SIG_DFL => {
+                if signal_default_ignored(signal) {
+                    Ok(SignalDeliveryAction::Ignore)
+                } else {
+                    Ok(SignalDeliveryAction::Terminate)
+                }
+            }
+            _ => Err(ZX_ERR_NOT_SUPPORTED),
         }
-        let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
-        group.task_ids.clear();
-        self.finalize_group_exit(tgid, code)
+    }
+
+    fn queue_signal_to_group(&mut self, tgid: i32, signal: i32) -> Result<u64, zx_status_t> {
+        if signal == 0 {
+            return Ok(0);
+        }
+        let bit = linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
+        let Some(group) = self.groups.get_mut(&tgid) else {
+            return Ok(linux_errno(LINUX_ESRCH));
+        };
+        if !matches!(group.state, ThreadGroupState::Running) {
+            return Ok(linux_errno(LINUX_ESRCH));
+        }
+        group.shared_pending |= bit;
+        Ok(0)
+    }
+
+    fn queue_signal_to_task(
+        &mut self,
+        tgid: i32,
+        tid: i32,
+        signal: i32,
+    ) -> Result<u64, zx_status_t> {
+        if signal == 0 {
+            return Ok(0);
+        }
+        let bit = linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
+        let Some(task) = self.tasks.get_mut(&tid) else {
+            return Ok(linux_errno(LINUX_ESRCH));
+        };
+        if task.tgid != tgid {
+            return Ok(linux_errno(LINUX_ESRCH));
+        }
+        task.signals.pending |= bit;
+        Ok(0)
+    }
+
+    fn sys_getpid(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        complete_syscall(stop_state, tgid as u64)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_gettid(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        complete_syscall(stop_state, task_id as u64)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_rt_sigprocmask(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let how = stop_state.regs.rdi;
+        let set_addr = stop_state.regs.rsi;
+        let oldset_addr = stop_state.regs.rdx;
+        let sigset_size = stop_state.regs.r10;
+        if sigset_size != LINUX_SIGNAL_SET_BYTES as u64 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let old_mask = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .signals
+            .blocked;
+        if oldset_addr != 0 {
+            match write_guest_signal_mask(session, oldset_addr, old_mask) {
+                Ok(()) => {}
+                Err(status) => {
+                    complete_syscall(
+                        stop_state,
+                        linux_errno(map_guest_write_status_to_errno(status)),
+                    )?;
+                    return Ok(SyscallAction::Resume);
+                }
+            }
+        }
+        if set_addr != 0 {
+            let requested = match read_guest_signal_mask(session, set_addr) {
+                Ok(mask) => mask,
+                Err(status) => {
+                    complete_syscall(
+                        stop_state,
+                        linux_errno(map_guest_memory_status_to_errno(status)),
+                    )?;
+                    return Ok(SyscallAction::Resume);
+                }
+            };
+            let requested = normalize_signal_mask(requested);
+            let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
+            task.signals.blocked = match how {
+                LINUX_SIG_BLOCK => task.signals.blocked | requested,
+                LINUX_SIG_UNBLOCK => task.signals.blocked & !requested,
+                LINUX_SIG_SETMASK => requested,
+                _ => {
+                    complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+                    return Ok(SyscallAction::Resume);
+                }
+            };
+        }
+        complete_syscall(stop_state, 0)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_rt_sigaction(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let signal = stop_state.regs.rdi as u32 as i32;
+        let act_addr = stop_state.regs.rsi;
+        let oldact_addr = stop_state.regs.rdx;
+        let sigset_size = stop_state.regs.r10;
+        if sigset_size != LINUX_SIGNAL_SET_BYTES as u64
+            || !linux_signal_is_valid(signal)
+            || signal == LINUX_SIGKILL
+            || signal == LINUX_SIGSTOP
+        {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let old_action = self
+            .groups
+            .get(&tgid)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .sigactions
+            .get(&signal)
+            .copied()
+            .unwrap_or_default();
+        if oldact_addr != 0 {
+            match write_guest_sigaction(session, oldact_addr, old_action) {
+                Ok(()) => {}
+                Err(status) => {
+                    complete_syscall(
+                        stop_state,
+                        linux_errno(map_guest_write_status_to_errno(status)),
+                    )?;
+                    return Ok(SyscallAction::Resume);
+                }
+            }
+        }
+        if act_addr != 0 {
+            let action = match read_guest_sigaction(session, act_addr) {
+                Ok(action) => action,
+                Err(status) => {
+                    complete_syscall(
+                        stop_state,
+                        linux_errno(map_guest_memory_status_to_errno(status)),
+                    )?;
+                    return Ok(SyscallAction::Resume);
+                }
+            };
+            if action.handler != LINUX_SIG_DFL && action.handler != LINUX_SIG_IGN {
+                complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?;
+                return Ok(SyscallAction::Resume);
+            }
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            if action.handler == LINUX_SIG_DFL
+                && action.flags == 0
+                && action.restorer == 0
+                && action.mask == 0
+            {
+                group.sigactions.remove(&signal);
+            } else {
+                group.sigactions.insert(signal, action);
+            }
+        }
+        complete_syscall(stop_state, 0)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_kill(
+        &mut self,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let pid = stop_state.regs.rdi as u32 as i32;
+        let signal = stop_state.regs.rsi as u32 as i32;
+        let result = if pid <= 0 || !linux_signal_is_valid_or_zero(signal) {
+            linux_errno(LINUX_EINVAL)
+        } else {
+            self.queue_signal_to_group(pid, signal)?
+        };
+        complete_syscall(stop_state, result)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_tgkill(
+        &mut self,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let tgid = stop_state.regs.rdi as u32 as i32;
+        let tid = stop_state.regs.rsi as u32 as i32;
+        let signal = stop_state.regs.rdx as u32 as i32;
+        let result = if tgid <= 0 || tid <= 0 || !linux_signal_is_valid_or_zero(signal) {
+            linux_errno(LINUX_EINVAL)
+        } else {
+            self.queue_signal_to_task(tgid, tid, signal)?
+        };
+        complete_syscall(stop_state, result)?;
+        Ok(SyscallAction::Resume)
     }
 
     fn sys_clone(
@@ -673,6 +1067,12 @@ impl StarnixKernel {
             .process_handle;
         let packet_key = self.alloc_packet_key()?;
         let child_tid = self.alloc_tid()?;
+        let parent_blocked = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .signals
+            .blocked;
         let child_carrier = match create_thread_carrier(process_handle, self.port, packet_key) {
             Ok(carrier) => carrier,
             Err(status) => {
@@ -710,6 +1110,10 @@ impl StarnixKernel {
                 tgid,
                 carrier: child_carrier,
                 state: TaskState::Running,
+                signals: TaskSignals {
+                    blocked: parent_blocked,
+                    pending: 0,
+                },
             },
         );
         self.groups
@@ -733,6 +1137,12 @@ impl StarnixKernel {
             .ok_or(ZX_ERR_BAD_STATE)?
             .carrier
             .session_handle;
+        let parent_blocked = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .signals
+            .blocked;
         let (task_image, namespace) = {
             let group = self.groups.get(&parent_tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let image = group.image.clone().ok_or(ZX_ERR_BAD_STATE)?;
@@ -744,6 +1154,12 @@ impl StarnixKernel {
                 .clone();
             (image, namespace)
         };
+        let parent_sigactions = self
+            .groups
+            .get(&parent_tgid)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .sigactions
+            .clone();
         let (_, _, image_vmo) = match open_exec_image_from_namespace(&namespace, &task_image.path) {
             Ok(opened) => opened,
             Err(status) => {
@@ -852,6 +1268,10 @@ impl StarnixKernel {
                 tgid: child_tgid,
                 carrier: child_carrier,
                 state: TaskState::Running,
+                signals: TaskSignals {
+                    blocked: parent_blocked,
+                    pending: 0,
+                },
             },
         );
         self.groups.insert(
@@ -863,6 +1283,8 @@ impl StarnixKernel {
                 child_tgids: BTreeSet::new(),
                 task_ids,
                 state: ThreadGroupState::Running,
+                shared_pending: 0,
+                sigactions: parent_sigactions,
                 image: Some(task_image),
                 resources: Some(child_resources),
             },
@@ -1207,6 +1629,7 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         tgid: 1,
         carrier,
         state: TaskState::Running,
+        signals: TaskSignals::default(),
     };
     let mut task_ids = BTreeSet::new();
     task_ids.insert(1);
@@ -1217,6 +1640,8 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         child_tgids: BTreeSet::new(),
         task_ids,
         state: ThreadGroupState::Running,
+        shared_pending: 0,
+        sigactions: BTreeMap::new(),
         image: Some(task_image),
         resources: Some(resources),
     };
@@ -1402,6 +1827,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-fd-smoke") => Some(LINUX_FD_SMOKE_BYTES),
         Some("linux-round2-smoke") => Some(LINUX_ROUND2_BYTES),
         Some("linux-round3-smoke") => Some(LINUX_ROUND3_BYTES),
+        Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BYTES),
         Some(_) => None,
     }
 }
@@ -1412,6 +1838,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-fd-smoke") => Some(LINUX_FD_SMOKE_BINARY_PATH),
         Some("linux-round2-smoke") => Some(LINUX_ROUND2_BINARY_PATH),
         Some("linux-round3-smoke") => Some(LINUX_ROUND3_BINARY_PATH),
+        Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -1896,6 +2323,96 @@ fn complete_syscall(
         .checked_add(AX_GUEST_X64_SYSCALL_INSN_LEN)
         .ok_or(ZX_ERR_INVALID_ARGS)?;
     Ok(())
+}
+
+fn linux_signal_is_valid(signal: i32) -> bool {
+    (1..=64).contains(&signal)
+}
+
+fn linux_signal_is_valid_or_zero(signal: i32) -> bool {
+    signal == 0 || linux_signal_is_valid(signal)
+}
+
+fn linux_signal_bit(signal: i32) -> Option<u64> {
+    if !linux_signal_is_valid(signal) {
+        return None;
+    }
+    Some(1u64 << ((signal - 1) as u32))
+}
+
+fn lowest_signal(mask: u64) -> Option<i32> {
+    if mask == 0 {
+        None
+    } else {
+        Some(mask.trailing_zeros() as i32 + 1)
+    }
+}
+
+fn signal_default_ignored(signal: i32) -> bool {
+    signal == LINUX_SIGCHLD
+}
+
+fn normalize_signal_mask(mask: u64) -> u64 {
+    let mut normalized = mask;
+    if let Some(bit) = linux_signal_bit(LINUX_SIGKILL) {
+        normalized &= !bit;
+    }
+    if let Some(bit) = linux_signal_bit(LINUX_SIGSTOP) {
+        normalized &= !bit;
+    }
+    normalized
+}
+
+fn read_guest_signal_mask(session: zx_handle_t, addr: u64) -> Result<u64, zx_status_t> {
+    let bytes = read_guest_bytes(session, addr, LINUX_SIGNAL_SET_BYTES)?;
+    let raw = bytes
+        .get(..LINUX_SIGNAL_SET_BYTES)
+        .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
+    Ok(u64::from_ne_bytes(
+        raw.try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    ))
+}
+
+fn write_guest_signal_mask(session: zx_handle_t, addr: u64, mask: u64) -> Result<(), zx_status_t> {
+    write_guest_bytes(session, addr, &mask.to_ne_bytes())
+}
+
+fn read_guest_sigaction(session: zx_handle_t, addr: u64) -> Result<LinuxSigAction, zx_status_t> {
+    let bytes = read_guest_bytes(session, addr, LINUX_SIGACTION_BYTES)?;
+    let raw = bytes
+        .get(..LINUX_SIGACTION_BYTES)
+        .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
+    Ok(LinuxSigAction {
+        handler: u64::from_ne_bytes(raw[0..8].try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?),
+        flags: u64::from_ne_bytes(
+            raw[8..16]
+                .try_into()
+                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+        ),
+        restorer: u64::from_ne_bytes(
+            raw[16..24]
+                .try_into()
+                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+        ),
+        mask: u64::from_ne_bytes(
+            raw[24..32]
+                .try_into()
+                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+        ),
+    })
+}
+
+fn write_guest_sigaction(
+    session: zx_handle_t,
+    addr: u64,
+    action: LinuxSigAction,
+) -> Result<(), zx_status_t> {
+    let mut bytes = [0u8; LINUX_SIGACTION_BYTES];
+    bytes[0..8].copy_from_slice(&action.handler.to_ne_bytes());
+    bytes[8..16].copy_from_slice(&action.flags.to_ne_bytes());
+    bytes[16..24].copy_from_slice(&action.restorer.to_ne_bytes());
+    bytes[24..32].copy_from_slice(&action.mask.to_ne_bytes());
+    write_guest_bytes(session, addr, &bytes)
 }
 
 fn linux_errno(errno: i32) -> u64 {
@@ -2780,6 +3297,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND3_BYTES,
         ));
     }
+    if !LINUX_ROUND4_SIGNAL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND4_SIGNAL_BINARY_PATH,
+            LINUX_ROUND4_SIGNAL_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -2802,6 +3325,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round3-smoke.nxcd",
             LINUX_ROUND3_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND4_SIGNAL_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round4-signal-smoke.nxcd",
+            LINUX_ROUND4_SIGNAL_DECL_BYTES,
         ));
     }
     let bootstrap = BootstrapNamespace::build(&assets)?;
