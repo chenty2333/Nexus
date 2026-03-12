@@ -25,7 +25,7 @@ use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::signals::{ZX_SOCKET_PEER_CLOSED, ZX_SOCKET_READABLE};
 use axle_types::status::{ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NOT_FOUND, ZX_OK};
 use axle_types::{zx_handle_t, zx_status_t};
-use libzircon::{
+use libax::compat::{
     ZX_TIME_INFINITE, zx_channel_create, zx_handle_close, zx_object_wait_one, zx_socket_read,
 };
 use nexus_component::{ControllerRequest, NamespaceEntry, ResolvedComponent, StartupMode};

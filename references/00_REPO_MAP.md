@@ -93,8 +93,8 @@ rest of the leaf references should be treated as `working` current-state docs.
 - `crates/axle-page-table` - page-table transaction and mapping support
 - `crates/axle-sync` - synchronization primitives such as the SPSC queue
 - `crates/axle-arch-x86_64` - userspace-side x86_64 ABI glue and syscall entry helpers
-- `crates/libax` - thin native `ax_*` userspace facade; today it bridges into the frozen `libzircon` compat wrappers while the kernel/user ABI migrates
-- `crates/libzircon` - frozen `zx_*` compat wrappers over the current Axle `int 0x80` ABI
+- `crates/libax` - thin native `ax_*` userspace facade; native Nexus crates should depend on this crate, and any temporary `zx_*` compat reach-through now sits under `libax::compat`
+- `crates/libzircon` - frozen `zx_*` compat wrappers over the current Axle `int 0x80` ABI; no longer a direct dependency for native `nexus-*` crates
 - `crates/nexus-component` - minimal component declaration IR, resolver result shape, bootstrap-channel start payloads, and tiny lifecycle/directory messages
 - `crates/nexus-fs-proto` - shared filesystem wire contract: identities, open
   flags, `GetVmo`, and routed directory/file operations used by `nexus-io` and
@@ -103,8 +103,8 @@ rest of the leaf references should be treated as `working` current-state docs.
   state transitions, logical journaling, crash invariants, and replay
 - `crates/nexus-io` - early userspace fd/namespace substrate: `FdOps`, `FdTable`,
   `WaitSpec`, handle-backed fd wrappers, longest-prefix `NamespaceTrie`, and
-  one `ProcessNamespace` helper for logical-root / `cwd` path walk
-- `crates/nexus-rt` - single-thread userspace dispatcher/executor built on one port, one dispatcher timer, generation-safe signal registrations, and async channel/socket helpers
+  one `ProcessNamespace` helper for logical-root / `cwd` path walk; now consumes the native `libax` facade rather than depending directly on `libzircon`
+- `crates/nexus-rt` - single-thread userspace dispatcher/executor built on one port, one dispatcher timer, generation-safe signal registrations, and async channel/socket helpers; now depends on `libax`
 - `kernel/axle-kernel` - live kernel integration layer
 - `user/nexus-init` - extracted bootstrap `nexus-init` root manager plus shared
   manager/runtime logic reused by the minimal component smoke binaries;
@@ -112,7 +112,8 @@ rest of the leaf references should be treated as `working` current-state docs.
   and the built-in boot resolver / ELF runner glue that consumes it through
   `nexus-io`; the local service tree now supports directory enumeration,
   basic tmpfs-style link/rename/unlink, and read-only `GetVmo` for both seeded
-  boot image VMOs and byte-backed package/resource assets
+  boot image VMOs and byte-backed package/resource assets; native syscall-facing
+  code in this crate now goes through `libax`
 - `user/echo-provider` - dedicated bootstrap component binary for the routed
   echo protocol provider
 - `user/echo-client` - dedicated bootstrap component binary for the routed echo

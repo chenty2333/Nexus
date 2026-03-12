@@ -15,7 +15,7 @@ use bitflags::bitflags;
 use core::any::Any;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
-use libzircon::{
+use libax::compat::{
     zx_channel_create, zx_channel_read_alloc, zx_channel_write, zx_handle_close, zx_socket_read,
     zx_socket_write,
 };

@@ -6,4 +6,4 @@ license = "Unlicense"
 publish = false
 
 [dependencies]
-libzircon = { path = "../libzircon", default-features = false }
+libax = { path = "../libax", default-features = false }

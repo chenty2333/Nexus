@@ -1,6 +1,6 @@
-use libzircon::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
-use libzircon::status::ZX_OK;
-use libzircon::{
+use libax::compat::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
+use libax::compat::status::ZX_OK;
+use libax::compat::{
     zx_handle_t, zx_object_wait_async, zx_packet_signal_t, zx_port_create, zx_port_packet_t,
     zx_port_wait, zx_signals_t, zx_status_t, zx_time_t,
 };
@@ -128,8 +128,8 @@ impl Reactor {
 #[cfg(test)]
 mod tests {
     use super::{Event, SignalEvent};
-    use libzircon::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
-    use libzircon::{zx_packet_signal_t, zx_packet_user_t, zx_port_packet_t};
+    use libax::compat::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
+    use libax::compat::{zx_packet_signal_t, zx_packet_user_t, zx_port_packet_t};
 
     #[test]
     fn decodes_signal_packets() {

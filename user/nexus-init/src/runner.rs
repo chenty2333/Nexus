@@ -7,7 +7,7 @@ use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::rights::ZX_RIGHT_SAME_RIGHTS;
 use axle_types::status::{ZX_ERR_INTERNAL, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED, ZX_OK};
 use axle_types::{zx_handle_t, zx_status_t};
-use libzircon::{
+use libax::compat::{
     ax_process_prepare_start, zx_channel_create, zx_channel_write, zx_handle_close,
     zx_handle_duplicate, zx_process_create, zx_process_start, zx_socket_create, zx_task_kill,
     zx_thread_create,

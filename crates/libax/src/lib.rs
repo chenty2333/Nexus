@@ -36,6 +36,16 @@ pub use axle_types::{
 
 use axle_types::status::{AX_ERR_NO_MEMORY, AX_ERR_OUT_OF_RANGE, AX_OK};
 
+/// Frozen Zircon-compatible facade re-exported behind the native `libax`
+/// boundary.
+///
+/// Native crates should prefer `ax_*` entry points from this crate. This module
+/// exists only so legacy `zx_*` call sites can continue compiling while the
+/// repository contracts the old compat surface.
+pub mod compat {
+    pub use libzircon::*;
+}
+
 /// Infinite deadline used by blocking wait syscalls.
 pub const AX_TIME_INFINITE: ax_time_t = i64::MAX;
 

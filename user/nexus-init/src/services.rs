@@ -16,7 +16,7 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_WRITE,
 };
 use axle_types::{zx_handle_t, zx_rights_t, zx_status_t};
-use libzircon::{zx_handle_close, zx_socket_create};
+use libax::compat::{zx_handle_close, zx_socket_create};
 use nexus_io::{
     DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFlags, PipeFd,
     ProcessNamespace, SeekOrigin, SocketFd, VmoFlags,

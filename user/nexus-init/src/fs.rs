@@ -5,7 +5,7 @@ use axle_types::status::{
     ZX_ERR_SHOULD_WAIT, ZX_OK,
 };
 use axle_types::{zx_handle_t, zx_status_t};
-use libzircon::{ZX_TIME_INFINITE, zx_channel_read_alloc, zx_channel_write};
+use libax::compat::{ZX_TIME_INFINITE, zx_channel_read_alloc, zx_channel_write};
 use nexus_fs_proto::{
     CloneRequest, CloseRequest, DescribeResponse, DirEntryRecord, FsMessageKind, GetVmoRequest,
     GetVmoResponse, NodeDescriptor, NodeKind, ObjectIdentity, OpenRequest, ReadDirRequest,

@@ -30,14 +30,17 @@ use axle_types::{
     ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_spec_header_t, zx_handle_t,
     zx_status_t,
 };
-use libax::{AX_TIME_INFINITE, ax_object_wait_async, ax_object_wait_one};
-use libzircon::{
-    ax_guest_session_create, ax_guest_session_read_memory, ax_guest_session_resume,
-    ax_guest_session_write_memory, ax_guest_stop_state_read, ax_guest_stop_state_write,
-    ax_linux_exec_spec_blob, ax_process_prepare_linux_exec, ax_process_start_guest,
-    ax_thread_start_guest, zx_handle_close, zx_handle_duplicate, zx_packet_user_t, zx_port_create,
-    zx_port_packet_t, zx_port_queue, zx_port_wait, zx_process_create, zx_socket_create,
-    zx_status_result, zx_task_kill, zx_thread_create, zx_vmo_create,
+use libax::{
+    AX_TIME_INFINITE, ax_guest_session_create, ax_guest_session_read_memory,
+    ax_guest_session_resume, ax_guest_session_write_memory, ax_guest_stop_state_read,
+    ax_guest_stop_state_write, ax_handle_close as zx_handle_close,
+    ax_handle_duplicate as zx_handle_duplicate, ax_linux_exec_spec_blob, ax_object_wait_async,
+    ax_object_wait_one, ax_packet_user_t as zx_packet_user_t, ax_port_create as zx_port_create,
+    ax_port_packet_t as zx_port_packet_t, ax_port_queue as zx_port_queue,
+    ax_port_wait as zx_port_wait, ax_process_create as zx_process_create,
+    ax_process_prepare_linux_exec, ax_process_start_guest, ax_socket_create as zx_socket_create,
+    ax_status_result as zx_status_result, ax_task_kill as zx_task_kill,
+    ax_thread_create as zx_thread_create, ax_thread_start_guest, ax_vmo_create as zx_vmo_create,
 };
 use nexus_component::{ComponentStartInfo, NumberedHandle};
 use nexus_io::{

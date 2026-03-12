@@ -120,6 +120,7 @@ depends on: C3, A1
 = current tree now has a shared `libzircon` crate wrapping the bootstrap `int 0x80` ABI, including the current stack-extended `channel_read` calling convention
 = `libzircon` is now a frozen compat personality rather than the long-term native UAPI
 = a new `libax` crate is the native facade for future userspace work; today it bridges into `libzircon` while handle/codec internals are migrated
+= native `nexus-rt`, `nexus-io`, and `nexus-init` now depend on `libax`; compat-only `zx_*` wrappers are intended to be reached through `libax::compat` rather than by taking new direct `libzircon` dependencies
 depends on: Axle syscall/object semantics being stable enough to wrap cleanly
 
 #### F2. async/reactor base `[x]`

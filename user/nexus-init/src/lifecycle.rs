@@ -4,7 +4,7 @@ use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::signals::{ZX_CHANNEL_PEER_CLOSED, ZX_CHANNEL_READABLE};
 use axle_types::status::{ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_SHOULD_WAIT, ZX_OK};
 use axle_types::{zx_handle_t, zx_status_t, zx_time_t};
-use libzircon::{
+use libax::compat::{
     ZX_TIME_INFINITE, zx_channel_read, zx_channel_read_alloc, zx_channel_write, zx_object_wait_one,
 };
 use nexus_component::{ComponentStartInfo, ControllerEvent, ControllerRequest};

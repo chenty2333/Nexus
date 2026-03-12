@@ -11,13 +11,13 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use core::task::{Context, Poll, Waker};
 
-use libzircon::handle::ZX_HANDLE_INVALID;
-use libzircon::packet::ZX_PKT_TYPE_USER;
-use libzircon::signals::{
+use libax::compat::handle::ZX_HANDLE_INVALID;
+use libax::compat::packet::ZX_PKT_TYPE_USER;
+use libax::compat::signals::{
     ZX_CHANNEL_PEER_CLOSED, ZX_CHANNEL_READABLE, ZX_CHANNEL_WRITABLE, ZX_SOCKET_PEER_CLOSED,
 };
-use libzircon::status::{ZX_ERR_CANCELED, ZX_ERR_NOT_FOUND, ZX_ERR_SHOULD_WAIT, ZX_OK};
-use libzircon::{
+use libax::compat::status::{ZX_ERR_CANCELED, ZX_ERR_NOT_FOUND, ZX_ERR_SHOULD_WAIT, ZX_OK};
+use libax::compat::{
     ZX_TIME_INFINITE, zx_channel_read, zx_channel_write, zx_handle_close, zx_handle_t,
     zx_packet_user_t, zx_port_packet_t, zx_port_queue, zx_signals_t, zx_status_t, zx_time_t,
     zx_timer_cancel, zx_timer_create_monotonic, zx_timer_set,
@@ -817,7 +817,7 @@ impl DispatcherHandle {
                     reactor.wait_async(
                         timer,
                         TIMER_PACKET_KEY,
-                        libzircon::signals::ZX_TIMER_SIGNALED,
+                        libax::compat::signals::ZX_TIMER_SIGNALED,
                         0,
                     )?;
                     let mut state = self.core.state.borrow_mut();
@@ -1242,7 +1242,7 @@ mod tests {
     use alloc::collections::{BinaryHeap, VecDeque};
     use alloc::vec;
     use alloc::vec::Vec;
-    use libzircon::handle::ZX_HANDLE_INVALID;
+    use libax::compat::handle::ZX_HANDLE_INVALID;
 
     #[test]
     fn timer_heap_discards_stale_entries() {
