@@ -43,8 +43,9 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
     AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
     AXLE_SYS_AX_PROCESS_START_GUEST, AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_CHANNEL_CREATE,
-    AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_HANDLE_CLOSE,
-    AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
+    AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE,
+    AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_OBJECT_SIGNAL,
+    AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE,
     AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE,
     AXLE_SYS_TASK_KILL, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL,
@@ -129,6 +130,49 @@ pub fn zx_object_wait_async(
     int80_call(
         AXLE_SYS_OBJECT_WAIT_ASYNC as u64,
         [handle, port, key, signals as u64, options as u64, 0],
+    )
+}
+
+/// Create an eventpair handle pair.
+pub fn zx_eventpair_create(
+    options: u32,
+    out0: &mut zx_handle_t,
+    out1: &mut zx_handle_t,
+) -> zx_status_t {
+    int80_call(
+        AXLE_SYS_EVENTPAIR_CREATE as u64,
+        [
+            options as u64,
+            out0 as *mut zx_handle_t as u64,
+            out1 as *mut zx_handle_t as u64,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Clear and set user-visible signals on one handle.
+pub fn zx_object_signal(
+    handle: zx_handle_t,
+    clear_mask: zx_signals_t,
+    set_mask: zx_signals_t,
+) -> zx_status_t {
+    int80_call(
+        AXLE_SYS_OBJECT_SIGNAL as u64,
+        [handle, clear_mask as u64, set_mask as u64, 0, 0, 0],
+    )
+}
+
+/// Clear and set user-visible signals on the peer of one handle.
+pub fn zx_object_signal_peer(
+    handle: zx_handle_t,
+    clear_mask: zx_signals_t,
+    set_mask: zx_signals_t,
+) -> zx_status_t {
+    int80_call(
+        AXLE_SYS_OBJECT_SIGNAL_PEER as u64,
+        [handle, clear_mask as u64, set_mask as u64, 0, 0, 0],
     )
 }
 

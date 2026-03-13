@@ -2,6 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 
 use axle_types::guest::{
     AX_GUEST_STOP_REASON_X64_SYSCALL, AX_GUEST_X64_SYSCALL_INSN_LEN, AX_LINUX_EXEC_SPEC_V1,
@@ -10,8 +11,8 @@ use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
 use axle_types::rights::ZX_RIGHT_SAME_RIGHTS;
 use axle_types::signals::{
-    ZX_CHANNEL_PEER_CLOSED, ZX_CHANNEL_READABLE, ZX_CHANNEL_WRITABLE, ZX_SOCKET_PEER_CLOSED,
-    ZX_SOCKET_READABLE, ZX_SOCKET_WRITABLE,
+    AX_USER_SIGNAL_0, AX_USER_SIGNAL_1, ZX_CHANNEL_PEER_CLOSED, ZX_CHANNEL_READABLE,
+    ZX_CHANNEL_WRITABLE, ZX_SOCKET_PEER_CLOSED, ZX_SOCKET_READABLE, ZX_SOCKET_WRITABLE,
 };
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_PATH,
@@ -31,22 +32,24 @@ use axle_types::{
     zx_status_t,
 };
 use libax::{
-    AX_TIME_INFINITE, ax_guest_session_create, ax_guest_session_read_memory,
+    AX_TIME_INFINITE, ax_eventpair_create, ax_guest_session_create, ax_guest_session_read_memory,
     ax_guest_session_resume, ax_guest_session_write_memory, ax_guest_stop_state_read,
     ax_guest_stop_state_write, ax_handle_close as zx_handle_close,
-    ax_handle_duplicate as zx_handle_duplicate, ax_linux_exec_spec_blob, ax_object_wait_async,
-    ax_object_wait_one, ax_packet_user_t as zx_packet_user_t, ax_port_create as zx_port_create,
-    ax_port_packet_t as zx_port_packet_t, ax_port_queue as zx_port_queue,
-    ax_port_wait as zx_port_wait, ax_process_create as zx_process_create,
-    ax_process_prepare_linux_exec, ax_process_start_guest, ax_socket_create as zx_socket_create,
-    ax_status_result as zx_status_result, ax_task_kill as zx_task_kill,
-    ax_thread_create as zx_thread_create, ax_thread_start_guest, ax_vmo_create as zx_vmo_create,
+    ax_handle_duplicate as zx_handle_duplicate, ax_linux_exec_spec_blob, ax_object_signal,
+    ax_object_wait_async, ax_object_wait_one, ax_packet_user_t as zx_packet_user_t,
+    ax_port_create as zx_port_create, ax_port_packet_t as zx_port_packet_t,
+    ax_port_queue as zx_port_queue, ax_port_wait as zx_port_wait,
+    ax_process_create as zx_process_create, ax_process_prepare_linux_exec, ax_process_start_guest,
+    ax_socket_create as zx_socket_create, ax_status_result as zx_status_result,
+    ax_task_kill as zx_task_kill, ax_thread_create as zx_thread_create, ax_thread_start_guest,
+    ax_vmo_create as zx_vmo_create,
 };
 use nexus_component::{ComponentStartInfo, NumberedHandle};
 use nexus_io::{
     DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFileDescription, OpenFlags,
     PipeFd, PseudoNodeFd, SocketFd, WaitSpec,
 };
+use spin::Mutex;
 
 use crate::lifecycle::{read_channel_alloc_blocking, send_controller_event, send_status_event};
 use crate::services::{BootAssetEntry, BootstrapNamespace, LocalFdMetadataKind, local_fd_metadata};
@@ -57,7 +60,8 @@ use crate::{
     LINUX_ROUND3_DECL_BYTES, LINUX_ROUND4_FUTEX_BINARY_PATH, LINUX_ROUND4_FUTEX_BYTES,
     LINUX_ROUND4_FUTEX_DECL_BYTES, LINUX_ROUND4_SIGNAL_BINARY_PATH, LINUX_ROUND4_SIGNAL_BYTES,
     LINUX_ROUND4_SIGNAL_DECL_BYTES, LINUX_ROUND5_EPOLL_BINARY_PATH, LINUX_ROUND5_EPOLL_BYTES,
-    LINUX_ROUND5_EPOLL_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
+    LINUX_ROUND5_EPOLL_DECL_BYTES, LINUX_ROUND6_EVENTFD_BINARY_PATH, LINUX_ROUND6_EVENTFD_BYTES,
+    LINUX_ROUND6_EVENTFD_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
     STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
     STARTUP_HANDLE_STARNIX_STDOUT,
 };
@@ -95,6 +99,7 @@ const LINUX_SYSCALL_FORK: u64 = 57;
 const LINUX_SYSCALL_EXECVE: u64 = 59;
 const LINUX_SYSCALL_WAIT4: u64 = 61;
 const LINUX_SYSCALL_KILL: u64 = 62;
+const LINUX_SYSCALL_EVENTFD2: u64 = 290;
 const LINUX_SYSCALL_EPOLL_WAIT: u64 = 232;
 const LINUX_SYSCALL_EPOLL_CTL: u64 = 233;
 const LINUX_SYSCALL_GETTID: u64 = 186;
@@ -151,6 +156,9 @@ const LINUX_EPOLLHUP: u32 = 0x010;
 const LINUX_EPOLLONESHOT: u32 = 1 << 30;
 const LINUX_EPOLLET: u32 = 1 << 31;
 const LINUX_EPOLL_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_EFD_SEMAPHORE: u64 = 0x1;
+const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
+const LINUX_EFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 const LINUX_EPOLL_EVENT_BYTES: usize = 12;
 const LINUX_DT_UNKNOWN: u8 = 0;
 const LINUX_DT_DIR: u8 = 4;
@@ -192,6 +200,10 @@ const LINUX_SIGCHLD: i32 = 17;
 const LINUX_SIGSTOP: i32 = 19;
 const LINUX_SIGNAL_SET_BYTES: usize = 8;
 const LINUX_SIGACTION_BYTES: usize = 32;
+const EVENTFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
+const EVENTFD_WRITABLE_SIGNAL: u32 = AX_USER_SIGNAL_1;
+const EVENTFD_SIGNAL_MASK: u32 = EVENTFD_READABLE_SIGNAL | EVENTFD_WRITABLE_SIGNAL;
+const EVENTFD_COUNTER_MAX: u64 = u64::MAX - 1;
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
@@ -389,6 +401,19 @@ struct EpollInstance {
     waiting_tasks: VecDeque<i32>,
 }
 
+#[derive(Clone)]
+struct EventFd {
+    state: Arc<Mutex<EventFdState>>,
+}
+
+struct EventFdState {
+    wait_handle: zx_handle_t,
+    peer_handle: zx_handle_t,
+    counter: u64,
+    semaphore: bool,
+    closed: bool,
+}
+
 enum TaskState {
     Running,
     Waiting(WaitState),
@@ -580,6 +605,132 @@ impl EpollInstance {
             ready_set: BTreeSet::new(),
             waiting_tasks: VecDeque::new(),
         }
+    }
+}
+
+impl EventFd {
+    fn new(initial: u32, semaphore: bool) -> Result<Self, zx_status_t> {
+        let mut wait_handle = ZX_HANDLE_INVALID;
+        let mut peer_handle = ZX_HANDLE_INVALID;
+        zx_status_result(ax_eventpair_create(0, &mut wait_handle, &mut peer_handle))?;
+        let this = Self {
+            state: Arc::new(Mutex::new(EventFdState {
+                wait_handle,
+                peer_handle,
+                counter: u64::from(initial),
+                semaphore,
+                closed: false,
+            })),
+        };
+        if let Err(status) = this.refresh_signals() {
+            let _ = zx_handle_close(wait_handle);
+            let _ = zx_handle_close(peer_handle);
+            return Err(status);
+        }
+        Ok(this)
+    }
+
+    fn refresh_signals(&self) -> Result<(), zx_status_t> {
+        let state = self.state.lock();
+        Self::refresh_signals_locked(&state)
+    }
+
+    fn refresh_signals_locked(state: &EventFdState) -> Result<(), zx_status_t> {
+        if state.closed {
+            return Ok(());
+        }
+        let mut set_mask = 0u32;
+        if state.counter != 0 {
+            set_mask |= EVENTFD_READABLE_SIGNAL;
+        }
+        if state.counter < EVENTFD_COUNTER_MAX {
+            set_mask |= EVENTFD_WRITABLE_SIGNAL;
+        }
+        zx_status_result(ax_object_signal(
+            state.wait_handle,
+            EVENTFD_SIGNAL_MASK,
+            set_mask,
+        ))
+    }
+}
+
+impl FdOps for EventFd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
+        if buffer.len() != 8 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let mut state = self.state.lock();
+        if state.counter == 0 {
+            return Err(ZX_ERR_SHOULD_WAIT);
+        }
+        let value = if state.semaphore {
+            state.counter -= 1;
+            1u64
+        } else {
+            let value = state.counter;
+            state.counter = 0;
+            value
+        };
+        Self::refresh_signals_locked(&state)?;
+        buffer.copy_from_slice(&value.to_ne_bytes());
+        Ok(8)
+    }
+
+    fn write(&self, buffer: &[u8]) -> Result<usize, zx_status_t> {
+        if buffer.len() != 8 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let value = u64::from_ne_bytes(buffer.try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?);
+        if value == u64::MAX {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let mut state = self.state.lock();
+        let remaining = EVENTFD_COUNTER_MAX
+            .checked_sub(state.counter)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        if value > remaining {
+            return Err(ZX_ERR_SHOULD_WAIT);
+        }
+        state.counter = state
+            .counter
+            .checked_add(value)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        Self::refresh_signals_locked(&state)?;
+        Ok(8)
+    }
+
+    fn seek(&self, _origin: nexus_io::SeekOrigin, _offset: i64) -> Result<u64, zx_status_t> {
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }
+
+    fn close(&self) -> Result<(), zx_status_t> {
+        if Arc::strong_count(&self.state) != 1 {
+            return Ok(());
+        }
+        let (wait_handle, peer_handle) = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return Ok(());
+            }
+            state.closed = true;
+            (state.wait_handle, state.peer_handle)
+        };
+        let _ = zx_handle_close(peer_handle);
+        let _ = zx_handle_close(wait_handle);
+        Ok(())
+    }
+
+    fn clone_fd(&self, _flags: FdFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
+        Ok(Arc::new(self.clone()))
+    }
+
+    fn wait_interest(&self) -> Option<WaitSpec> {
+        let state = self.state.lock();
+        (!state.closed).then_some(WaitSpec::new(state.wait_handle, EVENTFD_SIGNAL_MASK))
     }
 }
 
@@ -1201,6 +1352,7 @@ impl StarnixKernel {
             LINUX_SYSCALL_GETPID => self.sys_getpid(task_id, stop_state),
             LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
             LINUX_SYSCALL_FUTEX => self.sys_futex(task_id, stop_state),
+            LINUX_SYSCALL_EVENTFD2 => self.sys_eventfd2(task_id, stop_state),
             LINUX_SYSCALL_EPOLL_WAIT => self.sys_epoll_wait(task_id, stop_state),
             LINUX_SYSCALL_EPOLL_CTL => self.sys_epoll_ctl(task_id, stop_state),
             LINUX_SYSCALL_EPOLL_CREATE1 => self.sys_epoll_create1(task_id, stop_state),
@@ -2098,6 +2250,50 @@ impl StarnixKernel {
                 self.epolls.insert(epoll_key, EpollInstance::new());
                 complete_syscall(stop_state, fd as u64)?;
             }
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+            }
+        }
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_eventfd2(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let initval = u32::try_from(stop_state.regs.rdi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let flags = stop_state.regs.rsi;
+        let allowed = LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC;
+        if (flags & !allowed) != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let eventfd = EventFd::new(initval, (flags & LINUX_EFD_SEMAPHORE) != 0);
+        let fd = match eventfd {
+            Ok(eventfd) => {
+                let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+                let mut open_flags = OpenFlags::READABLE | OpenFlags::WRITABLE;
+                if (flags & LINUX_EFD_NONBLOCK) != 0 {
+                    open_flags |= OpenFlags::NONBLOCK;
+                }
+                let fd_flags = if (flags & LINUX_EFD_CLOEXEC) != 0 {
+                    FdFlags::CLOEXEC
+                } else {
+                    FdFlags::empty()
+                };
+                resources
+                    .fd_table
+                    .open(Arc::new(eventfd), open_flags, fd_flags)
+            }
+            Err(status) => Err(status),
+        };
+
+        match fd {
+            Ok(fd) => complete_syscall(stop_state, fd as u64)?,
             Err(status) => {
                 complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
             }
@@ -3307,6 +3503,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-round4-futex-smoke") => Some(LINUX_ROUND4_FUTEX_BYTES),
         Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BYTES),
         Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BYTES),
+        Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BYTES),
         Some(_) => None,
     }
 }
@@ -3320,6 +3517,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-round4-futex-smoke") => Some(LINUX_ROUND4_FUTEX_BINARY_PATH),
         Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BINARY_PATH),
         Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BINARY_PATH),
+        Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -3820,10 +4018,10 @@ fn file_description_key(description: &Arc<OpenFileDescription>) -> LinuxFileDesc
 
 fn map_wait_signals_to_epoll(signals: u32) -> u32 {
     let mut events = 0u32;
-    if (signals & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE)) != 0 {
+    if (signals & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE | EVENTFD_READABLE_SIGNAL)) != 0 {
         events |= LINUX_EPOLLIN;
     }
-    if (signals & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE)) != 0 {
+    if (signals & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE | EVENTFD_WRITABLE_SIGNAL)) != 0 {
         events |= LINUX_EPOLLOUT;
     }
     if (signals & (ZX_CHANNEL_PEER_CLOSED | ZX_SOCKET_PEER_CLOSED)) != 0 {
@@ -3841,10 +4039,12 @@ fn filter_epoll_wait_interest(interest: WaitSpec, epoll_interest: u32) -> WaitSp
     let peer_closed = ZX_CHANNEL_PEER_CLOSED | ZX_SOCKET_PEER_CLOSED;
     let mut signals = 0;
     if (epoll_interest & LINUX_EPOLLIN) != 0 {
-        signals |= interest.signals() & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE);
+        signals |= interest.signals()
+            & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE | EVENTFD_READABLE_SIGNAL);
     }
     if (epoll_interest & LINUX_EPOLLOUT) != 0 {
-        signals |= interest.signals() & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE);
+        signals |= interest.signals()
+            & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE | EVENTFD_WRITABLE_SIGNAL);
     }
     if signals != 0 || (epoll_interest & LINUX_EPOLLHUP) != 0 {
         signals |= interest.signals() & peer_closed;
@@ -3891,10 +4091,12 @@ fn filter_wait_interest(interest: WaitSpec, op: FdWaitOp) -> WaitSpec {
     let peer_closed = ZX_CHANNEL_PEER_CLOSED | ZX_SOCKET_PEER_CLOSED;
     let signals = match op {
         FdWaitOp::Read => {
-            interest.signals() & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE | peer_closed)
+            interest.signals()
+                & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE | EVENTFD_READABLE_SIGNAL | peer_closed)
         }
         FdWaitOp::Write => {
-            interest.signals() & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE | peer_closed)
+            interest.signals()
+                & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE | EVENTFD_WRITABLE_SIGNAL | peer_closed)
         }
     };
     WaitSpec::new(interest.handle(), signals)
@@ -4890,6 +5092,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND5_EPOLL_BYTES,
         ));
     }
+    if !LINUX_ROUND6_EVENTFD_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_EVENTFD_BINARY_PATH,
+            LINUX_ROUND6_EVENTFD_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -4930,6 +5138,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round5-epoll-smoke.nxcd",
             LINUX_ROUND5_EPOLL_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_EVENTFD_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-eventfd-smoke.nxcd",
+            LINUX_ROUND6_EVENTFD_DECL_BYTES,
         ));
     }
     let bootstrap = BootstrapNamespace::build(&assets)?;

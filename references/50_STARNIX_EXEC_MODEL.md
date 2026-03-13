@@ -64,6 +64,11 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - Linux `FUTEX_REQUEUE_PRIVATE`
   - guest-task futex parking kept in the Starnix executive while the carrier
     thread remains stopped at the supervised syscall boundary
+- the current Round-6 long-tail bootstrap now has its first anon-inode slice:
+  - `eventfd2`
+  - counter-based `read` / `write` semantics in the userspace executive
+  - epoll-visible readiness derived from one synthetic wait handle instead of a
+    new kernel object family
 
 ## Frozen architectural split
 
@@ -108,6 +113,7 @@ The Starnix executive is a userspace semantic layer. It owns:
   - `Namespace`
   - `FsContext`
   - Linux fd table state
+  - synthetic anon-inode style objects such as `eventfd`
 - Linux signal state:
   - blocked masks
   - per-task pending

@@ -132,6 +132,46 @@ pub fn ax_object_wait_async(
     libzircon::zx_object_wait_async(raw_handle, raw_port, key, signals, options)
 }
 
+/// Create an eventpair handle pair.
+pub fn ax_eventpair_create(
+    options: u32,
+    out0: &mut ax_handle_t,
+    out1: &mut ax_handle_t,
+) -> ax_status_t {
+    let mut raw0 = libzircon::handle::ZX_HANDLE_INVALID;
+    let mut raw1 = libzircon::handle::ZX_HANDLE_INVALID;
+    let status = libzircon::zx_eventpair_create(options, &mut raw0, &mut raw1);
+    if status == AX_OK {
+        *out0 = widen_handle(raw0);
+        *out1 = widen_handle(raw1);
+    }
+    status
+}
+
+/// Clear and set user-visible signals on one handle.
+pub fn ax_object_signal(
+    handle: ax_handle_t,
+    clear_mask: ax_signals_t,
+    set_mask: ax_signals_t,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::zx_object_signal(raw, clear_mask, set_mask),
+        Err(status) => status,
+    }
+}
+
+/// Clear and set user-visible signals on the peer of one handle.
+pub fn ax_object_signal_peer(
+    handle: ax_handle_t,
+    clear_mask: ax_signals_t,
+    set_mask: ax_signals_t,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::zx_object_signal_peer(raw, clear_mask, set_mask),
+        Err(status) => status,
+    }
+}
+
 /// Create a port handle.
 pub fn ax_port_create(options: u32, out: &mut ax_handle_t) -> ax_status_t {
     let mut raw_out = libzircon::handle::ZX_HANDLE_INVALID;

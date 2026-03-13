@@ -1,0 +1,7 @@
+url = "boot://linux-round6-eventfd-smoke"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-round6-eventfd-smoke"
+args = ["linux-round6-eventfd-smoke"]
+env = []
