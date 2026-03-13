@@ -62,11 +62,12 @@ use crate::{
     LINUX_ROUND4_FUTEX_DECL_BYTES, LINUX_ROUND4_SIGNAL_BINARY_PATH, LINUX_ROUND4_SIGNAL_BYTES,
     LINUX_ROUND4_SIGNAL_DECL_BYTES, LINUX_ROUND5_EPOLL_BINARY_PATH, LINUX_ROUND5_EPOLL_BYTES,
     LINUX_ROUND5_EPOLL_DECL_BYTES, LINUX_ROUND6_EVENTFD_BINARY_PATH, LINUX_ROUND6_EVENTFD_BYTES,
-    LINUX_ROUND6_EVENTFD_DECL_BYTES, LINUX_ROUND6_SIGNALFD_BINARY_PATH,
-    LINUX_ROUND6_SIGNALFD_BYTES, LINUX_ROUND6_SIGNALFD_DECL_BYTES,
-    LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES, LINUX_ROUND6_TIMERFD_DECL_BYTES,
-    STARTUP_HANDLE_COMPONENT_STATUS, STARTUP_HANDLE_STARNIX_IMAGE_VMO,
-    STARTUP_HANDLE_STARNIX_PARENT_PROCESS, STARTUP_HANDLE_STARNIX_STDOUT,
+    LINUX_ROUND6_EVENTFD_DECL_BYTES, LINUX_ROUND6_FUTEX_BINARY_PATH, LINUX_ROUND6_FUTEX_BYTES,
+    LINUX_ROUND6_FUTEX_DECL_BYTES, LINUX_ROUND6_SIGNALFD_BINARY_PATH, LINUX_ROUND6_SIGNALFD_BYTES,
+    LINUX_ROUND6_SIGNALFD_DECL_BYTES, LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES,
+    LINUX_ROUND6_TIMERFD_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
+    STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
+    STARTUP_HANDLE_STARNIX_STDOUT,
 };
 
 const USER_PAGE_BYTES: u64 = 0x1000;
@@ -102,6 +103,8 @@ const LINUX_SYSCALL_FORK: u64 = 57;
 const LINUX_SYSCALL_EXECVE: u64 = 59;
 const LINUX_SYSCALL_WAIT4: u64 = 61;
 const LINUX_SYSCALL_KILL: u64 = 62;
+const LINUX_SYSCALL_SET_ROBUST_LIST: u64 = 273;
+const LINUX_SYSCALL_GET_ROBUST_LIST: u64 = 274;
 const LINUX_SYSCALL_TIMERFD_CREATE: u64 = 283;
 const LINUX_SYSCALL_TIMERFD_SETTIME: u64 = 286;
 const LINUX_SYSCALL_TIMERFD_GETTIME: u64 = 287;
@@ -151,8 +154,16 @@ const LINUX_FUTEX_CMD_MASK: u64 = 0x7f;
 const LINUX_FUTEX_WAIT: u64 = 0;
 const LINUX_FUTEX_WAKE: u64 = 1;
 const LINUX_FUTEX_REQUEUE: u64 = 3;
+const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
+const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
 const LINUX_FUTEX_PRIVATE_FLAG: u64 = 0x80;
 const LINUX_FUTEX_CLOCK_REALTIME: u64 = 0x100;
+const LINUX_FUTEX_WAITERS: u32 = 0x8000_0000;
+const LINUX_FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const LINUX_FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+const LINUX_FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
+const LINUX_ROBUST_LIST_HEAD_BYTES: u64 = 24;
+const LINUX_ROBUST_LIST_LIMIT: usize = 2048;
 const LINUX_EPOLL_CTL_ADD: i32 = 1;
 const LINUX_EPOLL_CTL_DEL: i32 = 2;
 const LINUX_EPOLL_CTL_MOD: i32 = 3;
@@ -374,6 +385,12 @@ struct TaskSignals {
 }
 
 #[derive(Clone, Copy)]
+struct LinuxRobustListState {
+    head_addr: u64,
+    len: u64,
+}
+
+#[derive(Clone, Copy)]
 struct ActiveSignalFrame {
     restore_regs: ax_guest_x64_regs_t,
     previous_blocked: u64,
@@ -458,6 +475,12 @@ struct SignalFdState {
     closed: bool,
 }
 
+#[derive(Clone, Copy)]
+struct LinuxFutexWaiter {
+    task_id: i32,
+    bitset: u32,
+}
+
 #[derive(Clone, Copy, Default)]
 struct LinuxItimerSpec {
     interval_ns: u64,
@@ -535,7 +558,7 @@ impl WaitState {
 
     const fn futex_key(self) -> Option<LinuxFutexKey> {
         match self.kind {
-            WaitKind::Futex { key } => Some(key),
+            WaitKind::Futex { key, .. } => Some(key),
             WaitKind::Wait4 { .. }
             | WaitKind::Epoll { .. }
             | WaitKind::FdRead { .. }
@@ -584,6 +607,7 @@ struct LinuxTask {
     carrier: TaskCarrier,
     state: TaskState,
     signals: TaskSignals,
+    robust_list: Option<LinuxRobustListState>,
     active_signal: Option<ActiveSignalFrame>,
 }
 
@@ -613,7 +637,7 @@ struct StarnixKernel {
     root_tgid: i32,
     tasks: BTreeMap<i32, LinuxTask>,
     groups: BTreeMap<i32, LinuxThreadGroup>,
-    futex_waiters: BTreeMap<LinuxFutexKey, VecDeque<i32>>,
+    futex_waiters: BTreeMap<LinuxFutexKey, VecDeque<LinuxFutexWaiter>>,
     epolls: BTreeMap<LinuxFileDescriptionKey, EpollInstance>,
     epoll_packets: BTreeMap<u64, (LinuxFileDescriptionKey, LinuxFileDescriptionKey)>,
     signalfds: BTreeMap<LinuxFileDescriptionKey, Weak<Mutex<SignalFdState>>>,
@@ -1044,17 +1068,18 @@ impl StarnixKernel {
         Ok(LinuxFutexKey::Private { tgid, addr })
     }
 
-    fn enqueue_futex_waiter(&mut self, key: LinuxFutexKey, task_id: i32) {
-        self.futex_waiters
-            .entry(key)
-            .or_default()
-            .push_back(task_id);
+    const fn private_futex_key_for_tgid(tgid: i32, addr: u64) -> LinuxFutexKey {
+        LinuxFutexKey::Private { tgid, addr }
+    }
+
+    fn enqueue_futex_waiter(&mut self, key: LinuxFutexKey, waiter: LinuxFutexWaiter) {
+        self.futex_waiters.entry(key).or_default().push_back(waiter);
     }
 
     fn remove_task_from_futex_queue(&mut self, task_id: i32, key: LinuxFutexKey) {
         let remove_key = match self.futex_waiters.get_mut(&key) {
             Some(queue) => {
-                if let Some(index) = queue.iter().position(|queued| *queued == task_id) {
+                if let Some(index) = queue.iter().position(|queued| queued.task_id == task_id) {
                     let _ = queue.remove(index);
                 }
                 queue.is_empty()
@@ -1090,27 +1115,31 @@ impl StarnixKernel {
         }
     }
 
-    fn pop_live_futex_waiter(&mut self, key: LinuxFutexKey) -> Option<i32> {
-        loop {
-            let next = {
-                let queue = self.futex_waiters.get_mut(&key)?;
-                queue.pop_front()
-            };
-            let Some(task_id) = next else {
-                let _ = self.futex_waiters.remove(&key);
-                return None;
-            };
-            let remove_key = self.futex_waiters.get(&key).is_some_and(VecDeque::is_empty);
-            if remove_key {
-                let _ = self.futex_waiters.remove(&key);
-            }
-            let live = self.tasks.get(&task_id).is_some_and(|task| {
+    fn take_futex_waiter(
+        &mut self,
+        key: LinuxFutexKey,
+        wake_mask: u32,
+    ) -> Option<LinuxFutexWaiter> {
+        let mut queue = self.futex_waiters.remove(&key)?;
+        let mut kept = VecDeque::with_capacity(queue.len());
+        let mut chosen = None;
+        while let Some(waiter) = queue.pop_front() {
+            let live = self.tasks.get(&waiter.task_id).is_some_and(|task| {
                 matches!(task.state, TaskState::Waiting(wait) if wait.futex_key() == Some(key))
             });
-            if live {
-                return Some(task_id);
+            if !live {
+                continue;
             }
+            if chosen.is_none() && (waiter.bitset & wake_mask) != 0 {
+                chosen = Some(waiter);
+                continue;
+            }
+            kept.push_back(waiter);
         }
+        if !kept.is_empty() {
+            self.futex_waiters.insert(key, kept);
+        }
+        chosen
     }
 
     fn resume_futex_waiter(&mut self, task_id: i32, result: u64) -> Result<(), zx_status_t> {
@@ -1132,13 +1161,14 @@ impl StarnixKernel {
         &mut self,
         key: LinuxFutexKey,
         wake_count: usize,
+        wake_mask: u32,
     ) -> Result<u64, zx_status_t> {
         let mut woke = 0u64;
         for _ in 0..wake_count {
-            let Some(task_id) = self.pop_live_futex_waiter(key) else {
+            let Some(waiter) = self.take_futex_waiter(key, wake_mask) else {
                 break;
             };
-            self.resume_futex_waiter(task_id, 0)?;
+            self.resume_futex_waiter(waiter.task_id, 0)?;
             woke = woke.checked_add(1).ok_or(ZX_ERR_OUT_OF_RANGE)?;
         }
         Ok(woke)
@@ -1151,12 +1181,15 @@ impl StarnixKernel {
         wake_count: usize,
         requeue_count: usize,
     ) -> Result<u64, zx_status_t> {
-        let woke = self.wake_futex_waiters(source, wake_count)?;
+        let woke = self.wake_futex_waiters(source, wake_count, LINUX_FUTEX_BITSET_MATCH_ANY)?;
         for _ in 0..requeue_count {
-            let Some(task_id) = self.pop_live_futex_waiter(source) else {
+            let Some(waiter) = self.take_futex_waiter(source, LINUX_FUTEX_BITSET_MATCH_ANY) else {
                 break;
             };
-            let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
+            let task = self
+                .tasks
+                .get_mut(&waiter.task_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
             let TaskState::Waiting(ref mut wait) = task.state else {
                 return Err(ZX_ERR_BAD_STATE);
             };
@@ -1164,7 +1197,7 @@ impl StarnixKernel {
                 restartable: wait.restartable,
                 kind: WaitKind::Futex { key: target },
             };
-            self.enqueue_futex_waiter(target, task_id);
+            self.enqueue_futex_waiter(target, waiter);
         }
         Ok(woke)
     }
@@ -1614,6 +1647,8 @@ impl StarnixKernel {
             LINUX_SYSCALL_GETPID => self.sys_getpid(task_id, stop_state),
             LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
             LINUX_SYSCALL_FUTEX => self.sys_futex(task_id, stop_state),
+            LINUX_SYSCALL_SET_ROBUST_LIST => self.sys_set_robust_list(task_id, stop_state),
+            LINUX_SYSCALL_GET_ROBUST_LIST => self.sys_get_robust_list(task_id, stop_state),
             LINUX_SYSCALL_TIMERFD_CREATE => self.sys_timerfd_create(task_id, stop_state),
             LINUX_SYSCALL_TIMERFD_SETTIME => self.sys_timerfd_settime(task_id, stop_state),
             LINUX_SYSCALL_TIMERFD_GETTIME => self.sys_timerfd_gettime(stop_state),
@@ -1857,6 +1892,7 @@ impl StarnixKernel {
             {
                 self.cancel_task_wait(*member_id, wait);
             }
+            self.process_robust_list_on_exit(*member_id);
             if let Some(task) = self.tasks.remove(member_id) {
                 task.carrier.kill_and_close();
             }
@@ -1875,6 +1911,7 @@ impl StarnixKernel {
         {
             self.cancel_task_wait(task_id, wait);
         }
+        self.process_robust_list_on_exit(task_id);
         let task = self.tasks.remove(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
         task.carrier.kill_and_close();
         let tgid = task.tgid;
@@ -1903,6 +1940,71 @@ impl StarnixKernel {
             .get(&task_id)
             .map(|task| task.signals.blocked)
             .ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    fn process_robust_list_on_exit(&mut self, task_id: i32) {
+        let Some((tgid, session, robust)) = self.tasks.get(&task_id).and_then(|task| {
+            task.robust_list
+                .map(|robust| (task.tgid, task.carrier.session_handle, robust))
+        }) else {
+            return;
+        };
+        let Ok((mut next, futex_offset, list_op_pending)) =
+            read_guest_robust_list_head(session, robust.head_addr)
+        else {
+            return;
+        };
+
+        let mut walked = 0usize;
+        while next != 0 && next != robust.head_addr && walked < LINUX_ROBUST_LIST_LIMIT {
+            let entry_addr = next;
+            next = match read_guest_u64(session, entry_addr) {
+                Ok(next) => next,
+                Err(_) => break,
+            };
+            self.process_robust_entry_on_exit(task_id, tgid, session, entry_addr, futex_offset);
+            walked += 1;
+        }
+
+        if list_op_pending != 0 && list_op_pending != robust.head_addr {
+            self.process_robust_entry_on_exit(
+                task_id,
+                tgid,
+                session,
+                list_op_pending,
+                futex_offset,
+            );
+        }
+    }
+
+    fn process_robust_entry_on_exit(
+        &mut self,
+        task_id: i32,
+        tgid: i32,
+        session: zx_handle_t,
+        entry_addr: u64,
+        futex_offset: i64,
+    ) {
+        let futex_addr = if futex_offset >= 0 {
+            entry_addr.checked_add(futex_offset as u64)
+        } else {
+            entry_addr.checked_sub(futex_offset.unsigned_abs())
+        };
+        let Some(futex_addr) = futex_addr else {
+            return;
+        };
+        let Ok(word) = read_guest_u32(session, futex_addr) else {
+            return;
+        };
+        if (word & LINUX_FUTEX_TID_MASK) != (task_id as u32 & LINUX_FUTEX_TID_MASK) {
+            return;
+        }
+        let new_word = (word & LINUX_FUTEX_WAITERS) | LINUX_FUTEX_OWNER_DIED;
+        if write_guest_u32(session, futex_addr, new_word).is_err() {
+            return;
+        }
+        let key = Self::private_futex_key_for_tgid(tgid, futex_addr);
+        let _ = self.wake_futex_waiters(key, 1, LINUX_FUTEX_BITSET_MATCH_ANY);
     }
 
     fn signalfd_ready_mask(&self, owner_tid: i32, mask: u64) -> Result<u64, zx_status_t> {
@@ -2590,6 +2692,7 @@ impl StarnixKernel {
         let val = stop_state.regs.rdx;
         let timeout_or_val2 = stop_state.regs.r10;
         let uaddr2 = stop_state.regs.r8;
+        let val3 = stop_state.regs.r9;
 
         if (futex_op
             & !(LINUX_FUTEX_CMD_MASK | LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME))
@@ -2604,7 +2707,17 @@ impl StarnixKernel {
         let command = futex_op & LINUX_FUTEX_CMD_MASK;
         let key = self.private_futex_key(task_id, uaddr)?;
         match command {
-            LINUX_FUTEX_WAIT => {
+            LINUX_FUTEX_WAIT | LINUX_FUTEX_WAIT_BITSET => {
+                let bitset = if command == LINUX_FUTEX_WAIT {
+                    LINUX_FUTEX_BITSET_MATCH_ANY
+                } else {
+                    let bitset = val3 as u32;
+                    if bitset == 0 {
+                        complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+                        return Ok(SyscallAction::Resume);
+                    }
+                    bitset
+                };
                 if timeout_or_val2 != 0 {
                     complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?;
                     return Ok(SyscallAction::Resume);
@@ -2630,7 +2743,7 @@ impl StarnixKernel {
                     complete_syscall(stop_state, linux_errno(LINUX_EAGAIN))?;
                     return Ok(SyscallAction::Resume);
                 }
-                self.enqueue_futex_waiter(key, task_id);
+                self.enqueue_futex_waiter(key, LinuxFutexWaiter { task_id, bitset });
                 let wait = WaitState {
                     restartable: false,
                     kind: WaitKind::Futex { key },
@@ -2639,12 +2752,22 @@ impl StarnixKernel {
                     TaskState::Waiting(wait);
                 self.deliver_or_interrupt_wait(task_id, wait, stop_state)
             }
-            LINUX_FUTEX_WAKE => {
+            LINUX_FUTEX_WAKE | LINUX_FUTEX_WAKE_BITSET => {
+                let wake_mask = if command == LINUX_FUTEX_WAKE {
+                    LINUX_FUTEX_BITSET_MATCH_ANY
+                } else {
+                    let bitset = val3 as u32;
+                    if bitset == 0 {
+                        complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+                        return Ok(SyscallAction::Resume);
+                    }
+                    bitset
+                };
                 let Ok(wake_count) = usize::try_from(val) else {
                     complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
                     return Ok(SyscallAction::Resume);
                 };
-                let woken = self.wake_futex_waiters(key, wake_count)?;
+                let woken = self.wake_futex_waiters(key, wake_count, wake_mask)?;
                 complete_syscall(stop_state, woken)?;
                 Ok(SyscallAction::Resume)
             }
@@ -2675,6 +2798,69 @@ impl StarnixKernel {
                 Ok(SyscallAction::Resume)
             }
         }
+    }
+
+    fn sys_set_robust_list(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let head_addr = stop_state.regs.rdi;
+        let len = stop_state.regs.rsi;
+        if head_addr == 0 || len != LINUX_ROBUST_LIST_HEAD_BYTES {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
+        task.robust_list = Some(LinuxRobustListState { head_addr, len });
+        complete_syscall(stop_state, 0)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_get_robust_list(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let target_tid = stop_state.regs.rdi as u32 as i32;
+        let head_addr_ptr = stop_state.regs.rsi;
+        let len_ptr = stop_state.regs.rdx;
+        if head_addr_ptr == 0 || len_ptr == 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EFAULT))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let resolved_tid = if target_tid == 0 { task_id } else { target_tid };
+        let Some(target) = self.tasks.get(&resolved_tid) else {
+            complete_syscall(stop_state, linux_errno(LINUX_ESRCH))?;
+            return Ok(SyscallAction::Resume);
+        };
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let robust = target.robust_list.unwrap_or(LinuxRobustListState {
+            head_addr: 0,
+            len: LINUX_ROBUST_LIST_HEAD_BYTES,
+        });
+        if let Err(status) = write_guest_u64(session, head_addr_ptr, robust.head_addr) {
+            complete_syscall(
+                stop_state,
+                linux_errno(map_guest_write_status_to_errno(status)),
+            )?;
+            return Ok(SyscallAction::Resume);
+        }
+        if let Err(status) = write_guest_u64(session, len_ptr, robust.len) {
+            complete_syscall(
+                stop_state,
+                linux_errno(map_guest_write_status_to_errno(status)),
+            )?;
+            return Ok(SyscallAction::Resume);
+        }
+        complete_syscall(stop_state, 0)?;
+        Ok(SyscallAction::Resume)
     }
 
     fn sys_epoll_create1(
@@ -3458,6 +3644,7 @@ impl StarnixKernel {
                     blocked: parent_blocked,
                     pending: 0,
                 },
+                robust_list: None,
                 active_signal: None,
             },
         );
@@ -3617,6 +3804,7 @@ impl StarnixKernel {
                     blocked: parent_blocked,
                     pending: 0,
                 },
+                robust_list: None,
                 active_signal: None,
             },
         );
@@ -3779,6 +3967,7 @@ impl StarnixKernel {
             let old_carrier = task.carrier;
             task.carrier = new_carrier;
             task.active_signal = None;
+            task.robust_list = None;
             old_carrier
         };
         let old_resources = {
@@ -3980,6 +4169,7 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         carrier,
         state: TaskState::Running,
         signals: TaskSignals::default(),
+        robust_list: None,
         active_signal: None,
     };
     let mut task_ids = BTreeSet::new();
@@ -4184,6 +4374,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BYTES),
         Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BYTES),
         Some("linux-round6-signalfd-smoke") => Some(LINUX_ROUND6_SIGNALFD_BYTES),
+        Some("linux-round6-futex-smoke") => Some(LINUX_ROUND6_FUTEX_BYTES),
         Some(_) => None,
     }
 }
@@ -4200,6 +4391,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BINARY_PATH),
         Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BINARY_PATH),
         Some("linux-round6-signalfd-smoke") => Some(LINUX_ROUND6_SIGNALFD_BINARY_PATH),
+        Some("linux-round6-futex-smoke") => Some(LINUX_ROUND6_FUTEX_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -4468,6 +4660,10 @@ fn read_guest_u32(session: zx_handle_t, addr: u64) -> Result<u32, zx_status_t> {
     Ok(u32::from_ne_bytes(
         raw.try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
     ))
+}
+
+fn write_guest_u32(session: zx_handle_t, addr: u64, value: u32) -> Result<(), zx_status_t> {
+    write_guest_bytes(session, addr, &value.to_ne_bytes())
 }
 
 fn write_guest_bytes(session: zx_handle_t, addr: u64, bytes: &[u8]) -> Result<(), zx_status_t> {
@@ -5808,6 +6004,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND6_SIGNALFD_BYTES,
         ));
     }
+    if !LINUX_ROUND6_FUTEX_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_FUTEX_BINARY_PATH,
+            LINUX_ROUND6_FUTEX_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -5866,6 +6068,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round6-signalfd-smoke.nxcd",
             LINUX_ROUND6_SIGNALFD_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_FUTEX_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-futex-smoke.nxcd",
+            LINUX_ROUND6_FUTEX_DECL_BYTES,
         ));
     }
     let bootstrap = BootstrapNamespace::build(&assets)?;
@@ -6000,6 +6208,26 @@ fn read_guest_u64(session: zx_handle_t, addr: u64) -> Result<u64, zx_status_t> {
     Ok(u64::from_ne_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
+}
+
+fn write_guest_u64(session: zx_handle_t, addr: u64, value: u64) -> Result<(), zx_status_t> {
+    write_guest_bytes(session, addr, &value.to_ne_bytes())
+}
+
+fn read_guest_i64(session: zx_handle_t, addr: u64) -> Result<i64, zx_status_t> {
+    let value = read_guest_u64(session, addr)?;
+    Ok(i64::from_ne_bytes(value.to_ne_bytes()))
+}
+
+fn read_guest_robust_list_head(
+    session: zx_handle_t,
+    head_addr: u64,
+) -> Result<(u64, i64, u64), zx_status_t> {
+    Ok((
+        read_guest_u64(session, head_addr)?,
+        read_guest_i64(session, head_addr + 8)?,
+        read_guest_u64(session, head_addr + 16)?,
+    ))
 }
 
 fn parse_linux_timespec_ns(raw: &[u8]) -> Result<u64, zx_status_t> {

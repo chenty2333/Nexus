@@ -80,6 +80,12 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - the current bootstrap slice binds each signalfd object to its creating task
     and thread group, rather than trying to model full cross-thread shared-fd
     semantics yet
+  - `FUTEX_WAIT_BITSET_PRIVATE`
+  - `FUTEX_WAKE_BITSET_PRIVATE`
+  - `set_robust_list`
+  - `get_robust_list`
+  - best-effort robust-list owner-died marking plus wake-on-thread-exit for
+    private futex words owned by the exiting task
 
 ## Frozen architectural split
 
@@ -386,8 +392,14 @@ The current in-tree Round-4 futex slice is intentionally narrower than the
 full model above:
 
 - the executive directly owns the live wait queues for supervised Linux tasks
-- only `FUTEX_*_PRIVATE` wait/wake/requeue is implemented so far
-- timeout, bitset, and restart-block policy are still deferred
+- `FUTEX_WAIT_PRIVATE`, `FUTEX_WAKE_PRIVATE`, `FUTEX_REQUEUE_PRIVATE`,
+  `FUTEX_WAIT_BITSET_PRIVATE`, and `FUTEX_WAKE_BITSET_PRIVATE` are implemented
+- timeout, shared-futex identity, and restart-block policy are still deferred
+- robust-list support is currently limited to:
+  - `set_robust_list`
+  - `get_robust_list`
+  - owner-died marking and one waiter wake during thread exit
+  - no PI robust futex policy yet
 - a future generic Axle helper may later let the supervisor park a guest carrier
   on the kernel futex substrate without blocking the supervisor thread itself
 

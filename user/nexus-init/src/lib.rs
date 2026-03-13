@@ -140,6 +140,10 @@ const ROOT_DECL_STARNIX_ROUND6_SIGNALFD_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_round6_signalfd.nxcd"
 ));
+const ROOT_DECL_STARNIX_ROUND6_FUTEX_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_round6_futex.nxcd"
+));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
@@ -195,6 +199,11 @@ pub(crate) const LINUX_ROUND6_SIGNALFD_DECL_BYTES: &[u8] = include_bytes!(concat
 ));
 #[cfg(not(nexus_init_embed_starnix_round6_signalfd))]
 pub(crate) const LINUX_ROUND6_SIGNALFD_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round6_futex)]
+pub(crate) const LINUX_ROUND6_FUTEX_DECL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux_round6_futex_smoke.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_round6_futex))]
+pub(crate) const LINUX_ROUND6_FUTEX_DECL_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_hello)]
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
@@ -245,6 +254,11 @@ pub(crate) const LINUX_ROUND6_SIGNALFD_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-round6-signalfd-smoke"));
 #[cfg(not(nexus_init_embed_starnix_round6_signalfd))]
 pub(crate) const LINUX_ROUND6_SIGNALFD_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round6_futex)]
+pub(crate) const LINUX_ROUND6_FUTEX_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-round6-futex-smoke"));
+#[cfg(not(nexus_init_embed_starnix_round6_futex))]
+pub(crate) const LINUX_ROUND6_FUTEX_BYTES: &[u8] = &[];
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
@@ -265,6 +279,7 @@ pub(crate) const LINUX_ROUND5_EPOLL_BINARY_PATH: &str = "bin/linux-round5-epoll-
 pub(crate) const LINUX_ROUND6_EVENTFD_BINARY_PATH: &str = "bin/linux-round6-eventfd-smoke";
 pub(crate) const LINUX_ROUND6_TIMERFD_BINARY_PATH: &str = "bin/linux-round6-timerfd-smoke";
 pub(crate) const LINUX_ROUND6_SIGNALFD_BINARY_PATH: &str = "bin/linux-round6-signalfd-smoke";
+pub(crate) const LINUX_ROUND6_FUTEX_BINARY_PATH: &str = "bin/linux-round6-futex-smoke";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -290,6 +305,7 @@ const STARNIX_ROUND5_EPOLL_EXPECTED_STDOUT: &[u8] = b"round5 epoll ok\n";
 const STARNIX_ROUND6_EVENTFD_EXPECTED_STDOUT: &[u8] = b"round6 eventfd ok\n";
 const STARNIX_ROUND6_TIMERFD_EXPECTED_STDOUT: &[u8] = b"round6 timerfd ok\n";
 const STARNIX_ROUND6_SIGNALFD_EXPECTED_STDOUT: &[u8] = b"round6 signalfd ok\n";
+const STARNIX_ROUND6_FUTEX_EXPECTED_STDOUT: &[u8] = b"round6 futex ok\n";
 
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
@@ -534,6 +550,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             LINUX_ROUND6_SIGNALFD_BYTES,
         ));
     }
+    if !LINUX_ROUND6_FUTEX_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_FUTEX_BINARY_PATH,
+            LINUX_ROUND6_FUTEX_BYTES,
+        ));
+    }
     assets.push(BootAssetEntry::bytes(
         "manifests/root.nxcd",
         ROOT_DECL_EAGER_BYTES,
@@ -581,6 +603,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-round6-signalfd.nxcd",
         ROOT_DECL_STARNIX_ROUND6_SIGNALFD_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-round6-futex.nxcd",
+        ROOT_DECL_STARNIX_ROUND6_FUTEX_BYTES,
     ));
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
@@ -640,6 +666,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round6-signalfd-smoke.nxcd",
             LINUX_ROUND6_SIGNALFD_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_FUTEX_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-futex-smoke.nxcd",
+            LINUX_ROUND6_FUTEX_DECL_BYTES,
         ));
     }
     assets.push(BootAssetEntry::bytes(
@@ -840,6 +872,16 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             &runners,
             "linux_round6_signalfd_smoke",
             STARNIX_ROUND6_SIGNALFD_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-round6-futex" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_round6_futex_smoke",
+            STARNIX_ROUND6_FUTEX_EXPECTED_STDOUT,
             summary,
         );
     }

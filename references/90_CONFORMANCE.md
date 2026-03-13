@@ -121,8 +121,8 @@ Main just targets include:
   - `FUTEX_REQUEUE_PRIVATE`
   - waiters are Linux tasks parked in the userspace executive rather than the
     supervisor thread itself
-  - this gate intentionally excludes timeout, bitset, and shared-futex identity
-    semantics, which remain later Round-4 work
+  - this gate intentionally excludes timeout, bitset, robust-list, and
+    shared-futex identity semantics, which remain later work
 - The first Round-6 Starnix long-tail scenario now closes one narrow anon-inode slice:
   - `eventfd2`
   - nonblocking empty-read `EAGAIN`
@@ -146,6 +146,15 @@ Main just targets include:
   - the current bootstrap implementation ties each signalfd object to the
     creating task's blocked/pending view plus its thread-group shared pending
     set; full shared-fd cross-thread semantics remain later work
+- The fourth Round-6 Starnix long-tail scenario now closes the next futex tail
+  slice:
+  - `FUTEX_WAIT_BITSET_PRIVATE`
+  - `FUTEX_WAKE_BITSET_PRIVATE`
+  - `set_robust_list`
+  - `get_robust_list`
+  - owner-died marking on thread exit for one private robust futex word
+  - the current bootstrap gate still excludes timeout, shared-futex identity,
+    and PI robust-futex policy
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return
