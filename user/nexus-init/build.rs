@@ -32,6 +32,8 @@ fn main() {
         manifest_dir.join("../linux-round6-pidfd-smoke/round6_pidfd_smoke.S");
     let linux_round6_proc_job_source =
         manifest_dir.join("../linux-round6-proc-job-smoke/round6_proc_job_smoke.S");
+    let linux_round6_proc_control_source =
+        manifest_dir.join("../linux-round6-proc-control-smoke/round6_proc_control_smoke.S");
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
@@ -79,6 +81,10 @@ fn main() {
         "cargo:rerun-if-changed={}",
         linux_round6_proc_job_source.display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_round6_proc_control_source.display()
+    );
     for manifest in [
         "root_component.toml",
         "root_component_round3.toml",
@@ -96,6 +102,7 @@ fn main() {
         "root_component_starnix_round6_scm_rights.toml",
         "root_component_starnix_round6_pidfd.toml",
         "root_component_starnix_round6_proc_job.toml",
+        "root_component_starnix_round6_proc_control.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
@@ -113,6 +120,7 @@ fn main() {
         "linux_round6_scm_rights_smoke.toml",
         "linux_round6_pidfd_smoke.toml",
         "linux_round6_proc_job_smoke.toml",
+        "linux_round6_proc_control_smoke.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -177,6 +185,10 @@ fn main() {
             "root_component_starnix_round6_proc_job.toml",
             "root_component_starnix_round6_proc_job.nxcd",
         ),
+        (
+            "root_component_starnix_round6_proc_control.toml",
+            "root_component_starnix_round6_proc_control.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
@@ -223,6 +235,10 @@ fn main() {
         (
             "linux_round6_proc_job_smoke.toml",
             "linux_round6_proc_job_smoke.nxcd",
+        ),
+        (
+            "linux_round6_proc_control_smoke.toml",
+            "linux_round6_proc_control_smoke.nxcd",
         ),
     ] {
         let source_path = manifests_dir.join(input);
@@ -278,6 +294,10 @@ fn main() {
         &linux_round6_proc_job_source,
         &out_dir.join("linux-round6-proc-job-smoke"),
     );
+    build_linux_binary(
+        &linux_round6_proc_control_source,
+        &out_dir.join("linux-round6-proc-control-smoke"),
+    );
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
         // Link the bootstrap userspace binary at the fixed VA currently
@@ -307,6 +327,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_scm_rights)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_pidfd)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_proc_job)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_proc_control)");
     match root_url.as_str() {
         "boot://root-starnix" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
@@ -352,6 +373,9 @@ fn main() {
         }
         "boot://root-starnix-round6-proc-job" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_round6_proc_job");
+        }
+        "boot://root-starnix-round6-proc-control" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_round6_proc_control");
         }
         _ => {}
     }

@@ -107,6 +107,14 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
       `/proc/<pid>/stat`, and `/proc/<pid>/fd/*`
     - `/proc/<pid>/fd/<n>` stays a proxy to the live Linux file description
       rather than a new native object family
+  - the next `/proc` + stop/continue slice now also has:
+    - synthetic `/proc/self/comm`
+    - synthetic `/proc/self/cmdline`
+    - synthetic `/proc/self/task`
+    - synthetic `/proc/self/task/<tid>/{comm,stat,status}`
+    - group-stop / continue transitions through default `SIGSTOP` / `SIGCONT`
+    - `wait4(..., WUNTRACED, ...)` observing one stop event
+    - `wait4(..., WCONTINUED, ...)` observing one continue event
 
 ## Frozen architectural split
 
@@ -502,6 +510,14 @@ forcing every syscall through one uniform RPC layer.
     - `/proc/self/stat`
     - `/proc/self/fd`
     - `/proc/self/fd/<n>`
+    - `/proc/self/comm`
+    - `/proc/self/cmdline`
+    - `/proc/self/task`
+    - `/proc/self/task/<tid>/{comm,stat,status}`
+  - one minimal job-control stop / continue view now exists:
+    - default `SIGSTOP` / `SIGCONT` transitions are tracked at thread-group scope
+    - `wait4(..., WUNTRACED, ...)` consumes one pending stop event
+    - `wait4(..., WCONTINUED, ...)` consumes one pending continue event
   - no restart blocks / `sigaltstack` yet
   - no epoll model yet
 - `fork` currently clones the Linux-side control plane and eagerly copies the

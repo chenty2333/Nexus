@@ -168,7 +168,7 @@ Main just targets include:
   slice:
   - `pidfd_open`
   - `pidfd_send_signal`
-  - pidfd readability after the target thread group leaves the running state
+  - pidfd readability after the target thread group becomes zombie / exited
   - the current bootstrap gate intentionally keeps the pidfd object synthetic in
     the executive and excludes `waitid(P_PIDFD)` plus broader pidfd lifecycle
     features
@@ -186,6 +186,16 @@ Main just targets include:
     executive boundary: syscall parameters such as `AT_FDCWD == -100` must be
     interpreted from the low 32 bits of the guest register, not by trying to
     downcast the raw 64-bit register value
+- The eighth Round-6 Starnix long-tail scenario now extends that with one
+  `/proc` + stop/continue slice:
+  - synthetic `/proc/self/comm`
+  - synthetic `/proc/self/cmdline`
+  - synthetic `/proc/self/task`
+  - synthetic `/proc/self/task/<tid>/status`
+  - `SIGSTOP` default-delivery entering thread-group stop state
+  - `SIGCONT` resuming the stopped thread group
+  - `wait4(..., WUNTRACED, ...)` observing the stop event
+  - `wait4(..., WCONTINUED, ...)` observing the continue event
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return
