@@ -144,6 +144,14 @@ const ROOT_DECL_STARNIX_ROUND6_FUTEX_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_round6_futex.nxcd"
 ));
+const ROOT_DECL_STARNIX_ROUND6_SCM_RIGHTS_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_round6_scm_rights.nxcd"
+));
+const ROOT_DECL_STARNIX_ROUND6_PIDFD_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_round6_pidfd.nxcd"
+));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
@@ -204,6 +212,18 @@ pub(crate) const LINUX_ROUND6_FUTEX_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_round6_futex_smoke.nxcd"));
 #[cfg(not(nexus_init_embed_starnix_round6_futex))]
 pub(crate) const LINUX_ROUND6_FUTEX_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round6_scm_rights)]
+pub(crate) const LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/linux_round6_scm_rights_smoke.nxcd"
+));
+#[cfg(not(nexus_init_embed_starnix_round6_scm_rights))]
+pub(crate) const LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round6_pidfd)]
+pub(crate) const LINUX_ROUND6_PIDFD_DECL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux_round6_pidfd_smoke.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_round6_pidfd))]
+pub(crate) const LINUX_ROUND6_PIDFD_DECL_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_hello)]
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
@@ -259,6 +279,16 @@ pub(crate) const LINUX_ROUND6_FUTEX_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-round6-futex-smoke"));
 #[cfg(not(nexus_init_embed_starnix_round6_futex))]
 pub(crate) const LINUX_ROUND6_FUTEX_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round6_scm_rights)]
+pub(crate) const LINUX_ROUND6_SCM_RIGHTS_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-round6-scm-rights-smoke"));
+#[cfg(not(nexus_init_embed_starnix_round6_scm_rights))]
+pub(crate) const LINUX_ROUND6_SCM_RIGHTS_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round6_pidfd)]
+pub(crate) const LINUX_ROUND6_PIDFD_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-round6-pidfd-smoke"));
+#[cfg(not(nexus_init_embed_starnix_round6_pidfd))]
+pub(crate) const LINUX_ROUND6_PIDFD_BYTES: &[u8] = &[];
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
@@ -280,6 +310,8 @@ pub(crate) const LINUX_ROUND6_EVENTFD_BINARY_PATH: &str = "bin/linux-round6-even
 pub(crate) const LINUX_ROUND6_TIMERFD_BINARY_PATH: &str = "bin/linux-round6-timerfd-smoke";
 pub(crate) const LINUX_ROUND6_SIGNALFD_BINARY_PATH: &str = "bin/linux-round6-signalfd-smoke";
 pub(crate) const LINUX_ROUND6_FUTEX_BINARY_PATH: &str = "bin/linux-round6-futex-smoke";
+pub(crate) const LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH: &str = "bin/linux-round6-scm-rights-smoke";
+pub(crate) const LINUX_ROUND6_PIDFD_BINARY_PATH: &str = "bin/linux-round6-pidfd-smoke";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -291,8 +323,6 @@ pub(crate) const STARTUP_HANDLE_COMPONENT_STATUS: u32 = 1;
 pub(crate) const STARTUP_HANDLE_STARNIX_IMAGE_VMO: u32 = 2;
 pub(crate) const STARTUP_HANDLE_STARNIX_PARENT_PROCESS: u32 = 3;
 pub(crate) const STARTUP_HANDLE_STARNIX_STDOUT: u32 = 4;
-pub(crate) const MAX_BOOTSTRAP_MESSAGE_BYTES: usize = 512;
-pub(crate) const MAX_BOOTSTRAP_MESSAGE_HANDLES: usize = 8;
 pub(crate) const MAX_SMALL_CHANNEL_BYTES: usize = 128;
 pub(crate) const MAX_SMALL_CHANNEL_HANDLES: usize = 1;
 const STARNIX_HELLO_EXPECTED_STDOUT: &[u8] = b"hello from linux-hello\n";
@@ -306,6 +336,8 @@ const STARNIX_ROUND6_EVENTFD_EXPECTED_STDOUT: &[u8] = b"round6 eventfd ok\n";
 const STARNIX_ROUND6_TIMERFD_EXPECTED_STDOUT: &[u8] = b"round6 timerfd ok\n";
 const STARNIX_ROUND6_SIGNALFD_EXPECTED_STDOUT: &[u8] = b"round6 signalfd ok\n";
 const STARNIX_ROUND6_FUTEX_EXPECTED_STDOUT: &[u8] = b"round6 futex ok\n";
+const STARNIX_ROUND6_SCM_RIGHTS_EXPECTED_STDOUT: &[u8] = b"round6 scm_rights ok\n";
+const STARNIX_ROUND6_PIDFD_EXPECTED_STDOUT: &[u8] = b"round6 pidfd ok\n";
 
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
@@ -556,6 +588,18 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             LINUX_ROUND6_FUTEX_BYTES,
         ));
     }
+    if !LINUX_ROUND6_SCM_RIGHTS_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH,
+            LINUX_ROUND6_SCM_RIGHTS_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_PIDFD_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_PIDFD_BINARY_PATH,
+            LINUX_ROUND6_PIDFD_BYTES,
+        ));
+    }
     assets.push(BootAssetEntry::bytes(
         "manifests/root.nxcd",
         ROOT_DECL_EAGER_BYTES,
@@ -607,6 +651,14 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-round6-futex.nxcd",
         ROOT_DECL_STARNIX_ROUND6_FUTEX_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-round6-scm-rights.nxcd",
+        ROOT_DECL_STARNIX_ROUND6_SCM_RIGHTS_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-round6-pidfd.nxcd",
+        ROOT_DECL_STARNIX_ROUND6_PIDFD_BYTES,
     ));
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
@@ -672,6 +724,18 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round6-futex-smoke.nxcd",
             LINUX_ROUND6_FUTEX_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-scm-rights-smoke.nxcd",
+            LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_PIDFD_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-pidfd-smoke.nxcd",
+            LINUX_ROUND6_PIDFD_DECL_BYTES,
         ));
     }
     assets.push(BootAssetEntry::bytes(
@@ -882,6 +946,26 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             &runners,
             "linux_round6_futex_smoke",
             STARNIX_ROUND6_FUTEX_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-round6-scm-rights" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_round6_scm_rights_smoke",
+            STARNIX_ROUND6_SCM_RIGHTS_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-round6-pidfd" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_round6_pidfd_smoke",
+            STARNIX_ROUND6_PIDFD_EXPECTED_STDOUT,
             summary,
         );
     }

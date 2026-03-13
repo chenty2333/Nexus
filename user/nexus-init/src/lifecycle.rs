@@ -121,20 +121,6 @@ pub(crate) fn read_channel_fixed(
     Ok((actual_bytes as usize, actual_handles as usize))
 }
 
-pub(crate) fn read_channel_blocking(
-    handle: zx_handle_t,
-    bytes: &mut [u8],
-    handles: &mut [zx_handle_t],
-) -> Result<(usize, usize), zx_status_t> {
-    loop {
-        match read_channel_fixed(handle, bytes, handles) {
-            Ok(message) => return Ok(message),
-            Err(ZX_ERR_SHOULD_WAIT) => wait_for_channel_readable(handle, ZX_TIME_INFINITE)?,
-            Err(status) => return Err(status),
-        }
-    }
-}
-
 pub(crate) fn read_channel_alloc_blocking(
     handle: zx_handle_t,
 ) -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<zx_handle_t>), zx_status_t> {

@@ -1,0 +1,7 @@
+url = "boot://linux-round6-scm-rights-smoke"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-round6-scm-rights-smoke"
+args = ["linux-round6-scm-rights-smoke"]
+env = []

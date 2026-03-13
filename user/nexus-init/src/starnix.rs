@@ -63,7 +63,10 @@ use crate::{
     LINUX_ROUND4_SIGNAL_DECL_BYTES, LINUX_ROUND5_EPOLL_BINARY_PATH, LINUX_ROUND5_EPOLL_BYTES,
     LINUX_ROUND5_EPOLL_DECL_BYTES, LINUX_ROUND6_EVENTFD_BINARY_PATH, LINUX_ROUND6_EVENTFD_BYTES,
     LINUX_ROUND6_EVENTFD_DECL_BYTES, LINUX_ROUND6_FUTEX_BINARY_PATH, LINUX_ROUND6_FUTEX_BYTES,
-    LINUX_ROUND6_FUTEX_DECL_BYTES, LINUX_ROUND6_SIGNALFD_BINARY_PATH, LINUX_ROUND6_SIGNALFD_BYTES,
+    LINUX_ROUND6_FUTEX_DECL_BYTES, LINUX_ROUND6_PIDFD_BINARY_PATH, LINUX_ROUND6_PIDFD_BYTES,
+    LINUX_ROUND6_PIDFD_DECL_BYTES, LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH,
+    LINUX_ROUND6_SCM_RIGHTS_BYTES, LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES,
+    LINUX_ROUND6_SIGNALFD_BINARY_PATH, LINUX_ROUND6_SIGNALFD_BYTES,
     LINUX_ROUND6_SIGNALFD_DECL_BYTES, LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES,
     LINUX_ROUND6_TIMERFD_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
     STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
@@ -97,6 +100,8 @@ const LINUX_SYSCALL_RT_SIGPROCMASK: u64 = 14;
 const LINUX_SYSCALL_RT_SIGRETURN: u64 = 15;
 const LINUX_SYSCALL_BRK: u64 = 12;
 const LINUX_SYSCALL_GETPID: u64 = 39;
+const LINUX_SYSCALL_SENDMSG: u64 = 46;
+const LINUX_SYSCALL_RECVMSG: u64 = 47;
 const LINUX_SYSCALL_SOCKETPAIR: u64 = 53;
 const LINUX_SYSCALL_CLONE: u64 = 56;
 const LINUX_SYSCALL_FORK: u64 = 57;
@@ -116,14 +121,18 @@ const LINUX_SYSCALL_GETTID: u64 = 186;
 const LINUX_SYSCALL_FUTEX: u64 = 202;
 const LINUX_SYSCALL_TGKILL: u64 = 234;
 const LINUX_SYSCALL_GETDENTS64: u64 = 217;
+const LINUX_SYSCALL_PIDFD_SEND_SIGNAL: u64 = 424;
 const LINUX_SYSCALL_EXIT: u64 = 60;
 const LINUX_SYSCALL_OPENAT: u64 = 257;
 const LINUX_SYSCALL_NEWFSTATAT: u64 = 262;
 const LINUX_SYSCALL_EPOLL_CREATE1: u64 = 291;
 const LINUX_SYSCALL_EXIT_GROUP: u64 = 231;
 const LINUX_SYSCALL_PIPE2: u64 = 293;
+const LINUX_SYSCALL_PIDFD_OPEN: u64 = 434;
 const LINUX_AF_UNIX: u64 = 1;
 const LINUX_SOCK_STREAM: u64 = 1;
+const LINUX_SOL_SOCKET: i32 = 1;
+const LINUX_SCM_RIGHTS: i32 = 1;
 const LINUX_AT_FDCWD: i32 = -100;
 const LINUX_O_ACCMODE: u64 = 0x3;
 const LINUX_O_WRONLY: u64 = 0x1;
@@ -179,6 +188,7 @@ const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_EFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 const LINUX_SFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_SFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 const LINUX_SIGNALFD_SIGINFO_BYTES: usize = 128;
 const LINUX_TFD_TIMER_ABSTIME: u64 = 0x1;
 const LINUX_TFD_TIMER_CANCEL_ON_SET: u64 = 0x2;
@@ -198,6 +208,10 @@ const LINUX_S_IFDIR: u32 = 0o040000;
 const LINUX_S_IFREG: u32 = 0o100000;
 const LINUX_S_IFSOCK: u32 = 0o140000;
 const LINUX_STAT_STRUCT_BYTES: usize = 144;
+const LINUX_MSGHDR_BYTES: usize = 56;
+const LINUX_IOVEC_BYTES: usize = 16;
+const LINUX_CMSGHDR_BYTES: usize = 16;
+const LINUX_IOV_MAX: usize = 1024;
 const LINUX_PATH_MAX: usize = 4096;
 const LINUX_EINTR: i32 = 4;
 const LINUX_EIO: i32 = 5;
@@ -216,6 +230,7 @@ const LINUX_EPIPE: i32 = 32;
 const LINUX_ENOSYS: i32 = 38;
 const LINUX_ENODEV: i32 = 19;
 const LINUX_ECHILD: i32 = 10;
+const LINUX_ENOTSOCK: i32 = 88;
 const LINUX_SIG_BLOCK: u64 = 0;
 const LINUX_SIG_UNBLOCK: u64 = 1;
 const LINUX_SIG_SETMASK: u64 = 2;
@@ -233,6 +248,7 @@ const EVENTFD_WRITABLE_SIGNAL: u32 = AX_USER_SIGNAL_1;
 const EVENTFD_SIGNAL_MASK: u32 = EVENTFD_READABLE_SIGNAL | EVENTFD_WRITABLE_SIGNAL;
 const EVENTFD_COUNTER_MAX: u64 = u64::MAX - 1;
 const SIGNALFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
+const PIDFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
@@ -293,8 +309,6 @@ struct LinuxLoadSegment {
     vaddr: u64,
     mem_size: usize,
     flags: u32,
-    file_offset: usize,
-    file_size: usize,
 }
 
 struct LinuxElf<'a> {
@@ -303,7 +317,7 @@ struct LinuxElf<'a> {
     phent: u16,
     phnum: u16,
     segments: Vec<LinuxLoadSegment>,
-    bytes: &'a [u8],
+    _bytes: &'a [u8],
 }
 
 enum SyscallAction {
@@ -364,8 +378,6 @@ struct LinuxWritableRange {
 #[derive(Clone)]
 struct TaskImage {
     path: String,
-    args: Vec<String>,
-    env: Vec<String>,
     exec_blob: Vec<u8>,
     writable_ranges: Vec<LinuxWritableRange>,
 }
@@ -451,6 +463,11 @@ struct SignalFd {
     state: Arc<Mutex<SignalFdState>>,
 }
 
+#[derive(Clone)]
+struct PidFd {
+    state: Arc<Mutex<PidFdState>>,
+}
+
 struct EventFdState {
     wait_handle: zx_handle_t,
     peer_handle: zx_handle_t,
@@ -473,6 +490,34 @@ struct SignalFdState {
     owner_tgid: i32,
     mask: u64,
     closed: bool,
+}
+
+struct PidFdState {
+    wait_handle: zx_handle_t,
+    peer_handle: zx_handle_t,
+    target_tgid: i32,
+    closed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct LinuxMsgHdr {
+    name_addr: u64,
+    name_len: u32,
+    iov_addr: u64,
+    iov_len: usize,
+    control_addr: u64,
+    control_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct LinuxIovec {
+    base: u64,
+    len: usize,
+}
+
+#[derive(Clone)]
+struct PendingScmRights {
+    descriptions: Vec<Arc<OpenFileDescription>>,
 }
 
 #[derive(Clone, Copy)]
@@ -524,15 +569,28 @@ enum WaitKind {
         len: usize,
         packet_key: u64,
     },
+    MsgRecv {
+        fd: i32,
+        msg_addr: u64,
+        flags: u64,
+        packet_key: u64,
+    },
+    MsgSend {
+        fd: i32,
+        msg_addr: u64,
+        flags: u64,
+        packet_key: u64,
+    },
 }
 
 impl WaitState {
     const fn packet_key(self) -> Option<u64> {
         match self.kind {
             WaitKind::Wait4 { .. } | WaitKind::Futex { .. } | WaitKind::Epoll { .. } => None,
-            WaitKind::FdRead { packet_key, .. } | WaitKind::FdWrite { packet_key, .. } => {
-                Some(packet_key)
-            }
+            WaitKind::FdRead { packet_key, .. }
+            | WaitKind::FdWrite { packet_key, .. }
+            | WaitKind::MsgRecv { packet_key, .. }
+            | WaitKind::MsgSend { packet_key, .. } => Some(packet_key),
         }
     }
 
@@ -542,7 +600,9 @@ impl WaitState {
             WaitKind::Futex { .. }
             | WaitKind::Epoll { .. }
             | WaitKind::FdRead { .. }
-            | WaitKind::FdWrite { .. } => None,
+            | WaitKind::FdWrite { .. }
+            | WaitKind::MsgRecv { .. }
+            | WaitKind::MsgSend { .. } => None,
         }
     }
 
@@ -552,7 +612,9 @@ impl WaitState {
             WaitKind::Futex { .. }
             | WaitKind::Epoll { .. }
             | WaitKind::FdRead { .. }
-            | WaitKind::FdWrite { .. } => None,
+            | WaitKind::FdWrite { .. }
+            | WaitKind::MsgRecv { .. }
+            | WaitKind::MsgSend { .. } => None,
         }
     }
 
@@ -562,7 +624,9 @@ impl WaitState {
             WaitKind::Wait4 { .. }
             | WaitKind::Epoll { .. }
             | WaitKind::FdRead { .. }
-            | WaitKind::FdWrite { .. } => None,
+            | WaitKind::FdWrite { .. }
+            | WaitKind::MsgRecv { .. }
+            | WaitKind::MsgSend { .. } => None,
         }
     }
 
@@ -572,7 +636,9 @@ impl WaitState {
             WaitKind::Wait4 { .. }
             | WaitKind::Futex { .. }
             | WaitKind::FdRead { .. }
-            | WaitKind::FdWrite { .. } => None,
+            | WaitKind::FdWrite { .. }
+            | WaitKind::MsgRecv { .. }
+            | WaitKind::MsgSend { .. } => None,
         }
     }
 }
@@ -641,6 +707,9 @@ struct StarnixKernel {
     epolls: BTreeMap<LinuxFileDescriptionKey, EpollInstance>,
     epoll_packets: BTreeMap<u64, (LinuxFileDescriptionKey, LinuxFileDescriptionKey)>,
     signalfds: BTreeMap<LinuxFileDescriptionKey, Weak<Mutex<SignalFdState>>>,
+    pidfds: BTreeMap<LinuxFileDescriptionKey, Weak<Mutex<PidFdState>>>,
+    unix_socket_peers: BTreeMap<LinuxFileDescriptionKey, LinuxFileDescriptionKey>,
+    unix_socket_rights: BTreeMap<LinuxFileDescriptionKey, VecDeque<PendingScmRights>>,
 }
 
 struct PreparedProcessCarrier {
@@ -1021,6 +1090,94 @@ impl FdOps for SignalFd {
     }
 }
 
+impl PidFd {
+    fn new(target_tgid: i32) -> Result<Self, zx_status_t> {
+        let mut wait_handle = ZX_HANDLE_INVALID;
+        let mut peer_handle = ZX_HANDLE_INVALID;
+        zx_status_result(ax_eventpair_create(0, &mut wait_handle, &mut peer_handle))?;
+        let this = Self {
+            state: Arc::new(Mutex::new(PidFdState {
+                wait_handle,
+                peer_handle,
+                target_tgid,
+                closed: false,
+            })),
+        };
+        if let Err(status) = this.set_ready(false) {
+            let _ = zx_handle_close(wait_handle);
+            let _ = zx_handle_close(peer_handle);
+            return Err(status);
+        }
+        Ok(this)
+    }
+
+    fn snapshot(&self) -> Option<(i32, zx_handle_t)> {
+        let state = self.state.lock();
+        (!state.closed).then_some((state.target_tgid, state.wait_handle))
+    }
+
+    fn set_ready(&self, ready: bool) -> Result<(), zx_status_t> {
+        let state = self.state.lock();
+        if state.closed {
+            return Ok(());
+        }
+        let set_mask = if ready { PIDFD_READABLE_SIGNAL } else { 0 };
+        zx_status_result(ax_object_signal(
+            state.wait_handle,
+            PIDFD_READABLE_SIGNAL,
+            set_mask,
+        ))
+    }
+
+    fn weak_state(&self) -> Weak<Mutex<PidFdState>> {
+        Arc::downgrade(&self.state)
+    }
+}
+
+impl FdOps for PidFd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }
+
+    fn write(&self, _buffer: &[u8]) -> Result<usize, zx_status_t> {
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }
+
+    fn seek(&self, _origin: nexus_io::SeekOrigin, _offset: i64) -> Result<u64, zx_status_t> {
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }
+
+    fn close(&self) -> Result<(), zx_status_t> {
+        if Arc::strong_count(&self.state) != 1 {
+            return Ok(());
+        }
+        let (wait_handle, peer_handle) = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return Ok(());
+            }
+            state.closed = true;
+            (state.wait_handle, state.peer_handle)
+        };
+        let _ = zx_handle_close(peer_handle);
+        let _ = zx_handle_close(wait_handle);
+        Ok(())
+    }
+
+    fn clone_fd(&self, _flags: FdFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
+        Ok(Arc::new(self.clone()))
+    }
+
+    fn wait_interest(&self) -> Option<WaitSpec> {
+        let state = self.state.lock();
+        (!state.closed).then_some(WaitSpec::new(state.wait_handle, PIDFD_READABLE_SIGNAL))
+    }
+}
+
 impl StarnixKernel {
     fn new(
         parent_process: zx_handle_t,
@@ -1045,6 +1202,9 @@ impl StarnixKernel {
             epolls: BTreeMap::new(),
             epoll_packets: BTreeMap::new(),
             signalfds: BTreeMap::new(),
+            pidfds: BTreeMap::new(),
+            unix_socket_peers: BTreeMap::new(),
+            unix_socket_rights: BTreeMap::new(),
         }
     }
 
@@ -1644,8 +1804,11 @@ impl StarnixKernel {
         match stop_state.regs.rax {
             LINUX_SYSCALL_READ => self.sys_read(task_id, stop_state),
             LINUX_SYSCALL_WRITE => self.sys_write(task_id, stop_state, stdout),
+            LINUX_SYSCALL_SENDMSG => self.sys_sendmsg(task_id, stop_state),
+            LINUX_SYSCALL_RECVMSG => self.sys_recvmsg(task_id, stop_state),
             LINUX_SYSCALL_GETPID => self.sys_getpid(task_id, stop_state),
             LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
+            LINUX_SYSCALL_SOCKETPAIR => self.sys_socketpair(task_id, stop_state),
             LINUX_SYSCALL_FUTEX => self.sys_futex(task_id, stop_state),
             LINUX_SYSCALL_SET_ROBUST_LIST => self.sys_set_robust_list(task_id, stop_state),
             LINUX_SYSCALL_GET_ROBUST_LIST => self.sys_get_robust_list(task_id, stop_state),
@@ -1666,6 +1829,8 @@ impl StarnixKernel {
             LINUX_SYSCALL_WAIT4 => self.sys_wait4(task_id, stop_state),
             LINUX_SYSCALL_KILL => self.sys_kill(stop_state),
             LINUX_SYSCALL_TGKILL => self.sys_tgkill(stop_state),
+            LINUX_SYSCALL_PIDFD_SEND_SIGNAL => self.sys_pidfd_send_signal(task_id, stop_state),
+            LINUX_SYSCALL_PIDFD_OPEN => self.sys_pidfd_open(task_id, stop_state),
             _ => {
                 let session = self
                     .tasks
@@ -1863,6 +2028,7 @@ impl StarnixKernel {
             wait_status,
             exit_code,
         };
+        self.refresh_pidfds_for_group(tgid)?;
         self.maybe_wake_parent_waiter(tgid, wait_status)
     }
 
@@ -2074,6 +2240,92 @@ impl StarnixKernel {
             let _ = self.signalfds.remove(&key);
         }
         Ok(())
+    }
+
+    fn refresh_pidfd_key(&mut self, key: LinuxFileDescriptionKey) -> Result<(), zx_status_t> {
+        let Some(weak) = self.pidfds.get(&key).cloned() else {
+            return Ok(());
+        };
+        let Some(state) = weak.upgrade() else {
+            let _ = self.pidfds.remove(&key);
+            return Ok(());
+        };
+        let (target_tgid, wait_handle, closed) = {
+            let guard = state.lock();
+            (guard.target_tgid, guard.wait_handle, guard.closed)
+        };
+        if closed {
+            let _ = self.pidfds.remove(&key);
+            return Ok(());
+        }
+        let ready = self
+            .groups
+            .get(&target_tgid)
+            .is_some_and(|group| !matches!(group.state, ThreadGroupState::Running));
+        zx_status_result(ax_object_signal(
+            wait_handle,
+            PIDFD_READABLE_SIGNAL,
+            if ready { PIDFD_READABLE_SIGNAL } else { 0 },
+        ))
+    }
+
+    fn refresh_pidfds_for_group(&mut self, tgid: i32) -> Result<(), zx_status_t> {
+        let keys = self.pidfds.keys().copied().collect::<Vec<_>>();
+        let mut stale = Vec::new();
+        for key in keys {
+            let Some(weak) = self.pidfds.get(&key).cloned() else {
+                continue;
+            };
+            let Some(state) = weak.upgrade() else {
+                stale.push(key);
+                continue;
+            };
+            let target_tgid = {
+                let guard = state.lock();
+                guard.target_tgid
+            };
+            if target_tgid == tgid {
+                self.refresh_pidfd_key(key)?;
+            }
+        }
+        for key in stale {
+            let _ = self.pidfds.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn lookup_socket_keys(
+        &self,
+        tgid: i32,
+        fd: i32,
+    ) -> Result<(LinuxFileDescriptionKey, LinuxFileDescriptionKey), zx_status_t> {
+        let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+        let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+        let entry = resources.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+        let key = file_description_key(entry.description());
+        let Some(peer_key) = self.unix_socket_peers.get(&key).copied() else {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        };
+        Ok((key, peer_key))
+    }
+
+    fn peek_socket_rights(&self, key: LinuxFileDescriptionKey) -> Option<&PendingScmRights> {
+        self.unix_socket_rights.get(&key).and_then(VecDeque::front)
+    }
+
+    fn take_socket_rights(&mut self, key: LinuxFileDescriptionKey) -> Option<PendingScmRights> {
+        let rights = self
+            .unix_socket_rights
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front);
+        if self
+            .unix_socket_rights
+            .get(&key)
+            .is_some_and(VecDeque::is_empty)
+        {
+            let _ = self.unix_socket_rights.remove(&key);
+        }
+        rights
     }
 
     fn take_signalfd_signal(
@@ -2620,6 +2872,312 @@ impl StarnixKernel {
         }
     }
 
+    fn sys_sendmsg(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let fd = i32::try_from(stop_state.regs.rdi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let msg_addr = stop_state.regs.rsi;
+        let flags = stop_state.regs.rdx;
+        if flags != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let msg = match read_guest_msghdr(session, msg_addr) {
+            Ok(msg) => msg,
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_msg_status_to_errno(status)))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        if msg.name_addr != 0 || msg.name_len != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let iovecs = match read_guest_iovecs(session, msg.iov_addr, msg.iov_len) {
+            Ok(iovecs) => iovecs,
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_msg_status_to_errno(status)))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let payload = match read_guest_iovec_payload(session, &iovecs) {
+            Ok(payload) => payload,
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_msg_status_to_errno(status)))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let (_socket_key, peer_key) = match self.lookup_socket_keys(tgid, fd) {
+            Ok(keys) => keys,
+            Err(ZX_ERR_NOT_SUPPORTED) => {
+                complete_syscall(stop_state, linux_errno(LINUX_ENOTSOCK))?;
+                return Ok(SyscallAction::Resume);
+            }
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+
+        let wait_policy = self.fd_wait_policy_for_op(task_id, fd, FdWaitOp::Write)?;
+        let parsed_rights = {
+            let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            match parse_scm_rights(session, &resources.fd_table, &msg) {
+                Ok(rights) => rights,
+                Err(status) => {
+                    complete_syscall(stop_state, linux_errno(map_msg_status_to_errno(status)))?;
+                    return Ok(SyscallAction::Resume);
+                }
+            }
+        };
+        if parsed_rights
+            .as_ref()
+            .is_some_and(|rights| !rights.descriptions.is_empty() && payload.is_empty())
+        {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let attempt = {
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            match resources.fd_table.write(fd, &payload) {
+                Ok(actual) => WriteAttempt::Ready(actual),
+                Err(ZX_ERR_SHOULD_WAIT) => WriteAttempt::WouldBlock(wait_policy),
+                Err(status) => WriteAttempt::Err(status),
+            }
+        };
+
+        match attempt {
+            WriteAttempt::Ready(actual) => {
+                if actual != 0
+                    && let Some(rights) =
+                        parsed_rights.filter(|rights| !rights.descriptions.is_empty())
+                {
+                    self.unix_socket_rights
+                        .entry(peer_key)
+                        .or_default()
+                        .push_back(rights);
+                }
+                complete_syscall(
+                    stop_state,
+                    u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                )?;
+                Ok(SyscallAction::Resume)
+            }
+            WriteAttempt::WouldBlock(policy) => {
+                if policy.nonblock || policy.wait_interest.is_none() {
+                    complete_syscall(stop_state, linux_errno(LINUX_EAGAIN))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                let packet_key = self.alloc_packet_key()?;
+                let wait = WaitState {
+                    restartable: true,
+                    kind: WaitKind::MsgSend {
+                        fd,
+                        msg_addr,
+                        flags,
+                        packet_key,
+                    },
+                };
+                self.arm_fd_wait(
+                    task_id,
+                    wait,
+                    policy.wait_interest.ok_or(ZX_ERR_BAD_STATE)?,
+                    stop_state,
+                )
+            }
+            WriteAttempt::Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                Ok(SyscallAction::Resume)
+            }
+        }
+    }
+
+    fn sys_recvmsg(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let fd = i32::try_from(stop_state.regs.rdi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let msg_addr = stop_state.regs.rsi;
+        let flags = stop_state.regs.rdx;
+        if flags & !LINUX_MSG_CMSG_CLOEXEC != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let msg = match read_guest_msghdr(session, msg_addr) {
+            Ok(msg) => msg,
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_msg_status_to_errno(status)))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        if msg.name_addr != 0 || msg.name_len != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let iovecs = match read_guest_iovecs(session, msg.iov_addr, msg.iov_len) {
+            Ok(iovecs) => iovecs,
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_msg_status_to_errno(status)))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let total_len = total_iovec_len(&iovecs).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let (socket_key, _) = match self.lookup_socket_keys(tgid, fd) {
+            Ok(keys) => keys,
+            Err(ZX_ERR_NOT_SUPPORTED) => {
+                complete_syscall(stop_state, linux_errno(LINUX_ENOTSOCK))?;
+                return Ok(SyscallAction::Resume);
+            }
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        if let Some(rights) = self.peek_socket_rights(socket_key) {
+            let required = scm_rights_control_bytes(rights.descriptions.len())?;
+            if msg.control_len < required {
+                complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+                return Ok(SyscallAction::Resume);
+            }
+        }
+
+        let wait_policy = self.fd_wait_policy_for_op(task_id, fd, FdWaitOp::Read)?;
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(total_len)
+            .map_err(|_| ZX_ERR_NO_MEMORY)?;
+        payload.resize(total_len, 0);
+        let attempt = {
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            match resources.fd_table.read(fd, &mut payload) {
+                Ok(actual) => ReadAttempt::Ready {
+                    bytes: payload,
+                    actual,
+                },
+                Err(ZX_ERR_SHOULD_WAIT) => ReadAttempt::WouldBlock(wait_policy),
+                Err(ZX_ERR_PEER_CLOSED) => ReadAttempt::Ready {
+                    bytes: payload,
+                    actual: 0,
+                },
+                Err(status) => ReadAttempt::Err(status),
+            }
+        };
+
+        match attempt {
+            ReadAttempt::Ready { bytes, actual } => {
+                let rights_bundle = if actual != 0 {
+                    self.peek_socket_rights(socket_key).cloned()
+                } else {
+                    None
+                };
+                let received_flags = if (flags & LINUX_MSG_CMSG_CLOEXEC) != 0 {
+                    FdFlags::CLOEXEC
+                } else {
+                    FdFlags::empty()
+                };
+                let mut installed_fds = Vec::new();
+                let control_bytes = if let Some(rights) = rights_bundle.as_ref() {
+                    let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                    let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+                    installed_fds
+                        .try_reserve_exact(rights.descriptions.len())
+                        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+                    for description in &rights.descriptions {
+                        installed_fds.push(
+                            resources
+                                .fd_table
+                                .install(Arc::clone(description), received_flags),
+                        );
+                    }
+                    Some(encode_scm_rights_control(&installed_fds)?)
+                } else {
+                    None
+                };
+                let guest_result = (|| -> Result<u64, zx_status_t> {
+                    let wrote = write_guest_iovec_payload(session, &iovecs, &bytes[..actual])?;
+                    if wrote != actual {
+                        return Err(ZX_ERR_IO_DATA_INTEGRITY);
+                    }
+                    if let Some(control) = control_bytes.as_ref() {
+                        write_guest_bytes(session, msg.control_addr, control)?;
+                        write_guest_recv_msghdr(session, msg_addr, control.len(), 0)?;
+                    } else {
+                        write_guest_recv_msghdr(session, msg_addr, 0, 0)?;
+                    }
+                    u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)
+                })();
+                match guest_result {
+                    Ok(result) => {
+                        if rights_bundle.is_some() {
+                            let _ = self.take_socket_rights(socket_key);
+                        }
+                        complete_syscall(stop_state, result)?;
+                    }
+                    Err(status) => {
+                        if let Some(group) = self.groups.get_mut(&tgid)
+                            && let Some(resources) = group.resources.as_mut()
+                        {
+                            for fd in installed_fds {
+                                let _ = resources.fd_table.close(fd);
+                            }
+                        }
+                        complete_syscall(stop_state, linux_errno(map_msg_status_to_errno(status)))?;
+                    }
+                }
+                Ok(SyscallAction::Resume)
+            }
+            ReadAttempt::WouldBlock(policy) => {
+                if policy.nonblock || policy.wait_interest.is_none() {
+                    complete_syscall(stop_state, linux_errno(LINUX_EAGAIN))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                let packet_key = self.alloc_packet_key()?;
+                let wait = WaitState {
+                    restartable: true,
+                    kind: WaitKind::MsgRecv {
+                        fd,
+                        msg_addr,
+                        flags,
+                        packet_key,
+                    },
+                };
+                self.arm_fd_wait(
+                    task_id,
+                    wait,
+                    policy.wait_interest.ok_or(ZX_ERR_BAD_STATE)?,
+                    stop_state,
+                )
+            }
+            ReadAttempt::Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                Ok(SyscallAction::Resume)
+            }
+        }
+    }
+
     fn retry_waiting_task(
         &mut self,
         task_id: i32,
@@ -2657,6 +3215,34 @@ impl StarnixKernel {
                     let action = self.sys_write(task_id, &mut stop_state, stdout)?;
                     self.complete_task_action(task_id, action, &mut stop_state)
                 }
+                WaitKind::MsgRecv {
+                    fd,
+                    msg_addr,
+                    flags,
+                    ..
+                } => {
+                    self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
+                        TaskState::Running;
+                    stop_state.regs.rdi = fd as u64;
+                    stop_state.regs.rsi = msg_addr;
+                    stop_state.regs.rdx = flags;
+                    let action = self.sys_recvmsg(task_id, &mut stop_state)?;
+                    self.complete_task_action(task_id, action, &mut stop_state)
+                }
+                WaitKind::MsgSend {
+                    fd,
+                    msg_addr,
+                    flags,
+                    ..
+                } => {
+                    self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
+                        TaskState::Running;
+                    stop_state.regs.rdi = fd as u64;
+                    stop_state.regs.rsi = msg_addr;
+                    stop_state.regs.rdx = flags;
+                    let action = self.sys_sendmsg(task_id, &mut stop_state)?;
+                    self.complete_task_action(task_id, action, &mut stop_state)
+                }
             },
             SyscallAction::GroupSignalExit(signal) => self.exit_group_from_signal(task_id, signal),
             SyscallAction::TaskExit(_) | SyscallAction::GroupExit(_) => Err(ZX_ERR_BAD_STATE),
@@ -2679,6 +3265,189 @@ impl StarnixKernel {
         stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
         complete_syscall(stop_state, task_id as u64)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_socketpair(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let domain = stop_state.regs.rdi;
+        let socket_type = stop_state.regs.rsi;
+        let protocol = stop_state.regs.rdx;
+        let pair_addr = stop_state.regs.r10;
+        if domain != LINUX_AF_UNIX || socket_type != LINUX_SOCK_STREAM || protocol != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+
+        let mut left = ZX_HANDLE_INVALID;
+        let mut right = ZX_HANDLE_INVALID;
+        let status = zx_socket_create(0, &mut left, &mut right);
+        if status != ZX_OK {
+            complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let created = {
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            let left_fd = resources.fd_table.open(
+                Arc::new(SocketFd::new(left)),
+                OpenFlags::READABLE | OpenFlags::WRITABLE,
+                FdFlags::empty(),
+            );
+            let right_fd = resources.fd_table.open(
+                Arc::new(SocketFd::new(right)),
+                OpenFlags::READABLE | OpenFlags::WRITABLE,
+                FdFlags::empty(),
+            );
+            match (left_fd, right_fd) {
+                (Ok(left_fd), Ok(right_fd)) => {
+                    let left_key = resources
+                        .fd_table
+                        .get(left_fd)
+                        .map(|entry| file_description_key(entry.description()))
+                        .ok_or(ZX_ERR_BAD_STATE)?;
+                    let right_key = resources
+                        .fd_table
+                        .get(right_fd)
+                        .map(|entry| file_description_key(entry.description()))
+                        .ok_or(ZX_ERR_BAD_STATE)?;
+                    Ok((left_fd, right_fd, left_key, right_key))
+                }
+                (Ok(left_fd), Err(status)) => {
+                    let _ = resources.fd_table.close(left_fd);
+                    Err(status)
+                }
+                (Err(status), _) => Err(status),
+            }
+        };
+
+        match created {
+            Ok((left_fd, right_fd, left_key, right_key)) => {
+                if let Err(status) = write_guest_fd_pair(session, pair_addr, left_fd, right_fd) {
+                    if let Some(group) = self.groups.get_mut(&tgid)
+                        && let Some(resources) = group.resources.as_mut()
+                    {
+                        let _ = resources.fd_table.close(left_fd);
+                        let _ = resources.fd_table.close(right_fd);
+                    }
+                    complete_syscall(
+                        stop_state,
+                        linux_errno(map_guest_write_status_to_errno(status)),
+                    )?;
+                    return Ok(SyscallAction::Resume);
+                }
+                self.unix_socket_peers.insert(left_key, right_key);
+                self.unix_socket_peers.insert(right_key, left_key);
+                complete_syscall(stop_state, 0)?;
+            }
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+            }
+        }
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_pidfd_open(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let target_tgid = i32::try_from(stop_state.regs.rdi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let flags = stop_state.regs.rsi;
+        if flags != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        if !self.groups.contains_key(&target_tgid) {
+            complete_syscall(stop_state, linux_errno(LINUX_ESRCH))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let pidfd = match PidFd::new(target_tgid) {
+            Ok(pidfd) => pidfd,
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let weak = pidfd.weak_state();
+        let created_fd = {
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            resources
+                .fd_table
+                .open(Arc::new(pidfd), OpenFlags::READABLE, FdFlags::empty())
+        };
+        match created_fd {
+            Ok(fd) => {
+                let key = {
+                    let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                    let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+                    let entry = resources.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+                    file_description_key(entry.description())
+                };
+                self.pidfds.insert(key, weak);
+                self.refresh_pidfd_key(key)?;
+                complete_syscall(stop_state, fd as u64)?;
+            }
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+            }
+        }
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_pidfd_send_signal(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let pidfd = i32::try_from(stop_state.regs.rdi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let signal = i32::try_from(stop_state.regs.rsi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let info = stop_state.regs.rdx;
+        let flags = stop_state.regs.r10;
+        if info != 0 || flags != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let target_tgid = {
+            let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+            let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            let fd_entry = resources.fd_table.get(pidfd).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let Some(pidfd) = fd_entry
+                .description()
+                .ops()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<PidFd>()
+            else {
+                complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+                return Ok(SyscallAction::Resume);
+            };
+            pidfd.snapshot().map(|(target_tgid, _)| target_tgid)
+        };
+        let Some(target_tgid) = target_tgid else {
+            complete_syscall(stop_state, linux_errno(LINUX_EBADF))?;
+            return Ok(SyscallAction::Resume);
+        };
+        let result = self.queue_signal_to_group(target_tgid, signal)?;
+        self.service_pending_waiters()?;
+        complete_syscall(stop_state, result)?;
         Ok(SyscallAction::Resume)
     }
 
@@ -4193,17 +4962,6 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
     result
 }
 
-fn supervise_guest(
-    _process: zx_handle_t,
-    _root_vmar: zx_handle_t,
-    _session: zx_handle_t,
-    _port: zx_handle_t,
-    _sidecar: zx_handle_t,
-    _stdout_handle: Option<zx_handle_t>,
-) -> i32 {
-    map_status_to_return_code(ZX_ERR_NOT_SUPPORTED)
-}
-
 fn emulate_common_syscall(
     session: zx_handle_t,
     stop_state: &mut ax_guest_stop_state_t,
@@ -4375,6 +5133,8 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BYTES),
         Some("linux-round6-signalfd-smoke") => Some(LINUX_ROUND6_SIGNALFD_BYTES),
         Some("linux-round6-futex-smoke") => Some(LINUX_ROUND6_FUTEX_BYTES),
+        Some("linux-round6-scm-rights-smoke") => Some(LINUX_ROUND6_SCM_RIGHTS_BYTES),
+        Some("linux-round6-pidfd-smoke") => Some(LINUX_ROUND6_PIDFD_BYTES),
         Some(_) => None,
     }
 }
@@ -4392,6 +5152,8 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BINARY_PATH),
         Some("linux-round6-signalfd-smoke") => Some(LINUX_ROUND6_SIGNALFD_BINARY_PATH),
         Some("linux-round6-futex-smoke") => Some(LINUX_ROUND6_FUTEX_BINARY_PATH),
+        Some("linux-round6-scm-rights-smoke") => Some(LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH),
+        Some("linux-round6-pidfd-smoke") => Some(LINUX_ROUND6_PIDFD_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -4445,8 +5207,6 @@ fn build_task_image(
     }
     Ok(TaskImage {
         path: String::from(path),
-        args: args.to_vec(),
-        env: env.to_vec(),
         exec_blob,
         writable_ranges,
     })
@@ -4516,8 +5276,6 @@ fn parse_elf(bytes: &[u8]) -> Result<LinuxElf<'_>, zx_status_t> {
                 vaddr: p_vaddr,
                 mem_size: p_memsz,
                 flags: read_u32(bytes, base + 4)?,
-                file_offset: p_offset,
-                file_size: p_filesz,
             });
         }
     }
@@ -4530,7 +5288,7 @@ fn parse_elf(bytes: &[u8]) -> Result<LinuxElf<'_>, zx_status_t> {
         phent: phentsize,
         phnum,
         segments,
-        bytes,
+        _bytes: bytes,
     })
 }
 
@@ -4662,6 +5420,204 @@ fn read_guest_u32(session: zx_handle_t, addr: u64) -> Result<u32, zx_status_t> {
     ))
 }
 
+fn read_guest_msghdr(session: zx_handle_t, addr: u64) -> Result<LinuxMsgHdr, zx_status_t> {
+    let bytes = read_guest_bytes(session, addr, LINUX_MSGHDR_BYTES)?;
+    let name_addr = u64::from_ne_bytes(
+        bytes[0..8]
+            .try_into()
+            .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    );
+    let name_len = u32::from_ne_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    );
+    let iov_addr = u64::from_ne_bytes(
+        bytes[16..24]
+            .try_into()
+            .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    );
+    let iov_len = usize::try_from(u64::from_ne_bytes(
+        bytes[24..32]
+            .try_into()
+            .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    ))
+    .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let control_addr = u64::from_ne_bytes(
+        bytes[32..40]
+            .try_into()
+            .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    );
+    let control_len = usize::try_from(u64::from_ne_bytes(
+        bytes[40..48]
+            .try_into()
+            .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    ))
+    .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let _flags = u32::from_ne_bytes(
+        bytes[48..52]
+            .try_into()
+            .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    );
+    Ok(LinuxMsgHdr {
+        name_addr,
+        name_len,
+        iov_addr,
+        iov_len,
+        control_addr,
+        control_len,
+    })
+}
+
+fn read_guest_iovecs(
+    session: zx_handle_t,
+    addr: u64,
+    count: usize,
+) -> Result<Vec<LinuxIovec>, zx_status_t> {
+    if count > LINUX_IOV_MAX {
+        return Err(ZX_ERR_IO_DATA_INTEGRITY);
+    }
+    let mut iovecs = Vec::new();
+    iovecs
+        .try_reserve_exact(count)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    for index in 0..count {
+        let base = addr
+            .checked_add(
+                u64::try_from(
+                    index
+                        .checked_mul(LINUX_IOVEC_BYTES)
+                        .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+                )
+                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+            )
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let bytes = read_guest_bytes(session, base, LINUX_IOVEC_BYTES)?;
+        iovecs.push(LinuxIovec {
+            base: u64::from_ne_bytes(
+                bytes[0..8]
+                    .try_into()
+                    .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+            ),
+            len: usize::try_from(u64::from_ne_bytes(
+                bytes[8..16]
+                    .try_into()
+                    .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+            ))
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+        });
+    }
+    Ok(iovecs)
+}
+
+fn total_iovec_len(iovecs: &[LinuxIovec]) -> Option<usize> {
+    iovecs
+        .iter()
+        .try_fold(0usize, |total, iovec| total.checked_add(iovec.len))
+}
+
+fn read_guest_iovec_payload(
+    session: zx_handle_t,
+    iovecs: &[LinuxIovec],
+) -> Result<Vec<u8>, zx_status_t> {
+    let total_len = total_iovec_len(iovecs).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(total_len)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    for iovec in iovecs {
+        if iovec.len == 0 {
+            continue;
+        }
+        let bytes = read_guest_bytes(session, iovec.base, iovec.len)?;
+        payload.extend_from_slice(&bytes);
+    }
+    Ok(payload)
+}
+
+fn write_guest_iovec_payload(
+    session: zx_handle_t,
+    iovecs: &[LinuxIovec],
+    payload: &[u8],
+) -> Result<usize, zx_status_t> {
+    let mut written = 0usize;
+    for iovec in iovecs {
+        if written >= payload.len() {
+            break;
+        }
+        let chunk_len = (payload.len() - written).min(iovec.len);
+        if chunk_len == 0 {
+            continue;
+        }
+        write_guest_bytes(session, iovec.base, &payload[written..written + chunk_len])?;
+        written = written.checked_add(chunk_len).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    }
+    Ok(written)
+}
+
+fn parse_scm_rights(
+    session: zx_handle_t,
+    fd_table: &FdTable,
+    msg: &LinuxMsgHdr,
+) -> Result<Option<PendingScmRights>, zx_status_t> {
+    if msg.control_addr == 0 || msg.control_len == 0 {
+        return Ok(None);
+    }
+    let control = read_guest_bytes(session, msg.control_addr, msg.control_len)?;
+    let mut offset = 0usize;
+    let mut descriptions = Vec::new();
+    while offset
+        .checked_add(LINUX_CMSGHDR_BYTES)
+        .is_some_and(|end| end <= control.len())
+    {
+        let len = usize::try_from(u64::from_ne_bytes(
+            control[offset..offset + 8]
+                .try_into()
+                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+        ))
+        .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let level = i32::from_ne_bytes(
+            control[offset + 8..offset + 12]
+                .try_into()
+                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+        );
+        let kind = i32::from_ne_bytes(
+            control[offset + 12..offset + 16]
+                .try_into()
+                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+        );
+        if len < LINUX_CMSGHDR_BYTES {
+            return Err(ZX_ERR_IO_DATA_INTEGRITY);
+        }
+        let end = offset.checked_add(len).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        if end > control.len() {
+            return Err(ZX_ERR_IO_DATA_INTEGRITY);
+        }
+        if level == LINUX_SOL_SOCKET && kind == LINUX_SCM_RIGHTS {
+            let data = &control[offset + LINUX_CMSGHDR_BYTES..end];
+            if !data.len().is_multiple_of(4) {
+                return Err(ZX_ERR_IO_DATA_INTEGRITY);
+            }
+            descriptions
+                .try_reserve_exact(data.len() / 4)
+                .map_err(|_| ZX_ERR_NO_MEMORY)?;
+            for raw_fd in data.chunks_exact(4) {
+                let fd =
+                    i32::from_ne_bytes(raw_fd.try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?);
+                let entry = fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+                descriptions.push(Arc::clone(entry.description()));
+            }
+        }
+        let step = align_up(len, 8)?;
+        offset = offset.checked_add(step).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    }
+    if descriptions.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PendingScmRights { descriptions }))
+    }
+}
+
 fn write_guest_u32(session: zx_handle_t, addr: u64, value: u32) -> Result<(), zx_status_t> {
     write_guest_bytes(session, addr, &value.to_ne_bytes())
 }
@@ -4669,6 +5625,54 @@ fn write_guest_u32(session: zx_handle_t, addr: u64, value: u32) -> Result<(), zx
 fn write_guest_bytes(session: zx_handle_t, addr: u64, bytes: &[u8]) -> Result<(), zx_status_t> {
     let status = ax_guest_session_write_memory(session, addr, bytes);
     if status == ZX_OK { Ok(()) } else { Err(status) }
+}
+
+fn write_guest_recv_msghdr(
+    session: zx_handle_t,
+    msg_addr: u64,
+    control_len: usize,
+    flags: u32,
+) -> Result<(), zx_status_t> {
+    write_guest_u32(session, msg_addr + 8, 0)?;
+    write_guest_u64(
+        session,
+        msg_addr + 40,
+        u64::try_from(control_len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+    )?;
+    write_guest_u32(session, msg_addr + 48, flags)?;
+    Ok(())
+}
+
+fn scm_rights_control_bytes(fd_count: usize) -> Result<usize, zx_status_t> {
+    let raw_len = LINUX_CMSGHDR_BYTES
+        .checked_add(fd_count.checked_mul(4).ok_or(ZX_ERR_OUT_OF_RANGE)?)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    align_up(raw_len, 8)
+}
+
+fn encode_scm_rights_control(fds: &[i32]) -> Result<Vec<u8>, zx_status_t> {
+    let raw_len = LINUX_CMSGHDR_BYTES
+        .checked_add(fds.len().checked_mul(4).ok_or(ZX_ERR_OUT_OF_RANGE)?)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    let total_len = scm_rights_control_bytes(fds.len())?;
+    let mut control = Vec::new();
+    control
+        .try_reserve_exact(total_len)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    control.resize(total_len, 0);
+    control[0..8].copy_from_slice(
+        &u64::try_from(raw_len)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?
+            .to_ne_bytes(),
+    );
+    control[8..12].copy_from_slice(&LINUX_SOL_SOCKET.to_ne_bytes());
+    control[12..16].copy_from_slice(&LINUX_SCM_RIGHTS.to_ne_bytes());
+    let mut cursor = LINUX_CMSGHDR_BYTES;
+    for fd in fds {
+        control[cursor..cursor + 4].copy_from_slice(&fd.to_ne_bytes());
+        cursor += 4;
+    }
+    Ok(control)
 }
 
 fn copy_guest_region(
@@ -4901,6 +5905,7 @@ fn map_wait_signals_to_epoll(signals: u32) -> u32 {
             | ZX_SOCKET_READABLE
             | EVENTFD_READABLE_SIGNAL
             | SIGNALFD_READABLE_SIGNAL
+            | PIDFD_READABLE_SIGNAL
             | ZX_TIMER_SIGNALED))
         != 0
     {
@@ -5104,6 +6109,16 @@ fn map_fd_status_to_errno(status: zx_status_t) -> i32 {
         ZX_ERR_PEER_CLOSED => LINUX_EPIPE,
         ZX_ERR_SHOULD_WAIT => LINUX_EAGAIN,
         _ => LINUX_EBADF,
+    }
+}
+
+fn map_msg_status_to_errno(status: zx_status_t) -> i32 {
+    match status {
+        ZX_ERR_BAD_HANDLE => LINUX_EBADF,
+        ZX_ERR_INVALID_ARGS | ZX_ERR_OUT_OF_RANGE => LINUX_EFAULT,
+        ZX_ERR_IO_DATA_INTEGRITY | ZX_ERR_NOT_SUPPORTED | ZX_ERR_BAD_STATE => LINUX_EINVAL,
+        ZX_ERR_NO_MEMORY | ZX_ERR_INTERNAL => LINUX_ENOMEM,
+        _ => LINUX_EINVAL,
     }
 }
 
@@ -5550,7 +6565,7 @@ impl LinuxMm {
                     zx_status_result(zx_vmar_map_local(
                         mmap_vmar,
                         map_linux_prot_to_vm_options(entry.prot)
-                            .map_err(|errno| linux_status_from_errno(errno))?
+                            .map_err(linux_status_from_errno)?
                             | ZX_VM_SPECIFIC,
                         entry
                             .base
@@ -5583,7 +6598,7 @@ impl LinuxMm {
                     zx_status_result(zx_vmar_map_local(
                         mmap_vmar,
                         map_linux_prot_to_vm_options(entry.prot)
-                            .map_err(|errno| linux_status_from_errno(errno))?
+                            .map_err(linux_status_from_errno)?
                             | ZX_VM_SPECIFIC,
                         entry
                             .base
@@ -5671,6 +6686,7 @@ impl LinuxMm {
         requested
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn mmap(
         &mut self,
         fd_table: &FdTable,
@@ -5711,7 +6727,7 @@ impl LinuxMm {
                 return Ok(linux_errno(map_vm_status_to_errno(status)));
             }
         } else {
-            if offset % USER_PAGE_BYTES != 0 {
+            if !offset.is_multiple_of(USER_PAGE_BYTES) {
                 return Ok(linux_errno(LINUX_EINVAL));
             }
             if (prot & LINUX_PROT_WRITE) != 0 {
@@ -5760,7 +6776,7 @@ impl LinuxMm {
     }
 
     fn munmap(&mut self, addr: u64, len: u64) -> Result<u64, zx_status_t> {
-        if addr % USER_PAGE_BYTES != 0 || len == 0 {
+        if !addr.is_multiple_of(USER_PAGE_BYTES) || len == 0 {
             return Ok(linux_errno(LINUX_EINVAL));
         }
         let Some(aligned_len) = align_up_u64(len, USER_PAGE_BYTES) else {
@@ -5820,7 +6836,7 @@ impl LinuxMm {
     }
 
     fn mprotect(&mut self, addr: u64, len: u64, prot: u64) -> Result<u64, zx_status_t> {
-        if addr % USER_PAGE_BYTES != 0 || len == 0 {
+        if !addr.is_multiple_of(USER_PAGE_BYTES) || len == 0 {
             return Ok(linux_errno(LINUX_EINVAL));
         }
         let Some(aligned_len) = align_up_u64(len, USER_PAGE_BYTES) else {
@@ -6010,6 +7026,18 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND6_FUTEX_BYTES,
         ));
     }
+    if !LINUX_ROUND6_SCM_RIGHTS_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH,
+            LINUX_ROUND6_SCM_RIGHTS_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_PIDFD_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_PIDFD_BINARY_PATH,
+            LINUX_ROUND6_PIDFD_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -6076,6 +7104,18 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND6_FUTEX_DECL_BYTES,
         ));
     }
+    if !LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-scm-rights-smoke.nxcd",
+            LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_PIDFD_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-pidfd-smoke.nxcd",
+            LINUX_ROUND6_PIDFD_DECL_BYTES,
+        ));
+    }
     let bootstrap = BootstrapNamespace::build(&assets)?;
     let mut mounts = bootstrap.namespace().mounts().clone();
     mounts.insert("/", bootstrap.boot_root())?;
@@ -6114,6 +7154,12 @@ fn stat_metadata_for_ops(ops: &dyn FdOps) -> Result<LinuxStatMetadata, zx_status
         });
     }
     if ops.as_any().is::<SignalFd>() {
+        return Ok(LinuxStatMetadata {
+            mode: LINUX_S_IFREG | 0o444,
+            size_bytes: 0,
+        });
+    }
+    if ops.as_any().is::<PidFd>() {
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFREG | 0o444,
             size_bytes: 0,
@@ -6549,7 +7595,7 @@ fn zx_vmar_allocate_local(
     axle_arch_x86_64::int80_syscall(
         AXLE_SYS_VMAR_ALLOCATE as u64,
         [
-            parent_vmar as u64,
+            parent_vmar,
             options as u64,
             offset,
             size,
@@ -6571,10 +7617,10 @@ fn zx_vmar_map_local(
     axle_arch_x86_64::int80_syscall8(
         AXLE_SYS_VMAR_MAP as u64,
         [
-            vmar as u64,
+            vmar,
             options as u64,
             vmar_offset,
-            vmo as u64,
+            vmo,
             vmo_offset,
             len,
             mapped_addr as *mut u64 as u64,
@@ -6584,15 +7630,12 @@ fn zx_vmar_map_local(
 }
 
 fn zx_vmar_unmap_local(vmar: zx_handle_t, addr: u64, len: u64) -> zx_status_t {
-    axle_arch_x86_64::int80_syscall(
-        AXLE_SYS_VMAR_UNMAP as u64,
-        [vmar as u64, addr, len, 0, 0, 0],
-    )
+    axle_arch_x86_64::int80_syscall(AXLE_SYS_VMAR_UNMAP as u64, [vmar, addr, len, 0, 0, 0])
 }
 
 fn zx_vmar_protect_local(vmar: zx_handle_t, options: u32, addr: u64, len: u64) -> zx_status_t {
     axle_arch_x86_64::int80_syscall(
         AXLE_SYS_VMAR_PROTECT as u64,
-        [vmar as u64, options as u64, addr, len, 0, 0],
+        [vmar, options as u64, addr, len, 0, 0],
     )
 }

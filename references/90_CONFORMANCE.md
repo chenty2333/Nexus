@@ -155,6 +155,23 @@ Main just targets include:
   - owner-died marking on thread exit for one private robust futex word
   - the current bootstrap gate still excludes timeout, shared-futex identity,
     and PI robust-futex policy
+- The fifth Round-6 Starnix long-tail scenario now closes one narrow SCM_RIGHTS
+  slice:
+  - `sendmsg`
+  - `recvmsg`
+  - one `SCM_RIGHTS` control message carrying one shared open-file description
+    over a tracked `AF_UNIX` `SOCK_STREAM` socketpair
+  - the current bootstrap gate intentionally keeps ancillary parsing narrow:
+    one rights cmsg, no `msg_name`, and no broader UNIX datagram/seqpacket
+    coverage yet
+- The sixth Round-6 Starnix long-tail scenario now closes one narrow pidfd
+  slice:
+  - `pidfd_open`
+  - `pidfd_send_signal`
+  - pidfd readability after the target thread group leaves the running state
+  - the current bootstrap gate intentionally keeps the pidfd object synthetic in
+    the executive and excludes `waitid(P_PIDFD)` plus broader pidfd lifecycle
+    features
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

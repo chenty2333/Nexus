@@ -86,6 +86,15 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - `get_robust_list`
   - best-effort robust-list owner-died marking plus wake-on-thread-exit for
     private futex words owned by the exiting task
+  - `sendmsg`
+  - `recvmsg`
+  - one narrow `SCM_RIGHTS` slice over tracked `AF_UNIX` `SOCK_STREAM`
+    socketpairs, with Linux file-description semantics remaining in the
+    executive while the transferred backend objects still ride Axle transport
+  - `pidfd_open`
+  - `pidfd_send_signal`
+  - one synthetic pidfd object with readable state derived from thread-group
+    zombie/exit transitions rather than from a new kernel pidfd object family
 
 ## Frozen architectural split
 

@@ -716,7 +716,7 @@ fn duplicate_handle(handle: zx_handle_t, rights: zx_rights_t) -> Result<zx_handl
     let status = axle_arch_x86_64::int80_syscall(
         AXLE_SYS_HANDLE_DUPLICATE as u64,
         [
-            handle as u64,
+            handle,
             rights as u64,
             &mut duplicate as *mut zx_handle_t as u64,
             0,
@@ -744,14 +744,7 @@ fn create_vmo_with_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
     if !bytes.is_empty() {
         let status = axle_arch_x86_64::int80_syscall(
             AXLE_SYS_VMO_WRITE as u64,
-            [
-                handle as u64,
-                bytes.as_ptr() as u64,
-                0,
-                bytes.len() as u64,
-                0,
-                0,
-            ],
+            [handle, bytes.as_ptr() as u64, 0, bytes.len() as u64, 0, 0],
         );
         if status != ZX_OK {
             let _ = zx_handle_close(handle);
