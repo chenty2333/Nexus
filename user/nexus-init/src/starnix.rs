@@ -13,12 +13,13 @@ use axle_types::rights::ZX_RIGHT_SAME_RIGHTS;
 use axle_types::signals::{
     AX_USER_SIGNAL_0, AX_USER_SIGNAL_1, ZX_CHANNEL_PEER_CLOSED, ZX_CHANNEL_READABLE,
     ZX_CHANNEL_WRITABLE, ZX_SOCKET_PEER_CLOSED, ZX_SOCKET_READABLE, ZX_SOCKET_WRITABLE,
+    ZX_TIMER_SIGNALED,
 };
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_PATH,
     ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_IO_DATA_INTEGRITY,
     ZX_ERR_NO_MEMORY, ZX_ERR_NOT_DIR, ZX_ERR_NOT_FILE, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
-    ZX_ERR_OUT_OF_RANGE, ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_OK,
+    ZX_ERR_OUT_OF_RANGE, ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_OK,
 };
 use axle_types::syscall_numbers::{
     AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
@@ -42,7 +43,7 @@ use libax::{
     ax_process_create as zx_process_create, ax_process_prepare_linux_exec, ax_process_start_guest,
     ax_socket_create as zx_socket_create, ax_status_result as zx_status_result,
     ax_task_kill as zx_task_kill, ax_thread_create as zx_thread_create, ax_thread_start_guest,
-    ax_vmo_create as zx_vmo_create,
+    ax_timer_cancel, ax_timer_create_monotonic, ax_timer_set, ax_vmo_create as zx_vmo_create,
 };
 use nexus_component::{ComponentStartInfo, NumberedHandle};
 use nexus_io::{
@@ -61,7 +62,8 @@ use crate::{
     LINUX_ROUND4_FUTEX_DECL_BYTES, LINUX_ROUND4_SIGNAL_BINARY_PATH, LINUX_ROUND4_SIGNAL_BYTES,
     LINUX_ROUND4_SIGNAL_DECL_BYTES, LINUX_ROUND5_EPOLL_BINARY_PATH, LINUX_ROUND5_EPOLL_BYTES,
     LINUX_ROUND5_EPOLL_DECL_BYTES, LINUX_ROUND6_EVENTFD_BINARY_PATH, LINUX_ROUND6_EVENTFD_BYTES,
-    LINUX_ROUND6_EVENTFD_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
+    LINUX_ROUND6_EVENTFD_DECL_BYTES, LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES,
+    LINUX_ROUND6_TIMERFD_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
     STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
     STARTUP_HANDLE_STARNIX_STDOUT,
 };
@@ -99,6 +101,9 @@ const LINUX_SYSCALL_FORK: u64 = 57;
 const LINUX_SYSCALL_EXECVE: u64 = 59;
 const LINUX_SYSCALL_WAIT4: u64 = 61;
 const LINUX_SYSCALL_KILL: u64 = 62;
+const LINUX_SYSCALL_TIMERFD_CREATE: u64 = 283;
+const LINUX_SYSCALL_TIMERFD_SETTIME: u64 = 286;
+const LINUX_SYSCALL_TIMERFD_GETTIME: u64 = 287;
 const LINUX_SYSCALL_EVENTFD2: u64 = 290;
 const LINUX_SYSCALL_EPOLL_WAIT: u64 = 232;
 const LINUX_SYSCALL_EPOLL_CTL: u64 = 233;
@@ -159,7 +164,14 @@ const LINUX_EPOLL_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 const LINUX_EFD_SEMAPHORE: u64 = 0x1;
 const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_EFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_TFD_TIMER_ABSTIME: u64 = 0x1;
+const LINUX_TFD_TIMER_CANCEL_ON_SET: u64 = 0x2;
+const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
+const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_CLOCK_MONOTONIC: i32 = 1;
 const LINUX_EPOLL_EVENT_BYTES: usize = 12;
+const LINUX_TIMESPEC_BYTES: usize = 16;
+const LINUX_ITIMERSPEC_BYTES: usize = 32;
 const LINUX_DT_UNKNOWN: u8 = 0;
 const LINUX_DT_DIR: u8 = 4;
 const LINUX_DT_REG: u8 = 8;
@@ -406,12 +418,30 @@ struct EventFd {
     state: Arc<Mutex<EventFdState>>,
 }
 
+#[derive(Clone)]
+struct TimerFd {
+    state: Arc<Mutex<TimerFdState>>,
+}
+
 struct EventFdState {
     wait_handle: zx_handle_t,
     peer_handle: zx_handle_t,
     counter: u64,
     semaphore: bool,
     closed: bool,
+}
+
+struct TimerFdState {
+    timer_handle: zx_handle_t,
+    armed_deadline_ns: Option<u64>,
+    pending_expirations: u64,
+    closed: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LinuxItimerSpec {
+    interval_ns: u64,
+    value_ns: u64,
 }
 
 enum TaskState {
@@ -731,6 +761,123 @@ impl FdOps for EventFd {
     fn wait_interest(&self) -> Option<WaitSpec> {
         let state = self.state.lock();
         (!state.closed).then_some(WaitSpec::new(state.wait_handle, EVENTFD_SIGNAL_MASK))
+    }
+}
+
+impl TimerFd {
+    fn new() -> Result<Self, zx_status_t> {
+        let mut timer_handle = ZX_HANDLE_INVALID;
+        zx_status_result(ax_timer_create_monotonic(0, &mut timer_handle))?;
+        Ok(Self {
+            state: Arc::new(Mutex::new(TimerFdState {
+                timer_handle,
+                armed_deadline_ns: None,
+                pending_expirations: 0,
+                closed: false,
+            })),
+        })
+    }
+
+    fn sample_expiration_locked(state: &mut TimerFdState) -> Result<(), zx_status_t> {
+        if state.closed || state.pending_expirations != 0 {
+            return Ok(());
+        }
+        let mut observed = 0;
+        match ax_object_wait_one(state.timer_handle, ZX_TIMER_SIGNALED, 0, &mut observed) {
+            ZX_OK => {
+                state.armed_deadline_ns = None;
+                state.pending_expirations = 1;
+                Ok(())
+            }
+            ZX_ERR_TIMED_OUT => Ok(()),
+            status => Err(status),
+        }
+    }
+
+    fn settime(&self, flags: u64, new_value: LinuxItimerSpec) -> Result<(), zx_status_t> {
+        if (flags & LINUX_TFD_TIMER_CANCEL_ON_SET) != 0 {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        let allowed = LINUX_TFD_TIMER_ABSTIME | LINUX_TFD_TIMER_CANCEL_ON_SET;
+        if (flags & !allowed) != 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        if new_value.interval_ns != 0 {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        let mut state = self.state.lock();
+        if state.closed {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        zx_status_result(ax_timer_cancel(state.timer_handle))?;
+        state.armed_deadline_ns = None;
+        state.pending_expirations = 0;
+        if new_value.value_ns == 0 {
+            return Ok(());
+        }
+        if (flags & LINUX_TFD_TIMER_ABSTIME) == 0 {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        let deadline = i64::try_from(new_value.value_ns).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        zx_status_result(ax_timer_set(state.timer_handle, deadline, 0))?;
+        state.armed_deadline_ns = Some(new_value.value_ns);
+        Ok(())
+    }
+}
+
+impl FdOps for TimerFd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
+        if buffer.len() != 8 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let mut state = self.state.lock();
+        Self::sample_expiration_locked(&mut state)?;
+        if state.pending_expirations == 0 {
+            return Err(ZX_ERR_SHOULD_WAIT);
+        }
+        let expirations = state.pending_expirations;
+        state.pending_expirations = 0;
+        zx_status_result(ax_timer_cancel(state.timer_handle))?;
+        buffer.copy_from_slice(&expirations.to_ne_bytes());
+        Ok(8)
+    }
+
+    fn write(&self, _buffer: &[u8]) -> Result<usize, zx_status_t> {
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }
+
+    fn seek(&self, _origin: nexus_io::SeekOrigin, _offset: i64) -> Result<u64, zx_status_t> {
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }
+
+    fn close(&self) -> Result<(), zx_status_t> {
+        if Arc::strong_count(&self.state) != 1 {
+            return Ok(());
+        }
+        let timer_handle = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return Ok(());
+            }
+            state.closed = true;
+            state.timer_handle
+        };
+        let _ = ax_timer_cancel(timer_handle);
+        let _ = zx_handle_close(timer_handle);
+        Ok(())
+    }
+
+    fn clone_fd(&self, _flags: FdFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
+        Ok(Arc::new(self.clone()))
+    }
+
+    fn wait_interest(&self) -> Option<WaitSpec> {
+        let state = self.state.lock();
+        (!state.closed).then_some(WaitSpec::new(state.timer_handle, ZX_TIMER_SIGNALED))
     }
 }
 
@@ -1313,12 +1460,10 @@ impl StarnixKernel {
                     let Some(task_id) = self.waiting_task_id_for_packet_key(packet.key) else {
                         if let Some((epoll_key, target_key)) =
                             self.epoll_packets.get(&packet.key).copied()
-                        {
-                            if let Err(status) =
+                            && let Err(status) =
                                 self.handle_epoll_ready_packet(epoll_key, target_key)
-                            {
-                                return map_status_to_return_code(status);
-                            }
+                        {
+                            return map_status_to_return_code(status);
                         }
                         continue;
                     };
@@ -1352,6 +1497,9 @@ impl StarnixKernel {
             LINUX_SYSCALL_GETPID => self.sys_getpid(task_id, stop_state),
             LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
             LINUX_SYSCALL_FUTEX => self.sys_futex(task_id, stop_state),
+            LINUX_SYSCALL_TIMERFD_CREATE => self.sys_timerfd_create(task_id, stop_state),
+            LINUX_SYSCALL_TIMERFD_SETTIME => self.sys_timerfd_settime(task_id, stop_state),
+            LINUX_SYSCALL_TIMERFD_GETTIME => self.sys_timerfd_gettime(stop_state),
             LINUX_SYSCALL_EVENTFD2 => self.sys_eventfd2(task_id, stop_state),
             LINUX_SYSCALL_EPOLL_WAIT => self.sys_epoll_wait(task_id, stop_state),
             LINUX_SYSCALL_EPOLL_CTL => self.sys_epoll_ctl(task_id, stop_state),
@@ -2254,6 +2402,129 @@ impl StarnixKernel {
                 complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
             }
         }
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_timerfd_create(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let clockid = stop_state.regs.rdi as u32 as i32;
+        let flags = stop_state.regs.rsi;
+        let allowed = LINUX_TFD_NONBLOCK | LINUX_TFD_CLOEXEC;
+        if clockid != LINUX_CLOCK_MONOTONIC {
+            complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?;
+            return Ok(SyscallAction::Resume);
+        }
+        if (flags & !allowed) != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let timerfd = TimerFd::new();
+        let fd = match timerfd {
+            Ok(timerfd) => {
+                let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+                let mut open_flags = OpenFlags::READABLE;
+                if (flags & LINUX_TFD_NONBLOCK) != 0 {
+                    open_flags |= OpenFlags::NONBLOCK;
+                }
+                let fd_flags = if (flags & LINUX_TFD_CLOEXEC) != 0 {
+                    FdFlags::CLOEXEC
+                } else {
+                    FdFlags::empty()
+                };
+                resources
+                    .fd_table
+                    .open(Arc::new(timerfd), open_flags, fd_flags)
+            }
+            Err(status) => Err(status),
+        };
+
+        match fd {
+            Ok(fd) => complete_syscall(stop_state, fd as u64)?,
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+            }
+        }
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_timerfd_settime(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let fd = i32::try_from(stop_state.regs.rdi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let flags = stop_state.regs.rsi;
+        let new_value_addr = stop_state.regs.rdx;
+        let old_value_addr = stop_state.regs.r10;
+        if new_value_addr == 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EFAULT))?;
+            return Ok(SyscallAction::Resume);
+        }
+        if old_value_addr != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let new_value = match read_guest_itimerspec(session, new_value_addr) {
+            Ok(spec) => spec,
+            Err(status) => {
+                complete_syscall(
+                    stop_state,
+                    linux_errno(map_guest_memory_status_to_errno(status)),
+                )?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let result = {
+            let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            let Some(entry) = resources.fd_table.get(fd) else {
+                complete_syscall(stop_state, linux_errno(LINUX_EBADF))?;
+                return Ok(SyscallAction::Resume);
+            };
+            let Some(timerfd) = entry
+                .description()
+                .ops()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<TimerFd>()
+            else {
+                complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+                return Ok(SyscallAction::Resume);
+            };
+            timerfd.settime(flags, new_value)
+        };
+
+        match result {
+            Ok(()) => complete_syscall(stop_state, 0)?,
+            Err(ZX_ERR_INVALID_ARGS) => complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?,
+            Err(ZX_ERR_NOT_SUPPORTED) => complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?,
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?
+            }
+        }
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_timerfd_gettime(
+        &mut self,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?;
         Ok(SyscallAction::Resume)
     }
 
@@ -3504,6 +3775,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BYTES),
         Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BYTES),
         Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BYTES),
+        Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BYTES),
         Some(_) => None,
     }
 }
@@ -3518,6 +3790,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BINARY_PATH),
         Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BINARY_PATH),
         Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BINARY_PATH),
+        Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -4018,7 +4291,10 @@ fn file_description_key(description: &Arc<OpenFileDescription>) -> LinuxFileDesc
 
 fn map_wait_signals_to_epoll(signals: u32) -> u32 {
     let mut events = 0u32;
-    if (signals & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE | EVENTFD_READABLE_SIGNAL)) != 0 {
+    if (signals
+        & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE | EVENTFD_READABLE_SIGNAL | ZX_TIMER_SIGNALED))
+        != 0
+    {
         events |= LINUX_EPOLLIN;
     }
     if (signals & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE | EVENTFD_WRITABLE_SIGNAL)) != 0 {
@@ -4040,7 +4316,10 @@ fn filter_epoll_wait_interest(interest: WaitSpec, epoll_interest: u32) -> WaitSp
     let mut signals = 0;
     if (epoll_interest & LINUX_EPOLLIN) != 0 {
         signals |= interest.signals()
-            & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE | EVENTFD_READABLE_SIGNAL);
+            & (ZX_CHANNEL_READABLE
+                | ZX_SOCKET_READABLE
+                | EVENTFD_READABLE_SIGNAL
+                | ZX_TIMER_SIGNALED);
     }
     if (epoll_interest & LINUX_EPOLLOUT) != 0 {
         signals |= interest.signals()
@@ -4092,7 +4371,11 @@ fn filter_wait_interest(interest: WaitSpec, op: FdWaitOp) -> WaitSpec {
     let signals = match op {
         FdWaitOp::Read => {
             interest.signals()
-                & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE | EVENTFD_READABLE_SIGNAL | peer_closed)
+                & (ZX_CHANNEL_READABLE
+                    | ZX_SOCKET_READABLE
+                    | EVENTFD_READABLE_SIGNAL
+                    | ZX_TIMER_SIGNALED
+                    | peer_closed)
         }
         FdWaitOp::Write => {
             interest.signals()
@@ -5098,6 +5381,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND6_EVENTFD_BYTES,
         ));
     }
+    if !LINUX_ROUND6_TIMERFD_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_TIMERFD_BINARY_PATH,
+            LINUX_ROUND6_TIMERFD_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -5144,6 +5433,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round6-eventfd-smoke.nxcd",
             LINUX_ROUND6_EVENTFD_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_TIMERFD_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-timerfd-smoke.nxcd",
+            LINUX_ROUND6_TIMERFD_DECL_BYTES,
         ));
     }
     let bootstrap = BootstrapNamespace::build(&assets)?;
@@ -5266,6 +5561,38 @@ fn read_guest_u64(session: zx_handle_t, addr: u64) -> Result<u64, zx_status_t> {
     Ok(u64::from_ne_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
+}
+
+fn parse_linux_timespec_ns(raw: &[u8]) -> Result<u64, zx_status_t> {
+    if raw.len() < LINUX_TIMESPEC_BYTES {
+        return Err(ZX_ERR_IO_DATA_INTEGRITY);
+    }
+    let seconds = i64::from_ne_bytes(raw[0..8].try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?);
+    let nanos = i64::from_ne_bytes(
+        raw[8..16]
+            .try_into()
+            .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    );
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    let seconds = u64::try_from(seconds).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let nanos = u64::try_from(nanos).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|base| base.checked_add(nanos))
+        .ok_or(ZX_ERR_OUT_OF_RANGE)
+}
+
+fn read_guest_itimerspec(session: zx_handle_t, addr: u64) -> Result<LinuxItimerSpec, zx_status_t> {
+    let bytes = read_guest_bytes(session, addr, LINUX_ITIMERSPEC_BYTES)?;
+    let raw = bytes
+        .get(..LINUX_ITIMERSPEC_BYTES)
+        .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
+    Ok(LinuxItimerSpec {
+        interval_ns: parse_linux_timespec_ns(&raw[..LINUX_TIMESPEC_BYTES])?,
+        value_ns: parse_linux_timespec_ns(&raw[LINUX_TIMESPEC_BYTES..LINUX_ITIMERSPEC_BYTES])?,
+    })
 }
 
 fn read_guest_string_array(

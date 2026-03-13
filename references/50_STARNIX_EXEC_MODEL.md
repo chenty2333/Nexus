@@ -69,6 +69,10 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - counter-based `read` / `write` semantics in the userspace executive
   - epoll-visible readiness derived from one synthetic wait handle instead of a
     new kernel object family
+  - `timerfd_create`
+  - `timerfd_settime` for `CLOCK_MONOTONIC` one-shot timers
+  - `read` of the expiration counter
+  - epoll-visible readability through the native timer object's signaled state
 
 ## Frozen architectural split
 

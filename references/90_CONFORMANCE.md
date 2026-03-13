@@ -130,6 +130,13 @@ Main just targets include:
   - the current implementation keeps the counter and policy in the Starnix
     executive while driving readiness through one synthetic wait handle rather
     than adding a dedicated kernel eventfd object
+- The second Round-6 Starnix long-tail scenario now closes one narrow timerfd
+  slice:
+  - `timerfd_create(CLOCK_MONOTONIC)`
+  - one-shot `timerfd_settime(..., TFD_TIMER_ABSTIME, ...)`
+  - `read` returning one expiration count
+  - epoll-visible readability through the native timer object's signaled state
+  - interval timers and `timerfd_gettime` remain outside the current slice
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

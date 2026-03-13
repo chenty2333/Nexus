@@ -19,6 +19,8 @@ fn main() {
         manifest_dir.join("../linux-round5-epoll-smoke/round5_epoll_smoke.S");
     let linux_round6_eventfd_source =
         manifest_dir.join("../linux-round6-eventfd-smoke/round6_eventfd_smoke.S");
+    let linux_round6_timerfd_source =
+        manifest_dir.join("../linux-round6-timerfd-smoke/round6_timerfd_smoke.S");
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
@@ -42,6 +44,10 @@ fn main() {
         "cargo:rerun-if-changed={}",
         linux_round6_eventfd_source.display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_round6_timerfd_source.display()
+    );
     for manifest in [
         "root_component.toml",
         "root_component_round3.toml",
@@ -53,6 +59,7 @@ fn main() {
         "root_component_starnix_round4_signal.toml",
         "root_component_starnix_round5_epoll.toml",
         "root_component_starnix_round6_eventfd.toml",
+        "root_component_starnix_round6_timerfd.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
@@ -64,6 +71,7 @@ fn main() {
         "linux_round4_signal_smoke.toml",
         "linux_round5_epoll_smoke.toml",
         "linux_round6_eventfd_smoke.toml",
+        "linux_round6_timerfd_smoke.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -104,6 +112,10 @@ fn main() {
             "root_component_starnix_round6_eventfd.toml",
             "root_component_starnix_round6_eventfd.nxcd",
         ),
+        (
+            "root_component_starnix_round6_timerfd.toml",
+            "root_component_starnix_round6_timerfd.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
@@ -126,6 +138,10 @@ fn main() {
         (
             "linux_round6_eventfd_smoke.toml",
             "linux_round6_eventfd_smoke.nxcd",
+        ),
+        (
+            "linux_round6_timerfd_smoke.toml",
+            "linux_round6_timerfd_smoke.nxcd",
         ),
     ] {
         let source_path = manifests_dir.join(input);
@@ -157,6 +173,10 @@ fn main() {
         &linux_round6_eventfd_source,
         &out_dir.join("linux-round6-eventfd-smoke"),
     );
+    build_linux_binary(
+        &linux_round6_timerfd_source,
+        &out_dir.join("linux-round6-timerfd-smoke"),
+    );
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
         // Link the bootstrap userspace binary at the fixed VA currently
@@ -175,6 +195,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round4_signal)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round5_epoll)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_eventfd)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_timerfd)");
     match root_url.as_str() {
         "boot://root-starnix" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
@@ -202,6 +223,9 @@ fn main() {
         }
         "boot://root-starnix-round6-eventfd" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_round6_eventfd");
+        }
+        "boot://root-starnix-round6-timerfd" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_round6_timerfd");
         }
         _ => {}
     }

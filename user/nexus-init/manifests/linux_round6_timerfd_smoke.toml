@@ -1,0 +1,7 @@
+url = "boot://linux-round6-timerfd-smoke"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-round6-timerfd-smoke"
+args = ["linux-round6-timerfd-smoke"]
+env = []
