@@ -73,6 +73,13 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - `timerfd_settime` for `CLOCK_MONOTONIC` one-shot timers
   - `read` of the expiration counter
   - epoll-visible readability through the native timer object's signaled state
+  - `signalfd4`
+  - one blocked-signal `read` path producing one minimal `signalfd_siginfo`
+  - epoll-visible readability through one synthetic wait handle maintained by
+    the executive's pending-signal view
+  - the current bootstrap slice binds each signalfd object to its creating task
+    and thread group, rather than trying to model full cross-thread shared-fd
+    semantics yet
 
 ## Frozen architectural split
 

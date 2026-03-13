@@ -1,6 +1,6 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 
@@ -62,10 +62,11 @@ use crate::{
     LINUX_ROUND4_FUTEX_DECL_BYTES, LINUX_ROUND4_SIGNAL_BINARY_PATH, LINUX_ROUND4_SIGNAL_BYTES,
     LINUX_ROUND4_SIGNAL_DECL_BYTES, LINUX_ROUND5_EPOLL_BINARY_PATH, LINUX_ROUND5_EPOLL_BYTES,
     LINUX_ROUND5_EPOLL_DECL_BYTES, LINUX_ROUND6_EVENTFD_BINARY_PATH, LINUX_ROUND6_EVENTFD_BYTES,
-    LINUX_ROUND6_EVENTFD_DECL_BYTES, LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES,
-    LINUX_ROUND6_TIMERFD_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
-    STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
-    STARTUP_HANDLE_STARNIX_STDOUT,
+    LINUX_ROUND6_EVENTFD_DECL_BYTES, LINUX_ROUND6_SIGNALFD_BINARY_PATH,
+    LINUX_ROUND6_SIGNALFD_BYTES, LINUX_ROUND6_SIGNALFD_DECL_BYTES,
+    LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES, LINUX_ROUND6_TIMERFD_DECL_BYTES,
+    STARTUP_HANDLE_COMPONENT_STATUS, STARTUP_HANDLE_STARNIX_IMAGE_VMO,
+    STARTUP_HANDLE_STARNIX_PARENT_PROCESS, STARTUP_HANDLE_STARNIX_STDOUT,
 };
 
 const USER_PAGE_BYTES: u64 = 0x1000;
@@ -104,6 +105,7 @@ const LINUX_SYSCALL_KILL: u64 = 62;
 const LINUX_SYSCALL_TIMERFD_CREATE: u64 = 283;
 const LINUX_SYSCALL_TIMERFD_SETTIME: u64 = 286;
 const LINUX_SYSCALL_TIMERFD_GETTIME: u64 = 287;
+const LINUX_SYSCALL_SIGNALFD4: u64 = 289;
 const LINUX_SYSCALL_EVENTFD2: u64 = 290;
 const LINUX_SYSCALL_EPOLL_WAIT: u64 = 232;
 const LINUX_SYSCALL_EPOLL_CTL: u64 = 233;
@@ -164,6 +166,9 @@ const LINUX_EPOLL_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 const LINUX_EFD_SEMAPHORE: u64 = 0x1;
 const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_EFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_SFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
+const LINUX_SFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_SIGNALFD_SIGINFO_BYTES: usize = 128;
 const LINUX_TFD_TIMER_ABSTIME: u64 = 0x1;
 const LINUX_TFD_TIMER_CANCEL_ON_SET: u64 = 0x2;
 const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
@@ -216,6 +221,7 @@ const EVENTFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
 const EVENTFD_WRITABLE_SIGNAL: u32 = AX_USER_SIGNAL_1;
 const EVENTFD_SIGNAL_MASK: u32 = EVENTFD_READABLE_SIGNAL | EVENTFD_WRITABLE_SIGNAL;
 const EVENTFD_COUNTER_MAX: u64 = u64::MAX - 1;
+const SIGNALFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
@@ -423,6 +429,11 @@ struct TimerFd {
     state: Arc<Mutex<TimerFdState>>,
 }
 
+#[derive(Clone)]
+struct SignalFd {
+    state: Arc<Mutex<SignalFdState>>,
+}
+
 struct EventFdState {
     wait_handle: zx_handle_t,
     peer_handle: zx_handle_t,
@@ -435,6 +446,15 @@ struct TimerFdState {
     timer_handle: zx_handle_t,
     armed_deadline_ns: Option<u64>,
     pending_expirations: u64,
+    closed: bool,
+}
+
+struct SignalFdState {
+    wait_handle: zx_handle_t,
+    peer_handle: zx_handle_t,
+    owner_tid: i32,
+    owner_tgid: i32,
+    mask: u64,
     closed: bool,
 }
 
@@ -596,6 +616,7 @@ struct StarnixKernel {
     futex_waiters: BTreeMap<LinuxFutexKey, VecDeque<i32>>,
     epolls: BTreeMap<LinuxFileDescriptionKey, EpollInstance>,
     epoll_packets: BTreeMap<u64, (LinuxFileDescriptionKey, LinuxFileDescriptionKey)>,
+    signalfds: BTreeMap<LinuxFileDescriptionKey, Weak<Mutex<SignalFdState>>>,
 }
 
 struct PreparedProcessCarrier {
@@ -881,6 +902,101 @@ impl FdOps for TimerFd {
     }
 }
 
+impl SignalFd {
+    fn new(owner_tid: i32, owner_tgid: i32, mask: u64) -> Result<Self, zx_status_t> {
+        let mut wait_handle = ZX_HANDLE_INVALID;
+        let mut peer_handle = ZX_HANDLE_INVALID;
+        zx_status_result(ax_eventpair_create(0, &mut wait_handle, &mut peer_handle))?;
+        let this = Self {
+            state: Arc::new(Mutex::new(SignalFdState {
+                wait_handle,
+                peer_handle,
+                owner_tid,
+                owner_tgid,
+                mask: normalize_signal_mask(mask),
+                closed: false,
+            })),
+        };
+        if let Err(status) = this.set_ready(false) {
+            let _ = zx_handle_close(wait_handle);
+            let _ = zx_handle_close(peer_handle);
+            return Err(status);
+        }
+        Ok(this)
+    }
+
+    fn snapshot(&self) -> Option<(i32, i32, u64, zx_handle_t)> {
+        let state = self.state.lock();
+        (!state.closed).then_some((
+            state.owner_tid,
+            state.owner_tgid,
+            state.mask,
+            state.wait_handle,
+        ))
+    }
+
+    fn set_ready(&self, ready: bool) -> Result<(), zx_status_t> {
+        let state = self.state.lock();
+        if state.closed {
+            return Ok(());
+        }
+        let set_mask = if ready { SIGNALFD_READABLE_SIGNAL } else { 0 };
+        zx_status_result(ax_object_signal(
+            state.wait_handle,
+            SIGNALFD_READABLE_SIGNAL,
+            set_mask,
+        ))
+    }
+
+    fn weak_state(&self) -> Weak<Mutex<SignalFdState>> {
+        Arc::downgrade(&self.state)
+    }
+}
+
+impl FdOps for SignalFd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }
+
+    fn write(&self, _buffer: &[u8]) -> Result<usize, zx_status_t> {
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }
+
+    fn seek(&self, _origin: nexus_io::SeekOrigin, _offset: i64) -> Result<u64, zx_status_t> {
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }
+
+    fn close(&self) -> Result<(), zx_status_t> {
+        if Arc::strong_count(&self.state) != 1 {
+            return Ok(());
+        }
+        let (wait_handle, peer_handle) = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return Ok(());
+            }
+            state.closed = true;
+            (state.wait_handle, state.peer_handle)
+        };
+        let _ = zx_handle_close(peer_handle);
+        let _ = zx_handle_close(wait_handle);
+        Ok(())
+    }
+
+    fn clone_fd(&self, _flags: FdFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
+        Ok(Arc::new(self.clone()))
+    }
+
+    fn wait_interest(&self) -> Option<WaitSpec> {
+        let state = self.state.lock();
+        (!state.closed).then_some(WaitSpec::new(state.wait_handle, SIGNALFD_READABLE_SIGNAL))
+    }
+}
+
 impl StarnixKernel {
     fn new(
         parent_process: zx_handle_t,
@@ -904,6 +1020,7 @@ impl StarnixKernel {
             futex_waiters: BTreeMap::new(),
             epolls: BTreeMap::new(),
             epoll_packets: BTreeMap::new(),
+            signalfds: BTreeMap::new(),
         }
     }
 
@@ -1500,6 +1617,7 @@ impl StarnixKernel {
             LINUX_SYSCALL_TIMERFD_CREATE => self.sys_timerfd_create(task_id, stop_state),
             LINUX_SYSCALL_TIMERFD_SETTIME => self.sys_timerfd_settime(task_id, stop_state),
             LINUX_SYSCALL_TIMERFD_GETTIME => self.sys_timerfd_gettime(stop_state),
+            LINUX_SYSCALL_SIGNALFD4 => self.sys_signalfd4(task_id, stop_state),
             LINUX_SYSCALL_EVENTFD2 => self.sys_eventfd2(task_id, stop_state),
             LINUX_SYSCALL_EPOLL_WAIT => self.sys_epoll_wait(task_id, stop_state),
             LINUX_SYSCALL_EPOLL_CTL => self.sys_epoll_ctl(task_id, stop_state),
@@ -1787,6 +1905,109 @@ impl StarnixKernel {
             .ok_or(ZX_ERR_BAD_STATE)
     }
 
+    fn signalfd_ready_mask(&self, owner_tid: i32, mask: u64) -> Result<u64, zx_status_t> {
+        let task = self.tasks.get(&owner_tid).ok_or(ZX_ERR_BAD_STATE)?;
+        let blocked = task.signals.blocked;
+        let task_pending = task.signals.pending & mask & blocked;
+        let shared_pending = self
+            .groups
+            .get(&task.tgid)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .shared_pending
+            & mask
+            & blocked;
+        Ok(task_pending | shared_pending)
+    }
+
+    fn refresh_signalfd_key(&mut self, key: LinuxFileDescriptionKey) -> Result<(), zx_status_t> {
+        let Some(weak) = self.signalfds.get(&key).cloned() else {
+            return Ok(());
+        };
+        let Some(state) = weak.upgrade() else {
+            let _ = self.signalfds.remove(&key);
+            return Ok(());
+        };
+        let (owner_tid, _owner_tgid, mask, wait_handle, closed) = {
+            let guard = state.lock();
+            (
+                guard.owner_tid,
+                guard.owner_tgid,
+                guard.mask,
+                guard.wait_handle,
+                guard.closed,
+            )
+        };
+        if closed {
+            let _ = self.signalfds.remove(&key);
+            return Ok(());
+        }
+        let ready = self.signalfd_ready_mask(owner_tid, mask)? != 0;
+        zx_status_result(ax_object_signal(
+            wait_handle,
+            SIGNALFD_READABLE_SIGNAL,
+            if ready { SIGNALFD_READABLE_SIGNAL } else { 0 },
+        ))
+    }
+
+    fn refresh_signalfds_for_group(&mut self, tgid: i32) -> Result<(), zx_status_t> {
+        let keys = self.signalfds.keys().copied().collect::<Vec<_>>();
+        let mut stale = Vec::new();
+        for key in keys {
+            let Some(weak) = self.signalfds.get(&key).cloned() else {
+                continue;
+            };
+            let Some(state) = weak.upgrade() else {
+                stale.push(key);
+                continue;
+            };
+            let owner_tgid = {
+                let guard = state.lock();
+                guard.owner_tgid
+            };
+            if owner_tgid == tgid {
+                self.refresh_signalfd_key(key)?;
+            }
+        }
+        for key in stale {
+            let _ = self.signalfds.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn take_signalfd_signal(
+        &mut self,
+        owner_tid: i32,
+        mask: u64,
+    ) -> Result<Option<i32>, zx_status_t> {
+        let blocked = self.task_signal_mask(owner_tid)?;
+        let tgid = self.tasks.get(&owner_tid).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let task_pending = self
+            .tasks
+            .get(&owner_tid)
+            .map(|task| task.signals.pending & mask & blocked)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if let Some(signal) = lowest_signal(task_pending) {
+            if let Some(task) = self.tasks.get_mut(&owner_tid) {
+                task.signals.pending &= !linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
+            }
+            self.refresh_signalfds_for_group(tgid)?;
+            return Ok(Some(signal));
+        }
+        let shared_pending = self
+            .groups
+            .get(&tgid)
+            .map(|group| group.shared_pending & mask & blocked)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if let Some(signal) = lowest_signal(shared_pending) {
+            if let Some(group) = self.groups.get_mut(&tgid) {
+                group.shared_pending &= !linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
+            }
+            self.refresh_signalfds_for_group(tgid)?;
+            return Ok(Some(signal));
+        }
+        Ok(None)
+    }
+
     fn install_signal_frame(
         &mut self,
         task_id: i32,
@@ -1918,6 +2139,7 @@ impl StarnixKernel {
 
     fn take_deliverable_signal(&mut self, task_id: i32) -> Result<Option<i32>, zx_status_t> {
         let blocked = self.task_signal_mask(task_id)?;
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
         let task_pending = self
             .tasks
             .get(&task_id)
@@ -1927,10 +2149,10 @@ impl StarnixKernel {
             if let Some(task) = self.tasks.get_mut(&task_id) {
                 task.signals.pending &= !linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
             }
+            self.refresh_signalfds_for_group(tgid)?;
             return Ok(Some(signal));
         }
 
-        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
         let shared_pending = self
             .groups
             .get(&tgid)
@@ -1940,6 +2162,7 @@ impl StarnixKernel {
             if let Some(group) = self.groups.get_mut(&tgid) {
                 group.shared_pending &= !linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
             }
+            self.refresh_signalfds_for_group(tgid)?;
             return Ok(Some(signal));
         }
 
@@ -1978,13 +2201,16 @@ impl StarnixKernel {
             return Ok(0);
         }
         let bit = linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
-        let Some(group) = self.groups.get_mut(&tgid) else {
-            return Ok(linux_errno(LINUX_ESRCH));
-        };
-        if !matches!(group.state, ThreadGroupState::Running) {
-            return Ok(linux_errno(LINUX_ESRCH));
+        {
+            let Some(group) = self.groups.get_mut(&tgid) else {
+                return Ok(linux_errno(LINUX_ESRCH));
+            };
+            if !matches!(group.state, ThreadGroupState::Running) {
+                return Ok(linux_errno(LINUX_ESRCH));
+            }
+            group.shared_pending |= bit;
         }
-        group.shared_pending |= bit;
+        self.refresh_signalfds_for_group(tgid)?;
         Ok(0)
     }
 
@@ -1998,13 +2224,16 @@ impl StarnixKernel {
             return Ok(0);
         }
         let bit = linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
-        let Some(task) = self.tasks.get_mut(&tid) else {
-            return Ok(linux_errno(LINUX_ESRCH));
-        };
-        if task.tgid != tgid {
-            return Ok(linux_errno(LINUX_ESRCH));
+        {
+            let Some(task) = self.tasks.get_mut(&tid) else {
+                return Ok(linux_errno(LINUX_ESRCH));
+            };
+            if task.tgid != tgid {
+                return Ok(linux_errno(LINUX_ESRCH));
+            }
+            task.signals.pending |= bit;
         }
-        task.signals.pending |= bit;
+        self.refresh_signalfds_for_group(tgid)?;
         Ok(0)
     }
 
@@ -2072,6 +2301,24 @@ impl StarnixKernel {
             .carrier
             .session_handle;
         let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+
+        let signalfd = {
+            let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            resources.fd_table.get(fd).and_then(|entry| {
+                entry
+                    .description()
+                    .ops()
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<SignalFd>()
+                    .cloned()
+            })
+        };
+        if let Some(signalfd) = signalfd {
+            return self.sys_read_signalfd(task_id, fd, buf, len, stop_state, signalfd);
+        }
+
         let wait_policy = self.fd_wait_policy_for_op(task_id, fd, FdWaitOp::Read)?;
 
         let mut bytes = Vec::new();
@@ -2122,6 +2369,74 @@ impl StarnixKernel {
             ReadAttempt::Err(status) => {
                 complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
                 Ok(SyscallAction::Resume)
+            }
+        }
+    }
+
+    fn sys_read_signalfd(
+        &mut self,
+        task_id: i32,
+        fd: i32,
+        buf: u64,
+        len: usize,
+        stop_state: &mut ax_guest_stop_state_t,
+        signalfd: SignalFd,
+    ) -> Result<SyscallAction, zx_status_t> {
+        if len < LINUX_SIGNALFD_SIGINFO_BYTES || !len.is_multiple_of(LINUX_SIGNALFD_SIGINFO_BYTES) {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let wait_policy = self.fd_wait_policy_for_op(task_id, fd, FdWaitOp::Read)?;
+        let (owner_tid, owner_tgid, mask, _wait_handle) =
+            signalfd.snapshot().ok_or(ZX_ERR_BAD_STATE)?;
+        match self.take_signalfd_signal(owner_tid, mask)? {
+            Some(signal) => {
+                let info = encode_signalfd_siginfo(signal);
+                match write_guest_bytes(session, buf, &info) {
+                    Ok(()) => {
+                        complete_syscall(
+                            stop_state,
+                            u64::try_from(LINUX_SIGNALFD_SIGINFO_BYTES)
+                                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                        )?;
+                    }
+                    Err(status) => {
+                        complete_syscall(
+                            stop_state,
+                            linux_errno(map_guest_write_status_to_errno(status)),
+                        )?;
+                    }
+                }
+                self.refresh_signalfds_for_group(owner_tgid)?;
+                Ok(SyscallAction::Resume)
+            }
+            None => {
+                if wait_policy.nonblock || wait_policy.wait_interest.is_none() {
+                    complete_syscall(stop_state, linux_errno(LINUX_EAGAIN))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                let packet_key = self.alloc_packet_key()?;
+                let wait = WaitState {
+                    restartable: true,
+                    kind: WaitKind::FdRead {
+                        fd,
+                        buf,
+                        len,
+                        packet_key,
+                    },
+                };
+                self.arm_fd_wait(
+                    task_id,
+                    wait,
+                    wait_policy.wait_interest.ok_or(ZX_ERR_BAD_STATE)?,
+                    stop_state,
+                )
             }
         }
     }
@@ -2528,6 +2843,90 @@ impl StarnixKernel {
         Ok(SyscallAction::Resume)
     }
 
+    fn sys_signalfd4(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let fd = stop_state.regs.rdi as u32 as i32;
+        let mask_addr = stop_state.regs.rsi;
+        let sigset_size = stop_state.regs.rdx;
+        let flags = stop_state.regs.r10;
+        let allowed = LINUX_SFD_NONBLOCK | LINUX_SFD_CLOEXEC;
+        if sigset_size != LINUX_SIGNAL_SET_BYTES as u64 || mask_addr == 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        if (flags & !allowed) != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let mask = match read_guest_signal_mask(session, mask_addr) {
+            Ok(mask) => normalize_signal_mask(mask),
+            Err(status) => {
+                complete_syscall(
+                    stop_state,
+                    linux_errno(map_guest_memory_status_to_errno(status)),
+                )?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        if fd != -1 {
+            complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let signalfd = match SignalFd::new(task_id, tgid, mask) {
+            Ok(signalfd) => signalfd,
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let weak = signalfd.weak_state();
+        let created_fd = {
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            let mut open_flags = OpenFlags::READABLE;
+            if (flags & LINUX_SFD_NONBLOCK) != 0 {
+                open_flags |= OpenFlags::NONBLOCK;
+            }
+            let fd_flags = if (flags & LINUX_SFD_CLOEXEC) != 0 {
+                FdFlags::CLOEXEC
+            } else {
+                FdFlags::empty()
+            };
+            resources
+                .fd_table
+                .open(Arc::new(signalfd), open_flags, fd_flags)
+        };
+
+        match created_fd {
+            Ok(fd) => {
+                let key = {
+                    let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                    let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+                    let entry = resources.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+                    file_description_key(entry.description())
+                };
+                self.signalfds.insert(key, weak);
+                self.refresh_signalfd_key(key)?;
+                complete_syscall(stop_state, fd as u64)?;
+            }
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+            }
+        }
+        Ok(SyscallAction::Resume)
+    }
+
     fn sys_eventfd2(
         &mut self,
         task_id: i32,
@@ -2820,16 +3219,20 @@ impl StarnixKernel {
                 }
             };
             let requested = normalize_signal_mask(requested);
-            let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
-            task.signals.blocked = match how {
-                LINUX_SIG_BLOCK => task.signals.blocked | requested,
-                LINUX_SIG_UNBLOCK => task.signals.blocked & !requested,
-                LINUX_SIG_SETMASK => requested,
-                _ => {
-                    complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
-                    return Ok(SyscallAction::Resume);
-                }
+            let tgid = {
+                let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
+                task.signals.blocked = match how {
+                    LINUX_SIG_BLOCK => task.signals.blocked | requested,
+                    LINUX_SIG_UNBLOCK => task.signals.blocked & !requested,
+                    LINUX_SIG_SETMASK => requested,
+                    _ => {
+                        complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+                        return Ok(SyscallAction::Resume);
+                    }
+                };
+                task.tgid
             };
+            self.refresh_signalfds_for_group(tgid)?;
         }
         complete_syscall(stop_state, 0)?;
         Ok(SyscallAction::Resume)
@@ -2922,13 +3325,17 @@ impl StarnixKernel {
         task_id: i32,
         stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
-        let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
-        let Some(frame) = task.active_signal.take() else {
-            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
-            return Ok(SyscallAction::Resume);
+        let tgid = {
+            let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
+            let Some(frame) = task.active_signal.take() else {
+                complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+                return Ok(SyscallAction::Resume);
+            };
+            task.signals.blocked = frame.previous_blocked;
+            stop_state.regs = frame.restore_regs;
+            task.tgid
         };
-        task.signals.blocked = frame.previous_blocked;
-        stop_state.regs = frame.restore_regs;
+        self.refresh_signalfds_for_group(tgid)?;
         Ok(SyscallAction::Resume)
     }
 
@@ -3776,6 +4183,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BYTES),
         Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BYTES),
         Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BYTES),
+        Some("linux-round6-signalfd-smoke") => Some(LINUX_ROUND6_SIGNALFD_BYTES),
         Some(_) => None,
     }
 }
@@ -3791,6 +4199,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BINARY_PATH),
         Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BINARY_PATH),
         Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BINARY_PATH),
+        Some("linux-round6-signalfd-smoke") => Some(LINUX_ROUND6_SIGNALFD_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -4292,7 +4701,11 @@ fn file_description_key(description: &Arc<OpenFileDescription>) -> LinuxFileDesc
 fn map_wait_signals_to_epoll(signals: u32) -> u32 {
     let mut events = 0u32;
     if (signals
-        & (ZX_CHANNEL_READABLE | ZX_SOCKET_READABLE | EVENTFD_READABLE_SIGNAL | ZX_TIMER_SIGNALED))
+        & (ZX_CHANNEL_READABLE
+            | ZX_SOCKET_READABLE
+            | EVENTFD_READABLE_SIGNAL
+            | SIGNALFD_READABLE_SIGNAL
+            | ZX_TIMER_SIGNALED))
         != 0
     {
         events |= LINUX_EPOLLIN;
@@ -4319,6 +4732,7 @@ fn filter_epoll_wait_interest(interest: WaitSpec, epoll_interest: u32) -> WaitSp
             & (ZX_CHANNEL_READABLE
                 | ZX_SOCKET_READABLE
                 | EVENTFD_READABLE_SIGNAL
+                | SIGNALFD_READABLE_SIGNAL
                 | ZX_TIMER_SIGNALED);
     }
     if (epoll_interest & LINUX_EPOLLOUT) != 0 {
@@ -4374,6 +4788,7 @@ fn filter_wait_interest(interest: WaitSpec, op: FdWaitOp) -> WaitSpec {
                 & (ZX_CHANNEL_READABLE
                     | ZX_SOCKET_READABLE
                     | EVENTFD_READABLE_SIGNAL
+                    | SIGNALFD_READABLE_SIGNAL
                     | ZX_TIMER_SIGNALED
                     | peer_closed)
         }
@@ -5387,6 +5802,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND6_TIMERFD_BYTES,
         ));
     }
+    if !LINUX_ROUND6_SIGNALFD_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_SIGNALFD_BINARY_PATH,
+            LINUX_ROUND6_SIGNALFD_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -5441,6 +5862,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND6_TIMERFD_DECL_BYTES,
         ));
     }
+    if !LINUX_ROUND6_SIGNALFD_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-signalfd-smoke.nxcd",
+            LINUX_ROUND6_SIGNALFD_DECL_BYTES,
+        ));
+    }
     let bootstrap = BootstrapNamespace::build(&assets)?;
     let mut mounts = bootstrap.namespace().mounts().clone();
     mounts.insert("/", bootstrap.boot_root())?;
@@ -5473,6 +5900,12 @@ fn stat_metadata_for_ops(ops: &dyn FdOps) -> Result<LinuxStatMetadata, zx_status
         });
     }
     if ops.as_any().is::<PseudoNodeFd>() {
+        return Ok(LinuxStatMetadata {
+            mode: LINUX_S_IFREG | 0o444,
+            size_bytes: 0,
+        });
+    }
+    if ops.as_any().is::<SignalFd>() {
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFREG | 0o444,
             size_bytes: 0,
@@ -5513,6 +5946,12 @@ fn write_guest_fd_pair(
     bytes[..4].copy_from_slice(&left.to_ne_bytes());
     bytes[4..].copy_from_slice(&right.to_ne_bytes());
     write_guest_bytes(session, guest_addr, &bytes)
+}
+
+fn encode_signalfd_siginfo(signal: i32) -> [u8; LINUX_SIGNALFD_SIGINFO_BYTES] {
+    let mut bytes = [0u8; LINUX_SIGNALFD_SIGINFO_BYTES];
+    bytes[0..4].copy_from_slice(&(signal as u32).to_ne_bytes());
+    bytes
 }
 
 fn duplicate_linux_map_backing(backing: LinuxMapBacking) -> Result<LinuxMapBacking, zx_status_t> {

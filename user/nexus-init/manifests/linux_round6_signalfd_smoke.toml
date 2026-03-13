@@ -1,0 +1,7 @@
+url = "boot://linux-round6-signalfd-smoke"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-round6-signalfd-smoke"
+args = ["linux-round6-signalfd-smoke"]
+env = []

@@ -137,6 +137,15 @@ Main just targets include:
   - `read` returning one expiration count
   - epoll-visible readability through the native timer object's signaled state
   - interval timers and `timerfd_gettime` remain outside the current slice
+- The third Round-6 Starnix long-tail scenario now closes one narrow signalfd
+  slice:
+  - `signalfd4`
+  - one blocked `SIGUSR1` queued through the existing executive signal state
+  - `read` returning one minimal `signalfd_siginfo`
+  - epoll-visible readability through one synthetic signalfd wait handle
+  - the current bootstrap implementation ties each signalfd object to the
+    creating task's blocked/pending view plus its thread-group shared pending
+    set; full shared-fd cross-thread semantics remain later work
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return
