@@ -81,7 +81,8 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   on open-coded "queue has space" checks.
 - Current kernel defaults are capacity `64` and kernel reserve `16`.
 - The kernel wraps this in `KernelPort`, whose queue storage is backed by a kernel-created VMO-like page range.
-- User packets and signal packets are translated to and from `zx_port_packet_t`.
+- User packets and signal packets are translated to and from native `ax_port_packet_t`.
+  Frozen `zx_port_packet_t` remains available as a compat alias over the same layout.
 - `zx_port_wait` is FIFO over queued packets and flushes pending kernel events when space becomes available.
 - The syscall front-end now owns packet-output pointer decode and probe before `zx_port_wait` runs.
 - Immediate packet delivery returns one completed packet back to the syscall shell for writeback;

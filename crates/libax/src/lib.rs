@@ -302,11 +302,7 @@ pub fn ax_channel_read(
     );
     if status == AX_OK {
         let copy_len = core::cmp::min(handles.len(), usize::try_from(*actual_handles).unwrap_or(0));
-        for (dst, raw) in handles
-            .iter_mut()
-            .zip(raw_handles.into_iter())
-            .take(copy_len)
-        {
+        for (dst, raw) in handles.iter_mut().zip(raw_handles).take(copy_len) {
             *dst = widen_handle(raw);
         }
     }

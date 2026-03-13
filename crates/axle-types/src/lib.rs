@@ -288,90 +288,90 @@ impl ax_linux_exec_spec_header_t {
     }
 }
 
-/// Zircon user packet payload (32 bytes).
+/// Native Axle user packet payload (32 bytes).
 ///
-/// We use a 4x u64 layout to keep the payload naturally 8-byte aligned
+/// We use a 4x `u64` layout to keep the payload naturally 8-byte aligned
 /// while preserving the exact 32-byte payload size.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct zx_packet_user_t {
+pub struct ax_packet_user_t {
     /// User-controlled payload words.
     pub u64: [u64; 4],
 }
 
-/// Zircon signal packet payload (32 bytes).
+/// Native Axle signal packet payload (32 bytes).
 ///
-/// This corresponds to `zx_packet_signal_t` (used with `ZX_PKT_TYPE_SIGNAL_ONE`).
+/// This corresponds to `ax_packet_signal_t` (used with `AX_PKT_TYPE_SIGNAL_ONE`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct zx_packet_signal_t {
+pub struct ax_packet_signal_t {
     /// Watched signal mask that triggered the packet.
-    pub trigger: zx_signals_t,
+    pub trigger: ax_signals_t,
     /// Observed signals at the time of delivery.
-    pub observed: zx_signals_t,
+    pub observed: ax_signals_t,
     /// Delivery count (merged on overflow in some port implementations).
     pub count: u64,
     /// Monotonic timestamp (when requested via wait-async options).
-    pub timestamp: zx_time_t,
+    pub timestamp: ax_time_t,
     /// Reserved.
     pub reserved1: u64,
 }
 
-impl zx_packet_signal_t {
-    /// Encode into the raw 32-byte union payload shape (`zx_packet_user_t` view).
+impl ax_packet_signal_t {
+    /// Encode into the raw 32-byte union payload shape (`ax_packet_user_t` view).
     ///
     /// This avoids Rust unions in the public ABI while preserving layout
-    /// compatibility with Zircon's `zx_port_packet_t` union.
-    pub const fn to_user(self) -> zx_packet_user_t {
+    /// compatibility with Axle's `ax_port_packet_t` union.
+    pub const fn to_user(self) -> ax_packet_user_t {
         let first = (self.trigger as u64) | ((self.observed as u64) << 32);
-        zx_packet_user_t {
+        ax_packet_user_t {
             u64: [first, self.count, self.timestamp as u64, self.reserved1],
         }
     }
 
-    /// Decode from the raw 32-byte union payload shape (`zx_packet_user_t` view).
-    pub const fn from_user(user: zx_packet_user_t) -> Self {
+    /// Decode from the raw 32-byte union payload shape (`ax_packet_user_t` view).
+    pub const fn from_user(user: ax_packet_user_t) -> Self {
         let first = user.u64[0];
         Self {
-            trigger: first as zx_signals_t,
-            observed: (first >> 32) as zx_signals_t,
+            trigger: first as ax_signals_t,
+            observed: (first >> 32) as ax_signals_t,
             count: user.u64[1],
-            timestamp: user.u64[2] as zx_time_t,
+            timestamp: user.u64[2] as ax_time_t,
             reserved1: user.u64[3],
         }
     }
 }
 
-/// Zircon port packet (minimal Phase-B ABI shape).
+/// Native Axle port packet (minimal Phase-B ABI shape).
 ///
-/// For bootstrap we model the user-packet path used by `zx_port_queue` and
-/// `zx_port_wait`. Additional packet variants can be added later without
+/// For bootstrap we model the user-packet path used by `ax_port_queue` and
+/// `ax_port_wait`. Additional packet variants can be added later without
 /// changing this baseline layout: the `user` payload is the 32-byte union area
-/// used by Zircon (user packets, signal packets, etc).
+/// shared by user packets, signal packets, and future packet families.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct zx_port_packet_t {
+pub struct ax_port_packet_t {
     /// User-defined key.
     pub key: u64,
-    /// Packet type (for now `ZX_PKT_TYPE_USER`).
-    pub type_: zx_packet_type_t,
+    /// Packet type (for now `AX_PKT_TYPE_USER`).
+    pub type_: ax_packet_type_t,
     /// Status associated with the packet.
-    pub status: zx_status_t,
+    pub status: ax_status_t,
     /// User payload.
-    pub user: zx_packet_user_t,
+    pub user: ax_packet_user_t,
 }
 
-/// Native Axle alias for the raw user-packet payload shape.
-pub type ax_packet_user_t = zx_packet_user_t;
-/// Native Axle alias for the signal-packet payload shape.
-pub type ax_packet_signal_t = zx_packet_signal_t;
-/// Native Axle alias for the bootstrap port-packet layout.
-pub type ax_port_packet_t = zx_port_packet_t;
+/// Frozen Zircon-compat alias for the raw user-packet payload shape.
+pub type zx_packet_user_t = ax_packet_user_t;
+/// Frozen Zircon-compat alias for the signal-packet payload shape.
+pub type zx_packet_signal_t = ax_packet_signal_t;
+/// Frozen Zircon-compat alias for the bootstrap port-packet layout.
+pub type zx_port_packet_t = ax_port_packet_t;
 
-const _: [(); 32] = [(); core::mem::size_of::<zx_packet_user_t>()];
-const _: [(); 32] = [(); core::mem::size_of::<zx_packet_signal_t>()];
-const _: [(); 48] = [(); core::mem::size_of::<zx_port_packet_t>()];
-const _: [(); 8] = [(); core::mem::align_of::<zx_port_packet_t>()];
+const _: [(); 32] = [(); core::mem::size_of::<ax_packet_user_t>()];
+const _: [(); 32] = [(); core::mem::size_of::<ax_packet_signal_t>()];
+const _: [(); 48] = [(); core::mem::size_of::<ax_port_packet_t>()];
+const _: [(); 8] = [(); core::mem::align_of::<ax_port_packet_t>()];
 
 /// Clock ids.
 pub mod clock {
