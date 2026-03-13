@@ -152,6 +152,10 @@ const ROOT_DECL_STARNIX_ROUND6_PIDFD_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_round6_pidfd.nxcd"
 ));
+const ROOT_DECL_STARNIX_ROUND6_PROC_JOB_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_round6_proc_job.nxcd"
+));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
@@ -224,6 +228,13 @@ pub(crate) const LINUX_ROUND6_PIDFD_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_round6_pidfd_smoke.nxcd"));
 #[cfg(not(nexus_init_embed_starnix_round6_pidfd))]
 pub(crate) const LINUX_ROUND6_PIDFD_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round6_proc_job)]
+pub(crate) const LINUX_ROUND6_PROC_JOB_DECL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/linux_round6_proc_job_smoke.nxcd"
+));
+#[cfg(not(nexus_init_embed_starnix_round6_proc_job))]
+pub(crate) const LINUX_ROUND6_PROC_JOB_DECL_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_hello)]
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
@@ -289,11 +300,17 @@ pub(crate) const LINUX_ROUND6_PIDFD_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-round6-pidfd-smoke"));
 #[cfg(not(nexus_init_embed_starnix_round6_pidfd))]
 pub(crate) const LINUX_ROUND6_PIDFD_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round6_proc_job)]
+pub(crate) const LINUX_ROUND6_PROC_JOB_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-round6-proc-job-smoke"));
+#[cfg(not(nexus_init_embed_starnix_round6_proc_job))]
+pub(crate) const LINUX_ROUND6_PROC_JOB_BYTES: &[u8] = &[];
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
 pub(crate) const CHILD_ROLE_CONTROLLER_WORKER: &str = "controller-worker";
 const ROOT_COMPONENT_URL: &str = env!("NEXUS_INIT_ROOT_URL");
+const _: &str = env!("NEXUS_INIT_EMBED_STAMP");
 pub(crate) const ROOT_BINARY_PATH: &str = "bin/nexus-init";
 pub(crate) const PROVIDER_BINARY_PATH: &str = "bin/echo-provider";
 pub(crate) const CLIENT_BINARY_PATH: &str = "bin/echo-client";
@@ -312,6 +329,7 @@ pub(crate) const LINUX_ROUND6_SIGNALFD_BINARY_PATH: &str = "bin/linux-round6-sig
 pub(crate) const LINUX_ROUND6_FUTEX_BINARY_PATH: &str = "bin/linux-round6-futex-smoke";
 pub(crate) const LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH: &str = "bin/linux-round6-scm-rights-smoke";
 pub(crate) const LINUX_ROUND6_PIDFD_BINARY_PATH: &str = "bin/linux-round6-pidfd-smoke";
+pub(crate) const LINUX_ROUND6_PROC_JOB_BINARY_PATH: &str = "bin/linux-round6-proc-job-smoke";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -338,6 +356,7 @@ const STARNIX_ROUND6_SIGNALFD_EXPECTED_STDOUT: &[u8] = b"round6 signalfd ok\n";
 const STARNIX_ROUND6_FUTEX_EXPECTED_STDOUT: &[u8] = b"round6 futex ok\n";
 const STARNIX_ROUND6_SCM_RIGHTS_EXPECTED_STDOUT: &[u8] = b"round6 scm_rights ok\n";
 const STARNIX_ROUND6_PIDFD_EXPECTED_STDOUT: &[u8] = b"round6 pidfd ok\n";
+const STARNIX_ROUND6_PROC_JOB_EXPECTED_STDOUT: &[u8] = b"proc-fd bridge ok\nround6 proc_job ok\n";
 
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
@@ -600,6 +619,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             LINUX_ROUND6_PIDFD_BYTES,
         ));
     }
+    if !LINUX_ROUND6_PROC_JOB_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_PROC_JOB_BINARY_PATH,
+            LINUX_ROUND6_PROC_JOB_BYTES,
+        ));
+    }
     assets.push(BootAssetEntry::bytes(
         "manifests/root.nxcd",
         ROOT_DECL_EAGER_BYTES,
@@ -659,6 +684,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-round6-pidfd.nxcd",
         ROOT_DECL_STARNIX_ROUND6_PIDFD_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-round6-proc-job.nxcd",
+        ROOT_DECL_STARNIX_ROUND6_PROC_JOB_BYTES,
     ));
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
@@ -736,6 +765,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round6-pidfd-smoke.nxcd",
             LINUX_ROUND6_PIDFD_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_PROC_JOB_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-proc-job-smoke.nxcd",
+            LINUX_ROUND6_PROC_JOB_DECL_BYTES,
         ));
     }
     assets.push(BootAssetEntry::bytes(
@@ -966,6 +1001,16 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             &runners,
             "linux_round6_pidfd_smoke",
             STARNIX_ROUND6_PIDFD_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-round6-proc-job" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_round6_proc_job_smoke",
+            STARNIX_ROUND6_PROC_JOB_EXPECTED_STDOUT,
             summary,
         );
     }

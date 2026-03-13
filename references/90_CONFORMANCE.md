@@ -172,6 +172,20 @@ Main just targets include:
   - the current bootstrap gate intentionally keeps the pidfd object synthetic in
     the executive and excludes `waitid(P_PIDFD)` plus broader pidfd lifecycle
     features
+- The seventh Round-6 Starnix long-tail scenario now closes one narrow `/proc`
+  + job-control slice:
+  - `getpgrp` / `getpgid` / `getsid`
+  - `setpgid` / `setsid`
+  - `wait4` target matching for `pid == 0` and explicit negative process-group
+    targets
+  - `kill` routing for caller process-group and explicit process-group targets
+  - synthetic `/proc/self/status`, `/proc/self/stat`, `/proc/self/fd`, and
+    `/proc/self/fd/<n>` access, including one proxied write through
+    `/proc/self/fd/1`
+  - this gate also locks in Linux x86_64 integer-argument decoding at the
+    executive boundary: syscall parameters such as `AT_FDCWD == -100` must be
+    interpreted from the low 32 bits of the guest register, not by trying to
+    downcast the raw 64-bit register value
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return
@@ -236,6 +250,13 @@ This makes contract coverage part of the repo workflow, not just informal docume
   long-standing bootstrap userspace VA above 4 GiB, the component scenarios
   build them with `RUSTFLAGS='-C code-model=large'` instead of changing the
   whole `x86_64-unknown-none` target configuration.
+- The `nexus-init`-based component and Starnix scenarios now also force
+  `-C debuginfo=0` for those QEMU raw-loader builds:
+  - the bootstrap loader path imports the final userspace image as one raw ELF
+    blob rather than as a relocatable debug-aware image format
+  - leaving full debug sections enabled made the Rust ELFs large enough to
+    regress earlier scenarios into QEMU timeouts even when the underlying
+    behavior was still correct
 - The component scenarios now use wider QEMU loader spacing than the first
   round-two version because the dedicated Rust ELFs outgrew the older 4 MiB
   gaps, and the kernel bootstrap PMM reserved floor now follows that loader

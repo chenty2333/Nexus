@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     use std::fs;
@@ -29,6 +30,8 @@ fn main() {
         manifest_dir.join("../linux-round6-scm-rights-smoke/round6_scm_rights_smoke.S");
     let linux_round6_pidfd_source =
         manifest_dir.join("../linux-round6-pidfd-smoke/round6_pidfd_smoke.S");
+    let linux_round6_proc_job_source =
+        manifest_dir.join("../linux-round6-proc-job-smoke/round6_proc_job_smoke.S");
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
@@ -72,6 +75,10 @@ fn main() {
         "cargo:rerun-if-changed={}",
         linux_round6_pidfd_source.display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_round6_proc_job_source.display()
+    );
     for manifest in [
         "root_component.toml",
         "root_component_round3.toml",
@@ -88,6 +95,7 @@ fn main() {
         "root_component_starnix_round6_futex.toml",
         "root_component_starnix_round6_scm_rights.toml",
         "root_component_starnix_round6_pidfd.toml",
+        "root_component_starnix_round6_proc_job.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
@@ -104,6 +112,7 @@ fn main() {
         "linux_round6_futex_smoke.toml",
         "linux_round6_scm_rights_smoke.toml",
         "linux_round6_pidfd_smoke.toml",
+        "linux_round6_proc_job_smoke.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -164,6 +173,10 @@ fn main() {
             "root_component_starnix_round6_pidfd.toml",
             "root_component_starnix_round6_pidfd.nxcd",
         ),
+        (
+            "root_component_starnix_round6_proc_job.toml",
+            "root_component_starnix_round6_proc_job.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
@@ -206,6 +219,10 @@ fn main() {
         (
             "linux_round6_pidfd_smoke.toml",
             "linux_round6_pidfd_smoke.nxcd",
+        ),
+        (
+            "linux_round6_proc_job_smoke.toml",
+            "linux_round6_proc_job_smoke.nxcd",
         ),
     ] {
         let source_path = manifests_dir.join(input);
@@ -257,6 +274,10 @@ fn main() {
         &linux_round6_pidfd_source,
         &out_dir.join("linux-round6-pidfd-smoke"),
     );
+    build_linux_binary(
+        &linux_round6_proc_job_source,
+        &out_dir.join("linux-round6-proc-job-smoke"),
+    );
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
         // Link the bootstrap userspace binary at the fixed VA currently
@@ -267,6 +288,11 @@ fn main() {
     }
     let root_url =
         std::env::var("NEXUS_INIT_ROOT_URL").unwrap_or_else(|_| String::from("boot://root"));
+    let embed_stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    println!("cargo:rustc-env=NEXUS_INIT_EMBED_STAMP={embed_stamp}");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_hello)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_fd)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round2)");
@@ -280,6 +306,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_futex)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_scm_rights)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_pidfd)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_proc_job)");
     match root_url.as_str() {
         "boot://root-starnix" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
@@ -322,6 +349,9 @@ fn main() {
         }
         "boot://root-starnix-round6-pidfd" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_round6_pidfd");
+        }
+        "boot://root-starnix-round6-proc-job" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_round6_proc_job");
         }
         _ => {}
     }

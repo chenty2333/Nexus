@@ -95,6 +95,18 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - `pidfd_send_signal`
   - one synthetic pidfd object with readable state derived from thread-group
     zombie/exit transitions rather than from a new kernel pidfd object family
+  - one narrow `/proc` + job-control slice:
+    - `getpgrp`
+    - `getpgid`
+    - `getsid`
+    - `setpgid`
+    - `setsid`
+    - `wait4` target matching for `pid == 0` and `pid < -1`
+    - `kill` process-group routing for `pid == 0` and `pid < -1`
+    - synthetic `/proc`, `/proc/self`, `/proc/<pid>`, `/proc/<pid>/status`,
+      `/proc/<pid>/stat`, and `/proc/<pid>/fd/*`
+    - `/proc/<pid>/fd/<n>` stays a proxy to the live Linux file description
+      rather than a new native object family
 
 ## Frozen architectural split
 
@@ -439,6 +451,13 @@ Starnix syscall handling is split into three classes:
   - executive routes to native or synthetic backend objects
   - examples: `openat`, `getdents`, `ioctl`, `connect`, `sendmsg`
 
+For Linux syscall arguments whose UAPI type is `int` or another 32-bit scalar,
+the executive must decode the low 32 bits of the guest register and then apply
+the Linux signed/unsigned interpretation. It must not treat the raw 64-bit
+register contents as a host-sized positive integer. This preserves Linux ABI
+values such as `AT_FDCWD == -100`, negative process-group targets, and other
+low-32-bit sentinel arguments.
+
 This split is frozen because it keeps Linux semantics in userspace without
 forcing every syscall through one uniform RPC layer.
 
@@ -473,6 +492,16 @@ forcing every syscall through one uniform RPC layer.
   - one minimal userspace signal-handler trampoline path via `rt_sigreturn`
   - interruptible waits now cover `wait4` and blocking pipe-backed `read`
   - baseline `EINTR` / `SA_RESTART` behavior now exists for those wait paths
+  - one minimal process-group/session control surface now exists:
+    - `getpgrp` / `getpgid` / `getsid`
+    - `setpgid` / `setsid`
+    - process-group targeted `kill`
+    - `wait4` matching for caller group and explicit process-group waits
+  - one minimal synthetic `/proc` view now exists:
+    - `/proc/self/status`
+    - `/proc/self/stat`
+    - `/proc/self/fd`
+    - `/proc/self/fd/<n>`
   - no restart blocks / `sigaltstack` yet
   - no epoll model yet
 - `fork` currently clones the Linux-side control plane and eagerly copies the

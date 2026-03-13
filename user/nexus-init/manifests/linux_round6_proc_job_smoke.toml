@@ -1,0 +1,7 @@
+url = "boot://linux-round6-proc-job-smoke"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-round6-proc-job-smoke"
+args = ["linux-round6-proc-job-smoke"]
+env = []
