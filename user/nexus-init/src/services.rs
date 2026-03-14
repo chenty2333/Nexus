@@ -99,6 +99,26 @@ pub(crate) fn local_fd_metadata(fd: &dyn FdOps) -> Option<LocalFdMetadata> {
         .map(LocalFileFd::metadata)
 }
 
+pub(crate) fn local_fd_pread(
+    fd: &dyn FdOps,
+    offset: u64,
+    buffer: &mut [u8],
+) -> Option<Result<usize, zx_status_t>> {
+    fd.as_any()
+        .downcast_ref::<LocalFileFd>()
+        .map(|file| file.pread_at(offset, buffer))
+}
+
+pub(crate) fn local_fd_pwrite(
+    fd: &dyn FdOps,
+    offset: u64,
+    buffer: &[u8],
+) -> Option<Result<usize, zx_status_t>> {
+    fd.as_any()
+        .downcast_ref::<LocalFileFd>()
+        .map(|file| file.pwrite_at(offset, buffer))
+}
+
 pub(crate) fn run_tmpfs_smoke(namespace: &ProcessNamespace) -> Result<(), zx_status_t> {
     let tmp = namespace.open(
         "/tmp/bootstrap-note",
@@ -409,6 +429,33 @@ impl LocalFileFd {
         LocalFdMetadata {
             kind: LocalFdMetadataKind::RegularFile,
             size_bytes,
+        }
+    }
+
+    fn pread_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
+        let bytes = self.read_all();
+        let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if start >= bytes.len() {
+            return Ok(0);
+        }
+        let actual = (bytes.len() - start).min(buffer.len());
+        buffer[..actual].copy_from_slice(&bytes[start..start + actual]);
+        Ok(actual)
+    }
+
+    fn pwrite_at(&self, offset: u64, buffer: &[u8]) -> Result<usize, zx_status_t> {
+        match &self.backing {
+            LocalFileBacking::ReadOnly(_) => Err(ZX_ERR_ACCESS_DENIED),
+            LocalFileBacking::Mutable(file) => {
+                let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+                let mut bytes = file.bytes.lock();
+                let end = start.checked_add(buffer.len()).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+                if bytes.len() < end {
+                    bytes.resize(end, 0);
+                }
+                bytes[start..end].copy_from_slice(buffer);
+                Ok(buffer.len())
+            }
         }
     }
 }
@@ -797,7 +844,7 @@ fn create_vmo_with_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BootAssetEntry, BootstrapNamespace};
+    use super::{BootAssetEntry, BootstrapNamespace, local_fd_pread, local_fd_pwrite};
     use alloc::vec;
     use nexus_io::{FdTable, OpenFlags, SeekOrigin};
 
@@ -928,5 +975,49 @@ mod tests {
         let actual = table.read(fd, &mut bytes).expect("read from offset");
         assert_eq!(actual, 4);
         assert_eq!(&bytes[..actual], b"cdef");
+    }
+
+    #[test]
+    fn local_file_pread_and_pwrite_preserve_cursor() {
+        let namespace =
+            BootstrapNamespace::build(&[BootAssetEntry::bytes("manifests/root.nxcd", b"root")])
+                .expect("build namespace");
+
+        let file = namespace
+            .namespace()
+            .open(
+                "/tmp/state.bin",
+                OpenFlags::READABLE | OpenFlags::WRITABLE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            )
+            .expect("open tmp file");
+        file.write(b"abcdef").expect("seed bytes");
+
+        let mut read_back = [0u8; 4];
+        let actual = local_fd_pread(file.as_ref(), 2, &mut read_back)
+            .expect("local file helper")
+            .expect("pread");
+        assert_eq!(actual, 4);
+        assert_eq!(&read_back[..actual], b"cdef");
+
+        local_fd_pwrite(file.as_ref(), 1, b"XY")
+            .expect("local file helper")
+            .expect("pwrite");
+
+        let end = file
+            .seek(SeekOrigin::Current, 0)
+            .expect("cursor preserved at end");
+        assert_eq!(end, 6);
+
+        let mut sequential = [0u8; 6];
+        let actual = file
+            .read(&mut sequential)
+            .expect("read after pwrite at end");
+        assert_eq!(actual, 0);
+
+        file.seek(SeekOrigin::Start, 0)
+            .expect("seek back to start for content check");
+        let actual = file.read(&mut sequential).expect("read after pread/pwrite");
+        assert_eq!(actual, 6);
+        assert_eq!(&sequential[..actual], b"aXYdef");
     }
 }

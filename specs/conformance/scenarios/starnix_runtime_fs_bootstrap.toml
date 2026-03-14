@@ -1,0 +1,23 @@
+id = "kernel.starnix.runtime_fs_bootstrap"
+description = "Bootstrap starnix userspace should expose the next runtime fs slice: pread64/pwrite64, statx, AT_EMPTY_PATH fstatat, and relative proc readlinkat should work over the existing executive substrate"
+tags = ["kernel", "component", "starnix", "runner", "runtime", "fs"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/starnix-runtime-fs && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && NEXUS_INIT_ROOT_URL=boot://root-starnix-runtime-fs RUSTFLAGS='-C code-model=large -C debuginfo=0' cargo build -p nexus-init --target x86_64-unknown-none --target-dir \"$target_dir\" && init=\"$target_dir/x86_64-unknown-none/debug/nexus-init\" && init_size=$(stat -c%s \"$init\") && timeout --foreground 12s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$init\",addr=0x7000000,force-raw=on -device loader,data=$init_size,data-len=8,addr=0x6fffff8 -device loader,file=\"$init\",addr=0x5000000,force-raw=on -device loader,data=$init_size,data-len=8,addr=0x4fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+
+expect = ["kernel: component manager bootstrap"]
+forbid = ["KERNEL PANIC", "#GP:"]
+
+[assertions.status_code]
+resolve_root = 0
+resolve_provider = 0
+provider_launch = 0
+provider_event_read = 0
+
+[assertions.packet_fields]
+failure_step = 0
+provider_event_code = 0

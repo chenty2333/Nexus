@@ -240,9 +240,21 @@ Main just targets include:
     kernel task state
   - fd duplication and `CLOEXEC` remain Linux-fd semantics over the existing
     shared open-file-description substrate
-  - this gate intentionally excludes `arch_prctl`, TLS setup, `set_tid_address`,
-    positional I/O, and broader libc startup dependencies, which remain later
+  - this gate intentionally excludes `arch_prctl`, TLS setup, positional I/O,
+    and broader libc startup dependencies, which remain later
     runtime-enablement work
+- The next post-R7 runtime/filesystem scenario now closes one narrow positional
+  I/O and metadata slice:
+  - `pread64`
+  - `pwrite64`
+  - `statx`
+  - `newfstatat(..., AT_EMPTY_PATH, ...)`
+  - relative `readlinkat` against synthetic `/proc` directory fds
+  - the current gate intentionally keeps positional I/O narrow:
+    - local bootstrap file backends and synthetic proc text/proxy objects are
+      covered
+    - no new native `FdOps` offset-I/O contract is introduced yet
+    - remote/service-backed files still remain outside this bootstrap slice
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

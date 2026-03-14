@@ -153,9 +153,18 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - `uname`
     - `getrandom`
     - `set_tid_address`
+  - the next runtime-fs slice now also has:
+    - `pread64`
+    - `pwrite64`
+    - `statx`
+    - `newfstatat(..., AT_EMPTY_PATH, ...)`
+    - relative `readlinkat` against synthetic `/proc` directory fds
+    - positional I/O staying on top of executive-owned local-file and proc-text
+      backends rather than expanding the native `FdOps` public contract yet
   - the current `readlink`/`readlinkat` bootstrap remains intentionally narrow:
     - proc-style self links such as `/proc/self/exe` and `/proc/self/cwd`
     - proc fd links for stdio and current anon-inode/socket/pipe-style synthetic objects
+    - relative lookups through synthetic proc directory fds such as `/proc/self`
     - not a full generic symlink implementation for every backend yet
   - `getrandom` is currently one executive-owned bootstrap entropy source, suitable
     for libc/runtime bring-up but not yet documented as a strong cryptographic contract

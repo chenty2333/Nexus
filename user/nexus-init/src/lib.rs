@@ -172,6 +172,10 @@ const ROOT_DECL_STARNIX_RUNTIME_MISC_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_runtime_misc.nxcd"
 ));
+const ROOT_DECL_STARNIX_RUNTIME_FS_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_runtime_fs.nxcd"
+));
 const ROOT_DECL_STARNIX_DYNAMIC_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_dynamic.nxcd"
@@ -279,6 +283,11 @@ pub(crate) const LINUX_RUNTIME_MISC_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_runtime_misc_smoke.nxcd"));
 #[cfg(not(nexus_init_embed_starnix_runtime_misc))]
 pub(crate) const LINUX_RUNTIME_MISC_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_runtime_fs)]
+pub(crate) const LINUX_RUNTIME_FS_DECL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux_runtime_fs_smoke.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_runtime_fs))]
+pub(crate) const LINUX_RUNTIME_FS_DECL_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_dynamic)]
 pub(crate) const LINUX_DYNAMIC_ELF_SMOKE_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_dynamic_elf_smoke.nxcd"));
@@ -374,6 +383,11 @@ pub(crate) const LINUX_RUNTIME_MISC_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-runtime-misc-smoke"));
 #[cfg(not(nexus_init_embed_starnix_runtime_misc))]
 pub(crate) const LINUX_RUNTIME_MISC_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_runtime_fs)]
+pub(crate) const LINUX_RUNTIME_FS_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-runtime-fs-smoke"));
+#[cfg(not(nexus_init_embed_starnix_runtime_fs))]
+pub(crate) const LINUX_RUNTIME_FS_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_dynamic)]
 pub(crate) const LINUX_DYNAMIC_ELF_SMOKE_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-dynamic-elf-smoke"));
@@ -419,6 +433,7 @@ pub(crate) const LINUX_ROUND6_PROC_CONTROL_BINARY_PATH: &str =
 pub(crate) const LINUX_ROUND6_PROC_TTY_BINARY_PATH: &str = "bin/linux-round6-proc-tty-smoke";
 pub(crate) const LINUX_RUNTIME_FD_BINARY_PATH: &str = "bin/linux-runtime-fd-smoke";
 pub(crate) const LINUX_RUNTIME_MISC_BINARY_PATH: &str = "bin/linux-runtime-misc-smoke";
+pub(crate) const LINUX_RUNTIME_FS_BINARY_PATH: &str = "bin/linux-runtime-fs-smoke";
 pub(crate) const LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH: &str = "bin/linux-dynamic-elf-smoke";
 pub(crate) const LINUX_DYNAMIC_MAIN_BINARY_PATH: &str = "bin/linux-dynamic-main";
 pub(crate) const LINUX_DYNAMIC_INTERP_BINARY_PATH: &str = "lib/ld-nexus-dynamic-smoke.so";
@@ -453,6 +468,7 @@ const STARNIX_ROUND6_PROC_CONTROL_EXPECTED_STDOUT: &[u8] = b"round6 proc_control
 const STARNIX_ROUND6_PROC_TTY_EXPECTED_STDOUT: &[u8] = b"tround6 proc_tty ok\n";
 const STARNIX_RUNTIME_FD_EXPECTED_STDOUT: &[u8] = b"runtime fd ok\n";
 const STARNIX_RUNTIME_MISC_EXPECTED_STDOUT: &[u8] = b"runtime misc ok\n";
+const STARNIX_RUNTIME_FS_EXPECTED_STDOUT: &[u8] = b"runtime fs ok\n";
 const STARNIX_DYNAMIC_ELF_EXPECTED_STDOUT: &[u8] = b"dynamic interp ok\n";
 
 #[repr(align(16))]
@@ -746,6 +762,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             LINUX_RUNTIME_MISC_BYTES,
         ));
     }
+    if !LINUX_RUNTIME_FS_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_RUNTIME_FS_BINARY_PATH,
+            LINUX_RUNTIME_FS_BYTES,
+        ));
+    }
     if !LINUX_DYNAMIC_ELF_SMOKE_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH,
@@ -839,6 +861,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-runtime-misc.nxcd",
         ROOT_DECL_STARNIX_RUNTIME_MISC_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-runtime-fs.nxcd",
+        ROOT_DECL_STARNIX_RUNTIME_FS_BYTES,
     ));
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-dynamic.nxcd",
@@ -950,6 +976,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-runtime-misc-smoke.nxcd",
             LINUX_RUNTIME_MISC_DECL_BYTES,
+        ));
+    }
+    if !LINUX_RUNTIME_FS_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-runtime-fs-smoke.nxcd",
+            LINUX_RUNTIME_FS_DECL_BYTES,
         ));
     }
     if !LINUX_DYNAMIC_ELF_SMOKE_DECL_BYTES.is_empty() {
@@ -1236,6 +1268,16 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             &runners,
             "linux_runtime_misc_smoke",
             STARNIX_RUNTIME_MISC_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-runtime-fs" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_runtime_fs_smoke",
+            STARNIX_RUNTIME_FS_EXPECTED_STDOUT,
             summary,
         );
     }
