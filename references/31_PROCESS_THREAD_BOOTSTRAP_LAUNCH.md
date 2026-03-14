@@ -135,6 +135,12 @@ The first generic-launch contract is now implemented without changing syscall si
   ABI now exposes one fixed header plus appended stack-image bytes. The kernel maps the ELF image
   using the normal process-image layout path and installs the caller-provided Linux stack image
   into the fixed startup stack VMO.
+- The current v2 contract extends that blob with one optional interpreter header plus appended
+  interpreter ELF bytes. This is the first dynamic-ELF bootstrap slice:
+  - one ET_EXEC main image may carry `PT_INTERP`
+  - the userspace executive resolves the interpreter bytes from its namespace
+  - the kernel maps the interpreter as one additional process image using the supplied load bias
+  - the initial entry comes from the interpreter and the userspace stack now carries `AT_BASE`
 - The current Starnix bootstrap and minimal `execve()` paths are the first consumers of that
   helper: the userspace executive prepares one Linux stack image, calls
   `ax_process_prepare_linux_exec()`, then starts the target thread with the returned entry and
@@ -180,9 +186,12 @@ The first generic-launch contract is now implemented without changing syscall si
   - ELF64
   - little-endian
   - x86_64
-  - ET_EXEC
+  - ET_EXEC for the main image
+  - ET_DYN when the caller supplies one explicit page-aligned load bias for an interpreter image
 - The startup stack image is intentionally minimal today and does not yet carry the eventual full
   launcher-provided `argv` / `environ` contract.
-- Linux exec-prepare currently supports one fixed startup stack VMO and an opaque v1 exec-spec
-  header plus appended stack-image bytes; it is enough for the current bootstrap and minimal
-  `execve()` replacement path but is not yet the final long-term contract.
+- Linux exec-prepare currently supports one fixed startup stack VMO plus:
+  - a v1 exec-spec header with appended stack-image bytes
+  - a v2 exec-spec header with optional appended interpreter metadata and interpreter bytes
+  This is enough for the current bootstrap, minimal `execve()` replacement path, and first
+  `PT_INTERP` dynamic-ELF slice, but it is not yet the final long-term contract.

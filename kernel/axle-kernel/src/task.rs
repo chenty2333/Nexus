@@ -1420,6 +1420,29 @@ impl ProcessImageLayout {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LinuxExecExtraImage<'a> {
+    layout: ProcessImageLayout,
+    image_bytes: &'a [u8],
+}
+
+impl<'a> LinuxExecExtraImage<'a> {
+    pub(crate) fn new(layout: ProcessImageLayout, image_bytes: &'a [u8]) -> Self {
+        Self {
+            layout,
+            image_bytes,
+        }
+    }
+
+    pub(crate) const fn layout(&self) -> &ProcessImageLayout {
+        &self.layout
+    }
+
+    pub(crate) const fn image_bytes(&self) -> &'a [u8] {
+        self.image_bytes
+    }
+}
+
 pub(crate) const fn process_image_default_code_perms() -> MappingPerms {
     MappingPerms::READ.union(MappingPerms::EXECUTE)
 }
@@ -1439,6 +1462,28 @@ fn align_up_user_page(value: u64) -> Result<u64, zx_status_t> {
         .checked_add(align - 1)
         .map(|rounded| rounded & !(align - 1))
         .ok_or(ZX_ERR_OUT_OF_RANGE)
+}
+
+fn exec_image_backing_size(
+    layout: &ProcessImageLayout,
+    image_size: u64,
+) -> Result<u64, zx_status_t> {
+    let mut required = image_size;
+    for segment in layout.segments() {
+        let map_base = segment.vaddr() & !(crate::userspace::USER_PAGE_BYTES - 1);
+        let map_offset = segment.vmo_offset() & !(crate::userspace::USER_PAGE_BYTES - 1);
+        let page_delta = segment
+            .vaddr()
+            .checked_sub(map_base)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let len = align_up_user_page(
+            page_delta
+                .checked_add(segment.mem_size_bytes())
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+        )?;
+        required = required.max(map_offset.checked_add(len).ok_or(ZX_ERR_OUT_OF_RANGE)?);
+    }
+    align_up_user_page(required)
 }
 
 fn build_process_start_stack_image(
@@ -4220,17 +4265,19 @@ impl Kernel {
         regs: &ax_guest_x64_regs_t,
     ) -> Result<(), zx_status_t> {
         let stack_probe = regs.rsp.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
-        if !self.validate_process_user_mapping_perms(
+        let entry_ok = self.validate_process_user_mapping_perms(
             process_id,
             regs.rip,
             1,
             MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER,
-        ) || !self.validate_process_user_mapping_perms(
+        );
+        let stack_ok = self.validate_process_user_mapping_perms(
             process_id,
             stack_probe,
             8,
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
-        ) {
+        );
+        if !entry_ok || !stack_ok {
             return Err(ZX_ERR_INVALID_ARGS);
         }
         Ok(())
@@ -4846,6 +4893,7 @@ impl Kernel {
         layout: &ProcessImageLayout,
         exec_spec: ax_linux_exec_spec_header_t,
         stack_image: &[u8],
+        extra_image: Option<&LinuxExecExtraImage<'_>>,
     ) -> Result<PreparedProcessStart, zx_status_t> {
         let process = self.process(process_id)?;
         if process.state != ProcessState::Created {
@@ -4859,6 +4907,7 @@ impl Kernel {
                 layout,
                 exec_spec,
                 stack_image,
+                extra_image,
             )
         })
     }
@@ -6516,6 +6565,7 @@ impl VmDomain {
             stack.stack_pointer,
             stack.stack_vmo_offset,
             &stack.image,
+            None,
         )
     }
 
@@ -6527,6 +6577,7 @@ impl VmDomain {
         layout: &ProcessImageLayout,
         exec_spec: ax_linux_exec_spec_header_t,
         stack_image: &[u8],
+        extra_image: Option<&LinuxExecExtraImage<'_>>,
     ) -> Result<PreparedProcessStart, zx_status_t> {
         validate_linux_exec_stack_spec(exec_spec, stack_image)?;
         self.prepare_process_start_with_stack_image(
@@ -6538,6 +6589,7 @@ impl VmDomain {
             exec_spec.stack_pointer,
             exec_spec.stack_vmo_offset,
             stack_image,
+            extra_image,
         )
     }
 
@@ -6551,6 +6603,7 @@ impl VmDomain {
         stack_pointer: u64,
         stack_vmo_offset: u64,
         stack_image: &[u8],
+        extra_image: Option<&LinuxExecExtraImage<'_>>,
     ) -> Result<PreparedProcessStart, zx_status_t> {
         let root_vmar_id = {
             let address_space = self
@@ -6561,78 +6614,21 @@ impl VmDomain {
             root.id()
         };
 
-        let local_vmo_id =
-            self.import_global_vmo_into_address_space(address_space_id, global_vmo_id)?;
-        if layout.segments().is_empty() {
-            self.map_existing_local_vmo_fixed(
+        self.map_exec_layout_from_global_vmo(
+            process_id,
+            address_space_id,
+            root_vmar_id,
+            global_vmo_id,
+            layout,
+        )?;
+        if let Some(extra_image) = extra_image {
+            self.map_exec_layout_from_bytes(
+                process_id,
                 address_space_id,
                 root_vmar_id,
-                layout.code_base(),
-                crate::userspace::USER_CODE_BYTES,
-                local_vmo_id,
-                0,
-                process_image_default_code_perms() | MappingPerms::USER,
+                extra_image.layout(),
+                extra_image.image_bytes(),
             )?;
-        } else {
-            for segment in layout.segments() {
-                let map_base = segment.vaddr() & !(crate::userspace::USER_PAGE_BYTES - 1);
-                let map_offset = segment.vmo_offset() & !(crate::userspace::USER_PAGE_BYTES - 1);
-                let page_delta = segment
-                    .vaddr()
-                    .checked_sub(map_base)
-                    .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-                let len = align_up_user_page(
-                    page_delta
-                        .checked_add(segment.mem_size_bytes())
-                        .ok_or(ZX_ERR_OUT_OF_RANGE)?,
-                )?;
-                if len == 0 {
-                    continue;
-                }
-                let perms = segment.perms() | MappingPerms::USER;
-                if perms.contains(MappingPerms::WRITE) {
-                    let private_global_vmo_id = self.alloc_global_vmo_id();
-                    let private_vmo = self.create_anonymous_vmo_for_address_space(
-                        process_id,
-                        address_space_id,
-                        len,
-                        private_global_vmo_id,
-                    )?;
-                    self.map_existing_local_vmo_fixed(
-                        address_space_id,
-                        root_vmar_id,
-                        map_base,
-                        len,
-                        private_vmo.vmo_id(),
-                        0,
-                        perms,
-                    )?;
-                    if segment.file_size_bytes() != 0 {
-                        let bytes = self.read_shared_vmo_bytes(
-                            global_vmo_id,
-                            segment.vmo_offset(),
-                            usize::try_from(segment.file_size_bytes())
-                                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
-                        )?;
-                        self.write_local_vmo_bytes(
-                            address_space_id,
-                            private_vmo.vmo_id(),
-                            page_delta,
-                            &bytes,
-                        )?;
-                    }
-                } else {
-                    self.map_existing_local_vmo_fixed(
-                        address_space_id,
-                        root_vmar_id,
-                        map_base,
-                        len,
-                        local_vmo_id,
-                        map_offset,
-                        perms,
-                    )?;
-                }
-            }
         }
 
         let stack_global_vmo_id = self.alloc_global_vmo_id();
@@ -6658,10 +6654,166 @@ impl VmDomain {
             stack_image,
         )?;
 
+        let stack_probe = stack_pointer.checked_sub(8).ok_or(ZX_ERR_INVALID_ARGS)?;
+        let entry_ok = self
+            .lookup_user_mapping(address_space_id, entry, 1)
+            .is_some_and(|lookup| {
+                mapping_satisfies_required_perms(
+                    lookup,
+                    MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER,
+                )
+            });
+        let stack_ok = self
+            .lookup_user_mapping(address_space_id, stack_probe, 8)
+            .is_some_and(|lookup| {
+                mapping_satisfies_required_perms(
+                    lookup,
+                    MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                )
+            });
+        if !entry_ok || !stack_ok {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
         Ok(PreparedProcessStart {
             entry,
             stack_top: stack_pointer,
         })
+    }
+
+    fn map_exec_layout_from_global_vmo(
+        &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        root_vmar_id: VmarId,
+        global_vmo_id: KernelVmoId,
+        layout: &ProcessImageLayout,
+    ) -> Result<(), zx_status_t> {
+        let local_vmo_id =
+            self.import_global_vmo_into_address_space(address_space_id, global_vmo_id)?;
+        self.map_exec_layout_with_reader(
+            process_id,
+            address_space_id,
+            root_vmar_id,
+            layout,
+            local_vmo_id,
+            |this, offset, len| this.read_shared_vmo_bytes(global_vmo_id, offset, len),
+        )
+    }
+
+    fn map_exec_layout_from_bytes(
+        &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        root_vmar_id: VmarId,
+        layout: &ProcessImageLayout,
+        image_bytes: &[u8],
+    ) -> Result<(), zx_status_t> {
+        let image_size = u64::try_from(image_bytes.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let backing_size = exec_image_backing_size(layout, image_size)?;
+        let file_global_vmo_id = self.alloc_global_vmo_id();
+        let file_vmo = self.create_anonymous_vmo_for_address_space(
+            process_id,
+            address_space_id,
+            backing_size,
+            file_global_vmo_id,
+        )?;
+        if !image_bytes.is_empty() {
+            self.write_local_vmo_bytes(address_space_id, file_vmo.vmo_id(), 0, image_bytes)?;
+        }
+        self.map_exec_layout_with_reader(
+            process_id,
+            address_space_id,
+            root_vmar_id,
+            layout,
+            file_vmo.vmo_id(),
+            |this, offset, len| {
+                this.read_local_vmo_bytes(address_space_id, file_vmo.vmo_id(), offset, len)
+            },
+        )
+    }
+
+    fn map_exec_layout_with_reader(
+        &mut self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        root_vmar_id: VmarId,
+        layout: &ProcessImageLayout,
+        file_vmo_id: VmoId,
+        mut read_bytes: impl FnMut(&mut Self, u64, usize) -> Result<Vec<u8>, zx_status_t>,
+    ) -> Result<(), zx_status_t> {
+        if layout.segments().is_empty() {
+            self.map_existing_local_vmo_fixed(
+                address_space_id,
+                root_vmar_id,
+                layout.code_base(),
+                crate::userspace::USER_CODE_BYTES,
+                file_vmo_id,
+                0,
+                process_image_default_code_perms() | MappingPerms::USER,
+            )?;
+            return Ok(());
+        }
+        for segment in layout.segments() {
+            let map_base = segment.vaddr() & !(crate::userspace::USER_PAGE_BYTES - 1);
+            let map_offset = segment.vmo_offset() & !(crate::userspace::USER_PAGE_BYTES - 1);
+            let page_delta = segment
+                .vaddr()
+                .checked_sub(map_base)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let len = align_up_user_page(
+                page_delta
+                    .checked_add(segment.mem_size_bytes())
+                    .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+            )?;
+            if len == 0 {
+                continue;
+            }
+            let perms = segment.perms() | MappingPerms::USER;
+            if perms.contains(MappingPerms::WRITE) {
+                let private_global_vmo_id = self.alloc_global_vmo_id();
+                let private_vmo = self.create_anonymous_vmo_for_address_space(
+                    process_id,
+                    address_space_id,
+                    len,
+                    private_global_vmo_id,
+                )?;
+                self.map_existing_local_vmo_fixed(
+                    address_space_id,
+                    root_vmar_id,
+                    map_base,
+                    len,
+                    private_vmo.vmo_id(),
+                    0,
+                    perms,
+                )?;
+                if segment.file_size_bytes() != 0 {
+                    let bytes = read_bytes(
+                        self,
+                        segment.vmo_offset(),
+                        usize::try_from(segment.file_size_bytes())
+                            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                    )?;
+                    self.write_local_vmo_bytes(
+                        address_space_id,
+                        private_vmo.vmo_id(),
+                        page_delta,
+                        &bytes,
+                    )?;
+                }
+            } else {
+                self.map_existing_local_vmo_fixed(
+                    address_space_id,
+                    root_vmar_id,
+                    map_base,
+                    len,
+                    file_vmo_id,
+                    map_offset,
+                    perms,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn local_vmo_snapshot(

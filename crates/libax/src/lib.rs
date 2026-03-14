@@ -29,9 +29,9 @@ pub use axle_types::vm;
 pub use axle_types::wait_async;
 pub use axle_types::{
     ax_clock_t, ax_duration_t, ax_futex_t, ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_handle_t,
-    ax_koid_t, ax_linux_exec_spec_header_t, ax_packet_signal_t, ax_packet_type_t, ax_packet_user_t,
-    ax_port_packet_t, ax_rights_t, ax_signals_t, ax_status_t, ax_time_t, ax_vaddr_t,
-    ax_vm_option_t,
+    ax_koid_t, ax_linux_exec_interp_header_t, ax_linux_exec_spec_header_t, ax_packet_signal_t,
+    ax_packet_type_t, ax_packet_user_t, ax_port_packet_t, ax_rights_t, ax_signals_t, ax_status_t,
+    ax_time_t, ax_vaddr_t, ax_vm_option_t,
 };
 
 use axle_types::status::{AX_ERR_NO_MEMORY, AX_ERR_OUT_OF_RANGE, AX_OK};
@@ -664,6 +664,16 @@ pub fn ax_linux_exec_spec_blob(
     stack_image: &[u8],
 ) -> Result<Vec<u8>, ax_status_t> {
     libzircon::ax_linux_exec_spec_blob(header, stack_image)
+}
+
+/// Build one v2 Linux exec-spec blob with an appended interpreter image.
+pub fn ax_linux_exec_spec_blob_with_interp(
+    header: ax_linux_exec_spec_header_t,
+    stack_image: &[u8],
+    interp: ax_linux_exec_interp_header_t,
+    interp_image: &[u8],
+) -> Result<Vec<u8>, ax_status_t> {
+    libzircon::ax_linux_exec_spec_blob_with_interp(header, stack_image, interp, interp_image)
 }
 
 /// Read one guest stop-state snapshot from a sidecar VMO.

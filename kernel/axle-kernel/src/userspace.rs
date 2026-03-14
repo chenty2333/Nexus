@@ -951,6 +951,14 @@ pub(crate) fn parse_elf_process_image_layout(
     image_size: u64,
     mut read_bytes: impl FnMut(u64, usize) -> Result<Vec<u8>, zx_status_t>,
 ) -> Result<crate::task::ProcessImageLayout, zx_status_t> {
+    parse_elf_process_image_layout_with_load_bias(image_size, &mut read_bytes, None)
+}
+
+pub(crate) fn parse_elf_process_image_layout_with_load_bias(
+    image_size: u64,
+    mut read_bytes: impl FnMut(u64, usize) -> Result<Vec<u8>, zx_status_t>,
+    load_bias: Option<u64>,
+) -> Result<crate::task::ProcessImageLayout, zx_status_t> {
     if image_size < core::mem::size_of::<Elf64Ehdr>() as u64 {
         return Err(ZX_ERR_NOT_SUPPORTED);
     }
@@ -965,8 +973,15 @@ pub(crate) fn parse_elf_process_image_layout(
     if ehdr.e_ident[4] != 2 || ehdr.e_ident[5] != 1 {
         return Err(ZX_ERR_NOT_SUPPORTED);
     }
-    if ehdr.e_type != 2 || ehdr.e_machine != 0x3E {
+    const ET_EXEC: u16 = 2;
+    const ET_DYN: u16 = 3;
+    if ehdr.e_machine != 0x3E {
         return Err(ZX_ERR_NOT_SUPPORTED);
+    }
+    match (ehdr.e_type, load_bias) {
+        (ET_EXEC, None) => {}
+        (ET_DYN, Some(load_bias)) if (load_bias & (USER_PAGE_BYTES - 1)) == 0 => {}
+        _ => return Err(ZX_ERR_NOT_SUPPORTED),
     }
     if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
         return Err(ZX_ERR_NOT_SUPPORTED);
@@ -987,6 +1002,7 @@ pub(crate) fn parse_elf_process_image_layout(
     let mut min_vaddr = u64::MAX;
     let mut max_vend = 0u64;
     let mut phdr_vaddr = None;
+    let image_bias = load_bias.unwrap_or(0);
     for i in 0..phnum {
         let off = i * core::mem::size_of::<Elf64Phdr>();
         // SAFETY: `off` stays within the already-fetched program-header table and the target
@@ -1003,7 +1019,10 @@ pub(crate) fn parse_elf_process_image_layout(
             return Err(ZX_ERR_NOT_SUPPORTED);
         }
 
-        let vaddr = ph.p_vaddr;
+        let vaddr = ph
+            .p_vaddr
+            .checked_add(image_bias)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
         let vend = vaddr.checked_add(ph.p_memsz).unwrap_or(u64::MAX);
         if vaddr < USER_CODE_VA || vend > USER_SHARED_VA {
             return Err(ZX_ERR_NOT_SUPPORTED);
@@ -1031,14 +1050,18 @@ pub(crate) fn parse_elf_process_image_layout(
             .checked_add((phnum as u64) * (core::mem::size_of::<Elf64Phdr>() as u64))
             .unwrap_or(u64::MAX);
         if phdr_vaddr.is_none() && ehdr.e_phoff >= ph.p_offset && phdr_end <= file_end {
-            phdr_vaddr = ph.p_vaddr.checked_add(ehdr.e_phoff - ph.p_offset);
+            phdr_vaddr = vaddr.checked_add(ehdr.e_phoff - ph.p_offset);
         }
     }
 
     if segments.is_empty() {
         return Err(ZX_ERR_NOT_SUPPORTED);
     }
-    if ehdr.e_entry < min_vaddr || ehdr.e_entry >= max_vend {
+    let entry = ehdr
+        .e_entry
+        .checked_add(image_bias)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    if entry < min_vaddr || entry >= max_vend {
         return Err(ZX_ERR_NOT_SUPPORTED);
     }
 
@@ -1050,7 +1073,7 @@ pub(crate) fn parse_elf_process_image_layout(
     crate::task::ProcessImageLayout::with_segments_and_elf(
         code_base,
         code_size_bytes,
-        ehdr.e_entry,
+        entry,
         &segments,
         phdr_vaddr.map(|vaddr| {
             crate::task::ProcessImageElfInfo::new(vaddr, ehdr.e_phentsize, ehdr.e_phnum)

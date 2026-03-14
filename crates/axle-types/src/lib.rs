@@ -239,6 +239,10 @@ impl ax_guest_stop_state_t {
 /// The full blob is:
 /// - this header
 /// - followed immediately by `stack_bytes_len` bytes of stack image data
+/// - for v2 with `AX_LINUX_EXEC_SPEC_F_INTERP`, one
+///   `ax_linux_exec_interp_header_t`
+/// - followed immediately by `image_bytes_len` bytes of interpreter ELF file
+///   contents
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ax_linux_exec_spec_header_t {
@@ -284,6 +288,40 @@ impl ax_linux_exec_spec_header_t {
             stack_pointer: read_u64_le(bytes, 16)?,
             stack_vmo_offset: read_u64_le(bytes, 24)?,
             stack_bytes_len: read_u64_le(bytes, 32)?,
+        })
+    }
+}
+
+/// Optional trailing header for one interpreter image in a Linux exec-spec blob.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ax_linux_exec_interp_header_t {
+    /// Fixed load bias to apply when mapping one ET_DYN interpreter image.
+    pub load_bias: u64,
+    /// Number of bytes that follow this header in the exec-spec blob.
+    pub image_bytes_len: u64,
+}
+
+impl ax_linux_exec_interp_header_t {
+    /// Encoded byte size of the fixed little-endian trailing header.
+    pub const BYTE_LEN: usize = 16;
+
+    /// Encode into the fixed little-endian header form.
+    pub fn encode(self) -> [u8; Self::BYTE_LEN] {
+        let mut out = [0u8; Self::BYTE_LEN];
+        write_u64_le(&mut out, 0, self.load_bias);
+        write_u64_le(&mut out, 8, self.image_bytes_len);
+        out
+    }
+
+    /// Decode from the prefix of one interpreter-image payload.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::BYTE_LEN {
+            return None;
+        }
+        Some(Self {
+            load_bias: read_u64_le(bytes, 0)?,
+            image_bytes_len: read_u64_le(bytes, 8)?,
         })
     }
 }
@@ -565,6 +603,11 @@ pub mod guest {
     pub const AX_GUEST_X64_SYSCALL_INSN_LEN: u64 = 2;
     /// ABI version for the v1 Linux exec specification header.
     pub const AX_LINUX_EXEC_SPEC_V1: u32 = 1;
+    /// ABI version for the v2 Linux exec specification header.
+    pub const AX_LINUX_EXEC_SPEC_V2: u32 = 2;
+    /// v2 exec-spec flag: one interpreter image header and payload follow the
+    /// stack-image bytes.
+    pub const AX_LINUX_EXEC_SPEC_F_INTERP: u32 = 1 << 0;
 }
 
 /// Zircon handle rights bit definitions.

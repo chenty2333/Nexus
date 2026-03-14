@@ -213,6 +213,18 @@ Main just targets include:
   - the bootstrap gate intentionally keeps tty ownership policy narrow:
     foreground/background is modeled only for the inherited stdio set and still
     excludes `tcsetpgrp`, `TIOCSPGRP`, and broader tty discipline
+- The first post-R7 loader/runtime scenario now closes one narrow dynamic-ELF
+  bootstrap slice:
+  - `execve` of one ET_EXEC main image carrying `PT_INTERP`
+  - namespace resolution of the requested interpreter path
+  - ET_DYN interpreter mapping at one explicit load bias
+  - `AT_BASE` handed to the initial stack image
+  - first userspace entry through the interpreter rather than the main image
+  - the current bootstrap gate intentionally keeps the slice narrow:
+    - one static interpreter payload
+    - no shared-library dependency graph
+    - no relocations beyond the fixed entry path
+    - no general `PT_INTERP` package/runtime search policy yet
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

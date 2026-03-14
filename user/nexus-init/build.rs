@@ -36,6 +36,10 @@ fn main() {
         manifest_dir.join("../linux-round6-proc-control-smoke/round6_proc_control_smoke.S");
     let linux_round6_proc_tty_source =
         manifest_dir.join("../linux-round6-proc-tty-smoke/round6_proc_tty_smoke.S");
+    let linux_dynamic_elf_smoke_source =
+        manifest_dir.join("../linux-dynamic-elf-smoke/dynamic_elf_smoke.S");
+    let linux_dynamic_main_source = manifest_dir.join("../linux-dynamic-main/dynamic_main.S");
+    let linux_dynamic_interp_source = manifest_dir.join("../linux-dynamic-interp/dynamic_interp.S");
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
@@ -91,6 +95,18 @@ fn main() {
         "cargo:rerun-if-changed={}",
         linux_round6_proc_tty_source.display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_dynamic_elf_smoke_source.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_dynamic_main_source.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_dynamic_interp_source.display()
+    );
     for manifest in [
         "root_component.toml",
         "root_component_round3.toml",
@@ -110,6 +126,7 @@ fn main() {
         "root_component_starnix_round6_proc_job.toml",
         "root_component_starnix_round6_proc_control.toml",
         "root_component_starnix_round6_proc_tty.toml",
+        "root_component_starnix_dynamic.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
@@ -129,6 +146,7 @@ fn main() {
         "linux_round6_proc_job_smoke.toml",
         "linux_round6_proc_control_smoke.toml",
         "linux_round6_proc_tty_smoke.toml",
+        "linux_dynamic_elf_smoke.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -201,6 +219,10 @@ fn main() {
             "root_component_starnix_round6_proc_tty.toml",
             "root_component_starnix_round6_proc_tty.nxcd",
         ),
+        (
+            "root_component_starnix_dynamic.toml",
+            "root_component_starnix_dynamic.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
@@ -255,6 +277,10 @@ fn main() {
         (
             "linux_round6_proc_tty_smoke.toml",
             "linux_round6_proc_tty_smoke.nxcd",
+        ),
+        (
+            "linux_dynamic_elf_smoke.toml",
+            "linux_dynamic_elf_smoke.nxcd",
         ),
     ] {
         let source_path = manifests_dir.join(input);
@@ -318,6 +344,20 @@ fn main() {
         &linux_round6_proc_tty_source,
         &out_dir.join("linux-round6-proc-tty-smoke"),
     );
+    build_linux_binary(
+        &linux_dynamic_elf_smoke_source,
+        &out_dir.join("linux-dynamic-elf-smoke"),
+    );
+    build_linux_dynamic_binary(
+        &linux_dynamic_main_source,
+        &out_dir.join("linux-dynamic-main"),
+        "/lib/ld-nexus-dynamic-smoke.so",
+    );
+    build_linux_shared_binary(
+        &linux_dynamic_interp_source,
+        &out_dir.join("ld-nexus-dynamic-smoke.so"),
+        "ld-nexus-dynamic-smoke.so",
+    );
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
         // Link the bootstrap userspace binary at the fixed VA currently
@@ -349,6 +389,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_proc_job)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_proc_control)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_proc_tty)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic)");
     match root_url.as_str() {
         "boot://root-starnix" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
@@ -401,6 +442,9 @@ fn main() {
         "boot://root-starnix-round6-proc-tty" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_round6_proc_tty");
         }
+        "boot://root-starnix-dynamic" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_dynamic");
+        }
         _ => {}
     }
     println!("cargo:rustc-env=NEXUS_INIT_ROOT_URL={root_url}");
@@ -423,6 +467,50 @@ fn build_linux_binary(source: &Path, output: &Path) {
         .arg("-Wl,-z,max-page-size=4096")
         .arg("-Wl,--build-id=none")
         .arg("-Wl,--image-base=0x100000000")
+        .arg("-o")
+        .arg(output)
+        .arg(source)
+        .status()
+        .unwrap_or_else(|err| panic!("spawn {clang}: {err}"));
+    assert!(status.success(), "build {} failed", output.display());
+}
+
+fn build_linux_dynamic_binary(source: &Path, output: &Path, interp: &str) {
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| String::from("clang"));
+    let dynamic_linker = format!("--dynamic-linker={interp}");
+    let status = Command::new(&clang)
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("-nostdlib")
+        .arg("-no-pie")
+        .arg("-fuse-ld=lld")
+        .arg("-Wl,--entry=_start")
+        .arg("-Wl,-z,noexecstack")
+        .arg("-Wl,-z,max-page-size=4096")
+        .arg("-Wl,--build-id=none")
+        .arg("-Wl,--image-base=0x100000000")
+        .arg(format!("-Wl,{dynamic_linker}"))
+        .arg("-o")
+        .arg(output)
+        .arg(source)
+        .status()
+        .unwrap_or_else(|err| panic!("spawn {clang}: {err}"));
+    assert!(status.success(), "build {} failed", output.display());
+}
+
+fn build_linux_shared_binary(source: &Path, output: &Path, soname: &str) {
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| String::from("clang"));
+    let soname_flag = format!("-Wl,-soname,{soname}");
+    let status = Command::new(&clang)
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("-nostdlib")
+        .arg("-shared")
+        .arg("-fPIC")
+        .arg("-fuse-ld=lld")
+        .arg("-Wl,--entry=_start")
+        .arg("-Wl,-z,noexecstack")
+        .arg("-Wl,-z,max-page-size=4096")
+        .arg("-Wl,--build-id=none")
+        .arg(soname_flag)
         .arg("-o")
         .arg(output)
         .arg(source)

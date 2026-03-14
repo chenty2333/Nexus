@@ -128,6 +128,13 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - parent-observable `SIGCHLD` stop metadata for those tty-generated stops
     - re-foregrounding one stopped child with `setpgid()` before `SIGCONT`
       remaining purely executive policy, not a new Axle kernel object contract
+- the first post-R7 loader/runtime slice now also has:
+  - `PT_INTERP`-driven dynamic ELF bootstrap for one ET_EXEC main image
+  - one ET_DYN interpreter image resolved from the Starnix namespace
+  - interpreter load-bias handling in both the userspace executive and kernel ELF layout parser
+  - `AT_BASE` emitted into the initial Linux auxv when an interpreter is present
+  - interpreter bytes staged into one page-aligned local VMO so the normal VM fixed-map path can
+    preserve Linux-style zero-filled file tails up to the mapped page coverage
 
 ## Frozen architectural split
 
@@ -234,6 +241,9 @@ At the current code state, the helper exists as a real Round-1 launch path:
 - the syscall surface is shared as `ax_process_prepare_linux_exec`
 - the exec-spec remains opaque at the syscall boundary but is now backed by one
   fixed shared header plus appended stack-image bytes
+- the current v2 extension also allows one optional appended interpreter header
+  plus interpreter image bytes so the same helper can bootstrap the first
+  `PT_INTERP` dynamic-ELF path without introducing a second loader syscall
 - the kernel still does only generic image mapping and stack installation; it
   does not decode Linux syscall numbers or Linux signal policy
 

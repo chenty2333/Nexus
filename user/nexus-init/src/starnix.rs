@@ -6,7 +6,8 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 use axle_types::guest::{
-    AX_GUEST_STOP_REASON_X64_SYSCALL, AX_GUEST_X64_SYSCALL_INSN_LEN, AX_LINUX_EXEC_SPEC_V1,
+    AX_GUEST_STOP_REASON_X64_SYSCALL, AX_GUEST_X64_SYSCALL_INSN_LEN, AX_LINUX_EXEC_SPEC_F_INTERP,
+    AX_LINUX_EXEC_SPEC_V1, AX_LINUX_EXEC_SPEC_V2,
 };
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
@@ -30,21 +31,22 @@ use axle_types::vm::{
     ZX_VM_COMPACT, ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
 };
 use axle_types::{
-    ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_spec_header_t, zx_handle_t,
-    zx_status_t,
+    ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_interp_header_t,
+    ax_linux_exec_spec_header_t, zx_handle_t, zx_status_t,
 };
 use libax::{
     AX_TIME_INFINITE, ax_eventpair_create, ax_guest_session_create, ax_guest_session_read_memory,
     ax_guest_session_resume, ax_guest_session_write_memory, ax_guest_stop_state_read,
     ax_guest_stop_state_write, ax_handle_close as zx_handle_close,
-    ax_handle_duplicate as zx_handle_duplicate, ax_linux_exec_spec_blob, ax_object_signal,
-    ax_object_wait_async, ax_object_wait_one, ax_packet_user_t as zx_packet_user_t,
-    ax_port_create as zx_port_create, ax_port_packet_t as zx_port_packet_t,
-    ax_port_queue as zx_port_queue, ax_port_wait as zx_port_wait,
-    ax_process_create as zx_process_create, ax_process_prepare_linux_exec, ax_process_start_guest,
-    ax_socket_create as zx_socket_create, ax_status_result as zx_status_result,
-    ax_task_kill as zx_task_kill, ax_thread_create as zx_thread_create, ax_thread_start_guest,
-    ax_timer_cancel, ax_timer_create_monotonic, ax_timer_set, ax_vmo_create as zx_vmo_create,
+    ax_handle_duplicate as zx_handle_duplicate, ax_linux_exec_spec_blob,
+    ax_linux_exec_spec_blob_with_interp, ax_object_signal, ax_object_wait_async,
+    ax_object_wait_one, ax_packet_user_t as zx_packet_user_t, ax_port_create as zx_port_create,
+    ax_port_packet_t as zx_port_packet_t, ax_port_queue as zx_port_queue,
+    ax_port_wait as zx_port_wait, ax_process_create as zx_process_create,
+    ax_process_prepare_linux_exec, ax_process_start_guest, ax_socket_create as zx_socket_create,
+    ax_status_result as zx_status_result, ax_task_kill as zx_task_kill,
+    ax_thread_create as zx_thread_create, ax_thread_start_guest, ax_timer_cancel,
+    ax_timer_create_monotonic, ax_timer_set, ax_vmo_create as zx_vmo_create,
 };
 use nexus_component::{ComponentStartInfo, NumberedHandle};
 use nexus_io::{
@@ -56,26 +58,29 @@ use spin::Mutex;
 use crate::lifecycle::{read_channel_alloc_blocking, send_controller_event, send_status_event};
 use crate::services::{BootAssetEntry, BootstrapNamespace, LocalFdMetadataKind, local_fd_metadata};
 use crate::{
-    LINUX_FD_SMOKE_BINARY_PATH, LINUX_FD_SMOKE_BYTES, LINUX_FD_SMOKE_DECL_BYTES,
-    LINUX_HELLO_BINARY_PATH, LINUX_HELLO_BYTES, LINUX_HELLO_DECL_BYTES, LINUX_ROUND2_BINARY_PATH,
-    LINUX_ROUND2_BYTES, LINUX_ROUND2_DECL_BYTES, LINUX_ROUND3_BINARY_PATH, LINUX_ROUND3_BYTES,
-    LINUX_ROUND3_DECL_BYTES, LINUX_ROUND4_FUTEX_BINARY_PATH, LINUX_ROUND4_FUTEX_BYTES,
-    LINUX_ROUND4_FUTEX_DECL_BYTES, LINUX_ROUND4_SIGNAL_BINARY_PATH, LINUX_ROUND4_SIGNAL_BYTES,
-    LINUX_ROUND4_SIGNAL_DECL_BYTES, LINUX_ROUND5_EPOLL_BINARY_PATH, LINUX_ROUND5_EPOLL_BYTES,
-    LINUX_ROUND5_EPOLL_DECL_BYTES, LINUX_ROUND6_EVENTFD_BINARY_PATH, LINUX_ROUND6_EVENTFD_BYTES,
-    LINUX_ROUND6_EVENTFD_DECL_BYTES, LINUX_ROUND6_FUTEX_BINARY_PATH, LINUX_ROUND6_FUTEX_BYTES,
-    LINUX_ROUND6_FUTEX_DECL_BYTES, LINUX_ROUND6_PIDFD_BINARY_PATH, LINUX_ROUND6_PIDFD_BYTES,
-    LINUX_ROUND6_PIDFD_DECL_BYTES, LINUX_ROUND6_PROC_CONTROL_BINARY_PATH,
-    LINUX_ROUND6_PROC_CONTROL_BYTES, LINUX_ROUND6_PROC_CONTROL_DECL_BYTES,
-    LINUX_ROUND6_PROC_JOB_BINARY_PATH, LINUX_ROUND6_PROC_JOB_BYTES,
-    LINUX_ROUND6_PROC_JOB_DECL_BYTES, LINUX_ROUND6_PROC_TTY_BINARY_PATH,
-    LINUX_ROUND6_PROC_TTY_BYTES, LINUX_ROUND6_PROC_TTY_DECL_BYTES,
-    LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH, LINUX_ROUND6_SCM_RIGHTS_BYTES,
-    LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES, LINUX_ROUND6_SIGNALFD_BINARY_PATH,
-    LINUX_ROUND6_SIGNALFD_BYTES, LINUX_ROUND6_SIGNALFD_DECL_BYTES,
-    LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES, LINUX_ROUND6_TIMERFD_DECL_BYTES,
-    STARTUP_HANDLE_COMPONENT_STATUS, STARTUP_HANDLE_STARNIX_IMAGE_VMO,
-    STARTUP_HANDLE_STARNIX_PARENT_PROCESS, STARTUP_HANDLE_STARNIX_STDOUT,
+    LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH, LINUX_DYNAMIC_ELF_SMOKE_BYTES,
+    LINUX_DYNAMIC_INTERP_BINARY_PATH, LINUX_DYNAMIC_INTERP_BYTES, LINUX_DYNAMIC_MAIN_BINARY_PATH,
+    LINUX_DYNAMIC_MAIN_BYTES, LINUX_FD_SMOKE_BINARY_PATH, LINUX_FD_SMOKE_BYTES,
+    LINUX_FD_SMOKE_DECL_BYTES, LINUX_HELLO_BINARY_PATH, LINUX_HELLO_BYTES, LINUX_HELLO_DECL_BYTES,
+    LINUX_ROUND2_BINARY_PATH, LINUX_ROUND2_BYTES, LINUX_ROUND2_DECL_BYTES,
+    LINUX_ROUND3_BINARY_PATH, LINUX_ROUND3_BYTES, LINUX_ROUND3_DECL_BYTES,
+    LINUX_ROUND4_FUTEX_BINARY_PATH, LINUX_ROUND4_FUTEX_BYTES, LINUX_ROUND4_FUTEX_DECL_BYTES,
+    LINUX_ROUND4_SIGNAL_BINARY_PATH, LINUX_ROUND4_SIGNAL_BYTES, LINUX_ROUND4_SIGNAL_DECL_BYTES,
+    LINUX_ROUND5_EPOLL_BINARY_PATH, LINUX_ROUND5_EPOLL_BYTES, LINUX_ROUND5_EPOLL_DECL_BYTES,
+    LINUX_ROUND6_EVENTFD_BINARY_PATH, LINUX_ROUND6_EVENTFD_BYTES, LINUX_ROUND6_EVENTFD_DECL_BYTES,
+    LINUX_ROUND6_FUTEX_BINARY_PATH, LINUX_ROUND6_FUTEX_BYTES, LINUX_ROUND6_FUTEX_DECL_BYTES,
+    LINUX_ROUND6_PIDFD_BINARY_PATH, LINUX_ROUND6_PIDFD_BYTES, LINUX_ROUND6_PIDFD_DECL_BYTES,
+    LINUX_ROUND6_PROC_CONTROL_BINARY_PATH, LINUX_ROUND6_PROC_CONTROL_BYTES,
+    LINUX_ROUND6_PROC_CONTROL_DECL_BYTES, LINUX_ROUND6_PROC_JOB_BINARY_PATH,
+    LINUX_ROUND6_PROC_JOB_BYTES, LINUX_ROUND6_PROC_JOB_DECL_BYTES,
+    LINUX_ROUND6_PROC_TTY_BINARY_PATH, LINUX_ROUND6_PROC_TTY_BYTES,
+    LINUX_ROUND6_PROC_TTY_DECL_BYTES, LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH,
+    LINUX_ROUND6_SCM_RIGHTS_BYTES, LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES,
+    LINUX_ROUND6_SIGNALFD_BINARY_PATH, LINUX_ROUND6_SIGNALFD_BYTES,
+    LINUX_ROUND6_SIGNALFD_DECL_BYTES, LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES,
+    LINUX_ROUND6_TIMERFD_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
+    STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
+    STARTUP_HANDLE_STARNIX_STDOUT,
 };
 
 const USER_PAGE_BYTES: u64 = 0x1000;
@@ -225,6 +230,7 @@ const LINUX_IOV_MAX: usize = 1024;
 const LINUX_PATH_MAX: usize = 4096;
 const LINUX_EINTR: i32 = 4;
 const LINUX_EIO: i32 = 5;
+const LINUX_ENOEXEC: i32 = 8;
 const LINUX_EBADF: i32 = 9;
 const LINUX_EAGAIN: i32 = 11;
 const LINUX_EACCES: i32 = 13;
@@ -274,6 +280,7 @@ const SIGNALFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
 const PIDFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
+const AT_BASE: u64 = 7;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
@@ -281,8 +288,10 @@ const AT_ENTRY: u64 = 9;
 const ELF_CLASS_64: u8 = 2;
 const ELF_DATA_LE: u8 = 1;
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const PT_PHDR: u32 = 6;
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
@@ -339,6 +348,8 @@ struct LinuxElf<'a> {
     phdr_vaddr: Option<u64>,
     phent: u16,
     phnum: u16,
+    image_end: u64,
+    interp_path: Option<String>,
     segments: Vec<LinuxLoadSegment>,
     _bytes: &'a [u8],
 }
@@ -5724,7 +5735,7 @@ impl StarnixKernel {
                 let _ = zx_handle_close(image_vmo);
                 complete_syscall(
                     stop_state,
-                    linux_errno(map_guest_start_status_to_errno(status)),
+                    linux_errno(map_exec_prepare_status_to_errno(status)),
                 )?;
                 return Ok(SyscallAction::Resume);
             }
@@ -5920,14 +5931,26 @@ impl StarnixKernel {
         if args.is_empty() {
             args.push(resolved_path.clone());
         }
-        let task_image = match build_task_image(&resolved_path, &args, &env, &image_bytes) {
-            Ok(image) => image,
-            Err(status) => {
-                let _ = zx_handle_close(image_vmo);
-                complete_syscall(stop_state, linux_errno(map_exec_status_to_errno(status)))?;
-                return Ok(SyscallAction::Resume);
-            }
-        };
+        let task_image =
+            match build_task_image(&resolved_path, &args, &env, &image_bytes, |interp_path| {
+                let namespace = &self
+                    .groups
+                    .get(&tgid)
+                    .ok_or(ZX_ERR_BAD_STATE)?
+                    .resources
+                    .as_ref()
+                    .ok_or(ZX_ERR_BAD_STATE)?
+                    .namespace;
+                read_exec_image_bytes_from_namespace(namespace, interp_path).map(|(_, bytes)| bytes)
+            }) {
+                Ok(image) => image,
+                Err(status) => {
+                    let _ = zx_handle_close(image_vmo);
+                    let errno = map_exec_status_to_errno(status);
+                    complete_syscall(stop_state, linux_errno(errno))?;
+                    return Ok(SyscallAction::Resume);
+                }
+            };
         let packet_key = self.alloc_packet_key()?;
         let prepared = match prepare_process_carrier(
             self.parent_process,
@@ -5939,10 +5962,8 @@ impl StarnixKernel {
             Ok(prepared) => prepared,
             Err(status) => {
                 let _ = zx_handle_close(image_vmo);
-                complete_syscall(
-                    stop_state,
-                    linux_errno(map_guest_start_status_to_errno(status)),
-                )?;
+                let errno = map_exec_prepare_status_to_errno(status);
+                complete_syscall(stop_state, linux_errno(errno))?;
                 return Ok(SyscallAction::Resume);
             }
         };
@@ -5960,7 +5981,8 @@ impl StarnixKernel {
                 Ok(resources) => resources,
                 Err(status) => {
                     prepared.close();
-                    complete_syscall(stop_state, linux_errno(map_vm_status_to_errno(status)))?;
+                    let errno = map_vm_status_to_errno(status);
+                    complete_syscall(stop_state, linux_errno(errno))?;
                     return Ok(SyscallAction::Resume);
                 }
             }
@@ -5970,10 +5992,8 @@ impl StarnixKernel {
             match start_prepared_carrier_guest(prepared, &regs, new_resources) {
                 Ok(started) => started,
                 Err(status) => {
-                    complete_syscall(
-                        stop_state,
-                        linux_errno(map_guest_start_status_to_errno(status)),
-                    )?;
+                    let errno = map_guest_start_status_to_errno(status);
+                    complete_syscall(stop_state, linux_errno(errno))?;
                     return Ok(SyscallAction::Resume);
                 }
             };
@@ -6244,7 +6264,9 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         }
         return 1;
     }
-    let task_image = match build_task_image(payload_path, &args, &env, payload_bytes) {
+    let task_image = match build_task_image(payload_path, &args, &env, payload_bytes, |_| {
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }) {
         Ok(image) => image,
         Err(status) => return map_status_to_return_code(status),
     };
@@ -6504,6 +6526,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-round6-proc-job-smoke") => Some(LINUX_ROUND6_PROC_JOB_BYTES),
         Some("linux-round6-proc-control-smoke") => Some(LINUX_ROUND6_PROC_CONTROL_BYTES),
         Some("linux-round6-proc-tty-smoke") => Some(LINUX_ROUND6_PROC_TTY_BYTES),
+        Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BYTES),
         Some(_) => None,
     }
 }
@@ -6526,6 +6549,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-round6-proc-job-smoke") => Some(LINUX_ROUND6_PROC_JOB_BINARY_PATH),
         Some("linux-round6-proc-control-smoke") => Some(LINUX_ROUND6_PROC_CONTROL_BINARY_PATH),
         Some("linux-round6-proc-tty-smoke") => Some(LINUX_ROUND6_PROC_TTY_BINARY_PATH),
+        Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -6535,20 +6559,9 @@ fn build_task_image(
     args: &[String],
     env: &[String],
     bytes: &[u8],
+    mut resolve_interp_image: impl FnMut(&str) -> Result<Vec<u8>, zx_status_t>,
 ) -> Result<TaskImage, zx_status_t> {
-    let elf = parse_elf(bytes)?;
-    let stack = build_initial_stack(args, env, &elf)?;
-    let exec_blob = ax_linux_exec_spec_blob(
-        ax_linux_exec_spec_header_t {
-            version: AX_LINUX_EXEC_SPEC_V1,
-            flags: 0,
-            entry: elf.entry,
-            stack_pointer: stack.stack_pointer,
-            stack_vmo_offset: stack.stack_vmo_offset,
-            stack_bytes_len: stack.image.len() as u64,
-        },
-        &stack.image,
-    )?;
+    let elf = parse_elf(bytes, None)?;
     let mut cmdline = Vec::new();
     for arg in args {
         cmdline
@@ -6558,6 +6571,58 @@ fn build_task_image(
         cmdline.push(0);
     }
     let mut writable_ranges = Vec::new();
+    collect_writable_ranges(&mut writable_ranges, &elf)?;
+
+    let exec_blob = if let Some(interp_path) = elf.interp_path.as_deref() {
+        let interp_load_bias =
+            align_up_u64(elf.image_end, USER_PAGE_BYTES).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let interp_bytes = resolve_interp_image(interp_path)?;
+        let interp_elf = parse_elf(&interp_bytes, Some(interp_load_bias))?;
+        collect_writable_ranges(&mut writable_ranges, &interp_elf)?;
+        let stack = build_initial_stack(args, env, &elf, Some(interp_load_bias))?;
+        ax_linux_exec_spec_blob_with_interp(
+            ax_linux_exec_spec_header_t {
+                version: AX_LINUX_EXEC_SPEC_V2,
+                flags: AX_LINUX_EXEC_SPEC_F_INTERP,
+                entry: interp_elf.entry,
+                stack_pointer: stack.stack_pointer,
+                stack_vmo_offset: stack.stack_vmo_offset,
+                stack_bytes_len: stack.image.len() as u64,
+            },
+            &stack.image,
+            ax_linux_exec_interp_header_t {
+                load_bias: interp_load_bias,
+                image_bytes_len: interp_bytes.len() as u64,
+            },
+            &interp_bytes,
+        )?
+    } else {
+        let stack = build_initial_stack(args, env, &elf, None)?;
+        ax_linux_exec_spec_blob(
+            ax_linux_exec_spec_header_t {
+                version: AX_LINUX_EXEC_SPEC_V1,
+                flags: 0,
+                entry: elf.entry,
+                stack_pointer: stack.stack_pointer,
+                stack_vmo_offset: stack.stack_vmo_offset,
+                stack_bytes_len: stack.image.len() as u64,
+            },
+            &stack.image,
+        )?
+    };
+
+    Ok(TaskImage {
+        path: String::from(path),
+        cmdline,
+        exec_blob,
+        writable_ranges,
+    })
+}
+
+fn collect_writable_ranges(
+    writable_ranges: &mut Vec<LinuxWritableRange>,
+    elf: &LinuxElf<'_>,
+) -> Result<(), zx_status_t> {
     for segment in &elf.segments {
         if (segment.flags & 0x2) == 0 {
             continue;
@@ -6585,25 +6650,35 @@ fn build_task_image(
             len,
         });
     }
-    Ok(TaskImage {
-        path: String::from(path),
-        cmdline,
-        exec_blob,
-        writable_ranges,
-    })
+    Ok(())
 }
 
-fn parse_elf(bytes: &[u8]) -> Result<LinuxElf<'_>, zx_status_t> {
+fn parse_elf(bytes: &[u8], load_bias: Option<u64>) -> Result<LinuxElf<'_>, zx_status_t> {
     if bytes.len() < ELF64_EHDR_SIZE || &bytes[..4] != b"\x7fELF" {
         return Err(ZX_ERR_IO_DATA_INTEGRITY);
     }
     if bytes[4] != ELF_CLASS_64 || bytes[5] != ELF_DATA_LE {
         return Err(ZX_ERR_NOT_SUPPORTED);
     }
-    if read_u16(bytes, 16)? != ET_EXEC || read_u16(bytes, 18)? != EM_X86_64 {
+    let elf_type = read_u16(bytes, 16)?;
+    if read_u16(bytes, 18)? != EM_X86_64 {
         return Err(ZX_ERR_NOT_SUPPORTED);
     }
-    let entry = read_u64(bytes, 24)?;
+    match (elf_type, load_bias) {
+        (ET_EXEC, None) => {}
+        (ET_DYN, Some(load_bias)) if (load_bias & (USER_PAGE_BYTES - 1)) == 0 => {}
+        _ => return Err(ZX_ERR_NOT_SUPPORTED),
+    }
+    let image_bias = load_bias.unwrap_or(0);
+    let entry = read_u64(bytes, 24)?
+        .checked_add(image_bias)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    let image_limit = USER_CODE_VA
+        .checked_add(USER_CODE_BYTES)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    if entry < USER_CODE_VA || entry >= image_limit {
+        return Err(ZX_ERR_NOT_SUPPORTED);
+    }
     let phoff = usize::try_from(read_u64(bytes, 32)?).map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
     let phentsize = read_u16(bytes, 54)?;
     let phnum = read_u16(bytes, 56)?;
@@ -6621,13 +6696,17 @@ fn parse_elf(bytes: &[u8]) -> Result<LinuxElf<'_>, zx_status_t> {
     }
 
     let mut phdr_vaddr = None;
+    let mut interp_path = None;
+    let mut image_end = 0u64;
     let mut segments = Vec::new();
     for index in 0..usize::from(phnum) {
         let base = phoff + index * ELF64_PHDR_SIZE;
         let p_type = read_u32(bytes, base)?;
         let p_offset =
             usize::try_from(read_u64(bytes, base + 8)?).map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
-        let p_vaddr = read_u64(bytes, base + 16)?;
+        let p_vaddr = read_u64(bytes, base + 16)?
+            .checked_add(image_bias)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
         let p_filesz =
             usize::try_from(read_u64(bytes, base + 32)?).map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
         let p_memsz =
@@ -6635,12 +6714,29 @@ fn parse_elf(bytes: &[u8]) -> Result<LinuxElf<'_>, zx_status_t> {
         if p_type == PT_PHDR {
             phdr_vaddr = Some(p_vaddr);
         }
+        if p_type == PT_INTERP {
+            let file_end = p_offset
+                .checked_add(p_filesz)
+                .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
+            let raw = bytes
+                .get(p_offset..file_end)
+                .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
+            let trimmed = raw.split(|byte| *byte == 0).next().unwrap_or(raw);
+            let path = core::str::from_utf8(trimmed).map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
+            interp_path = Some(String::from(path));
+        }
         if p_type == PT_LOAD {
             let file_end = p_offset
                 .checked_add(p_filesz)
                 .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
             if file_end > bytes.len() {
                 return Err(ZX_ERR_IO_DATA_INTEGRITY);
+            }
+            let vend = p_vaddr
+                .checked_add(u64::try_from(p_memsz).map_err(|_| ZX_ERR_OUT_OF_RANGE)?)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            if p_vaddr < USER_CODE_VA || vend > image_limit {
+                return Err(ZX_ERR_NOT_SUPPORTED);
             }
             if phdr_vaddr.is_none() && p_offset <= phoff && phdr_end <= file_end {
                 phdr_vaddr = Some(
@@ -6658,6 +6754,7 @@ fn parse_elf(bytes: &[u8]) -> Result<LinuxElf<'_>, zx_status_t> {
                 mem_size: p_memsz,
                 flags: read_u32(bytes, base + 4)?,
             });
+            image_end = image_end.max(vend);
         }
     }
     if segments.is_empty() {
@@ -6668,6 +6765,8 @@ fn parse_elf(bytes: &[u8]) -> Result<LinuxElf<'_>, zx_status_t> {
         phdr_vaddr,
         phent: phentsize,
         phnum,
+        image_end,
+        interp_path,
         segments,
         _bytes: bytes,
     })
@@ -6677,6 +6776,7 @@ fn build_initial_stack(
     args: &[String],
     env: &[String],
     elf: &LinuxElf<'_>,
+    at_base: Option<u64>,
 ) -> Result<PreparedLinuxStack, zx_status_t> {
     let argv = if args.is_empty() {
         let mut argv = Vec::new();
@@ -6691,6 +6791,9 @@ fn build_initial_stack(
     auxv.try_reserve_exact(6).map_err(|_| ZX_ERR_INTERNAL)?;
     auxv.push((AT_PAGESZ, USER_PAGE_BYTES));
     auxv.push((AT_ENTRY, elf.entry));
+    if let Some(at_base) = at_base {
+        auxv.push((AT_BASE, at_base));
+    }
     if let Some(phdr_vaddr) = elf.phdr_vaddr {
         auxv.push((AT_PHDR, phdr_vaddr));
         auxv.push((AT_PHENT, u64::from(elf.phent)));
@@ -7096,6 +7199,16 @@ fn open_exec_image_from_namespace(
     let bytes = read_all_fd_bytes(ops.as_ref())?;
     let vmo = ops.as_vmo(nexus_io::VmoFlags::READ | nexus_io::VmoFlags::EXECUTE)?;
     Ok((resolved, bytes, vmo))
+}
+
+fn read_exec_image_bytes_from_namespace(
+    namespace: &nexus_io::ProcessNamespace,
+    path: &str,
+) -> Result<(String, Vec<u8>), zx_status_t> {
+    let resolved = namespace.resolve_path(path)?;
+    let ops = namespace.open(resolved.as_str(), OpenFlags::READABLE)?;
+    let bytes = read_all_fd_bytes(ops.as_ref())?;
+    Ok((resolved, bytes))
 }
 
 fn prepare_process_carrier(
@@ -8459,6 +8572,20 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND6_PROC_TTY_BYTES,
         ));
     }
+    if !LINUX_DYNAMIC_ELF_SMOKE_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH,
+            LINUX_DYNAMIC_ELF_SMOKE_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_MAIN_BINARY_PATH,
+            LINUX_DYNAMIC_MAIN_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_INTERP_BINARY_PATH,
+            LINUX_DYNAMIC_INTERP_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -9141,9 +9268,20 @@ fn map_guest_write_status_to_errno(status: zx_status_t) -> i32 {
 fn map_guest_start_status_to_errno(status: zx_status_t) -> i32 {
     match status {
         ZX_ERR_ACCESS_DENIED => LINUX_EACCES,
-        ZX_ERR_INVALID_ARGS | ZX_ERR_OUT_OF_RANGE => LINUX_EFAULT,
+        ZX_ERR_INVALID_ARGS => LINUX_EINVAL,
+        ZX_ERR_OUT_OF_RANGE => LINUX_EFAULT,
         ZX_ERR_NO_MEMORY => LINUX_ENOMEM,
         ZX_ERR_NOT_SUPPORTED => LINUX_ENOSYS,
+        _ => LINUX_EIO,
+    }
+}
+
+fn map_exec_prepare_status_to_errno(status: zx_status_t) -> i32 {
+    match status {
+        ZX_ERR_ACCESS_DENIED => LINUX_EACCES,
+        ZX_ERR_BAD_PATH | ZX_ERR_NOT_FOUND => LINUX_ENOENT,
+        ZX_ERR_INVALID_ARGS | ZX_ERR_IO_DATA_INTEGRITY | ZX_ERR_NOT_SUPPORTED => LINUX_ENOEXEC,
+        ZX_ERR_OUT_OF_RANGE | ZX_ERR_NO_MEMORY | ZX_ERR_INTERNAL => LINUX_ENOMEM,
         _ => LINUX_EIO,
     }
 }
@@ -9152,7 +9290,7 @@ fn map_exec_status_to_errno(status: zx_status_t) -> i32 {
     match status {
         ZX_ERR_ACCESS_DENIED => LINUX_EACCES,
         ZX_ERR_BAD_PATH | ZX_ERR_NOT_FOUND => LINUX_ENOENT,
-        ZX_ERR_INVALID_ARGS | ZX_ERR_IO_DATA_INTEGRITY | ZX_ERR_NOT_SUPPORTED => LINUX_EINVAL,
+        ZX_ERR_INVALID_ARGS | ZX_ERR_IO_DATA_INTEGRITY | ZX_ERR_NOT_SUPPORTED => LINUX_ENOEXEC,
         ZX_ERR_NO_MEMORY | ZX_ERR_INTERNAL | ZX_ERR_OUT_OF_RANGE => LINUX_ENOMEM,
         _ => LINUX_EIO,
     }

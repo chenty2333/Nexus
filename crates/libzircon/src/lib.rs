@@ -29,10 +29,10 @@ pub use axle_types::syscall_numbers;
 pub use axle_types::vm;
 pub use axle_types::wait_async;
 pub use axle_types::{
-    ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_spec_header_t, zx_clock_t,
-    zx_duration_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_packet_signal_t, zx_packet_type_t,
-    zx_packet_user_t, zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t, zx_time_t,
-    zx_vaddr_t, zx_vm_option_t,
+    ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_interp_header_t,
+    ax_linux_exec_spec_header_t, zx_clock_t, zx_duration_t, zx_futex_t, zx_handle_t, zx_koid_t,
+    zx_packet_signal_t, zx_packet_type_t, zx_packet_user_t, zx_port_packet_t, zx_rights_t,
+    zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t,
 };
 
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
@@ -769,6 +769,31 @@ pub fn ax_linux_exec_spec_blob(
         .map_err(|_| ZX_ERR_NO_MEMORY)?;
     blob.extend_from_slice(&header_bytes);
     blob.extend_from_slice(stack_image);
+    Ok(blob)
+}
+
+/// Build one v2 Linux exec-spec blob with an appended interpreter image.
+pub fn ax_linux_exec_spec_blob_with_interp(
+    header: ax_linux_exec_spec_header_t,
+    stack_image: &[u8],
+    interp: ax_linux_exec_interp_header_t,
+    interp_image: &[u8],
+) -> Result<Vec<u8>, zx_status_t> {
+    let header_bytes = header.encode();
+    let interp_header_bytes = interp.encode();
+    let total = header_bytes
+        .len()
+        .checked_add(stack_image.len())
+        .and_then(|size| size.checked_add(interp_header_bytes.len()))
+        .and_then(|size| size.checked_add(interp_image.len()))
+        .ok_or(status::ZX_ERR_OUT_OF_RANGE)?;
+    let mut blob = Vec::new();
+    blob.try_reserve_exact(total)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    blob.extend_from_slice(&header_bytes);
+    blob.extend_from_slice(stack_image);
+    blob.extend_from_slice(&interp_header_bytes);
+    blob.extend_from_slice(interp_image);
     Ok(blob)
 }
 

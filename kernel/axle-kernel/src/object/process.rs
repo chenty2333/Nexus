@@ -1,6 +1,6 @@
 use super::*;
 use axle_types::ax_guest_x64_regs_t;
-use axle_types::status::ZX_ERR_OUT_OF_RANGE;
+use axle_types::status::{ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_OUT_OF_RANGE};
 
 /// Return the bootstrap current-process handle seeded into the current process.
 pub fn bootstrap_self_process_handle() -> Option<zx_handle_t> {
@@ -223,9 +223,52 @@ pub fn prepare_linux_exec(
                     .ok_or(ZX_ERR_OUT_OF_RANGE)?,
         )
         .ok_or(ZX_ERR_INVALID_ARGS)?;
-    if header.version != axle_types::guest::AX_LINUX_EXEC_SPEC_V1 || header.flags != 0 {
-        return Err(ZX_ERR_INVALID_ARGS);
-    }
+    let mut trailing = exec_spec
+        .get(
+            axle_types::ax_linux_exec_spec_header_t::BYTE_LEN
+                .checked_add(stack_bytes_len)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?..,
+        )
+        .ok_or(ZX_ERR_INVALID_ARGS)?;
+    let interp = match header.version {
+        axle_types::guest::AX_LINUX_EXEC_SPEC_V1 => {
+            if header.flags != 0 || !trailing.is_empty() {
+                return Err(ZX_ERR_INVALID_ARGS);
+            }
+            None
+        }
+        axle_types::guest::AX_LINUX_EXEC_SPEC_V2 => {
+            let allowed = axle_types::guest::AX_LINUX_EXEC_SPEC_F_INTERP;
+            if (header.flags & !allowed) != 0 {
+                return Err(ZX_ERR_INVALID_ARGS);
+            }
+            if (header.flags & axle_types::guest::AX_LINUX_EXEC_SPEC_F_INTERP) == 0 {
+                if !trailing.is_empty() {
+                    return Err(ZX_ERR_INVALID_ARGS);
+                }
+                None
+            } else {
+                let interp_header = axle_types::ax_linux_exec_interp_header_t::decode(trailing)
+                    .ok_or(ZX_ERR_INVALID_ARGS)?;
+                let interp_len = usize::try_from(interp_header.image_bytes_len)
+                    .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+                trailing = trailing
+                    .get(axle_types::ax_linux_exec_interp_header_t::BYTE_LEN..)
+                    .ok_or(ZX_ERR_INVALID_ARGS)?;
+                let interp_bytes = trailing.get(..interp_len).ok_or(ZX_ERR_INVALID_ARGS)?;
+                if trailing
+                    .get(interp_len..)
+                    .is_none_or(|remainder| !remainder.is_empty())
+                {
+                    return Err(ZX_ERR_INVALID_ARGS);
+                }
+                Some((interp_header, interp_bytes))
+            }
+        }
+        _ => {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+    };
 
     let prepared = with_state_mut(|state| {
         let resolved_process =
@@ -274,6 +317,25 @@ pub fn prepare_linux_exec(
             }
         }
         let layout = resolve_process_image_layout(state, &image_vmo)?;
+        let interp_image = if let Some((interp_header, interp_bytes)) = interp {
+            Some(crate::task::LinuxExecExtraImage::new(
+                crate::userspace::parse_elf_process_image_layout_with_load_bias(
+                    u64::try_from(interp_bytes.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                    |offset, len| {
+                        let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+                        let end = start.checked_add(len).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+                        interp_bytes
+                            .get(start..end)
+                            .map(|slice| slice.to_vec())
+                            .ok_or(ZX_ERR_IO_DATA_INTEGRITY)
+                    },
+                    Some(interp_header.load_bias),
+                )?,
+                interp_bytes,
+            ))
+        } else {
+            None
+        };
         state.with_kernel_mut(|kernel| {
             kernel.prepare_linux_process_start(
                 process.process_id,
@@ -281,6 +343,7 @@ pub fn prepare_linux_exec(
                 &layout,
                 header,
                 stack_image,
+                interp_image.as_ref(),
             )
         })
     })?;
