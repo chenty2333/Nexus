@@ -10,6 +10,12 @@ task_dir_path:
     .asciz "/proc/self/task"
 task_status_path:
     .asciz "/proc/self/task/1/status"
+child_task_dir_path:
+    .asciz "/proc/2/task"
+child_task_comm_path:
+    .asciz "/proc/2/task/2/comm"
+child_task_status_path:
+    .asciz "/proc/2/task/2/status"
 comm_expected:
     .ascii "linux-round6-proc-control-smoke\n"
 comm_expected_len = . - comm_expected
@@ -19,9 +25,20 @@ cmdline_expected_len = . - cmdline_expected
 task_pid_line:
     .ascii "Pid:\t1\n"
 task_pid_line_len = . - task_pid_line
+child_pid_line:
+    .ascii "Pid:\t2\n"
+child_pid_line_len = . - child_pid_line
+child_tgid_line:
+    .ascii "Tgid:\t2\n"
+child_tgid_line_len = . - child_tgid_line
 dirent_name_1:
     .ascii "1\0"
 dirent_name_1_len = . - dirent_name_1
+dirent_name_2:
+    .ascii "2\0"
+dirent_name_2_len = . - dirent_name_2
+sigchld_mask:
+    .quad 0x0000000000010000
 ack_byte:
     .byte 0x41
 
@@ -30,6 +47,25 @@ ack_byte:
 .type _start, @function
 _start:
     sub $4096, %rsp
+
+    mov $0, %edi
+    lea sigchld_mask(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $14, %eax
+    syscall
+    test %rax, %rax
+    jne fail_1
+
+    mov $-1, %edi
+    lea sigchld_mask(%rip), %rsi
+    mov $8, %edx
+    xor %r10d, %r10d
+    mov $289, %eax
+    syscall
+    test %rax, %rax
+    js fail_1
+    mov %eax, %r15d
 
     mov $-100, %edi
     lea comm_path(%rip), %rsi
@@ -182,6 +218,8 @@ _start:
     js fail_18
     jz child_entry
     mov %eax, %r14d
+    cmp $2, %r14d
+    jne fail_18
 
     mov 4(%rsp), %edi
     mov $3, %eax
@@ -208,12 +246,119 @@ _start:
     test %rax, %rax
     jne fail_21
 
+    mov $-100, %edi
+    lea child_task_dir_path(%rip), %rsi
+    mov $0x10000, %edx
+    xor %r10d, %r10d
+    mov $257, %eax
+    syscall
+    test %rax, %rax
+    js fail_22
+    mov %eax, %r12d
+
+    mov %r12d, %edi
+    lea 1280(%rsp), %rsi
+    mov $256, %edx
+    mov $217, %eax
+    syscall
+    cmpq $0, %rax
+    jle fail_23
+    mov %rax, %r13
+
+    lea 1280(%rsp), %rdi
+    mov %r13, %rsi
+    lea dirent_name_2(%rip), %rdx
+    mov $dirent_name_2_len, %ecx
+    call contains_bytes
+    test %eax, %eax
+    jz fail_24
+
+    mov %r12d, %edi
+    mov $3, %eax
+    syscall
+    test %rax, %rax
+    jne fail_25
+
+    mov $-100, %edi
+    lea child_task_comm_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $257, %eax
+    syscall
+    test %rax, %rax
+    js fail_26
+    mov %eax, %r12d
+
+    mov %r12d, %edi
+    lea 1536(%rsp), %rsi
+    mov $128, %edx
+    xor %eax, %eax
+    syscall
+    cmpq $0, %rax
+    jle fail_27
+    mov %rax, %r13
+
+    lea 1536(%rsp), %rdi
+    mov %r13, %rsi
+    lea comm_expected(%rip), %rdx
+    mov $comm_expected_len, %ecx
+    call contains_bytes
+    test %eax, %eax
+    jz fail_28
+
+    mov %r12d, %edi
+    mov $3, %eax
+    syscall
+    test %rax, %rax
+    jne fail_29
+
+    mov $-100, %edi
+    lea child_task_status_path(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $257, %eax
+    syscall
+    test %rax, %rax
+    js fail_30
+    mov %eax, %r12d
+
+    mov %r12d, %edi
+    lea 1792(%rsp), %rsi
+    mov $256, %edx
+    xor %eax, %eax
+    syscall
+    cmpq $0, %rax
+    jle fail_31
+    mov %rax, %r13
+
+    lea 1792(%rsp), %rdi
+    mov %r13, %rsi
+    lea child_pid_line(%rip), %rdx
+    mov $child_pid_line_len, %ecx
+    call contains_bytes
+    test %eax, %eax
+    jz fail_32
+
+    lea 1792(%rsp), %rdi
+    mov %r13, %rsi
+    lea child_tgid_line(%rip), %rdx
+    mov $child_tgid_line_len, %ecx
+    call contains_bytes
+    test %eax, %eax
+    jz fail_33
+
+    mov %r12d, %edi
+    mov $3, %eax
+    syscall
+    test %rax, %rax
+    jne fail_34
+
     mov %r14d, %edi
-    mov $19, %esi
+    mov $20, %esi
     mov $62, %eax
     syscall
     test %rax, %rax
-    jne fail_22
+    jne fail_35
 
     mov %r14d, %edi
     lea 1024(%rsp), %rsi
@@ -222,24 +367,40 @@ _start:
     mov $61, %eax
     syscall
     cmp %r14d, %eax
-    jne fail_23
+    jne fail_36
 
     mov 1024(%rsp), %r11d
     mov %r11d, %r10d
     and $0xff, %r10d
     cmp $0x7f, %r10d
-    jne fail_24
+    jne fail_37
     shr $8, %r11d
     and $0xff, %r11d
-    cmp $19, %r11d
-    jne fail_25
+    cmp $20, %r11d
+    jne fail_38
+
+    mov %r15d, %edi
+    lea 2048(%rsp), %rsi
+    mov $128, %edx
+    xor %eax, %eax
+    syscall
+    cmpq $128, %rax
+    jne fail_39
+    cmpl $17, 2048(%rsp)
+    jne fail_40
+    cmpl $5, 2056(%rsp)
+    jne fail_41
+    cmpl %r14d, 2060(%rsp)
+    jne fail_42
+    cmpl $20, 2088(%rsp)
+    jne fail_43
 
     mov %r14d, %edi
     mov $18, %esi
     mov $62, %eax
     syscall
     test %rax, %rax
-    jne fail_26
+    jne fail_44
 
     mov %r14d, %edi
     lea 1024(%rsp), %rsi
@@ -248,10 +409,26 @@ _start:
     mov $61, %eax
     syscall
     cmp %r14d, %eax
-    jne fail_27
+    jne fail_45
     mov 1024(%rsp), %r11d
     cmp $0xffff, %r11d
-    jne fail_28
+    jne fail_46
+
+    mov %r15d, %edi
+    lea 2176(%rsp), %rsi
+    mov $128, %edx
+    xor %eax, %eax
+    syscall
+    cmpq $128, %rax
+    jne fail_47
+    cmpl $17, 2176(%rsp)
+    jne fail_48
+    cmpl $6, 2184(%rsp)
+    jne fail_49
+    cmpl %r14d, 2188(%rsp)
+    jne fail_50
+    cmpl $18, 2216(%rsp)
+    jne fail_51
 
     mov 12(%rsp), %edi
     lea ack_byte(%rip), %rsi
@@ -259,13 +436,19 @@ _start:
     mov $1, %eax
     syscall
     cmpq $1, %rax
-    jne fail_29
+    jne fail_52
 
     mov 12(%rsp), %edi
     mov $3, %eax
     syscall
     test %rax, %rax
-    jne fail_30
+    jne fail_53
+
+    mov %r15d, %edi
+    mov $3, %eax
+    syscall
+    test %rax, %rax
+    jne fail_54
 
     mov %r14d, %edi
     lea 1024(%rsp), %rsi
@@ -274,9 +457,9 @@ _start:
     mov $61, %eax
     syscall
     cmp %r14d, %eax
-    jne fail_31
+    jne fail_55
     cmpl $0, 1024(%rsp)
-    jne fail_32
+    jne fail_56
 
     mov $1, %edi
     lea success_message(%rip), %rsi
@@ -284,13 +467,16 @@ _start:
     mov $1, %eax
     syscall
     cmpq $success_message_len, %rax
-    jne fail_33
+    jne fail_57
 
     xor %edi, %edi
     mov $60, %eax
     syscall
 
 child_entry:
+    mov %r15d, %edi
+    mov $3, %eax
+    syscall
     mov 0(%rsp), %edi
     mov $3, %eax
     syscall
@@ -397,6 +583,30 @@ fail_30: mov $30, %edi; jmp fail_exit
 fail_31: mov $31, %edi; jmp fail_exit
 fail_32: mov $32, %edi; jmp fail_exit
 fail_33: mov $33, %edi; jmp fail_exit
+fail_34: mov $34, %edi; jmp fail_exit
+fail_35: mov $35, %edi; jmp fail_exit
+fail_36: mov $36, %edi; jmp fail_exit
+fail_37: mov $37, %edi; jmp fail_exit
+fail_38: mov $38, %edi; jmp fail_exit
+fail_39: mov $39, %edi; jmp fail_exit
+fail_40: mov $40, %edi; jmp fail_exit
+fail_41: mov $41, %edi; jmp fail_exit
+fail_42: mov $42, %edi; jmp fail_exit
+fail_43: mov $43, %edi; jmp fail_exit
+fail_44: mov $44, %edi; jmp fail_exit
+fail_45: mov $45, %edi; jmp fail_exit
+fail_46: mov $46, %edi; jmp fail_exit
+fail_47: mov $47, %edi; jmp fail_exit
+fail_48: mov $48, %edi; jmp fail_exit
+fail_49: mov $49, %edi; jmp fail_exit
+fail_50: mov $50, %edi; jmp fail_exit
+fail_51: mov $51, %edi; jmp fail_exit
+fail_52: mov $52, %edi; jmp fail_exit
+fail_53: mov $53, %edi; jmp fail_exit
+fail_54: mov $54, %edi; jmp fail_exit
+fail_55: mov $55, %edi; jmp fail_exit
+fail_56: mov $56, %edi; jmp fail_exit
+fail_57: mov $57, %edi; jmp fail_exit
 
 fail_exit:
     mov $60, %eax

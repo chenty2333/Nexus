@@ -1,5 +1,5 @@
 id = "kernel.starnix.round6_proc_control_bootstrap"
-description = "Bootstrap starnix userspace should expose the next Round 6 /proc and job-control slice: comm/cmdline/task views plus wait4-observable SIGSTOP/SIGCONT transitions"
+description = "Bootstrap starnix userspace should expose the next Round 6 /proc and job-control slice: self/child task views plus wait4- and signalfd-observable SIGTSTP/SIGCONT transitions"
 tags = ["kernel", "component", "starnix", "runner", "proc", "job-control", "signal"]
 timeout_ms = 180000
 

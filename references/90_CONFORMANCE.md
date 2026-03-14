@@ -192,8 +192,12 @@ Main just targets include:
   - synthetic `/proc/self/cmdline`
   - synthetic `/proc/self/task`
   - synthetic `/proc/self/task/<tid>/status`
-  - `SIGSTOP` default-delivery entering thread-group stop state
+  - synthetic `/proc/<pid>/task/<tid>/{comm,status}` for one stopped child
+  - `SIGTSTP` default-delivery entering thread-group stop state while retaining
+    the originating job-control stop signal in wait status
   - `SIGCONT` resuming the stopped thread group
+  - parent-observable `SIGCHLD` stop / continue metadata through one blocked
+    `signalfd`
   - `wait4(..., WUNTRACED, ...)` observing the stop event
   - `wait4(..., WCONTINUED, ...)` observing the continue event
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:

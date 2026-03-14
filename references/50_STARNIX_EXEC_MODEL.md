@@ -112,7 +112,13 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - synthetic `/proc/self/cmdline`
     - synthetic `/proc/self/task`
     - synthetic `/proc/self/task/<tid>/{comm,stat,status}`
-    - group-stop / continue transitions through default `SIGSTOP` / `SIGCONT`
+    - synthetic `/proc/<pid>/task/<tid>/{comm,status}` for non-self children
+    - group-stop / continue transitions now preserve the originating
+      job-control stop signal (`SIGTSTP` / `SIGTTIN` / `SIGTTOU` / `SIGSTOP`)
+    - parent-side `SIGCHLD` metadata for stop / continue transitions
+    - `signalfd(SIGCHLD)` now returns one minimal `signalfd_siginfo` carrying
+      `ssi_signo`, `ssi_code`, `ssi_pid`, and `ssi_status` for those child
+      transitions
     - `wait4(..., WUNTRACED, ...)` observing one stop event
     - `wait4(..., WCONTINUED, ...)` observing one continue event
 
@@ -514,10 +520,14 @@ forcing every syscall through one uniform RPC layer.
     - `/proc/self/cmdline`
     - `/proc/self/task`
     - `/proc/self/task/<tid>/{comm,stat,status}`
+    - `/proc/<pid>/task/<tid>/{comm,status}`
   - one minimal job-control stop / continue view now exists:
-    - default `SIGSTOP` / `SIGCONT` transitions are tracked at thread-group scope
+    - default job-control stop signals preserve their original identity at
+      thread-group scope
     - `wait4(..., WUNTRACED, ...)` consumes one pending stop event
     - `wait4(..., WCONTINUED, ...)` consumes one pending continue event
+    - parent thread groups now also keep one minimal `SIGCHLD` stop / continue
+      record for signalfd-visible observation
   - no restart blocks / `sigaltstack` yet
   - no epoll model yet
 - `fork` currently clones the Linux-side control plane and eagerly copies the

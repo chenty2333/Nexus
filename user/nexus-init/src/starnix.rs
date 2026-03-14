@@ -71,10 +71,10 @@ use crate::{
     LINUX_ROUND6_PROC_JOB_DECL_BYTES, LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH,
     LINUX_ROUND6_SCM_RIGHTS_BYTES, LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES,
     LINUX_ROUND6_SIGNALFD_BINARY_PATH, LINUX_ROUND6_SIGNALFD_BYTES,
-    LINUX_ROUND6_SIGNALFD_DECL_BYTES, LINUX_ROUND6_TIMERFD_BINARY_PATH,
-    LINUX_ROUND6_TIMERFD_BYTES, LINUX_ROUND6_TIMERFD_DECL_BYTES,
-    STARTUP_HANDLE_COMPONENT_STATUS, STARTUP_HANDLE_STARNIX_IMAGE_VMO,
-    STARTUP_HANDLE_STARNIX_PARENT_PROCESS, STARTUP_HANDLE_STARNIX_STDOUT,
+    LINUX_ROUND6_SIGNALFD_DECL_BYTES, LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES,
+    LINUX_ROUND6_TIMERFD_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
+    STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
+    STARTUP_HANDLE_STARNIX_STDOUT,
 };
 
 const USER_PAGE_BYTES: u64 = 0x1000;
@@ -258,6 +258,10 @@ const LINUX_SIGSTOP: i32 = 19;
 const LINUX_SIGTSTP: i32 = 20;
 const LINUX_SIGTTIN: i32 = 21;
 const LINUX_SIGTTOU: i32 = 22;
+const LINUX_CLD_EXITED: i32 = 1;
+const LINUX_CLD_KILLED: i32 = 2;
+const LINUX_CLD_STOPPED: i32 = 5;
+const LINUX_CLD_CONTINUED: i32 = 6;
 const LINUX_SIGNAL_SET_BYTES: usize = 8;
 const LINUX_SIGACTION_BYTES: usize = 32;
 const LINUX_WAIT_STATUS_CONTINUED: i32 = 0xffff;
@@ -435,6 +439,13 @@ struct ActiveSignalFrame {
     previous_blocked: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinuxSigChldInfo {
+    pid: i32,
+    status: i32,
+    code: i32,
+}
+
 #[derive(Clone, Copy)]
 struct TaskCarrier {
     thread_handle: zx_handle_t,
@@ -582,6 +593,12 @@ struct LinuxIovec {
 #[derive(Clone)]
 struct PendingScmRights {
     descriptions: Vec<Arc<OpenFileDescription>>,
+}
+
+#[derive(Clone, Copy)]
+struct ConsumedSignal {
+    signal: i32,
+    sigchld_info: Option<LinuxSigChldInfo>,
 }
 
 #[derive(Clone)]
@@ -798,6 +815,7 @@ struct LinuxThreadGroup {
     stop_wait_pending: bool,
     continued_wait_pending: bool,
     shared_pending: u64,
+    sigchld_info: Option<LinuxSigChldInfo>,
     sigactions: BTreeMap<i32, LinuxSigAction>,
     image: Option<TaskImage>,
     resources: Option<ExecutiveState>,
@@ -1446,9 +1464,7 @@ impl FdOps for ProcTaskListFd {
         if components.is_empty() {
             return Ok(Arc::new(self.clone()));
         }
-        let tid = components[0]
-            .parse::<i32>()
-            .map_err(|_| ZX_ERR_NOT_FOUND)?;
+        let tid = components[0].parse::<i32>().map_err(|_| ZX_ERR_NOT_FOUND)?;
         let snapshot = self.threads.get(&tid).cloned().ok_or(ZX_ERR_NOT_FOUND)?;
         let thread_dir = Arc::new(ProcThreadDirFd { snapshot });
         if components.len() == 1 {
@@ -2582,9 +2598,9 @@ impl StarnixKernel {
         }
         let child_group = self.groups.get(&child_tgid)?;
         match child_group.state {
-            ThreadGroupState::Zombie { wait_status, .. } => {
-                Some(WaitChildEvent::Zombie { status: wait_status })
-            }
+            ThreadGroupState::Zombie { wait_status, .. } => Some(WaitChildEvent::Zombie {
+                status: wait_status,
+            }),
             ThreadGroupState::Running | ThreadGroupState::Stopped => {
                 if child_group.stop_wait_pending && (options & LINUX_WUNTRACED) != 0 {
                     return Some(WaitChildEvent::Stopped {
@@ -2751,19 +2767,38 @@ impl StarnixKernel {
         group.last_stop_signal = None;
         group.stop_wait_pending = false;
         group.continued_wait_pending = false;
+        group.sigchld_info = None;
         self.refresh_pidfds_for_group(tgid)?;
         self.maybe_wake_parent_waiter(tgid)
     }
 
     fn finalize_group_exit(&mut self, tgid: i32, code: i32) -> Result<(), zx_status_t> {
         let wait_status = (code & 0xff) << 8;
-        self.finalize_group_zombie(tgid, wait_status, code)
+        self.queue_sigchld_to_parent(
+            tgid,
+            LinuxSigChldInfo {
+                pid: tgid,
+                status: code,
+                code: LINUX_CLD_EXITED,
+            },
+        )?;
+        self.finalize_group_zombie(tgid, wait_status, code)?;
+        self.service_pending_waiters()
     }
 
     fn finalize_group_signal_exit(&mut self, tgid: i32, signal: i32) -> Result<(), zx_status_t> {
         let wait_status = signal & 0x7f;
         let exit_code = 128 + signal;
-        self.finalize_group_zombie(tgid, wait_status, exit_code)
+        self.queue_sigchld_to_parent(
+            tgid,
+            LinuxSigChldInfo {
+                pid: tgid,
+                status: signal,
+                code: LINUX_CLD_KILLED,
+            },
+        )?;
+        self.finalize_group_zombie(tgid, wait_status, exit_code)?;
+        self.service_pending_waiters()
     }
 
     fn remove_group_tasks(&mut self, tgid: i32) -> Result<(), zx_status_t> {
@@ -3017,6 +3052,43 @@ impl StarnixKernel {
         Ok(())
     }
 
+    fn shared_sigchld_info(&self, tgid: i32) -> Option<LinuxSigChldInfo> {
+        self.groups.get(&tgid).and_then(|group| group.sigchld_info)
+    }
+
+    fn clear_shared_signal_state(&mut self, tgid: i32, signal: i32) -> Result<(), zx_status_t> {
+        if signal == LINUX_SIGCHLD
+            && let Some(group) = self.groups.get_mut(&tgid)
+        {
+            group.sigchld_info = None;
+        }
+        Ok(())
+    }
+
+    fn queue_sigchld_to_parent(
+        &mut self,
+        child_tgid: i32,
+        info: LinuxSigChldInfo,
+    ) -> Result<(), zx_status_t> {
+        let Some(parent_tgid) = self
+            .groups
+            .get(&child_tgid)
+            .and_then(|group| group.parent_tgid)
+        else {
+            return Ok(());
+        };
+        let bit = linux_signal_bit(LINUX_SIGCHLD).ok_or(ZX_ERR_INVALID_ARGS)?;
+        let Some(parent) = self.groups.get_mut(&parent_tgid) else {
+            return Ok(());
+        };
+        if matches!(parent.state, ThreadGroupState::Zombie { .. }) {
+            return Ok(());
+        }
+        parent.shared_pending |= bit;
+        parent.sigchld_info = Some(info);
+        self.refresh_signalfds_for_group(parent_tgid)
+    }
+
     fn lookup_socket_keys(
         &self,
         tgid: i32,
@@ -3055,7 +3127,7 @@ impl StarnixKernel {
         &mut self,
         owner_tid: i32,
         mask: u64,
-    ) -> Result<Option<i32>, zx_status_t> {
+    ) -> Result<Option<ConsumedSignal>, zx_status_t> {
         let blocked = self.task_signal_mask(owner_tid)?;
         let tgid = self.tasks.get(&owner_tid).ok_or(ZX_ERR_BAD_STATE)?.tgid;
         let task_pending = self
@@ -3068,7 +3140,10 @@ impl StarnixKernel {
                 task.signals.pending &= !linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
             }
             self.refresh_signalfds_for_group(tgid)?;
-            return Ok(Some(signal));
+            return Ok(Some(ConsumedSignal {
+                signal,
+                sigchld_info: None,
+            }));
         }
         let shared_pending = self
             .groups
@@ -3076,11 +3151,18 @@ impl StarnixKernel {
             .map(|group| group.shared_pending & mask & blocked)
             .ok_or(ZX_ERR_BAD_STATE)?;
         if let Some(signal) = lowest_signal(shared_pending) {
+            let sigchld_info = self
+                .shared_sigchld_info(tgid)
+                .filter(|_| signal == LINUX_SIGCHLD);
             if let Some(group) = self.groups.get_mut(&tgid) {
                 group.shared_pending &= !linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
             }
+            self.clear_shared_signal_state(tgid, signal)?;
             self.refresh_signalfds_for_group(tgid)?;
-            return Ok(Some(signal));
+            return Ok(Some(ConsumedSignal {
+                signal,
+                sigchld_info,
+            }));
         }
         Ok(None)
     }
@@ -3244,6 +3326,7 @@ impl StarnixKernel {
             if let Some(group) = self.groups.get_mut(&tgid) {
                 group.shared_pending &= !linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
             }
+            self.clear_shared_signal_state(tgid, signal)?;
             self.refresh_signalfds_for_group(tgid)?;
             return Ok(Some(signal));
         }
@@ -3312,9 +3395,18 @@ impl StarnixKernel {
             group.stop_wait_pending = true;
             group.continued_wait_pending = false;
         }
+        self.queue_sigchld_to_parent(
+            tgid,
+            LinuxSigChldInfo {
+                pid: tgid,
+                status: signal,
+                code: LINUX_CLD_STOPPED,
+            },
+        )?;
         self.refresh_pidfds_for_group(tgid)?;
         self.refresh_signalfds_for_group(tgid)?;
-        self.maybe_wake_parent_waiter(tgid)
+        self.maybe_wake_parent_waiter(tgid)?;
+        self.service_pending_waiters()
     }
 
     fn continue_thread_group(
@@ -3342,7 +3434,16 @@ impl StarnixKernel {
         if !was_stopped {
             return Ok(0);
         }
+        self.queue_sigchld_to_parent(
+            tgid,
+            LinuxSigChldInfo {
+                pid: tgid,
+                status: LINUX_SIGCONT,
+                code: LINUX_CLD_CONTINUED,
+            },
+        )?;
         self.maybe_wake_parent_waiter(tgid)?;
+        self.service_pending_waiters()?;
         let task_ids = self
             .groups
             .get(&tgid)
@@ -3394,7 +3495,10 @@ impl StarnixKernel {
             return self.continue_thread_group(tgid, stdout);
         }
         let bit = linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
-        self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?.shared_pending |= bit;
+        self.groups
+            .get_mut(&tgid)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .shared_pending |= bit;
         self.refresh_signalfds_for_group(tgid)?;
         Ok(0)
     }
@@ -3463,7 +3567,11 @@ impl StarnixKernel {
             return self.continue_thread_group(tgid, stdout);
         }
         let bit = linux_signal_bit(signal).ok_or(ZX_ERR_INVALID_ARGS)?;
-        self.tasks.get_mut(&tid).ok_or(ZX_ERR_BAD_STATE)?.signals.pending |= bit;
+        self.tasks
+            .get_mut(&tid)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .signals
+            .pending |= bit;
         self.refresh_signalfds_for_group(tgid)?;
         Ok(0)
     }
@@ -3627,8 +3735,8 @@ impl StarnixKernel {
         let (owner_tid, owner_tgid, mask, _wait_handle) =
             signalfd.snapshot().ok_or(ZX_ERR_BAD_STATE)?;
         match self.take_signalfd_signal(owner_tid, mask)? {
-            Some(signal) => {
-                let info = encode_signalfd_siginfo(signal);
+            Some(consumed) => {
+                let info = encode_signalfd_siginfo(consumed.signal, consumed.sigchld_info);
                 match write_guest_bytes(session, buf, &info) {
                     Ok(()) => {
                         complete_syscall(
@@ -5602,6 +5710,7 @@ impl StarnixKernel {
                 stop_wait_pending: false,
                 continued_wait_pending: false,
                 shared_pending: 0,
+                sigchld_info: None,
                 sigactions: parent_sigactions,
                 image: Some(task_image),
                 resources: Some(child_resources),
@@ -6084,6 +6193,7 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         stop_wait_pending: false,
         continued_wait_pending: false,
         shared_pending: 0,
+        sigchld_info: None,
         sigactions: BTreeMap::new(),
         image: Some(task_image),
         resources: Some(resources),
@@ -8433,9 +8543,9 @@ fn open_proc_task_snapshot(
         "cmdline" if components.len() == 1 => {
             Ok(Arc::new(ProcTextFd::new(snapshot.cmdline.clone())))
         }
-        "comm" if components.len() == 1 => {
-            Ok(Arc::new(ProcTextFd::new(build_proc_comm_bytes(&snapshot.name))))
-        }
+        "comm" if components.len() == 1 => Ok(Arc::new(ProcTextFd::new(build_proc_comm_bytes(
+            &snapshot.name,
+        )))),
         "status" if components.len() == 1 => {
             Ok(Arc::new(ProcTextFd::new(build_proc_status_bytes(snapshot))))
         }
@@ -8566,9 +8676,17 @@ fn write_guest_fd_pair(
     write_guest_bytes(session, guest_addr, &bytes)
 }
 
-fn encode_signalfd_siginfo(signal: i32) -> [u8; LINUX_SIGNALFD_SIGINFO_BYTES] {
+fn encode_signalfd_siginfo(
+    signal: i32,
+    sigchld_info: Option<LinuxSigChldInfo>,
+) -> [u8; LINUX_SIGNALFD_SIGINFO_BYTES] {
     let mut bytes = [0u8; LINUX_SIGNALFD_SIGINFO_BYTES];
     bytes[0..4].copy_from_slice(&(signal as u32).to_ne_bytes());
+    if let Some(info) = sigchld_info {
+        bytes[8..12].copy_from_slice(&info.code.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&(info.pid as u32).to_ne_bytes());
+        bytes[40..44].copy_from_slice(&info.status.to_ne_bytes());
+    }
     bytes
 }
 
@@ -9059,6 +9177,7 @@ mod tests {
             stop_wait_pending: false,
             continued_wait_pending: false,
             shared_pending: 0,
+            sigchld_info: None,
             sigactions: BTreeMap::new(),
             image: Some(TaskImage {
                 path: String::from("bin/linux-round6-proc-job-smoke"),
@@ -9107,10 +9226,7 @@ mod tests {
             .expect("open /proc/self/comm");
         let mut comm_bytes = [0u8; 128];
         let comm_len = comm.read(&mut comm_bytes).expect("read /proc/self/comm");
-        assert_eq!(
-            &comm_bytes[..comm_len],
-            b"linux-round6-proc-job-smoke\n"
-        );
+        assert_eq!(&comm_bytes[..comm_len], b"linux-round6-proc-job-smoke\n");
 
         let cmdline = kernel
             .open_proc_absolute(1, "/proc/self/cmdline")
@@ -9159,6 +9275,171 @@ mod tests {
         let len = status.read(&mut bytes).expect("read /proc/self/status");
         let text = core::str::from_utf8(&bytes[..len]).expect("utf8 status");
         assert!(text.contains("State:\tT\n"));
+    }
+
+    #[test]
+    fn proc_child_task_views_are_available() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        kernel
+            .groups
+            .get_mut(&1)
+            .expect("root group")
+            .child_tgids
+            .insert(2);
+        kernel.tasks.insert(
+            2,
+            LinuxTask {
+                tid: 2,
+                tgid: 2,
+                carrier: TaskCarrier {
+                    thread_handle: ZX_HANDLE_INVALID,
+                    session_handle: ZX_HANDLE_INVALID,
+                    sidecar_vmo: ZX_HANDLE_INVALID,
+                    packet_key: 2,
+                },
+                state: TaskState::Running,
+                signals: TaskSignals::default(),
+                robust_list: None,
+                active_signal: None,
+            },
+        );
+        kernel.groups.insert(
+            2,
+            LinuxThreadGroup {
+                tgid: 2,
+                leader_tid: 2,
+                parent_tgid: Some(1),
+                pgid: 2,
+                sid: 1,
+                child_tgids: BTreeSet::new(),
+                task_ids: BTreeSet::from([2]),
+                state: ThreadGroupState::Running,
+                last_stop_signal: None,
+                stop_wait_pending: false,
+                continued_wait_pending: false,
+                shared_pending: 0,
+                sigchld_info: None,
+                sigactions: BTreeMap::new(),
+                image: Some(TaskImage {
+                    path: String::from("bin/linux-round6-proc-control-smoke"),
+                    cmdline: b"linux-round6-proc-control-smoke\0".to_vec(),
+                    exec_blob: Vec::new(),
+                    writable_ranges: Vec::new(),
+                }),
+                resources: None,
+            },
+        );
+
+        let task_dir = kernel
+            .open_proc_absolute(1, "/proc/2/task")
+            .expect("open /proc/2/task");
+        let task_entries = task_dir.readdir().expect("readdir /proc/2/task");
+        let task_names: Vec<_> = task_entries.into_iter().map(|entry| entry.name).collect();
+        assert_eq!(task_names, vec!["2"]);
+
+        let task_comm = kernel
+            .open_proc_absolute(1, "/proc/2/task/2/comm")
+            .expect("open /proc/2/task/2/comm");
+        let mut comm = [0u8; 128];
+        let comm_len = task_comm.read(&mut comm).expect("read task comm");
+        assert_eq!(&comm[..comm_len], b"linux-round6-proc-control-smoke\n");
+
+        let task_status = kernel
+            .open_proc_absolute(1, "/proc/2/task/2/status")
+            .expect("open /proc/2/task/2/status");
+        let mut status = [0u8; 256];
+        let status_len = task_status.read(&mut status).expect("read task status");
+        let text = core::str::from_utf8(&status[..status_len]).expect("utf8 task status");
+        assert!(text.contains("Pid:\t2\n"));
+        assert!(text.contains("Tgid:\t2\n"));
+    }
+
+    #[test]
+    fn parent_sigchld_info_tracks_stop_and_continue() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        kernel
+            .groups
+            .get_mut(&1)
+            .expect("root group")
+            .child_tgids
+            .insert(2);
+        kernel.tasks.insert(
+            2,
+            LinuxTask {
+                tid: 2,
+                tgid: 2,
+                carrier: TaskCarrier {
+                    thread_handle: ZX_HANDLE_INVALID,
+                    session_handle: ZX_HANDLE_INVALID,
+                    sidecar_vmo: ZX_HANDLE_INVALID,
+                    packet_key: 2,
+                },
+                state: TaskState::Running,
+                signals: TaskSignals::default(),
+                robust_list: None,
+                active_signal: None,
+            },
+        );
+        kernel.groups.insert(
+            2,
+            LinuxThreadGroup {
+                tgid: 2,
+                leader_tid: 2,
+                parent_tgid: Some(1),
+                pgid: 2,
+                sid: 1,
+                child_tgids: BTreeSet::new(),
+                task_ids: BTreeSet::from([2]),
+                state: ThreadGroupState::Running,
+                last_stop_signal: None,
+                stop_wait_pending: false,
+                continued_wait_pending: false,
+                shared_pending: 0,
+                sigchld_info: None,
+                sigactions: BTreeMap::new(),
+                image: None,
+                resources: None,
+            },
+        );
+
+        kernel
+            .enter_group_stop(2, LINUX_SIGTSTP)
+            .expect("stop child group");
+        let root = kernel.groups.get(&1).expect("root group");
+        assert_ne!(
+            root.shared_pending & linux_signal_bit(LINUX_SIGCHLD).expect("sigchld bit"),
+            0
+        );
+        assert_eq!(
+            root.sigchld_info,
+            Some(LinuxSigChldInfo {
+                pid: 2,
+                status: LINUX_SIGTSTP,
+                code: LINUX_CLD_STOPPED,
+            })
+        );
+
+        kernel
+            .queue_sigchld_to_parent(
+                2,
+                LinuxSigChldInfo {
+                    pid: 2,
+                    status: LINUX_SIGCONT,
+                    code: LINUX_CLD_CONTINUED,
+                },
+            )
+            .expect("queue continued sigchld");
+        let root = kernel.groups.get(&1).expect("root group");
+        assert_eq!(
+            root.sigchld_info,
+            Some(LinuxSigChldInfo {
+                pid: 2,
+                status: LINUX_SIGCONT,
+                code: LINUX_CLD_CONTINUED,
+            })
+        );
     }
 }
 
