@@ -1,0 +1,8 @@
+url = "boot://linux-runtime-fd-smoke"
+startup = "eager"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-runtime-fd-smoke"
+args = ["linux-runtime-fd-smoke"]
+env = []

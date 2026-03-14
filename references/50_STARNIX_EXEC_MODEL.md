@@ -135,6 +135,20 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - `AT_BASE` emitted into the initial Linux auxv when an interpreter is present
   - interpreter bytes staged into one page-aligned local VMO so the normal VM fixed-map path can
     preserve Linux-style zero-filled file tails up to the mapped page coverage
+- the next post-R7 libc/runtime slice now also has:
+  - `getcwd`
+  - `chdir`
+  - `dup2`
+  - `dup3`
+  - `fcntl(F_GETFD)`
+  - `fcntl(F_SETFD)`
+  - `fcntl(F_GETFL)`
+  - `fcntl(F_DUPFD_CLOEXEC)`
+  - cwd and fd-management state remaining purely executive-owned over the existing
+    `ProcessNamespace` and Linux fd table substrate
+  - no TLS / `arch_prctl` / `set_tid_address` surface yet; those remain later
+    libc/runtime enablement work because they require additional guest-register
+    / thread-lifecycle contract beyond this first slice
 
 ## Frozen architectural split
 

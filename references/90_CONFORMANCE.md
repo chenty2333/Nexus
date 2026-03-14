@@ -225,6 +225,20 @@ Main just targets include:
     - no shared-library dependency graph
     - no relocations beyond the fixed entry path
     - no general `PT_INTERP` package/runtime search policy yet
+- The next post-R7 libc/runtime scenario now closes one narrow cwd/fd-management
+  slice:
+  - `getcwd`
+  - `chdir`
+  - `dup2`
+  - `dup3`
+  - `fcntl(F_GETFD / F_SETFD / F_GETFL / F_DUPFD_CLOEXEC)`
+  - cwd policy remains in the executive's `ProcessNamespace`, not in Axle
+    kernel task state
+  - fd duplication and `CLOEXEC` remain Linux-fd semantics over the existing
+    shared open-file-description substrate
+  - this gate intentionally excludes `arch_prctl`, TLS setup, `set_tid_address`,
+    positional I/O, and broader libc startup dependencies, which remain later
+    runtime-enablement work
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

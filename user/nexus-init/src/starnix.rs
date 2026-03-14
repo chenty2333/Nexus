@@ -78,9 +78,9 @@ use crate::{
     LINUX_ROUND6_SCM_RIGHTS_BYTES, LINUX_ROUND6_SCM_RIGHTS_DECL_BYTES,
     LINUX_ROUND6_SIGNALFD_BINARY_PATH, LINUX_ROUND6_SIGNALFD_BYTES,
     LINUX_ROUND6_SIGNALFD_DECL_BYTES, LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES,
-    LINUX_ROUND6_TIMERFD_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
-    STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
-    STARTUP_HANDLE_STARNIX_STDOUT,
+    LINUX_ROUND6_TIMERFD_DECL_BYTES, LINUX_RUNTIME_FD_BINARY_PATH, LINUX_RUNTIME_FD_BYTES,
+    STARTUP_HANDLE_COMPONENT_STATUS, STARTUP_HANDLE_STARNIX_IMAGE_VMO,
+    STARTUP_HANDLE_STARNIX_PARENT_PROCESS, STARTUP_HANDLE_STARNIX_STDOUT,
 };
 
 const USER_PAGE_BYTES: u64 = 0x1000;
@@ -102,6 +102,7 @@ const LINUX_SYSCALL_READ: u64 = 0;
 const LINUX_SYSCALL_WRITE: u64 = 1;
 const LINUX_SYSCALL_CLOSE: u64 = 3;
 const LINUX_SYSCALL_FSTAT: u64 = 5;
+const LINUX_SYSCALL_DUP2: u64 = 33;
 const LINUX_SYSCALL_MMAP: u64 = 9;
 const LINUX_SYSCALL_MPROTECT: u64 = 10;
 const LINUX_SYSCALL_MUNMAP: u64 = 11;
@@ -109,6 +110,9 @@ const LINUX_SYSCALL_RT_SIGACTION: u64 = 13;
 const LINUX_SYSCALL_RT_SIGPROCMASK: u64 = 14;
 const LINUX_SYSCALL_RT_SIGRETURN: u64 = 15;
 const LINUX_SYSCALL_BRK: u64 = 12;
+const LINUX_SYSCALL_FCNTL: u64 = 72;
+const LINUX_SYSCALL_GETCWD: u64 = 79;
+const LINUX_SYSCALL_CHDIR: u64 = 80;
 const LINUX_SYSCALL_GETPID: u64 = 39;
 const LINUX_SYSCALL_SETPGID: u64 = 109;
 const LINUX_SYSCALL_GETPGRP: u64 = 111;
@@ -141,6 +145,7 @@ const LINUX_SYSCALL_EXIT: u64 = 60;
 const LINUX_SYSCALL_OPENAT: u64 = 257;
 const LINUX_SYSCALL_NEWFSTATAT: u64 = 262;
 const LINUX_SYSCALL_EPOLL_CREATE1: u64 = 291;
+const LINUX_SYSCALL_DUP3: u64 = 292;
 const LINUX_SYSCALL_EXIT_GROUP: u64 = 231;
 const LINUX_SYSCALL_PIPE2: u64 = 293;
 const LINUX_SYSCALL_PIDFD_OPEN: u64 = 434;
@@ -198,6 +203,13 @@ const LINUX_EPOLLHUP: u32 = 0x010;
 const LINUX_EPOLLONESHOT: u32 = 1 << 30;
 const LINUX_EPOLLET: u32 = 1 << 31;
 const LINUX_EPOLL_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_F_DUPFD: i32 = 0;
+const LINUX_F_GETFD: i32 = 1;
+const LINUX_F_SETFD: i32 = 2;
+const LINUX_F_GETFL: i32 = 3;
+const LINUX_F_SETFL: i32 = 4;
+const LINUX_F_DUPFD_CLOEXEC: i32 = 1030;
+const LINUX_FD_CLOEXEC: u64 = 1;
 const LINUX_EFD_SEMAPHORE: u64 = 0x1;
 const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_EFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
@@ -248,6 +260,7 @@ const LINUX_ENOSYS: i32 = 38;
 const LINUX_ENODEV: i32 = 19;
 const LINUX_ECHILD: i32 = 10;
 const LINUX_ENOTSOCK: i32 = 88;
+const LINUX_ERANGE: i32 = 34;
 const LINUX_WNOHANG: u64 = 1;
 const LINUX_WUNTRACED: u64 = 2;
 const LINUX_WCONTINUED: u64 = 8;
@@ -6409,10 +6422,38 @@ fn emulate_common_syscall(
             complete_syscall(stop_state, result)?;
             Ok(SyscallAction::Resume)
         }
+        LINUX_SYSCALL_DUP2 => {
+            let oldfd = linux_arg_i32(stop_state.regs.rdi);
+            let newfd = linux_arg_i32(stop_state.regs.rsi);
+            let result = executive.dup2(oldfd, newfd)?;
+            complete_syscall(stop_state, result)?;
+            Ok(SyscallAction::Resume)
+        }
         LINUX_SYSCALL_FSTAT => {
             let fd = linux_arg_i32(stop_state.regs.rdi);
             let stat_addr = stop_state.regs.rsi;
             let result = executive.stat_fd(session, fd, stat_addr)?;
+            complete_syscall(stop_state, result)?;
+            Ok(SyscallAction::Resume)
+        }
+        LINUX_SYSCALL_FCNTL => {
+            let fd = linux_arg_i32(stop_state.regs.rdi);
+            let cmd = linux_arg_i32(stop_state.regs.rsi);
+            let arg = stop_state.regs.rdx;
+            let result = executive.fcntl(fd, cmd, arg)?;
+            complete_syscall(stop_state, result)?;
+            Ok(SyscallAction::Resume)
+        }
+        LINUX_SYSCALL_GETCWD => {
+            let buf = stop_state.regs.rdi;
+            let size = usize::try_from(stop_state.regs.rsi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+            let result = executive.getcwd(session, buf, size)?;
+            complete_syscall(stop_state, result)?;
+            Ok(SyscallAction::Resume)
+        }
+        LINUX_SYSCALL_CHDIR => {
+            let path = stop_state.regs.rdi;
+            let result = executive.chdir(session, path)?;
             complete_syscall(stop_state, result)?;
             Ok(SyscallAction::Resume)
         }
@@ -6491,6 +6532,14 @@ fn emulate_common_syscall(
             complete_syscall(stop_state, result)?;
             Ok(SyscallAction::Resume)
         }
+        LINUX_SYSCALL_DUP3 => {
+            let oldfd = linux_arg_i32(stop_state.regs.rdi);
+            let newfd = linux_arg_i32(stop_state.regs.rsi);
+            let flags = stop_state.regs.rdx;
+            let result = executive.dup3(oldfd, newfd, flags)?;
+            complete_syscall(stop_state, result)?;
+            Ok(SyscallAction::Resume)
+        }
         LINUX_SYSCALL_EXIT => {
             let code =
                 i32::try_from(stop_state.regs.rdi & 0xff).map_err(|_| ZX_ERR_INVALID_ARGS)?;
@@ -6526,6 +6575,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-round6-proc-job-smoke") => Some(LINUX_ROUND6_PROC_JOB_BYTES),
         Some("linux-round6-proc-control-smoke") => Some(LINUX_ROUND6_PROC_CONTROL_BYTES),
         Some("linux-round6-proc-tty-smoke") => Some(LINUX_ROUND6_PROC_TTY_BYTES),
+        Some("linux-runtime-fd-smoke") => Some(LINUX_RUNTIME_FD_BYTES),
         Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BYTES),
         Some(_) => None,
     }
@@ -6549,6 +6599,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-round6-proc-job-smoke") => Some(LINUX_ROUND6_PROC_JOB_BINARY_PATH),
         Some("linux-round6-proc-control-smoke") => Some(LINUX_ROUND6_PROC_CONTROL_BINARY_PATH),
         Some("linux-round6-proc-tty-smoke") => Some(LINUX_ROUND6_PROC_TTY_BINARY_PATH),
+        Some("linux-runtime-fd-smoke") => Some(LINUX_RUNTIME_FD_BINARY_PATH),
         Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH),
         Some(_) => None,
     }
@@ -7734,6 +7785,136 @@ impl ExecutiveState {
         self.linux_mm.mprotect(addr, len, prot)
     }
 
+    fn getcwd(
+        &self,
+        session: zx_handle_t,
+        guest_addr: u64,
+        size: usize,
+    ) -> Result<u64, zx_status_t> {
+        if size == 0 {
+            return Ok(linux_errno(LINUX_EINVAL));
+        }
+        let cwd = self.namespace.cwd();
+        let needed = cwd.len().checked_add(1).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        if needed > size {
+            return Ok(linux_errno(LINUX_ERANGE));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(needed)
+            .map_err(|_| ZX_ERR_NO_MEMORY)?;
+        bytes.extend_from_slice(cwd.as_bytes());
+        bytes.push(0);
+        match write_guest_bytes(session, guest_addr, &bytes) {
+            Ok(()) => Ok(needed as u64),
+            Err(status) => Ok(linux_errno(map_guest_write_status_to_errno(status))),
+        }
+    }
+
+    fn chdir(&mut self, session: zx_handle_t, path_addr: u64) -> Result<u64, zx_status_t> {
+        let path = match read_guest_c_string(session, path_addr, LINUX_PATH_MAX) {
+            Ok(path) => path,
+            Err(status) => return Ok(linux_errno(map_guest_memory_status_to_errno(status))),
+        };
+        if path.is_empty() {
+            return Ok(linux_errno(LINUX_ENOENT));
+        }
+        match self.namespace.set_cwd(path.as_str()) {
+            Ok(()) => Ok(0),
+            Err(status) => Ok(linux_errno(map_fd_status_to_errno(status))),
+        }
+    }
+
+    fn dup2(&mut self, oldfd: i32, newfd: i32) -> Result<u64, zx_status_t> {
+        if oldfd == newfd {
+            return if self.fd_table.get(oldfd).is_some() {
+                Ok(newfd as u64)
+            } else {
+                Ok(linux_errno(LINUX_EBADF))
+            };
+        }
+        if newfd < 0 {
+            return Ok(linux_errno(LINUX_EBADF));
+        }
+        match self.fd_table.duplicate_to(oldfd, newfd, FdFlags::empty()) {
+            Ok(fd) => Ok(fd as u64),
+            Err(status) => Ok(linux_errno(map_fd_status_to_errno(status))),
+        }
+    }
+
+    fn dup3(&mut self, oldfd: i32, newfd: i32, flags: u64) -> Result<u64, zx_status_t> {
+        if oldfd == newfd {
+            return Ok(linux_errno(LINUX_EINVAL));
+        }
+        if newfd < 0 {
+            return Ok(linux_errno(LINUX_EBADF));
+        }
+        if flags & !LINUX_O_CLOEXEC != 0 {
+            return Ok(linux_errno(LINUX_EINVAL));
+        }
+        let fd_flags = if (flags & LINUX_O_CLOEXEC) != 0 {
+            FdFlags::CLOEXEC
+        } else {
+            FdFlags::empty()
+        };
+        match self.fd_table.duplicate_to(oldfd, newfd, fd_flags) {
+            Ok(fd) => Ok(fd as u64),
+            Err(status) => Ok(linux_errno(map_fd_status_to_errno(status))),
+        }
+    }
+
+    fn fcntl(&mut self, fd: i32, cmd: i32, arg: u64) -> Result<u64, zx_status_t> {
+        match cmd {
+            LINUX_F_GETFD => {
+                let Some(entry) = self.fd_table.get(fd) else {
+                    return Ok(linux_errno(LINUX_EBADF));
+                };
+                Ok(encode_linux_fd_flags(entry.flags()))
+            }
+            LINUX_F_SETFD => {
+                let flags = FdFlags::from_bits_truncate(arg as u32);
+                match self.fd_table.set_fd_flags(fd, flags) {
+                    Ok(()) => Ok(0),
+                    Err(status) => Ok(linux_errno(map_fd_status_to_errno(status))),
+                }
+            }
+            LINUX_F_GETFL => {
+                let Some(entry) = self.fd_table.get(fd) else {
+                    return Ok(linux_errno(LINUX_EBADF));
+                };
+                Ok(encode_linux_open_flags(entry.description().flags()))
+            }
+            LINUX_F_DUPFD => {
+                let min_fd = linux_arg_i32(arg);
+                if min_fd < 0 {
+                    return Ok(linux_errno(LINUX_EINVAL));
+                }
+                match self
+                    .fd_table
+                    .duplicate_from_min(fd, min_fd, FdFlags::empty())
+                {
+                    Ok(new_fd) => Ok(new_fd as u64),
+                    Err(status) => Ok(linux_errno(map_fd_status_to_errno(status))),
+                }
+            }
+            LINUX_F_DUPFD_CLOEXEC => {
+                let min_fd = linux_arg_i32(arg);
+                if min_fd < 0 {
+                    return Ok(linux_errno(LINUX_EINVAL));
+                }
+                match self
+                    .fd_table
+                    .duplicate_from_min(fd, min_fd, FdFlags::CLOEXEC)
+                {
+                    Ok(new_fd) => Ok(new_fd as u64),
+                    Err(status) => Ok(linux_errno(map_fd_status_to_errno(status))),
+                }
+            }
+            LINUX_F_SETFL => Ok(linux_errno(LINUX_ENOSYS)),
+            _ => Ok(linux_errno(LINUX_EINVAL)),
+        }
+    }
+
     fn create_pipe(
         &mut self,
         session: zx_handle_t,
@@ -8572,6 +8753,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_ROUND6_PROC_TTY_BYTES,
         ));
     }
+    if !LINUX_RUNTIME_FD_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_RUNTIME_FD_BINARY_PATH,
+            LINUX_RUNTIME_FD_BYTES,
+        ));
+    }
     if !LINUX_DYNAMIC_ELF_SMOKE_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH,
@@ -9119,6 +9306,38 @@ fn decode_open_flags(flags: u64) -> (OpenFlags, FdFlags) {
         fd_flags |= FdFlags::CLOEXEC;
     }
     (open_flags, fd_flags)
+}
+
+fn encode_linux_fd_flags(flags: FdFlags) -> u64 {
+    let mut bits = 0u64;
+    if flags.contains(FdFlags::CLOEXEC) {
+        bits |= LINUX_FD_CLOEXEC;
+    }
+    bits
+}
+
+fn encode_linux_open_flags(flags: OpenFlags) -> u64 {
+    let mut bits = match (
+        flags.contains(OpenFlags::READABLE),
+        flags.contains(OpenFlags::WRITABLE),
+    ) {
+        (true, true) => LINUX_O_RDWR,
+        (false, true) => LINUX_O_WRONLY,
+        _ => 0,
+    };
+    if flags.contains(OpenFlags::APPEND) {
+        bits |= LINUX_O_APPEND;
+    }
+    if flags.contains(OpenFlags::NONBLOCK) {
+        bits |= LINUX_O_NONBLOCK;
+    }
+    if flags.contains(OpenFlags::DIRECTORY) {
+        bits |= LINUX_O_DIRECTORY;
+    }
+    if flags.contains(OpenFlags::PATH) {
+        bits |= LINUX_O_PATH;
+    }
+    bits
 }
 
 fn encode_linux_dirent64(

@@ -472,11 +472,59 @@ impl FdTable {
         }))
     }
 
+    /// Duplicate one fd into exactly `target_fd`, replacing any prior entry there.
+    pub fn duplicate_to(
+        &mut self,
+        fd: RawFd,
+        target_fd: RawFd,
+        new_flags: FdFlags,
+    ) -> Result<RawFd, zx_status_t> {
+        let target_index = fd_index(target_fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+        let entry = self.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?.clone();
+        self.install_entry_at(
+            target_index,
+            FdEntry {
+                description: entry.description,
+                flags: new_flags,
+            },
+        )?;
+        Ok(target_fd)
+    }
+
+    /// Duplicate one fd into the lowest free entry greater than or equal to `min_fd`.
+    pub fn duplicate_from_min(
+        &mut self,
+        fd: RawFd,
+        min_fd: RawFd,
+        new_flags: FdFlags,
+    ) -> Result<RawFd, zx_status_t> {
+        let min_index = fd_index(min_fd).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let entry = self.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?.clone();
+        Ok(self.install_entry_from(
+            min_index,
+            FdEntry {
+                description: entry.description,
+                flags: new_flags,
+            },
+        ))
+    }
+
     /// Clone one fd into a new open file description through `FdOps::clone_fd`.
     pub fn clone_fd(&mut self, fd: RawFd, new_flags: FdFlags) -> Result<RawFd, zx_status_t> {
         let entry = self.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
         let cloned = entry.description.ops().clone_fd(new_flags)?;
         self.open(cloned, entry.description.flags(), new_flags)
+    }
+
+    /// Replace the per-fd flags installed at `fd`.
+    pub fn set_fd_flags(&mut self, fd: RawFd, flags: FdFlags) -> Result<(), zx_status_t> {
+        let entry = self
+            .entries
+            .get_mut(fd_index(fd).ok_or(ZX_ERR_BAD_HANDLE)?)
+            .and_then(Option::as_mut)
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        entry.flags = flags;
+        Ok(())
     }
 
     /// Remove one fd entry from the table.
@@ -486,14 +534,7 @@ impl FdTable {
         let Some(entry) = slot.take() else {
             return Err(ZX_ERR_BAD_HANDLE);
         };
-        // Open-file-description identity can be shared across duplicated entries
-        // and across fork-cloned fd tables, so the close decision must follow the
-        // shared `Arc<OpenFileDescription>` lifetime rather than only this table.
-        let last_fd_for_description = Arc::strong_count(entry.description()) == 1;
-        if last_fd_for_description {
-            entry.description.ops().close()?;
-        }
-        Ok(())
+        self.close_entry(entry)
     }
 
     fn allocate_description_id(&mut self) -> Result<OpenFileDescriptionId, zx_status_t> {
@@ -518,6 +559,47 @@ impl FdTable {
             self.entries.push(Some(entry));
             (self.entries.len() - 1) as RawFd
         }
+    }
+
+    fn install_entry_from(&mut self, min_index: usize, entry: FdEntry) -> RawFd {
+        if let Some((index, slot)) = self
+            .entries
+            .iter_mut()
+            .enumerate()
+            .skip(min_index)
+            .find(|(_, slot)| slot.is_none())
+        {
+            *slot = Some(entry);
+            index as RawFd
+        } else {
+            if self.entries.len() < min_index {
+                self.entries.resize(min_index, None);
+            }
+            self.entries.push(Some(entry));
+            (self.entries.len() - 1) as RawFd
+        }
+    }
+
+    fn install_entry_at(&mut self, index: usize, entry: FdEntry) -> Result<(), zx_status_t> {
+        if self.entries.len() <= index {
+            self.entries.resize(index + 1, None);
+        }
+        if let Some(previous) = self.entries[index].take() {
+            self.close_entry(previous)?;
+        }
+        self.entries[index] = Some(entry);
+        Ok(())
+    }
+
+    fn close_entry(&mut self, entry: FdEntry) -> Result<(), zx_status_t> {
+        // Open-file-description identity can be shared across duplicated entries
+        // and across fork-cloned fd tables, so the close decision must follow the
+        // shared `Arc<OpenFileDescription>` lifetime rather than only this table.
+        let last_fd_for_description = Arc::strong_count(entry.description()) == 1;
+        if last_fd_for_description {
+            entry.description.ops().close()?;
+        }
+        Ok(())
     }
 }
 
@@ -1308,6 +1390,110 @@ mod tests {
 
         child.close(fd).expect("child close should succeed");
         assert_eq!(state.lock().expect("state poisoned").closes, 1);
+    }
+
+    #[test]
+    fn duplicate_to_replaces_target_entry_and_keeps_source_description_alive() {
+        let source_state = Arc::new(Mutex::new(MockState::default()));
+        let target_state = Arc::new(Mutex::new(MockState::default()));
+        let mut table = FdTable::new();
+        let source_fd = table
+            .open(
+                Arc::new(MockFd::new("source", source_state.clone())),
+                OpenFlags::READABLE,
+                FdFlags::empty(),
+            )
+            .expect("source open should succeed");
+        let target_fd = table
+            .open(
+                Arc::new(MockFd::new("target", target_state.clone())),
+                OpenFlags::WRITABLE,
+                FdFlags::empty(),
+            )
+            .expect("target open should succeed");
+
+        table
+            .duplicate_to(source_fd, target_fd, FdFlags::CLOEXEC)
+            .expect("duplicate_to should succeed");
+
+        let replaced = table.get(target_fd).expect("target fd installed");
+        assert_eq!(
+            replaced.description().id(),
+            table
+                .get(source_fd)
+                .expect("source fd installed")
+                .description()
+                .id()
+        );
+        assert_eq!(replaced.flags(), FdFlags::CLOEXEC);
+        assert_eq!(target_state.lock().expect("state poisoned").closes, 1);
+        assert_eq!(source_state.lock().expect("state poisoned").closes, 0);
+    }
+
+    #[test]
+    fn duplicate_from_min_finds_first_free_slot_at_or_after_minimum() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut table = FdTable::new();
+        let fd0 = table
+            .open(
+                Arc::new(MockFd::new("source", state)),
+                OpenFlags::READABLE,
+                FdFlags::empty(),
+            )
+            .expect("open should succeed");
+        let fd1 = table
+            .duplicate(fd0, FdFlags::empty())
+            .expect("duplicate should succeed");
+        let fd2 = table
+            .duplicate(fd0, FdFlags::empty())
+            .expect("duplicate should succeed");
+        table.close(fd1).expect("close should succeed");
+
+        let duplicated = table
+            .duplicate_from_min(fd0, fd1, FdFlags::CLOEXEC)
+            .expect("duplicate_from_min should succeed");
+        assert_eq!(duplicated, fd1);
+        assert_eq!(
+            table.get(fd2).expect("fd2 installed").flags(),
+            FdFlags::empty()
+        );
+        assert_eq!(
+            table.get(duplicated).expect("duplicated installed").flags(),
+            FdFlags::CLOEXEC
+        );
+    }
+
+    #[test]
+    fn set_fd_flags_only_mutates_one_fd_entry() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut table = FdTable::new();
+        let fd0 = table
+            .open(
+                Arc::new(MockFd::new("source", state)),
+                OpenFlags::READABLE,
+                FdFlags::empty(),
+            )
+            .expect("open should succeed");
+        let fd1 = table
+            .duplicate(fd0, FdFlags::empty())
+            .expect("duplicate should succeed");
+
+        table
+            .set_fd_flags(fd1, FdFlags::CLOEXEC)
+            .expect("set_fd_flags should succeed");
+
+        assert_eq!(
+            table.get(fd0).expect("fd0 installed").flags(),
+            FdFlags::empty()
+        );
+        assert_eq!(
+            table.get(fd1).expect("fd1 installed").flags(),
+            FdFlags::CLOEXEC
+        );
+        assert_eq!(
+            table.get(fd0).expect("fd0 installed").description().id(),
+            table.get(fd1).expect("fd1 installed").description().id()
+        );
     }
 
     #[test]
