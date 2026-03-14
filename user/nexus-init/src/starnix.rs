@@ -64,9 +64,11 @@ use crate::services::{
 use crate::{
     LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH, LINUX_DYNAMIC_ELF_SMOKE_BYTES,
     LINUX_DYNAMIC_INTERP_BINARY_PATH, LINUX_DYNAMIC_INTERP_BYTES, LINUX_DYNAMIC_MAIN_BINARY_PATH,
-    LINUX_DYNAMIC_MAIN_BYTES, LINUX_FD_SMOKE_BINARY_PATH, LINUX_FD_SMOKE_BYTES,
-    LINUX_FD_SMOKE_DECL_BYTES, LINUX_HELLO_BINARY_PATH, LINUX_HELLO_BYTES, LINUX_HELLO_DECL_BYTES,
-    LINUX_ROUND2_BINARY_PATH, LINUX_ROUND2_BYTES, LINUX_ROUND2_DECL_BYTES,
+    LINUX_DYNAMIC_MAIN_BYTES, LINUX_DYNAMIC_TLS_INTERP_BINARY_PATH, LINUX_DYNAMIC_TLS_INTERP_BYTES,
+    LINUX_DYNAMIC_TLS_MAIN_BINARY_PATH, LINUX_DYNAMIC_TLS_MAIN_BYTES,
+    LINUX_DYNAMIC_TLS_SMOKE_BINARY_PATH, LINUX_DYNAMIC_TLS_SMOKE_BYTES, LINUX_FD_SMOKE_BINARY_PATH,
+    LINUX_FD_SMOKE_BYTES, LINUX_FD_SMOKE_DECL_BYTES, LINUX_HELLO_BINARY_PATH, LINUX_HELLO_BYTES,
+    LINUX_HELLO_DECL_BYTES, LINUX_ROUND2_BINARY_PATH, LINUX_ROUND2_BYTES, LINUX_ROUND2_DECL_BYTES,
     LINUX_ROUND3_BINARY_PATH, LINUX_ROUND3_BYTES, LINUX_ROUND3_DECL_BYTES,
     LINUX_ROUND4_FUTEX_BINARY_PATH, LINUX_ROUND4_FUTEX_BYTES, LINUX_ROUND4_FUTEX_DECL_BYTES,
     LINUX_ROUND4_SIGNAL_BINARY_PATH, LINUX_ROUND4_SIGNAL_BYTES, LINUX_ROUND4_SIGNAL_DECL_BYTES,
@@ -328,6 +330,9 @@ const EVENTFD_COUNTER_MAX: u64 = u64::MAX - 1;
 const SIGNALFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
 const PIDFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
 const AT_NULL: u64 = 0;
+const AT_SECURE: u64 = 23;
+const AT_RANDOM: u64 = 25;
+const AT_EXECFN: u64 = 31;
 const AT_PHDR: u64 = 3;
 const AT_BASE: u64 = 7;
 const AT_PHENT: u64 = 4;
@@ -342,8 +347,10 @@ const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 const PT_PHDR: u32 = 6;
+const PT_TLS: u32 = 7;
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
+const X64_TLS_TCB_BYTES: u64 = 16;
 pub(crate) fn starnix_kernel_program_start(bootstrap_channel: zx_handle_t) -> ! {
     let mut status_handle = None;
     let mut controller_handle = None;
@@ -392,6 +399,14 @@ struct LinuxLoadSegment {
     flags: u32,
 }
 
+#[derive(Clone, Copy)]
+struct LinuxTlsSegment {
+    file_offset: usize,
+    file_size: usize,
+    mem_size: u64,
+    align: u64,
+}
+
 struct LinuxElf<'a> {
     entry: u64,
     phdr_vaddr: Option<u64>,
@@ -399,6 +414,7 @@ struct LinuxElf<'a> {
     phnum: u16,
     image_end: u64,
     interp_path: Option<String>,
+    tls: Option<LinuxTlsSegment>,
     segments: Vec<LinuxLoadSegment>,
     _bytes: &'a [u8],
 }
@@ -471,7 +487,15 @@ struct TaskImage {
     path: String,
     cmdline: Vec<u8>,
     exec_blob: Vec<u8>,
+    initial_tls: Option<LinuxInitialTls>,
     writable_ranges: Vec<LinuxWritableRange>,
+}
+
+#[derive(Clone)]
+struct LinuxInitialTls {
+    init_image: Vec<u8>,
+    mem_size: u64,
+    align: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -4613,14 +4637,12 @@ impl StarnixKernel {
             .session_handle;
 
         let result = match code {
-            LINUX_ARCH_SET_FS => match zx_status_result(ax_thread_set_guest_x64_fs_base(
-                thread_handle,
-                addr,
-                0,
-            )) {
-                Ok(()) => 0,
-                Err(status) => linux_errno(map_guest_start_status_to_errno(status)),
-            },
+            LINUX_ARCH_SET_FS => {
+                match zx_status_result(ax_thread_set_guest_x64_fs_base(thread_handle, addr, 0)) {
+                    Ok(()) => 0,
+                    Err(status) => linux_errno(map_guest_start_status_to_errno(status)),
+                }
+            }
             LINUX_ARCH_GET_FS => {
                 let mut fs_base = 0u64;
                 match zx_status_result(ax_thread_get_guest_x64_fs_base(
@@ -4951,14 +4973,6 @@ impl StarnixKernel {
         Ok(SyscallAction::Resume)
     }
 
-    fn next_random_u64(&mut self) -> u64 {
-        self.random_state = self.random_state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut value = self.random_state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^ (value >> 31)
-    }
-
     fn sys_getrandom(
         &mut self,
         task_id: i32,
@@ -4984,13 +4998,7 @@ impl StarnixKernel {
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
         bytes.resize(len, 0);
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            let chunk = self.next_random_u64().to_ne_bytes();
-            let actual = (bytes.len() - offset).min(chunk.len());
-            bytes[offset..offset + actual].copy_from_slice(&chunk[..actual]);
-            offset += actual;
-        }
+        fill_random_bytes(&mut self.random_state, &mut bytes);
         let result = match write_guest_bytes(session, buf_addr, &bytes) {
             Ok(()) => u64::try_from(len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
             Err(status) => linux_errno(map_guest_write_status_to_errno(status)),
@@ -6615,8 +6623,15 @@ impl StarnixKernel {
         if args.is_empty() {
             args.push(resolved_path.clone());
         }
-        let task_image =
-            match build_task_image(&resolved_path, &args, &env, &image_bytes, |interp_path| {
+        let mut stack_random = [0u8; 16];
+        fill_random_bytes(&mut self.random_state, &mut stack_random);
+        let task_image = match build_task_image(
+            &resolved_path,
+            &args,
+            &env,
+            &image_bytes,
+            stack_random,
+            |interp_path| {
                 let namespace = &self
                     .groups
                     .get(&tgid)
@@ -6626,15 +6641,16 @@ impl StarnixKernel {
                     .ok_or(ZX_ERR_BAD_STATE)?
                     .namespace;
                 read_exec_image_bytes_from_namespace(namespace, interp_path).map(|(_, bytes)| bytes)
-            }) {
-                Ok(image) => image,
-                Err(status) => {
-                    let _ = zx_handle_close(image_vmo);
-                    let errno = map_exec_status_to_errno(status);
-                    complete_syscall(stop_state, linux_errno(errno))?;
-                    return Ok(SyscallAction::Resume);
-                }
-            };
+            },
+        ) {
+            Ok(image) => image,
+            Err(status) => {
+                let _ = zx_handle_close(image_vmo);
+                let errno = map_exec_status_to_errno(status);
+                complete_syscall(stop_state, linux_errno(errno))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
         let packet_key = self.alloc_packet_key()?;
         let prepared = match prepare_process_carrier(
             self.parent_process,
@@ -6653,7 +6669,7 @@ impl StarnixKernel {
         };
         let _ = zx_handle_close(image_vmo);
 
-        let new_resources = {
+        let mut new_resources = {
             let resources = self
                 .groups
                 .get(&tgid)
@@ -6671,6 +6687,27 @@ impl StarnixKernel {
                 }
             }
         };
+        match new_resources.install_initial_tls(prepared.carrier.session_handle, &task_image) {
+            Ok(Some(fs_base)) => {
+                if let Err(status) = zx_status_result(ax_thread_set_guest_x64_fs_base(
+                    prepared.carrier.thread_handle,
+                    fs_base,
+                    0,
+                )) {
+                    prepared.close();
+                    let errno = map_guest_start_status_to_errno(status);
+                    complete_syscall(stop_state, linux_errno(errno))?;
+                    return Ok(SyscallAction::Resume);
+                }
+            }
+            Ok(None) => {}
+            Err(status) => {
+                prepared.close();
+                let errno = map_vm_status_to_errno(status);
+                complete_syscall(stop_state, linux_errno(errno))?;
+                return Ok(SyscallAction::Resume);
+            }
+        }
         let regs = linux_guest_initial_regs(prepared.prepared_entry, prepared.prepared_stack);
         let (new_resources, new_carrier) =
             match start_prepared_carrier_guest(prepared, &regs, new_resources) {
@@ -6931,9 +6968,17 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         }
         return 1;
     }
-    let task_image = match build_task_image(payload_path, &args, &env, payload_bytes, |_| {
-        Err(ZX_ERR_NOT_SUPPORTED)
-    }) {
+    let mut stack_random_state = seed_runtime_random_state(parent_process, port, 1);
+    let mut stack_random = [0u8; 16];
+    fill_random_bytes(&mut stack_random_state, &mut stack_random);
+    let task_image = match build_task_image(
+        payload_path,
+        &args,
+        &env,
+        payload_bytes,
+        stack_random,
+        |_| Err(ZX_ERR_NOT_SUPPORTED),
+    ) {
         Ok(image) => image,
         Err(status) => return map_status_to_return_code(status),
     };
@@ -6956,7 +7001,7 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         }
     };
     let _ = zx_handle_close(linux_image_vmo);
-    let resources =
+    let mut resources =
         match ExecutiveState::new(prepared.process_handle, prepared.root_vmar, stdout_handle) {
             Ok(resources) => resources,
             Err(status) => {
@@ -6969,6 +7014,33 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
                 return map_status_to_return_code(status);
             }
         };
+    match resources.install_initial_tls(prepared.carrier.session_handle, &task_image) {
+        Ok(Some(fs_base)) => {
+            if let Err(status) = zx_status_result(ax_thread_set_guest_x64_fs_base(
+                prepared.carrier.thread_handle,
+                fs_base,
+                0,
+            )) {
+                prepared.close();
+                let _ = zx_handle_close(port);
+                let _ = zx_handle_close(parent_process);
+                if let Some(stdout) = stdout_handle {
+                    let _ = zx_handle_close(stdout);
+                }
+                return map_status_to_return_code(status);
+            }
+        }
+        Ok(None) => {}
+        Err(status) => {
+            prepared.close();
+            let _ = zx_handle_close(port);
+            let _ = zx_handle_close(parent_process);
+            if let Some(stdout) = stdout_handle {
+                let _ = zx_handle_close(stdout);
+            }
+            return map_status_to_return_code(status);
+        }
+    }
     let regs = linux_guest_initial_regs(prepared.prepared_entry, prepared.prepared_stack);
     let (resources, carrier) = match start_prepared_carrier_guest(prepared, &regs, resources) {
         Ok(started) => started,
@@ -7235,6 +7307,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-runtime-fs-smoke") => Some(LINUX_RUNTIME_FS_BYTES),
         Some("linux-runtime-tls-smoke") => Some(LINUX_RUNTIME_TLS_BYTES),
         Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BYTES),
+        Some("linux-dynamic-tls-smoke") => Some(LINUX_DYNAMIC_TLS_SMOKE_BYTES),
         Some(_) => None,
     }
 }
@@ -7262,6 +7335,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-runtime-fs-smoke") => Some(LINUX_RUNTIME_FS_BINARY_PATH),
         Some("linux-runtime-tls-smoke") => Some(LINUX_RUNTIME_TLS_BINARY_PATH),
         Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH),
+        Some("linux-dynamic-tls-smoke") => Some(LINUX_DYNAMIC_TLS_SMOKE_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -7271,6 +7345,7 @@ fn build_task_image(
     args: &[String],
     env: &[String],
     bytes: &[u8],
+    stack_random: [u8; 16],
     mut resolve_interp_image: impl FnMut(&str) -> Result<Vec<u8>, zx_status_t>,
 ) -> Result<TaskImage, zx_status_t> {
     let elf = parse_elf(bytes, None)?;
@@ -7284,14 +7359,19 @@ fn build_task_image(
     }
     let mut writable_ranges = Vec::new();
     collect_writable_ranges(&mut writable_ranges, &elf)?;
+    let initial_tls = build_initial_tls_template(bytes, &elf)?;
 
     let exec_blob = if let Some(interp_path) = elf.interp_path.as_deref() {
         let interp_load_bias =
             align_up_u64(elf.image_end, USER_PAGE_BYTES).ok_or(ZX_ERR_OUT_OF_RANGE)?;
         let interp_bytes = resolve_interp_image(interp_path)?;
         let interp_elf = parse_elf(&interp_bytes, Some(interp_load_bias))?;
+        if interp_elf.tls.is_some() {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
         collect_writable_ranges(&mut writable_ranges, &interp_elf)?;
-        let stack = build_initial_stack(args, env, &elf, Some(interp_load_bias))?;
+        let stack =
+            build_initial_stack(path, args, env, &elf, Some(interp_load_bias), stack_random)?;
         ax_linux_exec_spec_blob_with_interp(
             ax_linux_exec_spec_header_t {
                 version: AX_LINUX_EXEC_SPEC_V2,
@@ -7309,7 +7389,7 @@ fn build_task_image(
             &interp_bytes,
         )?
     } else {
-        let stack = build_initial_stack(args, env, &elf, None)?;
+        let stack = build_initial_stack(path, args, env, &elf, None, stack_random)?;
         ax_linux_exec_spec_blob(
             ax_linux_exec_spec_header_t {
                 version: AX_LINUX_EXEC_SPEC_V1,
@@ -7327,8 +7407,32 @@ fn build_task_image(
         path: String::from(path),
         cmdline,
         exec_blob,
+        initial_tls,
         writable_ranges,
     })
+}
+
+fn build_initial_tls_template(
+    bytes: &[u8],
+    elf: &LinuxElf<'_>,
+) -> Result<Option<LinuxInitialTls>, zx_status_t> {
+    let Some(tls) = elf.tls else {
+        return Ok(None);
+    };
+    let mut init_image = Vec::new();
+    init_image
+        .try_reserve_exact(tls.file_size)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    init_image.extend_from_slice(
+        bytes
+            .get(tls.file_offset..tls.file_offset + tls.file_size)
+            .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?,
+    );
+    Ok(Some(LinuxInitialTls {
+        init_image,
+        mem_size: tls.mem_size,
+        align: tls.align,
+    }))
 }
 
 fn collect_writable_ranges(
@@ -7410,6 +7514,7 @@ fn parse_elf(bytes: &[u8], load_bias: Option<u64>) -> Result<LinuxElf<'_>, zx_st
     let mut phdr_vaddr = None;
     let mut interp_path = None;
     let mut image_end = 0u64;
+    let mut tls = None;
     let mut segments = Vec::new();
     for index in 0..usize::from(phnum) {
         let base = phoff + index * ELF64_PHDR_SIZE;
@@ -7419,6 +7524,7 @@ fn parse_elf(bytes: &[u8], load_bias: Option<u64>) -> Result<LinuxElf<'_>, zx_st
         let p_vaddr = read_u64(bytes, base + 16)?
             .checked_add(image_bias)
             .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let p_align = read_u64(bytes, base + 48)?;
         let p_filesz =
             usize::try_from(read_u64(bytes, base + 32)?).map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
         let p_memsz =
@@ -7436,6 +7542,30 @@ fn parse_elf(bytes: &[u8], load_bias: Option<u64>) -> Result<LinuxElf<'_>, zx_st
             let trimmed = raw.split(|byte| *byte == 0).next().unwrap_or(raw);
             let path = core::str::from_utf8(trimmed).map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
             interp_path = Some(String::from(path));
+        }
+        if p_type == PT_TLS {
+            if tls.is_some() {
+                return Err(ZX_ERR_NOT_SUPPORTED);
+            }
+            if p_filesz > p_memsz {
+                return Err(ZX_ERR_IO_DATA_INTEGRITY);
+            }
+            let file_end = p_offset
+                .checked_add(p_filesz)
+                .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
+            if file_end > bytes.len() {
+                return Err(ZX_ERR_IO_DATA_INTEGRITY);
+            }
+            let align = if p_align == 0 { 1 } else { p_align };
+            if !align.is_power_of_two() {
+                return Err(ZX_ERR_NOT_SUPPORTED);
+            }
+            tls = Some(LinuxTlsSegment {
+                file_offset: p_offset,
+                file_size: p_filesz,
+                mem_size: u64::try_from(p_memsz).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                align,
+            });
         }
         if p_type == PT_LOAD {
             let file_end = p_offset
@@ -7479,28 +7609,42 @@ fn parse_elf(bytes: &[u8], load_bias: Option<u64>) -> Result<LinuxElf<'_>, zx_st
         phnum,
         image_end,
         interp_path,
+        tls,
         segments,
         _bytes: bytes,
     })
 }
 
 fn build_initial_stack(
+    path: &str,
     args: &[String],
     env: &[String],
     elf: &LinuxElf<'_>,
     at_base: Option<u64>,
+    stack_random: [u8; 16],
 ) -> Result<PreparedLinuxStack, zx_status_t> {
     let argv = if args.is_empty() {
         let mut argv = Vec::new();
         argv.try_reserve_exact(1).map_err(|_| ZX_ERR_INTERNAL)?;
-        argv.push(String::from("linux-hello"));
+        argv.push(String::from(path));
         argv
     } else {
         args.to_vec()
     };
     let envv = env.to_vec();
+    let execfn = path.as_bytes();
+    let random_bytes = stack_random;
+    let mut blobs = Vec::new();
+    blobs
+        .try_reserve_exact(
+            argv.len()
+                .checked_add(envv.len())
+                .and_then(|count| count.checked_add(2))
+                .ok_or(ZX_ERR_INTERNAL)?,
+        )
+        .map_err(|_| ZX_ERR_INTERNAL)?;
     let mut auxv = Vec::new();
-    auxv.try_reserve_exact(6).map_err(|_| ZX_ERR_INTERNAL)?;
+    auxv.try_reserve_exact(9).map_err(|_| ZX_ERR_INTERNAL)?;
     auxv.push((AT_PAGESZ, USER_PAGE_BYTES));
     auxv.push((AT_ENTRY, elf.entry));
     if let Some(at_base) = at_base {
@@ -7511,32 +7655,45 @@ fn build_initial_stack(
         auxv.push((AT_PHENT, u64::from(elf.phent)));
         auxv.push((AT_PHNUM, u64::from(elf.phnum)));
     }
-    auxv.push((AT_NULL, 0));
-
     let stack_len = usize::try_from(USER_STACK_BYTES).map_err(|_| ZX_ERR_INTERNAL)?;
     let mut cursor = stack_len;
-    let mut string_ptrs = Vec::new();
-    let total_strings = argv.len().checked_add(envv.len()).ok_or(ZX_ERR_INTERNAL)?;
-    string_ptrs
-        .try_reserve_exact(total_strings)
+    let random_ptr =
+        reserve_stack_blob(&mut cursor, USER_STACK_VA, &random_bytes, false, &mut blobs)?;
+    let execfn_ptr = reserve_stack_blob(&mut cursor, USER_STACK_VA, execfn, true, &mut blobs)?;
+    let mut argv_ptrs = Vec::new();
+    argv_ptrs
+        .try_reserve_exact(argv.len())
         .map_err(|_| ZX_ERR_INTERNAL)?;
-
-    for value in envv.iter().rev().chain(argv.iter().rev()) {
-        let bytes = value.as_bytes();
-        cursor = cursor
-            .checked_sub(bytes.len().checked_add(1).ok_or(ZX_ERR_INTERNAL)?)
-            .ok_or(ZX_ERR_INTERNAL)?;
-        string_ptrs.push((
-            USER_STACK_VA
-                .checked_add(u64::try_from(cursor).map_err(|_| ZX_ERR_INTERNAL)?)
-                .ok_or(ZX_ERR_INTERNAL)?,
-            bytes,
-        ));
+    for value in argv.iter().rev() {
+        argv_ptrs.push(reserve_stack_blob(
+            &mut cursor,
+            USER_STACK_VA,
+            value.as_bytes(),
+            true,
+            &mut blobs,
+        )?);
     }
-    string_ptrs.reverse();
+    argv_ptrs.reverse();
+    let mut env_ptrs = Vec::new();
+    env_ptrs
+        .try_reserve_exact(envv.len())
+        .map_err(|_| ZX_ERR_INTERNAL)?;
+    for value in envv.iter().rev() {
+        env_ptrs.push(reserve_stack_blob(
+            &mut cursor,
+            USER_STACK_VA,
+            value.as_bytes(),
+            true,
+            &mut blobs,
+        )?);
+    }
+    env_ptrs.reverse();
 
-    let argv_ptrs = &string_ptrs[..argv.len()];
-    let env_ptrs = &string_ptrs[argv.len()..];
+    auxv.push((AT_SECURE, 0));
+    auxv.push((AT_RANDOM, random_ptr));
+    auxv.push((AT_EXECFN, execfn_ptr));
+    auxv.push((AT_NULL, 0));
+
     let mut words = Vec::new();
     let word_count = 1usize
         .checked_add(argv_ptrs.len())
@@ -7549,11 +7706,11 @@ fn build_initial_stack(
         .try_reserve_exact(word_count)
         .map_err(|_| ZX_ERR_INTERNAL)?;
     words.push(argv.len() as u64);
-    for (ptr, _) in argv_ptrs {
+    for ptr in &argv_ptrs {
         words.push(*ptr);
     }
     words.push(0);
-    for (ptr, _) in env_ptrs {
+    for ptr in &env_ptrs {
         words.push(*ptr);
     }
     words.push(0);
@@ -7577,15 +7734,18 @@ fn build_initial_stack(
         let start = words_offset + index * 8;
         image[start..start + 8].copy_from_slice(&word.to_ne_bytes());
     }
-    for (ptr, bytes) in &string_ptrs {
-        let guest_offset = usize::try_from(ptr.checked_sub(USER_STACK_VA).ok_or(ZX_ERR_INTERNAL)?)
-            .map_err(|_| ZX_ERR_INTERNAL)?;
+    for blob in &blobs {
+        let guest_offset =
+            usize::try_from(blob.ptr.checked_sub(USER_STACK_VA).ok_or(ZX_ERR_INTERNAL)?)
+                .map_err(|_| ZX_ERR_INTERNAL)?;
         let local_offset = guest_offset.checked_sub(cursor).ok_or(ZX_ERR_INTERNAL)?;
         let end = local_offset
-            .checked_add(bytes.len())
+            .checked_add(blob.bytes.len())
             .ok_or(ZX_ERR_INTERNAL)?;
-        image[local_offset..end].copy_from_slice(bytes);
-        image[end] = 0;
+        image[local_offset..end].copy_from_slice(blob.bytes);
+        if blob.nul_terminated {
+            image[end] = 0;
+        }
     }
 
     Ok(PreparedLinuxStack {
@@ -7595,6 +7755,36 @@ fn build_initial_stack(
         stack_vmo_offset: u64::try_from(cursor).map_err(|_| ZX_ERR_INTERNAL)?,
         image,
     })
+}
+
+struct StackBlob<'a> {
+    ptr: u64,
+    bytes: &'a [u8],
+    nul_terminated: bool,
+}
+
+fn reserve_stack_blob<'a>(
+    cursor: &mut usize,
+    guest_base: u64,
+    bytes: &'a [u8],
+    nul_terminated: bool,
+    blobs: &mut Vec<StackBlob<'a>>,
+) -> Result<u64, zx_status_t> {
+    let reserve = bytes
+        .len()
+        .checked_add(usize::from(nul_terminated))
+        .ok_or(ZX_ERR_INTERNAL)?;
+    *cursor = cursor.checked_sub(reserve).ok_or(ZX_ERR_INTERNAL)?;
+    let ptr = guest_base
+        .checked_add(u64::try_from(*cursor).map_err(|_| ZX_ERR_INTERNAL)?)
+        .ok_or(ZX_ERR_INTERNAL)?;
+    blobs.try_reserve_exact(1).map_err(|_| ZX_ERR_INTERNAL)?;
+    blobs.push(StackBlob {
+        ptr,
+        bytes,
+        nul_terminated,
+    });
+    Ok(ptr)
 }
 
 fn read_guest_bytes(session: zx_handle_t, addr: u64, len: usize) -> Result<Vec<u8>, zx_status_t> {
@@ -8444,6 +8634,51 @@ impl ExecutiveState {
 
     fn mprotect(&mut self, addr: u64, len: u64, prot: u64) -> Result<u64, zx_status_t> {
         self.linux_mm.mprotect(addr, len, prot)
+    }
+
+    fn map_private_anon(&mut self, len: u64, prot: u64) -> Result<u64, zx_status_t> {
+        let mapped = self.linux_mm.mmap(
+            &self.fd_table,
+            0,
+            len,
+            prot,
+            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+            -1,
+            0,
+        )?;
+        if (mapped as i64) < 0 {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        Ok(mapped)
+    }
+
+    fn install_initial_tls(
+        &mut self,
+        session: zx_handle_t,
+        task_image: &TaskImage,
+    ) -> Result<Option<u64>, zx_status_t> {
+        let Some(initial_tls) = task_image.initial_tls.as_ref() else {
+            return Ok(None);
+        };
+        if initial_tls.mem_size == 0 {
+            return Ok(None);
+        }
+        let tls_span = align_up_u64(initial_tls.mem_size, initial_tls.align.max(1))
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let map_len = align_up_u64(
+            tls_span
+                .checked_add(X64_TLS_TCB_BYTES)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+            USER_PAGE_BYTES,
+        )
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let map_base = self.map_private_anon(map_len, LINUX_PROT_READ | LINUX_PROT_WRITE)?;
+        if !initial_tls.init_image.is_empty() {
+            write_guest_bytes(session, map_base, &initial_tls.init_image)?;
+        }
+        let fs_base = map_base.checked_add(tls_span).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        write_guest_bytes(session, fs_base, &fs_base.to_ne_bytes())?;
+        Ok(Some(fs_base))
     }
 
     fn getcwd(
@@ -9482,6 +9717,20 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_DYNAMIC_INTERP_BYTES,
         ));
     }
+    if !LINUX_DYNAMIC_TLS_SMOKE_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_TLS_SMOKE_BINARY_PATH,
+            LINUX_DYNAMIC_TLS_SMOKE_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_TLS_MAIN_BINARY_PATH,
+            LINUX_DYNAMIC_TLS_MAIN_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_TLS_INTERP_BINARY_PATH,
+            LINUX_DYNAMIC_TLS_INTERP_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -10302,6 +10551,24 @@ fn seed_runtime_random_state(
     }
 }
 
+fn next_random_u64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn fill_random_bytes(state: &mut u64, bytes: &mut [u8]) {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let chunk = next_random_u64(state).to_ne_bytes();
+        let actual = (bytes.len() - offset).min(chunk.len());
+        bytes[offset..offset + actual].copy_from_slice(&chunk[..actual]);
+        offset += actual;
+    }
+}
+
 fn write_linux_uname_field(field: &mut [u8], value: &str) {
     let limit = field.len().saturating_sub(1);
     let actual = value.len().min(limit);
@@ -10569,6 +10836,7 @@ mod tests {
                 path: String::from("bin/linux-round6-proc-job-smoke"),
                 cmdline: b"linux-round6-proc-job-smoke\0".to_vec(),
                 exec_blob: Vec::new(),
+                initial_tls: None,
                 writable_ranges: Vec::new(),
             }),
             resources: Some(resources),
@@ -10622,6 +10890,7 @@ mod tests {
                     path: String::from("bin/linux-round6-proc-control-smoke"),
                     cmdline: b"linux-round6-proc-control-smoke\0".to_vec(),
                     exec_blob: Vec::new(),
+                    initial_tls: None,
                     writable_ranges: Vec::new(),
                 }),
                 resources: None,

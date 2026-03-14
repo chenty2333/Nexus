@@ -1,0 +1,8 @@
+url = "boot://linux-dynamic-tls-smoke"
+startup = "eager"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-dynamic-tls-smoke"
+args = ["linux-dynamic-tls-smoke"]
+env = []

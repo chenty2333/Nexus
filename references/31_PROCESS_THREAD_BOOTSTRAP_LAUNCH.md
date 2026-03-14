@@ -147,6 +147,15 @@ The first generic-launch contract is now implemented without changing syscall si
   - the userspace executive resolves the interpreter bytes from its namespace
   - the kernel maps the interpreter as one additional process image using the supplied load bias
   - the initial entry comes from the interpreter and the userspace stack now carries `AT_BASE`
+- The current dynamic-TLS bootstrap still uses that same v2 exec-spec surface; it does not add a
+  new syscall shape. The userspace executive now additionally:
+  - parses one executable `PT_TLS` segment from the main ET_EXEC image
+  - builds one initial TLS image template from the executable's TLS segment bytes
+  - augments the initial Linux stack image with `AT_RANDOM`, `AT_EXECFN`, and `AT_SECURE`
+  - installs one minimal x86_64 initial-thread TLS/TCB block before first entry and points the
+    guest thread's `fs_base` at that block through the generic guest-thread helper
+  - still intentionally excludes interpreter/shared-object `PT_TLS`, `gs_base`, and a final full
+    libc TLS model
 - The current Starnix bootstrap and minimal `execve()` paths are the first consumers of that
   helper: the userspace executive prepares one Linux stack image, calls
   `ax_process_prepare_linux_exec()`, then starts the target thread with the returned entry and
@@ -203,9 +212,20 @@ The first generic-launch contract is now implemented without changing syscall si
   - ET_EXEC for the main image
   - ET_DYN when the caller supplies one explicit page-aligned load bias for an interpreter image
 - The startup stack image is intentionally minimal today and does not yet carry the eventual full
-  launcher-provided `argv` / `environ` contract.
+  launcher-provided `argv` / `environ` contract, but the current Linux bootstrap path now does
+  carry a richer auxv subset:
+  - `AT_PAGESZ`
+  - `AT_ENTRY`
+  - `AT_BASE` when a `PT_INTERP` interpreter is present
+  - `AT_PHDR`
+  - `AT_PHENT`
+  - `AT_PHNUM`
+  - `AT_RANDOM`
+  - `AT_EXECFN`
+  - `AT_SECURE`
 - Linux exec-prepare currently supports one fixed startup stack VMO plus:
   - a v1 exec-spec header with appended stack-image bytes
   - a v2 exec-spec header with optional appended interpreter metadata and interpreter bytes
   This is enough for the current bootstrap, minimal `execve()` replacement path, and first
-  `PT_INTERP` dynamic-ELF slice, but it is not yet the final long-term contract.
+  `PT_INTERP` dynamic-ELF slice plus one executable `PT_TLS` initial-thread bootstrap, but it is
+  not yet the final long-term contract.

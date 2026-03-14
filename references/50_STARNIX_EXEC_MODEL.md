@@ -135,6 +135,20 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - `AT_BASE` emitted into the initial Linux auxv when an interpreter is present
   - interpreter bytes staged into one page-aligned local VMO so the normal VM fixed-map path can
     preserve Linux-style zero-filled file tails up to the mapped page coverage
+  - the next loader/runtime/TLS slice now also has:
+    - executable `PT_TLS` parsing in the Starnix executive for one ET_EXEC main image
+    - one initial TLS image template copied out of that main image's TLS segment
+    - one minimal x86_64 initial-thread TLS/TCB allocation in the executive's Linux mm
+    - `fs_base` pointed at that TCB before first userspace entry through the existing generic
+      guest-thread helper pair
+    - richer auxv entries on the initial Linux stack:
+      - `AT_RANDOM`
+      - `AT_EXECFN`
+      - `AT_SECURE`
+    - the current bootstrap remains intentionally narrow:
+      - only main-executable `PT_TLS`
+      - no interpreter/shared-object `PT_TLS`
+      - no final ELF TLS relocation/runtime model yet
 - the next post-R7 libc/runtime slice now also has:
   - `getcwd`
   - `chdir`
@@ -177,9 +191,10 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
       - `ax_thread_set_guest_x64_fs_base`
       - `ax_thread_get_guest_x64_fs_base`
   - the current TLS bootstrap intentionally stays narrow:
-    - only `fs_base`
+    - `fs_base` plus one initial-thread executable `PT_TLS` bootstrap
     - no `gs_base`
     - no `arch_prctl` subcommands beyond `ARCH_SET_FS` / `ARCH_GET_FS`
+    - no interpreter/shared-object `PT_TLS`
     - no final ELF TLS model or libc TLS runtime contract yet
 
 ## Frozen architectural split

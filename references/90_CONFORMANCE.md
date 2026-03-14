@@ -229,6 +229,20 @@ Main just targets include:
     - no shared-library dependency graph
     - no relocations beyond the fixed entry path
     - no general `PT_INTERP` package/runtime search policy yet
+- The next post-R7 loader/runtime scenario now closes one narrow dynamic-TLS
+  bootstrap slice:
+  - executable `PT_TLS` parsing for one ET_EXEC main image launched through
+    the existing `PT_INTERP` path
+  - one initial-thread TLS/TCB allocation in the executive-owned Linux mm
+  - `fs_base` pointed at that TCB before the first main-image instruction
+  - richer initial auxv entries:
+    - `AT_RANDOM`
+    - `AT_EXECFN`
+    - `AT_SECURE`
+  - the current gate intentionally keeps the slice narrow:
+    - only one executable `PT_TLS` segment
+    - no interpreter/shared-object TLS segments
+    - no final libc TLS relocation/runtime model yet
 - The next post-R7 libc/runtime scenario now closes one narrow cwd/fd-management
   slice:
   - `getcwd`

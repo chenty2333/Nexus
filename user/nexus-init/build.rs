@@ -46,6 +46,12 @@ fn main() {
         manifest_dir.join("../linux-dynamic-elf-smoke/dynamic_elf_smoke.S");
     let linux_dynamic_main_source = manifest_dir.join("../linux-dynamic-main/dynamic_main.S");
     let linux_dynamic_interp_source = manifest_dir.join("../linux-dynamic-interp/dynamic_interp.S");
+    let linux_dynamic_tls_smoke_source =
+        manifest_dir.join("../linux-dynamic-tls-smoke/dynamic_tls_smoke.S");
+    let linux_dynamic_tls_main_source =
+        manifest_dir.join("../linux-dynamic-tls-main/dynamic_tls_main.c");
+    let linux_dynamic_tls_interp_source =
+        manifest_dir.join("../linux-dynamic-tls-interp/dynamic_tls_interp.c");
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
@@ -129,6 +135,18 @@ fn main() {
         "cargo:rerun-if-changed={}",
         linux_dynamic_interp_source.display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_dynamic_tls_smoke_source.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_dynamic_tls_main_source.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_dynamic_tls_interp_source.display()
+    );
     for manifest in [
         "root_component.toml",
         "root_component_round3.toml",
@@ -153,6 +171,7 @@ fn main() {
         "root_component_starnix_runtime_fs.toml",
         "root_component_starnix_runtime_tls.toml",
         "root_component_starnix_dynamic.toml",
+        "root_component_starnix_dynamic_tls.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
@@ -177,6 +196,7 @@ fn main() {
         "linux_runtime_fs_smoke.toml",
         "linux_runtime_tls_smoke.toml",
         "linux_dynamic_elf_smoke.toml",
+        "linux_dynamic_tls_smoke.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -269,6 +289,10 @@ fn main() {
             "root_component_starnix_dynamic.toml",
             "root_component_starnix_dynamic.nxcd",
         ),
+        (
+            "root_component_starnix_dynamic_tls.toml",
+            "root_component_starnix_dynamic_tls.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
@@ -330,10 +354,17 @@ fn main() {
             "linux_runtime_misc_smoke.nxcd",
         ),
         ("linux_runtime_fs_smoke.toml", "linux_runtime_fs_smoke.nxcd"),
-        ("linux_runtime_tls_smoke.toml", "linux_runtime_tls_smoke.nxcd"),
+        (
+            "linux_runtime_tls_smoke.toml",
+            "linux_runtime_tls_smoke.nxcd",
+        ),
         (
             "linux_dynamic_elf_smoke.toml",
             "linux_dynamic_elf_smoke.nxcd",
+        ),
+        (
+            "linux_dynamic_tls_smoke.toml",
+            "linux_dynamic_tls_smoke.nxcd",
         ),
     ] {
         let source_path = manifests_dir.join(input);
@@ -427,6 +458,20 @@ fn main() {
         &out_dir.join("ld-nexus-dynamic-smoke.so"),
         "ld-nexus-dynamic-smoke.so",
     );
+    build_linux_binary(
+        &linux_dynamic_tls_smoke_source,
+        &out_dir.join("linux-dynamic-tls-smoke"),
+    );
+    build_linux_dynamic_binary(
+        &linux_dynamic_tls_main_source,
+        &out_dir.join("linux-dynamic-tls-main"),
+        "/lib/ld-nexus-dynamic-tls.so",
+    );
+    build_linux_shared_binary(
+        &linux_dynamic_tls_interp_source,
+        &out_dir.join("ld-nexus-dynamic-tls.so"),
+        "ld-nexus-dynamic-tls.so",
+    );
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
         // Link the bootstrap userspace binary at the fixed VA currently
@@ -463,6 +508,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_runtime_fs)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_runtime_tls)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic_tls)");
     match root_url.as_str() {
         "boot://root-starnix" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
@@ -529,6 +575,9 @@ fn main() {
         }
         "boot://root-starnix-dynamic" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_dynamic");
+        }
+        "boot://root-starnix-dynamic-tls" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_dynamic_tls");
         }
         _ => {}
     }

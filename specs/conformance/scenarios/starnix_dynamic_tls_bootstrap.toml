@@ -1,0 +1,23 @@
+id = "kernel.starnix.dynamic_tls_bootstrap"
+description = "Bootstrap starnix userspace should build initial PT_TLS state, richer auxv, and a dynamic interpreter handoff so one ET_EXEC main image with PT_TLS can observe fs_base-backed TLS"
+tags = ["kernel", "component", "starnix", "runner", "elf", "dynamic", "tls"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/starnix-dynamic-tls && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && NEXUS_INIT_ROOT_URL=boot://root-starnix-dynamic-tls RUSTFLAGS='-C code-model=large -C debuginfo=0' cargo build -p nexus-init --target x86_64-unknown-none --target-dir \"$target_dir\" && init=\"$target_dir/x86_64-unknown-none/debug/nexus-init\" && init_size=$(stat -c%s \"$init\") && timeout --foreground 24s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$init\",addr=0x7000000,force-raw=on -device loader,data=$init_size,data-len=8,addr=0x6fffff8 -device loader,file=\"$init\",addr=0x5000000,force-raw=on -device loader,data=$init_size,data-len=8,addr=0x4fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; code=$?; echo qemu_exit=$code; [ \"$code\" -eq 33 ]"
+]
+
+expect = ["kernel: component manager bootstrap"]
+forbid = ["KERNEL PANIC", "#GP:"]
+
+[assertions.status_code]
+resolve_root = 0
+resolve_provider = 0
+provider_launch = 0
+provider_event_read = 0
+
+[assertions.packet_fields]
+failure_step = 0
+provider_event_code = 0
