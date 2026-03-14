@@ -1,0 +1,8 @@
+url = "boot://linux-runtime-misc-smoke"
+startup = "eager"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-runtime-misc-smoke"
+args = ["linux-runtime-misc-smoke"]
+env = []

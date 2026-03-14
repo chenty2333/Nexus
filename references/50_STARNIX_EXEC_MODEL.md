@@ -146,9 +146,21 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - `fcntl(F_DUPFD_CLOEXEC)`
   - cwd and fd-management state remaining purely executive-owned over the existing
     `ProcessNamespace` and Linux fd table substrate
-  - no TLS / `arch_prctl` / `set_tid_address` surface yet; those remain later
-    libc/runtime enablement work because they require additional guest-register
-    / thread-lifecycle contract beyond this first slice
+  - the next runtime-misc slice now also has:
+    - `lseek`
+    - `readlink`
+    - `readlinkat`
+    - `uname`
+    - `getrandom`
+    - `set_tid_address`
+  - the current `readlink`/`readlinkat` bootstrap remains intentionally narrow:
+    - proc-style self links such as `/proc/self/exe` and `/proc/self/cwd`
+    - proc fd links for stdio and current anon-inode/socket/pipe-style synthetic objects
+    - not a full generic symlink implementation for every backend yet
+  - `getrandom` is currently one executive-owned bootstrap entropy source, suitable
+    for libc/runtime bring-up but not yet documented as a strong cryptographic contract
+  - no TLS / `arch_prctl` surface yet; that remains later libc/runtime enablement work
+    because it requires additional guest-register contract beyond this slice
 
 ## Frozen architectural split
 

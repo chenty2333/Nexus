@@ -1,0 +1,25 @@
+url = "boot://root-starnix-runtime-misc"
+startup = "eager"
+
+[program]
+runner = "elf"
+binary = "bin/nexus-init"
+args = ["nexus-init"]
+env = []
+
+[[use]]
+kind = "resolver"
+name = "boot-resolver"
+
+[[use]]
+kind = "runner"
+name = "elf"
+
+[[use]]
+kind = "runner"
+name = "starnix"
+
+[[children]]
+name = "linux_runtime_misc_smoke"
+url = "boot://linux-runtime-misc-smoke"
+startup = "eager"

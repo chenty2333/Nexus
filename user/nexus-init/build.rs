@@ -37,6 +37,8 @@ fn main() {
     let linux_round6_proc_tty_source =
         manifest_dir.join("../linux-round6-proc-tty-smoke/round6_proc_tty_smoke.S");
     let linux_runtime_fd_source = manifest_dir.join("../linux-runtime-fd-smoke/runtime_fd_smoke.S");
+    let linux_runtime_misc_source =
+        manifest_dir.join("../linux-runtime-misc-smoke/runtime_misc_smoke.S");
     let linux_dynamic_elf_smoke_source =
         manifest_dir.join("../linux-dynamic-elf-smoke/dynamic_elf_smoke.S");
     let linux_dynamic_main_source = manifest_dir.join("../linux-dynamic-main/dynamic_main.S");
@@ -102,6 +104,10 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
+        linux_runtime_misc_source.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         linux_dynamic_elf_smoke_source.display()
     );
     println!(
@@ -132,6 +138,7 @@ fn main() {
         "root_component_starnix_round6_proc_control.toml",
         "root_component_starnix_round6_proc_tty.toml",
         "root_component_starnix_runtime_fd.toml",
+        "root_component_starnix_runtime_misc.toml",
         "root_component_starnix_dynamic.toml",
         "echo_provider.toml",
         "echo_client.toml",
@@ -153,6 +160,7 @@ fn main() {
         "linux_round6_proc_control_smoke.toml",
         "linux_round6_proc_tty_smoke.toml",
         "linux_runtime_fd_smoke.toml",
+        "linux_runtime_misc_smoke.toml",
         "linux_dynamic_elf_smoke.toml",
     ] {
         println!(
@@ -231,6 +239,10 @@ fn main() {
             "root_component_starnix_runtime_fd.nxcd",
         ),
         (
+            "root_component_starnix_runtime_misc.toml",
+            "root_component_starnix_runtime_misc.nxcd",
+        ),
+        (
             "root_component_starnix_dynamic.toml",
             "root_component_starnix_dynamic.nxcd",
         ),
@@ -290,6 +302,10 @@ fn main() {
             "linux_round6_proc_tty_smoke.nxcd",
         ),
         ("linux_runtime_fd_smoke.toml", "linux_runtime_fd_smoke.nxcd"),
+        (
+            "linux_runtime_misc_smoke.toml",
+            "linux_runtime_misc_smoke.nxcd",
+        ),
         (
             "linux_dynamic_elf_smoke.toml",
             "linux_dynamic_elf_smoke.nxcd",
@@ -361,6 +377,10 @@ fn main() {
         &out_dir.join("linux-runtime-fd-smoke"),
     );
     build_linux_binary(
+        &linux_runtime_misc_source,
+        &out_dir.join("linux-runtime-misc-smoke"),
+    );
+    build_linux_binary(
         &linux_dynamic_elf_smoke_source,
         &out_dir.join("linux-dynamic-elf-smoke"),
     );
@@ -406,6 +426,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_proc_control)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_round6_proc_tty)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_runtime_fd)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_runtime_misc)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic)");
     match root_url.as_str() {
         "boot://root-starnix" => {
@@ -461,6 +482,9 @@ fn main() {
         }
         "boot://root-starnix-runtime-fd" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_runtime_fd");
+        }
+        "boot://root-starnix-runtime-misc" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_runtime_misc");
         }
         "boot://root-starnix-dynamic" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_dynamic");

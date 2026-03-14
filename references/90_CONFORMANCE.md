@@ -267,6 +267,7 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - process / thread behavior
   - SMP smoke
   - VM fault contention and loan/COW paths
+  - staged Starnix bootstrap/runtime slices, including dynamic ELF and libc/runtime follow-on gates
 
 ## Runner model
 

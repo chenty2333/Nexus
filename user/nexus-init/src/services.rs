@@ -10,7 +10,7 @@ use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_PATH,
     ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_IO_DATA_INTEGRITY,
     ZX_ERR_NOT_DIR, ZX_ERR_NOT_EMPTY, ZX_ERR_NOT_FILE, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
-    ZX_OK,
+    ZX_ERR_OUT_OF_RANGE, ZX_OK,
 };
 use axle_types::syscall_numbers::{
     AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_WRITE,
@@ -362,11 +362,15 @@ enum LocalFileBacking {
 #[derive(Debug)]
 struct LocalFileFd {
     backing: LocalFileBacking,
+    cursor: Mutex<u64>,
 }
 
 impl LocalFileFd {
     fn new(backing: LocalFileBacking) -> Self {
-        Self { backing }
+        Self {
+            backing,
+            cursor: Mutex::new(0),
+        }
     }
 
     fn read_all(&self) -> Vec<u8> {
@@ -374,6 +378,27 @@ impl LocalFileFd {
             LocalFileBacking::ReadOnly(file) => file.bytes.unwrap_or(&[]).to_vec(),
             LocalFileBacking::Mutable(file) => file.bytes.lock().clone(),
         }
+    }
+
+    fn len(&self) -> usize {
+        match &self.backing {
+            LocalFileBacking::ReadOnly(file) => file.bytes.unwrap_or(&[]).len(),
+            LocalFileBacking::Mutable(file) => file.bytes.lock().len(),
+        }
+    }
+
+    fn seek_cursor(&self, origin: SeekOrigin, offset: i64) -> Result<u64, zx_status_t> {
+        let base = match origin {
+            SeekOrigin::Start => 0i128,
+            SeekOrigin::Current => i128::from(*self.cursor.lock()),
+            SeekOrigin::End => i128::try_from(self.len()).map_err(|_| ZX_ERR_INVALID_ARGS)?,
+        };
+        let next = base
+            .checked_add(i128::from(offset))
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let next = u64::try_from(next).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        *self.cursor.lock() = next;
+        Ok(next)
     }
 
     fn metadata(&self) -> LocalFdMetadata {
@@ -395,8 +420,16 @@ impl FdOps for LocalFileFd {
 
     fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
         let bytes = self.read_all();
-        let actual = bytes.len().min(buffer.len());
-        buffer[..actual].copy_from_slice(&bytes[..actual]);
+        let mut cursor = self.cursor.lock();
+        let start = usize::try_from(*cursor).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if start >= bytes.len() {
+            return Ok(0);
+        }
+        let actual = (bytes.len() - start).min(buffer.len());
+        buffer[..actual].copy_from_slice(&bytes[start..start + actual]);
+        *cursor = cursor
+            .checked_add(u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)?)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
         Ok(actual)
     }
 
@@ -404,16 +437,22 @@ impl FdOps for LocalFileFd {
         match &self.backing {
             LocalFileBacking::ReadOnly(_) => Err(ZX_ERR_ACCESS_DENIED),
             LocalFileBacking::Mutable(file) => {
+                let mut cursor = self.cursor.lock();
+                let start = usize::try_from(*cursor).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
                 let mut bytes = file.bytes.lock();
-                bytes.clear();
-                bytes.extend_from_slice(buffer);
+                let end = start.checked_add(buffer.len()).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+                if bytes.len() < end {
+                    bytes.resize(end, 0);
+                }
+                bytes[start..end].copy_from_slice(buffer);
+                *cursor = u64::try_from(end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
                 Ok(buffer.len())
             }
         }
     }
 
-    fn seek(&self, _origin: SeekOrigin, _offset: i64) -> Result<u64, zx_status_t> {
-        Err(ZX_ERR_NOT_SUPPORTED)
+    fn seek(&self, origin: SeekOrigin, offset: i64) -> Result<u64, zx_status_t> {
+        self.seek_cursor(origin, offset)
     }
 
     fn close(&self) -> Result<(), zx_status_t> {
@@ -421,7 +460,9 @@ impl FdOps for LocalFileFd {
     }
 
     fn clone_fd(&self, _flags: FdFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
-        Ok(Arc::new(Self::new(self.backing.clone())))
+        let cloned = Self::new(self.backing.clone());
+        *cloned.cursor.lock() = *self.cursor.lock();
+        Ok(Arc::new(cloned))
     }
 
     fn wait_interest(&self) -> Option<nexus_io::WaitSpec> {
@@ -758,7 +799,7 @@ fn create_vmo_with_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
 mod tests {
     use super::{BootAssetEntry, BootstrapNamespace};
     use alloc::vec;
-    use nexus_io::{FdTable, OpenFlags};
+    use nexus_io::{FdTable, OpenFlags, SeekOrigin};
 
     #[test]
     fn boot_namespace_reads_manifest_assets() {
@@ -861,5 +902,31 @@ mod tests {
             .readdir("/tmp")
             .expect("readdir tmpfs after cleanup");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn boot_assets_support_seek_and_offset_reads() {
+        let namespace = BootstrapNamespace::build(&[BootAssetEntry::bytes("bin/app", b"abcdef")])
+            .expect("build namespace");
+
+        let mut table = FdTable::new();
+        let file = namespace
+            .namespace()
+            .open("/boot/bin/app", OpenFlags::READABLE)
+            .expect("open boot asset");
+        let fd = table
+            .open(file, OpenFlags::READABLE, nexus_io::FdFlags::empty())
+            .expect("install file");
+
+        let end = table.seek(fd, SeekOrigin::End, 0).expect("seek end");
+        assert_eq!(end, 6);
+
+        let start = table.seek(fd, SeekOrigin::Start, 2).expect("seek start");
+        assert_eq!(start, 2);
+
+        let mut bytes = [0u8; 8];
+        let actual = table.read(fd, &mut bytes).expect("read from offset");
+        assert_eq!(actual, 4);
+        assert_eq!(&bytes[..actual], b"cdef");
     }
 }

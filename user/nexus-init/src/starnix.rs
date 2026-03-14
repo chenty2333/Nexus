@@ -51,7 +51,7 @@ use libax::{
 use nexus_component::{ComponentStartInfo, NumberedHandle};
 use nexus_io::{
     DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFileDescription, OpenFlags,
-    PipeFd, PseudoNodeFd, SocketFd, WaitSpec,
+    PipeFd, PseudoNodeFd, SeekOrigin, SocketFd, WaitSpec,
 };
 use spin::Mutex;
 
@@ -79,6 +79,7 @@ use crate::{
     LINUX_ROUND6_SIGNALFD_BINARY_PATH, LINUX_ROUND6_SIGNALFD_BYTES,
     LINUX_ROUND6_SIGNALFD_DECL_BYTES, LINUX_ROUND6_TIMERFD_BINARY_PATH, LINUX_ROUND6_TIMERFD_BYTES,
     LINUX_ROUND6_TIMERFD_DECL_BYTES, LINUX_RUNTIME_FD_BINARY_PATH, LINUX_RUNTIME_FD_BYTES,
+    LINUX_RUNTIME_MISC_BINARY_PATH, LINUX_RUNTIME_MISC_BYTES, LINUX_RUNTIME_MISC_DECL_BYTES,
     STARTUP_HANDLE_COMPONENT_STATUS, STARTUP_HANDLE_STARNIX_IMAGE_VMO,
     STARTUP_HANDLE_STARNIX_PARENT_PROCESS, STARTUP_HANDLE_STARNIX_STDOUT,
 };
@@ -102,6 +103,7 @@ const LINUX_SYSCALL_READ: u64 = 0;
 const LINUX_SYSCALL_WRITE: u64 = 1;
 const LINUX_SYSCALL_CLOSE: u64 = 3;
 const LINUX_SYSCALL_FSTAT: u64 = 5;
+const LINUX_SYSCALL_LSEEK: u64 = 8;
 const LINUX_SYSCALL_DUP2: u64 = 33;
 const LINUX_SYSCALL_MMAP: u64 = 9;
 const LINUX_SYSCALL_MPROTECT: u64 = 10;
@@ -113,7 +115,9 @@ const LINUX_SYSCALL_BRK: u64 = 12;
 const LINUX_SYSCALL_FCNTL: u64 = 72;
 const LINUX_SYSCALL_GETCWD: u64 = 79;
 const LINUX_SYSCALL_CHDIR: u64 = 80;
+const LINUX_SYSCALL_READLINK: u64 = 89;
 const LINUX_SYSCALL_GETPID: u64 = 39;
+const LINUX_SYSCALL_UNAME: u64 = 63;
 const LINUX_SYSCALL_SETPGID: u64 = 109;
 const LINUX_SYSCALL_GETPGRP: u64 = 111;
 const LINUX_SYSCALL_SETSID: u64 = 112;
@@ -138,8 +142,10 @@ const LINUX_SYSCALL_EPOLL_WAIT: u64 = 232;
 const LINUX_SYSCALL_EPOLL_CTL: u64 = 233;
 const LINUX_SYSCALL_GETTID: u64 = 186;
 const LINUX_SYSCALL_FUTEX: u64 = 202;
+const LINUX_SYSCALL_SET_TID_ADDRESS: u64 = 218;
 const LINUX_SYSCALL_TGKILL: u64 = 234;
 const LINUX_SYSCALL_GETDENTS64: u64 = 217;
+const LINUX_SYSCALL_READLINKAT: u64 = 267;
 const LINUX_SYSCALL_PIDFD_SEND_SIGNAL: u64 = 424;
 const LINUX_SYSCALL_EXIT: u64 = 60;
 const LINUX_SYSCALL_OPENAT: u64 = 257;
@@ -148,12 +154,16 @@ const LINUX_SYSCALL_EPOLL_CREATE1: u64 = 291;
 const LINUX_SYSCALL_DUP3: u64 = 292;
 const LINUX_SYSCALL_EXIT_GROUP: u64 = 231;
 const LINUX_SYSCALL_PIPE2: u64 = 293;
+const LINUX_SYSCALL_GETRANDOM: u64 = 318;
 const LINUX_SYSCALL_PIDFD_OPEN: u64 = 434;
 const LINUX_AF_UNIX: u64 = 1;
 const LINUX_SOCK_STREAM: u64 = 1;
 const LINUX_SOL_SOCKET: i32 = 1;
 const LINUX_SCM_RIGHTS: i32 = 1;
 const LINUX_AT_FDCWD: i32 = -100;
+const LINUX_SEEK_SET: i32 = 0;
+const LINUX_SEEK_CUR: i32 = 1;
+const LINUX_SEEK_END: i32 = 2;
 const LINUX_O_ACCMODE: u64 = 0x3;
 const LINUX_O_WRONLY: u64 = 0x1;
 const LINUX_O_RDWR: u64 = 0x2;
@@ -222,9 +232,12 @@ const LINUX_TFD_TIMER_CANCEL_ON_SET: u64 = 0x2;
 const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 const LINUX_CLOCK_MONOTONIC: i32 = 1;
+const LINUX_GRND_NONBLOCK: u64 = 0x1;
 const LINUX_EPOLL_EVENT_BYTES: usize = 12;
 const LINUX_TIMESPEC_BYTES: usize = 16;
 const LINUX_ITIMERSPEC_BYTES: usize = 32;
+const LINUX_UTSNAME_FIELD_BYTES: usize = 65;
+const LINUX_UTSNAME_BYTES: usize = LINUX_UTSNAME_FIELD_BYTES * 6;
 const LINUX_DT_UNKNOWN: u8 = 0;
 const LINUX_DT_DIR: u8 = 4;
 const LINUX_DT_REG: u8 = 8;
@@ -254,6 +267,7 @@ const LINUX_ENOENT: i32 = 2;
 const LINUX_ENOTDIR: i32 = 20;
 const LINUX_EISDIR: i32 = 21;
 const LINUX_EINVAL: i32 = 22;
+const LINUX_ESPIPE: i32 = 29;
 const LINUX_ENOMEM: i32 = 12;
 const LINUX_EPIPE: i32 = 32;
 const LINUX_ENOSYS: i32 = 38;
@@ -816,6 +830,7 @@ struct LinuxTask {
     carrier: TaskCarrier,
     state: TaskState,
     signals: TaskSignals,
+    clear_child_tid: u64,
     robust_list: Option<LinuxRobustListState>,
     active_signal: Option<ActiveSignalFrame>,
 }
@@ -851,6 +866,7 @@ struct StarnixKernel {
     port: zx_handle_t,
     next_tid: i32,
     next_packet_key: u64,
+    random_state: u64,
     root_tgid: i32,
     tasks: BTreeMap<i32, LinuxTask>,
     groups: BTreeMap<i32, LinuxThreadGroup>,
@@ -1728,6 +1744,7 @@ impl StarnixKernel {
             port,
             next_tid: root_tgid + 1,
             next_packet_key: STARNIX_GUEST_PACKET_KEY_BASE + 1,
+            random_state: seed_runtime_random_state(parent_process, port, root_tgid),
             root_tgid,
             tasks,
             groups,
@@ -2568,13 +2585,19 @@ impl StarnixKernel {
             LINUX_SYSCALL_WRITE => self.sys_write(task_id, stop_state, stdout),
             LINUX_SYSCALL_SENDMSG => self.sys_sendmsg(task_id, stop_state),
             LINUX_SYSCALL_RECVMSG => self.sys_recvmsg(task_id, stop_state),
+            LINUX_SYSCALL_LSEEK => self.sys_lseek(task_id, stop_state),
             LINUX_SYSCALL_GETPID => self.sys_getpid(task_id, stop_state),
             LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
+            LINUX_SYSCALL_SET_TID_ADDRESS => self.sys_set_tid_address(task_id, stop_state),
             LINUX_SYSCALL_GETPGRP => self.sys_getpgrp(task_id, stop_state),
             LINUX_SYSCALL_GETPGID => self.sys_getpgid(task_id, stop_state),
             LINUX_SYSCALL_GETSID => self.sys_getsid(task_id, stop_state),
             LINUX_SYSCALL_SETPGID => self.sys_setpgid(task_id, stop_state),
             LINUX_SYSCALL_SETSID => self.sys_setsid(task_id, stop_state),
+            LINUX_SYSCALL_UNAME => self.sys_uname(task_id, stop_state),
+            LINUX_SYSCALL_GETRANDOM => self.sys_getrandom(task_id, stop_state),
+            LINUX_SYSCALL_READLINK => self.sys_readlink(task_id, stop_state),
+            LINUX_SYSCALL_READLINKAT => self.sys_readlinkat(task_id, stop_state),
             LINUX_SYSCALL_SOCKETPAIR => self.sys_socketpair(task_id, stop_state),
             LINUX_SYSCALL_FUTEX => self.sys_futex(task_id, stop_state),
             LINUX_SYSCALL_SET_ROBUST_LIST => self.sys_set_robust_list(task_id, stop_state),
@@ -2946,6 +2969,7 @@ impl StarnixKernel {
             {
                 self.cancel_task_wait(*member_id, wait);
             }
+            self.process_clear_child_tid_on_exit(*member_id);
             self.process_robust_list_on_exit(*member_id);
             if let Some(task) = self.tasks.remove(member_id) {
                 task.carrier.kill_and_close();
@@ -2965,6 +2989,7 @@ impl StarnixKernel {
         {
             self.cancel_task_wait(task_id, wait);
         }
+        self.process_clear_child_tid_on_exit(task_id);
         self.process_robust_list_on_exit(task_id);
         let task = self.tasks.remove(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
         task.carrier.kill_and_close();
@@ -3029,6 +3054,23 @@ impl StarnixKernel {
                 futex_offset,
             );
         }
+    }
+
+    fn process_clear_child_tid_on_exit(&mut self, task_id: i32) {
+        let Some((tgid, session, clear_child_tid)) = self.tasks.get(&task_id).and_then(|task| {
+            (task.clear_child_tid != 0).then_some((
+                task.tgid,
+                task.carrier.session_handle,
+                task.clear_child_tid,
+            ))
+        }) else {
+            return;
+        };
+        if write_guest_u32(session, clear_child_tid, 0).is_err() {
+            return;
+        }
+        let key = Self::private_futex_key_for_tgid(tgid, clear_child_tid);
+        let _ = self.wake_futex_waiters(key, 1, LINUX_FUTEX_BITSET_MATCH_ANY);
     }
 
     fn process_robust_entry_on_exit(
@@ -4393,12 +4435,293 @@ impl StarnixKernel {
         Ok(SyscallAction::Resume)
     }
 
+    fn sys_lseek(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let fd = linux_arg_i32(stop_state.regs.rdi);
+        let offset = i64::from_ne_bytes(stop_state.regs.rsi.to_ne_bytes());
+        let whence = linux_arg_i32(stop_state.regs.rdx);
+        let origin = match whence {
+            LINUX_SEEK_SET => SeekOrigin::Start,
+            LINUX_SEEK_CUR => SeekOrigin::Current,
+            LINUX_SEEK_END => SeekOrigin::End,
+            _ => {
+                complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let result = {
+            let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            match resources.fd_table.seek(fd, origin, offset) {
+                Ok(new_offset) => new_offset,
+                Err(status) => linux_errno(map_seek_status_to_errno(status)),
+            }
+        };
+        complete_syscall(stop_state, result)?;
+        Ok(SyscallAction::Resume)
+    }
+
     fn sys_gettid(
         &mut self,
         task_id: i32,
         stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
         complete_syscall(stop_state, task_id as u64)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_set_tid_address(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let clear_child_tid = stop_state.regs.rdi;
+        self.tasks
+            .get_mut(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .clear_child_tid = clear_child_tid;
+        complete_syscall(stop_state, task_id as u64)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn resolve_proc_readlink_target(
+        &self,
+        task_id: i32,
+        path: &str,
+    ) -> Result<String, zx_status_t> {
+        let suffix = path.strip_prefix("/proc/").ok_or(ZX_ERR_BAD_PATH)?;
+        let components = split_proc_path(suffix)?;
+        if components.is_empty() {
+            return Err(ZX_ERR_NOT_FOUND);
+        }
+        let target_tgid = match components[0] {
+            "self" => self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid,
+            raw => raw.parse::<i32>().map_err(|_| ZX_ERR_NOT_FOUND)?,
+        };
+        let group = self.groups.get(&target_tgid).ok_or(ZX_ERR_NOT_FOUND)?;
+        match components.as_slice() {
+            [_, "exe"] => group
+                .image
+                .as_ref()
+                .map(|image| image.path.clone())
+                .ok_or(ZX_ERR_NOT_FOUND),
+            [_, "cwd"] => group
+                .resources
+                .as_ref()
+                .map(|resources| String::from(resources.namespace.cwd()))
+                .ok_or(ZX_ERR_NOT_FOUND),
+            [_, "fd", raw_fd] => {
+                let fd = raw_fd.parse::<i32>().map_err(|_| ZX_ERR_NOT_FOUND)?;
+                self.proc_fd_readlink_target(target_tgid, fd)
+            }
+            _ => Err(ZX_ERR_NOT_FOUND),
+        }
+    }
+
+    fn proc_fd_readlink_target(&self, tgid: i32, fd: i32) -> Result<String, zx_status_t> {
+        let group = self.groups.get(&tgid).ok_or(ZX_ERR_NOT_FOUND)?;
+        let resources = group.resources.as_ref().ok_or(ZX_ERR_NOT_FOUND)?;
+        let entry = resources.fd_table.get(fd).ok_or(ZX_ERR_NOT_FOUND)?;
+        let description = entry.description();
+        let description_key = file_description_key(description);
+        if self.epolls.contains_key(&description_key) {
+            return Ok(String::from("anon_inode:[eventpoll]"));
+        }
+        if self.signalfds.contains_key(&description_key)
+            || description.ops().as_any().is::<SignalFd>()
+        {
+            return Ok(String::from("anon_inode:[signalfd]"));
+        }
+        if self.pidfds.contains_key(&description_key) || description.ops().as_any().is::<PidFd>() {
+            return Ok(String::from("anon_inode:[pidfd]"));
+        }
+        if description.ops().as_any().is::<EventFd>() {
+            return Ok(String::from("anon_inode:[eventfd]"));
+        }
+        if description.ops().as_any().is::<TimerFd>() {
+            return Ok(String::from("anon_inode:[timerfd]"));
+        }
+        if description.ops().as_any().is::<PipeFd>() {
+            return Ok(format!("pipe:[{}]", description.id().raw()));
+        }
+        if description.ops().as_any().is::<SocketFd>() {
+            return Ok(format!("socket:[{}]", description.id().raw()));
+        }
+        match fd {
+            0 => Ok(String::from("/dev/stdin")),
+            1 => Ok(String::from("/dev/stdout")),
+            2 => Ok(String::from("/dev/stderr")),
+            _ => Err(ZX_ERR_NOT_SUPPORTED),
+        }
+    }
+
+    fn resolve_readlink_target(
+        &self,
+        task_id: i32,
+        dirfd: i32,
+        path: &str,
+    ) -> Result<String, zx_status_t> {
+        if path.is_empty() {
+            return Err(ZX_ERR_NOT_FOUND);
+        }
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+        let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+        let resolved = if path.starts_with('/') || dirfd == LINUX_AT_FDCWD {
+            resources.namespace.resolve_path(path)?
+        } else {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        };
+        if !resolved.starts_with("/proc/") {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        self.resolve_proc_readlink_target(task_id, resolved.as_str())
+    }
+
+    fn sys_readlink(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let path_addr = stop_state.regs.rdi;
+        let buf_addr = stop_state.regs.rsi;
+        let buf_len = usize::try_from(stop_state.regs.rdx).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        self.sys_readlink_common(
+            task_id,
+            LINUX_AT_FDCWD,
+            path_addr,
+            buf_addr,
+            buf_len,
+            stop_state,
+        )
+    }
+
+    fn sys_readlinkat(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let dirfd = linux_arg_i32(stop_state.regs.rdi);
+        let path_addr = stop_state.regs.rsi;
+        let buf_addr = stop_state.regs.rdx;
+        let buf_len = usize::try_from(stop_state.regs.r10).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        self.sys_readlink_common(task_id, dirfd, path_addr, buf_addr, buf_len, stop_state)
+    }
+
+    fn sys_readlink_common(
+        &mut self,
+        task_id: i32,
+        dirfd: i32,
+        path_addr: u64,
+        buf_addr: u64,
+        buf_len: usize,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        if buf_len == 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let path = match read_guest_c_string(session, path_addr, LINUX_PATH_MAX) {
+            Ok(path) => path,
+            Err(status) => {
+                complete_syscall(
+                    stop_state,
+                    linux_errno(map_guest_memory_status_to_errno(status)),
+                )?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let result = match self.resolve_readlink_target(task_id, dirfd, path.as_str()) {
+            Ok(target) => {
+                let bytes = target.as_bytes();
+                let actual = bytes.len().min(buf_len);
+                match write_guest_bytes(session, buf_addr, &bytes[..actual]) {
+                    Ok(()) => u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                    Err(status) => linux_errno(map_guest_write_status_to_errno(status)),
+                }
+            }
+            Err(status) => linux_errno(map_readlink_status_to_errno(status)),
+        };
+        complete_syscall(stop_state, result)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn sys_uname(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let addr = stop_state.regs.rdi;
+        let bytes = build_linux_uname_bytes();
+        let result = match write_guest_bytes(session, addr, &bytes) {
+            Ok(()) => 0,
+            Err(status) => linux_errno(map_guest_write_status_to_errno(status)),
+        };
+        complete_syscall(stop_state, result)?;
+        Ok(SyscallAction::Resume)
+    }
+
+    fn next_random_u64(&mut self) -> u64 {
+        self.random_state = self.random_state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.random_state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn sys_getrandom(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let buf_addr = stop_state.regs.rdi;
+        let len = usize::try_from(stop_state.regs.rsi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let flags = stop_state.regs.rdx;
+        if (flags & !LINUX_GRND_NONBLOCK) != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+        if len == 0 {
+            complete_syscall(stop_state, 0)?;
+            return Ok(SyscallAction::Resume);
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
+        bytes.resize(len, 0);
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let chunk = self.next_random_u64().to_ne_bytes();
+            let actual = (bytes.len() - offset).min(chunk.len());
+            bytes[offset..offset + actual].copy_from_slice(&chunk[..actual]);
+            offset += actual;
+        }
+        let result = match write_guest_bytes(session, buf_addr, &bytes) {
+            Ok(()) => u64::try_from(len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+            Err(status) => linux_errno(map_guest_write_status_to_errno(status)),
+        };
+        complete_syscall(stop_state, result)?;
         Ok(SyscallAction::Resume)
     }
 
@@ -5674,6 +5997,7 @@ impl StarnixKernel {
                     blocked: parent_blocked,
                     pending: 0,
                 },
+                clear_child_tid: 0,
                 robust_list: None,
                 active_signal: None,
             },
@@ -5838,6 +6162,7 @@ impl StarnixKernel {
                     blocked: parent_blocked,
                     pending: 0,
                 },
+                clear_child_tid: 0,
                 robust_list: None,
                 active_signal: None,
             },
@@ -6015,6 +6340,7 @@ impl StarnixKernel {
             let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
             let old_carrier = task.carrier;
             task.carrier = new_carrier;
+            task.clear_child_tid = 0;
             task.active_signal = None;
             task.robust_list = None;
             old_carrier
@@ -6333,6 +6659,7 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         carrier,
         state: TaskState::Running,
         signals: TaskSignals::default(),
+        clear_child_tid: 0,
         robust_list: None,
         active_signal: None,
     };
@@ -6576,6 +6903,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-round6-proc-control-smoke") => Some(LINUX_ROUND6_PROC_CONTROL_BYTES),
         Some("linux-round6-proc-tty-smoke") => Some(LINUX_ROUND6_PROC_TTY_BYTES),
         Some("linux-runtime-fd-smoke") => Some(LINUX_RUNTIME_FD_BYTES),
+        Some("linux-runtime-misc-smoke") => Some(LINUX_RUNTIME_MISC_BYTES),
         Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BYTES),
         Some(_) => None,
     }
@@ -6600,6 +6928,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-round6-proc-control-smoke") => Some(LINUX_ROUND6_PROC_CONTROL_BINARY_PATH),
         Some("linux-round6-proc-tty-smoke") => Some(LINUX_ROUND6_PROC_TTY_BINARY_PATH),
         Some("linux-runtime-fd-smoke") => Some(LINUX_RUNTIME_FD_BINARY_PATH),
+        Some("linux-runtime-misc-smoke") => Some(LINUX_RUNTIME_MISC_BINARY_PATH),
         Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH),
         Some(_) => None,
     }
@@ -8759,6 +9088,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_RUNTIME_FD_BYTES,
         ));
     }
+    if !LINUX_RUNTIME_MISC_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_RUNTIME_MISC_BINARY_PATH,
+            LINUX_RUNTIME_MISC_BYTES,
+        ));
+    }
     if !LINUX_DYNAMIC_ELF_SMOKE_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH,
@@ -8867,6 +9202,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round6-proc-tty-smoke.nxcd",
             LINUX_ROUND6_PROC_TTY_DECL_BYTES,
+        ));
+    }
+    if !LINUX_RUNTIME_MISC_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-runtime-misc-smoke.nxcd",
+            LINUX_RUNTIME_MISC_DECL_BYTES,
         ));
     }
     let bootstrap = BootstrapNamespace::build(&assets)?;
@@ -9472,6 +9813,54 @@ fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
     value.checked_add(mask).map(|rounded| rounded & !mask)
 }
 
+fn seed_runtime_random_state(
+    parent_process: zx_handle_t,
+    port: zx_handle_t,
+    root_tgid: i32,
+) -> u64 {
+    let seed = parent_process
+        ^ port.rotate_left(17)
+        ^ (root_tgid as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ USER_CODE_VA;
+    if seed == 0 {
+        0x7f4a_7c15_d1ce_beef
+    } else {
+        seed
+    }
+}
+
+fn write_linux_uname_field(field: &mut [u8], value: &str) {
+    let limit = field.len().saturating_sub(1);
+    let actual = value.len().min(limit);
+    field[..actual].copy_from_slice(&value.as_bytes()[..actual]);
+}
+
+fn build_linux_uname_bytes() -> [u8; LINUX_UTSNAME_BYTES] {
+    let mut bytes = [0u8; LINUX_UTSNAME_BYTES];
+    write_linux_uname_field(&mut bytes[0..LINUX_UTSNAME_FIELD_BYTES], "NexusOS");
+    write_linux_uname_field(
+        &mut bytes[LINUX_UTSNAME_FIELD_BYTES..LINUX_UTSNAME_FIELD_BYTES * 2],
+        "nexus",
+    );
+    write_linux_uname_field(
+        &mut bytes[LINUX_UTSNAME_FIELD_BYTES * 2..LINUX_UTSNAME_FIELD_BYTES * 3],
+        "0.1",
+    );
+    write_linux_uname_field(
+        &mut bytes[LINUX_UTSNAME_FIELD_BYTES * 3..LINUX_UTSNAME_FIELD_BYTES * 4],
+        "#1 Axle",
+    );
+    write_linux_uname_field(
+        &mut bytes[LINUX_UTSNAME_FIELD_BYTES * 4..LINUX_UTSNAME_FIELD_BYTES * 5],
+        "x86_64",
+    );
+    write_linux_uname_field(
+        &mut bytes[LINUX_UTSNAME_FIELD_BYTES * 5..LINUX_UTSNAME_BYTES],
+        "localdomain",
+    );
+    bytes
+}
+
 fn map_guest_memory_status_to_errno(status: zx_status_t) -> i32 {
     match status {
         ZX_ERR_INVALID_ARGS | ZX_ERR_OUT_OF_RANGE => LINUX_EFAULT,
@@ -9523,6 +9912,25 @@ fn map_vm_status_to_errno(status: zx_status_t) -> i32 {
         ZX_ERR_INVALID_ARGS => LINUX_EINVAL,
         ZX_ERR_NO_MEMORY | ZX_ERR_OUT_OF_RANGE => LINUX_ENOMEM,
         ZX_ERR_NOT_SUPPORTED => LINUX_ENODEV,
+        _ => LINUX_EINVAL,
+    }
+}
+
+fn map_seek_status_to_errno(status: zx_status_t) -> i32 {
+    match status {
+        ZX_ERR_BAD_HANDLE => LINUX_EBADF,
+        ZX_ERR_INVALID_ARGS | ZX_ERR_OUT_OF_RANGE => LINUX_EINVAL,
+        ZX_ERR_NOT_SUPPORTED => LINUX_ESPIPE,
+        _ => LINUX_EINVAL,
+    }
+}
+
+fn map_readlink_status_to_errno(status: zx_status_t) -> i32 {
+    match status {
+        ZX_ERR_BAD_PATH | ZX_ERR_NOT_FOUND => LINUX_ENOENT,
+        ZX_ERR_NOT_SUPPORTED | ZX_ERR_INVALID_ARGS => LINUX_EINVAL,
+        ZX_ERR_OUT_OF_RANGE => LINUX_EFAULT,
+        ZX_ERR_NO_MEMORY => LINUX_ENOMEM,
         _ => LINUX_EINVAL,
     }
 }
@@ -9655,6 +10063,7 @@ mod tests {
             },
             state: TaskState::Running,
             signals: TaskSignals::default(),
+            clear_child_tid: 0,
             robust_list: None,
             active_signal: None,
         };
@@ -9704,6 +10113,7 @@ mod tests {
                 },
                 state: task_state,
                 signals: TaskSignals::default(),
+                clear_child_tid: 0,
                 robust_list: None,
                 active_signal: None,
             },
@@ -9821,6 +10231,42 @@ mod tests {
         let len = status.read(&mut bytes).expect("read /proc/self/status");
         let text = core::str::from_utf8(&bytes[..len]).expect("utf8 status");
         assert!(text.contains("State:\tT\n"));
+    }
+
+    #[test]
+    fn proc_self_readlink_targets_report_exe_and_cwd() {
+        let stdout = RecordingFd::new();
+        let kernel = test_kernel_with_stdio(stdout);
+        assert_eq!(
+            kernel
+                .resolve_proc_readlink_target(1, "/proc/self/exe")
+                .expect("proc exe target"),
+            "bin/linux-round6-proc-job-smoke"
+        );
+        assert_eq!(
+            kernel
+                .resolve_proc_readlink_target(1, "/proc/self/cwd")
+                .expect("proc cwd target"),
+            "/"
+        );
+    }
+
+    #[test]
+    fn proc_self_fd_readlink_reports_stdio_targets() {
+        let stdout = RecordingFd::new();
+        let kernel = test_kernel_with_stdio(stdout);
+        assert_eq!(
+            kernel
+                .resolve_proc_readlink_target(1, "/proc/self/fd/0")
+                .expect("stdin target"),
+            "/dev/stdin"
+        );
+        assert_eq!(
+            kernel
+                .resolve_proc_readlink_target(1, "/proc/self/fd/1")
+                .expect("stdout target"),
+            "/dev/stdout"
+        );
     }
 
     #[test]
