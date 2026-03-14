@@ -559,3 +559,25 @@ args = [
   { name = "regs", ty = "*const ax_guest_x64_regs_t" },
   { name = "options", ty = "u32" },
 ]
+
+[[syscall]]
+name = "ax_thread_set_guest_x64_fs_base"
+nr = 47
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "thread", ty = "ax_handle_t" },
+  { name = "fs_base", ty = "u64" },
+  { name = "options", ty = "u32" },
+]
+
+[[syscall]]
+name = "ax_thread_get_guest_x64_fs_base"
+nr = 48
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "thread", ty = "ax_handle_t" },
+  { name = "options", ty = "u32" },
+  { name = "out_fs_base", ty = "*mut u64" },
+]

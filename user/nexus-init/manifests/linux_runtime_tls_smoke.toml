@@ -1,0 +1,8 @@
+url = "boot://linux-runtime-tls-smoke"
+startup = "eager"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-runtime-tls-smoke"
+args = ["linux-runtime-tls-smoke"]
+env = []

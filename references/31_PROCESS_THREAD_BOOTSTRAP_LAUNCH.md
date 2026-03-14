@@ -91,6 +91,12 @@ The bootstrap address space is prewired enough to exercise real VM behavior earl
   - a directly parsed ELF64 ET_EXEC image VMO
   and returns prepared start parameters plus the initial user stack image.
 - `start_process()` transitions the process from `Created` to `Started` and starts one thread.
+- Thread carriers now also cache one guest-visible x86_64 `fs_base` value for
+  the current runtime/TLS bootstrap slice:
+  - the kernel snapshots that base when it captures a user context
+  - ring3 restore writes that base back before returning to userspace
+  - generic `ax_*` helpers may set/get the cached base without pushing Linux
+    `arch_prctl` policy into the process/thread object model
 
 ## Thread start model
 
@@ -145,6 +151,14 @@ The first generic-launch contract is now implemented without changing syscall si
   helper: the userspace executive prepares one Linux stack image, calls
   `ax_process_prepare_linux_exec()`, then starts the target thread with the returned entry and
   stack pointer.
+- The next runtime/TLS slice now also relies on one additional generic carrier
+  helper pair:
+  - `ax_thread_set_guest_x64_fs_base()`
+  - `ax_thread_get_guest_x64_fs_base()`
+  Starnix uses that pair for `arch_prctl(ARCH_SET_FS/ARCH_GET_FS)`,
+  `CLONE_SETTLS`, and fork-time FS-base inheritance while the kernel stays
+  responsible only for restoring the guest register/MSR state at thread entry
+  and context-switch boundaries.
 - `ProcessImageLayout` is the common launch artifact for:
   - bootstrap image import
   - internal code-image VMOs

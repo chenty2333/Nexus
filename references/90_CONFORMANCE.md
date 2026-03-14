@@ -255,6 +255,17 @@ Main just targets include:
       covered
     - no new native `FdOps` offset-I/O contract is introduced yet
     - remote/service-backed files still remain outside this bootstrap slice
+- The next post-R7 runtime/TLS scenario now closes one narrow guest-thread TLS
+  slice:
+  - `arch_prctl(ARCH_SET_FS)`
+  - `arch_prctl(ARCH_GET_FS)`
+  - `clone(..., CLONE_SETTLS, ...)`
+  - fork inheriting the parent's `fs_base`
+  - the gate intentionally keeps the kernel-side helper generic:
+    - one thread-carrier `fs_base` set/get control plane
+    - no Linux-only syscall mode
+    - no `gs_base`
+    - no broader ELF TLS or `arch_prctl` subcommand surface yet
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

@@ -168,8 +168,19 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - not a full generic symlink implementation for every backend yet
   - `getrandom` is currently one executive-owned bootstrap entropy source, suitable
     for libc/runtime bring-up but not yet documented as a strong cryptographic contract
-  - no TLS / `arch_prctl` surface yet; that remains later libc/runtime enablement work
-    because it requires additional guest-register contract beyond this slice
+  - the next runtime/TLS slice now also has:
+    - `arch_prctl(ARCH_SET_FS)`
+    - `arch_prctl(ARCH_GET_FS)`
+    - `clone(..., CLONE_SETTLS, ...)`
+    - fork-time FS-base inheritance across the new child carrier
+    - one generic x86_64 guest-thread helper pair:
+      - `ax_thread_set_guest_x64_fs_base`
+      - `ax_thread_get_guest_x64_fs_base`
+  - the current TLS bootstrap intentionally stays narrow:
+    - only `fs_base`
+    - no `gs_base`
+    - no `arch_prctl` subcommands beyond `ARCH_SET_FS` / `ARCH_GET_FS`
+    - no final ELF TLS model or libc TLS runtime contract yet
 
 ## Frozen architectural split
 

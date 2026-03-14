@@ -549,6 +549,53 @@ pub fn start_process_guest(
     })
 }
 
+/// Set the cached guest x86_64 FS base for one thread carrier.
+pub fn set_thread_guest_x64_fs_base(
+    thread_handle: zx_handle_t,
+    fs_base: u64,
+    options: u32,
+) -> Result<(), zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved =
+            state.lookup_handle(thread_handle, crate::task::HandleRights::MANAGE_THREAD)?;
+        let thread = state.with_objects(|objects| {
+            Ok(match objects.get(resolved.object_key()) {
+                Some(KernelObject::Thread(thread)) => *thread,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+        state.with_kernel_mut(|kernel| kernel.set_thread_guest_fs_base(thread.thread_id, fs_base))
+    })
+}
+
+/// Read the cached guest x86_64 FS base for one thread carrier.
+pub fn thread_guest_x64_fs_base(
+    thread_handle: zx_handle_t,
+    options: u32,
+) -> Result<u64, zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved =
+            state.lookup_handle(thread_handle, crate::task::HandleRights::MANAGE_THREAD)?;
+        let thread = state.with_objects(|objects| {
+            Ok(match objects.get(resolved.object_key()) {
+                Some(KernelObject::Thread(thread)) => *thread,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+        state.with_kernel(|kernel| kernel.thread_guest_fs_base(thread.thread_id))
+    })
+}
+
 fn install_start_arg_handle(
     state: &KernelState,
     process_id: u64,

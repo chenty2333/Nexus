@@ -19,13 +19,15 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
     AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
     AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
-    AXLE_SYS_AX_PROCESS_START_GUEST, AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_CHANNEL_CREATE,
-    AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE,
-    AXLE_SYS_FUTEX_GET_OWNER, AXLE_SYS_FUTEX_REQUEUE, AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE,
-    AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_HANDLE_REPLACE,
-    AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC,
-    AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT,
-    AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ,
+    AXLE_SYS_AX_PROCESS_START_GUEST, AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
+    AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_START_GUEST,
+    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
+    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER, AXLE_SYS_FUTEX_REQUEUE,
+    AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE,
+    AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_OBJECT_SIGNAL,
+    AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
+    AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE,
+    AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ,
     AXLE_SYS_SOCKET_WRITE, AXLE_SYS_TASK_KILL, AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE,
     AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET,
     AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT,
@@ -42,7 +44,7 @@ use axle_types::{
 };
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 47] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 49] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -90,6 +92,8 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 47] = [
     AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
     AXLE_SYS_AX_PROCESS_START_GUEST,
     AXLE_SYS_AX_THREAD_START_GUEST,
+    AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE,
+    AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
 ];
 
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
@@ -649,6 +653,14 @@ fn writeback_koid(
     koid: zx_koid_t,
 ) -> Result<(), zx_status_t> {
     write_out_value(out, koid)
+}
+
+fn writeback_u64(
+    _ctx: &mut SyscallCtx,
+    out: OutValue<u64>,
+    value: u64,
+) -> Result<(), zx_status_t> {
+    write_out_value(out, value)
 }
 
 fn writeback_optional_usize(
@@ -2495,6 +2507,85 @@ typed_syscall!(
 const AX_THREAD_START_GUEST_DISPATCH: SyscallDispatch =
     SyscallDispatch::new(ax_thread_start_guest_entry);
 
+#[derive(Clone, Copy, Debug)]
+struct ThreadSetGuestFsBaseRequest {
+    thread: zx_handle_t,
+    fs_base: u64,
+    options: u32,
+}
+
+fn decode_ax_thread_set_guest_x64_fs_base(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<ThreadSetGuestFsBaseRequest, NoWriteback>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        ThreadSetGuestFsBaseRequest {
+            thread: ctx.arg_handle(args, 0)?,
+            fs_base: args[1],
+            options: ctx.arg_u32(args, 2)?,
+        },
+        NoWriteback,
+    ))
+}
+
+fn run_ax_thread_set_guest_x64_fs_base(
+    req: ThreadSetGuestFsBaseRequest,
+) -> Result<(), zx_status_t> {
+    crate::object::process::set_thread_guest_x64_fs_base(req.thread, req.fs_base, req.options)
+}
+
+typed_syscall!(
+    AX_THREAD_SET_GUEST_X64_FS_BASE_TYPED,
+    ax_thread_set_guest_x64_fs_base_entry,
+    ThreadSetGuestFsBaseRequest,
+    NoWriteback,
+    (),
+    decode_ax_thread_set_guest_x64_fs_base,
+    run_ax_thread_set_guest_x64_fs_base,
+    writeback_noop
+);
+const AX_THREAD_SET_GUEST_X64_FS_BASE_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_thread_set_guest_x64_fs_base_entry);
+
+#[derive(Clone, Copy, Debug)]
+struct ThreadGetGuestFsBaseRequest {
+    thread: zx_handle_t,
+    options: u32,
+}
+
+fn decode_ax_thread_get_guest_x64_fs_base(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<ThreadGetGuestFsBaseRequest, OutValue<u64>>, zx_status_t> {
+    let out_fs_base = ctx.decode_out_value::<u64>(args, 2)?;
+    Ok(DecodedSyscall::new(
+        ThreadGetGuestFsBaseRequest {
+            thread: ctx.arg_handle(args, 0)?,
+            options: ctx.arg_u32(args, 1)?,
+        },
+        out_fs_base,
+    ))
+}
+
+fn run_ax_thread_get_guest_x64_fs_base(
+    req: ThreadGetGuestFsBaseRequest,
+) -> Result<u64, zx_status_t> {
+    crate::object::process::thread_guest_x64_fs_base(req.thread, req.options)
+}
+
+typed_syscall!(
+    AX_THREAD_GET_GUEST_X64_FS_BASE_TYPED,
+    ax_thread_get_guest_x64_fs_base_entry,
+    ThreadGetGuestFsBaseRequest,
+    OutValue<u64>,
+    u64,
+    decode_ax_thread_get_guest_x64_fs_base,
+    run_ax_thread_get_guest_x64_fs_base,
+    writeback_u64
+);
+const AX_THREAD_GET_GUEST_X64_FS_BASE_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_thread_get_guest_x64_fs_base_entry);
+
 fn decode_task_kill(
     ctx: &mut SyscallCtx,
     args: [u64; 6],
@@ -2591,6 +2682,12 @@ fn syscall_dispatch(nr: SyscallNumber) -> Option<&'static SyscallDispatch> {
         AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY => Some(&AX_GUEST_SESSION_WRITE_MEMORY_DISPATCH),
         AXLE_SYS_AX_PROCESS_START_GUEST => Some(&AX_PROCESS_START_GUEST_DISPATCH),
         AXLE_SYS_AX_THREAD_START_GUEST => Some(&AX_THREAD_START_GUEST_DISPATCH),
+        AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE => {
+            Some(&AX_THREAD_SET_GUEST_X64_FS_BASE_DISPATCH)
+        }
+        AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE => {
+            Some(&AX_THREAD_GET_GUEST_X64_FS_BASE_DISPATCH)
+        }
         AXLE_SYS_TASK_KILL => Some(&TASK_KILL_DISPATCH),
         AXLE_SYS_TASK_SUSPEND => Some(&TASK_SUSPEND_DISPATCH),
         _ => None,

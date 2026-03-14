@@ -1035,6 +1035,7 @@ pub(crate) struct UserContext {
     rflags: u64,
     rsp: u64,
     ss: u64,
+    fs_base: u64,
 }
 
 impl UserContext {
@@ -1063,6 +1064,7 @@ impl UserContext {
             rflags,
             rsp,
             ss,
+            fs_base: crate::arch::user_tls::read_fs_base(),
         })
     }
 
@@ -1083,6 +1085,7 @@ impl UserContext {
             *cpu_frame.add(3) = self.rsp;
             *cpu_frame.add(4) = self.ss;
         }
+        crate::arch::user_tls::write_fs_base(self.fs_base);
         Ok(())
     }
 
@@ -1136,6 +1139,11 @@ impl UserContext {
         self
     }
 
+    fn with_fs_base(mut self, fs_base: u64) -> Self {
+        self.fs_base = fs_base;
+        self
+    }
+
     fn new_user_entry(entry: u64, stack: u64, arg0: u64, arg1: u64) -> Self {
         let selectors = crate::arch::gdt::init();
         let mut trap = crate::arch::int80::TrapFrame::default();
@@ -1148,6 +1156,7 @@ impl UserContext {
             rflags: 0x202,
             rsp: stack,
             ss: selectors.user_data.0 as u64,
+            fs_base: 0,
         }
     }
 
@@ -1163,6 +1172,7 @@ impl UserContext {
 
         // SAFETY: `UserContext` stores a complete ring3 register and IRET frame snapshot. The
         // entry helper restores those registers verbatim and finishes with `iretq`.
+        crate::arch::user_tls::write_fs_base(self.fs_base);
         unsafe {
             axle_enter_user_context(core::ptr::addr_of!(self));
         }
@@ -3177,6 +3187,7 @@ enum ProcessState {
 struct Thread {
     process_id: ProcessId,
     koid: zx_koid_t,
+    guest_fs_base: u64,
     state: ThreadState,
     queued_on_cpu: Option<usize>,
     last_cpu: usize,
@@ -3437,6 +3448,7 @@ impl Kernel {
             Thread {
                 process_id,
                 koid: thread_koid,
+                guest_fs_base: 0,
                 state: ThreadState::Runnable,
                 queued_on_cpu: None,
                 last_cpu: bootstrap_cpu_id,
@@ -4216,6 +4228,7 @@ impl Kernel {
             .threads
             .get_mut(&current_thread_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
+        thread.guest_fs_base = context.fs_base;
         thread.context = Some(context);
         Ok(())
     }
@@ -4257,6 +4270,27 @@ impl Kernel {
         };
         thread.context = Some(context.with_guest_x64_regs(*regs));
         Ok(())
+    }
+
+    pub(crate) fn set_thread_guest_fs_base(
+        &mut self,
+        thread_id: ThreadId,
+        fs_base: u64,
+    ) -> Result<(), zx_status_t> {
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        thread.guest_fs_base = fs_base;
+        if let Some(context) = thread.context {
+            thread.context = Some(context.with_fs_base(fs_base));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn thread_guest_fs_base(&self, thread_id: ThreadId) -> Result<u64, zx_status_t> {
+        Ok(self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .guest_fs_base)
     }
 
     fn validate_thread_guest_start_regs(
@@ -4694,6 +4728,7 @@ impl Kernel {
             Thread {
                 process_id,
                 koid,
+                guest_fs_base: 0,
                 state: ThreadState::New,
                 queued_on_cpu: None,
                 last_cpu: current_cpu_id,
@@ -4773,8 +4808,11 @@ impl Kernel {
         if !matches!(thread.state, ThreadState::New) {
             return Err(ZX_ERR_BAD_STATE);
         }
-        thread.context =
-            Some(UserContext::new_user_entry(regs.rip, regs.rsp, 0, 0).with_guest_x64_regs(*regs));
+        thread.context = Some(
+            UserContext::new_user_entry(regs.rip, regs.rsp, 0, 0)
+                .with_guest_x64_regs(*regs)
+                .with_fs_base(thread.guest_fs_base),
+        );
         thread.state = ThreadState::Runnable;
         let queued = thread.queued_on_cpu.is_some();
         let thread_id_copy = thread_id;

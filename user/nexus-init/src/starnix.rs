@@ -45,7 +45,8 @@ use libax::{
     ax_port_wait as zx_port_wait, ax_process_create as zx_process_create,
     ax_process_prepare_linux_exec, ax_process_start_guest, ax_socket_create as zx_socket_create,
     ax_status_result as zx_status_result, ax_task_kill as zx_task_kill,
-    ax_thread_create as zx_thread_create, ax_thread_start_guest, ax_timer_cancel,
+    ax_thread_create as zx_thread_create, ax_thread_get_guest_x64_fs_base,
+    ax_thread_set_guest_x64_fs_base, ax_thread_start_guest, ax_timer_cancel,
     ax_timer_create_monotonic, ax_timer_set, ax_vmo_create as zx_vmo_create,
 };
 use nexus_component::{ComponentStartInfo, NumberedHandle};
@@ -84,6 +85,7 @@ use crate::{
     LINUX_ROUND6_TIMERFD_DECL_BYTES, LINUX_RUNTIME_FD_BINARY_PATH, LINUX_RUNTIME_FD_BYTES,
     LINUX_RUNTIME_FS_BINARY_PATH, LINUX_RUNTIME_FS_BYTES, LINUX_RUNTIME_FS_DECL_BYTES,
     LINUX_RUNTIME_MISC_BINARY_PATH, LINUX_RUNTIME_MISC_BYTES, LINUX_RUNTIME_MISC_DECL_BYTES,
+    LINUX_RUNTIME_TLS_BINARY_PATH, LINUX_RUNTIME_TLS_BYTES, LINUX_RUNTIME_TLS_DECL_BYTES,
     STARTUP_HANDLE_COMPONENT_STATUS, STARTUP_HANDLE_STARNIX_IMAGE_VMO,
     STARTUP_HANDLE_STARNIX_PARENT_PROCESS, STARTUP_HANDLE_STARNIX_STDOUT,
 };
@@ -149,6 +151,7 @@ const LINUX_SYSCALL_EPOLL_CTL: u64 = 233;
 const LINUX_SYSCALL_GETTID: u64 = 186;
 const LINUX_SYSCALL_FUTEX: u64 = 202;
 const LINUX_SYSCALL_SET_TID_ADDRESS: u64 = 218;
+const LINUX_SYSCALL_ARCH_PRCTL: u64 = 158;
 const LINUX_SYSCALL_TGKILL: u64 = 234;
 const LINUX_SYSCALL_GETDENTS64: u64 = 217;
 const LINUX_SYSCALL_READLINKAT: u64 = 267;
@@ -199,7 +202,12 @@ const LINUX_CLONE_VM: u64 = 0x0000_0100;
 const LINUX_CLONE_FS: u64 = 0x0000_0200;
 const LINUX_CLONE_FILES: u64 = 0x0000_0400;
 const LINUX_CLONE_SIGHAND: u64 = 0x0000_0800;
+const LINUX_CLONE_SETTLS: u64 = 0x0008_0000;
 const LINUX_CLONE_THREAD: u64 = 0x0001_0000;
+const LINUX_ARCH_SET_GS: u64 = 0x1001;
+const LINUX_ARCH_SET_FS: u64 = 0x1002;
+const LINUX_ARCH_GET_FS: u64 = 0x1003;
+const LINUX_ARCH_GET_GS: u64 = 0x1004;
 const LINUX_FUTEX_CMD_MASK: u64 = 0x7f;
 const LINUX_FUTEX_WAIT: u64 = 0;
 const LINUX_FUTEX_WAKE: u64 = 1;
@@ -2606,6 +2614,7 @@ impl StarnixKernel {
             LINUX_SYSCALL_PWRITE64 => self.sys_pwrite64(task_id, stop_state),
             LINUX_SYSCALL_GETPID => self.sys_getpid(task_id, stop_state),
             LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
+            LINUX_SYSCALL_ARCH_PRCTL => self.sys_arch_prctl(task_id, stop_state),
             LINUX_SYSCALL_SET_TID_ADDRESS => self.sys_set_tid_address(task_id, stop_state),
             LINUX_SYSCALL_GETPGRP => self.sys_getpgrp(task_id, stop_state),
             LINUX_SYSCALL_GETPGID => self.sys_getpgid(task_id, stop_state),
@@ -4583,6 +4592,56 @@ impl StarnixKernel {
         Ok(SyscallAction::Resume)
     }
 
+    fn sys_arch_prctl(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let code = stop_state.regs.rdi;
+        let addr = stop_state.regs.rsi;
+        let thread_handle = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .thread_handle;
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+
+        let result = match code {
+            LINUX_ARCH_SET_FS => match zx_status_result(ax_thread_set_guest_x64_fs_base(
+                thread_handle,
+                addr,
+                0,
+            )) {
+                Ok(()) => 0,
+                Err(status) => linux_errno(map_guest_start_status_to_errno(status)),
+            },
+            LINUX_ARCH_GET_FS => {
+                let mut fs_base = 0u64;
+                match zx_status_result(ax_thread_get_guest_x64_fs_base(
+                    thread_handle,
+                    0,
+                    &mut fs_base,
+                )) {
+                    Ok(()) => match write_guest_u64(session, addr, fs_base) {
+                        Ok(()) => 0,
+                        Err(status) => linux_errno(map_guest_write_status_to_errno(status)),
+                    },
+                    Err(status) => linux_errno(map_guest_start_status_to_errno(status)),
+                }
+            }
+            LINUX_ARCH_SET_GS | LINUX_ARCH_GET_GS => linux_errno(LINUX_EINVAL),
+            _ => linux_errno(LINUX_EINVAL),
+        };
+        complete_syscall(stop_state, result)?;
+        Ok(SyscallAction::Resume)
+    }
+
     fn sys_set_tid_address(
         &mut self,
         task_id: i32,
@@ -6141,14 +6200,19 @@ impl StarnixKernel {
             | LINUX_CLONE_FS
             | LINUX_CLONE_FILES
             | LINUX_CLONE_SIGHAND
+            | LINUX_CLONE_SETTLS
             | LINUX_CLONE_THREAD;
-        let required = supported;
+        let required = LINUX_CLONE_VM
+            | LINUX_CLONE_FS
+            | LINUX_CLONE_FILES
+            | LINUX_CLONE_SIGHAND
+            | LINUX_CLONE_THREAD;
         if (flags & required) != required
             || (flags & !(supported | 0xff)) != 0
             || exit_signal != 0
             || parent_tid_addr != 0
             || child_tid_addr != 0
-            || tls != 0
+            || ((flags & LINUX_CLONE_SETTLS) == 0 && tls != 0)
         {
             complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
             return Ok(SyscallAction::Resume);
@@ -6171,6 +6235,12 @@ impl StarnixKernel {
             .ok_or(ZX_ERR_BAD_STATE)?
             .signals
             .blocked;
+        let parent_thread_handle = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .thread_handle;
         let child_carrier = match create_thread_carrier(process_handle, self.port, packet_key) {
             Ok(carrier) => carrier,
             Err(status) => {
@@ -6181,6 +6251,36 @@ impl StarnixKernel {
                 return Ok(SyscallAction::Resume);
             }
         };
+        let child_fs_base = if (flags & LINUX_CLONE_SETTLS) != 0 {
+            tls
+        } else {
+            let mut inherited = 0u64;
+            if let Err(status) = zx_status_result(ax_thread_get_guest_x64_fs_base(
+                parent_thread_handle,
+                0,
+                &mut inherited,
+            )) {
+                child_carrier.close();
+                complete_syscall(
+                    stop_state,
+                    linux_errno(map_guest_start_status_to_errno(status)),
+                )?;
+                return Ok(SyscallAction::Resume);
+            }
+            inherited
+        };
+        if let Err(status) = zx_status_result(ax_thread_set_guest_x64_fs_base(
+            child_carrier.thread_handle,
+            child_fs_base,
+            0,
+        )) {
+            child_carrier.close();
+            complete_syscall(
+                stop_state,
+                linux_errno(map_guest_start_status_to_errno(status)),
+            )?;
+            return Ok(SyscallAction::Resume);
+        }
 
         let mut child_regs = stop_state.regs;
         child_regs.rax = 0;
@@ -6244,6 +6344,12 @@ impl StarnixKernel {
             .ok_or(ZX_ERR_BAD_STATE)?
             .signals
             .blocked;
+        let parent_thread_handle = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .thread_handle;
         let (task_image, namespace) = {
             let group = self.groups.get(&parent_tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let image = group.image.clone().ok_or(ZX_ERR_BAD_STATE)?;
@@ -6272,6 +6378,19 @@ impl StarnixKernel {
                 return Ok(SyscallAction::Resume);
             }
         };
+        let mut inherited_fs_base = 0u64;
+        if let Err(status) = zx_status_result(ax_thread_get_guest_x64_fs_base(
+            parent_thread_handle,
+            0,
+            &mut inherited_fs_base,
+        )) {
+            let _ = zx_handle_close(image_vmo);
+            complete_syscall(
+                stop_state,
+                linux_errno(map_guest_start_status_to_errno(status)),
+            )?;
+            return Ok(SyscallAction::Resume);
+        }
 
         let child_tgid = self.alloc_tid()?;
         let packet_key = self.alloc_packet_key()?;
@@ -6293,6 +6412,18 @@ impl StarnixKernel {
             }
         };
         let _ = zx_handle_close(image_vmo);
+        if let Err(status) = zx_status_result(ax_thread_set_guest_x64_fs_base(
+            prepared.carrier.thread_handle,
+            inherited_fs_base,
+            0,
+        )) {
+            prepared.close();
+            complete_syscall(
+                stop_state,
+                linux_errno(map_guest_start_status_to_errno(status)),
+            )?;
+            return Ok(SyscallAction::Resume);
+        }
 
         let child_resources = {
             let parent_resources = self
@@ -7102,6 +7233,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-runtime-fd-smoke") => Some(LINUX_RUNTIME_FD_BYTES),
         Some("linux-runtime-misc-smoke") => Some(LINUX_RUNTIME_MISC_BYTES),
         Some("linux-runtime-fs-smoke") => Some(LINUX_RUNTIME_FS_BYTES),
+        Some("linux-runtime-tls-smoke") => Some(LINUX_RUNTIME_TLS_BYTES),
         Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BYTES),
         Some(_) => None,
     }
@@ -7128,6 +7260,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-runtime-fd-smoke") => Some(LINUX_RUNTIME_FD_BINARY_PATH),
         Some("linux-runtime-misc-smoke") => Some(LINUX_RUNTIME_MISC_BINARY_PATH),
         Some("linux-runtime-fs-smoke") => Some(LINUX_RUNTIME_FS_BINARY_PATH),
+        Some("linux-runtime-tls-smoke") => Some(LINUX_RUNTIME_TLS_BINARY_PATH),
         Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH),
         Some(_) => None,
     }
@@ -9329,6 +9462,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_RUNTIME_FS_BYTES,
         ));
     }
+    if !LINUX_RUNTIME_TLS_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_RUNTIME_TLS_BINARY_PATH,
+            LINUX_RUNTIME_TLS_BYTES,
+        ));
+    }
     if !LINUX_DYNAMIC_ELF_SMOKE_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH,
@@ -9449,6 +9588,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-runtime-fs-smoke.nxcd",
             LINUX_RUNTIME_FS_DECL_BYTES,
+        ));
+    }
+    if !LINUX_RUNTIME_TLS_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-runtime-tls-smoke.nxcd",
+            LINUX_RUNTIME_TLS_DECL_BYTES,
         ));
     }
     let bootstrap = BootstrapNamespace::build(&assets)?;

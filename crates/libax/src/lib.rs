@@ -650,6 +650,30 @@ pub fn ax_thread_start_guest(
     }
 }
 
+/// Set the guest x86_64 FS base for one thread carrier.
+pub fn ax_thread_set_guest_x64_fs_base(
+    thread: ax_handle_t,
+    fs_base: u64,
+    options: u32,
+) -> ax_status_t {
+    match narrow_handle(thread) {
+        Ok(raw) => libzircon::ax_thread_set_guest_x64_fs_base(raw, fs_base, options),
+        Err(status) => status,
+    }
+}
+
+/// Read the guest x86_64 FS base for one thread carrier.
+pub fn ax_thread_get_guest_x64_fs_base(
+    thread: ax_handle_t,
+    options: u32,
+    out_fs_base: &mut u64,
+) -> ax_status_t {
+    match narrow_handle(thread) {
+        Ok(raw) => libzircon::ax_thread_get_guest_x64_fs_base(raw, options, out_fs_base),
+        Err(status) => status,
+    }
+}
+
 /// Kill a process or thread carrier.
 pub fn ax_task_kill(handle: ax_handle_t) -> ax_status_t {
     match narrow_handle(handle) {

@@ -31,7 +31,7 @@ This file describes the current syscall-number source, trap entry, argument copy
 - `kernel/axle-kernel/src/syscall/mod.rs` is the main syscall layer.
 - `dispatch_syscall()` handles supported syscalls from a `[u64; 6]` argument array.
 - `invoke_from_trapframe()` is the architecture-facing path.
-- The current bootstrap syscall ABI surface is `45` generated syscall numbers.
+- The current bootstrap syscall ABI surface is `49` generated syscall numbers.
 - `AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC` is now the distinct Linux-facing
   exec-prepare helper. It accepts one opaque exec-spec blob and produces the
   prepared entry/stack pair without overloading the generic native launch path.
@@ -44,6 +44,13 @@ This file describes the current syscall-number source, trap entry, argument copy
   - read copies guest userspace bytes out to the supervisor
   - write copies kernel-owned bytes back into the guest address space
   - neither syscall interprets Linux ABI structures or Linux syscall semantics
+- `AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE` and
+  `AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE` are the current generic x86_64
+  guest-thread TLS hooks:
+  - they operate on one existing thread carrier
+  - they cache and expose that carrier's guest-visible `fs_base`
+  - they do not encode Linux `arch_prctl` or `CLONE_SETTLS` policy in-kernel;
+    the Starnix executive remains responsible for those semantics
 - `SyscallCtx` is now the syscall front-end authority for:
   - scalar argument decoding
   - extra syscall stack argument recovery
@@ -97,6 +104,7 @@ The current bootstrap syscall surface includes:
 - process create / prepare start / start
 - Linux exec prepare
 - guest session create / resume / read-memory / write-memory
+- guest-thread x86_64 FS-base set / get
 - thread create / start
 - task kill / suspend
 - socket create / read / write
