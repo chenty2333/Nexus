@@ -200,6 +200,19 @@ Main just targets include:
     `signalfd`
   - `wait4(..., WUNTRACED, ...)` observing the stop event
   - `wait4(..., WCONTINUED, ...)` observing the continue event
+- The ninth Round-6 Starnix long-tail scenario now pushes that job-control view
+  through one tty-oriented slice:
+  - background `read(0, ...)` on the controlling stdio set stops the child with
+    `SIGTTIN`
+  - background `write(1, ...)` on the same controlling stdio set stops the
+    child with `SIGTTOU`
+  - `wait4(..., WUNTRACED, ...)` and blocked `signalfd(SIGCHLD)` both observe
+    those concrete tty stop causes
+  - `/proc/<pid>/task/<tid>/stat` now exposes stopped thread-state for the
+    child while it remains in group-stop
+  - the bootstrap gate intentionally keeps tty ownership policy narrow:
+    foreground/background is modeled only for the inherited stdio set and still
+    excludes `tcsetpgrp`, `TIOCSPGRP`, and broader tty discipline
 - VMAR lifecycle is now also a MUST gate for bootstrap VM/TLB semantics:
   - map / protect / unmap must remain stable at the syscall surface
   - the calling thread must observe the committed mapping / protection state on return

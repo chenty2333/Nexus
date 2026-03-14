@@ -112,7 +112,7 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - synthetic `/proc/self/cmdline`
     - synthetic `/proc/self/task`
     - synthetic `/proc/self/task/<tid>/{comm,stat,status}`
-    - synthetic `/proc/<pid>/task/<tid>/{comm,status}` for non-self children
+    - synthetic `/proc/<pid>/task/<tid>/{comm,stat,status}` for non-self children
     - group-stop / continue transitions now preserve the originating
       job-control stop signal (`SIGTSTP` / `SIGTTIN` / `SIGTTOU` / `SIGSTOP`)
     - parent-side `SIGCHLD` metadata for stop / continue transitions
@@ -121,6 +121,13 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
       transitions
     - `wait4(..., WUNTRACED, ...)` observing one stop event
     - `wait4(..., WCONTINUED, ...)` observing one continue event
+  - the tty-oriented job-control slice now also has:
+    - one executive-owned foreground-process-group mapping per Linux session
+    - background stdio reads on fd `0` delivering `SIGTTIN`
+    - background stdio writes on fd `1` / `2` delivering `SIGTTOU`
+    - parent-observable `SIGCHLD` stop metadata for those tty-generated stops
+    - re-foregrounding one stopped child with `setpgid()` before `SIGCONT`
+      remaining purely executive policy, not a new Axle kernel object contract
 
 ## Frozen architectural split
 
@@ -520,12 +527,18 @@ forcing every syscall through one uniform RPC layer.
     - `/proc/self/cmdline`
     - `/proc/self/task`
     - `/proc/self/task/<tid>/{comm,stat,status}`
-    - `/proc/<pid>/task/<tid>/{comm,status}`
+    - `/proc/<pid>/task/<tid>/{comm,stat,status}`
+    - `/proc/<pid>/task/<tid>/stat` and `/proc/<pid>/task/<tid>/status` now
+      reflect per-thread runnable / waiting / stopped state (`R` / `S` / `T`)
+      instead of only mirroring the enclosing thread-group state
   - one minimal job-control stop / continue view now exists:
     - default job-control stop signals preserve their original identity at
       thread-group scope
     - `wait4(..., WUNTRACED, ...)` consumes one pending stop event
     - `wait4(..., WCONTINUED, ...)` consumes one pending continue event
+    - background controlling-stdio access now enters group-stop with
+      `SIGTTIN` / `SIGTTOU` while the tty ownership policy remains wholly in
+      the userspace executive
     - parent thread groups now also keep one minimal `SIGCHLD` stop / continue
       record for signalfd-visible observation
   - no restart blocks / `sigaltstack` yet

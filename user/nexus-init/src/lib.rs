@@ -160,6 +160,10 @@ const ROOT_DECL_STARNIX_ROUND6_PROC_CONTROL_BYTES: &[u8] = include_bytes!(concat
     env!("OUT_DIR"),
     "/root_component_starnix_round6_proc_control.nxcd"
 ));
+const ROOT_DECL_STARNIX_ROUND6_PROC_TTY_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_round6_proc_tty.nxcd"
+));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
@@ -246,6 +250,13 @@ pub(crate) const LINUX_ROUND6_PROC_CONTROL_DECL_BYTES: &[u8] = include_bytes!(co
 ));
 #[cfg(not(nexus_init_embed_starnix_round6_proc_control))]
 pub(crate) const LINUX_ROUND6_PROC_CONTROL_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round6_proc_tty)]
+pub(crate) const LINUX_ROUND6_PROC_TTY_DECL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/linux_round6_proc_tty_smoke.nxcd"
+));
+#[cfg(not(nexus_init_embed_starnix_round6_proc_tty))]
+pub(crate) const LINUX_ROUND6_PROC_TTY_DECL_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_hello)]
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
@@ -321,6 +332,11 @@ pub(crate) const LINUX_ROUND6_PROC_CONTROL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-round6-proc-control-smoke"));
 #[cfg(not(nexus_init_embed_starnix_round6_proc_control))]
 pub(crate) const LINUX_ROUND6_PROC_CONTROL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_round6_proc_tty)]
+pub(crate) const LINUX_ROUND6_PROC_TTY_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-round6-proc-tty-smoke"));
+#[cfg(not(nexus_init_embed_starnix_round6_proc_tty))]
+pub(crate) const LINUX_ROUND6_PROC_TTY_BYTES: &[u8] = &[];
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
@@ -348,6 +364,7 @@ pub(crate) const LINUX_ROUND6_PIDFD_BINARY_PATH: &str = "bin/linux-round6-pidfd-
 pub(crate) const LINUX_ROUND6_PROC_JOB_BINARY_PATH: &str = "bin/linux-round6-proc-job-smoke";
 pub(crate) const LINUX_ROUND6_PROC_CONTROL_BINARY_PATH: &str =
     "bin/linux-round6-proc-control-smoke";
+pub(crate) const LINUX_ROUND6_PROC_TTY_BINARY_PATH: &str = "bin/linux-round6-proc-tty-smoke";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -376,6 +393,7 @@ const STARNIX_ROUND6_SCM_RIGHTS_EXPECTED_STDOUT: &[u8] = b"round6 scm_rights ok\
 const STARNIX_ROUND6_PIDFD_EXPECTED_STDOUT: &[u8] = b"round6 pidfd ok\n";
 const STARNIX_ROUND6_PROC_JOB_EXPECTED_STDOUT: &[u8] = b"proc-fd bridge ok\nround6 proc_job ok\n";
 const STARNIX_ROUND6_PROC_CONTROL_EXPECTED_STDOUT: &[u8] = b"round6 proc_control ok\n";
+const STARNIX_ROUND6_PROC_TTY_EXPECTED_STDOUT: &[u8] = b"tround6 proc_tty ok\n";
 
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
@@ -650,6 +668,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             LINUX_ROUND6_PROC_CONTROL_BYTES,
         ));
     }
+    if !LINUX_ROUND6_PROC_TTY_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_ROUND6_PROC_TTY_BINARY_PATH,
+            LINUX_ROUND6_PROC_TTY_BYTES,
+        ));
+    }
     assets.push(BootAssetEntry::bytes(
         "manifests/root.nxcd",
         ROOT_DECL_EAGER_BYTES,
@@ -717,6 +741,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-round6-proc-control.nxcd",
         ROOT_DECL_STARNIX_ROUND6_PROC_CONTROL_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-round6-proc-tty.nxcd",
+        ROOT_DECL_STARNIX_ROUND6_PROC_TTY_BYTES,
     ));
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
@@ -806,6 +834,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-round6-proc-control-smoke.nxcd",
             LINUX_ROUND6_PROC_CONTROL_DECL_BYTES,
+        ));
+    }
+    if !LINUX_ROUND6_PROC_TTY_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-round6-proc-tty-smoke.nxcd",
+            LINUX_ROUND6_PROC_TTY_DECL_BYTES,
         ));
     }
     assets.push(BootAssetEntry::bytes(
@@ -1056,6 +1090,16 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             &runners,
             "linux_round6_proc_control_smoke",
             STARNIX_ROUND6_PROC_CONTROL_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-round6-proc-tty" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_round6_proc_tty_smoke",
+            STARNIX_ROUND6_PROC_TTY_EXPECTED_STDOUT,
             summary,
         );
     }
