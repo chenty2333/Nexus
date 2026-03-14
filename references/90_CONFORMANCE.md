@@ -50,6 +50,10 @@ Main just targets include:
     `expected_failure_kinds`
   - or `mode = "not_applicable"` with a reason when the current host-side concurrent harness does
     not model that contract
+- The `expected_failure_kinds` list is now kept aligned with failures the current
+  healthy host-side model can actually surface, rather than with hypothetical
+  invariant names that the model itself cannot produce without first modeling a
+  bug in the queue or waiter bookkeeping implementation.
 - `tools/axle-conformance` checks:
   - unknown contract references
   - uncovered MUST contracts

@@ -100,7 +100,7 @@ mode = "seeded"
 system = "wait_port_timer"
 hook_classes = ["waiter_linked", "port_reserve_exhausted", "signal_updated_before_wake"]
 state_projections = ["wait_port_timer_port_queue", "wait_port_timer_object_signals"]
-expected_failure_kinds = ["invariant.port_overflow", "hang.wait_port_timer"]
+expected_failure_kinds = ["hang.wait_port_timer"]
 
 [[contracts]]
 id = "must.port.pending_merge_flushes_signal"
@@ -111,7 +111,7 @@ mode = "seeded"
 system = "wait_port_timer"
 hook_classes = ["waiter_linked", "signal_updated_before_wake", "port_reserve_exhausted"]
 state_projections = ["wait_port_timer_port_queue", "wait_port_timer_object_signals"]
-expected_failure_kinds = ["invariant.port_overflow", "hang.wait_port_timer"]
+expected_failure_kinds = ["hang.wait_port_timer"]
 
 [[contracts]]
 id = "must.port.readable_writable_bootstrap"
@@ -343,7 +343,7 @@ mode = "seeded"
 system = "futex_fault"
 hook_classes = ["fault_leader_claimed", "fault_heavy_prepare_before_commit", "fault_tx_before_commit"]
 state_projections = ["futex_fault_inflight_shape"]
-expected_failure_kinds = ["hang.futex_fault", "hang.step_budget", "invariant.futex_waiter_lost"]
+expected_failure_kinds = ["hang.futex_fault", "hang.step_budget"]
 
 [[contracts]]
 id = "should.vmo.read_write_resize_bootstrap"

@@ -1799,4 +1799,16 @@ mod tests {
         assert!(!observation.state_signatures.is_empty());
         assert!(!observation.state_projections.is_empty());
     }
+
+    #[test]
+    fn wait_port_timer_reserve_seed_hits_port_reserve_hook() {
+        let seed = ConcurrentSeed::base_corpus(32).remove(6);
+        let observation = run_seed(&seed);
+        assert!(
+            observation
+                .hook_classes
+                .contains(&ConcurrencyHookClass::PortReserveExhausted),
+            "{observation:#?}"
+        );
+    }
 }

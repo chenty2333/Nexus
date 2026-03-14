@@ -189,6 +189,19 @@ pub struct ConcurrentSeed {
 impl ConcurrentSeed {
     /// Built-in corpus used by the smoke runner.
     pub fn base_corpus(max_steps: u16) -> Vec<Self> {
+        let wait_step_budget_program =
+            vec![ProgramOp::Wait(WaitOp::AdvanceTime { ticks: 1 }); usize::from(max_steps) + 1];
+        let futex_step_budget_program =
+            vec![
+                ProgramOp::FutexFault(FutexFaultOp::AdvanceTime { ticks: 1 });
+                usize::from(max_steps) + 1
+            ];
+        let channel_step_budget_program =
+            vec![
+                ProgramOp::ChannelHandle(ChannelHandleOp::ChannelRead { handle: 0 });
+                usize::from(max_steps) + 1
+            ];
+
         vec![
             Self {
                 replay: ReplayMeta::new(0x1001, max_steps),
@@ -304,6 +317,126 @@ impl ConcurrentSeed {
                     HookId::HandleReplaceBeforePublish,
                     1,
                 )],
+            },
+            Self {
+                replay: ReplayMeta::new(0x1003, max_steps),
+                system: SystemKind::WaitPortTimer,
+                program_a: vec![ProgramOp::Wait(WaitOp::WaitAsync {
+                    waitable: 4,
+                    key: 0x44,
+                    bits: 1,
+                    edge: false,
+                })],
+                program_b: vec![
+                    ProgramOp::Wait(WaitOp::SetSignal {
+                        waitable: 0,
+                        bits: 1,
+                    }),
+                    ProgramOp::Wait(WaitOp::WaitAsync {
+                        waitable: 0,
+                        key: 0x20,
+                        bits: 1,
+                        edge: false,
+                    }),
+                    ProgramOp::Wait(WaitOp::SetSignal {
+                        waitable: 1,
+                        bits: 1,
+                    }),
+                    ProgramOp::Wait(WaitOp::WaitAsync {
+                        waitable: 1,
+                        key: 0x21,
+                        bits: 1,
+                        edge: false,
+                    }),
+                    ProgramOp::Wait(WaitOp::SetSignal {
+                        waitable: 2,
+                        bits: 1,
+                    }),
+                    ProgramOp::Wait(WaitOp::WaitAsync {
+                        waitable: 2,
+                        key: 0x22,
+                        bits: 1,
+                        edge: false,
+                    }),
+                    ProgramOp::Wait(WaitOp::SetSignal {
+                        waitable: 3,
+                        bits: 1,
+                    }),
+                    ProgramOp::Wait(WaitOp::WaitAsync {
+                        waitable: 3,
+                        key: 0x23,
+                        bits: 1,
+                        edge: false,
+                    }),
+                    ProgramOp::Wait(WaitOp::SetSignal {
+                        waitable: 4,
+                        bits: 1,
+                    }),
+                ],
+                hints: vec![SchedHint::YieldHere(HookId::SignalUpdatedBeforeWake)],
+            },
+            Self {
+                replay: ReplayMeta::new(0x1004, max_steps),
+                system: SystemKind::WaitPortTimer,
+                program_a: wait_step_budget_program,
+                program_b: Vec::new(),
+                hints: Vec::new(),
+            },
+            Self {
+                replay: ReplayMeta::new(0x1005, max_steps),
+                system: SystemKind::WaitPortTimer,
+                program_a: vec![ProgramOp::Wait(WaitOp::WaitOne {
+                    waitable: 9,
+                    bits: 1,
+                    deadline_ticks: None,
+                })],
+                program_b: Vec::new(),
+                hints: Vec::new(),
+            },
+            Self {
+                replay: ReplayMeta::new(0x2003, max_steps),
+                system: SystemKind::FutexFault,
+                program_a: vec![
+                    ProgramOp::FutexFault(FutexFaultOp::FutexStore { key: 0, value: 1 }),
+                    ProgramOp::FutexFault(FutexFaultOp::FutexWait {
+                        key: 0,
+                        expected: 1,
+                        deadline_ticks: None,
+                    }),
+                ],
+                program_b: vec![ProgramOp::FutexFault(FutexFaultOp::FutexWait {
+                    key: 0,
+                    expected: 1,
+                    deadline_ticks: None,
+                })],
+                hints: vec![SchedHint::PauseThread(HookId::WaiterLinked, 1)],
+            },
+            Self {
+                replay: ReplayMeta::new(0x2004, max_steps),
+                system: SystemKind::FutexFault,
+                program_a: futex_step_budget_program,
+                program_b: Vec::new(),
+                hints: Vec::new(),
+            },
+            Self {
+                replay: ReplayMeta::new(0x3003, max_steps),
+                system: SystemKind::ChannelHandle,
+                program_a: vec![ProgramOp::ChannelHandle(ChannelHandleOp::WaitReadable {
+                    handle: 1,
+                    deadline_ticks: None,
+                })],
+                program_b: vec![ProgramOp::ChannelHandle(ChannelHandleOp::WaitPeerClosed {
+                    handle: 0,
+                    deadline_ticks: None,
+                })],
+                hints: Vec::new(),
+            },
+            Self {
+                replay: ReplayMeta::new(0x3004, max_steps),
+                system: SystemKind::ChannelHandle,
+                program_a: channel_step_budget_program,
+                program_b: Vec::new(),
+                hints: Vec::new(),
             },
         ]
     }
