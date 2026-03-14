@@ -26,7 +26,8 @@ result
 result-*
 
 # Documentation (local only)
-references/
+references/Axle*
+references/Nexus*
 AGENTS.md
 Cargo.lock
 README.md

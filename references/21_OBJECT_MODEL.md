@@ -1,0 +1,135 @@
+# 21 - object model
+
+Part of the Axle kernel object layer.
+
+See also:
+- `20_HANDLE_CAPABILITY.md` - handle and capability storage
+- `11_SYSCALL_DISPATCH.md` - object-layer syscall entry points
+- `12_WAIT_SIGNAL_PORT_TIMER.md` - waitable behavior shared by objects
+- `30_PROCESS_THREAD.md` - process and thread lifecycle
+- `33_IPC.md` - channel and socket object families
+- `40_VM.md` - VMO and VMAR object families
+- `90_CONFORMANCE.md` - object-facing contract coverage
+
+## Scope
+
+This file describes the current kernel object table, object kinds, and lifetime rules in the repository.
+
+## Current implementation
+
+- The object layer is rooted at `kernel/axle-kernel/src/object.rs`.
+- `KernelState` is now an immutable handle container over split slice state:
+  - `Kernel` for process/thread/futex/run-queue core state
+  - `ObjectRegistry` for the global object table, bootstrap handles, timer reverse index, and object-handle refcounts
+  - `TransportCore` for shared socket runtime state and transport telemetry
+  - `Reactor` for observers, waiter indexes, and unified timer backend state
+  - `VmFacade` for VM and fault authority
+- `object.rs` is still the public kernel object façade, but mutable runtime ownership is no longer centralized in `KernelState`.
+- Object-family service code is now split by slice:
+  - `kernel/axle-kernel/src/object/handle.rs`
+  - `kernel/axle-kernel/src/object/process.rs`
+  - `kernel/axle-kernel/src/object/transport.rs`
+  - `kernel/axle-kernel/src/object/vm.rs`
+- Object ids are global within `ObjectRegistry` and distinct from per-process handles.
+- Handles point at object ids through per-process CSpaces owned by `Process`.
+
+## Current object kinds
+
+The current `KernelObject` enum includes:
+
+- `Process`
+- `Thread`
+- `SuspendToken`
+- `GuestSession`
+- `Port`
+- `Timer`
+- `Channel`
+- `EventPair`
+- `Socket`
+- `Vmo`
+- `Vmar`
+
+There is no public Job object, Resource object, Revoker object, or Interrupt object yet.
+
+## VMO object shape
+
+- `VmoObject` now keeps stable control-plane state:
+  - creator process id
+  - kernel-global VMO id
+  - backing scope (`LocalPrivate` or `GlobalShared`)
+  - kind
+  - size
+- It does not cache resident / writable / COW / loaned per-page state.
+- Cross-address-space map and cross-process transfer can promote one anonymous VMO object from
+  `LocalPrivate` to `GlobalShared`.
+
+## Bootstrap objects
+
+At initialization, `KernelState::new()` seeds bootstrap objects and stores the resulting bootstrap handles in `ObjectRegistry` for:
+
+- self process
+- self thread
+- root VMAR
+- bootstrap code VMO when one bootstrap image is imported
+
+These bootstrap handles are used by bootstrap execution paths and conformance paths.
+
+## Lifetime shape
+
+- `ObjectRegistry` is now a slot table. Each slot holds:
+  - generation
+  - state (`Live`, `Dying`, `Retired`)
+  - external handle refcount
+  - internal kernel refcount
+  - optional `KernelObject` payload
+- Public handle lookup only succeeds against `Live` slots with a matching `(object_id, generation)`.
+- Teardown is split into two phases:
+  - logical destroy: remove the payload from live lookup and move the slot to `Dying`
+  - physical retire: once handle refs and kernel refs both reach zero, bump generation and return
+    the numeric object id to the free list
+- Closing the last handle now triggers control-plane teardown for:
+  - channel endpoint close drains queued messages and marks the peer as `peer_closed`
+  - eventpair close marks the peer as `peer_closed`
+  - socket endpoint close updates the shared `SocketCore`
+  - port close destroys the underlying kernel queue backing
+  - timer close tears down the reactor timer object and its reverse index entry
+  - VMO / VMAR close retires the control object record even if backing VM state still exists
+- Task objects are still synchronized against thread/process lifecycle reaping; they are not
+  retired until the task lifecycle says they can disappear.
+- A logically destroyed stale handle is no longer usable for normal object operations, but one
+  `handle_close` may still succeed so the stale reference can drain.
+
+## Signals and waitability
+
+- Signal state is derived from object state rather than stored in one generic field for every object.
+- Waitable object families currently include:
+  - channel
+  - eventpair
+  - socket
+  - port
+  - timer
+  - process/thread termination
+- `object_signals()` computes per-object signal snapshots on demand.
+
+## Rights defaults
+
+The object layer assigns default rights per object family, for example:
+
+- channel/socket: duplicate, transfer, wait, read, write
+- eventpair: duplicate, transfer, wait, signal, signal-peer
+- process/thread: duplicate, transfer, wait, inspect, manage-*
+- guest-session: duplicate, transfer, read, write
+- vmo/vmar: duplicate, transfer, read, map, plus write where supported
+
+These defaults are interpreted through `HandleRights` and currently live in `object/handle.rs`.
+
+## Current limitations
+
+- There is still one global bootstrap object namespace; this is not yet a multi-kernel-instance or job-governed authority model.
+- The root object module is thinner than before, but close/signal flows still coordinate multiple slices from one façade rather than through a fully explicit command graph.
+- Process and thread object slots still depend on lifecycle reaping before their numeric object ids
+  can be reused.
+- Several future object families from the roadmap are absent.
+- `GuestSession` is a new Round-1 execution-control object rather than a Linux semantic object:
+  it binds one carrier thread to one sidecar VMO and one supervisor port so userspace can emulate
+  guest ABI policy outside the kernel.
