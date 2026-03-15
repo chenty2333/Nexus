@@ -167,6 +167,22 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - `uname`
     - `getrandom`
     - `set_tid_address`
+  - the next runtime-process slice now also has:
+    - `getuid`
+    - `geteuid`
+    - `getgid`
+    - `getegid`
+    - `getppid`
+    - `access`
+    - `faccessat`
+    - `faccessat2`
+    - `prlimit64`
+    - one narrow bootstrap identity/limit contract:
+      - uid/gid/euid/egid currently report root-style `0`
+      - `prlimit64` currently supports self queries for `RLIMIT_STACK` and
+        `RLIMIT_NOFILE`
+      - `faccessat*` currently checks bootstrap mode bits over existing local
+        and synthetic backends without introducing a broader DAC policy model
   - the next runtime-fs slice now also has:
     - `pread64`
     - `pwrite64`

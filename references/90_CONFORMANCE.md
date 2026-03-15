@@ -257,6 +257,23 @@ Main just targets include:
   - this gate intentionally excludes `arch_prctl`, TLS setup, positional I/O,
     and broader libc startup dependencies, which remain later
     runtime-enablement work
+- The next post-R7 runtime/process scenario now closes one narrow
+  identity/access/limit slice:
+  - `getuid`
+  - `geteuid`
+  - `getgid`
+  - `getegid`
+  - `getppid`
+  - `access`
+  - `faccessat`
+  - `faccessat2`
+  - `prlimit64`
+  - the current gate intentionally keeps that contract narrow:
+    - identity syscalls currently report one root-style bootstrap identity
+    - `prlimit64` currently supports self queries for `RLIMIT_STACK` and
+      `RLIMIT_NOFILE`
+    - `faccessat*` currently checks mode bits over existing local and
+      synthetic backends without introducing a full DAC policy model
 - The next post-R7 runtime/filesystem scenario now closes one narrow positional
   I/O and metadata slice:
   - `pread64`
