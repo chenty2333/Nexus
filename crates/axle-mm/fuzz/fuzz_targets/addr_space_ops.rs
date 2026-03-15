@@ -72,7 +72,12 @@ fuzz_target!(|data: &[u8]| {
             4 => {
                 let page_index = u64::from(chunk.get(1).copied().unwrap_or(0) % 16);
                 let perms = decode_perms(chunk.get(2).copied().unwrap_or(0));
-                let _ = space.protect(ROOT_BASE + (page_index * PAGE_SIZE), PAGE_SIZE, perms);
+                let _ = space.protect(
+                    &mut frames,
+                    ROOT_BASE + (page_index * PAGE_SIZE),
+                    PAGE_SIZE,
+                    perms,
+                );
             }
             5 => {
                 let page_index = u64::from(chunk.get(1).copied().unwrap_or(0) % 16);
