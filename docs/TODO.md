@@ -1,331 +1,289 @@
-# Axle / Nexus TODO Tree
+# Axle / Nexus TODO
 
 For AI agents:
 
 - This file tracks unfinished work only.
-- Completed work is intentionally omitted.
-- Treat this as a dependency map, not as the semantic source of truth.
-- `references/` remains the source of truth for contracts and intended behavior.
+- `references/` remains the semantic source of truth.
+- This file is the implementation plan for freezing the current Starnix bootstrap
+  path into a maintainable long-term architecture.
+- Prefer updating this file when priorities or sequencing change.
 
 Legend:
 
-- `[~]` partially implemented
-- `[ ]` largely missing
-
-Current rough status:
-
-- Axle kernel is around "late Phase C / early Phase D".
-- Nexus system-layer work is still mostly out-of-tree or not started.
-
-## Axle Core Unfinished Tree
-
-### A. Scheduler / Execution Model `[~]`
-
-#### A1. per-CPU L0 scheduler follow-on `[~]`
-
-= phase-one per-CPU runnable ownership, remote wakeup, reschedule IPI, unified blocked/runnable states, and basic preemption/time slicing have landed
-= remaining work is scheduler policy follow-on: load balancing, richer fairness/accounting, lock-granularity cleanup, and L1 handoff points
-depends on: existing SMP bring-up, thread/process model, wait/futex/port blocking paths
-
-#### A2. generic userspace launch follow-on `[~]`
-
-= phase-one generic image launch, `process_start(arg_handle)`, and executable child start have landed
-= remaining work is broader launcher coverage: fuller ELF support, init/service launch, and less bootstrap-specific bring-up for the very first userspace entry
-depends on: A1, C1
-
-#### A3. user-mode L1 scheduler `[ ]`
-
-= add the higher-level policy layer described in the roadmap  
-= event ring, decision ring, L0 fallback when L1 is absent or stuck, CPU-domain aware policy hooks  
-depends on: A1, stable wait/port semantics, stable shared-memory ring transport
-
-### B. Capability / Governance `[~]`
-
-#### B1. external revocation model `[ ]`
-
-= turn revocation into a real object-level contract instead of internal-only machinery  
-= revocation-group object, revoker authority handle/right, revoke syscall, inheritance/propagation rules, revoke conformance coverage  
-depends on: existing CSpace, existing `RevocationManager`
-
-#### B2. job / policy / quota tree `[ ]`
-
-= add governance structure above raw objects and handles  
-= process/job hierarchy, quotas for handles/ports/vmos/vmars/revocation groups, policy surface, accounting/diagnostics  
-depends on: B1, A2
-
-### C. VM Mainline Completion `[~]`
-
-#### C1. Execute VM / code mappings follow-on `[~]`
-
-= phase-one executable mapping support and launch-time validation have landed
-= remaining work is broader ecosystem coverage around pager/file-backed execution and additional hardening/tests
-depends on: existing page-table, VMAR, VMO, loader path
-
-#### C2. pager-backed / file-backed VMO externalization `[~]`
-
-= turn the current internal pager-backed path into a stable object-facing contract  
-= public semantics for fault/read/map, backing-source rules, write/resize restrictions, file-like source model  
-depends on: existing lazy-VMO materialization path
-
-#### C3. device VM primitives `[ ]`
-
-= add the VM-side primitives needed by a userspace driver framework  
-= Physical/MMIO VMO, Contiguous/DMA-capable memory, DMA grant or `DmaContext`, IOMMU-facing isolation hooks  
-depends on: C1, B2
-
-#### C4. TLB / invalidate hardening `[x]`
-
-= strict visibility and active-peer shootdown support have landed
-= shootdown ack timeout now fails the strict commit instead of silently advancing observed epochs
-= current remaining work is scalability-only follow-up: finer active-CPU tracking and better batching
-depends on: existing epoch/shootdown base
-
-### D. IPC Mainline Completion `[x]`
-
-#### D1. Channel scatter page-loan `[x]`
-
-= bootstrap mixed head/body/tail remap/copy coverage now exists, and sender-side aligned body loan no longer requires an exact standalone mapping
-= fragmented payload remap/copy, snapshot preservation, receiver-side remap COW, and quota recovery are now all contracted
-= future fragment-page objects or a more reusable scatter descriptor are deferred generalization work, not a runtime blocker
-depends on: existing full-page loan, pin/refcount/loan accounting, COW support
-
-#### D2. Channel race hardening `[x]`
-
-= channel cleanup and concurrency behavior are now contracted far enough for bootstrap runtime use
-= close/read ordering, WRITABLE recovery, and channel wait_async/port_wait signal delivery now have explicit regression coverage
-= broader differential fuzz/stress remains ongoing hardening work rather than an open correctness gate
-depends on: D1
-
-### E. Object Family Expansion `[~]`
-
-#### E1. Socket datagram `[ ]`
-
-= add message-oriented socket semantics on top of the current stream-only implementation  
-= message boundaries, truncation rules, datagram backpressure, signal/wait contract  
-depends on: existing stream socket
-
-#### E2. InterruptObject / device waitable objects `[ ]`
-
-= expose the minimal waitable interrupt surface needed by userspace drivers  
-= IRQ object, wait/port integration, ack/mask/unmask primitives, ownership rules  
-depends on: C3, A1
-
-## Outer Tree Toward Starnix
-
-### F. Zircon-compatible runtime `[ ]`
-
-#### F1. thin `libzircon` `[x]`
-
-= userspace `zx_*` stubs, ABI types/struct glue, syscall wrappers, low-logic mapping onto Axle
-= current tree now has a shared `libzircon` crate wrapping the bootstrap `int 0x80` ABI, including the current stack-extended `channel_read` calling convention
-= `libzircon` is now a frozen compat personality rather than the long-term native UAPI
-= a new `libax` crate is the native facade for future userspace work; today it bridges into `libzircon` while handle/codec internals are migrated
-= native `nexus-rt`, `nexus-io`, and `nexus-init` now depend on `libax`; compat-only `zx_*` wrappers are intended to be reached through `libax::compat` rather than by taking new direct `libzircon` dependencies
-depends on: Axle syscall/object semantics being stable enough to wrap cleanly
-
-#### F2. async/reactor base `[x]`
-
-= event loop built on port/timer/channel semantics  
-= enough runtime glue for non-busy async waiting and dispatch
-= current tree now has a single-thread `nexus-rt` dispatcher/executor:
-  - one port
-  - one dispatcher timer object
-  - generation-safe signal registrations
-  - task wakeups routed through `zx_port_queue`
-  - `Sleep`, `OnSignals`, `AsyncChannelRecv/Call`, and `AsyncSocketReadiness`
-depends on: F1
-
-#### F3. FIDL runtime / bindings
-
-= typed RPC over channels with executor integration  
-= transport, encoding/decoding, async binding support  
-depends on: F2
-
-### G. Component Framework `[~]`
-
-#### G1. runner abstraction `[x]`
-
-= round-one launch contracts are now frozen:
-  - shared `ComponentDecl` binary IR
-  - shared `ResolvedComponent` shape
-  - bootstrap-channel `ComponentStartInfo`
-  - minimal controller and outgoing-directory request messages
-= round-two eager-topology gate is now in:
-  - `ElfRunner` can launch eager child components from boot-backed ELF images
-  - child startup flows through the bootstrap channel and per-component namespace assembly
-  - the manager can observe `OnTerminated` controller events from those children
-= the current tree now also has an extracted `user/nexus-init` package so the
-  root manager no longer lives only inside `component_smoke.rs`
-= the current tree now also boots dedicated `echo-provider`, `echo-client`, and
-  `controller-worker` binaries instead of reusing one self image for child roles
-= the current root-manager path now resolves one boot root URL through a built-in
-  `boot-resolver` provider and validates child `runner = "elf"` lookup against
-  the built-in runner registry in `nexus-init`
-= raw task-handle termination waiting remains covered by the kernel task suite,
-  not by the component-manager layer
-
-#### G2. capability routing
-
-= structured capability passing and restriction between components
-
-#### G3. init / service manager / minimal resolver `[x]`
-
-= round-one groundwork is in:
-  - host-side manifest compiler for the minimal component IR
-  - unified resolver shape for `boot://`, `pkg://`, and `local://`
-  - boot-backed manifest loading through the built-in `boot-resolver`
-= round-two topology loop is now in:
-  - root manifest resolve
-  - static `/svc` assembly for one routed protocol
-  - eager bring-up of provider/client children
-  - controller-event collection back into the manager
-= round-three bootstrap lifecycle coverage is now in:
-  - one lazy provider is launched on first `/svc` use
-  - `Stop` / `Kill` requests flow through the controller channel
-= the current tree now carries that manager logic in `user/nexus-init` and
-  boots dedicated child binaries for provider/client/worker roles
-= the formal root startup path now comes from one boot-selected root URL
-  resolved by `nexus-init` through the built-in boot resolver
-= eager and lazy topologies now use the same `nexus-init` binary and component
-  lifecycle path; the root manifest, not a smoke-mode branch, decides startup behavior
-
-depends on: F1-F2, A2
-
-### H. Driver Framework `[ ]`
-
-#### H1. user-mode driver manager
-
-= central manager for driver lifecycle and binding
-
-#### H2. DFv2-style driver components
-
-= driver processes/components instead of in-kernel driver growth
-
-#### H3. devfs / protocol exposure
-
-= a clean way for the rest of the system to talk to drivers
-
-depends on: C3, E2, G
-
-### I. I/O Stack `[~]`
-
-#### I1. zxio/fdio-like fd abstraction `[~]`
-
-= bridge channel/protocol objects into fd-shaped userspace APIs
-= the current tree now has a dedicated `crates/nexus-io` userspace crate with:
-  - `FdOps`
-  - `FdTable`
-  - `WaitSpec`
-  - `OpenFlags` / `FdFlags` / read-only `VmoFlags`
-  - `RemoteFile` / `RemoteDir` / `SocketFd` / `PipeFd` / `StdioFd` / `PseudoNodeFd`
-= `FdTable` already separates per-fd state from shared open-file-description state
-= `nexus-init` now uses the shared namespace path normalizer and mount registry
-  shape from `nexus-io` instead of an ad-hoc path container
-= `nexus-io` now also carries:
-  - directory enumeration through `readdir`
-  - path-based link / rename / unlink hooks on directory-shaped `FdOps`
-  - one `ProcessNamespace` helper with `cwd` / logical-root path walk
-
-#### I2. namespace / VFS / pipe / socket glue `[~]`
-
-= the core glue layer that makes filesystem and socket use practical
-= the current tree now carries one minimal bootstrap namespace/service shape in
-  `user/nexus-init`:
-  - local read-only `/boot` and `/pkg` mounts backed by boot assets
-  - local writable `/tmp` backed by one tiny in-process tmpfs-style tree
-  - routed `/svc` still carried by remote directory handles and the shared FS protocol
-= the current `boot-resolver` and `ElfRunner` now consume `/boot` through the
-  shared `FdOps` / namespace layer instead of private in-memory image tables
-= `PipeFd` and `SocketFd` already wrap current kernel socket objects, and the
-  bootstrap manager now exercises them through one small smoke path
-= the bootstrap namespace path layer now has:
-  - lexical `cwd` / logical-root path walk
-  - full relative-path handling for the local `/boot` / `/pkg` / `/tmp` mounts
-  - directory enumeration for both local directories and routed remote `/svc`
-  - basic local link / rename / unlink semantics on the tmpfs-style writable tree
-  - read-only `GetVmo` for boot/package files, including byte-backed assets that
-    now synthesize cached VMOs on demand
-
-#### I3. filesystem and network services `[~]`
-
-= the service side needed for meaningful program execution
-= the current bootstrap service stack is intentionally minimal:
-  - read-only boot asset service shape for binaries and compiled manifests
-  - tiny tmpfs-style writable file service shape for runtime scratch
-  - one routed `svcfs`-style directory path exercised by the component smoke
-  - pipe/socket glue still stands directly on current kernel socket objects
-= package/resource-style boot assets can now participate in the same read-only
-  file / `GetVmo` path as the boot-backed ELF images
-
-depends on: F, H, E1
-
-### K. DataFS-prep `[~]`
-
-#### K1. reference model / crash checker scaffolding `[~]`
-
-= freeze the first DataFS design constraints before the real filesystem exists
-= the current tree now has:
-  - `crates/nexus-fs-model`
-  - `tools/datafs-check`
-= `nexus-fs-model` now carries:
-  - one object/inode reference model
-  - logical journal records for begin / mutation / commit / checkpoint
-  - state transitions for `rename` / `link` / `unlink` / `fsync`
-  - reserved recovery metadata for `session_id`, open-file-description identity,
-    and reconnect intent
-  - one transport reservation layer for channel RPC first and shared-ring later
-= `datafs-check` now carries:
-  - scenario exploration
-  - fault injection
-  - crash-state replay
-  - journal / state invariant reporting
-= the frozen v1 shape is now:
-  - userspace FS service
-  - single volume
-  - extent-based regular files
-  - indexed directories
-  - logical metadata journal
-  - checksum + checkpoint
-  - minimal fsck-style invariant checker
-  - read-only `GetVmo`
-  - no writable `mmap`
-= real on-disk DataFS implementation, allocator policy, writeback, and recovery
-  execution are still not in tree
-
-depends on: I
-
-### J. Starnix `[ ]`
-
-#### J1. starnix runner
-
-= component/runner integration for launching Linux-facing tasks
-
-#### J2. Linux task/mm/fs/socket/syscall adaptation
-
-= the broad Linux compatibility layer itself
-
-#### J3. signal/futex/epoll/process semantic alignment
-
-= the Linux-visible behavior polishing needed to run real software reliably
-
-depends on: F, G, I  
-full shape will also depend on: H
-
-## Practical Critical Path
-
-If the immediate goal is "move toward Starnix with the least detour", the rough path is:
-
-1. D1/D2 channel completion and hardening
-2. F1 thin `libzircon`
-3. F2 async runtime
-4. G minimal component framework
-5. I minimal fd/I/O stack
-6. J initial Starnix runner and Linux adaptation work
+- `[~]` partially underway
+- `[ ]` not yet started
+
+## Current position
+
+- Axle already has enough generic substrate to host a bootstrap Starnix path.
+- The current risk is not "missing substrate"; it is that
+  `user/nexus-init/src/starnix.rs` has become a monolithic prototype.
+- The highest-value work is now boundary freeze, responsibility split, and
+  semantic tests.
+- New Linux syscall slices are lower priority unless they directly unblock the
+  rounds below.
+
+## Working definition
+
+> Starnix in Nexus is a shared Linux environment launched by a runner and
+> implemented as a userspace executive over Axle's generic carrier / VM /
+> waitable / transport substrate.
+
+## Hard constraints
+
+1. Axle does not gain Linux-only object families or Linux-only kernel modes.
+2. Axle keeps generic mechanisms only:
+   carrier objects, guest supervision, VM substrate, wait/port/timer,
+   futex parking primitives, transport primitives, generic loader helpers, and
+   generic address-space clone helpers.
+3. `libax`, `nexus-rt`, and `nexus-io` stay narrow and generic.
+4. `nexus-io` does not become the Linux VFS. Linux mount, namespace, procfs,
+   anon-inode, and Linux file-description semantics stay in Starnix.
+5. Starnix is treated as one shared Linux environment with shared pid,
+   process-group, session, mount, socket, and signal state. It is not modeled as
+   per-binary glue.
+6. Semantic object tests are a required gate for Starnix work. Smoke binaries
+   and QEMU scenarios remain integration tests, not the only source of truth.
+7. Bootstrap-only payload helpers must not remain on the main production exec
+   path.
+8. Short-term `fork` performance is explicitly secondary to correctness and
+   architectural shape.
+
+## Immediate critical path
+
+### R1. Freeze boundaries and stop growth `[~]`
+
+Goal:
+
+- Stop `starnix` from continuing to grow as one large executive file.
+- Freeze the architectural split before more Linux slices land.
+
+Work:
+
+- Treat `references/50_STARNIX_EXEC_MODEL.md` as the frozen kernel/userspace
+  split.
+- Stop adding features that deepen the current `starnix.rs` monolith unless
+  they directly help the refactor.
+- Use the following standing rule:
+  Starnix work now defaults to "split responsibilities and add semantic tests"
+  before "add more syscall surface".
+
+Exit criteria:
+
+- The architectural split and narrow-waist rules are documented and treated as
+  active constraints during review.
+- New Starnix changes stop broadening the monolith by default.
+
+### R2. In-crate modularization and bootstrap-path demotion `[ ]`
+
+Goal:
+
+- Split the current monolith into stable internal layers without changing
+  external behavior or workspace shape.
+
+Work:
+
+- Replace `user/nexus-init/src/starnix.rs` with `user/nexus-init/src/starnix/`.
+- Keep one crate for now.
+- Target internal layout:
+
+```text
+user/nexus-init/src/starnix/
+  mod.rs
+
+  substrate/
+    guest.rs
+    packet_loop.rs
+    restart.rs
+
+  task/
+    task.rs
+    thread_group.rs
+    process_group.rs
+    session.rs
+    wait.rs
+    exit.rs
+
+  signal/
+    action.rs
+    queue.rs
+    delivery.rs
+    signalfd.rs
+
+  mm/
+    elf.rs
+    stack.rs
+    tls.rs
+    auxv.rs
+    mmap.rs
+    exec.rs
+    fork.rs
+
+  fs/
+    fd.rs
+    file_description.rs
+    namespace.rs
+    mount.rs
+    procfs.rs
+    anon_inode.rs
+    unix.rs
+
+  poll/
+    epoll.rs
+    readiness.rs
+
+  sys/
+    table.rs
+    fs.rs
+    process.rs
+    signal.rs
+    mm.rs
+    poll.rs
+    futex.rs
+    net.rs
+```
+
+- Keep `sys/` thin: decode guest registers, call semantic objects, write back
+  stop-state results.
+- Demote `payload_path_for` / `payload_bytes_for` and similar bootstrap tables
+  to test-only or bootstrap-smoke-only mechanisms.
+- Keep production exec/image load paths namespace-backed.
+
+Exit criteria:
+
+- `starnix.rs` is no longer a monolithic file.
+- Production exec flow no longer depends on embedded payload lookup helpers.
+- `sys/` is visibly a dispatch layer rather than the main semantic home.
+
+### R3. Generic supervised guest substrate and blocking-op model `[ ]`
+
+Goal:
+
+- Introduce one narrow substrate layer between Linux semantics and raw Axle
+  guest/VM/wait primitives.
+- Replace ad-hoc per-syscall blocking logic with one restart discipline.
+
+Work:
+
+- Extract a generic supervised guest substrate that owns:
+  guest session, sidecar, guest memory r/w, resume, syscall completion, and
+  packet demux.
+- Promote `WaitState` / `WaitKind` into a first-class blocked-operation model.
+- Make all blocking Linux syscalls converge on one protocol:
+  `start -> Ready / Blocked / Interrupted`,
+  `resume -> Ready / StillBlocked / Restart`.
+- Preserve the current synthetic-object direction for
+  `eventfd`, `timerfd`, `signalfd`, and `pidfd`.
+- Systematize those objects behind a shared synthetic waitable / readiness
+  bridge so `epoll` depends only on wait registration plus readiness
+  translation.
+
+Exit criteria:
+
+- Starnix semantic code no longer talks directly to scattered raw
+  `ax_guest_session_*` helpers.
+- `epoll`, `wait4`, futex, blocking fd I/O, and message I/O all flow through
+  one restart discipline.
+- Synthetic waitable fds share one common integration path with `epoll`.
+
+### R4. Semantic core objectization and tests `[ ]`
+
+Goal:
+
+- Turn the executive into explicit Linux semantic objects that can be tested in
+  isolation.
+
+Work:
+
+- Replace the current "big resource bag" shape with explicit semantic objects:
+  - `TaskModel`
+  - `SignalModel`
+  - `MmContext`
+  - `FsContext`
+- Keep Starnix centered on one shared Linux environment rather than per-binary
+  bootstrap glue.
+- Add host-side semantic tests for at least:
+  - `dup` / `dup2` / `dup3` open-file-description sharing
+  - process-group / session / `wait4` target matching
+  - signal interrupt / restart / `rt_sigreturn`
+  - `epoll` interactions with synthetic waitables
+  - `fork` / `execve` mm, fd, and signal inheritance/reset behavior
+- Keep smoke binaries and conformance scenarios as integration coverage on top
+  of those semantic tests.
+
+Exit criteria:
+
+- Each major Linux semantic subsystem has focused unit tests.
+- Starnix behavior can be reasoned about without booting a guest payload.
+- Shared-environment semantics are primary in the code structure.
+
+### R5. Post-freeze extraction and performance follow-on `[ ]`
+
+Goal:
+
+- Only after semantic boundaries stabilize, extract crates and pursue the more
+  expensive VM/performance follow-on work.
+
+Work:
+
+- Consider extracting stable internal layers into dedicated crates:
+  - `crates/nexus-starnix-substrate`
+  - `crates/nexus-starnix-core`
+  - `crates/nexus-starnix-mm`
+  - `crates/nexus-starnix-fs`
+- Continue VM and Starnix follow-on on top of stable boundaries:
+  - pager-backed and file-backed VMO externalization
+  - generic MM clone helper
+  - better `fork`
+  - broader Linux fs/socket/signal semantics
+
+Exit criteria:
+
+- Crate boundaries reflect semantic boundaries rather than temporary file size.
+- Performance work no longer forces major architectural reshaping.
+
+## Semantic test inventory
+
+The near-term Starnix test gate should grow around semantic objects, not only
+around guest smoke binaries.
+
+Priority test families:
+
+- task/process/session/process-group identity and wait semantics
+- Linux signal queueing, interruption, restart, and return
+- `MmContext` exec/fork inheritance and reset rules
+- Linux file-description sharing and descriptor-table operations
+- `epoll` level/edge behavior across native and synthetic waitables
+- procfs and anon-inode behavior that projects executive state into fd-visible
+  objects
+
+## Deferred but still important
+
+These remain real project tasks, but they are outside the immediate Starnix
+architecture-freeze loop:
+
+- external revocation / job / policy tree
+- device-facing VM primitives and interrupt objects for DFv2
+- user-mode L1 scheduler
+- broader FIDL/runtime/component follow-on
+- real DataFS implementation beyond the current model/checker
+
+## Practical sequencing
+
+If the immediate goal is "turn the current Starnix bootstrap into a maintainable
+system with the least detour", the rough order is:
+
+1. Freeze boundaries and stop monolith growth.
+2. Split `starnix.rs` into internal layers while keeping one crate.
+3. Introduce the guest substrate and unified blocked-op model.
+4. Add semantic-object tests and make them a real gate.
+5. Only then extract crates and optimize the slower paths.
 
 ## Notes For Agents
 
-- The first substrate-closing pass is in; the next priorities are the outer runtime layers and
-  remaining IPC hardening.
-- B1/B2 are not the shortest path to a demo, but delaying them too far can create later refactors.
-- C3 and E2 matter more for DFv2 than for the earliest Starnix-facing work.
-- D1 is one of the main remaining gaps between the current channel implementation and the full roadmap design.
+- Do not treat "more syscall coverage" as the default next step.
+- Prefer semantic tests over new smoke binaries unless integration coverage is
+  the missing piece.
+- Prefer internal module boundaries before workspace/crate boundaries.
+- Do not widen `nexus-io` into a Linux VFS.
+- Do not add Linux-only Axle objects to simplify Starnix work.
