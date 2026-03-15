@@ -229,6 +229,21 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - no `arch_prctl` subcommands beyond `ARCH_SET_FS` / `ARCH_GET_FS`
     - no shared-object TLS dependency graph beyond the resolved interpreter
     - no final ELF TLS model or libc TLS runtime contract yet
+  - the next dynamic-userspace slice now also has:
+    - one real glibc-linked PIE hello payload running through the packaged
+      `ld-linux` + `libc.so.6` bootstrap path
+    - loader-driven `MAP_FIXED` remaps of file-backed segments, including:
+      - read-only / executable fixed remaps over reserved file mappings
+      - one narrow `MAP_PRIVATE | PROT_WRITE` file-backed path implemented as a
+        private anonymous copy seeded from the source file VMO
+    - one executive-side protectability view for main-image writable segments
+      that are created by the native exec helper instead of the generic `mmap`
+      control plane, so loader `mprotect` for main-image RELRO can succeed
+    - the current implementation intentionally keeps that protectability slice
+      narrow:
+      - it tracks only writable exec-image ranges that sit outside the normal
+        Linux `mmap` arena
+      - it does not claim full exec-image `munmap` / remap parity yet
 
 ## Frozen architectural split
 

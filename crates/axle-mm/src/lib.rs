@@ -1108,6 +1108,13 @@ impl Vma {
     fn contains(self, va: u64) -> bool {
         va >= self.base && va < self.end()
     }
+
+    fn contains_range(self, base: u64, len: u64) -> bool {
+        let Some(end) = base.checked_add(len) else {
+            return false;
+        };
+        base >= self.base && end <= self.end()
+    }
 }
 
 /// Result of resolving a virtual address back to its VMA and VMO metadata.
@@ -2531,11 +2538,19 @@ impl AddressSpace {
             .vmas
             .iter()
             .position(|vma| vma.vmar_id == vmar_id && vma.base == base && vma.len == len)
+            .or_else(|| {
+                self.vmas
+                    .iter()
+                    .position(|vma| vma.vmar_id == vmar_id && vma.contains_range(base, len))
+            })
             .ok_or(AddressSpaceError::NotFound)?;
         let vma = self.vmas[index];
         let map_rec = self
             .map_record(vma.map_id)
             .ok_or(AddressSpaceError::NotFound)?;
+        if map_rec.base() != base || map_rec.len() != len {
+            return self.unmap_subrange_in_single_vma(frames, index, map_rec, vma, base, len);
+        }
         let vmo = self
             .vmo(map_rec.vmo_id())
             .ok_or(AddressSpaceError::InvalidVmo)?;
@@ -2588,6 +2603,7 @@ impl AddressSpace {
     /// Change permissions on an existing mapping without changing its extent.
     pub fn protect_in_vmar(
         &mut self,
+        frames: &mut FrameTable,
         vmar_id: VmarId,
         base: u64,
         len: u64,
@@ -2597,17 +2613,28 @@ impl AddressSpace {
         let index = self
             .vmas
             .iter()
-            .find(|vma| vma.vmar_id == vmar_id && vma.base == base && vma.len == len)
-            .map(|vma| vma.map_id)
+            .position(|vma| vma.vmar_id == vmar_id && vma.base == base && vma.len == len)
+            .or_else(|| {
+                self.vmas
+                    .iter()
+                    .position(|vma| vma.vmar_id == vmar_id && vma.contains_range(base, len))
+            })
             .ok_or(AddressSpaceError::NotFound)?;
-        let map_rec = self.map_record(index).ok_or(AddressSpaceError::NotFound)?;
+        let vma = self.vmas[index];
+        let map_rec = self
+            .map_record(vma.map_id)
+            .ok_or(AddressSpaceError::NotFound)?;
         if !map_rec.max_perms().contains(new_perms) {
             return Err(AddressSpaceError::PermissionIncrease);
+        }
+        if map_rec.base() != base || map_rec.len() != len {
+            return self
+                .protect_subrange_in_single_vma(frames, index, map_rec, vma, base, len, new_perms);
         }
         let vma = self
             .vmas
             .iter_mut()
-            .find(|vma| vma.map_id == index)
+            .find(|vma| vma.map_id == map_rec.id())
             .ok_or(AddressSpaceError::NotFound)?;
         vma.perms = new_perms;
         let logical_write = new_perms.contains(MappingPerms::WRITE);
@@ -2618,14 +2645,298 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Change permissions on one existing root-VMAR mapping.
-    pub fn protect(
+    fn unmap_subrange_in_single_vma(
         &mut self,
+        frames: &mut FrameTable,
+        vma_index: usize,
+        map_rec: MapRec,
+        vma: Vma,
+        base: u64,
+        len: u64,
+    ) -> Result<(), AddressSpaceError> {
+        let end = base
+            .checked_add(len)
+            .ok_or(AddressSpaceError::InvalidArgs)?;
+        let left_len = base - map_rec.base();
+        let right_len = map_rec.end() - end;
+        let left_nodes = if left_len != 0 {
+            Some(self.collect_segment_nodes(
+                frames,
+                map_rec,
+                map_rec.base(),
+                left_len,
+                map_rec.id(),
+                false,
+            )?)
+        } else {
+            None
+        };
+        self.remove_segment_nodes(frames, map_rec, base, len)?;
+        let right_map_id = if right_len != 0 {
+            Some(self.alloc_map_id())
+        } else {
+            None
+        };
+        let right_nodes = if let Some(right_map_id) = right_map_id {
+            Some(self.collect_segment_nodes(frames, map_rec, end, right_len, right_map_id, true)?)
+        } else {
+            None
+        };
+        self.remove_mapping_metadata(vma_index, map_rec, vma)?;
+        if let Some(nodes) = left_nodes {
+            self.install_split_segment(
+                map_rec.id(),
+                map_rec,
+                vma,
+                map_rec.base(),
+                left_len,
+                vma.perms,
+                nodes,
+            )?;
+        }
+        if let (Some(right_map_id), Some(nodes)) = (right_map_id, right_nodes) {
+            self.install_split_segment(
+                right_map_id,
+                map_rec,
+                vma,
+                end,
+                right_len,
+                vma.perms,
+                nodes,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn protect_subrange_in_single_vma(
+        &mut self,
+        frames: &mut FrameTable,
+        vma_index: usize,
+        map_rec: MapRec,
+        vma: Vma,
         base: u64,
         len: u64,
         new_perms: MappingPerms,
     ) -> Result<(), AddressSpaceError> {
-        self.protect_in_vmar(self.root.vmar.id, base, len, new_perms)
+        let end = base
+            .checked_add(len)
+            .ok_or(AddressSpaceError::InvalidArgs)?;
+        let left_len = base - map_rec.base();
+        let right_len = map_rec.end() - end;
+        let left_nodes = if left_len != 0 {
+            Some(self.collect_segment_nodes(
+                frames,
+                map_rec,
+                map_rec.base(),
+                left_len,
+                map_rec.id(),
+                false,
+            )?)
+        } else {
+            None
+        };
+        let middle_map_id = if left_len == 0 {
+            map_rec.id()
+        } else {
+            self.alloc_map_id()
+        };
+        let middle_nodes =
+            self.collect_segment_nodes(frames, map_rec, base, len, middle_map_id, left_len != 0)?;
+        let right_map_id = if right_len != 0 {
+            Some(self.alloc_map_id())
+        } else {
+            None
+        };
+        let right_nodes = if let Some(right_map_id) = right_map_id {
+            Some(self.collect_segment_nodes(frames, map_rec, end, right_len, right_map_id, true)?)
+        } else {
+            None
+        };
+        self.remove_mapping_metadata(vma_index, map_rec, vma)?;
+        if let Some(nodes) = left_nodes {
+            self.install_split_segment(
+                map_rec.id(),
+                map_rec,
+                vma,
+                map_rec.base(),
+                left_len,
+                vma.perms,
+                nodes,
+            )?;
+        }
+        self.install_split_segment(
+            middle_map_id,
+            map_rec,
+            vma,
+            base,
+            len,
+            new_perms,
+            middle_nodes,
+        )?;
+        if let (Some(right_map_id), Some(nodes)) = (right_map_id, right_nodes) {
+            self.install_split_segment(
+                right_map_id,
+                map_rec,
+                vma,
+                end,
+                right_len,
+                vma.perms,
+                nodes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn collect_segment_nodes(
+        &mut self,
+        frames: &mut FrameTable,
+        map_rec: MapRec,
+        base: u64,
+        len: u64,
+        map_id: MapId,
+        reanchor: bool,
+    ) -> Result<Vec<Option<RmapNodeId>>, AddressSpaceError> {
+        let vmo = self
+            .vmo(map_rec.vmo_id())
+            .ok_or(AddressSpaceError::InvalidVmo)?;
+        let page_count =
+            usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
+        let mut nodes = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let page_base = base + (page_index as u64) * PAGE_SIZE;
+            let page_offset = map_rec
+                .vmo_offset()
+                .checked_add(page_base - map_rec.base())
+                .ok_or(AddressSpaceError::InvalidArgs)?;
+            let Some(frame_id) = vmo.frame_at_offset(page_offset) else {
+                nodes.push(None);
+                continue;
+            };
+            let node_id = self
+                .rmap_node_at(page_base)
+                .ok_or(AddressSpaceError::FrameTable(
+                    FrameTableError::MissingAnchor,
+                ))?;
+            if reanchor {
+                frames
+                    .unmap_frame(frame_id, node_id)
+                    .map_err(AddressSpaceError::FrameTable)?;
+                let new_node = frames
+                    .map_frame(frame_id, self.make_rmap_anchor(map_id, page_index as u64))
+                    .map_err(AddressSpaceError::FrameTable)?;
+                nodes.push(Some(new_node));
+            } else {
+                nodes.push(Some(node_id));
+            }
+        }
+        Ok(nodes)
+    }
+
+    fn remove_segment_nodes(
+        &mut self,
+        frames: &mut FrameTable,
+        map_rec: MapRec,
+        base: u64,
+        len: u64,
+    ) -> Result<(), AddressSpaceError> {
+        let vmo = self
+            .vmo(map_rec.vmo_id())
+            .ok_or(AddressSpaceError::InvalidVmo)?;
+        let page_count =
+            usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
+        for page_index in 0..page_count {
+            let page_base = base + (page_index as u64) * PAGE_SIZE;
+            let page_offset = map_rec
+                .vmo_offset()
+                .checked_add(page_base - map_rec.base())
+                .ok_or(AddressSpaceError::InvalidArgs)?;
+            let Some(frame_id) = vmo.frame_at_offset(page_offset) else {
+                continue;
+            };
+            let node_id = self
+                .rmap_node_at(page_base)
+                .ok_or(AddressSpaceError::FrameTable(
+                    FrameTableError::MissingAnchor,
+                ))?;
+            frames
+                .unmap_frame(frame_id, node_id)
+                .map_err(AddressSpaceError::FrameTable)?;
+        }
+        Ok(())
+    }
+
+    fn remove_mapping_metadata(
+        &mut self,
+        vma_index: usize,
+        map_rec: MapRec,
+        vma: Vma,
+    ) -> Result<(), AddressSpaceError> {
+        self.vmas.remove(vma_index);
+        let map_index = self
+            .map_recs
+            .iter()
+            .position(|candidate| candidate.id == map_rec.id())
+            .ok_or(AddressSpaceError::NotFound)?;
+        self.map_recs.remove(map_index);
+        self.pte_meta.clear_range(vma.base, vma.len)?;
+        self.rmap_index.clear_range(vma.base, vma.len)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_split_segment(
+        &mut self,
+        map_id: MapId,
+        source: MapRec,
+        vma: Vma,
+        base: u64,
+        len: u64,
+        perms: MappingPerms,
+        nodes: Vec<Option<RmapNodeId>>,
+    ) -> Result<(), AddressSpaceError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let map_rec = MapRec {
+            id: map_id,
+            vmar_id: source.vmar_id(),
+            base,
+            len,
+            vmo_id: source.vmo_id(),
+            global_vmo_id: source.global_vmo_id(),
+            vmo_offset: source
+                .vmo_offset()
+                .checked_add(base - source.base())
+                .ok_or(AddressSpaceError::InvalidArgs)?,
+            max_perms: source.max_perms(),
+        };
+        let vma = Vma {
+            map_id,
+            vmar_id: vma.vmar_id,
+            base,
+            len,
+            perms,
+            copy_on_write: vma.copy_on_write,
+        };
+        let page_meta = self.build_pte_meta_range(map_rec, vma)?;
+        self.pte_meta.install_range(base, &page_meta)?;
+        self.rmap_index.install_range(base, &nodes)?;
+        self.map_recs.push(map_rec);
+        self.vmas.push(vma);
+        self.vmas.sort_by_key(|entry| entry.base);
+        Ok(())
+    }
+
+    /// Change permissions on one existing root-VMAR mapping.
+    pub fn protect(
+        &mut self,
+        frames: &mut FrameTable,
+        base: u64,
+        len: u64,
+        new_perms: MappingPerms,
+    ) -> Result<(), AddressSpaceError> {
+        self.protect_in_vmar(frames, self.root.vmar.id, base, len, new_perms)
     }
 
     /// Arm an existing mapped range for copy-on-write handling.
@@ -3759,6 +4070,33 @@ mod tests {
         (space, frames, code_frame, data_frame)
     }
 
+    fn sample_large_space() -> (AddressSpace, FrameTable, [FrameId; 3]) {
+        let mut frames = FrameTable::new();
+        let frame0 = frames.register_existing(0x50_000).unwrap();
+        let frame1 = frames.register_existing(0x51_000).unwrap();
+        let frame2 = frames.register_existing(0x52_000).unwrap();
+
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let vmo = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE * 3, global_vmo_id(30))
+            .unwrap();
+        space.bind_vmo_frame(vmo, 0, frame0).unwrap();
+        space.bind_vmo_frame(vmo, PAGE_SIZE, frame1).unwrap();
+        space.bind_vmo_frame(vmo, PAGE_SIZE * 2, frame2).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE * 3,
+                vmo,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+        (space, frames, [frame0, frame1, frame2])
+    }
+
     #[test]
     fn lookup_reports_vmo_offset_perms_and_frame() {
         let (space, frames, code_frame, _) = sample_space();
@@ -3825,6 +4163,7 @@ mod tests {
         assert_eq!(
             space
                 .protect_in_vmar(
+                    &mut frames,
                     space.root_vmar().id(),
                     child.base(),
                     PAGE_SIZE,
@@ -3885,6 +4224,60 @@ mod tests {
                 MappingPerms::READ | MappingPerms::USER,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn protect_subrange_of_single_vma_splits_metadata() {
+        let (mut space, mut frames, _frames) = sample_large_space();
+
+        space
+            .protect(
+                &mut frames,
+                ROOT_BASE + PAGE_SIZE,
+                PAGE_SIZE,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+
+        let left = space.lookup(ROOT_BASE).unwrap();
+        let middle = space.lookup(ROOT_BASE + PAGE_SIZE).unwrap();
+        let right = space.lookup(ROOT_BASE + PAGE_SIZE * 2).unwrap();
+
+        assert_eq!(left.mapping_base(), ROOT_BASE);
+        assert_eq!(left.mapping_len(), PAGE_SIZE);
+        assert_eq!(
+            left.perms(),
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER
+        );
+
+        assert_eq!(middle.mapping_base(), ROOT_BASE + PAGE_SIZE);
+        assert_eq!(middle.mapping_len(), PAGE_SIZE);
+        assert_eq!(middle.perms(), MappingPerms::READ | MappingPerms::USER);
+
+        assert_eq!(right.mapping_base(), ROOT_BASE + PAGE_SIZE * 2);
+        assert_eq!(right.mapping_len(), PAGE_SIZE);
+        assert_eq!(
+            right.perms(),
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER
+        );
+    }
+
+    #[test]
+    fn unmap_subrange_of_single_vma_splits_metadata() {
+        let (mut space, mut frames, _frames) = sample_large_space();
+
+        space
+            .unmap(&mut frames, ROOT_BASE + PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+
+        let left = space.lookup(ROOT_BASE).unwrap();
+        let right = space.lookup(ROOT_BASE + PAGE_SIZE * 2).unwrap();
+
+        assert_eq!(left.mapping_base(), ROOT_BASE);
+        assert_eq!(left.mapping_len(), PAGE_SIZE);
+        assert!(space.lookup(ROOT_BASE + PAGE_SIZE).is_none());
+        assert_eq!(right.mapping_base(), ROOT_BASE + PAGE_SIZE * 2);
+        assert_eq!(right.mapping_len(), PAGE_SIZE);
     }
 
     #[test]
@@ -4289,6 +4682,7 @@ mod tests {
         let data_base = ROOT_BASE + PAGE_SIZE;
         space
             .protect(
+                &mut frames,
                 data_base,
                 PAGE_SIZE,
                 MappingPerms::READ | MappingPerms::USER,
@@ -4300,6 +4694,7 @@ mod tests {
         );
         assert_eq!(
             space.protect(
+                &mut frames,
                 data_base,
                 PAGE_SIZE,
                 MappingPerms::EXECUTE | MappingPerms::USER
@@ -4324,6 +4719,7 @@ mod tests {
 
         space
             .protect(
+                &mut frames,
                 data_base,
                 PAGE_SIZE,
                 MappingPerms::READ | MappingPerms::USER,
@@ -4335,6 +4731,7 @@ mod tests {
 
         space
             .protect(
+                &mut frames,
                 data_base,
                 PAGE_SIZE,
                 MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
@@ -4747,6 +5144,7 @@ mod tests {
 
         space
             .protect(
+                &mut frames,
                 ROOT_BASE,
                 PAGE_SIZE,
                 MappingPerms::READ | MappingPerms::USER,
@@ -4754,6 +5152,7 @@ mod tests {
             .unwrap();
         space
             .protect(
+                &mut frames,
                 ROOT_BASE + PAGE_SIZE,
                 PAGE_SIZE,
                 MappingPerms::READ | MappingPerms::USER,

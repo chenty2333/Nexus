@@ -94,6 +94,11 @@ Current object/syscall paths support:
 - VMO read / write / resize
 - VMAR allocate / destroy
 - VMAR map / unmap / protect
+- one narrow subrange split path for `unmap` / `protect`:
+  - one exact-range fast path still exists for whole-mapping operations
+  - one single-covering-VMA subrange path now exists for dynamic-loader style
+    `MAP_FIXED` / `mprotect` surgery inside one larger mapping
+  - multi-VMA range surgery is still intentionally out of scope
 - execute-capable VMAR map / protect when VMAR caps and handle rights allow it
 
 The metadata layer also validates overlap, mapping range, resize legality, and VMAR subtree ownership.

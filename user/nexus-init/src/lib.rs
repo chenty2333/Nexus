@@ -40,6 +40,7 @@ use crate::lifecycle::{
     read_controller_request_blocking, run_controller_lifecycle_step, send_controller_event,
     send_status_event,
 };
+
 use crate::namespace::{CapabilityRegistry, build_namespace_entries, publish_protocols};
 use crate::resolver::{ResolverRegistry, resolve_root_child};
 use crate::runner::{ElfRunner, RunnerRegistry, StarnixRunner};
@@ -48,7 +49,7 @@ use crate::services::{BootAssetEntry, BootstrapNamespace, run_socket_fd_smoke, r
 // Keep this bootstrap shared-slot VA in sync with
 // `kernel/axle-kernel/src/userspace.rs`.
 const USER_PAGE_BYTES: u64 = 0x1000;
-const USER_CODE_PAGE_COUNT: u64 = 1024;
+const USER_CODE_PAGE_COUNT: u64 = 4096;
 const USER_CODE_BASE: u64 = 0x0000_0001_0000_0000;
 const USER_SHARED_BASE: u64 = USER_CODE_BASE + (USER_PAGE_BYTES * USER_CODE_PAGE_COUNT);
 const SLOT_OK: usize = 0;
@@ -200,6 +201,10 @@ const ROOT_DECL_STARNIX_DYNAMIC_PIE_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_dynamic_pie.nxcd"
 ));
+const ROOT_DECL_STARNIX_GLIBC_HELLO_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_glibc_hello.nxcd"
+));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
@@ -342,6 +347,11 @@ pub(crate) const LINUX_DYNAMIC_PIE_SMOKE_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_dynamic_pie_smoke.nxcd"));
 #[cfg(not(nexus_init_embed_starnix_dynamic_pie))]
 pub(crate) const LINUX_DYNAMIC_PIE_SMOKE_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_glibc_hello)]
+pub(crate) const LINUX_GLIBC_HELLO_DECL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux_glibc_hello.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_glibc_hello))]
+pub(crate) const LINUX_GLIBC_HELLO_DECL_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_hello)]
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
@@ -507,6 +517,21 @@ pub(crate) const LINUX_DYNAMIC_PIE_INTERP_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ld-nexus-dynamic-runtime.so"));
 #[cfg(not(nexus_init_embed_starnix_dynamic_pie))]
 pub(crate) const LINUX_DYNAMIC_PIE_INTERP_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_glibc_hello)]
+pub(crate) const LINUX_GLIBC_HELLO_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-glibc-hello"));
+#[cfg(not(nexus_init_embed_starnix_glibc_hello))]
+pub(crate) const LINUX_GLIBC_HELLO_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_glibc_hello)]
+pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ld-nexus-glibc.so"));
+#[cfg(not(nexus_init_embed_starnix_glibc_hello))]
+pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_glibc_hello)]
+pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/libc.so.6"));
+#[cfg(not(nexus_init_embed_starnix_glibc_hello))]
+pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_BYTES: &[u8] = &[];
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
@@ -552,6 +577,9 @@ pub(crate) const LINUX_DYNAMIC_RUNTIME_INTERP_BINARY_PATH: &str = "lib/ld-nexus-
 pub(crate) const LINUX_DYNAMIC_PIE_SMOKE_BINARY_PATH: &str = "bin/linux-dynamic-pie-smoke";
 pub(crate) const LINUX_DYNAMIC_PIE_MAIN_BINARY_PATH: &str = "bin/linux-dynamic-pie-main";
 pub(crate) const LINUX_DYNAMIC_PIE_INTERP_BINARY_PATH: &str = "lib/ld-nexus-dynamic-runtime.so";
+pub(crate) const LINUX_GLIBC_HELLO_BINARY_PATH: &str = "bin/linux-glibc-hello";
+pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_BINARY_PATH: &str = "lib/ld-nexus-glibc.so";
+pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_BINARY_PATH: &str = "lib/libc.so.6";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -590,11 +618,12 @@ const STARNIX_DYNAMIC_ELF_EXPECTED_STDOUT: &[u8] = b"dynamic interp ok\n";
 const STARNIX_DYNAMIC_TLS_EXPECTED_STDOUT: &[u8] = b"dynamic tls ok\n";
 const STARNIX_DYNAMIC_RUNTIME_EXPECTED_STDOUT: &[u8] = b"dynamic runtime ok\n";
 const STARNIX_DYNAMIC_PIE_EXPECTED_STDOUT: &[u8] = b"dynamic pie ok\n";
+const STARNIX_GLIBC_HELLO_EXPECTED_STDOUT: &[u8] = b"glibc hello\n";
 
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
 
-const HEAP_BYTES: usize = 512 * 1024;
+const HEAP_BYTES: usize = 4 * 1024 * 1024;
 static mut HEAP: HeapStorage = HeapStorage([0; HEAP_BYTES]);
 static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
 static ROLE: AtomicUsize = AtomicUsize::new(ROLE_NONE);
@@ -956,6 +985,20 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             LINUX_DYNAMIC_PIE_INTERP_BYTES,
         ));
     }
+    if !LINUX_GLIBC_HELLO_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_GLIBC_HELLO_BINARY_PATH,
+            LINUX_GLIBC_HELLO_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_GLIBC_RUNTIME_INTERP_BINARY_PATH,
+            LINUX_GLIBC_RUNTIME_INTERP_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_GLIBC_RUNTIME_LIBC_BINARY_PATH,
+            LINUX_GLIBC_RUNTIME_LIBC_BYTES,
+        ));
+    }
     assets.push(BootAssetEntry::bytes(
         "manifests/root.nxcd",
         ROOT_DECL_EAGER_BYTES,
@@ -1063,6 +1106,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-dynamic-pie.nxcd",
         ROOT_DECL_STARNIX_DYNAMIC_PIE_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-glibc-hello.nxcd",
+        ROOT_DECL_STARNIX_GLIBC_HELLO_BYTES,
     ));
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
@@ -1212,6 +1259,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-dynamic-pie-smoke.nxcd",
             LINUX_DYNAMIC_PIE_SMOKE_DECL_BYTES,
+        ));
+    }
+    if !LINUX_GLIBC_HELLO_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-glibc-hello.nxcd",
+            LINUX_GLIBC_HELLO_DECL_BYTES,
         ));
     }
     assets.push(BootAssetEntry::bytes(
@@ -1562,6 +1615,16 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             &runners,
             "linux_dynamic_pie_smoke",
             STARNIX_DYNAMIC_PIE_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-glibc-hello" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_glibc_hello",
+            STARNIX_GLIBC_HELLO_EXPECTED_STDOUT,
             summary,
         );
     }

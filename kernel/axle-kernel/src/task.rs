@@ -2985,12 +2985,14 @@ impl AddressSpace {
 
     fn protect(
         &mut self,
+        frames: &mut FrameTable,
         vmar_id: VmarId,
         base: u64,
         len: u64,
         new_perms: MappingPerms,
     ) -> Result<(), AddressSpaceError> {
-        self.vm.protect_in_vmar(vmar_id, base, len, new_perms)
+        self.vm
+            .protect_in_vmar(frames, vmar_id, base, len, new_perms)
     }
 
     fn resolve_cow_fault(
@@ -3188,6 +3190,7 @@ struct Thread {
     process_id: ProcessId,
     koid: zx_koid_t,
     guest_fs_base: u64,
+    fpu_state: crate::arch::fpu::FxState,
     state: ThreadState,
     queued_on_cpu: Option<usize>,
     last_cpu: usize,
@@ -3449,6 +3452,7 @@ impl Kernel {
                 process_id,
                 koid: thread_koid,
                 guest_fs_base: 0,
+                fpu_state: crate::arch::fpu::clean_state(),
                 state: ThreadState::Runnable,
                 queued_on_cpu: None,
                 last_cpu: bootstrap_cpu_id,
@@ -4228,6 +4232,7 @@ impl Kernel {
             .threads
             .get_mut(&current_thread_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
+        crate::arch::fpu::save_current(&mut thread.fpu_state);
         thread.guest_fs_base = context.fs_base;
         thread.context = Some(context);
         Ok(())
@@ -4322,7 +4327,13 @@ impl Kernel {
         trap: &mut crate::arch::int80::TrapFrame,
         cpu_frame: *mut u64,
     ) -> Result<(), zx_status_t> {
-        let context = self.current_thread()?.context.ok_or(ZX_ERR_BAD_STATE)?;
+        let current_thread_id = self.current_thread_id()?;
+        let thread = self
+            .threads
+            .get(&current_thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        crate::arch::fpu::restore_current(&thread.fpu_state);
+        let context = thread.context.ok_or(ZX_ERR_BAD_STATE)?;
         context.restore(trap, cpu_frame)
     }
 
@@ -4729,6 +4740,7 @@ impl Kernel {
                 process_id,
                 koid,
                 guest_fs_base: 0,
+                fpu_state: crate::arch::fpu::clean_state(),
                 state: ThreadState::New,
                 queued_on_cpu: None,
                 last_cpu: current_cpu_id,
@@ -5677,7 +5689,9 @@ impl Kernel {
         let Some(thread_id) = self.pop_runnable_thread() else {
             return Ok(None);
         };
-        self.activate_thread_on_current_cpu(thread_id).map(Some)
+        let context = self.activate_thread_on_current_cpu(thread_id)?;
+        self.restore_thread_fpu_state(thread_id)?;
+        Ok(Some(context))
     }
 
     fn switch_to_thread(
@@ -5687,7 +5701,14 @@ impl Kernel {
         cpu_frame: *mut u64,
     ) -> Result<(), zx_status_t> {
         let context = self.activate_thread_on_current_cpu(thread_id)?;
+        self.restore_thread_fpu_state(thread_id)?;
         context.restore(trap, cpu_frame)?;
+        Ok(())
+    }
+
+    fn restore_thread_fpu_state(&self, thread_id: ThreadId) -> Result<(), zx_status_t> {
+        let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        crate::arch::fpu::restore_current(&thread.fpu_state);
         Ok(())
     }
 
@@ -7802,14 +7823,18 @@ impl VmDomain {
         perms: MappingPerms,
     ) -> Result<TlbCommitReq, zx_status_t> {
         let strict = self.protect_requires_strict_sync(address_space_id, addr, len, perms)?;
+        let frames_handle = self.frame_table();
         let address_space = self
             .address_spaces
             .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
-        address_space
-            .protect(vmar_id, addr, len, perms)
-            .map_err(map_address_space_error)?;
+        {
+            let mut frames = frames_handle.lock();
+            address_space
+                .protect(&mut frames, vmar_id, addr, len, perms)
+                .map_err(map_address_space_error)?;
+        }
         self.update_mapping_pages(address_space_id, addr, len)?;
         Ok(if strict {
             TlbCommitReq::strict(address_space_id)

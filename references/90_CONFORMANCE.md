@@ -253,6 +253,19 @@ Main just targets include:
     - only one ET_EXEC-or-ET_DYN main image plus one ET_DYN interpreter image
     - no general shared-object TLS dependency graph
     - no final libc TLS relocation/runtime model yet
+- The next dynamic-userspace scenario now closes one real glibc bootstrap gate:
+  - one glibc-linked PIE hello payload started through the packaged
+    `ld-linux` + `libc.so.6` runtime path
+  - loader-driven file-backed `MAP_FIXED` remaps, including one writable
+    private segment seeded through the executive's narrow anonymous-copy path
+  - main-image RELRO `mprotect` succeeding even though the executable image
+    itself was installed through the native exec helper instead of the generic
+    `mmap` control plane
+  - the current gate intentionally keeps the slice narrow:
+    - one small real program rather than a general distro userspace claim
+    - no full shared-object dependency graph beyond `ld-linux` + `libc.so.6`
+    - no `vDSO` / `vvar`
+    - no `gs_base`
 - The next post-R7 libc/runtime scenario now closes one narrow cwd/fd-management
   slice:
   - `getcwd`
@@ -387,7 +400,7 @@ This makes contract coverage part of the repo workflow, not just informal docume
   `0x0100_0000` slot because the fixed 4 MiB bootstrap code backing lives in
   the same low-RAM identity map during bring-up; the higher slot keeps the raw
   QEMU loader image from being overwritten before the loader imports it.
-- The bootstrap code window above 4 GiB now spans 4 MiB, which keeps the
+- The bootstrap code window above 4 GiB now spans 16 MiB, which keeps the
   runtime dispatcher runner, current `nexus-init` manager images, and the
   shared summary pages from overlapping in the fixed bootstrap mapping.
 - Some bootstrap channel metrics currently come from a second structured summary line rather than

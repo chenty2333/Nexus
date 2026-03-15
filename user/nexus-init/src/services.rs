@@ -393,11 +393,20 @@ impl LocalFileFd {
         }
     }
 
-    fn read_all(&self) -> Vec<u8> {
+    fn read_only_bytes(&self) -> Option<&[u8]> {
         match &self.backing {
-            LocalFileBacking::ReadOnly(file) => file.bytes.unwrap_or(&[]).to_vec(),
-            LocalFileBacking::Mutable(file) => file.bytes.lock().clone(),
+            LocalFileBacking::ReadOnly(file) => Some(file.bytes.unwrap_or(&[])),
+            LocalFileBacking::Mutable(_) => None,
         }
+    }
+
+    fn read_all(&self) -> Vec<u8> {
+        self.read_only_bytes()
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_else(|| match &self.backing {
+                LocalFileBacking::ReadOnly(_) => Vec::new(),
+                LocalFileBacking::Mutable(file) => file.bytes.lock().clone(),
+            })
     }
 
     fn len(&self) -> usize {
@@ -433,8 +442,16 @@ impl LocalFileFd {
     }
 
     fn pread_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
-        let bytes = self.read_all();
         let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if let Some(bytes) = self.read_only_bytes() {
+            if start >= bytes.len() {
+                return Ok(0);
+            }
+            let actual = (bytes.len() - start).min(buffer.len());
+            buffer[..actual].copy_from_slice(&bytes[start..start + actual]);
+            return Ok(actual);
+        }
+        let bytes = self.read_all();
         if start >= bytes.len() {
             return Ok(0);
         }
@@ -466,9 +483,20 @@ impl FdOps for LocalFileFd {
     }
 
     fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
-        let bytes = self.read_all();
         let mut cursor = self.cursor.lock();
         let start = usize::try_from(*cursor).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if let Some(bytes) = self.read_only_bytes() {
+            if start >= bytes.len() {
+                return Ok(0);
+            }
+            let actual = (bytes.len() - start).min(buffer.len());
+            buffer[..actual].copy_from_slice(&bytes[start..start + actual]);
+            *cursor = cursor
+                .checked_add(u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)?)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            return Ok(actual);
+        }
+        let bytes = self.read_all();
         if start >= bytes.len() {
             return Ok(0);
         }

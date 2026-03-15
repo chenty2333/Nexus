@@ -239,7 +239,6 @@ pub(crate) fn handle_invalid_opcode_trap(
         let lifecycle_dirty = kernel.take_task_lifecycle_dirty();
         Ok((stop_seq, stop_state, disposition, lifecycle_dirty))
     })?;
-
     let encoded = stop_state.encode();
     state.with_vm_mut(|vm| vm.write_vmo_bytes(&session.sidecar_vmo, 0, &encoded))?;
     state.with_objects_mut(|objects| {

@@ -48,6 +48,7 @@ use libax::{
     ax_thread_create as zx_thread_create, ax_thread_get_guest_x64_fs_base,
     ax_thread_set_guest_x64_fs_base, ax_thread_start_guest, ax_timer_cancel,
     ax_timer_create_monotonic, ax_timer_set, ax_vmo_create as zx_vmo_create,
+    ax_vmo_read as zx_vmo_read, ax_vmo_write as zx_vmo_write,
 };
 use nexus_component::{ComponentStartInfo, NumberedHandle};
 use nexus_io::{
@@ -74,7 +75,10 @@ use crate::{
     LINUX_DYNAMIC_TLS_INTERP_BINARY_PATH, LINUX_DYNAMIC_TLS_INTERP_BYTES,
     LINUX_DYNAMIC_TLS_MAIN_BINARY_PATH, LINUX_DYNAMIC_TLS_MAIN_BYTES,
     LINUX_DYNAMIC_TLS_SMOKE_BINARY_PATH, LINUX_DYNAMIC_TLS_SMOKE_BYTES, LINUX_FD_SMOKE_BINARY_PATH,
-    LINUX_FD_SMOKE_BYTES, LINUX_FD_SMOKE_DECL_BYTES, LINUX_HELLO_BINARY_PATH, LINUX_HELLO_BYTES,
+    LINUX_FD_SMOKE_BYTES, LINUX_FD_SMOKE_DECL_BYTES, LINUX_GLIBC_HELLO_BINARY_PATH,
+    LINUX_GLIBC_HELLO_BYTES, LINUX_GLIBC_HELLO_DECL_BYTES, LINUX_GLIBC_RUNTIME_INTERP_BINARY_PATH,
+    LINUX_GLIBC_RUNTIME_INTERP_BYTES, LINUX_GLIBC_RUNTIME_LIBC_BINARY_PATH,
+    LINUX_GLIBC_RUNTIME_LIBC_BYTES, LINUX_HELLO_BINARY_PATH, LINUX_HELLO_BYTES,
     LINUX_HELLO_DECL_BYTES, LINUX_ROUND2_BINARY_PATH, LINUX_ROUND2_BYTES, LINUX_ROUND2_DECL_BYTES,
     LINUX_ROUND3_BINARY_PATH, LINUX_ROUND3_BYTES, LINUX_ROUND3_DECL_BYTES,
     LINUX_ROUND4_FUTEX_BINARY_PATH, LINUX_ROUND4_FUTEX_BYTES, LINUX_ROUND4_FUTEX_DECL_BYTES,
@@ -104,7 +108,7 @@ use crate::{
 const USER_PAGE_BYTES: u64 = 0x1000;
 // Keep this Linux guest bootstrap layout in sync with
 // `kernel/axle-kernel/src/userspace.rs`.
-const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * 1024;
+const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * 4096;
 const USER_SHARED_BYTES: u64 = USER_PAGE_BYTES * 2;
 const USER_STACK_BYTES: u64 = USER_PAGE_BYTES * 16;
 const USER_CODE_VA: u64 = 0x0000_0001_0000_0000;
@@ -122,6 +126,8 @@ const LINUX_SYSCALL_WRITE: u64 = 1;
 const LINUX_SYSCALL_CLOSE: u64 = 3;
 const LINUX_SYSCALL_FSTAT: u64 = 5;
 const LINUX_SYSCALL_LSEEK: u64 = 8;
+const LINUX_SYSCALL_READV: u64 = 19;
+const LINUX_SYSCALL_WRITEV: u64 = 20;
 const LINUX_SYSCALL_ACCESS: u64 = 21;
 const LINUX_SYSCALL_PREAD64: u64 = 17;
 const LINUX_SYSCALL_PWRITE64: u64 = 18;
@@ -387,7 +393,11 @@ const PT_PHDR: u32 = 6;
 const PT_TLS: u32 = 7;
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
-const X64_TLS_TCB_BYTES: u64 = 16;
+const X64_TLS_TCB_BYTES: u64 = 0x80;
+const X64_TLS_DTV_PREFIX_WORDS: u64 = 2;
+const X64_TLS_DTV_HEADER_WORDS: u64 = 2;
+const X64_TLS_DTV_WORDS_PER_MODULE: u64 = 2;
+const X64_TLS_DTV_MIN_MODULE_SLOTS: u64 = 4;
 const LINUX_AUX_PLATFORM: &[u8] = b"x86_64";
 const LINUX_AUX_CLKTCK: u64 = 100;
 const LINUX_AUX_HWCAP: u64 = 0;
@@ -504,6 +514,13 @@ struct LinuxMapEntry {
     backing: LinuxMapBacking,
 }
 
+#[derive(Clone, Copy)]
+struct LinuxProtectEntry {
+    base: u64,
+    len: u64,
+    prot: u64,
+}
+
 struct LinuxMm {
     root_vmar: zx_handle_t,
     heap_vmar: zx_handle_t,
@@ -514,6 +531,7 @@ struct LinuxMm {
     heap_mapped_len: u64,
     mmap_vmar: zx_handle_t,
     mmap_base: u64,
+    exec_tree: BTreeMap<u64, LinuxProtectEntry>,
     map_tree: BTreeMap<u64, LinuxMapEntry>,
 }
 
@@ -529,6 +547,7 @@ struct TaskImage {
     cmdline: Vec<u8>,
     exec_blob: Vec<u8>,
     initial_tls_modules: Vec<LinuxInitialTls>,
+    runtime_random: [u8; 16],
     writable_ranges: Vec<LinuxWritableRange>,
 }
 
@@ -2672,6 +2691,8 @@ impl StarnixKernel {
         match stop_state.regs.rax {
             LINUX_SYSCALL_READ => self.sys_read(task_id, stop_state),
             LINUX_SYSCALL_WRITE => self.sys_write(task_id, stop_state, stdout),
+            LINUX_SYSCALL_READV => self.sys_readv(task_id, stop_state),
+            LINUX_SYSCALL_WRITEV => self.sys_writev(task_id, stop_state, stdout),
             LINUX_SYSCALL_SENDMSG => self.sys_sendmsg(task_id, stop_state),
             LINUX_SYSCALL_RECVMSG => self.sys_recvmsg(task_id, stop_state),
             LINUX_SYSCALL_LSEEK => self.sys_lseek(task_id, stop_state),
@@ -4142,6 +4163,174 @@ impl StarnixKernel {
         }
     }
 
+    fn sys_readv(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let fd = linux_arg_i32(stop_state.regs.rdi);
+        let iov_addr = stop_state.regs.rsi;
+        let iov_len = linux_arg_i32(stop_state.regs.rdx);
+        let iovecs = match self.read_sys_iovecs(task_id, iov_addr, iov_len, stop_state)? {
+            Some(iovecs) => iovecs,
+            None => return Ok(SyscallAction::Resume),
+        };
+        let total_len = total_iovec_len(&iovecs).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        if total_len == 0 {
+            complete_syscall(stop_state, 0)?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let wait_policy = self.fd_wait_policy_for_op(task_id, fd, FdWaitOp::Read)?;
+
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_len)
+            .map_err(|_| ZX_ERR_NO_MEMORY)?;
+        bytes.resize(total_len, 0);
+        let attempt = {
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            match resources.fd_table.read(fd, &mut bytes) {
+                Ok(actual) => ReadAttempt::Ready { bytes, actual },
+                Err(ZX_ERR_SHOULD_WAIT) => ReadAttempt::WouldBlock(wait_policy),
+                Err(ZX_ERR_PEER_CLOSED) => ReadAttempt::Ready { bytes, actual: 0 },
+                Err(status) => ReadAttempt::Err(status),
+            }
+        };
+
+        match attempt {
+            ReadAttempt::Ready { bytes, actual } => {
+                let result = match write_guest_iovec_payload(session, &iovecs, &bytes[..actual]) {
+                    Ok(wrote) => u64::try_from(wrote).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                    Err(status) => linux_errno(map_guest_write_status_to_errno(status)),
+                };
+                complete_syscall(stop_state, result)?;
+                Ok(SyscallAction::Resume)
+            }
+            ReadAttempt::WouldBlock(policy) => {
+                if policy.nonblock || policy.wait_interest.is_none() {
+                    complete_syscall(stop_state, linux_errno(LINUX_EAGAIN))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                let packet_key = self.alloc_packet_key()?;
+                let wait = WaitState {
+                    restartable: true,
+                    kind: WaitKind::FdRead {
+                        fd,
+                        buf: iov_addr,
+                        len: usize::try_from(iov_len).map_err(|_| ZX_ERR_INVALID_ARGS)?,
+                        packet_key,
+                    },
+                };
+                self.arm_fd_wait(
+                    task_id,
+                    wait,
+                    policy.wait_interest.ok_or(ZX_ERR_BAD_STATE)?,
+                    stop_state,
+                )
+            }
+            ReadAttempt::Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                Ok(SyscallAction::Resume)
+            }
+        }
+    }
+
+    fn sys_writev(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+        stdout: &mut Vec<u8>,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let fd = linux_arg_i32(stop_state.regs.rdi);
+        let iov_addr = stop_state.regs.rsi;
+        let iov_len = linux_arg_i32(stop_state.regs.rdx);
+        let iovecs = match self.read_sys_iovecs(task_id, iov_addr, iov_len, stop_state)? {
+            Some(iovecs) => iovecs,
+            None => return Ok(SyscallAction::Resume),
+        };
+        let bytes = match read_guest_iovec_payload(
+            self.tasks
+                .get(&task_id)
+                .ok_or(ZX_ERR_BAD_STATE)?
+                .carrier
+                .session_handle,
+            &iovecs,
+        ) {
+            Ok(bytes) => bytes,
+            Err(status) => {
+                complete_syscall(
+                    stop_state,
+                    linux_errno(map_guest_memory_status_to_errno(status)),
+                )?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        if let Some(action) =
+            self.maybe_apply_tty_job_control(task_id, fd, FdWaitOp::Write, stop_state)?
+        {
+            return Ok(action);
+        }
+        let wait_policy = self.fd_wait_policy_for_op(task_id, fd, FdWaitOp::Write)?;
+        let attempt = {
+            let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            match resources.fd_table.write(fd, &bytes) {
+                Ok(actual) => WriteAttempt::Ready(actual),
+                Err(ZX_ERR_SHOULD_WAIT) => WriteAttempt::WouldBlock(wait_policy),
+                Err(status) => WriteAttempt::Err(status),
+            }
+        };
+
+        match attempt {
+            WriteAttempt::Ready(actual) => {
+                if fd == 1 || fd == 2 {
+                    stdout.extend_from_slice(&bytes[..actual]);
+                }
+                complete_syscall(
+                    stop_state,
+                    u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                )?;
+                Ok(SyscallAction::Resume)
+            }
+            WriteAttempt::WouldBlock(policy) => {
+                if policy.nonblock || policy.wait_interest.is_none() {
+                    complete_syscall(stop_state, linux_errno(LINUX_EAGAIN))?;
+                    return Ok(SyscallAction::Resume);
+                }
+                let packet_key = self.alloc_packet_key()?;
+                let wait = WaitState {
+                    restartable: true,
+                    kind: WaitKind::FdWrite {
+                        fd,
+                        buf: iov_addr,
+                        len: usize::try_from(iov_len).map_err(|_| ZX_ERR_INVALID_ARGS)?,
+                        packet_key,
+                    },
+                };
+                self.arm_fd_wait(
+                    task_id,
+                    wait,
+                    policy.wait_interest.ok_or(ZX_ERR_BAD_STATE)?,
+                    stop_state,
+                )
+            }
+            WriteAttempt::Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                Ok(SyscallAction::Resume)
+            }
+        }
+    }
+
     fn sys_sendmsg(
         &mut self,
         task_id: i32,
@@ -4992,10 +5181,12 @@ impl StarnixKernel {
             .ok_or(ZX_ERR_BAD_STATE)?
             .carrier
             .session_handle;
+        let path = read_guest_c_string(session, stop_state.regs.rdi, LINUX_PATH_MAX).ok();
         let result = {
             let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
             let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            let _ = path;
             resources.accessat(session, LINUX_AT_FDCWD, stop_state.regs.rdi, mode, 0)?
         };
         complete_syscall(stop_state, result)?;
@@ -5407,6 +5598,36 @@ impl StarnixKernel {
             }
         }
         Ok(SyscallAction::Resume)
+    }
+
+    fn read_sys_iovecs(
+        &self,
+        task_id: i32,
+        iov_addr: u64,
+        iov_len: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<Option<Vec<LinuxIovec>>, zx_status_t> {
+        if iov_len < 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(None);
+        }
+        let iov_len = usize::try_from(iov_len).map_err(|_| ZX_ERR_INVALID_ARGS)?;
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        match read_guest_iovecs(session, iov_addr, iov_len) {
+            Ok(iovecs) => Ok(Some(iovecs)),
+            Err(status) => {
+                complete_syscall(
+                    stop_state,
+                    linux_errno(map_guest_memory_status_to_errno(status)),
+                )?;
+                Ok(None)
+            }
+        }
     }
 
     fn sys_pidfd_open(
@@ -6879,6 +7100,13 @@ impl StarnixKernel {
                 }
             }
         };
+        if let Err(status) = new_resources.install_exec_writable_ranges(&task_image.writable_ranges)
+        {
+            prepared.close();
+            let errno = map_vm_status_to_errno(status);
+            complete_syscall(stop_state, linux_errno(errno))?;
+            return Ok(SyscallAction::Resume);
+        }
         match new_resources.install_initial_tls(prepared.carrier.session_handle, &task_image) {
             Ok(Some(fs_base)) => {
                 if let Err(status) = zx_status_result(ax_thread_set_guest_x64_fs_base(
@@ -7062,6 +7290,7 @@ impl StarnixKernel {
         } else {
             let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+            let _ = path;
             resources.openat(session, dirfd, path_addr, flags, mode)?
         };
         complete_syscall(stop_state, result)?;
@@ -7135,6 +7364,45 @@ fn read_start_info(bootstrap_channel: zx_handle_t) -> Result<StarnixStartInfo, z
     })
 }
 
+struct ExecutiveBootstrapCleanup {
+    parent_process: zx_handle_t,
+    linux_image_vmo: zx_handle_t,
+    port: zx_handle_t,
+    stdout_handle: Option<zx_handle_t>,
+}
+
+impl ExecutiveBootstrapCleanup {
+    const fn new(
+        parent_process: zx_handle_t,
+        linux_image_vmo: zx_handle_t,
+        stdout_handle: Option<zx_handle_t>,
+    ) -> Self {
+        Self {
+            parent_process,
+            linux_image_vmo,
+            port: ZX_HANDLE_INVALID,
+            stdout_handle,
+        }
+    }
+}
+
+impl Drop for ExecutiveBootstrapCleanup {
+    fn drop(&mut self) {
+        if let Some(handle) = self.stdout_handle.take() {
+            let _ = zx_handle_close(handle);
+        }
+        if self.port != ZX_HANDLE_INVALID {
+            let _ = zx_handle_close(self.port);
+        }
+        if self.linux_image_vmo != ZX_HANDLE_INVALID {
+            let _ = zx_handle_close(self.linux_image_vmo);
+        }
+        if self.parent_process != ZX_HANDLE_INVALID {
+            let _ = zx_handle_close(self.parent_process);
+        }
+    }
+}
+
 fn run_executive(start_info: StarnixStartInfo) -> i32 {
     let StarnixStartInfo {
         args,
@@ -7145,21 +7413,23 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         status_handle: _,
         controller_handle: _,
     } = start_info;
+    let mut cleanup =
+        ExecutiveBootstrapCleanup::new(parent_process, linux_image_vmo, stdout_handle);
     let Some(payload_path) = payload_path_for(&args) else {
         return map_status_to_return_code(ZX_ERR_NOT_SUPPORTED);
     };
     let Some(payload_bytes) = payload_bytes_for(&args) else {
         return map_status_to_return_code(ZX_ERR_NOT_SUPPORTED);
     };
+    let namespace = match build_starnix_namespace() {
+        Ok(namespace) => namespace,
+        Err(status) => return map_status_to_return_code(status),
+    };
     let mut port = ZX_HANDLE_INVALID;
     if zx_port_create(0, &mut port) != ZX_OK {
-        let _ = zx_handle_close(linux_image_vmo);
-        let _ = zx_handle_close(parent_process);
-        if let Some(stdout) = stdout_handle {
-            let _ = zx_handle_close(stdout);
-        }
         return 1;
     }
+    cleanup.port = port;
     let mut stack_random_state = seed_runtime_random_state(parent_process, port, 1);
     let mut stack_random = [0u8; 16];
     fill_random_bytes(&mut stack_random_state, &mut stack_random);
@@ -7169,7 +7439,10 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         &env,
         payload_bytes,
         stack_random,
-        |_| Err(ZX_ERR_NOT_SUPPORTED),
+        |interp_path| {
+            read_exec_image_bytes_from_namespace(&namespace, interp_path)
+                .map(|(_resolved, bytes)| bytes)
+        },
     ) {
         Ok(image) => image,
         Err(status) => return map_status_to_return_code(status),
@@ -7182,30 +7455,27 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         &task_image.exec_blob,
     ) {
         Ok(prepared) => prepared,
+        Err(status) => return map_status_to_return_code(status),
+    };
+    let _ = zx_handle_close(linux_image_vmo);
+    cleanup.linux_image_vmo = ZX_HANDLE_INVALID;
+    let stdout_handle = cleanup.stdout_handle.take();
+    let mut resources = match ExecutiveState::new(
+        prepared.process_handle,
+        prepared.root_vmar,
+        stdout_handle,
+        namespace,
+    ) {
+        Ok(resources) => resources,
         Err(status) => {
-            let _ = zx_handle_close(linux_image_vmo);
-            let _ = zx_handle_close(port);
-            let _ = zx_handle_close(parent_process);
-            if let Some(stdout) = stdout_handle {
-                let _ = zx_handle_close(stdout);
-            }
+            prepared.close();
             return map_status_to_return_code(status);
         }
     };
-    let _ = zx_handle_close(linux_image_vmo);
-    let mut resources =
-        match ExecutiveState::new(prepared.process_handle, prepared.root_vmar, stdout_handle) {
-            Ok(resources) => resources,
-            Err(status) => {
-                prepared.close();
-                let _ = zx_handle_close(port);
-                let _ = zx_handle_close(parent_process);
-                if let Some(stdout) = stdout_handle {
-                    let _ = zx_handle_close(stdout);
-                }
-                return map_status_to_return_code(status);
-            }
-        };
+    if let Err(status) = resources.install_exec_writable_ranges(&task_image.writable_ranges) {
+        prepared.close();
+        return map_status_to_return_code(status);
+    }
     match resources.install_initial_tls(prepared.carrier.session_handle, &task_image) {
         Ok(Some(fs_base)) => {
             if let Err(status) = zx_status_result(ax_thread_set_guest_x64_fs_base(
@@ -7214,36 +7484,19 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
                 0,
             )) {
                 prepared.close();
-                let _ = zx_handle_close(port);
-                let _ = zx_handle_close(parent_process);
-                if let Some(stdout) = stdout_handle {
-                    let _ = zx_handle_close(stdout);
-                }
                 return map_status_to_return_code(status);
             }
         }
         Ok(None) => {}
         Err(status) => {
             prepared.close();
-            let _ = zx_handle_close(port);
-            let _ = zx_handle_close(parent_process);
-            if let Some(stdout) = stdout_handle {
-                let _ = zx_handle_close(stdout);
-            }
             return map_status_to_return_code(status);
         }
     }
     let regs = linux_guest_initial_regs(prepared.prepared_entry, prepared.prepared_stack);
     let (resources, carrier) = match start_prepared_carrier_guest(prepared, &regs, resources) {
         Ok(started) => started,
-        Err(status) => {
-            let _ = zx_handle_close(port);
-            let _ = zx_handle_close(parent_process);
-            if let Some(stdout) = stdout_handle {
-                let _ = zx_handle_close(stdout);
-            }
-            return map_status_to_return_code(status);
-        }
+        Err(status) => return map_status_to_return_code(status),
     };
     let root_task = LinuxTask {
         tid: 1,
@@ -7276,10 +7529,7 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
         resources: Some(resources),
     };
     let mut kernel = StarnixKernel::new(parent_process, port, root_task, root_group);
-    let result = kernel.run();
-    let _ = zx_handle_close(port);
-    let _ = zx_handle_close(parent_process);
-    result
+    kernel.run()
 }
 
 fn emulate_common_syscall(
@@ -7503,6 +7753,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-dynamic-tls-smoke") => Some(LINUX_DYNAMIC_TLS_SMOKE_BYTES),
         Some("linux-dynamic-runtime-smoke") => Some(LINUX_DYNAMIC_RUNTIME_SMOKE_BYTES),
         Some("linux-dynamic-pie-smoke") => Some(LINUX_DYNAMIC_PIE_SMOKE_BYTES),
+        Some("linux-glibc-hello") => Some(LINUX_GLIBC_HELLO_BYTES),
         Some(_) => None,
     }
 }
@@ -7534,6 +7785,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-dynamic-tls-smoke") => Some(LINUX_DYNAMIC_TLS_SMOKE_BINARY_PATH),
         Some("linux-dynamic-runtime-smoke") => Some(LINUX_DYNAMIC_RUNTIME_SMOKE_BINARY_PATH),
         Some("linux-dynamic-pie-smoke") => Some(LINUX_DYNAMIC_PIE_SMOKE_BINARY_PATH),
+        Some("linux-glibc-hello") => Some(LINUX_GLIBC_HELLO_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -7606,6 +7858,7 @@ fn build_task_image(
         cmdline,
         exec_blob,
         initial_tls_modules,
+        runtime_random: stack_random,
         writable_ranges,
     })
 }
@@ -8762,6 +9015,7 @@ impl ExecutiveState {
         process_handle: zx_handle_t,
         root_vmar: zx_handle_t,
         stdout_handle: Option<zx_handle_t>,
+        namespace: nexus_io::ProcessNamespace,
     ) -> Result<Self, zx_status_t> {
         let mut fd_table = FdTable::new();
         let stdin_fd = fd_table.open(
@@ -8784,7 +9038,7 @@ impl ExecutiveState {
         Ok(Self {
             process_handle,
             fd_table,
-            namespace: build_starnix_namespace()?,
+            namespace,
             directory_offsets: BTreeMap::new(),
             linux_mm: LinuxMm::new(root_vmar)?,
         })
@@ -8863,54 +9117,158 @@ impl ExecutiveState {
         Ok(mapped)
     }
 
+    fn install_exec_writable_ranges(
+        &mut self,
+        writable_ranges: &[LinuxWritableRange],
+    ) -> Result<(), zx_status_t> {
+        self.linux_mm.install_exec_writable_ranges(writable_ranges)
+    }
+
     fn install_initial_tls(
         &mut self,
         session: zx_handle_t,
         task_image: &TaskImage,
     ) -> Result<Option<u64>, zx_status_t> {
-        if task_image.initial_tls_modules.is_empty() {
-            return Ok(None);
-        }
         let mut tls_span = 0u64;
+        let mut tls_module_offsets = Vec::new();
+        tls_module_offsets
+            .try_reserve_exact(task_image.initial_tls_modules.len())
+            .map_err(|_| ZX_ERR_NO_MEMORY)?;
         for initial_tls in &task_image.initial_tls_modules {
+            let offset = tls_span;
+            tls_module_offsets.push(offset);
             if initial_tls.mem_size == 0 {
                 continue;
             }
             let module_align = initial_tls.align.max(1);
             tls_span = align_up_u64(tls_span, module_align).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            *tls_module_offsets.last_mut().ok_or(ZX_ERR_BAD_STATE)? = tls_span;
             let module_span =
                 align_up_u64(initial_tls.mem_size, module_align).ok_or(ZX_ERR_OUT_OF_RANGE)?;
             tls_span = tls_span
                 .checked_add(module_span)
                 .ok_or(ZX_ERR_OUT_OF_RANGE)?;
         }
-        if tls_span == 0 {
-            return Ok(None);
-        }
-        let map_len = align_up_u64(
-            tls_span
+        let dtv_module_slots = task_image
+            .initial_tls_modules
+            .len()
+            .max(X64_TLS_DTV_MIN_MODULE_SLOTS as usize);
+        let dtv_storage_words = X64_TLS_DTV_PREFIX_WORDS
+            .checked_add(X64_TLS_DTV_HEADER_WORDS)
+            .and_then(|words| {
+                words.checked_add(
+                    u64::try_from(dtv_module_slots)
+                        .ok()?
+                        .checked_mul(X64_TLS_DTV_WORDS_PER_MODULE)?,
+                )
+            })
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let dtv_storage_bytes = dtv_storage_words
+            .checked_mul(8)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let tcb_offset = tls_span;
+        let dtv_storage_offset = align_up_u64(
+            tcb_offset
                 .checked_add(X64_TLS_TCB_BYTES)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+            16,
+        )
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let map_len = align_up_u64(
+            dtv_storage_offset
+                .checked_add(dtv_storage_bytes)
                 .ok_or(ZX_ERR_OUT_OF_RANGE)?,
             USER_PAGE_BYTES,
         )
         .ok_or(ZX_ERR_OUT_OF_RANGE)?;
         let map_base = self.map_private_anon(map_len, LINUX_PROT_READ | LINUX_PROT_WRITE)?;
-        let mut cursor = map_base;
-        for initial_tls in &task_image.initial_tls_modules {
+        for (index, initial_tls) in task_image.initial_tls_modules.iter().enumerate() {
             if initial_tls.mem_size == 0 {
                 continue;
             }
-            let module_align = initial_tls.align.max(1);
-            cursor = align_up_u64(cursor, module_align).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let module_addr = map_base
+                .checked_add(*tls_module_offsets.get(index).ok_or(ZX_ERR_BAD_STATE)?)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
             if !initial_tls.init_image.is_empty() {
-                write_guest_bytes(session, cursor, &initial_tls.init_image)?;
+                write_guest_bytes(session, module_addr, &initial_tls.init_image)?;
             }
-            let module_span =
-                align_up_u64(initial_tls.mem_size, module_align).ok_or(ZX_ERR_OUT_OF_RANGE)?;
-            cursor = cursor.checked_add(module_span).ok_or(ZX_ERR_OUT_OF_RANGE)?;
         }
-        let fs_base = map_base.checked_add(tls_span).ok_or(ZX_ERR_OUT_OF_RANGE)?;
-        write_guest_bytes(session, fs_base, &fs_base.to_ne_bytes())?;
+        let dtv_storage_base = map_base
+            .checked_add(dtv_storage_offset)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let dtv_ptr = dtv_storage_base
+            .checked_add(
+                X64_TLS_DTV_PREFIX_WORDS
+                    .checked_mul(8)
+                    .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+            )
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        write_guest_u64(
+            session,
+            dtv_storage_base,
+            u64::try_from(dtv_module_slots).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+        )?;
+        write_guest_u64(
+            session,
+            dtv_storage_base.checked_add(8).ok_or(ZX_ERR_OUT_OF_RANGE)?,
+            0,
+        )?;
+        write_guest_u64(session, dtv_ptr, 1)?;
+        write_guest_u64(
+            session,
+            dtv_ptr.checked_add(8).ok_or(ZX_ERR_OUT_OF_RANGE)?,
+            0,
+        )?;
+        for (index, _) in task_image.initial_tls_modules.iter().enumerate() {
+            let slot_offset = u64::try_from(index)
+                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?
+                .checked_mul(X64_TLS_DTV_WORDS_PER_MODULE)
+                .and_then(|words| words.checked_mul(8))
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let slot_addr = dtv_ptr
+                .checked_add(
+                    X64_TLS_DTV_HEADER_WORDS
+                        .checked_mul(8)
+                        .and_then(|header| header.checked_add(slot_offset))
+                        .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+                )
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let module_addr = map_base
+                .checked_add(*tls_module_offsets.get(index).ok_or(ZX_ERR_BAD_STATE)?)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            write_guest_u64(session, slot_addr, module_addr)?;
+            write_guest_u64(
+                session,
+                slot_addr.checked_add(8).ok_or(ZX_ERR_OUT_OF_RANGE)?,
+                0,
+            )?;
+        }
+        let fs_base = map_base
+            .checked_add(tcb_offset)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let stack_guard = u64::from_ne_bytes(task_image.runtime_random[..8].try_into().unwrap());
+        let pointer_guard = u64::from_ne_bytes(task_image.runtime_random[8..].try_into().unwrap());
+        write_guest_u64(session, fs_base, fs_base)?;
+        write_guest_u64(
+            session,
+            fs_base.checked_add(8).ok_or(ZX_ERR_OUT_OF_RANGE)?,
+            dtv_ptr,
+        )?;
+        write_guest_u64(
+            session,
+            fs_base.checked_add(16).ok_or(ZX_ERR_OUT_OF_RANGE)?,
+            fs_base,
+        )?;
+        write_guest_u64(
+            session,
+            fs_base.checked_add(0x28).ok_or(ZX_ERR_OUT_OF_RANGE)?,
+            stack_guard,
+        )?;
+        write_guest_u64(
+            session,
+            fs_base.checked_add(0x30).ok_or(ZX_ERR_OUT_OF_RANGE)?,
+            pointer_guard,
+        )?;
         Ok(Some(fs_base))
     }
 
@@ -9431,6 +9789,7 @@ impl LinuxMm {
             heap_mapped_len: 0,
             mmap_vmar,
             mmap_base,
+            exec_tree: BTreeMap::new(),
             map_tree: BTreeMap::new(),
         })
     }
@@ -9481,6 +9840,7 @@ impl LinuxMm {
             )?;
         }
 
+        let exec_tree = self.exec_tree.clone();
         let mut map_tree = BTreeMap::new();
         for entry in self.map_tree.values() {
             match entry.backing {
@@ -9561,8 +9921,38 @@ impl LinuxMm {
             heap_mapped_len: self.heap_mapped_len,
             mmap_vmar,
             mmap_base: self.mmap_base,
+            exec_tree,
             map_tree,
         })
+    }
+
+    fn install_exec_writable_ranges(
+        &mut self,
+        writable_ranges: &[LinuxWritableRange],
+    ) -> Result<(), zx_status_t> {
+        self.exec_tree.clear();
+        let mmap_end = self
+            .mmap_base
+            .checked_add(LINUX_MMAP_REGION_BYTES)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        for range in writable_ranges {
+            let range_end = range
+                .base
+                .checked_add(range.len)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            if range.base >= self.mmap_base && range_end <= mmap_end {
+                continue;
+            }
+            self.exec_tree.insert(
+                range.base,
+                LinuxProtectEntry {
+                    base: range.base,
+                    len: range.len,
+                    prot: LINUX_PROT_READ | LINUX_PROT_WRITE,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn brk(&mut self, requested: u64) -> u64 {
@@ -9638,12 +10028,31 @@ impl LinuxMm {
         if shared == private {
             return Ok(linux_errno(LINUX_EINVAL));
         }
-        if (flags & LINUX_MAP_FIXED) != 0 {
-            return Ok(linux_errno(LINUX_EINVAL));
+        let anonymous = (flags & LINUX_MAP_ANONYMOUS) != 0;
+        let fixed = (flags & LINUX_MAP_FIXED) != 0;
+        let end = addr.checked_add(aligned_len).ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        if fixed {
+            if !addr.is_multiple_of(USER_PAGE_BYTES) {
+                return Ok(linux_errno(LINUX_EINVAL));
+            }
+            let mmap_end = self
+                .mmap_base
+                .checked_add(LINUX_MMAP_REGION_BYTES)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            if addr < self.mmap_base || end > mmap_end {
+                return Ok(linux_errno(LINUX_ENOMEM));
+            }
+            if self.covered_mappings(addr, end)?.is_some() {
+                let result = self.munmap(addr, aligned_len)?;
+                if result != 0 {
+                    return Ok(result);
+                }
+            }
         }
 
-        let anonymous = (flags & LINUX_MAP_ANONYMOUS) != 0;
         let mut vmo = ZX_HANDLE_INVALID;
+        let mut private_file_copy = false;
+        let mut map_vmo_offset = offset;
         if anonymous {
             if fd != -1 || offset != 0 {
                 return Ok(linux_errno(LINUX_EINVAL));
@@ -9652,30 +10061,80 @@ impl LinuxMm {
             if status != ZX_OK {
                 return Ok(linux_errno(map_vm_status_to_errno(status)));
             }
+            map_vmo_offset = 0;
         } else {
             if !offset.is_multiple_of(USER_PAGE_BYTES) {
                 return Ok(linux_errno(LINUX_EINVAL));
             }
-            if (prot & LINUX_PROT_WRITE) != 0 {
-                return Ok(linux_errno(LINUX_EACCES));
+            if private && (prot & LINUX_PROT_WRITE) != 0 {
+                let source_vmo = match fd_table.as_vmo(fd, nexus_io::VmoFlags::READ) {
+                    Ok(vmo) => vmo,
+                    Err(status) => return Ok(linux_errno(map_fd_status_to_errno(status))),
+                };
+                let status = zx_vmo_create(aligned_len, 0, &mut vmo);
+                if status != ZX_OK {
+                    let _ = zx_handle_close(source_vmo);
+                    return Ok(linux_errno(map_vm_status_to_errno(status)));
+                }
+                let mut bytes = Vec::new();
+                if bytes
+                    .try_reserve_exact(
+                        usize::try_from(aligned_len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                    )
+                    .is_err()
+                {
+                    let _ = zx_handle_close(source_vmo);
+                    let _ = zx_handle_close(vmo);
+                    return Ok(linux_errno(LINUX_ENOMEM));
+                }
+                bytes.resize(
+                    usize::try_from(aligned_len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                    0,
+                );
+                let read_status = zx_vmo_read(source_vmo, &mut bytes, offset);
+                let _ = zx_handle_close(source_vmo);
+                if read_status != ZX_OK {
+                    let _ = zx_handle_close(vmo);
+                    return Ok(linux_errno(map_vm_status_to_errno(read_status)));
+                }
+                let write_status = zx_vmo_write(vmo, &bytes, 0);
+                if write_status != ZX_OK {
+                    let _ = zx_handle_close(vmo);
+                    return Ok(linux_errno(map_vm_status_to_errno(write_status)));
+                }
+                private_file_copy = true;
+                map_vmo_offset = 0;
+            } else {
+                if (prot & LINUX_PROT_WRITE) != 0 {
+                    return Ok(linux_errno(LINUX_EACCES));
+                }
+                let mut vmo_flags = nexus_io::VmoFlags::READ;
+                if (prot & LINUX_PROT_EXEC) != 0 {
+                    vmo_flags |= nexus_io::VmoFlags::EXECUTE;
+                }
+                vmo = match fd_table.as_vmo(fd, vmo_flags) {
+                    Ok(vmo) => vmo,
+                    Err(status) => return Ok(linux_errno(map_fd_status_to_errno(status))),
+                };
             }
-            let mut vmo_flags = nexus_io::VmoFlags::READ;
-            if (prot & LINUX_PROT_EXEC) != 0 {
-                vmo_flags |= nexus_io::VmoFlags::EXECUTE;
-            }
-            vmo = match fd_table.as_vmo(fd, vmo_flags) {
-                Ok(vmo) => vmo,
-                Err(status) => return Ok(linux_errno(map_fd_status_to_errno(status))),
-            };
         }
 
         let mut mapped_addr = 0u64;
         let status = zx_vmar_map_local(
             self.mmap_vmar,
-            map_options,
-            0,
+            if fixed {
+                map_options | ZX_VM_SPECIFIC
+            } else {
+                map_options
+            },
+            if fixed {
+                addr.checked_sub(self.mmap_base)
+                    .ok_or(ZX_ERR_OUT_OF_RANGE)?
+            } else {
+                0
+            },
             vmo,
-            offset,
+            map_vmo_offset,
             aligned_len,
             &mut mapped_addr,
         );
@@ -9685,20 +10144,19 @@ impl LinuxMm {
         }
 
         self.map_tree.insert(
-            mapped_addr,
+            if fixed { addr } else { mapped_addr },
             LinuxMapEntry {
-                base: mapped_addr,
+                base: if fixed { addr } else { mapped_addr },
                 len: aligned_len,
                 prot,
-                backing: if anonymous {
+                backing: if anonymous || private_file_copy {
                     LinuxMapBacking::Anonymous { vmo }
                 } else {
                     LinuxMapBacking::File { vmo, offset }
                 },
             },
         );
-        let _ = addr;
-        Ok(mapped_addr)
+        Ok(if fixed { addr } else { mapped_addr })
     }
 
     fn munmap(&mut self, addr: u64, len: u64) -> Result<u64, zx_status_t> {
@@ -9781,6 +10239,50 @@ impl LinuxMm {
                 linux_errno(map_vm_status_to_errno(status))
             });
         }
+        if let Some(overlaps) = self.covered_exec_mappings(addr, end)? {
+            let status = zx_vmar_protect_local(self.root_vmar, map_options, addr, aligned_len);
+            if status != ZX_OK {
+                return Ok(linux_errno(map_vm_status_to_errno(status)));
+            }
+            for entry in overlaps {
+                let _ = self.exec_tree.remove(&entry.base);
+                let entry_end = entry
+                    .base
+                    .checked_add(entry.len)
+                    .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+                if entry.base < addr {
+                    self.exec_tree.insert(
+                        entry.base,
+                        LinuxProtectEntry {
+                            base: entry.base,
+                            len: addr - entry.base,
+                            prot: entry.prot,
+                        },
+                    );
+                }
+                let protected_end = end.min(entry_end);
+                let protected_start = addr.max(entry.base);
+                self.exec_tree.insert(
+                    protected_start,
+                    LinuxProtectEntry {
+                        base: protected_start,
+                        len: protected_end - protected_start,
+                        prot,
+                    },
+                );
+                if end < entry_end {
+                    self.exec_tree.insert(
+                        end,
+                        LinuxProtectEntry {
+                            base: end,
+                            len: entry_end - end,
+                            prot: entry.prot,
+                        },
+                    );
+                }
+            }
+            return Ok(0);
+        }
         let Some(overlaps) = self.covered_mappings(addr, end)? else {
             return Ok(linux_errno(LINUX_EINVAL));
         };
@@ -9851,6 +10353,58 @@ impl LinuxMm {
         }
 
         for (_, entry) in self.map_tree.range(addr..) {
+            if entry.base >= end {
+                break;
+            }
+            if entry.base > cursor {
+                return Ok(None);
+            }
+            if overlaps
+                .last()
+                .map(|last| last.base != entry.base)
+                .unwrap_or(true)
+            {
+                overlaps.push(*entry);
+            }
+            let entry_end = entry
+                .base
+                .checked_add(entry.len)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            if entry_end > cursor {
+                cursor = entry_end;
+            }
+            if cursor >= end {
+                return Ok(Some(overlaps));
+            }
+        }
+
+        if cursor >= end {
+            Ok(Some(overlaps))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn covered_exec_mappings(
+        &self,
+        addr: u64,
+        end: u64,
+    ) -> Result<Option<Vec<LinuxProtectEntry>>, zx_status_t> {
+        let mut overlaps = Vec::new();
+        let mut cursor = addr;
+
+        if let Some((_, entry)) = self.exec_tree.range(..=addr).next_back() {
+            let entry_end = entry
+                .base
+                .checked_add(entry.len)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            if addr < entry_end {
+                overlaps.push(*entry);
+                cursor = entry_end;
+            }
+        }
+
+        for (_, entry) in self.exec_tree.range(addr..) {
             if entry.base >= end {
                 break;
             }
@@ -10068,6 +10622,20 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_DYNAMIC_PIE_INTERP_BYTES,
         ));
     }
+    if !LINUX_GLIBC_HELLO_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_GLIBC_HELLO_BINARY_PATH,
+            LINUX_GLIBC_HELLO_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_GLIBC_RUNTIME_INTERP_BINARY_PATH,
+            LINUX_GLIBC_RUNTIME_INTERP_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_GLIBC_RUNTIME_LIBC_BINARY_PATH,
+            LINUX_GLIBC_RUNTIME_LIBC_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -10198,6 +10766,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-dynamic-pie-smoke.nxcd",
             LINUX_DYNAMIC_PIE_SMOKE_DECL_BYTES,
+        ));
+    }
+    if !LINUX_GLIBC_HELLO_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-glibc-hello.nxcd",
+            LINUX_GLIBC_HELLO_DECL_BYTES,
         ));
     }
     let bootstrap = BootstrapNamespace::build(&assets)?;
@@ -11135,6 +11709,7 @@ mod tests {
             heap_mapped_len: 0,
             mmap_vmar: ZX_HANDLE_INVALID,
             mmap_base: 0,
+            exec_tree: BTreeMap::new(),
             map_tree: BTreeMap::new(),
         }
     }
@@ -11204,6 +11779,7 @@ mod tests {
                 cmdline: b"linux-round6-proc-job-smoke\0".to_vec(),
                 exec_blob: Vec::new(),
                 initial_tls_modules: Vec::new(),
+                runtime_random: [0; 16],
                 writable_ranges: Vec::new(),
             }),
             resources: Some(resources),
@@ -11258,6 +11834,7 @@ mod tests {
                     cmdline: b"linux-round6-proc-control-smoke\0".to_vec(),
                     exec_blob: Vec::new(),
                     initial_tls_modules: Vec::new(),
+                    runtime_random: [0; 16],
                     writable_ranges: Vec::new(),
                 }),
                 resources: None,

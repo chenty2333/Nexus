@@ -22,7 +22,7 @@ use x86_64::instructions::segmentation::Segment;
 // --- Userspace virtual layout (in current single-address-space model) ---
 
 pub(crate) const USER_PAGE_BYTES: u64 = 0x1000;
-pub(crate) const USER_CODE_PAGE_COUNT: usize = 1024;
+pub(crate) const USER_CODE_PAGE_COUNT: usize = 4096;
 const USER_SHARED_PAGE_COUNT: usize = 2;
 pub(crate) const USER_STACK_PAGE_COUNT: usize = 16;
 pub(crate) const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * USER_CODE_PAGE_COUNT as u64;
@@ -1270,9 +1270,6 @@ pub fn ensure_user_range_resident(
     len: usize,
     for_write: bool,
 ) -> Result<(), zx_status_t> {
-    if bootstrap_user_window_contains(ptr, len) {
-        return Ok(());
-    }
     crate::fault::ensure_current_user_range_resident(ptr, len, for_write)
 }
 

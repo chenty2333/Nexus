@@ -3,7 +3,7 @@
 .global axle_user_prog_end
 axle_user_prog_start:
 	// rbx = shared base (USER_SHARED_VA)
-	movabs $0x0000000100400000, %rbx
+	movabs $0x0000000101000000, %rbx
 // r12 = t0_ns baseline provided by the kernel (slot 511)
 mov 8*511(%rbx), %r12
 
@@ -752,7 +752,7 @@ mov 0x16f8(%rbx), %rax
 mov %rax, 8*356(%rbx)
 
 // Write/read through the far mapped page.
-movabs $0x0000008100010000, %r13
+mov 0x16f8(%rbx), %r13
 movabs $0x8877665544332211, %rax
 mov %rax, (%r13)
 mov (%r13), %rcx
@@ -764,7 +764,7 @@ vmar_far_write_check_done:
 
 // vmar_unmap(far-range)
 mov 8*62(%rbx), %rdi
-movabs $0x0000008100010000, %rsi
+mov 0x16f8(%rbx), %rsi
 movabs $0x1000, %rdx
 movabs $11, %rax
 int $0x80
@@ -1701,11 +1701,11 @@ movabs $0x0000000100420008, %rdx
 	int $0x80
 	mov %rax, 8*519(%rbx)
 
-	movq $0, 0x1150(%rbx)
-	movq $0, 0x1158(%rbx)
-	mov 0x1148(%rbx), %rdi
-	xorl %esi, %esi
-movabs $0x0000000100424008, %rdx
+movq $0, 0x1150(%rbx)
+movq $0, 0x1158(%rbx)
+mov 0x1148(%rbx), %rdi
+xorl %esi, %esi
+movabs $0x0000000100428008, %rdx
 	xorl %r10d, %r10d
 	movl $8192, %r8d
 	xorl %r9d, %r9d
@@ -1721,8 +1721,8 @@ movabs $0x0000000100424008, %rdx
 	mov 0x1150(%rbx), %rax
 	mov %rax, 8*521(%rbx)
 	movq $0, 8*522(%rbx)
-movabs $0x0000000100424008, %rsi
-movabs $0x0000000100425000, %rdi
+movabs $0x0000000100428008, %rsi
+movabs $0x0000000100429000, %rdi
 	mov (%rsi), %r8
 	mov (%rdi), %r9
 	movabs $0x1213141516171819, %rax
@@ -1731,7 +1731,7 @@ movabs $0x0000000100425000, %rdi
 	movabs $0x2324252627282908, %rax
 	cmp %rax, %r9
 	jne channel_fragmented_copy_write
-movabs $0x0000000100426000, %rdi
+movabs $0x000000010042a000, %rdi
 	mov (%rdi), %r9
 	movabs $0x45464748494a4b08, %rax
 	cmp %rax, %r9
@@ -3175,7 +3175,7 @@ movq $0, 0x00(%rbx)
 int3
 
 thread_worker_entry:
-	movabs $0x0000000100400000, %rbx
+	movabs $0x0000000101000000, %rbx
 	movq $1, 8*399(%rbx)
 thread_worker_spin:
 	mov 8*403(%rbx), %rax
@@ -3309,7 +3309,7 @@ process_child_touch_shared_fault_page:
 	jmp process_child_spin
 
 suspend_worker_entry:
-	movabs $0x0000000100400000, %rbx
+	movabs $0x0000000101000000, %rbx
 	mov %rdi, %r12
 suspend_worker_wait:
 	xorl %esi, %esi

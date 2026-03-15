@@ -121,7 +121,7 @@ rest of the leaf references should be treated as `working` current-state docs.
 - `user/controller-worker` - dedicated bootstrap component binary for minimal
   `Stop` / `Kill` lifecycle coverage
 - `user/test-runner` - ring3 conformance runner loaded at the fixed bootstrap userspace VA with a
-  4 MiB bootstrap code window for the Rust dispatcher/runtime and current
+  16 MiB bootstrap code window for the Rust dispatcher/runtime and current
   `nexus-init` manager builds; the
   `component_smoke` entry is now only a thin wrapper into `user/nexus-init`
 - `tools/syscalls-gen` - generator for `syscalls/generated/syscall_numbers.rs`

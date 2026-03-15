@@ -70,9 +70,13 @@ Rust component binaries still import successfully in dev builds.
 The bootstrap address space is prewired enough to exercise real VM behavior early:
 
 - code and shared windows are mapped into the fixed bootstrap userspace range
-- the fixed bootstrap code window now spans 4 MiB above 4 GiB, which keeps the
+- the fixed bootstrap code window now spans 16 MiB above 4 GiB, which keeps the
   current Rust dispatcher/component/Starnix manager images below the shared
   summary pages instead of overlapping them
+- fixed bootstrap virtual placement no longer implies every page is already
+  resident; direct kernel access to current-thread bootstrap user ranges must
+  still fault in or otherwise ensure residency before touching freshly mapped
+  pages
 - the root runner staging slot now lives above the auxiliary component payload
   slots so that the larger bootstrap code backing arrays do not clobber the
   raw QEMU loader image before it is imported

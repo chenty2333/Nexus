@@ -41,6 +41,7 @@ Current BSP init does the following early:
 - log CPU features
 - install GDT/TSS
 - initialize per-CPU data
+- enable x87/SSE execution (`CR0.MP/NE`, `CR4.OSFXSR/OSXMMEXCPT`) and seed a clean FXSAVE state
 - later install the IDT through `trap::init()`
 
 The kernel then:
@@ -71,6 +72,7 @@ This is a deliberate bootstrap path, not yet a final fast syscall mechanism.
   - GDT/TSS
   - IDT load
   - per-CPU setup
+  - x87/SSE enablement
   - local APIC init
 - After APs come online, they enter the kernel's idle scheduler loop.
 - The BSP performs a simple fixed-vector IPI acknowledgement test during bring-up.
@@ -104,6 +106,8 @@ Current stack contract:
 - `#PF` / `#GP` use a separate per-CPU fault IST
 - `#UD` currently also uses the fault IST because supervised guest-stop v1 is trap-driven
 - `#DF` keeps its own dedicated IST
+- x87/SSE state for user threads currently uses legacy `FXSAVE64/FXRSTOR64` images captured on
+  trap exit and restored before resuming another user thread
 
 Axle previously used a shared IRQ IST for timer/IPI/breakpoint entry, but that shape breaks once a
 blocked trap path re-enables interrupts and idles: a nested IRQ would reset `rsp` back to the same
@@ -118,6 +122,8 @@ stack preserves nested interrupt frames, while `#PF` / `#GP` still keep a dedica
   trap/exception handoff instead: an x86_64 guest thread bound to a guest session can execute
   `syscall`, take `#UD`, and let the kernel hand the stop to a userspace supervisor through the
   generic guest-session sidecar + port path.
+- The architecture layer currently enables only legacy x87/SSE state management. `XSAVE`/AVX and
+  wider extended-state contracts are still out of scope.
 - The initial userspace model still uses a fixed bootstrap window and special bootstrap assumptions.
 - Ring3 is entered through bootstrap state rather than a fully general process-loader path.
 - AP local timers are enabled after `init_ap()` when TSC-deadline hardware is available; otherwise

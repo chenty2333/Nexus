@@ -64,6 +64,7 @@ fn main() {
         manifest_dir.join("../linux-dynamic-pie-smoke/dynamic_pie_smoke.S");
     let linux_dynamic_pie_main_source =
         manifest_dir.join("../linux-dynamic-pie-main/dynamic_pie_main.c");
+    let linux_glibc_hello_source = manifest_dir.join("../linux-glibc-hello/glibc_hello.c");
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
@@ -183,6 +184,10 @@ fn main() {
         "cargo:rerun-if-changed={}",
         linux_dynamic_pie_main_source.display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_glibc_hello_source.display()
+    );
     for manifest in [
         "root_component.toml",
         "root_component_round3.toml",
@@ -211,6 +216,7 @@ fn main() {
         "root_component_starnix_dynamic_tls.toml",
         "root_component_starnix_dynamic_runtime.toml",
         "root_component_starnix_dynamic_pie.toml",
+        "root_component_starnix_glibc_hello.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
@@ -239,6 +245,7 @@ fn main() {
         "linux_dynamic_tls_smoke.toml",
         "linux_dynamic_runtime_smoke.toml",
         "linux_dynamic_pie_smoke.toml",
+        "linux_glibc_hello.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -347,6 +354,10 @@ fn main() {
             "root_component_starnix_dynamic_pie.toml",
             "root_component_starnix_dynamic_pie.nxcd",
         ),
+        (
+            "root_component_starnix_glibc_hello.toml",
+            "root_component_starnix_glibc_hello.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
@@ -432,6 +443,7 @@ fn main() {
             "linux_dynamic_pie_smoke.toml",
             "linux_dynamic_pie_smoke.nxcd",
         ),
+        ("linux_glibc_hello.toml", "linux_glibc_hello.nxcd"),
     ] {
         let source_path = manifests_dir.join(input);
         let source = fs::read_to_string(&source_path)
@@ -565,6 +577,20 @@ fn main() {
         &out_dir.join("linux-dynamic-pie-main"),
         "/lib/ld-nexus-dynamic-runtime.so",
     );
+    build_linux_glibc_binary(
+        &linux_glibc_hello_source,
+        &out_dir.join("linux-glibc-hello"),
+        "/lib/ld-nexus-glibc.so",
+        "/lib",
+    );
+    copy_linux_runtime_asset(
+        &host_linux_runtime_path("libc.so.6"),
+        &out_dir.join("libc.so.6"),
+    );
+    copy_linux_runtime_asset(
+        &host_linux_runtime_path("ld-linux-x86-64.so.2"),
+        &out_dir.join("ld-nexus-glibc.so"),
+    );
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
         // Link the bootstrap userspace binary at the fixed VA currently
@@ -605,6 +631,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic_tls)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic_runtime)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic_pie)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_glibc_hello)");
     match root_url.as_str() {
         "boot://root-starnix" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
@@ -684,6 +711,9 @@ fn main() {
         "boot://root-starnix-dynamic-pie" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_dynamic_pie");
         }
+        "boot://root-starnix-glibc-hello" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_glibc_hello");
+        }
         _ => {}
     }
     println!("cargo:rustc-env=NEXUS_INIT_ROOT_URL={root_url}");
@@ -756,6 +786,60 @@ fn build_linux_dynamic_pie_binary(source: &Path, output: &Path, interp: &str) {
         .status()
         .unwrap_or_else(|err| panic!("spawn {clang}: {err}"));
     assert!(status.success(), "build {} failed", output.display());
+}
+
+fn build_linux_glibc_binary(source: &Path, output: &Path, interp: &str, runpath: &str) {
+    let cc = std::env::var("CC").unwrap_or_else(|_| String::from("cc"));
+    let dynamic_linker = format!("-Wl,--dynamic-linker={interp}");
+    let runpath_flag = format!("-Wl,-rpath,{runpath}");
+    let status = Command::new(&cc)
+        .arg("-fPIE")
+        .arg("-pie")
+        .arg("-Wl,-z,noexecstack")
+        .arg("-Wl,--build-id=none")
+        .arg(dynamic_linker)
+        .arg(runpath_flag)
+        .arg("-o")
+        .arg(output)
+        .arg(source)
+        .status()
+        .unwrap_or_else(|err| panic!("spawn {cc}: {err}"));
+    assert!(status.success(), "build {} failed", output.display());
+}
+
+fn host_linux_runtime_path(name: &str) -> PathBuf {
+    let cc = std::env::var("CC").unwrap_or_else(|_| String::from("cc"));
+    let output = Command::new(&cc)
+        .arg(format!("-print-file-name={name}"))
+        .output()
+        .unwrap_or_else(|err| panic!("spawn {cc} -print-file-name={name}: {err}"));
+    assert!(
+        output.status.success(),
+        "{cc} -print-file-name={name} failed with status {:?}",
+        output.status.code()
+    );
+    let printed = String::from_utf8(output.stdout)
+        .unwrap_or_else(|err| panic!("decode {name} path from {cc}: {err}"));
+    let path = PathBuf::from(printed.trim());
+    assert!(
+        path.is_absolute() && path.is_file(),
+        "host runtime asset {name} not found: {}",
+        path.display()
+    );
+    path
+}
+
+fn copy_linux_runtime_asset(source: &Path, output: &Path) {
+    if output.exists() {
+        std::fs::remove_file(output).unwrap_or_else(|err| {
+            panic!(
+                "remove existing runtime asset {} before copy: {err}",
+                output.display()
+            )
+        });
+    }
+    std::fs::copy(source, output)
+        .unwrap_or_else(|err| panic!("copy {} to {}: {err}", source.display(), output.display()));
 }
 
 fn build_linux_shared_binary(source: &Path, output: &Path, soname: &str) {
