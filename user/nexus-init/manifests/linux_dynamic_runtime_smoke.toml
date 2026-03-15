@@ -1,0 +1,7 @@
+url = "boot://linux-dynamic-runtime-smoke"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-dynamic-runtime-smoke"
+args = ["linux-dynamic-runtime-smoke"]
+env = []

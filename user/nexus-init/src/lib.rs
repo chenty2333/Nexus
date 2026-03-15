@@ -192,6 +192,10 @@ const ROOT_DECL_STARNIX_DYNAMIC_TLS_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_dynamic_tls.nxcd"
 ));
+const ROOT_DECL_STARNIX_DYNAMIC_RUNTIME_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_dynamic_runtime.nxcd"
+));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
@@ -322,6 +326,13 @@ pub(crate) const LINUX_DYNAMIC_TLS_SMOKE_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_dynamic_tls_smoke.nxcd"));
 #[cfg(not(nexus_init_embed_starnix_dynamic_tls))]
 pub(crate) const LINUX_DYNAMIC_TLS_SMOKE_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_dynamic_runtime)]
+pub(crate) const LINUX_DYNAMIC_RUNTIME_SMOKE_DECL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/linux_dynamic_runtime_smoke.nxcd"
+));
+#[cfg(not(nexus_init_embed_starnix_dynamic_runtime))]
+pub(crate) const LINUX_DYNAMIC_RUNTIME_SMOKE_DECL_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_hello)]
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
@@ -457,6 +468,21 @@ pub(crate) const LINUX_DYNAMIC_TLS_INTERP_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ld-nexus-dynamic-tls.so"));
 #[cfg(not(nexus_init_embed_starnix_dynamic_tls))]
 pub(crate) const LINUX_DYNAMIC_TLS_INTERP_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_dynamic_runtime)]
+pub(crate) const LINUX_DYNAMIC_RUNTIME_SMOKE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-dynamic-runtime-smoke"));
+#[cfg(not(nexus_init_embed_starnix_dynamic_runtime))]
+pub(crate) const LINUX_DYNAMIC_RUNTIME_SMOKE_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_dynamic_runtime)]
+pub(crate) const LINUX_DYNAMIC_RUNTIME_MAIN_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-dynamic-runtime-main"));
+#[cfg(not(nexus_init_embed_starnix_dynamic_runtime))]
+pub(crate) const LINUX_DYNAMIC_RUNTIME_MAIN_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_dynamic_runtime)]
+pub(crate) const LINUX_DYNAMIC_RUNTIME_INTERP_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ld-nexus-dynamic-runtime.so"));
+#[cfg(not(nexus_init_embed_starnix_dynamic_runtime))]
+pub(crate) const LINUX_DYNAMIC_RUNTIME_INTERP_BYTES: &[u8] = &[];
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
@@ -496,6 +522,9 @@ pub(crate) const LINUX_DYNAMIC_INTERP_BINARY_PATH: &str = "lib/ld-nexus-dynamic-
 pub(crate) const LINUX_DYNAMIC_TLS_SMOKE_BINARY_PATH: &str = "bin/linux-dynamic-tls-smoke";
 pub(crate) const LINUX_DYNAMIC_TLS_MAIN_BINARY_PATH: &str = "bin/linux-dynamic-tls-main";
 pub(crate) const LINUX_DYNAMIC_TLS_INTERP_BINARY_PATH: &str = "lib/ld-nexus-dynamic-tls.so";
+pub(crate) const LINUX_DYNAMIC_RUNTIME_SMOKE_BINARY_PATH: &str = "bin/linux-dynamic-runtime-smoke";
+pub(crate) const LINUX_DYNAMIC_RUNTIME_MAIN_BINARY_PATH: &str = "bin/linux-dynamic-runtime-main";
+pub(crate) const LINUX_DYNAMIC_RUNTIME_INTERP_BINARY_PATH: &str = "lib/ld-nexus-dynamic-runtime.so";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -532,6 +561,7 @@ const STARNIX_RUNTIME_FS_EXPECTED_STDOUT: &[u8] = b"runtime fs ok\n";
 const STARNIX_RUNTIME_TLS_EXPECTED_STDOUT: &[u8] = b"runtime tls ok\n";
 const STARNIX_DYNAMIC_ELF_EXPECTED_STDOUT: &[u8] = b"dynamic interp ok\n";
 const STARNIX_DYNAMIC_TLS_EXPECTED_STDOUT: &[u8] = b"dynamic tls ok\n";
+const STARNIX_DYNAMIC_RUNTIME_EXPECTED_STDOUT: &[u8] = b"dynamic runtime ok\n";
 
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
@@ -870,6 +900,20 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             LINUX_DYNAMIC_TLS_INTERP_BYTES,
         ));
     }
+    if !LINUX_DYNAMIC_RUNTIME_SMOKE_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_RUNTIME_SMOKE_BINARY_PATH,
+            LINUX_DYNAMIC_RUNTIME_SMOKE_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_RUNTIME_MAIN_BINARY_PATH,
+            LINUX_DYNAMIC_RUNTIME_MAIN_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_RUNTIME_INTERP_BINARY_PATH,
+            LINUX_DYNAMIC_RUNTIME_INTERP_BYTES,
+        ));
+    }
     assets.push(BootAssetEntry::bytes(
         "manifests/root.nxcd",
         ROOT_DECL_EAGER_BYTES,
@@ -969,6 +1013,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-dynamic-tls.nxcd",
         ROOT_DECL_STARNIX_DYNAMIC_TLS_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-dynamic-runtime.nxcd",
+        ROOT_DECL_STARNIX_DYNAMIC_RUNTIME_BYTES,
     ));
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
@@ -1106,6 +1154,12 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-dynamic-tls-smoke.nxcd",
             LINUX_DYNAMIC_TLS_SMOKE_DECL_BYTES,
+        ));
+    }
+    if !LINUX_DYNAMIC_RUNTIME_SMOKE_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-dynamic-runtime-smoke.nxcd",
+            LINUX_DYNAMIC_RUNTIME_SMOKE_DECL_BYTES,
         ));
     }
     assets.push(BootAssetEntry::bytes(
@@ -1436,6 +1490,16 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             &runners,
             "linux_dynamic_tls_smoke",
             STARNIX_DYNAMIC_TLS_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-dynamic-runtime" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_dynamic_runtime_smoke",
+            STARNIX_DYNAMIC_RUNTIME_EXPECTED_STDOUT,
             summary,
         );
     }
