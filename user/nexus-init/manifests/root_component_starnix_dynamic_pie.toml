@@ -1,0 +1,25 @@
+url = "boot://root-starnix-dynamic-pie"
+startup = "eager"
+
+[program]
+runner = "elf"
+binary = "bin/nexus-init"
+args = ["nexus-init"]
+env = []
+
+[[use]]
+kind = "resolver"
+name = "boot-resolver"
+
+[[use]]
+kind = "runner"
+name = "elf"
+
+[[use]]
+kind = "runner"
+name = "starnix"
+
+[[children]]
+name = "linux_dynamic_pie_smoke"
+url = "boot://linux-dynamic-pie-smoke"
+startup = "eager"

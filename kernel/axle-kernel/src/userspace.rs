@@ -978,11 +978,12 @@ pub(crate) fn parse_elf_process_image_layout_with_load_bias(
     if ehdr.e_machine != 0x3E {
         return Err(ZX_ERR_NOT_SUPPORTED);
     }
-    match (ehdr.e_type, load_bias) {
-        (ET_EXEC, None) => {}
-        (ET_DYN, Some(load_bias)) if (load_bias & (USER_PAGE_BYTES - 1)) == 0 => {}
+    let image_bias = match (ehdr.e_type, load_bias) {
+        (ET_EXEC, None) => 0,
+        (ET_DYN, None) => USER_CODE_VA,
+        (ET_DYN, Some(load_bias)) if (load_bias & (USER_PAGE_BYTES - 1)) == 0 => load_bias,
         _ => return Err(ZX_ERR_NOT_SUPPORTED),
-    }
+    };
     if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
         return Err(ZX_ERR_NOT_SUPPORTED);
     }
@@ -1002,7 +1003,6 @@ pub(crate) fn parse_elf_process_image_layout_with_load_bias(
     let mut min_vaddr = u64::MAX;
     let mut max_vend = 0u64;
     let mut phdr_vaddr = None;
-    let image_bias = load_bias.unwrap_or(0);
     for i in 0..phnum {
         let off = i * core::mem::size_of::<Elf64Phdr>();
         // SAFETY: `off` stays within the already-fetched program-header table and the target

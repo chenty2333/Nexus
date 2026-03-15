@@ -64,7 +64,10 @@ use crate::services::{
 use crate::{
     LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH, LINUX_DYNAMIC_ELF_SMOKE_BYTES,
     LINUX_DYNAMIC_INTERP_BINARY_PATH, LINUX_DYNAMIC_INTERP_BYTES, LINUX_DYNAMIC_MAIN_BINARY_PATH,
-    LINUX_DYNAMIC_MAIN_BYTES, LINUX_DYNAMIC_RUNTIME_INTERP_BINARY_PATH,
+    LINUX_DYNAMIC_MAIN_BYTES, LINUX_DYNAMIC_PIE_INTERP_BINARY_PATH, LINUX_DYNAMIC_PIE_INTERP_BYTES,
+    LINUX_DYNAMIC_PIE_MAIN_BINARY_PATH, LINUX_DYNAMIC_PIE_MAIN_BYTES,
+    LINUX_DYNAMIC_PIE_SMOKE_BINARY_PATH, LINUX_DYNAMIC_PIE_SMOKE_BYTES,
+    LINUX_DYNAMIC_PIE_SMOKE_DECL_BYTES, LINUX_DYNAMIC_RUNTIME_INTERP_BINARY_PATH,
     LINUX_DYNAMIC_RUNTIME_INTERP_BYTES, LINUX_DYNAMIC_RUNTIME_MAIN_BINARY_PATH,
     LINUX_DYNAMIC_RUNTIME_MAIN_BYTES, LINUX_DYNAMIC_RUNTIME_SMOKE_BINARY_PATH,
     LINUX_DYNAMIC_RUNTIME_SMOKE_BYTES, LINUX_DYNAMIC_RUNTIME_SMOKE_DECL_BYTES,
@@ -105,6 +108,7 @@ const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * 1024;
 const USER_SHARED_BYTES: u64 = USER_PAGE_BYTES * 2;
 const USER_STACK_BYTES: u64 = USER_PAGE_BYTES * 16;
 const USER_CODE_VA: u64 = 0x0000_0001_0000_0000;
+const USER_MAIN_ET_DYN_LOAD_BIAS: u64 = USER_CODE_VA;
 const USER_STACK_VA: u64 = USER_CODE_VA + USER_CODE_BYTES + USER_SHARED_BYTES;
 const LINUX_HEAP_REGION_BYTES: u64 = 16 * 1024 * 1024;
 const LINUX_HEAP_VMO_BYTES: u64 = 16 * 1024 * 1024;
@@ -7498,6 +7502,7 @@ fn payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
         Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BYTES),
         Some("linux-dynamic-tls-smoke") => Some(LINUX_DYNAMIC_TLS_SMOKE_BYTES),
         Some("linux-dynamic-runtime-smoke") => Some(LINUX_DYNAMIC_RUNTIME_SMOKE_BYTES),
+        Some("linux-dynamic-pie-smoke") => Some(LINUX_DYNAMIC_PIE_SMOKE_BYTES),
         Some(_) => None,
     }
 }
@@ -7528,6 +7533,7 @@ fn payload_path_for(args: &[String]) -> Option<&'static str> {
         Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH),
         Some("linux-dynamic-tls-smoke") => Some(LINUX_DYNAMIC_TLS_SMOKE_BINARY_PATH),
         Some("linux-dynamic-runtime-smoke") => Some(LINUX_DYNAMIC_RUNTIME_SMOKE_BINARY_PATH),
+        Some("linux-dynamic-pie-smoke") => Some(LINUX_DYNAMIC_PIE_SMOKE_BINARY_PATH),
         Some(_) => None,
     }
 }
@@ -7675,12 +7681,12 @@ fn parse_elf(bytes: &[u8], load_bias: Option<u64>) -> Result<LinuxElf<'_>, zx_st
     if read_u16(bytes, 18)? != EM_X86_64 {
         return Err(ZX_ERR_NOT_SUPPORTED);
     }
-    match (elf_type, load_bias) {
-        (ET_EXEC, None) => {}
-        (ET_DYN, Some(load_bias)) if (load_bias & (USER_PAGE_BYTES - 1)) == 0 => {}
+    let image_bias = match (elf_type, load_bias) {
+        (ET_EXEC, None) => 0,
+        (ET_DYN, None) => USER_MAIN_ET_DYN_LOAD_BIAS,
+        (ET_DYN, Some(load_bias)) if (load_bias & (USER_PAGE_BYTES - 1)) == 0 => load_bias,
         _ => return Err(ZX_ERR_NOT_SUPPORTED),
-    }
-    let image_bias = load_bias.unwrap_or(0);
+    };
     let entry = read_u64(bytes, 24)?
         .checked_add(image_bias)
         .ok_or(ZX_ERR_OUT_OF_RANGE)?;
@@ -10048,6 +10054,20 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_DYNAMIC_RUNTIME_INTERP_BYTES,
         ));
     }
+    if !LINUX_DYNAMIC_PIE_SMOKE_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_PIE_SMOKE_BINARY_PATH,
+            LINUX_DYNAMIC_PIE_SMOKE_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_PIE_MAIN_BINARY_PATH,
+            LINUX_DYNAMIC_PIE_MAIN_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_DYNAMIC_PIE_INTERP_BINARY_PATH,
+            LINUX_DYNAMIC_PIE_INTERP_BYTES,
+        ));
+    }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -10172,6 +10192,12 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-dynamic-runtime-smoke.nxcd",
             LINUX_DYNAMIC_RUNTIME_SMOKE_DECL_BYTES,
+        ));
+    }
+    if !LINUX_DYNAMIC_PIE_SMOKE_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-dynamic-pie-smoke.nxcd",
+            LINUX_DYNAMIC_PIE_SMOKE_DECL_BYTES,
         ));
     }
     let bootstrap = BootstrapNamespace::build(&assets)?;

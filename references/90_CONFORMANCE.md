@@ -219,7 +219,7 @@ Main just targets include:
     excludes `tcsetpgrp`, `TIOCSPGRP`, and broader tty discipline
 - The first post-R7 loader/runtime scenario now closes one narrow dynamic-ELF
   bootstrap slice:
-  - `execve` of one ET_EXEC main image carrying `PT_INTERP`
+  - `execve` of one ET_EXEC or fixed-bias ET_DYN main image carrying `PT_INTERP`
   - namespace resolution of the requested interpreter path
   - ET_DYN interpreter mapping at one explicit load bias
   - `AT_BASE` handed to the initial stack image
@@ -232,7 +232,7 @@ Main just targets include:
 - The next post-R7 loader/runtime scenario now closes one narrow dynamic-TLS
   bootstrap slice:
   - static `PT_TLS` parsing for:
-    - one ET_EXEC main image launched through the existing `PT_INTERP` path
+    - one ET_EXEC or fixed-bias ET_DYN main image launched through the existing `PT_INTERP` path
     - one ET_DYN interpreter image
   - one initial-thread TLS/TCB allocation in the executive-owned Linux mm
     with the main-image TLS block remaining adjacent to the TCB
@@ -250,7 +250,7 @@ Main just targets include:
     - `AT_SECURE`
     - `AT_HWCAP2`
   - the current gate intentionally keeps the slice narrow:
-    - only one ET_EXEC main image plus one ET_DYN interpreter image
+    - only one ET_EXEC-or-ET_DYN main image plus one ET_DYN interpreter image
     - no general shared-object TLS dependency graph
     - no final libc TLS relocation/runtime model yet
 - The next post-R7 libc/runtime scenario now closes one narrow cwd/fd-management

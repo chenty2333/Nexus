@@ -129,7 +129,9 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - re-foregrounding one stopped child with `setpgid()` before `SIGCONT`
       remaining purely executive policy, not a new Axle kernel object contract
 - the first post-R7 loader/runtime slice now also has:
-  - `PT_INTERP`-driven dynamic ELF bootstrap for one ET_EXEC main image
+  - `PT_INTERP`-driven dynamic ELF bootstrap for:
+    - one ET_EXEC main image
+    - one ET_DYN main image loaded at the fixed native main-image bias
   - one ET_DYN interpreter image resolved from the Starnix namespace
   - interpreter load-bias handling in both the userspace executive and kernel ELF layout parser
   - `AT_BASE` emitted into the initial Linux auxv when an interpreter is present
@@ -137,7 +139,7 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     preserve Linux-style zero-filled file tails up to the mapped page coverage
   - the next loader/runtime/TLS slice now also has:
     - `PT_TLS` parsing in the Starnix executive for:
-      - one ET_EXEC main image
+      - one ET_EXEC or fixed-bias ET_DYN main image
       - one ET_DYN interpreter image reached through `PT_INTERP`
     - one initial TLS image template copied out of each static TLS segment
     - one minimal x86_64 initial-thread TLS/TCB allocation in the executive's Linux mm that
@@ -159,7 +161,7 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
       - `AT_SECURE`
       - `AT_HWCAP2`
     - the current bootstrap remains intentionally narrow:
-      - only one ET_EXEC main image plus one ET_DYN interpreter image
+      - only one ET_EXEC-or-ET_DYN main image plus one ET_DYN interpreter image
       - no general shared-object TLS graph beyond that first interpreter
       - no final ELF TLS relocation/runtime model yet
 - the next post-R7 libc/runtime slice now also has:
@@ -221,7 +223,7 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
       - `ax_thread_get_guest_x64_fs_base`
   - the current TLS bootstrap intentionally stays narrow:
     - `fs_base` plus one initial-thread static-TLS bootstrap spanning:
-      - one ET_EXEC main image
+      - one ET_EXEC or fixed-bias ET_DYN main image
       - one ET_DYN interpreter image
     - no `gs_base`
     - no `arch_prctl` subcommands beyond `ARCH_SET_FS` / `ARCH_GET_FS`

@@ -1,0 +1,7 @@
+url = "boot://linux-dynamic-pie-smoke"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-dynamic-pie-smoke"
+args = ["linux-dynamic-pie-smoke"]
+env = []

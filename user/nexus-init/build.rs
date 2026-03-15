@@ -60,6 +60,10 @@ fn main() {
         manifest_dir.join("../linux-dynamic-runtime-main/dynamic_runtime_main.c");
     let linux_dynamic_runtime_interp_source =
         manifest_dir.join("../linux-dynamic-runtime-interp/dynamic_runtime_interp.c");
+    let linux_dynamic_pie_smoke_source =
+        manifest_dir.join("../linux-dynamic-pie-smoke/dynamic_pie_smoke.S");
+    let linux_dynamic_pie_main_source =
+        manifest_dir.join("../linux-dynamic-pie-main/dynamic_pie_main.c");
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
@@ -171,6 +175,14 @@ fn main() {
         "cargo:rerun-if-changed={}",
         linux_dynamic_runtime_interp_source.display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_dynamic_pie_smoke_source.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        linux_dynamic_pie_main_source.display()
+    );
     for manifest in [
         "root_component.toml",
         "root_component_round3.toml",
@@ -198,6 +210,7 @@ fn main() {
         "root_component_starnix_dynamic.toml",
         "root_component_starnix_dynamic_tls.toml",
         "root_component_starnix_dynamic_runtime.toml",
+        "root_component_starnix_dynamic_pie.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
@@ -225,6 +238,7 @@ fn main() {
         "linux_dynamic_elf_smoke.toml",
         "linux_dynamic_tls_smoke.toml",
         "linux_dynamic_runtime_smoke.toml",
+        "linux_dynamic_pie_smoke.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -329,6 +343,10 @@ fn main() {
             "root_component_starnix_dynamic_runtime.toml",
             "root_component_starnix_dynamic_runtime.nxcd",
         ),
+        (
+            "root_component_starnix_dynamic_pie.toml",
+            "root_component_starnix_dynamic_pie.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
@@ -409,6 +427,10 @@ fn main() {
         (
             "linux_dynamic_runtime_smoke.toml",
             "linux_dynamic_runtime_smoke.nxcd",
+        ),
+        (
+            "linux_dynamic_pie_smoke.toml",
+            "linux_dynamic_pie_smoke.nxcd",
         ),
     ] {
         let source_path = manifests_dir.join(input);
@@ -534,6 +556,15 @@ fn main() {
         &out_dir.join("ld-nexus-dynamic-runtime.so"),
         "ld-nexus-dynamic-runtime.so",
     );
+    build_linux_binary(
+        &linux_dynamic_pie_smoke_source,
+        &out_dir.join("linux-dynamic-pie-smoke"),
+    );
+    build_linux_dynamic_pie_binary(
+        &linux_dynamic_pie_main_source,
+        &out_dir.join("linux-dynamic-pie-main"),
+        "/lib/ld-nexus-dynamic-runtime.so",
+    );
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
         // Link the bootstrap userspace binary at the fixed VA currently
@@ -573,6 +604,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic_tls)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic_runtime)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic_pie)");
     match root_url.as_str() {
         "boot://root-starnix" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
@@ -649,6 +681,9 @@ fn main() {
         "boot://root-starnix-dynamic-runtime" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_dynamic_runtime");
         }
+        "boot://root-starnix-dynamic-pie" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_dynamic_pie");
+        }
         _ => {}
     }
     println!("cargo:rustc-env=NEXUS_INIT_ROOT_URL={root_url}");
@@ -692,6 +727,28 @@ fn build_linux_dynamic_binary(source: &Path, output: &Path, interp: &str) {
         .arg("-Wl,-z,max-page-size=4096")
         .arg("-Wl,--build-id=none")
         .arg("-Wl,--image-base=0x100000000")
+        .arg(format!("-Wl,{dynamic_linker}"))
+        .arg("-o")
+        .arg(output)
+        .arg(source)
+        .status()
+        .unwrap_or_else(|err| panic!("spawn {clang}: {err}"));
+    assert!(status.success(), "build {} failed", output.display());
+}
+
+fn build_linux_dynamic_pie_binary(source: &Path, output: &Path, interp: &str) {
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| String::from("clang"));
+    let dynamic_linker = format!("--dynamic-linker={interp}");
+    let status = Command::new(&clang)
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("-nostdlib")
+        .arg("-fPIE")
+        .arg("-pie")
+        .arg("-fuse-ld=lld")
+        .arg("-Wl,--entry=_start")
+        .arg("-Wl,-z,noexecstack")
+        .arg("-Wl,-z,max-page-size=4096")
+        .arg("-Wl,--build-id=none")
         .arg(format!("-Wl,{dynamic_linker}"))
         .arg("-o")
         .arg(output)

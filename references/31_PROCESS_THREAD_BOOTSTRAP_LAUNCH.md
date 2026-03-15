@@ -143,14 +143,14 @@ The first generic-launch contract is now implemented without changing syscall si
   into the fixed startup stack VMO.
 - The current v2 contract extends that blob with one optional interpreter header plus appended
   interpreter ELF bytes. This is the first dynamic-ELF bootstrap slice:
-  - one ET_EXEC main image may carry `PT_INTERP`
+  - one ET_EXEC or fixed-bias ET_DYN main image may carry `PT_INTERP`
   - the userspace executive resolves the interpreter bytes from its namespace
   - the kernel maps the interpreter as one additional process image using the supplied load bias
   - the initial entry comes from the interpreter and the userspace stack now carries `AT_BASE`
 - The current dynamic-TLS bootstrap still uses that same v2 exec-spec surface; it does not add a
   new syscall shape. The userspace executive now additionally:
   - parses static `PT_TLS` segments from:
-    - one ET_EXEC main image
+    - one ET_EXEC or fixed-bias ET_DYN main image
     - one ET_DYN interpreter image reached through `PT_INTERP`
   - builds one initial TLS image template from each static TLS segment
   - lays out the initial thread's static TLS so the main-image block remains adjacent to the TCB
@@ -223,7 +223,7 @@ The first generic-launch contract is now implemented without changing syscall si
   - ELF64
   - little-endian
   - x86_64
-  - ET_EXEC for the main image
+  - ET_EXEC for the main image, or one ET_DYN main image at the fixed native load bias
   - ET_DYN when the caller supplies one explicit page-aligned load bias for an interpreter image
 - The startup stack image is intentionally minimal today and does not yet carry the eventual full
   launcher-provided `argv` / `environ` contract, but the current Linux bootstrap path now does
@@ -249,5 +249,5 @@ The first generic-launch contract is now implemented without changing syscall si
   - a v1 exec-spec header with appended stack-image bytes
   - a v2 exec-spec header with optional appended interpreter metadata and interpreter bytes
   This is enough for the current bootstrap, minimal `execve()` replacement path, and first
-  `PT_INTERP` dynamic-ELF slice plus one ET_EXEC-main + one ET_DYN-interpreter static-TLS
-  initial-thread bootstrap, but it is not yet the final long-term contract.
+  `PT_INTERP` dynamic-ELF slice plus one ET_EXEC-or-ET_DYN main image + one ET_DYN-interpreter
+  static-TLS initial-thread bootstrap, but it is not yet the final long-term contract.
