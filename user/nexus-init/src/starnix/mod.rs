@@ -6,9 +6,15 @@ mod substrate;
 mod sys;
 mod task;
 
+use self::poll::epoll::{encode_epoll_events, read_guest_epoll_event};
+use self::poll::readiness::filter_wait_interest;
+use self::signal::action::{
+    read_guest_sigaction, read_guest_signal_mask, write_guest_sigaction, write_guest_signal_mask,
+};
 use self::substrate::guest::{
-    create_thread_carrier, linux_guest_initial_regs, prepare_process_carrier,
-    start_prepared_carrier_guest,
+    copy_guest_region, create_thread_carrier, linux_guest_initial_regs, prepare_process_carrier,
+    read_guest_bytes, read_guest_c_string, read_guest_i64, read_guest_u32, read_guest_u64,
+    start_prepared_carrier_guest, write_guest_bytes, write_guest_u32, write_guest_u64,
 };
 use self::substrate::restart::complete_syscall;
 
@@ -7983,25 +7989,6 @@ fn reserve_stack_blob<'a>(
     Ok(ptr)
 }
 
-fn read_guest_bytes(session: zx_handle_t, addr: u64, len: usize) -> Result<Vec<u8>, zx_status_t> {
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(len).map_err(|_| ZX_ERR_INTERNAL)?;
-    bytes.resize(len, 0);
-    let status = ax_guest_session_read_memory(session, addr, &mut bytes);
-    if status != ZX_OK {
-        return Err(status);
-    }
-    Ok(bytes)
-}
-
-fn read_guest_u32(session: zx_handle_t, addr: u64) -> Result<u32, zx_status_t> {
-    let bytes = read_guest_bytes(session, addr, 4)?;
-    let raw = bytes.get(..4).ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
-    Ok(u32::from_ne_bytes(
-        raw.try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
-    ))
-}
-
 fn read_guest_msghdr(session: zx_handle_t, addr: u64) -> Result<LinuxMsgHdr, zx_status_t> {
     let bytes = read_guest_bytes(session, addr, LINUX_MSGHDR_BYTES)?;
     let name_addr = u64::from_ne_bytes(
@@ -8200,15 +8187,6 @@ fn parse_scm_rights(
     }
 }
 
-fn write_guest_u32(session: zx_handle_t, addr: u64, value: u32) -> Result<(), zx_status_t> {
-    write_guest_bytes(session, addr, &value.to_ne_bytes())
-}
-
-fn write_guest_bytes(session: zx_handle_t, addr: u64, bytes: &[u8]) -> Result<(), zx_status_t> {
-    let status = ax_guest_session_write_memory(session, addr, bytes);
-    if status == ZX_OK { Ok(()) } else { Err(status) }
-}
-
 fn write_guest_recv_msghdr(
     session: zx_handle_t,
     msg_addr: u64,
@@ -8255,26 +8233,6 @@ fn encode_scm_rights_control(fds: &[i32]) -> Result<Vec<u8>, zx_status_t> {
         cursor += 4;
     }
     Ok(control)
-}
-
-fn copy_guest_region(
-    src_session: zx_handle_t,
-    dst_session: zx_handle_t,
-    base: u64,
-    len: u64,
-) -> Result<(), zx_status_t> {
-    let mut offset = 0u64;
-    let chunk = [0u8; 4096];
-    while offset < len {
-        let remaining = len - offset;
-        let chunk_len = remaining.min(chunk.len() as u64) as usize;
-        let bytes = read_guest_bytes(src_session, base + offset, chunk_len)?;
-        write_guest_bytes(dst_session, base + offset, &bytes)?;
-        offset = offset
-            .checked_add(chunk_len as u64)
-            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-    }
-    Ok(())
 }
 
 fn read_all_fd_bytes(ops: &dyn FdOps) -> Result<Vec<u8>, zx_status_t> {
@@ -8361,61 +8319,6 @@ fn filter_epoll_wait_interest(interest: WaitSpec, epoll_interest: u32) -> WaitSp
     WaitSpec::new(interest.handle(), signals)
 }
 
-fn read_guest_epoll_event(session: zx_handle_t, addr: u64) -> Result<LinuxEpollEvent, zx_status_t> {
-    let bytes = read_guest_bytes(session, addr, LINUX_EPOLL_EVENT_BYTES)?;
-    let raw = bytes
-        .get(..LINUX_EPOLL_EVENT_BYTES)
-        .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
-    Ok(LinuxEpollEvent {
-        events: u32::from_ne_bytes(raw[0..4].try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?),
-        data: u64::from_ne_bytes(
-            raw[4..12]
-                .try_into()
-                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
-        ),
-    })
-}
-
-fn encode_epoll_events(events: &[LinuxEpollEvent]) -> Result<Vec<u8>, zx_status_t> {
-    let total = events
-        .len()
-        .checked_mul(LINUX_EPOLL_EVENT_BYTES)
-        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(total)
-        .map_err(|_| ZX_ERR_NO_MEMORY)?;
-    bytes.resize(total, 0);
-    for (index, event) in events.iter().enumerate() {
-        let start = index
-            .checked_mul(LINUX_EPOLL_EVENT_BYTES)
-            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-        bytes[start..start + 4].copy_from_slice(&event.events.to_ne_bytes());
-        bytes[start + 4..start + 12].copy_from_slice(&event.data.to_ne_bytes());
-    }
-    Ok(bytes)
-}
-
-fn filter_wait_interest(interest: WaitSpec, op: FdWaitOp) -> WaitSpec {
-    let peer_closed = ZX_CHANNEL_PEER_CLOSED | ZX_SOCKET_PEER_CLOSED;
-    let signals = match op {
-        FdWaitOp::Read => {
-            interest.signals()
-                & (ZX_CHANNEL_READABLE
-                    | ZX_SOCKET_READABLE
-                    | EVENTFD_READABLE_SIGNAL
-                    | SIGNALFD_READABLE_SIGNAL
-                    | ZX_TIMER_SIGNALED
-                    | peer_closed)
-        }
-        FdWaitOp::Write => {
-            interest.signals()
-                & (ZX_CHANNEL_WRITABLE | ZX_SOCKET_WRITABLE | EVENTFD_WRITABLE_SIGNAL | peer_closed)
-        }
-    };
-    WaitSpec::new(interest.handle(), signals)
-}
-
 fn linux_signal_is_valid(signal: i32) -> bool {
     (1..=64).contains(&signal)
 }
@@ -8474,58 +8377,6 @@ fn normalize_signal_mask(mask: u64) -> u64 {
         normalized &= !bit;
     }
     normalized
-}
-
-fn read_guest_signal_mask(session: zx_handle_t, addr: u64) -> Result<u64, zx_status_t> {
-    let bytes = read_guest_bytes(session, addr, LINUX_SIGNAL_SET_BYTES)?;
-    let raw = bytes
-        .get(..LINUX_SIGNAL_SET_BYTES)
-        .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
-    Ok(u64::from_ne_bytes(
-        raw.try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
-    ))
-}
-
-fn write_guest_signal_mask(session: zx_handle_t, addr: u64, mask: u64) -> Result<(), zx_status_t> {
-    write_guest_bytes(session, addr, &mask.to_ne_bytes())
-}
-
-fn read_guest_sigaction(session: zx_handle_t, addr: u64) -> Result<LinuxSigAction, zx_status_t> {
-    let bytes = read_guest_bytes(session, addr, LINUX_SIGACTION_BYTES)?;
-    let raw = bytes
-        .get(..LINUX_SIGACTION_BYTES)
-        .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
-    Ok(LinuxSigAction {
-        handler: u64::from_ne_bytes(raw[0..8].try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?),
-        flags: u64::from_ne_bytes(
-            raw[8..16]
-                .try_into()
-                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
-        ),
-        restorer: u64::from_ne_bytes(
-            raw[16..24]
-                .try_into()
-                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
-        ),
-        mask: u64::from_ne_bytes(
-            raw[24..32]
-                .try_into()
-                .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
-        ),
-    })
-}
-
-fn write_guest_sigaction(
-    session: zx_handle_t,
-    addr: u64,
-    action: LinuxSigAction,
-) -> Result<(), zx_status_t> {
-    let mut bytes = [0u8; LINUX_SIGACTION_BYTES];
-    bytes[0..8].copy_from_slice(&action.handler.to_ne_bytes());
-    bytes[8..16].copy_from_slice(&action.flags.to_ne_bytes());
-    bytes[16..24].copy_from_slice(&action.restorer.to_ne_bytes());
-    bytes[24..32].copy_from_slice(&action.mask.to_ne_bytes());
-    write_guest_bytes(session, addr, &bytes)
 }
 
 fn linux_errno(errno: i32) -> u64 {
@@ -10663,50 +10514,12 @@ fn duplicate_linux_map_backing(backing: LinuxMapBacking) -> Result<LinuxMapBacki
     })
 }
 
-fn read_guest_c_string(
-    session: zx_handle_t,
-    addr: u64,
-    limit: usize,
-) -> Result<String, zx_status_t> {
-    let mut out = Vec::new();
-    out.try_reserve_exact(limit.min(256))
-        .map_err(|_| ZX_ERR_NO_MEMORY)?;
-    for index in 0..limit {
-        let mut byte = [0u8; 1];
-        let status = ax_guest_session_read_memory(session, addr + index as u64, &mut byte);
-        if status != ZX_OK {
-            return Err(status);
-        }
-        if byte[0] == 0 {
-            return String::from_utf8(out).map_err(|_| ZX_ERR_BAD_PATH);
-        }
-        out.push(byte[0]);
-    }
-    Err(ZX_ERR_OUT_OF_RANGE)
-}
-
-fn read_guest_u64(session: zx_handle_t, addr: u64) -> Result<u64, zx_status_t> {
-    let bytes = read_guest_bytes(session, addr, 8)?;
-    Ok(u64::from_ne_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ]))
-}
-
 fn linux_arg_i32(raw: u64) -> i32 {
     raw as u32 as i32
 }
 
 fn linux_arg_u32(raw: u64) -> u32 {
     raw as u32
-}
-
-fn write_guest_u64(session: zx_handle_t, addr: u64, value: u64) -> Result<(), zx_status_t> {
-    write_guest_bytes(session, addr, &value.to_ne_bytes())
-}
-
-fn read_guest_i64(session: zx_handle_t, addr: u64) -> Result<i64, zx_status_t> {
-    let value = read_guest_u64(session, addr)?;
-    Ok(i64::from_ne_bytes(value.to_ne_bytes()))
 }
 
 fn read_guest_robust_list_head(

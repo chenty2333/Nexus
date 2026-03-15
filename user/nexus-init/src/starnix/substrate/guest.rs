@@ -163,3 +163,114 @@ pub(in crate::starnix) fn create_thread_carrier(
         packet_key,
     })
 }
+
+pub(in crate::starnix) fn read_guest_bytes(
+    session: zx_handle_t,
+    addr: u64,
+    len: usize,
+) -> Result<Vec<u8>, zx_status_t> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| ZX_ERR_INTERNAL)?;
+    bytes.resize(len, 0);
+    let status = ax_guest_session_read_memory(session, addr, &mut bytes);
+    if status != ZX_OK {
+        return Err(status);
+    }
+    Ok(bytes)
+}
+
+pub(in crate::starnix) fn read_guest_u32(
+    session: zx_handle_t,
+    addr: u64,
+) -> Result<u32, zx_status_t> {
+    let bytes = read_guest_bytes(session, addr, 4)?;
+    let raw = bytes.get(..4).ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
+    Ok(u32::from_ne_bytes(
+        raw.try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    ))
+}
+
+pub(in crate::starnix) fn write_guest_u32(
+    session: zx_handle_t,
+    addr: u64,
+    value: u32,
+) -> Result<(), zx_status_t> {
+    write_guest_bytes(session, addr, &value.to_ne_bytes())
+}
+
+pub(in crate::starnix) fn write_guest_bytes(
+    session: zx_handle_t,
+    addr: u64,
+    bytes: &[u8],
+) -> Result<(), zx_status_t> {
+    let status = ax_guest_session_write_memory(session, addr, bytes);
+    if status == ZX_OK { Ok(()) } else { Err(status) }
+}
+
+pub(in crate::starnix) fn copy_guest_region(
+    src_session: zx_handle_t,
+    dst_session: zx_handle_t,
+    base: u64,
+    len: u64,
+) -> Result<(), zx_status_t> {
+    let mut offset = 0u64;
+    let chunk = [0u8; 4096];
+    while offset < len {
+        let remaining = len - offset;
+        let chunk_len = remaining.min(chunk.len() as u64) as usize;
+        let bytes = read_guest_bytes(src_session, base + offset, chunk_len)?;
+        write_guest_bytes(dst_session, base + offset, &bytes)?;
+        offset = offset
+            .checked_add(chunk_len as u64)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    }
+    Ok(())
+}
+
+pub(in crate::starnix) fn read_guest_c_string(
+    session: zx_handle_t,
+    addr: u64,
+    limit: usize,
+) -> Result<String, zx_status_t> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(limit.min(256))
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    for index in 0..limit {
+        let mut byte = [0u8; 1];
+        let status = ax_guest_session_read_memory(session, addr + index as u64, &mut byte);
+        if status != ZX_OK {
+            return Err(status);
+        }
+        if byte[0] == 0 {
+            return String::from_utf8(out).map_err(|_| ZX_ERR_BAD_PATH);
+        }
+        out.push(byte[0]);
+    }
+    Err(ZX_ERR_OUT_OF_RANGE)
+}
+
+pub(in crate::starnix) fn read_guest_u64(
+    session: zx_handle_t,
+    addr: u64,
+) -> Result<u64, zx_status_t> {
+    let bytes = read_guest_bytes(session, addr, 8)?;
+    Ok(u64::from_ne_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
+pub(in crate::starnix) fn write_guest_u64(
+    session: zx_handle_t,
+    addr: u64,
+    value: u64,
+) -> Result<(), zx_status_t> {
+    write_guest_bytes(session, addr, &value.to_ne_bytes())
+}
+
+pub(in crate::starnix) fn read_guest_i64(
+    session: zx_handle_t,
+    addr: u64,
+) -> Result<i64, zx_status_t> {
+    let value = read_guest_u64(session, addr)?;
+    Ok(i64::from_ne_bytes(value.to_ne_bytes()))
+}
