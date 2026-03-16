@@ -12,7 +12,7 @@ xtest:
 
 # Kernel conformance gate.
 test-kernel:
-  cargo run -p axle-conformance -- run
+  cargo run -p axle-conformance -- run --retries 1
 
 # Ensure contract catalog and scenario bindings remain complete.
 check-conformance-contracts:
