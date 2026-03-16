@@ -201,6 +201,7 @@ extern "C" fn axle_ipi_reschedule_rust(
         return;
     }
     let from_user = unsafe { (*cpu_frame.add(1) & 0b11) == 0b11 };
+    crate::trace::record_resched_ipi(from_user);
     if from_user {
         let _ = crate::object::finish_reschedule_interrupt(frame, cpu_frame);
     }

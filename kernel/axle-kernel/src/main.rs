@@ -20,6 +20,7 @@ mod smp;
 mod syscall;
 mod task;
 mod time;
+mod trace;
 mod trap;
 mod userspace;
 mod wait;

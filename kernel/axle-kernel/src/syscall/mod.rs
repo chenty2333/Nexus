@@ -495,10 +495,13 @@ fn dispatch_syscall_with_ctx(
 /// Dispatch a syscall from the architecture trap frame and write status back.
 pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame, cpu_frame: *const u64) {
     let mut ctx = SyscallCtx::from_trapframe(frame, cpu_frame);
-    let status = match u32::try_from(frame.syscall_nr()) {
+    let syscall_nr = frame.syscall_nr();
+    crate::trace::record_sys_enter(syscall_nr);
+    let status = match u32::try_from(syscall_nr) {
         Ok(nr) => dispatch_syscall_with_ctx(&mut ctx, nr, frame.args()),
         Err(_) => ZX_ERR_BAD_SYSCALL,
     };
+    crate::trace::record_sys_exit(syscall_nr, status);
     frame.set_status(status);
     ctx.finish(frame);
 }

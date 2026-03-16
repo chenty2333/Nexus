@@ -155,6 +155,7 @@ extern "C" fn axle_timer_rust(frame: &mut crate::arch::int80::TrapFrame, cpu_fra
     on_tick();
     let now = crate::time::now_ns();
     let needs_trap_exit = crate::object::timer_interrupt_requires_trap_exit(now).unwrap_or(false);
+    crate::trace::record_timer_fire(from_user, needs_trap_exit);
     if from_user && needs_trap_exit {
         let _ = crate::object::finish_timer_interrupt(frame, cpu_frame);
     }

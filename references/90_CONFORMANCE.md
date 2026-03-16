@@ -72,6 +72,13 @@ Main just targets include:
     - one dispatcher timer instead of one kernel timer per sleep future
     - task wakeups routed through user packets on the dispatcher port
     - async channel receive/call and socket readiness paths
+- Bootstrap performance-smoke coverage now also includes one minimal measurement gate:
+  - a bootstrap ring3 runner can execute `null_syscall`, `wait_one` ping-pong, and cross-core
+    wake-path smoke loops under QEMU
+  - the kernel exports one bootstrap VMO-backed trace summary covering at least syscall,
+    scheduler, and timer events
+  - the scenario currently acts as a wiring and attribution gate, not as a stable performance
+    regression threshold
 - Component-framework bootstrap coverage now also includes one eager-topology gate:
   - a minimal `nexus-init` can resolve a root manifest and launch eager ELF children
   - one protocol route through `/svc` is exercised end-to-end

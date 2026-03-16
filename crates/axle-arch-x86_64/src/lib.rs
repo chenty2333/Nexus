@@ -97,3 +97,11 @@ pub fn debug_break() -> ! {
         core::hint::spin_loop();
     }
 }
+
+/// Read the x86_64 time-stamp counter.
+#[inline(always)]
+pub fn rdtsc() -> u64 {
+    // SAFETY: `rdtsc` only reads the CPU time-stamp counter and does not
+    // access memory.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}

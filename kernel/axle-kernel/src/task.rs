@@ -5776,6 +5776,9 @@ impl Kernel {
         }
         if queued_on_cpu.is_none() {
             let target_cpu = self.choose_wake_cpu(thread_id);
+            if target_cpu != self.current_cpu_id() {
+                crate::trace::record_remote_wake(thread_id, target_cpu);
+            }
             if matches!(previous_state, ThreadState::Blocked { .. }) {
                 self.enqueue_runnable_thread_front_on_cpu(thread_id, target_cpu)?;
             } else {
