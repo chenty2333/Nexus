@@ -581,7 +581,11 @@ const SLOT_PERF_TLB_PEER_ITERS: usize = 644;
 const SLOT_PERF_TLB_PEER_CYCLES: usize = 645;
 const SLOT_TRACE_TLB_SYNC_PLAN_PHASE5: usize = 646;
 const SLOT_TRACE_TLB_SHOOTDOWN_FULL_PHASE5: usize = 647;
-const SLOT_MAX: usize = SLOT_TRACE_TLB_SHOOTDOWN_FULL_PHASE5;
+const SLOT_TRACE_SYS_ENTER_PHASE1: usize = 654;
+const SLOT_TRACE_SYS_EXIT_PHASE1: usize = 655;
+const SLOT_TRACE_SYS_RETIRE_PHASE1: usize = 656;
+const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
+const SLOT_MAX: usize = SLOT_TRACE_CONTEXT_SWITCHES;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1520,6 +1524,10 @@ fn update_perf_trace_slots(slots: &mut [u64]) {
     slots[SLOT_TRACE_DROPPED] = crate::trace::bootstrap_trace_dropped_count();
     slots[SLOT_TRACE_EXPORTED_BYTES] = crate::trace::bootstrap_trace_exported_bytes();
     slots[SLOT_TRACE_REMOTE_WAKE_PHASE3] = crate::trace::bootstrap_trace_remote_wake_phase3();
+    slots[SLOT_TRACE_SYS_ENTER_PHASE1] = crate::trace::bootstrap_trace_sys_enter_phase1();
+    slots[SLOT_TRACE_SYS_EXIT_PHASE1] = crate::trace::bootstrap_trace_sys_exit_phase1();
+    slots[SLOT_TRACE_SYS_RETIRE_PHASE1] = crate::trace::bootstrap_trace_sys_retire_phase1();
+    slots[SLOT_TRACE_CONTEXT_SWITCHES] = crate::trace::bootstrap_trace_context_switch_count();
     slots[SLOT_TRACE_TIMER_REPROGRAM] = crate::trace::bootstrap_trace_timer_reprogram_count();
     slots[SLOT_TRACE_TLB_SYNC_PLANS] = crate::trace::bootstrap_trace_tlb_sync_plan_count();
     slots[SLOT_TRACE_TLB_LOCAL_PAGE_FLUSH] =
@@ -1544,7 +1552,7 @@ fn print_perf_summary(slots: &mut [u64]) {
     crate::trace::flush_bootstrap_trace();
     update_perf_trace_slots(slots);
     crate::kprintln!(
-        "kernel: bootstrap perf smoke (perf_failure_step={}, perf_thread_create={}, perf_thread_start={}, perf_eventpair_create={}, perf_null_status={}, perf_null_iters={}, perf_null_cycles={}, perf_wait_status={}, perf_wait_iters={}, perf_wait_cycles={}, perf_wake_status={}, perf_wake_iters={}, perf_wake_cycles={}, perf_tlb_status={}, perf_tlb_iters={}, perf_tlb_cycles={}, perf_tlb_peer_status={}, perf_tlb_peer_iters={}, perf_tlb_peer_cycles={}, trace_vmo_h={}, trace_records={}, trace_dropped={}, trace_export_bytes={}, trace_remote_wake_phase3={}, trace_timer_reprogram={}, trace_tlb_sync_plans={}, trace_tlb_local_page_flush={}, trace_tlb_local_full_flush={}, trace_tlb_shootdown_page={}, trace_tlb_shootdown_full={}, trace_tlb_shootdown_target_cpus={}, trace_tlb_max_active_cpus={}, trace_tlb_last_active_mask={}, trace_tlb_page_flush_phase4={}, trace_tlb_full_flush_phase4={}, trace_tlb_sync_plan_phase4={}, trace_tlb_sync_plan_phase5={}, trace_tlb_shootdown_full_phase5={})",
+        "kernel: bootstrap perf smoke (perf_failure_step={}, perf_thread_create={}, perf_thread_start={}, perf_eventpair_create={}, perf_null_status={}, perf_null_iters={}, perf_null_cycles={}, perf_wait_status={}, perf_wait_iters={}, perf_wait_cycles={}, perf_wake_status={}, perf_wake_iters={}, perf_wake_cycles={}, perf_tlb_status={}, perf_tlb_iters={}, perf_tlb_cycles={}, perf_tlb_peer_status={}, perf_tlb_peer_iters={}, perf_tlb_peer_cycles={}, trace_vmo_h={}, trace_records={}, trace_dropped={}, trace_export_bytes={}, trace_remote_wake_phase3={}, trace_sys_enter_phase1={}, trace_sys_exit_phase1={}, trace_sys_retire_phase1={}, trace_context_switches={}, trace_timer_reprogram={}, trace_tlb_sync_plans={}, trace_tlb_local_page_flush={}, trace_tlb_local_full_flush={}, trace_tlb_shootdown_page={}, trace_tlb_shootdown_full={}, trace_tlb_shootdown_target_cpus={}, trace_tlb_max_active_cpus={}, trace_tlb_last_active_mask={}, trace_tlb_page_flush_phase4={}, trace_tlb_full_flush_phase4={}, trace_tlb_sync_plan_phase4={}, trace_tlb_sync_plan_phase5={}, trace_tlb_shootdown_full_phase5={})",
         slots[SLOT_PERF_FAILURE_STEP],
         slots[SLOT_PERF_THREAD_CREATE] as i64,
         slots[SLOT_PERF_THREAD_START] as i64,
@@ -1569,6 +1577,10 @@ fn print_perf_summary(slots: &mut [u64]) {
         slots[SLOT_TRACE_DROPPED],
         slots[SLOT_TRACE_EXPORTED_BYTES],
         slots[SLOT_TRACE_REMOTE_WAKE_PHASE3],
+        slots[SLOT_TRACE_SYS_ENTER_PHASE1],
+        slots[SLOT_TRACE_SYS_EXIT_PHASE1],
+        slots[SLOT_TRACE_SYS_RETIRE_PHASE1],
+        slots[SLOT_TRACE_CONTEXT_SWITCHES],
         slots[SLOT_TRACE_TIMER_REPROGRAM],
         slots[SLOT_TRACE_TLB_SYNC_PLANS],
         slots[SLOT_TRACE_TLB_LOCAL_PAGE_FLUSH],

@@ -26,17 +26,19 @@ pub(crate) enum TraceCategory {
 pub(crate) enum TraceEvent {
     SysEnter = 1,
     SysExit = 2,
-    RemoteWake = 3,
-    ReschedIpi = 4,
-    TimerFire = 5,
-    TimerReprogram = 6,
-    TlbSyncPlan = 7,
-    TlbFlushPage = 8,
-    TlbFlushAll = 9,
-    TlbShootdownPage = 10,
-    TlbShootdownAll = 11,
-    IrqEnter = 12,
-    IrqExit = 13,
+    SysRetire = 3,
+    RemoteWake = 4,
+    ReschedIpi = 5,
+    TimerFire = 6,
+    TimerReprogram = 7,
+    TlbSyncPlan = 8,
+    TlbFlushPage = 9,
+    TlbFlushAll = 10,
+    TlbShootdownPage = 11,
+    TlbShootdownAll = 12,
+    IrqEnter = 13,
+    IrqExit = 14,
+    ContextSwitch = 15,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -77,17 +79,19 @@ impl TraceRecord {
         match (self.meta & 0xffff) as u16 {
             1 => TraceEvent::SysEnter,
             2 => TraceEvent::SysExit,
-            3 => TraceEvent::RemoteWake,
-            4 => TraceEvent::ReschedIpi,
-            5 => TraceEvent::TimerFire,
-            6 => TraceEvent::TimerReprogram,
-            7 => TraceEvent::TlbSyncPlan,
-            8 => TraceEvent::TlbFlushPage,
-            9 => TraceEvent::TlbFlushAll,
-            10 => TraceEvent::TlbShootdownPage,
-            11 => TraceEvent::TlbShootdownAll,
-            12 => TraceEvent::IrqEnter,
-            13 => TraceEvent::IrqExit,
+            3 => TraceEvent::SysRetire,
+            4 => TraceEvent::RemoteWake,
+            5 => TraceEvent::ReschedIpi,
+            6 => TraceEvent::TimerFire,
+            7 => TraceEvent::TimerReprogram,
+            8 => TraceEvent::TlbSyncPlan,
+            9 => TraceEvent::TlbFlushPage,
+            10 => TraceEvent::TlbFlushAll,
+            11 => TraceEvent::TlbShootdownPage,
+            12 => TraceEvent::TlbShootdownAll,
+            13 => TraceEvent::IrqEnter,
+            14 => TraceEvent::IrqExit,
+            15 => TraceEvent::ContextSwitch,
             _ => TraceEvent::SysEnter,
         }
     }
@@ -98,6 +102,10 @@ static TRACE_RECORD_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_EXPORTED_BYTES: AtomicU64 = AtomicU64::new(0);
 static TRACE_REMOTE_WAKE_PHASE3: AtomicU64 = AtomicU64::new(0);
+static TRACE_SYS_ENTER_PHASE1: AtomicU64 = AtomicU64::new(0);
+static TRACE_SYS_EXIT_PHASE1: AtomicU64 = AtomicU64::new(0);
+static TRACE_SYS_RETIRE_PHASE1: AtomicU64 = AtomicU64::new(0);
+static TRACE_CONTEXT_SWITCH_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_TIMER_REPROGRAM_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_TLB_SYNC_PLAN_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_TLB_LOCAL_PAGE_FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -139,6 +147,22 @@ pub(crate) fn bootstrap_trace_exported_bytes() -> u64 {
 
 pub(crate) fn bootstrap_trace_remote_wake_phase3() -> u64 {
     TRACE_REMOTE_WAKE_PHASE3.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sys_enter_phase1() -> u64 {
+    TRACE_SYS_ENTER_PHASE1.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sys_exit_phase1() -> u64 {
+    TRACE_SYS_EXIT_PHASE1.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sys_retire_phase1() -> u64 {
+    TRACE_SYS_RETIRE_PHASE1.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_context_switch_count() -> u64 {
+    TRACE_CONTEXT_SWITCH_COUNT.load(Ordering::Acquire)
 }
 
 pub(crate) fn bootstrap_trace_timer_reprogram_count() -> u64 {
@@ -213,6 +237,10 @@ pub(crate) fn init_bootstrap_trace() {
     TRACE_DROPPED_COUNT.store(0, Ordering::Release);
     TRACE_EXPORTED_BYTES.store(0, Ordering::Release);
     TRACE_REMOTE_WAKE_PHASE3.store(0, Ordering::Release);
+    TRACE_SYS_ENTER_PHASE1.store(0, Ordering::Release);
+    TRACE_SYS_EXIT_PHASE1.store(0, Ordering::Release);
+    TRACE_SYS_RETIRE_PHASE1.store(0, Ordering::Release);
+    TRACE_CONTEXT_SWITCH_COUNT.store(0, Ordering::Release);
     TRACE_TIMER_REPROGRAM_COUNT.store(0, Ordering::Release);
     TRACE_TLB_SYNC_PLAN_COUNT.store(0, Ordering::Release);
     TRACE_TLB_LOCAL_PAGE_FLUSH_COUNT.store(0, Ordering::Release);
@@ -285,6 +313,15 @@ pub(crate) fn record_sys_exit(syscall_nr: u64, status: axle_types::zx_status_t) 
     );
 }
 
+pub(crate) fn record_sys_retire(syscall_nr: u64, status: axle_types::zx_status_t) {
+    record(
+        TraceCategory::Syscall,
+        TraceEvent::SysRetire,
+        syscall_nr,
+        (status as i64) as u64,
+    );
+}
+
 pub(crate) fn record_remote_wake(thread_id: u64, target_cpu: usize) {
     record(
         TraceCategory::Sched,
@@ -300,6 +337,23 @@ pub(crate) fn record_resched_ipi(from_user: bool) {
         TraceEvent::ReschedIpi,
         u64::from(from_user),
         0,
+    );
+}
+
+pub(crate) fn record_context_switch(
+    previous_thread_id: Option<u64>,
+    next_thread_id: u64,
+    address_space_switched: bool,
+) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_CONTEXT_SWITCH_COUNT.fetch_add(1, Ordering::AcqRel);
+    record(
+        TraceCategory::Sched,
+        TraceEvent::ContextSwitch,
+        previous_thread_id.unwrap_or(u64::MAX),
+        next_thread_id | (u64::from(u8::from(address_space_switched)) << 63),
     );
 }
 
@@ -480,6 +534,7 @@ fn event_name(event: TraceEvent) -> &'static str {
     match event {
         TraceEvent::SysEnter => "sys_enter",
         TraceEvent::SysExit => "sys_exit",
+        TraceEvent::SysRetire => "sys_retire",
         TraceEvent::RemoteWake => "remote_wake",
         TraceEvent::ReschedIpi => "resched_ipi",
         TraceEvent::TimerFire => "timer_fire",
@@ -491,6 +546,7 @@ fn event_name(event: TraceEvent) -> &'static str {
         TraceEvent::TlbShootdownAll => "tlb_shootdown_all",
         TraceEvent::IrqEnter => "irq_enter",
         TraceEvent::IrqExit => "irq_exit",
+        TraceEvent::ContextSwitch => "context_switch",
     }
 }
 
@@ -502,6 +558,27 @@ pub(crate) fn flush_bootstrap_trace() {
         .filter(|record| record.phase == 3 && record.event() == TraceEvent::RemoteWake)
         .count() as u64;
     TRACE_REMOTE_WAKE_PHASE3.store(remote_wake_phase3, Ordering::Release);
+    TRACE_SYS_ENTER_PHASE1.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 1 && record.event() == TraceEvent::SysEnter)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_SYS_EXIT_PHASE1.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 1 && record.event() == TraceEvent::SysExit)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_SYS_RETIRE_PHASE1.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 1 && record.event() == TraceEvent::SysRetire)
+            .count() as u64,
+        Ordering::Release,
+    );
     TRACE_TLB_PAGE_FLUSH_PHASE4.store(
         records
             .iter()

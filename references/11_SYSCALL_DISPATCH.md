@@ -57,9 +57,11 @@ This file describes the current syscall-number source, trap entry, argument copy
   - typed pointer / sink decode and output probe planning
   - trap-exit / restartable tail handling through `finish_syscall()`
 - `invoke_from_trapframe()` now does only three things:
+- `invoke_from_trapframe()` now does only four things:
   - build `SyscallCtx`
   - resolve one syscall descriptor by number and invoke it
   - write the returned status and run `ctx.finish()`
+  - emit one `sys_retire` trace event only after trap-exit completion has finished
 - Supported syscalls now dispatch through one lightweight descriptor pipeline:
   - `decode(ctx, raw_args) -> Request + writeback plan`
   - `run(request) -> Response`
@@ -115,6 +117,10 @@ The current bootstrap syscall surface includes:
 - Known-but-unimplemented paths use `ZX_ERR_NOT_SUPPORTED`.
 - Type, rights, pointer, and object-state checks are largely delegated into the object layer after the syscall shell validates raw arguments.
 - A syscall can leave the thread blocked; trap-exit handling then decides whether to return to user mode, switch threads, or block current execution.
+- The bootstrap perf trace now distinguishes:
+  - dispatch completion (`sys_exit`)
+  - actual return-to-user retirement (`sys_retire`)
+  so blocked or scheduler-mediated syscall completion can be observed separately from plain dispatch.
 - For output-producing syscalls that can create, dequeue, or otherwise commit kernel-visible state,
   the syscall shell now probes user outputs before the run stage so copyout failures do not trail
   committed side effects.

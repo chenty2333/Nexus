@@ -60,6 +60,11 @@ The kernel then:
   - `rdi/rsi/rdx/r10/r8/r9` = args 0..5
 - The assembly stub saves a full register snapshot and hands control to the Rust syscall layer.
 - Return status is written back to `rax` before `iretq`.
+- The bootstrap trace stream now exposes three native `int 0x80` edges:
+  - `sys_enter` when the trap frame first reaches the syscall layer
+  - `sys_exit` after dispatch returns a status
+  - `sys_retire` only after trap-exit completion has finished and the thread is about to return to
+    user mode
 - There is no `SYSCALL/SYSRET` path yet.
 
 This is a deliberate bootstrap path, not yet a final fast syscall mechanism.
@@ -130,3 +135,5 @@ stack preserves nested interrupt frames, while `#PF` / `#GP` still keep a dedica
   the BSP remains the coarse fallback scheduler tick source.
 - SMP now includes the minimum scheduler/IPI glue needed for per-CPU runnable ownership, but it is
   still not the final architecture.
+- The bootstrap trace stream now also marks timer and reschedule IRQ boundaries explicitly with
+  `irq_enter` / `irq_exit`, and records scheduler context switches as separate events.

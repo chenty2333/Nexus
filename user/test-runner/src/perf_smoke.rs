@@ -191,6 +191,7 @@ fn run_perf_smoke() -> PerfSummary {
     }
     summary.null_cycles = axle_arch_x86_64::rdtsc().wrapping_sub(null_start);
     summary.null_status = ZX_OK as i64;
+    write_slot(SLOT_TRACE_PHASE, 0);
 
     let wait = run_eventpair_roundtrip(
         self_process,

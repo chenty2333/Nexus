@@ -5717,6 +5717,7 @@ impl Kernel {
             .context
             .ok_or(ZX_ERR_BAD_STATE)?;
         next_page_tables.activate().map_err(map_page_table_error)?;
+        let address_space_switched = current_address_space_id != Some(next_address_space_id);
         if let Some(current_address_space_id) = current_address_space_id {
             if current_address_space_id != next_address_space_id {
                 self.with_vm_mut(|vm| {
@@ -5727,6 +5728,7 @@ impl Kernel {
         self.observe_cpu_tlb_epoch_for_address_space(next_address_space_id, current_cpu_id);
         self.current_cpu_scheduler_mut().current_thread_id = Some(thread_id);
         self.arm_current_slice_from(self.current_cpu_now_ns());
+        crate::trace::record_context_switch(previous_thread_id, thread_id, address_space_switched);
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         thread.last_cpu = current_cpu_id;
         Ok(context)

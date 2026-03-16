@@ -504,6 +504,7 @@ pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame, cpu_fram
     crate::trace::record_sys_exit(syscall_nr, status);
     frame.set_status(status);
     ctx.finish(frame);
+    crate::trace::record_sys_retire(syscall_nr, status);
 }
 
 fn user_stack_ptr_from_cpu_frame(cpu_frame: *const u64) -> Result<u64, zx_status_t> {

@@ -77,6 +77,9 @@ Main just targets include:
     wake-path smoke loops under QEMU
   - the kernel exports one bootstrap VMO-backed trace summary covering syscall, scheduler,
     timer, and TLB events, including irq enter/exit edges on timer and reschedule handlers
+  - the same summary now distinguishes syscall dispatch completion from actual return-to-user
+    retirement through `sys_enter` / `sys_exit` / `sys_retire` counts for the deterministic
+    null-syscall phase
   - the same runner now also executes one narrow VMAR map/protect/unmap churn slice so TLB-local
     page-flush telemetry is exercised and parsed through the same key=value summary path
   - one follow-on active-peer TLB slice now keeps the same address space live on both CPUs long
