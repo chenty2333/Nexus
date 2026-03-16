@@ -3,7 +3,8 @@ success_message:
     .ascii "runtime misc ok\n"
 success_message_len = . - success_message
 runtime_misc_path:
-    .asciz "bin/linux-runtime-misc-smoke"
+    .asciz "/bin/linux-runtime-misc-smoke"
+runtime_misc_path_len = . - runtime_misc_path - 1
 proc_self_exe:
     .asciz "/proc/self/exe"
 proc_self_cwd:
@@ -91,12 +92,12 @@ _start:
     mov $128, %edx
     mov $89, %eax
     syscall
-    cmpq $28, %rax
+    cmpq $runtime_misc_path_len, %rax
     jne fail_9
 
     lea 64(%rsp), %rdi
     lea runtime_misc_path(%rip), %rsi
-    mov $28, %edx
+    mov $runtime_misc_path_len, %edx
     call bytes_equal
     test %eax, %eax
     jz fail_10

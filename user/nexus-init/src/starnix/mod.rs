@@ -5834,7 +5834,10 @@ fn resolve_exec_payload_source(
         .try_reserve_exact(bytes.len())
         .map_err(|_| ZX_ERR_NO_MEMORY)?;
     owned.extend_from_slice(bytes);
-    Ok((String::from(path), owned))
+    let stored_path = namespace
+        .resolve_path(path)
+        .unwrap_or_else(|_| String::from(path));
+    Ok((stored_path, owned))
 }
 
 fn file_description_key(description: &Arc<OpenFileDescription>) -> LinuxFileDescriptionKey {
@@ -7630,7 +7633,7 @@ mod tests {
             sigchld_info: None,
             sigactions: BTreeMap::new(),
             image: Some(TaskImage {
-                path: String::from("bin/linux-round6-proc-job-smoke"),
+                path: String::from("/bin/linux-round6-proc-job-smoke"),
                 cmdline: b"linux-round6-proc-job-smoke\0".to_vec(),
                 exec_blob: Vec::new(),
                 initial_tls_modules: Vec::new(),
@@ -7792,7 +7795,7 @@ mod tests {
             kernel
                 .resolve_proc_readlink_target(1, "/proc/self/exe")
                 .expect("proc exe target"),
-            "bin/linux-round6-proc-job-smoke"
+            "/bin/linux-round6-proc-job-smoke"
         );
         assert_eq!(
             kernel

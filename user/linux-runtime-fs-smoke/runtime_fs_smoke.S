@@ -3,7 +3,7 @@ success_message:
     .ascii "runtime fs ok\n"
 success_message_len = . - success_message
 runtime_fs_path:
-    .asciz "bin/linux-runtime-fs-smoke"
+    .asciz "/bin/linux-runtime-fs-smoke"
 runtime_fs_path_len = . - runtime_fs_path - 1
 tmp_file_path:
     .asciz "/tmp/runtime-fs.bin"
