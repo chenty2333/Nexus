@@ -11,6 +11,9 @@ use self::fs::unix::{
     read_guest_msghdr, scm_rights_control_bytes, total_iovec_len, write_guest_iovec_payload,
     write_guest_recv_msghdr,
 };
+use self::mm::exec::{
+    open_exec_image_from_namespace, read_exec_image_bytes_from_namespace, read_guest_string_array,
+};
 use self::poll::epoll::{encode_epoll_events, read_guest_epoll_event};
 use self::poll::readiness::filter_wait_interest;
 use self::signal::action::{
@@ -7994,38 +7997,6 @@ fn reserve_stack_blob<'a>(
     Ok(ptr)
 }
 
-fn read_all_fd_bytes(ops: &dyn FdOps) -> Result<Vec<u8>, zx_status_t> {
-    let metadata = local_fd_metadata(ops).ok_or(ZX_ERR_NOT_SUPPORTED)?;
-    let len = usize::try_from(metadata.size_bytes).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
-    bytes.resize(len, 0);
-    let actual = ops.read(&mut bytes)?;
-    bytes.truncate(actual);
-    Ok(bytes)
-}
-
-fn open_exec_image_from_namespace(
-    namespace: &nexus_io::ProcessNamespace,
-    path: &str,
-) -> Result<(String, Vec<u8>, zx_handle_t), zx_status_t> {
-    let resolved = namespace.resolve_path(path)?;
-    let ops = namespace.open(resolved.as_str(), OpenFlags::READABLE)?;
-    let bytes = read_all_fd_bytes(ops.as_ref())?;
-    let vmo = ops.as_vmo(nexus_io::VmoFlags::READ | nexus_io::VmoFlags::EXECUTE)?;
-    Ok((resolved, bytes, vmo))
-}
-
-fn read_exec_image_bytes_from_namespace(
-    namespace: &nexus_io::ProcessNamespace,
-    path: &str,
-) -> Result<(String, Vec<u8>), zx_status_t> {
-    let resolved = namespace.resolve_path(path)?;
-    let ops = namespace.open(resolved.as_str(), OpenFlags::READABLE)?;
-    let bytes = read_all_fd_bytes(ops.as_ref())?;
-    Ok((resolved, bytes))
-}
-
 fn file_description_key(description: &Arc<OpenFileDescription>) -> LinuxFileDescriptionKey {
     LinuxFileDescriptionKey(Arc::as_ptr(description) as usize)
 }
@@ -10322,30 +10293,6 @@ fn read_guest_itimerspec(session: zx_handle_t, addr: u64) -> Result<LinuxItimerS
         interval_ns: parse_linux_timespec_ns(&raw[..LINUX_TIMESPEC_BYTES])?,
         value_ns: parse_linux_timespec_ns(&raw[LINUX_TIMESPEC_BYTES..LINUX_ITIMERSPEC_BYTES])?,
     })
-}
-
-fn read_guest_string_array(
-    session: zx_handle_t,
-    addr: u64,
-    max_entries: usize,
-) -> Result<Vec<String>, zx_status_t> {
-    if addr == 0 {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    out.try_reserve(max_entries.min(8))
-        .map_err(|_| ZX_ERR_NO_MEMORY)?;
-    for index in 0..max_entries {
-        let entry_addr = addr
-            .checked_add((index * 8) as u64)
-            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-        let value = read_guest_u64(session, entry_addr)?;
-        if value == 0 {
-            return Ok(out);
-        }
-        out.push(read_guest_c_string(session, value, LINUX_PATH_MAX)?);
-    }
-    Err(ZX_ERR_OUT_OF_RANGE)
 }
 
 fn decode_open_flags(flags: u64) -> (OpenFlags, FdFlags) {
