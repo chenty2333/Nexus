@@ -1,5 +1,21 @@
 use super::super::*;
 
+pub(in crate::starnix) struct PreparedProcessCarrier {
+    pub(in crate::starnix) process_handle: zx_handle_t,
+    pub(in crate::starnix) root_vmar: zx_handle_t,
+    pub(in crate::starnix) carrier: TaskCarrier,
+    pub(in crate::starnix) prepared_entry: u64,
+    pub(in crate::starnix) prepared_stack: u64,
+}
+
+impl PreparedProcessCarrier {
+    pub(in crate::starnix) fn close(self) {
+        self.carrier.close();
+        let _ = zx_handle_close(self.root_vmar);
+        let _ = zx_handle_close(self.process_handle);
+    }
+}
+
 pub(in crate::starnix) fn prepare_process_carrier(
     parent_process: zx_handle_t,
     port: zx_handle_t,

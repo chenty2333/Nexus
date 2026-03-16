@@ -1,3 +1,4 @@
+mod bootstrap;
 mod fs;
 mod mm;
 mod poll;
@@ -17,8 +18,8 @@ use self::fs::unix::{
     write_guest_recv_msghdr,
 };
 use self::mm::exec::{
-    build_task_image, open_exec_image_from_namespace, read_exec_image_bytes_from_namespace,
-    read_guest_string_array,
+    TaskImage, build_task_image, open_exec_image_from_namespace,
+    read_exec_image_bytes_from_namespace, read_guest_string_array,
 };
 use self::mm::mmap::{LinuxMm, LinuxWritableRange};
 use self::poll::epoll::EpollInstance;
@@ -34,6 +35,7 @@ use self::substrate::guest::{
     start_prepared_carrier_guest, write_guest_bytes, write_guest_u32, write_guest_u64,
 };
 use self::substrate::restart::complete_syscall;
+use self::sys::table::emulate_common_syscall;
 use self::task::task::{
     ActiveSignalFrame, LinuxRobustListState, LinuxTask, TaskCarrier, TaskSignals, TaskState,
 };
@@ -55,59 +57,6 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 
-use axle_types::guest::{
-    AX_GUEST_STOP_REASON_X64_SYSCALL, AX_GUEST_X64_SYSCALL_INSN_LEN, AX_LINUX_EXEC_SPEC_F_INTERP,
-    AX_LINUX_EXEC_SPEC_V1, AX_LINUX_EXEC_SPEC_V2,
-};
-use axle_types::handle::ZX_HANDLE_INVALID;
-use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
-use axle_types::rights::ZX_RIGHT_SAME_RIGHTS;
-use axle_types::signals::{
-    AX_USER_SIGNAL_0, AX_USER_SIGNAL_1, ZX_CHANNEL_PEER_CLOSED, ZX_CHANNEL_READABLE,
-    ZX_CHANNEL_WRITABLE, ZX_SOCKET_PEER_CLOSED, ZX_SOCKET_READABLE, ZX_SOCKET_WRITABLE,
-    ZX_TIMER_SIGNALED,
-};
-use axle_types::status::{
-    ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_PATH,
-    ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_IO_DATA_INTEGRITY,
-    ZX_ERR_NO_MEMORY, ZX_ERR_NOT_DIR, ZX_ERR_NOT_FILE, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
-    ZX_ERR_OUT_OF_RANGE, ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_OK,
-};
-use axle_types::syscall_numbers::{
-    AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
-};
-use axle_types::vm::{
-    ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ, ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE,
-    ZX_VM_COMPACT, ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
-};
-use axle_types::{
-    ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_interp_header_t,
-    ax_linux_exec_spec_header_t, zx_handle_t, zx_status_t,
-};
-use libax::{
-    AX_TIME_INFINITE, ax_eventpair_create, ax_guest_session_create, ax_guest_session_read_memory,
-    ax_guest_session_resume, ax_guest_session_write_memory, ax_guest_stop_state_read,
-    ax_guest_stop_state_write, ax_handle_close as zx_handle_close,
-    ax_handle_duplicate as zx_handle_duplicate, ax_linux_exec_spec_blob,
-    ax_linux_exec_spec_blob_with_interp, ax_object_signal, ax_object_wait_async,
-    ax_object_wait_one, ax_packet_user_t as zx_packet_user_t, ax_port_create as zx_port_create,
-    ax_port_packet_t as zx_port_packet_t, ax_port_queue as zx_port_queue,
-    ax_port_wait as zx_port_wait, ax_process_create as zx_process_create,
-    ax_process_prepare_linux_exec, ax_process_start_guest, ax_socket_create as zx_socket_create,
-    ax_status_result as zx_status_result, ax_task_kill as zx_task_kill,
-    ax_thread_create as zx_thread_create, ax_thread_get_guest_x64_fs_base,
-    ax_thread_set_guest_x64_fs_base, ax_thread_start_guest, ax_timer_cancel,
-    ax_timer_create_monotonic, ax_timer_set, ax_vmo_create as zx_vmo_create,
-    ax_vmo_read as zx_vmo_read, ax_vmo_write as zx_vmo_write,
-};
-use nexus_component::{ComponentStartInfo, NumberedHandle};
-use nexus_io::{
-    DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFileDescription, OpenFlags,
-    PipeFd, PseudoNodeFd, SeekOrigin, SocketFd, WaitSpec,
-};
-use spin::Mutex;
-
-use crate::lifecycle::{read_channel_alloc_blocking, send_controller_event, send_status_event};
 use crate::services::{
     BootAssetEntry, BootstrapNamespace, LocalFdMetadataKind, local_fd_metadata, local_fd_pread,
     local_fd_pwrite,
@@ -154,6 +103,56 @@ use crate::{
     STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
     STARTUP_HANDLE_STARNIX_STDOUT,
 };
+use axle_types::guest::{
+    AX_GUEST_STOP_REASON_X64_SYSCALL, AX_GUEST_X64_SYSCALL_INSN_LEN, AX_LINUX_EXEC_SPEC_F_INTERP,
+    AX_LINUX_EXEC_SPEC_V1, AX_LINUX_EXEC_SPEC_V2,
+};
+use axle_types::handle::ZX_HANDLE_INVALID;
+use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
+use axle_types::rights::ZX_RIGHT_SAME_RIGHTS;
+use axle_types::signals::{
+    AX_USER_SIGNAL_0, AX_USER_SIGNAL_1, ZX_CHANNEL_PEER_CLOSED, ZX_CHANNEL_READABLE,
+    ZX_CHANNEL_WRITABLE, ZX_SOCKET_PEER_CLOSED, ZX_SOCKET_READABLE, ZX_SOCKET_WRITABLE,
+    ZX_TIMER_SIGNALED,
+};
+use axle_types::status::{
+    ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_PATH,
+    ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_IO_DATA_INTEGRITY,
+    ZX_ERR_NO_MEMORY, ZX_ERR_NOT_DIR, ZX_ERR_NOT_FILE, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
+    ZX_ERR_OUT_OF_RANGE, ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_OK,
+};
+use axle_types::syscall_numbers::{
+    AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
+};
+use axle_types::vm::{
+    ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ, ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE,
+    ZX_VM_COMPACT, ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
+};
+use axle_types::{
+    ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_interp_header_t,
+    ax_linux_exec_spec_header_t, zx_handle_t, zx_status_t,
+};
+use libax::{
+    AX_TIME_INFINITE, ax_eventpair_create, ax_guest_session_create, ax_guest_session_read_memory,
+    ax_guest_session_resume, ax_guest_session_write_memory, ax_guest_stop_state_read,
+    ax_guest_stop_state_write, ax_handle_close as zx_handle_close,
+    ax_handle_duplicate as zx_handle_duplicate, ax_linux_exec_spec_blob,
+    ax_linux_exec_spec_blob_with_interp, ax_object_signal, ax_object_wait_async,
+    ax_object_wait_one, ax_packet_user_t as zx_packet_user_t, ax_port_create as zx_port_create,
+    ax_port_packet_t as zx_port_packet_t, ax_port_queue as zx_port_queue,
+    ax_port_wait as zx_port_wait, ax_process_create as zx_process_create,
+    ax_process_prepare_linux_exec, ax_process_start_guest, ax_socket_create as zx_socket_create,
+    ax_status_result as zx_status_result, ax_task_kill as zx_task_kill,
+    ax_thread_create as zx_thread_create, ax_thread_get_guest_x64_fs_base,
+    ax_thread_set_guest_x64_fs_base, ax_thread_start_guest, ax_timer_cancel,
+    ax_timer_create_monotonic, ax_timer_set, ax_vmo_create as zx_vmo_create,
+    ax_vmo_read as zx_vmo_read, ax_vmo_write as zx_vmo_write,
+};
+use nexus_io::{
+    DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFileDescription, OpenFlags,
+    PipeFd, PseudoNodeFd, SeekOrigin, SocketFd, WaitSpec,
+};
+use spin::Mutex;
 
 const USER_PAGE_BYTES: u64 = 0x1000;
 // Keep this Linux guest bootstrap layout in sync with
@@ -453,38 +452,7 @@ const LINUX_AUX_CLKTCK: u64 = 100;
 const LINUX_AUX_HWCAP: u64 = 0;
 const LINUX_AUX_HWCAP2: u64 = 0;
 pub(crate) fn starnix_kernel_program_start(bootstrap_channel: zx_handle_t) -> ! {
-    let mut status_handle = None;
-    let mut controller_handle = None;
-    let return_code = match read_start_info(bootstrap_channel) {
-        Ok(start_info) => {
-            status_handle = start_info.status_handle;
-            controller_handle = start_info.controller_handle;
-            run_executive(start_info)
-        }
-        Err(status) => map_status_to_return_code(status),
-    };
-
-    if let Some(handle) = status_handle {
-        let _ = send_status_event(handle, return_code);
-        let _ = zx_handle_close(handle);
-    }
-    if let Some(handle) = controller_handle {
-        let _ = send_controller_event(handle, return_code);
-        let _ = zx_handle_close(handle);
-    }
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
-struct StarnixStartInfo {
-    args: Vec<String>,
-    env: Vec<String>,
-    parent_process: zx_handle_t,
-    linux_image_vmo: zx_handle_t,
-    stdout_handle: Option<zx_handle_t>,
-    status_handle: Option<zx_handle_t>,
-    controller_handle: Option<zx_handle_t>,
+    bootstrap::program_start(bootstrap_channel)
 }
 
 struct PreparedLinuxStack {
@@ -528,23 +496,6 @@ enum SyscallAction {
     GroupSignalExit(i32),
 }
 
-#[derive(Clone)]
-struct TaskImage {
-    path: String,
-    cmdline: Vec<u8>,
-    exec_blob: Vec<u8>,
-    initial_tls_modules: Vec<LinuxInitialTls>,
-    runtime_random: [u8; 16],
-    writable_ranges: Vec<LinuxWritableRange>,
-}
-
-#[derive(Clone)]
-struct LinuxInitialTls {
-    init_image: Vec<u8>,
-    mem_size: u64,
-    align: u64,
-}
-
 #[derive(Clone, Copy)]
 struct LinuxMsgHdr {
     name_addr: u64,
@@ -578,22 +529,6 @@ struct StarnixKernel {
     pidfds: BTreeMap<LinuxFileDescriptionKey, Weak<Mutex<PidFdState>>>,
     unix_socket_peers: BTreeMap<LinuxFileDescriptionKey, LinuxFileDescriptionKey>,
     unix_socket_rights: BTreeMap<LinuxFileDescriptionKey, VecDeque<PendingScmRights>>,
-}
-
-struct PreparedProcessCarrier {
-    process_handle: zx_handle_t,
-    root_vmar: zx_handle_t,
-    carrier: TaskCarrier,
-    prepared_entry: u64,
-    prepared_stack: u64,
-}
-
-impl PreparedProcessCarrier {
-    fn close(self) {
-        self.carrier.close();
-        let _ = zx_handle_close(self.root_vmar);
-        let _ = zx_handle_close(self.process_handle);
-    }
 }
 
 impl StarnixKernel {
@@ -703,65 +638,6 @@ impl StarnixKernel {
             }
             None => {
                 let _ = self.foreground_pgid_by_sid.remove(&sid);
-            }
-        }
-    }
-
-    fn tty_job_control_signal(
-        &self,
-        task_id: i32,
-        fd: i32,
-        op: FdWaitOp,
-    ) -> Result<Option<i32>, zx_status_t> {
-        let signal = match (fd, op) {
-            (0, FdWaitOp::Read) => LINUX_SIGTTIN,
-            (1 | 2, FdWaitOp::Write) => LINUX_SIGTTOU,
-            _ => return Ok(None),
-        };
-        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
-        let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
-        let Some(foreground_pgid) = self.foreground_pgid(group.sid) else {
-            return Ok(None);
-        };
-        if foreground_pgid == group.pgid {
-            Ok(None)
-        } else {
-            Ok(Some(signal))
-        }
-    }
-
-    fn maybe_apply_tty_job_control(
-        &mut self,
-        task_id: i32,
-        fd: i32,
-        op: FdWaitOp,
-        stop_state: &mut ax_guest_stop_state_t,
-    ) -> Result<Option<SyscallAction>, zx_status_t> {
-        let Some(signal) = self.tty_job_control_signal(task_id, fd, op)? else {
-            return Ok(None);
-        };
-        match self.signal_delivery_action(task_id, signal)? {
-            SignalDeliveryAction::Ignore => Ok(None),
-            SignalDeliveryAction::Terminate => Ok(Some(SyscallAction::GroupSignalExit(signal))),
-            SignalDeliveryAction::Stop => {
-                let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
-                self.enter_group_stop(tgid, signal)?;
-                Ok(Some(SyscallAction::LeaveStopped))
-            }
-            SignalDeliveryAction::Catch(sigaction) => {
-                let restore_regs = stop_state.regs;
-                let previous_blocked = self.task_signal_mask(task_id)?;
-                self.install_signal_frame(
-                    task_id,
-                    signal,
-                    sigaction,
-                    stop_state,
-                    ActiveSignalFrame {
-                        restore_regs,
-                        previous_blocked,
-                    },
-                )?;
-                Ok(Some(SyscallAction::Resume))
             }
         }
     }
@@ -1043,499 +919,6 @@ impl StarnixKernel {
         self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Waiting(wait);
         self.deliver_or_interrupt_wait(task_id, wait, stop_state)
     }
-}
-
-fn read_start_info(bootstrap_channel: zx_handle_t) -> Result<StarnixStartInfo, zx_status_t> {
-    let (bytes, handles) = read_channel_alloc_blocking(bootstrap_channel)?;
-    let start_info = ComponentStartInfo::decode_channel_message(&bytes, &handles)
-        .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
-    let mut linux_image_vmo = ZX_HANDLE_INVALID;
-    let mut parent_process = ZX_HANDLE_INVALID;
-    let mut stdout_handle = None;
-    let mut status_handle = None;
-    for NumberedHandle { id, handle } in start_info.numbered_handles {
-        if id == STARTUP_HANDLE_COMPONENT_STATUS {
-            status_handle = Some(handle);
-        } else if id == STARTUP_HANDLE_STARNIX_IMAGE_VMO {
-            linux_image_vmo = handle;
-        } else if id == STARTUP_HANDLE_STARNIX_PARENT_PROCESS {
-            parent_process = handle;
-        } else if id == STARTUP_HANDLE_STARNIX_STDOUT {
-            stdout_handle = Some(handle);
-        }
-    }
-    if linux_image_vmo == ZX_HANDLE_INVALID || parent_process == ZX_HANDLE_INVALID {
-        return Err(ZX_ERR_NOT_FOUND);
-    }
-    Ok(StarnixStartInfo {
-        args: start_info.args,
-        env: start_info.env,
-        parent_process,
-        linux_image_vmo,
-        stdout_handle,
-        status_handle,
-        controller_handle: start_info.controller_channel,
-    })
-}
-
-struct ExecutiveBootstrapCleanup {
-    parent_process: zx_handle_t,
-    linux_image_vmo: zx_handle_t,
-    port: zx_handle_t,
-    stdout_handle: Option<zx_handle_t>,
-}
-
-impl ExecutiveBootstrapCleanup {
-    const fn new(
-        parent_process: zx_handle_t,
-        linux_image_vmo: zx_handle_t,
-        stdout_handle: Option<zx_handle_t>,
-    ) -> Self {
-        Self {
-            parent_process,
-            linux_image_vmo,
-            port: ZX_HANDLE_INVALID,
-            stdout_handle,
-        }
-    }
-}
-
-impl Drop for ExecutiveBootstrapCleanup {
-    fn drop(&mut self) {
-        if let Some(handle) = self.stdout_handle.take() {
-            let _ = zx_handle_close(handle);
-        }
-        if self.port != ZX_HANDLE_INVALID {
-            let _ = zx_handle_close(self.port);
-        }
-        if self.linux_image_vmo != ZX_HANDLE_INVALID {
-            let _ = zx_handle_close(self.linux_image_vmo);
-        }
-        if self.parent_process != ZX_HANDLE_INVALID {
-            let _ = zx_handle_close(self.parent_process);
-        }
-    }
-}
-
-fn run_executive(start_info: StarnixStartInfo) -> i32 {
-    let StarnixStartInfo {
-        args,
-        env,
-        parent_process,
-        linux_image_vmo,
-        stdout_handle,
-        status_handle: _,
-        controller_handle: _,
-    } = start_info;
-    let mut cleanup =
-        ExecutiveBootstrapCleanup::new(parent_process, linux_image_vmo, stdout_handle);
-    let namespace = match build_starnix_namespace() {
-        Ok(namespace) => namespace,
-        Err(status) => return map_status_to_return_code(status),
-    };
-    let (payload_path, payload_bytes) = match resolve_exec_payload_source(&namespace, &args) {
-        Ok(payload) => payload,
-        Err(status) => return map_status_to_return_code(status),
-    };
-    let mut port = ZX_HANDLE_INVALID;
-    if zx_port_create(0, &mut port) != ZX_OK {
-        return 1;
-    }
-    cleanup.port = port;
-    let mut stack_random_state = seed_runtime_random_state(parent_process, port, 1);
-    let mut stack_random = [0u8; 16];
-    fill_random_bytes(&mut stack_random_state, &mut stack_random);
-    let task_image = match build_task_image(
-        payload_path.as_str(),
-        &args,
-        &env,
-        payload_bytes.as_slice(),
-        stack_random,
-        |interp_path| {
-            read_exec_image_bytes_from_namespace(&namespace, interp_path)
-                .map(|(_resolved, bytes)| bytes)
-        },
-    ) {
-        Ok(image) => image,
-        Err(status) => return map_status_to_return_code(status),
-    };
-    let prepared = match prepare_process_carrier(
-        parent_process,
-        port,
-        STARNIX_GUEST_PACKET_KEY,
-        linux_image_vmo,
-        &task_image.exec_blob,
-    ) {
-        Ok(prepared) => prepared,
-        Err(status) => return map_status_to_return_code(status),
-    };
-    let _ = zx_handle_close(linux_image_vmo);
-    cleanup.linux_image_vmo = ZX_HANDLE_INVALID;
-    let stdout_handle = cleanup.stdout_handle.take();
-    let mut resources = match ProcessResources::new(
-        prepared.process_handle,
-        prepared.root_vmar,
-        stdout_handle,
-        namespace,
-    ) {
-        Ok(resources) => resources,
-        Err(status) => {
-            prepared.close();
-            return map_status_to_return_code(status);
-        }
-    };
-    if let Err(status) = resources.install_exec_writable_ranges(&task_image.writable_ranges) {
-        prepared.close();
-        return map_status_to_return_code(status);
-    }
-    match resources.install_initial_tls(prepared.carrier.session_handle, &task_image) {
-        Ok(Some(fs_base)) => {
-            if let Err(status) = zx_status_result(ax_thread_set_guest_x64_fs_base(
-                prepared.carrier.thread_handle,
-                fs_base,
-                0,
-            )) {
-                prepared.close();
-                return map_status_to_return_code(status);
-            }
-        }
-        Ok(None) => {}
-        Err(status) => {
-            prepared.close();
-            return map_status_to_return_code(status);
-        }
-    }
-    let regs = linux_guest_initial_regs(prepared.prepared_entry, prepared.prepared_stack);
-    let (resources, carrier) = match start_prepared_carrier_guest(prepared, &regs, resources) {
-        Ok(started) => started,
-        Err(status) => return map_status_to_return_code(status),
-    };
-    let root_task = LinuxTask {
-        tid: 1,
-        tgid: 1,
-        carrier,
-        state: TaskState::Running,
-        signals: TaskSignals::default(),
-        clear_child_tid: 0,
-        robust_list: None,
-        active_signal: None,
-    };
-    let mut task_ids = BTreeSet::new();
-    task_ids.insert(1);
-    let root_group = LinuxThreadGroup {
-        tgid: 1,
-        leader_tid: 1,
-        parent_tgid: None,
-        pgid: 1,
-        sid: 1,
-        child_tgids: BTreeSet::new(),
-        task_ids,
-        state: ThreadGroupState::Running,
-        last_stop_signal: None,
-        stop_wait_pending: false,
-        continued_wait_pending: false,
-        shared_pending: 0,
-        sigchld_info: None,
-        sigactions: BTreeMap::new(),
-        image: Some(task_image),
-        resources: Some(resources),
-    };
-    let mut kernel = StarnixKernel::new(parent_process, port, root_task, root_group);
-    kernel.run()
-}
-
-fn emulate_common_syscall(
-    session: zx_handle_t,
-    stop_state: &mut ax_guest_stop_state_t,
-    executive: &mut ProcessResources,
-    stdout: &mut Vec<u8>,
-) -> Result<SyscallAction, zx_status_t> {
-    match stop_state.regs.rax {
-        LINUX_SYSCALL_READ => {
-            let fd = linux_arg_i32(stop_state.regs.rdi);
-            let buf = stop_state.regs.rsi;
-            let len = usize::try_from(stop_state.regs.rdx).map_err(|_| ZX_ERR_INVALID_ARGS)?;
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(len).map_err(|_| ZX_ERR_NO_MEMORY)?;
-            bytes.resize(len, 0);
-            let result = match executive.fs.fd_table.read(fd, &mut bytes) {
-                Ok(actual) => match write_guest_bytes(session, buf, &bytes[..actual]) {
-                    Ok(()) => u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
-                    Err(status) => linux_errno(map_guest_write_status_to_errno(status)),
-                },
-                Err(status) => linux_errno(map_fd_status_to_errno(status)),
-            };
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_WRITE => {
-            let fd = linux_arg_i32(stop_state.regs.rdi);
-            let buf = stop_state.regs.rsi;
-            let len = usize::try_from(stop_state.regs.rdx).map_err(|_| ZX_ERR_INVALID_ARGS)?;
-            let bytes = match read_guest_bytes(session, buf, len) {
-                Ok(bytes) => bytes,
-                Err(status) => {
-                    complete_syscall(
-                        stop_state,
-                        linux_errno(map_guest_memory_status_to_errno(status)),
-                    )?;
-                    return Ok(SyscallAction::Resume);
-                }
-            };
-            let result = match executive.fs.fd_table.write(fd, &bytes) {
-                Ok(actual) => {
-                    if fd == 1 || fd == 2 {
-                        stdout.extend_from_slice(&bytes[..actual]);
-                    }
-                    u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)?
-                }
-                Err(status) => linux_errno(map_fd_status_to_errno(status)),
-            };
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_CLOSE => {
-            let fd = linux_arg_i32(stop_state.regs.rdi);
-            let result = match executive.fs.fd_table.close(fd) {
-                Ok(()) => 0,
-                Err(status) => linux_errno(map_fd_status_to_errno(status)),
-            };
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_DUP2 => {
-            let oldfd = linux_arg_i32(stop_state.regs.rdi);
-            let newfd = linux_arg_i32(stop_state.regs.rsi);
-            let result = executive.dup2(oldfd, newfd)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_FSTAT => {
-            let fd = linux_arg_i32(stop_state.regs.rdi);
-            let stat_addr = stop_state.regs.rsi;
-            let result = executive.stat_fd(session, fd, stat_addr)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_FCNTL => {
-            let fd = linux_arg_i32(stop_state.regs.rdi);
-            let cmd = linux_arg_i32(stop_state.regs.rsi);
-            let arg = stop_state.regs.rdx;
-            let result = executive.fcntl(fd, cmd, arg)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_GETCWD => {
-            let buf = stop_state.regs.rdi;
-            let size = usize::try_from(stop_state.regs.rsi).map_err(|_| ZX_ERR_INVALID_ARGS)?;
-            let result = executive.getcwd(session, buf, size)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_CHDIR => {
-            let path = stop_state.regs.rdi;
-            let result = executive.chdir(session, path)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_MMAP => {
-            let addr = stop_state.regs.rdi;
-            let len = stop_state.regs.rsi;
-            let prot = stop_state.regs.rdx;
-            let flags = stop_state.regs.r10;
-            let fd = linux_arg_i32(stop_state.regs.r8);
-            let offset = stop_state.regs.r9;
-            let result = executive.mmap(addr, len, prot, flags, fd, offset)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_MPROTECT => {
-            let addr = stop_state.regs.rdi;
-            let len = stop_state.regs.rsi;
-            let prot = stop_state.regs.rdx;
-            let result = executive.mprotect(addr, len, prot)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_MUNMAP => {
-            let addr = stop_state.regs.rdi;
-            let len = stop_state.regs.rsi;
-            let result = executive.munmap(addr, len)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_BRK => {
-            let addr = stop_state.regs.rdi;
-            let result = executive.brk(addr)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_GETDENTS64 => {
-            let fd = linux_arg_i32(stop_state.regs.rdi);
-            let dirent_addr = stop_state.regs.rsi;
-            let count = usize::try_from(stop_state.regs.rdx).map_err(|_| ZX_ERR_INVALID_ARGS)?;
-            let result = executive.getdents64(session, fd, dirent_addr, count)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_PIPE2 => {
-            let pipefd = stop_state.regs.rdi;
-            let flags = stop_state.regs.rsi;
-            let result = executive.create_pipe(session, pipefd, flags)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_OPENAT => {
-            let dirfd = linux_arg_i32(stop_state.regs.rdi);
-            let path = stop_state.regs.rsi;
-            let flags = stop_state.regs.rdx;
-            let mode = stop_state.regs.r10;
-            let result = executive.openat(session, dirfd, path, flags, mode)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_NEWFSTATAT => {
-            let dirfd = linux_arg_i32(stop_state.regs.rdi);
-            let path = stop_state.regs.rsi;
-            let stat_addr = stop_state.regs.rdx;
-            let flags = stop_state.regs.r10;
-            let result = executive.statat(session, dirfd, path, stat_addr, flags)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_SOCKETPAIR => {
-            let domain = stop_state.regs.rdi;
-            let socket_type = stop_state.regs.rsi;
-            let protocol = stop_state.regs.rdx;
-            let pair = stop_state.regs.r10;
-            let result =
-                executive.create_socketpair(session, domain, socket_type, protocol, pair)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_DUP3 => {
-            let oldfd = linux_arg_i32(stop_state.regs.rdi);
-            let newfd = linux_arg_i32(stop_state.regs.rsi);
-            let flags = stop_state.regs.rdx;
-            let result = executive.dup3(oldfd, newfd, flags)?;
-            complete_syscall(stop_state, result)?;
-            Ok(SyscallAction::Resume)
-        }
-        LINUX_SYSCALL_EXIT => {
-            let code =
-                i32::try_from(stop_state.regs.rdi & 0xff).map_err(|_| ZX_ERR_INVALID_ARGS)?;
-            Ok(SyscallAction::TaskExit(code))
-        }
-        LINUX_SYSCALL_EXIT_GROUP => {
-            let code =
-                i32::try_from(stop_state.regs.rdi & 0xff).map_err(|_| ZX_ERR_INVALID_ARGS)?;
-            Ok(SyscallAction::GroupExit(code))
-        }
-        _ => {
-            complete_syscall(stop_state, linux_errno(LINUX_ENOSYS))?;
-            Ok(SyscallAction::Resume)
-        }
-    }
-}
-
-// Legacy embedded smoke payloads remain only as a bootstrap fallback while
-// production exec is resolved from the startup namespace.
-fn bootstrap_payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
-    match args.first().map(String::as_str) {
-        Some("linux-hello") | None => Some(LINUX_HELLO_BYTES),
-        Some("linux-fd-smoke") => Some(LINUX_FD_SMOKE_BYTES),
-        Some("linux-round2-smoke") => Some(LINUX_ROUND2_BYTES),
-        Some("linux-round3-smoke") => Some(LINUX_ROUND3_BYTES),
-        Some("linux-round4-futex-smoke") => Some(LINUX_ROUND4_FUTEX_BYTES),
-        Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BYTES),
-        Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BYTES),
-        Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BYTES),
-        Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BYTES),
-        Some("linux-round6-signalfd-smoke") => Some(LINUX_ROUND6_SIGNALFD_BYTES),
-        Some("linux-round6-futex-smoke") => Some(LINUX_ROUND6_FUTEX_BYTES),
-        Some("linux-round6-scm-rights-smoke") => Some(LINUX_ROUND6_SCM_RIGHTS_BYTES),
-        Some("linux-round6-pidfd-smoke") => Some(LINUX_ROUND6_PIDFD_BYTES),
-        Some("linux-round6-proc-job-smoke") => Some(LINUX_ROUND6_PROC_JOB_BYTES),
-        Some("linux-round6-proc-control-smoke") => Some(LINUX_ROUND6_PROC_CONTROL_BYTES),
-        Some("linux-round6-proc-tty-smoke") => Some(LINUX_ROUND6_PROC_TTY_BYTES),
-        Some("linux-runtime-fd-smoke") => Some(LINUX_RUNTIME_FD_BYTES),
-        Some("linux-runtime-misc-smoke") => Some(LINUX_RUNTIME_MISC_BYTES),
-        Some("linux-runtime-process-smoke") => Some(LINUX_RUNTIME_PROCESS_BYTES),
-        Some("linux-runtime-fs-smoke") => Some(LINUX_RUNTIME_FS_BYTES),
-        Some("linux-runtime-tls-smoke") => Some(LINUX_RUNTIME_TLS_BYTES),
-        Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BYTES),
-        Some("linux-dynamic-tls-smoke") => Some(LINUX_DYNAMIC_TLS_SMOKE_BYTES),
-        Some("linux-dynamic-runtime-smoke") => Some(LINUX_DYNAMIC_RUNTIME_SMOKE_BYTES),
-        Some("linux-dynamic-pie-smoke") => Some(LINUX_DYNAMIC_PIE_SMOKE_BYTES),
-        Some("linux-glibc-hello") => Some(LINUX_GLIBC_HELLO_BYTES),
-        Some(_) => None,
-    }
-}
-
-fn bootstrap_payload_path_for(args: &[String]) -> Option<&'static str> {
-    match args.first().map(String::as_str) {
-        Some("linux-hello") | None => Some(LINUX_HELLO_BINARY_PATH),
-        Some("linux-fd-smoke") => Some(LINUX_FD_SMOKE_BINARY_PATH),
-        Some("linux-round2-smoke") => Some(LINUX_ROUND2_BINARY_PATH),
-        Some("linux-round3-smoke") => Some(LINUX_ROUND3_BINARY_PATH),
-        Some("linux-round4-futex-smoke") => Some(LINUX_ROUND4_FUTEX_BINARY_PATH),
-        Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BINARY_PATH),
-        Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BINARY_PATH),
-        Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BINARY_PATH),
-        Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BINARY_PATH),
-        Some("linux-round6-signalfd-smoke") => Some(LINUX_ROUND6_SIGNALFD_BINARY_PATH),
-        Some("linux-round6-futex-smoke") => Some(LINUX_ROUND6_FUTEX_BINARY_PATH),
-        Some("linux-round6-scm-rights-smoke") => Some(LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH),
-        Some("linux-round6-pidfd-smoke") => Some(LINUX_ROUND6_PIDFD_BINARY_PATH),
-        Some("linux-round6-proc-job-smoke") => Some(LINUX_ROUND6_PROC_JOB_BINARY_PATH),
-        Some("linux-round6-proc-control-smoke") => Some(LINUX_ROUND6_PROC_CONTROL_BINARY_PATH),
-        Some("linux-round6-proc-tty-smoke") => Some(LINUX_ROUND6_PROC_TTY_BINARY_PATH),
-        Some("linux-runtime-fd-smoke") => Some(LINUX_RUNTIME_FD_BINARY_PATH),
-        Some("linux-runtime-misc-smoke") => Some(LINUX_RUNTIME_MISC_BINARY_PATH),
-        Some("linux-runtime-process-smoke") => Some(LINUX_RUNTIME_PROCESS_BINARY_PATH),
-        Some("linux-runtime-fs-smoke") => Some(LINUX_RUNTIME_FS_BINARY_PATH),
-        Some("linux-runtime-tls-smoke") => Some(LINUX_RUNTIME_TLS_BINARY_PATH),
-        Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH),
-        Some("linux-dynamic-tls-smoke") => Some(LINUX_DYNAMIC_TLS_SMOKE_BINARY_PATH),
-        Some("linux-dynamic-runtime-smoke") => Some(LINUX_DYNAMIC_RUNTIME_SMOKE_BINARY_PATH),
-        Some("linux-dynamic-pie-smoke") => Some(LINUX_DYNAMIC_PIE_SMOKE_BINARY_PATH),
-        Some("linux-glibc-hello") => Some(LINUX_GLIBC_HELLO_BINARY_PATH),
-        Some(_) => None,
-    }
-}
-
-fn requested_exec_path(args: &[String]) -> Option<String> {
-    match args.first().map(String::as_str) {
-        Some("") => None,
-        Some(path) if path.contains('/') => Some(String::from(path)),
-        Some(name) => Some(format!("bin/{name}")),
-        None => None,
-    }
-}
-
-fn resolve_exec_payload_source(
-    namespace: &nexus_io::ProcessNamespace,
-    args: &[String],
-) -> Result<(String, Vec<u8>), zx_status_t> {
-    if let Some(path) = requested_exec_path(args) {
-        match read_exec_image_bytes_from_namespace(namespace, path.as_str()) {
-            Ok(source) => return Ok(source),
-            Err(ZX_ERR_NOT_FOUND | ZX_ERR_NOT_DIR | ZX_ERR_BAD_PATH) => {}
-            Err(status) => return Err(status),
-        }
-    }
-
-    let path = bootstrap_payload_path_for(args).ok_or(ZX_ERR_NOT_SUPPORTED)?;
-    let bytes = bootstrap_payload_bytes_for(args).ok_or(ZX_ERR_NOT_SUPPORTED)?;
-    let mut owned = Vec::new();
-    owned
-        .try_reserve_exact(bytes.len())
-        .map_err(|_| ZX_ERR_NO_MEMORY)?;
-    owned.extend_from_slice(bytes);
-    let stored_path = namespace
-        .resolve_path(path)
-        .unwrap_or_else(|_| String::from(path));
-    Ok((stored_path, owned))
 }
 
 fn file_description_key(description: &Arc<OpenFileDescription>) -> LinuxFileDescriptionKey {

@@ -1,5 +1,22 @@
 use super::super::*;
 
+#[derive(Clone)]
+pub(in crate::starnix) struct TaskImage {
+    pub(in crate::starnix) path: String,
+    pub(in crate::starnix) cmdline: Vec<u8>,
+    pub(in crate::starnix) exec_blob: Vec<u8>,
+    pub(in crate::starnix) initial_tls_modules: Vec<LinuxInitialTls>,
+    pub(in crate::starnix) runtime_random: [u8; 16],
+    pub(in crate::starnix) writable_ranges: Vec<LinuxWritableRange>,
+}
+
+#[derive(Clone)]
+pub(in crate::starnix) struct LinuxInitialTls {
+    pub(in crate::starnix) init_image: Vec<u8>,
+    pub(in crate::starnix) mem_size: u64,
+    pub(in crate::starnix) align: u64,
+}
+
 fn read_all_fd_bytes(ops: &dyn FdOps) -> Result<Vec<u8>, zx_status_t> {
     let metadata = local_fd_metadata(ops).ok_or(ZX_ERR_NOT_SUPPORTED)?;
     let len = usize::try_from(metadata.size_bytes).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;

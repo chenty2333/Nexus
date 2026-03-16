@@ -1,6 +1,65 @@
 use super::super::*;
 
 impl StarnixKernel {
+    pub(in crate::starnix) fn tty_job_control_signal(
+        &self,
+        task_id: i32,
+        fd: i32,
+        op: FdWaitOp,
+    ) -> Result<Option<i32>, zx_status_t> {
+        let signal = match (fd, op) {
+            (0, FdWaitOp::Read) => LINUX_SIGTTIN,
+            (1 | 2, FdWaitOp::Write) => LINUX_SIGTTOU,
+            _ => return Ok(None),
+        };
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+        let Some(foreground_pgid) = self.foreground_pgid(group.sid) else {
+            return Ok(None);
+        };
+        if foreground_pgid == group.pgid {
+            Ok(None)
+        } else {
+            Ok(Some(signal))
+        }
+    }
+
+    pub(in crate::starnix) fn maybe_apply_tty_job_control(
+        &mut self,
+        task_id: i32,
+        fd: i32,
+        op: FdWaitOp,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<Option<SyscallAction>, zx_status_t> {
+        let Some(signal) = self.tty_job_control_signal(task_id, fd, op)? else {
+            return Ok(None);
+        };
+        match self.signal_delivery_action(task_id, signal)? {
+            SignalDeliveryAction::Ignore => Ok(None),
+            SignalDeliveryAction::Terminate => Ok(Some(SyscallAction::GroupSignalExit(signal))),
+            SignalDeliveryAction::Stop => {
+                let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+                self.enter_group_stop(tgid, signal)?;
+                Ok(Some(SyscallAction::LeaveStopped))
+            }
+            SignalDeliveryAction::Catch(sigaction) => {
+                let restore_regs = stop_state.regs;
+                let previous_blocked = self.task_signal_mask(task_id)?;
+                self.install_signal_frame(
+                    task_id,
+                    signal,
+                    sigaction,
+                    stop_state,
+                    ActiveSignalFrame {
+                        restore_regs,
+                        previous_blocked,
+                    },
+                )?;
+                Ok(Some(SyscallAction::Resume))
+            }
+        }
+    }
+
     pub(in crate::starnix) fn shared_sigchld_info(&self, tgid: i32) -> Option<LinuxSigChldInfo> {
         self.groups.get(&tgid).and_then(|group| group.sigchld_info)
     }
