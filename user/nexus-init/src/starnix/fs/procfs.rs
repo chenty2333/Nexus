@@ -72,6 +72,36 @@ impl ProcTextFd {
     }
 }
 
+fn split_proc_path(path: &str) -> Result<Vec<&str>, zx_status_t> {
+    if path.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut components = Vec::new();
+    for component in path.trim_matches('/').split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            return Err(ZX_ERR_BAD_PATH);
+        }
+        components.push(component);
+    }
+    Ok(components)
+}
+
+fn join_proc_relative_path(base: &str, path: &str) -> Result<String, zx_status_t> {
+    let components = split_proc_path(path)?;
+    if components.is_empty() {
+        return Ok(String::from(base.trim_end_matches('/')));
+    }
+    let mut resolved = String::from(base.trim_end_matches('/'));
+    for component in components {
+        resolved.push('/');
+        resolved.push_str(component);
+    }
+    Ok(resolved)
+}
+
 impl FdOps for ProcRootFd {
     fn as_any(&self) -> &dyn Any {
         self

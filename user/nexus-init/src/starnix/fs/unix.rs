@@ -1,5 +1,21 @@
 use super::super::*;
 
+#[derive(Clone, Copy)]
+pub(in crate::starnix) struct LinuxMsgHdr {
+    pub(in crate::starnix) name_addr: u64,
+    pub(in crate::starnix) name_len: u32,
+    pub(in crate::starnix) iov_addr: u64,
+    pub(in crate::starnix) iov_len: usize,
+    pub(in crate::starnix) control_addr: u64,
+    pub(in crate::starnix) control_len: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::starnix) struct LinuxIovec {
+    pub(in crate::starnix) base: u64,
+    pub(in crate::starnix) len: usize,
+}
+
 pub(in crate::starnix) fn read_guest_msghdr(
     session: zx_handle_t,
     addr: u64,

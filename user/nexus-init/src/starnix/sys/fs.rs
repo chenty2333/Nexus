@@ -1,5 +1,37 @@
 use super::super::*;
 
+fn write_linux_uname_field(field: &mut [u8], value: &str) {
+    let limit = field.len().saturating_sub(1);
+    let actual = value.len().min(limit);
+    field[..actual].copy_from_slice(&value.as_bytes()[..actual]);
+}
+
+fn build_linux_uname_bytes() -> [u8; LINUX_UTSNAME_BYTES] {
+    let mut bytes = [0u8; LINUX_UTSNAME_BYTES];
+    write_linux_uname_field(&mut bytes[0..LINUX_UTSNAME_FIELD_BYTES], "NexusOS");
+    write_linux_uname_field(
+        &mut bytes[LINUX_UTSNAME_FIELD_BYTES..LINUX_UTSNAME_FIELD_BYTES * 2],
+        "nexus",
+    );
+    write_linux_uname_field(
+        &mut bytes[LINUX_UTSNAME_FIELD_BYTES * 2..LINUX_UTSNAME_FIELD_BYTES * 3],
+        "0.1",
+    );
+    write_linux_uname_field(
+        &mut bytes[LINUX_UTSNAME_FIELD_BYTES * 3..LINUX_UTSNAME_FIELD_BYTES * 4],
+        "#1 Axle",
+    );
+    write_linux_uname_field(
+        &mut bytes[LINUX_UTSNAME_FIELD_BYTES * 4..LINUX_UTSNAME_FIELD_BYTES * 5],
+        "x86_64",
+    );
+    write_linux_uname_field(
+        &mut bytes[LINUX_UTSNAME_FIELD_BYTES * 5..LINUX_UTSNAME_BYTES],
+        "localdomain",
+    );
+    bytes
+}
+
 impl StarnixKernel {
     pub(in crate::starnix) fn sys_readlink(
         &mut self,

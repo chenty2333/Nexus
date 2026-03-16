@@ -1,5 +1,38 @@
 use super::super::*;
 
+pub(in crate::starnix) struct PreparedLinuxStack {
+    pub(in crate::starnix) stack_pointer: u64,
+    pub(in crate::starnix) stack_vmo_offset: u64,
+    pub(in crate::starnix) image: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::starnix) struct LinuxLoadSegment {
+    pub(in crate::starnix) vaddr: u64,
+    pub(in crate::starnix) mem_size: usize,
+    pub(in crate::starnix) flags: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::starnix) struct LinuxTlsSegment {
+    pub(in crate::starnix) file_offset: usize,
+    pub(in crate::starnix) file_size: usize,
+    pub(in crate::starnix) mem_size: u64,
+    pub(in crate::starnix) align: u64,
+}
+
+pub(in crate::starnix) struct LinuxElf<'a> {
+    pub(in crate::starnix) entry: u64,
+    pub(in crate::starnix) phdr_vaddr: Option<u64>,
+    pub(in crate::starnix) phent: u16,
+    pub(in crate::starnix) phnum: u16,
+    pub(in crate::starnix) image_end: u64,
+    pub(in crate::starnix) interp_path: Option<String>,
+    pub(in crate::starnix) tls: Option<LinuxTlsSegment>,
+    pub(in crate::starnix) segments: Vec<LinuxLoadSegment>,
+    pub(in crate::starnix) _bytes: &'a [u8],
+}
+
 #[derive(Clone)]
 pub(in crate::starnix) struct TaskImage {
     pub(in crate::starnix) path: String,

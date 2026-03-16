@@ -63,6 +63,38 @@ struct ConsumedSignal {
     sigchld_info: Option<LinuxSigChldInfo>,
 }
 
+fn parse_linux_timespec_ns(raw: &[u8]) -> Result<u64, zx_status_t> {
+    if raw.len() < LINUX_TIMESPEC_BYTES {
+        return Err(ZX_ERR_IO_DATA_INTEGRITY);
+    }
+    let seconds = i64::from_ne_bytes(raw[0..8].try_into().map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?);
+    let nanos = i64::from_ne_bytes(
+        raw[8..16]
+            .try_into()
+            .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?,
+    );
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    let seconds = u64::try_from(seconds).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let nanos = u64::try_from(nanos).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|base| base.checked_add(nanos))
+        .ok_or(ZX_ERR_OUT_OF_RANGE)
+}
+
+fn read_guest_itimerspec(session: zx_handle_t, addr: u64) -> Result<LinuxItimerSpec, zx_status_t> {
+    let bytes = read_guest_bytes(session, addr, LINUX_ITIMERSPEC_BYTES)?;
+    let raw = bytes
+        .get(..LINUX_ITIMERSPEC_BYTES)
+        .ok_or(ZX_ERR_IO_DATA_INTEGRITY)?;
+    Ok(LinuxItimerSpec {
+        interval_ns: parse_linux_timespec_ns(&raw[..LINUX_TIMESPEC_BYTES])?,
+        value_ns: parse_linux_timespec_ns(&raw[LINUX_TIMESPEC_BYTES..LINUX_ITIMERSPEC_BYTES])?,
+    })
+}
+
 impl EventFd {
     fn new(initial: u32, semaphore: bool) -> Result<Self, zx_status_t> {
         let mut wait_handle = ZX_HANDLE_INVALID;

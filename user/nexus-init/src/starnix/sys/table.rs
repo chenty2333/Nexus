@@ -1,5 +1,13 @@
 use super::super::*;
 
+pub(in crate::starnix) fn linux_arg_i32(raw: u64) -> i32 {
+    raw as u32 as i32
+}
+
+pub(in crate::starnix) fn linux_arg_u32(raw: u64) -> u32 {
+    raw as u32
+}
+
 pub(in crate::starnix) fn emulate_common_syscall(
     session: zx_handle_t,
     stop_state: &mut ax_guest_stop_state_t,

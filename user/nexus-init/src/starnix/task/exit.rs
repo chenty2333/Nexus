@@ -1,5 +1,16 @@
 use super::super::*;
 
+fn read_guest_robust_list_head(
+    session: zx_handle_t,
+    head_addr: u64,
+) -> Result<(u64, i64, u64), zx_status_t> {
+    Ok((
+        read_guest_u64(session, head_addr)?,
+        read_guest_i64(session, head_addr + 8)?,
+        read_guest_u64(session, head_addr + 16)?,
+    ))
+}
+
 impl StarnixKernel {
     pub(in crate::starnix) fn finalize_group_zombie(
         &mut self,

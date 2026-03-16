@@ -1,5 +1,11 @@
 use super::super::*;
 
+#[derive(Clone, Copy)]
+pub(in crate::starnix) struct LinuxStatMetadata {
+    pub(in crate::starnix) mode: u32,
+    pub(in crate::starnix) size_bytes: u64,
+}
+
 pub(in crate::starnix) struct FsContext {
     pub(in crate::starnix) fd_table: FdTable,
     pub(in crate::starnix) namespace: nexus_io::ProcessNamespace,
@@ -597,5 +603,205 @@ impl ProcessResources {
             }
             Err(status) => Ok(linux_errno(map_guest_memory_status_to_errno(status))),
         }
+    }
+}
+
+pub(in crate::starnix) fn install_stdio_fd(
+    table: &mut FdTable,
+    handle: zx_handle_t,
+    expected_fd: i32,
+) -> Result<(), zx_status_t> {
+    let mut duplicated = ZX_HANDLE_INVALID;
+    let status = zx_handle_duplicate(handle, ZX_RIGHT_SAME_RIGHTS, &mut duplicated);
+    if status != ZX_OK {
+        return Err(status);
+    }
+    let fd = table.open(
+        Arc::new(SocketFd::new(duplicated)),
+        OpenFlags::READABLE | OpenFlags::WRITABLE,
+        FdFlags::empty(),
+    )?;
+    if fd != expected_fd {
+        let _ = table.close(fd);
+        return Err(ZX_ERR_BAD_STATE);
+    }
+    Ok(())
+}
+
+pub(in crate::starnix) fn write_guest_fd_pair(
+    session: zx_handle_t,
+    guest_addr: u64,
+    left: i32,
+    right: i32,
+) -> Result<(), zx_status_t> {
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&left.to_ne_bytes());
+    bytes[4..].copy_from_slice(&right.to_ne_bytes());
+    write_guest_bytes(session, guest_addr, &bytes)
+}
+
+pub(in crate::starnix) fn decode_open_flags(flags: u64) -> (OpenFlags, FdFlags) {
+    let mut open_flags = OpenFlags::empty();
+    match flags & LINUX_O_ACCMODE {
+        0 => open_flags |= OpenFlags::READABLE,
+        LINUX_O_WRONLY => open_flags |= OpenFlags::WRITABLE,
+        LINUX_O_RDWR => open_flags |= OpenFlags::READABLE | OpenFlags::WRITABLE,
+        _ => {}
+    }
+    if (flags & LINUX_O_CREAT) != 0 {
+        open_flags |= OpenFlags::CREATE;
+    }
+    if (flags & LINUX_O_TRUNC) != 0 {
+        open_flags |= OpenFlags::TRUNCATE;
+    }
+    if (flags & LINUX_O_APPEND) != 0 {
+        open_flags |= OpenFlags::APPEND;
+    }
+    if (flags & LINUX_O_NONBLOCK) != 0 {
+        open_flags |= OpenFlags::NONBLOCK;
+    }
+    if (flags & LINUX_O_DIRECTORY) != 0 {
+        open_flags |= OpenFlags::DIRECTORY;
+    }
+    if (flags & LINUX_O_PATH) != 0 {
+        open_flags |= OpenFlags::PATH;
+    }
+    let _ignored = flags & (LINUX_O_NOCTTY | LINUX_O_LARGEFILE | LINUX_O_NOFOLLOW);
+
+    let mut fd_flags = FdFlags::empty();
+    if (flags & LINUX_O_CLOEXEC) != 0 {
+        fd_flags |= FdFlags::CLOEXEC;
+    }
+    (open_flags, fd_flags)
+}
+
+pub(in crate::starnix) fn encode_linux_fd_flags(flags: FdFlags) -> u64 {
+    let mut bits = 0u64;
+    if flags.contains(FdFlags::CLOEXEC) {
+        bits |= LINUX_FD_CLOEXEC;
+    }
+    bits
+}
+
+pub(in crate::starnix) fn encode_linux_open_flags(flags: OpenFlags) -> u64 {
+    let mut bits = match (
+        flags.contains(OpenFlags::READABLE),
+        flags.contains(OpenFlags::WRITABLE),
+    ) {
+        (true, true) => LINUX_O_RDWR,
+        (false, true) => LINUX_O_WRONLY,
+        _ => 0,
+    };
+    if flags.contains(OpenFlags::APPEND) {
+        bits |= LINUX_O_APPEND;
+    }
+    if flags.contains(OpenFlags::NONBLOCK) {
+        bits |= LINUX_O_NONBLOCK;
+    }
+    if flags.contains(OpenFlags::DIRECTORY) {
+        bits |= LINUX_O_DIRECTORY;
+    }
+    if flags.contains(OpenFlags::PATH) {
+        bits |= LINUX_O_PATH;
+    }
+    bits
+}
+
+pub(in crate::starnix) fn encode_linux_dirent64(
+    entry: &DirectoryEntry,
+    next_offset: usize,
+) -> Result<Vec<u8>, zx_status_t> {
+    let name = entry.name.as_bytes();
+    let header_bytes = 19usize;
+    let record_len = align_up(
+        header_bytes
+            .checked_add(name.len())
+            .and_then(|len| len.checked_add(1))
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+        8,
+    )?;
+    let mut record = Vec::new();
+    record
+        .try_reserve_exact(record_len)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    record.resize(record_len, 0);
+    record[0..8].copy_from_slice(&(next_offset as u64).to_ne_bytes());
+    record[8..16].copy_from_slice(&(next_offset as i64).to_ne_bytes());
+    record[16..18].copy_from_slice(&(record_len as u16).to_ne_bytes());
+    record[18] = match entry.kind {
+        DirectoryEntryKind::Directory => LINUX_DT_DIR,
+        DirectoryEntryKind::File => LINUX_DT_REG,
+        DirectoryEntryKind::Symlink => LINUX_DT_LNK,
+        DirectoryEntryKind::Socket => LINUX_DT_SOCK,
+        DirectoryEntryKind::Service | DirectoryEntryKind::Unknown => LINUX_DT_UNKNOWN,
+    };
+    let name_start = 19usize;
+    let name_end = name_start
+        .checked_add(name.len())
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    record[name_start..name_end].copy_from_slice(name);
+    Ok(record)
+}
+
+pub(in crate::starnix) fn write_guest_stat(
+    session: zx_handle_t,
+    addr: u64,
+    metadata: LinuxStatMetadata,
+    ino_seed: Option<u64>,
+) -> Result<u64, zx_status_t> {
+    let mut bytes = [0u8; LINUX_STAT_STRUCT_BYTES];
+    let ino = ino_seed.unwrap_or(1);
+    bytes[8..16].copy_from_slice(&ino.to_ne_bytes());
+    bytes[16..24].copy_from_slice(&1u64.to_ne_bytes());
+    bytes[24..28].copy_from_slice(&metadata.mode.to_ne_bytes());
+    bytes[48..56].copy_from_slice(&(metadata.size_bytes as i64).to_ne_bytes());
+    bytes[56..64].copy_from_slice(&4096i64.to_ne_bytes());
+    bytes[64..72].copy_from_slice(&(metadata.size_bytes.div_ceil(512) as i64).to_ne_bytes());
+    match write_guest_bytes(session, addr, &bytes) {
+        Ok(()) => Ok(0),
+        Err(status) => Ok(linux_errno(map_guest_memory_status_to_errno(status))),
+    }
+}
+
+pub(in crate::starnix) fn write_guest_rlimit(
+    session: zx_handle_t,
+    addr: u64,
+    current: u64,
+    maximum: u64,
+) -> Result<(), zx_status_t> {
+    let mut bytes = [0u8; LINUX_RLIMIT_BYTES];
+    bytes[..8].copy_from_slice(&current.to_ne_bytes());
+    bytes[8..].copy_from_slice(&maximum.to_ne_bytes());
+    write_guest_bytes(session, addr, &bytes)
+}
+
+pub(in crate::starnix) fn write_guest_statx(
+    session: zx_handle_t,
+    addr: u64,
+    metadata: LinuxStatMetadata,
+    ino_seed: Option<u64>,
+    requested_mask: u32,
+) -> Result<u64, zx_status_t> {
+    let supported_mask = LINUX_STATX_BASIC_STATS | LINUX_STATX_MNT_ID;
+    let mask = if requested_mask == 0 {
+        supported_mask
+    } else {
+        supported_mask & requested_mask
+    };
+    let ino = ino_seed.unwrap_or(1);
+    let mut bytes = [0u8; LINUX_STATX_BYTES];
+    bytes[0..4].copy_from_slice(&mask.to_ne_bytes());
+    bytes[4..8].copy_from_slice(&4096u32.to_ne_bytes());
+    bytes[16..20].copy_from_slice(&1u32.to_ne_bytes());
+    bytes[20..24].copy_from_slice(&0u32.to_ne_bytes());
+    bytes[24..28].copy_from_slice(&0u32.to_ne_bytes());
+    bytes[28..30].copy_from_slice(&(metadata.mode as u16).to_ne_bytes());
+    bytes[32..40].copy_from_slice(&ino.to_ne_bytes());
+    bytes[40..48].copy_from_slice(&metadata.size_bytes.to_ne_bytes());
+    bytes[48..56].copy_from_slice(&(metadata.size_bytes.div_ceil(512)).to_ne_bytes());
+    bytes[144..152].copy_from_slice(&1u64.to_ne_bytes());
+    match write_guest_bytes(session, addr, &bytes) {
+        Ok(()) => Ok(0),
+        Err(status) => Ok(linux_errno(map_guest_write_status_to_errno(status))),
     }
 }
