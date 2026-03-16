@@ -1,5 +1,13 @@
 use super::super::*;
 
+#[derive(Clone, Copy, Default)]
+pub(in crate::starnix) struct LinuxSigAction {
+    pub(in crate::starnix) handler: u64,
+    pub(in crate::starnix) flags: u64,
+    pub(in crate::starnix) restorer: u64,
+    pub(in crate::starnix) mask: u64,
+}
+
 pub(in crate::starnix) fn read_guest_signal_mask(
     session: zx_handle_t,
     addr: u64,
