@@ -2522,6 +2522,10 @@ impl TrackedTlbCpuSet {
     fn iter(self) -> impl Iterator<Item = usize> {
         (0..TLB_CPU_TRACKER_CAPACITY).filter(move |&cpu_id| self.contains(cpu_id))
     }
+
+    fn mask(self) -> u64 {
+        self.mask
+    }
 }
 
 #[derive(Debug)]
@@ -2585,6 +2589,7 @@ impl TlbCpuTracker {
             .filter(|&cpu_id| self.observed_epoch(cpu_id) < target_epoch)
             .collect();
         TlbCpuSyncShape {
+            active_cpu_mask: self.active.mask(),
             local_needs_flush,
             remote_cpus,
         }
@@ -2593,6 +2598,7 @@ impl TlbCpuTracker {
 
 #[derive(Debug)]
 struct TlbCpuSyncShape {
+    active_cpu_mask: u64,
     local_needs_flush: bool,
     remote_cpus: Vec<usize>,
 }
@@ -2602,6 +2608,7 @@ struct AddressSpace {
     vm: VmAddressSpace,
     page_tables: crate::page_table::UserPageTables,
     tlb_cpus: TlbCpuTracker,
+    strict_tlb_epoch: u64,
     vm_resources: VmResourceState,
 }
 
@@ -2746,6 +2753,7 @@ impl AddressSpace {
             vm,
             page_tables,
             tlb_cpus: TlbCpuTracker::default(),
+            strict_tlb_epoch: 0,
             vm_resources: VmResourceState::new(),
         }
     }
@@ -2830,7 +2838,13 @@ impl AddressSpace {
     }
 
     fn current_invalidate_epoch(&self) -> u64 {
-        self.page_tables.max_invalidate_epoch()
+        self.page_tables
+            .max_invalidate_epoch()
+            .max(self.strict_tlb_epoch)
+    }
+
+    fn bump_strict_tlb_epoch(&mut self) {
+        self.strict_tlb_epoch = self.current_invalidate_epoch().wrapping_add(1);
     }
 
     fn validate_descriptor_metadata_range(&self, base: u64, len: u64) -> bool {
@@ -2840,10 +2854,12 @@ impl AddressSpace {
 
     fn note_cpu_active(&mut self, cpu_id: usize) {
         self.tlb_cpus.note_active(cpu_id);
+        crate::trace::note_tlb_active_mask(self.tlb_cpus.active.mask());
     }
 
     fn note_cpu_inactive(&mut self, cpu_id: usize) {
         self.tlb_cpus.note_inactive(cpu_id);
+        crate::trace::note_tlb_active_mask(self.tlb_cpus.active.mask());
     }
 
     #[allow(dead_code)]
@@ -2864,6 +2880,7 @@ impl AddressSpace {
         current_cpu_id: usize,
         current_cpu_active: bool,
     ) -> TlbCpuSyncShape {
+        self.bump_strict_tlb_epoch();
         let target_epoch = self.current_invalidate_epoch();
         self.tlb_cpus
             .plan_strict_sync(current_cpu_id, current_cpu_active, target_epoch)
@@ -3340,6 +3357,12 @@ impl VmDomain {
         if !sync_shape.local_needs_flush && sync_shape.remote_cpus.is_empty() {
             return Ok(None);
         }
+        crate::trace::record_tlb_sync_plan(
+            address_space_id,
+            sync_shape.active_cpu_mask,
+            sync_shape.remote_cpus.len(),
+            sync_shape.local_needs_flush,
+        );
         Ok(Some(StrictTlbSyncPlan {
             address_space_id,
             target_epoch,
@@ -4794,7 +4817,10 @@ impl Kernel {
         let thread_id_copy = thread_id;
         let _ = thread;
         if !queued {
-            let target_cpu = self.choose_wake_cpu(thread_id_copy);
+            let target_cpu = self.choose_start_cpu(thread_id_copy);
+            if target_cpu != self.current_cpu_id() {
+                crate::trace::record_remote_wake(thread_id_copy, target_cpu);
+            }
             self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
             self.request_reschedule_on_cpu(target_cpu);
         }
@@ -4830,7 +4856,10 @@ impl Kernel {
         let thread_id_copy = thread_id;
         let _ = thread;
         if !queued {
-            let target_cpu = self.choose_wake_cpu(thread_id_copy);
+            let target_cpu = self.choose_start_cpu(thread_id_copy);
+            if target_cpu != self.current_cpu_id() {
+                crate::trace::record_remote_wake(thread_id_copy, target_cpu);
+            }
             self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
             self.request_reschedule_on_cpu(target_cpu);
         }
@@ -5328,6 +5357,32 @@ impl Kernel {
 
     fn take_reschedule_requested(&mut self, cpu_id: usize) -> bool {
         core::mem::take(&mut self.cpu_scheduler_mut(cpu_id).reschedule_requested)
+    }
+
+    fn choose_start_cpu(&self, thread_id: ThreadId) -> usize {
+        let current_cpu_id = self.current_cpu_id();
+        let current_thread_present = self
+            .current_cpu_scheduler()
+            .ok()
+            .and_then(|scheduler| scheduler.current_thread_id)
+            .is_some();
+        let first_run = self
+            .threads
+            .get(&thread_id)
+            .is_some_and(|thread| thread.runtime_ns == 0 && thread.last_cpu == current_cpu_id);
+        if first_run && current_thread_present {
+            if let Some((&idle_cpu_id, _)) =
+                self.cpu_schedulers.iter().find(|(cpu_id, scheduler)| {
+                    **cpu_id != current_cpu_id
+                        && scheduler.online
+                        && scheduler.current_thread_id.is_none()
+                        && scheduler.run_queue.is_empty()
+                })
+            {
+                return idle_cpu_id;
+            }
+        }
+        self.choose_wake_cpu(thread_id)
     }
 
     fn choose_wake_cpu(&self, thread_id: ThreadId) -> usize {
@@ -6046,6 +6101,7 @@ impl VmDomain {
             page_tables: crate::page_table::UserPageTables::clone_current_kernel_template()
                 .map_err(map_page_table_error)?,
             tlb_cpus: TlbCpuTracker::default(),
+            strict_tlb_epoch: 0,
             vm_resources: VmResourceState::new(),
         };
         debug_assert!(

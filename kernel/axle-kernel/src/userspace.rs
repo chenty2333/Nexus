@@ -561,7 +561,27 @@ const SLOT_TRACE_REMOTE_WAKE_PHASE3: usize = 624;
 const SLOT_PERF_THREAD_CREATE: usize = 625;
 const SLOT_PERF_THREAD_START: usize = 626;
 const SLOT_PERF_EVENTPAIR_CREATE: usize = 627;
-const SLOT_MAX: usize = SLOT_PERF_EVENTPAIR_CREATE;
+const SLOT_PERF_TLB_STATUS: usize = 628;
+const SLOT_PERF_TLB_ITERS: usize = 629;
+const SLOT_PERF_TLB_CYCLES: usize = 630;
+const SLOT_TRACE_TIMER_REPROGRAM: usize = 631;
+const SLOT_TRACE_TLB_SYNC_PLANS: usize = 632;
+const SLOT_TRACE_TLB_LOCAL_PAGE_FLUSH: usize = 633;
+const SLOT_TRACE_TLB_LOCAL_FULL_FLUSH: usize = 634;
+const SLOT_TRACE_TLB_SHOOTDOWN_PAGE: usize = 635;
+const SLOT_TRACE_TLB_SHOOTDOWN_FULL: usize = 636;
+const SLOT_TRACE_TLB_SHOOTDOWN_TARGET_CPUS: usize = 637;
+const SLOT_TRACE_TLB_MAX_ACTIVE_CPUS: usize = 638;
+const SLOT_TRACE_TLB_LAST_ACTIVE_MASK: usize = 639;
+const SLOT_TRACE_TLB_PAGE_FLUSH_PHASE4: usize = 640;
+const SLOT_TRACE_TLB_FULL_FLUSH_PHASE4: usize = 641;
+const SLOT_TRACE_TLB_SYNC_PLAN_PHASE4: usize = 642;
+const SLOT_PERF_TLB_PEER_STATUS: usize = 643;
+const SLOT_PERF_TLB_PEER_ITERS: usize = 644;
+const SLOT_PERF_TLB_PEER_CYCLES: usize = 645;
+const SLOT_TRACE_TLB_SYNC_PLAN_PHASE5: usize = 646;
+const SLOT_TRACE_TLB_SHOOTDOWN_FULL_PHASE5: usize = 647;
+const SLOT_MAX: usize = SLOT_TRACE_TLB_SHOOTDOWN_FULL_PHASE5;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1490,6 +1510,8 @@ fn perf_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_PERF_NULL_ITERS] != 0
         || slots[SLOT_PERF_WAIT_ITERS] != 0
         || slots[SLOT_PERF_WAKE_ITERS] != 0
+        || slots[SLOT_PERF_TLB_ITERS] != 0
+        || slots[SLOT_PERF_TLB_PEER_ITERS] != 0
         || slots[SLOT_PERF_FAILURE_STEP] != 0
 }
 
@@ -1498,13 +1520,31 @@ fn update_perf_trace_slots(slots: &mut [u64]) {
     slots[SLOT_TRACE_DROPPED] = crate::trace::bootstrap_trace_dropped_count();
     slots[SLOT_TRACE_EXPORTED_BYTES] = crate::trace::bootstrap_trace_exported_bytes();
     slots[SLOT_TRACE_REMOTE_WAKE_PHASE3] = crate::trace::bootstrap_trace_remote_wake_phase3();
+    slots[SLOT_TRACE_TIMER_REPROGRAM] = crate::trace::bootstrap_trace_timer_reprogram_count();
+    slots[SLOT_TRACE_TLB_SYNC_PLANS] = crate::trace::bootstrap_trace_tlb_sync_plan_count();
+    slots[SLOT_TRACE_TLB_LOCAL_PAGE_FLUSH] =
+        crate::trace::bootstrap_trace_tlb_local_page_flush_count();
+    slots[SLOT_TRACE_TLB_LOCAL_FULL_FLUSH] =
+        crate::trace::bootstrap_trace_tlb_local_full_flush_count();
+    slots[SLOT_TRACE_TLB_SHOOTDOWN_PAGE] = crate::trace::bootstrap_trace_tlb_shootdown_page_count();
+    slots[SLOT_TRACE_TLB_SHOOTDOWN_FULL] = crate::trace::bootstrap_trace_tlb_shootdown_full_count();
+    slots[SLOT_TRACE_TLB_SHOOTDOWN_TARGET_CPUS] =
+        crate::trace::bootstrap_trace_tlb_shootdown_target_cpu_total();
+    slots[SLOT_TRACE_TLB_MAX_ACTIVE_CPUS] = crate::trace::bootstrap_trace_tlb_max_active_cpus();
+    slots[SLOT_TRACE_TLB_LAST_ACTIVE_MASK] = crate::trace::bootstrap_trace_tlb_last_active_mask();
+    slots[SLOT_TRACE_TLB_PAGE_FLUSH_PHASE4] = crate::trace::bootstrap_trace_tlb_page_flush_phase4();
+    slots[SLOT_TRACE_TLB_FULL_FLUSH_PHASE4] = crate::trace::bootstrap_trace_tlb_full_flush_phase4();
+    slots[SLOT_TRACE_TLB_SYNC_PLAN_PHASE4] = crate::trace::bootstrap_trace_tlb_sync_plan_phase4();
+    slots[SLOT_TRACE_TLB_SYNC_PLAN_PHASE5] = crate::trace::bootstrap_trace_tlb_sync_plan_phase5();
+    slots[SLOT_TRACE_TLB_SHOOTDOWN_FULL_PHASE5] =
+        crate::trace::bootstrap_trace_tlb_shootdown_full_phase5();
 }
 
 fn print_perf_summary(slots: &mut [u64]) {
     crate::trace::flush_bootstrap_trace();
     update_perf_trace_slots(slots);
     crate::kprintln!(
-        "kernel: bootstrap perf smoke (perf_failure_step={}, perf_thread_create={}, perf_thread_start={}, perf_eventpair_create={}, perf_null_status={}, perf_null_iters={}, perf_null_cycles={}, perf_wait_status={}, perf_wait_iters={}, perf_wait_cycles={}, perf_wake_status={}, perf_wake_iters={}, perf_wake_cycles={}, trace_vmo_h={}, trace_records={}, trace_dropped={}, trace_export_bytes={}, trace_remote_wake_phase3={})",
+        "kernel: bootstrap perf smoke (perf_failure_step={}, perf_thread_create={}, perf_thread_start={}, perf_eventpair_create={}, perf_null_status={}, perf_null_iters={}, perf_null_cycles={}, perf_wait_status={}, perf_wait_iters={}, perf_wait_cycles={}, perf_wake_status={}, perf_wake_iters={}, perf_wake_cycles={}, perf_tlb_status={}, perf_tlb_iters={}, perf_tlb_cycles={}, perf_tlb_peer_status={}, perf_tlb_peer_iters={}, perf_tlb_peer_cycles={}, trace_vmo_h={}, trace_records={}, trace_dropped={}, trace_export_bytes={}, trace_remote_wake_phase3={}, trace_timer_reprogram={}, trace_tlb_sync_plans={}, trace_tlb_local_page_flush={}, trace_tlb_local_full_flush={}, trace_tlb_shootdown_page={}, trace_tlb_shootdown_full={}, trace_tlb_shootdown_target_cpus={}, trace_tlb_max_active_cpus={}, trace_tlb_last_active_mask={}, trace_tlb_page_flush_phase4={}, trace_tlb_full_flush_phase4={}, trace_tlb_sync_plan_phase4={}, trace_tlb_sync_plan_phase5={}, trace_tlb_shootdown_full_phase5={})",
         slots[SLOT_PERF_FAILURE_STEP],
         slots[SLOT_PERF_THREAD_CREATE] as i64,
         slots[SLOT_PERF_THREAD_START] as i64,
@@ -1518,11 +1558,31 @@ fn print_perf_summary(slots: &mut [u64]) {
         slots[SLOT_PERF_WAKE_STATUS] as i64,
         slots[SLOT_PERF_WAKE_ITERS],
         slots[SLOT_PERF_WAKE_CYCLES],
+        slots[SLOT_PERF_TLB_STATUS] as i64,
+        slots[SLOT_PERF_TLB_ITERS],
+        slots[SLOT_PERF_TLB_CYCLES],
+        slots[SLOT_PERF_TLB_PEER_STATUS] as i64,
+        slots[SLOT_PERF_TLB_PEER_ITERS],
+        slots[SLOT_PERF_TLB_PEER_CYCLES],
         slots[SLOT_TRACE_VMO_H],
         slots[SLOT_TRACE_RECORDS],
         slots[SLOT_TRACE_DROPPED],
         slots[SLOT_TRACE_EXPORTED_BYTES],
-        slots[SLOT_TRACE_REMOTE_WAKE_PHASE3]
+        slots[SLOT_TRACE_REMOTE_WAKE_PHASE3],
+        slots[SLOT_TRACE_TIMER_REPROGRAM],
+        slots[SLOT_TRACE_TLB_SYNC_PLANS],
+        slots[SLOT_TRACE_TLB_LOCAL_PAGE_FLUSH],
+        slots[SLOT_TRACE_TLB_LOCAL_FULL_FLUSH],
+        slots[SLOT_TRACE_TLB_SHOOTDOWN_PAGE],
+        slots[SLOT_TRACE_TLB_SHOOTDOWN_FULL],
+        slots[SLOT_TRACE_TLB_SHOOTDOWN_TARGET_CPUS],
+        slots[SLOT_TRACE_TLB_MAX_ACTIVE_CPUS],
+        slots[SLOT_TRACE_TLB_LAST_ACTIVE_MASK],
+        slots[SLOT_TRACE_TLB_PAGE_FLUSH_PHASE4],
+        slots[SLOT_TRACE_TLB_FULL_FLUSH_PHASE4],
+        slots[SLOT_TRACE_TLB_SYNC_PLAN_PHASE4],
+        slots[SLOT_TRACE_TLB_SYNC_PLAN_PHASE5],
+        slots[SLOT_TRACE_TLB_SHOOTDOWN_FULL_PHASE5]
     );
 }
 

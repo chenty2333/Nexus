@@ -75,8 +75,13 @@ Main just targets include:
 - Bootstrap performance-smoke coverage now also includes one minimal measurement gate:
   - a bootstrap ring3 runner can execute `null_syscall`, `wait_one` ping-pong, and cross-core
     wake-path smoke loops under QEMU
-  - the kernel exports one bootstrap VMO-backed trace summary covering at least syscall,
-    scheduler, and timer events
+  - the kernel exports one bootstrap VMO-backed trace summary covering syscall, scheduler,
+    timer, and TLB events, including irq enter/exit edges on timer and reschedule handlers
+  - the same runner now also executes one narrow VMAR map/protect/unmap churn slice so TLB-local
+    page-flush telemetry is exercised and parsed through the same key=value summary path
+  - one follow-on active-peer TLB slice now keeps the same address space live on both CPUs long
+    enough to drive strict sync-plan and remote full-shootdown telemetry through the same summary
+    path
   - the scenario currently acts as a wiring and attribution gate, not as a stable performance
     regression threshold
 - Component-framework bootstrap coverage now also includes one eager-topology gate:
@@ -87,11 +92,11 @@ Main just targets include:
   - one provider is lazy-started on first routed `/svc` open
   - `Stop` / `Kill` controller requests are exercised through the minimal component-manager path
   - `OnTerminated` controller events, not raw task-handle waits, are the lifecycle contract at this layer
-- The Round-1 Starnix bootstrap scenario also runs under `-smp 2` and now acts as one regression
-  guard for the scheduler's first-run child-launch path:
-  - a brand-new child thread must not be opportunistically migrated to an unrelated idle AP before
-    its first runnable handoff has respected its preferred / creator CPU
+- The Round-1 Starnix bootstrap scenario also runs under `-smp 2` and continues to guard the
+  scheduler's first-run child-launch path against gross regressions:
   - the scenario explicitly forbids a kernel `#GP` during that launch path
+  - first-run child activation may now spill to an idle peer CPU in the narrower `creator busy +
+    peer idle` case without changing the generic guest bootstrap contract
 - The first Round-2 Starnix fd scenario now extends that same bootstrap path with one narrow
   Linux-fd slice:
   - `read` / `write` / `close`

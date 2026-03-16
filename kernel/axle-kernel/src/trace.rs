@@ -5,8 +5,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use axle_types::zx_handle_t;
 
-const TRACE_RECORD_CAPACITY: usize = 1280;
-const TRACE_VMO_BYTES: u64 = 64 * 1024;
+const TRACE_RECORD_CAPACITY: usize = 4096;
+const TRACE_VMO_BYTES: u64 = 256 * 1024;
 const TRACE_MAGIC: u64 = u64::from_le_bytes(*b"AXLTRC01");
 const TRACE_VERSION: u64 = 1;
 const TRACE_RECORD_WORDS: u64 = 6;
@@ -18,6 +18,7 @@ pub(crate) enum TraceCategory {
     Syscall = 1,
     Sched = 2,
     Timer = 3,
+    Tlb = 4,
 }
 
 #[repr(u16)]
@@ -28,6 +29,14 @@ pub(crate) enum TraceEvent {
     RemoteWake = 3,
     ReschedIpi = 4,
     TimerFire = 5,
+    TimerReprogram = 6,
+    TlbSyncPlan = 7,
+    TlbFlushPage = 8,
+    TlbFlushAll = 9,
+    TlbShootdownPage = 10,
+    TlbShootdownAll = 11,
+    IrqEnter = 12,
+    IrqExit = 13,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,6 +68,7 @@ impl TraceRecord {
             1 => TraceCategory::Syscall,
             2 => TraceCategory::Sched,
             3 => TraceCategory::Timer,
+            4 => TraceCategory::Tlb,
             _ => TraceCategory::Syscall,
         }
     }
@@ -70,6 +80,14 @@ impl TraceRecord {
             3 => TraceEvent::RemoteWake,
             4 => TraceEvent::ReschedIpi,
             5 => TraceEvent::TimerFire,
+            6 => TraceEvent::TimerReprogram,
+            7 => TraceEvent::TlbSyncPlan,
+            8 => TraceEvent::TlbFlushPage,
+            9 => TraceEvent::TlbFlushAll,
+            10 => TraceEvent::TlbShootdownPage,
+            11 => TraceEvent::TlbShootdownAll,
+            12 => TraceEvent::IrqEnter,
+            13 => TraceEvent::IrqExit,
             _ => TraceEvent::SysEnter,
         }
     }
@@ -80,6 +98,20 @@ static TRACE_RECORD_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_EXPORTED_BYTES: AtomicU64 = AtomicU64::new(0);
 static TRACE_REMOTE_WAKE_PHASE3: AtomicU64 = AtomicU64::new(0);
+static TRACE_TIMER_REPROGRAM_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_SYNC_PLAN_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_LOCAL_PAGE_FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_LOCAL_FULL_FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_SHOOTDOWN_PAGE_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_SHOOTDOWN_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_SHOOTDOWN_TARGET_CPU_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_MAX_ACTIVE_CPUS: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_LAST_ACTIVE_MASK: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_PAGE_FLUSH_PHASE4: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_FULL_FLUSH_PHASE4: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_SYNC_PLAN_PHASE4: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_SYNC_PLAN_PHASE5: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_SHOOTDOWN_FULL_PHASE5: AtomicU64 = AtomicU64::new(0);
 static mut TRACE_RECORDS: [TraceRecord; TRACE_RECORD_CAPACITY] =
     [TraceRecord::ZERO; TRACE_RECORD_CAPACITY];
 
@@ -109,6 +141,71 @@ pub(crate) fn bootstrap_trace_remote_wake_phase3() -> u64 {
     TRACE_REMOTE_WAKE_PHASE3.load(Ordering::Acquire)
 }
 
+pub(crate) fn bootstrap_trace_timer_reprogram_count() -> u64 {
+    TRACE_TIMER_REPROGRAM_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_sync_plan_count() -> u64 {
+    TRACE_TLB_SYNC_PLAN_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_local_page_flush_count() -> u64 {
+    TRACE_TLB_LOCAL_PAGE_FLUSH_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_local_full_flush_count() -> u64 {
+    TRACE_TLB_LOCAL_FULL_FLUSH_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_shootdown_page_count() -> u64 {
+    TRACE_TLB_SHOOTDOWN_PAGE_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_shootdown_full_count() -> u64 {
+    TRACE_TLB_SHOOTDOWN_FULL_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_shootdown_target_cpu_total() -> u64 {
+    TRACE_TLB_SHOOTDOWN_TARGET_CPU_TOTAL.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_max_active_cpus() -> u64 {
+    TRACE_TLB_MAX_ACTIVE_CPUS.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_last_active_mask() -> u64 {
+    TRACE_TLB_LAST_ACTIVE_MASK.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_page_flush_phase4() -> u64 {
+    TRACE_TLB_PAGE_FLUSH_PHASE4.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_full_flush_phase4() -> u64 {
+    TRACE_TLB_FULL_FLUSH_PHASE4.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_sync_plan_phase4() -> u64 {
+    TRACE_TLB_SYNC_PLAN_PHASE4.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_sync_plan_phase5() -> u64 {
+    TRACE_TLB_SYNC_PLAN_PHASE5.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_shootdown_full_phase5() -> u64 {
+    TRACE_TLB_SHOOTDOWN_FULL_PHASE5.load(Ordering::Acquire)
+}
+
+pub(crate) fn note_tlb_active_mask(active_cpu_mask: u64) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_TLB_LAST_ACTIVE_MASK.store(active_cpu_mask, Ordering::Release);
+    let active_cpu_count = active_cpu_mask.count_ones() as u64;
+    let _ = TRACE_TLB_MAX_ACTIVE_CPUS.fetch_max(active_cpu_count, Ordering::AcqRel);
+}
+
 pub(crate) fn init_bootstrap_trace() {
     let trace_vmo_handle = crate::object::vm::create_vmo(TRACE_VMO_BYTES, 0).unwrap_or(0);
     TRACE_VMO_HANDLE.store(u64::from(trace_vmo_handle), Ordering::Release);
@@ -116,6 +213,20 @@ pub(crate) fn init_bootstrap_trace() {
     TRACE_DROPPED_COUNT.store(0, Ordering::Release);
     TRACE_EXPORTED_BYTES.store(0, Ordering::Release);
     TRACE_REMOTE_WAKE_PHASE3.store(0, Ordering::Release);
+    TRACE_TIMER_REPROGRAM_COUNT.store(0, Ordering::Release);
+    TRACE_TLB_SYNC_PLAN_COUNT.store(0, Ordering::Release);
+    TRACE_TLB_LOCAL_PAGE_FLUSH_COUNT.store(0, Ordering::Release);
+    TRACE_TLB_LOCAL_FULL_FLUSH_COUNT.store(0, Ordering::Release);
+    TRACE_TLB_SHOOTDOWN_PAGE_COUNT.store(0, Ordering::Release);
+    TRACE_TLB_SHOOTDOWN_FULL_COUNT.store(0, Ordering::Release);
+    TRACE_TLB_SHOOTDOWN_TARGET_CPU_TOTAL.store(0, Ordering::Release);
+    TRACE_TLB_MAX_ACTIVE_CPUS.store(0, Ordering::Release);
+    TRACE_TLB_LAST_ACTIVE_MASK.store(0, Ordering::Release);
+    TRACE_TLB_PAGE_FLUSH_PHASE4.store(0, Ordering::Release);
+    TRACE_TLB_FULL_FLUSH_PHASE4.store(0, Ordering::Release);
+    TRACE_TLB_SYNC_PLAN_PHASE4.store(0, Ordering::Release);
+    TRACE_TLB_SYNC_PLAN_PHASE5.store(0, Ordering::Release);
+    TRACE_TLB_SHOOTDOWN_FULL_PHASE5.store(0, Ordering::Release);
     // SAFETY: resetting the bootstrap trace ring happens before userspace starts
     // producing trace records for this run, so no concurrent writers can observe
     // partially cleared records. Each slot is written through a raw pointer to
@@ -201,6 +312,121 @@ pub(crate) fn record_timer_fire(from_user: bool, needs_trap_exit: bool) {
     );
 }
 
+pub(crate) fn record_timer_irq_enter(from_user: bool) {
+    record(
+        TraceCategory::Timer,
+        TraceEvent::IrqEnter,
+        u64::from(from_user),
+        0,
+    );
+}
+
+pub(crate) fn record_timer_irq_exit(from_user: bool, trap_exit_taken: bool) {
+    record(
+        TraceCategory::Timer,
+        TraceEvent::IrqExit,
+        u64::from(from_user),
+        u64::from(trap_exit_taken),
+    );
+}
+
+pub(crate) fn record_timer_reprogram(deadline_tsc: u64) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_TIMER_REPROGRAM_COUNT.fetch_add(1, Ordering::AcqRel);
+    record(
+        TraceCategory::Timer,
+        TraceEvent::TimerReprogram,
+        deadline_tsc,
+        0,
+    );
+}
+
+pub(crate) fn record_tlb_sync_plan(
+    address_space_id: u64,
+    active_cpu_mask: u64,
+    remote_cpu_count: usize,
+    local_needs_flush: bool,
+) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_TLB_SYNC_PLAN_COUNT.fetch_add(1, Ordering::AcqRel);
+    note_tlb_active_mask(active_cpu_mask);
+    let flags = ((remote_cpu_count as u64) << 1) | u64::from(u8::from(local_needs_flush));
+    record(
+        TraceCategory::Tlb,
+        TraceEvent::TlbSyncPlan,
+        address_space_id,
+        (active_cpu_mask & 0xffff_ffff) | (flags << 32),
+    );
+}
+
+pub(crate) fn record_tlb_flush_page(va: u64) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_TLB_LOCAL_PAGE_FLUSH_COUNT.fetch_add(1, Ordering::AcqRel);
+    record(TraceCategory::Tlb, TraceEvent::TlbFlushPage, va, 0);
+}
+
+pub(crate) fn record_tlb_flush_all() {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_TLB_LOCAL_FULL_FLUSH_COUNT.fetch_add(1, Ordering::AcqRel);
+    record(TraceCategory::Tlb, TraceEvent::TlbFlushAll, 0, 0);
+}
+
+pub(crate) fn record_tlb_shootdown_page(va: u64, target_cpu_mask: u64) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_TLB_SHOOTDOWN_PAGE_COUNT.fetch_add(1, Ordering::AcqRel);
+    TRACE_TLB_SHOOTDOWN_TARGET_CPU_TOTAL
+        .fetch_add(target_cpu_mask.count_ones() as u64, Ordering::AcqRel);
+    record(
+        TraceCategory::Tlb,
+        TraceEvent::TlbShootdownPage,
+        va,
+        target_cpu_mask,
+    );
+}
+
+pub(crate) fn record_tlb_shootdown_all(target_cpu_mask: u64) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_TLB_SHOOTDOWN_FULL_COUNT.fetch_add(1, Ordering::AcqRel);
+    TRACE_TLB_SHOOTDOWN_TARGET_CPU_TOTAL
+        .fetch_add(target_cpu_mask.count_ones() as u64, Ordering::AcqRel);
+    record(
+        TraceCategory::Tlb,
+        TraceEvent::TlbShootdownAll,
+        target_cpu_mask,
+        0,
+    );
+}
+
+pub(crate) fn record_sched_irq_enter(from_user: bool) {
+    record(
+        TraceCategory::Sched,
+        TraceEvent::IrqEnter,
+        u64::from(from_user),
+        0,
+    );
+}
+
+pub(crate) fn record_sched_irq_exit(from_user: bool, trap_exit_taken: bool) {
+    record(
+        TraceCategory::Sched,
+        TraceEvent::IrqExit,
+        u64::from(from_user),
+        u64::from(trap_exit_taken),
+    );
+}
+
 fn snapshot_records() -> Vec<TraceRecord> {
     let record_count = bootstrap_trace_record_count() as usize;
     let mut snapshot = Vec::with_capacity(record_count);
@@ -246,6 +472,7 @@ fn category_name(category: TraceCategory) -> &'static str {
         TraceCategory::Syscall => "ax_syscall",
         TraceCategory::Sched => "ax_sched",
         TraceCategory::Timer => "ax_timer",
+        TraceCategory::Tlb => "ax_tlb",
     }
 }
 
@@ -256,6 +483,14 @@ fn event_name(event: TraceEvent) -> &'static str {
         TraceEvent::RemoteWake => "remote_wake",
         TraceEvent::ReschedIpi => "resched_ipi",
         TraceEvent::TimerFire => "timer_fire",
+        TraceEvent::TimerReprogram => "timer_reprogram",
+        TraceEvent::TlbSyncPlan => "tlb_sync_plan",
+        TraceEvent::TlbFlushPage => "tlb_flush_page",
+        TraceEvent::TlbFlushAll => "tlb_flush_all",
+        TraceEvent::TlbShootdownPage => "tlb_shootdown_page",
+        TraceEvent::TlbShootdownAll => "tlb_shootdown_all",
+        TraceEvent::IrqEnter => "irq_enter",
+        TraceEvent::IrqExit => "irq_exit",
     }
 }
 
@@ -267,6 +502,41 @@ pub(crate) fn flush_bootstrap_trace() {
         .filter(|record| record.phase == 3 && record.event() == TraceEvent::RemoteWake)
         .count() as u64;
     TRACE_REMOTE_WAKE_PHASE3.store(remote_wake_phase3, Ordering::Release);
+    TRACE_TLB_PAGE_FLUSH_PHASE4.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 4 && record.event() == TraceEvent::TlbFlushPage)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_TLB_FULL_FLUSH_PHASE4.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 4 && record.event() == TraceEvent::TlbFlushAll)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_TLB_SYNC_PLAN_PHASE4.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 4 && record.event() == TraceEvent::TlbSyncPlan)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_TLB_SYNC_PLAN_PHASE5.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 5 && record.event() == TraceEvent::TlbSyncPlan)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_TLB_SHOOTDOWN_FULL_PHASE5.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 5 && record.event() == TraceEvent::TlbShootdownAll)
+            .count() as u64,
+        Ordering::Release,
+    );
 
     let encoded = encode_snapshot(&records);
     TRACE_EXPORTED_BYTES.store(encoded.len() as u64, Ordering::Release);

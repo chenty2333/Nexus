@@ -73,6 +73,7 @@ fn arm_next_tick() {
     unsafe {
         Msr::new(IA32_TSC_DEADLINE).write(deadline);
     }
+    crate::trace::record_timer_reprogram(deadline);
 }
 
 /// Called from the timer interrupt handler.
@@ -152,13 +153,16 @@ extern "C" fn axle_timer_rust(frame: &mut crate::arch::int80::TrapFrame, cpu_fra
         // slot is valid for both kernel- and user-origin interrupts.
         unsafe { (*cpu_frame.add(1) & 0b11) == 0b11 }
     };
+    crate::trace::record_timer_irq_enter(from_user);
     on_tick();
     let now = crate::time::now_ns();
     let needs_trap_exit = crate::object::timer_interrupt_requires_trap_exit(now).unwrap_or(false);
     crate::trace::record_timer_fire(from_user, needs_trap_exit);
+    let mut trap_exit_taken = false;
     if from_user && needs_trap_exit {
-        let _ = crate::object::finish_timer_interrupt(frame, cpu_frame);
+        trap_exit_taken = crate::object::finish_timer_interrupt(frame, cpu_frame).is_ok();
     }
+    crate::trace::record_timer_irq_exit(from_user, trap_exit_taken);
 
     if USE_TSC_DEADLINE.load(Ordering::Relaxed) {
         arm_next_tick();

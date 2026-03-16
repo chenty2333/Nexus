@@ -197,14 +197,20 @@ extern "C" fn axle_ipi_reschedule_rust(
     // If this hit user mode, turn it into an immediate trap-exit so the target CPU can observe
     // `reschedule_requested` without waiting for a later syscall or timer edge.
     apic::eoi();
-    if cpu_frame.is_null() {
-        return;
-    }
-    let from_user = unsafe { (*cpu_frame.add(1) & 0b11) == 0b11 };
+    let from_user = if cpu_frame.is_null() {
+        false
+    } else {
+        // SAFETY: the reschedule IPI stub passes the pointer to the CPU-saved IRET frame.
+        // Reading the saved CS slot is valid for both kernel- and user-origin interrupts.
+        unsafe { (*cpu_frame.add(1) & 0b11) == 0b11 }
+    };
+    crate::trace::record_sched_irq_enter(from_user);
     crate::trace::record_resched_ipi(from_user);
+    let mut trap_exit_taken = false;
     if from_user {
-        let _ = crate::object::finish_reschedule_interrupt(frame, cpu_frame);
+        trap_exit_taken = crate::object::finish_reschedule_interrupt(frame, cpu_frame).is_ok();
     }
+    crate::trace::record_sched_irq_exit(from_user, trap_exit_taken);
 }
 
 #[allow(dead_code)]
@@ -215,6 +221,16 @@ fn tlb_ack_count(apic_id: usize) -> u64 {
     TLB_SHOOTDOWN_ACK[apic_id].load(Ordering::Acquire)
 }
 
+fn apic_id_mask(apic_ids: &[usize]) -> u64 {
+    let mut mask = 0_u64;
+    for &apic_id in apic_ids {
+        if apic_id < u64::BITS as usize {
+            mask |= 1_u64 << apic_id;
+        }
+    }
+    mask
+}
+
 #[allow(dead_code)]
 pub fn shootdown_page(va: u64) -> Result<(), zx_status_t> {
     let _guard = TLB_SHOOTDOWN_LOCK.lock();
@@ -223,12 +239,16 @@ pub fn shootdown_page(va: u64) -> Result<(), zx_status_t> {
 
     let mut result = Ok(());
     let local_apic_id = apic::this_apic_id() as usize;
+    let mut target_mask = 0_u64;
     crate::smp::for_each_online_cpu(|apic_id| {
         if result.is_err() {
             return;
         }
         if apic_id == local_apic_id {
             return;
+        }
+        if apic_id < u64::BITS as usize {
+            target_mask |= 1_u64 << apic_id;
         }
 
         let before = tlb_ack_count(apic_id);
@@ -249,6 +269,8 @@ pub fn shootdown_page(va: u64) -> Result<(), zx_status_t> {
         }
     });
 
+    crate::trace::record_tlb_shootdown_page(va, target_mask);
+
     TLB_SHOOTDOWN_PAGE.store(0, Ordering::Release);
     TLB_SHOOTDOWN_MODE.store(TLB_MODE_NONE, Ordering::Release);
     result
@@ -258,6 +280,7 @@ pub fn shootdown_all(apic_ids: &[usize]) -> Result<(), zx_status_t> {
     let _guard = TLB_SHOOTDOWN_LOCK.lock();
     TLB_SHOOTDOWN_MODE.store(TLB_MODE_FULL, Ordering::Release);
     TLB_SHOOTDOWN_PAGE.store(0, Ordering::Release);
+    crate::trace::record_tlb_shootdown_all(apic_id_mask(apic_ids));
 
     let mut result = Ok(());
     for &apic_id in apic_ids {

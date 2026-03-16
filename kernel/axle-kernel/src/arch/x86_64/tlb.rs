@@ -9,6 +9,7 @@ pub fn flush_page_local(va: u64) {
         // canonical virtual address in the current address space.
         core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
     }
+    crate::trace::record_tlb_flush_page(va);
 }
 
 /// Flush the current CPU's TLB by reloading CR3.
@@ -20,6 +21,7 @@ pub fn flush_all_local() {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
     }
+    crate::trace::record_tlb_flush_all();
 }
 
 /// Flush one page locally and request remote CPUs to invalidate the same page.

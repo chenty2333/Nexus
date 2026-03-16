@@ -23,9 +23,17 @@ perf_eventpair_create = 0
 perf_null_status = 0
 perf_wait_status = 0
 perf_wake_status = 0
+perf_tlb_status = 0
+perf_tlb_peer_status = 0
 
 [assertions.packet_fields]
 perf_failure_step = 0
 perf_null_iters = 64
 perf_wait_iters = 32
 perf_wake_iters = 32
+perf_tlb_iters = 8
+perf_tlb_peer_iters = 8
+trace_tlb_max_active_cpus = 2
+trace_tlb_page_flush_phase4 = 40
+trace_tlb_sync_plan_phase5 = 8
+trace_tlb_shootdown_full_phase5 = 8
