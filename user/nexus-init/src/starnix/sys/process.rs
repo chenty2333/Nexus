@@ -446,6 +446,7 @@ impl StarnixKernel {
                 .resources
                 .as_ref()
                 .ok_or(ZX_ERR_BAD_STATE)?
+                .fs
                 .namespace
                 .clone();
             (image, namespace)
@@ -690,6 +691,7 @@ impl StarnixKernel {
                 .resources
                 .as_ref()
                 .ok_or(ZX_ERR_BAD_STATE)?
+                .fs
                 .namespace;
             match open_exec_image_from_namespace(namespace, &path) {
                 Ok((resolved_path, image_bytes, image_vmo)) => {
@@ -720,6 +722,7 @@ impl StarnixKernel {
                     .resources
                     .as_ref()
                     .ok_or(ZX_ERR_BAD_STATE)?
+                    .fs
                     .namespace;
                 read_exec_image_bytes_from_namespace(namespace, interp_path).map(|(_, bytes)| bytes)
             },

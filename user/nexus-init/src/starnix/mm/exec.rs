@@ -517,7 +517,7 @@ fn reserve_stack_blob<'a>(
     Ok(ptr)
 }
 
-impl ExecutiveState {
+impl ProcessResources {
     pub(in crate::starnix) fn install_initial_tls(
         &mut self,
         session: zx_handle_t,

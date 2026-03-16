@@ -252,7 +252,7 @@ impl StarnixKernel {
                 Ok(ops) => {
                     let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
                     let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
-                    match resources.fd_table.open(ops, open_flags, fd_flags) {
+                    match resources.fs.fd_table.open(ops, open_flags, fd_flags) {
                         Ok(fd) => fd as u64,
                         Err(status) => linux_errno(map_fd_status_to_errno(status)),
                     }

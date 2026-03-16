@@ -41,9 +41,9 @@ pub(in crate::starnix) struct LinuxWritableRange {
     pub(in crate::starnix) len: u64,
 }
 
-impl ExecutiveState {
+impl ProcessResources {
     pub(in crate::starnix) fn brk(&mut self, addr: u64) -> Result<u64, zx_status_t> {
-        Ok(self.linux_mm.brk(addr))
+        Ok(self.mm.brk(addr))
     }
 
     pub(in crate::starnix) fn mmap(
@@ -55,12 +55,12 @@ impl ExecutiveState {
         fd: i32,
         offset: u64,
     ) -> Result<u64, zx_status_t> {
-        self.linux_mm
-            .mmap(&self.fd_table, addr, len, prot, flags, fd, offset)
+        self.mm
+            .mmap(&self.fs.fd_table, addr, len, prot, flags, fd, offset)
     }
 
     pub(in crate::starnix) fn munmap(&mut self, addr: u64, len: u64) -> Result<u64, zx_status_t> {
-        self.linux_mm.munmap(addr, len)
+        self.mm.munmap(addr, len)
     }
 
     pub(in crate::starnix) fn mprotect(
@@ -69,7 +69,7 @@ impl ExecutiveState {
         len: u64,
         prot: u64,
     ) -> Result<u64, zx_status_t> {
-        self.linux_mm.mprotect(addr, len, prot)
+        self.mm.mprotect(addr, len, prot)
     }
 
     pub(in crate::starnix) fn map_private_anon(
@@ -77,8 +77,8 @@ impl ExecutiveState {
         len: u64,
         prot: u64,
     ) -> Result<u64, zx_status_t> {
-        let mapped = self.linux_mm.mmap(
-            &self.fd_table,
+        let mapped = self.mm.mmap(
+            &self.fs.fd_table,
             0,
             len,
             prot,
@@ -96,7 +96,7 @@ impl ExecutiveState {
         &mut self,
         writable_ranges: &[LinuxWritableRange],
     ) -> Result<(), zx_status_t> {
-        self.linux_mm.install_exec_writable_ranges(writable_ranges)
+        self.mm.install_exec_writable_ranges(writable_ranges)
     }
 }
 

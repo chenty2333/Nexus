@@ -643,6 +643,7 @@ impl StarnixKernel {
             let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
             resources
+                .fs
                 .fd_table
                 .open(Arc::new(pidfd), OpenFlags::READABLE, FdFlags::empty())
         };
@@ -651,7 +652,7 @@ impl StarnixKernel {
                 let key = {
                     let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
                     let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
-                    let entry = resources.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+                    let entry = resources.fs.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
                     file_description_key(entry.description())
                 };
                 self.pidfds.insert(key, weak);
@@ -684,7 +685,7 @@ impl StarnixKernel {
             let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
             let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
-            let fd_entry = resources.fd_table.get(pidfd).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let fd_entry = resources.fs.fd_table.get(pidfd).ok_or(ZX_ERR_BAD_HANDLE)?;
             let Some(pidfd) = fd_entry
                 .description()
                 .ops()
@@ -740,6 +741,7 @@ impl StarnixKernel {
                     FdFlags::empty()
                 };
                 resources
+                    .fs
                     .fd_table
                     .open(Arc::new(timerfd), open_flags, fd_flags)
             }
@@ -794,7 +796,7 @@ impl StarnixKernel {
         let result = {
             let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
-            let Some(entry) = resources.fd_table.get(fd) else {
+            let Some(entry) = resources.fs.fd_table.get(fd) else {
                 complete_syscall(stop_state, linux_errno(LINUX_EBADF))?;
                 return Ok(SyscallAction::Resume);
             };
@@ -891,6 +893,7 @@ impl StarnixKernel {
                 FdFlags::empty()
             };
             resources
+                .fs
                 .fd_table
                 .open(Arc::new(signalfd), open_flags, fd_flags)
         };
@@ -900,7 +903,7 @@ impl StarnixKernel {
                 let key = {
                     let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
                     let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
-                    let entry = resources.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+                    let entry = resources.fs.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
                     file_description_key(entry.description())
                 };
                 self.signalfds.insert(key, weak);
@@ -943,6 +946,7 @@ impl StarnixKernel {
                     FdFlags::empty()
                 };
                 resources
+                    .fs
                     .fd_table
                     .open(Arc::new(eventfd), open_flags, fd_flags)
             }

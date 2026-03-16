@@ -468,10 +468,11 @@ impl StarnixKernel {
     }
 
     fn snapshot_fd_descriptions(
-        resources: &ExecutiveState,
+        resources: &ProcessResources,
     ) -> Result<BTreeMap<String, Arc<OpenFileDescription>>, zx_status_t> {
         let mut entries = BTreeMap::new();
         let target_hits = resources
+            .fs
             .fd_table
             .len()
             .checked_add(32)
@@ -480,7 +481,7 @@ impl StarnixKernel {
         let mut misses_after_hits = 0usize;
         let mut fd = 0i32;
         while hits < target_hits && misses_after_hits < 64 {
-            if let Some(entry) = resources.fd_table.get(fd) {
+            if let Some(entry) = resources.fs.fd_table.get(fd) {
                 entries.insert(format!("{fd}"), Arc::clone(entry.description()));
                 hits = hits.checked_add(1).ok_or(ZX_ERR_OUT_OF_RANGE)?;
                 misses_after_hits = 0;
@@ -581,7 +582,7 @@ impl StarnixKernel {
             [_, "cwd"] => group
                 .resources
                 .as_ref()
-                .map(|resources| String::from(resources.namespace.cwd()))
+                .map(|resources| String::from(resources.fs.namespace.cwd()))
                 .ok_or(ZX_ERR_NOT_FOUND),
             [_, "fd", raw_fd] => {
                 let fd = raw_fd.parse::<i32>().map_err(|_| ZX_ERR_NOT_FOUND)?;
@@ -594,7 +595,7 @@ impl StarnixKernel {
     fn proc_fd_readlink_target(&self, tgid: i32, fd: i32) -> Result<String, zx_status_t> {
         let group = self.groups.get(&tgid).ok_or(ZX_ERR_NOT_FOUND)?;
         let resources = group.resources.as_ref().ok_or(ZX_ERR_NOT_FOUND)?;
-        let entry = resources.fd_table.get(fd).ok_or(ZX_ERR_NOT_FOUND)?;
+        let entry = resources.fs.fd_table.get(fd).ok_or(ZX_ERR_NOT_FOUND)?;
         let description = entry.description();
         let description_key = file_description_key(description);
         if self.epolls.contains_key(&description_key) {
@@ -639,7 +640,7 @@ impl StarnixKernel {
         let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
         let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
         let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
-        let entry = resources.fd_table.get(dirfd).ok_or(ZX_ERR_BAD_HANDLE)?;
+        let entry = resources.fs.fd_table.get(dirfd).ok_or(ZX_ERR_BAD_HANDLE)?;
         let ops = entry.description().ops().as_ref();
         if ops.as_any().is::<ProcRootFd>() {
             return Ok(Some(String::from("/proc")));
@@ -675,7 +676,7 @@ impl StarnixKernel {
         let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
         let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
         let resolved = if path.starts_with('/') || dirfd == LINUX_AT_FDCWD {
-            resources.namespace.resolve_path(path)?
+            resources.fs.namespace.resolve_path(path)?
         } else if let Some(base) = self.proc_readlink_base_for_dirfd(task_id, dirfd)? {
             join_proc_relative_path(base.as_str(), path)?
         } else {

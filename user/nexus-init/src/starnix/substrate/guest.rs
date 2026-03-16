@@ -109,8 +109,8 @@ pub(in crate::starnix) fn linux_guest_initial_regs(entry: u64, stack: u64) -> ax
 pub(in crate::starnix) fn start_prepared_carrier_guest(
     prepared: PreparedProcessCarrier,
     regs: &ax_guest_x64_regs_t,
-    resources: ExecutiveState,
-) -> Result<(ExecutiveState, TaskCarrier), zx_status_t> {
+    resources: ProcessResources,
+) -> Result<(ProcessResources, TaskCarrier), zx_status_t> {
     let start_status = ax_process_start_guest(
         prepared.process_handle,
         prepared.carrier.thread_handle,

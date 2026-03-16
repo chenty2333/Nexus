@@ -418,7 +418,7 @@ impl StarnixKernel {
             } else {
                 FdFlags::empty()
             };
-            resources.fd_table.open(
+            resources.fs.fd_table.open(
                 Arc::new(PseudoNodeFd::new(None)),
                 OpenFlags::READABLE,
                 fd_flags,
@@ -429,7 +429,7 @@ impl StarnixKernel {
                 let epoll_key = {
                     let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
                     let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
-                    let entry = resources.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+                    let entry = resources.fs.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
                     file_description_key(entry.description())
                 };
                 self.epolls.insert(epoll_key, EpollInstance::new());
@@ -462,13 +462,13 @@ impl StarnixKernel {
         let (epoll_key, target_description, raw_wait_interest) = {
             let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
-            let epoll_entry = resources.fd_table.get(epfd).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let epoll_entry = resources.fs.fd_table.get(epfd).ok_or(ZX_ERR_BAD_HANDLE)?;
             let epoll_key = file_description_key(epoll_entry.description());
-            let target_entry = resources.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let target_entry = resources.fs.fd_table.get(fd).ok_or(ZX_ERR_BAD_HANDLE)?;
             (
                 epoll_key,
                 Arc::clone(target_entry.description()),
-                resources.fd_table.wait_interest(fd)?,
+                resources.fs.fd_table.wait_interest(fd)?,
             )
         };
         if !self.epolls.contains_key(&epoll_key) {
@@ -606,7 +606,7 @@ impl StarnixKernel {
         let epoll_key = {
             let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
-            let epoll_entry = resources.fd_table.get(epfd).ok_or(ZX_ERR_BAD_HANDLE)?;
+            let epoll_entry = resources.fs.fd_table.get(epfd).ok_or(ZX_ERR_BAD_HANDLE)?;
             file_description_key(epoll_entry.description())
         };
         if !self.epolls.contains_key(&epoll_key) {
