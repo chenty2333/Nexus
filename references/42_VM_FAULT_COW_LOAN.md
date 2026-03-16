@@ -36,6 +36,19 @@ This file describes the current page-fault, copy-on-write, and channel page-loan
   futex waits, with source `Fault(key)`.
 - Resident-range helper contention still uses a local spin/retry helper in the non-trap path.
 - Completion wakes waiters and advances an epoch-like completion counter for the in-flight fault record.
+- The bootstrap trace recorder now exports one minimal trap-facing fault timeline:
+  - `fault_enter`
+  - `fault_block`
+  - `fault_resume`
+  - `fault_handled`
+  - `fault_unhandled`
+- The current bootstrap perf-smoke phase exercises one same-page contention shape through the
+  existing leader-pause test hook, and the stable gate today is:
+  - three fault entries
+  - two blocked trap paths
+  - two preserve-context resumes
+  - one handled resolution
+  - zero unhandled exits
 
 This is the current mechanism that prevents duplicate materialization or inconsistent COW races on the same page.
 

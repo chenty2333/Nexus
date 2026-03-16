@@ -19,6 +19,7 @@ pub(crate) enum TraceCategory {
     Sched = 2,
     Timer = 3,
     Tlb = 4,
+    Fault = 5,
 }
 
 #[repr(u16)]
@@ -39,6 +40,11 @@ pub(crate) enum TraceEvent {
     IrqEnter = 13,
     IrqExit = 14,
     ContextSwitch = 15,
+    FaultEnter = 16,
+    FaultHandled = 17,
+    FaultBlock = 18,
+    FaultResume = 19,
+    FaultUnhandled = 20,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -71,6 +77,7 @@ impl TraceRecord {
             2 => TraceCategory::Sched,
             3 => TraceCategory::Timer,
             4 => TraceCategory::Tlb,
+            5 => TraceCategory::Fault,
             _ => TraceCategory::Syscall,
         }
     }
@@ -92,6 +99,11 @@ impl TraceRecord {
             13 => TraceEvent::IrqEnter,
             14 => TraceEvent::IrqExit,
             15 => TraceEvent::ContextSwitch,
+            16 => TraceEvent::FaultEnter,
+            17 => TraceEvent::FaultHandled,
+            18 => TraceEvent::FaultBlock,
+            19 => TraceEvent::FaultResume,
+            20 => TraceEvent::FaultUnhandled,
             _ => TraceEvent::SysEnter,
         }
     }
@@ -120,6 +132,11 @@ static TRACE_TLB_FULL_FLUSH_PHASE4: AtomicU64 = AtomicU64::new(0);
 static TRACE_TLB_SYNC_PLAN_PHASE4: AtomicU64 = AtomicU64::new(0);
 static TRACE_TLB_SYNC_PLAN_PHASE5: AtomicU64 = AtomicU64::new(0);
 static TRACE_TLB_SHOOTDOWN_FULL_PHASE5: AtomicU64 = AtomicU64::new(0);
+static TRACE_FAULT_ENTER_PHASE6: AtomicU64 = AtomicU64::new(0);
+static TRACE_FAULT_HANDLED_PHASE6: AtomicU64 = AtomicU64::new(0);
+static TRACE_FAULT_BLOCK_PHASE6: AtomicU64 = AtomicU64::new(0);
+static TRACE_FAULT_RESUME_PHASE6: AtomicU64 = AtomicU64::new(0);
+static TRACE_FAULT_UNHANDLED_PHASE6: AtomicU64 = AtomicU64::new(0);
 static mut TRACE_RECORDS: [TraceRecord; TRACE_RECORD_CAPACITY] =
     [TraceRecord::ZERO; TRACE_RECORD_CAPACITY];
 
@@ -221,6 +238,26 @@ pub(crate) fn bootstrap_trace_tlb_shootdown_full_phase5() -> u64 {
     TRACE_TLB_SHOOTDOWN_FULL_PHASE5.load(Ordering::Acquire)
 }
 
+pub(crate) fn bootstrap_trace_fault_enter_phase6() -> u64 {
+    TRACE_FAULT_ENTER_PHASE6.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_fault_handled_phase6() -> u64 {
+    TRACE_FAULT_HANDLED_PHASE6.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_fault_block_phase6() -> u64 {
+    TRACE_FAULT_BLOCK_PHASE6.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_fault_resume_phase6() -> u64 {
+    TRACE_FAULT_RESUME_PHASE6.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_fault_unhandled_phase6() -> u64 {
+    TRACE_FAULT_UNHANDLED_PHASE6.load(Ordering::Acquire)
+}
+
 pub(crate) fn note_tlb_active_mask(active_cpu_mask: u64) {
     if !trace_enabled() {
         return;
@@ -255,6 +292,11 @@ pub(crate) fn init_bootstrap_trace() {
     TRACE_TLB_SYNC_PLAN_PHASE4.store(0, Ordering::Release);
     TRACE_TLB_SYNC_PLAN_PHASE5.store(0, Ordering::Release);
     TRACE_TLB_SHOOTDOWN_FULL_PHASE5.store(0, Ordering::Release);
+    TRACE_FAULT_ENTER_PHASE6.store(0, Ordering::Release);
+    TRACE_FAULT_HANDLED_PHASE6.store(0, Ordering::Release);
+    TRACE_FAULT_BLOCK_PHASE6.store(0, Ordering::Release);
+    TRACE_FAULT_RESUME_PHASE6.store(0, Ordering::Release);
+    TRACE_FAULT_UNHANDLED_PHASE6.store(0, Ordering::Release);
     // SAFETY: resetting the bootstrap trace ring happens before userspace starts
     // producing trace records for this run, so no concurrent writers can observe
     // partially cleared records. Each slot is written through a raw pointer to
@@ -481,6 +523,51 @@ pub(crate) fn record_sched_irq_exit(from_user: bool, trap_exit_taken: bool) {
     );
 }
 
+pub(crate) fn record_fault_enter(fault_va: u64, error: u64) {
+    record(
+        TraceCategory::Fault,
+        TraceEvent::FaultEnter,
+        fault_va,
+        error,
+    );
+}
+
+pub(crate) fn record_fault_handled(fault_va: u64, error: u64) {
+    record(
+        TraceCategory::Fault,
+        TraceEvent::FaultHandled,
+        fault_va,
+        error,
+    );
+}
+
+pub(crate) fn record_fault_block(fault_va: u64, flags: u64) {
+    record(
+        TraceCategory::Fault,
+        TraceEvent::FaultBlock,
+        fault_va,
+        flags,
+    );
+}
+
+pub(crate) fn record_fault_resume(fault_va: u64, error: u64) {
+    record(
+        TraceCategory::Fault,
+        TraceEvent::FaultResume,
+        fault_va,
+        error,
+    );
+}
+
+pub(crate) fn record_fault_unhandled(fault_va: u64, error: u64) {
+    record(
+        TraceCategory::Fault,
+        TraceEvent::FaultUnhandled,
+        fault_va,
+        error,
+    );
+}
+
 fn snapshot_records() -> Vec<TraceRecord> {
     let record_count = bootstrap_trace_record_count() as usize;
     let mut snapshot = Vec::with_capacity(record_count);
@@ -527,6 +614,7 @@ fn category_name(category: TraceCategory) -> &'static str {
         TraceCategory::Sched => "ax_sched",
         TraceCategory::Timer => "ax_timer",
         TraceCategory::Tlb => "ax_tlb",
+        TraceCategory::Fault => "ax_fault",
     }
 }
 
@@ -547,6 +635,11 @@ fn event_name(event: TraceEvent) -> &'static str {
         TraceEvent::IrqEnter => "irq_enter",
         TraceEvent::IrqExit => "irq_exit",
         TraceEvent::ContextSwitch => "context_switch",
+        TraceEvent::FaultEnter => "fault_enter",
+        TraceEvent::FaultHandled => "fault_handled",
+        TraceEvent::FaultBlock => "fault_block",
+        TraceEvent::FaultResume => "fault_resume",
+        TraceEvent::FaultUnhandled => "fault_unhandled",
     }
 }
 
@@ -611,6 +704,41 @@ pub(crate) fn flush_bootstrap_trace() {
         records
             .iter()
             .filter(|record| record.phase == 5 && record.event() == TraceEvent::TlbShootdownAll)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_FAULT_ENTER_PHASE6.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 6 && record.event() == TraceEvent::FaultEnter)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_FAULT_HANDLED_PHASE6.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 6 && record.event() == TraceEvent::FaultHandled)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_FAULT_BLOCK_PHASE6.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 6 && record.event() == TraceEvent::FaultBlock)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_FAULT_RESUME_PHASE6.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 6 && record.event() == TraceEvent::FaultResume)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_FAULT_UNHANDLED_PHASE6.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 6 && record.event() == TraceEvent::FaultUnhandled)
             .count() as u64,
         Ordering::Release,
     );

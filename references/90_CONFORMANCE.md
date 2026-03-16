@@ -82,9 +82,12 @@ Main just targets include:
     null-syscall phase
   - the same runner now also executes one narrow VMAR map/protect/unmap churn slice so TLB-local
     page-flush telemetry is exercised and parsed through the same key=value summary path
-  - one follow-on active-peer TLB slice now keeps the same address space live on both CPUs long
-    enough to drive strict sync-plan and remote full-shootdown telemetry through the same summary
-    path
+  - the same runner now also executes one trap-facing same-page fault slice and exports
+    `fault_enter / fault_block / fault_resume / fault_handled / fault_unhandled` counts through
+    the same summary path
+  - one follow-on TLB peer slice still checks that the phase runs and emits sync-plan telemetry,
+    but it no longer relies on a synthetic remote-first thread-start policy just to force a
+    two-CPU active-address-space shape
   - the scenario currently acts as a wiring and attribution gate, not as a stable performance
     regression threshold
 - Component-framework bootstrap coverage now also includes one eager-topology gate:
@@ -98,8 +101,8 @@ Main just targets include:
 - The Round-1 Starnix bootstrap scenario also runs under `-smp 2` and continues to guard the
   scheduler's first-run child-launch path against gross regressions:
   - the scenario explicitly forbids a kernel `#GP` during that launch path
-  - first-run child activation may now spill to an idle peer CPU in the narrower `creator busy +
-    peer idle` case without changing the generic guest bootstrap contract
+  - first-run child activation now stays on the normal preferred-CPU / wake-affine path; the
+    bootstrap gate no longer depends on a special remote-first launch exception
 - The first Round-2 Starnix fd scenario now extends that same bootstrap path with one narrow
   Linux-fd slice:
   - `read` / `write` / `close`

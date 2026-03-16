@@ -412,12 +412,34 @@ fn clone_global_vmo_store(vm_handle: &Arc<Mutex<VmDomain>>) -> Arc<Mutex<GlobalV
     vm.global_vmo_store()
 }
 
-fn wake_fault_waiters(kernel_handle: &Arc<Mutex<Kernel>>, waiters: Vec<ThreadId>) {
+fn fault_resume_trace_args(key: FaultInFlightKey, thread_id: ThreadId) -> (u64, u64) {
+    match key {
+        FaultInFlightKey::LocalPage {
+            address_space_id,
+            page_base,
+        } => (page_base, thread_id | (address_space_id << 32)),
+        FaultInFlightKey::SharedVmoPage {
+            global_vmo_id,
+            page_offset,
+        } => (
+            page_offset,
+            thread_id | (global_vmo_id.raw() << 32) | (1_u64 << 63),
+        ),
+    }
+}
+
+fn wake_fault_waiters(
+    kernel_handle: &Arc<Mutex<Kernel>>,
+    key: FaultInFlightKey,
+    waiters: Vec<ThreadId>,
+) {
     if waiters.is_empty() {
         return;
     }
     let mut kernel = kernel_handle.lock();
     for thread_id in waiters {
+        let (arg0, arg1) = fault_resume_trace_args(key, thread_id);
+        crate::trace::record_fault_resume(arg0, arg1);
         let _ = kernel.complete_waiter_source_removed(thread_id, WakeReason::PreserveContext);
     }
 }
@@ -661,7 +683,7 @@ pub(crate) fn handle_page_fault_serialized(
                         };
                         prepared.release_unused();
                         let waiters = guard.complete();
-                        wake_fault_waiters(&kernel_handle, waiters);
+                        wake_fault_waiters(&kernel_handle, key, waiters);
                         match outcome {
                             Ok((FaultCommitDisposition::Resolved, tlb_commit)) => {
                                 if crate::task::apply_tlb_commit_reqs(
@@ -702,7 +724,7 @@ pub(crate) fn handle_page_fault_serialized(
                         };
                         prepared.release_unused();
                         let waiters = guard.complete();
-                        wake_fault_waiters(&kernel_handle, waiters);
+                        wake_fault_waiters(&kernel_handle, key, waiters);
                         match outcome {
                             Ok((FaultCommitDisposition::Resolved, tlb_commit)) => {
                                 if crate::task::apply_tlb_commit_reqs(

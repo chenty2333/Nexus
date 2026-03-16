@@ -5360,28 +5360,6 @@ impl Kernel {
     }
 
     fn choose_start_cpu(&self, thread_id: ThreadId) -> usize {
-        let current_cpu_id = self.current_cpu_id();
-        let current_thread_present = self
-            .current_cpu_scheduler()
-            .ok()
-            .and_then(|scheduler| scheduler.current_thread_id)
-            .is_some();
-        let first_run = self
-            .threads
-            .get(&thread_id)
-            .is_some_and(|thread| thread.runtime_ns == 0 && thread.last_cpu == current_cpu_id);
-        if first_run && current_thread_present {
-            if let Some((&idle_cpu_id, _)) =
-                self.cpu_schedulers.iter().find(|(cpu_id, scheduler)| {
-                    **cpu_id != current_cpu_id
-                        && scheduler.online
-                        && scheduler.current_thread_id.is_none()
-                        && scheduler.run_queue.is_empty()
-                })
-            {
-                return idle_cpu_id;
-            }
-        }
         self.choose_wake_cpu(thread_id)
     }
 
@@ -5396,8 +5374,6 @@ impl Kernel {
             .map(|thread| thread.last_cpu)
             .unwrap_or(current_cpu_id);
         // Preserve first-run and wakeup affinity before considering arbitrary idle CPUs.
-        // Brand-new threads inherit the creator CPU as `last_cpu`; preferring that CPU avoids
-        // remote-first activation on an unrelated AP before the thread has ever executed.
         if self.cpu_is_online(preferred_cpu) && self.cpu_is_idle(preferred_cpu) {
             return preferred_cpu;
         }

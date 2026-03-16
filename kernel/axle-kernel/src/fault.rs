@@ -15,6 +15,36 @@ fn kernel_vm_handle(
     Ok(kernel.vm_handle())
 }
 
+fn fault_block_trace_flags(
+    key: crate::task::fault::FaultInFlightKey,
+    wake_thread: Option<u64>,
+) -> u64 {
+    let key_kind = match key {
+        crate::task::fault::FaultInFlightKey::LocalPage { .. } => 0_u64,
+        crate::task::fault::FaultInFlightKey::SharedVmoPage { .. } => 1_u64,
+    };
+    key_kind | (u64::from(u8::from(wake_thread.is_some())) << 8)
+}
+
+fn fault_resume_trace_args(
+    key: crate::task::fault::FaultInFlightKey,
+    thread_id: u64,
+) -> (u64, u64) {
+    match key {
+        crate::task::fault::FaultInFlightKey::LocalPage {
+            address_space_id,
+            page_base,
+        } => (page_base, thread_id | (address_space_id << 32)),
+        crate::task::fault::FaultInFlightKey::SharedVmoPage {
+            global_vmo_id,
+            page_offset,
+        } => (
+            page_offset,
+            thread_id | (global_vmo_id.raw() << 32) | (1_u64 << 63),
+        ),
+    }
+}
+
 /// Validate a user pointer against the current thread's address-space policy.
 pub fn validate_current_user_ptr(ptr: u64, len: usize) -> bool {
     let Ok(kernel) = crate::object::kernel_handle() else {
@@ -75,6 +105,7 @@ pub fn handle_page_fault(
     cr2: u64,
     error: u64,
 ) -> bool {
+    crate::trace::record_fault_enter(cr2, error);
     // SAFETY: x86_64 faults with an error code place that code at `cpu_frame[0]`,
     // followed by the user IRET frame {rip, cs, rflags, rsp, ss}. The generic
     // trap-exit/context helpers expect a pointer to the first IRET slot.
@@ -128,19 +159,24 @@ pub fn handle_page_fault(
             error,
         ) {
             crate::task::fault::PageFaultSerializedResult::Handled => {
+                crate::trace::record_fault_handled(cr2, error);
                 let cpu_id = crate::arch::apic::this_apic_id() as usize;
                 let _ = vm.sync_current_cpu_tlb_state(address_space_id, cpu_id);
                 Ok(crate::object::TrapBlock::Ready(true))
             }
             crate::task::fault::PageFaultSerializedResult::Unhandled => {
+                crate::trace::record_fault_unhandled(cr2, error);
                 Ok(crate::object::TrapBlock::Ready(false))
             }
             crate::task::fault::PageFaultSerializedResult::BlockCurrent { key, wake_thread } => {
+                crate::trace::record_fault_block(cr2, fault_block_trace_flags(key, wake_thread));
                 let (disposition, lifecycle_dirty) = {
                     let mut kernel = kernel.lock();
                     kernel.capture_current_user_context(trap, user_cpu_frame.cast_const())?;
                     kernel.park_current(crate::task::WaitRegistration::VmFault { key }, None)?;
                     if let Some(thread_id) = wake_thread {
+                        let (arg0, arg1) = fault_resume_trace_args(key, thread_id);
+                        crate::trace::record_fault_resume(arg0, arg1);
                         kernel.wake_thread(thread_id, crate::task::WakeReason::PreserveContext)?;
                     }
                     let disposition = kernel.finish_trap_exit(trap, user_cpu_frame, false)?;

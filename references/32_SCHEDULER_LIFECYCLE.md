@@ -29,14 +29,9 @@ This file describes the current task-state, scheduler, kill, suspend, and reap b
 - Wakeup targeting is now CPU-aware, but scheduling policy is still intentionally simple.
 - Wakeup targeting now honors a thread's preferred / last CPU before opportunistically handing work
   to some other idle CPU.
-- Brand-new threads still inherit the creator CPU as `last_cpu`, but first activation now has one
-  narrower exception:
-  - if the creator CPU is already occupied
-  - and one idle peer CPU exists
-  - then `start_thread()` / `start_thread_guest()` may enqueue that never-run thread on the idle
-    peer CPU instead of forcing first activation to stay local
-- Normal wakeups still preserve wake-affine / last-CPU behavior; the remote-first exception only
-  applies at brand-new thread start.
+- Brand-new threads still inherit the creator CPU as `last_cpu`.
+- `start_thread()` / `start_thread_guest()` currently follow the same preferred-CPU / wake-affine
+  rules as ordinary wakeups; there is no special remote-first launch exception.
 - Basic local time slicing and runtime accounting now exist, but there is still no finished fairness
   or load-balancing policy layer.
 
@@ -125,5 +120,8 @@ The first "non-bootstrap substrate" scheduler contract is now implemented.
 
 - Blocked current execution still relies on `sti; hlt` when the current CPU has no runnable work.
 - Cross-CPU load balancing and work stealing do not exist yet.
+- Bootstrap perf smoke therefore no longer depends on a synthetic "first run goes remote" launch
+  rule just to force an active-peer TLB phase; that shape would be a scheduler policy shortcut, not
+  a safe L0 contract.
 - Scheduler fairness is still simple fixed-slice FIFO/RR rather than a richer policy such as
   weighted fairness or vruntime tracking.
