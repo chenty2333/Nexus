@@ -26,6 +26,8 @@ This file describes the current x86_64-only startup path, trap entry, timer, and
 - IDT
 - native x86_64 `SYSCALL` entry
 - `int 0x80` syscall entry
+- PCID / local TLB policy helpers
+- minimal fixed-counter PMU enablement
 - page-fault / GP fault / double-fault stubs
 - local APIC support
 - timer interrupt entry
@@ -76,7 +78,14 @@ The kernel then:
 - The current fast path is intentionally narrow:
   - native entry exists
   - native `sysretq` is currently only the same-thread, non-blocked fast-return path
-  - PCID / INVPCID / entry-side PMU work are still pending
+  - local CR3/TLB maintenance now prefers one support-aware policy:
+    - plain CR3 reload fallback when PCID is unavailable
+    - per-context PCID switch with flush/no-flush distinction when PCID is available
+    - local `INVPCID single-context` when both PCID and INVPCID are available
+  - the current QEMU bootstrap target often reports `pcid=false`, `invpcid=false`, and `pmu=false`,
+    so the bootstrap gate currently proves wiring and support detection first, not final x86 gains
+  - ring3 bootstrap perf smoke can now also read the first three fixed PMU counters when the
+    kernel enables `CR4.PCE` and the CPU reports the architectural PMU shape
 
 ## SMP startup
 
@@ -134,6 +143,10 @@ stack preserves nested interrupt frames, while `#PF` / `#GP` still keep a dedica
 - Native syscall entry now exists, and the direct same-thread fast return can use `sysretq`, but
   the broader x86 fast path is still incomplete.
 - `EFER.SCE` is now enabled on CPUs that advertise native syscall support.
+- `CR4.PCIDE` is now enabled on CPUs that advertise PCID support and satisfy the required CR3
+  low-bit precondition; address-space roots can therefore carry one bounded PCID tag today.
+- Local full-context flush currently prefers `INVPCID single-context` when available; otherwise it
+  falls back to one PCID-local or legacy CR3 flush.
 - x86_64 supervised guest execution now intercepts native `SYSCALL` only for guest-started carrier
   threads that are still bound to one guest session, then converts that stop into the same generic
   guest-session sidecar + port handoff used by the wider Starnix executive.
@@ -149,3 +162,5 @@ stack preserves nested interrupt frames, while `#PF` / `#GP` still keep a dedica
   still not the final architecture.
 - The bootstrap trace stream now also marks timer and reschedule IRQ boundaries explicitly with
   `irq_enter` / `irq_exit`, and records scheduler context switches as separate events.
+- The bootstrap perf runner now also includes one same-image child-process roundtrip slice so
+  address-space switch policy can be observed through the same key=value summary path.

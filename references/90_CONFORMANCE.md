@@ -38,6 +38,9 @@ Main just targets include:
 - `just fuzz-smoke`
 - `just concurrency-smoke`
 - `just test-kernel`
+- `just perf-smoke-qemu`
+- `just perf-smoke-bundle`
+- `just perf-smoke-parse <serial-log>`
 - `just check-conformance-contracts`
 - `just test-all`
 
@@ -104,6 +107,15 @@ Main just targets include:
     - one fallback-copy read path into an ordinary userspace buffer
     - `ax_ipc` enqueue/dequeue/reclaim trace counts plus fragment-pool counters exported through
       the same summary line
+  - the same runner now also executes one same-image child-process roundtrip slice:
+    - one narrow address-space-switch benchmark built on `zx_process_create` +
+      `ax_process_prepare_start` + `zx_process_start`
+    - one derived `trace_tlb_phase8_ok` bit proving that phase saw address-space-switch telemetry
+  - the same summary now also exports support-aware x86 depth signals:
+    - `perf_pmu_supported`, `perf_pmu_version`, `perf_pmu_fixed_counters`
+    - PMU deltas for `null_syscall`, local TLB churn, and address-space switch when available
+    - `trace_tlb_as_switch_*` counts plus `trace_tlb_invpcid_single`
+    - `trace_tlb_pcid_enabled` / `trace_tlb_invpcid_enabled`
   - the same peer-worker reuse also keeps the active-address-space TLB and fault slices from
     depending on a second synthetic launch rule
   - the phase-3 wake-path gate is now frozen as a minimum-contract check rather than as one exact
@@ -114,6 +126,11 @@ Main just targets include:
       the raw phase-3 counters for diagnosis
   - the scenario currently acts as a wiring and attribution gate, not as a stable performance
     regression threshold
+  - the new `just perf-smoke-bundle` + `just perf-smoke-parse` flow is the current minimal
+    bare-metal baseline path:
+    - build one kernel + perf-smoke runner bundle
+    - capture one serial log from a real machine
+    - extract the same key=value perf summary into one JSON baseline
 - Component-framework bootstrap coverage now also includes one eager-topology gate:
   - a minimal `nexus-init` can resolve a root manifest and launch eager ELF children
   - one protocol route through `/svc` is exercised end-to-end

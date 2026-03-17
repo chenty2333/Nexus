@@ -174,3 +174,33 @@ pub fn rdtsc() -> u64 {
     // access memory.
     unsafe { core::arch::x86_64::_rdtsc() }
 }
+
+/// Read one architectural fixed-function PMU counter through `RDPMC`.
+///
+/// Counter indices:
+/// - `0` = instructions retired
+/// - `1` = core cycles
+/// - `2` = reference cycles
+///
+/// The kernel must have enabled ring3 PMU reads through `CR4.PCE` first.
+#[inline(always)]
+pub fn rdpmc_fixed(counter: u32) -> u64 {
+    let ecx = 1_u32.checked_shl(30).unwrap_or(0).wrapping_add(counter);
+    let eax: u32;
+    let edx: u32;
+
+    // SAFETY: this only issues the architected `rdpmc` instruction for one
+    // fixed counter index. The kernel explicitly enables ring3 PMU reads when
+    // it exposes this path to perf-smoke userspace.
+    unsafe {
+        core::arch::asm!(
+            "rdpmc",
+            in("ecx") ecx,
+            lateout("eax") eax,
+            lateout("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    (u64::from(edx) << 32) | u64::from(eax)
+}

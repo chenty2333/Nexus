@@ -2628,8 +2628,10 @@ impl AddressSpace {
             crate::userspace::USER_REGION_BYTES,
         )
         .expect("bootstrap address-space root must be valid");
-        let page_tables = crate::page_table::UserPageTables::bootstrap_current()
-            .expect("bootstrap user page tables must exist");
+        let page_tables = crate::page_table::UserPageTables::bootstrap_current(
+            crate::arch::tlb::pcid_for_address_space(address_space_id),
+        )
+        .expect("bootstrap user page tables must exist");
 
         let code_vmo = vm
             .create_vmo(
@@ -5914,14 +5916,22 @@ impl Kernel {
             .process_id;
         let next_address_space_id = self.process(next_process_id)?.address_space_id;
         let next_page_tables = self.with_vm(|vm| vm.root_page_table(next_address_space_id))?;
+        let local_tlb_flush_needed = self
+            .with_vm(|vm| vm.current_cpu_needs_tlb_sync(next_address_space_id, current_cpu_id))?;
         let context = self
             .threads
             .get_mut(&thread_id)
             .ok_or(ZX_ERR_BAD_STATE)?
             .context
             .ok_or(ZX_ERR_BAD_STATE)?;
-        next_page_tables.activate().map_err(map_page_table_error)?;
         let address_space_switched = current_address_space_id != Some(next_address_space_id);
+        let switch_kind = if address_space_switched || local_tlb_flush_needed {
+            next_page_tables
+                .activate(local_tlb_flush_needed)
+                .map_err(map_page_table_error)?
+        } else {
+            crate::arch::tlb::AddressSpaceSwitchKind::SameAddressSpaceSkip
+        };
         if let Some(current_address_space_id) = current_address_space_id {
             if current_address_space_id != next_address_space_id {
                 self.with_vm_mut(|vm| {
@@ -5929,10 +5939,17 @@ impl Kernel {
                 });
             }
         }
-        self.observe_cpu_tlb_epoch_for_address_space(next_address_space_id, current_cpu_id);
+        if address_space_switched || local_tlb_flush_needed {
+            self.observe_cpu_tlb_epoch_for_address_space(next_address_space_id, current_cpu_id);
+        }
         self.current_cpu_scheduler_mut().current_thread_id = Some(thread_id);
         self.arm_current_slice_from(self.current_cpu_now_ns());
         crate::trace::record_context_switch(previous_thread_id, thread_id, address_space_switched);
+        crate::trace::record_tlb_address_space_switch(
+            current_address_space_id.unwrap_or(0),
+            next_address_space_id,
+            switch_kind,
+        );
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         if let (Some(enqueued_ns), Some(source_cpu_id), Some(target_cpu_id)) = (
             thread.remote_wake_enqueued_ns,
@@ -6333,8 +6350,10 @@ impl VmDomain {
                 crate::userspace::USER_REGION_BYTES,
             )
             .map_err(map_address_space_error)?,
-            page_tables: crate::page_table::UserPageTables::clone_current_kernel_template()
-                .map_err(map_page_table_error)?,
+            page_tables: crate::page_table::UserPageTables::clone_current_kernel_template(
+                crate::arch::tlb::pcid_for_address_space(address_space_id),
+            )
+            .map_err(map_page_table_error)?,
             tlb_cpus: TlbCpuTracker::default(),
             strict_tlb_epoch: 0,
             vm_resources: VmResourceState::new(),
@@ -8617,6 +8636,18 @@ impl VmDomain {
         crate::arch::tlb::flush_all_local();
         address_space.observe_tlb_epoch(cpu_id, target_epoch);
         Ok(())
+    }
+
+    pub(crate) fn current_cpu_needs_tlb_sync(
+        &self,
+        address_space_id: AddressSpaceId,
+        cpu_id: usize,
+    ) -> Result<bool, zx_status_t> {
+        let address_space = self
+            .address_spaces
+            .get(&address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(address_space.observed_tlb_epoch(cpu_id) < address_space.current_invalidate_epoch())
     }
 
     fn observe_cpu_tlb_epoch_for_address_space(

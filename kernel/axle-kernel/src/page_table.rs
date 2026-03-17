@@ -7,7 +7,7 @@ use axle_page_table::{
 };
 use spin::Mutex;
 use x86_64::PhysAddr;
-use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{PageTable as X86PageTable, PageTableFlags, PhysFrame, Size4KiB};
 
@@ -311,6 +311,7 @@ pub(crate) struct UserPageTables {
     pdpt_paddr: u64,
     user_pd_paddr: u64,
     user_pt_paddrs: [u64; crate::userspace::BOOTSTRAP_USER_PT_COUNT],
+    pcid: Option<u16>,
     descs: Arc<Mutex<PtDescriptorStore>>,
 }
 
@@ -389,7 +390,7 @@ impl UserPageTables {
     }
 
     /// Bind the bootstrap address space to the already-active PVH root and static user tables.
-    pub(crate) fn bootstrap_current() -> Result<Self, PageTableError> {
+    pub(crate) fn bootstrap_current(pcid: Option<u16>) -> Result<Self, PageTableError> {
         let (root_frame, _) = Cr3::read();
         let root_paddr = root_frame.start_address().as_u64();
         let pdpt_paddr = table(root_paddr)[0].addr().as_u64();
@@ -400,13 +401,14 @@ impl UserPageTables {
             pdpt_paddr,
             user_pd_paddr,
             user_pt_paddrs,
+            pcid,
             descs: Self::new_descriptors(root_paddr, pdpt_paddr, user_pd_paddr, &user_pt_paddrs),
         })
     }
 
     /// Create one fresh address-space root by cloning current kernel mappings and
     /// installing one bootstrap user PD/PT anchor under the wider logical user window.
-    pub(crate) fn clone_current_kernel_template() -> Result<Self, PageTableError> {
+    pub(crate) fn clone_current_kernel_template(pcid: Option<u16>) -> Result<Self, PageTableError> {
         let (current_root_frame, _) = Cr3::read();
         let current_root_paddr = current_root_frame.start_address().as_u64();
         let current_root = table(current_root_paddr);
@@ -456,6 +458,7 @@ impl UserPageTables {
             pdpt_paddr,
             user_pd_paddr,
             user_pt_paddrs,
+            pcid,
             descs: Self::new_descriptors(root_paddr, pdpt_paddr, user_pd_paddr, &user_pt_paddrs),
         })
     }
@@ -538,14 +541,16 @@ impl UserPageTables {
         true
     }
 
-    pub(crate) fn activate(self) -> Result<(), PageTableError> {
-        let frame = frame(self.root_paddr)?;
-        unsafe {
-            // SAFETY: the root frame was either the currently loaded CR3 or one freshly
-            // allocated/copy-initialized x86_64 page-table root with preserved kernel mappings.
-            Cr3::write(frame, Cr3Flags::empty());
-        }
-        Ok(())
+    pub(crate) fn activate(
+        self,
+        flush_context: bool,
+    ) -> Result<crate::arch::tlb::AddressSpaceSwitchKind, PageTableError> {
+        let _ = frame(self.root_paddr)?;
+        Ok(crate::arch::tlb::activate_root(
+            self.root_paddr,
+            self.pcid,
+            flush_context,
+        ))
     }
 
     fn is_active(self) -> bool {

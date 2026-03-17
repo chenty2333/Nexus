@@ -13,6 +13,10 @@ bitflags! {
         const TSC = 1 << 2;
         const X2APIC = 1 << 3;
         const SYSCALL = 1 << 4;
+        const PCID = 1 << 5;
+        const INVPCID = 1 << 6;
+        const PMU = 1 << 7;
+        const TSC_DEADLINE = 1 << 8;
     }
 }
 
@@ -32,6 +36,12 @@ fn detect_caps<R: CpuIdReader>(cpuid: &CpuId<R>) -> CpuCaps {
         if fi.has_x2apic() {
             caps |= CpuCaps::X2APIC;
         }
+        if fi.has_pcid() {
+            caps |= CpuCaps::PCID;
+        }
+        if fi.has_tsc_deadline() {
+            caps |= CpuCaps::TSC_DEADLINE;
+        }
     }
 
     if cpuid
@@ -41,11 +51,58 @@ fn detect_caps<R: CpuIdReader>(cpuid: &CpuId<R>) -> CpuCaps {
         caps |= CpuCaps::SYSCALL;
     }
 
+    if cpuid
+        .get_extended_feature_info()
+        .is_some_and(|features| features.has_invpcid())
+    {
+        caps |= CpuCaps::INVPCID;
+    }
+
+    if cpuid.get_performance_monitoring_info().is_some_and(|info| {
+        info.version_id() >= 2
+            && info.fixed_function_counters() >= 3
+            && !info.is_core_cyc_ev_unavailable()
+            && !info.is_inst_ret_ev_unavailable()
+            && !info.is_ref_cycle_ev_unavailable()
+    }) {
+        caps |= CpuCaps::PMU;
+    }
+
     caps
 }
 
 pub fn supports_native_syscall() -> bool {
     detect_caps(&CpuId::new()).contains(CpuCaps::SYSCALL)
+}
+
+pub fn supports_pcid() -> bool {
+    detect_caps(&CpuId::new()).contains(CpuCaps::PCID)
+}
+
+pub fn supports_invpcid() -> bool {
+    detect_caps(&CpuId::new()).contains(CpuCaps::INVPCID)
+}
+
+pub fn supports_pmu() -> bool {
+    detect_caps(&CpuId::new()).contains(CpuCaps::PMU)
+}
+
+pub fn supports_tsc_deadline() -> bool {
+    detect_caps(&CpuId::new()).contains(CpuCaps::TSC_DEADLINE)
+}
+
+pub fn pmu_version() -> u8 {
+    CpuId::new()
+        .get_performance_monitoring_info()
+        .map(|info| info.version_id())
+        .unwrap_or(0)
+}
+
+pub fn pmu_fixed_counter_count() -> u8 {
+    CpuId::new()
+        .get_performance_monitoring_info()
+        .map(|info| info.fixed_function_counters())
+        .unwrap_or(0)
 }
 
 pub fn log_boot_cpu_info() {
@@ -61,12 +118,16 @@ pub fn log_boot_cpu_info() {
     let caps = detect_caps(&cpuid);
 
     crate::kprintln!(
-        "cpu: vendor={} caps=[sse2={},apic={},tsc={},x2apic={},syscall={}]",
+        "cpu: vendor={} caps=[sse2={},apic={},tsc={},x2apic={},syscall={},pcid={},invpcid={},tsc_deadline={},pmu={}]",
         vendor,
         caps.contains(CpuCaps::SSE2),
         caps.contains(CpuCaps::APIC),
         caps.contains(CpuCaps::TSC),
         caps.contains(CpuCaps::X2APIC),
         caps.contains(CpuCaps::SYSCALL),
+        caps.contains(CpuCaps::PCID),
+        caps.contains(CpuCaps::INVPCID),
+        caps.contains(CpuCaps::TSC_DEADLINE),
+        caps.contains(CpuCaps::PMU),
     );
 }

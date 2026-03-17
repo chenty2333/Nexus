@@ -14,6 +14,15 @@ xtest:
 test-kernel:
   cargo run -p axle-conformance -- run --retries 1
 
+perf-smoke-qemu:
+  cargo run -p axle-conformance -- run --scenario kernel.runtime.bootstrap_perf_smoke
+
+perf-smoke-bundle:
+  bash -lc 'set -euo pipefail; target_dir=target/perf-smoke-bundle; mkdir -p "$target_dir"; cargo build -p axle-kernel --target x86_64-unknown-none --target-dir "$target_dir"; AXLE_TEST_RUNNER_RUST_ENTRY=perf_smoke RUSTFLAGS="-C code-model=large" cargo build -p nexus-test-runner --target x86_64-unknown-none --target-dir "$target_dir"; cp "$target_dir/x86_64-unknown-none/debug/axle-kernel" "$target_dir/axle-kernel"; cp "$target_dir/x86_64-unknown-none/debug/nexus-test-runner" "$target_dir/nexus-test-runner"; printf "bundle_dir=%s\nkernel=%s\nrunner=%s\n" "$target_dir" "$target_dir/axle-kernel" "$target_dir/nexus-test-runner"'
+
+perf-smoke-parse logfile:
+  python tools/axle-conformance/scripts/extract_perf_smoke.py {{logfile}}
+
 # Ensure contract catalog and scenario bindings remain complete.
 check-conformance-contracts:
   cargo run -p axle-conformance -- check-contracts

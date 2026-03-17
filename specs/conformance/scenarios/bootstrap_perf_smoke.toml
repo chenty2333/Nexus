@@ -27,6 +27,7 @@ perf_tlb_status = 0
 perf_tlb_peer_status = 0
 perf_fault_status = 0
 perf_channel_fragment_status = 0
+perf_as_switch_status = 0
 
 [assertions.packet_fields]
 perf_failure_step = 0
@@ -37,7 +38,9 @@ perf_tlb_iters = 8
 perf_tlb_peer_iters = 8
 perf_fault_iters = 1
 perf_channel_fragment_iters = 8
+perf_as_switch_iters = 32
 trace_sched_phase3_ok = 1
+trace_tlb_phase8_ok = 1
 trace_sys_enter_phase1 = 64
 trace_sys_exit_phase1 = 64
 trace_sys_retire_phase1 = 64

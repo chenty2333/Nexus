@@ -11,8 +11,9 @@ use libzircon::status::{ZX_ERR_BAD_SYSCALL, ZX_OK};
 use libzircon::syscall_numbers::{AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP};
 use libzircon::vm::{ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
-    zx_channel_create, zx_channel_read, zx_channel_write, zx_eventpair_create, zx_handle_close,
-    zx_handle_t, zx_object_signal, zx_object_signal_peer, zx_object_wait_one, zx_signals_t,
+    ZX_TIME_INFINITE, ax_process_prepare_start, zx_channel_create, zx_channel_read,
+    zx_channel_write, zx_eventpair_create, zx_handle_close, zx_handle_t, zx_object_signal,
+    zx_object_signal_peer, zx_object_wait_one, zx_process_create, zx_process_start, zx_signals_t,
     zx_status_t, zx_task_kill, zx_thread_create, zx_thread_start, zx_vmo_create, zx_vmo_write,
 };
 
@@ -21,6 +22,7 @@ const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
 const SLOT_OK: usize = 0;
 const SLOT_ROOT_VMAR_H: usize = 62;
 const SLOT_SELF_PROCESS_H: usize = 396;
+const SLOT_SELF_CODE_VMO_H: usize = 506;
 const SLOT_T0_NS: usize = 511;
 const SLOT_TRACE_PHASE: usize = 610;
 const SLOT_PERF_FAILURE_STEP: usize = 611;
@@ -49,6 +51,18 @@ const SLOT_PERF_FAULT_CYCLES: usize = 664;
 const SLOT_PERF_CHANNEL_FRAGMENT_STATUS: usize = 679;
 const SLOT_PERF_CHANNEL_FRAGMENT_ITERS: usize = 680;
 const SLOT_PERF_CHANNEL_FRAGMENT_CYCLES: usize = 681;
+const SLOT_PERF_AS_SWITCH_STATUS: usize = 761;
+const SLOT_PERF_AS_SWITCH_ITERS: usize = 762;
+const SLOT_PERF_AS_SWITCH_CYCLES: usize = 763;
+const SLOT_PERF_PMU_SUPPORTED: usize = 764;
+const SLOT_PERF_NULL_PMU_INSTR: usize = 765;
+const SLOT_PERF_NULL_PMU_REF_CYCLES: usize = 766;
+const SLOT_PERF_TLB_PMU_INSTR: usize = 767;
+const SLOT_PERF_TLB_PMU_REF_CYCLES: usize = 768;
+const SLOT_PERF_AS_SWITCH_PMU_INSTR: usize = 769;
+const SLOT_PERF_AS_SWITCH_PMU_REF_CYCLES: usize = 770;
+const SLOT_PERF_PMU_VERSION: usize = 779;
+const SLOT_PERF_PMU_FIXED_COUNTERS: usize = 780;
 
 const STEP_NULL_SYSCALL: u64 = 1;
 const STEP_WAIT_PING_PONG: u64 = 2;
@@ -57,6 +71,7 @@ const STEP_TLB_CHURN: u64 = 4;
 const STEP_TLB_ACTIVE_PEER: u64 = 5;
 const STEP_FAULT_TIMELINE: u64 = 6;
 const STEP_CHANNEL_FRAGMENT: u64 = 7;
+const STEP_ADDRESS_SPACE_SWITCH: u64 = 8;
 const STEP_PANIC: u64 = u64::MAX;
 
 const PHASE_NULL_SYSCALL: u64 = 1;
@@ -66,6 +81,7 @@ const PHASE_TLB_CHURN: u64 = 4;
 const PHASE_TLB_ACTIVE_PEER: u64 = 5;
 const PHASE_FAULT_TIMELINE: u64 = 6;
 const PHASE_CHANNEL_FRAGMENT: u64 = 7;
+const PHASE_ADDRESS_SPACE_SWITCH: u64 = 8;
 
 const NULL_SYSCALL_ITERS: u64 = 64;
 const WAIT_PING_PONG_ITERS: u64 = 32;
@@ -74,6 +90,7 @@ const TLB_ITERS: u64 = 8;
 const TLB_ACTIVE_PEER_ITERS: u64 = 8;
 const FAULT_TIMELINE_ITERS: u64 = 1;
 const CHANNEL_FRAGMENT_ITERS: u64 = 8;
+const ADDRESS_SPACE_SWITCH_ITERS: u64 = 32;
 const TLB_CHURN_BYTES: u64 = 4096;
 const CHANNEL_FRAGMENT_MAPPING_BYTES: u64 = 3 * 4096;
 const CHANNEL_FRAGMENT_BYTES: usize = 2 * 4096;
@@ -170,6 +187,8 @@ struct PerfSummary {
     null_status: i64,
     null_iters: u64,
     null_cycles: u64,
+    null_pmu_instr: u64,
+    null_pmu_ref_cycles: u64,
     wait_status: i64,
     wait_iters: u64,
     wait_cycles: u64,
@@ -179,6 +198,8 @@ struct PerfSummary {
     tlb_status: i64,
     tlb_iters: u64,
     tlb_cycles: u64,
+    tlb_pmu_instr: u64,
+    tlb_pmu_ref_cycles: u64,
     tlb_peer_status: i64,
     tlb_peer_iters: u64,
     tlb_peer_cycles: u64,
@@ -188,6 +209,14 @@ struct PerfSummary {
     channel_fragment_status: i64,
     channel_fragment_iters: u64,
     channel_fragment_cycles: u64,
+    as_switch_status: i64,
+    as_switch_iters: u64,
+    as_switch_cycles: u64,
+    as_switch_pmu_instr: u64,
+    as_switch_pmu_ref_cycles: u64,
+    pmu_supported: u64,
+    pmu_version: u64,
+    pmu_fixed_counters: u64,
     thread_create: i64,
     thread_start: i64,
     eventpair_create: i64,
@@ -197,6 +226,8 @@ struct PerfSummary {
 struct RoundtripResult {
     status: i64,
     cycles: u64,
+    pmu_instr: u64,
+    pmu_ref_cycles: u64,
     thread_create: i64,
     thread_start: i64,
     eventpair_create: i64,
@@ -215,13 +246,70 @@ struct CrossCoreRoundtrip {
     worker: CrossCoreWorker,
 }
 
+#[derive(Clone, Copy, Default)]
+struct CrossProcessWorker {
+    process: zx_handle_t,
+    root_vmar: zx_handle_t,
+    thread: zx_handle_t,
+    main_ep: zx_handle_t,
+    worker_ep: zx_handle_t,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PmuCaps {
+    supported: bool,
+    version: u64,
+    fixed_counters: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PmuSnapshot {
+    instructions: u64,
+    ref_cycles: u64,
+}
+
+fn pmu_caps() -> PmuCaps {
+    // SAFETY: CPUID is side-effect free on x86_64 and leaf `0xA` is
+    // architecturally defined when the reported max basic leaf covers it.
+    let max_leaf = unsafe { __cpuid(0).eax };
+    if max_leaf < 0xA {
+        return PmuCaps::default();
+    }
+    // SAFETY: guarded by the max-leaf check above.
+    let leaf = unsafe { __cpuid(0xA) };
+    let version = u64::from(leaf.eax & 0xff);
+    let fixed_counters = u64::from(leaf.edx & 0x1f);
+    let supported = version >= 2 && fixed_counters >= 3;
+    PmuCaps {
+        supported,
+        version,
+        fixed_counters,
+    }
+}
+
+fn pmu_snapshot(pmu: PmuCaps) -> PmuSnapshot {
+    if !pmu.supported {
+        return PmuSnapshot::default();
+    }
+    PmuSnapshot {
+        instructions: axle_arch_x86_64::rdpmc_fixed(0),
+        ref_cycles: axle_arch_x86_64::rdpmc_fixed(2),
+    }
+}
+
 fn run_perf_smoke() -> PerfSummary {
     let mut summary = PerfSummary::default();
     let self_process = read_slot(SLOT_SELF_PROCESS_H) as zx_handle_t;
+    let self_code_vmo = read_slot(SLOT_SELF_CODE_VMO_H) as zx_handle_t;
     let root_vmar = read_slot(SLOT_ROOT_VMAR_H) as zx_handle_t;
+    let pmu = pmu_caps();
+    summary.pmu_supported = u64::from(pmu.supported);
+    summary.pmu_version = pmu.version;
+    summary.pmu_fixed_counters = pmu.fixed_counters;
 
     summary.null_iters = NULL_SYSCALL_ITERS;
     write_slot(SLOT_TRACE_PHASE, PHASE_NULL_SYSCALL);
+    let null_pmu_start = pmu_snapshot(pmu);
     let null_start = axle_arch_x86_64::rdtsc();
     for _ in 0..NULL_SYSCALL_ITERS {
         let status = axle_arch_x86_64::native_syscall(u64::MAX, [0; 6]);
@@ -233,6 +321,13 @@ fn run_perf_smoke() -> PerfSummary {
         }
     }
     summary.null_cycles = axle_arch_x86_64::rdtsc().wrapping_sub(null_start);
+    let null_pmu_end = pmu_snapshot(pmu);
+    summary.null_pmu_instr = null_pmu_end
+        .instructions
+        .wrapping_sub(null_pmu_start.instructions);
+    summary.null_pmu_ref_cycles = null_pmu_end
+        .ref_cycles
+        .wrapping_sub(null_pmu_start.ref_cycles);
     summary.null_status = ZX_OK as i64;
     write_slot(SLOT_TRACE_PHASE, 0);
 
@@ -267,10 +362,12 @@ fn run_perf_smoke() -> PerfSummary {
         return summary;
     }
 
-    let tlb = run_tlb_churn(root_vmar, TLB_ITERS);
+    let tlb = run_tlb_churn(root_vmar, TLB_ITERS, pmu);
     summary.tlb_status = tlb.status;
     summary.tlb_iters = TLB_ITERS;
     summary.tlb_cycles = tlb.cycles;
+    summary.tlb_pmu_instr = tlb.pmu_instr;
+    summary.tlb_pmu_ref_cycles = tlb.pmu_ref_cycles;
     if tlb.status != ZX_OK as i64 {
         close_cross_core_worker(wake_worker);
         summary.failure_step = STEP_TLB_CHURN;
@@ -308,6 +405,19 @@ fn run_perf_smoke() -> PerfSummary {
     summary.channel_fragment_cycles = channel_fragment.cycles;
     if channel_fragment.status != ZX_OK as i64 {
         summary.failure_step = STEP_CHANNEL_FRAGMENT;
+        write_slot(SLOT_TRACE_PHASE, 0);
+        return summary;
+    }
+
+    let as_switch =
+        run_address_space_switch(self_process, self_code_vmo, ADDRESS_SPACE_SWITCH_ITERS, pmu);
+    summary.as_switch_status = as_switch.status;
+    summary.as_switch_iters = ADDRESS_SPACE_SWITCH_ITERS;
+    summary.as_switch_cycles = as_switch.cycles;
+    summary.as_switch_pmu_instr = as_switch.pmu_instr;
+    summary.as_switch_pmu_ref_cycles = as_switch.pmu_ref_cycles;
+    if as_switch.status != ZX_OK as i64 {
+        summary.failure_step = STEP_ADDRESS_SPACE_SWITCH;
         write_slot(SLOT_TRACE_PHASE, 0);
         return summary;
     }
@@ -520,7 +630,7 @@ fn park_forever(handle: zx_handle_t) -> ! {
     }
 }
 
-fn run_tlb_churn(root_vmar: zx_handle_t, iterations: u64) -> RoundtripResult {
+fn run_tlb_churn(root_vmar: zx_handle_t, iterations: u64, pmu: PmuCaps) -> RoundtripResult {
     let mut result = RoundtripResult::default();
     let mut vmo: zx_handle_t = 0;
     result.status = zx_vmo_create(TLB_CHURN_BYTES, 0, &mut vmo) as i64;
@@ -536,6 +646,7 @@ fn run_tlb_churn(root_vmar: zx_handle_t, iterations: u64) -> RoundtripResult {
     }
 
     write_slot(SLOT_TRACE_PHASE, PHASE_TLB_CHURN);
+    let tlb_pmu_start = pmu_snapshot(pmu);
     let start = axle_arch_x86_64::rdtsc();
     for _ in 0..iterations {
         let mut mapped_addr = 0_u64;
@@ -577,6 +688,13 @@ fn run_tlb_churn(root_vmar: zx_handle_t, iterations: u64) -> RoundtripResult {
         }
     }
     result.cycles = axle_arch_x86_64::rdtsc().wrapping_sub(start);
+    let tlb_pmu_end = pmu_snapshot(pmu);
+    result.pmu_instr = tlb_pmu_end
+        .instructions
+        .wrapping_sub(tlb_pmu_start.instructions);
+    result.pmu_ref_cycles = tlb_pmu_end
+        .ref_cycles
+        .wrapping_sub(tlb_pmu_start.ref_cycles);
     result.status = ZX_OK as i64;
     write_slot(SLOT_TRACE_PHASE, 0);
     let _ = zx_handle_close(vmo);
@@ -855,6 +973,170 @@ fn close_channel_pair(tx: zx_handle_t, rx: zx_handle_t) {
     }
 }
 
+fn run_address_space_switch(
+    self_process: zx_handle_t,
+    self_code_vmo: zx_handle_t,
+    iterations: u64,
+    pmu: PmuCaps,
+) -> RoundtripResult {
+    let mut result = RoundtripResult::default();
+    let mut worker = CrossProcessWorker::default();
+
+    result.eventpair_create =
+        zx_eventpair_create(0, &mut worker.main_ep, &mut worker.worker_ep) as i64;
+    if result.eventpair_create != ZX_OK as i64 {
+        result.status = result.eventpair_create;
+        return result;
+    }
+
+    result.thread_create =
+        zx_process_create(self_process, 0, &mut worker.process, &mut worker.root_vmar) as i64;
+    if result.thread_create != ZX_OK as i64 {
+        result.status = result.thread_create;
+        close_cross_process_worker(worker);
+        return result;
+    }
+
+    result.thread_start = zx_thread_create(worker.process, 0, &mut worker.thread) as i64;
+    if result.thread_start != ZX_OK as i64 {
+        result.status = result.thread_start;
+        close_cross_process_worker(worker);
+        return result;
+    }
+
+    let mut ignored_entry = 0_u64;
+    let mut stack = 0_u64;
+    let prepare_status = ax_process_prepare_start(
+        worker.process,
+        self_code_vmo,
+        0,
+        &mut ignored_entry,
+        &mut stack,
+    );
+    if prepare_status != ZX_OK {
+        result.status = prepare_status as i64;
+        close_cross_process_worker(worker);
+        return result;
+    }
+
+    let child_stack = match stack.checked_sub(8) {
+        Some(value) => value,
+        None => {
+            result.status = -40;
+            close_cross_process_worker(worker);
+            return result;
+        }
+    };
+
+    let start_status = zx_process_start(
+        worker.process,
+        worker.thread,
+        cross_process_roundtrip_worker_entry as *const () as usize as u64,
+        child_stack,
+        worker.worker_ep,
+        iterations,
+    );
+    if start_status != ZX_OK {
+        result.status = start_status as i64;
+        close_cross_process_worker(worker);
+        return result;
+    }
+
+    let mut observed: zx_signals_t = 0;
+    let ready = zx_object_wait_one(
+        worker.main_ep,
+        ZX_USER_SIGNAL_0,
+        wait_deadline(),
+        &mut observed,
+    );
+    if ready != ZX_OK {
+        result.status = ready as i64;
+        close_cross_process_worker(worker);
+        return result;
+    }
+    let _ = zx_object_signal(worker.main_ep, ZX_USER_SIGNAL_0, 0);
+
+    write_slot(SLOT_TRACE_PHASE, PHASE_ADDRESS_SPACE_SWITCH);
+    let as_pmu_start = pmu_snapshot(pmu);
+    let start = axle_arch_x86_64::rdtsc();
+    for _ in 0..iterations {
+        if zx_object_signal_peer(worker.main_ep, 0, ZX_USER_SIGNAL_0) != ZX_OK {
+            result.status = -41;
+            write_slot(SLOT_TRACE_PHASE, 0);
+            close_cross_process_worker(worker);
+            return result;
+        }
+        let status = zx_object_wait_one(
+            worker.main_ep,
+            ZX_USER_SIGNAL_0,
+            wait_deadline(),
+            &mut observed,
+        );
+        if status != ZX_OK {
+            result.status = status as i64;
+            write_slot(SLOT_TRACE_PHASE, 0);
+            close_cross_process_worker(worker);
+            return result;
+        }
+        let _ = zx_object_signal(worker.main_ep, ZX_USER_SIGNAL_0, 0);
+    }
+    result.cycles = axle_arch_x86_64::rdtsc().wrapping_sub(start);
+    let as_pmu_end = pmu_snapshot(pmu);
+    result.pmu_instr = as_pmu_end
+        .instructions
+        .wrapping_sub(as_pmu_start.instructions);
+    result.pmu_ref_cycles = as_pmu_end.ref_cycles.wrapping_sub(as_pmu_start.ref_cycles);
+    result.status = ZX_OK as i64;
+    write_slot(SLOT_TRACE_PHASE, 0);
+    close_cross_process_worker(worker);
+    result
+}
+
+extern "C" fn cross_process_roundtrip_worker_entry(worker_ep: u64, _iterations: u64) -> ! {
+    let worker_ep = worker_ep as zx_handle_t;
+    let _ = zx_object_signal_peer(worker_ep, 0, ZX_USER_SIGNAL_0);
+    loop {
+        let mut observed: zx_signals_t = 0;
+        let status =
+            zx_object_wait_one(worker_ep, ZX_USER_SIGNAL_0, ZX_TIME_INFINITE, &mut observed);
+        if status != ZX_OK {
+            park_forever(worker_ep);
+        }
+        let _ = zx_object_signal(worker_ep, ZX_USER_SIGNAL_0, 0);
+        let _ = zx_object_signal_peer(worker_ep, 0, ZX_USER_SIGNAL_0);
+    }
+}
+
+fn close_cross_process_worker(worker: CrossProcessWorker) {
+    if worker.process != 0 {
+        let _ = zx_task_kill(worker.process);
+    }
+    if worker.thread != 0 {
+        let mut terminated_observed: zx_signals_t = 0;
+        let _ = zx_object_wait_one(
+            worker.thread,
+            ZX_TASK_TERMINATED,
+            wait_deadline(),
+            &mut terminated_observed,
+        );
+    }
+    if worker.worker_ep != 0 {
+        let _ = zx_handle_close(worker.worker_ep);
+    }
+    if worker.main_ep != 0 {
+        let _ = zx_handle_close(worker.main_ep);
+    }
+    if worker.thread != 0 {
+        let _ = zx_handle_close(worker.thread);
+    }
+    if worker.root_vmar != 0 {
+        let _ = zx_handle_close(worker.root_vmar);
+    }
+    if worker.process != 0 {
+        let _ = zx_handle_close(worker.process);
+    }
+}
+
 fn current_cpu_apic_id() -> u64 {
     // SAFETY: CPUID leaf 1 is always available on the x86_64 bootstrap target used by this
     // perf runner, and reading the APIC id is side-effect free.
@@ -962,6 +1244,21 @@ fn write_summary(summary: &PerfSummary) {
     write_slot(
         SLOT_PERF_CHANNEL_FRAGMENT_CYCLES,
         summary.channel_fragment_cycles,
+    );
+    write_slot(SLOT_PERF_AS_SWITCH_STATUS, summary.as_switch_status as u64);
+    write_slot(SLOT_PERF_AS_SWITCH_ITERS, summary.as_switch_iters);
+    write_slot(SLOT_PERF_AS_SWITCH_CYCLES, summary.as_switch_cycles);
+    write_slot(SLOT_PERF_PMU_SUPPORTED, summary.pmu_supported);
+    write_slot(SLOT_PERF_PMU_VERSION, summary.pmu_version);
+    write_slot(SLOT_PERF_PMU_FIXED_COUNTERS, summary.pmu_fixed_counters);
+    write_slot(SLOT_PERF_NULL_PMU_INSTR, summary.null_pmu_instr);
+    write_slot(SLOT_PERF_NULL_PMU_REF_CYCLES, summary.null_pmu_ref_cycles);
+    write_slot(SLOT_PERF_TLB_PMU_INSTR, summary.tlb_pmu_instr);
+    write_slot(SLOT_PERF_TLB_PMU_REF_CYCLES, summary.tlb_pmu_ref_cycles);
+    write_slot(SLOT_PERF_AS_SWITCH_PMU_INSTR, summary.as_switch_pmu_instr);
+    write_slot(
+        SLOT_PERF_AS_SWITCH_PMU_REF_CYCLES,
+        summary.as_switch_pmu_ref_cycles,
     );
     write_slot(SLOT_PERF_THREAD_CREATE, summary.thread_create as u64);
     write_slot(SLOT_PERF_THREAD_START, summary.thread_start as u64);

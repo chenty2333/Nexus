@@ -55,6 +55,8 @@ pub(crate) enum TraceEvent {
     ChannelReclaim = 27,
     SysNativeEnter = 28,
     SysNativeSysret = 29,
+    TlbAddressSpaceSwitch = 30,
+    TlbInvpcidSingle = 31,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -124,6 +126,8 @@ impl TraceRecord {
             27 => TraceEvent::ChannelReclaim,
             28 => TraceEvent::SysNativeEnter,
             29 => TraceEvent::SysNativeSysret,
+            30 => TraceEvent::TlbAddressSpaceSwitch,
+            31 => TraceEvent::TlbInvpcidSingle,
             _ => TraceEvent::SysEnter,
         }
     }
@@ -159,6 +163,12 @@ static TRACE_TLB_FULL_FLUSH_PHASE4: AtomicU64 = AtomicU64::new(0);
 static TRACE_TLB_SYNC_PLAN_PHASE4: AtomicU64 = AtomicU64::new(0);
 static TRACE_TLB_SYNC_PLAN_PHASE5: AtomicU64 = AtomicU64::new(0);
 static TRACE_TLB_SHOOTDOWN_FULL_PHASE5: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_AS_SWITCH_LEGACY_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_AS_SWITCH_PCID_FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_AS_SWITCH_PCID_NOFLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_AS_SWITCH_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_AS_SWITCH_PHASE8: AtomicU64 = AtomicU64::new(0);
+static TRACE_TLB_INVPCID_SINGLE_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_FAULT_ENTER_PHASE6: AtomicU64 = AtomicU64::new(0);
 static TRACE_FAULT_HANDLED_PHASE6: AtomicU64 = AtomicU64::new(0);
 static TRACE_FAULT_BLOCK_PHASE6: AtomicU64 = AtomicU64::new(0);
@@ -298,6 +308,30 @@ pub(crate) fn bootstrap_trace_tlb_sync_plan_phase5() -> u64 {
 
 pub(crate) fn bootstrap_trace_tlb_shootdown_full_phase5() -> u64 {
     TRACE_TLB_SHOOTDOWN_FULL_PHASE5.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_as_switch_legacy_count() -> u64 {
+    TRACE_TLB_AS_SWITCH_LEGACY_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_as_switch_pcid_flush_count() -> u64 {
+    TRACE_TLB_AS_SWITCH_PCID_FLUSH_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_as_switch_pcid_noflush_count() -> u64 {
+    TRACE_TLB_AS_SWITCH_PCID_NOFLUSH_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_as_switch_skip_count() -> u64 {
+    TRACE_TLB_AS_SWITCH_SKIP_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_as_switch_phase8() -> u64 {
+    TRACE_TLB_AS_SWITCH_PHASE8.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_tlb_invpcid_single_count() -> u64 {
+    TRACE_TLB_INVPCID_SINGLE_COUNT.load(Ordering::Acquire)
 }
 
 pub(crate) fn bootstrap_trace_fault_enter_phase6() -> u64 {
@@ -694,6 +728,49 @@ pub(crate) fn record_tlb_shootdown_all(target_cpu_mask: u64) {
     );
 }
 
+pub(crate) fn record_tlb_address_space_switch(
+    previous_address_space_id: u64,
+    next_address_space_id: u64,
+    kind: crate::arch::tlb::AddressSpaceSwitchKind,
+) {
+    if !trace_enabled() {
+        return;
+    }
+    match kind {
+        crate::arch::tlb::AddressSpaceSwitchKind::LegacyCr3 => {
+            TRACE_TLB_AS_SWITCH_LEGACY_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+        crate::arch::tlb::AddressSpaceSwitchKind::PcidFlush => {
+            TRACE_TLB_AS_SWITCH_PCID_FLUSH_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+        crate::arch::tlb::AddressSpaceSwitchKind::PcidNoFlush => {
+            TRACE_TLB_AS_SWITCH_PCID_NOFLUSH_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+        crate::arch::tlb::AddressSpaceSwitchKind::SameAddressSpaceSkip => {
+            TRACE_TLB_AS_SWITCH_SKIP_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    record(
+        TraceCategory::Tlb,
+        TraceEvent::TlbAddressSpaceSwitch,
+        previous_address_space_id,
+        next_address_space_id | ((kind as u64) << 56),
+    );
+}
+
+pub(crate) fn record_tlb_invpcid_single(pcid: u16) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_TLB_INVPCID_SINGLE_COUNT.fetch_add(1, Ordering::AcqRel);
+    record(
+        TraceCategory::Tlb,
+        TraceEvent::TlbInvpcidSingle,
+        u64::from(pcid),
+        0,
+    );
+}
+
 pub(crate) fn record_sched_irq_enter(from_user: bool) {
     record(
         TraceCategory::Sched,
@@ -866,6 +943,8 @@ fn event_name(event: TraceEvent) -> &'static str {
         TraceEvent::ChannelReclaim => "channel_reclaim",
         TraceEvent::SysNativeEnter => "sys_native_enter",
         TraceEvent::SysNativeSysret => "sys_native_sysret",
+        TraceEvent::TlbAddressSpaceSwitch => "tlb_as_switch",
+        TraceEvent::TlbInvpcidSingle => "tlb_invpcid_single",
     }
 }
 
@@ -965,6 +1044,15 @@ pub(crate) fn flush_bootstrap_trace() {
         records
             .iter()
             .filter(|record| record.phase == 5 && record.event() == TraceEvent::TlbShootdownAll)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_TLB_AS_SWITCH_PHASE8.store(
+        records
+            .iter()
+            .filter(|record| {
+                record.phase == 8 && record.event() == TraceEvent::TlbAddressSpaceSwitch
+            })
             .count() as u64,
         Ordering::Release,
     );

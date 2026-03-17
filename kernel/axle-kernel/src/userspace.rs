@@ -622,8 +622,29 @@ const SLOT_TRACE_SYS_EXIT_PHASE1: usize = 655;
 const SLOT_TRACE_SYS_RETIRE_PHASE1: usize = 656;
 const SLOT_TRACE_SYS_NATIVE_ENTER_PHASE1: usize = 759;
 const SLOT_TRACE_SYS_NATIVE_SYSRET_PHASE1: usize = 760;
+const SLOT_PERF_AS_SWITCH_STATUS: usize = 761;
+const SLOT_PERF_AS_SWITCH_ITERS: usize = 762;
+const SLOT_PERF_AS_SWITCH_CYCLES: usize = 763;
+const SLOT_PERF_PMU_SUPPORTED: usize = 764;
+const SLOT_PERF_NULL_PMU_INSTR: usize = 765;
+const SLOT_PERF_NULL_PMU_REF_CYCLES: usize = 766;
+const SLOT_PERF_TLB_PMU_INSTR: usize = 767;
+const SLOT_PERF_TLB_PMU_REF_CYCLES: usize = 768;
+const SLOT_PERF_AS_SWITCH_PMU_INSTR: usize = 769;
+const SLOT_PERF_AS_SWITCH_PMU_REF_CYCLES: usize = 770;
+const SLOT_TRACE_TLB_AS_SWITCH_LEGACY: usize = 771;
+const SLOT_TRACE_TLB_AS_SWITCH_PCID_FLUSH: usize = 772;
+const SLOT_TRACE_TLB_AS_SWITCH_PCID_NOFLUSH: usize = 773;
+const SLOT_TRACE_TLB_AS_SWITCH_SKIP: usize = 774;
+const SLOT_TRACE_TLB_AS_SWITCH_PHASE8: usize = 775;
+const SLOT_TRACE_TLB_INVPCID_SINGLE: usize = 776;
+const SLOT_TRACE_TLB_PCID_ENABLED: usize = 777;
+const SLOT_TRACE_TLB_INVPCID_ENABLED: usize = 778;
+const SLOT_PERF_PMU_VERSION: usize = 779;
+const SLOT_PERF_PMU_FIXED_COUNTERS: usize = 780;
+const SLOT_TRACE_TLB_PHASE8_OK: usize = 781;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_TRACE_SYS_NATIVE_SYSRET_PHASE1;
+const SLOT_MAX: usize = SLOT_TRACE_TLB_PHASE8_OK;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1556,6 +1577,7 @@ fn perf_summary_present(slots: &[u64]) -> bool {
         || slots[SLOT_PERF_TLB_PEER_ITERS] != 0
         || slots[SLOT_PERF_FAULT_ITERS] != 0
         || slots[SLOT_PERF_CHANNEL_FRAGMENT_ITERS] != 0
+        || slots[SLOT_PERF_AS_SWITCH_ITERS] != 0
         || slots[SLOT_PERF_FAILURE_STEP] != 0
 }
 
@@ -1609,6 +1631,25 @@ fn update_perf_trace_slots(slots: &mut [u64]) {
     slots[SLOT_TRACE_TLB_SYNC_PLAN_PHASE5] = crate::trace::bootstrap_trace_tlb_sync_plan_phase5();
     slots[SLOT_TRACE_TLB_SHOOTDOWN_FULL_PHASE5] =
         crate::trace::bootstrap_trace_tlb_shootdown_full_phase5();
+    slots[SLOT_TRACE_TLB_AS_SWITCH_LEGACY] =
+        crate::trace::bootstrap_trace_tlb_as_switch_legacy_count();
+    slots[SLOT_TRACE_TLB_AS_SWITCH_PCID_FLUSH] =
+        crate::trace::bootstrap_trace_tlb_as_switch_pcid_flush_count();
+    slots[SLOT_TRACE_TLB_AS_SWITCH_PCID_NOFLUSH] =
+        crate::trace::bootstrap_trace_tlb_as_switch_pcid_noflush_count();
+    slots[SLOT_TRACE_TLB_AS_SWITCH_SKIP] = crate::trace::bootstrap_trace_tlb_as_switch_skip_count();
+    slots[SLOT_TRACE_TLB_AS_SWITCH_PHASE8] = crate::trace::bootstrap_trace_tlb_as_switch_phase8();
+    slots[SLOT_TRACE_TLB_INVPCID_SINGLE] = crate::trace::bootstrap_trace_tlb_invpcid_single_count();
+    slots[SLOT_TRACE_TLB_PCID_ENABLED] = u64::from(crate::arch::tlb::pcid_enabled());
+    slots[SLOT_TRACE_TLB_INVPCID_ENABLED] = u64::from(crate::arch::tlb::invpcid_enabled());
+    slots[SLOT_PERF_PMU_SUPPORTED] = u64::from(crate::arch::pmu::supported());
+    slots[SLOT_PERF_PMU_VERSION] = crate::arch::pmu::version();
+    slots[SLOT_PERF_PMU_FIXED_COUNTERS] = crate::arch::pmu::fixed_counter_count();
+    slots[SLOT_TRACE_TLB_PHASE8_OK] = u64::from(
+        slots[SLOT_PERF_AS_SWITCH_STATUS] == 0
+            && slots[SLOT_PERF_AS_SWITCH_ITERS] != 0
+            && slots[SLOT_TRACE_TLB_AS_SWITCH_PHASE8] != 0,
+    );
     slots[SLOT_TRACE_FAULT_ENTER_PHASE6] = crate::trace::bootstrap_trace_fault_enter_phase6();
     slots[SLOT_TRACE_FAULT_HANDLED_PHASE6] = crate::trace::bootstrap_trace_fault_handled_phase6();
     slots[SLOT_TRACE_FAULT_BLOCK_PHASE6] = crate::trace::bootstrap_trace_fault_block_phase6();
@@ -1635,7 +1676,7 @@ fn print_perf_summary(slots: &mut [u64]) {
     crate::trace::flush_bootstrap_trace();
     update_perf_trace_slots(slots);
     crate::kprintln!(
-        "kernel: bootstrap perf smoke (perf_failure_step={}, perf_thread_create={}, perf_thread_start={}, perf_eventpair_create={}, perf_null_status={}, perf_null_iters={}, perf_null_cycles={}, perf_wait_status={}, perf_wait_iters={}, perf_wait_cycles={}, perf_wake_status={}, perf_wake_iters={}, perf_wake_cycles={}, perf_tlb_status={}, perf_tlb_iters={}, perf_tlb_cycles={}, perf_tlb_peer_status={}, perf_tlb_peer_iters={}, perf_tlb_peer_cycles={}, perf_fault_status={}, perf_fault_iters={}, perf_fault_cycles={}, perf_channel_fragment_status={}, perf_channel_fragment_iters={}, perf_channel_fragment_cycles={}, trace_vmo_h={}, trace_records={}, trace_dropped={}, trace_export_bytes={}, trace_remote_wake_phase3={}, trace_sched_max_rq_depth={}, trace_sched_steals={}, trace_sched_handoffs={}, trace_sched_remote_wake_latency_count={}, trace_sched_remote_wake_latency_max_ns={}, trace_sched_steal_phase3={}, trace_sched_handoff_phase3={}, trace_sched_remote_wake_latency_phase3={}, trace_sched_steal_phase5={}, trace_sched_phase3_ok={}, trace_sys_enter_phase1={}, trace_sys_exit_phase1={}, trace_sys_retire_phase1={}, trace_sys_native_enter_phase1={}, trace_sys_native_sysret_phase1={}, trace_context_switches={}, trace_timer_reprogram={}, trace_tlb_sync_plans={}, trace_tlb_local_page_flush={}, trace_tlb_local_full_flush={}, trace_tlb_shootdown_page={}, trace_tlb_shootdown_full={}, trace_tlb_shootdown_target_cpus={}, trace_tlb_max_active_cpus={}, trace_tlb_last_active_mask={}, trace_tlb_page_flush_phase4={}, trace_tlb_full_flush_phase4={}, trace_tlb_sync_plan_phase4={}, trace_tlb_sync_plan_phase5={}, trace_tlb_shootdown_full_phase5={}, trace_fault_enter_phase6={}, trace_fault_handled_phase6={}, trace_fault_block_phase6={}, trace_fault_resume_phase6={}, trace_fault_unhandled_phase6={}, trace_ipc_channel_enqueue_phase7={}, trace_ipc_channel_dequeue_phase7={}, trace_ipc_channel_reclaim_phase7={}, channel_fragment_pool_new={}, channel_fragment_pool_reuse={}, channel_fragment_pool_local_free={}, channel_fragment_pool_remote_free={}, channel_fragment_pool_cached_current={}, channel_fragment_pool_cached_peak={}, channel_fragmented_desc_count={}, channel_fragmented_bytes_total={})",
+        "kernel: bootstrap perf smoke (perf_failure_step={}, perf_thread_create={}, perf_thread_start={}, perf_eventpair_create={}, perf_null_status={}, perf_null_iters={}, perf_null_cycles={}, perf_wait_status={}, perf_wait_iters={}, perf_wait_cycles={}, perf_wake_status={}, perf_wake_iters={}, perf_wake_cycles={}, perf_tlb_status={}, perf_tlb_iters={}, perf_tlb_cycles={}, perf_tlb_peer_status={}, perf_tlb_peer_iters={}, perf_tlb_peer_cycles={}, perf_fault_status={}, perf_fault_iters={}, perf_fault_cycles={}, perf_channel_fragment_status={}, perf_channel_fragment_iters={}, perf_channel_fragment_cycles={}, perf_as_switch_status={}, perf_as_switch_iters={}, perf_as_switch_cycles={}, perf_pmu_supported={}, perf_pmu_version={}, perf_pmu_fixed_counters={}, perf_null_pmu_instr={}, perf_null_pmu_ref_cycles={}, perf_tlb_pmu_instr={}, perf_tlb_pmu_ref_cycles={}, perf_as_switch_pmu_instr={}, perf_as_switch_pmu_ref_cycles={}, trace_vmo_h={}, trace_records={}, trace_dropped={}, trace_export_bytes={}, trace_remote_wake_phase3={}, trace_sched_max_rq_depth={}, trace_sched_steals={}, trace_sched_handoffs={}, trace_sched_remote_wake_latency_count={}, trace_sched_remote_wake_latency_max_ns={}, trace_sched_steal_phase3={}, trace_sched_handoff_phase3={}, trace_sched_remote_wake_latency_phase3={}, trace_sched_steal_phase5={}, trace_sched_phase3_ok={}, trace_sys_enter_phase1={}, trace_sys_exit_phase1={}, trace_sys_retire_phase1={}, trace_sys_native_enter_phase1={}, trace_sys_native_sysret_phase1={}, trace_context_switches={}, trace_timer_reprogram={}, trace_tlb_sync_plans={}, trace_tlb_local_page_flush={}, trace_tlb_local_full_flush={}, trace_tlb_shootdown_page={}, trace_tlb_shootdown_full={}, trace_tlb_shootdown_target_cpus={}, trace_tlb_max_active_cpus={}, trace_tlb_last_active_mask={}, trace_tlb_page_flush_phase4={}, trace_tlb_full_flush_phase4={}, trace_tlb_sync_plan_phase4={}, trace_tlb_sync_plan_phase5={}, trace_tlb_shootdown_full_phase5={}, trace_tlb_as_switch_legacy={}, trace_tlb_as_switch_pcid_flush={}, trace_tlb_as_switch_pcid_noflush={}, trace_tlb_as_switch_skip={}, trace_tlb_as_switch_phase8={}, trace_tlb_invpcid_single={}, trace_tlb_pcid_enabled={}, trace_tlb_invpcid_enabled={}, trace_tlb_phase8_ok={}, trace_fault_enter_phase6={}, trace_fault_handled_phase6={}, trace_fault_block_phase6={}, trace_fault_resume_phase6={}, trace_fault_unhandled_phase6={}, trace_ipc_channel_enqueue_phase7={}, trace_ipc_channel_dequeue_phase7={}, trace_ipc_channel_reclaim_phase7={}, channel_fragment_pool_new={}, channel_fragment_pool_reuse={}, channel_fragment_pool_local_free={}, channel_fragment_pool_remote_free={}, channel_fragment_pool_cached_current={}, channel_fragment_pool_cached_peak={}, channel_fragmented_desc_count={}, channel_fragmented_bytes_total={})",
         slots[SLOT_PERF_FAILURE_STEP],
         slots[SLOT_PERF_THREAD_CREATE] as i64,
         slots[SLOT_PERF_THREAD_START] as i64,
@@ -1661,6 +1702,18 @@ fn print_perf_summary(slots: &mut [u64]) {
         slots[SLOT_PERF_CHANNEL_FRAGMENT_STATUS] as i64,
         slots[SLOT_PERF_CHANNEL_FRAGMENT_ITERS],
         slots[SLOT_PERF_CHANNEL_FRAGMENT_CYCLES],
+        slots[SLOT_PERF_AS_SWITCH_STATUS] as i64,
+        slots[SLOT_PERF_AS_SWITCH_ITERS],
+        slots[SLOT_PERF_AS_SWITCH_CYCLES],
+        slots[SLOT_PERF_PMU_SUPPORTED],
+        slots[SLOT_PERF_PMU_VERSION],
+        slots[SLOT_PERF_PMU_FIXED_COUNTERS],
+        slots[SLOT_PERF_NULL_PMU_INSTR],
+        slots[SLOT_PERF_NULL_PMU_REF_CYCLES],
+        slots[SLOT_PERF_TLB_PMU_INSTR],
+        slots[SLOT_PERF_TLB_PMU_REF_CYCLES],
+        slots[SLOT_PERF_AS_SWITCH_PMU_INSTR],
+        slots[SLOT_PERF_AS_SWITCH_PMU_REF_CYCLES],
         slots[SLOT_TRACE_VMO_H],
         slots[SLOT_TRACE_RECORDS],
         slots[SLOT_TRACE_DROPPED],
@@ -1696,6 +1749,15 @@ fn print_perf_summary(slots: &mut [u64]) {
         slots[SLOT_TRACE_TLB_SYNC_PLAN_PHASE4],
         slots[SLOT_TRACE_TLB_SYNC_PLAN_PHASE5],
         slots[SLOT_TRACE_TLB_SHOOTDOWN_FULL_PHASE5],
+        slots[SLOT_TRACE_TLB_AS_SWITCH_LEGACY],
+        slots[SLOT_TRACE_TLB_AS_SWITCH_PCID_FLUSH],
+        slots[SLOT_TRACE_TLB_AS_SWITCH_PCID_NOFLUSH],
+        slots[SLOT_TRACE_TLB_AS_SWITCH_SKIP],
+        slots[SLOT_TRACE_TLB_AS_SWITCH_PHASE8],
+        slots[SLOT_TRACE_TLB_INVPCID_SINGLE],
+        slots[SLOT_TRACE_TLB_PCID_ENABLED],
+        slots[SLOT_TRACE_TLB_INVPCID_ENABLED],
+        slots[SLOT_TRACE_TLB_PHASE8_OK],
         slots[SLOT_TRACE_FAULT_ENTER_PHASE6],
         slots[SLOT_TRACE_FAULT_HANDLED_PHASE6],
         slots[SLOT_TRACE_FAULT_BLOCK_PHASE6],
