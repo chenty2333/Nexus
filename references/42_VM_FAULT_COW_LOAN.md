@@ -88,8 +88,12 @@ This is the current mechanism that prevents duplicate materialization or inconsi
 - Shared/global anonymous aliases and imported VMOs still fault through the shared/global backing source.
 - Lazy VMO-backed pages bind to a shared/global source frame on first fault.
 - Pager-backed global VMOs materialize through the kernel's pager source abstraction.
-- `ZX_VM_PRIVATE_CLONE` / `AX_VM_PRIVATE_CLONE` pager-backed mappings stay on that shared source
-  for first materialization, then rebind one mapping-local private frame on the first write fault.
+- `ZX_VM_PRIVATE_CLONE` / `AX_VM_PRIVATE_CLONE` now accepts any shared source whose VMO kind
+  supports COW:
+  - pager-backed / file-backed sources stay on that shared source for first materialization, then
+    rebind one mapping-local private frame on the first write fault
+  - staged byte-backed boot assets currently ride one page-rounded shared anonymous VMO through the
+    same private-clone path
 - Kernel VMO byte I/O can also materialize anonymous pages.
   When that happens for a page that is already mapped somewhere, the kernel now attaches the new
   frame to existing mapping aliases:

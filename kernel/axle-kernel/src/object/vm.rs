@@ -301,7 +301,7 @@ pub fn vmar_map(
         require_vm_mapping_rights(
             resolved_vmo,
             request.perms,
-            request.private_clone && matches!(vmo.kind, axle_mm::VmoKind::PagerBacked),
+            request.private_clone && vmo.kind.supports_copy_on_write(),
         )?;
         require_vmar_mapping_caps(vmar.mapping_caps, request.perms, request.specific)?;
         let mut vmo = vmo;

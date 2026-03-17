@@ -6490,13 +6490,13 @@ impl VmDomain {
         if !matches!(
             vmo.backing_scope(),
             crate::object::VmoBackingScope::GlobalShared
-        ) || vmo.kind() != VmoKind::PagerBacked
+        ) || !vmo.kind().supports_copy_on_write()
         {
             return Err(ZX_ERR_NOT_SUPPORTED);
         }
 
         // Keep one imported shared alias as the canonical global-backed view in this address
-        // space, then create a mapping-local pager shadow that faults through the same source.
+        // space, then create a mapping-local COW shadow that faults through the same source.
         let _ = self.ensure_vmo_backing_for_mapping(target_address_space_id, vmo)?;
         let global_vmo = self.global_vmos.lock().snapshot(vmo.global_vmo_id())?;
         let address_space = self
@@ -8354,7 +8354,7 @@ impl VmDomain {
                     .get(&address_space_id)
                     .and_then(|space| space.lookup_user_mapping(page_base, 1))
                     .ok_or(ZX_ERR_BAD_STATE)?;
-                if lookup.vmo_kind() != VmoKind::Anonymous
+                if !lookup.vmo_kind().supports_copy_on_write()
                     || lookup.frame_id() != Some(old_frame_id)
                 {
                     return Ok((

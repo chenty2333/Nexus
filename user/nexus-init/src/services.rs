@@ -849,7 +849,16 @@ fn duplicate_handle(handle: zx_handle_t, rights: zx_rights_t) -> Result<zx_handl
 
 fn create_vmo_with_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
     let mut handle = ZX_HANDLE_INVALID;
-    let size = bytes.len().max(1) as u64;
+    let size = if bytes.is_empty() {
+        1
+    } else {
+        const LOCAL_FILE_VMO_ALIGNMENT: u64 = 4096;
+        let raw = bytes.len() as u64;
+        let mask = LOCAL_FILE_VMO_ALIGNMENT - 1;
+        raw.checked_add(mask)
+            .map(|rounded| rounded & !mask)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?
+    };
     let status = axle_arch_x86_64::int80_syscall(
         AXLE_SYS_VMO_CREATE as u64,
         [size, 0, &mut handle as *mut zx_handle_t as u64, 0, 0, 0],

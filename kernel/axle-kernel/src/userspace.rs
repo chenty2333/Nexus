@@ -613,11 +613,15 @@ const SLOT_CHANNEL_FRAGMENT_POOL_CACHED_PEAK: usize = 690;
 const SLOT_CHANNEL_FRAGMENTED_DESC_COUNT: usize = 691;
 const SLOT_CHANNEL_FRAGMENTED_BYTES_TOTAL: usize = 692;
 const SLOT_TRACE_SCHED_PHASE3_OK: usize = 693;
+const SLOT_COMPONENT_PROVIDER_OUTPUT_LEN: usize = 694;
+const SLOT_COMPONENT_PROVIDER_OUTPUT_WORD_BASE: usize = 695;
+const COMPONENT_PROVIDER_OUTPUT_WORDS: usize = 64;
 const SLOT_TRACE_SYS_ENTER_PHASE1: usize = 654;
 const SLOT_TRACE_SYS_EXIT_PHASE1: usize = 655;
 const SLOT_TRACE_SYS_RETIRE_PHASE1: usize = 656;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_TRACE_SCHED_PHASE3_OK;
+const SLOT_MAX: usize =
+    SLOT_COMPONENT_PROVIDER_OUTPUT_WORD_BASE + COMPONENT_PROVIDER_OUTPUT_WORDS - 1;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1703,6 +1707,27 @@ fn print_perf_summary(slots: &mut [u64]) {
     );
 }
 
+fn component_provider_output_preview(
+    slots: &[u64],
+) -> ([u8; COMPONENT_PROVIDER_OUTPUT_WORDS * 8], usize) {
+    let max_len = COMPONENT_PROVIDER_OUTPUT_WORDS * 8;
+    let output_len = core::cmp::min(slots[SLOT_COMPONENT_PROVIDER_OUTPUT_LEN] as usize, max_len);
+    let mut preview = [0u8; COMPONENT_PROVIDER_OUTPUT_WORDS * 8];
+    let word_count = output_len.div_ceil(8);
+    for index in 0..word_count {
+        let word = slots[SLOT_COMPONENT_PROVIDER_OUTPUT_WORD_BASE + index].to_le_bytes();
+        let start = index * 8;
+        let end = core::cmp::min(start + 8, output_len);
+        preview[start..end].copy_from_slice(&word[..end - start]);
+    }
+    for byte in &mut preview[..output_len] {
+        if !matches!(*byte, b' '..=b'~') {
+            *byte = b' ';
+        }
+    }
+    (preview, output_len)
+}
+
 /// Called by the breakpoint handler to print the userspace-produced summary.
 pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
     let slots = shared_slots();
@@ -1715,8 +1740,12 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
             let frame = unsafe { &*frame };
             (frame.rax as i64, frame.rbx, frame.rcx)
         };
+        let (provider_output_preview, provider_output_len) =
+            component_provider_output_preview(slots);
+        let provider_output_preview =
+            core::str::from_utf8(&provider_output_preview[..provider_output_len]).unwrap_or("");
         crate::kprintln!(
-            "userspace: conformance reported failure (ok=0, trap_rax={}, trap_rbx={:#x}, trap_rcx={:#x}, unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, queue={}, wait={}, port_wait_readable={}, port_wait_readable_observed={}, t0_ns={}, tx=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}], rx=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}], component_failure_step={}, provider_stage={}, provider_status={}, client_stage={}, client_status={}, provider_event_read={}, provider_event_code={}, client_event_read={}, client_event_code={}, stop_request={}, stop_event_read={}, stop_event_code={}, stop_wait_observed={}, kill_request={}, kill_event_read={}, kill_event_code={}, kill_wait_observed={})",
+            "userspace: conformance reported failure (ok=0, trap_rax={}, trap_rbx={:#x}, trap_rcx={:#x}, unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, queue={}, wait={}, port_wait_readable={}, port_wait_readable_observed={}, t0_ns={}, tx=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}], rx=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}], component_failure_step={}, provider_stage={}, provider_status={}, client_stage={}, client_status={}, provider_event_read={}, provider_event_code={}, client_event_read={}, client_event_code={}, stop_request={}, stop_event_read={}, stop_event_code={}, stop_wait_observed={}, kill_request={}, kill_event_read={}, kill_event_code={}, kill_wait_observed={}, provider_output_len={}, provider_output_preview=\"{}\")",
             trap_rax,
             trap_rbx,
             trap_rip,
@@ -1757,7 +1786,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
             slots[SLOT_COMPONENT_KILL_REQUEST] as i64,
             slots[SLOT_COMPONENT_KILL_EVENT_READ] as i64,
             slots[SLOT_COMPONENT_KILL_EVENT_CODE] as i64,
-            slots[SLOT_COMPONENT_KILL_WAIT_OBSERVED]
+            slots[SLOT_COMPONENT_KILL_WAIT_OBSERVED],
+            slots[SLOT_COMPONENT_PROVIDER_OUTPUT_LEN],
+            provider_output_preview,
         );
         crate::kprintln!(
             "userspace: early slots queue={} wait={} tx=[{:016x} {:016x} {:016x} {:016x} {:016x} {:016x}] rx=[{:016x} {:016x} {:016x} {:016x} {:016x} {:016x}]",

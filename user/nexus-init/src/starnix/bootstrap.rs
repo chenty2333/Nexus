@@ -308,6 +308,18 @@ fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx_status_t> 
             LINUX_GLIBC_RUNTIME_LIBC_BINARY_PATH,
             LINUX_GLIBC_RUNTIME_LIBC_BYTES,
         ));
+        assets.push(BootAssetEntry::bytes(
+            crate::LINUX_GLIBC_RUNTIME_INTERP_CANONICAL_PATH,
+            LINUX_GLIBC_RUNTIME_INTERP_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            crate::LINUX_GLIBC_RUNTIME_INTERP_LIB64_PATH,
+            LINUX_GLIBC_RUNTIME_INTERP_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            crate::LINUX_GLIBC_RUNTIME_LIBC_LIB64_PATH,
+            LINUX_GLIBC_RUNTIME_LIBC_BYTES,
+        ));
     }
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(

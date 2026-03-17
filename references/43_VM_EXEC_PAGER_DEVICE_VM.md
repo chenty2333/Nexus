@@ -72,11 +72,16 @@ Current state:
 - The bootstrap userspace service tree can now hand out read-only `GetVmo`
   handles for boot/package files:
   - seeded boot-loaded ELF images reuse the imported pager-backed code VMOs
-  - byte-backed assets such as compiled manifests synthesize one cached VMO on
-    first request and duplicate that handle for later callers
+  - byte-backed assets such as compiled manifests and staged runtime libraries
+    synthesize one cached page-rounded anonymous VMO on first request and
+    duplicate that handle for later callers
 - The narrow public pager/file-backed mapping contract is now:
-  - the handle still names one shared read-only pager-backed VMO
-  - `AX_VM_PRIVATE_CLONE` / `ZX_VM_PRIVATE_CLONE` may map that source through a
+  - the handle names one shared read-only mapping source:
+    - imported pager-backed/file-backed VMOs when the boot image already has
+      one
+    - otherwise one staged shared anonymous VMO containing the file bytes
+  - `AX_VM_PRIVATE_CLONE` / `ZX_VM_PRIVATE_CLONE` may map any shared COW-capable
+    source through a
     writable mapping-local shadow view
   - the shared pager/file source remains unchanged; first write allocates one
     private page for that mapping instead of mutating the source VMO

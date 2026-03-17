@@ -82,6 +82,9 @@ const SLOT_COMPONENT_KILL_REQUEST: usize = 596;
 const SLOT_COMPONENT_KILL_EVENT_READ: usize = 597;
 const SLOT_COMPONENT_KILL_EVENT_CODE: usize = 598;
 const SLOT_COMPONENT_KILL_WAIT_OBSERVED: usize = 599;
+const SLOT_COMPONENT_PROVIDER_OUTPUT_LEN: usize = 694;
+const SLOT_COMPONENT_PROVIDER_OUTPUT_WORD_BASE: usize = 695;
+const COMPONENT_PROVIDER_OUTPUT_WORDS: usize = 64;
 
 const STEP_RESOLVE_ROOT: u64 = 1;
 const STEP_RESOLVE_PROVIDER: u64 = 2;
@@ -579,7 +582,10 @@ pub(crate) const LINUX_DYNAMIC_PIE_MAIN_BINARY_PATH: &str = "bin/linux-dynamic-p
 pub(crate) const LINUX_DYNAMIC_PIE_INTERP_BINARY_PATH: &str = "lib/ld-nexus-dynamic-runtime.so";
 pub(crate) const LINUX_GLIBC_HELLO_BINARY_PATH: &str = "bin/linux-glibc-hello";
 pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_BINARY_PATH: &str = "lib/ld-nexus-glibc.so";
+pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_CANONICAL_PATH: &str = "lib/ld-linux-x86-64.so.2";
+pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_LIB64_PATH: &str = "lib64/ld-linux-x86-64.so.2";
 pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_BINARY_PATH: &str = "lib/libc.so.6";
+pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_LIB64_PATH: &str = "lib64/libc.so.6";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -996,6 +1002,18 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         ));
         assets.push(BootAssetEntry::bytes(
             LINUX_GLIBC_RUNTIME_LIBC_BINARY_PATH,
+            LINUX_GLIBC_RUNTIME_LIBC_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_GLIBC_RUNTIME_INTERP_CANONICAL_PATH,
+            LINUX_GLIBC_RUNTIME_INTERP_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_GLIBC_RUNTIME_INTERP_LIB64_PATH,
+            LINUX_GLIBC_RUNTIME_INTERP_BYTES,
+        ));
+        assets.push(BootAssetEntry::bytes(
+            LINUX_GLIBC_RUNTIME_LIBC_LIB64_PATH,
             LINUX_GLIBC_RUNTIME_LIBC_BYTES,
         ));
     }
@@ -2121,6 +2139,7 @@ fn run_starnix_root_child(
         Ok(bytes) => {
             if return_code != 0 {
                 summary.failure_step = STEP_PROVIDER_EVENT;
+                write_component_output_prefix(&bytes);
                 let _ = zx_handle_close(stdout);
                 let _ = zx_handle_close(running.status);
                 let _ = zx_handle_close(running.controller);
@@ -2128,6 +2147,7 @@ fn run_starnix_root_child(
             }
             if bytes != expected_stdout {
                 summary.failure_step = STEP_STARNIX_STDOUT;
+                write_component_output_prefix(&bytes);
                 let _ = zx_handle_close(stdout);
                 let _ = zx_handle_close(running.status);
                 let _ = zx_handle_close(running.controller);
@@ -2182,6 +2202,23 @@ fn read_socket_to_end(handle: zx_handle_t) -> Result<Vec<u8>, zx_status_t> {
             return Ok(out);
         }
         return Err(status);
+    }
+}
+
+fn write_component_output_prefix(bytes: &[u8]) {
+    let prefix_len = core::cmp::min(bytes.len(), COMPONENT_PROVIDER_OUTPUT_WORDS * 8);
+    write_slot(SLOT_COMPONENT_PROVIDER_OUTPUT_LEN, prefix_len as u64);
+    for index in 0..COMPONENT_PROVIDER_OUTPUT_WORDS {
+        let start = index * 8;
+        let end = core::cmp::min(start + 8, prefix_len);
+        let mut word = [0u8; 8];
+        if start < end {
+            word[..end - start].copy_from_slice(&bytes[start..end]);
+        }
+        write_slot(
+            SLOT_COMPONENT_PROVIDER_OUTPUT_WORD_BASE + index,
+            u64::from_le_bytes(word),
+        );
     }
 }
 

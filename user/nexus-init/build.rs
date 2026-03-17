@@ -581,7 +581,7 @@ fn main() {
         &linux_glibc_hello_source,
         &out_dir.join("linux-glibc-hello"),
         "/lib/ld-nexus-glibc.so",
-        "/lib",
+        "/lib:/lib64",
     );
     copy_linux_runtime_asset(
         &host_linux_runtime_path("libc.so.6"),
