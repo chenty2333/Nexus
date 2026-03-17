@@ -407,7 +407,7 @@ pub fn start_thread(
         }
 
         state.with_kernel_mut(|kernel| {
-            kernel.start_thread(thread.thread_id, entry, stack, arg0, arg1)
+            kernel.start_thread_explicit(thread.thread_id, entry, stack, arg0, arg1)
         })
     })
 }

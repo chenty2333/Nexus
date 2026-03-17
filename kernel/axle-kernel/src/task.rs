@@ -3230,10 +3230,15 @@ struct CpuSchedulerState {
     online: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartPlacementPolicy {
+    PreserveAffinity,
+    PreferIdlePeer,
+}
+
 const RQ_DEPTH_ENQUEUE_BACK: u16 = 1;
 const RQ_DEPTH_ENQUEUE_FRONT: u16 = 2;
 const RQ_DEPTH_DEQUEUE_LOCAL: u16 = 3;
-const RQ_DEPTH_STEAL_TAKE: u16 = 4;
 
 /// Internal bootstrap kernel model.
 #[derive(Debug)]
@@ -4430,15 +4435,26 @@ impl Kernel {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     Ok(TrapExitDisposition::Complete)
                 } else {
+                    self.clear_current_thread_slot();
                     Ok(TrapExitDisposition::BlockCurrent)
                 }
             }
-            ThreadState::Suspended | ThreadState::Terminated => {
+            ThreadState::Suspended => {
                 self.clear_current_slice_state();
                 if let Some(next_thread_id) = self.pop_runnable_thread() {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     Ok(TrapExitDisposition::Complete)
                 } else {
+                    Ok(TrapExitDisposition::BlockCurrent)
+                }
+            }
+            ThreadState::Terminated => {
+                self.clear_current_slice_state();
+                if let Some(next_thread_id) = self.pop_runnable_thread() {
+                    self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
+                    Ok(TrapExitDisposition::Complete)
+                } else {
+                    self.clear_current_thread_slot();
                     Ok(TrapExitDisposition::BlockCurrent)
                 }
             }
@@ -4812,13 +4828,14 @@ impl Kernel {
         Ok((thread_id, koid))
     }
 
-    pub(crate) fn start_thread(
+    fn start_thread_with_policy(
         &mut self,
         thread_id: ThreadId,
         entry: u64,
         stack: u64,
         arg0: u64,
         arg1: u64,
+        placement: StartPlacementPolicy,
     ) -> Result<(), zx_status_t> {
         let process_id = self
             .threads
@@ -4853,7 +4870,7 @@ impl Kernel {
         let thread_id_copy = thread_id;
         let _ = thread;
         if !queued {
-            let target_cpu = self.choose_start_cpu(thread_id_copy);
+            let target_cpu = self.choose_start_cpu(thread_id_copy, placement);
             if target_cpu != self.current_cpu_id() {
                 crate::trace::record_remote_wake(thread_id_copy, target_cpu);
             }
@@ -4862,6 +4879,42 @@ impl Kernel {
             self.maybe_nudge_idle_stealer(target_cpu);
         }
         Ok(())
+    }
+
+    pub(crate) fn start_thread(
+        &mut self,
+        thread_id: ThreadId,
+        entry: u64,
+        stack: u64,
+        arg0: u64,
+        arg1: u64,
+    ) -> Result<(), zx_status_t> {
+        self.start_thread_with_policy(
+            thread_id,
+            entry,
+            stack,
+            arg0,
+            arg1,
+            StartPlacementPolicy::PreserveAffinity,
+        )
+    }
+
+    pub(crate) fn start_thread_explicit(
+        &mut self,
+        thread_id: ThreadId,
+        entry: u64,
+        stack: u64,
+        arg0: u64,
+        arg1: u64,
+    ) -> Result<(), zx_status_t> {
+        self.start_thread_with_policy(
+            thread_id,
+            entry,
+            stack,
+            arg0,
+            arg1,
+            StartPlacementPolicy::PreferIdlePeer,
+        )
     }
 
     pub(crate) fn start_thread_guest(
@@ -4893,7 +4946,8 @@ impl Kernel {
         let thread_id_copy = thread_id;
         let _ = thread;
         if !queued {
-            let target_cpu = self.choose_start_cpu(thread_id_copy);
+            let target_cpu =
+                self.choose_start_cpu(thread_id_copy, StartPlacementPolicy::PreserveAffinity);
             if target_cpu != self.current_cpu_id() {
                 crate::trace::record_remote_wake(thread_id_copy, target_cpu);
             }
@@ -5392,10 +5446,6 @@ impl Kernel {
         })
     }
 
-    fn first_steal_target_cpu_excluding(&self, excluded_cpu_id: usize) -> Option<usize> {
-        self.first_idle_cpu_excluding(excluded_cpu_id)
-    }
-
     fn note_run_queue_depth(&self, thread_id: ThreadId, cpu_id: usize, op: u16) {
         let depth = self
             .cpu_schedulers
@@ -5406,16 +5456,7 @@ impl Kernel {
     }
 
     fn maybe_nudge_idle_stealer(&mut self, donor_cpu_id: usize) {
-        let donor_busy = self
-            .cpu_schedulers
-            .get(&donor_cpu_id)
-            .is_some_and(|scheduler| scheduler.current_thread_id.is_some());
-        if !donor_busy {
-            return;
-        }
-        if let Some(target_cpu_id) = self.first_steal_target_cpu_excluding(donor_cpu_id) {
-            self.request_reschedule_on_cpu(target_cpu_id);
-        }
+        let _ = donor_cpu_id;
     }
 
     pub(crate) fn mark_cpu_online(&mut self, cpu_id: usize) {
@@ -5433,8 +5474,19 @@ impl Kernel {
         core::mem::take(&mut self.cpu_scheduler_mut(cpu_id).reschedule_requested)
     }
 
-    fn choose_start_cpu(&self, thread_id: ThreadId) -> usize {
-        self.choose_wake_cpu(thread_id)
+    fn choose_start_cpu(&self, thread_id: ThreadId, placement: StartPlacementPolicy) -> usize {
+        let preferred_cpu = self.choose_wake_cpu(thread_id);
+        if placement == StartPlacementPolicy::PreferIdlePeer
+            && preferred_cpu == self.current_cpu_id()
+            && self
+                .cpu_schedulers
+                .get(&preferred_cpu)
+                .is_some_and(|scheduler| scheduler.current_thread_id.is_some())
+            && let Some(idle_cpu_id) = self.first_idle_cpu_excluding(preferred_cpu)
+        {
+            return idle_cpu_id;
+        }
+        preferred_cpu
     }
 
     fn choose_wake_cpu(&self, thread_id: ThreadId) -> usize {
@@ -5467,50 +5519,6 @@ impl Kernel {
         current_cpu_id
     }
 
-    fn choose_steal_donor_cpu(&self, receiver_cpu_id: usize) -> Option<usize> {
-        self.cpu_schedulers
-            .iter()
-            .filter(|(cpu_id, scheduler)| {
-                **cpu_id != receiver_cpu_id && scheduler.online && scheduler.run_queue.len() > 1
-            })
-            .max_by_key(|(_, scheduler)| scheduler.run_queue.len())
-            .map(|(&cpu_id, _)| cpu_id)
-    }
-
-    fn steal_runnable_thread(&mut self, receiver_cpu_id: usize) -> Option<ThreadId> {
-        let donor_cpu_id = self.choose_steal_donor_cpu(receiver_cpu_id)?;
-        loop {
-            let thread_id = self.cpu_scheduler_mut(donor_cpu_id).run_queue.pop_back()?;
-            let donor_depth_after = self
-                .cpu_schedulers
-                .get(&donor_cpu_id)
-                .map(|scheduler| scheduler.run_queue.len())
-                .unwrap_or(0);
-            let Some(thread) = self.threads.get_mut(&thread_id) else {
-                continue;
-            };
-            if thread.queued_on_cpu != Some(donor_cpu_id) {
-                continue;
-            }
-            thread.queued_on_cpu = None;
-            thread.remote_wake_enqueued_ns = None;
-            thread.remote_wake_source_cpu = None;
-            thread.remote_wake_target_cpu = None;
-            if !matches!(thread.state, ThreadState::Runnable) {
-                continue;
-            }
-            let _ = thread;
-            self.note_run_queue_depth(thread_id, donor_cpu_id, RQ_DEPTH_STEAL_TAKE);
-            crate::trace::record_sched_steal(
-                thread_id,
-                donor_cpu_id,
-                receiver_cpu_id,
-                donor_depth_after,
-            );
-            return Some(thread_id);
-        }
-    }
-
     fn current_cpu_id(&self) -> usize {
         crate::arch::apic::this_apic_id() as usize
     }
@@ -5529,6 +5537,10 @@ impl Kernel {
         let scheduler = self.current_cpu_scheduler_mut();
         scheduler.current_runtime_started_ns = None;
         scheduler.slice_deadline_ns = None;
+    }
+
+    fn clear_current_thread_slot(&mut self) {
+        self.current_cpu_scheduler_mut().current_thread_id = None;
     }
 
     fn account_current_runtime_until(&mut self, now: i64) -> Result<(), zx_status_t> {
@@ -5816,9 +5828,7 @@ impl Kernel {
     }
 
     fn take_next_runnable_thread_for_current_cpu(&mut self) -> Option<ThreadId> {
-        let current_cpu_id = self.current_cpu_id();
         self.pop_runnable_thread()
-            .or_else(|| self.steal_runnable_thread(current_cpu_id))
     }
 
     fn activate_thread_on_current_cpu(

@@ -77,25 +77,24 @@ Main just targets include:
     wake-path smoke loops under QEMU
   - the kernel exports one bootstrap VMO-backed trace summary covering syscall, scheduler,
     timer, and TLB events, including irq enter/exit edges on timer and reschedule handlers
-  - the scheduler slice now also exports one minimal L0 wake/steal telemetry set:
+  - the scheduler slice now also exports one minimal L0 wake telemetry set:
     - run-queue depth
     - blocked-wake handoff count
     - remote-wake latency count / max
-    - one global steal count
+    - one global steal counter reserved for future L0 migration work; healthy runs currently keep it at zero
   - the same summary now distinguishes syscall dispatch completion from actual return-to-user
     retirement through `sys_enter` / `sys_exit` / `sys_retire` counts for the deterministic
     null-syscall phase
-  - the same runner now waits to enter the phase-3 wake benchmark until the worker has actually
-    reached a different CPU, so the phase now measures one honest cross-CPU wake/resume path
-    rather than one synthetic first-run placement rule
+  - the same runner now proves one explicit `zx_thread_start()` launch onto a different CPU, then
+    reuses that peer worker across the phase-3 wake benchmark, the active-peer TLB slice, and the
+    same-page fault slice instead of depending on repeated cross-CPU launches
   - the same runner now also executes one narrow VMAR map/protect/unmap churn slice so TLB-local
     page-flush telemetry is exercised and parsed through the same key=value summary path
   - the same runner now also executes one trap-facing same-page fault slice and exports
     `fault_enter / fault_block / fault_resume / fault_handled / fault_unhandled` counts through
     the same summary path
-  - one follow-on TLB peer slice now reuses the real peer-CPU worker proven by the cross-core wake
-    phase, so the active-address-space shootdown counts no longer depend on a second synthetic
-    launch rule
+  - the same peer-worker reuse also keeps the active-address-space TLB and fault slices from
+    depending on a second synthetic launch rule
   - the scenario currently acts as a wiring and attribution gate, not as a stable performance
     regression threshold
 - Component-framework bootstrap coverage now also includes one eager-topology gate:
