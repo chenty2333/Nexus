@@ -26,17 +26,19 @@ This file describes the current channel object behavior in the repository.
   - message queue
   - `peer_closed` and `closed` state
 - Each message stores:
+  - one message descriptor
   - payload
   - transferred handles
+  - cached `actual_bytes` / `actual_handles`
 
 Current payload forms are:
 
 - copied bytes
 - loaned user pages
 - fragmented payloads:
-  - copied head bytes
+  - pooled head fragment page
   - optional loaned full-page body
-  - copied tail bytes
+  - pooled tail fragment page
 
 Each endpoint's inbound queue is currently capped at `64` messages.
 
@@ -57,10 +59,14 @@ These are computed from endpoint state and participate in both `wait_one` and `w
 - `channel_write()` supports ordinary copied payloads.
 - It also supports a loan fast path for page-aligned full-page user ranges.
 - For mixed-shape user buffers, the kernel copy service can now build a fragmented payload:
-  - copied head/tail fragments
+  - pooled head/tail fragment pages
   - loaned aligned body pages when possible
   - sender-side COW arming now works on the aligned body subrange even when that body sits inside a
     larger anonymous mapping
+- Channel message ownership is now centralized around one descriptor shape:
+  - enqueue caches actual byte/handle counts once
+  - dequeue consumes the same descriptor without recomputing payload shape
+  - read-result release and close-drain both funnel through one reclaim path
 - Message enqueue is all-or-nothing: the whole message plus transferred handles lands on the peer, or the call fails.
 - Handle transfer uses `TransferredCap` snapshots from the sender CSpace, then installs them into the receiver process on read.
 - Receiver-side transferred-handle install now runs through a typed install batch.
@@ -86,19 +92,24 @@ These are computed from endpoint state and participate in both `wait_one` and `w
 ## Close behavior
 
 - Closing one endpoint drains its queued messages and releases transferred resources.
+- Fragment-page head/tail storage is now recycled through a per-CPU fragment pool:
+  - local free returns to the current CPU cache
+  - remote free is batched back to the owner CPU
 - The surviving peer sees `peer_closed`.
 - Reads from an empty queue with a closed peer return the peer-closed condition rather than waiting forever.
 
 ## Current limitations
 
-- The mixed-shape channel path now exists, but fragment storage is still simple copied byte vectors rather than dedicated fragment-page objects or a reusable fragment pool.
 - `owner_process_id` is fixed at endpoint creation and is still part of the current loan/remap assumptions.
-- The planner and bulk copy execution now live in the kernel copy-service slice, but channel payload ownership still spans `object.rs`, `transport.rs`, `task.rs`, and `copy.rs`.
-- Loaned payload ownership is now consuming rather than clone-based.
-  - releasing one queued payload consumes the loan token and tears down its backing resources
+- The planner and bulk copy execution still live in the kernel copy-service slice, while descriptor enqueue/dequeue/reclaim live in `transport.rs`.
+  - this is a much tighter ownership split than before, but it is not yet the final shared
+    data-movement substrate for socket/file/net
+- Loaned payload ownership is consuming rather than clone-based.
+  - reclaiming one queued payload consumes the loan token and tears down its backing resources
 - Receiver-side fragmented remap is still stricter than the fallback path.
   - the loaned body currently expects a compatible exact anonymous destination mapping span
   - a normal contiguous user buffer still works, but it takes the copy-fill path instead of remap
-- The current runtime-grade contract is centered on the existing mixed `head/body/tail` design.
-  Dedicated fragment-page objects or a reusable general scatter descriptor are still later
-  generalization work, not part of the current bootstrap/runtime gate.
+- The current runtime-grade contract is centered on the existing mixed `head/body/tail` design and
+  one channel-specific descriptor shape.
+  A reusable general scatter descriptor shared across channel/socket/file/net is still later work,
+  not part of the current bootstrap/runtime gate.

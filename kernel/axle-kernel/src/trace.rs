@@ -5,8 +5,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use axle_types::zx_handle_t;
 
-const TRACE_RECORD_CAPACITY: usize = 4096;
-const TRACE_VMO_BYTES: u64 = 256 * 1024;
+const TRACE_RECORD_CAPACITY: usize = 8192;
+const TRACE_VMO_BYTES: u64 = 512 * 1024;
 const TRACE_MAGIC: u64 = u64::from_le_bytes(*b"AXLTRC01");
 const TRACE_VERSION: u64 = 1;
 const TRACE_RECORD_WORDS: u64 = 6;
@@ -20,6 +20,7 @@ pub(crate) enum TraceCategory {
     Timer = 3,
     Tlb = 4,
     Fault = 5,
+    Ipc = 6,
 }
 
 #[repr(u16)]
@@ -49,6 +50,9 @@ pub(crate) enum TraceEvent {
     Steal = 22,
     Handoff = 23,
     RemoteWakeLatency = 24,
+    ChannelEnqueue = 25,
+    ChannelDequeue = 26,
+    ChannelReclaim = 27,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -82,6 +86,7 @@ impl TraceRecord {
             3 => TraceCategory::Timer,
             4 => TraceCategory::Tlb,
             5 => TraceCategory::Fault,
+            6 => TraceCategory::Ipc,
             _ => TraceCategory::Syscall,
         }
     }
@@ -112,6 +117,9 @@ impl TraceRecord {
             22 => TraceEvent::Steal,
             23 => TraceEvent::Handoff,
             24 => TraceEvent::RemoteWakeLatency,
+            25 => TraceEvent::ChannelEnqueue,
+            26 => TraceEvent::ChannelDequeue,
+            27 => TraceEvent::ChannelReclaim,
             _ => TraceEvent::SysEnter,
         }
     }
@@ -154,6 +162,9 @@ static TRACE_SCHED_STEAL_PHASE3: AtomicU64 = AtomicU64::new(0);
 static TRACE_SCHED_HANDOFF_PHASE3: AtomicU64 = AtomicU64::new(0);
 static TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3: AtomicU64 = AtomicU64::new(0);
 static TRACE_SCHED_STEAL_PHASE5: AtomicU64 = AtomicU64::new(0);
+static TRACE_IPC_CHANNEL_ENQUEUE_PHASE7: AtomicU64 = AtomicU64::new(0);
+static TRACE_IPC_CHANNEL_DEQUEUE_PHASE7: AtomicU64 = AtomicU64::new(0);
+static TRACE_IPC_CHANNEL_RECLAIM_PHASE7: AtomicU64 = AtomicU64::new(0);
 static mut TRACE_RECORDS: [TraceRecord; TRACE_RECORD_CAPACITY] =
     [TraceRecord::ZERO; TRACE_RECORD_CAPACITY];
 
@@ -311,6 +322,18 @@ pub(crate) fn bootstrap_trace_sched_steal_phase5() -> u64 {
     TRACE_SCHED_STEAL_PHASE5.load(Ordering::Acquire)
 }
 
+pub(crate) fn bootstrap_trace_ipc_channel_enqueue_phase7() -> u64 {
+    TRACE_IPC_CHANNEL_ENQUEUE_PHASE7.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_ipc_channel_dequeue_phase7() -> u64 {
+    TRACE_IPC_CHANNEL_DEQUEUE_PHASE7.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_ipc_channel_reclaim_phase7() -> u64 {
+    TRACE_IPC_CHANNEL_RECLAIM_PHASE7.load(Ordering::Acquire)
+}
+
 pub(crate) fn note_tlb_active_mask(active_cpu_mask: u64) {
     if !trace_enabled() {
         return;
@@ -359,6 +382,9 @@ pub(crate) fn init_bootstrap_trace() {
     TRACE_SCHED_HANDOFF_PHASE3.store(0, Ordering::Release);
     TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3.store(0, Ordering::Release);
     TRACE_SCHED_STEAL_PHASE5.store(0, Ordering::Release);
+    TRACE_IPC_CHANNEL_ENQUEUE_PHASE7.store(0, Ordering::Release);
+    TRACE_IPC_CHANNEL_DEQUEUE_PHASE7.store(0, Ordering::Release);
+    TRACE_IPC_CHANNEL_RECLAIM_PHASE7.store(0, Ordering::Release);
     // SAFETY: resetting the bootstrap trace ring happens before userspace starts
     // producing trace records for this run, so no concurrent writers can observe
     // partially cleared records. Each slot is written through a raw pointer to
@@ -697,6 +723,33 @@ pub(crate) fn record_fault_unhandled(fault_va: u64, error: u64) {
     );
 }
 
+pub(crate) fn record_channel_enqueue(actual_bytes: u32, actual_handles: u32, fragmented: bool) {
+    record(
+        TraceCategory::Ipc,
+        TraceEvent::ChannelEnqueue,
+        u64::from(actual_bytes),
+        u64::from(actual_handles) | (u64::from(u8::from(fragmented)) << 32),
+    );
+}
+
+pub(crate) fn record_channel_dequeue(actual_bytes: u32, actual_handles: u32, fragmented: bool) {
+    record(
+        TraceCategory::Ipc,
+        TraceEvent::ChannelDequeue,
+        u64::from(actual_bytes),
+        u64::from(actual_handles) | (u64::from(u8::from(fragmented)) << 32),
+    );
+}
+
+pub(crate) fn record_channel_reclaim(actual_bytes: u32, fragmented: bool, drained: bool) {
+    record(
+        TraceCategory::Ipc,
+        TraceEvent::ChannelReclaim,
+        u64::from(actual_bytes),
+        u64::from(u8::from(fragmented)) | (u64::from(u8::from(drained)) << 1),
+    );
+}
+
 fn snapshot_records() -> Vec<TraceRecord> {
     let record_count = bootstrap_trace_record_count() as usize;
     let mut snapshot = Vec::with_capacity(record_count);
@@ -744,6 +797,7 @@ fn category_name(category: TraceCategory) -> &'static str {
         TraceCategory::Timer => "ax_timer",
         TraceCategory::Tlb => "ax_tlb",
         TraceCategory::Fault => "ax_fault",
+        TraceCategory::Ipc => "ax_ipc",
     }
 }
 
@@ -773,6 +827,9 @@ fn event_name(event: TraceEvent) -> &'static str {
         TraceEvent::Steal => "steal",
         TraceEvent::Handoff => "handoff",
         TraceEvent::RemoteWakeLatency => "remote_wake_latency",
+        TraceEvent::ChannelEnqueue => "channel_enqueue",
+        TraceEvent::ChannelDequeue => "channel_dequeue",
+        TraceEvent::ChannelReclaim => "channel_reclaim",
     }
 }
 
@@ -858,6 +915,27 @@ pub(crate) fn flush_bootstrap_trace() {
         records
             .iter()
             .filter(|record| record.phase == 5 && record.event() == TraceEvent::TlbShootdownAll)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_IPC_CHANNEL_ENQUEUE_PHASE7.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 7 && record.event() == TraceEvent::ChannelEnqueue)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_IPC_CHANNEL_DEQUEUE_PHASE7.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 7 && record.event() == TraceEvent::ChannelDequeue)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_IPC_CHANNEL_RECLAIM_PHASE7.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 7 && record.event() == TraceEvent::ChannelReclaim)
             .count() as u64,
         Ordering::Release,
     );

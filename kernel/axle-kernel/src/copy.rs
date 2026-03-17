@@ -12,7 +12,7 @@ use axle_types::{zx_handle_t, zx_status_t};
 use core::mem::size_of;
 use spin::Mutex;
 
-use crate::object::{ChannelPayload, FragmentedChannelPayload};
+use crate::object::{ChannelFragment, ChannelPayload, FragmentedChannelPayload};
 use crate::task::{AddressSpaceId, LoanedUserPages};
 
 const TINY_INLINE_THRESHOLD: usize = 128;
@@ -396,14 +396,14 @@ fn copy_fragmented_payload_to_span(
     span: ValidatedUserSpan,
     payload: &FragmentedChannelPayload,
 ) -> Result<(), zx_status_t> {
-    let head_len = payload.head.len();
+    let head_len = payload.head.as_ref().map_or(0, ChannelFragment::len);
     let body_len = payload
         .body
         .as_ref()
         .map(|loaned| usize::try_from(loaned.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE))
         .transpose()?
         .unwrap_or(0);
-    let tail_len = payload.tail.len();
+    let tail_len = payload.tail.as_ref().map_or(0, ChannelFragment::len);
     let total = head_len
         .checked_add(body_len)
         .and_then(|len| len.checked_add(tail_len))
@@ -429,11 +429,27 @@ fn copy_fragmented_payload_to_span(
 
     if head_len != 0 {
         let head = span.subspan(0, head_len)?;
-        write_bytes_to_span_with_tracking(head, &payload.head, false)?;
+        write_bytes_to_span_with_tracking(
+            head,
+            payload
+                .head
+                .as_ref()
+                .map(ChannelFragment::bytes)
+                .ok_or(ZX_ERR_BAD_STATE)?,
+            false,
+        )?;
     }
     if tail_len != 0 {
         let tail = span.subspan(head_len + body_len, tail_len)?;
-        write_bytes_to_span_with_tracking(tail, &payload.tail, false)?;
+        write_bytes_to_span_with_tracking(
+            tail,
+            payload
+                .tail
+                .as_ref()
+                .map(ChannelFragment::bytes)
+                .ok_or(ZX_ERR_BAD_STATE)?,
+            false,
+        )?;
     }
     note_plan(CopyPlan::FragmentAssemble, total);
     Ok(())
@@ -515,27 +531,19 @@ pub(crate) fn prepare_channel_write_payload(
         let tail_len = usize::try_from(end - body_end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
         if let Some(body) = ctx.try_pin_read(body_start, body_len)? {
             let head = if head_len == 0 {
-                Vec::new()
+                None
             } else {
-                let mut bytes = Vec::new();
-                bytes
-                    .try_reserve_exact(head_len)
-                    .map_err(|_| ZX_ERR_NO_MEMORY)?;
-                bytes.resize(head_len, 0);
-                crate::userspace::read_validated_user_bytes(span.base, &mut bytes);
-                bytes
+                let mut fragment = crate::object::transport::allocate_channel_fragment(head_len)?;
+                crate::userspace::read_validated_user_bytes(span.base, fragment.bytes_mut());
+                Some(fragment)
             };
             let tail = if tail_len == 0 {
-                Vec::new()
+                None
             } else {
                 let tail_base = body_end;
-                let mut bytes = Vec::new();
-                bytes
-                    .try_reserve_exact(tail_len)
-                    .map_err(|_| ZX_ERR_NO_MEMORY)?;
-                bytes.resize(tail_len, 0);
-                crate::userspace::read_validated_user_bytes(tail_base, &mut bytes);
-                bytes
+                let mut fragment = crate::object::transport::allocate_channel_fragment(tail_len)?;
+                crate::userspace::read_validated_user_bytes(tail_base, fragment.bytes_mut());
+                Some(fragment)
             };
             note_plan(CopyPlan::FragmentAssemble, len);
             return Ok(ChannelPayload::Fragmented(FragmentedChannelPayload {

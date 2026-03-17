@@ -83,10 +83,41 @@ pub(crate) struct TimerObject {
 }
 
 #[derive(Debug)]
+pub(crate) struct ChannelFragmentPage {
+    owner_cpu: usize,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChannelFragment {
+    page: ChannelFragmentPage,
+    len: u16,
+}
+
+impl ChannelFragment {
+    pub(crate) fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.page.bytes[..self.len()]
+    }
+
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        let len = self.len();
+        &mut self.page.bytes[..len]
+    }
+
+    fn into_page(self) -> ChannelFragmentPage {
+        self.page
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct FragmentedChannelPayload {
-    pub(crate) head: Vec<u8>,
+    pub(crate) head: Option<ChannelFragment>,
     pub(crate) body: Option<crate::task::LoanedUserPages>,
-    pub(crate) tail: Vec<u8>,
+    pub(crate) tail: Option<ChannelFragment>,
     pub(crate) len: u32,
 }
 
@@ -98,16 +129,18 @@ pub(crate) enum ChannelPayload {
 }
 
 #[derive(Debug)]
-struct ChannelMessage {
+struct ChannelMsgDesc {
     payload: ChannelPayload,
     handles: Vec<TransferredCap>,
+    actual_bytes: u32,
+    actual_handles: u32,
 }
 
 #[derive(Debug)]
 pub(crate) struct ChannelEndpoint {
     peer_object: ObjectKey,
     owner_process_id: u64,
-    messages: VecDeque<ChannelMessage>,
+    messages: VecDeque<ChannelMsgDesc>,
     peer_closed: bool,
     closed: bool,
 }
@@ -148,23 +181,38 @@ impl ChannelPayload {
             Self::Copied(_) => None,
         }
     }
-
-    pub(crate) fn into_loaned_body(self) -> Option<crate::task::LoanedUserPages> {
-        match self {
-            Self::Loaned(loaned) => Some(loaned),
-            Self::Fragmented(payload) => payload.body,
-            Self::Copied(_) => None,
-        }
-    }
 }
 
-impl ChannelMessage {
-    fn actual_bytes(&self) -> Result<u32, zx_status_t> {
-        self.payload.actual_bytes()
+impl ChannelMsgDesc {
+    fn new(payload: ChannelPayload, handles: Vec<TransferredCap>) -> Result<Self, zx_status_t> {
+        let actual_bytes = payload.actual_bytes()?;
+        let actual_handles = u32::try_from(handles.len()).map_err(|_| ZX_ERR_BAD_STATE)?;
+        Ok(Self {
+            payload,
+            handles,
+            actual_bytes,
+            actual_handles,
+        })
     }
 
-    fn actual_handles(&self) -> Result<u32, zx_status_t> {
-        u32::try_from(self.handles.len()).map_err(|_| ZX_ERR_BAD_STATE)
+    fn actual_bytes(&self) -> u32 {
+        self.actual_bytes
+    }
+
+    fn actual_handles(&self) -> u32 {
+        self.actual_handles
+    }
+
+    fn handles(&self) -> &[TransferredCap] {
+        &self.handles
+    }
+
+    fn is_fragmented(&self) -> bool {
+        matches!(self.payload, ChannelPayload::Fragmented(_))
+    }
+
+    fn into_parts(self) -> (ChannelPayload, Vec<TransferredCap>) {
+        (self.payload, self.handles)
     }
 }
 
@@ -369,6 +417,28 @@ pub(crate) struct SocketTelemetrySnapshot {
     pub(crate) peak_buffered_bytes: u64,
     pub(crate) short_write_count: u64,
     pub(crate) write_should_wait_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ChannelTelemetrySnapshot {
+    pub(crate) desc_enqueued_count: u64,
+    pub(crate) desc_dequeued_count: u64,
+    pub(crate) desc_reclaimed_count: u64,
+    pub(crate) desc_drained_count: u64,
+    pub(crate) fragmented_desc_count: u64,
+    pub(crate) fragmented_bytes_total: u64,
+    pub(crate) fragment_pool_new_count: u64,
+    pub(crate) fragment_pool_reuse_count: u64,
+    pub(crate) fragment_pool_local_free_count: u64,
+    pub(crate) fragment_pool_remote_free_count: u64,
+    pub(crate) fragment_pool_cached_current: u64,
+    pub(crate) fragment_pool_cached_peak: u64,
+}
+
+#[derive(Debug, Default)]
+struct ChannelFragmentPool {
+    local_cache: BTreeMap<usize, Vec<ChannelFragmentPage>>,
+    remote_returns: BTreeMap<usize, Vec<ChannelFragmentPage>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -835,6 +905,8 @@ impl ObjectRegistry {
 pub(crate) struct TransportCore {
     socket_cores: BTreeMap<u64, SocketCore>,
     socket_telemetry: SocketTelemetrySnapshot,
+    channel_telemetry: ChannelTelemetrySnapshot,
+    channel_fragment_pool: ChannelFragmentPool,
     next_socket_core_id: u64,
 }
 
@@ -843,6 +915,8 @@ impl TransportCore {
         Self {
             socket_cores: BTreeMap::new(),
             socket_telemetry: SocketTelemetrySnapshot::default(),
+            channel_telemetry: ChannelTelemetrySnapshot::default(),
+            channel_fragment_pool: ChannelFragmentPool::default(),
             next_socket_core_id: 1,
         }
     }

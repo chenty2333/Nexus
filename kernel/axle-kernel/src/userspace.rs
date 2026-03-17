@@ -598,11 +598,26 @@ const SLOT_TRACE_SCHED_STEAL_PHASE3: usize = 675;
 const SLOT_TRACE_SCHED_HANDOFF_PHASE3: usize = 676;
 const SLOT_TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3: usize = 677;
 const SLOT_TRACE_SCHED_STEAL_PHASE5: usize = 678;
+const SLOT_PERF_CHANNEL_FRAGMENT_STATUS: usize = 679;
+const SLOT_PERF_CHANNEL_FRAGMENT_ITERS: usize = 680;
+const SLOT_PERF_CHANNEL_FRAGMENT_CYCLES: usize = 681;
+const SLOT_TRACE_IPC_CHANNEL_ENQUEUE_PHASE7: usize = 682;
+const SLOT_TRACE_IPC_CHANNEL_DEQUEUE_PHASE7: usize = 683;
+const SLOT_TRACE_IPC_CHANNEL_RECLAIM_PHASE7: usize = 684;
+const SLOT_CHANNEL_FRAGMENT_POOL_NEW: usize = 685;
+const SLOT_CHANNEL_FRAGMENT_POOL_REUSE: usize = 686;
+const SLOT_CHANNEL_FRAGMENT_POOL_LOCAL_FREE: usize = 687;
+const SLOT_CHANNEL_FRAGMENT_POOL_REMOTE_FREE: usize = 688;
+const SLOT_CHANNEL_FRAGMENT_POOL_CACHED_CURRENT: usize = 689;
+const SLOT_CHANNEL_FRAGMENT_POOL_CACHED_PEAK: usize = 690;
+const SLOT_CHANNEL_FRAGMENTED_DESC_COUNT: usize = 691;
+const SLOT_CHANNEL_FRAGMENTED_BYTES_TOTAL: usize = 692;
+const SLOT_TRACE_SCHED_PHASE3_OK: usize = 693;
 const SLOT_TRACE_SYS_ENTER_PHASE1: usize = 654;
 const SLOT_TRACE_SYS_EXIT_PHASE1: usize = 655;
 const SLOT_TRACE_SYS_RETIRE_PHASE1: usize = 656;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_TRACE_SCHED_STEAL_PHASE5;
+const SLOT_MAX: usize = SLOT_TRACE_SCHED_PHASE3_OK;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1534,10 +1549,12 @@ fn perf_summary_present(slots: &[u64]) -> bool {
         || slots[SLOT_PERF_TLB_ITERS] != 0
         || slots[SLOT_PERF_TLB_PEER_ITERS] != 0
         || slots[SLOT_PERF_FAULT_ITERS] != 0
+        || slots[SLOT_PERF_CHANNEL_FRAGMENT_ITERS] != 0
         || slots[SLOT_PERF_FAILURE_STEP] != 0
 }
 
 fn update_perf_trace_slots(slots: &mut [u64]) {
+    let channel = crate::object::transport::channel_telemetry_snapshot();
     slots[SLOT_TRACE_RECORDS] = crate::trace::bootstrap_trace_record_count();
     slots[SLOT_TRACE_DROPPED] = crate::trace::bootstrap_trace_dropped_count();
     slots[SLOT_TRACE_EXPORTED_BYTES] = crate::trace::bootstrap_trace_exported_bytes();
@@ -1555,6 +1572,11 @@ fn update_perf_trace_slots(slots: &mut [u64]) {
     slots[SLOT_TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3] =
         crate::trace::bootstrap_trace_sched_remote_wake_latency_phase3();
     slots[SLOT_TRACE_SCHED_STEAL_PHASE5] = crate::trace::bootstrap_trace_sched_steal_phase5();
+    slots[SLOT_TRACE_SCHED_PHASE3_OK] = u64::from(
+        slots[SLOT_TRACE_REMOTE_WAKE_PHASE3] >= 63
+            && slots[SLOT_TRACE_SCHED_HANDOFF_PHASE3] >= 63
+            && slots[SLOT_TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3] >= 63,
+    );
     slots[SLOT_TRACE_SYS_ENTER_PHASE1] = crate::trace::bootstrap_trace_sys_enter_phase1();
     slots[SLOT_TRACE_SYS_EXIT_PHASE1] = crate::trace::bootstrap_trace_sys_exit_phase1();
     slots[SLOT_TRACE_SYS_RETIRE_PHASE1] = crate::trace::bootstrap_trace_sys_retire_phase1();
@@ -1583,13 +1605,27 @@ fn update_perf_trace_slots(slots: &mut [u64]) {
     slots[SLOT_TRACE_FAULT_RESUME_PHASE6] = crate::trace::bootstrap_trace_fault_resume_phase6();
     slots[SLOT_TRACE_FAULT_UNHANDLED_PHASE6] =
         crate::trace::bootstrap_trace_fault_unhandled_phase6();
+    slots[SLOT_TRACE_IPC_CHANNEL_ENQUEUE_PHASE7] =
+        crate::trace::bootstrap_trace_ipc_channel_enqueue_phase7();
+    slots[SLOT_TRACE_IPC_CHANNEL_DEQUEUE_PHASE7] =
+        crate::trace::bootstrap_trace_ipc_channel_dequeue_phase7();
+    slots[SLOT_TRACE_IPC_CHANNEL_RECLAIM_PHASE7] =
+        crate::trace::bootstrap_trace_ipc_channel_reclaim_phase7();
+    slots[SLOT_CHANNEL_FRAGMENT_POOL_NEW] = channel.fragment_pool_new_count;
+    slots[SLOT_CHANNEL_FRAGMENT_POOL_REUSE] = channel.fragment_pool_reuse_count;
+    slots[SLOT_CHANNEL_FRAGMENT_POOL_LOCAL_FREE] = channel.fragment_pool_local_free_count;
+    slots[SLOT_CHANNEL_FRAGMENT_POOL_REMOTE_FREE] = channel.fragment_pool_remote_free_count;
+    slots[SLOT_CHANNEL_FRAGMENT_POOL_CACHED_CURRENT] = channel.fragment_pool_cached_current;
+    slots[SLOT_CHANNEL_FRAGMENT_POOL_CACHED_PEAK] = channel.fragment_pool_cached_peak;
+    slots[SLOT_CHANNEL_FRAGMENTED_DESC_COUNT] = channel.fragmented_desc_count;
+    slots[SLOT_CHANNEL_FRAGMENTED_BYTES_TOTAL] = channel.fragmented_bytes_total;
 }
 
 fn print_perf_summary(slots: &mut [u64]) {
     crate::trace::flush_bootstrap_trace();
     update_perf_trace_slots(slots);
     crate::kprintln!(
-        "kernel: bootstrap perf smoke (perf_failure_step={}, perf_thread_create={}, perf_thread_start={}, perf_eventpair_create={}, perf_null_status={}, perf_null_iters={}, perf_null_cycles={}, perf_wait_status={}, perf_wait_iters={}, perf_wait_cycles={}, perf_wake_status={}, perf_wake_iters={}, perf_wake_cycles={}, perf_tlb_status={}, perf_tlb_iters={}, perf_tlb_cycles={}, perf_tlb_peer_status={}, perf_tlb_peer_iters={}, perf_tlb_peer_cycles={}, perf_fault_status={}, perf_fault_iters={}, perf_fault_cycles={}, trace_vmo_h={}, trace_records={}, trace_dropped={}, trace_export_bytes={}, trace_remote_wake_phase3={}, trace_sched_max_rq_depth={}, trace_sched_steals={}, trace_sched_handoffs={}, trace_sched_remote_wake_latency_count={}, trace_sched_remote_wake_latency_max_ns={}, trace_sched_steal_phase3={}, trace_sched_handoff_phase3={}, trace_sched_remote_wake_latency_phase3={}, trace_sched_steal_phase5={}, trace_sys_enter_phase1={}, trace_sys_exit_phase1={}, trace_sys_retire_phase1={}, trace_context_switches={}, trace_timer_reprogram={}, trace_tlb_sync_plans={}, trace_tlb_local_page_flush={}, trace_tlb_local_full_flush={}, trace_tlb_shootdown_page={}, trace_tlb_shootdown_full={}, trace_tlb_shootdown_target_cpus={}, trace_tlb_max_active_cpus={}, trace_tlb_last_active_mask={}, trace_tlb_page_flush_phase4={}, trace_tlb_full_flush_phase4={}, trace_tlb_sync_plan_phase4={}, trace_tlb_sync_plan_phase5={}, trace_tlb_shootdown_full_phase5={}, trace_fault_enter_phase6={}, trace_fault_handled_phase6={}, trace_fault_block_phase6={}, trace_fault_resume_phase6={}, trace_fault_unhandled_phase6={})",
+        "kernel: bootstrap perf smoke (perf_failure_step={}, perf_thread_create={}, perf_thread_start={}, perf_eventpair_create={}, perf_null_status={}, perf_null_iters={}, perf_null_cycles={}, perf_wait_status={}, perf_wait_iters={}, perf_wait_cycles={}, perf_wake_status={}, perf_wake_iters={}, perf_wake_cycles={}, perf_tlb_status={}, perf_tlb_iters={}, perf_tlb_cycles={}, perf_tlb_peer_status={}, perf_tlb_peer_iters={}, perf_tlb_peer_cycles={}, perf_fault_status={}, perf_fault_iters={}, perf_fault_cycles={}, perf_channel_fragment_status={}, perf_channel_fragment_iters={}, perf_channel_fragment_cycles={}, trace_vmo_h={}, trace_records={}, trace_dropped={}, trace_export_bytes={}, trace_remote_wake_phase3={}, trace_sched_max_rq_depth={}, trace_sched_steals={}, trace_sched_handoffs={}, trace_sched_remote_wake_latency_count={}, trace_sched_remote_wake_latency_max_ns={}, trace_sched_steal_phase3={}, trace_sched_handoff_phase3={}, trace_sched_remote_wake_latency_phase3={}, trace_sched_steal_phase5={}, trace_sched_phase3_ok={}, trace_sys_enter_phase1={}, trace_sys_exit_phase1={}, trace_sys_retire_phase1={}, trace_context_switches={}, trace_timer_reprogram={}, trace_tlb_sync_plans={}, trace_tlb_local_page_flush={}, trace_tlb_local_full_flush={}, trace_tlb_shootdown_page={}, trace_tlb_shootdown_full={}, trace_tlb_shootdown_target_cpus={}, trace_tlb_max_active_cpus={}, trace_tlb_last_active_mask={}, trace_tlb_page_flush_phase4={}, trace_tlb_full_flush_phase4={}, trace_tlb_sync_plan_phase4={}, trace_tlb_sync_plan_phase5={}, trace_tlb_shootdown_full_phase5={}, trace_fault_enter_phase6={}, trace_fault_handled_phase6={}, trace_fault_block_phase6={}, trace_fault_resume_phase6={}, trace_fault_unhandled_phase6={}, trace_ipc_channel_enqueue_phase7={}, trace_ipc_channel_dequeue_phase7={}, trace_ipc_channel_reclaim_phase7={}, channel_fragment_pool_new={}, channel_fragment_pool_reuse={}, channel_fragment_pool_local_free={}, channel_fragment_pool_remote_free={}, channel_fragment_pool_cached_current={}, channel_fragment_pool_cached_peak={}, channel_fragmented_desc_count={}, channel_fragmented_bytes_total={})",
         slots[SLOT_PERF_FAILURE_STEP],
         slots[SLOT_PERF_THREAD_CREATE] as i64,
         slots[SLOT_PERF_THREAD_START] as i64,
@@ -1612,6 +1648,9 @@ fn print_perf_summary(slots: &mut [u64]) {
         slots[SLOT_PERF_FAULT_STATUS] as i64,
         slots[SLOT_PERF_FAULT_ITERS],
         slots[SLOT_PERF_FAULT_CYCLES],
+        slots[SLOT_PERF_CHANNEL_FRAGMENT_STATUS] as i64,
+        slots[SLOT_PERF_CHANNEL_FRAGMENT_ITERS],
+        slots[SLOT_PERF_CHANNEL_FRAGMENT_CYCLES],
         slots[SLOT_TRACE_VMO_H],
         slots[SLOT_TRACE_RECORDS],
         slots[SLOT_TRACE_DROPPED],
@@ -1626,6 +1665,7 @@ fn print_perf_summary(slots: &mut [u64]) {
         slots[SLOT_TRACE_SCHED_HANDOFF_PHASE3],
         slots[SLOT_TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3],
         slots[SLOT_TRACE_SCHED_STEAL_PHASE5],
+        slots[SLOT_TRACE_SCHED_PHASE3_OK],
         slots[SLOT_TRACE_SYS_ENTER_PHASE1],
         slots[SLOT_TRACE_SYS_EXIT_PHASE1],
         slots[SLOT_TRACE_SYS_RETIRE_PHASE1],
@@ -1648,7 +1688,18 @@ fn print_perf_summary(slots: &mut [u64]) {
         slots[SLOT_TRACE_FAULT_HANDLED_PHASE6],
         slots[SLOT_TRACE_FAULT_BLOCK_PHASE6],
         slots[SLOT_TRACE_FAULT_RESUME_PHASE6],
-        slots[SLOT_TRACE_FAULT_UNHANDLED_PHASE6]
+        slots[SLOT_TRACE_FAULT_UNHANDLED_PHASE6],
+        slots[SLOT_TRACE_IPC_CHANNEL_ENQUEUE_PHASE7],
+        slots[SLOT_TRACE_IPC_CHANNEL_DEQUEUE_PHASE7],
+        slots[SLOT_TRACE_IPC_CHANNEL_RECLAIM_PHASE7],
+        slots[SLOT_CHANNEL_FRAGMENT_POOL_NEW],
+        slots[SLOT_CHANNEL_FRAGMENT_POOL_REUSE],
+        slots[SLOT_CHANNEL_FRAGMENT_POOL_LOCAL_FREE],
+        slots[SLOT_CHANNEL_FRAGMENT_POOL_REMOTE_FREE],
+        slots[SLOT_CHANNEL_FRAGMENT_POOL_CACHED_CURRENT],
+        slots[SLOT_CHANNEL_FRAGMENT_POOL_CACHED_PEAK],
+        slots[SLOT_CHANNEL_FRAGMENTED_DESC_COUNT],
+        slots[SLOT_CHANNEL_FRAGMENTED_BYTES_TOTAL]
     );
 }
 
@@ -1731,6 +1782,7 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         crate::arch::qemu::exit_failure();
     }
     let socket_stats = crate::object::transport::socket_telemetry_snapshot();
+    let channel_stats = crate::object::transport::channel_telemetry_snapshot();
     slots[SLOT_SOCKET_BUFFERED_CURRENT] = socket_stats.current_buffered_bytes;
     slots[SLOT_SOCKET_BUFFERED_PEAK] = socket_stats.peak_buffered_bytes;
     slots[SLOT_SOCKET_SHORT_WRITES] = socket_stats.short_write_count;
@@ -2102,7 +2154,7 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
     );
 
     crate::kprintln!(
-        "kernel: channel fragmented payload (channel_fragmented_create={}, channel_fragmented_tx_vmo_create={}, channel_fragmented_tx_map={}, channel_fragmented_rx_remap_vmo_create={}, channel_fragmented_rx_remap_map={}, channel_fragmented_rx_copy_vmo_create={}, channel_fragmented_rx_copy_map={}, channel_fragmented_write_remap={}, channel_fragmented_read_remap={}, channel_fragmented_actual_bytes_remap={}, channel_fragmented_match_remap={}, channel_fragmented_write_copy={}, channel_fragmented_read_copy={}, channel_fragmented_actual_bytes_copy={}, channel_fragmented_match_copy={})",
+        "kernel: channel fragmented payload (channel_fragmented_create={}, channel_fragmented_tx_vmo_create={}, channel_fragmented_tx_map={}, channel_fragmented_rx_remap_vmo_create={}, channel_fragmented_rx_remap_map={}, channel_fragmented_rx_copy_vmo_create={}, channel_fragmented_rx_copy_map={}, channel_fragmented_write_remap={}, channel_fragmented_read_remap={}, channel_fragmented_actual_bytes_remap={}, channel_fragmented_match_remap={}, channel_fragmented_write_copy={}, channel_fragmented_read_copy={}, channel_fragmented_actual_bytes_copy={}, channel_fragmented_match_copy={}, channel_desc_enqueued={}, channel_desc_dequeued={}, channel_desc_reclaimed={}, channel_desc_drained={}, channel_fragmented_desc_count={}, channel_fragmented_bytes_total={}, channel_fragment_pool_new={}, channel_fragment_pool_reuse={}, channel_fragment_pool_local_free={}, channel_fragment_pool_remote_free={}, channel_fragment_pool_cached_current={}, channel_fragment_pool_cached_peak={})",
         slots[SLOT_CHANNEL_FRAGMENTED_CREATE] as i64,
         slots[SLOT_CHANNEL_FRAGMENTED_TX_VMO_CREATE] as i64,
         slots[SLOT_CHANNEL_FRAGMENTED_TX_MAP] as i64,
@@ -2117,7 +2169,19 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         slots[SLOT_CHANNEL_FRAGMENTED_WRITE_COPY] as i64,
         slots[SLOT_CHANNEL_FRAGMENTED_READ_COPY] as i64,
         slots[SLOT_CHANNEL_FRAGMENTED_ACTUAL_BYTES_COPY] as i64,
-        slots[SLOT_CHANNEL_FRAGMENTED_MATCH_COPY] as i64
+        slots[SLOT_CHANNEL_FRAGMENTED_MATCH_COPY] as i64,
+        channel_stats.desc_enqueued_count as i64,
+        channel_stats.desc_dequeued_count as i64,
+        channel_stats.desc_reclaimed_count as i64,
+        channel_stats.desc_drained_count as i64,
+        channel_stats.fragmented_desc_count as i64,
+        channel_stats.fragmented_bytes_total as i64,
+        channel_stats.fragment_pool_new_count as i64,
+        channel_stats.fragment_pool_reuse_count as i64,
+        channel_stats.fragment_pool_local_free_count as i64,
+        channel_stats.fragment_pool_remote_free_count as i64,
+        channel_stats.fragment_pool_cached_current as i64,
+        channel_stats.fragment_pool_cached_peak as i64
     );
 
     crate::kprintln!(

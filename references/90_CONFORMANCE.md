@@ -62,6 +62,9 @@ Main just targets include:
 - Bootstrap channel coverage now also includes one fragmented mixed-payload gate:
   - one exact-body remap read shape
   - one fallback-copy read shape
+  - current assertions now also pin the fragment-pool reuse path:
+    - fragmented descriptor count / bytes total
+    - pool new/reuse/local-free/current-cache/peak-cache counts
 - Bootstrap channel coverage now also includes one async-signal gate:
   - `CHANNEL_WRITABLE` recovery through `wait_async` + `port_wait`
   - `CHANNEL_PEER_CLOSED` delivery through the same path without stale writable republish
@@ -93,8 +96,19 @@ Main just targets include:
   - the same runner now also executes one trap-facing same-page fault slice and exports
     `fault_enter / fault_block / fault_resume / fault_handled / fault_unhandled` counts through
     the same summary path
+  - the same runner now also executes one fragmented channel slice:
+    - one unaligned `head/body/tail` write path using pooled fragment pages
+    - one fallback-copy read path into an ordinary userspace buffer
+    - `ax_ipc` enqueue/dequeue/reclaim trace counts plus fragment-pool counters exported through
+      the same summary line
   - the same peer-worker reuse also keeps the active-address-space TLB and fault slices from
     depending on a second synthetic launch rule
+  - the phase-3 wake-path gate is now frozen as a minimum-contract check rather than as one exact
+    raw counter:
+    - current L0 runs may land at either `63` or `64` phase-3 remote-wake/handoff/latency events
+      depending on whether one loop edge is already parked
+    - the summary therefore exports one derived `trace_sched_phase3_ok` bit while still printing
+      the raw phase-3 counters for diagnosis
   - the scenario currently acts as a wiring and attribution gate, not as a stable performance
     regression threshold
 - Component-framework bootstrap coverage now also includes one eager-topology gate:

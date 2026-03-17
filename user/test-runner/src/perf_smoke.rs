@@ -1,3 +1,6 @@
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::x86_64::__cpuid;
 use core::ptr;
@@ -8,9 +11,9 @@ use libzircon::status::{ZX_ERR_BAD_SYSCALL, ZX_OK};
 use libzircon::syscall_numbers::{AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP};
 use libzircon::vm::{ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
-    zx_eventpair_create, zx_handle_close, zx_handle_t, zx_object_signal, zx_object_signal_peer,
-    zx_object_wait_one, zx_signals_t, zx_status_t, zx_task_kill, zx_thread_create, zx_thread_start,
-    zx_vmo_create, zx_vmo_write,
+    zx_channel_create, zx_channel_read, zx_channel_write, zx_eventpair_create, zx_handle_close,
+    zx_handle_t, zx_object_signal, zx_object_signal_peer, zx_object_wait_one, zx_signals_t,
+    zx_status_t, zx_task_kill, zx_thread_create, zx_thread_start, zx_vmo_create, zx_vmo_write,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
@@ -43,6 +46,9 @@ const SLOT_PERF_TLB_PEER_CYCLES: usize = 645;
 const SLOT_PERF_FAULT_STATUS: usize = 662;
 const SLOT_PERF_FAULT_ITERS: usize = 663;
 const SLOT_PERF_FAULT_CYCLES: usize = 664;
+const SLOT_PERF_CHANNEL_FRAGMENT_STATUS: usize = 679;
+const SLOT_PERF_CHANNEL_FRAGMENT_ITERS: usize = 680;
+const SLOT_PERF_CHANNEL_FRAGMENT_CYCLES: usize = 681;
 
 const STEP_NULL_SYSCALL: u64 = 1;
 const STEP_WAIT_PING_PONG: u64 = 2;
@@ -50,6 +56,7 @@ const STEP_WAKEUP: u64 = 3;
 const STEP_TLB_CHURN: u64 = 4;
 const STEP_TLB_ACTIVE_PEER: u64 = 5;
 const STEP_FAULT_TIMELINE: u64 = 6;
+const STEP_CHANNEL_FRAGMENT: u64 = 7;
 const STEP_PANIC: u64 = u64::MAX;
 
 const PHASE_NULL_SYSCALL: u64 = 1;
@@ -58,6 +65,7 @@ const PHASE_WAKEUP: u64 = 3;
 const PHASE_TLB_CHURN: u64 = 4;
 const PHASE_TLB_ACTIVE_PEER: u64 = 5;
 const PHASE_FAULT_TIMELINE: u64 = 6;
+const PHASE_CHANNEL_FRAGMENT: u64 = 7;
 
 const NULL_SYSCALL_ITERS: u64 = 64;
 const WAIT_PING_PONG_ITERS: u64 = 32;
@@ -65,7 +73,11 @@ const WAKE_ITERS: u64 = 32;
 const TLB_ITERS: u64 = 8;
 const TLB_ACTIVE_PEER_ITERS: u64 = 8;
 const FAULT_TIMELINE_ITERS: u64 = 1;
+const CHANNEL_FRAGMENT_ITERS: u64 = 8;
 const TLB_CHURN_BYTES: u64 = 4096;
+const CHANNEL_FRAGMENT_MAPPING_BYTES: u64 = 3 * 4096;
+const CHANNEL_FRAGMENT_BYTES: usize = 2 * 4096;
+const CHANNEL_FRAGMENT_OFFSET: usize = 64;
 const WORKER_STACK_BYTES: usize = 4096;
 const HEAP_BYTES: usize = 64 * 1024;
 const WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
@@ -73,6 +85,9 @@ const CROSS_CORE_START_ATTEMPTS: usize = 8;
 const CPU_ID_UNKNOWN: u64 = u64::MAX;
 const WORKER_MODE_ROUNDTRIP: u64 = 0;
 const WORKER_MODE_FAULT_TIMELINE: u64 = 1;
+const WORKER_WAIT_STATE_UNKNOWN: u64 = 0;
+const WORKER_WAIT_STATE_PARKED: u64 = 1;
+const WORKER_WAIT_STATE_RUNNING: u64 = 2;
 #[repr(align(16))]
 struct WorkerStack([u8; WORKER_STACK_BYTES]);
 #[repr(align(16))]
@@ -86,6 +101,7 @@ static ALLOCATOR: BumpAllocator = BumpAllocator;
 static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
 static ROUNDTRIP_WORKER_CPU: AtomicU64 = AtomicU64::new(CPU_ID_UNKNOWN);
 static ROUNDTRIP_WORKER_MODE: AtomicU64 = AtomicU64::new(WORKER_MODE_ROUNDTRIP);
+static ROUNDTRIP_WORKER_WAIT_STATE: AtomicU64 = AtomicU64::new(WORKER_WAIT_STATE_UNKNOWN);
 static ROUNDTRIP_FAULT_ADDR: AtomicU64 = AtomicU64::new(0);
 static mut WAIT_WORKER_STACK: WorkerStack = WorkerStack([0; WORKER_STACK_BYTES]);
 static mut WAKE_WORKER_STACK: WorkerStack = WorkerStack([0; WORKER_STACK_BYTES]);
@@ -169,6 +185,9 @@ struct PerfSummary {
     fault_status: i64,
     fault_iters: u64,
     fault_cycles: u64,
+    channel_fragment_status: i64,
+    channel_fragment_iters: u64,
+    channel_fragment_cycles: u64,
     thread_create: i64,
     thread_start: i64,
     eventpair_create: i64,
@@ -271,9 +290,6 @@ fn run_perf_smoke() -> PerfSummary {
     }
 
     let fault = run_fault_timeline(wake_worker, root_vmar, FAULT_TIMELINE_ITERS);
-    summary.thread_create = fault.thread_create;
-    summary.thread_start = fault.thread_start;
-    summary.eventpair_create = fault.eventpair_create;
     summary.fault_status = fault.status;
     summary.fault_iters = FAULT_TIMELINE_ITERS;
     summary.fault_cycles = fault.cycles;
@@ -285,6 +301,17 @@ fn run_perf_smoke() -> PerfSummary {
     }
 
     write_slot(SLOT_TRACE_PHASE, 0);
+
+    let channel_fragment = run_channel_fragment(root_vmar, CHANNEL_FRAGMENT_ITERS);
+    summary.channel_fragment_status = channel_fragment.status;
+    summary.channel_fragment_iters = CHANNEL_FRAGMENT_ITERS;
+    summary.channel_fragment_cycles = channel_fragment.cycles;
+    if channel_fragment.status != ZX_OK as i64 {
+        summary.failure_step = STEP_CHANNEL_FRAGMENT;
+        write_slot(SLOT_TRACE_PHASE, 0);
+        return summary;
+    }
+
     summary
 }
 
@@ -294,6 +321,7 @@ fn run_eventpair_roundtrip_phase(
     iterations: u64,
 ) -> RoundtripResult {
     let mut result = RoundtripResult::default();
+    wait_for_worker_parked();
     write_slot(SLOT_TRACE_PHASE, phase);
     let start = axle_arch_x86_64::rdtsc();
     for _ in 0..iterations {
@@ -314,6 +342,7 @@ fn run_eventpair_roundtrip_phase(
             write_slot(SLOT_TRACE_PHASE, 0);
             return result;
         }
+        wait_for_worker_parked();
     }
     result.cycles = axle_arch_x86_64::rdtsc().wrapping_sub(start);
     result.status = ZX_OK as i64;
@@ -372,6 +401,7 @@ fn run_cross_core_eventpair_roundtrip(
         }
 
         ROUNDTRIP_WORKER_CPU.store(CPU_ID_UNKNOWN, Ordering::Release);
+        ROUNDTRIP_WORKER_WAIT_STATE.store(WORKER_WAIT_STATE_UNKNOWN, Ordering::Release);
         result.thread_start = zx_thread_start(
             worker_thread,
             cross_core_roundtrip_worker_entry as *const () as usize as u64,
@@ -463,12 +493,14 @@ extern "C" fn cross_core_roundtrip_worker_entry(worker_ep: u64, _iterations: u64
     ROUNDTRIP_WORKER_CPU.store(current_cpu_apic_id(), Ordering::Release);
     let _ = zx_object_signal_peer(worker_ep, 0, ZX_USER_SIGNAL_0);
     loop {
+        ROUNDTRIP_WORKER_WAIT_STATE.store(WORKER_WAIT_STATE_PARKED, Ordering::Release);
         let mut observed: zx_signals_t = 0;
         let status =
             zx_object_wait_one(worker_ep, ZX_USER_SIGNAL_0, wait_deadline(), &mut observed);
         if status != ZX_OK {
             park_forever(worker_ep);
         }
+        ROUNDTRIP_WORKER_WAIT_STATE.store(WORKER_WAIT_STATE_RUNNING, Ordering::Release);
         let _ = zx_object_signal(worker_ep, ZX_USER_SIGNAL_0, 0);
         if ROUNDTRIP_WORKER_MODE.swap(WORKER_MODE_ROUNDTRIP, Ordering::AcqRel)
             == WORKER_MODE_FAULT_TIMELINE
@@ -672,6 +704,157 @@ fn run_fault_timeline(
     result
 }
 
+fn run_channel_fragment(root_vmar: zx_handle_t, iterations: u64) -> RoundtripResult {
+    let mut result = RoundtripResult::default();
+    let mut tx: zx_handle_t = 0;
+    let mut rx: zx_handle_t = 0;
+    let mut vmo: zx_handle_t = 0;
+    let mut mapped_addr = 0_u64;
+
+    result.status = zx_channel_create(0, &mut tx, &mut rx) as i64;
+    if result.status != ZX_OK as i64 {
+        return result;
+    }
+
+    result.status = zx_vmo_create(CHANNEL_FRAGMENT_MAPPING_BYTES, 0, &mut vmo) as i64;
+    if result.status != ZX_OK as i64 {
+        close_channel_pair(tx, rx);
+        return result;
+    }
+
+    let status = zx_vmar_map_local(
+        root_vmar,
+        (ZX_VM_PERM_READ | ZX_VM_PERM_WRITE) as u32,
+        0,
+        vmo,
+        0,
+        CHANNEL_FRAGMENT_MAPPING_BYTES,
+        &mut mapped_addr,
+    );
+    if status != ZX_OK {
+        result.status = status as i64;
+        let _ = zx_handle_close(vmo);
+        close_channel_pair(tx, rx);
+        return result;
+    }
+
+    let expected = match seed_channel_fragment_payload(mapped_addr) {
+        Ok(expected) => expected,
+        Err(status) => {
+            result.status = status;
+            let _ = zx_vmar_unmap_local(root_vmar, mapped_addr, CHANNEL_FRAGMENT_MAPPING_BYTES);
+            let _ = zx_handle_close(vmo);
+            close_channel_pair(tx, rx);
+            return result;
+        }
+    };
+    let mut received = Vec::new();
+    if received.try_reserve_exact(CHANNEL_FRAGMENT_BYTES).is_err() {
+        result.status = -30;
+        let _ = zx_vmar_unmap_local(root_vmar, mapped_addr, CHANNEL_FRAGMENT_MAPPING_BYTES);
+        let _ = zx_handle_close(vmo);
+        close_channel_pair(tx, rx);
+        return result;
+    }
+    received.resize(CHANNEL_FRAGMENT_BYTES, 0);
+
+    write_slot(SLOT_TRACE_PHASE, PHASE_CHANNEL_FRAGMENT);
+    let start = axle_arch_x86_64::rdtsc();
+    for _ in 0..iterations {
+        let status = zx_channel_write(
+            tx,
+            0,
+            (mapped_addr + CHANNEL_FRAGMENT_OFFSET as u64) as *const u8,
+            CHANNEL_FRAGMENT_BYTES as u32,
+            ptr::null(),
+            0,
+        );
+        if status != ZX_OK {
+            result.status = status as i64;
+            write_slot(SLOT_TRACE_PHASE, 0);
+            let _ = zx_vmar_unmap_local(root_vmar, mapped_addr, CHANNEL_FRAGMENT_MAPPING_BYTES);
+            let _ = zx_handle_close(vmo);
+            close_channel_pair(tx, rx);
+            return result;
+        }
+
+        let mut actual_bytes = 0_u32;
+        let mut actual_handles = 0_u32;
+        let status = zx_channel_read(
+            rx,
+            0,
+            received.as_mut_ptr(),
+            ptr::null_mut(),
+            CHANNEL_FRAGMENT_BYTES as u32,
+            0,
+            &mut actual_bytes,
+            &mut actual_handles,
+        );
+        if status != ZX_OK {
+            result.status = status as i64;
+            write_slot(SLOT_TRACE_PHASE, 0);
+            let _ = zx_vmar_unmap_local(root_vmar, mapped_addr, CHANNEL_FRAGMENT_MAPPING_BYTES);
+            let _ = zx_handle_close(vmo);
+            close_channel_pair(tx, rx);
+            return result;
+        }
+        if actual_bytes != CHANNEL_FRAGMENT_BYTES as u32 || actual_handles != 0 {
+            result.status = -31;
+            write_slot(SLOT_TRACE_PHASE, 0);
+            let _ = zx_vmar_unmap_local(root_vmar, mapped_addr, CHANNEL_FRAGMENT_MAPPING_BYTES);
+            let _ = zx_handle_close(vmo);
+            close_channel_pair(tx, rx);
+            return result;
+        }
+        if received != expected {
+            result.status = -32;
+            write_slot(SLOT_TRACE_PHASE, 0);
+            let _ = zx_vmar_unmap_local(root_vmar, mapped_addr, CHANNEL_FRAGMENT_MAPPING_BYTES);
+            let _ = zx_handle_close(vmo);
+            close_channel_pair(tx, rx);
+            return result;
+        }
+    }
+
+    result.cycles = axle_arch_x86_64::rdtsc().wrapping_sub(start);
+    result.status = ZX_OK as i64;
+    write_slot(SLOT_TRACE_PHASE, 0);
+    let _ = zx_vmar_unmap_local(root_vmar, mapped_addr, CHANNEL_FRAGMENT_MAPPING_BYTES);
+    let _ = zx_handle_close(vmo);
+    close_channel_pair(tx, rx);
+    result
+}
+
+fn seed_channel_fragment_payload(mapped_addr: u64) -> Result<Vec<u8>, i64> {
+    let mut expected = Vec::new();
+    expected
+        .try_reserve_exact(CHANNEL_FRAGMENT_BYTES)
+        .map_err(|_| -29)?;
+    for index in 0..CHANNEL_FRAGMENT_BYTES {
+        let value = (index as u8).wrapping_mul(17).wrapping_add(3);
+        expected.push(value);
+        // SAFETY: `run_channel_fragment()` maps `CHANNEL_FRAGMENT_MAPPING_BYTES`
+        // bytes of writable user memory and only asks this helper to seed the
+        // `CHANNEL_FRAGMENT_OFFSET..OFFSET+BYTES` subrange within that mapping.
+        unsafe {
+            ptr::write_volatile(
+                (mapped_addr + CHANNEL_FRAGMENT_OFFSET as u64 + index as u64) as *mut u8,
+                value,
+            );
+        }
+    }
+    Ok(expected)
+}
+
+fn close_channel_pair(tx: zx_handle_t, rx: zx_handle_t) {
+    if tx != 0 {
+        let _ = zx_handle_close(tx);
+    }
+    if rx != 0 {
+        let _ = zx_handle_close(rx);
+    }
+}
+
 fn current_cpu_apic_id() -> u64 {
     // SAFETY: CPUID leaf 1 is always available on the x86_64 bootstrap target used by this
     // perf runner, and reading the APIC id is side-effect free.
@@ -719,6 +902,12 @@ fn wait_deadline() -> i64 {
         .min(i64::MAX as u64) as i64
 }
 
+fn wait_for_worker_parked() {
+    while ROUNDTRIP_WORKER_WAIT_STATE.load(Ordering::Acquire) != WORKER_WAIT_STATE_PARKED {
+        core::hint::spin_loop();
+    }
+}
+
 fn wait_worker_stack_top() -> u64 {
     // SAFETY: the perf smoke owns this dedicated bootstrap worker stack and
     // only hands its top address to `zx_thread_start`.
@@ -762,6 +951,18 @@ fn write_summary(summary: &PerfSummary) {
     write_slot(SLOT_PERF_FAULT_STATUS, summary.fault_status as u64);
     write_slot(SLOT_PERF_FAULT_ITERS, summary.fault_iters);
     write_slot(SLOT_PERF_FAULT_CYCLES, summary.fault_cycles);
+    write_slot(
+        SLOT_PERF_CHANNEL_FRAGMENT_STATUS,
+        summary.channel_fragment_status as u64,
+    );
+    write_slot(
+        SLOT_PERF_CHANNEL_FRAGMENT_ITERS,
+        summary.channel_fragment_iters,
+    );
+    write_slot(
+        SLOT_PERF_CHANNEL_FRAGMENT_CYCLES,
+        summary.channel_fragment_cycles,
+    );
     write_slot(SLOT_PERF_THREAD_CREATE, summary.thread_create as u64);
     write_slot(SLOT_PERF_THREAD_START, summary.thread_start as u64);
     write_slot(SLOT_PERF_EVENTPAIR_CREATE, summary.eventpair_create as u64);

@@ -1,5 +1,12 @@
 use super::*;
 
+const CHANNEL_FRAGMENT_PAGE_BYTES: usize = crate::userspace::USER_PAGE_BYTES as usize;
+const CHANNEL_FRAGMENT_POOL_CACHE_LIMIT_PER_CPU: usize = 8;
+
+fn current_transport_cpu_id() -> usize {
+    crate::arch::apic::this_apic_id() as usize
+}
+
 impl TransportCore {
     pub(super) fn alloc_socket_core_id(&mut self) -> u64 {
         let id = self.next_socket_core_id;
@@ -47,11 +54,149 @@ impl TransportCore {
             .current_buffered_bytes
             .saturating_sub(core.buffered_bytes() as u64);
     }
+
+    fn drain_remote_fragment_returns(&mut self, cpu_id: usize) {
+        let Some(mut returned) = self.channel_fragment_pool.remote_returns.remove(&cpu_id) else {
+            return;
+        };
+        self.channel_fragment_pool
+            .local_cache
+            .entry(cpu_id)
+            .or_default()
+            .append(&mut returned);
+    }
+
+    fn alloc_channel_fragment(&mut self, len: usize) -> Result<ChannelFragment, zx_status_t> {
+        if len == 0 || len > CHANNEL_FRAGMENT_PAGE_BYTES {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        let cpu_id = current_transport_cpu_id();
+        self.drain_remote_fragment_returns(cpu_id);
+        let page = if let Some(page) = self
+            .channel_fragment_pool
+            .local_cache
+            .entry(cpu_id)
+            .or_default()
+            .pop()
+        {
+            self.channel_telemetry.fragment_pool_reuse_count = self
+                .channel_telemetry
+                .fragment_pool_reuse_count
+                .wrapping_add(1);
+            self.channel_telemetry.fragment_pool_cached_current = self
+                .channel_telemetry
+                .fragment_pool_cached_current
+                .saturating_sub(1);
+            page
+        } else {
+            let mut page_bytes = Vec::new();
+            page_bytes
+                .try_reserve_exact(CHANNEL_FRAGMENT_PAGE_BYTES)
+                .map_err(|_| axle_types::status::ZX_ERR_NO_MEMORY)?;
+            page_bytes.resize(CHANNEL_FRAGMENT_PAGE_BYTES, 0);
+            self.channel_telemetry.fragment_pool_new_count = self
+                .channel_telemetry
+                .fragment_pool_new_count
+                .wrapping_add(1);
+            ChannelFragmentPage {
+                owner_cpu: cpu_id,
+                bytes: page_bytes,
+            }
+        };
+
+        let mut page = page;
+        page.owner_cpu = cpu_id;
+        Ok(ChannelFragment {
+            page,
+            len: u16::try_from(len).map_err(|_| axle_types::status::ZX_ERR_OUT_OF_RANGE)?,
+        })
+    }
+
+    fn recycle_channel_fragment(&mut self, fragment: ChannelFragment) {
+        let cpu_id = current_transport_cpu_id();
+        let page = fragment.into_page();
+        let owner_cpu = page.owner_cpu;
+        let cache = if owner_cpu == cpu_id {
+            self.channel_telemetry.fragment_pool_local_free_count = self
+                .channel_telemetry
+                .fragment_pool_local_free_count
+                .wrapping_add(1);
+            self.channel_fragment_pool
+                .local_cache
+                .entry(owner_cpu)
+                .or_default()
+        } else {
+            self.channel_telemetry.fragment_pool_remote_free_count = self
+                .channel_telemetry
+                .fragment_pool_remote_free_count
+                .wrapping_add(1);
+            self.channel_fragment_pool
+                .remote_returns
+                .entry(owner_cpu)
+                .or_default()
+        };
+        if cache.len() < CHANNEL_FRAGMENT_POOL_CACHE_LIMIT_PER_CPU {
+            cache.push(page);
+            self.channel_telemetry.fragment_pool_cached_current = self
+                .channel_telemetry
+                .fragment_pool_cached_current
+                .wrapping_add(1);
+            self.channel_telemetry.fragment_pool_cached_peak = self
+                .channel_telemetry
+                .fragment_pool_cached_peak
+                .max(self.channel_telemetry.fragment_pool_cached_current);
+        }
+    }
+
+    fn note_channel_desc_enqueued(
+        &mut self,
+        fragmented: bool,
+        actual_bytes: u32,
+        actual_handles: u32,
+    ) {
+        self.channel_telemetry.desc_enqueued_count =
+            self.channel_telemetry.desc_enqueued_count.wrapping_add(1);
+        if fragmented {
+            self.channel_telemetry.fragmented_desc_count =
+                self.channel_telemetry.fragmented_desc_count.wrapping_add(1);
+            self.channel_telemetry.fragmented_bytes_total = self
+                .channel_telemetry
+                .fragmented_bytes_total
+                .wrapping_add(u64::from(actual_bytes));
+        }
+        crate::trace::record_channel_enqueue(actual_bytes, actual_handles, fragmented);
+    }
+
+    fn note_channel_desc_dequeued(&mut self) {
+        self.channel_telemetry.desc_dequeued_count =
+            self.channel_telemetry.desc_dequeued_count.wrapping_add(1);
+    }
+
+    fn note_channel_desc_reclaimed(&mut self, drained: bool) {
+        self.channel_telemetry.desc_reclaimed_count =
+            self.channel_telemetry.desc_reclaimed_count.wrapping_add(1);
+        if drained {
+            self.channel_telemetry.desc_drained_count =
+                self.channel_telemetry.desc_drained_count.wrapping_add(1);
+        }
+    }
 }
 
 pub(crate) fn socket_telemetry_snapshot() -> SocketTelemetrySnapshot {
     with_state_mut(|state| state.with_transport(|transport| Ok(transport.socket_telemetry)))
         .unwrap_or_default()
+}
+
+pub(crate) fn channel_telemetry_snapshot() -> ChannelTelemetrySnapshot {
+    with_state_mut(|state| state.with_transport(|transport| Ok(transport.channel_telemetry)))
+        .unwrap_or_default()
+}
+
+pub(crate) fn allocate_channel_fragment(len: usize) -> Result<ChannelFragment, zx_status_t> {
+    with_state_mut(|state| {
+        state.with_transport_mut(|transport| transport.alloc_channel_fragment(len))
+    })
 }
 
 /// Create a socket endpoint pair and return both handles.
@@ -186,12 +331,52 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
 }
 
 pub(super) fn release_channel_payload(state: &KernelState, payload: ChannelPayload) {
-    if let Some(loaned) = payload.into_loaned_body() {
-        let _ = state.with_vm_mut(|vm| {
-            vm.release_loaned_user_pages(loaned);
-            Ok(())
-        });
+    match payload {
+        ChannelPayload::Copied(_) => {}
+        ChannelPayload::Loaned(loaned) => {
+            let _ = state.with_vm_mut(|vm| {
+                vm.release_loaned_user_pages(loaned);
+                Ok(())
+            });
+        }
+        ChannelPayload::Fragmented(payload) => {
+            if let Some(loaned) = payload.body {
+                let _ = state.with_vm_mut(|vm| {
+                    vm.release_loaned_user_pages(loaned);
+                    Ok(())
+                });
+            }
+            if let Some(head) = payload.head {
+                let _ = state.with_transport_mut(|transport| {
+                    transport.recycle_channel_fragment(head);
+                    Ok(())
+                });
+            }
+            if let Some(tail) = payload.tail {
+                let _ = state.with_transport_mut(|transport| {
+                    transport.recycle_channel_fragment(tail);
+                    Ok(())
+                });
+            }
+        }
     }
+}
+
+fn reclaim_channel_payload(state: &KernelState, payload: ChannelPayload, drained: bool) {
+    let actual_bytes = payload.actual_bytes().unwrap_or(0);
+    let fragmented = matches!(&payload, ChannelPayload::Fragmented(_));
+    let _ = state.with_transport_mut(|transport| {
+        transport.note_channel_desc_reclaimed(drained);
+        Ok(())
+    });
+    crate::trace::record_channel_reclaim(actual_bytes, fragmented, drained);
+    release_channel_payload(state, payload);
+}
+
+fn release_channel_message(state: &KernelState, message: ChannelMsgDesc) {
+    let (payload, handles) = message.into_parts();
+    release_transferred_handles(state, &handles);
+    reclaim_channel_payload(state, payload, true);
 }
 
 fn retain_transferred_handles(state: &KernelState, handles: &[TransferredCap]) {
@@ -206,11 +391,6 @@ fn release_transferred_handles(state: &KernelState, handles: &[TransferredCap]) 
     for transferred in handles {
         state.decrement_object_handle_ref(transferred.capability().object_key());
     }
-}
-
-fn release_channel_message(state: &KernelState, message: ChannelMessage) {
-    release_transferred_handles(state, &message.handles);
-    release_channel_payload(state, message.payload);
 }
 
 struct HandleInstallBatch<'a> {
@@ -247,7 +427,7 @@ impl Drop for HandleInstallBatch<'_> {
 
 pub(super) fn drain_channel_messages(
     state: &KernelState,
-    messages: impl IntoIterator<Item = ChannelMessage>,
+    messages: impl IntoIterator<Item = ChannelMsgDesc>,
 ) {
     for message in messages {
         release_channel_message(state, message);
@@ -569,17 +749,21 @@ pub fn channel_write(
             return Err(status);
         }
 
-        retain_transferred_handles(state, &transferred);
-        let message = ChannelMessage {
-            payload: payload.take().ok_or(ZX_ERR_BAD_STATE)?,
-            handles: transferred,
-        };
+        let message = ChannelMsgDesc::new(payload.take().ok_or(ZX_ERR_BAD_STATE)?, transferred)?;
+        let actual_bytes = message.actual_bytes();
+        let actual_handles = message.actual_handles();
+        let fragmented = message.is_fragmented();
+        retain_transferred_handles(state, message.handles());
         state.with_registry_mut(|registry| {
             match registry.get_mut(peer_object_id) {
                 Some(KernelObject::Channel(peer)) => peer.messages.push_back(message),
                 Some(_) => return Err(ZX_ERR_BAD_STATE),
                 None => return Err(ZX_ERR_PEER_CLOSED),
             }
+            Ok(())
+        })?;
+        state.with_transport_mut(|transport| {
+            transport.note_channel_desc_enqueued(fragmented, actual_bytes, actual_handles);
             Ok(())
         })?;
 
@@ -624,11 +808,11 @@ pub fn channel_read(
                     ZX_ERR_SHOULD_WAIT
                 });
             };
-            let actual_bytes = message.actual_bytes()?;
-            let actual_handles = message.actual_handles()?;
+            let actual_bytes = message.actual_bytes();
+            let actual_handles = message.actual_handles();
             Ok((
                 endpoint.peer_object,
-                message.handles.clone(),
+                message.handles().to_vec(),
                 actual_bytes,
                 actual_handles,
             ))
@@ -658,13 +842,22 @@ pub fn channel_read(
             endpoint.messages.pop_front().ok_or(ZX_ERR_BAD_STATE)
         })
         .map_err(|status| (status, 0, 0))?;
-    release_transferred_handles(state, &message.handles);
+    state
+        .with_transport_mut(|transport| {
+            transport.note_channel_desc_dequeued();
+            Ok(())
+        })
+        .map_err(|status| (status, 0, 0))?;
+    let fragmented = message.is_fragmented();
+    let (payload, retained_handles) = message.into_parts();
+    crate::trace::record_channel_dequeue(actual_bytes, actual_handles, fragmented);
+    release_transferred_handles(state, &retained_handles);
 
     let _ = publish_object_signals(state, object_id);
     let _ = publish_object_signals(state, peer_object_id);
 
     Ok(ChannelReadResult {
-        payload: message.payload,
+        payload,
         handles: installed_handles,
         actual_bytes,
         actual_handles,
@@ -673,7 +866,7 @@ pub fn channel_read(
 
 pub(crate) fn release_channel_read_result(result: ChannelReadResult) {
     let _ = with_state_mut(|state| {
-        release_channel_payload(state, result.payload);
+        reclaim_channel_payload(state, result.payload, false);
         Ok(())
     });
 }
