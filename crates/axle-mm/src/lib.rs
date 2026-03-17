@@ -781,7 +781,7 @@ impl VmoKind {
 
     /// Whether mappings of this VMO may be armed for copy-on-write.
     pub const fn supports_copy_on_write(self) -> bool {
-        matches!(self, Self::Anonymous)
+        matches!(self, Self::Anonymous | Self::PagerBacked)
     }
 
     /// Whether mappings of this VMO may participate in page-loan transfer.
@@ -2020,6 +2020,27 @@ impl AddressSpace {
             vmo.frames.resize(new_page_count, None);
         }
         Ok(dropped)
+    }
+
+    /// Drop one tracked VMO when no live mappings still reference it.
+    pub fn remove_vmo_if_unmapped(&mut self, vmo_id: VmoId) -> Result<bool, AddressSpaceError> {
+        if self.vmo(vmo_id).is_none() {
+            return Err(AddressSpaceError::InvalidVmo);
+        }
+        if self
+            .map_recs
+            .iter()
+            .any(|map_rec| map_rec.vmo_id() == vmo_id)
+        {
+            return Ok(false);
+        }
+        let index = self
+            .vmos
+            .iter()
+            .position(|candidate| candidate.id == vmo_id)
+            .ok_or(AddressSpaceError::InvalidVmo)?;
+        self.vmos.remove(index);
+        Ok(true)
     }
 
     /// Import one kernel-global VMO description into this address space, or reuse an existing alias.
@@ -5009,7 +5030,7 @@ mod tests {
         assert!(VmoKind::PagerBacked.supports_kernel_read());
         assert!(!VmoKind::PagerBacked.supports_kernel_write());
         assert!(!VmoKind::PagerBacked.supports_resize());
-        assert!(!VmoKind::PagerBacked.supports_copy_on_write());
+        assert!(VmoKind::PagerBacked.supports_copy_on_write());
         assert!(!VmoKind::PagerBacked.supports_page_loan());
         assert!(!VmoKind::PagerBacked.requires_resident_frames());
     }
@@ -5045,6 +5066,46 @@ mod tests {
             space.vmo(pager).unwrap().missing_page_tag(),
             PteMetaTag::LazyVmo
         );
+    }
+
+    #[test]
+    fn pager_backed_mapping_can_resolve_copy_on_write() {
+        let mut frames = FrameTable::new();
+        let shared = frames.register_existing(0x90_4000).unwrap();
+        let replacement = frames.register_existing(0x90_5000).unwrap();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let pager = space
+            .import_vmo(VmoKind::PagerBacked, PAGE_SIZE, global_vmo_id(134))
+            .unwrap();
+        space.set_vmo_frame(pager, 0, shared).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                pager,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+        space.mark_copy_on_write(ROOT_BASE, PAGE_SIZE).unwrap();
+
+        let before = space.lookup(ROOT_BASE).unwrap();
+        assert_eq!(before.frame_id(), Some(shared));
+        assert!(before.is_copy_on_write());
+        assert!(!before.perms().contains(MappingPerms::WRITE));
+
+        let resolved = space
+            .resolve_cow_fault(&mut frames, ROOT_BASE + 0x88, replacement)
+            .unwrap();
+        let after = space.lookup(ROOT_BASE).unwrap();
+
+        assert_eq!(resolved.old_frame_id(), shared);
+        assert_eq!(resolved.new_frame_id(), replacement);
+        assert_eq!(after.frame_id(), Some(replacement));
+        assert!(after.perms().contains(MappingPerms::WRITE));
+        assert!(!after.is_copy_on_write());
     }
 
     #[test]

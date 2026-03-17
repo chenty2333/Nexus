@@ -76,7 +76,10 @@ This is the current mechanism that prevents duplicate materialization or inconsi
   - current and peak private COW pages
   - current and peak in-flight loan pages
   - quota-hit counters
-- COW is currently an anonymous-memory path, not a general path for physical, contiguous, or pager-backed mappings.
+- COW now covers:
+  - anonymous mappings
+  - mapping-local private-clone views over pager-backed / file-backed sources
+- COW still does not apply to physical or contiguous mappings.
 
 ## Lazy materialization
 
@@ -85,6 +88,8 @@ This is the current mechanism that prevents duplicate materialization or inconsi
 - Shared/global anonymous aliases and imported VMOs still fault through the shared/global backing source.
 - Lazy VMO-backed pages bind to a shared/global source frame on first fault.
 - Pager-backed global VMOs materialize through the kernel's pager source abstraction.
+- `ZX_VM_PRIVATE_CLONE` / `AX_VM_PRIVATE_CLONE` pager-backed mappings stay on that shared source
+  for first materialization, then rebind one mapping-local private frame on the first write fault.
 - Kernel VMO byte I/O can also materialize anonymous pages.
   When that happens for a page that is already mapped somewhere, the kernel now attaches the new
   frame to existing mapping aliases:

@@ -11,7 +11,14 @@ pub(in crate::starnix) struct LinuxMapEntry {
     base: u64,
     len: u64,
     prot: u64,
+    flags: u64,
     backing: LinuxMapBacking,
+}
+
+impl LinuxMapEntry {
+    fn is_private(self) -> bool {
+        (self.flags & LINUX_MAP_PRIVATE) != 0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -239,11 +246,43 @@ impl LinuxMm {
                             base: entry.base,
                             len: entry.len,
                             prot: entry.prot,
+                            flags: entry.flags,
                             backing: LinuxMapBacking::Anonymous { vmo: child_vmo },
                         },
                     );
                 }
                 LinuxMapBacking::File { vmo, offset } => {
+                    if entry.is_private() {
+                        let mut child_vmo = ZX_HANDLE_INVALID;
+                        zx_status_result(zx_vmo_create(entry.len, 0, &mut child_vmo))?;
+                        let mut mapped_addr = 0u64;
+                        zx_status_result(zx_vmar_map_local(
+                            mmap_vmar,
+                            map_linux_prot_to_vm_options(entry.prot)
+                                .map_err(linux_status_from_errno)?
+                                | ZX_VM_SPECIFIC,
+                            entry
+                                .base
+                                .checked_sub(self.mmap_base)
+                                .ok_or(ZX_ERR_OUT_OF_RANGE)?,
+                            child_vmo,
+                            0,
+                            entry.len,
+                            &mut mapped_addr,
+                        ))?;
+                        copy_guest_region(parent_session, child_session, entry.base, entry.len)?;
+                        map_tree.insert(
+                            entry.base,
+                            LinuxMapEntry {
+                                base: entry.base,
+                                len: entry.len,
+                                prot: entry.prot,
+                                flags: entry.flags,
+                                backing: LinuxMapBacking::Anonymous { vmo: child_vmo },
+                            },
+                        );
+                        continue;
+                    }
                     let mut duplicated = ZX_HANDLE_INVALID;
                     zx_status_result(zx_handle_duplicate(
                         vmo,
@@ -271,6 +310,7 @@ impl LinuxMm {
                             base: entry.base,
                             len: entry.len,
                             prot: entry.prot,
+                            flags: entry.flags,
                             backing: LinuxMapBacking::File {
                                 vmo: duplicated,
                                 offset,
@@ -438,7 +478,7 @@ impl LinuxMm {
         }
 
         let mut vmo = ZX_HANDLE_INVALID;
-        let mut private_file_copy = false;
+        let mut private_file_shadow = false;
         let mut map_vmo_offset = offset;
         if anonymous {
             if fd != -1 || offset != 0 {
@@ -454,43 +494,15 @@ impl LinuxMm {
                 return Ok(linux_errno(LINUX_EINVAL));
             }
             if private && (prot & LINUX_PROT_WRITE) != 0 {
-                let source_vmo = match fd_table.as_vmo(fd, nexus_io::VmoFlags::READ) {
+                let mut vmo_flags = nexus_io::VmoFlags::READ;
+                if (prot & LINUX_PROT_EXEC) != 0 {
+                    vmo_flags |= nexus_io::VmoFlags::EXECUTE;
+                }
+                vmo = match fd_table.as_vmo(fd, vmo_flags) {
                     Ok(vmo) => vmo,
                     Err(status) => return Ok(linux_errno(map_fd_status_to_errno(status))),
                 };
-                let status = zx_vmo_create(aligned_len, 0, &mut vmo);
-                if status != ZX_OK {
-                    let _ = zx_handle_close(source_vmo);
-                    return Ok(linux_errno(map_vm_status_to_errno(status)));
-                }
-                let mut bytes = Vec::new();
-                if bytes
-                    .try_reserve_exact(
-                        usize::try_from(aligned_len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
-                    )
-                    .is_err()
-                {
-                    let _ = zx_handle_close(source_vmo);
-                    let _ = zx_handle_close(vmo);
-                    return Ok(linux_errno(LINUX_ENOMEM));
-                }
-                bytes.resize(
-                    usize::try_from(aligned_len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
-                    0,
-                );
-                let read_status = zx_vmo_read(source_vmo, &mut bytes, offset);
-                let _ = zx_handle_close(source_vmo);
-                if read_status != ZX_OK {
-                    let _ = zx_handle_close(vmo);
-                    return Ok(linux_errno(map_vm_status_to_errno(read_status)));
-                }
-                let write_status = zx_vmo_write(vmo, &bytes, 0);
-                if write_status != ZX_OK {
-                    let _ = zx_handle_close(vmo);
-                    return Ok(linux_errno(map_vm_status_to_errno(write_status)));
-                }
-                private_file_copy = true;
-                map_vmo_offset = 0;
+                private_file_shadow = true;
             } else {
                 if (prot & LINUX_PROT_WRITE) != 0 {
                     return Ok(linux_errno(LINUX_EACCES));
@@ -507,13 +519,17 @@ impl LinuxMm {
         }
 
         let mut mapped_addr = 0u64;
+        let mut map_options = if fixed {
+            map_options | ZX_VM_SPECIFIC
+        } else {
+            map_options
+        };
+        if private_file_shadow {
+            map_options |= ZX_VM_PRIVATE_CLONE;
+        }
         let status = zx_vmar_map_local(
             self.mmap_vmar,
-            if fixed {
-                map_options | ZX_VM_SPECIFIC
-            } else {
-                map_options
-            },
+            map_options,
             if fixed {
                 addr.checked_sub(self.mmap_base)
                     .ok_or(ZX_ERR_OUT_OF_RANGE)?
@@ -536,7 +552,8 @@ impl LinuxMm {
                 base: if fixed { addr } else { mapped_addr },
                 len: aligned_len,
                 prot,
-                backing: if anonymous || private_file_copy {
+                flags,
+                backing: if anonymous {
                     LinuxMapBacking::Anonymous { vmo }
                 } else {
                     LinuxMapBacking::File { vmo, offset }
@@ -571,7 +588,7 @@ impl LinuxMm {
             let keep_right = end < entry_end;
             if keep_left {
                 let backing = if keep_right {
-                    duplicate_linux_map_backing(entry.backing)?
+                    duplicate_linux_map_backing(entry.backing, 0)?
                 } else {
                     entry.backing
                 };
@@ -581,18 +598,21 @@ impl LinuxMm {
                         base: entry.base,
                         len: addr - entry.base,
                         prot: entry.prot,
+                        flags: entry.flags,
                         backing,
                     },
                 );
             }
             if keep_right {
+                let right_delta = end.checked_sub(entry.base).ok_or(ZX_ERR_OUT_OF_RANGE)?;
                 self.map_tree.insert(
                     end,
                     LinuxMapEntry {
                         base: end,
                         len: entry_end - end,
                         prot: entry.prot,
-                        backing: entry.backing,
+                        flags: entry.flags,
+                        backing: rebase_linux_map_backing(entry.backing, right_delta)?,
                     },
                 );
             }
@@ -690,7 +710,8 @@ impl LinuxMm {
                         base: entry.base,
                         len: addr - entry.base,
                         prot: entry.prot,
-                        backing: duplicate_linux_map_backing(entry.backing)?,
+                        flags: entry.flags,
+                        backing: duplicate_linux_map_backing(entry.backing, 0)?,
                     },
                 );
             }
@@ -702,17 +723,20 @@ impl LinuxMm {
                     base: protected_start,
                     len: protected_end - protected_start,
                     prot,
+                    flags: entry.flags,
                     backing: entry.backing,
                 },
             );
             if end < entry_end {
+                let right_delta = end.checked_sub(entry.base).ok_or(ZX_ERR_OUT_OF_RANGE)?;
                 self.map_tree.insert(
                     end,
                     LinuxMapEntry {
                         base: end,
                         len: entry_end - end,
                         prot: entry.prot,
-                        backing: duplicate_linux_map_backing(entry.backing)?,
+                        flags: entry.flags,
+                        backing: duplicate_linux_map_backing(entry.backing, right_delta)?,
                     },
                 );
             }
@@ -825,7 +849,10 @@ impl LinuxMm {
     }
 }
 
-fn duplicate_linux_map_backing(backing: LinuxMapBacking) -> Result<LinuxMapBacking, zx_status_t> {
+fn duplicate_linux_map_backing(
+    backing: LinuxMapBacking,
+    delta: u64,
+) -> Result<LinuxMapBacking, zx_status_t> {
     let handle = match backing {
         LinuxMapBacking::Anonymous { vmo } | LinuxMapBacking::File { vmo, .. } => vmo,
     };
@@ -839,7 +866,20 @@ fn duplicate_linux_map_backing(backing: LinuxMapBacking) -> Result<LinuxMapBacki
         LinuxMapBacking::Anonymous { .. } => LinuxMapBacking::Anonymous { vmo: duplicated },
         LinuxMapBacking::File { offset, .. } => LinuxMapBacking::File {
             vmo: duplicated,
-            offset,
+            offset: offset.checked_add(delta).ok_or(ZX_ERR_OUT_OF_RANGE)?,
+        },
+    })
+}
+
+fn rebase_linux_map_backing(
+    backing: LinuxMapBacking,
+    delta: u64,
+) -> Result<LinuxMapBacking, zx_status_t> {
+    Ok(match backing {
+        LinuxMapBacking::Anonymous { vmo } => LinuxMapBacking::Anonymous { vmo },
+        LinuxMapBacking::File { vmo, offset } => LinuxMapBacking::File {
+            vmo,
+            offset: offset.checked_add(delta).ok_or(ZX_ERR_OUT_OF_RANGE)?,
         },
     })
 }

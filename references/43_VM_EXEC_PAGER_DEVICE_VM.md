@@ -74,12 +74,23 @@ Current state:
   - seeded boot-loaded ELF images reuse the imported pager-backed code VMOs
   - byte-backed assets such as compiled manifests synthesize one cached VMO on
     first request and duplicate that handle for later callers
+- The narrow public pager/file-backed mapping contract is now:
+  - the handle still names one shared read-only pager-backed VMO
+  - `AX_VM_PRIVATE_CLONE` / `ZX_VM_PRIVATE_CLONE` may map that source through a
+    writable mapping-local shadow view
+  - the shared pager/file source remains unchanged; first write allocates one
+    private page for that mapping instead of mutating the source VMO
+  - this mapping-local private-clone path does not require VMO write rights on
+    the source file-backed handle
 
 What is not complete yet:
 
-- pager-backed VMOs are not yet a normal user-facing VMO object contract
+- pager-backed VMOs are still only a narrow user-facing contract:
+  - read-only shared handles
+  - writable private-clone mappings
 - there is no external pager object or full file-backed VMO interface
-- write/resize semantics for pager-backed objects are not public contracts yet
+- write/resize semantics for pager-backed objects are not public beyond
+  mapping-local private-clone faults
 - DataFS-prep only freezes read-only `GetVmo` and recovery/model constraints on
   the host side; it does not yet provide a real writable file-backed VMO path
 
@@ -100,5 +111,6 @@ These are relevant for the future driver framework more than for the earliest bo
 
 - Treat execute mappings as part of the supported phase-one VM contract rather than bootstrap-only
   metadata.
-- Treat internal pager-backed code as bootstrap infrastructure, not as a stable pager ABI.
+- Treat pager-backed/file-backed support as one narrow page-object contract:
+  shared read-only source plus mapping-local private shadow on write.
 - Treat physical / contiguous VMO support in `axle-mm` as groundwork for later device work, not as a fully surfaced subsystem today.

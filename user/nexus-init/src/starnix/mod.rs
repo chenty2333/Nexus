@@ -135,7 +135,8 @@ use axle_types::syscall_numbers::{
 };
 use axle_types::vm::{
     ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ, ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE,
-    ZX_VM_COMPACT, ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
+    ZX_VM_COMPACT, ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_PRIVATE_CLONE,
+    ZX_VM_SPECIFIC,
 };
 use axle_types::{
     ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_interp_header_t,

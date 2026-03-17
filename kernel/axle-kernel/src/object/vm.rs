@@ -297,8 +297,12 @@ pub fn vmar_map(
             })
         })?;
 
-        require_vm_mapping_rights(resolved_vmar, request.perms)?;
-        require_vm_mapping_rights(resolved_vmo, request.perms)?;
+        require_vm_mapping_rights(resolved_vmar, request.perms, false)?;
+        require_vm_mapping_rights(
+            resolved_vmo,
+            request.perms,
+            request.private_clone && matches!(vmo.kind, axle_mm::VmoKind::PagerBacked),
+        )?;
         require_vmar_mapping_caps(vmar.mapping_caps, request.perms, request.specific)?;
         let mut vmo = vmo;
         if let VmoBackingScope::LocalPrivate {
@@ -332,6 +336,7 @@ pub fn vmar_map(
                 vmo_offset,
                 len,
                 request.perms,
+                request.private_clone,
             )
         })?;
         state.apply_tlb_commit_reqs(&[tlb_commit])?;
@@ -398,7 +403,7 @@ pub fn vmar_protect(
             })
         })?;
         let _ = (vmar.process_id, vmar.base, vmar.len);
-        require_vm_mapping_rights(resolved_vmar, perms)?;
+        require_vm_mapping_rights(resolved_vmar, perms, false)?;
         require_vmar_mapping_caps(vmar.mapping_caps, perms, false)?;
         let tlb_commit = state.with_vm_mut(|vm| {
             vm.protect_vmar(vmar.address_space_id, vmar.vmar_id, addr, len, perms)
@@ -420,10 +425,11 @@ pub(super) fn root_vmar_mapping_caps() -> VmarMappingCaps {
 fn require_vm_mapping_rights(
     resolved: crate::task::ResolvedHandle,
     perms: MappingPerms,
+    private_clone: bool,
 ) -> Result<(), zx_status_t> {
     require_handle_rights(resolved, crate::task::HandleRights::MAP)?;
     require_handle_rights(resolved, crate::task::HandleRights::READ)?;
-    if perms.contains(MappingPerms::WRITE) {
+    if perms.contains(MappingPerms::WRITE) && !private_clone {
         require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
     }
     if perms.contains(MappingPerms::EXECUTE) {
@@ -468,11 +474,16 @@ fn mapping_request_from_options(
     options: u32,
     vmar_offset: u64,
 ) -> Result<VmarMappingRequest, zx_status_t> {
-    let allowed = ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_PERM_EXECUTE | ZX_VM_SPECIFIC;
+    let allowed = ZX_VM_PERM_READ
+        | ZX_VM_PERM_WRITE
+        | ZX_VM_PERM_EXECUTE
+        | ZX_VM_PRIVATE_CLONE
+        | ZX_VM_SPECIFIC;
     if (options & !allowed) != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
     let specific = (options & ZX_VM_SPECIFIC) != 0;
+    let private_clone = (options & ZX_VM_PRIVATE_CLONE) != 0;
     if !specific && vmar_offset != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
@@ -480,6 +491,9 @@ fn mapping_request_from_options(
     let has_write = (options & ZX_VM_PERM_WRITE) != 0;
     let has_execute = (options & ZX_VM_PERM_EXECUTE) != 0;
     if !has_read {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if private_clone && !has_write {
         return Err(ZX_ERR_INVALID_ARGS);
     }
 
@@ -490,7 +504,11 @@ fn mapping_request_from_options(
     if has_execute {
         perms |= MappingPerms::EXECUTE;
     }
-    Ok(VmarMappingRequest { perms, specific })
+    Ok(VmarMappingRequest {
+        perms,
+        specific,
+        private_clone,
+    })
 }
 
 fn mapping_perms_from_options(
@@ -601,6 +619,30 @@ mod tests {
             MappingPerms::READ | MappingPerms::EXECUTE | MappingPerms::USER
         );
         assert!(!request.specific);
+        assert!(!request.private_clone);
+    }
+
+    #[test]
+    fn mapping_request_decodes_private_clone() {
+        let request = mapping_request_from_options(
+            ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_PRIVATE_CLONE,
+            0,
+        )
+        .expect("private-clone mapping request should decode");
+
+        assert_eq!(
+            request.perms,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER
+        );
+        assert!(request.private_clone);
+    }
+
+    #[test]
+    fn private_clone_requires_write_permission() {
+        assert!(matches!(
+            mapping_request_from_options(ZX_VM_PERM_READ | ZX_VM_PRIVATE_CLONE, 0),
+            Err(ZX_ERR_INVALID_ARGS)
+        ));
     }
 
     #[test]
@@ -630,9 +672,9 @@ mod tests {
 
     #[test]
     fn execute_without_read_remains_invalid() {
-        assert_eq!(
+        assert!(matches!(
             mapping_request_from_options(ZX_VM_PERM_EXECUTE, 0),
             Err(ZX_ERR_INVALID_ARGS)
-        );
+        ));
     }
 }

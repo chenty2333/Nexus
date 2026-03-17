@@ -503,6 +503,11 @@ pub mod vm {
     pub const AX_VM_PERM_EXECUTE: ax_vm_option_t = 1 << 2;
     /// Native compact VMAR allocation preference.
     pub const AX_VM_COMPACT: ax_vm_option_t = 1 << 3;
+    /// Native private-clone mapping request over one shared pager/file-backed source.
+    ///
+    /// The initial mapping remains read-only in hardware. The first write faults in one
+    /// mapping-local private page without mutating the shared source object.
+    pub const AX_VM_PRIVATE_CLONE: ax_vm_option_t = 1 << 4;
     /// Native upper-bound interpretation for non-specific VMAR allocation.
     pub const AX_VM_OFFSET_IS_UPPER_LIMIT: ax_vm_option_t = 1 << 9;
     /// Native child VMAR may create readable mappings.
@@ -550,6 +555,8 @@ pub mod vm {
     pub const ZX_VM_PERM_EXECUTE: zx_vm_option_t = AX_VM_PERM_EXECUTE as zx_vm_option_t;
     /// Prefer compact placement instead of ASLR-style placement for non-specific VMAR allocation.
     pub const ZX_VM_COMPACT: zx_vm_option_t = AX_VM_COMPACT as zx_vm_option_t;
+    /// Map one shared pager/file-backed VMO through a private copy-on-write view.
+    pub const ZX_VM_PRIVATE_CLONE: zx_vm_option_t = AX_VM_PRIVATE_CLONE as zx_vm_option_t;
     /// Interpret the supplied offset as an upper bound for non-specific VMAR allocation.
     pub const ZX_VM_OFFSET_IS_UPPER_LIMIT: zx_vm_option_t =
         AX_VM_OFFSET_IS_UPPER_LIMIT as zx_vm_option_t;

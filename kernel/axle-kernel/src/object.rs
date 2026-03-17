@@ -27,7 +27,7 @@ use axle_types::status::{
 use axle_types::vm::{
     ZX_VM_ALIGN_BASE, ZX_VM_ALIGN_MASK, ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ,
     ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE, ZX_VM_COMPACT, ZX_VM_OFFSET_IS_UPPER_LIMIT,
-    ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_SPECIFIC,
+    ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_PRIVATE_CLONE, ZX_VM_SPECIFIC,
 };
 use axle_types::zx_signals_t;
 use axle_types::{
@@ -402,6 +402,14 @@ impl VmoObject {
     pub(crate) const fn backing_scope(&self) -> VmoBackingScope {
         self.backing_scope
     }
+
+    pub(crate) const fn kind(&self) -> axle_mm::VmoKind {
+        self.kind
+    }
+
+    pub(crate) const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -414,6 +422,7 @@ struct VmarMappingCaps {
 struct VmarMappingRequest {
     perms: MappingPerms,
     specific: bool,
+    private_clone: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -737,6 +737,7 @@ impl VmFacade {
         vmo_offset: u64,
         len: u64,
         perms: MappingPerms,
+        private_clone: bool,
     ) -> Result<(u64, TlbCommitReq), zx_status_t> {
         self.with_domain_mut(|vm| {
             vm.map_vmo_object_into_vmar(
@@ -748,6 +749,7 @@ impl VmFacade {
                 vmo_offset,
                 len,
                 perms,
+                private_clone,
             )
         })
     }
@@ -2610,6 +2612,7 @@ struct AddressSpace {
     tlb_cpus: TlbCpuTracker,
     strict_tlb_epoch: u64,
     vm_resources: VmResourceState,
+    private_clone_vmos: Vec<VmoId>,
 }
 
 impl AddressSpace {
@@ -2755,6 +2758,7 @@ impl AddressSpace {
             tlb_cpus: TlbCpuTracker::default(),
             strict_tlb_epoch: 0,
             vm_resources: VmResourceState::new(),
+            private_clone_vmos: Vec::new(),
         }
     }
 
@@ -2945,6 +2949,43 @@ impl AddressSpace {
         self.vm.set_vmo_frame(vmo_id, offset, frame_id)
     }
 
+    fn create_private_clone_vmo(
+        &mut self,
+        kind: VmoKind,
+        size: u64,
+        global_vmo_id: KernelVmoId,
+        frames: &[Option<FrameId>],
+    ) -> Result<VmoId, AddressSpaceError> {
+        let vmo_id = self.vm.create_vmo(kind, size, global_vmo_id)?;
+        for (page_index, frame_id) in frames.iter().copied().enumerate() {
+            let Some(frame_id) = frame_id else {
+                continue;
+            };
+            self.vm.set_vmo_frame(
+                vmo_id,
+                (page_index as u64) * crate::userspace::USER_PAGE_BYTES,
+                frame_id,
+            )?;
+        }
+        if !self.private_clone_vmos.contains(&vmo_id) {
+            self.private_clone_vmos.push(vmo_id);
+        }
+        Ok(vmo_id)
+    }
+
+    fn reclaim_unmapped_private_clone_vmos(&mut self) {
+        let tracked = self.private_clone_vmos.clone();
+        for vmo_id in tracked {
+            match self.vm.remove_vmo_if_unmapped(vmo_id) {
+                Ok(true) => {
+                    self.private_clone_vmos
+                        .retain(|candidate| *candidate != vmo_id);
+                }
+                Ok(false) | Err(_) => {}
+            }
+        }
+    }
+
     fn mapped_ranges_for_global_vmo(&self, global_vmo_id: KernelVmoId) -> Vec<(u64, u64)> {
         self.vm.mapped_ranges_for_global_vmo(global_vmo_id)
     }
@@ -2997,7 +3038,9 @@ impl AddressSpace {
         base: u64,
         len: u64,
     ) -> Result<(), AddressSpaceError> {
-        self.vm.unmap_in_vmar(frames, vmar_id, base, len)
+        self.vm.unmap_in_vmar(frames, vmar_id, base, len)?;
+        self.reclaim_unmapped_private_clone_vmos();
+        Ok(())
     }
 
     fn protect(
@@ -6279,6 +6322,7 @@ impl VmDomain {
             tlb_cpus: TlbCpuTracker::default(),
             strict_tlb_epoch: 0,
             vm_resources: VmResourceState::new(),
+            private_clone_vmos: Vec::new(),
         };
         debug_assert!(
             address_space
@@ -6436,6 +6480,37 @@ impl VmDomain {
             crate::object::VmoBackingScope::GlobalShared => self
                 .import_global_vmo_into_address_space(target_address_space_id, vmo.global_vmo_id()),
         }
+    }
+
+    fn create_private_clone_local_vmo_for_mapping(
+        &mut self,
+        target_address_space_id: AddressSpaceId,
+        vmo: &crate::object::VmoObject,
+    ) -> Result<VmoId, zx_status_t> {
+        if !matches!(
+            vmo.backing_scope(),
+            crate::object::VmoBackingScope::GlobalShared
+        ) || vmo.kind() != VmoKind::PagerBacked
+        {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+
+        // Keep one imported shared alias as the canonical global-backed view in this address
+        // space, then create a mapping-local pager shadow that faults through the same source.
+        let _ = self.ensure_vmo_backing_for_mapping(target_address_space_id, vmo)?;
+        let global_vmo = self.global_vmos.lock().snapshot(vmo.global_vmo_id())?;
+        let address_space = self
+            .address_spaces
+            .get_mut(&target_address_space_id)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        address_space
+            .create_private_clone_vmo(
+                global_vmo.source.kind(),
+                global_vmo.size_bytes,
+                vmo.global_vmo_id(),
+                global_vmo.source.frames(),
+            )
+            .map_err(map_address_space_error)
     }
 
     pub(crate) fn promote_vmo_object_to_shared(
@@ -7964,8 +8039,13 @@ impl VmDomain {
         vmo_offset: u64,
         len: u64,
         perms: MappingPerms,
+        private_clone: bool,
     ) -> Result<(u64, TlbCommitReq), zx_status_t> {
-        let local_vmo_id = self.ensure_vmo_backing_for_mapping(address_space_id, vmo)?;
+        let local_vmo_id = if private_clone {
+            self.create_private_clone_local_vmo_for_mapping(address_space_id, vmo)?
+        } else {
+            self.ensure_vmo_backing_for_mapping(address_space_id, vmo)?
+        };
         let frames_handle = self.frame_table();
         let mapped_addr = {
             let address_space = self
@@ -8012,6 +8092,15 @@ impl VmDomain {
                 }
             }
         };
+        if private_clone {
+            let address_space = self
+                .address_spaces
+                .get_mut(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            address_space
+                .arm_copy_on_write(mapped_addr, len)
+                .map_err(map_address_space_error)?;
+        }
         self.install_mapping_pages(address_space_id, mapped_addr, len)?;
         Ok((
             mapped_addr,
@@ -8102,7 +8191,7 @@ impl VmDomain {
             .get(&address_space_id)
             .and_then(|space| space.lookup_user_mapping(page_base, 1))
             .ok_or(ZX_ERR_BAD_STATE)?;
-        if lookup.vmo_kind() != VmoKind::Anonymous {
+        if !lookup.vmo_kind().supports_copy_on_write() {
             return Err(ZX_ERR_BAD_STATE);
         }
         let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
@@ -8755,7 +8844,7 @@ impl VmDomain {
                 .get(&address_space_id)
                 .and_then(|space| space.lookup_user_mapping(fault_va, 1))
                 .ok_or(ZX_ERR_BAD_STATE)?;
-            if lookup.vmo_kind() != VmoKind::Anonymous {
+            if !lookup.vmo_kind().supports_copy_on_write() {
                 return Err(ZX_ERR_BAD_STATE);
             }
             let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;

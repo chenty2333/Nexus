@@ -237,7 +237,9 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - loader-driven `MAP_FIXED` remaps of file-backed segments, including:
       - read-only / executable fixed remaps over reserved file mappings
       - one narrow `MAP_PRIVATE | PROT_WRITE` file-backed path implemented as a
-        private anonymous copy seeded from the source file VMO
+        file-backed VMO map plus kernel private-clone shadow faults
+      - fork still snapshots those private file mappings into child anonymous
+        VMOs so the child sees the parent's current private contents
     - one executive-side protectability view for main-image writable segments
       that are created by the native exec helper instead of the generic `mmap`
       control plane, so loader `mprotect` for main-image RELRO can succeed
