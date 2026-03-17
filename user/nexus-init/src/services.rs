@@ -829,7 +829,7 @@ fn duplicate_handle(handle: zx_handle_t, rights: zx_rights_t) -> Result<zx_handl
         return Err(ZX_ERR_BAD_HANDLE);
     }
     let mut duplicate = ZX_HANDLE_INVALID;
-    let status = axle_arch_x86_64::int80_syscall(
+    let status = axle_arch_x86_64::native_syscall(
         AXLE_SYS_HANDLE_DUPLICATE as u64,
         [
             handle,
@@ -859,7 +859,7 @@ fn create_vmo_with_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
             .map(|rounded| rounded & !mask)
             .ok_or(ZX_ERR_OUT_OF_RANGE)?
     };
-    let status = axle_arch_x86_64::int80_syscall(
+    let status = axle_arch_x86_64::native_syscall(
         AXLE_SYS_VMO_CREATE as u64,
         [size, 0, &mut handle as *mut zx_handle_t as u64, 0, 0, 0],
     );
@@ -867,7 +867,7 @@ fn create_vmo_with_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
         return Err(status);
     }
     if !bytes.is_empty() {
-        let status = axle_arch_x86_64::int80_syscall(
+        let status = axle_arch_x86_64::native_syscall(
             AXLE_SYS_VMO_WRITE as u64,
             [handle, bytes.as_ptr() as u64, 0, bytes.len() as u64, 0, 0],
         );

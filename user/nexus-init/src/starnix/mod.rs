@@ -1217,7 +1217,7 @@ fn zx_vmar_allocate_local(
     out_child_vmar: &mut zx_handle_t,
     out_child_addr: &mut u64,
 ) -> zx_status_t {
-    axle_arch_x86_64::int80_syscall(
+    axle_arch_x86_64::native_syscall(
         AXLE_SYS_VMAR_ALLOCATE as u64,
         [
             parent_vmar,
@@ -1239,7 +1239,7 @@ fn zx_vmar_map_local(
     len: u64,
     mapped_addr: &mut u64,
 ) -> zx_status_t {
-    axle_arch_x86_64::int80_syscall8(
+    axle_arch_x86_64::native_syscall8(
         AXLE_SYS_VMAR_MAP as u64,
         [
             vmar,
@@ -1255,11 +1255,11 @@ fn zx_vmar_map_local(
 }
 
 fn zx_vmar_unmap_local(vmar: zx_handle_t, addr: u64, len: u64) -> zx_status_t {
-    axle_arch_x86_64::int80_syscall(AXLE_SYS_VMAR_UNMAP as u64, [vmar, addr, len, 0, 0, 0])
+    axle_arch_x86_64::native_syscall(AXLE_SYS_VMAR_UNMAP as u64, [vmar, addr, len, 0, 0, 0])
 }
 
 fn zx_vmar_protect_local(vmar: zx_handle_t, options: u32, addr: u64, len: u64) -> zx_status_t {
-    axle_arch_x86_64::int80_syscall(
+    axle_arch_x86_64::native_syscall(
         AXLE_SYS_VMAR_PROTECT as u64,
         [vmar, options as u64, addr, len, 0, 0],
     )

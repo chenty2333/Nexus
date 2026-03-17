@@ -1,6 +1,7 @@
 use axle_core::Packet;
 use axle_types::guest::{
     AX_GUEST_ARCH_X86_64, AX_GUEST_STOP_REASON_X64_SYSCALL, AX_GUEST_STOP_STATE_V1,
+    AX_GUEST_X64_SYSCALL_INSN_LEN,
 };
 use axle_types::status::{
     ZX_ERR_ALREADY_BOUND, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE, ZX_ERR_INVALID_ARGS,
@@ -201,20 +202,68 @@ pub(crate) fn handle_invalid_opcode_trap(
         return finish_guest_trap_resume(state, trap, cpu_frame, true);
     }
 
-    let (thread_id, session_key) = state.with_kernel(|kernel| {
-        let thread = kernel.current_thread_info()?;
-        Ok((
-            thread.thread_id(),
-            state.guest_session_key(thread.thread_id()),
-        ))
-    })?;
-    let Some(session_key) = session_key else {
+    let Some((thread_id, session_key)) = current_guest_session(state)? else {
         return Ok(TrapBlock::Ready(false));
     };
     if !is_syscall_invalid_opcode(cpu_frame.cast_const())? {
         return Ok(TrapBlock::Ready(false));
     }
 
+    handle_guest_syscall_stop(state, trap, cpu_frame, thread_id, session_key, 0)
+}
+
+pub(crate) fn handle_native_syscall_trap(
+    state: &KernelState,
+    trap: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+    resuming_blocked_current: bool,
+) -> Result<TrapBlock<bool>, zx_status_t> {
+    if resuming_blocked_current {
+        return finish_guest_trap_resume(state, trap, cpu_frame, true);
+    }
+
+    let Some((thread_id, session_key)) = current_guest_session(state)? else {
+        return Ok(TrapBlock::Ready(false));
+    };
+    handle_guest_syscall_stop(
+        state,
+        trap,
+        cpu_frame,
+        thread_id,
+        session_key,
+        AX_GUEST_X64_SYSCALL_INSN_LEN,
+    )
+}
+
+fn current_guest_session(state: &KernelState) -> Result<Option<(u64, ObjectKey)>, zx_status_t> {
+    state.with_kernel(|kernel| {
+        let thread = match kernel.current_thread_info() {
+            Ok(thread) => thread,
+            Err(ZX_ERR_BAD_STATE) => return Ok(None),
+            Err(status) => return Err(status),
+        };
+        let guest_started = match kernel.thread_uses_guest_syscall_stop(thread.thread_id()) {
+            Ok(guest_started) => guest_started,
+            Err(ZX_ERR_BAD_STATE) => return Ok(None),
+            Err(status) => return Err(status),
+        };
+        if !guest_started {
+            return Ok(None);
+        }
+        Ok(state
+            .guest_session_key(thread.thread_id())
+            .map(|session_key| (thread.thread_id(), session_key)))
+    })
+}
+
+fn handle_guest_syscall_stop(
+    state: &KernelState,
+    trap: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+    thread_id: u64,
+    session_key: ObjectKey,
+    stop_rip_adjust: u64,
+) -> Result<TrapBlock<bool>, zx_status_t> {
     let session = state.with_objects(|objects| {
         Ok(match objects.get(session_key) {
             Some(KernelObject::GuestSession(session)) => session.clone(),
@@ -225,6 +274,15 @@ pub(crate) fn handle_invalid_opcode_trap(
 
     let (stop_seq, stop_state, disposition, lifecycle_dirty) = state.with_kernel_mut(|kernel| {
         kernel.capture_current_user_context(trap, cpu_frame.cast_const())?;
+        if stop_rip_adjust != 0 {
+            let context = kernel.thread_user_context(thread_id)?;
+            let mut regs = context.to_guest_x64_regs();
+            regs.rip = regs
+                .rip
+                .checked_sub(stop_rip_adjust)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            kernel.replace_thread_guest_context(thread_id, &regs)?;
+        }
         let context = kernel.thread_user_context(thread_id)?;
         let stop_seq = session.stop_seq.saturating_add(1);
         let stop_state = ax_guest_stop_state_t {

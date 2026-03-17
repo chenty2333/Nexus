@@ -87,7 +87,8 @@ Main just targets include:
     - one global steal counter reserved for future L0 migration work; healthy runs currently keep it at zero
   - the same summary now distinguishes syscall dispatch completion from actual return-to-user
     retirement through `sys_enter` / `sys_exit` / `sys_retire` counts for the deterministic
-    null-syscall phase
+    null-syscall phase, and now also pins one native-entry `sys_native_enter` count for that same
+    phase
   - the same runner now proves one explicit `zx_thread_start()` launch onto a different CPU, then
     reuses that peer worker across the phase-3 wake benchmark, the active-peer TLB slice, and the
     same-page fault slice instead of depending on repeated cross-CPU launches
@@ -105,8 +106,8 @@ Main just targets include:
     depending on a second synthetic launch rule
   - the phase-3 wake-path gate is now frozen as a minimum-contract check rather than as one exact
     raw counter:
-    - current L0 runs may land at either `63` or `64` phase-3 remote-wake/handoff/latency events
-      depending on whether one loop edge is already parked
+    - current native-syscall L0 runs now commonly land in the `55..=60` range for the phase-3
+      remote-wake / handoff / latency counters on QEMU
     - the summary therefore exports one derived `trace_sched_phase3_ok` bit while still printing
       the raw phase-3 counters for diagnosis
   - the scenario currently acts as a wiring and attribution gate, not as a stable performance

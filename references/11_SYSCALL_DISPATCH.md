@@ -3,7 +3,7 @@
 Part of the Axle syscall surface.
 
 See also:
-- `10_ARCH_X86_64_STARTUP.md` - `int 0x80` entry path
+- `10_ARCH_X86_64_STARTUP.md` - native `SYSCALL` and legacy `int 0x80` entry paths
 - `12_WAIT_SIGNAL_PORT_TIMER.md` - wait and signal syscall families
 - `20_HANDLE_CAPABILITY.md` - handle validation and rights checks
 - `21_OBJECT_MODEL.md` - object-layer syscall targets
@@ -30,7 +30,11 @@ This file describes the current syscall-number source, trap entry, argument copy
 
 - `kernel/axle-kernel/src/syscall/mod.rs` is the main syscall layer.
 - `dispatch_syscall()` handles supported syscalls from a `[u64; 6]` argument array.
-- `invoke_from_trapframe()` is the architecture-facing path.
+- `invoke_from_trapframe()` is the shared trap-facing path once a logical trap frame exists.
+- `invoke_from_native_syscall()` is the native x86_64 `SYSCALL` entry hook:
+  - it first gives guest-started carrier threads one chance to divert into the generic
+    guest-session stop boundary
+  - ordinary native userspace then falls through to the same shared syscall shell
 - The current bootstrap syscall ABI surface is `49` generated syscall numbers.
 - `AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC` is now the distinct Linux-facing
   exec-prepare helper. It accepts one opaque exec-spec blob and produces the
@@ -56,7 +60,6 @@ This file describes the current syscall-number source, trap entry, argument copy
   - extra syscall stack argument recovery
   - typed pointer / sink decode and output probe planning
   - trap-exit / restartable tail handling through `finish_syscall()`
-- `invoke_from_trapframe()` now does only three things:
 - `invoke_from_trapframe()` now does only four things:
   - build `SyscallCtx`
   - resolve one syscall descriptor by number and invoke it
@@ -118,6 +121,7 @@ The current bootstrap syscall surface includes:
 - Type, rights, pointer, and object-state checks are largely delegated into the object layer after the syscall shell validates raw arguments.
 - A syscall can leave the thread blocked; trap-exit handling then decides whether to return to user mode, switch threads, or block current execution.
 - The bootstrap perf trace now distinguishes:
+  - native entry (`sys_native_enter`)
   - dispatch completion (`sys_exit`)
   - actual return-to-user retirement (`sys_retire`)
   so blocked or scheduler-mediated syscall completion can be observed separately from plain dispatch.
@@ -127,6 +131,9 @@ The current bootstrap syscall surface includes:
 
 ## Current limitations
 
+- The native x86_64 fast path currently shares the same logical trap shell as `int 0x80`; the
+  kernel has not split out a dedicated `sysretq` return path or more aggressive x86 entry
+  specialization yet.
 - Long-lived blocked waits still complete their final user writes in the wake path rather than in the
   original syscall shell. The tightened boundary is:
   - syscall front-end owns pointer decode and probe

@@ -3249,6 +3249,7 @@ enum ProcessState {
 struct Thread {
     process_id: ProcessId,
     koid: zx_koid_t,
+    guest_started: bool,
     guest_fs_base: u64,
     fpu_state: crate::arch::fpu::FxState,
     state: ThreadState,
@@ -3530,6 +3531,7 @@ impl Kernel {
             Thread {
                 process_id,
                 koid: thread_koid,
+                guest_started: false,
                 guest_fs_base: 0,
                 fpu_state: crate::arch::fpu::clean_state(),
                 state: ThreadState::Runnable,
@@ -4380,6 +4382,17 @@ impl Kernel {
             .guest_fs_base)
     }
 
+    pub(crate) fn thread_uses_guest_syscall_stop(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<bool, zx_status_t> {
+        Ok(self
+            .threads
+            .get(&thread_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .guest_started)
+    }
+
     fn validate_thread_guest_start_regs(
         &self,
         process_id: ProcessId,
@@ -4854,6 +4867,7 @@ impl Kernel {
             Thread {
                 process_id,
                 koid,
+                guest_started: false,
                 guest_fs_base: 0,
                 fpu_state: crate::arch::fpu::clean_state(),
                 state: ThreadState::New,
@@ -4907,6 +4921,7 @@ impl Kernel {
         if !matches!(thread.state, ThreadState::New) {
             return Err(ZX_ERR_BAD_STATE);
         }
+        thread.guest_started = false;
         thread.context = Some(UserContext::new_user_entry(entry, stack, arg0, arg1));
         thread.state = ThreadState::Runnable;
         let queued = thread.queued_on_cpu.is_some();
@@ -4979,6 +4994,7 @@ impl Kernel {
         if !matches!(thread.state, ThreadState::New) {
             return Err(ZX_ERR_BAD_STATE);
         }
+        thread.guest_started = true;
         thread.context = Some(
             UserContext::new_user_entry(regs.rip, regs.rsp, 0, 0)
                 .with_guest_x64_regs(*regs)

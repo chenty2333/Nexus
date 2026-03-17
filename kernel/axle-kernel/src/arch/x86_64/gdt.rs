@@ -58,6 +58,17 @@ static GDT: [Once<(GlobalDescriptorTable, Selectors)>; MAX_CPUS] =
     [const { Once::new() }; MAX_CPUS];
 static LOADED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
+pub(crate) fn ring0_stack_top(cpu: usize) -> u64 {
+    assert!(
+        cpu < MAX_CPUS,
+        "gdt: ring0 stack cpu {} exceeds MAX_CPUS",
+        cpu
+    );
+    // SAFETY: ring0 stacks are statically allocated for the kernel lifetime.
+    let stack_start = unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(RING0_STACKS[cpu])) };
+    (stack_start + RING0_STACK_SIZE).as_u64()
+}
+
 /// Initialize and load GDT + TSS.
 ///
 /// Safe to call multiple times per CPU (idempotent).

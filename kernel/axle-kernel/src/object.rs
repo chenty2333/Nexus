@@ -1408,6 +1408,17 @@ pub(crate) fn finish_syscall(
     })
 }
 
+pub(crate) fn handle_native_syscall_entry(
+    trap: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+) -> Result<bool, zx_status_t> {
+    run_trap_blocking(|resuming_blocked_current| {
+        with_state_mut(|state| {
+            guest::handle_native_syscall_trap(state, trap, cpu_frame, resuming_blocked_current)
+        })
+    })
+}
+
 pub(crate) fn finish_timer_interrupt(
     trap: &mut crate::arch::int80::TrapFrame,
     cpu_frame: *mut u64,

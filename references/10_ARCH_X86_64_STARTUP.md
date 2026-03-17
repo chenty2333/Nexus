@@ -3,7 +3,7 @@
 Part of the Axle architecture layer.
 
 See also:
-- `11_SYSCALL_DISPATCH.md` - syscall dispatch reached through `int 0x80`
+- `11_SYSCALL_DISPATCH.md` - syscall dispatch reached through native `SYSCALL` or legacy `int 0x80`
 - `12_WAIT_SIGNAL_PORT_TIMER.md` - timer and trap-side wake behavior
 - `30_PROCESS_THREAD.md` - process and thread execution context
 - `31_PROCESS_THREAD_BOOTSTRAP_LAUNCH.md` - ring3 entry after bootstrap setup
@@ -24,6 +24,7 @@ This file describes the current x86_64-only startup path, trap entry, timer, and
 - CPUID logging
 - GDT / TSS
 - IDT
+- native x86_64 `SYSCALL` entry
 - `int 0x80` syscall entry
 - page-fault / GP fault / double-fault stubs
 - local APIC support
@@ -54,20 +55,26 @@ The kernel then:
 
 ## Syscall entry
 
-- The current userspace ABI enters the kernel through `int 0x80`.
-- The register contract is:
+- Native x86_64 userspace now prefers one `SYSCALL` entry path.
+- The logical syscall register contract remains:
   - `rax` = syscall number
   - `rdi/rsi/rdx/r10/r8/r9` = args 0..5
-- The assembly stub saves a full register snapshot and hands control to the Rust syscall layer.
-- Return status is written back to `rax` before `iretq`.
-- The bootstrap trace stream now exposes three native `int 0x80` edges:
+- The native entry stub currently:
+  - uses `swapgs`
+  - switches to the per-CPU `RSP0` kernel stack
+  - synthesizes the same logical `TrapFrame + cpu_frame` layout used by the legacy trap path
+  - returns through `iretq` after the shared trap-exit machinery finishes
+- The legacy `int 0x80` path still exists for bootstrap compatibility and targeted conformance.
+- The bootstrap trace stream now exposes four syscall edges:
+  - `sys_native_enter` when ring3 entered through native `SYSCALL`
   - `sys_enter` when the trap frame first reaches the syscall layer
   - `sys_exit` after dispatch returns a status
   - `sys_retire` only after trap-exit completion has finished and the thread is about to return to
     user mode
-- There is no `SYSCALL/SYSRET` path yet.
-
-This is a deliberate bootstrap path, not yet a final fast syscall mechanism.
+- The current fast path is intentionally narrow:
+  - native entry exists
+  - return still uses `iretq`, not `sysretq`
+  - PCID / INVPCID / entry-side PMU work are still pending
 
 ## SMP startup
 
@@ -122,11 +129,14 @@ stack preserves nested interrupt frames, while `#PF` / `#GP` still keep a dedica
 ## Current limitations
 
 - The architecture layer is x86_64-only today.
-- The syscall mechanism is `int 0x80`, not yet a later optimized path.
-- `EFER.SCE` still remains disabled. Round-1 supervised guest execution uses ordinary
-  trap/exception handoff instead: an x86_64 guest thread bound to a guest session can execute
-  `syscall`, take `#UD`, and let the kernel hand the stop to a userspace supervisor through the
-  generic guest-session sidecar + port path.
+- Native syscall entry now exists, but the return path is still `iretq` and the broader x86 fast
+  path work is not complete yet.
+- `EFER.SCE` is now enabled on CPUs that advertise native syscall support.
+- x86_64 supervised guest execution now intercepts native `SYSCALL` only for guest-started carrier
+  threads that are still bound to one guest session, then converts that stop into the same generic
+  guest-session sidecar + port handoff used by the wider Starnix executive.
+- The older trap-driven guest-stop helpers remain in-tree as fallback machinery, but they no longer
+  define the native syscall fast path.
 - The architecture layer currently enables only legacy x87/SSE state management. `XSAVE`/AVX and
   wider extended-state contracts are still out of scope.
 - The initial userspace model still uses a fixed bootstrap window and special bootstrap assumptions.

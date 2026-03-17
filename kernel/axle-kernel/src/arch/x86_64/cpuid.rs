@@ -44,6 +44,10 @@ fn detect_caps<R: CpuIdReader>(cpuid: &CpuId<R>) -> CpuCaps {
     caps
 }
 
+pub fn supports_native_syscall() -> bool {
+    detect_caps(&CpuId::new()).contains(CpuCaps::SYSCALL)
+}
+
 pub fn log_boot_cpu_info() {
     let cpuid = CpuId::new();
 

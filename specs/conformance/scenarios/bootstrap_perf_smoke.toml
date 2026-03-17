@@ -41,6 +41,7 @@ trace_sched_phase3_ok = 1
 trace_sys_enter_phase1 = 64
 trace_sys_exit_phase1 = 64
 trace_sys_retire_phase1 = 64
+trace_sys_native_enter_phase1 = 64
 trace_tlb_page_flush_phase4 = 40
 trace_tlb_sync_plan_phase5 = 8
 trace_tlb_shootdown_full_phase5 = 8

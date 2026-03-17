@@ -507,6 +507,18 @@ pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame, cpu_fram
     crate::trace::record_sys_retire(syscall_nr, status);
 }
 
+pub fn invoke_from_native_syscall(
+    frame: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *const u64,
+) {
+    match crate::object::handle_native_syscall_entry(frame, cpu_frame.cast_mut()) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(status) => panic!("native guest syscall entry failed: {status}"),
+    }
+    invoke_from_trapframe(frame, cpu_frame);
+}
+
 fn user_stack_ptr_from_cpu_frame(cpu_frame: *const u64) -> Result<u64, zx_status_t> {
     if cpu_frame.is_null() {
         return Err(ZX_ERR_INVALID_ARGS);

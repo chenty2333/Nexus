@@ -232,7 +232,7 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - no shared-object TLS dependency graph beyond the resolved interpreter
     - no final ELF TLS model or libc TLS runtime contract yet
   - the next dynamic-userspace slice now also has:
-    - one real glibc-linked PIE hello payload running through the packaged
+  - one real glibc-linked PIE hello payload running through the packaged
       `ld-linux` + `libc.so.6` bootstrap path
     - loader-driven `MAP_FIXED` remaps of file-backed segments, including:
       - read-only / executable fixed remaps over reserved file mappings
@@ -248,6 +248,11 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
       - it tracks only writable exec-image ranges that sit outside the normal
         Linux `mmap` arena
       - it does not claim full exec-image `munmap` / remap parity yet
+  - x86_64 carrier threads now stop at the generic guest-session boundary through native
+    `SYSCALL` interception once they have been started as guest carriers:
+    - the kernel rewrites the captured stop RIP back to the syscall instruction boundary
+    - the userspace executive can keep using the same `complete_syscall()` restart model
+    - ordinary native `ax_*` / `zx_*` userspace is not routed through that guest stop path
 
 ## Frozen architectural split
 

@@ -47,6 +47,8 @@ _start:
     syscall
     test %rax, %rax
     js fail
+    // x86_64 SYSCALL clobbers r11; reload the expected mask after the call.
+    mov sigusr1_mask(%rip), %r11
     cmp %r11, 16(%rsp)
     jne fail
 

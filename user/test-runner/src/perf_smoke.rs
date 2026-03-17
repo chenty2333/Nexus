@@ -224,7 +224,7 @@ fn run_perf_smoke() -> PerfSummary {
     write_slot(SLOT_TRACE_PHASE, PHASE_NULL_SYSCALL);
     let null_start = axle_arch_x86_64::rdtsc();
     for _ in 0..NULL_SYSCALL_ITERS {
-        let status = axle_arch_x86_64::int80_syscall(u64::MAX, [0; 6]);
+        let status = axle_arch_x86_64::native_syscall(u64::MAX, [0; 6]);
         if status != ZX_ERR_BAD_SYSCALL {
             summary.null_status = i64::from(status);
             summary.failure_step = STEP_NULL_SYSCALL;
@@ -870,7 +870,7 @@ fn zx_vmar_map_local(
     len: u64,
     mapped_addr: &mut u64,
 ) -> zx_status_t {
-    axle_arch_x86_64::int80_syscall8(
+    axle_arch_x86_64::native_syscall8(
         AXLE_SYS_VMAR_MAP as u64,
         [
             vmar,
@@ -886,14 +886,14 @@ fn zx_vmar_map_local(
 }
 
 fn zx_vmar_protect_local(vmar: zx_handle_t, options: u32, addr: u64, len: u64) -> zx_status_t {
-    axle_arch_x86_64::int80_syscall(
+    axle_arch_x86_64::native_syscall(
         AXLE_SYS_VMAR_PROTECT as u64,
         [vmar, options as u64, addr, len, 0, 0],
     )
 }
 
 fn zx_vmar_unmap_local(vmar: zx_handle_t, addr: u64, len: u64) -> zx_status_t {
-    axle_arch_x86_64::int80_syscall(AXLE_SYS_VMAR_UNMAP as u64, [vmar, addr, len, 0, 0, 0])
+    axle_arch_x86_64::native_syscall(AXLE_SYS_VMAR_UNMAP as u64, [vmar, addr, len, 0, 0, 0])
 }
 
 fn wait_deadline() -> i64 {

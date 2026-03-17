@@ -53,6 +53,7 @@ pub(crate) enum TraceEvent {
     ChannelEnqueue = 25,
     ChannelDequeue = 26,
     ChannelReclaim = 27,
+    SysNativeEnter = 28,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -120,6 +121,7 @@ impl TraceRecord {
             25 => TraceEvent::ChannelEnqueue,
             26 => TraceEvent::ChannelDequeue,
             27 => TraceEvent::ChannelReclaim,
+            28 => TraceEvent::SysNativeEnter,
             _ => TraceEvent::SysEnter,
         }
     }
@@ -138,6 +140,7 @@ static TRACE_SCHED_REMOTE_WAKE_LATENCY_MAX_NS: AtomicU64 = AtomicU64::new(0);
 static TRACE_SYS_ENTER_PHASE1: AtomicU64 = AtomicU64::new(0);
 static TRACE_SYS_EXIT_PHASE1: AtomicU64 = AtomicU64::new(0);
 static TRACE_SYS_RETIRE_PHASE1: AtomicU64 = AtomicU64::new(0);
+static TRACE_SYS_NATIVE_ENTER_PHASE1: AtomicU64 = AtomicU64::new(0);
 static TRACE_CONTEXT_SWITCH_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_TIMER_REPROGRAM_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_TLB_SYNC_PLAN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -224,6 +227,10 @@ pub(crate) fn bootstrap_trace_sys_exit_phase1() -> u64 {
 
 pub(crate) fn bootstrap_trace_sys_retire_phase1() -> u64 {
     TRACE_SYS_RETIRE_PHASE1.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sys_native_enter_phase1() -> u64 {
+    TRACE_SYS_NATIVE_ENTER_PHASE1.load(Ordering::Acquire)
 }
 
 pub(crate) fn bootstrap_trace_context_switch_count() -> u64 {
@@ -358,6 +365,7 @@ pub(crate) fn init_bootstrap_trace() {
     TRACE_SYS_ENTER_PHASE1.store(0, Ordering::Release);
     TRACE_SYS_EXIT_PHASE1.store(0, Ordering::Release);
     TRACE_SYS_RETIRE_PHASE1.store(0, Ordering::Release);
+    TRACE_SYS_NATIVE_ENTER_PHASE1.store(0, Ordering::Release);
     TRACE_CONTEXT_SWITCH_COUNT.store(0, Ordering::Release);
     TRACE_TIMER_REPROGRAM_COUNT.store(0, Ordering::Release);
     TRACE_TLB_SYNC_PLAN_COUNT.store(0, Ordering::Release);
@@ -432,6 +440,15 @@ fn record(category: TraceCategory, event: TraceEvent, arg0: u64, arg1: u64) {
 
 pub(crate) fn record_sys_enter(syscall_nr: u64) {
     record(TraceCategory::Syscall, TraceEvent::SysEnter, syscall_nr, 0);
+}
+
+pub(crate) fn record_sys_native_enter(syscall_nr: u64) {
+    record(
+        TraceCategory::Syscall,
+        TraceEvent::SysNativeEnter,
+        syscall_nr,
+        0,
+    );
 }
 
 pub(crate) fn record_sys_exit(syscall_nr: u64, status: axle_types::zx_status_t) {
@@ -830,6 +847,7 @@ fn event_name(event: TraceEvent) -> &'static str {
         TraceEvent::ChannelEnqueue => "channel_enqueue",
         TraceEvent::ChannelDequeue => "channel_dequeue",
         TraceEvent::ChannelReclaim => "channel_reclaim",
+        TraceEvent::SysNativeEnter => "sys_native_enter",
     }
 }
 
@@ -880,6 +898,13 @@ pub(crate) fn flush_bootstrap_trace() {
         records
             .iter()
             .filter(|record| record.phase == 1 && record.event() == TraceEvent::SysRetire)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_SYS_NATIVE_ENTER_PHASE1.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 1 && record.event() == TraceEvent::SysNativeEnter)
             .count() as u64,
         Ordering::Release,
     );

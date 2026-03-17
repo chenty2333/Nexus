@@ -21,6 +21,7 @@ pub mod pic;
 pub mod pvh;
 pub mod qemu;
 pub mod serial;
+pub mod syscall;
 pub mod timer;
 pub mod tlb;
 pub mod user_tls;
@@ -35,6 +36,7 @@ pub fn init() {
     // Install a real GDT/TSS so ring3 can enter the kernel through the IDT.
     let _ = gdt::init();
     percpu::init();
+    syscall::init_cpu();
     fpu::init_cpu();
 }
 
@@ -46,6 +48,7 @@ pub fn init_ap() {
     let _ = gdt::init();
     idt::load();
     percpu::init();
+    syscall::init_cpu();
     fpu::init_cpu();
     timer::init_ap();
 }
