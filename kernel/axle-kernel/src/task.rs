@@ -3215,6 +3215,9 @@ struct Thread {
     wait: WaitNode,
     context: Option<UserContext>,
     suspend_tokens: u32,
+    remote_wake_enqueued_ns: Option<u64>,
+    remote_wake_source_cpu: Option<usize>,
+    remote_wake_target_cpu: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -3226,6 +3229,11 @@ struct CpuSchedulerState {
     slice_deadline_ns: Option<i64>,
     online: bool,
 }
+
+const RQ_DEPTH_ENQUEUE_BACK: u16 = 1;
+const RQ_DEPTH_ENQUEUE_FRONT: u16 = 2;
+const RQ_DEPTH_DEQUEUE_LOCAL: u16 = 3;
+const RQ_DEPTH_STEAL_TAKE: u16 = 4;
 
 /// Internal bootstrap kernel model.
 #[derive(Debug)]
@@ -3483,6 +3491,9 @@ impl Kernel {
                 wait: WaitNode::default(),
                 context: None,
                 suspend_tokens: 0,
+                remote_wake_enqueued_ns: None,
+                remote_wake_source_cpu: None,
+                remote_wake_target_cpu: None,
             },
         );
         kernel.cpu_schedulers.insert(
@@ -4374,6 +4385,28 @@ impl Kernel {
         match self.current_thread()?.state {
             ThreadState::Runnable => {
                 if resuming_blocked_current {
+                    let current_cpu_id = self.current_cpu_id();
+                    let now_ns = now.max(0) as u64;
+                    let current_thread_id = self.current_thread_id()?;
+                    if let Some(thread) = self.threads.get_mut(&current_thread_id) {
+                        if let (Some(enqueued_ns), Some(source_cpu_id), Some(target_cpu_id)) = (
+                            thread.remote_wake_enqueued_ns,
+                            thread.remote_wake_source_cpu,
+                            thread.remote_wake_target_cpu,
+                        ) {
+                            if target_cpu_id == current_cpu_id {
+                                crate::trace::record_remote_wake_latency(
+                                    current_thread_id,
+                                    source_cpu_id,
+                                    target_cpu_id,
+                                    now_ns.saturating_sub(enqueued_ns),
+                                );
+                            }
+                        }
+                        thread.remote_wake_enqueued_ns = None;
+                        thread.remote_wake_source_cpu = None;
+                        thread.remote_wake_target_cpu = None;
+                    }
                     self.restore_current_user_context(trap, cpu_frame)?;
                     self.arm_current_slice_from(now);
                 } else {
@@ -4771,6 +4804,9 @@ impl Kernel {
                 wait: WaitNode::default(),
                 context: None,
                 suspend_tokens: 0,
+                remote_wake_enqueued_ns: None,
+                remote_wake_source_cpu: None,
+                remote_wake_target_cpu: None,
             },
         );
         Ok((thread_id, koid))
@@ -4823,6 +4859,7 @@ impl Kernel {
             }
             self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
             self.request_reschedule_on_cpu(target_cpu);
+            self.maybe_nudge_idle_stealer(target_cpu);
         }
         Ok(())
     }
@@ -4862,6 +4899,7 @@ impl Kernel {
             }
             self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
             self.request_reschedule_on_cpu(target_cpu);
+            self.maybe_nudge_idle_stealer(target_cpu);
         }
         Ok(())
     }
@@ -5344,6 +5382,42 @@ impl Kernel {
         })
     }
 
+    fn first_idle_cpu_excluding(&self, excluded_cpu_id: usize) -> Option<usize> {
+        self.cpu_schedulers.iter().find_map(|(&cpu_id, scheduler)| {
+            (cpu_id != excluded_cpu_id
+                && scheduler.online
+                && scheduler.current_thread_id.is_none()
+                && scheduler.run_queue.is_empty())
+            .then_some(cpu_id)
+        })
+    }
+
+    fn first_steal_target_cpu_excluding(&self, excluded_cpu_id: usize) -> Option<usize> {
+        self.first_idle_cpu_excluding(excluded_cpu_id)
+    }
+
+    fn note_run_queue_depth(&self, thread_id: ThreadId, cpu_id: usize, op: u16) {
+        let depth = self
+            .cpu_schedulers
+            .get(&cpu_id)
+            .map(|scheduler| scheduler.run_queue.len())
+            .unwrap_or(0);
+        crate::trace::record_run_queue_depth(thread_id, cpu_id, depth, op);
+    }
+
+    fn maybe_nudge_idle_stealer(&mut self, donor_cpu_id: usize) {
+        let donor_busy = self
+            .cpu_schedulers
+            .get(&donor_cpu_id)
+            .is_some_and(|scheduler| scheduler.current_thread_id.is_some());
+        if !donor_busy {
+            return;
+        }
+        if let Some(target_cpu_id) = self.first_steal_target_cpu_excluding(donor_cpu_id) {
+            self.request_reschedule_on_cpu(target_cpu_id);
+        }
+    }
+
     pub(crate) fn mark_cpu_online(&mut self, cpu_id: usize) {
         self.cpu_scheduler_mut(cpu_id).online = true;
     }
@@ -5391,6 +5465,50 @@ impl Kernel {
             return current_cpu_id;
         }
         current_cpu_id
+    }
+
+    fn choose_steal_donor_cpu(&self, receiver_cpu_id: usize) -> Option<usize> {
+        self.cpu_schedulers
+            .iter()
+            .filter(|(cpu_id, scheduler)| {
+                **cpu_id != receiver_cpu_id && scheduler.online && scheduler.run_queue.len() > 1
+            })
+            .max_by_key(|(_, scheduler)| scheduler.run_queue.len())
+            .map(|(&cpu_id, _)| cpu_id)
+    }
+
+    fn steal_runnable_thread(&mut self, receiver_cpu_id: usize) -> Option<ThreadId> {
+        let donor_cpu_id = self.choose_steal_donor_cpu(receiver_cpu_id)?;
+        loop {
+            let thread_id = self.cpu_scheduler_mut(donor_cpu_id).run_queue.pop_back()?;
+            let donor_depth_after = self
+                .cpu_schedulers
+                .get(&donor_cpu_id)
+                .map(|scheduler| scheduler.run_queue.len())
+                .unwrap_or(0);
+            let Some(thread) = self.threads.get_mut(&thread_id) else {
+                continue;
+            };
+            if thread.queued_on_cpu != Some(donor_cpu_id) {
+                continue;
+            }
+            thread.queued_on_cpu = None;
+            thread.remote_wake_enqueued_ns = None;
+            thread.remote_wake_source_cpu = None;
+            thread.remote_wake_target_cpu = None;
+            if !matches!(thread.state, ThreadState::Runnable) {
+                continue;
+            }
+            let _ = thread;
+            self.note_run_queue_depth(thread_id, donor_cpu_id, RQ_DEPTH_STEAL_TAKE);
+            crate::trace::record_sched_steal(
+                thread_id,
+                donor_cpu_id,
+                receiver_cpu_id,
+                donor_depth_after,
+            );
+            return Some(thread_id);
+        }
     }
 
     fn current_cpu_id(&self) -> usize {
@@ -5593,6 +5711,7 @@ impl Kernel {
         let target_cpu = self.choose_wake_cpu(thread_id);
         self.enqueue_runnable_thread_on_cpu(thread_id, target_cpu)?;
         self.request_reschedule_on_cpu(target_cpu);
+        self.maybe_nudge_idle_stealer(target_cpu);
         Ok(())
     }
 
@@ -5605,15 +5724,27 @@ impl Kernel {
         thread_id: ThreadId,
         cpu_id: usize,
     ) -> Result<(), zx_status_t> {
+        let current_cpu_id = self.current_cpu_id();
+        let enqueue_ns = self.current_cpu_now_ns().max(0) as u64;
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         if thread.queued_on_cpu.is_some() || !matches!(thread.state, ThreadState::Runnable) {
             return Ok(());
         }
         thread.queued_on_cpu = Some(cpu_id);
+        if cpu_id != current_cpu_id {
+            thread.remote_wake_enqueued_ns = Some(enqueue_ns);
+            thread.remote_wake_source_cpu = Some(current_cpu_id);
+            thread.remote_wake_target_cpu = Some(cpu_id);
+        } else {
+            thread.remote_wake_enqueued_ns = None;
+            thread.remote_wake_source_cpu = None;
+            thread.remote_wake_target_cpu = None;
+        }
         let _ = thread;
         self.cpu_scheduler_mut(cpu_id)
             .run_queue
             .push_back(thread_id);
+        self.note_run_queue_depth(thread_id, cpu_id, RQ_DEPTH_ENQUEUE_BACK);
         Ok(())
     }
 
@@ -5626,15 +5757,35 @@ impl Kernel {
         thread_id: ThreadId,
         cpu_id: usize,
     ) -> Result<(), zx_status_t> {
+        let current_cpu_id = self.current_cpu_id();
+        let enqueue_ns = self.current_cpu_now_ns().max(0) as u64;
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         if thread.queued_on_cpu.is_some() || !matches!(thread.state, ThreadState::Runnable) {
             return Ok(());
         }
         thread.queued_on_cpu = Some(cpu_id);
+        if cpu_id != current_cpu_id {
+            thread.remote_wake_enqueued_ns = Some(enqueue_ns);
+            thread.remote_wake_source_cpu = Some(current_cpu_id);
+            thread.remote_wake_target_cpu = Some(cpu_id);
+        } else {
+            thread.remote_wake_enqueued_ns = None;
+            thread.remote_wake_source_cpu = None;
+            thread.remote_wake_target_cpu = None;
+        }
         let _ = thread;
         self.cpu_scheduler_mut(cpu_id)
             .run_queue
             .push_front(thread_id);
+        self.note_run_queue_depth(thread_id, cpu_id, RQ_DEPTH_ENQUEUE_FRONT);
+        crate::trace::record_sched_handoff(
+            thread_id,
+            cpu_id,
+            self.cpu_schedulers
+                .get(&cpu_id)
+                .map(|scheduler| scheduler.run_queue.len())
+                .unwrap_or(0),
+        );
         Ok(())
     }
 
@@ -5650,6 +5801,7 @@ impl Kernel {
                 .cpu_scheduler_mut(current_cpu_id)
                 .run_queue
                 .pop_front()?;
+            self.note_run_queue_depth(thread_id, current_cpu_id, RQ_DEPTH_DEQUEUE_LOCAL);
             let Some(thread) = self.threads.get_mut(&thread_id) else {
                 continue;
             };
@@ -5663,11 +5815,18 @@ impl Kernel {
         }
     }
 
+    fn take_next_runnable_thread_for_current_cpu(&mut self) -> Option<ThreadId> {
+        let current_cpu_id = self.current_cpu_id();
+        self.pop_runnable_thread()
+            .or_else(|| self.steal_runnable_thread(current_cpu_id))
+    }
+
     fn activate_thread_on_current_cpu(
         &mut self,
         thread_id: ThreadId,
     ) -> Result<UserContext, zx_status_t> {
         let current_cpu_id = self.current_cpu_id();
+        let activation_now_ns = self.current_cpu_now_ns().max(0) as u64;
         let previous_thread_id = self.current_cpu_scheduler()?.current_thread_id;
         let current_address_space_id = if let Some(current_thread_id) = previous_thread_id {
             let process_id = self
@@ -5706,6 +5865,23 @@ impl Kernel {
         self.arm_current_slice_from(self.current_cpu_now_ns());
         crate::trace::record_context_switch(previous_thread_id, thread_id, address_space_switched);
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if let (Some(enqueued_ns), Some(source_cpu_id), Some(target_cpu_id)) = (
+            thread.remote_wake_enqueued_ns,
+            thread.remote_wake_source_cpu,
+            thread.remote_wake_target_cpu,
+        ) {
+            if target_cpu_id == current_cpu_id {
+                crate::trace::record_remote_wake_latency(
+                    thread_id,
+                    source_cpu_id,
+                    target_cpu_id,
+                    activation_now_ns.saturating_sub(enqueued_ns),
+                );
+            }
+        }
+        thread.remote_wake_enqueued_ns = None;
+        thread.remote_wake_source_cpu = None;
+        thread.remote_wake_target_cpu = None;
         thread.last_cpu = current_cpu_id;
         Ok(context)
     }
@@ -5719,7 +5895,7 @@ impl Kernel {
             return Err(ZX_ERR_BAD_STATE);
         }
         let _ = self.take_reschedule_requested(current_cpu_id);
-        let Some(thread_id) = self.pop_runnable_thread() else {
+        let Some(thread_id) = self.take_next_runnable_thread_for_current_cpu() else {
             return Ok(None);
         };
         let context = self.activate_thread_on_current_cpu(thread_id)?;
@@ -5804,6 +5980,17 @@ impl Kernel {
             return Ok(());
         }
         if let Some(cpu_id) = running_cpu_id {
+            if cpu_id != self.current_cpu_id() {
+                let now_ns = self.current_cpu_now_ns().max(0) as u64;
+                let source_cpu_id = self.current_cpu_id();
+                let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+                thread.remote_wake_enqueued_ns = Some(now_ns);
+                thread.remote_wake_source_cpu = Some(source_cpu_id);
+                thread.remote_wake_target_cpu = Some(cpu_id);
+                let _ = thread;
+                crate::trace::record_remote_wake(thread_id, cpu_id);
+                crate::trace::record_sched_handoff(thread_id, cpu_id, 0);
+            }
             self.request_reschedule_on_cpu(cpu_id);
             return Ok(());
         }
@@ -5818,6 +6005,7 @@ impl Kernel {
                 self.enqueue_runnable_thread_on_cpu(thread_id, target_cpu)?;
             }
             self.request_reschedule_on_cpu(target_cpu);
+            self.maybe_nudge_idle_stealer(target_cpu);
         } else if let Some(cpu_id) = queued_on_cpu {
             self.request_reschedule_on_cpu(cpu_id);
         }

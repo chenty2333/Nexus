@@ -29,6 +29,9 @@ This file describes the current task-state, scheduler, kill, suspend, and reap b
 - Wakeup targeting is now CPU-aware, but scheduling policy is still intentionally simple.
 - Wakeup targeting now honors a thread's preferred / last CPU before opportunistically handing work
   to some other idle CPU.
+- When a runnable thread is queued onto a busy CPU and another CPU is already idle, the donor may
+  also poke that idle peer so one honest idle-steal path can drain backlog without overriding
+  wake-affine / first-run placement.
 - Brand-new threads still inherit the creator CPU as `last_cpu`.
 - `start_thread()` / `start_thread_guest()` currently follow the same preferred-CPU / wake-affine
   rules as ordinary wakeups; there is no special remote-first launch exception.
@@ -68,6 +71,13 @@ Processes currently move through states such as:
   `make_thread_runnable()`.
 - Wakeups from blocked states are still pushed to the front of the selected CPU run queue.
 - Remote wakeup may target another CPU and request a fixed-vector reschedule IPI.
+- A CPU with no local runnable work may now pull one runnable thread from another CPU only from the
+  idle loop, when the local CPU has no current thread and no local queued work.
+- Scheduler tracing now exports:
+  - run-queue depth changes
+  - steal events
+  - blocked-wake handoff events
+  - remote-wake latency, including the direct blocked-current resume path that does not enqueue
 - The deadline backend is per-CPU at the storage layer.
 - When x86_64 TSC-deadline timers are available, each online CPU now drives its own scheduler tick,
   timeout polling, and local slice accounting.
@@ -109,6 +119,10 @@ The first "non-bootstrap substrate" scheduler contract is now implemented.
 - Required end-state:
   - one runnable-state owner and run queue per CPU
   - remote wakeup may enqueue work on another CPU and request a reschedule IPI
+  - a waking CPU may still preserve wake-affine / first-run placement on the donor CPU while
+    nudging an already-idle peer to steal backlog through one explicit idle path
+  - one CPU carrying a blocked current thread may still resume that current thread directly without
+    queueing, but the remote wake and wake-to-resume latency must remain observable
   - signal, port, futex, fault, timer, and timeout completion all converge on one blocked-to-runnable handoff path
   - trap-exit, timeout, and wake paths may preempt or reschedule, but must not lose one completed wake
   - the current global run queue is bootstrap scaffolding, not a compatibility contract
@@ -119,9 +133,12 @@ The first "non-bootstrap substrate" scheduler contract is now implemented.
 ## Current limitations
 
 - Blocked current execution still relies on `sti; hlt` when the current CPU has no runnable work.
-- Cross-CPU load balancing and work stealing do not exist yet.
-- Bootstrap perf smoke therefore no longer depends on a synthetic "first run goes remote" launch
-  rule just to force an active-peer TLB phase; that shape would be a scheduler policy shortcut, not
-  a safe L0 contract.
+- The cross-CPU runnable path is still narrow:
+  - one best-effort single-thread steal, not batch balancing
+  - idle-loop-only steal rather than general blocked-current or fairness-driven migration
+  - no periodic rebalance
+  - no fairness-aware migration policy
+- Bootstrap perf smoke now proves the active-peer TLB phase without a synthetic remote-first launch
+  rule, but it still acts as a shape / attribution gate rather than as a throughput threshold.
 - Scheduler fairness is still simple fixed-slice FIFO/RR rather than a richer policy such as
   weighted fairness or vruntime tracking.

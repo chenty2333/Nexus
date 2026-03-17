@@ -45,6 +45,10 @@ pub(crate) enum TraceEvent {
     FaultBlock = 18,
     FaultResume = 19,
     FaultUnhandled = 20,
+    RunQueueDepth = 21,
+    Steal = 22,
+    Handoff = 23,
+    RemoteWakeLatency = 24,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -104,6 +108,10 @@ impl TraceRecord {
             18 => TraceEvent::FaultBlock,
             19 => TraceEvent::FaultResume,
             20 => TraceEvent::FaultUnhandled,
+            21 => TraceEvent::RunQueueDepth,
+            22 => TraceEvent::Steal,
+            23 => TraceEvent::Handoff,
+            24 => TraceEvent::RemoteWakeLatency,
             _ => TraceEvent::SysEnter,
         }
     }
@@ -114,6 +122,11 @@ static TRACE_RECORD_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_EXPORTED_BYTES: AtomicU64 = AtomicU64::new(0);
 static TRACE_REMOTE_WAKE_PHASE3: AtomicU64 = AtomicU64::new(0);
+static TRACE_SCHED_MAX_RUN_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static TRACE_SCHED_STEAL_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_SCHED_HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_SCHED_REMOTE_WAKE_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRACE_SCHED_REMOTE_WAKE_LATENCY_MAX_NS: AtomicU64 = AtomicU64::new(0);
 static TRACE_SYS_ENTER_PHASE1: AtomicU64 = AtomicU64::new(0);
 static TRACE_SYS_EXIT_PHASE1: AtomicU64 = AtomicU64::new(0);
 static TRACE_SYS_RETIRE_PHASE1: AtomicU64 = AtomicU64::new(0);
@@ -137,6 +150,10 @@ static TRACE_FAULT_HANDLED_PHASE6: AtomicU64 = AtomicU64::new(0);
 static TRACE_FAULT_BLOCK_PHASE6: AtomicU64 = AtomicU64::new(0);
 static TRACE_FAULT_RESUME_PHASE6: AtomicU64 = AtomicU64::new(0);
 static TRACE_FAULT_UNHANDLED_PHASE6: AtomicU64 = AtomicU64::new(0);
+static TRACE_SCHED_STEAL_PHASE3: AtomicU64 = AtomicU64::new(0);
+static TRACE_SCHED_HANDOFF_PHASE3: AtomicU64 = AtomicU64::new(0);
+static TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3: AtomicU64 = AtomicU64::new(0);
+static TRACE_SCHED_STEAL_PHASE5: AtomicU64 = AtomicU64::new(0);
 static mut TRACE_RECORDS: [TraceRecord; TRACE_RECORD_CAPACITY] =
     [TraceRecord::ZERO; TRACE_RECORD_CAPACITY];
 
@@ -164,6 +181,26 @@ pub(crate) fn bootstrap_trace_exported_bytes() -> u64 {
 
 pub(crate) fn bootstrap_trace_remote_wake_phase3() -> u64 {
     TRACE_REMOTE_WAKE_PHASE3.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sched_max_run_queue_depth() -> u64 {
+    TRACE_SCHED_MAX_RUN_QUEUE_DEPTH.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sched_steal_count() -> u64 {
+    TRACE_SCHED_STEAL_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sched_handoff_count() -> u64 {
+    TRACE_SCHED_HANDOFF_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sched_remote_wake_latency_count() -> u64 {
+    TRACE_SCHED_REMOTE_WAKE_LATENCY_COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sched_remote_wake_latency_max_ns() -> u64 {
+    TRACE_SCHED_REMOTE_WAKE_LATENCY_MAX_NS.load(Ordering::Acquire)
 }
 
 pub(crate) fn bootstrap_trace_sys_enter_phase1() -> u64 {
@@ -258,6 +295,22 @@ pub(crate) fn bootstrap_trace_fault_unhandled_phase6() -> u64 {
     TRACE_FAULT_UNHANDLED_PHASE6.load(Ordering::Acquire)
 }
 
+pub(crate) fn bootstrap_trace_sched_steal_phase3() -> u64 {
+    TRACE_SCHED_STEAL_PHASE3.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sched_handoff_phase3() -> u64 {
+    TRACE_SCHED_HANDOFF_PHASE3.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sched_remote_wake_latency_phase3() -> u64 {
+    TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3.load(Ordering::Acquire)
+}
+
+pub(crate) fn bootstrap_trace_sched_steal_phase5() -> u64 {
+    TRACE_SCHED_STEAL_PHASE5.load(Ordering::Acquire)
+}
+
 pub(crate) fn note_tlb_active_mask(active_cpu_mask: u64) {
     if !trace_enabled() {
         return;
@@ -274,6 +327,11 @@ pub(crate) fn init_bootstrap_trace() {
     TRACE_DROPPED_COUNT.store(0, Ordering::Release);
     TRACE_EXPORTED_BYTES.store(0, Ordering::Release);
     TRACE_REMOTE_WAKE_PHASE3.store(0, Ordering::Release);
+    TRACE_SCHED_MAX_RUN_QUEUE_DEPTH.store(0, Ordering::Release);
+    TRACE_SCHED_STEAL_COUNT.store(0, Ordering::Release);
+    TRACE_SCHED_HANDOFF_COUNT.store(0, Ordering::Release);
+    TRACE_SCHED_REMOTE_WAKE_LATENCY_COUNT.store(0, Ordering::Release);
+    TRACE_SCHED_REMOTE_WAKE_LATENCY_MAX_NS.store(0, Ordering::Release);
     TRACE_SYS_ENTER_PHASE1.store(0, Ordering::Release);
     TRACE_SYS_EXIT_PHASE1.store(0, Ordering::Release);
     TRACE_SYS_RETIRE_PHASE1.store(0, Ordering::Release);
@@ -297,6 +355,10 @@ pub(crate) fn init_bootstrap_trace() {
     TRACE_FAULT_BLOCK_PHASE6.store(0, Ordering::Release);
     TRACE_FAULT_RESUME_PHASE6.store(0, Ordering::Release);
     TRACE_FAULT_UNHANDLED_PHASE6.store(0, Ordering::Release);
+    TRACE_SCHED_STEAL_PHASE3.store(0, Ordering::Release);
+    TRACE_SCHED_HANDOFF_PHASE3.store(0, Ordering::Release);
+    TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3.store(0, Ordering::Release);
+    TRACE_SCHED_STEAL_PHASE5.store(0, Ordering::Release);
     // SAFETY: resetting the bootstrap trace ring happens before userspace starts
     // producing trace records for this run, so no concurrent writers can observe
     // partially cleared records. Each slot is written through a raw pointer to
@@ -370,6 +432,73 @@ pub(crate) fn record_remote_wake(thread_id: u64, target_cpu: usize) {
         TraceEvent::RemoteWake,
         thread_id,
         target_cpu as u64,
+    );
+}
+
+pub(crate) fn record_run_queue_depth(thread_id: u64, queue_cpu_id: usize, depth: usize, op: u16) {
+    if !trace_enabled() {
+        return;
+    }
+    let _ = TRACE_SCHED_MAX_RUN_QUEUE_DEPTH.fetch_max(depth as u64, Ordering::AcqRel);
+    record(
+        TraceCategory::Sched,
+        TraceEvent::RunQueueDepth,
+        thread_id,
+        u64::from(queue_cpu_id as u16) | (u64::from(op) << 16) | ((depth as u64) << 32),
+    );
+}
+
+pub(crate) fn record_sched_steal(
+    thread_id: u64,
+    donor_cpu_id: usize,
+    receiver_cpu_id: usize,
+    donor_depth_after: usize,
+) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_SCHED_STEAL_COUNT.fetch_add(1, Ordering::AcqRel);
+    record(
+        TraceCategory::Sched,
+        TraceEvent::Steal,
+        thread_id,
+        u64::from(donor_cpu_id as u16)
+            | (u64::from(receiver_cpu_id as u16) << 16)
+            | ((donor_depth_after as u64) << 32),
+    );
+}
+
+pub(crate) fn record_sched_handoff(thread_id: u64, target_cpu_id: usize, queue_depth: usize) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_SCHED_HANDOFF_COUNT.fetch_add(1, Ordering::AcqRel);
+    record(
+        TraceCategory::Sched,
+        TraceEvent::Handoff,
+        thread_id,
+        u64::from(target_cpu_id as u16) | ((queue_depth as u64) << 32),
+    );
+}
+
+pub(crate) fn record_remote_wake_latency(
+    thread_id: u64,
+    source_cpu_id: usize,
+    target_cpu_id: usize,
+    latency_ns: u64,
+) {
+    if !trace_enabled() {
+        return;
+    }
+    TRACE_SCHED_REMOTE_WAKE_LATENCY_COUNT.fetch_add(1, Ordering::AcqRel);
+    let _ = TRACE_SCHED_REMOTE_WAKE_LATENCY_MAX_NS.fetch_max(latency_ns, Ordering::AcqRel);
+    record(
+        TraceCategory::Sched,
+        TraceEvent::RemoteWakeLatency,
+        thread_id,
+        u64::from(source_cpu_id as u16)
+            | (u64::from(target_cpu_id as u16) << 16)
+            | ((latency_ns & 0xffff_ffff) << 32),
     );
 }
 
@@ -640,6 +769,10 @@ fn event_name(event: TraceEvent) -> &'static str {
         TraceEvent::FaultBlock => "fault_block",
         TraceEvent::FaultResume => "fault_resume",
         TraceEvent::FaultUnhandled => "fault_unhandled",
+        TraceEvent::RunQueueDepth => "rq_depth",
+        TraceEvent::Steal => "steal",
+        TraceEvent::Handoff => "handoff",
+        TraceEvent::RemoteWakeLatency => "remote_wake_latency",
     }
 }
 
@@ -651,6 +784,27 @@ pub(crate) fn flush_bootstrap_trace() {
         .filter(|record| record.phase == 3 && record.event() == TraceEvent::RemoteWake)
         .count() as u64;
     TRACE_REMOTE_WAKE_PHASE3.store(remote_wake_phase3, Ordering::Release);
+    TRACE_SCHED_STEAL_PHASE3.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 3 && record.event() == TraceEvent::Steal)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_SCHED_HANDOFF_PHASE3.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 3 && record.event() == TraceEvent::Handoff)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 3 && record.event() == TraceEvent::RemoteWakeLatency)
+            .count() as u64,
+        Ordering::Release,
+    );
     TRACE_SYS_ENTER_PHASE1.store(
         records
             .iter()
@@ -704,6 +858,13 @@ pub(crate) fn flush_bootstrap_trace() {
         records
             .iter()
             .filter(|record| record.phase == 5 && record.event() == TraceEvent::TlbShootdownAll)
+            .count() as u64,
+        Ordering::Release,
+    );
+    TRACE_SCHED_STEAL_PHASE5.store(
+        records
+            .iter()
+            .filter(|record| record.phase == 5 && record.event() == TraceEvent::Steal)
             .count() as u64,
         Ordering::Release,
     );

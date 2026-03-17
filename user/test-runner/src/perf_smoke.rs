@@ -1,4 +1,5 @@
 use core::alloc::{GlobalAlloc, Layout};
+use core::arch::x86_64::__cpuid;
 use core::hint::spin_loop;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -69,10 +70,9 @@ const TLB_CHURN_BYTES: u64 = 4096;
 const WORKER_STACK_BYTES: usize = 4096;
 const HEAP_BYTES: usize = 64 * 1024;
 const WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
-const TLB_WORKER_STATE_INIT: u64 = 0;
-const TLB_WORKER_STATE_READY: u64 = 1;
-const TLB_WORKER_STATE_STOP: u64 = 2;
-
+const WORKER_READY_TIMEOUT_CYCLES: u64 = 2_000_000_000;
+const CROSS_CORE_START_ATTEMPTS: usize = 8;
+const CPU_ID_UNKNOWN: u64 = u64::MAX;
 #[repr(align(16))]
 struct WorkerStack([u8; WORKER_STACK_BYTES]);
 #[repr(align(16))]
@@ -84,10 +84,10 @@ struct BumpAllocator;
 static ALLOCATOR: BumpAllocator = BumpAllocator;
 
 static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
-static TLB_WORKER_STATE: AtomicU64 = AtomicU64::new(TLB_WORKER_STATE_INIT);
+static ROUNDTRIP_WORKER_READY: AtomicU64 = AtomicU64::new(0);
+static ROUNDTRIP_WORKER_CPU: AtomicU64 = AtomicU64::new(CPU_ID_UNKNOWN);
 static mut WAIT_WORKER_STACK: WorkerStack = WorkerStack([0; WORKER_STACK_BYTES]);
 static mut WAKE_WORKER_STACK: WorkerStack = WorkerStack([0; WORKER_STACK_BYTES]);
-static mut TLB_WORKER_STACK: WorkerStack = WorkerStack([0; WORKER_STACK_BYTES]);
 static mut FAULT_WORKER_STACK: WorkerStack = WorkerStack([0; WORKER_STACK_BYTES]);
 static mut HEAP: HeapStorage = HeapStorage([0; HEAP_BYTES]);
 
@@ -183,6 +183,19 @@ struct RoundtripResult {
     eventpair_create: i64,
 }
 
+#[derive(Clone, Copy, Default)]
+struct CrossCoreWorker {
+    worker_thread: zx_handle_t,
+    main_ep: zx_handle_t,
+    worker_ep: zx_handle_t,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CrossCoreRoundtrip {
+    result: RoundtripResult,
+    worker: CrossCoreWorker,
+}
+
 fn run_perf_smoke() -> PerfSummary {
     let mut summary = PerfSummary::default();
     let self_process = read_slot(SLOT_SELF_PROCESS_H) as zx_handle_t;
@@ -222,19 +235,19 @@ fn run_perf_smoke() -> PerfSummary {
         return summary;
     }
 
-    let wake = run_eventpair_roundtrip(
+    let wake = run_cross_core_eventpair_roundtrip(
         self_process,
         PHASE_WAKEUP,
         WAKE_ITERS,
         wake_worker_stack_top(),
     );
-    summary.thread_create = wake.thread_create;
-    summary.thread_start = wake.thread_start;
-    summary.eventpair_create = wake.eventpair_create;
-    summary.wake_status = wake.status;
+    summary.thread_create = wake.result.thread_create;
+    summary.thread_start = wake.result.thread_start;
+    summary.eventpair_create = wake.result.eventpair_create;
+    summary.wake_status = wake.result.status;
     summary.wake_iters = WAKE_ITERS;
-    summary.wake_cycles = wake.cycles;
-    if wake.status != ZX_OK as i64 {
+    summary.wake_cycles = wake.result.cycles;
+    if wake.result.status != ZX_OK as i64 {
         summary.failure_step = STEP_WAKEUP;
         write_slot(SLOT_TRACE_PHASE, 0);
         return summary;
@@ -245,15 +258,17 @@ fn run_perf_smoke() -> PerfSummary {
     summary.tlb_iters = TLB_ITERS;
     summary.tlb_cycles = tlb.cycles;
     if tlb.status != ZX_OK as i64 {
+        close_cross_core_worker(wake.worker);
         summary.failure_step = STEP_TLB_CHURN;
         write_slot(SLOT_TRACE_PHASE, 0);
         return summary;
     }
 
-    let tlb_peer = run_tlb_active_peer(self_process, root_vmar, TLB_ACTIVE_PEER_ITERS);
+    let tlb_peer = run_tlb_active_peer(root_vmar, TLB_ACTIVE_PEER_ITERS);
     summary.tlb_peer_status = tlb_peer.status;
     summary.tlb_peer_iters = TLB_ACTIVE_PEER_ITERS;
     summary.tlb_peer_cycles = tlb_peer.cycles;
+    close_cross_core_worker(wake.worker);
     if tlb_peer.status != ZX_OK as i64 {
         summary.failure_step = STEP_TLB_ACTIVE_PEER;
         write_slot(SLOT_TRACE_PHASE, 0);
@@ -335,8 +350,150 @@ fn run_eventpair_roundtrip(
     result
 }
 
+fn run_cross_core_eventpair_roundtrip(
+    process: zx_handle_t,
+    phase: u64,
+    iterations: u64,
+    worker_stack_top: u64,
+) -> CrossCoreRoundtrip {
+    let mut result = RoundtripResult::default();
+    let mut worker = CrossCoreWorker::default();
+    for attempt in 0..CROSS_CORE_START_ATTEMPTS {
+        let mut main_ep: zx_handle_t = 0;
+        let mut worker_ep: zx_handle_t = 0;
+        result.eventpair_create = zx_eventpair_create(0, &mut main_ep, &mut worker_ep) as i64;
+        if result.eventpair_create != ZX_OK as i64 {
+            result.status = result.eventpair_create;
+            return CrossCoreRoundtrip { result, worker };
+        }
+
+        let mut worker_thread: zx_handle_t = 0;
+        result.thread_create = zx_thread_create(process, 0, &mut worker_thread) as i64;
+        if result.thread_create != ZX_OK as i64 {
+            result.status = result.thread_create;
+            let _ = zx_handle_close(worker_ep);
+            let _ = zx_handle_close(main_ep);
+            return CrossCoreRoundtrip { result, worker };
+        }
+
+        ROUNDTRIP_WORKER_CPU.store(CPU_ID_UNKNOWN, Ordering::Release);
+        ROUNDTRIP_WORKER_READY.store(0, Ordering::Release);
+        result.thread_start = zx_thread_start(
+            worker_thread,
+            roundtrip_worker_entry as *const () as usize as u64,
+            worker_stack_top,
+            worker_ep,
+            iterations,
+        ) as i64;
+        if result.thread_start != ZX_OK as i64 {
+            result.status = result.thread_start;
+            let _ = zx_handle_close(worker_thread);
+            let _ = zx_handle_close(worker_ep);
+            let _ = zx_handle_close(main_ep);
+            return CrossCoreRoundtrip { result, worker };
+        }
+
+        if !wait_for_atomic_value(&ROUNDTRIP_WORKER_READY, 1) {
+            result.status = -11;
+            let _ = zx_task_kill(worker_thread);
+            let _ = zx_handle_close(worker_thread);
+            let _ = zx_handle_close(worker_ep);
+            let _ = zx_handle_close(main_ep);
+            return CrossCoreRoundtrip { result, worker };
+        }
+
+        if ROUNDTRIP_WORKER_CPU.load(Ordering::Acquire) == current_cpu_apic_id() {
+            let _ = zx_task_kill(worker_thread);
+            let mut terminated_observed: zx_signals_t = 0;
+            let _ = zx_object_wait_one(
+                worker_thread,
+                ZX_TASK_TERMINATED,
+                wait_deadline(),
+                &mut terminated_observed,
+            );
+            let _ = zx_handle_close(worker_thread);
+            let _ = zx_handle_close(worker_ep);
+            let _ = zx_handle_close(main_ep);
+            if attempt + 1 == CROSS_CORE_START_ATTEMPTS {
+                result.status = -12;
+                return CrossCoreRoundtrip { result, worker };
+            }
+            continue;
+        }
+
+        write_slot(SLOT_TRACE_PHASE, phase);
+        let start = axle_arch_x86_64::rdtsc();
+        for _ in 0..iterations {
+            if zx_object_signal_peer(main_ep, 0, ZX_USER_SIGNAL_0) != ZX_OK {
+                result.status = -1;
+                write_slot(SLOT_TRACE_PHASE, 0);
+                let _ = zx_task_kill(worker_thread);
+                let _ = zx_handle_close(worker_thread);
+                let _ = zx_handle_close(worker_ep);
+                let _ = zx_handle_close(main_ep);
+                return CrossCoreRoundtrip { result, worker };
+            }
+            let mut observed: zx_signals_t = 0;
+            let status =
+                zx_object_wait_one(main_ep, ZX_USER_SIGNAL_0, wait_deadline(), &mut observed);
+            if status != ZX_OK {
+                result.status = status as i64;
+                write_slot(SLOT_TRACE_PHASE, 0);
+                let _ = zx_task_kill(worker_thread);
+                let _ = zx_handle_close(worker_thread);
+                let _ = zx_handle_close(worker_ep);
+                let _ = zx_handle_close(main_ep);
+                return CrossCoreRoundtrip { result, worker };
+            }
+            if zx_object_signal(main_ep, ZX_USER_SIGNAL_0, 0) != ZX_OK {
+                result.status = -2;
+                write_slot(SLOT_TRACE_PHASE, 0);
+                let _ = zx_task_kill(worker_thread);
+                let _ = zx_handle_close(worker_thread);
+                let _ = zx_handle_close(worker_ep);
+                let _ = zx_handle_close(main_ep);
+                return CrossCoreRoundtrip { result, worker };
+            }
+        }
+        result.cycles = axle_arch_x86_64::rdtsc().wrapping_sub(start);
+        result.status = ZX_OK as i64;
+        write_slot(SLOT_TRACE_PHASE, 0);
+        worker = CrossCoreWorker {
+            worker_thread,
+            main_ep,
+            worker_ep,
+        };
+        return CrossCoreRoundtrip { result, worker };
+    }
+
+    result.status = -12;
+    CrossCoreRoundtrip { result, worker }
+}
+
+fn close_cross_core_worker(worker: CrossCoreWorker) {
+    if worker.worker_thread != 0 {
+        let _ = zx_task_kill(worker.worker_thread);
+        let mut terminated_observed: zx_signals_t = 0;
+        let _ = zx_object_wait_one(
+            worker.worker_thread,
+            ZX_TASK_TERMINATED,
+            wait_deadline(),
+            &mut terminated_observed,
+        );
+        let _ = zx_handle_close(worker.worker_thread);
+    }
+    if worker.worker_ep != 0 {
+        let _ = zx_handle_close(worker.worker_ep);
+    }
+    if worker.main_ep != 0 {
+        let _ = zx_handle_close(worker.main_ep);
+    }
+}
+
 extern "C" fn roundtrip_worker_entry(worker_ep: u64, iterations: u64) -> ! {
     let worker_ep = worker_ep as zx_handle_t;
+    ROUNDTRIP_WORKER_CPU.store(current_cpu_apic_id(), Ordering::Release);
+    ROUNDTRIP_WORKER_READY.store(1, Ordering::Release);
     for _ in 0..iterations {
         let mut observed: zx_signals_t = 0;
         let status =
@@ -421,11 +578,7 @@ fn run_tlb_churn(root_vmar: zx_handle_t, iterations: u64) -> RoundtripResult {
     result
 }
 
-fn run_tlb_active_peer(
-    process: zx_handle_t,
-    root_vmar: zx_handle_t,
-    iterations: u64,
-) -> RoundtripResult {
+fn run_tlb_active_peer(root_vmar: zx_handle_t, iterations: u64) -> RoundtripResult {
     let mut result = RoundtripResult::default();
     let mut vmo: zx_handle_t = 0;
     result.status = zx_vmo_create(TLB_CHURN_BYTES, 0, &mut vmo) as i64;
@@ -439,56 +592,6 @@ fn run_tlb_active_peer(
         let _ = zx_handle_close(vmo);
         return result;
     }
-
-    let mut main_ep: zx_handle_t = 0;
-    let mut worker_ep: zx_handle_t = 0;
-    result.eventpair_create = zx_eventpair_create(0, &mut main_ep, &mut worker_ep) as i64;
-    if result.eventpair_create != ZX_OK as i64 {
-        result.status = result.eventpair_create;
-        let _ = zx_handle_close(vmo);
-        return result;
-    }
-
-    let mut worker_thread: zx_handle_t = 0;
-    result.thread_create = zx_thread_create(process, 0, &mut worker_thread) as i64;
-    if result.thread_create != ZX_OK as i64 {
-        result.status = result.thread_create;
-        let _ = zx_handle_close(worker_ep);
-        let _ = zx_handle_close(main_ep);
-        let _ = zx_handle_close(vmo);
-        return result;
-    }
-
-    TLB_WORKER_STATE.store(TLB_WORKER_STATE_INIT, Ordering::Release);
-    result.thread_start = zx_thread_start(
-        worker_thread,
-        tlb_worker_entry as *const () as usize as u64,
-        tlb_worker_stack_top(),
-        worker_ep,
-        0,
-    ) as i64;
-    if result.thread_start != ZX_OK as i64 {
-        result.status = result.thread_start;
-        let _ = zx_handle_close(worker_thread);
-        let _ = zx_handle_close(worker_ep);
-        let _ = zx_handle_close(main_ep);
-        let _ = zx_handle_close(vmo);
-        return result;
-    }
-
-    let mut observed: zx_signals_t = 0;
-    let ready = zx_object_wait_one(main_ep, ZX_USER_SIGNAL_0, wait_deadline(), &mut observed);
-    if ready != ZX_OK || TLB_WORKER_STATE.load(Ordering::Acquire) != TLB_WORKER_STATE_READY {
-        result.status = if ready == ZX_OK { -10 } else { ready as i64 };
-        let _ = zx_task_kill(worker_thread);
-        let _ = zx_handle_close(worker_thread);
-        let _ = zx_handle_close(worker_ep);
-        let _ = zx_handle_close(main_ep);
-        let _ = zx_handle_close(vmo);
-        return result;
-    }
-    let _ = zx_object_signal(main_ep, ZX_USER_SIGNAL_0, 0);
-
     write_slot(SLOT_TRACE_PHASE, PHASE_TLB_ACTIVE_PEER);
     let start = axle_arch_x86_64::rdtsc();
     for _ in 0..iterations {
@@ -505,11 +608,6 @@ fn run_tlb_active_peer(
         if status != ZX_OK {
             result.status = status as i64;
             write_slot(SLOT_TRACE_PHASE, 0);
-            TLB_WORKER_STATE.store(TLB_WORKER_STATE_STOP, Ordering::Release);
-            let _ = zx_task_kill(worker_thread);
-            let _ = zx_handle_close(worker_thread);
-            let _ = zx_handle_close(worker_ep);
-            let _ = zx_handle_close(main_ep);
             let _ = zx_handle_close(vmo);
             return result;
         }
@@ -518,11 +616,6 @@ fn run_tlb_active_peer(
         if status != ZX_OK {
             result.status = status as i64;
             write_slot(SLOT_TRACE_PHASE, 0);
-            TLB_WORKER_STATE.store(TLB_WORKER_STATE_STOP, Ordering::Release);
-            let _ = zx_task_kill(worker_thread);
-            let _ = zx_handle_close(worker_thread);
-            let _ = zx_handle_close(worker_ep);
-            let _ = zx_handle_close(main_ep);
             let _ = zx_handle_close(vmo);
             return result;
         }
@@ -530,19 +623,6 @@ fn run_tlb_active_peer(
     result.cycles = axle_arch_x86_64::rdtsc().wrapping_sub(start);
     result.status = ZX_OK as i64;
     write_slot(SLOT_TRACE_PHASE, 0);
-
-    TLB_WORKER_STATE.store(TLB_WORKER_STATE_STOP, Ordering::Release);
-    let _ = zx_task_kill(worker_thread);
-    let mut terminated_observed: zx_signals_t = 0;
-    let _ = zx_object_wait_one(
-        worker_thread,
-        ZX_TASK_TERMINATED,
-        wait_deadline(),
-        &mut terminated_observed,
-    );
-    let _ = zx_handle_close(worker_thread);
-    let _ = zx_handle_close(worker_ep);
-    let _ = zx_handle_close(main_ep);
     let _ = zx_handle_close(vmo);
     result
 }
@@ -677,14 +757,23 @@ fn run_fault_timeline(
     result
 }
 
-extern "C" fn tlb_worker_entry(ready_ep: u64, _unused: u64) -> ! {
-    let ready_ep = ready_ep as zx_handle_t;
-    TLB_WORKER_STATE.store(TLB_WORKER_STATE_READY, Ordering::Release);
-    let _ = zx_object_signal_peer(ready_ep, 0, ZX_USER_SIGNAL_0);
-    while TLB_WORKER_STATE.load(Ordering::Acquire) != TLB_WORKER_STATE_STOP {
+fn wait_for_atomic_value(value: &AtomicU64, expected: u64) -> bool {
+    let start = axle_arch_x86_64::rdtsc();
+    loop {
+        if value.load(Ordering::Acquire) == expected {
+            return true;
+        }
+        if axle_arch_x86_64::rdtsc().wrapping_sub(start) >= WORKER_READY_TIMEOUT_CYCLES {
+            return false;
+        }
         spin_loop();
     }
-    park_forever(ready_ep)
+}
+
+fn current_cpu_apic_id() -> u64 {
+    // SAFETY: CPUID leaf 1 is always available on the x86_64 bootstrap target used by this
+    // perf runner, and reading the APIC id is side-effect free.
+    unsafe { u64::from((__cpuid(1).ebx >> 24) & 0xff) }
 }
 
 extern "C" fn fault_worker_entry(worker_ep: u64, mapped_addr: u64) -> ! {
@@ -753,13 +842,6 @@ fn wake_worker_stack_top() -> u64 {
     // SAFETY: the perf smoke owns this dedicated bootstrap worker stack and
     // only hands its top address to `zx_thread_start`.
     let base = unsafe { ptr::addr_of_mut!(WAKE_WORKER_STACK.0) as *mut u8 as usize };
-    (base + WORKER_STACK_BYTES) as u64
-}
-
-fn tlb_worker_stack_top() -> u64 {
-    // SAFETY: the perf smoke owns this dedicated bootstrap worker stack and
-    // only hands its top address to `zx_thread_start`.
-    let base = unsafe { ptr::addr_of_mut!(TLB_WORKER_STACK.0) as *mut u8 as usize };
     (base + WORKER_STACK_BYTES) as u64
 }
 
