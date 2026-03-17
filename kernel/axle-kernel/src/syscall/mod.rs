@@ -111,7 +111,10 @@ const _ABI_TYPES_WITNESS: Option<(
 
 #[derive(Clone, Copy, Debug)]
 enum PostAction {
-    FinishTrapExit { cpu_frame: *mut u64 },
+    FinishTrapExit {
+        cpu_frame: *mut u64,
+        native_sysret_ok: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -317,6 +320,18 @@ impl SyscallCtx {
     }
 
     fn from_trapframe(frame: &crate::arch::int80::TrapFrame, cpu_frame: *const u64) -> Self {
+        Self::from_trapframe_with_mode(frame, cpu_frame, false)
+    }
+
+    fn from_native_trapframe(frame: &crate::arch::int80::TrapFrame, cpu_frame: *const u64) -> Self {
+        Self::from_trapframe_with_mode(frame, cpu_frame, true)
+    }
+
+    fn from_trapframe_with_mode(
+        frame: &crate::arch::int80::TrapFrame,
+        cpu_frame: *const u64,
+        native_sysret_ok: bool,
+    ) -> Self {
         let _ = crate::object::capture_current_user_context(frame, cpu_frame);
         let mut ctx = Self {
             extra_args_user_rsp: user_stack_ptr_from_cpu_frame(cpu_frame).ok(),
@@ -324,6 +339,7 @@ impl SyscallCtx {
         };
         ctx.push_post_action(PostAction::FinishTrapExit {
             cpu_frame: cpu_frame.cast_mut(),
+            native_sysret_ok,
         });
         ctx
     }
@@ -451,14 +467,25 @@ impl SyscallCtx {
         )
     }
 
-    fn finish(self, frame: &mut crate::arch::int80::TrapFrame) {
+    fn finish(self, frame: &mut crate::arch::int80::TrapFrame) -> bool {
+        let mut native_sysret = false;
         for action in self.post_actions {
             match action {
-                PostAction::FinishTrapExit { cpu_frame } => {
-                    let _ = crate::object::finish_syscall(frame, cpu_frame);
+                PostAction::FinishTrapExit {
+                    cpu_frame,
+                    native_sysret_ok,
+                } => {
+                    let sysret = if native_sysret_ok {
+                        crate::object::finish_syscall_native(frame, cpu_frame).unwrap_or(false)
+                    } else {
+                        let _ = crate::object::finish_syscall(frame, cpu_frame);
+                        false
+                    };
+                    native_sysret |= sysret;
                 }
             }
         }
+        native_sysret
     }
 }
 
@@ -494,7 +521,19 @@ fn dispatch_syscall_with_ctx(
 
 /// Dispatch a syscall from the architecture trap frame and write status back.
 pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame, cpu_frame: *const u64) {
-    let mut ctx = SyscallCtx::from_trapframe(frame, cpu_frame);
+    let _ = invoke_from_frame(frame, cpu_frame, false);
+}
+
+fn invoke_from_frame(
+    frame: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *const u64,
+    native_sysret_ok: bool,
+) -> bool {
+    let mut ctx = if native_sysret_ok {
+        SyscallCtx::from_native_trapframe(frame, cpu_frame)
+    } else {
+        SyscallCtx::from_trapframe(frame, cpu_frame)
+    };
     let syscall_nr = frame.syscall_nr();
     crate::trace::record_sys_enter(syscall_nr);
     let status = match u32::try_from(syscall_nr) {
@@ -503,20 +542,24 @@ pub fn invoke_from_trapframe(frame: &mut crate::arch::int80::TrapFrame, cpu_fram
     };
     crate::trace::record_sys_exit(syscall_nr, status);
     frame.set_status(status);
-    ctx.finish(frame);
+    let native_sysret = ctx.finish(frame);
+    if native_sysret {
+        crate::trace::record_sys_native_sysret(syscall_nr, status);
+    }
     crate::trace::record_sys_retire(syscall_nr, status);
+    native_sysret
 }
 
 pub fn invoke_from_native_syscall(
     frame: &mut crate::arch::int80::TrapFrame,
     cpu_frame: *const u64,
-) {
+) -> u64 {
     match crate::object::handle_native_syscall_entry(frame, cpu_frame.cast_mut()) {
-        Ok(true) => return,
+        Ok(true) => return 0,
         Ok(false) => {}
         Err(status) => panic!("native guest syscall entry failed: {status}"),
     }
-    invoke_from_trapframe(frame, cpu_frame);
+    u64::from(invoke_from_frame(frame, cpu_frame, true))
 }
 
 fn user_stack_ptr_from_cpu_frame(cpu_frame: *const u64) -> Result<u64, zx_status_t> {

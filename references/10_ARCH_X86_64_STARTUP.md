@@ -63,7 +63,9 @@ The kernel then:
   - uses `swapgs`
   - switches to the per-CPU `RSP0` kernel stack
   - synthesizes the same logical `TrapFrame + cpu_frame` layout used by the legacy trap path
-  - returns through `iretq` after the shared trap-exit machinery finishes
+  - returns through `sysretq` only when the shared trap-exit path proves that the same native
+    thread can retire directly back to userspace without blocking or switching
+  - falls back to `iretq` for the wider blocked / switched / compatibility cases
 - The legacy `int 0x80` path still exists for bootstrap compatibility and targeted conformance.
 - The bootstrap trace stream now exposes four syscall edges:
   - `sys_native_enter` when ring3 entered through native `SYSCALL`
@@ -73,7 +75,7 @@ The kernel then:
     user mode
 - The current fast path is intentionally narrow:
   - native entry exists
-  - return still uses `iretq`, not `sysretq`
+  - native `sysretq` is currently only the same-thread, non-blocked fast-return path
   - PCID / INVPCID / entry-side PMU work are still pending
 
 ## SMP startup
@@ -129,8 +131,8 @@ stack preserves nested interrupt frames, while `#PF` / `#GP` still keep a dedica
 ## Current limitations
 
 - The architecture layer is x86_64-only today.
-- Native syscall entry now exists, but the return path is still `iretq` and the broader x86 fast
-  path work is not complete yet.
+- Native syscall entry now exists, and the direct same-thread fast return can use `sysretq`, but
+  the broader x86 fast path is still incomplete.
 - `EFER.SCE` is now enabled on CPUs that advertise native syscall support.
 - x86_64 supervised guest execution now intercepts native `SYSCALL` only for guest-started carrier
   threads that are still bound to one guest session, then converts that stop into the same generic

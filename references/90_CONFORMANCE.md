@@ -87,8 +87,10 @@ Main just targets include:
     - one global steal counter reserved for future L0 migration work; healthy runs currently keep it at zero
   - the same summary now distinguishes syscall dispatch completion from actual return-to-user
     retirement through `sys_enter` / `sys_exit` / `sys_retire` counts for the deterministic
-    null-syscall phase, and now also pins one native-entry `sys_native_enter` count for that same
-    phase
+    null-syscall phase, and now also pins:
+    - one native-entry `sys_native_enter` count
+    - one native fast-return `sys_native_sysret` count
+    for that same phase
   - the same runner now proves one explicit `zx_thread_start()` launch onto a different CPU, then
     reuses that peer worker across the phase-3 wake benchmark, the active-peer TLB slice, and the
     same-page fault slice instead of depending on repeated cross-CPU launches

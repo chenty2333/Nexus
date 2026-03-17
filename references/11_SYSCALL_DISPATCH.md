@@ -122,6 +122,7 @@ The current bootstrap syscall surface includes:
 - A syscall can leave the thread blocked; trap-exit handling then decides whether to return to user mode, switch threads, or block current execution.
 - The bootstrap perf trace now distinguishes:
   - native entry (`sys_native_enter`)
+  - native fast return (`sys_native_sysret`)
   - dispatch completion (`sys_exit`)
   - actual return-to-user retirement (`sys_retire`)
   so blocked or scheduler-mediated syscall completion can be observed separately from plain dispatch.
@@ -131,9 +132,8 @@ The current bootstrap syscall surface includes:
 
 ## Current limitations
 
-- The native x86_64 fast path currently shares the same logical trap shell as `int 0x80`; the
-  kernel has not split out a dedicated `sysretq` return path or more aggressive x86 entry
-  specialization yet.
+- The native x86_64 fast path still shares most of the same logical trap shell as `int 0x80`;
+  only the direct same-thread fast return now peels off into one `sysretq` path.
 - Long-lived blocked waits still complete their final user writes in the wake path rather than in the
   original syscall shell. The tightened boundary is:
   - syscall front-end owns pointer decode and probe

@@ -15,6 +15,7 @@ const IA32_FMASK: u32 = 0xC000_0084;
 const EFER_SCE: u64 = 1 << 0;
 const RFLAGS_IF: u64 = 1 << 9;
 const RFLAGS_DF: u64 = 1 << 10;
+const CANONICAL_TOP_MASK: u64 = 0xffff_8000_0000_0000;
 
 core::arch::global_asm!(
     r#"
@@ -54,6 +55,8 @@ axle_native_syscall_entry:
     mov rdi, rsp
     lea rsi, [rsp + 15*8]
     call {rust_handler}
+    test rax, rax
+    jnz .Lnative_sysret
 
     mov rax, [rsp + 0]
 
@@ -75,6 +78,26 @@ axle_native_syscall_entry:
 
     swapgs
     iretq
+
+.Lnative_sysret:
+    mov rax, [rsp + 0]
+    mov rdi, [rsp + 8]
+    mov rsi, [rsp + 16]
+    mov rdx, [rsp + 24]
+    mov r10, [rsp + 32]
+    mov r8, [rsp + 40]
+    mov r9, [rsp + 48]
+    mov rbp, [rsp + 72]
+    mov rbx, [rsp + 80]
+    mov r12, [rsp + 88]
+    mov r13, [rsp + 96]
+    mov r14, [rsp + 104]
+    mov r15, [rsp + 112]
+    mov rcx, [rsp + 120]
+    mov r11, [rsp + 136]
+    mov rsp, gs:[{user_rsp_scratch_offset}]
+    swapgs
+    sysretq
     .size axle_native_syscall_entry, .-axle_native_syscall_entry
     "#,
     kernel_rsp0_offset = const crate::arch::percpu::KERNEL_RSP0_OFFSET,
@@ -98,8 +121,12 @@ pub fn init_cpu() {
     }
 
     let selectors = crate::arch::gdt::init();
-    let star =
-        (u64::from(selectors.user_code.0) << 48) | (u64::from(selectors.kernel_code.0) << 32);
+    let sysret_cs = selectors
+        .user_code
+        .0
+        .checked_sub(16)
+        .expect("sysret cs selector must sit 16 bytes below user code selector");
+    let star = (u64::from(sysret_cs) << 48) | (u64::from(selectors.kernel_code.0) << 32);
     let fmask = RFLAGS_IF | RFLAGS_DF;
 
     // SAFETY: these MSRs are programmed once per CPU after GDT/per-CPU setup.
@@ -118,7 +145,37 @@ pub fn init_cpu() {
 extern "C" fn axle_native_syscall_rust(
     frame: &mut crate::arch::int80::TrapFrame,
     cpu_frame: *const u64,
-) {
+) -> u64 {
     crate::trace::record_sys_native_enter(frame.syscall_nr());
-    crate::syscall::invoke_from_native_syscall(frame, cpu_frame);
+    crate::syscall::invoke_from_native_syscall(frame, cpu_frame)
+}
+
+fn is_canonical_user_addr(addr: u64) -> bool {
+    let top = addr & CANONICAL_TOP_MASK;
+    top == 0 || top == CANONICAL_TOP_MASK
+}
+
+pub(crate) fn sysret_eligible(cpu_frame: *const u64) -> bool {
+    if cpu_frame.is_null() {
+        return false;
+    }
+
+    let selectors = crate::arch::gdt::init();
+    // SAFETY: `cpu_frame` points at the synthetic user IRET frame that the native
+    // syscall entry stub built on the current kernel stack.
+    let (rip, cs, rflags, rsp, ss) = unsafe {
+        (
+            *cpu_frame.add(0),
+            *cpu_frame.add(1),
+            *cpu_frame.add(2),
+            *cpu_frame.add(3),
+            *cpu_frame.add(4),
+        )
+    };
+
+    is_canonical_user_addr(rip)
+        && is_canonical_user_addr(rsp)
+        && cs == u64::from(selectors.user_code.0)
+        && ss == u64::from(selectors.user_data.0)
+        && (rflags & 0x2) != 0
 }

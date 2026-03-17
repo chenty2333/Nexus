@@ -1390,7 +1390,26 @@ pub(crate) fn finish_syscall(
     trap: &mut crate::arch::int80::TrapFrame,
     cpu_frame: *mut u64,
 ) -> Result<(), zx_status_t> {
+    finish_syscall_inner(trap, cpu_frame, false).map(|_| ())
+}
+
+pub(crate) fn finish_syscall_native(
+    trap: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+) -> Result<bool, zx_status_t> {
+    finish_syscall_inner(trap, cpu_frame, true)
+}
+
+fn finish_syscall_inner(
+    trap: &mut crate::arch::int80::TrapFrame,
+    cpu_frame: *mut u64,
+    allow_native_sysret: bool,
+) -> Result<bool, zx_status_t> {
+    let initial_thread_id =
+        with_kernel_mut(|kernel| Ok(kernel.current_thread_info()?.thread_id())).ok();
+    let mut blocked_current = false;
     run_trap_blocking(|resuming_blocked_current| {
+        blocked_current |= resuming_blocked_current;
         with_state_mut(|state| {
             let disposition = state.with_kernel_mut(|kernel| {
                 kernel.finish_trap_exit(trap, cpu_frame, resuming_blocked_current)
@@ -1405,7 +1424,16 @@ pub(crate) fn finish_syscall(
                 crate::task::TrapExitDisposition::BlockCurrent => TrapBlock::BlockCurrent,
             })
         })
-    })
+    })?;
+
+    if !allow_native_sysret || blocked_current {
+        return Ok(false);
+    }
+    let final_thread_id =
+        with_kernel_mut(|kernel| Ok(kernel.current_thread_info()?.thread_id())).ok();
+    Ok(initial_thread_id.is_some()
+        && initial_thread_id == final_thread_id
+        && crate::arch::syscall::sysret_eligible(cpu_frame.cast_const()))
 }
 
 pub(crate) fn handle_native_syscall_entry(
