@@ -702,6 +702,15 @@ const SLOT_NET_PACKET_MATCH: usize = 950;
 const SLOT_NET_DRIVER_CPU: usize = 951;
 const SLOT_NET_WORKER_CPU: usize = 952;
 const SLOT_NET_PRESENT: usize = 953;
+const SLOT_NET_MMIO_READY: usize = 978;
+const SLOT_NET_MMIO_DEVICE_FEATURES: usize = 979;
+const SLOT_NET_MMIO_DRIVER_FEATURES: usize = 980;
+const SLOT_NET_MMIO_STATUS: usize = 981;
+const SLOT_NET_TX_NOTIFY_COUNT: usize = 982;
+const SLOT_NET_RX_COMPLETE_COUNT: usize = 983;
+const SLOT_NET_PACKET_COUNT: usize = 984;
+const SLOT_NET_PACKET_MATCH_COUNT: usize = 985;
+const SLOT_NET_BATCH_CYCLES: usize = 986;
 const SLOT_DGRAM_PRESENT: usize = 954;
 const SLOT_DGRAM_FAILURE_STEP: usize = 955;
 const SLOT_DGRAM_CREATE: usize = 956;
@@ -1922,7 +1931,7 @@ fn print_device_summary(slots: &[u64]) {
 
 fn print_net_summary(slots: &[u64]) {
     crate::kprintln!(
-        "kernel: net dataplane smoke (net_present={}, net_failure_step={}, ready_irq_create={}, tx_irq_create={}, rx_irq_create={}, queue_vmo_create={}, queue_lookup={}, queue_map={}, worker_thread_create={}, worker_thread_start={}, ready_wait={}, ready_ack={}, tx_kick={}, worker_wait_kick={}, worker_ack_kick={}, worker_trigger_rx={}, rx_wait={}, rx_ack={}, tx_used_idx={}, rx_used_idx={}, tx_used_len={}, rx_used_len={}, packet_bytes={}, packet_match={}, driver_cpu={}, worker_cpu={})",
+        "kernel: net dataplane smoke (net_present={}, net_failure_step={}, ready_irq_create={}, tx_irq_create={}, rx_irq_create={}, queue_vmo_create={}, queue_lookup={}, queue_map={}, worker_thread_create={}, worker_thread_start={}, ready_wait={}, ready_ack={}, tx_kick={}, worker_wait_kick={}, worker_ack_kick={}, worker_trigger_rx={}, rx_wait={}, rx_ack={}, tx_used_idx={}, rx_used_idx={}, tx_used_len={}, rx_used_len={}, packet_bytes={}, packet_match={}, driver_cpu={}, worker_cpu={}, mmio_ready={}, mmio_device_features={}, mmio_driver_features={}, mmio_status={}, tx_notify_count={}, rx_complete_count={}, packet_count={}, packet_match_count={}, batch_cycles={})",
         slots[SLOT_NET_PRESENT],
         slots[SLOT_NET_FAILURE_STEP],
         slots[SLOT_NET_READY_IRQ_CREATE] as i64,
@@ -1949,6 +1958,15 @@ fn print_net_summary(slots: &[u64]) {
         slots[SLOT_NET_PACKET_MATCH],
         slots[SLOT_NET_DRIVER_CPU],
         slots[SLOT_NET_WORKER_CPU],
+        slots[SLOT_NET_MMIO_READY],
+        slots[SLOT_NET_MMIO_DEVICE_FEATURES],
+        slots[SLOT_NET_MMIO_DRIVER_FEATURES],
+        slots[SLOT_NET_MMIO_STATUS],
+        slots[SLOT_NET_TX_NOTIFY_COUNT],
+        slots[SLOT_NET_RX_COMPLETE_COUNT],
+        slots[SLOT_NET_PACKET_COUNT],
+        slots[SLOT_NET_PACKET_MATCH_COUNT],
+        slots[SLOT_NET_BATCH_CYCLES],
     );
 }
 

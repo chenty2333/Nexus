@@ -163,9 +163,25 @@ Main just targets include:
   - one ring3 worker thread acts as the minimal device-side peer
   - one contiguous VMO supplies the shared queue/buffer memory
   - one physical-address lookup freezes the DMA-style address handoff shape
+  - one shared MMIO-style register page freezes a minimal control-plane shape:
+    - device identity/version
+    - feature bits plus driver-acknowledged feature bits
+    - queue-ready state
+    - notify / interrupt status
+    - notify / completion counters
   - one ready interrupt, one TX-kick interrupt, and one RX-complete interrupt carry control flow
-  - one reusable split TX/RX virtio-style transport slice completes a single loopback packet
-    without channel/socket data-plane help
+  - one reusable split TX/RX virtio-style transport slice now completes one four-packet batched
+    loopback round without channel/socket data-plane help
+  - the summary now also exports:
+    - `mmio_ready`
+    - `mmio_device_features`
+    - `mmio_driver_features`
+    - `mmio_status`
+    - `tx_notify_count`
+    - `rx_complete_count`
+    - `packet_count`
+    - `packet_match_count`
+    - `batch_cycles`
 - Bootstrap socket coverage now also includes one narrow datagram gate:
   - datagram create succeeds through the normal socket object family
   - one peek/read pair proves message preservation without stream fallback
