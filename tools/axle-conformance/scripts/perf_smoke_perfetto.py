@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
+import sys
+
+sys.dont_write_bytecode = True
+
 import json
 import re
-import sys
 from pathlib import Path
 
 from extract_perf_smoke import extract_summary

@@ -44,6 +44,8 @@ Main just targets include:
 - `just perf-smoke-kvm`
 - `just perf-smoke-parse <serial-log>`
 - `just perf-smoke-perfetto <serial-log>`
+- `just perf-smoke-archive <serial-log> <label> [cpuinfo]`
+- `just perf-smoke-kvm-archive [label]`
 - `just check-conformance-contracts`
 - `just test-all`
 
@@ -141,6 +143,13 @@ Main just targets include:
     - capture one serial log from a real machine
     - extract the same key=value perf summary into one JSON baseline
     - export the same trace stream into one Perfetto-compatible JSON timeline
+    - archive one baseline capture under `target/perf-smoke-baselines/<timestamp>-<label>/`
+      with:
+      - `serial.log`
+      - `perf-smoke.json`
+      - `baseline.json`
+      - `perfetto-trace.json`
+      - `manifest.json`
   - `just perf-smoke-kvm` is the current minimal KVM-hosted baseline path:
     - reuses the same bundle
     - runs `qemu-system-x86_64` with `-machine q35,accel=kvm -cpu host`
@@ -148,6 +157,8 @@ Main just targets include:
     - writes `perf-smoke.json` with the guest summary
     - writes `baseline.json` with host CPU flags plus guest x86 feature signals
     - writes `perfetto-trace.json` with the full bootstrap trace timeline
+  - `just perf-smoke-kvm-archive` then snapshots that run into the same
+    `target/perf-smoke-baselines/` archive layout used by real-machine captures
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - one ring3 worker thread acts as the minimal device-side peer
   - one contiguous VMO supplies the shared queue/buffer memory
