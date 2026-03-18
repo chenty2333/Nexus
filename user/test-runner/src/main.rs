@@ -18,6 +18,7 @@
         not(axle_test_runner_rust_entry = "component_smoke"),
         not(axle_test_runner_rust_entry = "perf_smoke"),
         not(axle_test_runner_rust_entry = "device_smoke"),
+        not(axle_test_runner_rust_entry = "net_smoke"),
         not(axle_test_runner_rust_entry = "smp_smoke")
     ),
     forbid(unsafe_code)
@@ -28,6 +29,7 @@
         axle_test_runner_rust_entry = "component_smoke",
         axle_test_runner_rust_entry = "perf_smoke",
         axle_test_runner_rust_entry = "device_smoke",
+        axle_test_runner_rust_entry = "net_smoke",
         axle_test_runner_rust_entry = "smp_smoke"
     ),
     deny(unsafe_op_in_unsafe_fn)
@@ -38,6 +40,7 @@
         axle_test_runner_rust_entry = "component_smoke",
         axle_test_runner_rust_entry = "perf_smoke",
         axle_test_runner_rust_entry = "device_smoke",
+        axle_test_runner_rust_entry = "net_smoke",
         axle_test_runner_rust_entry = "smp_smoke"
     ),
     deny(clippy::undocumented_unsafe_blocks)
@@ -55,6 +58,8 @@ use core::panic::PanicInfo;
 mod component_smoke;
 #[cfg(axle_test_runner_rust_entry = "device_smoke")]
 mod device_smoke;
+#[cfg(axle_test_runner_rust_entry = "net_smoke")]
+mod net_smoke;
 #[cfg(axle_test_runner_rust_entry = "perf_smoke")]
 mod perf_smoke;
 #[cfg(axle_test_runner_rust_entry = "reactor_smoke")]
@@ -86,6 +91,12 @@ fn panic(_info: &PanicInfo) -> ! {
     device_smoke::report_panic()
 }
 
+#[cfg(axle_test_runner_rust_entry = "net_smoke")]
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    net_smoke::report_panic()
+}
+
 #[cfg(axle_test_runner_rust_entry = "smp_smoke")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -97,6 +108,7 @@ fn panic(_info: &PanicInfo) -> ! {
     not(axle_test_runner_rust_entry = "component_smoke"),
     not(axle_test_runner_rust_entry = "perf_smoke"),
     not(axle_test_runner_rust_entry = "device_smoke"),
+    not(axle_test_runner_rust_entry = "net_smoke"),
     not(axle_test_runner_rust_entry = "smp_smoke")
 ))]
 #[panic_handler]

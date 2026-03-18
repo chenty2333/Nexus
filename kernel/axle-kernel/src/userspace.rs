@@ -675,6 +675,32 @@ const SLOT_DEVICE_PHYSICAL_PADDR: usize = 924;
 const SLOT_DEVICE_PHYSICAL_MATCHES_CONTIG0: usize = 925;
 const SLOT_DEVICE_PHYSICAL_MAP: usize = 926;
 const SLOT_DEVICE_PRESENT: usize = 927;
+const SLOT_NET_FAILURE_STEP: usize = 928;
+const SLOT_NET_READY_IRQ_CREATE: usize = 929;
+const SLOT_NET_TX_IRQ_CREATE: usize = 930;
+const SLOT_NET_RX_IRQ_CREATE: usize = 931;
+const SLOT_NET_QUEUE_VMO_CREATE: usize = 932;
+const SLOT_NET_QUEUE_LOOKUP: usize = 933;
+const SLOT_NET_QUEUE_MAP: usize = 934;
+const SLOT_NET_WORKER_THREAD_CREATE: usize = 935;
+const SLOT_NET_WORKER_THREAD_START: usize = 936;
+const SLOT_NET_READY_WAIT: usize = 937;
+const SLOT_NET_READY_ACK: usize = 938;
+const SLOT_NET_TX_KICK: usize = 939;
+const SLOT_NET_WORKER_WAIT_KICK: usize = 940;
+const SLOT_NET_WORKER_ACK_KICK: usize = 941;
+const SLOT_NET_WORKER_TRIGGER_RX: usize = 942;
+const SLOT_NET_RX_WAIT: usize = 943;
+const SLOT_NET_RX_ACK: usize = 944;
+const SLOT_NET_TX_USED_IDX: usize = 945;
+const SLOT_NET_RX_USED_IDX: usize = 946;
+const SLOT_NET_TX_USED_LEN: usize = 947;
+const SLOT_NET_RX_USED_LEN: usize = 948;
+const SLOT_NET_PACKET_BYTES: usize = 949;
+const SLOT_NET_PACKET_MATCH: usize = 950;
+const SLOT_NET_DRIVER_CPU: usize = 951;
+const SLOT_NET_WORKER_CPU: usize = 952;
+const SLOT_NET_PRESENT: usize = 953;
 const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
 const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
@@ -1619,6 +1645,10 @@ fn device_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_DEVICE_PRESENT] != 0 || slots[SLOT_DEVICE_FAILURE_STEP] != 0
 }
 
+fn net_summary_present(slots: &[u64]) -> bool {
+    slots[SLOT_NET_PRESENT] != 0 || slots[SLOT_NET_FAILURE_STEP] != 0
+}
+
 fn smp_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_SMP_SMOKE_PRESENT] != 0
 }
@@ -1857,6 +1887,38 @@ fn print_device_summary(slots: &[u64]) {
     );
 }
 
+fn print_net_summary(slots: &[u64]) {
+    crate::kprintln!(
+        "kernel: net dataplane smoke (net_present={}, net_failure_step={}, ready_irq_create={}, tx_irq_create={}, rx_irq_create={}, queue_vmo_create={}, queue_lookup={}, queue_map={}, worker_thread_create={}, worker_thread_start={}, ready_wait={}, ready_ack={}, tx_kick={}, worker_wait_kick={}, worker_ack_kick={}, worker_trigger_rx={}, rx_wait={}, rx_ack={}, tx_used_idx={}, rx_used_idx={}, tx_used_len={}, rx_used_len={}, packet_bytes={}, packet_match={}, driver_cpu={}, worker_cpu={})",
+        slots[SLOT_NET_PRESENT],
+        slots[SLOT_NET_FAILURE_STEP],
+        slots[SLOT_NET_READY_IRQ_CREATE] as i64,
+        slots[SLOT_NET_TX_IRQ_CREATE] as i64,
+        slots[SLOT_NET_RX_IRQ_CREATE] as i64,
+        slots[SLOT_NET_QUEUE_VMO_CREATE] as i64,
+        slots[SLOT_NET_QUEUE_LOOKUP] as i64,
+        slots[SLOT_NET_QUEUE_MAP] as i64,
+        slots[SLOT_NET_WORKER_THREAD_CREATE] as i64,
+        slots[SLOT_NET_WORKER_THREAD_START] as i64,
+        slots[SLOT_NET_READY_WAIT] as i64,
+        slots[SLOT_NET_READY_ACK] as i64,
+        slots[SLOT_NET_TX_KICK] as i64,
+        slots[SLOT_NET_WORKER_WAIT_KICK] as i64,
+        slots[SLOT_NET_WORKER_ACK_KICK] as i64,
+        slots[SLOT_NET_WORKER_TRIGGER_RX] as i64,
+        slots[SLOT_NET_RX_WAIT] as i64,
+        slots[SLOT_NET_RX_ACK] as i64,
+        slots[SLOT_NET_TX_USED_IDX],
+        slots[SLOT_NET_RX_USED_IDX],
+        slots[SLOT_NET_TX_USED_LEN],
+        slots[SLOT_NET_RX_USED_LEN],
+        slots[SLOT_NET_PACKET_BYTES],
+        slots[SLOT_NET_PACKET_MATCH],
+        slots[SLOT_NET_DRIVER_CPU],
+        slots[SLOT_NET_WORKER_CPU],
+    );
+}
+
 fn print_smp_summary(slots: &[u64]) {
     crate::kprintln!(
         "kernel: smp smoke ok (present={}, status={})",
@@ -1971,6 +2033,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         if device_summary_present(slots) {
             print_device_summary(slots);
         }
+        if net_summary_present(slots) {
+            print_net_summary(slots);
+        }
         if smp_summary_present(slots) {
             print_smp_summary(slots);
         }
@@ -2000,6 +2065,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
     }
     if device_summary_present(slots) {
         print_device_summary(slots);
+    }
+    if net_summary_present(slots) {
+        print_net_summary(slots);
     }
     if smp_summary_present(slots) {
         print_smp_summary(slots);

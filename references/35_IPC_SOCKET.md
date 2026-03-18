@@ -8,6 +8,7 @@ See also:
 - `20_HANDLE_CAPABILITY.md` - socket handle ownership and rights
 - `21_OBJECT_MODEL.md` - socket object records and lifetime
 - `33_IPC.md` - IPC index
+- `36_NET_DATAPLANE.md` - current queue-owned network dataplane bootstrap direction
 - `32_SCHEDULER_LIFECYCLE.md` - wakeup and blocked-state interactions
 - `90_CONFORMANCE.md` - socket scenario coverage
 
@@ -69,3 +70,5 @@ The object layer already tracks basic stream telemetry such as:
 - Datagram semantics are absent.
 - The implementation is deliberately simple and byte-stream oriented; it is not yet a full cross-family socket subsystem.
 - Socket state currently lives entirely inside the kernel object layer rather than in a reusable lower-level crate.
+- The current stream socket should not be treated as the final network dataplane shape.
+  Queue-owned shared-memory network work now has its own separate bootstrap track.

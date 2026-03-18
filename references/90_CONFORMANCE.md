@@ -11,6 +11,7 @@ See also:
 - `33_IPC.md` - IPC scenarios and contract coverage
 - `34_IPC_CHANNEL.md` - channel-specific scenario surface
 - `35_IPC_SOCKET.md` - socket-specific scenario surface
+- `36_NET_DATAPLANE.md` - queue-owned network dataplane bootstrap direction
 - `40_VM.md` - VM scenarios and contract coverage
 
 ## Scope
@@ -144,6 +145,12 @@ Main just targets include:
     - writes the serial log to `target/perf-smoke-kvm/serial.log`
     - writes `perf-smoke.json` with the guest summary
     - writes `baseline.json` with host CPU flags plus guest x86 feature signals
+- Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
+  - one ring3 worker thread acts as the minimal device-side peer
+  - one contiguous VMO supplies the shared queue/buffer memory
+  - one physical-address lookup freezes the DMA-style address handoff shape
+  - one ready interrupt, one TX-kick interrupt, and one RX-complete interrupt carry control flow
+  - one split TX/RX ring pair completes a single loopback packet without channel/socket data-plane help
 - Component-framework bootstrap coverage now also includes one eager-topology gate:
   - a minimal `nexus-init` can resolve a root manifest and launch eager ELF children
   - one protocol route through `/svc` is exercised end-to-end
