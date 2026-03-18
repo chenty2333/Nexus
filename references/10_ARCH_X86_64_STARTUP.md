@@ -84,6 +84,10 @@ The kernel then:
     - local `INVPCID single-context` when both PCID and INVPCID are available
   - the current QEMU bootstrap target often reports `pcid=false`, `invpcid=false`, and `pmu=false`,
     so the bootstrap gate currently proves wiring and support detection first, not final x86 gains
+  - the current KVM-hosted baseline path should be interpreted against both the guest perf summary
+    and the host CPU flags:
+    - some hosts may expose `invpcid` to the guest while still withholding `pcid`
+    - some hosts may not expose the architectural PMU shape at all, so PMU deltas remain zero
   - ring3 bootstrap perf smoke can now also read the first three fixed PMU counters when the
     kernel enables `CR4.PCE` and the CPU reports the architectural PMU shape
 

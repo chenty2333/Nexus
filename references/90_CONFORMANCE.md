@@ -40,6 +40,7 @@ Main just targets include:
 - `just test-kernel`
 - `just perf-smoke-qemu`
 - `just perf-smoke-bundle`
+- `just perf-smoke-kvm`
 - `just perf-smoke-parse <serial-log>`
 - `just check-conformance-contracts`
 - `just test-all`
@@ -131,6 +132,12 @@ Main just targets include:
     - build one kernel + perf-smoke runner bundle
     - capture one serial log from a real machine
     - extract the same key=value perf summary into one JSON baseline
+  - `just perf-smoke-kvm` is the current minimal KVM-hosted baseline path:
+    - reuses the same bundle
+    - runs `qemu-system-x86_64` with `-machine q35,accel=kvm -cpu host`
+    - writes the serial log to `target/perf-smoke-kvm/serial.log`
+    - writes `perf-smoke.json` with the guest summary
+    - writes `baseline.json` with host CPU flags plus guest x86 feature signals
 - Component-framework bootstrap coverage now also includes one eager-topology gate:
   - a minimal `nexus-init` can resolve a root manifest and launch eager ELF children
   - one protocol route through `/svc` is exercised end-to-end
