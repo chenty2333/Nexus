@@ -103,7 +103,8 @@ The current bootstrap syscall surface includes:
 - timer create / set / cancel
 - interrupt create / ack / mask / unmask
 - VMO create / read / write / set size
-- VMO create physical / create contiguous / lookup backing paddr
+- VMO create physical / create contiguous / lookup backing paddr / pin DMA region
+- DMA-region lookup backing paddr
 - VMAR allocate / destroy / map / unmap / protect
 - channel create / write / read
 - eventpair create
@@ -147,4 +148,11 @@ The current bootstrap syscall surface includes:
 - The current device-facing syscall surface is intentionally narrow:
   - `interrupt_create()` only accepts `ZX_INTERRUPT_VIRTUAL`
   - `ax_interrupt_trigger()` is an Axle-native helper rather than a fully generic IRQ delivery ABI
-  - `ax_vmo_lookup_paddr()` is a narrow bootstrap helper, not yet a full BTI/pinning contract
+  - `ax_vmo_lookup_paddr()` is a narrow bootstrap helper
+  - `ax_vmo_pin()` + `ax_dma_region_lookup_paddr()` now add one first explicit DMA lifetime object
+    without yet becoming a full BTI/IOMMU contract
+  - `ZX_VM_MAP_MMIO` is now the first narrow public VM mapping attribute bit:
+    - it requests device/MMIO cache attributes on the installed mapping
+    - it is currently intended only for physical/contiguous VMOs
+    - `vmar_protect()` still treats cache policy as fixed mapping truth rather than one mutable
+      protect-time knob

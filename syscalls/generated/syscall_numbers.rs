@@ -116,3 +116,7 @@ pub const AXLE_SYS_VMO_CREATE_PHYSICAL: SyscallNumber = 54;
 pub const AXLE_SYS_VMO_CREATE_CONTIGUOUS: SyscallNumber = 55;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_VMO_LOOKUP_PADDR: SyscallNumber = 56;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_VMO_PIN: SyscallNumber = 57;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR: SyscallNumber = 58;

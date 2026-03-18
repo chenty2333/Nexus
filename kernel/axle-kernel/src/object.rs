@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::{Capability, ObjectKey, PortError, Signals, TimerError, TimerId, TransferredCap};
-use axle_mm::{MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
+use axle_mm::{MappingCachePolicy, MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::interrupt::ZX_INTERRUPT_VIRTUAL;
@@ -28,8 +28,9 @@ use axle_types::status::{
 };
 use axle_types::vm::{
     ZX_VM_ALIGN_BASE, ZX_VM_ALIGN_MASK, ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ,
-    ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE, ZX_VM_COMPACT, ZX_VM_OFFSET_IS_UPPER_LIMIT,
-    ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_PRIVATE_CLONE, ZX_VM_SPECIFIC,
+    ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE, ZX_VM_COMPACT, ZX_VM_MAP_MMIO,
+    ZX_VM_OFFSET_IS_UPPER_LIMIT, ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE,
+    ZX_VM_PRIVATE_CLONE, ZX_VM_SPECIFIC,
 };
 use axle_types::zx_signals_t;
 use axle_types::{
@@ -72,6 +73,8 @@ pub enum ObjectKind {
     Timer,
     /// Interrupt object.
     Interrupt,
+    /// DMA region object.
+    DmaRegion,
     /// Supervised guest-session object.
     GuestSession,
     /// VMO object.
@@ -93,6 +96,49 @@ pub(crate) struct InterruptObject {
     pending_count: u64,
     masked: bool,
     virtual_only: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct DmaRegionObject {
+    source_vmo_object: ObjectKey,
+    source_offset: u64,
+    size_bytes: u64,
+    pin: axle_mm::PinToken,
+}
+
+impl DmaRegionObject {
+    pub(crate) const fn source_vmo_object(&self) -> ObjectKey {
+        self.source_vmo_object
+    }
+
+    pub(crate) const fn source_offset(&self) -> u64 {
+        self.source_offset
+    }
+
+    pub(crate) const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    pub(crate) fn lookup_paddr(&self, offset: u64) -> Result<u64, zx_status_t> {
+        if offset >= self.size_bytes {
+            return Err(ZX_ERR_OUT_OF_RANGE);
+        }
+        let page_size = crate::userspace::USER_PAGE_BYTES;
+        let page_offset = offset & !(page_size - 1);
+        let byte_offset = offset - page_offset;
+        let page_index =
+            usize::try_from(page_offset / page_size).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let frame_id = *self
+            .pin
+            .frame_ids()
+            .get(page_index)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        Ok(frame_id.raw() + byte_offset)
+    }
+
+    fn release(self, frames: &mut axle_mm::FrameTable) {
+        self.pin.release(frames);
+    }
 }
 
 impl InterruptObject {
@@ -713,6 +759,7 @@ struct VmarMappingCaps {
 #[derive(Clone, Copy, Debug)]
 struct VmarMappingRequest {
     perms: MappingPerms,
+    cache_policy: MappingCachePolicy,
     specific: bool,
     private_clone: bool,
 }
@@ -781,6 +828,7 @@ pub(crate) enum KernelObject {
     Port(KernelPort),
     Timer(TimerObject),
     Interrupt(InterruptObject),
+    DmaRegion(DmaRegionObject),
     Vmo(VmoObject),
     Vmar(VmarObject),
     Thread(ThreadObject),
@@ -1550,6 +1598,10 @@ impl KernelState {
         f(&self.vm)
     }
 
+    fn with_frames_mut<T>(&self, f: impl FnOnce(&mut axle_mm::FrameTable) -> T) -> T {
+        self.vm.with_frames_mut(f)
+    }
+
     fn current_address_space_id(&self) -> Option<crate::task::AddressSpaceId> {
         self.with_core(|kernel| kernel.current_address_space_id())
             .ok()
@@ -2278,6 +2330,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
                 | Some(KernelObject::EventPair(_))
                 | Some(KernelObject::Port(_))
                 | Some(KernelObject::Interrupt(_))
+                | Some(KernelObject::DmaRegion(_))
                 | Some(KernelObject::Thread(_))
                 | Some(KernelObject::Vmo(_))
                 | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
@@ -2319,6 +2372,7 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
                 | Some(KernelObject::EventPair(_))
                 | Some(KernelObject::Port(_))
                 | Some(KernelObject::Interrupt(_))
+                | Some(KernelObject::DmaRegion(_))
                 | Some(KernelObject::Thread(_))
                 | Some(KernelObject::Vmo(_))
                 | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
@@ -2356,6 +2410,7 @@ enum CloseHandleAction {
     Port,
     Timer,
     Interrupt,
+    DmaRegion,
     Vmo,
     Vmar,
 }
@@ -2380,6 +2435,7 @@ fn close_handle_action_for_live_object(object: &KernelObject) -> CloseHandleActi
         KernelObject::Port(_) => CloseHandleAction::Port,
         KernelObject::Timer(_) => CloseHandleAction::Timer,
         KernelObject::Interrupt(_) => CloseHandleAction::Interrupt,
+        KernelObject::DmaRegion(_) => CloseHandleAction::DmaRegion,
         KernelObject::Vmo(_) => CloseHandleAction::Vmo,
         KernelObject::Vmar(_) => CloseHandleAction::Vmar,
         KernelObject::Process(_) | KernelObject::Thread(_) => CloseHandleAction::None,
@@ -2549,6 +2605,18 @@ fn finalize_last_handle_close(
             state.finish_logical_destroy(object_key);
             Ok(())
         }
+        CloseHandleAction::DmaRegion => {
+            let removed = state.begin_logical_destroy(object_key)?;
+            let result = match removed {
+                KernelObject::DmaRegion(region) => {
+                    state.with_frames_mut(|frames| region.release(frames));
+                    Ok(())
+                }
+                _ => Err(ZX_ERR_BAD_STATE),
+            };
+            state.finish_logical_destroy(object_key);
+            result
+        }
         CloseHandleAction::Vmo | CloseHandleAction::Vmar => {
             let _ = state.begin_logical_destroy(object_key)?;
             state.finish_logical_destroy(object_key);
@@ -2639,6 +2707,15 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                         interrupt.virtual_only,
                     );
                     ObjectKind::Interrupt
+                }
+                KernelObject::DmaRegion(region) => {
+                    let _ = (
+                        region.source_vmo_object.object_id(),
+                        region.source_offset,
+                        region.size_bytes,
+                        region.pin.frame_ids().len(),
+                    );
+                    ObjectKind::DmaRegion
                 }
                 KernelObject::Vmo(vmo) => {
                     let _ = (
@@ -2765,7 +2842,9 @@ pub(crate) fn signals_for_object_id(
                 })
             }
             KernelObject::Interrupt(interrupt) => Ok(interrupt.signals()),
-            KernelObject::Vmo(_) | KernelObject::Vmar(_) => Ok(Signals::NONE),
+            KernelObject::DmaRegion(_) | KernelObject::Vmo(_) | KernelObject::Vmar(_) => {
+                Ok(Signals::NONE)
+            }
         }
     })
 }

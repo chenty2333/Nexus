@@ -16,12 +16,13 @@ use alloc::vec::Vec;
 use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
 use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_OUT_OF_RANGE, ZX_OK};
 use axle_types::syscall_numbers::{
-    AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
-    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
-    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
-    AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
-    AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE,
-    AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_CHANNEL_CREATE,
+    AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR, AXLE_SYS_AX_GUEST_SESSION_CREATE,
+    AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY, AXLE_SYS_AX_GUEST_SESSION_RESUME,
+    AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY, AXLE_SYS_AX_INTERRUPT_TRIGGER,
+    AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
+    AXLE_SYS_AX_PROCESS_START_GUEST, AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
+    AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_START_GUEST,
+    AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_AX_VMO_PIN, AXLE_SYS_CHANNEL_CREATE,
     AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE,
     AXLE_SYS_FUTEX_GET_OWNER, AXLE_SYS_FUTEX_REQUEUE, AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE,
     AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_HANDLE_REPLACE,
@@ -46,7 +47,7 @@ use axle_types::{
 };
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 57] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 59] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -91,6 +92,8 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 57] = [
     AXLE_SYS_VMO_WRITE,
     AXLE_SYS_VMO_SET_SIZE,
     AXLE_SYS_AX_VMO_LOOKUP_PADDR,
+    AXLE_SYS_AX_VMO_PIN,
+    AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR,
     AXLE_SYS_SOCKET_CREATE,
     AXLE_SYS_SOCKET_WRITE,
     AXLE_SYS_SOCKET_READ,
@@ -1379,6 +1382,68 @@ typed_syscall!(
 );
 const AX_VMO_LOOKUP_PADDR_DISPATCH: SyscallDispatch =
     SyscallDispatch::new(ax_vmo_lookup_paddr_entry);
+
+type VmoPinRequest = (zx_handle_t, u64, u64, u32);
+
+fn decode_ax_vmo_pin(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<VmoPinRequest, OutValue<zx_handle_t>>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        (
+            ctx.arg_handle(args, 0)?,
+            args[1],
+            args[2],
+            ctx.arg_u32(args, 3)?,
+        ),
+        ctx.decode_out_value::<zx_handle_t>(args, 4)?,
+    ))
+}
+
+fn run_ax_vmo_pin(req: VmoPinRequest) -> Result<zx_handle_t, zx_status_t> {
+    crate::object::vm::pin_vmo(req.0, req.1, req.2, req.3)
+}
+
+typed_syscall!(
+    AX_VMO_PIN_TYPED,
+    ax_vmo_pin_entry,
+    VmoPinRequest,
+    OutValue<zx_handle_t>,
+    zx_handle_t,
+    decode_ax_vmo_pin,
+    run_ax_vmo_pin,
+    writeback_handle
+);
+const AX_VMO_PIN_DISPATCH: SyscallDispatch = SyscallDispatch::new(ax_vmo_pin_entry);
+
+type DmaRegionLookupPaddrRequest = (zx_handle_t, u64);
+
+fn decode_ax_dma_region_lookup_paddr(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<DmaRegionLookupPaddrRequest, OutValue<u64>>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        (ctx.arg_handle(args, 0)?, args[1]),
+        ctx.decode_out_value::<u64>(args, 2)?,
+    ))
+}
+
+fn run_ax_dma_region_lookup_paddr(req: DmaRegionLookupPaddrRequest) -> Result<u64, zx_status_t> {
+    crate::object::vm::lookup_dma_region_paddr(req.0, req.1)
+}
+
+typed_syscall!(
+    AX_DMA_REGION_LOOKUP_PADDR_TYPED,
+    ax_dma_region_lookup_paddr_entry,
+    DmaRegionLookupPaddrRequest,
+    OutValue<u64>,
+    u64,
+    decode_ax_dma_region_lookup_paddr,
+    run_ax_dma_region_lookup_paddr,
+    writeback_u64
+);
+const AX_DMA_REGION_LOOKUP_PADDR_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_dma_region_lookup_paddr_entry);
 
 #[derive(Debug)]
 struct VmoReadRequest {
@@ -2936,6 +3001,8 @@ fn syscall_dispatch(nr: SyscallNumber) -> Option<&'static SyscallDispatch> {
         AXLE_SYS_VMO_WRITE => Some(&VMO_WRITE_DISPATCH),
         AXLE_SYS_VMO_SET_SIZE => Some(&VMO_SET_SIZE_DISPATCH),
         AXLE_SYS_AX_VMO_LOOKUP_PADDR => Some(&AX_VMO_LOOKUP_PADDR_DISPATCH),
+        AXLE_SYS_AX_VMO_PIN => Some(&AX_VMO_PIN_DISPATCH),
+        AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR => Some(&AX_DMA_REGION_LOOKUP_PADDR_DISPATCH),
         AXLE_SYS_SOCKET_CREATE => Some(&SOCKET_CREATE_DISPATCH),
         AXLE_SYS_SOCKET_WRITE => Some(&SOCKET_WRITE_DISPATCH),
         AXLE_SYS_SOCKET_READ => Some(&SOCKET_READ_DISPATCH),

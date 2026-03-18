@@ -164,10 +164,15 @@ Main just targets include:
   - one contiguous VMO supplies the shared queue/buffer memory
   - one separate contiguous register-backing page plus one separate contiguous PCI-shaped config
     page freeze the current user-mode transport discovery shape
-  - one physical-address lookup freezes the DMA-style address handoff shape for both queues and the
-    register page
+  - explicit `DmaRegion` objects now pin:
+    - the shared queue/buffer memory
+    - the synthetic PCI config backing page
+    - the register backing page
+    - the BAR0 physical alias
+  - DMA-region lookup, not raw VMO lookup, now freezes the DMA-style address handoff shape
   - one physical alias over the config page plus one BAR0 physical VMO created from that config
     page freeze the current PCI-shaped register-window contract
+  - driver mapping of the config alias and BAR0 window now explicitly exercises `ZX_VM_MAP_MMIO`
   - one MMIO-style BAR0 register page freezes a minimal control-plane shape:
     - device identity/version
     - feature bits plus driver-acknowledged feature bits
@@ -179,18 +184,24 @@ Main just targets include:
     loopback round without channel/socket data-plane help
   - the summary now also exports:
     - `config_backing_create`
-    - `config_lookup`
+    - `config_pin_create`
+    - `config_dma_lookup`
     - `config_alias_create`
-    - `config_alias_lookup`
+    - `config_alias_pin_create`
+    - `config_alias_dma_lookup`
     - `config_alias_match`
     - `config_alias_map`
     - `reg_backing_create`
-    - `reg_lookup`
+    - `reg_pin_create`
+    - `reg_dma_lookup`
     - `reg_backing_map`
     - `bar0_create`
-    - `bar0_lookup`
+    - `bar0_pin_create`
+    - `bar0_dma_lookup`
     - `bar0_match`
     - `bar0_map`
+    - `queue_pin_create`
+    - `queue_dma_lookup`
     - `mmio_ready`
     - `mmio_device_features`
     - `mmio_driver_features`
@@ -555,7 +566,9 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - current assertions cover:
     - virtual interrupt create / wait / trigger / mask / unmask / ack
     - contiguous VMO creation, physical-address lookup, and contiguity check
+    - contiguous VMO pin into one `DmaRegion` object plus pinned-range paddr lookup
     - physical VMO aliasing over an existing contiguous page
+    - physical VMO pin into one `DmaRegion` object plus pinned-range paddr lookup
 - `tools/axle-concurrency` is a host-side Snowcat-lite runner for concurrent seeds:
   - seeds carry both operation programs and schedule hints
   - replay metadata includes runner version, logical CPU count, flags, PRNG seed, and step budget

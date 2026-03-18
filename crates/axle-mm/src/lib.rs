@@ -42,6 +42,15 @@ bitflags! {
     }
 }
 
+/// Cache policy carried by one mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingCachePolicy {
+    /// Normal cacheable memory.
+    Cached,
+    /// Device/MMIO-style uncached memory.
+    DeviceMmio,
+}
+
 bitflags! {
     /// Relevant fault bits observed by the VM metadata layer.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -998,6 +1007,7 @@ pub struct MapRec {
     global_vmo_id: GlobalVmoId,
     vmo_offset: u64,
     max_perms: MappingPerms,
+    cache_policy: MappingCachePolicy,
 }
 
 impl MapRec {
@@ -1044,6 +1054,11 @@ impl MapRec {
     /// Maximum allowed permissions for future `protect` operations.
     pub const fn max_perms(self) -> MappingPerms {
         self.max_perms
+    }
+
+    /// Fixed cache policy for this mapping.
+    pub const fn cache_policy(self) -> MappingCachePolicy {
+        self.cache_policy
     }
 
     fn end(self) -> u64 {
@@ -1138,6 +1153,7 @@ pub struct VmaLookup {
     frame_id: Option<FrameId>,
     perms: MappingPerms,
     max_perms: MappingPerms,
+    cache_policy: MappingCachePolicy,
     copy_on_write: bool,
     global_backed: bool,
     mapping_base: u64,
@@ -1193,6 +1209,11 @@ impl VmaLookup {
     /// Maximum allowed permissions.
     pub const fn max_perms(self) -> MappingPerms {
         self.max_perms
+    }
+
+    /// Fixed cache policy for this mapping.
+    pub const fn cache_policy(self) -> MappingCachePolicy {
+        self.cache_policy
     }
 
     /// Whether the resolved mapping is currently armed for copy-on-write.
@@ -2370,6 +2391,33 @@ impl AddressSpace {
         perms: MappingPerms,
         max_perms: MappingPerms,
     ) -> Result<(), AddressSpaceError> {
+        self.map_fixed_in_vmar_with_policy(
+            frames,
+            vmar_id,
+            base,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            max_perms,
+            MappingCachePolicy::Cached,
+        )
+    }
+
+    /// Install a fixed mapping into one VMAR with explicit cache policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_fixed_in_vmar_with_policy(
+        &mut self,
+        frames: &mut FrameTable,
+        vmar_id: VmarId,
+        base: u64,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        max_perms: MappingPerms,
+        cache_policy: MappingCachePolicy,
+    ) -> Result<(), AddressSpaceError> {
         validate_mapping_range(base, len)?;
         let vmar = self.vmar(vmar_id).ok_or(AddressSpaceError::InvalidVmar)?;
         if !max_perms.contains(perms) || !vmar.contains_range(base, len) {
@@ -2450,6 +2498,7 @@ impl AddressSpace {
             global_vmo_id,
             vmo_offset,
             max_perms,
+            cache_policy,
         };
         let vma = Vma {
             map_id,
@@ -2526,6 +2575,35 @@ impl AddressSpace {
         max_perms: MappingPerms,
         align: u64,
     ) -> Result<u64, AddressSpaceError> {
+        self.map_anywhere_in_vmar_with_policy(
+            frames,
+            cpu_id,
+            vmar_id,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            max_perms,
+            align,
+            MappingCachePolicy::Cached,
+        )
+    }
+
+    /// Install one non-specific mapping with explicit cache policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_anywhere_in_vmar_with_policy(
+        &mut self,
+        frames: &mut FrameTable,
+        cpu_id: usize,
+        vmar_id: VmarId,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        max_perms: MappingPerms,
+        align: u64,
+        cache_policy: MappingCachePolicy,
+    ) -> Result<u64, AddressSpaceError> {
         let vmar = self
             .vmar_record(vmar_id)
             .ok_or(AddressSpaceError::InvalidVmar)?;
@@ -2548,8 +2626,16 @@ impl AddressSpace {
             )
             .map(|(base, _)| base)
             .ok_or(AddressSpaceError::OutOfRange)?;
-        self.map_fixed_in_vmar(
-            frames, vmar_id, base, len, vmo_id, vmo_offset, perms, max_perms,
+        self.map_fixed_in_vmar_with_policy(
+            frames,
+            vmar_id,
+            base,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            max_perms,
+            cache_policy,
         )?;
         Ok(base)
     }
@@ -2939,6 +3025,7 @@ impl AddressSpace {
                 .checked_add(base - source.base())
                 .ok_or(AddressSpaceError::InvalidArgs)?,
             max_perms: source.max_perms(),
+            cache_policy: source.cache_policy(),
         };
         let vma = Vma {
             map_id,
@@ -3411,6 +3498,7 @@ impl AddressSpace {
             frame_id: vmo.frame_at_offset(resolved_offset),
             perms,
             max_perms: resolved.map_rec.max_perms(),
+            cache_policy: resolved.map_rec.cache_policy(),
             copy_on_write: resolved.meta.cow_shared(),
             global_backed: vmo.is_global_backed(),
             mapping_base: resolved.map_rec.base(),

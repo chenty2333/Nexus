@@ -662,3 +662,27 @@ args = [
   { name = "offset", ty = "u64" },
   { name = "out_paddr", ty = "*mut u64" },
 ]
+
+[[syscall]]
+name = "ax_vmo_pin"
+nr = 57
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "offset", ty = "u64" },
+  { name = "len", ty = "u64" },
+  { name = "options", ty = "u32" },
+  { name = "out", ty = "*mut ax_handle_t" },
+]
+
+[[syscall]]
+name = "ax_dma_region_lookup_paddr"
+nr = 58
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "offset", ty = "u64" },
+  { name = "out_paddr", ty = "*mut u64" },
+]

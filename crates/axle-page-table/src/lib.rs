@@ -69,10 +69,20 @@ impl PageRange {
 
 /// One mapped leaf-page entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingCachePolicy {
+    /// Normal cacheable memory.
+    Cached,
+    /// Device/MMIO-style uncached mapping.
+    DeviceMmio,
+}
+
+/// One mapped leaf-page entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageMapping {
     paddr: u64,
     writable: bool,
     executable: bool,
+    cache_policy: MappingCachePolicy,
 }
 
 impl PageMapping {
@@ -87,6 +97,16 @@ impl PageMapping {
         writable: bool,
         executable: bool,
     ) -> Result<Self, PageTableError> {
+        Self::with_cache_policy(paddr, writable, executable, MappingCachePolicy::Cached)
+    }
+
+    /// Build one page mapping from a page-aligned physical address with explicit cache policy.
+    pub fn with_cache_policy(
+        paddr: u64,
+        writable: bool,
+        executable: bool,
+        cache_policy: MappingCachePolicy,
+    ) -> Result<Self, PageTableError> {
         if !is_page_aligned(paddr) {
             return Err(PageTableError::InvalidArgs);
         }
@@ -94,6 +114,7 @@ impl PageMapping {
             paddr,
             writable,
             executable,
+            cache_policy,
         })
     }
 
@@ -110,6 +131,11 @@ impl PageMapping {
     /// Whether the mapping should be executable.
     pub const fn executable(self) -> bool {
         self.executable
+    }
+
+    /// Leaf-page cache policy.
+    pub const fn cache_policy(self) -> MappingCachePolicy {
+        self.cache_policy
     }
 }
 

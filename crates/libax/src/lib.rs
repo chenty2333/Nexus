@@ -488,6 +488,38 @@ pub fn ax_vmo_lookup_paddr(handle: ax_handle_t, offset: u64, out_paddr: &mut u64
     }
 }
 
+/// Pin one physical/contiguous VMO range and return a DMA region handle.
+pub fn ax_vmo_pin(
+    handle: ax_handle_t,
+    offset: u64,
+    len: u64,
+    options: u32,
+    out: &mut ax_handle_t,
+) -> ax_status_t {
+    let raw = match narrow_handle(handle) {
+        Ok(raw) => raw,
+        Err(status) => return status,
+    };
+    let mut raw_out = libzircon::handle::ZX_HANDLE_INVALID;
+    let status = libzircon::ax_vmo_pin(raw, offset, len, options, &mut raw_out);
+    if status == AX_OK {
+        *out = widen_handle(raw_out);
+    }
+    status
+}
+
+/// Return the physical address backing one offset inside a pinned DMA region.
+pub fn ax_dma_region_lookup_paddr(
+    handle: ax_handle_t,
+    offset: u64,
+    out_paddr: &mut u64,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_dma_region_lookup_paddr(raw, offset, out_paddr),
+        Err(status) => status,
+    }
+}
+
 /// Read bytes from a VMO.
 pub fn ax_vmo_read(handle: ax_handle_t, bytes: &mut [u8], offset: u64) -> ax_status_t {
     match narrow_handle(handle) {

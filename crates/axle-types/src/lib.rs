@@ -519,6 +519,11 @@ pub mod vm {
     /// The initial mapping remains read-only in hardware. The first write faults in one
     /// mapping-local private page without mutating the shared source object.
     pub const AX_VM_PRIVATE_CLONE: ax_vm_option_t = 1 << 4;
+    /// Native device/MMIO mapping request.
+    ///
+    /// This requests one uncached device-style mapping attribute on the installed leaf PTEs.
+    /// It is currently intended only for physical/contiguous device-facing VMOs.
+    pub const AX_VM_MAP_MMIO: ax_vm_option_t = 1 << 5;
     /// Native upper-bound interpretation for non-specific VMAR allocation.
     pub const AX_VM_OFFSET_IS_UPPER_LIMIT: ax_vm_option_t = 1 << 9;
     /// Native child VMAR may create readable mappings.
@@ -568,6 +573,8 @@ pub mod vm {
     pub const ZX_VM_COMPACT: zx_vm_option_t = AX_VM_COMPACT as zx_vm_option_t;
     /// Map one shared pager/file-backed VMO through a private copy-on-write view.
     pub const ZX_VM_PRIVATE_CLONE: zx_vm_option_t = AX_VM_PRIVATE_CLONE as zx_vm_option_t;
+    /// Map one physical/contiguous VMO with device/MMIO cache attributes.
+    pub const ZX_VM_MAP_MMIO: zx_vm_option_t = AX_VM_MAP_MMIO as zx_vm_option_t;
     /// Interpret the supplied offset as an upper bound for non-specific VMAR allocation.
     pub const ZX_VM_OFFSET_IS_UPPER_LIMIT: zx_vm_option_t =
         AX_VM_OFFSET_IS_UPPER_LIMIT as zx_vm_option_t;

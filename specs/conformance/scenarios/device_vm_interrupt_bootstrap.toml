@@ -36,6 +36,11 @@ contig_write = 0
 contig_read = 0
 physical_create = 0
 physical_lookup = 0
+contig_pin_create = 0
+contig_pin_lookup0 = 0
+contig_pin_lookup1 = 0
+physical_pin_create = 0
+physical_pin_lookup = 0
 physical_map = 0
 
 [assertions.packet_fields]
@@ -43,5 +48,7 @@ device_failure_step = 0
 interrupt_wait_signaled_observed = 8
 interrupt_wait_unmasked_observed = 8
 contig_is_contiguous = 1
+contig_pin_matches = 1
 contig_read_match = 1
 physical_matches_contig0 = 1
+physical_pin_matches = 1

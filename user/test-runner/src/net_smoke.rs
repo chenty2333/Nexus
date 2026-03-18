@@ -8,11 +8,11 @@ use crate::virtio_net_transport::{
     MMIO_NOTIFY_RX, MMIO_NOTIFY_TX, MMIO_STATUS_ACKNOWLEDGE, MMIO_STATUS_DRIVER,
     MMIO_STATUS_DRIVER_OK, MMIO_STATUS_FEATURES_OK, MMIO_VENDOR_ID_AXLE, MMIO_VERSION, PAGE_SIZE,
     PCI_CLASS_NETWORK, PCI_DEVICE_ID_NET, PCI_SUBCLASS_ETHERNET, PCI_VENDOR_ID_AXLE, PciConfigPage,
-    QUEUE_PAIR_COUNT, QUEUE_SIZE, QUEUE_VMO_BYTES, REGISTER_VMO_BYTES, VirtioMmioHeader,
-    VirtioNetHdr, VirtioQueueRegs, VirtqDesc, buffer_offset, buffer_paddr, empty_avail, empty_used,
-    frame_len, init_pci_config, init_regs, read_avail, read_header, read_pci_config,
-    read_queue_regs, read_used, rx_buffer_offset, rx_queue_offset, tx_buffer_offset,
-    tx_queue_offset, write_avail, write_desc, write_header, write_queue_regs, write_used,
+    QUEUE_PAIR_COUNT, QUEUE_SIZE, QUEUE_VMO_BYTES, REGISTER_VMO_BYTES, VirtioNetHdr,
+    VirtioQueueRegs, VirtqDesc, buffer_offset, buffer_paddr, empty_avail, empty_used, frame_len,
+    init_pci_config, init_regs, read_avail, read_header, read_pci_config, read_queue_regs,
+    read_used, rx_buffer_offset, rx_queue_offset, tx_buffer_offset, tx_queue_offset, write_avail,
+    write_desc, write_header, write_queue_regs, write_used,
 };
 use axle_arch_x86_64::{debug_break, native_syscall8, rdtsc};
 use libzircon::handle::ZX_HANDLE_INVALID;
@@ -20,11 +20,12 @@ use libzircon::interrupt::ZX_INTERRUPT_VIRTUAL;
 use libzircon::signals::{ZX_INTERRUPT_SIGNALED, ZX_TASK_TERMINATED};
 use libzircon::status::ZX_OK;
 use libzircon::syscall_numbers::AXLE_SYS_VMAR_MAP;
-use libzircon::vm::{ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
+use libzircon::vm::{ZX_VM_MAP_MMIO, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
-    ax_interrupt_trigger, ax_vmo_lookup_paddr, zx_handle_close, zx_handle_t, zx_interrupt_ack,
-    zx_interrupt_create, zx_object_wait_one, zx_signals_t, zx_status_t, zx_task_kill,
-    zx_thread_create, zx_thread_start, zx_vmo_create_contiguous, zx_vmo_create_physical,
+    ax_dma_region_lookup_paddr, ax_interrupt_trigger, ax_vmo_pin, zx_handle_close, zx_handle_t,
+    zx_interrupt_ack, zx_interrupt_create, zx_object_wait_one, zx_signals_t, zx_status_t,
+    zx_task_kill, zx_thread_create, zx_thread_start, zx_vmo_create_contiguous,
+    zx_vmo_create_physical,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
@@ -89,6 +90,11 @@ const SLOT_NET_RX_COMPLETE_MASK: usize = 1004;
 const SLOT_NET_TX_READY_MASK: usize = 1005;
 const SLOT_NET_RX_READY_MASK: usize = 1006;
 const SLOT_NET_PCI_VENDOR_ID: usize = 1007;
+const SLOT_NET_REG_PIN_CREATE: usize = 1008;
+const SLOT_NET_CONFIG_PIN_CREATE: usize = 1009;
+const SLOT_NET_CONFIG_ALIAS_PIN_CREATE: usize = 1010;
+const SLOT_NET_QUEUE_PIN_CREATE: usize = 1011;
+const SLOT_NET_BAR0_PIN_CREATE: usize = 1012;
 
 const STEP_PANIC: u64 = u64::MAX;
 const STEP_ROOT_VMAR: u64 = 1;
@@ -97,34 +103,39 @@ const STEP_READY_IRQ_CREATE: u64 = 3;
 const STEP_TX_IRQ_CREATE: u64 = 4;
 const STEP_RX_IRQ_CREATE: u64 = 5;
 const STEP_REG_BACKING_CREATE: u64 = 6;
-const STEP_REG_LOOKUP: u64 = 7;
-const STEP_REG_BACKING_MAP: u64 = 8;
-const STEP_CONFIG_BACKING_CREATE: u64 = 9;
-const STEP_CONFIG_LOOKUP: u64 = 10;
-const STEP_CONFIG_ALIAS_CREATE: u64 = 11;
-const STEP_CONFIG_ALIAS_LOOKUP: u64 = 12;
-const STEP_CONFIG_ALIAS_MAP: u64 = 13;
-const STEP_CONFIG_BACKING_MAP: u64 = 14;
-const STEP_QUEUE_VMO_CREATE: u64 = 15;
-const STEP_QUEUE_LOOKUP: u64 = 16;
-const STEP_QUEUE_MAP: u64 = 17;
-const STEP_BAR0_CREATE: u64 = 18;
-const STEP_BAR0_LOOKUP: u64 = 19;
-const STEP_BAR0_MAP: u64 = 20;
-const STEP_WORKER_THREAD_CREATE: u64 = 21;
-const STEP_WORKER_THREAD_START: u64 = 22;
-const STEP_READY_WAIT: u64 = 23;
-const STEP_READY_ACK: u64 = 24;
-const STEP_MMIO_READY: u64 = 25;
-const STEP_TX_KICK: u64 = 26;
-const STEP_RX_WAIT: u64 = 27;
-const STEP_RX_ACK: u64 = 28;
-const STEP_WORKER_WAIT_KICK: u64 = 29;
-const STEP_WORKER_ACK_KICK: u64 = 30;
-const STEP_WORKER_TRIGGER_RX: u64 = 31;
-const STEP_TX_USED: u64 = 32;
-const STEP_RX_USED: u64 = 33;
-const STEP_PACKET_MATCH: u64 = 34;
+const STEP_REG_PIN_CREATE: u64 = 7;
+const STEP_REG_DMA_LOOKUP: u64 = 8;
+const STEP_REG_BACKING_MAP: u64 = 9;
+const STEP_CONFIG_BACKING_CREATE: u64 = 10;
+const STEP_CONFIG_PIN_CREATE: u64 = 11;
+const STEP_CONFIG_DMA_LOOKUP: u64 = 12;
+const STEP_CONFIG_ALIAS_CREATE: u64 = 13;
+const STEP_CONFIG_ALIAS_PIN_CREATE: u64 = 14;
+const STEP_CONFIG_ALIAS_DMA_LOOKUP: u64 = 15;
+const STEP_CONFIG_ALIAS_MAP: u64 = 16;
+const STEP_CONFIG_BACKING_MAP: u64 = 17;
+const STEP_QUEUE_VMO_CREATE: u64 = 18;
+const STEP_QUEUE_PIN_CREATE: u64 = 19;
+const STEP_QUEUE_DMA_LOOKUP: u64 = 20;
+const STEP_QUEUE_MAP: u64 = 21;
+const STEP_BAR0_CREATE: u64 = 22;
+const STEP_BAR0_PIN_CREATE: u64 = 23;
+const STEP_BAR0_DMA_LOOKUP: u64 = 24;
+const STEP_BAR0_MAP: u64 = 25;
+const STEP_WORKER_THREAD_CREATE: u64 = 26;
+const STEP_WORKER_THREAD_START: u64 = 27;
+const STEP_READY_WAIT: u64 = 28;
+const STEP_READY_ACK: u64 = 29;
+const STEP_MMIO_READY: u64 = 30;
+const STEP_TX_KICK: u64 = 31;
+const STEP_RX_WAIT: u64 = 32;
+const STEP_RX_ACK: u64 = 33;
+const STEP_WORKER_WAIT_KICK: u64 = 34;
+const STEP_WORKER_ACK_KICK: u64 = 35;
+const STEP_WORKER_TRIGGER_RX: u64 = 36;
+const STEP_TX_USED: u64 = 37;
+const STEP_RX_USED: u64 = 38;
+const STEP_PACKET_MATCH: u64 = 39;
 
 const WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
 const WORKER_STACK_BYTES: usize = 4096;
@@ -146,7 +157,6 @@ struct BumpAllocator;
 static ALLOCATOR: BumpAllocator = BumpAllocator;
 
 static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
-
 #[derive(Clone, Copy, Default)]
 struct NetSummary {
     failure_step: u64,
@@ -154,19 +164,24 @@ struct NetSummary {
     tx_irq_create: i64,
     rx_irq_create: i64,
     reg_backing_create: i64,
-    reg_lookup: i64,
+    reg_pin_create: i64,
+    reg_dma_lookup: i64,
     reg_backing_map: i64,
     config_backing_create: i64,
-    config_lookup: i64,
+    config_pin_create: i64,
+    config_dma_lookup: i64,
     config_alias_create: i64,
-    config_alias_lookup: i64,
+    config_alias_pin_create: i64,
+    config_alias_dma_lookup: i64,
     config_alias_map: i64,
     config_backing_map: i64,
     queue_vmo_create: i64,
-    queue_lookup: i64,
+    queue_pin_create: i64,
+    queue_dma_lookup: i64,
     queue_map: i64,
     bar0_create: i64,
-    bar0_lookup: i64,
+    bar0_pin_create: i64,
+    bar0_dma_lookup: i64,
     bar0_map: i64,
     worker_thread_create: i64,
     worker_thread_start: i64,
@@ -228,6 +243,18 @@ static NET_WORKER_FAILURE_STEP: [AtomicU64; QUEUE_PAIR_COUNT] =
 static mut NET_WORKER_STACKS: [WorkerStack; QUEUE_PAIR_COUNT] =
     [WorkerStack([0; WORKER_STACK_BYTES]); QUEUE_PAIR_COUNT];
 static mut HEAP: HeapStorage = HeapStorage([0; HEAP_BYTES]);
+
+const OWNED_REG_BACKING: usize = 0;
+const OWNED_REG_DMA: usize = 1;
+const OWNED_CONFIG_BACKING: usize = 2;
+const OWNED_CONFIG_DMA: usize = 3;
+const OWNED_CONFIG_ALIAS: usize = 4;
+const OWNED_CONFIG_ALIAS_DMA: usize = 5;
+const OWNED_QUEUE_VMO: usize = 6;
+const OWNED_QUEUE_DMA: usize = 7;
+const OWNED_BAR0_VMO: usize = 8;
+const OWNED_BAR0_DMA: usize = 9;
+const OWNED_HANDLE_COUNT: usize = 10;
 
 // SAFETY: this allocator serves only the single-process bootstrap smoke. It
 // monotonically carves aligned ranges from one fixed static buffer and never
@@ -302,6 +329,7 @@ fn run_net_smoke() -> NetSummary {
         summary.failure_step = STEP_SELF_PROCESS;
         return summary;
     }
+    let mut owned_handles = [ZX_HANDLE_INVALID; OWNED_HANDLE_COUNT];
 
     let mut ready_irqs = [ZX_HANDLE_INVALID; QUEUE_PAIR_COUNT];
     for ready_irq in &mut ready_irqs {
@@ -339,20 +367,34 @@ fn run_net_smoke() -> NetSummary {
         }
     }
 
-    let mut reg_backing_vmo = ZX_HANDLE_INVALID;
     summary.reg_backing_create =
-        zx_vmo_create_contiguous(REGISTER_VMO_BYTES, 0, &mut reg_backing_vmo) as i64;
+        zx_vmo_create_contiguous(REGISTER_VMO_BYTES, 0, &mut owned_handles[OWNED_REG_BACKING])
+            as i64;
     if summary.reg_backing_create != ZX_OK as i64 {
         summary.failure_step = STEP_REG_BACKING_CREATE;
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &[]);
         return summary;
     }
 
+    summary.reg_pin_create = ax_vmo_pin(
+        owned_handles[OWNED_REG_BACKING],
+        0,
+        REGISTER_VMO_BYTES,
+        0,
+        &mut owned_handles[OWNED_REG_DMA],
+    ) as i64;
+    if summary.reg_pin_create != ZX_OK as i64 {
+        summary.failure_step = STEP_REG_PIN_CREATE;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
+        return summary;
+    }
+
     let mut reg_paddr = 0u64;
-    summary.reg_lookup = ax_vmo_lookup_paddr(reg_backing_vmo, 0, &mut reg_paddr) as i64;
-    if summary.reg_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_REG_LOOKUP;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &[reg_backing_vmo]);
+    summary.reg_dma_lookup =
+        ax_dma_region_lookup_paddr(owned_handles[OWNED_REG_DMA], 0, &mut reg_paddr) as i64;
+    if summary.reg_dma_lookup != ZX_OK as i64 {
+        summary.failure_step = STEP_REG_DMA_LOOKUP;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
 
@@ -361,61 +403,81 @@ fn run_net_smoke() -> NetSummary {
         root_vmar,
         ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
         0,
-        reg_backing_vmo,
+        owned_handles[OWNED_REG_BACKING],
         0,
         REGISTER_VMO_BYTES,
         &mut reg_device_base,
     ) as i64;
     if summary.reg_backing_map != ZX_OK as i64 {
         summary.failure_step = STEP_REG_BACKING_MAP;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &[reg_backing_vmo]);
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
 
-    let mut config_backing_vmo = ZX_HANDLE_INVALID;
     summary.config_backing_create =
-        zx_vmo_create_contiguous(PAGE_SIZE, 0, &mut config_backing_vmo) as i64;
+        zx_vmo_create_contiguous(PAGE_SIZE, 0, &mut owned_handles[OWNED_CONFIG_BACKING]) as i64;
     if summary.config_backing_create != ZX_OK as i64 {
         summary.failure_step = STEP_CONFIG_BACKING_CREATE;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[config_backing_vmo, reg_backing_vmo],
-        );
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
+        return summary;
+    }
+
+    summary.config_pin_create = ax_vmo_pin(
+        owned_handles[OWNED_CONFIG_BACKING],
+        0,
+        PAGE_SIZE,
+        0,
+        &mut owned_handles[OWNED_CONFIG_DMA],
+    ) as i64;
+    if summary.config_pin_create != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_PIN_CREATE;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
 
     let mut config_paddr = 0u64;
-    summary.config_lookup = ax_vmo_lookup_paddr(config_backing_vmo, 0, &mut config_paddr) as i64;
-    if summary.config_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_CONFIG_LOOKUP;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[config_backing_vmo, reg_backing_vmo],
-        );
+    summary.config_dma_lookup =
+        ax_dma_region_lookup_paddr(owned_handles[OWNED_CONFIG_DMA], 0, &mut config_paddr) as i64;
+    if summary.config_dma_lookup != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_DMA_LOOKUP;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
 
-    let mut config_alias_vmo = ZX_HANDLE_INVALID;
-    summary.config_alias_create =
-        zx_vmo_create_physical(config_paddr, PAGE_SIZE, 0, &mut config_alias_vmo) as i64;
+    summary.config_alias_create = zx_vmo_create_physical(
+        config_paddr,
+        PAGE_SIZE,
+        0,
+        &mut owned_handles[OWNED_CONFIG_ALIAS],
+    ) as i64;
     if summary.config_alias_create != ZX_OK as i64 {
         summary.failure_step = STEP_CONFIG_ALIAS_CREATE;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[config_alias_vmo, config_backing_vmo, reg_backing_vmo],
-        );
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
+        return summary;
+    }
+
+    summary.config_alias_pin_create = ax_vmo_pin(
+        owned_handles[OWNED_CONFIG_ALIAS],
+        0,
+        PAGE_SIZE,
+        0,
+        &mut owned_handles[OWNED_CONFIG_ALIAS_DMA],
+    ) as i64;
+    if summary.config_alias_pin_create != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_ALIAS_PIN_CREATE;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
 
     let mut config_alias_paddr = 0u64;
-    summary.config_alias_lookup =
-        ax_vmo_lookup_paddr(config_alias_vmo, 0, &mut config_alias_paddr) as i64;
-    if summary.config_alias_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_CONFIG_ALIAS_LOOKUP;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[config_alias_vmo, config_backing_vmo, reg_backing_vmo],
-        );
+    summary.config_alias_dma_lookup = ax_dma_region_lookup_paddr(
+        owned_handles[OWNED_CONFIG_ALIAS_DMA],
+        0,
+        &mut config_alias_paddr,
+    ) as i64;
+    if summary.config_alias_dma_lookup != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_ALIAS_DMA_LOOKUP;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
     summary.config_alias_match = u64::from(config_alias_paddr == config_paddr);
@@ -423,19 +485,16 @@ fn run_net_smoke() -> NetSummary {
     let mut config_driver_base = 0u64;
     summary.config_alias_map = zx_vmar_map_local(
         root_vmar,
-        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_MAP_MMIO,
         0,
-        config_alias_vmo,
+        owned_handles[OWNED_CONFIG_ALIAS],
         0,
         PAGE_SIZE,
         &mut config_driver_base,
     ) as i64;
     if summary.config_alias_map != ZX_OK as i64 {
         summary.failure_step = STEP_CONFIG_ALIAS_MAP;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[config_alias_vmo, config_backing_vmo, reg_backing_vmo],
-        );
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
 
@@ -444,52 +503,47 @@ fn run_net_smoke() -> NetSummary {
         root_vmar,
         ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
         0,
-        config_backing_vmo,
+        owned_handles[OWNED_CONFIG_BACKING],
         0,
         PAGE_SIZE,
         &mut config_device_base,
     ) as i64;
     if summary.config_backing_map != ZX_OK as i64 {
         summary.failure_step = STEP_CONFIG_BACKING_MAP;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[config_alias_vmo, config_backing_vmo, reg_backing_vmo],
-        );
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
 
     init_regs(reg_device_base);
     init_pci_config(config_device_base, reg_paddr);
 
-    let mut queue_vmo = ZX_HANDLE_INVALID;
-    summary.queue_vmo_create = zx_vmo_create_contiguous(QUEUE_VMO_BYTES, 0, &mut queue_vmo) as i64;
+    summary.queue_vmo_create =
+        zx_vmo_create_contiguous(QUEUE_VMO_BYTES, 0, &mut owned_handles[OWNED_QUEUE_VMO]) as i64;
     if summary.queue_vmo_create != ZX_OK as i64 {
         summary.failure_step = STEP_QUEUE_VMO_CREATE;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[
-                queue_vmo,
-                config_alias_vmo,
-                config_backing_vmo,
-                reg_backing_vmo,
-            ],
-        );
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
+        return summary;
+    }
+
+    summary.queue_pin_create = ax_vmo_pin(
+        owned_handles[OWNED_QUEUE_VMO],
+        0,
+        QUEUE_VMO_BYTES,
+        0,
+        &mut owned_handles[OWNED_QUEUE_DMA],
+    ) as i64;
+    if summary.queue_pin_create != ZX_OK as i64 {
+        summary.failure_step = STEP_QUEUE_PIN_CREATE;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
 
     let mut queue_paddr = 0u64;
-    summary.queue_lookup = ax_vmo_lookup_paddr(queue_vmo, 0, &mut queue_paddr) as i64;
-    if summary.queue_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_QUEUE_LOOKUP;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[
-                queue_vmo,
-                config_alias_vmo,
-                config_backing_vmo,
-                reg_backing_vmo,
-            ],
-        );
+    summary.queue_dma_lookup =
+        ax_dma_region_lookup_paddr(owned_handles[OWNED_QUEUE_DMA], 0, &mut queue_paddr) as i64;
+    if summary.queue_dma_lookup != ZX_OK as i64 {
+        summary.failure_step = STEP_QUEUE_DMA_LOOKUP;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
 
@@ -498,41 +552,25 @@ fn run_net_smoke() -> NetSummary {
         root_vmar,
         ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
         0,
-        queue_vmo,
+        owned_handles[OWNED_QUEUE_VMO],
         0,
         QUEUE_VMO_BYTES,
         &mut mapped_queue_base,
     ) as i64;
     if summary.queue_map != ZX_OK as i64 {
         summary.failure_step = STEP_QUEUE_MAP;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[
-                queue_vmo,
-                config_alias_vmo,
-                config_backing_vmo,
-                reg_backing_vmo,
-            ],
-        );
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
     init_transport_memory(mapped_queue_base);
 
     let config = read_pci_config(config_driver_base);
     summary.pci_vendor_id = u64::from(config.vendor_id);
-    let (bar0_vmo, bar0_paddr, reg_driver_base) =
-        match map_driver_bar0(root_vmar, config, &mut summary) {
+    let (_bar0_vmo, bar0_paddr, reg_driver_base) =
+        match map_driver_bar0(root_vmar, config, &mut summary, &mut owned_handles) {
             Some(values) => values,
             None => {
-                close_handle_sets(
-                    &[&rx_irqs, &tx_irqs, &ready_irqs],
-                    &[
-                        queue_vmo,
-                        config_alias_vmo,
-                        config_backing_vmo,
-                        reg_backing_vmo,
-                    ],
-                );
+                close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
                 return summary;
             }
         };
@@ -561,13 +599,7 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[
-                    bar0_vmo,
-                    queue_vmo,
-                    config_alias_vmo,
-                    config_backing_vmo,
-                    reg_backing_vmo,
-                ],
+                &owned_handles,
             );
             return summary;
         }
@@ -587,13 +619,7 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[
-                    bar0_vmo,
-                    queue_vmo,
-                    config_alias_vmo,
-                    config_backing_vmo,
-                    reg_backing_vmo,
-                ],
+                &owned_handles,
             );
             return summary;
         }
@@ -613,13 +639,7 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[
-                    bar0_vmo,
-                    queue_vmo,
-                    config_alias_vmo,
-                    config_backing_vmo,
-                    reg_backing_vmo,
-                ],
+                &owned_handles,
             );
             return summary;
         }
@@ -633,13 +653,7 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[
-                    bar0_vmo,
-                    queue_vmo,
-                    config_alias_vmo,
-                    config_backing_vmo,
-                    reg_backing_vmo,
-                ],
+                &owned_handles,
             );
             return summary;
         }
@@ -650,13 +664,7 @@ fn run_net_smoke() -> NetSummary {
         close_workers_and_handles(
             &worker_threads,
             &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[
-                bar0_vmo,
-                queue_vmo,
-                config_alias_vmo,
-                config_backing_vmo,
-                reg_backing_vmo,
-            ],
+            &owned_handles,
         );
         return summary;
     }
@@ -674,13 +682,7 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[
-                    bar0_vmo,
-                    queue_vmo,
-                    config_alias_vmo,
-                    config_backing_vmo,
-                    reg_backing_vmo,
-                ],
+                &owned_handles,
             );
             return summary;
         }
@@ -700,13 +702,7 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[
-                    bar0_vmo,
-                    queue_vmo,
-                    config_alias_vmo,
-                    config_backing_vmo,
-                    reg_backing_vmo,
-                ],
+                &owned_handles,
             );
             return summary;
         }
@@ -721,13 +717,7 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[
-                    bar0_vmo,
-                    queue_vmo,
-                    config_alias_vmo,
-                    config_backing_vmo,
-                    reg_backing_vmo,
-                ],
+                &owned_handles,
             );
             return summary;
         }
@@ -819,13 +809,7 @@ fn run_net_smoke() -> NetSummary {
     close_workers_and_handles(
         &worker_threads,
         &[&rx_irqs, &tx_irqs, &ready_irqs],
-        &[
-            bar0_vmo,
-            queue_vmo,
-            config_alias_vmo,
-            config_backing_vmo,
-            reg_backing_vmo,
-        ],
+        &owned_handles,
     );
     summary
 }
@@ -834,6 +818,7 @@ fn map_driver_bar0(
     root_vmar: zx_handle_t,
     config: PciConfigPage,
     summary: &mut NetSummary,
+    owned_handles: &mut [zx_handle_t; OWNED_HANDLE_COUNT],
 ) -> Option<(zx_handle_t, u64, u64)> {
     if config.vendor_id != PCI_VENDOR_ID_AXLE
         || config.device_id != PCI_DEVICE_ID_NET
@@ -844,47 +829,57 @@ fn map_driver_bar0(
         || config.queue_pairs != QUEUE_PAIR_COUNT as u32
         || config.queue_size != QUEUE_SIZE as u32
     {
-        summary.failure_step = STEP_CONFIG_ALIAS_LOOKUP;
+        summary.failure_step = STEP_CONFIG_ALIAS_DMA_LOOKUP;
         return None;
     }
 
-    let mut bar0_vmo = ZX_HANDLE_INVALID;
     summary.bar0_create = zx_vmo_create_physical(
         config.bar0_paddr,
         u64::from(config.bar0_size),
         0,
-        &mut bar0_vmo,
+        &mut owned_handles[OWNED_BAR0_VMO],
     ) as i64;
     if summary.bar0_create != ZX_OK as i64 {
         summary.failure_step = STEP_BAR0_CREATE;
         return None;
     }
 
+    summary.bar0_pin_create = ax_vmo_pin(
+        owned_handles[OWNED_BAR0_VMO],
+        0,
+        u64::from(config.bar0_size),
+        0,
+        &mut owned_handles[OWNED_BAR0_DMA],
+    ) as i64;
+    if summary.bar0_pin_create != ZX_OK as i64 {
+        summary.failure_step = STEP_BAR0_PIN_CREATE;
+        return None;
+    }
+
     let mut bar0_paddr = 0u64;
-    summary.bar0_lookup = ax_vmo_lookup_paddr(bar0_vmo, 0, &mut bar0_paddr) as i64;
-    if summary.bar0_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_BAR0_LOOKUP;
-        close_handles(&[bar0_vmo]);
+    summary.bar0_dma_lookup =
+        ax_dma_region_lookup_paddr(owned_handles[OWNED_BAR0_DMA], 0, &mut bar0_paddr) as i64;
+    if summary.bar0_dma_lookup != ZX_OK as i64 {
+        summary.failure_step = STEP_BAR0_DMA_LOOKUP;
         return None;
     }
 
     let mut bar0_driver_base = 0u64;
     summary.bar0_map = zx_vmar_map_local(
         root_vmar,
-        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_MAP_MMIO,
         0,
-        bar0_vmo,
+        owned_handles[OWNED_BAR0_VMO],
         0,
         u64::from(config.bar0_size),
         &mut bar0_driver_base,
     ) as i64;
     if summary.bar0_map != ZX_OK as i64 {
         summary.failure_step = STEP_BAR0_MAP;
-        close_handles(&[bar0_vmo]);
         return None;
     }
 
-    Some((bar0_vmo, bar0_paddr, bar0_driver_base))
+    Some((owned_handles[OWNED_BAR0_VMO], bar0_paddr, bar0_driver_base))
 }
 
 fn configure_driver_transport(
@@ -1214,7 +1209,7 @@ fn aggregate_status(dst: &mut i64, status: i64) {
 fn current_cpu_apic_id() -> u64 {
     // SAFETY: CPUID leaf 1 is always available on the x86_64 bootstrap target,
     // and reading the local APIC id is side-effect free.
-    u64::from((unsafe { __cpuid(1) }.ebx >> 24) & 0xff)
+    u64::from((__cpuid(1).ebx >> 24) & 0xff)
 }
 
 fn worker_stack_top(pair: usize) -> u64 {
@@ -1317,7 +1312,7 @@ fn write_summary(summary: &NetSummary) {
     write_slot(SLOT_NET_TX_IRQ_CREATE, summary.tx_irq_create as u64);
     write_slot(SLOT_NET_RX_IRQ_CREATE, summary.rx_irq_create as u64);
     write_slot(SLOT_NET_QUEUE_VMO_CREATE, summary.queue_vmo_create as u64);
-    write_slot(SLOT_NET_QUEUE_LOOKUP, summary.queue_lookup as u64);
+    write_slot(SLOT_NET_QUEUE_LOOKUP, summary.queue_dma_lookup as u64);
     write_slot(SLOT_NET_QUEUE_MAP, summary.queue_map as u64);
     write_slot(
         SLOT_NET_WORKER_THREAD_CREATE,
@@ -1347,14 +1342,14 @@ fn write_summary(summary: &NetSummary) {
         SLOT_NET_CONFIG_BACKING_CREATE,
         summary.config_backing_create as u64,
     );
-    write_slot(SLOT_NET_CONFIG_LOOKUP, summary.config_lookup as u64);
+    write_slot(SLOT_NET_CONFIG_LOOKUP, summary.config_dma_lookup as u64);
     write_slot(
         SLOT_NET_CONFIG_ALIAS_CREATE,
         summary.config_alias_create as u64,
     );
     write_slot(
         SLOT_NET_CONFIG_ALIAS_LOOKUP,
-        summary.config_alias_lookup as u64,
+        summary.config_alias_dma_lookup as u64,
     );
     write_slot(SLOT_NET_CONFIG_ALIAS_MATCH, summary.config_alias_match);
     write_slot(SLOT_NET_CONFIG_ALIAS_MAP, summary.config_alias_map as u64);
@@ -1366,10 +1361,10 @@ fn write_summary(summary: &NetSummary) {
         SLOT_NET_REG_BACKING_CREATE,
         summary.reg_backing_create as u64,
     );
-    write_slot(SLOT_NET_REG_LOOKUP, summary.reg_lookup as u64);
+    write_slot(SLOT_NET_REG_LOOKUP, summary.reg_dma_lookup as u64);
     write_slot(SLOT_NET_REG_BACKING_MAP, summary.reg_backing_map as u64);
     write_slot(SLOT_NET_BAR0_CREATE, summary.bar0_create as u64);
-    write_slot(SLOT_NET_BAR0_LOOKUP, summary.bar0_lookup as u64);
+    write_slot(SLOT_NET_BAR0_LOOKUP, summary.bar0_dma_lookup as u64);
     write_slot(SLOT_NET_BAR0_MATCH, summary.bar0_match);
     write_slot(SLOT_NET_BAR0_MAP, summary.bar0_map as u64);
     write_slot(SLOT_NET_MMIO_READY, summary.mmio_ready);
@@ -1388,4 +1383,12 @@ fn write_summary(summary: &NetSummary) {
     write_slot(SLOT_NET_TX_READY_MASK, summary.tx_ready_mask);
     write_slot(SLOT_NET_RX_READY_MASK, summary.rx_ready_mask);
     write_slot(SLOT_NET_PCI_VENDOR_ID, summary.pci_vendor_id);
+    write_slot(SLOT_NET_REG_PIN_CREATE, summary.reg_pin_create as u64);
+    write_slot(SLOT_NET_CONFIG_PIN_CREATE, summary.config_pin_create as u64);
+    write_slot(
+        SLOT_NET_CONFIG_ALIAS_PIN_CREATE,
+        summary.config_alias_pin_create as u64,
+    );
+    write_slot(SLOT_NET_QUEUE_PIN_CREATE, summary.queue_pin_create as u64);
+    write_slot(SLOT_NET_BAR0_PIN_CREATE, summary.bar0_pin_create as u64);
 }

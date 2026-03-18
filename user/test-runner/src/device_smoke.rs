@@ -8,11 +8,12 @@ use libzircon::interrupt::ZX_INTERRUPT_VIRTUAL;
 use libzircon::signals::ZX_INTERRUPT_SIGNALED;
 use libzircon::status::{ZX_ERR_TIMED_OUT, ZX_OK};
 use libzircon::syscall_numbers::AXLE_SYS_VMAR_MAP;
-use libzircon::vm::{ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
+use libzircon::vm::{ZX_VM_MAP_MMIO, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
-    ax_interrupt_trigger, ax_vmo_lookup_paddr, zx_handle_t, zx_interrupt_ack, zx_interrupt_create,
-    zx_interrupt_mask, zx_interrupt_unmask, zx_object_wait_one, zx_signals_t, zx_status_t,
-    zx_vmo_create_contiguous, zx_vmo_create_physical, zx_vmo_read, zx_vmo_write,
+    ax_dma_region_lookup_paddr, ax_interrupt_trigger, ax_vmo_lookup_paddr, ax_vmo_pin, zx_handle_t,
+    zx_interrupt_ack, zx_interrupt_create, zx_interrupt_mask, zx_interrupt_unmask,
+    zx_object_wait_one, zx_signals_t, zx_status_t, zx_vmo_create_contiguous,
+    zx_vmo_create_physical, zx_vmo_read, zx_vmo_write,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
@@ -52,6 +53,16 @@ const SLOT_DEVICE_PHYSICAL_PADDR: usize = 924;
 const SLOT_DEVICE_PHYSICAL_MATCHES_CONTIG0: usize = 925;
 const SLOT_DEVICE_PHYSICAL_MAP: usize = 926;
 const SLOT_DEVICE_PRESENT: usize = 927;
+const SLOT_DEVICE_CONTIG_PIN_CREATE: usize = 928;
+const SLOT_DEVICE_CONTIG_PIN_LOOKUP0: usize = 929;
+const SLOT_DEVICE_CONTIG_PIN_LOOKUP1: usize = 930;
+const SLOT_DEVICE_CONTIG_PIN_PADDR0: usize = 931;
+const SLOT_DEVICE_CONTIG_PIN_PADDR1: usize = 932;
+const SLOT_DEVICE_CONTIG_PIN_MATCHES: usize = 933;
+const SLOT_DEVICE_PHYSICAL_PIN_CREATE: usize = 934;
+const SLOT_DEVICE_PHYSICAL_PIN_LOOKUP: usize = 935;
+const SLOT_DEVICE_PHYSICAL_PIN_PADDR: usize = 936;
+const SLOT_DEVICE_PHYSICAL_PIN_MATCHES: usize = 937;
 
 const STEP_PANIC: u64 = u64::MAX;
 const STEP_ROOT_VMAR: u64 = 1;
@@ -70,12 +81,17 @@ const STEP_INTERRUPT_WAIT_DRAINED: u64 = 13;
 const STEP_CONTIG_CREATE: u64 = 14;
 const STEP_CONTIG_LOOKUP0: u64 = 15;
 const STEP_CONTIG_LOOKUP1: u64 = 16;
-const STEP_CONTIG_MAP: u64 = 17;
-const STEP_CONTIG_WRITE: u64 = 18;
-const STEP_CONTIG_READ: u64 = 19;
-const STEP_PHYSICAL_CREATE: u64 = 20;
-const STEP_PHYSICAL_LOOKUP: u64 = 21;
-const STEP_PHYSICAL_MAP: u64 = 22;
+const STEP_CONTIG_PIN_CREATE: u64 = 17;
+const STEP_CONTIG_PIN_LOOKUP0: u64 = 18;
+const STEP_CONTIG_PIN_LOOKUP1: u64 = 19;
+const STEP_CONTIG_MAP: u64 = 20;
+const STEP_CONTIG_WRITE: u64 = 21;
+const STEP_CONTIG_READ: u64 = 22;
+const STEP_PHYSICAL_CREATE: u64 = 23;
+const STEP_PHYSICAL_LOOKUP: u64 = 24;
+const STEP_PHYSICAL_PIN_CREATE: u64 = 25;
+const STEP_PHYSICAL_PIN_LOOKUP: u64 = 26;
+const STEP_PHYSICAL_MAP: u64 = 27;
 
 const CONTIG_TEST_OFFSET: u64 = 128;
 const CONTIG_TEST_BYTES: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
@@ -280,6 +296,36 @@ fn run_device_smoke() {
         u64::from(contig_paddr1 == contig_paddr0 + PAGE_SIZE),
     );
 
+    let mut contig_region = ZX_HANDLE_INVALID;
+    let status = ax_vmo_pin(contig, 0, 2 * PAGE_SIZE, 0, &mut contig_region);
+    write_status(SLOT_DEVICE_CONTIG_PIN_CREATE, status);
+    if status != ZX_OK {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_CONTIG_PIN_CREATE);
+        return;
+    }
+
+    let mut contig_pin_paddr0 = 0u64;
+    let status = ax_dma_region_lookup_paddr(contig_region, 0, &mut contig_pin_paddr0);
+    write_status(SLOT_DEVICE_CONTIG_PIN_LOOKUP0, status);
+    write_slot(SLOT_DEVICE_CONTIG_PIN_PADDR0, contig_pin_paddr0);
+    if status != ZX_OK {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_CONTIG_PIN_LOOKUP0);
+        return;
+    }
+
+    let mut contig_pin_paddr1 = 0u64;
+    let status = ax_dma_region_lookup_paddr(contig_region, PAGE_SIZE, &mut contig_pin_paddr1);
+    write_status(SLOT_DEVICE_CONTIG_PIN_LOOKUP1, status);
+    write_slot(SLOT_DEVICE_CONTIG_PIN_PADDR1, contig_pin_paddr1);
+    write_slot(
+        SLOT_DEVICE_CONTIG_PIN_MATCHES,
+        u64::from(contig_pin_paddr0 == contig_paddr0 && contig_pin_paddr1 == contig_paddr1),
+    );
+    if status != ZX_OK || contig_pin_paddr0 != contig_paddr0 || contig_pin_paddr1 != contig_paddr1 {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_CONTIG_PIN_LOOKUP1);
+        return;
+    }
+
     let mut mapped_contig = 0u64;
     let status = zx_vmar_map_local(
         root_vmar,
@@ -336,10 +382,31 @@ fn run_device_smoke() {
         return;
     }
 
+    let mut physical_region = ZX_HANDLE_INVALID;
+    let status = ax_vmo_pin(physical, 0, PAGE_SIZE, 0, &mut physical_region);
+    write_status(SLOT_DEVICE_PHYSICAL_PIN_CREATE, status);
+    if status != ZX_OK {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_PHYSICAL_PIN_CREATE);
+        return;
+    }
+
+    let mut physical_pin_paddr = 0u64;
+    let status = ax_dma_region_lookup_paddr(physical_region, 0, &mut physical_pin_paddr);
+    write_status(SLOT_DEVICE_PHYSICAL_PIN_LOOKUP, status);
+    write_slot(SLOT_DEVICE_PHYSICAL_PIN_PADDR, physical_pin_paddr);
+    write_slot(
+        SLOT_DEVICE_PHYSICAL_PIN_MATCHES,
+        u64::from(physical_pin_paddr == physical_paddr),
+    );
+    if status != ZX_OK || physical_pin_paddr != physical_paddr {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_PHYSICAL_PIN_LOOKUP);
+        return;
+    }
+
     let mut mapped_physical = 0u64;
     let status = zx_vmar_map_local(
         root_vmar,
-        ZX_VM_PERM_READ,
+        ZX_VM_PERM_READ | ZX_VM_MAP_MMIO,
         0,
         physical,
         0,

@@ -106,18 +106,29 @@ Current state:
 - `zx_vmo_create_physical(base_paddr, size, 0, out)` is now public and creates a shared
   physical/MMIO-style VMO over an existing page-aligned physical span.
 - `zx_vmo_create_contiguous(size, 0, out)` is now public and creates a shared contiguous VMO.
+- `ZX_VM_MAP_MMIO` is now public on `vmar_map()` and requests one device/MMIO cache policy for
+  the installed mapping.
 - `ax_vmo_lookup_paddr(handle, offset, out_paddr)` is the current narrow Axle-native helper for
   resolving the backing physical address of one physical/contiguous VMO offset.
+- `ax_vmo_pin(handle, offset, len, 0, out)` is now public and creates one `DmaRegion` object over
+  one page-aligned range of one physical/contiguous VMO.
+- `ax_dma_region_lookup_paddr(handle, offset, out_paddr)` is the first narrow query on that pinned
+  DMA-region object.
 - `interrupt_create(ZX_INTERRUPT_VIRTUAL)` is now public as a narrow virtual/software interrupt
   object, and `ax_interrupt_trigger()` is the matching Axle-native injection helper.
 
 What is still intentionally narrow:
 
-- there is no BTI/pinning/grant object
+- the current pin contract is one direct VMO -> `DmaRegion` path, not yet a fuller BTI/grant
+  object model
+- only physical and contiguous VMOs may currently be pinned
+- the pin contract is still physical-address oriented; there is no device-visible IOVA or map/unmap
+  token yet
 - there is no IOMMU-facing isolation contract
 - there is no hardware IRQ routing or MSI/MSI-X model yet
 - contiguous allocation is a bootstrap DMA-oriented primitive, not yet a richer device-memory policy
 - physical/MMIO VMOs do not yet expose cache-policy or mapping-attribute controls
+  beyond the first narrow `ZX_VM_MAP_MMIO` bit
 
 ## Current guidance
 
@@ -127,5 +138,7 @@ What is still intentionally narrow:
   shared read-only source plus mapping-local private shadow on write.
 - Treat the current physical / contiguous / interrupt surface as one minimal device-facing substrate:
   enough for bootstrap smoke, the current queue-owned user-mode net dataplane slice, the current
-  synthetic PCI-shaped config + BAR0 transport smoke, future user-mode virtio transport work, and
-  later DMA/IOMMU integration, but not yet the final DFv2 device contract.
+  synthetic PCI-shaped config + BAR0 transport smoke, the now-explicit `DmaRegion`-backed queue
+  and control-window lifetime slice, the first MMIO-attributed driver BAR/config mappings, future
+  user-mode virtio transport work, and later
+  DMA/IOMMU integration, but not yet the final DFv2 device contract.

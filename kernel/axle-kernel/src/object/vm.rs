@@ -211,6 +211,74 @@ pub fn create_contiguous_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_
     })
 }
 
+/// Pin one physical/contiguous VMO range and return a DMA region handle.
+pub fn pin_vmo(
+    handle: zx_handle_t,
+    offset: u64,
+    len: u64,
+    options: u32,
+) -> Result<zx_handle_t, zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::MAP)?;
+        let object_key = resolved.object_key();
+        let vmo = state.with_objects(|objects| {
+            Ok(match objects.get(object_key) {
+                Some(KernelObject::Vmo(vmo)) => vmo.clone(),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+        let mut pin = Some(state.with_vm_mut(|vm| vm.pin_vmo_range(&vmo, offset, len))?);
+        let region_object_id = state.alloc_object_id();
+        let insert_result = state.with_objects_mut(|objects| {
+            let region = DmaRegionObject {
+                source_vmo_object: object_key,
+                source_offset: offset,
+                size_bytes: len,
+                pin: pin.take().ok_or(ZX_ERR_BAD_STATE)?,
+            };
+            objects.insert(region_object_id, KernelObject::DmaRegion(region))?;
+            Ok(())
+        });
+        if let Err(err) = insert_result {
+            if let Some(pin) = pin.take() {
+                state.with_frames_mut(|frames| pin.release(frames));
+            }
+            return Err(err);
+        }
+
+        match state.alloc_handle_for_object(region_object_id, handle::dma_region_default_rights()) {
+            Ok(region_handle) => Ok(region_handle),
+            Err(err) => {
+                if let Some(KernelObject::DmaRegion(region)) =
+                    state.with_objects_mut(|objects| Ok(objects.remove(region_object_id)))?
+                {
+                    state.with_frames_mut(|frames| region.release(frames));
+                }
+                Err(err)
+            }
+        }
+    })
+}
+
+/// Return the physical address backing one offset inside a pinned DMA region.
+pub fn lookup_dma_region_paddr(handle: zx_handle_t, offset: u64) -> Result<u64, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        Ok(
+            state.with_objects(|objects| match objects.get(resolved.object_key()) {
+                Some(KernelObject::DmaRegion(region)) => region.lookup_paddr(offset),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })?,
+        )
+    })
+}
+
 /// Return the physical address backing one physical/contiguous VMO offset.
 pub fn lookup_vmo_paddr(handle: zx_handle_t, offset: u64) -> Result<u64, zx_status_t> {
     with_state_mut(|state| {
@@ -399,6 +467,14 @@ pub fn vmar_map(
             request.private_clone && vmo.kind.supports_copy_on_write(),
         )?;
         require_vmar_mapping_caps(vmar.mapping_caps, request.perms, request.specific)?;
+        if request.cache_policy == axle_mm::MappingCachePolicy::DeviceMmio
+            && !matches!(
+                vmo.kind,
+                axle_mm::VmoKind::Physical | axle_mm::VmoKind::Contiguous
+            )
+        {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
         let mut vmo = vmo;
         if let VmoBackingScope::LocalPrivate {
             owner_address_space_id,
@@ -431,6 +507,7 @@ pub fn vmar_map(
                 vmo_offset,
                 len,
                 request.perms,
+                request.cache_policy,
                 request.private_clone,
             )
         })?;
@@ -572,6 +649,7 @@ fn mapping_request_from_options(
     let allowed = ZX_VM_PERM_READ
         | ZX_VM_PERM_WRITE
         | ZX_VM_PERM_EXECUTE
+        | ZX_VM_MAP_MMIO
         | ZX_VM_PRIVATE_CLONE
         | ZX_VM_SPECIFIC;
     if (options & !allowed) != 0 {
@@ -579,6 +657,11 @@ fn mapping_request_from_options(
     }
     let specific = (options & ZX_VM_SPECIFIC) != 0;
     let private_clone = (options & ZX_VM_PRIVATE_CLONE) != 0;
+    let cache_policy = if (options & ZX_VM_MAP_MMIO) != 0 {
+        axle_mm::MappingCachePolicy::DeviceMmio
+    } else {
+        axle_mm::MappingCachePolicy::Cached
+    };
     if !specific && vmar_offset != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
@@ -591,6 +674,9 @@ fn mapping_request_from_options(
     if private_clone && !has_write {
         return Err(ZX_ERR_INVALID_ARGS);
     }
+    if cache_policy == axle_mm::MappingCachePolicy::DeviceMmio && (private_clone || has_execute) {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
 
     let mut perms = MappingPerms::READ | MappingPerms::USER;
     if has_write {
@@ -601,6 +687,7 @@ fn mapping_request_from_options(
     }
     Ok(VmarMappingRequest {
         perms,
+        cache_policy,
         specific,
         private_clone,
     })
@@ -610,6 +697,9 @@ fn mapping_perms_from_options(
     options: u32,
     require_specific: bool,
 ) -> Result<MappingPerms, zx_status_t> {
+    if (options & ZX_VM_MAP_MMIO) != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
     if !require_specific && (options & ZX_VM_SPECIFIC) != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }

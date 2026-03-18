@@ -47,6 +47,7 @@ The current `KernelObject` enum includes:
 - `EventPair`
 - `Socket`
 - `Interrupt`
+- `DmaRegion`
 - `Vmo`
 - `Vmar`
 
@@ -59,6 +60,16 @@ Current interrupt shape:
 - it tracks one pending count plus one masked/unmasked bit
 - `interrupt_ack()` drains one pending count
 - `ax_interrupt_trigger()` is the current Axle-native software injection helper
+
+Current DMA-region shape:
+
+- `DmaRegion` is one narrow device-memory lifetime object
+- it is created through `ax_vmo_pin()` over one page-aligned range of one physical or contiguous
+  VMO
+- it owns one explicit frame-pin token, so closing the last handle releases the pinned pages
+- it currently exposes one narrow metadata query:
+  - `ax_dma_region_lookup_paddr()` for one offset inside the pinned range
+- it is not waitable and it does not yet imply any BTI/IOMMU grant or cache-policy contract
 
 Current socket shape:
 
@@ -110,6 +121,7 @@ These bootstrap handles are used by bootstrap execution paths and conformance pa
   - socket endpoint close updates the shared `SocketCore`
   - port close destroys the underlying kernel queue backing
   - timer close tears down the reactor timer object and its reverse index entry
+  - dma-region close releases the pinned frame set carried by that region object
   - VMO / VMAR close retires the control object record even if backing VM state still exists
 - Task objects are still synchronized against thread/process lifecycle reaping; they are not
   retired until the task lifecycle says they can disappear.
@@ -136,6 +148,7 @@ The object layer assigns default rights per object family, for example:
 - channel/socket: duplicate, transfer, wait, read, write
 - eventpair: duplicate, transfer, wait, signal, signal-peer
 - interrupt: duplicate, transfer, wait, write
+- dma-region: duplicate, transfer, inspect
 - process/thread: duplicate, transfer, wait, inspect, manage-*
 - guest-session: duplicate, transfer, read, write
 - vmo/vmar: duplicate, transfer, read, map, plus write where supported

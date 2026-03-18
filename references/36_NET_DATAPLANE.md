@@ -24,12 +24,16 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
 - one shared queue/buffer window allocated through `zx_vmo_create_contiguous()`
 - one dedicated register-backing page allocated through `zx_vmo_create_contiguous()`
 - one dedicated PCI-shaped config page allocated through `zx_vmo_create_contiguous()`
-- one physical-address lookup through `ax_vmo_lookup_paddr()` for:
+- one explicit `DmaRegion` lifetime object over:
   - the queue memory
   - the PCI config page
   - the register page
+  - the driver-visible BAR0 physical alias
+- one DMA-region address lookup through `ax_dma_region_lookup_paddr()` rather than one raw
+  `ax_vmo_lookup_paddr()` handoff
 - one driver-side physical alias VMO over the PCI-shaped config page
 - one driver-side BAR0 physical VMO created only after reading that config page
+- driver mappings of the config alias and BAR0 window now request `ZX_VM_MAP_MMIO`
 - one device-side config/register backing mapping through the original contiguous VMOs
 - one MMIO-style control page carrying:
   - device identity/version
@@ -94,17 +98,21 @@ than treating networking as "stream socket but faster".
 The current bootstrap slice proves three things:
 
 1. The current public `InterruptObject` + contiguous/physical VMO surface is sufficient to drive one
-   user-mode shared-memory dataplane loop with one PCI-shaped config page and one BAR0 register
-   window.
+   user-mode shared-memory dataplane loop with one PCI-shaped config page, one BAR0 register
+   window, and one first narrow public MMIO mapping attribute bit.
 2. Queue-owned multi-queue transport can already be exercised without inventing a kernel-resident
    network stack.
-3. The next net step should build on queue ownership and batching, not on growing generic socket
-   semantics first.
+3. The current `DmaRegion` object is already enough to express one explicit DMA lifetime contract
+   for queue memory and driver-visible control windows; the next device/net cuts should build on
+   that object rather than on ad-hoc physical-address helpers.
 
 ## What this is not yet
 
 - no PCI bus enumeration
 - no real PCI config space or BAR management contract from the kernel
+- no public PCI resource-export contract yet
+- no MMIO cache-policy / mapping-attribute controls beyond the first narrow `ZX_VM_MAP_MMIO` bit
+- no DMA map/unmap or IOVA model yet
 - no MSI/MSI-X or hardware IRQ routing
 - no real virtio feature negotiation
 - no userspace TCP/IP stack
@@ -117,6 +125,7 @@ The current bootstrap slice proves three things:
   as the final driver shape.
 - Keep the next net cuts focused on:
   - moving from the current synthetic PCI-shaped config page to a real PCI-backed config source
+  - keeping queue memory and control windows on explicit `DmaRegion` lifetime objects
   - queue ownership
   - interrupt/kick/completion batching
   - shared-memory data movement

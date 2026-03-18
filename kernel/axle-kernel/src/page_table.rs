@@ -3,7 +3,8 @@ extern crate alloc;
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use axle_page_table::{
-    FlushOp, PageMapping, PageRange, PageTable, PageTableError, PageTableLock, ShootdownBatch,
+    FlushOp, MappingCachePolicy, PageMapping, PageRange, PageTable, PageTableError, PageTableLock,
+    ShootdownBatch,
 };
 use spin::Mutex;
 use x86_64::PhysAddr;
@@ -688,6 +689,21 @@ impl PageTableLock for LockedUserPageTable {
             entry.flags().contains(PageTableFlags::WRITABLE),
             !entry.flags().contains(PageTableFlags::NO_EXECUTE),
         )
+        .and_then(|mapping| {
+            PageMapping::with_cache_policy(
+                mapping.paddr(),
+                mapping.writable(),
+                mapping.executable(),
+                if entry
+                    .flags()
+                    .intersects(PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH)
+                {
+                    MappingCachePolicy::DeviceMmio
+                } else {
+                    MappingCachePolicy::Cached
+                },
+            )
+        })
         .map(Some)
     }
 
@@ -698,6 +714,9 @@ impl PageTableLock for LockedUserPageTable {
         }
         if !mapping.executable() {
             flags |= PageTableFlags::NO_EXECUTE;
+        }
+        if mapping.cache_policy() == MappingCachePolicy::DeviceMmio {
+            flags |= PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH;
         }
         self.tables
             .entry_mut(va)?

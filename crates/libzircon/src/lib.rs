@@ -40,12 +40,13 @@ use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::status::{ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NO_MEMORY};
 use axle_types::syscall_numbers::{
-    AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
-    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
-    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
-    AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
-    AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE,
-    AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_CHANNEL_CREATE,
+    AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR, AXLE_SYS_AX_GUEST_SESSION_CREATE,
+    AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY, AXLE_SYS_AX_GUEST_SESSION_RESUME,
+    AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY, AXLE_SYS_AX_INTERRUPT_TRIGGER,
+    AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
+    AXLE_SYS_AX_PROCESS_START_GUEST, AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
+    AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_START_GUEST,
+    AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_AX_VMO_PIN, AXLE_SYS_CHANNEL_CREATE,
     AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE,
     AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_INTERRUPT_ACK,
     AXLE_SYS_INTERRUPT_CREATE, AXLE_SYS_INTERRUPT_MASK, AXLE_SYS_INTERRUPT_UNMASK,
@@ -553,6 +554,39 @@ pub fn zx_vmo_create_contiguous(size: u64, options: u32, out: &mut zx_handle_t) 
 pub fn ax_vmo_lookup_paddr(handle: zx_handle_t, offset: u64, out_paddr: &mut u64) -> zx_status_t {
     native_call(
         AXLE_SYS_AX_VMO_LOOKUP_PADDR as u64,
+        [handle, offset, out_paddr as *mut u64 as u64, 0, 0, 0],
+    )
+}
+
+/// Pin one physical/contiguous VMO range and return a DMA region handle.
+pub fn ax_vmo_pin(
+    handle: zx_handle_t,
+    offset: u64,
+    len: u64,
+    options: u32,
+    out: &mut zx_handle_t,
+) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_VMO_PIN as u64,
+        [
+            handle,
+            offset,
+            len,
+            options as u64,
+            out as *mut zx_handle_t as u64,
+            0,
+        ],
+    )
+}
+
+/// Return the physical address backing one offset inside a pinned DMA region.
+pub fn ax_dma_region_lookup_paddr(
+    handle: zx_handle_t,
+    offset: u64,
+    out_paddr: &mut u64,
+) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR as u64,
         [handle, offset, out_paddr as *mut u64 as u64, 0, 0, 0],
     )
 }

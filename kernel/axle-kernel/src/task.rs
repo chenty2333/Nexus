@@ -25,11 +25,14 @@ use axle_core::{
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
     CowFaultResolution, FrameId, FrameTable, FutexKey, GlobalVmoId, LazyAnonFaultResolution,
-    LazyVmoFaultResolution, LoanToken, MapRec, MappingPerms, PageFaultDecision, PageFaultFlags,
-    PteMeta, PteMetaTag, ReverseMapAnchor, VmaLookup, Vmar, VmarAllocMode, VmarId,
+    LazyVmoFaultResolution, LoanToken, MapRec, MappingCachePolicy, MappingPerms, PageFaultDecision,
+    PageFaultFlags, PteMeta, PteMetaTag, ReverseMapAnchor, VmaLookup, Vmar, VmarAllocMode, VmarId,
     VmarPlacementPolicy, Vmo, VmoId, VmoKind,
 };
-use axle_page_table::{PageMapping, PageRange, PageTable, PageTableError, TxCursor, TxSet};
+use axle_page_table::{
+    MappingCachePolicy as PtMappingCachePolicy, PageMapping, PageRange, PageTable, PageTableError,
+    TxCursor, TxSet,
+};
 use axle_types::rights::{
     ZX_RIGHT_APPLY_PROFILE, ZX_RIGHT_DESTROY, ZX_RIGHT_DUPLICATE, ZX_RIGHT_ENUMERATE,
     ZX_RIGHT_EXECUTE, ZX_RIGHT_GET_POLICY, ZX_RIGHT_GET_PROPERTY, ZX_RIGHT_INSPECT,
@@ -543,6 +546,10 @@ impl VmFacade {
         f(&mut domain)
     }
 
+    pub(crate) fn with_frames_mut<T>(&self, f: impl FnOnce(&mut FrameTable) -> T) -> T {
+        self.with_domain_mut(|vm| vm.with_frames_mut(f))
+    }
+
     pub(crate) fn validate_user_ptr(
         &self,
         address_space_id: AddressSpaceId,
@@ -708,6 +715,15 @@ impl VmFacade {
         self.with_domain(|vm| vm.lookup_vmo_paddr(vmo, offset))
     }
 
+    pub(crate) fn pin_vmo_range(
+        &self,
+        vmo: &crate::object::VmoObject,
+        offset: u64,
+        len: u64,
+    ) -> Result<axle_mm::PinToken, zx_status_t> {
+        self.with_domain_mut(|vm| vm.pin_vmo_range(vmo, offset, len))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn allocate_subvmar(
         &self,
@@ -762,6 +778,7 @@ impl VmFacade {
         vmo_offset: u64,
         len: u64,
         perms: MappingPerms,
+        cache_policy: MappingCachePolicy,
         private_clone: bool,
     ) -> Result<(u64, TlbCommitReq), zx_status_t> {
         self.with_domain_mut(|vm| {
@@ -774,6 +791,7 @@ impl VmFacade {
                 vmo_offset,
                 len,
                 perms,
+                cache_policy,
                 private_clone,
             )
         })
@@ -3031,8 +3049,40 @@ impl AddressSpace {
         vmo_offset: u64,
         perms: MappingPerms,
     ) -> Result<(), AddressSpaceError> {
-        self.vm
-            .map_fixed_in_vmar(frames, vmar_id, base, len, vmo_id, vmo_offset, perms, perms)
+        self.map_vmo_fixed_with_policy(
+            frames,
+            vmar_id,
+            base,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            MappingCachePolicy::Cached,
+        )
+    }
+
+    fn map_vmo_fixed_with_policy(
+        &mut self,
+        frames: &mut FrameTable,
+        vmar_id: VmarId,
+        base: u64,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        cache_policy: MappingCachePolicy,
+    ) -> Result<(), AddressSpaceError> {
+        self.vm.map_fixed_in_vmar_with_policy(
+            frames,
+            vmar_id,
+            base,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            perms,
+            cache_policy,
+        )
     }
 
     fn map_vmo_anywhere(
@@ -3045,7 +3095,30 @@ impl AddressSpace {
         vmo_offset: u64,
         perms: MappingPerms,
     ) -> Result<u64, AddressSpaceError> {
-        self.vm.map_anywhere_in_vmar(
+        self.map_vmo_anywhere_with_policy(
+            frames,
+            cpu_id,
+            vmar_id,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            MappingCachePolicy::Cached,
+        )
+    }
+
+    fn map_vmo_anywhere_with_policy(
+        &mut self,
+        frames: &mut FrameTable,
+        cpu_id: usize,
+        vmar_id: VmarId,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        cache_policy: MappingCachePolicy,
+    ) -> Result<u64, AddressSpaceError> {
+        self.vm.map_anywhere_in_vmar_with_policy(
             frames,
             cpu_id,
             vmar_id,
@@ -3055,6 +3128,7 @@ impl AddressSpace {
             perms,
             perms,
             axle_mm::PAGE_SIZE,
+            cache_policy,
         )
     }
 
@@ -7844,6 +7918,85 @@ impl VmDomain {
         }
     }
 
+    fn pin_shared_vmo_range(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        offset: u64,
+        len: u64,
+    ) -> Result<axle_mm::PinToken, zx_status_t> {
+        let snapshot = self.global_vmos.lock().snapshot(global_vmo_id)?;
+        if !matches!(
+            snapshot.source.kind(),
+            VmoKind::Physical | VmoKind::Contiguous
+        ) {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        let len_usize = usize::try_from(len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        validate_vmo_io_range(snapshot.size_bytes, offset, len_usize)?;
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let mut frame_ids = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let page_offset = offset + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            let frame_id = self
+                .global_vmo_frame(global_vmo_id, page_offset)?
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            frame_ids.push(frame_id);
+        }
+        self.with_frames_mut(|frames| frames.pin_many(&frame_ids))
+            .map_err(map_frame_table_error)
+    }
+
+    fn pin_local_vmo_range(
+        &mut self,
+        owner_address_space_id: AddressSpaceId,
+        local_vmo_id: VmoId,
+        offset: u64,
+        len: u64,
+    ) -> Result<axle_mm::PinToken, zx_status_t> {
+        let snapshot = self.local_vmo_snapshot(owner_address_space_id, local_vmo_id)?;
+        if !matches!(snapshot.kind(), VmoKind::Physical | VmoKind::Contiguous) {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        let len_usize = usize::try_from(len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        validate_vmo_io_range(snapshot.size_bytes(), offset, len_usize)?;
+        let page_count = usize::try_from(len / crate::userspace::USER_PAGE_BYTES)
+            .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let mut frame_ids = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let page_offset = offset + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+            let frame_id = snapshot
+                .frame_at_offset(page_offset)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            frame_ids.push(frame_id);
+        }
+        self.with_frames_mut(|frames| frames.pin_many(&frame_ids))
+            .map_err(map_frame_table_error)
+    }
+
+    pub(crate) fn pin_vmo_range(
+        &mut self,
+        vmo: &crate::object::VmoObject,
+        offset: u64,
+        len: u64,
+    ) -> Result<axle_mm::PinToken, zx_status_t> {
+        if len == 0
+            || (offset & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
+            || (len & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
+        {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        match vmo.backing_scope() {
+            crate::object::VmoBackingScope::LocalPrivate {
+                owner_address_space_id,
+                local_vmo_id,
+            } => self.pin_local_vmo_range(owner_address_space_id, local_vmo_id, offset, len),
+            crate::object::VmoBackingScope::GlobalShared => {
+                self.pin_shared_vmo_range(vmo.global_vmo_id(), offset, len)
+            }
+        }
+    }
+
     pub(crate) fn allocate_subvmar(
         &mut self,
         address_space_id: AddressSpaceId,
@@ -8197,7 +8350,7 @@ impl VmDomain {
                     {
                         let mut frames = frames_handle.lock();
                         address_space
-                            .map_vmo_fixed(
+                            .map_vmo_fixed_with_policy(
                                 &mut frames,
                                 vmar_id,
                                 mapped_addr,
@@ -8205,6 +8358,7 @@ impl VmDomain {
                                 local_vmo_id,
                                 vmo_offset,
                                 perms,
+                                MappingCachePolicy::Cached,
                             )
                             .map_err(map_address_space_error)?;
                     }
@@ -8214,7 +8368,7 @@ impl VmDomain {
                     let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
                     let mut frames = frames_handle.lock();
                     address_space
-                        .map_vmo_anywhere(
+                        .map_vmo_anywhere_with_policy(
                             &mut frames,
                             cpu_id,
                             vmar_id,
@@ -8222,6 +8376,7 @@ impl VmDomain {
                             local_vmo_id,
                             vmo_offset,
                             perms,
+                            MappingCachePolicy::Cached,
                         )
                         .map_err(map_address_space_error)?
                 }
@@ -8248,6 +8403,7 @@ impl VmDomain {
         vmo_offset: u64,
         len: u64,
         perms: MappingPerms,
+        cache_policy: MappingCachePolicy,
         private_clone: bool,
     ) -> Result<(u64, TlbCommitReq), zx_status_t> {
         let local_vmo_id = if private_clone {
@@ -8271,7 +8427,7 @@ impl VmDomain {
                     {
                         let mut frames = frames_handle.lock();
                         address_space
-                            .map_vmo_fixed(
+                            .map_vmo_fixed_with_policy(
                                 &mut frames,
                                 vmar_id,
                                 mapped_addr,
@@ -8279,6 +8435,7 @@ impl VmDomain {
                                 local_vmo_id,
                                 vmo_offset,
                                 perms,
+                                cache_policy,
                             )
                             .map_err(map_address_space_error)?;
                     }
@@ -8288,7 +8445,7 @@ impl VmDomain {
                     let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
                     let mut frames = frames_handle.lock();
                     address_space
-                        .map_vmo_anywhere(
+                        .map_vmo_anywhere_with_policy(
                             &mut frames,
                             cpu_id,
                             vmar_id,
@@ -8296,6 +8453,7 @@ impl VmDomain {
                             local_vmo_id,
                             vmo_offset,
                             perms,
+                            cache_policy,
                         )
                         .map_err(map_address_space_error)?
                 }
@@ -9006,10 +9164,14 @@ impl VmDomain {
                 .ok_or(ZX_ERR_BAD_STATE)?;
             match lookup.frame_id() {
                 Some(frame_id) => {
-                    let mapping = PageMapping::with_perms(
+                    let mapping = PageMapping::with_cache_policy(
                         frame_id.raw(),
                         lookup.perms().contains(MappingPerms::WRITE),
                         lookup.perms().contains(MappingPerms::EXECUTE),
+                        match lookup.cache_policy() {
+                            MappingCachePolicy::Cached => PtMappingCachePolicy::Cached,
+                            MappingCachePolicy::DeviceMmio => PtMappingCachePolicy::DeviceMmio,
+                        },
                     )
                     .map_err(map_page_table_error)?;
                     tx.map(va, crate::userspace::USER_PAGE_BYTES, |_| Ok(mapping))
