@@ -45,6 +45,9 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
 - a component runner / resolver / bootstrap namespace stack
 - a minimal Starnix runner + userspace executive
 - J2-A single-process Linux task/mm/fs/socket bootstrap
+- the current Round-2 socket bootstrap now covers:
+  - `AF_UNIX` `socketpair(..., SOCK_STREAM, ...)`
+  - `AF_UNIX` `socketpair(..., SOCK_DGRAM, ...)`
 - J2-B task/process state for:
   - `clone(CLONE_THREAD)`
   - `fork`

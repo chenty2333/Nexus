@@ -127,5 +127,5 @@ What is still intentionally narrow:
   shared read-only source plus mapping-local private shadow on write.
 - Treat the current physical / contiguous / interrupt surface as one minimal device-facing substrate:
   enough for bootstrap smoke, the first queue-owned user-mode net dataplane slice, future
-  user-mode virtio work, and later DMA/IOMMU integration, but not yet the final DFv2 device
-  contract.
+  user-mode virtio transport work, and later DMA/IOMMU integration, but not yet the final DFv2
+  device contract.

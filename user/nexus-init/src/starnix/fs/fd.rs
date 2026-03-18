@@ -307,12 +307,17 @@ impl ProcessResources {
         protocol: u64,
         guest_addr: u64,
     ) -> Result<u64, zx_status_t> {
-        if domain != LINUX_AF_UNIX || socket_type != LINUX_SOCK_STREAM || protocol != 0 {
+        let zx_socket_options = match socket_type {
+            LINUX_SOCK_STREAM => ZX_SOCKET_STREAM,
+            LINUX_SOCK_DGRAM => ZX_SOCKET_DATAGRAM,
+            _ => return Ok(linux_errno(LINUX_EINVAL)),
+        };
+        if domain != LINUX_AF_UNIX || protocol != 0 {
             return Ok(linux_errno(LINUX_EINVAL));
         }
         let mut left = ZX_HANDLE_INVALID;
         let mut right = ZX_HANDLE_INVALID;
-        let status = zx_socket_create(0, &mut left, &mut right);
+        let status = zx_socket_create(zx_socket_options, &mut left, &mut right);
         if status != ZX_OK {
             return Ok(linux_errno(map_fd_status_to_errno(status)));
         }

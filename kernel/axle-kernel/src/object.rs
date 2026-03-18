@@ -44,6 +44,8 @@ const PORT_CAPACITY: usize = 64;
 const PORT_KERNEL_RESERVE: usize = 16;
 const CHANNEL_CAPACITY: usize = 64;
 const SOCKET_STREAM_CAPACITY: usize = 4096;
+const SOCKET_DATAGRAM_CAPACITY_BYTES: usize = 4096;
+const SOCKET_DATAGRAM_CAPACITY_MESSAGES: usize = 64;
 const BOOTSTRAP_REACTOR_CPU_COUNT: usize = 16;
 
 pub(crate) enum TrapBlock<T> {
@@ -296,6 +298,12 @@ enum SocketSide {
     B,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocketMode {
+    Stream,
+    Datagram,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SocketEndpoint {
     core_id: u64,
@@ -366,9 +374,91 @@ impl ByteRing {
 }
 
 #[derive(Debug)]
+struct DatagramQueue {
+    messages: VecDeque<Vec<u8>>,
+    buffered_bytes: usize,
+    capacity_bytes: usize,
+    capacity_messages: usize,
+}
+
+impl DatagramQueue {
+    fn with_capacity(capacity_bytes: usize, capacity_messages: usize) -> Self {
+        Self {
+            messages: VecDeque::new(),
+            buffered_bytes: 0,
+            capacity_bytes,
+            capacity_messages,
+        }
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes
+    }
+
+    fn queued_messages(&self) -> usize {
+        self.messages.len()
+    }
+
+    fn can_accept_more(&self) -> bool {
+        self.buffered_bytes < self.capacity_bytes && self.messages.len() < self.capacity_messages
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, zx_status_t> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if bytes.len() > self.capacity_bytes {
+            return Err(ZX_ERR_OUT_OF_RANGE);
+        }
+        let next_bytes = self
+            .buffered_bytes
+            .checked_add(bytes.len())
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        if self.messages.len() >= self.capacity_messages || next_bytes > self.capacity_bytes {
+            return Err(ZX_ERR_SHOULD_WAIT);
+        }
+        let mut message = Vec::new();
+        message
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| axle_types::status::ZX_ERR_NO_MEMORY)?;
+        message.extend_from_slice(bytes);
+        self.buffered_bytes = next_bytes;
+        self.messages.push_back(message);
+        Ok(bytes.len())
+    }
+
+    fn read(&mut self, len: usize, consume: bool) -> Result<(Vec<u8>, bool), zx_status_t> {
+        if len == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let Some(message) = self.messages.front() else {
+            return Err(ZX_ERR_SHOULD_WAIT);
+        };
+        let truncated = message.len() > len;
+        let actual = message.len().min(len);
+        let mut out = Vec::new();
+        out.try_reserve_exact(actual)
+            .map_err(|_| axle_types::status::ZX_ERR_NO_MEMORY)?;
+        out.extend_from_slice(&message[..actual]);
+        if consume {
+            let consumed = self.messages.pop_front().ok_or(ZX_ERR_BAD_STATE)?;
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(consumed.len());
+        }
+        Ok((out, truncated))
+    }
+}
+
+#[derive(Debug)]
+enum SocketQueue {
+    Stream(ByteRing),
+    Datagram(DatagramQueue),
+}
+
+#[derive(Debug)]
 struct SocketCore {
-    dir_ab: ByteRing,
-    dir_ba: ByteRing,
+    mode: SocketMode,
+    dir_ab: SocketQueue,
+    dir_ba: SocketQueue,
     open_a: bool,
     open_b: bool,
 }
@@ -376,23 +466,77 @@ struct SocketCore {
 impl SocketCore {
     fn new_stream(capacity: usize) -> Result<Self, zx_status_t> {
         Ok(Self {
-            dir_ab: ByteRing::with_capacity(capacity)?,
-            dir_ba: ByteRing::with_capacity(capacity)?,
+            mode: SocketMode::Stream,
+            dir_ab: SocketQueue::Stream(ByteRing::with_capacity(capacity)?),
+            dir_ba: SocketQueue::Stream(ByteRing::with_capacity(capacity)?),
             open_a: true,
             open_b: true,
         })
     }
 
+    fn new_datagram(capacity_bytes: usize, capacity_messages: usize) -> Self {
+        Self {
+            mode: SocketMode::Datagram,
+            dir_ab: SocketQueue::Datagram(DatagramQueue::with_capacity(
+                capacity_bytes,
+                capacity_messages,
+            )),
+            dir_ba: SocketQueue::Datagram(DatagramQueue::with_capacity(
+                capacity_bytes,
+                capacity_messages,
+            )),
+            open_a: true,
+            open_b: true,
+        }
+    }
+
+    fn mode(&self) -> SocketMode {
+        self.mode
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        match (&self.dir_ab, &self.dir_ba) {
+            (SocketQueue::Stream(ab), SocketQueue::Stream(ba)) => {
+                ab.available_read() + ba.available_read()
+            }
+            (SocketQueue::Datagram(ab), SocketQueue::Datagram(ba)) => {
+                ab.buffered_bytes() + ba.buffered_bytes()
+            }
+            _ => 0,
+        }
+    }
+
+    fn buffered_messages(&self) -> usize {
+        match (&self.dir_ab, &self.dir_ba) {
+            (SocketQueue::Datagram(ab), SocketQueue::Datagram(ba)) => {
+                ab.queued_messages() + ba.queued_messages()
+            }
+            _ => 0,
+        }
+    }
+
     fn signals_for(&self, side: SocketSide) -> Signals {
         let (readable, writable, peer_open) = match side {
             SocketSide::A => (
-                self.dir_ba.available_read() != 0,
-                self.dir_ab.available_write() != 0,
+                match &self.dir_ba {
+                    SocketQueue::Stream(queue) => queue.available_read() != 0,
+                    SocketQueue::Datagram(queue) => queue.queued_messages() != 0,
+                },
+                match &self.dir_ab {
+                    SocketQueue::Stream(queue) => queue.available_write() != 0,
+                    SocketQueue::Datagram(queue) => queue.can_accept_more(),
+                },
                 self.open_b,
             ),
             SocketSide::B => (
-                self.dir_ab.available_read() != 0,
-                self.dir_ba.available_write() != 0,
+                match &self.dir_ab {
+                    SocketQueue::Stream(queue) => queue.available_read() != 0,
+                    SocketQueue::Datagram(queue) => queue.queued_messages() != 0,
+                },
+                match &self.dir_ba {
+                    SocketQueue::Stream(queue) => queue.available_write() != 0,
+                    SocketQueue::Datagram(queue) => queue.can_accept_more(),
+                },
                 self.open_a,
             ),
         };
@@ -420,11 +564,16 @@ impl SocketCore {
         if !peer_open {
             return Err(ZX_ERR_PEER_CLOSED);
         }
-        let written = queue.write(bytes);
-        if written == 0 {
-            return Err(ZX_ERR_SHOULD_WAIT);
+        match queue {
+            SocketQueue::Stream(queue) => {
+                let written = queue.write(bytes);
+                if written == 0 {
+                    return Err(ZX_ERR_SHOULD_WAIT);
+                }
+                Ok(written)
+            }
+            SocketQueue::Datagram(queue) => queue.write(bytes),
         }
-        Ok(written)
     }
 
     fn read(
@@ -432,22 +581,36 @@ impl SocketCore {
         side: SocketSide,
         len: usize,
         consume: bool,
-    ) -> Result<Vec<u8>, zx_status_t> {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
+    ) -> Result<(Vec<u8>, bool), zx_status_t> {
         let (queue, peer_open) = match side {
             SocketSide::A => (&mut self.dir_ba, self.open_b),
             SocketSide::B => (&mut self.dir_ab, self.open_a),
         };
-        if queue.available_read() == 0 {
-            return Err(if peer_open {
-                ZX_ERR_SHOULD_WAIT
-            } else {
-                ZX_ERR_PEER_CLOSED
-            });
+        match queue {
+            SocketQueue::Stream(queue) => {
+                if len == 0 {
+                    return Ok((Vec::new(), false));
+                }
+                if queue.available_read() == 0 {
+                    return Err(if peer_open {
+                        ZX_ERR_SHOULD_WAIT
+                    } else {
+                        ZX_ERR_PEER_CLOSED
+                    });
+                }
+                queue.read(len, consume).map(|bytes| (bytes, false))
+            }
+            SocketQueue::Datagram(queue) => {
+                if queue.queued_messages() == 0 {
+                    return Err(if peer_open {
+                        ZX_ERR_SHOULD_WAIT
+                    } else {
+                        ZX_ERR_PEER_CLOSED
+                    });
+                }
+                queue.read(len, consume)
+            }
         }
-        queue.read(len, consume)
     }
 
     fn close_side(&mut self, side: SocketSide) {
@@ -460,10 +623,6 @@ impl SocketCore {
     fn fully_closed(&self) -> bool {
         !self.open_a && !self.open_b
     }
-
-    fn buffered_bytes(&self) -> usize {
-        self.dir_ab.available_read() + self.dir_ba.available_read()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -472,6 +631,14 @@ pub(crate) struct SocketTelemetrySnapshot {
     pub(crate) peak_buffered_bytes: u64,
     pub(crate) short_write_count: u64,
     pub(crate) write_should_wait_count: u64,
+    pub(crate) datagram_current_buffered_bytes: u64,
+    pub(crate) datagram_peak_buffered_bytes: u64,
+    pub(crate) datagram_current_buffered_messages: u64,
+    pub(crate) datagram_peak_buffered_messages: u64,
+    pub(crate) datagram_write_count: u64,
+    pub(crate) datagram_read_count: u64,
+    pub(crate) datagram_write_should_wait_count: u64,
+    pub(crate) datagram_truncated_read_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

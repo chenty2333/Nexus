@@ -1,0 +1,49 @@
+id = "kernel.socket.datagram_bootstrap"
+description = "Bootstrap datagram sockets should preserve message atomicity, bounded backpressure, and peer-closed signaling"
+tags = ["kernel", "socket", "datagram", "bootstrap", "qemu"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/datagram-smoke && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && AXLE_TEST_RUNNER_RUST_ENTRY=datagram_smoke RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none --target-dir \"$target_dir\" && runner_src=\"$target_dir/x86_64-unknown-none/debug/nexus-test-runner\" && runner=$(mktemp /tmp/nexus-test-runner-XXXXXX) && cp \"$runner_src\" \"$runner\" && size=$(stat -c%s \"$runner\") && { timeout --foreground 20s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x7000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x6fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; qemu_code=$?; echo qemu_exit=$qemu_code; [ \"$qemu_code\" -eq 33 ]; }"
+]
+
+expect = [
+  "kernel: socket datagram smoke",
+]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.socket.datagram_bootstrap"]
+
+[assertions.status_code]
+create = 0
+wait_writable = 0
+write_first = 0
+wait_readable = 0
+peek = 0
+read_first = 0
+write_trunc = 0
+read_trunc = 0
+read_after_trunc = -22
+fill_should_wait = -22
+write_recover = 0
+close_left = 0
+wait_peer_closed = 0
+write_peer_closed = -24
+
+[assertions.packet_fields]
+dgram_present = 1
+dgram_failure_step = 0
+peek_match = 1
+read_first_match = 1
+read_trunc_prefix = 1
+peek_actual = 16
+read_first_actual = 16
+read_trunc_actual = 8
+drain_after_fill = 1024
+wait_peer_closed_observed = 5
+datagram_peak_buffered_messages = 4
+datagram_write_count = 7
+datagram_read_count = 3
+datagram_write_should_wait = 1
+datagram_truncated_read_count = 1

@@ -19,6 +19,7 @@
         not(axle_test_runner_rust_entry = "perf_smoke"),
         not(axle_test_runner_rust_entry = "device_smoke"),
         not(axle_test_runner_rust_entry = "net_smoke"),
+        not(axle_test_runner_rust_entry = "datagram_smoke"),
         not(axle_test_runner_rust_entry = "smp_smoke")
     ),
     forbid(unsafe_code)
@@ -30,6 +31,7 @@
         axle_test_runner_rust_entry = "perf_smoke",
         axle_test_runner_rust_entry = "device_smoke",
         axle_test_runner_rust_entry = "net_smoke",
+        axle_test_runner_rust_entry = "datagram_smoke",
         axle_test_runner_rust_entry = "smp_smoke"
     ),
     deny(unsafe_op_in_unsafe_fn)
@@ -41,6 +43,7 @@
         axle_test_runner_rust_entry = "perf_smoke",
         axle_test_runner_rust_entry = "device_smoke",
         axle_test_runner_rust_entry = "net_smoke",
+        axle_test_runner_rust_entry = "datagram_smoke",
         axle_test_runner_rust_entry = "smp_smoke"
     ),
     deny(clippy::undocumented_unsafe_blocks)
@@ -56,6 +59,8 @@ use core::panic::PanicInfo;
 
 #[cfg(axle_test_runner_rust_entry = "component_smoke")]
 mod component_smoke;
+#[cfg(axle_test_runner_rust_entry = "datagram_smoke")]
+mod datagram_smoke;
 #[cfg(axle_test_runner_rust_entry = "device_smoke")]
 mod device_smoke;
 #[cfg(axle_test_runner_rust_entry = "net_smoke")]
@@ -66,6 +71,8 @@ mod perf_smoke;
 mod reactor_smoke;
 #[cfg(axle_test_runner_rust_entry = "smp_smoke")]
 mod smp_smoke;
+#[cfg(axle_test_runner_rust_entry = "net_smoke")]
+mod virtio_net_transport;
 
 #[cfg(axle_test_runner_rust_entry = "component_smoke")]
 #[panic_handler]
@@ -91,6 +98,12 @@ fn panic(_info: &PanicInfo) -> ! {
     device_smoke::report_panic()
 }
 
+#[cfg(axle_test_runner_rust_entry = "datagram_smoke")]
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    datagram_smoke::report_panic()
+}
+
 #[cfg(axle_test_runner_rust_entry = "net_smoke")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -109,6 +122,7 @@ fn panic(_info: &PanicInfo) -> ! {
     not(axle_test_runner_rust_entry = "perf_smoke"),
     not(axle_test_runner_rust_entry = "device_smoke"),
     not(axle_test_runner_rust_entry = "net_smoke"),
+    not(axle_test_runner_rust_entry = "datagram_smoke"),
     not(axle_test_runner_rust_entry = "smp_smoke")
 ))]
 #[panic_handler]

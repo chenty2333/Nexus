@@ -3,7 +3,7 @@
 Part of the Axle transport and device-facing runtime substrate.
 
 See also:
-- `35_IPC_SOCKET.md` - current stream-socket object shape and current datagram absence
+- `35_IPC_SOCKET.md` - current stream/datagram socket object shape and current socket limits
 - `43_VM_EXEC_PAGER_DEVICE_VM.md` - current device-facing interrupt / physical / contiguous VMO surface
 - `32_SCHEDULER_LIFECYCLE.md` - owner-local wakeup and per-CPU runnable substrate used by later queue ownership
 - `90_CONFORMANCE.md` - bootstrap runtime scenario coverage
@@ -16,9 +16,10 @@ It is not yet a full PCI transport, a full virtio-net driver, or a full userspac
 It is the first proof that the current device-facing Axle substrate is already enough to support a
 queue-owned shared-memory + interrupt dataplane in ring3.
 
-## Current bootstrap slice
+## Current transport slice
 
-The repository now includes one narrow ring3 `net_smoke` path with:
+The repository now includes one narrow ring3 `net_smoke` path built around one reusable
+`virtio_net_transport` slice in `user/test-runner` with:
 
 - one queue-owned shared-memory dataplane buffer allocated through `zx_vmo_create_contiguous()`
 - one physical-address lookup through `ax_vmo_lookup_paddr()`
@@ -38,6 +39,7 @@ The current bootstrap gate uses one deliberately narrow split-ring layout:
 - one RX queue
 - one descriptor slot per queue
 - one `virtio_net_hdr`-shaped prefix plus one payload buffer
+- one reusable split-ring layout module instead of one fully ad-hoc smoke-local encoding
 
 Ownership is intentionally one-writer-per-substructure:
 
@@ -72,11 +74,12 @@ The current bootstrap slice proves three things:
 - no real virtio feature negotiation
 - no userspace TCP/IP stack
 - no RSS / multi-queue policy
-- no datagram socket contract
+- no real PCI-backed virtio transport bring-up yet
 
 ## Current guidance
 
-- Treat the current `net_smoke` as a device-substrate proof, not as the final driver shape.
+- Treat the current `net_smoke` as a device-substrate proof plus one reusable transport slice, not
+  as the final driver shape.
 - Keep the next net cuts focused on:
   - queue ownership
   - interrupt/kick/completion batching

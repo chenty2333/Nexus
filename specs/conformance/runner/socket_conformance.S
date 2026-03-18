@@ -275,13 +275,22 @@ socket_read_cmp:
 	cmp $0, 8*480(%rbx)
 	jne user_fail
 
-	// socket_create(DATAGRAM, ...) => NOT_SUPPORTED
+	// socket_create(DATAGRAM, ...) => OK, then close the pair
 	lea 0x1490(%rbx), %rsi
 	lea 0x1498(%rbx), %rdx
 	movl $1, %edi
 	movabs $36, %rax
 	int $0x80
 	mov %rax, 8*482(%rbx)
+	test %rax, %rax
+	jne socket_datagram_create_done
+	mov 0x1490(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+	mov 0x1498(%rbx), %rdi
+	movabs $0, %rax
+	int $0x80
+socket_datagram_create_done:
 
 	// socket_create(invalid options=2, ...) => INVALID_ARGS
 	lea 0x1490(%rbx), %rsi

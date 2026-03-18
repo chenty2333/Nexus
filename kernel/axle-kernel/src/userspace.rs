@@ -701,6 +701,30 @@ const SLOT_NET_PACKET_MATCH: usize = 950;
 const SLOT_NET_DRIVER_CPU: usize = 951;
 const SLOT_NET_WORKER_CPU: usize = 952;
 const SLOT_NET_PRESENT: usize = 953;
+const SLOT_DGRAM_PRESENT: usize = 954;
+const SLOT_DGRAM_FAILURE_STEP: usize = 955;
+const SLOT_DGRAM_CREATE: usize = 956;
+const SLOT_DGRAM_WAIT_WRITABLE: usize = 957;
+const SLOT_DGRAM_WRITE_FIRST: usize = 958;
+const SLOT_DGRAM_WAIT_READABLE: usize = 959;
+const SLOT_DGRAM_PEEK: usize = 960;
+const SLOT_DGRAM_PEEK_ACTUAL: usize = 961;
+const SLOT_DGRAM_PEEK_MATCH: usize = 962;
+const SLOT_DGRAM_READ_FIRST: usize = 963;
+const SLOT_DGRAM_READ_FIRST_ACTUAL: usize = 964;
+const SLOT_DGRAM_READ_FIRST_MATCH: usize = 965;
+const SLOT_DGRAM_WRITE_TRUNC: usize = 966;
+const SLOT_DGRAM_READ_TRUNC: usize = 967;
+const SLOT_DGRAM_READ_TRUNC_ACTUAL: usize = 968;
+const SLOT_DGRAM_READ_TRUNC_PREFIX: usize = 969;
+const SLOT_DGRAM_READ_AFTER_TRUNC: usize = 970;
+const SLOT_DGRAM_FILL_SHOULD_WAIT: usize = 971;
+const SLOT_DGRAM_DRAIN_AFTER_FILL: usize = 972;
+const SLOT_DGRAM_WRITE_RECOVER: usize = 973;
+const SLOT_DGRAM_CLOSE_LEFT: usize = 974;
+const SLOT_DGRAM_WAIT_PEER_CLOSED: usize = 975;
+const SLOT_DGRAM_WAIT_PEER_CLOSED_OBSERVED: usize = 976;
+const SLOT_DGRAM_WRITE_PEER_CLOSED: usize = 977;
 const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
 const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
@@ -1649,6 +1673,10 @@ fn net_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_NET_PRESENT] != 0 || slots[SLOT_NET_FAILURE_STEP] != 0
 }
 
+fn datagram_summary_present(slots: &[u64]) -> bool {
+    slots[SLOT_DGRAM_PRESENT] != 0 || slots[SLOT_DGRAM_FAILURE_STEP] != 0
+}
+
 fn smp_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_SMP_SMOKE_PRESENT] != 0
 }
@@ -1919,6 +1947,43 @@ fn print_net_summary(slots: &[u64]) {
     );
 }
 
+fn print_datagram_summary(slots: &[u64]) {
+    let socket = crate::object::transport::socket_telemetry_snapshot();
+    crate::kprintln!(
+        "kernel: socket datagram smoke (dgram_present={}, dgram_failure_step={}, create={}, wait_writable={}, write_first={}, wait_readable={}, peek={}, peek_actual={}, peek_match={}, read_first={}, read_first_actual={}, read_first_match={}, write_trunc={}, read_trunc={}, read_trunc_actual={}, read_trunc_prefix={}, read_after_trunc={}, fill_should_wait={}, drain_after_fill={}, write_recover={}, close_left={}, wait_peer_closed={}, wait_peer_closed_observed={}, write_peer_closed={}, datagram_peak_buffered_bytes={}, datagram_peak_buffered_messages={}, datagram_write_count={}, datagram_read_count={}, datagram_write_should_wait={}, datagram_truncated_read_count={})",
+        slots[SLOT_DGRAM_PRESENT],
+        slots[SLOT_DGRAM_FAILURE_STEP],
+        slots[SLOT_DGRAM_CREATE] as i64,
+        slots[SLOT_DGRAM_WAIT_WRITABLE] as i64,
+        slots[SLOT_DGRAM_WRITE_FIRST] as i64,
+        slots[SLOT_DGRAM_WAIT_READABLE] as i64,
+        slots[SLOT_DGRAM_PEEK] as i64,
+        slots[SLOT_DGRAM_PEEK_ACTUAL],
+        slots[SLOT_DGRAM_PEEK_MATCH],
+        slots[SLOT_DGRAM_READ_FIRST] as i64,
+        slots[SLOT_DGRAM_READ_FIRST_ACTUAL],
+        slots[SLOT_DGRAM_READ_FIRST_MATCH],
+        slots[SLOT_DGRAM_WRITE_TRUNC] as i64,
+        slots[SLOT_DGRAM_READ_TRUNC] as i64,
+        slots[SLOT_DGRAM_READ_TRUNC_ACTUAL],
+        slots[SLOT_DGRAM_READ_TRUNC_PREFIX],
+        slots[SLOT_DGRAM_READ_AFTER_TRUNC] as i64,
+        slots[SLOT_DGRAM_FILL_SHOULD_WAIT] as i64,
+        slots[SLOT_DGRAM_DRAIN_AFTER_FILL],
+        slots[SLOT_DGRAM_WRITE_RECOVER] as i64,
+        slots[SLOT_DGRAM_CLOSE_LEFT] as i64,
+        slots[SLOT_DGRAM_WAIT_PEER_CLOSED] as i64,
+        slots[SLOT_DGRAM_WAIT_PEER_CLOSED_OBSERVED],
+        slots[SLOT_DGRAM_WRITE_PEER_CLOSED] as i64,
+        socket.datagram_peak_buffered_bytes,
+        socket.datagram_peak_buffered_messages,
+        socket.datagram_write_count,
+        socket.datagram_read_count,
+        socket.datagram_write_should_wait_count,
+        socket.datagram_truncated_read_count,
+    );
+}
+
 fn print_smp_summary(slots: &[u64]) {
     crate::kprintln!(
         "kernel: smp smoke ok (present={}, status={})",
@@ -2036,6 +2101,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         if net_summary_present(slots) {
             print_net_summary(slots);
         }
+        if datagram_summary_present(slots) {
+            print_datagram_summary(slots);
+        }
         if smp_summary_present(slots) {
             print_smp_summary(slots);
         }
@@ -2068,6 +2136,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
     }
     if net_summary_present(slots) {
         print_net_summary(slots);
+    }
+    if datagram_summary_present(slots) {
+        print_datagram_summary(slots);
     }
     if smp_summary_present(slots) {
         print_smp_summary(slots);

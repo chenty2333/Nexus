@@ -1,5 +1,5 @@
 id = "kernel.socket.options_args_bootstrap"
-description = "Bootstrap STREAM sockets should enforce creation and pointer/options edge cases"
+description = "Bootstrap sockets should enforce stream/datagram creation and pointer/options edge cases"
 tags = ["module:kernel", "module:socket", "kind:qemu"]
 timeout_ms = 180000
 command = [
@@ -12,7 +12,7 @@ forbid = ["KERNEL PANIC"]
 contracts = ["should.socket.options_args_bootstrap"]
 
 [assertions.status_code]
-socket_create_datagram = -2
+socket_create_datagram = 0
 socket_create_bad_opts = -10
 socket_write_zero_null = 0
 socket_read_bad_null = -10

@@ -57,6 +57,8 @@ pub(crate) enum TraceEvent {
     SysNativeSysret = 29,
     TlbAddressSpaceSwitch = 30,
     TlbInvpcidSingle = 31,
+    SocketDatagramEnqueue = 32,
+    SocketDatagramDequeue = 33,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -128,6 +130,8 @@ impl TraceRecord {
             29 => TraceEvent::SysNativeSysret,
             30 => TraceEvent::TlbAddressSpaceSwitch,
             31 => TraceEvent::TlbInvpcidSingle,
+            32 => TraceEvent::SocketDatagramEnqueue,
+            33 => TraceEvent::SocketDatagramDequeue,
             _ => TraceEvent::SysEnter,
         }
     }
@@ -861,6 +865,32 @@ pub(crate) fn record_channel_reclaim(actual_bytes: u32, fragmented: bool, draine
     );
 }
 
+pub(crate) fn record_socket_datagram_enqueue(
+    actual_bytes: u32,
+    queued_messages: u32,
+    buffered_after: u32,
+) {
+    record(
+        TraceCategory::Ipc,
+        TraceEvent::SocketDatagramEnqueue,
+        u64::from(actual_bytes),
+        u64::from(queued_messages) | (u64::from(buffered_after) << 32),
+    );
+}
+
+pub(crate) fn record_socket_datagram_dequeue(
+    actual_bytes: u32,
+    truncated: bool,
+    queued_messages_after: u32,
+) {
+    record(
+        TraceCategory::Ipc,
+        TraceEvent::SocketDatagramDequeue,
+        u64::from(actual_bytes),
+        u64::from(queued_messages_after) | (u64::from(u8::from(truncated)) << 32),
+    );
+}
+
 fn snapshot_records() -> Vec<TraceRecord> {
     let record_count = bootstrap_trace_record_count() as usize;
     let mut snapshot = Vec::with_capacity(record_count);
@@ -945,6 +975,8 @@ fn event_name(event: TraceEvent) -> &'static str {
         TraceEvent::SysNativeSysret => "sys_native_sysret",
         TraceEvent::TlbAddressSpaceSwitch => "tlb_as_switch",
         TraceEvent::TlbInvpcidSingle => "tlb_invpcid_single",
+        TraceEvent::SocketDatagramEnqueue => "socket_datagram_enqueue",
+        TraceEvent::SocketDatagramDequeue => "socket_datagram_dequeue",
     }
 }
 

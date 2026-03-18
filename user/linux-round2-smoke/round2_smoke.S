@@ -76,6 +76,67 @@ _start:
     test %rax, %rax
     js fail
 
+    mov $1, %edi
+    mov $2, %esi
+    xor %edx, %edx
+    lea 8(%rsp), %r10
+    mov $53, %eax
+    syscall
+    test %rax, %rax
+    js fail
+
+    mov 8(%rsp), %edi
+    lea dgram_payload_a(%rip), %rsi
+    mov $dgram_payload_len, %edx
+    mov $1, %eax
+    syscall
+    cmp $dgram_payload_len, %rax
+    jne fail
+
+    mov 8(%rsp), %edi
+    lea dgram_payload_b(%rip), %rsi
+    mov $dgram_payload_len, %edx
+    mov $1, %eax
+    syscall
+    cmp $dgram_payload_len, %rax
+    jne fail
+
+    mov 12(%rsp), %edi
+    lea 4256(%rsp), %rsi
+    mov $3, %edx
+    xor %eax, %eax
+    syscall
+    cmp $dgram_payload_len, %rax
+    jne fail
+    cmpb $'D', 4256(%rsp)
+    jne fail
+    cmpb $'A', 4257(%rsp)
+    jne fail
+
+    mov 12(%rsp), %edi
+    lea 4256(%rsp), %rsi
+    mov $3, %edx
+    xor %eax, %eax
+    syscall
+    cmp $dgram_payload_len, %rax
+    jne fail
+    cmpb $'D', 4256(%rsp)
+    jne fail
+    cmpb $'B', 4257(%rsp)
+    jne fail
+
+    mov 8(%rsp), %edi
+    mov $3, %eax
+    syscall
+    test %rax, %rax
+    js fail
+
+    mov 12(%rsp), %edi
+    mov $3, %eax
+    syscall
+    test %rax, %rax
+    js fail
+
     mov $-100, %rdi
     lea hello_path(%rip), %rsi
     xor %edx, %edx
@@ -267,6 +328,12 @@ socket_payload:
     .ascii "sock"
 socket_payload_end:
 .set socket_payload_len, socket_payload_end - socket_payload
+
+dgram_payload_a:
+    .ascii "DA"
+dgram_payload_b:
+    .ascii "DB"
+.set dgram_payload_len, 2
 
 hello_path:
     .asciz "/boot/bin/linux-hello"

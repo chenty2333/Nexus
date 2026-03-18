@@ -1,5 +1,5 @@
 id = "kernel.runtime.net_dataplane_bootstrap"
-description = "Bootstrap ring3 userspace should exercise one queue-owned shared-memory net dataplane slice on top of InterruptObject plus contiguous VMO"
+description = "Bootstrap ring3 userspace should exercise one queue-owned virtio-style transport slice on top of InterruptObject plus contiguous VMO"
 tags = ["kernel", "runtime", "net", "device", "bootstrap"]
 timeout_ms = 180000
 

@@ -1,5 +1,5 @@
 id = "kernel.starnix.round2_bootstrap"
-description = "Bootstrap starnix userspace should close the Round 2 single-process loop: openat/read/write/close/fstat/getdents, pipe2/socketpair, brk, anonymous mmap, mprotect, munmap, and read-only file-backed mmap"
+description = "Bootstrap starnix userspace should close the Round 2 single-process loop: openat/read/write/close/fstat/getdents, pipe2, AF_UNIX socketpair (stream/datagram), brk, anonymous mmap, mprotect, munmap, and read-only file-backed mmap"
 tags = ["kernel", "component", "starnix", "runner", "fd", "fs", "mm", "bootstrap"]
 timeout_ms = 180000
 

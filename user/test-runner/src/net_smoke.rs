@@ -1,9 +1,14 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::x86_64::__cpuid;
-use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
+use crate::virtio_net_transport::{
+    PAGE_SIZE, QUEUE_AVAIL_OFFSET, QUEUE_DESC_OFFSET, QUEUE_SIZE, QUEUE_USED_OFFSET,
+    QUEUE_VMO_BYTES, RX_BUFFER_OFFSET, RX_QUEUE_OFFSET, TX_BUFFER_OFFSET, TX_QUEUE_OFFSET,
+    VirtioNetHdr, VirtqAvail, VirtqDesc, VirtqUsed, VirtqUsedElem, empty_avail, empty_used,
+    frame_len,
+};
 use axle_arch_x86_64::{debug_break, native_syscall8};
 use libzircon::handle::ZX_HANDLE_INVALID;
 use libzircon::interrupt::ZX_INTERRUPT_VIRTUAL;
@@ -18,7 +23,6 @@ use libzircon::{
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
-const PAGE_SIZE: u64 = 4096;
 const SLOT_OK: usize = 0;
 const SLOT_ROOT_VMAR_H: usize = 62;
 const SLOT_SELF_PROCESS_H: usize = 396;
@@ -77,15 +81,6 @@ const STEP_WORKER_TRIGGER_RX: u64 = 21;
 const WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
 const WORKER_STACK_BYTES: usize = 4096;
 const HEAP_BYTES: usize = 16 * 1024;
-const QUEUE_VMO_BYTES: u64 = 4 * PAGE_SIZE;
-const QUEUE_SIZE: usize = 1;
-const QUEUE_DESC_OFFSET: u64 = 0;
-const QUEUE_AVAIL_OFFSET: u64 = 64;
-const QUEUE_USED_OFFSET: u64 = 128;
-const TX_QUEUE_OFFSET: u64 = 0;
-const TX_BUFFER_OFFSET: u64 = PAGE_SIZE;
-const RX_QUEUE_OFFSET: u64 = 2 * PAGE_SIZE;
-const RX_BUFFER_OFFSET: u64 = 3 * PAGE_SIZE;
 
 const PAYLOAD_BYTES: [u8; 32] = *b"axle-net-smoke-loopback-packet!!";
 
@@ -100,51 +95,6 @@ struct BumpAllocator;
 static ALLOCATOR: BumpAllocator = BumpAllocator;
 
 static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtqDesc {
-    addr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtqAvail {
-    flags: u16,
-    idx: u16,
-    ring: [u16; QUEUE_SIZE],
-    used_event: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtqUsedElem {
-    id: u32,
-    len: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtqUsed {
-    flags: u16,
-    idx: u16,
-    ring: [VirtqUsedElem; QUEUE_SIZE],
-    avail_event: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtioNetHdr {
-    flags: u8,
-    gso_type: u8,
-    hdr_len: u16,
-    gso_size: u16,
-    csum_start: u16,
-    csum_offset: u16,
-}
 
 #[derive(Clone, Copy, Default)]
 struct NetSummary {
@@ -424,9 +374,13 @@ fn run_net_smoke() -> NetSummary {
         summary.failure_step = STEP_WORKER_ACK_KICK;
     } else if summary.worker_trigger_rx != ZX_OK as i64 {
         summary.failure_step = STEP_WORKER_TRIGGER_RX;
-    } else if summary.tx_used_idx != 1 || summary.tx_used_len != frame_len() as u64 {
+    } else if summary.tx_used_idx != 1
+        || summary.tx_used_len != frame_len(PAYLOAD_BYTES.len()) as u64
+    {
         summary.failure_step = STEP_TX_USED;
-    } else if summary.rx_used_idx != 1 || summary.rx_used_len != frame_len() as u64 {
+    } else if summary.rx_used_idx != 1
+        || summary.rx_used_len != frame_len(PAYLOAD_BYTES.len()) as u64
+    {
         summary.failure_step = STEP_RX_USED;
     } else {
         summary.packet_match = u64::from(rx_payload_matches(mapped_addr));
@@ -549,22 +503,15 @@ fn init_queue_memory(mapped_base: u64) {
 fn prepare_tx_packet(mapped_base: u64, queue_paddr: u64) {
     let tx_desc = VirtqDesc {
         addr: queue_paddr + TX_BUFFER_OFFSET,
-        len: frame_len() as u32,
+        len: frame_len(PAYLOAD_BYTES.len()) as u32,
         flags: 0,
         next: 0,
     };
     let tx_avail = VirtqAvail {
-        flags: 0,
         idx: 1,
-        ring: [0],
-        used_event: 0,
+        ..empty_avail()
     };
-    let tx_used = VirtqUsed {
-        flags: 0,
-        idx: 0,
-        ring: [VirtqUsedElem { id: 0, len: 0 }],
-        avail_event: 0,
-    };
+    let tx_used = empty_used();
     write_desc(mapped_base, TX_QUEUE_OFFSET, 0, tx_desc);
     write_avail(mapped_base, TX_QUEUE_OFFSET, tx_avail);
     write_used(mapped_base, TX_QUEUE_OFFSET, tx_used);
@@ -579,7 +526,7 @@ fn prepare_tx_packet(mapped_base: u64, queue_paddr: u64) {
     };
     write_header(mapped_base + TX_BUFFER_OFFSET, header);
     write_bytes(
-        mapped_base + TX_BUFFER_OFFSET + size_of::<VirtioNetHdr>() as u64,
+        mapped_base + TX_BUFFER_OFFSET + frame_header_bytes(),
         &PAYLOAD_BYTES,
     );
 }
@@ -587,39 +534,35 @@ fn prepare_tx_packet(mapped_base: u64, queue_paddr: u64) {
 fn prepare_rx_buffer(mapped_base: u64, queue_paddr: u64) {
     let rx_desc = VirtqDesc {
         addr: queue_paddr + RX_BUFFER_OFFSET,
-        len: frame_len() as u32,
+        len: frame_len(PAYLOAD_BYTES.len()) as u32,
         flags: 0,
         next: 0,
     };
     let rx_avail = VirtqAvail {
-        flags: 0,
         idx: 1,
-        ring: [0],
-        used_event: 0,
+        ..empty_avail()
     };
-    let rx_used = VirtqUsed {
-        flags: 0,
-        idx: 0,
-        ring: [VirtqUsedElem { id: 0, len: 0 }],
-        avail_event: 0,
-    };
+    let rx_used = empty_used();
     write_desc(mapped_base, RX_QUEUE_OFFSET, 0, rx_desc);
     write_avail(mapped_base, RX_QUEUE_OFFSET, rx_avail);
     write_used(mapped_base, RX_QUEUE_OFFSET, rx_used);
-    zero_bytes(mapped_base + RX_BUFFER_OFFSET, frame_len());
+    zero_bytes(
+        mapped_base + RX_BUFFER_OFFSET,
+        frame_len(PAYLOAD_BYTES.len()),
+    );
 }
 
 fn rx_payload_matches(mapped_base: u64) -> bool {
     let mut received = [0u8; PAYLOAD_BYTES.len()];
     read_bytes(
-        mapped_base + RX_BUFFER_OFFSET + size_of::<VirtioNetHdr>() as u64,
+        mapped_base + RX_BUFFER_OFFSET + frame_header_bytes(),
         &mut received,
     );
     received == PAYLOAD_BYTES
 }
 
-fn frame_len() -> usize {
-    size_of::<VirtioNetHdr>() + PAYLOAD_BYTES.len()
+fn frame_header_bytes() -> u64 {
+    core::mem::size_of::<VirtioNetHdr>() as u64
 }
 
 fn queue_desc_ptr(mapped_base: u64, queue_offset: u64, desc_index: usize) -> *mut VirtqDesc {

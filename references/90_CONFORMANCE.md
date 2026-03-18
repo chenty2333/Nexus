@@ -150,7 +150,16 @@ Main just targets include:
   - one contiguous VMO supplies the shared queue/buffer memory
   - one physical-address lookup freezes the DMA-style address handoff shape
   - one ready interrupt, one TX-kick interrupt, and one RX-complete interrupt carry control flow
-  - one split TX/RX ring pair completes a single loopback packet without channel/socket data-plane help
+  - one reusable split TX/RX virtio-style transport slice completes a single loopback packet
+    without channel/socket data-plane help
+- Bootstrap socket coverage now also includes one narrow datagram gate:
+  - datagram create succeeds through the normal socket object family
+  - one peek/read pair proves message preservation without stream fallback
+  - one truncating read proves the current bootstrap consume-on-truncate behavior
+  - one bounded-fill loop proves datagram writes stay atomic and fail with `SHOULD_WAIT` rather
+    than degrading into short writes
+  - one peer-close wait/write pair proves peer-closed signaling and error propagation still match
+    the shared socket signal family
 - Component-framework bootstrap coverage now also includes one eager-topology gate:
   - a minimal `nexus-init` can resolve a root manifest and launch eager ELF children
   - one protocol route through `/svc` is exercised end-to-end

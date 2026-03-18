@@ -347,7 +347,15 @@ impl StarnixKernel {
         let socket_type = stop_state.regs.rsi;
         let protocol = stop_state.regs.rdx;
         let pair_addr = stop_state.regs.r10;
-        if domain != LINUX_AF_UNIX || socket_type != LINUX_SOCK_STREAM || protocol != 0 {
+        let zx_socket_options = match socket_type {
+            LINUX_SOCK_STREAM => ZX_SOCKET_STREAM,
+            LINUX_SOCK_DGRAM => ZX_SOCKET_DATAGRAM,
+            _ => {
+                complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        if domain != LINUX_AF_UNIX || protocol != 0 {
             complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
             return Ok(SyscallAction::Resume);
         }
@@ -362,7 +370,7 @@ impl StarnixKernel {
 
         let mut left = ZX_HANDLE_INVALID;
         let mut right = ZX_HANDLE_INVALID;
-        let status = zx_socket_create(0, &mut left, &mut right);
+        let status = zx_socket_create(zx_socket_options, &mut left, &mut right);
         if status != ZX_OK {
             complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
             return Ok(SyscallAction::Resume);

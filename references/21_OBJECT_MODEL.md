@@ -60,6 +60,14 @@ Current interrupt shape:
 - `interrupt_ack()` drains one pending count
 - `ax_interrupt_trigger()` is the current Axle-native software injection helper
 
+Current socket shape:
+
+- `Socket` remains one object family rather than splitting into separate stream/datagram kinds
+- paired socket endpoints still share one `SocketCore`
+- the shared core now carries one mode:
+  - `stream` with directional byte rings
+  - `datagram` with directional bounded message queues
+
 ## VMO object shape
 
 - `VmoObject` now keeps stable control-plane state:

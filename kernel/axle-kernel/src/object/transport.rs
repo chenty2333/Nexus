@@ -41,6 +41,36 @@ impl TransportCore {
             .max(buffered_after as u64);
     }
 
+    pub(super) fn note_socket_datagram_write(
+        &mut self,
+        requested: usize,
+        buffered_after: usize,
+        messages_after: usize,
+    ) {
+        if requested == 0 {
+            return;
+        }
+        self.socket_telemetry.datagram_write_count =
+            self.socket_telemetry.datagram_write_count.wrapping_add(1);
+        self.socket_telemetry.datagram_current_buffered_bytes = buffered_after as u64;
+        self.socket_telemetry.datagram_peak_buffered_bytes = self
+            .socket_telemetry
+            .datagram_peak_buffered_bytes
+            .max(buffered_after as u64);
+        self.socket_telemetry.datagram_current_buffered_messages = messages_after as u64;
+        self.socket_telemetry.datagram_peak_buffered_messages = self
+            .socket_telemetry
+            .datagram_peak_buffered_messages
+            .max(messages_after as u64);
+    }
+
+    pub(super) fn note_socket_datagram_write_should_wait(&mut self) {
+        self.socket_telemetry.datagram_write_should_wait_count = self
+            .socket_telemetry
+            .datagram_write_should_wait_count
+            .wrapping_add(1);
+    }
+
     pub(super) fn note_socket_read(&mut self, consumed: usize) {
         self.socket_telemetry.current_buffered_bytes = self
             .socket_telemetry
@@ -48,11 +78,43 @@ impl TransportCore {
             .saturating_sub(consumed as u64);
     }
 
+    pub(super) fn note_socket_datagram_read(
+        &mut self,
+        buffered_after: usize,
+        messages_after: usize,
+        truncated: bool,
+    ) {
+        self.socket_telemetry.datagram_read_count =
+            self.socket_telemetry.datagram_read_count.wrapping_add(1);
+        if truncated {
+            self.socket_telemetry.datagram_truncated_read_count = self
+                .socket_telemetry
+                .datagram_truncated_read_count
+                .wrapping_add(1);
+        }
+        self.socket_telemetry.datagram_current_buffered_bytes = buffered_after as u64;
+        self.socket_telemetry.datagram_current_buffered_messages = messages_after as u64;
+    }
+
     pub(super) fn note_socket_core_drop(&mut self, core: &SocketCore) {
-        self.socket_telemetry.current_buffered_bytes = self
-            .socket_telemetry
-            .current_buffered_bytes
-            .saturating_sub(core.buffered_bytes() as u64);
+        match core.mode() {
+            SocketMode::Stream => {
+                self.socket_telemetry.current_buffered_bytes = self
+                    .socket_telemetry
+                    .current_buffered_bytes
+                    .saturating_sub(core.buffered_bytes() as u64);
+            }
+            SocketMode::Datagram => {
+                self.socket_telemetry.datagram_current_buffered_bytes = self
+                    .socket_telemetry
+                    .datagram_current_buffered_bytes
+                    .saturating_sub(core.buffered_bytes() as u64);
+                self.socket_telemetry.datagram_current_buffered_messages = self
+                    .socket_telemetry
+                    .datagram_current_buffered_messages
+                    .saturating_sub(core.buffered_messages() as u64);
+            }
+        }
     }
 
     fn drain_remote_fragment_returns(&mut self, cpu_id: usize) {
@@ -201,15 +263,17 @@ pub(crate) fn allocate_channel_fragment(len: usize) -> Result<ChannelFragment, z
 
 /// Create a socket endpoint pair and return both handles.
 pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_status_t> {
-    match options {
-        ZX_SOCKET_STREAM => {}
-        ZX_SOCKET_DATAGRAM => return Err(ZX_ERR_NOT_SUPPORTED),
+    let core = match options {
+        ZX_SOCKET_STREAM => SocketCore::new_stream(SOCKET_STREAM_CAPACITY)?,
+        ZX_SOCKET_DATAGRAM => SocketCore::new_datagram(
+            SOCKET_DATAGRAM_CAPACITY_BYTES,
+            SOCKET_DATAGRAM_CAPACITY_MESSAGES,
+        ),
         _ => return Err(ZX_ERR_INVALID_ARGS),
-    }
+    };
 
     with_state_mut(|state| {
         let core_id = state.with_transport_mut(|transport| Ok(transport.alloc_socket_core_id()))?;
-        let core = SocketCore::new_stream(SOCKET_STREAM_CAPACITY)?;
         state.with_transport_mut(|transport| {
             transport.socket_cores.insert(core_id, core);
             Ok(())
@@ -511,7 +575,7 @@ pub(crate) fn try_remap_loaned_channel_read(
     })
 }
 
-/// Write bytes into one stream socket.
+/// Write bytes into one socket endpoint.
 pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<usize, zx_status_t> {
     if options != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
@@ -533,24 +597,56 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
                 .get_mut(&endpoint.core_id)
                 .ok_or(ZX_ERR_BAD_STATE)?;
             Ok(match core.write(endpoint.side, bytes) {
-                Ok(written) => Ok((written, core.buffered_bytes())),
-                Err(ZX_ERR_SHOULD_WAIT) => Err((ZX_ERR_SHOULD_WAIT, core.buffered_bytes())),
-                Err(e) => Err((e, core.buffered_bytes())),
+                Ok(written) => Ok((
+                    written,
+                    core.mode(),
+                    core.buffered_bytes(),
+                    core.buffered_messages(),
+                )),
+                Err(ZX_ERR_SHOULD_WAIT) => Err((
+                    ZX_ERR_SHOULD_WAIT,
+                    core.mode(),
+                    core.buffered_bytes(),
+                    core.buffered_messages(),
+                )),
+                Err(e) => Err((
+                    e,
+                    core.mode(),
+                    core.buffered_bytes(),
+                    core.buffered_messages(),
+                )),
             })
         })?;
-        let (written, buffered_after) = match write_result {
+        let (written, mode, buffered_after, messages_after) = match write_result {
             Ok(result) => result,
-            Err((ZX_ERR_SHOULD_WAIT, buffered_after)) => {
+            Err((ZX_ERR_SHOULD_WAIT, mode, buffered_after, _messages_after)) => {
                 let _ = state.with_transport_mut(|transport| {
-                    transport.note_socket_write(bytes.len(), 0, buffered_after);
+                    match mode {
+                        SocketMode::Stream => {
+                            transport.note_socket_write(bytes.len(), 0, buffered_after);
+                        }
+                        SocketMode::Datagram => transport.note_socket_datagram_write_should_wait(),
+                    }
                     Ok(())
                 });
                 return Err(ZX_ERR_SHOULD_WAIT);
             }
-            Err((e, _)) => return Err(e),
+            Err((e, _, _, _)) => return Err(e),
         };
         state.with_transport_mut(|transport| {
-            transport.note_socket_write(bytes.len(), written, buffered_after);
+            match mode {
+                SocketMode::Stream => {
+                    transport.note_socket_write(bytes.len(), written, buffered_after)
+                }
+                SocketMode::Datagram => {
+                    transport.note_socket_datagram_write(written, buffered_after, messages_after);
+                    crate::trace::record_socket_datagram_enqueue(
+                        written as u32,
+                        messages_after as u32,
+                        buffered_after as u32,
+                    );
+                }
+            }
             Ok(())
         })?;
 
@@ -560,7 +656,7 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
     })
 }
 
-/// Read bytes from one stream socket.
+/// Read bytes from one socket endpoint.
 pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<u8>, zx_status_t> {
     let peek = match options {
         0 => false,
@@ -578,17 +674,39 @@ pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<
             })?;
         require_handle_rights(resolved, crate::task::HandleRights::READ)?;
 
-        let bytes = state.with_transport_mut(|transport| {
-            let core = transport
-                .socket_cores
-                .get_mut(&endpoint.core_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            core.read(endpoint.side, len, !peek)
-        })?;
+        let (bytes, truncated, mode, buffered_after, messages_after) =
+            state.with_transport_mut(|transport| {
+                let core = transport
+                    .socket_cores
+                    .get_mut(&endpoint.core_id)
+                    .ok_or(ZX_ERR_BAD_STATE)?;
+                let (bytes, truncated) = core.read(endpoint.side, len, !peek)?;
+                Ok((
+                    bytes,
+                    truncated,
+                    core.mode(),
+                    core.buffered_bytes(),
+                    core.buffered_messages(),
+                ))
+            })?;
 
         if !peek {
             state.with_transport_mut(|transport| {
-                transport.note_socket_read(bytes.len());
+                match mode {
+                    SocketMode::Stream => transport.note_socket_read(bytes.len()),
+                    SocketMode::Datagram => transport.note_socket_datagram_read(
+                        buffered_after,
+                        messages_after,
+                        truncated,
+                    ),
+                }
+                if mode == SocketMode::Datagram {
+                    crate::trace::record_socket_datagram_dequeue(
+                        bytes.len() as u32,
+                        truncated,
+                        messages_after as u32,
+                    );
+                }
                 Ok(())
             })?;
             let _ = publish_object_signals(state, resolved.object_key());

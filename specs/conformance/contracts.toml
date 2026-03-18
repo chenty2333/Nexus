@@ -391,6 +391,11 @@ level = "should"
 description = "Bootstrap STREAM sockets should report stable short-write and would-block telemetry when the fixed-capacity buffer fills and drains"
 
 [[contracts]]
+id = "should.socket.datagram_bootstrap"
+level = "should"
+description = "Bootstrap DATAGRAM sockets should preserve message boundaries, support peek, truncate on narrow reads, exert bounded backpressure without short writes, and surface peer-closed state through the shared socket signal family"
+
+[[contracts]]
 id = "must.runtime.libzircon_bootstrap"
 level = "must"
 description = "Phase-three bootstrap userspace must expose a thin libzircon wrapper layer that can drive port, channel, timer, and handle-close syscalls from Rust ring3 code without handwritten per-syscall assembly"
