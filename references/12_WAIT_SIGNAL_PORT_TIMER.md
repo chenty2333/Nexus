@@ -27,6 +27,7 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   - `OBJECT_SIGNALED`
   - user signal bits 24..31
 - Object-specific aliases reuse those base bits for channels, sockets, timers, and task termination.
+- `INTERRUPT_SIGNALED` is now a public alias over `OBJECT_SIGNALED` for interrupt objects.
 
 ## wait_one
 
@@ -97,6 +98,13 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
 
 - Timers and blocked-wait deadlines are backed by one shared `axle_core::ReactorTimerCore`.
 - Current timers are one-shot.
+- Virtual interrupt objects are also waitable:
+  - `interrupt_create(ZX_INTERRUPT_VIRTUAL)` creates one software-driven interrupt object
+  - `ax_interrupt_trigger(handle, count)` increments one pending count and republishes
+    `INTERRUPT_SIGNALED` when the object is unmasked
+  - `interrupt_mask()` suppresses signal visibility without dropping pending counts
+  - `interrupt_unmask()` republishes the current pending state
+  - `interrupt_ack()` drains one pending count at a time
 - `set(deadline)` arms or re-arms and clears `SIGNALED`.
 - When polled at or after the deadline, the timer becomes signaled and disarms.
 - `cancel()` clears both arm state and signal state.
@@ -141,3 +149,7 @@ Wait completion eventually makes the thread runnable again through kernel task-s
 - `wait_async` still uses persistent port observers rather than the per-thread blocking wait node.
 - Timer interrupt ownership is per-CPU when the platform exposes TSC-deadline timers; otherwise the
   BSP remains the shared fallback tick source.
+- Interrupt objects are currently only the narrow virtual/software shape:
+  - no hardware IRQ routing
+  - no port packet delivery model
+  - no direct DMA / device binding yet

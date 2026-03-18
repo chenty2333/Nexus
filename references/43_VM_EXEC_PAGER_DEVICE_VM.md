@@ -101,16 +101,23 @@ What is not complete yet:
 
 ## Device-facing VM primitives
 
-The metadata layer already knows about `Physical` and `Contiguous` VMO kinds, but the external system model is not there yet.
+Current state:
 
-Missing or incomplete areas include:
+- `zx_vmo_create_physical(base_paddr, size, 0, out)` is now public and creates a shared
+  physical/MMIO-style VMO over an existing page-aligned physical span.
+- `zx_vmo_create_contiguous(size, 0, out)` is now public and creates a shared contiguous VMO.
+- `ax_vmo_lookup_paddr(handle, offset, out_paddr)` is the current narrow Axle-native helper for
+  resolving the backing physical address of one physical/contiguous VMO offset.
+- `interrupt_create(ZX_INTERRUPT_VIRTUAL)` is now public as a narrow virtual/software interrupt
+  object, and `ax_interrupt_trigger()` is the matching Axle-native injection helper.
 
-- Physical / MMIO VMO object exposure
-- DMA-oriented allocation or grant model
-- IOMMU-facing isolation hooks
-- interrupt object integration with device mappings
+What is still intentionally narrow:
 
-These are relevant for the future driver framework more than for the earliest bootstrap userspace path.
+- there is no BTI/pinning/grant object
+- there is no IOMMU-facing isolation contract
+- there is no hardware IRQ routing or MSI/MSI-X model yet
+- contiguous allocation is a bootstrap DMA-oriented primitive, not yet a richer device-memory policy
+- physical/MMIO VMOs do not yet expose cache-policy or mapping-attribute controls
 
 ## Current guidance
 
@@ -118,4 +125,6 @@ These are relevant for the future driver framework more than for the earliest bo
   metadata.
 - Treat pager-backed/file-backed support as one narrow page-object contract:
   shared read-only source plus mapping-local private shadow on write.
-- Treat physical / contiguous VMO support in `axle-mm` as groundwork for later device work, not as a fully surfaced subsystem today.
+- Treat the current physical / contiguous / interrupt surface as one minimal device-facing substrate:
+  enough for bootstrap smoke, future user-mode virtio work, and later DMA/IOMMU integration, but
+  not yet the final DFv2 device contract.

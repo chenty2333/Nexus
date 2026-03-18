@@ -60,6 +60,14 @@ bitflags! {
 pub struct FrameId(u64);
 
 impl FrameId {
+    /// Construct one frame id from a raw page-aligned physical address.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        if raw & (PAGE_SIZE - 1) != 0 {
+            return None;
+        }
+        Some(Self(raw))
+    }
+
     /// Raw page-aligned physical address.
     pub const fn raw(self) -> u64 {
         self.0

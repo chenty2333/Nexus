@@ -4,7 +4,6 @@
 //! a stable periodic wakeup without needing PIT/HPET calibration.
 
 use core::sync::atomic::{AtomicBool, Ordering};
-use raw_cpuid::CpuId;
 use x86_64::registers::model_specific::Msr;
 
 use crate::arch::apic;
@@ -19,9 +18,7 @@ static USE_TSC_DEADLINE: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the BSP local APIC + a periodic timer interrupt.
 pub fn init_bsp() {
-    let tsc_deadline = CpuId::new()
-        .get_feature_info()
-        .is_some_and(|fi| fi.has_tsc_deadline());
+    let tsc_deadline = crate::arch::cpuid::supports_tsc_deadline();
 
     USE_TSC_DEADLINE.store(tsc_deadline, Ordering::Relaxed);
     TICKS_ALL_CPUS.store(true, Ordering::Relaxed);
@@ -42,9 +39,7 @@ pub fn init_bsp() {
 
 /// Initialize an AP local timer using the same per-CPU periodic wakeup contract as the BSP.
 pub fn init_ap() {
-    let tsc_deadline = CpuId::new()
-        .get_feature_info()
-        .is_some_and(|fi| fi.has_tsc_deadline());
+    let tsc_deadline = crate::arch::cpuid::supports_tsc_deadline();
 
     crate::arch::apic::init_ap(true);
 

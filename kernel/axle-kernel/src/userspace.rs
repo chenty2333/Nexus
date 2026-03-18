@@ -643,8 +643,42 @@ const SLOT_TRACE_TLB_INVPCID_ENABLED: usize = 778;
 const SLOT_PERF_PMU_VERSION: usize = 779;
 const SLOT_PERF_PMU_FIXED_COUNTERS: usize = 780;
 const SLOT_TRACE_TLB_PHASE8_OK: usize = 781;
+const SLOT_DEVICE_FAILURE_STEP: usize = 896;
+const SLOT_DEVICE_INTERRUPT_CREATE: usize = 897;
+const SLOT_DEVICE_INTERRUPT_WAIT_INITIAL: usize = 898;
+const SLOT_DEVICE_INTERRUPT_WAIT_INITIAL_OBSERVED: usize = 899;
+const SLOT_DEVICE_INTERRUPT_TRIGGER: usize = 900;
+const SLOT_DEVICE_INTERRUPT_WAIT_SIGNALED: usize = 901;
+const SLOT_DEVICE_INTERRUPT_WAIT_SIGNALED_OBSERVED: usize = 902;
+const SLOT_DEVICE_INTERRUPT_MASK: usize = 903;
+const SLOT_DEVICE_INTERRUPT_TRIGGER_MASKED: usize = 904;
+const SLOT_DEVICE_INTERRUPT_WAIT_MASKED: usize = 905;
+const SLOT_DEVICE_INTERRUPT_UNMASK: usize = 906;
+const SLOT_DEVICE_INTERRUPT_WAIT_UNMASKED: usize = 907;
+const SLOT_DEVICE_INTERRUPT_WAIT_UNMASKED_OBSERVED: usize = 908;
+const SLOT_DEVICE_INTERRUPT_ACK1: usize = 909;
+const SLOT_DEVICE_INTERRUPT_ACK2: usize = 910;
+const SLOT_DEVICE_INTERRUPT_WAIT_DRAINED: usize = 911;
+const SLOT_DEVICE_CONTIG_CREATE: usize = 912;
+const SLOT_DEVICE_CONTIG_LOOKUP0: usize = 913;
+const SLOT_DEVICE_CONTIG_LOOKUP1: usize = 914;
+const SLOT_DEVICE_CONTIG_PADDR0: usize = 915;
+const SLOT_DEVICE_CONTIG_PADDR1: usize = 916;
+const SLOT_DEVICE_CONTIG_IS_CONTIGUOUS: usize = 917;
+const SLOT_DEVICE_CONTIG_MAP: usize = 918;
+const SLOT_DEVICE_CONTIG_WRITE: usize = 919;
+const SLOT_DEVICE_CONTIG_READ: usize = 920;
+const SLOT_DEVICE_CONTIG_READ_MATCH: usize = 921;
+const SLOT_DEVICE_PHYSICAL_CREATE: usize = 922;
+const SLOT_DEVICE_PHYSICAL_LOOKUP: usize = 923;
+const SLOT_DEVICE_PHYSICAL_PADDR: usize = 924;
+const SLOT_DEVICE_PHYSICAL_MATCHES_CONTIG0: usize = 925;
+const SLOT_DEVICE_PHYSICAL_MAP: usize = 926;
+const SLOT_DEVICE_PRESENT: usize = 927;
+const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
+const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_TRACE_TLB_PHASE8_OK;
+const SLOT_MAX: usize = SLOT_SMP_SMOKE_STATUS;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1581,6 +1615,14 @@ fn perf_summary_present(slots: &[u64]) -> bool {
         || slots[SLOT_PERF_FAILURE_STEP] != 0
 }
 
+fn device_summary_present(slots: &[u64]) -> bool {
+    slots[SLOT_DEVICE_PRESENT] != 0 || slots[SLOT_DEVICE_FAILURE_STEP] != 0
+}
+
+fn smp_summary_present(slots: &[u64]) -> bool {
+    slots[SLOT_SMP_SMOKE_PRESENT] != 0
+}
+
 fn update_perf_trace_slots(slots: &mut [u64]) {
     let channel = crate::object::transport::channel_telemetry_snapshot();
     slots[SLOT_TRACE_RECORDS] = crate::trace::bootstrap_trace_record_count();
@@ -1777,6 +1819,52 @@ fn print_perf_summary(slots: &mut [u64]) {
     );
 }
 
+fn print_device_summary(slots: &[u64]) {
+    crate::kprintln!(
+        "kernel: device vm interrupt smoke (device_present={}, device_failure_step={}, interrupt_create={}, interrupt_wait_initial={}, interrupt_wait_initial_observed={}, interrupt_trigger={}, interrupt_wait_signaled={}, interrupt_wait_signaled_observed={}, interrupt_mask={}, interrupt_trigger_masked={}, interrupt_wait_masked={}, interrupt_unmask={}, interrupt_wait_unmasked={}, interrupt_wait_unmasked_observed={}, interrupt_ack1={}, interrupt_ack2={}, interrupt_wait_drained={}, contig_create={}, contig_lookup0={}, contig_lookup1={}, contig_paddr0={}, contig_paddr1={}, contig_is_contiguous={}, contig_map={}, contig_write={}, contig_read={}, contig_read_match={}, physical_create={}, physical_lookup={}, physical_paddr={}, physical_matches_contig0={}, physical_map={})",
+        slots[SLOT_DEVICE_PRESENT],
+        slots[SLOT_DEVICE_FAILURE_STEP],
+        slots[SLOT_DEVICE_INTERRUPT_CREATE] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_WAIT_INITIAL] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_WAIT_INITIAL_OBSERVED],
+        slots[SLOT_DEVICE_INTERRUPT_TRIGGER] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_WAIT_SIGNALED] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_WAIT_SIGNALED_OBSERVED],
+        slots[SLOT_DEVICE_INTERRUPT_MASK] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_TRIGGER_MASKED] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_WAIT_MASKED] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_UNMASK] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_WAIT_UNMASKED] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_WAIT_UNMASKED_OBSERVED],
+        slots[SLOT_DEVICE_INTERRUPT_ACK1] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_ACK2] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_WAIT_DRAINED] as i64,
+        slots[SLOT_DEVICE_CONTIG_CREATE] as i64,
+        slots[SLOT_DEVICE_CONTIG_LOOKUP0] as i64,
+        slots[SLOT_DEVICE_CONTIG_LOOKUP1] as i64,
+        slots[SLOT_DEVICE_CONTIG_PADDR0],
+        slots[SLOT_DEVICE_CONTIG_PADDR1],
+        slots[SLOT_DEVICE_CONTIG_IS_CONTIGUOUS],
+        slots[SLOT_DEVICE_CONTIG_MAP] as i64,
+        slots[SLOT_DEVICE_CONTIG_WRITE] as i64,
+        slots[SLOT_DEVICE_CONTIG_READ] as i64,
+        slots[SLOT_DEVICE_CONTIG_READ_MATCH],
+        slots[SLOT_DEVICE_PHYSICAL_CREATE] as i64,
+        slots[SLOT_DEVICE_PHYSICAL_LOOKUP] as i64,
+        slots[SLOT_DEVICE_PHYSICAL_PADDR],
+        slots[SLOT_DEVICE_PHYSICAL_MATCHES_CONTIG0],
+        slots[SLOT_DEVICE_PHYSICAL_MAP] as i64,
+    );
+}
+
+fn print_smp_summary(slots: &[u64]) {
+    crate::kprintln!(
+        "kernel: smp smoke ok (present={}, status={})",
+        slots[SLOT_SMP_SMOKE_PRESENT],
+        slots[SLOT_SMP_SMOKE_STATUS] as i64,
+    );
+}
+
 fn component_provider_output_preview(
     slots: &[u64],
 ) -> ([u8; COMPONENT_PROVIDER_OUTPUT_WORDS * 8], usize) {
@@ -1880,6 +1968,12 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         if perf_summary_present(slots) {
             print_perf_summary(slots);
         }
+        if device_summary_present(slots) {
+            print_device_summary(slots);
+        }
+        if smp_summary_present(slots) {
+            print_smp_summary(slots);
+        }
         crate::arch::qemu::exit_failure();
     }
     let socket_stats = crate::object::transport::socket_telemetry_snapshot();
@@ -1903,6 +1997,13 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
 
     if perf_summary_present(slots) {
         print_perf_summary(slots);
+    }
+    if device_summary_present(slots) {
+        print_device_summary(slots);
+    }
+    if smp_summary_present(slots) {
+        print_smp_summary(slots);
+        crate::arch::qemu::exit_success();
     }
 
     crate::kprintln!(

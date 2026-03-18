@@ -35,7 +35,7 @@ This file describes the current syscall-number source, trap entry, argument copy
   - it first gives guest-started carrier threads one chance to divert into the generic
     guest-session stop boundary
   - ordinary native userspace then falls through to the same shared syscall shell
-- The current bootstrap syscall ABI surface is `49` generated syscall numbers.
+- The current bootstrap syscall ABI surface is `57` generated syscall numbers.
 - `AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC` is now the distinct Linux-facing
   exec-prepare helper. It accepts one opaque exec-spec blob and produces the
   prepared entry/stack pair without overloading the generic native launch path.
@@ -101,7 +101,9 @@ The current bootstrap syscall surface includes:
 - object wait one / wait async / signal / signal peer
 - port create / queue / wait
 - timer create / set / cancel
+- interrupt create / ack / mask / unmask
 - VMO create / read / write / set size
+- VMO create physical / create contiguous / lookup backing paddr
 - VMAR allocate / destroy / map / unmap / protect
 - channel create / write / read
 - eventpair create
@@ -113,6 +115,7 @@ The current bootstrap syscall surface includes:
 - thread create / start
 - task kill / suspend
 - socket create / read / write
+- Axle-native interrupt trigger
 
 ## Error-handling shape
 
@@ -141,3 +144,7 @@ The current bootstrap syscall surface includes:
 - The current ABI surface is substantial for early system work, but not every planned Zircon-facing syscall family exists yet.
 - The public `ax_*` naming and the live handle codec are now aligned: handles travel through the
   syscall boundary at full native 64-bit width.
+- The current device-facing syscall surface is intentionally narrow:
+  - `interrupt_create()` only accepts `ZX_INTERRUPT_VIRTUAL`
+  - `ax_interrupt_trigger()` is an Axle-native helper rather than a fully generic IRQ delivery ABI
+  - `ax_vmo_lookup_paddr()` is a narrow bootstrap helper, not yet a full BTI/pinning contract

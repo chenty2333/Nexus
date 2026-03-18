@@ -73,10 +73,21 @@ pub(crate) fn ring0_stack_top(cpu: usize) -> u64 {
 ///
 /// Safe to call multiple times per CPU (idempotent).
 pub fn init() -> &'static Selectors {
+    if let (Some(cpu_slot), Some(apic_id)) = (
+        crate::arch::percpu::try_current_cpu_slot(),
+        crate::arch::percpu::try_current_apic_id(),
+    ) {
+        return init_cpu(cpu_slot, apic_id as usize);
+    }
+
     let apic_id = CpuId::new()
         .get_feature_info()
         .map(|fi| fi.initial_local_apic_id() as usize)
         .unwrap_or(0);
+    init_for_apic_id(apic_id)
+}
+
+pub(crate) fn init_for_apic_id(apic_id: usize) -> &'static Selectors {
     init_cpu(
         crate::smp::cpu_slot_for_apic_id(apic_id).unwrap_or(0),
         apic_id,

@@ -131,6 +131,101 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
     })
 }
 
+/// Create one public physical/MMIO-style VMO over an existing page-aligned span.
+pub fn create_physical_vmo(
+    base_paddr: u64,
+    size: u64,
+    options: u32,
+) -> Result<zx_handle_t, zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let object_id = state.alloc_object_id();
+        let global_vmo_id = state.with_kernel_mut(|kernel| Ok(kernel.allocate_global_vmo_id()))?;
+        let process_id =
+            state.with_core(|kernel| Ok(kernel.current_process_info()?.process_id()))?;
+        let size_bytes = state
+            .with_vm_mut(|vm| vm.create_physical_vmo_global(base_paddr, size, global_vmo_id))?;
+        state.with_objects_mut(|objects| {
+            objects.insert(
+                object_id,
+                KernelObject::Vmo(VmoObject {
+                    creator_process_id: process_id,
+                    global_vmo_id,
+                    backing_scope: VmoBackingScope::GlobalShared,
+                    kind: axle_mm::VmoKind::Physical,
+                    size_bytes,
+                    image_layout: None,
+                }),
+            )?;
+            Ok(())
+        })?;
+
+        match state.alloc_handle_for_object(object_id, handle::vmo_default_rights()) {
+            Ok(handle) => Ok(handle),
+            Err(err) => {
+                let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
+                Err(err)
+            }
+        }
+    })
+}
+
+/// Create one public contiguous, DMA-capable VMO and return a handle.
+pub fn create_contiguous_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let object_id = state.alloc_object_id();
+        let global_vmo_id = state.with_kernel_mut(|kernel| Ok(kernel.allocate_global_vmo_id()))?;
+        let process_id =
+            state.with_core(|kernel| Ok(kernel.current_process_info()?.process_id()))?;
+        let size_bytes =
+            state.with_vm_mut(|vm| vm.create_contiguous_vmo_global(size, global_vmo_id))?;
+        state.with_objects_mut(|objects| {
+            objects.insert(
+                object_id,
+                KernelObject::Vmo(VmoObject {
+                    creator_process_id: process_id,
+                    global_vmo_id,
+                    backing_scope: VmoBackingScope::GlobalShared,
+                    kind: axle_mm::VmoKind::Contiguous,
+                    size_bytes,
+                    image_layout: None,
+                }),
+            )?;
+            Ok(())
+        })?;
+
+        match state.alloc_handle_for_object(object_id, handle::vmo_default_rights()) {
+            Ok(handle) => Ok(handle),
+            Err(err) => {
+                let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
+                Err(err)
+            }
+        }
+    })
+}
+
+/// Return the physical address backing one physical/contiguous VMO offset.
+pub fn lookup_vmo_paddr(handle: zx_handle_t, offset: u64) -> Result<u64, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::READ)?;
+        let vmo = state.with_objects(|objects| {
+            Ok(match objects.get(resolved.object_key()) {
+                Some(KernelObject::Vmo(vmo)) => vmo.clone(),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+        state.with_vm_mut(|vm| vm.lookup_vmo_paddr(&vmo, offset))
+    })
+}
+
 /// Read bytes from one VMO into a kernel-owned buffer.
 pub fn vmo_read(handle: zx_handle_t, offset: u64, len: usize) -> Result<Vec<u8>, zx_status_t> {
     with_state_mut(|state| {

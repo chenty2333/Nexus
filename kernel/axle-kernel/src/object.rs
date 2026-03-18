@@ -16,13 +16,15 @@ use axle_core::{Capability, ObjectKey, PortError, Signals, TimerError, TimerId, 
 use axle_mm::{MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
+use axle_types::interrupt::ZX_INTERRUPT_VIRTUAL;
 use axle_types::koid::ZX_KOID_INVALID;
 use axle_types::rights::{ZX_RIGHT_SAME_RIGHTS, ZX_RIGHTS_ALL};
 use axle_types::socket::{ZX_SOCKET_DATAGRAM, ZX_SOCKET_PEEK, ZX_SOCKET_STREAM};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
     ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
-    ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE,
+    ZX_ERR_OUT_OF_RANGE, ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT,
+    ZX_ERR_WRONG_TYPE,
 };
 use axle_types::vm::{
     ZX_VM_ALIGN_BASE, ZX_VM_ALIGN_MASK, ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ,
@@ -66,6 +68,8 @@ pub enum ObjectKind {
     Port,
     /// Timer object.
     Timer,
+    /// Interrupt object.
+    Interrupt,
     /// Supervised guest-session object.
     GuestSession,
     /// VMO object.
@@ -80,6 +84,57 @@ pub enum ObjectKind {
 pub(crate) struct TimerObject {
     pub(crate) timer_id: TimerId,
     clock_id: zx_clock_t,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InterruptObject {
+    pending_count: u64,
+    masked: bool,
+    virtual_only: bool,
+}
+
+impl InterruptObject {
+    fn new(virtual_only: bool) -> Self {
+        Self {
+            pending_count: 0,
+            masked: false,
+            virtual_only,
+        }
+    }
+
+    fn signals(self) -> Signals {
+        if self.pending_count != 0 && !self.masked {
+            Signals::INTERRUPT_SIGNALED
+        } else {
+            Signals::NONE
+        }
+    }
+
+    fn trigger(&mut self, count: u64) -> Result<Signals, zx_status_t> {
+        self.pending_count = self
+            .pending_count
+            .checked_add(count)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        Ok(self.signals())
+    }
+
+    fn ack(&mut self) -> Result<Signals, zx_status_t> {
+        if self.pending_count == 0 {
+            return Err(ZX_ERR_BAD_STATE);
+        }
+        self.pending_count -= 1;
+        Ok(self.signals())
+    }
+
+    fn mask(&mut self) -> Signals {
+        self.masked = true;
+        self.signals()
+    }
+
+    fn unmask(&mut self) -> Signals {
+        self.masked = false;
+        self.signals()
+    }
 }
 
 #[derive(Debug)]
@@ -558,6 +613,7 @@ pub(crate) enum KernelObject {
     EventPair(EventPairEndpoint),
     Port(KernelPort),
     Timer(TimerObject),
+    Interrupt(InterruptObject),
     Vmo(VmoObject),
     Vmar(VmarObject),
     Thread(ThreadObject),
@@ -1719,6 +1775,102 @@ pub fn create_timer(options: u32, clock_id: zx_clock_t) -> Result<zx_handle_t, z
     })
 }
 
+/// Create a virtual interrupt object and return a handle.
+pub fn create_interrupt(options: u32) -> Result<zx_handle_t, zx_status_t> {
+    if options != ZX_INTERRUPT_VIRTUAL {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let object_id = state.alloc_object_id();
+        state.with_objects_mut(|objects| {
+            objects.insert(
+                object_id,
+                KernelObject::Interrupt(InterruptObject::new(true)),
+            )?;
+            Ok(())
+        })?;
+        match state.alloc_handle_for_object(object_id, handle::interrupt_default_rights()) {
+            Ok(handle) => Ok(handle),
+            Err(err) => {
+                let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
+                Err(err)
+            }
+        }
+    })
+}
+
+/// Acknowledge one pending interrupt packet.
+pub fn interrupt_ack(handle: zx_handle_t) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::WRITE)?;
+        let object_key = resolved.object_key();
+        let current = state.with_objects_mut(|objects| {
+            let interrupt = match objects.get_mut(object_key) {
+                Some(KernelObject::Interrupt(interrupt)) => interrupt,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            interrupt.ack()
+        })?;
+        crate::wait::publish_signals_changed(state, object_key, current)
+    })
+}
+
+/// Mask one interrupt object without discarding pending counts.
+pub fn interrupt_mask(handle: zx_handle_t) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::WRITE)?;
+        let object_key = resolved.object_key();
+        let current = state.with_objects_mut(|objects| {
+            let interrupt = match objects.get_mut(object_key) {
+                Some(KernelObject::Interrupt(interrupt)) => interrupt,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            Ok(interrupt.mask())
+        })?;
+        crate::wait::publish_signals_changed(state, object_key, current)
+    })
+}
+
+/// Unmask one interrupt object and republish its current pending state.
+pub fn interrupt_unmask(handle: zx_handle_t) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::WRITE)?;
+        let object_key = resolved.object_key();
+        let current = state.with_objects_mut(|objects| {
+            let interrupt = match objects.get_mut(object_key) {
+                Some(KernelObject::Interrupt(interrupt)) => interrupt,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            Ok(interrupt.unmask())
+        })?;
+        crate::wait::publish_signals_changed(state, object_key, current)
+    })
+}
+
+/// Software-trigger one virtual interrupt object.
+pub fn ax_interrupt_trigger(handle: zx_handle_t, count: u64) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::WRITE)?;
+        let object_key = resolved.object_key();
+        let current = state.with_objects_mut(|objects| {
+            let interrupt = match objects.get_mut(object_key) {
+                Some(KernelObject::Interrupt(interrupt)) => interrupt,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            if !interrupt.virtual_only {
+                return Err(ZX_ERR_NOT_SUPPORTED);
+            }
+            interrupt.trigger(count)
+        })?;
+        crate::wait::publish_signals_changed(state, object_key, current)
+    })
+}
+
 /// Signal the local side of an EventPair.
 pub fn object_signal(
     handle: zx_handle_t,
@@ -1958,6 +2110,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
                 | Some(KernelObject::Channel(_))
                 | Some(KernelObject::EventPair(_))
                 | Some(KernelObject::Port(_))
+                | Some(KernelObject::Interrupt(_))
                 | Some(KernelObject::Thread(_))
                 | Some(KernelObject::Vmo(_))
                 | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
@@ -1998,6 +2151,7 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
                 | Some(KernelObject::Channel(_))
                 | Some(KernelObject::EventPair(_))
                 | Some(KernelObject::Port(_))
+                | Some(KernelObject::Interrupt(_))
                 | Some(KernelObject::Thread(_))
                 | Some(KernelObject::Vmo(_))
                 | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
@@ -2034,6 +2188,7 @@ enum CloseHandleAction {
     EventPair { peer_object: ObjectKey },
     Port,
     Timer,
+    Interrupt,
     Vmo,
     Vmar,
 }
@@ -2057,6 +2212,7 @@ fn close_handle_action_for_live_object(object: &KernelObject) -> CloseHandleActi
         },
         KernelObject::Port(_) => CloseHandleAction::Port,
         KernelObject::Timer(_) => CloseHandleAction::Timer,
+        KernelObject::Interrupt(_) => CloseHandleAction::Interrupt,
         KernelObject::Vmo(_) => CloseHandleAction::Vmo,
         KernelObject::Vmar(_) => CloseHandleAction::Vmar,
         KernelObject::Process(_) | KernelObject::Thread(_) => CloseHandleAction::None,
@@ -2217,6 +2373,15 @@ fn finalize_last_handle_close(
             state.finish_logical_destroy(object_key);
             result
         }
+        CloseHandleAction::Interrupt => {
+            state.with_reactor_mut(|reactor| {
+                reactor.remove_waitable(object_key);
+                Ok(())
+            })?;
+            let _ = state.begin_logical_destroy(object_key)?;
+            state.finish_logical_destroy(object_key);
+            Ok(())
+        }
         CloseHandleAction::Vmo | CloseHandleAction::Vmar => {
             let _ = state.begin_logical_destroy(object_key)?;
             state.finish_logical_destroy(object_key);
@@ -2299,6 +2464,14 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                     let _ = timer.clock_id;
                     let _ = timer.timer_id.raw();
                     ObjectKind::Timer
+                }
+                KernelObject::Interrupt(interrupt) => {
+                    let _ = (
+                        interrupt.pending_count,
+                        interrupt.masked,
+                        interrupt.virtual_only,
+                    );
+                    ObjectKind::Interrupt
                 }
                 KernelObject::Vmo(vmo) => {
                     let _ = (
@@ -2424,6 +2597,7 @@ pub(crate) fn signals_for_object_id(
                     Signals::NONE
                 })
             }
+            KernelObject::Interrupt(interrupt) => Ok(interrupt.signals()),
             KernelObject::Vmo(_) | KernelObject::Vmar(_) => Ok(Signals::NONE),
         }
     })

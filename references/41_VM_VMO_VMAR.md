@@ -66,7 +66,12 @@ Current user-facing object creation is much narrower:
 
 - `zx_vmo_create` currently creates anonymous VMOs.
 - Pager-backed VMOs exist internally for bootstrap code images and loader-backed sources.
-- Physical and contiguous kinds exist in the metadata model but are not yet exposed as public VM object primitives.
+- `zx_vmo_create_physical(base_paddr, size, 0, out)` now creates one shared physical/MMIO-style VMO
+  over an existing page-aligned physical span.
+- `zx_vmo_create_contiguous(size, 0, out)` now creates one shared contiguous VMO suitable for the
+  current narrow DMA-oriented bootstrap path.
+- `ax_vmo_lookup_paddr(handle, offset, out_paddr)` is the current Axle-native helper for resolving
+  the physical address backing one physical/contiguous VMO offset.
 
 ## VMAR model
 
@@ -143,6 +148,10 @@ It is not fully implemented yet.
 ## Current limitations
 
 - Execute mappings are now wired through the normal VMAR path, but the surrounding pager / file-backed object model is still incomplete; see `43_VM_EXEC_PAGER_DEVICE_VM.md`.
-- Physical / contiguous / MMIO-facing object surfaces are not yet public.
+- Physical / contiguous VMOs are now public as narrow bootstrap primitives, but the broader device
+  model is still incomplete:
+  - no BTI/pinning object
+  - no IOMMU isolation contract
+  - no richer MMIO cache-policy surface yet
 - Public allocation defaults are still simpler than the full internal placement machinery; some compact/per-CPU placement paths are internal rather than normal syscall behavior.
 - The crate is structurally large and still concentrated in one file, even though the semantic layers are already distinct.

@@ -5,8 +5,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use axle_types::zx_handle_t;
 
-const TRACE_RECORD_CAPACITY: usize = 8192;
-const TRACE_VMO_BYTES: u64 = 512 * 1024;
+const TRACE_RECORD_CAPACITY: usize = 32_768;
+const TRACE_VMO_BYTES: u64 = 2 * 1024 * 1024;
 const TRACE_MAGIC: u64 = u64::from_le_bytes(*b"AXLTRC01");
 const TRACE_VERSION: u64 = 1;
 const TRACE_RECORD_WORDS: u64 = 6;

@@ -2,6 +2,7 @@
 
 use bitflags::bitflags;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use heapless::String;
 use raw_cpuid::{CpuId, CpuIdReader};
 
@@ -19,6 +20,11 @@ bitflags! {
         const TSC_DEADLINE = 1 << 8;
     }
 }
+
+static BOOT_CAPS_READY: AtomicBool = AtomicBool::new(false);
+static BOOT_CAPS_BITS: AtomicU64 = AtomicU64::new(0);
+static BOOT_PMU_VERSION: AtomicU64 = AtomicU64::new(0);
+static BOOT_PMU_FIXED_COUNTERS: AtomicU64 = AtomicU64::new(0);
 
 fn detect_caps<R: CpuIdReader>(cpuid: &CpuId<R>) -> CpuCaps {
     let mut caps = CpuCaps::empty();
@@ -71,38 +77,83 @@ fn detect_caps<R: CpuIdReader>(cpuid: &CpuId<R>) -> CpuCaps {
     caps
 }
 
+fn cache_boot_caps<R: CpuIdReader>(cpuid: &CpuId<R>) -> CpuCaps {
+    let caps = detect_caps(cpuid);
+    BOOT_CAPS_BITS.store(caps.bits() as u64, Ordering::Release);
+    BOOT_PMU_VERSION.store(
+        u64::from(
+            cpuid
+                .get_performance_monitoring_info()
+                .map(|info| info.version_id())
+                .unwrap_or(0),
+        ),
+        Ordering::Release,
+    );
+    BOOT_PMU_FIXED_COUNTERS.store(
+        u64::from(
+            cpuid
+                .get_performance_monitoring_info()
+                .map(|info| info.fixed_function_counters())
+                .unwrap_or(0),
+        ),
+        Ordering::Release,
+    );
+    BOOT_CAPS_READY.store(true, Ordering::Release);
+    caps
+}
+
+fn current_caps() -> CpuCaps {
+    if BOOT_CAPS_READY.load(Ordering::Acquire) {
+        CpuCaps::from_bits_truncate(BOOT_CAPS_BITS.load(Ordering::Acquire) as u32)
+    } else {
+        detect_caps(&CpuId::new())
+    }
+}
+
 pub fn supports_native_syscall() -> bool {
-    detect_caps(&CpuId::new()).contains(CpuCaps::SYSCALL)
+    current_caps().contains(CpuCaps::SYSCALL)
+}
+
+pub fn supports_x2apic() -> bool {
+    current_caps().contains(CpuCaps::X2APIC)
 }
 
 pub fn supports_pcid() -> bool {
-    detect_caps(&CpuId::new()).contains(CpuCaps::PCID)
+    current_caps().contains(CpuCaps::PCID)
 }
 
 pub fn supports_invpcid() -> bool {
-    detect_caps(&CpuId::new()).contains(CpuCaps::INVPCID)
+    current_caps().contains(CpuCaps::INVPCID)
 }
 
 pub fn supports_pmu() -> bool {
-    detect_caps(&CpuId::new()).contains(CpuCaps::PMU)
+    current_caps().contains(CpuCaps::PMU)
 }
 
 pub fn supports_tsc_deadline() -> bool {
-    detect_caps(&CpuId::new()).contains(CpuCaps::TSC_DEADLINE)
+    current_caps().contains(CpuCaps::TSC_DEADLINE)
 }
 
 pub fn pmu_version() -> u8 {
-    CpuId::new()
-        .get_performance_monitoring_info()
-        .map(|info| info.version_id())
-        .unwrap_or(0)
+    if BOOT_CAPS_READY.load(Ordering::Acquire) {
+        BOOT_PMU_VERSION.load(Ordering::Acquire) as u8
+    } else {
+        CpuId::new()
+            .get_performance_monitoring_info()
+            .map(|info| info.version_id())
+            .unwrap_or(0)
+    }
 }
 
 pub fn pmu_fixed_counter_count() -> u8 {
-    CpuId::new()
-        .get_performance_monitoring_info()
-        .map(|info| info.fixed_function_counters())
-        .unwrap_or(0)
+    if BOOT_CAPS_READY.load(Ordering::Acquire) {
+        BOOT_PMU_FIXED_COUNTERS.load(Ordering::Acquire) as u8
+    } else {
+        CpuId::new()
+            .get_performance_monitoring_info()
+            .map(|info| info.fixed_function_counters())
+            .unwrap_or(0)
+    }
 }
 
 pub fn log_boot_cpu_info() {
@@ -115,7 +166,7 @@ pub fn log_boot_cpu_info() {
         let _ = write!(&mut vendor, "unknown");
     }
 
-    let caps = detect_caps(&cpuid);
+    let caps = cache_boot_caps(&cpuid);
 
     crate::kprintln!(
         "cpu: vendor={} caps=[sse2={},apic={},tsc={},x2apic={},syscall={},pcid={},invpcid={},tsc_deadline={},pmu={}]",

@@ -258,6 +258,13 @@ pub(super) fn timer_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::WRITE
 }
 
+pub(super) fn interrupt_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::WAIT
+        | crate::task::HandleRights::WRITE
+}
+
 pub(super) fn vmo_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER

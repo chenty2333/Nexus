@@ -100,3 +100,19 @@ pub const AXLE_SYS_AX_THREAD_START_GUEST: SyscallNumber = 46;
 pub const AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE: SyscallNumber = 47;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE: SyscallNumber = 48;
+/// Contract: SHOULD
+pub const AXLE_SYS_INTERRUPT_CREATE: SyscallNumber = 49;
+/// Contract: SHOULD
+pub const AXLE_SYS_INTERRUPT_ACK: SyscallNumber = 50;
+/// Contract: SHOULD
+pub const AXLE_SYS_INTERRUPT_MASK: SyscallNumber = 51;
+/// Contract: SHOULD
+pub const AXLE_SYS_INTERRUPT_UNMASK: SyscallNumber = 52;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_INTERRUPT_TRIGGER: SyscallNumber = 53;
+/// Contract: SHOULD
+pub const AXLE_SYS_VMO_CREATE_PHYSICAL: SyscallNumber = 54;
+/// Contract: SHOULD
+pub const AXLE_SYS_VMO_CREATE_CONTIGUOUS: SyscallNumber = 55;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_VMO_LOOKUP_PADDR: SyscallNumber = 56;

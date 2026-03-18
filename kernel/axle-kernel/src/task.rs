@@ -638,6 +638,23 @@ impl VmFacade {
         })
     }
 
+    pub(crate) fn create_physical_vmo_global(
+        &self,
+        base_paddr: u64,
+        size: u64,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<u64, zx_status_t> {
+        self.with_domain_mut(|vm| vm.create_physical_vmo_global(base_paddr, size, global_vmo_id))
+    }
+
+    pub(crate) fn create_contiguous_vmo_global(
+        &self,
+        size: u64,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<u64, zx_status_t> {
+        self.with_domain_mut(|vm| vm.create_contiguous_vmo_global(size, global_vmo_id))
+    }
+
     pub(crate) fn create_pager_file_vmo_for_address_space(
         &self,
         process_id: ProcessId,
@@ -681,6 +698,14 @@ impl VmFacade {
         new_size: u64,
     ) -> Result<VmoResizeResult, zx_status_t> {
         self.with_domain_mut(|vm| vm.set_vmo_size(vmo, new_size))
+    }
+
+    pub(crate) fn lookup_vmo_paddr(
+        &self,
+        vmo: &crate::object::VmoObject,
+        offset: u64,
+    ) -> Result<u64, zx_status_t> {
+        self.with_domain(|vm| vm.lookup_vmo_paddr(vmo, offset))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6810,6 +6835,99 @@ impl VmDomain {
         })
     }
 
+    pub(crate) fn create_physical_vmo_global(
+        &mut self,
+        base_paddr: u64,
+        size: u64,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<u64, zx_status_t> {
+        if base_paddr == 0
+            || (base_paddr & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
+            || size == 0
+            || (size & (crate::userspace::USER_PAGE_BYTES - 1)) != 0
+        {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        self.register_empty_global_vmo(global_vmo_id, VmoKind::Physical, size)?;
+
+        let created = {
+            let mut frames = self.frames.lock();
+            let mut global_vmos = self.global_vmos.lock();
+            let page_count = usize::try_from(size / crate::userspace::USER_PAGE_BYTES)
+                .map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+            for page_index in 0..page_count {
+                let paddr = base_paddr + (page_index as u64) * crate::userspace::USER_PAGE_BYTES;
+                let frame_id = if frames.contains(FrameId::from_raw(paddr).ok_or(ZX_ERR_BAD_STATE)?)
+                {
+                    FrameId::from_raw(paddr).ok_or(ZX_ERR_BAD_STATE)?
+                } else {
+                    frames
+                        .register_existing(paddr)
+                        .map_err(map_frame_table_error)?
+                };
+                global_vmos.update_frame(
+                    global_vmo_id,
+                    (page_index as u64) * crate::userspace::USER_PAGE_BYTES,
+                    frame_id,
+                )?;
+            }
+            Ok(())
+        };
+
+        if let Err(status) = created {
+            let _ = self.global_vmos.lock().remove(global_vmo_id);
+            return Err(status);
+        }
+        Ok(size)
+    }
+
+    pub(crate) fn create_contiguous_vmo_global(
+        &mut self,
+        size: u64,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<u64, zx_status_t> {
+        if size == 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        let page_size = crate::userspace::USER_PAGE_BYTES;
+        let rounded_size = size
+            .checked_add(page_size - 1)
+            .map(|value| value & !(page_size - 1))
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let page_count =
+            usize::try_from(rounded_size / page_size).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        self.register_empty_global_vmo(global_vmo_id, VmoKind::Contiguous, rounded_size)?;
+
+        let Some(base_paddr) = crate::userspace::alloc_bootstrap_zeroed_pages(page_count) else {
+            let _ = self.global_vmos.lock().remove(global_vmo_id);
+            return Err(ZX_ERR_NO_MEMORY);
+        };
+
+        let created = {
+            let mut frames = self.frames.lock();
+            let mut global_vmos = self.global_vmos.lock();
+            for page_index in 0..page_count {
+                let paddr = base_paddr + (page_index as u64) * page_size;
+                let frame_id = frames
+                    .register_existing(paddr)
+                    .map_err(map_frame_table_error)?;
+                global_vmos.update_frame(
+                    global_vmo_id,
+                    (page_index as u64) * page_size,
+                    frame_id,
+                )?;
+            }
+            Ok(())
+        };
+
+        if let Err(status) = created {
+            let _ = self.global_vmos.lock().remove(global_vmo_id);
+            crate::userspace::free_bootstrap_pages(base_paddr, page_count);
+            return Err(status);
+        }
+        Ok(rounded_size)
+    }
+
     pub(crate) fn create_pager_backed_vmo_for_address_space(
         &mut self,
         process_id: ProcessId,
@@ -7666,6 +7784,62 @@ impl VmDomain {
             } => self.set_local_vmo_size(owner_address_space_id, local_vmo_id, new_size),
             crate::object::VmoBackingScope::GlobalShared => {
                 self.set_shared_vmo_size(vmo.global_vmo_id(), new_size)
+            }
+        }
+    }
+
+    fn lookup_shared_vmo_paddr(
+        &self,
+        global_vmo_id: KernelVmoId,
+        offset: u64,
+    ) -> Result<u64, zx_status_t> {
+        let snapshot = self.global_vmos.lock().snapshot(global_vmo_id)?;
+        if !matches!(
+            snapshot.source.kind(),
+            VmoKind::Physical | VmoKind::Contiguous
+        ) {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        validate_vmo_io_range(snapshot.size_bytes, offset, 1)?;
+        let page_offset = align_down_page(offset);
+        let byte_offset = offset - page_offset;
+        let frame_id = self
+            .global_vmo_frame(global_vmo_id, page_offset)?
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(frame_id.raw() + byte_offset)
+    }
+
+    fn lookup_local_vmo_paddr(
+        &self,
+        owner_address_space_id: AddressSpaceId,
+        local_vmo_id: VmoId,
+        offset: u64,
+    ) -> Result<u64, zx_status_t> {
+        let snapshot = self.local_vmo_snapshot(owner_address_space_id, local_vmo_id)?;
+        if !matches!(snapshot.kind(), VmoKind::Physical | VmoKind::Contiguous) {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+        validate_vmo_io_range(snapshot.size_bytes(), offset, 1)?;
+        let page_offset = align_down_page(offset);
+        let byte_offset = offset - page_offset;
+        let frame_id = snapshot
+            .frame_at_offset(page_offset)
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(frame_id.raw() + byte_offset)
+    }
+
+    pub(crate) fn lookup_vmo_paddr(
+        &self,
+        vmo: &crate::object::VmoObject,
+        offset: u64,
+    ) -> Result<u64, zx_status_t> {
+        match vmo.backing_scope() {
+            crate::object::VmoBackingScope::LocalPrivate {
+                owner_address_space_id,
+                local_vmo_id,
+            } => self.lookup_local_vmo_paddr(owner_address_space_id, local_vmo_id, offset),
+            crate::object::VmoBackingScope::GlobalShared => {
+                self.lookup_shared_vmo_paddr(vmo.global_vmo_id(), offset)
             }
         }
     }
@@ -9325,6 +9499,20 @@ fn map_address_space_error(err: AddressSpaceError) -> zx_status_t {
         AddressSpaceError::PermissionIncrease => ZX_ERR_ACCESS_DENIED,
         AddressSpaceError::FrameTable(_) => ZX_ERR_NO_MEMORY,
         AddressSpaceError::NotCopyOnWrite => ZX_ERR_BAD_STATE,
+    }
+}
+
+fn map_frame_table_error(err: axle_mm::FrameTableError) -> zx_status_t {
+    match err {
+        axle_mm::FrameTableError::InvalidArgs => ZX_ERR_INVALID_ARGS,
+        axle_mm::FrameTableError::AlreadyExists => ZX_ERR_ALREADY_EXISTS,
+        axle_mm::FrameTableError::NotFound
+        | axle_mm::FrameTableError::CountOverflow
+        | axle_mm::FrameTableError::RefUnderflow
+        | axle_mm::FrameTableError::PinUnderflow
+        | axle_mm::FrameTableError::LoanUnderflow
+        | axle_mm::FrameTableError::MissingAnchor
+        | axle_mm::FrameTableError::Busy => ZX_ERR_BAD_STATE,
     }
 }
 

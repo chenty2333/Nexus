@@ -19,6 +19,7 @@ pub use nexus_component;
 pub use axle_types::clock;
 pub use axle_types::guest;
 pub use axle_types::handle;
+pub use axle_types::interrupt;
 pub use axle_types::koid;
 pub use axle_types::packet;
 pub use axle_types::rights;
@@ -41,17 +42,20 @@ use axle_types::status::{ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_IO_DATA_INTEGRITY, ZX_E
 use axle_types::syscall_numbers::{
     AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
     AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
-    AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
-    AXLE_SYS_AX_PROCESS_START_GUEST, AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
-    AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_START_GUEST,
-    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
-    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
+    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
+    AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
+    AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE,
+    AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_CHANNEL_CREATE,
+    AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE,
+    AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_INTERRUPT_ACK,
+    AXLE_SYS_INTERRUPT_CREATE, AXLE_SYS_INTERRUPT_MASK, AXLE_SYS_INTERRUPT_UNMASK,
     AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC,
     AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT,
     AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ,
     AXLE_SYS_SOCKET_WRITE, AXLE_SYS_TASK_KILL, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START,
     AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMO_CREATE,
-    AXLE_SYS_VMO_READ, AXLE_SYS_VMO_WRITE,
+    AXLE_SYS_VMO_CREATE_CONTIGUOUS, AXLE_SYS_VMO_CREATE_PHYSICAL, AXLE_SYS_VMO_READ,
+    AXLE_SYS_VMO_WRITE,
 };
 
 /// Infinite deadline used by blocking wait syscalls.
@@ -243,6 +247,37 @@ pub fn zx_timer_set(handle: zx_handle_t, deadline: zx_time_t, slack: zx_duration
 /// Cancel a timer.
 pub fn zx_timer_cancel(handle: zx_handle_t) -> zx_status_t {
     native_call(AXLE_SYS_TIMER_CANCEL as u64, [handle, 0, 0, 0, 0, 0])
+}
+
+/// Create a virtual interrupt object.
+pub fn zx_interrupt_create(options: u32, out: &mut zx_handle_t) -> zx_status_t {
+    native_call(
+        AXLE_SYS_INTERRUPT_CREATE as u64,
+        [options as u64, out as *mut zx_handle_t as u64, 0, 0, 0, 0],
+    )
+}
+
+/// Acknowledge one pending interrupt.
+pub fn zx_interrupt_ack(handle: zx_handle_t) -> zx_status_t {
+    native_call(AXLE_SYS_INTERRUPT_ACK as u64, [handle, 0, 0, 0, 0, 0])
+}
+
+/// Mask one interrupt object.
+pub fn zx_interrupt_mask(handle: zx_handle_t) -> zx_status_t {
+    native_call(AXLE_SYS_INTERRUPT_MASK as u64, [handle, 0, 0, 0, 0, 0])
+}
+
+/// Unmask one interrupt object.
+pub fn zx_interrupt_unmask(handle: zx_handle_t) -> zx_status_t {
+    native_call(AXLE_SYS_INTERRUPT_UNMASK as u64, [handle, 0, 0, 0, 0, 0])
+}
+
+/// Software-trigger one virtual interrupt object.
+pub fn ax_interrupt_trigger(handle: zx_handle_t, count: u64) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_INTERRUPT_TRIGGER as u64,
+        [handle, count, 0, 0, 0, 0],
+    )
 }
 
 /// Create a channel pair.
@@ -476,6 +511,49 @@ pub fn zx_vmo_create(size: u64, options: u32, out: &mut zx_handle_t) -> zx_statu
             0,
             0,
         ],
+    )
+}
+
+/// Create a physical/MMIO-style VMO over an existing page-aligned span.
+pub fn zx_vmo_create_physical(
+    base_paddr: u64,
+    size: u64,
+    options: u32,
+    out: &mut zx_handle_t,
+) -> zx_status_t {
+    native_call(
+        AXLE_SYS_VMO_CREATE_PHYSICAL as u64,
+        [
+            base_paddr,
+            size,
+            options as u64,
+            out as *mut zx_handle_t as u64,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Create a contiguous, DMA-capable VMO.
+pub fn zx_vmo_create_contiguous(size: u64, options: u32, out: &mut zx_handle_t) -> zx_status_t {
+    native_call(
+        AXLE_SYS_VMO_CREATE_CONTIGUOUS as u64,
+        [
+            size,
+            options as u64,
+            out as *mut zx_handle_t as u64,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Return the physical address backing one physical/contiguous VMO offset.
+pub fn ax_vmo_lookup_paddr(handle: zx_handle_t, offset: u64, out_paddr: &mut u64) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_VMO_LOOKUP_PADDR as u64,
+        [handle, offset, out_paddr as *mut u64 as u64, 0, 0, 0],
     )
 }
 

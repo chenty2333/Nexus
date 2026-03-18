@@ -581,3 +581,84 @@ args = [
   { name = "options", ty = "u32" },
   { name = "out_fs_base", ty = "*mut u64" },
 ]
+
+[[syscall]]
+name = "interrupt_create"
+nr = 49
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "options", ty = "u32" },
+  { name = "out", ty = "*mut ax_handle_t" },
+]
+
+[[syscall]]
+name = "interrupt_ack"
+nr = 50
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+]
+
+[[syscall]]
+name = "interrupt_mask"
+nr = 51
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+]
+
+[[syscall]]
+name = "interrupt_unmask"
+nr = 52
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+]
+
+[[syscall]]
+name = "ax_interrupt_trigger"
+nr = 53
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "count", ty = "u64" },
+]
+
+[[syscall]]
+name = "vmo_create_physical"
+nr = 54
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "base_paddr", ty = "u64" },
+  { name = "size", ty = "u64" },
+  { name = "options", ty = "u32" },
+  { name = "out", ty = "*mut ax_handle_t" },
+]
+
+[[syscall]]
+name = "vmo_create_contiguous"
+nr = 55
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "size", ty = "u64" },
+  { name = "options", ty = "u32" },
+  { name = "out", ty = "*mut ax_handle_t" },
+]
+
+[[syscall]]
+name = "ax_vmo_lookup_paddr"
+nr = 56
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "offset", ty = "u64" },
+  { name = "out_paddr", ty = "*mut u64" },
+]

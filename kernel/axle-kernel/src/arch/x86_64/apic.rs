@@ -65,15 +65,11 @@ enum XapicIpiDeliveryMode {
 }
 
 fn cpu_has_x2apic() -> bool {
-    CpuId::new()
-        .get_feature_info()
-        .is_some_and(|fi| fi.has_x2apic())
+    crate::arch::cpuid::supports_x2apic()
 }
 
 fn cpu_has_tsc_deadline() -> bool {
-    CpuId::new()
-        .get_feature_info()
-        .is_some_and(|fi| fi.has_tsc_deadline())
+    crate::arch::cpuid::supports_tsc_deadline()
 }
 
 /// Enable and configure the BSP local APIC.
@@ -284,10 +280,12 @@ pub fn eoi() {
 
 /// Current CPU initial APIC id (CPUID leaf 1).
 pub fn this_apic_id() -> u32 {
-    CpuId::new()
-        .get_feature_info()
-        .map(|fi| u32::from(fi.initial_local_apic_id()))
-        .unwrap_or(0)
+    crate::arch::percpu::try_current_apic_id().unwrap_or_else(|| {
+        CpuId::new()
+            .get_feature_info()
+            .map(|fi| u32::from(fi.initial_local_apic_id()))
+            .unwrap_or(0)
+    })
 }
 
 // --- Spurious/error interrupt stubs (kernel-only) ---

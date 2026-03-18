@@ -4,7 +4,6 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use axle_types::status::ZX_ERR_TIMED_OUT;
 use axle_types::zx_status_t;
-use raw_cpuid::CpuId;
 use spin::Mutex;
 
 use crate::arch::apic;
@@ -156,10 +155,7 @@ extern "C" fn axle_ipi_test_rust(_frame: *const u8) {
     // Acknowledge first to minimize time spent in-service.
     apic::eoi();
 
-    let apic_id = CpuId::new()
-        .get_feature_info()
-        .map(|fi| fi.initial_local_apic_id() as usize)
-        .unwrap_or(0);
+    let apic_id = apic::this_apic_id() as usize;
 
     if apic_id < MAX_CPUS {
         let _ = IPI_ACK_COUNT[apic_id].fetch_add(1, Ordering::AcqRel);
@@ -169,10 +165,7 @@ extern "C" fn axle_ipi_test_rust(_frame: *const u8) {
 extern "C" fn axle_ipi_tlb_rust(_frame: *const u8) {
     apic::eoi();
 
-    let apic_id = CpuId::new()
-        .get_feature_info()
-        .map(|fi| fi.initial_local_apic_id() as usize)
-        .unwrap_or(0);
+    let apic_id = apic::this_apic_id() as usize;
     match TLB_SHOOTDOWN_MODE.load(Ordering::Acquire) {
         TLB_MODE_PAGE => {
             let page = TLB_SHOOTDOWN_PAGE.load(Ordering::Acquire);

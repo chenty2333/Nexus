@@ -1,0 +1,47 @@
+id = "kernel.runtime.device_vm_interrupt_bootstrap"
+description = "Bootstrap ring3 Rust userspace should exercise the minimal InterruptObject plus public physical/contiguous VMO surface"
+tags = ["kernel", "runtime", "device", "vm", "interrupt", "bootstrap"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/device-smoke && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && AXLE_TEST_RUNNER_RUST_ENTRY=device_smoke RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none --target-dir \"$target_dir\" && runner_src=\"$target_dir/x86_64-unknown-none/debug/nexus-test-runner\" && runner=$(mktemp /tmp/nexus-test-runner-XXXXXX) && cp \"$runner_src\" \"$runner\" && size=$(stat -c%s \"$runner\") && { timeout --foreground 20s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x7000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x6fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; qemu_code=$?; echo qemu_exit=$qemu_code; [ \"$qemu_code\" -eq 33 ]; }"
+]
+
+expect = [
+  "kernel: device vm interrupt smoke",
+]
+forbid = ["KERNEL PANIC"]
+contracts = []
+
+[assertions.status_code]
+interrupt_create = 0
+interrupt_wait_initial = -21
+interrupt_trigger = 0
+interrupt_wait_signaled = 0
+interrupt_mask = 0
+interrupt_trigger_masked = 0
+interrupt_wait_masked = -21
+interrupt_unmask = 0
+interrupt_wait_unmasked = 0
+interrupt_ack1 = 0
+interrupt_ack2 = 0
+interrupt_wait_drained = -21
+contig_create = 0
+contig_lookup0 = 0
+contig_lookup1 = 0
+contig_map = 0
+contig_write = 0
+contig_read = 0
+physical_create = 0
+physical_lookup = 0
+physical_map = 0
+
+[assertions.packet_fields]
+device_failure_step = 0
+interrupt_wait_signaled_observed = 8
+interrupt_wait_unmasked_observed = 8
+contig_is_contiguous = 1
+contig_read_match = 1
+physical_matches_contig0 = 1

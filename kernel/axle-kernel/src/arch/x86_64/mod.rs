@@ -45,12 +45,12 @@ pub fn init() {
 
 /// Minimal AP init: load GDT/TSS/IDT, set per-CPU base, enable local APIC, and
 /// arm the CPU-local scheduler tick.
-pub fn init_ap() {
+pub fn init_ap(apic_id: usize) {
     serial::init();
     enable_no_execute();
-    let _ = gdt::init();
+    let _ = gdt::init_for_apic_id(apic_id);
     idt::load();
-    percpu::init();
+    percpu::init_for_apic_id(apic_id);
     tlb::init_cpu();
     syscall::init_cpu();
     fpu::init_cpu();

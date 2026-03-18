@@ -18,6 +18,7 @@ pub use libzircon::nexus_component;
 pub use axle_types::clock;
 pub use axle_types::guest;
 pub use axle_types::handle;
+pub use axle_types::interrupt;
 pub use axle_types::koid;
 pub use axle_types::packet;
 pub use axle_types::rights;
@@ -238,6 +239,48 @@ pub fn ax_timer_cancel(handle: ax_handle_t) -> ax_status_t {
     }
 }
 
+/// Create a virtual interrupt object.
+pub fn ax_interrupt_create(options: u32, out: &mut ax_handle_t) -> ax_status_t {
+    let mut raw_out = libzircon::handle::ZX_HANDLE_INVALID;
+    let status = libzircon::zx_interrupt_create(options, &mut raw_out);
+    if status == AX_OK {
+        *out = widen_handle(raw_out);
+    }
+    status
+}
+
+/// Acknowledge one pending interrupt.
+pub fn ax_interrupt_ack(handle: ax_handle_t) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::zx_interrupt_ack(raw),
+        Err(status) => status,
+    }
+}
+
+/// Mask one interrupt object.
+pub fn ax_interrupt_mask(handle: ax_handle_t) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::zx_interrupt_mask(raw),
+        Err(status) => status,
+    }
+}
+
+/// Unmask one interrupt object.
+pub fn ax_interrupt_unmask(handle: ax_handle_t) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::zx_interrupt_unmask(raw),
+        Err(status) => status,
+    }
+}
+
+/// Software-trigger one virtual interrupt object.
+pub fn ax_interrupt_trigger(handle: ax_handle_t, count: u64) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_interrupt_trigger(raw, count),
+        Err(status) => status,
+    }
+}
+
 /// Create a channel pair.
 pub fn ax_channel_create(
     options: u32,
@@ -410,6 +453,39 @@ pub fn ax_vmo_create(size: u64, options: u32, out: &mut ax_handle_t) -> ax_statu
         *out = widen_handle(raw_out);
     }
     status
+}
+
+/// Create a physical/MMIO-style VMO over an existing page-aligned span.
+pub fn ax_vmo_create_physical(
+    base_paddr: u64,
+    size: u64,
+    options: u32,
+    out: &mut ax_handle_t,
+) -> ax_status_t {
+    let mut raw_out = libzircon::handle::ZX_HANDLE_INVALID;
+    let status = libzircon::zx_vmo_create_physical(base_paddr, size, options, &mut raw_out);
+    if status == AX_OK {
+        *out = widen_handle(raw_out);
+    }
+    status
+}
+
+/// Create a contiguous, DMA-capable VMO.
+pub fn ax_vmo_create_contiguous(size: u64, options: u32, out: &mut ax_handle_t) -> ax_status_t {
+    let mut raw_out = libzircon::handle::ZX_HANDLE_INVALID;
+    let status = libzircon::zx_vmo_create_contiguous(size, options, &mut raw_out);
+    if status == AX_OK {
+        *out = widen_handle(raw_out);
+    }
+    status
+}
+
+/// Return the physical address backing one physical/contiguous VMO offset.
+pub fn ax_vmo_lookup_paddr(handle: ax_handle_t, offset: u64, out_paddr: &mut u64) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_vmo_lookup_paddr(raw, offset, out_paddr),
+        Err(status) => status,
+    }
 }
 
 /// Read bytes from a VMO.

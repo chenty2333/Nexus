@@ -97,6 +97,9 @@ Processes currently move through states such as:
 - The AP bring-up path no longer depends on raw APIC ids being `0..cpu_count-1`; the kernel keeps
   raw APIC ids for transport/IPI routing while mapping AP-local stack/TSS state onto bounded
   logical CPU slots.
+- The 4-core AP-online conformance gate now uses one dedicated narrow ring3 smoke after bring-up
+  rather than requiring the full default-int80 suite to complete under `-smp 4` QEMU fallback
+  timer conditions.
 - The system now has a real per-CPU L0 runnable topology, but it is still not the final scheduler
   architecture.
 

@@ -46,10 +46,19 @@ The current `KernelObject` enum includes:
 - `Channel`
 - `EventPair`
 - `Socket`
+- `Interrupt`
 - `Vmo`
 - `Vmar`
 
-There is no public Job object, Resource object, Revoker object, or Interrupt object yet.
+There is no public Job object, Resource object, or Revoker object yet.
+
+Current interrupt shape:
+
+- only one narrow virtual/software interrupt object is public today
+- it is waitable and exposes `INTERRUPT_SIGNALED`
+- it tracks one pending count plus one masked/unmasked bit
+- `interrupt_ack()` drains one pending count
+- `ax_interrupt_trigger()` is the current Axle-native software injection helper
 
 ## VMO object shape
 
@@ -108,6 +117,7 @@ These bootstrap handles are used by bootstrap execution paths and conformance pa
   - socket
   - port
   - timer
+  - interrupt
   - process/thread termination
 - `object_signals()` computes per-object signal snapshots on demand.
 
@@ -117,6 +127,7 @@ The object layer assigns default rights per object family, for example:
 
 - channel/socket: duplicate, transfer, wait, read, write
 - eventpair: duplicate, transfer, wait, signal, signal-peer
+- interrupt: duplicate, transfer, wait, write
 - process/thread: duplicate, transfer, wait, inspect, manage-*
 - guest-session: duplicate, transfer, read, write
 - vmo/vmar: duplicate, transfer, read, map, plus write where supported

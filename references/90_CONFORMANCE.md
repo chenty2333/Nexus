@@ -63,6 +63,12 @@ Main just targets include:
   - uncovered MUST contracts
   - missing / malformed MUST concurrency metadata
 - Current MUST gates now include core `wait_async`, `port`, `channel`, and same-page fault serialization contracts in addition to the earlier syscall/handle/timer/SMP basics.
+- SMP bring-up coverage now uses two narrow scenario shapes rather than one broad default-int80 run:
+  - `kernel.smp.ipi_ack` keeps the 2-core fixed-vector IPI sanity gate
+  - `kernel.smp.ap_online_4` now uses one dedicated `smp_smoke` runner under `-smp 4` to assert:
+    - all requested APs report online
+    - one AP acknowledges one fixed-vector IPI
+    - ring3 reaches a breakpoint smoke without depending on the full default-int80 suite under 4-way QEMU fallback timers
 - Bootstrap channel coverage now also includes one fragmented mixed-payload gate:
   - one exact-body remap read shape
   - one fallback-copy read shape
@@ -405,6 +411,7 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - waits / ports / timers
   - channel behavior
   - fragmented channel payload remap/copy coverage
+  - virtual interrupt plus physical/contiguous VMO bootstrap smoke
   - socket behavior
   - VMO / VMAR behavior
   - process / thread behavior
@@ -473,6 +480,12 @@ This makes contract coverage part of the repo workflow, not just informal docume
   the main `int80 conformance ok (...)` line.
   - the fragmented channel payload scenario uses this to report both remap-path and fallback-copy
     results without overloading the older monolithic line further
+- The device-facing bootstrap smoke now also reports through its own structured summary line:
+  - `kernel: device vm interrupt smoke (...)`
+  - current assertions cover:
+    - virtual interrupt create / wait / trigger / mask / unmask / ack
+    - contiguous VMO creation, physical-address lookup, and contiguity check
+    - physical VMO aliasing over an existing contiguous page
 - `tools/axle-concurrency` is a host-side Snowcat-lite runner for concurrent seeds:
   - seeds carry both operation programs and schedule hints
   - replay metadata includes runner version, logical CPU count, flags, PRNG seed, and step budget

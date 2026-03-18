@@ -489,6 +489,17 @@ pub mod socket {
     pub const ZX_SOCKET_PEEK: u32 = AX_SOCKET_PEEK;
 }
 
+/// Interrupt creation options.
+pub mod interrupt {
+    use super::{ax_vm_option_t, zx_vm_option_t};
+
+    /// Create one software-triggerable virtual interrupt object.
+    pub const AX_INTERRUPT_VIRTUAL: ax_vm_option_t = 1 << 0;
+
+    /// Create one software-triggerable virtual interrupt object.
+    pub const ZX_INTERRUPT_VIRTUAL: zx_vm_option_t = AX_INTERRUPT_VIRTUAL as zx_vm_option_t;
+}
+
 /// VM mapping and protection options.
 ///
 /// VM option bits used by Axle's Zircon-style VM syscalls.
@@ -1049,6 +1060,8 @@ pub mod signals {
     pub const AX_SOCKET_PEER_CLOSED: ax_signals_t = AX_OBJECT_PEER_CLOSED;
     /// Native timer signaled alias.
     pub const AX_TIMER_SIGNALED: ax_signals_t = AX_OBJECT_SIGNALED;
+    /// Native interrupt signaled alias.
+    pub const AX_INTERRUPT_SIGNALED: ax_signals_t = AX_OBJECT_SIGNALED;
     /// Native task terminated alias.
     pub const AX_TASK_TERMINATED: ax_signals_t = AX_OBJECT_SIGNALED;
 
@@ -1105,6 +1118,8 @@ pub mod signals {
 
     /// Timer signaled.
     pub const ZX_TIMER_SIGNALED: zx_signals_t = AX_TIMER_SIGNALED as zx_signals_t;
+    /// Interrupt signaled.
+    pub const ZX_INTERRUPT_SIGNALED: zx_signals_t = AX_INTERRUPT_SIGNALED as zx_signals_t;
 
     /// Task terminated.
     pub const ZX_TASK_TERMINATED: zx_signals_t = AX_TASK_TERMINATED as zx_signals_t;

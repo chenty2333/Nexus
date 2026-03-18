@@ -81,7 +81,7 @@ extern "C" fn ap_entry(apic_id: u64) -> ! {
     let apic_id_usize = apic_id as usize;
     let cpu_slot = register_apic_slot(apic_id_usize);
 
-    crate::arch::init_ap();
+    crate::arch::init_ap(apic_id_usize);
 
     if apic_id_usize < MAX_APIC_IDS
         && AP_ONLINE[apic_id_usize]

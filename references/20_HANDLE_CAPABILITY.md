@@ -106,3 +106,12 @@ It is a current-state reference, not a roadmap.
 - There is no externally exposed revocation-group object type.
 - Revocation is still independent from generation-based stale-handle isolation; there is no public
   revoker object yet.
+
+## Current object-right examples
+
+- interrupt handles now use the narrow default set:
+  - duplicate
+  - transfer
+  - wait
+  - write
+- physical / contiguous VMO handles currently reuse the normal VMO default-right shape.

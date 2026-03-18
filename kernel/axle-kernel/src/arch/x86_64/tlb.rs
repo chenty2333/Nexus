@@ -3,10 +3,10 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use axle_types::zx_status_t;
+use x86_64::PhysAddr;
 use x86_64::instructions::tlb::{InvPcidCommand, Pcid, flush_pcid};
 use x86_64::registers::control::{Cr3, Cr3Flags, Cr4, Cr4Flags};
 use x86_64::structures::paging::PhysFrame;
-use x86_64::PhysAddr;
 
 static PCID_ENABLED: AtomicU64 = AtomicU64::new(0);
 
