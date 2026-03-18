@@ -10,7 +10,7 @@ const TRACE_VMO_BYTES: u64 = 2 * 1024 * 1024;
 const TRACE_MAGIC: u64 = u64::from_le_bytes(*b"AXLTRC01");
 const TRACE_VERSION: u64 = 1;
 const TRACE_RECORD_WORDS: u64 = 6;
-const TRACE_LOG_LIMIT: usize = 128;
+const TRACE_DEFAULT_LOG_LIMIT: usize = 128;
 
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -980,6 +980,14 @@ fn event_name(event: TraceEvent) -> &'static str {
     }
 }
 
+fn trace_log_limit(record_count: usize) -> usize {
+    if crate::userspace::bootstrap_trace_dump_full() {
+        record_count
+    } else {
+        record_count.min(TRACE_DEFAULT_LOG_LIMIT)
+    }
+}
+
 pub(crate) fn flush_bootstrap_trace() {
     let records = snapshot_records();
 
@@ -1169,7 +1177,8 @@ pub(crate) fn flush_bootstrap_trace() {
         remote_wake_phase3
     );
 
-    for record in records.iter().take(TRACE_LOG_LIMIT) {
+    let logged_records = trace_log_limit(records.len());
+    for record in records.iter().take(logged_records) {
         crate::kprintln!(
             "trace: seq={} ts_ns={} phase={} cpu={} cat={} ev={} arg0={} arg1={}",
             record.seq,
@@ -1182,11 +1191,11 @@ pub(crate) fn flush_bootstrap_trace() {
             record.arg1 as i64
         );
     }
-    if records.len() > TRACE_LOG_LIMIT {
+    if records.len() > logged_records {
         crate::kprintln!(
             "trace: truncated logged_records={} remaining={}",
-            TRACE_LOG_LIMIT,
-            records.len() - TRACE_LOG_LIMIT
+            logged_records,
+            records.len() - logged_records
         );
     }
 }

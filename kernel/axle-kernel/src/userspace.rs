@@ -643,6 +643,7 @@ const SLOT_TRACE_TLB_INVPCID_ENABLED: usize = 778;
 const SLOT_PERF_PMU_VERSION: usize = 779;
 const SLOT_PERF_PMU_FIXED_COUNTERS: usize = 780;
 const SLOT_TRACE_TLB_PHASE8_OK: usize = 781;
+const SLOT_TRACE_DUMP_FULL: usize = 782;
 const SLOT_DEVICE_FAILURE_STEP: usize = 896;
 const SLOT_DEVICE_INTERRUPT_CREATE: usize = 897;
 const SLOT_DEVICE_INTERRUPT_WAIT_INITIAL: usize = 898;
@@ -1624,6 +1625,10 @@ pub(crate) fn consume_vm_fault_leader_pause_hook() -> bool {
 
 pub(crate) fn bootstrap_trace_phase() -> u64 {
     shared_slots()[SLOT_TRACE_PHASE]
+}
+
+pub(crate) fn bootstrap_trace_dump_full() -> bool {
+    shared_slots()[SLOT_TRACE_DUMP_FULL] != 0
 }
 
 pub(crate) fn component_summary_snapshot() -> Option<(u64, i64, i64, i64, i64, i64)> {
@@ -2662,6 +2667,7 @@ pub fn prepare() -> u64 {
     crate::trace::init_bootstrap_trace();
     slots[SLOT_TRACE_VMO_H] = u64::from(crate::trace::bootstrap_trace_vmo_handle());
     slots[SLOT_TRACE_PHASE] = 0;
+    slots[SLOT_TRACE_DUMP_FULL] = 0;
     // Keep the exported bootstrap code-image VMO span stable for the runner ABI. The parsed
     // image layout is an internal loader detail; the bootstrap code window is still the legacy
     // fixed-size mapping.

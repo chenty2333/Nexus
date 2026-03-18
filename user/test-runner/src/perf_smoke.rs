@@ -25,6 +25,7 @@ const SLOT_SELF_PROCESS_H: usize = 396;
 const SLOT_SELF_CODE_VMO_H: usize = 506;
 const SLOT_T0_NS: usize = 511;
 const SLOT_TRACE_PHASE: usize = 610;
+const SLOT_TRACE_DUMP_FULL: usize = 782;
 const SLOT_PERF_FAILURE_STEP: usize = 611;
 const SLOT_PERF_NULL_STATUS: usize = 612;
 const SLOT_PERF_NULL_ITERS: usize = 613;
@@ -298,6 +299,7 @@ fn pmu_snapshot(pmu: PmuCaps) -> PmuSnapshot {
 }
 
 fn run_perf_smoke() -> PerfSummary {
+    write_slot(SLOT_TRACE_DUMP_FULL, 1);
     let mut summary = PerfSummary::default();
     let self_process = read_slot(SLOT_SELF_PROCESS_H) as zx_handle_t;
     let self_code_vmo = read_slot(SLOT_SELF_CODE_VMO_H) as zx_handle_t;
