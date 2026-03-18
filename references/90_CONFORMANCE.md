@@ -160,25 +160,40 @@ Main just targets include:
   - `just perf-smoke-kvm-archive` then snapshots that run into the same
     `target/perf-smoke-baselines/` archive layout used by real-machine captures
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
-  - one ring3 worker thread acts as the minimal device-side peer
+  - two ring3 worker threads act as minimal device-side peers, one queue pair each
   - one contiguous VMO supplies the shared queue/buffer memory
-  - one physical-address lookup freezes the DMA-style address handoff shape
-  - one shared MMIO-style register page freezes a minimal control-plane shape:
+  - one separate contiguous register-backing page plus one physical alias VMO freeze the current
+    MMIO-backed register-window contract
+  - one physical-address lookup freezes the DMA-style address handoff shape for both queues and the
+    register page
+  - one MMIO-style register page freezes a minimal control-plane shape:
     - device identity/version
     - feature bits plus driver-acknowledged feature bits
-    - queue-ready state
-    - notify / interrupt status
-    - notify / completion counters
-  - one ready interrupt, one TX-kick interrupt, and one RX-complete interrupt carry control flow
-  - one reusable split TX/RX virtio-style transport slice now completes one four-packet batched
+    - queue-pair count and stride metadata
+    - one queue-local ready/notify/completion block per queue pair
+  - one ready interrupt, one TX-kick interrupt, and one RX-complete interrupt per queue pair carry
+    control flow
+  - one reusable split TX/RX virtio-style transport slice now completes one eight-packet batched
     loopback round without channel/socket data-plane help
   - the summary now also exports:
+    - `reg_backing_create`
+    - `reg_lookup`
+    - `reg_alias_create`
+    - `reg_alias_lookup`
+    - `reg_alias_match`
+    - `reg_alias_map`
+    - `reg_backing_map`
     - `mmio_ready`
     - `mmio_device_features`
     - `mmio_driver_features`
     - `mmio_status`
+    - `queue_pairs`
     - `tx_notify_count`
     - `rx_complete_count`
+    - `tx_notify_mask`
+    - `rx_complete_mask`
+    - `tx_ready_mask`
+    - `rx_ready_mask`
     - `packet_count`
     - `packet_match_count`
     - `batch_cycles`
