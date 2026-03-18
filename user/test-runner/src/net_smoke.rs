@@ -7,11 +7,12 @@ use crate::virtio_net_transport::{
     BUFFER_STRIDE, MMIO_DEVICE_ID_NET, MMIO_FEATURE_CSUM, MMIO_INTERRUPT_RX_COMPLETE, MMIO_MAGIC,
     MMIO_NOTIFY_RX, MMIO_NOTIFY_TX, MMIO_STATUS_ACKNOWLEDGE, MMIO_STATUS_DRIVER,
     MMIO_STATUS_DRIVER_OK, MMIO_STATUS_FEATURES_OK, MMIO_VENDOR_ID_AXLE, MMIO_VERSION, PAGE_SIZE,
+    PCI_CLASS_NETWORK, PCI_DEVICE_ID_NET, PCI_SUBCLASS_ETHERNET, PCI_VENDOR_ID_AXLE, PciConfigPage,
     QUEUE_PAIR_COUNT, QUEUE_SIZE, QUEUE_VMO_BYTES, REGISTER_VMO_BYTES, VirtioMmioHeader,
     VirtioNetHdr, VirtioQueueRegs, VirtqDesc, buffer_offset, buffer_paddr, empty_avail, empty_used,
-    frame_len, init_regs, read_avail, read_header, read_queue_regs, read_used, rx_buffer_offset,
-    rx_queue_offset, tx_buffer_offset, tx_queue_offset, write_avail, write_desc, write_header,
-    write_queue_regs, write_used,
+    frame_len, init_pci_config, init_regs, read_avail, read_header, read_pci_config,
+    read_queue_regs, read_used, rx_buffer_offset, rx_queue_offset, tx_buffer_offset,
+    tx_queue_offset, write_avail, write_desc, write_header, write_queue_regs, write_used,
 };
 use axle_arch_x86_64::{debug_break, native_syscall8, rdtsc};
 use libzircon::handle::ZX_HANDLE_INVALID;
@@ -58,28 +59,36 @@ const SLOT_NET_PACKET_MATCH: usize = 950;
 const SLOT_NET_DRIVER_CPU: usize = 951;
 const SLOT_NET_WORKER_CPU: usize = 952;
 const SLOT_NET_PRESENT: usize = 953;
-const SLOT_NET_REG_BACKING_CREATE: usize = 978;
-const SLOT_NET_REG_LOOKUP: usize = 979;
-const SLOT_NET_REG_ALIAS_CREATE: usize = 980;
-const SLOT_NET_REG_ALIAS_LOOKUP: usize = 981;
-const SLOT_NET_REG_ALIAS_MATCH: usize = 982;
-const SLOT_NET_REG_ALIAS_MAP: usize = 983;
-const SLOT_NET_REG_BACKING_MAP: usize = 984;
-const SLOT_NET_MMIO_READY: usize = 985;
-const SLOT_NET_MMIO_DEVICE_FEATURES: usize = 986;
-const SLOT_NET_MMIO_DRIVER_FEATURES: usize = 987;
-const SLOT_NET_MMIO_STATUS: usize = 988;
-const SLOT_NET_TX_NOTIFY_COUNT: usize = 989;
-const SLOT_NET_RX_COMPLETE_COUNT: usize = 990;
-const SLOT_NET_PACKET_COUNT: usize = 991;
-const SLOT_NET_PACKET_MATCH_COUNT: usize = 992;
-const SLOT_NET_BATCH_CYCLES: usize = 993;
-const SLOT_NET_QUEUE_PAIRS: usize = 994;
-const SLOT_NET_WORKER_CPU1: usize = 995;
-const SLOT_NET_TX_NOTIFY_MASK: usize = 996;
-const SLOT_NET_RX_COMPLETE_MASK: usize = 997;
-const SLOT_NET_TX_READY_MASK: usize = 998;
-const SLOT_NET_RX_READY_MASK: usize = 999;
+const SLOT_NET_CONFIG_BACKING_CREATE: usize = 978;
+const SLOT_NET_CONFIG_LOOKUP: usize = 979;
+const SLOT_NET_CONFIG_ALIAS_CREATE: usize = 980;
+const SLOT_NET_CONFIG_ALIAS_LOOKUP: usize = 981;
+const SLOT_NET_CONFIG_ALIAS_MATCH: usize = 982;
+const SLOT_NET_CONFIG_ALIAS_MAP: usize = 983;
+const SLOT_NET_CONFIG_BACKING_MAP: usize = 984;
+const SLOT_NET_REG_BACKING_CREATE: usize = 985;
+const SLOT_NET_REG_LOOKUP: usize = 986;
+const SLOT_NET_REG_BACKING_MAP: usize = 987;
+const SLOT_NET_BAR0_CREATE: usize = 988;
+const SLOT_NET_BAR0_LOOKUP: usize = 989;
+const SLOT_NET_BAR0_MATCH: usize = 990;
+const SLOT_NET_BAR0_MAP: usize = 991;
+const SLOT_NET_MMIO_READY: usize = 992;
+const SLOT_NET_MMIO_DEVICE_FEATURES: usize = 993;
+const SLOT_NET_MMIO_DRIVER_FEATURES: usize = 994;
+const SLOT_NET_MMIO_STATUS: usize = 995;
+const SLOT_NET_QUEUE_PAIRS: usize = 996;
+const SLOT_NET_WORKER_CPU1: usize = 997;
+const SLOT_NET_TX_NOTIFY_COUNT: usize = 998;
+const SLOT_NET_RX_COMPLETE_COUNT: usize = 999;
+const SLOT_NET_PACKET_COUNT: usize = 1000;
+const SLOT_NET_PACKET_MATCH_COUNT: usize = 1001;
+const SLOT_NET_BATCH_CYCLES: usize = 1002;
+const SLOT_NET_TX_NOTIFY_MASK: usize = 1003;
+const SLOT_NET_RX_COMPLETE_MASK: usize = 1004;
+const SLOT_NET_TX_READY_MASK: usize = 1005;
+const SLOT_NET_RX_READY_MASK: usize = 1006;
+const SLOT_NET_PCI_VENDOR_ID: usize = 1007;
 
 const STEP_PANIC: u64 = u64::MAX;
 const STEP_ROOT_VMAR: u64 = 1;
@@ -89,27 +98,33 @@ const STEP_TX_IRQ_CREATE: u64 = 4;
 const STEP_RX_IRQ_CREATE: u64 = 5;
 const STEP_REG_BACKING_CREATE: u64 = 6;
 const STEP_REG_LOOKUP: u64 = 7;
-const STEP_REG_ALIAS_CREATE: u64 = 8;
-const STEP_REG_ALIAS_LOOKUP: u64 = 9;
-const STEP_REG_ALIAS_MAP: u64 = 10;
-const STEP_REG_BACKING_MAP: u64 = 11;
-const STEP_QUEUE_VMO_CREATE: u64 = 12;
-const STEP_QUEUE_LOOKUP: u64 = 13;
-const STEP_QUEUE_MAP: u64 = 14;
-const STEP_WORKER_THREAD_CREATE: u64 = 15;
-const STEP_WORKER_THREAD_START: u64 = 16;
-const STEP_READY_WAIT: u64 = 17;
-const STEP_READY_ACK: u64 = 18;
-const STEP_MMIO_READY: u64 = 19;
-const STEP_TX_KICK: u64 = 20;
-const STEP_RX_WAIT: u64 = 21;
-const STEP_RX_ACK: u64 = 22;
-const STEP_WORKER_WAIT_KICK: u64 = 23;
-const STEP_WORKER_ACK_KICK: u64 = 24;
-const STEP_WORKER_TRIGGER_RX: u64 = 25;
-const STEP_TX_USED: u64 = 26;
-const STEP_RX_USED: u64 = 27;
-const STEP_PACKET_MATCH: u64 = 28;
+const STEP_REG_BACKING_MAP: u64 = 8;
+const STEP_CONFIG_BACKING_CREATE: u64 = 9;
+const STEP_CONFIG_LOOKUP: u64 = 10;
+const STEP_CONFIG_ALIAS_CREATE: u64 = 11;
+const STEP_CONFIG_ALIAS_LOOKUP: u64 = 12;
+const STEP_CONFIG_ALIAS_MAP: u64 = 13;
+const STEP_CONFIG_BACKING_MAP: u64 = 14;
+const STEP_QUEUE_VMO_CREATE: u64 = 15;
+const STEP_QUEUE_LOOKUP: u64 = 16;
+const STEP_QUEUE_MAP: u64 = 17;
+const STEP_BAR0_CREATE: u64 = 18;
+const STEP_BAR0_LOOKUP: u64 = 19;
+const STEP_BAR0_MAP: u64 = 20;
+const STEP_WORKER_THREAD_CREATE: u64 = 21;
+const STEP_WORKER_THREAD_START: u64 = 22;
+const STEP_READY_WAIT: u64 = 23;
+const STEP_READY_ACK: u64 = 24;
+const STEP_MMIO_READY: u64 = 25;
+const STEP_TX_KICK: u64 = 26;
+const STEP_RX_WAIT: u64 = 27;
+const STEP_RX_ACK: u64 = 28;
+const STEP_WORKER_WAIT_KICK: u64 = 29;
+const STEP_WORKER_ACK_KICK: u64 = 30;
+const STEP_WORKER_TRIGGER_RX: u64 = 31;
+const STEP_TX_USED: u64 = 32;
+const STEP_RX_USED: u64 = 33;
+const STEP_PACKET_MATCH: u64 = 34;
 
 const WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
 const WORKER_STACK_BYTES: usize = 4096;
@@ -140,13 +155,19 @@ struct NetSummary {
     rx_irq_create: i64,
     reg_backing_create: i64,
     reg_lookup: i64,
-    reg_alias_create: i64,
-    reg_alias_lookup: i64,
-    reg_alias_map: i64,
     reg_backing_map: i64,
+    config_backing_create: i64,
+    config_lookup: i64,
+    config_alias_create: i64,
+    config_alias_lookup: i64,
+    config_alias_map: i64,
+    config_backing_map: i64,
     queue_vmo_create: i64,
     queue_lookup: i64,
     queue_map: i64,
+    bar0_create: i64,
+    bar0_lookup: i64,
+    bar0_map: i64,
     worker_thread_create: i64,
     worker_thread_start: i64,
     ready_wait: i64,
@@ -170,7 +191,9 @@ struct NetSummary {
     worker_cpu: u64,
     worker_cpu1: u64,
     queue_pairs: u64,
-    reg_alias_match: u64,
+    config_alias_match: u64,
+    bar0_match: u64,
+    pci_vendor_id: u64,
     mmio_ready: u64,
     mmio_device_features: u64,
     mmio_driver_features: u64,
@@ -333,49 +356,6 @@ fn run_net_smoke() -> NetSummary {
         return summary;
     }
 
-    let mut reg_alias_vmo = ZX_HANDLE_INVALID;
-    summary.reg_alias_create =
-        zx_vmo_create_physical(reg_paddr, REGISTER_VMO_BYTES, 0, &mut reg_alias_vmo) as i64;
-    if summary.reg_alias_create != ZX_OK as i64 {
-        summary.failure_step = STEP_REG_ALIAS_CREATE;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[reg_backing_vmo, reg_alias_vmo],
-        );
-        return summary;
-    }
-
-    let mut reg_alias_paddr = 0u64;
-    summary.reg_alias_lookup = ax_vmo_lookup_paddr(reg_alias_vmo, 0, &mut reg_alias_paddr) as i64;
-    if summary.reg_alias_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_REG_ALIAS_LOOKUP;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[reg_backing_vmo, reg_alias_vmo],
-        );
-        return summary;
-    }
-    summary.reg_alias_match = u64::from(reg_alias_paddr == reg_paddr);
-
-    let mut reg_driver_base = 0u64;
-    summary.reg_alias_map = zx_vmar_map_local(
-        root_vmar,
-        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
-        0,
-        reg_alias_vmo,
-        0,
-        REGISTER_VMO_BYTES,
-        &mut reg_driver_base,
-    ) as i64;
-    if summary.reg_alias_map != ZX_OK as i64 {
-        summary.failure_step = STEP_REG_ALIAS_MAP;
-        close_handle_sets(
-            &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[reg_backing_vmo, reg_alias_vmo],
-        );
-        return summary;
-    }
-
     let mut reg_device_base = 0u64;
     summary.reg_backing_map = zx_vmar_map_local(
         root_vmar,
@@ -388,12 +368,98 @@ fn run_net_smoke() -> NetSummary {
     ) as i64;
     if summary.reg_backing_map != ZX_OK as i64 {
         summary.failure_step = STEP_REG_BACKING_MAP;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &[reg_backing_vmo]);
+        return summary;
+    }
+
+    let mut config_backing_vmo = ZX_HANDLE_INVALID;
+    summary.config_backing_create =
+        zx_vmo_create_contiguous(PAGE_SIZE, 0, &mut config_backing_vmo) as i64;
+    if summary.config_backing_create != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_BACKING_CREATE;
         close_handle_sets(
             &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[reg_backing_vmo, reg_alias_vmo],
+            &[config_backing_vmo, reg_backing_vmo],
         );
         return summary;
     }
+
+    let mut config_paddr = 0u64;
+    summary.config_lookup = ax_vmo_lookup_paddr(config_backing_vmo, 0, &mut config_paddr) as i64;
+    if summary.config_lookup != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_LOOKUP;
+        close_handle_sets(
+            &[&rx_irqs, &tx_irqs, &ready_irqs],
+            &[config_backing_vmo, reg_backing_vmo],
+        );
+        return summary;
+    }
+
+    let mut config_alias_vmo = ZX_HANDLE_INVALID;
+    summary.config_alias_create =
+        zx_vmo_create_physical(config_paddr, PAGE_SIZE, 0, &mut config_alias_vmo) as i64;
+    if summary.config_alias_create != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_ALIAS_CREATE;
+        close_handle_sets(
+            &[&rx_irqs, &tx_irqs, &ready_irqs],
+            &[config_alias_vmo, config_backing_vmo, reg_backing_vmo],
+        );
+        return summary;
+    }
+
+    let mut config_alias_paddr = 0u64;
+    summary.config_alias_lookup =
+        ax_vmo_lookup_paddr(config_alias_vmo, 0, &mut config_alias_paddr) as i64;
+    if summary.config_alias_lookup != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_ALIAS_LOOKUP;
+        close_handle_sets(
+            &[&rx_irqs, &tx_irqs, &ready_irqs],
+            &[config_alias_vmo, config_backing_vmo, reg_backing_vmo],
+        );
+        return summary;
+    }
+    summary.config_alias_match = u64::from(config_alias_paddr == config_paddr);
+
+    let mut config_driver_base = 0u64;
+    summary.config_alias_map = zx_vmar_map_local(
+        root_vmar,
+        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+        0,
+        config_alias_vmo,
+        0,
+        PAGE_SIZE,
+        &mut config_driver_base,
+    ) as i64;
+    if summary.config_alias_map != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_ALIAS_MAP;
+        close_handle_sets(
+            &[&rx_irqs, &tx_irqs, &ready_irqs],
+            &[config_alias_vmo, config_backing_vmo, reg_backing_vmo],
+        );
+        return summary;
+    }
+
+    let mut config_device_base = 0u64;
+    summary.config_backing_map = zx_vmar_map_local(
+        root_vmar,
+        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+        0,
+        config_backing_vmo,
+        0,
+        PAGE_SIZE,
+        &mut config_device_base,
+    ) as i64;
+    if summary.config_backing_map != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_BACKING_MAP;
+        close_handle_sets(
+            &[&rx_irqs, &tx_irqs, &ready_irqs],
+            &[config_alias_vmo, config_backing_vmo, reg_backing_vmo],
+        );
+        return summary;
+    }
+
+    init_regs(reg_device_base);
+    init_pci_config(config_device_base, reg_paddr);
 
     let mut queue_vmo = ZX_HANDLE_INVALID;
     summary.queue_vmo_create = zx_vmo_create_contiguous(QUEUE_VMO_BYTES, 0, &mut queue_vmo) as i64;
@@ -401,7 +467,12 @@ fn run_net_smoke() -> NetSummary {
         summary.failure_step = STEP_QUEUE_VMO_CREATE;
         close_handle_sets(
             &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+            &[
+                queue_vmo,
+                config_alias_vmo,
+                config_backing_vmo,
+                reg_backing_vmo,
+            ],
         );
         return summary;
     }
@@ -412,7 +483,12 @@ fn run_net_smoke() -> NetSummary {
         summary.failure_step = STEP_QUEUE_LOOKUP;
         close_handle_sets(
             &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+            &[
+                queue_vmo,
+                config_alias_vmo,
+                config_backing_vmo,
+                reg_backing_vmo,
+            ],
         );
         return summary;
     }
@@ -431,13 +507,36 @@ fn run_net_smoke() -> NetSummary {
         summary.failure_step = STEP_QUEUE_MAP;
         close_handle_sets(
             &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+            &[
+                queue_vmo,
+                config_alias_vmo,
+                config_backing_vmo,
+                reg_backing_vmo,
+            ],
         );
         return summary;
     }
-
-    init_regs(reg_driver_base);
     init_transport_memory(mapped_queue_base);
+
+    let config = read_pci_config(config_driver_base);
+    summary.pci_vendor_id = u64::from(config.vendor_id);
+    let (bar0_vmo, bar0_paddr, reg_driver_base) =
+        match map_driver_bar0(root_vmar, config, &mut summary) {
+            Some(values) => values,
+            None => {
+                close_handle_sets(
+                    &[&rx_irqs, &tx_irqs, &ready_irqs],
+                    &[
+                        queue_vmo,
+                        config_alias_vmo,
+                        config_backing_vmo,
+                        reg_backing_vmo,
+                    ],
+                );
+                return summary;
+            }
+        };
+    summary.bar0_match = u64::from(bar0_paddr == config.bar0_paddr);
 
     NET_REG_DEVICE_BASE.store(reg_device_base, Ordering::Release);
     NET_QUEUE_BASE.store(mapped_queue_base, Ordering::Release);
@@ -462,7 +561,13 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+                &[
+                    bar0_vmo,
+                    queue_vmo,
+                    config_alias_vmo,
+                    config_backing_vmo,
+                    reg_backing_vmo,
+                ],
             );
             return summary;
         }
@@ -482,7 +587,13 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+                &[
+                    bar0_vmo,
+                    queue_vmo,
+                    config_alias_vmo,
+                    config_backing_vmo,
+                    reg_backing_vmo,
+                ],
             );
             return summary;
         }
@@ -502,7 +613,13 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+                &[
+                    bar0_vmo,
+                    queue_vmo,
+                    config_alias_vmo,
+                    config_backing_vmo,
+                    reg_backing_vmo,
+                ],
             );
             return summary;
         }
@@ -516,18 +633,30 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+                &[
+                    bar0_vmo,
+                    queue_vmo,
+                    config_alias_vmo,
+                    config_backing_vmo,
+                    reg_backing_vmo,
+                ],
             );
             return summary;
         }
     }
 
-    if !configure_driver_transport(reg_driver_base, &mut summary) {
+    if !configure_driver_transport(reg_driver_base, &mut summary, config) {
         summary.failure_step = STEP_MMIO_READY;
         close_workers_and_handles(
             &worker_threads,
             &[&rx_irqs, &tx_irqs, &ready_irqs],
-            &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+            &[
+                bar0_vmo,
+                queue_vmo,
+                config_alias_vmo,
+                config_backing_vmo,
+                reg_backing_vmo,
+            ],
         );
         return summary;
     }
@@ -545,7 +674,13 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+                &[
+                    bar0_vmo,
+                    queue_vmo,
+                    config_alias_vmo,
+                    config_backing_vmo,
+                    reg_backing_vmo,
+                ],
             );
             return summary;
         }
@@ -565,7 +700,13 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+                &[
+                    bar0_vmo,
+                    queue_vmo,
+                    config_alias_vmo,
+                    config_backing_vmo,
+                    reg_backing_vmo,
+                ],
             );
             return summary;
         }
@@ -580,7 +721,13 @@ fn run_net_smoke() -> NetSummary {
             close_workers_and_handles(
                 &worker_threads,
                 &[&rx_irqs, &tx_irqs, &ready_irqs],
-                &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+                &[
+                    bar0_vmo,
+                    queue_vmo,
+                    config_alias_vmo,
+                    config_backing_vmo,
+                    reg_backing_vmo,
+                ],
             );
             return summary;
         }
@@ -672,14 +819,81 @@ fn run_net_smoke() -> NetSummary {
     close_workers_and_handles(
         &worker_threads,
         &[&rx_irqs, &tx_irqs, &ready_irqs],
-        &[queue_vmo, reg_backing_vmo, reg_alias_vmo],
+        &[
+            bar0_vmo,
+            queue_vmo,
+            config_alias_vmo,
+            config_backing_vmo,
+            reg_backing_vmo,
+        ],
     );
     summary
 }
 
-fn configure_driver_transport(reg_base: u64, summary: &mut NetSummary) -> bool {
+fn map_driver_bar0(
+    root_vmar: zx_handle_t,
+    config: PciConfigPage,
+    summary: &mut NetSummary,
+) -> Option<(zx_handle_t, u64, u64)> {
+    if config.vendor_id != PCI_VENDOR_ID_AXLE
+        || config.device_id != PCI_DEVICE_ID_NET
+        || config.class_code != PCI_CLASS_NETWORK
+        || config.subclass != PCI_SUBCLASS_ETHERNET
+        || config.bar0_size != REGISTER_VMO_BYTES as u32
+        || config.device_features != MMIO_FEATURE_CSUM
+        || config.queue_pairs != QUEUE_PAIR_COUNT as u32
+        || config.queue_size != QUEUE_SIZE as u32
+    {
+        summary.failure_step = STEP_CONFIG_ALIAS_LOOKUP;
+        return None;
+    }
+
+    let mut bar0_vmo = ZX_HANDLE_INVALID;
+    summary.bar0_create = zx_vmo_create_physical(
+        config.bar0_paddr,
+        u64::from(config.bar0_size),
+        0,
+        &mut bar0_vmo,
+    ) as i64;
+    if summary.bar0_create != ZX_OK as i64 {
+        summary.failure_step = STEP_BAR0_CREATE;
+        return None;
+    }
+
+    let mut bar0_paddr = 0u64;
+    summary.bar0_lookup = ax_vmo_lookup_paddr(bar0_vmo, 0, &mut bar0_paddr) as i64;
+    if summary.bar0_lookup != ZX_OK as i64 {
+        summary.failure_step = STEP_BAR0_LOOKUP;
+        close_handles(&[bar0_vmo]);
+        return None;
+    }
+
+    let mut bar0_driver_base = 0u64;
+    summary.bar0_map = zx_vmar_map_local(
+        root_vmar,
+        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+        0,
+        bar0_vmo,
+        0,
+        u64::from(config.bar0_size),
+        &mut bar0_driver_base,
+    ) as i64;
+    if summary.bar0_map != ZX_OK as i64 {
+        summary.failure_step = STEP_BAR0_MAP;
+        close_handles(&[bar0_vmo]);
+        return None;
+    }
+
+    Some((bar0_vmo, bar0_paddr, bar0_driver_base))
+}
+
+fn configure_driver_transport(
+    reg_base: u64,
+    summary: &mut NetSummary,
+    config: PciConfigPage,
+) -> bool {
     let header = read_header(reg_base);
-    let expected_device_features = MMIO_FEATURE_CSUM;
+    let expected_device_features = config.device_features;
     if header.magic != MMIO_MAGIC
         || header.version != MMIO_VERSION
         || header.device_id != MMIO_DEVICE_ID_NET
@@ -1130,28 +1344,48 @@ fn write_summary(summary: &NetSummary) {
     write_slot(SLOT_NET_DRIVER_CPU, summary.driver_cpu);
     write_slot(SLOT_NET_WORKER_CPU, summary.worker_cpu);
     write_slot(
+        SLOT_NET_CONFIG_BACKING_CREATE,
+        summary.config_backing_create as u64,
+    );
+    write_slot(SLOT_NET_CONFIG_LOOKUP, summary.config_lookup as u64);
+    write_slot(
+        SLOT_NET_CONFIG_ALIAS_CREATE,
+        summary.config_alias_create as u64,
+    );
+    write_slot(
+        SLOT_NET_CONFIG_ALIAS_LOOKUP,
+        summary.config_alias_lookup as u64,
+    );
+    write_slot(SLOT_NET_CONFIG_ALIAS_MATCH, summary.config_alias_match);
+    write_slot(SLOT_NET_CONFIG_ALIAS_MAP, summary.config_alias_map as u64);
+    write_slot(
+        SLOT_NET_CONFIG_BACKING_MAP,
+        summary.config_backing_map as u64,
+    );
+    write_slot(
         SLOT_NET_REG_BACKING_CREATE,
         summary.reg_backing_create as u64,
     );
     write_slot(SLOT_NET_REG_LOOKUP, summary.reg_lookup as u64);
-    write_slot(SLOT_NET_REG_ALIAS_CREATE, summary.reg_alias_create as u64);
-    write_slot(SLOT_NET_REG_ALIAS_LOOKUP, summary.reg_alias_lookup as u64);
-    write_slot(SLOT_NET_REG_ALIAS_MATCH, summary.reg_alias_match);
-    write_slot(SLOT_NET_REG_ALIAS_MAP, summary.reg_alias_map as u64);
     write_slot(SLOT_NET_REG_BACKING_MAP, summary.reg_backing_map as u64);
+    write_slot(SLOT_NET_BAR0_CREATE, summary.bar0_create as u64);
+    write_slot(SLOT_NET_BAR0_LOOKUP, summary.bar0_lookup as u64);
+    write_slot(SLOT_NET_BAR0_MATCH, summary.bar0_match);
+    write_slot(SLOT_NET_BAR0_MAP, summary.bar0_map as u64);
     write_slot(SLOT_NET_MMIO_READY, summary.mmio_ready);
     write_slot(SLOT_NET_MMIO_DEVICE_FEATURES, summary.mmio_device_features);
     write_slot(SLOT_NET_MMIO_DRIVER_FEATURES, summary.mmio_driver_features);
     write_slot(SLOT_NET_MMIO_STATUS, summary.mmio_status);
+    write_slot(SLOT_NET_QUEUE_PAIRS, summary.queue_pairs);
+    write_slot(SLOT_NET_WORKER_CPU1, summary.worker_cpu1);
     write_slot(SLOT_NET_TX_NOTIFY_COUNT, summary.tx_notify_count);
     write_slot(SLOT_NET_RX_COMPLETE_COUNT, summary.rx_complete_count);
     write_slot(SLOT_NET_PACKET_COUNT, summary.packet_count);
     write_slot(SLOT_NET_PACKET_MATCH_COUNT, summary.packet_match_count);
     write_slot(SLOT_NET_BATCH_CYCLES, summary.batch_cycles);
-    write_slot(SLOT_NET_QUEUE_PAIRS, summary.queue_pairs);
-    write_slot(SLOT_NET_WORKER_CPU1, summary.worker_cpu1);
     write_slot(SLOT_NET_TX_NOTIFY_MASK, summary.tx_notify_mask);
     write_slot(SLOT_NET_RX_COMPLETE_MASK, summary.rx_complete_mask);
     write_slot(SLOT_NET_TX_READY_MASK, summary.tx_ready_mask);
     write_slot(SLOT_NET_RX_READY_MASK, summary.rx_ready_mask);
+    write_slot(SLOT_NET_PCI_VENDOR_ID, summary.pci_vendor_id);
 }

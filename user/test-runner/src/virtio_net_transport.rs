@@ -24,6 +24,30 @@ pub(crate) const MMIO_STATUS_DRIVER_OK: u32 = 1 << 4;
 pub(crate) const MMIO_NOTIFY_TX: u32 = 1;
 pub(crate) const MMIO_NOTIFY_RX: u32 = 2;
 pub(crate) const MMIO_INTERRUPT_RX_COMPLETE: u32 = 1;
+pub(crate) const PCI_VENDOR_ID_AXLE: u16 = 0x4158;
+pub(crate) const PCI_DEVICE_ID_NET: u16 = 0x0001;
+pub(crate) const PCI_CLASS_NETWORK: u8 = 0x02;
+pub(crate) const PCI_SUBCLASS_ETHERNET: u8 = 0x00;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PciConfigPage {
+    pub(crate) vendor_id: u16,
+    pub(crate) device_id: u16,
+    pub(crate) command: u16,
+    pub(crate) status: u16,
+    pub(crate) revision_id: u8,
+    pub(crate) prog_if: u8,
+    pub(crate) subclass: u8,
+    pub(crate) class_code: u8,
+    pub(crate) bar0_paddr: u64,
+    pub(crate) bar0_size: u32,
+    pub(crate) device_features: u32,
+    pub(crate) queue_pairs: u32,
+    pub(crate) queue_size: u32,
+    pub(crate) reserved0: u32,
+    pub(crate) reserved1: u32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -161,6 +185,36 @@ pub(crate) fn init_regs(mapped_base: u64) {
             ..VirtioMmioRegs::default()
         },
     );
+}
+
+pub(crate) fn init_pci_config(mapped_base: u64, bar0_paddr: u64) {
+    write_pci_config(
+        mapped_base,
+        PciConfigPage {
+            vendor_id: PCI_VENDOR_ID_AXLE,
+            device_id: PCI_DEVICE_ID_NET,
+            class_code: PCI_CLASS_NETWORK,
+            subclass: PCI_SUBCLASS_ETHERNET,
+            bar0_paddr,
+            bar0_size: REGISTER_VMO_BYTES as u32,
+            device_features: MMIO_FEATURE_CSUM,
+            queue_pairs: QUEUE_PAIR_COUNT as u32,
+            queue_size: QUEUE_SIZE as u32,
+            ..PciConfigPage::default()
+        },
+    );
+}
+
+pub(crate) fn read_pci_config(mapped_base: u64) -> PciConfigPage {
+    // SAFETY: the bootstrap config page is one mapped PCI-shaped control page
+    // owned by the synthetic device side and read as one packed record.
+    unsafe { ptr::read_volatile(mapped_base as *const PciConfigPage) }
+}
+
+pub(crate) fn write_pci_config(mapped_base: u64, config: PciConfigPage) {
+    // SAFETY: bootstrap setup owns the synthetic PCI config page and writes it
+    // as one packed control-plane record before driver discovery.
+    unsafe { ptr::write_volatile(mapped_base as *mut PciConfigPage, config) }
 }
 
 pub(crate) fn read_header(mapped_base: u64) -> VirtioMmioHeader {

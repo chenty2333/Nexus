@@ -162,11 +162,13 @@ Main just targets include:
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - two ring3 worker threads act as minimal device-side peers, one queue pair each
   - one contiguous VMO supplies the shared queue/buffer memory
-  - one separate contiguous register-backing page plus one physical alias VMO freeze the current
-    MMIO-backed register-window contract
+  - one separate contiguous register-backing page plus one separate contiguous PCI-shaped config
+    page freeze the current user-mode transport discovery shape
   - one physical-address lookup freezes the DMA-style address handoff shape for both queues and the
     register page
-  - one MMIO-style register page freezes a minimal control-plane shape:
+  - one physical alias over the config page plus one BAR0 physical VMO created from that config
+    page freeze the current PCI-shaped register-window contract
+  - one MMIO-style BAR0 register page freezes a minimal control-plane shape:
     - device identity/version
     - feature bits plus driver-acknowledged feature bits
     - queue-pair count and stride metadata
@@ -176,17 +178,24 @@ Main just targets include:
   - one reusable split TX/RX virtio-style transport slice now completes one eight-packet batched
     loopback round without channel/socket data-plane help
   - the summary now also exports:
+    - `config_backing_create`
+    - `config_lookup`
+    - `config_alias_create`
+    - `config_alias_lookup`
+    - `config_alias_match`
+    - `config_alias_map`
     - `reg_backing_create`
     - `reg_lookup`
-    - `reg_alias_create`
-    - `reg_alias_lookup`
-    - `reg_alias_match`
-    - `reg_alias_map`
     - `reg_backing_map`
+    - `bar0_create`
+    - `bar0_lookup`
+    - `bar0_match`
+    - `bar0_map`
     - `mmio_ready`
     - `mmio_device_features`
     - `mmio_driver_features`
     - `mmio_status`
+    - `pci_vendor_id`
     - `queue_pairs`
     - `tx_notify_count`
     - `rx_complete_count`

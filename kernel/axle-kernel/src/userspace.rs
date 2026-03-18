@@ -702,28 +702,36 @@ const SLOT_NET_PACKET_MATCH: usize = 950;
 const SLOT_NET_DRIVER_CPU: usize = 951;
 const SLOT_NET_WORKER_CPU: usize = 952;
 const SLOT_NET_PRESENT: usize = 953;
-const SLOT_NET_REG_BACKING_CREATE: usize = 978;
-const SLOT_NET_REG_LOOKUP: usize = 979;
-const SLOT_NET_REG_ALIAS_CREATE: usize = 980;
-const SLOT_NET_REG_ALIAS_LOOKUP: usize = 981;
-const SLOT_NET_REG_ALIAS_MATCH: usize = 982;
-const SLOT_NET_REG_ALIAS_MAP: usize = 983;
-const SLOT_NET_REG_BACKING_MAP: usize = 984;
-const SLOT_NET_MMIO_READY: usize = 985;
-const SLOT_NET_MMIO_DEVICE_FEATURES: usize = 986;
-const SLOT_NET_MMIO_DRIVER_FEATURES: usize = 987;
-const SLOT_NET_MMIO_STATUS: usize = 988;
-const SLOT_NET_TX_NOTIFY_COUNT: usize = 989;
-const SLOT_NET_RX_COMPLETE_COUNT: usize = 990;
-const SLOT_NET_PACKET_COUNT: usize = 991;
-const SLOT_NET_PACKET_MATCH_COUNT: usize = 992;
-const SLOT_NET_BATCH_CYCLES: usize = 993;
-const SLOT_NET_QUEUE_PAIRS: usize = 994;
-const SLOT_NET_WORKER_CPU1: usize = 995;
-const SLOT_NET_TX_NOTIFY_MASK: usize = 996;
-const SLOT_NET_RX_COMPLETE_MASK: usize = 997;
-const SLOT_NET_TX_READY_MASK: usize = 998;
-const SLOT_NET_RX_READY_MASK: usize = 999;
+const SLOT_NET_CONFIG_BACKING_CREATE: usize = 978;
+const SLOT_NET_CONFIG_LOOKUP: usize = 979;
+const SLOT_NET_CONFIG_ALIAS_CREATE: usize = 980;
+const SLOT_NET_CONFIG_ALIAS_LOOKUP: usize = 981;
+const SLOT_NET_CONFIG_ALIAS_MATCH: usize = 982;
+const SLOT_NET_CONFIG_ALIAS_MAP: usize = 983;
+const SLOT_NET_CONFIG_BACKING_MAP: usize = 984;
+const SLOT_NET_REG_BACKING_CREATE: usize = 985;
+const SLOT_NET_REG_LOOKUP: usize = 986;
+const SLOT_NET_REG_BACKING_MAP: usize = 987;
+const SLOT_NET_BAR0_CREATE: usize = 988;
+const SLOT_NET_BAR0_LOOKUP: usize = 989;
+const SLOT_NET_BAR0_MATCH: usize = 990;
+const SLOT_NET_BAR0_MAP: usize = 991;
+const SLOT_NET_MMIO_READY: usize = 992;
+const SLOT_NET_MMIO_DEVICE_FEATURES: usize = 993;
+const SLOT_NET_MMIO_DRIVER_FEATURES: usize = 994;
+const SLOT_NET_MMIO_STATUS: usize = 995;
+const SLOT_NET_QUEUE_PAIRS: usize = 996;
+const SLOT_NET_WORKER_CPU1: usize = 997;
+const SLOT_NET_TX_NOTIFY_COUNT: usize = 998;
+const SLOT_NET_RX_COMPLETE_COUNT: usize = 999;
+const SLOT_NET_PACKET_COUNT: usize = 1000;
+const SLOT_NET_PACKET_MATCH_COUNT: usize = 1001;
+const SLOT_NET_BATCH_CYCLES: usize = 1002;
+const SLOT_NET_TX_NOTIFY_MASK: usize = 1003;
+const SLOT_NET_RX_COMPLETE_MASK: usize = 1004;
+const SLOT_NET_TX_READY_MASK: usize = 1005;
+const SLOT_NET_RX_READY_MASK: usize = 1006;
+const SLOT_NET_PCI_VENDOR_ID: usize = 1007;
 const SLOT_DGRAM_PRESENT: usize = 954;
 const SLOT_DGRAM_FAILURE_STEP: usize = 955;
 const SLOT_DGRAM_CREATE: usize = 956;
@@ -1944,19 +1952,26 @@ fn print_device_summary(slots: &[u64]) {
 
 fn print_net_summary(slots: &[u64]) {
     crate::kprintln!(
-        "kernel: net dataplane smoke (net_present={}, net_failure_step={}, ready_irq_create={}, tx_irq_create={}, rx_irq_create={}, reg_backing_create={}, reg_lookup={}, reg_alias_create={}, reg_alias_lookup={}, reg_alias_match={}, reg_alias_map={}, reg_backing_map={}, queue_vmo_create={}, queue_lookup={}, queue_map={}, worker_thread_create={}, worker_thread_start={}, ready_wait={}, ready_ack={}, tx_kick={}, worker_wait_kick={}, worker_ack_kick={}, worker_trigger_rx={}, rx_wait={}, rx_ack={}, tx_used_idx={}, rx_used_idx={}, tx_used_len={}, rx_used_len={}, packet_bytes={}, packet_match={}, driver_cpu={}, worker_cpu={}, worker_cpu1={}, queue_pairs={}, mmio_ready={}, mmio_device_features={}, mmio_driver_features={}, mmio_status={}, tx_notify_count={}, rx_complete_count={}, tx_notify_mask={}, rx_complete_mask={}, tx_ready_mask={}, rx_ready_mask={}, packet_count={}, packet_match_count={}, batch_cycles={})",
+        "kernel: net dataplane smoke (net_present={}, net_failure_step={}, ready_irq_create={}, tx_irq_create={}, rx_irq_create={}, config_backing_create={}, config_lookup={}, config_alias_create={}, config_alias_lookup={}, config_alias_match={}, config_alias_map={}, config_backing_map={}, reg_backing_create={}, reg_lookup={}, reg_backing_map={}, bar0_create={}, bar0_lookup={}, bar0_match={}, bar0_map={}, queue_vmo_create={}, queue_lookup={}, queue_map={}, worker_thread_create={}, worker_thread_start={}, ready_wait={}, ready_ack={}, tx_kick={}, worker_wait_kick={}, worker_ack_kick={}, worker_trigger_rx={}, rx_wait={}, rx_ack={}, tx_used_idx={}, rx_used_idx={}, tx_used_len={}, rx_used_len={}, packet_bytes={}, packet_match={}, driver_cpu={}, worker_cpu={}, worker_cpu1={}, pci_vendor_id={}, queue_pairs={}, mmio_ready={}, mmio_device_features={}, mmio_driver_features={}, mmio_status={}, tx_notify_count={}, rx_complete_count={}, tx_notify_mask={}, rx_complete_mask={}, tx_ready_mask={}, rx_ready_mask={}, packet_count={}, packet_match_count={}, batch_cycles={})",
         slots[SLOT_NET_PRESENT],
         slots[SLOT_NET_FAILURE_STEP],
         slots[SLOT_NET_READY_IRQ_CREATE] as i64,
         slots[SLOT_NET_TX_IRQ_CREATE] as i64,
         slots[SLOT_NET_RX_IRQ_CREATE] as i64,
+        slots[SLOT_NET_CONFIG_BACKING_CREATE] as i64,
+        slots[SLOT_NET_CONFIG_LOOKUP] as i64,
+        slots[SLOT_NET_CONFIG_ALIAS_CREATE] as i64,
+        slots[SLOT_NET_CONFIG_ALIAS_LOOKUP] as i64,
+        slots[SLOT_NET_CONFIG_ALIAS_MATCH],
+        slots[SLOT_NET_CONFIG_ALIAS_MAP] as i64,
+        slots[SLOT_NET_CONFIG_BACKING_MAP] as i64,
         slots[SLOT_NET_REG_BACKING_CREATE] as i64,
         slots[SLOT_NET_REG_LOOKUP] as i64,
-        slots[SLOT_NET_REG_ALIAS_CREATE] as i64,
-        slots[SLOT_NET_REG_ALIAS_LOOKUP] as i64,
-        slots[SLOT_NET_REG_ALIAS_MATCH],
-        slots[SLOT_NET_REG_ALIAS_MAP] as i64,
         slots[SLOT_NET_REG_BACKING_MAP] as i64,
+        slots[SLOT_NET_BAR0_CREATE] as i64,
+        slots[SLOT_NET_BAR0_LOOKUP] as i64,
+        slots[SLOT_NET_BAR0_MATCH],
+        slots[SLOT_NET_BAR0_MAP] as i64,
         slots[SLOT_NET_QUEUE_VMO_CREATE] as i64,
         slots[SLOT_NET_QUEUE_LOOKUP] as i64,
         slots[SLOT_NET_QUEUE_MAP] as i64,
@@ -1979,6 +1994,7 @@ fn print_net_summary(slots: &[u64]) {
         slots[SLOT_NET_DRIVER_CPU],
         slots[SLOT_NET_WORKER_CPU],
         slots[SLOT_NET_WORKER_CPU1],
+        slots[SLOT_NET_PCI_VENDOR_ID],
         slots[SLOT_NET_QUEUE_PAIRS],
         slots[SLOT_NET_MMIO_READY],
         slots[SLOT_NET_MMIO_DEVICE_FEATURES],

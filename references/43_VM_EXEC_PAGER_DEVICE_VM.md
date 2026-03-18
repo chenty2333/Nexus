@@ -126,6 +126,6 @@ What is still intentionally narrow:
 - Treat pager-backed/file-backed support as one narrow page-object contract:
   shared read-only source plus mapping-local private shadow on write.
 - Treat the current physical / contiguous / interrupt surface as one minimal device-facing substrate:
-  enough for bootstrap smoke, the first queue-owned user-mode net dataplane slice, future
-  user-mode virtio transport work, and later DMA/IOMMU integration, but not yet the final DFv2
-  device contract.
+  enough for bootstrap smoke, the current queue-owned user-mode net dataplane slice, the current
+  synthetic PCI-shaped config + BAR0 transport smoke, future user-mode virtio transport work, and
+  later DMA/IOMMU integration, but not yet the final DFv2 device contract.

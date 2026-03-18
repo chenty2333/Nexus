@@ -23,12 +23,14 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
 
 - one shared queue/buffer window allocated through `zx_vmo_create_contiguous()`
 - one dedicated register-backing page allocated through `zx_vmo_create_contiguous()`
-- one physical alias VMO created over that register page through `zx_vmo_create_physical()`
+- one dedicated PCI-shaped config page allocated through `zx_vmo_create_contiguous()`
 - one physical-address lookup through `ax_vmo_lookup_paddr()` for:
   - the queue memory
+  - the PCI config page
   - the register page
-- one driver-side MMIO-style register mapping through the physical alias VMO
-- one device-side register mapping through the original backing VMO
+- one driver-side physical alias VMO over the PCI-shaped config page
+- one driver-side BAR0 physical VMO created only after reading that config page
+- one device-side config/register backing mapping through the original contiguous VMOs
 - one MMIO-style control page carrying:
   - device identity/version
   - feature bits plus driver-accepted feature bits
@@ -44,6 +46,10 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
   - one RX-complete interrupt per queue pair
 - two user-mode worker threads acting as minimal device-side peers
 - one driver-side thread acting as the queue owner and verifier
+- one synthetic PCI-shaped discovery step:
+  - vendor/device/class fields
+  - BAR0 physical address and size
+  - queue-pair count and queue size metadata
 
 ## Current queue shape
 
@@ -72,6 +78,7 @@ Ownership is intentionally one-writer-per-substructure:
 
 The current smoke now completes one batched transport round:
 
+- one PCI-shaped config read plus BAR0 discovery
 - one MMIO-style ready/feature/queue-ready handshake
 - one four-packet TX publish on each queue pair
 - one TX kick interrupt per queue pair
@@ -87,7 +94,8 @@ than treating networking as "stream socket but faster".
 The current bootstrap slice proves three things:
 
 1. The current public `InterruptObject` + contiguous/physical VMO surface is sufficient to drive one
-   user-mode shared-memory dataplane loop with a real register-window alias shape.
+   user-mode shared-memory dataplane loop with one PCI-shaped config page and one BAR0 register
+   window.
 2. Queue-owned multi-queue transport can already be exercised without inventing a kernel-resident
    network stack.
 3. The next net step should build on queue ownership and batching, not on growing generic socket
@@ -95,8 +103,8 @@ The current bootstrap slice proves three things:
 
 ## What this is not yet
 
-- no PCI enumeration
-- no PCI-backed MMIO device register model yet
+- no PCI bus enumeration
+- no real PCI config space or BAR management contract from the kernel
 - no MSI/MSI-X or hardware IRQ routing
 - no real virtio feature negotiation
 - no userspace TCP/IP stack
@@ -108,6 +116,7 @@ The current bootstrap slice proves three things:
 - Treat the current `net_smoke` as a device-substrate proof plus one reusable transport slice, not
   as the final driver shape.
 - Keep the next net cuts focused on:
+  - moving from the current synthetic PCI-shaped config page to a real PCI-backed config source
   - queue ownership
   - interrupt/kick/completion batching
   - shared-memory data movement
