@@ -211,9 +211,14 @@ Work:
   bootstrap glue.
 - Host-side Starnix semantic tests now need to remain merge-blocking under
   `just xtest`, not only as QEMU smoke scenarios.
+- Those host-side semantic checks should live in focused internal modules
+  (for example `starnix/tests/{fd,process,signal,poll,procfs}.rs`) rather than
+  accreting back into one large `mod.rs` test block.
 - The current first-wave host semantic gate now already covers:
   - `dup2` / `dup3` open-file-description sharing
   - `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC` descriptor-table duplication rules
+  - `FsContext::fork_clone()` preserving shared open-file-description identity
+    plus namespace / directory-offset state
   - process-group / session identity updates through `wait4` target matching and `setsid`
   - `rt_sigreturn` plus pure restart-frame handling for `EINTR` / `SA_RESTART`
   - `epoll` interactions with one synthetic waitable plus level-triggered and

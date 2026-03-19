@@ -52,9 +52,14 @@ Main just targets include:
 
 `just xlint` and `just xtest` now both include `nexus-init`, so Starnix host-side semantic tests
 are part of the default merge-blocking host gate rather than living only behind QEMU smoke.
+Those host-side semantic checks now live in focused internal modules under
+`user/nexus-init/src/starnix/tests/{fd,process,signal,poll,procfs}.rs` rather
+than one monolithic inline `starnix/mod.rs` test block.
 That host gate now explicitly covers:
 - `dup2` / `dup3` open-file-description sharing
 - `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC` descriptor-table duplication rules
+- `FsContext::fork_clone()` preserving shared open-file-description identity
+  plus namespace / directory-offset state
 - `wait4` target matching and `setsid` session rebinding
 - pure `EINTR` / `SA_RESTART` restart-frame handling plus `rt_sigreturn`
 - synthetic-waitable to `epoll` readiness bridging plus level-triggered and

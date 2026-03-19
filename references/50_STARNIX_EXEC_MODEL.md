@@ -268,8 +268,13 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
       - blocking fd I/O
       - blocking message I/O
   - host-side semantic tests in `nexus-init` now cover:
+    - dedicated internal semantic test modules under
+      `user/nexus-init/src/starnix/tests/{fd,process,signal,poll,procfs}.rs`
+      instead of one monolithic inline test block
     - `dup2` / `dup3` open-file-description sharing
     - `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC` descriptor-table duplication rules
+    - `FsContext::fork_clone()` preserving shared open-file-description identity
+      plus namespace / directory-offset state
     - `wait4` target matching
     - `setsid` session / foreground identity rebinding
     - pure restart-frame handling for `EINTR` vs `SA_RESTART`

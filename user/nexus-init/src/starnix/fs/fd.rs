@@ -48,7 +48,7 @@ impl FsContext {
         })
     }
 
-    fn fork_clone(&self) -> Self {
+    pub(in crate::starnix) fn fork_clone(&self) -> Self {
         Self {
             fd_table: self.fd_table.clone(),
             namespace: self.namespace.clone(),
