@@ -216,6 +216,17 @@ That host gate now explicitly covers:
     - the imported child handle must report `Anonymous + GlobalShared`
     - the parent's original remaining handle must also report
       `Anonymous + GlobalShared`
+- Bootstrap VM coverage now also includes one narrow private-clone source/shadow
+  gate:
+  - `kernel.vmo.private_clone_bootstrap`
+  - one shared pager-backed source handle must prove the current
+    `PRIVATE_CLONE` split:
+    - the initial private-clone mapping bytes match the shared source bytes
+    - a write through the mapping becomes visible through that mapping
+    - the same write does not mutate bytes read back through the shared source
+      handle
+    - `ax_vmo_get_info()` on the source handle remains
+      `PagerBacked + GlobalShared` before and after the mapping-local write
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - two ring3 worker threads act as minimal device-side peers, one queue pair each
   - one bootstrap `PciDevice` handle is now seeded into the runner shared-slot window

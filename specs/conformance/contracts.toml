@@ -371,6 +371,11 @@ level = "should"
 description = "Fresh anonymous VMOs should report LocalPrivate before cross-process transfer and promote to GlobalShared in both exporter and importer after transfer/install"
 
 [[contracts]]
+id = "should.vmo.private_clone_source_shadow_contract"
+level = "should"
+description = "PRIVATE_CLONE mappings over shared source handles should preserve the shared source bytes/info while writes become visible only through the mapping-local private shadow"
+
+[[contracts]]
 id = "should.socket.stream_basics_bootstrap"
 level = "should"
 description = "Bootstrap STREAM sockets should support create, waitable readable/writable states, peek, read, peer-close signaling, and peer-closed read/write errors"

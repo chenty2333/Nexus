@@ -105,6 +105,14 @@ Current state:
   - readable
   - not directly writable
   - not directly resizable
+- the bootstrap private-clone gate now also freezes the current source-vs-shadow
+  split for shared pager-backed source handles:
+  - one `ZX_VM_PRIVATE_CLONE` mapping may install a writable mapping-local view
+    over the shared source handle
+  - bytes read back through the shared source handle remain unchanged after the
+    mapping writes its private shadow
+  - `ax_vmo_get_info()` on the shared source handle remains
+    `PagerBacked + GlobalShared` before and after the mapping-local write
 - the staged shared-anonymous `GetVmo` gate now freezes that same exported
   source-handle behavior for boot/package assets that are still byte-backed:
   - readable

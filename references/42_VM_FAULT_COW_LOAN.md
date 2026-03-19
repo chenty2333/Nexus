@@ -94,6 +94,12 @@ This is the current mechanism that prevents duplicate materialization or inconsi
     rebind one mapping-local private frame on the first write fault
   - staged byte-backed boot assets currently ride one page-rounded shared anonymous VMO through the
     same private-clone path
+- The current bootstrap gate also now freezes the public source-vs-shadow
+  consequence of that path for shared pager-backed handles:
+  - writes through the `PRIVATE_CLONE` mapping become visible through the
+    mapping-local shadow
+  - reads through the shared source handle still observe the original source
+    bytes
 - Kernel VMO byte I/O can also materialize anonymous pages.
   When that happens for a page that is already mapped somewhere, the kernel now attaches the new
   frame to existing mapping aliases:

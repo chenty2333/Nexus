@@ -23,7 +23,8 @@
         not(axle_test_runner_rust_entry = "smp_smoke"),
         not(axle_test_runner_rust_entry = "vmo_info_smoke"),
         not(axle_test_runner_rust_entry = "vmo_shared_smoke"),
-        not(axle_test_runner_rust_entry = "vmo_promotion_smoke")
+        not(axle_test_runner_rust_entry = "vmo_promotion_smoke"),
+        not(axle_test_runner_rust_entry = "vmo_private_clone_smoke")
     ),
     forbid(unsafe_code)
 )]
@@ -38,7 +39,8 @@
         axle_test_runner_rust_entry = "smp_smoke",
         axle_test_runner_rust_entry = "vmo_info_smoke",
         axle_test_runner_rust_entry = "vmo_shared_smoke",
-        axle_test_runner_rust_entry = "vmo_promotion_smoke"
+        axle_test_runner_rust_entry = "vmo_promotion_smoke",
+        axle_test_runner_rust_entry = "vmo_private_clone_smoke"
     ),
     deny(unsafe_op_in_unsafe_fn)
 )]
@@ -53,7 +55,8 @@
         axle_test_runner_rust_entry = "smp_smoke",
         axle_test_runner_rust_entry = "vmo_info_smoke",
         axle_test_runner_rust_entry = "vmo_shared_smoke",
-        axle_test_runner_rust_entry = "vmo_promotion_smoke"
+        axle_test_runner_rust_entry = "vmo_promotion_smoke",
+        axle_test_runner_rust_entry = "vmo_private_clone_smoke"
     ),
     deny(clippy::undocumented_unsafe_blocks)
 )]
@@ -84,6 +87,8 @@ mod smp_smoke;
 mod virtio_net_transport;
 #[cfg(axle_test_runner_rust_entry = "vmo_info_smoke")]
 mod vmo_info_smoke;
+#[cfg(axle_test_runner_rust_entry = "vmo_private_clone_smoke")]
+mod vmo_private_clone_smoke;
 #[cfg(axle_test_runner_rust_entry = "vmo_promotion_smoke")]
 mod vmo_promotion_smoke;
 #[cfg(axle_test_runner_rust_entry = "vmo_shared_smoke")]
@@ -149,6 +154,12 @@ fn panic(_info: &PanicInfo) -> ! {
     vmo_promotion_smoke::report_panic()
 }
 
+#[cfg(axle_test_runner_rust_entry = "vmo_private_clone_smoke")]
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    vmo_private_clone_smoke::report_panic()
+}
+
 #[cfg(all(
     not(axle_test_runner_rust_entry = "reactor_smoke"),
     not(axle_test_runner_rust_entry = "component_smoke"),
@@ -159,7 +170,8 @@ fn panic(_info: &PanicInfo) -> ! {
     not(axle_test_runner_rust_entry = "smp_smoke"),
     not(axle_test_runner_rust_entry = "vmo_info_smoke"),
     not(axle_test_runner_rust_entry = "vmo_shared_smoke"),
-    not(axle_test_runner_rust_entry = "vmo_promotion_smoke")
+    not(axle_test_runner_rust_entry = "vmo_promotion_smoke"),
+    not(axle_test_runner_rust_entry = "vmo_private_clone_smoke")
 ))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

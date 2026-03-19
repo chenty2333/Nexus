@@ -829,6 +829,22 @@ const SLOT_VMO_PROMOTION_CHILD_INFO_BACKING_SCOPE: usize = 1086;
 const SLOT_VMO_PROMOTION_PARENT_INFO_AFTER: usize = 1087;
 const SLOT_VMO_PROMOTION_PARENT_INFO_AFTER_KIND: usize = 1088;
 const SLOT_VMO_PROMOTION_PARENT_INFO_AFTER_BACKING_SCOPE: usize = 1089;
+const SLOT_VMO_PRIVATE_CLONE_PRESENT: usize = 1090;
+const SLOT_VMO_PRIVATE_CLONE_FAILURE_STEP: usize = 1091;
+const SLOT_VMO_PRIVATE_CLONE_INFO_BEFORE: usize = 1092;
+const SLOT_VMO_PRIVATE_CLONE_KIND_BEFORE: usize = 1093;
+const SLOT_VMO_PRIVATE_CLONE_SCOPE_BEFORE: usize = 1094;
+const SLOT_VMO_PRIVATE_CLONE_SOURCE_READ_BEFORE: usize = 1095;
+const SLOT_VMO_PRIVATE_CLONE_MAP: usize = 1096;
+const SLOT_VMO_PRIVATE_CLONE_PREFIX_MATCH: usize = 1097;
+const SLOT_VMO_PRIVATE_CLONE_WRITE_THROUGH_MAPPING: usize = 1098;
+const SLOT_VMO_PRIVATE_CLONE_MAPPING_SEES_PRIVATE: usize = 1099;
+const SLOT_VMO_PRIVATE_CLONE_SOURCE_READ_AFTER: usize = 1100;
+const SLOT_VMO_PRIVATE_CLONE_SOURCE_UNCHANGED: usize = 1101;
+const SLOT_VMO_PRIVATE_CLONE_INFO_AFTER: usize = 1102;
+const SLOT_VMO_PRIVATE_CLONE_KIND_AFTER: usize = 1103;
+const SLOT_VMO_PRIVATE_CLONE_SCOPE_AFTER: usize = 1104;
+const SLOT_VMO_PRIVATE_CLONE_UNMAP: usize = 1105;
 const SLOT_DGRAM_PRESENT: usize = 954;
 const SLOT_DGRAM_FAILURE_STEP: usize = 955;
 const SLOT_DGRAM_CREATE: usize = 956;
@@ -856,7 +872,7 @@ const SLOT_DGRAM_WRITE_PEER_CLOSED: usize = 977;
 const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
 const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_VMO_PROMOTION_PARENT_INFO_AFTER_BACKING_SCOPE;
+const SLOT_MAX: usize = SLOT_VMO_PRIVATE_CLONE_UNMAP;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1825,6 +1841,10 @@ fn vmo_promotion_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_VMO_PROMOTION_PRESENT] != 0 || slots[SLOT_VMO_PROMOTION_FAILURE_STEP] != 0
 }
 
+fn vmo_private_clone_summary_present(slots: &[u64]) -> bool {
+    slots[SLOT_VMO_PRIVATE_CLONE_PRESENT] != 0 || slots[SLOT_VMO_PRIVATE_CLONE_FAILURE_STEP] != 0
+}
+
 fn smp_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_SMP_SMOKE_PRESENT] != 0
 }
@@ -2282,6 +2302,28 @@ fn print_vmo_promotion_summary(slots: &[u64]) {
     );
 }
 
+fn print_vmo_private_clone_summary(slots: &[u64]) {
+    crate::kprintln!(
+        "kernel: vmo private clone smoke (vmo_private_clone_present={}, vmo_private_clone_failure_step={}, vmo_private_clone_info_before={}, vmo_private_clone_kind_before={}, vmo_private_clone_scope_before={}, vmo_private_clone_source_read_before={}, vmo_private_clone_map={}, vmo_private_clone_prefix_match={}, vmo_private_clone_write_through_mapping={}, vmo_private_clone_mapping_sees_private={}, vmo_private_clone_source_read_after={}, vmo_private_clone_source_unchanged={}, vmo_private_clone_info_after={}, vmo_private_clone_kind_after={}, vmo_private_clone_scope_after={}, vmo_private_clone_unmap={})",
+        slots[SLOT_VMO_PRIVATE_CLONE_PRESENT],
+        slots[SLOT_VMO_PRIVATE_CLONE_FAILURE_STEP],
+        slots[SLOT_VMO_PRIVATE_CLONE_INFO_BEFORE] as i64,
+        slots[SLOT_VMO_PRIVATE_CLONE_KIND_BEFORE],
+        slots[SLOT_VMO_PRIVATE_CLONE_SCOPE_BEFORE],
+        slots[SLOT_VMO_PRIVATE_CLONE_SOURCE_READ_BEFORE] as i64,
+        slots[SLOT_VMO_PRIVATE_CLONE_MAP] as i64,
+        slots[SLOT_VMO_PRIVATE_CLONE_PREFIX_MATCH],
+        slots[SLOT_VMO_PRIVATE_CLONE_WRITE_THROUGH_MAPPING],
+        slots[SLOT_VMO_PRIVATE_CLONE_MAPPING_SEES_PRIVATE],
+        slots[SLOT_VMO_PRIVATE_CLONE_SOURCE_READ_AFTER] as i64,
+        slots[SLOT_VMO_PRIVATE_CLONE_SOURCE_UNCHANGED],
+        slots[SLOT_VMO_PRIVATE_CLONE_INFO_AFTER] as i64,
+        slots[SLOT_VMO_PRIVATE_CLONE_KIND_AFTER],
+        slots[SLOT_VMO_PRIVATE_CLONE_SCOPE_AFTER],
+        slots[SLOT_VMO_PRIVATE_CLONE_UNMAP] as i64,
+    );
+}
+
 fn print_smp_summary(slots: &[u64]) {
     crate::kprintln!(
         "kernel: smp smoke ok (present={}, status={})",
@@ -2414,6 +2456,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         if vmo_promotion_summary_present(slots) {
             print_vmo_promotion_summary(slots);
         }
+        if vmo_private_clone_summary_present(slots) {
+            print_vmo_private_clone_summary(slots);
+        }
         if smp_summary_present(slots) {
             print_smp_summary(slots);
         }
@@ -2461,6 +2506,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
     }
     if vmo_promotion_summary_present(slots) {
         print_vmo_promotion_summary(slots);
+    }
+    if vmo_private_clone_summary_present(slots) {
+        print_vmo_private_clone_summary(slots);
     }
     if smp_summary_present(slots) {
         print_smp_summary(slots);

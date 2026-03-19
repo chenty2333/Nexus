@@ -1,0 +1,36 @@
+id = "kernel.vmo.private_clone_bootstrap"
+description = "Bootstrap ring3 Rust userspace should freeze the PRIVATE_CLONE source-vs-shadow contract for shared pager-backed source handles"
+tags = ["kernel", "runtime", "vm", "vmo", "bootstrap"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/vmo-private-clone-smoke && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && AXLE_TEST_RUNNER_RUST_ENTRY=vmo_private_clone_smoke RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none --target-dir \"$target_dir\" && runner_src=\"$target_dir/x86_64-unknown-none/debug/nexus-test-runner\" && runner=$(mktemp /tmp/nexus-test-runner-XXXXXX) && cp \"$runner_src\" \"$runner\" && size=$(stat -c%s \"$runner\") && { timeout --foreground 20s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x7000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x6fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; qemu_code=$?; echo qemu_exit=$qemu_code; [ \"$qemu_code\" -eq 33 ]; }"
+]
+
+expect = [
+  "kernel: vmo private clone smoke",
+]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.vmo.private_clone_source_shadow_contract"]
+
+[assertions.status_code]
+vmo_private_clone_info_before = 0
+vmo_private_clone_source_read_before = 0
+vmo_private_clone_map = 0
+vmo_private_clone_source_read_after = 0
+vmo_private_clone_info_after = 0
+vmo_private_clone_unmap = 0
+
+[assertions.packet_fields]
+vmo_private_clone_present = 1
+vmo_private_clone_failure_step = 0
+vmo_private_clone_kind_before = 3
+vmo_private_clone_scope_before = 1
+vmo_private_clone_prefix_match = 1
+vmo_private_clone_write_through_mapping = 1
+vmo_private_clone_mapping_sees_private = 1
+vmo_private_clone_source_unchanged = 1
+vmo_private_clone_kind_after = 3
+vmo_private_clone_scope_after = 1
