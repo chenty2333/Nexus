@@ -975,8 +975,11 @@ fn run_net_bringup() -> NetSummary {
         }
     }
 
-    for pair in 0..QUEUE_PAIR_COUNT {
-        let worker_failure = NET_WORKER_FAILURE_STEP[pair].load(Ordering::Acquire);
+    for worker_failure in NET_WORKER_FAILURE_STEP
+        .iter()
+        .take(QUEUE_PAIR_COUNT)
+        .map(|slot| slot.load(Ordering::Acquire))
+    {
         if summary.failure_step == 0 && worker_failure != 0 {
             summary.failure_step = worker_failure;
         }

@@ -96,7 +96,7 @@ fn read_guest_itimerspec(session: zx_handle_t, addr: u64) -> Result<LinuxItimerS
 }
 
 impl EventFd {
-    fn new(initial: u32, semaphore: bool) -> Result<Self, zx_status_t> {
+    pub(in crate::starnix) fn new(initial: u32, semaphore: bool) -> Result<Self, zx_status_t> {
         let mut wait_handle = ZX_HANDLE_INVALID;
         let mut peer_handle = ZX_HANDLE_INVALID;
         zx_status_result(ax_eventpair_create(0, &mut wait_handle, &mut peer_handle))?;
@@ -630,6 +630,7 @@ impl StarnixKernel {
                 let wait = WaitState {
                     restartable: true,
                     kind: WaitKind::FdRead {
+                        io_kind: FdReadKind::Read,
                         fd,
                         buf,
                         len,

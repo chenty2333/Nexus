@@ -33,6 +33,23 @@ pub(in crate::starnix) struct WaitState {
 }
 
 #[derive(Clone, Copy)]
+pub(in crate::starnix) enum FdReadKind {
+    Read,
+    Readv,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::starnix) enum FdWriteKind {
+    Write,
+    Writev,
+}
+
+pub(in crate::starnix) enum BlockedOpResume {
+    StillBlocked,
+    Restart(SyscallAction),
+}
+
+#[derive(Clone, Copy)]
 pub(in crate::starnix) enum WaitKind {
     Wait4 {
         target_pid: i32,
@@ -48,12 +65,14 @@ pub(in crate::starnix) enum WaitKind {
         maxevents: usize,
     },
     FdRead {
+        io_kind: FdReadKind,
         fd: i32,
         buf: u64,
         len: usize,
         packet_key: u64,
     },
     FdWrite {
+        io_kind: FdWriteKind,
         fd: i32,
         buf: u64,
         len: usize,

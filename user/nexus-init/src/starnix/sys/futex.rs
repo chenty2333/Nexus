@@ -67,9 +67,7 @@ impl StarnixKernel {
                     restartable: false,
                     kind: WaitKind::Futex { key },
                 };
-                self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
-                    TaskState::Waiting(wait);
-                self.deliver_or_interrupt_wait(task_id, wait, stop_state)
+                self.begin_wait(task_id, wait, stop_state)
             }
             LINUX_FUTEX_WAKE | LINUX_FUTEX_WAKE_BITSET => {
                 let wake_mask = if command == LINUX_FUTEX_WAKE {

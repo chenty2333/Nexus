@@ -440,16 +440,7 @@ impl StarnixKernel {
         wait_interest: WaitSpec,
         stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
-        let status = ax_object_wait_async(
-            wait_interest.handle(),
-            self.port,
-            wait.packet_key().ok_or(ZX_ERR_BAD_STATE)?,
-            wait_interest.signals(),
-            0,
-        );
-        zx_status_result(status)?;
-        self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Waiting(wait);
-        self.deliver_or_interrupt_wait(task_id, wait, stop_state)
+        self.begin_async_wait(task_id, wait, wait_interest, stop_state)
     }
 }
 

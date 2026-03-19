@@ -256,6 +256,22 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - the kernel rewrites the captured stop RIP back to the syscall instruction boundary
     - the userspace executive can keep using the same `complete_syscall()` restart model
     - ordinary native `ax_*` / `zx_*` userspace is not routed through that guest stop path
+  - production Starnix exec-image resolution is now namespace-backed only:
+    - `run_executive()` resolves the main image bytes through the Starnix namespace
+    - embedded payload lookup tables remain bootstrap-namespace population helpers only
+  - blocked guest syscalls now enter and retry through one shared executive path:
+    - `begin_wait` / `begin_async_wait` own the transition into `TaskState::Waiting`
+    - `WaitKind` owns the retry-side replay choice for:
+      - `wait4`
+      - futex wait
+      - `epoll_wait`
+      - blocking fd I/O
+      - blocking message I/O
+  - host-side semantic tests in `nexus-init` now cover:
+    - `dup2` / `dup3` open-file-description sharing
+    - `wait4` target matching
+    - `rt_sigreturn` register + blocked-mask restore
+    - `epoll` readiness derived from one synthetic `eventfd` waitable
 
 ## Frozen architectural split
 

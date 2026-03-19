@@ -592,72 +592,6 @@ fn run_executive(start_info: StarnixStartInfo) -> i32 {
     kernel.run()
 }
 
-// Legacy embedded smoke payloads remain only as a bootstrap fallback while
-// production exec is resolved from the startup namespace.
-fn bootstrap_payload_bytes_for(args: &[String]) -> Option<&'static [u8]> {
-    match args.first().map(String::as_str) {
-        Some("linux-hello") | None => Some(LINUX_HELLO_BYTES),
-        Some("linux-fd-smoke") => Some(LINUX_FD_SMOKE_BYTES),
-        Some("linux-round2-smoke") => Some(LINUX_ROUND2_BYTES),
-        Some("linux-round3-smoke") => Some(LINUX_ROUND3_BYTES),
-        Some("linux-round4-futex-smoke") => Some(LINUX_ROUND4_FUTEX_BYTES),
-        Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BYTES),
-        Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BYTES),
-        Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BYTES),
-        Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BYTES),
-        Some("linux-round6-signalfd-smoke") => Some(LINUX_ROUND6_SIGNALFD_BYTES),
-        Some("linux-round6-futex-smoke") => Some(LINUX_ROUND6_FUTEX_BYTES),
-        Some("linux-round6-scm-rights-smoke") => Some(LINUX_ROUND6_SCM_RIGHTS_BYTES),
-        Some("linux-round6-pidfd-smoke") => Some(LINUX_ROUND6_PIDFD_BYTES),
-        Some("linux-round6-proc-job-smoke") => Some(LINUX_ROUND6_PROC_JOB_BYTES),
-        Some("linux-round6-proc-control-smoke") => Some(LINUX_ROUND6_PROC_CONTROL_BYTES),
-        Some("linux-round6-proc-tty-smoke") => Some(LINUX_ROUND6_PROC_TTY_BYTES),
-        Some("linux-runtime-fd-smoke") => Some(LINUX_RUNTIME_FD_BYTES),
-        Some("linux-runtime-misc-smoke") => Some(LINUX_RUNTIME_MISC_BYTES),
-        Some("linux-runtime-process-smoke") => Some(LINUX_RUNTIME_PROCESS_BYTES),
-        Some("linux-runtime-fs-smoke") => Some(LINUX_RUNTIME_FS_BYTES),
-        Some("linux-runtime-tls-smoke") => Some(LINUX_RUNTIME_TLS_BYTES),
-        Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BYTES),
-        Some("linux-dynamic-tls-smoke") => Some(LINUX_DYNAMIC_TLS_SMOKE_BYTES),
-        Some("linux-dynamic-runtime-smoke") => Some(LINUX_DYNAMIC_RUNTIME_SMOKE_BYTES),
-        Some("linux-dynamic-pie-smoke") => Some(LINUX_DYNAMIC_PIE_SMOKE_BYTES),
-        Some("linux-glibc-hello") => Some(LINUX_GLIBC_HELLO_BYTES),
-        Some(_) => None,
-    }
-}
-
-fn bootstrap_payload_path_for(args: &[String]) -> Option<&'static str> {
-    match args.first().map(String::as_str) {
-        Some("linux-hello") | None => Some(LINUX_HELLO_BINARY_PATH),
-        Some("linux-fd-smoke") => Some(LINUX_FD_SMOKE_BINARY_PATH),
-        Some("linux-round2-smoke") => Some(LINUX_ROUND2_BINARY_PATH),
-        Some("linux-round3-smoke") => Some(LINUX_ROUND3_BINARY_PATH),
-        Some("linux-round4-futex-smoke") => Some(LINUX_ROUND4_FUTEX_BINARY_PATH),
-        Some("linux-round4-signal-smoke") => Some(LINUX_ROUND4_SIGNAL_BINARY_PATH),
-        Some("linux-round5-epoll-smoke") => Some(LINUX_ROUND5_EPOLL_BINARY_PATH),
-        Some("linux-round6-eventfd-smoke") => Some(LINUX_ROUND6_EVENTFD_BINARY_PATH),
-        Some("linux-round6-timerfd-smoke") => Some(LINUX_ROUND6_TIMERFD_BINARY_PATH),
-        Some("linux-round6-signalfd-smoke") => Some(LINUX_ROUND6_SIGNALFD_BINARY_PATH),
-        Some("linux-round6-futex-smoke") => Some(LINUX_ROUND6_FUTEX_BINARY_PATH),
-        Some("linux-round6-scm-rights-smoke") => Some(LINUX_ROUND6_SCM_RIGHTS_BINARY_PATH),
-        Some("linux-round6-pidfd-smoke") => Some(LINUX_ROUND6_PIDFD_BINARY_PATH),
-        Some("linux-round6-proc-job-smoke") => Some(LINUX_ROUND6_PROC_JOB_BINARY_PATH),
-        Some("linux-round6-proc-control-smoke") => Some(LINUX_ROUND6_PROC_CONTROL_BINARY_PATH),
-        Some("linux-round6-proc-tty-smoke") => Some(LINUX_ROUND6_PROC_TTY_BINARY_PATH),
-        Some("linux-runtime-fd-smoke") => Some(LINUX_RUNTIME_FD_BINARY_PATH),
-        Some("linux-runtime-misc-smoke") => Some(LINUX_RUNTIME_MISC_BINARY_PATH),
-        Some("linux-runtime-process-smoke") => Some(LINUX_RUNTIME_PROCESS_BINARY_PATH),
-        Some("linux-runtime-fs-smoke") => Some(LINUX_RUNTIME_FS_BINARY_PATH),
-        Some("linux-runtime-tls-smoke") => Some(LINUX_RUNTIME_TLS_BINARY_PATH),
-        Some("linux-dynamic-elf-smoke") => Some(LINUX_DYNAMIC_ELF_SMOKE_BINARY_PATH),
-        Some("linux-dynamic-tls-smoke") => Some(LINUX_DYNAMIC_TLS_SMOKE_BINARY_PATH),
-        Some("linux-dynamic-runtime-smoke") => Some(LINUX_DYNAMIC_RUNTIME_SMOKE_BINARY_PATH),
-        Some("linux-dynamic-pie-smoke") => Some(LINUX_DYNAMIC_PIE_SMOKE_BINARY_PATH),
-        Some("linux-glibc-hello") => Some(LINUX_GLIBC_HELLO_BINARY_PATH),
-        Some(_) => None,
-    }
-}
-
 fn requested_exec_path(args: &[String]) -> Option<String> {
     match args.first().map(String::as_str) {
         Some("") => None,
@@ -671,23 +605,33 @@ fn resolve_exec_payload_source(
     namespace: &nexus_io::ProcessNamespace,
     args: &[String],
 ) -> Result<(String, Vec<u8>), zx_status_t> {
-    if let Some(path) = requested_exec_path(args) {
-        match read_exec_image_bytes_from_namespace(namespace, path.as_str()) {
-            Ok(source) => return Ok(source),
-            Err(ZX_ERR_NOT_FOUND | ZX_ERR_NOT_DIR | ZX_ERR_BAD_PATH) => {}
-            Err(status) => return Err(status),
-        }
+    let path = requested_exec_path(args).ok_or(ZX_ERR_INVALID_ARGS)?;
+    read_exec_image_bytes_from_namespace(namespace, path.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use alloc::vec;
+    use nexus_io::{NamespaceTrie, ProcessNamespace};
+
+    #[test]
+    fn resolve_exec_payload_source_requires_explicit_exec_path() {
+        let namespace = ProcessNamespace::new(NamespaceTrie::new());
+        assert_eq!(
+            resolve_exec_payload_source(&namespace, &[]).expect_err("missing path should fail"),
+            ZX_ERR_INVALID_ARGS
+        );
     }
 
-    let path = bootstrap_payload_path_for(args).ok_or(ZX_ERR_NOT_SUPPORTED)?;
-    let bytes = bootstrap_payload_bytes_for(args).ok_or(ZX_ERR_NOT_SUPPORTED)?;
-    let mut owned = Vec::new();
-    owned
-        .try_reserve_exact(bytes.len())
-        .map_err(|_| ZX_ERR_NO_MEMORY)?;
-    owned.extend_from_slice(bytes);
-    let stored_path = namespace
-        .resolve_path(path)
-        .unwrap_or_else(|_| String::from(path));
-    Ok((stored_path, owned))
+    #[test]
+    fn resolve_exec_payload_source_does_not_fallback_to_embedded_payloads() {
+        let namespace = ProcessNamespace::new(NamespaceTrie::new());
+        let args = vec![String::from("linux-hello")];
+        let status =
+            resolve_exec_payload_source(&namespace, &args).expect_err("missing namespace entry");
+        assert_eq!(status, ZX_ERR_NOT_FOUND);
+    }
 }

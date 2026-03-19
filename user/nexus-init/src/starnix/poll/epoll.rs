@@ -20,6 +20,28 @@ pub(in crate::starnix) struct EpollEntry {
     observer_armed: bool,
 }
 
+impl EpollEntry {
+    #[cfg(test)]
+    pub(in crate::starnix) fn new(
+        description: Arc<OpenFileDescription>,
+        interest: u32,
+        data: u64,
+        wait_interest: Option<WaitSpec>,
+        packet_key: Option<u64>,
+    ) -> Self {
+        Self {
+            description,
+            interest,
+            data,
+            wait_interest,
+            packet_key,
+            disabled: false,
+            queued_events: 0,
+            observer_armed: false,
+        }
+    }
+}
+
 pub(in crate::starnix) struct EpollInstance {
     pub(in crate::starnix) entries: BTreeMap<LinuxFileDescriptionKey, EpollEntry>,
     pub(in crate::starnix) ready_list: VecDeque<LinuxFileDescriptionKey>,
@@ -632,12 +654,11 @@ impl StarnixKernel {
                 maxevents,
             },
         };
-        self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Waiting(wait);
         self.epolls
             .get_mut(&epoll_key)
             .ok_or(ZX_ERR_BAD_STATE)?
             .waiting_tasks
             .push_back(task_id);
-        self.deliver_or_interrupt_wait(task_id, wait, stop_state)
+        self.begin_wait(task_id, wait, stop_state)
     }
 }

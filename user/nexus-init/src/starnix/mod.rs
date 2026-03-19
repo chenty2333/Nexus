@@ -53,8 +53,9 @@ use self::task::task::{
 };
 use self::task::thread_group::{LinuxSigChldInfo, LinuxThreadGroup, ThreadGroupState};
 use self::task::wait::{
-    FdWaitOp, FdWaitPolicy, LinuxFileDescriptionKey, LinuxFutexKey, LinuxFutexWaiter,
-    PendingScmRights, ReadAttempt, WaitChildEvent, WaitKind, WaitState, WriteAttempt,
+    BlockedOpResume, FdReadKind, FdWaitOp, FdWaitPolicy, FdWriteKind, LinuxFileDescriptionKey,
+    LinuxFutexKey, LinuxFutexWaiter, PendingScmRights, ReadAttempt, WaitChildEvent, WaitKind,
+    WaitState, WriteAttempt,
 };
 
 #[cfg(test)]
@@ -157,7 +158,6 @@ use libax::{
     ax_thread_create as zx_thread_create, ax_thread_get_guest_x64_fs_base,
     ax_thread_set_guest_x64_fs_base, ax_thread_start_guest, ax_timer_cancel,
     ax_timer_create_monotonic, ax_timer_set, ax_vmo_create as zx_vmo_create,
-    ax_vmo_read as zx_vmo_read, ax_vmo_write as zx_vmo_write,
 };
 use nexus_io::{
     DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFileDescription, OpenFlags,
@@ -761,6 +761,41 @@ mod tests {
         }
     }
 
+    struct SyntheticWaitFd;
+
+    impl FdOps for SyntheticWaitFd {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn read(&self, _buffer: &mut [u8]) -> Result<usize, zx_status_t> {
+            Err(ZX_ERR_NOT_SUPPORTED)
+        }
+
+        fn write(&self, _buffer: &[u8]) -> Result<usize, zx_status_t> {
+            Err(ZX_ERR_NOT_SUPPORTED)
+        }
+
+        fn seek(&self, _origin: SeekOrigin, _offset: i64) -> Result<u64, zx_status_t> {
+            Err(ZX_ERR_NOT_SUPPORTED)
+        }
+
+        fn close(&self) -> Result<(), zx_status_t> {
+            Ok(())
+        }
+
+        fn clone_fd(&self, _flags: FdFlags) -> Result<Arc<dyn FdOps>, zx_status_t> {
+            Ok(Arc::new(Self))
+        }
+
+        fn wait_interest(&self) -> Option<WaitSpec> {
+            Some(WaitSpec::new(
+                ZX_HANDLE_INVALID,
+                EVENTFD_READABLE_SIGNAL | EVENTFD_WRITABLE_SIGNAL,
+            ))
+        }
+    }
+
     fn test_linux_mm() -> LinuxMm {
         LinuxMm::empty_for_tests()
     }
@@ -893,6 +928,182 @@ mod tests {
                 resources: None,
             },
         );
+    }
+
+    #[test]
+    fn dup2_and_dup3_share_open_file_descriptions() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        let resources = kernel
+            .groups
+            .get_mut(&1)
+            .expect("root group")
+            .resources
+            .as_mut()
+            .expect("root resources");
+        let source_fd = resources
+            .fs
+            .fd_table
+            .open(
+                Arc::new(PseudoNodeFd::new(None)),
+                OpenFlags::READABLE | OpenFlags::WRITABLE,
+                FdFlags::empty(),
+            )
+            .expect("open source fd");
+        let source_key = {
+            let entry = resources.fs.fd_table.get(source_fd).expect("source entry");
+            file_description_key(entry.description())
+        };
+
+        assert_eq!(resources.dup2(source_fd, 9).expect("dup2"), 9);
+        let dup2_entry = resources.fs.fd_table.get(9).expect("dup2 entry");
+        assert_eq!(file_description_key(dup2_entry.description()), source_key);
+        assert_eq!(dup2_entry.flags(), FdFlags::empty());
+
+        assert_eq!(
+            resources
+                .dup3(source_fd, 10, LINUX_O_CLOEXEC)
+                .expect("dup3 cloexec"),
+            10
+        );
+        let dup3_entry = resources.fs.fd_table.get(10).expect("dup3 entry");
+        assert_eq!(file_description_key(dup3_entry.description()), source_key);
+        assert_eq!(dup3_entry.flags(), FdFlags::CLOEXEC);
+        assert_eq!(
+            resources
+                .fs
+                .fd_table
+                .get(source_fd)
+                .expect("source after dup3")
+                .flags(),
+            FdFlags::empty()
+        );
+    }
+
+    #[test]
+    fn wait_matches_tracks_same_group_and_explicit_pgid_targets() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        insert_test_child(&mut kernel, TaskState::Running, 7);
+
+        assert!(kernel.wait_matches(1, -1, 2));
+        assert!(kernel.wait_matches(1, 2, 2));
+        assert!(!kernel.wait_matches(1, 0, 2));
+        assert!(kernel.wait_matches(1, -7, 2));
+        assert!(!kernel.wait_matches(1, -9, 2));
+
+        kernel.groups.get_mut(&2).expect("child group").pgid = 1;
+        assert!(kernel.wait_matches(1, 0, 2));
+    }
+
+    #[test]
+    fn rt_sigreturn_restores_registers_and_signal_mask() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        let restore_regs = ax_guest_x64_regs_t {
+            rax: 42,
+            rcx: 7,
+            rip: 0x1234,
+            rsp: 0x5678,
+            ..Default::default()
+        };
+        {
+            let task = kernel.tasks.get_mut(&1).expect("root task");
+            task.signals.blocked = linux_signal_bit(LINUX_SIGSTOP).expect("sigstop bit");
+            task.active_signal = Some(ActiveSignalFrame {
+                restore_regs,
+                previous_blocked: linux_signal_bit(LINUX_SIGCONT).expect("sigcont bit"),
+            });
+        }
+
+        let mut stop_state = ax_guest_stop_state_t::default();
+        let action = kernel
+            .sys_rt_sigreturn(1, &mut stop_state)
+            .expect("rt_sigreturn");
+        assert!(matches!(action, SyscallAction::Resume));
+        assert_eq!(stop_state.regs.rax, restore_regs.rax);
+        assert_eq!(stop_state.regs.rcx, restore_regs.rcx);
+        assert_eq!(stop_state.regs.rip, restore_regs.rip);
+        assert_eq!(stop_state.regs.rsp, restore_regs.rsp);
+        let task = kernel.tasks.get(&1).expect("root task after sigreturn");
+        assert_eq!(
+            task.signals.blocked,
+            linux_signal_bit(LINUX_SIGCONT).expect("sigcont bit")
+        );
+        assert!(task.active_signal.is_none());
+    }
+
+    #[test]
+    fn epoll_translates_synthetic_waitable_readiness() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        let (description, target_key, wait_interest) = {
+            let resources = kernel
+                .groups
+                .get_mut(&1)
+                .expect("root group")
+                .resources
+                .as_mut()
+                .expect("root resources");
+            let fd = resources
+                .fs
+                .fd_table
+                .open(
+                    Arc::new(SyntheticWaitFd),
+                    OpenFlags::READABLE | OpenFlags::WRITABLE,
+                    FdFlags::empty(),
+                )
+                .expect("open synthetic waitable");
+            let entry = resources
+                .fs
+                .fd_table
+                .get(fd)
+                .expect("synthetic waitable entry");
+            let description = Arc::clone(entry.description());
+            let target_key = file_description_key(&description);
+            let wait_interest = resources
+                .fs
+                .fd_table
+                .wait_interest(fd)
+                .expect("synthetic wait interest")
+                .map(|interest| {
+                    super::poll::readiness::filter_epoll_wait_interest(interest, LINUX_EPOLLIN)
+                });
+            (description, target_key, wait_interest)
+        };
+        assert_eq!(
+            wait_interest.expect("readable wait interest").signals(),
+            EVENTFD_READABLE_SIGNAL
+        );
+
+        let epoll_key = LinuxFileDescriptionKey(0xface);
+        let packet_key = Some(kernel.alloc_packet_key().expect("packet key"));
+        if let Some(packet_key) = packet_key {
+            kernel
+                .epoll_packets
+                .insert(packet_key, (epoll_key, target_key));
+        }
+        let mut instance = EpollInstance::new();
+        instance.entries.insert(
+            target_key,
+            super::poll::epoll::EpollEntry::new(
+                description,
+                LINUX_EPOLLIN,
+                0x1234,
+                wait_interest,
+                packet_key,
+            ),
+        );
+        kernel.epolls.insert(epoll_key, instance);
+
+        kernel.queue_epoll_ready(
+            epoll_key,
+            target_key,
+            super::poll::readiness::map_wait_signals_to_epoll(EVENTFD_READABLE_SIGNAL),
+        );
+        let instance = kernel.epolls.get(&epoll_key).expect("epoll instance");
+        assert!(instance.ready_set.contains(&target_key));
+        assert_eq!(instance.ready_list.front(), Some(&target_key));
     }
 
     #[test]

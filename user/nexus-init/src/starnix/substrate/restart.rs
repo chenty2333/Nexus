@@ -14,6 +14,34 @@ pub(in crate::starnix) fn complete_syscall(
 }
 
 impl StarnixKernel {
+    pub(in crate::starnix) fn begin_wait(
+        &mut self,
+        task_id: i32,
+        wait: WaitState,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Waiting(wait);
+        self.deliver_or_interrupt_wait(task_id, wait, stop_state)
+    }
+
+    pub(in crate::starnix) fn begin_async_wait(
+        &mut self,
+        task_id: i32,
+        wait: WaitState,
+        wait_interest: WaitSpec,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let status = ax_object_wait_async(
+            wait_interest.handle(),
+            self.port,
+            wait.packet_key().ok_or(ZX_ERR_BAD_STATE)?,
+            wait_interest.signals(),
+            0,
+        );
+        zx_status_result(status)?;
+        self.begin_wait(task_id, wait, stop_state)
+    }
+
     fn queue_wait_signal_wake(&self, task_id: i32) -> Result<(), zx_status_t> {
         let packet = zx_port_packet_t {
             key: STARNIX_SIGNAL_WAKE_PACKET_KEY,
@@ -170,59 +198,92 @@ impl StarnixKernel {
         let mut stop_state = ax_guest_stop_state_read(task.carrier.sidecar_vmo)?;
         match self.deliver_or_interrupt_wait(task_id, wait, &mut stop_state)? {
             SyscallAction::Resume => self.writeback_and_resume(task_id, &stop_state),
-            SyscallAction::LeaveStopped => match wait.kind {
-                WaitKind::Wait4 { .. } => Ok(()),
-                WaitKind::Futex { .. } => Ok(()),
-                WaitKind::Epoll { .. } => Ok(()),
-                WaitKind::FdRead { fd, buf, len, .. } => {
-                    self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
-                        TaskState::Running;
-                    stop_state.regs.rdi = fd as u64;
-                    stop_state.regs.rsi = buf;
-                    stop_state.regs.rdx = len as u64;
-                    let action = self.sys_read(task_id, &mut stop_state)?;
-                    self.complete_task_action(task_id, action, &mut stop_state)
+            SyscallAction::LeaveStopped => {
+                match self.resume_wait_kind(task_id, wait, &mut stop_state, stdout)? {
+                    BlockedOpResume::StillBlocked => Ok(()),
+                    BlockedOpResume::Restart(action) => {
+                        self.complete_task_action(task_id, action, &mut stop_state)
+                    }
                 }
-                WaitKind::FdWrite { fd, buf, len, .. } => {
-                    self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
-                        TaskState::Running;
-                    stop_state.regs.rdi = fd as u64;
-                    stop_state.regs.rsi = buf;
-                    stop_state.regs.rdx = len as u64;
-                    let action = self.sys_write(task_id, &mut stop_state, stdout)?;
-                    self.complete_task_action(task_id, action, &mut stop_state)
-                }
-                WaitKind::MsgRecv {
-                    fd,
-                    msg_addr,
-                    flags,
-                    ..
-                } => {
-                    self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
-                        TaskState::Running;
-                    stop_state.regs.rdi = fd as u64;
-                    stop_state.regs.rsi = msg_addr;
-                    stop_state.regs.rdx = flags;
-                    let action = self.sys_recvmsg(task_id, &mut stop_state)?;
-                    self.complete_task_action(task_id, action, &mut stop_state)
-                }
-                WaitKind::MsgSend {
-                    fd,
-                    msg_addr,
-                    flags,
-                    ..
-                } => {
-                    self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state =
-                        TaskState::Running;
-                    stop_state.regs.rdi = fd as u64;
-                    stop_state.regs.rsi = msg_addr;
-                    stop_state.regs.rdx = flags;
-                    let action = self.sys_sendmsg(task_id, &mut stop_state)?;
-                    self.complete_task_action(task_id, action, &mut stop_state)
-                }
-            },
+            }
             SyscallAction::GroupSignalExit(signal) => self.exit_group_from_signal(task_id, signal),
             _ => Err(ZX_ERR_BAD_STATE),
+        }
+    }
+
+    fn resume_wait_kind(
+        &mut self,
+        task_id: i32,
+        wait: WaitState,
+        stop_state: &mut ax_guest_stop_state_t,
+        stdout: &mut Vec<u8>,
+    ) -> Result<BlockedOpResume, zx_status_t> {
+        match wait.kind {
+            WaitKind::Wait4 { .. } | WaitKind::Futex { .. } | WaitKind::Epoll { .. } => {
+                Ok(BlockedOpResume::StillBlocked)
+            }
+            WaitKind::FdRead {
+                io_kind,
+                fd,
+                buf,
+                len,
+                ..
+            } => {
+                self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Running;
+                stop_state.regs.rdi = fd as u64;
+                stop_state.regs.rsi = buf;
+                stop_state.regs.rdx = len as u64;
+                let action = match io_kind {
+                    FdReadKind::Read => self.sys_read(task_id, stop_state)?,
+                    FdReadKind::Readv => self.sys_readv(task_id, stop_state)?,
+                };
+                Ok(BlockedOpResume::Restart(action))
+            }
+            WaitKind::FdWrite {
+                io_kind,
+                fd,
+                buf,
+                len,
+                ..
+            } => {
+                self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Running;
+                stop_state.regs.rdi = fd as u64;
+                stop_state.regs.rsi = buf;
+                stop_state.regs.rdx = len as u64;
+                let action = match io_kind {
+                    FdWriteKind::Write => self.sys_write(task_id, stop_state, stdout)?,
+                    FdWriteKind::Writev => self.sys_writev(task_id, stop_state, stdout)?,
+                };
+                Ok(BlockedOpResume::Restart(action))
+            }
+            WaitKind::MsgRecv {
+                fd,
+                msg_addr,
+                flags,
+                ..
+            } => {
+                self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Running;
+                stop_state.regs.rdi = fd as u64;
+                stop_state.regs.rsi = msg_addr;
+                stop_state.regs.rdx = flags;
+                Ok(BlockedOpResume::Restart(
+                    self.sys_recvmsg(task_id, stop_state)?,
+                ))
+            }
+            WaitKind::MsgSend {
+                fd,
+                msg_addr,
+                flags,
+                ..
+            } => {
+                self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Running;
+                stop_state.regs.rdi = fd as u64;
+                stop_state.regs.rsi = msg_addr;
+                stop_state.regs.rdx = flags;
+                Ok(BlockedOpResume::Restart(
+                    self.sys_sendmsg(task_id, stop_state)?,
+                ))
+            }
         }
     }
 }

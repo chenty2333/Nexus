@@ -911,7 +911,6 @@ impl StarnixKernel {
                 options,
             },
         };
-        self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Waiting(wait);
-        self.deliver_or_interrupt_wait(task_id, wait, stop_state)
+        self.begin_wait(task_id, wait, stop_state)
     }
 }

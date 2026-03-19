@@ -23,6 +23,7 @@ This file describes the current host-test, fuzz, loom, and QEMU conformance stru
 The repository currently uses several layers:
 
 - host unit tests for core crates
+- host unit tests for `nexus-init` Starnix semantic objects
 - loom tests for concurrency-sensitive code
 - fuzz smoke for state-machine-heavy subsystems
 - host-side concurrent seed replay and triage for schedule-sensitive subsystem boundaries
@@ -48,6 +49,9 @@ Main just targets include:
 - `just perf-smoke-kvm-archive [label]`
 - `just check-conformance-contracts`
 - `just test-all`
+
+`just xlint` and `just xtest` now both include `nexus-init`, so Starnix host-side semantic tests
+are part of the default merge-blocking host gate rather than living only behind QEMU smoke.
 
 ## Contract catalog
 

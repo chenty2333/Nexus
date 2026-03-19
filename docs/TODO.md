@@ -74,7 +74,7 @@ Exit criteria:
   active constraints during review.
 - New Starnix changes stop broadening the monolith by default.
 
-### R2. In-crate modularization and bootstrap-path demotion `[ ]`
+### R2. In-crate modularization and bootstrap-path demotion `[~]`
 
 Goal:
 
@@ -85,6 +85,9 @@ Work:
 
 - Replace `user/nexus-init/src/starnix.rs` with `user/nexus-init/src/starnix/`.
 - Keep one crate for now.
+- Production exec/image load now resolves only through the Starnix namespace.
+  Embedded payload tables remain bootstrap-namespace population helpers, not
+  production exec fallback.
 - Target internal layout:
 
 ```text
@@ -155,7 +158,7 @@ Exit criteria:
 - Production exec flow no longer depends on embedded payload lookup helpers.
 - `sys/` is visibly a dispatch layer rather than the main semantic home.
 
-### R3. Generic supervised guest substrate and blocking-op model `[ ]`
+### R3. Generic supervised guest substrate and blocking-op model `[~]`
 
 Goal:
 
@@ -169,6 +172,10 @@ Work:
   guest session, sidecar, guest memory r/w, resume, syscall completion, and
   packet demux.
 - Promote `WaitState` / `WaitKind` into a first-class blocked-operation model.
+- Waiting syscalls now enter the stopped state through one `begin_wait` /
+  `begin_async_wait` path, and retry through one `WaitKind`-driven restart
+  path. Remaining work is to finish migrating semantic subsystems onto that
+  shape instead of open-coding new wait logic.
 - Make all blocking Linux syscalls converge on one protocol:
   `start -> Ready / Blocked / Interrupted`,
   `resume -> Ready / StillBlocked / Restart`.
@@ -186,7 +193,7 @@ Exit criteria:
   one restart discipline.
 - Synthetic waitable fds share one common integration path with `epoll`.
 
-### R4. Semantic core objectization and tests `[ ]`
+### R4. Semantic core objectization and tests `[~]`
 
 Goal:
 
@@ -202,6 +209,8 @@ Work:
   - `FsContext`
 - Keep Starnix centered on one shared Linux environment rather than per-binary
   bootstrap glue.
+- Host-side Starnix semantic tests now need to remain merge-blocking under
+  `just xtest`, not only as QEMU smoke scenarios.
 - Add host-side semantic tests for at least:
   - `dup` / `dup2` / `dup3` open-file-description sharing
   - process-group / session / `wait4` target matching

@@ -407,6 +407,7 @@ impl StarnixKernel {
                 let wait = WaitState {
                     restartable: true,
                     kind: WaitKind::FdRead {
+                        io_kind: FdReadKind::Read,
                         fd,
                         buf,
                         len,
@@ -489,6 +490,7 @@ impl StarnixKernel {
                 let wait = WaitState {
                     restartable: true,
                     kind: WaitKind::FdWrite {
+                        io_kind: FdWriteKind::Write,
                         fd,
                         buf,
                         len,
@@ -570,6 +572,7 @@ impl StarnixKernel {
                 let wait = WaitState {
                     restartable: true,
                     kind: WaitKind::FdRead {
+                        io_kind: FdReadKind::Readv,
                         fd,
                         buf: iov_addr,
                         len: usize::try_from(iov_len).map_err(|_| ZX_ERR_INVALID_ARGS)?,
@@ -657,6 +660,7 @@ impl StarnixKernel {
                 let wait = WaitState {
                     restartable: true,
                     kind: WaitKind::FdWrite {
+                        io_kind: FdWriteKind::Writev,
                         fd,
                         buf: iov_addr,
                         len: usize::try_from(iov_len).map_err(|_| ZX_ERR_INVALID_ARGS)?,
