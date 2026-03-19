@@ -47,6 +47,7 @@ The current `KernelObject` enum includes:
 - `EventPair`
 - `Socket`
 - `Interrupt`
+- `PciDevice`
 - `DmaRegion`
 - `Vmo`
 - `Vmar`
@@ -60,6 +61,21 @@ Current interrupt shape:
 - it tracks one pending count plus one masked/unmasked bit
 - `interrupt_ack()` drains one pending count
 - `ax_interrupt_trigger()` is the current Axle-native software injection helper
+
+Current PCI-device shape:
+
+- `PciDevice` is one narrow bootstrap device-resource object
+- it is not waitable
+- it currently exports:
+  - one immutable device-info snapshot
+  - one BAR VMO handle per supported BAR index
+  - one interrupt-object handle per `(group, queue_pair)` tuple
+- the first concrete user is the queue-owned bootstrap net dataplane slice
+- it is not yet a full PCI bus/discovery object:
+  - no enumeration
+  - no config-space read/write ABI
+  - no MSI/MSI-X model
+  - no resource rebinding or hotplug semantics
 
 Current DMA-region shape:
 
@@ -148,6 +164,7 @@ The object layer assigns default rights per object family, for example:
 - channel/socket: duplicate, transfer, wait, read, write
 - eventpair: duplicate, transfer, wait, signal, signal-peer
 - interrupt: duplicate, transfer, wait, write
+- pci-device: duplicate, transfer, inspect
 - dma-region: duplicate, transfer, inspect
 - process/thread: duplicate, transfer, wait, inspect, manage-*
 - guest-session: duplicate, transfer, read, write

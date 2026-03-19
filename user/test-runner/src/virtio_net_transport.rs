@@ -31,26 +31,6 @@ pub(crate) const PCI_SUBCLASS_ETHERNET: u8 = 0x00;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub(crate) struct PciConfigPage {
-    pub(crate) vendor_id: u16,
-    pub(crate) device_id: u16,
-    pub(crate) command: u16,
-    pub(crate) status: u16,
-    pub(crate) revision_id: u8,
-    pub(crate) prog_if: u8,
-    pub(crate) subclass: u8,
-    pub(crate) class_code: u8,
-    pub(crate) bar0_paddr: u64,
-    pub(crate) bar0_size: u32,
-    pub(crate) device_features: u32,
-    pub(crate) queue_pairs: u32,
-    pub(crate) queue_size: u32,
-    pub(crate) reserved0: u32,
-    pub(crate) reserved1: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
 pub(crate) struct VirtioMmioHeader {
     pub(crate) magic: u32,
     pub(crate) version: u32,
@@ -187,36 +167,6 @@ pub(crate) fn init_regs(mapped_base: u64) {
     );
 }
 
-pub(crate) fn init_pci_config(mapped_base: u64, bar0_paddr: u64) {
-    write_pci_config(
-        mapped_base,
-        PciConfigPage {
-            vendor_id: PCI_VENDOR_ID_AXLE,
-            device_id: PCI_DEVICE_ID_NET,
-            class_code: PCI_CLASS_NETWORK,
-            subclass: PCI_SUBCLASS_ETHERNET,
-            bar0_paddr,
-            bar0_size: REGISTER_VMO_BYTES as u32,
-            device_features: MMIO_FEATURE_CSUM,
-            queue_pairs: QUEUE_PAIR_COUNT as u32,
-            queue_size: QUEUE_SIZE as u32,
-            ..PciConfigPage::default()
-        },
-    );
-}
-
-pub(crate) fn read_pci_config(mapped_base: u64) -> PciConfigPage {
-    // SAFETY: the bootstrap config page is one mapped PCI-shaped control page
-    // owned by the synthetic device side and read as one packed record.
-    unsafe { ptr::read_volatile(mapped_base as *const PciConfigPage) }
-}
-
-pub(crate) fn write_pci_config(mapped_base: u64, config: PciConfigPage) {
-    // SAFETY: bootstrap setup owns the synthetic PCI config page and writes it
-    // as one packed control-plane record before driver discovery.
-    unsafe { ptr::write_volatile(mapped_base as *mut PciConfigPage, config) }
-}
-
 pub(crate) fn read_header(mapped_base: u64) -> VirtioMmioHeader {
     // SAFETY: the register header lives at the front of one mapped MMIO-style
     // page and is read as a single packed control-plane record.
@@ -227,12 +177,6 @@ pub(crate) fn write_header(mapped_base: u64, header: VirtioMmioHeader) {
     // SAFETY: the driver side owns the global transport header and writes it as
     // one packed control-plane record before queue handoff.
     unsafe { ptr::write_volatile(mapped_base as *mut VirtioMmioHeader, header) }
-}
-
-pub(crate) fn read_regs(mapped_base: u64) -> VirtioMmioRegs {
-    // SAFETY: bootstrap diagnostics may snapshot the full register page after
-    // the transport round has completed and queue-local writers are quiescent.
-    unsafe { ptr::read_volatile(mapped_base as *const VirtioMmioRegs) }
 }
 
 pub(crate) fn write_regs(mapped_base: u64, regs: VirtioMmioRegs) {

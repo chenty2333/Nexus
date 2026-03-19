@@ -686,3 +686,36 @@ args = [
   { name = "offset", ty = "u64" },
   { name = "out_paddr", ty = "*mut u64" },
 ]
+
+[[syscall]]
+name = "ax_pci_device_get_info"
+nr = 59
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "out_info", ty = "*mut ax_pci_device_info_t" },
+]
+
+[[syscall]]
+name = "ax_pci_device_get_bar"
+nr = 60
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "bar_index", ty = "u32" },
+  { name = "out_bar", ty = "*mut ax_pci_bar_info_t" },
+]
+
+[[syscall]]
+name = "ax_pci_device_get_interrupt"
+nr = 61
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "group", ty = "u32" },
+  { name = "queue_pair", ty = "u32" },
+  { name = "out_interrupt", ty = "*mut ax_pci_interrupt_info_t" },
+]

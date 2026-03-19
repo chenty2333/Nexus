@@ -500,6 +500,91 @@ pub mod interrupt {
     pub const ZX_INTERRUPT_VIRTUAL: zx_vm_option_t = AX_INTERRUPT_VIRTUAL as zx_vm_option_t;
 }
 
+/// Narrow PCI/device-facing bootstrap types and constants.
+pub mod pci {
+    use super::{ax_handle_t, zx_handle_t};
+
+    /// Export the current queue-ready interrupt for one queue pair.
+    pub const AX_PCI_INTERRUPT_GROUP_READY: u32 = 0;
+    /// Export the current TX-kick interrupt for one queue pair.
+    pub const AX_PCI_INTERRUPT_GROUP_TX_KICK: u32 = 1;
+    /// Export the current RX-complete interrupt for one queue pair.
+    pub const AX_PCI_INTERRUPT_GROUP_RX_COMPLETE: u32 = 2;
+
+    /// Export the current queue-ready interrupt for one queue pair.
+    pub const ZX_PCI_INTERRUPT_GROUP_READY: u32 = AX_PCI_INTERRUPT_GROUP_READY;
+    /// Export the current TX-kick interrupt for one queue pair.
+    pub const ZX_PCI_INTERRUPT_GROUP_TX_KICK: u32 = AX_PCI_INTERRUPT_GROUP_TX_KICK;
+    /// Export the current RX-complete interrupt for one queue pair.
+    pub const ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE: u32 = AX_PCI_INTERRUPT_GROUP_RX_COMPLETE;
+
+    /// One narrow public PCI/device info snapshot.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ax_pci_device_info_t {
+        /// Vendor id.
+        pub vendor_id: u16,
+        /// Device id.
+        pub device_id: u16,
+        /// Programming interface byte.
+        pub prog_if: u8,
+        /// Subclass byte.
+        pub subclass: u8,
+        /// Class-code byte.
+        pub class_code: u8,
+        /// Revision id.
+        pub revision_id: u8,
+        /// Number of exported BAR resources.
+        pub bar_count: u32,
+        /// Number of queue pairs visible through the current narrow transport contract.
+        pub queue_pairs: u32,
+        /// Queue size in descriptor slots.
+        pub queue_size: u32,
+        /// Device feature bits exported through the current narrow transport contract.
+        pub device_features: u32,
+        /// Interrupt-resource groups exported per queue pair.
+        pub interrupt_groups: u32,
+        /// Reserved for later expansion.
+        pub reserved0: u32,
+    }
+
+    /// Frozen Zircon-compat alias over the native PCI/device info record.
+    pub type zx_pci_device_info_t = ax_pci_device_info_t;
+
+    /// One BAR export result.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ax_pci_bar_info_t {
+        /// Handle naming the exported BAR VMO.
+        pub handle: ax_handle_t,
+        /// BAR size in bytes.
+        pub size: u64,
+    }
+
+    /// Frozen Zircon-compat alias over the native BAR-export result.
+    pub type zx_pci_bar_info_t = ax_pci_bar_info_t;
+
+    /// One interrupt export result.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ax_pci_interrupt_info_t {
+        /// Handle naming the exported interrupt object.
+        pub handle: ax_handle_t,
+    }
+
+    /// Frozen Zircon-compat alias over the native interrupt-export result.
+    pub type zx_pci_interrupt_info_t = ax_pci_interrupt_info_t;
+
+    const _: () = {
+        let _ = core::mem::size_of::<zx_handle_t>();
+    };
+}
+
+pub use pci::{
+    ax_pci_bar_info_t, ax_pci_device_info_t, ax_pci_interrupt_info_t, zx_pci_bar_info_t,
+    zx_pci_device_info_t, zx_pci_interrupt_info_t,
+};
+
 /// VM mapping and protection options.
 ///
 /// VM option bits used by Axle's Zircon-style VM syscalls.

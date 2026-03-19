@@ -161,18 +161,15 @@ Main just targets include:
     `target/perf-smoke-baselines/` archive layout used by real-machine captures
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - two ring3 worker threads act as minimal device-side peers, one queue pair each
+  - one bootstrap `PciDevice` handle is now seeded into the runner shared-slot window
+  - the runner now queries device info, BAR0, and per-queue interrupts through the public device
+    syscall surface instead of synthesizing a separate userspace config page
   - one contiguous VMO supplies the shared queue/buffer memory
-  - one separate contiguous register-backing page plus one separate contiguous PCI-shaped config
-    page freeze the current user-mode transport discovery shape
   - explicit `DmaRegion` objects now pin:
     - the shared queue/buffer memory
-    - the synthetic PCI config backing page
-    - the register backing page
-    - the BAR0 physical alias
+    - the exported BAR0 VMO
   - DMA-region lookup, not raw VMO lookup, now freezes the DMA-style address handoff shape
-  - one physical alias over the config page plus one BAR0 physical VMO created from that config
-    page freeze the current PCI-shaped register-window contract
-  - driver mapping of the config alias and BAR0 window now explicitly exercises `ZX_VM_MAP_MMIO`
+  - driver mapping of the exported BAR0 window now explicitly exercises `ZX_VM_MAP_MMIO`
   - one MMIO-style BAR0 register page freezes a minimal control-plane shape:
     - device identity/version
     - feature bits plus driver-acknowledged feature bits

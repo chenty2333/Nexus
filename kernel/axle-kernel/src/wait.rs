@@ -141,6 +141,7 @@ fn require_port_object(
             | KernelObject::Timer(_)
             | KernelObject::Interrupt(_)
             | KernelObject::DmaRegion(_)
+            | KernelObject::PciDevice(_)
             | KernelObject::Thread(_)
             | KernelObject::Vmo(_)
             | KernelObject::Vmar(_) => Err(ZX_ERR_WRONG_TYPE),
@@ -166,6 +167,7 @@ fn queue_user_port_packet(
             | KernelObject::Timer(_)
             | KernelObject::Interrupt(_)
             | KernelObject::DmaRegion(_)
+            | KernelObject::PciDevice(_)
             | KernelObject::Thread(_)
             | KernelObject::Vmo(_)
             | KernelObject::Vmar(_) => return Err(ZX_ERR_WRONG_TYPE),

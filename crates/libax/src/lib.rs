@@ -21,6 +21,7 @@ pub use axle_types::handle;
 pub use axle_types::interrupt;
 pub use axle_types::koid;
 pub use axle_types::packet;
+pub use axle_types::pci;
 pub use axle_types::rights;
 pub use axle_types::signals;
 pub use axle_types::socket;
@@ -31,8 +32,9 @@ pub use axle_types::wait_async;
 pub use axle_types::{
     ax_clock_t, ax_duration_t, ax_futex_t, ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_handle_t,
     ax_koid_t, ax_linux_exec_interp_header_t, ax_linux_exec_spec_header_t, ax_packet_signal_t,
-    ax_packet_type_t, ax_packet_user_t, ax_port_packet_t, ax_rights_t, ax_signals_t, ax_status_t,
-    ax_time_t, ax_vaddr_t, ax_vm_option_t,
+    ax_packet_type_t, ax_packet_user_t, ax_pci_bar_info_t, ax_pci_device_info_t,
+    ax_pci_interrupt_info_t, ax_port_packet_t, ax_rights_t, ax_signals_t, ax_status_t, ax_time_t,
+    ax_vaddr_t, ax_vm_option_t,
 };
 
 use axle_types::status::{AX_ERR_NO_MEMORY, AX_ERR_OUT_OF_RANGE, AX_OK};
@@ -516,6 +518,58 @@ pub fn ax_dma_region_lookup_paddr(
 ) -> ax_status_t {
     match narrow_handle(handle) {
         Ok(raw) => libzircon::ax_dma_region_lookup_paddr(raw, offset, out_paddr),
+        Err(status) => status,
+    }
+}
+
+/// Read one narrow PCI/device info snapshot from a device handle.
+pub fn ax_pci_device_get_info(
+    handle: ax_handle_t,
+    out_info: &mut ax_pci_device_info_t,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_pci_device_get_info(raw, out_info),
+        Err(status) => status,
+    }
+}
+
+/// Export one BAR resource from a PCI/device handle.
+pub fn ax_pci_device_get_bar(
+    handle: ax_handle_t,
+    bar_index: u32,
+    out_bar: &mut ax_pci_bar_info_t,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => {
+            let mut raw_bar = libzircon::pci::zx_pci_bar_info_t::default();
+            let status = libzircon::ax_pci_device_get_bar(raw, bar_index, &mut raw_bar);
+            if status == AX_OK {
+                out_bar.handle = widen_handle(raw_bar.handle);
+                out_bar.size = raw_bar.size;
+            }
+            status
+        }
+        Err(status) => status,
+    }
+}
+
+/// Export one interrupt resource from a PCI/device handle.
+pub fn ax_pci_device_get_interrupt(
+    handle: ax_handle_t,
+    group: u32,
+    queue_pair: u32,
+    out_interrupt: &mut ax_pci_interrupt_info_t,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => {
+            let mut raw_interrupt = libzircon::pci::zx_pci_interrupt_info_t::default();
+            let status =
+                libzircon::ax_pci_device_get_interrupt(raw, group, queue_pair, &mut raw_interrupt);
+            if status == AX_OK {
+                out_interrupt.handle = widen_handle(raw_interrupt.handle);
+            }
+            status
+        }
         Err(status) => status,
     }
 }

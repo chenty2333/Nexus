@@ -14,28 +14,27 @@ This file describes the current narrow network-dataplane bootstrap shape in the 
 
 It is not yet a full PCI transport, a full virtio-net driver, or a full userspace netstack.
 It is the first proof that the current device-facing Axle substrate is already enough to support a
-queue-owned shared-memory + interrupt dataplane in ring3.
+queue-owned shared-memory + interrupt dataplane in ring3 through one kernel-exported bootstrap
+device contract.
 
 ## Current transport slice
 
 The repository now includes one narrow ring3 `net_smoke` path built around one reusable
 `virtio_net_transport` slice in `user/test-runner` with:
 
+- one bootstrap `PciDevice` handle seeded by the kernel into the runner shared-slot window
+- one device-info query instead of one userspace-synthesized config-page discovery step
+- one BAR0 VMO exported by the kernel from that device handle
+- one interrupt-object export per queue pair and per interrupt group
 - one shared queue/buffer window allocated through `zx_vmo_create_contiguous()`
-- one dedicated register-backing page allocated through `zx_vmo_create_contiguous()`
-- one dedicated PCI-shaped config page allocated through `zx_vmo_create_contiguous()`
 - one explicit `DmaRegion` lifetime object over:
   - the queue memory
-  - the PCI config page
-  - the register page
-  - the driver-visible BAR0 physical alias
+  - the exported BAR0 VMO
 - one DMA-region address lookup through `ax_dma_region_lookup_paddr()` rather than one raw
   `ax_vmo_lookup_paddr()` handoff
-- one driver-side physical alias VMO over the PCI-shaped config page
-- one driver-side BAR0 physical VMO created only after reading that config page
-- driver mappings of the config alias and BAR0 window now request `ZX_VM_MAP_MMIO`
-- one device-side config/register backing mapping through the original contiguous VMOs
-- one MMIO-style control page carrying:
+- driver mapping of the BAR0 window now requests `ZX_VM_MAP_MMIO`
+- one second mapping of that same BAR0 export is used by the synthetic device-side worker
+- one MMIO-style BAR0 page carries:
   - device identity/version
   - feature bits plus driver-accepted feature bits
   - queue-pair count and stride metadata
@@ -50,10 +49,11 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
   - one RX-complete interrupt per queue pair
 - two user-mode worker threads acting as minimal device-side peers
 - one driver-side thread acting as the queue owner and verifier
-- one synthetic PCI-shaped discovery step:
+- one narrow kernel-exported device-resource discovery step:
   - vendor/device/class fields
-  - BAR0 physical address and size
-  - queue-pair count and queue size metadata
+  - BAR count, queue-pair count, and queue size metadata
+  - BAR0 VMO export
+  - per-queue interrupt export
 
 ## Current queue shape
 
@@ -82,7 +82,7 @@ Ownership is intentionally one-writer-per-substructure:
 
 The current smoke now completes one batched transport round:
 
-- one PCI-shaped config read plus BAR0 discovery
+- one `PciDevice` info query plus BAR0 export
 - one MMIO-style ready/feature/queue-ready handshake
 - one four-packet TX publish on each queue pair
 - one TX kick interrupt per queue pair
@@ -98,8 +98,8 @@ than treating networking as "stream socket but faster".
 The current bootstrap slice proves three things:
 
 1. The current public `InterruptObject` + contiguous/physical VMO surface is sufficient to drive one
-   user-mode shared-memory dataplane loop with one PCI-shaped config page, one BAR0 register
-   window, and one first narrow public MMIO mapping attribute bit.
+   user-mode shared-memory dataplane loop with one kernel-exported device handle, one BAR0
+   register window, and one first narrow public MMIO mapping attribute bit.
 2. Queue-owned multi-queue transport can already be exercised without inventing a kernel-resident
    network stack.
 3. The current `DmaRegion` object is already enough to express one explicit DMA lifetime contract
@@ -110,7 +110,7 @@ The current bootstrap slice proves three things:
 
 - no PCI bus enumeration
 - no real PCI config space or BAR management contract from the kernel
-- no public PCI resource-export contract yet
+- no generic PCI enumeration or config-space ABI yet; only one narrow resource-export object
 - no MMIO cache-policy / mapping-attribute controls beyond the first narrow `ZX_VM_MAP_MMIO` bit
 - no DMA map/unmap or IOVA model yet
 - no MSI/MSI-X or hardware IRQ routing
@@ -124,7 +124,7 @@ The current bootstrap slice proves three things:
 - Treat the current `net_smoke` as a device-substrate proof plus one reusable transport slice, not
   as the final driver shape.
 - Keep the next net cuts focused on:
-  - moving from the current synthetic PCI-shaped config page to a real PCI-backed config source
+  - moving from the current bootstrap `PciDevice` export object to a fuller PCI resource model
   - keeping queue memory and control windows on explicit `DmaRegion` lifetime objects
   - queue ownership
   - interrupt/kick/completion batching

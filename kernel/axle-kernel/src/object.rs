@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub(crate) mod device;
 pub(crate) mod guest;
 pub(crate) mod handle;
 pub(crate) mod process;
@@ -75,6 +76,8 @@ pub enum ObjectKind {
     Interrupt,
     /// DMA region object.
     DmaRegion,
+    /// PCI/device resource object.
+    PciDevice,
     /// Supervised guest-session object.
     GuestSession,
     /// VMO object.
@@ -829,6 +832,7 @@ pub(crate) enum KernelObject {
     Timer(TimerObject),
     Interrupt(InterruptObject),
     DmaRegion(DmaRegionObject),
+    PciDevice(device::PciDeviceObject),
     Vmo(VmoObject),
     Vmar(VmarObject),
     Thread(ThreadObject),
@@ -899,6 +903,7 @@ pub(crate) struct ObjectRegistry {
     bootstrap_controller_worker_code_vmo_handle: zx_handle_t,
     bootstrap_starnix_kernel_code_vmo_handle: zx_handle_t,
     bootstrap_linux_hello_code_vmo_handle: zx_handle_t,
+    bootstrap_net_pci_device_handle: zx_handle_t,
     bootstrap_process_image_layout: crate::task::ProcessImageLayout,
 }
 
@@ -918,6 +923,7 @@ impl ObjectRegistry {
             bootstrap_controller_worker_code_vmo_handle: 0,
             bootstrap_starnix_kernel_code_vmo_handle: 0,
             bootstrap_linux_hello_code_vmo_handle: 0,
+            bootstrap_net_pci_device_handle: 0,
             bootstrap_process_image_layout: crate::task::ProcessImageLayout::bootstrap_conformance(
             ),
         }
@@ -1432,6 +1438,9 @@ impl KernelState {
                 Ok(())
             })
             .expect("bootstrap component image handle publish must succeed");
+
+        device::seed_bootstrap_net_pci_device(&state)
+            .expect("bootstrap net pci device handle publish must succeed");
 
         state
     }
@@ -2330,6 +2339,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
                 | Some(KernelObject::EventPair(_))
                 | Some(KernelObject::Port(_))
                 | Some(KernelObject::Interrupt(_))
+                | Some(KernelObject::PciDevice(_))
                 | Some(KernelObject::DmaRegion(_))
                 | Some(KernelObject::Thread(_))
                 | Some(KernelObject::Vmo(_))
@@ -2372,6 +2382,7 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
                 | Some(KernelObject::EventPair(_))
                 | Some(KernelObject::Port(_))
                 | Some(KernelObject::Interrupt(_))
+                | Some(KernelObject::PciDevice(_))
                 | Some(KernelObject::DmaRegion(_))
                 | Some(KernelObject::Thread(_))
                 | Some(KernelObject::Vmo(_))
@@ -2411,6 +2422,7 @@ enum CloseHandleAction {
     Timer,
     Interrupt,
     DmaRegion,
+    PciDevice,
     Vmo,
     Vmar,
 }
@@ -2436,6 +2448,7 @@ fn close_handle_action_for_live_object(object: &KernelObject) -> CloseHandleActi
         KernelObject::Timer(_) => CloseHandleAction::Timer,
         KernelObject::Interrupt(_) => CloseHandleAction::Interrupt,
         KernelObject::DmaRegion(_) => CloseHandleAction::DmaRegion,
+        KernelObject::PciDevice(_) => CloseHandleAction::PciDevice,
         KernelObject::Vmo(_) => CloseHandleAction::Vmo,
         KernelObject::Vmar(_) => CloseHandleAction::Vmar,
         KernelObject::Process(_) | KernelObject::Thread(_) => CloseHandleAction::None,
@@ -2617,6 +2630,18 @@ fn finalize_last_handle_close(
             state.finish_logical_destroy(object_key);
             result
         }
+        CloseHandleAction::PciDevice => {
+            let removed = state.begin_logical_destroy(object_key)?;
+            let result = match removed {
+                KernelObject::PciDevice(device) => {
+                    device::release_pci_device_resources(state, device);
+                    Ok(())
+                }
+                _ => Err(ZX_ERR_BAD_STATE),
+            };
+            state.finish_logical_destroy(object_key);
+            result
+        }
         CloseHandleAction::Vmo | CloseHandleAction::Vmar => {
             let _ = state.begin_logical_destroy(object_key)?;
             state.finish_logical_destroy(object_key);
@@ -2716,6 +2741,17 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                         region.pin.frame_ids().len(),
                     );
                     ObjectKind::DmaRegion
+                }
+                KernelObject::PciDevice(device) => {
+                    let _ = (
+                        device.vendor_id,
+                        device.device_id,
+                        device.bar0_object.object_id(),
+                        device.bar0_backing_object.object_id(),
+                        device.queue_pairs,
+                        device.queue_size,
+                    );
+                    ObjectKind::PciDevice
                 }
                 KernelObject::Vmo(vmo) => {
                     let _ = (
@@ -2842,9 +2878,10 @@ pub(crate) fn signals_for_object_id(
                 })
             }
             KernelObject::Interrupt(interrupt) => Ok(interrupt.signals()),
-            KernelObject::DmaRegion(_) | KernelObject::Vmo(_) | KernelObject::Vmar(_) => {
-                Ok(Signals::NONE)
-            }
+            KernelObject::DmaRegion(_)
+            | KernelObject::PciDevice(_)
+            | KernelObject::Vmo(_)
+            | KernelObject::Vmar(_) => Ok(Signals::NONE),
         }
     })
 }

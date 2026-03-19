@@ -271,6 +271,12 @@ pub(super) fn dma_region_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::INSPECT
 }
 
+pub(super) fn pci_device_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::INSPECT
+}
+
 pub(super) fn vmo_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER

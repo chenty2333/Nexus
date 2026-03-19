@@ -103,6 +103,11 @@ What is not complete yet:
 
 Current state:
 
+- one narrow bootstrap `PciDevice` contract is now public:
+  - kernel seeds one device handle into the bootstrap runner shared-slot window
+  - `ax_pci_device_get_info()` exports one immutable resource summary
+  - `ax_pci_device_get_bar()` exports one BAR VMO handle
+  - `ax_pci_device_get_interrupt()` exports one interrupt-object handle per queue-pair/group
 - `zx_vmo_create_physical(base_paddr, size, 0, out)` is now public and creates a shared
   physical/MMIO-style VMO over an existing page-aligned physical span.
 - `zx_vmo_create_contiguous(size, 0, out)` is now public and creates a shared contiguous VMO.
@@ -119,6 +124,8 @@ Current state:
 
 What is still intentionally narrow:
 
+- the current `PciDevice` object is one bootstrap resource-export object, not yet a generic PCI bus
+  or config-space ABI
 - the current pin contract is one direct VMO -> `DmaRegion` path, not yet a fuller BTI/grant
   object model
 - only physical and contiguous VMOs may currently be pinned
@@ -138,7 +145,7 @@ What is still intentionally narrow:
   shared read-only source plus mapping-local private shadow on write.
 - Treat the current physical / contiguous / interrupt surface as one minimal device-facing substrate:
   enough for bootstrap smoke, the current queue-owned user-mode net dataplane slice, the current
-  synthetic PCI-shaped config + BAR0 transport smoke, the now-explicit `DmaRegion`-backed queue
-  and control-window lifetime slice, the first MMIO-attributed driver BAR/config mappings, future
+  bootstrap `PciDevice` + BAR0 transport smoke, the now-explicit `DmaRegion`-backed queue
+  and control-window lifetime slice, the first MMIO-attributed driver BAR mappings, future
   user-mode virtio transport work, and later
   DMA/IOMMU integration, but not yet the final DFv2 device contract.

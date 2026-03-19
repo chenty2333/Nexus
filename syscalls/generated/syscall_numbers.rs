@@ -120,3 +120,9 @@ pub const AXLE_SYS_AX_VMO_LOOKUP_PADDR: SyscallNumber = 56;
 pub const AXLE_SYS_AX_VMO_PIN: SyscallNumber = 57;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR: SyscallNumber = 58;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_PCI_DEVICE_GET_INFO: SyscallNumber = 59;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_PCI_DEVICE_GET_BAR: SyscallNumber = 60;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT: SyscallNumber = 61;

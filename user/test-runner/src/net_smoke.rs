@@ -7,31 +7,36 @@ use crate::virtio_net_transport::{
     BUFFER_STRIDE, MMIO_DEVICE_ID_NET, MMIO_FEATURE_CSUM, MMIO_INTERRUPT_RX_COMPLETE, MMIO_MAGIC,
     MMIO_NOTIFY_RX, MMIO_NOTIFY_TX, MMIO_STATUS_ACKNOWLEDGE, MMIO_STATUS_DRIVER,
     MMIO_STATUS_DRIVER_OK, MMIO_STATUS_FEATURES_OK, MMIO_VENDOR_ID_AXLE, MMIO_VERSION, PAGE_SIZE,
-    PCI_CLASS_NETWORK, PCI_DEVICE_ID_NET, PCI_SUBCLASS_ETHERNET, PCI_VENDOR_ID_AXLE, PciConfigPage,
+    PCI_CLASS_NETWORK, PCI_DEVICE_ID_NET, PCI_SUBCLASS_ETHERNET, PCI_VENDOR_ID_AXLE,
     QUEUE_PAIR_COUNT, QUEUE_SIZE, QUEUE_VMO_BYTES, REGISTER_VMO_BYTES, VirtioNetHdr,
     VirtioQueueRegs, VirtqDesc, buffer_offset, buffer_paddr, empty_avail, empty_used, frame_len,
-    init_pci_config, init_regs, read_avail, read_header, read_pci_config, read_queue_regs,
-    read_used, rx_buffer_offset, rx_queue_offset, tx_buffer_offset, tx_queue_offset, write_avail,
-    write_desc, write_header, write_queue_regs, write_used,
+    init_regs, read_avail, read_header, read_queue_regs, read_used, rx_buffer_offset,
+    rx_queue_offset, tx_buffer_offset, tx_queue_offset, write_avail, write_desc, write_header,
+    write_queue_regs, write_used,
 };
 use axle_arch_x86_64::{debug_break, native_syscall8, rdtsc};
 use libzircon::handle::ZX_HANDLE_INVALID;
-use libzircon::interrupt::ZX_INTERRUPT_VIRTUAL;
+use libzircon::pci::{
+    ZX_PCI_INTERRUPT_GROUP_READY, ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
+    ZX_PCI_INTERRUPT_GROUP_TX_KICK, zx_pci_bar_info_t, zx_pci_device_info_t,
+    zx_pci_interrupt_info_t,
+};
 use libzircon::signals::{ZX_INTERRUPT_SIGNALED, ZX_TASK_TERMINATED};
 use libzircon::status::ZX_OK;
 use libzircon::syscall_numbers::AXLE_SYS_VMAR_MAP;
 use libzircon::vm::{ZX_VM_MAP_MMIO, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
-    ax_dma_region_lookup_paddr, ax_interrupt_trigger, ax_vmo_pin, zx_handle_close, zx_handle_t,
-    zx_interrupt_ack, zx_interrupt_create, zx_object_wait_one, zx_signals_t, zx_status_t,
-    zx_task_kill, zx_thread_create, zx_thread_start, zx_vmo_create_contiguous,
-    zx_vmo_create_physical,
+    ax_dma_region_lookup_paddr, ax_interrupt_trigger, ax_pci_device_get_bar,
+    ax_pci_device_get_info, ax_pci_device_get_interrupt, ax_vmo_pin, zx_handle_close, zx_handle_t,
+    zx_interrupt_ack, zx_object_wait_one, zx_signals_t, zx_status_t, zx_task_kill,
+    zx_thread_create, zx_thread_start, zx_vmo_create_contiguous,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
 const SLOT_OK: usize = 0;
 const SLOT_ROOT_VMAR_H: usize = 62;
 const SLOT_SELF_PROCESS_H: usize = 396;
+const SLOT_BOOTSTRAP_NET_PCI_DEVICE_H: usize = 648;
 const SLOT_T0_NS: usize = 511;
 
 const SLOT_NET_FAILURE_STEP: usize = 928;
@@ -102,18 +107,10 @@ const STEP_SELF_PROCESS: u64 = 2;
 const STEP_READY_IRQ_CREATE: u64 = 3;
 const STEP_TX_IRQ_CREATE: u64 = 4;
 const STEP_RX_IRQ_CREATE: u64 = 5;
-const STEP_REG_BACKING_CREATE: u64 = 6;
-const STEP_REG_PIN_CREATE: u64 = 7;
-const STEP_REG_DMA_LOOKUP: u64 = 8;
 const STEP_REG_BACKING_MAP: u64 = 9;
 const STEP_CONFIG_BACKING_CREATE: u64 = 10;
 const STEP_CONFIG_PIN_CREATE: u64 = 11;
-const STEP_CONFIG_DMA_LOOKUP: u64 = 12;
-const STEP_CONFIG_ALIAS_CREATE: u64 = 13;
-const STEP_CONFIG_ALIAS_PIN_CREATE: u64 = 14;
 const STEP_CONFIG_ALIAS_DMA_LOOKUP: u64 = 15;
-const STEP_CONFIG_ALIAS_MAP: u64 = 16;
-const STEP_CONFIG_BACKING_MAP: u64 = 17;
 const STEP_QUEUE_VMO_CREATE: u64 = 18;
 const STEP_QUEUE_PIN_CREATE: u64 = 19;
 const STEP_QUEUE_DMA_LOOKUP: u64 = 20;
@@ -244,17 +241,12 @@ static mut NET_WORKER_STACKS: [WorkerStack; QUEUE_PAIR_COUNT] =
     [WorkerStack([0; WORKER_STACK_BYTES]); QUEUE_PAIR_COUNT];
 static mut HEAP: HeapStorage = HeapStorage([0; HEAP_BYTES]);
 
-const OWNED_REG_BACKING: usize = 0;
-const OWNED_REG_DMA: usize = 1;
-const OWNED_CONFIG_BACKING: usize = 2;
-const OWNED_CONFIG_DMA: usize = 3;
-const OWNED_CONFIG_ALIAS: usize = 4;
-const OWNED_CONFIG_ALIAS_DMA: usize = 5;
-const OWNED_QUEUE_VMO: usize = 6;
-const OWNED_QUEUE_DMA: usize = 7;
-const OWNED_BAR0_VMO: usize = 8;
-const OWNED_BAR0_DMA: usize = 9;
-const OWNED_HANDLE_COUNT: usize = 10;
+const OWNED_PCI_DEVICE: usize = 0;
+const OWNED_QUEUE_VMO: usize = 1;
+const OWNED_QUEUE_DMA: usize = 2;
+const OWNED_BAR0_VMO: usize = 3;
+const OWNED_BAR0_DMA: usize = 4;
+const OWNED_HANDLE_COUNT: usize = 5;
 
 // SAFETY: this allocator serves only the single-process bootstrap smoke. It
 // monotonically carves aligned ranges from one fixed static buffer and never
@@ -330,82 +322,138 @@ fn run_net_smoke() -> NetSummary {
         return summary;
     }
     let mut owned_handles = [ZX_HANDLE_INVALID; OWNED_HANDLE_COUNT];
+    owned_handles[OWNED_PCI_DEVICE] = read_slot(SLOT_BOOTSTRAP_NET_PCI_DEVICE_H) as zx_handle_t;
+    if owned_handles[OWNED_PCI_DEVICE] == ZX_HANDLE_INVALID {
+        summary.failure_step = STEP_CONFIG_BACKING_CREATE;
+        return summary;
+    }
+
+    let mut pci_info = zx_pci_device_info_t::default();
+    summary.config_pin_create =
+        ax_pci_device_get_info(owned_handles[OWNED_PCI_DEVICE], &mut pci_info) as i64;
+    if summary.config_pin_create != ZX_OK as i64 {
+        summary.failure_step = STEP_CONFIG_PIN_CREATE;
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    }
+    summary.pci_vendor_id = u64::from(pci_info.vendor_id);
+    summary.config_alias_match = u64::from(
+        pci_info.vendor_id == PCI_VENDOR_ID_AXLE
+            && pci_info.device_id == PCI_DEVICE_ID_NET
+            && pci_info.class_code == PCI_CLASS_NETWORK
+            && pci_info.subclass == PCI_SUBCLASS_ETHERNET
+            && pci_info.device_features == MMIO_FEATURE_CSUM
+            && pci_info.queue_pairs == QUEUE_PAIR_COUNT as u32
+            && pci_info.queue_size == QUEUE_SIZE as u32
+            && pci_info.bar_count == 1,
+    );
+    if summary.config_alias_match != 1 {
+        summary.failure_step = STEP_CONFIG_ALIAS_DMA_LOOKUP;
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    }
 
     let mut ready_irqs = [ZX_HANDLE_INVALID; QUEUE_PAIR_COUNT];
-    for ready_irq in &mut ready_irqs {
-        let status = zx_interrupt_create(ZX_INTERRUPT_VIRTUAL, ready_irq) as i64;
+    for (pair, ready_irq) in ready_irqs.iter_mut().enumerate() {
+        let mut info = zx_pci_interrupt_info_t::default();
+        let status = ax_pci_device_get_interrupt(
+            owned_handles[OWNED_PCI_DEVICE],
+            ZX_PCI_INTERRUPT_GROUP_READY,
+            pair as u32,
+            &mut info,
+        ) as i64;
         aggregate_status(&mut summary.ready_irq_create, status);
         if status != ZX_OK as i64 {
             summary.failure_step = STEP_READY_IRQ_CREATE;
             close_handles(&ready_irqs);
+            close_handle_sets(&[], &owned_handles);
             return summary;
         }
+        *ready_irq = info.handle;
     }
 
     let mut tx_irqs = [ZX_HANDLE_INVALID; QUEUE_PAIR_COUNT];
-    for tx_irq in &mut tx_irqs {
-        let status = zx_interrupt_create(ZX_INTERRUPT_VIRTUAL, tx_irq) as i64;
+    for (pair, tx_irq) in tx_irqs.iter_mut().enumerate() {
+        let mut info = zx_pci_interrupt_info_t::default();
+        let status = ax_pci_device_get_interrupt(
+            owned_handles[OWNED_PCI_DEVICE],
+            ZX_PCI_INTERRUPT_GROUP_TX_KICK,
+            pair as u32,
+            &mut info,
+        ) as i64;
         aggregate_status(&mut summary.tx_irq_create, status);
         if status != ZX_OK as i64 {
             summary.failure_step = STEP_TX_IRQ_CREATE;
             close_handles(&tx_irqs);
             close_handles(&ready_irqs);
+            close_handle_sets(&[], &owned_handles);
             return summary;
         }
+        *tx_irq = info.handle;
     }
 
     let mut rx_irqs = [ZX_HANDLE_INVALID; QUEUE_PAIR_COUNT];
-    for rx_irq in &mut rx_irqs {
-        let status = zx_interrupt_create(ZX_INTERRUPT_VIRTUAL, rx_irq) as i64;
+    for (pair, rx_irq) in rx_irqs.iter_mut().enumerate() {
+        let mut info = zx_pci_interrupt_info_t::default();
+        let status = ax_pci_device_get_interrupt(
+            owned_handles[OWNED_PCI_DEVICE],
+            ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
+            pair as u32,
+            &mut info,
+        ) as i64;
         aggregate_status(&mut summary.rx_irq_create, status);
         if status != ZX_OK as i64 {
             summary.failure_step = STEP_RX_IRQ_CREATE;
             close_handles(&rx_irqs);
             close_handles(&tx_irqs);
             close_handles(&ready_irqs);
+            close_handle_sets(&[], &owned_handles);
             return summary;
         }
+        *rx_irq = info.handle;
     }
 
-    summary.reg_backing_create =
-        zx_vmo_create_contiguous(REGISTER_VMO_BYTES, 0, &mut owned_handles[OWNED_REG_BACKING])
-            as i64;
-    if summary.reg_backing_create != ZX_OK as i64 {
-        summary.failure_step = STEP_REG_BACKING_CREATE;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &[]);
+    let mut pci_bar = zx_pci_bar_info_t::default();
+    summary.bar0_create =
+        ax_pci_device_get_bar(owned_handles[OWNED_PCI_DEVICE], 0, &mut pci_bar) as i64;
+    if summary.bar0_create != ZX_OK as i64 {
+        summary.failure_step = STEP_BAR0_CREATE;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
+    owned_handles[OWNED_BAR0_VMO] = pci_bar.handle;
 
-    summary.reg_pin_create = ax_vmo_pin(
-        owned_handles[OWNED_REG_BACKING],
+    summary.bar0_pin_create = ax_vmo_pin(
+        owned_handles[OWNED_BAR0_VMO],
         0,
-        REGISTER_VMO_BYTES,
+        pci_bar.size,
         0,
-        &mut owned_handles[OWNED_REG_DMA],
+        &mut owned_handles[OWNED_BAR0_DMA],
     ) as i64;
-    if summary.reg_pin_create != ZX_OK as i64 {
-        summary.failure_step = STEP_REG_PIN_CREATE;
+    if summary.bar0_pin_create != ZX_OK as i64 {
+        summary.failure_step = STEP_BAR0_PIN_CREATE;
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
 
-    let mut reg_paddr = 0u64;
-    summary.reg_dma_lookup =
-        ax_dma_region_lookup_paddr(owned_handles[OWNED_REG_DMA], 0, &mut reg_paddr) as i64;
-    if summary.reg_dma_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_REG_DMA_LOOKUP;
+    let mut bar0_paddr = 0u64;
+    summary.bar0_dma_lookup =
+        ax_dma_region_lookup_paddr(owned_handles[OWNED_BAR0_DMA], 0, &mut bar0_paddr) as i64;
+    if summary.bar0_dma_lookup != ZX_OK as i64 {
+        summary.failure_step = STEP_BAR0_DMA_LOOKUP;
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
+    summary.bar0_match = u64::from(pci_bar.size == REGISTER_VMO_BYTES && bar0_paddr != 0);
 
     let mut reg_device_base = 0u64;
     summary.reg_backing_map = zx_vmar_map_local(
         root_vmar,
         ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
         0,
-        owned_handles[OWNED_REG_BACKING],
+        owned_handles[OWNED_BAR0_VMO],
         0,
-        REGISTER_VMO_BYTES,
+        pci_bar.size,
         &mut reg_device_base,
     ) as i64;
     if summary.reg_backing_map != ZX_OK as i64 {
@@ -413,109 +461,7 @@ fn run_net_smoke() -> NetSummary {
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
-
-    summary.config_backing_create =
-        zx_vmo_create_contiguous(PAGE_SIZE, 0, &mut owned_handles[OWNED_CONFIG_BACKING]) as i64;
-    if summary.config_backing_create != ZX_OK as i64 {
-        summary.failure_step = STEP_CONFIG_BACKING_CREATE;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
-        return summary;
-    }
-
-    summary.config_pin_create = ax_vmo_pin(
-        owned_handles[OWNED_CONFIG_BACKING],
-        0,
-        PAGE_SIZE,
-        0,
-        &mut owned_handles[OWNED_CONFIG_DMA],
-    ) as i64;
-    if summary.config_pin_create != ZX_OK as i64 {
-        summary.failure_step = STEP_CONFIG_PIN_CREATE;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
-        return summary;
-    }
-
-    let mut config_paddr = 0u64;
-    summary.config_dma_lookup =
-        ax_dma_region_lookup_paddr(owned_handles[OWNED_CONFIG_DMA], 0, &mut config_paddr) as i64;
-    if summary.config_dma_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_CONFIG_DMA_LOOKUP;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
-        return summary;
-    }
-
-    summary.config_alias_create = zx_vmo_create_physical(
-        config_paddr,
-        PAGE_SIZE,
-        0,
-        &mut owned_handles[OWNED_CONFIG_ALIAS],
-    ) as i64;
-    if summary.config_alias_create != ZX_OK as i64 {
-        summary.failure_step = STEP_CONFIG_ALIAS_CREATE;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
-        return summary;
-    }
-
-    summary.config_alias_pin_create = ax_vmo_pin(
-        owned_handles[OWNED_CONFIG_ALIAS],
-        0,
-        PAGE_SIZE,
-        0,
-        &mut owned_handles[OWNED_CONFIG_ALIAS_DMA],
-    ) as i64;
-    if summary.config_alias_pin_create != ZX_OK as i64 {
-        summary.failure_step = STEP_CONFIG_ALIAS_PIN_CREATE;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
-        return summary;
-    }
-
-    let mut config_alias_paddr = 0u64;
-    summary.config_alias_dma_lookup = ax_dma_region_lookup_paddr(
-        owned_handles[OWNED_CONFIG_ALIAS_DMA],
-        0,
-        &mut config_alias_paddr,
-    ) as i64;
-    if summary.config_alias_dma_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_CONFIG_ALIAS_DMA_LOOKUP;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
-        return summary;
-    }
-    summary.config_alias_match = u64::from(config_alias_paddr == config_paddr);
-
-    let mut config_driver_base = 0u64;
-    summary.config_alias_map = zx_vmar_map_local(
-        root_vmar,
-        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_MAP_MMIO,
-        0,
-        owned_handles[OWNED_CONFIG_ALIAS],
-        0,
-        PAGE_SIZE,
-        &mut config_driver_base,
-    ) as i64;
-    if summary.config_alias_map != ZX_OK as i64 {
-        summary.failure_step = STEP_CONFIG_ALIAS_MAP;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
-        return summary;
-    }
-
-    let mut config_device_base = 0u64;
-    summary.config_backing_map = zx_vmar_map_local(
-        root_vmar,
-        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
-        0,
-        owned_handles[OWNED_CONFIG_BACKING],
-        0,
-        PAGE_SIZE,
-        &mut config_device_base,
-    ) as i64;
-    if summary.config_backing_map != ZX_OK as i64 {
-        summary.failure_step = STEP_CONFIG_BACKING_MAP;
-        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
-        return summary;
-    }
-
     init_regs(reg_device_base);
-    init_pci_config(config_device_base, reg_paddr);
 
     summary.queue_vmo_create =
         zx_vmo_create_contiguous(QUEUE_VMO_BYTES, 0, &mut owned_handles[OWNED_QUEUE_VMO]) as i64;
@@ -564,17 +510,13 @@ fn run_net_smoke() -> NetSummary {
     }
     init_transport_memory(mapped_queue_base);
 
-    let config = read_pci_config(config_driver_base);
-    summary.pci_vendor_id = u64::from(config.vendor_id);
-    let (_bar0_vmo, bar0_paddr, reg_driver_base) =
-        match map_driver_bar0(root_vmar, config, &mut summary, &mut owned_handles) {
-            Some(values) => values,
-            None => {
-                close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
-                return summary;
-            }
-        };
-    summary.bar0_match = u64::from(bar0_paddr == config.bar0_paddr);
+    let reg_driver_base = match map_driver_bar0(root_vmar, pci_bar, &mut summary, &owned_handles) {
+        Some(base) => base,
+        None => {
+            close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
+            return summary;
+        }
+    };
 
     NET_REG_DEVICE_BASE.store(reg_device_base, Ordering::Release);
     NET_QUEUE_BASE.store(mapped_queue_base, Ordering::Release);
@@ -659,7 +601,7 @@ fn run_net_smoke() -> NetSummary {
         }
     }
 
-    if !configure_driver_transport(reg_driver_base, &mut summary, config) {
+    if !configure_driver_transport(reg_driver_base, &mut summary, pci_info) {
         summary.failure_step = STEP_MMIO_READY;
         close_workers_and_handles(
             &worker_threads,
@@ -816,51 +758,12 @@ fn run_net_smoke() -> NetSummary {
 
 fn map_driver_bar0(
     root_vmar: zx_handle_t,
-    config: PciConfigPage,
+    bar: zx_pci_bar_info_t,
     summary: &mut NetSummary,
-    owned_handles: &mut [zx_handle_t; OWNED_HANDLE_COUNT],
-) -> Option<(zx_handle_t, u64, u64)> {
-    if config.vendor_id != PCI_VENDOR_ID_AXLE
-        || config.device_id != PCI_DEVICE_ID_NET
-        || config.class_code != PCI_CLASS_NETWORK
-        || config.subclass != PCI_SUBCLASS_ETHERNET
-        || config.bar0_size != REGISTER_VMO_BYTES as u32
-        || config.device_features != MMIO_FEATURE_CSUM
-        || config.queue_pairs != QUEUE_PAIR_COUNT as u32
-        || config.queue_size != QUEUE_SIZE as u32
-    {
-        summary.failure_step = STEP_CONFIG_ALIAS_DMA_LOOKUP;
-        return None;
-    }
-
-    summary.bar0_create = zx_vmo_create_physical(
-        config.bar0_paddr,
-        u64::from(config.bar0_size),
-        0,
-        &mut owned_handles[OWNED_BAR0_VMO],
-    ) as i64;
-    if summary.bar0_create != ZX_OK as i64 {
+    owned_handles: &[zx_handle_t; OWNED_HANDLE_COUNT],
+) -> Option<u64> {
+    if bar.handle == ZX_HANDLE_INVALID || bar.size != REGISTER_VMO_BYTES {
         summary.failure_step = STEP_BAR0_CREATE;
-        return None;
-    }
-
-    summary.bar0_pin_create = ax_vmo_pin(
-        owned_handles[OWNED_BAR0_VMO],
-        0,
-        u64::from(config.bar0_size),
-        0,
-        &mut owned_handles[OWNED_BAR0_DMA],
-    ) as i64;
-    if summary.bar0_pin_create != ZX_OK as i64 {
-        summary.failure_step = STEP_BAR0_PIN_CREATE;
-        return None;
-    }
-
-    let mut bar0_paddr = 0u64;
-    summary.bar0_dma_lookup =
-        ax_dma_region_lookup_paddr(owned_handles[OWNED_BAR0_DMA], 0, &mut bar0_paddr) as i64;
-    if summary.bar0_dma_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_BAR0_DMA_LOOKUP;
         return None;
     }
 
@@ -871,7 +774,7 @@ fn map_driver_bar0(
         0,
         owned_handles[OWNED_BAR0_VMO],
         0,
-        u64::from(config.bar0_size),
+        bar.size,
         &mut bar0_driver_base,
     ) as i64;
     if summary.bar0_map != ZX_OK as i64 {
@@ -879,23 +782,23 @@ fn map_driver_bar0(
         return None;
     }
 
-    Some((owned_handles[OWNED_BAR0_VMO], bar0_paddr, bar0_driver_base))
+    Some(bar0_driver_base)
 }
 
 fn configure_driver_transport(
     reg_base: u64,
     summary: &mut NetSummary,
-    config: PciConfigPage,
+    info: zx_pci_device_info_t,
 ) -> bool {
     let header = read_header(reg_base);
-    let expected_device_features = config.device_features;
+    let expected_device_features = info.device_features;
     if header.magic != MMIO_MAGIC
         || header.version != MMIO_VERSION
         || header.device_id != MMIO_DEVICE_ID_NET
         || header.vendor_id != MMIO_VENDOR_ID_AXLE
         || header.device_features != expected_device_features
-        || header.queue_pairs != QUEUE_PAIR_COUNT as u32
-        || header.queue_size != QUEUE_SIZE as u32
+        || header.queue_pairs != info.queue_pairs
+        || header.queue_size != info.queue_size
     {
         return false;
     }
