@@ -24,6 +24,7 @@ use self::fs::unix::{
     read_guest_msghdr, scm_rights_control_bytes, total_iovec_len, write_guest_iovec_payload,
     write_guest_recv_msghdr,
 };
+use self::mm::context::{LinuxMm, LinuxWritableRange};
 #[allow(unused_imports)]
 pub(in crate::starnix) use self::mm::exec::{
     LinuxElf, LinuxLoadSegment, LinuxTlsSegment, PreparedLinuxStack,
@@ -32,7 +33,6 @@ use self::mm::exec::{
     TaskImage, build_task_image, open_exec_image_from_namespace,
     read_exec_image_bytes_from_namespace, read_guest_string_array,
 };
-use self::mm::mmap::{LinuxMm, LinuxWritableRange};
 use self::poll::epoll::EpollInstance;
 use self::poll::readiness::filter_wait_interest;
 use self::signal::action::{
