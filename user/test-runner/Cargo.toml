@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 axle-arch-x86_64 = { path = "../../crates/axle-arch-x86_64", default-features = false }
 axle-types = { path = "../../crates/axle-types", default-features = false }
+axle-virtio-transport = { path = "../../crates/axle-virtio-transport", default-features = false }
 libzircon = { path = "../../crates/libzircon", default-features = false }
 nexus-component = { path = "../../crates/nexus-component", default-features = false }
 nexus-init = { path = "../nexus-init", default-features = false }

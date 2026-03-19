@@ -1,0 +1,16 @@
+url = "boot://root-net-dataplane"
+startup = "eager"
+
+[program]
+runner = "elf"
+binary = "bin/nexus-init"
+args = ["nexus-init"]
+env = []
+
+[[use]]
+kind = "resolver"
+name = "boot-resolver"
+
+[[use]]
+kind = "runner"
+name = "elf"

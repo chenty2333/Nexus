@@ -540,6 +540,7 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - process / thread behavior
   - SMP smoke
   - VM fault contention and loan/COW paths
+  - Nexus root-manager bring-up slices
   - staged Starnix bootstrap/runtime slices, including dynamic ELF and libc/runtime follow-on gates
 
 ## Runner model
@@ -610,6 +611,14 @@ This makes contract coverage part of the repo workflow, not just informal docume
     - contiguous VMO creation, physical-address lookup, and contiguity check
     - contiguous VMO pin into one `DmaRegion` object with explicit DMA permission bits plus
       pinned-range paddr lookup
+- The narrow net dataplane transport now has two conformance shapes:
+  - `kernel.runtime.net_dataplane_bootstrap`
+    - boots `nexus-test-runner` directly into the current queue-owned net smoke entrypoint
+  - `kernel.runtime.net_dataplane_nexus_bootstrap`
+    - boots `nexus-init` with `NEXUS_INIT_ROOT_URL=boot://root-net-dataplane`
+    - verifies that the same synthetic PCI-shaped transport and `DmaRegion`-backed queue memory
+      can be consumed through the current Nexus root bootstrap path rather than only through the
+      dedicated test runner
     - physical VMO aliasing over an existing contiguous page
     - physical VMO pin into one `DmaRegion` object with explicit DMA permission bits plus
       pinned-range paddr lookup

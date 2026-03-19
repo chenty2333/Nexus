@@ -9,6 +9,7 @@ extern crate alloc;
 mod fs;
 mod lifecycle;
 mod namespace;
+mod net;
 mod resolver;
 mod runner;
 mod services;
@@ -53,7 +54,9 @@ const USER_CODE_PAGE_COUNT: u64 = 4096;
 const USER_CODE_BASE: u64 = 0x0000_0001_0000_0000;
 const USER_SHARED_BASE: u64 = USER_CODE_BASE + (USER_PAGE_BYTES * USER_CODE_PAGE_COUNT);
 const SLOT_OK: usize = 0;
+pub(crate) const SLOT_ROOT_VMAR_H: usize = 62;
 const SLOT_SELF_PROCESS_H: usize = 396;
+pub(crate) const SLOT_T0_NS: usize = 511;
 const SLOT_SELF_CODE_VMO_H: usize = 506;
 const SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H: usize = 604;
 const SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H: usize = 605;
@@ -207,6 +210,10 @@ const ROOT_DECL_STARNIX_DYNAMIC_PIE_BYTES: &[u8] = include_bytes!(concat!(
 const ROOT_DECL_STARNIX_GLIBC_HELLO_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_glibc_hello.nxcd"
+));
+const ROOT_DECL_NET_DATAPLANE_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_net_dataplane.nxcd"
 ));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
@@ -639,9 +646,10 @@ struct BumpAllocator;
 #[global_allocator]
 static ALLOCATOR: BumpAllocator = BumpAllocator;
 
-// SAFETY: this allocator serves the single-threaded bootstrap component smoke in
-// one process at a time. Allocations come from one fixed static buffer,
-// deallocation is a no-op, and alignment is preserved by monotonic bumping.
+// SAFETY: this allocator serves one bootstrap userspace process at a time from
+// one fixed static buffer. Allocation is synchronized by the atomic bump
+// pointer, deallocation is a no-op, and alignment is preserved by monotonic
+// bumping.
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let align_mask = layout.align().saturating_sub(1);
@@ -1128,6 +1136,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-glibc-hello.nxcd",
         ROOT_DECL_STARNIX_GLIBC_HELLO_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-net-dataplane.nxcd",
+        ROOT_DECL_NET_DATAPLANE_BYTES,
     ));
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
@@ -1645,6 +1657,9 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             STARNIX_GLIBC_HELLO_EXPECTED_STDOUT,
             summary,
         );
+    }
+    if root.decl.url == "boot://root-net-dataplane" {
+        return net::run_root_dataplane();
     }
 
     let (provider, provider_startup) = match resolve_root_child(&root, &resolvers, "echo_provider")
@@ -2436,14 +2451,14 @@ fn write_summary(summary: &ComponentSummary) {
     );
 }
 
-fn read_slot(index: usize) -> u64 {
+pub(crate) fn read_slot(index: usize) -> u64 {
     // SAFETY: the kernel maps one shared result page at `USER_SHARED_BASE` for
     // the bootstrap userspace runner, and all indices in this file are within
     // the fixed slot table exported by `kernel/axle-kernel/src/userspace.rs`.
     unsafe { slot_ptr(index).read_volatile() }
 }
 
-fn write_slot(index: usize, value: u64) {
+pub(crate) fn write_slot(index: usize, value: u64) {
     // SAFETY: the kernel-owned shared result page is writable by the bootstrap
     // userspace runner for these fixed diagnostic slots.
     unsafe { slot_ptr(index).write_volatile(value) }

@@ -20,8 +20,13 @@ device contract.
 
 ## Current transport slice
 
-The repository now includes one narrow ring3 `net_smoke` path built around one reusable
-`virtio_net_transport` slice in `user/test-runner` with:
+The repository now includes one narrow ring3 net dataplane slice built around one reusable
+`axle-virtio-transport` `no_std` crate plus two current userspace consumers:
+
+- `user/test-runner` `net_smoke`
+- `user/nexus-init` `boot://root-net-dataplane`
+
+The current bootstrap transport includes:
 
 - one bootstrap `PciDevice` handle seeded by the kernel into the runner shared-slot window
 - one PCI config-space export discovered through `ax_pci_device_get_config()`:
@@ -77,6 +82,8 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
   - the current bootstrap transport requires those interrupt objects to be triggerable
 - two user-mode worker threads acting as minimal device-side peers
 - one driver-side thread acting as the queue owner and verifier
+- one `nexus-init` root bring-up path that consumes the same synthetic PCI-shaped export through
+  the normal bootstrap resolver / root-manifest flow instead of one runner-only entrypoint
 - one narrow kernel-exported device-resource discovery step:
   - vendor/device/class fields
   - BAR count, queue-pair count, and queue size metadata
@@ -148,6 +155,9 @@ The current bootstrap slice proves three things:
 5. Ring3 code can now discover the transport through a PCI-shaped config export first and only then
    map BAR0, which is closer to the eventual user-mode virtio-net bring-up than the earlier direct
    BAR0-only smoke.
+6. The transport is no longer trapped inside one smoke-only binary. `nexus-init` can now consume
+   the same transport crate and bootstrap device export as one root component, which means the
+   current user-mode virtio-style path is becoming system substrate rather than only test harness.
 
 ## What this is not yet
 

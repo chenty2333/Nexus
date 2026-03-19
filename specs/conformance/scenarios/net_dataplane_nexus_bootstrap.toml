@@ -1,0 +1,96 @@
+id = "kernel.runtime.net_dataplane_nexus_bootstrap"
+description = "nexus-init root should consume the bootstrap PCI-shaped device export and bring up the narrow user-mode virtio-style net dataplane slice"
+tags = ["kernel", "runtime", "net", "device", "bootstrap", "nexus-init"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/net-dataplane-nexus && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && NEXUS_INIT_ROOT_URL=boot://root-net-dataplane RUSTFLAGS='-C code-model=large -C debuginfo=0' cargo build -p nexus-init --target x86_64-unknown-none --target-dir \"$target_dir\" && init=\"$target_dir/x86_64-unknown-none/debug/nexus-init\" && init_size=$(stat -c%s \"$init\") && { timeout --foreground 20s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$init\",addr=0x7000000,force-raw=on -device loader,data=$init_size,data-len=8,addr=0x6fffff8 -device loader,file=\"$init\",addr=0x5000000,force-raw=on -device loader,data=$init_size,data-len=8,addr=0x4fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; qemu_code=$?; echo qemu_exit=$qemu_code; [ \"$qemu_code\" -eq 33 ]; }"
+]
+
+expect = [
+  "kernel: net dataplane smoke",
+]
+forbid = ["KERNEL PANIC"]
+contracts = []
+
+[assertions.status_code]
+ready_irq_create = 0
+tx_irq_create = 0
+rx_irq_create = 0
+config_backing_create = 0
+config_pin_create = 0
+config_dma_lookup = 0
+config_alias_create = 0
+pci_config_info = 0
+pci_config_map = 0
+pci_config_caps_ok = 1
+pci_config_common_bar = 0
+pci_config_common_offset = 0
+pci_config_notify_offset = 256
+pci_config_isr_offset = 384
+pci_config_device_offset = 512
+pci_config_map_options = 32
+pci_config_flags = 3
+config_alias_pin_create = 0
+config_alias_dma_lookup = 0
+config_alias_map = 0
+config_backing_map = 0
+reg_backing_create = 0
+reg_pin_create = 0
+reg_dma_lookup = 0
+reg_backing_map = 0
+pci_irq_mode_info = 0
+pci_irq_mode_set = 0
+bar0_create = 0
+bar0_pin_create = 0
+bar0_dma_lookup = 0
+bar0_dma_info = 0
+bar0_map = 0
+queue_vmo_create = 0
+queue_pin_create = 0
+queue_dma_lookup = 0
+queue_dma_info = 0
+queue_map = 0
+worker_thread_create = 0
+worker_thread_start = 0
+ready_wait = 0
+ready_ack = 0
+tx_kick = 0
+worker_wait_kick = 0
+worker_ack_kick = 0
+worker_trigger_rx = 0
+rx_wait = 0
+rx_ack = 0
+
+[assertions.packet_fields]
+net_present = 1
+net_failure_step = 0
+config_alias_match = 1
+bar0_match = 1
+pci_vendor_id = 16728
+pci_irq_mode_flags = 7
+pci_irq_mode_base_vector = 0
+pci_irq_mode_vector_count = 6
+bar0_dma_flags = 3
+queue_dma_flags = 3
+tx_used_idx = 8
+rx_used_idx = 8
+tx_used_len = 42
+rx_used_len = 42
+packet_bytes = 32
+packet_match = 1
+queue_pairs = 2
+mmio_ready = 1
+mmio_device_features = 1
+mmio_driver_features = 1
+mmio_status = 27
+tx_notify_count = 2
+rx_complete_count = 2
+tx_notify_mask = 3
+rx_complete_mask = 3
+tx_ready_mask = 3
+rx_ready_mask = 3
+packet_count = 8
+packet_match_count = 8
