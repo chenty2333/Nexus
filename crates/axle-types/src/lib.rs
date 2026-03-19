@@ -552,11 +552,39 @@ pub mod dma {
     pub const AX_DMA_PERM_DEVICE_READ: u32 = 1 << 0;
     /// Device may write into the pinned region.
     pub const AX_DMA_PERM_DEVICE_WRITE: u32 = 1 << 1;
+    /// The current device-visible address view is identical to the backing physical address.
+    pub const AX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA: u32 = 1 << 0;
+    /// The pinned frame set is physically contiguous across the full region.
+    pub const AX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS: u32 = 1 << 1;
 
     /// Device may read from the pinned region.
     pub const ZX_DMA_PERM_DEVICE_READ: u32 = AX_DMA_PERM_DEVICE_READ;
     /// Device may write into the pinned region.
     pub const ZX_DMA_PERM_DEVICE_WRITE: u32 = AX_DMA_PERM_DEVICE_WRITE;
+    /// The current device-visible address view is identical to the backing physical address.
+    pub const ZX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA: u32 = AX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA;
+    /// The pinned frame set is physically contiguous across the full region.
+    pub const ZX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS: u32 =
+        AX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS;
+
+    /// One pinned DMA-region metadata snapshot.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ax_dma_region_info_t {
+        /// Pinned region size in bytes.
+        pub size_bytes: u64,
+        /// Creation-time DMA permission bits.
+        pub options: u32,
+        /// Region metadata flags.
+        pub flags: u32,
+        /// Base physical address for offset zero.
+        pub paddr_base: u64,
+        /// Base device-visible address for offset zero.
+        pub iova_base: u64,
+    }
+
+    /// Frozen Zircon-compat alias over the native DMA-region info record.
+    pub type zx_dma_region_info_t = ax_dma_region_info_t;
 }
 
 /// Narrow PCI/device-facing bootstrap types and constants.
@@ -582,6 +610,16 @@ pub mod pci {
     /// BAR names one MMIO window.
     pub const ZX_PCI_BAR_FLAG_MMIO: u32 = AX_PCI_BAR_FLAG_MMIO;
 
+    /// Config window is one MMIO-style exported config-space alias.
+    pub const AX_PCI_CONFIG_FLAG_MMIO: u32 = 1 << 0;
+    /// Config window should be treated as read-only by the driver.
+    pub const AX_PCI_CONFIG_FLAG_READ_ONLY: u32 = 1 << 1;
+
+    /// Config window is one MMIO-style exported config-space alias.
+    pub const ZX_PCI_CONFIG_FLAG_MMIO: u32 = AX_PCI_CONFIG_FLAG_MMIO;
+    /// Config window should be treated as read-only by the driver.
+    pub const ZX_PCI_CONFIG_FLAG_READ_ONLY: u32 = AX_PCI_CONFIG_FLAG_READ_ONLY;
+
     /// Interrupt resource is one synthetic virtual line.
     pub const AX_PCI_INTERRUPT_MODE_VIRTUAL: u32 = 0;
     /// Reserved mode for future hardware INTx wiring.
@@ -599,6 +637,21 @@ pub mod pci {
     pub const ZX_PCI_INTERRUPT_MODE_MSI: u32 = AX_PCI_INTERRUPT_MODE_MSI;
     /// Reserved mode for future MSI-X wiring.
     pub const ZX_PCI_INTERRUPT_MODE_MSIX: u32 = AX_PCI_INTERRUPT_MODE_MSIX;
+    /// Interrupt mode is exported by this device object.
+    pub const AX_PCI_INTERRUPT_MODE_INFO_FLAG_SUPPORTED: u32 = 1 << 0;
+    /// Interrupt mode is the device object's current active delivery mode.
+    pub const AX_PCI_INTERRUPT_MODE_INFO_FLAG_ACTIVE: u32 = 1 << 1;
+    /// Interrupt mode currently routes through triggerable interrupt objects.
+    pub const AX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE: u32 = 1 << 2;
+
+    /// Interrupt mode is exported by this device object.
+    pub const ZX_PCI_INTERRUPT_MODE_INFO_FLAG_SUPPORTED: u32 =
+        AX_PCI_INTERRUPT_MODE_INFO_FLAG_SUPPORTED;
+    /// Interrupt mode is the device object's current active delivery mode.
+    pub const ZX_PCI_INTERRUPT_MODE_INFO_FLAG_ACTIVE: u32 = AX_PCI_INTERRUPT_MODE_INFO_FLAG_ACTIVE;
+    /// Interrupt mode currently routes through triggerable interrupt objects.
+    pub const ZX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE: u32 =
+        AX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE;
 
     /// One narrow public PCI/device info snapshot.
     #[repr(C)]
@@ -650,6 +703,23 @@ pub mod pci {
     /// Frozen Zircon-compat alias over the native BAR-export result.
     pub type zx_pci_bar_info_t = ax_pci_bar_info_t;
 
+    /// One exported PCI config-space window.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ax_pci_config_info_t {
+        /// Handle naming the exported config-space VMO.
+        pub handle: ax_handle_t,
+        /// Config-space window size in bytes.
+        pub size: u64,
+        /// Resource flags describing that config-space export.
+        pub flags: u32,
+        /// Mapping options the driver should apply when installing this window.
+        pub map_options: u32,
+    }
+
+    /// Frozen Zircon-compat alias over the native config-window export result.
+    pub type zx_pci_config_info_t = ax_pci_config_info_t;
+
     /// One interrupt export result.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -665,16 +735,35 @@ pub mod pci {
     /// Frozen Zircon-compat alias over the native interrupt-export result.
     pub type zx_pci_interrupt_info_t = ax_pci_interrupt_info_t;
 
+    /// One interrupt-mode capability snapshot for a PCI/device handle.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ax_pci_interrupt_mode_info_t {
+        /// Interrupt delivery mode this snapshot describes.
+        pub mode: u32,
+        /// Capability and activity flags for that mode.
+        pub flags: u32,
+        /// Base vector or line index exported for this mode.
+        pub base_vector: u32,
+        /// Number of vectors or lines exported in this mode.
+        pub vector_count: u32,
+    }
+
+    /// Frozen Zircon-compat alias over the native interrupt-mode info record.
+    pub type zx_pci_interrupt_mode_info_t = ax_pci_interrupt_mode_info_t;
+
     const _: () = {
         let _ = core::mem::size_of::<zx_handle_t>();
     };
 }
 
-pub use pci::{
-    ax_pci_bar_info_t, ax_pci_device_info_t, ax_pci_interrupt_info_t, zx_pci_bar_info_t,
-    zx_pci_device_info_t, zx_pci_interrupt_info_t,
-};
+pub use dma::{ax_dma_region_info_t, zx_dma_region_info_t};
 pub use interrupt::{ax_interrupt_info_t, zx_interrupt_info_t};
+pub use pci::{
+    ax_pci_bar_info_t, ax_pci_config_info_t, ax_pci_device_info_t, ax_pci_interrupt_info_t,
+    ax_pci_interrupt_mode_info_t, zx_pci_bar_info_t, zx_pci_config_info_t, zx_pci_device_info_t,
+    zx_pci_interrupt_info_t, zx_pci_interrupt_mode_info_t,
+};
 
 /// VM mapping and protection options.
 ///

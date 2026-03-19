@@ -4,36 +4,44 @@ use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::virtio_net_transport::{
-    BUFFER_STRIDE, MMIO_DEVICE_ID_NET, MMIO_FEATURE_CSUM, MMIO_INTERRUPT_RX_COMPLETE, MMIO_MAGIC,
-    MMIO_STATUS_ACKNOWLEDGE, MMIO_STATUS_DRIVER, MMIO_STATUS_DRIVER_OK, MMIO_STATUS_FEATURES_OK,
-    MMIO_VENDOR_ID_AXLE, MMIO_VERSION, PAGE_SIZE, PCI_CLASS_NETWORK, PCI_DEVICE_ID_NET,
-    PCI_SUBCLASS_ETHERNET, PCI_VENDOR_ID_AXLE, QUEUE_PAIR_COUNT, QUEUE_SIZE, QUEUE_VMO_BYTES,
-    REGISTER_VMO_BYTES, VirtioNetHdr, VirtioQueueRegs, VirtqDesc, buffer_offset, buffer_paddr,
-    driver_program_queue, driver_select_queue, empty_avail, empty_used, frame_len, init_regs,
-    map_dma_addr, read_avail_at, read_desc_at, read_header, read_queue_regs, read_used,
-    rx_avail_paddr, rx_buffer_offset, rx_desc_paddr, rx_queue_notify_value, rx_queue_offset,
-    rx_used_paddr, tx_avail_paddr, tx_buffer_offset, tx_desc_paddr, tx_queue_notify_value,
-    tx_queue_offset, tx_used_paddr, write_avail, write_desc, write_header, write_queue_regs,
-    write_used, write_used_at,
+    BUFFER_STRIDE, CONFIG_VMO_BYTES, MMIO_DEVICE_ID_NET, MMIO_FEATURE_CSUM,
+    MMIO_INTERRUPT_RX_COMPLETE, MMIO_MAGIC, MMIO_STATUS_ACKNOWLEDGE, MMIO_STATUS_DRIVER,
+    MMIO_STATUS_DRIVER_OK, MMIO_STATUS_FEATURES_OK, MMIO_VENDOR_ID_AXLE, MMIO_VERSION, PAGE_SIZE,
+    PCI_CLASS_NETWORK, PCI_DEVICE_ID_NET, PCI_SUBCLASS_ETHERNET, PCI_VENDOR_ID_AXLE,
+    QUEUE_PAIR_COUNT, QUEUE_SIZE, QUEUE_VMO_BYTES, REGISTER_VMO_BYTES, VirtioNetHdr,
+    VirtioPciDiscovery, VirtioQueueRegs, VirtqDesc, buffer_offset, buffer_paddr,
+    discover_pci_transport, driver_program_queue, driver_select_queue, empty_avail, empty_used,
+    frame_len, init_regs, map_dma_addr, read_avail_at, read_desc_at, read_header, read_queue_regs,
+    read_used, rx_avail_paddr, rx_buffer_offset, rx_desc_paddr, rx_queue_notify_value,
+    rx_queue_offset, rx_used_paddr, tx_avail_paddr, tx_buffer_offset, tx_desc_paddr,
+    tx_queue_notify_value, tx_queue_offset, tx_used_paddr, write_avail, write_desc, write_header,
+    write_queue_regs, write_used, write_used_at,
 };
 use axle_arch_x86_64::{debug_break, native_syscall8, rdtsc};
-use libzircon::dma::{ZX_DMA_PERM_DEVICE_READ, ZX_DMA_PERM_DEVICE_WRITE};
+use libzircon::dma::{
+    ZX_DMA_PERM_DEVICE_READ, ZX_DMA_PERM_DEVICE_WRITE, ZX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA,
+    ZX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS,
+};
 use libzircon::handle::ZX_HANDLE_INVALID;
 use libzircon::interrupt::{
     ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE, ZX_INTERRUPT_MODE_VIRTUAL, zx_interrupt_info_t,
 };
 use libzircon::pci::{
-    ZX_PCI_BAR_FLAG_MMIO, ZX_PCI_INTERRUPT_GROUP_READY, ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
-    ZX_PCI_INTERRUPT_GROUP_TX_KICK, zx_pci_bar_info_t, zx_pci_device_info_t,
-    zx_pci_interrupt_info_t,
+    ZX_PCI_BAR_FLAG_MMIO, ZX_PCI_CONFIG_FLAG_MMIO, ZX_PCI_CONFIG_FLAG_READ_ONLY,
+    ZX_PCI_INTERRUPT_GROUP_READY, ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
+    ZX_PCI_INTERRUPT_GROUP_TX_KICK, ZX_PCI_INTERRUPT_MODE_INFO_FLAG_ACTIVE,
+    ZX_PCI_INTERRUPT_MODE_INFO_FLAG_SUPPORTED, ZX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE,
+    ZX_PCI_INTERRUPT_MODE_VIRTUAL, zx_pci_bar_info_t, zx_pci_config_info_t, zx_pci_device_info_t,
+    zx_pci_interrupt_info_t, zx_pci_interrupt_mode_info_t,
 };
 use libzircon::signals::{ZX_INTERRUPT_SIGNALED, ZX_TASK_TERMINATED};
 use libzircon::status::ZX_OK;
 use libzircon::syscall_numbers::AXLE_SYS_VMAR_MAP;
 use libzircon::vm::{ZX_VM_MAP_MMIO, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
-    ax_dma_region_lookup_iova, ax_interrupt_trigger, ax_pci_device_get_bar, ax_pci_device_get_info,
-    ax_pci_device_get_interrupt, ax_vmo_pin, zx_handle_close, zx_handle_t, zx_interrupt_ack,
+    ax_dma_region_get_info, ax_interrupt_trigger, ax_pci_device_get_bar, ax_pci_device_get_config,
+    ax_pci_device_get_info, ax_pci_device_get_interrupt, ax_pci_device_get_interrupt_mode,
+    ax_pci_device_set_interrupt_mode, ax_vmo_pin, zx_handle_close, zx_handle_t, zx_interrupt_ack,
     zx_interrupt_get_info, zx_object_wait_one, zx_signals_t, zx_status_t, zx_task_kill,
     zx_thread_create, zx_thread_start, zx_vmo_create_contiguous,
 };
@@ -106,6 +114,27 @@ const SLOT_NET_CONFIG_PIN_CREATE: usize = 1009;
 const SLOT_NET_CONFIG_ALIAS_PIN_CREATE: usize = 1010;
 const SLOT_NET_QUEUE_PIN_CREATE: usize = 1011;
 const SLOT_NET_BAR0_PIN_CREATE: usize = 1012;
+const SLOT_NET_PCI_IRQ_MODE_INFO: usize = 1013;
+const SLOT_NET_PCI_IRQ_MODE_FLAGS: usize = 1014;
+const SLOT_NET_PCI_IRQ_MODE_BASE_VECTOR: usize = 1015;
+const SLOT_NET_PCI_IRQ_MODE_VECTOR_COUNT: usize = 1016;
+const SLOT_NET_BAR0_DMA_INFO: usize = 1017;
+const SLOT_NET_BAR0_DMA_FLAGS: usize = 1018;
+const SLOT_NET_BAR0_DMA_IOVA: usize = 1019;
+const SLOT_NET_QUEUE_DMA_INFO: usize = 1020;
+const SLOT_NET_QUEUE_DMA_FLAGS: usize = 1021;
+const SLOT_NET_QUEUE_DMA_IOVA: usize = 1022;
+const SLOT_NET_PCI_CONFIG_INFO: usize = 1023;
+const SLOT_NET_PCI_CONFIG_FLAGS: usize = 1024;
+const SLOT_NET_PCI_CONFIG_MAP_OPTIONS: usize = 1025;
+const SLOT_NET_PCI_CONFIG_MAP: usize = 1026;
+const SLOT_NET_PCI_CONFIG_CAPS_OK: usize = 1027;
+const SLOT_NET_PCI_CONFIG_COMMON_BAR: usize = 1028;
+const SLOT_NET_PCI_CONFIG_COMMON_OFFSET: usize = 1029;
+const SLOT_NET_PCI_CONFIG_NOTIFY_OFFSET: usize = 1030;
+const SLOT_NET_PCI_CONFIG_ISR_OFFSET: usize = 1031;
+const SLOT_NET_PCI_CONFIG_DEVICE_OFFSET: usize = 1032;
+const SLOT_NET_PCI_IRQ_MODE_SET: usize = 1033;
 
 const STEP_PANIC: u64 = u64::MAX;
 const STEP_ROOT_VMAR: u64 = 1;
@@ -139,6 +168,13 @@ const STEP_WORKER_TRIGGER_RX: u64 = 36;
 const STEP_TX_USED: u64 = 37;
 const STEP_RX_USED: u64 = 38;
 const STEP_PACKET_MATCH: u64 = 39;
+const STEP_PCI_IRQ_MODE_INFO: u64 = 40;
+const STEP_BAR0_DMA_INFO: u64 = 41;
+const STEP_QUEUE_DMA_INFO: u64 = 42;
+const STEP_PCI_CONFIG_INFO: u64 = 43;
+const STEP_PCI_CONFIG_MAP: u64 = 44;
+const STEP_PCI_CONFIG_CAPS: u64 = 45;
+const STEP_PCI_IRQ_MODE_SET: u64 = 46;
 
 const WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
 const WORKER_STACK_BYTES: usize = 4096;
@@ -170,6 +206,21 @@ struct NetSummary {
     reg_pin_create: i64,
     reg_dma_lookup: i64,
     reg_backing_map: i64,
+    pci_config_info: i64,
+    pci_config_flags: u64,
+    pci_config_map_options: u64,
+    pci_config_map: i64,
+    pci_config_caps_ok: u64,
+    pci_config_common_bar: u64,
+    pci_config_common_offset: u64,
+    pci_config_notify_offset: u64,
+    pci_config_isr_offset: u64,
+    pci_config_device_offset: u64,
+    pci_irq_mode_info: i64,
+    pci_irq_mode_set: i64,
+    pci_irq_mode_flags: u64,
+    pci_irq_mode_base_vector: u64,
+    pci_irq_mode_vector_count: u64,
     config_backing_create: i64,
     config_pin_create: i64,
     config_dma_lookup: i64,
@@ -181,10 +232,16 @@ struct NetSummary {
     queue_vmo_create: i64,
     queue_pin_create: i64,
     queue_dma_lookup: i64,
+    queue_dma_info: i64,
+    queue_dma_flags: u64,
+    queue_dma_iova: u64,
     queue_map: i64,
     bar0_create: i64,
     bar0_pin_create: i64,
     bar0_dma_lookup: i64,
+    bar0_dma_info: i64,
+    bar0_dma_flags: u64,
+    bar0_dma_iova: u64,
     bar0_map: i64,
     worker_thread_create: i64,
     worker_thread_start: i64,
@@ -248,11 +305,12 @@ static mut NET_WORKER_STACKS: [WorkerStack; QUEUE_PAIR_COUNT] =
 static mut HEAP: HeapStorage = HeapStorage([0; HEAP_BYTES]);
 
 const OWNED_PCI_DEVICE: usize = 0;
-const OWNED_QUEUE_VMO: usize = 1;
-const OWNED_QUEUE_DMA: usize = 2;
-const OWNED_BAR0_VMO: usize = 3;
-const OWNED_BAR0_DMA: usize = 4;
-const OWNED_HANDLE_COUNT: usize = 5;
+const OWNED_CONFIG_VMO: usize = 1;
+const OWNED_QUEUE_VMO: usize = 2;
+const OWNED_QUEUE_DMA: usize = 3;
+const OWNED_BAR0_VMO: usize = 4;
+const OWNED_BAR0_DMA: usize = 5;
+const OWNED_HANDLE_COUNT: usize = 6;
 
 // SAFETY: this allocator serves only the single-process bootstrap smoke. It
 // monotonically carves aligned ranges from one fixed static buffer and never
@@ -334,6 +392,18 @@ fn run_net_smoke() -> NetSummary {
         return summary;
     }
 
+    let mut pci_config = zx_pci_config_info_t::default();
+    summary.pci_config_info =
+        ax_pci_device_get_config(owned_handles[OWNED_PCI_DEVICE], &mut pci_config) as i64;
+    summary.pci_config_flags = u64::from(pci_config.flags);
+    summary.pci_config_map_options = u64::from(pci_config.map_options);
+    if summary.pci_config_info != ZX_OK as i64 {
+        summary.failure_step = STEP_PCI_CONFIG_INFO;
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    }
+    owned_handles[OWNED_CONFIG_VMO] = pci_config.handle;
+
     let mut pci_info = zx_pci_device_info_t::default();
     summary.config_pin_create =
         ax_pci_device_get_info(owned_handles[OWNED_PCI_DEVICE], &mut pci_info) as i64;
@@ -343,18 +413,62 @@ fn run_net_smoke() -> NetSummary {
         return summary;
     }
     summary.pci_vendor_id = u64::from(pci_info.vendor_id);
-    summary.config_alias_match = u64::from(
-        pci_info.vendor_id == PCI_VENDOR_ID_AXLE
-            && pci_info.device_id == PCI_DEVICE_ID_NET
-            && pci_info.class_code == PCI_CLASS_NETWORK
-            && pci_info.subclass == PCI_SUBCLASS_ETHERNET
-            && pci_info.device_features == MMIO_FEATURE_CSUM
-            && pci_info.queue_pairs == QUEUE_PAIR_COUNT as u32
-            && pci_info.queue_size == QUEUE_SIZE as u32
-            && pci_info.bar_count == 1,
-    );
-    if summary.config_alias_match != 1 {
-        summary.failure_step = STEP_CONFIG_ALIAS_DMA_LOOKUP;
+
+    let Some(config_base) = map_driver_config(root_vmar, pci_config, &mut summary, &owned_handles)
+    else {
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    };
+    let Some(discovery) = discover_pci_transport(config_base) else {
+        summary.failure_step = STEP_PCI_CONFIG_CAPS;
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    };
+    summary.pci_config_common_bar = u64::from(discovery.common.bar);
+    summary.pci_config_common_offset = u64::from(discovery.common.offset);
+    summary.pci_config_notify_offset = u64::from(discovery.notify.offset);
+    summary.pci_config_isr_offset = u64::from(discovery.isr.offset);
+    summary.pci_config_device_offset = u64::from(discovery.device.offset);
+    summary.pci_config_caps_ok = u64::from(validate_pci_discovery(&pci_info, &discovery));
+    summary.config_alias_match = summary.pci_config_caps_ok;
+    if summary.pci_config_caps_ok != 1 {
+        summary.failure_step = STEP_PCI_CONFIG_CAPS;
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    }
+
+    summary.pci_irq_mode_set = ax_pci_device_set_interrupt_mode(
+        owned_handles[OWNED_PCI_DEVICE],
+        ZX_PCI_INTERRUPT_MODE_VIRTUAL,
+    ) as i64;
+    if summary.pci_irq_mode_set != ZX_OK as i64 {
+        summary.failure_step = STEP_PCI_IRQ_MODE_SET;
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    }
+
+    let mut irq_mode = zx_pci_interrupt_mode_info_t::default();
+    summary.pci_irq_mode_info = ax_pci_device_get_interrupt_mode(
+        owned_handles[OWNED_PCI_DEVICE],
+        ZX_PCI_INTERRUPT_MODE_VIRTUAL,
+        &mut irq_mode,
+    ) as i64;
+    summary.pci_irq_mode_flags = u64::from(irq_mode.flags);
+    summary.pci_irq_mode_base_vector = u64::from(irq_mode.base_vector);
+    summary.pci_irq_mode_vector_count = u64::from(irq_mode.vector_count);
+    if summary.pci_irq_mode_info != ZX_OK as i64
+        || irq_mode.mode != ZX_PCI_INTERRUPT_MODE_VIRTUAL
+        || (irq_mode.flags
+            & (ZX_PCI_INTERRUPT_MODE_INFO_FLAG_SUPPORTED
+                | ZX_PCI_INTERRUPT_MODE_INFO_FLAG_ACTIVE
+                | ZX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE))
+            != (ZX_PCI_INTERRUPT_MODE_INFO_FLAG_SUPPORTED
+                | ZX_PCI_INTERRUPT_MODE_INFO_FLAG_ACTIVE
+                | ZX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE)
+        || irq_mode.base_vector != 0
+        || irq_mode.vector_count != pci_info.queue_pairs * pci_info.interrupt_groups
+    {
+        summary.failure_step = STEP_PCI_IRQ_MODE_INFO;
         close_handle_sets(&[], &owned_handles);
         return summary;
     }
@@ -465,8 +579,11 @@ fn run_net_smoke() -> NetSummary {
     }
 
     let mut pci_bar = zx_pci_bar_info_t::default();
-    summary.bar0_create =
-        ax_pci_device_get_bar(owned_handles[OWNED_PCI_DEVICE], 0, &mut pci_bar) as i64;
+    summary.bar0_create = ax_pci_device_get_bar(
+        owned_handles[OWNED_PCI_DEVICE],
+        u32::from(discovery.common.bar),
+        &mut pci_bar,
+    ) as i64;
     if summary.bar0_create != ZX_OK as i64 {
         summary.failure_step = STEP_BAR0_CREATE;
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
@@ -487,19 +604,27 @@ fn run_net_smoke() -> NetSummary {
         return summary;
     }
 
-    let mut bar0_paddr = 0u64;
-    summary.bar0_dma_lookup =
-        ax_dma_region_lookup_iova(owned_handles[OWNED_BAR0_DMA], 0, &mut bar0_paddr) as i64;
-    if summary.bar0_dma_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_BAR0_DMA_LOOKUP;
+    let mut bar0_dma = libzircon::zx_dma_region_info_t::default();
+    summary.bar0_dma_info =
+        ax_dma_region_get_info(owned_handles[OWNED_BAR0_DMA], &mut bar0_dma) as i64;
+    summary.bar0_dma_iova = bar0_dma.iova_base;
+    summary.bar0_dma_flags = u64::from(bar0_dma.flags);
+    summary.bar0_dma_lookup = ZX_OK as i64;
+    if summary.bar0_dma_info != ZX_OK as i64 {
+        summary.failure_step = STEP_BAR0_DMA_INFO;
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
     summary.bar0_match = u64::from(
         pci_bar.size == REGISTER_VMO_BYTES
-            && bar0_paddr != 0
+            && bar0_dma.iova_base != 0
+            && bar0_dma.size_bytes == pci_bar.size
+            && bar0_dma.options == (ZX_DMA_PERM_DEVICE_READ | ZX_DMA_PERM_DEVICE_WRITE)
+            && (bar0_dma.flags & ZX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA) != 0
+            && (bar0_dma.flags & ZX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS) != 0
             && (pci_bar.flags & ZX_PCI_BAR_FLAG_MMIO) != 0
-            && (pci_bar.map_options & ZX_VM_MAP_MMIO) != 0,
+            && (pci_bar.map_options & ZX_VM_MAP_MMIO) != 0
+            && discovery.common.bar == 0,
     );
 
     let mut reg_device_base = 0u64;
@@ -540,11 +665,23 @@ fn run_net_smoke() -> NetSummary {
         return summary;
     }
 
-    let mut queue_paddr = 0u64;
-    summary.queue_dma_lookup =
-        ax_dma_region_lookup_iova(owned_handles[OWNED_QUEUE_DMA], 0, &mut queue_paddr) as i64;
-    if summary.queue_dma_lookup != ZX_OK as i64 {
-        summary.failure_step = STEP_QUEUE_DMA_LOOKUP;
+    let mut queue_dma = libzircon::zx_dma_region_info_t::default();
+    summary.queue_dma_info =
+        ax_dma_region_get_info(owned_handles[OWNED_QUEUE_DMA], &mut queue_dma) as i64;
+    summary.queue_dma_iova = queue_dma.iova_base;
+    summary.queue_dma_flags = u64::from(queue_dma.flags);
+    summary.queue_dma_lookup = ZX_OK as i64;
+    if summary.queue_dma_info != ZX_OK as i64 {
+        summary.failure_step = STEP_QUEUE_DMA_INFO;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
+        return summary;
+    }
+    if queue_dma.size_bytes != QUEUE_VMO_BYTES
+        || queue_dma.options != (ZX_DMA_PERM_DEVICE_READ | ZX_DMA_PERM_DEVICE_WRITE)
+        || (queue_dma.flags & ZX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA) == 0
+        || (queue_dma.flags & ZX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS) == 0
+    {
+        summary.failure_step = STEP_QUEUE_DMA_INFO;
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
@@ -566,7 +703,13 @@ fn run_net_smoke() -> NetSummary {
     }
     init_transport_memory(mapped_queue_base);
 
-    let reg_driver_base = match map_driver_bar0(root_vmar, pci_bar, &mut summary, &owned_handles) {
+    let reg_driver_base = match map_driver_bar0(
+        root_vmar,
+        pci_bar,
+        discovery.common.offset,
+        &mut summary,
+        &owned_handles,
+    ) {
         Some(base) => base,
         None => {
             close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
@@ -576,7 +719,7 @@ fn run_net_smoke() -> NetSummary {
 
     NET_REG_DEVICE_BASE.store(reg_device_base, Ordering::Release);
     NET_QUEUE_BASE.store(mapped_queue_base, Ordering::Release);
-    NET_QUEUE_PADDR.store(queue_paddr, Ordering::Release);
+    NET_QUEUE_PADDR.store(queue_dma.iova_base, Ordering::Release);
     for pair in 0..QUEUE_PAIR_COUNT {
         NET_READY_IRQS[pair].store(ready_irqs[pair], Ordering::Release);
         NET_TX_IRQS[pair].store(tx_irqs[pair], Ordering::Release);
@@ -657,7 +800,7 @@ fn run_net_smoke() -> NetSummary {
         }
     }
 
-    if !configure_driver_transport(reg_driver_base, &mut summary, pci_info, queue_paddr) {
+    if !configure_driver_transport(reg_driver_base, &mut summary, pci_info, queue_dma.iova_base) {
         summary.failure_step = STEP_MMIO_READY;
         close_workers_and_handles(
             &worker_threads,
@@ -667,8 +810,8 @@ fn run_net_smoke() -> NetSummary {
         return summary;
     }
 
-    prepare_tx_packets(mapped_queue_base, queue_paddr);
-    prepare_rx_buffers(mapped_queue_base, queue_paddr);
+    prepare_tx_packets(mapped_queue_base, queue_dma.iova_base);
+    prepare_rx_buffers(mapped_queue_base, queue_dma.iova_base);
     fence(Ordering::SeqCst);
 
     let batch_start = rdtsc();
@@ -812,13 +955,74 @@ fn run_net_smoke() -> NetSummary {
     summary
 }
 
-fn map_driver_bar0(
+fn map_driver_config(
     root_vmar: zx_handle_t,
-    bar: zx_pci_bar_info_t,
+    config: zx_pci_config_info_t,
     summary: &mut NetSummary,
     owned_handles: &[zx_handle_t; OWNED_HANDLE_COUNT],
 ) -> Option<u64> {
-    if bar.handle == ZX_HANDLE_INVALID || bar.size != REGISTER_VMO_BYTES {
+    if config.handle == ZX_HANDLE_INVALID
+        || config.size != CONFIG_VMO_BYTES
+        || (config.flags & ZX_PCI_CONFIG_FLAG_MMIO) == 0
+        || (config.flags & ZX_PCI_CONFIG_FLAG_READ_ONLY) == 0
+        || (config.map_options & ZX_VM_MAP_MMIO) == 0
+    {
+        summary.failure_step = STEP_PCI_CONFIG_INFO;
+        return None;
+    }
+
+    let mut config_base = 0u64;
+    summary.pci_config_map = zx_vmar_map_local(
+        root_vmar,
+        ZX_VM_PERM_READ | config.map_options,
+        0,
+        owned_handles[OWNED_CONFIG_VMO],
+        0,
+        config.size,
+        &mut config_base,
+    ) as i64;
+    if summary.pci_config_map != ZX_OK as i64 {
+        summary.failure_step = STEP_PCI_CONFIG_MAP;
+        return None;
+    }
+
+    Some(config_base)
+}
+
+fn validate_pci_discovery(info: &zx_pci_device_info_t, discovery: &VirtioPciDiscovery) -> bool {
+    discovery.vendor_id == PCI_VENDOR_ID_AXLE
+        && discovery.device_id == PCI_DEVICE_ID_NET
+        && discovery.class_code == PCI_CLASS_NETWORK
+        && discovery.subclass == PCI_SUBCLASS_ETHERNET
+        && info.vendor_id == discovery.vendor_id
+        && info.device_id == discovery.device_id
+        && info.class_code == discovery.class_code
+        && info.subclass == discovery.subclass
+        && info.device_features == MMIO_FEATURE_CSUM
+        && info.queue_pairs == QUEUE_PAIR_COUNT as u32
+        && info.queue_size == QUEUE_SIZE as u32
+        && info.bar_count == 1
+        && discovery.common.bar == 0
+        && discovery.notify.bar == 0
+        && discovery.isr.bar == 0
+        && discovery.device.bar == 0
+        && discovery.common.length != 0
+        && discovery.notify.length != 0
+        && discovery.isr.length != 0
+        && discovery.device.length != 0
+}
+
+fn map_driver_bar0(
+    root_vmar: zx_handle_t,
+    bar: zx_pci_bar_info_t,
+    common_offset: u32,
+    summary: &mut NetSummary,
+    owned_handles: &[zx_handle_t; OWNED_HANDLE_COUNT],
+) -> Option<u64> {
+    if bar.handle == ZX_HANDLE_INVALID
+        || bar.size != REGISTER_VMO_BYTES
+        || u64::from(common_offset) >= bar.size
+    {
         summary.failure_step = STEP_BAR0_CREATE;
         return None;
     }
@@ -838,7 +1042,7 @@ fn map_driver_bar0(
         return None;
     }
 
-    Some(bar0_driver_base)
+    Some(bar0_driver_base + u64::from(common_offset))
 }
 
 fn configure_driver_transport(
@@ -1354,8 +1558,50 @@ fn write_summary(summary: &NetSummary) {
     );
     write_slot(SLOT_NET_REG_LOOKUP, summary.reg_dma_lookup as u64);
     write_slot(SLOT_NET_REG_BACKING_MAP, summary.reg_backing_map as u64);
+    write_slot(SLOT_NET_PCI_CONFIG_INFO, summary.pci_config_info as u64);
+    write_slot(SLOT_NET_PCI_CONFIG_FLAGS, summary.pci_config_flags);
+    write_slot(
+        SLOT_NET_PCI_CONFIG_MAP_OPTIONS,
+        summary.pci_config_map_options,
+    );
+    write_slot(SLOT_NET_PCI_CONFIG_MAP, summary.pci_config_map as u64);
+    write_slot(SLOT_NET_PCI_CONFIG_CAPS_OK, summary.pci_config_caps_ok);
+    write_slot(
+        SLOT_NET_PCI_CONFIG_COMMON_BAR,
+        summary.pci_config_common_bar,
+    );
+    write_slot(
+        SLOT_NET_PCI_CONFIG_COMMON_OFFSET,
+        summary.pci_config_common_offset,
+    );
+    write_slot(
+        SLOT_NET_PCI_CONFIG_NOTIFY_OFFSET,
+        summary.pci_config_notify_offset,
+    );
+    write_slot(
+        SLOT_NET_PCI_CONFIG_ISR_OFFSET,
+        summary.pci_config_isr_offset,
+    );
+    write_slot(
+        SLOT_NET_PCI_CONFIG_DEVICE_OFFSET,
+        summary.pci_config_device_offset,
+    );
+    write_slot(SLOT_NET_PCI_IRQ_MODE_INFO, summary.pci_irq_mode_info as u64);
+    write_slot(SLOT_NET_PCI_IRQ_MODE_SET, summary.pci_irq_mode_set as u64);
+    write_slot(SLOT_NET_PCI_IRQ_MODE_FLAGS, summary.pci_irq_mode_flags);
+    write_slot(
+        SLOT_NET_PCI_IRQ_MODE_BASE_VECTOR,
+        summary.pci_irq_mode_base_vector,
+    );
+    write_slot(
+        SLOT_NET_PCI_IRQ_MODE_VECTOR_COUNT,
+        summary.pci_irq_mode_vector_count,
+    );
     write_slot(SLOT_NET_BAR0_CREATE, summary.bar0_create as u64);
     write_slot(SLOT_NET_BAR0_LOOKUP, summary.bar0_dma_lookup as u64);
+    write_slot(SLOT_NET_BAR0_DMA_INFO, summary.bar0_dma_info as u64);
+    write_slot(SLOT_NET_BAR0_DMA_FLAGS, summary.bar0_dma_flags);
+    write_slot(SLOT_NET_BAR0_DMA_IOVA, summary.bar0_dma_iova);
     write_slot(SLOT_NET_BAR0_MATCH, summary.bar0_match);
     write_slot(SLOT_NET_BAR0_MAP, summary.bar0_map as u64);
     write_slot(SLOT_NET_MMIO_READY, summary.mmio_ready);
@@ -1381,5 +1627,8 @@ fn write_summary(summary: &NetSummary) {
         summary.config_alias_pin_create as u64,
     );
     write_slot(SLOT_NET_QUEUE_PIN_CREATE, summary.queue_pin_create as u64);
+    write_slot(SLOT_NET_QUEUE_DMA_INFO, summary.queue_dma_info as u64);
+    write_slot(SLOT_NET_QUEUE_DMA_FLAGS, summary.queue_dma_flags);
+    write_slot(SLOT_NET_QUEUE_DMA_IOVA, summary.queue_dma_iova);
     write_slot(SLOT_NET_BAR0_PIN_CREATE, summary.bar0_pin_create as u64);
 }

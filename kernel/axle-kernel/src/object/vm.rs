@@ -282,6 +282,20 @@ pub fn lookup_dma_region_paddr(handle: zx_handle_t, offset: u64) -> Result<u64, 
     })
 }
 
+/// Read one metadata snapshot from a pinned DMA region.
+pub fn dma_region_get_info(
+    handle: zx_handle_t,
+) -> Result<axle_types::ax_dma_region_info_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        state.with_objects(|objects| match objects.get(resolved.object_key()) {
+            Some(KernelObject::DmaRegion(region)) => region.info(),
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        })
+    })
+}
+
 /// Return the device-visible IOVA backing one offset inside a pinned DMA region.
 pub fn lookup_dma_region_iova(handle: zx_handle_t, offset: u64) -> Result<u64, zx_status_t> {
     with_state_mut(|state| {

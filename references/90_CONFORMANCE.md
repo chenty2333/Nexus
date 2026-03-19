@@ -184,6 +184,22 @@ Main just targets include:
   - the runner now also cross-checks those exported interrupts through `interrupt_get_info()`:
     - mode/vector metadata must agree with the PCI-exported snapshot
     - the current synthetic transport requires triggerable interrupt objects
+  - the runner now also queries the device's virtual interrupt-mode capability through
+    `ax_pci_device_get_interrupt_mode()` and pins:
+    - supported / active / triggerable flags
+    - base vector `0`
+    - vector count `queue_pairs * interrupt_groups`
+  - the runner now also discovers the transport through `ax_pci_device_get_config()` and pins:
+    - config export status
+    - config export flags (`MMIO | READ_ONLY`)
+    - config export map options (`ZX_VM_MAP_MMIO`)
+    - capability discovery success
+    - BAR/common/notify/isr/device offsets
+    - explicit `ax_pci_device_set_interrupt_mode(..., VIRTUAL)` success
+  - the runner now also queries both DMA-region objects through `ax_dma_region_get_info()` and
+    pins:
+    - identity-IOVA and physically-contiguous flags
+    - base device-visible address for BAR0 and queue memory
   - one reusable split TX/RX virtio-style transport slice now completes one eight-packet batched
     loopback round without channel/socket data-plane help, and the driver now exercises a
     virtio-style feature/status/queue-select bring-up sequence before the first kick
@@ -192,21 +208,42 @@ Main just targets include:
     - `config_pin_create`
     - `config_dma_lookup`
     - `config_alias_create`
+    - `pci_config_info`
+    - `pci_config_flags`
+    - `pci_config_map_options`
     - `config_alias_pin_create`
     - `config_alias_dma_lookup`
     - `config_alias_match`
     - `config_alias_map`
+    - `pci_config_map`
+    - `pci_config_caps_ok`
+    - `pci_config_common_bar`
+    - `pci_config_common_offset`
+    - `pci_config_notify_offset`
+    - `pci_config_isr_offset`
+    - `pci_config_device_offset`
     - `reg_backing_create`
     - `reg_pin_create`
     - `reg_dma_lookup`
     - `reg_backing_map`
+    - `pci_irq_mode_info`
+    - `pci_irq_mode_flags`
+    - `pci_irq_mode_base_vector`
+    - `pci_irq_mode_vector_count`
+    - `pci_irq_mode_set`
     - `bar0_create`
     - `bar0_pin_create`
     - `bar0_dma_lookup`
+    - `bar0_dma_info`
+    - `bar0_dma_flags`
+    - `bar0_dma_iova`
     - `bar0_match`
     - `bar0_map`
     - `queue_pin_create`
     - `queue_dma_lookup`
+    - `queue_dma_info`
+    - `queue_dma_flags`
+    - `queue_dma_iova`
     - `mmio_ready`
     - `mmio_device_features`
     - `mmio_driver_features`

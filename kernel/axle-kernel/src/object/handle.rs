@@ -276,6 +276,14 @@ pub(super) fn pci_device_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::INSPECT
+        | crate::task::HandleRights::WRITE
+}
+
+pub(super) fn pci_config_vmo_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::READ
+        | crate::task::HandleRights::MAP
 }
 
 pub(super) fn vmo_default_rights() -> crate::task::HandleRights {

@@ -16,6 +16,10 @@ use alloc::vec::Vec;
 use axle_core::{Capability, ObjectKey, PortError, Signals, TimerError, TimerId, TransferredCap};
 use axle_mm::{MappingCachePolicy, MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
+use axle_types::dma::{
+    AX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA, AX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS,
+    ax_dma_region_info_t,
+};
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::interrupt::{
     AX_INTERRUPT_INFO_FLAG_TRIGGERABLE, AX_INTERRUPT_MODE_VIRTUAL, ZX_INTERRUPT_VIRTUAL,
@@ -151,6 +155,31 @@ impl DmaRegionObject {
 
     pub(crate) fn lookup_iova(&self, offset: u64) -> Result<u64, zx_status_t> {
         self.lookup_paddr(offset)
+    }
+
+    pub(crate) fn info(&self) -> Result<ax_dma_region_info_t, zx_status_t> {
+        let mut flags = AX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA;
+        if self.is_physically_contiguous() {
+            flags |= AX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS;
+        }
+        Ok(ax_dma_region_info_t {
+            size_bytes: self.size_bytes,
+            options: self.options,
+            flags,
+            paddr_base: self.lookup_paddr(0)?,
+            iova_base: self.lookup_iova(0)?,
+        })
+    }
+
+    fn is_physically_contiguous(&self) -> bool {
+        let frames = self.pin.frame_ids();
+        if frames.len() <= 1 {
+            return true;
+        }
+        let step = crate::userspace::USER_PAGE_BYTES;
+        frames
+            .windows(2)
+            .all(|pair| pair[0].raw().saturating_add(step) == pair[1].raw())
     }
 
     fn release(self, frames: &mut axle_mm::FrameTable) {

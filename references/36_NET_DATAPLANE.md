@@ -24,10 +24,17 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
 `virtio_net_transport` slice in `user/test-runner` with:
 
 - one bootstrap `PciDevice` handle seeded by the kernel into the runner shared-slot window
-- one device-info query instead of one userspace-synthesized config-page discovery step
+- one PCI config-space export discovered through `ax_pci_device_get_config()`:
+  - MMIO + read-only flags
+  - map options used for the config alias mapping
+  - virtio-style capability discovery for BAR0/common/notify/isr/device regions
 - one BAR0 VMO exported by the kernel from that device handle, plus BAR MMIO metadata
 - one interrupt-object export per queue pair and per interrupt group, plus interrupt mode/vector
   metadata
+- one interrupt-mode capability query through `ax_pci_device_get_interrupt_mode()`:
+  - supported / active / triggerable flags
+  - base vector
+  - vector count
 - one shared queue/buffer window allocated through `zx_vmo_create_contiguous()`
 - one explicit `DmaRegion` lifetime object over:
   - the queue memory
@@ -37,8 +44,16 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
   - `DEVICE_WRITE`
 - one DMA-region address lookup through `ax_dma_region_lookup_iova()` rather than one raw
   `ax_vmo_lookup_paddr()` handoff
+- one DMA-region metadata query through `ax_dma_region_get_info()`:
+  - size in bytes
+  - DMA-permission bits
+  - identity-IOVA / physical-contiguity flags
+  - base physical / device-visible addresses
 - driver mapping of the BAR0 window now uses the BAR-exported VM map options and therefore
   explicitly requests `ZX_VM_MAP_MMIO`
+- driver mapping of the synthetic PCI config window also uses `ZX_VM_MAP_MMIO`
+- the driver now explicitly switches the bootstrap device into `VIRTUAL` interrupt mode before it
+  starts consuming queue interrupts
 - one second mapping of that same BAR0 export is used by the synthetic device-side worker
 - one BAR0 register window now carries one first narrow virtio-style common-config shape:
   - device identity/version
@@ -127,6 +142,12 @@ The current bootstrap slice proves three things:
    queue ownership through explicit programmed DMA addresses instead of one fully synthetic offset
    convention; the next device/net cuts should build on that object rather than on ad-hoc physical
    address helpers.
+4. The current bootstrap `PciDevice` contract is now explicit enough for ring3 code to validate
+   interrupt delivery mode capabilities before it starts treating exported queue interrupts as one
+   usable transport substrate.
+5. Ring3 code can now discover the transport through a PCI-shaped config export first and only then
+   map BAR0, which is closer to the eventual user-mode virtio-net bring-up than the earlier direct
+   BAR0-only smoke.
 
 ## What this is not yet
 
@@ -136,8 +157,9 @@ The current bootstrap slice proves three things:
 - no MMIO cache-policy / mapping-attribute controls beyond the first narrow `ZX_VM_MAP_MMIO` bit
 - only one first narrow identity-like IOVA query exists; there is still no DMA map/unmap or fuller
   IOVA token model yet
-- no MSI/MSI-X or hardware IRQ routing
-- no full virtio PCI capability layout or config-space ABI
+- no hardware interrupt routing or MSI/MSI-X programming surface yet; only one mode-capability
+  query hang point exists today
+- no full virtio PCI capability layout or generic config-space ABI
 - no userspace TCP/IP stack
 - no RSS / scheduler-domain queue placement policy
 - no real hardware-backed virtio-net device bring-up yet

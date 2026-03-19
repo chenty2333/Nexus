@@ -14,32 +14,38 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
+use axle_types::dma::ax_dma_region_info_t;
 use axle_types::interrupt::ax_interrupt_info_t;
-use axle_types::pci::{ax_pci_bar_info_t, ax_pci_device_info_t, ax_pci_interrupt_info_t};
+use axle_types::pci::{
+    ax_pci_bar_info_t, ax_pci_config_info_t, ax_pci_device_info_t, ax_pci_interrupt_info_t,
+    ax_pci_interrupt_mode_info_t,
+};
 use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_OUT_OF_RANGE, ZX_OK};
 use axle_types::syscall_numbers::{
-    AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA, AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR,
-    AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
-    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
-    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
-    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
-    AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
-    AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE,
-    AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_AX_VMO_PIN,
-    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
-    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER, AXLE_SYS_FUTEX_REQUEUE,
-    AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
-    AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_INTERRUPT_ACK, AXLE_SYS_INTERRUPT_CREATE,
-    AXLE_SYS_INTERRUPT_GET_INFO, AXLE_SYS_INTERRUPT_MASK, AXLE_SYS_INTERRUPT_UNMASK,
-    AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC,
-    AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT,
-    AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ,
-    AXLE_SYS_SOCKET_WRITE, AXLE_SYS_TASK_KILL, AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE,
-    AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET,
-    AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT,
-    AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_CREATE_CONTIGUOUS,
-    AXLE_SYS_VMO_CREATE_PHYSICAL, AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE,
-    SyscallNumber,
+    AXLE_SYS_AX_DMA_REGION_GET_INFO, AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA,
+    AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR, AXLE_SYS_AX_GUEST_SESSION_CREATE,
+    AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY, AXLE_SYS_AX_GUEST_SESSION_RESUME,
+    AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY, AXLE_SYS_AX_INTERRUPT_TRIGGER,
+    AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG,
+    AXLE_SYS_AX_PCI_DEVICE_GET_INFO, AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT,
+    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE, AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE,
+    AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
+    AXLE_SYS_AX_PROCESS_START_GUEST, AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
+    AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_START_GUEST,
+    AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_AX_VMO_PIN, AXLE_SYS_CHANNEL_CREATE,
+    AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE,
+    AXLE_SYS_FUTEX_GET_OWNER, AXLE_SYS_FUTEX_REQUEUE, AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE,
+    AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_HANDLE_REPLACE,
+    AXLE_SYS_INTERRUPT_ACK, AXLE_SYS_INTERRUPT_CREATE, AXLE_SYS_INTERRUPT_GET_INFO,
+    AXLE_SYS_INTERRUPT_MASK, AXLE_SYS_INTERRUPT_UNMASK, AXLE_SYS_OBJECT_SIGNAL,
+    AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
+    AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE,
+    AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE,
+    AXLE_SYS_TASK_KILL, AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START,
+    AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE,
+    AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
+    AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_CREATE_CONTIGUOUS, AXLE_SYS_VMO_CREATE_PHYSICAL,
+    AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE, SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -51,7 +57,7 @@ use axle_types::{
 };
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 64] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 68] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -100,9 +106,13 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 64] = [
     AXLE_SYS_AX_VMO_PIN,
     AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR,
     AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA,
+    AXLE_SYS_AX_DMA_REGION_GET_INFO,
     AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
+    AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG,
     AXLE_SYS_AX_PCI_DEVICE_GET_BAR,
     AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT,
+    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE,
+    AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE,
     AXLE_SYS_SOCKET_CREATE,
     AXLE_SYS_SOCKET_WRITE,
     AXLE_SYS_SOCKET_READ,
@@ -748,10 +758,26 @@ fn writeback_u64(_ctx: &mut SyscallCtx, out: OutValue<u64>, value: u64) -> Resul
     write_out_value(out, value)
 }
 
+fn writeback_dma_region_info(
+    _ctx: &mut SyscallCtx,
+    out: OutValue<ax_dma_region_info_t>,
+    value: ax_dma_region_info_t,
+) -> Result<(), zx_status_t> {
+    write_out_value(out, value)
+}
+
 fn writeback_pci_device_info(
     _ctx: &mut SyscallCtx,
     out: OutValue<ax_pci_device_info_t>,
     value: ax_pci_device_info_t,
+) -> Result<(), zx_status_t> {
+    write_out_value(out, value)
+}
+
+fn writeback_pci_config_info(
+    _ctx: &mut SyscallCtx,
+    out: OutValue<ax_pci_config_info_t>,
+    value: ax_pci_config_info_t,
 ) -> Result<(), zx_status_t> {
     write_out_value(out, value)
 }
@@ -768,6 +794,14 @@ fn writeback_pci_interrupt_info(
     _ctx: &mut SyscallCtx,
     out: OutValue<ax_pci_interrupt_info_t>,
     value: ax_pci_interrupt_info_t,
+) -> Result<(), zx_status_t> {
+    write_out_value(out, value)
+}
+
+fn writeback_pci_interrupt_mode_info(
+    _ctx: &mut SyscallCtx,
+    out: OutValue<ax_pci_interrupt_mode_info_t>,
+    value: ax_pci_interrupt_mode_info_t,
 ) -> Result<(), zx_status_t> {
     write_out_value(out, value)
 }
@@ -1541,6 +1575,37 @@ typed_syscall!(
 const AX_DMA_REGION_LOOKUP_IOVA_DISPATCH: SyscallDispatch =
     SyscallDispatch::new(ax_dma_region_lookup_iova_entry);
 
+type DmaRegionGetInfoRequest = zx_handle_t;
+
+fn decode_ax_dma_region_get_info(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<DmaRegionGetInfoRequest, OutValue<ax_dma_region_info_t>>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        ctx.arg_handle(args, 0)?,
+        ctx.decode_out_value::<ax_dma_region_info_t>(args, 1)?,
+    ))
+}
+
+fn run_ax_dma_region_get_info(
+    req: DmaRegionGetInfoRequest,
+) -> Result<ax_dma_region_info_t, zx_status_t> {
+    crate::object::vm::dma_region_get_info(req)
+}
+
+typed_syscall!(
+    AX_DMA_REGION_GET_INFO_TYPED,
+    ax_dma_region_get_info_entry,
+    DmaRegionGetInfoRequest,
+    OutValue<ax_dma_region_info_t>,
+    ax_dma_region_info_t,
+    decode_ax_dma_region_get_info,
+    run_ax_dma_region_get_info,
+    writeback_dma_region_info
+);
+const AX_DMA_REGION_GET_INFO_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_dma_region_get_info_entry);
+
 type PciDeviceGetInfoRequest = zx_handle_t;
 
 fn decode_ax_pci_device_get_info(
@@ -1571,6 +1636,38 @@ typed_syscall!(
 );
 const AX_PCI_DEVICE_GET_INFO_DISPATCH: SyscallDispatch =
     SyscallDispatch::new(ax_pci_device_get_info_entry);
+
+type PciDeviceGetConfigRequest = zx_handle_t;
+
+fn decode_ax_pci_device_get_config(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<PciDeviceGetConfigRequest, OutValue<ax_pci_config_info_t>>, zx_status_t>
+{
+    Ok(DecodedSyscall::new(
+        ctx.arg_handle(args, 0)?,
+        ctx.decode_out_value::<ax_pci_config_info_t>(args, 1)?,
+    ))
+}
+
+fn run_ax_pci_device_get_config(
+    req: PciDeviceGetConfigRequest,
+) -> Result<ax_pci_config_info_t, zx_status_t> {
+    crate::object::device::pci_device_get_config(req)
+}
+
+typed_syscall!(
+    AX_PCI_DEVICE_GET_CONFIG_TYPED,
+    ax_pci_device_get_config_entry,
+    PciDeviceGetConfigRequest,
+    OutValue<ax_pci_config_info_t>,
+    ax_pci_config_info_t,
+    decode_ax_pci_device_get_config,
+    run_ax_pci_device_get_config,
+    writeback_pci_config_info
+);
+const AX_PCI_DEVICE_GET_CONFIG_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_pci_device_get_config_entry);
 
 type PciDeviceGetBarRequest = (zx_handle_t, u32);
 
@@ -1640,6 +1737,71 @@ typed_syscall!(
 );
 const AX_PCI_DEVICE_GET_INTERRUPT_DISPATCH: SyscallDispatch =
     SyscallDispatch::new(ax_pci_device_get_interrupt_entry);
+
+type PciDeviceGetInterruptModeRequest = (zx_handle_t, u32);
+
+fn decode_ax_pci_device_get_interrupt_mode(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<
+    DecodedSyscall<PciDeviceGetInterruptModeRequest, OutValue<ax_pci_interrupt_mode_info_t>>,
+    zx_status_t,
+> {
+    Ok(DecodedSyscall::new(
+        (ctx.arg_handle(args, 0)?, ctx.arg_u32(args, 1)?),
+        ctx.decode_out_value::<ax_pci_interrupt_mode_info_t>(args, 2)?,
+    ))
+}
+
+fn run_ax_pci_device_get_interrupt_mode(
+    req: PciDeviceGetInterruptModeRequest,
+) -> Result<ax_pci_interrupt_mode_info_t, zx_status_t> {
+    crate::object::device::pci_device_get_interrupt_mode(req.0, req.1)
+}
+
+typed_syscall!(
+    AX_PCI_DEVICE_GET_INTERRUPT_MODE_TYPED,
+    ax_pci_device_get_interrupt_mode_entry,
+    PciDeviceGetInterruptModeRequest,
+    OutValue<ax_pci_interrupt_mode_info_t>,
+    ax_pci_interrupt_mode_info_t,
+    decode_ax_pci_device_get_interrupt_mode,
+    run_ax_pci_device_get_interrupt_mode,
+    writeback_pci_interrupt_mode_info
+);
+const AX_PCI_DEVICE_GET_INTERRUPT_MODE_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_pci_device_get_interrupt_mode_entry);
+
+type PciDeviceSetInterruptModeRequest = (zx_handle_t, u32);
+
+fn decode_ax_pci_device_set_interrupt_mode(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<PciDeviceSetInterruptModeRequest, NoWriteback>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        (ctx.arg_handle(args, 0)?, ctx.arg_u32(args, 1)?),
+        NoWriteback,
+    ))
+}
+
+fn run_ax_pci_device_set_interrupt_mode(
+    req: PciDeviceSetInterruptModeRequest,
+) -> Result<(), zx_status_t> {
+    crate::object::device::pci_device_set_interrupt_mode(req.0, req.1)
+}
+
+typed_syscall!(
+    AX_PCI_DEVICE_SET_INTERRUPT_MODE_TYPED,
+    ax_pci_device_set_interrupt_mode_entry,
+    PciDeviceSetInterruptModeRequest,
+    NoWriteback,
+    (),
+    decode_ax_pci_device_set_interrupt_mode,
+    run_ax_pci_device_set_interrupt_mode,
+    writeback_noop
+);
+const AX_PCI_DEVICE_SET_INTERRUPT_MODE_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_pci_device_set_interrupt_mode_entry);
 
 #[derive(Debug)]
 struct VmoReadRequest {
@@ -3201,9 +3363,17 @@ fn syscall_dispatch(nr: SyscallNumber) -> Option<&'static SyscallDispatch> {
         AXLE_SYS_AX_VMO_PIN => Some(&AX_VMO_PIN_DISPATCH),
         AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR => Some(&AX_DMA_REGION_LOOKUP_PADDR_DISPATCH),
         AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA => Some(&AX_DMA_REGION_LOOKUP_IOVA_DISPATCH),
+        AXLE_SYS_AX_DMA_REGION_GET_INFO => Some(&AX_DMA_REGION_GET_INFO_DISPATCH),
         AXLE_SYS_AX_PCI_DEVICE_GET_INFO => Some(&AX_PCI_DEVICE_GET_INFO_DISPATCH),
+        AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG => Some(&AX_PCI_DEVICE_GET_CONFIG_DISPATCH),
         AXLE_SYS_AX_PCI_DEVICE_GET_BAR => Some(&AX_PCI_DEVICE_GET_BAR_DISPATCH),
         AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT => Some(&AX_PCI_DEVICE_GET_INTERRUPT_DISPATCH),
+        AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE => {
+            Some(&AX_PCI_DEVICE_GET_INTERRUPT_MODE_DISPATCH)
+        }
+        AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE => {
+            Some(&AX_PCI_DEVICE_SET_INTERRUPT_MODE_DISPATCH)
+        }
         AXLE_SYS_SOCKET_CREATE => Some(&SOCKET_CREATE_DISPATCH),
         AXLE_SYS_SOCKET_WRITE => Some(&SOCKET_WRITE_DISPATCH),
         AXLE_SYS_SOCKET_READ => Some(&SOCKET_READ_DISPATCH),

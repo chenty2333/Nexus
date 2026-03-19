@@ -169,7 +169,7 @@ const USER_PAGE_BYTES: u64 = 0x1000;
 // Keep this Linux guest bootstrap layout in sync with
 // `kernel/axle-kernel/src/userspace.rs`.
 const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * 4096;
-const USER_SHARED_BYTES: u64 = USER_PAGE_BYTES * 2;
+const USER_SHARED_BYTES: u64 = USER_PAGE_BYTES * 3;
 const USER_STACK_BYTES: u64 = USER_PAGE_BYTES * 16;
 const USER_CODE_VA: u64 = 0x0000_0001_0000_0000;
 const USER_MAIN_ET_DYN_LOAD_BIAS: u64 = USER_CODE_VA;

@@ -33,33 +33,37 @@ pub use axle_types::vm;
 pub use axle_types::wait_async;
 pub use axle_types::{
     ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_interp_header_t,
-    ax_linux_exec_spec_header_t, zx_clock_t, zx_duration_t, zx_futex_t, zx_handle_t,
-    zx_interrupt_info_t, zx_koid_t, zx_packet_signal_t, zx_packet_type_t, zx_packet_user_t,
-    zx_pci_bar_info_t, zx_pci_device_info_t, zx_pci_interrupt_info_t, zx_port_packet_t,
-    zx_rights_t, zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t,
+    ax_linux_exec_spec_header_t, zx_clock_t, zx_dma_region_info_t, zx_duration_t, zx_futex_t,
+    zx_handle_t, zx_interrupt_info_t, zx_koid_t, zx_packet_signal_t, zx_packet_type_t,
+    zx_packet_user_t, zx_pci_bar_info_t, zx_pci_config_info_t, zx_pci_device_info_t,
+    zx_pci_interrupt_info_t, zx_pci_interrupt_mode_info_t, zx_port_packet_t, zx_rights_t,
+    zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t,
 };
 
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::status::{ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NO_MEMORY};
 use axle_types::syscall_numbers::{
-    AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA, AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR,
-    AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
-    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
-    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
-    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
-    AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
-    AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE,
-    AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_AX_VMO_PIN,
-    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
-    AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
-    AXLE_SYS_INTERRUPT_ACK, AXLE_SYS_INTERRUPT_CREATE, AXLE_SYS_INTERRUPT_GET_INFO,
-    AXLE_SYS_INTERRUPT_MASK, AXLE_SYS_INTERRUPT_UNMASK, AXLE_SYS_OBJECT_SIGNAL,
-    AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
-    AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE,
-    AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE,
-    AXLE_SYS_TASK_KILL, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL,
-    AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_CREATE_CONTIGUOUS,
+    AXLE_SYS_AX_DMA_REGION_GET_INFO, AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA,
+    AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR, AXLE_SYS_AX_GUEST_SESSION_CREATE,
+    AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY, AXLE_SYS_AX_GUEST_SESSION_RESUME,
+    AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY, AXLE_SYS_AX_INTERRUPT_TRIGGER,
+    AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG,
+    AXLE_SYS_AX_PCI_DEVICE_GET_INFO, AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT,
+    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE, AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE,
+    AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
+    AXLE_SYS_AX_PROCESS_START_GUEST, AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
+    AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_START_GUEST,
+    AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_AX_VMO_PIN, AXLE_SYS_CHANNEL_CREATE,
+    AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE, AXLE_SYS_EVENTPAIR_CREATE,
+    AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE, AXLE_SYS_INTERRUPT_ACK,
+    AXLE_SYS_INTERRUPT_CREATE, AXLE_SYS_INTERRUPT_GET_INFO, AXLE_SYS_INTERRUPT_MASK,
+    AXLE_SYS_INTERRUPT_UNMASK, AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER,
+    AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE,
+    AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START,
+    AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE, AXLE_SYS_TASK_KILL,
+    AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE,
+    AXLE_SYS_TIMER_SET, AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_CREATE_CONTIGUOUS,
     AXLE_SYS_VMO_CREATE_PHYSICAL, AXLE_SYS_VMO_READ, AXLE_SYS_VMO_WRITE,
 };
 
@@ -625,6 +629,24 @@ pub fn ax_dma_region_lookup_iova(
     )
 }
 
+/// Read one metadata snapshot from a DMA-region object.
+pub fn ax_dma_region_get_info(
+    handle: zx_handle_t,
+    out_info: &mut zx_dma_region_info_t,
+) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_DMA_REGION_GET_INFO as u64,
+        [
+            handle,
+            out_info as *mut zx_dma_region_info_t as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
 /// Read one narrow PCI/device info snapshot from a device handle.
 pub fn ax_pci_device_get_info(
     handle: zx_handle_t,
@@ -635,6 +657,24 @@ pub fn ax_pci_device_get_info(
         [
             handle,
             out_info as *mut zx_pci_device_info_t as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Export one PCI config-space window from a device handle.
+pub fn ax_pci_device_get_config(
+    handle: zx_handle_t,
+    out_info: &mut zx_pci_config_info_t,
+) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG as u64,
+        [
+            handle,
+            out_info as *mut zx_pci_config_info_t as u64,
             0,
             0,
             0,
@@ -679,6 +719,33 @@ pub fn ax_pci_device_get_interrupt(
             0,
             0,
         ],
+    )
+}
+
+/// Query one interrupt delivery mode exported by a PCI/device handle.
+pub fn ax_pci_device_get_interrupt_mode(
+    handle: zx_handle_t,
+    mode: u32,
+    out_info: &mut zx_pci_interrupt_mode_info_t,
+) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE as u64,
+        [
+            handle,
+            mode as u64,
+            out_info as *mut zx_pci_interrupt_mode_info_t as u64,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Select one interrupt delivery mode for a PCI/device handle.
+pub fn ax_pci_device_set_interrupt_mode(handle: zx_handle_t, mode: u32) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE as u64,
+        [handle, mode as u64, 0, 0, 0, 0],
     )
 }
 

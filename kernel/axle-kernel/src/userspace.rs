@@ -24,7 +24,7 @@ use x86_64::instructions::segmentation::Segment;
 
 pub(crate) const USER_PAGE_BYTES: u64 = 0x1000;
 pub(crate) const USER_CODE_PAGE_COUNT: usize = 4096;
-const USER_SHARED_PAGE_COUNT: usize = 2;
+const USER_SHARED_PAGE_COUNT: usize = 3;
 pub(crate) const USER_STACK_PAGE_COUNT: usize = 16;
 pub(crate) const USER_CODE_BYTES: u64 = USER_PAGE_BYTES * USER_CODE_PAGE_COUNT as u64;
 const USER_SHARED_BYTES: u64 = USER_PAGE_BYTES * USER_SHARED_PAGE_COUNT as u64;
@@ -752,6 +752,27 @@ const SLOT_NET_CONFIG_PIN_CREATE: usize = 1009;
 const SLOT_NET_CONFIG_ALIAS_PIN_CREATE: usize = 1010;
 const SLOT_NET_QUEUE_PIN_CREATE: usize = 1011;
 const SLOT_NET_BAR0_PIN_CREATE: usize = 1012;
+const SLOT_NET_PCI_IRQ_MODE_INFO: usize = 1013;
+const SLOT_NET_PCI_IRQ_MODE_FLAGS: usize = 1014;
+const SLOT_NET_PCI_IRQ_MODE_BASE_VECTOR: usize = 1015;
+const SLOT_NET_PCI_IRQ_MODE_VECTOR_COUNT: usize = 1016;
+const SLOT_NET_BAR0_DMA_INFO: usize = 1017;
+const SLOT_NET_BAR0_DMA_FLAGS: usize = 1018;
+const SLOT_NET_BAR0_DMA_IOVA: usize = 1019;
+const SLOT_NET_QUEUE_DMA_INFO: usize = 1020;
+const SLOT_NET_QUEUE_DMA_FLAGS: usize = 1021;
+const SLOT_NET_QUEUE_DMA_IOVA: usize = 1022;
+const SLOT_NET_PCI_CONFIG_INFO: usize = 1023;
+const SLOT_NET_PCI_CONFIG_FLAGS: usize = 1024;
+const SLOT_NET_PCI_CONFIG_MAP_OPTIONS: usize = 1025;
+const SLOT_NET_PCI_CONFIG_MAP: usize = 1026;
+const SLOT_NET_PCI_CONFIG_CAPS_OK: usize = 1027;
+const SLOT_NET_PCI_CONFIG_COMMON_BAR: usize = 1028;
+const SLOT_NET_PCI_CONFIG_COMMON_OFFSET: usize = 1029;
+const SLOT_NET_PCI_CONFIG_NOTIFY_OFFSET: usize = 1030;
+const SLOT_NET_PCI_CONFIG_ISR_OFFSET: usize = 1031;
+const SLOT_NET_PCI_CONFIG_DEVICE_OFFSET: usize = 1032;
+const SLOT_NET_PCI_IRQ_MODE_SET: usize = 1033;
 const SLOT_DGRAM_PRESENT: usize = 954;
 const SLOT_DGRAM_FAILURE_STEP: usize = 955;
 const SLOT_DGRAM_CREATE: usize = 956;
@@ -779,7 +800,7 @@ const SLOT_DGRAM_WRITE_PEER_CLOSED: usize = 977;
 const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
 const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_SMP_SMOKE_STATUS;
+const SLOT_MAX: usize = SLOT_NET_PCI_IRQ_MODE_SET;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1986,7 +2007,7 @@ fn print_device_summary(slots: &[u64]) {
 
 fn print_net_summary(slots: &[u64]) {
     crate::kprintln!(
-        "kernel: net dataplane smoke (net_present={}, net_failure_step={}, ready_irq_create={}, tx_irq_create={}, rx_irq_create={}, config_backing_create={}, config_pin_create={}, config_dma_lookup={}, config_alias_create={}, config_alias_pin_create={}, config_alias_dma_lookup={}, config_alias_match={}, config_alias_map={}, config_backing_map={}, reg_backing_create={}, reg_pin_create={}, reg_dma_lookup={}, reg_backing_map={}, bar0_create={}, bar0_pin_create={}, bar0_dma_lookup={}, bar0_match={}, bar0_map={}, queue_vmo_create={}, queue_pin_create={}, queue_dma_lookup={}, queue_map={}, worker_thread_create={}, worker_thread_start={}, ready_wait={}, ready_ack={}, tx_kick={}, worker_wait_kick={}, worker_ack_kick={}, worker_trigger_rx={}, rx_wait={}, rx_ack={}, tx_used_idx={}, rx_used_idx={}, tx_used_len={}, rx_used_len={}, packet_bytes={}, packet_match={}, driver_cpu={}, worker_cpu={}, worker_cpu1={}, pci_vendor_id={}, queue_pairs={}, mmio_ready={}, mmio_device_features={}, mmio_driver_features={}, mmio_status={}, tx_notify_count={}, rx_complete_count={}, tx_notify_mask={}, rx_complete_mask={}, tx_ready_mask={}, rx_ready_mask={}, packet_count={}, packet_match_count={}, batch_cycles={})",
+        "kernel: net dataplane smoke (net_present={}, net_failure_step={}, ready_irq_create={}, tx_irq_create={}, rx_irq_create={}, config_backing_create={}, config_pin_create={}, config_dma_lookup={}, config_alias_create={}, config_alias_pin_create={}, config_alias_dma_lookup={}, config_alias_match={}, config_alias_map={}, config_backing_map={}, reg_backing_create={}, reg_pin_create={}, reg_dma_lookup={}, reg_backing_map={}, pci_config_info={}, pci_config_flags={}, pci_config_map_options={}, pci_config_map={}, pci_config_caps_ok={}, pci_config_common_bar={}, pci_config_common_offset={}, pci_config_notify_offset={}, pci_config_isr_offset={}, pci_config_device_offset={}, pci_irq_mode_info={}, pci_irq_mode_set={}, pci_irq_mode_flags={}, pci_irq_mode_base_vector={}, pci_irq_mode_vector_count={}, bar0_create={}, bar0_pin_create={}, bar0_dma_lookup={}, bar0_dma_info={}, bar0_dma_flags={}, bar0_dma_iova={}, bar0_match={}, bar0_map={}, queue_vmo_create={}, queue_pin_create={}, queue_dma_lookup={}, queue_dma_info={}, queue_dma_flags={}, queue_dma_iova={}, queue_map={}, worker_thread_create={}, worker_thread_start={}, ready_wait={}, ready_ack={}, tx_kick={}, worker_wait_kick={}, worker_ack_kick={}, worker_trigger_rx={}, rx_wait={}, rx_ack={}, tx_used_idx={}, rx_used_idx={}, tx_used_len={}, rx_used_len={}, packet_bytes={}, packet_match={}, driver_cpu={}, worker_cpu={}, worker_cpu1={}, pci_vendor_id={}, queue_pairs={}, mmio_ready={}, mmio_device_features={}, mmio_driver_features={}, mmio_status={}, tx_notify_count={}, rx_complete_count={}, tx_notify_mask={}, rx_complete_mask={}, tx_ready_mask={}, rx_ready_mask={}, packet_count={}, packet_match_count={}, batch_cycles={})",
         slots[SLOT_NET_PRESENT],
         slots[SLOT_NET_FAILURE_STEP],
         slots[SLOT_NET_READY_IRQ_CREATE] as i64,
@@ -2005,14 +2026,35 @@ fn print_net_summary(slots: &[u64]) {
         slots[SLOT_NET_REG_PIN_CREATE] as i64,
         slots[SLOT_NET_REG_LOOKUP] as i64,
         slots[SLOT_NET_REG_BACKING_MAP] as i64,
+        slots[SLOT_NET_PCI_CONFIG_INFO] as i64,
+        slots[SLOT_NET_PCI_CONFIG_FLAGS],
+        slots[SLOT_NET_PCI_CONFIG_MAP_OPTIONS],
+        slots[SLOT_NET_PCI_CONFIG_MAP] as i64,
+        slots[SLOT_NET_PCI_CONFIG_CAPS_OK],
+        slots[SLOT_NET_PCI_CONFIG_COMMON_BAR],
+        slots[SLOT_NET_PCI_CONFIG_COMMON_OFFSET],
+        slots[SLOT_NET_PCI_CONFIG_NOTIFY_OFFSET],
+        slots[SLOT_NET_PCI_CONFIG_ISR_OFFSET],
+        slots[SLOT_NET_PCI_CONFIG_DEVICE_OFFSET],
+        slots[SLOT_NET_PCI_IRQ_MODE_INFO] as i64,
+        slots[SLOT_NET_PCI_IRQ_MODE_SET] as i64,
+        slots[SLOT_NET_PCI_IRQ_MODE_FLAGS],
+        slots[SLOT_NET_PCI_IRQ_MODE_BASE_VECTOR],
+        slots[SLOT_NET_PCI_IRQ_MODE_VECTOR_COUNT],
         slots[SLOT_NET_BAR0_CREATE] as i64,
         slots[SLOT_NET_BAR0_PIN_CREATE] as i64,
         slots[SLOT_NET_BAR0_LOOKUP] as i64,
+        slots[SLOT_NET_BAR0_DMA_INFO] as i64,
+        slots[SLOT_NET_BAR0_DMA_FLAGS],
+        slots[SLOT_NET_BAR0_DMA_IOVA],
         slots[SLOT_NET_BAR0_MATCH],
         slots[SLOT_NET_BAR0_MAP] as i64,
         slots[SLOT_NET_QUEUE_VMO_CREATE] as i64,
         slots[SLOT_NET_QUEUE_PIN_CREATE] as i64,
         slots[SLOT_NET_QUEUE_LOOKUP] as i64,
+        slots[SLOT_NET_QUEUE_DMA_INFO] as i64,
+        slots[SLOT_NET_QUEUE_DMA_FLAGS],
+        slots[SLOT_NET_QUEUE_DMA_IOVA],
         slots[SLOT_NET_QUEUE_MAP] as i64,
         slots[SLOT_NET_WORKER_THREAD_CREATE] as i64,
         slots[SLOT_NET_WORKER_THREAD_START] as i64,
@@ -2831,4 +2873,4 @@ core::arch::global_asm!(
 );
 
 // Compile-time witness: slot indices must fit in the shared two-page u64 slot window.
-const _: () = assert!(SLOT_MAX < 1024);
+const _: () = assert!(SLOT_MAX < (USER_SHARED_PAGE_COUNT * 4096) / core::mem::size_of::<u64>());

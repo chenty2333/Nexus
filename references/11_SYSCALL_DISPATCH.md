@@ -156,15 +156,33 @@ The current bootstrap syscall surface includes:
     - triggerable flag
   - `ax_interrupt_trigger()` is an Axle-native helper rather than a fully generic IRQ delivery ABI
   - `ax_vmo_lookup_paddr()` is a narrow bootstrap helper
-  - `ax_vmo_pin()` + `ax_dma_region_lookup_paddr()` + `ax_dma_region_lookup_iova()` now add one
-    first explicit DMA lifetime object without yet becoming a full BTI/IOMMU contract:
+  - `ax_vmo_pin()` + `ax_dma_region_get_info()` + `ax_dma_region_lookup_paddr()` +
+    `ax_dma_region_lookup_iova()` now add one first explicit DMA lifetime object without yet
+    becoming a full BTI/IOMMU contract:
     - `ax_vmo_pin()` now also freezes one first DMA-permission bit surface
       (`DEVICE_READ` / `DEVICE_WRITE`)
-  - `ax_pci_device_get_info()` / `ax_pci_device_get_bar()` / `ax_pci_device_get_interrupt()`
-    currently export one narrow bootstrap device contract:
+    - `ax_dma_region_get_info()` now exposes one narrow metadata snapshot:
+      - size in bytes
+      - creation-time DMA permission bits
+      - region flags (`IDENTITY_IOVA`, `PHYSICALLY_CONTIGUOUS`)
+      - base physical and device-visible addresses
+  - `ax_pci_device_get_info()` / `ax_pci_device_get_config()` / `ax_pci_device_get_bar()` /
+    `ax_pci_device_get_interrupt()` / `ax_pci_device_get_interrupt_mode()` /
+    `ax_pci_device_set_interrupt_mode()` currently export one narrow bootstrap device contract:
     - one capability already seeded into the bootstrap runner
+    - one synthetic PCI config-space export:
+      - MMIO + read-only flags
+      - VM map options for the config alias
+      - virtio-style region discovery for BAR0/common/notify/isr/device
     - one BAR VMO export result plus BAR flags / VM map-option metadata
     - one interrupt-object export result per queue-pair/group plus delivery-mode / vector metadata
+    - one interrupt-mode capability query exposing:
+      - whether a delivery mode is supported / active
+      - whether the current transport routes through triggerable objects
+      - base vector and vector count for that mode
+    - one first interrupt-mode activation entry point:
+      - `VIRTUAL` is currently the only supported active mode
+      - `LEGACY` / `MSI` / `MSI-X` still return `ZX_ERR_NOT_SUPPORTED`
     - no generic PCI enumeration or bus-management ABI yet
   - `ZX_VM_MAP_MMIO` is now the first narrow public VM mapping attribute bit:
     - it requests device/MMIO cache attributes on the installed mapping

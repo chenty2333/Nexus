@@ -740,3 +740,44 @@ args = [
   { name = "handle", ty = "ax_handle_t" },
   { name = "out_info", ty = "*mut ax_interrupt_info_t" },
 ]
+
+[[syscall]]
+name = "ax_dma_region_get_info"
+nr = 64
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "out_info", ty = "*mut ax_dma_region_info_t" },
+]
+
+[[syscall]]
+name = "ax_pci_device_get_interrupt_mode"
+nr = 65
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "mode", ty = "u32" },
+  { name = "out_info", ty = "*mut ax_pci_interrupt_mode_info_t" },
+]
+
+[[syscall]]
+name = "ax_pci_device_get_config"
+nr = 66
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "out_info", ty = "*mut ax_pci_config_info_t" },
+]
+
+[[syscall]]
+name = "ax_pci_device_set_interrupt_mode"
+nr = 67
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "mode", ty = "u32" },
+]

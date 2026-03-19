@@ -125,6 +125,12 @@ Current state:
   DMA-region object.
 - `ax_dma_region_lookup_iova(handle, offset, out_iova)` is the first narrow device-visible address
   query on that same pinned DMA-region object.
+- `ax_dma_region_get_info(handle, out)` is now the first narrow metadata query on that same pinned
+  DMA-region object:
+  - size in bytes
+  - DMA-permission bits
+  - identity-IOVA / physical-contiguity flags
+  - base physical / device-visible addresses
 - `interrupt_create(ZX_INTERRUPT_VIRTUAL)` is now public as a narrow virtual/software interrupt
   object, and `ax_interrupt_trigger()` is the matching Axle-native injection helper.
 - `interrupt_get_info(handle, out)` is now the first narrow metadata query over an interrupt
@@ -132,6 +138,20 @@ Current state:
   - delivery mode
   - vector / line index
   - triggerable flag
+- `ax_pci_device_get_interrupt_mode(handle, mode, out)` is now the first narrow interrupt-mode
+  capability query on the bootstrap `PciDevice` object:
+  - supported / active / triggerable flags
+  - base vector
+  - vector count
+- `ax_pci_device_get_config(handle, out)` is now the first narrow config-space export on that same
+  bootstrap `PciDevice` object:
+  - config size in bytes
+  - MMIO + read-only flags
+  - VM map options for the config alias mapping
+- `ax_pci_device_set_interrupt_mode(handle, mode)` is now the first narrow interrupt-mode
+  activation path on that same bootstrap `PciDevice` object:
+  - only `VIRTUAL` may currently be selected
+  - hardware-backed modes remain future hang points
 
 What is still intentionally narrow:
 
@@ -142,6 +162,7 @@ What is still intentionally narrow:
 - only physical and contiguous VMOs may currently be pinned
 - the pin contract now has:
   - one first identity-like device-visible IOVA query
+  - one first metadata query over that pinned DMA lifetime object
   - one first DMA-permission bit surface
   but there is still no map/unmap token or richer translation/isolation model yet
 - there is no IOMMU-facing isolation contract

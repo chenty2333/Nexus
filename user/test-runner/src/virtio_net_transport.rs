@@ -7,6 +7,7 @@ pub(crate) const QUEUE_PAIR_COUNT: usize = 2;
 pub(crate) const TOTAL_QUEUE_COUNT: usize = QUEUE_PAIR_COUNT * 2;
 pub(crate) const BUFFER_STRIDE: u64 = 256;
 pub(crate) const REGISTER_VMO_BYTES: u64 = PAGE_SIZE;
+pub(crate) const CONFIG_VMO_BYTES: u64 = PAGE_SIZE;
 
 pub(crate) const QUEUE_PAIR_BYTES: u64 = 4 * PAGE_SIZE;
 pub(crate) const QUEUE_VMO_BYTES: u64 = QUEUE_PAIR_COUNT as u64 * QUEUE_PAIR_BYTES;
@@ -29,6 +30,32 @@ pub(crate) const PCI_VENDOR_ID_AXLE: u16 = 0x4158;
 pub(crate) const PCI_DEVICE_ID_NET: u16 = 0x0001;
 pub(crate) const PCI_CLASS_NETWORK: u8 = 0x02;
 pub(crate) const PCI_SUBCLASS_ETHERNET: u8 = 0x00;
+pub(crate) const PCI_CAP_ID_VENDOR: u8 = 0x09;
+pub(crate) const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
+pub(crate) const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+pub(crate) const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
+pub(crate) const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+pub(crate) const PCI_CAP_PTR_OFFSET: u64 = 0x34;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct VirtioPciCapRegion {
+    pub(crate) bar: u8,
+    pub(crate) offset: u32,
+    pub(crate) length: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct VirtioPciDiscovery {
+    pub(crate) vendor_id: u16,
+    pub(crate) device_id: u16,
+    pub(crate) class_code: u8,
+    pub(crate) subclass: u8,
+    pub(crate) common: VirtioPciCapRegion,
+    pub(crate) notify: VirtioPciCapRegion,
+    pub(crate) notify_multiplier: u32,
+    pub(crate) isr: VirtioPciCapRegion,
+    pub(crate) device: VirtioPciCapRegion,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -105,6 +132,75 @@ struct VirtioQueueState {
 struct VirtioPciRegs {
     pub(crate) common: VirtioPciCommonCfg,
     pub(crate) queues: [VirtioQueueState; TOTAL_QUEUE_COUNT],
+}
+
+fn read_cfg_u8(mapped_base: u64, offset: u64) -> u8 {
+    // SAFETY: the mapped PCI config window is a fixed read-only byte span.
+    unsafe { ptr::read_volatile((mapped_base + offset) as *const u8) }
+}
+
+fn read_cfg_u16(mapped_base: u64, offset: u64) -> u16 {
+    let b0 = read_cfg_u8(mapped_base, offset);
+    let b1 = read_cfg_u8(mapped_base, offset + 1);
+    u16::from_le_bytes([b0, b1])
+}
+
+fn read_cfg_u32(mapped_base: u64, offset: u64) -> u32 {
+    let b0 = read_cfg_u8(mapped_base, offset);
+    let b1 = read_cfg_u8(mapped_base, offset + 1);
+    let b2 = read_cfg_u8(mapped_base, offset + 2);
+    let b3 = read_cfg_u8(mapped_base, offset + 3);
+    u32::from_le_bytes([b0, b1, b2, b3])
+}
+
+fn read_cap_region(mapped_base: u64, cap_offset: u64) -> VirtioPciCapRegion {
+    VirtioPciCapRegion {
+        bar: read_cfg_u8(mapped_base, cap_offset + 4),
+        offset: read_cfg_u32(mapped_base, cap_offset + 8),
+        length: read_cfg_u32(mapped_base, cap_offset + 12),
+    }
+}
+
+pub(crate) fn discover_pci_transport(mapped_base: u64) -> Option<VirtioPciDiscovery> {
+    let mut discovery = VirtioPciDiscovery {
+        vendor_id: read_cfg_u16(mapped_base, 0x00),
+        device_id: read_cfg_u16(mapped_base, 0x02),
+        subclass: read_cfg_u8(mapped_base, 0x0a),
+        class_code: read_cfg_u8(mapped_base, 0x0b),
+        ..VirtioPciDiscovery::default()
+    };
+
+    let mut cap_off = u64::from(read_cfg_u8(mapped_base, PCI_CAP_PTR_OFFSET));
+    while cap_off != 0 {
+        if read_cfg_u8(mapped_base, cap_off) != PCI_CAP_ID_VENDOR {
+            cap_off = u64::from(read_cfg_u8(mapped_base, cap_off + 1));
+            continue;
+        }
+
+        match read_cfg_u8(mapped_base, cap_off + 3) {
+            VIRTIO_PCI_CAP_COMMON_CFG => {
+                discovery.common = read_cap_region(mapped_base, cap_off);
+            }
+            VIRTIO_PCI_CAP_NOTIFY_CFG => {
+                discovery.notify = read_cap_region(mapped_base, cap_off);
+                discovery.notify_multiplier = read_cfg_u32(mapped_base, cap_off + 16);
+            }
+            VIRTIO_PCI_CAP_ISR_CFG => {
+                discovery.isr = read_cap_region(mapped_base, cap_off);
+            }
+            VIRTIO_PCI_CAP_DEVICE_CFG => {
+                discovery.device = read_cap_region(mapped_base, cap_off);
+            }
+            _ => {}
+        }
+        cap_off = u64::from(read_cfg_u8(mapped_base, cap_off + 1));
+    }
+
+    (discovery.common.length != 0
+        && discovery.notify.length != 0
+        && discovery.isr.length != 0
+        && discovery.device.length != 0)
+        .then_some(discovery)
 }
 
 #[repr(C)]

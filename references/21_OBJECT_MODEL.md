@@ -72,6 +72,10 @@ Current PCI-device shape:
 - it is not waitable
 - it currently exports:
   - one immutable device-info snapshot
+  - one synthetic PCI config-space export plus:
+    - config size
+    - MMIO + read-only flags
+    - suggested VM map options for the config alias
   - one BAR VMO handle per supported BAR index plus:
     - BAR size
     - BAR flags
@@ -79,10 +83,18 @@ Current PCI-device shape:
   - one interrupt-object handle per `(group, queue_pair)` tuple plus:
     - delivery mode
     - opaque vector / line index metadata
+  - one interrupt-mode capability snapshot per delivery mode through
+    `ax_pci_device_get_interrupt_mode()`:
+    - supported / active / triggerable flags
+    - base vector
+    - vector count
+  - one interrupt-mode activation path through `ax_pci_device_set_interrupt_mode()`:
+    - `VIRTUAL` may be selected today
+    - hardware-backed modes remain intentionally unimplemented
 - the first concrete user is the queue-owned bootstrap net dataplane slice
 - it is not yet a full PCI bus/discovery object:
   - no enumeration
-  - no config-space read/write ABI
+  - no generic config-space read/write ABI
   - no MSI/MSI-X model
   - no resource rebinding or hotplug semantics
 
@@ -96,6 +108,11 @@ Current DMA-region shape:
   - `DEVICE_READ`
   - `DEVICE_WRITE`
 - it currently exposes two narrow metadata queries:
+  - `ax_dma_region_get_info()`:
+    - size in bytes
+    - creation-time DMA permission bits
+    - region flags (`IDENTITY_IOVA`, `PHYSICALLY_CONTIGUOUS`)
+    - base physical / device-visible addresses
   - `ax_dma_region_lookup_paddr()` for one offset inside the pinned range
   - `ax_dma_region_lookup_iova()` for one first device-visible address view of that same range
 - it is not waitable and it does not yet imply any BTI/IOMMU grant or cache-policy contract

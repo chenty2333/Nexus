@@ -130,3 +130,11 @@ pub const AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT: SyscallNumber = 61;
 pub const AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA: SyscallNumber = 62;
 /// Contract: SHOULD
 pub const AXLE_SYS_INTERRUPT_GET_INFO: SyscallNumber = 63;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_DMA_REGION_GET_INFO: SyscallNumber = 64;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE: SyscallNumber = 65;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG: SyscallNumber = 66;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE: SyscallNumber = 67;
