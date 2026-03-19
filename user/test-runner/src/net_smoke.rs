@@ -5,15 +5,16 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::virtio_net_transport::{
     BUFFER_STRIDE, MMIO_DEVICE_ID_NET, MMIO_FEATURE_CSUM, MMIO_INTERRUPT_RX_COMPLETE, MMIO_MAGIC,
-    MMIO_NOTIFY_RX, MMIO_NOTIFY_TX, MMIO_STATUS_ACKNOWLEDGE, MMIO_STATUS_DRIVER,
-    MMIO_STATUS_DRIVER_OK, MMIO_STATUS_FEATURES_OK, MMIO_VENDOR_ID_AXLE, MMIO_VERSION, PAGE_SIZE,
-    PCI_CLASS_NETWORK, PCI_DEVICE_ID_NET, PCI_SUBCLASS_ETHERNET, PCI_VENDOR_ID_AXLE,
-    QUEUE_PAIR_COUNT, QUEUE_SIZE, QUEUE_VMO_BYTES, REGISTER_VMO_BYTES, VirtioNetHdr,
-    VirtioQueueRegs, VirtqDesc, buffer_offset, buffer_paddr, empty_avail, empty_used, frame_len,
-    init_regs, map_dma_addr, read_avail_at, read_desc_at, read_header, read_queue_regs, read_used,
-    rx_avail_paddr, rx_buffer_offset, rx_desc_paddr, rx_queue_offset, rx_used_paddr,
-    tx_avail_paddr, tx_buffer_offset, tx_desc_paddr, tx_queue_offset, tx_used_paddr, write_avail,
-    write_desc, write_header, write_queue_regs, write_used, write_used_at,
+    MMIO_STATUS_ACKNOWLEDGE, MMIO_STATUS_DRIVER, MMIO_STATUS_DRIVER_OK, MMIO_STATUS_FEATURES_OK,
+    MMIO_VENDOR_ID_AXLE, MMIO_VERSION, PAGE_SIZE, PCI_CLASS_NETWORK, PCI_DEVICE_ID_NET,
+    PCI_SUBCLASS_ETHERNET, PCI_VENDOR_ID_AXLE, QUEUE_PAIR_COUNT, QUEUE_SIZE, QUEUE_VMO_BYTES,
+    REGISTER_VMO_BYTES, VirtioNetHdr, VirtioQueueRegs, VirtqDesc, buffer_offset, buffer_paddr,
+    driver_program_queue, driver_select_queue, empty_avail, empty_used, frame_len, init_regs,
+    map_dma_addr, read_avail_at, read_desc_at, read_header, read_queue_regs, read_used,
+    rx_avail_paddr, rx_buffer_offset, rx_desc_paddr, rx_queue_notify_value, rx_queue_offset,
+    rx_used_paddr, tx_avail_paddr, tx_buffer_offset, tx_desc_paddr, tx_queue_notify_value,
+    tx_queue_offset, tx_used_paddr, write_avail, write_desc, write_header, write_queue_regs,
+    write_used, write_used_at,
 };
 use axle_arch_x86_64::{debug_break, native_syscall8, rdtsc};
 use libzircon::dma::{ZX_DMA_PERM_DEVICE_READ, ZX_DMA_PERM_DEVICE_WRITE};
@@ -868,20 +869,21 @@ fn configure_driver_transport(
     write_header(reg_base, new_header);
 
     for pair in 0..QUEUE_PAIR_COUNT {
-        write_queue_regs(
+        driver_select_queue(reg_base, crate::virtio_net_transport::tx_queue_index(pair));
+        driver_program_queue(
             reg_base,
-            pair,
-            VirtioQueueRegs {
-                tx_queue_ready: 1,
-                rx_queue_ready: 1,
-                tx_desc_addr: tx_desc_paddr(queue_paddr, pair),
-                tx_avail_addr: tx_avail_paddr(queue_paddr, pair),
-                tx_used_addr: tx_used_paddr(queue_paddr, pair),
-                rx_desc_addr: rx_desc_paddr(queue_paddr, pair),
-                rx_avail_addr: rx_avail_paddr(queue_paddr, pair),
-                rx_used_addr: rx_used_paddr(queue_paddr, pair),
-                ..VirtioQueueRegs::default()
-            },
+            crate::virtio_net_transport::tx_queue_index(pair),
+            tx_desc_paddr(queue_paddr, pair),
+            tx_avail_paddr(queue_paddr, pair),
+            tx_used_paddr(queue_paddr, pair),
+        );
+        driver_select_queue(reg_base, crate::virtio_net_transport::rx_queue_index(pair));
+        driver_program_queue(
+            reg_base,
+            crate::virtio_net_transport::rx_queue_index(pair),
+            rx_desc_paddr(queue_paddr, pair),
+            rx_avail_paddr(queue_paddr, pair),
+            rx_used_paddr(queue_paddr, pair),
         );
     }
 
@@ -950,7 +952,7 @@ extern "C" fn net_worker_entry(pair_raw: u64, _arg1: u64) -> ! {
     }
 
     let mut queue_regs = queue_regs;
-    queue_regs.notify_value = MMIO_NOTIFY_TX;
+    queue_regs.notify_value = tx_queue_notify_value(pair);
     queue_regs.tx_notify_count = queue_regs.tx_notify_count.saturating_add(1);
     write_queue_regs(reg_base, pair, queue_regs);
 
@@ -1022,7 +1024,7 @@ extern "C" fn net_worker_entry(pair_raw: u64, _arg1: u64) -> ! {
     write_used_at(rx_used_base, rx_used);
 
     queue_regs = read_queue_regs(reg_base, pair);
-    queue_regs.notify_value = MMIO_NOTIFY_RX;
+    queue_regs.notify_value = rx_queue_notify_value(pair);
     queue_regs.interrupt_status |= MMIO_INTERRUPT_RX_COMPLETE;
     queue_regs.rx_complete_count = queue_regs.rx_complete_count.saturating_add(1);
     write_queue_regs(reg_base, pair, queue_regs);

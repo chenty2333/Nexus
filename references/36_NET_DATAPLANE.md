@@ -12,7 +12,8 @@ See also:
 
 This file describes the current narrow network-dataplane bootstrap shape in the repository.
 
-It is not yet a full PCI transport, a full virtio-net driver, or a full userspace netstack.
+It is not yet a full PCI transport, a full userspace netstack, or a real hardware-backed
+virtio-net driver.
 It is the first proof that the current device-facing Axle substrate is already enough to support a
 queue-owned shared-memory + interrupt dataplane in ring3 through one kernel-exported bootstrap
 device contract.
@@ -39,16 +40,19 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
 - driver mapping of the BAR0 window now uses the BAR-exported VM map options and therefore
   explicitly requests `ZX_VM_MAP_MMIO`
 - one second mapping of that same BAR0 export is used by the synthetic device-side worker
-- one MMIO-style BAR0 page carries:
+- one BAR0 register window now carries one first narrow virtio-style common-config shape:
   - device identity/version
-  - feature bits plus driver-accepted feature bits
-  - queue-pair count and stride metadata
-  - one queue-local control block per queue pair for:
-    - ready bits
-    - last notify value
-    - interrupt status
-    - notify / completion counts
-    - driver-programmed TX/RX desc / avail / used DMA addresses
+  - device feature bits plus driver-accepted feature bits
+  - device status
+  - queue-select
+  - selected-queue size / enable / notify-off view
+  - selected-queue desc / avail / used DMA addresses
+- one queue-state array behind that common-config view now carries:
+  - per-queue ready state
+  - last notify value
+  - interrupt status
+  - notify / completion counts
+  - programmed TX/RX desc / avail / used DMA addresses
 - two queue-local virtual interrupt triplets:
   - one worker-ready interrupt per queue pair
   - one TX-kick interrupt per queue pair
@@ -81,21 +85,25 @@ Ownership is intentionally one-writer-per-substructure:
   - every TX avail ring
   - every RX descriptor table entry
   - every RX avail ring
-  - the global MMIO header
+  - the BAR0 common-config state
 - worker/device side writes:
   - the TX used ring for its owned queue pair
   - the RX used ring for its owned queue pair
-  - the MMIO queue-local control block for its owned queue pair
-- driver side writes the MMIO driver-ready / feature-ack state before the first kick
-- driver side now also writes the queue DMA addresses into that same queue-local MMIO block before
-  the first kick; the worker/device side consumes those programmed addresses rather than relying on
-  one fixed shared-memory offset convention
+  - the queue-state runtime counters for its owned TX/RX queues
+- driver side now performs one first narrow virtio-style bring-up sequence before the first kick:
+  - accept features
+  - set `ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK`
+  - select each TX/RX queue in BAR0
+  - program desc / avail / used DMA addresses for that selected queue
+  - enable the selected queue
+- worker/device side consumes those programmed queue DMA addresses rather than relying on one fixed
+  shared-memory offset convention
 - readiness/notification uses interrupt objects rather than channels or ports in the data path
 
 The current smoke now completes one batched transport round:
 
 - one `PciDevice` info query plus BAR0 export
-- one MMIO-style ready/feature/queue-ready handshake
+- one virtio-style feature/status/queue-select bring-up handshake over BAR0
 - one four-packet TX publish on each queue pair
 - one TX kick interrupt per queue pair
 - one batched device-side copy/completion pass per queue pair
@@ -112,8 +120,8 @@ The current bootstrap slice proves three things:
 1. The current public `InterruptObject` + contiguous/physical VMO surface is sufficient to drive one
    user-mode shared-memory dataplane loop with one kernel-exported device handle, one BAR0
    register window, and one first narrow public MMIO mapping attribute bit.
-2. Queue-owned multi-queue transport can already be exercised without inventing a kernel-resident
-   network stack.
+2. Queue-owned multi-queue transport can already be exercised through one first narrow user-mode
+   virtio-style bring-up path without inventing a kernel-resident network stack.
 3. The current `DmaRegion` object is already enough to express one explicit DMA lifetime contract
    for queue memory and driver-visible control windows, and the driver/device pair can now pass
    queue ownership through explicit programmed DMA addresses instead of one fully synthetic offset
@@ -129,10 +137,10 @@ The current bootstrap slice proves three things:
 - only one first narrow identity-like IOVA query exists; there is still no DMA map/unmap or fuller
   IOVA token model yet
 - no MSI/MSI-X or hardware IRQ routing
-- no real virtio feature negotiation
+- no full virtio PCI capability layout or config-space ABI
 - no userspace TCP/IP stack
 - no RSS / scheduler-domain queue placement policy
-- no real PCI-backed virtio transport bring-up yet
+- no real hardware-backed virtio-net device bring-up yet
 
 ## Current guidance
 
@@ -141,6 +149,8 @@ The current bootstrap slice proves three things:
 - Keep the next net cuts focused on:
   - moving from the current bootstrap `PciDevice` export object to a fuller PCI resource model
   - keeping queue memory and control windows on explicit `DmaRegion` lifetime objects
+  - keeping the current common-config / queue-select bring-up path aligned with later real
+    virtio-net transport work instead of growing more smoke-local control-plane shortcuts
   - queue ownership
   - interrupt/kick/completion batching
   - shared-memory data movement

@@ -172,19 +172,21 @@ Main just targets include:
   - DMA-region IOVA lookup, not raw VMO lookup, now freezes the DMA-style address handoff shape
   - driver mapping of the exported BAR0 window now consumes the BAR-exported map options and
     therefore explicitly exercises `ZX_VM_MAP_MMIO`
-  - one MMIO-style BAR0 register page freezes a minimal control-plane shape:
+  - one BAR0 register window now freezes one first narrow virtio-style control-plane shape:
     - device identity/version
-    - feature bits plus driver-acknowledged feature bits
-    - queue-pair count and stride metadata
-    - one queue-local ready/notify/completion block per queue pair
-    - one queue-local set of programmed TX/RX desc / avail / used DMA addresses
+    - device feature bits plus driver-acknowledged feature bits
+    - device status
+    - queue-select plus selected-queue size / enable / notify-off state
+    - selected-queue desc / avail / used DMA addresses
+    - one queue-state array behind that view carrying runtime notify/completion counts
   - one ready interrupt, one TX-kick interrupt, and one RX-complete interrupt per queue pair carry
     control flow
   - the runner now also cross-checks those exported interrupts through `interrupt_get_info()`:
     - mode/vector metadata must agree with the PCI-exported snapshot
     - the current synthetic transport requires triggerable interrupt objects
   - one reusable split TX/RX virtio-style transport slice now completes one eight-packet batched
-    loopback round without channel/socket data-plane help
+    loopback round without channel/socket data-plane help, and the driver now exercises a
+    virtio-style feature/status/queue-select bring-up sequence before the first kick
   - the summary now also exports:
     - `config_backing_create`
     - `config_pin_create`

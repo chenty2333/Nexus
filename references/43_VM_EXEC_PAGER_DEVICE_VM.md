@@ -159,6 +159,6 @@ What is still intentionally narrow:
 - Treat the current physical / contiguous / interrupt surface as one minimal device-facing substrate:
   enough for bootstrap smoke, the current queue-owned user-mode net dataplane slice, the current
   bootstrap `PciDevice` + BAR0 transport smoke, the now-explicit `DmaRegion`-backed queue
-  and control-window lifetime slice, the first MMIO-attributed driver BAR mappings, future
-  user-mode virtio transport work, and later
+  and control-window lifetime slice, the first MMIO-attributed driver BAR mappings, the first
+  narrow user-mode virtio-style feature/status/queue-select bring-up path, and later
   DMA/IOMMU integration, but not yet the final DFv2 device contract.
