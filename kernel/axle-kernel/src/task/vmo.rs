@@ -498,6 +498,138 @@ impl VmDomain {
             }
         }
     }
+
+    pub(super) fn ensure_global_vmo_frame(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        page_offset: u64,
+        prepared: &mut PreparedFaultWork,
+    ) -> Result<FrameId, zx_status_t> {
+        if let Some(frame_id) = self.global_vmo_frame(global_vmo_id, page_offset)? {
+            return Ok(frame_id);
+        }
+        let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
+        let new_frame_id = self.with_frames_mut(|frames| {
+            frames
+                .register_existing(new_frame_paddr)
+                .map_err(|_| ZX_ERR_BAD_STATE)
+        })?;
+        self.update_global_vmo_frame(global_vmo_id, page_offset, new_frame_id)?;
+        Ok(new_frame_id)
+    }
+}
+
+impl VmDomain {
+    pub(super) fn local_vmo_snapshot(
+        &self,
+        owner_address_space_id: AddressSpaceId,
+        local_vmo_id: VmoId,
+    ) -> Result<Vmo, zx_status_t> {
+        self.address_spaces
+            .get(&owner_address_space_id)
+            .and_then(|space| space.vm.vmo(local_vmo_id))
+            .cloned()
+            .ok_or(ZX_ERR_BAD_STATE)
+    }
+
+    pub(super) fn ensure_local_vmo_frame(
+        &mut self,
+        owner_address_space_id: AddressSpaceId,
+        local_vmo_id: VmoId,
+        page_offset: u64,
+    ) -> Result<FrameId, zx_status_t> {
+        if let Some(frame_id) = self
+            .address_spaces
+            .get(&owner_address_space_id)
+            .and_then(|space| space.vm.vmo(local_vmo_id))
+            .and_then(|vmo| vmo.frame_at_offset(page_offset))
+        {
+            return Ok(frame_id);
+        }
+
+        let new_frame_paddr =
+            crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
+        let bound =
+            self.with_address_space_frames_mut(owner_address_space_id, |address_space, frames| {
+                if let Some(frame_id) = address_space
+                    .vm
+                    .vmo(local_vmo_id)
+                    .and_then(|vmo| vmo.frame_at_offset(page_offset))
+                {
+                    return Ok((frame_id, false));
+                }
+                let new_frame_id = frames
+                    .register_existing(new_frame_paddr)
+                    .map_err(|_| ZX_ERR_BAD_STATE)?;
+                address_space
+                    .set_vmo_frame(local_vmo_id, page_offset, new_frame_id)
+                    .map_err(map_address_space_error)?;
+                Ok((new_frame_id, true))
+            })?;
+        if !bound.1 {
+            crate::userspace::free_bootstrap_page(new_frame_paddr);
+        }
+        Ok(bound.0)
+    }
+
+    pub(super) fn attach_local_vmo_page_aliases(
+        &mut self,
+        owner_address_space_id: AddressSpaceId,
+        local_vmo_id: VmoId,
+        page_offset: u64,
+        frame_id: FrameId,
+    ) -> Result<(), zx_status_t> {
+        let page_bases =
+            self.with_address_space_frames_mut(owner_address_space_id, |address_space, frames| {
+                address_space
+                    .vm
+                    .materialize_vmo_page_aliases(frames, local_vmo_id, page_offset, frame_id)
+                    .map_err(map_address_space_error)
+            })?;
+        for page_base in page_bases {
+            self.sync_mapping_pages(
+                owner_address_space_id,
+                page_base,
+                crate::userspace::USER_PAGE_BYTES,
+            )?;
+        }
+        self.validate_frame_mapping_invariants(frame_id, "attach_local_vmo_page_aliases");
+        Ok(())
+    }
+
+    pub(super) fn attach_global_vmo_page_aliases(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+        page_offset: u64,
+        frame_id: FrameId,
+    ) -> Result<(), zx_status_t> {
+        let address_space_ids = self.address_space_ids_importing_global_vmo(global_vmo_id);
+        for address_space_id in address_space_ids {
+            let Some(local_vmo_id) = self
+                .address_spaces
+                .get(&address_space_id)
+                .and_then(|space| space.local_vmo_id(global_vmo_id))
+            else {
+                continue;
+            };
+            let page_bases =
+                self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
+                    address_space
+                        .vm
+                        .materialize_vmo_page_aliases(frames, local_vmo_id, page_offset, frame_id)
+                        .map_err(map_address_space_error)
+                })?;
+            for page_base in page_bases {
+                self.sync_mapping_pages(
+                    address_space_id,
+                    page_base,
+                    crate::userspace::USER_PAGE_BYTES,
+                )?;
+            }
+        }
+        self.validate_frame_mapping_invariants(frame_id, "attach_global_vmo_page_aliases");
+        Ok(())
+    }
 }
 
 fn validate_vmo_io_range(size_bytes: u64, offset: u64, len: usize) -> Result<(), zx_status_t> {
