@@ -1,3 +1,6 @@
+use super::super::task::lifecycle::{
+    fork_sigactions, fork_task_signals, reset_exec_sigactions, reset_task_after_exec,
+};
 use super::super::*;
 use super::support::{RecordingFd, test_kernel_with_stdio};
 
@@ -127,7 +130,7 @@ fn fork_sigactions_clone_is_independent_of_parent_mutation() {
         },
     );
 
-    let cloned = super::super::sys::process::fork_sigactions(&parent);
+    let cloned = fork_sigactions(&parent);
     parent.clear();
     assert_eq!(cloned.len(), 1);
     assert_eq!(cloned.get(&10).expect("cloned action").handler, 0x4000);
@@ -138,7 +141,7 @@ fn fork_and_exec_signal_helpers_preserve_and_reset_expected_state() {
     const TEST_SIGUSR1: i32 = 10;
     const TEST_SIGUSR2: i32 = 12;
     let parent_blocked = linux_signal_bit(LINUX_SIGSTOP).expect("sigstop bit");
-    let inherited = super::super::sys::process::fork_task_signals(parent_blocked);
+    let inherited = fork_task_signals(parent_blocked);
     assert_eq!(inherited.blocked, parent_blocked);
     assert_eq!(inherited.pending, 0);
 
@@ -161,9 +164,9 @@ fn fork_and_exec_signal_helpers_preserve_and_reset_expected_state() {
             mask: 0,
         },
     );
-    let cloned = super::super::sys::process::fork_sigactions(&sigactions);
+    let cloned = fork_sigactions(&sigactions);
     assert_eq!(cloned.len(), 2);
-    super::super::sys::process::reset_exec_sigactions(&mut sigactions);
+    reset_exec_sigactions(&mut sigactions);
     assert_eq!(sigactions.len(), 1);
     assert_eq!(
         sigactions
@@ -197,7 +200,7 @@ fn fork_and_exec_signal_helpers_preserve_and_reset_expected_state() {
             previous_blocked: 0,
         }),
     };
-    super::super::sys::process::reset_task_after_exec(&mut task);
+    reset_task_after_exec(&mut task);
     assert_eq!(task.signals.blocked, parent_blocked);
     assert_eq!(
         task.signals.pending,
