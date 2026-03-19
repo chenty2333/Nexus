@@ -315,6 +315,31 @@ impl StarnixKernel {
         Ok(events)
     }
 
+    #[cfg(test)]
+    pub(in crate::starnix) fn collect_epoll_events_for_test(
+        &mut self,
+        epoll_key: LinuxFileDescriptionKey,
+        maxevents: usize,
+    ) -> Result<Vec<LinuxEpollEvent>, zx_status_t> {
+        self.refresh_level_triggered_epoll_ready(epoll_key)?;
+        self.collect_epoll_events(epoll_key, maxevents)
+    }
+
+    #[cfg(test)]
+    pub(in crate::starnix) fn epoll_entry_disabled_for_test(
+        &self,
+        epoll_key: LinuxFileDescriptionKey,
+        target_key: LinuxFileDescriptionKey,
+    ) -> Option<bool> {
+        Some(
+            self.epolls
+                .get(&epoll_key)?
+                .entries
+                .get(&target_key)?
+                .disabled,
+        )
+    }
+
     fn refresh_level_triggered_epoll_ready(
         &mut self,
         epoll_key: LinuxFileDescriptionKey,

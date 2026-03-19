@@ -981,6 +981,55 @@ mod tests {
     }
 
     #[test]
+    fn fcntl_dupfd_variants_share_open_file_descriptions_and_apply_cloexec() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        let resources = kernel
+            .groups
+            .get_mut(&1)
+            .expect("root group")
+            .resources
+            .as_mut()
+            .expect("root resources");
+        let source_fd = resources
+            .fs
+            .fd_table
+            .open(
+                Arc::new(PseudoNodeFd::new(None)),
+                OpenFlags::READABLE | OpenFlags::WRITABLE,
+                FdFlags::empty(),
+            )
+            .expect("open source fd");
+        let source_key = {
+            let entry = resources.fs.fd_table.get(source_fd).expect("source entry");
+            file_description_key(entry.description())
+        };
+
+        let dupfd = resources
+            .fcntl(source_fd, LINUX_F_DUPFD, 8)
+            .expect("f_dupfd") as i32;
+        let dupfd_entry = resources.fs.fd_table.get(dupfd).expect("dupfd entry");
+        assert_eq!(dupfd, 8);
+        assert_eq!(file_description_key(dupfd_entry.description()), source_key);
+        assert_eq!(dupfd_entry.flags(), FdFlags::empty());
+
+        let dupfd_cloexec = resources
+            .fcntl(source_fd, LINUX_F_DUPFD_CLOEXEC, 11)
+            .expect("f_dupfd_cloexec") as i32;
+        let cloexec_entry = resources
+            .fs
+            .fd_table
+            .get(dupfd_cloexec)
+            .expect("cloexec dupfd entry");
+        assert_eq!(dupfd_cloexec, 11);
+        assert_eq!(
+            file_description_key(cloexec_entry.description()),
+            source_key
+        );
+        assert_eq!(cloexec_entry.flags(), FdFlags::CLOEXEC);
+    }
+
+    #[test]
     fn wait_matches_tracks_same_group_and_explicit_pgid_targets() {
         let stdout = RecordingFd::new();
         let mut kernel = test_kernel_with_stdio(stdout);
@@ -1196,6 +1245,116 @@ mod tests {
         let instance = kernel.epolls.get(&epoll_key).expect("epoll instance");
         assert!(instance.ready_set.contains(&target_key));
         assert_eq!(instance.ready_list.front(), Some(&target_key));
+    }
+
+    #[test]
+    fn epoll_level_triggered_entries_requeue_while_target_stays_ready() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        let (description, target_key) = {
+            let resources = kernel
+                .groups
+                .get_mut(&1)
+                .expect("root group")
+                .resources
+                .as_mut()
+                .expect("root resources");
+            let fd = resources
+                .fs
+                .fd_table
+                .open(
+                    Arc::new(PseudoNodeFd::new(None)),
+                    OpenFlags::READABLE | OpenFlags::WRITABLE,
+                    FdFlags::empty(),
+                )
+                .expect("open pseudo fd");
+            let entry = resources.fs.fd_table.get(fd).expect("pseudo entry");
+            (
+                Arc::clone(entry.description()),
+                file_description_key(entry.description()),
+            )
+        };
+        let epoll_key = LinuxFileDescriptionKey(0xbeef);
+        let mut instance = EpollInstance::new();
+        instance.entries.insert(
+            target_key,
+            super::poll::epoll::EpollEntry::new(description, LINUX_EPOLLIN, 0xaaaa, None, None),
+        );
+        kernel.epolls.insert(epoll_key, instance);
+
+        kernel.queue_epoll_ready(epoll_key, target_key, LINUX_EPOLLIN);
+        let first = kernel
+            .collect_epoll_events_for_test(epoll_key, 1)
+            .expect("first epoll collect");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].events, LINUX_EPOLLIN);
+        assert_eq!(first[0].data, 0xaaaa);
+
+        let second = kernel
+            .collect_epoll_events_for_test(epoll_key, 1)
+            .expect("second epoll collect");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].events, LINUX_EPOLLIN);
+        assert_eq!(second[0].data, 0xaaaa);
+    }
+
+    #[test]
+    fn epoll_oneshot_entries_disable_after_first_delivery() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        let (description, target_key) = {
+            let resources = kernel
+                .groups
+                .get_mut(&1)
+                .expect("root group")
+                .resources
+                .as_mut()
+                .expect("root resources");
+            let fd = resources
+                .fs
+                .fd_table
+                .open(
+                    Arc::new(PseudoNodeFd::new(None)),
+                    OpenFlags::READABLE | OpenFlags::WRITABLE,
+                    FdFlags::empty(),
+                )
+                .expect("open pseudo fd");
+            let entry = resources.fs.fd_table.get(fd).expect("pseudo entry");
+            (
+                Arc::clone(entry.description()),
+                file_description_key(entry.description()),
+            )
+        };
+        let epoll_key = LinuxFileDescriptionKey(0xcafe);
+        let mut instance = EpollInstance::new();
+        instance.entries.insert(
+            target_key,
+            super::poll::epoll::EpollEntry::new(
+                description,
+                LINUX_EPOLLIN | LINUX_EPOLLONESHOT,
+                0xbbbb,
+                None,
+                None,
+            ),
+        );
+        kernel.epolls.insert(epoll_key, instance);
+
+        kernel.queue_epoll_ready(epoll_key, target_key, LINUX_EPOLLIN);
+        let first = kernel
+            .collect_epoll_events_for_test(epoll_key, 1)
+            .expect("oneshot epoll collect");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].events, LINUX_EPOLLIN);
+        assert_eq!(first[0].data, 0xbbbb);
+        assert_eq!(
+            kernel.epoll_entry_disabled_for_test(epoll_key, target_key),
+            Some(true)
+        );
+
+        let second = kernel
+            .collect_epoll_events_for_test(epoll_key, 1)
+            .expect("second oneshot epoll collect");
+        assert!(second.is_empty());
     }
 
     #[test]
@@ -1430,6 +1589,92 @@ mod tests {
                 .resolve_proc_readlink_target(1, "/proc/self/fd/1")
                 .expect("stdout target"),
             "/dev/stdout"
+        );
+    }
+
+    #[test]
+    fn proc_self_fd_readlink_reports_anon_inode_targets() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+
+        let mut stop_state = ax_guest_stop_state_t::default();
+        let epollfd = {
+            stop_state.regs.rdi = 0;
+            let action = kernel
+                .sys_epoll_create1(1, &mut stop_state)
+                .expect("epoll_create1");
+            assert!(matches!(action, SyscallAction::Resume));
+            stop_state.regs.rax as i32
+        };
+        let (signalfd, pidfd) = {
+            let resources = kernel
+                .groups
+                .get_mut(&1)
+                .expect("root group")
+                .resources
+                .as_mut()
+                .expect("root resources");
+            let signalfd = resources
+                .fs
+                .fd_table
+                .open(
+                    Arc::new(PseudoNodeFd::new(None)),
+                    OpenFlags::READABLE,
+                    FdFlags::empty(),
+                )
+                .expect("open synthetic signalfd");
+            let signalfd_key = {
+                let entry = resources
+                    .fs
+                    .fd_table
+                    .get(signalfd)
+                    .expect("synthetic signalfd entry");
+                file_description_key(entry.description())
+            };
+            kernel
+                .signalfds
+                .insert(signalfd_key, Weak::<Mutex<SignalFdState>>::new());
+
+            let pidfd = resources
+                .fs
+                .fd_table
+                .open(
+                    Arc::new(PseudoNodeFd::new(None)),
+                    OpenFlags::READABLE,
+                    FdFlags::empty(),
+                )
+                .expect("open synthetic pidfd");
+            let pidfd_key = {
+                let entry = resources
+                    .fs
+                    .fd_table
+                    .get(pidfd)
+                    .expect("synthetic pidfd entry");
+                file_description_key(entry.description())
+            };
+            kernel
+                .pidfds
+                .insert(pidfd_key, Weak::<Mutex<PidFdState>>::new());
+            (signalfd, pidfd)
+        };
+
+        assert_eq!(
+            kernel
+                .resolve_proc_readlink_target(1, format!("/proc/self/fd/{epollfd}").as_str())
+                .expect("epoll target"),
+            "anon_inode:[eventpoll]"
+        );
+        assert_eq!(
+            kernel
+                .resolve_proc_readlink_target(1, format!("/proc/self/fd/{signalfd}").as_str())
+                .expect("signalfd target"),
+            "anon_inode:[signalfd]"
+        );
+        assert_eq!(
+            kernel
+                .resolve_proc_readlink_target(1, format!("/proc/self/fd/{pidfd}").as_str())
+                .expect("pidfd target"),
+            "anon_inode:[pidfd]"
         );
     }
 

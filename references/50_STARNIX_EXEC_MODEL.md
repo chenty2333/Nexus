@@ -269,13 +269,17 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
       - blocking message I/O
   - host-side semantic tests in `nexus-init` now cover:
     - `dup2` / `dup3` open-file-description sharing
+    - `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC` descriptor-table duplication rules
     - `wait4` target matching
     - `setsid` session / foreground identity rebinding
     - pure restart-frame handling for `EINTR` vs `SA_RESTART`
     - `rt_sigreturn` register + blocked-mask restore
-    - `epoll` readiness derived from one synthetic `eventfd` waitable
+    - `epoll` readiness derived from one synthetic `eventfd` waitable plus
+      level-triggered and oneshot delivery rules
     - `execve`-side `CLOEXEC` cleanup and caught-signal reset helpers
     - one narrow exec-mm writable-range reset rule
+    - `/proc/self/fd/*` anon-inode projection for `signalfd` / `pidfd` /
+      `eventpoll`
 
 ## Frozen architectural split
 

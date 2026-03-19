@@ -213,11 +213,15 @@ Work:
   `just xtest`, not only as QEMU smoke scenarios.
 - The current first-wave host semantic gate now already covers:
   - `dup2` / `dup3` open-file-description sharing
+  - `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC` descriptor-table duplication rules
   - process-group / session identity updates through `wait4` target matching and `setsid`
   - `rt_sigreturn` plus pure restart-frame handling for `EINTR` / `SA_RESTART`
-  - `epoll` interactions with one synthetic waitable
+  - `epoll` interactions with one synthetic waitable plus level-triggered and
+    oneshot delivery rules
   - `execve`-side `CLOEXEC` cleanup and caught-signal reset helpers
   - one narrow exec-mm reset rule for writable-range tracking
+  - `/proc/self/fd/*` anon-inode projection for `signalfd` / `pidfd` /
+    `eventpoll`
 - Add host-side semantic tests for at least:
   - `dup` / `dup2` / `dup3` open-file-description sharing
   - process-group / session / `wait4` target matching

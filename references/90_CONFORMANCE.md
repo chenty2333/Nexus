@@ -54,10 +54,14 @@ Main just targets include:
 are part of the default merge-blocking host gate rather than living only behind QEMU smoke.
 That host gate now explicitly covers:
 - `dup2` / `dup3` open-file-description sharing
+- `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC` descriptor-table duplication rules
 - `wait4` target matching and `setsid` session rebinding
 - pure `EINTR` / `SA_RESTART` restart-frame handling plus `rt_sigreturn`
-- synthetic-waitable to `epoll` readiness bridging
+- synthetic-waitable to `epoll` readiness bridging plus level-triggered and
+  oneshot delivery rules
 - `execve`-side `CLOEXEC` cleanup and caught-signal reset helpers
+- `/proc/self/fd/*` anon-inode projection for `signalfd` / `pidfd` /
+  `eventpoll`
 
 ## Contract catalog
 
