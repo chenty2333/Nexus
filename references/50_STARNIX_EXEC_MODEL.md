@@ -259,6 +259,9 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - production Starnix exec-image resolution is now namespace-backed only:
     - `run_executive()` resolves the main image bytes through the Starnix namespace
     - embedded payload lookup tables remain bootstrap-namespace population helpers only
+    - the bootstrap entry path is now split into a thin `bootstrap/mod.rs`
+      plus dedicated namespace, exec-image source, and launch-preparation
+      helpers instead of one mixed file
   - blocked guest syscalls now enter and retry through one shared executive path:
     - `begin_wait` / `begin_async_wait` own the transition into `TaskState::Waiting`
     - `WaitKind` owns the retry-side replay choice for:

@@ -88,6 +88,9 @@ Work:
 - Production exec/image load now resolves only through the Starnix namespace.
   Embedded payload tables remain bootstrap-namespace population helpers, not
   production exec fallback.
+- The bootstrap entry path is now split into a thin
+  `starnix/bootstrap/mod.rs` plus dedicated namespace, image-source, and
+  launch-preparation helpers.
 - Target internal layout:
 
 ```text
