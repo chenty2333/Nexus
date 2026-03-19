@@ -14,6 +14,24 @@ pub(in crate::starnix) fn complete_syscall(
 }
 
 impl StarnixKernel {
+    pub(in crate::starnix) fn prepare_wait_signal_frame(
+        &self,
+        wait: WaitState,
+        sigaction: LinuxSigAction,
+        stop_state: &mut ax_guest_stop_state_t,
+        previous_blocked: u64,
+    ) -> Result<ActiveSignalFrame, zx_status_t> {
+        let mut restore_regs = stop_state.regs;
+        if !wait.restartable || (sigaction.flags & LINUX_SA_RESTART) == 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINTR))?;
+            restore_regs = stop_state.regs;
+        }
+        Ok(ActiveSignalFrame {
+            restore_regs,
+            previous_blocked,
+        })
+    }
+
     pub(in crate::starnix) fn begin_wait(
         &mut self,
         task_id: i32,
@@ -81,21 +99,13 @@ impl StarnixKernel {
                 SignalDeliveryAction::Catch(sigaction) => {
                     self.cancel_task_wait(task_id, wait);
                     let previous_blocked = self.task_signal_mask(task_id)?;
-                    let mut restore_regs = stop_state.regs;
-                    if !wait.restartable || (sigaction.flags & LINUX_SA_RESTART) == 0 {
-                        complete_syscall(stop_state, linux_errno(LINUX_EINTR))?;
-                        restore_regs = stop_state.regs;
-                    }
-                    self.install_signal_frame(
-                        task_id,
-                        signal,
+                    let frame = self.prepare_wait_signal_frame(
+                        wait,
                         sigaction,
                         stop_state,
-                        ActiveSignalFrame {
-                            restore_regs,
-                            previous_blocked,
-                        },
+                        previous_blocked,
                     )?;
+                    self.install_signal_frame(task_id, signal, sigaction, stop_state, frame)?;
                     if let Some(task) = self.tasks.get_mut(&task_id) {
                         task.state = TaskState::Running;
                     }

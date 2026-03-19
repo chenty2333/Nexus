@@ -52,6 +52,12 @@ Main just targets include:
 
 `just xlint` and `just xtest` now both include `nexus-init`, so Starnix host-side semantic tests
 are part of the default merge-blocking host gate rather than living only behind QEMU smoke.
+That host gate now explicitly covers:
+- `dup2` / `dup3` open-file-description sharing
+- `wait4` target matching and `setsid` session rebinding
+- pure `EINTR` / `SA_RESTART` restart-frame handling plus `rt_sigreturn`
+- synthetic-waitable to `epoll` readiness bridging
+- `execve`-side `CLOEXEC` cleanup and caught-signal reset helpers
 
 ## Contract catalog
 

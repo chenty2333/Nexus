@@ -849,6 +849,42 @@ impl LinuxMm {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_exec_writable_ranges_resets_tree_and_skips_mmap_window() {
+        let mut mm = LinuxMm::empty_for_tests();
+        mm.mmap_base = 0x4000_0000;
+        mm.exec_tree.insert(
+            0x1000,
+            LinuxProtectEntry {
+                base: 0x1000,
+                len: 0x1000,
+                prot: LINUX_PROT_READ,
+            },
+        );
+        mm.install_exec_writable_ranges(&[
+            LinuxWritableRange {
+                base: 0x2000,
+                len: 0x3000,
+            },
+            LinuxWritableRange {
+                base: 0x4000_1000,
+                len: 0x2000,
+            },
+        ])
+        .expect("install exec ranges");
+
+        assert_eq!(mm.exec_tree.len(), 1);
+        let entry = mm.exec_tree.get(&0x2000).expect("non-mmap exec range");
+        assert_eq!(entry.base, 0x2000);
+        assert_eq!(entry.len, 0x3000);
+        assert_eq!(entry.prot, LINUX_PROT_READ | LINUX_PROT_WRITE);
+    }
+}
+
 fn duplicate_linux_map_backing(
     backing: LinuxMapBacking,
     delta: u64,

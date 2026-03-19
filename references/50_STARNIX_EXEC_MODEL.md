@@ -270,8 +270,12 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
   - host-side semantic tests in `nexus-init` now cover:
     - `dup2` / `dup3` open-file-description sharing
     - `wait4` target matching
+    - `setsid` session / foreground identity rebinding
+    - pure restart-frame handling for `EINTR` vs `SA_RESTART`
     - `rt_sigreturn` register + blocked-mask restore
     - `epoll` readiness derived from one synthetic `eventfd` waitable
+    - `execve`-side `CLOEXEC` cleanup and caught-signal reset helpers
+    - one narrow exec-mm writable-range reset rule
 
 ## Frozen architectural split
 
@@ -697,7 +701,13 @@ forcing every syscall through one uniform RPC layer.
   parent and child. Closing one side must not tear down the underlying
   description until the last cross-table reference is gone.
 - `execve` already preserves Linux task identity while replacing carrier and
-  address-space resources, but later rounds still need the remaining Linux
-  process semantics such as signal reset and `CLOEXEC` cleanup.
+  address-space resources.
+- `execve` now also applies the first executive-only reset rules that later
+  rounds depend on:
+  - descriptor-table `CLOEXEC` cleanup
+  - caught-signal disposition reset while preserving ignored dispositions
+  - task-local reset of active signal frame, robust-list state, and
+    `clear_child_tid`
+- broader post-exec process semantics still remain later work.
 - Restricted-mode style shared-process execution remains later optimization
   work, not a J1 requirement.

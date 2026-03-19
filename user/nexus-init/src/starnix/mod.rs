@@ -997,6 +997,98 @@ mod tests {
     }
 
     #[test]
+    fn setsid_rehomes_group_and_updates_foreground_mapping() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        kernel.groups.get_mut(&1).expect("root group").pgid = 7;
+
+        let mut stop_state = ax_guest_stop_state_t::default();
+        let action = kernel.sys_setsid(1, &mut stop_state).expect("setsid");
+        assert!(matches!(action, SyscallAction::Resume));
+        assert_eq!(stop_state.regs.rax, 1);
+        let root = kernel.groups.get(&1).expect("root group");
+        assert_eq!(root.sid, 1);
+        assert_eq!(root.pgid, 1);
+        assert_eq!(kernel.foreground_pgid(1), Some(1));
+    }
+
+    #[test]
+    fn wait_signal_frame_without_sa_restart_reports_eintr() {
+        let stdout = RecordingFd::new();
+        let kernel = test_kernel_with_stdio(stdout);
+        let wait = WaitState {
+            restartable: true,
+            kind: WaitKind::Wait4 {
+                target_pid: -1,
+                status_addr: 0,
+                options: 0,
+            },
+        };
+        let mut stop_state = ax_guest_stop_state_t::default();
+        stop_state.regs.rip = 0x4000;
+        let frame = kernel
+            .prepare_wait_signal_frame(
+                WaitState {
+                    restartable: false,
+                    ..wait
+                },
+                LinuxSigAction {
+                    handler: 0x1000,
+                    flags: LINUX_SA_RESTORER,
+                    restorer: 0x2000,
+                    mask: 0,
+                },
+                &mut stop_state,
+                0x55,
+            )
+            .expect("prepare frame");
+        assert_eq!(stop_state.regs.rax, linux_errno(LINUX_EINTR));
+        assert_eq!(stop_state.regs.rip, 0x4000 + AX_GUEST_X64_SYSCALL_INSN_LEN);
+        assert_eq!(frame.restore_regs.rax, linux_errno(LINUX_EINTR));
+        assert_eq!(
+            frame.restore_regs.rip,
+            0x4000 + AX_GUEST_X64_SYSCALL_INSN_LEN
+        );
+        assert_eq!(frame.previous_blocked, 0x55);
+    }
+
+    #[test]
+    fn wait_signal_frame_with_sa_restart_keeps_original_resume_state() {
+        let stdout = RecordingFd::new();
+        let kernel = test_kernel_with_stdio(stdout);
+        let wait = WaitState {
+            restartable: true,
+            kind: WaitKind::Futex {
+                key: LinuxFutexKey::Private {
+                    tgid: 1,
+                    addr: 0x1000,
+                },
+            },
+        };
+        let mut stop_state = ax_guest_stop_state_t::default();
+        stop_state.regs.rax = 99;
+        stop_state.regs.rip = 0x9000;
+        let frame = kernel
+            .prepare_wait_signal_frame(
+                wait,
+                LinuxSigAction {
+                    handler: 0x1000,
+                    flags: LINUX_SA_RESTORER | LINUX_SA_RESTART,
+                    restorer: 0x2000,
+                    mask: 0,
+                },
+                &mut stop_state,
+                0xaa,
+            )
+            .expect("prepare frame");
+        assert_eq!(stop_state.regs.rax, 99);
+        assert_eq!(stop_state.regs.rip, 0x9000);
+        assert_eq!(frame.restore_regs.rax, 99);
+        assert_eq!(frame.restore_regs.rip, 0x9000);
+        assert_eq!(frame.previous_blocked, 0xaa);
+    }
+
+    #[test]
     fn rt_sigreturn_restores_registers_and_signal_mask() {
         let stdout = RecordingFd::new();
         let mut kernel = test_kernel_with_stdio(stdout);
@@ -1104,6 +1196,118 @@ mod tests {
         let instance = kernel.epolls.get(&epoll_key).expect("epoll instance");
         assert!(instance.ready_set.contains(&target_key));
         assert_eq!(instance.ready_list.front(), Some(&target_key));
+    }
+
+    #[test]
+    fn exec_fd_replace_drops_cloexec_entries_and_clears_offsets() {
+        let stdout = RecordingFd::new();
+        let mut kernel = test_kernel_with_stdio(stdout);
+        let resources = kernel
+            .groups
+            .get_mut(&1)
+            .expect("root group")
+            .resources
+            .as_mut()
+            .expect("root resources");
+        let cloexec_fd = resources
+            .fs
+            .fd_table
+            .open(
+                Arc::new(PseudoNodeFd::new(None)),
+                OpenFlags::READABLE,
+                FdFlags::CLOEXEC,
+            )
+            .expect("open cloexec fd");
+        let kept_fd = resources
+            .fs
+            .fd_table
+            .open(
+                Arc::new(PseudoNodeFd::new(None)),
+                OpenFlags::READABLE,
+                FdFlags::empty(),
+            )
+            .expect("open kept fd");
+        resources.fs.directory_offsets.insert(11, 3);
+
+        let replaced = resources.fs.exec_replace();
+        assert!(replaced.fd_table.get(cloexec_fd).is_none());
+        assert!(replaced.fd_table.get(kept_fd).is_some());
+        assert!(replaced.directory_offsets.is_empty());
+    }
+
+    #[test]
+    fn fork_and_exec_signal_helpers_preserve_and_reset_expected_state() {
+        const TEST_SIGUSR1: i32 = 10;
+        const TEST_SIGUSR2: i32 = 12;
+        let parent_blocked = linux_signal_bit(LINUX_SIGSTOP).expect("sigstop bit");
+        let inherited = super::sys::process::fork_task_signals(parent_blocked);
+        assert_eq!(inherited.blocked, parent_blocked);
+        assert_eq!(inherited.pending, 0);
+
+        let mut sigactions = BTreeMap::new();
+        sigactions.insert(
+            TEST_SIGUSR1,
+            LinuxSigAction {
+                handler: 0x4000,
+                flags: LINUX_SA_RESTORER | LINUX_SA_RESTART,
+                restorer: 0x5000,
+                mask: 0,
+            },
+        );
+        sigactions.insert(
+            TEST_SIGUSR2,
+            LinuxSigAction {
+                handler: LINUX_SIG_IGN,
+                flags: 0,
+                restorer: 0,
+                mask: 0,
+            },
+        );
+        let cloned = super::sys::process::fork_sigactions(&sigactions);
+        assert_eq!(cloned.len(), 2);
+        super::sys::process::reset_exec_sigactions(&mut sigactions);
+        assert_eq!(sigactions.len(), 1);
+        assert_eq!(
+            sigactions
+                .get(&TEST_SIGUSR2)
+                .expect("ignored signal survives")
+                .handler,
+            LINUX_SIG_IGN
+        );
+
+        let mut task = LinuxTask {
+            tid: 1,
+            tgid: 1,
+            carrier: TaskCarrier {
+                thread_handle: ZX_HANDLE_INVALID,
+                session_handle: ZX_HANDLE_INVALID,
+                sidecar_vmo: ZX_HANDLE_INVALID,
+                packet_key: 1,
+            },
+            state: TaskState::Running,
+            signals: TaskSignals {
+                blocked: parent_blocked,
+                pending: linux_signal_bit(LINUX_SIGCONT).expect("sigcont bit"),
+            },
+            clear_child_tid: 0xdead_beef,
+            robust_list: Some(LinuxRobustListState {
+                head_addr: 0x1000,
+                len: 24,
+            }),
+            active_signal: Some(ActiveSignalFrame {
+                restore_regs: ax_guest_x64_regs_t::default(),
+                previous_blocked: 0,
+            }),
+        };
+        super::sys::process::reset_task_after_exec(&mut task);
+        assert_eq!(task.signals.blocked, parent_blocked);
+        assert_eq!(
+            task.signals.pending,
+            linux_signal_bit(LINUX_SIGCONT).expect("sigcont bit")
+        );
+        assert_eq!(task.clear_child_tid, 0);
+        assert!(task.robust_list.is_none());
+        assert!(task.active_signal.is_none());
     }
 
     #[test]

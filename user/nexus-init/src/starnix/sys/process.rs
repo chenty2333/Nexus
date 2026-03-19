@@ -1,5 +1,28 @@
 use super::super::*;
 
+pub(in crate::starnix) fn fork_task_signals(parent_blocked: u64) -> TaskSignals {
+    TaskSignals {
+        blocked: parent_blocked,
+        pending: 0,
+    }
+}
+
+pub(in crate::starnix) fn fork_sigactions(
+    parent_sigactions: &BTreeMap<i32, LinuxSigAction>,
+) -> BTreeMap<i32, LinuxSigAction> {
+    parent_sigactions.clone()
+}
+
+pub(in crate::starnix) fn reset_exec_sigactions(sigactions: &mut BTreeMap<i32, LinuxSigAction>) {
+    sigactions.retain(|_, action| action.handler == LINUX_SIG_IGN);
+}
+
+pub(in crate::starnix) fn reset_task_after_exec(task: &mut LinuxTask) {
+    task.clear_child_tid = 0;
+    task.active_signal = None;
+    task.robust_list = None;
+}
+
 impl StarnixKernel {
     pub(in crate::starnix) fn sys_getpid(
         &mut self,
@@ -397,10 +420,7 @@ impl StarnixKernel {
                 tgid,
                 carrier: child_carrier,
                 state: TaskState::Running,
-                signals: TaskSignals {
-                    blocked: parent_blocked,
-                    pending: 0,
-                },
+                signals: fork_task_signals(parent_blocked),
                 clear_child_tid: 0,
                 robust_list: None,
                 active_signal: None,
@@ -451,12 +471,13 @@ impl StarnixKernel {
                 .clone();
             (image, namespace)
         };
-        let parent_sigactions = self
-            .groups
-            .get(&parent_tgid)
-            .ok_or(ZX_ERR_BAD_STATE)?
-            .sigactions
-            .clone();
+        let parent_sigactions = fork_sigactions(
+            &self
+                .groups
+                .get(&parent_tgid)
+                .ok_or(ZX_ERR_BAD_STATE)?
+                .sigactions,
+        );
         let (parent_pgid, parent_sid) = {
             let parent_group = self.groups.get(&parent_tgid).ok_or(ZX_ERR_BAD_STATE)?;
             (parent_group.pgid, parent_group.sid)
@@ -594,10 +615,7 @@ impl StarnixKernel {
                 tgid: child_tgid,
                 carrier: child_carrier,
                 state: TaskState::Running,
-                signals: TaskSignals {
-                    blocked: parent_blocked,
-                    pending: 0,
-                },
+                signals: fork_task_signals(parent_blocked),
                 clear_child_tid: 0,
                 robust_list: None,
                 active_signal: None,
@@ -814,14 +832,13 @@ impl StarnixKernel {
             let task = self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
             let old_carrier = task.carrier;
             task.carrier = new_carrier;
-            task.clear_child_tid = 0;
-            task.active_signal = None;
-            task.robust_list = None;
+            reset_task_after_exec(task);
             old_carrier
         };
         let old_resources = {
             let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
             group.image = Some(task_image);
+            reset_exec_sigactions(&mut group.sigactions);
             group
                 .resources
                 .replace(new_resources)

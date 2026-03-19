@@ -56,9 +56,22 @@ impl FsContext {
         }
     }
 
-    fn exec_replace(&self) -> Self {
+    pub(in crate::starnix) fn exec_replace(&self) -> Self {
+        let mut fd_table = self.fd_table.clone();
+        let mut seen = 0usize;
+        let live = self.fd_table.len();
+        let mut fd = 0i32;
+        while seen < live {
+            if let Some(entry) = self.fd_table.get(fd) {
+                seen += 1;
+                if entry.flags().contains(FdFlags::CLOEXEC) {
+                    let _ = fd_table.close(fd);
+                }
+            }
+            fd = fd.saturating_add(1);
+        }
         Self {
-            fd_table: self.fd_table.clone(),
+            fd_table,
             namespace: self.namespace.clone(),
             directory_offsets: BTreeMap::new(),
         }
