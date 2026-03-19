@@ -268,6 +268,32 @@ pub fn vmo_get_info(handle: zx_handle_t) -> Result<axle_types::vmo::ax_vmo_info_
     })
 }
 
+/// Promote one local-private VMO object to the shared/global backing domain.
+pub fn vmo_promote_shared(handle: zx_handle_t) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::WRITE)?;
+        let object_key = resolved.object_key();
+        let vmo = state.with_objects(|objects| {
+            Ok(match objects.get(object_key) {
+                Some(KernelObject::Vmo(vmo)) => vmo.clone(),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+        let promoted = state.with_vm_mut(|vm| vm.promote_vmo_object_to_shared(&vmo))?;
+        if !promoted {
+            return Ok(());
+        }
+        state.with_objects_mut(|objects| {
+            let Some(KernelObject::Vmo(vmo_object)) = objects.get_mut(object_key) else {
+                return Err(ZX_ERR_BAD_STATE);
+            };
+            vmo_object.backing_scope = VmoBackingScope::GlobalShared;
+            Ok(())
+        })
+    })
+}
+
 /// Pin one physical/contiguous VMO range and return a DMA region handle.
 pub fn pin_vmo(
     handle: zx_handle_t,

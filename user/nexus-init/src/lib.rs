@@ -14,6 +14,7 @@ mod resolver;
 mod runner;
 mod services;
 mod starnix;
+mod vmo;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -215,6 +216,8 @@ const ROOT_DECL_NET_DATAPLANE_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_net_dataplane.nxcd"
 ));
+const ROOT_DECL_VMO_SHARED_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/root_component_vmo_shared.nxcd"));
 const PROVIDER_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_provider.nxcd"));
 const CLIENT_DECL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_client.nxcd"));
 const CONTROLLER_WORKER_DECL_BYTES: &[u8] =
@@ -1141,6 +1144,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
         "manifests/root-net-dataplane.nxcd",
         ROOT_DECL_NET_DATAPLANE_BYTES,
     ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-vmo-shared.nxcd",
+        ROOT_DECL_VMO_SHARED_BYTES,
+    ));
     if !LINUX_HELLO_DECL_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-hello.nxcd",
@@ -1660,6 +1667,9 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
     }
     if root.decl.url == "boot://root-net-dataplane" {
         return net::run_root_dataplane();
+    }
+    if root.decl.url == "boot://root-vmo-shared" {
+        return vmo::run_root_shared_source_contract();
     }
 
     let (provider, provider_startup) = match resolve_root_child(&root, &resolvers, "echo_provider")

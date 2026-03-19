@@ -73,8 +73,10 @@ Current state:
   handles for boot/package files:
   - seeded boot-loaded ELF images reuse the imported pager-backed code VMOs
   - byte-backed assets such as compiled manifests and staged runtime libraries
-    synthesize one cached page-rounded anonymous VMO on first request and
-    duplicate that handle for later callers
+    synthesize one cached page-rounded anonymous VMO on first request, promote
+    that VMO object into the shared/global backing domain through
+    `ax_vmo_promote_shared()`, and then duplicate one narrowed handle for later
+    callers
 - The narrow public pager/file-backed mapping contract is now:
   - the handle names one shared read-only mapping source:
     - imported pager-backed/file-backed VMOs when the boot image already has
@@ -94,11 +96,17 @@ Current state:
 - `ax_vmo_get_info()` now exposes the first narrow public object snapshot over
   that same contract:
   - bootstrap code-image VMOs report `PagerBacked + GlobalShared`
+  - staged shared-anonymous `GetVmo` handles report `Anonymous + GlobalShared`
   - anonymous private-clone destinations report `Anonymous + LocalPrivate`
   - the public fields are still limited to logical size, kind, backing scope,
     and stable behavior flags
 - the bootstrap shared-handle gate now also freezes the current source-handle
   access pattern for pager-backed/file-backed VMOs:
+  - readable
+  - not directly writable
+  - not directly resizable
+- the staged shared-anonymous `GetVmo` gate now freezes that same exported
+  source-handle behavior for boot/package assets that are still byte-backed:
   - readable
   - not directly writable
   - not directly resizable

@@ -192,6 +192,7 @@ fn main() {
         "root_component.toml",
         "root_component_round3.toml",
         "root_component_net_dataplane.toml",
+        "root_component_vmo_shared.toml",
         "root_component_starnix.toml",
         "root_component_starnix_fd.toml",
         "root_component_starnix_round2.toml",
@@ -261,6 +262,10 @@ fn main() {
         (
             "root_component_net_dataplane.toml",
             "root_component_net_dataplane.nxcd",
+        ),
+        (
+            "root_component_vmo_shared.toml",
+            "root_component_vmo_shared.nxcd",
         ),
         ("root_component_starnix.toml", "root_component_starnix.nxcd"),
         (

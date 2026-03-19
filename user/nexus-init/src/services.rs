@@ -5,7 +5,10 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 use axle_types::handle::ZX_HANDLE_INVALID;
-use axle_types::rights::ZX_RIGHT_SAME_RIGHTS;
+use axle_types::rights::{
+    ZX_RIGHT_DUPLICATE, ZX_RIGHT_EXECUTE, ZX_RIGHT_INSPECT, ZX_RIGHT_MAP, ZX_RIGHT_READ,
+    ZX_RIGHT_TRANSFER,
+};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_PATH,
     ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_IO_DATA_INTEGRITY,
@@ -17,6 +20,7 @@ use axle_types::syscall_numbers::{
 };
 use axle_types::{zx_handle_t, zx_rights_t, zx_status_t};
 use libax::compat::{zx_handle_close, zx_socket_create};
+use libzircon::ax_vmo_promote_shared;
 use nexus_io::{
     DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFlags, PipeFd,
     ProcessNamespace, SeekOrigin, SocketFd, VmoFlags,
@@ -551,7 +555,7 @@ impl FdOps for LocalFileFd {
         match &self.backing {
             LocalFileBacking::ReadOnly(file) => file
                 .get_or_create_vmo()
-                .and_then(|handle| duplicate_handle(handle, ZX_RIGHT_SAME_RIGHTS)),
+                .and_then(|handle| duplicate_handle(handle, exported_read_only_vmo_rights(flags))),
             LocalFileBacking::Mutable(_) => Err(ZX_ERR_NOT_SUPPORTED),
         }
     }
@@ -847,6 +851,15 @@ fn duplicate_handle(handle: zx_handle_t, rights: zx_rights_t) -> Result<zx_handl
     }
 }
 
+fn exported_read_only_vmo_rights(flags: VmoFlags) -> zx_rights_t {
+    let mut rights =
+        ZX_RIGHT_DUPLICATE | ZX_RIGHT_TRANSFER | ZX_RIGHT_READ | ZX_RIGHT_MAP | ZX_RIGHT_INSPECT;
+    if flags.contains(VmoFlags::EXECUTE) {
+        rights |= ZX_RIGHT_EXECUTE;
+    }
+    rights
+}
+
 fn create_vmo_with_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
     let mut handle = ZX_HANDLE_INVALID;
     let size = if bytes.is_empty() {
@@ -876,13 +889,26 @@ fn create_vmo_with_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
             return Err(status);
         }
     }
+    let status = ax_vmo_promote_shared(handle);
+    if status != ZX_OK {
+        let _ = zx_handle_close(handle);
+        return Err(status);
+    }
     Ok(handle)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BootAssetEntry, BootstrapNamespace, local_fd_pread, local_fd_pwrite};
+    use super::{
+        BootAssetEntry, BootstrapNamespace, exported_read_only_vmo_rights, local_fd_pread,
+        local_fd_pwrite,
+    };
     use alloc::vec;
+    use axle_types::rights::{
+        ZX_RIGHT_DUPLICATE, ZX_RIGHT_EXECUTE, ZX_RIGHT_INSPECT, ZX_RIGHT_MAP, ZX_RIGHT_READ,
+        ZX_RIGHT_TRANSFER, ZX_RIGHT_WRITE,
+    };
+    use nexus_io::VmoFlags;
     use nexus_io::{FdTable, OpenFlags, SeekOrigin};
 
     #[test]
@@ -1056,5 +1082,31 @@ mod tests {
         let actual = file.read(&mut sequential).expect("read after pread/pwrite");
         assert_eq!(actual, 6);
         assert_eq!(&sequential[..actual], b"aXYdef");
+    }
+
+    #[test]
+    fn read_only_get_vmo_rights_stay_narrow() {
+        let read_only = exported_read_only_vmo_rights(VmoFlags::READ);
+        assert_eq!(
+            read_only,
+            ZX_RIGHT_DUPLICATE
+                | ZX_RIGHT_TRANSFER
+                | ZX_RIGHT_READ
+                | ZX_RIGHT_MAP
+                | ZX_RIGHT_INSPECT
+        );
+        assert_eq!(read_only & ZX_RIGHT_WRITE, 0);
+
+        let executable = exported_read_only_vmo_rights(VmoFlags::READ | VmoFlags::EXECUTE);
+        assert_eq!(
+            executable,
+            ZX_RIGHT_DUPLICATE
+                | ZX_RIGHT_TRANSFER
+                | ZX_RIGHT_READ
+                | ZX_RIGHT_MAP
+                | ZX_RIGHT_INSPECT
+                | ZX_RIGHT_EXECUTE
+        );
+        assert_eq!(executable & ZX_RIGHT_WRITE, 0);
     }
 }

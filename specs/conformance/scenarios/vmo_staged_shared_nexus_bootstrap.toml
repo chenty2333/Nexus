@@ -1,0 +1,33 @@
+id = "kernel.vmo.staged_shared_nexus_bootstrap"
+description = "nexus-init root should freeze the shared staged-anonymous GetVmo source-handle contract for boot assets"
+tags = ["kernel", "vm", "vmo", "bootstrap", "nexus-init"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/vmo-staged-shared-nexus && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && NEXUS_INIT_ROOT_URL=boot://root-vmo-shared RUSTFLAGS='-C code-model=large -C debuginfo=0' cargo build -p nexus-init --target x86_64-unknown-none --target-dir \"$target_dir\" && init=\"$target_dir/x86_64-unknown-none/debug/nexus-init\" && init_size=$(stat -c%s \"$init\") && { timeout --foreground 20s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$init\",addr=0x7000000,force-raw=on -device loader,data=$init_size,data-len=8,addr=0x6fffff8 -device loader,file=\"$init\",addr=0x5000000,force-raw=on -device loader,data=$init_size,data-len=8,addr=0x4fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; qemu_code=$?; echo qemu_exit=$qemu_code; [ \"$qemu_code\" -eq 33 ]; }"
+]
+
+expect = [
+  "kernel: vmo staged shared smoke",
+]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.vmo.staged_shared_source_handle_contract"]
+
+[assertions.status_code]
+vmo_staged_namespace_build = 0
+vmo_staged_open = 0
+vmo_staged_get_vmo = 0
+vmo_staged_info = 0
+vmo_staged_read = 0
+vmo_staged_write = -30
+vmo_staged_resize = -30
+
+[assertions.packet_fields]
+vmo_staged_present = 1
+vmo_staged_failure_step = 0
+vmo_staged_info_kind = 0
+vmo_staged_info_backing_scope = 1
+vmo_staged_info_size_page_aligned = 1
+vmo_staged_read_match = 1

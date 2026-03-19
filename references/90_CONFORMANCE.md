@@ -196,6 +196,16 @@ That host gate now explicitly covers:
     - the first bytes match the current bootstrap code window mapping
     - direct `vmo_write()` returns `ZX_ERR_ACCESS_DENIED`
     - direct `vmo_set_size()` returns `ZX_ERR_ACCESS_DENIED`
+- Nexus-root VM coverage now also includes one narrow staged shared-anonymous
+  source-handle gate:
+  - `kernel.vmo.staged_shared_nexus_bootstrap`
+  - one `/boot/...` staged shared-anonymous `GetVmo` handle must prove the
+    current public source-handle contract:
+    - `ax_vmo_get_info()` reports `Anonymous + GlobalShared`
+    - the exported size is page-aligned and large enough for the staged asset
+    - `vmo_read()` succeeds and the bytes match the boot asset payload
+    - direct `vmo_write()` returns `ZX_ERR_ACCESS_DENIED`
+    - direct `vmo_set_size()` returns `ZX_ERR_ACCESS_DENIED`
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - two ring3 worker threads act as minimal device-side peers, one queue pair each
   - one bootstrap `PciDevice` handle is now seeded into the runner shared-slot window

@@ -513,6 +513,14 @@ pub fn ax_vmo_get_info(handle: ax_handle_t, out_info: &mut ax_vmo_info_t) -> ax_
     }
 }
 
+/// Promote one local-private VMO object to the shared/global backing domain.
+pub fn ax_vmo_promote_shared(handle: ax_handle_t) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_vmo_promote_shared(raw),
+        Err(status) => status,
+    }
+}
+
 /// Pin one physical/contiguous VMO range and return a DMA region handle.
 pub fn ax_vmo_pin(
     handle: ax_handle_t,

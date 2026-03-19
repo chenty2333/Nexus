@@ -158,6 +158,12 @@ The current bootstrap syscall surface includes:
     - backing scope (`LocalPrivate` / `GlobalShared`)
     - behavior flags such as resizable / COW-capable / kernel-readable
     - it does not expose hot residency, dirty state, or per-page fault truth
+  - `ax_vmo_promote_shared()` is now the first narrow control-plane promotion hook
+    over that same VMO family:
+    - it upgrades one local-private VMO object to the shared/global backing domain
+    - the bootstrap staged-asset `GetVmo` path uses it to freeze byte-backed boot
+      assets into the same shared source-handle shape as imported pager-backed code
+      images
   - `interrupt_create()` only accepts `ZX_INTERRUPT_VIRTUAL`
   - `interrupt_get_info()` is now the first narrow metadata query over an interrupt object:
     - delivery mode

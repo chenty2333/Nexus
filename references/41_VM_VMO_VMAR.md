@@ -82,6 +82,11 @@ Current user-facing object creation is much narrower:
   those same VMO families:
   - it reports size / kind / backing scope / behavior flags
   - it intentionally does not expose live residency, dirty/writeback state, or per-page mappings
+- `ax_vmo_promote_shared(handle)` is now the first narrow control-plane promotion hook over
+  anonymous VMOs:
+  - it upgrades one local-private VMO object into the shared/global backing domain
+  - the staged boot-asset `GetVmo` path uses it before it exports one read-only
+    shared source handle
 
 ## VMAR model
 
@@ -165,6 +170,12 @@ It is not fully implemented yet.
 - The current shared pager-backed/file-backed handle contract is also now
   explicitly gated at the syscall surface:
   - `vmo_read()` is allowed on the shared source handle
+  - direct `vmo_write()` is denied
+  - direct `vmo_set_size()` is denied
+- The current staged shared-anonymous `GetVmo` source-handle contract is now
+  frozen to the same public shape:
+  - `ax_vmo_get_info()` reports `Anonymous + GlobalShared`
+  - `vmo_read()` is allowed on the exported shared handle
   - direct `vmo_write()` is denied
   - direct `vmo_set_size()` is denied
 - Physical / contiguous VMOs are now public as narrow bootstrap primitives, but the broader device

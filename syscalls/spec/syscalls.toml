@@ -823,3 +823,12 @@ args = [
   { name = "handle", ty = "ax_handle_t" },
   { name = "out_info", ty = "*mut ax_vmo_info_t" },
 ]
+
+[[syscall]]
+name = "ax_vmo_promote_shared"
+nr = 72
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+]

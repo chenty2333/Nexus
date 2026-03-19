@@ -361,6 +361,11 @@ level = "should"
 description = "Bootstrap shared pager-backed/file-backed VMO handles should remain readable but reject direct write and resize through the shared source handle"
 
 [[contracts]]
+id = "should.vmo.staged_shared_source_handle_contract"
+level = "should"
+description = "Staged shared-anonymous GetVmo handles for boot assets should report Anonymous + GlobalShared and remain readable but reject direct write and resize through the exported source handle"
+
+[[contracts]]
 id = "should.socket.stream_basics_bootstrap"
 level = "should"
 description = "Bootstrap STREAM sockets should support create, waitable readable/writable states, peek, read, peer-close signaling, and peer-closed read/write errors"

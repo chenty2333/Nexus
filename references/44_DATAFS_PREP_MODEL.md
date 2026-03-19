@@ -78,6 +78,10 @@ implementation:
 Practical meaning:
 
 - package/resource-style pager-backed reads are in scope
+- read-only `GetVmo` now explicitly includes both:
+  - shared pager-backed/file-backed source handles
+  - staged shared-anonymous source handles for byte-backed assets
+  and freezes them as readable but not directly writable/resizable
 - coherent writable mappings, writeback invalidation, and mmap-driven dirty-page
   ownership are explicitly out of scope for v1
 

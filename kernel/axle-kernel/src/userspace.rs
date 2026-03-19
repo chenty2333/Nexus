@@ -792,6 +792,21 @@ const SLOT_VMO_SHARED_READ: usize = 1049;
 const SLOT_VMO_SHARED_READ_MATCH: usize = 1050;
 const SLOT_VMO_SHARED_WRITE: usize = 1051;
 const SLOT_VMO_SHARED_RESIZE: usize = 1052;
+const SLOT_VMO_STAGED_PRESENT: usize = 1053;
+const SLOT_VMO_STAGED_FAILURE_STEP: usize = 1054;
+const SLOT_VMO_STAGED_NAMESPACE_BUILD: usize = 1055;
+const SLOT_VMO_STAGED_OPEN: usize = 1056;
+const SLOT_VMO_STAGED_GET_VMO: usize = 1057;
+const SLOT_VMO_STAGED_INFO: usize = 1058;
+const SLOT_VMO_STAGED_INFO_KIND: usize = 1059;
+const SLOT_VMO_STAGED_INFO_BACKING_SCOPE: usize = 1060;
+const SLOT_VMO_STAGED_INFO_FLAGS: usize = 1061;
+const SLOT_VMO_STAGED_INFO_SIZE: usize = 1062;
+const SLOT_VMO_STAGED_INFO_SIZE_PAGE_ALIGNED: usize = 1063;
+const SLOT_VMO_STAGED_READ: usize = 1064;
+const SLOT_VMO_STAGED_READ_MATCH: usize = 1065;
+const SLOT_VMO_STAGED_WRITE: usize = 1066;
+const SLOT_VMO_STAGED_RESIZE: usize = 1067;
 const SLOT_DGRAM_PRESENT: usize = 954;
 const SLOT_DGRAM_FAILURE_STEP: usize = 955;
 const SLOT_DGRAM_CREATE: usize = 956;
@@ -819,7 +834,7 @@ const SLOT_DGRAM_WRITE_PEER_CLOSED: usize = 977;
 const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
 const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_VMO_SHARED_RESIZE;
+const SLOT_MAX: usize = SLOT_VMO_STAGED_RESIZE;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1780,6 +1795,10 @@ fn vmo_shared_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_VMO_SHARED_PRESENT] != 0 || slots[SLOT_VMO_SHARED_FAILURE_STEP] != 0
 }
 
+fn vmo_staged_summary_present(slots: &[u64]) -> bool {
+    slots[SLOT_VMO_STAGED_PRESENT] != 0 || slots[SLOT_VMO_STAGED_FAILURE_STEP] != 0
+}
+
 fn smp_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_SMP_SMOKE_PRESENT] != 0
 }
@@ -2188,6 +2207,27 @@ fn print_vmo_shared_summary(slots: &[u64]) {
     );
 }
 
+fn print_vmo_staged_summary(slots: &[u64]) {
+    crate::kprintln!(
+        "kernel: vmo staged shared smoke (vmo_staged_present={}, vmo_staged_failure_step={}, vmo_staged_namespace_build={}, vmo_staged_open={}, vmo_staged_get_vmo={}, vmo_staged_info={}, vmo_staged_info_kind={}, vmo_staged_info_backing_scope={}, vmo_staged_info_flags={}, vmo_staged_info_size={}, vmo_staged_info_size_page_aligned={}, vmo_staged_read={}, vmo_staged_read_match={}, vmo_staged_write={}, vmo_staged_resize={})",
+        slots[SLOT_VMO_STAGED_PRESENT],
+        slots[SLOT_VMO_STAGED_FAILURE_STEP],
+        slots[SLOT_VMO_STAGED_NAMESPACE_BUILD] as i64,
+        slots[SLOT_VMO_STAGED_OPEN] as i64,
+        slots[SLOT_VMO_STAGED_GET_VMO] as i64,
+        slots[SLOT_VMO_STAGED_INFO] as i64,
+        slots[SLOT_VMO_STAGED_INFO_KIND],
+        slots[SLOT_VMO_STAGED_INFO_BACKING_SCOPE],
+        slots[SLOT_VMO_STAGED_INFO_FLAGS],
+        slots[SLOT_VMO_STAGED_INFO_SIZE],
+        slots[SLOT_VMO_STAGED_INFO_SIZE_PAGE_ALIGNED],
+        slots[SLOT_VMO_STAGED_READ] as i64,
+        slots[SLOT_VMO_STAGED_READ_MATCH],
+        slots[SLOT_VMO_STAGED_WRITE] as i64,
+        slots[SLOT_VMO_STAGED_RESIZE] as i64,
+    );
+}
+
 fn print_smp_summary(slots: &[u64]) {
     crate::kprintln!(
         "kernel: smp smoke ok (present={}, status={})",
@@ -2314,6 +2354,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         if vmo_shared_summary_present(slots) {
             print_vmo_shared_summary(slots);
         }
+        if vmo_staged_summary_present(slots) {
+            print_vmo_staged_summary(slots);
+        }
         if smp_summary_present(slots) {
             print_smp_summary(slots);
         }
@@ -2355,6 +2398,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
     }
     if vmo_shared_summary_present(slots) {
         print_vmo_shared_summary(slots);
+    }
+    if vmo_staged_summary_present(slots) {
+        print_vmo_staged_summary(slots);
     }
     if smp_summary_present(slots) {
         print_smp_summary(slots);
