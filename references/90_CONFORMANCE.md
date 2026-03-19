@@ -168,13 +168,15 @@ Main just targets include:
   - explicit `DmaRegion` objects now pin:
     - the shared queue/buffer memory
     - the exported BAR0 VMO
-  - DMA-region lookup, not raw VMO lookup, now freezes the DMA-style address handoff shape
-  - driver mapping of the exported BAR0 window now explicitly exercises `ZX_VM_MAP_MMIO`
+  - DMA-region IOVA lookup, not raw VMO lookup, now freezes the DMA-style address handoff shape
+  - driver mapping of the exported BAR0 window now consumes the BAR-exported map options and
+    therefore explicitly exercises `ZX_VM_MAP_MMIO`
   - one MMIO-style BAR0 register page freezes a minimal control-plane shape:
     - device identity/version
     - feature bits plus driver-acknowledged feature bits
     - queue-pair count and stride metadata
     - one queue-local ready/notify/completion block per queue pair
+    - one queue-local set of programmed TX/RX desc / avail / used DMA addresses
   - one ready interrupt, one TX-kick interrupt, and one RX-complete interrupt per queue pair carry
     control flow
   - one reusable split TX/RX virtio-style transport slice now completes one eight-packet batched

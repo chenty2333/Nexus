@@ -68,8 +68,13 @@ Current PCI-device shape:
 - it is not waitable
 - it currently exports:
   - one immutable device-info snapshot
-  - one BAR VMO handle per supported BAR index
-  - one interrupt-object handle per `(group, queue_pair)` tuple
+  - one BAR VMO handle per supported BAR index plus:
+    - BAR size
+    - BAR flags
+    - suggested VM map options for that BAR window
+  - one interrupt-object handle per `(group, queue_pair)` tuple plus:
+    - delivery mode
+    - opaque vector / line index metadata
 - the first concrete user is the queue-owned bootstrap net dataplane slice
 - it is not yet a full PCI bus/discovery object:
   - no enumeration
@@ -83,8 +88,9 @@ Current DMA-region shape:
 - it is created through `ax_vmo_pin()` over one page-aligned range of one physical or contiguous
   VMO
 - it owns one explicit frame-pin token, so closing the last handle releases the pinned pages
-- it currently exposes one narrow metadata query:
+- it currently exposes two narrow metadata queries:
   - `ax_dma_region_lookup_paddr()` for one offset inside the pinned range
+  - `ax_dma_region_lookup_iova()` for one first device-visible address view of that same range
 - it is not waitable and it does not yet imply any BTI/IOMMU grant or cache-policy contract
 
 Current socket shape:

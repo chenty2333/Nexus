@@ -106,8 +106,9 @@ Current state:
 - one narrow bootstrap `PciDevice` contract is now public:
   - kernel seeds one device handle into the bootstrap runner shared-slot window
   - `ax_pci_device_get_info()` exports one immutable resource summary
-  - `ax_pci_device_get_bar()` exports one BAR VMO handle
-  - `ax_pci_device_get_interrupt()` exports one interrupt-object handle per queue-pair/group
+  - `ax_pci_device_get_bar()` exports one BAR VMO handle plus BAR flags / suggested VM map options
+  - `ax_pci_device_get_interrupt()` exports one interrupt-object handle per queue-pair/group plus
+    interrupt mode / vector metadata
 - `zx_vmo_create_physical(base_paddr, size, 0, out)` is now public and creates a shared
   physical/MMIO-style VMO over an existing page-aligned physical span.
 - `zx_vmo_create_contiguous(size, 0, out)` is now public and creates a shared contiguous VMO.
@@ -119,6 +120,8 @@ Current state:
   one page-aligned range of one physical/contiguous VMO.
 - `ax_dma_region_lookup_paddr(handle, offset, out_paddr)` is the first narrow query on that pinned
   DMA-region object.
+- `ax_dma_region_lookup_iova(handle, offset, out_iova)` is the first narrow device-visible address
+  query on that same pinned DMA-region object.
 - `interrupt_create(ZX_INTERRUPT_VIRTUAL)` is now public as a narrow virtual/software interrupt
   object, and `ax_interrupt_trigger()` is the matching Axle-native injection helper.
 
@@ -129,8 +132,8 @@ What is still intentionally narrow:
 - the current pin contract is one direct VMO -> `DmaRegion` path, not yet a fuller BTI/grant
   object model
 - only physical and contiguous VMOs may currently be pinned
-- the pin contract is still physical-address oriented; there is no device-visible IOVA or map/unmap
-  token yet
+- the pin contract now has one first identity-like device-visible IOVA query, but there is still
+  no map/unmap token or richer translation/isolation model yet
 - there is no IOMMU-facing isolation contract
 - there is no hardware IRQ routing or MSI/MSI-X model yet
 - contiguous allocation is a bootstrap DMA-oriented primitive, not yet a richer device-memory policy

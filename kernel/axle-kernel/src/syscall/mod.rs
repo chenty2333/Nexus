@@ -17,10 +17,10 @@ use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
 use axle_types::pci::{ax_pci_bar_info_t, ax_pci_device_info_t, ax_pci_interrupt_info_t};
 use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_OUT_OF_RANGE, ZX_OK};
 use axle_types::syscall_numbers::{
-    AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR, AXLE_SYS_AX_GUEST_SESSION_CREATE,
-    AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY, AXLE_SYS_AX_GUEST_SESSION_RESUME,
-    AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY, AXLE_SYS_AX_INTERRUPT_TRIGGER,
-    AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
+    AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA, AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR,
+    AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
+    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
+    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
     AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
     AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
     AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE,
@@ -49,7 +49,7 @@ use axle_types::{
 };
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 62] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 63] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -96,6 +96,7 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 62] = [
     AXLE_SYS_AX_VMO_LOOKUP_PADDR,
     AXLE_SYS_AX_VMO_PIN,
     AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR,
+    AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA,
     AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
     AXLE_SYS_AX_PCI_DEVICE_GET_BAR,
     AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT,
@@ -1473,6 +1474,35 @@ typed_syscall!(
 );
 const AX_DMA_REGION_LOOKUP_PADDR_DISPATCH: SyscallDispatch =
     SyscallDispatch::new(ax_dma_region_lookup_paddr_entry);
+
+type DmaRegionLookupIovaRequest = (zx_handle_t, u64);
+
+fn decode_ax_dma_region_lookup_iova(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<DmaRegionLookupIovaRequest, OutValue<u64>>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        (ctx.arg_handle(args, 0)?, args[1]),
+        ctx.decode_out_value::<u64>(args, 2)?,
+    ))
+}
+
+fn run_ax_dma_region_lookup_iova(req: DmaRegionLookupIovaRequest) -> Result<u64, zx_status_t> {
+    crate::object::vm::lookup_dma_region_iova(req.0, req.1)
+}
+
+typed_syscall!(
+    AX_DMA_REGION_LOOKUP_IOVA_TYPED,
+    ax_dma_region_lookup_iova_entry,
+    DmaRegionLookupIovaRequest,
+    OutValue<u64>,
+    u64,
+    decode_ax_dma_region_lookup_iova,
+    run_ax_dma_region_lookup_iova,
+    writeback_u64
+);
+const AX_DMA_REGION_LOOKUP_IOVA_DISPATCH: SyscallDispatch =
+    SyscallDispatch::new(ax_dma_region_lookup_iova_entry);
 
 type PciDeviceGetInfoRequest = zx_handle_t;
 
@@ -3132,6 +3162,7 @@ fn syscall_dispatch(nr: SyscallNumber) -> Option<&'static SyscallDispatch> {
         AXLE_SYS_AX_VMO_LOOKUP_PADDR => Some(&AX_VMO_LOOKUP_PADDR_DISPATCH),
         AXLE_SYS_AX_VMO_PIN => Some(&AX_VMO_PIN_DISPATCH),
         AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR => Some(&AX_DMA_REGION_LOOKUP_PADDR_DISPATCH),
+        AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA => Some(&AX_DMA_REGION_LOOKUP_IOVA_DISPATCH),
         AXLE_SYS_AX_PCI_DEVICE_GET_INFO => Some(&AX_PCI_DEVICE_GET_INFO_DISPATCH),
         AXLE_SYS_AX_PCI_DEVICE_GET_BAR => Some(&AX_PCI_DEVICE_GET_BAR_DISPATCH),
         AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT => Some(&AX_PCI_DEVICE_GET_INTERRUPT_DISPATCH),

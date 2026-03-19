@@ -42,10 +42,10 @@ use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::status::{ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NO_MEMORY};
 use axle_types::syscall_numbers::{
-    AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR, AXLE_SYS_AX_GUEST_SESSION_CREATE,
-    AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY, AXLE_SYS_AX_GUEST_SESSION_RESUME,
-    AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY, AXLE_SYS_AX_INTERRUPT_TRIGGER,
-    AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
+    AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA, AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR,
+    AXLE_SYS_AX_GUEST_SESSION_CREATE, AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY,
+    AXLE_SYS_AX_GUEST_SESSION_RESUME, AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY,
+    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
     AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
     AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
     AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE,
@@ -591,6 +591,18 @@ pub fn ax_dma_region_lookup_paddr(
     native_call(
         AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR as u64,
         [handle, offset, out_paddr as *mut u64 as u64, 0, 0, 0],
+    )
+}
+
+/// Return the device-visible IOVA backing one offset inside a pinned DMA region.
+pub fn ax_dma_region_lookup_iova(
+    handle: zx_handle_t,
+    offset: u64,
+    out_iova: &mut u64,
+) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA as u64,
+        [handle, offset, out_iova as *mut u64 as u64, 0, 0, 0],
     )
 }
 

@@ -279,6 +279,20 @@ pub fn lookup_dma_region_paddr(handle: zx_handle_t, offset: u64) -> Result<u64, 
     })
 }
 
+/// Return the device-visible IOVA backing one offset inside a pinned DMA region.
+pub fn lookup_dma_region_iova(handle: zx_handle_t, offset: u64) -> Result<u64, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        Ok(
+            state.with_objects(|objects| match objects.get(resolved.object_key()) {
+                Some(KernelObject::DmaRegion(region)) => region.lookup_iova(offset),
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })?,
+        )
+    })
+}
+
 /// Return the physical address backing one physical/contiguous VMO offset.
 pub fn lookup_vmo_paddr(handle: zx_handle_t, offset: u64) -> Result<u64, zx_status_t> {
     with_state_mut(|state| {

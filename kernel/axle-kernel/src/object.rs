@@ -139,6 +139,10 @@ impl DmaRegionObject {
         Ok(frame_id.raw() + byte_offset)
     }
 
+    pub(crate) fn lookup_iova(&self, offset: u64) -> Result<u64, zx_status_t> {
+        self.lookup_paddr(offset)
+    }
+
     fn release(self, frames: &mut axle_mm::FrameTable) {
         self.pin.release(frames);
     }

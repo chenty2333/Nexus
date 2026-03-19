@@ -53,8 +53,12 @@ pub(crate) struct VirtioQueueRegs {
     pub(crate) interrupt_status: u32,
     pub(crate) tx_notify_count: u32,
     pub(crate) rx_complete_count: u32,
-    pub(crate) reserved0: u32,
-    pub(crate) reserved1: u32,
+    pub(crate) tx_desc_addr: u64,
+    pub(crate) tx_avail_addr: u64,
+    pub(crate) tx_used_addr: u64,
+    pub(crate) rx_desc_addr: u64,
+    pub(crate) rx_avail_addr: u64,
+    pub(crate) rx_used_addr: u64,
 }
 
 #[repr(C)]
@@ -127,6 +131,30 @@ pub(crate) const fn rx_buffer_offset(pair: usize) -> u64 {
 
 pub(crate) const fn frame_len(payload_len: usize) -> usize {
     size_of::<VirtioNetHdr>() + payload_len
+}
+
+pub(crate) const fn tx_desc_paddr(queue_paddr: u64, pair: usize) -> u64 {
+    queue_paddr + tx_queue_offset(pair)
+}
+
+pub(crate) const fn tx_avail_paddr(queue_paddr: u64, pair: usize) -> u64 {
+    tx_desc_paddr(queue_paddr, pair) + 64
+}
+
+pub(crate) const fn tx_used_paddr(queue_paddr: u64, pair: usize) -> u64 {
+    tx_desc_paddr(queue_paddr, pair) + 128
+}
+
+pub(crate) const fn rx_desc_paddr(queue_paddr: u64, pair: usize) -> u64 {
+    queue_paddr + rx_queue_offset(pair)
+}
+
+pub(crate) const fn rx_avail_paddr(queue_paddr: u64, pair: usize) -> u64 {
+    rx_desc_paddr(queue_paddr, pair) + 64
+}
+
+pub(crate) const fn rx_used_paddr(queue_paddr: u64, pair: usize) -> u64 {
+    rx_desc_paddr(queue_paddr, pair) + 128
 }
 
 pub(crate) const fn empty_avail() -> VirtqAvail {
@@ -235,6 +263,12 @@ pub(crate) fn read_desc(mapped_base: u64, queue_offset: u64, desc_index: usize) 
     unsafe { ptr::read_volatile(queue_desc_ptr(mapped_base, queue_offset, desc_index)) }
 }
 
+pub(crate) fn read_desc_at(desc_base: u64, desc_index: usize) -> VirtqDesc {
+    // SAFETY: the descriptor table base is one mapped shared-memory address,
+    // and readers only access slots that the published ring points at.
+    unsafe { ptr::read_volatile((desc_base as *const VirtqDesc).add(desc_index)) }
+}
+
 pub(crate) fn write_avail(mapped_base: u64, queue_offset: u64, avail: VirtqAvail) {
     // SAFETY: the avail ring header lives in mapped shared memory and is
     // single-writer from the driver side.
@@ -247,6 +281,12 @@ pub(crate) fn read_avail(mapped_base: u64, queue_offset: u64) -> VirtqAvail {
     unsafe { ptr::read_volatile(queue_avail_ptr(mapped_base, queue_offset)) }
 }
 
+pub(crate) fn read_avail_at(avail_base: u64) -> VirtqAvail {
+    // SAFETY: the avail ring header base is one mapped shared-memory address,
+    // and the device side only reads it after the notify boundary.
+    unsafe { ptr::read_volatile(avail_base as *const VirtqAvail) }
+}
+
 pub(crate) fn write_used(mapped_base: u64, queue_offset: u64, used: VirtqUsed) {
     // SAFETY: the used ring header lives in mapped shared memory and is
     // single-writer from the device side.
@@ -257,4 +297,24 @@ pub(crate) fn read_used(mapped_base: u64, queue_offset: u64) -> VirtqUsed {
     // SAFETY: the used ring header lives in mapped shared memory and is read
     // by the driver side only after completion publication.
     unsafe { ptr::read_volatile(queue_used_ptr(mapped_base, queue_offset)) }
+}
+
+pub(crate) fn write_used_at(used_base: u64, used: VirtqUsed) {
+    // SAFETY: the used ring header base is one mapped shared-memory address,
+    // and the device side is the only writer for one queue at a time.
+    unsafe { ptr::write_volatile(used_base as *mut VirtqUsed, used) }
+}
+
+pub(crate) fn read_used_at(used_base: u64) -> VirtqUsed {
+    // SAFETY: the used ring header base is one mapped shared-memory address,
+    // and the driver reads it only after completion publication.
+    unsafe { ptr::read_volatile(used_base as *const VirtqUsed) }
+}
+
+pub(crate) fn map_dma_addr(mapped_queue_base: u64, queue_paddr: u64, addr: u64) -> Option<u64> {
+    if addr < queue_paddr {
+        return None;
+    }
+    let offset = addr - queue_paddr;
+    (offset < QUEUE_VMO_BYTES).then_some(mapped_queue_base + offset)
 }

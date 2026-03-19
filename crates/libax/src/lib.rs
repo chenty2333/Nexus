@@ -522,6 +522,18 @@ pub fn ax_dma_region_lookup_paddr(
     }
 }
 
+/// Return the device-visible IOVA backing one offset inside a pinned DMA region.
+pub fn ax_dma_region_lookup_iova(
+    handle: ax_handle_t,
+    offset: u64,
+    out_iova: &mut u64,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_dma_region_lookup_iova(raw, offset, out_iova),
+        Err(status) => status,
+    }
+}
+
 /// Read one narrow PCI/device info snapshot from a device handle.
 pub fn ax_pci_device_get_info(
     handle: ax_handle_t,
@@ -546,6 +558,8 @@ pub fn ax_pci_device_get_bar(
             if status == AX_OK {
                 out_bar.handle = widen_handle(raw_bar.handle);
                 out_bar.size = raw_bar.size;
+                out_bar.flags = raw_bar.flags;
+                out_bar.map_options = raw_bar.map_options;
             }
             status
         }
@@ -567,6 +581,8 @@ pub fn ax_pci_device_get_interrupt(
                 libzircon::ax_pci_device_get_interrupt(raw, group, queue_pair, &mut raw_interrupt);
             if status == AX_OK {
                 out_interrupt.handle = widen_handle(raw_interrupt.handle);
+                out_interrupt.mode = raw_interrupt.mode;
+                out_interrupt.vector = raw_interrupt.vector;
             }
             status
         }

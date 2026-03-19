@@ -35,7 +35,7 @@ This file describes the current syscall-number source, trap entry, argument copy
   - it first gives guest-started carrier threads one chance to divert into the generic
     guest-session stop boundary
   - ordinary native userspace then falls through to the same shared syscall shell
-- The current bootstrap syscall ABI surface is `62` generated syscall numbers.
+- The current bootstrap syscall ABI surface is `63` generated syscall numbers.
 - `AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC` is now the distinct Linux-facing
   exec-prepare helper. It accepts one opaque exec-spec blob and produces the
   prepared entry/stack pair without overloading the generic native launch path.
@@ -105,6 +105,7 @@ The current bootstrap syscall surface includes:
 - VMO create / read / write / set size
 - VMO create physical / create contiguous / lookup backing paddr / pin DMA region
 - DMA-region lookup backing paddr
+- DMA-region lookup device-visible IOVA
 - PCI/device info / BAR / interrupt export
 - VMAR allocate / destroy / map / unmap / protect
 - channel create / write / read
@@ -150,13 +151,13 @@ The current bootstrap syscall surface includes:
   - `interrupt_create()` only accepts `ZX_INTERRUPT_VIRTUAL`
   - `ax_interrupt_trigger()` is an Axle-native helper rather than a fully generic IRQ delivery ABI
   - `ax_vmo_lookup_paddr()` is a narrow bootstrap helper
-  - `ax_vmo_pin()` + `ax_dma_region_lookup_paddr()` now add one first explicit DMA lifetime object
-    without yet becoming a full BTI/IOMMU contract
+  - `ax_vmo_pin()` + `ax_dma_region_lookup_paddr()` + `ax_dma_region_lookup_iova()` now add one
+    first explicit DMA lifetime object without yet becoming a full BTI/IOMMU contract
   - `ax_pci_device_get_info()` / `ax_pci_device_get_bar()` / `ax_pci_device_get_interrupt()`
     currently export one narrow bootstrap device contract:
     - one capability already seeded into the bootstrap runner
-    - one BAR VMO export result
-    - one interrupt-object export result per queue-pair/group
+    - one BAR VMO export result plus BAR flags / VM map-option metadata
+    - one interrupt-object export result per queue-pair/group plus delivery-mode / vector metadata
     - no generic PCI enumeration or bus-management ABI yet
   - `ZX_VM_MAP_MMIO` is now the first narrow public VM mapping attribute bit:
     - it requests device/MMIO cache attributes on the installed mapping

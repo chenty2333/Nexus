@@ -719,3 +719,14 @@ args = [
   { name = "queue_pair", ty = "u32" },
   { name = "out_interrupt", ty = "*mut ax_pci_interrupt_info_t" },
 ]
+
+[[syscall]]
+name = "ax_dma_region_lookup_iova"
+nr = 62
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "offset", ty = "u64" },
+  { name = "out_iova", ty = "*mut u64" },
+]

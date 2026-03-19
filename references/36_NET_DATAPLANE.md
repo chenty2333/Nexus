@@ -24,15 +24,17 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
 
 - one bootstrap `PciDevice` handle seeded by the kernel into the runner shared-slot window
 - one device-info query instead of one userspace-synthesized config-page discovery step
-- one BAR0 VMO exported by the kernel from that device handle
-- one interrupt-object export per queue pair and per interrupt group
+- one BAR0 VMO exported by the kernel from that device handle, plus BAR MMIO metadata
+- one interrupt-object export per queue pair and per interrupt group, plus interrupt mode/vector
+  metadata
 - one shared queue/buffer window allocated through `zx_vmo_create_contiguous()`
 - one explicit `DmaRegion` lifetime object over:
   - the queue memory
   - the exported BAR0 VMO
-- one DMA-region address lookup through `ax_dma_region_lookup_paddr()` rather than one raw
+- one DMA-region address lookup through `ax_dma_region_lookup_iova()` rather than one raw
   `ax_vmo_lookup_paddr()` handoff
-- driver mapping of the BAR0 window now requests `ZX_VM_MAP_MMIO`
+- driver mapping of the BAR0 window now uses the BAR-exported VM map options and therefore
+  explicitly requests `ZX_VM_MAP_MMIO`
 - one second mapping of that same BAR0 export is used by the synthetic device-side worker
 - one MMIO-style BAR0 page carries:
   - device identity/version
@@ -43,6 +45,7 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
     - last notify value
     - interrupt status
     - notify / completion counts
+    - driver-programmed TX/RX desc / avail / used DMA addresses
 - two queue-local virtual interrupt triplets:
   - one worker-ready interrupt per queue pair
   - one TX-kick interrupt per queue pair
@@ -78,6 +81,9 @@ Ownership is intentionally one-writer-per-substructure:
   - the RX used ring for its owned queue pair
   - the MMIO queue-local control block for its owned queue pair
 - driver side writes the MMIO driver-ready / feature-ack state before the first kick
+- driver side now also writes the queue DMA addresses into that same queue-local MMIO block before
+  the first kick; the worker/device side consumes those programmed addresses rather than relying on
+  one fixed shared-memory offset convention
 - readiness/notification uses interrupt objects rather than channels or ports in the data path
 
 The current smoke now completes one batched transport round:
@@ -103,8 +109,10 @@ The current bootstrap slice proves three things:
 2. Queue-owned multi-queue transport can already be exercised without inventing a kernel-resident
    network stack.
 3. The current `DmaRegion` object is already enough to express one explicit DMA lifetime contract
-   for queue memory and driver-visible control windows; the next device/net cuts should build on
-   that object rather than on ad-hoc physical-address helpers.
+   for queue memory and driver-visible control windows, and the driver/device pair can now pass
+   queue ownership through explicit programmed DMA addresses instead of one fully synthetic offset
+   convention; the next device/net cuts should build on that object rather than on ad-hoc physical
+   address helpers.
 
 ## What this is not yet
 
@@ -112,7 +120,8 @@ The current bootstrap slice proves three things:
 - no real PCI config space or BAR management contract from the kernel
 - no generic PCI enumeration or config-space ABI yet; only one narrow resource-export object
 - no MMIO cache-policy / mapping-attribute controls beyond the first narrow `ZX_VM_MAP_MMIO` bit
-- no DMA map/unmap or IOVA model yet
+- only one first narrow identity-like IOVA query exists; there is still no DMA map/unmap or fuller
+  IOVA token model yet
 - no MSI/MSI-X or hardware IRQ routing
 - no real virtio feature negotiation
 - no userspace TCP/IP stack

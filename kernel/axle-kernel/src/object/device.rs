@@ -1,8 +1,8 @@
 use super::*;
 use axle_types::pci::{
-    AX_PCI_INTERRUPT_GROUP_READY, AX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
-    AX_PCI_INTERRUPT_GROUP_TX_KICK, ax_pci_bar_info_t, ax_pci_device_info_t,
-    ax_pci_interrupt_info_t,
+    AX_PCI_BAR_FLAG_MMIO, AX_PCI_INTERRUPT_GROUP_READY, AX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
+    AX_PCI_INTERRUPT_GROUP_TX_KICK, AX_PCI_INTERRUPT_MODE_VIRTUAL, ax_pci_bar_info_t,
+    ax_pci_device_info_t, ax_pci_interrupt_info_t,
 };
 use axle_types::status::{ZX_ERR_BAD_HANDLE, ZX_ERR_OUT_OF_RANGE, ZX_ERR_WRONG_TYPE};
 
@@ -63,6 +63,8 @@ impl PciDeviceObject {
             ax_pci_bar_info_t {
                 handle: ZX_HANDLE_INVALID,
                 size: self.bar0_size,
+                flags: AX_PCI_BAR_FLAG_MMIO,
+                map_options: axle_types::vm::AX_VM_MAP_MMIO,
             },
         ))
     }
@@ -199,7 +201,14 @@ pub fn pci_device_get_interrupt(
             })?;
         let irq_handle =
             state.alloc_handle_for_object(irq_object, handle::interrupt_default_rights())?;
-        Ok(ax_pci_interrupt_info_t { handle: irq_handle })
+        let vector = group
+            .saturating_mul(BOOTSTRAP_NET_QUEUE_PAIR_COUNT as u32)
+            .saturating_add(queue_pair);
+        Ok(ax_pci_interrupt_info_t {
+            handle: irq_handle,
+            mode: AX_PCI_INTERRUPT_MODE_VIRTUAL,
+            vector,
+        })
     })
 }
 

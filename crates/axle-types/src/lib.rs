@@ -518,6 +518,29 @@ pub mod pci {
     /// Export the current RX-complete interrupt for one queue pair.
     pub const ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE: u32 = AX_PCI_INTERRUPT_GROUP_RX_COMPLETE;
 
+    /// BAR names one MMIO window.
+    pub const AX_PCI_BAR_FLAG_MMIO: u32 = 1 << 0;
+    /// BAR names one MMIO window.
+    pub const ZX_PCI_BAR_FLAG_MMIO: u32 = AX_PCI_BAR_FLAG_MMIO;
+
+    /// Interrupt resource is one synthetic virtual line.
+    pub const AX_PCI_INTERRUPT_MODE_VIRTUAL: u32 = 0;
+    /// Reserved mode for future hardware INTx wiring.
+    pub const AX_PCI_INTERRUPT_MODE_LEGACY: u32 = 1;
+    /// Reserved mode for future MSI wiring.
+    pub const AX_PCI_INTERRUPT_MODE_MSI: u32 = 2;
+    /// Reserved mode for future MSI-X wiring.
+    pub const AX_PCI_INTERRUPT_MODE_MSIX: u32 = 3;
+
+    /// Interrupt resource is one synthetic virtual line.
+    pub const ZX_PCI_INTERRUPT_MODE_VIRTUAL: u32 = AX_PCI_INTERRUPT_MODE_VIRTUAL;
+    /// Reserved mode for future hardware INTx wiring.
+    pub const ZX_PCI_INTERRUPT_MODE_LEGACY: u32 = AX_PCI_INTERRUPT_MODE_LEGACY;
+    /// Reserved mode for future MSI wiring.
+    pub const ZX_PCI_INTERRUPT_MODE_MSI: u32 = AX_PCI_INTERRUPT_MODE_MSI;
+    /// Reserved mode for future MSI-X wiring.
+    pub const ZX_PCI_INTERRUPT_MODE_MSIX: u32 = AX_PCI_INTERRUPT_MODE_MSIX;
+
     /// One narrow public PCI/device info snapshot.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -559,6 +582,10 @@ pub mod pci {
         pub handle: ax_handle_t,
         /// BAR size in bytes.
         pub size: u64,
+        /// Resource flags describing the BAR window.
+        pub flags: u32,
+        /// Mapping options the driver should apply when installing this BAR.
+        pub map_options: u32,
     }
 
     /// Frozen Zircon-compat alias over the native BAR-export result.
@@ -570,6 +597,10 @@ pub mod pci {
     pub struct ax_pci_interrupt_info_t {
         /// Handle naming the exported interrupt object.
         pub handle: ax_handle_t,
+        /// Interrupt delivery mode for this resource.
+        pub mode: u32,
+        /// Opaque vector or line index within that delivery mode.
+        pub vector: u32,
     }
 
     /// Frozen Zircon-compat alias over the native interrupt-export result.

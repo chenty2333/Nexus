@@ -10,14 +10,15 @@ use crate::virtio_net_transport::{
     PCI_CLASS_NETWORK, PCI_DEVICE_ID_NET, PCI_SUBCLASS_ETHERNET, PCI_VENDOR_ID_AXLE,
     QUEUE_PAIR_COUNT, QUEUE_SIZE, QUEUE_VMO_BYTES, REGISTER_VMO_BYTES, VirtioNetHdr,
     VirtioQueueRegs, VirtqDesc, buffer_offset, buffer_paddr, empty_avail, empty_used, frame_len,
-    init_regs, read_avail, read_header, read_queue_regs, read_used, rx_buffer_offset,
-    rx_queue_offset, tx_buffer_offset, tx_queue_offset, write_avail, write_desc, write_header,
-    write_queue_regs, write_used,
+    init_regs, map_dma_addr, read_avail_at, read_desc_at, read_header, read_queue_regs, read_used,
+    rx_avail_paddr, rx_buffer_offset, rx_desc_paddr, rx_queue_offset, rx_used_paddr,
+    tx_avail_paddr, tx_buffer_offset, tx_desc_paddr, tx_queue_offset, tx_used_paddr, write_avail,
+    write_desc, write_header, write_queue_regs, write_used, write_used_at,
 };
 use axle_arch_x86_64::{debug_break, native_syscall8, rdtsc};
 use libzircon::handle::ZX_HANDLE_INVALID;
 use libzircon::pci::{
-    ZX_PCI_INTERRUPT_GROUP_READY, ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
+    ZX_PCI_BAR_FLAG_MMIO, ZX_PCI_INTERRUPT_GROUP_READY, ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
     ZX_PCI_INTERRUPT_GROUP_TX_KICK, zx_pci_bar_info_t, zx_pci_device_info_t,
     zx_pci_interrupt_info_t,
 };
@@ -26,10 +27,10 @@ use libzircon::status::ZX_OK;
 use libzircon::syscall_numbers::AXLE_SYS_VMAR_MAP;
 use libzircon::vm::{ZX_VM_MAP_MMIO, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
-    ax_dma_region_lookup_paddr, ax_interrupt_trigger, ax_pci_device_get_bar,
-    ax_pci_device_get_info, ax_pci_device_get_interrupt, ax_vmo_pin, zx_handle_close, zx_handle_t,
-    zx_interrupt_ack, zx_object_wait_one, zx_signals_t, zx_status_t, zx_task_kill,
-    zx_thread_create, zx_thread_start, zx_vmo_create_contiguous,
+    ax_dma_region_lookup_iova, ax_interrupt_trigger, ax_pci_device_get_bar, ax_pci_device_get_info,
+    ax_pci_device_get_interrupt, ax_vmo_pin, zx_handle_close, zx_handle_t, zx_interrupt_ack,
+    zx_object_wait_one, zx_signals_t, zx_status_t, zx_task_kill, zx_thread_create, zx_thread_start,
+    zx_vmo_create_contiguous,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
@@ -438,13 +439,18 @@ fn run_net_smoke() -> NetSummary {
 
     let mut bar0_paddr = 0u64;
     summary.bar0_dma_lookup =
-        ax_dma_region_lookup_paddr(owned_handles[OWNED_BAR0_DMA], 0, &mut bar0_paddr) as i64;
+        ax_dma_region_lookup_iova(owned_handles[OWNED_BAR0_DMA], 0, &mut bar0_paddr) as i64;
     if summary.bar0_dma_lookup != ZX_OK as i64 {
         summary.failure_step = STEP_BAR0_DMA_LOOKUP;
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
-    summary.bar0_match = u64::from(pci_bar.size == REGISTER_VMO_BYTES && bar0_paddr != 0);
+    summary.bar0_match = u64::from(
+        pci_bar.size == REGISTER_VMO_BYTES
+            && bar0_paddr != 0
+            && (pci_bar.flags & ZX_PCI_BAR_FLAG_MMIO) != 0
+            && (pci_bar.map_options & ZX_VM_MAP_MMIO) != 0,
+    );
 
     let mut reg_device_base = 0u64;
     summary.reg_backing_map = zx_vmar_map_local(
@@ -486,7 +492,7 @@ fn run_net_smoke() -> NetSummary {
 
     let mut queue_paddr = 0u64;
     summary.queue_dma_lookup =
-        ax_dma_region_lookup_paddr(owned_handles[OWNED_QUEUE_DMA], 0, &mut queue_paddr) as i64;
+        ax_dma_region_lookup_iova(owned_handles[OWNED_QUEUE_DMA], 0, &mut queue_paddr) as i64;
     if summary.queue_dma_lookup != ZX_OK as i64 {
         summary.failure_step = STEP_QUEUE_DMA_LOOKUP;
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
@@ -601,7 +607,7 @@ fn run_net_smoke() -> NetSummary {
         }
     }
 
-    if !configure_driver_transport(reg_driver_base, &mut summary, pci_info) {
+    if !configure_driver_transport(reg_driver_base, &mut summary, pci_info, queue_paddr) {
         summary.failure_step = STEP_MMIO_READY;
         close_workers_and_handles(
             &worker_threads,
@@ -770,7 +776,7 @@ fn map_driver_bar0(
     let mut bar0_driver_base = 0u64;
     summary.bar0_map = zx_vmar_map_local(
         root_vmar,
-        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_MAP_MMIO,
+        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | bar.map_options,
         0,
         owned_handles[OWNED_BAR0_VMO],
         0,
@@ -789,6 +795,7 @@ fn configure_driver_transport(
     reg_base: u64,
     summary: &mut NetSummary,
     info: zx_pci_device_info_t,
+    queue_paddr: u64,
 ) -> bool {
     let header = read_header(reg_base);
     let expected_device_features = info.device_features;
@@ -818,6 +825,12 @@ fn configure_driver_transport(
             VirtioQueueRegs {
                 tx_queue_ready: 1,
                 rx_queue_ready: 1,
+                tx_desc_addr: tx_desc_paddr(queue_paddr, pair),
+                tx_avail_addr: tx_avail_paddr(queue_paddr, pair),
+                tx_used_addr: tx_used_paddr(queue_paddr, pair),
+                rx_desc_addr: rx_desc_paddr(queue_paddr, pair),
+                rx_avail_addr: rx_avail_paddr(queue_paddr, pair),
+                rx_used_addr: rx_used_paddr(queue_paddr, pair),
                 ..VirtioQueueRegs::default()
             },
         );
@@ -876,6 +889,12 @@ extern "C" fn net_worker_entry(pair_raw: u64, _arg1: u64) -> ! {
         || header.queue_size != QUEUE_SIZE as u32
         || queue_regs.tx_queue_ready != 1
         || queue_regs.rx_queue_ready != 1
+        || queue_regs.tx_desc_addr == 0
+        || queue_regs.tx_avail_addr == 0
+        || queue_regs.tx_used_addr == 0
+        || queue_regs.rx_desc_addr == 0
+        || queue_regs.rx_avail_addr == 0
+        || queue_regs.rx_used_addr == 0
     {
         NET_WORKER_FAILURE_STEP[pair].store(STEP_MMIO_READY, Ordering::Release);
         park_forever();
@@ -886,8 +905,34 @@ extern "C" fn net_worker_entry(pair_raw: u64, _arg1: u64) -> ! {
     queue_regs.tx_notify_count = queue_regs.tx_notify_count.saturating_add(1);
     write_queue_regs(reg_base, pair, queue_regs);
 
-    let tx_avail = read_avail(queue_base, tx_queue_offset(pair));
-    let rx_avail = read_avail(queue_base, rx_queue_offset(pair));
+    let Some(tx_desc_base) = map_dma_addr(queue_base, queue_paddr, queue_regs.tx_desc_addr) else {
+        NET_WORKER_FAILURE_STEP[pair].store(STEP_MMIO_READY, Ordering::Release);
+        park_forever();
+    };
+    let Some(tx_avail_base) = map_dma_addr(queue_base, queue_paddr, queue_regs.tx_avail_addr)
+    else {
+        NET_WORKER_FAILURE_STEP[pair].store(STEP_MMIO_READY, Ordering::Release);
+        park_forever();
+    };
+    let Some(tx_used_base) = map_dma_addr(queue_base, queue_paddr, queue_regs.tx_used_addr) else {
+        NET_WORKER_FAILURE_STEP[pair].store(STEP_MMIO_READY, Ordering::Release);
+        park_forever();
+    };
+    let Some(rx_desc_base) = map_dma_addr(queue_base, queue_paddr, queue_regs.rx_desc_addr) else {
+        NET_WORKER_FAILURE_STEP[pair].store(STEP_MMIO_READY, Ordering::Release);
+        park_forever();
+    };
+    let Some(rx_avail_base) = map_dma_addr(queue_base, queue_paddr, queue_regs.rx_avail_addr)
+    else {
+        NET_WORKER_FAILURE_STEP[pair].store(STEP_MMIO_READY, Ordering::Release);
+        park_forever();
+    };
+    let Some(rx_used_base) = map_dma_addr(queue_base, queue_paddr, queue_regs.rx_used_addr) else {
+        NET_WORKER_FAILURE_STEP[pair].store(STEP_MMIO_READY, Ordering::Release);
+        park_forever();
+    };
+    let tx_avail = read_avail_at(tx_avail_base);
+    let rx_avail = read_avail_at(rx_avail_base);
     if tx_avail.idx != QUEUE_SIZE as u16 || rx_avail.idx != QUEUE_SIZE as u16 {
         NET_WORKER_FAILURE_STEP[pair].store(STEP_WORKER_WAIT_KICK, Ordering::Release);
         park_forever();
@@ -901,16 +946,8 @@ extern "C" fn net_worker_entry(pair_raw: u64, _arg1: u64) -> ! {
     for slot in 0..QUEUE_SIZE {
         let tx_head = tx_avail.ring[slot];
         let rx_head = rx_avail.ring[slot];
-        let tx_desc = crate::virtio_net_transport::read_desc(
-            queue_base,
-            tx_queue_offset(pair),
-            usize::from(tx_head),
-        );
-        let rx_desc = crate::virtio_net_transport::read_desc(
-            queue_base,
-            rx_queue_offset(pair),
-            usize::from(rx_head),
-        );
+        let tx_desc = read_desc_at(tx_desc_base, usize::from(tx_head));
+        let rx_desc = read_desc_at(rx_desc_base, usize::from(rx_head));
         let tx_offset = tx_desc.addr.saturating_sub(queue_paddr);
         let rx_offset = rx_desc.addr.saturating_sub(queue_paddr);
         if tx_offset >= QUEUE_VMO_BYTES || rx_offset >= QUEUE_VMO_BYTES {
@@ -932,8 +969,8 @@ extern "C" fn net_worker_entry(pair_raw: u64, _arg1: u64) -> ! {
             len: copy_len,
         };
     }
-    write_used(queue_base, tx_queue_offset(pair), tx_used);
-    write_used(queue_base, rx_queue_offset(pair), rx_used);
+    write_used_at(tx_used_base, tx_used);
+    write_used_at(rx_used_base, rx_used);
 
     queue_regs = read_queue_regs(reg_base, pair);
     queue_regs.notify_value = MMIO_NOTIFY_RX;
