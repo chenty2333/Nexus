@@ -168,6 +168,7 @@ Main just targets include:
   - explicit `DmaRegion` objects now pin:
     - the shared queue/buffer memory
     - the exported BAR0 VMO
+    - with explicit `DEVICE_READ | DEVICE_WRITE` pin options
   - DMA-region IOVA lookup, not raw VMO lookup, now freezes the DMA-style address handoff shape
   - driver mapping of the exported BAR0 window now consumes the BAR-exported map options and
     therefore explicitly exercises `ZX_VM_MAP_MMIO`
@@ -179,6 +180,9 @@ Main just targets include:
     - one queue-local set of programmed TX/RX desc / avail / used DMA addresses
   - one ready interrupt, one TX-kick interrupt, and one RX-complete interrupt per queue pair carry
     control flow
+  - the runner now also cross-checks those exported interrupts through `interrupt_get_info()`:
+    - mode/vector metadata must agree with the PCI-exported snapshot
+    - the current synthetic transport requires triggerable interrupt objects
   - one reusable split TX/RX virtio-style transport slice now completes one eight-packet batched
     loopback round without channel/socket data-plane help
   - the summary now also exports:
@@ -563,11 +567,13 @@ This makes contract coverage part of the repo workflow, not just informal docume
 - The device-facing bootstrap smoke now also reports through its own structured summary line:
   - `kernel: device vm interrupt smoke (...)`
   - current assertions cover:
-    - virtual interrupt create / wait / trigger / mask / unmask / ack
+    - virtual interrupt create / get-info / wait / trigger / mask / unmask / ack
     - contiguous VMO creation, physical-address lookup, and contiguity check
-    - contiguous VMO pin into one `DmaRegion` object plus pinned-range paddr lookup
+    - contiguous VMO pin into one `DmaRegion` object with explicit DMA permission bits plus
+      pinned-range paddr lookup
     - physical VMO aliasing over an existing contiguous page
-    - physical VMO pin into one `DmaRegion` object plus pinned-range paddr lookup
+    - physical VMO pin into one `DmaRegion` object with explicit DMA permission bits plus
+      pinned-range paddr lookup
 - `tools/axle-concurrency` is a host-side Snowcat-lite runner for concurrent seeds:
   - seeds carry both operation programs and schedule hints
   - replay metadata includes runner version, logical CPU count, flags, PRNG seed, and step budget

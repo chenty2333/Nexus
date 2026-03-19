@@ -3,16 +3,20 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axle_arch_x86_64::{debug_break, native_syscall8};
+use libzircon::dma::{ZX_DMA_PERM_DEVICE_READ, ZX_DMA_PERM_DEVICE_WRITE};
 use libzircon::handle::ZX_HANDLE_INVALID;
-use libzircon::interrupt::ZX_INTERRUPT_VIRTUAL;
+use libzircon::interrupt::{
+    ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE, ZX_INTERRUPT_MODE_VIRTUAL, ZX_INTERRUPT_VIRTUAL,
+    zx_interrupt_info_t,
+};
 use libzircon::signals::ZX_INTERRUPT_SIGNALED;
 use libzircon::status::{ZX_ERR_TIMED_OUT, ZX_OK};
 use libzircon::syscall_numbers::AXLE_SYS_VMAR_MAP;
 use libzircon::vm::{ZX_VM_MAP_MMIO, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
     ax_dma_region_lookup_paddr, ax_interrupt_trigger, ax_vmo_lookup_paddr, ax_vmo_pin, zx_handle_t,
-    zx_interrupt_ack, zx_interrupt_create, zx_interrupt_mask, zx_interrupt_unmask,
-    zx_object_wait_one, zx_signals_t, zx_status_t, zx_vmo_create_contiguous,
+    zx_interrupt_ack, zx_interrupt_create, zx_interrupt_get_info, zx_interrupt_mask,
+    zx_interrupt_unmask, zx_object_wait_one, zx_signals_t, zx_status_t, zx_vmo_create_contiguous,
     zx_vmo_create_physical, zx_vmo_read, zx_vmo_write,
 };
 
@@ -37,6 +41,10 @@ const SLOT_DEVICE_INTERRUPT_WAIT_UNMASKED_OBSERVED: usize = 908;
 const SLOT_DEVICE_INTERRUPT_ACK1: usize = 909;
 const SLOT_DEVICE_INTERRUPT_ACK2: usize = 910;
 const SLOT_DEVICE_INTERRUPT_WAIT_DRAINED: usize = 911;
+const SLOT_DEVICE_INTERRUPT_INFO: usize = 938;
+const SLOT_DEVICE_INTERRUPT_MODE: usize = 939;
+const SLOT_DEVICE_INTERRUPT_VECTOR: usize = 940;
+const SLOT_DEVICE_INTERRUPT_FLAGS: usize = 941;
 const SLOT_DEVICE_CONTIG_CREATE: usize = 912;
 const SLOT_DEVICE_CONTIG_LOOKUP0: usize = 913;
 const SLOT_DEVICE_CONTIG_LOOKUP1: usize = 914;
@@ -78,6 +86,7 @@ const STEP_INTERRUPT_WAIT_UNMASKED: u64 = 10;
 const STEP_INTERRUPT_ACK1: u64 = 11;
 const STEP_INTERRUPT_ACK2: u64 = 12;
 const STEP_INTERRUPT_WAIT_DRAINED: u64 = 13;
+const STEP_INTERRUPT_INFO: u64 = 28;
 const STEP_CONTIG_CREATE: u64 = 14;
 const STEP_CONTIG_LOOKUP0: u64 = 15;
 const STEP_CONTIG_LOOKUP1: u64 = 16;
@@ -172,6 +181,24 @@ fn run_device_smoke() {
     write_status(SLOT_DEVICE_INTERRUPT_CREATE, status);
     if status != ZX_OK {
         write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_INTERRUPT_CREATE);
+        return;
+    }
+
+    let mut interrupt_info = zx_interrupt_info_t::default();
+    let status = zx_interrupt_get_info(interrupt, &mut interrupt_info);
+    write_status(SLOT_DEVICE_INTERRUPT_INFO, status);
+    write_slot(SLOT_DEVICE_INTERRUPT_MODE, u64::from(interrupt_info.mode));
+    write_slot(
+        SLOT_DEVICE_INTERRUPT_VECTOR,
+        u64::from(interrupt_info.vector),
+    );
+    write_slot(SLOT_DEVICE_INTERRUPT_FLAGS, u64::from(interrupt_info.flags));
+    if status != ZX_OK
+        || interrupt_info.mode != ZX_INTERRUPT_MODE_VIRTUAL
+        || interrupt_info.vector != 0
+        || (interrupt_info.flags & ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE) == 0
+    {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_INTERRUPT_INFO);
         return;
     }
 
@@ -297,7 +324,13 @@ fn run_device_smoke() {
     );
 
     let mut contig_region = ZX_HANDLE_INVALID;
-    let status = ax_vmo_pin(contig, 0, 2 * PAGE_SIZE, 0, &mut contig_region);
+    let status = ax_vmo_pin(
+        contig,
+        0,
+        2 * PAGE_SIZE,
+        ZX_DMA_PERM_DEVICE_READ | ZX_DMA_PERM_DEVICE_WRITE,
+        &mut contig_region,
+    );
     write_status(SLOT_DEVICE_CONTIG_PIN_CREATE, status);
     if status != ZX_OK {
         write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_CONTIG_PIN_CREATE);
@@ -383,7 +416,13 @@ fn run_device_smoke() {
     }
 
     let mut physical_region = ZX_HANDLE_INVALID;
-    let status = ax_vmo_pin(physical, 0, PAGE_SIZE, 0, &mut physical_region);
+    let status = ax_vmo_pin(
+        physical,
+        0,
+        PAGE_SIZE,
+        ZX_DMA_PERM_DEVICE_READ | ZX_DMA_PERM_DEVICE_WRITE,
+        &mut physical_region,
+    );
     write_status(SLOT_DEVICE_PHYSICAL_PIN_CREATE, status);
     if status != ZX_OK {
         write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_PHYSICAL_PIN_CREATE);

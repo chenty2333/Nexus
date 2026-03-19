@@ -687,6 +687,10 @@ const SLOT_DEVICE_PHYSICAL_PIN_CREATE: usize = 934;
 const SLOT_DEVICE_PHYSICAL_PIN_LOOKUP: usize = 935;
 const SLOT_DEVICE_PHYSICAL_PIN_PADDR: usize = 936;
 const SLOT_DEVICE_PHYSICAL_PIN_MATCHES: usize = 937;
+const SLOT_DEVICE_INTERRUPT_INFO: usize = 938;
+const SLOT_DEVICE_INTERRUPT_MODE: usize = 939;
+const SLOT_DEVICE_INTERRUPT_VECTOR: usize = 940;
+const SLOT_DEVICE_INTERRUPT_FLAGS: usize = 941;
 const SLOT_NET_FAILURE_STEP: usize = 928;
 const SLOT_NET_READY_IRQ_CREATE: usize = 929;
 const SLOT_NET_TX_IRQ_CREATE: usize = 930;
@@ -1930,10 +1934,14 @@ fn print_perf_summary(slots: &mut [u64]) {
 
 fn print_device_summary(slots: &[u64]) {
     crate::kprintln!(
-        "kernel: device vm interrupt smoke (device_present={}, device_failure_step={}, interrupt_create={}, interrupt_wait_initial={}, interrupt_wait_initial_observed={}, interrupt_trigger={}, interrupt_wait_signaled={}, interrupt_wait_signaled_observed={}, interrupt_mask={}, interrupt_trigger_masked={}, interrupt_wait_masked={}, interrupt_unmask={}, interrupt_wait_unmasked={}, interrupt_wait_unmasked_observed={}, interrupt_ack1={}, interrupt_ack2={}, interrupt_wait_drained={}, contig_create={}, contig_lookup0={}, contig_lookup1={}, contig_paddr0={}, contig_paddr1={}, contig_is_contiguous={}, contig_pin_create={}, contig_pin_lookup0={}, contig_pin_lookup1={}, contig_pin_paddr0={}, contig_pin_paddr1={}, contig_pin_matches={}, contig_map={}, contig_write={}, contig_read={}, contig_read_match={}, physical_create={}, physical_lookup={}, physical_paddr={}, physical_matches_contig0={}, physical_pin_create={}, physical_pin_lookup={}, physical_pin_paddr={}, physical_pin_matches={}, physical_map={})",
+        "kernel: device vm interrupt smoke (device_present={}, device_failure_step={}, interrupt_create={}, interrupt_info={}, interrupt_mode={}, interrupt_vector={}, interrupt_flags={}, interrupt_wait_initial={}, interrupt_wait_initial_observed={}, interrupt_trigger={}, interrupt_wait_signaled={}, interrupt_wait_signaled_observed={}, interrupt_mask={}, interrupt_trigger_masked={}, interrupt_wait_masked={}, interrupt_unmask={}, interrupt_wait_unmasked={}, interrupt_wait_unmasked_observed={}, interrupt_ack1={}, interrupt_ack2={}, interrupt_wait_drained={}, contig_create={}, contig_lookup0={}, contig_lookup1={}, contig_paddr0={}, contig_paddr1={}, contig_is_contiguous={}, contig_pin_create={}, contig_pin_lookup0={}, contig_pin_lookup1={}, contig_pin_paddr0={}, contig_pin_paddr1={}, contig_pin_matches={}, contig_map={}, contig_write={}, contig_read={}, contig_read_match={}, physical_create={}, physical_lookup={}, physical_paddr={}, physical_matches_contig0={}, physical_pin_create={}, physical_pin_lookup={}, physical_pin_paddr={}, physical_pin_matches={}, physical_map={})",
         slots[SLOT_DEVICE_PRESENT],
         slots[SLOT_DEVICE_FAILURE_STEP],
         slots[SLOT_DEVICE_INTERRUPT_CREATE] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_INFO] as i64,
+        slots[SLOT_DEVICE_INTERRUPT_MODE],
+        slots[SLOT_DEVICE_INTERRUPT_VECTOR],
+        slots[SLOT_DEVICE_INTERRUPT_FLAGS],
         slots[SLOT_DEVICE_INTERRUPT_WAIT_INITIAL] as i64,
         slots[SLOT_DEVICE_INTERRUPT_WAIT_INITIAL_OBSERVED],
         slots[SLOT_DEVICE_INTERRUPT_TRIGGER] as i64,

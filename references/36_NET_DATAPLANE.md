@@ -31,6 +31,9 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
 - one explicit `DmaRegion` lifetime object over:
   - the queue memory
   - the exported BAR0 VMO
+- both current DMA-region creations now also freeze one first DMA-permission shape:
+  - `DEVICE_READ`
+  - `DEVICE_WRITE`
 - one DMA-region address lookup through `ax_dma_region_lookup_iova()` rather than one raw
   `ax_vmo_lookup_paddr()` handoff
 - driver mapping of the BAR0 window now uses the BAR-exported VM map options and therefore
@@ -50,6 +53,9 @@ The repository now includes one narrow ring3 `net_smoke` path built around one r
   - one worker-ready interrupt per queue pair
   - one TX-kick interrupt per queue pair
   - one RX-complete interrupt per queue pair
+- the driver now also validates the exported interrupt handles through `interrupt_get_info()`:
+  - exported PCI interrupt metadata and object metadata must agree on mode/vector
+  - the current bootstrap transport requires those interrupt objects to be triggerable
 - two user-mode worker threads acting as minimal device-side peers
 - one driver-side thread acting as the queue owner and verifier
 - one narrow kernel-exported device-resource discovery step:

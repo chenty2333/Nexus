@@ -14,6 +14,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use axle_core::{WaitAsyncOptions, WaitAsyncTimestamp};
+use axle_types::interrupt::ax_interrupt_info_t;
 use axle_types::pci::{ax_pci_bar_info_t, ax_pci_device_info_t, ax_pci_interrupt_info_t};
 use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_OUT_OF_RANGE, ZX_OK};
 use axle_types::syscall_numbers::{
@@ -29,15 +30,16 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER, AXLE_SYS_FUTEX_REQUEUE,
     AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
     AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_INTERRUPT_ACK, AXLE_SYS_INTERRUPT_CREATE,
-    AXLE_SYS_INTERRUPT_MASK, AXLE_SYS_INTERRUPT_UNMASK, AXLE_SYS_OBJECT_SIGNAL,
-    AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC, AXLE_SYS_OBJECT_WAIT_ONE,
-    AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT, AXLE_SYS_PROCESS_CREATE,
-    AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE,
-    AXLE_SYS_TASK_KILL, AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START,
-    AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMAR_ALLOCATE,
-    AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
-    AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_CREATE_CONTIGUOUS, AXLE_SYS_VMO_CREATE_PHYSICAL,
-    AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE, SyscallNumber,
+    AXLE_SYS_INTERRUPT_GET_INFO, AXLE_SYS_INTERRUPT_MASK, AXLE_SYS_INTERRUPT_UNMASK,
+    AXLE_SYS_OBJECT_SIGNAL, AXLE_SYS_OBJECT_SIGNAL_PEER, AXLE_SYS_OBJECT_WAIT_ASYNC,
+    AXLE_SYS_OBJECT_WAIT_ONE, AXLE_SYS_PORT_CREATE, AXLE_SYS_PORT_QUEUE, AXLE_SYS_PORT_WAIT,
+    AXLE_SYS_PROCESS_CREATE, AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ,
+    AXLE_SYS_SOCKET_WRITE, AXLE_SYS_TASK_KILL, AXLE_SYS_TASK_SUSPEND, AXLE_SYS_THREAD_CREATE,
+    AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL, AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET,
+    AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_DESTROY, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT,
+    AXLE_SYS_VMAR_UNMAP, AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_CREATE_CONTIGUOUS,
+    AXLE_SYS_VMO_CREATE_PHYSICAL, AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE,
+    SyscallNumber,
 };
 use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
@@ -49,7 +51,7 @@ use axle_types::{
 };
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 63] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 64] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -60,6 +62,7 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 63] = [
     AXLE_SYS_TIMER_SET,
     AXLE_SYS_TIMER_CANCEL,
     AXLE_SYS_INTERRUPT_CREATE,
+    AXLE_SYS_INTERRUPT_GET_INFO,
     AXLE_SYS_INTERRUPT_ACK,
     AXLE_SYS_INTERRUPT_MASK,
     AXLE_SYS_INTERRUPT_UNMASK,
@@ -716,6 +719,14 @@ fn writeback_vaddr(
     write_out_value(out, value)
 }
 
+fn writeback_value<T: Copy>(
+    _ctx: &mut SyscallCtx,
+    out: OutValue<T>,
+    value: T,
+) -> Result<(), zx_status_t> {
+    write_out_value(out, value)
+}
+
 fn writeback_vaddr_pair(
     _ctx: &mut SyscallCtx,
     outs: (OutValue<zx_vaddr_t>, OutValue<zx_vaddr_t>),
@@ -1195,6 +1206,32 @@ typed_syscall!(
     writeback_handle
 );
 const INTERRUPT_CREATE_DISPATCH: SyscallDispatch = SyscallDispatch::new(interrupt_create_entry);
+
+fn decode_interrupt_get_info(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<zx_handle_t, OutValue<ax_interrupt_info_t>>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        ctx.arg_handle(args, 0)?,
+        ctx.decode_out_value::<ax_interrupt_info_t>(args, 1)?,
+    ))
+}
+
+fn run_interrupt_get_info(handle: zx_handle_t) -> Result<ax_interrupt_info_t, zx_status_t> {
+    crate::object::interrupt_get_info(handle)
+}
+
+typed_syscall!(
+    INTERRUPT_GET_INFO_TYPED,
+    interrupt_get_info_entry,
+    zx_handle_t,
+    OutValue<ax_interrupt_info_t>,
+    ax_interrupt_info_t,
+    decode_interrupt_get_info,
+    run_interrupt_get_info,
+    writeback_value
+);
+const INTERRUPT_GET_INFO_DISPATCH: SyscallDispatch = SyscallDispatch::new(interrupt_get_info_entry);
 
 fn decode_interrupt_ack(
     ctx: &mut SyscallCtx,
@@ -3149,6 +3186,7 @@ fn syscall_dispatch(nr: SyscallNumber) -> Option<&'static SyscallDispatch> {
         AXLE_SYS_TIMER_SET => Some(&TIMER_SET_DISPATCH),
         AXLE_SYS_TIMER_CANCEL => Some(&TIMER_CANCEL_DISPATCH),
         AXLE_SYS_INTERRUPT_CREATE => Some(&INTERRUPT_CREATE_DISPATCH),
+        AXLE_SYS_INTERRUPT_GET_INFO => Some(&INTERRUPT_GET_INFO_DISPATCH),
         AXLE_SYS_INTERRUPT_ACK => Some(&INTERRUPT_ACK_DISPATCH),
         AXLE_SYS_INTERRUPT_MASK => Some(&INTERRUPT_MASK_DISPATCH),
         AXLE_SYS_INTERRUPT_UNMASK => Some(&INTERRUPT_UNMASK_DISPATCH),

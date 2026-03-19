@@ -16,6 +16,7 @@ use core::ptr;
 pub use libzircon::nexus_component;
 
 pub use axle_types::clock;
+pub use axle_types::dma;
 pub use axle_types::guest;
 pub use axle_types::handle;
 pub use axle_types::interrupt;
@@ -31,10 +32,10 @@ pub use axle_types::vm;
 pub use axle_types::wait_async;
 pub use axle_types::{
     ax_clock_t, ax_duration_t, ax_futex_t, ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_handle_t,
-    ax_koid_t, ax_linux_exec_interp_header_t, ax_linux_exec_spec_header_t, ax_packet_signal_t,
-    ax_packet_type_t, ax_packet_user_t, ax_pci_bar_info_t, ax_pci_device_info_t,
-    ax_pci_interrupt_info_t, ax_port_packet_t, ax_rights_t, ax_signals_t, ax_status_t, ax_time_t,
-    ax_vaddr_t, ax_vm_option_t,
+    ax_interrupt_info_t, ax_koid_t, ax_linux_exec_interp_header_t, ax_linux_exec_spec_header_t,
+    ax_packet_signal_t, ax_packet_type_t, ax_packet_user_t, ax_pci_bar_info_t,
+    ax_pci_device_info_t, ax_pci_interrupt_info_t, ax_port_packet_t, ax_rights_t, ax_signals_t,
+    ax_status_t, ax_time_t, ax_vaddr_t, ax_vm_option_t,
 };
 
 use axle_types::status::{AX_ERR_NO_MEMORY, AX_ERR_OUT_OF_RANGE, AX_OK};
@@ -249,6 +250,17 @@ pub fn ax_interrupt_create(options: u32, out: &mut ax_handle_t) -> ax_status_t {
         *out = widen_handle(raw_out);
     }
     status
+}
+
+/// Read one metadata snapshot from an interrupt object.
+pub fn ax_interrupt_get_info(
+    handle: ax_handle_t,
+    out_info: &mut ax_interrupt_info_t,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::zx_interrupt_get_info(raw, out_info),
+        Err(status) => status,
+    }
 }
 
 /// Acknowledge one pending interrupt.

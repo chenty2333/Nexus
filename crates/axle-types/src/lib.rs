@@ -491,13 +491,72 @@ pub mod socket {
 
 /// Interrupt creation options.
 pub mod interrupt {
-    use super::{ax_vm_option_t, zx_vm_option_t};
+    use super::{ax_handle_t, ax_vm_option_t, zx_handle_t, zx_vm_option_t};
 
     /// Create one software-triggerable virtual interrupt object.
     pub const AX_INTERRUPT_VIRTUAL: ax_vm_option_t = 1 << 0;
 
     /// Create one software-triggerable virtual interrupt object.
     pub const ZX_INTERRUPT_VIRTUAL: zx_vm_option_t = AX_INTERRUPT_VIRTUAL as zx_vm_option_t;
+
+    /// Interrupt object delivers one synthetic virtual line.
+    pub const AX_INTERRUPT_MODE_VIRTUAL: u32 = 0;
+    /// Reserved mode for future hardware INTx wiring.
+    pub const AX_INTERRUPT_MODE_LEGACY: u32 = 1;
+    /// Reserved mode for future MSI wiring.
+    pub const AX_INTERRUPT_MODE_MSI: u32 = 2;
+    /// Reserved mode for future MSI-X wiring.
+    pub const AX_INTERRUPT_MODE_MSIX: u32 = 3;
+
+    /// Interrupt object delivers one synthetic virtual line.
+    pub const ZX_INTERRUPT_MODE_VIRTUAL: u32 = AX_INTERRUPT_MODE_VIRTUAL;
+    /// Reserved mode for future hardware INTx wiring.
+    pub const ZX_INTERRUPT_MODE_LEGACY: u32 = AX_INTERRUPT_MODE_LEGACY;
+    /// Reserved mode for future MSI wiring.
+    pub const ZX_INTERRUPT_MODE_MSI: u32 = AX_INTERRUPT_MODE_MSI;
+    /// Reserved mode for future MSI-X wiring.
+    pub const ZX_INTERRUPT_MODE_MSIX: u32 = AX_INTERRUPT_MODE_MSIX;
+
+    /// Software trigger is permitted through `ax_interrupt_trigger()`.
+    pub const AX_INTERRUPT_INFO_FLAG_TRIGGERABLE: u32 = 1 << 0;
+    /// Software trigger is permitted through `ax_interrupt_trigger()`.
+    pub const ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE: u32 = AX_INTERRUPT_INFO_FLAG_TRIGGERABLE;
+
+    /// One interrupt-object metadata snapshot.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ax_interrupt_info_t {
+        /// Handle naming the interrupt object that produced this snapshot.
+        pub handle: ax_handle_t,
+        /// Delivery mode for this interrupt object.
+        pub mode: u32,
+        /// Opaque vector or line index within that delivery mode.
+        pub vector: u32,
+        /// Capability and source flags for this interrupt object.
+        pub flags: u32,
+        /// Reserved for later expansion.
+        pub reserved0: u32,
+    }
+
+    /// Frozen Zircon-compat alias over the native interrupt-info record.
+    pub type zx_interrupt_info_t = ax_interrupt_info_t;
+
+    const _: () = {
+        let _ = core::mem::size_of::<zx_handle_t>();
+    };
+}
+
+/// DMA pin options and metadata.
+pub mod dma {
+    /// Device may read from the pinned region.
+    pub const AX_DMA_PERM_DEVICE_READ: u32 = 1 << 0;
+    /// Device may write into the pinned region.
+    pub const AX_DMA_PERM_DEVICE_WRITE: u32 = 1 << 1;
+
+    /// Device may read from the pinned region.
+    pub const ZX_DMA_PERM_DEVICE_READ: u32 = AX_DMA_PERM_DEVICE_READ;
+    /// Device may write into the pinned region.
+    pub const ZX_DMA_PERM_DEVICE_WRITE: u32 = AX_DMA_PERM_DEVICE_WRITE;
 }
 
 /// Narrow PCI/device-facing bootstrap types and constants.
@@ -615,6 +674,7 @@ pub use pci::{
     ax_pci_bar_info_t, ax_pci_device_info_t, ax_pci_interrupt_info_t, zx_pci_bar_info_t,
     zx_pci_device_info_t, zx_pci_interrupt_info_t,
 };
+pub use interrupt::{ax_interrupt_info_t, zx_interrupt_info_t};
 
 /// VM mapping and protection options.
 ///

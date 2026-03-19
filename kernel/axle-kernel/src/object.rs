@@ -17,7 +17,10 @@ use axle_core::{Capability, ObjectKey, PortError, Signals, TimerError, TimerId, 
 use axle_mm::{MappingCachePolicy, MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::handle::ZX_HANDLE_INVALID;
-use axle_types::interrupt::ZX_INTERRUPT_VIRTUAL;
+use axle_types::interrupt::{
+    AX_INTERRUPT_INFO_FLAG_TRIGGERABLE, AX_INTERRUPT_MODE_VIRTUAL, ZX_INTERRUPT_VIRTUAL,
+    ax_interrupt_info_t,
+};
 use axle_types::koid::ZX_KOID_INVALID;
 use axle_types::rights::{ZX_RIGHT_SAME_RIGHTS, ZX_RIGHTS_ALL};
 use axle_types::socket::{ZX_SOCKET_DATAGRAM, ZX_SOCKET_PEEK, ZX_SOCKET_STREAM};
@@ -98,7 +101,9 @@ pub(crate) struct TimerObject {
 pub(crate) struct InterruptObject {
     pending_count: u64,
     masked: bool,
-    virtual_only: bool,
+    mode: u32,
+    vector: u32,
+    triggerable: bool,
 }
 
 #[derive(Debug)]
@@ -106,6 +111,7 @@ pub(crate) struct DmaRegionObject {
     source_vmo_object: ObjectKey,
     source_offset: u64,
     size_bytes: u64,
+    options: u32,
     pin: axle_mm::PinToken,
 }
 
@@ -120,6 +126,10 @@ impl DmaRegionObject {
 
     pub(crate) const fn size_bytes(&self) -> u64 {
         self.size_bytes
+    }
+
+    pub(crate) const fn options(&self) -> u32 {
+        self.options
     }
 
     pub(crate) fn lookup_paddr(&self, offset: u64) -> Result<u64, zx_status_t> {
@@ -149,11 +159,27 @@ impl DmaRegionObject {
 }
 
 impl InterruptObject {
-    fn new(virtual_only: bool) -> Self {
+    fn new(mode: u32, vector: u32, triggerable: bool) -> Self {
         Self {
             pending_count: 0,
             masked: false,
-            virtual_only,
+            mode,
+            vector,
+            triggerable,
+        }
+    }
+
+    fn info(&self, handle: zx_handle_t) -> ax_interrupt_info_t {
+        ax_interrupt_info_t {
+            handle,
+            mode: self.mode,
+            vector: self.vector,
+            flags: if self.triggerable {
+                AX_INTERRUPT_INFO_FLAG_TRIGGERABLE
+            } else {
+                0
+            },
+            reserved0: 0,
         }
     }
 
@@ -2018,7 +2044,7 @@ pub fn create_interrupt(options: u32) -> Result<zx_handle_t, zx_status_t> {
         state.with_objects_mut(|objects| {
             objects.insert(
                 object_id,
-                KernelObject::Interrupt(InterruptObject::new(true)),
+                KernelObject::Interrupt(InterruptObject::new(AX_INTERRUPT_MODE_VIRTUAL, 0, true)),
             )?;
             Ok(())
         })?;
@@ -2046,6 +2072,18 @@ pub fn interrupt_ack(handle: zx_handle_t) -> Result<(), zx_status_t> {
             interrupt.ack()
         })?;
         crate::wait::publish_signals_changed(state, object_key, current)
+    })
+}
+
+/// Return one metadata snapshot for an interrupt object.
+pub fn interrupt_get_info(handle: zx_handle_t) -> Result<ax_interrupt_info_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        state.with_objects(|objects| match objects.get(resolved.object_key()) {
+            Some(KernelObject::Interrupt(interrupt)) => Ok(interrupt.info(handle)),
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        })
     })
 }
 
@@ -2094,7 +2132,7 @@ pub fn ax_interrupt_trigger(handle: zx_handle_t, count: u64) -> Result<(), zx_st
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
             };
-            if !interrupt.virtual_only {
+            if !interrupt.triggerable {
                 return Err(ZX_ERR_NOT_SUPPORTED);
             }
             interrupt.trigger(count)
@@ -2733,7 +2771,9 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                     let _ = (
                         interrupt.pending_count,
                         interrupt.masked,
-                        interrupt.virtual_only,
+                        interrupt.mode,
+                        interrupt.vector,
+                        interrupt.triggerable,
                     );
                     ObjectKind::Interrupt
                 }
@@ -2742,6 +2782,7 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                         region.source_vmo_object.object_id(),
                         region.source_offset,
                         region.size_bytes,
+                        region.options,
                         region.pin.frame_ids().len(),
                     );
                     ObjectKind::DmaRegion

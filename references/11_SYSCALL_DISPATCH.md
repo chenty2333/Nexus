@@ -35,7 +35,7 @@ This file describes the current syscall-number source, trap entry, argument copy
   - it first gives guest-started carrier threads one chance to divert into the generic
     guest-session stop boundary
   - ordinary native userspace then falls through to the same shared syscall shell
-- The current bootstrap syscall ABI surface is `63` generated syscall numbers.
+- The current bootstrap syscall ABI surface is `64` generated syscall numbers.
 - `AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC` is now the distinct Linux-facing
   exec-prepare helper. It accepts one opaque exec-spec blob and produces the
   prepared entry/stack pair without overloading the generic native launch path.
@@ -102,6 +102,7 @@ The current bootstrap syscall surface includes:
 - port create / queue / wait
 - timer create / set / cancel
 - interrupt create / ack / mask / unmask
+- interrupt get-info
 - VMO create / read / write / set size
 - VMO create physical / create contiguous / lookup backing paddr / pin DMA region
 - DMA-region lookup backing paddr
@@ -149,10 +150,16 @@ The current bootstrap syscall surface includes:
   syscall boundary at full native 64-bit width.
 - The current device-facing syscall surface is intentionally narrow:
   - `interrupt_create()` only accepts `ZX_INTERRUPT_VIRTUAL`
+  - `interrupt_get_info()` is now the first narrow metadata query over an interrupt object:
+    - delivery mode
+    - vector / line index
+    - triggerable flag
   - `ax_interrupt_trigger()` is an Axle-native helper rather than a fully generic IRQ delivery ABI
   - `ax_vmo_lookup_paddr()` is a narrow bootstrap helper
   - `ax_vmo_pin()` + `ax_dma_region_lookup_paddr()` + `ax_dma_region_lookup_iova()` now add one
-    first explicit DMA lifetime object without yet becoming a full BTI/IOMMU contract
+    first explicit DMA lifetime object without yet becoming a full BTI/IOMMU contract:
+    - `ax_vmo_pin()` now also freezes one first DMA-permission bit surface
+      (`DEVICE_READ` / `DEVICE_WRITE`)
   - `ax_pci_device_get_info()` / `ax_pci_device_get_bar()` / `ax_pci_device_get_interrupt()`
     currently export one narrow bootstrap device contract:
     - one capability already seeded into the bootstrap runner

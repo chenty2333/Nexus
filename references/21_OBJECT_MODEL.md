@@ -60,6 +60,10 @@ Current interrupt shape:
 - it is waitable and exposes `INTERRUPT_SIGNALED`
 - it tracks one pending count plus one masked/unmasked bit
 - `interrupt_ack()` drains one pending count
+- `interrupt_get_info()` now exposes one narrow metadata snapshot:
+  - delivery mode
+  - vector / line index
+  - triggerable flag
 - `ax_interrupt_trigger()` is the current Axle-native software injection helper
 
 Current PCI-device shape:
@@ -88,6 +92,9 @@ Current DMA-region shape:
 - it is created through `ax_vmo_pin()` over one page-aligned range of one physical or contiguous
   VMO
 - it owns one explicit frame-pin token, so closing the last handle releases the pinned pages
+- it now also freezes one first DMA-permission surface on creation:
+  - `DEVICE_READ`
+  - `DEVICE_WRITE`
 - it currently exposes two narrow metadata queries:
   - `ax_dma_region_lookup_paddr()` for one offset inside the pinned range
   - `ax_dma_region_lookup_iova()` for one first device-visible address view of that same range

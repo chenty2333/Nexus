@@ -121,9 +121,9 @@ pub(crate) fn seed_bootstrap_net_pci_device(state: &KernelState) -> Result<(), z
         },
     )?;
 
-    let ready_irqs = create_interrupt_array(state)?;
-    let tx_irqs = create_interrupt_array(state)?;
-    let rx_irqs = create_interrupt_array(state)?;
+    let ready_irqs = create_interrupt_array(state, AX_PCI_INTERRUPT_GROUP_READY)?;
+    let tx_irqs = create_interrupt_array(state, AX_PCI_INTERRUPT_GROUP_TX_KICK)?;
+    let rx_irqs = create_interrupt_array(state, AX_PCI_INTERRUPT_GROUP_RX_COMPLETE)?;
 
     let object_id = state.alloc_object_id();
     state.with_registry_mut(|registry| {
@@ -229,20 +229,31 @@ pub(crate) fn release_pci_device_resources(state: &KernelState, device: PciDevic
 
 fn create_interrupt_array(
     state: &KernelState,
+    group: u32,
 ) -> Result<[ObjectKey; BOOTSTRAP_NET_QUEUE_PAIR_COUNT], zx_status_t> {
     let mut keys = [ObjectKey::INVALID; BOOTSTRAP_NET_QUEUE_PAIR_COUNT];
-    for key in &mut keys {
-        *key = create_interrupt_object(state)?;
+    for (pair, key) in keys.iter_mut().enumerate() {
+        *key = create_interrupt_object(
+            state,
+            AX_PCI_INTERRUPT_MODE_VIRTUAL,
+            group
+                .saturating_mul(BOOTSTRAP_NET_QUEUE_PAIR_COUNT as u32)
+                .saturating_add(pair as u32),
+        )?;
     }
     Ok(keys)
 }
 
-fn create_interrupt_object(state: &KernelState) -> Result<ObjectKey, zx_status_t> {
+fn create_interrupt_object(
+    state: &KernelState,
+    mode: u32,
+    vector: u32,
+) -> Result<ObjectKey, zx_status_t> {
     let object_id = state.alloc_object_id();
     state.with_registry_mut(|registry| {
         registry.insert(
             object_id,
-            KernelObject::Interrupt(InterruptObject::new(true)),
+            KernelObject::Interrupt(InterruptObject::new(mode, vector, true)),
         )?;
         registry.retain_kernel_ref(object_id)?;
         Ok(())

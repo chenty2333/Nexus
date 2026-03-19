@@ -117,13 +117,21 @@ Current state:
 - `ax_vmo_lookup_paddr(handle, offset, out_paddr)` is the current narrow Axle-native helper for
   resolving the backing physical address of one physical/contiguous VMO offset.
 - `ax_vmo_pin(handle, offset, len, 0, out)` is now public and creates one `DmaRegion` object over
-  one page-aligned range of one physical/contiguous VMO.
+  one page-aligned range of one physical/contiguous VMO:
+  - `DEVICE_READ`
+  - `DEVICE_WRITE`
+  are now the first narrow public DMA-permission bits on that pin contract.
 - `ax_dma_region_lookup_paddr(handle, offset, out_paddr)` is the first narrow query on that pinned
   DMA-region object.
 - `ax_dma_region_lookup_iova(handle, offset, out_iova)` is the first narrow device-visible address
   query on that same pinned DMA-region object.
 - `interrupt_create(ZX_INTERRUPT_VIRTUAL)` is now public as a narrow virtual/software interrupt
   object, and `ax_interrupt_trigger()` is the matching Axle-native injection helper.
+- `interrupt_get_info(handle, out)` is now the first narrow metadata query over an interrupt
+  object:
+  - delivery mode
+  - vector / line index
+  - triggerable flag
 
 What is still intentionally narrow:
 
@@ -132,8 +140,10 @@ What is still intentionally narrow:
 - the current pin contract is one direct VMO -> `DmaRegion` path, not yet a fuller BTI/grant
   object model
 - only physical and contiguous VMOs may currently be pinned
-- the pin contract now has one first identity-like device-visible IOVA query, but there is still
-  no map/unmap token or richer translation/isolation model yet
+- the pin contract now has:
+  - one first identity-like device-visible IOVA query
+  - one first DMA-permission bit surface
+  but there is still no map/unmap token or richer translation/isolation model yet
 - there is no IOMMU-facing isolation contract
 - there is no hardware IRQ routing or MSI/MSI-X model yet
 - contiguous allocation is a bootstrap DMA-oriented primitive, not yet a richer device-memory policy

@@ -262,6 +262,7 @@ pub(super) fn interrupt_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::WAIT
+        | crate::task::HandleRights::INSPECT
         | crate::task::HandleRights::WRITE
 }
 

@@ -730,3 +730,13 @@ args = [
   { name = "offset", ty = "u64" },
   { name = "out_iova", ty = "*mut u64" },
 ]
+
+[[syscall]]
+name = "interrupt_get_info"
+nr = 63
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "out_info", ty = "*mut ax_interrupt_info_t" },
+]

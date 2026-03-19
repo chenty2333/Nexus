@@ -128,3 +128,5 @@ pub const AXLE_SYS_AX_PCI_DEVICE_GET_BAR: SyscallNumber = 60;
 pub const AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT: SyscallNumber = 61;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA: SyscallNumber = 62;
+/// Contract: SHOULD
+pub const AXLE_SYS_INTERRUPT_GET_INFO: SyscallNumber = 63;

@@ -218,7 +218,9 @@ pub fn pin_vmo(
     len: u64,
     options: u32,
 ) -> Result<zx_handle_t, zx_status_t> {
-    if options != 0 {
+    let allowed =
+        axle_types::dma::ZX_DMA_PERM_DEVICE_READ | axle_types::dma::ZX_DMA_PERM_DEVICE_WRITE;
+    if (options & !allowed) != 0 || options == 0 {
         return Err(ZX_ERR_INVALID_ARGS);
     }
 
@@ -239,6 +241,7 @@ pub fn pin_vmo(
                 source_vmo_object: object_key,
                 source_offset: offset,
                 size_bytes: len,
+                options,
                 pin: pin.take().ok_or(ZX_ERR_BAD_STATE)?,
             };
             objects.insert(region_object_id, KernelObject::DmaRegion(region))?;

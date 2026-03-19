@@ -16,7 +16,11 @@ use crate::virtio_net_transport::{
     write_desc, write_header, write_queue_regs, write_used, write_used_at,
 };
 use axle_arch_x86_64::{debug_break, native_syscall8, rdtsc};
+use libzircon::dma::{ZX_DMA_PERM_DEVICE_READ, ZX_DMA_PERM_DEVICE_WRITE};
 use libzircon::handle::ZX_HANDLE_INVALID;
+use libzircon::interrupt::{
+    ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE, ZX_INTERRUPT_MODE_VIRTUAL, zx_interrupt_info_t,
+};
 use libzircon::pci::{
     ZX_PCI_BAR_FLAG_MMIO, ZX_PCI_INTERRUPT_GROUP_READY, ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
     ZX_PCI_INTERRUPT_GROUP_TX_KICK, zx_pci_bar_info_t, zx_pci_device_info_t,
@@ -29,8 +33,8 @@ use libzircon::vm::{ZX_VM_MAP_MMIO, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
     ax_dma_region_lookup_iova, ax_interrupt_trigger, ax_pci_device_get_bar, ax_pci_device_get_info,
     ax_pci_device_get_interrupt, ax_vmo_pin, zx_handle_close, zx_handle_t, zx_interrupt_ack,
-    zx_object_wait_one, zx_signals_t, zx_status_t, zx_task_kill, zx_thread_create, zx_thread_start,
-    zx_vmo_create_contiguous,
+    zx_interrupt_get_info, zx_object_wait_one, zx_signals_t, zx_status_t, zx_task_kill,
+    zx_thread_create, zx_thread_start, zx_vmo_create_contiguous,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
@@ -370,6 +374,20 @@ fn run_net_smoke() -> NetSummary {
             close_handle_sets(&[], &owned_handles);
             return summary;
         }
+        let mut irq_info = zx_interrupt_info_t::default();
+        let info_status = zx_interrupt_get_info(info.handle, &mut irq_info) as i64;
+        aggregate_status(&mut summary.ready_irq_create, info_status);
+        if info_status != ZX_OK as i64
+            || info.mode != ZX_INTERRUPT_MODE_VIRTUAL
+            || irq_info.mode != info.mode
+            || irq_info.vector != info.vector
+            || (irq_info.flags & ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE) == 0
+        {
+            summary.failure_step = STEP_READY_IRQ_CREATE;
+            close_handles(&ready_irqs);
+            close_handle_sets(&[], &owned_handles);
+            return summary;
+        }
         *ready_irq = info.handle;
     }
 
@@ -384,6 +402,21 @@ fn run_net_smoke() -> NetSummary {
         ) as i64;
         aggregate_status(&mut summary.tx_irq_create, status);
         if status != ZX_OK as i64 {
+            summary.failure_step = STEP_TX_IRQ_CREATE;
+            close_handles(&tx_irqs);
+            close_handles(&ready_irqs);
+            close_handle_sets(&[], &owned_handles);
+            return summary;
+        }
+        let mut irq_info = zx_interrupt_info_t::default();
+        let info_status = zx_interrupt_get_info(info.handle, &mut irq_info) as i64;
+        aggregate_status(&mut summary.tx_irq_create, info_status);
+        if info_status != ZX_OK as i64
+            || info.mode != ZX_INTERRUPT_MODE_VIRTUAL
+            || irq_info.mode != info.mode
+            || irq_info.vector != info.vector
+            || (irq_info.flags & ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE) == 0
+        {
             summary.failure_step = STEP_TX_IRQ_CREATE;
             close_handles(&tx_irqs);
             close_handles(&ready_irqs);
@@ -411,6 +444,22 @@ fn run_net_smoke() -> NetSummary {
             close_handle_sets(&[], &owned_handles);
             return summary;
         }
+        let mut irq_info = zx_interrupt_info_t::default();
+        let info_status = zx_interrupt_get_info(info.handle, &mut irq_info) as i64;
+        aggregate_status(&mut summary.rx_irq_create, info_status);
+        if info_status != ZX_OK as i64
+            || info.mode != ZX_INTERRUPT_MODE_VIRTUAL
+            || irq_info.mode != info.mode
+            || irq_info.vector != info.vector
+            || (irq_info.flags & ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE) == 0
+        {
+            summary.failure_step = STEP_RX_IRQ_CREATE;
+            close_handles(&rx_irqs);
+            close_handles(&tx_irqs);
+            close_handles(&ready_irqs);
+            close_handle_sets(&[], &owned_handles);
+            return summary;
+        }
         *rx_irq = info.handle;
     }
 
@@ -428,7 +477,7 @@ fn run_net_smoke() -> NetSummary {
         owned_handles[OWNED_BAR0_VMO],
         0,
         pci_bar.size,
-        0,
+        ZX_DMA_PERM_DEVICE_READ | ZX_DMA_PERM_DEVICE_WRITE,
         &mut owned_handles[OWNED_BAR0_DMA],
     ) as i64;
     if summary.bar0_pin_create != ZX_OK as i64 {
@@ -481,7 +530,7 @@ fn run_net_smoke() -> NetSummary {
         owned_handles[OWNED_QUEUE_VMO],
         0,
         QUEUE_VMO_BYTES,
-        0,
+        ZX_DMA_PERM_DEVICE_READ | ZX_DMA_PERM_DEVICE_WRITE,
         &mut owned_handles[OWNED_QUEUE_DMA],
     ) as i64;
     if summary.queue_pin_create != ZX_OK as i64 {
