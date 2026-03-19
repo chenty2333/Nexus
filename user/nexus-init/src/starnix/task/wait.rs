@@ -189,6 +189,87 @@ pub(in crate::starnix) enum FdWaitOp {
 }
 
 impl StarnixKernel {
+    pub(in crate::starnix) fn sys_wait4(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let target_pid = stop_state.regs.rdi as u32 as i32;
+        let status_addr = stop_state.regs.rsi;
+        let options = stop_state.regs.rdx;
+        let rusage_addr = stop_state.regs.r10;
+        let supported_options = LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED;
+        if (options & !supported_options) != 0 || rusage_addr != 0 {
+            complete_syscall(stop_state, linux_errno(LINUX_EINVAL))?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let parent_tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let child_tgids = self
+            .groups
+            .get(&parent_tgid)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .child_tgids
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut has_match = false;
+        for child_tgid in child_tgids {
+            if !self.wait_matches(parent_tgid, target_pid, child_tgid) {
+                continue;
+            }
+            has_match = true;
+            if let Some(event) =
+                self.wait_event_for_child(parent_tgid, target_pid, child_tgid, options)
+            {
+                let wait_status = match event {
+                    WaitChildEvent::Zombie { status } | WaitChildEvent::Stopped { status } => {
+                        status
+                    }
+                    WaitChildEvent::Continued => LINUX_WAIT_STATUS_CONTINUED,
+                };
+                if status_addr != 0 {
+                    write_guest_bytes(
+                        self.tasks
+                            .get(&task_id)
+                            .ok_or(ZX_ERR_BAD_STATE)?
+                            .carrier
+                            .session_handle,
+                        status_addr,
+                        &wait_status.to_ne_bytes(),
+                    )
+                    .map_err(|status| {
+                        linux_status_from_errno(map_guest_write_status_to_errno(status))
+                    })?;
+                }
+                self.consume_wait_event(child_tgid, event)?;
+                complete_syscall(stop_state, child_tgid as u64)?;
+                if matches!(event, WaitChildEvent::Zombie { .. }) {
+                    self.reap_group(child_tgid)?;
+                }
+                return Ok(SyscallAction::Resume);
+            }
+        }
+        if !has_match {
+            complete_syscall(stop_state, linux_errno(LINUX_ECHILD))?;
+            return Ok(SyscallAction::Resume);
+        }
+        if (options & LINUX_WNOHANG) != 0 {
+            complete_syscall(stop_state, 0)?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let wait = WaitState {
+            restartable: true,
+            kind: WaitKind::Wait4 {
+                target_pid,
+                status_addr,
+                options,
+            },
+        };
+        self.begin_wait(task_id, wait, stop_state)
+    }
+
     pub(in crate::starnix) fn cancel_task_wait(&mut self, task_id: i32, wait: WaitState) {
         if let Some(key) = wait.futex_key() {
             self.remove_task_from_futex_queue(task_id, key);

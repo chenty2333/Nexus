@@ -1,6 +1,5 @@
-use super::super::task::lifecycle::{
-    fork_sigactions, fork_task_signals, reset_exec_sigactions, reset_task_after_exec,
-};
+use super::super::task::exec::{reset_exec_sigactions, reset_task_after_exec};
+use super::super::task::fork::{fork_sigactions, fork_task_signals};
 use super::super::*;
 use super::support::{RecordingFd, test_kernel_with_stdio};
 

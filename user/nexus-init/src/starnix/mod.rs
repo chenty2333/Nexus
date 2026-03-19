@@ -54,8 +54,8 @@ use self::task::task::{
 use self::task::thread_group::{LinuxSigChldInfo, LinuxThreadGroup, ThreadGroupState};
 use self::task::wait::{
     BlockedOpResume, FdReadKind, FdWaitOp, FdWaitPolicy, FdWriteKind, LinuxFileDescriptionKey,
-    LinuxFutexKey, LinuxFutexWaiter, PendingScmRights, ReadAttempt, WaitChildEvent, WaitKind,
-    WaitState, WriteAttempt,
+    LinuxFutexKey, LinuxFutexWaiter, PendingScmRights, ReadAttempt, WaitKind, WaitState,
+    WriteAttempt,
 };
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
