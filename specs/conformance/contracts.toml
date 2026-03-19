@@ -366,6 +366,11 @@ level = "should"
 description = "Staged shared-anonymous GetVmo handles for boot assets should report Anonymous + GlobalShared and remain readable but reject direct write and resize through the exported source handle"
 
 [[contracts]]
+id = "should.vmo.anonymous_promotion_bootstrap_contract"
+level = "should"
+description = "Fresh anonymous VMOs should report LocalPrivate before cross-process transfer and promote to GlobalShared in both exporter and importer after transfer/install"
+
+[[contracts]]
 id = "should.socket.stream_basics_bootstrap"
 level = "should"
 description = "Bootstrap STREAM sockets should support create, waitable readable/writable states, peek, read, peer-close signaling, and peer-closed read/write errors"

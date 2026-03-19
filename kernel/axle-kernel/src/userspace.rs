@@ -807,6 +807,28 @@ const SLOT_VMO_STAGED_READ: usize = 1064;
 const SLOT_VMO_STAGED_READ_MATCH: usize = 1065;
 const SLOT_VMO_STAGED_WRITE: usize = 1066;
 const SLOT_VMO_STAGED_RESIZE: usize = 1067;
+const SLOT_VMO_PROMOTION_PRESENT: usize = 1068;
+const SLOT_VMO_PROMOTION_FAILURE_STEP: usize = 1069;
+const SLOT_VMO_PROMOTION_CREATE: usize = 1070;
+const SLOT_VMO_PROMOTION_INFO_BEFORE: usize = 1071;
+const SLOT_VMO_PROMOTION_INFO_BEFORE_KIND: usize = 1072;
+const SLOT_VMO_PROMOTION_INFO_BEFORE_BACKING_SCOPE: usize = 1073;
+const SLOT_VMO_PROMOTION_CHANNEL_CREATE: usize = 1074;
+const SLOT_VMO_PROMOTION_PROCESS_CREATE: usize = 1075;
+const SLOT_VMO_PROMOTION_THREAD_CREATE: usize = 1076;
+const SLOT_VMO_PROMOTION_PREPARE_START: usize = 1077;
+const SLOT_VMO_PROMOTION_PROCESS_START: usize = 1078;
+const SLOT_VMO_PROMOTION_HANDLE_DUP: usize = 1079;
+const SLOT_VMO_PROMOTION_TRANSFER: usize = 1080;
+const SLOT_VMO_PROMOTION_WAIT_REPLY: usize = 1081;
+const SLOT_VMO_PROMOTION_WAIT_REPLY_OBSERVED: usize = 1082;
+const SLOT_VMO_PROMOTION_READ_REPLY: usize = 1083;
+const SLOT_VMO_PROMOTION_CHILD_INFO: usize = 1084;
+const SLOT_VMO_PROMOTION_CHILD_INFO_KIND: usize = 1085;
+const SLOT_VMO_PROMOTION_CHILD_INFO_BACKING_SCOPE: usize = 1086;
+const SLOT_VMO_PROMOTION_PARENT_INFO_AFTER: usize = 1087;
+const SLOT_VMO_PROMOTION_PARENT_INFO_AFTER_KIND: usize = 1088;
+const SLOT_VMO_PROMOTION_PARENT_INFO_AFTER_BACKING_SCOPE: usize = 1089;
 const SLOT_DGRAM_PRESENT: usize = 954;
 const SLOT_DGRAM_FAILURE_STEP: usize = 955;
 const SLOT_DGRAM_CREATE: usize = 956;
@@ -834,7 +856,7 @@ const SLOT_DGRAM_WRITE_PEER_CLOSED: usize = 977;
 const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
 const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_VMO_STAGED_RESIZE;
+const SLOT_MAX: usize = SLOT_VMO_PROMOTION_PARENT_INFO_AFTER_BACKING_SCOPE;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1799,6 +1821,10 @@ fn vmo_staged_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_VMO_STAGED_PRESENT] != 0 || slots[SLOT_VMO_STAGED_FAILURE_STEP] != 0
 }
 
+fn vmo_promotion_summary_present(slots: &[u64]) -> bool {
+    slots[SLOT_VMO_PROMOTION_PRESENT] != 0 || slots[SLOT_VMO_PROMOTION_FAILURE_STEP] != 0
+}
+
 fn smp_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_SMP_SMOKE_PRESENT] != 0
 }
@@ -2228,6 +2254,34 @@ fn print_vmo_staged_summary(slots: &[u64]) {
     );
 }
 
+fn print_vmo_promotion_summary(slots: &[u64]) {
+    crate::kprintln!(
+        "kernel: vmo promotion smoke (vmo_promotion_present={}, vmo_promotion_failure_step={}, vmo_promotion_create={}, vmo_promotion_info_before={}, vmo_promotion_info_before_kind={}, vmo_promotion_info_before_backing_scope={}, vmo_promotion_channel_create={}, vmo_promotion_process_create={}, vmo_promotion_thread_create={}, vmo_promotion_prepare_start={}, vmo_promotion_process_start={}, vmo_promotion_handle_dup={}, vmo_promotion_transfer={}, vmo_promotion_wait_reply={}, vmo_promotion_wait_reply_observed={}, vmo_promotion_read_reply={}, vmo_promotion_child_info={}, vmo_promotion_child_info_kind={}, vmo_promotion_child_info_backing_scope={}, vmo_promotion_parent_info_after={}, vmo_promotion_parent_info_after_kind={}, vmo_promotion_parent_info_after_backing_scope={})",
+        slots[SLOT_VMO_PROMOTION_PRESENT],
+        slots[SLOT_VMO_PROMOTION_FAILURE_STEP],
+        slots[SLOT_VMO_PROMOTION_CREATE] as i64,
+        slots[SLOT_VMO_PROMOTION_INFO_BEFORE] as i64,
+        slots[SLOT_VMO_PROMOTION_INFO_BEFORE_KIND],
+        slots[SLOT_VMO_PROMOTION_INFO_BEFORE_BACKING_SCOPE],
+        slots[SLOT_VMO_PROMOTION_CHANNEL_CREATE] as i64,
+        slots[SLOT_VMO_PROMOTION_PROCESS_CREATE] as i64,
+        slots[SLOT_VMO_PROMOTION_THREAD_CREATE] as i64,
+        slots[SLOT_VMO_PROMOTION_PREPARE_START] as i64,
+        slots[SLOT_VMO_PROMOTION_PROCESS_START] as i64,
+        slots[SLOT_VMO_PROMOTION_HANDLE_DUP] as i64,
+        slots[SLOT_VMO_PROMOTION_TRANSFER] as i64,
+        slots[SLOT_VMO_PROMOTION_WAIT_REPLY] as i64,
+        slots[SLOT_VMO_PROMOTION_WAIT_REPLY_OBSERVED],
+        slots[SLOT_VMO_PROMOTION_READ_REPLY] as i64,
+        slots[SLOT_VMO_PROMOTION_CHILD_INFO] as i64,
+        slots[SLOT_VMO_PROMOTION_CHILD_INFO_KIND],
+        slots[SLOT_VMO_PROMOTION_CHILD_INFO_BACKING_SCOPE],
+        slots[SLOT_VMO_PROMOTION_PARENT_INFO_AFTER] as i64,
+        slots[SLOT_VMO_PROMOTION_PARENT_INFO_AFTER_KIND],
+        slots[SLOT_VMO_PROMOTION_PARENT_INFO_AFTER_BACKING_SCOPE],
+    );
+}
+
 fn print_smp_summary(slots: &[u64]) {
     crate::kprintln!(
         "kernel: smp smoke ok (present={}, status={})",
@@ -2357,6 +2411,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         if vmo_staged_summary_present(slots) {
             print_vmo_staged_summary(slots);
         }
+        if vmo_promotion_summary_present(slots) {
+            print_vmo_promotion_summary(slots);
+        }
         if smp_summary_present(slots) {
             print_smp_summary(slots);
         }
@@ -2401,6 +2458,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
     }
     if vmo_staged_summary_present(slots) {
         print_vmo_staged_summary(slots);
+    }
+    if vmo_promotion_summary_present(slots) {
+        print_vmo_promotion_summary(slots);
     }
     if smp_summary_present(slots) {
         print_smp_summary(slots);

@@ -10,7 +10,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AXLE_TEST_RUNNER_ASM");
     println!("cargo:rerun-if-env-changed=AXLE_TEST_RUNNER_RUST_ENTRY");
     println!(
-        "cargo:rustc-check-cfg=cfg(axle_test_runner_rust_entry, values(\"reactor_smoke\", \"component_smoke\", \"perf_smoke\", \"device_smoke\", \"net_smoke\", \"datagram_smoke\", \"smp_smoke\", \"vmo_info_smoke\", \"vmo_shared_smoke\"))"
+        "cargo:rustc-check-cfg=cfg(axle_test_runner_rust_entry, values(\"reactor_smoke\", \"component_smoke\", \"perf_smoke\", \"device_smoke\", \"net_smoke\", \"datagram_smoke\", \"smp_smoke\", \"vmo_info_smoke\", \"vmo_shared_smoke\", \"vmo_promotion_smoke\"))"
     );
 
     // Link the userspace runner at the fixed VA expected by the kernel bring-up
@@ -45,6 +45,9 @@ fn main() {
                 println!("cargo:rustc-cfg=axle_test_runner_rust_entry=\"{entry}\"");
             }
             "vmo_shared_smoke" => {
+                println!("cargo:rustc-cfg=axle_test_runner_rust_entry=\"{entry}\"");
+            }
+            "vmo_promotion_smoke" => {
                 println!("cargo:rustc-cfg=axle_test_runner_rust_entry=\"{entry}\"");
             }
             _ => panic!("unsupported AXLE_TEST_RUNNER_RUST_ENTRY={entry}"),

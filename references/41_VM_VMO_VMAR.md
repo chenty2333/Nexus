@@ -131,6 +131,12 @@ The metadata layer also validates overlap, mapping range, resize legality, and V
 - It does not immediately register one shared/global anonymous backing source just because it has a kernel-global id.
 - Cross-address-space map or cross-process handle transfer promotes that VMO to `GlobalShared`.
 - Imported anonymous VMOs are treated as shared/global-backed aliases from the start.
+- That promotion rule is now also frozen at the public object-info surface:
+  - one fresh anonymous VMO must report `Anonymous + LocalPrivate`
+  - after one cross-process handle transfer/install, both:
+    - the importer's handle
+    - the exporter's remaining original handle
+    must report `Anonymous + GlobalShared`
 
 ## Identity model
 
@@ -178,6 +184,13 @@ It is not fully implemented yet.
   - `vmo_read()` is allowed on the exported shared handle
   - direct `vmo_write()` is denied
   - direct `vmo_set_size()` is denied
+- The current anonymous-promotion contract is now also explicitly gated at the
+  syscall/object-info surface:
+  - one fresh anonymous VMO reports `LocalPrivate`
+  - one cross-process transfer/install promotes that same backing to
+    `GlobalShared`
+  - the promotion is visible through both the imported handle and the original
+    exporting handle that remains open in the parent
 - Physical / contiguous VMOs are now public as narrow bootstrap primitives, but the broader device
   model is still incomplete:
   - no BTI/pinning object

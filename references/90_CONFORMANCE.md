@@ -206,6 +206,16 @@ That host gate now explicitly covers:
     - `vmo_read()` succeeds and the bytes match the boot asset payload
     - direct `vmo_write()` returns `ZX_ERR_ACCESS_DENIED`
     - direct `vmo_set_size()` returns `ZX_ERR_ACCESS_DENIED`
+- Bootstrap VM coverage now also includes one narrow anonymous-promotion gate:
+  - `kernel.vmo.promotion_bootstrap`
+  - one fresh anonymous VMO must first report the current local-private object
+    contract:
+    - `Anonymous`
+    - `LocalPrivate`
+  - after one explicit cross-process handle transfer/install:
+    - the imported child handle must report `Anonymous + GlobalShared`
+    - the parent's original remaining handle must also report
+      `Anonymous + GlobalShared`
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - two ring3 worker threads act as minimal device-side peers, one queue pair each
   - one bootstrap `PciDevice` handle is now seeded into the runner shared-slot window
