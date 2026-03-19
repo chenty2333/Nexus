@@ -162,14 +162,16 @@ Main just targets include:
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - two ring3 worker threads act as minimal device-side peers, one queue pair each
   - one bootstrap `PciDevice` handle is now seeded into the runner shared-slot window
-  - the runner now queries device info, BAR0, and per-queue interrupts through the public device
-    syscall surface instead of synthesizing a separate userspace config page
+  - the runner now queries device info plus one generic config/BAR/interrupt resource index
+    through the public device syscall surface instead of synthesizing a separate userspace config page
   - one contiguous VMO supplies the shared queue/buffer memory
   - explicit `DmaRegion` objects now pin:
     - the shared queue/buffer memory
     - the exported BAR0 VMO
     - with explicit `DEVICE_READ | DEVICE_WRITE` pin options
   - DMA-region IOVA lookup, not raw VMO lookup, now freezes the DMA-style address handoff shape
+  - DMA-region segment lookup now also freezes the current "one segment per pinned BAR0/queue
+    region" bootstrap assumption
   - driver mapping of the exported BAR0 window now consumes the BAR-exported map options and
     therefore explicitly exercises `ZX_VM_MAP_MMIO`
   - one BAR0 register window now freezes one first narrow virtio-style control-plane shape:
@@ -189,6 +191,11 @@ Main just targets include:
     - supported / active / triggerable flags
     - base vector `0`
     - vector count `queue_pairs * interrupt_groups`
+  - the runner now also probes one synthetic `MSI` round-trip through the same public contract:
+    - `MSI` mode reports `SUPPORTED` but not `ACTIVE`
+    - `ax_pci_device_set_interrupt_mode(..., MSI)` succeeds
+    - one re-fetched interrupt handle reports `ZX_INTERRUPT_MODE_MSI` and is not triggerable
+    - the driver then restores `VIRTUAL` mode before it starts using queue interrupts
   - the runner now also discovers the transport through `ax_pci_device_get_config()` and pins:
     - config export status
     - config export flags (`MMIO | READ_ONLY`)
@@ -200,6 +207,7 @@ Main just targets include:
     pins:
     - identity-IOVA and physically-contiguous flags
     - base device-visible address for BAR0 and queue memory
+    - one coalesced segment count of `1` for the current bootstrap BAR0 and queue regions
   - one reusable split TX/RX virtio-style transport slice now completes one eight-packet batched
     loopback round without channel/socket data-plane help, and the driver now exercises a
     virtio-style feature/status/queue-select bring-up sequence before the first kick

@@ -1,12 +1,18 @@
 use super::*;
+use axle_types::interrupt::{
+    AX_INTERRUPT_MODE_LEGACY, AX_INTERRUPT_MODE_MSI, AX_INTERRUPT_MODE_MSIX,
+    AX_INTERRUPT_MODE_VIRTUAL,
+};
 use axle_types::pci::{
     AX_PCI_BAR_FLAG_MMIO, AX_PCI_CONFIG_FLAG_MMIO, AX_PCI_CONFIG_FLAG_READ_ONLY,
     AX_PCI_INTERRUPT_GROUP_READY, AX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
     AX_PCI_INTERRUPT_GROUP_TX_KICK, AX_PCI_INTERRUPT_MODE_INFO_FLAG_ACTIVE,
     AX_PCI_INTERRUPT_MODE_INFO_FLAG_SUPPORTED, AX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE,
     AX_PCI_INTERRUPT_MODE_LEGACY, AX_PCI_INTERRUPT_MODE_MSI, AX_PCI_INTERRUPT_MODE_MSIX,
-    AX_PCI_INTERRUPT_MODE_VIRTUAL, ax_pci_bar_info_t, ax_pci_config_info_t, ax_pci_device_info_t,
-    ax_pci_interrupt_info_t, ax_pci_interrupt_mode_info_t,
+    AX_PCI_INTERRUPT_MODE_VIRTUAL, AX_PCI_RESOURCE_FLAG_MMIO, AX_PCI_RESOURCE_FLAG_READ_ONLY,
+    AX_PCI_RESOURCE_FLAG_TRIGGERABLE, AX_PCI_RESOURCE_KIND_BAR, AX_PCI_RESOURCE_KIND_CONFIG,
+    AX_PCI_RESOURCE_KIND_INTERRUPT, ax_pci_bar_info_t, ax_pci_config_info_t, ax_pci_device_info_t,
+    ax_pci_interrupt_info_t, ax_pci_interrupt_mode_info_t, ax_pci_resource_info_t,
 };
 use axle_types::status::{
     ZX_ERR_BAD_HANDLE, ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_ERR_WRONG_TYPE,
@@ -205,6 +211,10 @@ pub(crate) struct PciDeviceObject {
 }
 
 impl PciDeviceObject {
+    fn resource_count(&self) -> u32 {
+        1 + BOOTSTRAP_NET_BAR_COUNT + BOOTSTRAP_NET_INTERRUPT_GROUPS * self.queue_pairs
+    }
+
     fn info(&self) -> ax_pci_device_info_t {
         ax_pci_device_info_t {
             vendor_id: self.vendor_id,
@@ -249,6 +259,112 @@ impl PciDeviceObject {
         ))
     }
 
+    fn interrupt_triggerable(mode: u32) -> bool {
+        mode == AX_PCI_INTERRUPT_MODE_VIRTUAL
+    }
+
+    fn interrupt_vector(&self, mode: u32, group: u32, queue_pair: u32) -> u32 {
+        match mode {
+            AX_PCI_INTERRUPT_MODE_LEGACY => 0,
+            AX_PCI_INTERRUPT_MODE_VIRTUAL
+            | AX_PCI_INTERRUPT_MODE_MSI
+            | AX_PCI_INTERRUPT_MODE_MSIX => group
+                .saturating_mul(self.queue_pairs)
+                .saturating_add(queue_pair),
+            _ => 0,
+        }
+    }
+
+    fn interrupt_mode_for_object(mode: u32) -> Result<u32, zx_status_t> {
+        match mode {
+            AX_PCI_INTERRUPT_MODE_VIRTUAL => Ok(AX_INTERRUPT_MODE_VIRTUAL),
+            AX_PCI_INTERRUPT_MODE_LEGACY => Ok(AX_INTERRUPT_MODE_LEGACY),
+            AX_PCI_INTERRUPT_MODE_MSI => Ok(AX_INTERRUPT_MODE_MSI),
+            AX_PCI_INTERRUPT_MODE_MSIX => Ok(AX_INTERRUPT_MODE_MSIX),
+            _ => Err(ZX_ERR_OUT_OF_RANGE),
+        }
+    }
+
+    fn interrupt_resource_count(&self) -> u32 {
+        BOOTSTRAP_NET_INTERRUPT_GROUPS * self.queue_pairs
+    }
+
+    fn interrupt_resource_tuple(&self, ordinal: u32) -> Result<(u32, u32), zx_status_t> {
+        if ordinal >= self.interrupt_resource_count() {
+            return Err(ZX_ERR_OUT_OF_RANGE);
+        }
+        let queue_pair = ordinal % self.queue_pairs;
+        let group = ordinal / self.queue_pairs;
+        Ok((group, queue_pair))
+    }
+
+    fn interrupt_resource(
+        &self,
+        ordinal: u32,
+    ) -> Result<(ObjectKey, ax_pci_resource_info_t), zx_status_t> {
+        let (group, queue_pair) = self.interrupt_resource_tuple(ordinal)?;
+        let object = self.interrupt_key(group, queue_pair)?;
+        let triggerable = Self::interrupt_triggerable(self.active_interrupt_mode);
+        Ok((
+            object,
+            ax_pci_resource_info_t {
+                handle: ZX_HANDLE_INVALID,
+                kind: AX_PCI_RESOURCE_KIND_INTERRUPT,
+                index: group,
+                subindex: queue_pair,
+                flags: if triggerable {
+                    AX_PCI_RESOURCE_FLAG_TRIGGERABLE
+                } else {
+                    0
+                },
+                map_options: 0,
+                size: 0,
+                mode: self.active_interrupt_mode,
+                vector: self.interrupt_vector(self.active_interrupt_mode, group, queue_pair),
+                reserved0: 0,
+            },
+        ))
+    }
+
+    fn resource(&self, ordinal: u32) -> Result<(ObjectKey, ax_pci_resource_info_t), zx_status_t> {
+        if ordinal == 0 {
+            return Ok((
+                self.config_object,
+                ax_pci_resource_info_t {
+                    handle: ZX_HANDLE_INVALID,
+                    kind: AX_PCI_RESOURCE_KIND_CONFIG,
+                    index: 0,
+                    subindex: 0,
+                    flags: AX_PCI_RESOURCE_FLAG_MMIO | AX_PCI_RESOURCE_FLAG_READ_ONLY,
+                    map_options: axle_types::vm::AX_VM_MAP_MMIO,
+                    size: self.config_size,
+                    mode: 0,
+                    vector: 0,
+                    reserved0: 0,
+                },
+            ));
+        }
+        let ordinal = ordinal - 1;
+        if ordinal < BOOTSTRAP_NET_BAR_COUNT {
+            return Ok((
+                self.bar0_object,
+                ax_pci_resource_info_t {
+                    handle: ZX_HANDLE_INVALID,
+                    kind: AX_PCI_RESOURCE_KIND_BAR,
+                    index: ordinal,
+                    subindex: 0,
+                    flags: AX_PCI_RESOURCE_FLAG_MMIO,
+                    map_options: axle_types::vm::AX_VM_MAP_MMIO,
+                    size: self.bar0_size,
+                    mode: 0,
+                    vector: 0,
+                    reserved0: 0,
+                },
+            ));
+        }
+        self.interrupt_resource(ordinal - BOOTSTRAP_NET_BAR_COUNT)
+    }
+
     fn interrupt_key(&self, group: u32, queue_pair: u32) -> Result<ObjectKey, zx_status_t> {
         let pair = usize::try_from(queue_pair).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
         if pair >= BOOTSTRAP_NET_QUEUE_PAIR_COUNT {
@@ -263,7 +379,13 @@ impl PciDeviceObject {
     }
 
     fn interrupt_mode_info(&self, mode: u32) -> Result<ax_pci_interrupt_mode_info_t, zx_status_t> {
-        let vector_count = BOOTSTRAP_NET_INTERRUPT_GROUPS * self.queue_pairs;
+        let vector_count = match mode {
+            AX_PCI_INTERRUPT_MODE_LEGACY => 1,
+            AX_PCI_INTERRUPT_MODE_VIRTUAL
+            | AX_PCI_INTERRUPT_MODE_MSI
+            | AX_PCI_INTERRUPT_MODE_MSIX => BOOTSTRAP_NET_INTERRUPT_GROUPS * self.queue_pairs,
+            _ => return Err(ZX_ERR_OUT_OF_RANGE),
+        };
         let info = match mode {
             AX_PCI_INTERRUPT_MODE_VIRTUAL => ax_pci_interrupt_mode_info_t {
                 mode,
@@ -281,26 +403,18 @@ impl PciDeviceObject {
             | AX_PCI_INTERRUPT_MODE_MSI
             | AX_PCI_INTERRUPT_MODE_MSIX => ax_pci_interrupt_mode_info_t {
                 mode,
-                flags: 0,
+                flags: AX_PCI_INTERRUPT_MODE_INFO_FLAG_SUPPORTED
+                    | if self.active_interrupt_mode == mode {
+                        AX_PCI_INTERRUPT_MODE_INFO_FLAG_ACTIVE
+                    } else {
+                        0
+                    },
                 base_vector: 0,
-                vector_count: 0,
+                vector_count,
             },
             _ => return Err(ZX_ERR_OUT_OF_RANGE),
         };
         Ok(info)
-    }
-
-    fn set_interrupt_mode(&mut self, mode: u32) -> Result<(), zx_status_t> {
-        match mode {
-            AX_PCI_INTERRUPT_MODE_VIRTUAL => {
-                self.active_interrupt_mode = mode;
-                Ok(())
-            }
-            AX_PCI_INTERRUPT_MODE_LEGACY
-            | AX_PCI_INTERRUPT_MODE_MSI
-            | AX_PCI_INTERRUPT_MODE_MSIX => Err(ZX_ERR_NOT_SUPPORTED),
-            _ => Err(ZX_ERR_OUT_OF_RANGE),
-        }
     }
 }
 
@@ -465,14 +579,51 @@ pub fn pci_device_get_interrupt(
             })?;
         let irq_handle =
             state.alloc_handle_for_object(irq_object, handle::interrupt_default_rights())?;
-        let vector = group
-            .saturating_mul(BOOTSTRAP_NET_QUEUE_PAIR_COUNT as u32)
-            .saturating_add(queue_pair);
         Ok(ax_pci_interrupt_info_t {
             handle: irq_handle,
             mode,
-            vector,
+            vector: state.with_objects(|objects| match objects.get(resolved.object_key()) {
+                Some(KernelObject::PciDevice(device)) => {
+                    Ok(device.interrupt_vector(mode, group, queue_pair))
+                }
+                Some(_) => Err(ZX_ERR_WRONG_TYPE),
+                None => Err(ZX_ERR_BAD_HANDLE),
+            })?,
         })
+    })
+}
+
+pub fn pci_device_get_resource_count(handle: zx_handle_t) -> Result<u32, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        state.with_objects(|objects| match objects.get(resolved.object_key()) {
+            Some(KernelObject::PciDevice(device)) => Ok(device.resource_count()),
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        })
+    })
+}
+
+pub fn pci_device_get_resource(
+    handle: zx_handle_t,
+    resource_index: u32,
+) -> Result<ax_pci_resource_info_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        let (resource_object, mut info) =
+            state.with_objects(|objects| match objects.get(resolved.object_key()) {
+                Some(KernelObject::PciDevice(device)) => device.resource(resource_index),
+                Some(_) => Err(ZX_ERR_WRONG_TYPE),
+                None => Err(ZX_ERR_BAD_HANDLE),
+            })?;
+        let rights = match info.kind {
+            AX_PCI_RESOURCE_KIND_CONFIG => handle::pci_config_vmo_rights(),
+            AX_PCI_RESOURCE_KIND_BAR => handle::vmo_default_rights(),
+            AX_PCI_RESOURCE_KIND_INTERRUPT => handle::interrupt_default_rights(),
+            _ => return Err(ZX_ERR_BAD_STATE),
+        };
+        info.handle = state.alloc_handle_for_object(resource_object, rights)?;
+        Ok(info)
     })
 }
 
@@ -493,10 +644,47 @@ pub fn pci_device_get_interrupt_mode(
 pub fn pci_device_set_interrupt_mode(handle: zx_handle_t, mode: u32) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::WRITE)?;
-        state.with_objects_mut(|objects| match objects.get_mut(resolved.object_key()) {
-            Some(KernelObject::PciDevice(device)) => device.set_interrupt_mode(mode),
-            Some(_) => Err(ZX_ERR_WRONG_TYPE),
-            None => Err(ZX_ERR_BAD_HANDLE),
+        state.with_objects_mut(|objects| {
+            let (ready_irqs, tx_irqs, rx_irqs, queue_pairs) =
+                match objects.get_mut(resolved.object_key()) {
+                    Some(KernelObject::PciDevice(device)) => {
+                        let _ = PciDeviceObject::interrupt_mode_info(device, mode)?;
+                        device.active_interrupt_mode = mode;
+                        (
+                            device.ready_irqs,
+                            device.tx_irqs,
+                            device.rx_irqs,
+                            device.queue_pairs,
+                        )
+                    }
+                    Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                    None => return Err(ZX_ERR_BAD_HANDLE),
+                };
+
+            let interrupt_mode = PciDeviceObject::interrupt_mode_for_object(mode)?;
+            let triggerable = PciDeviceObject::interrupt_triggerable(mode);
+            for pair in 0..usize::try_from(queue_pairs).map_err(|_| ZX_ERR_OUT_OF_RANGE)? {
+                for (group, key) in [
+                    (AX_PCI_INTERRUPT_GROUP_READY, ready_irqs[pair]),
+                    (AX_PCI_INTERRUPT_GROUP_TX_KICK, tx_irqs[pair]),
+                    (AX_PCI_INTERRUPT_GROUP_RX_COMPLETE, rx_irqs[pair]),
+                ] {
+                    let vector = match mode {
+                        AX_PCI_INTERRUPT_MODE_LEGACY => 0,
+                        _ => group
+                            .saturating_mul(queue_pairs)
+                            .saturating_add(pair as u32),
+                    };
+                    match objects.get_mut(key) {
+                        Some(KernelObject::Interrupt(interrupt)) => {
+                            interrupt.set_metadata(interrupt_mode, vector, triggerable);
+                        }
+                        Some(_) => return Err(ZX_ERR_BAD_STATE),
+                        None => return Err(ZX_ERR_BAD_STATE),
+                    }
+                }
+            }
+            Ok(())
         })
     })
 }

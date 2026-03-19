@@ -23,27 +23,33 @@ use axle_virtio_transport::{
 };
 use libzircon::dma::{
     ZX_DMA_PERM_DEVICE_READ, ZX_DMA_PERM_DEVICE_WRITE, ZX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA,
-    ZX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS,
+    ZX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS, ZX_DMA_SEGMENT_INFO_FLAG_IDENTITY_IOVA,
+    ZX_DMA_SEGMENT_INFO_FLAG_PHYSICALLY_CONTIGUOUS, zx_dma_segment_info_t,
 };
 use libzircon::interrupt::{
-    ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE, ZX_INTERRUPT_MODE_VIRTUAL, zx_interrupt_info_t,
+    ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE, ZX_INTERRUPT_MODE_MSI, ZX_INTERRUPT_MODE_VIRTUAL,
+    zx_interrupt_info_t,
 };
 use libzircon::pci::{
     ZX_PCI_BAR_FLAG_MMIO, ZX_PCI_CONFIG_FLAG_MMIO, ZX_PCI_CONFIG_FLAG_READ_ONLY,
     ZX_PCI_INTERRUPT_GROUP_READY, ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
     ZX_PCI_INTERRUPT_GROUP_TX_KICK, ZX_PCI_INTERRUPT_MODE_INFO_FLAG_ACTIVE,
     ZX_PCI_INTERRUPT_MODE_INFO_FLAG_SUPPORTED, ZX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE,
-    ZX_PCI_INTERRUPT_MODE_VIRTUAL, zx_pci_bar_info_t, zx_pci_config_info_t, zx_pci_device_info_t,
-    zx_pci_interrupt_info_t, zx_pci_interrupt_mode_info_t,
+    ZX_PCI_INTERRUPT_MODE_MSI, ZX_PCI_INTERRUPT_MODE_VIRTUAL, ZX_PCI_RESOURCE_FLAG_MMIO,
+    ZX_PCI_RESOURCE_FLAG_READ_ONLY, ZX_PCI_RESOURCE_FLAG_TRIGGERABLE, ZX_PCI_RESOURCE_KIND_BAR,
+    ZX_PCI_RESOURCE_KIND_CONFIG, ZX_PCI_RESOURCE_KIND_INTERRUPT, zx_pci_bar_info_t,
+    zx_pci_config_info_t, zx_pci_device_info_t, zx_pci_interrupt_info_t,
+    zx_pci_interrupt_mode_info_t, zx_pci_resource_info_t,
 };
 use libzircon::signals::{ZX_INTERRUPT_SIGNALED, ZX_TASK_TERMINATED};
+use libzircon::status::ZX_ERR_NOT_FOUND;
 use libzircon::vm::{ZX_VM_MAP_MMIO, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
-    ax_dma_region_get_info, ax_interrupt_trigger, ax_pci_device_get_bar, ax_pci_device_get_config,
+    ax_dma_region_get_info, ax_dma_region_get_segment, ax_interrupt_trigger,
     ax_pci_device_get_info, ax_pci_device_get_interrupt, ax_pci_device_get_interrupt_mode,
-    ax_pci_device_set_interrupt_mode, ax_vmo_pin, zx_dma_region_info_t, zx_handle_close,
-    zx_interrupt_ack, zx_interrupt_get_info, zx_object_wait_one, zx_task_kill, zx_thread_create,
-    zx_thread_start, zx_vmo_create_contiguous,
+    ax_pci_device_get_resource, ax_pci_device_get_resource_count, ax_pci_device_set_interrupt_mode,
+    ax_vmo_pin, zx_dma_region_info_t, zx_handle_close, zx_interrupt_ack, zx_interrupt_get_info,
+    zx_object_wait_one, zx_task_kill, zx_thread_create, zx_thread_start, zx_vmo_create_contiguous,
 };
 
 use crate::{SLOT_ROOT_VMAR_H, SLOT_SELF_PROCESS_H, SLOT_T0_NS, read_slot, write_slot};
@@ -264,6 +270,15 @@ struct NetSummary {
     rx_ready_mask: u64,
 }
 
+#[derive(Clone, Copy, Default)]
+struct BootstrapPciResources {
+    config: zx_pci_config_info_t,
+    bar0: zx_pci_bar_info_t,
+    ready_irqs: [zx_pci_interrupt_info_t; QUEUE_PAIR_COUNT],
+    tx_irqs: [zx_pci_interrupt_info_t; QUEUE_PAIR_COUNT],
+    rx_irqs: [zx_pci_interrupt_info_t; QUEUE_PAIR_COUNT],
+}
+
 static NET_READY_IRQS: [AtomicU64; QUEUE_PAIR_COUNT] =
     [const { AtomicU64::new(ZX_HANDLE_INVALID) }; QUEUE_PAIR_COUNT];
 static NET_TX_IRQS: [AtomicU64; QUEUE_PAIR_COUNT] =
@@ -325,9 +340,18 @@ fn run_net_bringup() -> NetSummary {
         return summary;
     }
 
-    let mut pci_config = zx_pci_config_info_t::default();
-    summary.pci_config_info =
-        ax_pci_device_get_config(owned_handles[OWNED_PCI_DEVICE], &mut pci_config) as i64;
+    let mut bootstrap_resources =
+        match collect_bootstrap_pci_resources(owned_handles[OWNED_PCI_DEVICE]) {
+            Ok(resources) => resources,
+            Err(status) => {
+                summary.pci_config_info = status as i64;
+                summary.failure_step = STEP_PCI_CONFIG_INFO;
+                close_handle_sets(&[], &owned_handles);
+                return summary;
+            }
+        };
+    let pci_config = bootstrap_resources.config;
+    summary.pci_config_info = ZX_OK as i64;
     summary.pci_config_flags = u64::from(pci_config.flags);
     summary.pci_config_map_options = u64::from(pci_config.map_options);
     if summary.pci_config_info != ZX_OK as i64 {
@@ -336,6 +360,7 @@ fn run_net_bringup() -> NetSummary {
         return summary;
     }
     owned_handles[OWNED_CONFIG_VMO] = pci_config.handle;
+    bootstrap_resources.config.handle = ZX_HANDLE_INVALID;
 
     let mut pci_info = zx_pci_device_info_t::default();
     summary.config_pin_create =
@@ -370,12 +395,76 @@ fn run_net_bringup() -> NetSummary {
         return summary;
     }
 
-    summary.pci_irq_mode_set = ax_pci_device_set_interrupt_mode(
+    let mut msi_irq_mode = zx_pci_interrupt_mode_info_t::default();
+    let msi_mode_status = ax_pci_device_get_interrupt_mode(
         owned_handles[OWNED_PCI_DEVICE],
-        ZX_PCI_INTERRUPT_MODE_VIRTUAL,
+        ZX_PCI_INTERRUPT_MODE_MSI,
+        &mut msi_irq_mode,
     ) as i64;
+    if msi_mode_status != ZX_OK as i64
+        || msi_irq_mode.mode != ZX_PCI_INTERRUPT_MODE_MSI
+        || (msi_irq_mode.flags & ZX_PCI_INTERRUPT_MODE_INFO_FLAG_SUPPORTED) == 0
+        || (msi_irq_mode.flags
+            & (ZX_PCI_INTERRUPT_MODE_INFO_FLAG_ACTIVE
+                | ZX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE))
+            != 0
+        || msi_irq_mode.base_vector != 0
+        || msi_irq_mode.vector_count != pci_info.queue_pairs * pci_info.interrupt_groups
+    {
+        summary.failure_step = STEP_PCI_IRQ_MODE_INFO;
+        close_bootstrap_pci_resources(&bootstrap_resources);
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    }
+
+    aggregate_status(
+        &mut summary.pci_irq_mode_set,
+        ax_pci_device_set_interrupt_mode(owned_handles[OWNED_PCI_DEVICE], ZX_PCI_INTERRUPT_MODE_MSI)
+            as i64,
+    );
     if summary.pci_irq_mode_set != ZX_OK as i64 {
         summary.failure_step = STEP_PCI_IRQ_MODE_SET;
+        close_bootstrap_pci_resources(&bootstrap_resources);
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    }
+    let mut msi_probe = zx_pci_interrupt_info_t::default();
+    let msi_probe_status = ax_pci_device_get_interrupt(
+        owned_handles[OWNED_PCI_DEVICE],
+        ZX_PCI_INTERRUPT_GROUP_TX_KICK,
+        1,
+        &mut msi_probe,
+    ) as i64;
+    if msi_probe_status != ZX_OK as i64 {
+        summary.failure_step = STEP_PCI_IRQ_MODE_SET;
+        close_bootstrap_pci_resources(&bootstrap_resources);
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    }
+    let mut msi_probe_info = zx_interrupt_info_t::default();
+    let msi_probe_info_status = zx_interrupt_get_info(msi_probe.handle, &mut msi_probe_info) as i64;
+    let _ = zx_handle_close(msi_probe.handle);
+    if msi_probe_info_status != ZX_OK as i64
+        || msi_probe.mode != ZX_INTERRUPT_MODE_MSI
+        || msi_probe_info.mode != ZX_INTERRUPT_MODE_MSI
+        || (msi_probe_info.flags & ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE) != 0
+    {
+        summary.failure_step = STEP_PCI_IRQ_MODE_SET;
+        close_bootstrap_pci_resources(&bootstrap_resources);
+        close_handle_sets(&[], &owned_handles);
+        return summary;
+    }
+
+    aggregate_status(
+        &mut summary.pci_irq_mode_set,
+        ax_pci_device_set_interrupt_mode(
+            owned_handles[OWNED_PCI_DEVICE],
+            ZX_PCI_INTERRUPT_MODE_VIRTUAL,
+        ) as i64,
+    );
+    if summary.pci_irq_mode_set != ZX_OK as i64 {
+        summary.failure_step = STEP_PCI_IRQ_MODE_SET;
+        close_bootstrap_pci_resources(&bootstrap_resources);
         close_handle_sets(&[], &owned_handles);
         return summary;
     }
@@ -402,23 +491,20 @@ fn run_net_bringup() -> NetSummary {
         || irq_mode.vector_count != pci_info.queue_pairs * pci_info.interrupt_groups
     {
         summary.failure_step = STEP_PCI_IRQ_MODE_INFO;
+        close_bootstrap_pci_resources(&bootstrap_resources);
         close_handle_sets(&[], &owned_handles);
         return summary;
     }
 
     let mut ready_irqs = [ZX_HANDLE_INVALID; QUEUE_PAIR_COUNT];
     for (pair, ready_irq) in ready_irqs.iter_mut().enumerate() {
-        let mut info = zx_pci_interrupt_info_t::default();
-        let status = ax_pci_device_get_interrupt(
-            owned_handles[OWNED_PCI_DEVICE],
-            ZX_PCI_INTERRUPT_GROUP_READY,
-            pair as u32,
-            &mut info,
-        ) as i64;
+        let info = bootstrap_resources.ready_irqs[pair];
+        let status = ZX_OK as i64;
         aggregate_status(&mut summary.ready_irq_create, status);
-        if status != ZX_OK as i64 {
+        if info.handle == ZX_HANDLE_INVALID {
             summary.failure_step = STEP_READY_IRQ_CREATE;
             close_handles(&ready_irqs);
+            close_bootstrap_pci_resources(&bootstrap_resources);
             close_handle_sets(&[], &owned_handles);
             return summary;
         }
@@ -433,26 +519,24 @@ fn run_net_bringup() -> NetSummary {
         {
             summary.failure_step = STEP_READY_IRQ_CREATE;
             close_handles(&ready_irqs);
+            close_bootstrap_pci_resources(&bootstrap_resources);
             close_handle_sets(&[], &owned_handles);
             return summary;
         }
         *ready_irq = info.handle;
+        bootstrap_resources.ready_irqs[pair].handle = ZX_HANDLE_INVALID;
     }
 
     let mut tx_irqs = [ZX_HANDLE_INVALID; QUEUE_PAIR_COUNT];
     for (pair, tx_irq) in tx_irqs.iter_mut().enumerate() {
-        let mut info = zx_pci_interrupt_info_t::default();
-        let status = ax_pci_device_get_interrupt(
-            owned_handles[OWNED_PCI_DEVICE],
-            ZX_PCI_INTERRUPT_GROUP_TX_KICK,
-            pair as u32,
-            &mut info,
-        ) as i64;
+        let info = bootstrap_resources.tx_irqs[pair];
+        let status = ZX_OK as i64;
         aggregate_status(&mut summary.tx_irq_create, status);
-        if status != ZX_OK as i64 {
+        if info.handle == ZX_HANDLE_INVALID {
             summary.failure_step = STEP_TX_IRQ_CREATE;
             close_handles(&tx_irqs);
             close_handles(&ready_irqs);
+            close_bootstrap_pci_resources(&bootstrap_resources);
             close_handle_sets(&[], &owned_handles);
             return summary;
         }
@@ -468,27 +552,25 @@ fn run_net_bringup() -> NetSummary {
             summary.failure_step = STEP_TX_IRQ_CREATE;
             close_handles(&tx_irqs);
             close_handles(&ready_irqs);
+            close_bootstrap_pci_resources(&bootstrap_resources);
             close_handle_sets(&[], &owned_handles);
             return summary;
         }
         *tx_irq = info.handle;
+        bootstrap_resources.tx_irqs[pair].handle = ZX_HANDLE_INVALID;
     }
 
     let mut rx_irqs = [ZX_HANDLE_INVALID; QUEUE_PAIR_COUNT];
     for (pair, rx_irq) in rx_irqs.iter_mut().enumerate() {
-        let mut info = zx_pci_interrupt_info_t::default();
-        let status = ax_pci_device_get_interrupt(
-            owned_handles[OWNED_PCI_DEVICE],
-            ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE,
-            pair as u32,
-            &mut info,
-        ) as i64;
+        let info = bootstrap_resources.rx_irqs[pair];
+        let status = ZX_OK as i64;
         aggregate_status(&mut summary.rx_irq_create, status);
-        if status != ZX_OK as i64 {
+        if info.handle == ZX_HANDLE_INVALID {
             summary.failure_step = STEP_RX_IRQ_CREATE;
             close_handles(&rx_irqs);
             close_handles(&tx_irqs);
             close_handles(&ready_irqs);
+            close_bootstrap_pci_resources(&bootstrap_resources);
             close_handle_sets(&[], &owned_handles);
             return summary;
         }
@@ -505,24 +587,24 @@ fn run_net_bringup() -> NetSummary {
             close_handles(&rx_irqs);
             close_handles(&tx_irqs);
             close_handles(&ready_irqs);
+            close_bootstrap_pci_resources(&bootstrap_resources);
             close_handle_sets(&[], &owned_handles);
             return summary;
         }
         *rx_irq = info.handle;
+        bootstrap_resources.rx_irqs[pair].handle = ZX_HANDLE_INVALID;
     }
 
-    let mut pci_bar = zx_pci_bar_info_t::default();
-    summary.bar0_create = ax_pci_device_get_bar(
-        owned_handles[OWNED_PCI_DEVICE],
-        u32::from(discovery.common.bar),
-        &mut pci_bar,
-    ) as i64;
+    let pci_bar = bootstrap_resources.bar0;
+    summary.bar0_create = ZX_OK as i64;
     if summary.bar0_create != ZX_OK as i64 {
         summary.failure_step = STEP_BAR0_CREATE;
+        close_bootstrap_pci_resources(&bootstrap_resources);
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
     owned_handles[OWNED_BAR0_VMO] = pci_bar.handle;
+    bootstrap_resources.bar0.handle = ZX_HANDLE_INVALID;
 
     summary.bar0_pin_create = ax_vmo_pin(
         owned_handles[OWNED_BAR0_VMO],
@@ -540,21 +622,27 @@ fn run_net_bringup() -> NetSummary {
     let mut bar0_dma = zx_dma_region_info_t::default();
     summary.bar0_dma_info =
         ax_dma_region_get_info(owned_handles[OWNED_BAR0_DMA], &mut bar0_dma) as i64;
-    summary.bar0_dma_iova = bar0_dma.iova_base;
     summary.bar0_dma_flags = u64::from(bar0_dma.flags);
-    summary.bar0_dma_lookup = ZX_OK as i64;
+    let mut bar0_dma_segment = zx_dma_segment_info_t::default();
+    summary.bar0_dma_lookup =
+        ax_dma_region_get_segment(owned_handles[OWNED_BAR0_DMA], 0, &mut bar0_dma_segment) as i64;
+    summary.bar0_dma_iova = bar0_dma_segment.iova_base;
     if summary.bar0_dma_info != ZX_OK as i64 {
         summary.failure_step = STEP_BAR0_DMA_INFO;
+        close_bootstrap_pci_resources(&bootstrap_resources);
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
     summary.bar0_match = u64::from(
         pci_bar.size == REGISTER_VMO_BYTES
-            && bar0_dma.iova_base != 0
+            && bar0_dma.segment_count == 1
+            && bar0_dma_segment.iova_base != 0
             && bar0_dma.size_bytes == pci_bar.size
             && bar0_dma.options == (ZX_DMA_PERM_DEVICE_READ | ZX_DMA_PERM_DEVICE_WRITE)
             && (bar0_dma.flags & ZX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA) != 0
             && (bar0_dma.flags & ZX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS) != 0
+            && (bar0_dma_segment.flags & ZX_DMA_SEGMENT_INFO_FLAG_IDENTITY_IOVA) != 0
+            && (bar0_dma_segment.flags & ZX_DMA_SEGMENT_INFO_FLAG_PHYSICALLY_CONTIGUOUS) != 0
             && (pci_bar.flags & ZX_PCI_BAR_FLAG_MMIO) != 0
             && (pci_bar.map_options & ZX_VM_MAP_MMIO) != 0
             && discovery.common.bar == 0,
@@ -601,20 +689,27 @@ fn run_net_bringup() -> NetSummary {
     let mut queue_dma = zx_dma_region_info_t::default();
     summary.queue_dma_info =
         ax_dma_region_get_info(owned_handles[OWNED_QUEUE_DMA], &mut queue_dma) as i64;
-    summary.queue_dma_iova = queue_dma.iova_base;
     summary.queue_dma_flags = u64::from(queue_dma.flags);
-    summary.queue_dma_lookup = ZX_OK as i64;
+    let mut queue_dma_segment = zx_dma_segment_info_t::default();
+    summary.queue_dma_lookup =
+        ax_dma_region_get_segment(owned_handles[OWNED_QUEUE_DMA], 0, &mut queue_dma_segment) as i64;
+    summary.queue_dma_iova = queue_dma_segment.iova_base;
     if summary.queue_dma_info != ZX_OK as i64 {
         summary.failure_step = STEP_QUEUE_DMA_INFO;
+        close_bootstrap_pci_resources(&bootstrap_resources);
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
     if queue_dma.size_bytes != QUEUE_VMO_BYTES
         || queue_dma.options != (ZX_DMA_PERM_DEVICE_READ | ZX_DMA_PERM_DEVICE_WRITE)
+        || queue_dma.segment_count != 1
         || (queue_dma.flags & ZX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA) == 0
         || (queue_dma.flags & ZX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS) == 0
+        || (queue_dma_segment.flags & ZX_DMA_SEGMENT_INFO_FLAG_IDENTITY_IOVA) == 0
+        || (queue_dma_segment.flags & ZX_DMA_SEGMENT_INFO_FLAG_PHYSICALLY_CONTIGUOUS) == 0
     {
         summary.failure_step = STEP_QUEUE_DMA_INFO;
+        close_bootstrap_pci_resources(&bootstrap_resources);
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
@@ -652,7 +747,7 @@ fn run_net_bringup() -> NetSummary {
 
     NET_REG_DEVICE_BASE.store(reg_device_base, Ordering::Release);
     NET_QUEUE_BASE.store(mapped_queue_base, Ordering::Release);
-    NET_QUEUE_IOVA.store(queue_dma.iova_base, Ordering::Release);
+    NET_QUEUE_IOVA.store(queue_dma_segment.iova_base, Ordering::Release);
     for pair in 0..QUEUE_PAIR_COUNT {
         NET_READY_IRQS[pair].store(ready_irqs[pair], Ordering::Release);
         NET_TX_IRQS[pair].store(tx_irqs[pair], Ordering::Release);
@@ -730,7 +825,12 @@ fn run_net_bringup() -> NetSummary {
         }
     }
 
-    if !configure_driver_transport(reg_driver_base, &mut summary, pci_info, queue_dma.iova_base) {
+    if !configure_driver_transport(
+        reg_driver_base,
+        &mut summary,
+        pci_info,
+        queue_dma_segment.iova_base,
+    ) {
         summary.failure_step = STEP_MMIO_READY;
         close_workers_and_handles(
             &worker_threads,
@@ -739,8 +839,8 @@ fn run_net_bringup() -> NetSummary {
         );
         return summary;
     }
-    prepare_tx_packets(mapped_queue_base, queue_dma.iova_base);
-    prepare_rx_buffers(mapped_queue_base, queue_dma.iova_base);
+    prepare_tx_packets(mapped_queue_base, queue_dma_segment.iova_base);
+    prepare_rx_buffers(mapped_queue_base, queue_dma_segment.iova_base);
 
     let batch_start = axle_arch_x86_64::rdtsc();
     for &tx_irq in &tx_irqs {
@@ -1488,6 +1588,145 @@ fn close_workers_and_handles(
         }
     }
     close_handle_sets(handle_sets, singles);
+}
+
+fn close_bootstrap_pci_resources(resources: &BootstrapPciResources) {
+    if resources.config.handle != ZX_HANDLE_INVALID {
+        let _ = zx_handle_close(resources.config.handle);
+    }
+    if resources.bar0.handle != ZX_HANDLE_INVALID {
+        let _ = zx_handle_close(resources.bar0.handle);
+    }
+    for info in resources.ready_irqs {
+        if info.handle != ZX_HANDLE_INVALID {
+            let _ = zx_handle_close(info.handle);
+        }
+    }
+    for info in resources.tx_irqs {
+        if info.handle != ZX_HANDLE_INVALID {
+            let _ = zx_handle_close(info.handle);
+        }
+    }
+    for info in resources.rx_irqs {
+        if info.handle != ZX_HANDLE_INVALID {
+            let _ = zx_handle_close(info.handle);
+        }
+    }
+}
+
+fn collect_bootstrap_pci_resources(
+    pci_device: zx_handle_t,
+) -> Result<BootstrapPciResources, zx_status_t> {
+    let mut count = 0u64;
+    let status = ax_pci_device_get_resource_count(pci_device, &mut count);
+    if status != ZX_OK {
+        return Err(status);
+    }
+
+    let mut resources = BootstrapPciResources::default();
+    for ordinal in 0..count {
+        let mut info = zx_pci_resource_info_t::default();
+        let status = ax_pci_device_get_resource(pci_device, ordinal as u32, &mut info);
+        if status != ZX_OK {
+            close_bootstrap_pci_resources(&resources);
+            return Err(status);
+        }
+        match info.kind {
+            ZX_PCI_RESOURCE_KIND_CONFIG => {
+                if (info.flags & (ZX_PCI_RESOURCE_FLAG_MMIO | ZX_PCI_RESOURCE_FLAG_READ_ONLY))
+                    != (ZX_PCI_RESOURCE_FLAG_MMIO | ZX_PCI_RESOURCE_FLAG_READ_ONLY)
+                    || (info.map_options & ZX_VM_MAP_MMIO) == 0
+                {
+                    let _ = zx_handle_close(info.handle);
+                    close_bootstrap_pci_resources(&resources);
+                    return Err(ZX_ERR_NOT_FOUND);
+                }
+                if resources.config.handle != ZX_HANDLE_INVALID {
+                    let _ = zx_handle_close(info.handle);
+                    close_bootstrap_pci_resources(&resources);
+                    return Err(ZX_ERR_NOT_FOUND);
+                }
+                resources.config = zx_pci_config_info_t {
+                    handle: info.handle,
+                    size: info.size,
+                    flags: info.flags,
+                    map_options: info.map_options,
+                };
+            }
+            ZX_PCI_RESOURCE_KIND_BAR if info.index == 0 => {
+                if (info.flags & ZX_PCI_RESOURCE_FLAG_MMIO) == 0
+                    || (info.map_options & ZX_VM_MAP_MMIO) == 0
+                {
+                    let _ = zx_handle_close(info.handle);
+                    close_bootstrap_pci_resources(&resources);
+                    return Err(ZX_ERR_NOT_FOUND);
+                }
+                if resources.bar0.handle != ZX_HANDLE_INVALID {
+                    let _ = zx_handle_close(info.handle);
+                    close_bootstrap_pci_resources(&resources);
+                    return Err(ZX_ERR_NOT_FOUND);
+                }
+                resources.bar0 = zx_pci_bar_info_t {
+                    handle: info.handle,
+                    size: info.size,
+                    flags: info.flags,
+                    map_options: info.map_options,
+                };
+            }
+            ZX_PCI_RESOURCE_KIND_INTERRUPT => {
+                if info.mode != ZX_INTERRUPT_MODE_VIRTUAL
+                    || (info.flags & ZX_PCI_RESOURCE_FLAG_TRIGGERABLE) == 0
+                {
+                    let _ = zx_handle_close(info.handle);
+                    close_bootstrap_pci_resources(&resources);
+                    return Err(ZX_ERR_NOT_FOUND);
+                }
+                let pair = usize::try_from(info.subindex).map_err(|_| ZX_ERR_NOT_FOUND)?;
+                let slot = match info.index {
+                    ZX_PCI_INTERRUPT_GROUP_READY => resources.ready_irqs.get_mut(pair),
+                    ZX_PCI_INTERRUPT_GROUP_TX_KICK => resources.tx_irqs.get_mut(pair),
+                    ZX_PCI_INTERRUPT_GROUP_RX_COMPLETE => resources.rx_irqs.get_mut(pair),
+                    _ => None,
+                };
+                let Some(slot) = slot else {
+                    let _ = zx_handle_close(info.handle);
+                    close_bootstrap_pci_resources(&resources);
+                    return Err(ZX_ERR_NOT_FOUND);
+                };
+                if slot.handle != ZX_HANDLE_INVALID {
+                    let _ = zx_handle_close(info.handle);
+                    close_bootstrap_pci_resources(&resources);
+                    return Err(ZX_ERR_NOT_FOUND);
+                }
+                *slot = zx_pci_interrupt_info_t {
+                    handle: info.handle,
+                    mode: info.mode,
+                    vector: info.vector,
+                };
+            }
+            _ => {
+                if info.handle != ZX_HANDLE_INVALID {
+                    let _ = zx_handle_close(info.handle);
+                }
+            }
+        }
+    }
+
+    let have_all_interrupts = resources
+        .ready_irqs
+        .iter()
+        .chain(resources.tx_irqs.iter())
+        .chain(resources.rx_irqs.iter())
+        .all(|info| info.handle != ZX_HANDLE_INVALID);
+    if resources.config.handle == ZX_HANDLE_INVALID
+        || resources.bar0.handle == ZX_HANDLE_INVALID
+        || !have_all_interrupts
+    {
+        close_bootstrap_pci_resources(&resources);
+        return Err(ZX_ERR_NOT_FOUND);
+    }
+
+    Ok(resources)
 }
 
 fn close_handle_sets(handle_sets: &[&[zx_handle_t]], singles: &[zx_handle_t]) {

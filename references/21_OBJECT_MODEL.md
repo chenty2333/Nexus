@@ -83,14 +83,27 @@ Current PCI-device shape:
   - one interrupt-object handle per `(group, queue_pair)` tuple plus:
     - delivery mode
     - opaque vector / line index metadata
+  - one generic resource index through `ax_pci_device_get_resource_count()` /
+    `ax_pci_device_get_resource()`:
+    - one config resource
+    - one BAR resource per supported BAR
+    - one interrupt resource per `(group, queue_pair)` tuple
+    - each resource carries:
+      - kind / index / subindex
+      - flags
+      - suggested VM map options
+      - size
+      - interrupt mode/vector metadata where relevant
   - one interrupt-mode capability snapshot per delivery mode through
     `ax_pci_device_get_interrupt_mode()`:
     - supported / active / triggerable flags
     - base vector
     - vector count
   - one interrupt-mode activation path through `ax_pci_device_set_interrupt_mode()`:
-    - `VIRTUAL` may be selected today
-    - hardware-backed modes remain intentionally unimplemented
+    - `VIRTUAL` remains the current bootstrap delivery mode
+    - `LEGACY` / `MSI` / `MSI-X` may now also be selected so ring3 can validate that exported
+      interrupt objects track the selected mode/vector metadata
+    - real hardware-backed routing/programming still remains intentionally unimplemented
 - the first concrete user is the queue-owned bootstrap net dataplane slice
 - it is not yet a full PCI bus/discovery object:
   - no enumeration
@@ -108,11 +121,17 @@ Current DMA-region shape:
   - `DEVICE_READ`
   - `DEVICE_WRITE`
 - it currently exposes two narrow metadata queries:
+- it currently exposes three narrow metadata queries:
   - `ax_dma_region_get_info()`:
     - size in bytes
     - creation-time DMA permission bits
     - region flags (`IDENTITY_IOVA`, `PHYSICALLY_CONTIGUOUS`)
+    - coalesced segment count
     - base physical / device-visible addresses
+  - `ax_dma_region_get_segment()`:
+    - segment offset / size in bytes
+    - identity-IOVA / physically-contiguous flags
+    - segment base physical / device-visible addresses
   - `ax_dma_region_lookup_paddr()` for one offset inside the pinned range
   - `ax_dma_region_lookup_iova()` for one first device-visible address view of that same range
 - it is not waitable and it does not yet imply any BTI/IOMMU grant or cache-policy contract

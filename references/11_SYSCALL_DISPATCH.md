@@ -35,7 +35,7 @@ This file describes the current syscall-number source, trap entry, argument copy
   - it first gives guest-started carrier threads one chance to divert into the generic
     guest-session stop boundary
   - ordinary native userspace then falls through to the same shared syscall shell
-- The current bootstrap syscall ABI surface is `64` generated syscall numbers.
+- The current bootstrap syscall ABI surface is `71` generated syscall numbers.
 - `AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC` is now the distinct Linux-facing
   exec-prepare helper. It accepts one opaque exec-spec blob and produces the
   prepared entry/stack pair without overloading the generic native launch path.
@@ -107,7 +107,9 @@ The current bootstrap syscall surface includes:
 - VMO create physical / create contiguous / lookup backing paddr / pin DMA region
 - DMA-region lookup backing paddr
 - DMA-region lookup device-visible IOVA
+- DMA-region lookup coalesced segment metadata
 - PCI/device info / BAR / interrupt export
+- PCI/device generic resource-count and resource export
 - VMAR allocate / destroy / map / unmap / protect
 - channel create / write / read
 - eventpair create
@@ -157,7 +159,8 @@ The current bootstrap syscall surface includes:
   - `ax_interrupt_trigger()` is an Axle-native helper rather than a fully generic IRQ delivery ABI
   - `ax_vmo_lookup_paddr()` is a narrow bootstrap helper
   - `ax_vmo_pin()` + `ax_dma_region_get_info()` + `ax_dma_region_lookup_paddr()` +
-    `ax_dma_region_lookup_iova()` now add one first explicit DMA lifetime object without yet
+    `ax_dma_region_lookup_iova()` + `ax_dma_region_get_segment()` now add one first explicit DMA
+    lifetime object without yet
     becoming a full BTI/IOMMU contract:
     - `ax_vmo_pin()` now also freezes one first DMA-permission bit surface
       (`DEVICE_READ` / `DEVICE_WRITE`)
@@ -165,11 +168,22 @@ The current bootstrap syscall surface includes:
       - size in bytes
       - creation-time DMA permission bits
       - region flags (`IDENTITY_IOVA`, `PHYSICALLY_CONTIGUOUS`)
+      - coalesced segment count
+      - base physical and device-visible addresses
+    - `ax_dma_region_get_segment()` then exposes each coalesced physically contiguous segment:
+      - offset / size in bytes
+      - identity-IOVA / physically-contiguous flags
       - base physical and device-visible addresses
   - `ax_pci_device_get_info()` / `ax_pci_device_get_config()` / `ax_pci_device_get_bar()` /
     `ax_pci_device_get_interrupt()` / `ax_pci_device_get_interrupt_mode()` /
+    `ax_pci_device_get_resource_count()` / `ax_pci_device_get_resource()` /
     `ax_pci_device_set_interrupt_mode()` currently export one narrow bootstrap device contract:
     - one capability already seeded into the bootstrap runner
+    - one generic resource index:
+      - resource count
+      - config resource export
+      - BAR resource export
+      - interrupt resource export
     - one synthetic PCI config-space export:
       - MMIO + read-only flags
       - VM map options for the config alias
@@ -181,8 +195,10 @@ The current bootstrap syscall surface includes:
       - whether the current transport routes through triggerable objects
       - base vector and vector count for that mode
     - one first interrupt-mode activation entry point:
-      - `VIRTUAL` is currently the only supported active mode
-      - `LEGACY` / `MSI` / `MSI-X` still return `ZX_ERR_NOT_SUPPORTED`
+      - `VIRTUAL` remains the only triggerable/bootstrap delivery mode
+      - `LEGACY` / `MSI` / `MSI-X` can now be selected so ring3 can validate exported interrupt
+        metadata and mode transitions against the same handles
+      - real hardware routing and MSI/MSI-X programming are still future work
     - no generic PCI enumeration or bus-management ABI yet
   - `ZX_VM_MAP_MMIO` is now the first narrow public VM mapping attribute bit:
     - it requests device/MMIO cache attributes on the installed mapping

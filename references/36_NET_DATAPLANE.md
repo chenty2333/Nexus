@@ -29,17 +29,29 @@ The repository now includes one narrow ring3 net dataplane slice built around on
 The current bootstrap transport includes:
 
 - one bootstrap `PciDevice` handle seeded by the kernel into the runner shared-slot window
-- one PCI config-space export discovered through `ax_pci_device_get_config()`:
+- one generic PCI resource discovery step through:
+  - `ax_pci_device_get_resource_count()`
+  - `ax_pci_device_get_resource()`
+  - one config resource carrying MMIO + read-only flags and suggested map options
+  - one BAR0 resource carrying MMIO flags and suggested map options
+  - one interrupt resource per queue pair and per interrupt group
+- one config resource export then reinterpreted as the synthetic PCI config-space window:
   - MMIO + read-only flags
   - map options used for the config alias mapping
   - virtio-style capability discovery for BAR0/common/notify/isr/device regions
-- one BAR0 VMO exported by the kernel from that device handle, plus BAR MMIO metadata
+- one BAR0 VMO exported from that same generic resource path, plus BAR MMIO metadata
 - one interrupt-object export per queue pair and per interrupt group, plus interrupt mode/vector
-  metadata
+  metadata carried through that same generic resource path
 - one interrupt-mode capability query through `ax_pci_device_get_interrupt_mode()`:
   - supported / active / triggerable flags
   - base vector
   - vector count
+- one synthetic MSI/restore round-trip before the data path starts:
+  - ring3 queries `MSI` capability metadata
+  - ring3 selects `MSI`
+  - ring3 re-fetches one interrupt handle and verifies the object metadata now reports
+    `ZX_INTERRUPT_MODE_MSI` and no triggerable flag
+  - ring3 then switches back to `VIRTUAL` before driving the current bootstrap transport
 - one shared queue/buffer window allocated through `zx_vmo_create_contiguous()`
 - one explicit `DmaRegion` lifetime object over:
   - the queue memory
@@ -53,7 +65,13 @@ The current bootstrap transport includes:
   - size in bytes
   - DMA-permission bits
   - identity-IOVA / physical-contiguity flags
+  - coalesced segment count
   - base physical / device-visible addresses
+- one DMA-region segment query through `ax_dma_region_get_segment()` for segment `0` on both BAR0
+  and queue memory:
+  - the current bootstrap transport pins exactly one segment for each of those regions
+  - the driver/device pair now treats that returned segment IOVA as the programmed queue/control
+    address instead of assuming "base IOVA == whole region truth"
 - driver mapping of the BAR0 window now uses the BAR-exported VM map options and therefore
   explicitly requests `ZX_VM_MAP_MMIO`
 - driver mapping of the synthetic PCI config window also uses `ZX_VM_MAP_MMIO`
@@ -87,8 +105,8 @@ The current bootstrap transport includes:
 - one narrow kernel-exported device-resource discovery step:
   - vendor/device/class fields
   - BAR count, queue-pair count, and queue size metadata
-  - BAR0 VMO export
-  - per-queue interrupt export
+  - generic resource enumeration
+  - config/BAR/interrupt handle export through that generic resource path
 
 ## Current queue shape
 
@@ -158,17 +176,22 @@ The current bootstrap slice proves three things:
 6. The transport is no longer trapped inside one smoke-only binary. `nexus-init` can now consume
    the same transport crate and bootstrap device export as one root component, which means the
    current user-mode virtio-style path is becoming system substrate rather than only test harness.
+7. The current device-memory contract is no longer just "lookup one paddr and hope." The bootstrap
+   net path now proves that ring3 can discover a device through generic PCI resources, select an
+   interrupt mode, and then program queue/control addresses from explicit `DmaRegion` segment
+   metadata.
 
 ## What this is not yet
 
 - no PCI bus enumeration
 - no real PCI config space or BAR management contract from the kernel
-- no generic PCI enumeration or config-space ABI yet; only one narrow resource-export object
+- no generic PCI enumeration or config-space read/write ABI yet; only one narrow resource-export
+  object
 - no MMIO cache-policy / mapping-attribute controls beyond the first narrow `ZX_VM_MAP_MMIO` bit
-- only one first narrow identity-like IOVA query exists; there is still no DMA map/unmap or fuller
-  IOVA token model yet
-- no hardware interrupt routing or MSI/MSI-X programming surface yet; only one mode-capability
-  query hang point exists today
+- only one first narrow identity-like IOVA contract exists; the next step is still a fuller
+  DMA map/unmap or IOVA-token model beyond the current explicit `DmaRegion`
+- no hardware interrupt routing or MSI/MSI-X programming surface yet; the current MSI/legacy/MSI-X
+  mode handling is still metadata/activation scaffolding rather than real hardware delivery
 - no full virtio PCI capability layout or generic config-space ABI
 - no userspace TCP/IP stack
 - no RSS / scheduler-domain queue placement policy

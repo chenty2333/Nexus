@@ -31,12 +31,13 @@ pub use axle_types::syscall_numbers;
 pub use axle_types::vm;
 pub use axle_types::wait_async;
 pub use axle_types::{
-    ax_clock_t, ax_dma_region_info_t, ax_duration_t, ax_futex_t, ax_guest_stop_state_t,
-    ax_guest_x64_regs_t, ax_handle_t, ax_interrupt_info_t, ax_koid_t,
+    ax_clock_t, ax_dma_region_info_t, ax_dma_segment_info_t, ax_duration_t, ax_futex_t,
+    ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_handle_t, ax_interrupt_info_t, ax_koid_t,
     ax_linux_exec_interp_header_t, ax_linux_exec_spec_header_t, ax_packet_signal_t,
     ax_packet_type_t, ax_packet_user_t, ax_pci_bar_info_t, ax_pci_config_info_t,
-    ax_pci_device_info_t, ax_pci_interrupt_info_t, ax_pci_interrupt_mode_info_t, ax_port_packet_t,
-    ax_rights_t, ax_signals_t, ax_status_t, ax_time_t, ax_vaddr_t, ax_vm_option_t,
+    ax_pci_device_info_t, ax_pci_interrupt_info_t, ax_pci_interrupt_mode_info_t,
+    ax_pci_resource_info_t, ax_port_packet_t, ax_rights_t, ax_signals_t, ax_status_t, ax_time_t,
+    ax_vaddr_t, ax_vm_option_t,
 };
 
 use axle_types::status::{AX_ERR_NO_MEMORY, AX_ERR_OUT_OF_RANGE, AX_OK};
@@ -558,6 +559,18 @@ pub fn ax_dma_region_get_info(
     }
 }
 
+/// Read one segment metadata snapshot from a DMA-region object.
+pub fn ax_dma_region_get_segment(
+    handle: ax_handle_t,
+    segment_index: u32,
+    out_info: &mut ax_dma_segment_info_t,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_dma_region_get_segment(raw, segment_index, out_info),
+        Err(status) => status,
+    }
+}
+
 /// Read one narrow PCI/device info snapshot from a device handle.
 pub fn ax_pci_device_get_info(
     handle: ax_handle_t,
@@ -643,6 +656,42 @@ pub fn ax_pci_device_get_interrupt_mode(
 ) -> ax_status_t {
     match narrow_handle(handle) {
         Ok(raw) => libzircon::ax_pci_device_get_interrupt_mode(raw, mode, out_info),
+        Err(status) => status,
+    }
+}
+
+/// Query the number of generic resource exports from a PCI/device handle.
+pub fn ax_pci_device_get_resource_count(handle: ax_handle_t, out_count: &mut u64) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_pci_device_get_resource_count(raw, out_count),
+        Err(status) => status,
+    }
+}
+
+/// Export one generic resource from a PCI/device handle.
+pub fn ax_pci_device_get_resource(
+    handle: ax_handle_t,
+    resource_index: u32,
+    out_info: &mut ax_pci_resource_info_t,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => {
+            let mut raw_info = libzircon::pci::zx_pci_resource_info_t::default();
+            let status = libzircon::ax_pci_device_get_resource(raw, resource_index, &mut raw_info);
+            if status == AX_OK {
+                out_info.handle = widen_handle(raw_info.handle);
+                out_info.kind = raw_info.kind;
+                out_info.index = raw_info.index;
+                out_info.subindex = raw_info.subindex;
+                out_info.flags = raw_info.flags;
+                out_info.map_options = raw_info.map_options;
+                out_info.size = raw_info.size;
+                out_info.mode = raw_info.mode;
+                out_info.vector = raw_info.vector;
+                out_info.reserved0 = raw_info.reserved0;
+            }
+            status
+        }
         Err(status) => status,
     }
 }

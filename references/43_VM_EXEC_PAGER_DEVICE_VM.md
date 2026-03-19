@@ -106,6 +106,11 @@ Current state:
 - one narrow bootstrap `PciDevice` contract is now public:
   - kernel seeds one device handle into the bootstrap runner shared-slot window
   - `ax_pci_device_get_info()` exports one immutable resource summary
+  - `ax_pci_device_get_resource_count()` / `ax_pci_device_get_resource()` now export one generic
+    resource index over that same bootstrap handle:
+    - one config resource
+    - one BAR resource per supported BAR
+    - one interrupt resource per `(group, queue_pair)` tuple
   - `ax_pci_device_get_bar()` exports one BAR VMO handle plus BAR flags / suggested VM map options
   - `ax_pci_device_get_interrupt()` exports one interrupt-object handle per queue-pair/group plus
     interrupt mode / vector metadata
@@ -130,7 +135,13 @@ Current state:
   - size in bytes
   - DMA-permission bits
   - identity-IOVA / physical-contiguity flags
+  - coalesced segment count
   - base physical / device-visible addresses
+- `ax_dma_region_get_segment(handle, segment_index, out)` is now the first narrow segment query on
+  that same pinned DMA-region object:
+  - segment offset / size in bytes
+  - identity-IOVA / physical-contiguity flags
+  - segment base physical / device-visible addresses
 - `interrupt_create(ZX_INTERRUPT_VIRTUAL)` is now public as a narrow virtual/software interrupt
   object, and `ax_interrupt_trigger()` is the matching Axle-native injection helper.
 - `interrupt_get_info(handle, out)` is now the first narrow metadata query over an interrupt
@@ -150,8 +161,10 @@ Current state:
   - VM map options for the config alias mapping
 - `ax_pci_device_set_interrupt_mode(handle, mode)` is now the first narrow interrupt-mode
   activation path on that same bootstrap `PciDevice` object:
-  - only `VIRTUAL` may currently be selected
-  - hardware-backed modes remain future hang points
+  - `VIRTUAL` remains the current bootstrap delivery mode
+  - `LEGACY` / `MSI` / `MSI-X` may now also be selected so userspace can validate exported
+    interrupt-handle metadata against the selected mode
+  - real hardware-backed routing/programming still remains future work
 
 What is still intentionally narrow:
 
@@ -163,10 +176,12 @@ What is still intentionally narrow:
 - the pin contract now has:
   - one first identity-like device-visible IOVA query
   - one first metadata query over that pinned DMA lifetime object
+  - one first coalesced segment query over that same pinned lifetime object
   - one first DMA-permission bit surface
   but there is still no map/unmap token or richer translation/isolation model yet
 - there is no IOMMU-facing isolation contract
-- there is no hardware IRQ routing or MSI/MSI-X model yet
+- there is no hardware IRQ routing or real MSI/MSI-X programming model yet; current non-virtual
+  interrupt modes are still synthetic metadata/activation scaffolding
 - contiguous allocation is a bootstrap DMA-oriented primitive, not yet a richer device-memory policy
 - physical/MMIO VMOs do not yet expose cache-policy or mapping-attribute controls
   beyond the first narrow `ZX_VM_MAP_MMIO` bit
@@ -179,7 +194,8 @@ What is still intentionally narrow:
   shared read-only source plus mapping-local private shadow on write.
 - Treat the current physical / contiguous / interrupt surface as one minimal device-facing substrate:
   enough for bootstrap smoke, the current queue-owned user-mode net dataplane slice, the current
-  bootstrap `PciDevice` + BAR0 transport smoke, the now-explicit `DmaRegion`-backed queue
-  and control-window lifetime slice, the first MMIO-attributed driver BAR mappings, the first
-  narrow user-mode virtio-style feature/status/queue-select bring-up path, and later
+  bootstrap `PciDevice` + BAR0 transport smoke, the current generic PCI-resource discovery path,
+  the now-explicit `DmaRegion`-backed queue and control-window lifetime slice, the first MMIO-
+  attributed driver BAR/config mappings, the first narrow user-mode virtio-style
+  feature/status/queue-select bring-up path, and later
   DMA/IOMMU integration, but not yet the final DFv2 device contract.

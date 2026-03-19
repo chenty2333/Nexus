@@ -18,12 +18,13 @@ use axle_mm::{MappingCachePolicy, MappingPerms, VmarAllocMode, VmarId, VmarPlace
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::dma::{
     AX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA, AX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS,
-    ax_dma_region_info_t,
+    AX_DMA_SEGMENT_INFO_FLAG_IDENTITY_IOVA, AX_DMA_SEGMENT_INFO_FLAG_PHYSICALLY_CONTIGUOUS,
+    ax_dma_region_info_t, ax_dma_segment_info_t,
 };
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::interrupt::{
-    AX_INTERRUPT_INFO_FLAG_TRIGGERABLE, AX_INTERRUPT_MODE_VIRTUAL, ZX_INTERRUPT_VIRTUAL,
-    ax_interrupt_info_t,
+    AX_INTERRUPT_INFO_FLAG_TRIGGERABLE, AX_INTERRUPT_MODE_LEGACY, AX_INTERRUPT_MODE_MSI,
+    AX_INTERRUPT_MODE_MSIX, AX_INTERRUPT_MODE_VIRTUAL, ZX_INTERRUPT_VIRTUAL, ax_interrupt_info_t,
 };
 use axle_types::koid::ZX_KOID_INVALID;
 use axle_types::rights::{ZX_RIGHT_SAME_RIGHTS, ZX_RIGHTS_ALL};
@@ -166,8 +167,67 @@ impl DmaRegionObject {
             size_bytes: self.size_bytes,
             options: self.options,
             flags,
+            segment_count: self.segment_count(),
+            reserved0: 0,
             paddr_base: self.lookup_paddr(0)?,
             iova_base: self.lookup_iova(0)?,
+        })
+    }
+
+    pub(crate) fn segment_count(&self) -> u32 {
+        self.segments().count() as u32
+    }
+
+    pub(crate) fn segment_info(
+        &self,
+        segment_index: u32,
+    ) -> Result<ax_dma_segment_info_t, zx_status_t> {
+        self.segments()
+            .nth(segment_index as usize)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)
+    }
+
+    fn segments(&self) -> impl Iterator<Item = ax_dma_segment_info_t> + '_ {
+        let page_size = crate::userspace::USER_PAGE_BYTES;
+        let frame_count = self.pin.frame_ids().len();
+        let last_index = frame_count.saturating_sub(1);
+        let region_size = self.size_bytes;
+        let base_offset = self.source_offset;
+
+        let mut start_index = 0usize;
+        core::iter::from_fn(move || {
+            if start_index >= frame_count {
+                return None;
+            }
+
+            let start_frame = self.pin.frame_ids()[start_index];
+            let mut end_index = start_index;
+            while end_index + 1 < frame_count {
+                let current = self.pin.frame_ids()[end_index];
+                let next = self.pin.frame_ids()[end_index + 1];
+                if current.raw().saturating_add(page_size) != next.raw() {
+                    break;
+                }
+                end_index += 1;
+            }
+
+            let segment_offset = start_index as u64 * page_size;
+            let covered_pages = end_index.saturating_sub(start_index) + 1;
+            let mut segment_size = covered_pages as u64 * page_size;
+            if end_index == last_index {
+                segment_size = region_size.saturating_sub(segment_offset);
+            }
+            start_index = end_index + 1;
+
+            Some(ax_dma_segment_info_t {
+                offset_bytes: segment_offset,
+                size_bytes: segment_size,
+                flags: AX_DMA_SEGMENT_INFO_FLAG_IDENTITY_IOVA
+                    | AX_DMA_SEGMENT_INFO_FLAG_PHYSICALLY_CONTIGUOUS,
+                reserved0: 0,
+                paddr_base: start_frame.raw() + (base_offset & (page_size - 1)),
+                iova_base: start_frame.raw() + (base_offset & (page_size - 1)),
+            })
         })
     }
 
@@ -210,6 +270,12 @@ impl InterruptObject {
             },
             reserved0: 0,
         }
+    }
+
+    pub(crate) fn set_metadata(&mut self, mode: u32, vector: u32, triggerable: bool) {
+        self.mode = mode;
+        self.vector = vector;
+        self.triggerable = triggerable;
     }
 
     fn signals(self) -> Signals {

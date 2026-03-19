@@ -781,3 +781,35 @@ args = [
   { name = "handle", ty = "ax_handle_t" },
   { name = "mode", ty = "u32" },
 ]
+
+[[syscall]]
+name = "ax_dma_region_get_segment"
+nr = 68
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "segment_index", ty = "u32" },
+  { name = "out_info", ty = "*mut ax_dma_segment_info_t" },
+]
+
+[[syscall]]
+name = "ax_pci_device_get_resource_count"
+nr = 69
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "out_count", ty = "*mut u32" },
+]
+
+[[syscall]]
+name = "ax_pci_device_get_resource"
+nr = 70
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "resource_index", ty = "u32" },
+  { name = "out_info", ty = "*mut ax_pci_resource_info_t" },
+]

@@ -567,6 +567,17 @@ pub mod dma {
     pub const ZX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS: u32 =
         AX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS;
 
+    /// One exported DMA segment uses identity IOVA semantics.
+    pub const AX_DMA_SEGMENT_INFO_FLAG_IDENTITY_IOVA: u32 = 1 << 0;
+    /// One exported DMA segment is physically contiguous across its full byte range.
+    pub const AX_DMA_SEGMENT_INFO_FLAG_PHYSICALLY_CONTIGUOUS: u32 = 1 << 1;
+
+    /// One exported DMA segment uses identity IOVA semantics.
+    pub const ZX_DMA_SEGMENT_INFO_FLAG_IDENTITY_IOVA: u32 = AX_DMA_SEGMENT_INFO_FLAG_IDENTITY_IOVA;
+    /// One exported DMA segment is physically contiguous across its full byte range.
+    pub const ZX_DMA_SEGMENT_INFO_FLAG_PHYSICALLY_CONTIGUOUS: u32 =
+        AX_DMA_SEGMENT_INFO_FLAG_PHYSICALLY_CONTIGUOUS;
+
     /// One pinned DMA-region metadata snapshot.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -577,6 +588,10 @@ pub mod dma {
         pub options: u32,
         /// Region metadata flags.
         pub flags: u32,
+        /// Number of exported DMA segments in this region.
+        pub segment_count: u32,
+        /// Reserved for later expansion.
+        pub reserved0: u32,
         /// Base physical address for offset zero.
         pub paddr_base: u64,
         /// Base device-visible address for offset zero.
@@ -585,6 +600,27 @@ pub mod dma {
 
     /// Frozen Zircon-compat alias over the native DMA-region info record.
     pub type zx_dma_region_info_t = ax_dma_region_info_t;
+
+    /// One DMA-segment metadata snapshot.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ax_dma_segment_info_t {
+        /// Byte offset from the start of the DMA region.
+        pub offset_bytes: u64,
+        /// Segment size in bytes.
+        pub size_bytes: u64,
+        /// Segment metadata flags.
+        pub flags: u32,
+        /// Reserved for later expansion.
+        pub reserved0: u32,
+        /// Base physical address for this segment.
+        pub paddr_base: u64,
+        /// Base device-visible address for this segment.
+        pub iova_base: u64,
+    }
+
+    /// Frozen Zircon-compat alias over the native DMA-segment info record.
+    pub type zx_dma_segment_info_t = ax_dma_segment_info_t;
 }
 
 /// Narrow PCI/device-facing bootstrap types and constants.
@@ -609,6 +645,20 @@ pub mod pci {
     pub const AX_PCI_BAR_FLAG_MMIO: u32 = 1 << 0;
     /// BAR names one MMIO window.
     pub const ZX_PCI_BAR_FLAG_MMIO: u32 = AX_PCI_BAR_FLAG_MMIO;
+
+    /// Resource names one MMIO window.
+    pub const AX_PCI_RESOURCE_FLAG_MMIO: u32 = 1 << 0;
+    /// Resource should be treated as read-only.
+    pub const AX_PCI_RESOURCE_FLAG_READ_ONLY: u32 = 1 << 1;
+    /// Resource is currently software-triggerable.
+    pub const AX_PCI_RESOURCE_FLAG_TRIGGERABLE: u32 = 1 << 2;
+
+    /// Resource names one MMIO window.
+    pub const ZX_PCI_RESOURCE_FLAG_MMIO: u32 = AX_PCI_RESOURCE_FLAG_MMIO;
+    /// Resource should be treated as read-only.
+    pub const ZX_PCI_RESOURCE_FLAG_READ_ONLY: u32 = AX_PCI_RESOURCE_FLAG_READ_ONLY;
+    /// Resource is currently software-triggerable.
+    pub const ZX_PCI_RESOURCE_FLAG_TRIGGERABLE: u32 = AX_PCI_RESOURCE_FLAG_TRIGGERABLE;
 
     /// Config window is one MMIO-style exported config-space alias.
     pub const AX_PCI_CONFIG_FLAG_MMIO: u32 = 1 << 0;
@@ -652,6 +702,20 @@ pub mod pci {
     /// Interrupt mode currently routes through triggerable interrupt objects.
     pub const ZX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE: u32 =
         AX_PCI_INTERRUPT_MODE_INFO_FLAG_TRIGGERABLE;
+
+    /// Resource entry names the config-space export.
+    pub const AX_PCI_RESOURCE_KIND_CONFIG: u32 = 0;
+    /// Resource entry names one BAR export.
+    pub const AX_PCI_RESOURCE_KIND_BAR: u32 = 1;
+    /// Resource entry names one interrupt export.
+    pub const AX_PCI_RESOURCE_KIND_INTERRUPT: u32 = 2;
+
+    /// Resource entry names the config-space export.
+    pub const ZX_PCI_RESOURCE_KIND_CONFIG: u32 = AX_PCI_RESOURCE_KIND_CONFIG;
+    /// Resource entry names one BAR export.
+    pub const ZX_PCI_RESOURCE_KIND_BAR: u32 = AX_PCI_RESOURCE_KIND_BAR;
+    /// Resource entry names one interrupt export.
+    pub const ZX_PCI_RESOURCE_KIND_INTERRUPT: u32 = AX_PCI_RESOURCE_KIND_INTERRUPT;
 
     /// One narrow public PCI/device info snapshot.
     #[repr(C)]
@@ -752,17 +816,54 @@ pub mod pci {
     /// Frozen Zircon-compat alias over the native interrupt-mode info record.
     pub type zx_pci_interrupt_mode_info_t = ax_pci_interrupt_mode_info_t;
 
+    /// One generic PCI/device resource export.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ax_pci_resource_info_t {
+        /// Handle naming the exported resource object.
+        pub handle: ax_handle_t,
+        /// Resource kind (`CONFIG`, `BAR`, or `INTERRUPT`).
+        pub kind: u32,
+        /// Resource primary index:
+        /// - `0` for config
+        /// - BAR index for BARs
+        /// - interrupt group for interrupts
+        pub index: u32,
+        /// Resource secondary index:
+        /// - `0` for config/BAR
+        /// - queue-pair index for interrupts
+        pub subindex: u32,
+        /// Resource flags.
+        pub flags: u32,
+        /// Suggested VM map options for this resource mapping.
+        pub map_options: u32,
+        /// Resource size in bytes for config/BAR exports.
+        pub size: u64,
+        /// Interrupt delivery mode for interrupt resources.
+        pub mode: u32,
+        /// Interrupt vector or line metadata for interrupt resources.
+        pub vector: u32,
+        /// Reserved for later expansion.
+        pub reserved0: u32,
+    }
+
+    /// Frozen Zircon-compat alias over the native PCI/device resource export.
+    pub type zx_pci_resource_info_t = ax_pci_resource_info_t;
+
     const _: () = {
         let _ = core::mem::size_of::<zx_handle_t>();
     };
 }
 
-pub use dma::{ax_dma_region_info_t, zx_dma_region_info_t};
+pub use dma::{
+    ax_dma_region_info_t, ax_dma_segment_info_t, zx_dma_region_info_t, zx_dma_segment_info_t,
+};
 pub use interrupt::{ax_interrupt_info_t, zx_interrupt_info_t};
 pub use pci::{
     ax_pci_bar_info_t, ax_pci_config_info_t, ax_pci_device_info_t, ax_pci_interrupt_info_t,
-    ax_pci_interrupt_mode_info_t, zx_pci_bar_info_t, zx_pci_config_info_t, zx_pci_device_info_t,
-    zx_pci_interrupt_info_t, zx_pci_interrupt_mode_info_t,
+    ax_pci_interrupt_mode_info_t, ax_pci_resource_info_t, zx_pci_bar_info_t, zx_pci_config_info_t,
+    zx_pci_device_info_t, zx_pci_interrupt_info_t, zx_pci_interrupt_mode_info_t,
+    zx_pci_resource_info_t,
 };
 
 /// VM mapping and protection options.
