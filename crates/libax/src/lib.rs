@@ -729,6 +729,14 @@ pub fn ax_vmo_write(handle: ax_handle_t, bytes: &[u8], offset: u64) -> ax_status
     }
 }
 
+/// Resize one VMO.
+pub fn ax_vmo_set_size(handle: ax_handle_t, size: u64) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::zx_vmo_set_size(raw, size),
+        Err(status) => status,
+    }
+}
+
 /// Create a process and its root VMAR.
 pub fn ax_process_create(
     parent_process: ax_handle_t,

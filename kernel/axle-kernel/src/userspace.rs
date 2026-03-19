@@ -786,6 +786,12 @@ const SLOT_VMO_BOOT_CODE_SIZE_NONZERO: usize = 1043;
 const SLOT_VMO_BOOT_CODE_SIZE: usize = 1044;
 const SLOT_VMO_PRESENT: usize = 1045;
 const SLOT_VMO_FAILURE_STEP: usize = 1046;
+const SLOT_VMO_SHARED_PRESENT: usize = 1047;
+const SLOT_VMO_SHARED_FAILURE_STEP: usize = 1048;
+const SLOT_VMO_SHARED_READ: usize = 1049;
+const SLOT_VMO_SHARED_READ_MATCH: usize = 1050;
+const SLOT_VMO_SHARED_WRITE: usize = 1051;
+const SLOT_VMO_SHARED_RESIZE: usize = 1052;
 const SLOT_DGRAM_PRESENT: usize = 954;
 const SLOT_DGRAM_FAILURE_STEP: usize = 955;
 const SLOT_DGRAM_CREATE: usize = 956;
@@ -813,7 +819,7 @@ const SLOT_DGRAM_WRITE_PEER_CLOSED: usize = 977;
 const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
 const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_VMO_FAILURE_STEP;
+const SLOT_MAX: usize = SLOT_VMO_SHARED_RESIZE;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1770,6 +1776,10 @@ fn vmo_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_VMO_PRESENT] != 0 || slots[SLOT_VMO_FAILURE_STEP] != 0
 }
 
+fn vmo_shared_summary_present(slots: &[u64]) -> bool {
+    slots[SLOT_VMO_SHARED_PRESENT] != 0 || slots[SLOT_VMO_SHARED_FAILURE_STEP] != 0
+}
+
 fn smp_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_SMP_SMOKE_PRESENT] != 0
 }
@@ -2166,6 +2176,18 @@ fn print_vmo_summary(slots: &[u64]) {
     );
 }
 
+fn print_vmo_shared_summary(slots: &[u64]) {
+    crate::kprintln!(
+        "kernel: vmo shared smoke (vmo_shared_present={}, vmo_shared_failure_step={}, vmo_shared_read={}, vmo_shared_read_match={}, vmo_shared_write={}, vmo_shared_resize={})",
+        slots[SLOT_VMO_SHARED_PRESENT],
+        slots[SLOT_VMO_SHARED_FAILURE_STEP],
+        slots[SLOT_VMO_SHARED_READ] as i64,
+        slots[SLOT_VMO_SHARED_READ_MATCH],
+        slots[SLOT_VMO_SHARED_WRITE] as i64,
+        slots[SLOT_VMO_SHARED_RESIZE] as i64,
+    );
+}
+
 fn print_smp_summary(slots: &[u64]) {
     crate::kprintln!(
         "kernel: smp smoke ok (present={}, status={})",
@@ -2289,6 +2311,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         if vmo_summary_present(slots) {
             print_vmo_summary(slots);
         }
+        if vmo_shared_summary_present(slots) {
+            print_vmo_shared_summary(slots);
+        }
         if smp_summary_present(slots) {
             print_smp_summary(slots);
         }
@@ -2327,6 +2352,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
     }
     if vmo_summary_present(slots) {
         print_vmo_summary(slots);
+    }
+    if vmo_shared_summary_present(slots) {
+        print_vmo_shared_summary(slots);
     }
     if smp_summary_present(slots) {
         print_smp_summary(slots);

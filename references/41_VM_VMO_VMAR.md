@@ -162,6 +162,11 @@ It is not fully implemented yet.
 - `ax_vmo_get_info()` is intentionally object-level only:
   - it freezes the public size / kind / backing-scope / behavior-flag snapshot
   - it is not a public residency, dirty-page, or page-cache inspection API
+- The current shared pager-backed/file-backed handle contract is also now
+  explicitly gated at the syscall surface:
+  - `vmo_read()` is allowed on the shared source handle
+  - direct `vmo_write()` is denied
+  - direct `vmo_set_size()` is denied
 - Physical / contiguous VMOs are now public as narrow bootstrap primitives, but the broader device
   model is still incomplete:
   - no BTI/pinning object

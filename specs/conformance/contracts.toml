@@ -356,6 +356,11 @@ level = "should"
 description = "Bootstrap VMO syscalls should support basic read/write, page-aligned grow/shrink, and reject shrinking a mapped tail or writing beyond the resized end"
 
 [[contracts]]
+id = "should.vmo.shared_bootstrap_contract"
+level = "should"
+description = "Bootstrap shared pager-backed/file-backed VMO handles should remain readable but reject direct write and resize through the shared source handle"
+
+[[contracts]]
 id = "should.socket.stream_basics_bootstrap"
 level = "should"
 description = "Bootstrap STREAM sockets should support create, waitable readable/writable states, peek, read, peer-close signaling, and peer-closed read/write errors"

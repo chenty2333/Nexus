@@ -187,6 +187,15 @@ That host gate now explicitly covers:
     - `GlobalShared`
     - read-only shared behavior flags
     - non-zero logical size
+- Bootstrap VM coverage now also includes one narrow shared-handle behavior
+  gate:
+  - `kernel.vmo.shared_bootstrap`
+  - one bootstrap code-image VMO must prove the current shared pager-backed
+    source-handle behavior:
+    - `vmo_read()` succeeds
+    - the first bytes match the current bootstrap code window mapping
+    - direct `vmo_write()` returns `ZX_ERR_ACCESS_DENIED`
+    - direct `vmo_set_size()` returns `ZX_ERR_ACCESS_DENIED`
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - two ring3 worker threads act as minimal device-side peers, one queue pair each
   - one bootstrap `PciDevice` handle is now seeded into the runner shared-slot window

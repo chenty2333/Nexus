@@ -67,7 +67,7 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_PROCESS_START, AXLE_SYS_SOCKET_CREATE, AXLE_SYS_SOCKET_READ, AXLE_SYS_SOCKET_WRITE,
     AXLE_SYS_TASK_KILL, AXLE_SYS_THREAD_CREATE, AXLE_SYS_THREAD_START, AXLE_SYS_TIMER_CANCEL,
     AXLE_SYS_TIMER_CREATE, AXLE_SYS_TIMER_SET, AXLE_SYS_VMO_CREATE, AXLE_SYS_VMO_CREATE_CONTIGUOUS,
-    AXLE_SYS_VMO_CREATE_PHYSICAL, AXLE_SYS_VMO_READ, AXLE_SYS_VMO_WRITE,
+    AXLE_SYS_VMO_CREATE_PHYSICAL, AXLE_SYS_VMO_READ, AXLE_SYS_VMO_SET_SIZE, AXLE_SYS_VMO_WRITE,
 };
 
 /// Infinite deadline used by blocking wait syscalls.
@@ -842,6 +842,11 @@ pub fn zx_vmo_write(handle: zx_handle_t, bytes: &[u8], offset: u64) -> zx_status
             0,
         ],
     )
+}
+
+/// Resize one VMO.
+pub fn zx_vmo_set_size(handle: zx_handle_t, size: u64) -> zx_status_t {
+    native_call(AXLE_SYS_VMO_SET_SIZE as u64, [handle, size, 0, 0, 0, 0])
 }
 
 /// Create a process and its root VMAR.

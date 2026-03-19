@@ -1,0 +1,26 @@
+id = "kernel.vmo.shared_bootstrap"
+description = "Bootstrap shared pager-backed VMOs should remain readable but reject direct write and resize through the shared handle"
+tags = ["kernel", "runtime", "vm", "vmo", "bootstrap"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/vmo-shared-smoke && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && AXLE_TEST_RUNNER_RUST_ENTRY=vmo_shared_smoke RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none --target-dir \"$target_dir\" && runner_src=\"$target_dir/x86_64-unknown-none/debug/nexus-test-runner\" && runner=$(mktemp /tmp/nexus-test-runner-XXXXXX) && cp \"$runner_src\" \"$runner\" && size=$(stat -c%s \"$runner\") && { timeout --foreground 20s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x7000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x6fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; qemu_code=$?; echo qemu_exit=$qemu_code; [ \"$qemu_code\" -eq 33 ]; }"
+]
+
+expect = [
+  "kernel: vmo shared smoke",
+]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.vmo.shared_bootstrap_contract"]
+
+[assertions.status_code]
+vmo_shared_read = 0
+vmo_shared_write = -30
+vmo_shared_resize = -30
+
+[assertions.packet_fields]
+vmo_shared_present = 1
+vmo_shared_failure_step = 0
+vmo_shared_read_match = 1

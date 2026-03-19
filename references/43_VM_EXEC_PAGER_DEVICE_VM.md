@@ -80,6 +80,10 @@ Current state:
     - imported pager-backed/file-backed VMOs when the boot image already has
       one
     - otherwise one staged shared anonymous VMO containing the file bytes
+  - the shared source handle itself is now frozen as a read/inspect/map handle:
+    - `vmo_read()` may read shared source bytes
+    - direct `vmo_write()` on that shared handle is denied
+    - direct `vmo_set_size()` on that shared handle is denied
   - `AX_VM_PRIVATE_CLONE` / `ZX_VM_PRIVATE_CLONE` may map any shared COW-capable
     source through a
     writable mapping-local shadow view
@@ -93,6 +97,11 @@ Current state:
   - anonymous private-clone destinations report `Anonymous + LocalPrivate`
   - the public fields are still limited to logical size, kind, backing scope,
     and stable behavior flags
+- the bootstrap shared-handle gate now also freezes the current source-handle
+  access pattern for pager-backed/file-backed VMOs:
+  - readable
+  - not directly writable
+  - not directly resizable
 
 What is not complete yet:
 
