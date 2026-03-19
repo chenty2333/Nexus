@@ -127,6 +127,11 @@ level = "should"
 description = "zx_vmo_create must reject bad bootstrap arguments and return a non-zero anonymous VMO handle on success"
 
 [[contracts]]
+id = "should.vmo.info_bootstrap_narrow_contract"
+level = "should"
+description = "ax_vmo_get_info must expose the current narrow public VMO contract for anonymous private objects and shared pager-backed image sources"
+
+[[contracts]]
 id = "must.vmar.map_protect_unmap_bootstrap"
 level = "must"
 description = "Root-VMAR bootstrap map/protect/unmap must commit an explicit anonymous mapping lifecycle with stable error codes and post-return visibility for the calling thread"

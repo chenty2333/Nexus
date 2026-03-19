@@ -35,6 +35,12 @@ This file describes the current VMO, VMAR, VMA, and address-space control-plane 
   - size
   - kind
   - backing scope (`LocalPrivate` vs `GlobalShared`)
+- `ax_vmo_get_info()` now exports that same narrow object snapshot as the current public VMO info
+  contract:
+  - logical size in bytes
+  - kind
+  - backing scope
+  - stable behavior flags such as resizable / COW-capable / kernel-readable
 - Hot page state is not cached in the object layer.
 - `MapRec` is the coarse mapping/control-plane identity:
   - `(address_space, vmar_id, map_id, va range)`
@@ -72,6 +78,10 @@ Current user-facing object creation is much narrower:
   current narrow DMA-oriented bootstrap path.
 - `ax_vmo_lookup_paddr(handle, offset, out_paddr)` is the current Axle-native helper for resolving
   the physical address backing one physical/contiguous VMO offset.
+- `ax_vmo_get_info(handle, out_info)` is the first narrow public object-level metadata query over
+  those same VMO families:
+  - it reports size / kind / backing scope / behavior flags
+  - it intentionally does not expose live residency, dirty/writeback state, or per-page mappings
 
 ## VMAR model
 
@@ -96,6 +106,7 @@ Current object/syscall paths support:
 
 - create process address space plus root VMAR
 - create anonymous VMO
+- query narrow VMO object metadata
 - VMO read / write / resize
 - VMAR allocate / destroy
 - VMAR map / unmap / protect
@@ -148,6 +159,9 @@ It is not fully implemented yet.
 ## Current limitations
 
 - Execute mappings are now wired through the normal VMAR path, but the surrounding pager / file-backed object model is still incomplete; see `43_VM_EXEC_PAGER_DEVICE_VM.md`.
+- `ax_vmo_get_info()` is intentionally object-level only:
+  - it freezes the public size / kind / backing-scope / behavior-flag snapshot
+  - it is not a public residency, dirty-page, or page-cache inspection API
 - Physical / contiguous VMOs are now public as narrow bootstrap primitives, but the broader device
   model is still incomplete:
   - no BTI/pinning object

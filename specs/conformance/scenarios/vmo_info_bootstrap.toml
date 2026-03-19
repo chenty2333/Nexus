@@ -1,0 +1,32 @@
+id = "kernel.vmo.info_bootstrap"
+description = "Bootstrap ring3 Rust userspace should expose the narrow public anonymous/private and pager-backed/shared VMO contract through ax_vmo_get_info"
+tags = ["kernel", "runtime", "vm", "vmo", "bootstrap"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/vmo-info-smoke && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && AXLE_TEST_RUNNER_RUST_ENTRY=vmo_info_smoke RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none --target-dir \"$target_dir\" && runner_src=\"$target_dir/x86_64-unknown-none/debug/nexus-test-runner\" && runner=$(mktemp /tmp/nexus-test-runner-XXXXXX) && cp \"$runner_src\" \"$runner\" && size=$(stat -c%s \"$runner\") && { timeout --foreground 20s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x7000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x6fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; qemu_code=$?; echo qemu_exit=$qemu_code; [ \"$qemu_code\" -eq 33 ]; }"
+]
+
+expect = [
+  "kernel: vmo info smoke",
+]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.vmo.info_bootstrap_narrow_contract"]
+
+[assertions.status_code]
+vmo_info = 0
+vmo_boot_code_info = 0
+
+[assertions.packet_fields]
+vmo_present = 1
+vmo_failure_step = 0
+vmo_info_kind = 0
+vmo_info_backing_scope = 0
+vmo_info_flags = 31
+vmo_info_size = 4096
+vmo_boot_code_kind = 3
+vmo_boot_code_backing_scope = 1
+vmo_boot_code_flags = 9
+vmo_boot_code_size_nonzero = 1

@@ -813,3 +813,13 @@ args = [
   { name = "resource_index", ty = "u32" },
   { name = "out_info", ty = "*mut ax_pci_resource_info_t" },
 ]
+
+[[syscall]]
+name = "ax_vmo_get_info"
+nr = 71
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "out_info", ty = "*mut ax_vmo_info_t" },
+]

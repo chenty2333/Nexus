@@ -173,6 +173,20 @@ That host gate now explicitly covers:
     - writes `perfetto-trace.json` with the full bootstrap trace timeline
   - `just perf-smoke-kvm-archive` then snapshots that run into the same
     `target/perf-smoke-baselines/` archive layout used by real-machine captures
+- Bootstrap VM coverage now also includes one narrow object-metadata gate:
+  - `kernel.vmo.info_bootstrap`
+  - one anonymous VMO must report the current public local-private object
+    contract:
+    - `Anonymous`
+    - `LocalPrivate`
+    - resizable + COW-capable + kernel-readable/kernel-writable flags
+    - size `4096`
+  - one bootstrap code-image VMO must report the current public
+    pager-backed/shared object contract:
+    - `PagerBacked`
+    - `GlobalShared`
+    - read-only shared behavior flags
+    - non-zero logical size
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - two ring3 worker threads act as minimal device-side peers, one queue pair each
   - one bootstrap `PciDevice` handle is now seeded into the runner shared-slot window

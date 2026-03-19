@@ -20,7 +20,8 @@
         not(axle_test_runner_rust_entry = "device_smoke"),
         not(axle_test_runner_rust_entry = "net_smoke"),
         not(axle_test_runner_rust_entry = "datagram_smoke"),
-        not(axle_test_runner_rust_entry = "smp_smoke")
+        not(axle_test_runner_rust_entry = "smp_smoke"),
+        not(axle_test_runner_rust_entry = "vmo_info_smoke")
     ),
     forbid(unsafe_code)
 )]
@@ -32,7 +33,8 @@
         axle_test_runner_rust_entry = "device_smoke",
         axle_test_runner_rust_entry = "net_smoke",
         axle_test_runner_rust_entry = "datagram_smoke",
-        axle_test_runner_rust_entry = "smp_smoke"
+        axle_test_runner_rust_entry = "smp_smoke",
+        axle_test_runner_rust_entry = "vmo_info_smoke"
     ),
     deny(unsafe_op_in_unsafe_fn)
 )]
@@ -44,7 +46,8 @@
         axle_test_runner_rust_entry = "device_smoke",
         axle_test_runner_rust_entry = "net_smoke",
         axle_test_runner_rust_entry = "datagram_smoke",
-        axle_test_runner_rust_entry = "smp_smoke"
+        axle_test_runner_rust_entry = "smp_smoke",
+        axle_test_runner_rust_entry = "vmo_info_smoke"
     ),
     deny(clippy::undocumented_unsafe_blocks)
 )]
@@ -73,6 +76,8 @@ mod reactor_smoke;
 mod smp_smoke;
 #[cfg(axle_test_runner_rust_entry = "net_smoke")]
 mod virtio_net_transport;
+#[cfg(axle_test_runner_rust_entry = "vmo_info_smoke")]
+mod vmo_info_smoke;
 
 #[cfg(axle_test_runner_rust_entry = "component_smoke")]
 #[panic_handler]
@@ -116,6 +121,12 @@ fn panic(_info: &PanicInfo) -> ! {
     smp_smoke::report_panic()
 }
 
+#[cfg(axle_test_runner_rust_entry = "vmo_info_smoke")]
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    vmo_info_smoke::report_panic()
+}
+
 #[cfg(all(
     not(axle_test_runner_rust_entry = "reactor_smoke"),
     not(axle_test_runner_rust_entry = "component_smoke"),
@@ -123,7 +134,8 @@ fn panic(_info: &PanicInfo) -> ! {
     not(axle_test_runner_rust_entry = "device_smoke"),
     not(axle_test_runner_rust_entry = "net_smoke"),
     not(axle_test_runner_rust_entry = "datagram_smoke"),
-    not(axle_test_runner_rust_entry = "smp_smoke")
+    not(axle_test_runner_rust_entry = "smp_smoke"),
+    not(axle_test_runner_rust_entry = "vmo_info_smoke")
 ))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

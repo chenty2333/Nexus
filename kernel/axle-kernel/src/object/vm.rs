@@ -211,6 +211,63 @@ pub fn create_contiguous_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_
     })
 }
 
+fn encode_vmo_kind(kind: axle_mm::VmoKind) -> u32 {
+    match kind {
+        axle_mm::VmoKind::Anonymous => axle_types::vmo::AX_VMO_KIND_ANONYMOUS,
+        axle_mm::VmoKind::Physical => axle_types::vmo::AX_VMO_KIND_PHYSICAL,
+        axle_mm::VmoKind::Contiguous => axle_types::vmo::AX_VMO_KIND_CONTIGUOUS,
+        axle_mm::VmoKind::PagerBacked => axle_types::vmo::AX_VMO_KIND_PAGER_BACKED,
+    }
+}
+
+fn encode_vmo_backing_scope(scope: VmoBackingScope) -> u32 {
+    match scope {
+        VmoBackingScope::LocalPrivate { .. } => axle_types::vmo::AX_VMO_BACKING_SCOPE_LOCAL_PRIVATE,
+        VmoBackingScope::GlobalShared => axle_types::vmo::AX_VMO_BACKING_SCOPE_GLOBAL_SHARED,
+    }
+}
+
+fn encode_vmo_flags(kind: axle_mm::VmoKind) -> u32 {
+    let mut flags = 0u32;
+    if kind.supports_kernel_read() {
+        flags |= axle_types::vmo::AX_VMO_INFO_FLAG_KERNEL_READ;
+    }
+    if kind.supports_kernel_write() {
+        flags |= axle_types::vmo::AX_VMO_INFO_FLAG_KERNEL_WRITE;
+    }
+    if kind.supports_resize() {
+        flags |= axle_types::vmo::AX_VMO_INFO_FLAG_RESIZABLE;
+    }
+    if kind.supports_copy_on_write() {
+        flags |= axle_types::vmo::AX_VMO_INFO_FLAG_COPY_ON_WRITE;
+    }
+    if kind.supports_page_loan() {
+        flags |= axle_types::vmo::AX_VMO_INFO_FLAG_PAGE_LOAN;
+    }
+    if kind.requires_resident_frames() {
+        flags |= axle_types::vmo::AX_VMO_INFO_FLAG_REQUIRES_RESIDENT_FRAMES;
+    }
+    flags
+}
+
+/// Read one narrow public VMO/object-model snapshot.
+pub fn vmo_get_info(handle: zx_handle_t) -> Result<axle_types::vmo::ax_vmo_info_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        state.with_objects(|objects| match objects.get(resolved.object_key()) {
+            Some(KernelObject::Vmo(vmo)) => Ok(axle_types::vmo::ax_vmo_info_t {
+                size_bytes: vmo.size_bytes(),
+                kind: encode_vmo_kind(vmo.kind()),
+                backing_scope: encode_vmo_backing_scope(vmo.backing_scope()),
+                flags: encode_vmo_flags(vmo.kind()),
+                reserved0: 0,
+            }),
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        })
+    })
+}
+
 /// Pin one physical/contiguous VMO range and return a DMA region handle.
 pub fn pin_vmo(
     handle: zx_handle_t,

@@ -292,6 +292,7 @@ pub(super) fn vmo_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::READ
         | crate::task::HandleRights::WRITE
         | crate::task::HandleRights::EXECUTE
+        | crate::task::HandleRights::INSPECT
         | crate::task::HandleRights::MAP
 }
 
@@ -300,6 +301,7 @@ pub(super) fn bootstrap_code_vmo_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::READ
         | crate::task::HandleRights::EXECUTE
+        | crate::task::HandleRights::INSPECT
         | crate::task::HandleRights::MAP
 }
 

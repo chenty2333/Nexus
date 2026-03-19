@@ -87,12 +87,22 @@ Current state:
     private page for that mapping instead of mutating the source VMO
   - this mapping-local private-clone path does not require VMO write rights on
     the source file-backed handle
+- `ax_vmo_get_info()` now exposes the first narrow public object snapshot over
+  that same contract:
+  - bootstrap code-image VMOs report `PagerBacked + GlobalShared`
+  - anonymous private-clone destinations report `Anonymous + LocalPrivate`
+  - the public fields are still limited to logical size, kind, backing scope,
+    and stable behavior flags
 
 What is not complete yet:
 
 - pager-backed VMOs are still only a narrow user-facing contract:
   - read-only shared handles
   - writable private-clone mappings
+- `ax_vmo_get_info()` is query-only:
+  - it does not externalize one pager object
+  - it does not provide a public write / resize / dirty-page interface for
+    pager-backed objects
 - there is no external pager object or full file-backed VMO interface
 - write/resize semantics for pager-backed objects are not public beyond
   mapping-local private-clone faults
@@ -192,6 +202,9 @@ What is still intentionally narrow:
   metadata.
 - Treat pager-backed/file-backed support as one narrow page-object contract:
   shared read-only source plus mapping-local private shadow on write.
+- Treat `ax_vmo_get_info()` as the current public metadata face of that
+  contract, not as evidence that pager/file-backed objects are already fully
+  externalized.
 - Treat the current physical / contiguous / interrupt surface as one minimal device-facing substrate:
   enough for bootstrap smoke, the current queue-owned user-mode net dataplane slice, the current
   bootstrap `PciDevice` + BAR0 transport smoke, the current generic PCI-resource discovery path,

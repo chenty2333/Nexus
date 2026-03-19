@@ -228,6 +228,41 @@ mov %rax, 8*65(%rbx)
 mov 0x16d0(%rbx), %rcx
 mov %rcx, 8*66(%rbx)
 
+// ax_vmo_get_info(vmo_h, &anon_vmo_info)
+mov 0x16d0(%rbx), %rdi
+lea 0x1ea0(%rbx), %rsi
+movabs $71, %rax
+int $0x80
+mov %rax, 8*1034(%rbx)
+mov 0x1ea8(%rbx), %eax
+mov %rax, 8*1035(%rbx)
+mov 0x1eac(%rbx), %eax
+mov %rax, 8*1036(%rbx)
+mov 0x1eb0(%rbx), %eax
+mov %rax, 8*1037(%rbx)
+mov 0x1ea0(%rbx), %rax
+mov %rax, 8*1038(%rbx)
+
+// ax_vmo_get_info(self_code_vmo_h, &boot_code_vmo_info)
+mov 8*506(%rbx), %rdi
+lea 0x1ec0(%rbx), %rsi
+movabs $71, %rax
+int $0x80
+mov %rax, 8*1039(%rbx)
+mov 0x1ec8(%rbx), %eax
+mov %rax, 8*1040(%rbx)
+mov 0x1ecc(%rbx), %eax
+mov %rax, 8*1041(%rbx)
+mov 0x1ed0(%rbx), %eax
+mov %rax, 8*1042(%rbx)
+movq $0, 8*1043(%rbx)
+mov 0x1ec0(%rbx), %rax
+mov %rax, 8*1044(%rbx)
+test %rax, %rax
+jz boot_code_vmo_info_size_done
+movq $1, 8*1043(%rbx)
+boot_code_vmo_info_size_done:
+
 // vmar_map(wrong type: vmar=timer_h)
 mov 0x1698(%rbx), %rdi
 movl $0x403, %esi          // ZX_VM_SPECIFIC | READ | WRITE

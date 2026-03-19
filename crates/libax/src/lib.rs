@@ -29,6 +29,7 @@ pub use axle_types::socket;
 pub use axle_types::status;
 pub use axle_types::syscall_numbers;
 pub use axle_types::vm;
+pub use axle_types::vmo;
 pub use axle_types::wait_async;
 pub use axle_types::{
     ax_clock_t, ax_dma_region_info_t, ax_dma_segment_info_t, ax_duration_t, ax_futex_t,
@@ -37,7 +38,7 @@ pub use axle_types::{
     ax_packet_type_t, ax_packet_user_t, ax_pci_bar_info_t, ax_pci_config_info_t,
     ax_pci_device_info_t, ax_pci_interrupt_info_t, ax_pci_interrupt_mode_info_t,
     ax_pci_resource_info_t, ax_port_packet_t, ax_rights_t, ax_signals_t, ax_status_t, ax_time_t,
-    ax_vaddr_t, ax_vm_option_t,
+    ax_vaddr_t, ax_vm_option_t, ax_vmo_info_t,
 };
 
 use axle_types::status::{AX_ERR_NO_MEMORY, AX_ERR_OUT_OF_RANGE, AX_OK};
@@ -500,6 +501,14 @@ pub fn ax_vmo_create_contiguous(size: u64, options: u32, out: &mut ax_handle_t) 
 pub fn ax_vmo_lookup_paddr(handle: ax_handle_t, offset: u64, out_paddr: &mut u64) -> ax_status_t {
     match narrow_handle(handle) {
         Ok(raw) => libzircon::ax_vmo_lookup_paddr(raw, offset, out_paddr),
+        Err(status) => status,
+    }
+}
+
+/// Read one narrow public VMO/object-model snapshot.
+pub fn ax_vmo_get_info(handle: ax_handle_t, out_info: &mut ax_vmo_info_t) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_vmo_get_info(raw, out_info),
         Err(status) => status,
     }
 }

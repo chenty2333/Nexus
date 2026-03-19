@@ -35,7 +35,7 @@ This file describes the current syscall-number source, trap entry, argument copy
   - it first gives guest-started carrier threads one chance to divert into the generic
     guest-session stop boundary
   - ordinary native userspace then falls through to the same shared syscall shell
-- The current bootstrap syscall ABI surface is `71` generated syscall numbers.
+- The current bootstrap syscall ABI surface is `72` generated syscall numbers.
 - `AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC` is now the distinct Linux-facing
   exec-prepare helper. It accepts one opaque exec-spec blob and produces the
   prepared entry/stack pair without overloading the generic native launch path.
@@ -104,6 +104,7 @@ The current bootstrap syscall surface includes:
 - interrupt create / ack / mask / unmask
 - interrupt get-info
 - VMO create / read / write / set size
+- VMO get-info
 - VMO create physical / create contiguous / lookup backing paddr / pin DMA region
 - DMA-region lookup backing paddr
 - DMA-region lookup device-visible IOVA
@@ -151,6 +152,12 @@ The current bootstrap syscall surface includes:
 - The public `ax_*` naming and the live handle codec are now aligned: handles travel through the
   syscall boundary at full native 64-bit width.
 - The current device-facing syscall surface is intentionally narrow:
+  - `ax_vmo_get_info()` is now the first narrow public VMO object-metadata query:
+    - logical size in bytes
+    - VMO kind (`Anonymous` / `Physical` / `Contiguous` / `PagerBacked`)
+    - backing scope (`LocalPrivate` / `GlobalShared`)
+    - behavior flags such as resizable / COW-capable / kernel-readable
+    - it does not expose hot residency, dirty state, or per-page fault truth
   - `interrupt_create()` only accepts `ZX_INTERRUPT_VIRTUAL`
   - `interrupt_get_info()` is now the first narrow metadata query over an interrupt object:
     - delivery mode

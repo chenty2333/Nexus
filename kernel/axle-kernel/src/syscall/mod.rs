@@ -33,8 +33,8 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
     AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
     AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE,
-    AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_AX_VMO_PIN,
-    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
+    AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_AX_VMO_GET_INFO, AXLE_SYS_AX_VMO_LOOKUP_PADDR,
+    AXLE_SYS_AX_VMO_PIN, AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
     AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_FUTEX_GET_OWNER, AXLE_SYS_FUTEX_REQUEUE,
     AXLE_SYS_FUTEX_WAIT, AXLE_SYS_FUTEX_WAKE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
     AXLE_SYS_HANDLE_REPLACE, AXLE_SYS_INTERRUPT_ACK, AXLE_SYS_INTERRUPT_CREATE,
@@ -53,13 +53,13 @@ use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
 };
 use axle_types::{
-    ax_guest_x64_regs_t, zx_clock_t, zx_duration_t, zx_futex_t, zx_handle_t, zx_koid_t,
-    zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t,
+    ax_guest_x64_regs_t, ax_vmo_info_t, zx_clock_t, zx_duration_t, zx_futex_t, zx_handle_t,
+    zx_koid_t, zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t,
     zx_vm_option_t,
 };
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 71] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 72] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
@@ -104,6 +104,7 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 71] = [
     AXLE_SYS_VMO_READ,
     AXLE_SYS_VMO_WRITE,
     AXLE_SYS_VMO_SET_SIZE,
+    AXLE_SYS_AX_VMO_GET_INFO,
     AXLE_SYS_AX_VMO_LOOKUP_PADDR,
     AXLE_SYS_AX_VMO_PIN,
     AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR,
@@ -760,6 +761,14 @@ fn writeback_koid(
 }
 
 fn writeback_u64(_ctx: &mut SyscallCtx, out: OutValue<u64>, value: u64) -> Result<(), zx_status_t> {
+    write_out_value(out, value)
+}
+
+fn writeback_vmo_info(
+    _ctx: &mut SyscallCtx,
+    out: OutValue<ax_vmo_info_t>,
+    value: ax_vmo_info_t,
+) -> Result<(), zx_status_t> {
     write_out_value(out, value)
 }
 
@@ -1477,6 +1486,34 @@ const VMO_CREATE_CONTIGUOUS_DISPATCH: SyscallDispatch =
     SyscallDispatch::new(vmo_create_contiguous_entry);
 
 type VmoLookupPaddrRequest = (zx_handle_t, u64);
+
+type VmoGetInfoRequest = zx_handle_t;
+
+fn decode_ax_vmo_get_info(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<VmoGetInfoRequest, OutValue<ax_vmo_info_t>>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        ctx.arg_handle(args, 0)?,
+        ctx.decode_out_value::<ax_vmo_info_t>(args, 1)?,
+    ))
+}
+
+fn run_ax_vmo_get_info(req: VmoGetInfoRequest) -> Result<ax_vmo_info_t, zx_status_t> {
+    crate::object::vm::vmo_get_info(req)
+}
+
+typed_syscall!(
+    AX_VMO_GET_INFO_TYPED,
+    ax_vmo_get_info_entry,
+    VmoGetInfoRequest,
+    OutValue<ax_vmo_info_t>,
+    ax_vmo_info_t,
+    decode_ax_vmo_get_info,
+    run_ax_vmo_get_info,
+    writeback_vmo_info
+);
+const AX_VMO_GET_INFO_DISPATCH: SyscallDispatch = SyscallDispatch::new(ax_vmo_get_info_entry);
 
 fn decode_ax_vmo_lookup_paddr(
     ctx: &mut SyscallCtx,
@@ -3479,6 +3516,7 @@ fn syscall_dispatch(nr: SyscallNumber) -> Option<&'static SyscallDispatch> {
         AXLE_SYS_VMO_READ => Some(&VMO_READ_DISPATCH),
         AXLE_SYS_VMO_WRITE => Some(&VMO_WRITE_DISPATCH),
         AXLE_SYS_VMO_SET_SIZE => Some(&VMO_SET_SIZE_DISPATCH),
+        AXLE_SYS_AX_VMO_GET_INFO => Some(&AX_VMO_GET_INFO_DISPATCH),
         AXLE_SYS_AX_VMO_LOOKUP_PADDR => Some(&AX_VMO_LOOKUP_PADDR_DISPATCH),
         AXLE_SYS_AX_VMO_PIN => Some(&AX_VMO_PIN_DISPATCH),
         AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR => Some(&AX_DMA_REGION_LOOKUP_PADDR_DISPATCH),

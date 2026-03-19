@@ -144,3 +144,5 @@ pub const AXLE_SYS_AX_DMA_REGION_GET_SEGMENT: SyscallNumber = 68;
 pub const AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE_COUNT: SyscallNumber = 69;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE: SyscallNumber = 70;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_VMO_GET_INFO: SyscallNumber = 71;

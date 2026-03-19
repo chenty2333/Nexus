@@ -865,6 +865,84 @@ pub use pci::{
     zx_pci_device_info_t, zx_pci_interrupt_info_t, zx_pci_interrupt_mode_info_t,
     zx_pci_resource_info_t,
 };
+/// Narrow VMO/object-model metadata.
+pub mod vmo {
+    /// Anonymous/private VMO.
+    pub const AX_VMO_KIND_ANONYMOUS: u32 = 0;
+    /// Fixed physical span VMO.
+    pub const AX_VMO_KIND_PHYSICAL: u32 = 1;
+    /// Physically contiguous VMO.
+    pub const AX_VMO_KIND_CONTIGUOUS: u32 = 2;
+    /// Read-only pager/file-backed shared source VMO.
+    pub const AX_VMO_KIND_PAGER_BACKED: u32 = 3;
+
+    /// Anonymous/private VMO.
+    pub const ZX_VMO_KIND_ANONYMOUS: u32 = AX_VMO_KIND_ANONYMOUS;
+    /// Fixed physical span VMO.
+    pub const ZX_VMO_KIND_PHYSICAL: u32 = AX_VMO_KIND_PHYSICAL;
+    /// Physically contiguous VMO.
+    pub const ZX_VMO_KIND_CONTIGUOUS: u32 = AX_VMO_KIND_CONTIGUOUS;
+    /// Read-only pager/file-backed shared source VMO.
+    pub const ZX_VMO_KIND_PAGER_BACKED: u32 = AX_VMO_KIND_PAGER_BACKED;
+
+    /// Backing is local to one address space and not shared across unrelated mappings.
+    pub const AX_VMO_BACKING_SCOPE_LOCAL_PRIVATE: u32 = 0;
+    /// Backing is one globally shared source object.
+    pub const AX_VMO_BACKING_SCOPE_GLOBAL_SHARED: u32 = 1;
+
+    /// Backing is local to one address space and not shared across unrelated mappings.
+    pub const ZX_VMO_BACKING_SCOPE_LOCAL_PRIVATE: u32 = AX_VMO_BACKING_SCOPE_LOCAL_PRIVATE;
+    /// Backing is one globally shared source object.
+    pub const ZX_VMO_BACKING_SCOPE_GLOBAL_SHARED: u32 = AX_VMO_BACKING_SCOPE_GLOBAL_SHARED;
+
+    /// Kernel byte-oriented reads are permitted.
+    pub const AX_VMO_INFO_FLAG_KERNEL_READ: u32 = 1 << 0;
+    /// Kernel byte-oriented writes are permitted.
+    pub const AX_VMO_INFO_FLAG_KERNEL_WRITE: u32 = 1 << 1;
+    /// Object size may change after creation.
+    pub const AX_VMO_INFO_FLAG_RESIZABLE: u32 = 1 << 2;
+    /// Mappings may arm copy-on-write over this source.
+    pub const AX_VMO_INFO_FLAG_COPY_ON_WRITE: u32 = 1 << 3;
+    /// Mappings may participate in page-loan transfer.
+    pub const AX_VMO_INFO_FLAG_PAGE_LOAN: u32 = 1 << 4;
+    /// Fault/install requires one resident frame before mapping becomes present.
+    pub const AX_VMO_INFO_FLAG_REQUIRES_RESIDENT_FRAMES: u32 = 1 << 5;
+
+    /// Kernel byte-oriented reads are permitted.
+    pub const ZX_VMO_INFO_FLAG_KERNEL_READ: u32 = AX_VMO_INFO_FLAG_KERNEL_READ;
+    /// Kernel byte-oriented writes are permitted.
+    pub const ZX_VMO_INFO_FLAG_KERNEL_WRITE: u32 = AX_VMO_INFO_FLAG_KERNEL_WRITE;
+    /// Object size may change after creation.
+    pub const ZX_VMO_INFO_FLAG_RESIZABLE: u32 = AX_VMO_INFO_FLAG_RESIZABLE;
+    /// Mappings may arm copy-on-write over this source.
+    pub const ZX_VMO_INFO_FLAG_COPY_ON_WRITE: u32 = AX_VMO_INFO_FLAG_COPY_ON_WRITE;
+    /// Mappings may participate in page-loan transfer.
+    pub const ZX_VMO_INFO_FLAG_PAGE_LOAN: u32 = AX_VMO_INFO_FLAG_PAGE_LOAN;
+    /// Fault/install requires one resident frame before mapping becomes present.
+    pub const ZX_VMO_INFO_FLAG_REQUIRES_RESIDENT_FRAMES: u32 =
+        AX_VMO_INFO_FLAG_REQUIRES_RESIDENT_FRAMES;
+
+    /// One narrow public VMO/object-model snapshot.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ax_vmo_info_t {
+        /// Current object size in bytes.
+        pub size_bytes: u64,
+        /// One `AX_VMO_KIND_*` discriminator.
+        pub kind: u32,
+        /// One `AX_VMO_BACKING_SCOPE_*` discriminator.
+        pub backing_scope: u32,
+        /// Capability/behavior flags for this VMO kind.
+        pub flags: u32,
+        /// Reserved for later expansion.
+        pub reserved0: u32,
+    }
+
+    /// Frozen Zircon-compat alias over the native VMO-info record.
+    pub type zx_vmo_info_t = ax_vmo_info_t;
+}
+
+pub use vmo::{ax_vmo_info_t, zx_vmo_info_t};
 
 /// VM mapping and protection options.
 ///

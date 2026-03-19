@@ -30,6 +30,7 @@ pub use axle_types::socket;
 pub use axle_types::status;
 pub use axle_types::syscall_numbers;
 pub use axle_types::vm;
+pub use axle_types::vmo;
 pub use axle_types::wait_async;
 pub use axle_types::{
     ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_interp_header_t,
@@ -38,7 +39,7 @@ pub use axle_types::{
     zx_packet_type_t, zx_packet_user_t, zx_pci_bar_info_t, zx_pci_config_info_t,
     zx_pci_device_info_t, zx_pci_interrupt_info_t, zx_pci_interrupt_mode_info_t,
     zx_pci_resource_info_t, zx_port_packet_t, zx_rights_t, zx_signals_t, zx_status_t, zx_time_t,
-    zx_vaddr_t, zx_vm_option_t,
+    zx_vaddr_t, zx_vm_option_t, zx_vmo_info_t,
 };
 
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
@@ -56,8 +57,8 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
     AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
     AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE,
-    AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_AX_VMO_PIN,
-    AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
+    AXLE_SYS_AX_THREAD_START_GUEST, AXLE_SYS_AX_VMO_GET_INFO, AXLE_SYS_AX_VMO_LOOKUP_PADDR,
+    AXLE_SYS_AX_VMO_PIN, AXLE_SYS_CHANNEL_CREATE, AXLE_SYS_CHANNEL_READ, AXLE_SYS_CHANNEL_WRITE,
     AXLE_SYS_EVENTPAIR_CREATE, AXLE_SYS_HANDLE_CLOSE, AXLE_SYS_HANDLE_DUPLICATE,
     AXLE_SYS_INTERRUPT_ACK, AXLE_SYS_INTERRUPT_CREATE, AXLE_SYS_INTERRUPT_GET_INFO,
     AXLE_SYS_INTERRUPT_MASK, AXLE_SYS_INTERRUPT_UNMASK, AXLE_SYS_OBJECT_SIGNAL,
@@ -583,6 +584,14 @@ pub fn ax_vmo_lookup_paddr(handle: zx_handle_t, offset: u64, out_paddr: &mut u64
     native_call(
         AXLE_SYS_AX_VMO_LOOKUP_PADDR as u64,
         [handle, offset, out_paddr as *mut u64 as u64, 0, 0, 0],
+    )
+}
+
+/// Read one narrow public VMO/object-model snapshot.
+pub fn ax_vmo_get_info(handle: zx_handle_t, out_info: &mut zx_vmo_info_t) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_VMO_GET_INFO as u64,
+        [handle, out_info as *mut zx_vmo_info_t as u64, 0, 0, 0, 0],
     )
 }
 
