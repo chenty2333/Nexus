@@ -1,31 +1,6 @@
 use super::*;
 
 impl Kernel {
-    pub(crate) fn pop_runnable_thread(&mut self) -> Option<ThreadId> {
-        let current_cpu_id = self.current_cpu_id();
-        loop {
-            let thread_id = self
-                .cpu_scheduler_mut(current_cpu_id)
-                .run_queue
-                .pop_front()?;
-            self.note_run_queue_depth(thread_id, current_cpu_id, RQ_DEPTH_DEQUEUE_LOCAL);
-            let Some(thread) = self.threads.get_mut(&thread_id) else {
-                continue;
-            };
-            if thread.queued_on_cpu != Some(current_cpu_id) {
-                continue;
-            }
-            thread.queued_on_cpu = None;
-            if matches!(thread.state, ThreadState::Runnable) {
-                return Some(thread_id);
-            }
-        }
-    }
-
-    fn take_next_runnable_thread_for_current_cpu(&mut self) -> Option<ThreadId> {
-        self.pop_runnable_thread()
-    }
-
     fn activate_thread_on_current_cpu(
         &mut self,
         thread_id: ThreadId,

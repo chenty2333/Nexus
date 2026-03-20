@@ -2,10 +2,12 @@ use alloc::collections::VecDeque;
 
 use super::*;
 
+mod policy;
+mod runqueue;
 mod switch;
 mod wake;
 
-pub(crate) use wake::StartPlacementPolicy;
+pub(crate) use policy::StartPlacementPolicy;
 
 #[derive(Debug, Default)]
 pub(super) struct CpuSchedulerState {
@@ -30,10 +32,6 @@ impl CpuSchedulerState {
     }
 }
 
-const RQ_DEPTH_ENQUEUE_BACK: u16 = 1;
-const RQ_DEPTH_ENQUEUE_FRONT: u16 = 2;
-const RQ_DEPTH_DEQUEUE_LOCAL: u16 = 3;
-
 impl Kernel {
     fn cpu_scheduler(&self, cpu_id: usize) -> Result<&CpuSchedulerState, zx_status_t> {
         self.cpu_schedulers.get(&cpu_id).ok_or(ZX_ERR_BAD_STATE)
@@ -56,45 +54,6 @@ impl Kernel {
         self.current_cpu_scheduler()?
             .current_thread_id
             .ok_or(ZX_ERR_BAD_STATE)
-    }
-
-    pub(super) fn running_cpu_for_thread(&self, thread_id: ThreadId) -> Option<usize> {
-        self.cpu_schedulers.iter().find_map(|(&cpu_id, scheduler)| {
-            (scheduler.current_thread_id == Some(thread_id)).then_some(cpu_id)
-        })
-    }
-
-    fn cpu_is_online(&self, cpu_id: usize) -> bool {
-        self.cpu_schedulers
-            .get(&cpu_id)
-            .is_some_and(|scheduler| scheduler.online)
-    }
-
-    fn cpu_is_idle(&self, cpu_id: usize) -> bool {
-        self.cpu_schedulers.get(&cpu_id).is_some_and(|scheduler| {
-            scheduler.online
-                && scheduler.current_thread_id.is_none()
-                && scheduler.run_queue.is_empty()
-        })
-    }
-
-    fn first_idle_cpu_excluding(&self, excluded_cpu_id: usize) -> Option<usize> {
-        self.cpu_schedulers.iter().find_map(|(&cpu_id, scheduler)| {
-            (cpu_id != excluded_cpu_id
-                && scheduler.online
-                && scheduler.current_thread_id.is_none()
-                && scheduler.run_queue.is_empty())
-            .then_some(cpu_id)
-        })
-    }
-
-    fn note_run_queue_depth(&self, thread_id: ThreadId, cpu_id: usize, op: u16) {
-        let depth = self
-            .cpu_schedulers
-            .get(&cpu_id)
-            .map(|scheduler| scheduler.run_queue.len())
-            .unwrap_or(0);
-        crate::trace::record_run_queue_depth(thread_id, cpu_id, depth, op);
     }
 
     pub(super) fn maybe_nudge_idle_stealer(&mut self, donor_cpu_id: usize) {
