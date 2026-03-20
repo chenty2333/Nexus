@@ -60,13 +60,53 @@ pub(crate) fn write_header(mapped_base: u64, header: VirtioMmioHeader) {
 }
 
 pub(crate) fn read_queue_regs(mapped_base: u64, pair: usize) -> VirtioQueueRegs {
-    axle_virtio_transport::read_queue_regs(&read_regs(mapped_base), pair)
+    let tx = read_queue_state(mapped_base, tx_queue_index(pair));
+    let rx = read_queue_state(mapped_base, rx_queue_index(pair));
+    VirtioQueueRegs {
+        tx_queue_ready: tx.ready,
+        rx_queue_ready: rx.ready,
+        notify_value: if rx.complete_count != 0 {
+            rx.notify_value
+        } else {
+            tx.notify_value
+        },
+        interrupt_status: rx.interrupt_status,
+        tx_notify_count: tx.notify_count,
+        rx_complete_count: rx.complete_count,
+        tx_desc_addr: tx.desc_addr,
+        tx_avail_addr: tx.avail_addr,
+        tx_used_addr: tx.used_addr,
+        rx_desc_addr: rx.desc_addr,
+        rx_avail_addr: rx.avail_addr,
+        rx_used_addr: rx.used_addr,
+    }
 }
 
 pub(crate) fn write_queue_regs(mapped_base: u64, pair: usize, queue_regs: VirtioQueueRegs) {
-    let mut regs = read_regs(mapped_base);
-    axle_virtio_transport::write_queue_regs(&mut regs, pair, queue_regs);
-    write_regs(mapped_base, regs);
+    let tx_index = tx_queue_index(pair);
+    let rx_index = rx_queue_index(pair);
+
+    let mut tx = read_queue_state(mapped_base, tx_index);
+    tx.ready = queue_regs.tx_queue_ready;
+    tx.notify_value = queue_regs.notify_value;
+    tx.notify_count = queue_regs.tx_notify_count;
+    tx.desc_addr = queue_regs.tx_desc_addr;
+    tx.avail_addr = queue_regs.tx_avail_addr;
+    tx.used_addr = queue_regs.tx_used_addr;
+    write_queue_state(mapped_base, tx_index, tx);
+
+    let mut rx = read_queue_state(mapped_base, rx_index);
+    rx.ready = queue_regs.rx_queue_ready;
+    rx.notify_value = queue_regs.notify_value;
+    rx.complete_count = queue_regs.rx_complete_count;
+    rx.interrupt_status = queue_regs.interrupt_status;
+    rx.desc_addr = queue_regs.rx_desc_addr;
+    rx.avail_addr = queue_regs.rx_avail_addr;
+    rx.used_addr = queue_regs.rx_used_addr;
+    write_queue_state(mapped_base, rx_index, rx);
+
+    refresh_selected_queue_common(mapped_base, tx_index, tx);
+    refresh_selected_queue_common(mapped_base, rx_index, rx);
 }
 
 fn read_regs(mapped_base: u64) -> VirtioPciRegs {
@@ -77,6 +117,65 @@ fn read_regs(mapped_base: u64) -> VirtioPciRegs {
 fn write_regs(mapped_base: u64, regs: VirtioPciRegs) {
     // SAFETY: bootstrap setup and queue owners write the packed BAR0 image at explicit handoff points.
     unsafe { ptr::write_volatile(mapped_base as *mut VirtioPciRegs, regs) }
+}
+
+fn read_queue_state(
+    mapped_base: u64,
+    queue_index: usize,
+) -> axle_virtio_transport::VirtioQueueState {
+    let regs_ptr = mapped_base as *const VirtioPciRegs;
+    // SAFETY: the BAR0 register image is one valid mapped `VirtioPciRegs`, and this reads exactly
+    // one queue-state slot with volatile semantics.
+    unsafe { ptr::read_volatile(ptr::addr_of!((*regs_ptr).queues[queue_index])) }
+}
+
+fn write_queue_state(
+    mapped_base: u64,
+    queue_index: usize,
+    queue: axle_virtio_transport::VirtioQueueState,
+) {
+    let regs_ptr = mapped_base as *mut VirtioPciRegs;
+    // SAFETY: the BAR0 register image is one valid mapped `VirtioPciRegs`, and each queue-state
+    // slot has one writer per queue pair during the smoke transport.
+    unsafe { ptr::write_volatile(ptr::addr_of_mut!((*regs_ptr).queues[queue_index]), queue) }
+}
+
+fn refresh_selected_queue_common(
+    mapped_base: u64,
+    queue_index: usize,
+    queue: axle_virtio_transport::VirtioQueueState,
+) {
+    let regs_ptr = mapped_base as *mut VirtioPciRegs;
+    // SAFETY: the common-config header lives in the same mapped BAR0 register image; only the
+    // selected-queue mirror fields are updated, and only when the current selection matches this
+    // queue slot.
+    unsafe {
+        let selected = ptr::read_volatile(ptr::addr_of!((*regs_ptr).common.queue_select)) as usize;
+        if selected != queue_index {
+            return;
+        }
+        ptr::write_volatile(ptr::addr_of_mut!((*regs_ptr).common.queue_size), queue.size);
+        ptr::write_volatile(
+            ptr::addr_of_mut!((*regs_ptr).common.queue_enable),
+            queue.ready,
+        );
+        ptr::write_volatile(
+            ptr::addr_of_mut!((*regs_ptr).common.queue_notify_off),
+            queue.notify_off,
+        );
+        ptr::write_volatile(
+            ptr::addr_of_mut!((*regs_ptr).common.queue_desc_addr),
+            queue.desc_addr,
+        );
+        ptr::write_volatile(
+            ptr::addr_of_mut!((*regs_ptr).common.queue_avail_addr),
+            queue.avail_addr,
+        );
+        ptr::write_volatile(
+            ptr::addr_of_mut!((*regs_ptr).common.queue_used_addr),
+            queue.used_addr,
+        );
+    }
 }
 
 fn queue_desc_ptr(mapped_base: u64, queue_offset: u64, desc_index: usize) -> *mut VirtqDesc {
