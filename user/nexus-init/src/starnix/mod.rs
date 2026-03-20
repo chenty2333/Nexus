@@ -10,6 +10,7 @@ mod task;
 #[allow(unused_imports)]
 pub(in crate::starnix) use self::fs::anon_inode::LinuxItimerSpec;
 use self::fs::anon_inode::{EventFd, PidFd, PidFdState, SignalFd, SignalFdState, TimerFd};
+use self::fs::console::ConsoleFd;
 use self::fs::fd::{LinuxStatMetadata, ProcessResources};
 #[allow(unused_imports)]
 pub(in crate::starnix) use self::fs::fd::{
@@ -141,19 +142,19 @@ use axle_types::{
     ax_linux_exec_spec_header_t, zx_handle_t, zx_status_t,
 };
 use libax::{
-    AX_TIME_INFINITE, ax_eventpair_create, ax_guest_session_create, ax_guest_session_read_memory,
-    ax_guest_session_resume, ax_guest_session_write_memory, ax_guest_stop_state_read,
-    ax_guest_stop_state_write, ax_handle_close as zx_handle_close,
-    ax_handle_duplicate as zx_handle_duplicate, ax_linux_exec_spec_blob,
-    ax_linux_exec_spec_blob_with_interp, ax_object_signal, ax_object_wait_async,
-    ax_object_wait_one, ax_packet_user_t as zx_packet_user_t, ax_port_create as zx_port_create,
-    ax_port_packet_t as zx_port_packet_t, ax_port_queue as zx_port_queue,
-    ax_port_wait as zx_port_wait, ax_process_create as zx_process_create,
-    ax_process_prepare_linux_exec, ax_process_start_guest, ax_socket_create as zx_socket_create,
-    ax_status_result as zx_status_result, ax_task_kill as zx_task_kill,
-    ax_thread_create as zx_thread_create, ax_thread_get_guest_x64_fs_base,
-    ax_thread_set_guest_x64_fs_base, ax_thread_start_guest, ax_timer_cancel,
-    ax_timer_create_monotonic, ax_timer_set, ax_vmo_create as zx_vmo_create,
+    AX_TIME_INFINITE, ax_console_read, ax_console_write, ax_eventpair_create,
+    ax_guest_session_create, ax_guest_session_read_memory, ax_guest_session_resume,
+    ax_guest_session_write_memory, ax_guest_stop_state_read, ax_guest_stop_state_write,
+    ax_handle_close as zx_handle_close, ax_handle_duplicate as zx_handle_duplicate,
+    ax_linux_exec_spec_blob, ax_linux_exec_spec_blob_with_interp, ax_object_signal,
+    ax_object_wait_async, ax_object_wait_one, ax_packet_user_t as zx_packet_user_t,
+    ax_port_create as zx_port_create, ax_port_packet_t as zx_port_packet_t,
+    ax_port_queue as zx_port_queue, ax_port_wait as zx_port_wait,
+    ax_process_create as zx_process_create, ax_process_prepare_linux_exec, ax_process_start_guest,
+    ax_socket_create as zx_socket_create, ax_status_result as zx_status_result,
+    ax_task_kill as zx_task_kill, ax_thread_create as zx_thread_create,
+    ax_thread_get_guest_x64_fs_base, ax_thread_set_guest_x64_fs_base, ax_thread_start_guest,
+    ax_timer_cancel, ax_timer_create_monotonic, ax_timer_set, ax_vmo_create as zx_vmo_create,
 };
 use nexus_io::{
     DirectoryEntry, DirectoryEntryKind, FdFlags, FdOps, FdTable, OpenFileDescription, OpenFlags,
@@ -194,10 +195,14 @@ const LINUX_SYSCALL_MUNMAP: u64 = 11;
 const LINUX_SYSCALL_RT_SIGACTION: u64 = 13;
 const LINUX_SYSCALL_RT_SIGPROCMASK: u64 = 14;
 const LINUX_SYSCALL_RT_SIGRETURN: u64 = 15;
+const LINUX_SYSCALL_IOCTL: u64 = 16;
 const LINUX_SYSCALL_BRK: u64 = 12;
 const LINUX_SYSCALL_FCNTL: u64 = 72;
 const LINUX_SYSCALL_GETCWD: u64 = 79;
 const LINUX_SYSCALL_CHDIR: u64 = 80;
+const LINUX_SYSCALL_MKDIR: u64 = 83;
+const LINUX_SYSCALL_RMDIR: u64 = 84;
+const LINUX_SYSCALL_UNLINK: u64 = 87;
 const LINUX_SYSCALL_READLINK: u64 = 89;
 const LINUX_SYSCALL_GETPID: u64 = 39;
 const LINUX_SYSCALL_UNAME: u64 = 63;
@@ -216,6 +221,7 @@ const LINUX_SYSCALL_RECVMSG: u64 = 47;
 const LINUX_SYSCALL_SOCKETPAIR: u64 = 53;
 const LINUX_SYSCALL_CLONE: u64 = 56;
 const LINUX_SYSCALL_FORK: u64 = 57;
+const LINUX_SYSCALL_VFORK: u64 = 58;
 const LINUX_SYSCALL_EXECVE: u64 = 59;
 const LINUX_SYSCALL_WAIT4: u64 = 61;
 const LINUX_SYSCALL_KILL: u64 = 62;
@@ -242,7 +248,9 @@ const LINUX_SYSCALL_PIDFD_SEND_SIGNAL: u64 = 424;
 const LINUX_SYSCALL_FACCESSAT2: u64 = 439;
 const LINUX_SYSCALL_EXIT: u64 = 60;
 const LINUX_SYSCALL_OPENAT: u64 = 257;
+const LINUX_SYSCALL_MKDIRAT: u64 = 258;
 const LINUX_SYSCALL_NEWFSTATAT: u64 = 262;
+const LINUX_SYSCALL_UNLINKAT: u64 = 263;
 const LINUX_SYSCALL_EPOLL_CREATE1: u64 = 291;
 const LINUX_SYSCALL_DUP3: u64 = 292;
 const LINUX_SYSCALL_EXIT_GROUP: u64 = 231;
@@ -256,6 +264,7 @@ const LINUX_SOL_SOCKET: i32 = 1;
 const LINUX_SCM_RIGHTS: i32 = 1;
 const LINUX_AT_FDCWD: i32 = -100;
 const LINUX_AT_EACCESS: u64 = 0x200;
+const LINUX_AT_REMOVEDIR: u64 = 0x200;
 const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
 const LINUX_AT_STATX_FORCE_SYNC: u64 = 0x2000;
@@ -290,8 +299,11 @@ const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 const LINUX_CLONE_VM: u64 = 0x0000_0100;
 const LINUX_CLONE_FS: u64 = 0x0000_0200;
 const LINUX_CLONE_FILES: u64 = 0x0000_0400;
+const LINUX_CLONE_VFORK: u64 = 0x0000_4000;
 const LINUX_CLONE_SIGHAND: u64 = 0x0000_0800;
+const LINUX_CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 const LINUX_CLONE_SETTLS: u64 = 0x0008_0000;
+const LINUX_CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 const LINUX_CLONE_THREAD: u64 = 0x0001_0000;
 const LINUX_ARCH_SET_GS: u64 = 0x1001;
 const LINUX_ARCH_SET_FS: u64 = 0x1002;
@@ -354,6 +366,8 @@ const LINUX_DT_REG: u8 = 8;
 const LINUX_DT_LNK: u8 = 10;
 const LINUX_DT_SOCK: u8 = 12;
 const LINUX_S_IFIFO: u32 = 0o010000;
+const LINUX_S_IFMT: u32 = 0o170000;
+const LINUX_S_IFCHR: u32 = 0o020000;
 const LINUX_S_IFDIR: u32 = 0o040000;
 const LINUX_S_IFREG: u32 = 0o100000;
 const LINUX_S_IFSOCK: u32 = 0o140000;
@@ -379,6 +393,7 @@ const LINUX_ENOENT: i32 = 2;
 const LINUX_ENOTDIR: i32 = 20;
 const LINUX_EISDIR: i32 = 21;
 const LINUX_EINVAL: i32 = 22;
+const LINUX_ENOTTY: i32 = 25;
 const LINUX_ESPIPE: i32 = 29;
 const LINUX_ENOMEM: i32 = 12;
 const LINUX_EPIPE: i32 = 32;

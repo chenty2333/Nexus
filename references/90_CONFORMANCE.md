@@ -637,6 +637,13 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - VM fault contention and loan/COW paths
   - Nexus root-manager bring-up slices
   - staged Starnix bootstrap/runtime slices, including dynamic ELF and libc/runtime follow-on gates
+  - one interactive Starnix shell slice:
+    - `kernel.starnix.busybox_shell_bootstrap` boots `boot://root-starnix-shell`
+      and drives `busybox ash` over the QEMU serial console
+    - the current gate proves one narrow command set:
+      `echo`, `ls`, `cat`, `mkdir`, `rm`, and `ps`
+    - the gate uses a host-side shell driver so command pacing is stable and
+      does not depend on one best-effort `printf` burst into serial stdin
 
 ## Runner model
 
@@ -692,6 +699,11 @@ This makes contract coverage part of the repo workflow, not just informal docume
   `0x0100_0000` slot because the fixed 4 MiB bootstrap code backing lives in
   the same low-RAM identity map during bring-up; the higher slot keeps the raw
   QEMU loader image from being overwritten before the loader imports it.
+- The repo now also ships one user-facing Starnix shell recipe:
+  - `just starnix-shell`
+  - it boots the same `boot://root-starnix-shell` manifest used by the
+    conformance shell gate and leaves QEMU attached to the interactive serial
+    console instead of driving commands automatically
 - The bootstrap code window above 4 GiB now spans 16 MiB, which keeps the
   runtime dispatcher runner, current `nexus-init` manager images, and the
   shared summary pages from overlapping in the fixed bootstrap mapping.

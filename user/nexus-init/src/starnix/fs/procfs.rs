@@ -864,10 +864,12 @@ pub(in crate::starnix) fn stat_metadata_for_ops(
             LocalFdMetadataKind::Directory => LinuxStatMetadata {
                 mode: LINUX_S_IFDIR | 0o555,
                 size_bytes: metadata.size_bytes,
+                inode: metadata.inode,
             },
             LocalFdMetadataKind::RegularFile => LinuxStatMetadata {
                 mode: LINUX_S_IFREG | 0o444,
                 size_bytes: metadata.size_bytes,
+                inode: metadata.inode,
             },
         });
     }
@@ -875,18 +877,28 @@ pub(in crate::starnix) fn stat_metadata_for_ops(
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFIFO | 0o666,
             size_bytes: 0,
+            inode: 0x1000,
         });
     }
     if ops.as_any().is::<SocketFd>() {
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFSOCK | 0o666,
             size_bytes: 0,
+            inode: 0x1001,
         });
     }
     if ops.as_any().is::<PseudoNodeFd>() {
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFREG | 0o444,
             size_bytes: 0,
+            inode: 0x1002,
+        });
+    }
+    if ops.as_any().is::<ConsoleFd>() {
+        return Ok(LinuxStatMetadata {
+            mode: LINUX_S_IFCHR | 0o666,
+            size_bytes: 0,
+            inode: 0x1003,
         });
     }
     if ops.as_any().is::<ProcRootFd>()
@@ -898,12 +910,14 @@ pub(in crate::starnix) fn stat_metadata_for_ops(
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFDIR | 0o555,
             size_bytes: 0,
+            inode: ops as *const dyn FdOps as *const () as usize as u64,
         });
     }
     if let Some(text) = ops.as_any().downcast_ref::<ProcTextFd>() {
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFREG | 0o444,
             size_bytes: text.bytes.len() as u64,
+            inode: text as *const ProcTextFd as usize as u64,
         });
     }
     if let Some(proxy) = ops.as_any().downcast_ref::<ProcProxyFd>() {
@@ -913,12 +927,14 @@ pub(in crate::starnix) fn stat_metadata_for_ops(
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFREG | 0o444,
             size_bytes: 0,
+            inode: 0x1004,
         });
     }
     if ops.as_any().is::<PidFd>() {
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFREG | 0o444,
             size_bytes: 0,
+            inode: 0x1005,
         });
     }
     Err(ZX_ERR_NOT_SUPPORTED)

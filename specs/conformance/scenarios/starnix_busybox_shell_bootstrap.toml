@@ -1,0 +1,22 @@
+id = "kernel.starnix.busybox_shell_bootstrap"
+description = "starnix should boot into busybox ash on the serial console and run a small shell/applet set"
+tags = ["kernel", "starnix", "shell", "busybox", "bootstrap"]
+timeout_ms = 240000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/starnix-busybox-shell && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && NEXUS_INIT_ROOT_URL=boot://root-starnix-shell RUSTFLAGS='-C code-model=large -C debuginfo=0' cargo build -p nexus-init --target x86_64-unknown-none --target-dir \"$target_dir\" && PYTHONDONTWRITEBYTECODE=1 python tools/axle-conformance/scripts/drive_starnix_shell.py --kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\" --init \"$target_dir/x86_64-unknown-none/debug/nexus-init\" --timeout 90"
+]
+
+expect = [
+  "kernel: component manager bootstrap",
+  "shell-ok",
+  "ls-ok",
+  "cat-ok",
+  "mkdir-ok",
+  "rm-ok",
+  "ps-ok",
+  "root:x:0:0:root:/root:/bin/sh",
+]
+forbid = ["KERNEL PANIC", "#GP:"]

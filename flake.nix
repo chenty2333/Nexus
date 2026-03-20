@@ -51,6 +51,8 @@
             # Build
             mold
             just
+            patchelf
+            busybox
 
             # Virtualization
             qemu

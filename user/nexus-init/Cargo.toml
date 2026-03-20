@@ -13,6 +13,7 @@ path = "src/lib.rs"
 axle-arch-x86_64 = { path = "../../crates/axle-arch-x86_64", default-features = false }
 axle-types = { path = "../../crates/axle-types", default-features = false }
 axle-virtio-transport = { path = "../../crates/axle-virtio-transport", default-features = false }
+linked_list_allocator = { version = "0.10.5", default-features = false, features = ["use_spin"] }
 libax = { path = "../../crates/libax", default-features = false }
 libzircon = { path = "../../crates/libzircon", default-features = false }
 nexus-component = { path = "../../crates/nexus-component", default-features = false }

@@ -22,6 +22,10 @@ Legend:
   semantic tests.
 - New Linux syscall slices are lower priority unless they directly unblock the
   rounds below.
+- The first user-facing vertical slice after the freeze loop is now the
+  interactive shell path:
+  - keep chasing `busybox ash` / shell usability before widening Linux surface
+  - do not let shell bring-up bypass the hard constraints below
 
 ## Working definition
 
@@ -265,6 +269,8 @@ Work:
     heap/mmap `fork` clone slice
   - better `fork`
   - broader Linux fs/socket/signal semantics
+  - shell-oriented tty / pty / termios follow-on after the current
+    console-backed shell slice
 
 Exit criteria:
 

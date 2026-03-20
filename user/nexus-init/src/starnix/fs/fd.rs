@@ -4,6 +4,24 @@ use super::super::*;
 pub(in crate::starnix) struct LinuxStatMetadata {
     pub(in crate::starnix) mode: u32,
     pub(in crate::starnix) size_bytes: u64,
+    pub(in crate::starnix) inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::starnix) enum StdioMode {
+    Socket,
+    Console,
+}
+
+impl StdioMode {
+    pub(in crate::starnix) fn from_env(env: &[String]) -> Self {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix("NEXUS_STARNIX_STDIO="))
+            .map_or(Self::Socket, |value| match value {
+                "console" => Self::Console,
+                _ => Self::Socket,
+            })
+    }
 }
 
 pub(in crate::starnix) struct FsContext {
@@ -20,26 +38,47 @@ pub(in crate::starnix) struct ProcessResources {
 
 impl FsContext {
     fn new(
+        stdio_mode: StdioMode,
         stdout_handle: Option<zx_handle_t>,
         namespace: nexus_io::ProcessNamespace,
     ) -> Result<Self, zx_status_t> {
         let mut fd_table = FdTable::new();
-        let stdin_fd = fd_table.open(
-            Arc::new(PseudoNodeFd::new(None)),
-            OpenFlags::READABLE,
-            FdFlags::empty(),
-        )?;
-        if stdin_fd != 0 {
-            return Err(ZX_ERR_BAD_STATE);
-        }
-        if let Some(handle) = stdout_handle {
-            let install_result = (|| {
-                install_stdio_fd(&mut fd_table, handle, 1)?;
-                install_stdio_fd(&mut fd_table, handle, 2)?;
-                Ok::<(), zx_status_t>(())
-            })();
-            let _ = zx_handle_close(handle);
-            install_result?;
+        match stdio_mode {
+            StdioMode::Socket => {
+                let stdin_fd = fd_table.open(
+                    Arc::new(PseudoNodeFd::new(None)),
+                    OpenFlags::READABLE,
+                    FdFlags::empty(),
+                )?;
+                if stdin_fd != 0 {
+                    return Err(ZX_ERR_BAD_STATE);
+                }
+                if let Some(handle) = stdout_handle {
+                    let install_result = (|| {
+                        install_stdio_fd(&mut fd_table, handle, 1)?;
+                        install_stdio_fd(&mut fd_table, handle, 2)?;
+                        Ok::<(), zx_status_t>(())
+                    })();
+                    let _ = zx_handle_close(handle);
+                    install_result?;
+                }
+            }
+            StdioMode::Console => {
+                install_console_stdio_fd(&mut fd_table, OpenFlags::READABLE, 0)?;
+                install_console_stdio_fd(
+                    &mut fd_table,
+                    OpenFlags::READABLE | OpenFlags::WRITABLE,
+                    1,
+                )?;
+                install_console_stdio_fd(
+                    &mut fd_table,
+                    OpenFlags::READABLE | OpenFlags::WRITABLE,
+                    2,
+                )?;
+                if let Some(handle) = stdout_handle {
+                    let _ = zx_handle_close(handle);
+                }
+            }
         }
         Ok(Self {
             fd_table,
@@ -82,12 +121,13 @@ impl ProcessResources {
     pub(in crate::starnix) fn new(
         process_handle: zx_handle_t,
         root_vmar: zx_handle_t,
+        stdio_mode: StdioMode,
         stdout_handle: Option<zx_handle_t>,
         namespace: nexus_io::ProcessNamespace,
     ) -> Result<Self, zx_status_t> {
         Ok(Self {
             process_handle,
-            fs: FsContext::new(stdout_handle, namespace)?,
+            fs: FsContext::new(stdio_mode, stdout_handle, namespace)?,
             mm: LinuxMm::new(root_vmar)?,
         })
     }
@@ -396,6 +436,96 @@ impl ProcessResources {
         }
     }
 
+    pub(in crate::starnix) fn mkdirat(
+        &mut self,
+        session: zx_handle_t,
+        dirfd: i32,
+        path_addr: u64,
+        _mode: u64,
+    ) -> Result<u64, zx_status_t> {
+        let path = match read_guest_c_string(session, path_addr, LINUX_PATH_MAX) {
+            Ok(path) => path,
+            Err(status) => return Ok(linux_errno(map_guest_memory_status_to_errno(status))),
+        };
+        if path.is_empty() {
+            return Ok(linux_errno(LINUX_ENOENT));
+        }
+        let open_flags =
+            OpenFlags::READABLE | OpenFlags::WRITABLE | OpenFlags::CREATE | OpenFlags::DIRECTORY;
+        let result = if path.starts_with('/') || dirfd == LINUX_AT_FDCWD {
+            self.fs
+                .namespace
+                .open(path.as_str(), open_flags)
+                .map(|_| 0u64)
+                .or_else(|status| {
+                    Ok::<u64, zx_status_t>(linux_errno(map_fd_status_to_errno(status)))
+                })
+        } else {
+            self.fs
+                .fd_table
+                .openat(dirfd, path.as_str(), open_flags, FdFlags::empty())
+                .map(|fd| {
+                    let _ = self.fs.fd_table.close(fd);
+                    0u64
+                })
+                .or_else(|status| {
+                    Ok::<u64, zx_status_t>(linux_errno(map_fd_status_to_errno(status)))
+                })
+        }?;
+        Ok(result)
+    }
+
+    pub(in crate::starnix) fn unlinkat(
+        &mut self,
+        session: zx_handle_t,
+        dirfd: i32,
+        path_addr: u64,
+        flags: u64,
+    ) -> Result<u64, zx_status_t> {
+        if (flags & !LINUX_AT_REMOVEDIR) != 0 {
+            return Ok(linux_errno(LINUX_EINVAL));
+        }
+        let path = match read_guest_c_string(session, path_addr, LINUX_PATH_MAX) {
+            Ok(path) => path,
+            Err(status) => return Ok(linux_errno(map_guest_memory_status_to_errno(status))),
+        };
+        if path.is_empty() {
+            return Ok(linux_errno(LINUX_ENOENT));
+        }
+        let metadata = match self.stat_metadata_at_path(dirfd, path.as_str(), 0) {
+            Ok(metadata) => metadata,
+            Err(status) => return Ok(linux_errno(map_fd_status_to_errno(status))),
+        };
+        let removing_dir = (flags & LINUX_AT_REMOVEDIR) != 0;
+        let is_dir = (metadata.mode & LINUX_S_IFMT) == LINUX_S_IFDIR;
+        if removing_dir && !is_dir {
+            return Ok(linux_errno(LINUX_ENOTDIR));
+        }
+        if !removing_dir && is_dir {
+            return Ok(linux_errno(LINUX_EISDIR));
+        }
+        let result = if path.starts_with('/') || dirfd == LINUX_AT_FDCWD {
+            self.fs
+                .namespace
+                .unlink(path.as_str())
+                .map(|()| 0u64)
+                .or_else(|status| {
+                    Ok::<u64, zx_status_t>(linux_errno(map_fd_status_to_errno(status)))
+                })
+        } else {
+            let entry = self.fs.fd_table.get(dirfd).ok_or(ZX_ERR_BAD_HANDLE)?;
+            entry
+                .description()
+                .ops()
+                .unlinkat(path.as_str())
+                .map(|()| 0u64)
+                .or_else(|status| {
+                    Ok::<u64, zx_status_t>(linux_errno(map_fd_status_to_errno(status)))
+                })
+        }?;
+        Ok(result)
+    }
+
     pub(in crate::starnix) fn stat_fd(
         &self,
         session: zx_handle_t,
@@ -406,7 +536,7 @@ impl ProcessResources {
             Ok(metadata) => metadata,
             Err(status) => return Ok(linux_errno(map_fd_status_to_errno(status))),
         };
-        write_guest_stat(session, stat_addr, metadata, Some(fd as u64))
+        write_guest_stat(session, stat_addr, metadata, None)
     }
 
     pub(in crate::starnix) fn pread(
@@ -642,6 +772,19 @@ pub(in crate::starnix) fn install_stdio_fd(
     Ok(())
 }
 
+fn install_console_stdio_fd(
+    table: &mut FdTable,
+    open_flags: OpenFlags,
+    expected_fd: i32,
+) -> Result<(), zx_status_t> {
+    let fd = table.open(Arc::new(ConsoleFd::new()), open_flags, FdFlags::empty())?;
+    if fd != expected_fd {
+        let _ = table.close(fd);
+        return Err(ZX_ERR_BAD_STATE);
+    }
+    Ok(())
+}
+
 pub(in crate::starnix) fn write_guest_fd_pair(
     session: zx_handle_t,
     guest_addr: u64,
@@ -764,7 +907,7 @@ pub(in crate::starnix) fn write_guest_stat(
     ino_seed: Option<u64>,
 ) -> Result<u64, zx_status_t> {
     let mut bytes = [0u8; LINUX_STAT_STRUCT_BYTES];
-    let ino = ino_seed.unwrap_or(1);
+    let ino = ino_seed.unwrap_or(metadata.inode);
     bytes[8..16].copy_from_slice(&ino.to_ne_bytes());
     bytes[16..24].copy_from_slice(&1u64.to_ne_bytes());
     bytes[24..28].copy_from_slice(&metadata.mode.to_ne_bytes());
@@ -802,7 +945,7 @@ pub(in crate::starnix) fn write_guest_statx(
     } else {
         supported_mask & requested_mask
     };
-    let ino = ino_seed.unwrap_or(1);
+    let ino = ino_seed.unwrap_or(metadata.inode);
     let mut bytes = [0u8; LINUX_STATX_BYTES];
     bytes[0..4].copy_from_slice(&mask.to_ne_bytes());
     bytes[4..8].copy_from_slice(&4096u32.to_ne_bytes());

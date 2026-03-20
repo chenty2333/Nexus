@@ -722,6 +722,19 @@ forcing every syscall through one uniform RPC layer.
       the userspace executive
     - parent thread groups now also keep one minimal `SIGCHLD` stop / continue
       record for signalfd-visible observation
+  - one narrow interactive shell slice now also exists:
+    - `boot://root-starnix-shell` launches one `busybox ash` instance through
+      the Starnix runner
+    - the current shell path seeds a tiny bootstrap root with `/bin/busybox`
+      plus `/bin/{sh,ls,cat,echo,mkdir,rm,ps}`, `/etc/passwd`, `/proc`, and
+      writable `/tmp`
+    - `NEXUS_STARNIX_STDIO=console` currently binds stdio directly to the
+      bootstrap console fd so QEMU can enter an interactive shell without
+      adding Linux-only kernel objects
+    - the shell slice is intentionally narrow:
+      - `ash` still reports `can't access tty; job control turned off`
+      - no `devpts` / `ptmx` / `pty` stack yet
+      - no `tcsetpgrp`, `TIOCSPGRP`, or broader tty discipline yet
   - no restart blocks / `sigaltstack` yet
   - no epoll model yet
 - `fork` currently clones the Linux-side control plane and eagerly copies the

@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::{fs, os::unix::fs::PermissionsExt};
 
 fn main() {
     use std::fs;
@@ -68,6 +70,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-env-changed=NEXUS_INIT_ROOT_URL");
+    println!("cargo:rerun-if-env-changed=BUSYBOX");
     println!("cargo:rerun-if-changed={}", linux_hello_source.display());
     println!("cargo:rerun-if-changed={}", linux_fd_smoke_source.display());
     println!("cargo:rerun-if-changed={}", linux_round2_source.display());
@@ -219,6 +222,7 @@ fn main() {
         "root_component_starnix_dynamic_runtime.toml",
         "root_component_starnix_dynamic_pie.toml",
         "root_component_starnix_glibc_hello.toml",
+        "root_component_starnix_shell.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
@@ -248,6 +252,7 @@ fn main() {
         "linux_dynamic_runtime_smoke.toml",
         "linux_dynamic_pie_smoke.toml",
         "linux_glibc_hello.toml",
+        "linux_busybox_shell.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -368,6 +373,10 @@ fn main() {
             "root_component_starnix_glibc_hello.toml",
             "root_component_starnix_glibc_hello.nxcd",
         ),
+        (
+            "root_component_starnix_shell.toml",
+            "root_component_starnix_shell.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
@@ -454,6 +463,7 @@ fn main() {
             "linux_dynamic_pie_smoke.nxcd",
         ),
         ("linux_glibc_hello.toml", "linux_glibc_hello.nxcd"),
+        ("linux_busybox_shell.toml", "linux_busybox_shell.nxcd"),
     ] {
         let source_path = manifests_dir.join(input);
         let source = fs::read_to_string(&source_path)
@@ -598,6 +608,14 @@ fn main() {
         &out_dir.join("libc.so.6"),
     );
     copy_linux_runtime_asset(
+        &host_linux_runtime_path("libm.so.6"),
+        &out_dir.join("libm.so.6"),
+    );
+    copy_linux_runtime_asset(
+        &host_linux_runtime_path("libresolv.so.2"),
+        &out_dir.join("libresolv.so.2"),
+    );
+    copy_linux_runtime_asset(
         &host_linux_runtime_path("ld-linux-x86-64.so.2"),
         &out_dir.join("ld-nexus-glibc.so"),
     );
@@ -642,6 +660,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic_runtime)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic_pie)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_glibc_hello)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_shell)");
     match root_url.as_str() {
         "boot://root-starnix" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
@@ -723,6 +742,10 @@ fn main() {
         }
         "boot://root-starnix-glibc-hello" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_glibc_hello");
+        }
+        "boot://root-starnix-shell" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_shell");
+            embed_busybox_shell_assets(&out_dir);
         }
         _ => {}
     }
@@ -850,6 +873,169 @@ fn copy_linux_runtime_asset(source: &Path, output: &Path) {
     }
     std::fs::copy(source, output)
         .unwrap_or_else(|err| panic!("copy {} to {}: {err}", source.display(), output.display()));
+}
+
+fn embed_busybox_shell_assets(out_dir: &Path) {
+    let busybox = host_command_path("BUSYBOX", "busybox");
+    let output = out_dir.join("busybox");
+    if output.exists() {
+        std::fs::remove_file(&output).unwrap_or_else(|err| {
+            panic!(
+                "remove existing busybox asset {} before copy: {err}",
+                output.display()
+            )
+        });
+    }
+    std::fs::copy(&busybox, &output).unwrap_or_else(|err| {
+        panic!(
+            "copy busybox {} to {}: {err}",
+            busybox.display(),
+            output.display()
+        )
+    });
+    #[cfg(unix)]
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap_or_else(|err| {
+        panic!(
+            "set writable permissions on copied busybox {}: {err}",
+            output.display()
+        )
+    });
+    patch_elf_interp_and_runpath(&output, "/lib/ld-nexus-glibc.so", "/lib:/lib64");
+    copy_busybox_runtime_assets(&busybox, out_dir);
+}
+
+fn host_command_path(env_var: &str, fallback: &str) -> PathBuf {
+    if let Ok(path) = std::env::var(env_var) {
+        let candidate = PathBuf::from(path);
+        assert!(
+            candidate.is_absolute() && candidate.is_file(),
+            "{env_var} must point to one existing host executable, got {}",
+            candidate.display()
+        );
+        return candidate;
+    }
+    let output = Command::new("bash")
+        .arg("-lc")
+        .arg(format!("command -v {fallback}"))
+        .output()
+        .unwrap_or_else(|err| panic!("spawn bash -lc 'command -v {fallback}': {err}"));
+    if output.status.success() {
+        let printed = String::from_utf8(output.stdout)
+            .unwrap_or_else(|err| panic!("decode command -v {fallback} output: {err}"));
+        let path = parse_command_path_output(&printed, fallback);
+        assert!(
+            path.is_absolute() && path.is_file(),
+            "host executable {fallback} not found: {}",
+            path.display()
+        );
+        return path;
+    }
+    let nix_output = Command::new("nix")
+        .arg("develop")
+        .arg("-c")
+        .arg("bash")
+        .arg("-lc")
+        .arg(format!("command -v {fallback}"))
+        .output()
+        .unwrap_or_else(|err| panic!("spawn nix develop fallback for {fallback}: {err}"));
+    assert!(
+        nix_output.status.success(),
+        "command -v {fallback} failed locally ({:?}) and via nix develop ({:?})",
+        output.status.code(),
+        nix_output.status.code()
+    );
+    let printed = String::from_utf8(nix_output.stdout)
+        .unwrap_or_else(|err| panic!("decode nix develop command -v {fallback} output: {err}"));
+    let path = parse_command_path_output(&printed, fallback);
+    assert!(
+        path.is_absolute() && path.is_file(),
+        "host executable {fallback} not found after nix develop lookup: {}",
+        path.display()
+    );
+    path
+}
+
+fn parse_command_path_output(printed: &str, fallback: &str) -> PathBuf {
+    let candidate = printed
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with('/'))
+        .unwrap_or_else(|| {
+            panic!("command -v {fallback} did not print an absolute path: {printed}")
+        });
+    PathBuf::from(candidate)
+}
+
+fn copy_busybox_runtime_assets(busybox: &Path, out_dir: &Path) {
+    let ldd = host_command_path("LDD", "ldd");
+    let output = Command::new(&ldd)
+        .arg(busybox)
+        .output()
+        .unwrap_or_else(|err| panic!("spawn {} for {}: {err}", ldd.display(), busybox.display()));
+    assert!(
+        output.status.success(),
+        "{} {} failed with status {:?}",
+        ldd.display(),
+        busybox.display(),
+        output.status.code()
+    );
+    let printed = String::from_utf8(output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "decode {} output for {}: {err}",
+            ldd.display(),
+            busybox.display()
+        )
+    });
+    copy_linux_runtime_asset(
+        &parse_ldd_dependency(&printed, "ld-linux-x86-64.so.2"),
+        &out_dir.join("ld-nexus-glibc.so"),
+    );
+    copy_linux_runtime_asset(
+        &parse_ldd_dependency(&printed, "libc.so.6"),
+        &out_dir.join("libc.so.6"),
+    );
+    copy_linux_runtime_asset(
+        &parse_ldd_dependency(&printed, "libm.so.6"),
+        &out_dir.join("libm.so.6"),
+    );
+    copy_linux_runtime_asset(
+        &parse_ldd_dependency(&printed, "libresolv.so.2"),
+        &out_dir.join("libresolv.so.2"),
+    );
+}
+
+fn parse_ldd_dependency(printed: &str, name: &str) -> PathBuf {
+    for line in printed.lines() {
+        if !line.contains(name) {
+            continue;
+        }
+        let candidate = if let Some((_, rhs)) = line.split_once("=>") {
+            rhs.split_whitespace().next()
+        } else {
+            line.split_whitespace().next()
+        };
+        if let Some(path) = candidate {
+            let resolved = PathBuf::from(path.trim());
+            if resolved.is_absolute() && resolved.is_file() {
+                return resolved;
+            }
+        }
+    }
+    panic!("failed to resolve {name} from ldd output: {printed}");
+}
+
+fn patch_elf_interp_and_runpath(path: &Path, interp: &str, runpath: &str) {
+    let patchelf = host_command_path("PATCHELF", "patchelf");
+    let status = Command::new(&patchelf)
+        .arg("--set-interpreter")
+        .arg(interp)
+        .arg("--set-rpath")
+        .arg(runpath)
+        .arg(path)
+        .status()
+        .unwrap_or_else(|err| panic!("spawn {} for {}: {err}", patchelf.display(), path.display()));
+    assert!(status.success(), "patchelf {} failed", path.display());
 }
 
 fn build_linux_shared_binary(source: &Path, output: &Path, soname: &str) {

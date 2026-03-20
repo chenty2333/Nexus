@@ -89,6 +89,7 @@ pub(crate) enum LocalFdMetadataKind {
 pub(crate) struct LocalFdMetadata {
     pub(crate) kind: LocalFdMetadataKind,
     pub(crate) size_bytes: u64,
+    pub(crate) inode: u64,
 }
 
 pub(crate) fn local_fd_metadata(fd: &dyn FdOps) -> Option<LocalFdMetadata> {
@@ -96,6 +97,11 @@ pub(crate) fn local_fd_metadata(fd: &dyn FdOps) -> Option<LocalFdMetadata> {
         return Some(LocalFdMetadata {
             kind: LocalFdMetadataKind::Directory,
             size_bytes: 4096,
+            inode: fd
+                .as_any()
+                .downcast_ref::<LocalDirFd>()
+                .map(LocalDirFd::inode)
+                .unwrap_or(1),
         });
     }
     fd.as_any()
@@ -222,6 +228,10 @@ impl LocalDirFd {
     fn new(node: Arc<LocalDirectoryNode>) -> Self {
         Self { node }
     }
+
+    fn inode(&self) -> u64 {
+        Arc::as_ptr(&self.node) as usize as u64
+    }
 }
 
 impl FdOps for LocalDirFd {
@@ -294,7 +304,11 @@ impl FdOps for LocalDirFd {
                         return Err(ZX_ERR_NOT_FOUND);
                     }
                     if flags.contains(OpenFlags::DIRECTORY) {
-                        return Err(ZX_ERR_NOT_SUPPORTED);
+                        let created = Arc::new(LocalNode::Directory(Arc::new(
+                            LocalDirectoryNode::new(false),
+                        )));
+                        directory.insert_child(component, Arc::clone(&created))?;
+                        return wrap_local_node(created);
                     }
                     let created = Arc::new(LocalNode::MutableFile(Arc::new(
                         LocalMutableFileNode::default(),
@@ -439,9 +453,14 @@ impl LocalFileFd {
             LocalFileBacking::ReadOnly(file) => file.bytes.unwrap_or(&[]).len() as u64,
             LocalFileBacking::Mutable(file) => file.bytes.lock().len() as u64,
         };
+        let inode = match &self.backing {
+            LocalFileBacking::ReadOnly(file) => Arc::as_ptr(file) as usize as u64,
+            LocalFileBacking::Mutable(file) => Arc::as_ptr(file) as usize as u64,
+        };
         LocalFdMetadata {
             kind: LocalFdMetadataKind::RegularFile,
             size_bytes,
+            inode,
         }
     }
 

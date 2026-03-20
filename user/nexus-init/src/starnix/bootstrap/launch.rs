@@ -1,3 +1,4 @@
+use super::super::fs::fd::StdioMode;
 use super::super::*;
 
 use super::{
@@ -33,6 +34,7 @@ pub(super) fn run_executive(start_info: StarnixStartInfo) -> i32 {
     let mut stack_random_state = seed_runtime_random_state(parent_process, port, 1);
     let mut stack_random = [0u8; 16];
     fill_random_bytes(&mut stack_random_state, &mut stack_random);
+    let stdio_mode = StdioMode::from_env(&env);
     let task_image = match build_task_image(
         payload_path.as_str(),
         &args,
@@ -63,6 +65,7 @@ pub(super) fn run_executive(start_info: StarnixStartInfo) -> i32 {
     let mut resources = match ProcessResources::new(
         prepared.process_handle,
         prepared.root_vmar,
+        stdio_mode,
         stdout_handle,
         namespace,
     ) {

@@ -352,6 +352,8 @@ pub(super) fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx
             LINUX_GLIBC_HELLO_DECL_BYTES,
         ));
     }
+    crate::push_busybox_shell_runtime_assets(&mut assets);
+    crate::push_busybox_shell_decl_assets(&mut assets);
     let bootstrap = BootstrapNamespace::build(&assets)?;
     let mut mounts = bootstrap.namespace().mounts().clone();
     mounts.insert("/", bootstrap.boot_root())?;

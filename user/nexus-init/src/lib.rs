@@ -5,6 +5,8 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod fs;
 mod lifecycle;
@@ -20,7 +22,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::alloc::{GlobalAlloc, Layout};
+#[cfg(not(test))]
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axle_types::handle::ZX_HANDLE_INVALID;
@@ -30,6 +33,8 @@ use axle_types::{zx_handle_t, zx_status_t};
 use libax::compat::{
     ZX_TIME_INFINITE, zx_channel_create, zx_handle_close, zx_object_wait_one, zx_socket_read,
 };
+#[cfg(not(test))]
+use linked_list_allocator::LockedHeap;
 use nexus_component::{ControllerRequest, NamespaceEntry, ResolvedComponent, StartupMode};
 use nexus_io::{FdFlags, FdOps, FdTable, OpenFlags, ProcessNamespace, RemoteDir};
 
@@ -212,6 +217,10 @@ const ROOT_DECL_STARNIX_GLIBC_HELLO_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_glibc_hello.nxcd"
 ));
+const ROOT_DECL_STARNIX_SHELL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_shell.nxcd"
+));
 const ROOT_DECL_NET_DATAPLANE_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_net_dataplane.nxcd"
@@ -365,6 +374,11 @@ pub(crate) const LINUX_GLIBC_HELLO_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_glibc_hello.nxcd"));
 #[cfg(not(nexus_init_embed_starnix_glibc_hello))]
 pub(crate) const LINUX_GLIBC_HELLO_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_shell)]
+pub(crate) const LINUX_BUSYBOX_SHELL_DECL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux_busybox_shell.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_shell))]
+pub(crate) const LINUX_BUSYBOX_SHELL_DECL_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_hello)]
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
@@ -535,16 +549,30 @@ pub(crate) const LINUX_GLIBC_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-glibc-hello"));
 #[cfg(not(nexus_init_embed_starnix_glibc_hello))]
 pub(crate) const LINUX_GLIBC_HELLO_BYTES: &[u8] = &[];
-#[cfg(nexus_init_embed_starnix_glibc_hello)]
+#[cfg(any(nexus_init_embed_starnix_glibc_hello, nexus_init_embed_starnix_shell))]
 pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ld-nexus-glibc.so"));
-#[cfg(not(nexus_init_embed_starnix_glibc_hello))]
+#[cfg(not(any(nexus_init_embed_starnix_glibc_hello, nexus_init_embed_starnix_shell)))]
 pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_BYTES: &[u8] = &[];
-#[cfg(nexus_init_embed_starnix_glibc_hello)]
+#[cfg(any(nexus_init_embed_starnix_glibc_hello, nexus_init_embed_starnix_shell))]
 pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/libc.so.6"));
-#[cfg(not(nexus_init_embed_starnix_glibc_hello))]
+#[cfg(not(any(nexus_init_embed_starnix_glibc_hello, nexus_init_embed_starnix_shell)))]
 pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_shell)]
+pub(crate) const LINUX_BUSYBOX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox"));
+#[cfg(not(nexus_init_embed_starnix_shell))]
+pub(crate) const LINUX_BUSYBOX_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_shell)]
+pub(crate) const LINUX_GLIBC_RUNTIME_LIBM_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/libm.so.6"));
+#[cfg(not(nexus_init_embed_starnix_shell))]
+pub(crate) const LINUX_GLIBC_RUNTIME_LIBM_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_shell)]
+pub(crate) const LINUX_GLIBC_RUNTIME_RESOLV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/libresolv.so.2"));
+#[cfg(not(nexus_init_embed_starnix_shell))]
+pub(crate) const LINUX_GLIBC_RUNTIME_RESOLV_BYTES: &[u8] = &[];
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
 pub(crate) const CHILD_ROLE_CLIENT: &str = "echo-client";
@@ -591,11 +619,24 @@ pub(crate) const LINUX_DYNAMIC_PIE_SMOKE_BINARY_PATH: &str = "bin/linux-dynamic-
 pub(crate) const LINUX_DYNAMIC_PIE_MAIN_BINARY_PATH: &str = "bin/linux-dynamic-pie-main";
 pub(crate) const LINUX_DYNAMIC_PIE_INTERP_BINARY_PATH: &str = "lib/ld-nexus-dynamic-runtime.so";
 pub(crate) const LINUX_GLIBC_HELLO_BINARY_PATH: &str = "bin/linux-glibc-hello";
+pub(crate) const LINUX_BUSYBOX_BINARY_PATH: &str = "bin/busybox";
+pub(crate) const LINUX_BUSYBOX_SHELL_BINARY_PATH: &str = "bin/sh";
+pub(crate) const LINUX_BUSYBOX_LS_BINARY_PATH: &str = "bin/ls";
+pub(crate) const LINUX_BUSYBOX_CAT_BINARY_PATH: &str = "bin/cat";
+pub(crate) const LINUX_BUSYBOX_ECHO_BINARY_PATH: &str = "bin/echo";
+pub(crate) const LINUX_BUSYBOX_MKDIR_BINARY_PATH: &str = "bin/mkdir";
+pub(crate) const LINUX_BUSYBOX_RM_BINARY_PATH: &str = "bin/rm";
+pub(crate) const LINUX_BUSYBOX_PS_BINARY_PATH: &str = "bin/ps";
+pub(crate) const LINUX_BUSYBOX_PASSWD_PATH: &str = "etc/passwd";
 pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_BINARY_PATH: &str = "lib/ld-nexus-glibc.so";
 pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_CANONICAL_PATH: &str = "lib/ld-linux-x86-64.so.2";
 pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_LIB64_PATH: &str = "lib64/ld-linux-x86-64.so.2";
 pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_BINARY_PATH: &str = "lib/libc.so.6";
 pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_LIB64_PATH: &str = "lib64/libc.so.6";
+pub(crate) const LINUX_GLIBC_RUNTIME_LIBM_BINARY_PATH: &str = "lib/libm.so.6";
+pub(crate) const LINUX_GLIBC_RUNTIME_LIBM_LIB64_PATH: &str = "lib64/libm.so.6";
+pub(crate) const LINUX_GLIBC_RUNTIME_RESOLV_BINARY_PATH: &str = "lib/libresolv.so.2";
+pub(crate) const LINUX_GLIBC_RUNTIME_RESOLV_LIB64_PATH: &str = "lib64/libresolv.so.2";
 pub(crate) const SVC_NAMESPACE_PATH: &str = "/svc";
 pub(crate) const ECHO_PROTOCOL_NAME: &str = "nexus.echo.Echo";
 const ECHO_REQUEST: &[u8] = b"hello";
@@ -635,58 +676,114 @@ const STARNIX_DYNAMIC_TLS_EXPECTED_STDOUT: &[u8] = b"dynamic tls ok\n";
 const STARNIX_DYNAMIC_RUNTIME_EXPECTED_STDOUT: &[u8] = b"dynamic runtime ok\n";
 const STARNIX_DYNAMIC_PIE_EXPECTED_STDOUT: &[u8] = b"dynamic pie ok\n";
 const STARNIX_GLIBC_HELLO_EXPECTED_STDOUT: &[u8] = b"glibc hello\n";
+const STARNIX_SHELL_EXPECTED_STDOUT: &[u8] = b"";
+const LINUX_BUSYBOX_PASSWD_BYTES: &[u8] = b"root:x:0:0:root:/root:/bin/sh\n";
 
+pub(crate) fn push_busybox_shell_runtime_assets(assets: &mut Vec<BootAssetEntry>) {
+    if LINUX_BUSYBOX_BYTES.is_empty() {
+        return;
+    }
+    for path in [
+        LINUX_BUSYBOX_BINARY_PATH,
+        LINUX_BUSYBOX_SHELL_BINARY_PATH,
+        LINUX_BUSYBOX_LS_BINARY_PATH,
+        LINUX_BUSYBOX_CAT_BINARY_PATH,
+        LINUX_BUSYBOX_ECHO_BINARY_PATH,
+        LINUX_BUSYBOX_MKDIR_BINARY_PATH,
+        LINUX_BUSYBOX_RM_BINARY_PATH,
+        LINUX_BUSYBOX_PS_BINARY_PATH,
+    ] {
+        assets.push(BootAssetEntry::bytes(path, LINUX_BUSYBOX_BYTES));
+    }
+    assets.push(BootAssetEntry::bytes(
+        LINUX_GLIBC_RUNTIME_INTERP_BINARY_PATH,
+        LINUX_GLIBC_RUNTIME_INTERP_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_GLIBC_RUNTIME_LIBC_BINARY_PATH,
+        LINUX_GLIBC_RUNTIME_LIBC_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_GLIBC_RUNTIME_INTERP_CANONICAL_PATH,
+        LINUX_GLIBC_RUNTIME_INTERP_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_GLIBC_RUNTIME_INTERP_LIB64_PATH,
+        LINUX_GLIBC_RUNTIME_INTERP_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_GLIBC_RUNTIME_LIBC_LIB64_PATH,
+        LINUX_GLIBC_RUNTIME_LIBC_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_GLIBC_RUNTIME_LIBM_BINARY_PATH,
+        LINUX_GLIBC_RUNTIME_LIBM_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_GLIBC_RUNTIME_LIBM_LIB64_PATH,
+        LINUX_GLIBC_RUNTIME_LIBM_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_GLIBC_RUNTIME_RESOLV_BINARY_PATH,
+        LINUX_GLIBC_RUNTIME_RESOLV_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_GLIBC_RUNTIME_RESOLV_LIB64_PATH,
+        LINUX_GLIBC_RUNTIME_RESOLV_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        LINUX_BUSYBOX_PASSWD_PATH,
+        LINUX_BUSYBOX_PASSWD_BYTES,
+    ));
+}
+
+pub(crate) fn push_busybox_shell_decl_assets(assets: &mut Vec<BootAssetEntry>) {
+    if !LINUX_BUSYBOX_SHELL_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-busybox-shell.nxcd",
+            LINUX_BUSYBOX_SHELL_DECL_BYTES,
+        ));
+    }
+}
+
+#[cfg(not(test))]
 #[repr(align(16))]
 struct HeapStorage([u8; HEAP_BYTES]);
 
+#[cfg(not(test))]
 const HEAP_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(not(test))]
 static mut HEAP: HeapStorage = HeapStorage([0; HEAP_BYTES]);
-static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(test))]
+static HEAP_READY: AtomicBool = AtomicBool::new(false);
 static ROLE: AtomicUsize = AtomicUsize::new(ROLE_NONE);
 
-struct BumpAllocator;
-
+#[cfg(not(test))]
 #[global_allocator]
-static ALLOCATOR: BumpAllocator = BumpAllocator;
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: std::alloc::System = std::alloc::System;
 
-// SAFETY: this allocator serves one bootstrap userspace process at a time from
-// one fixed static buffer. Allocation is synchronized by the atomic bump
-// pointer, deallocation is a no-op, and alignment is preserved by monotonic
-// bumping.
-unsafe impl GlobalAlloc for BumpAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let align_mask = layout.align().saturating_sub(1);
-        let size = layout.size();
-        let mut current = HEAP_NEXT.load(Ordering::Relaxed);
-
-        loop {
-            let aligned = (current + align_mask) & !align_mask;
-            let Some(next) = aligned.checked_add(size) else {
-                return core::ptr::null_mut();
-            };
-            if next > HEAP_BYTES {
-                return core::ptr::null_mut();
-            }
-            match HEAP_NEXT.compare_exchange_weak(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // SAFETY: `HEAP` is the dedicated backing storage for this bump allocator.
-                    // Allocation is serialized by the atomic bump pointer, and callers only
-                    // receive disjoint regions within this static buffer.
-                    let base = unsafe { core::ptr::addr_of_mut!(HEAP.0).cast::<u8>() as usize };
-                    return (base + aligned) as *mut u8;
-                }
-                Err(observed) => current = observed,
-            }
+#[cfg(not(test))]
+fn init_heap_once() {
+    if HEAP_READY
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        // SAFETY: `HEAP` is the dedicated backing storage for this userspace process.
+        // Initialization happens exactly once under `HEAP_READY`, and the memory range
+        // remains reserved for the allocator for the entire process lifetime.
+        unsafe {
+            ALLOCATOR
+                .lock()
+                .init(core::ptr::addr_of_mut!(HEAP.0).cast::<u8>(), HEAP_BYTES);
         }
     }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 }
+
+#[cfg(test)]
+fn init_heap_once() {}
 
 #[derive(Clone, Copy, Default)]
 struct ComponentSummary {
@@ -715,6 +812,7 @@ struct ComponentSummary {
 }
 
 pub fn program_start(bootstrap_channel: zx_handle_t, arg1: u64) -> ! {
+    init_heap_once();
     if arg1 == CHILD_MARKER_STARNIX_KERNEL {
         ROLE.store(ROLE_CHILD, Ordering::Relaxed);
         starnix::starnix_kernel_program_start(bootstrap_channel);
@@ -748,6 +846,7 @@ pub fn report_panic() -> ! {
 
 /// Start the dedicated `echo-provider` component image.
 pub fn echo_provider_program_start(bootstrap_channel: zx_handle_t) -> ! {
+    init_heap_once();
     run_dedicated_child_component(
         bootstrap_channel,
         MinimalRole::Provider,
@@ -757,11 +856,13 @@ pub fn echo_provider_program_start(bootstrap_channel: zx_handle_t) -> ! {
 
 /// Start the dedicated `echo-client` component image.
 pub fn echo_client_program_start(bootstrap_channel: zx_handle_t) -> ! {
+    init_heap_once();
     run_dedicated_child_component(bootstrap_channel, MinimalRole::Client, CHILD_MARKER_CLIENT)
 }
 
 /// Start the dedicated `controller-worker` component image.
 pub fn controller_worker_program_start(bootstrap_channel: zx_handle_t) -> ! {
+    init_heap_once();
     run_dedicated_child_component(
         bootstrap_channel,
         MinimalRole::ControllerWorker,
@@ -1028,6 +1129,7 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             LINUX_GLIBC_RUNTIME_LIBC_BYTES,
         ));
     }
+    push_busybox_shell_runtime_assets(&mut assets);
     assets.push(BootAssetEntry::bytes(
         "manifests/root.nxcd",
         ROOT_DECL_EAGER_BYTES,
@@ -1139,6 +1241,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-glibc-hello.nxcd",
         ROOT_DECL_STARNIX_GLIBC_HELLO_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-shell.nxcd",
+        ROOT_DECL_STARNIX_SHELL_BYTES,
     ));
     assets.push(BootAssetEntry::bytes(
         "manifests/root-net-dataplane.nxcd",
@@ -1304,6 +1410,7 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
             LINUX_GLIBC_HELLO_DECL_BYTES,
         ));
     }
+    push_busybox_shell_decl_assets(&mut assets);
     assets.push(BootAssetEntry::bytes(
         "manifests/echo-provider.nxcd",
         PROVIDER_DECL_BYTES,
@@ -1662,6 +1769,16 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             &runners,
             "linux_glibc_hello",
             STARNIX_GLIBC_HELLO_EXPECTED_STDOUT,
+            summary,
+        );
+    }
+    if root.decl.url == "boot://root-starnix-shell" {
+        return run_starnix_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_busybox_shell",
+            STARNIX_SHELL_EXPECTED_STDOUT,
             summary,
         );
     }
