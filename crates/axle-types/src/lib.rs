@@ -968,6 +968,17 @@ pub mod vm {
     /// This requests one uncached device-style mapping attribute on the installed leaf PTEs.
     /// It is currently intended only for physical/contiguous device-facing VMOs.
     pub const AX_VM_MAP_MMIO: ax_vm_option_t = 1 << 5;
+    /// Native fork-clone policy: child mappings inherit this range through private COW.
+    ///
+    /// This freezes one mapping-level fork contract. A later `VMAR` clone helper may clone the
+    /// current mapping contents into a child mapping while re-arming both parent and child for
+    /// copy-on-write fault handling.
+    pub const AX_VM_CLONE_COW: ax_vm_option_t = 1 << 6;
+    /// Native fork-clone policy: child mappings inherit this range as one shared alias.
+    ///
+    /// This is intended for shared mappings whose backing truth should remain shared across the
+    /// clone boundary instead of snapshotting into private shadow state.
+    pub const AX_VM_CLONE_SHARE: ax_vm_option_t = 1 << 7;
     /// Native upper-bound interpretation for non-specific VMAR allocation.
     pub const AX_VM_OFFSET_IS_UPPER_LIMIT: ax_vm_option_t = 1 << 9;
     /// Native child VMAR may create readable mappings.
@@ -1019,6 +1030,10 @@ pub mod vm {
     pub const ZX_VM_PRIVATE_CLONE: zx_vm_option_t = AX_VM_PRIVATE_CLONE as zx_vm_option_t;
     /// Map one physical/contiguous VMO with device/MMIO cache attributes.
     pub const ZX_VM_MAP_MMIO: zx_vm_option_t = AX_VM_MAP_MMIO as zx_vm_option_t;
+    /// Clone this mapping into child address spaces through private COW semantics.
+    pub const ZX_VM_CLONE_COW: zx_vm_option_t = AX_VM_CLONE_COW as zx_vm_option_t;
+    /// Clone this mapping into child address spaces as one shared alias.
+    pub const ZX_VM_CLONE_SHARE: zx_vm_option_t = AX_VM_CLONE_SHARE as zx_vm_option_t;
     /// Interpret the supplied offset as an upper bound for non-specific VMAR allocation.
     pub const ZX_VM_OFFSET_IS_UPPER_LIMIT: zx_vm_option_t =
         AX_VM_OFFSET_IS_UPPER_LIMIT as zx_vm_option_t;

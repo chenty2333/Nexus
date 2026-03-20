@@ -128,7 +128,8 @@ use axle_types::status::{
     ZX_ERR_OUT_OF_RANGE, ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_OK,
 };
 use axle_types::syscall_numbers::{
-    AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
+    AXLE_SYS_AX_VMAR_CLONE_MAPPINGS, AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_MAP,
+    AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
 };
 use axle_types::vm::{
     ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ, ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE,
@@ -780,5 +781,12 @@ fn zx_vmar_protect_local(vmar: zx_handle_t, options: u32, addr: u64, len: u64) -
     axle_arch_x86_64::native_syscall(
         AXLE_SYS_VMAR_PROTECT as u64,
         [vmar, options as u64, addr, len, 0, 0],
+    )
+}
+
+fn ax_vmar_clone_mappings_local(src_vmar: zx_handle_t, dst_vmar: zx_handle_t) -> zx_status_t {
+    axle_arch_x86_64::native_syscall(
+        AXLE_SYS_AX_VMAR_CLONE_MAPPINGS as u64,
+        [src_vmar, dst_vmar, 0, 0, 0, 0],
     )
 }

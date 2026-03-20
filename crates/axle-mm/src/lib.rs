@@ -51,6 +51,17 @@ pub enum MappingCachePolicy {
     DeviceMmio,
 }
 
+/// Clone policy carried by one mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingClonePolicy {
+    /// This mapping does not participate in generic child-address-space cloning.
+    None,
+    /// Child address spaces inherit this mapping as one shared alias.
+    SharedAlias,
+    /// Child address spaces inherit this mapping through private copy-on-write semantics.
+    PrivateCow,
+}
+
 bitflags! {
     /// Relevant fault bits observed by the VM metadata layer.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1086,6 +1097,7 @@ pub struct Vma {
     len: u64,
     perms: MappingPerms,
     copy_on_write: bool,
+    clone_policy: MappingClonePolicy,
 }
 
 impl Vma {
@@ -1124,6 +1136,11 @@ impl Vma {
         self.copy_on_write
     }
 
+    /// Child-clone policy frozen for this mapping.
+    pub const fn clone_policy(self) -> MappingClonePolicy {
+        self.clone_policy
+    }
+
     fn end(self) -> u64 {
         self.base + self.len
     }
@@ -1155,6 +1172,7 @@ pub struct VmaLookup {
     max_perms: MappingPerms,
     cache_policy: MappingCachePolicy,
     copy_on_write: bool,
+    clone_policy: MappingClonePolicy,
     global_backed: bool,
     mapping_base: u64,
     mapping_len: u64,
@@ -1219,6 +1237,11 @@ impl VmaLookup {
     /// Whether the resolved mapping is currently armed for copy-on-write.
     pub const fn is_copy_on_write(self) -> bool {
         self.copy_on_write
+    }
+
+    /// Child-clone policy frozen for the resolved mapping.
+    pub const fn clone_policy(self) -> MappingClonePolicy {
+        self.clone_policy
     }
 
     /// Whether missing pages for this mapping fault through a shared/global backing source.
@@ -2418,6 +2441,35 @@ impl AddressSpace {
         max_perms: MappingPerms,
         cache_policy: MappingCachePolicy,
     ) -> Result<(), AddressSpaceError> {
+        self.map_fixed_in_vmar_with_mapping_policy(
+            frames,
+            vmar_id,
+            base,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            max_perms,
+            cache_policy,
+            MappingClonePolicy::None,
+        )
+    }
+
+    /// Install a fixed mapping into one VMAR with explicit cache and clone policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_fixed_in_vmar_with_mapping_policy(
+        &mut self,
+        frames: &mut FrameTable,
+        vmar_id: VmarId,
+        base: u64,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        max_perms: MappingPerms,
+        cache_policy: MappingCachePolicy,
+        clone_policy: MappingClonePolicy,
+    ) -> Result<(), AddressSpaceError> {
         validate_mapping_range(base, len)?;
         let vmar = self.vmar(vmar_id).ok_or(AddressSpaceError::InvalidVmar)?;
         if !max_perms.contains(perms) || !vmar.contains_range(base, len) {
@@ -2507,6 +2559,7 @@ impl AddressSpace {
             len,
             perms,
             copy_on_write: false,
+            clone_policy,
         };
         let page_meta = match self.build_pte_meta_range(map_rec, vma) {
             Ok(page_meta) => page_meta,
@@ -2604,6 +2657,37 @@ impl AddressSpace {
         align: u64,
         cache_policy: MappingCachePolicy,
     ) -> Result<u64, AddressSpaceError> {
+        self.map_anywhere_in_vmar_with_mapping_policy(
+            frames,
+            cpu_id,
+            vmar_id,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            max_perms,
+            align,
+            cache_policy,
+            MappingClonePolicy::None,
+        )
+    }
+
+    /// Install one non-specific mapping with explicit cache and clone policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_anywhere_in_vmar_with_mapping_policy(
+        &mut self,
+        frames: &mut FrameTable,
+        cpu_id: usize,
+        vmar_id: VmarId,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        max_perms: MappingPerms,
+        align: u64,
+        cache_policy: MappingCachePolicy,
+        clone_policy: MappingClonePolicy,
+    ) -> Result<u64, AddressSpaceError> {
         let vmar = self
             .vmar_record(vmar_id)
             .ok_or(AddressSpaceError::InvalidVmar)?;
@@ -2626,7 +2710,7 @@ impl AddressSpace {
             )
             .map(|(base, _)| base)
             .ok_or(AddressSpaceError::OutOfRange)?;
-        self.map_fixed_in_vmar_with_policy(
+        self.map_fixed_in_vmar_with_mapping_policy(
             frames,
             vmar_id,
             base,
@@ -2636,6 +2720,7 @@ impl AddressSpace {
             perms,
             max_perms,
             cache_policy,
+            clone_policy,
         )?;
         Ok(base)
     }
@@ -3034,6 +3119,7 @@ impl AddressSpace {
             len,
             perms,
             copy_on_write: vma.copy_on_write,
+            clone_policy: vma.clone_policy,
         };
         let page_meta = self.build_pte_meta_range(map_rec, vma)?;
         self.pte_meta.install_range(base, &page_meta)?;
@@ -3500,6 +3586,7 @@ impl AddressSpace {
             max_perms: resolved.map_rec.max_perms(),
             cache_policy: resolved.map_rec.cache_policy(),
             copy_on_write: resolved.meta.cow_shared(),
+            clone_policy: vma.clone_policy,
             global_backed: vmo.is_global_backed(),
             mapping_base: resolved.map_rec.base(),
             mapping_len: resolved.map_rec.len(),

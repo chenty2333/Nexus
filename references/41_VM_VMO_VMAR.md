@@ -52,6 +52,7 @@ This file describes the current VMO, VMAR, VMA, and address-space control-plane 
   - `base / len`
   - current permissions
   - mapping-wide COW bit
+  - mapping-level clone policy (`None` / `SharedAlias` / `PrivateCow`)
 - Per-page hot state lives in `PteMeta`.
 - Physical frame / reverse-map / pin / loan truth lives in `FrameTable`.
 - Reverse-map state is no longer only diagnostic metadata.
@@ -115,12 +116,20 @@ Current object/syscall paths support:
 - VMO read / write / resize
 - VMAR allocate / destroy
 - VMAR map / unmap / protect
+- VMAR clone for mappings whose clone policy is already part of VM truth:
+  - `ax_vmar_clone_mappings(src_vmar, dst_vmar)`
+  - the helper stays generic and clones Axle VM mappings, not Linux VMA trees
 - one narrow subrange split path for `unmap` / `protect`:
   - one exact-range fast path still exists for whole-mapping operations
   - one single-covering-VMA subrange path now exists for dynamic-loader style
     `MAP_FIXED` / `mprotect` surgery inside one larger mapping
   - multi-VMA range surgery is still intentionally out of scope
 - execute-capable VMAR map / protect when VMAR caps and handle rights allow it
+- mapping-level clone policy bits on `vmar_map()`:
+  - `ZX_VM_CLONE_COW`
+  - `ZX_VM_CLONE_SHARE`
+  - `ZX_VM_PRIVATE_CLONE` remains the source-handle-facing pager/file-backed
+    shadow path
 
 The metadata layer also validates overlap, mapping range, resize legality, and VMAR subtree ownership.
 
@@ -163,6 +172,13 @@ It is not fully implemented yet.
 - The external visibility rule is frozen even though the implementation detail stays internal:
   - relaxed vs strict commit remains an internal classification
   - syscall-return visibility and frame-reuse safety are externally visible and therefore fixed by contract
+- Mapping-level child-clone semantics are now also part of that public control
+  plane:
+  - `ZX_VM_CLONE_COW` freezes one child-visible COW clone policy on a mapping
+  - `ZX_VM_CLONE_SHARE` freezes one child-visible shared-alias clone policy on
+    a mapping
+  - `ax_vmar_clone_mappings()` is the first narrow public consumer of those
+    policies
 - Conformance gate:
   - contract: `must.vm.strict_tlb_visibility_phase1`
   - minimal scenario: `kernel.vm.strict_tlb_visibility_phase1`
@@ -191,6 +207,11 @@ It is not fully implemented yet.
     `GlobalShared`
   - the promotion is visible through both the imported handle and the original
     exporting handle that remains open in the parent
+- Root direct `fork` mappings now also have a first generic clone contract:
+  - Starnix `fork` no longer copies writable image ranges or the initial user
+    stack through guest byte loops
+  - instead it clones root-VMAR mappings through `ax_vmar_clone_mappings()`
+    using the same mapping-level clone policy already stored in VM truth
 - Physical / contiguous VMOs are now public as narrow bootstrap primitives, but the broader device
   model is still incomplete:
   - no BTI/pinning object

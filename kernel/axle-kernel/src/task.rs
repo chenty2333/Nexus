@@ -25,9 +25,9 @@ use axle_core::{
 use axle_mm::{
     AddressSpace as VmAddressSpace, AddressSpaceError, AddressSpaceId as VmAddressSpaceId,
     CowFaultResolution, FrameId, FrameTable, FutexKey, GlobalVmoId, LazyAnonFaultResolution,
-    LazyVmoFaultResolution, LoanToken, MapRec, MappingCachePolicy, MappingPerms, PageFaultDecision,
-    PageFaultFlags, PteMeta, PteMetaTag, ReverseMapAnchor, VmaLookup, Vmar, VmarAllocMode, VmarId,
-    VmarPlacementPolicy, Vmo, VmoId, VmoKind,
+    LazyVmoFaultResolution, LoanToken, MapRec, MappingCachePolicy, MappingClonePolicy,
+    MappingPerms, PageFaultDecision, PageFaultFlags, PteMeta, PteMetaTag, ReverseMapAnchor,
+    VmaLookup, Vmar, VmarAllocMode, VmarId, VmarPlacementPolicy, Vmo, VmoId, VmoKind,
 };
 use axle_page_table::{
     MappingCachePolicy as PtMappingCachePolicy, PageMapping, PageRange, PageTable, PageTableError,
@@ -55,6 +55,7 @@ use raw_cpuid::CpuId;
 use spin::Mutex;
 
 mod backing;
+mod clone;
 mod facade;
 pub(crate) mod fault;
 mod image;
@@ -1188,7 +1189,32 @@ impl AddressSpace {
         perms: MappingPerms,
         cache_policy: MappingCachePolicy,
     ) -> Result<(), AddressSpaceError> {
-        self.vm.map_fixed_in_vmar_with_policy(
+        self.map_vmo_fixed_with_mapping_policy(
+            frames,
+            vmar_id,
+            base,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            cache_policy,
+            MappingClonePolicy::None,
+        )
+    }
+
+    fn map_vmo_fixed_with_mapping_policy(
+        &mut self,
+        frames: &mut FrameTable,
+        vmar_id: VmarId,
+        base: u64,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        cache_policy: MappingCachePolicy,
+        clone_policy: MappingClonePolicy,
+    ) -> Result<(), AddressSpaceError> {
+        self.vm.map_fixed_in_vmar_with_mapping_policy(
             frames,
             vmar_id,
             base,
@@ -1198,6 +1224,7 @@ impl AddressSpace {
             perms,
             perms,
             cache_policy,
+            clone_policy,
         )
     }
 
@@ -1234,7 +1261,32 @@ impl AddressSpace {
         perms: MappingPerms,
         cache_policy: MappingCachePolicy,
     ) -> Result<u64, AddressSpaceError> {
-        self.vm.map_anywhere_in_vmar_with_policy(
+        self.map_vmo_anywhere_with_mapping_policy(
+            frames,
+            cpu_id,
+            vmar_id,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            cache_policy,
+            MappingClonePolicy::None,
+        )
+    }
+
+    fn map_vmo_anywhere_with_mapping_policy(
+        &mut self,
+        frames: &mut FrameTable,
+        cpu_id: usize,
+        vmar_id: VmarId,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        cache_policy: MappingCachePolicy,
+        clone_policy: MappingClonePolicy,
+    ) -> Result<u64, AddressSpaceError> {
+        self.vm.map_anywhere_in_vmar_with_mapping_policy(
             frames,
             cpu_id,
             vmar_id,
@@ -1245,6 +1297,7 @@ impl AddressSpace {
             perms,
             axle_mm::PAGE_SIZE,
             cache_policy,
+            clone_policy,
         )
     }
 
@@ -2066,6 +2119,7 @@ impl Kernel {
                 vmo_offset,
                 len,
                 perms,
+                MappingClonePolicy::None,
             )
         })?;
         self.apply_tlb_commit_reqs_current(&[req])?;
@@ -2092,6 +2146,7 @@ impl Kernel {
                 vmo_offset,
                 len,
                 perms,
+                MappingClonePolicy::None,
             )
         })?;
         self.apply_tlb_commit_reqs_current(&[req])?;

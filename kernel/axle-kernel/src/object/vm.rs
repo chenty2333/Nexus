@@ -638,6 +638,7 @@ pub fn vmar_map(
                 request.perms,
                 request.cache_policy,
                 request.private_clone,
+                request.clone_policy,
             )
         })?;
         state.apply_tlb_commit_reqs(&[tlb_commit])?;
@@ -713,6 +714,45 @@ pub fn vmar_protect(
     })
 }
 
+/// Clone all child-visible mappings from one VMAR into another.
+pub fn vmar_clone_mappings(
+    src_vmar_handle: zx_handle_t,
+    dst_vmar_handle: zx_handle_t,
+) -> Result<(), zx_status_t> {
+    with_state_mut(|state| {
+        let resolved_src =
+            state.lookup_handle(src_vmar_handle, crate::task::HandleRights::empty())?;
+        let resolved_dst =
+            state.lookup_handle(dst_vmar_handle, crate::task::HandleRights::empty())?;
+        let (src_vmar, dst_vmar) = state.with_objects(|objects| {
+            let src = match objects.get(resolved_src.object_key()) {
+                Some(KernelObject::Vmar(vmar)) => *vmar,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            let dst = match objects.get(resolved_dst.object_key()) {
+                Some(KernelObject::Vmar(vmar)) => *vmar,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            Ok((src, dst))
+        })?;
+
+        require_vmar_control_rights(resolved_src)?;
+        require_vmar_control_rights(resolved_dst)?;
+
+        let tlb_commits = state.with_vm_mut(|vm| {
+            vm.clone_vmar_mappings(
+                src_vmar.address_space_id,
+                src_vmar.vmar_id,
+                dst_vmar.address_space_id,
+                dst_vmar.vmar_id,
+            )
+        })?;
+        state.apply_tlb_commit_reqs(&tlb_commits)
+    })
+}
+
 pub(super) fn root_vmar_mapping_caps() -> VmarMappingCaps {
     VmarMappingCaps {
         max_perms: MappingPerms::READ
@@ -779,6 +819,8 @@ fn mapping_request_from_options(
         | ZX_VM_PERM_WRITE
         | ZX_VM_PERM_EXECUTE
         | ZX_VM_MAP_MMIO
+        | ZX_VM_CLONE_COW
+        | ZX_VM_CLONE_SHARE
         | ZX_VM_PRIVATE_CLONE
         | ZX_VM_SPECIFIC;
     if (options & !allowed) != 0 {
@@ -786,6 +828,8 @@ fn mapping_request_from_options(
     }
     let specific = (options & ZX_VM_SPECIFIC) != 0;
     let private_clone = (options & ZX_VM_PRIVATE_CLONE) != 0;
+    let clone_cow = (options & ZX_VM_CLONE_COW) != 0;
+    let clone_share = (options & ZX_VM_CLONE_SHARE) != 0;
     let cache_policy = if (options & ZX_VM_MAP_MMIO) != 0 {
         axle_mm::MappingCachePolicy::DeviceMmio
     } else {
@@ -800,12 +844,27 @@ fn mapping_request_from_options(
     if !has_read {
         return Err(ZX_ERR_INVALID_ARGS);
     }
+    if clone_cow && clone_share {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
     if private_clone && !has_write {
         return Err(ZX_ERR_INVALID_ARGS);
     }
-    if cache_policy == axle_mm::MappingCachePolicy::DeviceMmio && (private_clone || has_execute) {
+    if clone_cow && !has_write {
         return Err(ZX_ERR_INVALID_ARGS);
     }
+    if cache_policy == axle_mm::MappingCachePolicy::DeviceMmio
+        && (private_clone || clone_cow || clone_share || has_execute)
+    {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+    let clone_policy = if private_clone || clone_cow {
+        axle_mm::MappingClonePolicy::PrivateCow
+    } else if clone_share {
+        axle_mm::MappingClonePolicy::SharedAlias
+    } else {
+        axle_mm::MappingClonePolicy::None
+    };
 
     let mut perms = MappingPerms::READ | MappingPerms::USER;
     if has_write {
@@ -817,6 +876,7 @@ fn mapping_request_from_options(
     Ok(VmarMappingRequest {
         perms,
         cache_policy,
+        clone_policy,
         specific,
         private_clone,
     })

@@ -443,7 +443,7 @@ On x86_64 v1, guest `syscall` is still trap-driven rather than a new in-kernel
 Linux syscall fast path: with `EFER.SCE` disabled, a bound guest thread takes
 `#UD` on `syscall`, and the kernel converts that into the generic guest stop.
 
-### A generic MM clone helper is expected for `fork`
+### A generic MM clone helper is now landing for `fork`
 
 J2-B needs a way to clone one carrier address space for `fork`.
 
@@ -453,6 +453,16 @@ Round-0 freezes that this helper must stay generic:
 - it operates on carrier address spaces, VMARs, VMOs, and COW/share semantics
 - it preserves the existing Axle fault/COW/TLB contracts
 - it does not import Linux VMA trees or Linux process identity into the kernel
+
+That helper now exists in its first narrow form:
+
+- mapping-level child-clone policy lives in VM truth
+- `ax_vmar_clone_mappings(src_vmar, dst_vmar)` clones only mappings whose clone
+  policy is already frozen
+- Starnix `fork` now uses it for root direct mappings such as:
+  - writable image ranges
+  - the initial user stack
+- heap/mmap backing-handle synchronization remains userspace follow-on work
 
 The Linux `LinuxMapTree` remains userspace control-plane state even when the
 kernel gains an MM clone helper.

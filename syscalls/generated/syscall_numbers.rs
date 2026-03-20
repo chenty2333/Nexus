@@ -148,3 +148,5 @@ pub const AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE: SyscallNumber = 70;
 pub const AXLE_SYS_AX_VMO_GET_INFO: SyscallNumber = 71;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_VMO_PROMOTE_SHARED: SyscallNumber = 72;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_VMAR_CLONE_MAPPINGS: SyscallNumber = 73;

@@ -523,7 +523,7 @@ impl VmDomain {
             PROCESS_START_STACK_BYTES,
             stack_global_vmo_id,
         )?;
-        self.map_existing_local_vmo_fixed(
+        self.map_existing_local_vmo_fixed_with_clone_policy(
             address_space_id,
             root_vmar_id,
             crate::userspace::USER_STACK_VA,
@@ -531,6 +531,7 @@ impl VmDomain {
             stack_vmo.vmo_id(),
             0,
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            MappingClonePolicy::PrivateCow,
         )?;
         self.write_local_vmo_bytes(
             address_space_id,
@@ -663,7 +664,7 @@ impl VmDomain {
                     len,
                     private_global_vmo_id,
                 )?;
-                self.map_existing_local_vmo_fixed(
+                self.map_existing_local_vmo_fixed_with_clone_policy(
                     address_space_id,
                     root_vmar_id,
                     map_base,
@@ -671,6 +672,7 @@ impl VmDomain {
                     private_vmo.vmo_id(),
                     0,
                     perms,
+                    MappingClonePolicy::PrivateCow,
                 )?;
                 if segment.file_size_bytes() != 0 {
                     let bytes = read_bytes(

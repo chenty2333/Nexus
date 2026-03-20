@@ -152,6 +152,13 @@ The current bootstrap syscall surface includes:
 - The public `ax_*` naming and the live handle codec are now aligned: handles travel through the
   syscall boundary at full native 64-bit width.
 - The current device-facing syscall surface is intentionally narrow:
+  - `ax_vmar_clone_mappings()` is now the first narrow VMAR-to-VMAR clone helper:
+    - it clones only mappings whose mapping-level clone policy is already frozen
+      in VM metadata
+    - `CLONE_COW` mappings re-arm source and child ranges for normal VM COW
+    - `CLONE_SHARE` mappings rebind both sides onto the same shared/global VMO
+      identity
+    - it does not externalize Linux VMA trees or any process identity model
   - `ax_vmo_get_info()` is now the first narrow public VMO object-metadata query:
     - logical size in bytes
     - VMO kind (`Anonymous` / `Physical` / `Contiguous` / `PagerBacked`)

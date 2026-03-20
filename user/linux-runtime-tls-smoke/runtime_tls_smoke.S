@@ -6,6 +6,11 @@ thread_flag:
 thread_fs_value:
     .quad 0
 
+.section .data
+.align 8
+fork_shared_value:
+    .quad 0
+
 .section .rodata
 success_message:
     .ascii "runtime tls ok\n"
@@ -79,6 +84,9 @@ wait_thread:
     cmp %rax, 8(%rsp)
     jne fail_9
 
+    movabs $0x123456789abcdef0, %rax
+    mov %rax, fork_shared_value(%rip)
+
     mov $57, %eax
     syscall
     test %rax, %rax
@@ -140,6 +148,9 @@ fork_child:
     jne fork_fail
     movabs $0x1122334455667788, %rax
     cmp %rax, 24(%rsp)
+    jne fork_fail
+    movabs $0x123456789abcdef0, %rax
+    cmp %rax, fork_shared_value(%rip)
     jne fork_fail
     xor %edi, %edi
     mov $60, %eax

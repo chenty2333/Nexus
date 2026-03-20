@@ -17,9 +17,8 @@ use axle_virtio_transport::{
     VirtqUsed, VirtqUsedElem, buffer_offset, buffer_paddr, empty_avail, empty_used,
     frame_header_bytes, frame_len, map_dma_addr, read_header as read_transport_header,
     rx_avail_paddr, rx_buffer_offset, rx_desc_paddr, rx_queue_index, rx_queue_notify_value,
-    rx_queue_offset, rx_used_paddr, tx_avail_paddr,
-    tx_buffer_offset, tx_desc_paddr, tx_queue_index, tx_queue_notify_value, tx_queue_offset,
-    tx_used_paddr,
+    rx_queue_offset, rx_used_paddr, tx_avail_paddr, tx_buffer_offset, tx_desc_paddr,
+    tx_queue_index, tx_queue_notify_value, tx_queue_offset, tx_used_paddr,
 };
 use libzircon::dma::{
     ZX_DMA_PERM_DEVICE_READ, ZX_DMA_PERM_DEVICE_WRITE, ZX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA,

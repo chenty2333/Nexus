@@ -317,6 +317,23 @@ impl VmFacade {
         self.with_domain_mut(|vm| vm.destroy_vmar(address_space_id, vmar_id))
     }
 
+    pub(crate) fn clone_vmar_mappings(
+        &self,
+        src_address_space_id: AddressSpaceId,
+        src_vmar_id: VmarId,
+        dst_address_space_id: AddressSpaceId,
+        dst_vmar_id: VmarId,
+    ) -> Result<Vec<TlbCommitReq>, zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.clone_vmar_mappings(
+                src_address_space_id,
+                src_vmar_id,
+                dst_address_space_id,
+                dst_vmar_id,
+            )
+        })
+    }
+
     pub(crate) fn promote_vmo_object_to_shared(
         &self,
         vmo: &crate::object::VmoObject,
@@ -337,6 +354,7 @@ impl VmFacade {
         perms: MappingPerms,
         cache_policy: MappingCachePolicy,
         private_clone: bool,
+        clone_policy: MappingClonePolicy,
     ) -> Result<(u64, TlbCommitReq), zx_status_t> {
         self.with_domain_mut(|vm| {
             vm.map_vmo_object_into_vmar(
@@ -350,6 +368,7 @@ impl VmFacade {
                 perms,
                 cache_policy,
                 private_clone,
+                clone_policy,
             )
         })
     }

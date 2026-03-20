@@ -832,3 +832,13 @@ ret = "ax_status_t"
 args = [
   { name = "handle", ty = "ax_handle_t" },
 ]
+
+[[syscall]]
+name = "ax_vmar_clone_mappings"
+nr = 73
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "src_vmar", ty = "ax_handle_t" },
+  { name = "dst_vmar", ty = "ax_handle_t" },
+]

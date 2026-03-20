@@ -276,35 +276,6 @@ impl StarnixKernel {
             }
         };
 
-        for range in &task_image.writable_ranges {
-            if let Err(status) = copy_guest_region(
-                parent_session,
-                prepared.carrier.session_handle,
-                range.base,
-                range.len,
-            ) {
-                prepared.close();
-                complete_syscall(
-                    stop_state,
-                    linux_errno(map_guest_memory_status_to_errno(status)),
-                )?;
-                return Ok(SyscallAction::Resume);
-            }
-        }
-        if let Err(status) = copy_guest_region(
-            parent_session,
-            prepared.carrier.session_handle,
-            USER_STACK_VA,
-            USER_STACK_BYTES,
-        ) {
-            prepared.close();
-            complete_syscall(
-                stop_state,
-                linux_errno(map_guest_memory_status_to_errno(status)),
-            )?;
-            return Ok(SyscallAction::Resume);
-        }
-
         let mut child_regs = stop_state.regs;
         child_regs.rax = 0;
         child_regs.rip = child_regs

@@ -261,7 +261,8 @@ Work:
   - `crates/nexus-starnix-fs`
 - Continue VM and Starnix follow-on on top of stable boundaries:
   - pager-backed and file-backed VMO externalization
-  - generic MM clone helper
+  - generic MM clone helper follow-on for heap/mmap after the new root-direct
+    VMAR-clone slice
   - better `fork`
   - broader Linux fs/socket/signal semantics
 

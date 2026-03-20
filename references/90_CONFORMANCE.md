@@ -232,6 +232,14 @@ That host gate now explicitly covers:
       handle
     - `ax_vmo_get_info()` on the source handle remains
       `PagerBacked + GlobalShared` before and after the mapping-local write
+- Starnix runtime/TLS coverage now also freezes the first generic MM clone
+  slice used by `fork`:
+  - `kernel.starnix.runtime_tls_bootstrap`
+  - the child still inherits the parent's `fs_base`
+  - one writable direct image/data location modified in the parent before
+    `fork` must remain visible in the child after `fork`
+  - this proves that Starnix `fork` root direct mappings now clone through VM
+    truth instead of through guest byte copies
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - two ring3 worker threads act as minimal device-side peers, one queue pair each
   - one bootstrap `PciDevice` handle is now seeded into the runner shared-slot window

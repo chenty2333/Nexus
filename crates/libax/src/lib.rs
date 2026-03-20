@@ -521,6 +521,19 @@ pub fn ax_vmo_promote_shared(handle: ax_handle_t) -> ax_status_t {
     }
 }
 
+/// Clone all child-visible source mappings from one VMAR into another.
+pub fn ax_vmar_clone_mappings(src_vmar: ax_handle_t, dst_vmar: ax_handle_t) -> ax_status_t {
+    let src_raw = match narrow_handle(src_vmar) {
+        Ok(raw) => raw,
+        Err(status) => return status,
+    };
+    let dst_raw = match narrow_handle(dst_vmar) {
+        Ok(raw) => raw,
+        Err(status) => return status,
+    };
+    libzircon::ax_vmar_clone_mappings(src_raw, dst_raw)
+}
+
 /// Pin one physical/contiguous VMO range and return a DMA region handle.
 pub fn ax_vmo_pin(
     handle: ax_handle_t,

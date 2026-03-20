@@ -79,6 +79,8 @@ This is the current mechanism that prevents duplicate materialization or inconsi
 - COW now covers:
   - anonymous mappings
   - mapping-local private-clone views over pager-backed / file-backed sources
+  - root direct mappings cloned into a child VMAR through mapping-level
+    `PrivateCow` policy
 - COW still does not apply to physical or contiguous mappings.
 
 ## Lazy materialization
@@ -100,6 +102,18 @@ This is the current mechanism that prevents duplicate materialization or inconsi
     mapping-local shadow
   - reads through the shared source handle still observe the original source
     bytes
+- The VM control plane now also carries child-clone policy as part of mapping
+  truth:
+  - `ZX_VM_CLONE_COW` / `AX_VM_CLONE_COW` mark one mapping as child-clonable
+    through the normal COW machinery
+  - `ZX_VM_CLONE_SHARE` / `AX_VM_CLONE_SHARE` mark one mapping as child-clonable
+    as a shared alias over one shared/global source
+  - `ax_vmar_clone_mappings()` is the first narrow public helper that consumes
+    those policy bits without importing Linux VMA metadata into the kernel
+- The first live user of that path is Starnix `fork` for root direct mappings:
+  - writable image ranges and the initial user stack now clone through VM truth
+    instead of guest-side byte copies
+  - heap/mmap child backing synchronization remains a later follow-on
 - Kernel VMO byte I/O can also materialize anonymous pages.
   When that happens for a page that is already mapped somewhere, the kernel now attaches the new
   frame to existing mapping aliases:

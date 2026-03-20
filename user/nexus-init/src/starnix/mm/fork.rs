@@ -70,6 +70,10 @@ impl LinuxMm {
         )?;
         let mut child_heap_vmo = ZX_HANDLE_INVALID;
         zx_status_result(zx_vmo_create(LINUX_HEAP_VMO_BYTES, 0, &mut child_heap_vmo))?;
+        zx_status_result(ax_vmar_clone_mappings_local(
+            self.root_vmar,
+            child_root_vmar,
+        ))?;
         if self.heap_mapped_len != 0 {
             let mut mapped_addr = 0u64;
             zx_status_result(zx_vmar_map_local(

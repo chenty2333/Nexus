@@ -720,9 +720,42 @@ impl VmDomain {
         vmo_offset: u64,
         perms: MappingPerms,
     ) -> Result<(), zx_status_t> {
+        self.map_existing_local_vmo_fixed_with_clone_policy(
+            address_space_id,
+            vmar_id,
+            base,
+            len,
+            local_vmo_id,
+            vmo_offset,
+            perms,
+            MappingClonePolicy::None,
+        )
+    }
+
+    pub(super) fn map_existing_local_vmo_fixed_with_clone_policy(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        vmar_id: VmarId,
+        base: u64,
+        len: u64,
+        local_vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        clone_policy: MappingClonePolicy,
+    ) -> Result<(), zx_status_t> {
         self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
             address_space
-                .map_vmo_fixed(frames, vmar_id, base, len, local_vmo_id, vmo_offset, perms)
+                .map_vmo_fixed_with_mapping_policy(
+                    frames,
+                    vmar_id,
+                    base,
+                    len,
+                    local_vmo_id,
+                    vmo_offset,
+                    perms,
+                    MappingCachePolicy::Cached,
+                    clone_policy,
+                )
                 .map_err(map_address_space_error)
         })?;
         self.install_mapping_pages(address_space_id, base, len)?;
@@ -739,6 +772,7 @@ impl VmDomain {
         vmo_offset: u64,
         len: u64,
         perms: MappingPerms,
+        clone_policy: MappingClonePolicy,
     ) -> Result<(u64, TlbCommitReq), zx_status_t> {
         let local_vmo_id =
             self.import_global_vmo_into_address_space(address_space_id, global_vmo_id)?;
@@ -758,7 +792,7 @@ impl VmDomain {
                     {
                         let mut frames = frames_handle.lock();
                         address_space
-                            .map_vmo_fixed_with_policy(
+                            .map_vmo_fixed_with_mapping_policy(
                                 &mut frames,
                                 vmar_id,
                                 mapped_addr,
@@ -767,6 +801,7 @@ impl VmDomain {
                                 vmo_offset,
                                 perms,
                                 MappingCachePolicy::Cached,
+                                clone_policy,
                             )
                             .map_err(map_address_space_error)?;
                     }
@@ -776,7 +811,7 @@ impl VmDomain {
                     let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
                     let mut frames = frames_handle.lock();
                     address_space
-                        .map_vmo_anywhere_with_policy(
+                        .map_vmo_anywhere_with_mapping_policy(
                             &mut frames,
                             cpu_id,
                             vmar_id,
@@ -785,6 +820,7 @@ impl VmDomain {
                             vmo_offset,
                             perms,
                             MappingCachePolicy::Cached,
+                            clone_policy,
                         )
                         .map_err(map_address_space_error)?
                 }
@@ -813,6 +849,7 @@ impl VmDomain {
         perms: MappingPerms,
         cache_policy: MappingCachePolicy,
         private_clone: bool,
+        clone_policy: MappingClonePolicy,
     ) -> Result<(u64, TlbCommitReq), zx_status_t> {
         let local_vmo_id = if private_clone {
             self.create_private_clone_local_vmo_for_mapping(address_space_id, vmo)?
@@ -835,7 +872,7 @@ impl VmDomain {
                     {
                         let mut frames = frames_handle.lock();
                         address_space
-                            .map_vmo_fixed_with_policy(
+                            .map_vmo_fixed_with_mapping_policy(
                                 &mut frames,
                                 vmar_id,
                                 mapped_addr,
@@ -844,6 +881,7 @@ impl VmDomain {
                                 vmo_offset,
                                 perms,
                                 cache_policy,
+                                clone_policy,
                             )
                             .map_err(map_address_space_error)?;
                     }
@@ -853,7 +891,7 @@ impl VmDomain {
                     let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
                     let mut frames = frames_handle.lock();
                     address_space
-                        .map_vmo_anywhere_with_policy(
+                        .map_vmo_anywhere_with_mapping_policy(
                             &mut frames,
                             cpu_id,
                             vmar_id,
@@ -862,6 +900,7 @@ impl VmDomain {
                             vmo_offset,
                             perms,
                             cache_policy,
+                            clone_policy,
                         )
                         .map_err(map_address_space_error)?
                 }

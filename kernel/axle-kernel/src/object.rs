@@ -14,7 +14,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::{Capability, ObjectKey, PortError, Signals, TimerError, TimerId, TransferredCap};
-use axle_mm::{MappingCachePolicy, MappingPerms, VmarAllocMode, VmarId, VmarPlacementPolicy};
+use axle_mm::{
+    MappingCachePolicy, MappingClonePolicy, MappingPerms, VmarAllocMode, VmarId,
+    VmarPlacementPolicy,
+};
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
 use axle_types::dma::{
     AX_DMA_REGION_INFO_FLAG_IDENTITY_IOVA, AX_DMA_REGION_INFO_FLAG_PHYSICALLY_CONTIGUOUS,
@@ -37,9 +40,9 @@ use axle_types::status::{
 };
 use axle_types::vm::{
     ZX_VM_ALIGN_BASE, ZX_VM_ALIGN_MASK, ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ,
-    ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE, ZX_VM_COMPACT, ZX_VM_MAP_MMIO,
-    ZX_VM_OFFSET_IS_UPPER_LIMIT, ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE,
-    ZX_VM_PRIVATE_CLONE, ZX_VM_SPECIFIC,
+    ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE, ZX_VM_CLONE_COW, ZX_VM_CLONE_SHARE, ZX_VM_COMPACT,
+    ZX_VM_MAP_MMIO, ZX_VM_OFFSET_IS_UPPER_LIMIT, ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ,
+    ZX_VM_PERM_WRITE, ZX_VM_PRIVATE_CLONE, ZX_VM_SPECIFIC,
 };
 use axle_types::zx_signals_t;
 use axle_types::{
@@ -888,6 +891,7 @@ struct VmarMappingCaps {
 struct VmarMappingRequest {
     perms: MappingPerms,
     cache_policy: MappingCachePolicy,
+    clone_policy: MappingClonePolicy,
     specific: bool,
     private_clone: bool,
 }
