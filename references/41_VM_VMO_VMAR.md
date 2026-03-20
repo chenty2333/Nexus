@@ -88,6 +88,14 @@ Current user-facing object creation is much narrower:
   - it upgrades one local-private VMO object into the shared/global backing domain
   - the staged boot-asset `GetVmo` path uses it before it exports one read-only
     shared source handle
+- `ax_vmar_get_mapping_vmo(vmar, addr, out_vmo)` is now the first narrow
+  mapping-backed VMO capture hook:
+  - it snapshots the current backing VMO of the mapping that covers `addr`
+    inside `vmar`
+  - it exposes one new handle over that backing using the current mapping
+    permissions as the public rights ceiling
+  - it intentionally captures one control-plane view of mapping truth rather
+    than per-page state
 
 ## VMAR model
 
@@ -119,6 +127,10 @@ Current object/syscall paths support:
 - VMAR clone for mappings whose clone policy is already part of VM truth:
   - `ax_vmar_clone_mappings(src_vmar, dst_vmar)`
   - the helper stays generic and clones Axle VM mappings, not Linux VMA trees
+- VMAR capture of the current mapping-backed VMO for one address:
+  - `ax_vmar_get_mapping_vmo(vmar, addr, out_vmo)`
+  - the helper stays generic and names the backing VMO currently installed for
+    that mapping rather than exporting Linux VMA metadata
 - one narrow subrange split path for `unmap` / `protect`:
   - one exact-range fast path still exists for whole-mapping operations
   - one single-covering-VMA subrange path now exists for dynamic-loader style
@@ -212,6 +224,13 @@ It is not fully implemented yet.
     stack through guest byte loops
   - instead it clones root-VMAR mappings through `ax_vmar_clone_mappings()`
     using the same mapping-level clone policy already stored in VM truth
+- Heap / mmap `fork` backing handles now also follow the same VM truth instead
+  of guest byte copies:
+  - Starnix captures child heap and `mmap()` backing handles through
+    `ax_vmar_get_mapping_vmo()`
+  - anonymous mappings, shared file mappings, and private-clone shadow mappings
+    now rebuild child-side userspace control-plane state from the child's actual
+    VM mappings
 - Physical / contiguous VMOs are now public as narrow bootstrap primitives, but the broader device
   model is still incomplete:
   - no BTI/pinning object

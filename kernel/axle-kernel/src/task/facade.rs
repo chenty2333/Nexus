@@ -116,6 +116,15 @@ impl VmFacade {
         self.with_domain(|vm| vm.validate_user_ptr(address_space_id, ptr, len))
     }
 
+    pub(crate) fn snapshot_mapping_vmo(
+        &self,
+        address_space_id: AddressSpaceId,
+        ptr: u64,
+        len: usize,
+    ) -> Option<(VmaLookup, Vmo)> {
+        self.with_domain(|vm| vm.snapshot_mapping_vmo(address_space_id, ptr, len))
+    }
+
     pub(crate) fn try_loan_user_pages(
         &self,
         address_space_id: AddressSpaceId,

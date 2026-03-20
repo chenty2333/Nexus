@@ -534,6 +534,19 @@ pub fn ax_vmar_clone_mappings(src_vmar: ax_handle_t, dst_vmar: ax_handle_t) -> a
     libzircon::ax_vmar_clone_mappings(src_raw, dst_raw)
 }
 
+/// Reify the current backing VMO of one mapping inside a VMAR.
+pub fn ax_vmar_get_mapping_vmo(
+    vmar: ax_handle_t,
+    addr: u64,
+    out_vmo: &mut ax_handle_t,
+) -> ax_status_t {
+    let raw = match narrow_handle(vmar) {
+        Ok(raw) => raw,
+        Err(status) => return status,
+    };
+    libzircon::ax_vmar_get_mapping_vmo(raw, addr, out_vmo)
+}
+
 /// Pin one physical/contiguous VMO range and return a DMA region handle.
 pub fn ax_vmo_pin(
     handle: ax_handle_t,

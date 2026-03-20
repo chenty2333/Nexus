@@ -52,7 +52,7 @@ impl LinuxMm {
         if target_mapped_len > self.heap_mapped_len {
             let delta = target_mapped_len - self.heap_mapped_len;
             let heap_offset = self.heap_mapped_len;
-            let map_options = ZX_VM_SPECIFIC | ZX_VM_PERM_READ | ZX_VM_PERM_WRITE;
+            let map_options = ZX_VM_SPECIFIC | ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_CLONE_COW;
             let mut mapped_addr = 0u64;
             let status = zx_vmar_map_local(
                 self.heap_vmar,
@@ -175,8 +175,12 @@ impl LinuxMm {
         } else {
             map_options
         };
-        if private_file_shadow {
-            map_options |= ZX_VM_PRIVATE_CLONE;
+        if anonymous {
+            map_options |= ZX_VM_CLONE_COW;
+        } else if private_file_shadow {
+            map_options |= ZX_VM_PRIVATE_CLONE | ZX_VM_CLONE_COW;
+        } else if shared {
+            map_options |= ZX_VM_CLONE_SHARE;
         }
         let status = zx_vmar_map_local(
             self.mmap_vmar,
@@ -197,21 +201,40 @@ impl LinuxMm {
             return Ok(linux_errno(map_vm_status_to_errno(status)));
         }
 
+        let map_base = if fixed { addr } else { mapped_addr };
+        let backing = if anonymous {
+            LinuxMapBacking::Anonymous { vmo }
+        } else {
+            let mut mapping_vmo = ZX_HANDLE_INVALID;
+            let capture_status =
+                ax_vmar_get_mapping_vmo_local(self.mmap_vmar, map_base, &mut mapping_vmo);
+            if capture_status != ZX_OK {
+                let _ = zx_vmar_unmap_local(self.mmap_vmar, map_base, aligned_len);
+                let _ = zx_handle_close(vmo);
+                return Ok(linux_errno(map_vm_status_to_errno(capture_status)));
+            }
+            let _ = zx_handle_close(vmo);
+            if private_file_shadow {
+                LinuxMapBacking::Anonymous { vmo: mapping_vmo }
+            } else {
+                LinuxMapBacking::File {
+                    vmo: mapping_vmo,
+                    offset,
+                }
+            }
+        };
+
         self.map_tree.insert(
-            if fixed { addr } else { mapped_addr },
+            map_base,
             LinuxMapEntry {
-                base: if fixed { addr } else { mapped_addr },
+                base: map_base,
                 len: aligned_len,
                 prot,
                 flags,
-                backing: if anonymous {
-                    LinuxMapBacking::Anonymous { vmo }
-                } else {
-                    LinuxMapBacking::File { vmo, offset }
-                },
+                backing,
             },
         );
-        Ok(if fixed { addr } else { mapped_addr })
+        Ok(map_base)
     }
 
     pub(in crate::starnix) fn munmap(&mut self, addr: u64, len: u64) -> Result<u64, zx_status_t> {

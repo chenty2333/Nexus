@@ -462,7 +462,15 @@ That helper now exists in its first narrow form:
 - Starnix `fork` now uses it for root direct mappings such as:
   - writable image ranges
   - the initial user stack
-- heap/mmap backing-handle synchronization remains userspace follow-on work
+- a second narrow helper now also keeps userspace heap/mmap backing handles in
+  sync with child VM truth:
+  - `ax_vmar_get_mapping_vmo(vmar, addr, out_vmo)` returns the current child
+    mapping's backing VMO handle
+  - Starnix `fork` now uses that handle capture for:
+    - heap `brk()` ranges
+    - anonymous `mmap()` ranges
+    - shared file mappings
+    - private-clone file-shadow mappings
 
 The Linux `LinuxMapTree` remains userspace control-plane state even when the
 kernel gains an MM clone helper.

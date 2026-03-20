@@ -41,8 +41,8 @@ use self::signal::action::{
 };
 use self::signal::delivery::SignalDeliveryAction;
 use self::substrate::guest::{
-    copy_guest_region, create_thread_carrier, linux_guest_initial_regs, prepare_process_carrier,
-    read_guest_bytes, read_guest_c_string, read_guest_i64, read_guest_u32, read_guest_u64,
+    create_thread_carrier, linux_guest_initial_regs, prepare_process_carrier, read_guest_bytes,
+    read_guest_c_string, read_guest_i64, read_guest_u32, read_guest_u64,
     start_prepared_carrier_guest, write_guest_bytes, write_guest_u32, write_guest_u64,
 };
 use self::substrate::restart::complete_syscall;
@@ -128,13 +128,13 @@ use axle_types::status::{
     ZX_ERR_OUT_OF_RANGE, ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_OK,
 };
 use axle_types::syscall_numbers::{
-    AXLE_SYS_AX_VMAR_CLONE_MAPPINGS, AXLE_SYS_VMAR_ALLOCATE, AXLE_SYS_VMAR_MAP,
-    AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
+    AXLE_SYS_AX_VMAR_CLONE_MAPPINGS, AXLE_SYS_AX_VMAR_GET_MAPPING_VMO, AXLE_SYS_VMAR_ALLOCATE,
+    AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_PROTECT, AXLE_SYS_VMAR_UNMAP,
 };
 use axle_types::vm::{
     ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ, ZX_VM_CAN_MAP_SPECIFIC, ZX_VM_CAN_MAP_WRITE,
-    ZX_VM_COMPACT, ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE, ZX_VM_PRIVATE_CLONE,
-    ZX_VM_SPECIFIC,
+    ZX_VM_CLONE_COW, ZX_VM_CLONE_SHARE, ZX_VM_COMPACT, ZX_VM_PERM_EXECUTE, ZX_VM_PERM_READ,
+    ZX_VM_PERM_WRITE, ZX_VM_PRIVATE_CLONE, ZX_VM_SPECIFIC,
 };
 use axle_types::{
     ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_interp_header_t,
@@ -788,5 +788,16 @@ fn ax_vmar_clone_mappings_local(src_vmar: zx_handle_t, dst_vmar: zx_handle_t) ->
     axle_arch_x86_64::native_syscall(
         AXLE_SYS_AX_VMAR_CLONE_MAPPINGS as u64,
         [src_vmar, dst_vmar, 0, 0, 0, 0],
+    )
+}
+
+fn ax_vmar_get_mapping_vmo_local(
+    vmar: zx_handle_t,
+    addr: u64,
+    out_vmo: &mut zx_handle_t,
+) -> zx_status_t {
+    axle_arch_x86_64::native_syscall(
+        AXLE_SYS_AX_VMAR_GET_MAPPING_VMO as u64,
+        [vmar, addr, out_vmo as *mut zx_handle_t as u64, 0, 0, 0],
     )
 }

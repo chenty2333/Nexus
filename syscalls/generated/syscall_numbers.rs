@@ -150,3 +150,5 @@ pub const AXLE_SYS_AX_VMO_GET_INFO: SyscallNumber = 71;
 pub const AXLE_SYS_AX_VMO_PROMOTE_SHARED: SyscallNumber = 72;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_VMAR_CLONE_MAPPINGS: SyscallNumber = 73;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_VMAR_GET_MAPPING_VMO: SyscallNumber = 74;

@@ -238,8 +238,14 @@ That host gate now explicitly covers:
   - the child still inherits the parent's `fs_base`
   - one writable direct image/data location modified in the parent before
     `fork` must remain visible in the child after `fork`
-  - this proves that Starnix `fork` root direct mappings now clone through VM
-    truth instead of through guest byte copies
+  - one `brk()`-grown heap location modified in the parent before `fork` must
+    remain visible in the child after `fork`
+  - one anonymous `mmap()` location modified in the parent before `fork` must
+    remain visible in the child after `fork`
+  - this now proves that Starnix `fork` uses VM truth for:
+    - root direct mappings
+    - heap backing-handle reconstruction
+    - anonymous `mmap()` backing-handle reconstruction
 - Bootstrap runtime coverage now also includes one narrow queue-owned net dataplane gate:
   - two ring3 worker threads act as minimal device-side peers, one queue pair each
   - one bootstrap `PciDevice` handle is now seeded into the runner shared-slot window

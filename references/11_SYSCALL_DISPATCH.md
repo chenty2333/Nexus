@@ -112,6 +112,7 @@ The current bootstrap syscall surface includes:
 - PCI/device info / BAR / interrupt export
 - PCI/device generic resource-count and resource export
 - VMAR allocate / destroy / map / unmap / protect
+- VMAR clone-mappings / mapping-backed VMO capture
 - channel create / write / read
 - eventpair create
 - futex wait / wake / requeue / get owner
@@ -159,6 +160,14 @@ The current bootstrap syscall surface includes:
     - `CLONE_SHARE` mappings rebind both sides onto the same shared/global VMO
       identity
     - it does not externalize Linux VMA trees or any process identity model
+  - `ax_vmar_get_mapping_vmo()` is now the first narrow mapping-backed VMO
+    capture helper:
+    - it returns one handle naming the current backing VMO of the mapping that
+      covers one address inside one VMAR
+    - returned rights are derived from the current mapping permissions plus the
+      captured VMO's stable behavior
+    - it is a control-plane synchronization helper for userspace executives,
+      not a residency / dirty-page / per-page inspection API
   - `ax_vmo_get_info()` is now the first narrow public VMO object-metadata query:
     - logical size in bytes
     - VMO kind (`Anonymous` / `Physical` / `Contiguous` / `PagerBacked`)

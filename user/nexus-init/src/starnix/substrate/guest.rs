@@ -223,26 +223,6 @@ pub(in crate::starnix) fn write_guest_bytes(
     if status == ZX_OK { Ok(()) } else { Err(status) }
 }
 
-pub(in crate::starnix) fn copy_guest_region(
-    src_session: zx_handle_t,
-    dst_session: zx_handle_t,
-    base: u64,
-    len: u64,
-) -> Result<(), zx_status_t> {
-    let mut offset = 0u64;
-    let chunk = [0u8; 4096];
-    while offset < len {
-        let remaining = len - offset;
-        let chunk_len = remaining.min(chunk.len() as u64) as usize;
-        let bytes = read_guest_bytes(src_session, base + offset, chunk_len)?;
-        write_guest_bytes(dst_session, base + offset, &bytes)?;
-        offset = offset
-            .checked_add(chunk_len as u64)
-            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-    }
-    Ok(())
-}
-
 pub(in crate::starnix) fn read_guest_c_string(
     session: zx_handle_t,
     addr: u64,

@@ -2477,6 +2477,18 @@ impl VmDomain {
             .and_then(|address_space| address_space.lookup_user_mapping(ptr, len))
     }
 
+    pub(crate) fn snapshot_mapping_vmo(
+        &self,
+        address_space_id: AddressSpaceId,
+        ptr: u64,
+        len: usize,
+    ) -> Option<(VmaLookup, Vmo)> {
+        let address_space = self.address_spaces.get(&address_space_id)?;
+        let lookup = address_space.lookup_user_mapping(ptr, len)?;
+        let vmo = address_space.vm.vmo(lookup.vmo_id())?.clone();
+        Some((lookup, vmo))
+    }
+
     pub(crate) fn root_vmar(&self, address_space_id: AddressSpaceId) -> Result<Vmar, zx_status_t> {
         let address_space = self
             .address_spaces

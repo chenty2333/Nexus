@@ -842,3 +842,14 @@ args = [
   { name = "src_vmar", ty = "ax_handle_t" },
   { name = "dst_vmar", ty = "ax_handle_t" },
 ]
+
+[[syscall]]
+name = "ax_vmar_get_mapping_vmo"
+nr = 74
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "vmar", ty = "ax_handle_t" },
+  { name = "addr", ty = "u64" },
+  { name = "out_vmo", ty = "*mut ax_handle_t" },
+]

@@ -113,7 +113,14 @@ This is the current mechanism that prevents duplicate materialization or inconsi
 - The first live user of that path is Starnix `fork` for root direct mappings:
   - writable image ranges and the initial user stack now clone through VM truth
     instead of guest-side byte copies
-  - heap/mmap child backing synchronization remains a later follow-on
+  - heap and `mmap()` child backing handles now also resynchronize through VM
+    truth:
+    - the child heap mapping is captured through one child-side
+      `ax_vmar_get_mapping_vmo()` query
+    - anonymous and private-shadow `mmap()` entries rebuild child backing
+      handles from the child mapping's actual VMO
+    - shared file mappings rebuild child backing handles from the same
+      child-visible shared/global source
 - Kernel VMO byte I/O can also materialize anonymous pages.
   When that happens for a page that is already mapped somewhere, the kernel now attaches the new
   frame to existing mapping aliases:

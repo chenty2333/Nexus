@@ -132,11 +132,18 @@ What is not complete yet:
 - write/resize semantics for pager-backed objects are not public beyond
   mapping-local private-clone faults
 - the generic VMAR clone helper now exists only for the first root-direct
-  mapping slice:
+  mapping slice plus the current heap/mmap backing-handle follow-on:
   - mapping-level clone policy is now part of VM truth
   - `ax_vmar_clone_mappings()` can clone those mappings into one child VMAR
   - Starnix `fork` uses that helper for root direct mappings
-  - heap/mmap backing-handle synchronization still remains future work
+  - `ax_vmar_get_mapping_vmo()` is now the first narrow userspace helper for
+    reifying the child mapping's current backing VMO after that clone
+  - Starnix `fork` now uses that helper to rebuild:
+    - heap backing handles
+    - anonymous `mmap()` backing handles
+    - shared file mapping source handles
+    - private-clone shadow backing handles
+  - the kernel still does not export Linux VMA trees or one public pager object
 - DataFS-prep only freezes read-only `GetVmo` and recovery/model constraints on
   the host side; it does not yet provide a real writable file-backed VMO path
 

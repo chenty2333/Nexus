@@ -158,12 +158,6 @@ impl StarnixKernel {
         stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
         let parent_tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
-        let parent_session = self
-            .tasks
-            .get(&task_id)
-            .ok_or(ZX_ERR_BAD_STATE)?
-            .carrier
-            .session_handle;
         let parent_blocked = self
             .tasks
             .get(&task_id)
@@ -261,12 +255,7 @@ impl StarnixKernel {
                 .resources
                 .as_ref()
                 .ok_or(ZX_ERR_BAD_STATE)?;
-            match parent_resources.fork_clone(
-                prepared.process_handle,
-                prepared.root_vmar,
-                parent_session,
-                prepared.carrier.session_handle,
-            ) {
+            match parent_resources.fork_clone(prepared.process_handle, prepared.root_vmar) {
                 Ok(resources) => resources,
                 Err(status) => {
                     prepared.close();

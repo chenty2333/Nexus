@@ -84,6 +84,37 @@ wait_thread:
     cmp %rax, 8(%rsp)
     jne fail_9
 
+    xor %edi, %edi
+    mov $12, %eax
+    syscall
+    test %rax, %rax
+    js fail_14
+    mov %rax, %r13
+
+    lea 4096(%r13), %rdi
+    mov $12, %eax
+    syscall
+    cmp %rdi, %rax
+    jne fail_15
+
+    movabs $0x0fedcba987654321, %rax
+    mov %rax, 0(%r13)
+
+    xor %edi, %edi
+    mov $4096, %esi
+    mov $3, %edx
+    mov $34, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_16
+    mov %rax, %r14
+
+    movabs $0x13579bdf2468ace0, %rax
+    mov %rax, 0(%r14)
+
     movabs $0x123456789abcdef0, %rax
     mov %rax, fork_shared_value(%rip)
 
@@ -152,6 +183,12 @@ fork_child:
     movabs $0x123456789abcdef0, %rax
     cmp %rax, fork_shared_value(%rip)
     jne fork_fail
+    movabs $0x0fedcba987654321, %rax
+    cmp %rax, 0(%r13)
+    jne fork_fail
+    movabs $0x13579bdf2468ace0, %rax
+    cmp %rax, 0(%r14)
+    jne fork_fail
     xor %edi, %edi
     mov $60, %eax
     syscall
@@ -174,6 +211,9 @@ fail_10: mov $10, %edi; jmp fail_exit
 fail_11: mov $11, %edi; jmp fail_exit
 fail_12: mov $12, %edi; jmp fail_exit
 fail_13: mov $13, %edi; jmp fail_exit
+fail_14: mov $14, %edi; jmp fail_exit
+fail_15: mov $15, %edi; jmp fail_exit
+fail_16: mov $16, %edi; jmp fail_exit
 
 fail_exit:
     mov $231, %eax

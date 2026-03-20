@@ -1,6 +1,5 @@
 use super::super::*;
 use super::context::{LinuxMapBacking, LinuxMapEntry, LinuxMm};
-use super::mmap::map_linux_prot_to_vm_options;
 
 impl LinuxMm {
     pub(in crate::starnix) fn new(root_vmar: zx_handle_t) -> Result<Self, zx_status_t> {
@@ -46,8 +45,6 @@ impl LinuxMm {
     pub(in crate::starnix) fn fork_clone(
         &self,
         child_root_vmar: zx_handle_t,
-        parent_session: zx_handle_t,
-        child_session: zx_handle_t,
     ) -> Result<Self, zx_status_t> {
         let heap_options =
             ZX_VM_CAN_MAP_READ | ZX_VM_CAN_MAP_WRITE | ZX_VM_CAN_MAP_SPECIFIC | ZX_VM_SPECIFIC;
@@ -68,133 +65,47 @@ impl LinuxMm {
             self.mmap_base,
             LINUX_MMAP_REGION_BYTES,
         )?;
-        let mut child_heap_vmo = ZX_HANDLE_INVALID;
-        zx_status_result(zx_vmo_create(LINUX_HEAP_VMO_BYTES, 0, &mut child_heap_vmo))?;
         zx_status_result(ax_vmar_clone_mappings_local(
             self.root_vmar,
             child_root_vmar,
         ))?;
-        if self.heap_mapped_len != 0 {
-            let mut mapped_addr = 0u64;
-            zx_status_result(zx_vmar_map_local(
-                heap_vmar,
-                ZX_VM_SPECIFIC | ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
-                0,
-                child_heap_vmo,
-                0,
-                self.heap_mapped_len,
-                &mut mapped_addr,
-            ))?;
-            copy_guest_region(
-                parent_session,
-                child_session,
-                self.heap_base,
-                self.heap_mapped_len,
-            )?;
-        }
+        zx_status_result(ax_vmar_clone_mappings_local(self.heap_vmar, heap_vmar))?;
+        zx_status_result(ax_vmar_clone_mappings_local(self.mmap_vmar, mmap_vmar))?;
+        let child_heap_vmo = if self.heap_mapped_len == 0 {
+            let mut child_heap_vmo = ZX_HANDLE_INVALID;
+            zx_status_result(zx_vmo_create(LINUX_HEAP_VMO_BYTES, 0, &mut child_heap_vmo))?;
+            child_heap_vmo
+        } else {
+            capture_mapping_vmo(heap_vmar, self.heap_base)?
+        };
 
         let exec_tree = self.exec_tree.clone();
         let mut map_tree = BTreeMap::new();
         for entry in self.map_tree.values() {
-            match entry.backing {
-                LinuxMapBacking::Anonymous { .. } => {
-                    let mut child_vmo = ZX_HANDLE_INVALID;
-                    zx_status_result(zx_vmo_create(entry.len, 0, &mut child_vmo))?;
-                    let mut mapped_addr = 0u64;
-                    zx_status_result(zx_vmar_map_local(
-                        mmap_vmar,
-                        map_linux_prot_to_vm_options(entry.prot)
-                            .map_err(linux_status_from_errno)?
-                            | ZX_VM_SPECIFIC,
-                        entry
-                            .base
-                            .checked_sub(self.mmap_base)
-                            .ok_or(ZX_ERR_OUT_OF_RANGE)?,
-                        child_vmo,
-                        0,
-                        entry.len,
-                        &mut mapped_addr,
-                    ))?;
-                    copy_guest_region(parent_session, child_session, entry.base, entry.len)?;
-                    map_tree.insert(
-                        entry.base,
-                        LinuxMapEntry {
-                            base: entry.base,
-                            len: entry.len,
-                            prot: entry.prot,
-                            flags: entry.flags,
-                            backing: LinuxMapBacking::Anonymous { vmo: child_vmo },
-                        },
-                    );
+            let child_vmo = capture_mapping_vmo(mmap_vmar, entry.base)?;
+            let backing = if matches!(entry.backing, LinuxMapBacking::Anonymous { .. })
+                || entry.is_private()
+            {
+                LinuxMapBacking::Anonymous { vmo: child_vmo }
+            } else {
+                let LinuxMapBacking::File { offset, .. } = entry.backing else {
+                    return Err(ZX_ERR_BAD_STATE);
+                };
+                LinuxMapBacking::File {
+                    vmo: child_vmo,
+                    offset,
                 }
-                LinuxMapBacking::File { vmo, offset } => {
-                    if entry.is_private() {
-                        let mut child_vmo = ZX_HANDLE_INVALID;
-                        zx_status_result(zx_vmo_create(entry.len, 0, &mut child_vmo))?;
-                        let mut mapped_addr = 0u64;
-                        zx_status_result(zx_vmar_map_local(
-                            mmap_vmar,
-                            map_linux_prot_to_vm_options(entry.prot)
-                                .map_err(linux_status_from_errno)?
-                                | ZX_VM_SPECIFIC,
-                            entry
-                                .base
-                                .checked_sub(self.mmap_base)
-                                .ok_or(ZX_ERR_OUT_OF_RANGE)?,
-                            child_vmo,
-                            0,
-                            entry.len,
-                            &mut mapped_addr,
-                        ))?;
-                        copy_guest_region(parent_session, child_session, entry.base, entry.len)?;
-                        map_tree.insert(
-                            entry.base,
-                            LinuxMapEntry {
-                                base: entry.base,
-                                len: entry.len,
-                                prot: entry.prot,
-                                flags: entry.flags,
-                                backing: LinuxMapBacking::Anonymous { vmo: child_vmo },
-                            },
-                        );
-                        continue;
-                    }
-                    let mut duplicated = ZX_HANDLE_INVALID;
-                    zx_status_result(zx_handle_duplicate(
-                        vmo,
-                        ZX_RIGHT_SAME_RIGHTS,
-                        &mut duplicated,
-                    ))?;
-                    let mut mapped_addr = 0u64;
-                    zx_status_result(zx_vmar_map_local(
-                        mmap_vmar,
-                        map_linux_prot_to_vm_options(entry.prot)
-                            .map_err(linux_status_from_errno)?
-                            | ZX_VM_SPECIFIC,
-                        entry
-                            .base
-                            .checked_sub(self.mmap_base)
-                            .ok_or(ZX_ERR_OUT_OF_RANGE)?,
-                        duplicated,
-                        offset,
-                        entry.len,
-                        &mut mapped_addr,
-                    ))?;
-                    map_tree.insert(
-                        entry.base,
-                        LinuxMapEntry {
-                            base: entry.base,
-                            len: entry.len,
-                            prot: entry.prot,
-                            flags: entry.flags,
-                            backing: LinuxMapBacking::File {
-                                vmo: duplicated,
-                                offset,
-                            },
-                        },
-                    );
-                }
-            }
+            };
+            map_tree.insert(
+                entry.base,
+                LinuxMapEntry {
+                    base: entry.base,
+                    len: entry.len,
+                    prot: entry.prot,
+                    flags: entry.flags,
+                    backing,
+                },
+            );
         }
 
         Ok(Self {
@@ -228,6 +139,12 @@ impl LinuxMm {
             map_tree: BTreeMap::new(),
         }
     }
+}
+
+fn capture_mapping_vmo(vmar: zx_handle_t, addr: u64) -> Result<zx_handle_t, zx_status_t> {
+    let mut vmo = ZX_HANDLE_INVALID;
+    zx_status_result(ax_vmar_get_mapping_vmo_local(vmar, addr, &mut vmo))?;
+    Ok(vmo)
 }
 
 fn allocate_child_vmar(

@@ -753,6 +753,69 @@ pub fn vmar_clone_mappings(
     })
 }
 
+/// Reify the current backing VMO of one child-visible mapping inside a VMAR.
+pub fn vmar_get_mapping_vmo(
+    vmar_handle: zx_handle_t,
+    addr: u64,
+) -> Result<zx_handle_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved_vmar = state.lookup_handle(vmar_handle, crate::task::HandleRights::empty())?;
+        let vmar = state.with_objects(|objects| {
+            Ok(match objects.get(resolved_vmar.object_key()) {
+                Some(KernelObject::Vmar(vmar)) => *vmar,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            })
+        })?;
+
+        require_vmar_control_rights(resolved_vmar)?;
+
+        let (lookup, mapping_vmo) = state
+            .with_vm_mut(|vm| Ok(vm.snapshot_mapping_vmo(vmar.address_space_id, addr, 1)))
+            .and_then(|snapshot| snapshot.ok_or(ZX_ERR_NOT_FOUND))?;
+        if lookup.vmar_id() != vmar.vmar_id {
+            return Err(ZX_ERR_NOT_FOUND);
+        }
+
+        let process_id =
+            state.with_core(|kernel| Ok(kernel.current_process_info()?.process_id()))?;
+        let object_id = state.alloc_object_id();
+        let backing_scope = if lookup.is_global_backed() {
+            VmoBackingScope::GlobalShared
+        } else {
+            VmoBackingScope::LocalPrivate {
+                owner_address_space_id: lookup.address_space_id().raw(),
+                local_vmo_id: lookup.vmo_id(),
+            }
+        };
+        state.with_objects_mut(|objects| {
+            objects.insert(
+                object_id,
+                KernelObject::Vmo(VmoObject {
+                    creator_process_id: process_id,
+                    global_vmo_id: lookup.global_vmo_id(),
+                    backing_scope,
+                    kind: mapping_vmo.kind(),
+                    size_bytes: mapping_vmo.size_bytes(),
+                    image_layout: None,
+                }),
+            )?;
+            Ok(())
+        })?;
+
+        match state.alloc_handle_for_object(
+            object_id,
+            mapping_vmo_capture_rights(lookup.perms(), mapping_vmo.kind()),
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(err) => {
+                let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
+                Err(err)
+            }
+        }
+    })
+}
+
 pub(super) fn root_vmar_mapping_caps() -> VmarMappingCaps {
     VmarMappingCaps {
         max_perms: MappingPerms::READ
@@ -782,6 +845,26 @@ fn require_vm_mapping_rights(
 fn require_vmar_control_rights(resolved: crate::task::ResolvedHandle) -> Result<(), zx_status_t> {
     require_handle_rights(resolved, crate::task::HandleRights::MAP)?;
     require_handle_rights(resolved, crate::task::HandleRights::WRITE)
+}
+
+fn mapping_vmo_capture_rights(
+    perms: MappingPerms,
+    kind: axle_mm::VmoKind,
+) -> crate::task::HandleRights {
+    let mut rights = crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::INSPECT
+        | crate::task::HandleRights::MAP;
+    if kind.supports_kernel_read() {
+        rights |= crate::task::HandleRights::READ;
+    }
+    if perms.contains(MappingPerms::WRITE) && kind.supports_kernel_write() {
+        rights |= crate::task::HandleRights::WRITE;
+    }
+    if perms.contains(MappingPerms::EXECUTE) {
+        rights |= crate::task::HandleRights::EXECUTE;
+    }
+    rights
 }
 
 fn require_vmar_mapping_caps(

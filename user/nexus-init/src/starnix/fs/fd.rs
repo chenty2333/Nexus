@@ -96,15 +96,11 @@ impl ProcessResources {
         &self,
         child_process: zx_handle_t,
         child_root_vmar: zx_handle_t,
-        parent_session: zx_handle_t,
-        child_session: zx_handle_t,
     ) -> Result<Self, zx_status_t> {
         Ok(Self {
             process_handle: child_process,
             fs: self.fs.fork_clone(),
-            mm: self
-                .mm
-                .fork_clone(child_root_vmar, parent_session, child_session)?,
+            mm: self.mm.fork_clone(child_root_vmar)?,
         })
     }
 
