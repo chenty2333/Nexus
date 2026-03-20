@@ -468,16 +468,10 @@ impl Kernel {
                 remote_wake_target_cpu: None,
             },
         );
+        let now = crate::time::now_ns();
         kernel.cpu_schedulers.insert(
             bootstrap_cpu_id,
-            CpuSchedulerState {
-                run_queue: VecDeque::new(),
-                current_thread_id: Some(thread_id),
-                reschedule_requested: false,
-                current_runtime_started_ns: Some(crate::time::now_ns()),
-                slice_deadline_ns: crate::time::now_ns().checked_add(DEFAULT_TIME_SLICE_NS),
-                online: true,
-            },
+            CpuSchedulerState::bootstrap_current(thread_id, now),
         );
         kernel
     }

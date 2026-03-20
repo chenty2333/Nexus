@@ -1,3 +1,5 @@
+use alloc::collections::VecDeque;
+
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
