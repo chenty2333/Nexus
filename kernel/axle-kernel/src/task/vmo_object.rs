@@ -728,6 +728,7 @@ impl VmDomain {
             local_vmo_id,
             vmo_offset,
             perms,
+            perms,
             MappingClonePolicy::None,
         )
     }
@@ -741,11 +742,12 @@ impl VmDomain {
         local_vmo_id: VmoId,
         vmo_offset: u64,
         perms: MappingPerms,
+        max_perms: MappingPerms,
         clone_policy: MappingClonePolicy,
     ) -> Result<(), zx_status_t> {
         self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
             address_space
-                .map_vmo_fixed_with_mapping_policy(
+                .map_vmo_fixed_with_max_perms_and_mapping_policy(
                     frames,
                     vmar_id,
                     base,
@@ -753,6 +755,7 @@ impl VmDomain {
                     local_vmo_id,
                     vmo_offset,
                     perms,
+                    max_perms,
                     MappingCachePolicy::Cached,
                     clone_policy,
                 )

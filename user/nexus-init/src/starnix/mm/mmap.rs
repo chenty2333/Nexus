@@ -179,7 +179,7 @@ impl LinuxMm {
             map_options |= ZX_VM_CLONE_COW;
         } else if private_file_shadow {
             map_options |= ZX_VM_PRIVATE_CLONE | ZX_VM_CLONE_COW;
-        } else if shared {
+        } else if shared || private {
             map_options |= ZX_VM_CLONE_SHARE;
         }
         let status = zx_vmar_map_local(

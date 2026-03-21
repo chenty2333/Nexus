@@ -531,6 +531,7 @@ impl VmDomain {
             stack_vmo.vmo_id(),
             0,
             MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
             MappingClonePolicy::PrivateCow,
         )?;
         self.write_local_vmo_bytes(
@@ -671,6 +672,7 @@ impl VmDomain {
                     len,
                     private_vmo.vmo_id(),
                     0,
+                    perms,
                     perms,
                     MappingClonePolicy::PrivateCow,
                 )?;

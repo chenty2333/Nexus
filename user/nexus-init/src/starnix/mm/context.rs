@@ -15,12 +15,6 @@ pub(in crate::starnix) struct LinuxMapEntry {
     pub(in crate::starnix) backing: LinuxMapBacking,
 }
 
-impl LinuxMapEntry {
-    pub(in crate::starnix) fn is_private(self) -> bool {
-        (self.flags & LINUX_MAP_PRIVATE) != 0
-    }
-}
-
 #[derive(Clone, Copy)]
 pub(in crate::starnix) struct LinuxProtectEntry {
     pub(in crate::starnix) base: u64,

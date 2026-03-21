@@ -83,18 +83,12 @@ impl LinuxMm {
         let mut map_tree = BTreeMap::new();
         for entry in self.map_tree.values() {
             let child_vmo = capture_mapping_vmo(mmap_vmar, entry.base)?;
-            let backing = if matches!(entry.backing, LinuxMapBacking::Anonymous { .. })
-                || entry.is_private()
-            {
-                LinuxMapBacking::Anonymous { vmo: child_vmo }
-            } else {
-                let LinuxMapBacking::File { offset, .. } = entry.backing else {
-                    return Err(ZX_ERR_BAD_STATE);
-                };
-                LinuxMapBacking::File {
+            let backing = match entry.backing {
+                LinuxMapBacking::Anonymous { .. } => LinuxMapBacking::Anonymous { vmo: child_vmo },
+                LinuxMapBacking::File { offset, .. } => LinuxMapBacking::File {
                     vmo: child_vmo,
                     offset,
-                }
+                },
             };
             map_tree.insert(
                 entry.base,

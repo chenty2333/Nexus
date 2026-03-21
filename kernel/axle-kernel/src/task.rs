@@ -1214,7 +1214,7 @@ impl AddressSpace {
         cache_policy: MappingCachePolicy,
         clone_policy: MappingClonePolicy,
     ) -> Result<(), AddressSpaceError> {
-        self.vm.map_fixed_in_vmar_with_mapping_policy(
+        self.map_vmo_fixed_with_max_perms_and_mapping_policy(
             frames,
             vmar_id,
             base,
@@ -1223,6 +1223,33 @@ impl AddressSpace {
             vmo_offset,
             perms,
             perms,
+            cache_policy,
+            clone_policy,
+        )
+    }
+
+    fn map_vmo_fixed_with_max_perms_and_mapping_policy(
+        &mut self,
+        frames: &mut FrameTable,
+        vmar_id: VmarId,
+        base: u64,
+        len: u64,
+        vmo_id: VmoId,
+        vmo_offset: u64,
+        perms: MappingPerms,
+        max_perms: MappingPerms,
+        cache_policy: MappingCachePolicy,
+        clone_policy: MappingClonePolicy,
+    ) -> Result<(), AddressSpaceError> {
+        self.vm.map_fixed_in_vmar_with_mapping_policy(
+            frames,
+            vmar_id,
+            base,
+            len,
+            vmo_id,
+            vmo_offset,
+            perms,
+            max_perms,
             cache_policy,
             clone_policy,
         )

@@ -14,6 +14,204 @@ pub(in crate::starnix) fn fork_sigactions(
 }
 
 impl StarnixKernel {
+    fn sys_fork_like(
+        &mut self,
+        task_id: i32,
+        stop_state: &mut ax_guest_stop_state_t,
+        child_tid_addr: u64,
+        child_set_tid: bool,
+        child_clear_tid: bool,
+    ) -> Result<SyscallAction, zx_status_t> {
+        let parent_tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let parent_blocked = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .signals
+            .blocked;
+        let parent_thread_handle = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .thread_handle;
+        let (task_image, namespace) = {
+            let group = self.groups.get(&parent_tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let image = group.image.clone().ok_or(ZX_ERR_BAD_STATE)?;
+            let namespace = group
+                .resources
+                .as_ref()
+                .ok_or(ZX_ERR_BAD_STATE)?
+                .fs
+                .namespace
+                .clone();
+            (image, namespace)
+        };
+        let parent_sigactions = fork_sigactions(
+            &self
+                .groups
+                .get(&parent_tgid)
+                .ok_or(ZX_ERR_BAD_STATE)?
+                .sigactions,
+        );
+        let (parent_pgid, parent_sid) = {
+            let parent_group = self.groups.get(&parent_tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            (parent_group.pgid, parent_group.sid)
+        };
+        let (_, _, image_vmo) = match open_exec_image_from_namespace(&namespace, &task_image.path) {
+            Ok(opened) => opened,
+            Err(status) => {
+                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let mut inherited_fs_base = 0u64;
+        if let Err(status) = zx_status_result(ax_thread_get_guest_x64_fs_base(
+            parent_thread_handle,
+            0,
+            &mut inherited_fs_base,
+        )) {
+            let _ = zx_handle_close(image_vmo);
+            complete_syscall(
+                stop_state,
+                linux_errno(map_guest_start_status_to_errno(status)),
+            )?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let child_tgid = self.alloc_tid()?;
+        let packet_key = self.alloc_packet_key()?;
+        let prepared = match prepare_process_carrier(
+            self.parent_process,
+            self.port,
+            packet_key,
+            image_vmo,
+            &task_image.exec_blob,
+        ) {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                let _ = zx_handle_close(image_vmo);
+                complete_syscall(
+                    stop_state,
+                    linux_errno(map_exec_prepare_status_to_errno(status)),
+                )?;
+                return Ok(SyscallAction::Resume);
+            }
+        };
+        let _ = zx_handle_close(image_vmo);
+        if let Err(status) = zx_status_result(ax_thread_set_guest_x64_fs_base(
+            prepared.carrier.thread_handle,
+            inherited_fs_base,
+            0,
+        )) {
+            prepared.close();
+            complete_syscall(
+                stop_state,
+                linux_errno(map_guest_start_status_to_errno(status)),
+            )?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let child_resources = {
+            let parent_resources = self
+                .groups
+                .get(&parent_tgid)
+                .ok_or(ZX_ERR_BAD_STATE)?
+                .resources
+                .as_ref()
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            match parent_resources.fork_clone(prepared.process_handle, prepared.root_vmar) {
+                Ok(resources) => resources,
+                Err(status) => {
+                    prepared.close();
+                    complete_syscall(stop_state, linux_errno(map_vm_status_to_errno(status)))?;
+                    return Ok(SyscallAction::Resume);
+                }
+            }
+        };
+
+        let mut child_regs = stop_state.regs;
+        child_regs.rax = 0;
+        child_regs.rip = child_regs
+            .rip
+            .checked_add(AX_GUEST_X64_SYSCALL_INSN_LEN)
+            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+        let (child_resources, child_carrier) =
+            match start_prepared_carrier_guest(prepared, &child_regs, child_resources) {
+                Ok(started) => started,
+                Err(status) => {
+                    complete_syscall(
+                        stop_state,
+                        linux_errno(map_guest_start_status_to_errno(status)),
+                    )?;
+                    return Ok(SyscallAction::Resume);
+                }
+            };
+        if child_set_tid
+            && child_tid_addr != 0
+            && let Err(status) = write_guest_u32(
+                child_carrier.session_handle,
+                child_tid_addr,
+                child_tgid as u32,
+            )
+        {
+            let process_handle = child_resources.process_handle;
+            child_carrier.kill_and_close();
+            let _ = zx_task_kill(process_handle);
+            let _ = zx_handle_close(process_handle);
+            drop(child_resources);
+            complete_syscall(
+                stop_state,
+                linux_errno(map_guest_memory_status_to_errno(status)),
+            )?;
+            return Ok(SyscallAction::Resume);
+        }
+
+        let mut task_ids = BTreeSet::new();
+        task_ids.insert(child_tgid);
+        self.tasks.insert(
+            child_tgid,
+            LinuxTask {
+                tid: child_tgid,
+                tgid: child_tgid,
+                carrier: child_carrier,
+                state: TaskState::Running,
+                signals: fork_task_signals(parent_blocked),
+                clear_child_tid: if child_clear_tid { child_tid_addr } else { 0 },
+                robust_list: None,
+                active_signal: None,
+            },
+        );
+        self.groups.insert(
+            child_tgid,
+            LinuxThreadGroup {
+                tgid: child_tgid,
+                leader_tid: child_tgid,
+                parent_tgid: Some(parent_tgid),
+                pgid: parent_pgid,
+                sid: parent_sid,
+                child_tgids: BTreeSet::new(),
+                task_ids,
+                state: ThreadGroupState::Running,
+                last_stop_signal: None,
+                stop_wait_pending: false,
+                continued_wait_pending: false,
+                shared_pending: 0,
+                sigchld_info: None,
+                sigactions: parent_sigactions,
+                image: Some(task_image),
+                resources: Some(child_resources),
+            },
+        );
+        self.groups
+            .get_mut(&parent_tgid)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .child_tgids
+            .insert(child_tgid);
+        complete_syscall(stop_state, child_tgid as u64)?;
+        Ok(SyscallAction::Resume)
+    }
+
     pub(in crate::starnix) fn sys_clone(
         &mut self,
         task_id: i32,
@@ -25,6 +223,28 @@ impl StarnixKernel {
         let child_tid_addr = stop_state.regs.r10;
         let tls = stop_state.regs.r8;
         let exit_signal = flags & 0xff;
+        let child_set_tid = (flags & LINUX_CLONE_CHILD_SETTID) != 0;
+        let child_clear_tid = (flags & LINUX_CLONE_CHILD_CLEARTID) != 0;
+        let fork_like_supported = LINUX_CLONE_VM
+            | LINUX_CLONE_VFORK
+            | LINUX_CLONE_CHILD_SETTID
+            | LINUX_CLONE_CHILD_CLEARTID;
+        let fork_like_signal = u64::try_from(LINUX_SIGCHLD).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if (flags & LINUX_CLONE_THREAD) == 0
+            && (flags & !(fork_like_supported | 0xff)) == 0
+            && exit_signal == fork_like_signal
+            && child_stack == 0
+            && parent_tid_addr == 0
+            && tls == 0
+        {
+            return self.sys_fork_like(
+                task_id,
+                stop_state,
+                child_tid_addr,
+                child_set_tid,
+                child_clear_tid,
+            );
+        }
         let supported = LINUX_CLONE_VM
             | LINUX_CLONE_FS
             | LINUX_CLONE_FILES
@@ -157,174 +377,6 @@ impl StarnixKernel {
         task_id: i32,
         stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
-        let parent_tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
-        let parent_blocked = self
-            .tasks
-            .get(&task_id)
-            .ok_or(ZX_ERR_BAD_STATE)?
-            .signals
-            .blocked;
-        let parent_thread_handle = self
-            .tasks
-            .get(&task_id)
-            .ok_or(ZX_ERR_BAD_STATE)?
-            .carrier
-            .thread_handle;
-        let (task_image, namespace) = {
-            let group = self.groups.get(&parent_tgid).ok_or(ZX_ERR_BAD_STATE)?;
-            let image = group.image.clone().ok_or(ZX_ERR_BAD_STATE)?;
-            let namespace = group
-                .resources
-                .as_ref()
-                .ok_or(ZX_ERR_BAD_STATE)?
-                .fs
-                .namespace
-                .clone();
-            (image, namespace)
-        };
-        let parent_sigactions = fork_sigactions(
-            &self
-                .groups
-                .get(&parent_tgid)
-                .ok_or(ZX_ERR_BAD_STATE)?
-                .sigactions,
-        );
-        let (parent_pgid, parent_sid) = {
-            let parent_group = self.groups.get(&parent_tgid).ok_or(ZX_ERR_BAD_STATE)?;
-            (parent_group.pgid, parent_group.sid)
-        };
-        let (_, _, image_vmo) = match open_exec_image_from_namespace(&namespace, &task_image.path) {
-            Ok(opened) => opened,
-            Err(status) => {
-                complete_syscall(stop_state, linux_errno(map_fd_status_to_errno(status)))?;
-                return Ok(SyscallAction::Resume);
-            }
-        };
-        let mut inherited_fs_base = 0u64;
-        if let Err(status) = zx_status_result(ax_thread_get_guest_x64_fs_base(
-            parent_thread_handle,
-            0,
-            &mut inherited_fs_base,
-        )) {
-            let _ = zx_handle_close(image_vmo);
-            complete_syscall(
-                stop_state,
-                linux_errno(map_guest_start_status_to_errno(status)),
-            )?;
-            return Ok(SyscallAction::Resume);
-        }
-
-        let child_tgid = self.alloc_tid()?;
-        let packet_key = self.alloc_packet_key()?;
-        let prepared = match prepare_process_carrier(
-            self.parent_process,
-            self.port,
-            packet_key,
-            image_vmo,
-            &task_image.exec_blob,
-        ) {
-            Ok(prepared) => prepared,
-            Err(status) => {
-                let _ = zx_handle_close(image_vmo);
-                complete_syscall(
-                    stop_state,
-                    linux_errno(map_exec_prepare_status_to_errno(status)),
-                )?;
-                return Ok(SyscallAction::Resume);
-            }
-        };
-        let _ = zx_handle_close(image_vmo);
-        if let Err(status) = zx_status_result(ax_thread_set_guest_x64_fs_base(
-            prepared.carrier.thread_handle,
-            inherited_fs_base,
-            0,
-        )) {
-            prepared.close();
-            complete_syscall(
-                stop_state,
-                linux_errno(map_guest_start_status_to_errno(status)),
-            )?;
-            return Ok(SyscallAction::Resume);
-        }
-
-        let child_resources = {
-            let parent_resources = self
-                .groups
-                .get(&parent_tgid)
-                .ok_or(ZX_ERR_BAD_STATE)?
-                .resources
-                .as_ref()
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            match parent_resources.fork_clone(prepared.process_handle, prepared.root_vmar) {
-                Ok(resources) => resources,
-                Err(status) => {
-                    prepared.close();
-                    complete_syscall(stop_state, linux_errno(map_vm_status_to_errno(status)))?;
-                    return Ok(SyscallAction::Resume);
-                }
-            }
-        };
-
-        let mut child_regs = stop_state.regs;
-        child_regs.rax = 0;
-        child_regs.rip = child_regs
-            .rip
-            .checked_add(AX_GUEST_X64_SYSCALL_INSN_LEN)
-            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-        let (child_resources, child_carrier) =
-            match start_prepared_carrier_guest(prepared, &child_regs, child_resources) {
-                Ok(started) => started,
-                Err(status) => {
-                    complete_syscall(
-                        stop_state,
-                        linux_errno(map_guest_start_status_to_errno(status)),
-                    )?;
-                    return Ok(SyscallAction::Resume);
-                }
-            };
-
-        let mut task_ids = BTreeSet::new();
-        task_ids.insert(child_tgid);
-        self.tasks.insert(
-            child_tgid,
-            LinuxTask {
-                tid: child_tgid,
-                tgid: child_tgid,
-                carrier: child_carrier,
-                state: TaskState::Running,
-                signals: fork_task_signals(parent_blocked),
-                clear_child_tid: 0,
-                robust_list: None,
-                active_signal: None,
-            },
-        );
-        self.groups.insert(
-            child_tgid,
-            LinuxThreadGroup {
-                tgid: child_tgid,
-                leader_tid: child_tgid,
-                parent_tgid: Some(parent_tgid),
-                pgid: parent_pgid,
-                sid: parent_sid,
-                child_tgids: BTreeSet::new(),
-                task_ids,
-                state: ThreadGroupState::Running,
-                last_stop_signal: None,
-                stop_wait_pending: false,
-                continued_wait_pending: false,
-                shared_pending: 0,
-                sigchld_info: None,
-                sigactions: parent_sigactions,
-                image: Some(task_image),
-                resources: Some(child_resources),
-            },
-        );
-        self.groups
-            .get_mut(&parent_tgid)
-            .ok_or(ZX_ERR_BAD_STATE)?
-            .child_tgids
-            .insert(child_tgid);
-        complete_syscall(stop_state, child_tgid as u64)?;
-        Ok(SyscallAction::Resume)
+        self.sys_fork_like(task_id, stop_state, 0, false, false)
     }
 }

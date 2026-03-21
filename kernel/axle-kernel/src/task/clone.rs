@@ -7,6 +7,7 @@ struct VmarClonePlan {
     len: u64,
     vmo_offset: u64,
     perms: MappingPerms,
+    max_perms: MappingPerms,
     cache_policy: MappingCachePolicy,
     clone_policy: MappingClonePolicy,
     source_vmo_id: VmoId,
@@ -118,6 +119,7 @@ impl VmDomain {
                 len: vma.len(),
                 vmo_offset: map_rec.vmo_offset(),
                 perms: vma.perms(),
+                max_perms: map_rec.max_perms(),
                 cache_policy: map_rec.cache_policy(),
                 clone_policy: vma.clone_policy(),
                 source_vmo_id: map_rec.vmo_id(),
@@ -175,6 +177,7 @@ impl VmDomain {
                 shared_src_vmo_id,
                 plan.vmo_offset,
                 plan.perms,
+                plan.max_perms,
                 MappingClonePolicy::SharedAlias,
             )?;
         }
@@ -193,6 +196,7 @@ impl VmDomain {
             shared_dst_vmo_id,
             plan.vmo_offset,
             plan.perms,
+            plan.max_perms,
             MappingClonePolicy::SharedAlias,
         )?;
         Ok(())
@@ -231,6 +235,7 @@ impl VmDomain {
             dst_vmo_id,
             plan.vmo_offset,
             plan.perms,
+            plan.max_perms,
             MappingClonePolicy::PrivateCow,
         )?;
         self.with_address_space_frames_mut(dst_address_space_id, |address_space, _frames| {

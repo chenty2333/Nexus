@@ -231,6 +231,7 @@ impl StarnixKernel {
             LINUX_SYSCALL_LSEEK => self.sys_lseek(task_id, stop_state),
             LINUX_SYSCALL_PREAD64 => self.sys_pread64(task_id, stop_state),
             LINUX_SYSCALL_PWRITE64 => self.sys_pwrite64(task_id, stop_state),
+            LINUX_SYSCALL_IOCTL => self.sys_ioctl(task_id, stop_state),
             LINUX_SYSCALL_GETPID => self.sys_getpid(task_id, stop_state),
             LINUX_SYSCALL_GETTID => self.sys_gettid(task_id, stop_state),
             LINUX_SYSCALL_GETPPID => self.sys_getppid(task_id, stop_state),
@@ -271,6 +272,7 @@ impl StarnixKernel {
             LINUX_SYSCALL_RT_SIGRETURN => self.sys_rt_sigreturn(task_id, stop_state),
             LINUX_SYSCALL_CLONE => self.sys_clone(task_id, stop_state),
             LINUX_SYSCALL_FORK => self.sys_fork(task_id, stop_state),
+            LINUX_SYSCALL_VFORK => self.sys_fork(task_id, stop_state),
             LINUX_SYSCALL_EXECVE => self.sys_execve(task_id, stop_state),
             LINUX_SYSCALL_WAIT4 => self.sys_wait4(task_id, stop_state),
             LINUX_SYSCALL_KILL => self.sys_kill(task_id, stop_state, stdout),
@@ -279,8 +281,13 @@ impl StarnixKernel {
                 self.sys_pidfd_send_signal(task_id, stop_state, stdout)
             }
             LINUX_SYSCALL_PIDFD_OPEN => self.sys_pidfd_open(task_id, stop_state),
+            LINUX_SYSCALL_MKDIR => self.sys_mkdir(task_id, stop_state),
+            LINUX_SYSCALL_RMDIR => self.sys_rmdir(task_id, stop_state),
+            LINUX_SYSCALL_UNLINK => self.sys_unlink(task_id, stop_state),
             LINUX_SYSCALL_OPENAT => self.sys_openat(task_id, stop_state),
+            LINUX_SYSCALL_MKDIRAT => self.sys_mkdirat(task_id, stop_state),
             LINUX_SYSCALL_NEWFSTATAT => self.sys_newfstatat(task_id, stop_state),
+            LINUX_SYSCALL_UNLINKAT => self.sys_unlinkat(task_id, stop_state),
             _ => {
                 let session = self
                     .tasks
