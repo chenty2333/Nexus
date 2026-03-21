@@ -1,3 +1,4 @@
+use super::super::fs::tty::tty_endpoint_identity;
 use super::super::*;
 
 impl StarnixKernel {
@@ -7,13 +8,24 @@ impl StarnixKernel {
         fd: i32,
         op: FdWaitOp,
     ) -> Result<Option<i32>, zx_status_t> {
-        let signal = match (fd, op) {
-            (0, FdWaitOp::Read) => LINUX_SIGTTIN,
-            (1 | 2, FdWaitOp::Write) => LINUX_SIGTTOU,
-            _ => return Ok(None),
+        let signal = match op {
+            FdWaitOp::Read => LINUX_SIGTTIN,
+            FdWaitOp::Write => LINUX_SIGTTOU,
         };
         let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
         let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+        let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+        let entry = match resources.fs.fd_table.get(fd) {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
+        let Some((tty_id, is_slave)) = tty_endpoint_identity(entry.description().ops().as_ref())
+        else {
+            return Ok(None);
+        };
+        if !is_slave || resources.fs.controlling_tty_id() != Some(tty_id) {
+            return Ok(None);
+        }
         let Some(foreground_pgid) = self.foreground_pgid(group.sid) else {
             return Ok(None);
         };
@@ -38,6 +50,9 @@ impl StarnixKernel {
             SignalDeliveryAction::Ignore => Ok(None),
             SignalDeliveryAction::Terminate => Ok(Some(SyscallAction::GroupSignalExit(signal))),
             SignalDeliveryAction::Stop => {
+                if matches!(op, FdWaitOp::Read) {
+                    complete_syscall(stop_state, linux_errno(LINUX_EINTR))?;
+                }
                 let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
                 self.enter_group_stop(tgid, signal)?;
                 Ok(Some(SyscallAction::LeaveStopped))

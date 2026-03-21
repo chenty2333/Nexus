@@ -1,4 +1,5 @@
 use super::super::fs::fd::FsContext;
+use super::super::fs::tty::PtyRegistry;
 use super::super::*;
 use super::std::sync::Mutex as StdMutex;
 use alloc::sync::Arc;
@@ -121,8 +122,11 @@ pub(super) fn test_kernel_with_stdio(stdout: RecordingFd) -> StarnixKernel {
         process_handle: ZX_HANDLE_INVALID,
         fs: FsContext {
             fd_table,
+            base_namespace: ProcessNamespace::new(NamespaceTrie::new()),
             namespace: ProcessNamespace::new(NamespaceTrie::new()),
             directory_offsets: BTreeMap::new(),
+            pty_registry: Arc::new(PtyRegistry::new()),
+            controlling_tty: Arc::new(Mutex::new(None)),
         },
         mm: test_linux_mm(),
     };

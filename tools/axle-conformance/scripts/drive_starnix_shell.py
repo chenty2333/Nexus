@@ -78,6 +78,7 @@ def shell_steps() -> list[ShellStep]:
     return [
         ShellStep("echo shell-ok", b"shell-ok"),
         ShellStep("ls / && echo ls-ok", b"ls-ok"),
+        ShellStep("ls /dev/ptmx /dev/pts /dev/pts/0 && echo tty-ok", b"tty-ok"),
         ShellStep("cat /etc/passwd && echo cat-ok", b"cat-ok"),
         ShellStep("mkdir /tmp/shell-dir && echo mkdir-ok", b"mkdir-ok"),
         ShellStep("echo rm-me > /tmp/rm-me", PROMPT),
@@ -126,7 +127,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--kernel", required=True)
     parser.add_argument("--init", required=True)
-    parser.add_argument("--timeout", type=float, default=90.0)
+    parser.add_argument("--timeout", type=float, default=150.0)
     args = parser.parse_args()
 
     init_size = int(subprocess.check_output(["stat", "-c%s", args.init], text=True).strip())
@@ -167,13 +168,14 @@ def main() -> int:
     full = transcript.snapshot()
     if b"can't access tty" in full:
         raise RuntimeError("shell transcript still reports missing tty")
-    required = [b"shell-ok", b"ls-ok", b"cat-ok", b"mkdir-ok", b"rm-ok", b"ps-ok"]
+    required = [b"shell-ok", b"ls-ok", b"tty-ok", b"cat-ok", b"mkdir-ok", b"rm-ok", b"ps-ok"]
     for needle in required:
         if needle not in full:
             raise RuntimeError(f"missing shell transcript token {needle!r}")
     echoed = [
         b"echo shell-ok",
         b"ls / && echo ls-ok",
+        b"ls /dev/ptmx /dev/pts /dev/pts/0 && echo tty-ok",
         b"cat /etc/passwd && echo cat-ok",
         b"mkdir /tmp/shell-dir && echo mkdir-ok",
         b"ps && echo ps-ok",

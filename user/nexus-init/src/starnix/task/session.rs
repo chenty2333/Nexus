@@ -73,6 +73,9 @@ impl StarnixKernel {
             } else {
                 group.sid = tgid;
                 group.pgid = tgid;
+                if let Some(resources) = group.resources.as_mut() {
+                    resources.fs.set_controlling_tty(None);
+                }
                 tgid as u64
             }
         };

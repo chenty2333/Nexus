@@ -506,16 +506,19 @@ That host gate now explicitly covers:
     child while it remains in group-stop
   - the bootstrap gate intentionally keeps tty ownership policy narrow:
     foreground/background is modeled only for the inherited stdio set over one
-    shared bootstrap console tty
+    shared executive tty core and its controlling slave pty
   - the same shell-facing console slice now also proves:
     - `TCGETS` / `TCSETS*`
     - `TIOCGWINSZ` / `TIOCSWINSZ`
     - `TIOCGPGRP` / `TIOCSPGRP`
     - shell-visible character echo over the inherited stdio set
+    - `/dev/ptmx`
+    - `/dev/pts/0`
+    - slave-pty-backed controlling tty for the shell stdio set
   - the bootstrap gate still intentionally excludes:
-    - `devpts`
-    - `ptmx` / Unix98 pty allocation
-    - broader tty discipline beyond the shared bootstrap console
+    - pty readiness through `poll` / `epoll`
+    - packet mode and broader tty ioctl coverage
+    - network-facing pty sessions such as `sshd`
 - The first post-R7 loader/runtime scenario now closes one narrow dynamic-ELF
   bootstrap slice:
   - `execve` of one ET_EXEC or fixed-bias ET_DYN main image carrying `PT_INTERP`
@@ -656,6 +659,12 @@ This makes contract coverage part of the repo workflow, not just informal docume
     - the same driver now also asserts:
       - the shell no longer reports `can't access tty`
       - typed commands are echoed before execution
+      - `/dev/ptmx`, `/dev/pts`, and `/dev/pts/0` are present inside the shell
+  - the older `kernel.starnix.round6_proc_tty_bootstrap` smoke has now been
+    retired
+    - its job-control and `/proc` coverage is superseded by:
+      - host semantic tests under `starnix/tests/{process,procfs}.rs`
+      - the pty-backed shell slice above
 
 ## Runner model
 

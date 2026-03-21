@@ -1,4 +1,7 @@
-use super::super::fs::console::{LINUX_TIOCGPGRP, LINUX_TIOCSPGRP};
+use super::super::fs::tty::{
+    LINUX_TIOCGPGRP, LINUX_TIOCNOTTY, LINUX_TIOCSCTTY, LINUX_TIOCSPGRP, PtySlaveFd,
+    tty_endpoint_identity,
+};
 use super::super::*;
 
 fn write_linux_uname_field(field: &mut [u8], value: &str) {
@@ -334,7 +337,13 @@ impl StarnixKernel {
 
         let result = match request {
             LINUX_TIOCGPGRP => {
-                if !ops.as_any().is::<ConsoleFd>() {
+                let Some((tty_id, is_slave)) = tty_endpoint_identity(ops.as_ref()) else {
+                    complete_syscall(stop_state, linux_errno(LINUX_ENOTTY))?;
+                    return Ok(SyscallAction::Resume);
+                };
+                let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+                if !is_slave || resources.fs.controlling_tty_id() != Some(tty_id) {
                     linux_errno(LINUX_ENOTTY)
                 } else {
                     let sid = self.task_sid(task_id)?;
@@ -348,7 +357,13 @@ impl StarnixKernel {
                 }
             }
             LINUX_TIOCSPGRP => {
-                if !ops.as_any().is::<ConsoleFd>() {
+                let Some((tty_id, is_slave)) = tty_endpoint_identity(ops.as_ref()) else {
+                    complete_syscall(stop_state, linux_errno(LINUX_ENOTTY))?;
+                    return Ok(SyscallAction::Resume);
+                };
+                let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+                if !is_slave || resources.fs.controlling_tty_id() != Some(tty_id) {
                     linux_errno(LINUX_ENOTTY)
                 } else {
                     if let Some(action) =
@@ -373,6 +388,45 @@ impl StarnixKernel {
                         self.foreground_pgid_by_sid.insert(sid, pgid);
                         0
                     }
+                }
+            }
+            LINUX_TIOCSCTTY => {
+                let Some((_tty_id, is_slave)) = tty_endpoint_identity(ops.as_ref()) else {
+                    complete_syscall(stop_state, linux_errno(LINUX_ENOTTY))?;
+                    return Ok(SyscallAction::Resume);
+                };
+                if !is_slave {
+                    linux_errno(LINUX_ENOTTY)
+                } else {
+                    let sid = self.task_sid(task_id)?;
+                    let caller_pgid = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?.pgid;
+                    if sid != tgid || caller_pgid != tgid {
+                        linux_errno(LINUX_EPERM)
+                    } else if let Some(slave) = ops.as_any().downcast_ref::<PtySlaveFd>() {
+                        let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                        let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+                        resources
+                            .fs
+                            .set_controlling_tty(Some(Arc::new(slave.clone())));
+                        self.foreground_pgid_by_sid.insert(sid, caller_pgid);
+                        0
+                    } else {
+                        linux_errno(LINUX_ENOTTY)
+                    }
+                }
+            }
+            LINUX_TIOCNOTTY => {
+                let Some((tty_id, is_slave)) = tty_endpoint_identity(ops.as_ref()) else {
+                    complete_syscall(stop_state, linux_errno(LINUX_ENOTTY))?;
+                    return Ok(SyscallAction::Resume);
+                };
+                let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
+                if !is_slave || resources.fs.controlling_tty_id() != Some(tty_id) {
+                    linux_errno(LINUX_ENOTTY)
+                } else {
+                    resources.fs.set_controlling_tty(None);
+                    0
                 }
             }
             _ => {

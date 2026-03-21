@@ -242,6 +242,9 @@ Work:
   - `fork` / `execve` mm, fd, and signal inheritance/reset behavior
 - Keep smoke binaries and conformance scenarios as integration coverage on top
   of those semantic tests.
+- The old dedicated Round-6 proc/tty guest smoke is now superseded by:
+  - host semantic tests for job-control and procfs state
+  - the `busybox ash` shell slice over `devpts` / `ptmx` / controlling tty
 
 Exit criteria:
 
@@ -269,8 +272,10 @@ Work:
     heap/mmap `fork` clone slice
   - better `fork`
   - broader Linux fs/socket/signal semantics
-  - shell-oriented `devpts` / `ptmx` / pty follow-on after the current
-    tty-backed bootstrap console shell slice
+  - network / sshd follow-on after the current `busybox ash` shell slice over
+    `devpts` / `ptmx` / controlling-tty pty
+  - broader tty follow-on beyond the current narrow shell slice:
+    `poll` / `epoll` readiness, packet mode, and wider tty ioctl coverage
 
 Exit criteria:
 

@@ -1,6 +1,6 @@
 use super::super::*;
-use super::console::ConsoleFd;
-use super::devfs::{DevDirFd, NullFd, ZeroFd};
+use super::devfs::{NullFd, ZeroFd};
+use super::tty::{DevDirFd, DevPtsDirFd, PtyMasterFd, PtySlaveFd};
 
 #[derive(Clone)]
 pub(in crate::starnix) struct ProcRootFd {
@@ -896,7 +896,7 @@ pub(in crate::starnix) fn stat_metadata_for_ops(
             inode: 0x1002,
         });
     }
-    if ops.as_any().is::<ConsoleFd>() {
+    if ops.as_any().is::<PtyMasterFd>() || ops.as_any().is::<PtySlaveFd>() {
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFCHR | 0o666,
             size_bytes: 0,
@@ -916,6 +916,7 @@ pub(in crate::starnix) fn stat_metadata_for_ops(
         || ops.as_any().is::<ProcThreadDirFd>()
         || ops.as_any().is::<ProcFdDirFd>()
         || ops.as_any().is::<DevDirFd>()
+        || ops.as_any().is::<DevPtsDirFd>()
     {
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFDIR | 0o555,

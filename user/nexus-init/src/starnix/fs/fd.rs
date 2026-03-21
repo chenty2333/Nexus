@@ -1,5 +1,6 @@
 use super::super::*;
-use super::devfs::{DevDirFd, NullFd, ZeroFd};
+use super::devfs::{NullFd, ZeroFd};
+use super::tty::{DevDirFd, PtyRegistry, PtySlaveFd};
 
 #[derive(Clone, Copy)]
 pub(in crate::starnix) struct LinuxStatMetadata {
@@ -27,8 +28,11 @@ impl StdioMode {
 
 pub(in crate::starnix) struct FsContext {
     pub(in crate::starnix) fd_table: FdTable,
+    pub(in crate::starnix) base_namespace: nexus_io::ProcessNamespace,
     pub(in crate::starnix) namespace: nexus_io::ProcessNamespace,
     pub(in crate::starnix) directory_offsets: BTreeMap<u64, usize>,
+    pub(in crate::starnix) pty_registry: Arc<PtyRegistry>,
+    pub(in crate::starnix) controlling_tty: Arc<Mutex<Option<Arc<PtySlaveFd>>>>,
 }
 
 pub(in crate::starnix) struct ProcessResources {
@@ -38,12 +42,41 @@ pub(in crate::starnix) struct ProcessResources {
 }
 
 impl FsContext {
+    fn build_namespace(
+        base_namespace: &nexus_io::ProcessNamespace,
+        view_namespace: &nexus_io::ProcessNamespace,
+        pty_registry: Arc<PtyRegistry>,
+        controlling_tty: Arc<Mutex<Option<Arc<PtySlaveFd>>>>,
+    ) -> Result<nexus_io::ProcessNamespace, zx_status_t> {
+        let null_fd: Arc<dyn FdOps> = Arc::new(NullFd);
+        let zero_fd: Arc<dyn FdOps> = Arc::new(ZeroFd);
+        let dev_root: Arc<dyn FdOps> = Arc::new(DevDirFd::new(
+            controlling_tty,
+            pty_registry,
+            null_fd,
+            zero_fd,
+        ));
+        let mut mounts = base_namespace.mounts().clone();
+        mounts.insert("/dev", dev_root)?;
+        let mut namespace = nexus_io::ProcessNamespace::new(mounts);
+        if namespace.mounts().get(view_namespace.root())?.is_some() || view_namespace.root() != "/"
+        {
+            namespace.set_root(view_namespace.root())?;
+        }
+        if view_namespace.cwd() != "/" {
+            namespace.set_cwd(view_namespace.cwd())?;
+        }
+        Ok(namespace)
+    }
+
     fn new(
         stdio_mode: StdioMode,
         stdout_handle: Option<zx_handle_t>,
-        namespace: nexus_io::ProcessNamespace,
+        base_namespace: nexus_io::ProcessNamespace,
     ) -> Result<Self, zx_status_t> {
         let mut fd_table = FdTable::new();
+        let pty_registry = Arc::new(PtyRegistry::new());
+        let controlling_tty = Arc::new(Mutex::new(None));
         let namespace = match stdio_mode {
             StdioMode::Socket => {
                 let stdin_fd = fd_table.open(
@@ -63,20 +96,22 @@ impl FsContext {
                     let _ = zx_handle_close(handle);
                     install_result?;
                 }
-                namespace
+                Self::build_namespace(
+                    &base_namespace,
+                    &base_namespace,
+                    pty_registry.clone(),
+                    controlling_tty.clone(),
+                )?
             }
             StdioMode::Console => {
-                let tty = Arc::new(ConsoleFd::new());
-                let null_fd: Arc<dyn FdOps> = Arc::new(NullFd);
-                let zero_fd: Arc<dyn FdOps> = Arc::new(ZeroFd);
-                let dev_root: Arc<dyn FdOps> = Arc::new(DevDirFd::new(
-                    tty.clone(),
-                    Arc::clone(&null_fd),
-                    Arc::clone(&zero_fd),
-                ));
-                let mut mounts = namespace.mounts().clone();
-                mounts.insert("/dev", dev_root)?;
-                let namespace = nexus_io::ProcessNamespace::new(mounts);
+                let tty = pty_registry.allocate_console_slave();
+                *controlling_tty.lock() = Some(tty.clone());
+                let namespace = Self::build_namespace(
+                    &base_namespace,
+                    &base_namespace,
+                    pty_registry.clone(),
+                    controlling_tty.clone(),
+                )?;
                 install_console_stdio_fd(&mut fd_table, tty.clone(), OpenFlags::READABLE, 0)?;
                 install_console_stdio_fd(
                     &mut fd_table,
@@ -98,16 +133,30 @@ impl FsContext {
         };
         Ok(Self {
             fd_table,
+            base_namespace,
             namespace,
             directory_offsets: BTreeMap::new(),
+            pty_registry,
+            controlling_tty,
         })
     }
 
     pub(in crate::starnix) fn fork_clone(&self) -> Self {
+        let controlling_tty = Arc::new(Mutex::new(self.controlling_tty.lock().clone()));
+        let namespace = Self::build_namespace(
+            &self.base_namespace,
+            &self.namespace,
+            self.pty_registry.clone(),
+            controlling_tty.clone(),
+        )
+        .expect("fork-clone dev namespace");
         Self {
             fd_table: self.fd_table.clone(),
-            namespace: self.namespace.clone(),
+            base_namespace: self.base_namespace.clone(),
+            namespace,
             directory_offsets: self.directory_offsets.clone(),
+            pty_registry: self.pty_registry.clone(),
+            controlling_tty,
         }
     }
 
@@ -125,11 +174,30 @@ impl FsContext {
             }
             fd = fd.saturating_add(1);
         }
+        let controlling_tty = Arc::new(Mutex::new(self.controlling_tty.lock().clone()));
+        let namespace = Self::build_namespace(
+            &self.base_namespace,
+            &self.namespace,
+            self.pty_registry.clone(),
+            controlling_tty.clone(),
+        )
+        .expect("exec dev namespace");
         Self {
             fd_table,
-            namespace: self.namespace.clone(),
+            base_namespace: self.base_namespace.clone(),
+            namespace,
             directory_offsets: BTreeMap::new(),
+            pty_registry: self.pty_registry.clone(),
+            controlling_tty,
         }
+    }
+
+    pub(in crate::starnix) fn controlling_tty_id(&self) -> Option<u64> {
+        self.controlling_tty.lock().as_ref().map(|tty| tty.tty_id())
+    }
+
+    pub(in crate::starnix) fn set_controlling_tty(&self, tty: Option<Arc<PtySlaveFd>>) {
+        *self.controlling_tty.lock() = tty;
     }
 }
 

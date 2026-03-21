@@ -10,7 +10,6 @@ mod task;
 #[allow(unused_imports)]
 pub(in crate::starnix) use self::fs::anon_inode::LinuxItimerSpec;
 use self::fs::anon_inode::{EventFd, PidFd, PidFdState, SignalFd, SignalFdState, TimerFd};
-use self::fs::console::ConsoleFd;
 use self::fs::fd::{LinuxStatMetadata, ProcessResources};
 #[allow(unused_imports)]
 pub(in crate::starnix) use self::fs::fd::{

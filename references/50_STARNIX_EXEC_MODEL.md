@@ -729,19 +729,27 @@ forcing every syscall through one uniform RPC layer.
       plus `/bin/{sh,ls,cat,echo,mkdir,rm,ps}`, `/etc/passwd`, `/proc`, and
       writable `/tmp`
     - `NEXUS_STARNIX_STDIO=console` now binds stdio to one shared executive
-      tty-like console endpoint so QEMU can enter an interactive shell without
-      adding Linux-only kernel objects
-    - the current console shell now includes one narrow tty discipline:
+      tty core and one slave pty so QEMU can enter an interactive shell
+      without adding Linux-only kernel objects
+    - the current shell slice now includes one narrow tty / pty stack:
       - canonical line buffering
       - input echo
       - `TCGETS` / `TCSETS*`
       - `TIOCGWINSZ` / `TIOCSWINSZ`
       - `TIOCGPGRP` / `TIOCSPGRP`
-      - `/dev/tty`, `/dev/null`, and `/dev/zero`
+      - `TIOCSCTTY` / `TIOCNOTTY`
+      - `/dev/tty`, `/dev/null`, `/dev/zero`
+      - `/dev/ptmx`
+      - `/dev/pts/<n>` re-export of allocated slave ptys
+      - shell stdio attached to one controlling slave pty rather than the raw
+        bootstrap console
     - the shell slice is intentionally narrow:
-      - no `devpts` / `ptmx` / `pty` stack yet
-      - no Unix98 pty allocation path or `devpts` mount model yet
-      - no broader tty discipline beyond the shared bootstrap console
+      - no poll/epoll readiness integration for pty master/slave endpoints yet
+      - no packet mode, line-speed, or broader tty ioctl surface yet
+      - no network or sshd session integration yet
+    - the older dedicated `round6_proc_tty` guest smoke is now superseded by:
+      - host-side process/procfs semantic tests
+      - the pty-backed shell conformance slice
   - no restart blocks / `sigaltstack` yet
   - no epoll model yet
 - `fork` currently clones the Linux-side control plane and eagerly copies the
