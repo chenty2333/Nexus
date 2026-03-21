@@ -274,6 +274,14 @@ Work:
   - broader Linux fs/socket/signal semantics
   - network / sshd follow-on after the current `busybox ash` shell slice over
     `devpts` / `ptmx` / controlling-tty pty
+    - first narrow inet loopback slice is now in-tree:
+      `AF_INET/SOCK_STREAM`, `bind/listen/connect/accept`, `shutdown`,
+      `getsockname/getpeername`, minimal `setsockopt/getsockopt`,
+      and readiness projection into the shared `epoll` bridge
+    - next cuts are:
+      - real packet transport integration over the current ring3 virtio path
+      - host-forwarded QEMU networking
+      - sshd + pty shell
   - broader tty follow-on beyond the current narrow shell slice:
     `poll` / `epoll` readiness, packet mode, and wider tty ioctl coverage
 

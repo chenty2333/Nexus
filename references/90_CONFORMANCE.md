@@ -53,7 +53,7 @@ Main just targets include:
 `just xlint` and `just xtest` now both include `nexus-init`, so Starnix host-side semantic tests
 are part of the default merge-blocking host gate rather than living only behind QEMU smoke.
 Those host-side semantic checks now live in focused internal modules under
-`user/nexus-init/src/starnix/tests/{fd,process,signal,poll,procfs}.rs` rather
+`user/nexus-init/src/starnix/tests/{fd,net,poll,procfs,process,signal}.rs` rather
 than one monolithic inline `starnix/mod.rs` test block.
 That host gate now explicitly covers:
 - `dup2` / `dup3` open-file-description sharing
@@ -67,6 +67,10 @@ That host gate now explicitly covers:
 - `execve`-side `CLOEXEC` cleanup and caught-signal reset helpers
 - `/proc/self/fd/*` anon-inode projection for `signalfd` / `pidfd` /
   `eventpoll`
+- one first inet loopback semantic slice:
+  - listener accept plus bidirectional stream bytes
+  - readiness projection into `epoll`
+  - inet sockets projecting as `S_IFSOCK` in proc/stat metadata
 
 ## Contract catalog
 
@@ -728,6 +732,10 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - when stdin is a tty, the recipe now temporarily switches the host terminal
     to raw/no-echo mode before launching QEMU so character-at-a-time shell
     input reaches the guest instead of being line-buffered by the host
+  - `just starnix-shell-kvm`
+  - same shell path, but under `-machine q35,accel=kvm -cpu host`
+  - this is the preferred day-to-day interactive entrypoint because busybox
+    applet `execve` latency is dramatically lower than under pure TCG
 - The bootstrap code window above 4 GiB now spans 16 MiB, which keeps the
   runtime dispatcher runner, current `nexus-init` manager images, and the
   shared summary pages from overlapping in the fixed bootstrap mapping.
@@ -753,6 +761,20 @@ This makes contract coverage part of the repo workflow, not just informal docume
     - physical VMO aliasing over an existing contiguous page
     - physical VMO pin into one `DmaRegion` object with explicit DMA permission bits plus
       pinned-range paddr lookup
+- Starnix inet coverage now has its first QEMU guest-facing loopback gate:
+  - `kernel.starnix.runtime_net_bootstrap`
+  - one guest payload now proves:
+    - `socket(AF_INET, SOCK_STREAM)`
+    - `bind` / `listen` / `accept4`
+    - `connect`
+    - `shutdown`
+    - `getsockname` / `getpeername`
+    - minimal `SO_REUSEADDR` / `TCP_NODELAY`
+    - stream byte exchange plus EOF after half-close
+  - no QEMU host-forwarded networking gate exists yet
+  - no sshd gate exists yet
+  - those remain the next network-facing vertical-slice cuts after the current
+    shell + loopback milestone
 - `tools/axle-concurrency` is a host-side Snowcat-lite runner for concurrent seeds:
   - seeds carry both operation programs and schedule hints
   - replay metadata includes runner version, logical CPU count, flags, PRNG seed, and step budget

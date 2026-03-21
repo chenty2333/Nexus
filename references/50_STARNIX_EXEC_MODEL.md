@@ -272,7 +272,7 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
       - blocking message I/O
   - host-side semantic tests in `nexus-init` now cover:
     - dedicated internal semantic test modules under
-      `user/nexus-init/src/starnix/tests/{fd,process,signal,poll,procfs}.rs`
+      `user/nexus-init/src/starnix/tests/{fd,net,poll,procfs,process,signal}.rs`
       instead of one monolithic inline test block
     - `dup2` / `dup3` open-file-description sharing
     - `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC` descriptor-table duplication rules
@@ -288,6 +288,13 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - one narrow exec-mm writable-range reset rule
     - `/proc/self/fd/*` anon-inode projection for `signalfd` / `pidfd` /
       `eventpoll`
+    - one narrow Starnix-owned inet loopback slice:
+      - `AF_INET` / `SOCK_STREAM`
+      - `bind` / `listen` / `connect` / `accept`
+      - `shutdown`
+      - `getsockname` / `getpeername`
+      - minimal `setsockopt` / `getsockopt`
+      - `epoll` readability projection from the socket wait signals
 
 ## Frozen architectural split
 
@@ -333,6 +340,11 @@ The Starnix executive is a userspace semantic layer. It owns:
   - `FsContext`
   - Linux fd table state
   - synthetic anon-inode style objects such as `eventfd`
+- Linux network semantic objects:
+  - `InetSocketFd`
+  - `LoopbackNetStack`
+  - listener / stream endpoint state
+  - Linux socket-option and readiness state
 - Linux signal state:
   - blocked masks
   - per-task pending
@@ -566,6 +578,13 @@ Early mapping strategy is frozen as:
   stream-socket pairs
 - `AF_UNIX` datagram / seqpacket semantics stay in the Starnix socket layer and
   should not be forced into the current Axle stream socket object
+- the current first `AF_INET` slice also stays executive-owned:
+  - loopback listeners and streams are Starnix semantic objects, not Axle
+    kernel socket families
+  - readiness is projected through synthetic wait handles plus the existing
+    executive `epoll` bridge
+  - later real-packet transport work must preserve that layering when it moves
+    from loopback-only semantics to the ring3 virtio dataplane
 - `SCM_RIGHTS` should reuse Axle channel handle transfer as the transport
   mechanism underneath Linux file-description passing
 - large message optimization may reuse Axle channel loan/remap/fallback-copy
@@ -750,6 +769,25 @@ forcing every syscall through one uniform RPC layer.
     - the older dedicated `round6_proc_tty` guest smoke is now superseded by:
       - host-side process/procfs semantic tests
       - the pty-backed shell conformance slice
+  - one first post-shell inet slice now also exists:
+    - `socket(AF_INET, SOCK_STREAM)` stays wholly in the Starnix executive
+    - current support now covers:
+      - `bind`
+      - `listen`
+      - `accept4`
+      - `connect`
+      - `shutdown`
+      - `getsockname` / `getpeername`
+      - minimal `setsockopt` / `getsockopt`
+    - accepted/listening/connected sockets now participate in the shared
+      blocked-op model and project readiness into the existing `epoll` bridge
+    - `/proc/self/fd/*` now projects those inet sockets as `socket:[...]`
+    - the current inet slice is intentionally narrow:
+      - loopback only (`127.0.0.1`)
+      - `SOCK_STREAM` only
+      - no ring3 virtio transport integration yet
+      - no QEMU host-forwarded networking yet
+      - no sshd integration yet
   - no restart blocks / `sigaltstack` yet
   - no epoll model yet
 - `fork` currently clones the Linux-side control plane and eagerly copies the

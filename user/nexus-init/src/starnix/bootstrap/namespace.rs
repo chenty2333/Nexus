@@ -120,6 +120,12 @@ pub(super) fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx
             LINUX_RUNTIME_PROCESS_BYTES,
         ));
     }
+    if !LINUX_RUNTIME_NET_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            LINUX_RUNTIME_NET_BINARY_PATH,
+            LINUX_RUNTIME_NET_BYTES,
+        ));
+    }
     if !LINUX_RUNTIME_FS_BYTES.is_empty() {
         assets.push(BootAssetEntry::bytes(
             LINUX_RUNTIME_FS_BINARY_PATH,
@@ -320,6 +326,12 @@ pub(super) fn build_starnix_namespace() -> Result<nexus_io::ProcessNamespace, zx
         assets.push(BootAssetEntry::bytes(
             "manifests/linux-runtime-process-smoke.nxcd",
             LINUX_RUNTIME_PROCESS_DECL_BYTES,
+        ));
+    }
+    if !LINUX_RUNTIME_NET_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-runtime-net-smoke.nxcd",
+            LINUX_RUNTIME_NET_DECL_BYTES,
         ));
     }
     if !LINUX_RUNTIME_FS_DECL_BYTES.is_empty() {

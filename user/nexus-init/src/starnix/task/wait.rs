@@ -64,6 +64,13 @@ pub(in crate::starnix) enum WaitKind {
         events_addr: u64,
         maxevents: usize,
     },
+    SocketAccept {
+        fd: i32,
+        addr_addr: u64,
+        addrlen_addr: u64,
+        flags: u64,
+        packet_key: u64,
+    },
     FdRead {
         io_kind: FdReadKind,
         fd: i32,
@@ -96,6 +103,7 @@ impl WaitState {
     pub(in crate::starnix) const fn packet_key(self) -> Option<u64> {
         match self.kind {
             WaitKind::Wait4 { .. } | WaitKind::Futex { .. } | WaitKind::Epoll { .. } => None,
+            WaitKind::SocketAccept { packet_key, .. } => Some(packet_key),
             WaitKind::FdRead { packet_key, .. }
             | WaitKind::FdWrite { packet_key, .. }
             | WaitKind::MsgRecv { packet_key, .. }
@@ -108,6 +116,7 @@ impl WaitState {
             WaitKind::Wait4 { target_pid, .. } => Some(target_pid),
             WaitKind::Futex { .. }
             | WaitKind::Epoll { .. }
+            | WaitKind::SocketAccept { .. }
             | WaitKind::FdRead { .. }
             | WaitKind::FdWrite { .. }
             | WaitKind::MsgRecv { .. }
@@ -120,6 +129,7 @@ impl WaitState {
             WaitKind::Wait4 { status_addr, .. } => Some(status_addr),
             WaitKind::Futex { .. }
             | WaitKind::Epoll { .. }
+            | WaitKind::SocketAccept { .. }
             | WaitKind::FdRead { .. }
             | WaitKind::FdWrite { .. }
             | WaitKind::MsgRecv { .. }
@@ -132,6 +142,7 @@ impl WaitState {
             WaitKind::Wait4 { options, .. } => Some(options),
             WaitKind::Futex { .. }
             | WaitKind::Epoll { .. }
+            | WaitKind::SocketAccept { .. }
             | WaitKind::FdRead { .. }
             | WaitKind::FdWrite { .. }
             | WaitKind::MsgRecv { .. }
@@ -144,6 +155,7 @@ impl WaitState {
             WaitKind::Futex { key, .. } => Some(key),
             WaitKind::Wait4 { .. }
             | WaitKind::Epoll { .. }
+            | WaitKind::SocketAccept { .. }
             | WaitKind::FdRead { .. }
             | WaitKind::FdWrite { .. }
             | WaitKind::MsgRecv { .. }
@@ -156,6 +168,7 @@ impl WaitState {
             WaitKind::Epoll { epoll_key, .. } => Some(epoll_key),
             WaitKind::Wait4 { .. }
             | WaitKind::Futex { .. }
+            | WaitKind::SocketAccept { .. }
             | WaitKind::FdRead { .. }
             | WaitKind::FdWrite { .. }
             | WaitKind::MsgRecv { .. }

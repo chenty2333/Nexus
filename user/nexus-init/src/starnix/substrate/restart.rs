@@ -232,6 +232,22 @@ impl StarnixKernel {
             WaitKind::Wait4 { .. } | WaitKind::Futex { .. } | WaitKind::Epoll { .. } => {
                 Ok(BlockedOpResume::StillBlocked)
             }
+            WaitKind::SocketAccept {
+                fd,
+                addr_addr,
+                addrlen_addr,
+                flags,
+                ..
+            } => {
+                self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Running;
+                stop_state.regs.rdi = fd as u64;
+                stop_state.regs.rsi = addr_addr;
+                stop_state.regs.rdx = addrlen_addr;
+                stop_state.regs.r10 = flags;
+                Ok(BlockedOpResume::Restart(
+                    self.sys_accept4(task_id, stop_state)?,
+                ))
+            }
             WaitKind::FdRead {
                 io_kind,
                 fd,

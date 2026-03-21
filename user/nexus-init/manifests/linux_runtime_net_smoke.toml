@@ -1,0 +1,7 @@
+url = "boot://linux-runtime-net-smoke"
+
+[program]
+runner = "starnix"
+binary = "bin/linux-runtime-net-smoke"
+args = ["linux-runtime-net-smoke"]
+env = []

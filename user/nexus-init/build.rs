@@ -43,6 +43,8 @@ fn main() {
         manifest_dir.join("../linux-runtime-misc-smoke/runtime_misc_smoke.S");
     let linux_runtime_process_source =
         manifest_dir.join("../linux-runtime-process-smoke/runtime_process_smoke.S");
+    let linux_runtime_net_source =
+        manifest_dir.join("../linux-runtime-net-smoke/runtime_net_smoke.S");
     let linux_runtime_fs_source = manifest_dir.join("../linux-runtime-fs-smoke/runtime_fs_smoke.S");
     let linux_runtime_tls_source =
         manifest_dir.join("../linux-runtime-tls-smoke/runtime_tls_smoke.S");
@@ -137,6 +139,10 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
+        linux_runtime_net_source.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         linux_runtime_fs_source.display()
     );
     println!(
@@ -215,6 +221,7 @@ fn main() {
         "root_component_starnix_runtime_fd.toml",
         "root_component_starnix_runtime_misc.toml",
         "root_component_starnix_runtime_process.toml",
+        "root_component_starnix_runtime_net.toml",
         "root_component_starnix_runtime_fs.toml",
         "root_component_starnix_runtime_tls.toml",
         "root_component_starnix_dynamic.toml",
@@ -245,6 +252,7 @@ fn main() {
         "linux_runtime_fd_smoke.toml",
         "linux_runtime_misc_smoke.toml",
         "linux_runtime_process_smoke.toml",
+        "linux_runtime_net_smoke.toml",
         "linux_runtime_fs_smoke.toml",
         "linux_runtime_tls_smoke.toml",
         "linux_dynamic_elf_smoke.toml",
@@ -346,6 +354,10 @@ fn main() {
             "root_component_starnix_runtime_process.nxcd",
         ),
         (
+            "root_component_starnix_runtime_net.toml",
+            "root_component_starnix_runtime_net.nxcd",
+        ),
+        (
             "root_component_starnix_runtime_fs.toml",
             "root_component_starnix_runtime_fs.nxcd",
         ),
@@ -440,6 +452,10 @@ fn main() {
         (
             "linux_runtime_process_smoke.toml",
             "linux_runtime_process_smoke.nxcd",
+        ),
+        (
+            "linux_runtime_net_smoke.toml",
+            "linux_runtime_net_smoke.nxcd",
         ),
         ("linux_runtime_fs_smoke.toml", "linux_runtime_fs_smoke.nxcd"),
         (
@@ -537,6 +553,10 @@ fn main() {
     build_linux_binary(
         &linux_runtime_process_source,
         &out_dir.join("linux-runtime-process-smoke"),
+    );
+    build_linux_binary(
+        &linux_runtime_net_source,
+        &out_dir.join("linux-runtime-net-smoke"),
     );
     build_linux_binary(
         &linux_runtime_fs_source,
@@ -653,6 +673,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_runtime_fd)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_runtime_misc)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_runtime_process)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_runtime_net)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_runtime_fs)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_runtime_tls)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic)");
@@ -721,6 +742,9 @@ fn main() {
         }
         "boot://root-starnix-runtime-process" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_runtime_process");
+        }
+        "boot://root-starnix-runtime-net" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_runtime_net");
         }
         "boot://root-starnix-runtime-fs" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_runtime_fs");

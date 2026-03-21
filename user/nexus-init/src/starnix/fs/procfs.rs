@@ -650,7 +650,9 @@ impl StarnixKernel {
         if description.ops().as_any().is::<PipeFd>() {
             return Ok(format!("pipe:[{}]", description.id().raw()));
         }
-        if description.ops().as_any().is::<SocketFd>() {
+        if description.ops().as_any().is::<SocketFd>()
+            || description.ops().as_any().is::<InetSocketFd>()
+        {
             return Ok(format!("socket:[{}]", description.id().raw()));
         }
         match fd {
@@ -882,7 +884,7 @@ pub(in crate::starnix) fn stat_metadata_for_ops(
             inode: 0x1000,
         });
     }
-    if ops.as_any().is::<SocketFd>() {
+    if ops.as_any().is::<SocketFd>() || ops.as_any().is::<InetSocketFd>() {
         return Ok(LinuxStatMetadata {
             mode: LINUX_S_IFSOCK | 0o666,
             size_bytes: 0,

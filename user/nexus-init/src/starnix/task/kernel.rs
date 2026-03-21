@@ -28,6 +28,7 @@ pub(in crate::starnix) struct StarnixKernel {
         BTreeMap<LinuxFileDescriptionKey, LinuxFileDescriptionKey>,
     pub(in crate::starnix) unix_socket_rights:
         BTreeMap<LinuxFileDescriptionKey, VecDeque<PendingScmRights>>,
+    pub(in crate::starnix) loopback_net: LoopbackNetStack,
 }
 
 impl StarnixKernel {
@@ -63,6 +64,7 @@ impl StarnixKernel {
             pidfds: BTreeMap::new(),
             unix_socket_peers: BTreeMap::new(),
             unix_socket_rights: BTreeMap::new(),
+            loopback_net: LoopbackNetStack::default(),
         }
     }
 
@@ -222,6 +224,15 @@ impl StarnixKernel {
         stdout: &mut Vec<u8>,
     ) -> Result<SyscallAction, zx_status_t> {
         match stop_state.regs.rax {
+            LINUX_SYSCALL_SOCKET => self.sys_socket(task_id, stop_state),
+            LINUX_SYSCALL_CONNECT => self.sys_connect(task_id, stop_state),
+            LINUX_SYSCALL_ACCEPT => self.sys_accept(task_id, stop_state),
+            LINUX_SYSCALL_ACCEPT4 => self.sys_accept4(task_id, stop_state),
+            LINUX_SYSCALL_SHUTDOWN => self.sys_shutdown(task_id, stop_state),
+            LINUX_SYSCALL_BIND => self.sys_bind(task_id, stop_state),
+            LINUX_SYSCALL_LISTEN => self.sys_listen(task_id, stop_state),
+            LINUX_SYSCALL_GETSOCKNAME => self.sys_getsockname(task_id, stop_state),
+            LINUX_SYSCALL_GETPEERNAME => self.sys_getpeername(task_id, stop_state),
             LINUX_SYSCALL_READ => self.sys_read(task_id, stop_state),
             LINUX_SYSCALL_WRITE => self.sys_write(task_id, stop_state, stdout),
             LINUX_SYSCALL_READV => self.sys_readv(task_id, stop_state),
@@ -256,6 +267,8 @@ impl StarnixKernel {
             LINUX_SYSCALL_STATX => self.sys_statx(task_id, stop_state),
             LINUX_SYSCALL_PRLIMIT64 => self.sys_prlimit64(task_id, stop_state),
             LINUX_SYSCALL_SOCKETPAIR => self.sys_socketpair(task_id, stop_state),
+            LINUX_SYSCALL_SETSOCKOPT => self.sys_setsockopt(task_id, stop_state),
+            LINUX_SYSCALL_GETSOCKOPT => self.sys_getsockopt(task_id, stop_state),
             LINUX_SYSCALL_FUTEX => self.sys_futex(task_id, stop_state),
             LINUX_SYSCALL_SET_ROBUST_LIST => self.sys_set_robust_list(task_id, stop_state),
             LINUX_SYSCALL_GET_ROBUST_LIST => self.sys_get_robust_list(task_id, stop_state),
