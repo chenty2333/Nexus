@@ -853,3 +853,25 @@ args = [
   { name = "addr", ty = "u64" },
   { name = "out_vmo", ty = "*mut ax_handle_t" },
 ]
+
+[[syscall]]
+name = "ax_console_write"
+nr = 75
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "bytes", ty = "*const u8" },
+  { name = "len", ty = "usize" },
+  { name = "out_actual", ty = "*mut usize" },
+]
+
+[[syscall]]
+name = "ax_console_read"
+nr = 76
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "buffer", ty = "*mut u8" },
+  { name = "len", ty = "usize" },
+  { name = "out_actual", ty = "*mut usize" },
+]

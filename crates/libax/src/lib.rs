@@ -81,6 +81,16 @@ pub fn ax_status_result(status: ax_status_t) -> Result<(), ax_status_t> {
     if status == AX_OK { Ok(()) } else { Err(status) }
 }
 
+/// Write bytes to the bootstrap console.
+pub fn ax_console_write(bytes: &[u8], out_actual: &mut usize) -> ax_status_t {
+    libzircon::ax_console_write(bytes, out_actual)
+}
+
+/// Read bytes from the bootstrap console.
+pub fn ax_console_read(buffer: &mut [u8], out_actual: &mut usize) -> ax_status_t {
+    libzircon::ax_console_read(buffer, out_actual)
+}
+
 /// Close a handle.
 pub fn ax_handle_close(handle: ax_handle_t) -> ax_status_t {
     match narrow_handle(handle) {
