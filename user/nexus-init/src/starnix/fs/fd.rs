@@ -1,4 +1,5 @@
 use super::super::*;
+use super::devfs::{DevDirFd, NullFd, ZeroFd};
 
 #[derive(Clone, Copy)]
 pub(in crate::starnix) struct LinuxStatMetadata {
@@ -43,7 +44,7 @@ impl FsContext {
         namespace: nexus_io::ProcessNamespace,
     ) -> Result<Self, zx_status_t> {
         let mut fd_table = FdTable::new();
-        match stdio_mode {
+        let namespace = match stdio_mode {
             StdioMode::Socket => {
                 let stdin_fd = fd_table.open(
                     Arc::new(PseudoNodeFd::new(None)),
@@ -62,24 +63,39 @@ impl FsContext {
                     let _ = zx_handle_close(handle);
                     install_result?;
                 }
+                namespace
             }
             StdioMode::Console => {
-                install_console_stdio_fd(&mut fd_table, OpenFlags::READABLE, 0)?;
+                let tty = Arc::new(ConsoleFd::new());
+                let null_fd: Arc<dyn FdOps> = Arc::new(NullFd);
+                let zero_fd: Arc<dyn FdOps> = Arc::new(ZeroFd);
+                let dev_root: Arc<dyn FdOps> = Arc::new(DevDirFd::new(
+                    tty.clone(),
+                    Arc::clone(&null_fd),
+                    Arc::clone(&zero_fd),
+                ));
+                let mut mounts = namespace.mounts().clone();
+                mounts.insert("/dev", dev_root)?;
+                let namespace = nexus_io::ProcessNamespace::new(mounts);
+                install_console_stdio_fd(&mut fd_table, tty.clone(), OpenFlags::READABLE, 0)?;
                 install_console_stdio_fd(
                     &mut fd_table,
+                    tty.clone(),
                     OpenFlags::READABLE | OpenFlags::WRITABLE,
                     1,
                 )?;
                 install_console_stdio_fd(
                     &mut fd_table,
+                    tty,
                     OpenFlags::READABLE | OpenFlags::WRITABLE,
                     2,
                 )?;
                 if let Some(handle) = stdout_handle {
                     let _ = zx_handle_close(handle);
                 }
+                namespace
             }
-        }
+        };
         Ok(Self {
             fd_table,
             namespace,
@@ -774,10 +790,11 @@ pub(in crate::starnix) fn install_stdio_fd(
 
 fn install_console_stdio_fd(
     table: &mut FdTable,
+    ops: Arc<dyn FdOps>,
     open_flags: OpenFlags,
     expected_fd: i32,
 ) -> Result<(), zx_status_t> {
-    let fd = table.open(Arc::new(ConsoleFd::new()), open_flags, FdFlags::empty())?;
+    let fd = table.open(ops, open_flags, FdFlags::empty())?;
     if fd != expected_fd {
         let _ = table.close(fd);
         return Err(ZX_ERR_BAD_STATE);

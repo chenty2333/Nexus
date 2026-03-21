@@ -559,6 +559,17 @@ fn map_fd_status_to_errno(status: zx_status_t) -> i32 {
     }
 }
 
+fn map_ioctl_status_to_errno(status: zx_status_t) -> i32 {
+    match status {
+        ZX_ERR_BAD_HANDLE => LINUX_EBADF,
+        ZX_ERR_NOT_SUPPORTED => LINUX_ENOTTY,
+        ZX_ERR_ACCESS_DENIED => LINUX_EACCES,
+        ZX_ERR_INVALID_ARGS | ZX_ERR_OUT_OF_RANGE => LINUX_EINVAL,
+        ZX_ERR_NO_MEMORY => LINUX_ENOMEM,
+        _ => LINUX_EIO,
+    }
+}
+
 fn map_msg_status_to_errno(status: zx_status_t) -> i32 {
     match status {
         ZX_ERR_BAD_HANDLE => LINUX_EBADF,

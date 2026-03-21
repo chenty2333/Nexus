@@ -269,8 +269,8 @@ Work:
     heap/mmap `fork` clone slice
   - better `fork`
   - broader Linux fs/socket/signal semantics
-  - shell-oriented tty / pty / termios follow-on after the current
-    console-backed shell slice
+  - shell-oriented `devpts` / `ptmx` / pty follow-on after the current
+    tty-backed bootstrap console shell slice
 
 Exit criteria:
 

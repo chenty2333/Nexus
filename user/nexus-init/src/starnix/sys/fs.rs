@@ -1,3 +1,4 @@
+use super::super::fs::console::{LINUX_TIOCGPGRP, LINUX_TIOCSPGRP};
 use super::super::*;
 
 fn write_linux_uname_field(field: &mut [u8], value: &str) {
@@ -303,10 +304,90 @@ impl StarnixKernel {
 
     pub(in crate::starnix) fn sys_ioctl(
         &mut self,
-        _task_id: i32,
+        task_id: i32,
         stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
-        complete_syscall(stop_state, linux_errno(LINUX_ENOTTY))?;
+        let fd = linux_arg_i32(stop_state.regs.rdi);
+        let request = stop_state.regs.rsi;
+        let arg = stop_state.regs.rdx;
+        let session = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ZX_ERR_BAD_STATE)?
+            .carrier
+            .session_handle;
+        let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+
+        let ops = {
+            let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            Arc::clone(
+                resources
+                    .fs
+                    .fd_table
+                    .get(fd)
+                    .ok_or(ZX_ERR_BAD_HANDLE)?
+                    .description()
+                    .ops(),
+            )
+        };
+
+        let result = match request {
+            LINUX_TIOCGPGRP => {
+                if !ops.as_any().is::<ConsoleFd>() {
+                    linux_errno(LINUX_ENOTTY)
+                } else {
+                    let sid = self.task_sid(task_id)?;
+                    let pgid = self
+                        .foreground_pgid(sid)
+                        .unwrap_or_else(|| self.groups.get(&tgid).map_or(tgid, |group| group.pgid));
+                    match write_guest_u32(session, arg, pgid as u32) {
+                        Ok(()) => 0,
+                        Err(status) => linux_errno(map_guest_write_status_to_errno(status)),
+                    }
+                }
+            }
+            LINUX_TIOCSPGRP => {
+                if !ops.as_any().is::<ConsoleFd>() {
+                    linux_errno(LINUX_ENOTTY)
+                } else {
+                    if let Some(action) =
+                        self.maybe_apply_tty_job_control(task_id, fd, FdWaitOp::Write, stop_state)?
+                    {
+                        return Ok(action);
+                    }
+                    let sid = self.task_sid(task_id)?;
+                    let pgid = match read_guest_u32(session, arg) {
+                        Ok(value) => value as i32,
+                        Err(status) => {
+                            complete_syscall(
+                                stop_state,
+                                linux_errno(map_guest_memory_status_to_errno(status)),
+                            )?;
+                            return Ok(SyscallAction::Resume);
+                        }
+                    };
+                    if !self.session_has_pgid(sid, pgid) {
+                        linux_errno(LINUX_EPERM)
+                    } else {
+                        self.foreground_pgid_by_sid.insert(sid, pgid);
+                        0
+                    }
+                }
+            }
+            _ => {
+                let result = {
+                    let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+                    let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+                    resources.fs.fd_table.ioctl(fd, session, request, arg)
+                };
+                match result {
+                    Ok(value) => value,
+                    Err(status) => linux_errno(map_ioctl_status_to_errno(status)),
+                }
+            }
+        };
+        complete_syscall(stop_state, result)?;
         Ok(SyscallAction::Resume)
     }
 

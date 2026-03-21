@@ -505,8 +505,17 @@ That host gate now explicitly covers:
   - `/proc/<pid>/task/<tid>/stat` now exposes stopped thread-state for the
     child while it remains in group-stop
   - the bootstrap gate intentionally keeps tty ownership policy narrow:
-    foreground/background is modeled only for the inherited stdio set and still
-    excludes `tcsetpgrp`, `TIOCSPGRP`, and broader tty discipline
+    foreground/background is modeled only for the inherited stdio set over one
+    shared bootstrap console tty
+  - the same shell-facing console slice now also proves:
+    - `TCGETS` / `TCSETS*`
+    - `TIOCGWINSZ` / `TIOCSWINSZ`
+    - `TIOCGPGRP` / `TIOCSPGRP`
+    - shell-visible character echo over the inherited stdio set
+  - the bootstrap gate still intentionally excludes:
+    - `devpts`
+    - `ptmx` / Unix98 pty allocation
+    - broader tty discipline beyond the shared bootstrap console
 - The first post-R7 loader/runtime scenario now closes one narrow dynamic-ELF
   bootstrap slice:
   - `execve` of one ET_EXEC or fixed-bias ET_DYN main image carrying `PT_INTERP`
@@ -644,6 +653,9 @@ This makes contract coverage part of the repo workflow, not just informal docume
       `echo`, `ls`, `cat`, `mkdir`, `rm`, and `ps`
     - the gate uses a host-side shell driver so command pacing is stable and
       does not depend on one best-effort `printf` burst into serial stdin
+    - the same driver now also asserts:
+      - the shell no longer reports `can't access tty`
+      - typed commands are echoed before execution
 
 ## Runner model
 
@@ -704,6 +716,9 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - it boots the same `boot://root-starnix-shell` manifest used by the
     conformance shell gate and leaves QEMU attached to the interactive serial
     console instead of driving commands automatically
+  - when stdin is a tty, the recipe now temporarily switches the host terminal
+    to raw/no-echo mode before launching QEMU so character-at-a-time shell
+    input reaches the guest instead of being line-buffered by the host
 - The bootstrap code window above 4 GiB now spans 16 MiB, which keeps the
   runtime dispatcher runner, current `nexus-init` manager images, and the
   shared summary pages from overlapping in the fixed bootstrap mapping.

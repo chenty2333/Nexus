@@ -2,6 +2,7 @@
 
 pub(super) mod anon_inode;
 pub(super) mod console;
+pub(super) mod devfs;
 pub(super) mod fd;
 pub(super) mod file_description;
 pub(super) mod mount;

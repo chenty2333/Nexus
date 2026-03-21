@@ -165,10 +165,22 @@ def main() -> int:
     if exit_code != 33:
         return 1
     full = transcript.snapshot()
+    if b"can't access tty" in full:
+        raise RuntimeError("shell transcript still reports missing tty")
     required = [b"shell-ok", b"ls-ok", b"cat-ok", b"mkdir-ok", b"rm-ok", b"ps-ok"]
     for needle in required:
         if needle not in full:
             raise RuntimeError(f"missing shell transcript token {needle!r}")
+    echoed = [
+        b"echo shell-ok",
+        b"ls / && echo ls-ok",
+        b"cat /etc/passwd && echo cat-ok",
+        b"mkdir /tmp/shell-dir && echo mkdir-ok",
+        b"ps && echo ps-ok",
+    ]
+    for needle in echoed:
+        if needle not in full:
+            raise RuntimeError(f"missing echoed shell command {needle!r}")
     return 0
 
 

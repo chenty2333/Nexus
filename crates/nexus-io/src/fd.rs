@@ -158,6 +158,12 @@ pub trait FdOps: Any + Send + Sync {
     /// Reactor registration interest for readiness-style waiting.
     fn wait_interest(&self) -> Option<WaitSpec>;
 
+    /// Handle one ioctl-style control request against this description.
+    fn ioctl(&self, session: zx_handle_t, request: u64, arg: u64) -> Result<u64, zx_status_t> {
+        let _ = (session, request, arg);
+        Err(ZX_ERR_NOT_SUPPORTED)
+    }
+
     /// Return a read-only backing VMO when supported.
     fn as_vmo(&self, flags: VmoFlags) -> Result<zx_handle_t, zx_status_t> {
         let _ = flags;
@@ -388,6 +394,21 @@ impl FdTable {
             .description()
             .ops()
             .wait_interest())
+    }
+
+    /// Issue one ioctl-style control request against `fd`.
+    pub fn ioctl(
+        &self,
+        fd: RawFd,
+        session: zx_handle_t,
+        request: u64,
+        arg: u64,
+    ) -> Result<u64, zx_status_t> {
+        self.get(fd)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .description()
+            .ops()
+            .ioctl(session, request, arg)
     }
 
     /// Request a read-only VMO from one fd when supported.
