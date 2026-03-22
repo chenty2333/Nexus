@@ -65,3 +65,20 @@ channel_fragment_pool_cached_current = 2
 channel_fragment_pool_cached_peak = 2
 channel_fragmented_desc_count = 8
 channel_fragmented_bytes_total = 65536
+
+[assertions.packet_fields_min]
+trace_records = 10000
+trace_export_bytes = 500000
+trace_sched_handoff_phase3 = 64
+trace_sched_remote_wake_latency_phase3 = 64
+
+[assertions.packet_fields_max]
+perf_null_cycles = 100000000
+perf_wait_cycles = 800000000
+perf_wake_cycles = 800000000
+perf_tlb_cycles = 1000000000
+perf_tlb_peer_cycles = 800000000
+perf_fault_cycles = 200000000
+perf_channel_fragment_cycles = 1500000000
+perf_as_switch_cycles = 1200000000
+trace_sched_remote_wake_latency_max_ns = 10000000

@@ -25,15 +25,39 @@ pub struct AssertionsSpec {
     /// Success-path status-like values.
     #[serde(default)]
     pub status_code: BTreeMap<String, i64>,
+    /// Lower bounds over success-path status-like values.
+    #[serde(default)]
+    pub status_code_min: BTreeMap<String, i64>,
+    /// Upper bounds over success-path status-like values.
+    #[serde(default)]
+    pub status_code_max: BTreeMap<String, i64>,
     /// Error-code values.
     #[serde(default)]
     pub error_code: BTreeMap<String, i64>,
+    /// Lower bounds over error-code values.
+    #[serde(default)]
+    pub error_code_min: BTreeMap<String, i64>,
+    /// Upper bounds over error-code values.
+    #[serde(default)]
+    pub error_code_max: BTreeMap<String, i64>,
     /// Signal-mask values.
     #[serde(default)]
     pub signal_mask: BTreeMap<String, i64>,
+    /// Lower bounds over signal-mask values.
+    #[serde(default)]
+    pub signal_mask_min: BTreeMap<String, i64>,
+    /// Upper bounds over signal-mask values.
+    #[serde(default)]
+    pub signal_mask_max: BTreeMap<String, i64>,
     /// Packet field values.
     #[serde(default)]
     pub packet_fields: BTreeMap<String, i64>,
+    /// Lower bounds over packet field values.
+    #[serde(default)]
+    pub packet_fields_min: BTreeMap<String, i64>,
+    /// Upper bounds over packet field values.
+    #[serde(default)]
+    pub packet_fields_max: BTreeMap<String, i64>,
 }
 
 /// Declarative scenario contract.

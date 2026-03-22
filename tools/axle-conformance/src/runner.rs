@@ -738,9 +738,33 @@ fn evaluate_assertions(
         parsed_metrics,
         &mut mismatches,
     );
+    check_assertion_group_min(
+        "status_code_min",
+        &assertions.status_code_min,
+        parsed_metrics,
+        &mut mismatches,
+    );
+    check_assertion_group_max(
+        "status_code_max",
+        &assertions.status_code_max,
+        parsed_metrics,
+        &mut mismatches,
+    );
     check_assertion_group(
         "error_code",
         &assertions.error_code,
+        parsed_metrics,
+        &mut mismatches,
+    );
+    check_assertion_group_min(
+        "error_code_min",
+        &assertions.error_code_min,
+        parsed_metrics,
+        &mut mismatches,
+    );
+    check_assertion_group_max(
+        "error_code_max",
+        &assertions.error_code_max,
         parsed_metrics,
         &mut mismatches,
     );
@@ -750,9 +774,33 @@ fn evaluate_assertions(
         parsed_metrics,
         &mut mismatches,
     );
+    check_assertion_group_min(
+        "signal_mask_min",
+        &assertions.signal_mask_min,
+        parsed_metrics,
+        &mut mismatches,
+    );
+    check_assertion_group_max(
+        "signal_mask_max",
+        &assertions.signal_mask_max,
+        parsed_metrics,
+        &mut mismatches,
+    );
     check_assertion_group(
         "packet_fields",
         &assertions.packet_fields,
+        parsed_metrics,
+        &mut mismatches,
+    );
+    check_assertion_group_min(
+        "packet_fields_min",
+        &assertions.packet_fields_min,
+        parsed_metrics,
+        &mut mismatches,
+    );
+    check_assertion_group_max(
+        "packet_fields_max",
+        &assertions.packet_fields_max,
         parsed_metrics,
         &mut mismatches,
     );
@@ -771,6 +819,42 @@ fn check_assertion_group(
             Some(actual_v) if actual_v == expected_v => {}
             Some(actual_v) => mismatches.push(format!(
                 "{}.{} expected={} actual={}",
+                group, k, expected_v, actual_v
+            )),
+            None => mismatches.push(format!("{}.{} missing", group, k)),
+        }
+    }
+}
+
+fn check_assertion_group_min(
+    group: &str,
+    expected: &BTreeMap<String, i64>,
+    parsed_metrics: &BTreeMap<String, i64>,
+    mismatches: &mut Vec<String>,
+) {
+    for (k, expected_v) in expected {
+        match parsed_metrics.get(k) {
+            Some(actual_v) if actual_v >= expected_v => {}
+            Some(actual_v) => mismatches.push(format!(
+                "{}.{} expected>={} actual={}",
+                group, k, expected_v, actual_v
+            )),
+            None => mismatches.push(format!("{}.{} missing", group, k)),
+        }
+    }
+}
+
+fn check_assertion_group_max(
+    group: &str,
+    expected: &BTreeMap<String, i64>,
+    parsed_metrics: &BTreeMap<String, i64>,
+    mismatches: &mut Vec<String>,
+) {
+    for (k, expected_v) in expected {
+        match parsed_metrics.get(k) {
+            Some(actual_v) if actual_v <= expected_v => {}
+            Some(actual_v) => mismatches.push(format!(
+                "{}.{} expected<={} actual={}",
                 group, k, expected_v, actual_v
             )),
             None => mismatches.push(format!("{}.{} missing", group, k)),
@@ -966,9 +1050,7 @@ mod tests {
             contracts: vec![],
             assertions: Some(crate::model::AssertionsSpec {
                 status_code: BTreeMap::from([("ok".to_string(), 0), ("missing".to_string(), 1)]),
-                error_code: BTreeMap::new(),
-                signal_mask: BTreeMap::new(),
-                packet_fields: BTreeMap::new(),
+                ..crate::model::AssertionsSpec::default()
             }),
             elf_check: None,
         };
@@ -981,5 +1063,62 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("status_code.missing missing"))
         );
+    }
+
+    #[test]
+    fn evaluate_assertions_reports_min_and_max_mismatches() {
+        let scenario = ScenarioSpec {
+            id: "s".into(),
+            description: String::new(),
+            tags: vec![],
+            timeout_ms: 100,
+            command: vec!["true".into()],
+            expect: vec![],
+            forbid: vec![],
+            contracts: vec![],
+            assertions: Some(crate::model::AssertionsSpec {
+                packet_fields_min: BTreeMap::from([("cycles".to_string(), 10)]),
+                packet_fields_max: BTreeMap::from([("latency".to_string(), 20)]),
+                ..crate::model::AssertionsSpec::default()
+            }),
+            elf_check: None,
+        };
+
+        let parsed = BTreeMap::from([("cycles".to_string(), 9), ("latency".to_string(), 21)]);
+        let mismatches = evaluate_assertions(&scenario, &parsed);
+        assert!(
+            mismatches
+                .iter()
+                .any(|m| m.contains("packet_fields_min.cycles expected>=10 actual=9"))
+        );
+        assert!(
+            mismatches
+                .iter()
+                .any(|m| m.contains("packet_fields_max.latency expected<=20 actual=21"))
+        );
+    }
+
+    #[test]
+    fn evaluate_assertions_accepts_min_and_max_bounds() {
+        let scenario = ScenarioSpec {
+            id: "s".into(),
+            description: String::new(),
+            tags: vec![],
+            timeout_ms: 100,
+            command: vec!["true".into()],
+            expect: vec![],
+            forbid: vec![],
+            contracts: vec![],
+            assertions: Some(crate::model::AssertionsSpec {
+                packet_fields_min: BTreeMap::from([("cycles".to_string(), 10)]),
+                packet_fields_max: BTreeMap::from([("cycles".to_string(), 20)]),
+                ..crate::model::AssertionsSpec::default()
+            }),
+            elf_check: None,
+        };
+
+        let parsed = BTreeMap::from([("cycles".to_string(), 15)]);
+        let mismatches = evaluate_assertions(&scenario, &parsed);
+        assert!(mismatches.is_empty());
     }
 }

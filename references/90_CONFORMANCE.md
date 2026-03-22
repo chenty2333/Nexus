@@ -158,6 +158,9 @@ That host gate now explicitly covers:
       remote-wake / handoff / latency counters on QEMU
     - the summary therefore exports one derived `trace_sched_phase3_ok` bit while still printing
       the raw phase-3 counters for diagnosis
+  - the same `bootstrap_perf_smoke` scenario now also carries conservative merge-blocking upper
+    bounds for cycle/latency summaries plus minimum export/trace-volume checks, so perf-smoke is a
+    real gate rather than only a parsed report
   - the scenario currently acts as a wiring and attribution gate, not as a stable performance
     regression threshold
   - the new `just perf-smoke-bundle` + `just perf-smoke-parse` flow is the current minimal
