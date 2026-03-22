@@ -12,19 +12,22 @@ See also:
 
 This file describes the current narrow network-dataplane bootstrap shape in the repository.
 
-It is not yet a full PCI transport, a full userspace netstack, or a real hardware-backed
-virtio-net driver.
-It is the first proof that the current device-facing Axle substrate is already enough to support a
-queue-owned shared-memory + interrupt dataplane in ring3 through one kernel-exported bootstrap
-device contract.
+It is not yet a full PCI transport or a generic production netstack.
+It now covers two concrete slices:
+- one synthetic/bootstrap queue-owned shared-memory dataplane
+- one first real QEMU `virtio-net-pci` bring-up path used by the remote-shell bootstrap
+Both prove that the current device-facing Axle substrate is already enough to support a
+queue-owned shared-memory + interrupt dataplane in ring3 through one kernel-exported device
+contract.
 
 ## Current transport slice
 
 The repository now includes one narrow ring3 net dataplane slice built around one reusable
-`axle-virtio-transport` `no_std` crate plus two current userspace consumers:
+`axle-virtio-transport` `no_std` crate plus three current userspace consumers:
 
 - `user/test-runner` `net_smoke`
 - `user/nexus-init` `boot://root-net-dataplane`
+- `user/nexus-init` `boot://root-starnix-net-shell`
 
 The current bootstrap transport includes:
 
@@ -107,6 +110,14 @@ The current bootstrap transport includes:
   - BAR count, queue-pair count, and queue size metadata
   - generic resource enumeration
   - config/BAR/interrupt handle export through that generic resource path
+- one first real-device follow-on now also exists when QEMU exposes `virtio-net-pci`:
+  - the kernel discovers the first x86 network PCI function during bootstrap
+  - the kernel seeds one second bootstrap `PciDevice` handle carrying:
+    - one read-only config snapshot
+    - one BAR export per discovered MMIO window
+  - userspace enables `MEMORY_SPACE | BUS_MASTER` through `ax_pci_device_set_command()`
+  - `nexus-init` then drives the device through a smoltcp-backed userspace transport path
+    suitable for the current host-forwarded remote shell slice
 
 ## Current queue shape
 
@@ -180,29 +191,34 @@ The current bootstrap slice proves three things:
    net path now proves that ring3 can discover a device through generic PCI resources, select an
    interrupt mode, and then program queue/control addresses from explicit `DmaRegion` segment
    metadata.
+8. The device-facing substrate is no longer limited to one synthetic transport-only proof.
+   The current remote-shell slice proves that the same public `PciDevice` / BAR / DMA / MMIO
+   contract is already enough to bring up one real QEMU `virtio-net-pci` function in userspace.
 
 ## What this is not yet
 
 - no PCI bus enumeration
 - no real PCI config space or BAR management contract from the kernel
-- no generic PCI enumeration or config-space read/write ABI yet; only one narrow resource-export
-  object
+- no generic PCI enumeration yet; current discovery is still "first matching network function"
+- no broad config-space read/write ABI yet; only one narrow command-register write helper plus the
+  exported read-only snapshot
 - no MMIO cache-policy / mapping-attribute controls beyond the first narrow `ZX_VM_MAP_MMIO` bit
 - only one first narrow identity-like IOVA contract exists; the next step is still a fuller
   DMA map/unmap or IOVA-token model beyond the current explicit `DmaRegion`
 - no hardware interrupt routing or MSI/MSI-X programming surface yet; the current MSI/legacy/MSI-X
   mode handling is still metadata/activation scaffolding rather than real hardware delivery
 - no full virtio PCI capability layout or generic config-space ABI
-- no userspace TCP/IP stack
+- no general reusable userspace TCP/IP stack beyond the current smoltcp-backed remote-shell slice
 - no RSS / scheduler-domain queue placement policy
-- no real hardware-backed virtio-net device bring-up yet
+- no generic multi-device or driver-manager-owned real virtio-net bring-up yet
 
 ## Current guidance
 
 - Treat the current `net_smoke` as a device-substrate proof plus one reusable transport slice, not
   as the final driver shape.
 - Keep the next net cuts focused on:
-  - moving from the current bootstrap `PciDevice` export object to a fuller PCI resource model
+  - moving from the current "synthetic bootstrap device + first discovered real function" shape to
+    a fuller PCI resource model
   - keeping queue memory and control windows on explicit `DmaRegion` lifetime objects
   - keeping the current common-config / queue-select bring-up path aligned with later real
     virtio-net transport work instead of growing more smoke-local control-plane shortcuts

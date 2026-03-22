@@ -875,3 +875,13 @@ args = [
   { name = "len", ty = "usize" },
   { name = "out_actual", ty = "*mut usize" },
 ]
+
+[[syscall]]
+name = "ax_pci_device_set_command"
+nr = 77
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "command", ty = "u16" },
+]

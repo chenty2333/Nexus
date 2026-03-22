@@ -18,6 +18,7 @@ pub(in crate::starnix) use self::fs::fd::{
     install_stdio_fd, write_guest_fd_pair, write_guest_rlimit, write_guest_stat, write_guest_statx,
 };
 use self::fs::procfs::{pread_from_ops, pwrite_to_ops, stat_metadata_for_ops};
+use self::fs::tty::RemoteTtyBridge;
 #[allow(unused_imports)]
 pub(in crate::starnix) use self::fs::unix::{LinuxIovec, LinuxMsgHdr};
 use self::fs::unix::{
@@ -109,7 +110,7 @@ use crate::{
     LINUX_RUNTIME_PROCESS_DECL_BYTES, LINUX_RUNTIME_TLS_BINARY_PATH, LINUX_RUNTIME_TLS_BYTES,
     LINUX_RUNTIME_TLS_DECL_BYTES, STARTUP_HANDLE_COMPONENT_STATUS,
     STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
-    STARTUP_HANDLE_STARNIX_STDOUT,
+    STARTUP_HANDLE_STARNIX_STDIN, STARTUP_HANDLE_STARNIX_STDOUT,
 };
 use axle_types::guest::{
     AX_GUEST_STOP_REASON_X64_SYSCALL, AX_GUEST_X64_SYSCALL_INSN_LEN, AX_LINUX_EXEC_SPEC_F_INTERP,
@@ -474,6 +475,10 @@ const EVENTFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
 const EVENTFD_WRITABLE_SIGNAL: u32 = AX_USER_SIGNAL_1;
 const EVENTFD_SIGNAL_MASK: u32 = EVENTFD_READABLE_SIGNAL | EVENTFD_WRITABLE_SIGNAL;
 const EVENTFD_COUNTER_MAX: u64 = u64::MAX - 1;
+const TTY_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
+const TTY_WRITABLE_SIGNAL: u32 = AX_USER_SIGNAL_1;
+const TTY_PEER_CLOSED_SIGNAL: u32 = AX_USER_SIGNAL_2;
+const TTY_SIGNAL_MASK: u32 = TTY_READABLE_SIGNAL | TTY_WRITABLE_SIGNAL | TTY_PEER_CLOSED_SIGNAL;
 const SIGNALFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
 const PIDFD_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;
 const INET_READABLE_SIGNAL: u32 = AX_USER_SIGNAL_0;

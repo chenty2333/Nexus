@@ -16,6 +16,7 @@ pub mod idt;
 pub mod int80;
 pub mod ipi;
 pub mod log;
+pub mod pci;
 pub mod percpu;
 pub mod pic;
 pub mod pmu;

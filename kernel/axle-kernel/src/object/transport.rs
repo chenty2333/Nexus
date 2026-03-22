@@ -1,5 +1,4 @@
 use super::*;
-
 const CHANNEL_FRAGMENT_PAGE_BYTES: usize = crate::userspace::USER_PAGE_BYTES as usize;
 const CHANNEL_FRAGMENT_POOL_CACHE_LIMIT_PER_CPU: usize = 8;
 
@@ -649,7 +648,6 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
             }
             Ok(())
         })?;
-
         let _ = publish_object_signals(state, resolved.object_key());
         let _ = publish_object_signals(state, endpoint.peer_object);
         Ok(written)

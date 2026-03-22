@@ -95,7 +95,7 @@ fn tty_job_control_marks_background_stdio_access() {
             .as_mut()
             .expect("root resources");
         let registry = Arc::new(PtyRegistry::new());
-        let (_master, slave) = registry.allocate_pair(false);
+        let (_master, slave) = registry.allocate_unbridged_pair();
         resources.fs.fd_table.close(0).expect("close stdin");
         resources.fs.fd_table.close(1).expect("close stdout");
         resources.fs.fd_table.close(2).expect("close stderr");
@@ -153,6 +153,7 @@ fn tty_job_control_marks_background_stdio_access() {
             directory_offsets: BTreeMap::new(),
             pty_registry: Arc::new(PtyRegistry::new()),
             controlling_tty: Arc::new(Mutex::new(Some(tty.clone()))),
+            tty_bridge: None,
         },
         mm: super::support::test_linux_mm(),
     });
@@ -201,7 +202,7 @@ fn tty_background_read_stop_advances_syscall_as_eintr() {
             .as_mut()
             .expect("root resources");
         let registry = Arc::new(PtyRegistry::new());
-        let (_master, slave) = registry.allocate_pair(false);
+        let (_master, slave) = registry.allocate_unbridged_pair();
         resources.fs.fd_table.close(0).expect("close stdin");
         resources.fs.fd_table.close(1).expect("close stdout");
         resources.fs.fd_table.close(2).expect("close stderr");
@@ -256,6 +257,7 @@ fn tty_background_read_stop_advances_syscall_as_eintr() {
             directory_offsets: BTreeMap::new(),
             pty_registry: Arc::new(PtyRegistry::new()),
             controlling_tty: Arc::new(Mutex::new(Some(tty.clone()))),
+            tty_bridge: None,
         },
         mm: super::support::test_linux_mm(),
     });

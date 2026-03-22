@@ -583,6 +583,7 @@ const SLOT_PERF_TLB_PEER_CYCLES: usize = 645;
 const SLOT_TRACE_TLB_SYNC_PLAN_PHASE5: usize = 646;
 const SLOT_TRACE_TLB_SHOOTDOWN_FULL_PHASE5: usize = 647;
 const SLOT_BOOTSTRAP_NET_PCI_DEVICE_H: usize = 648;
+const SLOT_REAL_NET_PCI_DEVICE_H: usize = 649;
 const SLOT_PERF_FAULT_STATUS: usize = 662;
 const SLOT_PERF_FAULT_ITERS: usize = 663;
 const SLOT_PERF_FAULT_CYCLES: usize = 664;
@@ -3031,6 +3032,8 @@ pub fn prepare() -> u64 {
         crate::object::vm::bootstrap_linux_hello_code_vmo_handle().unwrap_or(0) as u64;
     slots[SLOT_BOOTSTRAP_NET_PCI_DEVICE_H] =
         crate::object::device::bootstrap_net_pci_device_handle().unwrap_or(0) as u64;
+    slots[SLOT_REAL_NET_PCI_DEVICE_H] =
+        crate::object::device::bootstrap_real_net_pci_device_handle().unwrap_or(0) as u64;
     crate::trace::init_bootstrap_trace();
     slots[SLOT_TRACE_VMO_H] = u64::from(crate::trace::bootstrap_trace_vmo_handle());
     slots[SLOT_TRACE_PHASE] = 0;

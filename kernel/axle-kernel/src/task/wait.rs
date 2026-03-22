@@ -327,6 +327,11 @@ impl Kernel {
             .registration)
     }
 
+    pub(crate) fn thread_wait_seq(&self, thread_id: ThreadId) -> Result<Option<u64>, zx_status_t> {
+        let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        Ok(thread.wait.registration.map(|_| thread.wait.seq))
+    }
+
     pub(super) fn push_signal_waiter(&mut self, object_key: ObjectKey, thread_id: ThreadId) {
         self.reactor
             .lock()
@@ -432,11 +437,11 @@ impl Kernel {
         Some((seq, registration))
     }
 
-    pub(crate) fn park_current(
+    pub(crate) fn park_current_with_seq(
         &mut self,
         registration: WaitRegistration,
         deadline: Option<i64>,
-    ) -> Result<(), zx_status_t> {
+    ) -> Result<u64, zx_status_t> {
         let thread_id = self.current_thread_id()?;
         let source = registration.source_key();
         let seq = {
@@ -453,6 +458,15 @@ impl Kernel {
                 .lock()
                 .arm_wait_deadline(self.current_cpu_id(), thread_id, seq, deadline);
         }
+        Ok(seq)
+    }
+
+    pub(crate) fn park_current(
+        &mut self,
+        registration: WaitRegistration,
+        deadline: Option<i64>,
+    ) -> Result<(), zx_status_t> {
+        let _ = self.park_current_with_seq(registration, deadline)?;
         Ok(())
     }
 
@@ -525,6 +539,22 @@ impl Kernel {
         };
         self.remove_wait_source_membership(thread_id, registration);
         self.wake_thread(thread_id, reason)?;
+        Ok(true)
+    }
+
+    pub(crate) fn cancel_waiter_if_seq(
+        &mut self,
+        thread_id: ThreadId,
+        seq: u64,
+    ) -> Result<bool, zx_status_t> {
+        let Some(registration) = self.take_wait_registration_if_seq(thread_id, seq) else {
+            return Ok(false);
+        };
+        self.remove_wait_source_membership(thread_id, registration);
+        let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        if matches!(thread.state, ThreadState::Blocked { .. }) {
+            thread.state = ThreadState::Runnable;
+        }
         Ok(true)
     }
 

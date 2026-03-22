@@ -98,6 +98,10 @@ pub(crate) fn read_controller_event_blocking(
     try_read_controller_event(handle)?.ok_or(ZX_ERR_SHOULD_WAIT)
 }
 
+pub(crate) fn poll_controller_event(handle: zx_handle_t) -> Result<Option<i64>, zx_status_t> {
+    try_read_controller_event(handle)
+}
+
 pub(crate) fn read_channel_fixed(
     handle: zx_handle_t,
     bytes: &mut [u8],

@@ -19,6 +19,7 @@ libzircon = { path = "../../crates/libzircon", default-features = false }
 nexus-component = { path = "../../crates/nexus-component", default-features = false }
 nexus-fs-proto = { path = "../../crates/nexus-fs-proto", default-features = false }
 nexus-io = { path = "../../crates/nexus-io", default-features = false }
+smoltcp = { version = "0.13.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket", "socket-tcp"] }
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
 
 [build-dependencies]

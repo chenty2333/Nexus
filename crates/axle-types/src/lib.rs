@@ -670,6 +670,16 @@ pub mod pci {
     /// Config window should be treated as read-only by the driver.
     pub const ZX_PCI_CONFIG_FLAG_READ_ONLY: u32 = AX_PCI_CONFIG_FLAG_READ_ONLY;
 
+    /// Enable PCI MMIO decode in the command register.
+    pub const AX_PCI_COMMAND_MEMORY_SPACE: u16 = 1 << 1;
+    /// Enable PCI bus mastering in the command register.
+    pub const AX_PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
+
+    /// Enable PCI MMIO decode in the command register.
+    pub const ZX_PCI_COMMAND_MEMORY_SPACE: u16 = AX_PCI_COMMAND_MEMORY_SPACE;
+    /// Enable PCI bus mastering in the command register.
+    pub const ZX_PCI_COMMAND_BUS_MASTER: u16 = AX_PCI_COMMAND_BUS_MASTER;
+
     /// Interrupt resource is one synthetic virtual line.
     pub const AX_PCI_INTERRUPT_MODE_VIRTUAL: u32 = 0;
     /// Reserved mode for future hardware INTx wiring.

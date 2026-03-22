@@ -757,6 +757,14 @@ pub fn ax_pci_device_set_interrupt_mode(handle: ax_handle_t, mode: u32) -> ax_st
     }
 }
 
+/// Update the live PCI command register for a PCI/device handle.
+pub fn ax_pci_device_set_command(handle: ax_handle_t, command: u16) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_pci_device_set_command(raw, command),
+        Err(status) => status,
+    }
+}
+
 /// Read bytes from a VMO.
 pub fn ax_vmo_read(handle: ax_handle_t, bytes: &mut [u8], offset: u64) -> ax_status_t {
     match narrow_handle(handle) {

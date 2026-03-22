@@ -1033,6 +1033,7 @@ pub(crate) struct ObjectRegistry {
     bootstrap_starnix_kernel_code_vmo_handle: zx_handle_t,
     bootstrap_linux_hello_code_vmo_handle: zx_handle_t,
     bootstrap_net_pci_device_handle: zx_handle_t,
+    bootstrap_real_net_pci_device_handle: zx_handle_t,
     bootstrap_process_image_layout: crate::task::ProcessImageLayout,
 }
 
@@ -1053,6 +1054,7 @@ impl ObjectRegistry {
             bootstrap_starnix_kernel_code_vmo_handle: 0,
             bootstrap_linux_hello_code_vmo_handle: 0,
             bootstrap_net_pci_device_handle: 0,
+            bootstrap_real_net_pci_device_handle: 0,
             bootstrap_process_image_layout: crate::task::ProcessImageLayout::bootstrap_conformance(
             ),
         }
@@ -1570,6 +1572,8 @@ impl KernelState {
 
         device::seed_bootstrap_net_pci_device(&state)
             .expect("bootstrap net pci device handle publish must succeed");
+        device::seed_real_net_pci_device(&state)
+            .expect("real net pci device handle publish must succeed");
 
         state
     }
@@ -2890,8 +2894,17 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                     let _ = (
                         device.vendor_id,
                         device.device_id,
-                        device.bar0_object.object_id(),
-                        device.bar0_backing_object.object_id(),
+                        device
+                            .bars
+                            .first()
+                            .map(|bar| bar.object.object_id())
+                            .unwrap_or(0),
+                        device
+                            .bars
+                            .first()
+                            .and_then(|bar| bar.backing_object)
+                            .map(ObjectKey::object_id)
+                            .unwrap_or(0),
                         device.queue_pairs,
                         device.queue_size,
                     );

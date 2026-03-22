@@ -3,6 +3,7 @@ use super::super::fs::tty::{
     tty_endpoint_identity,
 };
 use super::super::*;
+fn log_tty_read(_prefix: &[u8], _fd: i32, _status: Option<zx_status_t>) {}
 
 fn write_linux_uname_field(field: &mut [u8], value: &str) {
     let limit = field.len().saturating_sub(1);
@@ -334,6 +335,9 @@ impl StarnixKernel {
                     .ops(),
             )
         };
+        if tty_endpoint_identity(ops.as_ref()).is_some() {
+            log_tty_read(b"tty-ioctl:     ", fd, Some(request as i32));
+        }
 
         let result = match request {
             LINUX_TIOCGPGRP => {
@@ -611,6 +615,20 @@ impl StarnixKernel {
             .carrier
             .session_handle;
         let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let tty_fd = {
+            let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            resources
+                .fs
+                .fd_table
+                .get(fd)
+                .and_then(|entry| tty_endpoint_identity(entry.description().ops().as_ref()))
+                .is_some()
+        };
+
+        if tty_fd {
+            log_tty_read(b"tty-read: enter ", fd, None);
+        }
 
         let signalfd = {
             let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
@@ -632,6 +650,9 @@ impl StarnixKernel {
         if let Some(action) =
             self.maybe_apply_tty_job_control(task_id, fd, FdWaitOp::Read, stop_state)?
         {
+            if tty_fd {
+                log_tty_read(b"tty-read: stop  ", fd, None);
+            }
             return Ok(action);
         }
 
@@ -644,10 +665,30 @@ impl StarnixKernel {
             let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
             match resources.fs.fd_table.read(fd, &mut bytes) {
-                Ok(actual) => ReadAttempt::Ready { bytes, actual },
-                Err(ZX_ERR_SHOULD_WAIT) => ReadAttempt::WouldBlock(wait_policy),
-                Err(ZX_ERR_PEER_CLOSED) => ReadAttempt::Ready { bytes, actual: 0 },
-                Err(status) => ReadAttempt::Err(status),
+                Ok(actual) => {
+                    if tty_fd {
+                        log_tty_read(b"tty-read: ready ", fd, None);
+                    }
+                    ReadAttempt::Ready { bytes, actual }
+                }
+                Err(ZX_ERR_SHOULD_WAIT) => {
+                    if tty_fd {
+                        log_tty_read(b"tty-read: wait  ", fd, Some(ZX_ERR_SHOULD_WAIT));
+                    }
+                    ReadAttempt::WouldBlock(wait_policy)
+                }
+                Err(ZX_ERR_PEER_CLOSED) => {
+                    if tty_fd {
+                        log_tty_read(b"tty-read: peer  ", fd, Some(ZX_ERR_PEER_CLOSED));
+                    }
+                    ReadAttempt::Ready { bytes, actual: 0 }
+                }
+                Err(status) => {
+                    if tty_fd {
+                        log_tty_read(b"tty-read: err   ", fd, Some(status));
+                    }
+                    ReadAttempt::Err(status)
+                }
             }
         };
 
@@ -734,7 +775,12 @@ impl StarnixKernel {
 
         match attempt {
             WriteAttempt::Ready(actual) => {
-                if fd == 1 || fd == 2 {
+                let capture = self
+                    .groups
+                    .get(&tgid)
+                    .and_then(|group| group.resources.as_ref())
+                    .is_some_and(|resources| resources.should_capture_stdio_output(fd));
+                if capture {
                     stdout.extend_from_slice(&bytes[..actual]);
                 }
                 complete_syscall(
@@ -798,6 +844,24 @@ impl StarnixKernel {
             .carrier
             .session_handle;
         let tgid = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?.tgid;
+        let tty_fd = {
+            let group = self.groups.get(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
+            let resources = group.resources.as_ref().ok_or(ZX_ERR_BAD_STATE)?;
+            resources
+                .fs
+                .fd_table
+                .get(fd)
+                .and_then(|entry| tty_endpoint_identity(entry.description().ops().as_ref()))
+                .is_some()
+        };
+        if let Some(action) =
+            self.maybe_apply_tty_job_control(task_id, fd, FdWaitOp::Read, stop_state)?
+        {
+            if tty_fd {
+                log_tty_read(b"tty-readv: stop ", fd, None);
+            }
+            return Ok(action);
+        }
         let wait_policy = self.fd_wait_policy_for_op(task_id, fd, FdWaitOp::Read)?;
 
         let mut bytes = Vec::new();
@@ -809,10 +873,30 @@ impl StarnixKernel {
             let group = self.groups.get_mut(&tgid).ok_or(ZX_ERR_BAD_STATE)?;
             let resources = group.resources.as_mut().ok_or(ZX_ERR_BAD_STATE)?;
             match resources.fs.fd_table.read(fd, &mut bytes) {
-                Ok(actual) => ReadAttempt::Ready { bytes, actual },
-                Err(ZX_ERR_SHOULD_WAIT) => ReadAttempt::WouldBlock(wait_policy),
-                Err(ZX_ERR_PEER_CLOSED) => ReadAttempt::Ready { bytes, actual: 0 },
-                Err(status) => ReadAttempt::Err(status),
+                Ok(actual) => {
+                    if tty_fd {
+                        log_tty_read(b"tty-readv: ready", fd, None);
+                    }
+                    ReadAttempt::Ready { bytes, actual }
+                }
+                Err(ZX_ERR_SHOULD_WAIT) => {
+                    if tty_fd {
+                        log_tty_read(b"tty-readv: wait ", fd, Some(ZX_ERR_SHOULD_WAIT));
+                    }
+                    ReadAttempt::WouldBlock(wait_policy)
+                }
+                Err(ZX_ERR_PEER_CLOSED) => {
+                    if tty_fd {
+                        log_tty_read(b"tty-readv: peer ", fd, Some(ZX_ERR_PEER_CLOSED));
+                    }
+                    ReadAttempt::Ready { bytes, actual: 0 }
+                }
+                Err(status) => {
+                    if tty_fd {
+                        log_tty_read(b"tty-readv: err  ", fd, Some(status));
+                    }
+                    ReadAttempt::Err(status)
+                }
             }
         };
 
@@ -904,7 +988,12 @@ impl StarnixKernel {
 
         match attempt {
             WriteAttempt::Ready(actual) => {
-                if fd == 1 || fd == 2 {
+                let capture = self
+                    .groups
+                    .get(&tgid)
+                    .and_then(|group| group.resources.as_ref())
+                    .is_some_and(|resources| resources.should_capture_stdio_output(fd));
+                if capture {
                     stdout.extend_from_slice(&bytes[..actual]);
                 }
                 complete_syscall(

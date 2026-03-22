@@ -156,3 +156,5 @@ pub const AXLE_SYS_AX_VMAR_GET_MAPPING_VMO: SyscallNumber = 74;
 pub const AXLE_SYS_AX_CONSOLE_WRITE: SyscallNumber = 75;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_CONSOLE_READ: SyscallNumber = 76;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_PCI_DEVICE_SET_COMMAND: SyscallNumber = 77;

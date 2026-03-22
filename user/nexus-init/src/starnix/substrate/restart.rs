@@ -1,4 +1,5 @@
 use super::super::*;
+fn log_resume_state(_prefix: &[u8], _task_id: i32, _rip: u64) {}
 
 pub(in crate::starnix) fn complete_syscall(
     stop_state: &mut ax_guest_stop_state_t,
@@ -38,6 +39,7 @@ impl StarnixKernel {
         wait: WaitState,
         stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
+        crate::starnix::task::kernel::log_wait_state(b"starnix-wait: set ", task_id, wait);
         self.tasks.get_mut(&task_id).ok_or(ZX_ERR_BAD_STATE)?.state = TaskState::Waiting(wait);
         self.deliver_or_interrupt_wait(task_id, wait, stop_state)
     }
@@ -177,12 +179,15 @@ impl StarnixKernel {
         task_id: i32,
         stop_state: &ax_guest_stop_state_t,
     ) -> Result<(), zx_status_t> {
+        log_resume_state(b"starnix-resume: begin ", task_id, stop_state.regs.rip);
         let task = self.tasks.get(&task_id).ok_or(ZX_ERR_BAD_STATE)?;
         let write_status = ax_guest_stop_state_write(task.carrier.sidecar_vmo, stop_state);
         zx_status_result(write_status)?;
         let resume_status =
             ax_guest_session_resume(task.carrier.session_handle, stop_state.stop_seq, 0);
-        zx_status_result(resume_status)
+        zx_status_result(resume_status)?;
+        log_resume_state(b"starnix-resume: end   ", task_id, stop_state.regs.rip);
+        Ok(())
     }
 
     pub(in crate::starnix) fn retry_waiting_task(
@@ -204,6 +209,7 @@ impl StarnixKernel {
         let TaskState::Waiting(wait) = task.state else {
             return Ok(());
         };
+        crate::starnix::task::kernel::log_wait_state(b"starnix-wait: retry ", task_id, wait);
 
         let mut stop_state = ax_guest_stop_state_read(task.carrier.sidecar_vmo)?;
         match self.deliver_or_interrupt_wait(task_id, wait, &mut stop_state)? {

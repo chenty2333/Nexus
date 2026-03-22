@@ -127,6 +127,7 @@ pub(super) fn test_kernel_with_stdio(stdout: RecordingFd) -> StarnixKernel {
             directory_offsets: BTreeMap::new(),
             pty_registry: Arc::new(PtyRegistry::new()),
             controlling_tty: Arc::new(Mutex::new(None)),
+            tty_bridge: None,
         },
         mm: test_linux_mm(),
     };
@@ -171,6 +172,7 @@ pub(super) fn test_kernel_with_stdio(stdout: RecordingFd) -> StarnixKernel {
         resources: Some(resources),
     };
     StarnixKernel::new(ZX_HANDLE_INVALID, ZX_HANDLE_INVALID, root_task, root_group)
+        .expect("test kernel")
 }
 
 pub(super) fn insert_test_child(kernel: &mut StarnixKernel, task_state: TaskState, pgid: i32) {

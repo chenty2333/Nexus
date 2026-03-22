@@ -48,7 +48,7 @@ pub(in crate::starnix) fn emulate_common_syscall(
             };
             let result = match executive.fs.fd_table.write(fd, &bytes) {
                 Ok(actual) => {
-                    if fd == 1 || fd == 2 {
+                    if executive.should_capture_stdio_output(fd) {
                         stdout.extend_from_slice(&bytes[..actual]);
                     }
                     u64::try_from(actual).map_err(|_| ZX_ERR_OUT_OF_RANGE)?

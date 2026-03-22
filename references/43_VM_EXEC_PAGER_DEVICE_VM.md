@@ -207,6 +207,11 @@ Current state:
   - config size in bytes
   - MMIO + read-only flags
   - VM map options for the config alias mapping
+- `ax_pci_device_set_command(handle, command)` is now the first narrow config-write helper on that
+  same device family:
+  - it updates the live PCI command register on one discovered real-device handle
+  - it also updates the exported config snapshot backing so userspace keeps one coherent view of
+    the command bits it just programmed
 - `ax_pci_device_set_interrupt_mode(handle, mode)` is now the first narrow interrupt-mode
   activation path on that same bootstrap `PciDevice` object:
   - `VIRTUAL` remains the current bootstrap delivery mode
@@ -216,8 +221,11 @@ Current state:
 
 What is still intentionally narrow:
 
-- the current `PciDevice` object is one bootstrap resource-export object, not yet a generic PCI bus
-  or config-space ABI
+- the current `PciDevice` object is still a narrow resource-export object, not yet a generic PCI
+  bus or full config-space ABI:
+  - one synthetic bootstrap device handle may be seeded for conformance/runtime smoke
+  - one first discovered x86 network function may also be seeded as one real-device bootstrap
+    handle
 - the current pin contract is one direct VMO -> `DmaRegion` path, not yet a fuller BTI/grant
   object model
 - only physical and contiguous VMOs may currently be pinned

@@ -104,10 +104,23 @@ Current PCI-device shape:
     - `LEGACY` / `MSI` / `MSI-X` may now also be selected so ring3 can validate that exported
       interrupt objects track the selected mode/vector metadata
     - real hardware-backed routing/programming still remains intentionally unimplemented
+- one narrow config-write path now also exists through `ax_pci_device_set_command()`:
+  - userspace may update the live PCI command register on a discovered device handle
+  - the current concrete user is the first QEMU `virtio-net-pci` bootstrap slice, which enables:
+    - `MEMORY_SPACE`
+    - `BUS_MASTER`
+  - the kernel mirrors that write back into the exported read-only config snapshot so userspace
+    keeps one coherent control-plane view
 - the first concrete user is the queue-owned bootstrap net dataplane slice
+- the kernel may now also seed one second bootstrap `PciDevice` handle for the first discovered
+  x86 network function when one virtio-style device is present:
+  - config export becomes one page-aligned read-only snapshot over the discovered config space
+  - BAR exports may carry multiple MMIO windows, not only the earlier synthetic BAR0 singleton
+  - queue-pair / interrupt-group metadata may remain `0` until userspace interprets the device's
+    own virtio config/capability layout
 - it is not yet a full PCI bus/discovery object:
-  - no enumeration
-  - no generic config-space read/write ABI
+  - no generic enumeration beyond "first matching network function"
+  - no general config-space read/write ABI beyond the narrow command-register helper
   - no MSI/MSI-X model
   - no resource rebinding or hotplug semantics
 

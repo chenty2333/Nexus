@@ -763,13 +763,17 @@ forcing every syscall through one uniform RPC layer.
       - shell stdio attached to one controlling slave pty rather than the raw
         bootstrap console
     - the shell slice is intentionally narrow:
-      - no poll/epoll readiness integration for pty master/slave endpoints yet
+      - pty master/slave readiness now projects into the shared wait / epoll bridge through one
+        narrow tty signal vocabulary
       - no packet mode, line-speed, or broader tty ioctl surface yet
     - one narrow remote-shell follow-on now also exists:
       - `boot://root-starnix-net-shell` launches the same interactive shell
         through the Starnix runner, but bridges stdio over one remote
         socket-backed tty path and a host-forwarded QEMU TCP port
       - the current remote path proves:
+        - one real QEMU `virtio-net-pci` function can be discovered through the narrow bootstrap
+          `PciDevice` contract, enabled with `MEMORY_SPACE | BUS_MASTER`, and driven from userspace
+          through the existing virtio transport helpers
         - remote command injection over hostfwd -> guest TCP -> Starnix shell
         - remote prompt / echo / command output round-tripping back to the host
         - remote shell use of the same controlling tty / slave pty model as the

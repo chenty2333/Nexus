@@ -9,8 +9,8 @@ use axle_types::zx_handle_t;
 use core::panic::PanicInfo;
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    nexus_init::report_panic()
+fn panic(info: &PanicInfo) -> ! {
+    nexus_init::report_panic_with_info(info)
 }
 
 #[unsafe(no_mangle)]

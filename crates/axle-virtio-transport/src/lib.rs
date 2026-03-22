@@ -43,7 +43,7 @@ pub const MMIO_STATUS_DRIVER: u32 = 1 << 1;
 /// Virtio device status bit: features accepted.
 pub const MMIO_STATUS_FEATURES_OK: u32 = 1 << 3;
 /// Virtio device status bit: queues enabled.
-pub const MMIO_STATUS_DRIVER_OK: u32 = 1 << 4;
+pub const MMIO_STATUS_DRIVER_OK: u32 = 1 << 2;
 
 /// Notify value written for one TX queue.
 pub const MMIO_NOTIFY_TX: u32 = 1;

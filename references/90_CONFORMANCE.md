@@ -779,6 +779,8 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - Starnix remote shell coverage now has its first QEMU host-forwarded gate:
     - `kernel.starnix.remote_shell_bootstrap`
     - one host driver now proves:
+      - the current userspace path can enable and use one discovered QEMU
+        `virtio-net-pci` function through the narrow bootstrap PCI/device contract
       - QEMU user-net `hostfwd` into the guest network path
       - remote prompt / echo / command output round-tripping through the
         socket-backed tty bridge
