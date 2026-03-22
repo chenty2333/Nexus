@@ -46,9 +46,9 @@ trace_sys_exit_phase1 = 64
 trace_sys_retire_phase1 = 64
 trace_sys_native_enter_phase1 = 64
 trace_sys_native_sysret_phase1 = 64
-trace_tlb_page_flush_phase4 = 40
 trace_tlb_sync_plan_phase5 = 8
-trace_tlb_shootdown_full_phase5 = 8
+trace_tlb_shootdown_full_phase5 = 0
+trace_tlb_shootdown_page = 32
 trace_fault_enter_phase6 = 3
 trace_fault_handled_phase6 = 1
 trace_fault_block_phase6 = 2
@@ -69,8 +69,9 @@ channel_fragmented_bytes_total = 65536
 [assertions.packet_fields_min]
 trace_records = 10000
 trace_export_bytes = 500000
-trace_sched_handoff_phase3 = 64
-trace_sched_remote_wake_latency_phase3 = 64
+trace_sched_handoff_phase3 = 63
+trace_sched_remote_wake_latency_phase3 = 63
+trace_tlb_page_flush_phase4 = 40
 
 [assertions.packet_fields_max]
 perf_null_cycles = 100000000

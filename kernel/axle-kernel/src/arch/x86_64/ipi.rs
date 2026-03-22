@@ -1,7 +1,11 @@
 //! Fixed-vector IPI support (bring-up / conformance / TLB shootdown / reschedule).
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+use axle_page_table::PageRange;
 use axle_types::status::ZX_ERR_TIMED_OUT;
 use axle_types::zx_status_t;
 use spin::Mutex;
@@ -226,19 +230,35 @@ fn apic_id_mask(apic_ids: &[usize]) -> u64 {
 
 #[allow(dead_code)]
 pub fn shootdown_page(va: u64) -> Result<(), zx_status_t> {
+    let mut remote_cpus = Vec::new();
+    let local_apic_id = apic::this_apic_id() as usize;
+    crate::smp::for_each_online_cpu(|apic_id| {
+        if apic_id != local_apic_id {
+            remote_cpus.push(apic_id);
+        }
+    });
+    shootdown_page_targets(va, &remote_cpus)
+}
+
+pub fn shootdown_range(apic_ids: &[usize], range: PageRange) -> Result<(), zx_status_t> {
+    let mut page = range.base();
+    while page < range.end() {
+        shootdown_page_targets(page, apic_ids)?;
+        page = page.wrapping_add(axle_page_table::PAGE_SIZE);
+    }
+    Ok(())
+}
+
+fn shootdown_page_targets(va: u64, apic_ids: &[usize]) -> Result<(), zx_status_t> {
     let _guard = TLB_SHOOTDOWN_LOCK.lock();
     TLB_SHOOTDOWN_MODE.store(TLB_MODE_PAGE, Ordering::Release);
     TLB_SHOOTDOWN_PAGE.store(va, Ordering::Release);
 
     let mut result = Ok(());
-    let local_apic_id = apic::this_apic_id() as usize;
     let mut target_mask = 0_u64;
-    crate::smp::for_each_online_cpu(|apic_id| {
+    for &apic_id in apic_ids {
         if result.is_err() {
-            return;
-        }
-        if apic_id == local_apic_id {
-            return;
+            break;
         }
         if apic_id < u64::BITS as usize {
             target_mask |= 1_u64 << apic_id;
@@ -260,7 +280,7 @@ pub fn shootdown_page(va: u64) -> Result<(), zx_status_t> {
                 break;
             }
         }
-    });
+    }
 
     crate::trace::record_tlb_shootdown_page(va, target_mask);
 

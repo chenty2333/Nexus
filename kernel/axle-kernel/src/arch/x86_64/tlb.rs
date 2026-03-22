@@ -2,6 +2,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use axle_page_table::PageRange;
 use axle_types::zx_status_t;
 use x86_64::PhysAddr;
 use x86_64::instructions::tlb::{InvPcidCommand, Pcid, flush_pcid};
@@ -136,6 +137,15 @@ pub fn flush_page_local(va: u64) {
         core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
     }
     crate::trace::record_tlb_flush_page(va);
+}
+
+/// Flush one aligned virtual-address range from the current CPU's TLB.
+pub fn flush_range_local(range: PageRange) {
+    let mut va = range.base();
+    while va < range.end() {
+        flush_page_local(va);
+        va = va.wrapping_add(axle_page_table::PAGE_SIZE);
+    }
 }
 
 /// Flush the current CPU's TLB for the active address-space context.

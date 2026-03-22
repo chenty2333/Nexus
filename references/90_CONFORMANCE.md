@@ -133,6 +133,8 @@ That host gate now explicitly covers:
     same-page fault slice instead of depending on repeated cross-CPU launches
   - the same runner now also executes one narrow VMAR map/protect/unmap churn slice so TLB-local
     page-flush telemetry is exercised and parsed through the same key=value summary path
+  - the same perf-smoke TLB phase now also accepts the merged page-range shootdown path as the
+    current phase-5 contract, rather than pinning phase 5 to full-shootdown-only behavior
   - the same runner now also executes one trap-facing same-page fault slice and exports
     `fault_enter / fault_block / fault_resume / fault_handled / fault_unhandled` counts through
     the same summary path

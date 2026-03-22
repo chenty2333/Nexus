@@ -110,11 +110,19 @@ pub(crate) enum CommitClass {
     Strict,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TlbInvalidateHint {
+    None,
+    Range(PageRange),
+    Full,
+}
+
 /// Post-commit TLB synchronization requirement for one address space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TlbCommitReq {
     address_space_id: AddressSpaceId,
     class: CommitClass,
+    invalidate_hint: TlbInvalidateHint,
 }
 
 impl TlbCommitReq {
@@ -122,6 +130,7 @@ impl TlbCommitReq {
         Self {
             address_space_id,
             class: CommitClass::Relaxed,
+            invalidate_hint: TlbInvalidateHint::None,
         }
     }
 
@@ -129,6 +138,15 @@ impl TlbCommitReq {
         Self {
             address_space_id,
             class: CommitClass::Strict,
+            invalidate_hint: TlbInvalidateHint::Full,
+        }
+    }
+
+    pub(crate) const fn strict_range(address_space_id: AddressSpaceId, range: PageRange) -> Self {
+        Self {
+            address_space_id,
+            class: CommitClass::Strict,
+            invalidate_hint: TlbInvalidateHint::Range(range),
         }
     }
 
@@ -138,6 +156,10 @@ impl TlbCommitReq {
 
     pub(crate) const fn class(self) -> CommitClass {
         self.class
+    }
+
+    const fn invalidate_hint(self) -> TlbInvalidateHint {
+        self.invalidate_hint
     }
 }
 
@@ -163,8 +185,10 @@ struct StrictTlbSyncPlan {
     target_epoch: u64,
     current_cpu_id: usize,
     current_cpu_active: bool,
+    local_observe: bool,
     local_needs_flush: bool,
     remote_cpus: Vec<usize>,
+    op: TlbSyncOp,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -475,10 +499,14 @@ impl LoanRemapResult {
         }
     }
 
-    fn remapped(address_space_id: AddressSpaceId, retire_plan: FrameRetirePlan) -> Self {
+    fn remapped(
+        address_space_id: AddressSpaceId,
+        range: PageRange,
+        retire_plan: FrameRetirePlan,
+    ) -> Self {
         Self {
             remapped: true,
-            tlb_commit: TlbCommitReq::strict(address_space_id),
+            tlb_commit: TlbCommitReq::strict_range(address_space_id, range),
             retire_plan,
         }
     }
@@ -842,12 +870,14 @@ impl TlbCpuTracker {
         current_cpu_id: usize,
         current_cpu_active: bool,
         target_epoch: u64,
+        local_already_flushed: bool,
     ) -> TlbCpuSyncShape {
         if current_cpu_active {
             self.note_active(current_cpu_id);
         }
-        let local_needs_flush =
+        let local_observe =
             current_cpu_active && self.observed_epoch(current_cpu_id) < target_epoch;
+        let local_needs_flush = local_observe && !local_already_flushed;
         let remote_cpus = self
             .active
             .iter()
@@ -856,6 +886,7 @@ impl TlbCpuTracker {
             .collect();
         TlbCpuSyncShape {
             active_cpu_mask: self.active.mask(),
+            local_observe,
             local_needs_flush,
             remote_cpus,
         }
@@ -865,8 +896,74 @@ impl TlbCpuTracker {
 #[derive(Debug)]
 struct TlbCpuSyncShape {
     active_cpu_mask: u64,
+    local_observe: bool,
     local_needs_flush: bool,
     remote_cpus: Vec<usize>,
+}
+
+const TLB_RANGE_FLUSH_PAGE_LIMIT: usize = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TlbSyncOp {
+    Full,
+    Ranges(Vec<PageRange>),
+}
+
+impl TlbSyncOp {
+    fn from_hint(hint: TlbInvalidateHint) -> Result<Option<Self>, PageTableError> {
+        match hint {
+            TlbInvalidateHint::None => Ok(None),
+            TlbInvalidateHint::Full => Ok(Some(Self::Full)),
+            TlbInvalidateHint::Range(range) => Ok(Some(Self::from_range(range))),
+        }
+    }
+
+    fn from_range(range: PageRange) -> Self {
+        let mut ranges = Vec::with_capacity(1);
+        ranges.push(range);
+        Self::Ranges(ranges)
+    }
+
+    const fn is_full(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    fn total_pages(&self) -> Result<usize, PageTableError> {
+        match self {
+            Self::Full => Ok(TLB_RANGE_FLUSH_PAGE_LIMIT.saturating_add(1)),
+            Self::Ranges(ranges) => ranges.iter().try_fold(0_usize, |total, range| {
+                let pages = usize::try_from(range.len() / crate::userspace::USER_PAGE_BYTES)
+                    .map_err(|_| PageTableError::InvalidArgs)?;
+                total.checked_add(pages).ok_or(PageTableError::InvalidArgs)
+            }),
+        }
+    }
+
+    fn merge(&mut self, other: Self) -> Result<(), PageTableError> {
+        if self.is_full() || other.is_full() {
+            *self = Self::Full;
+            return Ok(());
+        }
+        let Self::Ranges(other_ranges) = other else {
+            return Ok(());
+        };
+        let Self::Ranges(ranges) = self else {
+            return Ok(());
+        };
+        for range in other_ranges {
+            insert_merged_page_range(ranges, range)?;
+        }
+        if self.total_pages()? > TLB_RANGE_FLUSH_PAGE_LIMIT {
+            *self = Self::Full;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingTlbSync {
+    epoch: u64,
+    op: TlbSyncOp,
 }
 
 #[derive(Debug)]
@@ -875,6 +972,7 @@ struct AddressSpace {
     page_tables: crate::page_table::UserPageTables,
     tlb_cpus: TlbCpuTracker,
     strict_tlb_epoch: u64,
+    pending_tlb_sync: Option<PendingTlbSync>,
     vm_resources: VmResourceState,
     private_clone_vmos: Vec<VmoId>,
 }
@@ -1023,6 +1121,7 @@ impl AddressSpace {
             page_tables,
             tlb_cpus: TlbCpuTracker::default(),
             strict_tlb_epoch: 0,
+            pending_tlb_sync: None,
             vm_resources: VmResourceState::new(),
             private_clone_vmos: Vec::new(),
         }
@@ -1149,11 +1248,31 @@ impl AddressSpace {
         &mut self,
         current_cpu_id: usize,
         current_cpu_active: bool,
-    ) -> TlbCpuSyncShape {
+        op: TlbSyncOp,
+        local_already_flushed: bool,
+    ) -> (u64, TlbCpuSyncShape) {
         self.bump_strict_tlb_epoch();
         let target_epoch = self.current_invalidate_epoch();
-        self.tlb_cpus
-            .plan_strict_sync(current_cpu_id, current_cpu_active, target_epoch)
+        self.pending_tlb_sync = Some(PendingTlbSync {
+            epoch: target_epoch,
+            op,
+        });
+        (
+            target_epoch,
+            self.tlb_cpus.plan_strict_sync(
+                current_cpu_id,
+                current_cpu_active,
+                target_epoch,
+                local_already_flushed,
+            ),
+        )
+    }
+
+    fn pending_tlb_sync_op(&self, epoch: u64) -> Option<&TlbSyncOp> {
+        self.pending_tlb_sync
+            .as_ref()
+            .filter(|pending| pending.epoch == epoch)
+            .map(|pending| &pending.op)
     }
 
     fn map_vmo_fixed(
@@ -1567,14 +1686,20 @@ impl VmDomain {
         address_space_id: AddressSpaceId,
         current_cpu_id: usize,
         current_cpu_active: bool,
+        op: TlbSyncOp,
+        local_already_flushed: bool,
     ) -> Result<Option<StrictTlbSyncPlan>, zx_status_t> {
         let address_space = self
             .address_spaces
             .get_mut(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        let target_epoch = address_space.current_invalidate_epoch();
-        let sync_shape = address_space.plan_tlb_sync(current_cpu_id, current_cpu_active);
-        if !sync_shape.local_needs_flush && sync_shape.remote_cpus.is_empty() {
+        let (target_epoch, sync_shape) = address_space.plan_tlb_sync(
+            current_cpu_id,
+            current_cpu_active,
+            op.clone(),
+            local_already_flushed,
+        );
+        if !sync_shape.local_observe && sync_shape.remote_cpus.is_empty() {
             return Ok(None);
         }
         crate::trace::record_tlb_sync_plan(
@@ -1588,8 +1713,10 @@ impl VmDomain {
             target_epoch,
             current_cpu_id,
             current_cpu_active,
+            local_observe: sync_shape.local_observe,
             local_needs_flush: sync_shape.local_needs_flush,
             remote_cpus: sync_shape.remote_cpus,
+            op,
         }))
     }
 
@@ -1598,7 +1725,7 @@ impl VmDomain {
             .address_spaces
             .get_mut(&plan.address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        if plan.current_cpu_active {
+        if plan.current_cpu_active && plan.local_observe {
             address_space.observe_tlb_epoch(plan.current_cpu_id, plan.target_epoch);
         }
         for &cpu_id in &plan.remote_cpus {
@@ -2406,6 +2533,64 @@ impl Kernel {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MergedStrictTlbReq {
+    op: TlbSyncOp,
+    local_already_flushed: bool,
+}
+
+fn merge_strict_tlb_commit_reqs(
+    reqs: &[TlbCommitReq],
+) -> Result<alloc::collections::BTreeMap<AddressSpaceId, MergedStrictTlbReq>, zx_status_t> {
+    let mut merged = alloc::collections::BTreeMap::new();
+    for req in reqs {
+        if req.class() != CommitClass::Strict {
+            continue;
+        }
+        let Some(op) = TlbSyncOp::from_hint(req.invalidate_hint()).map_err(map_page_table_error)?
+        else {
+            continue;
+        };
+        let initial_op = op.clone();
+        let entry = merged
+            .entry(req.address_space_id())
+            .or_insert_with(|| MergedStrictTlbReq {
+                op: initial_op,
+                local_already_flushed: !matches!(req.invalidate_hint(), TlbInvalidateHint::Full),
+            });
+        if entry.op != op {
+            entry.op.merge(op).map_err(map_page_table_error)?;
+        }
+        if matches!(req.invalidate_hint(), TlbInvalidateHint::Full) {
+            entry.local_already_flushed = false;
+        }
+    }
+    Ok(merged)
+}
+
+fn flush_tlb_sync_op_local(op: &TlbSyncOp) {
+    match op {
+        TlbSyncOp::Full => crate::arch::tlb::flush_all_local(),
+        TlbSyncOp::Ranges(ranges) => {
+            for &range in ranges {
+                crate::arch::tlb::flush_range_local(range);
+            }
+        }
+    }
+}
+
+fn shootdown_tlb_sync_op(op: &TlbSyncOp, remote_cpus: &[usize]) -> Result<(), zx_status_t> {
+    match op {
+        TlbSyncOp::Full => crate::arch::ipi::shootdown_all(remote_cpus),
+        TlbSyncOp::Ranges(ranges) => {
+            for &range in ranges {
+                crate::arch::ipi::shootdown_range(remote_cpus, range)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Apply one or more committed TLB requirements against the current CPU and any tracked
 /// active peer CPUs for the affected address spaces.
 pub(crate) fn apply_tlb_commit_reqs(
@@ -2414,28 +2599,29 @@ pub(crate) fn apply_tlb_commit_reqs(
     current_address_space_id: Option<AddressSpaceId>,
     reqs: &[TlbCommitReq],
 ) -> Result<(), zx_status_t> {
-    let mut strict_address_spaces = BTreeSet::new();
-    for req in reqs {
-        if req.class() == CommitClass::Strict {
-            strict_address_spaces.insert(req.address_space_id());
-        }
-    }
+    let strict_address_spaces = merge_strict_tlb_commit_reqs(reqs)?;
 
-    for address_space_id in strict_address_spaces {
+    for (address_space_id, merged_req) in strict_address_spaces {
         let current_cpu_active = current_address_space_id == Some(address_space_id);
         let plan = {
             let mut vm = vm_handle.lock();
-            vm.plan_strict_tlb_sync(address_space_id, current_cpu_id, current_cpu_active)?
+            vm.plan_strict_tlb_sync(
+                address_space_id,
+                current_cpu_id,
+                current_cpu_active,
+                merged_req.op.clone(),
+                current_cpu_active && merged_req.local_already_flushed,
+            )?
         };
         let Some(plan) = plan else {
             continue;
         };
 
         if plan.local_needs_flush {
-            crate::arch::tlb::flush_all_local();
+            flush_tlb_sync_op_local(&plan.op);
         }
         if !plan.remote_cpus.is_empty() {
-            crate::arch::ipi::shootdown_all(&plan.remote_cpus)?;
+            shootdown_tlb_sync_op(&plan.op, &plan.remote_cpus)?;
         }
 
         let mut vm = vm_handle.lock();
@@ -2541,6 +2727,7 @@ impl VmDomain {
             .map_err(map_page_table_error)?,
             tlb_cpus: TlbCpuTracker::default(),
             strict_tlb_epoch: 0,
+            pending_tlb_sync: None,
             vm_resources: VmResourceState::new(),
             private_clone_vmos: Vec::new(),
         };
@@ -2809,7 +2996,20 @@ impl VmDomain {
         Ok(if affected_ranges.is_empty() {
             TlbCommitReq::relaxed(address_space_id)
         } else {
-            TlbCommitReq::strict(address_space_id)
+            TlbCommitReq::strict_range(
+                address_space_id,
+                affected_ranges
+                    .into_iter()
+                    .try_fold(None, |merged: Option<PageRange>, (base, len)| {
+                        let range = PageRange::new(base, len)?;
+                        Ok::<_, PageTableError>(Some(match merged {
+                            Some(existing) => merge_page_ranges(existing, range)?,
+                            None => range,
+                        }))
+                    })
+                    .map_err(map_page_table_error)?
+                    .ok_or(ZX_ERR_BAD_STATE)?,
+            )
         })
     }
 
@@ -2964,7 +3164,7 @@ impl VmDomain {
             sender_cursor,
         )?;
         loan_tx.commit().map_err(map_page_table_error)?;
-        Ok(TlbCommitReq::strict(loaned.address_space_id()))
+        Ok(TlbCommitReq::strict_range(loaned.address_space_id(), range))
     }
 
     pub(crate) fn try_remap_loaned_channel_read(
@@ -3058,6 +3258,7 @@ impl VmDomain {
         );
         Ok(LoanRemapResult::remapped(
             current_address_space_id,
+            receiver_range,
             retire_plan,
         ))
     }
@@ -3085,7 +3286,10 @@ impl VmDomain {
         self.clear_private_cow_range(address_space_id, addr, len);
         self.clear_mapping_pages(address_space_id, addr, len)?;
         self.validate_frame_mapping_invariants_for(&affected_frames, "unmap_current_vmar");
-        Ok(TlbCommitReq::strict(address_space_id))
+        Ok(TlbCommitReq::strict_range(
+            address_space_id,
+            PageRange::new(addr, len).map_err(map_page_table_error)?,
+        ))
     }
 
     pub(crate) fn protect_vmar(
@@ -3111,7 +3315,10 @@ impl VmDomain {
         }
         self.update_mapping_pages(address_space_id, addr, len)?;
         Ok(if strict {
-            TlbCommitReq::strict(address_space_id)
+            TlbCommitReq::strict_range(
+                address_space_id,
+                PageRange::new(addr, len).map_err(map_page_table_error)?,
+            )
         } else {
             TlbCommitReq::relaxed(address_space_id)
         })
@@ -3548,7 +3755,11 @@ impl VmDomain {
         if address_space.observed_tlb_epoch(cpu_id) >= target_epoch {
             return Ok(());
         }
-        crate::arch::tlb::flush_all_local();
+        if let Some(op) = address_space.pending_tlb_sync_op(target_epoch) {
+            flush_tlb_sync_op_local(op);
+        } else {
+            crate::arch::tlb::flush_all_local();
+        }
         address_space.observe_tlb_epoch(cpu_id, target_epoch);
         Ok(())
     }
@@ -4189,6 +4400,31 @@ fn merge_page_ranges(left: PageRange, right: PageRange) -> Result<PageRange, Pag
     let end = left.end().max(right.end());
     let len = end.checked_sub(base).ok_or(PageTableError::InvalidArgs)?;
     PageRange::new(base, len)
+}
+
+fn ranges_touch_or_overlap(left: PageRange, right: PageRange) -> bool {
+    left.base() <= right.end() && right.base() <= left.end()
+}
+
+fn insert_merged_page_range(
+    ranges: &mut Vec<PageRange>,
+    range: PageRange,
+) -> Result<(), PageTableError> {
+    let mut merged = range;
+    let mut index = 0;
+    while index < ranges.len() {
+        if ranges_touch_or_overlap(ranges[index], merged) {
+            merged = merge_page_ranges(ranges[index], merged)?;
+            ranges.remove(index);
+            continue;
+        }
+        if ranges[index].base() > merged.end() {
+            break;
+        }
+        index += 1;
+    }
+    ranges.insert(index, merged);
+    Ok(())
 }
 
 fn map_alloc_error(err: CSpaceError) -> zx_status_t {
