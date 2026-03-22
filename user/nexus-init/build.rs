@@ -230,6 +230,7 @@ fn main() {
         "root_component_starnix_dynamic_pie.toml",
         "root_component_starnix_glibc_hello.toml",
         "root_component_starnix_shell.toml",
+        "root_component_starnix_net_shell.toml",
         "echo_provider.toml",
         "echo_client.toml",
         "controller_worker.toml",
@@ -261,6 +262,7 @@ fn main() {
         "linux_dynamic_pie_smoke.toml",
         "linux_glibc_hello.toml",
         "linux_busybox_shell.toml",
+        "linux_busybox_socket_shell.toml",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -389,6 +391,10 @@ fn main() {
             "root_component_starnix_shell.toml",
             "root_component_starnix_shell.nxcd",
         ),
+        (
+            "root_component_starnix_net_shell.toml",
+            "root_component_starnix_net_shell.nxcd",
+        ),
         ("echo_provider.toml", "echo_provider.nxcd"),
         ("echo_client.toml", "echo_client.nxcd"),
         ("controller_worker.toml", "controller_worker.nxcd"),
@@ -480,6 +486,10 @@ fn main() {
         ),
         ("linux_glibc_hello.toml", "linux_glibc_hello.nxcd"),
         ("linux_busybox_shell.toml", "linux_busybox_shell.nxcd"),
+        (
+            "linux_busybox_socket_shell.toml",
+            "linux_busybox_socket_shell.nxcd",
+        ),
     ] {
         let source_path = manifests_dir.join(input);
         let source = fs::read_to_string(&source_path)
@@ -682,6 +692,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_dynamic_pie)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_glibc_hello)");
     println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_shell)");
+    println!("cargo:rustc-check-cfg=cfg(nexus_init_embed_starnix_net_shell)");
     match root_url.as_str() {
         "boot://root-starnix" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_hello");
@@ -769,6 +780,10 @@ fn main() {
         }
         "boot://root-starnix-shell" => {
             println!("cargo:rustc-cfg=nexus_init_embed_starnix_shell");
+            embed_busybox_shell_assets(&out_dir);
+        }
+        "boot://root-starnix-net-shell" => {
+            println!("cargo:rustc-cfg=nexus_init_embed_starnix_net_shell");
             embed_busybox_shell_assets(&out_dir);
         }
         _ => {}

@@ -3,6 +3,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::ToString;
 use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use libax::compat::{zx_channel_read_alloc, zx_channel_write, zx_socket_read, zx_socket_write};
 
 const LINUX_NCCS: usize = 19;
 const LINUX_VINTR: usize = 0;
@@ -46,6 +47,44 @@ const LINUX_TERMIOS_BYTES: usize = 36;
 const LINUX_WINSIZE_BYTES: usize = 8;
 
 static NEXT_TTY_ID: AtomicU64 = AtomicU64::new(1);
+
+fn log_tty_bridge(_prefix: &[u8], _detail: usize) {}
+
+fn log_tty_bridge_bytes(_prefix: &[u8], _bytes: &[u8]) {}
+
+#[derive(Debug)]
+enum TtyBridge {
+    None,
+    Console,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TtyBridgeInput {
+    Socket(zx_handle_t),
+    Channel(zx_handle_t),
+}
+
+impl TtyBridgeInput {
+    const fn handle(self) -> zx_handle_t {
+        match self {
+            Self::Socket(handle) | Self::Channel(handle) => handle,
+        }
+    }
+
+    const fn readable_signals(self) -> u32 {
+        match self {
+            Self::Socket(_) => ZX_SOCKET_READABLE | ZX_SOCKET_PEER_CLOSED,
+            Self::Channel(_) => ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
+        }
+    }
+
+    fn close(self) {
+        let handle = self.handle();
+        if handle != ZX_HANDLE_INVALID {
+            let _ = zx_handle_close(handle);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LinuxTermios {
@@ -181,6 +220,7 @@ struct TtyState {
     slave_ready: VecDeque<u8>,
     master_ready: VecDeque<u8>,
     eof_pending: bool,
+    bridge_peer_closed: bool,
 }
 
 impl TtyState {
@@ -271,59 +311,134 @@ impl TtyState {
     }
 }
 
+fn create_tty_wait_pair() -> Result<(zx_handle_t, zx_handle_t), zx_status_t> {
+    let mut wait_handle = ZX_HANDLE_INVALID;
+    let mut peer_handle = ZX_HANDLE_INVALID;
+    let status = ax_eventpair_create(0, &mut wait_handle, &mut peer_handle);
+    if status == ZX_OK {
+        return Ok((wait_handle, peer_handle));
+    }
+    #[cfg(test)]
+    {
+        Ok((ZX_HANDLE_INVALID, ZX_HANDLE_INVALID))
+    }
+    #[cfg(not(test))]
+    {
+        Err(status)
+    }
+}
+
 #[derive(Debug)]
 pub(in crate::starnix) struct TtyCore {
     id: u64,
     state: Mutex<TtyState>,
+    bridge: TtyBridge,
+    slave_wait_handle: zx_handle_t,
+    slave_peer_handle: zx_handle_t,
+    master_wait_handle: zx_handle_t,
+    master_peer_handle: zx_handle_t,
 }
 
 impl TtyCore {
-    fn new() -> Self {
-        Self {
+    fn new(bridge: TtyBridge) -> Self {
+        let (slave_wait_handle, slave_peer_handle) =
+            create_tty_wait_pair().expect("tty slave wait pair");
+        let (master_wait_handle, master_peer_handle) =
+            create_tty_wait_pair().expect("tty master wait pair");
+        let core = Self {
             id: NEXT_TTY_ID.fetch_add(1, Ordering::Relaxed),
             state: Mutex::new(TtyState::default()),
+            bridge,
+            slave_wait_handle,
+            slave_peer_handle,
+            master_wait_handle,
+            master_peer_handle,
+        };
+        {
+            let state = core.state.lock();
+            core.refresh_signals_locked(&state)
+                .expect("tty initial signal state");
         }
+        core
     }
 
     pub(in crate::starnix) const fn id(&self) -> u64 {
         self.id
     }
 
-    fn slave_read(&self, buffer: &mut [u8], console_bridge: bool) -> Result<usize, zx_status_t> {
+    fn refresh_signals_locked(&self, state: &TtyState) -> Result<(), zx_status_t> {
+        let mut slave_set = TTY_WRITABLE_SIGNAL;
+        if state.eof_pending || !state.slave_ready.is_empty() {
+            slave_set |= TTY_READABLE_SIGNAL;
+        }
+        if state.bridge_peer_closed {
+            slave_set |= TTY_PEER_CLOSED_SIGNAL;
+        }
+        if self.slave_wait_handle != ZX_HANDLE_INVALID {
+            zx_status_result(ax_object_signal(
+                self.slave_wait_handle,
+                TTY_SIGNAL_MASK,
+                slave_set,
+            ))?;
+        }
+
+        let mut master_set = TTY_WRITABLE_SIGNAL;
+        if !state.master_ready.is_empty() {
+            master_set |= TTY_READABLE_SIGNAL;
+        }
+        if self.master_wait_handle != ZX_HANDLE_INVALID {
+            zx_status_result(ax_object_signal(
+                self.master_wait_handle,
+                TTY_SIGNAL_MASK,
+                master_set,
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn slave_read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
         if buffer.is_empty() {
             return Ok(0);
         }
 
         loop {
-            if let Some(actual) = self.state.lock().try_consume_slave_ready(buffer) {
+            let mut state = self.state.lock();
+            if let Some(actual) = state.try_consume_slave_ready(buffer) {
+                self.refresh_signals_locked(&state)?;
                 return Ok(actual);
             }
-            if !console_bridge {
-                return Err(ZX_ERR_SHOULD_WAIT);
-            }
-
-            let mut raw = [0u8; 128];
-            let mut actual = 0usize;
-            zx_status_result(ax_console_read(&mut raw, &mut actual))?;
-            if actual == 0 {
-                continue;
-            }
-            let echo = self.state.lock().ingest_master_bytes(&raw[..actual]);
-            if !echo.is_empty() {
-                let mut echoed = 0usize;
-                zx_status_result(ax_console_write(&echo, &mut echoed))?;
+            drop(state);
+            match self.bridge {
+                TtyBridge::None => return Err(ZX_ERR_SHOULD_WAIT),
+                TtyBridge::Console => {
+                    let mut raw = [0u8; 128];
+                    let mut actual = 0usize;
+                    zx_status_result(ax_console_read(&mut raw, &mut actual))?;
+                    if actual == 0 {
+                        continue;
+                    }
+                    let echo = self.state.lock().ingest_master_bytes(&raw[..actual]);
+                    if !echo.is_empty() {
+                        let mut echoed = 0usize;
+                        zx_status_result(ax_console_write(&echo, &mut echoed))?;
+                    }
+                }
             }
         }
     }
 
-    fn slave_write(&self, buffer: &[u8], console_bridge: bool) -> Result<usize, zx_status_t> {
-        self.state
-            .lock()
-            .master_ready
-            .extend(buffer.iter().copied());
-        if console_bridge {
-            let mut actual = 0usize;
-            zx_status_result(ax_console_write(buffer, &mut actual))?;
+    fn slave_write(&self, buffer: &[u8]) -> Result<usize, zx_status_t> {
+        {
+            let mut state = self.state.lock();
+            state.master_ready.extend(buffer.iter().copied());
+            self.refresh_signals_locked(&state)?;
+        }
+        match self.bridge {
+            TtyBridge::None => {}
+            TtyBridge::Console => {
+                let mut actual = 0usize;
+                zx_status_result(ax_console_write(buffer, &mut actual))?;
+            }
         }
         Ok(buffer.len())
     }
@@ -332,15 +447,29 @@ impl TtyCore {
         if buffer.is_empty() {
             return Ok(0);
         }
-        self.state
-            .lock()
+        let mut state = self.state.lock();
+        let actual = state
             .try_consume_master_ready(buffer)
-            .ok_or(ZX_ERR_SHOULD_WAIT)
+            .ok_or(ZX_ERR_SHOULD_WAIT)?;
+        self.refresh_signals_locked(&state)?;
+        Ok(actual)
     }
 
     fn master_write(&self, buffer: &[u8]) -> Result<usize, zx_status_t> {
-        let _ = self.state.lock().ingest_master_bytes(buffer);
+        let mut state = self.state.lock();
+        let echo = state.ingest_master_bytes(buffer);
+        if !echo.is_empty() {
+            state.master_ready.extend(echo.iter().copied());
+        }
+        self.refresh_signals_locked(&state)?;
         Ok(buffer.len())
+    }
+
+    fn mark_bridge_closed(&self) -> Result<(), zx_status_t> {
+        let mut state = self.state.lock();
+        state.bridge_peer_closed = true;
+        state.eof_pending = true;
+        self.refresh_signals_locked(&state)
     }
 
     fn ioctl(&self, session: zx_handle_t, request: u64, arg: u64) -> Result<u64, zx_status_t> {
@@ -377,20 +506,95 @@ impl TtyCore {
             _ => Err(ZX_ERR_NOT_SUPPORTED),
         }
     }
+
+    fn slave_wait_interest(&self) -> Option<WaitSpec> {
+        Some(WaitSpec::new(self.slave_wait_handle, TTY_SIGNAL_MASK))
+    }
+
+    fn master_wait_interest(&self) -> Option<WaitSpec> {
+        Some(WaitSpec::new(self.master_wait_handle, TTY_SIGNAL_MASK))
+    }
+}
+
+impl Drop for TtyCore {
+    fn drop(&mut self) {
+        let _ = zx_handle_close(self.master_peer_handle);
+        let _ = zx_handle_close(self.master_wait_handle);
+        let _ = zx_handle_close(self.slave_peer_handle);
+        let _ = zx_handle_close(self.slave_wait_handle);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TtyBridgeOutput {
+    Socket(zx_handle_t),
+    Channel(zx_handle_t),
+}
+
+impl TtyBridgeOutput {
+    const fn handle(self) -> zx_handle_t {
+        match self {
+            Self::Socket(handle) | Self::Channel(handle) => handle,
+        }
+    }
+
+    const fn writable_signals(self) -> u32 {
+        match self {
+            Self::Socket(_) => ZX_SOCKET_WRITABLE | ZX_SOCKET_PEER_CLOSED,
+            Self::Channel(_) => ZX_CHANNEL_WRITABLE | ZX_CHANNEL_PEER_CLOSED,
+        }
+    }
+
+    fn write_chunk(self, bytes: &[u8]) -> Result<usize, zx_status_t> {
+        match self {
+            Self::Socket(handle) => {
+                let status = zx_socket_write(
+                    handle,
+                    0,
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    core::ptr::null_mut(),
+                );
+                if status == ZX_OK {
+                    Ok(bytes.len())
+                } else {
+                    Err(status)
+                }
+            }
+            Self::Channel(handle) => {
+                let status = zx_channel_write(
+                    handle,
+                    0,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    core::ptr::null(),
+                    0,
+                );
+                if status == ZX_OK {
+                    Ok(bytes.len())
+                } else {
+                    Err(status)
+                }
+            }
+        }
+    }
+
+    fn close(self) {
+        let handle = self.handle();
+        if handle != ZX_HANDLE_INVALID {
+            let _ = zx_handle_close(handle);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(in crate::starnix) struct PtySlaveFd {
     core: Arc<TtyCore>,
-    console_bridge: bool,
 }
 
 impl PtySlaveFd {
-    fn new(core: Arc<TtyCore>, console_bridge: bool) -> Self {
-        Self {
-            core,
-            console_bridge,
-        }
+    fn new(core: Arc<TtyCore>) -> Self {
+        Self { core }
     }
 
     pub(in crate::starnix) fn tty_id(&self) -> u64 {
@@ -404,11 +608,11 @@ impl FdOps for PtySlaveFd {
     }
 
     fn read(&self, buffer: &mut [u8]) -> Result<usize, zx_status_t> {
-        self.core.slave_read(buffer, self.console_bridge)
+        self.core.slave_read(buffer)
     }
 
     fn write(&self, buffer: &[u8]) -> Result<usize, zx_status_t> {
-        self.core.slave_write(buffer, self.console_bridge)
+        self.core.slave_write(buffer)
     }
 
     fn seek(&self, _origin: SeekOrigin, _offset: i64) -> Result<u64, zx_status_t> {
@@ -424,7 +628,7 @@ impl FdOps for PtySlaveFd {
     }
 
     fn wait_interest(&self) -> Option<WaitSpec> {
-        None
+        self.core.slave_wait_interest()
     }
 
     fn ioctl(&self, session: zx_handle_t, request: u64, arg: u64) -> Result<u64, zx_status_t> {
@@ -444,6 +648,21 @@ impl PtyMasterFd {
 
     pub(in crate::starnix) fn tty_id(&self) -> u64 {
         self.core.id()
+    }
+
+    pub(in crate::starnix) fn try_read_ready(
+        &self,
+        buffer: &mut [u8],
+    ) -> Result<usize, zx_status_t> {
+        self.core.master_read(buffer)
+    }
+
+    pub(in crate::starnix) fn write_input(&self, buffer: &[u8]) -> Result<usize, zx_status_t> {
+        self.core.master_write(buffer)
+    }
+
+    pub(in crate::starnix) fn mark_bridge_closed(&self) -> Result<(), zx_status_t> {
+        self.core.mark_bridge_closed()
     }
 }
 
@@ -473,11 +692,203 @@ impl FdOps for PtyMasterFd {
     }
 
     fn wait_interest(&self) -> Option<WaitSpec> {
-        None
+        self.core.master_wait_interest()
     }
 
     fn ioctl(&self, session: zx_handle_t, request: u64, arg: u64) -> Result<u64, zx_status_t> {
         self.core.ioctl(session, request, arg)
+    }
+}
+
+pub(in crate::starnix) struct RemoteTtyBridge {
+    input: TtyBridgeInput,
+    output: TtyBridgeOutput,
+    master: Arc<PtyMasterFd>,
+    pending_tx: Mutex<VecDeque<u8>>,
+}
+
+impl RemoteTtyBridge {
+    fn new(input: TtyBridgeInput, output: TtyBridgeOutput, master: Arc<PtyMasterFd>) -> Self {
+        Self {
+            input,
+            output,
+            master,
+            pending_tx: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub(in crate::starnix) fn arm_input(
+        &self,
+        port: zx_handle_t,
+        packet_key: u64,
+    ) -> Result<(), zx_status_t> {
+        zx_status_result(ax_object_wait_async(
+            self.input.handle(),
+            port,
+            packet_key,
+            self.input.readable_signals(),
+            0,
+        ))
+    }
+
+    pub(in crate::starnix) fn arm_output(
+        &self,
+        port: zx_handle_t,
+        packet_key: u64,
+    ) -> Result<(), zx_status_t> {
+        let output_pending = !self.pending_tx.lock().is_empty();
+        let (handle, signals) = if output_pending {
+            (self.output.handle(), self.output.writable_signals())
+        } else {
+            (
+                self.master.core.master_wait_handle,
+                TTY_READABLE_SIGNAL | TTY_PEER_CLOSED_SIGNAL,
+            )
+        };
+        zx_status_result(ax_object_wait_async(handle, port, packet_key, signals, 0))
+    }
+
+    fn flush_pending_tx(&self) -> Result<bool, zx_status_t> {
+        let mut chunk = [0u8; 256];
+        loop {
+            let (count, had_more) = {
+                let mut pending = self.pending_tx.lock();
+                let count = pending.len().min(chunk.len());
+                for slot in &mut chunk[..count] {
+                    *slot = pending.pop_front().expect("pending tty byte");
+                }
+                (count, !pending.is_empty())
+            };
+            if count == 0 {
+                return Ok(false);
+            }
+            log_tty_bridge(b"tty-flush ", count);
+            match self.output.write_chunk(&chunk[..count]) {
+                Ok(actual) => {
+                    log_tty_bridge(b"tty-wrote ", actual);
+                    if actual == 0 {
+                        let mut pending = self.pending_tx.lock();
+                        for &byte in chunk[..count].iter().rev() {
+                            pending.push_front(byte);
+                        }
+                        return Ok(false);
+                    }
+                    if actual < count {
+                        let mut pending = self.pending_tx.lock();
+                        for &byte in chunk[actual..count].iter().rev() {
+                            pending.push_front(byte);
+                        }
+                        return Ok(false);
+                    }
+                    if had_more {
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                Err(ZX_ERR_SHOULD_WAIT) => {
+                    let mut pending = self.pending_tx.lock();
+                    for &byte in chunk[..count].iter().rev() {
+                        pending.push_front(byte);
+                    }
+                    return Ok(false);
+                }
+                Err(ZX_ERR_PEER_CLOSED) => {
+                    self.master.mark_bridge_closed()?;
+                    return Ok(true);
+                }
+                Err(status) => return Err(status),
+            }
+        }
+    }
+
+    pub(in crate::starnix) fn service(&self, input_packet: bool) -> Result<bool, zx_status_t> {
+        if self.flush_pending_tx()? {
+            return Ok(true);
+        }
+
+        if input_packet {
+            loop {
+                match self.input {
+                    TtyBridgeInput::Socket(handle) => {
+                        let mut raw = [0u8; 256];
+                        let mut actual = 0usize;
+                        let status =
+                            zx_socket_read(handle, 0, raw.as_mut_ptr(), raw.len(), &mut actual);
+                        if status == ZX_OK {
+                            if actual == 0 {
+                                break;
+                            }
+                            log_tty_bridge_bytes(b"tty-bridge: rx ", &raw[..actual]);
+                            let _ = self.master.write_input(&raw[..actual])?;
+                            continue;
+                        }
+                        if status == ZX_ERR_SHOULD_WAIT {
+                            break;
+                        }
+                        if status == ZX_ERR_PEER_CLOSED {
+                            self.master.mark_bridge_closed()?;
+                            return Ok(true);
+                        }
+                        return Err(status);
+                    }
+                    TtyBridgeInput::Channel(handle) => match zx_channel_read_alloc(handle, 0) {
+                        Ok((bytes, handles)) => {
+                            for owned in handles {
+                                let _ = zx_handle_close(owned);
+                            }
+                            if bytes.is_empty() {
+                                break;
+                            }
+                            log_tty_bridge_bytes(b"tty-bridge: rx ", &bytes);
+                            let _ = self.master.write_input(&bytes)?;
+                        }
+                        Err(ZX_ERR_SHOULD_WAIT) => break,
+                        Err(ZX_ERR_PEER_CLOSED) => {
+                            self.master.mark_bridge_closed()?;
+                            return Ok(true);
+                        }
+                        Err(status) => return Err(status),
+                    },
+                }
+            }
+
+            return Ok(false);
+        }
+
+        loop {
+            let mut raw = [0u8; 256];
+            match self.master.try_read_ready(&mut raw) {
+                Ok(actual) => {
+                    log_tty_bridge(b"tty-read  ", actual);
+                    if actual == 0 {
+                        break;
+                    }
+                    log_tty_bridge_bytes(b"tty-bridge: tx ", &raw[..actual]);
+                    self.pending_tx.lock().extend(raw[..actual].iter().copied());
+                    if self.flush_pending_tx()? {
+                        return Ok(true);
+                    }
+                    if actual < raw.len() {
+                        break;
+                    }
+                }
+                Err(ZX_ERR_SHOULD_WAIT) => {
+                    log_tty_bridge(b"tty-wait  ", 0);
+                    break;
+                }
+                Err(status) => return Err(status),
+            }
+        }
+
+        log_tty_bridge(b"tty-ret   ", 0);
+        Ok(false)
+    }
+}
+
+impl Drop for RemoteTtyBridge {
+    fn drop(&mut self) {
+        self.input.close();
+        self.output.close();
     }
 }
 
@@ -492,25 +903,60 @@ impl PtyRegistry {
         Self::default()
     }
 
-    pub(in crate::starnix) fn allocate_pair(
-        &self,
-        console_bridge: bool,
-    ) -> (Arc<PtyMasterFd>, Arc<PtySlaveFd>) {
+    fn allocate_pair(&self, bridge: TtyBridge) -> (Arc<PtyMasterFd>, Arc<PtySlaveFd>) {
         let mut next = self.next_id.lock();
         let pts_id = *next;
         *next = next.saturating_add(1);
         drop(next);
 
-        let core = Arc::new(TtyCore::new());
-        let slave = Arc::new(PtySlaveFd::new(core.clone(), console_bridge));
+        let core = Arc::new(TtyCore::new(bridge));
+        let slave = Arc::new(PtySlaveFd::new(core.clone()));
         let master = Arc::new(PtyMasterFd::new(core));
         self.slaves.lock().insert(pts_id, slave.clone());
         (master, slave)
     }
 
     pub(in crate::starnix) fn allocate_console_slave(&self) -> Arc<PtySlaveFd> {
-        let (_master, slave) = self.allocate_pair(true);
+        let (_master, slave) = self.allocate_pair(TtyBridge::Console);
         slave
+    }
+
+    pub(in crate::starnix) fn allocate_unbridged_pair(
+        &self,
+    ) -> (Arc<PtyMasterFd>, Arc<PtySlaveFd>) {
+        self.allocate_pair(TtyBridge::None)
+    }
+
+    pub(in crate::starnix) fn allocate_socket_bridge(
+        &self,
+        read_handle: zx_handle_t,
+        write_handle: zx_handle_t,
+    ) -> (Arc<RemoteTtyBridge>, Arc<PtySlaveFd>) {
+        let (master, slave) = self.allocate_unbridged_pair();
+        (
+            Arc::new(RemoteTtyBridge::new(
+                TtyBridgeInput::Socket(read_handle),
+                TtyBridgeOutput::Socket(write_handle),
+                master,
+            )),
+            slave,
+        )
+    }
+
+    pub(in crate::starnix) fn allocate_channel_bridge(
+        &self,
+        read_handle: zx_handle_t,
+        write_handle: zx_handle_t,
+    ) -> (Arc<RemoteTtyBridge>, Arc<PtySlaveFd>) {
+        let (master, slave) = self.allocate_unbridged_pair();
+        (
+            Arc::new(RemoteTtyBridge::new(
+                TtyBridgeInput::Channel(read_handle),
+                TtyBridgeOutput::Channel(write_handle),
+                master,
+            )),
+            slave,
+        )
     }
 
     fn clone_slave(&self, pts_id: u32) -> Result<Arc<dyn FdOps>, zx_status_t> {
@@ -689,7 +1135,7 @@ impl FdOps for DevDirFd {
         match (head, tail) {
             ("tty", None) => self.tty(),
             ("ptmx", None) => {
-                let (master, _slave) = self.registry.allocate_pair(false);
+                let (master, _slave) = self.registry.allocate_unbridged_pair();
                 Ok(master)
             }
             ("pts", None) => Ok(self.pts_dir.clone()),
@@ -718,7 +1164,7 @@ mod tests {
     #[test]
     fn canonical_tty_returns_line_after_newline() {
         let registry = PtyRegistry::new();
-        let master = registry.allocate_pair(false).0;
+        let master = registry.allocate_unbridged_pair().0;
         let slave = registry.slaves.lock().get(&0).cloned().expect("slave");
 
         assert_eq!(master.write(b"ls"), Ok(2));
@@ -733,7 +1179,7 @@ mod tests {
     #[test]
     fn devpts_reexports_allocated_slave() {
         let registry = Arc::new(PtyRegistry::new());
-        let (_master, _slave) = registry.allocate_pair(false);
+        let (_master, _slave) = registry.allocate_unbridged_pair();
         let pts = DevPtsDirFd::new(registry.clone());
         let reopened = pts.openat("0", OpenFlags::READABLE).expect("pts/0");
         assert!(reopened.as_any().is::<PtySlaveFd>());

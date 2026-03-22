@@ -765,7 +765,19 @@ forcing every syscall through one uniform RPC layer.
     - the shell slice is intentionally narrow:
       - no poll/epoll readiness integration for pty master/slave endpoints yet
       - no packet mode, line-speed, or broader tty ioctl surface yet
-      - no network or sshd session integration yet
+    - one narrow remote-shell follow-on now also exists:
+      - `boot://root-starnix-net-shell` launches the same interactive shell
+        through the Starnix runner, but bridges stdio over one remote
+        socket-backed tty path and a host-forwarded QEMU TCP port
+      - the current remote path proves:
+        - remote command injection over hostfwd -> guest TCP -> Starnix shell
+        - remote prompt / echo / command output round-tripping back to the host
+        - remote shell use of the same controlling tty / slave pty model as the
+          local shell slice
+      - the current remote slice is intentionally narrow:
+        - plain remote shell transport only, not SSH protocol
+        - no sshd session integration yet
+        - no auth/config/session-daemon layer yet
     - the older dedicated `round6_proc_tty` guest smoke is now superseded by:
       - host-side process/procfs semantic tests
       - the pty-backed shell conformance slice
@@ -785,8 +797,8 @@ forcing every syscall through one uniform RPC layer.
     - the current inet slice is intentionally narrow:
       - loopback only (`127.0.0.1`)
       - `SOCK_STREAM` only
-      - no ring3 virtio transport integration yet
-      - no QEMU host-forwarded networking yet
+      - ring3 virtio transport is now integrated far enough to host one
+        QEMU user-network / hostfwd remote shell slice
       - no sshd integration yet
   - no restart blocks / `sigaltstack` yet
   - no epoll model yet

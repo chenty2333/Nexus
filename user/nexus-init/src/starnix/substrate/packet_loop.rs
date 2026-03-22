@@ -1,6 +1,47 @@
 use super::super::*;
+use alloc::sync::Arc;
+
+fn log_tty_bridge_packet(_prefix: &[u8], _key: u64) {}
+
+fn log_port_packet(prefix: &[u8], packet: &zx_port_packet_t) {
+    let _ = prefix;
+    let _ = packet;
+}
+
+fn log_packet_loop_wait(prefix: &[u8], detail: u64) {
+    let _ = prefix;
+    let _ = detail;
+}
 
 impl StarnixKernel {
+    fn service_tty_bridge_packet(&mut self, packet_key: u64) -> Result<(), zx_status_t> {
+        log_tty_bridge_packet(b"tty-bridge: pkt ", packet_key);
+        let Some((bridge, packet_kind)) = self.tty_bridge_packets.get(&packet_key).cloned() else {
+            return Err(ZX_ERR_BAD_STATE);
+        };
+        if packet_kind {
+            log_tty_bridge_packet(b"tty-bridge: svc-rx ", packet_key);
+        } else {
+            log_tty_bridge_packet(b"tty-bridge: svc-tx ", packet_key);
+        }
+        let closed = bridge.service(packet_kind)?;
+        log_tty_bridge_packet(b"tty-bridge: done ", packet_key);
+        if !closed {
+            if packet_kind {
+                log_tty_bridge_packet(b"tty-bridge: rearm-rx ", packet_key);
+                bridge.arm_input(self.port, packet_key)?;
+            } else {
+                log_tty_bridge_packet(b"tty-bridge: rearm-tx ", packet_key);
+                bridge.arm_output(self.port, packet_key)?;
+            }
+        } else {
+            log_tty_bridge_packet(b"tty-bridge: closed ", packet_key);
+            self.tty_bridge_packets
+                .retain(|_, (registered, _)| !Arc::ptr_eq(registered, &bridge));
+        }
+        Ok(())
+    }
+
     fn task_id_for_packet_key(&self, packet_key: u64) -> Option<i32> {
         self.tasks
             .iter()
@@ -21,12 +62,18 @@ impl StarnixKernel {
                 return status;
             }
             let mut packet = zx_port_packet_t::default();
+            log_packet_loop_wait(b"starnix-loop: wait ", self.port);
             let wait_status = zx_port_wait(self.port, AX_TIME_INFINITE, &mut packet);
             if wait_status != ZX_OK {
                 return map_status_to_return_code(wait_status);
             }
+            log_packet_loop_wait(b"starnix-loop: wake ", packet.key);
+            log_port_packet(b"port-pkt: ", &packet);
             match packet.type_ {
                 ZX_PKT_TYPE_USER => {
+                    if self.tty_bridge_packets.contains_key(&packet.key) {
+                        log_tty_bridge_packet(b"tty-bridge: user ", packet.key);
+                    }
                     if packet.key == STARNIX_SIGNAL_WAKE_PACKET_KEY
                         && packet.user.u64[0] == STARNIX_WAIT_WAKE_KIND_SIGNAL
                     {
@@ -74,6 +121,15 @@ impl StarnixKernel {
                     }
                 }
                 ZX_PKT_TYPE_SIGNAL_ONE => {
+                    if self.tty_bridge_packets.contains_key(&packet.key) {
+                        log_tty_bridge_packet(b"tty-bridge: sig  ", packet.key);
+                    }
+                    if self.tty_bridge_packets.contains_key(&packet.key) {
+                        if let Err(status) = self.service_tty_bridge_packet(packet.key) {
+                            return map_status_to_return_code(status);
+                        }
+                        continue;
+                    }
                     let Some(task_id) = self.waiting_task_id_for_packet_key(packet.key) else {
                         if let Some((epoll_key, target_key)) =
                             self.epoll_packets.get(&packet.key).copied()

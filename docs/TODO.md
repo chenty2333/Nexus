@@ -279,8 +279,7 @@ Work:
       `getsockname/getpeername`, minimal `setsockopt/getsockopt`,
       and readiness projection into the shared `epoll` bridge
     - next cuts are:
-      - real packet transport integration over the current ring3 virtio path
-      - host-forwarded QEMU networking
+      - remote shell hardening over the current host-forwarded QEMU networking
       - sshd + pty shell
   - broader tty follow-on beyond the current narrow shell slice:
     `poll` / `epoll` readiness, packet mode, and wider tty ioctl coverage

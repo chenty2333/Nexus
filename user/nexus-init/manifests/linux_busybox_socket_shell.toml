@@ -1,0 +1,13 @@
+url = "boot://linux-busybox-socket-shell"
+
+[program]
+runner = "starnix"
+binary = "bin/sh"
+args = ["/bin/sh", "-i"]
+env = [
+  "NEXUS_STARNIX_STDIO=socket-tty",
+  "PATH=/bin:/usr/bin",
+  "HOME=/",
+  "SHELL=/bin/sh",
+  "TERM=vt100",
+]

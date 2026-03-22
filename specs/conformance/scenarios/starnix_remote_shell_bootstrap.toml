@@ -1,0 +1,18 @@
+id = "kernel.starnix.remote_shell_bootstrap"
+description = "starnix should accept one host-forwarded remote shell session and execute basic commands over the network shell path"
+tags = ["kernel", "starnix", "shell", "network", "remote"]
+timeout_ms = 360000
+
+command = [
+  "bash",
+  "-c",
+  "if [ ! -e /dev/kvm ]; then echo '/dev/kvm not available' >&2; exit 1; fi; target_dir=target/conformance/starnix-remote-shell && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && NEXUS_INIT_ROOT_URL=boot://root-starnix-net-shell RUSTFLAGS='-C code-model=large -C debuginfo=0' cargo build -p nexus-init --target x86_64-unknown-none --target-dir \"$target_dir\" && PYTHONDONTWRITEBYTECODE=1 python tools/axle-conformance/scripts/drive_starnix_remote_shell.py --kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\" --init \"$target_dir/x86_64-unknown-none/debug/nexus-init\" --timeout 60"
+]
+
+expect = [
+  "prompt-ok",
+  "remote-shell-ok",
+  "remote-tty-ok",
+  "remote-ps-ok",
+]
+forbid = ["KERNEL PANIC", "#GP:"]

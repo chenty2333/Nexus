@@ -761,7 +761,7 @@ This makes contract coverage part of the repo workflow, not just informal docume
     - physical VMO aliasing over an existing contiguous page
     - physical VMO pin into one `DmaRegion` object with explicit DMA permission bits plus
       pinned-range paddr lookup
-- Starnix inet coverage now has its first QEMU guest-facing loopback gate:
+  - Starnix inet coverage now has its first QEMU guest-facing loopback gate:
   - `kernel.starnix.runtime_net_bootstrap`
   - one guest payload now proves:
     - `socket(AF_INET, SOCK_STREAM)`
@@ -771,7 +771,14 @@ This makes contract coverage part of the repo workflow, not just informal docume
     - `getsockname` / `getpeername`
     - minimal `SO_REUSEADDR` / `TCP_NODELAY`
     - stream byte exchange plus EOF after half-close
-  - no QEMU host-forwarded networking gate exists yet
+  - Starnix remote shell coverage now has its first QEMU host-forwarded gate:
+    - `kernel.starnix.remote_shell_bootstrap`
+    - one host driver now proves:
+      - QEMU user-net `hostfwd` into the guest network path
+      - remote prompt / echo / command output round-tripping through the
+        socket-backed tty bridge
+      - remote `/dev/ptmx`, `/dev/pts/0`, and `ps` shell commands over the
+        network shell path
   - no sshd gate exists yet
   - those remain the next network-facing vertical-slice cuts after the current
     shell + loopback milestone

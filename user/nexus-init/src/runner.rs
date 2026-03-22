@@ -22,7 +22,7 @@ use crate::resolver::lookup_use_decl;
 use crate::{
     CHILD_MARKER_STARNIX_KERNEL, STARNIX_KERNEL_BINARY_PATH, STARTUP_HANDLE_COMPONENT_STATUS,
     STARTUP_HANDLE_STARNIX_IMAGE_VMO, STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
-    STARTUP_HANDLE_STARNIX_STDOUT,
+    STARTUP_HANDLE_STARNIX_STDIN, STARTUP_HANDLE_STARNIX_STDOUT,
 };
 
 #[allow(dead_code)]
@@ -30,6 +30,7 @@ pub(crate) struct RunningComponent {
     pub(crate) process: zx_handle_t,
     pub(crate) controller: zx_handle_t,
     pub(crate) status: zx_handle_t,
+    pub(crate) stdin: Option<zx_handle_t>,
     pub(crate) stdout: Option<zx_handle_t>,
 }
 
@@ -152,35 +153,78 @@ impl StarnixRunner {
         }
         let mut stdout_parent = ZX_HANDLE_INVALID;
         let mut stdout_child = ZX_HANDLE_INVALID;
-        let stdout_status = zx_socket_create(0, &mut stdout_parent, &mut stdout_child);
+        let use_channel_stdout = component
+            .decl
+            .program
+            .env
+            .iter()
+            .any(|entry| entry == "NEXUS_STARNIX_STDIO=channel-tty");
+        let stdout_status = if use_channel_stdout {
+            zx_channel_create(0, &mut stdout_parent, &mut stdout_child)
+        } else {
+            zx_socket_create(0, &mut stdout_parent, &mut stdout_child)
+        };
         if stdout_status != ZX_OK {
             let _ = zx_handle_close(parent_process_dup);
             let _ = zx_handle_close(linux_image_vmo);
             let _ = zx_handle_close(executive_vmo);
             return Err(stdout_status);
         }
+        let use_channel_stdin = component
+            .decl
+            .program
+            .env
+            .iter()
+            .any(|entry| entry == "NEXUS_STARNIX_STDIO=channel-tty");
+        let use_socket_stdin = component.decl.program.env.iter().any(|entry| {
+            entry == "NEXUS_STARNIX_STDIO=socket" || entry == "NEXUS_STARNIX_STDIO=socket-tty"
+        });
+        let mut stdin_parent = ZX_HANDLE_INVALID;
+        let mut stdin_child = ZX_HANDLE_INVALID;
+        if use_socket_stdin || use_channel_stdin {
+            let stdin_status = if use_channel_stdin {
+                zx_channel_create(0, &mut stdin_parent, &mut stdin_child)
+            } else {
+                zx_socket_create(0, &mut stdin_parent, &mut stdin_child)
+            };
+            if stdin_status != ZX_OK {
+                let _ = zx_handle_close(stdout_parent);
+                let _ = zx_handle_close(stdout_child);
+                let _ = zx_handle_close(parent_process_dup);
+                let _ = zx_handle_close(linux_image_vmo);
+                let _ = zx_handle_close(executive_vmo);
+                return Err(stdin_status);
+            }
+        }
+        let mut numbered_handles = vec![
+            NumberedHandle {
+                id: STARTUP_HANDLE_COMPONENT_STATUS,
+                handle: ZX_HANDLE_INVALID,
+            },
+            NumberedHandle {
+                id: STARTUP_HANDLE_STARNIX_IMAGE_VMO,
+                handle: linux_image_vmo,
+            },
+            NumberedHandle {
+                id: STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
+                handle: parent_process_dup,
+            },
+            NumberedHandle {
+                id: STARTUP_HANDLE_STARNIX_STDOUT,
+                handle: stdout_child,
+            },
+        ];
+        if use_socket_stdin || use_channel_stdin {
+            numbered_handles.push(NumberedHandle {
+                id: STARTUP_HANDLE_STARNIX_STDIN,
+                handle: stdin_child,
+            });
+        }
         let start_info = ComponentStartInfo {
             args: component.decl.program.args.clone(),
             env: component.decl.program.env.clone(),
             namespace_entries,
-            numbered_handles: vec![
-                NumberedHandle {
-                    id: STARTUP_HANDLE_COMPONENT_STATUS,
-                    handle: ZX_HANDLE_INVALID,
-                },
-                NumberedHandle {
-                    id: STARTUP_HANDLE_STARNIX_IMAGE_VMO,
-                    handle: linux_image_vmo,
-                },
-                NumberedHandle {
-                    id: STARTUP_HANDLE_STARNIX_PARENT_PROCESS,
-                    handle: parent_process_dup,
-                },
-                NumberedHandle {
-                    id: STARTUP_HANDLE_STARNIX_STDOUT,
-                    handle: stdout_child,
-                },
-            ],
+            numbered_handles,
             outgoing_dir_server_end: outgoing_dir,
             controller_channel: None,
         };
@@ -191,10 +235,14 @@ impl StarnixRunner {
             CHILD_MARKER_STARNIX_KERNEL,
         ) {
             Ok(mut running) => {
+                running.stdin = (use_socket_stdin || use_channel_stdin).then_some(stdin_parent);
                 running.stdout = Some(stdout_parent);
                 Ok(running)
             }
             Err(status) => {
+                if stdin_parent != ZX_HANDLE_INVALID {
+                    let _ = zx_handle_close(stdin_parent);
+                }
                 let _ = zx_handle_close(stdout_parent);
                 Err(status)
             }
@@ -324,6 +372,7 @@ fn launch_native_binary(
         process,
         controller: controller_parent,
         status: status_parent,
+        stdin: None,
         stdout: None,
     })
 }

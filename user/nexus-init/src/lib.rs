@@ -12,6 +12,7 @@ mod fs;
 mod lifecycle;
 mod namespace;
 mod net;
+mod remote_net;
 mod resolver;
 mod runner;
 mod services;
@@ -22,6 +23,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt::{self, Write as _};
 #[cfg(not(test))]
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -32,6 +34,7 @@ use axle_types::status::{ZX_ERR_BAD_STATE, ZX_ERR_INTERNAL, ZX_ERR_NOT_FOUND, ZX
 use axle_types::{zx_handle_t, zx_status_t};
 use libax::compat::{
     ZX_TIME_INFINITE, zx_channel_create, zx_handle_close, zx_object_wait_one, zx_socket_read,
+    zx_task_kill,
 };
 #[cfg(not(test))]
 use linked_list_allocator::LockedHeap;
@@ -225,6 +228,10 @@ const ROOT_DECL_STARNIX_SHELL_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_starnix_shell.nxcd"
 ));
+const ROOT_DECL_STARNIX_NET_SHELL_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/root_component_starnix_net_shell.nxcd"
+));
 const ROOT_DECL_NET_DATAPLANE_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/root_component_net_dataplane.nxcd"
@@ -388,6 +395,11 @@ pub(crate) const LINUX_BUSYBOX_SHELL_DECL_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux_busybox_shell.nxcd"));
 #[cfg(not(nexus_init_embed_starnix_shell))]
 pub(crate) const LINUX_BUSYBOX_SHELL_DECL_BYTES: &[u8] = &[];
+#[cfg(nexus_init_embed_starnix_net_shell)]
+pub(crate) const LINUX_BUSYBOX_SOCKET_SHELL_DECL_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux_busybox_socket_shell.nxcd"));
+#[cfg(not(nexus_init_embed_starnix_net_shell))]
+pub(crate) const LINUX_BUSYBOX_SOCKET_SHELL_DECL_BYTES: &[u8] = &[];
 #[cfg(nexus_init_embed_starnix_hello)]
 pub(crate) const LINUX_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-hello"));
@@ -563,29 +575,45 @@ pub(crate) const LINUX_GLIBC_HELLO_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/linux-glibc-hello"));
 #[cfg(not(nexus_init_embed_starnix_glibc_hello))]
 pub(crate) const LINUX_GLIBC_HELLO_BYTES: &[u8] = &[];
-#[cfg(any(nexus_init_embed_starnix_glibc_hello, nexus_init_embed_starnix_shell))]
+#[cfg(any(
+    nexus_init_embed_starnix_glibc_hello,
+    nexus_init_embed_starnix_shell,
+    nexus_init_embed_starnix_net_shell
+))]
 pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ld-nexus-glibc.so"));
-#[cfg(not(any(nexus_init_embed_starnix_glibc_hello, nexus_init_embed_starnix_shell)))]
+#[cfg(not(any(
+    nexus_init_embed_starnix_glibc_hello,
+    nexus_init_embed_starnix_shell,
+    nexus_init_embed_starnix_net_shell
+)))]
 pub(crate) const LINUX_GLIBC_RUNTIME_INTERP_BYTES: &[u8] = &[];
-#[cfg(any(nexus_init_embed_starnix_glibc_hello, nexus_init_embed_starnix_shell))]
+#[cfg(any(
+    nexus_init_embed_starnix_glibc_hello,
+    nexus_init_embed_starnix_shell,
+    nexus_init_embed_starnix_net_shell
+))]
 pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/libc.so.6"));
-#[cfg(not(any(nexus_init_embed_starnix_glibc_hello, nexus_init_embed_starnix_shell)))]
+#[cfg(not(any(
+    nexus_init_embed_starnix_glibc_hello,
+    nexus_init_embed_starnix_shell,
+    nexus_init_embed_starnix_net_shell
+)))]
 pub(crate) const LINUX_GLIBC_RUNTIME_LIBC_BYTES: &[u8] = &[];
-#[cfg(nexus_init_embed_starnix_shell)]
+#[cfg(any(nexus_init_embed_starnix_shell, nexus_init_embed_starnix_net_shell))]
 pub(crate) const LINUX_BUSYBOX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox"));
-#[cfg(not(nexus_init_embed_starnix_shell))]
+#[cfg(not(any(nexus_init_embed_starnix_shell, nexus_init_embed_starnix_net_shell)))]
 pub(crate) const LINUX_BUSYBOX_BYTES: &[u8] = &[];
-#[cfg(nexus_init_embed_starnix_shell)]
+#[cfg(any(nexus_init_embed_starnix_shell, nexus_init_embed_starnix_net_shell))]
 pub(crate) const LINUX_GLIBC_RUNTIME_LIBM_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/libm.so.6"));
-#[cfg(not(nexus_init_embed_starnix_shell))]
+#[cfg(not(any(nexus_init_embed_starnix_shell, nexus_init_embed_starnix_net_shell)))]
 pub(crate) const LINUX_GLIBC_RUNTIME_LIBM_BYTES: &[u8] = &[];
-#[cfg(nexus_init_embed_starnix_shell)]
+#[cfg(any(nexus_init_embed_starnix_shell, nexus_init_embed_starnix_net_shell))]
 pub(crate) const LINUX_GLIBC_RUNTIME_RESOLV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/libresolv.so.2"));
-#[cfg(not(nexus_init_embed_starnix_shell))]
+#[cfg(not(any(nexus_init_embed_starnix_shell, nexus_init_embed_starnix_net_shell)))]
 pub(crate) const LINUX_GLIBC_RUNTIME_RESOLV_BYTES: &[u8] = &[];
 
 pub(crate) const CHILD_ROLE_PROVIDER: &str = "echo-provider";
@@ -663,6 +691,7 @@ pub(crate) const STARTUP_HANDLE_COMPONENT_STATUS: u32 = 1;
 pub(crate) const STARTUP_HANDLE_STARNIX_IMAGE_VMO: u32 = 2;
 pub(crate) const STARTUP_HANDLE_STARNIX_PARENT_PROCESS: u32 = 3;
 pub(crate) const STARTUP_HANDLE_STARNIX_STDOUT: u32 = 4;
+pub(crate) const STARTUP_HANDLE_STARNIX_STDIN: u32 = 5;
 pub(crate) const MAX_SMALL_CHANNEL_BYTES: usize = 128;
 pub(crate) const MAX_SMALL_CHANNEL_HANDLES: usize = 1;
 const STARNIX_HELLO_EXPECTED_STDOUT: &[u8] = b"hello from linux-hello\n";
@@ -760,6 +789,12 @@ pub(crate) fn push_busybox_shell_decl_assets(assets: &mut Vec<BootAssetEntry>) {
             LINUX_BUSYBOX_SHELL_DECL_BYTES,
         ));
     }
+    if !LINUX_BUSYBOX_SOCKET_SHELL_DECL_BYTES.is_empty() {
+        assets.push(BootAssetEntry::bytes(
+            "manifests/linux-busybox-socket-shell.nxcd",
+            LINUX_BUSYBOX_SOCKET_SHELL_DECL_BYTES,
+        ));
+    }
 }
 
 #[cfg(not(test))]
@@ -849,8 +884,55 @@ pub fn program_start(bootstrap_channel: zx_handle_t, arg1: u64) -> ! {
 
 pub fn program_end() {}
 
+struct PanicPrefix<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> PanicPrefix<N> {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl<const N: usize> fmt::Write for PanicPrefix<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let available = N.saturating_sub(self.len);
+        if available == 0 {
+            return Ok(());
+        }
+        let bytes = s.as_bytes();
+        let copy_len = bytes.len().min(available);
+        self.bytes[self.len..self.len + copy_len].copy_from_slice(&bytes[..copy_len]);
+        self.len += copy_len;
+        Ok(())
+    }
+}
+
+pub fn report_panic_with_info(info: &core::panic::PanicInfo<'_>) -> ! {
+    if ROLE.load(Ordering::Relaxed) == ROLE_ROOT {
+        let mut prefix = PanicPrefix::<128>::new();
+        let _ = write!(&mut prefix, "panic: {}", info);
+        write_component_output_prefix(prefix.as_bytes());
+        write_slot(SLOT_COMPONENT_FAILURE_STEP, STEP_ROOT_PANIC);
+        write_slot(SLOT_OK, 0);
+        axle_arch_x86_64::debug_break()
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 pub fn report_panic() -> ! {
     if ROLE.load(Ordering::Relaxed) == ROLE_ROOT {
+        write_component_output_prefix(b"panic");
         write_slot(SLOT_COMPONENT_FAILURE_STEP, STEP_ROOT_PANIC);
         write_slot(SLOT_OK, 0);
         axle_arch_x86_64::debug_break()
@@ -1271,6 +1353,10 @@ fn build_bootstrap_namespace() -> Result<BootstrapNamespace, zx_status_t> {
     assets.push(BootAssetEntry::bytes(
         "manifests/root-starnix-shell.nxcd",
         ROOT_DECL_STARNIX_SHELL_BYTES,
+    ));
+    assets.push(BootAssetEntry::bytes(
+        "manifests/root-starnix-net-shell.nxcd",
+        ROOT_DECL_STARNIX_NET_SHELL_BYTES,
     ));
     assets.push(BootAssetEntry::bytes(
         "manifests/root-net-dataplane.nxcd",
@@ -1824,6 +1910,15 @@ fn run_component_manager(summary: &mut ComponentSummary) -> i32 {
             summary,
         );
     }
+    if root.decl.url == "boot://root-starnix-net-shell" {
+        return run_starnix_remote_shell_root_child(
+            &root,
+            &resolvers,
+            &runners,
+            "linux_busybox_socket_shell",
+            summary,
+        );
+    }
     if root.decl.url == "boot://root-net-dataplane" {
         return net::run_root_dataplane();
     }
@@ -2351,6 +2446,121 @@ fn run_starnix_root_child(
     let _ = zx_handle_close(running.status);
     let _ = zx_handle_close(running.controller);
     0
+}
+
+fn run_starnix_remote_shell_root_child(
+    root: &ResolvedComponent,
+    resolvers: &ResolverRegistry,
+    runners: &RunnerRegistry,
+    child_name: &str,
+    summary: &mut ComponentSummary,
+) -> i32 {
+    let (child, _startup) = match resolve_root_child(root, resolvers, child_name) {
+        Ok(component) => {
+            summary.resolve_provider = ZX_OK as i64;
+            write_summary(summary);
+            component
+        }
+        Err(status) => {
+            summary.failure_step = STEP_RESOLVE_PROVIDER;
+            summary.resolve_provider = status as i64;
+            return 1;
+        }
+    };
+    let stdout_mode = if child
+        .decl
+        .program
+        .env
+        .iter()
+        .any(|entry| entry == "NEXUS_STARNIX_STDIO=channel-tty")
+    {
+        remote_net::ShellStdoutMode::Channel
+    } else {
+        remote_net::ShellStdoutMode::Socket
+    };
+    let running = match runners.launch(
+        &root.decl,
+        &child,
+        Vec::new(),
+        None,
+        CHILD_MARKER_STARNIX_KERNEL,
+    ) {
+        Ok(running) => {
+            summary.provider_launch = ZX_OK as i64;
+            write_summary(summary);
+            running
+        }
+        Err(status) => {
+            summary.failure_step = STEP_PROVIDER_LAUNCH;
+            summary.provider_launch = status as i64;
+            return 1;
+        }
+    };
+    let stdout = match running.stdout {
+        Some(stdout) => stdout,
+        None => {
+            summary.failure_step = STEP_STARNIX_STDOUT;
+            if let Some(stdin) = running.stdin {
+                let _ = zx_handle_close(stdin);
+            }
+            let _ = zx_handle_close(running.status);
+            let _ = zx_handle_close(running.controller);
+            return 1;
+        }
+    };
+    let stdin = match running.stdin {
+        Some(stdin) => stdin,
+        None => {
+            summary.failure_step = STEP_STARNIX_STDOUT;
+            let _ = zx_handle_close(stdout);
+            let _ = zx_handle_close(running.status);
+            let _ = zx_handle_close(running.controller);
+            return 1;
+        }
+    };
+    let remote_result =
+        match remote_net::run_remote_shell(stdin, stdout, running.controller, stdout_mode) {
+            Ok(result) => result,
+            Err(status) => {
+                summary.failure_step = STEP_STARNIX_STDOUT;
+                summary.client_route = status as i64;
+                let _ = zx_handle_close(stdin);
+                let _ = zx_handle_close(stdout);
+                let _ = zx_task_kill(running.process);
+                let _ = zx_handle_close(running.status);
+                let _ = zx_handle_close(running.controller);
+                let _ = zx_handle_close(running.process);
+                return 1;
+            }
+        };
+    let _ = zx_handle_close(stdin);
+    let _ = zx_handle_close(stdout);
+    let return_code = match remote_result {
+        Some(return_code) => {
+            summary.provider_event_read = ZX_OK as i64;
+            summary.provider_event_code = return_code;
+            return_code
+        }
+        None => match read_controller_event_blocking(running.controller, ZX_TIME_INFINITE) {
+            Ok(return_code) => {
+                summary.provider_event_read = ZX_OK as i64;
+                summary.provider_event_code = return_code;
+                return_code
+            }
+            Err(status) => {
+                summary.failure_step = STEP_PROVIDER_EVENT;
+                summary.provider_event_read = status as i64;
+                let _ = zx_handle_close(running.status);
+                let _ = zx_handle_close(running.controller);
+                let _ = zx_handle_close(running.process);
+                return 1;
+            }
+        },
+    };
+    let _ = zx_handle_close(running.status);
+    let _ = zx_handle_close(running.controller);
+    let _ = zx_handle_close(running.process);
+    i32::from(return_code != 0)
 }
 
 fn read_socket_to_end(handle: zx_handle_t) -> Result<Vec<u8>, zx_status_t> {

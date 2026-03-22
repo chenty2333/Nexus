@@ -1,4 +1,11 @@
 use super::super::*;
+fn log_raw_syscall(_nr: u64) {}
+
+fn log_syscall_trace(_task_id: i32, _nr: u64) {}
+
+fn log_tty_bridge_register(_key: u64) {}
+
+pub(in crate::starnix) fn log_wait_state(_prefix: &[u8], _task_id: i32, _wait: WaitState) {}
 
 pub(in crate::starnix) enum SyscallAction {
     Resume,
@@ -28,6 +35,7 @@ pub(in crate::starnix) struct StarnixKernel {
         BTreeMap<LinuxFileDescriptionKey, LinuxFileDescriptionKey>,
     pub(in crate::starnix) unix_socket_rights:
         BTreeMap<LinuxFileDescriptionKey, VecDeque<PendingScmRights>>,
+    pub(in crate::starnix) tty_bridge_packets: BTreeMap<u64, (Arc<RemoteTtyBridge>, bool)>,
     pub(in crate::starnix) loopback_net: LoopbackNetStack,
 }
 
@@ -37,7 +45,7 @@ impl StarnixKernel {
         port: zx_handle_t,
         root_task: LinuxTask,
         root_group: LinuxThreadGroup,
-    ) -> Self {
+    ) -> Result<Self, zx_status_t> {
         let root_tgid = root_group.tgid;
         let root_sid = root_group.sid;
         let root_pgid = root_group.pgid;
@@ -47,7 +55,7 @@ impl StarnixKernel {
         groups.insert(root_group.tgid, root_group);
         let mut foreground_pgid_by_sid = BTreeMap::new();
         foreground_pgid_by_sid.insert(root_sid, root_pgid);
-        Self {
+        let mut kernel = Self {
             parent_process,
             port,
             next_tid: root_tgid + 1,
@@ -64,8 +72,11 @@ impl StarnixKernel {
             pidfds: BTreeMap::new(),
             unix_socket_peers: BTreeMap::new(),
             unix_socket_rights: BTreeMap::new(),
+            tty_bridge_packets: BTreeMap::new(),
             loopback_net: LoopbackNetStack::default(),
-        }
+        };
+        kernel.register_group_tty_bridge(root_tgid)?;
+        Ok(kernel)
     }
 
     pub(in crate::starnix) fn alloc_tid(&mut self) -> Result<i32, zx_status_t> {
@@ -81,6 +92,37 @@ impl StarnixKernel {
             .checked_add(1)
             .ok_or(ZX_ERR_OUT_OF_RANGE)?;
         Ok(key)
+    }
+
+    pub(in crate::starnix) fn register_group_tty_bridge(
+        &mut self,
+        tgid: i32,
+    ) -> Result<(), zx_status_t> {
+        let Some(bridge) = self
+            .groups
+            .get(&tgid)
+            .and_then(|group| group.resources.as_ref())
+            .and_then(|resources| resources.fs.tty_bridge())
+        else {
+            return Ok(());
+        };
+        if self
+            .tty_bridge_packets
+            .values()
+            .any(|(registered, _)| Arc::ptr_eq(registered, &bridge))
+        {
+            return Ok(());
+        }
+        let socket_key = self.alloc_packet_key()?;
+        log_tty_bridge_register(socket_key);
+        bridge.arm_input(self.port, socket_key)?;
+        self.tty_bridge_packets
+            .insert(socket_key, (bridge.clone(), true));
+        let master_key = self.alloc_packet_key()?;
+        log_tty_bridge_register(master_key);
+        bridge.arm_output(self.port, master_key)?;
+        self.tty_bridge_packets.insert(master_key, (bridge, false));
+        Ok(())
     }
 
     pub(in crate::starnix) fn private_futex_key(
@@ -223,6 +265,11 @@ impl StarnixKernel {
         stop_state: &mut ax_guest_stop_state_t,
         stdout: &mut Vec<u8>,
     ) -> Result<SyscallAction, zx_status_t> {
+        log_syscall_trace(task_id, stop_state.regs.rax);
+        if matches!(stop_state.regs.rax, 7 | 23 | 270 | 271) {
+            let _ = task_id;
+            log_raw_syscall(stop_state.regs.rax);
+        }
         match stop_state.regs.rax {
             LINUX_SYSCALL_SOCKET => self.sys_socket(task_id, stop_state),
             LINUX_SYSCALL_CONNECT => self.sys_connect(task_id, stop_state),
@@ -396,6 +443,7 @@ impl StarnixKernel {
         wait_interest: WaitSpec,
         stop_state: &mut ax_guest_stop_state_t,
     ) -> Result<SyscallAction, zx_status_t> {
+        log_wait_state(b"starnix-wait: arm ", task_id, wait);
         self.begin_async_wait(task_id, wait, wait_interest, stop_state)
     }
 }
