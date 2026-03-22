@@ -7,25 +7,33 @@ use super::{
 };
 
 pub(super) fn run_executive(start_info: StarnixStartInfo) -> i32 {
+    debug_stage(b"starnix-bootstrap: start\n");
     let StarnixStartInfo {
         args,
         env,
         parent_process,
         linux_image_vmo,
+        stdin_handle,
         stdout_handle,
         status_handle: _,
         controller_handle: _,
     } = start_info;
-    let mut cleanup =
-        ExecutiveBootstrapCleanup::new(parent_process, linux_image_vmo, stdout_handle);
+    let mut cleanup = ExecutiveBootstrapCleanup::new(
+        parent_process,
+        linux_image_vmo,
+        stdin_handle,
+        stdout_handle,
+    );
     let namespace = match build_starnix_namespace() {
         Ok(namespace) => namespace,
         Err(status) => return map_status_to_return_code(status),
     };
+    debug_stage(b"starnix-bootstrap: namespace\n");
     let (payload_path, payload_bytes) = match resolve_exec_payload_source(&namespace, &args) {
         Ok(payload) => payload,
         Err(status) => return map_status_to_return_code(status),
     };
+    debug_stage(b"starnix-bootstrap: payload\n");
     let mut port = ZX_HANDLE_INVALID;
     if zx_port_create(0, &mut port) != ZX_OK {
         return 1;
@@ -49,6 +57,7 @@ pub(super) fn run_executive(start_info: StarnixStartInfo) -> i32 {
         Ok(image) => image,
         Err(status) => return map_status_to_return_code(status),
     };
+    debug_stage(b"starnix-bootstrap: task-image\n");
     let prepared = match prepare_process_carrier(
         parent_process,
         port,
@@ -59,13 +68,16 @@ pub(super) fn run_executive(start_info: StarnixStartInfo) -> i32 {
         Ok(prepared) => prepared,
         Err(status) => return map_status_to_return_code(status),
     };
+    debug_stage(b"starnix-bootstrap: prepared\n");
     let _ = zx_handle_close(linux_image_vmo);
     cleanup.linux_image_vmo = ZX_HANDLE_INVALID;
+    let stdin_handle = cleanup.stdin_handle.take();
     let stdout_handle = cleanup.stdout_handle.take();
     let mut resources = match ProcessResources::new(
         prepared.process_handle,
         prepared.root_vmar,
         stdio_mode,
+        stdin_handle,
         stdout_handle,
         namespace,
     ) {
@@ -75,6 +87,7 @@ pub(super) fn run_executive(start_info: StarnixStartInfo) -> i32 {
             return map_status_to_return_code(status);
         }
     };
+    debug_stage(b"starnix-bootstrap: resources\n");
     if let Err(status) = resources.install_exec_writable_ranges(&task_image.writable_ranges) {
         prepared.close();
         return map_status_to_return_code(status);
@@ -131,6 +144,12 @@ pub(super) fn run_executive(start_info: StarnixStartInfo) -> i32 {
         image: Some(task_image),
         resources: Some(resources),
     };
-    let mut kernel = StarnixKernel::new(parent_process, port, root_task, root_group);
+    let mut kernel = match StarnixKernel::new(parent_process, port, root_task, root_group) {
+        Ok(kernel) => kernel,
+        Err(status) => return map_status_to_return_code(status),
+    };
+    debug_stage(b"starnix-bootstrap: run\n");
     kernel.run()
 }
+
+fn debug_stage(_bytes: &[u8]) {}

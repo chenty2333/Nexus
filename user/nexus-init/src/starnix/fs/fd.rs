@@ -1,6 +1,6 @@
 use super::super::*;
 use super::devfs::{NullFd, ZeroFd};
-use super::tty::{DevDirFd, PtyRegistry, PtySlaveFd};
+use super::tty::{DevDirFd, PtyRegistry, PtySlaveFd, RemoteTtyBridge, tty_endpoint_identity};
 
 #[derive(Clone, Copy)]
 pub(in crate::starnix) struct LinuxStatMetadata {
@@ -13,6 +13,8 @@ pub(in crate::starnix) struct LinuxStatMetadata {
 pub(in crate::starnix) enum StdioMode {
     Socket,
     Console,
+    SocketTty,
+    ChannelTty,
 }
 
 impl StdioMode {
@@ -21,6 +23,8 @@ impl StdioMode {
             .find_map(|entry| entry.strip_prefix("NEXUS_STARNIX_STDIO="))
             .map_or(Self::Socket, |value| match value {
                 "console" => Self::Console,
+                "socket-tty" => Self::SocketTty,
+                "channel-tty" => Self::ChannelTty,
                 _ => Self::Socket,
             })
     }
@@ -33,6 +37,7 @@ pub(in crate::starnix) struct FsContext {
     pub(in crate::starnix) directory_offsets: BTreeMap<u64, usize>,
     pub(in crate::starnix) pty_registry: Arc<PtyRegistry>,
     pub(in crate::starnix) controlling_tty: Arc<Mutex<Option<Arc<PtySlaveFd>>>>,
+    pub(in crate::starnix) tty_bridge: Option<Arc<RemoteTtyBridge>>,
 }
 
 pub(in crate::starnix) struct ProcessResources {
@@ -71,21 +76,29 @@ impl FsContext {
 
     fn new(
         stdio_mode: StdioMode,
+        stdin_handle: Option<zx_handle_t>,
         stdout_handle: Option<zx_handle_t>,
         base_namespace: nexus_io::ProcessNamespace,
     ) -> Result<Self, zx_status_t> {
         let mut fd_table = FdTable::new();
         let pty_registry = Arc::new(PtyRegistry::new());
         let controlling_tty = Arc::new(Mutex::new(None));
+        let mut tty_bridge = None;
         let namespace = match stdio_mode {
             StdioMode::Socket => {
-                let stdin_fd = fd_table.open(
-                    Arc::new(PseudoNodeFd::new(None)),
-                    OpenFlags::READABLE,
-                    FdFlags::empty(),
-                )?;
-                if stdin_fd != 0 {
-                    return Err(ZX_ERR_BAD_STATE);
+                if let Some(handle) = stdin_handle {
+                    let install_result = install_stdio_fd(&mut fd_table, handle, 0);
+                    let _ = zx_handle_close(handle);
+                    install_result?;
+                } else {
+                    let stdin_fd = fd_table.open(
+                        Arc::new(PseudoNodeFd::new(None)),
+                        OpenFlags::READABLE,
+                        FdFlags::empty(),
+                    )?;
+                    if stdin_fd != 0 {
+                        return Err(ZX_ERR_BAD_STATE);
+                    }
                 }
                 if let Some(handle) = stdout_handle {
                     let install_result = (|| {
@@ -102,6 +115,62 @@ impl FsContext {
                     pty_registry.clone(),
                     controlling_tty.clone(),
                 )?
+            }
+            StdioMode::SocketTty => {
+                let stdin_handle = stdin_handle.ok_or(ZX_ERR_NOT_FOUND)?;
+                let stdout_handle = stdout_handle.ok_or(ZX_ERR_NOT_FOUND)?;
+                let (bridge, tty) =
+                    pty_registry.allocate_socket_bridge(stdin_handle, stdout_handle);
+                tty_bridge = Some(bridge);
+                *controlling_tty.lock() = Some(tty.clone());
+                let namespace = Self::build_namespace(
+                    &base_namespace,
+                    &base_namespace,
+                    pty_registry.clone(),
+                    controlling_tty.clone(),
+                )?;
+                install_console_stdio_fd(&mut fd_table, tty.clone(), OpenFlags::READABLE, 0)?;
+                install_console_stdio_fd(
+                    &mut fd_table,
+                    tty.clone(),
+                    OpenFlags::READABLE | OpenFlags::WRITABLE,
+                    1,
+                )?;
+                install_console_stdio_fd(
+                    &mut fd_table,
+                    tty,
+                    OpenFlags::READABLE | OpenFlags::WRITABLE,
+                    2,
+                )?;
+                namespace
+            }
+            StdioMode::ChannelTty => {
+                let stdin_handle = stdin_handle.ok_or(ZX_ERR_NOT_FOUND)?;
+                let stdout_handle = stdout_handle.ok_or(ZX_ERR_NOT_FOUND)?;
+                let (bridge, tty) =
+                    pty_registry.allocate_channel_bridge(stdin_handle, stdout_handle);
+                tty_bridge = Some(bridge);
+                *controlling_tty.lock() = Some(tty.clone());
+                let namespace = Self::build_namespace(
+                    &base_namespace,
+                    &base_namespace,
+                    pty_registry.clone(),
+                    controlling_tty.clone(),
+                )?;
+                install_console_stdio_fd(&mut fd_table, tty.clone(), OpenFlags::READABLE, 0)?;
+                install_console_stdio_fd(
+                    &mut fd_table,
+                    tty.clone(),
+                    OpenFlags::READABLE | OpenFlags::WRITABLE,
+                    1,
+                )?;
+                install_console_stdio_fd(
+                    &mut fd_table,
+                    tty,
+                    OpenFlags::READABLE | OpenFlags::WRITABLE,
+                    2,
+                )?;
+                namespace
             }
             StdioMode::Console => {
                 let tty = pty_registry.allocate_console_slave();
@@ -128,6 +197,9 @@ impl FsContext {
                 if let Some(handle) = stdout_handle {
                     let _ = zx_handle_close(handle);
                 }
+                if let Some(handle) = stdin_handle {
+                    let _ = zx_handle_close(handle);
+                }
                 namespace
             }
         };
@@ -138,6 +210,7 @@ impl FsContext {
             directory_offsets: BTreeMap::new(),
             pty_registry,
             controlling_tty,
+            tty_bridge,
         })
     }
 
@@ -157,6 +230,7 @@ impl FsContext {
             directory_offsets: self.directory_offsets.clone(),
             pty_registry: self.pty_registry.clone(),
             controlling_tty,
+            tty_bridge: self.tty_bridge.clone(),
         }
     }
 
@@ -189,6 +263,7 @@ impl FsContext {
             directory_offsets: BTreeMap::new(),
             pty_registry: self.pty_registry.clone(),
             controlling_tty,
+            tty_bridge: self.tty_bridge.clone(),
         }
     }
 
@@ -199,6 +274,19 @@ impl FsContext {
     pub(in crate::starnix) fn set_controlling_tty(&self, tty: Option<Arc<PtySlaveFd>>) {
         *self.controlling_tty.lock() = tty;
     }
+
+    pub(in crate::starnix) fn tty_bridge(&self) -> Option<Arc<RemoteTtyBridge>> {
+        self.tty_bridge.clone()
+    }
+
+    pub(in crate::starnix) fn should_capture_stdio_output(&self, fd: i32) -> bool {
+        if fd != 1 && fd != 2 {
+            return false;
+        }
+        self.fd_table.get(fd).is_some_and(|entry| {
+            tty_endpoint_identity(entry.description().ops().as_ref()).is_none()
+        })
+    }
 }
 
 impl ProcessResources {
@@ -206,12 +294,13 @@ impl ProcessResources {
         process_handle: zx_handle_t,
         root_vmar: zx_handle_t,
         stdio_mode: StdioMode,
+        stdin_handle: Option<zx_handle_t>,
         stdout_handle: Option<zx_handle_t>,
         namespace: nexus_io::ProcessNamespace,
     ) -> Result<Self, zx_status_t> {
         Ok(Self {
             process_handle,
-            fs: FsContext::new(stdio_mode, stdout_handle, namespace)?,
+            fs: FsContext::new(stdio_mode, stdin_handle, stdout_handle, namespace)?,
             mm: LinuxMm::new(root_vmar)?,
         })
     }
@@ -238,6 +327,10 @@ impl ProcessResources {
             fs: self.fs.exec_replace(),
             mm: LinuxMm::new(root_vmar)?,
         })
+    }
+
+    pub(in crate::starnix) fn should_capture_stdio_output(&self, fd: i32) -> bool {
+        self.fs.should_capture_stdio_output(fd)
     }
 
     pub(in crate::starnix) fn getcwd(

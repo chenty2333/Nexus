@@ -46,6 +46,7 @@ impl StarnixKernel {
         let Some(signal) = self.tty_job_control_signal(task_id, fd, op)? else {
             return Ok(None);
         };
+        log_tty_job_control(task_id, fd, signal);
         match self.signal_delivery_action(task_id, signal)? {
             SignalDeliveryAction::Ignore => Ok(None),
             SignalDeliveryAction::Terminate => Ok(Some(SyscallAction::GroupSignalExit(signal))),
@@ -336,3 +337,5 @@ impl StarnixKernel {
         Ok(0)
     }
 }
+
+fn log_tty_job_control(_task_id: i32, _fd: i32, _signal: i32) {}

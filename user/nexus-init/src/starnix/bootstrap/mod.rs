@@ -14,6 +14,7 @@ pub(super) struct StarnixStartInfo {
     env: Vec<String>,
     parent_process: zx_handle_t,
     linux_image_vmo: zx_handle_t,
+    stdin_handle: Option<zx_handle_t>,
     stdout_handle: Option<zx_handle_t>,
     status_handle: Option<zx_handle_t>,
     controller_handle: Option<zx_handle_t>,
@@ -23,6 +24,7 @@ pub(super) struct ExecutiveBootstrapCleanup {
     parent_process: zx_handle_t,
     linux_image_vmo: zx_handle_t,
     port: zx_handle_t,
+    stdin_handle: Option<zx_handle_t>,
     stdout_handle: Option<zx_handle_t>,
 }
 
@@ -30,12 +32,14 @@ impl ExecutiveBootstrapCleanup {
     pub(super) const fn new(
         parent_process: zx_handle_t,
         linux_image_vmo: zx_handle_t,
+        stdin_handle: Option<zx_handle_t>,
         stdout_handle: Option<zx_handle_t>,
     ) -> Self {
         Self {
             parent_process,
             linux_image_vmo,
             port: ZX_HANDLE_INVALID,
+            stdin_handle,
             stdout_handle,
         }
     }
@@ -43,6 +47,9 @@ impl ExecutiveBootstrapCleanup {
 
 impl Drop for ExecutiveBootstrapCleanup {
     fn drop(&mut self) {
+        if let Some(handle) = self.stdin_handle.take() {
+            let _ = zx_handle_close(handle);
+        }
         if let Some(handle) = self.stdout_handle.take() {
             let _ = zx_handle_close(handle);
         }
@@ -84,11 +91,18 @@ pub(in crate::starnix) fn program_start(bootstrap_channel: zx_handle_t) -> ! {
 }
 
 fn read_start_info(bootstrap_channel: zx_handle_t) -> Result<StarnixStartInfo, zx_status_t> {
+    debug_bootstrap(b"starnix-bootstrap: read-start\n");
     let (bytes, handles) = read_channel_alloc_blocking(bootstrap_channel)?;
-    let start_info = ComponentStartInfo::decode_channel_message(&bytes, &handles)
-        .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
+    debug_bootstrap(b"starnix-bootstrap: read-bytes\n");
+    let start_info =
+        ComponentStartInfo::decode_channel_message(&bytes, &handles).map_err(|_| {
+            debug_bootstrap(b"starnix-bootstrap: decode-fail\n");
+            ZX_ERR_IO_DATA_INTEGRITY
+        })?;
+    debug_bootstrap(b"starnix-bootstrap: decode-ok\n");
     let mut linux_image_vmo = ZX_HANDLE_INVALID;
     let mut parent_process = ZX_HANDLE_INVALID;
+    let mut stdin_handle = None;
     let mut stdout_handle = None;
     let mut status_handle = None;
     for NumberedHandle { id, handle } in start_info.numbered_handles {
@@ -98,20 +112,27 @@ fn read_start_info(bootstrap_channel: zx_handle_t) -> Result<StarnixStartInfo, z
             linux_image_vmo = handle;
         } else if id == STARTUP_HANDLE_STARNIX_PARENT_PROCESS {
             parent_process = handle;
+        } else if id == STARTUP_HANDLE_STARNIX_STDIN {
+            stdin_handle = Some(handle);
         } else if id == STARTUP_HANDLE_STARNIX_STDOUT {
             stdout_handle = Some(handle);
         }
     }
     if linux_image_vmo == ZX_HANDLE_INVALID || parent_process == ZX_HANDLE_INVALID {
+        debug_bootstrap(b"starnix-bootstrap: missing-required\n");
         return Err(ZX_ERR_NOT_FOUND);
     }
+    debug_bootstrap(b"starnix-bootstrap: start-info-ok\n");
     Ok(StarnixStartInfo {
         args: start_info.args,
         env: start_info.env,
         parent_process,
         linux_image_vmo,
+        stdin_handle,
         stdout_handle,
         status_handle,
         controller_handle: start_info.controller_channel,
     })
 }
+
+fn debug_bootstrap(_bytes: &[u8]) {}
