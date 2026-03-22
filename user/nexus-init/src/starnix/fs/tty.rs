@@ -457,10 +457,7 @@ impl TtyCore {
 
     fn master_write(&self, buffer: &[u8]) -> Result<usize, zx_status_t> {
         let mut state = self.state.lock();
-        let echo = state.ingest_master_bytes(buffer);
-        if !echo.is_empty() {
-            state.master_ready.extend(echo.iter().copied());
-        }
+        let _ = state.ingest_master_bytes(buffer);
         self.refresh_signals_locked(&state)?;
         Ok(buffer.len())
     }
