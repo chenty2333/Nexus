@@ -14,6 +14,8 @@ pub const AXLE_SYS_PORT_CREATE: SyscallNumber = 3;
 pub const AXLE_SYS_PORT_QUEUE: SyscallNumber = 4;
 /// Contract: MUST
 pub const AXLE_SYS_PORT_WAIT: SyscallNumber = 5;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_PORT_GET_INFO: SyscallNumber = 78;
 /// Contract: MUST
 pub const AXLE_SYS_TIMER_CREATE: SyscallNumber = 6;
 /// Contract: MUST

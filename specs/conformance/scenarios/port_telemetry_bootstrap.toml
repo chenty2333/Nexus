@@ -1,0 +1,61 @@
+id = "kernel.port.telemetry_bootstrap"
+description = "Bootstrap ports should expose reserve, pending-merge, flush, and queue-depth telemetry through ax_port_get_info"
+tags = ["kernel", "port", "telemetry", "bootstrap", "qemu"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/port-smoke && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && AXLE_TEST_RUNNER_RUST_ENTRY=port_smoke RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none --target-dir \"$target_dir\" && runner_src=\"$target_dir/x86_64-unknown-none/debug/nexus-test-runner\" && runner=$(mktemp /tmp/nexus-test-runner-XXXXXX) && cp \"$runner_src\" \"$runner\" && size=$(stat -c%s \"$runner\") && { timeout --foreground 20s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x7000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x6fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; qemu_code=$?; echo qemu_exit=$qemu_code; [ \"$qemu_code\" -eq 33 ]; }"
+]
+
+expect = [
+  "kernel: port telemetry smoke",
+]
+forbid = ["KERNEL PANIC"]
+contracts = []
+
+[assertions.status_code]
+create = 0
+user_fill_status = 0
+user_full_wait = -22
+filler_create = 0
+filler_arm = 0
+filler_signal = 0
+target_create = 0
+target_arm = 0
+target_signal_first = 0
+target_signal_second = 0
+pop_flush = 0
+
+[assertions.packet_fields]
+port_present = 1
+port_failure_step = 0
+last_packet_ok = 1
+last_packet_count = 2
+port_capacity = 64
+port_kernel_reserve = 16
+peak_depth_before = 64
+current_depth_before = 64
+pending_current_before = 1
+pending_peak_before = 1
+pending_new_before = 1
+pending_merge_before = 1
+pending_flush_before = 0
+user_queue_count_before = 48
+user_should_wait_before = 1
+user_reserve_hits_before = 1
+kernel_queue_count_after = 17
+kernel_should_wait_after = 2
+pending_current_after = 0
+pending_peak_after = 1
+pending_new_after = 1
+pending_merge_after = 1
+pending_flush_after = 1
+pop_count_after = 1
+final_current_depth = 0
+
+[assertions.packet_fields_min]
+depth_p50_after = 32
+depth_p90_after = 48
+depth_p99_after = 63

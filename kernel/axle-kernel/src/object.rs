@@ -1709,6 +1709,14 @@ impl KernelState {
         f(&mut transport)
     }
 
+    pub(crate) fn with_reactor<T>(
+        &self,
+        f: impl FnOnce(&crate::task::Reactor) -> Result<T, zx_status_t>,
+    ) -> Result<T, zx_status_t> {
+        let reactor = self.reactor.lock();
+        f(&reactor)
+    }
+
     pub(crate) fn with_reactor_mut<T>(
         &self,
         f: impl FnOnce(&mut crate::task::Reactor) -> Result<T, zx_status_t>,
@@ -2043,6 +2051,45 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
                 Err(e)
             }
         }
+    })
+}
+
+/// Query one telemetry snapshot for a port object.
+pub fn port_get_info(handle: zx_handle_t) -> Result<axle_types::ax_port_info_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        let object_key = resolved.object_key();
+        let port = state.with_registry(|registry| {
+            let Some(KernelObject::Port(port)) = registry.get(object_key) else {
+                return Err(ZX_ERR_WRONG_TYPE);
+            };
+            Ok(port.telemetry_snapshot())
+        })?;
+        let observer = state
+            .with_reactor(|reactor| Ok(reactor.observers().port_telemetry_snapshot(object_key)))?;
+        Ok(axle_types::ax_port_info_t {
+            capacity: port.capacity,
+            kernel_reserve: port.kernel_reserve,
+            current_depth: port.current_depth,
+            peak_depth: port.peak_depth,
+            user_queue_count: port.user_queue_count,
+            user_should_wait_count: port.user_should_wait_count,
+            user_reserve_hit_count: port.user_reserve_hit_count,
+            user_full_hit_count: port.user_full_hit_count,
+            kernel_queue_count: port.kernel_queue_count,
+            kernel_should_wait_count: port.kernel_should_wait_count,
+            pop_count: port.pop_count,
+            pending_current: observer.pending_current,
+            pending_peak: observer.pending_peak,
+            pending_new_count: observer.pending_new_count,
+            pending_merge_count: observer.pending_merge_count,
+            pending_flush_delivered_count: observer.flush_delivered_count,
+            depth_sample_count: port.depth_sample_count,
+            depth_p50: port.depth_p50,
+            depth_p90: port.depth_p90,
+            depth_p99: port.depth_p99,
+            reserved0: 0,
+        })
     })
 }
 

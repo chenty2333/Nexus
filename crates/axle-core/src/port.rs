@@ -10,6 +10,7 @@
 //! queue and readiness surface.
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 use crate::capability::ObjectKey;
 use crate::signals::Signals;
@@ -139,6 +140,127 @@ pub enum PortError {
     NotFound,
 }
 
+/// Stable telemetry snapshot for one port queue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PortTelemetrySnapshot {
+    /// Total queue capacity.
+    pub capacity: u32,
+    /// Slots reserved for kernel packets.
+    pub kernel_reserve: u32,
+    /// Current queued-packet depth.
+    pub current_depth: u32,
+    /// Peak queued-packet depth observed so far.
+    pub peak_depth: u32,
+    /// Successful user-packet enqueues.
+    pub user_queue_count: u64,
+    /// User enqueue attempts rejected with `ShouldWait`.
+    pub user_should_wait_count: u64,
+    /// User rejections caused by the kernel-reserve ceiling.
+    pub user_reserve_hit_count: u64,
+    /// User rejections caused by total queue fullness.
+    pub user_full_hit_count: u64,
+    /// Successful kernel-packet enqueues.
+    pub kernel_queue_count: u64,
+    /// Kernel enqueue attempts rejected with `ShouldWait`.
+    pub kernel_should_wait_count: u64,
+    /// Successful packet dequeues.
+    pub pop_count: u64,
+    /// Number of recorded depth samples.
+    pub depth_sample_count: u64,
+    /// Median observed depth.
+    pub depth_p50: u32,
+    /// 90th-percentile observed depth.
+    pub depth_p90: u32,
+    /// 99th-percentile observed depth.
+    pub depth_p99: u32,
+}
+
+#[derive(Clone, Debug)]
+struct PortTelemetryState {
+    current_depth: u32,
+    peak_depth: u32,
+    user_queue_count: u64,
+    user_should_wait_count: u64,
+    user_reserve_hit_count: u64,
+    user_full_hit_count: u64,
+    kernel_queue_count: u64,
+    kernel_should_wait_count: u64,
+    pop_count: u64,
+    depth_sample_count: u64,
+    depth_hist: Vec<u64>,
+}
+
+impl PortTelemetryState {
+    fn new(capacity: usize) -> Self {
+        let mut depth_hist = Vec::new();
+        depth_hist.resize(capacity.saturating_add(1), 0);
+        let mut state = Self {
+            current_depth: 0,
+            peak_depth: 0,
+            user_queue_count: 0,
+            user_should_wait_count: 0,
+            user_reserve_hit_count: 0,
+            user_full_hit_count: 0,
+            kernel_queue_count: 0,
+            kernel_should_wait_count: 0,
+            pop_count: 0,
+            depth_sample_count: 0,
+            depth_hist,
+        };
+        state.record_depth(0);
+        state
+    }
+
+    fn record_depth(&mut self, depth: usize) {
+        let index = depth.min(self.depth_hist.len().saturating_sub(1));
+        self.current_depth = index as u32;
+        self.peak_depth = self.peak_depth.max(self.current_depth);
+        self.depth_sample_count = self.depth_sample_count.wrapping_add(1);
+        if let Some(sample) = self.depth_hist.get_mut(index) {
+            *sample = sample.wrapping_add(1);
+        }
+    }
+
+    fn percentile_depth(&self, numer: u64, denom: u64) -> u32 {
+        if self.depth_sample_count == 0 || self.depth_hist.is_empty() {
+            return 0;
+        }
+        let threshold = self
+            .depth_sample_count
+            .saturating_mul(numer)
+            .saturating_add(denom.saturating_sub(1))
+            / denom;
+        let mut cumulative = 0_u64;
+        for (depth, &count) in self.depth_hist.iter().enumerate() {
+            cumulative = cumulative.saturating_add(count);
+            if cumulative >= threshold.max(1) {
+                return depth as u32;
+            }
+        }
+        self.depth_hist.len().saturating_sub(1) as u32
+    }
+
+    fn snapshot(&self, capacity: usize, kernel_reserve: usize) -> PortTelemetrySnapshot {
+        PortTelemetrySnapshot {
+            capacity: capacity as u32,
+            kernel_reserve: kernel_reserve as u32,
+            current_depth: self.current_depth,
+            peak_depth: self.peak_depth,
+            user_queue_count: self.user_queue_count,
+            user_should_wait_count: self.user_should_wait_count,
+            user_reserve_hit_count: self.user_reserve_hit_count,
+            user_full_hit_count: self.user_full_hit_count,
+            kernel_queue_count: self.kernel_queue_count,
+            kernel_should_wait_count: self.kernel_should_wait_count,
+            pop_count: self.pop_count,
+            depth_sample_count: self.depth_sample_count,
+            depth_p50: self.percentile_depth(50, 100),
+            depth_p90: self.percentile_depth(90, 100),
+            depth_p99: self.percentile_depth(99, 100),
+        }
+    }
+}
+
 /// Packet queue backend used by the port state machine.
 pub trait PacketQueue: core::fmt::Debug {
     /// Number of queued packets currently stored.
@@ -198,6 +320,7 @@ pub struct PortState<Q: PacketQueue> {
     kernel_reserve: usize,
     q: Q,
     user_in_q: usize,
+    telemetry: PortTelemetryState,
 }
 
 /// Default port semantic state backed by an in-memory queue.
@@ -233,6 +356,7 @@ impl<Q: PacketQueue> PortState<Q> {
             kernel_reserve,
             q: queue,
             user_in_q: 0,
+            telemetry: PortTelemetryState::new(capacity),
         }
     }
 
@@ -277,6 +401,11 @@ impl<Q: PacketQueue> PortState<Q> {
         self.kernel_reserve
     }
 
+    /// Stable telemetry snapshot for this port.
+    pub fn telemetry_snapshot(&self) -> PortTelemetrySnapshot {
+        self.telemetry.snapshot(self.capacity, self.kernel_reserve)
+    }
+
     fn user_quota(&self) -> usize {
         self.capacity - self.kernel_reserve
     }
@@ -291,15 +420,24 @@ impl<Q: PacketQueue> PortState<Q> {
     pub fn queue_user(&mut self, pkt: Packet) -> Result<(), PortError> {
         debug_assert_eq!(pkt.kind, PacketKind::User);
         if self.user_in_q >= self.user_quota() {
+            self.telemetry.user_should_wait_count =
+                self.telemetry.user_should_wait_count.wrapping_add(1);
+            self.telemetry.user_reserve_hit_count =
+                self.telemetry.user_reserve_hit_count.wrapping_add(1);
             return Err(PortError::ShouldWait);
         }
         if self.q.len() >= self.capacity {
+            self.telemetry.user_should_wait_count =
+                self.telemetry.user_should_wait_count.wrapping_add(1);
+            self.telemetry.user_full_hit_count = self.telemetry.user_full_hit_count.wrapping_add(1);
             return Err(PortError::ShouldWait);
         }
         if self.q.push_back(pkt).is_err() {
             return Err(PortError::ShouldWait);
         }
         self.user_in_q += 1;
+        self.telemetry.user_queue_count = self.telemetry.user_queue_count.wrapping_add(1);
+        self.telemetry.record_depth(self.q.len());
         Ok(())
     }
 
@@ -309,10 +447,18 @@ impl<Q: PacketQueue> PortState<Q> {
     /// cannot exceed total capacity.
     pub fn queue_kernel(&mut self, pkt: Packet) -> Result<(), PortError> {
         debug_assert_ne!(pkt.kind, PacketKind::User);
-        let _ticket = self.reserve_kernel_slot().ok_or(PortError::ShouldWait)?;
+        let _ticket = self.reserve_kernel_slot().ok_or_else(|| {
+            self.telemetry.kernel_should_wait_count =
+                self.telemetry.kernel_should_wait_count.wrapping_add(1);
+            PortError::ShouldWait
+        })?;
         if self.q.push_back(pkt).is_err() {
+            self.telemetry.kernel_should_wait_count =
+                self.telemetry.kernel_should_wait_count.wrapping_add(1);
             return Err(PortError::ShouldWait);
         }
+        self.telemetry.kernel_queue_count = self.telemetry.kernel_queue_count.wrapping_add(1);
+        self.telemetry.record_depth(self.q.len());
         Ok(())
     }
 
@@ -325,6 +471,8 @@ impl<Q: PacketQueue> PortState<Q> {
             debug_assert!(self.user_in_q > 0);
             self.user_in_q -= 1;
         }
+        self.telemetry.pop_count = self.telemetry.pop_count.wrapping_add(1);
+        self.telemetry.record_depth(self.q.len());
         Ok(pkt)
     }
 }

@@ -406,10 +406,62 @@ pub type zx_packet_signal_t = ax_packet_signal_t;
 /// Frozen Zircon-compat alias for the bootstrap port-packet layout.
 pub type zx_port_packet_t = ax_port_packet_t;
 
+/// Native Axle port telemetry snapshot.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ax_port_info_t {
+    /// Queue capacity in packets.
+    pub capacity: u32,
+    /// Slots reserved for kernel packets.
+    pub kernel_reserve: u32,
+    /// Current queued-packet depth.
+    pub current_depth: u32,
+    /// Peak queued-packet depth.
+    pub peak_depth: u32,
+    /// Successful user-packet enqueues.
+    pub user_queue_count: u64,
+    /// User enqueue `SHOULD_WAIT` count.
+    pub user_should_wait_count: u64,
+    /// User reserve-ceiling hits.
+    pub user_reserve_hit_count: u64,
+    /// User full-queue hits.
+    pub user_full_hit_count: u64,
+    /// Successful kernel-packet enqueues.
+    pub kernel_queue_count: u64,
+    /// Kernel enqueue `SHOULD_WAIT` count.
+    pub kernel_should_wait_count: u64,
+    /// Successful dequeues.
+    pub pop_count: u64,
+    /// Pending async-wait registrations currently queued for later flush.
+    pub pending_current: u32,
+    /// Peak pending async-wait registrations.
+    pub pending_peak: u32,
+    /// New pending-registration count.
+    pub pending_new_count: u64,
+    /// Pending merge count.
+    pub pending_merge_count: u64,
+    /// Pending packets later delivered by flush.
+    pub pending_flush_delivered_count: u64,
+    /// Recorded queue-depth sample count.
+    pub depth_sample_count: u64,
+    /// 50th-percentile queue depth.
+    pub depth_p50: u32,
+    /// 90th-percentile queue depth.
+    pub depth_p90: u32,
+    /// 99th-percentile queue depth.
+    pub depth_p99: u32,
+    /// Reserved.
+    pub reserved0: u32,
+}
+
+/// Frozen Zircon-compat alias for the native port telemetry layout.
+pub type zx_port_info_t = ax_port_info_t;
+
 const _: [(); 32] = [(); core::mem::size_of::<ax_packet_user_t>()];
 const _: [(); 32] = [(); core::mem::size_of::<ax_packet_signal_t>()];
 const _: [(); 48] = [(); core::mem::size_of::<ax_port_packet_t>()];
 const _: [(); 8] = [(); core::mem::align_of::<ax_port_packet_t>()];
+const _: [(); 128] = [(); core::mem::size_of::<ax_port_info_t>()];
 
 /// Clock ids.
 pub mod clock {

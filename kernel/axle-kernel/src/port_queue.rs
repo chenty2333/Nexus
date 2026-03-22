@@ -1,6 +1,8 @@
 extern crate alloc;
 
-use axle_core::{Packet, PacketKind, PacketQueue, PortError, PortState, Signals};
+use axle_core::{
+    Packet, PacketKind, PacketQueue, PortError, PortState, PortTelemetrySnapshot, Signals,
+};
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
 use axle_types::status::ZX_OK;
 use axle_types::{zx_packet_signal_t, zx_port_packet_t, zx_status_t};
@@ -126,6 +128,10 @@ impl KernelPort {
 
     pub(crate) fn queue_kernel(&mut self, pkt: Packet) -> Result<(), PortError> {
         self.state.queue_kernel(pkt)
+    }
+
+    pub(crate) fn telemetry_snapshot(&self) -> PortTelemetrySnapshot {
+        self.state.telemetry_snapshot()
     }
 }
 

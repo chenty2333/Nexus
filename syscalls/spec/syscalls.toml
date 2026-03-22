@@ -72,6 +72,16 @@ args = [
 ]
 
 [[syscall]]
+name = "ax_port_get_info"
+nr = 78
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "port", ty = "ax_handle_t" },
+  { name = "out", ty = "*mut ax_port_info_t" },
+]
+
+[[syscall]]
 name = "timer_create"
 nr = 6
 must = true

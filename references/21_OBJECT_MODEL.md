@@ -225,6 +225,7 @@ The object layer assigns default rights per object family, for example:
 
 - channel/socket: duplicate, transfer, wait, read, write
 - eventpair: duplicate, transfer, wait, signal, signal-peer
+- port: duplicate, transfer, wait, inspect, read, write
 - interrupt: duplicate, transfer, wait, write
 - pci-device: duplicate, transfer, inspect
 - dma-region: duplicate, transfer, inspect

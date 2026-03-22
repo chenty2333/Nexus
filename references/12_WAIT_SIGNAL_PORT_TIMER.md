@@ -82,6 +82,13 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   on open-coded "queue has space" checks.
 - Current kernel defaults are capacity `64` and kernel reserve `16`.
 - The kernel wraps this in `KernelPort`, whose queue storage is backed by a kernel-created VMO-like page range.
+- `ax_port_get_info()` now exports one first explicit telemetry snapshot for that queue/observer
+  boundary:
+  - capacity / kernel reserve
+  - current / peak queue depth
+  - queue-depth percentiles
+  - user/kernel enqueue and `SHOULD_WAIT` counts
+  - pending async-wait overflow / merge / flush counts for that port
 - User packets and signal packets are translated to and from native `ax_port_packet_t`.
   Frozen `zx_port_packet_t` remains available as a compat alias over the same layout.
 - `zx_port_wait` is FIFO over queued packets and flushes pending kernel events when space becomes available.

@@ -32,10 +32,12 @@ pub mod timer;
 pub use capability::{Capability, ObjectKey};
 pub use cspace::{CSpace, CSpaceError, TransferredCap};
 pub use handle::{Handle, HandleError};
-pub use observer::{ObserverPortId, ObserverRegistry, WaitAsyncRegistration};
+pub use observer::{
+    ObserverPortId, ObserverPortTelemetrySnapshot, ObserverRegistry, WaitAsyncRegistration,
+};
 pub use port::{
-    Packet, PacketKind, PacketQueue, Port, PortError, PortKey, PortState, VecPortQueue,
-    WaitAsyncOptions, WaitAsyncTimestamp, WaitableId,
+    Packet, PacketKind, PacketQueue, Port, PortError, PortKey, PortState, PortTelemetrySnapshot,
+    VecPortQueue, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId,
 };
 pub use revocation::{RevocationGroupId, RevocationGroupToken, RevocationManager, RevocationRef};
 pub use signals::{Signals, WaitOne, wait_one};

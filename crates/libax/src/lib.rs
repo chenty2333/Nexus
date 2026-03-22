@@ -37,8 +37,8 @@ pub use axle_types::{
     ax_linux_exec_interp_header_t, ax_linux_exec_spec_header_t, ax_packet_signal_t,
     ax_packet_type_t, ax_packet_user_t, ax_pci_bar_info_t, ax_pci_config_info_t,
     ax_pci_device_info_t, ax_pci_interrupt_info_t, ax_pci_interrupt_mode_info_t,
-    ax_pci_resource_info_t, ax_port_packet_t, ax_rights_t, ax_signals_t, ax_status_t, ax_time_t,
-    ax_vaddr_t, ax_vm_option_t, ax_vmo_info_t,
+    ax_pci_resource_info_t, ax_port_info_t, ax_port_packet_t, ax_rights_t, ax_signals_t,
+    ax_status_t, ax_time_t, ax_vaddr_t, ax_vm_option_t, ax_vmo_info_t,
 };
 
 use axle_types::status::{AX_ERR_NO_MEMORY, AX_ERR_OUT_OF_RANGE, AX_OK};
@@ -89,6 +89,14 @@ pub fn ax_console_write(bytes: &[u8], out_actual: &mut usize) -> ax_status_t {
 /// Read bytes from the bootstrap console.
 pub fn ax_console_read(buffer: &mut [u8], out_actual: &mut usize) -> ax_status_t {
     libzircon::ax_console_read(buffer, out_actual)
+}
+
+/// Query one telemetry snapshot for a port.
+pub fn ax_port_get_info(handle: ax_handle_t, out: &mut ax_port_info_t) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_port_get_info(raw, out),
+        Err(status) => status,
+    }
 }
 
 /// Close a handle.

@@ -52,6 +52,42 @@ struct Observer {
     pending: Option<PendingState>,
 }
 
+/// Per-port async-wait overflow/flush telemetry snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObserverPortTelemetrySnapshot {
+    /// Registrations currently pending on this port because queue delivery overflowed.
+    pub pending_current: u32,
+    /// Peak number of simultaneously pending registrations on this port.
+    pub pending_peak: u32,
+    /// Number of first-time pending registrations on this port.
+    pub pending_new_count: u64,
+    /// Number of merges into an already pending registration on this port.
+    pub pending_merge_count: u64,
+    /// Number of pending registrations later delivered by `flush_port`.
+    pub flush_delivered_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ObserverPortTelemetry {
+    pending_current: u32,
+    pending_peak: u32,
+    pending_new_count: u64,
+    pending_merge_count: u64,
+    flush_delivered_count: u64,
+}
+
+impl ObserverPortTelemetry {
+    fn snapshot(self) -> ObserverPortTelemetrySnapshot {
+        ObserverPortTelemetrySnapshot {
+            pending_current: self.pending_current,
+            pending_peak: self.pending_peak,
+            pending_new_count: self.pending_new_count,
+            pending_merge_count: self.pending_merge_count,
+            flush_delivered_count: self.flush_delivered_count,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ObserverRegistration {
     waitable: WaitableId,
@@ -91,12 +127,22 @@ pub struct ObserverRegistry {
     observers: BTreeMap<ObserverRegistration, Observer>,
     waitables_by_port: BTreeMap<ObserverPortId, BTreeSet<WaitableId>>,
     pending_order_by_port: BTreeMap<ObserverPortId, VecDeque<ObserverRegistration>>,
+    telemetry_by_port: BTreeMap<ObserverPortId, ObserverPortTelemetry>,
 }
 
 impl ObserverRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Telemetry snapshot for one observing port.
+    pub fn port_telemetry_snapshot(&self, port: ObserverPortId) -> ObserverPortTelemetrySnapshot {
+        self.telemetry_by_port
+            .get(&port)
+            .copied()
+            .unwrap_or_default()
+            .snapshot()
     }
 
     /// Register an async wait on `waitable` targeting `port`.
@@ -241,6 +287,9 @@ impl ObserverRegistry {
                 break;
             }
 
+            if let Some(telemetry) = self.telemetry_by_port.get_mut(&port) {
+                telemetry.flush_delivered_count = telemetry.flush_delivered_count.wrapping_add(1);
+            }
             let _ = self.remove_observer(reg);
         }
 
@@ -257,6 +306,7 @@ impl ObserverRegistry {
     pub fn remove_port(&mut self, port: ObserverPortId) {
         let Some(waitables) = self.waitables_by_port.remove(&port) else {
             let _ = self.pending_order_by_port.remove(&port);
+            let _ = self.telemetry_by_port.remove(&port);
             return;
         };
 
@@ -275,6 +325,7 @@ impl ObserverRegistry {
         }
 
         let _ = self.pending_order_by_port.remove(&port);
+        let _ = self.telemetry_by_port.remove(&port);
     }
 
     /// Remove every observer attached to one waitable object.
@@ -337,6 +388,9 @@ impl ObserverRegistry {
     fn remove_observer(&mut self, reg: ObserverRegistration) -> Option<Observer> {
         let removed = self.observers.remove(&reg)?;
         if removed.pending.is_some() {
+            if let Some(telemetry) = self.telemetry_by_port.get_mut(&reg.port) {
+                telemetry.pending_current = telemetry.pending_current.saturating_sub(1);
+            }
             self.remove_pending_registration(reg);
         }
         self.maybe_forget_port_waitable(reg.port, reg.waitable);
@@ -381,12 +435,18 @@ impl ObserverRegistry {
                     observed: current,
                     timestamp,
                 });
+                let telemetry = self.telemetry_by_port.entry(reg.port).or_default();
+                telemetry.pending_new_count = telemetry.pending_new_count.wrapping_add(1);
+                telemetry.pending_current = telemetry.pending_current.saturating_add(1);
+                telemetry.pending_peak = telemetry.pending_peak.max(telemetry.pending_current);
                 self.pending_order_by_port
                     .entry(reg.port)
                     .or_default()
                     .push_back(reg);
             }
             Some(pending) => {
+                let telemetry = self.telemetry_by_port.entry(reg.port).or_default();
+                telemetry.pending_merge_count = telemetry.pending_merge_count.wrapping_add(1);
                 pending.count = pending.count.saturating_add(1);
                 pending.observed = pending.observed | current;
             }

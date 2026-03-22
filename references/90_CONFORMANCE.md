@@ -363,6 +363,15 @@ That host gate now explicitly covers:
     - `packet_count`
     - `packet_match_count`
     - `batch_cycles`
+- Bootstrap wait/port coverage now also includes one narrow telemetry gate:
+  - `kernel.port.telemetry_bootstrap`
+  - one user-filled + async-overflowed port must now prove the current explicit
+    port perf-contract surface:
+    - fixed capacity/kernel-reserve reporting through `ax_port_get_info()`
+    - queue-depth high-water plus percentile reporting
+    - user reserve-hit and kernel `SHOULD_WAIT` counters
+    - pending async-wait new/merge/flush counters
+    - merged signal delivery surviving one full-queue overflow cycle
 - Bootstrap socket coverage now also includes one narrow datagram gate:
   - datagram create succeeds through the normal socket object family
   - one peek/read pair proves message preservation without stream fallback
