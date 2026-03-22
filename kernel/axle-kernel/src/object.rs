@@ -6,6 +6,7 @@ pub(crate) mod device;
 pub(crate) mod guest;
 pub(crate) mod handle;
 pub(crate) mod process;
+pub(crate) mod revocation;
 pub(crate) mod transport;
 pub(crate) mod vm;
 
@@ -13,7 +14,10 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use axle_core::{Capability, ObjectKey, PortError, Signals, TimerError, TimerId, TransferredCap};
+use axle_core::{
+    Capability, ObjectKey, PortError, RevocationGroupToken, Signals, TimerError, TimerId,
+    TransferredCap,
+};
 use axle_mm::{
     MappingCachePolicy, MappingClonePolicy, MappingPerms, VmarAllocMode, VmarId,
     VmarPlacementPolicy,
@@ -89,6 +93,8 @@ pub enum ObjectKind {
     DmaRegion,
     /// PCI/device resource object.
     PciDevice,
+    /// Revocation-group object.
+    RevocationGroup,
     /// Supervised guest-session object.
     GuestSession,
     /// VMO object.
@@ -121,6 +127,17 @@ pub(crate) struct DmaRegionObject {
     size_bytes: u64,
     options: u32,
     pin: axle_mm::PinToken,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RevocationGroupObject {
+    token: RevocationGroupToken,
+}
+
+impl RevocationGroupObject {
+    pub(crate) const fn token(self) -> RevocationGroupToken {
+        self.token
+    }
 }
 
 impl DmaRegionObject {
@@ -962,6 +979,7 @@ pub(crate) enum KernelObject {
     Interrupt(InterruptObject),
     DmaRegion(DmaRegionObject),
     PciDevice(device::PciDeviceObject),
+    RevocationGroup(RevocationGroupObject),
     Vmo(VmoObject),
     Vmar(VmarObject),
     Thread(ThreadObject),
@@ -2532,6 +2550,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
                 | Some(KernelObject::Port(_))
                 | Some(KernelObject::Interrupt(_))
                 | Some(KernelObject::PciDevice(_))
+                | Some(KernelObject::RevocationGroup(_))
                 | Some(KernelObject::DmaRegion(_))
                 | Some(KernelObject::Thread(_))
                 | Some(KernelObject::Vmo(_))
@@ -2575,6 +2594,7 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
                 | Some(KernelObject::Port(_))
                 | Some(KernelObject::Interrupt(_))
                 | Some(KernelObject::PciDevice(_))
+                | Some(KernelObject::RevocationGroup(_))
                 | Some(KernelObject::DmaRegion(_))
                 | Some(KernelObject::Thread(_))
                 | Some(KernelObject::Vmo(_))
@@ -2615,6 +2635,7 @@ enum CloseHandleAction {
     Interrupt,
     DmaRegion,
     PciDevice,
+    RevocationGroup,
     Vmo,
     Vmar,
 }
@@ -2641,6 +2662,7 @@ fn close_handle_action_for_live_object(object: &KernelObject) -> CloseHandleActi
         KernelObject::Interrupt(_) => CloseHandleAction::Interrupt,
         KernelObject::DmaRegion(_) => CloseHandleAction::DmaRegion,
         KernelObject::PciDevice(_) => CloseHandleAction::PciDevice,
+        KernelObject::RevocationGroup(_) => CloseHandleAction::RevocationGroup,
         KernelObject::Vmo(_) => CloseHandleAction::Vmo,
         KernelObject::Vmar(_) => CloseHandleAction::Vmar,
         KernelObject::Process(_) | KernelObject::Thread(_) => CloseHandleAction::None,
@@ -2834,6 +2856,11 @@ fn finalize_last_handle_close(
             state.finish_logical_destroy(object_key);
             result
         }
+        CloseHandleAction::RevocationGroup => {
+            let _ = state.begin_logical_destroy(object_key)?;
+            state.finish_logical_destroy(object_key);
+            Ok(())
+        }
         CloseHandleAction::Vmo | CloseHandleAction::Vmar => {
             let _ = state.begin_logical_destroy(object_key)?;
             state.finish_logical_destroy(object_key);
@@ -2956,6 +2983,10 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
                         device.queue_size,
                     );
                     ObjectKind::PciDevice
+                }
+                KernelObject::RevocationGroup(group) => {
+                    let _ = (group.token().id().raw(), group.token().generation());
+                    ObjectKind::RevocationGroup
                 }
                 KernelObject::Vmo(vmo) => {
                     let _ = (
@@ -3084,6 +3115,7 @@ pub(crate) fn signals_for_object_id(
             KernelObject::Interrupt(interrupt) => Ok(interrupt.signals()),
             KernelObject::DmaRegion(_)
             | KernelObject::PciDevice(_)
+            | KernelObject::RevocationGroup(_)
             | KernelObject::Vmo(_)
             | KernelObject::Vmar(_) => Ok(Signals::NONE),
         }

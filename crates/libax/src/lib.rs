@@ -37,8 +37,8 @@ pub use axle_types::{
     ax_linux_exec_interp_header_t, ax_linux_exec_spec_header_t, ax_packet_signal_t,
     ax_packet_type_t, ax_packet_user_t, ax_pci_bar_info_t, ax_pci_config_info_t,
     ax_pci_device_info_t, ax_pci_interrupt_info_t, ax_pci_interrupt_mode_info_t,
-    ax_pci_resource_info_t, ax_port_info_t, ax_port_packet_t, ax_rights_t, ax_signals_t,
-    ax_status_t, ax_time_t, ax_vaddr_t, ax_vm_option_t, ax_vmo_info_t,
+    ax_pci_resource_info_t, ax_port_info_t, ax_port_packet_t, ax_revocation_group_info_t,
+    ax_rights_t, ax_signals_t, ax_status_t, ax_time_t, ax_vaddr_t, ax_vm_option_t, ax_vmo_info_t,
 };
 
 use axle_types::status::{AX_ERR_NO_MEMORY, AX_ERR_OUT_OF_RANGE, AX_OK};
@@ -97,6 +97,59 @@ pub fn ax_port_get_info(handle: ax_handle_t, out: &mut ax_port_info_t) -> ax_sta
         Ok(raw) => libzircon::ax_port_get_info(raw, out),
         Err(status) => status,
     }
+}
+
+/// Create a revocation-group handle.
+pub fn ax_revocation_group_create(options: u32, out: &mut ax_handle_t) -> ax_status_t {
+    let mut raw = libzircon::handle::ZX_HANDLE_INVALID;
+    let status = libzircon::ax_revocation_group_create(options, &mut raw);
+    if status == AX_OK {
+        *out = widen_handle(raw);
+    }
+    status
+}
+
+/// Query revocation-group metadata.
+pub fn ax_revocation_group_get_info(
+    handle: ax_handle_t,
+    out: &mut ax_revocation_group_info_t,
+) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_revocation_group_get_info(raw, out),
+        Err(status) => status,
+    }
+}
+
+/// Increment one revocation group's epoch.
+pub fn ax_revocation_group_revoke(handle: ax_handle_t) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_revocation_group_revoke(raw),
+        Err(status) => status,
+    }
+}
+
+/// Duplicate one handle and bind the duplicate to a revocation group.
+pub fn ax_handle_duplicate_revocable(
+    handle: ax_handle_t,
+    rights: ax_rights_t,
+    group: ax_handle_t,
+    out: &mut ax_handle_t,
+) -> ax_status_t {
+    let raw_handle = match narrow_handle(handle) {
+        Ok(raw) => raw,
+        Err(status) => return status,
+    };
+    let raw_group = match narrow_handle(group) {
+        Ok(raw) => raw,
+        Err(status) => return status,
+    };
+    let mut raw_out = libzircon::handle::ZX_HANDLE_INVALID;
+    let status =
+        libzircon::ax_handle_duplicate_revocable(raw_handle, rights, raw_group, &mut raw_out);
+    if status == AX_OK {
+        *out = widen_handle(raw_out);
+    }
+    status
 }
 
 /// Close a handle.

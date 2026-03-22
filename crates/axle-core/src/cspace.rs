@@ -190,6 +190,27 @@ impl CSpace {
         self.alloc_entry(entry)
     }
 
+    /// Duplicate a handle with derived rights and bind the duplicate to a revocation group.
+    pub fn duplicate_revocable(
+        &mut self,
+        h: Handle,
+        rights: u32,
+        revocation: RevocationRef,
+    ) -> Result<Handle, CSpaceError> {
+        let (idx, tag) = h.decode()?;
+        let slot = self
+            .slots
+            .get(usize::try_from(idx).map_err(|_| CSpaceError::BadHandle)?)
+            .ok_or(CSpaceError::BadHandle)?;
+        if slot.tag != tag {
+            return Err(CSpaceError::BadHandle);
+        }
+        let mut entry = slot.entry.ok_or(CSpaceError::BadHandle)?;
+        entry.cap = Capability::new(entry.cap.object_id(), rights, entry.cap.generation());
+        entry.rev = Some(revocation);
+        self.alloc_entry(entry)
+    }
+
     /// Replace a handle in-place with a rights-derived version.
     ///
     /// The slot stays occupied, but its ABA tag is bumped so the old handle value
@@ -413,6 +434,29 @@ mod tests {
         mgr.revoke(grp).unwrap();
         assert_eq!(cs.get_checked(h1, &mgr), Err(CSpaceError::BadHandle));
         assert_eq!(cs.get_checked(h2, &mgr), Err(CSpaceError::BadHandle));
+    }
+
+    #[test]
+    fn duplicate_revocable_attaches_group_to_nonrevocable_source() {
+        let mut mgr = RevocationManager::new();
+        let grp = mgr.create_group();
+        let mut cs = CSpace::new(4, 0);
+
+        let cap = Capability::new(77, 0b1111, 5);
+        let source = cs.alloc(cap).unwrap();
+        let delegated = cs
+            .duplicate_revocable(source, 0b0011, mgr.snapshot(grp).unwrap())
+            .unwrap();
+
+        assert_eq!(cs.get_checked(source, &mgr), Ok(cap));
+        assert_eq!(
+            cs.get_checked(delegated, &mgr),
+            Ok(Capability::new(77, 0b0011, 5))
+        );
+
+        mgr.revoke(grp).unwrap();
+        assert_eq!(cs.get_checked(source, &mgr), Ok(cap));
+        assert_eq!(cs.get_checked(delegated, &mgr), Err(CSpaceError::BadHandle));
     }
 
     #[test]

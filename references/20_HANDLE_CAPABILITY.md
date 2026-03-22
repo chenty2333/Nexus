@@ -77,6 +77,12 @@ It is a current-state reference, not a roadmap.
 - Lookup, duplicate, replace, transfer snapshot, and transferred-handle install are implemented from `object/handle.rs` by coordinating:
   - per-process `CSpace` mutations in `Kernel`
   - object-handle refcount updates in `ObjectRegistry`
+  - public revocation-group lookup and delegated-handle duplication now also live on that same
+    handle/object boundary:
+    - `ax_revocation_group_create()`
+    - `ax_revocation_group_get_info()`
+    - `ax_revocation_group_revoke()`
+    - `ax_handle_duplicate_revocable()`
 - `ResolvedHandle` carries:
   - process id
   - slot index / slot tag
@@ -95,17 +101,26 @@ It is a current-state reference, not a roadmap.
 
 - `axle-core` already has `RevocationManager`, `RevocationGroupToken`, and `RevocationRef`.
 - `CSpace` can allocate revocable entries and validate them on lookup.
-- The bootstrap kernel owns a `RevocationManager`, but there is no public revoker object or revoke syscall yet.
-- Today this is internal machinery, not a complete public object governance model.
-- Ordinary object handles are still non-revocable today, but capability generation is now live
-  object identity rather than a dormant field.
+- The bootstrap kernel now exposes one narrow public revocation-group object family:
+  - `ax_revocation_group_create()` returns one group handle that carries revoke authority
+  - `ax_revocation_group_revoke()` bumps the group's epoch
+  - `ax_revocation_group_get_info()` reports `group_id`, `generation`, and `epoch`
+- Public revocable delegation now starts through `ax_handle_duplicate_revocable()`:
+  - it duplicates one source handle with equal-or-fewer rights
+  - it snapshots the target revocation group's current epoch onto the duplicate
+  - later duplicate/replace/transfer of that delegated handle preserve the same revocation
+    association through the ordinary `CSpace` paths
+- Ordinary object handles are still non-revocable by default; revocation remains one deliberate
+  delegation opt-in rather than a property of every handle family.
 
 ## What is intentionally not true yet
 
 - There is no public job tree or resource-governance hierarchy on top of handles.
-- There is no externally exposed revocation-group object type.
-- Revocation is still independent from generation-based stale-handle isolation; there is no public
-  revoker object yet.
+- Revocation is still independent from generation-based stale-handle isolation.
+- There is still no public job/resource hierarchy controlling revocation-group quotas or ownership.
+- Public revocation-group lifecycle is intentionally modest today:
+  - closing the last group handle drops revoke authority
+  - full group-slot reclamation / quota governance remains later work
 
 ## Current object-right examples
 

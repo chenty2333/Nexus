@@ -148,6 +148,20 @@ impl Process {
         Ok(duplicated.raw())
     }
 
+    pub(super) fn duplicate_handle_revocable(
+        &mut self,
+        raw: zx_handle_t,
+        rights: HandleRights,
+        revocation: axle_core::RevocationRef,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        let handle = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
+        let duplicated = self
+            .cspace
+            .duplicate_revocable(handle, rights.bits(), revocation)
+            .map_err(map_alloc_error)?;
+        Ok(duplicated.raw())
+    }
+
     pub(super) fn replace_handle_derived(
         &mut self,
         raw: zx_handle_t,

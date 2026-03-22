@@ -1,0 +1,46 @@
+id = "kernel.handle.revocation_bootstrap"
+description = "Public revocation groups should invalidate delegated duplicates and transferred handles by epoch while leaving the source handle alive"
+tags = ["kernel", "handle", "revocation", "bootstrap", "qemu"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/revocation-smoke && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && AXLE_TEST_RUNNER_RUST_ENTRY=revocation_smoke RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none --target-dir \"$target_dir\" && runner_src=\"$target_dir/x86_64-unknown-none/debug/nexus-test-runner\" && runner=$(mktemp /tmp/nexus-test-runner-XXXXXX) && cp \"$runner_src\" \"$runner\" && size=$(stat -c%s \"$runner\") && { timeout --foreground 20s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x7000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x6fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; qemu_code=$?; echo qemu_exit=$qemu_code; [ \"$qemu_code\" -eq 33 ]; }"
+]
+
+expect = [
+  "kernel: revocation smoke",
+]
+forbid = ["KERNEL PANIC"]
+contracts = []
+
+[assertions.status_code]
+eventpair_create = 0
+group_create = 0
+info_before = 0
+dup_revocable = 0
+dup_inherited = 0
+channel_create = 0
+channel_write = 0
+channel_read = 0
+revoke = 0
+info_after = 0
+base_signal = 0
+base_wait = 0
+inherited_wait_bad_handle = -11
+transferred_wait_bad_handle = -11
+inherited_dup_bad_handle = -11
+dup_after_revoke = 0
+dup_after_revoke_dup = 0
+
+[assertions.packet_fields]
+rev_present = 1
+rev_failure_step = 0
+group_epoch_before = 0
+group_generation_before = 1
+inherited_distinct = 1
+transferred_actual_handles = 1
+group_epoch_after = 1
+group_generation_after = 1
+base_wait_observed = 16777216

@@ -247,6 +247,47 @@ args = [
 ]
 
 [[syscall]]
+name = "ax_revocation_group_create"
+nr = 79
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "options", ty = "u32" },
+  { name = "out", ty = "*mut ax_handle_t" },
+]
+
+[[syscall]]
+name = "ax_revocation_group_get_info"
+nr = 80
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "out", ty = "*mut ax_revocation_group_info_t" },
+]
+
+[[syscall]]
+name = "ax_revocation_group_revoke"
+nr = 81
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+]
+
+[[syscall]]
+name = "ax_handle_duplicate_revocable"
+nr = 82
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "handle", ty = "ax_handle_t" },
+  { name = "rights", ty = "ax_rights_t" },
+  { name = "group", ty = "ax_handle_t" },
+  { name = "out", ty = "*mut ax_handle_t" },
+]
+
+[[syscall]]
 name = "object_signal"
 nr = 20
 should = true

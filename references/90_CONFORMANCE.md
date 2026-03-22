@@ -372,6 +372,16 @@ That host gate now explicitly covers:
     - user reserve-hit and kernel `SHOULD_WAIT` counters
     - pending async-wait new/merge/flush counters
     - merged signal delivery surviving one full-queue overflow cycle
+- Bootstrap handle governance coverage now also includes one narrow revocation gate:
+  - `kernel.handle.revocation_bootstrap`
+  - one public revocation group must now prove:
+    - `ax_revocation_group_create()` succeeds
+    - `ax_revocation_group_get_info()` reports the current epoch before and after revoke
+    - `ax_handle_duplicate_revocable()` produces one delegated handle
+    - ordinary duplicate and channel transfer preserve that delegated revocation association
+    - `ax_revocation_group_revoke()` invalidates the old delegated copies
+    - the original non-revocable source handle remains usable
+    - one fresh delegated copy taken after revoke observes the new epoch and remains live
 - Bootstrap socket coverage now also includes one narrow datagram gate:
   - datagram create succeeds through the normal socket object family
   - one peek/read pair proves message preservation without stream fallback

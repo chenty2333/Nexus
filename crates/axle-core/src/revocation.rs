@@ -35,6 +35,11 @@ impl RevocationGroupToken {
     pub const fn id(self) -> RevocationGroupId {
         self.id
     }
+
+    /// Token generation used to reject stale handles after recycle.
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
 }
 
 /// A revocation reference carried by a capability/handle.

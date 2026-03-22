@@ -457,11 +457,29 @@ pub struct ax_port_info_t {
 /// Frozen Zircon-compat alias for the native port telemetry layout.
 pub type zx_port_info_t = ax_port_info_t;
 
+/// Native Axle revocation-group metadata snapshot.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ax_revocation_group_info_t {
+    /// Stable group id.
+    pub group_id: u32,
+    /// Token generation used to reject stale recycled ids.
+    pub generation: u32,
+    /// Current revocation epoch.
+    pub epoch: u32,
+    /// Reserved.
+    pub reserved0: u32,
+}
+
+/// Frozen Zircon-compat alias for the native revocation-group metadata layout.
+pub type zx_revocation_group_info_t = ax_revocation_group_info_t;
+
 const _: [(); 32] = [(); core::mem::size_of::<ax_packet_user_t>()];
 const _: [(); 32] = [(); core::mem::size_of::<ax_packet_signal_t>()];
 const _: [(); 48] = [(); core::mem::size_of::<ax_port_packet_t>()];
 const _: [(); 8] = [(); core::mem::align_of::<ax_port_packet_t>()];
 const _: [(); 128] = [(); core::mem::size_of::<ax_port_info_t>()];
+const _: [(); 16] = [(); core::mem::size_of::<ax_revocation_group_info_t>()];
 
 /// Clock ids.
 pub mod clock {

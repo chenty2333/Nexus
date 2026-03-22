@@ -183,6 +183,30 @@ pub fn replace_handle(
     })
 }
 
+/// Duplicate one handle with reduced rights and bind the duplicate to one revocation group.
+pub fn duplicate_handle_revocable(
+    handle: zx_handle_t,
+    rights: zx_rights_t,
+    group_handle: zx_handle_t,
+) -> Result<zx_handle_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::DUPLICATE)?;
+        let derived_rights = normalize_requested_rights(resolved, rights)?;
+        let group = state.lookup_handle(group_handle, crate::task::HandleRights::WRITE)?;
+        let token = state.with_objects(|objects| match objects.get(group.object_key()) {
+            Some(KernelObject::RevocationGroup(group)) => Ok(group.token()),
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        })?;
+        let object_key = resolved.object_key();
+        let duplicated = state.with_core_mut(|kernel| {
+            kernel.duplicate_current_handle_revocable(handle, derived_rights, token)
+        })?;
+        state.with_registry_mut(|registry| registry.increment_handle_ref(object_key))?;
+        Ok(duplicated)
+    })
+}
+
 pub(super) fn normalize_requested_rights(
     resolved: crate::task::ResolvedHandle,
     requested: zx_rights_t,
@@ -313,6 +337,13 @@ pub(super) fn vmar_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::WRITE
         | crate::task::HandleRights::EXECUTE
         | crate::task::HandleRights::MAP
+}
+
+pub(super) fn revocation_group_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::INSPECT
+        | crate::task::HandleRights::WRITE
 }
 
 pub(super) fn thread_default_rights() -> crate::task::HandleRights {

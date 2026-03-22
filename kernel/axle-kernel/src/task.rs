@@ -1810,6 +1810,21 @@ impl Kernel {
             .duplicate_handle_derived(raw, rights)
     }
 
+    pub(crate) fn duplicate_current_handle_revocable(
+        &mut self,
+        raw: zx_handle_t,
+        rights: HandleRights,
+        group_token: axle_core::RevocationGroupToken,
+    ) -> Result<zx_handle_t, zx_status_t> {
+        let _ = self.lookup_current_handle(raw, HandleRights::empty())?;
+        let revocation = self
+            .revocations
+            .snapshot(group_token)
+            .map_err(|_| ZX_ERR_BAD_HANDLE)?;
+        self.current_process_mut()?
+            .duplicate_handle_revocable(raw, rights, revocation)
+    }
+
     pub(crate) fn replace_current_handle(
         &mut self,
         raw: zx_handle_t,
@@ -1845,6 +1860,29 @@ impl Kernel {
     ) -> Result<zx_handle_t, zx_status_t> {
         self.process_mut(process_id)?
             .install_transferred_handle(transferred)
+    }
+
+    pub(crate) fn create_revocation_group(&mut self) -> axle_core::RevocationGroupToken {
+        self.revocations.create_group()
+    }
+
+    pub(crate) fn revoke_group(
+        &mut self,
+        token: axle_core::RevocationGroupToken,
+    ) -> Result<(), zx_status_t> {
+        self.revocations
+            .revoke(token)
+            .map_err(|_| ZX_ERR_BAD_HANDLE)
+    }
+
+    pub(crate) fn revocation_group_epoch(
+        &self,
+        token: axle_core::RevocationGroupToken,
+    ) -> Result<u32, zx_status_t> {
+        self.revocations
+            .snapshot(token)
+            .map(|snapshot| snapshot.epoch())
+            .map_err(|_| ZX_ERR_BAD_HANDLE)
     }
 
     pub(crate) fn validate_current_user_ptr(&self, ptr: u64, len: usize) -> bool {

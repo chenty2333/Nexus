@@ -45,6 +45,14 @@ pub const AXLE_SYS_HANDLE_DUPLICATE: SyscallNumber = 18;
 /// Contract: SHOULD
 pub const AXLE_SYS_HANDLE_REPLACE: SyscallNumber = 19;
 /// Contract: SHOULD
+pub const AXLE_SYS_AX_REVOCATION_GROUP_CREATE: SyscallNumber = 79;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_REVOCATION_GROUP_GET_INFO: SyscallNumber = 80;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_REVOCATION_GROUP_REVOKE: SyscallNumber = 81;
+/// Contract: SHOULD
+pub const AXLE_SYS_AX_HANDLE_DUPLICATE_REVOCABLE: SyscallNumber = 82;
+/// Contract: SHOULD
 pub const AXLE_SYS_OBJECT_SIGNAL: SyscallNumber = 20;
 /// Contract: SHOULD
 pub const AXLE_SYS_FUTEX_WAIT: SyscallNumber = 21;

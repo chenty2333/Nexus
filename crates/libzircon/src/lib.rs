@@ -38,8 +38,8 @@ pub use axle_types::{
     zx_duration_t, zx_futex_t, zx_handle_t, zx_interrupt_info_t, zx_koid_t, zx_packet_signal_t,
     zx_packet_type_t, zx_packet_user_t, zx_pci_bar_info_t, zx_pci_config_info_t,
     zx_pci_device_info_t, zx_pci_interrupt_info_t, zx_pci_interrupt_mode_info_t,
-    zx_pci_resource_info_t, zx_port_info_t, zx_port_packet_t, zx_rights_t, zx_signals_t,
-    zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t, zx_vmo_info_t,
+    zx_pci_resource_info_t, zx_port_info_t, zx_port_packet_t, zx_revocation_group_info_t,
+    zx_rights_t, zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t, zx_vmo_info_t,
 };
 
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
@@ -50,14 +50,16 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_AX_DMA_REGION_GET_SEGMENT, AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA,
     AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR, AXLE_SYS_AX_GUEST_SESSION_CREATE,
     AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY, AXLE_SYS_AX_GUEST_SESSION_RESUME,
-    AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY, AXLE_SYS_AX_INTERRUPT_TRIGGER,
-    AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG,
-    AXLE_SYS_AX_PCI_DEVICE_GET_INFO, AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT,
-    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE, AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE,
-    AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE_COUNT, AXLE_SYS_AX_PCI_DEVICE_SET_COMMAND,
-    AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE, AXLE_SYS_AX_PORT_GET_INFO,
-    AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC, AXLE_SYS_AX_PROCESS_PREPARE_START,
-    AXLE_SYS_AX_PROCESS_START_GUEST, AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
+    AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY, AXLE_SYS_AX_HANDLE_DUPLICATE_REVOCABLE,
+    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_PCI_DEVICE_GET_BAR,
+    AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG, AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
+    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT, AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE,
+    AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE, AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE_COUNT,
+    AXLE_SYS_AX_PCI_DEVICE_SET_COMMAND, AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE,
+    AXLE_SYS_AX_PORT_GET_INFO, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
+    AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
+    AXLE_SYS_AX_REVOCATION_GROUP_CREATE, AXLE_SYS_AX_REVOCATION_GROUP_GET_INFO,
+    AXLE_SYS_AX_REVOCATION_GROUP_REVOKE, AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
     AXLE_SYS_AX_THREAD_SET_GUEST_X64_FS_BASE, AXLE_SYS_AX_THREAD_START_GUEST,
     AXLE_SYS_AX_VMAR_CLONE_MAPPINGS, AXLE_SYS_AX_VMAR_GET_MAPPING_VMO, AXLE_SYS_AX_VMO_GET_INFO,
     AXLE_SYS_AX_VMO_LOOKUP_PADDR, AXLE_SYS_AX_VMO_PIN, AXLE_SYS_AX_VMO_PROMOTE_SHARED,
@@ -130,6 +132,60 @@ pub fn ax_port_get_info(handle: zx_handle_t, out: &mut zx_port_info_t) -> zx_sta
     native_call(
         AXLE_SYS_AX_PORT_GET_INFO as u64,
         [handle, out as *mut zx_port_info_t as u64, 0, 0, 0, 0],
+    )
+}
+
+/// Create a revocation-group handle.
+pub fn ax_revocation_group_create(options: u32, out: &mut zx_handle_t) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_REVOCATION_GROUP_CREATE as u64,
+        [options as u64, out as *mut zx_handle_t as u64, 0, 0, 0, 0],
+    )
+}
+
+/// Query revocation-group metadata.
+pub fn ax_revocation_group_get_info(
+    handle: zx_handle_t,
+    out: &mut zx_revocation_group_info_t,
+) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_REVOCATION_GROUP_GET_INFO as u64,
+        [
+            handle,
+            out as *mut zx_revocation_group_info_t as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Increment one revocation group's epoch.
+pub fn ax_revocation_group_revoke(handle: zx_handle_t) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_REVOCATION_GROUP_REVOKE as u64,
+        [handle, 0, 0, 0, 0, 0],
+    )
+}
+
+/// Duplicate one handle and bind the duplicate to a revocation group.
+pub fn ax_handle_duplicate_revocable(
+    handle: zx_handle_t,
+    rights: zx_rights_t,
+    group: zx_handle_t,
+    out: &mut zx_handle_t,
+) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_HANDLE_DUPLICATE_REVOCABLE as u64,
+        [
+            handle,
+            rights as u64,
+            group,
+            out as *mut zx_handle_t as u64,
+            0,
+            0,
+        ],
     )
 }
 

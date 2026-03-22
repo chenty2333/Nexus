@@ -49,10 +49,26 @@ The current `KernelObject` enum includes:
 - `Interrupt`
 - `PciDevice`
 - `DmaRegion`
+- `RevocationGroup`
 - `Vmo`
 - `Vmar`
 
-There is no public Job object, Resource object, or Revoker object yet.
+There is no public Job object or Resource object yet.
+
+Current revocation-group shape:
+
+- `RevocationGroup` is one narrow governance/control object
+- it is not waitable
+- it currently exports:
+  - one metadata query through `ax_revocation_group_get_info()`:
+    - stable `group_id`
+    - token generation
+    - current epoch
+  - one revoke path through `ax_revocation_group_revoke()`:
+    - revoke = `epoch++`
+    - any delegated handle carrying an older epoch snapshot fails future lookup
+- ordinary handles only become revocable when userspace explicitly creates one delegated copy
+  through `ax_handle_duplicate_revocable()`
 
 Current interrupt shape:
 
@@ -229,6 +245,7 @@ The object layer assigns default rights per object family, for example:
 - interrupt: duplicate, transfer, wait, write
 - pci-device: duplicate, transfer, inspect
 - dma-region: duplicate, transfer, inspect
+- revocation-group: duplicate, transfer, inspect, write
 - process/thread: duplicate, transfer, wait, inspect, manage-*
 - guest-session: duplicate, transfer, read, write
 - vmo/vmar: duplicate, transfer, read, map, plus write where supported
