@@ -35,3 +35,5 @@ README.md
 # Fuzzing outputs
 **/fuzz/corpus/
 **/fuzz/artifacts/
+
+.claude
