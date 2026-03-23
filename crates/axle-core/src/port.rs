@@ -10,6 +10,7 @@
 //! queue and readiness surface.
 
 use alloc::collections::VecDeque;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::capability::ObjectKey;
