@@ -628,6 +628,20 @@ pub fn ax_vmo_get_info(handle: ax_handle_t, out_info: &mut ax_vmo_info_t) -> ax_
     }
 }
 
+/// Create one object-level private clone from a shared COW-capable source VMO.
+pub fn ax_vmo_create_private_clone(handle: ax_handle_t, out: &mut ax_handle_t) -> ax_status_t {
+    let raw = match narrow_handle(handle) {
+        Ok(raw) => raw,
+        Err(status) => return status,
+    };
+    let mut raw_out = libzircon::handle::ZX_HANDLE_INVALID;
+    let status = libzircon::ax_vmo_create_private_clone(raw, &mut raw_out);
+    if status == AX_OK {
+        *out = widen_handle(raw_out);
+    }
+    status
+}
+
 /// Promote one local-private VMO object to the shared/global backing domain.
 pub fn ax_vmo_promote_shared(handle: ax_handle_t) -> ax_status_t {
     match narrow_handle(handle) {

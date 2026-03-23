@@ -874,11 +874,22 @@ const SLOT_DGRAM_PAGE_WRITE: usize = 1107;
 const SLOT_DGRAM_PAGE_READ: usize = 1108;
 const SLOT_DGRAM_PAGE_READ_ACTUAL: usize = 1109;
 const SLOT_DGRAM_PAGE_MATCH: usize = 1110;
+const SLOT_VMO_PRIVATE_OBJECT_PRESENT: usize = 1121;
+const SLOT_VMO_PRIVATE_OBJECT_FAILURE_STEP: usize = 1122;
+const SLOT_VMO_PRIVATE_OBJECT_SOURCE_INFO: usize = 1123;
+const SLOT_VMO_PRIVATE_OBJECT_CLONE_CREATE: usize = 1124;
+const SLOT_VMO_PRIVATE_OBJECT_CLONE_INFO: usize = 1125;
+const SLOT_VMO_PRIVATE_OBJECT_PREFIX_MATCH: usize = 1126;
+const SLOT_VMO_PRIVATE_OBJECT_CLONE_WRITE: usize = 1127;
+const SLOT_VMO_PRIVATE_OBJECT_CLONE_READ_AFTER: usize = 1128;
+const SLOT_VMO_PRIVATE_OBJECT_SOURCE_UNCHANGED: usize = 1129;
+const SLOT_VMO_PRIVATE_OBJECT_CLONE_RESIZE: usize = 1130;
+const SLOT_VMO_PRIVATE_OBJECT_CLONE_SIZE_AFTER: usize = 1131;
 const SLOT_SELF_JOB_H: usize = 1106;
 const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
 const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_DGRAM_PAGE_MATCH;
+const SLOT_MAX: usize = SLOT_VMO_PRIVATE_OBJECT_CLONE_SIZE_AFTER;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1851,6 +1862,10 @@ fn vmo_private_clone_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_VMO_PRIVATE_CLONE_PRESENT] != 0 || slots[SLOT_VMO_PRIVATE_CLONE_FAILURE_STEP] != 0
 }
 
+fn vmo_private_object_summary_present(slots: &[u64]) -> bool {
+    slots[SLOT_VMO_PRIVATE_OBJECT_PRESENT] != 0 || slots[SLOT_VMO_PRIVATE_OBJECT_FAILURE_STEP] != 0
+}
+
 fn smp_summary_present(slots: &[u64]) -> bool {
     slots[SLOT_SMP_SMOKE_PRESENT] != 0
 }
@@ -2334,6 +2349,23 @@ fn print_vmo_private_clone_summary(slots: &[u64]) {
     );
 }
 
+fn print_vmo_private_object_summary(slots: &[u64]) {
+    crate::kprintln!(
+        "kernel: vmo private object clone smoke (vmo_private_object_present={}, vmo_private_object_failure_step={}, vmo_private_object_source_info={}, vmo_private_object_clone_create={}, vmo_private_object_clone_info={}, vmo_private_object_prefix_match={}, vmo_private_object_clone_write={}, vmo_private_object_clone_read_after={}, vmo_private_object_source_unchanged={}, vmo_private_object_clone_resize={}, vmo_private_object_clone_size_after={})",
+        slots[SLOT_VMO_PRIVATE_OBJECT_PRESENT],
+        slots[SLOT_VMO_PRIVATE_OBJECT_FAILURE_STEP],
+        slots[SLOT_VMO_PRIVATE_OBJECT_SOURCE_INFO] as i64,
+        slots[SLOT_VMO_PRIVATE_OBJECT_CLONE_CREATE] as i64,
+        slots[SLOT_VMO_PRIVATE_OBJECT_CLONE_INFO] as i64,
+        slots[SLOT_VMO_PRIVATE_OBJECT_PREFIX_MATCH],
+        slots[SLOT_VMO_PRIVATE_OBJECT_CLONE_WRITE] as i64,
+        slots[SLOT_VMO_PRIVATE_OBJECT_CLONE_READ_AFTER],
+        slots[SLOT_VMO_PRIVATE_OBJECT_SOURCE_UNCHANGED],
+        slots[SLOT_VMO_PRIVATE_OBJECT_CLONE_RESIZE] as i64,
+        slots[SLOT_VMO_PRIVATE_OBJECT_CLONE_SIZE_AFTER],
+    );
+}
+
 fn print_smp_summary(slots: &[u64]) {
     crate::kprintln!(
         "kernel: smp smoke ok (present={}, status={})",
@@ -2469,6 +2501,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         if vmo_private_clone_summary_present(slots) {
             print_vmo_private_clone_summary(slots);
         }
+        if vmo_private_object_summary_present(slots) {
+            print_vmo_private_object_summary(slots);
+        }
         if smp_summary_present(slots) {
             print_smp_summary(slots);
         }
@@ -2519,6 +2554,9 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
     }
     if vmo_private_clone_summary_present(slots) {
         print_vmo_private_clone_summary(slots);
+    }
+    if vmo_private_object_summary_present(slots) {
+        print_vmo_private_object_summary(slots);
     }
     if smp_summary_present(slots) {
         print_smp_summary(slots);

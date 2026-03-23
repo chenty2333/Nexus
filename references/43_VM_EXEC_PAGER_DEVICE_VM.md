@@ -98,13 +98,24 @@ Current state:
   - bootstrap code-image VMOs report `PagerBacked + GlobalShared`
   - staged shared-anonymous `GetVmo` handles report `Anonymous + GlobalShared`
   - anonymous private-clone destinations report `Anonymous + LocalPrivate`
-  - the public fields are still limited to logical size, kind, backing scope,
-    and stable behavior flags
+  - the public fields now include:
+    - logical size
+    - kind
+    - backing scope
+    - stable behavior flags
+    - effective handle rights for the queried handle
 - the bootstrap shared-handle gate now also freezes the current source-handle
   access pattern for pager-backed/file-backed VMOs:
   - readable
   - not directly writable
   - not directly resizable
+- one narrow object-level private-shadow helper now also exists through
+  `ax_vmo_create_private_clone()`:
+  - it accepts one shared COW-capable source handle
+  - it returns one `Anonymous + LocalPrivate` VMO handle
+  - the clone begins with the source bytes visible through direct `vmo_read()`
+  - later direct `vmo_write()` / `vmo_set_size()` apply only to the clone and
+    leave the shared source unchanged
 - the bootstrap private-clone gate now also freezes the current source-vs-shadow
   split for shared pager-backed source handles:
   - one `ZX_VM_PRIVATE_CLONE` mapping may install a writable mapping-local view
@@ -124,13 +135,17 @@ What is not complete yet:
 - pager-backed VMOs are still only a narrow user-facing contract:
   - read-only shared handles
   - writable private-clone mappings
+  - writable object-level private clones
 - `ax_vmo_get_info()` is query-only:
   - it does not externalize one pager object
   - it does not provide a public write / resize / dirty-page interface for
     pager-backed objects
 - there is no external pager object or full file-backed VMO interface
-- write/resize semantics for pager-backed objects are not public beyond
-  mapping-local private-clone faults
+- write/resize semantics for pager-backed objects are still intentionally
+  narrow:
+  - object-level private clones
+  - mapping-local private-clone faults
+  and not one shared-source dirty/writeback interface
 - the generic VMAR clone helper now exists only for the first root-direct
   mapping slice plus the current heap/mmap backing-handle follow-on:
   - mapping-level clone policy is now part of VM truth
@@ -247,7 +262,10 @@ What is still intentionally narrow:
 - Treat execute mappings as part of the supported phase-one VM contract rather than bootstrap-only
   metadata.
 - Treat pager-backed/file-backed support as one narrow page-object contract:
-  shared read-only source plus mapping-local private shadow on write.
+  shared read-only source plus:
+  - mapping-local private shadow on write
+  - one object-level private clone helper when userspace needs direct
+    write/resize semantics on a detached shadow object
 - Treat `ax_vmo_get_info()` as the current public metadata face of that
   contract, not as evidence that pager/file-backed objects are already fully
   externalized.

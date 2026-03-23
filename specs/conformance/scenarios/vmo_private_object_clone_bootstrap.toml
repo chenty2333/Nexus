@@ -1,0 +1,33 @@
+id = "kernel.vmo.private_object_clone_bootstrap"
+description = "Bootstrap shared COW-capable VMO source handles should support object-level private clone creation with direct write/resize semantics"
+tags = ["kernel", "runtime", "vm", "vmo", "bootstrap"]
+timeout_ms = 180000
+
+command = [
+  "bash",
+  "-c",
+  "target_dir=target/conformance/vmo-private-object-clone && cargo build -p axle-kernel --target x86_64-unknown-none --target-dir \"$target_dir\" && AXLE_TEST_RUNNER_RUST_ENTRY=vmo_private_object_clone_smoke RUSTFLAGS='-C code-model=large' cargo build -p nexus-test-runner --target x86_64-unknown-none --target-dir \"$target_dir\" && runner_src=\"$target_dir/x86_64-unknown-none/debug/nexus-test-runner\" && runner=$(mktemp /tmp/nexus-test-runner-XXXXXX) && cp \"$runner_src\" \"$runner\" && size=$(stat -c%s \"$runner\") && { timeout --foreground 20s qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file=\"$runner\",addr=0x7000000,force-raw=on -device loader,data=$size,data-len=8,addr=0x6fffff8 -kernel \"$target_dir/x86_64-unknown-none/debug/axle-kernel\"; qemu_code=$?; echo qemu_exit=$qemu_code; [ \"$qemu_code\" -eq 33 ]; }"
+]
+
+expect = [
+  "kernel: vmo private object clone smoke",
+]
+forbid = ["KERNEL PANIC"]
+contracts = ["should.vmo.private_object_clone_bootstrap_contract"]
+
+[assertions.status_code]
+vmo_private_object_source_info = 0
+vmo_private_object_clone_create = 0
+vmo_private_object_clone_info = 0
+vmo_private_object_clone_write = 0
+vmo_private_object_clone_resize = 0
+
+[assertions.packet_fields]
+vmo_private_object_present = 1
+vmo_private_object_failure_step = 0
+vmo_private_object_prefix_match = 1
+vmo_private_object_clone_read_after = 1
+vmo_private_object_source_unchanged = 1
+
+[assertions.packet_fields_min]
+vmo_private_object_clone_size_after = 4096

@@ -173,7 +173,12 @@ The current bootstrap syscall surface includes:
     - VMO kind (`Anonymous` / `Physical` / `Contiguous` / `PagerBacked`)
     - backing scope (`LocalPrivate` / `GlobalShared`)
     - behavior flags such as resizable / COW-capable / kernel-readable
+    - effective handle rights for the queried VMO handle
     - it does not expose hot residency, dirty state, or per-page fault truth
+  - `ax_vmo_create_private_clone()` is now the first narrow object-level private-shadow helper:
+    - it clones one shared COW-capable source into one new local-private anonymous VMO
+    - the clone starts as a byte-identical snapshot of the source
+    - direct `vmo_write()` / `vmo_set_size()` then apply to that clone without mutating the source
   - `ax_vmo_promote_shared()` is now the first narrow control-plane promotion hook
     over that same VMO family:
     - it upgrades one local-private VMO object to the shared/global backing domain

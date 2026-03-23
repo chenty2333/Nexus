@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axle_arch_x86_64::debug_break;
 use libzircon::handle::ZX_HANDLE_INVALID;
+use libzircon::rights::{ZX_RIGHT_MAP, ZX_RIGHT_READ, ZX_RIGHT_WRITE};
 use libzircon::status::ZX_OK;
 use libzircon::vmo::{
     ZX_VMO_BACKING_SCOPE_GLOBAL_SHARED, ZX_VMO_BACKING_SCOPE_LOCAL_PRIVATE,
@@ -148,6 +149,8 @@ fn run_vmo_info_smoke() -> VmoInfoSummary {
         || anon_info.kind != ZX_VMO_KIND_ANONYMOUS
         || anon_info.backing_scope != ZX_VMO_BACKING_SCOPE_LOCAL_PRIVATE
         || anon_info.flags != ANON_EXPECTED_FLAGS
+        || (anon_info.rights & (ZX_RIGHT_READ | ZX_RIGHT_MAP | ZX_RIGHT_WRITE))
+            != (ZX_RIGHT_READ | ZX_RIGHT_MAP | ZX_RIGHT_WRITE)
         || anon_info.size_bytes != ANON_VMO_SIZE
     {
         summary.failure_step = STEP_VMO_INFO;
@@ -173,6 +176,8 @@ fn run_vmo_info_smoke() -> VmoInfoSummary {
         || boot_info.kind != ZX_VMO_KIND_PAGER_BACKED
         || boot_info.backing_scope != ZX_VMO_BACKING_SCOPE_GLOBAL_SHARED
         || boot_info.flags != BOOT_EXPECTED_FLAGS
+        || (boot_info.rights & (ZX_RIGHT_READ | ZX_RIGHT_MAP)) != (ZX_RIGHT_READ | ZX_RIGHT_MAP)
+        || (boot_info.rights & ZX_RIGHT_WRITE) != 0
         || boot_info.size_bytes == 0
     {
         summary.failure_step = STEP_BOOT_CODE_INFO;

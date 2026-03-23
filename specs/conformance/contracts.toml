@@ -129,7 +129,7 @@ description = "zx_vmo_create must reject bad bootstrap arguments and return a no
 [[contracts]]
 id = "should.vmo.info_bootstrap_narrow_contract"
 level = "should"
-description = "ax_vmo_get_info must expose the current narrow public VMO contract for anonymous private objects and shared pager-backed image sources"
+description = "ax_vmo_get_info must expose the current narrow public VMO contract for anonymous private objects and shared pager-backed image sources, including effective handle rights"
 
 [[contracts]]
 id = "must.vmar.map_protect_unmap_bootstrap"
@@ -384,6 +384,11 @@ description = "Fresh anonymous VMOs should report LocalPrivate before cross-proc
 id = "should.vmo.private_clone_source_shadow_contract"
 level = "should"
 description = "PRIVATE_CLONE mappings over shared source handles should preserve the shared source bytes/info while writes become visible only through the mapping-local private shadow"
+
+[[contracts]]
+id = "should.vmo.private_object_clone_bootstrap_contract"
+level = "should"
+description = "Shared COW-capable VMO source handles should support one object-level private clone that starts as a byte-identical local-private VMO and then allows direct write/resize without mutating the source"
 
 [[contracts]]
 id = "should.socket.stream_basics_bootstrap"

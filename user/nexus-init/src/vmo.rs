@@ -1,6 +1,7 @@
 use alloc::vec;
 
 use axle_types::status::{ZX_ERR_ACCESS_DENIED, ZX_OK};
+use libzircon::rights::{ZX_RIGHT_MAP, ZX_RIGHT_READ, ZX_RIGHT_WRITE};
 use libzircon::vmo::{ZX_VMO_BACKING_SCOPE_GLOBAL_SHARED, ZX_VMO_KIND_ANONYMOUS, zx_vmo_info_t};
 use libzircon::{ax_vmo_get_info, zx_handle_close, zx_vmo_read, zx_vmo_set_size, zx_vmo_write};
 use nexus_io::{OpenFlags, VmoFlags};
@@ -114,6 +115,8 @@ fn run_shared_source_contract() -> StagedSharedVmoSummary {
     }
     if info.kind != ZX_VMO_KIND_ANONYMOUS
         || info.backing_scope != ZX_VMO_BACKING_SCOPE_GLOBAL_SHARED
+        || (info.rights & (ZX_RIGHT_READ | ZX_RIGHT_MAP)) != (ZX_RIGHT_READ | ZX_RIGHT_MAP)
+        || (info.rights & ZX_RIGHT_WRITE) != 0
         || info.size_bytes < ROOT_DECL_VMO_SHARED_BYTES.len() as u64
         || summary.info_size_page_aligned != 1
     {

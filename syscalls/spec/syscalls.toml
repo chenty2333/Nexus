@@ -329,6 +329,16 @@ args = [
 ]
 
 [[syscall]]
+name = "ax_vmo_create_private_clone"
+nr = 87
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "source", ty = "ax_handle_t" },
+  { name = "out", ty = "*mut ax_handle_t" },
+]
+
+[[syscall]]
 name = "object_signal"
 nr = 20
 should = true

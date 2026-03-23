@@ -1038,8 +1038,8 @@ pub mod vmo {
         pub backing_scope: u32,
         /// Capability/behavior flags for this VMO kind.
         pub flags: u32,
-        /// Reserved for later expansion.
-        pub reserved0: u32,
+        /// Effective handle rights visible through this queried handle.
+        pub rights: crate::ax_rights_t,
     }
 
     /// Frozen Zircon-compat alias over the native VMO-info record.

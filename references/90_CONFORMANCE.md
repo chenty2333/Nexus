@@ -194,12 +194,14 @@ That host gate now explicitly covers:
     - `Anonymous`
     - `LocalPrivate`
     - resizable + COW-capable + kernel-readable/kernel-writable flags
+    - effective read/map/write handle rights
     - size `4096`
   - one bootstrap code-image VMO must report the current public
     pager-backed/shared object contract:
     - `PagerBacked`
     - `GlobalShared`
     - read-only shared behavior flags
+    - effective read/map-visible but non-writeable handle rights
     - non-zero logical size
 - Bootstrap VM coverage now also includes one narrow shared-handle behavior
   gate:
@@ -216,6 +218,7 @@ That host gate now explicitly covers:
   - one `/boot/...` staged shared-anonymous `GetVmo` handle must prove the
     current public source-handle contract:
     - `ax_vmo_get_info()` reports `Anonymous + GlobalShared`
+    - the reported effective rights stay read/map-visible and non-writeable
     - the exported size is page-aligned and large enough for the staged asset
     - `vmo_read()` succeeds and the bytes match the boot asset payload
     - direct `vmo_write()` returns `ZX_ERR_ACCESS_DENIED`
@@ -394,6 +397,17 @@ That host gate now explicitly covers:
     - `ax_job_set_policy()` narrows the root job's rights ceiling
     - later `zx_handle_duplicate()` calls under that process observe the cached rights ceiling and
       lose stripped rights such as `WAIT`
+- Bootstrap VMO metadata/source coverage now also includes one object-level
+  private-clone gate:
+  - `kernel.vmo.private_object_clone_bootstrap`
+  - one shared pager-backed source handle must now prove:
+    - `ax_vmo_get_info()` reports read/map-visible but non-writeable effective rights on that
+      source handle
+    - `ax_vmo_create_private_clone()` returns one `Anonymous + LocalPrivate` object
+    - the clone initially reads the same bytes as the source
+    - direct `vmo_write()` mutates the clone only
+    - direct `vmo_set_size()` succeeds on the clone only
+    - bytes read back through the source handle remain unchanged
 - Bootstrap socket coverage now also includes one narrow datagram gate:
   - datagram create succeeds through the normal socket object family
   - one peek/read pair proves message preservation without stream fallback

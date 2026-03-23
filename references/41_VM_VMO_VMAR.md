@@ -41,6 +41,7 @@ This file describes the current VMO, VMAR, VMA, and address-space control-plane 
   - kind
   - backing scope
   - stable behavior flags such as resizable / COW-capable / kernel-readable
+  - effective rights on the queried handle
 - Hot page state is not cached in the object layer.
 - `MapRec` is the coarse mapping/control-plane identity:
   - `(address_space, vmar_id, map_id, va range)`
@@ -81,8 +82,14 @@ Current user-facing object creation is much narrower:
   the physical address backing one physical/contiguous VMO offset.
 - `ax_vmo_get_info(handle, out_info)` is the first narrow public object-level metadata query over
   those same VMO families:
-  - it reports size / kind / backing scope / behavior flags
+  - it reports size / kind / backing scope / behavior flags / effective rights
   - it intentionally does not expose live residency, dirty/writeback state, or per-page mappings
+- `ax_vmo_create_private_clone(source, out)` is now the first narrow object-level
+  private-shadow helper:
+  - it requires one shared COW-capable source handle
+  - it returns one new `Anonymous + LocalPrivate` VMO handle seeded with the
+    current source bytes
+  - later direct write/resize apply to that clone only and do not mutate the shared source
 - `ax_vmo_promote_shared(handle)` is now the first narrow control-plane promotion hook over
   anonymous VMOs:
   - it upgrades one local-private VMO object into the shared/global backing domain

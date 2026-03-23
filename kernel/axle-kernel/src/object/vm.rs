@@ -260,11 +260,70 @@ pub fn vmo_get_info(handle: zx_handle_t) -> Result<axle_types::vmo::ax_vmo_info_
                 kind: encode_vmo_kind(vmo.kind()),
                 backing_scope: encode_vmo_backing_scope(vmo.backing_scope()),
                 flags: encode_vmo_flags(vmo.kind()),
-                reserved0: 0,
+                rights: resolved.rights().bits(),
             }),
             Some(_) => Err(ZX_ERR_WRONG_TYPE),
             None => Err(ZX_ERR_BAD_HANDLE),
         })
+    })
+}
+
+/// Create one object-level private clone from a shared COW-capable source VMO.
+pub fn vmo_create_private_clone(handle: zx_handle_t) -> Result<zx_handle_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::READ)?;
+        let source = state.with_objects(|objects| match objects.get(resolved.object_key()) {
+            Some(KernelObject::Vmo(vmo)) => Ok(vmo.clone()),
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        })?;
+        if !matches!(source.backing_scope(), VmoBackingScope::GlobalShared)
+            || !source.kind().supports_copy_on_write()
+            || !source.kind().supports_kernel_read()
+        {
+            return Err(ZX_ERR_NOT_SUPPORTED);
+        }
+
+        let size = source.size_bytes();
+        let global_vmo_id = state.with_core_mut(|kernel| Ok(kernel.allocate_global_vmo_id()))?;
+        let created = match state
+            .with_core_mut(|kernel| kernel.create_current_anonymous_vmo(size, global_vmo_id))
+        {
+            Ok(created) => created,
+            Err(status) => return Err(status),
+        };
+        let object_id = state.alloc_object_id();
+        let target_vmo = VmoObject {
+            creator_process_id: created.process_id(),
+            global_vmo_id: created.global_vmo_id(),
+            backing_scope: VmoBackingScope::LocalPrivate {
+                owner_address_space_id: created.address_space_id(),
+                local_vmo_id: created.vmo_id(),
+            },
+            kind: axle_mm::VmoKind::Anonymous,
+            size_bytes: created.size_bytes(),
+            image_layout: None,
+        };
+        let source_bytes = state.with_core(|kernel| {
+            kernel.vm_handle().read_vmo_bytes(
+                &source,
+                0,
+                usize::try_from(size).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+            )
+        })?;
+        state.with_vm_mut(|vm| vm.write_vmo_bytes(&target_vmo, 0, &source_bytes))?;
+        state.with_objects_mut(|objects| {
+            objects.insert(object_id, KernelObject::Vmo(target_vmo.clone()))?;
+            Ok(())
+        })?;
+
+        match state.alloc_handle_for_object(object_id, handle::vmo_default_rights()) {
+            Ok(handle) => Ok(handle),
+            Err(err) => {
+                let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
+                Err(err)
+            }
+        }
     })
 }
 

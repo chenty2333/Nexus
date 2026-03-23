@@ -61,6 +61,8 @@ pub const AXLE_SYS_AX_JOB_GET_INFO: SyscallNumber = 85;
 /// Contract: SHOULD
 pub const AXLE_SYS_AX_JOB_SET_POLICY: SyscallNumber = 86;
 /// Contract: SHOULD
+pub const AXLE_SYS_AX_VMO_CREATE_PRIVATE_CLONE: SyscallNumber = 87;
+/// Contract: SHOULD
 pub const AXLE_SYS_OBJECT_SIGNAL: SyscallNumber = 20;
 /// Contract: SHOULD
 pub const AXLE_SYS_FUTEX_WAIT: SyscallNumber = 21;
