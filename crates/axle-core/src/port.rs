@@ -192,8 +192,7 @@ struct PortTelemetryState {
 
 impl PortTelemetryState {
     fn new(capacity: usize) -> Self {
-        let mut depth_hist = Vec::new();
-        depth_hist.resize(capacity.saturating_add(1), 0);
+        let depth_hist = vec![0; capacity.saturating_add(1)];
         let mut state = Self {
             current_depth: 0,
             peak_depth: 0,
