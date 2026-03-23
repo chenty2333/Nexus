@@ -62,7 +62,7 @@ impl Kernel {
         if self.cpu_runnable_load(donor_cpu_id) <= 1 {
             return;
         }
-        let Some(idle_cpu_id) = self.first_idle_cpu_excluding(donor_cpu_id) else {
+        let Some(idle_cpu_id) = self.donation_receiver_cpu_excluding(donor_cpu_id) else {
             return;
         };
         if self

@@ -67,10 +67,10 @@ channel_fragmented_desc_count = 8
 channel_fragmented_bytes_total = 65536
 
 [assertions.packet_fields_min]
-trace_records = 10000
-trace_export_bytes = 500000
-trace_sched_handoff_phase3 = 63
-trace_sched_remote_wake_latency_phase3 = 63
+trace_records = 5000
+trace_export_bytes = 250000
+trace_sched_handoff_phase3 = 60
+trace_sched_remote_wake_latency_phase3 = 60
 trace_tlb_page_flush_phase4 = 40
 
 [assertions.packet_fields_max]

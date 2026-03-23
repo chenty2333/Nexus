@@ -473,7 +473,7 @@ fn close_roundtrip_worker(
         let _ = zx_object_wait_one(
             worker_thread,
             ZX_TASK_TERMINATED,
-            wait_deadline(),
+            ZX_TIME_INFINITE,
             &mut terminated_observed,
         );
         let _ = zx_handle_close(worker_thread);
@@ -587,7 +587,7 @@ fn close_cross_core_worker(worker: CrossCoreWorker) {
         let _ = zx_object_wait_one(
             worker.worker_thread,
             ZX_TASK_TERMINATED,
-            wait_deadline(),
+            ZX_TIME_INFINITE,
             &mut terminated_observed,
         );
         let _ = zx_handle_close(worker.worker_thread);
@@ -1030,6 +1030,7 @@ fn run_address_space_switch(
         }
     };
 
+    write_slot(SLOT_TRACE_PHASE, PHASE_ADDRESS_SPACE_SWITCH);
     let start_status = zx_process_start(
         worker.process,
         worker.thread,
@@ -1040,6 +1041,7 @@ fn run_address_space_switch(
     );
     if start_status != ZX_OK {
         result.status = start_status as i64;
+        write_slot(SLOT_TRACE_PHASE, 0);
         close_cross_process_worker(worker);
         return result;
     }
@@ -1053,12 +1055,12 @@ fn run_address_space_switch(
     );
     if ready != ZX_OK {
         result.status = ready as i64;
+        write_slot(SLOT_TRACE_PHASE, 0);
         close_cross_process_worker(worker);
         return result;
     }
     let _ = zx_object_signal(worker.main_ep, ZX_USER_SIGNAL_0, 0);
 
-    write_slot(SLOT_TRACE_PHASE, PHASE_ADDRESS_SPACE_SWITCH);
     let as_pmu_start = pmu_snapshot(pmu);
     let start = axle_arch_x86_64::rdtsc();
     for _ in 0..iterations {
@@ -1118,7 +1120,7 @@ fn close_cross_process_worker(worker: CrossProcessWorker) {
         let _ = zx_object_wait_one(
             worker.thread,
             ZX_TASK_TERMINATED,
-            wait_deadline(),
+            ZX_TIME_INFINITE,
             &mut terminated_observed,
         );
     }

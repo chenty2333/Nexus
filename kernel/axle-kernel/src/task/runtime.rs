@@ -714,7 +714,7 @@ impl Kernel {
             arg0,
             arg1,
             StartPlacementPolicy::PreserveAffinity,
-            false,
+            true,
         );
         if result.is_err() {
             let process = self

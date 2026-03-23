@@ -98,6 +98,12 @@ impl Kernel {
 
     pub(crate) fn requeue_current_thread(&mut self) -> Result<(), zx_status_t> {
         let thread_id = self.current_thread_id()?;
+        if let Some(thread) = self.threads.get_mut(&thread_id) {
+            thread.queued_on_cpu = None;
+            thread.remote_wake_enqueued_ns = None;
+            thread.remote_wake_source_cpu = None;
+            thread.remote_wake_target_cpu = None;
+        }
         self.enqueue_runnable_thread_on_cpu(thread_id, self.current_cpu_id())
     }
 

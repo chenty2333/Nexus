@@ -531,7 +531,7 @@ pub fn start_thread_guest(
             })
         })?;
 
-        state.with_kernel_mut(|kernel| kernel.start_thread_guest(thread.thread_id, regs))
+        state.with_kernel_mut(|kernel| kernel.start_thread_guest(thread.thread_id, regs, false))
     })
 }
 

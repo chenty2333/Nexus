@@ -306,6 +306,7 @@ impl Kernel {
         &mut self,
         thread_id: ThreadId,
         regs: &ax_guest_x64_regs_t,
+        allow_idle_spill: bool,
     ) -> Result<(), zx_status_t> {
         let process_id = self
             .threads
@@ -339,6 +340,9 @@ impl Kernel {
             }
             self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
             self.request_reschedule_on_cpu(target_cpu);
+            if allow_idle_spill {
+                self.maybe_nudge_idle_stealer(target_cpu);
+            }
         }
         Ok(())
     }
@@ -366,7 +370,7 @@ impl Kernel {
             return Err(ZX_ERR_BAD_STATE);
         }
         process.state = ProcessState::Started;
-        let result = self.start_thread_guest(thread_id, regs);
+        let result = self.start_thread_guest(thread_id, regs, true);
         if result.is_err() {
             let process = self
                 .processes
@@ -402,6 +406,14 @@ impl Kernel {
         let now = self.current_cpu_now_ns();
         if !resuming_blocked_current {
             self.account_current_runtime_until(now)?;
+        }
+        if resuming_blocked_current && self.current_thread_id().is_err() {
+            if let Some(next_thread_id) = self.pop_runnable_thread() {
+                self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
+                self.sync_current_cpu_tlb_state()?;
+                return Ok(TrapExitDisposition::Complete);
+            }
+            return Ok(TrapExitDisposition::BlockCurrent);
         }
         match self.current_thread()?.state {
             ThreadState::Runnable => {

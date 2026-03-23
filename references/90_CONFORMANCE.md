@@ -156,7 +156,7 @@ That host gate now explicitly covers:
     depending on a second synthetic launch rule
   - the phase-3 wake-path gate is now frozen as a minimum-contract check rather than as one exact
     raw counter:
-    - current native-syscall L0 runs now commonly land in the `55..=60` range for the phase-3
+    - current native-syscall L0 runs now commonly land in the `60..=64` range for the phase-3
       remote-wake / handoff / latency counters on QEMU
     - the summary therefore exports one derived `trace_sched_phase3_ok` bit while still printing
       the raw phase-3 counters for diagnosis

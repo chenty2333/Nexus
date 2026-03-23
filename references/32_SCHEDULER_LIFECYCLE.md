@@ -31,8 +31,11 @@ This file describes the current task-state, scheduler, kill, suspend, and reap b
   eligible CPU.
 - Brand-new threads still inherit the creator CPU as `last_cpu`.
 - `start_thread()` / explicit `zx_thread_start()` may place a brand-new thread onto an already-idle
-  peer CPU when the creator CPU is currently busy, but `start_thread_guest()` and process-start
-  paths stay on the normal preferred-CPU / wake-affine rules.
+  peer CPU when the creator CPU is currently busy.
+- `process_start()` and guest process-start now share the same narrow donation rule:
+  - they still enqueue on the preferred / wake-affine CPU first
+  - but they may donate that brand-new queued child to an idle or hlt-blocked peer CPU when the
+    donor would otherwise keep more than one runnable
 - Basic local time slicing and runtime accounting now exist, and the current L0 fairness /
   load-balance policy is now explicit rather than accidental.
 
@@ -48,7 +51,8 @@ This file describes the current task-state, scheduler, kill, suspend, and reap b
   - if the preferred CPU would exceed that skew bound, the wake goes to the current least-loaded
     eligible CPU instead
   - explicit brand-new `zx_thread_start()` may still spill to an already-idle peer CPU immediately
-  - process-start and guest-start do not use that explicit idle-peer spill rule
+  - `process_start()` and guest process-start do not force immediate peer placement, but they may
+    donate the newly queued child to one idle / hlt-blocked peer under the same narrow donation path
 - Migration is queued-thread-only:
   - the scheduler may move one runnable thread from the donor run-queue tail to a receiver
   - the currently running thread is never migrated directly
@@ -196,7 +200,8 @@ The first "non-bootstrap substrate" scheduler contract is now implemented.
 - Scheduler fairness is still intentionally simple fixed-slice FIFO/RR rather than a richer policy
   such as weighted fairness, vruntime tracking, or EEVDF.
 - The receiver set for general runnable donation is still conservative:
-  - true-idle peers are the immediate migration target
-  - CPUs carrying a blocked current thread are not treated as the generic foreign-runnable receiver
+  - true-idle peers remain the preferred migration target
+  - one hlt-blocked peer CPU with an empty local run queue may also receive a donated brand-new child
+    so process-start does not depend on same-CPU handoff
 - The kernel still has no topology / NUMA-aware balancing layer.
 - L1 remains a documented contract boundary, not an implemented shared-VMO scheduler protocol yet.
