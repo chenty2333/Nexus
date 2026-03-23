@@ -16,6 +16,7 @@ pub(super) struct CpuSchedulerState {
     reschedule_requested: bool,
     current_runtime_started_ns: Option<i64>,
     slice_deadline_ns: Option<i64>,
+    last_rebalance_ns: Option<i64>,
     online: bool,
 }
 
@@ -27,6 +28,7 @@ impl CpuSchedulerState {
             reschedule_requested: false,
             current_runtime_started_ns: Some(now),
             slice_deadline_ns: now.checked_add(DEFAULT_TIME_SLICE_NS),
+            last_rebalance_ns: Some(now),
             online: true,
         }
     }
@@ -57,7 +59,18 @@ impl Kernel {
     }
 
     pub(super) fn maybe_nudge_idle_stealer(&mut self, donor_cpu_id: usize) {
-        let _ = donor_cpu_id;
+        if self.cpu_runnable_load(donor_cpu_id) <= 1 {
+            return;
+        }
+        let Some(idle_cpu_id) = self.first_idle_cpu_excluding(donor_cpu_id) else {
+            return;
+        };
+        if self
+            .migrate_one_runnable_thread(donor_cpu_id, idle_cpu_id)
+            .is_some()
+        {
+            self.request_reschedule_on_cpu(idle_cpu_id);
+        }
     }
 
     pub(crate) fn mark_cpu_online(&mut self, cpu_id: usize) {
@@ -79,6 +92,39 @@ impl Kernel {
         let scheduler = self.current_cpu_scheduler_mut();
         scheduler.current_runtime_started_ns = Some(now);
         scheduler.slice_deadline_ns = now.checked_add(DEFAULT_TIME_SLICE_NS);
+    }
+
+    fn maybe_periodic_rebalance(&mut self, now: i64) {
+        let current_cpu_id = self.current_cpu_id();
+        let should_rebalance = {
+            let scheduler = self.cpu_scheduler_mut(current_cpu_id);
+            match scheduler.last_rebalance_ns {
+                Some(last_ns) if now.saturating_sub(last_ns) < DEFAULT_TIME_SLICE_NS => false,
+                _ => {
+                    scheduler.last_rebalance_ns = Some(now);
+                    true
+                }
+            }
+        };
+        if !should_rebalance {
+            return;
+        }
+
+        let Some((donor_cpu_id, donor_load)) = self.most_loaded_online_cpu() else {
+            return;
+        };
+        let Some((receiver_cpu_id, receiver_load)) = self.least_loaded_online_cpu(None) else {
+            return;
+        };
+        if donor_cpu_id == receiver_cpu_id || donor_load <= receiver_load + 1 {
+            return;
+        }
+        if self
+            .migrate_one_runnable_thread(donor_cpu_id, receiver_cpu_id)
+            .is_some()
+        {
+            self.request_reschedule_on_cpu(receiver_cpu_id);
+        }
     }
 
     pub(super) fn clear_current_slice_state(&mut self) {
@@ -117,6 +163,7 @@ impl Kernel {
         }
         let _ = scheduler;
         self.account_current_runtime_until(now)?;
+        self.maybe_periodic_rebalance(now);
         if self
             .current_cpu_scheduler()?
             .slice_deadline_ns

@@ -2061,6 +2061,13 @@ pub(crate) fn timer_interrupt_requires_trap_exit(now: i64) -> Result<bool, zx_st
     with_kernel_mut(|kernel| kernel.timer_interrupt_requires_trap_exit(now))
 }
 
+pub(crate) fn mark_scheduler_cpu_online(cpu_id: usize) -> Result<(), zx_status_t> {
+    with_kernel_mut(|kernel| {
+        kernel.mark_cpu_online(cpu_id);
+        Ok(())
+    })
+}
+
 #[allow(dead_code)]
 pub(crate) fn resolve_current_futex_key_relaxed(
     user_addr: zx_vaddr_t,

@@ -27,14 +27,70 @@ This file describes the current task-state, scheduler, kill, suspend, and reap b
   - one local runtime-accounting window plus slice deadline
   - an `online` bit used by wakeup targeting
 - Wakeup targeting is now CPU-aware, but scheduling policy is still intentionally simple.
-- Wakeup targeting now honors a thread's preferred / last CPU before falling back to the current
-  CPU or, if that preferred CPU is unavailable, to some other online idle CPU.
+- Wakeup targeting now honors a thread's preferred / last CPU before falling back to a least-loaded
+  eligible CPU.
 - Brand-new threads still inherit the creator CPU as `last_cpu`.
 - `start_thread()` / explicit `zx_thread_start()` may place a brand-new thread onto an already-idle
   peer CPU when the creator CPU is currently busy, but `start_thread_guest()` and process-start
   paths stay on the normal preferred-CPU / wake-affine rules.
-- Basic local time slicing and runtime accounting now exist, but there is still no finished fairness
-  or load-balancing policy layer.
+- Basic local time slicing and runtime accounting now exist, and the current L0 fairness /
+  load-balance policy is now explicit rather than accidental.
+
+## L0 fairness and load balance contract
+
+- Intra-CPU fairness is fixed-slice FIFO/RR:
+  - one runnable current thread runs until it blocks, yields to trap-exit reschedule, or reaches
+    the local slice deadline
+  - timed preemption requeues the current runnable thread at the tail of its local run queue
+- Cross-CPU placement stays intentionally narrow:
+  - ordinary wakeups keep `last_cpu` affinity as long as that choice does not exceed the
+    least-loaded eligible CPU by more than one runnable
+  - if the preferred CPU would exceed that skew bound, the wake goes to the current least-loaded
+    eligible CPU instead
+  - explicit brand-new `zx_thread_start()` may still spill to an already-idle peer CPU immediately
+  - process-start and guest-start do not use that explicit idle-peer spill rule
+- Migration is queued-thread-only:
+  - the scheduler may move one runnable thread from the donor run-queue tail to a receiver
+  - the currently running thread is never migrated directly
+  - blocked-current direct resume remains local and observable rather than being rewritten into
+    generic migration
+- Load-balance triggers are:
+  - enqueue-time idle nudge: if a donor CPU would otherwise hold more than one runnable, one queued
+    runnable may be donated to a true-idle peer CPU
+  - periodic rebalance: once per local slice window, a CPU may compare the most-loaded and
+    least-loaded eligible CPUs and migrate one queued runnable when the donor exceeds the receiver
+    by more than one runnable
+
+## L1 event / decision contract
+
+- L1 remains optional and asynchronous.
+- L0 must never synchronously depend on L1 to complete:
+  - wakeup delivery
+  - pick-next
+  - timeout completion
+  - trap-exit reschedule
+- The current frozen observation surface for future L1 policy is the scheduler trace / telemetry
+  family already exported by the kernel:
+  - run-queue depth changes
+  - handoff counts
+  - steal counts
+  - remote-wake latency
+- The current frozen decision boundary is:
+  - L1 may eventually suggest placement / rebalance / yield-style policy
+  - L0 may ignore or defer those suggestions
+  - L0 correctness, forward progress, and wake visibility may not depend on L1 availability
+
+## Scheduler locality matrix
+
+| Structure | Hot owner | Remote touch shape | Current rule |
+| --- | --- | --- | --- |
+| `CpuSchedulerState.current_thread_id` | local CPU | read for wake targeting / diagnostics | single-writer per CPU |
+| `CpuSchedulerState.run_queue` | local CPU | donor-tail dequeue during narrow migration | queued-thread-only migration |
+| `CpuSchedulerState.reschedule_requested` | target CPU | remote wake / rebalance may set it | cross-CPU IPI-visible flag |
+| `Thread.last_cpu` | last running CPU | read during wake placement | updated on activation |
+| `Thread.queued_on_cpu` | queue owner CPU | read/retarget during migration | one runnable queue owner at a time |
+| `Thread.runtime_ns` | local running CPU | diagnostics only | accumulated on local tick / trap-exit accounting |
+| remote-wake timestamps | target CPU activation path | written by wake/migrate source, consumed by receiver | latency-only accounting, not ownership |
 
 ## Current thread states
 
@@ -135,12 +191,12 @@ The first "non-bootstrap substrate" scheduler contract is now implemented.
 ## Current limitations
 
 - Blocked current execution still relies on `sti; hlt` when the current CPU has no runnable work.
-- The cross-CPU runnable path is still narrow:
-  - one explicit thread-start placement onto an idle peer, not general runnable stealing
-  - no general blocked-current or fairness-driven migration
-  - no periodic rebalance
-  - no fairness-aware migration policy
 - Bootstrap perf smoke now reuses one proven peer worker across wake, active-peer TLB, and fault
   phases, so those gates no longer depend on repeated synthetic cross-CPU launches.
-- Scheduler fairness is still simple fixed-slice FIFO/RR rather than a richer policy such as
-  weighted fairness or vruntime tracking.
+- Scheduler fairness is still intentionally simple fixed-slice FIFO/RR rather than a richer policy
+  such as weighted fairness, vruntime tracking, or EEVDF.
+- The receiver set for general runnable donation is still conservative:
+  - true-idle peers are the immediate migration target
+  - CPUs carrying a blocked current thread are not treated as the generic foreign-runnable receiver
+- The kernel still has no topology / NUMA-aware balancing layer.
+- L1 remains a documented contract boundary, not an implemented shared-VMO scheduler protocol yet.

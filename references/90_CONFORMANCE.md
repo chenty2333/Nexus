@@ -121,7 +121,7 @@ That host gate now explicitly covers:
     - run-queue depth
     - blocked-wake handoff count
     - remote-wake latency count / max
-    - one global steal counter reserved for future L0 migration work; healthy runs currently keep it at zero
+    - one global steal counter covering queued-thread donation / rebalance when scenarios exercise it
   - the same summary now distinguishes syscall dispatch completion from actual return-to-user
     retirement through `sys_enter` / `sys_exit` / `sys_retire` counts for the deterministic
     null-syscall phase, and now also pins:

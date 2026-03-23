@@ -339,7 +339,6 @@ impl Kernel {
             }
             self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
             self.request_reschedule_on_cpu(target_cpu);
-            self.maybe_nudge_idle_stealer(target_cpu);
         }
         Ok(())
     }

@@ -82,6 +82,7 @@ extern "C" fn ap_entry(apic_id: u64) -> ! {
     let cpu_slot = register_apic_slot(apic_id_usize);
 
     crate::arch::init_ap(apic_id_usize);
+    let _ = crate::object::mark_scheduler_cpu_online(apic_id_usize);
 
     if apic_id_usize < MAX_APIC_IDS
         && AP_ONLINE[apic_id_usize]

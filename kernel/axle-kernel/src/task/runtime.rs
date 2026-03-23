@@ -581,6 +581,7 @@ impl Kernel {
         arg0: u64,
         arg1: u64,
         placement: StartPlacementPolicy,
+        allow_idle_spill: bool,
     ) -> Result<(), zx_status_t> {
         let process_id = self
             .threads
@@ -622,7 +623,9 @@ impl Kernel {
             }
             self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
             self.request_reschedule_on_cpu(target_cpu);
-            self.maybe_nudge_idle_stealer(target_cpu);
+            if allow_idle_spill {
+                self.maybe_nudge_idle_stealer(target_cpu);
+            }
         }
         Ok(())
     }
@@ -642,6 +645,7 @@ impl Kernel {
             arg0,
             arg1,
             StartPlacementPolicy::PreserveAffinity,
+            true,
         )
     }
 
@@ -660,6 +664,7 @@ impl Kernel {
             arg0,
             arg1,
             StartPlacementPolicy::PreferIdlePeer,
+            true,
         )
     }
 
@@ -702,7 +707,15 @@ impl Kernel {
             return Err(ZX_ERR_BAD_STATE);
         }
         process.state = ProcessState::Started;
-        let result = self.start_thread(thread_id, entry, stack, arg0, arg1);
+        let result = self.start_thread_with_policy(
+            thread_id,
+            entry,
+            stack,
+            arg0,
+            arg1,
+            StartPlacementPolicy::PreserveAffinity,
+            false,
+        );
         if result.is_err() {
             let process = self
                 .processes
