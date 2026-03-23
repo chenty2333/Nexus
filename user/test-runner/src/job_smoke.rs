@@ -21,22 +21,24 @@ use libzircon::{
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
 const SLOT_OK: usize = 0;
 const SLOT_SELF_PROCESS_H: usize = 396;
+const SLOT_SELF_JOB_H: usize = 1106;
 const HEAP_BYTES: usize = 8 * 1024;
 
 const STEP_PANIC: u64 = u64::MAX;
 const STEP_ROOT_JOB: u64 = 1;
 const STEP_ROOT_INFO: u64 = 2;
-const STEP_CHILD_JOB: u64 = 3;
-const STEP_CHILD_INFO_BEFORE: u64 = 4;
-const STEP_CHILD_PROCESS_CREATE: u64 = 5;
-const STEP_CHILD_JOB_FROM_PROCESS: u64 = 6;
-const STEP_CHILD_INFO_AFTER: u64 = 7;
-const STEP_KILL_JOB: u64 = 8;
-const STEP_WAIT_KILLED_PROCESS: u64 = 9;
-const STEP_POLICY_SET: u64 = 10;
-const STEP_EVENTPAIR_CREATE: u64 = 11;
-const STEP_POLICY_DUP: u64 = 12;
-const STEP_POLICY_WAIT_DENIED: u64 = 13;
+const STEP_ROOT_JOB_SLOT: u64 = 3;
+const STEP_CHILD_JOB: u64 = 4;
+const STEP_CHILD_INFO_BEFORE: u64 = 5;
+const STEP_CHILD_PROCESS_CREATE: u64 = 6;
+const STEP_CHILD_JOB_FROM_PROCESS: u64 = 7;
+const STEP_CHILD_INFO_AFTER: u64 = 8;
+const STEP_KILL_JOB: u64 = 9;
+const STEP_WAIT_KILLED_PROCESS: u64 = 10;
+const STEP_POLICY_SET: u64 = 11;
+const STEP_EVENTPAIR_CREATE: u64 = 12;
+const STEP_POLICY_DUP: u64 = 13;
+const STEP_POLICY_WAIT_DENIED: u64 = 14;
 
 #[derive(Clone, Copy, Default)]
 struct JobSummary {
@@ -44,6 +46,9 @@ struct JobSummary {
     root_job: i64,
     root_info: i64,
     root_job_id: u64,
+    root_job_slot_present: u64,
+    root_job_slot_info: i64,
+    root_job_slot_same: u64,
     root_child_jobs_before: u32,
     child_job: i64,
     child_info_before: i64,
@@ -182,11 +187,25 @@ fn run_job_smoke() -> JobSummary {
     summary.root_job_id = root_info.job_id;
     summary.root_child_jobs_before = root_info.child_job_count;
 
+    let root_job_slot = read_slot(SLOT_SELF_JOB_H) as zx_handle_t;
+    summary.root_job_slot_present = u64::from(root_job_slot != ZX_HANDLE_INVALID);
+    let mut root_job_slot_info = zx_job_info_t::default();
+    summary.root_job_slot_info = ax_job_get_info(root_job_slot, &mut root_job_slot_info) as i64;
+    summary.root_job_slot_same = u64::from(
+        summary.root_job_slot_info == ZX_OK as i64
+            && root_job_slot_info.job_id == summary.root_job_id,
+    );
+    if summary.root_job_slot_present != 1 || summary.root_job_slot_same != 1 {
+        summary.failure_step = STEP_ROOT_JOB_SLOT;
+        close_handles(&[root_job, root_job_slot]);
+        return summary;
+    }
+
     let mut child_job = ZX_HANDLE_INVALID;
     summary.child_job = ax_job_create(root_job, 0, &mut child_job) as i64;
     if summary.child_job != ZX_OK as i64 {
         summary.failure_step = STEP_CHILD_JOB;
-        close_handles(&[root_job]);
+        close_handles(&[root_job, root_job_slot]);
         return summary;
     }
 
@@ -194,7 +213,7 @@ fn run_job_smoke() -> JobSummary {
     summary.child_info_before = ax_job_get_info(child_job, &mut child_info) as i64;
     if summary.child_info_before != ZX_OK as i64 {
         summary.failure_step = STEP_CHILD_INFO_BEFORE;
-        close_handles(&[root_job, child_job]);
+        close_handles(&[root_job, root_job_slot, child_job]);
         return summary;
     }
     summary.child_job_id = child_info.job_id;
@@ -206,7 +225,7 @@ fn run_job_smoke() -> JobSummary {
         zx_process_create(child_job, 0, &mut child_process, &mut child_root_vmar) as i64;
     if summary.child_process_create != ZX_OK as i64 {
         summary.failure_step = STEP_CHILD_PROCESS_CREATE;
-        close_handles(&[root_job, child_job]);
+        close_handles(&[root_job, root_job_slot, child_job]);
         return summary;
     }
 
@@ -216,7 +235,13 @@ fn run_job_smoke() -> JobSummary {
     summary.child_job_same = u64::from(child_job_from_process != ZX_HANDLE_INVALID);
     if summary.child_job_from_process != ZX_OK as i64 {
         summary.failure_step = STEP_CHILD_JOB_FROM_PROCESS;
-        close_handles(&[root_job, child_job, child_process, child_root_vmar]);
+        close_handles(&[
+            root_job,
+            root_job_slot,
+            child_job,
+            child_process,
+            child_root_vmar,
+        ]);
         return summary;
     }
     let mut child_info_again = zx_job_info_t::default();
@@ -226,6 +251,7 @@ fn run_job_smoke() -> JobSummary {
         summary.failure_step = STEP_CHILD_INFO_AFTER;
         close_handles(&[
             root_job,
+            root_job_slot,
             child_job,
             child_process,
             child_root_vmar,
@@ -241,6 +267,7 @@ fn run_job_smoke() -> JobSummary {
         summary.failure_step = STEP_KILL_JOB;
         close_handles(&[
             root_job,
+            root_job_slot,
             child_job,
             child_process,
             child_root_vmar,
@@ -257,6 +284,7 @@ fn run_job_smoke() -> JobSummary {
         summary.failure_step = STEP_WAIT_KILLED_PROCESS;
         close_handles(&[
             root_job,
+            root_job_slot,
             child_job,
             child_process,
             child_root_vmar,
@@ -275,6 +303,7 @@ fn run_job_smoke() -> JobSummary {
         summary.failure_step = STEP_POLICY_SET;
         close_handles(&[
             root_job,
+            root_job_slot,
             child_job,
             child_process,
             child_root_vmar,
@@ -290,6 +319,7 @@ fn run_job_smoke() -> JobSummary {
         summary.failure_step = STEP_EVENTPAIR_CREATE;
         close_handles(&[
             root_job,
+            root_job_slot,
             child_job,
             child_process,
             child_root_vmar,
@@ -324,6 +354,7 @@ fn run_job_smoke() -> JobSummary {
 
     close_handles(&[
         root_job,
+        root_job_slot,
         child_job,
         child_process,
         child_root_vmar,
@@ -348,11 +379,14 @@ fn emit_summary(summary: &JobSummary) {
     let _ = fmt::write(
         &mut line,
         format_args!(
-            "kernel: job smoke (job_present=1, job_failure_step={}, root_job={}, root_info={}, root_job_id={}, root_child_jobs_before={}, child_job={}, child_info_before={}, child_job_id={}, child_parent_koid={}, child_process_create={}, child_job_from_process={}, child_job_same={}, child_info_after={}, child_process_count_after={}, kill_job={}, wait_killed_process={}, wait_killed_observed={}, policy_set={}, eventpair_create={}, policy_dup={}, policy_wait_denied={})\n",
+            "kernel: job smoke (job_present=1, job_failure_step={}, root_job={}, root_info={}, root_job_id={}, root_job_slot_present={}, root_job_slot_info={}, root_job_slot_same={}, root_child_jobs_before={}, child_job={}, child_info_before={}, child_job_id={}, child_parent_koid={}, child_process_create={}, child_job_from_process={}, child_job_same={}, child_info_after={}, child_process_count_after={}, kill_job={}, wait_killed_process={}, wait_killed_observed={}, policy_set={}, eventpair_create={}, policy_dup={}, policy_wait_denied={})\n",
             summary.failure_step,
             summary.root_job,
             summary.root_info,
             summary.root_job_id,
+            summary.root_job_slot_present,
+            summary.root_job_slot_info,
+            summary.root_job_slot_same,
             summary.root_child_jobs_before,
             summary.child_job,
             summary.child_info_before,

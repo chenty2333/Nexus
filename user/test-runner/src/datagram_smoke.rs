@@ -2,19 +2,22 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use axle_arch_x86_64::debug_break;
+use axle_arch_x86_64::{debug_break, native_syscall, native_syscall8};
 use axle_types::signals::{ZX_SOCKET_PEER_CLOSED, ZX_SOCKET_READABLE, ZX_SOCKET_WRITABLE};
 use axle_types::socket::{ZX_SOCKET_DATAGRAM, ZX_SOCKET_PEEK};
 use axle_types::status::{ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_OK};
 use libzircon::handle::ZX_HANDLE_INVALID;
+use libzircon::syscall_numbers::{AXLE_SYS_VMAR_MAP, AXLE_SYS_VMAR_UNMAP};
+use libzircon::vm::{ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
     zx_handle_close, zx_handle_t, zx_object_wait_one, zx_signals_t, zx_socket_create,
-    zx_socket_read, zx_socket_write,
+    zx_socket_read, zx_socket_write, zx_vmo_create,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
 const SLOT_OK: usize = 0;
 const SLOT_T0_NS: usize = 511;
+const SLOT_ROOT_VMAR_H: usize = 62;
 
 const SLOT_DGRAM_PRESENT: usize = 954;
 const SLOT_DGRAM_FAILURE_STEP: usize = 955;
@@ -40,6 +43,10 @@ const SLOT_DGRAM_CLOSE_LEFT: usize = 974;
 const SLOT_DGRAM_WAIT_PEER_CLOSED: usize = 975;
 const SLOT_DGRAM_WAIT_PEER_CLOSED_OBSERVED: usize = 976;
 const SLOT_DGRAM_WRITE_PEER_CLOSED: usize = 977;
+const SLOT_DGRAM_PAGE_WRITE: usize = 1107;
+const SLOT_DGRAM_PAGE_READ: usize = 1108;
+const SLOT_DGRAM_PAGE_READ_ACTUAL: usize = 1109;
+const SLOT_DGRAM_PAGE_MATCH: usize = 1110;
 
 const STEP_PANIC: u64 = u64::MAX;
 const STEP_CREATE: u64 = 1;
@@ -51,17 +58,20 @@ const STEP_READ_FIRST: u64 = 6;
 const STEP_WRITE_TRUNC: u64 = 7;
 const STEP_READ_TRUNC: u64 = 8;
 const STEP_READ_AFTER_TRUNC: u64 = 9;
-const STEP_FILL: u64 = 10;
-const STEP_DRAIN_AFTER_FILL: u64 = 11;
-const STEP_WRITE_RECOVER: u64 = 12;
-const STEP_CLOSE_LEFT: u64 = 13;
-const STEP_WAIT_PEER_CLOSED: u64 = 14;
-const STEP_WRITE_PEER_CLOSED: u64 = 15;
+const STEP_PAGE_WRITE: u64 = 10;
+const STEP_PAGE_READ: u64 = 11;
+const STEP_FILL: u64 = 12;
+const STEP_DRAIN_AFTER_FILL: u64 = 13;
+const STEP_WRITE_RECOVER: u64 = 14;
+const STEP_CLOSE_LEFT: u64 = 15;
+const STEP_WAIT_PEER_CLOSED: u64 = 16;
+const STEP_WRITE_PEER_CLOSED: u64 = 17;
 
 const WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
 const FIRST_PAYLOAD: &[u8] = b"axle-dgram-first";
 const TRUNC_PAYLOAD: &[u8] = b"axle-dgram-truncate-payload";
 const FILL_PACKET_BYTES: usize = 1024;
+const PAGE_BYTES: usize = 4096;
 const HEAP_BYTES: usize = 8 * 1024;
 
 #[repr(align(16))]
@@ -93,6 +103,10 @@ struct DatagramSummary {
     read_trunc_actual: u64,
     read_trunc_prefix: u64,
     read_after_trunc: i64,
+    page_write: i64,
+    page_read: i64,
+    page_read_actual: u64,
+    page_match: u64,
     fill_should_wait: i64,
     drain_after_fill: u64,
     write_recover: i64,
@@ -161,6 +175,7 @@ fn run_datagram_smoke() -> DatagramSummary {
     let mut left = ZX_HANDLE_INVALID;
     let mut right = ZX_HANDLE_INVALID;
     let mut observed: zx_signals_t = 0;
+    let root_vmar = read_slot(SLOT_ROOT_VMAR_H) as zx_handle_t;
 
     summary.create = zx_socket_create(ZX_SOCKET_DATAGRAM, &mut left, &mut right) as i64;
     if summary.create != ZX_OK as i64 {
@@ -253,8 +268,9 @@ fn run_datagram_smoke() -> DatagramSummary {
     summary.read_trunc =
         zx_socket_read(right, 0, small.as_mut_ptr(), small.len(), &mut actual) as i64;
     summary.read_trunc_actual = actual as u64;
-    summary.read_trunc_prefix =
-        u64::from(actual == small.len() && small.as_slice() == &TRUNC_PAYLOAD[..small.len()]);
+    summary.read_trunc_prefix = u64::from(
+        actual == TRUNC_PAYLOAD.len() && small.as_slice() == &TRUNC_PAYLOAD[..small.len()],
+    );
     if summary.read_trunc != ZX_OK as i64 || summary.read_trunc_prefix != 1 {
         summary.failure_step = STEP_READ_TRUNC;
         close_pair(left, right);
@@ -266,6 +282,23 @@ fn run_datagram_smoke() -> DatagramSummary {
         zx_socket_read(right, 0, small.as_mut_ptr(), small.len(), &mut actual) as i64;
     if summary.read_after_trunc != ZX_ERR_SHOULD_WAIT as i64 {
         summary.failure_step = STEP_READ_AFTER_TRUNC;
+        close_pair(left, right);
+        return summary;
+    }
+
+    let (page_write, page_read, page_read_actual, page_match) =
+        run_page_payload_datagram(root_vmar, left, right);
+    summary.page_write = page_write;
+    summary.page_read = page_read;
+    summary.page_read_actual = page_read_actual;
+    summary.page_match = page_match;
+    if summary.page_write != ZX_OK as i64 {
+        summary.failure_step = STEP_PAGE_WRITE;
+        close_pair(left, right);
+        return summary;
+    }
+    if summary.page_read != ZX_OK as i64 || summary.page_match != 1 {
+        summary.failure_step = STEP_PAGE_READ;
         close_pair(left, right);
         return summary;
     }
@@ -374,6 +407,120 @@ fn close_pair(left: zx_handle_t, right: zx_handle_t) {
     }
 }
 
+fn run_page_payload_datagram(
+    root_vmar: zx_handle_t,
+    left: zx_handle_t,
+    right: zx_handle_t,
+) -> (i64, i64, u64, u64) {
+    let mut tx_vmo = ZX_HANDLE_INVALID;
+    let mut rx_vmo = ZX_HANDLE_INVALID;
+    let mut tx_addr = 0u64;
+    let mut rx_addr = 0u64;
+    let mut actual = 0usize;
+
+    let mut write_status = zx_vmo_create(PAGE_BYTES as u64, 0, &mut tx_vmo) as i64;
+    if write_status != ZX_OK as i64 {
+        return (write_status, 0, 0, 0);
+    }
+    write_status = zx_vmo_create(PAGE_BYTES as u64, 0, &mut rx_vmo) as i64;
+    if write_status != ZX_OK as i64 {
+        let _ = zx_handle_close(tx_vmo);
+        return (write_status, 0, 0, 0);
+    }
+
+    write_status = zx_vmar_map_local(
+        root_vmar,
+        (ZX_VM_PERM_READ | ZX_VM_PERM_WRITE) as u32,
+        0,
+        tx_vmo,
+        0,
+        PAGE_BYTES as u64,
+        &mut tx_addr,
+    );
+    if write_status != ZX_OK as i64 {
+        let _ = zx_handle_close(tx_vmo);
+        let _ = zx_handle_close(rx_vmo);
+        return (write_status, 0, 0, 0);
+    }
+    write_status = zx_vmar_map_local(
+        root_vmar,
+        (ZX_VM_PERM_READ | ZX_VM_PERM_WRITE) as u32,
+        0,
+        rx_vmo,
+        0,
+        PAGE_BYTES as u64,
+        &mut rx_addr,
+    );
+    if write_status != ZX_OK as i64 {
+        let _ = zx_vmar_unmap_local(root_vmar, tx_addr, PAGE_BYTES as u64);
+        let _ = zx_handle_close(tx_vmo);
+        let _ = zx_handle_close(rx_vmo);
+        return (write_status, 0, 0, 0);
+    }
+
+    let tx = unsafe {
+        // SAFETY: `tx_addr` is the base of a writable one-page mapping returned above.
+        core::slice::from_raw_parts_mut(tx_addr as *mut u8, PAGE_BYTES)
+    };
+    let rx = unsafe {
+        // SAFETY: `rx_addr` is the base of a writable one-page mapping returned above.
+        core::slice::from_raw_parts_mut(rx_addr as *mut u8, PAGE_BYTES)
+    };
+    for (index, byte) in tx.iter_mut().enumerate() {
+        *byte = ((index as u32).wrapping_mul(17).wrapping_add(3) & 0xff) as u8;
+    }
+    rx.fill(0);
+
+    write_status = zx_socket_write(left, 0, tx.as_ptr(), tx.len(), &mut actual) as i64;
+    if write_status != ZX_OK as i64 || actual != PAGE_BYTES {
+        let _ = zx_vmar_unmap_local(root_vmar, tx_addr, PAGE_BYTES as u64);
+        let _ = zx_vmar_unmap_local(root_vmar, rx_addr, PAGE_BYTES as u64);
+        let _ = zx_handle_close(tx_vmo);
+        let _ = zx_handle_close(rx_vmo);
+        return (write_status, 0, actual as u64, 0);
+    }
+
+    actual = 0;
+    let read_status = zx_socket_read(right, 0, rx.as_mut_ptr(), rx.len(), &mut actual) as i64;
+    let match_ok = u64::from(read_status == ZX_OK as i64 && actual == PAGE_BYTES && tx == rx);
+
+    let _ = zx_vmar_unmap_local(root_vmar, tx_addr, PAGE_BYTES as u64);
+    let _ = zx_vmar_unmap_local(root_vmar, rx_addr, PAGE_BYTES as u64);
+    let _ = zx_handle_close(tx_vmo);
+    let _ = zx_handle_close(rx_vmo);
+
+    (write_status, read_status, actual as u64, match_ok)
+}
+
+fn zx_vmar_map_local(
+    vmar: zx_handle_t,
+    options: u32,
+    vmar_offset: u64,
+    vmo: zx_handle_t,
+    vmo_offset: u64,
+    len: u64,
+    mapped_addr: &mut u64,
+) -> i64 {
+    native_syscall8(
+        AXLE_SYS_VMAR_MAP as u64,
+        [
+            vmar,
+            options as u64,
+            vmar_offset,
+            vmo,
+            vmo_offset,
+            len,
+            mapped_addr as *mut u64 as u64,
+            0,
+        ],
+    )
+    .into()
+}
+
+fn zx_vmar_unmap_local(vmar: zx_handle_t, addr: u64, len: u64) -> i64 {
+    native_syscall(AXLE_SYS_VMAR_UNMAP as u64, [vmar, addr, len, 0, 0, 0]).into()
+}
+
 fn read_slot(slot: usize) -> u64 {
     let slots = USER_SHARED_BASE as *const u64;
     // SAFETY: the kernel maps the bootstrap shared summary pages at `USER_SHARED_BASE`.
@@ -404,6 +551,10 @@ fn write_summary(summary: &DatagramSummary) {
     write_slot(SLOT_DGRAM_READ_TRUNC_ACTUAL, summary.read_trunc_actual);
     write_slot(SLOT_DGRAM_READ_TRUNC_PREFIX, summary.read_trunc_prefix);
     write_slot(SLOT_DGRAM_READ_AFTER_TRUNC, summary.read_after_trunc as u64);
+    write_slot(SLOT_DGRAM_PAGE_WRITE, summary.page_write as u64);
+    write_slot(SLOT_DGRAM_PAGE_READ, summary.page_read as u64);
+    write_slot(SLOT_DGRAM_PAGE_READ_ACTUAL, summary.page_read_actual);
+    write_slot(SLOT_DGRAM_PAGE_MATCH, summary.page_match);
     write_slot(SLOT_DGRAM_FILL_SHOULD_WAIT, summary.fill_should_wait as u64);
     write_slot(SLOT_DGRAM_DRAIN_AFTER_FILL, summary.drain_after_fill);
     write_slot(SLOT_DGRAM_WRITE_RECOVER, summary.write_recover as u64);

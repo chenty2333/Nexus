@@ -51,6 +51,10 @@ Each socket pair currently uses two `4096`-byte byte rings, one per direction.
 ## Current datagram semantics
 
 - Datagram sockets keep one bounded message queue per direction.
+- The queue now owns the same internal `DataPayload` descriptor family used by channel delivery:
+  - copied bytes
+  - full-page loaned body pages
+  - mixed `head/body/tail` fragmented payloads
 - Writes are message-atomic:
   - the whole datagram is enqueued
   - or the write fails with `ZX_ERR_SHOULD_WAIT`
@@ -58,9 +62,14 @@ Each socket pair currently uses two `4096`-byte byte rings, one per direction.
 - Oversize datagrams currently fail with `ZX_ERR_OUT_OF_RANGE`.
 - Reads consume at most one queued datagram.
 - `ZX_SOCKET_PEEK` returns the first queued datagram without consuming it.
-- Current bootstrap reads truncate an oversized datagram to the requested byte count and consume the
-  message in one step.
-  The current syscall surface does not yet export the original full packet length separately.
+- Current bootstrap reads still consume at most one queued datagram even when the caller buffer is
+  narrower than the message, but the syscall now reports the original full packet length through
+  the `actual` out parameter while only copying the requested prefix bytes.
+- Page-aligned full-page datagrams may now reuse the same loan/remap substrate as channel payloads:
+  - aligned full-body writes can be queued as loaned pages
+  - exact-size reads may remap or copy those pages through the shared copy service
+  - `ZX_SOCKET_PEEK` intentionally falls back to copied-prefix materialization so the queued
+    datagram ownership stays with the socket queue
 
 Each datagram socket pair currently uses:
 
@@ -81,6 +90,8 @@ These feed both synchronous waits and async waits on ports.
 - Duplicating a socket handle creates another reference to the same endpoint object.
 - Closing the final handle to one endpoint updates the shared `SocketCore`.
 - Peer-closed behavior is observable through both read/write errors and signal transitions.
+- Dropping the last socket core now also drains any queued datagram payload descriptors through the
+  same loan/fragment release path used by channel payload reclaim.
 
 ## Telemetry
 
@@ -106,7 +117,6 @@ It now also tracks datagram-specific telemetry such as:
 - Datagram semantics are present but still intentionally narrow:
   - no address families beyond paired endpoints
   - no ancillary in-kernel datagram policy
-  - no exposed original-packet-length writeback on truncating reads
 - Socket state currently lives entirely inside the kernel object layer rather than in a reusable lower-level crate.
 - The current stream socket should not be treated as the final network dataplane shape.
   Queue-owned shared-memory network work now has its own separate bootstrap track.

@@ -382,6 +382,8 @@ pub(crate) enum ChannelPayload {
     Fragmented(FragmentedChannelPayload),
 }
 
+pub(crate) type DataPayload = ChannelPayload;
+
 #[derive(Debug)]
 struct ChannelMsgDesc {
     payload: ChannelPayload,
@@ -433,6 +435,28 @@ impl ChannelPayload {
             Self::Loaned(loaned) => Some(loaned),
             Self::Fragmented(payload) => payload.body.as_mut(),
             Self::Copied(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum SocketReadPayload {
+    Copied(Vec<u8>),
+    Payload(DataPayload),
+}
+
+#[derive(Debug)]
+pub(crate) struct SocketReadResult {
+    pub(crate) payload: SocketReadPayload,
+    pub(crate) actual_bytes: usize,
+}
+
+impl SocketReadResult {
+    pub(crate) fn copied(bytes: Vec<u8>) -> Self {
+        let actual_bytes = bytes.len();
+        Self {
+            payload: SocketReadPayload::Copied(bytes),
+            actual_bytes,
         }
     }
 }
@@ -572,7 +596,7 @@ impl ByteRing {
 
 #[derive(Debug)]
 struct DatagramQueue {
-    messages: VecDeque<Vec<u8>>,
+    messages: VecDeque<DataPayload>,
     buffered_bytes: usize,
     capacity_bytes: usize,
     capacity_messages: usize,
@@ -600,48 +624,66 @@ impl DatagramQueue {
         self.buffered_bytes < self.capacity_bytes && self.messages.len() < self.capacity_messages
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<usize, zx_status_t> {
-        if bytes.is_empty() {
+    fn write_payload(&mut self, payload: DataPayload) -> Result<usize, zx_status_t> {
+        let payload_len =
+            usize::try_from(payload.actual_bytes()?).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if payload_len == 0 {
             return Ok(0);
         }
-        if bytes.len() > self.capacity_bytes {
+        if payload_len > self.capacity_bytes {
             return Err(ZX_ERR_OUT_OF_RANGE);
         }
         let next_bytes = self
             .buffered_bytes
-            .checked_add(bytes.len())
+            .checked_add(payload_len)
             .ok_or(ZX_ERR_OUT_OF_RANGE)?;
         if self.messages.len() >= self.capacity_messages || next_bytes > self.capacity_bytes {
             return Err(ZX_ERR_SHOULD_WAIT);
+        }
+        self.buffered_bytes = next_bytes;
+        self.messages.push_back(payload);
+        Ok(payload_len)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<usize, zx_status_t> {
+        if bytes.is_empty() {
+            return Ok(0);
         }
         let mut message = Vec::new();
         message
             .try_reserve_exact(bytes.len())
             .map_err(|_| axle_types::status::ZX_ERR_NO_MEMORY)?;
         message.extend_from_slice(bytes);
-        self.buffered_bytes = next_bytes;
-        self.messages.push_back(message);
-        Ok(bytes.len())
+        self.write_payload(ChannelPayload::Copied(message))
     }
 
-    fn read(&mut self, len: usize, consume: bool) -> Result<(Vec<u8>, bool), zx_status_t> {
+    fn read(&mut self, len: usize, consume: bool) -> Result<SocketReadResult, zx_status_t> {
         if len == 0 {
-            return Ok((Vec::new(), false));
+            return Ok(SocketReadResult::copied(Vec::new()));
         }
         let Some(message) = self.messages.front() else {
             return Err(ZX_ERR_SHOULD_WAIT);
         };
-        let truncated = message.len() > len;
-        let actual = message.len().min(len);
-        let mut out = Vec::new();
-        out.try_reserve_exact(actual)
-            .map_err(|_| axle_types::status::ZX_ERR_NO_MEMORY)?;
-        out.extend_from_slice(&message[..actual]);
+        let source_len =
+            usize::try_from(message.actual_bytes()?).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
         if consume {
-            let consumed = self.messages.pop_front().ok_or(ZX_ERR_BAD_STATE)?;
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(consumed.len());
+            let payload = self.messages.pop_front().ok_or(ZX_ERR_BAD_STATE)?;
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(source_len);
+            return Ok(SocketReadResult {
+                payload: SocketReadPayload::Payload(payload),
+                actual_bytes: source_len,
+            });
         }
-        Ok((out, truncated))
+        Ok(SocketReadResult {
+            payload: SocketReadPayload::Copied(crate::copy::materialize_data_payload_prefix(
+                message, len,
+            )?),
+            actual_bytes: source_len,
+        })
+    }
+
+    fn into_payloads(self) -> Vec<DataPayload> {
+        self.messages.into_iter().collect()
     }
 }
 
@@ -769,7 +811,30 @@ impl SocketCore {
                 }
                 Ok(written)
             }
-            SocketQueue::Datagram(queue) => queue.write(bytes),
+            SocketQueue::Datagram(queue) => queue.write_bytes(bytes),
+        }
+    }
+
+    fn write_payload(
+        &mut self,
+        side: SocketSide,
+        payload: DataPayload,
+    ) -> Result<usize, zx_status_t> {
+        let payload_len =
+            usize::try_from(payload.actual_bytes()?).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        if payload_len == 0 {
+            return Ok(0);
+        }
+        let (queue, peer_open) = match side {
+            SocketSide::A => (&mut self.dir_ab, self.open_b),
+            SocketSide::B => (&mut self.dir_ba, self.open_a),
+        };
+        if !peer_open {
+            return Err(ZX_ERR_PEER_CLOSED);
+        }
+        match queue {
+            SocketQueue::Stream(_) => Err(ZX_ERR_WRONG_TYPE),
+            SocketQueue::Datagram(queue) => queue.write_payload(payload),
         }
     }
 
@@ -778,7 +843,7 @@ impl SocketCore {
         side: SocketSide,
         len: usize,
         consume: bool,
-    ) -> Result<(Vec<u8>, bool), zx_status_t> {
+    ) -> Result<SocketReadResult, zx_status_t> {
         let (queue, peer_open) = match side {
             SocketSide::A => (&mut self.dir_ba, self.open_b),
             SocketSide::B => (&mut self.dir_ab, self.open_a),
@@ -786,7 +851,7 @@ impl SocketCore {
         match queue {
             SocketQueue::Stream(queue) => {
                 if len == 0 {
-                    return Ok((Vec::new(), false));
+                    return Ok(SocketReadResult::copied(Vec::new()));
                 }
                 if queue.available_read() == 0 {
                     return Err(if peer_open {
@@ -795,7 +860,7 @@ impl SocketCore {
                         ZX_ERR_PEER_CLOSED
                     });
                 }
-                queue.read(len, consume).map(|bytes| (bytes, false))
+                queue.read(len, consume).map(SocketReadResult::copied)
             }
             SocketQueue::Datagram(queue) => {
                 if queue.queued_messages() == 0 {
@@ -819,6 +884,16 @@ impl SocketCore {
 
     fn fully_closed(&self) -> bool {
         !self.open_a && !self.open_b
+    }
+
+    fn into_queued_payloads(self) -> Vec<DataPayload> {
+        let mut payloads = Vec::new();
+        for queue in [self.dir_ab, self.dir_ba] {
+            if let SocketQueue::Datagram(queue) = queue {
+                payloads.extend(queue.into_payloads());
+            }
+        }
+        payloads
     }
 }
 
@@ -1053,6 +1128,7 @@ pub(crate) struct ObjectRegistry {
     timer_object_ids: BTreeMap<TimerId, ObjectKey>,
     guest_session_thread_ids: BTreeMap<u64, ObjectKey>,
     bootstrap_self_process_handle: zx_handle_t,
+    bootstrap_self_job_handle: zx_handle_t,
     bootstrap_root_vmar_handle: zx_handle_t,
     bootstrap_self_thread_handle: zx_handle_t,
     bootstrap_self_code_vmo_handle: zx_handle_t,
@@ -1074,6 +1150,7 @@ impl ObjectRegistry {
             timer_object_ids: BTreeMap::new(),
             guest_session_thread_ids: BTreeMap::new(),
             bootstrap_self_process_handle: 0,
+            bootstrap_self_job_handle: 0,
             bootstrap_root_vmar_handle: 0,
             bootstrap_self_thread_handle: 0,
             bootstrap_self_code_vmo_handle: 0,
@@ -1407,6 +1484,15 @@ impl KernelState {
         state
             .with_kernel_mut(|kernel| kernel.bind_job_object(root_job_id, root_job_object_id))
             .expect("bootstrap root job object bind must succeed");
+        let root_job_handle = state
+            .alloc_handle_for_object(root_job_object_id, handle::job_default_rights())
+            .expect("bootstrap root job handle allocation must succeed");
+        state
+            .with_registry_mut(|registry| {
+                registry.bootstrap_self_job_handle = root_job_handle;
+                Ok(())
+            })
+            .expect("bootstrap root job handle publish must succeed");
 
         let process = state
             .with_kernel(|kernel| kernel.current_process_info())
@@ -2747,21 +2833,27 @@ fn finalize_last_handle_close(
             })?;
             let removed = state.begin_logical_destroy(object_key)?;
             let result = match removed {
-                KernelObject::Socket(endpoint) => state.with_transport_mut(|transport| {
-                    let should_drop_core = match transport.socket_cores.get_mut(&endpoint.core_id) {
-                        Some(core) => {
-                            core.close_side(endpoint.side);
-                            core.fully_closed()
-                        }
-                        None => return Err(ZX_ERR_BAD_STATE),
-                    };
-                    if should_drop_core
-                        && let Some(core) = transport.socket_cores.remove(&endpoint.core_id)
-                    {
-                        transport.note_socket_core_drop(&core);
+                KernelObject::Socket(endpoint) => {
+                    let dropped_core = state.with_transport_mut(|transport| {
+                        let should_drop_core =
+                            match transport.socket_cores.get_mut(&endpoint.core_id) {
+                                Some(core) => {
+                                    core.close_side(endpoint.side);
+                                    core.fully_closed()
+                                }
+                                None => return Err(ZX_ERR_BAD_STATE),
+                            };
+                        Ok(if should_drop_core {
+                            transport.socket_cores.remove(&endpoint.core_id)
+                        } else {
+                            None
+                        })
+                    })?;
+                    if let Some(core) = dropped_core {
+                        transport::release_socket_core(state, core);
                     }
                     Ok(())
-                }),
+                }
                 _ => Err(ZX_ERR_BAD_STATE),
             };
             state.finish_logical_destroy(object_key);

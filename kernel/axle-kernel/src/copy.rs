@@ -12,7 +12,10 @@ use axle_types::{zx_handle_t, zx_status_t};
 use core::mem::size_of;
 use spin::Mutex;
 
-use crate::object::{ChannelFragment, ChannelPayload, FragmentedChannelPayload};
+use crate::object::{
+    ChannelFragment, ChannelPayload, DataPayload, FragmentedChannelPayload, SocketReadPayload,
+    SocketReadResult,
+};
 use crate::task::{AddressSpaceId, LoanedUserPages};
 
 const TINY_INLINE_THRESHOLD: usize = 128;
@@ -455,33 +458,122 @@ fn copy_fragmented_payload_to_span(
     Ok(())
 }
 
+fn append_loaned_prefix_bytes(
+    out: &mut Vec<u8>,
+    loaned: &LoanedUserPages,
+    limit: usize,
+) -> Result<(), zx_status_t> {
+    let page_size = crate::userspace::USER_PAGE_BYTES as usize;
+    let total = usize::try_from(loaned.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let target = total.min(limit);
+    let page_count = loaned.pages().len();
+    if page_count != total.div_ceil(page_size) {
+        return Err(ZX_ERR_BAD_STATE);
+    }
+    out.try_reserve_exact(target)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    let mut copied = 0usize;
+    for frame_id in loaned.pages() {
+        if copied >= target {
+            break;
+        }
+        let chunk = (target - copied).min(page_size);
+        let start = out.len();
+        out.resize(start + chunk, 0);
+        crate::userspace::read_bootstrap_bytes(frame_id.raw(), 0, &mut out[start..start + chunk])
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        copied += chunk;
+    }
+    Ok(())
+}
+
+pub(crate) fn materialize_data_payload_prefix(
+    payload: &DataPayload,
+    limit: usize,
+) -> Result<Vec<u8>, zx_status_t> {
+    match payload {
+        ChannelPayload::Copied(bytes) => Ok(bytes[..bytes.len().min(limit)].to_vec()),
+        ChannelPayload::Loaned(loaned) => {
+            let mut out = Vec::new();
+            append_loaned_prefix_bytes(&mut out, loaned, limit)?;
+            Ok(out)
+        }
+        ChannelPayload::Fragmented(fragmented) => {
+            let total = usize::try_from(fragmented.len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+            let target = total.min(limit);
+            let mut out = Vec::new();
+            out.try_reserve_exact(target)
+                .map_err(|_| ZX_ERR_NO_MEMORY)?;
+
+            if let Some(head) = fragmented.head.as_ref() {
+                let copy = head.len().min(target);
+                out.extend_from_slice(&head.bytes()[..copy]);
+            }
+
+            if out.len() < target
+                && let Some(body) = fragmented.body.as_ref()
+            {
+                let remaining = target - out.len();
+                append_loaned_prefix_bytes(&mut out, body, remaining)?;
+            }
+
+            if out.len() < target
+                && let Some(tail) = fragmented.tail.as_ref()
+            {
+                let copy = tail.len().min(target - out.len());
+                out.extend_from_slice(&tail.bytes()[..copy]);
+            }
+
+            Ok(out)
+        }
+    }
+}
+
+pub(crate) fn write_data_payload_to_user(
+    dst_ptr: *mut u8,
+    len: usize,
+    payload: &DataPayload,
+) -> Result<usize, zx_status_t> {
+    let actual_len = usize::try_from(payload.actual_bytes()?).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let copy_len = len.min(actual_len);
+    if copy_len == 0 {
+        return Ok(0);
+    }
+    if copy_len == actual_len {
+        let ctx = UserCopyCtx::current()?;
+        let span = ctx.validate_write(dst_ptr as u64, copy_len)?;
+        match payload {
+            ChannelPayload::Copied(bytes) => write_bytes_to_span(span, bytes)?,
+            ChannelPayload::Loaned(loaned) => {
+                match crate::object::transport::try_remap_loaned_channel_read(span.base, loaned) {
+                    Ok(true) => note_plan(CopyPlan::RemapLoan, copy_len),
+                    Ok(false) => {
+                        note_remap_fallback(copy_len);
+                        copyout_loaned_to_span(span, 0, loaned)?;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            ChannelPayload::Fragmented(payload) => copy_fragmented_payload_to_span(span, payload)?,
+        }
+        return Ok(copy_len);
+    }
+
+    let bytes = materialize_data_payload_prefix(payload, copy_len)?;
+    copyout_bytes(dst_ptr, &bytes)?;
+    Ok(bytes.len())
+}
+
 pub(crate) fn write_channel_payload_to_user(
     dst_ptr: *mut u8,
     payload: &ChannelPayload,
 ) -> Result<(), zx_status_t> {
     let len = usize::try_from(payload.actual_bytes()?).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-    if len == 0 {
-        return Ok(());
+    let written = write_data_payload_to_user(dst_ptr, len, payload)?;
+    if written != len {
+        return Err(ZX_ERR_BAD_STATE);
     }
-    let ctx = UserCopyCtx::current()?;
-    let span = ctx.validate_write(dst_ptr as u64, len)?;
-    match payload {
-        ChannelPayload::Copied(bytes) => write_bytes_to_span(span, bytes),
-        ChannelPayload::Loaned(loaned) => {
-            match crate::object::transport::try_remap_loaned_channel_read(span.base, loaned) {
-                Ok(true) => {
-                    note_plan(CopyPlan::RemapLoan, len);
-                    Ok(())
-                }
-                Ok(false) => {
-                    note_remap_fallback(len);
-                    copyout_loaned_to_span(span, 0, loaned)
-                }
-                Err(err) => Err(err),
-            }
-        }
-        ChannelPayload::Fragmented(payload) => copy_fragmented_payload_to_span(span, payload),
-    }
+    Ok(())
 }
 
 pub(crate) fn copyout_loaned_bytes(
@@ -572,8 +664,27 @@ pub(crate) fn socket_write_from_user(
     if len == 0 {
         return crate::object::transport::socket_write(handle, options, &[]);
     }
+    if crate::object::transport::socket_is_datagram(handle)? {
+        let payload = prepare_channel_write_payload(buffer, len)?;
+        return crate::object::transport::socket_write_payload(handle, options, payload);
+    }
     let bytes = copyin_bytes(buffer, len)?;
     crate::object::transport::socket_write(handle, options, &bytes)
+}
+
+pub(crate) fn write_socket_read_result_to_user(
+    dst_ptr: *mut u8,
+    len: usize,
+    result: &SocketReadResult,
+) -> Result<usize, zx_status_t> {
+    match &result.payload {
+        SocketReadPayload::Copied(bytes) => {
+            let copy_len = len.min(bytes.len());
+            copyout_bytes(dst_ptr, &bytes[..copy_len])?;
+            Ok(copy_len)
+        }
+        SocketReadPayload::Payload(payload) => write_data_payload_to_user(dst_ptr, len, payload),
+    }
 }
 
 pub(crate) fn socket_read_to_user(
@@ -582,9 +693,9 @@ pub(crate) fn socket_read_to_user(
     buffer: *mut u8,
     len: usize,
 ) -> Result<usize, zx_status_t> {
-    let bytes = crate::object::transport::socket_read(handle, options, len)?;
-    copyout_bytes(buffer, &bytes)?;
-    Ok(bytes.len())
+    let result = crate::object::transport::socket_read(handle, options, len)?;
+    write_socket_read_result_to_user(buffer, len, &result)?;
+    Ok(result.actual_bytes)
 }
 
 pub(crate) fn vmo_write_from_user(

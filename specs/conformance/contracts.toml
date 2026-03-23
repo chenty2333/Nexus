@@ -286,7 +286,7 @@ description = "Bootstrap process_create/process_start should yield a real child 
 [[contracts]]
 id = "should.job.tree_bootstrap"
 level = "should"
-description = "Bootstrap Job objects should support process->job lookup, child-job creation, process creation under a Job handle, and job-scoped kill of descendant processes"
+description = "Bootstrap Job objects should seed one root-job handle, support process->job lookup, child-job creation, process creation under a Job handle, and job-scoped kill of descendant processes"
 
 [[contracts]]
 id = "should.job.policy_ceiling_bootstrap"
@@ -428,7 +428,7 @@ description = "Bootstrap STREAM sockets should report stable short-write and wou
 [[contracts]]
 id = "should.socket.datagram_bootstrap"
 level = "should"
-description = "Bootstrap DATAGRAM sockets should preserve message boundaries, support peek, truncate on narrow reads, exert bounded backpressure without short writes, and surface peer-closed state through the shared socket signal family"
+description = "Bootstrap DATAGRAM sockets should preserve message boundaries, report full source length on truncating reads, reuse the shared payload substrate for page-aligned messages, exert bounded backpressure without short writes, and surface peer-closed state through the shared socket signal family"
 
 [[contracts]]
 id = "must.runtime.libzircon_bootstrap"

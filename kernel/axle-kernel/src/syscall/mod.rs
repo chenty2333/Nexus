@@ -2485,7 +2485,8 @@ const SOCKET_CREATE_DISPATCH: SyscallDispatch = SyscallDispatch::new(socket_crea
 struct SocketWriteRequest {
     handle: zx_handle_t,
     options: u32,
-    bytes: Vec<u8>,
+    buffer: *const u8,
+    len: usize,
 }
 
 fn decode_socket_write(
@@ -2497,18 +2498,20 @@ fn decode_socket_write(
     if len != 0 && buffer.is_null() {
         return Err(ZX_ERR_INVALID_ARGS);
     }
+    probe_input_bytes(buffer, len)?;
     Ok(DecodedSyscall::new(
         SocketWriteRequest {
             handle: ctx.arg_handle(args, 0)?,
             options: ctx.arg_u32(args, 1)?,
-            bytes: decode_input_bytes(buffer, len)?,
+            buffer,
+            len,
         },
         ctx.decode_optional_out_value::<usize>(args, 4)?,
     ))
 }
 
 fn run_socket_write(req: SocketWriteRequest) -> Result<usize, zx_status_t> {
-    crate::object::transport::socket_write(req.handle, req.options, &req.bytes)
+    crate::copy::socket_write_from_user(req.handle, req.options, req.buffer, req.len)
 }
 
 typed_syscall!(
@@ -2536,6 +2539,44 @@ struct SocketReadWriteback {
     actual: OptionalOutValue<usize>,
 }
 
+#[derive(Debug)]
+struct SocketReadDelivery {
+    result: Option<crate::object::SocketReadResult>,
+}
+
+impl SocketReadDelivery {
+    fn new(result: crate::object::SocketReadResult) -> Self {
+        Self {
+            result: Some(result),
+        }
+    }
+
+    fn actual_bytes(&self) -> usize {
+        self.result
+            .as_ref()
+            .expect("socket read result missing")
+            .actual_bytes
+    }
+
+    fn result(&self) -> &crate::object::SocketReadResult {
+        self.result.as_ref().expect("socket read result missing")
+    }
+
+    fn finish(mut self) {
+        if let Some(result) = self.result.take() {
+            crate::object::transport::release_socket_read_result(result);
+        }
+    }
+}
+
+impl Drop for SocketReadDelivery {
+    fn drop(&mut self) {
+        if let Some(result) = self.result.take() {
+            crate::object::transport::release_socket_read_result(result);
+        }
+    }
+}
+
 fn decode_socket_read(
     ctx: &mut SyscallCtx,
     args: [u64; 6],
@@ -2558,17 +2599,24 @@ fn decode_socket_read(
     ))
 }
 
-fn run_socket_read(req: SocketReadRequest) -> Result<Vec<u8>, zx_status_t> {
+fn run_socket_read(req: SocketReadRequest) -> Result<crate::object::SocketReadResult, zx_status_t> {
     crate::object::transport::socket_read(req.handle, req.options, req.len)
 }
 
 fn writeback_socket_read(
     _ctx: &mut SyscallCtx,
     writeback: SocketReadWriteback,
-    bytes: Vec<u8>,
+    result: crate::object::SocketReadResult,
 ) -> Result<(), zx_status_t> {
-    write_user_bytes(writeback.buffer, &bytes)?;
-    write_optional_out_value(writeback.actual, bytes.len())
+    let delivery = SocketReadDelivery::new(result);
+    crate::copy::write_socket_read_result_to_user(
+        writeback.buffer.ptr(),
+        writeback.buffer.len(),
+        delivery.result(),
+    )?;
+    write_optional_out_value(writeback.actual, delivery.actual_bytes())?;
+    delivery.finish();
+    Ok(())
 }
 
 typed_syscall!(
@@ -2576,7 +2624,7 @@ typed_syscall!(
     socket_read_entry,
     SocketReadRequest,
     SocketReadWriteback,
-    Vec<u8>,
+    crate::object::SocketReadResult,
     decode_socket_read,
     run_socket_read,
     writeback_socket_read

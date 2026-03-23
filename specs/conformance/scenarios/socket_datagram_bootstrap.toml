@@ -1,5 +1,5 @@
 id = "kernel.socket.datagram_bootstrap"
-description = "Bootstrap datagram sockets should preserve message atomicity, bounded backpressure, and peer-closed signaling"
+description = "Bootstrap datagram sockets should preserve message atomicity, report source length on truncation, reuse the shared payload substrate for page-aligned messages, and keep bounded backpressure plus peer-closed signaling"
 tags = ["kernel", "socket", "datagram", "bootstrap", "qemu"]
 timeout_ms = 180000
 
@@ -39,11 +39,15 @@ read_first_match = 1
 read_trunc_prefix = 1
 peek_actual = 16
 read_first_actual = 16
-read_trunc_actual = 8
+read_trunc_actual = 27
+page_write = 0
+page_read = 0
+page_read_actual = 4096
+page_match = 1
 drain_after_fill = 1024
 wait_peer_closed_observed = 5
 datagram_peak_buffered_messages = 4
-datagram_write_count = 7
-datagram_read_count = 3
+datagram_write_count = 8
+datagram_read_count = 4
 datagram_write_should_wait = 1
 datagram_truncated_read_count = 1

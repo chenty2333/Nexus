@@ -393,7 +393,7 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
     })
 }
 
-pub(super) fn release_channel_payload(state: &KernelState, payload: ChannelPayload) {
+pub(super) fn release_data_payload(state: &KernelState, payload: DataPayload) {
     match payload {
         ChannelPayload::Copied(_) => {}
         ChannelPayload::Loaned(loaned) => {
@@ -425,7 +425,11 @@ pub(super) fn release_channel_payload(state: &KernelState, payload: ChannelPaylo
     }
 }
 
-fn reclaim_channel_payload(state: &KernelState, payload: ChannelPayload, drained: bool) {
+pub(super) fn release_channel_payload(state: &KernelState, payload: ChannelPayload) {
+    release_data_payload(state, payload);
+}
+
+fn reclaim_data_payload(state: &KernelState, payload: DataPayload, drained: bool) {
     let actual_bytes = payload.actual_bytes().unwrap_or(0);
     let fragmented = matches!(&payload, ChannelPayload::Fragmented(_));
     let _ = state.with_transport_mut(|transport| {
@@ -433,13 +437,17 @@ fn reclaim_channel_payload(state: &KernelState, payload: ChannelPayload, drained
         Ok(())
     });
     crate::trace::record_channel_reclaim(actual_bytes, fragmented, drained);
-    release_channel_payload(state, payload);
+    release_data_payload(state, payload);
+}
+
+fn reclaim_channel_payload(state: &KernelState, payload: ChannelPayload, drained: bool) {
+    reclaim_data_payload(state, payload, drained);
 }
 
 fn release_channel_message(state: &KernelState, message: ChannelMsgDesc) {
     let (payload, handles) = message.into_parts();
     release_transferred_handles(state, &handles);
-    reclaim_channel_payload(state, payload, true);
+    reclaim_data_payload(state, payload, true);
 }
 
 fn retain_transferred_handles(state: &KernelState, handles: &[TransferredCap]) {
@@ -574,6 +582,25 @@ pub(crate) fn try_remap_loaned_channel_read(
     })
 }
 
+pub(crate) fn socket_is_datagram(handle: zx_handle_t) -> Result<bool, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let endpoint =
+            state.with_registry(|registry| match registry.get(resolved.object_key()) {
+                Some(KernelObject::Socket(endpoint)) => Ok(*endpoint),
+                Some(_) => Err(ZX_ERR_WRONG_TYPE),
+                None => Err(ZX_ERR_BAD_HANDLE),
+            })?;
+        state.with_transport(|transport| {
+            let core = transport
+                .socket_cores
+                .get(&endpoint.core_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            Ok(core.mode() == SocketMode::Datagram)
+        })
+    })
+}
+
 /// Write bytes into one socket endpoint.
 pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<usize, zx_status_t> {
     if options != 0 {
@@ -654,8 +681,128 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
     })
 }
 
+/// Write one message-atomic payload into one DATAGRAM socket endpoint.
+pub fn socket_write_payload(
+    handle: zx_handle_t,
+    options: u32,
+    payload: DataPayload,
+) -> Result<usize, zx_status_t> {
+    if options != 0 {
+        let _ = with_state_mut(|state| {
+            release_data_payload(state, payload);
+            Ok(())
+        });
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let mut payload = Some(payload);
+        let resolved = match state.lookup_handle(handle, crate::task::HandleRights::empty()) {
+            Ok(resolved) => resolved,
+            Err(status) => {
+                if let Some(payload) = payload.take() {
+                    release_data_payload(state, payload);
+                }
+                return Err(status);
+            }
+        };
+        let endpoint =
+            match state.with_registry(|registry| match registry.get(resolved.object_key()) {
+                Some(KernelObject::Socket(endpoint)) => Ok(*endpoint),
+                Some(_) => Err(ZX_ERR_WRONG_TYPE),
+                None => Err(ZX_ERR_BAD_HANDLE),
+            }) {
+                Ok(endpoint) => endpoint,
+                Err(status) => {
+                    if let Some(payload) = payload.take() {
+                        release_data_payload(state, payload);
+                    }
+                    return Err(status);
+                }
+            };
+        if let Err(status) = require_handle_rights(resolved, crate::task::HandleRights::WRITE) {
+            if let Some(payload) = payload.take() {
+                release_data_payload(state, payload);
+            }
+            return Err(status);
+        }
+
+        let Some(write_payload) = payload.take() else {
+            return Err(ZX_ERR_BAD_STATE);
+        };
+        let payload_len =
+            usize::try_from(write_payload.actual_bytes()?).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let preflight = state.with_transport(|transport| {
+            let Some(core) = transport.socket_cores.get(&endpoint.core_id) else {
+                return Err(ZX_ERR_BAD_STATE);
+            };
+            if core.mode() != SocketMode::Datagram {
+                return Err(ZX_ERR_WRONG_TYPE);
+            }
+            let (queue, peer_open) = match endpoint.side {
+                SocketSide::A => (&core.dir_ab, core.open_b),
+                SocketSide::B => (&core.dir_ba, core.open_a),
+            };
+            if !peer_open {
+                return Err(ZX_ERR_PEER_CLOSED);
+            }
+            match queue {
+                SocketQueue::Stream(_) => Err(ZX_ERR_WRONG_TYPE),
+                SocketQueue::Datagram(queue) => {
+                    let Some(next_bytes) = queue.buffered_bytes().checked_add(payload_len) else {
+                        return Err(ZX_ERR_OUT_OF_RANGE);
+                    };
+                    if queue.queued_messages() >= queue.capacity_messages
+                        || next_bytes > queue.capacity_bytes
+                    {
+                        return Err(ZX_ERR_SHOULD_WAIT);
+                    }
+                    Ok(())
+                }
+            }
+        });
+
+        if let Err(status) = preflight {
+            release_data_payload(state, write_payload);
+            if status == ZX_ERR_SHOULD_WAIT {
+                let _ = state.with_transport_mut(|transport| {
+                    transport.note_socket_datagram_write_should_wait();
+                    Ok(())
+                });
+            }
+            return Err(status);
+        }
+
+        let (written, buffered_after, messages_after) = state.with_transport_mut(|transport| {
+            let core = transport
+                .socket_cores
+                .get_mut(&endpoint.core_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            let written = core.write_payload(endpoint.side, write_payload)?;
+            Ok((written, core.buffered_bytes(), core.buffered_messages()))
+        })?;
+
+        state.with_transport_mut(|transport| {
+            transport.note_socket_datagram_write(written, buffered_after, messages_after);
+            crate::trace::record_socket_datagram_enqueue(
+                written as u32,
+                messages_after as u32,
+                buffered_after as u32,
+            );
+            Ok(())
+        })?;
+        let _ = publish_object_signals(state, resolved.object_key());
+        let _ = publish_object_signals(state, endpoint.peer_object);
+        Ok(payload_len)
+    })
+}
+
 /// Read bytes from one socket endpoint.
-pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<u8>, zx_status_t> {
+pub fn socket_read(
+    handle: zx_handle_t,
+    options: u32,
+    len: usize,
+) -> Result<SocketReadResult, zx_status_t> {
     let peek = match options {
         0 => false,
         ZX_SOCKET_PEEK => true,
@@ -672,16 +819,15 @@ pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<
             })?;
         require_handle_rights(resolved, crate::task::HandleRights::READ)?;
 
-        let (bytes, truncated, mode, buffered_after, messages_after) =
+        let (result, mode, buffered_after, messages_after) =
             state.with_transport_mut(|transport| {
                 let core = transport
                     .socket_cores
                     .get_mut(&endpoint.core_id)
                     .ok_or(ZX_ERR_BAD_STATE)?;
-                let (bytes, truncated) = core.read(endpoint.side, len, !peek)?;
+                let result = core.read(endpoint.side, len, !peek)?;
                 Ok((
-                    bytes,
-                    truncated,
+                    result,
                     core.mode(),
                     core.buffered_bytes(),
                     core.buffered_messages(),
@@ -689,9 +835,14 @@ pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<
             })?;
 
         if !peek {
+            let copied_bytes = match &result.payload {
+                SocketReadPayload::Copied(bytes) => bytes.len(),
+                SocketReadPayload::Payload(_) => len.min(result.actual_bytes),
+            };
+            let truncated = result.actual_bytes > copied_bytes;
             state.with_transport_mut(|transport| {
                 match mode {
-                    SocketMode::Stream => transport.note_socket_read(bytes.len()),
+                    SocketMode::Stream => transport.note_socket_read(copied_bytes),
                     SocketMode::Datagram => transport.note_socket_datagram_read(
                         buffered_after,
                         messages_after,
@@ -700,7 +851,7 @@ pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<
                 }
                 if mode == SocketMode::Datagram {
                     crate::trace::record_socket_datagram_dequeue(
-                        bytes.len() as u32,
+                        copied_bytes as u32,
                         truncated,
                         messages_after as u32,
                     );
@@ -710,8 +861,18 @@ pub fn socket_read(handle: zx_handle_t, options: u32, len: usize) -> Result<Vec<
             let _ = publish_object_signals(state, resolved.object_key());
             let _ = publish_object_signals(state, endpoint.peer_object);
         }
-        Ok(bytes)
+        Ok(result)
     })
+}
+
+pub(super) fn release_socket_core(state: &KernelState, core: SocketCore) {
+    let _ = state.with_transport_mut(|transport| {
+        transport.note_socket_core_drop(&core);
+        Ok(())
+    });
+    for payload in core.into_queued_payloads() {
+        release_data_payload(state, payload);
+    }
 }
 
 /// Write one copied message into the peer side of a channel.
@@ -985,4 +1146,13 @@ pub(crate) fn release_channel_read_result(result: ChannelReadResult) {
         reclaim_channel_payload(state, result.payload, false);
         Ok(())
     });
+}
+
+pub(crate) fn release_socket_read_result(result: SocketReadResult) {
+    if let SocketReadPayload::Payload(payload) = result.payload {
+        let _ = with_state_mut(|state| {
+            reclaim_data_payload(state, payload, false);
+            Ok(())
+        });
+    }
 }

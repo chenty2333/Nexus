@@ -870,10 +870,15 @@ const SLOT_DGRAM_CLOSE_LEFT: usize = 974;
 const SLOT_DGRAM_WAIT_PEER_CLOSED: usize = 975;
 const SLOT_DGRAM_WAIT_PEER_CLOSED_OBSERVED: usize = 976;
 const SLOT_DGRAM_WRITE_PEER_CLOSED: usize = 977;
+const SLOT_DGRAM_PAGE_WRITE: usize = 1107;
+const SLOT_DGRAM_PAGE_READ: usize = 1108;
+const SLOT_DGRAM_PAGE_READ_ACTUAL: usize = 1109;
+const SLOT_DGRAM_PAGE_MATCH: usize = 1110;
+const SLOT_SELF_JOB_H: usize = 1106;
 const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
 const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
-const SLOT_MAX: usize = SLOT_VMO_PRIVATE_CLONE_UNMAP;
+const SLOT_MAX: usize = SLOT_DGRAM_PAGE_MATCH;
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -2189,7 +2194,7 @@ fn print_net_summary(slots: &[u64]) {
 fn print_datagram_summary(slots: &[u64]) {
     let socket = crate::object::transport::socket_telemetry_snapshot();
     crate::kprintln!(
-        "kernel: socket datagram smoke (dgram_present={}, dgram_failure_step={}, create={}, wait_writable={}, write_first={}, wait_readable={}, peek={}, peek_actual={}, peek_match={}, read_first={}, read_first_actual={}, read_first_match={}, write_trunc={}, read_trunc={}, read_trunc_actual={}, read_trunc_prefix={}, read_after_trunc={}, fill_should_wait={}, drain_after_fill={}, write_recover={}, close_left={}, wait_peer_closed={}, wait_peer_closed_observed={}, write_peer_closed={}, datagram_peak_buffered_bytes={}, datagram_peak_buffered_messages={}, datagram_write_count={}, datagram_read_count={}, datagram_write_should_wait={}, datagram_truncated_read_count={})",
+        "kernel: socket datagram smoke (dgram_present={}, dgram_failure_step={}, create={}, wait_writable={}, write_first={}, wait_readable={}, peek={}, peek_actual={}, peek_match={}, read_first={}, read_first_actual={}, read_first_match={}, write_trunc={}, read_trunc={}, read_trunc_actual={}, read_trunc_prefix={}, read_after_trunc={}, page_write={}, page_read={}, page_read_actual={}, page_match={}, fill_should_wait={}, drain_after_fill={}, write_recover={}, close_left={}, wait_peer_closed={}, wait_peer_closed_observed={}, write_peer_closed={}, datagram_peak_buffered_bytes={}, datagram_peak_buffered_messages={}, datagram_write_count={}, datagram_read_count={}, datagram_write_should_wait={}, datagram_truncated_read_count={})",
         slots[SLOT_DGRAM_PRESENT],
         slots[SLOT_DGRAM_FAILURE_STEP],
         slots[SLOT_DGRAM_CREATE] as i64,
@@ -2207,6 +2212,10 @@ fn print_datagram_summary(slots: &[u64]) {
         slots[SLOT_DGRAM_READ_TRUNC_ACTUAL],
         slots[SLOT_DGRAM_READ_TRUNC_PREFIX],
         slots[SLOT_DGRAM_READ_AFTER_TRUNC] as i64,
+        slots[SLOT_DGRAM_PAGE_WRITE] as i64,
+        slots[SLOT_DGRAM_PAGE_READ] as i64,
+        slots[SLOT_DGRAM_PAGE_READ_ACTUAL],
+        slots[SLOT_DGRAM_PAGE_MATCH],
         slots[SLOT_DGRAM_FILL_SHOULD_WAIT] as i64,
         slots[SLOT_DGRAM_DRAIN_AFTER_FILL],
         slots[SLOT_DGRAM_WRITE_RECOVER] as i64,
@@ -3018,6 +3027,8 @@ pub fn prepare() -> u64 {
         crate::object::process::bootstrap_self_thread_koid().unwrap_or(0);
     slots[SLOT_SELF_PROCESS_H] =
         crate::object::process::bootstrap_self_process_handle().unwrap_or(0) as u64;
+    slots[SLOT_SELF_JOB_H] =
+        crate::object::process::bootstrap_self_job_handle().unwrap_or(0) as u64;
     slots[SLOT_SELF_CODE_VMO_H] =
         crate::object::vm::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64;
     slots[SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H] =

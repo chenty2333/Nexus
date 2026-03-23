@@ -385,6 +385,7 @@ That host gate now explicitly covers:
 - Bootstrap governance coverage now also includes one narrow job-tree gate:
   - `kernel.job.bootstrap`
   - one public root job must now prove:
+    - one bootstrap root-job handle is seeded into the shared-slot window
     - `ax_process_get_job()` returns the caller's owning root job
     - `ax_job_create()` creates one child job under that root
     - `zx_process_create(job_handle, ...)` creates a process directly under that child job
@@ -396,7 +397,11 @@ That host gate now explicitly covers:
 - Bootstrap socket coverage now also includes one narrow datagram gate:
   - datagram create succeeds through the normal socket object family
   - one peek/read pair proves message preservation without stream fallback
-  - one truncating read proves the current bootstrap consume-on-truncate behavior
+  - one truncating read proves:
+    - consume-on-truncate behavior
+    - full source-length writeback through the `actual` out parameter
+  - one page-aligned full-page datagram proves the queue can reuse the shared payload substrate
+    rather than only copied byte vectors
   - one bounded-fill loop proves datagram writes stay atomic and fail with `SHOULD_WAIT` rather
     than degrading into short writes
   - one peer-close wait/write pair proves peer-closed signaling and error propagation still match

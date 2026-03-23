@@ -13,6 +13,15 @@ pub fn bootstrap_self_process_handle() -> Option<zx_handle_t> {
     .flatten()
 }
 
+/// Return the bootstrap current-job handle seeded into the current process.
+pub fn bootstrap_self_job_handle() -> Option<zx_handle_t> {
+    with_state_mut(|state| {
+        state.with_registry(|registry| Ok(Some(registry.bootstrap_self_job_handle)))
+    })
+    .ok()
+    .flatten()
+}
+
 /// Return the bootstrap current-thread handle seeded into the current process.
 pub fn bootstrap_self_thread_handle() -> Option<zx_handle_t> {
     with_state_mut(|state| {

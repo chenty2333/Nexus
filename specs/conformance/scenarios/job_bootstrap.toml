@@ -34,6 +34,8 @@ policy_wait_denied = -30
 [assertions.packet_fields]
 job_present = 1
 job_failure_step = 0
+root_job_slot_present = 1
+root_job_slot_same = 1
 root_child_jobs_before = 0
 child_job_same = 1
 child_process_count_after = 1
