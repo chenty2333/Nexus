@@ -494,18 +494,43 @@ pub struct ReadResponse {
     pub status: zx_status_t,
     /// Bytes returned by the server.
     pub bytes: Vec<u8>,
+    /// Byte count carried by the bulk VMO path, when present.
+    pub bulk_len: u32,
+    /// Optional VMO handle carrying the bulk read payload.
+    pub vmo: Option<zx_handle_t>,
 }
 
 impl ReadResponse {
+    /// Build one inline-byte response.
+    pub fn inline(status: zx_status_t, bytes: Vec<u8>) -> Self {
+        Self {
+            status,
+            bytes,
+            bulk_len: 0,
+            vmo: None,
+        }
+    }
+
+    /// Build one VMO-backed bulk response.
+    pub fn bulk(status: zx_status_t, bulk_len: u32, vmo: zx_handle_t) -> Self {
+        Self {
+            status,
+            bytes: Vec::new(),
+            bulk_len,
+            vmo: Some(vmo),
+        }
+    }
+
     /// Encode this response into one channel message.
     pub fn encode_channel_message(&self) -> EncodedMessage {
         let mut writer = Writer::new();
         write_message_header(&mut writer, FsMessageKind::ReadResponse);
         writer.write_i32(self.status);
+        writer.write_u32(self.bulk_len);
         writer.write_bytes(&self.bytes);
         EncodedMessage {
             bytes: writer.finish(),
-            handles: Vec::new(),
+            handles: self.vmo.into_iter().collect(),
         }
     }
 
@@ -514,17 +539,26 @@ impl ReadResponse {
         bytes: &[u8],
         handles: &[zx_handle_t],
     ) -> Result<Self, CodecError> {
-        if !handles.is_empty() {
+        let mut reader = Reader::new(bytes);
+        expect_message_header(&mut reader, FsMessageKind::ReadResponse)?;
+        let status = reader.read_i32()?;
+        let bulk_len = reader.read_u32()?;
+        let payload = reader.read_bytes()?;
+        let expected_handles = usize::from(bulk_len != 0);
+        if handles.len() != expected_handles {
             return Err(CodecError::HandleCountMismatch {
-                expected: 0,
+                expected: expected_handles,
                 actual: handles.len(),
             });
         }
-        let mut reader = Reader::new(bytes);
-        expect_message_header(&mut reader, FsMessageKind::ReadResponse)?;
+        if bulk_len != 0 && !payload.is_empty() {
+            return Err(CodecError::TrailingBytes);
+        }
         let response = Self {
-            status: reader.read_i32()?,
-            bytes: reader.read_bytes()?,
+            status,
+            bytes: payload,
+            bulk_len,
+            vmo: handles.first().copied(),
         };
         reader.finish()?;
         Ok(response)
@@ -540,19 +574,46 @@ pub struct WriteRequest {
     pub flags: u32,
     /// Bytes to write.
     pub bytes: Vec<u8>,
+    /// Byte count carried by the bulk VMO path, when present.
+    pub bulk_len: u32,
+    /// Optional VMO handle carrying the bulk write payload.
+    pub vmo: Option<zx_handle_t>,
 }
 
 impl WriteRequest {
+    /// Build one inline-byte write request.
+    pub fn inline(object: ObjectIdentity, flags: u32, bytes: Vec<u8>) -> Self {
+        Self {
+            object,
+            flags,
+            bytes,
+            bulk_len: 0,
+            vmo: None,
+        }
+    }
+
+    /// Build one VMO-backed bulk write request.
+    pub fn bulk(object: ObjectIdentity, flags: u32, bulk_len: u32, vmo: zx_handle_t) -> Self {
+        Self {
+            object,
+            flags,
+            bytes: Vec::new(),
+            bulk_len,
+            vmo: Some(vmo),
+        }
+    }
+
     /// Encode this request into one channel message.
     pub fn encode_channel_message(&self) -> EncodedMessage {
         let mut writer = Writer::new();
         write_message_header(&mut writer, FsMessageKind::WriteRequest);
         self.object.encode(&mut writer);
         writer.write_u32(self.flags);
+        writer.write_u32(self.bulk_len);
         writer.write_bytes(&self.bytes);
         EncodedMessage {
             bytes: writer.finish(),
-            handles: Vec::new(),
+            handles: self.vmo.into_iter().collect(),
         }
     }
 
@@ -561,18 +622,28 @@ impl WriteRequest {
         bytes: &[u8],
         handles: &[zx_handle_t],
     ) -> Result<Self, CodecError> {
-        if !handles.is_empty() {
+        let mut reader = Reader::new(bytes);
+        expect_message_header(&mut reader, FsMessageKind::WriteRequest)?;
+        let object = ObjectIdentity::decode(&mut reader)?;
+        let flags = reader.read_u32()?;
+        let bulk_len = reader.read_u32()?;
+        let bytes = reader.read_bytes()?;
+        let expected_handles = usize::from(bulk_len != 0);
+        if handles.len() != expected_handles {
             return Err(CodecError::HandleCountMismatch {
-                expected: 0,
+                expected: expected_handles,
                 actual: handles.len(),
             });
         }
-        let mut reader = Reader::new(bytes);
-        expect_message_header(&mut reader, FsMessageKind::WriteRequest)?;
+        if bulk_len != 0 && !bytes.is_empty() {
+            return Err(CodecError::TrailingBytes);
+        }
         let request = Self {
-            object: ObjectIdentity::decode(&mut reader)?,
-            flags: reader.read_u32()?,
-            bytes: reader.read_bytes()?,
+            object,
+            flags,
+            bytes,
+            bulk_len,
+            vmo: handles.first().copied(),
         };
         reader.finish()?;
         Ok(request)
@@ -1076,15 +1147,30 @@ mod tests {
             read
         );
 
-        let write = WriteRequest {
-            object: ObjectIdentity::new(5, 4, 3),
-            flags: 1,
-            bytes: alloc::vec![1, 2, 3, 4],
-        };
+        let write = WriteRequest::inline(ObjectIdentity::new(5, 4, 3), 1, alloc::vec![1, 2, 3, 4]);
         let write_encoded = write.encode_channel_message();
         assert_eq!(
             WriteRequest::decode_channel_message(&write_encoded.bytes, &write_encoded.handles)
                 .expect("decode write"),
+            write
+        );
+    }
+
+    #[test]
+    fn bulk_read_and_write_messages_round_trip() {
+        let read = ReadResponse::bulk(0, 8192, 77);
+        let read_encoded = read.encode_channel_message();
+        assert_eq!(
+            ReadResponse::decode_channel_message(&read_encoded.bytes, &read_encoded.handles)
+                .expect("decode bulk read"),
+            read
+        );
+
+        let write = WriteRequest::bulk(ObjectIdentity::new(5, 4, 3), 0, 4096, 66);
+        let write_encoded = write.encode_channel_message();
+        assert_eq!(
+            WriteRequest::decode_channel_message(&write_encoded.bytes, &write_encoded.handles)
+                .expect("decode bulk write"),
             write
         );
     }

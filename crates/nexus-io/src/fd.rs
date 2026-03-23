@@ -17,13 +17,16 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use libax::compat::{
     zx_channel_create, zx_channel_read_alloc, zx_channel_write, zx_handle_close, zx_socket_read,
-    zx_socket_write,
+    zx_socket_write, zx_vmo_create, zx_vmo_read, zx_vmo_write,
 };
 use nexus_fs_proto::{
     CloneRequest, CloseRequest, CodecError, DescribeResponse, DirEntryRecord, GetVmoRequest,
     GetVmoResponse, NodeDescriptor, NodeKind, ObjectIdentity, OpenRequest, ReadDirRequest,
     ReadDirResponse, ReadRequest, ReadResponse, WriteRequest, WriteResponse,
 };
+
+const REMOTE_FILE_BULK_DATA_THRESHOLD: usize = 1024;
+const REMOTE_FILE_BULK_PAGE_BYTES: u64 = 4096;
 
 /// POSIX-shaped file descriptor number.
 pub type RawFd = i32;
@@ -699,7 +702,13 @@ impl FdOps for RemoteFile {
         let response =
             ReadResponse::decode_channel_message(&bytes, &handles).map_err(map_codec_error)?;
         if response.status != ZX_OK {
+            if let Some(vmo) = response.vmo {
+                let _ = zx_handle_close(vmo);
+            }
             return Err(response.status);
+        }
+        if let Some(vmo) = response.vmo {
+            return read_bulk_vmo_into_buffer(vmo, buffer, response.bulk_len as usize);
         }
         let actual = response.bytes.len().min(buffer.len());
         buffer[..actual].copy_from_slice(&response.bytes[..actual]);
@@ -708,10 +717,15 @@ impl FdOps for RemoteFile {
 
     fn write(&self, buffer: &[u8]) -> Result<usize, zx_status_t> {
         let handle = checked_channel_handle(self.node.handle())?;
-        let request = WriteRequest {
-            object: self.node.descriptor.identity,
-            flags: 0,
-            bytes: buffer.to_vec(),
+        let request = if buffer.len() >= REMOTE_FILE_BULK_DATA_THRESHOLD {
+            WriteRequest::bulk(
+                self.node.descriptor.identity,
+                0,
+                u32::try_from(buffer.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+                create_bulk_vmo_from_bytes(buffer)?,
+            )
+        } else {
+            WriteRequest::inline(self.node.descriptor.identity, 0, buffer.to_vec())
         };
         write_encoded_message(handle, request.encode_channel_message())?;
         let (bytes, handles) = read_channel_message(handle)?;
@@ -1204,7 +1218,14 @@ fn write_encoded_message(
         },
         message.handles.len() as u32,
     );
-    if status == ZX_OK { Ok(()) } else { Err(status) }
+    if status == ZX_OK {
+        Ok(())
+    } else {
+        for transferred in message.handles {
+            let _ = zx_handle_close(transferred);
+        }
+        Err(status)
+    }
 }
 
 fn read_channel_message(handle: zx_handle_t) -> Result<(Vec<u8>, Vec<zx_handle_t>), zx_status_t> {
@@ -1219,6 +1240,47 @@ fn read_channel_message(handle: zx_handle_t) -> Result<(Vec<u8>, Vec<zx_handle_t
 
 fn map_codec_error(_error: CodecError) -> zx_status_t {
     ZX_ERR_IO_DATA_INTEGRITY
+}
+
+fn round_bulk_vmo_size(len: usize) -> Result<u64, zx_status_t> {
+    if len == 0 {
+        return Ok(REMOTE_FILE_BULK_PAGE_BYTES);
+    }
+    let raw = u64::try_from(len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let mask = REMOTE_FILE_BULK_PAGE_BYTES - 1;
+    raw.checked_add(mask)
+        .map(|rounded| rounded & !mask)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)
+}
+
+fn create_bulk_vmo_from_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
+    let mut vmo = ZX_HANDLE_INVALID;
+    let status = zx_vmo_create(round_bulk_vmo_size(bytes.len())?, 0, &mut vmo);
+    if status != ZX_OK {
+        return Err(status);
+    }
+    if !bytes.is_empty() {
+        let status = zx_vmo_write(vmo, bytes, 0);
+        if status != ZX_OK {
+            let _ = zx_handle_close(vmo);
+            return Err(status);
+        }
+    }
+    Ok(vmo)
+}
+
+fn read_bulk_vmo_into_buffer(
+    vmo: zx_handle_t,
+    buffer: &mut [u8],
+    actual_len: usize,
+) -> Result<usize, zx_status_t> {
+    let copy_len = actual_len.min(buffer.len());
+    let status = zx_vmo_read(vmo, &mut buffer[..copy_len], 0);
+    let _ = zx_handle_close(vmo);
+    if status != ZX_OK {
+        return Err(status);
+    }
+    Ok(copy_len)
 }
 
 fn receive_described_remote_object(

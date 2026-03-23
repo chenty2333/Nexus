@@ -97,7 +97,8 @@ rest of the leaf references should be treated as `working` current-state docs.
 - `crates/libzircon` - frozen `zx_*` compat wrappers over the current Axle `int 0x80` ABI; no longer a direct dependency for native `nexus-*` crates
 - `crates/nexus-component` - minimal component declaration IR, resolver result shape, bootstrap-channel start payloads, and tiny lifecycle/directory messages
 - `crates/nexus-fs-proto` - shared filesystem wire contract: identities, open
-  flags, `GetVmo`, and routed directory/file operations used by `nexus-io` and
+  flags, `GetVmo`, routed directory/file operations, and one VMO-backed bulk
+  transfer option for ordinary file `read` / `write` used by `nexus-io` and
   the bootstrap service stack
 - `crates/nexus-fs-model` - host-side DataFS-prep reference model over metadata
   state transitions, logical journaling, crash invariants, and replay

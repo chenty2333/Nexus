@@ -1,11 +1,15 @@
+use alloc::vec;
 use alloc::vec::Vec;
 
 use axle_types::status::{
-    ZX_ERR_BAD_STATE, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NOT_SUPPORTED, ZX_ERR_PEER_CLOSED,
-    ZX_ERR_SHOULD_WAIT, ZX_OK,
+    ZX_ERR_BAD_STATE, ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE,
+    ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_OK,
 };
 use axle_types::{zx_handle_t, zx_status_t};
-use libax::compat::{ZX_TIME_INFINITE, zx_channel_read_alloc, zx_channel_write};
+use libax::compat::{
+    ZX_TIME_INFINITE, zx_channel_read_alloc, zx_channel_write, zx_handle_close, zx_vmo_create,
+    zx_vmo_read, zx_vmo_write,
+};
 use nexus_fs_proto::{
     CloneRequest, CloseRequest, DescribeResponse, DirEntryRecord, FsMessageKind, GetVmoRequest,
     GetVmoResponse, NodeDescriptor, NodeKind, ObjectIdentity, OpenRequest, ReadDirRequest,
@@ -26,6 +30,8 @@ const ECHO_NODE_ID: u64 = 2;
 const ECHO_FILE_OPEN_FILE_ID: u64 = 2;
 const ECHO_FILE_FROM_CLONED_DIR_OPEN_FILE_ID: u64 = 4;
 const ECHO_FILE_CLONE_OPEN_FILE_ID: u64 = 5;
+const BULK_DATA_THRESHOLD: usize = 1024;
+const BULK_VMO_PAGE_BYTES: u64 = 4096;
 
 pub(crate) fn root_directory_descriptor() -> NodeDescriptor {
     NodeDescriptor::new(
@@ -136,11 +142,15 @@ fn serve_file(
                 let request = WriteRequest::decode_channel_message(&bytes, &handles)
                     .map_err(|_| ZX_ERR_IO_DATA_INTEGRITY)?;
                 ensure_identity(request.object, descriptor.identity)?;
-                pending = request.bytes.clone();
+                pending = if let Some(vmo) = request.vmo {
+                    read_bulk_vmo_bytes(vmo, request.bulk_len as usize)?
+                } else {
+                    request.bytes.clone()
+                };
                 send_write_response(
                     handle,
                     ZX_OK,
-                    u32::try_from(request.bytes.len()).map_err(|_| ZX_ERR_BAD_STATE)?,
+                    u32::try_from(pending.len()).map_err(|_| ZX_ERR_BAD_STATE)?,
                 )?;
             }
             FsMessageKind::ReadRequest => {
@@ -245,14 +255,17 @@ fn send_read_response(
     status: zx_status_t,
     bytes: &[u8],
 ) -> Result<(), zx_status_t> {
-    write_message(
-        handle,
-        ReadResponse {
+    let message = if status == ZX_OK && bytes.len() >= BULK_DATA_THRESHOLD {
+        ReadResponse::bulk(
             status,
-            bytes: bytes.to_vec(),
-        }
-        .encode_channel_message(),
-    )
+            u32::try_from(bytes.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
+            create_bulk_vmo_from_bytes(bytes)?,
+        )
+        .encode_channel_message()
+    } else {
+        ReadResponse::inline(status, bytes.to_vec()).encode_channel_message()
+    };
+    write_message(handle, message)
 }
 
 fn send_write_response(
@@ -308,7 +321,14 @@ fn write_message(
         },
         message.handles.len() as u32,
     );
-    if status == ZX_OK { Ok(()) } else { Err(status) }
+    if status == ZX_OK {
+        Ok(())
+    } else {
+        for transferred in message.handles {
+            let _ = zx_handle_close(transferred);
+        }
+        Err(status)
+    }
 }
 
 fn forward_raw_message(
@@ -328,7 +348,51 @@ fn forward_raw_message(
         },
         handles.len() as u32,
     );
-    if status == ZX_OK { Ok(()) } else { Err(status) }
+    if status == ZX_OK {
+        Ok(())
+    } else {
+        for &transferred in handles {
+            let _ = zx_handle_close(transferred);
+        }
+        Err(status)
+    }
+}
+
+fn round_bulk_vmo_size(len: usize) -> Result<u64, zx_status_t> {
+    if len == 0 {
+        return Ok(BULK_VMO_PAGE_BYTES);
+    }
+    let raw = u64::try_from(len).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+    let mask = BULK_VMO_PAGE_BYTES - 1;
+    raw.checked_add(mask)
+        .map(|rounded| rounded & !mask)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)
+}
+
+fn create_bulk_vmo_from_bytes(bytes: &[u8]) -> Result<zx_handle_t, zx_status_t> {
+    let mut handle = 0;
+    let status = zx_vmo_create(round_bulk_vmo_size(bytes.len())?, 0, &mut handle);
+    if status != ZX_OK {
+        return Err(status);
+    }
+    if !bytes.is_empty() {
+        let status = zx_vmo_write(handle, bytes, 0);
+        if status != ZX_OK {
+            let _ = zx_handle_close(handle);
+            return Err(status);
+        }
+    }
+    Ok(handle)
+}
+
+fn read_bulk_vmo_bytes(vmo: zx_handle_t, len: usize) -> Result<Vec<u8>, zx_status_t> {
+    let mut bytes = vec![0u8; len];
+    let status = zx_vmo_read(vmo, &mut bytes, 0);
+    let _ = zx_handle_close(vmo);
+    if status != ZX_OK {
+        return Err(status);
+    }
+    Ok(bytes)
 }
 
 fn read_message_waiting(handle: zx_handle_t) -> Result<Option<ChannelMessage>, zx_status_t> {

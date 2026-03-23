@@ -82,6 +82,10 @@ Practical meaning:
   - shared pager-backed/file-backed source handles
   - staged shared-anonymous source handles for byte-backed assets
   and freezes them as readable but not directly writable/resizable
+- the live channel protocol is still the control plane, but ordinary remote
+  file `read` / `write` traffic may now also use one VMO-backed bulk path for
+  larger payloads instead of always serializing every byte through the channel
+  body
 - coherent writable mappings, writeback invalidation, and mmap-driven dirty-page
   ownership are explicitly out of scope for v1
 
@@ -98,7 +102,8 @@ will need:
   - `SharedRing`
 
 This is only a reservation layer today. The live filesystem service protocol is
-still small and channel-based, but the model and checker already assume that the
+still small and channel-based, now with one VMO-backed bulk transfer option for
+ordinary read/write payloads, but the model and checker already assume that the
 transport and reconnect identity must not be retrofitted later.
 
 ## Current invariants
