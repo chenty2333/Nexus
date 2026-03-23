@@ -46,14 +46,6 @@ impl Kernel {
             .is_some_and(|scheduler| scheduler.online)
     }
 
-    fn cpu_is_idle(&self, cpu_id: usize) -> bool {
-        self.cpu_schedulers.get(&cpu_id).is_some_and(|scheduler| {
-            scheduler.online
-                && scheduler.current_thread_id.is_none()
-                && scheduler.run_queue.is_empty()
-        })
-    }
-
     pub(super) fn first_idle_cpu_excluding(&self, excluded_cpu_id: usize) -> Option<usize> {
         self.cpu_schedulers.iter().find_map(|(&cpu_id, scheduler)| {
             (cpu_id != excluded_cpu_id

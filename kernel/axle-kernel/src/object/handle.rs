@@ -152,8 +152,6 @@ impl KernelState {
         self.registry.lock().handle_refcount(object_key)
     }
 
-    pub(super) fn forget_object_handle_refs(&self, _object_key: ObjectKey) {}
-
     pub(super) fn decrement_object_handle_ref(&self, object_key: ObjectKey) {
         self.registry.lock().decrement_handle_ref(object_key);
     }

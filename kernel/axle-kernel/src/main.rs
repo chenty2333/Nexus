@@ -7,7 +7,6 @@
 #![cfg_attr(not(test), no_main)]
 
 mod arch;
-mod bringup;
 mod copy;
 mod fault;
 mod futex;

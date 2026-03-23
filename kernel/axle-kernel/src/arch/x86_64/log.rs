@@ -20,8 +20,3 @@ macro_rules! kprintln {
 pub fn _print(args: fmt::Arguments<'_>) {
     serial::_print(args);
 }
-
-pub fn println(args: fmt::Arguments<'_>) {
-    serial::_print(args);
-    serial::_print(format_args!("\n"));
-}

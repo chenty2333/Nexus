@@ -65,14 +65,6 @@ impl FutexTable {
             .unwrap_or(ZX_KOID_INVALID)
     }
 
-    /// Return whether `thread_id` is currently queued on `key`.
-    pub(crate) fn is_waiter(&self, key: FutexKey, thread_id: u64) -> bool {
-        self.queues
-            .get(&key)
-            .map(|queue| queue.waiters.iter().any(|waiter| *waiter == thread_id))
-            .unwrap_or(false)
-    }
-
     /// Enqueue one waiter in FIFO order.
     pub(crate) fn enqueue_waiter(&mut self, key: FutexKey, thread_id: u64, owner_koid: zx_koid_t) {
         let queue = self.queues.entry(key).or_default();

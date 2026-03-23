@@ -31,15 +31,6 @@ pub fn bootstrap_self_thread_handle() -> Option<zx_handle_t> {
     .flatten()
 }
 
-/// Return the bootstrap current-process image layout.
-pub fn bootstrap_process_image_layout() -> Option<crate::task::ProcessImageLayout> {
-    with_state_mut(|state| {
-        state.with_registry(|registry| Ok(Some(registry.bootstrap_process_image_layout.clone())))
-    })
-    .ok()
-    .flatten()
-}
-
 /// Return the bootstrap current-thread koid.
 pub fn bootstrap_self_thread_koid() -> Option<zx_koid_t> {
     with_kernel(|kernel| kernel.current_thread_koid()).ok()

@@ -6,28 +6,26 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use axle_arch_x86_64::debug_break;
 use libzircon::handle::ZX_HANDLE_INVALID;
 use libzircon::rights::ZX_RIGHT_SAME_RIGHTS;
-use libzircon::signals::{ZX_CHANNEL_PEER_CLOSED, ZX_CHANNEL_READABLE};
-use libzircon::status::ZX_OK;
+use libzircon::status::{ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_OK};
 use libzircon::vmo::{
     ZX_VMO_BACKING_SCOPE_GLOBAL_SHARED, ZX_VMO_BACKING_SCOPE_LOCAL_PRIVATE, ZX_VMO_KIND_ANONYMOUS,
     zx_vmo_info_t,
 };
 use libzircon::{
     ax_process_prepare_start, ax_vmo_get_info, zx_channel_create, zx_channel_read,
-    zx_channel_write, zx_handle_close, zx_handle_duplicate, zx_handle_t, zx_object_wait_one,
-    zx_process_create, zx_process_start, zx_signals_t, zx_task_kill, zx_thread_create,
-    zx_vmo_create,
+    zx_channel_write, zx_handle_close, zx_handle_duplicate, zx_handle_t, zx_process_create,
+    zx_process_start, zx_task_kill, zx_thread_create, zx_vmo_create,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
 const ANON_VMO_SIZE: u64 = 4096;
-const WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
 const HEAP_BYTES: usize = 8 * 1024;
+const CHILD_SETTLE_SPINS: usize = 100_000;
+const REPLY_POLL_LIMIT: usize = 1_000_000;
 
 const SLOT_OK: usize = 0;
 const SLOT_SELF_PROCESS_H: usize = 396;
 const SLOT_SELF_CODE_VMO_H: usize = 506;
-const SLOT_T0_NS: usize = 511;
 const SLOT_VMO_PROMOTION_PRESENT: usize = 1068;
 const SLOT_VMO_PROMOTION_FAILURE_STEP: usize = 1069;
 const SLOT_VMO_PROMOTION_CREATE: usize = 1070;
@@ -212,6 +210,28 @@ fn run_vmo_promotion_smoke() -> VmoPromotionSummary {
         return summary;
     }
 
+    let mut transferred_vmo = ZX_HANDLE_INVALID;
+    summary.handle_dup_status =
+        zx_handle_duplicate(anon_vmo, ZX_RIGHT_SAME_RIGHTS, &mut transferred_vmo) as i64;
+    if summary.handle_dup_status != ZX_OK as i64 {
+        summary.failure_step = STEP_HANDLE_DUP;
+        close_if_valid(parent_channel);
+        close_if_valid(child_channel);
+        close_if_valid(anon_vmo);
+        return summary;
+    }
+
+    summary.transfer_status =
+        zx_channel_write(parent_channel, 0, ptr::null(), 0, &transferred_vmo, 1) as i64;
+    if summary.transfer_status != ZX_OK as i64 {
+        summary.failure_step = STEP_TRANSFER;
+        close_if_valid(transferred_vmo);
+        close_if_valid(parent_channel);
+        close_if_valid(child_channel);
+        close_if_valid(anon_vmo);
+        return summary;
+    }
+
     summary.process_create_status =
         zx_process_create(self_process, 0, &mut child.process, &mut child.root_vmar) as i64;
     if summary.process_create_status != ZX_OK as i64 {
@@ -276,41 +296,42 @@ fn run_vmo_promotion_smoke() -> VmoPromotionSummary {
         close_if_valid(anon_vmo);
         return summary;
     }
+    close_if_valid(child_channel);
     child_channel = ZX_HANDLE_INVALID;
-
-    let mut transferred_vmo = ZX_HANDLE_INVALID;
-    summary.handle_dup_status =
-        zx_handle_duplicate(anon_vmo, ZX_RIGHT_SAME_RIGHTS, &mut transferred_vmo) as i64;
-    if summary.handle_dup_status != ZX_OK as i64 {
-        summary.failure_step = STEP_HANDLE_DUP;
-        let _ = zx_task_kill(child.process);
-        close_child_process(&child);
-        close_if_valid(parent_channel);
-        close_if_valid(anon_vmo);
-        return summary;
+    for _ in 0..CHILD_SETTLE_SPINS {
+        core::hint::spin_loop();
     }
 
-    summary.transfer_status =
-        zx_channel_write(parent_channel, 0, ptr::null(), 0, &transferred_vmo, 1) as i64;
-    if summary.transfer_status != ZX_OK as i64 {
-        summary.failure_step = STEP_TRANSFER;
-        close_if_valid(transferred_vmo);
-        let _ = zx_task_kill(child.process);
-        close_child_process(&child);
-        close_if_valid(parent_channel);
-        close_if_valid(anon_vmo);
-        return summary;
+    let mut reply = ChildReply::default();
+    let mut actual_bytes = 0_u32;
+    let mut actual_handles = 0_u32;
+    let mut read_status = ZX_ERR_SHOULD_WAIT;
+    for _ in 0..REPLY_POLL_LIMIT {
+        read_status = zx_channel_read(
+            parent_channel,
+            0,
+            (&mut reply as *mut ChildReply).cast::<u8>(),
+            ptr::null_mut(),
+            size_of::<ChildReply>() as u32,
+            0,
+            &mut actual_bytes,
+            &mut actual_handles,
+        );
+        if read_status == ZX_OK {
+            summary.wait_reply_status = ZX_OK as i64;
+            summary.wait_reply_observed = 1;
+            break;
+        }
+        if read_status != ZX_ERR_SHOULD_WAIT {
+            break;
+        }
+        core::hint::spin_loop();
     }
-
-    let mut observed: zx_signals_t = 0;
-    summary.wait_reply_status = zx_object_wait_one(
-        parent_channel,
-        ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
-        wait_deadline(),
-        &mut observed,
-    ) as i64;
-    summary.wait_reply_observed = u64::from(observed);
-    if summary.wait_reply_status != ZX_OK as i64 || (observed & ZX_CHANNEL_READABLE) == 0 {
+    if read_status == ZX_ERR_SHOULD_WAIT {
+        summary.wait_reply_status = ZX_ERR_TIMED_OUT as i64;
+    }
+    summary.read_reply_status = read_status as i64;
+    if summary.wait_reply_status != ZX_OK as i64 {
         summary.failure_step = STEP_WAIT_REPLY;
         let _ = zx_task_kill(child.process);
         close_child_process(&child);
@@ -318,20 +339,6 @@ fn run_vmo_promotion_smoke() -> VmoPromotionSummary {
         close_if_valid(anon_vmo);
         return summary;
     }
-
-    let mut reply = ChildReply::default();
-    let mut actual_bytes = 0_u32;
-    let mut actual_handles = 0_u32;
-    summary.read_reply_status = zx_channel_read(
-        parent_channel,
-        0,
-        (&mut reply as *mut ChildReply).cast::<u8>(),
-        ptr::null_mut(),
-        size_of::<ChildReply>() as u32,
-        0,
-        &mut actual_bytes,
-        &mut actual_handles,
-    ) as i64;
     summary.child_info_status = reply.status;
     summary.child_info_kind = reply.kind;
     summary.child_info_backing_scope = reply.backing_scope;
@@ -500,11 +507,6 @@ fn write_summary(summary: &VmoPromotionSummary) {
         SLOT_VMO_PROMOTION_PARENT_INFO_AFTER_BACKING_SCOPE,
         summary.parent_info_after_backing_scope,
     );
-}
-
-fn wait_deadline() -> i64 {
-    let deadline = read_slot(SLOT_T0_NS).saturating_add(WAIT_TIMEOUT_NS);
-    deadline.min(i64::MAX as u64) as i64
 }
 
 fn close_child_process(child: &ChildProcess) {

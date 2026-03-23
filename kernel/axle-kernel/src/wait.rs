@@ -209,19 +209,6 @@ pub fn queue_port_packet(handle: zx_handle_t, packet: zx_port_packet_t) -> Resul
     })
 }
 
-/// Pop one packet from a port queue.
-pub fn wait_port_packet(handle: zx_handle_t) -> Result<zx_port_packet_t, zx_status_t> {
-    object::with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let object_key = resolved.object_key();
-        require_port_object(state, object_key)?;
-        object::require_handle_rights(resolved, crate::task::HandleRights::READ)?;
-        let pkt = pop_port_packet_locked(state, object_key)?;
-        publish_port_signals_changed(state, object_key)?;
-        Ok(port_packet_from_core(pkt))
-    })
-}
-
 /// Wait for a packet on a port until `deadline`.
 ///
 /// - `deadline == 0`: non-blocking poll; returns `ZX_ERR_SHOULD_WAIT` if empty.

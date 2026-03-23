@@ -30,8 +30,8 @@ use axle_types::dma::{
 };
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::interrupt::{
-    AX_INTERRUPT_INFO_FLAG_TRIGGERABLE, AX_INTERRUPT_MODE_LEGACY, AX_INTERRUPT_MODE_MSI,
-    AX_INTERRUPT_MODE_MSIX, AX_INTERRUPT_MODE_VIRTUAL, ZX_INTERRUPT_VIRTUAL, ax_interrupt_info_t,
+    AX_INTERRUPT_INFO_FLAG_TRIGGERABLE, AX_INTERRUPT_MODE_VIRTUAL, ZX_INTERRUPT_VIRTUAL,
+    ax_interrupt_info_t,
 };
 use axle_types::koid::ZX_KOID_INVALID;
 use axle_types::rights::{ZX_RIGHT_SAME_RIGHTS, ZX_RIGHTS_ALL};
