@@ -44,9 +44,19 @@ pub struct TransferredCap {
 }
 
 impl TransferredCap {
+    /// Build one transferred capability payload.
+    pub const fn new(cap: Capability, rev: Option<RevocationRef>) -> Self {
+        Self { cap, rev }
+    }
+
     /// Return the stored capability bits.
     pub fn capability(self) -> Capability {
         self.cap
+    }
+
+    /// Return the attached revocation reference, if any.
+    pub fn revocation_ref(self) -> Option<RevocationRef> {
+        self.rev
     }
 }
 

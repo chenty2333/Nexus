@@ -88,13 +88,20 @@ The bootstrap address space is prewired enough to exercise real VM behavior earl
   - one new process record
   - one new address space
   - one root VMAR handle
-- The parent process handle authorizes creation; it is not currently a VM inheritance mechanism.
+- Process creation can now be authorized in two narrow ways:
+  - a parent process handle with `MANAGE_PROCESS`
+  - a job handle with `MANAGE_JOB`
+- The selected job becomes the child process's owner; it is not currently a VM inheritance
+  mechanism.
 - `create_thread()` creates a `New` thread in a target process.
 - `prepare_process_start()` now resolves a process image layout from either:
   - an imported metadata-backed image VMO
   - a directly parsed ELF64 ET_EXEC image VMO
   and returns prepared start parameters plus the initial user stack image.
 - `start_process()` transitions the process from `Created` to `Started` and starts one thread.
+- Each process now also caches:
+  - one owning `job_id`
+  - one effective policy-rights ceiling inherited from that job
 - Thread carriers now also cache one guest-visible x86_64 `fs_base` value for
   the current runtime/TLS bootstrap slice:
   - the kernel snapshots that base when it captures a user context
@@ -200,6 +207,9 @@ The first generic-launch contract is now implemented without changing syscall si
   - arg-handle handoff
 - Child launch, exit, and reap semantics must no longer depend on a runner-specific path in `userspace.rs`.
 - The bootstrap runner becomes one consumer of that path, not a separate launch mechanism.
+- The bootstrap handle table now also seeds one root-job handle alongside the earlier self-process,
+  self-thread, and root-VMAR handles so ring3 can discover or subdivide its current governance
+  root without inventing a separate bootstrap-only path.
 - Conformance gate:
   - contract: `must.process.generic_launch_phase1`
   - minimal scenario: `kernel.process.generic_launch_phase1`

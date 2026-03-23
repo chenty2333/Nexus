@@ -144,7 +144,8 @@ fn require_port_object(
         let obj = registry.get(object_key).ok_or(ZX_ERR_BAD_HANDLE)?;
         match obj {
             KernelObject::Port(_) => Ok(()),
-            KernelObject::Process(_)
+            KernelObject::Job(_)
+            | KernelObject::Process(_)
             | KernelObject::SuspendToken(_)
             | KernelObject::GuestSession(_)
             | KernelObject::Socket(_)
@@ -171,7 +172,8 @@ fn queue_user_port_packet(
         let obj = registry.get_mut(object_key).ok_or(ZX_ERR_BAD_HANDLE)?;
         let port = match obj {
             KernelObject::Port(port) => port,
-            KernelObject::Process(_)
+            KernelObject::Job(_)
+            | KernelObject::Process(_)
             | KernelObject::SuspendToken(_)
             | KernelObject::GuestSession(_)
             | KernelObject::Socket(_)

@@ -1,4 +1,6 @@
 use super::*;
+use axle_types::koid::ZX_KOID_INVALID;
+use axle_types::rights::ZX_RIGHTS_ALL;
 
 /// Kernel-visible description of the bootstrap current thread.
 #[derive(Clone, Copy, Debug)]
@@ -80,36 +82,73 @@ impl PreparedProcessStart {
 pub(super) struct Process {
     pub(super) koid: zx_koid_t,
     pub(super) address_space_id: AddressSpaceId,
+    pub(super) job_id: JobId,
+    pub(super) policy_rights_ceiling: HandleRights,
     cspace: CSpace,
     pub(super) state: ProcessState,
     pub(super) suspend_tokens: u32,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct Job {
+    pub(super) koid: zx_koid_t,
+    pub(super) parent_job_id: Option<JobId>,
+    pub(super) child_jobs: Vec<JobId>,
+    pub(super) child_processes: Vec<ProcessId>,
+    pub(super) policy_rights_ceiling: HandleRights,
+    pub(super) object_key: Option<ObjectKey>,
+    pub(super) suspend_tokens: u32,
+}
+
 impl Process {
-    pub(super) fn bootstrap(address_space_id: AddressSpaceId, koid: zx_koid_t) -> Self {
+    pub(super) fn bootstrap(
+        address_space_id: AddressSpaceId,
+        job_id: JobId,
+        policy_rights_ceiling: HandleRights,
+        koid: zx_koid_t,
+    ) -> Self {
         Self {
             koid,
             address_space_id,
+            job_id,
+            policy_rights_ceiling,
             cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
             state: ProcessState::Started,
             suspend_tokens: 0,
         }
     }
 
-    pub(super) fn created(address_space_id: AddressSpaceId, koid: zx_koid_t) -> Self {
+    pub(super) fn created(
+        address_space_id: AddressSpaceId,
+        job_id: JobId,
+        policy_rights_ceiling: HandleRights,
+        koid: zx_koid_t,
+    ) -> Self {
         Self {
             koid,
             address_space_id,
+            job_id,
+            policy_rights_ceiling,
             cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
             state: ProcessState::Created,
             suspend_tokens: 0,
         }
     }
 
+    fn apply_handle_policy(&self, rights: HandleRights) -> HandleRights {
+        rights & self.policy_rights_ceiling
+    }
+
     pub(super) fn alloc_handle_for_capability(
         &mut self,
         cap: Capability,
     ) -> Result<zx_handle_t, zx_status_t> {
+        let cap = Capability::new(
+            cap.object_id(),
+            self.apply_handle_policy(HandleRights::from_bits_retain(cap.rights()))
+                .bits(),
+            cap.generation(),
+        );
         let handle = self.cspace.alloc(cap).map_err(map_alloc_error)?;
         Ok(handle.raw())
     }
@@ -140,6 +179,7 @@ impl Process {
         raw: zx_handle_t,
         rights: HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
+        let rights = self.apply_handle_policy(rights);
         let handle = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
         let duplicated = self
             .cspace
@@ -154,6 +194,7 @@ impl Process {
         rights: HandleRights,
         revocation: axle_core::RevocationRef,
     ) -> Result<zx_handle_t, zx_status_t> {
+        let rights = self.apply_handle_policy(rights);
         let handle = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
         let duplicated = self
             .cspace
@@ -167,6 +208,7 @@ impl Process {
         raw: zx_handle_t,
         rights: HandleRights,
     ) -> Result<zx_handle_t, zx_status_t> {
+        let rights = self.apply_handle_policy(rights);
         let handle = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
         let replaced = self
             .cspace
@@ -190,11 +232,52 @@ impl Process {
         &mut self,
         transferred: TransferredCap,
     ) -> Result<zx_handle_t, zx_status_t> {
+        let transferred = TransferredCap::new(
+            Capability::new(
+                transferred.capability().object_id(),
+                self.apply_handle_policy(HandleRights::from_bits_retain(
+                    transferred.capability().rights(),
+                ))
+                .bits(),
+                transferred.capability().generation(),
+            ),
+            transferred.revocation_ref(),
+        );
         let handle = self
             .cspace
             .install_transfer(transferred)
             .map_err(map_alloc_error)?;
         Ok(handle.raw())
+    }
+}
+
+impl Job {
+    pub(crate) fn new_root(koid: zx_koid_t) -> Self {
+        Self {
+            koid,
+            parent_job_id: None,
+            child_jobs: Vec::new(),
+            child_processes: Vec::new(),
+            policy_rights_ceiling: HandleRights::from_zx_rights(ZX_RIGHTS_ALL),
+            object_key: None,
+            suspend_tokens: 0,
+        }
+    }
+
+    pub(crate) fn new_child(
+        parent_job_id: JobId,
+        koid: zx_koid_t,
+        policy_rights_ceiling: HandleRights,
+    ) -> Self {
+        Self {
+            koid,
+            parent_job_id: Some(parent_job_id),
+            child_jobs: Vec::new(),
+            child_processes: Vec::new(),
+            policy_rights_ceiling,
+            object_key: None,
+            suspend_tokens: 0,
+        }
     }
 }
 
@@ -208,6 +291,212 @@ pub(super) enum ProcessState {
 }
 
 impl Kernel {
+    pub(crate) fn root_job_id(&self) -> JobId {
+        self.root_job_id
+    }
+
+    pub(crate) fn job_koid(&self, job_id: JobId) -> Result<zx_koid_t, zx_status_t> {
+        Ok(self.jobs.get(&job_id).ok_or(ZX_ERR_BAD_HANDLE)?.koid)
+    }
+
+    pub(crate) fn bind_job_object(
+        &mut self,
+        job_id: JobId,
+        object_key: ObjectKey,
+    ) -> Result<(), zx_status_t> {
+        let job = self.jobs.get_mut(&job_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        job.object_key = Some(object_key);
+        Ok(())
+    }
+
+    pub(crate) fn job_object_key(&self, job_id: JobId) -> Result<ObjectKey, zx_status_t> {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.object_key)
+            .ok_or(ZX_ERR_BAD_HANDLE)
+    }
+
+    pub(crate) fn process_job_id(&self, process_id: ProcessId) -> Result<JobId, zx_status_t> {
+        Ok(self.process(process_id)?.job_id)
+    }
+
+    pub(crate) fn process_policy_rights_ceiling(
+        &self,
+        process_id: ProcessId,
+    ) -> Result<HandleRights, zx_status_t> {
+        Ok(self.process(process_id)?.policy_rights_ceiling)
+    }
+
+    pub(crate) fn create_job(
+        &mut self,
+        parent_job_id: JobId,
+    ) -> Result<(JobId, zx_koid_t), zx_status_t> {
+        let parent_policy = self
+            .jobs
+            .get(&parent_job_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .policy_rights_ceiling;
+        let job_id = self.alloc_job_id();
+        let koid = self.alloc_koid();
+        self.jobs
+            .insert(job_id, Job::new_child(parent_job_id, koid, parent_policy));
+        self.jobs
+            .get_mut(&parent_job_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .child_jobs
+            .push(job_id);
+        Ok((job_id, koid))
+    }
+
+    pub(crate) fn create_process_in_job(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<CreatedProcess, zx_status_t> {
+        let (address_space_id, root_vmar) =
+            self.with_vm_mut(|vm| vm.create_process_address_space())?;
+
+        let process_id = self.alloc_process_id();
+        let process_koid = self.alloc_koid();
+        let policy = self
+            .jobs
+            .get(&job_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .policy_rights_ceiling;
+        self.processes.insert(
+            process_id,
+            Process::created(address_space_id, job_id, policy, process_koid),
+        );
+        self.jobs
+            .get_mut(&job_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .child_processes
+            .push(process_id);
+
+        Ok(CreatedProcess {
+            process_id,
+            koid: process_koid,
+            address_space_id,
+            root_vmar,
+        })
+    }
+
+    pub(crate) fn job_info(&self, job_id: JobId) -> Result<axle_types::ax_job_info_t, zx_status_t> {
+        let job = self.jobs.get(&job_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        let live_child_processes = job
+            .child_processes
+            .iter()
+            .filter(|process_id| self.processes.contains_key(process_id))
+            .count() as u32;
+        Ok(axle_types::ax_job_info_t {
+            job_id,
+            koid: job.koid,
+            parent_koid: job
+                .parent_job_id
+                .and_then(|parent_id| self.jobs.get(&parent_id).map(|parent| parent.koid))
+                .unwrap_or(ZX_KOID_INVALID),
+            child_job_count: job.child_jobs.len() as u32,
+            child_process_count: live_child_processes,
+            policy_rights_ceiling: job.policy_rights_ceiling.bits(),
+            reserved0: 0,
+        })
+    }
+
+    pub(crate) fn set_job_policy(
+        &mut self,
+        job_id: JobId,
+        rights_ceiling: HandleRights,
+    ) -> Result<(), zx_status_t> {
+        let current = self
+            .jobs
+            .get(&job_id)
+            .ok_or(ZX_ERR_BAD_HANDLE)?
+            .policy_rights_ceiling;
+        if (rights_ceiling.bits() & !current.bits()) != 0 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        self.apply_job_policy_recursive(job_id, rights_ceiling)
+    }
+
+    fn apply_job_policy_recursive(
+        &mut self,
+        job_id: JobId,
+        rights_ceiling: HandleRights,
+    ) -> Result<(), zx_status_t> {
+        let (effective, child_jobs, child_processes) = {
+            let job = self.jobs.get_mut(&job_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+            job.policy_rights_ceiling &= rights_ceiling;
+            (
+                job.policy_rights_ceiling,
+                job.child_jobs.clone(),
+                job.child_processes.clone(),
+            )
+        };
+        for process_id in child_processes {
+            if let Some(process) = self.processes.get_mut(&process_id) {
+                process.policy_rights_ceiling &= effective;
+            }
+        }
+        for child_job_id in child_jobs {
+            self.apply_job_policy_recursive(child_job_id, effective)?;
+        }
+        Ok(())
+    }
+
+    fn descendant_process_ids(
+        &self,
+        job_id: JobId,
+        out: &mut Vec<ProcessId>,
+    ) -> Result<(), zx_status_t> {
+        let job = self.jobs.get(&job_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+        for &process_id in &job.child_processes {
+            if self.processes.contains_key(&process_id) {
+                out.push(process_id);
+            }
+        }
+        for &child_job_id in &job.child_jobs {
+            self.descendant_process_ids(child_job_id, out)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn kill_job(&mut self, job_id: JobId) -> Result<(), zx_status_t> {
+        let mut processes = Vec::new();
+        self.descendant_process_ids(job_id, &mut processes)?;
+        for process_id in processes {
+            let _ = self.kill_process(process_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn suspend_job(&mut self, job_id: JobId) -> Result<(), zx_status_t> {
+        {
+            let job = self.jobs.get_mut(&job_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+            job.suspend_tokens = job.suspend_tokens.saturating_add(1);
+        }
+        let mut processes = Vec::new();
+        self.descendant_process_ids(job_id, &mut processes)?;
+        for process_id in processes {
+            self.suspend_process(process_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resume_job(&mut self, job_id: JobId) -> Result<(), zx_status_t> {
+        {
+            let job = self.jobs.get_mut(&job_id).ok_or(ZX_ERR_BAD_HANDLE)?;
+            if job.suspend_tokens == 0 {
+                return Err(ZX_ERR_BAD_STATE);
+            }
+            job.suspend_tokens -= 1;
+        }
+        let mut processes = Vec::new();
+        self.descendant_process_ids(job_id, &mut processes)?;
+        for process_id in processes {
+            let _ = self.resume_process(process_id);
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn current_thread_koid(&self) -> Result<zx_koid_t, zx_status_t> {
         Ok(self.current_thread()?.koid)
@@ -242,20 +531,9 @@ impl Kernel {
     }
 
     pub(crate) fn create_process(&mut self) -> Result<CreatedProcess, zx_status_t> {
-        let (address_space_id, root_vmar) =
-            self.with_vm_mut(|vm| vm.create_process_address_space())?;
-
-        let process_id = self.alloc_process_id();
-        let process_koid = self.alloc_koid();
-        self.processes
-            .insert(process_id, Process::created(address_space_id, process_koid));
-
-        Ok(CreatedProcess {
-            process_id,
-            koid: process_koid,
-            address_space_id,
-            root_vmar,
-        })
+        let current_process_id = self.current_thread()?.process_id;
+        let job_id = self.process(current_process_id)?.job_id;
+        self.create_process_in_job(job_id)
     }
 
     pub(crate) fn create_thread(

@@ -56,6 +56,7 @@ use core::mem::size_of;
 use spin::{Mutex, Once};
 
 use crate::port_queue::KernelPort;
+use crate::task::JobId;
 
 const PORT_CAPACITY: usize = 64;
 const PORT_KERNEL_RESERVE: usize = 16;
@@ -73,6 +74,8 @@ pub(crate) enum TrapBlock<T> {
 /// Kernel object kinds needed in current phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
+    /// Job object.
+    Job,
     /// Process object.
     Process,
     /// Suspend token object.
@@ -946,7 +949,14 @@ pub(crate) struct ProcessObject {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct JobObject {
+    job_id: JobId,
+    koid: zx_koid_t,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum SuspendTarget {
+    Job { job_id: JobId },
     Process { process_id: u64 },
     Thread { thread_id: u64 },
 }
@@ -968,6 +978,7 @@ pub(crate) struct GuestSessionObject {
 
 #[derive(Debug)]
 pub(crate) enum KernelObject {
+    Job(JobObject),
     Process(ProcessObject),
     SuspendToken(SuspendTokenObject),
     GuestSession(GuestSessionObject),
@@ -1373,6 +1384,29 @@ impl KernelState {
             reactor,
             vm,
         };
+
+        let root_job_id = state
+            .with_kernel(|kernel| Ok(kernel.root_job_id()))
+            .expect("bootstrap root job must exist");
+        let root_job_koid = state
+            .with_kernel(|kernel| kernel.job_koid(root_job_id))
+            .expect("bootstrap root job koid must exist");
+        let root_job_object_id = state.alloc_object_id();
+        state
+            .with_registry_mut(|registry| {
+                registry.insert(
+                    root_job_object_id,
+                    KernelObject::Job(JobObject {
+                        job_id: root_job_id,
+                        koid: root_job_koid,
+                    }),
+                )?;
+                Ok(())
+            })
+            .expect("bootstrap root job object insert must succeed");
+        state
+            .with_kernel_mut(|kernel| kernel.bind_job_object(root_job_id, root_job_object_id))
+            .expect("bootstrap root job object bind must succeed");
 
         let process = state
             .with_kernel(|kernel| kernel.current_process_info())
@@ -2541,7 +2575,8 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
         let timer_id = state.with_objects(|objects| {
             Ok(match objects.get(object_key) {
                 Some(KernelObject::Timer(timer)) => timer.timer_id,
-                Some(KernelObject::Process(_))
+                Some(KernelObject::Job(_))
+                | Some(KernelObject::Process(_))
                 | Some(KernelObject::SuspendToken(_))
                 | Some(KernelObject::GuestSession(_))
                 | Some(KernelObject::Socket(_))
@@ -2585,7 +2620,8 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
         let timer_id = state.with_objects(|objects| {
             Ok(match objects.get(object_key) {
                 Some(KernelObject::Timer(timer)) => timer.timer_id,
-                Some(KernelObject::Process(_))
+                Some(KernelObject::Job(_))
+                | Some(KernelObject::Process(_))
                 | Some(KernelObject::SuspendToken(_))
                 | Some(KernelObject::GuestSession(_))
                 | Some(KernelObject::Socket(_))
@@ -2625,6 +2661,7 @@ pub fn object_signals(handle: zx_handle_t) -> Result<zx_signals_t, zx_status_t> 
 #[derive(Clone, Copy, Debug)]
 enum CloseHandleAction {
     None,
+    Job,
     SuspendToken { target: SuspendTarget },
     GuestSession { thread_id: u64 },
     Socket { peer_object: ObjectKey },
@@ -2642,6 +2679,7 @@ enum CloseHandleAction {
 
 fn close_handle_action_for_live_object(object: &KernelObject) -> CloseHandleAction {
     match object {
+        KernelObject::Job(_) => CloseHandleAction::Job,
         KernelObject::SuspendToken(token) => CloseHandleAction::SuspendToken {
             target: token.target,
         },
@@ -2676,6 +2714,7 @@ fn finalize_last_handle_close(
 ) -> Result<(), zx_status_t> {
     match action {
         CloseHandleAction::None => Ok(()),
+        CloseHandleAction::Job => Ok(()),
         CloseHandleAction::SuspendToken { target } => {
             process::close_suspend_token(state, object_key, target)
         }
@@ -2897,6 +2936,10 @@ fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), z
         let kind = state.with_objects(|objects| {
             let obj = objects.get(object_key).ok_or(ZX_ERR_BAD_HANDLE)?;
             Ok(match obj {
+                KernelObject::Job(job) => {
+                    let _ = (job.job_id, job.koid);
+                    ObjectKind::Job
+                }
                 KernelObject::Process(process) => {
                     let _ = (process.process_id, process.koid);
                     ObjectKind::Process
@@ -3113,7 +3156,8 @@ pub(crate) fn signals_for_object_id(
                 })
             }
             KernelObject::Interrupt(interrupt) => Ok(interrupt.signals()),
-            KernelObject::DmaRegion(_)
+            KernelObject::Job(_)
+            | KernelObject::DmaRegion(_)
             | KernelObject::PciDevice(_)
             | KernelObject::RevocationGroup(_)
             | KernelObject::Vmo(_)

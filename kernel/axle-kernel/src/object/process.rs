@@ -1,5 +1,7 @@
 use super::*;
+use crate::task::JobId;
 use axle_types::ax_guest_x64_regs_t;
+use axle_types::rights::ZX_RIGHTS_ALL;
 use axle_types::status::{ZX_ERR_IO_DATA_INTEGRITY, ZX_ERR_OUT_OF_RANGE};
 
 /// Return the bootstrap current-process handle seeded into the current process.
@@ -80,7 +82,7 @@ pub fn create_thread(
 
 /// Create a new process object plus its root VMAR and return both handles.
 pub fn create_process(
-    parent_process_handle: zx_handle_t,
+    parent_handle: zx_handle_t,
     options: u32,
 ) -> Result<(zx_handle_t, zx_handle_t), zx_status_t> {
     if options != 0 {
@@ -88,17 +90,21 @@ pub fn create_process(
     }
 
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(
-            parent_process_handle,
-            crate::task::HandleRights::MANAGE_PROCESS,
-        )?;
-        state.with_objects(|objects| match objects.get(resolved.object_key()) {
-            Some(KernelObject::Process(_)) => Ok(()),
+        let resolved = state.lookup_handle(parent_handle, crate::task::HandleRights::empty())?;
+        let job_id = state.with_objects(|objects| match objects.get(resolved.object_key()) {
+            Some(KernelObject::Process(process)) => {
+                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_PROCESS)?;
+                state.with_kernel(|kernel| kernel.process_job_id(process.process_id))
+            }
+            Some(KernelObject::Job(job)) => {
+                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_JOB)?;
+                Ok(job.job_id)
+            }
             Some(_) => Err(ZX_ERR_WRONG_TYPE),
             None => Err(ZX_ERR_BAD_HANDLE),
         })?;
 
-        let created = state.with_kernel_mut(|kernel| kernel.create_process())?;
+        let created = state.with_kernel_mut(|kernel| kernel.create_process_in_job(job_id))?;
 
         let process_object_id = state.alloc_object_id();
         state.with_objects_mut(|objects| {
@@ -155,6 +161,89 @@ pub fn create_process(
                 }
             };
         Ok((process_handle, root_vmar_handle))
+    })
+}
+
+/// Return one handle to the job that currently owns `process_handle`.
+pub fn process_get_job(process_handle: zx_handle_t) -> Result<zx_handle_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(process_handle, crate::task::HandleRights::INSPECT)?;
+        let process = state.with_objects(|objects| match objects.get(resolved.object_key()) {
+            Some(KernelObject::Process(process)) => Ok(*process),
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        })?;
+        let job_object = state.with_kernel(|kernel| {
+            let job_id = kernel.process_job_id(process.process_id)?;
+            kernel.job_object_key(job_id)
+        })?;
+        state.alloc_handle_for_object(job_object, handle::job_default_rights())
+    })
+}
+
+/// Create one child job under `parent_job_handle`.
+pub fn create_job(
+    parent_job_handle: zx_handle_t,
+    options: u32,
+) -> Result<zx_handle_t, zx_status_t> {
+    if options != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved =
+            state.lookup_handle(parent_job_handle, crate::task::HandleRights::MANAGE_JOB)?;
+        let parent = state.with_objects(|objects| match objects.get(resolved.object_key()) {
+            Some(KernelObject::Job(job)) => Ok(*job),
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        })?;
+        let (job_id, koid) = state.with_kernel_mut(|kernel| kernel.create_job(parent.job_id))?;
+        let object_id = state.alloc_object_id();
+        state.with_objects_mut(|objects| {
+            objects.insert(object_id, KernelObject::Job(JobObject { job_id, koid }))?;
+            Ok(())
+        })?;
+        state.with_kernel_mut(|kernel| kernel.bind_job_object(job_id, object_id))?;
+        state.alloc_handle_for_object(object_id, handle::job_default_rights())
+    })
+}
+
+/// Query one job metadata snapshot.
+pub fn job_get_info(handle: zx_handle_t) -> Result<axle_types::ax_job_info_t, zx_status_t> {
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        let job = state.with_objects(|objects| match objects.get(resolved.object_key()) {
+            Some(KernelObject::Job(job)) => Ok(*job),
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        })?;
+        state.with_kernel(|kernel| kernel.job_info(job.job_id))
+    })
+}
+
+/// Reduce the effective handle-rights ceiling for one job subtree.
+pub fn job_set_policy(handle: zx_handle_t, rights_ceiling: zx_rights_t) -> Result<(), zx_status_t> {
+    if (rights_ceiling & !ZX_RIGHTS_ALL) != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let resolved = state.lookup_handle(
+            handle,
+            crate::task::HandleRights::SET_POLICY | crate::task::HandleRights::MANAGE_JOB,
+        )?;
+        let job = state.with_objects(|objects| match objects.get(resolved.object_key()) {
+            Some(KernelObject::Job(job)) => Ok(*job),
+            Some(_) => Err(ZX_ERR_WRONG_TYPE),
+            None => Err(ZX_ERR_BAD_HANDLE),
+        })?;
+        state.with_kernel_mut(|kernel| {
+            kernel.set_job_policy(
+                job.job_id,
+                crate::task::HandleRights::from_zx_rights(rights_ceiling),
+            )
+        })
     })
 }
 
@@ -665,6 +754,7 @@ fn start_process_with_transferred_arg_handle(
 pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
         enum KillTarget {
+            Job(JobId),
             Process(u64),
             Thread(u64),
         }
@@ -672,6 +762,7 @@ pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let target = state.with_objects(|objects| {
             Ok(match objects.get(resolved.object_key()) {
+                Some(KernelObject::Job(job)) => KillTarget::Job(job.job_id),
                 Some(KernelObject::Process(process)) => KillTarget::Process(process.process_id),
                 Some(KernelObject::Thread(thread)) => KillTarget::Thread(thread.thread_id),
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
@@ -679,6 +770,10 @@ pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
             })
         })?;
         match target {
+            KillTarget::Job(job_id) => {
+                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_JOB)?;
+                state.with_kernel_mut(|kernel| kernel.kill_job(job_id))?;
+            }
             KillTarget::Process(process_id) => {
                 require_handle_rights(resolved, crate::task::HandleRights::MANAGE_PROCESS)?;
                 state.with_kernel_mut(|kernel| kernel.kill_process(process_id))?;
@@ -775,6 +870,7 @@ pub fn task_suspend(handle: zx_handle_t) -> Result<zx_handle_t, zx_status_t> {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let target = state.with_objects(|objects| {
             Ok(match objects.get(resolved.object_key()) {
+                Some(KernelObject::Job(job)) => SuspendTarget::Job { job_id: job.job_id },
                 Some(KernelObject::Process(process)) => SuspendTarget::Process {
                     process_id: process.process_id,
                 },
@@ -786,6 +882,10 @@ pub fn task_suspend(handle: zx_handle_t) -> Result<zx_handle_t, zx_status_t> {
             })
         })?;
         match target {
+            SuspendTarget::Job { job_id } => {
+                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_JOB)?;
+                state.with_kernel_mut(|kernel| kernel.suspend_job(job_id))?;
+            }
             SuspendTarget::Process { process_id } => {
                 require_handle_rights(resolved, crate::task::HandleRights::MANAGE_PROCESS)?;
                 state.with_kernel_mut(|kernel| kernel.suspend_process(process_id))?;
@@ -811,6 +911,9 @@ pub fn task_suspend(handle: zx_handle_t) -> Result<zx_handle_t, zx_status_t> {
             Err(err) => {
                 let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
                 let _ = match target {
+                    SuspendTarget::Job { job_id } => {
+                        state.with_kernel_mut(|kernel| kernel.resume_job(job_id))
+                    }
                     SuspendTarget::Process { process_id } => {
                         state.with_kernel_mut(|kernel| kernel.resume_process(process_id))
                     }
@@ -854,6 +957,12 @@ pub(super) fn close_suspend_token(
     })?;
     let _ = state.begin_logical_destroy(object_key)?;
     let result = match target {
+        SuspendTarget::Job { job_id } => {
+            match state.with_kernel_mut(|kernel| kernel.resume_job(job_id)) {
+                Ok(()) | Err(ZX_ERR_BAD_STATE) => Ok(()),
+                Err(status) => Err(status),
+            }
+        }
         SuspendTarget::Process { process_id } => {
             match state.with_kernel_mut(|kernel| kernel.resume_process(process_id)) {
                 Ok(()) | Err(ZX_ERR_BAD_STATE) => Ok(()),

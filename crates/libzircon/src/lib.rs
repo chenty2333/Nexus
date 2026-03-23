@@ -35,11 +35,12 @@ pub use axle_types::wait_async;
 pub use axle_types::{
     ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_linux_exec_interp_header_t,
     ax_linux_exec_spec_header_t, zx_clock_t, zx_dma_region_info_t, zx_dma_segment_info_t,
-    zx_duration_t, zx_futex_t, zx_handle_t, zx_interrupt_info_t, zx_koid_t, zx_packet_signal_t,
-    zx_packet_type_t, zx_packet_user_t, zx_pci_bar_info_t, zx_pci_config_info_t,
-    zx_pci_device_info_t, zx_pci_interrupt_info_t, zx_pci_interrupt_mode_info_t,
-    zx_pci_resource_info_t, zx_port_info_t, zx_port_packet_t, zx_revocation_group_info_t,
-    zx_rights_t, zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t, zx_vmo_info_t,
+    zx_duration_t, zx_futex_t, zx_handle_t, zx_interrupt_info_t, zx_job_info_t, zx_koid_t,
+    zx_packet_signal_t, zx_packet_type_t, zx_packet_user_t, zx_pci_bar_info_t,
+    zx_pci_config_info_t, zx_pci_device_info_t, zx_pci_interrupt_info_t,
+    zx_pci_interrupt_mode_info_t, zx_pci_resource_info_t, zx_port_info_t, zx_port_packet_t,
+    zx_revocation_group_info_t, zx_rights_t, zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t,
+    zx_vm_option_t, zx_vmo_info_t,
 };
 
 use axle_types::clock::ZX_CLOCK_MONOTONIC;
@@ -51,12 +52,13 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR, AXLE_SYS_AX_GUEST_SESSION_CREATE,
     AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY, AXLE_SYS_AX_GUEST_SESSION_RESUME,
     AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY, AXLE_SYS_AX_HANDLE_DUPLICATE_REVOCABLE,
-    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_PCI_DEVICE_GET_BAR,
-    AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG, AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
-    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT, AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE,
-    AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE, AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE_COUNT,
-    AXLE_SYS_AX_PCI_DEVICE_SET_COMMAND, AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE,
-    AXLE_SYS_AX_PORT_GET_INFO, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
+    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_JOB_CREATE, AXLE_SYS_AX_JOB_GET_INFO,
+    AXLE_SYS_AX_JOB_SET_POLICY, AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG,
+    AXLE_SYS_AX_PCI_DEVICE_GET_INFO, AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT,
+    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE, AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE,
+    AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE_COUNT, AXLE_SYS_AX_PCI_DEVICE_SET_COMMAND,
+    AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE, AXLE_SYS_AX_PORT_GET_INFO,
+    AXLE_SYS_AX_PROCESS_GET_JOB, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
     AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
     AXLE_SYS_AX_REVOCATION_GROUP_CREATE, AXLE_SYS_AX_REVOCATION_GROUP_GET_INFO,
     AXLE_SYS_AX_REVOCATION_GROUP_REVOKE, AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
@@ -186,6 +188,45 @@ pub fn ax_handle_duplicate_revocable(
             0,
             0,
         ],
+    )
+}
+
+/// Return a handle to the job that owns a process.
+pub fn ax_process_get_job(process: zx_handle_t, out: &mut zx_handle_t) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_PROCESS_GET_JOB as u64,
+        [process, out as *mut zx_handle_t as u64, 0, 0, 0, 0],
+    )
+}
+
+/// Create a child job.
+pub fn ax_job_create(parent_job: zx_handle_t, options: u32, out: &mut zx_handle_t) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_JOB_CREATE as u64,
+        [
+            parent_job,
+            options as u64,
+            out as *mut zx_handle_t as u64,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+/// Query job metadata.
+pub fn ax_job_get_info(handle: zx_handle_t, out: &mut zx_job_info_t) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_JOB_GET_INFO as u64,
+        [handle, out as *mut zx_job_info_t as u64, 0, 0, 0, 0],
+    )
+}
+
+/// Reduce the effective handle-rights ceiling for a job subtree.
+pub fn ax_job_set_policy(handle: zx_handle_t, rights_ceiling: zx_rights_t) -> zx_status_t {
+    native_call(
+        AXLE_SYS_AX_JOB_SET_POLICY as u64,
+        [handle, rights_ceiling as u64, 0, 0, 0, 0],
     )
 }
 

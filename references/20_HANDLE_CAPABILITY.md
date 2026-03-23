@@ -110,14 +110,26 @@ It is a current-state reference, not a roadmap.
   - it snapshots the target revocation group's current epoch onto the duplicate
   - later duplicate/replace/transfer of that delegated handle preserve the same revocation
     association through the ordinary `CSpace` paths
+- There is now one narrow public job-governance layer above ordinary handles:
+  - `ax_process_get_job()` returns the current owning job for one process handle
+  - `ax_job_create()` creates a child job under a parent job handle
+  - `ax_job_get_info()` reports stable `job_id`, parent koid, child counts, and the current
+    rights ceiling
+  - `ax_job_set_policy()` monotonically narrows a job's policy ceiling and pushes that ceiling
+    into descendant jobs/processes
+  - future handle derivation/install paths cache that ceiling by intersecting derived or imported
+    handle rights with the owning process policy ceiling
 - Ordinary object handles are still non-revocable by default; revocation remains one deliberate
   delegation opt-in rather than a property of every handle family.
 
 ## What is intentionally not true yet
 
-- There is no public job tree or resource-governance hierarchy on top of handles.
 - Revocation is still independent from generation-based stale-handle isolation.
-- There is still no public job/resource hierarchy controlling revocation-group quotas or ownership.
+- There is now one minimal public job tree for authority scoping, but it is intentionally narrow:
+  - no quota accounting
+  - no resource object family
+  - no install-time policy program beyond one rights ceiling
+- Revocation-group quotas or ownership are not yet job-governed.
 - Public revocation-group lifecycle is intentionally modest today:
   - closing the last group handle drops revoke authority
   - full group-slot reclamation / quota governance remains later work

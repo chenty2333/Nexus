@@ -27,12 +27,13 @@ use axle_types::syscall_numbers::{
     AXLE_SYS_AX_DMA_REGION_LOOKUP_PADDR, AXLE_SYS_AX_GUEST_SESSION_CREATE,
     AXLE_SYS_AX_GUEST_SESSION_READ_MEMORY, AXLE_SYS_AX_GUEST_SESSION_RESUME,
     AXLE_SYS_AX_GUEST_SESSION_WRITE_MEMORY, AXLE_SYS_AX_HANDLE_DUPLICATE_REVOCABLE,
-    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_PCI_DEVICE_GET_BAR,
-    AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG, AXLE_SYS_AX_PCI_DEVICE_GET_INFO,
-    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT, AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE,
-    AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE, AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE_COUNT,
-    AXLE_SYS_AX_PCI_DEVICE_SET_COMMAND, AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE,
-    AXLE_SYS_AX_PORT_GET_INFO, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
+    AXLE_SYS_AX_INTERRUPT_TRIGGER, AXLE_SYS_AX_JOB_CREATE, AXLE_SYS_AX_JOB_GET_INFO,
+    AXLE_SYS_AX_JOB_SET_POLICY, AXLE_SYS_AX_PCI_DEVICE_GET_BAR, AXLE_SYS_AX_PCI_DEVICE_GET_CONFIG,
+    AXLE_SYS_AX_PCI_DEVICE_GET_INFO, AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT,
+    AXLE_SYS_AX_PCI_DEVICE_GET_INTERRUPT_MODE, AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE,
+    AXLE_SYS_AX_PCI_DEVICE_GET_RESOURCE_COUNT, AXLE_SYS_AX_PCI_DEVICE_SET_COMMAND,
+    AXLE_SYS_AX_PCI_DEVICE_SET_INTERRUPT_MODE, AXLE_SYS_AX_PORT_GET_INFO,
+    AXLE_SYS_AX_PROCESS_GET_JOB, AXLE_SYS_AX_PROCESS_PREPARE_LINUX_EXEC,
     AXLE_SYS_AX_PROCESS_PREPARE_START, AXLE_SYS_AX_PROCESS_START_GUEST,
     AXLE_SYS_AX_REVOCATION_GROUP_CREATE, AXLE_SYS_AX_REVOCATION_GROUP_GET_INFO,
     AXLE_SYS_AX_REVOCATION_GROUP_REVOKE, AXLE_SYS_AX_THREAD_GET_GUEST_X64_FS_BASE,
@@ -58,19 +59,20 @@ use axle_types::wait_async::{
     ZX_WAIT_ASYNC_BOOT_TIMESTAMP, ZX_WAIT_ASYNC_EDGE, ZX_WAIT_ASYNC_TIMESTAMP,
 };
 use axle_types::{
-    ax_guest_x64_regs_t, ax_port_info_t, ax_revocation_group_info_t, ax_vmo_info_t, zx_clock_t,
-    zx_duration_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t, zx_signals_t,
-    zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t,
+    ax_guest_x64_regs_t, ax_job_info_t, ax_port_info_t, ax_revocation_group_info_t, ax_vmo_info_t,
+    zx_clock_t, zx_duration_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_port_packet_t, zx_rights_t,
+    zx_signals_t, zx_status_t, zx_time_t, zx_vaddr_t, zx_vm_option_t,
 };
 
 /// Phase-B bootstrap syscall numbers supported by the shared ABI spec.
-pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 83] = [
+pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 87] = [
     AXLE_SYS_HANDLE_CLOSE,
     AXLE_SYS_AX_HANDLE_DUPLICATE_REVOCABLE,
     AXLE_SYS_OBJECT_WAIT_ONE,
     AXLE_SYS_OBJECT_WAIT_ASYNC,
     AXLE_SYS_PORT_CREATE,
     AXLE_SYS_AX_PORT_GET_INFO,
+    AXLE_SYS_AX_PROCESS_GET_JOB,
     AXLE_SYS_PORT_QUEUE,
     AXLE_SYS_PORT_WAIT,
     AXLE_SYS_TIMER_CREATE,
@@ -98,6 +100,9 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 83] = [
     AXLE_SYS_AX_REVOCATION_GROUP_CREATE,
     AXLE_SYS_AX_REVOCATION_GROUP_GET_INFO,
     AXLE_SYS_AX_REVOCATION_GROUP_REVOKE,
+    AXLE_SYS_AX_JOB_CREATE,
+    AXLE_SYS_AX_JOB_GET_INFO,
+    AXLE_SYS_AX_JOB_SET_POLICY,
     AXLE_SYS_OBJECT_SIGNAL,
     AXLE_SYS_FUTEX_WAIT,
     AXLE_SYS_FUTEX_WAKE,
@@ -3353,6 +3358,125 @@ typed_syscall!(
 );
 const PROCESS_CREATE_DISPATCH: SyscallDispatch = SyscallDispatch::new(process_create_entry);
 
+fn decode_ax_process_get_job(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<zx_handle_t, OutValue<zx_handle_t>>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        ctx.arg_handle(args, 0)?,
+        ctx.decode_out_value::<zx_handle_t>(args, 1)?,
+    ))
+}
+
+fn run_ax_process_get_job(process: zx_handle_t) -> Result<zx_handle_t, zx_status_t> {
+    crate::object::process::process_get_job(process)
+}
+
+typed_syscall!(
+    PROCESS_GET_JOB_TYPED,
+    ax_process_get_job_entry,
+    zx_handle_t,
+    OutValue<zx_handle_t>,
+    zx_handle_t,
+    decode_ax_process_get_job,
+    run_ax_process_get_job,
+    writeback_handle
+);
+const PROCESS_GET_JOB_DISPATCH: SyscallDispatch = SyscallDispatch::new(ax_process_get_job_entry);
+
+type JobCreateRequest = (zx_handle_t, u32);
+
+fn decode_ax_job_create(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<JobCreateRequest, OutValue<zx_handle_t>>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        (ctx.arg_handle(args, 0)?, ctx.arg_u32(args, 1)?),
+        ctx.decode_out_value::<zx_handle_t>(args, 2)?,
+    ))
+}
+
+fn run_ax_job_create(req: JobCreateRequest) -> Result<zx_handle_t, zx_status_t> {
+    crate::object::process::create_job(req.0, req.1)
+}
+
+typed_syscall!(
+    JOB_CREATE_TYPED,
+    ax_job_create_entry,
+    JobCreateRequest,
+    OutValue<zx_handle_t>,
+    zx_handle_t,
+    decode_ax_job_create,
+    run_ax_job_create,
+    writeback_handle
+);
+const JOB_CREATE_DISPATCH: SyscallDispatch = SyscallDispatch::new(ax_job_create_entry);
+
+fn decode_ax_job_get_info(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<zx_handle_t, OutValue<ax_job_info_t>>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        ctx.arg_handle(args, 0)?,
+        ctx.decode_out_value::<ax_job_info_t>(args, 1)?,
+    ))
+}
+
+fn run_ax_job_get_info(handle: zx_handle_t) -> Result<ax_job_info_t, zx_status_t> {
+    crate::object::process::job_get_info(handle)
+}
+
+fn writeback_job_info(
+    _ctx: &mut SyscallCtx,
+    out: OutValue<ax_job_info_t>,
+    info: ax_job_info_t,
+) -> Result<(), zx_status_t> {
+    write_out_value(out, info)
+}
+
+typed_syscall!(
+    JOB_GET_INFO_TYPED,
+    ax_job_get_info_entry,
+    zx_handle_t,
+    OutValue<ax_job_info_t>,
+    ax_job_info_t,
+    decode_ax_job_get_info,
+    run_ax_job_get_info,
+    writeback_job_info
+);
+const JOB_GET_INFO_DISPATCH: SyscallDispatch = SyscallDispatch::new(ax_job_get_info_entry);
+
+type JobSetPolicyRequest = (zx_handle_t, zx_rights_t);
+
+fn decode_ax_job_set_policy(
+    ctx: &mut SyscallCtx,
+    args: [u64; 6],
+) -> Result<DecodedSyscall<JobSetPolicyRequest, NoWriteback>, zx_status_t> {
+    Ok(DecodedSyscall::new(
+        (
+            ctx.arg_handle(args, 0)?,
+            ctx.arg_u32(args, 1)? as zx_rights_t,
+        ),
+        NoWriteback,
+    ))
+}
+
+fn run_ax_job_set_policy(req: JobSetPolicyRequest) -> Result<(), zx_status_t> {
+    crate::object::process::job_set_policy(req.0, req.1)
+}
+
+typed_syscall!(
+    JOB_SET_POLICY_TYPED,
+    ax_job_set_policy_entry,
+    JobSetPolicyRequest,
+    NoWriteback,
+    (),
+    decode_ax_job_set_policy,
+    run_ax_job_set_policy,
+    writeback_noop
+);
+const JOB_SET_POLICY_DISPATCH: SyscallDispatch = SyscallDispatch::new(ax_job_set_policy_entry);
+
 type ProcessStartRequest = (zx_handle_t, zx_handle_t, u64, u64, zx_handle_t, u64);
 
 fn decode_process_start(
@@ -3870,6 +3994,10 @@ fn syscall_dispatch(nr: SyscallNumber) -> Option<&'static SyscallDispatch> {
         AXLE_SYS_AX_REVOCATION_GROUP_CREATE => Some(&REVOCATION_GROUP_CREATE_DISPATCH),
         AXLE_SYS_AX_REVOCATION_GROUP_GET_INFO => Some(&REVOCATION_GROUP_GET_INFO_DISPATCH),
         AXLE_SYS_AX_REVOCATION_GROUP_REVOKE => Some(&REVOCATION_GROUP_REVOKE_DISPATCH),
+        AXLE_SYS_AX_PROCESS_GET_JOB => Some(&PROCESS_GET_JOB_DISPATCH),
+        AXLE_SYS_AX_JOB_CREATE => Some(&JOB_CREATE_DISPATCH),
+        AXLE_SYS_AX_JOB_GET_INFO => Some(&JOB_GET_INFO_DISPATCH),
+        AXLE_SYS_AX_JOB_SET_POLICY => Some(&JOB_SET_POLICY_DISPATCH),
         AXLE_SYS_OBJECT_WAIT_ONE => Some(&OBJECT_WAIT_ONE_DISPATCH),
         AXLE_SYS_OBJECT_WAIT_ASYNC => Some(&OBJECT_WAIT_ASYNC_DISPATCH),
         AXLE_SYS_PORT_CREATE => Some(&PORT_CREATE_DISPATCH),

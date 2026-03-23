@@ -346,6 +346,16 @@ pub(super) fn revocation_group_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::WRITE
 }
 
+pub(super) fn job_default_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::INSPECT
+        | crate::task::HandleRights::ENUMERATE
+        | crate::task::HandleRights::GET_POLICY
+        | crate::task::HandleRights::SET_POLICY
+        | crate::task::HandleRights::MANAGE_JOB
+}
+
 pub(super) fn thread_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER

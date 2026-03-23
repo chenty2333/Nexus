@@ -49,11 +49,37 @@ The current `KernelObject` enum includes:
 - `Interrupt`
 - `PciDevice`
 - `DmaRegion`
+- `Job`
 - `RevocationGroup`
 - `Vmo`
 - `Vmar`
 
-There is no public Job object or Resource object yet.
+There is still no public Resource object.
+
+Current job shape:
+
+- `Job` is the first narrow governance tree object
+- it is not waitable
+- it currently exports:
+  - one parent/child topology:
+    - one root job seeded at bootstrap
+    - child jobs created through `ax_job_create()`
+    - child processes created either from a parent process handle or directly from a job handle
+  - one metadata query through `ax_job_get_info()`:
+    - stable `job_id`
+    - stable koid / parent koid
+    - child job count
+    - child process count
+    - current policy rights ceiling
+  - one policy path through `ax_job_set_policy()`:
+    - policy is currently one monotonic handle-rights ceiling
+    - lowering that ceiling recursively updates descendant jobs and processes
+    - future handle duplicate/replace/transfer-install paths intersect their rights with the
+      owning process ceiling
+  - existing task lifecycle calls may now also target jobs:
+    - `task_kill(job)` recursively terminates descendant processes
+    - `task_suspend(job)` returns one suspend token that holds descendant processes suspended until
+      the token closes
 
 Current revocation-group shape:
 
@@ -191,6 +217,7 @@ At initialization, `KernelState::new()` seeds bootstrap objects and stores the r
 
 - self process
 - self thread
+- root job
 - root VMAR
 - bootstrap code VMO when one bootstrap image is imported
 
@@ -245,6 +272,7 @@ The object layer assigns default rights per object family, for example:
 - interrupt: duplicate, transfer, wait, write
 - pci-device: duplicate, transfer, inspect
 - dma-region: duplicate, transfer, inspect
+- job: duplicate, transfer, inspect, enumerate, get-policy, set-policy, manage-job
 - revocation-group: duplicate, transfer, inspect, write
 - process/thread: duplicate, transfer, wait, inspect, manage-*
 - guest-session: duplicate, transfer, read, write
@@ -254,7 +282,8 @@ These defaults are interpreted through `HandleRights` and currently live in `obj
 
 ## Current limitations
 
-- There is still one global bootstrap object namespace; this is not yet a multi-kernel-instance or job-governed authority model.
+- There is still one global bootstrap object namespace; the new job tree governs process
+  authority but does not yet virtualize the kernel into multiple isolated namespaces.
 - The root object module is thinner than before, but close/signal flows still coordinate multiple slices from one façade rather than through a fully explicit command graph.
 - Process and thread object slots still depend on lifecycle reaping before their numeric object ids
   can be reused.

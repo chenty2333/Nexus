@@ -33,8 +33,8 @@ pub use axle_types::vmo;
 pub use axle_types::wait_async;
 pub use axle_types::{
     ax_clock_t, ax_dma_region_info_t, ax_dma_segment_info_t, ax_duration_t, ax_futex_t,
-    ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_handle_t, ax_interrupt_info_t, ax_koid_t,
-    ax_linux_exec_interp_header_t, ax_linux_exec_spec_header_t, ax_packet_signal_t,
+    ax_guest_stop_state_t, ax_guest_x64_regs_t, ax_handle_t, ax_interrupt_info_t, ax_job_info_t,
+    ax_koid_t, ax_linux_exec_interp_header_t, ax_linux_exec_spec_header_t, ax_packet_signal_t,
     ax_packet_type_t, ax_packet_user_t, ax_pci_bar_info_t, ax_pci_config_info_t,
     ax_pci_device_info_t, ax_pci_interrupt_info_t, ax_pci_interrupt_mode_info_t,
     ax_pci_resource_info_t, ax_port_info_t, ax_port_packet_t, ax_revocation_group_info_t,
@@ -150,6 +150,50 @@ pub fn ax_handle_duplicate_revocable(
         *out = widen_handle(raw_out);
     }
     status
+}
+
+/// Return a handle to the job that owns a process.
+pub fn ax_process_get_job(process: ax_handle_t, out: &mut ax_handle_t) -> ax_status_t {
+    let raw_process = match narrow_handle(process) {
+        Ok(raw) => raw,
+        Err(status) => return status,
+    };
+    let mut raw_out = libzircon::handle::ZX_HANDLE_INVALID;
+    let status = libzircon::ax_process_get_job(raw_process, &mut raw_out);
+    if status == AX_OK {
+        *out = widen_handle(raw_out);
+    }
+    status
+}
+
+/// Create a child job.
+pub fn ax_job_create(parent_job: ax_handle_t, options: u32, out: &mut ax_handle_t) -> ax_status_t {
+    let raw_parent = match narrow_handle(parent_job) {
+        Ok(raw) => raw,
+        Err(status) => return status,
+    };
+    let mut raw_out = libzircon::handle::ZX_HANDLE_INVALID;
+    let status = libzircon::ax_job_create(raw_parent, options, &mut raw_out);
+    if status == AX_OK {
+        *out = widen_handle(raw_out);
+    }
+    status
+}
+
+/// Query job metadata.
+pub fn ax_job_get_info(handle: ax_handle_t, out: &mut ax_job_info_t) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_job_get_info(raw, out),
+        Err(status) => status,
+    }
+}
+
+/// Reduce the effective handle-rights ceiling for a job subtree.
+pub fn ax_job_set_policy(handle: ax_handle_t, rights_ceiling: ax_rights_t) -> ax_status_t {
+    match narrow_handle(handle) {
+        Ok(raw) => libzircon::ax_job_set_policy(raw, rights_ceiling),
+        Err(status) => status,
+    }
 }
 
 /// Close a handle.

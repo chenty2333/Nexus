@@ -288,6 +288,47 @@ args = [
 ]
 
 [[syscall]]
+name = "ax_process_get_job"
+nr = 83
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "process", ty = "ax_handle_t" },
+  { name = "out", ty = "*mut ax_handle_t" },
+]
+
+[[syscall]]
+name = "ax_job_create"
+nr = 84
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "parent_job", ty = "ax_handle_t" },
+  { name = "options", ty = "u32" },
+  { name = "out", ty = "*mut ax_handle_t" },
+]
+
+[[syscall]]
+name = "ax_job_get_info"
+nr = 85
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "job", ty = "ax_handle_t" },
+  { name = "out", ty = "*mut ax_job_info_t" },
+]
+
+[[syscall]]
+name = "ax_job_set_policy"
+nr = 86
+should = true
+ret = "ax_status_t"
+args = [
+  { name = "job", ty = "ax_handle_t" },
+  { name = "rights_ceiling", ty = "ax_rights_t" },
+]
+
+[[syscall]]
 name = "object_signal"
 nr = 20
 should = true

@@ -81,8 +81,11 @@ Processes currently move through states such as:
 
 ## Kill / suspend / reap
 
-- `task_kill()` can target either a process or a thread object.
-- Suspending a process or thread produces suspend-token-backed state.
+- `task_kill()` can target a process, thread, or job object.
+- Killing a job recursively terminates descendant processes currently owned by that subtree.
+- Suspending a process, thread, or job produces suspend-token-backed state.
+- Suspending a job recursively increments the suspend depth of descendant processes until the token
+  closes.
 - Terminated thread/process objects expose `TASK_TERMINATED` signals.
 - Reaping removes fully terminated task records once object and handle state allow it.
 - Lifecycle sync may run from trap-exit or idle-loop paths on different CPUs, so zero-handle task

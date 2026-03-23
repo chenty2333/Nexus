@@ -454,6 +454,7 @@ impl Kernel {
         address_space_id: AddressSpaceId,
     ) -> Self {
         let mut kernel = Self {
+            jobs: BTreeMap::new(),
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
             futexes: crate::futex::FutexTable::new(),
@@ -461,18 +462,41 @@ impl Kernel {
             cpu_schedulers: BTreeMap::new(),
             revocations: RevocationManager::new(),
             next_koid: 1,
+            next_job_id: 1,
             next_process_id: 1,
             next_thread_id: 1,
+            root_job_id: 0,
             task_lifecycle_dirty: false,
             vm,
         };
         let bootstrap_cpu_id = Self::bootstrap_cpu_id();
+        let root_job_id = kernel.alloc_job_id();
+        let root_job_koid = kernel.alloc_koid();
+        kernel
+            .jobs
+            .insert(root_job_id, Job::new_root(root_job_koid));
+        kernel.root_job_id = root_job_id;
         let process_id = kernel.alloc_process_id();
         let process_koid = kernel.alloc_koid();
         kernel.processes.insert(
             process_id,
-            Process::bootstrap(address_space_id, process_koid),
+            Process::bootstrap(
+                address_space_id,
+                root_job_id,
+                kernel
+                    .jobs
+                    .get(&root_job_id)
+                    .expect("root job must exist")
+                    .policy_rights_ceiling,
+                process_koid,
+            ),
         );
+        kernel
+            .jobs
+            .get_mut(&root_job_id)
+            .expect("root job must exist")
+            .child_processes
+            .push(process_id);
 
         let thread_id = kernel.alloc_thread_id();
         let thread_koid = kernel.alloc_koid();

@@ -382,6 +382,17 @@ That host gate now explicitly covers:
     - `ax_revocation_group_revoke()` invalidates the old delegated copies
     - the original non-revocable source handle remains usable
     - one fresh delegated copy taken after revoke observes the new epoch and remains live
+- Bootstrap governance coverage now also includes one narrow job-tree gate:
+  - `kernel.job.bootstrap`
+  - one public root job must now prove:
+    - `ax_process_get_job()` returns the caller's owning root job
+    - `ax_job_create()` creates one child job under that root
+    - `zx_process_create(job_handle, ...)` creates a process directly under that child job
+    - `ax_job_get_info()` reports stable parent/child topology and child-process counts
+    - `zx_task_kill(job_handle)` recursively terminates descendant processes
+    - `ax_job_set_policy()` narrows the root job's rights ceiling
+    - later `zx_handle_duplicate()` calls under that process observe the cached rights ceiling and
+      lose stripped rights such as `WAIT`
 - Bootstrap socket coverage now also includes one narrow datagram gate:
   - datagram create succeeds through the normal socket object family
   - one peek/read pair proves message preservation without stream fallback

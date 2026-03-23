@@ -22,6 +22,7 @@
         not(axle_test_runner_rust_entry = "datagram_smoke"),
         not(axle_test_runner_rust_entry = "port_smoke"),
         not(axle_test_runner_rust_entry = "revocation_smoke"),
+        not(axle_test_runner_rust_entry = "job_smoke"),
         not(axle_test_runner_rust_entry = "smp_smoke"),
         not(axle_test_runner_rust_entry = "vmo_info_smoke"),
         not(axle_test_runner_rust_entry = "vmo_shared_smoke"),
@@ -40,6 +41,7 @@
         axle_test_runner_rust_entry = "datagram_smoke",
         axle_test_runner_rust_entry = "port_smoke",
         axle_test_runner_rust_entry = "revocation_smoke",
+        axle_test_runner_rust_entry = "job_smoke",
         axle_test_runner_rust_entry = "smp_smoke",
         axle_test_runner_rust_entry = "vmo_info_smoke",
         axle_test_runner_rust_entry = "vmo_shared_smoke",
@@ -58,6 +60,7 @@
         axle_test_runner_rust_entry = "datagram_smoke",
         axle_test_runner_rust_entry = "port_smoke",
         axle_test_runner_rust_entry = "revocation_smoke",
+        axle_test_runner_rust_entry = "job_smoke",
         axle_test_runner_rust_entry = "smp_smoke",
         axle_test_runner_rust_entry = "vmo_info_smoke",
         axle_test_runner_rust_entry = "vmo_shared_smoke",
@@ -81,6 +84,8 @@ mod component_smoke;
 mod datagram_smoke;
 #[cfg(axle_test_runner_rust_entry = "device_smoke")]
 mod device_smoke;
+#[cfg(axle_test_runner_rust_entry = "job_smoke")]
+mod job_smoke;
 #[cfg(axle_test_runner_rust_entry = "net_smoke")]
 mod net_smoke;
 #[cfg(axle_test_runner_rust_entry = "perf_smoke")]
@@ -146,6 +151,12 @@ fn panic(_info: &PanicInfo) -> ! {
     revocation_smoke::report_panic()
 }
 
+#[cfg(axle_test_runner_rust_entry = "job_smoke")]
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    job_smoke::report_panic()
+}
+
 #[cfg(axle_test_runner_rust_entry = "net_smoke")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -191,6 +202,7 @@ fn panic(_info: &PanicInfo) -> ! {
     not(axle_test_runner_rust_entry = "datagram_smoke"),
     not(axle_test_runner_rust_entry = "port_smoke"),
     not(axle_test_runner_rust_entry = "revocation_smoke"),
+    not(axle_test_runner_rust_entry = "job_smoke"),
     not(axle_test_runner_rust_entry = "smp_smoke"),
     not(axle_test_runner_rust_entry = "vmo_info_smoke"),
     not(axle_test_runner_rust_entry = "vmo_shared_smoke"),

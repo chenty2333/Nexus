@@ -16,6 +16,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::task::runtime::Job;
 use axle_core::handle::Handle;
 use axle_core::{
     CSpace, CSpaceError, Capability, ObjectKey, ObserverRegistry, ReactorTimerCore,
@@ -100,6 +101,7 @@ const VM_FRAME_DIAGNOSTICS_ENABLED: bool =
 
 type ProcessId = u64;
 type ThreadId = u64;
+pub(crate) type JobId = u64;
 pub(crate) type AddressSpaceId = u64;
 type KernelVmoId = GlobalVmoId;
 
@@ -1588,6 +1590,7 @@ pub(crate) struct VmDomain {
 
 #[derive(Debug)]
 pub(crate) struct Kernel {
+    jobs: BTreeMap<JobId, Job>,
     processes: BTreeMap<ProcessId, Process>,
     threads: BTreeMap<ThreadId, Thread>,
     futexes: crate::futex::FutexTable,
@@ -1595,8 +1598,10 @@ pub(crate) struct Kernel {
     cpu_schedulers: BTreeMap<usize, CpuSchedulerState>,
     revocations: RevocationManager,
     next_koid: zx_koid_t,
+    next_job_id: JobId,
     next_process_id: ProcessId,
     next_thread_id: ThreadId,
+    root_job_id: JobId,
     task_lifecycle_dirty: bool,
     vm: Arc<VmFacade>,
 }
@@ -2384,6 +2389,12 @@ impl Kernel {
     fn alloc_process_id(&mut self) -> ProcessId {
         let id = self.next_process_id;
         self.next_process_id = self.next_process_id.wrapping_add(1);
+        id
+    }
+
+    fn alloc_job_id(&mut self) -> JobId {
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.wrapping_add(1);
         id
     }
 

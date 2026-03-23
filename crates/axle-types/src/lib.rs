@@ -474,12 +474,36 @@ pub struct ax_revocation_group_info_t {
 /// Frozen Zircon-compat alias for the native revocation-group metadata layout.
 pub type zx_revocation_group_info_t = ax_revocation_group_info_t;
 
+/// Native Axle job metadata snapshot.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ax_job_info_t {
+    /// Stable job id.
+    pub job_id: u64,
+    /// Job koid.
+    pub koid: ax_koid_t,
+    /// Parent job koid, or `ZX_KOID_INVALID` for the root job.
+    pub parent_koid: ax_koid_t,
+    /// Number of direct child jobs.
+    pub child_job_count: u32,
+    /// Number of direct live child processes.
+    pub child_process_count: u32,
+    /// Effective handle-rights ceiling applied at derivation/install.
+    pub policy_rights_ceiling: ax_rights_t,
+    /// Reserved.
+    pub reserved0: u32,
+}
+
+/// Frozen Zircon-compat alias for the native job metadata layout.
+pub type zx_job_info_t = ax_job_info_t;
+
 const _: [(); 32] = [(); core::mem::size_of::<ax_packet_user_t>()];
 const _: [(); 32] = [(); core::mem::size_of::<ax_packet_signal_t>()];
 const _: [(); 48] = [(); core::mem::size_of::<ax_port_packet_t>()];
 const _: [(); 8] = [(); core::mem::align_of::<ax_port_packet_t>()];
 const _: [(); 128] = [(); core::mem::size_of::<ax_port_info_t>()];
 const _: [(); 16] = [(); core::mem::size_of::<ax_revocation_group_info_t>()];
+const _: [(); 40] = [(); core::mem::size_of::<ax_job_info_t>()];
 
 /// Clock ids.
 pub mod clock {
