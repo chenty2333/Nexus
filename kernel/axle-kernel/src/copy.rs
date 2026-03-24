@@ -235,6 +235,20 @@ pub(crate) fn probe_write_handles(ptr: *mut zx_handle_t, len: usize) -> Result<(
     probe_resident_write_bytes(ptr.cast::<u8>(), byte_len)
 }
 
+/// Copy one `T` from user space into kernel memory.
+///
+/// # Safety contract on `T`
+///
+/// The caller must ensure that `T` is a type for which **every possible bit
+/// pattern** of the correct size is a valid value (i.e., `T` has no invalid
+/// bit patterns / niche optimizations). Suitable types include primitive
+/// integers (`u8`, `u32`, `u64`, ...), `#[repr(C)]` structs composed entirely
+/// of such types, and fixed-size arrays thereof.
+///
+/// Types with validity invariants (`bool`, `char`, enums with fewer variants
+/// than the discriminant range, references, `NonZero*`, `Option<NonNull<_>>`,
+/// etc.) **must not** be used as `T` here because arbitrary user-supplied bytes
+/// could construct a value that violates those invariants, which is immediate UB.
 pub(crate) fn copyin_value<T: Copy>(ptr: *const T) -> Result<T, zx_status_t> {
     if ptr.is_null() {
         return Err(ZX_ERR_INVALID_ARGS);

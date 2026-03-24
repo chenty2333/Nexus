@@ -67,8 +67,12 @@ The kernel then:
   - synthesizes the same logical `TrapFrame + cpu_frame` layout used by the legacy trap path
   - returns through `sysretq` only when the shared trap-exit path proves that the same native
     thread can retire directly back to userspace without blocking or switching
+  - the `sysretq` path now performs a strict user-space address check on the return RIP,
+    allowing only low-half canonical addresses to prevent non-canonical address attacks
   - falls back to `iretq` for the wider blocked / switched / compatibility cases
 - The legacy `int 0x80` path still exists for bootstrap compatibility and targeted conformance.
+- The legacy `int 0x80` path now includes `swapgs` on ring3 entry, correctly switching the GS base
+  when entering from userspace.
 - The bootstrap trace stream now exposes four syscall edges:
   - `sys_native_enter` when ring3 entered through native `SYSCALL`
   - `sys_enter` when the trap frame first reaches the syscall layer
@@ -130,16 +134,37 @@ Current stack contract:
 
 - ring3 -> ring0 syscalls enter on the per-CPU `RSP0` stack
 - timer, APIC, breakpoint, and fixed-vector IPI entry stay on the current kernel stack
-- `#PF` / `#GP` use a separate per-CPU fault IST
-- `#UD` currently also uses the fault IST because supervised guest-stop v1 is trap-driven
+- `#PF` uses a dedicated per-CPU fault IST (IST3)
+- `#GP` uses its own separate per-CPU fault IST (IST4), independent from `#PF`
+- `#UD` does not use an IST (IST=0) and runs on the current kernel stack
 - `#DF` keeps its own dedicated IST
+- Ring0 and IST stacks are now 32 KiB per CPU (previously 16 KiB)
 - x87/SSE state for user threads currently uses legacy `FXSAVE64/FXRSTOR64` images captured on
   trap exit and restored before resuming another user thread
 
 Axle previously used a shared IRQ IST for timer/IPI/breakpoint entry, but that shape breaks once a
 blocked trap path re-enables interrupts and idles: a nested IRQ would reset `rsp` back to the same
 IST top and corrupt the suspended return chain. Keeping regular IRQ/IPI entry on the current kernel
-stack preserves nested interrupt frames, while `#PF` / `#GP` still keep a dedicated fault IST.
+stack preserves nested interrupt frames, while `#PF` and `#GP` each keep their own dedicated fault IST.
+
+Current architecture hardening and correctness notes:
+
+- x2APIC mode IPI sends now bypass the `LocalApic` structure and write the ICR MSR directly,
+  eliminating a data-race surface across multiple cores
+- serial output now uses `try_lock` to prevent deadlock when logging from interrupt context
+- PCI configuration space access is now protected by a global spinlock to ensure atomicity of
+  multi-register accesses
+- the TLB shootdown handler now reads its parameters before sending EOI, preventing a window where
+  new parameters could overwrite the in-flight request
+- per-CPU data access on hot paths now uses a `gs:` segment prefix instead of `rdmsr`, improving
+  performance for frequent per-CPU reads
+- the APIC spurious interrupt handler no longer sends EOI, conforming to the Intel SDM requirement
+  that spurious interrupts must not issue end-of-interrupt
+- xAPIC MMIO mappings now set PCD/PWT bits to ensure uncacheable (UC) memory type
+- timer flag loads and stores now use `Release`/`Acquire` ordering instead of `Relaxed`
+- APs no longer redundantly store `APIC_MODE`; only the BSP sets it during initialization
+- the IDT is now wrapped in `UnsafeCell` instead of using `static mut`
+- `lidt` uses `addr_of!` to avoid taking a reference to a packed struct field
 
 ## Current limitations
 

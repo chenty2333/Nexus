@@ -71,6 +71,8 @@ These are computed from endpoint state and participate in both `wait_one` and `w
 - Handle transfer uses `TransferredCap` snapshots from the sender CSpace, then installs them into the receiver process on read.
 - Receiver-side transferred-handle install now runs through a typed install batch.
   - partial install rollback no longer depends on an open-coded cleanup loop
+  - handle close during rollback is now atomic: partial-install failures close all successfully
+    installed handles before returning the error, preventing handle leaks on the receiver side
 - Backpressure is surfaced as `ZX_ERR_SHOULD_WAIT`.
 - Peer shutdown is surfaced as `ZX_ERR_PEER_CLOSED`.
 

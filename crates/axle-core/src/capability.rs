@@ -33,6 +33,10 @@ impl ObjectKey {
     }
 
     /// Return `true` when this key does not identify a live object incarnation.
+    ///
+    /// A key is considered invalid when `object_id == 0` regardless of the
+    /// `generation` field, because object-id zero is reserved as the sentinel
+    /// value for "no object" (see [`ObjectKey::INVALID`]).
     pub const fn is_invalid(self) -> bool {
         self.object_id == 0
     }

@@ -1,3 +1,11 @@
+// Test limitations:
+// - This conformance program executes from ring 0 (embedded in the kernel
+//   image) rather than being loaded as a true ring 3 ELF binary.  As a
+//   result, it cannot validate user-pointer rejection paths or permission
+//   checks that depend on the faulting CPL.  Any test that probes address
+//   validation (e.g. passing kernel-range pointers to syscalls) may yield
+//   misleading results.
+
 .section .text.axle_userprog, "ax"
 .global axle_user_prog_start
 .global axle_user_prog_end

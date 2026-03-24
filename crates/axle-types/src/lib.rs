@@ -567,12 +567,20 @@ pub mod wait_async {
 }
 
 /// Socket creation/read options.
+///
+/// `AX_SOCKET_DATAGRAM` and `AX_SOCKET_PEEK` share the numeric value `1` but
+/// belong to different option namespaces: `DATAGRAM` is a creation-time socket
+/// type selector, while `PEEK` is a read-time flag.  The kernel dispatches
+/// them through separate syscall arguments so no ambiguity arises at runtime.
 pub mod socket {
-    /// Native stream socket.
+    /// Native stream socket (creation-time socket type).
     pub const AX_SOCKET_STREAM: u32 = 0;
-    /// Native datagram socket.
+    /// Native datagram socket (creation-time socket type, same numeric value as
+    /// `AX_SOCKET_PEEK` but in a different option namespace).
     pub const AX_SOCKET_DATAGRAM: u32 = 1;
-    /// Native peek without consuming bytes from the socket.
+    /// Native peek without consuming bytes from the socket (read-time option,
+    /// same numeric value as `AX_SOCKET_DATAGRAM` but in a different option
+    /// namespace).
     pub const AX_SOCKET_PEEK: u32 = 1;
 
     /// Stream socket.

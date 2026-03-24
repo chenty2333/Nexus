@@ -410,7 +410,13 @@ impl SyscallCtx {
     }
 
     fn arg_handle(&self, args: [u64; 6], index: usize) -> Result<zx_handle_t, zx_status_t> {
-        Ok(args[index])
+        let raw = args[index];
+        // Reject obviously invalid sentinel values early so that downstream
+        // lookup_handle never has to deal with them.
+        if raw == u64::MAX || raw == u64::MAX - 1 {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+        Ok(raw)
     }
 
     fn arg_u32(&self, args: [u64; 6], index: usize) -> Result<u32, zx_status_t> {

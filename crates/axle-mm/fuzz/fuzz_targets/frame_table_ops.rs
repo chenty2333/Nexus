@@ -21,10 +21,12 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             2 => {
+                // Pin and immediately unpin to exercise the pin/unpin path.
                 if let Ok(frame_id) = frames.register_existing(paddr) {
-                    if let Ok(frame_ref) = frames.acquire_frame_ref(frame_id) {
-                        let _ = frame_ref.release(&mut frames);
+                    if let Ok(pin) = frames.pin_frame(frame_id) {
+                        pin.release(&mut frames);
                     }
+                    let _ = frames.unregister_existing(frame_id);
                 }
             }
             3 => {

@@ -1,5 +1,7 @@
 //! Minimal IDT setup for early syscall trap bring-up.
 
+use core::cell::UnsafeCell;
+
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct IdtEntry {
@@ -42,7 +44,14 @@ struct Idtr {
     base: u64,
 }
 
-static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
+struct IdtStorage(UnsafeCell<[IdtEntry; 256]>);
+
+// SAFETY: IDT is only mutated during single-core early boot (init) and then
+// read-only from all CPUs via `lidt`. The UnsafeCell is needed to allow
+// interior mutability without `static mut`.
+unsafe impl Sync for IdtStorage {}
+
+static IDT: IdtStorage = IdtStorage(UnsafeCell::new([IdtEntry::MISSING; 256]));
 
 /// Install the minimal IDT needed for:
 /// - `int 0x80` syscalls from ring3
@@ -78,31 +87,34 @@ pub fn init(
 
     // SAFETY: we are in single-core early bring-up; mutating the static IDT table is serialized.
     unsafe {
-        IDT[0x80] = IdtEntry::new(int80_handler, selector, user_callable_int_gate, 0);
-        IDT[3] = IdtEntry::new(breakpoint_handler, selector, user_callable_int_gate, 0);
-        IDT[6] = IdtEntry::new(
+        let idt = &mut *IDT.0.get();
+        idt[0x80] = IdtEntry::new(int80_handler, selector, user_callable_int_gate, 0);
+        idt[3] = IdtEntry::new(breakpoint_handler, selector, user_callable_int_gate, 0);
+        // #UD does not need its own IST -- it is a non-nesting fault and can use
+        // the interrupted kernel stack safely.
+        idt[6] = IdtEntry::new(
             invalid_opcode_handler,
             selector,
             kernel_int_gate,
-            crate::arch::gdt::IST_FAULT_INDEX,
+            0,
         );
 
-        // Fault handlers (kernel-only). Keep double fault on IST1 and use a separate fault IST
-        // for #PF/#GP so a fault taken during blocked kernel work does not reuse the current
-        // kernel stack top.
-        IDT[14] = IdtEntry::new(
+        // Fault handlers (kernel-only). #PF and #GP each get a separate IST so
+        // a nested exception (e.g. #GP inside #PF handler) does not overwrite
+        // the outer frame.
+        idt[14] = IdtEntry::new(
             page_fault_handler,
             selector,
             kernel_int_gate,
-            crate::arch::gdt::IST_FAULT_INDEX,
+            crate::arch::gdt::IST_PF_INDEX,
         );
-        IDT[13] = IdtEntry::new(
+        idt[13] = IdtEntry::new(
             gp_fault_handler,
             selector,
             kernel_int_gate,
-            crate::arch::gdt::IST_FAULT_INDEX,
+            crate::arch::gdt::IST_GP_INDEX,
         );
-        IDT[8] = IdtEntry::new(
+        idt[8] = IdtEntry::new(
             double_fault_handler,
             selector,
             kernel_int_gate,
@@ -112,19 +124,19 @@ pub fn init(
         // Local APIC IRQs (kernel-only). Keep them on the current kernel stack: trap/syscall
         // paths may re-enable interrupts while blocked, and re-entering a shared IRQ IST would
         // reset `rsp` back to that IST top and corrupt the suspended return chain.
-        IDT[crate::arch::apic::TIMER_VECTOR] =
+        idt[crate::arch::apic::TIMER_VECTOR] =
             IdtEntry::new(timer_handler, selector, kernel_int_gate, 0);
-        IDT[crate::arch::apic::SPURIOUS_VECTOR] =
+        idt[crate::arch::apic::SPURIOUS_VECTOR] =
             IdtEntry::new(apic_spurious_handler, selector, kernel_int_gate, 0);
-        IDT[crate::arch::apic::ERROR_VECTOR] =
+        idt[crate::arch::apic::ERROR_VECTOR] =
             IdtEntry::new(apic_error_handler, selector, kernel_int_gate, 0);
 
         // Fixed-vector IPI used by SMP conformance. (Kernel-only.)
-        IDT[crate::arch::ipi::TEST_VECTOR] =
+        idt[crate::arch::ipi::TEST_VECTOR] =
             IdtEntry::new(ipi_test_handler, selector, kernel_int_gate, 0);
-        IDT[crate::arch::ipi::TLB_SHOOTDOWN_VECTOR] =
+        idt[crate::arch::ipi::TLB_SHOOTDOWN_VECTOR] =
             IdtEntry::new(ipi_tlb_handler, selector, kernel_int_gate, 0);
-        IDT[crate::arch::ipi::RESCHEDULE_VECTOR] =
+        idt[crate::arch::ipi::RESCHEDULE_VECTOR] =
             IdtEntry::new(ipi_reschedule_handler, selector, kernel_int_gate, 0);
     }
     load_idt();
@@ -147,11 +159,12 @@ fn current_cs() -> u16 {
 fn load_idt() {
     let idtr = Idtr {
         limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
-        base: core::ptr::addr_of!(IDT) as u64,
+        base: IDT.0.get() as u64,
     };
 
     // SAFETY: `idtr` points to a valid in-memory descriptor for the static IDT table.
+    // Use `addr_of!` to avoid creating a reference to the packed struct.
     unsafe {
-        core::arch::asm!("lidt [{0}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
+        core::arch::asm!("lidt [{0}]", in(reg) core::ptr::addr_of!(idtr), options(readonly, nostack, preserves_flags));
     }
 }

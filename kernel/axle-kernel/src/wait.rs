@@ -452,10 +452,21 @@ pub(crate) fn publish_signals_changed(
     waitable_key: ObjectKey,
     current: Signals,
 ) -> Result<(), zx_status_t> {
+    const MAX_PROPAGATION_DEPTH: usize = 1024;
+
     let mut pending = VecDeque::from([(waitable_key, current)]);
     let mut queued = BTreeSet::from([waitable_key]);
+    let mut iterations = 0usize;
 
     while let Some((current_waitable_key, current)) = pending.pop_front() {
+        iterations += 1;
+        if iterations > MAX_PROPAGATION_DEPTH {
+            crate::kprintln!(
+                "warn: signal propagation exceeded {} iterations, stopping",
+                MAX_PROPAGATION_DEPTH
+            );
+            break;
+        }
         let _ = queued.remove(&current_waitable_key);
         let now = crate::time::now_ns();
         wake_signal_waiters(state, current_waitable_key, current)?;

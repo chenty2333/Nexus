@@ -167,12 +167,14 @@ extern "C" fn axle_ipi_test_rust(_frame: *const u8) {
 }
 
 extern "C" fn axle_ipi_tlb_rust(_frame: *const u8) {
-    apic::eoi();
+    // Read shootdown parameters into locals BEFORE sending EOI so that the
+    // initiator cannot overwrite them with a new request once we de-assert
+    // the in-service bit.
+    let mode = TLB_SHOOTDOWN_MODE.load(Ordering::Acquire);
+    let page = TLB_SHOOTDOWN_PAGE.load(Ordering::Acquire);
 
-    let apic_id = apic::this_apic_id() as usize;
-    match TLB_SHOOTDOWN_MODE.load(Ordering::Acquire) {
+    match mode {
         TLB_MODE_PAGE => {
-            let page = TLB_SHOOTDOWN_PAGE.load(Ordering::Acquire);
             if page != 0 {
                 crate::arch::tlb::flush_page_local(page);
             }
@@ -181,9 +183,14 @@ extern "C" fn axle_ipi_tlb_rust(_frame: *const u8) {
         _ => {}
     }
 
+    let apic_id = apic::this_apic_id() as usize;
     if apic_id < MAX_CPUS {
         let _ = TLB_SHOOTDOWN_ACK[apic_id].fetch_add(1, Ordering::AcqRel);
     }
+
+    // EOI after ack so the initiator observes the ack before we can take
+    // another IPI on the same vector.
+    apic::eoi();
 }
 
 extern "C" fn axle_ipi_reschedule_rust(

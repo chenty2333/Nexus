@@ -255,10 +255,21 @@ impl CowReservation {
 
 impl Drop for CowReservation {
     fn drop(&mut self) {
-        debug_assert!(
-            !matches!(self.state, CowReservationState::Reserved),
-            "CowReservation dropped without explicit commit or release"
-        );
+        if matches!(self.state, CowReservationState::Reserved) {
+            #[cfg(debug_assertions)]
+            {
+                panic!("CowReservation dropped without explicit commit or release");
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                crate::kprintln!(
+                    "WARNING: CowReservation dropped without explicit commit or release \
+                     (address_space={}, page_base={:#x})",
+                    self.address_space_id,
+                    self.page_base,
+                );
+            }
+        }
     }
 }
 
@@ -1558,6 +1569,10 @@ struct Thread {
     fpu_state: crate::arch::fpu::FxState,
     state: ThreadState,
     queued_on_cpu: Option<usize>,
+    /// CPU this thread is currently running on (set by `activate_thread_on_current_cpu`,
+    /// cleared when the thread is no longer the active thread on that CPU).
+    /// Enables O(1) lookup instead of scanning all per-CPU scheduler states.
+    running_on_cpu: Option<usize>,
     last_cpu: usize,
     runtime_ns: u64,
     wait: WaitNode,
@@ -1883,7 +1898,7 @@ impl Kernel {
     pub(crate) fn revocation_group_epoch(
         &self,
         token: axle_core::RevocationGroupToken,
-    ) -> Result<u32, zx_status_t> {
+    ) -> Result<u64, zx_status_t> {
         self.revocations
             .snapshot(token)
             .map(|snapshot| snapshot.epoch())
@@ -3060,6 +3075,42 @@ impl VmDomain {
                     .ok_or(ZX_ERR_BAD_STATE)?,
             )
         })
+    }
+
+    /// Remove all user-visible mappings from the address space associated with a
+    /// terminated process.  This releases frame references held by the VMAs so
+    /// physical memory can be reclaimed promptly rather than waiting for the
+    /// process to be reaped.
+    pub(crate) fn cleanup_process_address_space(
+        &mut self,
+        address_space_id: AddressSpaceId,
+    ) -> Result<TlbCommitReq, zx_status_t> {
+        let (root_vmar_id, ranges) = {
+            let address_space = self
+                .address_spaces
+                .get(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            let root = address_space.root_vmar();
+            let ranges = address_space.vm.mapped_ranges_in_vmar_subtree(root.id());
+            (root.id(), ranges)
+        };
+        if ranges.is_empty() {
+            return Ok(TlbCommitReq::relaxed(address_space_id));
+        }
+        for (base, len) in ranges.iter().copied() {
+            let frames_handle = self.frame_table();
+            let address_space = self
+                .address_spaces
+                .get_mut(&address_space_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            {
+                let mut frames = frames_handle.lock();
+                let _ = address_space.unmap(&mut frames, root_vmar_id, base, len);
+            }
+            self.clear_private_cow_range(address_space_id, base, len);
+            let _ = self.clear_mapping_pages(address_space_id, base, len);
+        }
+        Ok(TlbCommitReq::strict(address_space_id))
     }
 
     pub(crate) fn ensure_user_page_resident(
@@ -4481,6 +4532,7 @@ fn map_alloc_error(err: CSpaceError) -> zx_status_t {
         CSpaceError::NoSlots => ZX_ERR_NO_RESOURCES,
         CSpaceError::Handle(_) => ZX_ERR_INTERNAL,
         CSpaceError::BadHandle => ZX_ERR_BAD_HANDLE,
+        CSpaceError::AccessDenied => ZX_ERR_ACCESS_DENIED,
     }
 }
 

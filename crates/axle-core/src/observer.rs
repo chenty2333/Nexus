@@ -288,7 +288,7 @@ impl ObserverRegistry {
             }
 
             if let Some(telemetry) = self.telemetry_by_port.get_mut(&port) {
-                telemetry.flush_delivered_count = telemetry.flush_delivered_count.wrapping_add(1);
+                telemetry.flush_delivered_count = telemetry.flush_delivered_count.saturating_add(1);
             }
             let _ = self.remove_observer(reg);
         }
@@ -436,7 +436,7 @@ impl ObserverRegistry {
                     timestamp,
                 });
                 let telemetry = self.telemetry_by_port.entry(reg.port).or_default();
-                telemetry.pending_new_count = telemetry.pending_new_count.wrapping_add(1);
+                telemetry.pending_new_count = telemetry.pending_new_count.saturating_add(1);
                 telemetry.pending_current = telemetry.pending_current.saturating_add(1);
                 telemetry.pending_peak = telemetry.pending_peak.max(telemetry.pending_current);
                 self.pending_order_by_port
@@ -445,8 +445,15 @@ impl ObserverRegistry {
                     .push_back(reg);
             }
             Some(pending) => {
+                // Merge into an existing pending entry: bump the count and
+                // OR-merge the observed signals.  The `timestamp` field
+                // intentionally retains the value captured when the entry was
+                // first created (i.e. the time of the first trigger that could
+                // not be delivered).  This matches the contract that the
+                // delivered timestamp reflects the *earliest* firing event,
+                // allowing the consumer to reconstruct a lower-bound latency.
                 let telemetry = self.telemetry_by_port.entry(reg.port).or_default();
-                telemetry.pending_merge_count = telemetry.pending_merge_count.wrapping_add(1);
+                telemetry.pending_merge_count = telemetry.pending_merge_count.saturating_add(1);
                 pending.count = pending.count.saturating_add(1);
                 pending.observed = pending.observed | current;
             }

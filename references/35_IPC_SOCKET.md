@@ -88,6 +88,9 @@ These feed both synchronous waits and async waits on ports.
 ## Duplication and close
 
 - Duplicating a socket handle creates another reference to the same endpoint object.
+- Socket permission checks are now performed at handle-lookup time rather than after object access,
+  aligning with the unified rights-check-on-resolve policy and preventing information leakage
+  through timing side channels.
 - Closing the final handle to one endpoint updates the shared `SocketCore`.
 - Peer-closed behavior is observable through both read/write errors and signal transitions.
 - Dropping the last socket core now also drains any queued datagram payload descriptors through the

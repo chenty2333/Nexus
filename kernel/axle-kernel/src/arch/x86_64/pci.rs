@@ -1,9 +1,15 @@
 //! Minimal x86 PCI config-space helpers for bootstrap device discovery.
 
+use spin::Mutex;
 use x86_64::instructions::port::Port;
 
 const PCI_CONFIG_ADDRESS_PORT: u16 = 0xCF8;
 const PCI_CONFIG_DATA_PORT: u16 = 0xCFC;
+
+/// Global lock protecting the 0xCF8/0xCFC port pair. The PCI config-space
+/// address/data mechanism is a shared global resource; concurrent access from
+/// multiple CPUs would interleave address writes with data reads.
+static PCI_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 const PCI_INVALID_VENDOR_ID: u16 = 0xFFFF;
 const PCI_VENDOR_ID_OFF: u16 = 0x00;
 const PCI_DEVICE_ID_OFF: u16 = 0x02;
@@ -101,6 +107,12 @@ fn read_config_u16(bus: u8, device: u8, function: u8, offset: u16) -> Option<u16
 }
 
 fn read_config_u32(bus: u8, device: u8, function: u8, offset: u16) -> Option<u32> {
+    let _guard = PCI_CONFIG_LOCK.lock();
+    read_config_u32_locked(bus, device, function, offset)
+}
+
+/// Inner read that assumes PCI_CONFIG_LOCK is already held by the caller.
+fn read_config_u32_locked(bus: u8, device: u8, function: u8, offset: u16) -> Option<u32> {
     if device >= 32 || function >= 8 || offset >= 256 {
         return None;
     }
@@ -132,12 +144,23 @@ pub(crate) fn write_config_u16(
     let aligned = offset & !0x3;
     let shift = u32::from((offset & 0x2) * 8);
     let mask = !(0xffffu32 << shift);
-    let mut dword = read_config_u32(location.bus, location.device, location.function, aligned)?;
+
+    // Hold the lock across the entire read-modify-write to prevent another CPU
+    // from interleaving a config-space access between our read and write.
+    let _guard = PCI_CONFIG_LOCK.lock();
+    let mut dword = read_config_u32_locked(location.bus, location.device, location.function, aligned)?;
     dword = (dword & mask) | (u32::from(value) << shift);
-    write_config_u32(location, aligned, dword)
+    write_config_u32_locked(location, aligned, dword)
 }
 
+#[allow(dead_code)]
 fn write_config_u32(location: PciFunctionLocation, offset: u16, value: u32) -> Option<()> {
+    let _guard = PCI_CONFIG_LOCK.lock();
+    write_config_u32_locked(location, offset, value)
+}
+
+/// Inner write that assumes PCI_CONFIG_LOCK is already held by the caller.
+fn write_config_u32_locked(location: PciFunctionLocation, offset: u16, value: u32) -> Option<()> {
     if location.device >= 32 || location.function >= 8 || offset >= 256 {
         return None;
     }

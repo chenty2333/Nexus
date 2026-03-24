@@ -27,7 +27,7 @@ impl RevocationGroupId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RevocationGroupToken {
     id: RevocationGroupId,
-    generation: u32,
+    generation: u64,
 }
 
 impl RevocationGroupToken {
@@ -37,7 +37,7 @@ impl RevocationGroupToken {
     }
 
     /// Token generation used to reject stale handles after recycle.
-    pub const fn generation(self) -> u32 {
+    pub const fn generation(self) -> u64 {
         self.generation
     }
 }
@@ -46,8 +46,8 @@ impl RevocationGroupToken {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RevocationRef {
     id: RevocationGroupId,
-    generation: u32,
-    epoch: u32,
+    generation: u64,
+    epoch: u64,
 }
 
 impl RevocationRef {
@@ -57,15 +57,15 @@ impl RevocationRef {
     }
 
     /// Epoch snapshot at issuance.
-    pub const fn epoch(self) -> u32 {
+    pub const fn epoch(self) -> u64 {
         self.epoch
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct GroupSlot {
-    generation: u32,
-    epoch: u32,
+    generation: u64,
+    epoch: u64,
     live: bool,
 }
 
@@ -97,7 +97,7 @@ impl RevocationManager {
             let slot = &mut self.groups[id as usize];
             debug_assert!(!slot.live);
             slot.live = true;
-            slot.generation = slot.generation.wrapping_add(1);
+            slot.generation = slot.generation.saturating_add(1);
             slot.epoch = 0;
             RevocationGroupToken {
                 id: RevocationGroupId(id),
@@ -140,7 +140,7 @@ impl RevocationManager {
         if !slot.live || slot.generation != token.generation {
             return Err(RevocationError::InvalidToken);
         }
-        slot.epoch = slot.epoch.wrapping_add(1);
+        slot.epoch = slot.epoch.saturating_add(1);
         Ok(())
     }
 
@@ -168,7 +168,7 @@ impl RevocationManager {
     }
 
     /// Current epoch value of a group (for diagnostics).
-    pub fn epoch_of(&self, id: RevocationGroupId) -> Option<u32> {
+    pub fn epoch_of(&self, id: RevocationGroupId) -> Option<u64> {
         self.groups.get(id.0 as usize).map(|s| s.epoch)
     }
 }

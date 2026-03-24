@@ -179,6 +179,9 @@ Current state:
     interrupt mode / vector metadata
 - `zx_vmo_create_physical(base_paddr, size, 0, out)` is now public and creates a shared
   physical/MMIO-style VMO over an existing page-aligned physical span.
+  - Creation is now gated by a privilege check: only processes that are direct children of the root
+    job may create physical VMOs, preventing unprivileged processes from mapping arbitrary physical
+    memory.
 - `zx_vmo_create_contiguous(size, 0, out)` is now public and creates a shared contiguous VMO.
 - `ZX_VM_MAP_MMIO` is now public on `vmar_map()` and requests one device/MMIO cache policy for
   the installed mapping.

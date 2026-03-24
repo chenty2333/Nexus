@@ -28,6 +28,8 @@ const XAPIC_MMIO_REGION_SIZE: u64 = 2 * 1024 * 1024;
 
 const PTE_P: u64 = 1 << 0;
 const PTE_W: u64 = 1 << 1;
+const PTE_PWT: u64 = 1 << 3;
+const PTE_PCD: u64 = 1 << 4;
 const PTE_PS: u64 = 1 << 7;
 
 #[repr(align(4096))]
@@ -141,14 +143,24 @@ pub fn init_ap(enable_timer: bool) {
         0
     };
 
+    // The BSP has already set APIC_MODE in init_bsp(). APs only verify the
+    // mode matches their hardware; they do not re-store the global.
     if !cpu_has_x2apic() {
-        APIC_MODE.store(MODE_XAPIC, Ordering::Relaxed);
+        assert_eq!(
+            APIC_MODE.load(Ordering::Relaxed),
+            MODE_XAPIC,
+            "apic: AP detects xAPIC but BSP set x2APIC mode"
+        );
         let base = XAPIC_BASE.load(Ordering::Relaxed);
         if base == 0 {
             panic!("apic: xapic base not mapped; call init_bsp first");
         }
     } else {
-        APIC_MODE.store(MODE_X2APIC, Ordering::Relaxed);
+        assert_eq!(
+            APIC_MODE.load(Ordering::Relaxed),
+            MODE_X2APIC,
+            "apic: AP detects x2APIC but BSP set xAPIC mode"
+        );
     }
 
     let mut b = LocalApicBuilder::new();
@@ -243,13 +255,23 @@ pub fn send_startup_ipi(dest: u32, vector: u8) {
 }
 
 /// Send a fixed-vector IPI to `dest` APIC id.
+///
+/// In x2APIC mode we write the ICR MSR directly -- this avoids the data race
+/// of borrowing the BSP `LocalApic` from an arbitrary CPU.
 pub fn send_fixed_ipi(dest: u32, vector: u8) {
     match APIC_MODE.load(Ordering::Relaxed) {
-        MODE_X2APIC => with_bsp_lapic(|lapic| unsafe {
-            // SAFETY: sending an IPI mutates the local APIC state. This is BSP-only
-            // and only used after APIC bring-up.
-            lapic.send_ipi(vector, dest);
-        }),
+        MODE_X2APIC => {
+            // x2APIC ICR MSR (0x830) format: bits [31:0] = dest APIC id in
+            // bits [63:32], delivery mode + vector in bits [19:0].
+            const IA32_X2APIC_ICR: u32 = 0x830;
+            let icr_val = (u64::from(dest) << 32)
+                | u64::from(vector);
+            // SAFETY: writing the x2APIC ICR MSR sends a fixed IPI. Requires
+            // x2APIC to be enabled on the current CPU.
+            unsafe {
+                Msr::new(IA32_X2APIC_ICR).write(icr_val);
+            }
+        }
         _ => xapic_send_ipi(dest, XapicIpiDeliveryMode::Fixed, vector),
     }
 }
@@ -400,7 +422,9 @@ pub fn error_entry_addr() -> usize {
 }
 
 extern "C" fn axle_apic_spurious_rust(_frame: *const u8) {
-    eoi();
+    // Intel SDM vol. 3A, 11.9: "No EOI should be sent for the spurious
+    // interrupt." Sending EOI for a spurious vector can confuse the APIC
+    // priority state machine.
 }
 
 extern "C" fn axle_apic_error_rust(_frame: *const u8) {
@@ -422,7 +446,9 @@ fn map_xapic_mmio(base: u64) {
     unsafe {
         let pd_phys = core::ptr::addr_of!(XAPIC_PD) as u64;
         pvh_pdpt[pdpt_index] = pd_phys | (PTE_P | PTE_W);
-        XAPIC_PD.0[pd_index] = base | (PTE_P | PTE_W | PTE_PS);
+        // xAPIC MMIO must be mapped uncacheable (UC). Set PCD + PWT to force
+        // UC memory type regardless of MTRRs.
+        XAPIC_PD.0[pd_index] = base | (PTE_P | PTE_W | PTE_PS | PTE_PCD | PTE_PWT);
 
         crate::arch::tlb::flush_all_local();
     }

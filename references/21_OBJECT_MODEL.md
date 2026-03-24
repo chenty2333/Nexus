@@ -88,8 +88,8 @@ Current revocation-group shape:
 - it currently exports:
   - one metadata query through `ax_revocation_group_get_info()`:
     - stable `group_id`
-    - token generation
-    - current epoch
+    - token generation (`u64`)
+    - current epoch (`u64`, saturating increment to prevent wraparound)
   - one revoke path through `ax_revocation_group_revoke()`:
     - revoke = `epoch++`
     - any delegated handle carrying an older epoch snapshot fails future lookup
@@ -291,3 +291,6 @@ These defaults are interpreted through `HandleRights` and currently live in `obj
 - `GuestSession` is a new Round-1 execution-control object rather than a Linux semantic object:
   it binds one carrier thread to one sidecar VMO and one supervisor port so userspace can emulate
   guest ABI policy outside the kernel.
+- Guest-session memory access syscalls (`read_memory` / `write_memory`) now snapshot the guest
+  thread's address-space identity before performing the copy, preventing a TOCTOU window where
+  the supervisor could race against guest address-space replacement.

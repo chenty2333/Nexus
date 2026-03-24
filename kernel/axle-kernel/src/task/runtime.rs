@@ -414,14 +414,19 @@ impl Kernel {
         if (rights_ceiling.bits() & !current.bits()) != 0 {
             return Err(ZX_ERR_INVALID_ARGS);
         }
-        self.apply_job_policy_recursive(job_id, rights_ceiling)
+        self.apply_job_policy_recursive(job_id, rights_ceiling, 0)
     }
 
     fn apply_job_policy_recursive(
         &mut self,
         job_id: JobId,
         rights_ceiling: HandleRights,
+        depth: usize,
     ) -> Result<(), zx_status_t> {
+        const MAX_DEPTH: usize = 64;
+        if depth >= MAX_DEPTH {
+            return Err(ZX_ERR_OUT_OF_RANGE);
+        }
         let (effective, child_jobs, child_processes) = {
             let job = self.jobs.get_mut(&job_id).ok_or(ZX_ERR_BAD_HANDLE)?;
             job.policy_rights_ceiling &= rights_ceiling;
@@ -437,7 +442,7 @@ impl Kernel {
             }
         }
         for child_job_id in child_jobs {
-            self.apply_job_policy_recursive(child_job_id, effective)?;
+            self.apply_job_policy_recursive(child_job_id, effective, depth + 1)?;
         }
         Ok(())
     }
@@ -560,6 +565,7 @@ impl Kernel {
                 fpu_state: crate::arch::fpu::clean_state(),
                 state: ThreadState::New,
                 queued_on_cpu: None,
+                running_on_cpu: None,
                 last_cpu: current_cpu_id,
                 runtime_ns: 0,
                 wait: WaitNode::default(),
@@ -821,9 +827,17 @@ impl Kernel {
         thread.suspend_tokens = thread.suspend_tokens.saturating_add(1);
         if matches!(thread.state, ThreadState::Runnable) {
             thread.state = ThreadState::Suspended;
-            thread.queued_on_cpu = None;
+            thread.remote_wake_enqueued_ns = None;
+            thread.remote_wake_source_cpu = None;
+            thread.remote_wake_target_cpu = None;
+            let prev_cpu = thread.queued_on_cpu.take();
+            let _ = thread;
+            if let Some(cpu_id) = prev_cpu {
+                self.remove_thread_from_run_queue(thread_id, cpu_id);
+            }
+        } else {
+            let _ = thread;
         }
-        let _ = thread;
         if let Some(cpu_id) = running_cpu_id {
             self.request_reschedule_on_cpu(cpu_id);
         }
@@ -865,9 +879,14 @@ impl Kernel {
             let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
             if matches!(thread.state, ThreadState::Runnable) {
                 thread.state = ThreadState::Suspended;
-                thread.queued_on_cpu = None;
+                let prev_cpu = thread.queued_on_cpu.take();
+                let _ = thread;
+                if let Some(cpu_id) = prev_cpu {
+                    self.remove_thread_from_run_queue(thread_id, cpu_id);
+                }
+            } else {
+                let _ = thread;
             }
-            let _ = thread;
             if let Some(cpu_id) = running_cpu_id {
                 self.request_reschedule_on_cpu(cpu_id);
             }
@@ -1049,8 +1068,16 @@ impl Kernel {
                 ProcessState::Created | ProcessState::Terminated
             )
         {
+            let address_space_id = process.address_space_id;
             process.state = ProcessState::Terminated;
             self.task_lifecycle_dirty = true;
+            // Release all user-visible mappings so physical memory can be
+            // reclaimed before the process is reaped.
+            let req = self
+                .with_vm_mut(|vm| vm.cleanup_process_address_space(address_space_id));
+            if let Ok(req) = req {
+                let _ = self.apply_tlb_commit_reqs_current(&[req]);
+            }
         }
         Ok(())
     }

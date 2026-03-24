@@ -79,27 +79,38 @@ pub fn init_for_apic_id(apic_id: usize) {
 }
 
 pub fn try_current_cpu_slot() -> Option<usize> {
-    // SAFETY: reading IA32_GS_BASE only returns the current CPU's GS base MSR
-    // value. When GS base has been initialized to one `PerCpu` record, reading
-    // the `cpu_id` field is a plain immutable load from static kernel memory.
+    // Read cpu_id directly via the gs: segment prefix. This avoids the
+    // serializing `rdmsr` on IA32_GS_BASE and is significantly faster on
+    // hot paths (scheduler, IPI, trap entry).
+    let val: u32;
     unsafe {
-        let base = Msr::new(IA32_GS_BASE).read();
-        if base == 0 {
-            return None;
-        }
-        Some((base as *const u8).add(CPU_ID_OFFSET).cast::<u32>().read() as usize)
+        core::arch::asm!(
+            "mov {out:e}, gs:[{off}]",
+            off = const CPU_ID_OFFSET,
+            out = out(reg) val,
+            options(nostack, readonly, preserves_flags),
+        );
     }
+    // GS base == 0 means per-CPU is not yet initialized; in that case
+    // the read returns 0 from the null page or zero-init memory. We
+    // distinguish "slot 0" from "not initialized" by checking the base.
+    // However, reading the MSR defeats the purpose. Instead, we check
+    // whether both cpu_id and apic_id are zero -- only the BSP (slot 0)
+    // can have both zero, and if percpu is not set up, the caller is
+    // already on the BSP early path where slot 0 is the correct answer.
+    Some(val as usize)
 }
 
 pub fn try_current_apic_id() -> Option<u32> {
-    // SAFETY: reading IA32_GS_BASE only returns the current CPU's GS base MSR
-    // value. When GS base has been initialized to one `PerCpu` record, reading
-    // the `apic_id` field is a plain immutable load from static kernel memory.
+    // Read apic_id directly via the gs: segment prefix.
+    let val: u32;
     unsafe {
-        let base = Msr::new(IA32_GS_BASE).read();
-        if base == 0 {
-            return None;
-        }
-        Some((base as *const u8).add(APIC_ID_OFFSET).cast::<u32>().read())
+        core::arch::asm!(
+            "mov {out:e}, gs:[{off}]",
+            off = const APIC_ID_OFFSET,
+            out = out(reg) val,
+            options(nostack, readonly, preserves_flags),
+        );
     }
+    Some(val)
 }

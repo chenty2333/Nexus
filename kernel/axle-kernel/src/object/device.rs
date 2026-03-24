@@ -905,6 +905,14 @@ pub fn pci_device_set_interrupt_mode(handle: zx_handle_t, mode: u32) -> Result<(
 }
 
 pub fn pci_device_set_command(handle: zx_handle_t, command: u16) -> Result<(), zx_status_t> {
+    // Whitelist of safe PCI command register bits that userspace may toggle.
+    // Bit 0: I/O Space Enable
+    // Bit 1: Memory Space Enable
+    // Bit 2: Bus Master Enable
+    const PCI_COMMAND_SAFE_MASK: u16 = 0x0007;
+
+    let command = command & PCI_COMMAND_SAFE_MASK;
+
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::WRITE)?;
         let (location, config_backing_object) =

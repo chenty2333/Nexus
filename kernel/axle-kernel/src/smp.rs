@@ -29,7 +29,15 @@ struct ApTrampolineParams {
 #[derive(Clone, Copy)]
 struct AlignedApStack([u8; AP_STACK_SIZE]);
 
-static mut AP_STACKS: [AlignedApStack; MAX_CPUS] = [AlignedApStack([0; AP_STACK_SIZE]); MAX_CPUS];
+/// Wrapper for AP stack storage accessed through raw pointers only.
+/// BSP allocates stacks during single-core init; each AP uses its own stack exclusively.
+struct SyncApStacks(core::cell::UnsafeCell<[AlignedApStack; MAX_CPUS]>);
+// SAFETY: each AP stack is exclusively owned by one CPU after assignment.
+// BSP writes are serialized during single-core init phase.
+unsafe impl Sync for SyncApStacks {}
+
+static AP_STACKS: SyncApStacks =
+    SyncApStacks(core::cell::UnsafeCell::new([AlignedApStack([0; AP_STACK_SIZE]); MAX_CPUS]));
 
 static AP_ONLINE: [AtomicBool; MAX_APIC_IDS] = [const { AtomicBool::new(false) }; MAX_APIC_IDS];
 static APIC_ID_TO_SLOT: [AtomicUsize; MAX_APIC_IDS] =
@@ -72,8 +80,12 @@ fn delay_us(us: u64) {
 }
 
 fn ap_stack_top(slot: usize) -> u64 {
-    // SAFETY: AP_STACKS is a static backing store; slots are clamped to MAX_CPUS.
-    let base = unsafe { core::ptr::addr_of!(AP_STACKS[slot]) as u64 };
+    // SAFETY: AP_STACKS is wrapped in UnsafeCell; we only read the address of a
+    // specific slot. Slots are clamped to MAX_CPUS.
+    let base = unsafe {
+        let stacks_ptr = AP_STACKS.0.get() as *const AlignedApStack;
+        stacks_ptr.add(slot) as u64
+    };
     base + (AP_STACK_SIZE as u64)
 }
 

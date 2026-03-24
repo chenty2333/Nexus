@@ -32,14 +32,21 @@ pub fn revocation_group_get_info(
         let epoch = state.with_core(|kernel| kernel.revocation_group_epoch(token))?;
         Ok(axle_types::ax_revocation_group_info_t {
             group_id: token.id().raw(),
-            generation: token.generation(),
-            epoch,
+            generation: token.generation() as u32,
+            epoch: epoch as u32,
             reserved0: 0,
         })
     })
 }
 
 pub fn revocation_group_revoke(handle: zx_handle_t) -> Result<(), zx_status_t> {
+    // TODO(revocation-cascade): After revoking handles in a group, objects
+    // that were exclusively reachable through those handles may still have
+    // observable side-effects registered elsewhere -- for example, port
+    // subscriptions (`object_wait_async`) or pending timer firings.  A
+    // follow-up pass should enumerate affected objects and clean up stale
+    // port subscriptions, timer registrations, and any other reactor state
+    // so the system does not deliver events to now-unreachable handles.
     with_state_mut(|state| {
         let resolved = state.lookup_handle(handle, crate::task::HandleRights::WRITE)?;
         let token = state.with_objects(|objects| match objects.get(resolved.object_key()) {

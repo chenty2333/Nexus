@@ -9,6 +9,10 @@ impl Kernel {
         let activation_now_ns = self.current_cpu_now_ns().max(0) as u64;
         let previous_thread_id = self.current_cpu_scheduler()?.current_thread_id;
         let current_address_space_id = if let Some(current_thread_id) = previous_thread_id {
+            // Clear the running_on_cpu field for the thread being switched away from.
+            if let Some(prev_thread) = self.threads.get_mut(&current_thread_id) {
+                prev_thread.running_on_cpu = None;
+            }
             let process_id = self
                 .threads
                 .get(&current_thread_id)
@@ -77,6 +81,7 @@ impl Kernel {
         thread.remote_wake_enqueued_ns = None;
         thread.remote_wake_source_cpu = None;
         thread.remote_wake_target_cpu = None;
+        thread.running_on_cpu = Some(current_cpu_id);
         thread.last_cpu = current_cpu_id;
         Ok(context)
     }

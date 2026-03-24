@@ -67,6 +67,8 @@ This is the current mechanism that prevents duplicate materialization or inconsi
   - a new frame is allocated and populated
   - the local mapping becomes writable on the new frame
   - reverse-map and resource-accounting state is updated
+  - if any step after reservation fails, the reservation token is explicitly released to avoid
+    leaking the quota slot (COW rollback safety)
 - The reservation is now a typed internal token rather than one bool carried across the whole fault
   path.
   - commit consumes the token

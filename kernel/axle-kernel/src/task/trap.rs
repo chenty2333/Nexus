@@ -141,6 +141,7 @@ impl UserContext {
         }
     }
 
+    #[inline(never)]
     pub(crate) fn enter(self) -> ! {
         use x86_64::instructions::segmentation::{DS, ES, Segment};
 
@@ -473,6 +474,7 @@ impl Kernel {
                     self.switch_to_thread(next_thread_id, trap, cpu_frame)?;
                     Ok(TrapExitDisposition::Complete)
                 } else {
+                    self.clear_current_thread_slot();
                     Ok(TrapExitDisposition::BlockCurrent)
                 }
             }

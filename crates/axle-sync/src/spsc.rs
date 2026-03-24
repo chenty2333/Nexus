@@ -47,6 +47,7 @@ unsafe impl<T: Copy + Send, const N: usize> Sync for SpscRing<T, N> {}
 impl<T: Copy, const N: usize> SpscRing<T, N> {
     /// Create an empty ring.
     pub fn new() -> Self {
+        const { assert!(N >= 2, "ring size must be >= 2") }
         assert!(N >= 2, "ring size must be >= 2");
 
         // Start with all slots uninitialized.

@@ -35,9 +35,9 @@ impl Kernel {
     }
 
     pub(crate) fn running_cpu_for_thread(&self, thread_id: ThreadId) -> Option<usize> {
-        self.cpu_schedulers.iter().find_map(|(&cpu_id, scheduler)| {
-            (scheduler.current_thread_id == Some(thread_id)).then_some(cpu_id)
-        })
+        self.threads
+            .get(&thread_id)
+            .and_then(|thread| thread.running_on_cpu)
     }
 
     pub(super) fn cpu_is_online(&self, cpu_id: usize) -> bool {

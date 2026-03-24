@@ -13,6 +13,12 @@ core::arch::global_asm!(
     .global axle_int80_entry
     .type axle_int80_entry, @function
 axle_int80_entry:
+    // Check if we came from ring 3 by testing RPL bits in saved CS (at rsp+8).
+    // If RPL == 3 we need swapgs to switch to the kernel GS base.
+    test QWORD PTR [rsp + 8], 3
+    jz .Lint80_no_swapgs_entry
+    swapgs
+.Lint80_no_swapgs_entry:
     // Save a full register snapshot for the Rust trap handler.
     push r15
     push r14
@@ -53,6 +59,12 @@ axle_int80_entry:
     pop r13
     pop r14
     pop r15
+
+    // Restore user GS base before returning to ring 3.
+    test QWORD PTR [rsp + 8], 3
+    jz .Lint80_no_swapgs_exit
+    swapgs
+.Lint80_no_swapgs_exit:
     iretq
     .size axle_int80_entry, .-axle_int80_entry
     "#,

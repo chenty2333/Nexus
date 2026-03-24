@@ -25,6 +25,8 @@ This file describes the current VMO, VMAR, VMA, and address-space control-plane 
   - `MapRec`
   - `FrameTable`
   - reverse-map metadata and per-page metadata stores
+- `FrameTable` now uses a `BTreeMap<FrameId, FrameDescRecord>` internally instead of a linear
+  `Vec`, giving O(log n) frame lookup instead of O(n) linear scan for large physical memory.
 - `kernel/axle-kernel/src/task.rs` wraps this in `VmDomain` and ties it to page tables and process ownership.
 - `kernel/axle-kernel/src/object.rs` exposes VMO and VMAR syscalls through object handles.
 
@@ -56,6 +58,9 @@ This file describes the current VMO, VMAR, VMA, and address-space control-plane 
   - mapping-level clone policy (`None` / `SharedAlias` / `PrivateCow`)
 - Per-page hot state lives in `PteMeta`.
 - Physical frame / reverse-map / pin / loan truth lives in `FrameTable`.
+- `FrameRef`, `PinToken`, and `LoanToken` `Drop` implementations now use hard `assert!` (not
+  `debug_assert!`) so resource leaks panic even in release builds, preventing silent physical
+  frame leakage.
 - Reverse-map state is no longer only diagnostic metadata.
   - the kernel now consumes it to decide whether dropped or replaced frames are actually retireable
   - precise frame-reuse planning is based on the live anchor set plus frame ref / pin / loan state,

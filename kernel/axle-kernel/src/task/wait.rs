@@ -52,6 +52,11 @@ pub(super) struct WaitNode {
 }
 
 impl WaitNode {
+    /// Arm this wait node with a new registration and optional deadline.
+    ///
+    /// The sequence number is monotonically incremented on each arm; seq == 0
+    /// is reserved for the uninitialised/cleared state so that callers can
+    /// distinguish "never armed" from any valid armed generation.
     pub(super) fn arm(&mut self, registration: WaitRegistration, deadline: Option<i64>) -> u64 {
         self.seq = self.seq.wrapping_add(1);
         if self.seq == 0 {

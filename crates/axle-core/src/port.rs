@@ -215,9 +215,9 @@ impl PortTelemetryState {
         let index = depth.min(self.depth_hist.len().saturating_sub(1));
         self.current_depth = index as u32;
         self.peak_depth = self.peak_depth.max(self.current_depth);
-        self.depth_sample_count = self.depth_sample_count.wrapping_add(1);
+        self.depth_sample_count = self.depth_sample_count.saturating_add(1);
         if let Some(sample) = self.depth_hist.get_mut(index) {
-            *sample = sample.wrapping_add(1);
+            *sample = sample.saturating_add(1);
         }
     }
 
@@ -262,6 +262,13 @@ impl PortTelemetryState {
 }
 
 /// Packet queue backend used by the port state machine.
+///
+/// Implementations are not required to enforce a capacity limit themselves.
+/// Capacity control is the responsibility of [`PortState`], which gates
+/// admission through user-quota and kernel-reserve checks before calling
+/// [`push_back`](PacketQueue::push_back).  A backend that always succeeds
+/// (like [`VecPortQueue`]) is correct as long as `PortState` is the sole
+/// entry point for enqueue operations.
 pub trait PacketQueue: core::fmt::Debug {
     /// Number of queued packets currently stored.
     fn len(&self) -> usize;
@@ -421,22 +428,22 @@ impl<Q: PacketQueue> PortState<Q> {
         debug_assert_eq!(pkt.kind, PacketKind::User);
         if self.user_in_q >= self.user_quota() {
             self.telemetry.user_should_wait_count =
-                self.telemetry.user_should_wait_count.wrapping_add(1);
+                self.telemetry.user_should_wait_count.saturating_add(1);
             self.telemetry.user_reserve_hit_count =
-                self.telemetry.user_reserve_hit_count.wrapping_add(1);
+                self.telemetry.user_reserve_hit_count.saturating_add(1);
             return Err(PortError::ShouldWait);
         }
         if self.q.len() >= self.capacity {
             self.telemetry.user_should_wait_count =
-                self.telemetry.user_should_wait_count.wrapping_add(1);
-            self.telemetry.user_full_hit_count = self.telemetry.user_full_hit_count.wrapping_add(1);
+                self.telemetry.user_should_wait_count.saturating_add(1);
+            self.telemetry.user_full_hit_count = self.telemetry.user_full_hit_count.saturating_add(1);
             return Err(PortError::ShouldWait);
         }
         if self.q.push_back(pkt).is_err() {
             return Err(PortError::ShouldWait);
         }
         self.user_in_q += 1;
-        self.telemetry.user_queue_count = self.telemetry.user_queue_count.wrapping_add(1);
+        self.telemetry.user_queue_count = self.telemetry.user_queue_count.saturating_add(1);
         self.telemetry.record_depth(self.q.len());
         Ok(())
     }
@@ -449,15 +456,15 @@ impl<Q: PacketQueue> PortState<Q> {
         debug_assert_ne!(pkt.kind, PacketKind::User);
         let _ticket = self.reserve_kernel_slot().ok_or_else(|| {
             self.telemetry.kernel_should_wait_count =
-                self.telemetry.kernel_should_wait_count.wrapping_add(1);
+                self.telemetry.kernel_should_wait_count.saturating_add(1);
             PortError::ShouldWait
         })?;
         if self.q.push_back(pkt).is_err() {
             self.telemetry.kernel_should_wait_count =
-                self.telemetry.kernel_should_wait_count.wrapping_add(1);
+                self.telemetry.kernel_should_wait_count.saturating_add(1);
             return Err(PortError::ShouldWait);
         }
-        self.telemetry.kernel_queue_count = self.telemetry.kernel_queue_count.wrapping_add(1);
+        self.telemetry.kernel_queue_count = self.telemetry.kernel_queue_count.saturating_add(1);
         self.telemetry.record_depth(self.q.len());
         Ok(())
     }
@@ -471,7 +478,7 @@ impl<Q: PacketQueue> PortState<Q> {
             debug_assert!(self.user_in_q > 0);
             self.user_in_q -= 1;
         }
-        self.telemetry.pop_count = self.telemetry.pop_count.wrapping_add(1);
+        self.telemetry.pop_count = self.telemetry.pop_count.saturating_add(1);
         self.telemetry.record_depth(self.q.len());
         Ok(pkt)
     }

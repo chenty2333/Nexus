@@ -208,6 +208,21 @@ fuzz_target!(|data: &[u8]| {
     for pair in vmars.windows(2) {
         assert!(pair[0].base() + pair[0].len() <= pair[1].base());
     }
+
+    // Verify that no mapped frame has a negative or inconsistent reference
+    // count: ref_count should always be >= map_count.
+    for vma in vmas {
+        let va = vma.base();
+        if let Some(lookup) = space.lookup(va) {
+            if let Some(frame_id) = lookup.frame_id() {
+                if let Some(desc) = frames.state(frame_id) {
+                    assert!(desc.ref_count() >= desc.map_count(),
+                        "frame {frame_id:?}: ref_count ({}) < map_count ({})",
+                        desc.ref_count(), desc.map_count());
+                }
+            }
+        }
+    }
 });
 
 fn decode_perms(bits: u8) -> MappingPerms {

@@ -76,7 +76,7 @@ bitflags! {
 }
 
 /// Identifier for a registered physical frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FrameId(u64);
 
 impl FrameId {
@@ -217,7 +217,7 @@ impl FrameRef {
 
 impl Drop for FrameRef {
     fn drop(&mut self) {
-        debug_assert!(
+        assert!(
             self.frame_id.is_none(),
             "FrameRef dropped without explicit release"
         );
@@ -259,7 +259,7 @@ impl PinToken {
 
 impl Drop for PinToken {
     fn drop(&mut self) {
-        debug_assert!(
+        assert!(
             self.frame_ids.is_none(),
             "PinToken dropped without explicit release"
         );
@@ -289,7 +289,7 @@ impl LoanToken {
 
 impl Drop for LoanToken {
     fn drop(&mut self) {
-        debug_assert!(
+        assert!(
             self.frame_ids.is_none(),
             "LoanToken dropped without explicit release"
         );
@@ -322,7 +322,7 @@ pub enum FrameTableError {
 /// Global physical-frame bookkeeping used by the bootstrap kernel.
 #[derive(Debug, Default)]
 pub struct FrameTable {
-    frames: Vec<FrameDescRecord>,
+    frames: BTreeMap<FrameId, FrameDescRecord>,
     rmap_nodes: RmapNodeArena,
 }
 
@@ -379,7 +379,7 @@ impl FrameTable {
     /// Create an empty frame table.
     pub fn new() -> Self {
         Self {
-            frames: Vec::new(),
+            frames: BTreeMap::new(),
             rmap_nodes: RmapNodeArena::default(),
         }
     }
@@ -390,25 +390,27 @@ impl FrameTable {
             return Err(FrameTableError::InvalidArgs);
         }
         let id = FrameId(paddr);
-        if self.frames.iter().any(|frame| frame.id == id) {
+        if self.frames.contains_key(&id) {
             return Err(FrameTableError::AlreadyExists);
         }
-        self.frames.push(FrameDescRecord {
+        self.frames.insert(
             id,
-            ref_count: 0,
-            map_count: 0,
-            pin_count: 0,
-            loan_count: 0,
-            rmap_head: None,
-            rmap_anchor_count: 0,
-        });
+            FrameDescRecord {
+                id,
+                ref_count: 0,
+                map_count: 0,
+                pin_count: 0,
+                loan_count: 0,
+                rmap_head: None,
+                rmap_anchor_count: 0,
+            },
+        );
         Ok(id)
     }
 
     /// Remove a previously registered frame that no longer has active users.
     pub fn unregister_existing(&mut self, id: FrameId) -> Result<(), FrameTableError> {
-        let index = self.frame_index(id)?;
-        let frame = self.frames.get(index).ok_or(FrameTableError::NotFound)?;
+        let frame = self.frames.get(&id).ok_or(FrameTableError::NotFound)?;
         if frame.ref_count != 0
             || frame.map_count != 0
             || frame.pin_count != 0
@@ -418,20 +420,19 @@ impl FrameTable {
         {
             return Err(FrameTableError::Busy);
         }
-        let _ = self.frames.remove(index);
+        let _ = self.frames.remove(&id);
         Ok(())
     }
 
     /// Return whether the frame id is known.
     pub fn contains(&self, id: FrameId) -> bool {
-        self.frames.iter().any(|frame| frame.id == id)
+        self.frames.contains_key(&id)
     }
 
     /// Snapshot the current descriptor state of one registered frame.
     pub fn state(&self, id: FrameId) -> Option<FrameDesc> {
         self.frames
-            .iter()
-            .find(|frame| frame.id == id)
+            .get(&id)
             .map(|frame| FrameDesc {
                 id: frame.id,
                 ref_count: frame.ref_count,
@@ -447,7 +448,7 @@ impl FrameTable {
 
     /// Return the full reverse-mapping anchor set for one frame.
     pub fn rmap_anchors(&self, id: FrameId) -> Option<Vec<ReverseMapAnchor>> {
-        let frame = self.frames.iter().find(|frame| frame.id == id)?;
+        let frame = self.frames.get(&id)?;
         let mut anchors = Vec::with_capacity(frame.rmap_anchor_count as usize);
         let mut cursor = frame.rmap_head;
         while let Some(node_id) = cursor {
@@ -480,17 +481,17 @@ impl FrameTable {
         id: FrameId,
         anchor: ReverseMapAnchor,
     ) -> Result<RmapNodeId, FrameTableError> {
-        let frame_index = self.frame_index(id)?;
-        let head = self.frames[frame_index].rmap_head;
-        let map_count = self.frames[frame_index]
+        let frame = self.frames.get(&id).ok_or(FrameTableError::NotFound)?;
+        let head = frame.rmap_head;
+        let map_count = frame
             .map_count
             .checked_add(1)
             .ok_or(FrameTableError::CountOverflow)?;
-        let ref_count = self.frames[frame_index]
+        let ref_count = frame
             .ref_count
             .checked_add(1)
             .ok_or(FrameTableError::CountOverflow)?;
-        let rmap_anchor_count = self.frames[frame_index]
+        let rmap_anchor_count = frame
             .rmap_anchor_count
             .checked_add(1)
             .ok_or(FrameTableError::CountOverflow)?;
@@ -507,7 +508,7 @@ impl FrameTable {
                 .ok_or(FrameTableError::MissingAnchor)?;
             node.prev = Some(node_id);
         }
-        let frame = &mut self.frames[frame_index];
+        let frame = self.frames.get_mut(&id).ok_or(FrameTableError::NotFound)?;
         frame.map_count = map_count;
         frame.ref_count = ref_count;
         frame.rmap_anchor_count = rmap_anchor_count;
@@ -528,14 +529,13 @@ impl FrameTable {
 
     /// Remove one mapping anchor from a frame.
     fn unmap_frame(&mut self, id: FrameId, node_id: RmapNodeId) -> Result<(), FrameTableError> {
-        let frame_index = self.frame_index(id)?;
+        let frame = self.frames.get(&id).ok_or(FrameTableError::NotFound)?;
         let Some(node) = self.rmap_nodes.get(node_id).copied() else {
             return Err(FrameTableError::MissingAnchor);
         };
         if node.frame_id != id {
             return Err(FrameTableError::MissingAnchor);
         }
-        let frame = &self.frames[frame_index];
         if frame.map_count == 0 || frame.ref_count == 0 || frame.rmap_anchor_count == 0 {
             return Err(FrameTableError::RefUnderflow);
         }
@@ -546,7 +546,10 @@ impl FrameTable {
                 .ok_or(FrameTableError::MissingAnchor)?;
             prev.next = node.next;
         } else {
-            self.frames[frame_index].rmap_head = node.next;
+            self.frames
+                .get_mut(&id)
+                .ok_or(FrameTableError::NotFound)?
+                .rmap_head = node.next;
         }
         if let Some(next_id) = node.next {
             let next = self
@@ -559,7 +562,7 @@ impl FrameTable {
             .rmap_nodes
             .free(node_id)
             .ok_or(FrameTableError::MissingAnchor)?;
-        let frame = &mut self.frames[frame_index];
+        let frame = self.frames.get_mut(&id).ok_or(FrameTableError::NotFound)?;
         frame.map_count -= 1;
         frame.ref_count -= 1;
         frame.rmap_anchor_count -= 1;
@@ -682,15 +685,7 @@ impl FrameTable {
 
     fn frame_mut(&mut self, id: FrameId) -> Result<&mut FrameDescRecord, FrameTableError> {
         self.frames
-            .iter_mut()
-            .find(|frame| frame.id == id)
-            .ok_or(FrameTableError::NotFound)
-    }
-
-    fn frame_index(&self, id: FrameId) -> Result<usize, FrameTableError> {
-        self.frames
-            .iter()
-            .position(|frame| frame.id == id)
+            .get_mut(&id)
             .ok_or(FrameTableError::NotFound)
     }
 }

@@ -208,18 +208,17 @@ impl GlobalVmoStore {
         global_vmo_id: KernelVmoId,
         snapshot: &Vmo,
     ) -> Result<(), zx_status_t> {
+        let mut source = VmoBackingSource::from_kind(snapshot.kind(), snapshot.frames().len())?;
+        if let Some(frames) = source.frames_mut() {
+            *frames = snapshot.frames().to_vec();
+        }
         self.entries.insert(
             global_vmo_id,
             GlobalVmo {
                 size_bytes: snapshot.size_bytes(),
-                source: VmoBackingSource::from_kind(snapshot.kind(), snapshot.frames().len())?,
+                source,
             },
         );
-        if let Some(global_vmo) = self.entries.get_mut(&global_vmo_id) {
-            if let Some(frames) = global_vmo.source.frames_mut() {
-                *frames = snapshot.frames().to_vec();
-            }
-        }
         Ok(())
     }
 

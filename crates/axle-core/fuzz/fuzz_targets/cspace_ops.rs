@@ -6,17 +6,18 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let mut cs = CSpace::new(64, 8);
-    let revocations = RevocationManager::new();
+    let mut revocations = RevocationManager::new();
     let mut active: Vec<Handle> = Vec::new();
     let mut closed: Vec<Handle> = Vec::new();
     let mut transferred: Vec<TransferredCap> = Vec::new();
+    let mut groups = Vec::new();
 
     for chunk in data.chunks(16) {
         if chunk.is_empty() {
             continue;
         }
 
-        match chunk[0] % 7 {
+        match chunk[0] % 10 {
             0 => {
                 let object_id = le_u64(chunk.get(0..8).unwrap_or(&[]));
                 let rights = le_u32(chunk.get(8..12).unwrap_or(&[]));
@@ -62,7 +63,10 @@ fuzz_target!(|data: &[u8]| {
                             closed.push(old);
                         }
                         Err(CSpaceError::BadHandle) => closed.push(old),
-                        Err(_) => {}
+                        Err(_) => {
+                            // AccessDenied: old handle is still valid, push it back.
+                            active.push(old);
+                        }
                     }
                 }
             }
@@ -78,7 +82,10 @@ fuzz_target!(|data: &[u8]| {
                             }
                         }
                         Err(CSpaceError::BadHandle) => closed.push(h),
-                        Err(_) => {}
+                        Err(_) => {
+                            // Handle still valid, push it back.
+                            active.push(h);
+                        }
                     }
                 }
             }
@@ -91,11 +98,42 @@ fuzz_target!(|data: &[u8]| {
                     }
                 }
             }
+            7 => {
+                // Create a revocation group.
+                let grp = revocations.create_group();
+                groups.push(grp);
+            }
+            8 => {
+                // Alloc a revocable handle using an existing group.
+                if !groups.is_empty() {
+                    let gidx = usize::from(chunk.get(1).copied().unwrap_or(0)) % groups.len();
+                    let grp = groups[gidx];
+                    let object_id = le_u64(chunk.get(2..10).unwrap_or(&[]));
+                    let rights = le_u32(chunk.get(10..14).unwrap_or(&[]));
+                    let generation = le_u32(chunk.get(14..16).unwrap_or(&[]));
+                    if let Ok(h) = cs.alloc_revocable(
+                        Capability::new(object_id, rights, generation),
+                        &revocations,
+                        grp,
+                    ) {
+                        active.push(h);
+                    }
+                }
+            }
+            9 => {
+                // Revoke a group.
+                if !groups.is_empty() {
+                    let gidx = usize::from(chunk.get(1).copied().unwrap_or(0)) % groups.len();
+                    let grp = groups[gidx];
+                    let _ = revocations.revoke(grp);
+                }
+            }
             _ => unreachable!(),
         }
 
-        for &h in &closed {
-            assert!(matches!(cs.get(h), Err(CSpaceError::BadHandle)));
+        // Verify active handles are still resolvable.
+        for &h in &active {
+            assert!(cs.get(h).is_ok(), "active handle must be resolvable");
         }
     }
 });

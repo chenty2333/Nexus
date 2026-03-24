@@ -450,6 +450,7 @@ fn should_pause_fault_leader_for_test() -> bool {
 
 fn wait_for_fault_completion(table: &Arc<Mutex<FaultTable>>, wait: FaultWaitToken) {
     let mut observed_spin_loops = 0_u64;
+    const MAX_SPIN_ITERATIONS: u64 = 1_000_000;
     loop {
         let completed = {
             let table = table.lock();
@@ -474,6 +475,17 @@ fn wait_for_fault_completion(table: &Arc<Mutex<FaultTable>>, wait: FaultWaitToke
                 telemetry.prepare_lazy_anon,
                 telemetry.prepare_lazy_vmo_alloc,
             );
+            return;
+        }
+        if observed_spin_loops >= MAX_SPIN_ITERATIONS {
+            // Exceeded maximum spin count -- release our waiter slot and yield
+            // so the leader can make progress. The caller will retry the fault
+            // from the top of its planning loop.
+            let mut table = table.lock();
+            table.release_waiter(wait);
+            table.record_wait_spin_loops(observed_spin_loops);
+            drop(table);
+            core::hint::spin_loop();
             return;
         }
         for _ in 0..FAULT_WAIT_SPIN_LOOPS {

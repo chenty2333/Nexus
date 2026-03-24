@@ -25,6 +25,8 @@ This file describes the current syscall-number source, trap entry, argument copy
   `ax_signals_t`, ...).
 - The live trap path now decodes handle arguments at full native width instead of truncating them
   through the older 32-bit compat codec.
+- `arg_handle` now rejects obviously illegal sentinel values such as `u64::MAX` before attempting
+  CSpace lookup.
 
 ## Current dispatch shape
 
@@ -76,6 +78,11 @@ This file describes the current syscall-number source, trap entry, argument copy
 ## Copyin / copyout rules
 
 - `kernel/axle-kernel/src/copy.rs` is the only syscall-facing usercopy service.
+- `copyin_value<T: Copy>` now carries explicit SAFETY documentation requiring that `T` must be a
+  type for which all bit patterns are valid, since the copy reads arbitrary user-provided bytes.
+- The copy service uses `write_volatile` / `read_volatile` for shared-slot communication with
+  userspace, avoiding potential UB from the optimizer reordering or eliding accesses to memory
+  that may be concurrently visible to ring3.
 - `SyscallCtx` calls into that service for:
   - typed scalar / slice copyin
   - typed writeback for values, bytes, handles, and channel payloads
@@ -130,6 +137,10 @@ The current bootstrap syscall surface includes:
 - Unknown syscall numbers return `ZX_ERR_BAD_SYSCALL`.
 - Known-but-unimplemented paths use `ZX_ERR_NOT_SUPPORTED`.
 - Type, rights, pointer, and object-state checks are largely delegated into the object layer after the syscall shell validates raw arguments.
+- Permission checks for transport syscalls (`socket_write`, `socket_read`, `channel_write`,
+  `channel_read`, and similar families) are now unified at `lookup_handle` time, verifying rights
+  immediately on handle resolution rather than after object access, eliminating information-leakage
+  side channels.
 - A syscall can leave the thread blocked; trap-exit handling then decides whether to return to user mode, switch threads, or block current execution.
 - The bootstrap perf trace now distinguishes:
   - native entry (`sys_native_enter`)

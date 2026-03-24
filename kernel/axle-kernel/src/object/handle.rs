@@ -152,6 +152,14 @@ impl KernelState {
         self.registry.lock().handle_refcount(object_key)
     }
 
+    /// Decrement the handle reference count for the given object key.
+    ///
+    /// This is intentionally a thin delegate to the registry's
+    /// `decrement_handle_ref`, which also performs automatic retirement when
+    /// the combined handle + kernel reference count drops to zero.  Callers
+    /// that need side-effect cleanup (e.g., closing the last handle to a
+    /// channel endpoint) perform that work *after* this call via
+    /// `finalize_last_handle_close`, so no additional logic is required here.
     pub(super) fn decrement_object_handle_ref(&self, object_key: ObjectKey) {
         self.registry.lock().decrement_handle_ref(object_key);
     }

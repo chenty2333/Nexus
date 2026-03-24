@@ -39,6 +39,11 @@ pub enum HandleError {
 
 impl Handle {
     /// Create a handle from `(slot_index, slot_tag)` using the native 64-bit encoding.
+    ///
+    /// `index` may be zero -- slot index 0 is a valid CSpace slot.  The only
+    /// invalid combination is `(index=0, tag=0)` which encodes to
+    /// [`HANDLE_INVALID`].  A `tag` of [`HANDLE_TAG_RESERVED`] (0) is always
+    /// rejected.
     pub const fn new(index: u32, tag: u32) -> Result<Self, HandleError> {
         if tag == HANDLE_TAG_RESERVED {
             return Err(HandleError::ReservedTag);

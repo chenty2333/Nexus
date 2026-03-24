@@ -44,6 +44,18 @@ impl WaitModel {
         }
     }
 
+    /// Arm this wait model with the given source and optional deadline.
+    ///
+    /// # Thread safety
+    ///
+    /// This method must be called by exactly one thread (the thread entering a
+    /// blocking wait). Concurrent calls to `arm` from multiple threads produce
+    /// undefined sequencing: the `current_seq` bump, the `completion` reset,
+    /// and the `source` store are not jointly atomic, so interleaving two arms
+    /// can leave the model in an inconsistent state.
+    ///
+    /// A subsequent `wake`, `timeout`, or `cancel` call from any thread is
+    /// safe once `arm` has returned.
     fn arm(&self, source: WaitSource, deadline_armed: bool) -> usize {
         let seq = self
             .current_seq

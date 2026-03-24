@@ -134,7 +134,12 @@ impl Kernel {
     }
 
     pub(super) fn clear_current_thread_slot(&mut self) {
-        self.current_cpu_scheduler_mut().current_thread_id = None;
+        let scheduler = self.current_cpu_scheduler_mut();
+        if let Some(thread_id) = scheduler.current_thread_id.take() {
+            if let Some(thread) = self.threads.get_mut(&thread_id) {
+                thread.running_on_cpu = None;
+            }
+        }
     }
 
     pub(super) fn account_current_runtime_until(&mut self, now: i64) -> Result<(), zx_status_t> {

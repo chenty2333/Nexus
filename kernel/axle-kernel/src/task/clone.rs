@@ -60,9 +60,7 @@ impl VmDomain {
 
         let mut reqs = Vec::with_capacity(2);
         reqs.push(TlbCommitReq::strict(src_address_space_id));
-        if dst_address_space_id != src_address_space_id {
-            reqs.push(TlbCommitReq::strict(dst_address_space_id));
-        }
+        reqs.push(TlbCommitReq::strict(dst_address_space_id));
         Ok(reqs)
     }
 
@@ -246,11 +244,22 @@ impl VmDomain {
         self.clear_private_cow_range(dst_address_space_id, plan.dst_base, plan.len);
         self.update_mapping_pages(dst_address_space_id, plan.dst_base, plan.len)?;
 
-        self.with_address_space_frames_mut(src_address_space_id, |address_space, _frames| {
-            address_space
-                .arm_copy_on_write(plan.src_base, plan.len)
-                .map_err(map_address_space_error)
-        })?;
+        let src_arm_result =
+            self.with_address_space_frames_mut(src_address_space_id, |address_space, _frames| {
+                address_space
+                    .arm_copy_on_write(plan.src_base, plan.len)
+                    .map_err(map_address_space_error)
+            });
+        if let Err(err) = src_arm_result {
+            // Rollback: unmap the dst mapping and release the VMO we just created.
+            let _ = self.unmap_clone_target_if_present(
+                dst_address_space_id,
+                dst_vmar_id,
+                plan.dst_base,
+                plan.len,
+            );
+            return Err(err);
+        }
         self.clear_private_cow_range(src_address_space_id, plan.src_base, plan.len);
         self.update_mapping_pages(src_address_space_id, plan.src_base, plan.len)?;
         Ok(())

@@ -608,14 +608,13 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
     }
 
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::WRITE)?;
         let endpoint =
             state.with_registry(|registry| match registry.get(resolved.object_key()) {
                 Some(KernelObject::Socket(endpoint)) => Ok(*endpoint),
                 Some(_) => Err(ZX_ERR_WRONG_TYPE),
                 None => Err(ZX_ERR_BAD_HANDLE),
             })?;
-        require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
 
         let write_result = state.with_transport_mut(|transport| {
             let core = transport
@@ -697,7 +696,7 @@ pub fn socket_write_payload(
 
     with_state_mut(|state| {
         let mut payload = Some(payload);
-        let resolved = match state.lookup_handle(handle, crate::task::HandleRights::empty()) {
+        let resolved = match state.lookup_handle(handle, crate::task::HandleRights::WRITE) {
             Ok(resolved) => resolved,
             Err(status) => {
                 if let Some(payload) = payload.take() {
@@ -720,12 +719,6 @@ pub fn socket_write_payload(
                     return Err(status);
                 }
             };
-        if let Err(status) = require_handle_rights(resolved, crate::task::HandleRights::WRITE) {
-            if let Some(payload) = payload.take() {
-                release_data_payload(state, payload);
-            }
-            return Err(status);
-        }
 
         let Some(write_payload) = payload.take() else {
             return Err(ZX_ERR_BAD_STATE);
@@ -810,14 +803,13 @@ pub fn socket_read(
     };
 
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::READ)?;
         let endpoint =
             state.with_registry(|registry| match registry.get(resolved.object_key()) {
                 Some(KernelObject::Socket(endpoint)) => Ok(*endpoint),
                 Some(_) => Err(ZX_ERR_WRONG_TYPE),
                 None => Err(ZX_ERR_BAD_HANDLE),
             })?;
-        require_handle_rights(resolved, crate::task::HandleRights::READ)?;
 
         let (result, mode, buffered_after, messages_after) =
             state.with_transport_mut(|transport| {
@@ -893,7 +885,7 @@ pub fn channel_write(
     with_state_mut(|state| {
         let mut payload = Some(payload);
         let mut transferred = Vec::new();
-        let resolved = match state.lookup_handle(handle, crate::task::HandleRights::empty()) {
+        let resolved = match state.lookup_handle(handle, crate::task::HandleRights::WRITE) {
             Ok(resolved) => resolved,
             Err(status) => {
                 if let Some(payload) = payload.take() {
@@ -918,12 +910,6 @@ pub fn channel_write(
                         return Err(status);
                     }
                 };
-            if let Err(status) = require_handle_rights(resolved, crate::task::HandleRights::WRITE) {
-                if let Some(payload) = payload.take() {
-                    release_channel_payload(state, payload);
-                }
-                return Err(status);
-            }
             peer_object_id
         };
 
@@ -1045,7 +1031,12 @@ pub fn channel_write(
         })?;
 
         for raw in handles {
-            state.close_handle(raw)?;
+            // Ignore close errors: handles were already validated during the
+            // snapshot-for-transfer step above.  Propagating a mid-loop error
+            // here would leave some source handles unclosed while the message
+            // has already been enqueued with retained object references,
+            // causing a handle leak.
+            let _ = state.close_handle(raw);
         }
 
         let _ = publish_object_signals(state, object_id);
@@ -1067,10 +1058,9 @@ pub fn channel_read(
 
     let state = state().map_err(|e| (e, 0, 0))?;
     let resolved = state
-        .lookup_handle(handle, crate::task::HandleRights::empty())
+        .lookup_handle(handle, crate::task::HandleRights::READ)
         .map_err(|e| (e, 0, 0))?;
     let object_id = resolved.object_key();
-    require_handle_rights(resolved, crate::task::HandleRights::READ).map_err(|e| (e, 0, 0))?;
     let (peer_object_id, transferred_handles, actual_bytes, actual_handles) = state
         .with_registry(|registry| {
             let endpoint = match registry.get(object_id) {

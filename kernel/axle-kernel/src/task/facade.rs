@@ -510,6 +510,7 @@ impl Kernel {
                 fpu_state: crate::arch::fpu::clean_state(),
                 state: ThreadState::Runnable,
                 queued_on_cpu: None,
+                running_on_cpu: Some(bootstrap_cpu_id),
                 last_cpu: bootstrap_cpu_id,
                 runtime_ns: 0,
                 wait: WaitNode::default(),

@@ -57,6 +57,8 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   It no longer relies on later `flush_port()` calls to lazily skip stale pending registrations.
 - Reactor observer keys are generation-aware `ObjectKey`s, so retained async state stays tied to
   one object incarnation even after numeric object ids are recycled.
+- `RevocationManager` epoch and generation counters are now `u64` (previously `u32`) and use
+  `saturating_add` to prevent wraparound.
 - Delivery complexity is now proportional to the observing ports of one waitable, not the total
   number of ports in the system.
 - Current options include:
@@ -67,13 +69,15 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
 - Signal producers now publish `(waitable_id, current_signals)` directly into the reactor path.
   The wait slice no longer pulls current signal snapshots from the global object table during
   async delivery.
+- BFS signal propagation now enforces a `MAX_PROPAGATION_DEPTH` of 1024, bounding the traversal
+  depth to prevent unbounded recursion or runaway propagation chains.
 - Bootstrap conformance now explicitly covers both timer/object waits and transport-object delivery
   through this path, including channel `WRITABLE` recovery and `PEER_CLOSED` packets.
 
 ## Port model
 
 - `axle-core` provides the semantic port state machine:
-  - fixed capacity
+  - fixed capacity (asserted non-zero at construction via `KernelPortQueue::new`)
   - kernel reserve slots
   - pending-merge behavior when kernel packets overflow
 - Async observer state is no longer stored inside the port state machine; ports are pure queues
@@ -113,6 +117,9 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   - `interrupt_unmask()` republishes the current pending state
   - `interrupt_ack()` drains one pending count at a time
 - `set(deadline)` arms or re-arms and clears `SIGNALED`.
+- `TimerService` now triggers heap compaction on re-arm when the deadline heap grows beyond four
+  times the number of active timers, preventing unbounded heap growth from repeated arm/cancel
+  cycles.
 - When polled at or after the deadline, the timer becomes signaled and disarms.
 - `cancel()` clears both arm state and signal state.
 - The unified backend produces two event families:
@@ -142,6 +149,9 @@ The current scheduler-facing blocked state is `Blocked { source }`, where `sourc
 - `Futex(key)`
 - `Fault(key)`
 - `None` for deadline-only sleep
+
+Futex `enqueue_waiter` now includes a `debug_assert` check to detect duplicate enqueue of the same
+waiter, catching potential double-park bugs during development.
 
 Wait completion eventually makes the thread runnable again through kernel task-state transitions.
 

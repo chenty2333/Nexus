@@ -93,7 +93,10 @@ impl TraceRecord {
             4 => TraceCategory::Tlb,
             5 => TraceCategory::Fault,
             6 => TraceCategory::Ipc,
-            _ => TraceCategory::Syscall,
+            _ => {
+                debug_assert!(false, "trace: unknown category discriminant");
+                TraceCategory::Syscall
+            }
         }
     }
 
@@ -132,7 +135,10 @@ impl TraceRecord {
             31 => TraceEvent::TlbInvpcidSingle,
             32 => TraceEvent::SocketDatagramEnqueue,
             33 => TraceEvent::SocketDatagramDequeue,
-            _ => TraceEvent::SysEnter,
+            _ => {
+                debug_assert!(false, "trace: unknown event discriminant");
+                TraceEvent::SysEnter
+            }
         }
     }
 }
@@ -185,8 +191,18 @@ static TRACE_SCHED_STEAL_PHASE5: AtomicU64 = AtomicU64::new(0);
 static TRACE_IPC_CHANNEL_ENQUEUE_PHASE7: AtomicU64 = AtomicU64::new(0);
 static TRACE_IPC_CHANNEL_DEQUEUE_PHASE7: AtomicU64 = AtomicU64::new(0);
 static TRACE_IPC_CHANNEL_RECLAIM_PHASE7: AtomicU64 = AtomicU64::new(0);
-static mut TRACE_RECORDS: [TraceRecord; TRACE_RECORD_CAPACITY] =
-    [TraceRecord::ZERO; TRACE_RECORD_CAPACITY];
+/// Wrapper around an `UnsafeCell` to hold the trace record ring buffer.
+/// Each writer reserves a unique slot via `TRACE_RECORD_COUNT` (atomic), so
+/// concurrent raw-pointer writes to *distinct* indices are data-race free.
+struct TraceRecordStorage(core::cell::UnsafeCell<[TraceRecord; TRACE_RECORD_CAPACITY]>);
+
+// SAFETY: concurrent writers always write to distinct indices (reserved via
+// atomic increment of TRACE_RECORD_COUNT). Readers only access the buffer
+// after the trace phase has been set to 0, which means writers have stopped.
+unsafe impl Sync for TraceRecordStorage {}
+
+static TRACE_RECORDS: TraceRecordStorage =
+    TraceRecordStorage(core::cell::UnsafeCell::new([TraceRecord::ZERO; TRACE_RECORD_CAPACITY]));
 
 fn pack_meta(cpu_id: usize, category: TraceCategory, event: TraceEvent) -> u64 {
     (u64::from(cpu_id as u16) << 32) | (u64::from(category as u16) << 16) | u64::from(event as u16)
@@ -442,9 +458,9 @@ pub(crate) fn init_bootstrap_trace() {
     // SAFETY: resetting the bootstrap trace ring happens before userspace starts
     // producing trace records for this run, so no concurrent writers can observe
     // partially cleared records. Each slot is written through a raw pointer to
-    // avoid forming a mutable reference to the `static mut` array.
+    // avoid forming a mutable reference to the shared array.
     unsafe {
-        let base = core::ptr::addr_of_mut!(TRACE_RECORDS).cast::<TraceRecord>();
+        let base = TRACE_RECORDS.0.get().cast::<TraceRecord>();
         for index in 0..TRACE_RECORD_CAPACITY {
             core::ptr::write(base.add(index), TraceRecord::ZERO);
         }
@@ -479,8 +495,10 @@ fn record(category: TraceCategory, event: TraceEvent, arg0: u64, arg1: u64) {
 
     // SAFETY: each writer reserves a unique `index` via `TRACE_RECORD_COUNT`,
     // and the trace ring never wraps for this minimal bootstrap recorder.
+    // Writing through a raw pointer avoids forming a mutable reference.
     unsafe {
-        TRACE_RECORDS[index as usize] = record;
+        let base = TRACE_RECORDS.0.get().cast::<TraceRecord>();
+        core::ptr::write(base.add(index as usize), record);
     }
 }
 
@@ -893,11 +911,18 @@ pub(crate) fn record_socket_datagram_dequeue(
 
 fn snapshot_records() -> Vec<TraceRecord> {
     let record_count = bootstrap_trace_record_count() as usize;
+    // Ensure all writes from record() are visible before we read the records.
+    core::sync::atomic::fence(Ordering::Acquire);
     let mut snapshot = Vec::with_capacity(record_count);
     // SAFETY: callers snapshot only after the runner has set phase=0 and
-    // stopped generating trace records, so copying the written prefix is stable.
+    // stopped generating trace records, so reading the written prefix is stable.
+    // We read through a raw pointer to avoid forming a shared reference to the
+    // UnsafeCell contents.
     unsafe {
-        snapshot.extend_from_slice(&TRACE_RECORDS[..record_count]);
+        let base = TRACE_RECORDS.0.get().cast::<TraceRecord>() as *const TraceRecord;
+        for i in 0..record_count {
+            snapshot.push(core::ptr::read(base.add(i)));
+        }
     }
     snapshot
 }
@@ -988,175 +1013,109 @@ fn trace_log_limit(record_count: usize) -> usize {
     }
 }
 
+/// Count how many records in a snapshot match a given phase and event.
+fn count_phase_events(records: &[TraceRecord], phase: u64, event: TraceEvent) -> u64 {
+    records
+        .iter()
+        .filter(|record| record.phase == phase && record.event() == event)
+        .count() as u64
+}
+
 pub(crate) fn flush_bootstrap_trace() {
     let records = snapshot_records();
 
-    let remote_wake_phase3 = records
-        .iter()
-        .filter(|record| record.phase == 3 && record.event() == TraceEvent::RemoteWake)
-        .count() as u64;
+    let remote_wake_phase3 = count_phase_events(&records, 3, TraceEvent::RemoteWake);
     TRACE_REMOTE_WAKE_PHASE3.store(remote_wake_phase3, Ordering::Release);
     TRACE_SCHED_STEAL_PHASE3.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 3 && record.event() == TraceEvent::Steal)
-            .count() as u64,
+        count_phase_events(&records, 3, TraceEvent::Steal),
         Ordering::Release,
     );
     TRACE_SCHED_HANDOFF_PHASE3.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 3 && record.event() == TraceEvent::Handoff)
-            .count() as u64,
+        count_phase_events(&records, 3, TraceEvent::Handoff),
         Ordering::Release,
     );
     TRACE_SCHED_REMOTE_WAKE_LATENCY_PHASE3.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 3 && record.event() == TraceEvent::RemoteWakeLatency)
-            .count() as u64,
+        count_phase_events(&records, 3, TraceEvent::RemoteWakeLatency),
         Ordering::Release,
     );
     TRACE_SYS_ENTER_PHASE1.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 1 && record.event() == TraceEvent::SysEnter)
-            .count() as u64,
+        count_phase_events(&records, 1, TraceEvent::SysEnter),
         Ordering::Release,
     );
     TRACE_SYS_EXIT_PHASE1.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 1 && record.event() == TraceEvent::SysExit)
-            .count() as u64,
+        count_phase_events(&records, 1, TraceEvent::SysExit),
         Ordering::Release,
     );
     TRACE_SYS_RETIRE_PHASE1.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 1 && record.event() == TraceEvent::SysRetire)
-            .count() as u64,
+        count_phase_events(&records, 1, TraceEvent::SysRetire),
         Ordering::Release,
     );
     TRACE_SYS_NATIVE_ENTER_PHASE1.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 1 && record.event() == TraceEvent::SysNativeEnter)
-            .count() as u64,
+        count_phase_events(&records, 1, TraceEvent::SysNativeEnter),
         Ordering::Release,
     );
     TRACE_SYS_NATIVE_SYSRET_PHASE1.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 1 && record.event() == TraceEvent::SysNativeSysret)
-            .count() as u64,
+        count_phase_events(&records, 1, TraceEvent::SysNativeSysret),
         Ordering::Release,
     );
     TRACE_TLB_PAGE_FLUSH_PHASE4.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 4 && record.event() == TraceEvent::TlbFlushPage)
-            .count() as u64,
+        count_phase_events(&records, 4, TraceEvent::TlbFlushPage),
         Ordering::Release,
     );
     TRACE_TLB_FULL_FLUSH_PHASE4.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 4 && record.event() == TraceEvent::TlbFlushAll)
-            .count() as u64,
+        count_phase_events(&records, 4, TraceEvent::TlbFlushAll),
         Ordering::Release,
     );
     TRACE_TLB_SYNC_PLAN_PHASE4.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 4 && record.event() == TraceEvent::TlbSyncPlan)
-            .count() as u64,
+        count_phase_events(&records, 4, TraceEvent::TlbSyncPlan),
         Ordering::Release,
     );
     TRACE_TLB_SYNC_PLAN_PHASE5.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 5 && record.event() == TraceEvent::TlbSyncPlan)
-            .count() as u64,
+        count_phase_events(&records, 5, TraceEvent::TlbSyncPlan),
         Ordering::Release,
     );
     TRACE_TLB_SHOOTDOWN_FULL_PHASE5.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 5 && record.event() == TraceEvent::TlbShootdownAll)
-            .count() as u64,
+        count_phase_events(&records, 5, TraceEvent::TlbShootdownAll),
         Ordering::Release,
     );
     TRACE_TLB_AS_SWITCH_PHASE8.store(
-        records
-            .iter()
-            .filter(|record| {
-                record.phase == 8 && record.event() == TraceEvent::TlbAddressSpaceSwitch
-            })
-            .count() as u64,
+        count_phase_events(&records, 8, TraceEvent::TlbAddressSpaceSwitch),
         Ordering::Release,
     );
     TRACE_IPC_CHANNEL_ENQUEUE_PHASE7.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 7 && record.event() == TraceEvent::ChannelEnqueue)
-            .count() as u64,
+        count_phase_events(&records, 7, TraceEvent::ChannelEnqueue),
         Ordering::Release,
     );
     TRACE_IPC_CHANNEL_DEQUEUE_PHASE7.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 7 && record.event() == TraceEvent::ChannelDequeue)
-            .count() as u64,
+        count_phase_events(&records, 7, TraceEvent::ChannelDequeue),
         Ordering::Release,
     );
     TRACE_IPC_CHANNEL_RECLAIM_PHASE7.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 7 && record.event() == TraceEvent::ChannelReclaim)
-            .count() as u64,
+        count_phase_events(&records, 7, TraceEvent::ChannelReclaim),
         Ordering::Release,
     );
     TRACE_SCHED_STEAL_PHASE5.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 5 && record.event() == TraceEvent::Steal)
-            .count() as u64,
+        count_phase_events(&records, 5, TraceEvent::Steal),
         Ordering::Release,
     );
     TRACE_FAULT_ENTER_PHASE6.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 6 && record.event() == TraceEvent::FaultEnter)
-            .count() as u64,
+        count_phase_events(&records, 6, TraceEvent::FaultEnter),
         Ordering::Release,
     );
     TRACE_FAULT_HANDLED_PHASE6.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 6 && record.event() == TraceEvent::FaultHandled)
-            .count() as u64,
+        count_phase_events(&records, 6, TraceEvent::FaultHandled),
         Ordering::Release,
     );
     TRACE_FAULT_BLOCK_PHASE6.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 6 && record.event() == TraceEvent::FaultBlock)
-            .count() as u64,
+        count_phase_events(&records, 6, TraceEvent::FaultBlock),
         Ordering::Release,
     );
     TRACE_FAULT_RESUME_PHASE6.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 6 && record.event() == TraceEvent::FaultResume)
-            .count() as u64,
+        count_phase_events(&records, 6, TraceEvent::FaultResume),
         Ordering::Release,
     );
     TRACE_FAULT_UNHANDLED_PHASE6.store(
-        records
-            .iter()
-            .filter(|record| record.phase == 6 && record.event() == TraceEvent::FaultUnhandled)
-            .count() as u64,
+        count_phase_events(&records, 6, TraceEvent::FaultUnhandled),
         Ordering::Release,
     );
 

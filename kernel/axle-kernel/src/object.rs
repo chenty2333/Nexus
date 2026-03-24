@@ -61,6 +61,12 @@ use crate::task::JobId;
 const PORT_CAPACITY: usize = 64;
 const PORT_KERNEL_RESERVE: usize = 16;
 const CHANNEL_CAPACITY: usize = 64;
+// TODO(backpressure): The per-channel CHANNEL_CAPACITY limit prevents any
+// single channel from consuming unbounded memory, but there is no global
+// memory budget across all channels.  A system-wide accounting mechanism
+// should be added so that aggregate channel-message memory is bounded and
+// excess writers receive ZX_ERR_NO_MEMORY rather than consuming all
+// available kernel heap.
 const SOCKET_STREAM_CAPACITY: usize = 4096;
 const SOCKET_DATAGRAM_CAPACITY_BYTES: usize = 4096;
 const SOCKET_DATAGRAM_CAPACITY_MESSAGES: usize = 64;

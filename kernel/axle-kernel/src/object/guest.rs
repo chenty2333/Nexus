@@ -131,10 +131,9 @@ pub fn resume_guest_session(
             return Err(ZX_ERR_INVALID_ARGS);
         }
 
-        state.with_kernel_mut(|kernel| {
-            kernel.replace_thread_guest_context(session.thread_id, &stop_state.regs)?;
-            kernel.wake_thread(session.thread_id, crate::task::WakeReason::PreserveContext)
-        })?;
+        // Merge the sequence-number re-validation, session update, and thread
+        // wake into a single objects-lock hold to close the TOCTOU window
+        // between the outer check and the state mutation.
         state.with_objects_mut(|objects| {
             let Some(KernelObject::GuestSession(session)) = objects.get_mut(object_key) else {
                 return Err(ZX_ERR_BAD_STATE);
@@ -143,7 +142,11 @@ pub fn resume_guest_session(
                 return Err(ZX_ERR_BAD_STATE);
             }
             session.stopped_seq = None;
-            Ok(())
+            Ok(session.thread_id)
+        })?;
+        state.with_kernel_mut(|kernel| {
+            kernel.replace_thread_guest_context(session.thread_id, &stop_state.regs)?;
+            kernel.wake_thread(session.thread_id, crate::task::WakeReason::PreserveContext)
         })
     })
 }

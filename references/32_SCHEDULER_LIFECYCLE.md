@@ -107,6 +107,11 @@ Threads may currently be in states such as:
 - `TerminationPending`
 - `Terminated`
 
+The `Suspended` state now correctly interacts with run-queue ownership:
+- suspending a running thread removes it from the run queue before entering `Suspended`
+- resuming a suspended thread re-enqueues it through the normal `make_thread_runnable` path
+- `running_cpu` is tracked per-thread so suspend/wake can target the correct CPU in O(1)
+
 Processes currently move through states such as:
 
 - `Created`
@@ -195,6 +200,10 @@ The first "non-bootstrap substrate" scheduler contract is now implemented.
 ## Current limitations
 
 - Blocked current execution still relies on `sti; hlt` when the current CPU has no runnable work.
+- Page-fault trap handling now enforces a bounded retry limit (`MAX_FAULT_RETRIES`) to prevent
+  infinite fault-retry loops from starving the scheduler.
+- The `Suspended` trap-exit path now correctly checks suspension state after the trap completes,
+  preventing a window where a suspended thread could be accidentally re-enqueued.
 - Bootstrap perf smoke now reuses one proven peer worker across wake, active-peer TLB, and fault
   phases, so those gates no longer depend on repeated synthetic cross-CPU launches.
 - Scheduler fairness is still intentionally simple fixed-slice FIFO/RR rather than a richer policy

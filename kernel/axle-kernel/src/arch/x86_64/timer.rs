@@ -20,8 +20,8 @@ static USE_TSC_DEADLINE: AtomicBool = AtomicBool::new(false);
 pub fn init_bsp() {
     let tsc_deadline = crate::arch::cpuid::supports_tsc_deadline();
 
-    USE_TSC_DEADLINE.store(tsc_deadline, Ordering::Relaxed);
-    TICKS_ALL_CPUS.store(true, Ordering::Relaxed);
+    USE_TSC_DEADLINE.store(tsc_deadline, Ordering::Release);
+    TICKS_ALL_CPUS.store(true, Ordering::Release);
 
     apic::init_bsp();
 
@@ -44,17 +44,17 @@ pub fn init_ap() {
     crate::arch::apic::init_ap(true);
 
     if tsc_deadline {
-        USE_TSC_DEADLINE.store(true, Ordering::Relaxed);
+        USE_TSC_DEADLINE.store(true, Ordering::Release);
         arm_next_tick();
     }
-    TICKS_ALL_CPUS.store(true, Ordering::Relaxed);
+    TICKS_ALL_CPUS.store(true, Ordering::Release);
 }
 
 /// Phase-one scheduler shape: every online CPU receives a local tick. TSC-deadline is preferred,
 /// but a coarse periodic APIC timer is still good enough to preserve basic time slicing and wake
 /// processing on fallback hardware.
 pub fn ticks_all_cpus() -> bool {
-    TICKS_ALL_CPUS.load(Ordering::Relaxed)
+    TICKS_ALL_CPUS.load(Ordering::Acquire)
 }
 
 fn arm_next_tick() {
@@ -159,7 +159,7 @@ extern "C" fn axle_timer_rust(frame: &mut crate::arch::int80::TrapFrame, cpu_fra
     }
     crate::trace::record_timer_irq_exit(from_user, trap_exit_taken);
 
-    if USE_TSC_DEADLINE.load(Ordering::Relaxed) {
+    if USE_TSC_DEADLINE.load(Ordering::Acquire) {
         arm_next_tick();
     }
 }

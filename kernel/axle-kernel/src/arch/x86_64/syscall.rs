@@ -121,6 +121,21 @@ pub fn init_cpu() {
     }
 
     let selectors = crate::arch::gdt::init();
+
+    // SYSRET requires that the GDT segment layout is exactly:
+    //   SYSRET_CS_BASE + 0  = compatibility-mode code (unused on pure-64)
+    //   SYSRET_CS_BASE + 8  = user data segment
+    //   SYSRET_CS_BASE + 16 = user 64-bit code segment
+    // Verify the user_data and user_code selectors match this expected layout
+    // relative to each other.
+    assert!(
+        selectors.user_code.0 == selectors.user_data.0 + 8,
+        "sysret: user_code selector must be exactly 8 bytes above user_data selector \
+         (user_code={:#x}, user_data={:#x})",
+        selectors.user_code.0,
+        selectors.user_data.0,
+    );
+
     let sysret_cs = selectors
         .user_code
         .0
@@ -151,8 +166,11 @@ extern "C" fn axle_native_syscall_rust(
 }
 
 fn is_canonical_user_addr(addr: u64) -> bool {
+    // Only allow low-half (user) canonical addresses. Kernel-half addresses
+    // (top == CANONICAL_TOP_MASK) must be rejected: SYSRET with a non-canonical
+    // or kernel-range RCX would #GP in ring 0, which is a privilege escalation.
     let top = addr & CANONICAL_TOP_MASK;
-    top == 0 || top == CANONICAL_TOP_MASK
+    top == 0
 }
 
 pub(crate) fn sysret_eligible(cpu_frame: *const u64) -> bool {

@@ -21,6 +21,7 @@ impl KernelPortQueue {
         kernel: &mut crate::task::Kernel,
         capacity: usize,
     ) -> Result<Self, zx_status_t> {
+        assert!(capacity > 0, "port_queue: capacity must be > 0");
         let bytes = capacity
             .checked_mul(size_of::<zx_port_packet_t>())
             .and_then(|value| u64::try_from(value).ok())

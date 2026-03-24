@@ -69,6 +69,8 @@ pub enum CSpaceError {
     Handle(HandleError),
     /// Handle does not currently reference a live slot/capability.
     BadHandle,
+    /// Requested rights are not a subset of the source capability's rights.
+    AccessDenied,
 }
 
 impl From<HandleError> for CSpaceError {
@@ -186,6 +188,9 @@ impl CSpace {
     }
 
     /// Duplicate a handle while replacing the stored rights with a derived subset.
+    ///
+    /// `rights` must be a subset of the source capability's rights; otherwise
+    /// `AccessDenied` is returned to prevent privilege escalation.
     pub fn duplicate_derived(&mut self, h: Handle, rights: u32) -> Result<Handle, CSpaceError> {
         let (idx, tag) = h.decode()?;
         let slot = self
@@ -196,11 +201,17 @@ impl CSpace {
             return Err(CSpaceError::BadHandle);
         }
         let mut entry = slot.entry.ok_or(CSpaceError::BadHandle)?;
+        if rights & entry.cap.rights() != rights {
+            return Err(CSpaceError::AccessDenied);
+        }
         entry.cap = Capability::new(entry.cap.object_id(), rights, entry.cap.generation());
         self.alloc_entry(entry)
     }
 
     /// Duplicate a handle with derived rights and bind the duplicate to a revocation group.
+    ///
+    /// `rights` must be a subset of the source capability's rights; otherwise
+    /// `AccessDenied` is returned to prevent privilege escalation.
     pub fn duplicate_revocable(
         &mut self,
         h: Handle,
@@ -216,6 +227,9 @@ impl CSpace {
             return Err(CSpaceError::BadHandle);
         }
         let mut entry = slot.entry.ok_or(CSpaceError::BadHandle)?;
+        if rights & entry.cap.rights() != rights {
+            return Err(CSpaceError::AccessDenied);
+        }
         entry.cap = Capability::new(entry.cap.object_id(), rights, entry.cap.generation());
         entry.rev = Some(revocation);
         self.alloc_entry(entry)
@@ -225,6 +239,9 @@ impl CSpace {
     ///
     /// The slot stays occupied, but its ABA tag is bumped so the old handle value
     /// becomes invalid immediately.
+    ///
+    /// `rights` must be a subset of the source capability's rights; otherwise
+    /// `AccessDenied` is returned to prevent privilege escalation.
     pub fn replace_derived(&mut self, h: Handle, rights: u32) -> Result<Handle, CSpaceError> {
         let (idx, tag) = h.decode()?;
         let slot = self
@@ -235,6 +252,9 @@ impl CSpace {
             return Err(CSpaceError::BadHandle);
         }
         let mut entry = slot.entry.ok_or(CSpaceError::BadHandle)?;
+        if rights & entry.cap.rights() != rights {
+            return Err(CSpaceError::AccessDenied);
+        }
         let new_tag = bump_tag(slot.tag);
         entry.cap = Capability::new(entry.cap.object_id(), rights, entry.cap.generation());
         slot.tag = new_tag;
@@ -541,7 +561,10 @@ mod tests {
                     3 => {
                         if !active.is_empty() {
                             let idx = usize::from(selector) % active.len();
-                            if let Ok(h) = cs.duplicate_derived(active[idx], rights) {
+                            // Mask rights to be a subset of the source to avoid AccessDenied.
+                            let src_rights = cs.get(active[idx]).map(|c| c.rights()).unwrap_or(0);
+                            let derived_rights = rights & src_rights;
+                            if let Ok(h) = cs.duplicate_derived(active[idx], derived_rights) {
                                 active.push(h);
                             }
                         }
@@ -550,7 +573,10 @@ mod tests {
                         if !active.is_empty() {
                             let idx = usize::from(selector) % active.len();
                             let h = active.swap_remove(idx);
-                            match cs.replace_derived(h, rights) {
+                            // Mask rights to be a subset of the source to avoid AccessDenied.
+                            let src_rights = cs.get(h).map(|c| c.rights()).unwrap_or(0);
+                            let derived_rights = rights & src_rights;
+                            match cs.replace_derived(h, derived_rights) {
                                 Ok(new_h) => {
                                     active.push(new_h);
                                     closed.push(h);

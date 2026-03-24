@@ -50,7 +50,13 @@ pub fn init() {
 
 pub fn _print(args: fmt::Arguments<'_>) {
     use fmt::Write;
-    let mut guard = SERIAL.lock();
+    // Use try_lock to avoid deadlocking when called from interrupt context
+    // while the lock is already held (e.g. kprintln inside an ISR that
+    // interrupted a kprintln). If the lock is contended, the log line is
+    // silently dropped -- this is preferable to a hard deadlock.
+    let Some(mut guard) = SERIAL.try_lock() else {
+        return;
+    };
     if guard.is_none() {
         *guard = Some(SerialState::new());
     }

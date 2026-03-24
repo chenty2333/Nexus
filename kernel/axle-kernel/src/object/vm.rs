@@ -132,6 +132,13 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
 }
 
 /// Create one public physical/MMIO-style VMO over an existing page-aligned span.
+///
+/// # Privilege
+///
+/// Physical VMO creation grants direct access to physical memory and is
+/// restricted to processes that are direct children of the root job.
+/// A proper Resource-handle capability gate should replace this check once
+/// the Resource subsystem is implemented.
 pub fn create_physical_vmo(
     base_paddr: u64,
     size: u64,
@@ -142,6 +149,19 @@ pub fn create_physical_vmo(
     }
 
     with_state_mut(|state| {
+        // Privilege gate: only processes that are direct children of the root
+        // job may create physical VMOs.  This is a stop-gap until a full
+        // Resource-handle authority is plumbed through the object system.
+        // TODO(security): Replace with a proper root-resource handle check.
+        let caller_job_id = state.with_core(|kernel| {
+            let process = kernel.current_process_info()?;
+            kernel.process_job_id(process.process_id())
+        })?;
+        let root_job_id = state.with_kernel(|kernel| Ok(kernel.root_job_id()))?;
+        if caller_job_id != root_job_id {
+            return Err(ZX_ERR_ACCESS_DENIED);
+        }
+
         let object_id = state.alloc_object_id();
         let global_vmo_id = state.with_kernel_mut(|kernel| Ok(kernel.allocate_global_vmo_id()))?;
         let process_id =

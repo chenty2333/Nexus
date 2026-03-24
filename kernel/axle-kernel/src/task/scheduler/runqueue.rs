@@ -182,4 +182,13 @@ impl Kernel {
     pub(super) fn take_next_runnable_thread_for_current_cpu(&mut self) -> Option<ThreadId> {
         self.pop_runnable_thread()
     }
+
+    /// Remove a specific thread from its CPU run queue.
+    ///
+    /// Called when a thread transitions to a non-runnable state (e.g. Suspended)
+    /// so the run queue length accurately reflects the number of runnable threads.
+    pub(in crate::task) fn remove_thread_from_run_queue(&mut self, thread_id: ThreadId, cpu_id: usize) {
+        let scheduler = self.cpu_scheduler_mut(cpu_id);
+        scheduler.run_queue.retain(|&id| id != thread_id);
+    }
 }

@@ -907,9 +907,24 @@ static mut USER_SHARED_PAGES: [AlignedPage; USER_SHARED_PAGE_COUNT] =
 static mut USER_STACK_PAGES: [AlignedPage; USER_STACK_PAGE_COUNT] =
     [AlignedPage([0; 4096]); USER_STACK_PAGE_COUNT];
 
-static mut USER_PD: AlignedPageTable = AlignedPageTable([0; 512]);
-static mut USER_PTS: [AlignedPageTable; BOOTSTRAP_USER_PT_COUNT] =
-    [AlignedPageTable([0; 512]); BOOTSTRAP_USER_PT_COUNT];
+/// Wrapper for page-table static storage accessed through raw pointers.
+/// Early bring-up is single-core; later mutations are serialized by the kernel's
+/// transaction scaffolding.
+struct SyncPageTable(core::cell::UnsafeCell<AlignedPageTable>);
+// SAFETY: page-table mutations are serialized by single-core boot or transaction locks.
+unsafe impl Sync for SyncPageTable {}
+
+/// Wrapper for page-table array static storage.
+struct SyncPageTableArray<const N: usize>(core::cell::UnsafeCell<[AlignedPageTable; N]>);
+// SAFETY: same serialization guarantee as SyncPageTable.
+unsafe impl<const N: usize> Sync for SyncPageTableArray<N> {}
+
+static USER_PD: SyncPageTable =
+    SyncPageTable(core::cell::UnsafeCell::new(AlignedPageTable([0; 512])));
+static USER_PTS: SyncPageTableArray<BOOTSTRAP_USER_PT_COUNT> =
+    SyncPageTableArray(core::cell::UnsafeCell::new(
+        [AlignedPageTable([0; 512]); BOOTSTRAP_USER_PT_COUNT],
+    ));
 
 // PVH boot page tables (identity-mapped, used as the active CR3).
 unsafe extern "C" {
@@ -961,7 +976,7 @@ pub(crate) fn user_stack_page_paddr(index: usize) -> u64 {
 }
 
 pub(crate) fn bootstrap_user_pd_paddr() -> u64 {
-    phys_of(core::ptr::addr_of!(USER_PD))
+    phys_of(USER_PD.0.get() as *const AlignedPageTable)
 }
 
 pub(crate) fn bootstrap_user_pt_paddrs() -> [u64; BOOTSTRAP_USER_PT_COUNT] {
@@ -974,11 +989,9 @@ pub(crate) fn bootstrap_user_pt_paddr(index: usize) -> u64 {
 
 fn user_pt_paddr(index: usize) -> u64 {
     assert!(index < BOOTSTRAP_USER_PT_COUNT);
-    let pt = unsafe {
-        // SAFETY: callers only request one fixed bootstrap PT slot. Reading the address of one
-        // static table page does not mutate the bootstrap mapping state.
-        core::ptr::addr_of!(USER_PTS[index])
-    };
+    // SAFETY: reading the address of one bootstrap PT page through the UnsafeCell.
+    let base = USER_PTS.0.get() as *const AlignedPageTable;
+    let pt = unsafe { base.add(index) };
     phys_of(pt)
 }
 
@@ -1093,7 +1106,11 @@ pub(crate) fn read_bootstrap_bytes(
 pub(crate) fn query_user_page_frame(user_va: u64) -> Result<Option<UserPageFrame>, ()> {
     let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
     // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
-    let entry = unsafe { USER_PTS[pt_index].0[entry_index] };
+    // Access through UnsafeCell raw pointer avoids forming a reference to the static.
+    let entry = unsafe {
+        let base = USER_PTS.0.get() as *const AlignedPageTable;
+        core::ptr::read_volatile(&(*base.add(pt_index)).0[entry_index])
+    };
     if (entry & PTE_P) == 0 {
         return Ok(None);
     }
@@ -1113,34 +1130,37 @@ pub(crate) fn install_user_page_frame(user_va: u64, paddr: u64, writable: bool) 
         entry |= PTE_W;
     }
 
+    // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
     unsafe {
-        // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
-        USER_PTS[pt_index].0[entry_index] = entry;
+        let base = USER_PTS.0.get() as *mut AlignedPageTable;
+        core::ptr::write_volatile(&mut (*base.add(pt_index)).0[entry_index], entry);
     }
     Ok(())
 }
 
 pub(crate) fn clear_user_page_frame(user_va: u64) -> Result<(), ()> {
     let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
+    // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
     unsafe {
-        // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
-        USER_PTS[pt_index].0[entry_index] = 0;
+        let base = USER_PTS.0.get() as *mut AlignedPageTable;
+        core::ptr::write_volatile(&mut (*base.add(pt_index)).0[entry_index], 0);
     }
     Ok(())
 }
 
 pub(crate) fn set_user_page_writable(user_va: u64, writable: bool) -> Result<(), ()> {
     let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
+    // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
     unsafe {
-        // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
-        let entry = &mut USER_PTS[pt_index].0[entry_index];
-        if (*entry & PTE_P) == 0 {
+        let base = USER_PTS.0.get() as *mut AlignedPageTable;
+        let entry_ptr = &mut (*base.add(pt_index)).0[entry_index];
+        if (*entry_ptr & PTE_P) == 0 {
             return Err(());
         }
         if writable {
-            *entry |= PTE_W;
+            *entry_ptr |= PTE_W;
         } else {
-            *entry &= !PTE_W;
+            *entry_ptr &= !PTE_W;
         }
     }
     Ok(())
@@ -1154,9 +1174,10 @@ fn map_userspace_pages() {
         if writable {
             entry |= PTE_W;
         }
+        // SAFETY: early bring-up is single-core; bootstrap page tables are only mutated here.
         unsafe {
-            // SAFETY: early bring-up is single-core; bootstrap page tables are only mutated here.
-            USER_PTS[pt_index].0[entry_index] = entry;
+            let base = USER_PTS.0.get() as *mut AlignedPageTable;
+            core::ptr::write_volatile(&mut (*base.add(pt_index)).0[entry_index], entry);
         }
     }
 
@@ -1164,7 +1185,7 @@ fn map_userspace_pages() {
     unsafe {
         let pml4 = core::ptr::addr_of_mut!(pvh_pml4).cast::<u64>();
         let pdpt = core::ptr::addr_of_mut!(pvh_pdpt).cast::<u64>();
-        let user_pd = core::ptr::addr_of_mut!(USER_PD).cast::<u64>();
+        let user_pd = USER_PD.0.get() as *mut u64;
 
         // Allow user mappings under PML4[0] by setting U=1 at the top level.
         *pml4.add(0) |= PTE_U;
@@ -1694,19 +1715,53 @@ pub(crate) fn zero_current_mapping_bytes(dst_ptr: u64, len: usize) {
     }
 }
 
-fn shared_slots() -> &'static mut [u64] {
-    // SAFETY: the bootstrap ring3 bridge summary window is backed by the static
-    // `USER_SHARED_PAGES` array. The bootstrap runner reads and writes the same
-    // backing pages through its user mapping, but kernel-side telemetry must not
-    // depend on the current thread's address space also mapping `USER_SHARED_VA`.
-    // Component and child process faults can arrive while a different address
-    // space is active; reaching through the user VA there would fault in-kernel.
+/// Return a raw pointer to the base of the bootstrap shared-slot window.
+///
+/// The shared pages are user-writable, so forming `&mut` would be UB whenever
+/// the user half can concurrently write. All accesses go through raw pointer
+/// arithmetic + `write_volatile` / `read_volatile`.
+fn shared_slots_ptr() -> *mut u64 {
+    core::ptr::addr_of_mut!(USER_SHARED_PAGES) as *mut u64
+}
+
+/// Number of u64 slots in the shared window.
+const SHARED_SLOT_COUNT: usize = (USER_SHARED_PAGE_COUNT * 4096) / core::mem::size_of::<u64>();
+
+/// Write one u64 value into a shared slot via volatile store.
+///
+/// # Safety
+/// `index` must be < `SHARED_SLOT_COUNT`.
+unsafe fn shared_slot_write(index: usize, value: u64) {
+    debug_assert!(index < SHARED_SLOT_COUNT);
+    // SAFETY: the static backing array is large enough and the pointer is valid.
     unsafe {
-        core::slice::from_raw_parts_mut(
-            core::ptr::addr_of_mut!(USER_SHARED_PAGES) as *mut u64,
-            (USER_SHARED_PAGE_COUNT * 4096) / core::mem::size_of::<u64>(),
-        )
+        core::ptr::write_volatile(shared_slots_ptr().add(index), value);
     }
+}
+
+/// Read one u64 value from a shared slot via volatile load.
+///
+/// # Safety
+/// `index` must be < `SHARED_SLOT_COUNT`.
+unsafe fn shared_slot_read(index: usize) -> u64 {
+    debug_assert!(index < SHARED_SLOT_COUNT);
+    // SAFETY: the static backing array is large enough and the pointer is valid.
+    unsafe { core::ptr::read_volatile(shared_slots_ptr().add(index) as *const u64) }
+}
+
+/// Create a mutable snapshot of the shared-slot window for summary reporting.
+///
+/// This must only be called when user-side concurrent writes have ceased (e.g.
+/// after the runner has trapped on `int3` or before it starts), so the volatile
+/// reads produce a consistent view.
+fn snapshot_shared_slots() -> alloc::vec::Vec<u64> {
+    let mut buf = alloc::vec![0u64; SHARED_SLOT_COUNT];
+    let base = shared_slots_ptr() as *const u64;
+    for i in 0..SHARED_SLOT_COUNT {
+        // SAFETY: the static backing array has SHARED_SLOT_COUNT elements.
+        buf[i] = unsafe { core::ptr::read_volatile(base.add(i)) };
+    }
+    buf
 }
 
 fn bootstrap_user_window_contains(ptr: u64, len: usize) -> bool {
@@ -1721,17 +1776,21 @@ fn bootstrap_user_window_contains(ptr: u64, len: usize) -> bool {
 }
 
 pub(crate) fn record_vm_cow_fault_count(count: u64) {
-    shared_slots()[SLOT_VM_COW_FAULT_COUNT] = count;
+    // SAFETY: SLOT_VM_COW_FAULT_COUNT < SHARED_SLOT_COUNT.
+    unsafe { shared_slot_write(SLOT_VM_COW_FAULT_COUNT, count) };
 }
 
 pub(crate) fn record_vm_last_remap_source_rmap_count(count: u64) {
-    shared_slots()[SLOT_VM_LAST_REMAP_SOURCE_RMAP_COUNT] = count;
+    // SAFETY: SLOT_VM_LAST_REMAP_SOURCE_RMAP_COUNT < SHARED_SLOT_COUNT.
+    unsafe { shared_slot_write(SLOT_VM_LAST_REMAP_SOURCE_RMAP_COUNT, count) };
 }
 
 pub(crate) fn record_vm_last_cow_rmap_counts(old_count: u64, new_count: u64) {
-    let slots = shared_slots();
-    slots[SLOT_VM_LAST_COW_OLD_RMAP_COUNT] = old_count;
-    slots[SLOT_VM_LAST_COW_NEW_RMAP_COUNT] = new_count;
+    // SAFETY: both slot indices < SHARED_SLOT_COUNT.
+    unsafe {
+        shared_slot_write(SLOT_VM_LAST_COW_OLD_RMAP_COUNT, old_count);
+        shared_slot_write(SLOT_VM_LAST_COW_NEW_RMAP_COUNT, new_count);
+    }
 }
 
 pub(crate) fn record_vm_resource_accounting(
@@ -1742,13 +1801,15 @@ pub(crate) fn record_vm_resource_accounting(
     inflight_loan_peak: u64,
     inflight_loan_quota_hits: u64,
 ) {
-    let slots = shared_slots();
-    slots[SLOT_VM_PRIVATE_COW_PAGES_CURRENT] = private_cow_current;
-    slots[SLOT_VM_PRIVATE_COW_PAGES_PEAK] = private_cow_peak;
-    slots[SLOT_VM_PRIVATE_COW_QUOTA_HITS] = private_cow_quota_hits;
-    slots[SLOT_VM_INFLIGHT_LOAN_PAGES_CURRENT] = inflight_loan_current;
-    slots[SLOT_VM_INFLIGHT_LOAN_PAGES_PEAK] = inflight_loan_peak;
-    slots[SLOT_VM_INFLIGHT_LOAN_QUOTA_HITS] = inflight_loan_quota_hits;
+    // SAFETY: all slot indices < SHARED_SLOT_COUNT.
+    unsafe {
+        shared_slot_write(SLOT_VM_PRIVATE_COW_PAGES_CURRENT, private_cow_current);
+        shared_slot_write(SLOT_VM_PRIVATE_COW_PAGES_PEAK, private_cow_peak);
+        shared_slot_write(SLOT_VM_PRIVATE_COW_QUOTA_HITS, private_cow_quota_hits);
+        shared_slot_write(SLOT_VM_INFLIGHT_LOAN_PAGES_CURRENT, inflight_loan_current);
+        shared_slot_write(SLOT_VM_INFLIGHT_LOAN_PAGES_PEAK, inflight_loan_peak);
+        shared_slot_write(SLOT_VM_INFLIGHT_LOAN_QUOTA_HITS, inflight_loan_quota_hits);
+    }
 }
 
 pub(crate) fn record_fault_contention_telemetry(
@@ -1762,43 +1823,49 @@ pub(crate) fn record_fault_contention_telemetry(
     prepare_lazy_anon: u64,
     prepare_lazy_vmo_alloc: u64,
 ) {
-    let slots = shared_slots();
-    slots[SLOT_VM_FAULT_LEADER_CLAIMS] = leader_claims;
-    slots[SLOT_VM_FAULT_WAIT_CLAIMS] = wait_claims;
-    slots[SLOT_VM_FAULT_WAIT_SPIN_LOOPS] = wait_spin_loops;
-    slots[SLOT_VM_FAULT_RETRY_TOTAL] = retry_total;
-    slots[SLOT_VM_FAULT_COMMIT_RESOLVED] = commit_resolved;
-    slots[SLOT_VM_FAULT_COMMIT_RETRY] = commit_retry;
-    slots[SLOT_VM_FAULT_PREPARE_COW] = prepare_cow;
-    slots[SLOT_VM_FAULT_PREPARE_LAZY_ANON] = prepare_lazy_anon;
-    slots[SLOT_VM_FAULT_PREPARE_LAZY_VMO_ALLOC] = prepare_lazy_vmo_alloc;
+    // SAFETY: all slot indices < SHARED_SLOT_COUNT.
+    unsafe {
+        shared_slot_write(SLOT_VM_FAULT_LEADER_CLAIMS, leader_claims);
+        shared_slot_write(SLOT_VM_FAULT_WAIT_CLAIMS, wait_claims);
+        shared_slot_write(SLOT_VM_FAULT_WAIT_SPIN_LOOPS, wait_spin_loops);
+        shared_slot_write(SLOT_VM_FAULT_RETRY_TOTAL, retry_total);
+        shared_slot_write(SLOT_VM_FAULT_COMMIT_RESOLVED, commit_resolved);
+        shared_slot_write(SLOT_VM_FAULT_COMMIT_RETRY, commit_retry);
+        shared_slot_write(SLOT_VM_FAULT_PREPARE_COW, prepare_cow);
+        shared_slot_write(SLOT_VM_FAULT_PREPARE_LAZY_ANON, prepare_lazy_anon);
+        shared_slot_write(SLOT_VM_FAULT_PREPARE_LAZY_VMO_ALLOC, prepare_lazy_vmo_alloc);
+    }
 }
 
 pub(crate) fn consume_vm_fault_leader_pause_hook() -> bool {
-    let slots = shared_slots();
-    if slots[SLOT_VM_FAULT_TEST_HOOK_ARM] == 0 {
-        return false;
+    // SAFETY: slot indices < SHARED_SLOT_COUNT.
+    unsafe {
+        if shared_slot_read(SLOT_VM_FAULT_TEST_HOOK_ARM) == 0 {
+            return false;
+        }
+        shared_slot_write(SLOT_VM_FAULT_TEST_HOOK_ARM, 0);
     }
-    slots[SLOT_VM_FAULT_TEST_HOOK_ARM] = 0;
     true
 }
 
 pub(crate) fn bootstrap_trace_phase() -> u64 {
-    shared_slots()[SLOT_TRACE_PHASE]
+    // SAFETY: SLOT_TRACE_PHASE < SHARED_SLOT_COUNT.
+    unsafe { shared_slot_read(SLOT_TRACE_PHASE) }
 }
 
 pub(crate) fn bootstrap_trace_dump_full() -> bool {
-    shared_slots()[SLOT_TRACE_DUMP_FULL] != 0
+    // SAFETY: SLOT_TRACE_DUMP_FULL < SHARED_SLOT_COUNT.
+    unsafe { shared_slot_read(SLOT_TRACE_DUMP_FULL) != 0 }
 }
 
 pub(crate) fn component_summary_snapshot() -> Option<(u64, i64, i64, i64, i64, i64)> {
-    let slots = shared_slots();
-    let failure_step = slots[SLOT_COMPONENT_FAILURE_STEP];
-    let resolve_root = slots[SLOT_COMPONENT_RESOLVE_ROOT] as i64;
-    let provider_launch = slots[SLOT_COMPONENT_PROVIDER_LAUNCH] as i64;
-    let client_launch = slots[SLOT_COMPONENT_CLIENT_LAUNCH] as i64;
-    let stop_request = slots[SLOT_COMPONENT_STOP_REQUEST] as i64;
-    let kill_request = slots[SLOT_COMPONENT_KILL_REQUEST] as i64;
+    // SAFETY: all slot indices < SHARED_SLOT_COUNT.
+    let failure_step = unsafe { shared_slot_read(SLOT_COMPONENT_FAILURE_STEP) };
+    let resolve_root = unsafe { shared_slot_read(SLOT_COMPONENT_RESOLVE_ROOT) } as i64;
+    let provider_launch = unsafe { shared_slot_read(SLOT_COMPONENT_PROVIDER_LAUNCH) } as i64;
+    let client_launch = unsafe { shared_slot_read(SLOT_COMPONENT_CLIENT_LAUNCH) } as i64;
+    let stop_request = unsafe { shared_slot_read(SLOT_COMPONENT_STOP_REQUEST) } as i64;
+    let kill_request = unsafe { shared_slot_read(SLOT_COMPONENT_KILL_REQUEST) } as i64;
     if failure_step == 0
         && resolve_root == 0
         && provider_launch == 0
@@ -2397,7 +2464,8 @@ fn component_provider_output_preview(
 
 /// Called by the breakpoint handler to print the userspace-produced summary.
 pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
-    let slots = shared_slots();
+    let mut slots_buf = snapshot_shared_slots();
+    let slots: &mut [u64] = &mut slots_buf;
     if slots[SLOT_OK] != 1 {
         let (trap_rax, trap_rbx, trap_rip) = if frame.is_null() {
             (0, 0, 0)
@@ -3054,46 +3122,54 @@ pub fn prepare() -> u64 {
     };
 
     // Zero shared slots and set `ok=0` pessimistically.
-    let slots = shared_slots();
-    for i in 0..=SLOT_MAX {
-        slots[i] = 0;
+    // SAFETY: prepare() runs single-core before the user starts; no concurrent writers.
+    unsafe {
+        for i in 0..=SLOT_MAX {
+            shared_slot_write(i, 0);
+        }
+        shared_slot_write(SLOT_ROOT_VMAR_H, crate::object::vm::bootstrap_root_vmar_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_SELF_THREAD_H,
+            crate::object::process::bootstrap_self_thread_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_SELF_THREAD_KOID,
+            crate::object::process::bootstrap_self_thread_koid().unwrap_or(0));
+        shared_slot_write(SLOT_SELF_PROCESS_H,
+            crate::object::process::bootstrap_self_process_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_SELF_JOB_H,
+            crate::object::process::bootstrap_self_job_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_SELF_CODE_VMO_H,
+            crate::object::vm::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H,
+            crate::object::vm::bootstrap_echo_provider_code_vmo_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H,
+            crate::object::vm::bootstrap_echo_client_code_vmo_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H,
+            crate::object::vm::bootstrap_controller_worker_code_vmo_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_BOOT_IMAGE_STARNIX_KERNEL_VMO_H,
+            crate::object::vm::bootstrap_starnix_kernel_code_vmo_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_BOOT_IMAGE_LINUX_HELLO_VMO_H,
+            crate::object::vm::bootstrap_linux_hello_code_vmo_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_BOOTSTRAP_NET_PCI_DEVICE_H,
+            crate::object::device::bootstrap_net_pci_device_handle().unwrap_or(0) as u64);
+        shared_slot_write(SLOT_REAL_NET_PCI_DEVICE_H,
+            crate::object::device::bootstrap_real_net_pci_device_handle().unwrap_or(0) as u64);
     }
-    slots[SLOT_ROOT_VMAR_H] = crate::object::vm::bootstrap_root_vmar_handle().unwrap_or(0) as u64;
-    slots[SLOT_SELF_THREAD_H] =
-        crate::object::process::bootstrap_self_thread_handle().unwrap_or(0) as u64;
-    slots[SLOT_SELF_THREAD_KOID] =
-        crate::object::process::bootstrap_self_thread_koid().unwrap_or(0);
-    slots[SLOT_SELF_PROCESS_H] =
-        crate::object::process::bootstrap_self_process_handle().unwrap_or(0) as u64;
-    slots[SLOT_SELF_JOB_H] =
-        crate::object::process::bootstrap_self_job_handle().unwrap_or(0) as u64;
-    slots[SLOT_SELF_CODE_VMO_H] =
-        crate::object::vm::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64;
-    slots[SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H] =
-        crate::object::vm::bootstrap_echo_provider_code_vmo_handle().unwrap_or(0) as u64;
-    slots[SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H] =
-        crate::object::vm::bootstrap_echo_client_code_vmo_handle().unwrap_or(0) as u64;
-    slots[SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H] =
-        crate::object::vm::bootstrap_controller_worker_code_vmo_handle().unwrap_or(0) as u64;
-    slots[SLOT_BOOT_IMAGE_STARNIX_KERNEL_VMO_H] =
-        crate::object::vm::bootstrap_starnix_kernel_code_vmo_handle().unwrap_or(0) as u64;
-    slots[SLOT_BOOT_IMAGE_LINUX_HELLO_VMO_H] =
-        crate::object::vm::bootstrap_linux_hello_code_vmo_handle().unwrap_or(0) as u64;
-    slots[SLOT_BOOTSTRAP_NET_PCI_DEVICE_H] =
-        crate::object::device::bootstrap_net_pci_device_handle().unwrap_or(0) as u64;
-    slots[SLOT_REAL_NET_PCI_DEVICE_H] =
-        crate::object::device::bootstrap_real_net_pci_device_handle().unwrap_or(0) as u64;
     crate::trace::init_bootstrap_trace();
-    slots[SLOT_TRACE_VMO_H] = u64::from(crate::trace::bootstrap_trace_vmo_handle());
-    slots[SLOT_TRACE_PHASE] = 0;
-    slots[SLOT_TRACE_DUMP_FULL] = 0;
+    // SAFETY: slot indices < SHARED_SLOT_COUNT and no concurrent writers during prepare().
+    unsafe {
+        shared_slot_write(SLOT_TRACE_VMO_H, u64::from(crate::trace::bootstrap_trace_vmo_handle()));
+        shared_slot_write(SLOT_TRACE_PHASE, 0);
+        shared_slot_write(SLOT_TRACE_DUMP_FULL, 0);
+    }
     // Keep the exported bootstrap code-image VMO span stable for the runner ABI. The parsed
     // image layout is an internal loader detail; the bootstrap code window is still the legacy
     // fixed-size mapping.
-    slots[SLOT_SELF_CODE_VMO_SIZE] = USER_CODE_BYTES;
-    slots[SLOT_BOOTSTRAP_HEAP_USED] = 0;
-    slots[SLOT_BOOTSTRAP_HEAP_PEAK] = 0;
-    slots[SLOT_BOOTSTRAP_HEAP_ALLOC_FAILS] = 0;
+    // SAFETY: no concurrent writers during prepare().
+    unsafe {
+        shared_slot_write(SLOT_SELF_CODE_VMO_SIZE, USER_CODE_BYTES);
+        shared_slot_write(SLOT_BOOTSTRAP_HEAP_USED, 0);
+        shared_slot_write(SLOT_BOOTSTRAP_HEAP_PEAK, 0);
+        shared_slot_write(SLOT_BOOTSTRAP_HEAP_ALLOC_FAILS, 0);
+    }
 
     entry
 }
@@ -3102,7 +3178,8 @@ pub fn prepare() -> u64 {
 pub fn enter(entry: u64) -> ! {
     // Provide the runner baseline as late as possible so "future deadline" checks are relative
     // to actual ring3 start, not earlier bootstrap work like SMP bring-up.
-    shared_slots()[SLOT_T0_NS] = crate::time::now_ns() as u64;
+    // SAFETY: no concurrent user-side writers at this point.
+    unsafe { shared_slot_write(SLOT_T0_NS, crate::time::now_ns() as u64) };
     let selectors = crate::arch::gdt::init();
 
     // SAFETY: we build a valid iret frame to transition to ring3 using the installed GDT selectors.

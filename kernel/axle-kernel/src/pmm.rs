@@ -209,7 +209,14 @@ pub(crate) fn alloc_pages(page_count: usize) -> Option<u64> {
 
 pub(crate) fn alloc_zeroed_pages(page_count: usize) -> Option<u64> {
     let paddr = alloc_pages(page_count)?;
-    let bytes = usize::try_from(PAGE_BYTES.checked_mul(page_count as u64)?).ok()?;
+    let bytes = match PAGE_BYTES.checked_mul(page_count as u64).and_then(|b| usize::try_from(b).ok()) {
+        Some(b) => b,
+        None => {
+            // Allocation succeeded but size conversion failed; free to avoid leak.
+            free_pages(paddr, page_count);
+            return None;
+        }
+    };
     unsafe {
         // SAFETY: the bootstrap PMM only hands out physical pages below the identity-mapped
         // 1 GiB direct map, so the physical address is directly writable as a kernel pointer.
@@ -219,6 +226,15 @@ pub(crate) fn alloc_zeroed_pages(page_count: usize) -> Option<u64> {
 }
 
 pub(crate) fn free_pages(paddr: u64, page_count: usize) {
+    debug_assert!(
+        paddr & (PAGE_BYTES - 1) == 0,
+        "pmm: free_pages called with unaligned paddr {:#x}",
+        paddr
+    );
+    // In release mode, reject unaligned addresses rather than silently rounding down.
+    if paddr & (PAGE_BYTES - 1) != 0 {
+        return;
+    }
     PMM.lock().free_pages(paddr, page_count);
 }
 
@@ -268,9 +284,11 @@ fn bootstrap_reserved_floor(start: &crate::arch::pvh::HvmStartInfo) -> u64 {
 }
 
 const fn align_up(value: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
     (value + (align - 1)) & !(align - 1)
 }
 
 const fn align_down(value: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
     value & !(align - 1)
 }

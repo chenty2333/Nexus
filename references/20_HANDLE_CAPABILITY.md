@@ -101,6 +101,9 @@ It is a current-state reference, not a roadmap.
 
 - `axle-core` already has `RevocationManager`, `RevocationGroupToken`, and `RevocationRef`.
 - `CSpace` can allocate revocable entries and validate them on lookup.
+- `CSpace` `duplicate_derived`, `replace_derived`, and `duplicate_revocable` now validate that
+  the requested new rights are a subset of the original capability's rights, returning
+  `AccessDenied` when the caller attempts to expand rights through a derive operation.
 - The bootstrap kernel now exposes one narrow public revocation-group object family:
   - `ax_revocation_group_create()` returns one group handle that carries revoke authority
   - `ax_revocation_group_revoke()` bumps the group's epoch

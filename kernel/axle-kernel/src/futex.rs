@@ -68,6 +68,11 @@ impl FutexTable {
     /// Enqueue one waiter in FIFO order.
     pub(crate) fn enqueue_waiter(&mut self, key: FutexKey, thread_id: u64, owner_koid: zx_koid_t) {
         let queue = self.queues.entry(key).or_default();
+        debug_assert!(
+            !queue.waiters.contains(&thread_id),
+            "futex: duplicate enqueue of thread_id {}",
+            thread_id
+        );
         queue.waiters.push_back(thread_id);
         if owner_koid != ZX_KOID_INVALID {
             queue.owner_koid = owner_koid;

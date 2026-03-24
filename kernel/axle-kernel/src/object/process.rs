@@ -157,6 +157,10 @@ pub fn create_process(
                         let _ = objects.remove(vmar_object_id);
                         Ok(())
                     });
+                    // Clean up the underlying kernel process record that was
+                    // created by create_process_in_job, so it does not leak.
+                    let _ = state
+                        .with_kernel_mut(|kernel| kernel.reap_process(created.process_id()));
                     return Err(err);
                 }
             };
@@ -759,27 +763,35 @@ pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
             Thread(u64),
         }
 
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        // Check DESTROY right upfront so the error code does not leak
+        // information about the underlying object type.
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::DESTROY)?;
         let target = state.with_objects(|objects| {
             Ok(match objects.get(resolved.object_key()) {
-                Some(KernelObject::Job(job)) => KillTarget::Job(job.job_id),
-                Some(KernelObject::Process(process)) => KillTarget::Process(process.process_id),
-                Some(KernelObject::Thread(thread)) => KillTarget::Thread(thread.thread_id),
+                Some(KernelObject::Job(job)) => {
+                    require_handle_rights(resolved, crate::task::HandleRights::MANAGE_JOB)?;
+                    KillTarget::Job(job.job_id)
+                }
+                Some(KernelObject::Process(process)) => {
+                    require_handle_rights(resolved, crate::task::HandleRights::MANAGE_PROCESS)?;
+                    KillTarget::Process(process.process_id)
+                }
+                Some(KernelObject::Thread(thread)) => {
+                    require_handle_rights(resolved, crate::task::HandleRights::MANAGE_THREAD)?;
+                    KillTarget::Thread(thread.thread_id)
+                }
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
             })
         })?;
         match target {
             KillTarget::Job(job_id) => {
-                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_JOB)?;
                 state.with_kernel_mut(|kernel| kernel.kill_job(job_id))?;
             }
             KillTarget::Process(process_id) => {
-                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_PROCESS)?;
                 state.with_kernel_mut(|kernel| kernel.kill_process(process_id))?;
             }
             KillTarget::Thread(thread_id) => {
-                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_THREAD)?;
                 state.with_kernel_mut(|kernel| kernel.kill_thread(thread_id))?;
             }
         }
@@ -867,31 +879,39 @@ mod tests {
 /// Suspend one process or thread and return a token whose close resumes it.
 pub fn task_suspend(handle: zx_handle_t) -> Result<zx_handle_t, zx_status_t> {
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+        // Check a baseline right upfront before probing the object type,
+        // preventing information leakage through error-code differentiation.
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
         let target = state.with_objects(|objects| {
             Ok(match objects.get(resolved.object_key()) {
-                Some(KernelObject::Job(job)) => SuspendTarget::Job { job_id: job.job_id },
-                Some(KernelObject::Process(process)) => SuspendTarget::Process {
-                    process_id: process.process_id,
-                },
-                Some(KernelObject::Thread(thread)) => SuspendTarget::Thread {
-                    thread_id: thread.thread_id,
-                },
+                Some(KernelObject::Job(job)) => {
+                    require_handle_rights(resolved, crate::task::HandleRights::MANAGE_JOB)?;
+                    SuspendTarget::Job { job_id: job.job_id }
+                }
+                Some(KernelObject::Process(process)) => {
+                    require_handle_rights(resolved, crate::task::HandleRights::MANAGE_PROCESS)?;
+                    SuspendTarget::Process {
+                        process_id: process.process_id,
+                    }
+                }
+                Some(KernelObject::Thread(thread)) => {
+                    require_handle_rights(resolved, crate::task::HandleRights::MANAGE_THREAD)?;
+                    SuspendTarget::Thread {
+                        thread_id: thread.thread_id,
+                    }
+                }
                 Some(_) => return Err(ZX_ERR_WRONG_TYPE),
                 None => return Err(ZX_ERR_BAD_HANDLE),
             })
         })?;
         match target {
             SuspendTarget::Job { job_id } => {
-                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_JOB)?;
                 state.with_kernel_mut(|kernel| kernel.suspend_job(job_id))?;
             }
             SuspendTarget::Process { process_id } => {
-                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_PROCESS)?;
                 state.with_kernel_mut(|kernel| kernel.suspend_process(process_id))?;
             }
             SuspendTarget::Thread { thread_id } => {
-                require_handle_rights(resolved, crate::task::HandleRights::MANAGE_THREAD)?;
                 state.with_kernel_mut(|kernel| kernel.suspend_thread(thread_id))?;
             }
         }

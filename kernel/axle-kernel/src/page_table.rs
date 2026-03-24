@@ -216,6 +216,12 @@ impl PtDescriptorStore {
                     self.update_invalidate_epoch(PtPageLevel::Pt, pt_base, epoch);
                     self.update_invalidate_epoch(PtPageLevel::Pd, pd_base, epoch);
                 }
+                FlushOp::All => {
+                    // Full flush: mark all tracked descriptors as stale.
+                    for desc in self.by_key.values_mut() {
+                        desc.invalidate_epoch = epoch;
+                    }
+                }
             }
         }
     }
@@ -394,7 +400,7 @@ impl UserPageTables {
     pub(crate) fn bootstrap_current(pcid: Option<u16>) -> Result<Self, PageTableError> {
         let (root_frame, _) = Cr3::read();
         let root_paddr = root_frame.start_address().as_u64();
-        let pdpt_paddr = table(root_paddr)[0].addr().as_u64();
+        let pdpt_paddr = unsafe { table(root_paddr)[0].addr().as_u64() };
         let user_pd_paddr = crate::userspace::bootstrap_user_pd_paddr();
         let user_pt_paddrs = crate::userspace::bootstrap_user_pt_paddrs();
         Ok(Self {
@@ -412,9 +418,9 @@ impl UserPageTables {
     pub(crate) fn clone_current_kernel_template(pcid: Option<u16>) -> Result<Self, PageTableError> {
         let (current_root_frame, _) = Cr3::read();
         let current_root_paddr = current_root_frame.start_address().as_u64();
-        let current_root = table(current_root_paddr);
+        let current_root = unsafe { table(current_root_paddr) };
         let current_pdpt_paddr = current_root[0].addr().as_u64();
-        let current_pdpt = table(current_pdpt_paddr);
+        let current_pdpt = unsafe { table(current_pdpt_paddr) };
 
         let root_paddr =
             crate::userspace::alloc_bootstrap_zeroed_page().ok_or(PageTableError::Backend)?;
@@ -433,25 +439,31 @@ impl UserPageTables {
             // mapped kernel memory. Copying the current root and PDPT preserves kernel mappings.
             core::ptr::copy_nonoverlapping(
                 current_root as *const X86PageTable,
-                table_mut(root_paddr),
+                table_mut(root_paddr) as *mut X86PageTable,
                 1,
             );
             core::ptr::copy_nonoverlapping(
                 current_pdpt as *const X86PageTable,
-                table_mut(pdpt_paddr),
+                table_mut(pdpt_paddr) as *mut X86PageTable,
                 1,
             );
         }
 
         let root_flags = current_root[0].flags();
-        table_mut(root_paddr)[0].set_addr(PhysAddr::new(pdpt_paddr), root_flags);
+        // SAFETY: indexing into kernel-owned page-table pages.
+        unsafe {
+            table_mut(root_paddr)[0].set_addr(PhysAddr::new(pdpt_paddr), root_flags);
+        }
 
         let user_table_flags =
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-        table_mut(pdpt_paddr)[4].set_addr(PhysAddr::new(user_pd_paddr), user_table_flags);
-        for (index, user_pt_paddr) in user_pt_paddrs.iter().copied().enumerate() {
-            table_mut(user_pd_paddr)[index]
-                .set_addr(PhysAddr::new(user_pt_paddr), user_table_flags);
+        // SAFETY: indexing into newly allocated page-table pages.
+        unsafe {
+            table_mut(pdpt_paddr)[4].set_addr(PhysAddr::new(user_pd_paddr), user_table_flags);
+            for (index, user_pt_paddr) in user_pt_paddrs.iter().copied().enumerate() {
+                table_mut(user_pd_paddr)[index]
+                    .set_addr(PhysAddr::new(user_pt_paddr), user_table_flags);
+            }
         }
 
         Ok(Self {
@@ -570,7 +582,8 @@ impl UserPageTables {
             .child_level()
             .ok_or(PageTableError::InvalidArgs)?;
         let child_va_base = parent_va_base + index as u64 * parent_level.child_coverage_bytes();
-        let entry = &mut table_mut(parent_table_paddr)[index];
+        // SAFETY: indexing into a kernel-owned page-table page via raw pointer.
+        let entry = unsafe { &mut table_mut(parent_table_paddr)[index] };
         if entry.flags().contains(PageTableFlags::PRESENT) {
             return Ok((entry.addr().as_u64(), child_va_base));
         }
@@ -602,15 +615,16 @@ impl UserPageTables {
 
     fn leaf_table_paddr(&self, va: u64) -> Result<Option<u64>, PageTableError> {
         let indices = user_page_indices(va)?;
-        let root_entry = &table(self.root_paddr)[indices.pml4];
+        // SAFETY: indexing into kernel-owned page-table pages via raw pointers.
+        let root_entry = unsafe { &table(self.root_paddr)[indices.pml4] };
         if !root_entry.flags().contains(PageTableFlags::PRESENT) {
             return Ok(None);
         }
-        let pdpt_entry = &table(root_entry.addr().as_u64())[indices.pdpt];
+        let pdpt_entry = unsafe { &table(root_entry.addr().as_u64())[indices.pdpt] };
         if !pdpt_entry.flags().contains(PageTableFlags::PRESENT) {
             return Ok(None);
         }
-        let pd_entry = &table(pdpt_entry.addr().as_u64())[indices.pd];
+        let pd_entry = unsafe { &table(pdpt_entry.addr().as_u64())[indices.pd] };
         if !pd_entry.flags().contains(PageTableFlags::PRESENT) {
             return Ok(None);
         }
@@ -637,7 +651,7 @@ impl UserPageTables {
         let pt_paddr = self.ensure_leaf_table_paddr(va)?;
         Ok(unsafe {
             // SAFETY: `pt_paddr` points at one page-sized PT page owned by this address space.
-            &mut *((&mut table_mut(pt_paddr)[indices.pt]) as *mut _ as *mut PageTableEntryAccessor)
+            &mut *(&mut table_mut(pt_paddr)[indices.pt] as *mut _ as *mut PageTableEntryAccessor)
         })
     }
 
@@ -651,7 +665,7 @@ impl UserPageTables {
         };
         Ok(Some(unsafe {
             // SAFETY: `pt_paddr` points at an existing PT page reached through present ancestors.
-            &mut *((&mut table_mut(pt_paddr)[indices.pt]) as *mut _ as *mut PageTableEntryAccessor)
+            &mut *(&mut table_mut(pt_paddr)[indices.pt] as *mut _ as *mut PageTableEntryAccessor)
         }))
     }
 }
@@ -680,7 +694,7 @@ impl PageTableLock for LockedUserPageTable {
         let Some(pt_paddr) = self.tables.leaf_table_paddr(va)? else {
             return Ok(None);
         };
-        let entry = &table(pt_paddr)[indices.pt];
+        let entry = unsafe { &table(pt_paddr)[indices.pt] };
         if !entry.flags().contains(PageTableFlags::PRESENT) {
             return Ok(None);
         }
@@ -776,6 +790,14 @@ impl PageTableLock for LockedUserPageTable {
                             refreshed_leafs.insert(pt_desc.table_paddr());
                         }
                     }
+                    FlushOp::All => {
+                        // Collect all leaf-table paddrs for a full refresh.
+                        for (key, desc) in descs.by_key.iter() {
+                            if key.0 == PtPageLevel::Pt {
+                                refreshed_leafs.insert(desc.table_paddr());
+                            }
+                        }
+                    }
                 }
             }
             for leaf_table_paddr in refreshed_leafs {
@@ -788,6 +810,7 @@ impl PageTableLock for LockedUserPageTable {
         for op in shootdown.ops() {
             match *op {
                 FlushOp::Page(va) => crate::arch::tlb::flush_page_local(va),
+                FlushOp::All => crate::arch::tlb::flush_all_local(),
             }
         }
         Ok(())
@@ -824,8 +847,9 @@ fn frame(paddr: u64) -> Result<PhysFrame<Size4KiB>, PageTableError> {
 }
 
 fn uniform_leaf_template(user_pt_paddr: u64) -> Option<PtMetaTemplate> {
-    let table = table(user_pt_paddr);
-    let mut entries = table.iter();
+    // SAFETY: indexing into a kernel-owned page-table page via raw pointer.
+    let table_ref = unsafe { &*table(user_pt_paddr) };
+    let mut entries = table_ref.iter();
     let first = entries.next()?;
     let template = entry_meta_template(first);
     entries
@@ -865,19 +889,19 @@ fn user_page_indices(va: u64) -> Result<PageWalkIndices, PageTableError> {
     })
 }
 
-fn table(paddr: u64) -> &'static X86PageTable {
-    unsafe {
-        // SAFETY: all page-table pages used here are kernel-owned, page-aligned, and identity
-        // mapped. Callers only pass addresses that were either read from CR3/page-table entries
-        // or allocated as dedicated page-table pages.
-        &*(paddr as *const X86PageTable)
-    }
+/// # Safety
+///
+/// `paddr` must point to a valid, identity-mapped, kernel-owned page-table page.
+/// The returned reference has `'static` lifetime because hardware page-table pages
+/// live for the duration of the address space.  Callers must not hold two mutable
+/// references to the same physical page simultaneously; the kernel's transaction
+/// scaffolding serialises all page-table mutations to uphold this invariant.
+unsafe fn table(paddr: u64) -> &'static X86PageTable {
+    unsafe { &*(paddr as *const X86PageTable) }
 }
 
-fn table_mut(paddr: u64) -> &'static mut X86PageTable {
-    unsafe {
-        // SAFETY: all page-table pages used here are kernel-owned, page-aligned, and identity
-        // mapped. Mutations are serialized by the kernel's transaction scaffolding.
-        &mut *(paddr as *mut X86PageTable)
-    }
+/// See [`table`] for safety requirements.  Additionally, the caller must ensure
+/// exclusive access to the target page for the duration of the returned borrow.
+unsafe fn table_mut(paddr: u64) -> &'static mut X86PageTable {
+    unsafe { &mut *(paddr as *mut X86PageTable) }
 }

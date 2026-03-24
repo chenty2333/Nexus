@@ -142,7 +142,29 @@ impl TimerService {
         st.deadline = Some(deadline);
         st.signaled = false;
         self.heap.push(HeapEntry { deadline, id });
+
+        // Compact the heap when ghost entries dominate: if the heap has grown
+        // to more than 4x the number of active timers, rebuild it retaining
+        // only entries whose deadline still matches the authoritative state.
+        if self.heap.len() > self.timers.len().saturating_mul(4) {
+            self.compact_heap();
+        }
         Ok(())
+    }
+
+    /// Rebuild the heap retaining only entries that match current timer state.
+    fn compact_heap(&mut self) {
+        let timers = &self.timers;
+        let valid: Vec<HeapEntry> = self
+            .heap
+            .drain()
+            .filter(|entry| {
+                timers
+                    .get(&entry.id)
+                    .is_some_and(|st| st.deadline == Some(entry.deadline))
+            })
+            .collect();
+        self.heap = valid.into_iter().collect();
     }
 
     /// Cancel the timer (disarm + clear signal).

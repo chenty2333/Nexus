@@ -155,7 +155,14 @@ pub enum PageTableError {
 pub enum FlushOp {
     /// Invalidate one page-aligned virtual page.
     Page(u64),
+    /// Invalidate the entire address space (replaces individual page entries
+    /// when the per-page list exceeds a compaction threshold).
+    All,
 }
+
+/// Threshold at which individual page invalidations are promoted to a
+/// full address-space flush.
+const SHOOTDOWN_PROMOTION_THRESHOLD: usize = 16;
 
 /// Batched invalidation work collected during one transaction.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -185,10 +192,25 @@ impl ShootdownBatch {
     }
 
     /// Record one page invalidation, deduplicating repeated entries.
+    ///
+    /// When the number of individual page invalidation entries exceeds
+    /// [`SHOOTDOWN_PROMOTION_THRESHOLD`], the entire batch is replaced
+    /// with a single [`FlushOp::All`] to avoid O(n) deduplication costs
+    /// on large batches.
     pub fn invalidate_page(&mut self, va: u64) {
+        // Already promoted -- nothing to do.
+        if self.ops.first() == Some(&FlushOp::All) {
+            return;
+        }
+
         let op = FlushOp::Page(va);
         if !self.ops.contains(&op) {
             self.ops.push(op);
+        }
+
+        if self.ops.len() > SHOOTDOWN_PROMOTION_THRESHOLD {
+            self.ops.clear();
+            self.ops.push(FlushOp::All);
         }
     }
 }
@@ -496,8 +518,9 @@ mod tests {
             self.backend.commits += 1;
             self.backend
                 .flushes
-                .extend(shootdown.ops().iter().map(|op| match *op {
-                    FlushOp::Page(va) => va,
+                .extend(shootdown.ops().iter().filter_map(|op| match *op {
+                    FlushOp::Page(va) => Some(va),
+                    FlushOp::All => None,
                 }));
             self.backend.commit_log.borrow_mut().push(self.backend.id);
             Ok(())

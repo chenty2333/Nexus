@@ -151,6 +151,13 @@ impl LateHeap {
                     .is_err()
                 {
                     self.alloc_fail_count = self.alloc_fail_count.saturating_add(1);
+                    // Remove the already-inserted right fragment before restoring
+                    // the original range to avoid overlapping entries.
+                    if right != 0 {
+                        // The right fragment is at position `index` since we just
+                        // failed to insert left before it.
+                        self.free.remove(index);
+                    }
                     let _ = self.insert_free_range(range);
                     return None;
                 }
@@ -268,6 +275,7 @@ pub(crate) fn init_late_heap() {
 static GLOBAL_ALLOCATOR: BootstrapAllocator = BootstrapAllocator;
 
 const fn align_up(v: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
     (v + (align - 1)) & !(align - 1)
 }
 
