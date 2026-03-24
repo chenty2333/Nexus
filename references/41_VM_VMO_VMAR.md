@@ -249,4 +249,6 @@ It is not fully implemented yet.
   - no IOMMU isolation contract
   - no richer MMIO cache-policy surface yet
 - Public allocation defaults are still simpler than the full internal placement machinery; some compact/per-CPU placement paths are internal rather than normal syscall behavior.
-- The crate is structurally large and still concentrated in one file, even though the semantic layers are already distinct.
+- The crate has been split into focused modules (`frame_table.rs`, `vmo.rs`, `vma.rs`,
+  `pte_meta.rs`, `types.rs`) with `AddressSpace` and tests remaining in `lib.rs`.
+  All public types are re-exported from `lib.rs` so the external API is unchanged.

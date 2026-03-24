@@ -41,10 +41,18 @@ This file describes the current task-state, scheduler, kill, suspend, and reap b
 
 ## L0 fairness and load balance contract
 
-- Intra-CPU fairness is fixed-slice FIFO/RR:
-  - one runnable current thread runs until it blocks, yields to trap-exit reschedule, or reaches
-    the local slice deadline
-  - timed preemption requeues the current runnable thread at the tail of its local run queue
+- Intra-CPU fairness is now EEVDF (Eligible Earliest Virtual Deadline First):
+  - each thread tracks `vruntime` (virtual runtime weighted by 1024/weight), `vdeadline`, and
+    `eligible_time`
+  - pick-next selects the eligible thread with the smallest `vdeadline`; if no thread is eligible,
+    the smallest `vdeadline` unconditionally (starvation prevention)
+  - runtime accounting advances `vruntime` by `real_ns * 1024 / weight`, giving higher-weight
+    threads more CPU time
+  - time slices are weight-proportional: `DEFAULT_TIME_SLICE_NS * weight / 1024`
+  - all threads default to weight 1024 (nice 0), making equal-weight threads behave as round-robin
+  - `min_vruntime` is monotonically non-decreasing per CPU
+  - newly woken threads have `eligible_time = min_vruntime` and `vruntime` clamped to at most one
+    weighted slice below `min_vruntime` to prevent infinite credit after long sleep
 - Cross-CPU placement stays intentionally narrow:
   - ordinary wakeups keep `last_cpu` affinity as long as that choice does not exceed the
     least-loaded eligible CPU by more than one runnable
@@ -206,7 +214,8 @@ The first "non-bootstrap substrate" scheduler contract is now implemented.
   preventing a window where a suspended thread could be accidentally re-enqueued.
 - Bootstrap perf smoke now reuses one proven peer worker across wake, active-peer TLB, and fault
   phases, so those gates no longer depend on repeated synthetic cross-CPU launches.
-- Scheduler fairness is still intentionally simple fixed-slice FIFO/RR rather than a richer policy
+- Scheduler fairness is now EEVDF with per-thread vruntime, weight, and vdeadline tracking.
+  The previous fixed-slice FIFO/RR policy has been replaced.
   such as weighted fairness, vruntime tracking, or EEVDF.
 - The receiver set for general runnable donation is still conservative:
   - true-idle peers remain the preferred migration target

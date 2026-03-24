@@ -153,6 +153,15 @@ The current scheduler-facing blocked state is `Blocked { source }`, where `sourc
 Futex `enqueue_waiter` now includes a `debug_assert` check to detect duplicate enqueue of the same
 waiter, catching potential double-park bugs during development.
 
+Futex wait now supports single-level priority inheritance (PI):
+- when a high-weight thread blocks on a futex with a known owner, the owner's effective scheduler
+  weight is boosted to the maximum weight among all waiters
+- on wake or requeue, the owner's effective weight is recomputed from remaining waiters and
+  its own `base_weight`
+- the PI boost is transparent to the EEVDF scheduler: it sees the boosted `weight` field directly
+- `thread_id_for_koid` lookups use a `BTreeMap<koid, ThreadId>` reverse index for O(log n) access
+- chain propagation is bounded at 16 levels but currently only single-level (depth 1) is implemented
+
 Wait completion eventually makes the thread runnable again through kernel task-state transitions.
 
 ## Current limitations

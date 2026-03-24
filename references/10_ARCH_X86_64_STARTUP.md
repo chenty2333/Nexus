@@ -139,8 +139,11 @@ Current stack contract:
 - `#UD` does not use an IST (IST=0) and runs on the current kernel stack
 - `#DF` keeps its own dedicated IST
 - Ring0 and IST stacks are now 32 KiB per CPU (previously 16 KiB)
-- x87/SSE state for user threads currently uses legacy `FXSAVE64/FXRSTOR64` images captured on
-  trap exit and restored before resuming another user thread
+- x87/SSE state for user threads now uses XSAVE64/XRSTOR64 when the CPU advertises XSAVE support
+  (CPUID leaf 1, ECX bit 26), with automatic detection of AVX and AVX-512 components via CPUID
+  leaf 0xD.  When XSAVE is not available, the kernel falls back to legacy FXSAVE64/FXRSTOR64.
+  Per-thread FPU state buffers are 2688 bytes (64-byte aligned) to cover AVX-512.
+  CR4.OSXSAVE is enabled and XCR0 is programmed on every CPU (BSP and APs).
 
 Axle previously used a shared IRQ IST for timer/IPI/breakpoint entry, but that shape breaks once a
 blocked trap path re-enables interrupts and idles: a nested IRQ would reset `rsp` back to the same
@@ -165,6 +168,15 @@ Current architecture hardening and correctness notes:
 - APs no longer redundantly store `APIC_MODE`; only the BSP sets it during initialization
 - the IDT is now wrapped in `UnsafeCell` instead of using `static mut`
 - `lidt` uses `addr_of!` to avoid taking a reference to a packed struct field
+- a minimal IOAPIC driver exists at `arch/x86_64/ioapic.rs`:
+  - programs redirection entries to route legacy IRQ pins to APIC vectors
+  - provides init/route_pin/mask_pin/unmask_pin helpers
+  - the standard MMIO base 0xFEC0_0000 is used
+  - ISR stubs for device vectors 0x30-0x4F are not yet wired into the IDT
+- a kernel IRQ routing table exists at `irq.rs`:
+  - maps vectors to bound InterruptObject instances
+  - supports Virtual, IoApic, and Msi delivery modes
+  - provides alloc_vector / bind_object / handle_irq entry points
 
 ## Current limitations
 
@@ -181,8 +193,8 @@ Current architecture hardening and correctness notes:
   guest-session sidecar + port handoff used by the wider Starnix executive.
 - The older trap-driven guest-stop helpers remain in-tree as fallback machinery, but they no longer
   define the native syscall fast path.
-- The architecture layer currently enables only legacy x87/SSE state management. `XSAVE`/AVX and
-  wider extended-state contracts are still out of scope.
+- The architecture layer now supports XSAVE/AVX extended FPU state when the CPU advertises it,
+  with automatic fallback to legacy FXSAVE for older CPUs.
 - The initial userspace model still uses a fixed bootstrap window and special bootstrap assumptions.
 - Ring3 is entered through bootstrap state rather than a fully general process-loader path.
 - AP local timers are enabled after `init_ap()` when TSC-deadline hardware is available; otherwise
