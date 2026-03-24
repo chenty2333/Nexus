@@ -14,6 +14,7 @@ pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod int80;
+pub(crate) mod ioapic;
 pub mod ipi;
 pub mod log;
 pub mod pci;
