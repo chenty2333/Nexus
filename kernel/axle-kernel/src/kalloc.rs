@@ -16,10 +16,70 @@ const LATE_HEAP_GROW_PAGES: usize = 64; // 256 KiB.
 const MAX_LATE_ARENAS: usize = 64;
 const MAX_LATE_FREE_RANGES: usize = 1024;
 
+// ── Per-CPU slab allocator constants ────────────────────────────────────────
+const SLAB_SIZES: [usize; 5] = [32, 64, 128, 256, 512];
+const SLAB_FREE_LIST_CAP: usize = 128;
+const SLAB_BACKING_PAGES: usize = 4; // 16 KiB per slab backing allocation
+
 static NEXT: Mutex<usize> = Mutex::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static LATE_HEAP_ENABLED: AtomicBool = AtomicBool::new(false);
+
+// ── Per-CPU slab cache types ────────────────────────────────────────────────
+
+struct SlabFreeList {
+    entries: [usize; SLAB_FREE_LIST_CAP], // pointers stored as usize
+    count: usize,
+}
+
+impl SlabFreeList {
+    const fn new() -> Self {
+        Self {
+            entries: [0; SLAB_FREE_LIST_CAP],
+            count: 0,
+        }
+    }
+
+    fn pop(&mut self) -> Option<*mut u8> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(self.entries[self.count] as *mut u8)
+    }
+
+    fn push(&mut self, ptr: *mut u8) -> bool {
+        if self.count >= SLAB_FREE_LIST_CAP {
+            return false;
+        }
+        self.entries[self.count] = ptr as usize;
+        self.count += 1;
+        true
+    }
+}
+
+struct PerCpuSlabs {
+    caches: [SlabFreeList; 5], // one per SLAB_SIZES entry
+}
+
+impl PerCpuSlabs {
+    const fn new() -> Self {
+        Self {
+            caches: [
+                SlabFreeList::new(),
+                SlabFreeList::new(),
+                SlabFreeList::new(),
+                SlabFreeList::new(),
+                SlabFreeList::new(),
+            ],
+        }
+    }
+}
+
+const MAX_CPUS: usize = crate::arch::MAX_CPUS;
+static PER_CPU_SLABS: [Mutex<PerCpuSlabs>; MAX_CPUS] =
+    [const { Mutex::new(PerCpuSlabs::new()) }; MAX_CPUS];
 
 #[repr(align(4096))]
 struct AlignedHeap([u8; HEAP_SIZE]);
@@ -279,8 +339,87 @@ const fn align_up(v: usize, align: usize) -> usize {
     (v + (align - 1)) & !(align - 1)
 }
 
+// ── Slab allocator helpers ──────────────────────────────────────────────────
+
+/// Returns the slab class index for a given size, or `None` if too large or
+/// alignment exceeds the class size.
+fn slab_class_for(size: usize, align: usize) -> Option<usize> {
+    for (i, &class_size) in SLAB_SIZES.iter().enumerate() {
+        if size <= class_size && align <= class_size {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Slabs depend on the PMM being available for backing pages.
+fn slab_enabled() -> bool {
+    LATE_HEAP_ENABLED.load(Ordering::Relaxed)
+}
+
+fn current_cpu_index() -> usize {
+    crate::arch::x86_64::percpu::try_current_cpu_slot().unwrap_or(0) % MAX_CPUS
+}
+
+/// Try the per-CPU slab cache first; on a miss allocate a new backing slab
+/// from the PMM, carve it into objects, and return the first one.
+fn slab_alloc(class_idx: usize) -> Option<*mut u8> {
+    let cpu = current_cpu_index();
+
+    // Fast path: pop from per-CPU cache.
+    {
+        let mut slabs = PER_CPU_SLABS[cpu].lock();
+        if let Some(ptr) = slabs.caches[class_idx].pop() {
+            return Some(ptr);
+        }
+    }
+
+    // Cache miss: allocate a new slab backing from PMM and carve it up.
+    let class_size = SLAB_SIZES[class_idx];
+    let backing_bytes = SLAB_BACKING_PAGES * 4096;
+    let paddr = crate::pmm::alloc_pages(SLAB_BACKING_PAGES)?;
+    let base = paddr as *mut u8;
+
+    // Zero the backing (security).
+    unsafe {
+        core::ptr::write_bytes(base, 0, backing_bytes);
+    }
+
+    let obj_count = backing_bytes / class_size;
+
+    // Return first object, push the rest into the cache.
+    let result = base;
+    {
+        let mut slabs = PER_CPU_SLABS[cpu].lock();
+        for i in 1..obj_count {
+            let ptr = unsafe { base.add(i * class_size) };
+            if !slabs.caches[class_idx].push(ptr) {
+                break; // cache full
+            }
+        }
+    }
+    Some(result)
+}
+
+/// Return an object to the per-CPU slab cache.  If the cache is full the
+/// object is silently dropped (acceptable loss — the backing is still live).
+fn slab_dealloc(ptr: *mut u8, class_idx: usize) {
+    let cpu = current_cpu_index();
+    let mut slabs = PER_CPU_SLABS[cpu].lock();
+    let _ = slabs.caches[class_idx].push(ptr);
+}
+
 unsafe impl GlobalAlloc for BootstrapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Fast path: per-CPU slab for small, naturally-aligned allocations.
+        if slab_enabled() {
+            if let Some(class_idx) = slab_class_for(layout.size(), layout.align()) {
+                if let Some(ptr) = slab_alloc(class_idx) {
+                    return ptr;
+                }
+            }
+        }
+
         if LATE_HEAP_ENABLED.load(Ordering::Acquire) {
             if let Some(ptr) = alloc_from_late_heap(layout) {
                 return ptr;
@@ -313,6 +452,14 @@ unsafe impl GlobalAlloc for BootstrapAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // Fast path: return small objects to the per-CPU slab cache.
+        if slab_enabled() {
+            if let Some(class_idx) = slab_class_for(layout.size(), layout.align()) {
+                slab_dealloc(ptr, class_idx);
+                return;
+            }
+        }
+
         if !LATE_HEAP_ENABLED.load(Ordering::Acquire) {
             return;
         }
