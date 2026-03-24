@@ -1566,7 +1566,7 @@ struct Thread {
     koid: zx_koid_t,
     guest_started: bool,
     guest_fs_base: u64,
-    fpu_state: crate::arch::fpu::FxState,
+    fpu_state: crate::arch::fpu::FpuState,
     state: ThreadState,
     queued_on_cpu: Option<usize>,
     /// CPU this thread is currently running on (set by `activate_thread_on_current_cpu`,
