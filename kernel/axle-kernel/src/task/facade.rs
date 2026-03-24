@@ -457,6 +457,7 @@ impl Kernel {
             jobs: BTreeMap::new(),
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
+            thread_koid_index: BTreeMap::new(),
             futexes: crate::futex::FutexTable::new(),
             reactor,
             cpu_schedulers: BTreeMap::new(),
@@ -527,6 +528,7 @@ impl Kernel {
                 pi_blocked_on: None,
             },
         );
+        kernel.thread_koid_index.insert(thread_koid, thread_id);
         let now = crate::time::now_ns();
         kernel.cpu_schedulers.insert(
             bootstrap_cpu_id,

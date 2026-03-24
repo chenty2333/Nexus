@@ -452,11 +452,18 @@ unsafe impl GlobalAlloc for BootstrapAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // Fast path: return small objects to the per-CPU slab cache.
+        // Fast path: return small objects to the per-CPU slab cache, but only
+        // if the pointer did NOT originate from the late heap.  Without this
+        // check a late-heap pointer whose size happens to match a slab class
+        // would be pushed onto the slab free-list, corrupting both allocators.
         if slab_enabled() {
             if let Some(class_idx) = slab_class_for(layout.size(), layout.align()) {
-                slab_dealloc(ptr, class_idx);
-                return;
+                let in_late_heap = LATE_HEAP_ENABLED.load(Ordering::Acquire)
+                    && LATE_HEAP.lock().contains(ptr);
+                if !in_late_heap {
+                    slab_dealloc(ptr, class_idx);
+                    return;
+                }
             }
         }
 

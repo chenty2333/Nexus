@@ -2290,6 +2290,10 @@ pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_s
     }
 
     with_state_mut(|state| {
+        let job_id = state.current_job_id()?;
+        state.quota_check_and_increment(job_id, ObjectKindTag::EventPair)?;
+
+        let result = (|| {
         let left_object_id = state.alloc_object_id();
         let right_object_id = state.alloc_object_id();
         state.with_objects_mut(|objects| {
@@ -2333,6 +2337,12 @@ pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_s
         };
 
         Ok((left_handle, right_handle))
+        })();
+
+        if result.is_err() {
+            state.quota_decrement(job_id, ObjectKindTag::EventPair);
+        }
+        result
     })
 }
 

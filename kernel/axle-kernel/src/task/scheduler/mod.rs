@@ -251,7 +251,7 @@ impl Kernel {
 
     /// Prepare a thread's EEVDF scheduling parameters before enqueue.
     /// Sets eligible_time, vdeadline, and clamps vruntime.
-    fn prepare_enqueue_eevdf(&mut self, thread_id: ThreadId, cpu_id: usize) {
+    pub(in crate::task) fn prepare_enqueue_eevdf(&mut self, thread_id: ThreadId, cpu_id: usize) {
         let min_vruntime = self
             .cpu_schedulers
             .get(&cpu_id)

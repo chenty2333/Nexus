@@ -101,6 +101,7 @@ pub(crate) struct JobQuota {
     pub(crate) max_channels: u32,
     pub(crate) max_sockets: u32,
     pub(crate) max_revocation_groups: u32,
+    pub(crate) max_event_pairs: u32,
 }
 
 impl JobQuota {
@@ -114,6 +115,7 @@ impl JobQuota {
             max_channels: 65536,
             max_sockets: 65536,
             max_revocation_groups: 65536,
+            max_event_pairs: 65536,
         }
     }
 }
@@ -128,6 +130,7 @@ pub(crate) struct JobResourceCounters {
     pub(crate) channels: u32,
     pub(crate) sockets: u32,
     pub(crate) revocation_groups: u32,
+    pub(crate) event_pairs: u32,
 }
 
 /// Tag identifying which resource counter to check/update.
@@ -140,6 +143,7 @@ pub(crate) enum ObjectKindTag {
     Channel,
     Socket,
     RevocationGroup,
+    EventPair,
 }
 
 #[derive(Clone, Debug)]
@@ -403,6 +407,7 @@ impl Kernel {
             ObjectKindTag::RevocationGroup => {
                 (job.counters.revocation_groups, job.quota.max_revocation_groups)
             }
+            ObjectKindTag::EventPair => (job.counters.event_pairs, job.quota.max_event_pairs),
         };
         if count >= limit {
             return Err(ZX_ERR_NO_RESOURCES);
@@ -420,6 +425,7 @@ impl Kernel {
                 ObjectKindTag::Channel => &mut job.counters.channels,
                 ObjectKindTag::Socket => &mut job.counters.sockets,
                 ObjectKindTag::RevocationGroup => &mut job.counters.revocation_groups,
+                ObjectKindTag::EventPair => &mut job.counters.event_pairs,
             };
             *counter = counter.saturating_add(1);
         }
@@ -435,6 +441,7 @@ impl Kernel {
                 ObjectKindTag::Channel => &mut job.counters.channels,
                 ObjectKindTag::Socket => &mut job.counters.sockets,
                 ObjectKindTag::RevocationGroup => &mut job.counters.revocation_groups,
+                ObjectKindTag::EventPair => &mut job.counters.event_pairs,
             };
             *counter = counter.saturating_sub(1);
         }
@@ -701,6 +708,7 @@ impl Kernel {
                 pi_blocked_on: None,
             },
         );
+        self.thread_koid_index.insert(koid, thread_id);
         Ok((thread_id, koid))
     }
 
@@ -1082,7 +1090,9 @@ impl Kernel {
             return Err(ZX_ERR_BAD_STATE);
         }
         let process_id = thread.process_id;
+        let koid = thread.koid;
         let _ = self.threads.remove(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
+        self.thread_koid_index.remove(&koid);
         Ok(process_id)
     }
 

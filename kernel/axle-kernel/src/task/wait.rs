@@ -742,10 +742,7 @@ impl Kernel {
 
     /// Find a ThreadId by its koid. Returns `None` if no thread with that koid exists.
     fn thread_id_for_koid(&self, koid: zx_koid_t) -> Option<ThreadId> {
-        self.threads
-            .iter()
-            .find(|(_, thread)| thread.koid == koid)
-            .map(|(&tid, _)| tid)
+        self.thread_koid_index.get(&koid).copied()
     }
 
     /// Apply PI boost: if the waiter's effective weight exceeds the owner's effective weight,
@@ -758,12 +755,22 @@ impl Kernel {
             Some(tid) => tid,
             None => return,
         };
-        let owner = match self.threads.get_mut(&owner_tid) {
-            Some(t) => t,
-            None => return,
-        };
-        if waiter_weight > owner.weight {
+        let (needs_recompute, cpu_id) = {
+            let owner = match self.threads.get_mut(&owner_tid) {
+                Some(t) => t,
+                None => return,
+            };
+            if waiter_weight <= owner.weight {
+                return;
+            }
             owner.weight = waiter_weight;
+            // If owner is in a run queue, recompute its EEVDF parameters
+            (owner.queued_on_cpu.is_some(), owner.queued_on_cpu)
+        };
+        if needs_recompute {
+            if let Some(cpu_id) = cpu_id {
+                self.prepare_enqueue_eevdf(owner_tid, cpu_id);
+            }
         }
     }
 
@@ -789,8 +796,19 @@ impl Kernel {
             .get(&owner_tid)
             .map(|t| t.base_weight)
             .unwrap_or(1024);
-        if let Some(owner) = self.threads.get_mut(&owner_tid) {
-            owner.weight = base.max(max_waiter_weight);
+        let (needs_recompute, cpu_id) = {
+            if let Some(owner) = self.threads.get_mut(&owner_tid) {
+                let old_weight = owner.weight;
+                owner.weight = base.max(max_waiter_weight);
+                (owner.weight != old_weight && owner.queued_on_cpu.is_some(), owner.queued_on_cpu)
+            } else {
+                (false, None)
+            }
+        };
+        if needs_recompute {
+            if let Some(cpu_id) = cpu_id {
+                self.prepare_enqueue_eevdf(owner_tid, cpu_id);
+            }
         }
     }
 }

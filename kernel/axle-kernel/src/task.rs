@@ -1623,6 +1623,7 @@ pub(crate) struct Kernel {
     jobs: BTreeMap<JobId, Job>,
     processes: BTreeMap<ProcessId, Process>,
     threads: BTreeMap<ThreadId, Thread>,
+    thread_koid_index: BTreeMap<zx_koid_t, ThreadId>,
     futexes: crate::futex::FutexTable,
     reactor: Arc<Mutex<Reactor>>,
     cpu_schedulers: BTreeMap<usize, CpuSchedulerState>,

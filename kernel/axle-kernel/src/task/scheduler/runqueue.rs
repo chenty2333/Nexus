@@ -61,6 +61,13 @@ impl Kernel {
         self.enqueue_runnable_thread_front_on_cpu(thread_id, self.current_cpu_id())
     }
 
+    /// Enqueue a thread with handoff priority.
+    ///
+    /// Under EEVDF scheduling this still uses `push_back` like the normal
+    /// enqueue path because pick-next selects by smallest eligible vdeadline,
+    /// not by queue position.  The "front" name is retained for API stability
+    /// and telemetry distinction (blocked-current resume path), not for
+    /// ordering semantics.
     pub(crate) fn enqueue_runnable_thread_front_on_cpu(
         &mut self,
         thread_id: ThreadId,
