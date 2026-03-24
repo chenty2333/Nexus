@@ -1,5 +1,8 @@
 use super::*;
 
+/// Maximum VMO size that can be created via syscall (4 GiB).
+const MAX_VMO_CREATE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Return the bootstrap root VMAR handle seeded into the current process.
 pub fn bootstrap_root_vmar_handle() -> Option<zx_handle_t> {
     with_state_mut(|state| {
@@ -85,6 +88,9 @@ pub fn bootstrap_linux_hello_code_vmo_handle() -> Option<zx_handle_t> {
 pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
     if options != 0 {
         return Err(ZX_ERR_INVALID_ARGS);
+    }
+    if size > MAX_VMO_CREATE_SIZE {
+        return Err(ZX_ERR_OUT_OF_RANGE);
     }
 
     with_state_mut(|state| {

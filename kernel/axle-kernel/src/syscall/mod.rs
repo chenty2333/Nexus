@@ -156,6 +156,17 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 88] = [
     AXLE_SYS_AX_CONSOLE_READ,
 ];
 
+/// Maximum VMO size that can be created via syscall (4 GiB).
+pub(crate) const MAX_VMO_CREATE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+/// Maximum handles per channel message.
+const MAX_CHANNEL_HANDLES_PER_MSG: usize = 64;
+/// Maximum bytes per channel message.
+const MAX_CHANNEL_BYTES_PER_MSG: usize = 64 * 1024;
+/// Maximum bytes per socket read/write operation.
+const MAX_SOCKET_BUFFER_PER_OP: usize = 256 * 1024;
+/// Maximum bytes per VMO read/write operation.
+const MAX_VMO_IO_LEN: usize = 64 * 1024 * 1024;
+
 // Compile-time witness that kernel syscall layer consumes shared ABI types.
 const _ABI_TYPES_WITNESS: Option<(
     zx_handle_t,
@@ -2385,11 +2396,18 @@ fn decode_vmo_read(
     args: [u64; 6],
 ) -> Result<DecodedSyscall<VmoReadRequest, UserWriteBytes>, zx_status_t> {
     let len = ctx.arg_usize_or(args, 3, ZX_ERR_OUT_OF_RANGE)?;
+    if len > MAX_VMO_IO_LEN {
+        return Err(ZX_ERR_OUT_OF_RANGE);
+    }
+    let offset = args[2];
+    offset
+        .checked_add(len as u64)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
     let out = ctx.decode_user_write_bytes(ctx.arg_ptr::<u8>(args, 1), len)?;
     Ok(DecodedSyscall::new(
         VmoReadRequest {
             handle: ctx.arg_handle(args, 0)?,
-            offset: args[2],
+            offset,
             len,
         },
         out,
@@ -2432,6 +2450,13 @@ fn decode_vmo_write(
     args: [u64; 6],
 ) -> Result<DecodedSyscall<VmoWriteRequest, NoWriteback>, zx_status_t> {
     let len = ctx.arg_usize_or(args, 3, ZX_ERR_OUT_OF_RANGE)?;
+    if len > MAX_VMO_IO_LEN {
+        return Err(ZX_ERR_OUT_OF_RANGE);
+    }
+    let offset = args[2];
+    offset
+        .checked_add(len as u64)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
     let buffer = ctx.arg_const_ptr::<u8>(args, 1);
     if len != 0 && buffer.is_null() {
         return Err(ZX_ERR_INVALID_ARGS);
@@ -2439,7 +2464,7 @@ fn decode_vmo_write(
     Ok(DecodedSyscall::new(
         VmoWriteRequest {
             handle: ctx.arg_handle(args, 0)?,
-            offset: args[2],
+            offset,
             bytes: decode_input_bytes(buffer, len)?,
         },
         NoWriteback,
@@ -2532,6 +2557,9 @@ fn decode_socket_write(
     args: [u64; 6],
 ) -> Result<DecodedSyscall<SocketWriteRequest, OptionalOutValue<usize>>, zx_status_t> {
     let len = ctx.arg_usize_or(args, 3, ZX_ERR_OUT_OF_RANGE)?;
+    if len > MAX_SOCKET_BUFFER_PER_OP {
+        return Err(ZX_ERR_OUT_OF_RANGE);
+    }
     let buffer = ctx.arg_const_ptr::<u8>(args, 2);
     if len != 0 && buffer.is_null() {
         return Err(ZX_ERR_INVALID_ARGS);
@@ -2736,13 +2764,17 @@ fn decode_vmar_map(
         Some(len) if len != 0 => len,
         _ => return Err(ZX_ERR_INVALID_ARGS),
     };
+    let vmo_offset = args[4];
+    vmo_offset
+        .checked_add(len)
+        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
     Ok(DecodedSyscall::new(
         VmarMapRequest {
             vmar: ctx.arg_handle(args, 0)?,
             options: ctx.arg_u32(args, 1)?,
             vmar_offset: args[2],
             vmo: ctx.arg_handle(args, 3)?,
-            vmo_offset: args[4],
+            vmo_offset,
             len,
         },
         ctx.decode_extra_out_value::<zx_vaddr_t>(0)?,
@@ -2908,7 +2940,13 @@ fn decode_channel_write(
     args: [u64; 6],
 ) -> Result<DecodedSyscall<ChannelWriteRequest, NoWriteback>, zx_status_t> {
     let num_bytes = ctx.arg_usize(args, 3)?;
+    if num_bytes > MAX_CHANNEL_BYTES_PER_MSG {
+        return Err(ZX_ERR_OUT_OF_RANGE);
+    }
     let num_handles = ctx.arg_u32(args, 5)? as usize;
+    if num_handles > MAX_CHANNEL_HANDLES_PER_MSG {
+        return Err(ZX_ERR_OUT_OF_RANGE);
+    }
     let bytes_ptr = ctx.arg_const_ptr::<u8>(args, 2);
     let handles_ptr = ctx.arg_const_ptr::<zx_handle_t>(args, 4);
     if num_bytes != 0 && bytes_ptr.is_null() {
