@@ -4,6 +4,10 @@
 //! - only manages the identity-mapped low 1 GiB
 //! - uses fixed-capacity free-range metadata (no heap)
 //! - allocates top-down to stay away from low boot/kernel regions
+//!
+//! A per-CPU page cache sits in front of the global allocator to reduce lock
+//! contention on SMP. Single-page allocations and frees go through the local
+//! cache first; multi-page operations bypass the cache entirely.
 
 use core::cmp::{max, min};
 
@@ -14,6 +18,68 @@ const PAGE_BYTES: u64 = crate::userspace::USER_PAGE_BYTES;
 const IDENTITY_MAPPED_LIMIT: u64 = 1 << 30;
 const BOOTSTRAP_RESERVED_FLOOR: u64 = 0x0200_0000; // 32 MiB
 const MAX_FREE_RANGES: usize = 128;
+
+// ---------------------------------------------------------------------------
+// Per-CPU page cache constants
+// ---------------------------------------------------------------------------
+
+/// Maximum number of pages held in each CPU's local cache (64 pages = 256 KiB).
+const PER_CPU_CACHE_PAGES: usize = 64;
+
+/// Number of pages to refill/drain in one batch when the cache is empty/full.
+const PER_CPU_REFILL_BATCH: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Per-CPU page cache
+// ---------------------------------------------------------------------------
+
+struct PerCpuPageCache {
+    count: usize,
+    pages: [u64; PER_CPU_CACHE_PAGES],
+}
+
+impl PerCpuPageCache {
+    const fn new() -> Self {
+        Self {
+            count: 0,
+            pages: [0; PER_CPU_CACHE_PAGES],
+        }
+    }
+
+    fn pop(&mut self) -> Option<u64> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(self.pages[self.count])
+    }
+
+    fn push(&mut self, paddr: u64) -> bool {
+        if self.count >= PER_CPU_CACHE_PAGES {
+            return false;
+        }
+        self.pages[self.count] = paddr;
+        self.count += 1;
+        true
+    }
+}
+
+const MAX_CPUS: usize = crate::arch::MAX_CPUS;
+
+static PER_CPU_CACHES: [Mutex<PerCpuPageCache>; MAX_CPUS] = [const { Mutex::new(PerCpuPageCache::new()) }; MAX_CPUS];
+
+/// Return the logical CPU slot for the current processor, clamped to the
+/// `PER_CPU_CACHES` array bounds. Before per-CPU init this returns 0, which
+/// is the BSP — still correct (just a shared cache).
+fn current_cpu_index() -> usize {
+    crate::arch::percpu::try_current_cpu_slot()
+        .unwrap_or(0)
+        % MAX_CPUS
+}
+
+// ---------------------------------------------------------------------------
+// Global bootstrap allocator types
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PhysRange {
@@ -204,7 +270,56 @@ pub(crate) fn init() {
 }
 
 pub(crate) fn alloc_pages(page_count: usize) -> Option<u64> {
+    if page_count == 1 {
+        return alloc_single_page_cached();
+    }
+    // Multi-page allocations bypass the per-CPU cache.
     PMM.lock().alloc_pages(page_count)
+}
+
+/// Fast path: try the per-CPU cache, then batch-refill from the global
+/// allocator on a miss.
+fn alloc_single_page_cached() -> Option<u64> {
+    let cpu = current_cpu_index();
+
+    // Try local cache first (short critical section).
+    {
+        let mut cache = PER_CPU_CACHES[cpu].lock();
+        if let Some(paddr) = cache.pop() {
+            return Some(paddr);
+        }
+    }
+    // per-CPU lock released here before touching the global lock.
+
+    // Cache miss — refill a batch from the global allocator.
+    let mut batch = [0u64; PER_CPU_REFILL_BATCH];
+    let mut got = 0usize;
+    {
+        let mut global = PMM.lock();
+        for slot in &mut batch {
+            if let Some(paddr) = global.alloc_pages(1) {
+                *slot = paddr;
+                got += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    if got == 0 {
+        return None;
+    }
+
+    // Return the last page directly; stash the rest in the cache.
+    let result = batch[got - 1];
+    if got > 1 {
+        let mut cache = PER_CPU_CACHES[cpu].lock();
+        for &paddr in &batch[..got - 1] {
+            if !cache.push(paddr) {
+                break; // shouldn't happen — cache was just empty
+            }
+        }
+    }
+    Some(result)
 }
 
 pub(crate) fn alloc_zeroed_pages(page_count: usize) -> Option<u64> {
@@ -235,7 +350,45 @@ pub(crate) fn free_pages(paddr: u64, page_count: usize) {
     if paddr & (PAGE_BYTES - 1) != 0 {
         return;
     }
+
+    if page_count == 1 {
+        free_single_page_cached(paddr);
+        return;
+    }
+    // Multi-page frees bypass the per-CPU cache.
     PMM.lock().free_pages(paddr, page_count);
+}
+
+/// Fast path: push to the per-CPU cache. If the cache is full, drain half
+/// back to the global allocator first.
+fn free_single_page_cached(paddr: u64) {
+    let cpu = current_cpu_index();
+
+    let overflow = {
+        let mut cache = PER_CPU_CACHES[cpu].lock();
+        if cache.push(paddr) {
+            None
+        } else {
+            // Cache is full — drain a batch to make room.
+            let mut drain = [0u64; PER_CPU_REFILL_BATCH];
+            for slot in &mut drain {
+                // Safe: cache has PER_CPU_CACHE_PAGES (64) entries, and we
+                // only drain PER_CPU_REFILL_BATCH (32).
+                *slot = cache.pop().unwrap();
+            }
+            let ok = cache.push(paddr);
+            debug_assert!(ok, "pmm: cache push failed after drain");
+            Some(drain)
+        }
+    };
+    // per-CPU lock released here before touching the global lock.
+
+    if let Some(drain) = overflow {
+        let mut global = PMM.lock();
+        for &page in &drain {
+            global.free_pages(page, 1);
+        }
+    }
 }
 
 pub(crate) fn stats() -> BootstrapPageAllocatorStats {
