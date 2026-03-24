@@ -6,16 +6,26 @@ pub fn create_revocation_group(options: u32) -> Result<zx_handle_t, zx_status_t>
     }
 
     with_state_mut(|state| {
-        let token = state.with_core_mut(|kernel| Ok(kernel.create_revocation_group()))?;
-        let object_id = state.alloc_object_id();
-        state.with_objects_mut(|objects| {
-            objects.insert(
-                object_id,
-                KernelObject::RevocationGroup(RevocationGroupObject { token }),
-            )?;
-            Ok(())
-        })?;
-        state.alloc_handle_for_object(object_id, handle::revocation_group_default_rights())
+        let job_id = state.current_job_id()?;
+        state.quota_check_and_increment(job_id, ObjectKindTag::RevocationGroup)?;
+
+        let result = (|| {
+            let token = state.with_core_mut(|kernel| Ok(kernel.create_revocation_group()))?;
+            let object_id = state.alloc_object_id();
+            state.with_objects_mut(|objects| {
+                objects.insert(
+                    object_id,
+                    KernelObject::RevocationGroup(RevocationGroupObject { token }),
+                )?;
+                Ok(())
+            })?;
+            state.alloc_handle_for_object(object_id, handle::revocation_group_default_rights())
+        })();
+
+        if result.is_err() {
+            state.quota_decrement(job_id, ObjectKindTag::RevocationGroup);
+        }
+        result
     })
 }
 

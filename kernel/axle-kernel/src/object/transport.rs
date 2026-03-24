@@ -272,36 +272,42 @@ pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_stat
     };
 
     with_state_mut(|state| {
-        let core_id = state.with_transport_mut(|transport| Ok(transport.alloc_socket_core_id()))?;
-        state.with_transport_mut(|transport| {
-            transport.socket_cores.insert(core_id, core);
-            Ok(())
-        })?;
+        let job_id = state.current_job_id()?;
+        state.quota_check_and_increment(job_id, ObjectKindTag::Socket)?;
 
-        let left_object_id = state.alloc_object_id();
-        let right_object_id = state.alloc_object_id();
-        state.with_registry_mut(|registry| {
-            registry.insert(
-                left_object_id,
-                KernelObject::Socket(SocketEndpoint {
-                    core_id,
-                    peer_object: right_object_id,
-                    side: SocketSide::A,
-                }),
-            )?;
-            registry.insert(
-                right_object_id,
-                KernelObject::Socket(SocketEndpoint {
-                    core_id,
-                    peer_object: left_object_id,
-                    side: SocketSide::B,
-                }),
-            )?;
-            Ok(())
-        })?;
+        let result = (|| {
+            let core_id =
+                state.with_transport_mut(|transport| Ok(transport.alloc_socket_core_id()))?;
+            state.with_transport_mut(|transport| {
+                transport.socket_cores.insert(core_id, core);
+                Ok(())
+            })?;
 
-        let left_handle =
-            match state.alloc_handle_for_object(left_object_id, handle::socket_default_rights()) {
+            let left_object_id = state.alloc_object_id();
+            let right_object_id = state.alloc_object_id();
+            state.with_registry_mut(|registry| {
+                registry.insert(
+                    left_object_id,
+                    KernelObject::Socket(SocketEndpoint {
+                        core_id,
+                        peer_object: right_object_id,
+                        side: SocketSide::A,
+                    }),
+                )?;
+                registry.insert(
+                    right_object_id,
+                    KernelObject::Socket(SocketEndpoint {
+                        core_id,
+                        peer_object: left_object_id,
+                        side: SocketSide::B,
+                    }),
+                )?;
+                Ok(())
+            })?;
+
+            let left_handle = match state
+                .alloc_handle_for_object(left_object_id, handle::socket_default_rights())
+            {
                 Ok(handle) => handle,
                 Err(err) => {
                     let _ = state.with_registry_mut(|registry| {
@@ -316,8 +322,9 @@ pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_stat
                     return Err(err);
                 }
             };
-        let right_handle =
-            match state.alloc_handle_for_object(right_object_id, handle::socket_default_rights()) {
+            let right_handle = match state
+                .alloc_handle_for_object(right_object_id, handle::socket_default_rights())
+            {
                 Ok(handle) => handle,
                 Err(err) => {
                     let _ = state.close_handle(left_handle);
@@ -334,7 +341,13 @@ pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_stat
                 }
             };
 
-        Ok((left_handle, right_handle))
+            Ok((left_handle, right_handle))
+        })();
+
+        if result.is_err() {
+            state.quota_decrement(job_id, ObjectKindTag::Socket);
+        }
+        result
     })
 }
 
@@ -345,25 +358,36 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
     }
 
     with_state_mut(|state| {
-        let owner_process_id = state
-            .with_kernel(|kernel| kernel.current_process_info())?
-            .process_id();
-        let left_object_id = state.alloc_object_id();
-        let right_object_id = state.alloc_object_id();
-        state.with_registry_mut(|registry| {
-            registry.insert(
-                left_object_id,
-                KernelObject::Channel(ChannelEndpoint::new(right_object_id, owner_process_id)),
-            )?;
-            registry.insert(
-                right_object_id,
-                KernelObject::Channel(ChannelEndpoint::new(left_object_id, owner_process_id)),
-            )?;
-            Ok(())
-        })?;
+        let job_id = state.current_job_id()?;
+        state.quota_check_and_increment(job_id, ObjectKindTag::Channel)?;
 
-        let left_handle =
-            match state.alloc_handle_for_object(left_object_id, handle::channel_default_rights()) {
+        let result = (|| {
+            let owner_process_id = state
+                .with_kernel(|kernel| kernel.current_process_info())?
+                .process_id();
+            let left_object_id = state.alloc_object_id();
+            let right_object_id = state.alloc_object_id();
+            state.with_registry_mut(|registry| {
+                registry.insert(
+                    left_object_id,
+                    KernelObject::Channel(ChannelEndpoint::new(
+                        right_object_id,
+                        owner_process_id,
+                    )),
+                )?;
+                registry.insert(
+                    right_object_id,
+                    KernelObject::Channel(ChannelEndpoint::new(
+                        left_object_id,
+                        owner_process_id,
+                    )),
+                )?;
+                Ok(())
+            })?;
+
+            let left_handle = match state
+                .alloc_handle_for_object(left_object_id, handle::channel_default_rights())
+            {
                 Ok(handle) => handle,
                 Err(e) => {
                     let _ = state.with_registry_mut(|registry| {
@@ -374,22 +398,28 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
                     return Err(e);
                 }
             };
-        let right_handle = match state
-            .alloc_handle_for_object(right_object_id, handle::channel_default_rights())
-        {
-            Ok(handle) => handle,
-            Err(e) => {
-                let _ = state.close_handle(left_handle);
-                let _ = state.with_registry_mut(|registry| {
-                    let _ = registry.remove(left_object_id);
-                    let _ = registry.remove(right_object_id);
-                    Ok(())
-                });
-                return Err(e);
-            }
-        };
+            let right_handle = match state
+                .alloc_handle_for_object(right_object_id, handle::channel_default_rights())
+            {
+                Ok(handle) => handle,
+                Err(e) => {
+                    let _ = state.close_handle(left_handle);
+                    let _ = state.with_registry_mut(|registry| {
+                        let _ = registry.remove(left_object_id);
+                        let _ = registry.remove(right_object_id);
+                        Ok(())
+                    });
+                    return Err(e);
+                }
+            };
 
-        Ok((left_handle, right_handle))
+            Ok((left_handle, right_handle))
+        })();
+
+        if result.is_err() {
+            state.quota_decrement(job_id, ObjectKindTag::Channel);
+        }
+        result
     })
 }
 

@@ -81,7 +81,7 @@ use image::{ImportedProcessImage, align_up_user_page};
 use runtime::Process;
 #[allow(unused_imports)]
 pub(crate) use runtime::{
-    CreatedProcess, CurrentProcessInfo, CurrentThreadInfo, PreparedProcessStart,
+    CreatedProcess, CurrentProcessInfo, CurrentThreadInfo, ObjectKindTag, PreparedProcessStart,
 };
 use scheduler::{CpuSchedulerState, StartPlacementPolicy};
 pub(crate) use trap::TrapExitDisposition;

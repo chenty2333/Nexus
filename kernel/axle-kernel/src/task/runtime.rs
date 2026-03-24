@@ -89,6 +89,59 @@ pub(super) struct Process {
     pub(super) suspend_tokens: u32,
 }
 
+/// Per-job resource quotas. Each field limits how many live objects of that
+/// kind may exist under the job (including descendant processes).
+#[derive(Clone, Debug)]
+pub(crate) struct JobQuota {
+    pub(crate) max_handles: u32,
+    pub(crate) max_ports: u32,
+    pub(crate) max_timers: u32,
+    pub(crate) max_vmos: u32,
+    pub(crate) max_vmars: u32,
+    pub(crate) max_channels: u32,
+    pub(crate) max_sockets: u32,
+    pub(crate) max_revocation_groups: u32,
+}
+
+impl JobQuota {
+    pub(crate) fn root_default() -> Self {
+        Self {
+            max_handles: 65536,
+            max_ports: 65536,
+            max_timers: 65536,
+            max_vmos: 65536,
+            max_vmars: 65536,
+            max_channels: 65536,
+            max_sockets: 65536,
+            max_revocation_groups: 65536,
+        }
+    }
+}
+
+/// Live resource counts for one job node.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct JobResourceCounters {
+    pub(crate) ports: u32,
+    pub(crate) timers: u32,
+    pub(crate) vmos: u32,
+    pub(crate) vmars: u32,
+    pub(crate) channels: u32,
+    pub(crate) sockets: u32,
+    pub(crate) revocation_groups: u32,
+}
+
+/// Tag identifying which resource counter to check/update.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ObjectKindTag {
+    Port,
+    Timer,
+    Vmo,
+    Vmar,
+    Channel,
+    Socket,
+    RevocationGroup,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Job {
     pub(super) koid: zx_koid_t,
@@ -98,6 +151,8 @@ pub(crate) struct Job {
     pub(super) policy_rights_ceiling: HandleRights,
     pub(super) object_key: Option<ObjectKey>,
     pub(super) suspend_tokens: u32,
+    pub(super) quota: JobQuota,
+    pub(super) counters: JobResourceCounters,
 }
 
 impl Process {
@@ -261,6 +316,8 @@ impl Job {
             policy_rights_ceiling: HandleRights::from_zx_rights(ZX_RIGHTS_ALL),
             object_key: None,
             suspend_tokens: 0,
+            quota: JobQuota::root_default(),
+            counters: JobResourceCounters::default(),
         }
     }
 
@@ -268,6 +325,7 @@ impl Job {
         parent_job_id: JobId,
         koid: zx_koid_t,
         policy_rights_ceiling: HandleRights,
+        parent_quota: &JobQuota,
     ) -> Self {
         Self {
             koid,
@@ -277,6 +335,8 @@ impl Job {
             policy_rights_ceiling,
             object_key: None,
             suspend_tokens: 0,
+            quota: parent_quota.clone(),
+            counters: JobResourceCounters::default(),
         }
     }
 }
@@ -327,19 +387,78 @@ impl Kernel {
         Ok(self.process(process_id)?.policy_rights_ceiling)
     }
 
+    pub(crate) fn check_job_quota(
+        &self,
+        job_id: JobId,
+        tag: ObjectKindTag,
+    ) -> Result<(), zx_status_t> {
+        let job = self.jobs.get(&job_id).ok_or(ZX_ERR_BAD_STATE)?;
+        let (count, limit) = match tag {
+            ObjectKindTag::Port => (job.counters.ports, job.quota.max_ports),
+            ObjectKindTag::Timer => (job.counters.timers, job.quota.max_timers),
+            ObjectKindTag::Vmo => (job.counters.vmos, job.quota.max_vmos),
+            ObjectKindTag::Vmar => (job.counters.vmars, job.quota.max_vmars),
+            ObjectKindTag::Channel => (job.counters.channels, job.quota.max_channels),
+            ObjectKindTag::Socket => (job.counters.sockets, job.quota.max_sockets),
+            ObjectKindTag::RevocationGroup => {
+                (job.counters.revocation_groups, job.quota.max_revocation_groups)
+            }
+        };
+        if count >= limit {
+            return Err(ZX_ERR_NO_RESOURCES);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn increment_job_counter(&mut self, job_id: JobId, tag: ObjectKindTag) {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            let counter = match tag {
+                ObjectKindTag::Port => &mut job.counters.ports,
+                ObjectKindTag::Timer => &mut job.counters.timers,
+                ObjectKindTag::Vmo => &mut job.counters.vmos,
+                ObjectKindTag::Vmar => &mut job.counters.vmars,
+                ObjectKindTag::Channel => &mut job.counters.channels,
+                ObjectKindTag::Socket => &mut job.counters.sockets,
+                ObjectKindTag::RevocationGroup => &mut job.counters.revocation_groups,
+            };
+            *counter = counter.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn decrement_job_counter(&mut self, job_id: JobId, tag: ObjectKindTag) {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            let counter = match tag {
+                ObjectKindTag::Port => &mut job.counters.ports,
+                ObjectKindTag::Timer => &mut job.counters.timers,
+                ObjectKindTag::Vmo => &mut job.counters.vmos,
+                ObjectKindTag::Vmar => &mut job.counters.vmars,
+                ObjectKindTag::Channel => &mut job.counters.channels,
+                ObjectKindTag::Socket => &mut job.counters.sockets,
+                ObjectKindTag::RevocationGroup => &mut job.counters.revocation_groups,
+            };
+            *counter = counter.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn current_job_id(&self) -> Result<JobId, zx_status_t> {
+        let process_id = self.current_thread()?.process_id;
+        Ok(self.process(process_id)?.job_id)
+    }
+
     pub(crate) fn create_job(
         &mut self,
         parent_job_id: JobId,
     ) -> Result<(JobId, zx_koid_t), zx_status_t> {
-        let parent_policy = self
+        let parent = self
             .jobs
             .get(&parent_job_id)
-            .ok_or(ZX_ERR_BAD_HANDLE)?
-            .policy_rights_ceiling;
+            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        let parent_policy = parent.policy_rights_ceiling;
+        let parent_quota = parent.quota.clone();
         let job_id = self.alloc_job_id();
         let koid = self.alloc_koid();
         self.jobs
-            .insert(job_id, Job::new_child(parent_job_id, koid, parent_policy));
+            .insert(job_id, Job::new_child(parent_job_id, koid, parent_policy, &parent_quota));
         self.jobs
             .get_mut(&parent_job_id)
             .ok_or(ZX_ERR_BAD_HANDLE)?

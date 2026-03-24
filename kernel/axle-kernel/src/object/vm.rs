@@ -94,46 +94,57 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
     }
 
     with_state_mut(|state| {
-        let object_id = state.alloc_object_id();
-        let global_vmo_id = state.with_kernel_mut(|kernel| Ok(kernel.allocate_global_vmo_id()))?;
-        let (process_id, address_space_id) = state.with_core(|kernel| {
-            let process = kernel.current_process_info()?;
-            let address_space_id = kernel.process_address_space_id(process.process_id())?;
-            Ok((process.process_id(), address_space_id))
-        })?;
-        let created = state.with_vm_mut(|vm| {
-            vm.create_anonymous_vmo_for_address_space(
-                process_id,
-                address_space_id,
-                size,
-                global_vmo_id,
-            )
-        })?;
-        state.with_objects_mut(|objects| {
-            objects.insert(
-                object_id,
-                KernelObject::Vmo(VmoObject {
-                    creator_process_id: created.process_id(),
-                    global_vmo_id: created.global_vmo_id(),
-                    backing_scope: VmoBackingScope::LocalPrivate {
-                        owner_address_space_id: created.address_space_id(),
-                        local_vmo_id: created.vmo_id(),
-                    },
-                    kind: axle_mm::VmoKind::Anonymous,
-                    size_bytes: created.size_bytes(),
-                    image_layout: None,
-                }),
-            )?;
-            Ok(())
-        })?;
+        let job_id = state.current_job_id()?;
+        state.quota_check_and_increment(job_id, ObjectKindTag::Vmo)?;
 
-        match state.alloc_handle_for_object(object_id, handle::vmo_default_rights()) {
-            Ok(h) => Ok(h),
-            Err(e) => {
-                let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
-                Err(e)
+        let result = (|| {
+            let object_id = state.alloc_object_id();
+            let global_vmo_id =
+                state.with_kernel_mut(|kernel| Ok(kernel.allocate_global_vmo_id()))?;
+            let (process_id, address_space_id) = state.with_core(|kernel| {
+                let process = kernel.current_process_info()?;
+                let address_space_id = kernel.process_address_space_id(process.process_id())?;
+                Ok((process.process_id(), address_space_id))
+            })?;
+            let created = state.with_vm_mut(|vm| {
+                vm.create_anonymous_vmo_for_address_space(
+                    process_id,
+                    address_space_id,
+                    size,
+                    global_vmo_id,
+                )
+            })?;
+            state.with_objects_mut(|objects| {
+                objects.insert(
+                    object_id,
+                    KernelObject::Vmo(VmoObject {
+                        creator_process_id: created.process_id(),
+                        global_vmo_id: created.global_vmo_id(),
+                        backing_scope: VmoBackingScope::LocalPrivate {
+                            owner_address_space_id: created.address_space_id(),
+                            local_vmo_id: created.vmo_id(),
+                        },
+                        kind: axle_mm::VmoKind::Anonymous,
+                        size_bytes: created.size_bytes(),
+                        image_layout: None,
+                    }),
+                )?;
+                Ok(())
+            })?;
+
+            match state.alloc_handle_for_object(object_id, handle::vmo_default_rights()) {
+                Ok(h) => Ok(h),
+                Err(e) => {
+                    let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
+                    Err(e)
+                }
             }
+        })();
+
+        if result.is_err() {
+            state.quota_decrement(job_id, ObjectKindTag::Vmo);
         }
+        result
     })
 }
 

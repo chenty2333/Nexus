@@ -56,7 +56,7 @@ use core::mem::size_of;
 use spin::{Mutex, Once};
 
 use crate::port_queue::KernelPort;
-use crate::task::JobId;
+use crate::task::{JobId, ObjectKindTag};
 
 const PORT_CAPACITY: usize = 64;
 const PORT_KERNEL_RESERVE: usize = 16;
@@ -1935,6 +1935,32 @@ impl KernelState {
     ) -> Result<T, zx_status_t> {
         self.with_core_mut(f)
     }
+
+    /// Return the job ID of the current process, for quota enforcement.
+    fn current_job_id(&self) -> Result<JobId, zx_status_t> {
+        self.with_core(|kernel| kernel.current_job_id())
+    }
+
+    /// Check that `job_id` has not exceeded the quota for `tag`, then increment.
+    fn quota_check_and_increment(
+        &self,
+        job_id: JobId,
+        tag: ObjectKindTag,
+    ) -> Result<(), zx_status_t> {
+        self.with_core_mut(|kernel| {
+            kernel.check_job_quota(job_id, tag)?;
+            kernel.increment_job_counter(job_id, tag);
+            Ok(())
+        })
+    }
+
+    /// Decrement the counter for `tag` under `job_id` (rollback on failure).
+    fn quota_decrement(&self, job_id: JobId, tag: ObjectKindTag) {
+        let _ = self.with_core_mut(|kernel| {
+            kernel.decrement_job_counter(job_id, tag);
+            Ok(())
+        });
+    }
 }
 
 static STATE: Once<KernelState> = Once::new();
@@ -2182,14 +2208,26 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
     }
 
     with_state_mut(|state| {
+        let job_id = state.current_job_id()?;
+        state.quota_check_and_increment(job_id, ObjectKindTag::Port)?;
+
         let object_id = state.alloc_object_id();
-        let port = state.with_kernel_mut(|kernel| {
+        let port = match state.with_kernel_mut(|kernel| {
             KernelPort::new(kernel, PORT_CAPACITY, PORT_KERNEL_RESERVE)
-        })?;
-        state.with_objects_mut(|objects| {
+        }) {
+            Ok(port) => port,
+            Err(e) => {
+                state.quota_decrement(job_id, ObjectKindTag::Port);
+                return Err(e);
+            }
+        };
+        if let Err(e) = state.with_objects_mut(|objects| {
             objects.insert(object_id, KernelObject::Port(port))?;
             Ok(())
-        })?;
+        }) {
+            state.quota_decrement(job_id, ObjectKindTag::Port);
+            return Err(e);
+        }
 
         match state.alloc_handle_for_object(object_id, handle::port_default_rights()) {
             Ok(h) => Ok(h),
@@ -2199,6 +2237,7 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
                 {
                     let _ = state.with_kernel_mut(|kernel| port.destroy(kernel));
                 }
+                state.quota_decrement(job_id, ObjectKindTag::Port);
                 Err(e)
             }
         }
@@ -2307,16 +2346,32 @@ pub fn create_timer(options: u32, clock_id: zx_clock_t) -> Result<zx_handle_t, z
     }
 
     with_state_mut(|state| {
-        let timer_id = state.with_kernel_mut(|kernel| Ok(kernel.create_timer_object()))?;
+        let job_id = state.current_job_id()?;
+        state.quota_check_and_increment(job_id, ObjectKindTag::Timer)?;
+
+        let timer_id = match state.with_kernel_mut(|kernel| Ok(kernel.create_timer_object())) {
+            Ok(id) => id,
+            Err(e) => {
+                state.quota_decrement(job_id, ObjectKindTag::Timer);
+                return Err(e);
+            }
+        };
         let object_id = state.alloc_object_id();
-        state.with_objects_mut(|objects| {
+        if let Err(e) = state.with_objects_mut(|objects| {
             objects.insert(
                 object_id,
                 KernelObject::Timer(TimerObject { timer_id, clock_id }),
             )?;
             Ok(())
-        })?;
-        state.note_timer_object(timer_id, object_id)?;
+        }) {
+            state.quota_decrement(job_id, ObjectKindTag::Timer);
+            return Err(e);
+        }
+        if let Err(e) = state.note_timer_object(timer_id, object_id) {
+            let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
+            state.quota_decrement(job_id, ObjectKindTag::Timer);
+            return Err(e);
+        }
 
         match state.alloc_handle_for_object(object_id, handle::timer_default_rights()) {
             Ok(h) => Ok(h),
@@ -2328,6 +2383,7 @@ pub fn create_timer(options: u32, clock_id: zx_clock_t) -> Result<zx_handle_t, z
                         .destroy_timer_object(timer_id)
                         .map_err(map_timer_error)
                 });
+                state.quota_decrement(job_id, ObjectKindTag::Timer);
                 Err(e)
             }
         }
