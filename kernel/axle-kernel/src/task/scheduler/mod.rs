@@ -18,6 +18,8 @@ pub(super) struct CpuSchedulerState {
     slice_deadline_ns: Option<i64>,
     last_rebalance_ns: Option<i64>,
     online: bool,
+    /// EEVDF: monotonically non-decreasing floor of vruntime across all runnable threads on this CPU.
+    pub(crate) min_vruntime: i64,
 }
 
 impl CpuSchedulerState {
@@ -30,6 +32,7 @@ impl CpuSchedulerState {
             slice_deadline_ns: now.checked_add(DEFAULT_TIME_SLICE_NS),
             last_rebalance_ns: Some(now),
             online: true,
+            min_vruntime: 0,
         }
     }
 }
@@ -89,9 +92,23 @@ impl Kernel {
     }
 
     pub(super) fn arm_current_slice_from(&mut self, now: i64) {
+        let weight = self
+            .current_cpu_scheduler()
+            .ok()
+            .and_then(|sched| sched.current_thread_id)
+            .and_then(|tid| self.threads.get(&tid))
+            .map(|t| t.weight)
+            .unwrap_or(1024);
+        let slice_ns = Self::compute_slice_ns(weight);
         let scheduler = self.current_cpu_scheduler_mut();
         scheduler.current_runtime_started_ns = Some(now);
-        scheduler.slice_deadline_ns = now.checked_add(DEFAULT_TIME_SLICE_NS);
+        scheduler.slice_deadline_ns = now.checked_add(slice_ns);
+    }
+
+    /// Compute a weight-proportional time slice.
+    /// Higher weight = longer slice (proportionally to base).
+    fn compute_slice_ns(weight: u32) -> i64 {
+        DEFAULT_TIME_SLICE_NS * weight.max(1) as i64 / 1024
     }
 
     fn maybe_periodic_rebalance(&mut self, now: i64) {
@@ -156,6 +173,9 @@ impl Kernel {
             .get_mut(&current_thread_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         thread.runtime_ns = thread.runtime_ns.saturating_add(elapsed_ns);
+        // EEVDF: advance vruntime proportionally to 1/weight
+        let vruntime_delta = elapsed_ns as i64 * 1024 / thread.weight.max(1) as i64;
+        thread.vruntime = thread.vruntime.saturating_add(vruntime_delta);
         Ok(())
     }
 
@@ -168,14 +188,24 @@ impl Kernel {
         }
         let _ = scheduler;
         self.account_current_runtime_until(now)?;
+        // EEVDF: update min_vruntime from current running thread
+        self.update_min_vruntime_from_current();
         self.maybe_periodic_rebalance(now);
         if self
             .current_cpu_scheduler()?
             .slice_deadline_ns
             .is_some_and(|deadline| now >= deadline)
         {
+            let weight = self
+                .current_cpu_scheduler()
+                .ok()
+                .and_then(|sched| sched.current_thread_id)
+                .and_then(|tid| self.threads.get(&tid))
+                .map(|t| t.weight)
+                .unwrap_or(1024);
+            let slice_ns = Self::compute_slice_ns(weight);
             self.current_cpu_scheduler_mut().slice_deadline_ns =
-                now.checked_add(DEFAULT_TIME_SLICE_NS);
+                now.checked_add(slice_ns);
             self.request_reschedule_on_cpu(self.current_cpu_id());
         }
         Ok(())
@@ -197,5 +227,58 @@ impl Kernel {
 
     pub(crate) fn request_reschedule(&mut self) {
         self.request_reschedule_on_cpu(self.current_cpu_id());
+    }
+
+    // ---- EEVDF helpers ----
+
+    /// Update `min_vruntime` from the currently running thread's vruntime.
+    /// `min_vruntime` must be monotonically non-decreasing.
+    fn update_min_vruntime_from_current(&mut self) {
+        let cpu_id = self.current_cpu_id();
+        let current_vruntime = self
+            .cpu_schedulers
+            .get(&cpu_id)
+            .and_then(|sched| sched.current_thread_id)
+            .and_then(|tid| self.threads.get(&tid))
+            .map(|t| t.vruntime);
+        if let Some(vrt) = current_vruntime {
+            let scheduler = self.cpu_scheduler_mut(cpu_id);
+            if vrt > scheduler.min_vruntime {
+                scheduler.min_vruntime = vrt;
+            }
+        }
+    }
+
+    /// Prepare a thread's EEVDF scheduling parameters before enqueue.
+    /// Sets eligible_time, vdeadline, and clamps vruntime.
+    fn prepare_enqueue_eevdf(&mut self, thread_id: ThreadId, cpu_id: usize) {
+        let min_vruntime = self
+            .cpu_schedulers
+            .get(&cpu_id)
+            .map(|sched| sched.min_vruntime)
+            .unwrap_or(0);
+        if let Some(thread) = self.threads.get_mut(&thread_id) {
+            thread.eligible_time = min_vruntime;
+            let slice = DEFAULT_TIME_SLICE_NS;
+            let weighted_slice = slice * 1024 / thread.weight.max(1) as i64;
+            thread.vdeadline = thread.eligible_time.saturating_add(weighted_slice);
+            // Clamp vruntime so a long-blocked thread doesn't get infinite credit
+            let floor = min_vruntime.saturating_sub(weighted_slice);
+            if thread.vruntime < floor {
+                thread.vruntime = floor;
+            }
+        }
+    }
+
+    /// After picking a thread to run, advance min_vruntime.
+    fn update_min_vruntime_after_pick(&mut self, thread_id: ThreadId) {
+        let cpu_id = self.current_cpu_id();
+        let vruntime = self.threads.get(&thread_id).map(|t| t.vruntime);
+        if let Some(vrt) = vruntime {
+            let scheduler = self.cpu_scheduler_mut(cpu_id);
+            if vrt > scheduler.min_vruntime {
+                scheduler.min_vruntime = vrt;
+            }
+        }
     }
 }

@@ -519,6 +519,10 @@ impl Kernel {
                 remote_wake_enqueued_ns: None,
                 remote_wake_source_cpu: None,
                 remote_wake_target_cpu: None,
+                vruntime: 0,
+                weight: 1024,
+                vdeadline: 0,
+                eligible_time: 0,
             },
         );
         let now = crate::time::now_ns();

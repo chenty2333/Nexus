@@ -45,6 +45,8 @@ impl Kernel {
             thread.remote_wake_target_cpu = None;
         }
         let _ = thread;
+        // EEVDF: prepare scheduling parameters before enqueue
+        self.prepare_enqueue_eevdf(thread_id, cpu_id);
         self.cpu_scheduler_mut(cpu_id)
             .run_queue
             .push_back(thread_id);
@@ -81,9 +83,11 @@ impl Kernel {
             thread.remote_wake_target_cpu = None;
         }
         let _ = thread;
+        // EEVDF: prepare scheduling parameters before enqueue
+        self.prepare_enqueue_eevdf(thread_id, cpu_id);
         self.cpu_scheduler_mut(cpu_id)
             .run_queue
-            .push_front(thread_id);
+            .push_back(thread_id);
         self.note_run_queue_depth(thread_id, cpu_id, RQ_DEPTH_ENQUEUE_FRONT);
         crate::trace::record_sched_handoff(
             thread_id,
@@ -107,25 +111,86 @@ impl Kernel {
         self.enqueue_runnable_thread_on_cpu(thread_id, self.current_cpu_id())
     }
 
+    /// EEVDF pick-next: select the eligible thread with the smallest vdeadline.
+    ///
+    /// A thread is eligible when `eligible_time <= min_vruntime`. If no thread
+    /// is eligible (e.g. all newly woken), fall back to the smallest vdeadline
+    /// unconditionally to prevent starvation.
     pub(crate) fn pop_runnable_thread(&mut self) -> Option<ThreadId> {
         let current_cpu_id = self.current_cpu_id();
-        loop {
-            let thread_id = self
-                .cpu_scheduler_mut(current_cpu_id)
-                .run_queue
-                .pop_front()?;
-            self.note_run_queue_depth(thread_id, current_cpu_id, RQ_DEPTH_DEQUEUE_LOCAL);
-            let Some(thread) = self.threads.get_mut(&thread_id) else {
+        let min_vruntime = self
+            .cpu_schedulers
+            .get(&current_cpu_id)
+            .map(|sched| sched.min_vruntime)
+            .unwrap_or(0);
+
+        // First, purge stale entries from the front (threads that are no longer
+        // runnable or queued on a different CPU), same as the old FIFO loop.
+        // But for EEVDF we need to scan the whole queue, so we do it inline.
+
+        let run_queue = &self.cpu_scheduler_mut(current_cpu_id).run_queue;
+        if run_queue.is_empty() {
+            return None;
+        }
+
+        // Pass 1: find the best eligible thread (smallest vdeadline where eligible_time <= min_vruntime)
+        let mut best_idx: Option<usize> = None;
+        let mut best_vdl = i64::MAX;
+        let rq = &self.cpu_schedulers.get(&current_cpu_id)?.run_queue;
+        for (i, &tid) in rq.iter().enumerate() {
+            let Some(thread) = self.threads.get(&tid) else {
                 continue;
             };
             if thread.queued_on_cpu != Some(current_cpu_id) {
                 continue;
             }
-            thread.queued_on_cpu = None;
-            if matches!(thread.state, ThreadState::Runnable) {
-                return Some(thread_id);
+            if !matches!(thread.state, ThreadState::Runnable) {
+                continue;
+            }
+            if thread.eligible_time <= min_vruntime && thread.vdeadline < best_vdl {
+                best_vdl = thread.vdeadline;
+                best_idx = Some(i);
             }
         }
+
+        // Pass 2: if no eligible thread, pick the smallest vdeadline unconditionally
+        // (latency bound — prevents starvation of newly woken threads)
+        if best_idx.is_none() {
+            best_vdl = i64::MAX;
+            let rq = &self.cpu_schedulers.get(&current_cpu_id)?.run_queue;
+            for (i, &tid) in rq.iter().enumerate() {
+                let Some(thread) = self.threads.get(&tid) else {
+                    continue;
+                };
+                if thread.queued_on_cpu != Some(current_cpu_id) {
+                    continue;
+                }
+                if !matches!(thread.state, ThreadState::Runnable) {
+                    continue;
+                }
+                if thread.vdeadline < best_vdl {
+                    best_vdl = thread.vdeadline;
+                    best_idx = Some(i);
+                }
+            }
+        }
+
+        let idx = best_idx?;
+        let thread_id = self
+            .cpu_scheduler_mut(current_cpu_id)
+            .run_queue
+            .remove(idx)?;
+        self.note_run_queue_depth(thread_id, current_cpu_id, RQ_DEPTH_DEQUEUE_LOCAL);
+
+        // Clear queued_on_cpu for the picked thread
+        if let Some(thread) = self.threads.get_mut(&thread_id) {
+            thread.queued_on_cpu = None;
+        }
+
+        // EEVDF: advance min_vruntime after pick
+        self.update_min_vruntime_after_pick(thread_id);
+
+        Some(thread_id)
     }
 
     pub(super) fn migrate_one_runnable_thread(
@@ -158,7 +223,20 @@ impl Kernel {
             thread.remote_wake_enqueued_ns = Some(enqueue_ns);
             thread.remote_wake_source_cpu = Some(donor_cpu_id);
             thread.remote_wake_target_cpu = Some(receiver_cpu_id);
+
+            // EEVDF: adjust vruntime relative to destination CPU's min_vruntime
+            let dest_min_vruntime = self
+                .cpu_schedulers
+                .get(&receiver_cpu_id)
+                .map(|sched| sched.min_vruntime)
+                .unwrap_or(0);
+            if thread.vruntime < dest_min_vruntime {
+                thread.vruntime = dest_min_vruntime;
+            }
             let _ = thread;
+
+            // Prepare EEVDF parameters for the destination CPU
+            self.prepare_enqueue_eevdf(thread_id, receiver_cpu_id);
 
             self.cpu_scheduler_mut(receiver_cpu_id)
                 .run_queue
