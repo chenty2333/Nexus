@@ -1584,12 +1584,18 @@ struct Thread {
     /// EEVDF: virtual runtime in ns (weighted). Advances by real_ns * 1024 / weight.
     pub(crate) vruntime: i64,
     /// EEVDF: scheduling weight (default 1024 = nice 0). Higher weight = more CPU time.
+    /// This is the *effective* weight used by the scheduler. It may be temporarily elevated
+    /// above `base_weight` when priority inheritance is active.
     pub(crate) weight: u32,
+    /// The thread's own policy weight, unaffected by PI boosts.
+    pub(crate) base_weight: u32,
     /// EEVDF: virtual deadline = eligible_time + (slice_ns * 1024 / weight).
     pub(crate) vdeadline: i64,
     /// EEVDF: eligible time, set to min_vruntime at enqueue. Thread is eligible when
     /// eligible_time <= min_vruntime.
     pub(crate) eligible_time: i64,
+    /// Futex key this thread is currently blocked on (for PI chain walking).
+    pub(crate) pi_blocked_on: Option<FutexKey>,
 }
 
 /// Internal bootstrap kernel model.

@@ -13,6 +13,11 @@ use axle_mm::FutexKey;
 use axle_types::koid::ZX_KOID_INVALID;
 use axle_types::zx_koid_t;
 
+/// Maximum depth for priority inheritance chain propagation.
+/// Currently single-level PI is implemented; this constant reserves the chain-walk bound.
+#[allow(dead_code)]
+pub(crate) const MAX_PI_CHAIN_DEPTH: usize = 16;
+
 /// Result of waking waiters from one futex queue.
 #[derive(Debug, Default)]
 pub(crate) struct WakeResult {
@@ -63,6 +68,14 @@ impl FutexTable {
             .get(&key)
             .map(|queue| queue.owner_koid)
             .unwrap_or(ZX_KOID_INVALID)
+    }
+
+    /// Return a snapshot of the waiter thread IDs for one key (for PI weight recomputation).
+    pub(crate) fn waiter_thread_ids(&self, key: FutexKey) -> Vec<u64> {
+        self.queues
+            .get(&key)
+            .map(|queue| queue.waiters.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Enqueue one waiter in FIFO order.

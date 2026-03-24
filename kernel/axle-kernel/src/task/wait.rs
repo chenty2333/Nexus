@@ -1,5 +1,7 @@
 use alloc::collections::VecDeque;
 
+use axle_types::koid::ZX_KOID_INVALID;
+
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,7 +375,18 @@ impl Kernel {
                 self.push_port_waiter(port_object, thread_id)
             }
             WaitRegistration::Futex { key, owner_koid } => {
-                self.futexes.enqueue_waiter(key, thread_id, owner_koid)
+                self.futexes.enqueue_waiter(key, thread_id, owner_koid);
+                // PI: record which futex this thread is blocked on.
+                if let Some(thread) = self.threads.get_mut(&thread_id) {
+                    thread.pi_blocked_on = Some(key);
+                }
+                // PI: if the futex has a known owner, boost it if needed.
+                let waiter_weight = self
+                    .threads
+                    .get(&thread_id)
+                    .map(|t| t.weight)
+                    .unwrap_or(0);
+                self.apply_pi_boost(owner_koid, waiter_weight);
             }
             WaitRegistration::VmFault { .. } => {}
         }
@@ -394,6 +407,10 @@ impl Kernel {
             }
             WaitRegistration::Futex { key, .. } => {
                 let _ = self.futexes.cancel_waiter(key, thread_id);
+                // PI: clear the blocked-on record for the woken/cancelled thread.
+                if let Some(thread) = self.threads.get_mut(&thread_id) {
+                    thread.pi_blocked_on = None;
+                }
             }
             WaitRegistration::VmFault { key } => {
                 self.with_faults_mut(|faults| {
@@ -637,12 +654,20 @@ impl Kernel {
         new_owner_koid: zx_koid_t,
         single_owner: bool,
     ) -> Result<usize, zx_status_t> {
+        // PI: snapshot the old owner koid before wake changes it.
+        let old_owner_koid = self.futexes.owner(key);
         let result = self
             .futexes
             .wake(key, wake_count, new_owner_koid, single_owner);
-        for thread_id in result.woken {
+        for &thread_id in &result.woken {
+            // PI: clear blocked-on for each woken thread.
+            if let Some(thread) = self.threads.get_mut(&thread_id) {
+                thread.pi_blocked_on = None;
+            }
             let _ = self.complete_waiter_source_removed(thread_id, WakeReason::Status(ZX_OK))?;
         }
+        // PI: recompute old owner's weight based on remaining waiters.
+        self.recompute_pi_weight(old_owner_koid, key);
         Ok(result.remaining)
     }
 
@@ -655,20 +680,45 @@ impl Kernel {
         requeue_count: usize,
         target_owner_koid: zx_koid_t,
     ) -> Result<crate::futex::RequeueResult, zx_status_t> {
+        // PI: snapshot the old source owner koid before requeue changes it.
+        let old_source_owner_koid = self.futexes.owner(source);
         let result =
             self.futexes
                 .requeue(source, target, wake_count, requeue_count, target_owner_koid);
-        for thread_id in &result.woken {
-            let _ = self.complete_waiter_source_removed(*thread_id, WakeReason::Status(ZX_OK))?;
+        for &thread_id in &result.woken {
+            // PI: clear blocked-on for each woken thread.
+            if let Some(thread) = self.threads.get_mut(&thread_id) {
+                thread.pi_blocked_on = None;
+            }
+            let _ = self.complete_waiter_source_removed(thread_id, WakeReason::Status(ZX_OK))?;
         }
-        for thread_id in &result.requeued_waiters {
+        for &thread_id in &result.requeued_waiters {
+            // PI: update blocked-on to the target futex for requeued threads.
+            if let Some(thread) = self.threads.get_mut(&thread_id) {
+                thread.pi_blocked_on = Some(target);
+            }
             let _ = self.update_wait_registration(
-                *thread_id,
+                thread_id,
                 WaitRegistration::Futex {
                     key: target,
                     owner_koid: target_owner_koid,
                 },
             )?;
+        }
+        // PI: recompute old source owner's weight (waiters were removed from its queue).
+        self.recompute_pi_weight(old_source_owner_koid, source);
+        // PI: apply boost to the new target owner from the requeued waiters.
+        if target_owner_koid != ZX_KOID_INVALID {
+            let max_requeued_weight = result
+                .requeued_waiters
+                .iter()
+                .filter_map(|&tid| self.threads.get(&tid))
+                .map(|t| t.weight)
+                .max()
+                .unwrap_or(0);
+            if max_requeued_weight > 0 {
+                self.apply_pi_boost(target_owner_koid, max_requeued_weight);
+            }
         }
         Ok(result)
     }
@@ -686,5 +736,61 @@ impl Kernel {
             .is_some_and(|registration| {
                 matches!(registration, WaitRegistration::Futex { key: wait_key, .. } if wait_key == key)
             })
+    }
+
+    // ---- Priority Inheritance helpers ----
+
+    /// Find a ThreadId by its koid. Returns `None` if no thread with that koid exists.
+    fn thread_id_for_koid(&self, koid: zx_koid_t) -> Option<ThreadId> {
+        self.threads
+            .iter()
+            .find(|(_, thread)| thread.koid == koid)
+            .map(|(&tid, _)| tid)
+    }
+
+    /// Apply PI boost: if the waiter's effective weight exceeds the owner's effective weight,
+    /// boost the owner. Single-level only (no chain propagation beyond depth 1 for now).
+    fn apply_pi_boost(&mut self, owner_koid: zx_koid_t, waiter_weight: u32) {
+        if owner_koid == ZX_KOID_INVALID {
+            return;
+        }
+        let owner_tid = match self.thread_id_for_koid(owner_koid) {
+            Some(tid) => tid,
+            None => return,
+        };
+        let owner = match self.threads.get_mut(&owner_tid) {
+            Some(t) => t,
+            None => return,
+        };
+        if waiter_weight > owner.weight {
+            owner.weight = waiter_weight;
+        }
+    }
+
+    /// Recompute the owner's effective weight from base_weight and the maximum weight
+    /// among remaining waiters on the given futex key.
+    fn recompute_pi_weight(&mut self, owner_koid: zx_koid_t, futex_key: FutexKey) {
+        if owner_koid == ZX_KOID_INVALID {
+            return;
+        }
+        let owner_tid = match self.thread_id_for_koid(owner_koid) {
+            Some(tid) => tid,
+            None => return,
+        };
+        let remaining_ids = self.futexes.waiter_thread_ids(futex_key);
+        let max_waiter_weight = remaining_ids
+            .iter()
+            .filter_map(|&tid| self.threads.get(&tid))
+            .map(|t| t.weight)
+            .max()
+            .unwrap_or(0);
+        let base = self
+            .threads
+            .get(&owner_tid)
+            .map(|t| t.base_weight)
+            .unwrap_or(1024);
+        if let Some(owner) = self.threads.get_mut(&owner_tid) {
+            owner.weight = base.max(max_waiter_weight);
+        }
     }
 }
