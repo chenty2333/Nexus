@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+use crate::object::{self, KernelObject};
+use crate::port_queue::port_packet_from_core;
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
 use axle_core::{ObjectKey, Packet, Signals, WaitAsyncOptions, WaitAsyncRegistration};
@@ -11,17 +13,6 @@ use axle_types::status::{
     ZX_ERR_WRONG_TYPE, ZX_OK,
 };
 use axle_types::{zx_handle_t, zx_port_packet_t, zx_signals_t, zx_status_t};
-
-use crate::object::{self, KernelObject};
-use crate::port_queue::port_packet_from_core;
-
-fn log_wait_async(_prefix: &str, _key: u64, _waitable: ObjectKey, _signals: Signals) {}
-
-fn log_signal_packet(_key: u64, _waitable: ObjectKey, _observed: Signals) {}
-
-fn log_port_wait(_prefix: &str, _port: ObjectKey, _detail: u64) {}
-
-fn log_port_packet(_prefix: &str, _port: ObjectKey, _key: u64, _ok: bool) {}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UserSignalsSink(u64);
@@ -81,7 +72,6 @@ fn queue_kernel_signal_packet(
     port_key: ObjectKey,
     packet: Packet,
 ) -> bool {
-    log_signal_packet(packet.key, packet.waitable, packet.observed);
     let queued = state
         .with_registry_mut(|registry| {
             let Some(KernelObject::Port(port)) = registry.get_mut(port_key) else {
@@ -90,7 +80,6 @@ fn queue_kernel_signal_packet(
             Ok(port.queue_kernel(packet).is_ok())
         })
         .unwrap_or(false);
-    log_port_packet("queue", port_key, packet.key, queued);
     queued
 }
 
@@ -104,7 +93,6 @@ fn pop_port_packet_locked(
         };
         port.pop().map_err(object::map_port_error)
     })?;
-    log_port_packet("pop", port_key, packet.key, true);
     state.with_reactor_mut(|reactor| {
         reactor
             .observers_mut()
@@ -168,7 +156,7 @@ fn queue_user_port_packet(
     object_key: ObjectKey,
     packet: Packet,
 ) -> Result<(), zx_status_t> {
-    state.with_registry_mut(|registry| {
+    let result = state.with_registry_mut(|registry| {
         let obj = registry.get_mut(object_key).ok_or(ZX_ERR_BAD_HANDLE)?;
         let port = match obj {
             KernelObject::Port(port) => port,
@@ -189,7 +177,8 @@ fn queue_user_port_packet(
             | KernelObject::Vmar(_) => return Err(ZX_ERR_WRONG_TYPE),
         };
         port.queue_user(packet).map_err(object::map_port_error)
-    })
+    });
+    result
 }
 
 /// Queue a user packet into a port.
@@ -255,7 +244,6 @@ pub fn port_wait(
                     }
                     Some(deadline)
                 };
-                log_port_wait("park", object_key, sink.raw());
                 let (thread_id, wait_seq) = state.with_kernel_mut(|kernel| {
                     let thread_id = kernel.current_thread_info()?.thread_id();
                     let wait_seq = kernel.park_current_with_seq(
@@ -395,8 +383,6 @@ pub fn object_wait_async(
         let watched = Signals::from_bits(signals);
         let now = crate::time::now_ns();
 
-        log_wait_async("arm", key, waitable_key, current);
-
         require_port_object(state, port_key)?;
         object::require_handle_rights(resolved_port, crate::task::HandleRights::WRITE)?;
         state.with_reactor_mut(|reactor| {
@@ -494,7 +480,6 @@ pub(crate) fn publish_signals_changed(
         }
 
         for port_id in changed_ports {
-            log_port_wait("changed", port_id, current_waitable_key.object_id());
             let current = port_current_signals(state, port_id)?;
             if queued.insert(port_id) {
                 pending.push_back((port_id, current));
@@ -532,13 +517,11 @@ fn wake_signal_waiters(
 
 fn wake_port_waiters(state: &object::KernelState, port_key: ObjectKey) -> Result<(), zx_status_t> {
     let waiters = state.with_kernel_mut(|kernel| Ok(kernel.port_waiters(port_key)))?;
-    log_port_wait("wake-begin", port_key, waiters.len() as u64);
     if waiters.is_empty() {
         return Ok(());
     }
 
     for waiter in waiters {
-        log_port_wait("wake-one", port_key, waiter.thread_id());
         let packet = match pop_port_packet_locked(state, port_key) {
             Ok(packet) => packet,
             Err(ZX_ERR_SHOULD_WAIT) => break,

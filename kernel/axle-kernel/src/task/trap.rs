@@ -1,5 +1,18 @@
 use super::runtime::ProcessState;
 use super::*;
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+
+struct UserContextEnterSlots(UnsafeCell<[MaybeUninit<UserContext>; crate::arch::MAX_CPUS]>);
+
+// SAFETY: each CPU writes only its own slot immediately before a non-returning
+// ring3 transfer. Slots are indexed by logical CPU id, so concurrent CPUs do
+// not alias the same entry.
+unsafe impl Sync for UserContextEnterSlots {}
+
+static USER_CONTEXT_ENTER_SLOTS: UserContextEnterSlots = UserContextEnterSlots(UnsafeCell::new(
+    [const { MaybeUninit::uninit() }; crate::arch::MAX_CPUS],
+));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrapExitDisposition {
@@ -155,8 +168,13 @@ impl UserContext {
         // SAFETY: `UserContext` stores a complete ring3 register and IRET frame snapshot. The
         // entry helper restores those registers verbatim and finishes with `iretq`.
         crate::arch::user_tls::write_fs_base(self.fs_base);
+        let cpu_id = crate::arch::percpu::try_current_cpu_slot()
+            .filter(|cpu_id| *cpu_id < crate::arch::MAX_CPUS)
+            .unwrap_or(0);
         unsafe {
-            axle_enter_user_context(core::ptr::addr_of!(self));
+            let slots = &mut *USER_CONTEXT_ENTER_SLOTS.0.get();
+            slots[cpu_id].write(self);
+            axle_enter_user_context(slots[cpu_id].as_ptr());
         }
     }
 }
@@ -218,7 +236,7 @@ impl Kernel {
             .threads
             .get_mut(&current_thread_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        crate::arch::fpu::save_current(&mut thread.fpu_state);
+        crate::arch::fpu::save_current(thread.fpu_state.as_mut());
         thread.guest_fs_base = context.fs_base;
         thread.context = Some(context);
         Ok(())
@@ -339,9 +357,14 @@ impl Kernel {
             if target_cpu != self.current_cpu_id() {
                 crate::trace::record_remote_wake(thread_id_copy, target_cpu);
             }
-            self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
+            if target_cpu == self.current_cpu_id() {
+                self.enqueue_runnable_thread_front_on_cpu(thread_id_copy, target_cpu)?;
+                self.note_direct_handoff_candidate(target_cpu, thread_id_copy);
+            } else {
+                self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
+            }
             self.request_reschedule_on_cpu(target_cpu);
-            if allow_idle_spill {
+            if allow_idle_spill && target_cpu != self.current_cpu_id() {
                 self.maybe_nudge_idle_stealer(target_cpu);
             }
         }
@@ -392,7 +415,7 @@ impl Kernel {
             .threads
             .get(&current_thread_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        crate::arch::fpu::restore_current(&thread.fpu_state);
+        crate::arch::fpu::restore_current(thread.fpu_state.as_ref());
         let context = thread.context.ok_or(ZX_ERR_BAD_STATE)?;
         context.restore(trap, cpu_frame)
     }
@@ -445,6 +468,24 @@ impl Kernel {
                     self.arm_current_slice_from(now);
                 } else {
                     self.capture_current_user_context(trap, cpu_frame.cast_const())?;
+                }
+                let current_thread_id = self.current_thread_id()?;
+                if !resuming_blocked_current
+                    && let Some(handoff_thread_id) =
+                        self.take_pending_direct_handoff(current_cpu_id)
+                {
+                    let queued_here = self.threads.get(&handoff_thread_id).is_some_and(|thread| {
+                        handoff_thread_id != current_thread_id
+                            && thread.queued_on_cpu == Some(current_cpu_id)
+                            && matches!(thread.state, ThreadState::Runnable)
+                    });
+                    if queued_here {
+                        self.remove_thread_from_run_queue(handoff_thread_id, current_cpu_id);
+                        self.requeue_current_thread()?;
+                        self.switch_to_thread(handoff_thread_id, trap, cpu_frame)?;
+                        self.sync_current_cpu_tlb_state()?;
+                        return Ok(TrapExitDisposition::Complete);
+                    }
                 }
                 if !resuming_blocked_current && self.take_reschedule_requested(current_cpu_id) {
                     if let Some(next_thread_id) = self.pop_runnable_thread() {

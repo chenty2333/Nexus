@@ -148,7 +148,8 @@ pub(crate) fn write_config_u16(
     // Hold the lock across the entire read-modify-write to prevent another CPU
     // from interleaving a config-space access between our read and write.
     let _guard = PCI_CONFIG_LOCK.lock();
-    let mut dword = read_config_u32_locked(location.bus, location.device, location.function, aligned)?;
+    let mut dword =
+        read_config_u32_locked(location.bus, location.device, location.function, aligned)?;
     dword = (dword & mask) | (u32::from(value) << shift);
     write_config_u32_locked(location, aligned, dword)
 }

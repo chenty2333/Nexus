@@ -84,6 +84,10 @@ core::arch::global_asm!(
     .global axle_timer_entry
     .type axle_timer_entry, @function
 axle_timer_entry:
+    test QWORD PTR [rsp + 8], 3
+    jz .Ltimer_no_swapgs_entry
+    swapgs
+.Ltimer_no_swapgs_entry:
     // Save a conservative snapshot of registers.
     push r15
     push r14
@@ -101,9 +105,13 @@ axle_timer_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
-    lea rsi, [rsp + 15*8]
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
+    lea rsi, [rbx + 15*8]
     call {rust_handler}
+    mov rsp, rbx
 
     // Restore the interrupted/trap-updated rax before returning to user mode.
     mov rax, [rsp + 0]
@@ -122,6 +130,10 @@ axle_timer_entry:
     pop r13
     pop r14
     pop r15
+    test QWORD PTR [rsp + 8], 3
+    jz .Ltimer_no_swapgs_exit
+    swapgs
+.Ltimer_no_swapgs_exit:
     iretq
     .size axle_timer_entry, .-axle_timer_entry
     "#,

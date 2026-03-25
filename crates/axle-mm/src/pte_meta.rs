@@ -6,8 +6,9 @@ use alloc::vec::Vec;
 use super::frame_table::RmapNodeId;
 use super::types::AddressSpaceError;
 use super::vmo::MapId;
-use super::{align_down, is_page_aligned, validate_mapping_range, vpn_of, PAGE_SIZE,
-            PT_LEAF_PAGE_COUNT};
+use super::{
+    PAGE_SIZE, PT_LEAF_PAGE_COUNT, align_down, is_page_aligned, validate_mapping_range, vpn_of,
+};
 
 /// Software page-metadata tag for one virtual page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,11 +178,7 @@ impl<T: Copy> SparseLeafStore<T> {
         Ok(())
     }
 
-    pub(crate) fn clear_range(
-        &mut self,
-        base: u64,
-        len: u64,
-    ) -> Result<(), AddressSpaceError> {
+    pub(crate) fn clear_range(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
         validate_mapping_range(base, len)?;
         let page_count =
             usize::try_from(len / PAGE_SIZE).map_err(|_| AddressSpaceError::InvalidArgs)?;
@@ -282,11 +279,7 @@ impl PteMetaStore {
         self.leaves.install_dense_range(base, metas)
     }
 
-    pub(crate) fn clear_range(
-        &mut self,
-        base: u64,
-        len: u64,
-    ) -> Result<(), AddressSpaceError> {
+    pub(crate) fn clear_range(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
         self.leaves.clear_range(base, len)
     }
 
@@ -332,11 +325,7 @@ impl RmapIndexStore {
         self.leaves.install_optional_range(base, nodes)
     }
 
-    pub(crate) fn clear_range(
-        &mut self,
-        base: u64,
-        len: u64,
-    ) -> Result<(), AddressSpaceError> {
+    pub(crate) fn clear_range(&mut self, base: u64, len: u64) -> Result<(), AddressSpaceError> {
         self.leaves.clear_range(base, len)
     }
 

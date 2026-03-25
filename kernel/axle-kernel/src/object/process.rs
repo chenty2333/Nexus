@@ -147,23 +147,23 @@ pub fn create_process(
                 return Err(err);
             }
         };
-        let root_vmar_handle =
-            match state.alloc_handle_for_object(vmar_object_id, handle::vmar_default_rights()) {
-                Ok(handle) => handle,
-                Err(err) => {
-                    let _ = state.close_handle(process_handle);
-                    let _ = state.with_objects_mut(|objects| {
-                        let _ = objects.remove(process_object_id);
-                        let _ = objects.remove(vmar_object_id);
-                        Ok(())
-                    });
-                    // Clean up the underlying kernel process record that was
-                    // created by create_process_in_job, so it does not leak.
-                    let _ = state
-                        .with_kernel_mut(|kernel| kernel.reap_process(created.process_id()));
-                    return Err(err);
-                }
-            };
+        let root_vmar_handle = match state
+            .alloc_handle_for_object(vmar_object_id, handle::vmar_default_rights())
+        {
+            Ok(handle) => handle,
+            Err(err) => {
+                let _ = state.close_handle(process_handle);
+                let _ = state.with_objects_mut(|objects| {
+                    let _ = objects.remove(process_object_id);
+                    let _ = objects.remove(vmar_object_id);
+                    Ok(())
+                });
+                // Clean up the underlying kernel process record that was
+                // created by create_process_in_job, so it does not leak.
+                let _ = state.with_kernel_mut(|kernel| kernel.reap_process(created.process_id()));
+                return Err(err);
+            }
+        };
         Ok((process_handle, root_vmar_handle))
     })
 }
@@ -763,9 +763,9 @@ pub fn task_kill(handle: zx_handle_t) -> Result<(), zx_status_t> {
             Thread(u64),
         }
 
-        // Check DESTROY right upfront so the error code does not leak
-        // information about the underlying object type.
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::DESTROY)?;
+        // Task lifecycle authorization follows the object-specific MANAGE_* rights.
+        // There is no separate DESTROY baseline gate for job/process/thread kill.
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
         let target = state.with_objects(|objects| {
             Ok(match objects.get(resolved.object_key()) {
                 Some(KernelObject::Job(job)) => {

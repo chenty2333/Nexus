@@ -15,6 +15,10 @@ core::arch::global_asm!(
     .global axle_pf_entry
     .type axle_pf_entry, @function
 axle_pf_entry:
+    test QWORD PTR [rsp + 16], 3
+    jz .Lpf_no_swapgs_entry
+    swapgs
+.Lpf_no_swapgs_entry:
     push r15
     push r14
     push r13
@@ -31,10 +35,14 @@ axle_pf_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
-    lea rsi, [rsp + {pushed}]
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
+    lea rsi, [rbx + {pushed}]
     mov rdx, cr2
     call {rust_pf}
+    mov rsp, rbx
     test al, al
     jnz 2f
 
@@ -60,12 +68,20 @@ axle_pf_entry:
     pop r14
     pop r15
     add rsp, 8
+    test QWORD PTR [rsp + 8], 3
+    jz .Lpf_no_swapgs_exit
+    swapgs
+.Lpf_no_swapgs_exit:
     iretq
     .size axle_pf_entry, .-axle_pf_entry
 
     .global axle_ud_entry
     .type axle_ud_entry, @function
 axle_ud_entry:
+    test QWORD PTR [rsp + 8], 3
+    jz .Lud_no_swapgs_entry
+    swapgs
+.Lud_no_swapgs_entry:
     push r15
     push r14
     push r13
@@ -82,10 +98,14 @@ axle_ud_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
-    lea rsi, [rsp + {pushed}]
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
+    lea rsi, [rbx + {pushed}]
     xor rdx, rdx
     call {rust_ud}
+    mov rsp, rbx
     test al, al
     jnz 2f
 
@@ -109,12 +129,20 @@ axle_ud_entry:
     pop r13
     pop r14
     pop r15
+    test QWORD PTR [rsp + 8], 3
+    jz .Lud_no_swapgs_exit
+    swapgs
+.Lud_no_swapgs_exit:
     iretq
     .size axle_ud_entry, .-axle_ud_entry
 
     .global axle_gp_entry
     .type axle_gp_entry, @function
 axle_gp_entry:
+    test QWORD PTR [rsp + 16], 3
+    jz .Lgp_no_swapgs_entry
+    swapgs
+.Lgp_no_swapgs_entry:
     push r15
     push r14
     push r13
@@ -131,10 +159,14 @@ axle_gp_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
-    lea rsi, [rsp + {pushed}]
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
+    lea rsi, [rbx + {pushed}]
     xor rdx, rdx
     call {rust_gp}
+    mov rsp, rbx
 
 1:
     hlt
@@ -144,6 +176,10 @@ axle_gp_entry:
     .global axle_df_entry
     .type axle_df_entry, @function
 axle_df_entry:
+    test QWORD PTR [rsp + 16], 3
+    jz .Ldf_no_swapgs_entry
+    swapgs
+.Ldf_no_swapgs_entry:
     push r15
     push r14
     push r13
@@ -160,10 +196,14 @@ axle_df_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
-    lea rsi, [rsp + {pushed}]
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
+    lea rsi, [rbx + {pushed}]
     xor rdx, rdx
     call {rust_df}
+    mov rsp, rbx
 
 1:
     hlt
@@ -301,44 +341,14 @@ extern "C" fn axle_gp_fault_rust(
     _unused: u64,
 ) -> ! {
     let (error, rip, cs, rflags, rsp_ss) = decode_cpu_frame_with_error_code(cpu);
-    let component = crate::userspace::component_summary_snapshot();
-    let (kernel_stack_words, kernel_ret_words) = if rsp_ss.is_none() {
-        // SAFETY: for a ring0 #GP the CPU pushes {error, rip, cs, rflags} onto the current
-        // kernel stack before transferring control here. The pre-fault stack top is therefore
-        // the first word immediately after that four-word hardware frame.
-        unsafe {
-            let rsp = cpu.add(4);
-            (
-                Some([
-                    *rsp.add(0),
-                    *rsp.add(1),
-                    *rsp.add(2),
-                    *rsp.add(3),
-                    *rsp.add(4),
-                    *rsp.add(5),
-                    *rsp.add(6),
-                    *rsp.add(7),
-                    *rsp.add(8),
-                    *rsp.add(9),
-                    *rsp.add(10),
-                    *rsp.add(11),
-                ]),
-                Some([*rsp.add(17), *rsp.add(18), *rsp.add(19), *rsp.add(20)]),
-            )
-        }
-    } else {
-        (None, None)
-    };
     kprintln!(
-        "#GP: rip={:#x} cs={:#x} rflags={:#x} err={:#x} from_user={} rsp_ss={:?} kstack={:?} kret={:?} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} rbp={:#x} component={:?}",
+        "#GP: rip={:#x} cs={:#x} rflags={:#x} err={:#x} from_user={} rsp_ss={:?} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} rbp={:#x}",
         rip,
         cs,
         rflags,
         error,
         (cs & 0b11) == 0b11,
         rsp_ss,
-        kernel_stack_words,
-        kernel_ret_words,
         regs.rax,
         regs.rdi,
         regs.rsi,
@@ -349,7 +359,6 @@ extern "C" fn axle_gp_fault_rust(
         regs.r10,
         regs.r11,
         regs.rbp,
-        component,
     );
     arch::cpu::halt_loop();
 }

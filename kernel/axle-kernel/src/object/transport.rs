@@ -370,17 +370,11 @@ pub fn create_channel(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_sta
             state.with_registry_mut(|registry| {
                 registry.insert(
                     left_object_id,
-                    KernelObject::Channel(ChannelEndpoint::new(
-                        right_object_id,
-                        owner_process_id,
-                    )),
+                    KernelObject::Channel(ChannelEndpoint::new(right_object_id, owner_process_id)),
                 )?;
                 registry.insert(
                     right_object_id,
-                    KernelObject::Channel(ChannelEndpoint::new(
-                        left_object_id,
-                        owner_process_id,
-                    )),
+                    KernelObject::Channel(ChannelEndpoint::new(left_object_id, owner_process_id)),
                 )?;
                 Ok(())
             })?;

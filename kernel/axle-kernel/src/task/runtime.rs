@@ -404,9 +404,10 @@ impl Kernel {
             ObjectKindTag::Vmar => (job.counters.vmars, job.quota.max_vmars),
             ObjectKindTag::Channel => (job.counters.channels, job.quota.max_channels),
             ObjectKindTag::Socket => (job.counters.sockets, job.quota.max_sockets),
-            ObjectKindTag::RevocationGroup => {
-                (job.counters.revocation_groups, job.quota.max_revocation_groups)
-            }
+            ObjectKindTag::RevocationGroup => (
+                job.counters.revocation_groups,
+                job.quota.max_revocation_groups,
+            ),
             ObjectKindTag::EventPair => (job.counters.event_pairs, job.quota.max_event_pairs),
         };
         if count >= limit {
@@ -456,16 +457,15 @@ impl Kernel {
         &mut self,
         parent_job_id: JobId,
     ) -> Result<(JobId, zx_koid_t), zx_status_t> {
-        let parent = self
-            .jobs
-            .get(&parent_job_id)
-            .ok_or(ZX_ERR_BAD_HANDLE)?;
+        let parent = self.jobs.get(&parent_job_id).ok_or(ZX_ERR_BAD_HANDLE)?;
         let parent_policy = parent.policy_rights_ceiling;
         let parent_quota = parent.quota.clone();
         let job_id = self.alloc_job_id();
         let koid = self.alloc_koid();
-        self.jobs
-            .insert(job_id, Job::new_child(parent_job_id, koid, parent_policy, &parent_quota));
+        self.jobs.insert(
+            job_id,
+            Job::new_child(parent_job_id, koid, parent_policy, &parent_quota),
+        );
         self.jobs
             .get_mut(&parent_job_id)
             .ok_or(ZX_ERR_BAD_HANDLE)?
@@ -688,7 +688,7 @@ impl Kernel {
                 koid,
                 guest_started: false,
                 guest_fs_base: 0,
-                fpu_state: crate::arch::fpu::clean_state(),
+                fpu_state: alloc::boxed::Box::new(crate::arch::fpu::clean_state()),
                 state: ThreadState::New,
                 queued_on_cpu: None,
                 running_on_cpu: None,
@@ -760,7 +760,12 @@ impl Kernel {
             if target_cpu != self.current_cpu_id() {
                 crate::trace::record_remote_wake(thread_id_copy, target_cpu);
             }
-            self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
+            if target_cpu == self.current_cpu_id() {
+                self.enqueue_runnable_thread_front_on_cpu(thread_id_copy, target_cpu)?;
+                self.note_direct_handoff_candidate(target_cpu, thread_id_copy);
+            } else {
+                self.enqueue_runnable_thread_on_cpu(thread_id_copy, target_cpu)?;
+            }
             self.request_reschedule_on_cpu(target_cpu);
             if allow_idle_spill {
                 self.maybe_nudge_idle_stealer(target_cpu);
@@ -1208,8 +1213,7 @@ impl Kernel {
             self.task_lifecycle_dirty = true;
             // Release all user-visible mappings so physical memory can be
             // reclaimed before the process is reaped.
-            let req = self
-                .with_vm_mut(|vm| vm.cleanup_process_address_space(address_space_id));
+            let req = self.with_vm_mut(|vm| vm.cleanup_process_address_space(address_space_id));
             if let Ok(req) = req {
                 let _ = self.apply_tlb_commit_reqs_current(&[req]);
             }

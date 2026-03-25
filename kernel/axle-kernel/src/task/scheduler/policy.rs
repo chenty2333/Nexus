@@ -57,15 +57,7 @@ impl Kernel {
     }
 
     pub(super) fn donation_receiver_cpu_excluding(&self, excluded_cpu_id: usize) -> Option<usize> {
-        self.first_idle_cpu_excluding(excluded_cpu_id).or_else(|| {
-            self.cpu_schedulers.iter().find_map(|(&cpu_id, scheduler)| {
-                (cpu_id != excluded_cpu_id
-                    && scheduler.online
-                    && !self.current_thread_is_runnable_on_cpu(cpu_id)
-                    && scheduler.run_queue.is_empty())
-                .then_some(cpu_id)
-            })
-        })
+        self.first_idle_cpu_excluding(excluded_cpu_id)
     }
 
     pub(super) fn least_loaded_online_cpu(

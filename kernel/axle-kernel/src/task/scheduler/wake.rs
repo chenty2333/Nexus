@@ -13,6 +13,9 @@ impl Kernel {
         ) {
             return Ok(());
         }
+        if matches!(previous_state, ThreadState::Runnable) {
+            return Ok(());
+        }
         let hold_suspended = self.thread_should_be_suspended(thread_id)?;
         let running_cpu_id = self.running_cpu_for_thread(thread_id);
         let thread = self.threads.get_mut(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
@@ -40,6 +43,23 @@ impl Kernel {
             return Ok(());
         }
         if let Some(cpu_id) = running_cpu_id {
+            let direct_resume = self
+                .cpu_schedulers
+                .get(&cpu_id)
+                .and_then(|scheduler| scheduler.current_thread_id)
+                == Some(thread_id);
+            if !direct_resume {
+                if let Some(thread) = self.threads.get_mut(&thread_id) {
+                    thread.running_on_cpu = None;
+                }
+            }
+        }
+        if let Some(cpu_id) = running_cpu_id.filter(|cpu_id| {
+            self.cpu_schedulers
+                .get(cpu_id)
+                .and_then(|scheduler| scheduler.current_thread_id)
+                == Some(thread_id)
+        }) {
             if cpu_id != self.current_cpu_id() {
                 let now_ns = self.current_cpu_now_ns().max(0) as u64;
                 let source_cpu_id = self.current_cpu_id();

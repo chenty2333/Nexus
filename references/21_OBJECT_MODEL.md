@@ -80,6 +80,11 @@ Current job shape:
     - `task_kill(job)` recursively terminates descendant processes
     - `task_suspend(job)` returns one suspend token that holds descendant processes suspended until
       the token closes
+  - task lifecycle authorization is currently object-specific:
+    - `task_kill(process)` / `task_suspend(process)` require `MANAGE_PROCESS`
+    - `task_kill(thread)` / `task_suspend(thread)` require `MANAGE_THREAD`
+    - `task_kill(job)` / `task_suspend(job)` require `MANAGE_JOB`
+    - there is no extra `DESTROY` baseline gate for these lifecycle calls
 
 Current revocation-group shape:
 

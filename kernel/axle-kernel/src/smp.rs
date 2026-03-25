@@ -36,8 +36,9 @@ struct SyncApStacks(core::cell::UnsafeCell<[AlignedApStack; MAX_CPUS]>);
 // BSP writes are serialized during single-core init phase.
 unsafe impl Sync for SyncApStacks {}
 
-static AP_STACKS: SyncApStacks =
-    SyncApStacks(core::cell::UnsafeCell::new([AlignedApStack([0; AP_STACK_SIZE]); MAX_CPUS]));
+static AP_STACKS: SyncApStacks = SyncApStacks(core::cell::UnsafeCell::new(
+    [AlignedApStack([0; AP_STACK_SIZE]); MAX_CPUS],
+));
 
 static AP_ONLINE: [AtomicBool; MAX_APIC_IDS] = [const { AtomicBool::new(false) }; MAX_APIC_IDS];
 static APIC_ID_TO_SLOT: [AtomicUsize; MAX_APIC_IDS] =
@@ -158,6 +159,14 @@ pub fn cpu_slot_for_apic_id(apic_id: usize) -> Option<usize> {
     (apic_id < MAX_APIC_IDS)
         .then(|| APIC_ID_TO_SLOT[apic_id].load(Ordering::Acquire))
         .filter(|slot| *slot != usize::MAX)
+}
+
+pub fn apic_id_for_cpu_slot(cpu_slot: usize) -> Option<usize> {
+    (cpu_slot < MAX_CPUS).then_some(())?;
+    APIC_ID_TO_SLOT
+        .iter()
+        .enumerate()
+        .find_map(|(apic_id, slot)| (slot.load(Ordering::Acquire) == cpu_slot).then_some(apic_id))
 }
 
 fn register_apic_slot(apic_id: usize) -> usize {

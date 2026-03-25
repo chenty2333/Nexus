@@ -50,6 +50,9 @@ static XAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
 // x2APIC MSR numbers used for EOI.
 const IA32_X2APIC_EOI: u32 = 0x80B;
+const IA32_X2APIC_ESR: u32 = 0x828;
+const IA32_X2APIC_ICR: u32 = 0x830;
+const ICR_DEST_SHORTHAND_ALL_EXCLUDING_SELF: u64 = 0b11 << 18;
 
 struct BspLapicCell(UnsafeCell<Option<LocalApic>>);
 
@@ -261,11 +264,27 @@ pub fn send_startup_ipi(dest: u32, vector: u8) {
 pub fn send_fixed_ipi(dest: u32, vector: u8) {
     match APIC_MODE.load(Ordering::Relaxed) {
         MODE_X2APIC => {
-            // x2APIC ICR MSR (0x830) format: bits [31:0] = dest APIC id in
-            // bits [63:32], delivery mode + vector in bits [19:0].
-            const IA32_X2APIC_ICR: u32 = 0x830;
-            let icr_val = (u64::from(dest) << 32)
-                | u64::from(vector);
+            // Match the x2apic crate's `format_icr(Fixed)` shape:
+            // - vector in bits 0..8
+            // - delivery mode in bits 8..11 (0 for Fixed)
+            // - physical destination mode in bit 11 (false)
+            // - level in bit 14 (assert)
+            // - destination APIC id in bits 32..64
+            const ICR_LEVEL: u64 = 1 << 14;
+            let dest_is_bsp = crate::smp::apic_id_for_cpu_slot(0)
+                .map(|bsp_apic_id| bsp_apic_id as u32 == dest)
+                .unwrap_or(false);
+            let current_is_bsp = this_apic_id() == dest;
+            let icr_val = if dest_is_bsp && !current_is_bsp {
+                // KVM/QEMU on this path drops AP->BSP targeted x2APIC fixed IPIs.
+                // Broadcast-excluding-self preserves semantics for Axle's fixed vectors:
+                // - reschedule IPIs no-op on CPUs without `reschedule_requested`
+                // - TEST_VECTOR acks are tracked per recipient
+                // - TLB shootdowns are conservatively safe on extra CPUs
+                ICR_DEST_SHORTHAND_ALL_EXCLUDING_SELF | ICR_LEVEL | u64::from(vector)
+            } else {
+                (u64::from(dest) << 32) | ICR_LEVEL | u64::from(vector)
+            };
             // SAFETY: writing the x2APIC ICR MSR sends a fixed IPI. Requires
             // x2APIC to be enabled on the current CPU.
             unsafe {
@@ -273,6 +292,46 @@ pub fn send_fixed_ipi(dest: u32, vector: u8) {
             }
         }
         _ => xapic_send_ipi(dest, XapicIpiDeliveryMode::Fixed, vector),
+    }
+}
+
+/// Current CPU APIC error-status register.
+pub fn error_status() -> u32 {
+    match APIC_MODE.load(Ordering::Relaxed) {
+        MODE_X2APIC => {
+            // SAFETY: reading the x2APIC ESR MSR is a CPU-local diagnostic query.
+            unsafe { Msr::new(IA32_X2APIC_ESR).read() as u32 }
+        }
+        _ => {
+            let base = XAPIC_BASE.load(Ordering::Relaxed);
+            if base == 0 {
+                return 0;
+            }
+            // SAFETY: xAPIC ESR is a fixed MMIO register at base+0x280.
+            unsafe { core::ptr::read_volatile((base + 0x280) as *const u32) }
+        }
+    }
+}
+
+/// Current CPU raw APIC ICR value.
+pub fn icr_raw() -> u64 {
+    match APIC_MODE.load(Ordering::Relaxed) {
+        MODE_X2APIC => {
+            // SAFETY: reading the x2APIC ICR MSR is a CPU-local diagnostic query.
+            unsafe { Msr::new(IA32_X2APIC_ICR).read() }
+        }
+        _ => {
+            let base = XAPIC_BASE.load(Ordering::Relaxed);
+            if base == 0 {
+                return 0;
+            }
+            // SAFETY: xAPIC ICR is split across MMIO registers at base+0x300/0x310.
+            unsafe {
+                let lo = core::ptr::read_volatile((base + XAPIC_ICR_LOW_OFF) as *const u32);
+                let hi = core::ptr::read_volatile((base + XAPIC_ICR_HIGH_OFF) as *const u32);
+                u64::from(lo) | (u64::from(hi) << 32)
+            }
+        }
     }
 }
 
@@ -310,13 +369,17 @@ pub fn this_apic_id() -> u32 {
     })
 }
 
-// --- Spurious/error interrupt stubs (kernel-only) ---
+// --- Spurious/error interrupt stubs ---
 
 core::arch::global_asm!(
     r#"
     .global axle_apic_spurious_entry
     .type axle_apic_spurious_entry, @function
 axle_apic_spurious_entry:
+    test QWORD PTR [rsp + 8], 3
+    jz .Lapic_spurious_no_swapgs_entry
+    swapgs
+.Lapic_spurious_no_swapgs_entry:
     // Save a conservative snapshot of registers.
     push r15
     push r14
@@ -334,8 +397,12 @@ axle_apic_spurious_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
     call {rust_handler}
+    mov rsp, rbx
 
     mov rax, [rsp + 0]
     add rsp, 8
@@ -353,6 +420,10 @@ axle_apic_spurious_entry:
     pop r13
     pop r14
     pop r15
+    test QWORD PTR [rsp + 8], 3
+    jz .Lapic_spurious_no_swapgs_exit
+    swapgs
+.Lapic_spurious_no_swapgs_exit:
     iretq
     .size axle_apic_spurious_entry, .-axle_apic_spurious_entry
     "#,
@@ -364,6 +435,10 @@ core::arch::global_asm!(
     .global axle_apic_error_entry
     .type axle_apic_error_entry, @function
 axle_apic_error_entry:
+    test QWORD PTR [rsp + 8], 3
+    jz .Lapic_error_no_swapgs_entry
+    swapgs
+.Lapic_error_no_swapgs_entry:
     // Save a conservative snapshot of registers.
     push r15
     push r14
@@ -381,8 +456,12 @@ axle_apic_error_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
     call {rust_handler}
+    mov rsp, rbx
 
     mov rax, [rsp + 0]
     add rsp, 8
@@ -400,6 +479,10 @@ axle_apic_error_entry:
     pop r13
     pop r14
     pop r15
+    test QWORD PTR [rsp + 8], 3
+    jz .Lapic_error_no_swapgs_exit
+    swapgs
+.Lapic_error_no_swapgs_exit:
     iretq
     .size axle_apic_error_entry, .-axle_apic_error_entry
     "#,
@@ -428,7 +511,12 @@ extern "C" fn axle_apic_spurious_rust(_frame: *const u8) {
 }
 
 extern "C" fn axle_apic_error_rust(_frame: *const u8) {
-    // Keep it minimal: acknowledge and continue.
+    crate::kprintln!(
+        "apic_error: cpu={} esr={:#x} icr={:#x}",
+        crate::arch::percpu::try_current_cpu_slot().unwrap_or(usize::MAX),
+        error_status(),
+        icr_raw()
+    );
     eoi();
 }
 

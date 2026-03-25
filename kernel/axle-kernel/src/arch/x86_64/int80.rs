@@ -36,9 +36,13 @@ axle_int80_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
-    lea rsi, [rsp + 15*8]
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
+    lea rsi, [rbx + 15*8]
     call {rust_handler}
+    mov rsp, rbx
 
     // Load syscall return status from frame->rax.
     mov rax, [rsp + 0]

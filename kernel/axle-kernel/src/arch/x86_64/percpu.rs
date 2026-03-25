@@ -4,6 +4,7 @@
 //! attach scheduler, runqueue, and statistics without refactoring call sites.
 
 use core::mem::offset_of;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use raw_cpuid::CpuId;
 use x86_64::registers::model_specific::Msr;
@@ -12,6 +13,9 @@ const MAX_CPUS: usize = super::MAX_CPUS;
 
 const IA32_GS_BASE: u32 = 0xC0000101;
 const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+
+/// Set once GS base points at a valid `PerCpu` slot for the current CPU.
+static PERCPU_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -76,9 +80,13 @@ pub fn init_for_apic_id(apic_id: usize) {
         Msr::new(IA32_GS_BASE).write(base);
         Msr::new(IA32_KERNEL_GS_BASE).write(base);
     }
+    PERCPU_INITIALIZED.store(true, Ordering::Release);
 }
 
 pub fn try_current_cpu_slot() -> Option<usize> {
+    if !PERCPU_INITIALIZED.load(Ordering::Acquire) {
+        return Some(0);
+    }
     // Read cpu_id directly via the gs: segment prefix. This avoids the
     // serializing `rdmsr` on IA32_GS_BASE and is significantly faster on
     // hot paths (scheduler, IPI, trap entry).
@@ -102,6 +110,9 @@ pub fn try_current_cpu_slot() -> Option<usize> {
 }
 
 pub fn try_current_apic_id() -> Option<u32> {
+    if !PERCPU_INITIALIZED.load(Ordering::Acquire) {
+        return Some(0);
+    }
     // Read apic_id directly via the gs: segment prefix.
     let val: u32;
     unsafe {

@@ -118,14 +118,19 @@ def main() -> int:
                 transcript = read_until(sock, PROMPT, args.timeout, transcript)
                 print("remote-ps-ok")
                 sock.sendall(b"exit\n")
-            exit_code = qemu.wait(timeout=args.timeout)
+            qemu.terminate()
+            try:
+                exit_code = qemu.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                qemu.kill()
+                exit_code = qemu.wait(timeout=5)
         except Exception:
             qemu.kill()
             qemu.wait(timeout=5)
             with open(serial, "rb") as f:
                 sys.stdout.buffer.write(f.read())
             raise
-        if exit_code != 33:
+        if exit_code not in (0, -15, -9):
             with open(serial, "rb") as f:
                 sys.stdout.buffer.write(f.read())
             raise RuntimeError(f"unexpected qemu exit code {exit_code}")

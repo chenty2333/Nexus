@@ -1451,23 +1451,37 @@ pub(crate) struct KernelState {
 }
 
 impl KernelState {
+    fn with_local_interrupts_disabled<T>(&self, f: impl FnOnce() -> T) -> T {
+        let were_enabled = x86_64::instructions::interrupts::are_enabled();
+        if were_enabled {
+            x86_64::instructions::interrupts::disable();
+        }
+        let result = f();
+        if were_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        result
+    }
+
     fn new() -> Self {
         let (vm, address_space_id) = crate::task::VmFacade::bootstrap();
         let reactor = Arc::new(Mutex::new(crate::task::Reactor::new(
             BOOTSTRAP_REACTOR_CPU_COUNT,
         )));
+        let kernel = Arc::new(Mutex::new(crate::task::Kernel::bootstrap(
+            vm.clone(),
+            reactor.clone(),
+            address_space_id,
+        )));
+        let registry = Arc::new(Mutex::new(ObjectRegistry::new()));
+        let transport = Arc::new(Mutex::new(TransportCore::new()));
         let state = Self {
-            kernel: Arc::new(Mutex::new(crate::task::Kernel::bootstrap(
-                vm.clone(),
-                reactor.clone(),
-                address_space_id,
-            ))),
-            registry: Arc::new(Mutex::new(ObjectRegistry::new())),
-            transport: Arc::new(Mutex::new(TransportCore::new())),
+            kernel,
+            registry,
+            transport,
             reactor,
             vm,
         };
-
         let root_job_id = state
             .with_kernel(|kernel| Ok(kernel.root_job_id()))
             .expect("bootstrap root job must exist");
@@ -1714,10 +1728,18 @@ impl KernelState {
             })
             .expect("bootstrap component image handle publish must succeed");
 
-        device::seed_bootstrap_net_pci_device(&state)
-            .expect("bootstrap net pci device handle publish must succeed");
-        device::seed_real_net_pci_device(&state)
-            .expect("real net pci device handle publish must succeed");
+        if let Err(status) = device::seed_bootstrap_net_pci_device(&state) {
+            crate::kprintln!(
+                "device: bootstrap net pci device handle publish skipped status={}",
+                status
+            );
+        }
+        if let Err(status) = device::seed_real_net_pci_device(&state) {
+            crate::kprintln!(
+                "device: real net pci device handle publish skipped status={}",
+                status
+            );
+        }
 
         state
     }
@@ -1873,16 +1895,14 @@ impl KernelState {
         &self,
         f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
     ) -> Result<T, zx_status_t> {
-        let kernel = self.kernel.lock();
-        f(&kernel)
+        with_interrupt_safe_kernel_ref(&self.kernel, f)
     }
 
     fn with_core_mut<T>(
         &self,
         f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
     ) -> Result<T, zx_status_t> {
-        let mut kernel = self.kernel.lock();
-        f(&mut kernel)
+        with_interrupt_safe_kernel_mut(&self.kernel, f)
     }
 
     fn with_vm_mut<T>(
@@ -2026,9 +2046,10 @@ fn finish_syscall_inner(
     }
     let final_thread_id =
         with_kernel_mut(|kernel| Ok(kernel.current_thread_info()?.thread_id())).ok();
-    Ok(initial_thread_id.is_some()
+    let sysret_eligible = initial_thread_id.is_some()
         && initial_thread_id == final_thread_id
-        && crate::arch::syscall::sysret_eligible(cpu_frame.cast_const()))
+        && crate::arch::syscall::sysret_eligible(cpu_frame.cast_const());
+    Ok(sysret_eligible)
 }
 
 pub(crate) fn handle_native_syscall_entry(
@@ -2136,20 +2157,78 @@ pub(crate) fn kernel_handle() -> Result<Arc<Mutex<crate::task::Kernel>>, zx_stat
     Ok(state()?.kernel.clone())
 }
 
+fn with_local_interrupts_disabled<T>(f: impl FnOnce() -> T) -> T {
+    let were_enabled = x86_64::instructions::interrupts::are_enabled();
+    if were_enabled {
+        x86_64::instructions::interrupts::disable();
+    }
+    let result = f();
+    if were_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+    result
+}
+
+fn with_interrupt_safe_kernel_ref<T>(
+    kernel: &Arc<Mutex<crate::task::Kernel>>,
+    f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    let mut f = Some(f);
+    let were_enabled = x86_64::instructions::interrupts::are_enabled();
+    loop {
+        if were_enabled {
+            x86_64::instructions::interrupts::disable();
+        }
+        if let Some(guard) = kernel.try_lock() {
+            let result = f.take().expect("kernel ref closure reused")(&guard);
+            if were_enabled {
+                x86_64::instructions::interrupts::enable();
+            }
+            return result;
+        }
+        if were_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn with_interrupt_safe_kernel_mut<T>(
+    kernel: &Arc<Mutex<crate::task::Kernel>>,
+    f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    let mut f = Some(f);
+    let were_enabled = x86_64::instructions::interrupts::are_enabled();
+    loop {
+        if were_enabled {
+            x86_64::instructions::interrupts::disable();
+        }
+        if let Some(mut guard) = kernel.try_lock() {
+            let result = f.take().expect("kernel mut closure reused")(&mut guard);
+            if were_enabled {
+                x86_64::instructions::interrupts::enable();
+            }
+            return result;
+        }
+        if were_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        core::hint::spin_loop();
+    }
+}
+
 fn with_core_mut<T>(
     f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
     let kernel = kernel_handle()?;
-    let mut kernel = kernel.lock();
-    f(&mut kernel)
+    with_interrupt_safe_kernel_mut(&kernel, f)
 }
 
 fn with_core<T>(
     f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
     let kernel = kernel_handle()?;
-    let kernel = kernel.lock();
-    f(&kernel)
+    with_interrupt_safe_kernel_ref(&kernel, f)
 }
 
 fn with_kernel_mut<T>(
@@ -2186,6 +2265,7 @@ pub(crate) fn run_trap_blocking<T>(
 
 pub(crate) fn run_current_cpu_idle_loop() -> ! {
     loop {
+        x86_64::instructions::interrupts::enable();
         match with_state_mut(|state| {
             let lifecycle_dirty =
                 state.with_kernel_mut(|kernel| Ok(kernel.take_task_lifecycle_dirty()))?;
@@ -2194,7 +2274,10 @@ pub(crate) fn run_current_cpu_idle_loop() -> ! {
             }
             state.with_kernel_mut(|kernel| kernel.take_current_cpu_idle_context())
         }) {
-            Ok(Some(context)) => context.enter(),
+            Ok(Some(context)) => {
+                x86_64::instructions::interrupts::disable();
+                context.enter()
+            }
             Ok(None) => block_current_trap_until_runnable(),
             Err(status) => panic!("idle loop failed: {status}"),
         }
@@ -2212,9 +2295,9 @@ pub fn create_port(options: u32) -> Result<zx_handle_t, zx_status_t> {
         state.quota_check_and_increment(job_id, ObjectKindTag::Port)?;
 
         let object_id = state.alloc_object_id();
-        let port = match state.with_kernel_mut(|kernel| {
-            KernelPort::new(kernel, PORT_CAPACITY, PORT_KERNEL_RESERVE)
-        }) {
+        let port = match state
+            .with_kernel_mut(|kernel| KernelPort::new(kernel, PORT_CAPACITY, PORT_KERNEL_RESERVE))
+        {
             Ok(port) => port,
             Err(e) => {
                 state.quota_decrement(job_id, ObjectKindTag::Port);
@@ -2294,49 +2377,49 @@ pub fn create_eventpair(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_s
         state.quota_check_and_increment(job_id, ObjectKindTag::EventPair)?;
 
         let result = (|| {
-        let left_object_id = state.alloc_object_id();
-        let right_object_id = state.alloc_object_id();
-        state.with_objects_mut(|objects| {
-            objects.insert(
-                left_object_id,
-                KernelObject::EventPair(EventPairEndpoint::new(right_object_id)),
-            )?;
-            objects.insert(
-                right_object_id,
-                KernelObject::EventPair(EventPairEndpoint::new(left_object_id)),
-            )?;
-            Ok(())
-        })?;
+            let left_object_id = state.alloc_object_id();
+            let right_object_id = state.alloc_object_id();
+            state.with_objects_mut(|objects| {
+                objects.insert(
+                    left_object_id,
+                    KernelObject::EventPair(EventPairEndpoint::new(right_object_id)),
+                )?;
+                objects.insert(
+                    right_object_id,
+                    KernelObject::EventPair(EventPairEndpoint::new(left_object_id)),
+                )?;
+                Ok(())
+            })?;
 
-        let left_handle = match state
-            .alloc_handle_for_object(left_object_id, handle::eventpair_default_rights())
-        {
-            Ok(handle) => handle,
-            Err(e) => {
-                let _ = state.with_objects_mut(|objects| {
-                    let _ = objects.remove(left_object_id);
-                    let _ = objects.remove(right_object_id);
-                    Ok(())
-                });
-                return Err(e);
-            }
-        };
-        let right_handle = match state
-            .alloc_handle_for_object(right_object_id, handle::eventpair_default_rights())
-        {
-            Ok(handle) => handle,
-            Err(e) => {
-                let _ = state.close_handle(left_handle);
-                let _ = state.with_objects_mut(|objects| {
-                    let _ = objects.remove(left_object_id);
-                    let _ = objects.remove(right_object_id);
-                    Ok(())
-                });
-                return Err(e);
-            }
-        };
+            let left_handle = match state
+                .alloc_handle_for_object(left_object_id, handle::eventpair_default_rights())
+            {
+                Ok(handle) => handle,
+                Err(e) => {
+                    let _ = state.with_objects_mut(|objects| {
+                        let _ = objects.remove(left_object_id);
+                        let _ = objects.remove(right_object_id);
+                        Ok(())
+                    });
+                    return Err(e);
+                }
+            };
+            let right_handle = match state
+                .alloc_handle_for_object(right_object_id, handle::eventpair_default_rights())
+            {
+                Ok(handle) => handle,
+                Err(e) => {
+                    let _ = state.close_handle(left_handle);
+                    let _ = state.with_objects_mut(|objects| {
+                        let _ = objects.remove(left_object_id);
+                        let _ = objects.remove(right_object_id);
+                        Ok(())
+                    });
+                    return Err(e);
+                }
+            };
 
-        Ok((left_handle, right_handle))
+            Ok((left_handle, right_handle))
         })();
 
         if result.is_err() {

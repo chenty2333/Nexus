@@ -1,5 +1,4 @@
 use super::*;
-
 /// Maximum VMO size that can be created via syscall (4 GiB).
 const MAX_VMO_CREATE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 

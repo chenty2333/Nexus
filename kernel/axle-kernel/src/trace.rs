@@ -201,8 +201,9 @@ struct TraceRecordStorage(core::cell::UnsafeCell<[TraceRecord; TRACE_RECORD_CAPA
 // after the trace phase has been set to 0, which means writers have stopped.
 unsafe impl Sync for TraceRecordStorage {}
 
-static TRACE_RECORDS: TraceRecordStorage =
-    TraceRecordStorage(core::cell::UnsafeCell::new([TraceRecord::ZERO; TRACE_RECORD_CAPACITY]));
+static TRACE_RECORDS: TraceRecordStorage = TraceRecordStorage(core::cell::UnsafeCell::new(
+    [TraceRecord::ZERO; TRACE_RECORD_CAPACITY],
+));
 
 fn pack_meta(cpu_id: usize, category: TraceCategory, event: TraceEvent) -> u64 {
     (u64::from(cpu_id as u16) << 32) | (u64::from(category as u16) << 16) | u64::from(event as u16)

@@ -78,8 +78,8 @@ impl WaitNode {
 #[derive(Debug)]
 pub(crate) struct Reactor {
     observers: ObserverRegistry,
-    signal_waiters: BTreeMap<ObjectKey, VecDeque<ThreadId>>,
-    port_waiters: BTreeMap<ObjectKey, VecDeque<ThreadId>>,
+    signal_waiters: Vec<(ObjectKey, VecDeque<ThreadId>)>,
+    port_waiters: Vec<(ObjectKey, VecDeque<ThreadId>)>,
     timers: ReactorTimerCore,
 }
 
@@ -87,8 +87,8 @@ impl Reactor {
     pub(crate) fn new(cpu_count: usize) -> Self {
         Self {
             observers: ObserverRegistry::new(),
-            signal_waiters: BTreeMap::new(),
-            port_waiters: BTreeMap::new(),
+            signal_waiters: Vec::new(),
+            port_waiters: Vec::new(),
             timers: ReactorTimerCore::new(cpu_count),
         }
     }
@@ -101,52 +101,75 @@ impl Reactor {
         &mut self.observers
     }
 
+    fn waiters(
+        entries: &[(ObjectKey, VecDeque<ThreadId>)],
+        object_key: ObjectKey,
+    ) -> Option<&VecDeque<ThreadId>> {
+        entries
+            .iter()
+            .find_map(|(key, waiters)| (*key == object_key).then_some(waiters))
+    }
+
+    fn ensure_waiters_mut(
+        entries: &mut Vec<(ObjectKey, VecDeque<ThreadId>)>,
+        object_key: ObjectKey,
+    ) -> &mut VecDeque<ThreadId> {
+        if let Some(index) = entries.iter().position(|(key, _)| *key == object_key) {
+            return &mut entries[index].1;
+        }
+        entries.push((object_key, VecDeque::new()));
+        &mut entries
+            .last_mut()
+            .expect("newly pushed waiter queue must exist")
+            .1
+    }
+
+    fn remove_waiter(
+        entries: &mut Vec<(ObjectKey, VecDeque<ThreadId>)>,
+        object_key: ObjectKey,
+        thread_id: ThreadId,
+    ) {
+        let Some(index) = entries.iter().position(|(key, _)| *key == object_key) else {
+            return;
+        };
+        let waiters = &mut entries[index].1;
+        waiters.retain(|waiter| *waiter != thread_id);
+        if waiters.is_empty() {
+            entries.swap_remove(index);
+        }
+    }
+
+    fn remove_waiter_source(
+        entries: &mut Vec<(ObjectKey, VecDeque<ThreadId>)>,
+        object_key: ObjectKey,
+    ) {
+        entries.retain(|(key, _)| *key != object_key);
+    }
+
     pub(crate) fn remove_port(&mut self, port_key: ObjectKey) {
         self.observers.remove_port(port_key);
-        let _ = self.port_waiters.remove(&port_key);
+        Self::remove_waiter_source(&mut self.port_waiters, port_key);
     }
 
     pub(crate) fn remove_waitable(&mut self, waitable_key: ObjectKey) {
         self.observers.remove_waitable(waitable_key);
-        let _ = self.signal_waiters.remove(&waitable_key);
+        Self::remove_waiter_source(&mut self.signal_waiters, waitable_key);
     }
 
     pub(super) fn push_signal_waiter(&mut self, object_key: ObjectKey, thread_id: ThreadId) {
-        self.signal_waiters
-            .entry(object_key)
-            .or_default()
-            .push_back(thread_id);
+        Self::ensure_waiters_mut(&mut self.signal_waiters, object_key).push_back(thread_id);
     }
 
     pub(super) fn remove_signal_waiter(&mut self, object_key: ObjectKey, thread_id: ThreadId) {
-        let should_remove = if let Some(waiters) = self.signal_waiters.get_mut(&object_key) {
-            waiters.retain(|waiter| *waiter != thread_id);
-            waiters.is_empty()
-        } else {
-            false
-        };
-        if should_remove {
-            let _ = self.signal_waiters.remove(&object_key);
-        }
+        Self::remove_waiter(&mut self.signal_waiters, object_key, thread_id);
     }
 
     pub(super) fn push_port_waiter(&mut self, port_object: ObjectKey, thread_id: ThreadId) {
-        self.port_waiters
-            .entry(port_object)
-            .or_default()
-            .push_back(thread_id);
+        Self::ensure_waiters_mut(&mut self.port_waiters, port_object).push_back(thread_id);
     }
 
     pub(super) fn remove_port_waiter(&mut self, port_object: ObjectKey, thread_id: ThreadId) {
-        let should_remove = if let Some(waiters) = self.port_waiters.get_mut(&port_object) {
-            waiters.retain(|waiter| *waiter != thread_id);
-            waiters.is_empty()
-        } else {
-            false
-        };
-        if should_remove {
-            let _ = self.port_waiters.remove(&port_object);
-        }
+        Self::remove_waiter(&mut self.port_waiters, port_object, thread_id);
     }
 
     pub(super) fn cancel_wait_deadline(&mut self, thread_id: ThreadId, seq: u64) {
@@ -166,15 +189,13 @@ impl Reactor {
     }
 
     pub(super) fn signal_waiter_thread_ids(&self, object_key: ObjectKey) -> Vec<ThreadId> {
-        self.signal_waiters
-            .get(&object_key)
+        Self::waiters(&self.signal_waiters, object_key)
             .map(|waiters| waiters.iter().copied().collect())
             .unwrap_or_default()
     }
 
     pub(super) fn port_waiter_thread_ids(&self, port_object: ObjectKey) -> Vec<ThreadId> {
-        self.port_waiters
-            .get(&port_object)
+        Self::waiters(&self.port_waiters, port_object)
             .map(|waiters| waiters.iter().copied().collect())
             .unwrap_or_default()
     }
@@ -381,11 +402,7 @@ impl Kernel {
                     thread.pi_blocked_on = Some(key);
                 }
                 // PI: if the futex has a known owner, boost it if needed.
-                let waiter_weight = self
-                    .threads
-                    .get(&thread_id)
-                    .map(|t| t.weight)
-                    .unwrap_or(0);
+                let waiter_weight = self.threads.get(&thread_id).map(|t| t.weight).unwrap_or(0);
                 self.apply_pi_boost(owner_koid, waiter_weight);
             }
             WaitRegistration::VmFault { .. } => {}
@@ -800,7 +817,10 @@ impl Kernel {
             if let Some(owner) = self.threads.get_mut(&owner_tid) {
                 let old_weight = owner.weight;
                 owner.weight = base.max(max_waiter_weight);
-                (owner.weight != old_weight && owner.queued_on_cpu.is_some(), owner.queued_on_cpu)
+                (
+                    owner.weight != old_weight && owner.queued_on_cpu.is_some(),
+                    owner.queued_on_cpu,
+                )
             } else {
                 (false, None)
             }

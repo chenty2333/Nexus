@@ -16,8 +16,7 @@ const IOAPICVER: u32 = 0x01;
 const IOREDTBL_BASE: u32 = 0x10;
 
 /// Cached IOAPIC state.
-static IOAPIC_MAX_ENTRIES: core::sync::atomic::AtomicU8 =
-    core::sync::atomic::AtomicU8::new(0);
+static IOAPIC_MAX_ENTRIES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 static IOAPIC_INITIALIZED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

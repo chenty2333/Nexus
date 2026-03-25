@@ -3,7 +3,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use super::{is_page_aligned, ReverseMapAnchor, PAGE_SIZE};
+use super::{PAGE_SIZE, ReverseMapAnchor, is_page_aligned};
 
 /// Identifier for a registered physical frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -361,19 +361,17 @@ impl FrameTable {
 
     /// Snapshot the current descriptor state of one registered frame.
     pub fn state(&self, id: FrameId) -> Option<FrameDesc> {
-        self.frames
-            .get(&id)
-            .map(|frame| FrameDesc {
-                id: frame.id,
-                ref_count: frame.ref_count,
-                map_count: frame.map_count,
-                pin_count: frame.pin_count,
-                loan_count: frame.loan_count,
-                rmap_anchor: frame
-                    .rmap_head
-                    .and_then(|head| self.rmap_nodes.get(head).map(|node| node.anchor)),
-                rmap_anchor_count: frame.rmap_anchor_count,
-            })
+        self.frames.get(&id).map(|frame| FrameDesc {
+            id: frame.id,
+            ref_count: frame.ref_count,
+            map_count: frame.map_count,
+            pin_count: frame.pin_count,
+            loan_count: frame.loan_count,
+            rmap_anchor: frame
+                .rmap_head
+                .and_then(|head| self.rmap_nodes.get(head).map(|node| node.anchor)),
+            rmap_anchor_count: frame.rmap_anchor_count,
+        })
     }
 
     /// Return the full reverse-mapping anchor set for one frame.
@@ -618,8 +616,6 @@ impl FrameTable {
     }
 
     fn frame_mut(&mut self, id: FrameId) -> Result<&mut FrameDescRecord, FrameTableError> {
-        self.frames
-            .get_mut(&id)
-            .ok_or(FrameTableError::NotFound)
+        self.frames.get_mut(&id).ok_or(FrameTableError::NotFound)
     }
 }

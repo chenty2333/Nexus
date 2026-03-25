@@ -458,8 +458,8 @@ unsafe impl GlobalAlloc for BootstrapAllocator {
         // would be pushed onto the slab free-list, corrupting both allocators.
         if slab_enabled() {
             if let Some(class_idx) = slab_class_for(layout.size(), layout.align()) {
-                let in_late_heap = LATE_HEAP_ENABLED.load(Ordering::Acquire)
-                    && LATE_HEAP.lock().contains(ptr);
+                let in_late_heap =
+                    LATE_HEAP_ENABLED.load(Ordering::Acquire) && LATE_HEAP.lock().contains(ptr);
                 if !in_late_heap {
                     slab_dealloc(ptr, class_idx);
                     return;

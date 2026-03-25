@@ -4,7 +4,7 @@ use super::frame_table::{FrameId, FrameTableError};
 use super::pte_meta::PteMeta;
 use super::vma::{Vma, VmaLookup};
 use super::vmo::{GlobalVmoId, MapRec};
-use super::{align_down, PAGE_SIZE};
+use super::{PAGE_SIZE, align_down};
 
 /// Stable futex key derived from VMA metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

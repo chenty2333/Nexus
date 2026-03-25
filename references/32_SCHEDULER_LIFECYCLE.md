@@ -34,7 +34,7 @@ This file describes the current task-state, scheduler, kill, suspend, and reap b
   peer CPU when the creator CPU is currently busy.
 - `process_start()` and guest process-start now share the same narrow donation rule:
   - they still enqueue on the preferred / wake-affine CPU first
-  - but they may donate that brand-new queued child to an idle or hlt-blocked peer CPU when the
+  - but they may donate that brand-new queued child to a true-idle peer CPU when the
     donor would otherwise keep more than one runnable
 - Basic local time slicing and runtime accounting now exist, and the current L0 fairness /
   load-balance policy is now explicit rather than accidental.
@@ -60,7 +60,7 @@ This file describes the current task-state, scheduler, kill, suspend, and reap b
     eligible CPU instead
   - explicit brand-new `zx_thread_start()` may still spill to an already-idle peer CPU immediately
   - `process_start()` and guest process-start do not force immediate peer placement, but they may
-    donate the newly queued child to one idle / hlt-blocked peer under the same narrow donation path
+    donate the newly queued child to one true-idle peer under the same narrow donation path
 - Migration is queued-thread-only:
   - the scheduler may move one runnable thread from the donor run-queue tail to a receiver
   - the currently running thread is never migrated directly
@@ -218,8 +218,6 @@ The first "non-bootstrap substrate" scheduler contract is now implemented.
   The previous fixed-slice FIFO/RR policy has been replaced.
   such as weighted fairness, vruntime tracking, or EEVDF.
 - The receiver set for general runnable donation is still conservative:
-  - true-idle peers remain the preferred migration target
-  - one hlt-blocked peer CPU with an empty local run queue may also receive a donated brand-new child
-    so process-start does not depend on same-CPU handoff
+  - true-idle peers remain the migration target
 - The kernel still has no topology / NUMA-aware balancing layer.
 - L1 remains a documented contract boundary, not an implemented shared-VMO scheduler protocol yet.

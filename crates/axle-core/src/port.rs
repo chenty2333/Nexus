@@ -436,7 +436,8 @@ impl<Q: PacketQueue> PortState<Q> {
         if self.q.len() >= self.capacity {
             self.telemetry.user_should_wait_count =
                 self.telemetry.user_should_wait_count.saturating_add(1);
-            self.telemetry.user_full_hit_count = self.telemetry.user_full_hit_count.saturating_add(1);
+            self.telemetry.user_full_hit_count =
+                self.telemetry.user_full_hit_count.saturating_add(1);
             return Err(PortError::ShouldWait);
         }
         if self.q.push_back(pkt).is_err() {

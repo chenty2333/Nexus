@@ -1,4 +1,5 @@
 use super::*;
+use alloc::boxed::Box;
 
 static BOOTSTRAP_USER_RUNNER_SOURCE: Mutex<Option<PagerSourceHandle>> = Mutex::new(None);
 
@@ -508,7 +509,7 @@ impl Kernel {
                 koid: thread_koid,
                 guest_started: false,
                 guest_fs_base: 0,
-                fpu_state: crate::arch::fpu::clean_state(),
+                fpu_state: Box::new(crate::arch::fpu::clean_state()),
                 state: ThreadState::Runnable,
                 queued_on_cpu: None,
                 running_on_cpu: Some(bootstrap_cpu_id),

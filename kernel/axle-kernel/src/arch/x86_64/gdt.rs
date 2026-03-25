@@ -12,7 +12,9 @@ use raw_cpuid::CpuId;
 use spin::Once;
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::Segment;
-use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
+use x86_64::structures::gdt::{
+    Descriptor, DescriptorFlags, GlobalDescriptorTable, SegmentSelector,
+};
 use x86_64::structures::tss::TaskStateSegment;
 
 /// Segment selectors used by Axle.
@@ -26,6 +28,8 @@ pub struct Selectors {
     pub user_code: SegmentSelector,
     /// User data segment (Ring3).
     pub user_data: SegmentSelector,
+    /// User compatibility-mode code segment (Ring3).
+    pub user_compat_code: SegmentSelector,
     /// TSS segment.
     pub tss: SegmentSelector,
 }
@@ -138,6 +142,11 @@ fn init_cpu(cpu: usize, apic_id: usize) -> &'static Selectors {
         let mut gdt = GlobalDescriptorTable::new();
         let kernel_code = gdt.append(Descriptor::kernel_code_segment());
         let kernel_data = gdt.append(Descriptor::kernel_data_segment());
+        // Native `SYSRET` requires the ring3 segment layout:
+        //   compat code, user data, user 64-bit code
+        // in contiguous 8-byte slots.
+        let user_compat_code =
+            gdt.append(Descriptor::UserSegment(DescriptorFlags::USER_CODE32.bits()));
         let user_data = gdt.append(Descriptor::user_data_segment());
         let user_code = gdt.append(Descriptor::user_code_segment());
         let tss_sel = gdt.append(Descriptor::tss_segment(tss));
@@ -148,6 +157,7 @@ fn init_cpu(cpu: usize, apic_id: usize) -> &'static Selectors {
                 kernel_data,
                 user_code,
                 user_data,
+                user_compat_code,
                 tss: tss_sel,
             },
         )

@@ -2400,9 +2400,7 @@ fn decode_vmo_read(
         return Err(ZX_ERR_OUT_OF_RANGE);
     }
     let offset = args[2];
-    offset
-        .checked_add(len as u64)
-        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    offset.checked_add(len as u64).ok_or(ZX_ERR_OUT_OF_RANGE)?;
     let out = ctx.decode_user_write_bytes(ctx.arg_ptr::<u8>(args, 1), len)?;
     Ok(DecodedSyscall::new(
         VmoReadRequest {
@@ -2454,9 +2452,7 @@ fn decode_vmo_write(
         return Err(ZX_ERR_OUT_OF_RANGE);
     }
     let offset = args[2];
-    offset
-        .checked_add(len as u64)
-        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    offset.checked_add(len as u64).ok_or(ZX_ERR_OUT_OF_RANGE)?;
     let buffer = ctx.arg_const_ptr::<u8>(args, 1);
     if len != 0 && buffer.is_null() {
         return Err(ZX_ERR_INVALID_ARGS);
@@ -2765,9 +2761,7 @@ fn decode_vmar_map(
         _ => return Err(ZX_ERR_INVALID_ARGS),
     };
     let vmo_offset = args[4];
-    vmo_offset
-        .checked_add(len)
-        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+    vmo_offset.checked_add(len).ok_or(ZX_ERR_OUT_OF_RANGE)?;
     Ok(DecodedSyscall::new(
         VmarMapRequest {
             vmar: ctx.arg_handle(args, 0)?,

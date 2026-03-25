@@ -91,6 +91,10 @@ The bootstrap address space is prewired enough to exercise real VM behavior earl
 - Process creation can now be authorized in two narrow ways:
   - a parent process handle with `MANAGE_PROCESS`
   - a job handle with `MANAGE_JOB`
+- The same `MANAGE_*` family also authorizes the current lifecycle controls:
+  - `task_kill(process)` / `task_suspend(process)` use `MANAGE_PROCESS`
+  - `task_kill(thread)` / `task_suspend(thread)` use `MANAGE_THREAD`
+  - `task_kill(job)` / `task_suspend(job)` use `MANAGE_JOB`
 - The selected job becomes the child process's owner; it is not currently a VM inheritance
   mechanism.
 - `create_thread()` creates a `New` thread in a target process.

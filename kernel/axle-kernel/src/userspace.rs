@@ -906,6 +906,19 @@ static mut USER_SHARED_PAGES: [AlignedPage; USER_SHARED_PAGE_COUNT] =
     [AlignedPage([0; 4096]); USER_SHARED_PAGE_COUNT];
 static mut USER_STACK_PAGES: [AlignedPage; USER_STACK_PAGE_COUNT] =
     [AlignedPage([0; 4096]); USER_STACK_PAGE_COUNT];
+static USER_COPY_DEBUG_STAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static USER_COPY_DEBUG_DST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static USER_COPY_DEBUG_SRC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static USER_COPY_DEBUG_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn note_user_copy_debug(stage: u64, dst: u64, src: u64, len: usize) {
+    use core::sync::atomic::Ordering;
+
+    USER_COPY_DEBUG_STAGE.store(stage, Ordering::Release);
+    USER_COPY_DEBUG_DST.store(dst, Ordering::Release);
+    USER_COPY_DEBUG_SRC.store(src, Ordering::Release);
+    USER_COPY_DEBUG_LEN.store(len as u64, Ordering::Release);
+}
 
 /// Wrapper for page-table static storage accessed through raw pointers.
 /// Early bring-up is single-core; later mutations are serialized by the kernel's
@@ -921,21 +934,27 @@ unsafe impl<const N: usize> Sync for SyncPageTableArray<N> {}
 
 static USER_PD: SyncPageTable =
     SyncPageTable(core::cell::UnsafeCell::new(AlignedPageTable([0; 512])));
-static USER_PTS: SyncPageTableArray<BOOTSTRAP_USER_PT_COUNT> =
-    SyncPageTableArray(core::cell::UnsafeCell::new(
-        [AlignedPageTable([0; 512]); BOOTSTRAP_USER_PT_COUNT],
-    ));
+static USER_PTS: SyncPageTableArray<BOOTSTRAP_USER_PT_COUNT> = SyncPageTableArray(
+    core::cell::UnsafeCell::new([AlignedPageTable([0; 512]); BOOTSTRAP_USER_PT_COUNT]),
+);
+static KERNEL_IMAGE_PT: SyncPageTable =
+    SyncPageTable(core::cell::UnsafeCell::new(AlignedPageTable([0; 512])));
 
 // PVH boot page tables (identity-mapped, used as the active CR3).
 unsafe extern "C" {
     static mut pvh_pml4: [u64; 512];
     static mut pvh_pdpt: [u64; 512];
+    static mut pvh_pd: [u64; 512];
 }
 
 // Page table flag bits (x86_64).
 const PTE_P: u64 = 1 << 0;
 const PTE_W: u64 = 1 << 1;
 const PTE_U: u64 = 1 << 2;
+const PTE_PS: u64 = 1 << 7;
+const PAGE_BYTES_4K: u64 = 4096;
+const PAGE_BYTES_2M: u64 = 2 * 1024 * 1024;
+const KERNEL_IMAGE_PT_INDEX: usize = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct UserPageFrame {
@@ -1031,7 +1050,18 @@ pub(crate) fn alloc_bootstrap_zeroed_pages(page_count: usize) -> Option<u64> {
     if page_count == 0 {
         return None;
     }
-    crate::pmm::alloc_zeroed_pages(page_count)
+    let paddr = crate::pmm::alloc_zeroed_pages(page_count);
+    if paddr.is_none() {
+        let stats = crate::pmm::stats();
+        crate::kprintln!(
+            "userspace: alloc_bootstrap_zeroed_pages failed pages={} free_bytes={} capacity_bytes={} alloc_failures={}",
+            page_count,
+            stats.free_bytes,
+            stats.capacity_bytes,
+            stats.alloc_fail_count
+        );
+    }
+    paddr
 }
 
 pub(crate) fn free_bootstrap_page(paddr: u64) {
@@ -1181,8 +1211,37 @@ fn map_userspace_pages() {
         }
     }
 
+    fn protect_kernel_image_region() {
+        let region_base = (KERNEL_IMAGE_PT_INDEX as u64) * PAGE_BYTES_2M;
+
+        // SAFETY: early bring-up is single-core and this helper only replaces one bootstrap
+        // kernel huge-page mapping with an equivalent 4 KiB page table view covering the same
+        // 2 MiB range. The physical addresses remain identity-mapped and present.
+        unsafe {
+            let kernel_pt = KERNEL_IMAGE_PT.0.get() as *mut u64;
+            for entry_index in 0..512 {
+                let page_base = region_base + (entry_index as u64) * PAGE_BYTES_4K;
+                core::ptr::write_volatile(kernel_pt.add(entry_index), page_base | PTE_P);
+            }
+
+            let pd = core::ptr::addr_of_mut!(pvh_pd).cast::<u64>();
+            let current = core::ptr::read_volatile(pd.add(KERNEL_IMAGE_PT_INDEX));
+            debug_assert_ne!(
+                current & PTE_PS,
+                0,
+                "bootstrap kernel image range should start as a 2 MiB mapping"
+            );
+            core::ptr::write_volatile(
+                pd.add(KERNEL_IMAGE_PT_INDEX),
+                phys_of(KERNEL_IMAGE_PT.0.get() as *const AlignedPageTable) | PTE_P,
+            );
+        }
+    }
+
     // SAFETY: early bring-up is single-core; page table mutation is serialized.
     unsafe {
+        protect_kernel_image_region();
+
         let pml4 = core::ptr::addr_of_mut!(pvh_pml4).cast::<u64>();
         let pdpt = core::ptr::addr_of_mut!(pvh_pdpt).cast::<u64>();
         let user_pd = USER_PD.0.get() as *mut u64;
@@ -1658,11 +1717,13 @@ pub(crate) fn write_validated_user_bytes(ptr: u64, src: &[u8]) {
     if src.is_empty() {
         return;
     }
+    note_user_copy_debug(1, ptr, src.as_ptr() as u64, src.len());
     unsafe {
         // SAFETY: callers validate the current-process user range and make it resident before
         // calling this helper. `src` is a valid readable kernel slice for `src.len()` bytes.
         core::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, src.len());
     }
+    note_user_copy_debug(2, ptr, src.as_ptr() as u64, src.len());
 }
 
 /// Zero-fill a validated and resident current-process user range.
@@ -1856,33 +1917,6 @@ pub(crate) fn bootstrap_trace_phase() -> u64 {
 pub(crate) fn bootstrap_trace_dump_full() -> bool {
     // SAFETY: SLOT_TRACE_DUMP_FULL < SHARED_SLOT_COUNT.
     unsafe { shared_slot_read(SLOT_TRACE_DUMP_FULL) != 0 }
-}
-
-pub(crate) fn component_summary_snapshot() -> Option<(u64, i64, i64, i64, i64, i64)> {
-    // SAFETY: all slot indices < SHARED_SLOT_COUNT.
-    let failure_step = unsafe { shared_slot_read(SLOT_COMPONENT_FAILURE_STEP) };
-    let resolve_root = unsafe { shared_slot_read(SLOT_COMPONENT_RESOLVE_ROOT) } as i64;
-    let provider_launch = unsafe { shared_slot_read(SLOT_COMPONENT_PROVIDER_LAUNCH) } as i64;
-    let client_launch = unsafe { shared_slot_read(SLOT_COMPONENT_CLIENT_LAUNCH) } as i64;
-    let stop_request = unsafe { shared_slot_read(SLOT_COMPONENT_STOP_REQUEST) } as i64;
-    let kill_request = unsafe { shared_slot_read(SLOT_COMPONENT_KILL_REQUEST) } as i64;
-    if failure_step == 0
-        && resolve_root == 0
-        && provider_launch == 0
-        && client_launch == 0
-        && stop_request == 0
-        && kill_request == 0
-    {
-        return None;
-    }
-    Some((
-        failure_step,
-        resolve_root,
-        provider_launch,
-        client_launch,
-        stop_request,
-        kill_request,
-    ))
 }
 
 fn perf_summary_present(slots: &[u64]) -> bool {
@@ -2480,7 +2514,7 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
         let provider_output_preview =
             core::str::from_utf8(&provider_output_preview[..provider_output_len]).unwrap_or("");
         crate::kprintln!(
-            "userspace: conformance reported failure (ok=0, trap_rax={}, trap_rbx={:#x}, trap_rcx={:#x}, unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, queue={}, wait={}, port_wait_readable={}, port_wait_readable_observed={}, t0_ns={}, tx=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}], rx=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}], component_failure_step={}, provider_stage={}, provider_status={}, client_stage={}, client_status={}, provider_event_read={}, provider_event_code={}, client_event_read={}, client_event_code={}, stop_request={}, stop_event_read={}, stop_event_code={}, stop_wait_observed={}, kill_request={}, kill_event_read={}, kill_event_code={}, kill_wait_observed={}, provider_output_len={}, provider_output_preview=\"{}\")",
+            "userspace: conformance reported failure (ok=0, trap_rax={}, trap_rbx={:#x}, trap_rcx={:#x}, unknown={}, close_invalid={}, port_create_bad_opts={}, port_create_null_out={}, queue={}, wait={}, port_wait_readable={}, port_wait_readable_observed={}, t0_ns={}, tx=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}], rx=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}], component_failure_step={}, resolve_root={}, resolve_provider={}, resolve_client={}, provider_outgoing_pair={}, provider_launch={}, client_route={}, client_launch={}, provider_stage={}, provider_status={}, client_stage={}, client_status={}, provider_event_read={}, provider_event_code={}, client_event_read={}, client_event_code={}, stop_request={}, stop_event_read={}, stop_event_code={}, stop_wait_observed={}, kill_request={}, kill_event_read={}, kill_event_code={}, kill_wait_observed={}, provider_output_len={}, provider_output_preview=\"{}\")",
             trap_rax,
             trap_rbx,
             trap_rip,
@@ -2506,6 +2540,13 @@ pub fn on_breakpoint(frame: *const crate::arch::int80::TrapFrame) -> ! {
             slots[660],
             slots[661],
             slots[SLOT_COMPONENT_FAILURE_STEP],
+            slots[SLOT_COMPONENT_RESOLVE_ROOT] as i64,
+            slots[SLOT_COMPONENT_RESOLVE_PROVIDER] as i64,
+            slots[SLOT_COMPONENT_RESOLVE_CLIENT] as i64,
+            slots[SLOT_COMPONENT_PROVIDER_OUTGOING_PAIR] as i64,
+            slots[SLOT_COMPONENT_PROVIDER_LAUNCH] as i64,
+            slots[SLOT_COMPONENT_CLIENT_ROUTE] as i64,
+            slots[SLOT_COMPONENT_CLIENT_LAUNCH] as i64,
             slots[SLOT_COMPONENT_PROVIDER_STAGE],
             slots[SLOT_COMPONENT_PROVIDER_STATUS] as i64,
             slots[SLOT_COMPONENT_CLIENT_STAGE],
@@ -3127,36 +3168,66 @@ pub fn prepare() -> u64 {
         for i in 0..=SLOT_MAX {
             shared_slot_write(i, 0);
         }
-        shared_slot_write(SLOT_ROOT_VMAR_H, crate::object::vm::bootstrap_root_vmar_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_SELF_THREAD_H,
-            crate::object::process::bootstrap_self_thread_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_SELF_THREAD_KOID,
-            crate::object::process::bootstrap_self_thread_koid().unwrap_or(0));
-        shared_slot_write(SLOT_SELF_PROCESS_H,
-            crate::object::process::bootstrap_self_process_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_SELF_JOB_H,
-            crate::object::process::bootstrap_self_job_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_SELF_CODE_VMO_H,
-            crate::object::vm::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H,
-            crate::object::vm::bootstrap_echo_provider_code_vmo_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H,
-            crate::object::vm::bootstrap_echo_client_code_vmo_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H,
-            crate::object::vm::bootstrap_controller_worker_code_vmo_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_BOOT_IMAGE_STARNIX_KERNEL_VMO_H,
-            crate::object::vm::bootstrap_starnix_kernel_code_vmo_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_BOOT_IMAGE_LINUX_HELLO_VMO_H,
-            crate::object::vm::bootstrap_linux_hello_code_vmo_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_BOOTSTRAP_NET_PCI_DEVICE_H,
-            crate::object::device::bootstrap_net_pci_device_handle().unwrap_or(0) as u64);
-        shared_slot_write(SLOT_REAL_NET_PCI_DEVICE_H,
-            crate::object::device::bootstrap_real_net_pci_device_handle().unwrap_or(0) as u64);
+        shared_slot_write(
+            SLOT_ROOT_VMAR_H,
+            crate::object::vm::bootstrap_root_vmar_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_SELF_THREAD_H,
+            crate::object::process::bootstrap_self_thread_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_SELF_THREAD_KOID,
+            crate::object::process::bootstrap_self_thread_koid().unwrap_or(0),
+        );
+        shared_slot_write(
+            SLOT_SELF_PROCESS_H,
+            crate::object::process::bootstrap_self_process_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_SELF_JOB_H,
+            crate::object::process::bootstrap_self_job_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_SELF_CODE_VMO_H,
+            crate::object::vm::bootstrap_self_code_vmo_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_BOOT_IMAGE_ECHO_PROVIDER_VMO_H,
+            crate::object::vm::bootstrap_echo_provider_code_vmo_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_BOOT_IMAGE_ECHO_CLIENT_VMO_H,
+            crate::object::vm::bootstrap_echo_client_code_vmo_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_BOOT_IMAGE_CONTROLLER_WORKER_VMO_H,
+            crate::object::vm::bootstrap_controller_worker_code_vmo_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_BOOT_IMAGE_STARNIX_KERNEL_VMO_H,
+            crate::object::vm::bootstrap_starnix_kernel_code_vmo_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_BOOT_IMAGE_LINUX_HELLO_VMO_H,
+            crate::object::vm::bootstrap_linux_hello_code_vmo_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_BOOTSTRAP_NET_PCI_DEVICE_H,
+            crate::object::device::bootstrap_net_pci_device_handle().unwrap_or(0) as u64,
+        );
+        shared_slot_write(
+            SLOT_REAL_NET_PCI_DEVICE_H,
+            crate::object::device::bootstrap_real_net_pci_device_handle().unwrap_or(0) as u64,
+        );
     }
     crate::trace::init_bootstrap_trace();
     // SAFETY: slot indices < SHARED_SLOT_COUNT and no concurrent writers during prepare().
     unsafe {
-        shared_slot_write(SLOT_TRACE_VMO_H, u64::from(crate::trace::bootstrap_trace_vmo_handle()));
+        shared_slot_write(
+            SLOT_TRACE_VMO_H,
+            u64::from(crate::trace::bootstrap_trace_vmo_handle()),
+        );
         shared_slot_write(SLOT_TRACE_PHASE, 0);
         shared_slot_write(SLOT_TRACE_DUMP_FULL, 0);
     }

@@ -52,9 +52,13 @@ axle_native_syscall_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
-    lea rsi, [rsp + 15*8]
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
+    lea rsi, [rbx + 15*8]
     call {rust_handler}
+    mov rsp, rbx
     test rax, rax
     jnz .Lnative_sysret
 
@@ -123,25 +127,21 @@ pub fn init_cpu() {
     let selectors = crate::arch::gdt::init();
 
     // SYSRET requires that the GDT segment layout is exactly:
-    //   SYSRET_CS_BASE + 0  = compatibility-mode code (unused on pure-64)
+    //   SYSRET_CS_BASE + 0  = compatibility-mode code
     //   SYSRET_CS_BASE + 8  = user data segment
     //   SYSRET_CS_BASE + 16 = user 64-bit code segment
-    // Verify the user_data and user_code selectors match this expected layout
-    // relative to each other.
     assert!(
-        selectors.user_code.0 == selectors.user_data.0 + 8,
-        "sysret: user_code selector must be exactly 8 bytes above user_data selector \
-         (user_code={:#x}, user_data={:#x})",
-        selectors.user_code.0,
+        selectors.user_compat_code.0 + 8 == selectors.user_data.0
+            && selectors.user_compat_code.0 + 16 == selectors.user_code.0,
+        "sysret: unexpected ring3 selector layout \
+         (compat={:#x}, user_data={:#x}, user_code={:#x})",
+        selectors.user_compat_code.0,
         selectors.user_data.0,
+        selectors.user_code.0,
     );
 
-    let sysret_cs = selectors
-        .user_code
-        .0
-        .checked_sub(16)
-        .expect("sysret cs selector must sit 16 bytes below user code selector");
-    let star = (u64::from(sysret_cs) << 48) | (u64::from(selectors.kernel_code.0) << 32);
+    let star = (u64::from(selectors.user_compat_code.0) << 48)
+        | (u64::from(selectors.kernel_code.0) << 32);
     let fmask = RFLAGS_IF | RFLAGS_DF;
 
     // SAFETY: these MSRs are programmed once per CPU after GDT/per-CPU setup.
@@ -162,7 +162,8 @@ extern "C" fn axle_native_syscall_rust(
     cpu_frame: *const u64,
 ) -> u64 {
     crate::trace::record_sys_native_enter(frame.syscall_nr());
-    crate::syscall::invoke_from_native_syscall(frame, cpu_frame)
+    let ret = crate::syscall::invoke_from_native_syscall(frame, cpu_frame);
+    ret
 }
 
 fn is_canonical_user_addr(addr: u64) -> bool {

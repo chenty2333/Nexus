@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1566,7 +1567,7 @@ struct Thread {
     koid: zx_koid_t,
     guest_started: bool,
     guest_fs_base: u64,
-    fpu_state: crate::arch::fpu::FpuState,
+    fpu_state: Box<crate::arch::fpu::FpuState>,
     state: ThreadState,
     queued_on_cpu: Option<usize>,
     /// CPU this thread is currently running on (set by `activate_thread_on_current_cpu`,
@@ -3446,12 +3447,22 @@ impl VmDomain {
         page_base: u64,
         for_write: bool,
     ) -> bool {
-        self.address_spaces
-            .get(&address_space_id)
-            .and_then(|space| space.lookup_user_mapping(page_base, 1))
-            .and_then(|lookup| lookup.frame_id().map(|frame_id| (lookup, frame_id)))
-            .map(|(lookup, _)| !for_write || lookup.perms().contains(MappingPerms::WRITE))
-            .unwrap_or(false)
+        let Some(space) = self.address_spaces.get(&address_space_id) else {
+            return false;
+        };
+        let Some(lookup) = space.lookup_user_mapping(page_base, 1) else {
+            return false;
+        };
+        if lookup.frame_id().is_none() {
+            return false;
+        }
+        if !for_write {
+            return true;
+        }
+        let Some(meta) = space.page_meta(page_base) else {
+            return false;
+        };
+        lookup.perms().contains(MappingPerms::WRITE) && !meta.cow_shared()
     }
 
     fn build_copy_on_write_plan(

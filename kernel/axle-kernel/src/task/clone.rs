@@ -39,7 +39,7 @@ impl VmDomain {
             return Ok(Vec::new());
         }
 
-        for plan in &plans {
+        for plan in plans.iter() {
             match plan.clone_policy {
                 MappingClonePolicy::None => {}
                 MappingClonePolicy::SharedAlias => self.apply_shared_alias_clone(

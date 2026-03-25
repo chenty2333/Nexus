@@ -91,7 +91,6 @@ bitflags! {
     }
 }
 
-
 const VA_MAGAZINE_BYTES: u64 = 0x20_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

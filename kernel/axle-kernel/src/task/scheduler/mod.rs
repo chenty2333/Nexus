@@ -14,6 +14,7 @@ pub(super) struct CpuSchedulerState {
     run_queue: VecDeque<ThreadId>,
     current_thread_id: Option<ThreadId>,
     reschedule_requested: bool,
+    pending_direct_handoff: Option<ThreadId>,
     current_runtime_started_ns: Option<i64>,
     slice_deadline_ns: Option<i64>,
     last_rebalance_ns: Option<i64>,
@@ -28,6 +29,7 @@ impl CpuSchedulerState {
             run_queue: VecDeque::new(),
             current_thread_id: Some(thread_id),
             reschedule_requested: false,
+            pending_direct_handoff: None,
             current_runtime_started_ns: Some(now),
             slice_deadline_ns: now.checked_add(DEFAULT_TIME_SLICE_NS),
             last_rebalance_ns: Some(now),
@@ -62,7 +64,8 @@ impl Kernel {
     }
 
     pub(super) fn maybe_nudge_idle_stealer(&mut self, donor_cpu_id: usize) {
-        if self.cpu_runnable_load(donor_cpu_id) <= 1 {
+        let donor_load = self.cpu_runnable_load(donor_cpu_id);
+        if donor_load <= 1 {
             return;
         }
         let Some(idle_cpu_id) = self.donation_receiver_cpu_excluding(donor_cpu_id) else {
@@ -83,8 +86,18 @@ impl Kernel {
     pub(super) fn request_reschedule_on_cpu(&mut self, cpu_id: usize) {
         self.cpu_scheduler_mut(cpu_id).reschedule_requested = true;
         if cpu_id != self.current_cpu_id() && self.cpu_is_online(cpu_id) {
-            crate::arch::ipi::send_reschedule(cpu_id);
+            if let Some(apic_id) = crate::smp::apic_id_for_cpu_slot(cpu_id) {
+                crate::arch::ipi::send_reschedule(apic_id);
+            }
         }
+    }
+
+    pub(super) fn note_direct_handoff_candidate(&mut self, cpu_id: usize, thread_id: ThreadId) {
+        self.cpu_scheduler_mut(cpu_id).pending_direct_handoff = Some(thread_id);
+    }
+
+    pub(super) fn take_pending_direct_handoff(&mut self, cpu_id: usize) -> Option<ThreadId> {
+        self.cpu_scheduler_mut(cpu_id).pending_direct_handoff.take()
     }
 
     pub(super) fn take_reschedule_requested(&mut self, cpu_id: usize) -> bool {
@@ -204,8 +217,7 @@ impl Kernel {
                 .map(|t| t.weight)
                 .unwrap_or(1024);
             let slice_ns = Self::compute_slice_ns(weight);
-            self.current_cpu_scheduler_mut().slice_deadline_ns =
-                now.checked_add(slice_ns);
+            self.current_cpu_scheduler_mut().slice_deadline_ns = now.checked_add(slice_ns);
             self.request_reschedule_on_cpu(self.current_cpu_id());
         }
         Ok(())
@@ -267,6 +279,27 @@ impl Kernel {
             if thread.vruntime < floor {
                 thread.vruntime = floor;
             }
+        }
+    }
+
+    /// Prepare one blocked-wake / handoff enqueue so it wins one immediate pick on the
+    /// destination CPU instead of being buried behind a long-running spinner.
+    pub(in crate::task) fn prepare_enqueue_eevdf_handoff(
+        &mut self,
+        thread_id: ThreadId,
+        cpu_id: usize,
+    ) {
+        let min_vruntime = self
+            .cpu_schedulers
+            .get(&cpu_id)
+            .map(|sched| sched.min_vruntime)
+            .unwrap_or(0);
+        if let Some(thread) = self.threads.get_mut(&thread_id) {
+            let slice = DEFAULT_TIME_SLICE_NS;
+            let weighted_slice = slice * 1024 / thread.weight.max(1) as i64;
+            thread.eligible_time = min_vruntime;
+            thread.vruntime = min_vruntime.saturating_sub(weighted_slice);
+            thread.vdeadline = min_vruntime.saturating_sub(1);
         }
     }
 

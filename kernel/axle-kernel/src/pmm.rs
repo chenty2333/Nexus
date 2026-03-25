@@ -66,15 +66,14 @@ impl PerCpuPageCache {
 
 const MAX_CPUS: usize = crate::arch::MAX_CPUS;
 
-static PER_CPU_CACHES: [Mutex<PerCpuPageCache>; MAX_CPUS] = [const { Mutex::new(PerCpuPageCache::new()) }; MAX_CPUS];
+static PER_CPU_CACHES: [Mutex<PerCpuPageCache>; MAX_CPUS] =
+    [const { Mutex::new(PerCpuPageCache::new()) }; MAX_CPUS];
 
 /// Return the logical CPU slot for the current processor, clamped to the
 /// `PER_CPU_CACHES` array bounds. Before per-CPU init this returns 0, which
 /// is the BSP — still correct (just a shared cache).
 fn current_cpu_index() -> usize {
-    crate::arch::percpu::try_current_cpu_slot()
-        .unwrap_or(0)
-        % MAX_CPUS
+    crate::arch::percpu::try_current_cpu_slot().unwrap_or(0) % MAX_CPUS
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +323,10 @@ fn alloc_single_page_cached() -> Option<u64> {
 
 pub(crate) fn alloc_zeroed_pages(page_count: usize) -> Option<u64> {
     let paddr = alloc_pages(page_count)?;
-    let bytes = match PAGE_BYTES.checked_mul(page_count as u64).and_then(|b| usize::try_from(b).ok()) {
+    let bytes = match PAGE_BYTES
+        .checked_mul(page_count as u64)
+        .and_then(|b| usize::try_from(b).ok())
+    {
         Some(b) => b,
         None => {
             // Allocation succeeded but size conversion failed; free to avoid leak.

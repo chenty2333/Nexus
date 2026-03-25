@@ -1,5 +1,6 @@
 use super::*;
 use alloc::vec;
+use alloc::vec::Vec;
 use axle_types::interrupt::{
     AX_INTERRUPT_MODE_LEGACY, AX_INTERRUPT_MODE_MSI, AX_INTERRUPT_MODE_MSIX,
     AX_INTERRUPT_MODE_VIRTUAL,
@@ -16,7 +17,8 @@ use axle_types::pci::{
     ax_pci_interrupt_info_t, ax_pci_interrupt_mode_info_t, ax_pci_resource_info_t,
 };
 use axle_types::status::{
-    ZX_ERR_BAD_HANDLE, ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_ERR_WRONG_TYPE,
+    ZX_ERR_BAD_HANDLE, ZX_ERR_NO_MEMORY, ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE,
+    ZX_ERR_WRONG_TYPE,
 };
 use axle_virtio_transport::VirtioPciDiscovery;
 
@@ -118,27 +120,23 @@ fn write_notify_cap(
     write_u32_le(bytes, offset + 16, BOOTSTRAP_NET_NOTIFY_MULTIPLIER);
 }
 
-fn build_bootstrap_net_config_space(bar0_paddr: u64) -> [u8; BOOTSTRAP_NET_CONFIG_BYTES as usize] {
-    let mut bytes = [0u8; BOOTSTRAP_NET_CONFIG_BYTES as usize];
-    write_u16_le(&mut bytes, PCI_VENDOR_ID_OFF, BOOTSTRAP_NET_VENDOR_ID);
-    write_u16_le(&mut bytes, PCI_DEVICE_ID_OFF, BOOTSTRAP_NET_DEVICE_ID);
-    write_u16_le(&mut bytes, PCI_COMMAND_OFF, 0x0006);
-    write_u16_le(
-        &mut bytes,
-        PCI_STATUS_OFF,
-        BOOTSTRAP_NET_PCI_STATUS_CAP_LIST,
-    );
+fn write_bootstrap_net_config_space(bytes: &mut [u8], bar0_paddr: u64) {
+    assert_eq!(bytes.len(), BOOTSTRAP_NET_CONFIG_BYTES as usize);
+    write_u16_le(bytes, PCI_VENDOR_ID_OFF, BOOTSTRAP_NET_VENDOR_ID);
+    write_u16_le(bytes, PCI_DEVICE_ID_OFF, BOOTSTRAP_NET_DEVICE_ID);
+    write_u16_le(bytes, PCI_COMMAND_OFF, 0x0006);
+    write_u16_le(bytes, PCI_STATUS_OFF, BOOTSTRAP_NET_PCI_STATUS_CAP_LIST);
     bytes[PCI_REVISION_ID_OFF] = 0;
     bytes[PCI_PROG_IF_OFF] = 0;
     bytes[PCI_SUBCLASS_OFF] = BOOTSTRAP_NET_SUBCLASS_ETHERNET;
     bytes[PCI_CLASS_CODE_OFF] = BOOTSTRAP_NET_CLASS_CODE;
     bytes[PCI_HEADER_TYPE_OFF] = 0;
-    write_u32_le(&mut bytes, PCI_BAR0_OFF, (bar0_paddr as u32) & !0xf);
+    write_u32_le(bytes, PCI_BAR0_OFF, (bar0_paddr as u32) & !0xf);
     bytes[PCI_CAP_PTR_OFF] = BOOTSTRAP_NET_CONFIG_CAP_PTR as u8;
     bytes[PCI_INTERRUPT_PIN_OFF] = 1;
 
     write_virtio_cap(
-        &mut bytes,
+        bytes,
         CAP_COMMON_OFF,
         CAP_NOTIFY_OFF as u8,
         BOOTSTRAP_NET_VIRTIO_CAP_COMMON_CFG,
@@ -147,7 +145,7 @@ fn build_bootstrap_net_config_space(bar0_paddr: u64) -> [u8; BOOTSTRAP_NET_CONFI
         BOOTSTRAP_NET_COMMON_CFG_BYTES,
     );
     write_notify_cap(
-        &mut bytes,
+        bytes,
         CAP_NOTIFY_OFF,
         CAP_ISR_OFF as u8,
         0,
@@ -155,7 +153,7 @@ fn build_bootstrap_net_config_space(bar0_paddr: u64) -> [u8; BOOTSTRAP_NET_CONFI
         BOOTSTRAP_NET_NOTIFY_CFG_BYTES,
     );
     write_virtio_cap(
-        &mut bytes,
+        bytes,
         CAP_ISR_OFF,
         CAP_DEVICE_OFF as u8,
         BOOTSTRAP_NET_VIRTIO_CAP_ISR_CFG,
@@ -164,7 +162,7 @@ fn build_bootstrap_net_config_space(bar0_paddr: u64) -> [u8; BOOTSTRAP_NET_CONFI
         BOOTSTRAP_NET_ISR_CFG_BYTES,
     );
     write_virtio_cap(
-        &mut bytes,
+        bytes,
         CAP_DEVICE_OFF,
         0,
         BOOTSTRAP_NET_VIRTIO_CAP_DEVICE_CFG,
@@ -173,21 +171,20 @@ fn build_bootstrap_net_config_space(bar0_paddr: u64) -> [u8; BOOTSTRAP_NET_CONFI
         BOOTSTRAP_NET_DEVICE_CFG_BYTES,
     );
     write_u16_le(
-        &mut bytes,
+        bytes,
         BOOTSTRAP_NET_DEVICE_CFG_OFFSET as usize,
         BOOTSTRAP_NET_QUEUE_PAIR_COUNT as u16,
     );
     write_u16_le(
-        &mut bytes,
+        bytes,
         BOOTSTRAP_NET_DEVICE_CFG_OFFSET as usize + 2,
         BOOTSTRAP_NET_QUEUE_SIZE as u16,
     );
     write_u32_le(
-        &mut bytes,
+        bytes,
         BOOTSTRAP_NET_DEVICE_CFG_OFFSET as usize + 4,
         BOOTSTRAP_NET_DEVICE_FEATURES,
     );
-    bytes
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -489,7 +486,12 @@ pub(crate) fn seed_bootstrap_net_pci_device(state: &KernelState) -> Result<(), z
     )?;
     let bar0_backing_vmo = lookup_vmo_object(state, bar0_backing_object)?;
     let bar0_paddr = state.with_vm_mut(|vm| vm.lookup_vmo_paddr(&bar0_backing_vmo, 0))?;
-    let config_bytes = build_bootstrap_net_config_space(bar0_paddr);
+    let mut config_bytes = Vec::new();
+    config_bytes
+        .try_reserve_exact(BOOTSTRAP_NET_CONFIG_BYTES as usize)
+        .map_err(|_| ZX_ERR_NO_MEMORY)?;
+    config_bytes.resize(BOOTSTRAP_NET_CONFIG_BYTES as usize, 0);
+    write_bootstrap_net_config_space(&mut config_bytes, bar0_paddr);
     state.with_vm_mut(|vm| vm.write_vmo_bytes(&config_backing_vmo, 0, &config_bytes))?;
     let config_paddr = state.with_vm_mut(|vm| vm.lookup_vmo_paddr(&config_backing_vmo, 0))?;
     let config_object = create_global_vmo_object(

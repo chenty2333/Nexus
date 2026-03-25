@@ -7,6 +7,10 @@ core::arch::global_asm!(
     .global axle_breakpoint_entry
     .type axle_breakpoint_entry, @function
 axle_breakpoint_entry:
+    test QWORD PTR [rsp + 8], 3
+    jz .Lbreakpoint_no_swapgs_entry
+    swapgs
+.Lbreakpoint_no_swapgs_entry:
     // Save the same register snapshot layout as the int80 trap frame.
     push r15
     push r14
@@ -24,8 +28,12 @@ axle_breakpoint_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
     call {rust_handler}
+    mov rsp, rbx
 
     // If the Rust handler returns, restore context and continue.
     mov rax, [rsp + 0]
@@ -44,6 +52,10 @@ axle_breakpoint_entry:
     pop r13
     pop r14
     pop r15
+    test QWORD PTR [rsp + 8], 3
+    jz .Lbreakpoint_no_swapgs_exit
+    swapgs
+.Lbreakpoint_no_swapgs_exit:
     iretq
     .size axle_breakpoint_entry, .-axle_breakpoint_entry
     "#,

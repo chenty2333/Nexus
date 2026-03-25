@@ -45,6 +45,10 @@ core::arch::global_asm!(
     .global \name
     .type \name, @function
 \name:
+    test QWORD PTR [rsp + 8], 3
+    jz .L\name\()_no_swapgs_entry
+    swapgs
+.L\name\()_no_swapgs_entry:
     push r15
     push r14
     push r13
@@ -61,8 +65,12 @@ core::arch::global_asm!(
     push rdi
     push rax
 
-    mov rdi, rsp
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
     call \rust
+    mov rsp, rbx
 
     mov rax, [rsp + 0]
     add rsp, 8
@@ -80,6 +88,10 @@ core::arch::global_asm!(
     pop r13
     pop r14
     pop r15
+    test QWORD PTR [rsp + 8], 3
+    jz .L\name\()_no_swapgs_exit
+    swapgs
+.L\name\()_no_swapgs_exit:
     iretq
     .size \name, .-\name
     .endm
@@ -90,6 +102,10 @@ core::arch::global_asm!(
     .global axle_ipi_reschedule_entry
     .type axle_ipi_reschedule_entry, @function
 axle_ipi_reschedule_entry:
+    test QWORD PTR [rsp + 8], 3
+    jz .Lipi_reschedule_no_swapgs_entry
+    swapgs
+.Lipi_reschedule_no_swapgs_entry:
     push r15
     push r14
     push r13
@@ -106,9 +122,13 @@ axle_ipi_reschedule_entry:
     push rdi
     push rax
 
-    mov rdi, rsp
-    lea rsi, [rsp + 15*8]
+    mov rbx, rsp
+    sub rsp, 8
+    and rsp, -16
+    mov rdi, rbx
+    lea rsi, [rbx + 15*8]
     call {rust_resched}
+    mov rsp, rbx
 
     mov rax, [rsp + 0]
     add rsp, 8
@@ -126,6 +146,10 @@ axle_ipi_reschedule_entry:
     pop r13
     pop r14
     pop r15
+    test QWORD PTR [rsp + 8], 3
+    jz .Lipi_reschedule_no_swapgs_exit
+    swapgs
+.Lipi_reschedule_no_swapgs_exit:
     iretq
     .size axle_ipi_reschedule_entry, .-axle_ipi_reschedule_entry
     "#,

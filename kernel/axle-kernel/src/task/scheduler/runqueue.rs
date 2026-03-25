@@ -63,11 +63,8 @@ impl Kernel {
 
     /// Enqueue a thread with handoff priority.
     ///
-    /// Under EEVDF scheduling this still uses `push_back` like the normal
-    /// enqueue path because pick-next selects by smallest eligible vdeadline,
-    /// not by queue position.  The "front" name is retained for API stability
-    /// and telemetry distinction (blocked-current resume path), not for
-    /// ordering semantics.
+    /// Under EEVDF this is expressed through a more urgent eligible/deadline
+    /// pair rather than physical queue position.
     pub(crate) fn enqueue_runnable_thread_front_on_cpu(
         &mut self,
         thread_id: ThreadId,
@@ -90,8 +87,9 @@ impl Kernel {
             thread.remote_wake_target_cpu = None;
         }
         let _ = thread;
-        // EEVDF: prepare scheduling parameters before enqueue
-        self.prepare_enqueue_eevdf(thread_id, cpu_id);
+        // EEVDF: give blocked wake / handoff paths one urgent pick on the
+        // destination CPU instead of queue-ordering semantics.
+        self.prepare_enqueue_eevdf_handoff(thread_id, cpu_id);
         self.cpu_scheduler_mut(cpu_id)
             .run_queue
             .push_back(thread_id);
@@ -272,8 +270,22 @@ impl Kernel {
     ///
     /// Called when a thread transitions to a non-runnable state (e.g. Suspended)
     /// so the run queue length accurately reflects the number of runnable threads.
-    pub(in crate::task) fn remove_thread_from_run_queue(&mut self, thread_id: ThreadId, cpu_id: usize) {
+    pub(in crate::task) fn remove_thread_from_run_queue(
+        &mut self,
+        thread_id: ThreadId,
+        cpu_id: usize,
+    ) {
         let scheduler = self.cpu_scheduler_mut(cpu_id);
+        let original_len = scheduler.run_queue.len();
         scheduler.run_queue.retain(|&id| id != thread_id);
+        let removed = scheduler.run_queue.len() != original_len;
+        if removed {
+            if let Some(thread) = self.threads.get_mut(&thread_id)
+                && thread.queued_on_cpu == Some(cpu_id)
+            {
+                thread.queued_on_cpu = None;
+            }
+            self.note_run_queue_depth(thread_id, cpu_id, RQ_DEPTH_DEQUEUE_LOCAL);
+        }
     }
 }

@@ -92,12 +92,7 @@ pub fn init(
         idt[3] = IdtEntry::new(breakpoint_handler, selector, user_callable_int_gate, 0);
         // #UD does not need its own IST -- it is a non-nesting fault and can use
         // the interrupted kernel stack safely.
-        idt[6] = IdtEntry::new(
-            invalid_opcode_handler,
-            selector,
-            kernel_int_gate,
-            0,
-        );
+        idt[6] = IdtEntry::new(invalid_opcode_handler, selector, kernel_int_gate, 0);
 
         // Fault handlers (kernel-only). #PF and #GP each get a separate IST so
         // a nested exception (e.g. #GP inside #PF handler) does not overwrite
