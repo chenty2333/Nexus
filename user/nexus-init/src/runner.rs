@@ -25,7 +25,6 @@ use crate::{
     STARTUP_HANDLE_STARNIX_STDIN, STARTUP_HANDLE_STARNIX_STDOUT,
 };
 
-#[allow(dead_code)]
 pub(crate) struct RunningComponent {
     pub(crate) process: zx_handle_t,
     pub(crate) controller: zx_handle_t,

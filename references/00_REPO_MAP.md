@@ -114,7 +114,11 @@ rest of the leaf references should be treated as `working` current-state docs.
   `nexus-io`; the local service tree now supports directory enumeration,
   basic tmpfs-style link/rename/unlink, and read-only `GetVmo` for both seeded
   boot image VMOs and byte-backed package/resource assets; native syscall-facing
-  code in this crate now goes through `libax`
+  code in this crate now goes through `libax`; the current crate shape also
+  keeps:
+  - embedded boot assets under `src/assets.rs`
+  - root component-manager orchestration under `src/orchestrator.rs`
+  - Linux ABI/layout constants for the Starnix executive under `src/starnix/abi.rs`
 - `user/echo-provider` - dedicated bootstrap component binary for the routed
   echo protocol provider
 - `user/echo-client` - dedicated bootstrap component binary for the routed echo

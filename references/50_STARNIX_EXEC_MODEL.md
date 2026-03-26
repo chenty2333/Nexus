@@ -262,6 +262,9 @@ The current repository now has the first three Starnix bootstrap slices in-tree:
     - the bootstrap entry path is now split into a thin `bootstrap/mod.rs`
       plus dedicated namespace, exec-image source, and launch-preparation
       helpers instead of one mixed file
+    - the executive's Linux ABI/layout constants now live under a dedicated
+      `starnix/abi.rs` helper layer rather than staying interleaved with the
+      runtime entry/orchestration code in `starnix/mod.rs`
   - blocked guest syscalls now enter and retry through one shared executive path:
     - `begin_wait` / `begin_async_wait` own the transition into `TaskState::Waiting`
     - `WaitKind` owns the retry-side replay choice for:

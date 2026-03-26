@@ -6,7 +6,7 @@ use libzircon::vmo::{ZX_VMO_BACKING_SCOPE_GLOBAL_SHARED, ZX_VMO_KIND_ANONYMOUS, 
 use libzircon::{ax_vmo_get_info, zx_handle_close, zx_vmo_read, zx_vmo_set_size, zx_vmo_write};
 use nexus_io::{OpenFlags, VmoFlags};
 
-use crate::{ROOT_DECL_VMO_SHARED_BYTES, build_bootstrap_namespace, write_slot};
+use crate::{ROOT_DECL_VMO_SHARED_BYTES, orchestrator::build_bootstrap_namespace, write_slot};
 
 const SLOT_VMO_STAGED_PRESENT: usize = 1053;
 const SLOT_VMO_STAGED_FAILURE_STEP: usize = 1054;

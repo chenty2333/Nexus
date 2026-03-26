@@ -36,6 +36,7 @@ port_wait_purged = -22
 base_wait = 0
 inherited_wait_bad_handle = -11
 transferred_wait_bad_handle = -11
+timer_poll_after_revoke = -21
 timer_wait_after_revoke = -21
 inherited_dup_bad_handle = -11
 base_clear_after_revoke = 0
@@ -58,8 +59,15 @@ transferred_actual_handles = 1
 group_epoch_after = 1
 group_generation_after = 1
 base_wait_observed = 16777216
+timer_poll_after_revoke_observed = 0
 port_wait_fresh_key = 4276993775
 port_wait_fresh_type = 1
 port_wait_fresh_observed = 16777216
 timer_wait_after_revoke_observed = 0
 timer_wait_fresh_observed = 8
+
+[assertions.packet_fields_max]
+revoke_cycles = 100000000
+port_wait_purged_cycles = 100000000
+timer_poll_after_revoke_cycles = 100000000
+port_wait_fresh_cycles = 150000000

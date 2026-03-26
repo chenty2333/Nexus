@@ -424,6 +424,11 @@ That host gate now explicitly covers:
     - the original non-revocable source handle remains usable
     - one fresh delegated copy taken after revoke observes the new epoch and remains live
     - `wait_async` and timer state created through that fresh epoch remain deliverable
+    - the same bootstrap gate now also records conservative cycle bounds for:
+      - `ax_revocation_group_revoke()` itself
+      - the first post-revoke stale-port purge observation
+      - one zero-deadline poll of the canceled stale timer
+      - one fresh post-revoke signal-to-port delivery roundtrip
 - Bootstrap governance coverage now also includes one narrow job-tree gate:
   - `kernel.job.bootstrap`
   - one public root job must now prove:
