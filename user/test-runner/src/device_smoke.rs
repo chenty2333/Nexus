@@ -9,15 +9,20 @@ use libzircon::interrupt::{
     ZX_INTERRUPT_INFO_FLAG_TRIGGERABLE, ZX_INTERRUPT_MODE_VIRTUAL, ZX_INTERRUPT_VIRTUAL,
     zx_interrupt_info_t,
 };
+use libzircon::rights::{
+    ZX_RIGHT_INSPECT, ZX_RIGHT_INSPECT_LAYOUT, ZX_RIGHT_MAP, ZX_RIGHT_PIN, ZX_RIGHT_READ,
+    ZX_RIGHT_WRITE,
+};
 use libzircon::signals::ZX_INTERRUPT_SIGNALED;
-use libzircon::status::{ZX_ERR_TIMED_OUT, ZX_OK};
+use libzircon::status::{ZX_ERR_ACCESS_DENIED, ZX_ERR_TIMED_OUT, ZX_OK};
 use libzircon::syscall_numbers::AXLE_SYS_VMAR_MAP;
 use libzircon::vm::{ZX_VM_MAP_MMIO, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
-    ax_dma_region_lookup_paddr, ax_interrupt_trigger, ax_vmo_lookup_paddr, ax_vmo_pin, zx_handle_t,
-    zx_interrupt_ack, zx_interrupt_create, zx_interrupt_get_info, zx_interrupt_mask,
-    zx_interrupt_unmask, zx_object_wait_one, zx_signals_t, zx_status_t, zx_vmo_create_contiguous,
-    zx_vmo_create_physical, zx_vmo_read, zx_vmo_write,
+    ax_dma_region_lookup_paddr, ax_interrupt_trigger, ax_vmo_get_info, ax_vmo_lookup_paddr,
+    ax_vmo_pin, zx_handle_duplicate, zx_handle_t, zx_interrupt_ack, zx_interrupt_create,
+    zx_interrupt_get_info, zx_interrupt_mask, zx_interrupt_unmask, zx_object_wait_one,
+    zx_signals_t, zx_status_t, zx_vmo_create_contiguous, zx_vmo_create_physical, zx_vmo_info_t,
+    zx_vmo_read, zx_vmo_write,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
@@ -45,6 +50,14 @@ const SLOT_DEVICE_INTERRUPT_INFO: usize = 938;
 const SLOT_DEVICE_INTERRUPT_MODE: usize = 939;
 const SLOT_DEVICE_INTERRUPT_VECTOR: usize = 940;
 const SLOT_DEVICE_INTERRUPT_FLAGS: usize = 941;
+const SLOT_DEVICE_CONTIG_INFO: usize = 942;
+const SLOT_DEVICE_CONTIG_RIGHTS: usize = 943;
+const SLOT_DEVICE_CONTIG_NARROW_LOOKUP: usize = 944;
+const SLOT_DEVICE_CONTIG_NARROW_PIN: usize = 945;
+const SLOT_DEVICE_PHYSICAL_INFO: usize = 946;
+const SLOT_DEVICE_PHYSICAL_RIGHTS: usize = 947;
+const SLOT_DEVICE_PHYSICAL_NARROW_LOOKUP: usize = 948;
+const SLOT_DEVICE_PHYSICAL_NARROW_PIN: usize = 949;
 const SLOT_DEVICE_CONTIG_CREATE: usize = 912;
 const SLOT_DEVICE_CONTIG_LOOKUP0: usize = 913;
 const SLOT_DEVICE_CONTIG_LOOKUP1: usize = 914;
@@ -87,6 +100,12 @@ const STEP_INTERRUPT_ACK1: u64 = 11;
 const STEP_INTERRUPT_ACK2: u64 = 12;
 const STEP_INTERRUPT_WAIT_DRAINED: u64 = 13;
 const STEP_INTERRUPT_INFO: u64 = 28;
+const STEP_CONTIG_INFO: u64 = 29;
+const STEP_CONTIG_NARROW_LOOKUP: u64 = 30;
+const STEP_CONTIG_NARROW_PIN: u64 = 31;
+const STEP_PHYSICAL_INFO: u64 = 32;
+const STEP_PHYSICAL_NARROW_LOOKUP: u64 = 33;
+const STEP_PHYSICAL_NARROW_PIN: u64 = 34;
 const STEP_CONTIG_CREATE: u64 = 14;
 const STEP_CONTIG_LOOKUP0: u64 = 15;
 const STEP_CONTIG_LOOKUP1: u64 = 16;
@@ -301,6 +320,49 @@ fn run_device_smoke() {
         return;
     }
 
+    let mut contig_info = zx_vmo_info_t::default();
+    let status = ax_vmo_get_info(contig, &mut contig_info);
+    write_status(SLOT_DEVICE_CONTIG_INFO, status);
+    write_slot(SLOT_DEVICE_CONTIG_RIGHTS, u64::from(contig_info.rights));
+    if status != ZX_OK
+        || (contig_info.rights & (ZX_RIGHT_PIN | ZX_RIGHT_INSPECT_LAYOUT))
+            != (ZX_RIGHT_PIN | ZX_RIGHT_INSPECT_LAYOUT)
+    {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_CONTIG_INFO);
+        return;
+    }
+
+    let mut contig_narrow = ZX_HANDLE_INVALID;
+    let status = zx_handle_duplicate(
+        contig,
+        ZX_RIGHT_READ | ZX_RIGHT_WRITE | ZX_RIGHT_INSPECT | ZX_RIGHT_MAP,
+        &mut contig_narrow,
+    );
+    if status != ZX_OK {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_CONTIG_NARROW_LOOKUP);
+        return;
+    }
+    let mut denied_paddr = 0u64;
+    let status = ax_vmo_lookup_paddr(contig_narrow, 0, &mut denied_paddr);
+    write_status(SLOT_DEVICE_CONTIG_NARROW_LOOKUP, status);
+    if status != ZX_ERR_ACCESS_DENIED {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_CONTIG_NARROW_LOOKUP);
+        return;
+    }
+    let mut denied_region = ZX_HANDLE_INVALID;
+    let status = ax_vmo_pin(
+        contig_narrow,
+        0,
+        2 * PAGE_SIZE,
+        ZX_DMA_PERM_DEVICE_READ | ZX_DMA_PERM_DEVICE_WRITE,
+        &mut denied_region,
+    );
+    write_status(SLOT_DEVICE_CONTIG_NARROW_PIN, status);
+    if status != ZX_ERR_ACCESS_DENIED {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_CONTIG_NARROW_PIN);
+        return;
+    }
+
     let mut contig_paddr0 = 0u64;
     let status = ax_vmo_lookup_paddr(contig, 0, &mut contig_paddr0);
     write_status(SLOT_DEVICE_CONTIG_LOOKUP0, status);
@@ -399,6 +461,49 @@ fn run_device_smoke() {
     write_status(SLOT_DEVICE_PHYSICAL_CREATE, status);
     if status != ZX_OK {
         write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_PHYSICAL_CREATE);
+        return;
+    }
+
+    let mut physical_info = zx_vmo_info_t::default();
+    let status = ax_vmo_get_info(physical, &mut physical_info);
+    write_status(SLOT_DEVICE_PHYSICAL_INFO, status);
+    write_slot(SLOT_DEVICE_PHYSICAL_RIGHTS, u64::from(physical_info.rights));
+    if status != ZX_OK
+        || (physical_info.rights & (ZX_RIGHT_PIN | ZX_RIGHT_INSPECT_LAYOUT))
+            != (ZX_RIGHT_PIN | ZX_RIGHT_INSPECT_LAYOUT)
+    {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_PHYSICAL_INFO);
+        return;
+    }
+
+    let mut physical_narrow = ZX_HANDLE_INVALID;
+    let status = zx_handle_duplicate(
+        physical,
+        ZX_RIGHT_READ | ZX_RIGHT_WRITE | ZX_RIGHT_INSPECT | ZX_RIGHT_MAP,
+        &mut physical_narrow,
+    );
+    if status != ZX_OK {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_PHYSICAL_NARROW_LOOKUP);
+        return;
+    }
+    let mut denied_physical_paddr = 0u64;
+    let status = ax_vmo_lookup_paddr(physical_narrow, 0, &mut denied_physical_paddr);
+    write_status(SLOT_DEVICE_PHYSICAL_NARROW_LOOKUP, status);
+    if status != ZX_ERR_ACCESS_DENIED {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_PHYSICAL_NARROW_LOOKUP);
+        return;
+    }
+    let mut denied_physical_region = ZX_HANDLE_INVALID;
+    let status = ax_vmo_pin(
+        physical_narrow,
+        0,
+        PAGE_SIZE,
+        ZX_DMA_PERM_DEVICE_READ | ZX_DMA_PERM_DEVICE_WRITE,
+        &mut denied_physical_region,
+    );
+    write_status(SLOT_DEVICE_PHYSICAL_NARROW_PIN, status);
+    if status != ZX_ERR_ACCESS_DENIED {
+        write_slot(SLOT_DEVICE_FAILURE_STEP, STEP_PHYSICAL_NARROW_PIN);
         return;
     }
 

@@ -335,6 +335,9 @@ That host gate now explicitly covers:
     - identity-IOVA and physically-contiguous flags
     - base device-visible address for BAR0 and queue memory
     - one coalesced segment count of `1` for the current bootstrap BAR0 and queue regions
+  - BAR capability flow is now also frozen:
+    - `ax_vmo_pin(bar_vmo, ...)` must succeed
+    - direct `ax_vmo_lookup_paddr(bar_vmo, ...)` must fail with access denied
   - one reusable split TX/RX virtio-style transport slice now completes one eight-packet batched
     loopback round without channel/socket data-plane help, and the driver now exercises a
     virtio-style feature/status/queue-select bring-up sequence before the first kick
@@ -368,6 +371,7 @@ That host gate now explicitly covers:
     - `pci_irq_mode_set`
     - `bar0_create`
     - `bar0_pin_create`
+    - `bar0_direct_lookup`
     - `bar0_dma_lookup`
     - `bar0_dma_info`
     - `bar0_dma_flags`
@@ -414,6 +418,8 @@ That host gate now explicitly covers:
     - `ax_revocation_group_revoke()` invalidates the old delegated copies
     - one queued `wait_async` signal packet created through the revoked epoch is purged before
       userspace can consume it
+    - one blocked wait created through the revoked epoch is canceled without waiting for a global
+      thread/object scan
     - one timer armed through the revoked epoch is canceled before it can fire later
     - the original non-revocable source handle remains usable
     - one fresh delegated copy taken after revoke observes the new epoch and remains live
@@ -834,9 +840,14 @@ This makes contract coverage part of the repo workflow, not just informal docume
   - `kernel: device vm interrupt smoke (...)`
   - current assertions cover:
     - virtual interrupt create / get-info / wait / trigger / mask / unmask / ack
-    - contiguous VMO creation, physical-address lookup, and contiguity check
+    - contiguous VMO creation, VMO-info rights, physical-address lookup, and contiguity check
     - contiguous VMO pin into one `DmaRegion` object with explicit DMA permission bits plus
       pinned-range paddr lookup
+    - reduced-right contiguous-handle duplicates without `PIN` / layout-inspection rights must be
+      denied by `ax_vmo_lookup_paddr()` and `ax_vmo_pin()`
+    - physical VMO creation, VMO-info rights, and aliasing over one contiguous page
+    - reduced-right physical-handle duplicates without `PIN` / layout-inspection rights must be
+      denied by `ax_vmo_lookup_paddr()` and `ax_vmo_pin()`
 - The narrow net dataplane transport now has two conformance shapes:
   - `kernel.runtime.net_dataplane_bootstrap`
     - boots `nexus-test-runner` directly into the current queue-owned net smoke entrypoint
@@ -845,9 +856,6 @@ This makes contract coverage part of the repo workflow, not just informal docume
     - verifies that the same synthetic PCI-shaped transport and `DmaRegion`-backed queue memory
       can be consumed through the current Nexus root bootstrap path rather than only through the
       dedicated test runner
-    - physical VMO aliasing over an existing contiguous page
-    - physical VMO pin into one `DmaRegion` object with explicit DMA permission bits plus
-      pinned-range paddr lookup
   - Starnix inet coverage now has its first QEMU guest-facing loopback gate:
   - `kernel.starnix.runtime_net_bootstrap`
   - one guest payload now proves:

@@ -15,8 +15,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::{
-    Capability, ObjectKey, PortError, RevocationGroupToken, RevocationSet, Signals, TimerError,
-    TimerId, TransferredCap,
+    Capability, DeferredRevocationCountIndex, DeferredRevocationIndex, ObjectKey, PortError,
+    RevocationGroupToken, RevocationSet, Signals, TimerError, TimerId, TransferredCap,
 };
 use axle_mm::{
     MappingCachePolicy, MappingClonePolicy, MappingPerms, VmarAllocMode, VmarId,
@@ -82,6 +82,101 @@ static KERNEL_LOCK_OWNER_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
 static KERNEL_LOCK_OWNER_MUTABLE: AtomicBool = AtomicBool::new(false);
 static KERNEL_LOCK_OWNER_ACQUIRED_AT_NS: AtomicI64 = AtomicI64::new(0);
 static KERNEL_LOCK_HELD: AtomicBool = AtomicBool::new(false);
+static KERNEL_FATAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static KERNEL_FATAL_KIND: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_FATAL_STATUS: AtomicI64 = AtomicI64::new(0);
+static KERNEL_FATAL_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+static KERNEL_FATAL_THREAD_ID: AtomicU64 = AtomicU64::new(u64::MAX);
+static KERNEL_FATAL_CALLER_LINE: AtomicUsize = AtomicUsize::new(0);
+
+const KERNEL_LOCK_WAIT_WARN_INTERVAL_SPINS: u64 = 1_000_000;
+const KERNEL_LOCK_WAIT_FATAL_SPINS: u64 = 50_000_000;
+const KERNEL_LOCK_WAIT_FATAL_HELD_NS: i64 = 50_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KernelFatalKind {
+    KernelLockReadStall = 1,
+    KernelLockWriteStall = 2,
+    IdleLoop = 3,
+    IdleAddressSpaceActivation = 4,
+    WaitTickPoll = 5,
+    TimerTickPoll = 6,
+    TimerTickTlbSync = 7,
+}
+
+impl KernelFatalKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::KernelLockReadStall => "kernel_lock_read_stall",
+            Self::KernelLockWriteStall => "kernel_lock_write_stall",
+            Self::IdleLoop => "idle_loop",
+            Self::IdleAddressSpaceActivation => "idle_address_space_activation",
+            Self::WaitTickPoll => "wait_tick_poll",
+            Self::TimerTickPoll => "timer_tick_poll",
+            Self::TimerTickTlbSync => "timer_tick_tlb_sync",
+        }
+    }
+}
+
+fn kernel_lock_wait_held_ns(acquired_at_ns: i64, now_ns: i64) -> i64 {
+    if acquired_at_ns <= 0 {
+        return 0;
+    }
+    now_ns.saturating_sub(acquired_at_ns).max(0)
+}
+
+fn kernel_lock_wait_should_warn(spins: u64) -> bool {
+    spins != 0 && spins % KERNEL_LOCK_WAIT_WARN_INTERVAL_SPINS == 0
+}
+
+fn kernel_lock_wait_should_escalate(spins: u64, holder_held: bool, held_ns: i64) -> bool {
+    spins >= KERNEL_LOCK_WAIT_FATAL_SPINS
+        || (holder_held && held_ns >= KERNEL_LOCK_WAIT_FATAL_HELD_NS)
+}
+
+fn try_mark_current_execution_fatal() -> Option<u64> {
+    let state = STATE.get()?;
+    let mut kernel = state.kernel.try_lock()?;
+    let thread_id = kernel
+        .current_thread_info()
+        .ok()
+        .map(|info| info.thread_id() as u64);
+    kernel.mark_current_cpu_fatal();
+    thread_id
+}
+
+pub(crate) fn halt_if_kernel_fatal_active() {
+    if KERNEL_FATAL_ACTIVE.load(Ordering::Acquire) {
+        crate::arch::cpu::halt_loop();
+    }
+}
+
+#[track_caller]
+pub(crate) fn kernel_fatal(kind: KernelFatalKind, status: zx_status_t) -> ! {
+    let caller = Location::caller();
+    let current_cpu_id = crate::arch::apic::this_apic_id() as usize;
+    let thread_id = try_mark_current_execution_fatal().unwrap_or(u64::MAX);
+    let first = !KERNEL_FATAL_ACTIVE.swap(true, Ordering::AcqRel);
+    if first {
+        KERNEL_FATAL_KIND.store(kind as usize, Ordering::Release);
+        KERNEL_FATAL_STATUS.store(status as i64, Ordering::Release);
+        KERNEL_FATAL_CPU.store(current_cpu_id, Ordering::Release);
+        KERNEL_FATAL_THREAD_ID.store(thread_id, Ordering::Release);
+        KERNEL_FATAL_CALLER_LINE.store(caller.line() as usize, Ordering::Release);
+    }
+    crate::kprintln!(
+        "FATAL: kind={} status={} cpu={} thread={} caller_line={} lock_held={} lock_owner_cpu={} lock_owner_mut={}",
+        kind.as_str(),
+        status,
+        current_cpu_id,
+        thread_id,
+        caller.line(),
+        KERNEL_LOCK_HELD.load(Ordering::Acquire),
+        KERNEL_LOCK_OWNER_CPU.load(Ordering::Acquire),
+        KERNEL_LOCK_OWNER_MUTABLE.load(Ordering::Acquire),
+    );
+    crate::arch::qemu::exit_failure();
+}
 
 fn record_kernel_lock_owner(caller: &'static Location<'static>, mutable: bool) {
     KERNEL_LOCK_OWNER_CPU.store(
@@ -1284,6 +1379,8 @@ pub(crate) struct ObjectRegistry {
     free_slots: VecDeque<usize>,
     timer_object_ids: BTreeMap<TimerId, ObjectKey>,
     guest_session_thread_ids: BTreeMap<u64, ObjectKey>,
+    revocable_timer_objects: DeferredRevocationIndex<ObjectKey>,
+    revocable_kernel_port_packets: DeferredRevocationCountIndex<ObjectKey>,
     bootstrap_self_process_handle: zx_handle_t,
     bootstrap_self_job_handle: zx_handle_t,
     bootstrap_root_vmar_handle: zx_handle_t,
@@ -1306,6 +1403,8 @@ impl ObjectRegistry {
             free_slots: VecDeque::new(),
             timer_object_ids: BTreeMap::new(),
             guest_session_thread_ids: BTreeMap::new(),
+            revocable_timer_objects: DeferredRevocationIndex::new(),
+            revocable_kernel_port_packets: DeferredRevocationCountIndex::new(),
             bootstrap_self_process_handle: 0,
             bootstrap_self_job_handle: 0,
             bootstrap_root_vmar_handle: 0,
@@ -1373,6 +1472,43 @@ impl ObjectRegistry {
         }
         slot.payload = Some(object);
         Ok(())
+    }
+
+    fn forget_timer_revocation(&mut self, key: ObjectKey, revocation: RevocationSet) {
+        self.revocable_timer_objects.remove(key, revocation);
+    }
+
+    fn replace_timer_revocation(&mut self, key: ObjectKey, old: RevocationSet, new: RevocationSet) {
+        self.revocable_timer_objects.replace(key, old, new);
+    }
+
+    fn revoked_timer_candidates(
+        &self,
+        group: axle_core::RevocationGroupId,
+        generation: u64,
+    ) -> Vec<ObjectKey> {
+        self.revocable_timer_objects.candidates(group, generation)
+    }
+
+    fn note_port_kernel_packet(&mut self, key: ObjectKey, revocation: RevocationSet) {
+        self.revocable_kernel_port_packets.insert(key, revocation);
+    }
+
+    fn forget_port_kernel_packet(&mut self, key: ObjectKey, revocation: RevocationSet) {
+        self.revocable_kernel_port_packets.remove(key, revocation);
+    }
+
+    fn forget_all_port_kernel_packets(&mut self, key: ObjectKey) {
+        self.revocable_kernel_port_packets.remove_all(key);
+    }
+
+    fn revoked_port_packet_candidates(
+        &self,
+        group: axle_core::RevocationGroupId,
+        generation: u64,
+    ) -> Vec<ObjectKey> {
+        self.revocable_kernel_port_packets
+            .candidates(group, generation)
     }
 
     pub(crate) fn get(&self, key: ObjectKey) -> Option<&KernelObject> {
@@ -1920,6 +2056,16 @@ impl KernelState {
             .copied()
     }
 
+    pub(crate) fn note_port_kernel_packet(&self, key: ObjectKey, revocation: RevocationSet) {
+        let mut registry = self.registry.lock();
+        registry.note_port_kernel_packet(key, revocation);
+    }
+
+    pub(crate) fn forget_port_kernel_packet(&self, key: ObjectKey, revocation: RevocationSet) {
+        let mut registry = self.registry.lock();
+        registry.forget_port_kernel_packet(key, revocation);
+    }
+
     pub(crate) fn with_registry<T>(
         &self,
         f: impl FnOnce(&ObjectRegistry) -> Result<T, zx_status_t>,
@@ -2372,6 +2518,7 @@ pub(crate) fn resolve_current_futex_key(
 pub(crate) fn with_state_mut<T>(
     f: impl FnOnce(&KernelState) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
+    halt_if_kernel_fatal_active();
     f(state()?)
 }
 
@@ -2397,11 +2544,11 @@ fn with_interrupt_safe_kernel_ref<T>(
     // this CPU can still service timer/IPI work that another lock holder might
     // be waiting on. Avoid sleeping with HLT inside the lock-wait loop: that
     // path can be re-entered by timer/IPI activity on the same kernel stack.
-    const WARN_INTERVAL: u64 = 1_000_000;
     let mut spins = 0u64;
     let caller = core::panic::Location::caller();
     let were_enabled = x86_64::instructions::interrupts::are_enabled();
     loop {
+        halt_if_kernel_fatal_active();
         if were_enabled {
             x86_64::instructions::interrupts::disable();
         }
@@ -2416,11 +2563,12 @@ fn with_interrupt_safe_kernel_ref<T>(
             return result;
         }
         spins = spins.wrapping_add(1);
-        if spins % WARN_INTERVAL == 0 {
+        if kernel_lock_wait_should_warn(spins) {
             let holder_cpu = KERNEL_LOCK_OWNER_CPU.load(Ordering::Acquire);
             let holder_mutable = KERNEL_LOCK_OWNER_MUTABLE.load(Ordering::Acquire);
             let holder_held = KERNEL_LOCK_HELD.load(Ordering::Acquire);
             let acquired_at = KERNEL_LOCK_OWNER_ACQUIRED_AT_NS.load(Ordering::Acquire);
+            let held_ns = kernel_lock_wait_held_ns(acquired_at, crate::time::now_ns());
             crate::kprintln!(
                 "WARN: kernel-ref-wait spins={} caller_line={} holder={} holder_mut={} cpu={} held_ns={}",
                 spins,
@@ -2428,8 +2576,11 @@ fn with_interrupt_safe_kernel_ref<T>(
                 holder_held,
                 holder_mutable,
                 holder_cpu,
-                crate::time::now_ns().saturating_sub(acquired_at),
+                held_ns,
             );
+            if kernel_lock_wait_should_escalate(spins, holder_held, held_ns) {
+                kernel_fatal(KernelFatalKind::KernelLockReadStall, ZX_ERR_BAD_STATE);
+            }
         }
         if were_enabled {
             x86_64::instructions::interrupts::enable();
@@ -2445,11 +2596,11 @@ fn with_interrupt_safe_kernel_mut<T>(
     kernel: &Arc<Mutex<crate::task::Kernel>>,
     f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
-    const WARN_INTERVAL: u64 = 1_000_000;
     let mut spins = 0u64;
     let caller = core::panic::Location::caller();
     let were_enabled = x86_64::instructions::interrupts::are_enabled();
     loop {
+        halt_if_kernel_fatal_active();
         if were_enabled {
             x86_64::instructions::interrupts::disable();
         }
@@ -2464,11 +2615,12 @@ fn with_interrupt_safe_kernel_mut<T>(
             return result;
         }
         spins = spins.wrapping_add(1);
-        if spins % WARN_INTERVAL == 0 {
+        if kernel_lock_wait_should_warn(spins) {
             let holder_cpu = KERNEL_LOCK_OWNER_CPU.load(Ordering::Acquire);
             let holder_mutable = KERNEL_LOCK_OWNER_MUTABLE.load(Ordering::Acquire);
             let holder_held = KERNEL_LOCK_HELD.load(Ordering::Acquire);
             let acquired_at = KERNEL_LOCK_OWNER_ACQUIRED_AT_NS.load(Ordering::Acquire);
+            let held_ns = kernel_lock_wait_held_ns(acquired_at, crate::time::now_ns());
             crate::kprintln!(
                 "WARN: kernel-mut-wait spins={} caller_line={} holder={} holder_mut={} cpu={} held_ns={}",
                 spins,
@@ -2476,8 +2628,11 @@ fn with_interrupt_safe_kernel_mut<T>(
                 holder_held,
                 holder_mutable,
                 holder_cpu,
-                crate::time::now_ns().saturating_sub(acquired_at),
+                held_ns,
             );
+            if kernel_lock_wait_should_escalate(spins, holder_held, held_ns) {
+                kernel_fatal(KernelFatalKind::KernelLockWriteStall, ZX_ERR_BAD_STATE);
+            }
         }
         if were_enabled {
             x86_64::instructions::interrupts::enable();
@@ -2570,7 +2725,7 @@ pub(crate) fn run_current_cpu_idle_loop() -> ! {
                     activation.context().ss(),
                     activation.context().fs_base(),
                 );
-                let switch_kind = with_state_mut(|state| {
+                let switch_kind = match with_state_mut(|state| {
                     state.with_vm_mut(|vm| {
                         vm.activate_cpu_address_space_transition(
                             activation.current_cpu_id(),
@@ -2578,8 +2733,12 @@ pub(crate) fn run_current_cpu_idle_loop() -> ! {
                             activation.next_address_space_id(),
                         )
                     })
-                })
-                .expect("idle address-space activation must succeed");
+                }) {
+                    Ok(switch_kind) => switch_kind,
+                    Err(status) => {
+                        kernel_fatal(KernelFatalKind::IdleAddressSpaceActivation, status)
+                    }
+                };
                 crate::trace::record_context_switch(
                     activation.previous_thread_id(),
                     activation.thread_id(),
@@ -2599,7 +2758,7 @@ pub(crate) fn run_current_cpu_idle_loop() -> ! {
                 activation.context().enter()
             }
             Ok(None) => block_current_trap_until_runnable(),
-            Err(status) => panic!("idle loop failed: {status}"),
+            Err(status) => kernel_fatal(KernelFatalKind::IdleLoop, status),
         }
     }
 }
@@ -3163,17 +3322,23 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
                 })
                 .map_err(map_timer_error)
         })?;
+        let next_revocation = if current == Signals::TIMER_SIGNALED {
+            RevocationSet::none()
+        } else {
+            revocation
+        };
         state.with_objects_mut(|objects| {
-            let timer = match objects.get_mut(object_key) {
-                Some(KernelObject::Timer(timer)) => timer,
-                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-                None => return Err(ZX_ERR_BAD_HANDLE),
+            let old_revocation = {
+                let timer = match objects.get_mut(object_key) {
+                    Some(KernelObject::Timer(timer)) => timer,
+                    Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                    None => return Err(ZX_ERR_BAD_HANDLE),
+                };
+                let old = timer.armed_revocation;
+                timer.armed_revocation = next_revocation;
+                old
             };
-            timer.armed_revocation = if current == Signals::TIMER_SIGNALED {
-                RevocationSet::none()
-            } else {
-                revocation
-            };
+            objects.replace_timer_revocation(object_key, old_revocation, next_revocation);
             Ok(())
         })?;
         crate::wait::publish_signals_changed(state, object_key, current)
@@ -3191,12 +3356,17 @@ pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
                 .map_err(map_timer_error)
         })?;
         state.with_objects_mut(|objects| {
-            let timer = match objects.get_mut(object_key) {
-                Some(KernelObject::Timer(timer)) => timer,
-                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-                None => return Err(ZX_ERR_BAD_HANDLE),
+            let old_revocation = {
+                let timer = match objects.get_mut(object_key) {
+                    Some(KernelObject::Timer(timer)) => timer,
+                    Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                    None => return Err(ZX_ERR_BAD_HANDLE),
+                };
+                let old = timer.armed_revocation;
+                timer.armed_revocation = RevocationSet::none();
+                old
             };
-            timer.armed_revocation = RevocationSet::none();
+            objects.forget_timer_revocation(object_key, old_revocation);
             Ok(())
         })?;
         crate::wait::publish_signals_changed(state, object_key, Signals::NONE)
@@ -3384,6 +3554,10 @@ fn finalize_last_handle_close(
                 Ok(())
             })?;
             let removed = state.begin_logical_destroy(object_key)?;
+            state.with_objects_mut(|objects| {
+                objects.forget_all_port_kernel_packets(object_key);
+                Ok(())
+            })?;
             let result = match removed {
                 KernelObject::Port(port) => state.with_kernel_mut(|kernel| port.destroy(kernel)),
                 _ => Err(ZX_ERR_BAD_STATE),
@@ -3397,13 +3571,17 @@ fn finalize_last_handle_close(
                 Ok(())
             })?;
             let removed = state.begin_logical_destroy(object_key)?;
-            let timer_id = match removed {
-                KernelObject::Timer(timer) => timer.timer_id,
+            let (timer_id, armed_revocation) = match removed {
+                KernelObject::Timer(timer) => (timer.timer_id, timer.armed_revocation),
                 _ => {
                     state.finish_logical_destroy(object_key);
                     return Err(ZX_ERR_BAD_STATE);
                 }
             };
+            state.with_objects_mut(|objects| {
+                objects.forget_timer_revocation(object_key, armed_revocation);
+                Ok(())
+            })?;
             state.forget_timer_object(timer_id);
             let result = state.with_kernel_mut(|kernel| {
                 kernel
@@ -3505,12 +3683,17 @@ pub(crate) fn publish_timer_fired(
 ) -> Result<(), zx_status_t> {
     let object_key = state.timer_object_key(timer_id).ok_or(ZX_ERR_BAD_STATE)?;
     state.with_objects_mut(|objects| {
-        let timer = match objects.get_mut(object_key) {
-            Some(KernelObject::Timer(timer)) => timer,
-            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-            None => return Err(ZX_ERR_BAD_HANDLE),
+        let old_revocation = {
+            let timer = match objects.get_mut(object_key) {
+                Some(KernelObject::Timer(timer)) => timer,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            let old = timer.armed_revocation;
+            timer.armed_revocation = RevocationSet::none();
+            old
         };
-        timer.armed_revocation = RevocationSet::none();
+        objects.forget_timer_revocation(object_key, old_revocation);
         Ok(())
     })?;
     crate::wait::publish_signals_changed(state, object_key, Signals::TIMER_SIGNALED)
@@ -3684,5 +3867,40 @@ mod tests {
             GLOBAL_SOCKET_ACCOUNTED_BYTES.load(Ordering::Acquire),
             baseline
         );
+    }
+
+    #[test]
+    fn kernel_lock_wait_warn_and_fatal_thresholds_are_bounded() {
+        assert!(!kernel_lock_wait_should_warn(0));
+        assert!(!kernel_lock_wait_should_warn(
+            KERNEL_LOCK_WAIT_WARN_INTERVAL_SPINS - 1
+        ));
+        assert!(kernel_lock_wait_should_warn(
+            KERNEL_LOCK_WAIT_WARN_INTERVAL_SPINS
+        ));
+
+        assert!(!kernel_lock_wait_should_escalate(
+            KERNEL_LOCK_WAIT_FATAL_SPINS - 1,
+            false,
+            0,
+        ));
+        assert!(kernel_lock_wait_should_escalate(
+            KERNEL_LOCK_WAIT_FATAL_SPINS,
+            false,
+            0,
+        ));
+        assert!(kernel_lock_wait_should_escalate(
+            1,
+            true,
+            KERNEL_LOCK_WAIT_FATAL_HELD_NS,
+        ));
+    }
+
+    #[test]
+    fn kernel_lock_wait_held_time_saturates_at_zero() {
+        assert_eq!(kernel_lock_wait_held_ns(0, 123), 0);
+        assert_eq!(kernel_lock_wait_held_ns(-1, 123), 0);
+        assert_eq!(kernel_lock_wait_held_ns(100, 90), 0);
+        assert_eq!(kernel_lock_wait_held_ns(100, 175), 75);
     }
 }

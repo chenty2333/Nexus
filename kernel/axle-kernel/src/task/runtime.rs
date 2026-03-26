@@ -660,6 +660,7 @@ impl Kernel {
             Thread {
                 process_id,
                 koid,
+                kernel_faulted: false,
                 guest_started: false,
                 guest_fs_base: 0,
                 fpu_state: alloc::boxed::Box::new(crate::arch::fpu::clean_state()),

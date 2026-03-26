@@ -547,6 +547,47 @@ impl<Q: PacketQueue> PortState<Q> {
         }
         removed
     }
+
+    /// Remove and return every kernel-generated packet that does not satisfy `keep`.
+    ///
+    /// User packets are preserved in-place and maintain their relative order.
+    /// This is intended for maintenance paths such as revocation cleanup where
+    /// the caller needs the removed packets' metadata rather than just a count.
+    pub fn drain_kernel_packets_where<F>(&mut self, mut keep: F) -> Vec<Packet>
+    where
+        F: FnMut(&Packet) -> bool,
+    {
+        let initial_len = self.q.len();
+        if initial_len == 0 {
+            return Vec::new();
+        }
+
+        let mut kept = Vec::with_capacity(initial_len);
+        let mut removed = Vec::new();
+        for _ in 0..initial_len {
+            let Some(packet) = self.q.pop_front() else {
+                break;
+            };
+            if packet.kind == PacketKind::User || keep(&packet) {
+                kept.push(packet);
+            } else {
+                removed.push(packet);
+            }
+        }
+
+        self.user_in_q = 0;
+        for packet in kept {
+            if packet.kind == PacketKind::User {
+                self.user_in_q = self.user_in_q.saturating_add(1);
+            }
+            debug_assert!(self.q.push_back(packet).is_ok());
+        }
+
+        if !removed.is_empty() {
+            self.telemetry.record_depth(self.q.len());
+        }
+        removed
+    }
 }
 
 #[cfg(test)]

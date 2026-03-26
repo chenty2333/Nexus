@@ -127,6 +127,14 @@ It is a current-state reference, not a roadmap.
   The revocation boundary is intentionally precise:
   - future control-plane effects that the kernel still owns are canceled
   - already committed data-plane effects are not rolled back
+- Revoke-time cleanup no longer discovers that state by scanning every thread/object/observer.
+  Current mainline keeps per-group reverse indexes for:
+  - blocked waits
+  - async observers
+  - armed timers
+  - queued kernel-generated port packets
+  Revoke cost is therefore proportional to the revoked group's still-live deferred control-plane
+  registrations rather than total system object count.
 - There is now one narrow public job-governance layer above ordinary handles:
   - `ax_process_get_job()` returns the current owning job for one process handle
   - `ax_job_create()` creates a child job under a parent job handle

@@ -458,6 +458,22 @@ impl Kernel {
         }
     }
 
+    fn note_revocable_wait(&mut self, thread_id: ThreadId, registration: WaitRegistration) {
+        let revocation = registration.revocation();
+        if revocation.is_empty() {
+            return;
+        }
+        self.revocable_waits.insert(thread_id, revocation);
+    }
+
+    fn forget_revocable_wait(&mut self, thread_id: ThreadId, registration: WaitRegistration) {
+        let revocation = registration.revocation();
+        if revocation.is_empty() {
+            return;
+        }
+        self.revocable_waits.remove(thread_id, revocation);
+    }
+
     pub(super) fn take_wait_registration_if_seq(
         &mut self,
         thread_id: ThreadId,
@@ -476,6 +492,7 @@ impl Kernel {
         if had_deadline {
             self.cancel_wait_deadline(thread_id, seq);
         }
+        self.forget_revocable_wait(thread_id, registration);
         Some(registration)
     }
 
@@ -494,6 +511,7 @@ impl Kernel {
         if had_deadline {
             self.cancel_wait_deadline(thread_id, seq);
         }
+        self.forget_revocable_wait(thread_id, registration);
         Some((seq, registration))
     }
 
@@ -512,6 +530,7 @@ impl Kernel {
             thread.state = ThreadState::Blocked { source };
             thread.wait.arm(registration, deadline)
         };
+        self.note_revocable_wait(thread_id, registration);
         self.enqueue_wait_source(thread_id, registration);
         if let Some(deadline) = deadline {
             self.reactor
@@ -632,19 +651,21 @@ impl Kernel {
         generation: u64,
         current_epoch: u64,
     ) -> Result<usize, zx_status_t> {
-        let revoked = self
-            .threads
-            .iter()
-            .filter_map(|(&thread_id, thread)| {
-                let registration = thread.wait.registration?;
-                registration
-                    .revocation()
-                    .contains_revoked(group, generation, current_epoch)
-                    .then_some(thread_id)
-            })
-            .collect::<Vec<_>>();
+        let revoked = self.revocable_waits.candidates(group, generation);
         let mut canceled = 0usize;
         for thread_id in revoked {
+            let should_cancel = self
+                .threads
+                .get(&thread_id)
+                .and_then(|thread| thread.wait.registration)
+                .is_some_and(|registration| {
+                    registration
+                        .revocation()
+                        .contains_revoked(group, generation, current_epoch)
+                });
+            if !should_cancel {
+                continue;
+            }
             if self.complete_waiter_source_removed(
                 thread_id,
                 WakeReason::Status(axle_types::status::ZX_ERR_CANCELED),

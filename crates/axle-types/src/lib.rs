@@ -1250,6 +1250,10 @@ pub mod rights {
     pub const AX_RIGHT_MANAGE_THREAD: ax_rights_t = 1u32 << 18;
     /// Apply a profile.
     pub const AX_RIGHT_APPLY_PROFILE: ax_rights_t = 1u32 << 19;
+    /// Pin one DMA-capable VMO range into a DMA-region object.
+    pub const AX_RIGHT_PIN: ax_rights_t = 1u32 << 20;
+    /// Inspect one VMO or DMA-region physical/device-visible layout.
+    pub const AX_RIGHT_INSPECT_LAYOUT: ax_rights_t = 1u32 << 21;
     /// Basic transferable/duplicable/waitable rights.
     pub const AX_RIGHTS_BASIC: ax_rights_t =
         AX_RIGHT_TRANSFER | AX_RIGHT_DUPLICATE | AX_RIGHT_WAIT | AX_RIGHT_INSPECT;
@@ -1277,7 +1281,9 @@ pub mod rights {
         | AX_RIGHT_MANAGE_JOB
         | AX_RIGHT_MANAGE_PROCESS
         | AX_RIGHT_MANAGE_THREAD
-        | AX_RIGHT_APPLY_PROFILE;
+        | AX_RIGHT_APPLY_PROFILE
+        | AX_RIGHT_PIN
+        | AX_RIGHT_INSPECT_LAYOUT;
 
     /// Duplicate the handle.
     pub const ZX_RIGHT_DUPLICATE: zx_rights_t = AX_RIGHT_DUPLICATE as zx_rights_t;
@@ -1319,6 +1325,10 @@ pub mod rights {
     pub const ZX_RIGHT_MANAGE_THREAD: zx_rights_t = AX_RIGHT_MANAGE_THREAD as zx_rights_t;
     /// Apply a profile.
     pub const ZX_RIGHT_APPLY_PROFILE: zx_rights_t = AX_RIGHT_APPLY_PROFILE as zx_rights_t;
+    /// Pin one DMA-capable VMO range into a DMA-region object.
+    pub const ZX_RIGHT_PIN: zx_rights_t = AX_RIGHT_PIN as zx_rights_t;
+    /// Inspect one VMO or DMA-region physical/device-visible layout.
+    pub const ZX_RIGHT_INSPECT_LAYOUT: zx_rights_t = AX_RIGHT_INSPECT_LAYOUT as zx_rights_t;
 
     /// Basic transferable/duplicable/waitable rights.
     pub const ZX_RIGHTS_BASIC: zx_rights_t = AX_RIGHTS_BASIC as zx_rights_t;

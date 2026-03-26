@@ -40,7 +40,8 @@ pub use port::{
     PortTelemetrySnapshot, VecPortQueue, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId,
 };
 pub use revocation::{
-    RevocationGroupId, RevocationGroupToken, RevocationManager, RevocationRef, RevocationSet,
+    DeferredRevocationCountIndex, DeferredRevocationIndex, RevocationGroupId, RevocationGroupToken,
+    RevocationManager, RevocationRef, RevocationSet,
 };
 pub use signals::{Signals, WaitOne, wait_one};
 pub use timer::{

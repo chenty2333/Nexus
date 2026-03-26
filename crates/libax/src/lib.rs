@@ -588,6 +588,9 @@ pub fn ax_vmo_create(size: u64, options: u32, out: &mut ax_handle_t) -> ax_statu
 }
 
 /// Create a physical/MMIO-style VMO over an existing page-aligned span.
+///
+/// This surface is currently restricted to processes in the root job and
+/// returns a DMA-capable handle that explicitly carries pin/layout rights.
 pub fn ax_vmo_create_physical(
     base_paddr: u64,
     size: u64,
@@ -603,6 +606,9 @@ pub fn ax_vmo_create_physical(
 }
 
 /// Create a contiguous, DMA-capable VMO.
+///
+/// This surface is currently restricted to processes in the root job and
+/// returns a DMA-capable handle that explicitly carries pin/layout rights.
 pub fn ax_vmo_create_contiguous(size: u64, options: u32, out: &mut ax_handle_t) -> ax_status_t {
     let mut raw_out = libzircon::handle::ZX_HANDLE_INVALID;
     let status = libzircon::zx_vmo_create_contiguous(size, options, &mut raw_out);
@@ -613,6 +619,8 @@ pub fn ax_vmo_create_contiguous(size: u64, options: u32, out: &mut ax_handle_t) 
 }
 
 /// Return the physical address backing one physical/contiguous VMO offset.
+///
+/// The queried handle must carry `AX_RIGHT_INSPECT_LAYOUT`.
 pub fn ax_vmo_lookup_paddr(handle: ax_handle_t, offset: u64, out_paddr: &mut u64) -> ax_status_t {
     match narrow_handle(handle) {
         Ok(raw) => libzircon::ax_vmo_lookup_paddr(raw, offset, out_paddr),
@@ -677,6 +685,8 @@ pub fn ax_vmar_get_mapping_vmo(
 }
 
 /// Pin one physical/contiguous VMO range and return a DMA region handle.
+///
+/// The queried handle must carry `AX_RIGHT_PIN`.
 pub fn ax_vmo_pin(
     handle: ax_handle_t,
     offset: u64,
@@ -697,6 +707,8 @@ pub fn ax_vmo_pin(
 }
 
 /// Return the physical address backing one offset inside a pinned DMA region.
+///
+/// The queried handle must carry `AX_RIGHT_INSPECT_LAYOUT`.
 pub fn ax_dma_region_lookup_paddr(
     handle: ax_handle_t,
     offset: u64,
@@ -709,6 +721,8 @@ pub fn ax_dma_region_lookup_paddr(
 }
 
 /// Return the device-visible IOVA backing one offset inside a pinned DMA region.
+///
+/// The queried handle must carry `AX_RIGHT_INSPECT_LAYOUT`.
 pub fn ax_dma_region_lookup_iova(
     handle: ax_handle_t,
     offset: u64,
@@ -721,6 +735,8 @@ pub fn ax_dma_region_lookup_iova(
 }
 
 /// Read one metadata snapshot from a DMA-region object.
+///
+/// The queried handle must carry `AX_RIGHT_INSPECT_LAYOUT`.
 pub fn ax_dma_region_get_info(
     handle: ax_handle_t,
     out_info: &mut ax_dma_region_info_t,
@@ -732,6 +748,8 @@ pub fn ax_dma_region_get_info(
 }
 
 /// Read one segment metadata snapshot from a DMA-region object.
+///
+/// The queried handle must carry `AX_RIGHT_INSPECT_LAYOUT`.
 pub fn ax_dma_region_get_segment(
     handle: ax_handle_t,
     segment_index: u32,

@@ -773,7 +773,7 @@ pub fn pci_device_get_bar(
                 Some(_) => Err(ZX_ERR_WRONG_TYPE),
                 None => Err(ZX_ERR_BAD_HANDLE),
             })?;
-        let bar_handle = state.alloc_handle_for_object(bar_object, handle::vmo_default_rights())?;
+        let bar_handle = state.alloc_handle_for_object(bar_object, handle::pci_bar_vmo_rights())?;
         info.handle = bar_handle;
         Ok(info)
     })
@@ -836,7 +836,7 @@ pub fn pci_device_get_resource(
             })?;
         let rights = match info.kind {
             AX_PCI_RESOURCE_KIND_CONFIG => handle::pci_config_vmo_rights(),
-            AX_PCI_RESOURCE_KIND_BAR => handle::vmo_default_rights(),
+            AX_PCI_RESOURCE_KIND_BAR => handle::pci_bar_vmo_rights(),
             AX_PCI_RESOURCE_KIND_INTERRUPT => handle::interrupt_default_rights(),
             _ => return Err(ZX_ERR_BAD_STATE),
         };

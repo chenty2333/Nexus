@@ -175,28 +175,44 @@ Current state:
     - one BAR resource per supported BAR
     - one interrupt resource per `(group, queue_pair)` tuple
   - `ax_pci_device_get_bar()` exports one BAR VMO handle plus BAR flags / suggested VM map options
+    - BAR-exported handles may map and pin that MMIO window
+    - BAR-exported handles do not expose direct physical-layout inspection through
+      `ax_vmo_lookup_paddr()`
   - `ax_pci_device_get_interrupt()` exports one interrupt-object handle per queue-pair/group plus
     interrupt mode / vector metadata
 - `zx_vmo_create_physical(base_paddr, size, 0, out)` is now public and creates a shared
   physical/MMIO-style VMO over an existing page-aligned physical span.
-  - Creation is now gated by root-job membership: only processes running in the root job may create
-    physical VMOs, preventing unprivileged processes from mapping arbitrary physical memory.
-  - There is still no public Resource object; root-job authority is the current explicit policy
-    boundary for this surface.
+  - creation is gated by root-job membership: only processes running in the root job may create
+    physical VMOs, preventing unprivileged processes from mapping arbitrary physical memory
+  - the returned handle is one explicit DMA-capable handle carrying
+    `AX_RIGHT_PIN` / `ZX_RIGHT_PIN` and
+    `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
+  - there is still no public Resource object; root-job authority is the current explicit policy
+    boundary for this surface
 - `zx_vmo_create_contiguous(size, 0, out)` is now public and creates a shared contiguous VMO.
+  - creation is now gated by that same root-job DMA-memory authority boundary
+  - the returned handle is one explicit DMA-capable handle carrying
+    `AX_RIGHT_PIN` / `ZX_RIGHT_PIN` and
+    `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
 - `ZX_VM_MAP_MMIO` is now public on `vmar_map()` and requests one device/MMIO cache policy for
   the installed mapping.
 - `ax_vmo_lookup_paddr(handle, offset, out_paddr)` is the current narrow Axle-native helper for
   resolving the backing physical address of one physical/contiguous VMO offset.
-- `ax_vmo_pin(handle, offset, len, 0, out)` is now public and creates one `DmaRegion` object over
+  - it now requires `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
+  - `contiguous` as a VMO kind is not itself a promise that any exported handle may publicly inspect
+    the physical layout
+- `ax_vmo_pin(handle, offset, len, perms, out)` is now public and creates one `DmaRegion` object over
   one page-aligned range of one physical/contiguous VMO:
   - `DEVICE_READ`
   - `DEVICE_WRITE`
   are now the first narrow public DMA-permission bits on that pin contract.
+  - the source VMO handle must now carry `AX_RIGHT_PIN` / `ZX_RIGHT_PIN`
 - `ax_dma_region_lookup_paddr(handle, offset, out_paddr)` is the first narrow query on that pinned
   DMA-region object.
+  - the queried handle must carry `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
 - `ax_dma_region_lookup_iova(handle, offset, out_iova)` is the first narrow device-visible address
   query on that same pinned DMA-region object.
+  - the queried handle must carry `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
 - `ax_dma_region_get_info(handle, out)` is now the first narrow metadata query on that same pinned
   DMA-region object:
   - size in bytes
@@ -204,11 +220,13 @@ Current state:
   - identity-IOVA / physical-contiguity flags
   - coalesced segment count
   - base physical / device-visible addresses
+  - the queried handle must carry `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
 - `ax_dma_region_get_segment(handle, segment_index, out)` is now the first narrow segment query on
   that same pinned DMA-region object:
   - segment offset / size in bytes
   - identity-IOVA / physical-contiguity flags
   - segment base physical / device-visible addresses
+  - the queried handle must carry `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
 - `interrupt_create(ZX_INTERRUPT_VIRTUAL)` is now public as a narrow virtual/software interrupt
   object, and `ax_interrupt_trigger()` is the matching Axle-native injection helper.
 - `interrupt_get_info(handle, out)` is now the first narrow metadata query over an interrupt

@@ -19,10 +19,12 @@ This file describes the current kernel object table, object kinds, and lifetime 
 
 - The object layer is rooted at `kernel/axle-kernel/src/object.rs`.
 - `KernelState` is now an immutable handle container over split slice state:
-  - `Kernel` for process/thread/futex/run-queue core state
-  - `ObjectRegistry` for the global object table, bootstrap handles, timer reverse index, and object-handle refcounts
+  - `Kernel` for process/thread/futex/run-queue core state plus revocable blocked-wait index
+  - `ObjectRegistry` for the global object table, bootstrap handles, timer/object reverse indexes,
+    queued-kernel-port-packet revocation indexes, and object-handle refcounts
   - `TransportCore` for shared socket runtime state and transport telemetry
-  - `Reactor` for observers, waiter indexes, and unified timer backend state
+  - `Reactor` for observers, waiter indexes, unified timer backend state, and async-wait
+    revocation indexes
   - `VmFacade` for VM and fault authority
 - `object.rs` is still the public kernel object façade, but mutable runtime ownership is no longer centralized in `KernelState`.
 - Object-family service code is now split by slice:
@@ -98,6 +100,11 @@ Current revocation-group shape:
   - one revoke path through `ax_revocation_group_revoke()`:
     - revoke = `epoch++`
     - any delegated handle carrying an older epoch snapshot fails future lookup
+    - deferred control-plane cleanup is group-local:
+      - blocked waits, async observers, armed timers, and queued kernel packets are collected
+        through reverse indexes keyed by `(group_id, generation)`
+      - cleanup re-checks live provenance before removal, so fresh post-revoke registrations in the
+        same generation remain intact
 - ordinary handles only become revocable when userspace explicitly creates one delegated copy
   through `ax_handle_duplicate_revocable()`
 
@@ -176,11 +183,11 @@ Current DMA-region shape:
 - `DmaRegion` is one narrow device-memory lifetime object
 - it is created through `ax_vmo_pin()` over one page-aligned range of one physical or contiguous
   VMO
+  - the source VMO handle must carry `AX_RIGHT_PIN` / `ZX_RIGHT_PIN`
 - it owns one explicit frame-pin token, so closing the last handle releases the pinned pages
 - it now also freezes one first DMA-permission surface on creation:
   - `DEVICE_READ`
   - `DEVICE_WRITE`
-- it currently exposes two narrow metadata queries:
 - it currently exposes three narrow metadata queries:
   - `ax_dma_region_get_info()`:
     - size in bytes
@@ -188,12 +195,16 @@ Current DMA-region shape:
     - region flags (`IDENTITY_IOVA`, `PHYSICALLY_CONTIGUOUS`)
     - coalesced segment count
     - base physical / device-visible addresses
+    - the queried handle must carry `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
   - `ax_dma_region_get_segment()`:
     - segment offset / size in bytes
     - identity-IOVA / physically-contiguous flags
     - segment base physical / device-visible addresses
+    - the queried handle must carry `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
   - `ax_dma_region_lookup_paddr()` for one offset inside the pinned range
+    - the queried handle must carry `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
   - `ax_dma_region_lookup_iova()` for one first device-visible address view of that same range
+    - the queried handle must carry `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
 - it is not waitable and it does not yet imply any BTI/IOMMU grant or cache-policy contract
 
 Current socket shape:

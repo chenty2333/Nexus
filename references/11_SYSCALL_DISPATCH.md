@@ -203,10 +203,13 @@ The current bootstrap syscall surface includes:
     - triggerable flag
   - `ax_interrupt_trigger()` is an Axle-native helper rather than a fully generic IRQ delivery ABI
   - `ax_vmo_lookup_paddr()` is a narrow bootstrap helper
+    - it now requires one handle carrying `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
   - `ax_vmo_pin()` + `ax_dma_region_get_info()` + `ax_dma_region_lookup_paddr()` +
     `ax_dma_region_lookup_iova()` + `ax_dma_region_get_segment()` now add one first explicit DMA
     lifetime object without yet
     becoming a full BTI/IOMMU contract:
+    - `ax_vmo_pin()` now requires one source VMO handle carrying
+      `AX_RIGHT_PIN` / `ZX_RIGHT_PIN`
     - `ax_vmo_pin()` now also freezes one first DMA-permission bit surface
       (`DEVICE_READ` / `DEVICE_WRITE`)
     - `ax_dma_region_get_info()` now exposes one narrow metadata snapshot:
@@ -219,6 +222,8 @@ The current bootstrap syscall surface includes:
       - offset / size in bytes
       - identity-IOVA / physically-contiguous flags
       - base physical and device-visible addresses
+    - the DMA-region metadata/address queries now require
+      `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
   - `ax_pci_device_get_info()` / `ax_pci_device_get_config()` / `ax_pci_device_get_bar()` /
     `ax_pci_device_get_interrupt()` / `ax_pci_device_get_interrupt_mode()` /
     `ax_pci_device_get_resource_count()` / `ax_pci_device_get_resource()` /
@@ -228,6 +233,8 @@ The current bootstrap syscall surface includes:
       - resource count
       - config resource export
       - BAR resource export
+        - BAR handles may map and pin the window
+        - BAR handles do not directly expose `ax_vmo_lookup_paddr()`
       - interrupt resource export
     - one synthetic PCI config-space export:
       - MMIO + read-only flags

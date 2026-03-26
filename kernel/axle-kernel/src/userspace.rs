@@ -686,6 +686,14 @@ const SLOT_DEVICE_INTERRUPT_INFO: usize = 938;
 const SLOT_DEVICE_INTERRUPT_MODE: usize = 939;
 const SLOT_DEVICE_INTERRUPT_VECTOR: usize = 940;
 const SLOT_DEVICE_INTERRUPT_FLAGS: usize = 941;
+const SLOT_DEVICE_CONTIG_INFO: usize = 942;
+const SLOT_DEVICE_CONTIG_RIGHTS: usize = 943;
+const SLOT_DEVICE_CONTIG_NARROW_LOOKUP: usize = 944;
+const SLOT_DEVICE_CONTIG_NARROW_PIN: usize = 945;
+const SLOT_DEVICE_PHYSICAL_INFO: usize = 946;
+const SLOT_DEVICE_PHYSICAL_RIGHTS: usize = 947;
+const SLOT_DEVICE_PHYSICAL_NARROW_LOOKUP: usize = 948;
+const SLOT_DEVICE_PHYSICAL_NARROW_PIN: usize = 949;
 const SLOT_NET_FAILURE_STEP: usize = 928;
 const SLOT_NET_READY_IRQ_CREATE: usize = 929;
 const SLOT_NET_TX_IRQ_CREATE: usize = 930;
@@ -768,6 +776,7 @@ const SLOT_NET_PCI_CONFIG_NOTIFY_OFFSET: usize = 1030;
 const SLOT_NET_PCI_CONFIG_ISR_OFFSET: usize = 1031;
 const SLOT_NET_PCI_CONFIG_DEVICE_OFFSET: usize = 1032;
 const SLOT_NET_PCI_IRQ_MODE_SET: usize = 1033;
+const SLOT_NET_BAR0_DIRECT_LOOKUP: usize = 1034;
 const SLOT_VMO_INFO: usize = 1034;
 const SLOT_VMO_INFO_KIND: usize = 1035;
 const SLOT_VMO_INFO_BACKING_SCOPE: usize = 1036;
@@ -2121,7 +2130,7 @@ fn print_perf_summary(slots: &mut [u64]) {
 
 fn print_device_summary(slots: &[u64]) {
     crate::kprintln!(
-        "kernel: device vm interrupt smoke (device_present={}, device_failure_step={}, interrupt_create={}, interrupt_info={}, interrupt_mode={}, interrupt_vector={}, interrupt_flags={}, interrupt_wait_initial={}, interrupt_wait_initial_observed={}, interrupt_trigger={}, interrupt_wait_signaled={}, interrupt_wait_signaled_observed={}, interrupt_mask={}, interrupt_trigger_masked={}, interrupt_wait_masked={}, interrupt_unmask={}, interrupt_wait_unmasked={}, interrupt_wait_unmasked_observed={}, interrupt_ack1={}, interrupt_ack2={}, interrupt_wait_drained={}, contig_create={}, contig_lookup0={}, contig_lookup1={}, contig_paddr0={}, contig_paddr1={}, contig_is_contiguous={}, contig_pin_create={}, contig_pin_lookup0={}, contig_pin_lookup1={}, contig_pin_paddr0={}, contig_pin_paddr1={}, contig_pin_matches={}, contig_map={}, contig_write={}, contig_read={}, contig_read_match={}, physical_create={}, physical_lookup={}, physical_paddr={}, physical_matches_contig0={}, physical_pin_create={}, physical_pin_lookup={}, physical_pin_paddr={}, physical_pin_matches={}, physical_map={})",
+        "kernel: device vm interrupt smoke (device_present={}, device_failure_step={}, interrupt_create={}, interrupt_info={}, interrupt_mode={}, interrupt_vector={}, interrupt_flags={}, interrupt_wait_initial={}, interrupt_wait_initial_observed={}, interrupt_trigger={}, interrupt_wait_signaled={}, interrupt_wait_signaled_observed={}, interrupt_mask={}, interrupt_trigger_masked={}, interrupt_wait_masked={}, interrupt_unmask={}, interrupt_wait_unmasked={}, interrupt_wait_unmasked_observed={}, interrupt_ack1={}, interrupt_ack2={}, interrupt_wait_drained={}, contig_create={}, contig_info={}, contig_rights={}, contig_narrow_lookup={}, contig_narrow_pin={}, contig_lookup0={}, contig_lookup1={}, contig_paddr0={}, contig_paddr1={}, contig_is_contiguous={}, contig_pin_create={}, contig_pin_lookup0={}, contig_pin_lookup1={}, contig_pin_paddr0={}, contig_pin_paddr1={}, contig_pin_matches={}, contig_map={}, contig_write={}, contig_read={}, contig_read_match={}, physical_create={}, physical_info={}, physical_rights={}, physical_narrow_lookup={}, physical_narrow_pin={}, physical_lookup={}, physical_paddr={}, physical_matches_contig0={}, physical_pin_create={}, physical_pin_lookup={}, physical_pin_paddr={}, physical_pin_matches={}, physical_map={})",
         slots[SLOT_DEVICE_PRESENT],
         slots[SLOT_DEVICE_FAILURE_STEP],
         slots[SLOT_DEVICE_INTERRUPT_CREATE] as i64,
@@ -2144,6 +2153,10 @@ fn print_device_summary(slots: &[u64]) {
         slots[SLOT_DEVICE_INTERRUPT_ACK2] as i64,
         slots[SLOT_DEVICE_INTERRUPT_WAIT_DRAINED] as i64,
         slots[SLOT_DEVICE_CONTIG_CREATE] as i64,
+        slots[SLOT_DEVICE_CONTIG_INFO] as i64,
+        slots[SLOT_DEVICE_CONTIG_RIGHTS],
+        slots[SLOT_DEVICE_CONTIG_NARROW_LOOKUP] as i64,
+        slots[SLOT_DEVICE_CONTIG_NARROW_PIN] as i64,
         slots[SLOT_DEVICE_CONTIG_LOOKUP0] as i64,
         slots[SLOT_DEVICE_CONTIG_LOOKUP1] as i64,
         slots[SLOT_DEVICE_CONTIG_PADDR0],
@@ -2160,6 +2173,10 @@ fn print_device_summary(slots: &[u64]) {
         slots[SLOT_DEVICE_CONTIG_READ] as i64,
         slots[SLOT_DEVICE_CONTIG_READ_MATCH],
         slots[SLOT_DEVICE_PHYSICAL_CREATE] as i64,
+        slots[SLOT_DEVICE_PHYSICAL_INFO] as i64,
+        slots[SLOT_DEVICE_PHYSICAL_RIGHTS],
+        slots[SLOT_DEVICE_PHYSICAL_NARROW_LOOKUP] as i64,
+        slots[SLOT_DEVICE_PHYSICAL_NARROW_PIN] as i64,
         slots[SLOT_DEVICE_PHYSICAL_LOOKUP] as i64,
         slots[SLOT_DEVICE_PHYSICAL_PADDR],
         slots[SLOT_DEVICE_PHYSICAL_MATCHES_CONTIG0],
@@ -2173,7 +2190,7 @@ fn print_device_summary(slots: &[u64]) {
 
 fn print_net_summary(slots: &[u64]) {
     crate::kprintln!(
-        "kernel: net dataplane smoke (net_present={}, net_failure_step={}, ready_irq_create={}, tx_irq_create={}, rx_irq_create={}, config_backing_create={}, config_pin_create={}, config_dma_lookup={}, config_alias_create={}, config_alias_pin_create={}, config_alias_dma_lookup={}, config_alias_match={}, config_alias_map={}, config_backing_map={}, reg_backing_create={}, reg_pin_create={}, reg_dma_lookup={}, reg_backing_map={}, pci_config_info={}, pci_config_flags={}, pci_config_map_options={}, pci_config_map={}, pci_config_caps_ok={}, pci_config_common_bar={}, pci_config_common_offset={}, pci_config_notify_offset={}, pci_config_isr_offset={}, pci_config_device_offset={}, pci_irq_mode_info={}, pci_irq_mode_set={}, pci_irq_mode_flags={}, pci_irq_mode_base_vector={}, pci_irq_mode_vector_count={}, bar0_create={}, bar0_pin_create={}, bar0_dma_lookup={}, bar0_dma_info={}, bar0_dma_flags={}, bar0_dma_iova={}, bar0_match={}, bar0_map={}, queue_vmo_create={}, queue_pin_create={}, queue_dma_lookup={}, queue_dma_info={}, queue_dma_flags={}, queue_dma_iova={}, queue_map={}, worker_thread_create={}, worker_thread_start={}, ready_wait={}, ready_ack={}, tx_kick={}, worker_wait_kick={}, worker_ack_kick={}, worker_trigger_rx={}, rx_wait={}, rx_ack={}, tx_used_idx={}, rx_used_idx={}, tx_used_len={}, rx_used_len={}, packet_bytes={}, packet_match={}, driver_cpu={}, worker_cpu={}, worker_cpu1={}, pci_vendor_id={}, queue_pairs={}, mmio_ready={}, mmio_device_features={}, mmio_driver_features={}, mmio_status={}, tx_notify_count={}, rx_complete_count={}, tx_notify_mask={}, rx_complete_mask={}, tx_ready_mask={}, rx_ready_mask={}, packet_count={}, packet_match_count={}, batch_cycles={})",
+        "kernel: net dataplane smoke (net_present={}, net_failure_step={}, ready_irq_create={}, tx_irq_create={}, rx_irq_create={}, config_backing_create={}, config_pin_create={}, config_dma_lookup={}, config_alias_create={}, config_alias_pin_create={}, config_alias_dma_lookup={}, config_alias_match={}, config_alias_map={}, config_backing_map={}, reg_backing_create={}, reg_pin_create={}, reg_dma_lookup={}, reg_backing_map={}, pci_config_info={}, pci_config_flags={}, pci_config_map_options={}, pci_config_map={}, pci_config_caps_ok={}, pci_config_common_bar={}, pci_config_common_offset={}, pci_config_notify_offset={}, pci_config_isr_offset={}, pci_config_device_offset={}, pci_irq_mode_info={}, pci_irq_mode_set={}, pci_irq_mode_flags={}, pci_irq_mode_base_vector={}, pci_irq_mode_vector_count={}, bar0_create={}, bar0_pin_create={}, bar0_direct_lookup={}, bar0_dma_lookup={}, bar0_dma_info={}, bar0_dma_flags={}, bar0_dma_iova={}, bar0_match={}, bar0_map={}, queue_vmo_create={}, queue_pin_create={}, queue_dma_lookup={}, queue_dma_info={}, queue_dma_flags={}, queue_dma_iova={}, queue_map={}, worker_thread_create={}, worker_thread_start={}, ready_wait={}, ready_ack={}, tx_kick={}, worker_wait_kick={}, worker_ack_kick={}, worker_trigger_rx={}, rx_wait={}, rx_ack={}, tx_used_idx={}, rx_used_idx={}, tx_used_len={}, rx_used_len={}, packet_bytes={}, packet_match={}, driver_cpu={}, worker_cpu={}, worker_cpu1={}, pci_vendor_id={}, queue_pairs={}, mmio_ready={}, mmio_device_features={}, mmio_driver_features={}, mmio_status={}, tx_notify_count={}, rx_complete_count={}, tx_notify_mask={}, rx_complete_mask={}, tx_ready_mask={}, rx_ready_mask={}, packet_count={}, packet_match_count={}, batch_cycles={})",
         slots[SLOT_NET_PRESENT],
         slots[SLOT_NET_FAILURE_STEP],
         slots[SLOT_NET_READY_IRQ_CREATE] as i64,
@@ -2209,6 +2226,7 @@ fn print_net_summary(slots: &[u64]) {
         slots[SLOT_NET_PCI_IRQ_MODE_VECTOR_COUNT],
         slots[SLOT_NET_BAR0_CREATE] as i64,
         slots[SLOT_NET_BAR0_PIN_CREATE] as i64,
+        slots[SLOT_NET_BAR0_DIRECT_LOOKUP] as i64,
         slots[SLOT_NET_BAR0_LOOKUP] as i64,
         slots[SLOT_NET_BAR0_DMA_INFO] as i64,
         slots[SLOT_NET_BAR0_DMA_FLAGS],

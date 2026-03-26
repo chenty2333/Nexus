@@ -161,11 +161,11 @@ impl KernelPort {
         self.state.queue_kernel(pkt)
     }
 
-    pub(crate) fn retain_kernel_packets<F>(&mut self, keep: F) -> usize
+    pub(crate) fn drain_kernel_packets_where<F>(&mut self, keep: F) -> alloc::vec::Vec<Packet>
     where
         F: FnMut(&Packet) -> bool,
     {
-        self.state.retain_kernel_packets(keep)
+        self.state.drain_kernel_packets_where(keep)
     }
 
     pub(crate) fn telemetry_snapshot(&self) -> PortTelemetrySnapshot {

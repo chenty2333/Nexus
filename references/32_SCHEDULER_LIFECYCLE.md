@@ -138,6 +138,10 @@ Processes currently move through states such as:
   - resume current thread
   - switch to another runnable thread
   - block the current CPU when no runnable thread exists
+- Idle-loop runtime failures are now fail-closed:
+  - the kernel records one fatal context
+  - marks the current CPU execution as fatally broken when it can still reach kernel state
+  - exits to the bugcheck/halt path instead of panicking through the ordinary scheduler loop
 - Wakeup and timeout paths both complete the parked wait first, then feed back into
   `make_thread_runnable()`.
 - Wakeups from blocked states are still pushed to the front of the selected CPU run queue.
@@ -208,6 +212,10 @@ The first "non-bootstrap substrate" scheduler contract is now implemented.
 ## Current limitations
 
 - Blocked current execution still relies on `sti; hlt` when the current CPU has no runnable work.
+- The current kernel-global access path still uses one global lock, but lock acquisition is no
+  longer unbounded:
+  - long-held or no-progress lock contention now escalates into the kernel fatal handler instead of
+    spinning forever
 - Page-fault trap handling now enforces a bounded spin limit (`MAX_SPIN_ITERATIONS`) on fault
   contention, preventing infinite fault-retry loops from starving the scheduler.
 - The `Suspended` trap-exit path now correctly checks suspension state after the trap completes,

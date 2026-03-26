@@ -40,16 +40,16 @@ use libzircon::pci::{
     zx_pci_interrupt_mode_info_t, zx_pci_resource_info_t,
 };
 use libzircon::signals::{ZX_INTERRUPT_SIGNALED, ZX_TASK_TERMINATED};
-use libzircon::status::{ZX_ERR_NOT_FOUND, ZX_OK};
+use libzircon::status::{ZX_ERR_ACCESS_DENIED, ZX_ERR_NOT_FOUND, ZX_OK};
 use libzircon::syscall_numbers::AXLE_SYS_VMAR_MAP;
 use libzircon::vm::{ZX_VM_MAP_MMIO, ZX_VM_PERM_READ, ZX_VM_PERM_WRITE};
 use libzircon::{
     ax_dma_region_get_info, ax_dma_region_get_segment, ax_interrupt_trigger,
     ax_pci_device_get_info, ax_pci_device_get_interrupt, ax_pci_device_get_interrupt_mode,
     ax_pci_device_get_resource, ax_pci_device_get_resource_count, ax_pci_device_set_interrupt_mode,
-    ax_vmo_pin, zx_handle_close, zx_handle_t, zx_interrupt_ack, zx_interrupt_get_info,
-    zx_object_wait_one, zx_signals_t, zx_status_t, zx_task_kill, zx_thread_create, zx_thread_start,
-    zx_vmo_create_contiguous,
+    ax_vmo_lookup_paddr, ax_vmo_pin, zx_handle_close, zx_handle_t, zx_interrupt_ack,
+    zx_interrupt_get_info, zx_object_wait_one, zx_signals_t, zx_status_t, zx_task_kill,
+    zx_thread_create, zx_thread_start, zx_vmo_create_contiguous,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
@@ -141,6 +141,7 @@ const SLOT_NET_PCI_CONFIG_NOTIFY_OFFSET: usize = 1030;
 const SLOT_NET_PCI_CONFIG_ISR_OFFSET: usize = 1031;
 const SLOT_NET_PCI_CONFIG_DEVICE_OFFSET: usize = 1032;
 const SLOT_NET_PCI_IRQ_MODE_SET: usize = 1033;
+const SLOT_NET_BAR0_DIRECT_LOOKUP: usize = 1034;
 
 const STEP_PANIC: u64 = u64::MAX;
 const STEP_ROOT_VMAR: u64 = 1;
@@ -181,6 +182,7 @@ const STEP_PCI_CONFIG_INFO: u64 = 43;
 const STEP_PCI_CONFIG_MAP: u64 = 44;
 const STEP_PCI_CONFIG_CAPS: u64 = 45;
 const STEP_PCI_IRQ_MODE_SET: u64 = 46;
+const STEP_BAR0_DIRECT_LOOKUP: u64 = 47;
 
 const WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
 const WORKER_STACK_BYTES: usize = 4096;
@@ -244,6 +246,7 @@ struct NetSummary {
     queue_map: i64,
     bar0_create: i64,
     bar0_pin_create: i64,
+    bar0_direct_lookup: i64,
     bar0_dma_lookup: i64,
     bar0_dma_info: i64,
     bar0_dma_flags: u64,
@@ -682,6 +685,16 @@ fn run_net_smoke() -> NetSummary {
     ) as i64;
     if summary.bar0_pin_create != ZX_OK as i64 {
         summary.failure_step = STEP_BAR0_PIN_CREATE;
+        close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
+        return summary;
+    }
+
+    let mut denied_bar0_paddr = 0u64;
+    summary.bar0_direct_lookup =
+        ax_vmo_lookup_paddr(owned_handles[OWNED_BAR0_VMO], 0, &mut denied_bar0_paddr) as i64;
+    if summary.bar0_direct_lookup != ZX_ERR_ACCESS_DENIED as i64 {
+        summary.failure_step = STEP_BAR0_DIRECT_LOOKUP;
+        close_bootstrap_pci_resources(&bootstrap_resources);
         close_handle_sets(&[&rx_irqs, &tx_irqs, &ready_irqs], &owned_handles);
         return summary;
     }
@@ -1832,6 +1845,10 @@ fn write_summary(summary: &NetSummary) {
         summary.pci_irq_mode_vector_count,
     );
     write_slot(SLOT_NET_BAR0_CREATE, summary.bar0_create as u64);
+    write_slot(
+        SLOT_NET_BAR0_DIRECT_LOOKUP,
+        summary.bar0_direct_lookup as u64,
+    );
     write_slot(SLOT_NET_BAR0_LOOKUP, summary.bar0_dma_lookup as u64);
     write_slot(SLOT_NET_BAR0_DMA_INFO, summary.bar0_dma_info as u64);
     write_slot(SLOT_NET_BAR0_DMA_FLAGS, summary.bar0_dma_flags);

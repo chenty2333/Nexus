@@ -147,6 +147,18 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
     })
 }
 
+fn require_root_job_dma_memory_authority(state: &KernelState) -> Result<(), zx_status_t> {
+    let caller_job_id = state.with_core(|kernel| {
+        let process = kernel.current_process_info()?;
+        kernel.process_job_id(process.process_id())
+    })?;
+    let root_job_id = state.with_kernel(|kernel| Ok(kernel.root_job_id()))?;
+    if caller_job_id != root_job_id {
+        return Err(ZX_ERR_ACCESS_DENIED);
+    }
+    Ok(())
+}
+
 /// Create one public physical/MMIO-style VMO over an existing page-aligned span.
 ///
 /// # Privilege
@@ -165,16 +177,7 @@ pub fn create_physical_vmo(
     }
 
     with_state_mut(|state| {
-        // Privilege gate: only processes that run in the root job may create
-        // physical VMOs.
-        let caller_job_id = state.with_core(|kernel| {
-            let process = kernel.current_process_info()?;
-            kernel.process_job_id(process.process_id())
-        })?;
-        let root_job_id = state.with_kernel(|kernel| Ok(kernel.root_job_id()))?;
-        if caller_job_id != root_job_id {
-            return Err(ZX_ERR_ACCESS_DENIED);
-        }
+        require_root_job_dma_memory_authority(state)?;
 
         let object_id = state.alloc_object_id();
         let global_vmo_id = state.with_kernel_mut(|kernel| Ok(kernel.allocate_global_vmo_id()))?;
@@ -197,7 +200,7 @@ pub fn create_physical_vmo(
             Ok(())
         })?;
 
-        match state.alloc_handle_for_object(object_id, handle::vmo_default_rights()) {
+        match state.alloc_handle_for_object(object_id, handle::dma_vmo_rights()) {
             Ok(handle) => Ok(handle),
             Err(err) => {
                 let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
@@ -214,6 +217,8 @@ pub fn create_contiguous_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_
     }
 
     with_state_mut(|state| {
+        require_root_job_dma_memory_authority(state)?;
+
         let object_id = state.alloc_object_id();
         let global_vmo_id = state.with_kernel_mut(|kernel| Ok(kernel.allocate_global_vmo_id()))?;
         let process_id =
@@ -235,7 +240,7 @@ pub fn create_contiguous_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_
             Ok(())
         })?;
 
-        match state.alloc_handle_for_object(object_id, handle::vmo_default_rights()) {
+        match state.alloc_handle_for_object(object_id, handle::dma_vmo_rights()) {
             Ok(handle) => Ok(handle),
             Err(err) => {
                 let _ = state.with_objects_mut(|objects| Ok(objects.remove(object_id)));
@@ -401,7 +406,7 @@ pub fn pin_vmo(
     }
 
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::MAP)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::PIN)?;
         let object_key = resolved.object_key();
         let vmo = state.with_objects(|objects| {
             Ok(match objects.get(object_key) {
@@ -446,7 +451,7 @@ pub fn pin_vmo(
 /// Return the physical address backing one offset inside a pinned DMA region.
 pub fn lookup_dma_region_paddr(handle: zx_handle_t, offset: u64) -> Result<u64, zx_status_t> {
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT_LAYOUT)?;
         Ok(
             state.with_objects(|objects| match objects.get(resolved.object_key()) {
                 Some(KernelObject::DmaRegion(region)) => region.lookup_paddr(offset),
@@ -462,7 +467,7 @@ pub fn dma_region_get_info(
     handle: zx_handle_t,
 ) -> Result<axle_types::ax_dma_region_info_t, zx_status_t> {
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT_LAYOUT)?;
         state.with_objects(|objects| match objects.get(resolved.object_key()) {
             Some(KernelObject::DmaRegion(region)) => region.info(),
             Some(_) => Err(ZX_ERR_WRONG_TYPE),
@@ -477,7 +482,7 @@ pub fn dma_region_get_segment_info(
     segment_index: u32,
 ) -> Result<axle_types::ax_dma_segment_info_t, zx_status_t> {
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT_LAYOUT)?;
         state.with_objects(|objects| match objects.get(resolved.object_key()) {
             Some(KernelObject::DmaRegion(region)) => region.segment_info(segment_index),
             Some(_) => Err(ZX_ERR_WRONG_TYPE),
@@ -489,7 +494,7 @@ pub fn dma_region_get_segment_info(
 /// Return the device-visible IOVA backing one offset inside a pinned DMA region.
 pub fn lookup_dma_region_iova(handle: zx_handle_t, offset: u64) -> Result<u64, zx_status_t> {
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT_LAYOUT)?;
         Ok(
             state.with_objects(|objects| match objects.get(resolved.object_key()) {
                 Some(KernelObject::DmaRegion(region)) => region.lookup_iova(offset),
@@ -503,7 +508,7 @@ pub fn lookup_dma_region_iova(handle: zx_handle_t, offset: u64) -> Result<u64, z
 /// Return the physical address backing one physical/contiguous VMO offset.
 pub fn lookup_vmo_paddr(handle: zx_handle_t, offset: u64) -> Result<u64, zx_status_t> {
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::READ)?;
+        let resolved = state.lookup_handle(handle, crate::task::HandleRights::INSPECT_LAYOUT)?;
         let vmo = state.with_objects(|objects| {
             Ok(match objects.get(resolved.object_key()) {
                 Some(KernelObject::Vmo(vmo)) => vmo.clone(),

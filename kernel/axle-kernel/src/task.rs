@@ -38,9 +38,9 @@ use axle_page_table::{
 use axle_types::rights::{
     ZX_RIGHT_APPLY_PROFILE, ZX_RIGHT_DESTROY, ZX_RIGHT_DUPLICATE, ZX_RIGHT_ENUMERATE,
     ZX_RIGHT_EXECUTE, ZX_RIGHT_GET_POLICY, ZX_RIGHT_GET_PROPERTY, ZX_RIGHT_INSPECT,
-    ZX_RIGHT_MANAGE_JOB, ZX_RIGHT_MANAGE_PROCESS, ZX_RIGHT_MANAGE_THREAD, ZX_RIGHT_MAP,
-    ZX_RIGHT_READ, ZX_RIGHT_SET_POLICY, ZX_RIGHT_SET_PROPERTY, ZX_RIGHT_SIGNAL,
-    ZX_RIGHT_SIGNAL_PEER, ZX_RIGHT_TRANSFER, ZX_RIGHT_WAIT, ZX_RIGHT_WRITE,
+    ZX_RIGHT_INSPECT_LAYOUT, ZX_RIGHT_MANAGE_JOB, ZX_RIGHT_MANAGE_PROCESS, ZX_RIGHT_MANAGE_THREAD,
+    ZX_RIGHT_MAP, ZX_RIGHT_PIN, ZX_RIGHT_READ, ZX_RIGHT_SET_POLICY, ZX_RIGHT_SET_PROPERTY,
+    ZX_RIGHT_SIGNAL, ZX_RIGHT_SIGNAL_PEER, ZX_RIGHT_TRANSFER, ZX_RIGHT_WAIT, ZX_RIGHT_WRITE,
 };
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
@@ -447,6 +447,8 @@ bitflags! {
         const MANAGE_PROCESS = ZX_RIGHT_MANAGE_PROCESS;
         const MANAGE_THREAD = ZX_RIGHT_MANAGE_THREAD;
         const APPLY_PROFILE = ZX_RIGHT_APPLY_PROFILE;
+        const PIN = ZX_RIGHT_PIN;
+        const INSPECT_LAYOUT = ZX_RIGHT_INSPECT_LAYOUT;
     }
 }
 
@@ -1462,6 +1464,7 @@ impl AddressSpace {
 struct Thread {
     process_id: ProcessId,
     koid: zx_koid_t,
+    kernel_faulted: bool,
     guest_started: bool,
     guest_fs_base: u64,
     fpu_state: Box<crate::arch::fpu::FpuState>,
@@ -1524,6 +1527,7 @@ pub(crate) struct Kernel {
     reactor: Arc<Mutex<Reactor>>,
     cpu_schedulers: BTreeMap<usize, CpuSchedulerState>,
     revocations: RevocationManager,
+    revocable_waits: axle_core::DeferredRevocationIndex<ThreadId>,
     next_koid: zx_koid_t,
     next_job_id: JobId,
     next_process_id: ProcessId,
@@ -2020,7 +2024,21 @@ impl Kernel {
 
     pub(crate) fn sync_current_cpu_tlb_state(&mut self) -> Result<(), zx_status_t> {
         let current_cpu_id = self.current_cpu_id();
-        let current_address_space_id = self.current_process()?.address_space_id;
+        let current_address_space_id = match self.current_thread_id() {
+            Ok(thread_id) => self
+                .threads
+                .get(&thread_id)
+                .ok_or(ZX_ERR_BAD_STATE)
+                .and_then(|thread| self.process(thread.process_id))
+                .map(|process| process.address_space_id)?,
+            Err(ZX_ERR_BAD_STATE) => {
+                // An online CPU can take timer ticks before an activation binds a
+                // runnable thread. In that bootstrap/idle window there is no user
+                // address space to synchronize, so treat the tick as a no-op.
+                return Ok(());
+            }
+            Err(status) => return Err(status),
+        };
         self.with_vm_mut(|vm| {
             vm.sync_current_cpu_tlb_state(current_address_space_id, current_cpu_id)
         })

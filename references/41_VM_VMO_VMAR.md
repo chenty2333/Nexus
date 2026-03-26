@@ -97,10 +97,20 @@ Current user-facing object creation is much narrower:
 - Pager-backed VMOs exist internally for bootstrap code images and loader-backed sources.
 - `zx_vmo_create_physical(base_paddr, size, 0, out)` now creates one shared physical/MMIO-style VMO
   over an existing page-aligned physical span.
+  - creation is currently gated by root-job membership
+  - the returned handle is one explicit DMA-capable handle that carries
+    `AX_RIGHT_PIN` / `ZX_RIGHT_PIN` and
+    `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
 - `zx_vmo_create_contiguous(size, 0, out)` now creates one shared contiguous VMO suitable for the
   current narrow DMA-oriented bootstrap path.
+  - creation is currently gated by root-job membership under that same DMA-capable memory boundary
+  - the returned handle is one explicit DMA-capable handle that carries
+    `AX_RIGHT_PIN` / `ZX_RIGHT_PIN` and
+    `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
 - `ax_vmo_lookup_paddr(handle, offset, out_paddr)` is the current Axle-native helper for resolving
   the physical address backing one physical/contiguous VMO offset.
+  - it now requires `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
+  - `Contiguous` as a VMO kind is not by itself equivalent to publicly inspectable physical layout
 - `ax_vmo_get_info(handle, out_info)` is the first narrow public object-level metadata query over
   those same VMO families:
   - it reports size / kind / backing scope / behavior flags / effective rights
@@ -122,6 +132,9 @@ Current user-facing object creation is much narrower:
     inside `vmar`
   - it exposes one new handle over that backing using the current mapping
     permissions as the public rights ceiling
+  - it does not manufacture DMA-layout authority: captured handles do not gain
+    `AX_RIGHT_PIN` / `ZX_RIGHT_PIN` or
+    `AX_RIGHT_INSPECT_LAYOUT` / `ZX_RIGHT_INSPECT_LAYOUT`
   - it intentionally captures one control-plane view of mapping truth rather
     than per-page state
 
@@ -159,6 +172,8 @@ Current object/syscall paths support:
   - `ax_vmar_get_mapping_vmo(vmar, addr, out_vmo)`
   - the helper stays generic and names the backing VMO currently installed for
     that mapping rather than exporting Linux VMA metadata
+  - the captured handle follows mapping/map-permission truth and never re-exports
+    DMA-only rights such as `PIN` or layout inspection
 - one narrow subrange split path for `unmap` / `protect`:
   - one exact-range fast path still exists for whole-mapping operations
   - one single-covering-VMA subrange path now exists for dynamic-loader style

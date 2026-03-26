@@ -514,6 +514,7 @@ impl Kernel {
             reactor,
             cpu_schedulers: BTreeMap::new(),
             revocations: RevocationManager::new(),
+            revocable_waits: axle_core::DeferredRevocationIndex::new(),
             next_koid: 1,
             next_job_id: 1,
             next_process_id: 1,
@@ -556,6 +557,7 @@ impl Kernel {
             Thread {
                 process_id,
                 koid: thread_koid,
+                kernel_faulted: false,
                 guest_started: false,
                 guest_fs_base: 0,
                 fpu_state: Box::new(crate::arch::fpu::clean_state()),

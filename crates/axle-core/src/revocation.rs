@@ -8,10 +8,11 @@
 //! - `revoke(group)` increments epoch, invalidating all refs from earlier epochs.
 //! - A `generation` field prevents stale tokens from revoking a recycled group id.
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 /// A stable group identifier (index into the manager's group table).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RevocationGroupId(u32);
 
 impl RevocationGroupId {
@@ -123,6 +124,176 @@ impl RevocationSet {
         self.refs().into_iter().flatten().any(|rev| {
             rev.id() == group && rev.generation() == generation && rev.epoch() < current_epoch
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RevocationGroupKey {
+    id: RevocationGroupId,
+    generation: u64,
+}
+
+impl RevocationGroupKey {
+    const fn new(id: RevocationGroupId, generation: u64) -> Self {
+        Self { id, generation }
+    }
+}
+
+/// Reverse index for deferred control-plane state whose registrations are unique.
+///
+/// Each indexed item may carry up to two revocation references through
+/// [`RevocationSet`]. The index groups those items by `(group_id, generation)`
+/// so revoke-time collection can walk only the registrations that might match
+/// the revoked group instead of scanning every live registration globally.
+#[derive(Debug)]
+pub struct DeferredRevocationIndex<T> {
+    by_group: BTreeMap<RevocationGroupKey, BTreeSet<T>>,
+}
+
+impl<T> Default for DeferredRevocationIndex<T> {
+    fn default() -> Self {
+        Self {
+            by_group: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T> DeferredRevocationIndex<T>
+where
+    T: Copy + Ord,
+{
+    /// Create an empty reverse index.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one deferred item under every revocation reference it carries.
+    pub fn insert(&mut self, item: T, revocation: RevocationSet) {
+        for rev in revocation.refs().into_iter().flatten() {
+            self.by_group
+                .entry(RevocationGroupKey::new(rev.id(), rev.generation()))
+                .or_default()
+                .insert(item);
+        }
+    }
+
+    /// Remove one deferred item from every revocation reference it carries.
+    pub fn remove(&mut self, item: T, revocation: RevocationSet) {
+        for rev in revocation.refs().into_iter().flatten() {
+            self.remove_from_group(item, RevocationGroupKey::new(rev.id(), rev.generation()));
+        }
+    }
+
+    /// Replace one item's revocation provenance.
+    pub fn replace(&mut self, item: T, old: RevocationSet, new: RevocationSet) {
+        self.remove(item, old);
+        self.insert(item, new);
+    }
+
+    /// Candidate items that may match one revoke operation.
+    pub fn candidates(&self, group: RevocationGroupId, generation: u64) -> Vec<T> {
+        self.by_group
+            .get(&RevocationGroupKey::new(group, generation))
+            .map(|entries| entries.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn remove_from_group(&mut self, item: T, key: RevocationGroupKey) {
+        let should_remove_group = if let Some(entries) = self.by_group.get_mut(&key) {
+            let _ = entries.remove(&item);
+            entries.is_empty()
+        } else {
+            false
+        };
+        if should_remove_group {
+            let _ = self.by_group.remove(&key);
+        }
+    }
+}
+
+/// Reverse index for deferred control-plane state that may have multiple live
+/// registrations for the same `(group, item)` pair.
+///
+/// This is used for kernel-generated port packets where one port can retain
+/// multiple queued packets created through the same revocation group epoch.
+#[derive(Debug)]
+pub struct DeferredRevocationCountIndex<T> {
+    by_group: BTreeMap<RevocationGroupKey, BTreeMap<T, usize>>,
+}
+
+impl<T> Default for DeferredRevocationCountIndex<T> {
+    fn default() -> Self {
+        Self {
+            by_group: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T> DeferredRevocationCountIndex<T>
+where
+    T: Copy + Ord,
+{
+    /// Create an empty counted reverse index.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one counted deferred item.
+    pub fn insert(&mut self, item: T, revocation: RevocationSet) {
+        for rev in revocation.refs().into_iter().flatten() {
+            let group = self
+                .by_group
+                .entry(RevocationGroupKey::new(rev.id(), rev.generation()))
+                .or_default();
+            let count = group.entry(item).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    /// Remove one counted deferred item.
+    pub fn remove(&mut self, item: T, revocation: RevocationSet) {
+        for rev in revocation.refs().into_iter().flatten() {
+            self.remove_from_group(item, RevocationGroupKey::new(rev.id(), rev.generation()));
+        }
+    }
+
+    /// Candidate items that may match one revoke operation.
+    pub fn candidates(&self, group: RevocationGroupId, generation: u64) -> Vec<T> {
+        self.by_group
+            .get(&RevocationGroupKey::new(group, generation))
+            .map(|entries| entries.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove every counted membership for `item`, regardless of group.
+    ///
+    /// This is intended for cold destroy paths rather than revoke-time hot
+    /// paths, so it prefers coherence over asymptotic optimality.
+    pub fn remove_all(&mut self, item: T) {
+        let groups = self.by_group.keys().copied().collect::<Vec<_>>();
+        for group in groups {
+            self.remove_from_group(item, group);
+        }
+    }
+
+    fn remove_from_group(&mut self, item: T, key: RevocationGroupKey) {
+        let should_remove_group = if let Some(entries) = self.by_group.get_mut(&key) {
+            let should_remove_item = if let Some(count) = entries.get_mut(&item) {
+                *count = count.saturating_sub(1);
+                *count == 0
+            } else {
+                false
+            };
+            if should_remove_item {
+                let _ = entries.remove(&item);
+            }
+            entries.is_empty()
+        } else {
+            false
+        };
+        if should_remove_group {
+            let _ = self.by_group.remove(&key);
+        }
     }
 }
 
@@ -271,6 +442,44 @@ mod tests {
         assert_eq!(tok2.id(), id);
         assert_ne!(tok2.generation, tok1.generation);
         mgr.revoke(tok2).unwrap();
+    }
+
+    #[test]
+    fn deferred_revocation_index_tracks_unique_candidates_by_group() {
+        let mut mgr = RevocationManager::new();
+        let live = mgr.create_group();
+        let other = mgr.create_group();
+        let live_ref = mgr.snapshot(live).unwrap();
+        let other_ref = mgr.snapshot(other).unwrap();
+
+        let mut index = DeferredRevocationIndex::new();
+        index.insert(7u64, RevocationSet::pair(Some(live_ref), Some(other_ref)));
+        index.insert(9u64, RevocationSet::one(Some(other_ref)));
+
+        assert_eq!(index.candidates(live.id(), live.generation()), vec![7]);
+        assert_eq!(index.candidates(other.id(), other.generation()), vec![7, 9]);
+
+        index.remove(7, RevocationSet::pair(Some(live_ref), Some(other_ref)));
+        assert!(index.candidates(live.id(), live.generation()).is_empty());
+        assert_eq!(index.candidates(other.id(), other.generation()), vec![9]);
+    }
+
+    #[test]
+    fn deferred_revocation_count_index_tracks_multiple_memberships() {
+        let mut mgr = RevocationManager::new();
+        let group = mgr.create_group();
+        let rev = mgr.snapshot(group).unwrap();
+
+        let mut index = DeferredRevocationCountIndex::new();
+        index.insert(42u64, RevocationSet::one(Some(rev)));
+        index.insert(42u64, RevocationSet::one(Some(rev)));
+        assert_eq!(index.candidates(group.id(), group.generation()), vec![42]);
+
+        index.remove(42, RevocationSet::one(Some(rev)));
+        assert_eq!(index.candidates(group.id(), group.generation()), vec![42]);
+
+        index.remove(42, RevocationSet::one(Some(rev)));
+        assert!(index.candidates(group.id(), group.generation()).is_empty());
     }
 
     proptest! {

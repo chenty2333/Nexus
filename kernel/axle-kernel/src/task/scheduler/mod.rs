@@ -19,6 +19,7 @@ pub(super) struct CpuSchedulerState {
     slice_deadline_ns: Option<i64>,
     last_rebalance_ns: Option<i64>,
     online: bool,
+    fatal: bool,
     /// EEVDF: monotonically non-decreasing floor of vruntime across all runnable threads on this CPU.
     pub(crate) min_vruntime: i64,
 }
@@ -34,6 +35,7 @@ impl CpuSchedulerState {
             slice_deadline_ns: now.checked_add(DEFAULT_TIME_SLICE_NS),
             last_rebalance_ns: Some(now),
             online: true,
+            fatal: false,
             min_vruntime: 0,
         }
     }
@@ -80,7 +82,28 @@ impl Kernel {
     }
 
     pub(crate) fn mark_cpu_online(&mut self, cpu_id: usize) {
-        self.cpu_scheduler_mut(cpu_id).online = true;
+        let scheduler = self.cpu_scheduler_mut(cpu_id);
+        scheduler.online = true;
+        scheduler.fatal = false;
+    }
+
+    pub(crate) fn mark_current_cpu_fatal(&mut self) {
+        let current_cpu_id = self.current_cpu_id();
+        let current_thread_id = self
+            .cpu_schedulers
+            .get(&current_cpu_id)
+            .and_then(|scheduler| scheduler.current_thread_id);
+        let scheduler = self.cpu_scheduler_mut(current_cpu_id);
+        scheduler.online = false;
+        scheduler.fatal = true;
+        scheduler.reschedule_requested = false;
+        scheduler.current_runtime_started_ns = None;
+        scheduler.slice_deadline_ns = None;
+        if let Some(thread_id) = current_thread_id
+            && let Some(thread) = self.threads.get_mut(&thread_id)
+        {
+            thread.kernel_faulted = true;
+        }
     }
 
     pub(super) fn request_reschedule_on_cpu(&mut self, cpu_id: usize) {

@@ -80,6 +80,9 @@ fn queue_kernel_signal_packet(
             Ok(port.queue_kernel(packet).is_ok())
         })
         .unwrap_or(false);
+    if queued {
+        state.note_port_kernel_packet(port_key, packet.revocation);
+    }
     queued
 }
 
@@ -93,6 +96,7 @@ fn pop_port_packet_locked(
         };
         port.pop().map_err(object::map_port_error)
     })?;
+    state.forget_port_kernel_packet(port_key, packet.revocation);
     state.with_reactor_mut(|reactor| {
         reactor
             .observers_mut()
@@ -230,7 +234,7 @@ pub fn port_wait(
                 } else {
                     let now = crate::time::now_ns();
                     if deadline <= now {
-                        let _ = on_tick_locked(state);
+                        on_tick_locked_or_fatal(state, object::KernelFatalKind::WaitTickPoll);
                         let packet = pop_port_packet_locked(state, object_key);
                         return match packet {
                             Ok(packet) => {
@@ -321,7 +325,7 @@ pub fn object_wait_one(
         }
 
         if deadline != i64::MAX && deadline <= crate::time::now_ns() {
-            let _ = on_tick_locked(state);
+            on_tick_locked_or_fatal(state, object::KernelFatalKind::WaitTickPoll);
             let observed = object::signals_for_object_id(state, object_key)?;
             if observed.intersects(watched) {
                 return Ok(WaitOneOutcome::Completed {
@@ -407,7 +411,15 @@ pub fn object_wait_async(
 ///
 /// Fires due timers and notifies `wait_async` observers.
 pub fn on_tick() {
-    let _ = object::with_state_mut(|state| on_tick_locked(state));
+    if let Err(status) = object::with_state_mut(on_tick_locked) {
+        object::kernel_fatal(object::KernelFatalKind::TimerTickPoll, status);
+    }
+}
+
+fn on_tick_locked_or_fatal(state: &object::KernelState, kind: object::KernelFatalKind) {
+    if let Err(status) = on_tick_locked(state) {
+        object::kernel_fatal(kind, status);
+    }
 }
 
 fn on_tick_locked(state: &object::KernelState) -> Result<(), zx_status_t> {
@@ -423,7 +435,9 @@ fn on_tick_locked(state: &object::KernelState) -> Result<(), zx_status_t> {
             }
         }
     }
-    let _ = state.with_kernel_mut(|kernel| kernel.sync_current_cpu_tlb_state());
+    if let Err(status) = state.with_kernel_mut(|kernel| kernel.sync_current_cpu_tlb_state()) {
+        object::kernel_fatal(object::KernelFatalKind::TimerTickTlbSync, status);
+    }
     Ok(())
 }
 

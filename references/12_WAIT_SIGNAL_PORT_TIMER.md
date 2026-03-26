@@ -67,6 +67,10 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   - `wait_async` observers
   - armed timer deadlines
   - queued kernel-generated signal packets already sitting in ports
+- That cleanup path no longer relies on revoke-time global scans.
+  Current mainline keeps per-group reverse indexes for observer registrations, revocable blocked
+  waits, armed timers, and queued kernel packets, then re-checks live provenance only for the
+  candidate registrations of the revoked group.
 - Revocation does **not** roll back already committed data-plane effects.
   Channel messages, socket bytes/datagrams, completed handle transfer, and completed VM/object
   operations remain committed even if the originating handle epoch is later revoked.
@@ -153,9 +157,17 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   - publishes timer-object `SIGNALED` transitions
   - wakes expired blocked waits
   - syncs current CPU TLB state
+  - any invariant break in that poll / publish / TLB-sync path now enters the kernel fatal handler
+    and halts/bugchecks the affected runtime rather than being silently dropped
+  - one online CPU that has not yet bound a runnable thread is treated as an expected empty state;
+    timer-driven TLB sync is a no-op there instead of a fatal `BAD_STATE`
 - Kernel-mode timer interrupts no longer run the full wait/reactor poll path on an already
   suspended trap stack; instead, trap-blocking wait paths poll the same backend immediately after
   they wake from the `hlt` edge.
+- Deadline-boundary re-polls in `object_wait_one()` / `zx_port_wait()` now share that same
+  fail-closed rule:
+  - they may still complete successfully or return `TIMED_OUT`
+  - but internal wait/timer invariant breaks are not converted into user-visible soft errors
 - Backend storage is slot-owned by CPU, so timer objects and wait deadlines already share the same
   enqueue/cancel/poll path and telemetry surface.
 - When x86_64 TSC-deadline timers are available, each online CPU now drives its own timer poll.

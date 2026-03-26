@@ -55,13 +55,15 @@ The current bootstrap transport includes:
   - ring3 re-fetches one interrupt handle and verifies the object metadata now reports
     `ZX_INTERRUPT_MODE_MSI` and no triggerable flag
   - ring3 then switches back to `VIRTUAL` before driving the current bootstrap transport
-- one shared queue/buffer window allocated through `zx_vmo_create_contiguous()`
+- one shared queue/buffer window allocated through root-gated `zx_vmo_create_contiguous()`
 - one explicit `DmaRegion` lifetime object over:
   - the queue memory
   - the exported BAR0 VMO
 - both current DMA-region creations now also freeze one first DMA-permission shape:
   - `DEVICE_READ`
   - `DEVICE_WRITE`
+- BAR-exported VMO handles may pin that window for DMA but do not directly expose
+  `ax_vmo_lookup_paddr()`
 - one DMA-region address lookup through `ax_dma_region_lookup_iova()` rather than one raw
   `ax_vmo_lookup_paddr()` handoff
 - one DMA-region metadata query through `ax_dma_region_get_info()`:

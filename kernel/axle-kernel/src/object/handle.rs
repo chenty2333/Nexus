@@ -301,6 +301,7 @@ pub(super) fn dma_region_default_rights() -> crate::task::HandleRights {
     crate::task::HandleRights::DUPLICATE
         | crate::task::HandleRights::TRANSFER
         | crate::task::HandleRights::INSPECT
+        | crate::task::HandleRights::INSPECT_LAYOUT
 }
 
 pub(super) fn pci_device_default_rights() -> crate::task::HandleRights {
@@ -325,6 +326,27 @@ pub(super) fn vmo_default_rights() -> crate::task::HandleRights {
         | crate::task::HandleRights::EXECUTE
         | crate::task::HandleRights::INSPECT
         | crate::task::HandleRights::MAP
+}
+
+pub(super) fn dma_vmo_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::READ
+        | crate::task::HandleRights::WRITE
+        | crate::task::HandleRights::INSPECT
+        | crate::task::HandleRights::MAP
+        | crate::task::HandleRights::PIN
+        | crate::task::HandleRights::INSPECT_LAYOUT
+}
+
+pub(super) fn pci_bar_vmo_rights() -> crate::task::HandleRights {
+    crate::task::HandleRights::DUPLICATE
+        | crate::task::HandleRights::TRANSFER
+        | crate::task::HandleRights::READ
+        | crate::task::HandleRights::WRITE
+        | crate::task::HandleRights::INSPECT
+        | crate::task::HandleRights::MAP
+        | crate::task::HandleRights::PIN
 }
 
 pub(super) fn bootstrap_code_vmo_rights() -> crate::task::HandleRights {

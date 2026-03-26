@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use crate::capability::ObjectKey;
 use crate::port::{Packet, PortError, PortKey, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId};
-use crate::revocation::{RevocationGroupId, RevocationSet};
+use crate::revocation::{DeferredRevocationIndex, RevocationGroupId, RevocationSet};
 use crate::signals::Signals;
 use crate::timer::Time;
 
@@ -132,6 +132,7 @@ pub struct ObserverRegistry {
     waitables_by_port: BTreeMap<ObserverPortId, BTreeSet<WaitableId>>,
     pending_order_by_port: BTreeMap<ObserverPortId, VecDeque<ObserverRegistration>>,
     telemetry_by_port: BTreeMap<ObserverPortId, ObserverPortTelemetry>,
+    revocation_index: DeferredRevocationIndex<ObserverRegistration>,
 }
 
 impl ObserverRegistry {
@@ -180,6 +181,7 @@ impl ObserverRegistry {
                 pending: None,
             },
         );
+        self.revocation_index.insert(reg, registration.revocation);
         self.note_port_waitable(registration.port, registration.waitable);
 
         if satisfied && !registration.options.edge_triggered {
@@ -326,7 +328,7 @@ impl ObserverRegistry {
                 .map(|(reg, _)| *reg)
                 .collect();
             for reg in regs {
-                let _ = self.observers.remove(&reg);
+                let _ = self.remove_observer(reg);
             }
         }
 
@@ -356,19 +358,16 @@ impl ObserverRegistry {
         generation: u64,
         current_epoch: u64,
     ) {
-        let regs: Vec<ObserverRegistration> = self
-            .observers
-            .iter()
-            .filter_map(|(reg, observer)| {
-                let matches =
-                    observer
-                        .revocation
-                        .contains_revoked(group, generation, current_epoch);
-                matches.then_some(*reg)
-            })
-            .collect();
+        let regs = self.revocation_index.candidates(group, generation);
         for reg in regs {
-            let _ = self.remove_observer(reg);
+            let revoked = self.observers.get(&reg).is_some_and(|observer| {
+                observer
+                    .revocation
+                    .contains_revoked(group, generation, current_epoch)
+            });
+            if revoked {
+                let _ = self.remove_observer(reg);
+            }
         }
     }
 
@@ -416,6 +415,7 @@ impl ObserverRegistry {
 
     fn remove_observer(&mut self, reg: ObserverRegistration) -> Option<Observer> {
         let removed = self.observers.remove(&reg)?;
+        self.revocation_index.remove(reg, removed.revocation);
         if removed.pending.is_some() {
             if let Some(telemetry) = self.telemetry_by_port.get_mut(&reg.port) {
                 telemetry.pending_current = telemetry.pending_current.saturating_sub(1);

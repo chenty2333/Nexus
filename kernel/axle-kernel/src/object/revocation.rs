@@ -8,9 +8,10 @@ fn cancel_revoked_timers(
 ) -> Result<(), zx_status_t> {
     let revoked = state.with_objects(|objects| {
         Ok(objects
-            .iter()
-            .filter_map(|(object_key, object)| match object {
-                KernelObject::Timer(timer)
+            .revoked_timer_candidates(group, generation)
+            .into_iter()
+            .filter_map(|object_key| match objects.get(object_key) {
+                Some(KernelObject::Timer(timer))
                     if timer.armed_revocation.contains_revoked(
                         group,
                         generation,
@@ -31,12 +32,17 @@ fn cancel_revoked_timers(
                 .map_err(map_timer_error)
         })?;
         state.with_objects_mut(|objects| {
-            let timer = match objects.get_mut(object_key) {
-                Some(KernelObject::Timer(timer)) => timer,
-                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-                None => return Err(ZX_ERR_BAD_HANDLE),
+            let old_revocation = {
+                let timer = match objects.get_mut(object_key) {
+                    Some(KernelObject::Timer(timer)) => timer,
+                    Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                    None => return Err(ZX_ERR_BAD_HANDLE),
+                };
+                let old = timer.armed_revocation;
+                timer.armed_revocation = RevocationSet::none();
+                old
             };
-            timer.armed_revocation = RevocationSet::none();
+            objects.forget_timer_revocation(object_key, old_revocation);
             Ok(())
         })?;
     }
@@ -49,28 +55,27 @@ fn purge_revoked_port_packets(
     generation: u64,
     current_epoch: u64,
 ) -> Result<(), zx_status_t> {
-    let port_keys = state.with_objects(|objects| {
-        Ok(objects
-            .iter()
-            .filter_map(|(object_key, object)| match object {
-                KernelObject::Port(_) => Some(object_key),
-                _ => None,
-            })
-            .collect::<Vec<_>>())
-    })?;
+    let port_keys = state
+        .with_objects(|objects| Ok(objects.revoked_port_packet_candidates(group, generation)))?;
 
     for port_key in port_keys {
         let removed = state.with_objects_mut(|objects| {
-            let port = match objects.get_mut(port_key) {
-                Some(KernelObject::Port(port)) => port,
-                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
-                None => return Err(ZX_ERR_BAD_HANDLE),
+            let removed = {
+                let port = match objects.get_mut(port_key) {
+                    Some(KernelObject::Port(port)) => port,
+                    Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                    None => return Err(ZX_ERR_BAD_HANDLE),
+                };
+                port.drain_kernel_packets_where(|packet| {
+                    !packet
+                        .revocation
+                        .contains_revoked(group, generation, current_epoch)
+                })
             };
-            Ok(port.retain_kernel_packets(|packet| {
-                !packet
-                    .revocation
-                    .contains_revoked(group, generation, current_epoch)
-            }))
+            for packet in &removed {
+                objects.forget_port_kernel_packet(port_key, packet.revocation);
+            }
+            Ok(removed.len())
         });
         match removed {
             Ok(0) => {}
