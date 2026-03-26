@@ -156,6 +156,16 @@ impl Reactor {
         Self::remove_waiter_source(&mut self.signal_waiters, waitable_key);
     }
 
+    pub(crate) fn remove_revoked_wait_async(
+        &mut self,
+        group: axle_core::RevocationGroupId,
+        generation: u64,
+        current_epoch: u64,
+    ) {
+        self.observers
+            .remove_revoked_group(group, generation, current_epoch);
+    }
+
     pub(super) fn push_signal_waiter(&mut self, object_key: ObjectKey, thread_id: ThreadId) {
         Self::ensure_waiters_mut(&mut self.signal_waiters, object_key).push_back(thread_id);
     }

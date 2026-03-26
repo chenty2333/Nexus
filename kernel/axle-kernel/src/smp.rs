@@ -1,9 +1,8 @@
-//! SMP bring-up scaffolding (Phase B).
+//! SMP bring-up and AP trampoline plumbing.
 //!
-//! TODO:
-//! - detect CPU count from bootloader
-//! - bring up APs (trampoline + per-CPU stack)
-//! - per-CPU data + IPI
+//! CPU discovery still caps to the kernel's compiled `MAX_CPUS`, but the
+//! trampoline, per-CPU stacks, slot assignment, and AP online tracking are all
+//! live code rather than pending TODO stubs.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -81,8 +80,10 @@ fn delay_us(us: u64) {
 }
 
 fn ap_stack_top(slot: usize) -> u64 {
+    assert!(slot < MAX_CPUS, "smp: stack slot {} exceeds MAX_CPUS", slot);
+
     // SAFETY: AP_STACKS is wrapped in UnsafeCell; we only read the address of a
-    // specific slot. Slots are clamped to MAX_CPUS.
+    // specific slot after validating the slot index.
     let base = unsafe {
         let stacks_ptr = AP_STACKS.0.get() as *const AlignedApStack;
         stacks_ptr.add(slot) as u64

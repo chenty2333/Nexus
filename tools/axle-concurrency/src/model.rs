@@ -486,6 +486,8 @@ impl<'a> WaitPortTimerRunner<'a> {
                     WaitAsyncRegistration {
                         port: observer_port_key(),
                         waitable: waitable_key(waitable_id),
+                        waitable_revocation: None,
+                        port_revocation: None,
                         key: u64::from(key),
                         watched,
                         options: WaitAsyncOptions {

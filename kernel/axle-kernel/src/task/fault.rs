@@ -436,12 +436,14 @@ fn wake_fault_waiters(
     if waiters.is_empty() {
         return;
     }
-    let mut kernel = kernel_handle.lock();
-    for thread_id in waiters {
-        let (arg0, arg1) = fault_resume_trace_args(key, thread_id);
-        crate::trace::record_fault_resume(arg0, arg1);
-        let _ = kernel.complete_waiter_source_removed(thread_id, WakeReason::PreserveContext);
-    }
+    let _ = crate::object::with_kernel_handle_mut(kernel_handle, |kernel| {
+        for thread_id in waiters {
+            let (arg0, arg1) = fault_resume_trace_args(key, thread_id);
+            crate::trace::record_fault_resume(arg0, arg1);
+            let _ = kernel.complete_waiter_source_removed(thread_id, WakeReason::PreserveContext);
+        }
+        Ok(())
+    });
 }
 
 fn should_pause_fault_leader_for_test() -> bool {

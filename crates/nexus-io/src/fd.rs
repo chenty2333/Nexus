@@ -627,6 +627,15 @@ impl FdTable {
     }
 }
 
+impl Drop for FdTable {
+    fn drop(&mut self) {
+        let entries = core::mem::take(&mut self.entries);
+        for entry in entries.into_iter().flatten() {
+            let _ = self.close_entry(entry);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RemoteNode {
     handle: OwnedHandle,
@@ -1472,6 +1481,42 @@ mod tests {
         assert_eq!(state.lock().expect("state poisoned").closes, 0);
 
         child.close(fd).expect("child close should succeed");
+        assert_eq!(state.lock().expect("state poisoned").closes, 1);
+    }
+
+    #[test]
+    fn drop_closes_live_descriptions() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut table = FdTable::new();
+        let _fd = table
+            .open(
+                Arc::new(MockFd::new("drop", state.clone())),
+                OpenFlags::READABLE,
+                FdFlags::empty(),
+            )
+            .expect("open should succeed");
+
+        drop(table);
+        assert_eq!(state.lock().expect("state poisoned").closes, 1);
+    }
+
+    #[test]
+    fn drop_keeps_shared_description_alive_until_last_table_is_gone() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut parent = FdTable::new();
+        let _fd = parent
+            .open(
+                Arc::new(MockFd::new("shared-drop", state.clone())),
+                OpenFlags::READABLE | OpenFlags::WRITABLE,
+                FdFlags::empty(),
+            )
+            .expect("open should succeed");
+        let child = parent.clone();
+
+        drop(parent);
+        assert_eq!(state.lock().expect("state poisoned").closes, 0);
+
+        drop(child);
         assert_eq!(state.lock().expect("state poisoned").closes, 1);
     }
 

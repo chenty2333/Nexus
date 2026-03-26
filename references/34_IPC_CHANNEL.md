@@ -41,6 +41,11 @@ Current payload forms are:
   - pooled tail fragment page
 
 Each endpoint's inbound queue is currently capped at `64` messages.
+- Queue-owned channel memory now also participates in one system-wide accounted-byte budget.
+  - copied payload bytes, pooled fragment pages, transferred-handle snapshots, and one
+    descriptor-sized fixed cost are charged while the message is queued
+  - loaned body pages stay under the VM loan quota rather than this queue budget
+  - writes that would exceed the global queue budget now fail with `ZX_ERR_NO_MEMORY`
 
 ## Current signals
 
@@ -74,6 +79,7 @@ These are computed from endpoint state and participate in both `wait_one` and `w
   - handle close during rollback is now atomic: partial-install failures close all successfully
     installed handles before returning the error, preventing handle leaks on the receiver side
 - Backpressure is surfaced as `ZX_ERR_SHOULD_WAIT`.
+- Global queue-budget exhaustion is surfaced separately as `ZX_ERR_NO_MEMORY`.
 - Peer shutdown is surfaced as `ZX_ERR_PEER_CLOSED`.
 
 ## Read path

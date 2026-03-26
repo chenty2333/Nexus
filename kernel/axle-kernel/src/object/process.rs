@@ -287,8 +287,15 @@ pub fn prepare_process_start(
         })?;
         let layout = resolve_process_image_layout(state, &image_vmo)?;
 
-        state.with_kernel_mut(|kernel| {
-            kernel.prepare_process_start(process.process_id, image_vmo.global_vmo_id, &layout)
+        let address_space_id = state
+            .with_kernel(|kernel| kernel.process_start_address_space_id(process.process_id))?;
+        state.with_vm_mut(|vm| {
+            vm.prepare_process_start(
+                process.process_id,
+                address_space_id,
+                image_vmo.global_vmo_id,
+                &layout,
+            )
         })
     })
 }
@@ -429,9 +436,12 @@ pub fn prepare_linux_exec(
         } else {
             None
         };
-        state.with_kernel_mut(|kernel| {
-            kernel.prepare_linux_process_start(
+        let address_space_id = state
+            .with_kernel(|kernel| kernel.process_start_address_space_id(process.process_id))?;
+        state.with_vm_mut(|vm| {
+            vm.prepare_linux_process_start(
                 process.process_id,
+                address_space_id,
                 image_vmo.global_vmo_id,
                 &layout,
                 header,
@@ -1045,6 +1055,37 @@ fn maybe_reap_process_record(state: &KernelState, process_id: u64) -> Result<(),
     Ok(())
 }
 
+fn cleanup_terminated_process_address_spaces(state: &KernelState) -> Result<(), zx_status_t> {
+    let cleanup_work =
+        state.with_kernel_mut(|kernel| Ok(kernel.claim_terminated_process_cleanup_work()))?;
+    for (process_id, address_space_id) in cleanup_work {
+        let cleanup_req =
+            match state.with_vm_mut(|vm| vm.cleanup_process_address_space(address_space_id)) {
+                Ok(req) => req,
+                Err(status) => {
+                    let _ = state.with_kernel_mut(|kernel| {
+                        kernel.requeue_process_address_space_cleanup(process_id)
+                    });
+                    return Err(status);
+                }
+            };
+
+        let current_cpu_id = crate::arch::apic::this_apic_id() as usize;
+        let current_address_space_id =
+            state.with_kernel(|kernel| Ok(kernel.current_address_space_id().ok()))?;
+        if let Err(status) = state.with_vm_mut(|vm| {
+            vm.apply_tlb_commit_reqs(current_cpu_id, current_address_space_id, &[cleanup_req])
+        }) {
+            let _ = state
+                .with_kernel_mut(|kernel| kernel.requeue_process_address_space_cleanup(process_id));
+            return Err(status);
+        }
+
+        state.with_kernel_mut(|kernel| kernel.finish_process_address_space_cleanup(process_id))?;
+    }
+    Ok(())
+}
+
 fn reap_terminated_task_objects(state: &KernelState) -> Result<(), zx_status_t> {
     loop {
         let (thread_candidates, process_candidates) = state.with_registry(|registry| {
@@ -1138,5 +1179,6 @@ pub(crate) fn sync_task_lifecycle(state: &KernelState) -> Result<(), zx_status_t
     for object_id in task_object_ids(state) {
         let _ = publish_object_signals(state, object_id);
     }
+    cleanup_terminated_process_address_spaces(state)?;
     reap_terminated_task_objects(state)
 }

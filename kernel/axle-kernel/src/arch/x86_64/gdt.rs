@@ -35,7 +35,7 @@ pub struct Selectors {
 }
 
 const MAX_CPUS: usize = super::MAX_CPUS;
-const RING0_STACK_SIZE: u64 = 32 * 1024;
+const RING0_STACK_SIZE: u64 = 128 * 1024;
 const IST_STACK_SIZE: u64 = 32 * 1024;
 pub const IST_DOUBLE_FAULT_INDEX: u8 = 1;
 /// IST for #PF (page fault).
@@ -48,7 +48,9 @@ pub const IST_GP_INDEX: u8 = 4;
 #[derive(Clone, Copy)]
 struct AlignedRing0Stack([u8; RING0_STACK_SIZE as usize]);
 
-// 32 KiB ring0 stack for ring3->ring0 transitions, per CPU.
+// 128 KiB ring0 stack for ring3->ring0 transitions, per CPU. Trap-blocking
+// waits and timer-driven wakeups can stack several kernel frames on the same
+// per-CPU stack before returning to user mode.
 static mut RING0_STACKS: [AlignedRing0Stack; MAX_CPUS] =
     [AlignedRing0Stack([0; RING0_STACK_SIZE as usize]); MAX_CPUS];
 

@@ -1,6 +1,8 @@
-//! Trap/exception/interrupt scaffolding (Phase B).
+//! Trap/exception/interrupt bring-up.
 //!
-//! TODO: build full fault handlers, IRQ handlers, and IPI handling.
+//! The bootstrap kernel now installs concrete fault, timer/APIC, and IPI
+//! entry points here; this file remains intentionally thin glue over the arch
+//! handlers rather than a TODO placeholder.
 
 use crate::arch;
 

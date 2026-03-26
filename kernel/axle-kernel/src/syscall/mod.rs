@@ -8,8 +8,6 @@
 //! - perform handle lookup (CSpace + rights + revocation)
 //! - dispatch to object-specific handlers (Channel/Port/Timer/etc)
 
-#![allow(dead_code)]
-
 extern crate alloc;
 
 use alloc::vec::Vec;
@@ -20,7 +18,9 @@ use axle_types::pci::{
     ax_pci_bar_info_t, ax_pci_config_info_t, ax_pci_device_info_t, ax_pci_interrupt_info_t,
     ax_pci_interrupt_mode_info_t, ax_pci_resource_info_t,
 };
-use axle_types::status::{ZX_ERR_BAD_SYSCALL, ZX_ERR_INVALID_ARGS, ZX_ERR_OUT_OF_RANGE, ZX_OK};
+use axle_types::status::{
+    ZX_ERR_BAD_SYSCALL, ZX_ERR_INTERNAL, ZX_ERR_INVALID_ARGS, ZX_ERR_OUT_OF_RANGE, ZX_OK,
+};
 use axle_types::syscall_numbers::{
     AXLE_SYS_AX_CONSOLE_READ, AXLE_SYS_AX_CONSOLE_WRITE, AXLE_SYS_AX_DMA_REGION_GET_INFO,
     AXLE_SYS_AX_DMA_REGION_GET_SEGMENT, AXLE_SYS_AX_DMA_REGION_LOOKUP_IOVA,
@@ -156,8 +156,6 @@ pub const BOOTSTRAP_SYSCALLS: [SyscallNumber; 88] = [
     AXLE_SYS_AX_CONSOLE_READ,
 ];
 
-/// Maximum VMO size that can be created via syscall (4 GiB).
-pub(crate) const MAX_VMO_CREATE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 /// Maximum handles per channel message.
 const MAX_CHANNEL_HANDLES_PER_MSG: usize = 64;
 /// Maximum bytes per channel message.
@@ -387,10 +385,6 @@ struct SyscallCtx {
 }
 
 impl SyscallCtx {
-    fn new() -> Self {
-        Self::default()
-    }
-
     fn from_trapframe(frame: &crate::arch::int80::TrapFrame, cpu_frame: *const u64) -> Self {
         Self::from_trapframe_with_mode(frame, cpu_frame, false)
     }
@@ -581,8 +575,9 @@ pub fn init() {
 ///
 /// Unknown numbers return `ZX_ERR_BAD_SYSCALL`.
 /// Known-but-not-yet-implemented syscalls return `ZX_ERR_NOT_SUPPORTED`.
+#[allow(dead_code)]
 pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
-    let mut ctx = SyscallCtx::new();
+    let mut ctx = SyscallCtx::default();
     dispatch_syscall_with_ctx(&mut ctx, nr, args)
 }
 
@@ -635,7 +630,13 @@ pub fn invoke_from_native_syscall(
     match crate::object::handle_native_syscall_entry(frame, cpu_frame.cast_mut()) {
         Ok(true) => return 0,
         Ok(false) => {}
-        Err(status) => panic!("native guest syscall entry failed: {status}"),
+        Err(status) => {
+            // Native guest syscall entry failed — set the error status in the
+            // trap frame and return so the caller can safely resume userspace
+            // rather than crashing the kernel.
+            frame.set_status(status);
+            return 0;
+        }
     }
     u64::from(invoke_from_frame(frame, cpu_frame, true))
 }
@@ -2613,15 +2614,12 @@ impl SocketReadDelivery {
         }
     }
 
-    fn actual_bytes(&self) -> usize {
-        self.result
-            .as_ref()
-            .expect("socket read result missing")
-            .actual_bytes
+    fn actual_bytes(&self) -> Result<usize, zx_status_t> {
+        Ok(self.result.as_ref().ok_or(ZX_ERR_INTERNAL)?.actual_bytes)
     }
 
-    fn result(&self) -> &crate::object::SocketReadResult {
-        self.result.as_ref().expect("socket read result missing")
+    fn result(&self) -> Result<&crate::object::SocketReadResult, zx_status_t> {
+        self.result.as_ref().ok_or(ZX_ERR_INTERNAL)
     }
 
     fn finish(mut self) {
@@ -2674,9 +2672,9 @@ fn writeback_socket_read(
     crate::copy::write_socket_read_result_to_user(
         writeback.buffer.ptr(),
         writeback.buffer.len(),
-        delivery.result(),
+        delivery.result()?,
     )?;
-    write_optional_out_value(writeback.actual, delivery.actual_bytes())?;
+    write_optional_out_value(writeback.actual, delivery.actual_bytes()?)?;
     delivery.finish();
     Ok(())
 }
@@ -3019,34 +3017,20 @@ impl ChannelReadDelivery {
         }
     }
 
-    fn payload(&self) -> &crate::object::ChannelPayload {
-        &self
-            .result
-            .as_ref()
-            .expect("channel read result missing")
-            .payload
+    fn payload(&self) -> Result<&crate::object::ChannelPayload, zx_status_t> {
+        Ok(&self.result.as_ref().ok_or(ZX_ERR_INTERNAL)?.payload)
     }
 
-    fn handles(&self) -> &[zx_handle_t] {
-        &self
-            .result
-            .as_ref()
-            .expect("channel read result missing")
-            .handles
+    fn handles(&self) -> Result<&[zx_handle_t], zx_status_t> {
+        Ok(&self.result.as_ref().ok_or(ZX_ERR_INTERNAL)?.handles)
     }
 
-    fn actual_bytes(&self) -> u32 {
-        self.result
-            .as_ref()
-            .expect("channel read result missing")
-            .actual_bytes
+    fn actual_bytes(&self) -> Result<u32, zx_status_t> {
+        Ok(self.result.as_ref().ok_or(ZX_ERR_INTERNAL)?.actual_bytes)
     }
 
-    fn actual_handles(&self) -> u32 {
-        self.result
-            .as_ref()
-            .expect("channel read result missing")
-            .actual_handles
+    fn actual_handles(&self) -> Result<u32, zx_status_t> {
+        Ok(self.result.as_ref().ok_or(ZX_ERR_INTERNAL)?.actual_handles)
     }
 
     fn mark_handles_delivered(&mut self) {
@@ -3136,10 +3120,10 @@ fn writeback_channel_read(
         }
         ChannelReadResponse::Success(message) => {
             let mut delivery = ChannelReadDelivery::new(message);
-            write_channel_payload(writeback.bytes, delivery.payload())?;
-            write_optional_out_value(writeback.actual_bytes, delivery.actual_bytes())?;
-            write_optional_out_value(writeback.actual_handles, delivery.actual_handles())?;
-            write_out_handles(writeback.handles, delivery.handles())?;
+            write_channel_payload(writeback.bytes, delivery.payload()?)?;
+            write_optional_out_value(writeback.actual_bytes, delivery.actual_bytes()?)?;
+            write_optional_out_value(writeback.actual_handles, delivery.actual_handles()?)?;
+            write_out_handles(writeback.handles, delivery.handles()?)?;
             delivery.mark_handles_delivered();
             delivery.finish();
             Ok(())

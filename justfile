@@ -37,6 +37,12 @@ perf-smoke-archive logfile label cpuinfo='/proc/cpuinfo':
 perf-smoke-kvm-archive label='kvm-host':
   bash -lc 'set -euo pipefail; just perf-smoke-kvm >/dev/null; PYTHONDONTWRITEBYTECODE=1 python tools/axle-conformance/scripts/archive_perf_smoke.py target/perf-smoke-kvm/serial.log target/perf-smoke-baselines {{label}} /proc/cpuinfo'
 
+perf-regression-check baseline current='target/perf-smoke-kvm/baseline.json':
+  PYTHONDONTWRITEBYTECODE=1 python tools/axle-conformance/scripts/compare_perf_baselines.py {{baseline}} {{current}}
+
+perf-smoke-kvm-regression baseline:
+  bash -lc 'set -euo pipefail; just perf-smoke-kvm >/dev/null; PYTHONDONTWRITEBYTECODE=1 python tools/axle-conformance/scripts/compare_perf_baselines.py {{baseline}} target/perf-smoke-kvm/baseline.json'
+
 starnix-shell:
   nix develop -c bash --noprofile --norc -c 'set -euo pipefail; target_dir=target/starnix-shell; mkdir -p "$target_dir"; cargo build -p axle-kernel --target x86_64-unknown-none --target-dir "$target_dir"; NEXUS_INIT_ROOT_URL=boot://root-starnix-shell RUSTFLAGS="-C code-model=large -C debuginfo=0" cargo build -p nexus-init --target x86_64-unknown-none --target-dir "$target_dir"; init="$target_dir/x86_64-unknown-none/debug/nexus-init"; init_size=$(stat -c%s "$init"); tty_dev=/dev/tty; saved_tty=""; if [ -r "$tty_dev" ] && [ -w "$tty_dev" ]; then saved_tty=$(stty -g < "$tty_dev"); cleanup() { stty "$saved_tty" < "$tty_dev"; }; trap cleanup EXIT INT TERM; stty -echo -icanon -isig min 1 time 0 < "$tty_dev"; fi; set +e; qemu-system-x86_64 -machine q35 -m 256M -smp 2 -nographic -serial stdio -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device loader,file="$init",addr=0x7000000,force-raw=on -device loader,data=$init_size,data-len=8,addr=0x6fffff8 -device loader,file="$init",addr=0x5000000,force-raw=on -device loader,data=$init_size,data-len=8,addr=0x4fffff8 -kernel "$target_dir/x86_64-unknown-none/debug/axle-kernel" < "$tty_dev" > "$tty_dev"; code=$?; set -e; [ "$code" -eq 33 ]'
 

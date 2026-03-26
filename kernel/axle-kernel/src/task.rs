@@ -106,6 +106,46 @@ pub(crate) type JobId = u64;
 pub(crate) type AddressSpaceId = u64;
 type KernelVmoId = GlobalVmoId;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CpuThreadActivation {
+    previous_thread_id: Option<ThreadId>,
+    thread_id: ThreadId,
+    previous_address_space_id: Option<AddressSpaceId>,
+    next_address_space_id: AddressSpaceId,
+    current_cpu_id: usize,
+    context: UserContext,
+}
+
+impl CpuThreadActivation {
+    pub(crate) const fn previous_thread_id(self) -> Option<ThreadId> {
+        self.previous_thread_id
+    }
+
+    pub(crate) const fn thread_id(self) -> ThreadId {
+        self.thread_id
+    }
+
+    pub(crate) const fn previous_address_space_id(self) -> Option<AddressSpaceId> {
+        self.previous_address_space_id
+    }
+
+    pub(crate) const fn next_address_space_id(self) -> AddressSpaceId {
+        self.next_address_space_id
+    }
+
+    pub(crate) const fn current_cpu_id(self) -> usize {
+        self.current_cpu_id
+    }
+
+    pub(crate) const fn context(self) -> UserContext {
+        self.context
+    }
+
+    pub(crate) fn address_space_switched(self) -> bool {
+        self.previous_address_space_id != Some(self.next_address_space_id)
+    }
+}
+
 /// TLB synchronization class attached to one committed VM mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitClass {
@@ -257,19 +297,11 @@ impl CowReservation {
 impl Drop for CowReservation {
     fn drop(&mut self) {
         if matches!(self.state, CowReservationState::Reserved) {
-            #[cfg(debug_assertions)]
-            {
-                panic!("CowReservation dropped without explicit commit or release");
-            }
-            #[cfg(not(debug_assertions))]
-            {
-                crate::kprintln!(
-                    "WARNING: CowReservation dropped without explicit commit or release \
-                     (address_space={}, page_base={:#x})",
-                    self.address_space_id,
-                    self.page_base,
-                );
-            }
+            panic!(
+                "CowReservation dropped without explicit commit or release \
+                 (address_space={}, page_base={:#x})",
+                self.address_space_id, self.page_base,
+            );
         }
     }
 }
@@ -432,6 +464,7 @@ pub(crate) struct ResolvedHandle {
     slot_tag: u32,
     object_key: ObjectKey,
     rights: HandleRights,
+    revocation: Option<axle_core::RevocationRef>,
 }
 
 /// Kernel-visible description of the bootstrap root VMAR handle target.
@@ -756,7 +789,12 @@ impl ChannelLoanTx {
 }
 
 impl ResolvedHandle {
-    fn new(process_id: ProcessId, handle: Handle, cap: Capability) -> Result<Self, zx_status_t> {
+    fn new(
+        process_id: ProcessId,
+        handle: Handle,
+        cap: Capability,
+        revocation: Option<axle_core::RevocationRef>,
+    ) -> Result<Self, zx_status_t> {
         let (slot_index, slot_tag) = handle.decode().map_err(|_| ZX_ERR_BAD_HANDLE)?;
         Ok(Self {
             process_id,
@@ -764,6 +802,7 @@ impl ResolvedHandle {
             slot_tag,
             object_key: cap.object_key(),
             rights: HandleRights::from_bits_retain(cap.rights()),
+            revocation,
         })
     }
 
@@ -795,6 +834,11 @@ impl ResolvedHandle {
     /// Rights bits carried by the resolved capability.
     pub(crate) const fn rights(self) -> HandleRights {
         self.rights
+    }
+
+    /// Revocation provenance attached to this handle, if any.
+    pub(crate) const fn revocation_ref(self) -> Option<axle_core::RevocationRef> {
+        self.revocation
     }
 
     /// Capability generation carried by the resolved capability.
@@ -1922,6 +1966,19 @@ impl Kernel {
             .map_err(|_| ZX_ERR_BAD_HANDLE)
     }
 
+    pub(crate) fn revoke_group_and_get_epoch(
+        &mut self,
+        token: axle_core::RevocationGroupToken,
+    ) -> Result<u64, zx_status_t> {
+        self.revocations
+            .revoke(token)
+            .map_err(|_| ZX_ERR_BAD_HANDLE)?;
+        self.revocations
+            .snapshot(token)
+            .map(|snapshot| snapshot.epoch())
+            .map_err(|_| ZX_ERR_BAD_HANDLE)
+    }
+
     pub(crate) fn validate_current_user_ptr(&self, ptr: u64, len: usize) -> bool {
         let Ok(process) = self.current_process() else {
             return false;
@@ -2271,57 +2328,16 @@ impl Kernel {
         Ok(())
     }
 
-    pub(crate) fn copyout_thread_user<T: Copy>(
+    pub(crate) fn thread_address_space_id(
         &self,
         thread_id: ThreadId,
-        ptr: *mut T,
-        value: T,
-    ) -> Result<(), zx_status_t> {
-        if ptr.is_null() {
-            return Err(ZX_ERR_INVALID_ARGS);
-        }
+    ) -> Result<AddressSpaceId, zx_status_t> {
         let thread = self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?;
         let process = self
             .processes
             .get(&thread.process_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        let len = size_of::<T>();
-        if !self.with_vm(|vm| vm.validate_user_ptr(process.address_space_id, ptr as u64, len)) {
-            return Err(ZX_ERR_INVALID_ARGS);
-        }
-
-        if len == 0 {
-            return Ok(());
-        }
-
-        let page_bytes = crate::userspace::USER_PAGE_BYTES as usize;
-        // SAFETY: `value` is an in-register copy owned by this function. Reinterpreting its
-        // bytes for immediate copyout is sound because `T: Copy` and we never outlive `value`.
-        let src = unsafe { core::slice::from_raw_parts((&value as *const T).cast::<u8>(), len) };
-        let mut written = 0usize;
-        while written < len {
-            let dst_addr = (ptr as u64)
-                .checked_add(written as u64)
-                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-            let page_base = dst_addr - (dst_addr % crate::userspace::USER_PAGE_BYTES);
-            self.with_vm_mut(|vm| {
-                vm.ensure_user_page_resident(process.address_space_id, page_base, true)
-            })?;
-            let lookup = self
-                .with_vm(|vm| vm.lookup_user_mapping(process.address_space_id, page_base, 1))
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            let frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
-            let page_offset =
-                usize::try_from(dst_addr - page_base).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-            let chunk_len = core::cmp::min(page_bytes - page_offset, len - written);
-            crate::copy::write_bootstrap_frame_bytes(
-                frame_id.raw(),
-                page_offset,
-                &src[written..written + chunk_len],
-            )?;
-            written += chunk_len;
-        }
-        Ok(())
+        Ok(process.address_space_id)
     }
 
     pub(crate) fn thread_state(&self, thread_id: ThreadId) -> Result<ThreadState, zx_status_t> {
@@ -2890,6 +2906,25 @@ impl VmDomain {
                 self.record_vm_resource_telemetry();
                 self.log_vm_quota_exceeded(address_space_id, exceeded, "reserve_private_cow_page");
                 Err(ZX_ERR_NO_RESOURCES)
+            }
+        }
+    }
+
+    fn with_private_cow_page_reservation<T>(
+        &mut self,
+        address_space_id: AddressSpaceId,
+        page_base: u64,
+        f: impl FnOnce(&mut Self) -> Result<T, zx_status_t>,
+    ) -> Result<T, zx_status_t> {
+        let reservation = self.reserve_private_cow_page(address_space_id, page_base)?;
+        match f(self) {
+            Ok(value) => {
+                reservation.commit(self);
+                Ok(value)
+            }
+            Err(status) => {
+                reservation.release(self);
+                Err(status)
             }
         }
     }
@@ -3657,34 +3692,27 @@ impl VmDomain {
                         TlbCommitReq::relaxed(address_space_id),
                     ));
                 }
-                let reserve_private = self.reserve_private_cow_page(address_space_id, page_base)?;
-                let cow_result = (|| {
-                    let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
-                    self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
-                        let new_frame_id = frames
-                            .register_existing(new_frame_paddr)
-                            .map_err(|_| ZX_ERR_BAD_STATE)?;
-                        address_space
-                            .resolve_cow_fault(frames, page_base, new_frame_id)
-                            .map_err(map_address_space_error)
-                    })
-                })();
-                let resolved = match cow_result {
-                    Ok(resolved) => resolved,
-                    Err(status) => {
-                        reserve_private.release(self);
-                        return Err(status);
-                    }
-                };
-                if let Err(status) = self.sync_mapping_pages(
-                    address_space_id,
-                    resolved.fault_page_base(),
-                    crate::userspace::USER_PAGE_BYTES,
-                ) {
-                    reserve_private.release(self);
-                    return Err(status);
-                }
-                reserve_private.commit(self);
+                let resolved =
+                    self.with_private_cow_page_reservation(address_space_id, page_base, |vm| {
+                        let new_frame_paddr = prepared.take_page_paddr().ok_or(ZX_ERR_BAD_STATE)?;
+                        let resolved = vm.with_address_space_frames_mut(
+                            address_space_id,
+                            |address_space, frames| {
+                                let new_frame_id = frames
+                                    .register_existing(new_frame_paddr)
+                                    .map_err(|_| ZX_ERR_BAD_STATE)?;
+                                address_space
+                                    .resolve_cow_fault(frames, page_base, new_frame_id)
+                                    .map_err(map_address_space_error)
+                            },
+                        )?;
+                        vm.sync_mapping_pages(
+                            address_space_id,
+                            resolved.fault_page_base(),
+                            crate::userspace::USER_PAGE_BYTES,
+                        )?;
+                        Ok(resolved)
+                    })?;
                 self.cow_fault_count = self.cow_fault_count.wrapping_add(1);
                 crate::userspace::record_vm_cow_fault_count(self.cow_fault_count);
                 crate::userspace::record_vm_last_cow_rmap_counts(
@@ -3901,6 +3929,34 @@ impl VmDomain {
             .get(&address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         Ok(address_space.observed_tlb_epoch(cpu_id) < address_space.current_invalidate_epoch())
+    }
+
+    pub(crate) fn activate_cpu_address_space_transition(
+        &mut self,
+        cpu_id: usize,
+        previous_address_space_id: Option<AddressSpaceId>,
+        next_address_space_id: AddressSpaceId,
+    ) -> Result<crate::arch::tlb::AddressSpaceSwitchKind, zx_status_t> {
+        let next_page_tables = self.root_page_table(next_address_space_id)?;
+        let local_tlb_flush_needed =
+            self.current_cpu_needs_tlb_sync(next_address_space_id, cpu_id)?;
+        let address_space_switched = previous_address_space_id != Some(next_address_space_id);
+        let switch_kind = if address_space_switched || local_tlb_flush_needed {
+            next_page_tables
+                .activate(local_tlb_flush_needed)
+                .map_err(map_page_table_error)?
+        } else {
+            crate::arch::tlb::AddressSpaceSwitchKind::SameAddressSpaceSkip
+        };
+        if let Some(previous_address_space_id) = previous_address_space_id
+            && previous_address_space_id != next_address_space_id
+        {
+            self.note_cpu_inactive(previous_address_space_id, cpu_id);
+        }
+        if address_space_switched || local_tlb_flush_needed {
+            self.observe_cpu_tlb_epoch_for_address_space(next_address_space_id, cpu_id);
+        }
+        Ok(switch_kind)
     }
 
     fn observe_cpu_tlb_epoch_for_address_space(
@@ -4141,44 +4197,36 @@ impl VmDomain {
         fault_va: u64,
     ) -> Result<(), zx_status_t> {
         let fault_page_base = align_down_page(fault_va);
-        let reserve_private = self.reserve_private_cow_page(address_space_id, fault_page_base)?;
-        let cow_result = (|| {
-            let lookup = self
-                .address_spaces
-                .get(&address_space_id)
-                .and_then(|space| space.lookup_user_mapping(fault_va, 1))
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            if !lookup.vmo_kind().supports_copy_on_write() {
-                return Err(ZX_ERR_BAD_STATE);
-            }
-            let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
-            let new_frame_paddr = crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw())
-                .ok_or(ZX_ERR_NO_MEMORY)?;
-            self.with_address_space_frames_mut(address_space_id, |address_space, frames| {
-                let new_frame_id = frames
-                    .register_existing(new_frame_paddr)
-                    .map_err(|_| ZX_ERR_BAD_STATE)?;
-                address_space
-                    .resolve_cow_fault(frames, fault_va, new_frame_id)
-                    .map_err(map_address_space_error)
-            })
-        })();
-        let resolved = match cow_result {
-            Ok(resolved) => resolved,
-            Err(status) => {
-                reserve_private.release(self);
-                return Err(status);
-            }
-        };
-        if let Err(status) = self.sync_mapping_pages(
-            address_space_id,
-            resolved.fault_page_base(),
-            crate::userspace::USER_PAGE_BYTES,
-        ) {
-            reserve_private.release(self);
-            return Err(status);
-        }
-        reserve_private.commit(self);
+        let resolved =
+            self.with_private_cow_page_reservation(address_space_id, fault_page_base, |vm| {
+                let lookup = vm
+                    .address_spaces
+                    .get(&address_space_id)
+                    .and_then(|space| space.lookup_user_mapping(fault_va, 1))
+                    .ok_or(ZX_ERR_BAD_STATE)?;
+                if !lookup.vmo_kind().supports_copy_on_write() {
+                    return Err(ZX_ERR_BAD_STATE);
+                }
+                let old_frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
+                let new_frame_paddr =
+                    crate::userspace::alloc_bootstrap_cow_page(old_frame_id.raw())
+                        .ok_or(ZX_ERR_NO_MEMORY)?;
+                let resolved =
+                    vm.with_address_space_frames_mut(address_space_id, |address_space, frames| {
+                        let new_frame_id = frames
+                            .register_existing(new_frame_paddr)
+                            .map_err(|_| ZX_ERR_BAD_STATE)?;
+                        address_space
+                            .resolve_cow_fault(frames, fault_va, new_frame_id)
+                            .map_err(map_address_space_error)
+                    })?;
+                vm.sync_mapping_pages(
+                    address_space_id,
+                    resolved.fault_page_base(),
+                    crate::userspace::USER_PAGE_BYTES,
+                )?;
+                Ok(resolved)
+            })?;
         self.cow_fault_count = self.cow_fault_count.wrapping_add(1);
         crate::userspace::record_vm_cow_fault_count(self.cow_fault_count);
         crate::userspace::record_vm_last_cow_rmap_counts(

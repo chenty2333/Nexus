@@ -38,9 +38,9 @@ use axle_types::rights::{ZX_RIGHT_SAME_RIGHTS, ZX_RIGHTS_ALL};
 use axle_types::socket::{ZX_SOCKET_DATAGRAM, ZX_SOCKET_PEEK, ZX_SOCKET_STREAM};
 use axle_types::status::{
     ZX_ERR_ACCESS_DENIED, ZX_ERR_ALREADY_EXISTS, ZX_ERR_BAD_HANDLE, ZX_ERR_BAD_STATE,
-    ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NOT_FOUND, ZX_ERR_NOT_SUPPORTED,
-    ZX_ERR_OUT_OF_RANGE, ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT,
-    ZX_ERR_WRONG_TYPE,
+    ZX_ERR_BUFFER_TOO_SMALL, ZX_ERR_INVALID_ARGS, ZX_ERR_NO_MEMORY, ZX_ERR_NOT_FOUND,
+    ZX_ERR_NOT_SUPPORTED, ZX_ERR_OUT_OF_RANGE, ZX_ERR_PEER_CLOSED, ZX_ERR_SHOULD_WAIT,
+    ZX_ERR_TIMED_OUT, ZX_ERR_WRONG_TYPE,
 };
 use axle_types::vm::{
     ZX_VM_ALIGN_BASE, ZX_VM_ALIGN_MASK, ZX_VM_CAN_MAP_EXECUTE, ZX_VM_CAN_MAP_READ,
@@ -53,6 +53,8 @@ use axle_types::{
     zx_clock_t, zx_futex_t, zx_handle_t, zx_koid_t, zx_rights_t, zx_status_t, zx_vaddr_t,
 };
 use core::mem::size_of;
+use core::panic::Location;
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
 use crate::port_queue::KernelPort;
@@ -61,12 +63,104 @@ use crate::task::{JobId, ObjectKindTag};
 const PORT_CAPACITY: usize = 64;
 const PORT_KERNEL_RESERVE: usize = 16;
 const CHANNEL_CAPACITY: usize = 64;
-// TODO(backpressure): The per-channel CHANNEL_CAPACITY limit prevents any
-// single channel from consuming unbounded memory, but there is no global
-// memory budget across all channels.  A system-wide accounting mechanism
-// should be added so that aggregate channel-message memory is bounded and
-// excess writers receive ZX_ERR_NO_MEMORY rather than consuming all
-// available kernel heap.
+
+/// Global channel queue accounting.
+///
+/// Only memory directly retained by queued channel descriptors is charged here:
+/// copied payload bytes, fragment pages, transferred-handle snapshots, and one
+/// descriptor-sized fixed overhead. Loaned user pages are charged separately by
+/// VM loan quota tracking and are intentionally excluded from this budget.
+static GLOBAL_CHANNEL_ACCOUNTED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// System-wide ceiling for queue-owned channel memory.
+const GLOBAL_CHANNEL_ACCOUNTED_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
+
+static KERNEL_LOCK_OWNER_LOCATION: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_LOCK_OWNER_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+static KERNEL_LOCK_OWNER_MUTABLE: AtomicBool = AtomicBool::new(false);
+static KERNEL_LOCK_OWNER_ACQUIRED_AT_NS: AtomicI64 = AtomicI64::new(0);
+static KERNEL_LOCK_HELD: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+struct KernelLockOwnerSnapshot {
+    location: &'static Location<'static>,
+    cpu_id: usize,
+    mutable: bool,
+    currently_held: bool,
+    held_for_ns: i64,
+}
+
+fn record_kernel_lock_owner(caller: &'static Location<'static>, mutable: bool) {
+    KERNEL_LOCK_OWNER_CPU.store(
+        crate::arch::apic::this_apic_id() as usize,
+        Ordering::Release,
+    );
+    KERNEL_LOCK_OWNER_MUTABLE.store(mutable, Ordering::Release);
+    KERNEL_LOCK_OWNER_ACQUIRED_AT_NS.store(crate::time::now_ns(), Ordering::Release);
+    KERNEL_LOCK_OWNER_LOCATION.store(
+        caller as *const Location<'static> as usize,
+        Ordering::Release,
+    );
+    KERNEL_LOCK_HELD.store(true, Ordering::Release);
+}
+
+fn clear_kernel_lock_owner() {
+    KERNEL_LOCK_HELD.store(false, Ordering::Release);
+    KERNEL_LOCK_OWNER_LOCATION.store(0, Ordering::Release);
+    KERNEL_LOCK_OWNER_CPU.store(usize::MAX, Ordering::Release);
+    KERNEL_LOCK_OWNER_MUTABLE.store(false, Ordering::Release);
+    KERNEL_LOCK_OWNER_ACQUIRED_AT_NS.store(0, Ordering::Release);
+}
+
+fn kernel_lock_owner_snapshot() -> Option<KernelLockOwnerSnapshot> {
+    let ptr = KERNEL_LOCK_OWNER_LOCATION.load(Ordering::Acquire);
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: the pointer is written only from `Location::caller()`, which
+    // yields a `'static` location. We clear it by writing zero, never by
+    // freeing the backing storage, so dereferencing the non-zero pointer is
+    // valid for this best-effort diagnostic snapshot.
+    let location = unsafe { &*(ptr as *const Location<'static>) };
+    let acquired_at_ns = KERNEL_LOCK_OWNER_ACQUIRED_AT_NS.load(Ordering::Acquire);
+    Some(KernelLockOwnerSnapshot {
+        location,
+        cpu_id: KERNEL_LOCK_OWNER_CPU.load(Ordering::Acquire),
+        mutable: KERNEL_LOCK_OWNER_MUTABLE.load(Ordering::Acquire),
+        currently_held: KERNEL_LOCK_HELD.load(Ordering::Acquire),
+        held_for_ns: crate::time::now_ns().saturating_sub(acquired_at_ns),
+    })
+}
+
+pub(crate) fn try_reserve_global_channel_bytes(bytes: u64) -> Result<(), zx_status_t> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let mut current = GLOBAL_CHANNEL_ACCOUNTED_BYTES.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = current.checked_add(bytes) else {
+            return Err(ZX_ERR_NO_MEMORY);
+        };
+        if next > GLOBAL_CHANNEL_ACCOUNTED_BYTE_LIMIT {
+            return Err(ZX_ERR_NO_MEMORY);
+        }
+        match GLOBAL_CHANNEL_ACCOUNTED_BYTES.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+pub(crate) fn release_global_channel_bytes(bytes: u64) {
+    if bytes != 0 {
+        GLOBAL_CHANNEL_ACCOUNTED_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
 const SOCKET_STREAM_CAPACITY: usize = 4096;
 const SOCKET_DATAGRAM_CAPACITY_BYTES: usize = 4096;
 const SOCKET_DATAGRAM_CAPACITY_MESSAGES: usize = 64;
@@ -396,6 +490,7 @@ struct ChannelMsgDesc {
     handles: Vec<TransferredCap>,
     actual_bytes: u32,
     actual_handles: u32,
+    accounted_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -436,6 +531,18 @@ impl ChannelPayload {
         }
     }
 
+    pub(crate) fn queue_accounted_bytes(&self) -> u64 {
+        match self {
+            Self::Copied(bytes) => bytes.len() as u64,
+            Self::Loaned(_) => 0,
+            Self::Fragmented(payload) => {
+                let fragment_count = u64::from(u8::from(payload.head.is_some()))
+                    + u64::from(u8::from(payload.tail.is_some()));
+                fragment_count * crate::userspace::USER_PAGE_BYTES
+            }
+        }
+    }
+
     pub(crate) fn loaned_body_mut(&mut self) -> Option<&mut crate::task::LoanedUserPages> {
         match self {
             Self::Loaned(loaned) => Some(loaned),
@@ -471,11 +578,19 @@ impl ChannelMsgDesc {
     fn new(payload: ChannelPayload, handles: Vec<TransferredCap>) -> Result<Self, zx_status_t> {
         let actual_bytes = payload.actual_bytes()?;
         let actual_handles = u32::try_from(handles.len()).map_err(|_| ZX_ERR_BAD_STATE)?;
+        let accounted_bytes = payload
+            .queue_accounted_bytes()
+            .saturating_add(
+                (handles.len() as u64)
+                    .saturating_mul(core::mem::size_of::<TransferredCap>() as u64),
+            )
+            .saturating_add(core::mem::size_of::<Self>() as u64);
         Ok(Self {
             payload,
             handles,
             actual_bytes,
             actual_handles,
+            accounted_bytes,
         })
     }
 
@@ -491,12 +606,45 @@ impl ChannelMsgDesc {
         &self.handles
     }
 
+    fn accounted_bytes(&self) -> u64 {
+        self.accounted_bytes
+    }
+
     fn is_fragmented(&self) -> bool {
         matches!(self.payload, ChannelPayload::Fragmented(_))
     }
 
     fn into_parts(self) -> (ChannelPayload, Vec<TransferredCap>) {
         (self.payload, self.handles)
+    }
+}
+
+#[derive(Debug)]
+struct ChannelMessageBudgetReservation {
+    bytes: u64,
+    active: bool,
+}
+
+impl ChannelMessageBudgetReservation {
+    fn reserve(bytes: u64) -> Result<Self, zx_status_t> {
+        try_reserve_global_channel_bytes(bytes)?;
+        Ok(Self {
+            bytes,
+            active: true,
+        })
+    }
+
+    fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ChannelMessageBudgetReservation {
+    fn drop(&mut self) {
+        if self.active {
+            release_global_channel_bytes(self.bytes);
+            self.active = false;
+        }
     }
 }
 
@@ -1891,6 +2039,7 @@ impl KernelState {
         f(&mut reactor)
     }
 
+    #[track_caller]
     fn with_core<T>(
         &self,
         f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
@@ -1898,6 +2047,7 @@ impl KernelState {
         with_interrupt_safe_kernel_ref(&self.kernel, f)
     }
 
+    #[track_caller]
     fn with_core_mut<T>(
         &self,
         f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
@@ -1905,7 +2055,7 @@ impl KernelState {
         with_interrupt_safe_kernel_mut(&self.kernel, f)
     }
 
-    fn with_vm_mut<T>(
+    pub(crate) fn with_vm_mut<T>(
         &self,
         f: impl FnOnce(&crate::task::VmFacade) -> Result<T, zx_status_t>,
     ) -> Result<T, zx_status_t> {
@@ -1942,6 +2092,7 @@ impl KernelState {
         )
     }
 
+    #[track_caller]
     pub(crate) fn with_kernel<T>(
         &self,
         f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
@@ -1949,11 +2100,67 @@ impl KernelState {
         self.with_core(f)
     }
 
+    #[track_caller]
     pub(crate) fn with_kernel_mut<T>(
         &self,
         f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
     ) -> Result<T, zx_status_t> {
         self.with_core_mut(f)
+    }
+
+    pub(crate) fn copyout_thread_user<T: Copy>(
+        &self,
+        thread_id: u64,
+        ptr: *mut T,
+        value: T,
+    ) -> Result<(), zx_status_t> {
+        if ptr.is_null() {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        let address_space_id =
+            self.with_kernel(|kernel| kernel.thread_address_space_id(thread_id))?;
+        let len = core::mem::size_of::<T>();
+        if !self.with_vm_mut(|vm| Ok(vm.validate_user_ptr(address_space_id, ptr as u64, len)))? {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        if len == 0 {
+            return Ok(());
+        }
+
+        let page_bytes = crate::userspace::USER_PAGE_BYTES as usize;
+        // SAFETY: `value` is owned by this function, `T: Copy`, and the byte slice
+        // is used only for immediate copyout during this call.
+        let src = unsafe { core::slice::from_raw_parts((&value as *const T).cast::<u8>(), len) };
+        let mut written = 0usize;
+        while written < len {
+            let dst_addr = (ptr as u64)
+                .checked_add(written as u64)
+                .ok_or(ZX_ERR_OUT_OF_RANGE)?;
+            let page_base = dst_addr - (dst_addr % crate::userspace::USER_PAGE_BYTES);
+            self.with_vm_mut(|vm| {
+                vm.ensure_user_page_resident_serialized(address_space_id, page_base, true)
+            })?;
+            let lookup = self
+                .with_vm_mut(|vm| Ok(vm.snapshot_mapping_vmo(address_space_id, page_base, 1)))
+                .and_then(|snapshot| {
+                    snapshot
+                        .map(|(lookup, _vmo)| lookup)
+                        .ok_or(ZX_ERR_BAD_STATE)
+                })?;
+            let frame_id = lookup.frame_id().ok_or(ZX_ERR_BAD_STATE)?;
+            let page_offset =
+                usize::try_from(dst_addr - page_base).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+            let chunk_len = core::cmp::min(page_bytes - page_offset, len - written);
+            crate::copy::write_bootstrap_frame_bytes(
+                frame_id.raw(),
+                page_offset,
+                &src[written..written + chunk_len],
+            )?;
+            written += chunk_len;
+        }
+        Ok(())
     }
 
     /// Return the job ID of the current process, for quota enforcement.
@@ -2125,7 +2332,7 @@ pub(crate) fn mark_scheduler_cpu_online(cpu_id: usize) -> Result<(), zx_status_t
 pub(crate) fn resolve_current_futex_key_relaxed(
     user_addr: zx_vaddr_t,
 ) -> Result<axle_mm::FutexKey, zx_status_t> {
-    with_kernel_mut(|kernel| kernel.resolve_current_futex_key_relaxed(user_addr))
+    resolve_current_futex_key_inner(user_addr, true)
 }
 
 fn read_current_futex_word(user_addr: zx_vaddr_t) -> Result<zx_futex_t, zx_status_t> {
@@ -2135,16 +2342,81 @@ fn read_current_futex_word(user_addr: zx_vaddr_t) -> Result<zx_futex_t, zx_statu
     if !crate::userspace::validate_user_ptr(user_addr, size_of::<zx_futex_t>()) {
         return Err(ZX_ERR_INVALID_ARGS);
     }
+    // Ensure the target page is physically mapped before reading.  Without
+    // this the subsequent `read_unaligned` can trigger a kernel-mode page
+    // fault if the page has not been demand-paged in yet.
+    let page_base = user_addr & !0xFFF;
+    with_state_mut(|state| {
+        let address_space_id = state.with_kernel(|kernel| kernel.current_address_space_id())?;
+        state.with_vm_mut(|vm| {
+            vm.ensure_user_page_resident_serialized(address_space_id, page_base, false)
+        })
+    })?;
     let ptr = user_addr as *const zx_futex_t;
-    // SAFETY: the user range was validated above and the word is read-only here.
+    // SAFETY: address validated AND page confirmed resident above.  The read
+    // is a single aligned 4-byte load from a user page that is now present.
     unsafe { Ok(core::ptr::read_unaligned(ptr)) }
+}
+
+fn resolve_current_futex_key_inner(
+    user_addr: zx_vaddr_t,
+    relaxed: bool,
+) -> Result<axle_mm::FutexKey, zx_status_t> {
+    const FUTEX_WORD_BYTES: usize = size_of::<zx_futex_t>();
+
+    if (user_addr & 0x3) != 0 {
+        return Err(ZX_ERR_INVALID_ARGS);
+    }
+
+    with_state_mut(|state| {
+        let current = state.with_kernel(|kernel| kernel.current_thread_info())?;
+        let address_space_id = state.with_kernel(|kernel| kernel.current_address_space_id())?;
+        let root =
+            state.with_vm_mut(|vm| vm.with_domain(|domain| domain.root_vmar(address_space_id)))?;
+        let range_end = user_addr
+            .checked_add(FUTEX_WORD_BYTES as u64)
+            .ok_or(ZX_ERR_INVALID_ARGS)?;
+        let root_end = root
+            .base()
+            .checked_add(root.len())
+            .ok_or(ZX_ERR_BAD_STATE)?;
+        if user_addr < root.base() || range_end > root_end {
+            return Err(ZX_ERR_INVALID_ARGS);
+        }
+
+        let valid = state.with_vm_mut(|vm| {
+            Ok(vm.validate_user_ptr(address_space_id, user_addr, FUTEX_WORD_BYTES))
+        })?;
+        if !valid {
+            return if relaxed {
+                Ok(axle_mm::FutexKey::private_anonymous(
+                    current.process_id(),
+                    user_addr,
+                ))
+            } else {
+                Err(ZX_ERR_INVALID_ARGS)
+            };
+        }
+
+        let lookup = state.with_vm_mut(|vm| {
+            Ok(vm.with_domain(|domain| {
+                domain.lookup_user_mapping(address_space_id, user_addr, FUTEX_WORD_BYTES)
+            }))
+        })?;
+        let lookup = lookup.ok_or(ZX_ERR_INVALID_ARGS)?;
+        Ok(axle_mm::FutexKey::from_lookup(
+            current.process_id(),
+            user_addr,
+            lookup,
+        ))
+    })
 }
 
 #[allow(dead_code)]
 pub(crate) fn resolve_current_futex_key(
     user_addr: zx_vaddr_t,
 ) -> Result<axle_mm::FutexKey, zx_status_t> {
-    with_kernel_mut(|kernel| kernel.resolve_current_futex_key(user_addr))
+    resolve_current_futex_key_inner(user_addr, false)
 }
 
 pub(crate) fn with_state_mut<T>(
@@ -2155,6 +2427,22 @@ pub(crate) fn with_state_mut<T>(
 
 pub(crate) fn kernel_handle() -> Result<Arc<Mutex<crate::task::Kernel>>, zx_status_t> {
     Ok(state()?.kernel.clone())
+}
+
+#[track_caller]
+pub(crate) fn with_kernel_handle<T>(
+    kernel: &Arc<Mutex<crate::task::Kernel>>,
+    f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    with_interrupt_safe_kernel_ref(kernel, f)
+}
+
+#[track_caller]
+pub(crate) fn with_kernel_handle_mut<T>(
+    kernel: &Arc<Mutex<crate::task::Kernel>>,
+    f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
+) -> Result<T, zx_status_t> {
+    with_interrupt_safe_kernel_mut(kernel, f)
 }
 
 fn with_local_interrupts_disabled<T>(f: impl FnOnce() -> T) -> T {
@@ -2169,54 +2457,108 @@ fn with_local_interrupts_disabled<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+#[track_caller]
 fn with_interrupt_safe_kernel_ref<T>(
     kernel: &Arc<Mutex<crate::task::Kernel>>,
     f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
-    let mut f = Some(f);
+    // Acquire the kernel lock with interrupts masked only for the successful
+    // acquisition/critical section. While contended, re-enable interrupts so
+    // this CPU can still service timer/IPI work that another lock holder might
+    // be waiting on. Avoid sleeping with HLT inside the lock-wait loop: that
+    // path can be re-entered by timer/IPI activity on the same kernel stack.
+    const WARN_INTERVAL: u64 = 1_000_000;
+    let mut spins = 0u64;
+    let caller = core::panic::Location::caller();
     let were_enabled = x86_64::instructions::interrupts::are_enabled();
     loop {
         if were_enabled {
             x86_64::instructions::interrupts::disable();
         }
         if let Some(guard) = kernel.try_lock() {
-            let result = f.take().expect("kernel ref closure reused")(&guard);
+            record_kernel_lock_owner(caller, false);
+            let result = f(&guard);
+            drop(guard);
+            clear_kernel_lock_owner();
             if were_enabled {
                 x86_64::instructions::interrupts::enable();
             }
             return result;
         }
+        spins = spins.wrapping_add(1);
+        if spins % WARN_INTERVAL == 0 {
+            let holder_cpu = KERNEL_LOCK_OWNER_CPU.load(Ordering::Acquire);
+            let holder_mutable = KERNEL_LOCK_OWNER_MUTABLE.load(Ordering::Acquire);
+            let holder_held = KERNEL_LOCK_HELD.load(Ordering::Acquire);
+            let acquired_at = KERNEL_LOCK_OWNER_ACQUIRED_AT_NS.load(Ordering::Acquire);
+            crate::kprintln!(
+                "WARN: kernel-ref-wait spins={} caller_line={} holder={} holder_mut={} cpu={} held_ns={}",
+                spins,
+                caller.line(),
+                holder_held,
+                holder_mutable,
+                holder_cpu,
+                crate::time::now_ns().saturating_sub(acquired_at),
+            );
+        }
         if were_enabled {
             x86_64::instructions::interrupts::enable();
+            core::hint::spin_loop();
+        } else {
+            core::hint::spin_loop();
         }
-        core::hint::spin_loop();
     }
 }
 
+#[track_caller]
 fn with_interrupt_safe_kernel_mut<T>(
     kernel: &Arc<Mutex<crate::task::Kernel>>,
     f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
-    let mut f = Some(f);
+    const WARN_INTERVAL: u64 = 1_000_000;
+    let mut spins = 0u64;
+    let caller = core::panic::Location::caller();
     let were_enabled = x86_64::instructions::interrupts::are_enabled();
     loop {
         if were_enabled {
             x86_64::instructions::interrupts::disable();
         }
         if let Some(mut guard) = kernel.try_lock() {
-            let result = f.take().expect("kernel mut closure reused")(&mut guard);
+            record_kernel_lock_owner(caller, true);
+            let result = f(&mut guard);
+            drop(guard);
+            clear_kernel_lock_owner();
             if were_enabled {
                 x86_64::instructions::interrupts::enable();
             }
             return result;
         }
+        spins = spins.wrapping_add(1);
+        if spins % WARN_INTERVAL == 0 {
+            let holder_cpu = KERNEL_LOCK_OWNER_CPU.load(Ordering::Acquire);
+            let holder_mutable = KERNEL_LOCK_OWNER_MUTABLE.load(Ordering::Acquire);
+            let holder_held = KERNEL_LOCK_HELD.load(Ordering::Acquire);
+            let acquired_at = KERNEL_LOCK_OWNER_ACQUIRED_AT_NS.load(Ordering::Acquire);
+            crate::kprintln!(
+                "WARN: kernel-mut-wait spins={} caller_line={} holder={} holder_mut={} cpu={} held_ns={}",
+                spins,
+                caller.line(),
+                holder_held,
+                holder_mutable,
+                holder_cpu,
+                crate::time::now_ns().saturating_sub(acquired_at),
+            );
+        }
         if were_enabled {
             x86_64::instructions::interrupts::enable();
+            core::hint::spin_loop();
+        } else {
+            core::hint::spin_loop();
         }
-        core::hint::spin_loop();
     }
 }
 
+#[track_caller]
 fn with_core_mut<T>(
     f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
@@ -2224,6 +2566,7 @@ fn with_core_mut<T>(
     with_interrupt_safe_kernel_mut(&kernel, f)
 }
 
+#[track_caller]
 fn with_core<T>(
     f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
@@ -2231,12 +2574,14 @@ fn with_core<T>(
     with_interrupt_safe_kernel_ref(&kernel, f)
 }
 
+#[track_caller]
 fn with_kernel_mut<T>(
     f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
     with_core_mut(f)
 }
 
+#[track_caller]
 fn with_kernel<T>(
     f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
@@ -2244,8 +2589,14 @@ fn with_kernel<T>(
 }
 
 fn block_current_trap_until_runnable() {
-    x86_64::instructions::interrupts::enable_and_hlt();
-    x86_64::instructions::interrupts::disable();
+    // SAFETY: this is the standard x86 atomic sleep sequence for trap-blocked
+    // threads. `sti` defers interrupt recognition until after the following
+    // instruction, so `hlt` sleeps without racing a wakeup edge, and `cli`
+    // restores the trap/blocking invariant before returning to Rust.
+    unsafe {
+        core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+    }
+    crate::wait::on_tick();
 }
 
 pub(crate) fn run_trap_blocking<T>(
@@ -2272,11 +2623,50 @@ pub(crate) fn run_current_cpu_idle_loop() -> ! {
             if lifecycle_dirty {
                 process::sync_task_lifecycle(state)?;
             }
-            state.with_kernel_mut(|kernel| kernel.take_current_cpu_idle_context())
+            state.with_kernel_mut(|kernel| kernel.take_current_cpu_idle_activation())
         }) {
-            Ok(Some(context)) => {
+            Ok(Some(activation)) => {
                 x86_64::instructions::interrupts::disable();
-                context.enter()
+                crate::kprintln!(
+                    "idle: cpu{} activate thread={} prev_aspace={:?} next_aspace={} rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x} fs_base={:#x}",
+                    activation.current_cpu_id(),
+                    activation.thread_id(),
+                    activation.previous_address_space_id(),
+                    activation.next_address_space_id(),
+                    activation.context().rip(),
+                    activation.context().cs(),
+                    activation.context().rflags(),
+                    activation.context().rsp(),
+                    activation.context().ss(),
+                    activation.context().fs_base(),
+                );
+                let switch_kind = with_state_mut(|state| {
+                    state.with_vm_mut(|vm| {
+                        vm.activate_cpu_address_space_transition(
+                            activation.current_cpu_id(),
+                            activation.previous_address_space_id(),
+                            activation.next_address_space_id(),
+                        )
+                    })
+                })
+                .expect("idle address-space activation must succeed");
+                crate::trace::record_context_switch(
+                    activation.previous_thread_id(),
+                    activation.thread_id(),
+                    activation.address_space_switched(),
+                );
+                crate::trace::record_tlb_address_space_switch(
+                    activation.previous_address_space_id().unwrap_or(0),
+                    activation.next_address_space_id(),
+                    switch_kind,
+                );
+                crate::kprintln!(
+                    "idle: cpu{} entered thread={} switch={:?}",
+                    activation.current_cpu_id(),
+                    activation.thread_id(),
+                    switch_kind,
+                );
+                activation.context().enter()
             }
             Ok(None) => block_current_trap_until_runnable(),
             Err(status) => panic!("idle loop failed: {status}"),
@@ -2803,45 +3193,25 @@ pub fn futex_get_owner(value_ptr: zx_vaddr_t) -> Result<zx_koid_t, zx_status_t> 
     with_state_mut(|state| state.with_kernel(|kernel| Ok(kernel.futex_owner(key))))
 }
 
-/// Ensure a handle is valid and references a Port object.
-#[allow(dead_code)]
-pub fn ensure_port_handle(handle: zx_handle_t) -> Result<(), zx_status_t> {
-    ensure_handle_kind(handle, ObjectKind::Port)
-}
-
-/// Ensure a handle is valid and references a Timer object.
-#[allow(dead_code)]
-pub fn ensure_timer_handle(handle: zx_handle_t) -> Result<(), zx_status_t> {
-    ensure_handle_kind(handle, ObjectKind::Timer)
+fn lookup_timer_with_write_rights(
+    state: &KernelState,
+    handle: zx_handle_t,
+) -> Result<(ObjectKey, TimerId), zx_status_t> {
+    let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
+    let object_key = resolved.object_key();
+    let timer_id = state.with_objects(|objects| match objects.get(object_key) {
+        Some(KernelObject::Timer(timer)) => Ok(timer.timer_id),
+        Some(_) => Err(ZX_ERR_WRONG_TYPE),
+        None => Err(ZX_ERR_BAD_HANDLE),
+    })?;
+    require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
+    Ok((object_key, timer_id))
 }
 
 /// Arm or re-arm a timer.
 pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let object_key = resolved.object_key();
-        let timer_id = state.with_objects(|objects| {
-            Ok(match objects.get(object_key) {
-                Some(KernelObject::Timer(timer)) => timer.timer_id,
-                Some(KernelObject::Job(_))
-                | Some(KernelObject::Process(_))
-                | Some(KernelObject::SuspendToken(_))
-                | Some(KernelObject::GuestSession(_))
-                | Some(KernelObject::Socket(_))
-                | Some(KernelObject::Channel(_))
-                | Some(KernelObject::EventPair(_))
-                | Some(KernelObject::Port(_))
-                | Some(KernelObject::Interrupt(_))
-                | Some(KernelObject::PciDevice(_))
-                | Some(KernelObject::RevocationGroup(_))
-                | Some(KernelObject::DmaRegion(_))
-                | Some(KernelObject::Thread(_))
-                | Some(KernelObject::Vmo(_))
-                | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
-                None => return Err(ZX_ERR_BAD_HANDLE),
-            })
-        })?;
-        require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
+        let (object_key, timer_id) = lookup_timer_with_write_rights(state, handle)?;
 
         let now = crate::time::now_ns();
         let current = state.with_kernel_mut(|kernel| {
@@ -2863,30 +3233,7 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
 /// Cancel a timer.
 pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let object_key = resolved.object_key();
-        let timer_id = state.with_objects(|objects| {
-            Ok(match objects.get(object_key) {
-                Some(KernelObject::Timer(timer)) => timer.timer_id,
-                Some(KernelObject::Job(_))
-                | Some(KernelObject::Process(_))
-                | Some(KernelObject::SuspendToken(_))
-                | Some(KernelObject::GuestSession(_))
-                | Some(KernelObject::Socket(_))
-                | Some(KernelObject::Channel(_))
-                | Some(KernelObject::EventPair(_))
-                | Some(KernelObject::Port(_))
-                | Some(KernelObject::Interrupt(_))
-                | Some(KernelObject::PciDevice(_))
-                | Some(KernelObject::RevocationGroup(_))
-                | Some(KernelObject::DmaRegion(_))
-                | Some(KernelObject::Thread(_))
-                | Some(KernelObject::Vmo(_))
-                | Some(KernelObject::Vmar(_)) => return Err(ZX_ERR_WRONG_TYPE),
-                None => return Err(ZX_ERR_BAD_HANDLE),
-            })
-        })?;
-        require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
+        let (object_key, timer_id) = lookup_timer_with_write_rights(state, handle)?;
 
         state.with_kernel_mut(|kernel| {
             kernel

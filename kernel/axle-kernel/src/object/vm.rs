@@ -152,9 +152,9 @@ pub fn create_vmo(size: u64, options: u32) -> Result<zx_handle_t, zx_status_t> {
 /// # Privilege
 ///
 /// Physical VMO creation grants direct access to physical memory and is
-/// restricted to processes that are direct children of the root job.
-/// A proper Resource-handle capability gate should replace this check once
-/// the Resource subsystem is implemented.
+/// restricted to processes running in the root job. Axle does not expose a
+/// public Resource object yet, so root-job membership is the current authority
+/// boundary for this surface.
 pub fn create_physical_vmo(
     base_paddr: u64,
     size: u64,
@@ -165,10 +165,8 @@ pub fn create_physical_vmo(
     }
 
     with_state_mut(|state| {
-        // Privilege gate: only processes that are direct children of the root
-        // job may create physical VMOs.  This is a stop-gap until a full
-        // Resource-handle authority is plumbed through the object system.
-        // TODO(security): Replace with a proper root-resource handle check.
+        // Privilege gate: only processes that run in the root job may create
+        // physical VMOs.
         let caller_job_id = state.with_core(|kernel| {
             let process = kernel.current_process_info()?;
             kernel.process_job_id(process.process_id())

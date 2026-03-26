@@ -140,11 +140,10 @@ struct UserCopyCtx {
 
 impl UserCopyCtx {
     fn current() -> Result<Self, zx_status_t> {
-        let kernel = crate::object::kernel_handle()?;
-        let kernel = kernel.lock();
-        let process = kernel.current_process_info()?;
-        let address_space_id = kernel.process_address_space_id(process.process_id())?;
-        Ok(Self { address_space_id })
+        crate::object::with_state_mut(|state| {
+            let address_space_id = state.with_kernel(|kernel| kernel.current_address_space_id())?;
+            Ok(Self { address_space_id })
+        })
     }
 
     fn validate_read(&self, ptr: u64, len: usize) -> Result<ValidatedUserSpan, zx_status_t> {
@@ -156,9 +155,9 @@ impl UserCopyCtx {
     }
 
     fn try_pin_read(&self, ptr: u64, len: usize) -> Result<Option<LoanedUserPages>, zx_status_t> {
-        let kernel = crate::object::kernel_handle()?;
-        let vm = { kernel.lock().vm_handle() };
-        vm.try_loan_user_pages(self.address_space_id, ptr, len)
+        crate::object::with_state_mut(|state| {
+            state.with_vm_mut(|vm| vm.try_loan_user_pages(self.address_space_id, ptr, len))
+        })
     }
 }
 

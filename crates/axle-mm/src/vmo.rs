@@ -7,7 +7,7 @@ use super::pte_meta::PteMetaTag;
 use super::{MappingCachePolicy, MappingPerms, PAGE_SIZE};
 
 /// Identifier for a VMO tracked by an address space.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VmoId(u64);
 
 impl VmoId {
@@ -38,7 +38,7 @@ impl GlobalVmoId {
 }
 
 /// Identifier for a VMAR tracked by an address space.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VmarId(u64);
 
 impl VmarId {
@@ -53,7 +53,7 @@ impl VmarId {
 }
 
 /// Identifier for one coarse mapping record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MapId(u64);
 
 impl MapId {

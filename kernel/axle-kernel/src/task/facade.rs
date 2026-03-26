@@ -195,6 +195,21 @@ impl VmFacade {
         )
     }
 
+    pub(crate) fn activate_cpu_address_space_transition(
+        &self,
+        cpu_id: usize,
+        previous_address_space_id: Option<AddressSpaceId>,
+        next_address_space_id: AddressSpaceId,
+    ) -> Result<crate::arch::tlb::AddressSpaceSwitchKind, zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.activate_cpu_address_space_transition(
+                cpu_id,
+                previous_address_space_id,
+                next_address_space_id,
+            )
+        })
+    }
+
     pub(crate) fn create_anonymous_vmo_for_address_space(
         &self,
         process_id: ProcessId,
@@ -210,6 +225,13 @@ impl VmFacade {
                 global_vmo_id,
             )
         })
+    }
+
+    pub(crate) fn cleanup_process_address_space(
+        &self,
+        address_space_id: AddressSpaceId,
+    ) -> Result<TlbCommitReq, zx_status_t> {
+        self.with_domain_mut(|vm| vm.cleanup_process_address_space(address_space_id))
     }
 
     pub(crate) fn create_physical_vmo_global(
@@ -444,6 +466,41 @@ impl VmFacade {
             fault_va,
             error,
         )
+    }
+
+    pub(crate) fn prepare_process_start(
+        &self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        global_vmo_id: KernelVmoId,
+        layout: &ProcessImageLayout,
+    ) -> Result<PreparedProcessStart, zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.prepare_process_start(process_id, address_space_id, global_vmo_id, layout)
+        })
+    }
+
+    pub(crate) fn prepare_linux_process_start(
+        &self,
+        process_id: ProcessId,
+        address_space_id: AddressSpaceId,
+        global_vmo_id: KernelVmoId,
+        layout: &ProcessImageLayout,
+        exec_spec: ax_linux_exec_spec_header_t,
+        stack_image: &[u8],
+        extra_image: Option<&LinuxExecExtraImage<'_>>,
+    ) -> Result<PreparedProcessStart, zx_status_t> {
+        self.with_domain_mut(|vm| {
+            vm.prepare_linux_process_start(
+                process_id,
+                address_space_id,
+                global_vmo_id,
+                layout,
+                exec_spec,
+                stack_image,
+                extra_image,
+            )
+        })
     }
 }
 

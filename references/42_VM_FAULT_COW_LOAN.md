@@ -71,8 +71,10 @@ This is the current mechanism that prevents duplicate materialization or inconsi
     leaking the quota slot (COW rollback safety)
 - The reservation is now a typed internal token rather than one bool carried across the whole fault
   path.
-  - commit consumes the token
-  - early error paths explicitly release it
+  - the fault path now scopes the token through one helper that either commits on success or
+    releases on error
+  - dropping an unresolved token is treated as one internal invariant violation rather than silently
+    leaking quota in release builds
   - quota accounting now tracks pending reservations separately from committed private COW pages
 - VM resource tracking records:
   - current and peak private COW pages

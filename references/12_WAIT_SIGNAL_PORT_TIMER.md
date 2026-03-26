@@ -42,6 +42,10 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   - the object becomes invalid or otherwise completes with an error
 - Delayed completions keep only the opaque sink token in the wait registration; the wake path still
   performs the eventual write into that sink.
+- Delayed signal and port completions now split kernel bookkeeping from user-buffer writeback:
+  the wake path first decides the completion under the global kernel lock, then resolves user-page
+  residency and performs the copyout outside that lock before publishing the final wake reason.
+  This avoids doing VM fault / resident work while the kernel core lock is held.
 - Infinite and finite waits now use the same parked-thread path; finite waits are driven by the
   same per-thread wait registration plus the shared reactor timer backend.
 - Timeout delivery rechecks signal state at the timeout boundary before returning `TIMED_OUT`.
@@ -52,6 +56,10 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
 - Async observer authority now lives in `axle_core::ObserverRegistry`.
 - The registry owns registration uniqueness, reverse indexing by `waitable_id`, edge/level rules,
   and pending-overflow merge behavior.
+- Async registrations now also retain the revocation provenance of both the source waitable handle
+  and the destination port handle.
+  After `ax_revocation_group_revoke()` bumps one group's epoch, stale observers created through
+  handles from older epochs are removed eagerly instead of continuing to deliver packets.
 - Observer cleanup now eagerly removes pending-overflow entries when one registration is canceled or
   when the watched object is destroyed.
   It no longer relies on later `flush_port()` calls to lazily skip stale pending registrations.
@@ -125,10 +133,13 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
 - The unified backend produces two event families:
   - timer object fire
   - blocked wait deadline expiry
-- The timer interrupt path now polls that backend once per tick, then:
+- User-mode timer interrupts poll that backend once per tick, then:
   - publishes timer-object `SIGNALED` transitions
   - wakes expired blocked waits
   - syncs current CPU TLB state
+- Kernel-mode timer interrupts no longer run the full wait/reactor poll path on an already
+  suspended trap stack; instead, trap-blocking wait paths poll the same backend immediately after
+  they wake from the `hlt` edge.
 - Backend storage is slot-owned by CPU, so timer objects and wait deadlines already share the same
   enqueue/cancel/poll path and telemetry surface.
 - When x86_64 TSC-deadline timers are available, each online CPU now drives its own timer poll.

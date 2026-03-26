@@ -812,6 +812,10 @@ forcing every syscall through one uniform RPC layer.
 - `fork` clones Linux fd tables by sharing `FileDescription` identity across
   parent and child. Closing one side must not tear down the underlying
   description until the last cross-table reference is gone.
+- Dropping one whole Linux fd table now also walks every live entry through the
+  same last-description close rule, so teardown of one executive/process table
+  still delivers EOF / peer-close semantics once the final shared description is
+  gone.
 - `execve` already preserves Linux task identity while replacing carrier and
   address-space resources.
 - `execve` now also applies the first executive-only reset rules that later

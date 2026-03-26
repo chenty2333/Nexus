@@ -890,6 +890,12 @@ const SLOT_SMP_SMOKE_PRESENT: usize = 1008;
 const SLOT_SMP_SMOKE_STATUS: usize = 1009;
 const SLOT_TRACE_CONTEXT_SWITCHES: usize = 657;
 const SLOT_MAX: usize = SLOT_VMO_PRIVATE_OBJECT_CLONE_SIZE_AFTER;
+
+// Compile-time guarantee: no SLOT_* constant can exceed the shared window.
+const _: () = assert!(
+    SLOT_MAX < SHARED_SLOT_COUNT,
+    "SLOT_MAX exceeds SHARED_SLOT_COUNT — shared slot window is too small"
+);
 const SLOT_VMAR_DESTROY_STALE_MAP: usize = SLOT_SELF_CODE_VMO_H;
 const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
@@ -1793,7 +1799,7 @@ const SHARED_SLOT_COUNT: usize = (USER_SHARED_PAGE_COUNT * 4096) / core::mem::si
 /// # Safety
 /// `index` must be < `SHARED_SLOT_COUNT`.
 unsafe fn shared_slot_write(index: usize, value: u64) {
-    debug_assert!(index < SHARED_SLOT_COUNT);
+    assert!(index < SHARED_SLOT_COUNT, "shared slot write out of bounds");
     // SAFETY: the static backing array is large enough and the pointer is valid.
     unsafe {
         core::ptr::write_volatile(shared_slots_ptr().add(index), value);
@@ -1805,7 +1811,7 @@ unsafe fn shared_slot_write(index: usize, value: u64) {
 /// # Safety
 /// `index` must be < `SHARED_SLOT_COUNT`.
 unsafe fn shared_slot_read(index: usize) -> u64 {
-    debug_assert!(index < SHARED_SLOT_COUNT);
+    assert!(index < SHARED_SLOT_COUNT, "shared slot read out of bounds");
     // SAFETY: the static backing array is large enough and the pointer is valid.
     unsafe { core::ptr::read_volatile(shared_slots_ptr().add(index) as *const u64) }
 }

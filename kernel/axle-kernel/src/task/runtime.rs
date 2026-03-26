@@ -87,6 +87,14 @@ pub(super) struct Process {
     cspace: CSpace,
     pub(super) state: ProcessState,
     pub(super) suspend_tokens: u32,
+    address_space_cleanup: ProcessAddressSpaceCleanup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessAddressSpaceCleanup {
+    NotPending,
+    Pending,
+    InProgress,
 }
 
 /// Per-job resource quotas. Each field limits how many live objects of that
@@ -174,6 +182,7 @@ impl Process {
             cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
             state: ProcessState::Started,
             suspend_tokens: 0,
+            address_space_cleanup: ProcessAddressSpaceCleanup::NotPending,
         }
     }
 
@@ -191,6 +200,7 @@ impl Process {
             cspace: CSpace::new(CSPACE_MAX_SLOTS, CSPACE_QUARANTINE_LEN),
             state: ProcessState::Created,
             suspend_tokens: 0,
+            address_space_cleanup: ProcessAddressSpaceCleanup::NotPending,
         }
     }
 
@@ -219,11 +229,11 @@ impl Process {
         revocations: &RevocationManager,
     ) -> Result<ResolvedHandle, zx_status_t> {
         let handle = Handle::from_raw(raw).map_err(|_| ZX_ERR_BAD_HANDLE)?;
-        let cap = self
+        let (cap, revocation) = self
             .cspace
-            .get_checked(handle, revocations)
+            .get_checked_with_revocation(handle, revocations)
             .map_err(map_lookup_error)?;
-        ResolvedHandle::new(process_id, handle, cap)
+        ResolvedHandle::new(process_id, handle, cap, revocation)
     }
 
     pub(super) fn close_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
@@ -870,45 +880,15 @@ impl Kernel {
         result
     }
 
-    pub(crate) fn prepare_process_start(
-        &mut self,
+    pub(crate) fn process_start_address_space_id(
+        &self,
         process_id: ProcessId,
-        global_vmo_id: KernelVmoId,
-        layout: &ProcessImageLayout,
-    ) -> Result<PreparedProcessStart, zx_status_t> {
+    ) -> Result<AddressSpaceId, zx_status_t> {
         let process = self.process(process_id)?;
         if process.state != ProcessState::Created {
             return Err(ZX_ERR_BAD_STATE);
         }
-        self.with_vm_mut(|vm| {
-            vm.prepare_process_start(process_id, process.address_space_id, global_vmo_id, layout)
-        })
-    }
-
-    pub(crate) fn prepare_linux_process_start(
-        &mut self,
-        process_id: ProcessId,
-        global_vmo_id: KernelVmoId,
-        layout: &ProcessImageLayout,
-        exec_spec: ax_linux_exec_spec_header_t,
-        stack_image: &[u8],
-        extra_image: Option<&LinuxExecExtraImage<'_>>,
-    ) -> Result<PreparedProcessStart, zx_status_t> {
-        let process = self.process(process_id)?;
-        if process.state != ProcessState::Created {
-            return Err(ZX_ERR_BAD_STATE);
-        }
-        self.with_vm_mut(|vm| {
-            vm.prepare_linux_process_start(
-                process_id,
-                process.address_space_id,
-                global_vmo_id,
-                layout,
-                exec_spec,
-                stack_image,
-                extra_image,
-            )
-        })
+        Ok(process.address_space_id)
     }
 
     pub(crate) fn kill_thread(&mut self, thread_id: ThreadId) -> Result<(), zx_status_t> {
@@ -1109,7 +1089,8 @@ impl Kernel {
         Ok(self
             .threads
             .values()
-            .all(|thread| thread.process_id != process_id))
+            .all(|thread| thread.process_id != process_id)
+            && process.address_space_cleanup == ProcessAddressSpaceCleanup::NotPending)
     }
 
     pub(crate) fn reap_process(&mut self, process_id: ProcessId) -> Result<(), zx_status_t> {
@@ -1122,6 +1103,52 @@ impl Kernel {
 
     pub(crate) fn take_task_lifecycle_dirty(&mut self) -> bool {
         core::mem::take(&mut self.task_lifecycle_dirty)
+    }
+
+    pub(crate) fn claim_terminated_process_cleanup_work(
+        &mut self,
+    ) -> Vec<(ProcessId, AddressSpaceId)> {
+        self.processes
+            .iter_mut()
+            .filter_map(|(process_id, process)| {
+                (matches!(process.state, ProcessState::Terminated)
+                    && process.address_space_cleanup == ProcessAddressSpaceCleanup::Pending)
+                    .then(|| {
+                        process.address_space_cleanup = ProcessAddressSpaceCleanup::InProgress;
+                        (*process_id, process.address_space_id)
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn finish_process_address_space_cleanup(
+        &mut self,
+        process_id: ProcessId,
+    ) -> Result<(), zx_status_t> {
+        let Some(process) = self.processes.get_mut(&process_id) else {
+            return Ok(());
+        };
+        if matches!(process.state, ProcessState::Terminated)
+            && process.address_space_cleanup == ProcessAddressSpaceCleanup::InProgress
+        {
+            process.address_space_cleanup = ProcessAddressSpaceCleanup::NotPending;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn requeue_process_address_space_cleanup(
+        &mut self,
+        process_id: ProcessId,
+    ) -> Result<(), zx_status_t> {
+        let Some(process) = self.processes.get_mut(&process_id) else {
+            return Ok(());
+        };
+        if matches!(process.state, ProcessState::Terminated)
+            && process.address_space_cleanup == ProcessAddressSpaceCleanup::InProgress
+        {
+            process.address_space_cleanup = ProcessAddressSpaceCleanup::Pending;
+        }
+        Ok(())
     }
 
     pub(super) fn thread_should_be_suspended(
@@ -1208,15 +1235,9 @@ impl Kernel {
                 ProcessState::Created | ProcessState::Terminated
             )
         {
-            let address_space_id = process.address_space_id;
             process.state = ProcessState::Terminated;
+            process.address_space_cleanup = ProcessAddressSpaceCleanup::Pending;
             self.task_lifecycle_dirty = true;
-            // Release all user-visible mappings so physical memory can be
-            // reclaimed before the process is reaped.
-            let req = self.with_vm_mut(|vm| vm.cleanup_process_address_space(address_space_id));
-            if let Ok(req) = req {
-                let _ = self.apply_tlb_commit_reqs_current(&[req]);
-            }
         }
         Ok(())
     }

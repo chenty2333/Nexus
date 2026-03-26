@@ -56,6 +56,11 @@ impl RevocationRef {
         self.id
     }
 
+    /// Group generation captured at issuance.
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
     /// Epoch snapshot at issuance.
     pub const fn epoch(self) -> u64 {
         self.epoch

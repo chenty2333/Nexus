@@ -113,6 +113,11 @@ It is a current-state reference, not a roadmap.
   - it snapshots the target revocation group's current epoch onto the duplicate
   - later duplicate/replace/transfer of that delegated handle preserve the same revocation
     association through the ordinary `CSpace` paths
+- `wait_async` registrations now retain handle-level revocation provenance too:
+  - if a waitable handle or destination port handle came from one revocable delegation epoch,
+    `ax_revocation_group_revoke()` removes the stale observer when that epoch is revoked
+  - this keeps async packet delivery aligned with the same epoch validity rule used for ordinary
+    handle lookup and transfer
 - There is now one narrow public job-governance layer above ordinary handles:
   - `ax_process_get_job()` returns the current owning job for one process handle
   - `ax_job_create()` creates a child job under a parent job handle

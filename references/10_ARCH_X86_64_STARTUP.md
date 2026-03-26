@@ -138,7 +138,9 @@ Current stack contract:
 - `#GP` uses its own separate per-CPU fault IST (IST4), independent from `#PF`
 - `#UD` does not use an IST (IST=0) and runs on the current kernel stack
 - `#DF` keeps its own dedicated IST
-- Ring0 and IST stacks are now 32 KiB per CPU (previously 16 KiB)
+- Ring0 stacks are now 128 KiB per CPU; fault IST stacks remain 32 KiB per CPU
+- the larger `RSP0` stack budget is now required because trap-blocking waits can remain on the
+  per-CPU ring0 stack across timer-driven wakeups before returning to user mode
 - x87/SSE state for user threads now uses XSAVE64/XRSTOR64 when the CPU advertises XSAVE support
   (CPUID leaf 1, ECX bit 26), with automatic detection of AVX and AVX-512 components via CPUID
   leaf 0xD.  When XSAVE is not available, the kernel falls back to legacy FXSAVE64/FXRSTOR64.
@@ -149,6 +151,14 @@ Axle previously used a shared IRQ IST for timer/IPI/breakpoint entry, but that s
 blocked trap path re-enables interrupts and idles: a nested IRQ would reset `rsp` back to the same
 IST top and corrupt the suspended return chain. Keeping regular IRQ/IPI entry on the current kernel
 stack preserves nested interrupt frames, while `#PF` and `#GP` each keep their own dedicated fault IST.
+
+Current timer/wait discipline on x86_64:
+
+- user-mode timer interrupts still run the full timer/wait poll path in interrupt context
+- kernel-mode timer interrupts stay lighter and only advance time locally; trap-blocking wait paths
+  poll the timer/wait backend immediately after the wake edge returns from `hlt`
+- this avoids driving the full wait/reactor poll path recursively on a kernel stack that is already
+  suspended inside trap-exit blocking
 
 Current architecture hardening and correctness notes:
 

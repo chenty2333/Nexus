@@ -47,6 +47,8 @@ Main just targets include:
 - `just perf-smoke-perfetto <serial-log>`
 - `just perf-smoke-archive <serial-log> <label> [cpuinfo]`
 - `just perf-smoke-kvm-archive [label]`
+- `just perf-regression-check <baseline.json> [current.json]`
+- `just perf-smoke-kvm-regression <baseline.json>`
 - `just check-conformance-contracts`
 - `just test-all`
 
@@ -187,6 +189,32 @@ That host gate now explicitly covers:
     - writes `perfetto-trace.json` with the full bootstrap trace timeline
   - `just perf-smoke-kvm-archive` then snapshots that run into the same
     `target/perf-smoke-baselines/` archive layout used by real-machine captures
+  - `just perf-regression-check <baseline.json> [current.json]` is now the explicit regression
+    comparator for archived or freshly captured perf baselines:
+    - accepts either `baseline.json` or `perf-smoke.json`
+    - compares normalized `cycles / iter` ratios rather than raw totals
+    - currently covers:
+      - `null_syscall`
+      - `wait_one`
+      - cross-core wake
+      - TLB churn
+      - same-page fault
+      - fragmented channel
+      - address-space switch
+    - also requires the current capture to keep core wiring invariants healthy:
+      - `perf_failure_step = 0`
+      - zero per-phase status failures
+      - `trace_sched_phase3_ok = 1`
+      - `trace_tlb_phase8_ok = 1`
+      - `trace_dropped = 0`
+    - if both inputs are full `baseline.json` captures, guest feature visibility
+      (`pcid` / `invpcid` / PMU exposure) must also match
+  - `just perf-smoke-kvm-regression <baseline.json>` now provides the stable-host loop:
+    - run one fresh KVM perf-smoke capture
+    - compare it against one archived baseline on the same machine class
+  - this remains an explicit stable-host gate rather than part of generic hosted CI:
+    - shared runners are too noisy for merge-blocking latency thresholds
+    - baseline comparison is intended for self-hosted KVM or dedicated bare-metal capture paths
 - Bootstrap VM coverage now also includes one narrow object-metadata gate:
   - `kernel.vmo.info_bootstrap`
   - one anonymous VMO must report the current public local-private object

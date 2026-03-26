@@ -392,6 +392,8 @@ pub fn object_wait_async(
                     WaitAsyncRegistration {
                         port: port_key,
                         waitable: waitable_key,
+                        waitable_revocation: waitable.revocation_ref(),
+                        port_revocation: resolved_port.revocation_ref(),
                         key,
                         watched,
                         options,
@@ -497,9 +499,11 @@ fn wake_signal_waiters(
     let waiters =
         state.with_kernel_mut(|kernel| Ok(kernel.signal_waiters_ready(waitable_key, current)))?;
     for waiter in waiters {
-        let status = match state.with_kernel_mut(|kernel| {
-            kernel.copyout_thread_user(waiter.thread_id(), waiter.observed_ptr(), current.bits())
-        }) {
+        let status = match state.copyout_thread_user(
+            waiter.thread_id(),
+            waiter.observed_ptr(),
+            current.bits(),
+        ) {
             Ok(()) => ZX_OK,
             Err(err) => err,
         };
@@ -538,12 +542,11 @@ fn wake_port_waiters(state: &object::KernelState, port_key: ObjectKey) -> Result
             }
         };
         let packet = port_packet_from_core(packet);
-        let status = match state.with_kernel_mut(|kernel| {
-            kernel.copyout_thread_user(waiter.thread_id(), waiter.packet_ptr(), packet)
-        }) {
-            Ok(()) => ZX_OK,
-            Err(err) => err,
-        };
+        let status =
+            match state.copyout_thread_user(waiter.thread_id(), waiter.packet_ptr(), packet) {
+                Ok(()) => ZX_OK,
+                Err(err) => err,
+            };
         state.with_kernel_mut(|kernel| {
             let _ = kernel.complete_waiter(
                 waiter.thread_id(),
@@ -570,13 +573,11 @@ fn wake_expired_waits(
                 observed_ptr,
             } => {
                 let observed = object::signals_for_object_id(state, object_key)?;
-                let status = match state.with_kernel_mut(|kernel| {
-                    kernel.copyout_thread_user(
-                        thread_id,
-                        observed_ptr as *mut zx_signals_t,
-                        observed.bits(),
-                    )
-                }) {
+                let status = match state.copyout_thread_user(
+                    thread_id,
+                    observed_ptr as *mut zx_signals_t,
+                    observed.bits(),
+                ) {
                     Ok(()) if observed.intersects(watched) => ZX_OK,
                     Ok(()) => ZX_ERR_TIMED_OUT,
                     Err(err) => err,
@@ -591,13 +592,11 @@ fn wake_expired_waits(
                 let status = match packet {
                     Ok(packet) => {
                         let packet = port_packet_from_core(packet);
-                        let status = match state.with_kernel_mut(|kernel| {
-                            kernel.copyout_thread_user(
-                                thread_id,
-                                packet_ptr as *mut zx_port_packet_t,
-                                packet,
-                            )
-                        }) {
+                        let status = match state.copyout_thread_user(
+                            thread_id,
+                            packet_ptr as *mut zx_port_packet_t,
+                            packet,
+                        ) {
                             Ok(()) => ZX_OK,
                             Err(err) => err,
                         };

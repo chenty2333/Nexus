@@ -299,13 +299,22 @@ impl CSpace {
         h: Handle,
         rev_mgr: &RevocationManager,
     ) -> Result<Capability, CSpaceError> {
+        Ok(self.get_checked_with_revocation(h, rev_mgr)?.0)
+    }
+
+    /// Lookup a capability and its revocation provenance, enforcing revocation-group validity.
+    pub fn get_checked_with_revocation(
+        &self,
+        h: Handle,
+        rev_mgr: &RevocationManager,
+    ) -> Result<(Capability, Option<RevocationRef>), CSpaceError> {
         let entry = self.get_entry(h)?;
         if let Some(r) = entry.rev
             && !rev_mgr.is_live(r)
         {
             return Err(CSpaceError::BadHandle);
         }
-        Ok(entry.cap)
+        Ok((entry.cap, entry.rev))
     }
 
     fn get_entry(&self, h: Handle) -> Result<CapEntry, CSpaceError> {

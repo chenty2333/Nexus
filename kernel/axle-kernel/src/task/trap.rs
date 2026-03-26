@@ -1,7 +1,7 @@
 use super::runtime::ProcessState;
 use super::*;
 use core::cell::UnsafeCell;
-use core::mem::MaybeUninit;
+use core::mem::{MaybeUninit, offset_of};
 
 struct UserContextEnterSlots(UnsafeCell<[MaybeUninit<UserContext>; crate::arch::MAX_CPUS]>);
 
@@ -33,6 +33,30 @@ pub(crate) struct UserContext {
 }
 
 impl UserContext {
+    pub(crate) const fn rip(self) -> u64 {
+        self.rip
+    }
+
+    pub(crate) const fn cs(self) -> u64 {
+        self.cs
+    }
+
+    pub(crate) const fn rflags(self) -> u64 {
+        self.rflags
+    }
+
+    pub(crate) const fn rsp(self) -> u64 {
+        self.rsp
+    }
+
+    pub(crate) const fn ss(self) -> u64 {
+        self.ss
+    }
+
+    pub(crate) const fn fs_base(self) -> u64 {
+        self.fs_base
+    }
+
     fn capture(
         trap: &crate::arch::int80::TrapFrame,
         cpu_frame: *const u64,
@@ -210,6 +234,14 @@ axle_enter_user_context:
     "#
 );
 
+const _: () = assert!(offset_of!(UserContext, trap) == 0);
+const _: () = assert!(offset_of!(UserContext, rip) == 120);
+const _: () = assert!(offset_of!(UserContext, cs) == 128);
+const _: () = assert!(offset_of!(UserContext, rflags) == 136);
+const _: () = assert!(offset_of!(UserContext, rsp) == 144);
+const _: () = assert!(offset_of!(UserContext, ss) == 152);
+const _: () = assert!(offset_of!(UserContext, fs_base) == 160);
+
 unsafe extern "C" {
     fn axle_enter_user_context(context: *const UserContext) -> !;
 }
@@ -342,11 +374,21 @@ impl Kernel {
             return Err(ZX_ERR_BAD_STATE);
         }
         thread.guest_started = true;
-        thread.context = Some(
-            UserContext::new_user_entry(regs.rip, regs.rsp, 0, 0)
-                .with_guest_x64_regs(*regs)
-                .with_fs_base(thread.guest_fs_base),
+        let guest_context = UserContext::new_user_entry(regs.rip, regs.rsp, 0, 0)
+            .with_guest_x64_regs(*regs)
+            .with_fs_base(thread.guest_fs_base);
+        crate::kprintln!(
+            "guest-start: thread={} process={} rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x} fs_base={:#x}",
+            thread_id,
+            process_id,
+            guest_context.rip(),
+            guest_context.cs(),
+            guest_context.rflags(),
+            guest_context.rsp(),
+            guest_context.ss(),
+            guest_context.fs_base(),
         );
+        thread.context = Some(guest_context);
         thread.state = ThreadState::Runnable;
         let queued = thread.queued_on_cpu.is_some();
         let thread_id_copy = thread_id;

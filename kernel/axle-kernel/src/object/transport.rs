@@ -469,9 +469,21 @@ fn reclaim_channel_payload(state: &KernelState, payload: ChannelPayload, drained
 }
 
 fn release_channel_message(state: &KernelState, message: ChannelMsgDesc) {
+    release_global_channel_bytes(message.accounted_bytes());
     let (payload, handles) = message.into_parts();
     release_transferred_handles(state, &handles);
     reclaim_data_payload(state, payload, true);
+}
+
+fn release_unqueued_channel_message(state: &KernelState, message: ChannelMsgDesc) {
+    let (payload, _handles) = message.into_parts();
+    release_channel_payload(state, payload);
+}
+
+fn release_retained_unqueued_channel_message(state: &KernelState, message: ChannelMsgDesc) {
+    release_transferred_handles(state, message.handles());
+    let (payload, _handles) = message.into_parts();
+    release_channel_payload(state, payload);
 }
 
 fn retain_transferred_handles(state: &KernelState, handles: &[TransferredCap]) {
@@ -1037,18 +1049,34 @@ pub fn channel_write(
         }
 
         let message = ChannelMsgDesc::new(payload.take().ok_or(ZX_ERR_BAD_STATE)?, transferred)?;
+        let budget = match ChannelMessageBudgetReservation::reserve(message.accounted_bytes()) {
+            Ok(budget) => budget,
+            Err(status) => {
+                release_unqueued_channel_message(state, message);
+                return Err(status);
+            }
+        };
         let actual_bytes = message.actual_bytes();
         let actual_handles = message.actual_handles();
         let fragmented = message.is_fragmented();
-        retain_transferred_handles(state, message.handles());
-        state.with_registry_mut(|registry| {
+        let mut message = Some(message);
+        retain_transferred_handles(state, message.as_ref().ok_or(ZX_ERR_BAD_STATE)?.handles());
+        if let Err(status) = state.with_registry_mut(|registry| {
             match registry.get_mut(peer_object_id) {
-                Some(KernelObject::Channel(peer)) => peer.messages.push_back(message),
+                Some(KernelObject::Channel(peer)) => peer
+                    .messages
+                    .push_back(message.take().ok_or(ZX_ERR_BAD_STATE)?),
                 Some(_) => return Err(ZX_ERR_BAD_STATE),
                 None => return Err(ZX_ERR_PEER_CLOSED),
             }
             Ok(())
-        })?;
+        }) {
+            if let Some(message) = message.take() {
+                release_retained_unqueued_channel_message(state, message);
+            }
+            return Err(status);
+        }
+        budget.commit();
         state.with_transport_mut(|transport| {
             transport.note_channel_desc_enqueued(fragmented, actual_bytes, actual_handles);
             Ok(())
@@ -1139,6 +1167,7 @@ pub fn channel_read(
             Ok(())
         })
         .map_err(|status| (status, 0, 0))?;
+    release_global_channel_bytes(message.accounted_bytes());
     let fragmented = message.is_fragmented();
     let (payload, retained_handles) = message.into_parts();
     crate::trace::record_channel_dequeue(actual_bytes, actual_handles, fragmented);

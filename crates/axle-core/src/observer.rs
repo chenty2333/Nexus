@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 
 use crate::capability::ObjectKey;
 use crate::port::{Packet, PortError, PortKey, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId};
+use crate::revocation::{RevocationGroupId, RevocationRef};
 use crate::signals::Signals;
 use crate::timer::Time;
 
@@ -28,6 +29,10 @@ pub struct WaitAsyncRegistration {
     pub port: ObserverPortId,
     /// Waitable object being observed.
     pub waitable: WaitableId,
+    /// Revocation provenance carried by the source waitable handle, if any.
+    pub waitable_revocation: Option<RevocationRef>,
+    /// Revocation provenance carried by the destination port handle, if any.
+    pub port_revocation: Option<RevocationRef>,
     /// User packet key.
     pub key: PortKey,
     /// Signal mask watched by this observer.
@@ -48,6 +53,8 @@ struct PendingState {
 struct Observer {
     watched: Signals,
     options: WaitAsyncOptions,
+    waitable_revocation: Option<RevocationRef>,
+    port_revocation: Option<RevocationRef>,
     last_satisfied: bool,
     pending: Option<PendingState>,
 }
@@ -171,6 +178,8 @@ impl ObserverRegistry {
             Observer {
                 watched: registration.watched,
                 options: registration.options,
+                waitable_revocation: registration.waitable_revocation,
+                port_revocation: registration.port_revocation,
                 last_satisfied: satisfied,
                 pending: None,
             },
@@ -343,6 +352,34 @@ impl ObserverRegistry {
         }
     }
 
+    /// Remove every observer that was created through one revoked group epoch.
+    pub fn remove_revoked_group(
+        &mut self,
+        group: RevocationGroupId,
+        generation: u64,
+        current_epoch: u64,
+    ) {
+        let regs: Vec<ObserverRegistration> = self
+            .observers
+            .iter()
+            .filter_map(|(reg, observer)| {
+                let matches = observer
+                    .waitable_revocation
+                    .into_iter()
+                    .chain(observer.port_revocation)
+                    .any(|rev| {
+                        rev.id() == group
+                            && rev.generation() == generation
+                            && rev.epoch() < current_epoch
+                    });
+                matches.then_some(*reg)
+            })
+            .collect();
+        for reg in regs {
+            let _ = self.remove_observer(reg);
+        }
+    }
+
     fn note_port_waitable(&mut self, port: ObserverPortId, waitable: WaitableId) {
         self.waitables_by_port
             .entry(port)
@@ -473,6 +510,7 @@ impl ObserverRegistry {
 mod tests {
     use super::*;
     use crate::port::{PacketKind, Port};
+    use crate::revocation::RevocationManager;
 
     fn key(id: u64) -> ObjectKey {
         id.into()
@@ -492,6 +530,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(42),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 7,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -519,6 +559,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 10,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -538,6 +580,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 11,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions {
@@ -578,6 +622,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 33,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions {
@@ -615,6 +661,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(5),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 9,
                     watched: Signals::TIMER_SIGNALED,
                     options: WaitAsyncOptions::default(),
@@ -629,6 +677,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(5),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 9,
                     watched: Signals::TIMER_SIGNALED,
                     options: WaitAsyncOptions::default(),
@@ -651,6 +701,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(7),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 1,
                     watched: Signals::TIMER_SIGNALED,
                     options: WaitAsyncOptions::default(),
@@ -677,6 +729,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 10,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -691,6 +745,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(2),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 11,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -723,6 +779,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 10,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -737,6 +795,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(2),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 11,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -769,6 +829,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 10,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -783,6 +845,8 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(2),
+                    waitable_revocation: None,
+                    port_revocation: None,
                     key: 11,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -803,5 +867,77 @@ mod tests {
 
         registry.remove_port(key(10));
         assert_eq!(registry.pending_count_for_port(key(10)), 0);
+    }
+
+    #[test]
+    fn remove_revoked_group_drops_only_matching_observers() {
+        let mut registry = ObserverRegistry::new();
+        let mut mgr = RevocationManager::new();
+        let waitable_group = mgr.create_group();
+        let port_group = mgr.create_group();
+        let live_waitable = mgr.snapshot(waitable_group).unwrap();
+        let live_port = mgr.snapshot(port_group).unwrap();
+
+        registry
+            .wait_async(
+                WaitAsyncRegistration {
+                    port: key(10),
+                    waitable: key(1),
+                    waitable_revocation: Some(live_waitable),
+                    port_revocation: None,
+                    key: 1,
+                    watched: Signals::CHANNEL_READABLE,
+                    options: WaitAsyncOptions::default(),
+                },
+                Signals::NONE,
+                0,
+                |_, _| true,
+            )
+            .unwrap();
+        registry
+            .wait_async(
+                WaitAsyncRegistration {
+                    port: key(10),
+                    waitable: key(2),
+                    waitable_revocation: None,
+                    port_revocation: Some(live_port),
+                    key: 2,
+                    watched: Signals::CHANNEL_READABLE,
+                    options: WaitAsyncOptions::default(),
+                },
+                Signals::NONE,
+                0,
+                |_, _| true,
+            )
+            .unwrap();
+        registry
+            .wait_async(
+                WaitAsyncRegistration {
+                    port: key(10),
+                    waitable: key(3),
+                    waitable_revocation: None,
+                    port_revocation: None,
+                    key: 3,
+                    watched: Signals::CHANNEL_READABLE,
+                    options: WaitAsyncOptions::default(),
+                },
+                Signals::NONE,
+                0,
+                |_, _| true,
+            )
+            .unwrap();
+
+        mgr.revoke(waitable_group).unwrap();
+        registry.remove_revoked_group(
+            waitable_group.id(),
+            waitable_group.generation(),
+            mgr.epoch_of(waitable_group.id()).unwrap(),
+        );
+        assert_eq!(
+            registry.cancel(key(10), key(1), 1),
+            Err(PortError::NotFound)
+        );
+        assert_eq!(registry.cancel(key(10), key(2), 2), Ok(()));
+        assert_eq!(registry.cancel(key(10), key(3), 3), Ok(()));
     }
 }
