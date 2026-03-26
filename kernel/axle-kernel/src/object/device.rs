@@ -24,7 +24,6 @@ use axle_virtio_transport::VirtioPciDiscovery;
 
 pub(crate) const BOOTSTRAP_NET_QUEUE_PAIR_COUNT: usize = 2;
 pub(crate) const BOOTSTRAP_NET_QUEUE_SIZE: u32 = 4;
-pub(crate) const BOOTSTRAP_NET_BAR_COUNT: u32 = 1;
 pub(crate) const BOOTSTRAP_NET_INTERRUPT_GROUPS: u32 = 3;
 pub(crate) const BOOTSTRAP_NET_BAR0_BYTES: u64 = crate::userspace::USER_PAGE_BYTES;
 pub(crate) const BOOTSTRAP_NET_CONFIG_BYTES: u64 = crate::userspace::USER_PAGE_BYTES;
@@ -303,10 +302,6 @@ impl PciDeviceObject {
             AX_PCI_INTERRUPT_MODE_MSIX => Ok(AX_INTERRUPT_MODE_MSIX),
             _ => Err(ZX_ERR_OUT_OF_RANGE),
         }
-    }
-
-    fn interrupt_resource_count(&self) -> u32 {
-        self.interrupts.len() as u32
     }
 
     fn interrupt_resource(

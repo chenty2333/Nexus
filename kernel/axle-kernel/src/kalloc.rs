@@ -116,14 +116,6 @@ pub(crate) fn bootstrap_heap_region() -> (u64, u64) {
     (base, base + HEAP_SIZE as u64)
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct LateHeapStats {
-    pub(crate) arena_bytes: usize,
-    pub(crate) free_bytes: usize,
-    pub(crate) peak_used_bytes: usize,
-    pub(crate) alloc_fail_count: usize,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct HeapRange {
     base: usize,
@@ -267,15 +259,6 @@ impl LateHeap {
             .any(|arena| addr >= arena.base && addr < arena.end())
     }
 
-    fn stats(&self) -> LateHeapStats {
-        LateHeapStats {
-            arena_bytes: self.arena_bytes,
-            free_bytes: self.free_bytes,
-            peak_used_bytes: self.peak_used_bytes,
-            alloc_fail_count: self.alloc_fail_count,
-        }
-    }
-
     fn insert_free_range(&mut self, mut range: HeapRange) -> Result<(), ()> {
         if range.len == 0 {
             return Ok(());
@@ -311,10 +294,6 @@ impl LateHeap {
 }
 
 static LATE_HEAP: Mutex<LateHeap> = Mutex::new(LateHeap::new());
-
-pub(crate) fn late_heap_stats() -> LateHeapStats {
-    LATE_HEAP.lock().stats()
-}
 
 pub(crate) fn init_late_heap() {
     if LATE_HEAP_ENABLED.load(Ordering::Acquire) {

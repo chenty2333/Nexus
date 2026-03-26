@@ -96,7 +96,6 @@ impl PhysRange {
 pub(crate) struct BootstrapPageAllocatorStats {
     pub(crate) capacity_bytes: u64,
     pub(crate) free_bytes: u64,
-    pub(crate) peak_used_bytes: u64,
     pub(crate) alloc_fail_count: u64,
 }
 
@@ -222,7 +221,6 @@ impl BootstrapPageAllocator {
         BootstrapPageAllocatorStats {
             capacity_bytes: self.capacity_bytes,
             free_bytes: self.free_bytes,
-            peak_used_bytes: self.peak_used_bytes,
             alloc_fail_count: self.alloc_fail_count,
         }
     }

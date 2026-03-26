@@ -23,4 +23,6 @@ x2apic = { version = "0.5", default-features = false }
 
 [features]
 default = []
+hardware-irq = []
+scatter-gather = []
 vm-diagnostics = []

@@ -65,27 +65,6 @@ impl PagerSourceHandle {
     }
 }
 
-#[derive(Clone, Debug)]
-struct StaticPagerSource {
-    bytes: &'static [u8],
-}
-
-impl PagerReadOnlySource for StaticPagerSource {
-    fn size_bytes(&self) -> u64 {
-        self.bytes.len() as u64
-    }
-
-    fn read_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), zx_status_t> {
-        let end = offset
-            .checked_add(dst.len() as u64)
-            .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-        let start = usize::try_from(offset).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        let end = usize::try_from(end).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
-        let src = self.bytes.get(start..end).ok_or(ZX_ERR_OUT_OF_RANGE)?;
-        crate::copy::copy_kernel_bytes(dst, src)
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FilePagerSource {
     pub(super) size_bytes: u64,
@@ -263,32 +242,6 @@ impl GlobalVmoStore {
             },
         );
         Ok(())
-    }
-
-    pub(super) fn register_pager_read_only(
-        &mut self,
-        global_vmo_id: KernelVmoId,
-        bytes: &'static [u8],
-    ) -> Result<(), zx_status_t> {
-        self.register_pager_source(
-            global_vmo_id,
-            PagerSourceHandle::new(StaticPagerSource { bytes }),
-        )
-    }
-
-    pub(super) fn register_pager_file_source(
-        &mut self,
-        global_vmo_id: KernelVmoId,
-        size_bytes: u64,
-        read_at: PagerReadAtFn,
-    ) -> Result<(), zx_status_t> {
-        self.register_pager_source(
-            global_vmo_id,
-            PagerSourceHandle::new(FilePagerSource {
-                size_bytes,
-                read_at,
-            }),
-        )
     }
 
     pub(super) fn remove(&mut self, global_vmo_id: KernelVmoId) -> Option<GlobalVmo> {

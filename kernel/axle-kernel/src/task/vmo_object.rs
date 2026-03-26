@@ -87,18 +87,12 @@ impl VmDomain {
         global_vmo_id: KernelVmoId,
     ) -> Result<(), zx_status_t> {
         self.register_global_vmo_from_address_space(owner_address_space_id, global_vmo_id)?;
-        let (kind, size_bytes) = self
-            .address_spaces
-            .get(&owner_address_space_id)
-            .and_then(|space| space.snapshot_vmo(global_vmo_id))
-            .map(|snapshot| (snapshot.kind(), snapshot.size_bytes()))
-            .ok_or(ZX_ERR_BAD_STATE)?;
         let address_space = self
             .address_spaces
             .get_mut(&owner_address_space_id)
             .ok_or(ZX_ERR_BAD_STATE)?;
         let _ = address_space
-            .import_vmo_alias(kind, size_bytes, global_vmo_id)
+            .promote_local_vmo_to_shared(global_vmo_id)
             .map_err(map_address_space_error)?;
         Ok(())
     }
@@ -409,6 +403,13 @@ impl AddressSpace {
         self.vm.import_vmo(kind, size, global_vmo_id)
     }
 
+    pub(super) fn promote_local_vmo_to_shared(
+        &mut self,
+        global_vmo_id: KernelVmoId,
+    ) -> Result<VmoId, AddressSpaceError> {
+        self.vm.promote_vmo_to_shared(global_vmo_id)
+    }
+
     pub(super) fn local_vmo_id(&self, global_vmo_id: KernelVmoId) -> Option<VmoId> {
         self.vm.shared_vmo_id_by_backing_global_id(global_vmo_id)
     }
@@ -551,9 +552,7 @@ impl Kernel {
                 let _ = self.destroy_kernel_vmo_backing(KernelVmoBacking {
                     global_vmo_id,
                     base_paddr,
-                    page_count,
                     frame_ids: Vec::new(),
-                    size_bytes: rounded_size,
                 });
                 return Err(status);
             }
@@ -562,9 +561,7 @@ impl Kernel {
         Ok(KernelVmoBacking {
             global_vmo_id,
             base_paddr,
-            page_count,
             frame_ids,
-            size_bytes: rounded_size,
         })
     }
 
@@ -663,81 +660,6 @@ impl VmDomain {
         })?;
         self.install_mapping_pages(address_space_id, base, len)?;
         Ok(())
-    }
-
-    pub(crate) fn map_vmo_into_vmar(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        cpu_id: usize,
-        vmar_id: VmarId,
-        global_vmo_id: KernelVmoId,
-        fixed_vmar_offset: Option<u64>,
-        vmo_offset: u64,
-        len: u64,
-        perms: MappingPerms,
-        clone_policy: MappingClonePolicy,
-    ) -> Result<(u64, TlbCommitReq), zx_status_t> {
-        let local_vmo_id =
-            self.import_global_vmo_into_address_space(address_space_id, global_vmo_id)?;
-        let frames_handle = self.frame_table();
-        let mapped_addr = {
-            let address_space = self
-                .address_spaces
-                .get_mut(&address_space_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            match fixed_vmar_offset {
-                Some(vmar_offset) => {
-                    let vmar = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
-                    let mapped_addr = vmar
-                        .base()
-                        .checked_add(vmar_offset)
-                        .ok_or(ZX_ERR_OUT_OF_RANGE)?;
-                    {
-                        let mut frames = frames_handle.lock();
-                        address_space
-                            .map_vmo_fixed_with_mapping_policy(
-                                &mut frames,
-                                vmar_id,
-                                mapped_addr,
-                                len,
-                                local_vmo_id,
-                                vmo_offset,
-                                perms,
-                                MappingCachePolicy::Cached,
-                                clone_policy,
-                            )
-                            .map_err(map_address_space_error)?;
-                    }
-                    mapped_addr
-                }
-                None => {
-                    let _ = address_space.vmar(vmar_id).ok_or(ZX_ERR_NOT_FOUND)?;
-                    let mut frames = frames_handle.lock();
-                    address_space
-                        .map_vmo_anywhere_with_mapping_policy(
-                            &mut frames,
-                            cpu_id,
-                            vmar_id,
-                            len,
-                            local_vmo_id,
-                            vmo_offset,
-                            perms,
-                            MappingCachePolicy::Cached,
-                            clone_policy,
-                        )
-                        .map_err(map_address_space_error)?
-                }
-            }
-        };
-        self.install_mapping_pages(address_space_id, mapped_addr, len)?;
-        Ok((
-            mapped_addr,
-            if perms.contains(MappingPerms::EXECUTE) {
-                TlbCommitReq::strict(address_space_id)
-            } else {
-                TlbCommitReq::relaxed(address_space_id)
-            },
-        ))
     }
 
     pub(crate) fn map_vmo_object_into_vmar(

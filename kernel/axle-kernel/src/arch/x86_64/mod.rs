@@ -14,6 +14,7 @@ pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod int80;
+#[cfg(feature = "hardware-irq")]
 pub(crate) mod ioapic;
 pub mod ipi;
 pub mod log;

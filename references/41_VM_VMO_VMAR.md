@@ -179,6 +179,11 @@ The metadata layer also validates overlap, mapping range, resize legality, and V
 - A fresh anonymous VMO is owned by one address space through its local `VmoId`.
 - It does not immediately register one shared/global anonymous backing source just because it has a kernel-global id.
 - Cross-address-space map or cross-process handle transfer promotes that VMO to `GlobalShared`.
+- That promotion now canonicalizes the owner's existing local VMO record in place:
+  - the owner address space does not keep one parallel stale local-private record beside one new
+    shared alias with the same kernel-global id
+  - existing owner mappings therefore observe the same shared/global backing truth as newly
+    imported mappings after promotion
 - Imported anonymous VMOs are treated as shared/global-backed aliases from the start.
 - That promotion rule is now also frozen at the public object-info surface:
   - one fresh anonymous VMO must report `Anonymous + LocalPrivate`
@@ -207,6 +212,10 @@ The metadata layer also validates overlap, mapping range, resize legality, and V
 - The kernel uses shared-backing identities to synchronize genuinely shared
   aliases across address spaces, while fault-source identities only drive lazy
   materialization.
+- Shared futex identity now follows that same canonical shared-backing rule:
+  - one still-local anonymous mapping uses the private fallback key
+  - after promotion, both the exporter's existing mapping and the importer's
+    mapping resolve the futex key from the same shared/global backing identity
 - `ax_vmar_get_mapping_vmo()` now snapshots that distinction correctly:
   - direct shared aliases reify as `GlobalShared`
   - mapping-local private clones reify as `LocalPrivate` even when their lazy

@@ -459,9 +459,6 @@ impl HandleRights {
 /// Full handle-resolution result used by the kernel object layer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResolvedHandle {
-    process_id: ProcessId,
-    slot_index: u32,
-    slot_tag: u32,
     object_key: ObjectKey,
     rights: HandleRights,
     revocation: Option<axle_core::RevocationRef>,
@@ -713,10 +710,6 @@ enum AddressSpaceTxParticipant {
         key: AddressSpaceTxKey,
         cursor: BootstrapTxCursor,
     },
-    Deferred {
-        key: AddressSpaceTxKey,
-        range: PageRange,
-    },
 }
 
 #[derive(Debug, Default)]
@@ -735,11 +728,6 @@ impl AddressSpaceTxSet {
         Ok(())
     }
 
-    fn push_deferred(&mut self, key: AddressSpaceTxKey, range: PageRange) {
-        self.participants
-            .push(AddressSpaceTxParticipant::Deferred { key, range });
-    }
-
     fn cursor_mut(&mut self, key: AddressSpaceTxKey) -> Option<&mut BootstrapTxCursor> {
         self.participants
             .iter_mut()
@@ -755,13 +743,8 @@ impl AddressSpaceTxSet {
     fn commit(self) -> Result<(), PageTableError> {
         let mut active = TxSet::new();
         for participant in self.participants {
-            match participant {
-                AddressSpaceTxParticipant::Active { key, cursor } => active.push(key, cursor)?,
-                AddressSpaceTxParticipant::Deferred { key, range } => {
-                    let _ = key;
-                    let _ = range;
-                }
-            }
+            let AddressSpaceTxParticipant::Active { key, cursor } = participant;
+            active.push(key, cursor)?;
         }
         active.commit()
     }
@@ -790,40 +773,17 @@ impl ChannelLoanTx {
 
 impl ResolvedHandle {
     fn new(
-        process_id: ProcessId,
+        _process_id: ProcessId,
         handle: Handle,
         cap: Capability,
         revocation: Option<axle_core::RevocationRef>,
     ) -> Result<Self, zx_status_t> {
-        let (slot_index, slot_tag) = handle.decode().map_err(|_| ZX_ERR_BAD_HANDLE)?;
+        let _ = handle.decode().map_err(|_| ZX_ERR_BAD_HANDLE)?;
         Ok(Self {
-            process_id,
-            slot_index,
-            slot_tag,
             object_key: cap.object_key(),
             rights: HandleRights::from_bits_retain(cap.rights()),
             revocation,
         })
-    }
-
-    /// Owning process id.
-    pub(crate) const fn process_id(self) -> u64 {
-        self.process_id
-    }
-
-    /// CSpace slot index encoded in the handle.
-    pub(crate) const fn slot_index(self) -> u32 {
-        self.slot_index
-    }
-
-    /// CSpace slot ABA tag encoded in the handle.
-    pub(crate) const fn slot_tag(self) -> u32 {
-        self.slot_tag
-    }
-
-    /// Target object id from the resolved capability.
-    pub(crate) const fn object_id(self) -> u64 {
-        self.object_key.object_id()
     }
 
     /// Target object identity from the resolved capability.
@@ -839,11 +799,6 @@ impl ResolvedHandle {
     /// Revocation provenance attached to this handle, if any.
     pub(crate) const fn revocation_ref(self) -> Option<axle_core::RevocationRef> {
         self.revocation
-    }
-
-    /// Capability generation carried by the resolved capability.
-    pub(crate) const fn object_generation(self) -> u32 {
-        self.object_key.generation()
     }
 }
 
@@ -1323,52 +1278,6 @@ impl AddressSpace {
             .map(|pending| &pending.op)
     }
 
-    fn map_vmo_fixed(
-        &mut self,
-        frames: &mut FrameTable,
-        vmar_id: VmarId,
-        base: u64,
-        len: u64,
-        vmo_id: VmoId,
-        vmo_offset: u64,
-        perms: MappingPerms,
-    ) -> Result<(), AddressSpaceError> {
-        self.map_vmo_fixed_with_policy(
-            frames,
-            vmar_id,
-            base,
-            len,
-            vmo_id,
-            vmo_offset,
-            perms,
-            MappingCachePolicy::Cached,
-        )
-    }
-
-    fn map_vmo_fixed_with_policy(
-        &mut self,
-        frames: &mut FrameTable,
-        vmar_id: VmarId,
-        base: u64,
-        len: u64,
-        vmo_id: VmoId,
-        vmo_offset: u64,
-        perms: MappingPerms,
-        cache_policy: MappingCachePolicy,
-    ) -> Result<(), AddressSpaceError> {
-        self.map_vmo_fixed_with_mapping_policy(
-            frames,
-            vmar_id,
-            base,
-            len,
-            vmo_id,
-            vmo_offset,
-            perms,
-            cache_policy,
-            MappingClonePolicy::None,
-        )
-    }
-
     fn map_vmo_fixed_with_mapping_policy(
         &mut self,
         frames: &mut FrameTable,
@@ -1419,52 +1328,6 @@ impl AddressSpace {
             max_perms,
             cache_policy,
             clone_policy,
-        )
-    }
-
-    fn map_vmo_anywhere(
-        &mut self,
-        frames: &mut FrameTable,
-        cpu_id: usize,
-        vmar_id: VmarId,
-        len: u64,
-        vmo_id: VmoId,
-        vmo_offset: u64,
-        perms: MappingPerms,
-    ) -> Result<u64, AddressSpaceError> {
-        self.map_vmo_anywhere_with_policy(
-            frames,
-            cpu_id,
-            vmar_id,
-            len,
-            vmo_id,
-            vmo_offset,
-            perms,
-            MappingCachePolicy::Cached,
-        )
-    }
-
-    fn map_vmo_anywhere_with_policy(
-        &mut self,
-        frames: &mut FrameTable,
-        cpu_id: usize,
-        vmar_id: VmarId,
-        len: u64,
-        vmo_id: VmoId,
-        vmo_offset: u64,
-        perms: MappingPerms,
-        cache_policy: MappingCachePolicy,
-    ) -> Result<u64, AddressSpaceError> {
-        self.map_vmo_anywhere_with_mapping_policy(
-            frames,
-            cpu_id,
-            vmar_id,
-            len,
-            vmo_id,
-            vmo_offset,
-            perms,
-            cache_policy,
-            MappingClonePolicy::None,
         )
     }
 
@@ -1971,43 +1834,6 @@ impl Kernel {
         })
     }
 
-    pub(crate) fn release_loaned_user_pages(&mut self, loaned: LoanedUserPages) {
-        self.with_vm_mut(|vm| vm.release_loaned_user_pages(loaned))
-    }
-
-    pub(crate) fn prepare_loaned_channel_write(
-        &mut self,
-        loaned: &mut LoanedUserPages,
-        receiver_address_space_id: AddressSpaceId,
-    ) -> Result<(), zx_status_t> {
-        let req = self
-            .with_vm_mut(|vm| vm.prepare_loaned_channel_write(loaned, receiver_address_space_id))?;
-        self.apply_tlb_commit_reqs_current(&[req])
-    }
-
-    pub(crate) fn try_remap_loaned_channel_read(
-        &mut self,
-        dst_base: u64,
-        loaned: &LoanedUserPages,
-    ) -> Result<bool, zx_status_t> {
-        let current_address_space_id = self.current_process()?.address_space_id;
-        let remap = self.with_vm_mut(|vm| {
-            vm.try_remap_loaned_channel_read(current_address_space_id, dst_base, loaned)
-        })?;
-        self.vm.apply_tlb_commit_reqs(
-            self.current_cpu_id(),
-            Some(current_address_space_id),
-            &[remap.tlb_commit()],
-        )?;
-        if !remap.retire_plan().is_empty() {
-            self.retire_bootstrap_frames_after_quiescence_current(
-                remap.retire_plan().barrier_address_spaces(),
-                remap.retire_plan().retired_frames(),
-            )?;
-        }
-        Ok(remap.did_remap())
-    }
-
     pub(crate) fn current_root_vmar(&self) -> Result<RootVmarInfo, zx_status_t> {
         let thread = self.current_thread()?;
         let process = self.current_process()?;
@@ -2024,81 +1850,8 @@ impl Kernel {
         })
     }
 
-    pub(crate) fn allocate_subvmar(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        parent_vmar_id: VmarId,
-        offset: u64,
-        len: u64,
-        align: u64,
-        mode: VmarAllocMode,
-        offset_is_upper_limit: bool,
-        child_policy: VmarPlacementPolicy,
-    ) -> Result<Vmar, zx_status_t> {
-        let cpu_id = self.current_cpu_id();
-        self.with_vm_mut(|vm| {
-            vm.allocate_subvmar(
-                address_space_id,
-                cpu_id,
-                parent_vmar_id,
-                offset,
-                len,
-                align,
-                mode,
-                offset_is_upper_limit,
-                child_policy,
-            )
-        })
-    }
-
-    pub(crate) fn destroy_vmar(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        vmar_id: VmarId,
-    ) -> Result<(), zx_status_t> {
-        let req = self.with_vm_mut(|vm| vm.destroy_vmar(address_space_id, vmar_id))?;
-        self.apply_tlb_commit_reqs_current(&[req])
-    }
-
     pub(crate) fn allocate_global_vmo_id(&mut self) -> KernelVmoId {
         self.with_vm_mut(|vm| vm.alloc_global_vmo_id())
-    }
-
-    fn record_vm_resource_telemetry(&self) {
-        self.with_vm(|vm| vm.record_vm_resource_telemetry())
-    }
-
-    fn log_vm_quota_exceeded(
-        &self,
-        address_space_id: AddressSpaceId,
-        exceeded: VmQuotaExceeded,
-        context: &str,
-    ) {
-        self.with_vm(|vm| vm.log_vm_quota_exceeded(address_space_id, exceeded, context))
-    }
-
-    fn reserve_private_cow_page(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        page_base: u64,
-    ) -> Result<CowReservation, zx_status_t> {
-        self.with_vm_mut(|vm| vm.reserve_private_cow_page(address_space_id, page_base))
-    }
-
-    fn clear_private_cow_range(&mut self, address_space_id: AddressSpaceId, base: u64, len: u64) {
-        self.with_vm_mut(|vm| vm.clear_private_cow_range(address_space_id, base, len));
-    }
-
-    fn reserve_inflight_loan_pages(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        pages: u64,
-    ) -> Result<InflightLoanReservation, zx_status_t> {
-        self.with_vm_mut(|vm| vm.reserve_inflight_loan_pages(address_space_id, pages))
-    }
-
-    fn release_inflight_loan_pages(&mut self, address_space_id: AddressSpaceId, pages: u64) {
-        self.with_vm_mut(|vm| vm.release_inflight_loan_pages(address_space_id, pages));
     }
 
     pub(crate) fn read_thread_user_bytes(
@@ -2204,98 +1957,9 @@ impl Kernel {
         Ok(process.address_space_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn thread_state(&self, thread_id: ThreadId) -> Result<ThreadState, zx_status_t> {
         Ok(self.threads.get(&thread_id).ok_or(ZX_ERR_BAD_STATE)?.state)
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn map_current_vmo_into_vmar(
-        &mut self,
-        vmar_address_space_id: AddressSpaceId,
-        vmar_id: VmarId,
-        global_vmo_id: KernelVmoId,
-        vmar_offset: u64,
-        vmo_offset: u64,
-        len: u64,
-        perms: MappingPerms,
-    ) -> Result<u64, zx_status_t> {
-        let (mapped, req) = self.with_vm_mut(|vm| {
-            vm.map_vmo_into_vmar(
-                vmar_address_space_id,
-                self.current_cpu_id(),
-                vmar_id,
-                global_vmo_id,
-                Some(vmar_offset),
-                vmo_offset,
-                len,
-                perms,
-                MappingClonePolicy::None,
-            )
-        })?;
-        self.apply_tlb_commit_reqs_current(&[req])?;
-        Ok(mapped)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn map_current_vmo_into_vmar_anywhere(
-        &mut self,
-        vmar_address_space_id: AddressSpaceId,
-        vmar_id: VmarId,
-        global_vmo_id: KernelVmoId,
-        vmo_offset: u64,
-        len: u64,
-        perms: MappingPerms,
-    ) -> Result<u64, zx_status_t> {
-        let (mapped, req) = self.with_vm_mut(|vm| {
-            vm.map_vmo_into_vmar(
-                vmar_address_space_id,
-                self.current_cpu_id(),
-                vmar_id,
-                global_vmo_id,
-                None,
-                vmo_offset,
-                len,
-                perms,
-                MappingClonePolicy::None,
-            )
-        })?;
-        self.apply_tlb_commit_reqs_current(&[req])?;
-        Ok(mapped)
-    }
-
-    pub(crate) fn unmap_current_vmar(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        vmar_id: VmarId,
-        addr: u64,
-        len: u64,
-    ) -> Result<(), zx_status_t> {
-        let req = self.with_vm_mut(|vm| vm.unmap_vmar(address_space_id, vmar_id, addr, len))?;
-        self.apply_tlb_commit_reqs_current(&[req])
-    }
-
-    pub(crate) fn protect_current_vmar(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        vmar_id: VmarId,
-        addr: u64,
-        len: u64,
-        perms: MappingPerms,
-    ) -> Result<(), zx_status_t> {
-        let req =
-            self.with_vm_mut(|vm| vm.protect_vmar(address_space_id, vmar_id, addr, len, perms))?;
-        self.apply_tlb_commit_reqs_current(&[req])
-    }
-
-    pub(crate) fn handle_current_page_fault(&mut self, fault_va: u64, error: u64) -> bool {
-        let process_id = match self.current_thread() {
-            Ok(thread) => thread.process_id,
-            Err(_) => return false,
-        };
-        let address_space_id = match self.processes.get(&process_id) {
-            Some(process) => process.address_space_id,
-            None => return false,
-        };
-        self.with_vm_mut(|vm| vm.handle_page_fault(address_space_id, fault_va, error))
     }
 
     fn alloc_process_id(&mut self) -> ProcessId {
@@ -2362,135 +2026,8 @@ impl Kernel {
         })
     }
 
-    fn observe_cpu_tlb_epoch_for_address_space(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        cpu_id: usize,
-    ) {
-        self.with_vm_mut(|vm| vm.observe_cpu_tlb_epoch_for_address_space(address_space_id, cpu_id));
-    }
-
     pub(crate) fn current_address_space_id(&self) -> Result<AddressSpaceId, zx_status_t> {
         Ok(self.current_process()?.address_space_id)
-    }
-
-    fn install_mapping_pages(
-        &self,
-        address_space_id: AddressSpaceId,
-        base: u64,
-        len: u64,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm(|vm| vm.install_mapping_pages(address_space_id, base, len))
-    }
-
-    fn lock_address_space_tx_set(
-        &self,
-        requests: &[AddressSpaceTxRequest],
-    ) -> Result<AddressSpaceTxSet, zx_status_t> {
-        self.with_vm(|vm| vm.lock_address_space_tx_set(requests))
-    }
-
-    fn lock_channel_loan_tx(
-        &self,
-        sender_address_space_id: AddressSpaceId,
-        sender_range: PageRange,
-        receiver_address_space_id: AddressSpaceId,
-        receiver_range: PageRange,
-    ) -> Result<ChannelLoanTx, zx_status_t> {
-        self.with_vm(|vm| {
-            vm.lock_channel_loan_tx(
-                sender_address_space_id,
-                sender_range,
-                receiver_address_space_id,
-                receiver_range,
-            )
-        })
-    }
-
-    fn clear_mapping_pages(
-        &self,
-        address_space_id: AddressSpaceId,
-        base: u64,
-        len: u64,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm(|vm| vm.clear_mapping_pages(address_space_id, base, len))
-    }
-
-    fn update_mapping_pages(
-        &self,
-        address_space_id: AddressSpaceId,
-        base: u64,
-        len: u64,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm(|vm| vm.update_mapping_pages(address_space_id, base, len))
-    }
-
-    fn resolve_copy_on_write_page(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        fault_va: u64,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm_mut(|vm| vm.resolve_copy_on_write_page(address_space_id, fault_va))
-    }
-
-    fn materialize_lazy_anon_page(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        fault_va: u64,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm_mut(|vm| vm.materialize_lazy_anon_page(address_space_id, fault_va))
-    }
-
-    fn materialize_lazy_vmo_page(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        fault_va: u64,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm_mut(|vm| vm.materialize_lazy_vmo_page(address_space_id, fault_va))
-    }
-
-    fn sync_mapping_pages(
-        &self,
-        address_space_id: AddressSpaceId,
-        base: u64,
-        len: u64,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm(|vm| vm.sync_mapping_pages(address_space_id, base, len))
-    }
-
-    fn sync_mapping_pages_locked(
-        &self,
-        address_space_id: AddressSpaceId,
-        base: u64,
-        len: u64,
-        tx: &mut BootstrapTxCursor,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm(|vm| vm.sync_mapping_pages_locked(address_space_id, base, len, tx))
-    }
-
-    fn mapped_frames_in_range(
-        &self,
-        address_space_id: AddressSpaceId,
-        base: u64,
-        len: u64,
-    ) -> Result<Vec<FrameId>, zx_status_t> {
-        self.with_vm(|vm| vm.mapped_frames_in_range(address_space_id, base, len))
-    }
-
-    fn frame_mappings(&self, frame_id: FrameId) -> Vec<FrameMappingSnapshot> {
-        self.with_vm(|vm| vm.frame_mappings(frame_id))
-    }
-
-    fn frame_mapping_count(&self, frame_id: FrameId) -> u64 {
-        self.with_vm(|vm| vm.frame_mapping_count(frame_id))
-    }
-
-    fn validate_frame_mapping_invariants(&self, frame_id: FrameId, context: &str) {
-        self.with_vm(|vm| vm.validate_frame_mapping_invariants(frame_id, context))
-    }
-
-    fn validate_frame_mapping_invariants_for(&self, frame_ids: &[FrameId], context: &str) {
-        self.with_vm(|vm| vm.validate_frame_mapping_invariants_for(frame_ids, context))
     }
 }
 
@@ -3721,45 +3258,6 @@ impl VmDomain {
                     TlbCommitReq::relaxed(address_space_id),
                 ))
             }
-        }
-    }
-
-    pub(crate) fn handle_page_fault(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        fault_va: u64,
-        error: u64,
-    ) -> bool {
-        let mut flags = PageFaultFlags::empty();
-        if error & (1 << 0) != 0 {
-            flags |= PageFaultFlags::PRESENT;
-        }
-        if error & (1 << 1) != 0 {
-            flags |= PageFaultFlags::WRITE;
-        }
-        if error & (1 << 2) != 0 {
-            flags |= PageFaultFlags::USER;
-        }
-
-        let decision = match self.address_spaces.get(&address_space_id) {
-            Some(space) => space.classify_user_page_fault(fault_va, flags),
-            None => return false,
-        };
-        match decision {
-            PageFaultDecision::CopyOnWrite => self
-                .resolve_copy_on_write_page(address_space_id, fault_va)
-                .is_ok(),
-            PageFaultDecision::NotPresent {
-                tag: PteMetaTag::LazyAnon,
-            } => self
-                .materialize_lazy_anon_page(address_space_id, fault_va)
-                .is_ok(),
-            PageFaultDecision::NotPresent {
-                tag: PteMetaTag::LazyVmo,
-            } => self
-                .materialize_lazy_vmo_page(address_space_id, fault_va)
-                .is_ok(),
-            _ => false,
         }
     }
 

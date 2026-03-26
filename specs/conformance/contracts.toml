@@ -67,7 +67,7 @@ reason = "syscall return-code contract; not modeled by the host-side concurrent 
 [[contracts]]
 id = "must.handle.revocation_deferred_control_state_bootstrap"
 level = "must"
-description = "Bootstrap revocation must purge stale wait_async packets and stale timer arms while keeping fresh post-revoke delegations live"
+description = "Bootstrap revocation must eagerly purge stale deferred control-plane state while keeping fresh post-revoke delegations live"
 [contracts.concurrency]
 mode = "not_applicable"
 reason = "ring3/QEMU contract over revocation epoch transitions; not modeled by the host-side concurrent harness"
@@ -335,7 +335,7 @@ description = "Bootstrap task_suspend should return a suspend token, keep a chil
 [[contracts]]
 id = "should.process.lazy_shared_vmo_bootstrap"
 level = "should"
-description = "Bootstrap parent/child shared anonymous VMO mappings should lazily fault through the global VMO path without splitting into distinct frames"
+description = "Bootstrap parent/child shared anonymous VMO mappings should lazily fault through the global VMO path, preserve one shared futex identity across the promoted exporter/importer mappings, and avoid splitting into distinct frames"
 
 [[contracts]]
 id = "should.vmar.allocate_child_bootstrap"

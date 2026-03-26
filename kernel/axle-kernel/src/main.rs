@@ -10,12 +10,14 @@ mod arch;
 mod copy;
 mod fault;
 mod futex;
+#[cfg(feature = "hardware-irq")]
 mod irq;
 mod kalloc;
 mod object;
 mod page_table;
 mod pmm;
 mod port_queue;
+#[cfg(feature = "scatter-gather")]
 mod scatter;
 mod smp;
 mod syscall;

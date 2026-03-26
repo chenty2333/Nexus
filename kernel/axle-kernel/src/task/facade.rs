@@ -84,10 +84,6 @@ impl VmFacade {
         )
     }
 
-    pub(crate) fn domain_handle(&self) -> Arc<Mutex<VmDomain>> {
-        self.domain.clone()
-    }
-
     pub(crate) fn fault_handle(&self) -> Arc<Mutex<FaultTable>> {
         self.faults.clone()
     }
@@ -607,17 +603,6 @@ impl Kernel {
         let faults = self.vm.fault_handle();
         let mut faults = faults.lock();
         f(&mut faults)
-    }
-
-    pub(super) fn apply_tlb_commit_reqs_current(
-        &self,
-        reqs: &[TlbCommitReq],
-    ) -> Result<(), zx_status_t> {
-        self.vm.apply_tlb_commit_reqs(
-            self.current_cpu_id(),
-            self.current_address_space_id().ok(),
-            reqs,
-        )
     }
 
     pub(super) fn retire_bootstrap_frames_after_quiescence_current(

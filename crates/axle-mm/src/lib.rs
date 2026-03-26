@@ -865,6 +865,43 @@ impl AddressSpace {
         )
     }
 
+    /// Promote one existing local VMO into the canonical shared-backed form for this address space.
+    pub fn promote_vmo_to_shared(
+        &mut self,
+        global_id: GlobalVmoId,
+    ) -> Result<VmoId, AddressSpaceError> {
+        let vmo_id = self
+            .vmo_id_by_global_id(global_id)
+            .ok_or(AddressSpaceError::InvalidVmo)?;
+        let kind = self
+            .vmo(vmo_id)
+            .ok_or(AddressSpaceError::InvalidVmo)?
+            .kind();
+        let next_policy = vmo_fault_policy_for_import(kind);
+        let next_fault_source_id = match next_policy {
+            VmoFaultPolicy::GlobalBacked => Some(global_id),
+            VmoFaultPolicy::LocalAnonymous | VmoFaultPolicy::NonDemandPaged => None,
+        };
+
+        let changed = {
+            let vmo = self.vmo_mut(vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
+            let changed = vmo.shared_backing_id() != Some(global_id)
+                || vmo.fault_source_id() != next_fault_source_id
+                || vmo.fault_policy != next_policy;
+            vmo.shared_backing_id = Some(global_id);
+            vmo.fault_source_id = next_fault_source_id;
+            vmo.fault_policy = next_policy;
+            changed
+        };
+
+        self.shared_vmo_ids_by_backing_global_id
+            .insert(global_id, vmo_id);
+        if changed {
+            self.refresh_all_vmo_page_metadata(vmo_id)?;
+        }
+        Ok(vmo_id)
+    }
+
     fn refresh_all_vmo_page_metadata(&mut self, vmo_id: VmoId) -> Result<(), AddressSpaceError> {
         let page_count = self
             .vmo(vmo_id)
@@ -5507,6 +5544,65 @@ mod tests {
             FutexKey::Shared {
                 global_vmo_id: global_vmo_id(202),
                 offset: 0x24,
+            }
+        );
+    }
+
+    #[test]
+    fn promoted_local_anonymous_vmo_reuses_canonical_identity_and_shared_futex_key() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let global_id = global_vmo_id(205);
+        let local = space
+            .create_vmo(VmoKind::Anonymous, PAGE_SIZE, global_id)
+            .unwrap();
+        let frame = frames.register_existing(0x1000_4000).unwrap();
+        space.set_vmo_frame(local, 0, frame).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                local,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        assert_eq!(
+            FutexKey::from_lookup(
+                99,
+                ROOT_BASE + 0x28,
+                space.lookup(ROOT_BASE + 0x28).unwrap()
+            ),
+            FutexKey::PrivateAnonymous {
+                process_id: 99,
+                page_base: ROOT_BASE,
+                byte_offset: 0x28,
+            }
+        );
+
+        let promoted = space.promote_vmo_to_shared(global_id).unwrap();
+        assert_eq!(promoted, local);
+        assert_eq!(
+            space.shared_vmo_id_by_backing_global_id(global_id),
+            Some(local)
+        );
+        assert_eq!(space.vmo_id_by_global_id(global_id), Some(local));
+        assert_eq!(
+            space
+                .import_vmo(VmoKind::Anonymous, PAGE_SIZE, global_id)
+                .unwrap(),
+            local
+        );
+
+        let lookup = space.lookup(ROOT_BASE + 0x28).unwrap();
+        assert_eq!(
+            FutexKey::from_lookup(99, ROOT_BASE + 0x28, lookup),
+            FutexKey::Shared {
+                global_vmo_id: global_id,
+                offset: 0x28,
             }
         );
     }

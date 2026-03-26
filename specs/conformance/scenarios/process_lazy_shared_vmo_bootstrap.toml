@@ -1,5 +1,5 @@
 id = "kernel.process.lazy_shared_vmo_bootstrap"
-description = "Bootstrap process_create should let child and parent lazily materialize the same shared anonymous VMO page through the global VMO fault path"
+description = "Bootstrap process_create should let child and parent lazily materialize the same shared anonymous VMO page through the global VMO fault path and synchronize through the promoted shared futex identity"
 tags = ["module:process", "module:thread", "module:vmar", "module:vmo", "kind:qemu"]
 timeout_ms = 180000
 command = [

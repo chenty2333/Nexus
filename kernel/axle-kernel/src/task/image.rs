@@ -126,15 +126,6 @@ impl ProcessImageLayout {
         }
     }
 
-    pub(crate) fn with_segments(
-        code_base: u64,
-        code_size_bytes: u64,
-        entry: u64,
-        segments: &[ProcessImageSegment],
-    ) -> Result<Self, zx_status_t> {
-        Self::with_segments_and_elf(code_base, code_size_bytes, entry, segments, None)
-    }
-
     pub(crate) fn with_segments_and_elf(
         code_base: u64,
         code_size_bytes: u64,
@@ -157,10 +148,6 @@ impl ProcessImageLayout {
 
     pub(crate) fn code_base(&self) -> u64 {
         self.code_base
-    }
-
-    pub(crate) fn code_size_bytes(&self) -> u64 {
-        self.code_size_bytes
     }
 
     pub(crate) fn entry(&self) -> u64 {
@@ -401,9 +388,7 @@ impl ImportedProcessImage {
 pub(crate) struct KernelVmoBacking {
     pub(super) global_vmo_id: KernelVmoId,
     pub(super) base_paddr: u64,
-    pub(super) page_count: usize,
     pub(super) frame_ids: Vec<FrameId>,
-    pub(super) size_bytes: u64,
 }
 
 impl KernelVmoBacking {
@@ -417,14 +402,6 @@ impl KernelVmoBacking {
 
     pub(crate) fn base_paddr(&self) -> u64 {
         self.base_paddr
-    }
-
-    pub(crate) fn page_count(&self) -> usize {
-        self.page_count
-    }
-
-    pub(crate) fn size_bytes(&self) -> u64 {
-        self.size_bytes
     }
 }
 
