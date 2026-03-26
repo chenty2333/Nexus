@@ -250,6 +250,7 @@ pub fn port_wait(
                         crate::task::WaitRegistration::Port {
                             port_object: object_key,
                             packet_ptr: sink.raw(),
+                            revocation: axle_core::RevocationSet::one(resolved.revocation_ref()),
                         },
                         deadline,
                     )?;
@@ -341,23 +342,12 @@ pub fn object_wait_one(
                     object_key,
                     watched,
                     observed_ptr: sink.raw(),
+                    revocation: axle_core::RevocationSet::one(resolved.revocation_ref()),
                 },
                 deadline,
             )
         })?;
         Ok(WaitOneOutcome::Blocked)
-    })
-}
-
-#[allow(dead_code)]
-pub(crate) fn sleep_until(deadline: i64) -> Result<(), zx_status_t> {
-    if deadline <= crate::time::now_ns() {
-        return Ok(());
-    }
-    object::with_state_mut(|state| {
-        state.with_kernel_mut(|kernel| {
-            kernel.park_current(crate::task::WaitRegistration::Sleep, Some(deadline))
-        })
     })
 }
 
@@ -392,8 +382,10 @@ pub fn object_wait_async(
                     WaitAsyncRegistration {
                         port: port_key,
                         waitable: waitable_key,
-                        waitable_revocation: waitable.revocation_ref(),
-                        port_revocation: resolved_port.revocation_ref(),
+                        revocation: axle_core::RevocationSet::pair(
+                            waitable.revocation_ref(),
+                            resolved_port.revocation_ref(),
+                        ),
                         key,
                         watched,
                         options,
@@ -571,6 +563,7 @@ fn wake_expired_waits(
                 object_key,
                 watched,
                 observed_ptr,
+                ..
             } => {
                 let observed = object::signals_for_object_id(state, object_key)?;
                 let status = match state.copyout_thread_user(
@@ -587,6 +580,7 @@ fn wake_expired_waits(
             crate::task::WaitRegistration::Port {
                 port_object,
                 packet_ptr,
+                ..
             } => {
                 let packet = pop_port_packet_locked(state, port_object);
                 let status = match packet {

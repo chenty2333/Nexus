@@ -42,7 +42,6 @@ pub(crate) const BOOTSTRAP_USER_PT_BYTES: u64 =
 pub(crate) const USER_SHARED_VA: u64 = USER_CODE_VA + USER_CODE_BYTES;
 pub(crate) const USER_STACK_VA: u64 = USER_SHARED_VA + USER_SHARED_BYTES;
 const USER_STACK_TOP: u64 = USER_STACK_VA + USER_STACK_BYTES;
-pub(crate) const USER_VM_TEST_VA: u64 = USER_CODE_VA + 0x10_000;
 
 // --- QEMU loader handoff for external userspace runner ELF ---
 //
@@ -256,7 +255,6 @@ const SLOT_TASK_SUSPEND_TOKEN_PRESENT: usize = 165;
 const SLOT_TASK_SUSPEND_CLOSE_TOKEN: usize = 166;
 const SLOT_TASK_SUSPEND_RESUMED: usize = 167;
 const SLOT_TASK_SUSPEND_HELD: usize = 168;
-const SLOT_TASK_SUSPEND_READY: usize = 169;
 const SLOT_SELF_PROCESS_H: usize = 396;
 const SLOT_THREAD_CREATE: usize = 397;
 const SLOT_THREAD_START: usize = 398;
@@ -264,8 +262,6 @@ const SLOT_THREAD_CHILD_RAN: usize = 399;
 const SLOT_THREAD_FUTEX_WAIT: usize = 400;
 const SLOT_THREAD_WAKE_STATUS: usize = 401;
 const SLOT_THREAD_RESUMED: usize = 402;
-const SLOT_THREAD_WORK_CMD: usize = 403;
-const SLOT_THREAD_WORK_ARG0: usize = 404;
 const SLOT_THREAD_WAIT_ONE: usize = 405;
 const SLOT_THREAD_WAIT_ONE_OBS: usize = 406;
 const SLOT_THREAD_SIGNAL_STATUS: usize = 407;
@@ -368,8 +364,6 @@ const SLOT_TIMER_WAIT_FOREVER_OBS: usize = 430;
 const SLOT_VM_FAULT_TEST_HOOK_ARM: usize = 431;
 const SLOT_VM_FAULT_LOCAL_WAIT_OK: usize = 432;
 const SLOT_VM_FAULT_SHARED_WAIT_OK: usize = 433;
-const SLOT_VM_FAULT_LOCAL_DONE: usize = 434;
-const SLOT_VM_FAULT_SHARED_DONE: usize = 435;
 const SLOT_TASK_WAIT_THREAD_TERMINATED: usize = 436;
 const SLOT_TASK_WAIT_THREAD_TERMINATED_OBS: usize = 437;
 const SLOT_TASK_WAIT_PROCESS_TERMINATED: usize = 438;
@@ -901,17 +895,21 @@ const SLOT_VMAR_DESTROY_STALE_CLOSE: usize = SLOT_T0_NS;
 
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
-struct AlignedPage([u8; 4096]);
+struct AlignedPage {
+    _bytes: [u8; 4096],
+}
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
-struct AlignedPageTable([u64; 512]);
+struct AlignedPageTable {
+    _words: [u64; 512],
+}
 
 static mut USER_CODE_PAGES: [AlignedPage; USER_CODE_PAGE_COUNT] =
-    [AlignedPage([0; 4096]); USER_CODE_PAGE_COUNT];
+    [AlignedPage { _bytes: [0; 4096] }; USER_CODE_PAGE_COUNT];
 static mut USER_SHARED_PAGES: [AlignedPage; USER_SHARED_PAGE_COUNT] =
-    [AlignedPage([0; 4096]); USER_SHARED_PAGE_COUNT];
+    [AlignedPage { _bytes: [0; 4096] }; USER_SHARED_PAGE_COUNT];
 static mut USER_STACK_PAGES: [AlignedPage; USER_STACK_PAGE_COUNT] =
-    [AlignedPage([0; 4096]); USER_STACK_PAGE_COUNT];
+    [AlignedPage { _bytes: [0; 4096] }; USER_STACK_PAGE_COUNT];
 static USER_COPY_DEBUG_STAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static USER_COPY_DEBUG_DST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static USER_COPY_DEBUG_SRC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -938,13 +936,16 @@ struct SyncPageTableArray<const N: usize>(core::cell::UnsafeCell<[AlignedPageTab
 // SAFETY: same serialization guarantee as SyncPageTable.
 unsafe impl<const N: usize> Sync for SyncPageTableArray<N> {}
 
-static USER_PD: SyncPageTable =
-    SyncPageTable(core::cell::UnsafeCell::new(AlignedPageTable([0; 512])));
+static USER_PD: SyncPageTable = SyncPageTable(core::cell::UnsafeCell::new(AlignedPageTable {
+    _words: [0; 512],
+}));
 static USER_PTS: SyncPageTableArray<BOOTSTRAP_USER_PT_COUNT> = SyncPageTableArray(
-    core::cell::UnsafeCell::new([AlignedPageTable([0; 512]); BOOTSTRAP_USER_PT_COUNT]),
+    core::cell::UnsafeCell::new([AlignedPageTable { _words: [0; 512] }; BOOTSTRAP_USER_PT_COUNT]),
 );
 static KERNEL_IMAGE_PT: SyncPageTable =
-    SyncPageTable(core::cell::UnsafeCell::new(AlignedPageTable([0; 512])));
+    SyncPageTable(core::cell::UnsafeCell::new(AlignedPageTable {
+        _words: [0; 512],
+    }));
 
 // PVH boot page tables (identity-mapped, used as the active CR3).
 unsafe extern "C" {
@@ -961,22 +962,6 @@ const PTE_PS: u64 = 1 << 7;
 const PAGE_BYTES_4K: u64 = 4096;
 const PAGE_BYTES_2M: u64 = 2 * 1024 * 1024;
 const KERNEL_IMAGE_PT_INDEX: usize = 1;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct UserPageFrame {
-    paddr: u64,
-    writable: bool,
-}
-
-impl UserPageFrame {
-    pub(crate) const fn paddr(self) -> u64 {
-        self.paddr
-    }
-
-    pub(crate) const fn writable(self) -> bool {
-        self.writable
-    }
-}
 
 fn phys_of<T>(p: *const T) -> u64 {
     // In the current PVH identity mapping, physical == virtual for kernel static data.
@@ -1008,30 +993,12 @@ pub(crate) fn bootstrap_user_pt_paddrs() -> [u64; BOOTSTRAP_USER_PT_COUNT] {
     core::array::from_fn(user_pt_paddr)
 }
 
-pub(crate) fn bootstrap_user_pt_paddr(index: usize) -> u64 {
-    user_pt_paddr(index)
-}
-
 fn user_pt_paddr(index: usize) -> u64 {
     assert!(index < BOOTSTRAP_USER_PT_COUNT);
     // SAFETY: reading the address of one bootstrap PT page through the UnsafeCell.
     let base = USER_PTS.0.get() as *const AlignedPageTable;
     let pt = unsafe { base.add(index) };
     phys_of(pt)
-}
-
-fn bootstrap_user_page_slot(user_va: u64) -> Option<(usize, usize)> {
-    if user_va < USER_CODE_VA || user_va >= USER_STACK_TOP {
-        return None;
-    }
-    if user_va & (USER_PAGE_BYTES - 1) != 0 {
-        return None;
-    }
-    let page_index = usize::try_from((user_va - USER_CODE_VA) / USER_PAGE_BYTES).ok()?;
-    Some((
-        page_index / BOOTSTRAP_USER_PT_ENTRY_COUNT,
-        page_index % BOOTSTRAP_USER_PT_ENTRY_COUNT,
-    ))
 }
 
 pub(crate) fn alloc_bootstrap_cow_page(src_paddr: u64) -> Option<u64> {
@@ -1139,69 +1106,6 @@ pub(crate) fn read_bootstrap_bytes(
     Some(())
 }
 
-pub(crate) fn query_user_page_frame(user_va: u64) -> Result<Option<UserPageFrame>, ()> {
-    let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
-    // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
-    // Access through UnsafeCell raw pointer avoids forming a reference to the static.
-    let entry = unsafe {
-        let base = USER_PTS.0.get() as *const AlignedPageTable;
-        core::ptr::read_volatile(&(*base.add(pt_index)).0[entry_index])
-    };
-    if (entry & PTE_P) == 0 {
-        return Ok(None);
-    }
-    Ok(Some(UserPageFrame {
-        paddr: entry & !(USER_PAGE_BYTES - 1),
-        writable: (entry & PTE_W) != 0,
-    }))
-}
-
-pub(crate) fn install_user_page_frame(user_va: u64, paddr: u64, writable: bool) -> Result<(), ()> {
-    if paddr & (USER_PAGE_BYTES - 1) != 0 {
-        return Err(());
-    }
-    let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
-    let mut entry = paddr | (PTE_P | PTE_U);
-    if writable {
-        entry |= PTE_W;
-    }
-
-    // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
-    unsafe {
-        let base = USER_PTS.0.get() as *mut AlignedPageTable;
-        core::ptr::write_volatile(&mut (*base.add(pt_index)).0[entry_index], entry);
-    }
-    Ok(())
-}
-
-pub(crate) fn clear_user_page_frame(user_va: u64) -> Result<(), ()> {
-    let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
-    // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
-    unsafe {
-        let base = USER_PTS.0.get() as *mut AlignedPageTable;
-        core::ptr::write_volatile(&mut (*base.add(pt_index)).0[entry_index], 0);
-    }
-    Ok(())
-}
-
-pub(crate) fn set_user_page_writable(user_va: u64, writable: bool) -> Result<(), ()> {
-    let (pt_index, entry_index) = bootstrap_user_page_slot(user_va).ok_or(())?;
-    // SAFETY: USER_PTS are the active page table pages for the fixed bootstrap user region.
-    unsafe {
-        let base = USER_PTS.0.get() as *mut AlignedPageTable;
-        let entry_ptr = &mut (*base.add(pt_index)).0[entry_index];
-        if (*entry_ptr & PTE_P) == 0 {
-            return Err(());
-        }
-        if writable {
-            *entry_ptr |= PTE_W;
-        } else {
-            *entry_ptr &= !PTE_W;
-        }
-    }
-    Ok(())
-}
-
 fn map_userspace_pages() {
     fn install_bootstrap_pte(page_index: usize, paddr: u64, writable: bool) {
         let pt_index = page_index / BOOTSTRAP_USER_PT_ENTRY_COUNT;
@@ -1213,7 +1117,7 @@ fn map_userspace_pages() {
         // SAFETY: early bring-up is single-core; bootstrap page tables are only mutated here.
         unsafe {
             let base = USER_PTS.0.get() as *mut AlignedPageTable;
-            core::ptr::write_volatile(&mut (*base.add(pt_index)).0[entry_index], entry);
+            core::ptr::write_volatile(&mut (*base.add(pt_index))._words[entry_index], entry);
         }
     }
 
@@ -1559,7 +1463,8 @@ pub(crate) fn qemu_loader_linux_hello_size() -> Option<u64> {
 }
 
 fn qemu_loader_image_size(image: QemuLoaderImage) -> Option<u64> {
-    let blob_len = qemu_loader_image_blob(image).and_then(|blob| u64::try_from(blob.len()).ok())?;
+    let blob_len =
+        qemu_loader_image_explicit_size(image).or_else(|| qemu_loader_image_elf_span(image))?;
     let page = USER_PAGE_BYTES;
     let padded = blob_len.checked_add(page - 1)? & !(page - 1);
     Some(padded)
@@ -1676,14 +1581,67 @@ pub(crate) fn read_bootstrap_user_code_image_at(
 }
 
 fn qemu_loader_image_blob(image: QemuLoaderImage) -> Option<&'static [u8]> {
-    // SAFETY: conformance harness loads these bytes into identity-mapped RAM.
-    let size = unsafe { core::ptr::read_unaligned(image.size_paddr as *const u64) };
-    if size == 0 || size as usize > USER_RUNNER_ELF_MAX_BYTES {
-        return None;
-    }
+    let size =
+        qemu_loader_image_explicit_size(image).or_else(|| qemu_loader_image_elf_span(image))?;
 
     // SAFETY: we trust the loader-provided size bound above.
     Some(unsafe { core::slice::from_raw_parts(image.paddr as *const u8, size as usize) })
+}
+
+fn qemu_loader_image_explicit_size(image: QemuLoaderImage) -> Option<u64> {
+    // SAFETY: the QEMU loader writes the image-size word into identity-mapped RAM before `_start`.
+    let size = unsafe { core::ptr::read_unaligned(image.size_paddr as *const u64) };
+    (size != 0 && size as usize <= USER_RUNNER_ELF_MAX_BYTES).then_some(size)
+}
+
+fn qemu_loader_image_elf_span(image: QemuLoaderImage) -> Option<u64> {
+    let ehdr_size = core::mem::size_of::<Elf64Ehdr>();
+    // SAFETY: the QEMU loader drops raw ELF bytes into identity-mapped RAM at `image.paddr`.
+    let ehdr_bytes = unsafe { core::slice::from_raw_parts(image.paddr as *const u8, ehdr_size) };
+    if ehdr_bytes.get(..4)? != b"\x7FELF" {
+        return None;
+    }
+
+    // SAFETY: the slice is exactly one ELF header long and we only perform an unaligned POD read.
+    let ehdr = unsafe { core::ptr::read_unaligned(ehdr_bytes.as_ptr() as *const Elf64Ehdr) };
+    if ehdr.e_ident[4] != 2 || ehdr.e_ident[5] != 1 || ehdr.e_machine != 0x3E {
+        return None;
+    }
+    if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
+        return None;
+    }
+
+    let phnum = usize::from(ehdr.e_phnum);
+    let phoff = usize::try_from(ehdr.e_phoff).ok()?;
+    let ph_table_len = phnum.checked_mul(core::mem::size_of::<Elf64Phdr>())?;
+    let ph_end = phoff.checked_add(ph_table_len)?;
+    if ph_end > USER_RUNNER_ELF_MAX_BYTES {
+        return None;
+    }
+
+    // SAFETY: we cap the raw read to the static identity-mapped loader bound above.
+    let ph_table = unsafe {
+        core::slice::from_raw_parts((image.paddr + ehdr.e_phoff) as *const u8, ph_table_len)
+    };
+
+    let mut required = ph_end as u64;
+    for index in 0..phnum {
+        let offset = index.checked_mul(core::mem::size_of::<Elf64Phdr>())?;
+        // SAFETY: `offset` stays within the `ph_table` slice and `Elf64Phdr` is plain old data.
+        let ph =
+            unsafe { core::ptr::read_unaligned(ph_table.as_ptr().add(offset) as *const Elf64Phdr) };
+        const PT_LOAD: u32 = 1;
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        let file_end = ph.p_offset.checked_add(ph.p_filesz)?;
+        if file_end == 0 || file_end as usize > USER_RUNNER_ELF_MAX_BYTES {
+            return None;
+        }
+        required = required.max(file_end);
+    }
+
+    (required != 0).then_some(required)
 }
 
 /// Validate a user pointer for a copyin/copyout of `len` bytes.
@@ -1730,18 +1688,6 @@ pub(crate) fn write_validated_user_bytes(ptr: u64, src: &[u8]) {
         core::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, src.len());
     }
     note_user_copy_debug(2, ptr, src.as_ptr() as u64, src.len());
-}
-
-/// Zero-fill a validated and resident current-process user range.
-pub(crate) fn zero_validated_user_bytes(ptr: u64, len: usize) {
-    if len == 0 {
-        return;
-    }
-    unsafe {
-        // SAFETY: callers validate the current-process user range and make it resident before
-        // calling this helper. The destination region is writable for `len` bytes.
-        core::ptr::write_bytes(ptr as *mut u8, 0, len);
-    }
 }
 
 /// Copy bytes from one bootstrap-backed frame into a validated and resident user range.
@@ -3287,12 +3233,6 @@ pub fn enter(entry: u64) -> ! {
             options(noreturn),
         );
     }
-}
-
-/// Convenience wrapper (prepare + enter).
-pub fn run() -> ! {
-    let entry = prepare();
-    enter(entry)
 }
 
 // --- Embedded userspace program (one page) ---

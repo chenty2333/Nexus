@@ -39,9 +39,9 @@ impl FutexKey {
 
     /// Build a futex key from resolved mapping metadata.
     pub fn from_lookup(process_id: u64, user_addr: u64, lookup: VmaLookup) -> Self {
-        if lookup.is_global_backed() {
+        if let Some(global_vmo_id) = lookup.shared_backing_global_vmo_id() {
             return Self::Shared {
-                global_vmo_id: lookup.global_vmo_id(),
+                global_vmo_id,
                 offset: lookup.vmo_offset(),
             };
         }

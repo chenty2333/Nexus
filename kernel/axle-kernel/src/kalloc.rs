@@ -82,9 +82,13 @@ static PER_CPU_SLABS: [Mutex<PerCpuSlabs>; MAX_CPUS] =
     [const { Mutex::new(PerCpuSlabs::new()) }; MAX_CPUS];
 
 #[repr(align(4096))]
-struct AlignedHeap([u8; HEAP_SIZE]);
+struct AlignedHeap {
+    _bytes: [u8; HEAP_SIZE],
+}
 
-static mut HEAP: AlignedHeap = AlignedHeap([0; HEAP_SIZE]);
+static mut HEAP: AlignedHeap = AlignedHeap {
+    _bytes: [0; HEAP_SIZE],
+};
 
 /// Global bootstrap allocator.
 pub struct BootstrapAllocator;

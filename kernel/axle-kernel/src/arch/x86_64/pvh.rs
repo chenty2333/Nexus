@@ -100,7 +100,7 @@ pvh_pd:
     .section .bss.axle_pvh_stack, "aw", @nobits
     .align 16
 axle_pvh_stack:
-    .space 32768
+    .space 131072
 axle_pvh_stack_top:
 
     .section .data.axle_pvh_boot, "aw"

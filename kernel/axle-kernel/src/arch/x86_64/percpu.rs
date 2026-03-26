@@ -106,7 +106,8 @@ pub fn try_current_cpu_slot() -> Option<usize> {
     // whether both cpu_id and apic_id are zero -- only the BSP (slot 0)
     // can have both zero, and if percpu is not set up, the caller is
     // already on the BSP early path where slot 0 is the correct answer.
-    Some(val as usize)
+    let slot = val as usize;
+    (slot < MAX_CPUS).then_some(slot)
 }
 
 pub fn try_current_apic_id() -> Option<u32> {
@@ -123,5 +124,5 @@ pub fn try_current_apic_id() -> Option<u32> {
             options(nostack, readonly, preserves_flags),
         );
     }
-    Some(val)
+    ((val as usize) < super::MAX_APIC_IDS).then_some(val)
 }

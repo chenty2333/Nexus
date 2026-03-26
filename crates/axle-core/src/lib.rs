@@ -36,10 +36,12 @@ pub use observer::{
     ObserverPortId, ObserverPortTelemetrySnapshot, ObserverRegistry, WaitAsyncRegistration,
 };
 pub use port::{
-    Packet, PacketKind, PacketQueue, Port, PortError, PortKey, PortState, PortTelemetrySnapshot,
-    VecPortQueue, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId,
+    Packet, PacketKind, PacketQueue, PacketQueueError, Port, PortError, PortKey, PortState,
+    PortTelemetrySnapshot, VecPortQueue, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId,
 };
-pub use revocation::{RevocationGroupId, RevocationGroupToken, RevocationManager, RevocationRef};
+pub use revocation::{
+    RevocationGroupId, RevocationGroupToken, RevocationManager, RevocationRef, RevocationSet,
+};
 pub use signals::{Signals, WaitOne, wait_one};
 pub use timer::{
     FakeClock, ReactorTimerCore, ReactorTimerEvent, ReactorTimerStats, Time, TimerError, TimerId,

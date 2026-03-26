@@ -67,6 +67,65 @@ impl RevocationRef {
     }
 }
 
+/// One small fixed-size set of revocation references carried by deferred control-plane state.
+///
+/// This is used for state whose effect is delayed after the originating handle operation:
+/// queued kernel packets, async observers, blocked waits, or armed timers.  Revocation can then
+/// eagerly purge only the deferred state that still depends on a revoked handle epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RevocationSet {
+    first: Option<RevocationRef>,
+    second: Option<RevocationRef>,
+}
+
+impl RevocationSet {
+    /// Empty provenance.
+    pub const fn none() -> Self {
+        Self {
+            first: None,
+            second: None,
+        }
+    }
+
+    /// Provenance carrying one reference.
+    pub const fn one(first: Option<RevocationRef>) -> Self {
+        Self {
+            first,
+            second: None,
+        }
+    }
+
+    /// Provenance carrying up to two references.
+    pub fn pair(first: Option<RevocationRef>, second: Option<RevocationRef>) -> Self {
+        if first.is_some() && first == second {
+            return Self::one(first);
+        }
+        Self { first, second }
+    }
+
+    /// Returns `true` when this provenance is empty.
+    pub const fn is_empty(self) -> bool {
+        self.first.is_none() && self.second.is_none()
+    }
+
+    /// Return the contained references in stable order.
+    pub const fn refs(self) -> [Option<RevocationRef>; 2] {
+        [self.first, self.second]
+    }
+
+    /// Returns `true` when any carried reference belongs to a now-revoked epoch.
+    pub fn contains_revoked(
+        self,
+        group: RevocationGroupId,
+        generation: u64,
+        current_epoch: u64,
+    ) -> bool {
+        self.refs().into_iter().flatten().any(|rev| {
+            rev.id() == group && rev.generation() == generation && rev.epoch() < current_epoch
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GroupSlot {
     generation: u64,

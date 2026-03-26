@@ -571,16 +571,6 @@ pub fn init() {
     let _ = BOOTSTRAP_SYSCALLS;
 }
 
-/// Dispatch one syscall number + up to 6 arguments.
-///
-/// Unknown numbers return `ZX_ERR_BAD_SYSCALL`.
-/// Known-but-not-yet-implemented syscalls return `ZX_ERR_NOT_SUPPORTED`.
-#[allow(dead_code)]
-pub fn dispatch_syscall(nr: SyscallNumber, args: [u64; 6]) -> zx_status_t {
-    let mut ctx = SyscallCtx::default();
-    dispatch_syscall_with_ctx(&mut ctx, nr, args)
-}
-
 fn dispatch_syscall_with_ctx(
     ctx: &mut SyscallCtx,
     nr: SyscallNumber,

@@ -84,6 +84,11 @@ pub(crate) fn init_cpu() {
 
 /// Return the clean architectural FPU state for a new user thread.
 pub(crate) fn clean_state() -> FpuState {
+    if CLEAN_STATE.get().is_none() {
+        // Keep thread creation robust against any caller that reaches the
+        // FPU template before the boot path has explicitly seeded it.
+        init_cpu();
+    }
     CLEAN_STATE
         .get()
         .expect("x86_64 fpu state must be initialized before threads are created")

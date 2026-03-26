@@ -27,6 +27,20 @@ This file describes the current VMO, VMAR, VMA, and address-space control-plane 
   - reverse-map metadata and per-page metadata stores
 - `FrameTable` now uses a `BTreeMap<FrameId, FrameDescRecord>` internally instead of a linear
   `Vec`, giving O(log n) frame lookup instead of O(n) linear scan for large physical memory.
+- `AddressSpace` no longer maintains VMAR / VMO / map / VMA identity through `Vec::remove()`
+  followed by `sort + rebuild_*`.
+  It now uses a storage/index split:
+  - stable slot storage for VMAR / VMO / map / VMA records
+  - explicit `id -> slot` indexes for direct lookup
+  - base-address indexes for VMAR/VMA predecessor and range queries
+  - explicit parent->child VMAR and VMAR->VMA indexes for subtree teardown and occupancy queries
+  - per-parent / per-VMAR / per-VMO membership lists kept in base order so allocation,
+    occupancy, and mapped-range walks no longer need ad-hoc `collect + sort` passes after
+    mutation
+  - recursive VMAR destroy now reuses those same ordered child/VMA indexes, so subtree teardown
+    no longer flattens then sorts one temporary unmap list before walking it
+  This removes mutation-time full-index rebuilds while keeping lookup deterministic in `no_std`
+  `alloc` environments.
 - `kernel/axle-kernel/src/task.rs` wraps this in `VmDomain` and ties it to page tables and process ownership.
 - `kernel/axle-kernel/src/object.rs` exposes VMO and VMAR syscalls through object handles.
 
@@ -57,6 +71,8 @@ This file describes the current VMO, VMAR, VMA, and address-space control-plane 
   - mapping-wide COW bit
   - mapping-level clone policy (`None` / `SharedAlias` / `PrivateCow`)
 - Per-page hot state lives in `PteMeta`.
+- Public snapshots such as `AddressSpace::vmas()` and `map_records()` now rebuild ordered views from
+  those stable indexes instead of exposing backing storage directly.
 - Physical frame / reverse-map / pin / loan truth lives in `FrameTable`.
 - `FrameRef`, `PinToken`, and `LoanToken` `Drop` implementations now use hard `assert!` (not
   `debug_assert!`) so resource leaks panic even in release builds, preventing silent physical
@@ -175,9 +191,26 @@ The metadata layer also validates overlap, mapping range, resize legality, and V
 
 - VMOs have both local `VmoId` values and kernel-global `GlobalVmoId` values.
 - VMARs are identified by `VmarId` within one address space.
-- The kernel-global id is now a stable shared identity, not proof that the current backing is already shared/global-backed.
-- Shared/global backing is decided by backing scope and import/promotion, not by the mere presence of a non-zero global id.
-- The kernel uses global VMO ids to synchronize genuinely shared state across address spaces and page-loan paths.
+- The metadata model now distinguishes three concepts that were previously easy
+  to conflate:
+  - one VMO's own kernel-global identity
+  - one direct shared/global backing identity used for import de-duplication
+    and shared-handle semantics
+  - one fault source identity used when missing pages still materialize from a
+    shared pager/file-backed source
+- Direct shared aliases carry all three as the same value.
+- Local-private VMOs and mapping-local private clones keep their own
+  kernel-global identity even when they still fault missing pages from one
+  shared pager/file-backed source.
+- Shared/global backing is therefore decided by backing scope and import /
+  promotion, not by the mere presence of a non-zero global id.
+- The kernel uses shared-backing identities to synchronize genuinely shared
+  aliases across address spaces, while fault-source identities only drive lazy
+  materialization.
+- `ax_vmar_get_mapping_vmo()` now snapshots that distinction correctly:
+  - direct shared aliases reify as `GlobalShared`
+  - mapping-local private clones reify as `LocalPrivate` even when their lazy
+    fault source is still one shared pager/file-backed VMO
 
 ## Phase-one gate contract
 

@@ -414,7 +414,6 @@ pub fn pin_vmo(
         let region_object_id = state.alloc_object_id();
         let insert_result = state.with_objects_mut(|objects| {
             let region = DmaRegionObject {
-                source_vmo_object: object_key,
                 source_offset: offset,
                 size_bytes: len,
                 options,
@@ -873,7 +872,7 @@ pub fn vmar_get_mapping_vmo(
         let process_id =
             state.with_core(|kernel| Ok(kernel.current_process_info()?.process_id()))?;
         let object_id = state.alloc_object_id();
-        let backing_scope = if lookup.is_global_backed() {
+        let backing_scope = if mapping_vmo.is_shared_backed() {
             VmoBackingScope::GlobalShared
         } else {
             VmoBackingScope::LocalPrivate {

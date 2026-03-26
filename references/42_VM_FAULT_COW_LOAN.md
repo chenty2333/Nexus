@@ -100,6 +100,12 @@ This is the current mechanism that prevents duplicate materialization or inconsi
     rebind one mapping-local private frame on the first write fault
   - staged byte-backed boot assets currently ride one page-rounded shared anonymous VMO through the
     same private-clone path
+- Mapping-local private clones now keep one distinct local VMO identity even
+  while they continue to use one shared pager/file-backed source for lazy fault
+  materialization.
+  - shared-alias import de-duplication does not collapse onto those clones
+  - shared-futex / shared-handle semantics stay tied to the direct shared alias,
+    not to private shadow mappings
 - The current bootstrap gate also now freezes the public source-vs-shadow
   consequence of that path for shared pager-backed handles:
   - writes through the `PRIVATE_CLONE` mapping become visible through the

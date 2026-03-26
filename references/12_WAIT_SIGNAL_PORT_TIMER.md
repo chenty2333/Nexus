@@ -60,6 +60,16 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   and the destination port handle.
   After `ax_revocation_group_revoke()` bumps one group's epoch, stale observers created through
   handles from older epochs are removed eagerly instead of continuing to deliver packets.
+- Revocation is now broader than observer teardown alone.
+  The kernel eagerly cancels every still-pending control-plane effect that carries revoked
+  provenance:
+  - blocked `wait_one` / `port_wait` registrations
+  - `wait_async` observers
+  - armed timer deadlines
+  - queued kernel-generated signal packets already sitting in ports
+- Revocation does **not** roll back already committed data-plane effects.
+  Channel messages, socket bytes/datagrams, completed handle transfer, and completed VM/object
+  operations remain committed even if the originating handle epoch is later revoked.
 - Observer cleanup now eagerly removes pending-overflow entries when one registration is canceled or
   when the watched object is destroyed.
   It no longer relies on later `flush_port()` calls to lazily skip stale pending registrations.
@@ -103,6 +113,9 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   - pending async-wait overflow / merge / flush counts for that port
 - User packets and signal packets are translated to and from native `ax_port_packet_t`.
   Frozen `zx_port_packet_t` remains available as a compat alias over the same layout.
+- Kernel-generated packets now also carry revocation provenance internally.
+  Port purge on `ax_revocation_group_revoke()` removes only queued kernel packets whose provenance
+  is now stale; user packets are left untouched.
 - `zx_port_wait` is FIFO over queued packets and flushes pending kernel events when space becomes available.
 - The syscall front-end now owns packet-output pointer decode and probe before `zx_port_wait` runs.
 - Immediate packet delivery returns one completed packet back to the syscall shell for writeback;
@@ -130,6 +143,9 @@ This file describes the current wait-one, wait-async, signal, port, and timer be
   cycles.
 - When polled at or after the deadline, the timer becomes signaled and disarms.
 - `cancel()` clears both arm state and signal state.
+- Armed timers now retain the revocation provenance of the handle epoch that armed them.
+  `ax_revocation_group_revoke()` eagerly cancels timers armed through revoked handle epochs before
+  they can fire later.
 - The unified backend produces two event families:
   - timer object fire
   - blocked wait deadline expiry

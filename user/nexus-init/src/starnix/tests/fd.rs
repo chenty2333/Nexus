@@ -1,6 +1,9 @@
+use super::super::fs::devfs::{NullFd, ZeroFd};
+use super::super::fs::tty::{DevDirFd, PtyRegistry};
 use super::super::*;
 use super::support::RecordingFd;
 use alloc::sync::Arc;
+use nexus_io::{NamespaceTrie, ProcessNamespace};
 
 #[test]
 fn dup2_and_dup3_share_open_file_descriptions() {
@@ -222,4 +225,72 @@ fn exec_fd_replace_drops_cloexec_entries_and_clears_offsets() {
     assert!(replaced.fd_table.get(cloexec_fd).is_none());
     assert!(replaced.fd_table.get(kept_fd).is_some());
     assert!(replaced.directory_offsets.is_empty());
+}
+
+#[test]
+fn stat_metadata_for_dev_ptmx_is_side_effect_free() {
+    let stdout = RecordingFd::new();
+    let mut kernel = super::support::test_kernel_with_stdio(stdout);
+    let resources = kernel
+        .groups
+        .get_mut(&1)
+        .expect("root group")
+        .resources
+        .as_mut()
+        .expect("root resources");
+
+    let registry = Arc::new(PtyRegistry::new());
+    let tty = registry.allocate_console_slave();
+    let controlling_tty = Arc::new(Mutex::new(Some(tty)));
+    let dev_root: Arc<dyn FdOps> = Arc::new(DevDirFd::new(
+        controlling_tty,
+        registry.clone(),
+        Arc::new(NullFd),
+        Arc::new(ZeroFd),
+    ));
+    let mut mounts = NamespaceTrie::new();
+    mounts
+        .insert("/dev", dev_root.clone())
+        .expect("insert /dev");
+    resources.fs.base_namespace = ProcessNamespace::new(mounts.clone());
+    resources.fs.namespace = ProcessNamespace::new(mounts);
+
+    let before = resources
+        .fs
+        .namespace
+        .readdir("/dev/pts")
+        .expect("readdir /dev/pts before")
+        .len();
+    let absolute = resources
+        .stat_metadata_at_path(LINUX_AT_FDCWD, "/dev/ptmx", 0)
+        .expect("stat /dev/ptmx");
+    let after_absolute = resources
+        .fs
+        .namespace
+        .readdir("/dev/pts")
+        .expect("readdir /dev/pts after absolute stat")
+        .len();
+    assert_eq!(before, after_absolute);
+    assert_eq!(absolute.mode & LINUX_S_IFMT, LINUX_S_IFCHR);
+
+    let dev_fd = resources
+        .fs
+        .fd_table
+        .open(
+            dev_root,
+            OpenFlags::READABLE | OpenFlags::DIRECTORY,
+            FdFlags::empty(),
+        )
+        .expect("open /dev fd");
+    let relative = resources
+        .stat_metadata_at_path(dev_fd, "ptmx", 0)
+        .expect("fstatat ptmx");
+    let after_relative = resources
+        .fs
+        .namespace
+        .readdir("/dev/pts")
+        .expect("readdir /dev/pts after relative stat")
+        .len();
+    assert_eq!(before, after_relative);
+    assert_eq!(relative.mode & LINUX_S_IFMT, LINUX_S_IFCHR);
 }

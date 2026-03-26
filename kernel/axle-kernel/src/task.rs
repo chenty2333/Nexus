@@ -904,11 +904,6 @@ impl TlbCpuTracker {
         self.active.remove(cpu_id);
     }
 
-    #[allow(dead_code)]
-    fn is_active(&self, cpu_id: usize) -> bool {
-        self.active.contains(cpu_id)
-    }
-
     fn note_observed_epoch(&mut self, cpu_id: usize, epoch: u64) {
         if cpu_id < TLB_CPU_TRACKER_CAPACITY {
             self.observed_epoch[cpu_id] = epoch;
@@ -1289,11 +1284,6 @@ impl AddressSpace {
         crate::trace::note_tlb_active_mask(self.tlb_cpus.active.mask());
     }
 
-    #[allow(dead_code)]
-    fn is_cpu_active(&self, cpu_id: usize) -> bool {
-        self.tlb_cpus.is_active(cpu_id)
-    }
-
     fn observe_tlb_epoch(&mut self, cpu_id: usize, epoch: u64) {
         self.tlb_cpus.note_observed_epoch(cpu_id, epoch);
     }
@@ -1648,9 +1638,7 @@ struct Thread {
 pub(crate) struct VmDomain {
     address_spaces: BTreeMap<AddressSpaceId, AddressSpace>,
     global_vmos: Arc<Mutex<GlobalVmoStore>>,
-    bootstrap_user_runner_global_vmo_id: Option<KernelVmoId>,
     bootstrap_user_code_global_vmo_id: Option<KernelVmoId>,
-    #[allow(dead_code)]
     frames: Arc<Mutex<FrameTable>>,
     cow_fault_count: u64,
     vm_private_cow_pages_current: u64,
@@ -1868,11 +1856,6 @@ impl Kernel {
         Ok(resolved)
     }
 
-    pub(crate) fn close_current_handle(&mut self, raw: zx_handle_t) -> Result<(), zx_status_t> {
-        let process_id = self.current_thread()?.process_id;
-        self.close_handle_in_process(process_id, raw)
-    }
-
     pub(crate) fn close_handle_in_process(
         &mut self,
         process_id: ProcessId,
@@ -1926,14 +1909,6 @@ impl Kernel {
             .snapshot_handle_for_transfer(raw, &self.revocations)
     }
 
-    pub(crate) fn install_handle_in_current_process(
-        &mut self,
-        transferred: TransferredCap,
-    ) -> Result<zx_handle_t, zx_status_t> {
-        let process_id = self.current_thread()?.process_id;
-        self.install_handle_in_process(process_id, transferred)
-    }
-
     pub(crate) fn install_handle_in_process(
         &mut self,
         process_id: ProcessId,
@@ -1947,15 +1922,6 @@ impl Kernel {
         self.revocations.create_group()
     }
 
-    pub(crate) fn revoke_group(
-        &mut self,
-        token: axle_core::RevocationGroupToken,
-    ) -> Result<(), zx_status_t> {
-        self.revocations
-            .revoke(token)
-            .map_err(|_| ZX_ERR_BAD_HANDLE)
-    }
-
     pub(crate) fn revocation_group_epoch(
         &self,
         token: axle_core::RevocationGroupToken,
@@ -1963,6 +1929,16 @@ impl Kernel {
         self.revocations
             .snapshot(token)
             .map(|snapshot| snapshot.epoch())
+            .map_err(|_| ZX_ERR_BAD_HANDLE)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_revocation_ref(
+        &self,
+        token: axle_core::RevocationGroupToken,
+    ) -> Result<axle_core::RevocationRef, zx_status_t> {
+        self.revocations
+            .snapshot(token)
             .map_err(|_| ZX_ERR_BAD_HANDLE)
     }
 
@@ -1979,35 +1955,6 @@ impl Kernel {
             .map_err(|_| ZX_ERR_BAD_HANDLE)
     }
 
-    pub(crate) fn validate_current_user_ptr(&self, ptr: u64, len: usize) -> bool {
-        let Ok(process) = self.current_process() else {
-            return false;
-        };
-        self.with_vm(|vm| {
-            vm.address_spaces
-                .get(&process.address_space_id)
-                .map(|address_space| address_space.validate_user_ptr(ptr, len))
-                .unwrap_or(false)
-        })
-    }
-
-    pub(crate) fn validate_process_user_ptr(
-        &self,
-        process_id: ProcessId,
-        ptr: u64,
-        len: usize,
-    ) -> bool {
-        let Ok(process) = self.process(process_id) else {
-            return false;
-        };
-        self.with_vm(|vm| {
-            vm.address_spaces
-                .get(&process.address_space_id)
-                .map(|address_space| address_space.validate_user_ptr(ptr, len))
-                .unwrap_or(false)
-        })
-    }
-
     pub(crate) fn validate_process_user_mapping_perms(
         &self,
         process_id: ProcessId,
@@ -2022,89 +1969,6 @@ impl Kernel {
             vm.lookup_user_mapping(process.address_space_id, ptr, len)
                 .is_some_and(|lookup| mapping_satisfies_required_perms(lookup, required))
         })
-    }
-
-    pub(crate) fn ensure_current_user_page_resident(
-        &mut self,
-        page_va: u64,
-        for_write: bool,
-    ) -> Result<(), zx_status_t> {
-        let address_space_id = self.current_process()?.address_space_id;
-        self.with_vm_mut(|vm| vm.ensure_user_page_resident(address_space_id, page_va, for_write))
-    }
-
-    /// Resolve a current-thread userspace range back to its VMO mapping metadata.
-    #[allow(dead_code)]
-    pub(crate) fn lookup_current_user_mapping(&self, ptr: u64, len: usize) -> Option<VmaLookup> {
-        let process = self.current_process().ok()?;
-        self.with_vm(|vm| {
-            vm.address_spaces
-                .get(&process.address_space_id)
-                .and_then(|address_space| address_space.lookup_user_mapping(ptr, len))
-        })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn resolve_current_futex_key(
-        &self,
-        user_addr: u64,
-    ) -> Result<FutexKey, zx_status_t> {
-        const FUTEX_WORD_BYTES: usize = size_of::<u32>();
-        if (user_addr & 0x3) != 0 || !self.validate_current_user_ptr(user_addr, FUTEX_WORD_BYTES) {
-            return Err(ZX_ERR_INVALID_ARGS);
-        }
-
-        let process_id = self.current_thread()?.process_id;
-        let lookup = self
-            .lookup_current_user_mapping(user_addr, FUTEX_WORD_BYTES)
-            .ok_or(ZX_ERR_INVALID_ARGS)?;
-        Ok(FutexKey::from_lookup(process_id, user_addr, lookup))
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn resolve_current_futex_key_relaxed(
-        &self,
-        user_addr: u64,
-    ) -> Result<FutexKey, zx_status_t> {
-        const FUTEX_WORD_BYTES: usize = size_of::<u32>();
-        if (user_addr & 0x3) != 0 {
-            return Err(ZX_ERR_INVALID_ARGS);
-        }
-        let process_id = self.current_thread()?.process_id;
-        let process = self.current_process()?;
-        self.with_vm(|vm| {
-            let address_space = vm
-                .address_spaces
-                .get(&process.address_space_id)
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            let root = address_space.root_vmar();
-            let range_end = user_addr
-                .checked_add(FUTEX_WORD_BYTES as u64)
-                .ok_or(ZX_ERR_INVALID_ARGS)?;
-            let root_end = root
-                .base()
-                .checked_add(root.len())
-                .ok_or(ZX_ERR_BAD_STATE)?;
-            if user_addr < root.base() || range_end > root_end {
-                return Err(ZX_ERR_INVALID_ARGS);
-            }
-            if !address_space.validate_user_ptr(user_addr, FUTEX_WORD_BYTES) {
-                return Ok(FutexKey::private_anonymous(process_id, user_addr));
-            }
-            let lookup = address_space
-                .lookup_user_mapping(user_addr, FUTEX_WORD_BYTES)
-                .ok_or(ZX_ERR_INVALID_ARGS)?;
-            Ok(FutexKey::from_lookup(process_id, user_addr, lookup))
-        })
-    }
-
-    pub(crate) fn try_loan_current_user_pages(
-        &mut self,
-        ptr: u64,
-        len: usize,
-    ) -> Result<Option<LoanedUserPages>, zx_status_t> {
-        let address_space_id = self.current_process()?.address_space_id;
-        self.with_vm_mut(|vm| vm.try_loan_user_pages(address_space_id, ptr, len))
     }
 
     pub(crate) fn release_loaned_user_pages(&mut self, loaned: LoanedUserPages) {
@@ -3539,14 +3403,15 @@ impl VmDomain {
             .vmo_offset()
             .checked_sub(lookup.vmo_offset() % crate::userspace::USER_PAGE_BYTES)
             .ok_or(ZX_ERR_BAD_STATE)?;
+        let fault_global_vmo_id = lookup.fault_global_vmo_id().ok_or(ZX_ERR_BAD_STATE)?;
         Ok(FaultPlan::LazyVmo {
             key: FaultInFlightKey::SharedVmoPage {
-                global_vmo_id: lookup.global_vmo_id(),
+                global_vmo_id: fault_global_vmo_id,
                 page_offset,
             },
             address_space_id,
             page_base,
-            global_vmo_id: lookup.global_vmo_id(),
+            global_vmo_id: fault_global_vmo_id,
             page_offset,
             vmo_kind: lookup.vmo_kind(),
         })
@@ -3820,7 +3685,9 @@ impl VmDomain {
                     .vmo_offset()
                     .checked_sub(lookup.vmo_offset() % crate::userspace::USER_PAGE_BYTES)
                     .ok_or(ZX_ERR_BAD_STATE)?;
-                if lookup.global_vmo_id() != global_vmo_id || current_page_offset != page_offset {
+                if lookup.fault_global_vmo_id() != Some(global_vmo_id)
+                    || current_page_offset != page_offset
+                {
                     return Ok((
                         FaultCommitDisposition::Retry,
                         TlbCommitReq::relaxed(address_space_id),
@@ -4308,7 +4175,8 @@ impl VmDomain {
             .vmo_offset()
             .checked_sub(lookup.vmo_offset() % crate::userspace::USER_PAGE_BYTES)
             .ok_or(ZX_ERR_BAD_STATE)?;
-        let mut prepared = match self.global_vmo_frame(lookup.global_vmo_id(), page_offset)? {
+        let fault_global_vmo_id = lookup.fault_global_vmo_id().ok_or(ZX_ERR_BAD_STATE)?;
+        let mut prepared = match self.global_vmo_frame(fault_global_vmo_id, page_offset)? {
             Some(_) => PreparedFaultWork::None,
             None => match lookup.vmo_kind() {
                 VmoKind::Anonymous => PreparedFaultWork::NewPage {
@@ -4319,7 +4187,7 @@ impl VmDomain {
                     let new_frame_paddr =
                         crate::userspace::alloc_bootstrap_zeroed_page().ok_or(ZX_ERR_NO_MEMORY)?;
                     let materialized = self.global_vmos.lock().materialize_page_into(
-                        lookup.global_vmo_id(),
+                        fault_global_vmo_id,
                         page_offset,
                         new_frame_paddr,
                     );
@@ -4342,7 +4210,7 @@ impl VmDomain {
             },
         };
         let frame_id =
-            self.ensure_global_vmo_frame(lookup.global_vmo_id(), page_offset, &mut prepared)?;
+            self.ensure_global_vmo_frame(fault_global_vmo_id, page_offset, &mut prepared)?;
         let resolved = self.bind_lazy_vmo_frame(address_space_id, page_base, frame_id)?;
         prepared.release_unused();
         self.sync_mapping_pages(

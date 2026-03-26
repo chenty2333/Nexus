@@ -138,7 +138,14 @@ impl StarnixRunner {
         }
         let executive = open_binary(&*self.boot_root, STARNIX_KERNEL_BINARY_PATH)?;
         let executive_vmo = executive.as_vmo(VmoFlags::READ | VmoFlags::EXECUTE)?;
-        let linux_image = open_binary(&*self.boot_root, component.decl.program.binary.as_str())?;
+        let linux_image =
+            match open_binary(&*self.boot_root, component.decl.program.binary.as_str()) {
+                Ok(image) => image,
+                Err(status) => {
+                    let _ = zx_handle_close(executive_vmo);
+                    return Err(status);
+                }
+            };
         let linux_image_vmo = linux_image.as_vmo(VmoFlags::READ | VmoFlags::EXECUTE)?;
         let mut parent_process_dup = ZX_HANDLE_INVALID;
         let duplicate_status = zx_handle_duplicate(

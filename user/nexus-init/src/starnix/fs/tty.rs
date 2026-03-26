@@ -1,4 +1,6 @@
 use super::super::*;
+use super::fd::LinuxStatMetadata;
+use super::procfs::stat_metadata_for_ops;
 use alloc::collections::BTreeMap;
 use alloc::string::ToString;
 use alloc::vec;
@@ -966,6 +968,10 @@ impl PtyRegistry {
         slave.clone_fd(FdFlags::empty())
     }
 
+    pub(in crate::starnix) fn contains_slave(&self, pts_id: u32) -> bool {
+        self.slaves.lock().contains_key(&pts_id)
+    }
+
     fn readdir(&self) -> Vec<DirectoryEntry> {
         self.slaves
             .lock()
@@ -986,6 +992,28 @@ pub(in crate::starnix) struct DevPtsDirFd {
 impl DevPtsDirFd {
     pub(in crate::starnix) fn new(registry: Arc<PtyRegistry>) -> Self {
         Self { registry }
+    }
+
+    pub(in crate::starnix) fn stat_metadata_at(
+        &self,
+        path: &str,
+    ) -> Result<LinuxStatMetadata, zx_status_t> {
+        let normalized = path.trim_matches('/');
+        if normalized.is_empty() || normalized == "." {
+            return stat_metadata_for_ops(self);
+        }
+        if normalized.contains('/') {
+            return Err(ZX_ERR_NOT_FOUND);
+        }
+        let pts_id = normalized.parse::<u32>().map_err(|_| ZX_ERR_NOT_FOUND)?;
+        if !self.registry.contains_slave(pts_id) {
+            return Err(ZX_ERR_NOT_FOUND);
+        }
+        Ok(LinuxStatMetadata {
+            mode: LINUX_S_IFCHR | 0o666,
+            size_bytes: 0,
+            inode: 0x2000u64 + u64::from(pts_id),
+        })
     }
 }
 
@@ -1064,6 +1092,35 @@ impl DevDirFd {
     fn tty(&self) -> Result<Arc<dyn FdOps>, zx_status_t> {
         let tty = self.current_tty.lock().clone().ok_or(ZX_ERR_NOT_FOUND)?;
         tty.clone_fd(FdFlags::empty())
+    }
+
+    pub(in crate::starnix) fn stat_metadata_at(
+        &self,
+        path: &str,
+    ) -> Result<LinuxStatMetadata, zx_status_t> {
+        let normalized = path.trim_matches('/');
+        if normalized.is_empty() || normalized == "." {
+            return stat_metadata_for_ops(self);
+        }
+        let (head, tail) = normalized
+            .split_once('/')
+            .map_or((normalized, None), |(head, tail)| (head, Some(tail)));
+        match (head, tail) {
+            ("tty", None) => {
+                let tty = self.current_tty.lock().clone().ok_or(ZX_ERR_NOT_FOUND)?;
+                stat_metadata_for_ops(tty.as_ref())
+            }
+            ("ptmx", None) => Ok(LinuxStatMetadata {
+                mode: LINUX_S_IFCHR | 0o666,
+                size_bytes: 0,
+                inode: 0x1006,
+            }),
+            ("pts", None) => stat_metadata_for_ops(self.pts_dir.as_ref()),
+            ("pts", Some(tail)) => self.pts_dir.stat_metadata_at(tail),
+            ("null", None) => stat_metadata_for_ops(self.null.as_ref()),
+            ("zero", None) => stat_metadata_for_ops(self.zero.as_ref()),
+            _ => Err(ZX_ERR_NOT_FOUND),
+        }
     }
 }
 

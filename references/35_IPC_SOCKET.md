@@ -47,6 +47,10 @@ Current Starnix exposure is still intentionally narrow:
 - `ZX_ERR_SHOULD_WAIT` is returned when zero bytes fit; partial writes can still succeed as short writes.
 
 Each socket pair currently uses two `4096`-byte byte rings, one per direction.
+- Stream socket memory is now globally accounted at creation time:
+  - the fixed `SocketCore` metadata
+  - both preallocated byte rings
+  - creation fails with `ZX_ERR_NO_MEMORY` if the system-wide socket budget would be exceeded
 
 ## Current datagram semantics
 
@@ -76,6 +80,21 @@ Each datagram socket pair currently uses:
 - two bounded per-direction queues
 - `4096` bytes of total buffered payload capacity per direction
 - up to `64` queued datagrams per direction
+- one fixed per-core/socket budget reservation for the `SocketCore` itself
+- one dynamic global reservation per queued datagram descriptor:
+  - copied bytes
+  - fragment-head/tail storage
+  - one descriptor-sized fixed overhead
+  - loaned user pages remain under VM loan quota, not the socket queue budget
+
+Datagram queue memory now participates in the same accounted-byte style as channels:
+
+- channel and socket queue accounting now share the same small RAII reservation ticket in-kernel,
+  so pre-commit reservation and failure rollback follow one common CAS-based path
+- enqueue reserves global socket budget before the datagram is committed
+- dequeue releases that reservation as soon as the message leaves the socket queue
+- core teardown releases both fixed socket memory and any remaining queued datagram reservations
+- writes that would exceed the system-wide socket budget fail with `ZX_ERR_NO_MEMORY`
 
 ## Current signals
 

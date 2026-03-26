@@ -237,10 +237,6 @@ impl Kernel {
         ))
     }
 
-    pub(crate) fn request_reschedule(&mut self) {
-        self.request_reschedule_on_cpu(self.current_cpu_id());
-    }
-
     // ---- EEVDF helpers ----
 
     /// Update `min_vruntime` from the currently running thread's vruntime.

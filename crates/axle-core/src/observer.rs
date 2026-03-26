@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use crate::capability::ObjectKey;
 use crate::port::{Packet, PortError, PortKey, WaitAsyncOptions, WaitAsyncTimestamp, WaitableId};
-use crate::revocation::{RevocationGroupId, RevocationRef};
+use crate::revocation::{RevocationGroupId, RevocationSet};
 use crate::signals::Signals;
 use crate::timer::Time;
 
@@ -29,10 +29,8 @@ pub struct WaitAsyncRegistration {
     pub port: ObserverPortId,
     /// Waitable object being observed.
     pub waitable: WaitableId,
-    /// Revocation provenance carried by the source waitable handle, if any.
-    pub waitable_revocation: Option<RevocationRef>,
-    /// Revocation provenance carried by the destination port handle, if any.
-    pub port_revocation: Option<RevocationRef>,
+    /// Revocation provenance carried by the handles that created this deferred observer.
+    pub revocation: RevocationSet,
     /// User packet key.
     pub key: PortKey,
     /// Signal mask watched by this observer.
@@ -53,8 +51,7 @@ struct PendingState {
 struct Observer {
     watched: Signals,
     options: WaitAsyncOptions,
-    waitable_revocation: Option<RevocationRef>,
-    port_revocation: Option<RevocationRef>,
+    revocation: RevocationSet,
     last_satisfied: bool,
     pending: Option<PendingState>,
 }
@@ -178,8 +175,7 @@ impl ObserverRegistry {
             Observer {
                 watched: registration.watched,
                 options: registration.options,
-                waitable_revocation: registration.waitable_revocation,
-                port_revocation: registration.port_revocation,
+                revocation: registration.revocation,
                 last_satisfied: satisfied,
                 pending: None,
             },
@@ -281,13 +277,14 @@ impl ObserverRegistry {
                 continue;
             };
 
-            let pkt = Packet::signal(
+            let pkt = Packet::signal_with_revocation(
                 reg.key,
                 reg.waitable,
                 pending.trigger,
                 pending.observed,
                 pending.count,
                 pending.timestamp,
+                observer.revocation,
             );
             if !try_queue(port, pkt) {
                 if let Some(queue) = self.pending_order_by_port.get_mut(&port) {
@@ -363,15 +360,10 @@ impl ObserverRegistry {
             .observers
             .iter()
             .filter_map(|(reg, observer)| {
-                let matches = observer
-                    .waitable_revocation
-                    .into_iter()
-                    .chain(observer.port_revocation)
-                    .any(|rev| {
-                        rev.id() == group
-                            && rev.generation() == generation
-                            && rev.epoch() < current_epoch
-                    });
+                let matches =
+                    observer
+                        .revocation
+                        .contains_revoked(group, generation, current_epoch);
                 matches.then_some(*reg)
             })
             .collect();
@@ -445,16 +437,27 @@ impl ObserverRegistry {
     where
         F: FnMut(ObserverPortId, Packet) -> bool,
     {
-        let timestamp = self
+        let (timestamp, revocation) = self
             .observers
             .get(&reg)
-            .map(|observer| match observer.options.timestamp {
-                WaitAsyncTimestamp::None => 0,
-                WaitAsyncTimestamp::Monotonic | WaitAsyncTimestamp::Boot => now,
+            .map(|observer| {
+                let timestamp = match observer.options.timestamp {
+                    WaitAsyncTimestamp::None => 0,
+                    WaitAsyncTimestamp::Monotonic | WaitAsyncTimestamp::Boot => now,
+                };
+                (timestamp, observer.revocation)
             })
-            .unwrap_or(0);
+            .unwrap_or((0, RevocationSet::none()));
 
-        let pkt = Packet::signal(reg.key, reg.waitable, trigger, current, 1, timestamp);
+        let pkt = Packet::signal_with_revocation(
+            reg.key,
+            reg.waitable,
+            trigger,
+            current,
+            1,
+            timestamp,
+            revocation,
+        );
         if try_queue(reg.port, pkt) {
             let _ = self.remove_observer(reg);
             return true;
@@ -530,8 +533,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(42),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 7,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -559,8 +561,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 10,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -580,8 +581,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 11,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions {
@@ -622,8 +622,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 33,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions {
@@ -661,8 +660,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(5),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 9,
                     watched: Signals::TIMER_SIGNALED,
                     options: WaitAsyncOptions::default(),
@@ -677,8 +675,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(5),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 9,
                     watched: Signals::TIMER_SIGNALED,
                     options: WaitAsyncOptions::default(),
@@ -701,8 +698,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(7),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 1,
                     watched: Signals::TIMER_SIGNALED,
                     options: WaitAsyncOptions::default(),
@@ -729,8 +725,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 10,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -745,8 +740,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(2),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 11,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -779,8 +773,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 10,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -795,8 +788,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(2),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 11,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -829,8 +821,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 10,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -845,8 +836,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(2),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 11,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -883,8 +873,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(1),
-                    waitable_revocation: Some(live_waitable),
-                    port_revocation: None,
+                    revocation: RevocationSet::one(Some(live_waitable)),
                     key: 1,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -899,8 +888,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(2),
-                    waitable_revocation: None,
-                    port_revocation: Some(live_port),
+                    revocation: RevocationSet::one(Some(live_port)),
                     key: 2,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),
@@ -915,8 +903,7 @@ mod tests {
                 WaitAsyncRegistration {
                     port: key(10),
                     waitable: key(3),
-                    waitable_revocation: None,
-                    port_revocation: None,
+                    revocation: RevocationSet::none(),
                     key: 3,
                     watched: Signals::CHANNEL_READABLE,
                     options: WaitAsyncOptions::default(),

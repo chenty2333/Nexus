@@ -65,6 +65,14 @@ mode = "not_applicable"
 reason = "syscall return-code contract; not modeled by the host-side concurrent harness"
 
 [[contracts]]
+id = "must.handle.revocation_deferred_control_state_bootstrap"
+level = "must"
+description = "Bootstrap revocation must purge stale wait_async packets and stale timer arms while keeping fresh post-revoke delegations live"
+[contracts.concurrency]
+mode = "not_applicable"
+reason = "ring3/QEMU contract over revocation epoch transitions; not modeled by the host-side concurrent harness"
+
+[[contracts]]
 id = "must.smp.ipi_ack_fixed_vector"
 level = "must"
 description = "BSP must be able to deliver a fixed-vector IPI to an AP (ack observed)"

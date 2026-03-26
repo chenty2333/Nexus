@@ -112,7 +112,6 @@ pub fn create_process(
                 process_object_id,
                 KernelObject::Process(ProcessObject {
                     process_id: created.process_id(),
-                    koid: created.koid(),
                 }),
             )?;
             Ok(())
@@ -202,10 +201,10 @@ pub fn create_job(
             Some(_) => Err(ZX_ERR_WRONG_TYPE),
             None => Err(ZX_ERR_BAD_HANDLE),
         })?;
-        let (job_id, koid) = state.with_kernel_mut(|kernel| kernel.create_job(parent.job_id))?;
+        let (job_id, _koid) = state.with_kernel_mut(|kernel| kernel.create_job(parent.job_id))?;
         let object_id = state.alloc_object_id();
         state.with_objects_mut(|objects| {
-            objects.insert(object_id, KernelObject::Job(JobObject { job_id, koid }))?;
+            objects.insert(object_id, KernelObject::Job(JobObject { job_id }))?;
             Ok(())
         })?;
         state.with_kernel_mut(|kernel| kernel.bind_job_object(job_id, object_id))?;

@@ -39,7 +39,6 @@ impl CurrentProcessInfo {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CreatedProcess {
     process_id: ProcessId,
-    koid: zx_koid_t,
     address_space_id: AddressSpaceId,
     root_vmar: Vmar,
 }
@@ -47,10 +46,6 @@ pub(crate) struct CreatedProcess {
 impl CreatedProcess {
     pub(crate) const fn process_id(self) -> ProcessId {
         self.process_id
-    }
-
-    pub(crate) const fn koid(self) -> zx_koid_t {
-        self.koid
     }
 
     pub(crate) const fn address_space_id(self) -> AddressSpaceId {
@@ -80,7 +75,6 @@ impl PreparedProcessStart {
 
 #[derive(Debug)]
 pub(super) struct Process {
-    pub(super) koid: zx_koid_t,
     pub(super) address_space_id: AddressSpaceId,
     pub(super) job_id: JobId,
     pub(super) policy_rights_ceiling: HandleRights,
@@ -101,7 +95,6 @@ enum ProcessAddressSpaceCleanup {
 /// kind may exist under the job (including descendant processes).
 #[derive(Clone, Debug)]
 pub(crate) struct JobQuota {
-    pub(crate) max_handles: u32,
     pub(crate) max_ports: u32,
     pub(crate) max_timers: u32,
     pub(crate) max_vmos: u32,
@@ -115,7 +108,6 @@ pub(crate) struct JobQuota {
 impl JobQuota {
     pub(crate) fn root_default() -> Self {
         Self {
-            max_handles: 65536,
             max_ports: 65536,
             max_timers: 65536,
             max_vmos: 65536,
@@ -172,10 +164,8 @@ impl Process {
         address_space_id: AddressSpaceId,
         job_id: JobId,
         policy_rights_ceiling: HandleRights,
-        koid: zx_koid_t,
     ) -> Self {
         Self {
-            koid,
             address_space_id,
             job_id,
             policy_rights_ceiling,
@@ -190,10 +180,8 @@ impl Process {
         address_space_id: AddressSpaceId,
         job_id: JobId,
         policy_rights_ceiling: HandleRights,
-        koid: zx_koid_t,
     ) -> Self {
         Self {
-            koid,
             address_space_id,
             job_id,
             policy_rights_ceiling,
@@ -369,10 +357,6 @@ impl Kernel {
         self.root_job_id
     }
 
-    pub(crate) fn job_koid(&self, job_id: JobId) -> Result<zx_koid_t, zx_status_t> {
-        Ok(self.jobs.get(&job_id).ok_or(ZX_ERR_BAD_HANDLE)?.koid)
-    }
-
     pub(crate) fn bind_job_object(
         &mut self,
         job_id: JobId,
@@ -392,13 +376,6 @@ impl Kernel {
 
     pub(crate) fn process_job_id(&self, process_id: ProcessId) -> Result<JobId, zx_status_t> {
         Ok(self.process(process_id)?.job_id)
-    }
-
-    pub(crate) fn process_policy_rights_ceiling(
-        &self,
-        process_id: ProcessId,
-    ) -> Result<HandleRights, zx_status_t> {
-        Ok(self.process(process_id)?.policy_rights_ceiling)
     }
 
     pub(crate) fn check_job_quota(
@@ -492,7 +469,6 @@ impl Kernel {
             self.with_vm_mut(|vm| vm.create_process_address_space())?;
 
         let process_id = self.alloc_process_id();
-        let process_koid = self.alloc_koid();
         let policy = self
             .jobs
             .get(&job_id)
@@ -500,7 +476,7 @@ impl Kernel {
             .policy_rights_ceiling;
         self.processes.insert(
             process_id,
-            Process::created(address_space_id, job_id, policy, process_koid),
+            Process::created(address_space_id, job_id, policy),
         );
         self.jobs
             .get_mut(&job_id)
@@ -510,7 +486,6 @@ impl Kernel {
 
         Ok(CreatedProcess {
             process_id,
-            koid: process_koid,
             address_space_id,
             root_vmar,
         })
@@ -638,13 +613,8 @@ impl Kernel {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn current_thread_koid(&self) -> Result<zx_koid_t, zx_status_t> {
         Ok(self.current_thread()?.koid)
-    }
-
-    pub(crate) fn current_process_koid(&self) -> Result<zx_koid_t, zx_status_t> {
-        Ok(self.current_process()?.koid)
     }
 
     pub(crate) fn current_thread_info(&self) -> Result<CurrentThreadInfo, zx_status_t> {
@@ -671,6 +641,7 @@ impl Kernel {
         Ok(self.process(process_id)?.address_space_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_process(&mut self) -> Result<CreatedProcess, zx_status_t> {
         let current_process_id = self.current_thread()?.process_id;
         let job_id = self.process(current_process_id)?.job_id;
@@ -782,25 +753,6 @@ impl Kernel {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn start_thread(
-        &mut self,
-        thread_id: ThreadId,
-        entry: u64,
-        stack: u64,
-        arg0: u64,
-        arg1: u64,
-    ) -> Result<(), zx_status_t> {
-        self.start_thread_with_policy(
-            thread_id,
-            entry,
-            stack,
-            arg0,
-            arg1,
-            StartPlacementPolicy::PreserveAffinity,
-            true,
-        )
     }
 
     pub(crate) fn start_thread_explicit(

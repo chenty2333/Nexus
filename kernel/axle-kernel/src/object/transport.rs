@@ -262,6 +262,12 @@ pub(crate) fn allocate_channel_fragment(len: usize) -> Result<ChannelFragment, z
 
 /// Create a socket endpoint pair and return both handles.
 pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_status_t> {
+    let fixed_accounted_bytes = match options {
+        ZX_SOCKET_STREAM => SocketCore::fixed_accounted_bytes_for_stream(SOCKET_STREAM_CAPACITY),
+        ZX_SOCKET_DATAGRAM => SocketCore::fixed_accounted_bytes_for_datagram(),
+        _ => return Err(ZX_ERR_INVALID_ARGS),
+    };
+    let fixed_budget = AccountedBytesReservation::reserve_socket(fixed_accounted_bytes)?;
     let core = match options {
         ZX_SOCKET_STREAM => SocketCore::new_stream(SOCKET_STREAM_CAPACITY)?,
         ZX_SOCKET_DATAGRAM => SocketCore::new_datagram(
@@ -346,6 +352,8 @@ pub fn create_socket(options: u32) -> Result<(zx_handle_t, zx_handle_t), zx_stat
 
         if result.is_err() {
             state.quota_decrement(job_id, ObjectKindTag::Socket);
+        } else {
+            fixed_budget.commit();
         }
         result
     })
@@ -550,6 +558,7 @@ fn channel_endpoint_address_space_id(
 
 pub(super) fn transport_signals(
     state: &KernelState,
+    registry: &ObjectRegistry,
     object: &KernelObject,
 ) -> Option<Result<Signals, zx_status_t>> {
     match object {
@@ -560,7 +569,7 @@ pub(super) fn transport_signals(
                 .ok_or(ZX_ERR_BAD_STATE)?;
             Ok(core.signals_for(endpoint.side))
         })),
-        KernelObject::Channel(endpoint) => Some(state.with_registry(|registry| {
+        KernelObject::Channel(endpoint) => Some((|| {
             let mut signals = Signals::NONE;
             if endpoint.is_readable() {
                 signals = signals | Signals::CHANNEL_READABLE;
@@ -577,22 +586,9 @@ pub(super) fn transport_signals(
                 }
             }
             Ok(signals)
-        })),
+        })()),
         _ => None,
     }
-}
-
-pub(crate) fn try_loan_current_user_pages(
-    ptr: u64,
-    len: usize,
-) -> Result<Option<crate::task::LoanedUserPages>, zx_status_t> {
-    let address_space_id = with_core(|kernel| {
-        let process = kernel.current_process_info()?;
-        kernel.process_address_space_id(process.process_id())
-    })?;
-    with_state_mut(|state| {
-        state.with_vm_mut(|vm| vm.try_loan_user_pages(address_space_id, ptr, len))
-    })
 }
 
 pub(crate) fn try_remap_loaned_channel_read(
@@ -652,6 +648,23 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
                 None => Err(ZX_ERR_BAD_HANDLE),
             })?;
 
+        let datagram_budget = state.with_transport(|transport| {
+            let core = transport
+                .socket_cores
+                .get(&endpoint.core_id)
+                .ok_or(ZX_ERR_BAD_STATE)?;
+            Ok(match core.mode() {
+                SocketMode::Stream => None,
+                SocketMode::Datagram => {
+                    Some(DatagramMessage::accounted_bytes_for_copied_len(bytes.len()))
+                }
+            })
+        })?;
+        let budget = match datagram_budget {
+            Some(bytes) => Some(AccountedBytesReservation::reserve_socket(bytes)?),
+            None => None,
+        };
+
         let write_result = state.with_transport_mut(|transport| {
             let core = transport
                 .socket_cores
@@ -694,6 +707,9 @@ pub fn socket_write(handle: zx_handle_t, options: u32, bytes: &[u8]) -> Result<u
             }
             Err((e, _, _, _)) => return Err(e),
         };
+        if let Some(budget) = budget {
+            budget.commit();
+        }
         state.with_transport_mut(|transport| {
             match mode {
                 SocketMode::Stream => {
@@ -761,6 +777,7 @@ pub fn socket_write_payload(
         };
         let payload_len =
             usize::try_from(write_payload.actual_bytes()?).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let accounted_bytes = DatagramMessage::accounted_bytes_for(&write_payload)?;
         let preflight = state.with_transport(|transport| {
             let Some(core) = transport.socket_cores.get(&endpoint.core_id) else {
                 return Err(ZX_ERR_BAD_STATE);
@@ -802,6 +819,7 @@ pub fn socket_write_payload(
             return Err(status);
         }
 
+        let budget = AccountedBytesReservation::reserve_socket(accounted_bytes)?;
         let (written, buffered_after, messages_after) = state.with_transport_mut(|transport| {
             let core = transport
                 .socket_cores
@@ -810,6 +828,7 @@ pub fn socket_write_payload(
             let written = core.write_payload(endpoint.side, write_payload)?;
             Ok((written, core.buffered_bytes(), core.buffered_messages()))
         })?;
+        budget.commit();
 
         state.with_transport_mut(|transport| {
             transport.note_socket_datagram_write(written, buffered_after, messages_after);
@@ -863,6 +882,9 @@ pub fn socket_read(
             })?;
 
         if !peek {
+            if result.released_accounted_bytes != 0 {
+                release_global_socket_bytes(result.released_accounted_bytes);
+            }
             let copied_bytes = match &result.payload {
                 SocketReadPayload::Copied(bytes) => bytes.len(),
                 SocketReadPayload::Payload(_) => len.min(result.actual_bytes),
@@ -894,12 +916,14 @@ pub fn socket_read(
 }
 
 pub(super) fn release_socket_core(state: &KernelState, core: SocketCore) {
+    release_global_socket_bytes(core.fixed_accounted_bytes());
     let _ = state.with_transport_mut(|transport| {
         transport.note_socket_core_drop(&core);
         Ok(())
     });
-    for payload in core.into_queued_payloads() {
-        release_data_payload(state, payload);
+    for message in core.into_queued_messages() {
+        release_global_socket_bytes(message.accounted_bytes);
+        release_data_payload(state, message.payload);
     }
 }
 
@@ -1029,7 +1053,6 @@ pub fn channel_write(
                 }
             }
         }
-
         let peer_status = state.with_registry(|registry| {
             Ok(match registry.get(peer_object_id) {
                 Some(KernelObject::Channel(peer)) if peer.closed => Some(ZX_ERR_PEER_CLOSED),
@@ -1049,7 +1072,7 @@ pub fn channel_write(
         }
 
         let message = ChannelMsgDesc::new(payload.take().ok_or(ZX_ERR_BAD_STATE)?, transferred)?;
-        let budget = match ChannelMessageBudgetReservation::reserve(message.accounted_bytes()) {
+        let budget = match AccountedBytesReservation::reserve_channel(message.accounted_bytes()) {
             Ok(budget) => budget,
             Err(status) => {
                 release_unqueued_channel_message(state, message);
@@ -1090,7 +1113,6 @@ pub fn channel_write(
             // causing a handle leak.
             let _ = state.close_handle(raw);
         }
-
         let _ = publish_object_signals(state, object_id);
         let _ = publish_object_signals(state, peer_object_id);
         Ok(())

@@ -180,6 +180,8 @@ pub(crate) enum VmoFaultPolicy {
 pub struct Vmo {
     pub(crate) id: VmoId,
     pub(crate) global_id: GlobalVmoId,
+    pub(crate) shared_backing_id: Option<GlobalVmoId>,
+    pub(crate) fault_source_id: Option<GlobalVmoId>,
     pub(crate) kind: VmoKind,
     pub(crate) fault_policy: VmoFaultPolicy,
     pub(crate) size_bytes: u64,
@@ -197,6 +199,16 @@ impl Vmo {
         self.global_id
     }
 
+    /// Shared/global backing identity used for import de-duplication and shared semantics.
+    pub const fn shared_backing_id(&self) -> Option<GlobalVmoId> {
+        self.shared_backing_id
+    }
+
+    /// Global source consulted when faults must materialize bytes from shared backing.
+    pub const fn fault_source_id(&self) -> Option<GlobalVmoId> {
+        self.fault_source_id
+    }
+
     /// Backing kind.
     pub const fn kind(&self) -> VmoKind {
         self.kind
@@ -209,7 +221,12 @@ impl Vmo {
 
     /// Whether faults for missing pages in this VMO resolve through a shared/global backing.
     pub const fn is_global_backed(&self) -> bool {
-        matches!(self.fault_policy, VmoFaultPolicy::GlobalBacked)
+        self.fault_source_id.is_some()
+    }
+
+    /// Whether this VMO is one direct alias of shared/global backing.
+    pub const fn is_shared_backed(&self) -> bool {
+        self.shared_backing_id.is_some()
     }
 
     /// Return the bound frame for the given byte offset, if one is resident.

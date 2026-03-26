@@ -383,6 +383,7 @@ That host gate now explicitly covers:
     - `mmio_device_features`
     - `mmio_driver_features`
     - `mmio_status`
+      current bootstrap value is `15` (`ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK`)
     - `pci_vendor_id`
     - `queue_pairs`
     - `tx_notify_count`
@@ -411,8 +412,12 @@ That host gate now explicitly covers:
     - `ax_handle_duplicate_revocable()` produces one delegated handle
     - ordinary duplicate and channel transfer preserve that delegated revocation association
     - `ax_revocation_group_revoke()` invalidates the old delegated copies
+    - one queued `wait_async` signal packet created through the revoked epoch is purged before
+      userspace can consume it
+    - one timer armed through the revoked epoch is canceled before it can fire later
     - the original non-revocable source handle remains usable
     - one fresh delegated copy taken after revoke observes the new epoch and remains live
+    - `wait_async` and timer state created through that fresh epoch remain deliverable
 - Bootstrap governance coverage now also includes one narrow job-tree gate:
   - `kernel.job.bootstrap`
   - one public root job must now prove:

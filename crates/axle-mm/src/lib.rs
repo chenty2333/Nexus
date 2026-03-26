@@ -124,22 +124,90 @@ struct VmarRecord {
     random_state: u64,
 }
 
+type SlotId = usize;
+
+#[derive(Debug)]
+struct StableSlots<T> {
+    entries: Vec<Option<T>>,
+    free: Vec<SlotId>,
+}
+
+impl<T> StableSlots<T> {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, value: T) -> SlotId {
+        if let Some(slot) = self.free.pop() {
+            self.entries[slot] = Some(value);
+            slot
+        } else {
+            self.entries.push(Some(value));
+            self.entries.len() - 1
+        }
+    }
+
+    fn get(&self, slot: SlotId) -> Option<&T> {
+        self.entries.get(slot)?.as_ref()
+    }
+
+    fn get_mut(&mut self, slot: SlotId) -> Option<&mut T> {
+        self.entries.get_mut(slot)?.as_mut()
+    }
+
+    fn remove(&mut self, slot: SlotId) -> Option<T> {
+        let entry = self.entries.get_mut(slot)?;
+        let value = entry.take()?;
+        self.free.push(slot);
+        Some(value)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().filter_map(Option::as_ref)
+    }
+}
+
+fn slot_list_insert<K: Ord>(index: &mut BTreeMap<K, Vec<SlotId>>, key: K, slot: SlotId) {
+    index.entry(key).or_default().push(slot);
+}
+
+fn slot_list_remove<K: Ord>(index: &mut BTreeMap<K, Vec<SlotId>>, key: K, slot: SlotId) {
+    let mut should_remove = false;
+    if let Some(slots) = index.get_mut(&key) {
+        if let Some(position) = slots.iter().position(|candidate| *candidate == slot) {
+            slots.remove(position);
+        }
+        should_remove = slots.is_empty();
+    }
+    if should_remove {
+        let _ = index.remove(&key);
+    }
+}
+
 /// Metadata-only address space with one root VMAR.
 #[derive(Debug)]
 pub struct AddressSpace {
     id: AddressSpaceId,
     root: VmarRecord,
-    vmars: Vec<VmarRecord>,
-    vmars_by_id: BTreeMap<VmarId, usize>,
-    vmos: Vec<Vmo>,
-    vmos_by_id: BTreeMap<VmoId, usize>,
-    vmo_ids_by_global_id: BTreeMap<GlobalVmoId, VmoId>,
-    map_recs: Vec<MapRec>,
-    map_recs_by_id: BTreeMap<MapId, usize>,
+    vmars: StableSlots<VmarRecord>,
+    vmars_by_id: BTreeMap<VmarId, SlotId>,
+    vmar_slots_by_base: BTreeMap<u64, Vec<SlotId>>,
+    child_vmar_slots_by_parent_id: BTreeMap<VmarId, Vec<SlotId>>,
+    vmos: StableSlots<Vmo>,
+    vmos_by_id: BTreeMap<VmoId, SlotId>,
+    vmo_ids_by_identity_global_id: BTreeMap<GlobalVmoId, VmoId>,
+    shared_vmo_ids_by_backing_global_id: BTreeMap<GlobalVmoId, VmoId>,
+    map_recs: StableSlots<MapRec>,
+    map_recs_by_id: BTreeMap<MapId, SlotId>,
     pte_meta: PteMetaStore,
     rmap_index: RmapIndexStore,
-    vmas: Vec<Vma>,
-    vma_index_by_map_id: BTreeMap<MapId, usize>,
+    vmas: StableSlots<Vma>,
+    vma_slot_by_map_id: BTreeMap<MapId, SlotId>,
+    vma_slots_by_base: BTreeMap<u64, SlotId>,
+    vma_slots_by_vmar_id: BTreeMap<VmarId, Vec<SlotId>>,
     map_ids_by_vmo_id: BTreeMap<VmoId, Vec<MapId>>,
     va_magazines: BTreeMap<usize, VaMagazine>,
     next_vmar_id: u64,
@@ -186,17 +254,22 @@ impl AddressSpace {
                     },
                 ),
             },
-            vmars: Vec::new(),
+            vmars: StableSlots::new(),
             vmars_by_id: BTreeMap::new(),
-            vmos: Vec::new(),
+            vmar_slots_by_base: BTreeMap::new(),
+            child_vmar_slots_by_parent_id: BTreeMap::new(),
+            vmos: StableSlots::new(),
             vmos_by_id: BTreeMap::new(),
-            vmo_ids_by_global_id: BTreeMap::new(),
-            map_recs: Vec::new(),
+            vmo_ids_by_identity_global_id: BTreeMap::new(),
+            shared_vmo_ids_by_backing_global_id: BTreeMap::new(),
+            map_recs: StableSlots::new(),
             map_recs_by_id: BTreeMap::new(),
             pte_meta: PteMetaStore::new(root_base, root_len)?,
             rmap_index: RmapIndexStore::new(root_base, root_len)?,
-            vmas: Vec::new(),
-            vma_index_by_map_id: BTreeMap::new(),
+            vmas: StableSlots::new(),
+            vma_slot_by_map_id: BTreeMap::new(),
+            vma_slots_by_base: BTreeMap::new(),
+            vma_slots_by_vmar_id: BTreeMap::new(),
             map_ids_by_vmo_id: BTreeMap::new(),
             va_magazines: BTreeMap::new(),
             next_vmar_id: 2,
@@ -215,45 +288,190 @@ impl AddressSpace {
         self.root.vmar
     }
 
-    fn rebuild_vmar_index(&mut self) {
-        self.vmars_by_id.clear();
-        for (index, record) in self.vmars.iter().enumerate() {
-            self.vmars_by_id.insert(record.vmar.id, index);
+    fn vmar_records_in_base_order(&self) -> impl Iterator<Item = VmarRecord> + '_ {
+        self.vmar_slots_by_base
+            .values()
+            .flat_map(|slots| slots.iter().copied())
+            .filter_map(|slot| self.vmars.get(slot).copied())
+    }
+
+    fn vmas_in_base_order(&self) -> impl Iterator<Item = Vma> + '_ {
+        self.vma_slots_by_base
+            .values()
+            .filter_map(|slot| self.vmas.get(*slot).copied())
+    }
+
+    fn map_records_in_id_order(&self) -> impl Iterator<Item = MapRec> + '_ {
+        self.map_recs_by_id
+            .values()
+            .filter_map(|slot| self.map_recs.get(*slot).copied())
+    }
+
+    fn insert_vmar_record(&mut self, record: VmarRecord) {
+        let slot = self.vmars.insert(record);
+        self.vmars_by_id.insert(record.vmar.id, slot);
+        slot_list_insert(&mut self.vmar_slots_by_base, record.vmar.base, slot);
+        if let Some(parent_id) = record.parent_id {
+            self.insert_child_vmar_slot(parent_id, slot);
         }
     }
 
-    fn rebuild_vmo_indices(&mut self) {
-        self.vmos_by_id.clear();
-        self.vmo_ids_by_global_id.clear();
-        for (index, vmo) in self.vmos.iter().enumerate() {
-            self.vmos_by_id.insert(vmo.id(), index);
-            self.vmo_ids_by_global_id.insert(vmo.global_id(), vmo.id());
+    fn remove_vmar_record(&mut self, id: VmarId) -> Option<VmarRecord> {
+        let slot = self.vmars_by_id.remove(&id)?;
+        let record = self.vmars.remove(slot)?;
+        slot_list_remove(&mut self.vmar_slots_by_base, record.vmar.base, slot);
+        if let Some(parent_id) = record.parent_id {
+            slot_list_remove(&mut self.child_vmar_slots_by_parent_id, parent_id, slot);
+        }
+        Some(record)
+    }
+
+    fn insert_vmo(&mut self, vmo: Vmo) {
+        let vmo_id = vmo.id();
+        let global_id = vmo.global_id();
+        let shared_backing_id = vmo.shared_backing_id();
+        let slot = self.vmos.insert(vmo);
+        self.vmos_by_id.insert(vmo_id, slot);
+        self.vmo_ids_by_identity_global_id.insert(global_id, vmo_id);
+        if let Some(shared_backing_id) = shared_backing_id {
+            self.shared_vmo_ids_by_backing_global_id
+                .insert(shared_backing_id, vmo_id);
         }
     }
 
-    fn rebuild_map_indices(&mut self) {
-        self.map_recs_by_id.clear();
-        self.map_ids_by_vmo_id.clear();
-        for (index, map_rec) in self.map_recs.iter().enumerate() {
-            self.map_recs_by_id.insert(map_rec.id(), index);
-            self.map_ids_by_vmo_id
-                .entry(map_rec.vmo_id())
-                .or_default()
-                .push(map_rec.id());
+    fn remove_vmo(&mut self, vmo_id: VmoId) -> Option<Vmo> {
+        let slot = self.vmos_by_id.remove(&vmo_id)?;
+        let vmo = self.vmos.remove(slot)?;
+        self.vmo_ids_by_identity_global_id.remove(&vmo.global_id());
+        if let Some(shared_backing_id) = vmo.shared_backing_id() {
+            self.shared_vmo_ids_by_backing_global_id
+                .remove(&shared_backing_id);
         }
+        Some(vmo)
     }
 
-    fn rebuild_vma_index(&mut self) {
-        self.vma_index_by_map_id.clear();
-        for (index, vma) in self.vmas.iter().enumerate() {
-            self.vma_index_by_map_id.insert(vma.map_id, index);
+    fn insert_map_record(&mut self, map_rec: MapRec) {
+        let vmo_id = map_rec.vmo_id();
+        let base = map_rec.base();
+        let map_id = map_rec.id();
+        let insert_at = self
+            .map_ids_by_vmo_id
+            .get(&vmo_id)
+            .map(|map_ids| {
+                map_ids
+                    .iter()
+                    .position(|candidate| {
+                        self.map_record(*candidate)
+                            .is_some_and(|existing| existing.base() > base)
+                    })
+                    .unwrap_or(map_ids.len())
+            })
+            .unwrap_or(0);
+        let slot = self.map_recs.insert(map_rec);
+        self.map_recs_by_id.insert(map_id, slot);
+        self.map_ids_by_vmo_id
+            .entry(vmo_id)
+            .or_default()
+            .insert(insert_at, map_id);
+    }
+
+    fn remove_map_record(&mut self, map_id: MapId) -> Option<MapRec> {
+        let slot = self.map_recs_by_id.remove(&map_id)?;
+        let map_rec = self.map_recs.remove(slot)?;
+        if let Some(map_ids) = self.map_ids_by_vmo_id.get_mut(&map_rec.vmo_id()) {
+            if let Some(position) = map_ids.iter().position(|candidate| *candidate == map_id) {
+                map_ids.remove(position);
+            }
+            if map_ids.is_empty() {
+                self.map_ids_by_vmo_id.remove(&map_rec.vmo_id());
+            }
         }
+        Some(map_rec)
+    }
+
+    fn insert_vma(&mut self, vma: Vma) {
+        let slot = self.vmas.insert(vma);
+        self.vma_slot_by_map_id.insert(vma.map_id, slot);
+        self.vma_slots_by_base.insert(vma.base, slot);
+        self.insert_vma_slot(vma.vmar_id, slot);
+    }
+
+    fn remove_vma_by_map_id(&mut self, map_id: MapId) -> Option<Vma> {
+        let slot = self.vma_slot_by_map_id.remove(&map_id)?;
+        let vma = self.vmas.remove(slot)?;
+        self.vma_slots_by_base.remove(&vma.base);
+        slot_list_remove(&mut self.vma_slots_by_vmar_id, vma.vmar_id, slot);
+        Some(vma)
+    }
+
+    fn insert_child_vmar_slot(&mut self, parent_id: VmarId, slot: SlotId) {
+        let Some(base) = self.vmars.get(slot).map(|record| record.vmar.base()) else {
+            return;
+        };
+        let slots = self
+            .child_vmar_slots_by_parent_id
+            .entry(parent_id)
+            .or_default();
+        let insert_at = slots
+            .iter()
+            .position(|candidate| {
+                self.vmars
+                    .get(*candidate)
+                    .is_some_and(|record| record.vmar.base() > base)
+            })
+            .unwrap_or(slots.len());
+        slots.insert(insert_at, slot);
+    }
+
+    fn insert_vma_slot(&mut self, vmar_id: VmarId, slot: SlotId) {
+        let Some(base) = self.vmas.get(slot).map(|vma| vma.base()) else {
+            return;
+        };
+        let slots = self.vma_slots_by_vmar_id.entry(vmar_id).or_default();
+        let insert_at = slots
+            .iter()
+            .position(|candidate| {
+                self.vmas
+                    .get(*candidate)
+                    .is_some_and(|vma| vma.base() > base)
+            })
+            .unwrap_or(slots.len());
+        slots.insert(insert_at, slot);
+    }
+
+    fn find_vma_slot_covering_range(&self, vmar_id: VmarId, base: u64, len: u64) -> Option<SlotId> {
+        self.vma_slots_by_base
+            .range(..=base)
+            .next_back()
+            .and_then(|(_, slot)| self.vmas.get(*slot).map(|vma| (*slot, *vma)))
+            .and_then(|(slot, vma)| {
+                (vma.vmar_id == vmar_id && vma.contains_range(base, len)).then_some(slot)
+            })
+    }
+
+    fn vma_overlaps_range(&self, base: u64, len: u64) -> bool {
+        let Some(end) = base.checked_add(len) else {
+            return true;
+        };
+        if self
+            .vma_slots_by_base
+            .range(..=base)
+            .next_back()
+            .and_then(|(_, slot)| self.vmas.get(*slot))
+            .is_some_and(|vma| ranges_overlap(vma.base(), vma.len(), base, len))
+        {
+            return true;
+        }
+        self.vma_slots_by_base
+            .range(base..)
+            .filter_map(|(_, slot)| self.vmas.get(*slot))
+            .take_while(|vma| vma.base() < end)
+            .any(|vma| ranges_overlap(vma.base(), vma.len(), base, len))
     }
 
     /// Direct child VMAR reservations currently carved out of the root range.
     pub fn child_vmars(&self) -> Vec<Vmar> {
-        self.vmars
-            .iter()
+        self.vmar_records_in_base_order()
             .filter(|record| record.parent_id == Some(self.root.vmar.id))
             .map(|record| record.vmar)
             .collect()
@@ -266,7 +484,7 @@ impl AddressSpace {
         }
         self.vmars_by_id
             .get(&id)
-            .and_then(|&index| self.vmars.get(index))
+            .and_then(|slot| self.vmars.get(*slot))
             .map(|record| record.vmar)
     }
 
@@ -276,7 +494,7 @@ impl AddressSpace {
         }
         self.vmars_by_id
             .get(&id)
-            .and_then(|&index| self.vmars.get(index))
+            .and_then(|slot| self.vmars.get(*slot))
             .copied()
     }
 
@@ -284,8 +502,8 @@ impl AddressSpace {
         if self.root.vmar.id == id {
             return Some(&mut self.root);
         }
-        let index = *self.vmars_by_id.get(&id)?;
-        self.vmars.get_mut(index)
+        let slot = *self.vmars_by_id.get(&id)?;
+        self.vmars.get_mut(slot)
     }
 
     /// Allocate one child VMAR out of the root address space using a CPU-local VA magazine.
@@ -409,34 +627,29 @@ impl AddressSpace {
             return Err(AddressSpaceError::InvalidVmar);
         }
         let subtree = self.collect_vmar_subtree_ids(id);
-        let mut removed_ranges = self
-            .vmas
+        let mut removed_vmas = Vec::new();
+        self.append_destroy_unmaps_in_vmar_subtree(id, &mut removed_vmas);
+        let removed_ranges = removed_vmas
             .iter()
-            .filter(|vma| subtree.contains(&vma.vmar_id))
-            .map(|vma| (vma.base(), vma.len()))
-            .collect::<Vec<_>>();
-        removed_ranges.sort_by_key(|&(base, _)| base);
-        let removed_vmas = self
-            .vmas
-            .iter()
-            .filter(|vma| subtree.contains(&vma.vmar_id))
-            .map(|vma| (vma.vmar_id, vma.base(), vma.len()))
-            .collect::<Vec<_>>();
+            .map(|&(_, base, len)| (base, len))
+            .collect();
         for (vmar_id, base, len) in removed_vmas {
             self.unmap_in_vmar(frames, vmar_id, base, len)?;
         }
-        self.vmars
-            .retain(|record| !subtree.contains(&record.vmar.id));
-        self.rebuild_vmar_index();
+        for vmar_id in subtree {
+            let _ = self.remove_vmar_record(vmar_id);
+        }
         Ok(removed_ranges)
     }
 
-    /// Allocate a new VMO record.
-    pub fn create_vmo(
+    fn insert_new_vmo(
         &mut self,
         kind: VmoKind,
         size_bytes: u64,
         global_id: GlobalVmoId,
+        shared_backing_id: Option<GlobalVmoId>,
+        fault_source_id: Option<GlobalVmoId>,
+        fault_policy: VmoFaultPolicy,
     ) -> Result<VmoId, AddressSpaceError> {
         if size_bytes == 0 || !is_page_aligned(size_bytes) {
             return Err(AddressSpaceError::InvalidArgs);
@@ -444,23 +657,72 @@ impl AddressSpace {
 
         let id = VmoId::new(self.next_vmo_id);
         self.next_vmo_id = self.next_vmo_id.wrapping_add(1);
-        self.vmos.push(Vmo {
+        self.insert_vmo(Vmo {
             id,
             global_id,
+            shared_backing_id,
+            fault_source_id,
             kind,
-            fault_policy: vmo_fault_policy_for_create(kind),
+            fault_policy,
             size_bytes,
             frames: alloc::vec![None; usize::try_from(size_bytes / PAGE_SIZE).unwrap_or(0)],
         });
-        self.rebuild_vmo_indices();
         Ok(id)
+    }
+
+    /// Allocate a new local VMO record with one unique global identity.
+    pub fn create_vmo(
+        &mut self,
+        kind: VmoKind,
+        size_bytes: u64,
+        global_id: GlobalVmoId,
+    ) -> Result<VmoId, AddressSpaceError> {
+        let fault_policy = vmo_fault_policy_for_create(kind);
+        let fault_source_id = match fault_policy {
+            VmoFaultPolicy::GlobalBacked => Some(global_id),
+            VmoFaultPolicy::LocalAnonymous | VmoFaultPolicy::NonDemandPaged => None,
+        };
+        self.insert_new_vmo(
+            kind,
+            size_bytes,
+            global_id,
+            None,
+            fault_source_id,
+            fault_policy,
+        )
+    }
+
+    /// Allocate one local private clone VMO with its own identity and an optional lazy fault source.
+    pub fn create_private_clone_vmo(
+        &mut self,
+        kind: VmoKind,
+        size_bytes: u64,
+        clone_global_id: GlobalVmoId,
+        fault_source_id: Option<GlobalVmoId>,
+    ) -> Result<VmoId, AddressSpaceError> {
+        let fault_policy = match kind {
+            VmoKind::Anonymous => VmoFaultPolicy::LocalAnonymous,
+            VmoKind::Physical | VmoKind::Contiguous => VmoFaultPolicy::NonDemandPaged,
+            VmoKind::PagerBacked => VmoFaultPolicy::GlobalBacked,
+        };
+        if matches!(fault_policy, VmoFaultPolicy::GlobalBacked) && fault_source_id.is_none() {
+            return Err(AddressSpaceError::InvalidArgs);
+        }
+        self.insert_new_vmo(
+            kind,
+            size_bytes,
+            clone_global_id,
+            None,
+            fault_source_id,
+            fault_policy,
+        )
     }
 
     /// Return metadata for a tracked VMO.
     pub fn vmo(&self, id: VmoId) -> Option<&Vmo> {
         self.vmos_by_id
             .get(&id)
-            .and_then(|&index| self.vmos.get(index))
+            .and_then(|slot| self.vmos.get(*slot))
     }
 
     /// Return metadata for one tracked VMO by kernel-global identity.
@@ -469,14 +731,21 @@ impl AddressSpace {
             .and_then(|vmo_id| self.vmo(vmo_id))
     }
 
-    /// Return the local VMO id for one kernel-global identity.
+    /// Return the local VMO id for one unique kernel-global VMO identity.
     pub fn vmo_id_by_global_id(&self, global_id: GlobalVmoId) -> Option<VmoId> {
-        self.vmo_ids_by_global_id.get(&global_id).copied()
+        self.vmo_ids_by_identity_global_id.get(&global_id).copied()
+    }
+
+    /// Return the direct shared-alias VMO id for one shared/global backing identity.
+    pub fn shared_vmo_id_by_backing_global_id(&self, global_id: GlobalVmoId) -> Option<VmoId> {
+        self.shared_vmo_ids_by_backing_global_id
+            .get(&global_id)
+            .copied()
     }
 
     fn vmo_mut(&mut self, id: VmoId) -> Option<&mut Vmo> {
-        let index = *self.vmos_by_id.get(&id)?;
-        self.vmos.get_mut(index)
+        let slot = *self.vmos_by_id.get(&id)?;
+        self.vmos.get_mut(slot)
     }
 
     /// Validate whether one tracked VMO can be resized to `new_size_bytes`.
@@ -549,12 +818,7 @@ impl AddressSpace {
         {
             return Ok(false);
         }
-        let index = *self
-            .vmos_by_id
-            .get(&vmo_id)
-            .ok_or(AddressSpaceError::InvalidVmo)?;
-        self.vmos.remove(index);
-        self.rebuild_vmo_indices();
+        let _ = self.remove_vmo(vmo_id);
         Ok(true)
     }
 
@@ -565,7 +829,7 @@ impl AddressSpace {
         size_bytes: u64,
         global_id: GlobalVmoId,
     ) -> Result<VmoId, AddressSpaceError> {
-        if let Some(existing_id) = self.vmo_id_by_global_id(global_id) {
+        if let Some(existing_id) = self.shared_vmo_id_by_backing_global_id(global_id) {
             let existing = self
                 .vmo_mut(existing_id)
                 .ok_or(AddressSpaceError::InvalidVmo)?;
@@ -586,18 +850,19 @@ impl AddressSpace {
             return Err(AddressSpaceError::InvalidArgs);
         }
 
-        let id = VmoId::new(self.next_vmo_id);
-        self.next_vmo_id = self.next_vmo_id.wrapping_add(1);
-        self.vmos.push(Vmo {
-            id,
-            global_id,
+        let fault_policy = vmo_fault_policy_for_import(kind);
+        let fault_source_id = match fault_policy {
+            VmoFaultPolicy::GlobalBacked => Some(global_id),
+            VmoFaultPolicy::LocalAnonymous | VmoFaultPolicy::NonDemandPaged => None,
+        };
+        self.insert_new_vmo(
             kind,
-            fault_policy: vmo_fault_policy_for_import(kind),
             size_bytes,
-            frames: alloc::vec![None; usize::try_from(size_bytes / PAGE_SIZE).unwrap_or(0)],
-        });
-        self.rebuild_vmo_indices();
-        Ok(id)
+            global_id,
+            Some(global_id),
+            fault_source_id,
+            fault_policy,
+        )
     }
 
     fn refresh_all_vmo_page_metadata(&mut self, vmo_id: VmoId) -> Result<(), AddressSpaceError> {
@@ -612,16 +877,16 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Return the current coarse mapping records in insertion order.
-    pub fn map_records(&self) -> &[MapRec] {
-        &self.map_recs
+    /// Return the current coarse mapping records in stable map-id order.
+    pub fn map_records(&self) -> Vec<MapRec> {
+        self.map_records_in_id_order().collect()
     }
 
     /// Return the coarse mapping record for one mapping id.
     pub fn map_record(&self, id: MapId) -> Option<MapRec> {
         self.map_recs_by_id
             .get(&id)
-            .and_then(|&index| self.map_recs.get(index))
+            .and_then(|slot| self.map_recs.get(*slot))
             .copied()
     }
 
@@ -715,11 +980,7 @@ impl AddressSpace {
         if !is_page_aligned(offset) {
             return Err(AddressSpaceError::InvalidArgs);
         }
-        let vmo = self
-            .vmos
-            .iter_mut()
-            .find(|candidate| candidate.id == vmo_id)
-            .ok_or(AddressSpaceError::InvalidVmo)?;
+        let vmo = self.vmo_mut(vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
         if offset >= vmo.size_bytes {
             return Err(AddressSpaceError::OutOfRange);
         }
@@ -774,7 +1035,7 @@ impl AddressSpace {
 
         let mut page_targets = Vec::new();
         let mut installed = Vec::new();
-        for vma in self.vmas.iter().copied() {
+        for vma in self.vmas_in_base_order() {
             let Some(map_rec) = self.map_record(vma.map_id) else {
                 continue;
             };
@@ -833,16 +1094,20 @@ impl AddressSpace {
     }
 
     /// Return the current VMA list in ascending virtual-address order.
-    pub fn vmas(&self) -> &[Vma] {
-        &self.vmas
+    pub fn vmas(&self) -> Vec<Vma> {
+        self.vmas_in_base_order().collect()
     }
 
     /// Return every mapped range currently backed by the given kernel-global VMO identity.
     pub fn mapped_ranges_for_global_vmo(&self, global_id: GlobalVmoId) -> Vec<(u64, u64)> {
-        self.map_recs
-            .iter()
-            .copied()
-            .filter(|map_rec| map_rec.global_vmo_id() == global_id)
+        let Some(vmo_id) = self.shared_vmo_id_by_backing_global_id(global_id) else {
+            return Vec::new();
+        };
+        self.map_ids_by_vmo_id
+            .get(&vmo_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|map_id| self.map_record(*map_id))
             .map(|map_rec| (map_rec.base(), map_rec.len()))
             .collect()
     }
@@ -852,15 +1117,8 @@ impl AddressSpace {
         if self.vmar_record(vmar_id).is_none() {
             return Vec::new();
         }
-        let subtree = self.collect_vmar_subtree_ids(vmar_id);
-        let mut ranges = self
-            .map_recs
-            .iter()
-            .copied()
-            .filter(|map_rec| subtree.contains(&map_rec.vmar_id()))
-            .map(|map_rec| (map_rec.base(), map_rec.len()))
-            .collect::<Vec<_>>();
-        ranges.sort_by_key(|&(base, _)| base);
+        let mut ranges = Vec::new();
+        self.append_mapped_ranges_in_vmar_subtree(vmar_id, &mut ranges);
         ranges
     }
 
@@ -953,11 +1211,7 @@ impl AddressSpace {
         if vmo_end > vmo.size_bytes() {
             return Err(AddressSpaceError::OutOfRange);
         }
-        if self
-            .vmas
-            .iter()
-            .any(|existing| overlaps(*existing, base, len))
-        {
+        if self.vma_overlaps_range(base, len) {
             return Err(AddressSpaceError::Overlap);
         }
         if self.mapping_intersects_foreign_vmar(vmar_id, base, len) {
@@ -1046,11 +1300,8 @@ impl AddressSpace {
             }
             return Err(err);
         }
-        self.map_recs.push(map_rec);
-        self.vmas.push(vma);
-        self.vmas.sort_by_key(|vma| vma.base);
-        self.rebuild_map_indices();
-        self.rebuild_vma_index();
+        self.insert_map_record(map_rec);
+        self.insert_vma(vma);
         self.observe_mapping_placement(vmar_id, base, len);
         Ok(())
     }
@@ -1199,22 +1450,15 @@ impl AddressSpace {
         len: u64,
     ) -> Result<(), AddressSpaceError> {
         validate_mapping_range(base, len)?;
-        let index = self
-            .vmas
-            .iter()
-            .position(|vma| vma.vmar_id == vmar_id && vma.base == base && vma.len == len)
-            .or_else(|| {
-                self.vmas
-                    .iter()
-                    .position(|vma| vma.vmar_id == vmar_id && vma.contains_range(base, len))
-            })
+        let vma_slot = self
+            .find_vma_slot_covering_range(vmar_id, base, len)
             .ok_or(AddressSpaceError::NotFound)?;
-        let vma = self.vmas[index];
+        let vma = *self.vmas.get(vma_slot).ok_or(AddressSpaceError::NotFound)?;
         let map_rec = self
             .map_record(vma.map_id)
             .ok_or(AddressSpaceError::NotFound)?;
         if map_rec.base() != base || map_rec.len() != len {
-            return self.unmap_subrange_in_single_vma(frames, index, map_rec, vma, base, len);
+            return self.unmap_subrange_in_single_vma(frames, vma_slot, map_rec, vma, base, len);
         }
         let vmo = self
             .vmo(map_rec.vmo_id())
@@ -1242,12 +1486,10 @@ impl AddressSpace {
                 .unmap_frame(frame_id, node_id)
                 .map_err(AddressSpaceError::FrameTable)?;
         }
-        let removed = self.vmas.remove(index);
-        if let Some(map_index) = self.map_recs_by_id.get(&removed.map_id).copied() {
-            self.map_recs.remove(map_index);
-        }
-        self.rebuild_map_indices();
-        self.rebuild_vma_index();
+        let removed = self
+            .remove_vma_by_map_id(vma.map_id)
+            .ok_or(AddressSpaceError::NotFound)?;
+        let _ = self.remove_map_record(removed.map_id);
         self.pte_meta.clear_range(removed.base, removed.len)?;
         self.rmap_index.clear_range(removed.base, removed.len)?;
         Ok(())
@@ -1273,17 +1515,10 @@ impl AddressSpace {
         new_perms: MappingPerms,
     ) -> Result<(), AddressSpaceError> {
         validate_mapping_range(base, len)?;
-        let index = self
-            .vmas
-            .iter()
-            .position(|vma| vma.vmar_id == vmar_id && vma.base == base && vma.len == len)
-            .or_else(|| {
-                self.vmas
-                    .iter()
-                    .position(|vma| vma.vmar_id == vmar_id && vma.contains_range(base, len))
-            })
+        let vma_slot = self
+            .find_vma_slot_covering_range(vmar_id, base, len)
             .ok_or(AddressSpaceError::NotFound)?;
-        let vma = self.vmas[index];
+        let vma = *self.vmas.get(vma_slot).ok_or(AddressSpaceError::NotFound)?;
         let map_rec = self
             .map_record(vma.map_id)
             .ok_or(AddressSpaceError::NotFound)?;
@@ -1291,13 +1526,13 @@ impl AddressSpace {
             return Err(AddressSpaceError::PermissionIncrease);
         }
         if map_rec.base() != base || map_rec.len() != len {
-            return self
-                .protect_subrange_in_single_vma(frames, index, map_rec, vma, base, len, new_perms);
+            return self.protect_subrange_in_single_vma(
+                frames, vma_slot, map_rec, vma, base, len, new_perms,
+            );
         }
         let vma = self
             .vmas
-            .iter_mut()
-            .find(|vma| vma.map_id == map_rec.id())
+            .get_mut(vma_slot)
             .ok_or(AddressSpaceError::NotFound)?;
         vma.perms = new_perms;
         let logical_write = new_perms.contains(MappingPerms::WRITE);
@@ -1531,18 +1766,17 @@ impl AddressSpace {
 
     fn remove_mapping_metadata(
         &mut self,
-        vma_index: usize,
+        vma_slot: SlotId,
         map_rec: MapRec,
         vma: Vma,
     ) -> Result<(), AddressSpaceError> {
-        self.vmas.remove(vma_index);
-        let map_index = *self
-            .map_recs_by_id
-            .get(&map_rec.id())
+        let _ = self.vmas.get(vma_slot).ok_or(AddressSpaceError::NotFound)?;
+        let _ = self
+            .remove_vma_by_map_id(vma.map_id)
             .ok_or(AddressSpaceError::NotFound)?;
-        self.map_recs.remove(map_index);
-        self.rebuild_map_indices();
-        self.rebuild_vma_index();
+        let _ = self
+            .remove_map_record(map_rec.id())
+            .ok_or(AddressSpaceError::NotFound)?;
         self.pte_meta.clear_range(vma.base, vma.len)?;
         self.rmap_index.clear_range(vma.base, vma.len)?;
         Ok(())
@@ -1588,11 +1822,8 @@ impl AddressSpace {
         let page_meta = self.build_pte_meta_range(map_rec, vma)?;
         self.pte_meta.install_range(base, &page_meta)?;
         self.rmap_index.install_range(base, &nodes)?;
-        self.map_recs.push(map_rec);
-        self.vmas.push(vma);
-        self.vmas.sort_by_key(|entry| entry.base);
-        self.rebuild_map_indices();
-        self.rebuild_vma_index();
+        self.insert_map_record(map_rec);
+        self.insert_vma(vma);
         Ok(())
     }
 
@@ -1845,11 +2076,9 @@ impl AddressSpace {
         }
 
         let index = self
-            .vmas
-            .iter()
-            .position(|vma| vma.base == base && vma.len == len)
+            .find_vma_slot_covering_range(self.root.vmar.id, base, len)
             .ok_or(AddressSpaceError::NotFound)?;
-        let vma = self.vmas[index];
+        let vma = *self.vmas.get(index).ok_or(AddressSpaceError::NotFound)?;
         let map_rec = self
             .map_record(vma.map_id)
             .ok_or(AddressSpaceError::NotFound)?;
@@ -1994,25 +2223,32 @@ impl AddressSpace {
         }
         let end = base + len;
         let mut cursor = base;
+        let mut slot = self
+            .vma_slots_by_base
+            .range(..=base)
+            .next_back()
+            .map(|(_, slot)| *slot);
         while cursor < end {
-            let Some(vma) = self
-                .vmas
-                .iter()
-                .copied()
-                .find(|candidate| candidate.contains(cursor))
-            else {
+            let Some(current_slot) = slot else {
                 return false;
             };
+            let Some(vma) = self.vmas.get(current_slot).copied() else {
+                return false;
+            };
+            if !vma.contains(cursor) {
+                return false;
+            }
             cursor = core::cmp::min(vma.end(), end);
+            slot = self
+                .vma_slots_by_base
+                .range((
+                    core::ops::Bound::Excluded(vma.base),
+                    core::ops::Bound::Unbounded,
+                ))
+                .next()
+                .map(|(_, slot)| *slot);
         }
         true
-    }
-
-    fn root_contains(&self, base: u64, len: u64) -> bool {
-        let Some(end) = base.checked_add(len) else {
-            return false;
-        };
-        base >= self.root.vmar.base && end <= self.root.vmar.base + self.root.vmar.len
     }
 
     fn alloc_vmar_id(&mut self) -> VmarId {
@@ -2044,7 +2280,9 @@ impl AddressSpace {
             map_id: resolved.map_rec.id(),
             vmar_id: resolved.map_rec.vmar_id(),
             vmo_id: resolved.map_rec.vmo_id(),
-            global_vmo_id: resolved.map_rec.global_vmo_id(),
+            global_vmo_id: vmo.global_id(),
+            shared_backing_global_vmo_id: vmo.shared_backing_id(),
+            fault_global_vmo_id: vmo.fault_source_id(),
             vmo_kind: vmo.kind(),
             vmo_offset: resolved_offset,
             frame_id: vmo.frame_at_offset(resolved_offset),
@@ -2070,7 +2308,7 @@ impl AddressSpace {
         if meta.page_delta() != page_delta {
             return None;
         }
-        let vma_index = *self.vma_index_by_map_id.get(&meta.map_id())?;
+        let vma_index = *self.vma_slot_by_map_id.get(&meta.map_id())?;
         let vma = *self.vmas.get(vma_index)?;
         if vma.vmar_id != map_rec.vmar_id()
             || vma.base != map_rec.base()
@@ -2112,7 +2350,7 @@ impl AddressSpace {
         frame_id: FrameId,
         excluded_map_id: Option<MapId>,
     ) -> Option<ReverseMapAnchor> {
-        for vma in &self.vmas {
+        for vma in self.vmas.iter() {
             if excluded_map_id == Some(vma.map_id) {
                 continue;
             }
@@ -2154,7 +2392,7 @@ impl AddressSpace {
             let Some(map_rec) = self.map_record(map_id) else {
                 continue;
             };
-            let Some(&vma_index) = self.vma_index_by_map_id.get(&map_id) else {
+            let Some(&vma_index) = self.vma_slot_by_map_id.get(&map_id) else {
                 continue;
             };
             let Some(vma) = self.vmas.get(vma_index).copied() else {
@@ -2412,15 +2650,13 @@ impl AddressSpace {
             base,
             len,
         };
-        self.vmars.push(VmarRecord {
+        self.insert_vmar_record(VmarRecord {
             vmar,
             parent_id: Some(parent_id),
             alloc_cursor: base,
             placement_policy,
             random_state: initial_vmar_random_state(self.id, vmar),
         });
-        self.vmars.sort_by_key(|record| record.vmar.base);
-        self.rebuild_vmar_index();
         if parent_id == self.root.vmar.id
             && let Some(magazine) = self.va_magazines.get_mut(&cpu_id)
         {
@@ -2441,64 +2677,65 @@ impl AddressSpace {
         Ok(vmar)
     }
 
-    fn occupied_root_ranges(&self) -> Vec<(u64, u64)> {
-        let mut ranges = Vec::with_capacity(self.vmas.len() + self.vmars.len());
-        ranges.extend(self.vmas.iter().map(|vma| (vma.base(), vma.end())));
-        ranges.extend(
-            self.vmars
-                .iter()
-                .map(|record| (record.vmar.base(), record.vmar.end())),
-        );
-        ranges.sort_by_key(|&(base, _)| base);
-
-        let mut merged = Vec::with_capacity(ranges.len());
-        for (base, end) in ranges {
-            if let Some((_, merged_end)) = merged.last_mut()
-                && base <= *merged_end
-            {
-                *merged_end = core::cmp::max(*merged_end, end);
-                continue;
-            }
-            merged.push((base, end));
-        }
-        merged
-    }
-
     fn occupied_ranges_for_vmar(&self, vmar_id: VmarId) -> Vec<(u64, u64)> {
-        if vmar_id == self.root.vmar.id {
-            return self.occupied_root_ranges();
-        }
-        let Some(vmar) = self.vmar(vmar_id) else {
+        if self.vmar(vmar_id).is_none() {
             return Vec::new();
-        };
-        let mut ranges = self
-            .vmas
-            .iter()
-            .filter(|vma| vma.vmar_id == vmar_id)
-            .map(|vma| (vma.base(), vma.end()))
-            .collect::<Vec<_>>();
-        ranges.extend(
-            self.vmars
-                .iter()
-                .filter(|record| {
-                    record.vmar.id != vmar_id
-                        && vmar.contains_range(record.vmar.base(), record.vmar.len())
-                })
-                .map(|record| (record.vmar.base(), record.vmar.end())),
-        );
-        ranges.sort_by_key(|&(base, _)| base);
+        }
+        let vma_slots = self
+            .vma_slots_by_vmar_id
+            .get(&vmar_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let child_slots = self
+            .child_vmar_slots_by_parent_id
+            .get(&vmar_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        let mut ranges = Vec::with_capacity(vma_slots.len() + child_slots.len());
+        let mut vma_index = 0usize;
+        let mut child_index = 0usize;
+        while vma_index < vma_slots.len() || child_index < child_slots.len() {
+            let next_vma = vma_slots
+                .get(vma_index)
+                .and_then(|slot| self.vmas.get(*slot))
+                .map(|vma| (vma.base(), vma.end()));
+            let next_child = child_slots
+                .get(child_index)
+                .and_then(|slot| self.vmars.get(*slot))
+                .map(|record| (record.vmar.base(), record.vmar.end()));
+            let next = match (next_vma, next_child) {
+                (Some(vma), Some(child)) if vma.0 <= child.0 => {
+                    vma_index += 1;
+                    vma
+                }
+                (Some(_), Some(child)) => {
+                    child_index += 1;
+                    child
+                }
+                (Some(vma), None) => {
+                    vma_index += 1;
+                    vma
+                }
+                (None, Some(child)) => {
+                    child_index += 1;
+                    child
+                }
+                (None, None) => break,
+            };
+            if let Some((_, merged_end)) = ranges.last_mut()
+                && next.0 <= *merged_end
+            {
+                *merged_end = core::cmp::max(*merged_end, next.1);
+            } else {
+                ranges.push(next);
+            }
+        }
         ranges
     }
 
     fn root_range_is_free(&self, base: u64, len: u64) -> bool {
-        self.root_contains(base, len)
-            && !self
-                .occupied_root_ranges()
-                .into_iter()
-                .any(|(occupied_base, occupied_end)| {
-                    let occupied_len = occupied_end - occupied_base;
-                    ranges_overlap(occupied_base, occupied_len, base, len)
-                })
+        self.range_is_free_in_vmar(self.root.vmar.id, base, len)
     }
 
     fn find_free_gap_in_vmar_window(
@@ -2577,19 +2814,111 @@ impl AddressSpace {
         let mut cursor = 0;
         while cursor < ids.len() {
             let parent_id = ids[cursor];
-            for child in self
-                .vmars
-                .iter()
-                .filter(|record| record.parent_id == Some(parent_id))
-                .map(|record| record.vmar.id)
-            {
-                if !ids.contains(&child) {
-                    ids.push(child);
+            if let Some(slots) = self.child_vmar_slots_by_parent_id.get(&parent_id) {
+                for &slot in slots {
+                    let Some(record) = self.vmars.get(slot) else {
+                        continue;
+                    };
+                    ids.push(record.vmar.id);
                 }
             }
             cursor += 1;
         }
         ids
+    }
+
+    fn append_mapped_ranges_in_vmar_subtree(&self, vmar_id: VmarId, out: &mut Vec<(u64, u64)>) {
+        let vma_slots = self
+            .vma_slots_by_vmar_id
+            .get(&vmar_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let child_slots = self
+            .child_vmar_slots_by_parent_id
+            .get(&vmar_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        let mut vma_index = 0usize;
+        let mut child_index = 0usize;
+        while vma_index < vma_slots.len() || child_index < child_slots.len() {
+            let next_vma = vma_slots
+                .get(vma_index)
+                .and_then(|slot| self.vmas.get(*slot))
+                .map(|vma| (vma.base(), vma.len()));
+            let next_child = child_slots
+                .get(child_index)
+                .and_then(|slot| self.vmars.get(*slot))
+                .map(|record| (record.vmar.base(), record.vmar.id()));
+            match (next_vma, next_child) {
+                (Some(vma), Some(child)) if vma.0 <= child.0 => {
+                    vma_index += 1;
+                    out.push(vma);
+                }
+                (Some(_), Some((_, child_id))) => {
+                    child_index += 1;
+                    self.append_mapped_ranges_in_vmar_subtree(child_id, out);
+                }
+                (Some(vma), None) => {
+                    vma_index += 1;
+                    out.push(vma);
+                }
+                (None, Some((_, child_id))) => {
+                    child_index += 1;
+                    self.append_mapped_ranges_in_vmar_subtree(child_id, out);
+                }
+                (None, None) => break,
+            }
+        }
+    }
+
+    fn append_destroy_unmaps_in_vmar_subtree(
+        &self,
+        vmar_id: VmarId,
+        out: &mut Vec<(VmarId, u64, u64)>,
+    ) {
+        let vma_slots = self
+            .vma_slots_by_vmar_id
+            .get(&vmar_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let child_slots = self
+            .child_vmar_slots_by_parent_id
+            .get(&vmar_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        let mut vma_index = 0usize;
+        let mut child_index = 0usize;
+        while vma_index < vma_slots.len() || child_index < child_slots.len() {
+            let next_vma = vma_slots
+                .get(vma_index)
+                .and_then(|slot| self.vmas.get(*slot))
+                .map(|vma| (vma.base(), vma.vmar_id, vma.len()));
+            let next_child = child_slots
+                .get(child_index)
+                .and_then(|slot| self.vmars.get(*slot))
+                .map(|record| (record.vmar.base(), record.vmar.id()));
+            match (next_vma, next_child) {
+                (Some((base, owner_vmar_id, len)), Some((child_base, _))) if base <= child_base => {
+                    vma_index += 1;
+                    out.push((owner_vmar_id, base, len));
+                }
+                (Some(_), Some((_, child_id))) => {
+                    child_index += 1;
+                    self.append_destroy_unmaps_in_vmar_subtree(child_id, out);
+                }
+                (Some((base, owner_vmar_id, len)), None) => {
+                    vma_index += 1;
+                    out.push((owner_vmar_id, base, len));
+                }
+                (None, Some((_, child_id))) => {
+                    child_index += 1;
+                    self.append_destroy_unmaps_in_vmar_subtree(child_id, out);
+                }
+                (None, None) => break,
+            }
+        }
     }
 
     fn rebind_vmo_frame(
@@ -2601,11 +2930,7 @@ impl AddressSpace {
         if !is_page_aligned(offset) {
             return Err(AddressSpaceError::InvalidArgs);
         }
-        let vmo = self
-            .vmos
-            .iter_mut()
-            .find(|candidate| candidate.id == vmo_id)
-            .ok_or(AddressSpaceError::InvalidVmo)?;
+        let vmo = self.vmo_mut(vmo_id).ok_or(AddressSpaceError::InvalidVmo)?;
         if offset >= vmo.size_bytes {
             return Err(AddressSpaceError::OutOfRange);
         }
@@ -2658,11 +2983,6 @@ fn align_down(value: u64, align: u64) -> u64 {
 fn align_up(value: u64, align: u64) -> Option<u64> {
     let mask = align.checked_sub(1)?;
     value.checked_add(mask).map(|aligned| aligned & !mask)
-}
-
-fn overlaps(vma: Vma, base: u64, len: u64) -> bool {
-    let end = base + len;
-    base < vma.end() && end > vma.base
 }
 
 fn ranges_overlap(left_base: u64, left_len: u64, right_base: u64, right_len: u64) -> bool {
@@ -3096,6 +3416,122 @@ mod tests {
             .unwrap();
 
         assert_eq!(nested.base(), compact_child.base());
+    }
+
+    #[test]
+    fn mapped_ranges_for_global_vmo_stay_base_ordered_after_head_unmap() {
+        let mut frames = FrameTable::new();
+        let frame = frames.register_existing(0x60_000).unwrap();
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let vmo = space
+            .import_vmo(VmoKind::Anonymous, PAGE_SIZE, global_vmo_id(40))
+            .unwrap();
+        space.bind_vmo_frame(vmo, 0, frame).unwrap();
+
+        for page_offset in [0, 2, 4] {
+            let base = ROOT_BASE + page_offset * PAGE_SIZE;
+            space
+                .map_fixed(
+                    &mut frames,
+                    base,
+                    PAGE_SIZE,
+                    vmo,
+                    0,
+                    MappingPerms::READ | MappingPerms::USER,
+                    MappingPerms::READ | MappingPerms::USER,
+                )
+                .unwrap();
+        }
+
+        space.unmap(&mut frames, ROOT_BASE, PAGE_SIZE).unwrap();
+
+        assert_eq!(
+            space.mapped_ranges_for_global_vmo(global_vmo_id(40)),
+            vec![
+                (ROOT_BASE + 2 * PAGE_SIZE, PAGE_SIZE),
+                (ROOT_BASE + 4 * PAGE_SIZE, PAGE_SIZE),
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_subvmar_allocate_keeps_child_ranges_ordered_after_head_destroy() {
+        let mut frames = FrameTable::new();
+        let frame0 = frames.register_existing(0x61_000).unwrap();
+        let frame1 = frames.register_existing(0x62_000).unwrap();
+        let mut space = AddressSpace::new(ROOT_BASE, 0x20_0000).unwrap();
+        let root = space.root_vmar().id();
+        let root_vmo = space
+            .create_vmo(VmoKind::Anonymous, 2 * PAGE_SIZE, global_vmo_id(41))
+            .unwrap();
+        space.bind_vmo_frame(root_vmo, 0, frame0).unwrap();
+        space.bind_vmo_frame(root_vmo, PAGE_SIZE, frame1).unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                2 * PAGE_SIZE,
+                root_vmo,
+                0,
+                MappingPerms::READ | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::USER,
+            )
+            .unwrap();
+
+        let child_a = space
+            .allocate_subvmar(
+                0,
+                root,
+                2 * PAGE_SIZE,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Compact,
+            )
+            .unwrap();
+        let _child_b = space
+            .allocate_subvmar(
+                0,
+                root,
+                4 * PAGE_SIZE,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Compact,
+            )
+            .unwrap();
+        let _child_c = space
+            .allocate_subvmar(
+                0,
+                root,
+                6 * PAGE_SIZE,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Specific,
+                false,
+                VmarPlacementPolicy::Compact,
+            )
+            .unwrap();
+
+        let removed = space.destroy_vmar(&mut frames, child_a.id()).unwrap();
+        assert!(removed.is_empty());
+
+        let compact = space
+            .allocate_subvmar(
+                0,
+                root,
+                0,
+                3 * PAGE_SIZE,
+                PAGE_SIZE,
+                VmarAllocMode::Compact,
+                false,
+                VmarPlacementPolicy::Compact,
+            )
+            .unwrap();
+
+        assert_eq!(compact.base(), ROOT_BASE + 7 * PAGE_SIZE);
     }
 
     #[test]
@@ -3720,6 +4156,44 @@ mod tests {
         assert_eq!(
             space.vmo(pager).unwrap().missing_page_tag(),
             PteMetaTag::LazyVmo
+        );
+    }
+
+    #[test]
+    fn private_pager_clone_keeps_distinct_identity_from_shared_source() {
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let source_global = global_vmo_id(133);
+        let clone_global = global_vmo_id(134);
+        let imported = space
+            .import_vmo(VmoKind::PagerBacked, PAGE_SIZE, source_global)
+            .unwrap();
+        let private = space
+            .create_private_clone_vmo(
+                VmoKind::PagerBacked,
+                PAGE_SIZE,
+                clone_global,
+                Some(source_global),
+            )
+            .unwrap();
+
+        assert_eq!(
+            space.shared_vmo_id_by_backing_global_id(source_global),
+            Some(imported)
+        );
+        assert_eq!(space.vmo_id_by_global_id(source_global), Some(imported));
+        assert_eq!(space.vmo_id_by_global_id(clone_global), Some(private));
+        assert_eq!(
+            space.vmo(imported).unwrap().shared_backing_id(),
+            Some(source_global)
+        );
+        assert_eq!(
+            space.vmo(imported).unwrap().fault_source_id(),
+            Some(source_global)
+        );
+        assert_eq!(space.vmo(private).unwrap().shared_backing_id(), None);
+        assert_eq!(
+            space.vmo(private).unwrap().fault_source_id(),
+            Some(source_global)
         );
     }
 
@@ -5033,6 +5507,52 @@ mod tests {
             FutexKey::Shared {
                 global_vmo_id: global_vmo_id(202),
                 offset: 0x24,
+            }
+        );
+    }
+
+    #[test]
+    fn private_pager_clone_faults_from_shared_source_but_keeps_private_futex_identity() {
+        let mut frames = FrameTable::new();
+        let mut space = AddressSpace::new(ROOT_BASE, ROOT_LEN).unwrap();
+        let source_global = global_vmo_id(203);
+        let clone_global = global_vmo_id(204);
+        let imported = space
+            .import_vmo(VmoKind::PagerBacked, PAGE_SIZE, source_global)
+            .unwrap();
+        let frame = frames.register_existing(0x1000_3000).unwrap();
+        space.set_vmo_frame(imported, 0, frame).unwrap();
+        let private = space
+            .create_private_clone_vmo(
+                VmoKind::PagerBacked,
+                PAGE_SIZE,
+                clone_global,
+                Some(source_global),
+            )
+            .unwrap();
+        space
+            .map_fixed(
+                &mut frames,
+                ROOT_BASE,
+                PAGE_SIZE,
+                private,
+                0,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+                MappingPerms::READ | MappingPerms::WRITE | MappingPerms::USER,
+            )
+            .unwrap();
+
+        let lookup = space.lookup(ROOT_BASE + 0x28).unwrap();
+        assert_eq!(lookup.global_vmo_id(), clone_global);
+        assert_eq!(lookup.shared_backing_global_vmo_id(), None);
+        assert_eq!(lookup.fault_global_vmo_id(), Some(source_global));
+        assert!(lookup.is_global_backed());
+        assert_eq!(
+            FutexKey::from_lookup(99, ROOT_BASE + 0x28, lookup),
+            FutexKey::PrivateAnonymous {
+                process_id: 99,
+                page_base: ROOT_BASE,
+                byte_offset: 0x28,
             }
         );
     }

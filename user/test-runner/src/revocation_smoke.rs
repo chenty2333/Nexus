@@ -6,19 +6,26 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use axle_arch_x86_64::debug_break;
 use axle_types::handle::ZX_HANDLE_INVALID;
 use axle_types::rights::ZX_RIGHT_SAME_RIGHTS;
-use axle_types::signals::ZX_USER_SIGNAL_0;
-use axle_types::status::{ZX_ERR_BAD_HANDLE, ZX_OK};
-use axle_types::{zx_handle_t, zx_revocation_group_info_t, zx_signals_t};
+use axle_types::signals::{ZX_TIMER_SIGNALED, ZX_USER_SIGNAL_0};
+use axle_types::status::{ZX_ERR_BAD_HANDLE, ZX_ERR_SHOULD_WAIT, ZX_ERR_TIMED_OUT, ZX_OK};
+use axle_types::{zx_handle_t, zx_packet_signal_t, zx_port_packet_t, zx_revocation_group_info_t};
 use libzircon::{
     ax_console_write, ax_handle_duplicate_revocable, ax_revocation_group_create,
     ax_revocation_group_get_info, ax_revocation_group_revoke, zx_channel_create, zx_channel_read,
     zx_channel_write, zx_eventpair_create, zx_handle_close, zx_handle_duplicate,
-    zx_object_signal_peer, zx_object_wait_one,
+    zx_object_signal_peer, zx_object_wait_async, zx_object_wait_one, zx_port_create, zx_port_wait,
+    zx_timer_create_monotonic, zx_timer_set,
 };
 
 const USER_SHARED_BASE: u64 = 0x0000_0001_0100_0000;
 const SLOT_OK: usize = 0;
+const SLOT_T0_NS: usize = 511;
 const HEAP_BYTES: usize = 8 * 1024;
+const WAIT_TIMEOUT_NS: u64 = 3_000_000_000;
+const STALE_TIMER_OFFSET_NS: u64 = 1_500_000_000;
+const FRESH_TIMER_OFFSET_NS: u64 = 2_500_000_000;
+const STALE_PACKET_KEY: u64 = 0xfeed_face;
+const FRESH_PACKET_KEY: u64 = 0xfeed_beef;
 
 const STEP_PANIC: u64 = u64::MAX;
 const STEP_EVENTPAIR_CREATE: u64 = 1;
@@ -29,15 +36,29 @@ const STEP_DUP_INHERITED: u64 = 5;
 const STEP_CHANNEL_CREATE: u64 = 6;
 const STEP_CHANNEL_WRITE: u64 = 7;
 const STEP_CHANNEL_READ: u64 = 8;
-const STEP_REVOKE: u64 = 9;
-const STEP_INFO_AFTER: u64 = 10;
-const STEP_BASE_SIGNAL: u64 = 11;
-const STEP_BASE_WAIT: u64 = 12;
-const STEP_INHERITED_WAIT: u64 = 13;
-const STEP_TRANSFERRED_WAIT: u64 = 14;
-const STEP_INHERITED_DUP: u64 = 15;
-const STEP_DUP_AFTER_REVOKE: u64 = 16;
-const STEP_DUP_AFTER_REVOKE_DUP: u64 = 17;
+const STEP_PORT_CREATE: u64 = 9;
+const STEP_PORT_ARM_BEFORE: u64 = 10;
+const STEP_BASE_SIGNAL_BEFORE_REVOKE: u64 = 11;
+const STEP_TIMER_CREATE: u64 = 12;
+const STEP_TIMER_DUP_BEFORE: u64 = 13;
+const STEP_TIMER_SET_BEFORE: u64 = 14;
+const STEP_REVOKE: u64 = 15;
+const STEP_INFO_AFTER: u64 = 16;
+const STEP_PORT_WAIT_PURGED: u64 = 17;
+const STEP_BASE_WAIT: u64 = 18;
+const STEP_INHERITED_WAIT: u64 = 19;
+const STEP_TRANSFERRED_WAIT: u64 = 20;
+const STEP_TIMER_WAIT_AFTER_REVOKE: u64 = 21;
+const STEP_INHERITED_DUP: u64 = 22;
+const STEP_BASE_CLEAR_AFTER_REVOKE: u64 = 23;
+const STEP_DUP_AFTER_REVOKE: u64 = 24;
+const STEP_PORT_ARM_AFTER: u64 = 25;
+const STEP_BASE_SIGNAL_AFTER_REVOKE: u64 = 26;
+const STEP_PORT_WAIT_FRESH: u64 = 27;
+const STEP_TIMER_DUP_AFTER: u64 = 28;
+const STEP_TIMER_SET_AFTER: u64 = 29;
+const STEP_TIMER_WAIT_FRESH: u64 = 30;
+const STEP_DUP_AFTER_REVOKE_DUP: u64 = 31;
 
 #[derive(Clone, Copy, Default)]
 struct RevocationSummary {
@@ -54,17 +75,36 @@ struct RevocationSummary {
     channel_write: i64,
     channel_read: i64,
     transferred_actual_handles: u32,
+    port_create: i64,
+    port_arm_before: i64,
+    base_signal_before_revoke: i64,
+    timer_create: i64,
+    timer_dup_before: i64,
+    timer_set_before: i64,
     revoke: i64,
     info_after: i64,
     group_epoch_after: u32,
     group_generation_after: u32,
-    base_signal: i64,
     base_wait: i64,
     base_wait_observed: u32,
+    port_wait_purged: i64,
     inherited_wait_bad_handle: i64,
     transferred_wait_bad_handle: i64,
+    timer_wait_after_revoke: i64,
+    timer_wait_after_revoke_observed: u32,
     inherited_dup_bad_handle: i64,
+    base_clear_after_revoke: i64,
     dup_after_revoke: i64,
+    port_arm_after: i64,
+    base_signal_after_revoke: i64,
+    port_wait_fresh: i64,
+    port_wait_fresh_key: u64,
+    port_wait_fresh_type: u32,
+    port_wait_fresh_observed: u32,
+    timer_dup_after: i64,
+    timer_set_after: i64,
+    timer_wait_fresh: i64,
+    timer_wait_fresh_observed: u32,
     dup_after_revoke_dup: i64,
 }
 
@@ -170,6 +210,9 @@ fn run_revocation_smoke() -> RevocationSummary {
     let mut summary = RevocationSummary::default();
     let mut base = ZX_HANDLE_INVALID;
     let mut peer = ZX_HANDLE_INVALID;
+    let mut port = ZX_HANDLE_INVALID;
+    let mut timer_base = ZX_HANDLE_INVALID;
+    let mut timer_before = ZX_HANDLE_INVALID;
     summary.eventpair_create = zx_eventpair_create(0, &mut base, &mut peer) as i64;
     if summary.eventpair_create != ZX_OK as i64 {
         summary.failure_step = STEP_EVENTPAIR_CREATE;
@@ -253,10 +296,91 @@ fn run_revocation_smoke() -> RevocationSummary {
         return summary;
     }
 
+    summary.port_create = zx_port_create(0, &mut port) as i64;
+    if summary.port_create != ZX_OK as i64 {
+        summary.failure_step = STEP_PORT_CREATE;
+        close_handles(&[base, peer, group, inherited, ch0, ch1, out_handle, port]);
+        return summary;
+    }
+
+    summary.port_arm_before =
+        zx_object_wait_async(inherited, port, STALE_PACKET_KEY, ZX_USER_SIGNAL_0, 0) as i64;
+    if summary.port_arm_before != ZX_OK as i64 {
+        summary.failure_step = STEP_PORT_ARM_BEFORE;
+        close_handles(&[base, peer, group, inherited, ch0, ch1, out_handle, port]);
+        return summary;
+    }
+
+    summary.base_signal_before_revoke = zx_object_signal_peer(peer, 0, ZX_USER_SIGNAL_0) as i64;
+    if summary.base_signal_before_revoke != ZX_OK as i64 {
+        summary.failure_step = STEP_BASE_SIGNAL_BEFORE_REVOKE;
+        close_handles(&[base, peer, group, inherited, ch0, ch1, out_handle, port]);
+        return summary;
+    }
+
+    summary.timer_create = zx_timer_create_monotonic(0, &mut timer_base) as i64;
+    if summary.timer_create != ZX_OK as i64 {
+        summary.failure_step = STEP_TIMER_CREATE;
+        close_handles(&[
+            base, peer, group, inherited, ch0, ch1, out_handle, port, timer_base,
+        ]);
+        return summary;
+    }
+
+    summary.timer_dup_before =
+        ax_handle_duplicate_revocable(timer_base, ZX_RIGHT_SAME_RIGHTS, group, &mut timer_before)
+            as i64;
+    if summary.timer_dup_before != ZX_OK as i64 {
+        summary.failure_step = STEP_TIMER_DUP_BEFORE;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+        ]);
+        return summary;
+    }
+
+    summary.timer_set_before =
+        zx_timer_set(timer_before, deadline_after_start(STALE_TIMER_OFFSET_NS), 0) as i64;
+    if summary.timer_set_before != ZX_OK as i64 {
+        summary.failure_step = STEP_TIMER_SET_BEFORE;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+        ]);
+        return summary;
+    }
+
     summary.revoke = ax_revocation_group_revoke(group) as i64;
     if summary.revoke != ZX_OK as i64 {
         summary.failure_step = STEP_REVOKE;
-        close_handles(&[base, peer, group, inherited, ch0, ch1, out_handle]);
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+        ]);
         return summary;
     }
 
@@ -264,24 +388,59 @@ fn run_revocation_smoke() -> RevocationSummary {
     summary.info_after = ax_revocation_group_get_info(group, &mut info) as i64;
     if summary.info_after != ZX_OK as i64 {
         summary.failure_step = STEP_INFO_AFTER;
-        close_handles(&[base, peer, group, inherited, ch0, ch1, out_handle]);
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+        ]);
         return summary;
     }
     summary.group_epoch_after = info.epoch;
     summary.group_generation_after = info.generation;
 
-    summary.base_signal = zx_object_signal_peer(peer, 0, ZX_USER_SIGNAL_0) as i64;
-    if summary.base_signal != ZX_OK as i64 {
-        summary.failure_step = STEP_BASE_SIGNAL;
-        close_handles(&[base, peer, group, inherited, ch0, ch1, out_handle]);
+    let mut revoked_packet = zx_port_packet_t::default();
+    summary.port_wait_purged = zx_port_wait(port, 0, &mut revoked_packet) as i64;
+    if summary.port_wait_purged != ZX_ERR_SHOULD_WAIT as i64 {
+        summary.failure_step = STEP_PORT_WAIT_PURGED;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+        ]);
         return summary;
     }
+
     let mut observed = 0u32;
     summary.base_wait = zx_object_wait_one(base, ZX_USER_SIGNAL_0, 0, &mut observed) as i64;
     summary.base_wait_observed = observed;
     if summary.base_wait != ZX_OK as i64 {
         summary.failure_step = STEP_BASE_WAIT;
-        close_handles(&[base, peer, group, inherited, ch0, ch1, out_handle]);
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+        ]);
         return summary;
     }
 
@@ -290,7 +449,18 @@ fn run_revocation_smoke() -> RevocationSummary {
         zx_object_wait_one(inherited, ZX_USER_SIGNAL_0, 0, &mut observed) as i64;
     if summary.inherited_wait_bad_handle != ZX_ERR_BAD_HANDLE as i64 {
         summary.failure_step = STEP_INHERITED_WAIT;
-        close_handles(&[base, peer, group, inherited, ch0, ch1, out_handle]);
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+        ]);
         return summary;
     }
 
@@ -299,7 +469,43 @@ fn run_revocation_smoke() -> RevocationSummary {
         zx_object_wait_one(out_handle, ZX_USER_SIGNAL_0, 0, &mut observed) as i64;
     if summary.transferred_wait_bad_handle != ZX_ERR_BAD_HANDLE as i64 {
         summary.failure_step = STEP_TRANSFERRED_WAIT;
-        close_handles(&[base, peer, group, inherited, ch0, ch1, out_handle]);
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+        ]);
+        return summary;
+    }
+
+    observed = 0;
+    summary.timer_wait_after_revoke = zx_object_wait_one(
+        timer_base,
+        ZX_TIMER_SIGNALED,
+        wait_deadline(),
+        &mut observed,
+    ) as i64;
+    summary.timer_wait_after_revoke_observed = observed;
+    if summary.timer_wait_after_revoke != ZX_ERR_TIMED_OUT as i64 {
+        summary.failure_step = STEP_TIMER_WAIT_AFTER_REVOKE;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+        ]);
         return summary;
     }
 
@@ -316,6 +522,28 @@ fn run_revocation_smoke() -> RevocationSummary {
             ch0,
             ch1,
             out_handle,
+            port,
+            timer_base,
+            timer_before,
+            inherit_dup,
+        ]);
+        return summary;
+    }
+
+    summary.base_clear_after_revoke = zx_object_signal_peer(peer, ZX_USER_SIGNAL_0, 0) as i64;
+    if summary.base_clear_after_revoke != ZX_OK as i64 {
+        summary.failure_step = STEP_BASE_CLEAR_AFTER_REVOKE;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
             inherit_dup,
         ]);
         return summary;
@@ -335,7 +563,150 @@ fn run_revocation_smoke() -> RevocationSummary {
             ch0,
             ch1,
             out_handle,
+            port,
+            timer_base,
+            timer_before,
+            inherit_dup,
             delegated_after,
+        ]);
+        return summary;
+    }
+
+    summary.port_arm_after =
+        zx_object_wait_async(delegated_after, port, FRESH_PACKET_KEY, ZX_USER_SIGNAL_0, 0) as i64;
+    if summary.port_arm_after != ZX_OK as i64 {
+        summary.failure_step = STEP_PORT_ARM_AFTER;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+            inherit_dup,
+            delegated_after,
+        ]);
+        return summary;
+    }
+
+    summary.base_signal_after_revoke = zx_object_signal_peer(peer, 0, ZX_USER_SIGNAL_0) as i64;
+    if summary.base_signal_after_revoke != ZX_OK as i64 {
+        summary.failure_step = STEP_BASE_SIGNAL_AFTER_REVOKE;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+            inherit_dup,
+            delegated_after,
+        ]);
+        return summary;
+    }
+
+    let mut fresh_packet = zx_port_packet_t::default();
+    summary.port_wait_fresh = zx_port_wait(port, 0, &mut fresh_packet) as i64;
+    if summary.port_wait_fresh != ZX_OK as i64 {
+        summary.failure_step = STEP_PORT_WAIT_FRESH;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+            inherit_dup,
+            delegated_after,
+        ]);
+        return summary;
+    }
+    summary.port_wait_fresh_key = fresh_packet.key;
+    summary.port_wait_fresh_type = fresh_packet.type_;
+    summary.port_wait_fresh_observed = zx_packet_signal_t::from_user(fresh_packet.user).observed;
+
+    let mut timer_after = ZX_HANDLE_INVALID;
+    summary.timer_dup_after =
+        ax_handle_duplicate_revocable(timer_base, ZX_RIGHT_SAME_RIGHTS, group, &mut timer_after)
+            as i64;
+    if summary.timer_dup_after != ZX_OK as i64 {
+        summary.failure_step = STEP_TIMER_DUP_AFTER;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+            inherit_dup,
+            delegated_after,
+            timer_after,
+        ]);
+        return summary;
+    }
+
+    summary.timer_set_after =
+        zx_timer_set(timer_after, deadline_after_start(FRESH_TIMER_OFFSET_NS), 0) as i64;
+    if summary.timer_set_after != ZX_OK as i64 {
+        summary.failure_step = STEP_TIMER_SET_AFTER;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+            inherit_dup,
+            delegated_after,
+            timer_after,
+        ]);
+        return summary;
+    }
+
+    observed = 0;
+    summary.timer_wait_fresh = zx_object_wait_one(
+        timer_base,
+        ZX_TIMER_SIGNALED,
+        wait_deadline(),
+        &mut observed,
+    ) as i64;
+    summary.timer_wait_fresh_observed = observed;
+    if summary.timer_wait_fresh != ZX_OK as i64 {
+        summary.failure_step = STEP_TIMER_WAIT_FRESH;
+        close_handles(&[
+            base,
+            peer,
+            group,
+            inherited,
+            ch0,
+            ch1,
+            out_handle,
+            port,
+            timer_base,
+            timer_before,
+            inherit_dup,
+            delegated_after,
+            timer_after,
         ]);
         return summary;
     }
@@ -358,10 +729,25 @@ fn run_revocation_smoke() -> RevocationSummary {
         ch0,
         ch1,
         out_handle,
+        port,
+        timer_base,
+        timer_before,
+        inherit_dup,
         delegated_after,
+        timer_after,
         delegated_after_dup,
     ]);
     summary
+}
+
+fn deadline_after_start(offset_ns: u64) -> i64 {
+    read_slot(SLOT_T0_NS)
+        .saturating_add(offset_ns)
+        .min(i64::MAX as u64) as i64
+}
+
+fn wait_deadline() -> i64 {
+    deadline_after_start(WAIT_TIMEOUT_NS)
 }
 
 fn close_handles(handles: &[zx_handle_t]) {
@@ -373,11 +759,11 @@ fn close_handles(handles: &[zx_handle_t]) {
 }
 
 fn emit_summary(summary: &RevocationSummary) {
-    let mut line = FixedBuf::<1024>::new();
+    let mut line = FixedBuf::<2048>::new();
     let _ = fmt::write(
         &mut line,
         format_args!(
-            "kernel: revocation smoke (rev_present=1, rev_failure_step={}, eventpair_create={}, group_create={}, info_before={}, group_epoch_before={}, group_generation_before={}, dup_revocable={}, dup_inherited={}, inherited_distinct={}, channel_create={}, channel_write={}, channel_read={}, transferred_actual_handles={}, revoke={}, info_after={}, group_epoch_after={}, group_generation_after={}, base_signal={}, base_wait={}, base_wait_observed={}, inherited_wait_bad_handle={}, transferred_wait_bad_handle={}, inherited_dup_bad_handle={}, dup_after_revoke={}, dup_after_revoke_dup={})\n",
+            "kernel: revocation smoke (rev_present=1, rev_failure_step={}, eventpair_create={}, group_create={}, info_before={}, group_epoch_before={}, group_generation_before={}, dup_revocable={}, dup_inherited={}, inherited_distinct={}, channel_create={}, channel_write={}, channel_read={}, transferred_actual_handles={}, port_create={}, port_arm_before={}, base_signal_before_revoke={}, timer_create={}, timer_dup_before={}, timer_set_before={}, revoke={}, info_after={}, group_epoch_after={}, group_generation_after={}, port_wait_purged={}, base_wait={}, base_wait_observed={}, inherited_wait_bad_handle={}, transferred_wait_bad_handle={}, timer_wait_after_revoke={}, timer_wait_after_revoke_observed={}, inherited_dup_bad_handle={}, base_clear_after_revoke={}, dup_after_revoke={}, port_arm_after={}, base_signal_after_revoke={}, port_wait_fresh={}, port_wait_fresh_key={}, port_wait_fresh_type={}, port_wait_fresh_observed={}, timer_dup_after={}, timer_set_after={}, timer_wait_fresh={}, timer_wait_fresh_observed={}, dup_after_revoke_dup={})\n",
             summary.failure_step,
             summary.eventpair_create,
             summary.group_create,
@@ -391,22 +777,47 @@ fn emit_summary(summary: &RevocationSummary) {
             summary.channel_write,
             summary.channel_read,
             summary.transferred_actual_handles,
+            summary.port_create,
+            summary.port_arm_before,
+            summary.base_signal_before_revoke,
+            summary.timer_create,
+            summary.timer_dup_before,
+            summary.timer_set_before,
             summary.revoke,
             summary.info_after,
             summary.group_epoch_after,
             summary.group_generation_after,
-            summary.base_signal,
+            summary.port_wait_purged,
             summary.base_wait,
             summary.base_wait_observed,
             summary.inherited_wait_bad_handle,
             summary.transferred_wait_bad_handle,
+            summary.timer_wait_after_revoke,
+            summary.timer_wait_after_revoke_observed,
             summary.inherited_dup_bad_handle,
+            summary.base_clear_after_revoke,
             summary.dup_after_revoke,
+            summary.port_arm_after,
+            summary.base_signal_after_revoke,
+            summary.port_wait_fresh,
+            summary.port_wait_fresh_key,
+            summary.port_wait_fresh_type,
+            summary.port_wait_fresh_observed,
+            summary.timer_dup_after,
+            summary.timer_set_after,
+            summary.timer_wait_fresh,
+            summary.timer_wait_fresh_observed,
             summary.dup_after_revoke_dup,
         ),
     );
     let mut actual = 0usize;
     let _ = ax_console_write(line.as_bytes(), &mut actual);
+}
+
+fn read_slot(slot: usize) -> u64 {
+    let ptr = (USER_SHARED_BASE as *const u64).wrapping_add(slot);
+    // SAFETY: the bootstrap runner ABI reserves the shared summary page range at USER_SHARED_BASE.
+    unsafe { ptr::read_volatile(ptr) }
 }
 
 fn write_slot(slot: usize, value: u64) {

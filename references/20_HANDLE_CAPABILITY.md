@@ -118,6 +118,15 @@ It is a current-state reference, not a roadmap.
     `ax_revocation_group_revoke()` removes the stale observer when that epoch is revoked
   - this keeps async packet delivery aligned with the same epoch validity rule used for ordinary
     handle lookup and transfer
+- Revocation provenance is now also carried by deferred control-plane state beyond `wait_async`:
+  - blocked `wait_one` / `port_wait` registrations
+  - armed timer state
+  - queued kernel-generated port packets
+- `ax_revocation_group_revoke()` now eagerly purges that deferred state when it still depends on a
+  revoked handle epoch.
+  The revocation boundary is intentionally precise:
+  - future control-plane effects that the kernel still owns are canceled
+  - already committed data-plane effects are not rolled back
 - There is now one narrow public job-governance layer above ordinary handles:
   - `ax_process_get_job()` returns the current owning job for one process handle
   - `ax_job_create()` creates a child job under a parent job handle
@@ -141,6 +150,9 @@ It is a current-state reference, not a roadmap.
 - Public revocation-group lifecycle is intentionally modest today:
   - closing the last group handle drops revoke authority
   - full group-slot reclamation / quota governance remains later work
+- Revocation is still not a transactional rollback facility:
+  - it cancels deferred authority
+  - it does not undo already-enqueued channel/socket payloads or other completed operations
 
 ## Current object-right examples
 

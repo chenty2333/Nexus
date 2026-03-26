@@ -13,10 +13,6 @@ const MAX_CPUS: usize = crate::arch::MAX_CPUS;
 const MAX_APIC_IDS: usize = crate::arch::MAX_APIC_IDS; // must match `ap_trampoline_params` in assembly
 const AP_STACK_SIZE: usize = 16 * 1024;
 
-pub const fn max_cpus() -> usize {
-    MAX_CPUS
-}
-
 #[repr(C)]
 struct ApTrampolineParams {
     cr3: u64,
@@ -26,7 +22,9 @@ struct ApTrampolineParams {
 
 #[repr(align(16))]
 #[derive(Clone, Copy)]
-struct AlignedApStack([u8; AP_STACK_SIZE]);
+struct AlignedApStack {
+    _bytes: [u8; AP_STACK_SIZE],
+}
 
 /// Wrapper for AP stack storage accessed through raw pointers only.
 /// BSP allocates stacks during single-core init; each AP uses its own stack exclusively.
@@ -36,7 +34,9 @@ struct SyncApStacks(core::cell::UnsafeCell<[AlignedApStack; MAX_CPUS]>);
 unsafe impl Sync for SyncApStacks {}
 
 static AP_STACKS: SyncApStacks = SyncApStacks(core::cell::UnsafeCell::new(
-    [AlignedApStack([0; AP_STACK_SIZE]); MAX_CPUS],
+    [AlignedApStack {
+        _bytes: [0; AP_STACK_SIZE],
+    }; MAX_CPUS],
 ));
 
 static AP_ONLINE: [AtomicBool; MAX_APIC_IDS] = [const { AtomicBool::new(false) }; MAX_APIC_IDS];
@@ -201,7 +201,6 @@ fn first_online_apic_id() -> Option<usize> {
         .find_map(|(apic_id, online)| online.load(Ordering::Acquire).then_some(apic_id))
 }
 
-#[allow(dead_code)]
 pub fn for_each_online_cpu(mut f: impl FnMut(usize)) {
     let bsp_id = crate::arch::apic::this_apic_id() as usize;
     for apic_id in 0..MAX_APIC_IDS {

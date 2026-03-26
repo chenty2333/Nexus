@@ -496,15 +496,6 @@ impl UserPageTables {
         self.user_pt_paddrs[0]
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn descriptors(&self) -> UserPageTableDescSet {
-        self.descriptor_set()
-    }
-
-    pub(crate) fn descriptor(&self, level: PtPageLevel, va_base: u64) -> Option<PtPageDesc> {
-        self.descs.lock().descriptor(level, va_base)
-    }
-
     pub(crate) fn max_invalidate_epoch(&self) -> u64 {
         self.descs.lock().max_invalidate_epoch()
     }
@@ -823,10 +814,6 @@ struct PageTableEntryAccessor(PageTableEntry);
 impl PageTableEntryAccessor {
     fn flags(&self) -> PageTableFlags {
         self.0.flags()
-    }
-
-    fn addr(&self) -> PhysAddr {
-        self.0.addr()
     }
 
     fn set_addr(&mut self, addr: PhysAddr, flags: PageTableFlags) {

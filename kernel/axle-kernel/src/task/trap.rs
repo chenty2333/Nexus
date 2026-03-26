@@ -247,16 +247,6 @@ unsafe extern "C" {
 }
 
 impl Kernel {
-    pub(crate) fn current_thread_guest_x64_regs(
-        &self,
-    ) -> Result<axle_types::ax_guest_x64_regs_t, zx_status_t> {
-        Ok(self
-            .current_thread()?
-            .context
-            .ok_or(ZX_ERR_BAD_STATE)?
-            .to_guest_x64_regs())
-    }
-
     pub(crate) fn capture_current_user_context(
         &mut self,
         trap: &crate::arch::int80::TrapFrame,

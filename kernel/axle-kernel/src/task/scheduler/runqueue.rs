@@ -16,13 +16,6 @@ impl Kernel {
         crate::trace::record_run_queue_depth(thread_id, cpu_id, depth, op);
     }
 
-    pub(crate) fn enqueue_runnable_thread(
-        &mut self,
-        thread_id: ThreadId,
-    ) -> Result<(), zx_status_t> {
-        self.enqueue_runnable_thread_on_cpu(thread_id, self.current_cpu_id())
-    }
-
     pub(crate) fn enqueue_runnable_thread_on_cpu(
         &mut self,
         thread_id: ThreadId,
@@ -52,13 +45,6 @@ impl Kernel {
             .push_back(thread_id);
         self.note_run_queue_depth(thread_id, cpu_id, RQ_DEPTH_ENQUEUE_BACK);
         Ok(())
-    }
-
-    pub(crate) fn enqueue_runnable_thread_front(
-        &mut self,
-        thread_id: ThreadId,
-    ) -> Result<(), zx_status_t> {
-        self.enqueue_runnable_thread_front_on_cpu(thread_id, self.current_cpu_id())
     }
 
     /// Enqueue a thread with handoff priority.

@@ -193,10 +193,6 @@ fn note_remap_fallback(bytes: usize) {
     TELEMETRY.lock().note_remap_fallback(bytes);
 }
 
-pub(crate) fn telemetry_snapshot() -> CopyTelemetrySnapshot {
-    TELEMETRY.lock().snapshot
-}
-
 fn probe_user_bytes(ptr: u64, len: usize) -> Result<(), zx_status_t> {
     if len == 0 {
         return Ok(());
@@ -589,17 +585,6 @@ pub(crate) fn write_channel_payload_to_user(
     Ok(())
 }
 
-pub(crate) fn copyout_loaned_bytes(
-    ptr: *mut u8,
-    loaned: &LoanedUserPages,
-) -> Result<(), zx_status_t> {
-    let span = UserCopyCtx::current()?.validate_write(
-        ptr as u64,
-        usize::try_from(loaned.len()).map_err(|_| ZX_ERR_OUT_OF_RANGE)?,
-    )?;
-    copyout_loaned_to_span(span, 0, loaned)
-}
-
 pub(crate) fn prepare_channel_write_payload(
     ptr: *const u8,
     len: usize,
@@ -698,37 +683,6 @@ pub(crate) fn write_socket_read_result_to_user(
         }
         SocketReadPayload::Payload(payload) => write_data_payload_to_user(dst_ptr, len, payload),
     }
-}
-
-pub(crate) fn socket_read_to_user(
-    handle: zx_handle_t,
-    options: u32,
-    buffer: *mut u8,
-    len: usize,
-) -> Result<usize, zx_status_t> {
-    let result = crate::object::transport::socket_read(handle, options, len)?;
-    write_socket_read_result_to_user(buffer, len, &result)?;
-    Ok(result.actual_bytes)
-}
-
-pub(crate) fn vmo_write_from_user(
-    handle: zx_handle_t,
-    offset: u64,
-    buffer: *const u8,
-    len: usize,
-) -> Result<(), zx_status_t> {
-    let bytes = copyin_bytes(buffer, len)?;
-    crate::object::vm::vmo_write(handle, offset, &bytes)
-}
-
-pub(crate) fn vmo_read_to_user(
-    handle: zx_handle_t,
-    offset: u64,
-    buffer: *mut u8,
-    len: usize,
-) -> Result<(), zx_status_t> {
-    let bytes = crate::object::vm::vmo_read(handle, offset, len)?;
-    copyout_bytes(buffer, &bytes)
 }
 
 pub(crate) fn read_bootstrap_frame_bytes(

@@ -144,6 +144,8 @@ Ownership is intentionally one-writer-per-substructure:
 - driver side now performs one first narrow virtio-style bring-up sequence before the first kick:
   - accept features
   - set `ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK`
+  - the resulting `mmio_status` value is `15`; older conformance expectations that used `27`
+    were stale
   - select each TX/RX queue in BAR0
   - program desc / avail / used DMA addresses for that selected queue
   - enable the selected queue

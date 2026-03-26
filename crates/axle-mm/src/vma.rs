@@ -81,6 +81,8 @@ pub struct VmaLookup {
     pub(crate) vmar_id: VmarId,
     pub(crate) vmo_id: VmoId,
     pub(crate) global_vmo_id: GlobalVmoId,
+    pub(crate) shared_backing_global_vmo_id: Option<GlobalVmoId>,
+    pub(crate) fault_global_vmo_id: Option<GlobalVmoId>,
     pub(crate) vmo_kind: VmoKind,
     pub(crate) vmo_offset: u64,
     pub(crate) frame_id: Option<FrameId>,
@@ -118,6 +120,16 @@ impl VmaLookup {
     /// Kernel-global VMO identity.
     pub const fn global_vmo_id(self) -> GlobalVmoId {
         self.global_vmo_id
+    }
+
+    /// Shared/global backing identity for direct shared aliases, if any.
+    pub const fn shared_backing_global_vmo_id(self) -> Option<GlobalVmoId> {
+        self.shared_backing_global_vmo_id
+    }
+
+    /// Global source consulted for lazy shared-backed faults, if any.
+    pub const fn fault_global_vmo_id(self) -> Option<GlobalVmoId> {
+        self.fault_global_vmo_id
     }
 
     /// Backing VMO kind.

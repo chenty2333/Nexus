@@ -15,8 +15,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use axle_core::{
-    Capability, ObjectKey, PortError, RevocationGroupToken, Signals, TimerError, TimerId,
-    TransferredCap,
+    Capability, ObjectKey, PortError, RevocationGroupToken, RevocationSet, Signals, TimerError,
+    TimerId, TransferredCap,
 };
 use axle_mm::{
     MappingCachePolicy, MappingClonePolicy, MappingPerms, VmarAllocMode, VmarId,
@@ -71,24 +71,17 @@ const CHANNEL_CAPACITY: usize = 64;
 /// descriptor-sized fixed overhead. Loaned user pages are charged separately by
 /// VM loan quota tracking and are intentionally excluded from this budget.
 static GLOBAL_CHANNEL_ACCOUNTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_SOCKET_ACCOUNTED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// System-wide ceiling for queue-owned channel memory.
 const GLOBAL_CHANNEL_ACCOUNTED_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
+const GLOBAL_SOCKET_ACCOUNTED_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
 
 static KERNEL_LOCK_OWNER_LOCATION: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_LOCK_OWNER_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
 static KERNEL_LOCK_OWNER_MUTABLE: AtomicBool = AtomicBool::new(false);
 static KERNEL_LOCK_OWNER_ACQUIRED_AT_NS: AtomicI64 = AtomicI64::new(0);
 static KERNEL_LOCK_HELD: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Copy)]
-struct KernelLockOwnerSnapshot {
-    location: &'static Location<'static>,
-    cpu_id: usize,
-    mutable: bool,
-    currently_held: bool,
-    held_for_ns: i64,
-}
 
 fn record_kernel_lock_owner(caller: &'static Location<'static>, mutable: bool) {
     KERNEL_LOCK_OWNER_CPU.store(
@@ -112,58 +105,62 @@ fn clear_kernel_lock_owner() {
     KERNEL_LOCK_OWNER_ACQUIRED_AT_NS.store(0, Ordering::Release);
 }
 
-fn kernel_lock_owner_snapshot() -> Option<KernelLockOwnerSnapshot> {
-    let ptr = KERNEL_LOCK_OWNER_LOCATION.load(Ordering::Acquire);
-    if ptr == 0 {
-        return None;
-    }
-    // SAFETY: the pointer is written only from `Location::caller()`, which
-    // yields a `'static` location. We clear it by writing zero, never by
-    // freeing the backing storage, so dereferencing the non-zero pointer is
-    // valid for this best-effort diagnostic snapshot.
-    let location = unsafe { &*(ptr as *const Location<'static>) };
-    let acquired_at_ns = KERNEL_LOCK_OWNER_ACQUIRED_AT_NS.load(Ordering::Acquire);
-    Some(KernelLockOwnerSnapshot {
-        location,
-        cpu_id: KERNEL_LOCK_OWNER_CPU.load(Ordering::Acquire),
-        mutable: KERNEL_LOCK_OWNER_MUTABLE.load(Ordering::Acquire),
-        currently_held: KERNEL_LOCK_HELD.load(Ordering::Acquire),
-        held_for_ns: crate::time::now_ns().saturating_sub(acquired_at_ns),
-    })
-}
-
-pub(crate) fn try_reserve_global_channel_bytes(bytes: u64) -> Result<(), zx_status_t> {
+fn try_reserve_accounted_bytes(
+    counter: &AtomicU64,
+    limit: u64,
+    bytes: u64,
+) -> Result<(), zx_status_t> {
     if bytes == 0 {
         return Ok(());
     }
-    let mut current = GLOBAL_CHANNEL_ACCOUNTED_BYTES.load(Ordering::Relaxed);
+    let mut current = counter.load(Ordering::Relaxed);
     loop {
         let Some(next) = current.checked_add(bytes) else {
             return Err(ZX_ERR_NO_MEMORY);
         };
-        if next > GLOBAL_CHANNEL_ACCOUNTED_BYTE_LIMIT {
+        if next > limit {
             return Err(ZX_ERR_NO_MEMORY);
         }
-        match GLOBAL_CHANNEL_ACCOUNTED_BYTES.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
             Ok(_) => return Ok(()),
             Err(observed) => current = observed,
         }
     }
 }
 
-pub(crate) fn release_global_channel_bytes(bytes: u64) {
+pub(crate) fn try_reserve_global_channel_bytes(bytes: u64) -> Result<(), zx_status_t> {
+    try_reserve_accounted_bytes(
+        &GLOBAL_CHANNEL_ACCOUNTED_BYTES,
+        GLOBAL_CHANNEL_ACCOUNTED_BYTE_LIMIT,
+        bytes,
+    )
+}
+
+pub(crate) fn try_reserve_global_socket_bytes(bytes: u64) -> Result<(), zx_status_t> {
+    try_reserve_accounted_bytes(
+        &GLOBAL_SOCKET_ACCOUNTED_BYTES,
+        GLOBAL_SOCKET_ACCOUNTED_BYTE_LIMIT,
+        bytes,
+    )
+}
+
+fn release_accounted_bytes(counter: &AtomicU64, bytes: u64) {
     if bytes != 0 {
-        GLOBAL_CHANNEL_ACCOUNTED_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+        counter.fetch_sub(bytes, Ordering::AcqRel);
     }
+}
+
+pub(crate) fn release_global_channel_bytes(bytes: u64) {
+    release_accounted_bytes(&GLOBAL_CHANNEL_ACCOUNTED_BYTES, bytes);
+}
+
+pub(crate) fn release_global_socket_bytes(bytes: u64) {
+    release_accounted_bytes(&GLOBAL_SOCKET_ACCOUNTED_BYTES, bytes);
 }
 const SOCKET_STREAM_CAPACITY: usize = 4096;
 const SOCKET_DATAGRAM_CAPACITY_BYTES: usize = 4096;
 const SOCKET_DATAGRAM_CAPACITY_MESSAGES: usize = 64;
+const SOCKET_STREAM_DIRECTIONS: u64 = 2;
 const BOOTSTRAP_REACTOR_CPU_COUNT: usize = 16;
 
 pub(crate) enum TrapBlock<T> {
@@ -171,47 +168,10 @@ pub(crate) enum TrapBlock<T> {
     BlockCurrent,
 }
 
-/// Kernel object kinds needed in current phase.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ObjectKind {
-    /// Job object.
-    Job,
-    /// Process object.
-    Process,
-    /// Suspend token object.
-    SuspendToken,
-    /// Socket endpoint object.
-    Socket,
-    /// Channel endpoint object.
-    Channel,
-    /// EventPair endpoint object.
-    EventPair,
-    /// Port object.
-    Port,
-    /// Timer object.
-    Timer,
-    /// Interrupt object.
-    Interrupt,
-    /// DMA region object.
-    DmaRegion,
-    /// PCI/device resource object.
-    PciDevice,
-    /// Revocation-group object.
-    RevocationGroup,
-    /// Supervised guest-session object.
-    GuestSession,
-    /// VMO object.
-    Vmo,
-    /// VMAR object.
-    Vmar,
-    /// Thread object.
-    Thread,
-}
-
 #[derive(Debug)]
 pub(crate) struct TimerObject {
     pub(crate) timer_id: TimerId,
-    clock_id: zx_clock_t,
+    armed_revocation: RevocationSet,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -225,7 +185,6 @@ pub(crate) struct InterruptObject {
 
 #[derive(Debug)]
 pub(crate) struct DmaRegionObject {
-    source_vmo_object: ObjectKey,
     source_offset: u64,
     size_bytes: u64,
     options: u32,
@@ -244,22 +203,6 @@ impl RevocationGroupObject {
 }
 
 impl DmaRegionObject {
-    pub(crate) const fn source_vmo_object(&self) -> ObjectKey {
-        self.source_vmo_object
-    }
-
-    pub(crate) const fn source_offset(&self) -> u64 {
-        self.source_offset
-    }
-
-    pub(crate) const fn size_bytes(&self) -> u64 {
-        self.size_bytes
-    }
-
-    pub(crate) const fn options(&self) -> u32 {
-        self.options
-    }
-
     pub(crate) fn lookup_paddr(&self, offset: u64) -> Result<u64, zx_status_t> {
         if offset >= self.size_bytes {
             return Err(ZX_ERR_OUT_OF_RANGE);
@@ -562,6 +505,7 @@ pub(crate) enum SocketReadPayload {
 pub(crate) struct SocketReadResult {
     pub(crate) payload: SocketReadPayload,
     pub(crate) actual_bytes: usize,
+    pub(crate) released_accounted_bytes: u64,
 }
 
 impl SocketReadResult {
@@ -570,6 +514,7 @@ impl SocketReadResult {
         Self {
             payload: SocketReadPayload::Copied(bytes),
             actual_bytes,
+            released_accounted_bytes: 0,
         }
     }
 }
@@ -620,15 +565,26 @@ impl ChannelMsgDesc {
 }
 
 #[derive(Debug)]
-struct ChannelMessageBudgetReservation {
+struct AccountedBytesReservation {
+    release: fn(u64),
     bytes: u64,
     active: bool,
 }
 
-impl ChannelMessageBudgetReservation {
-    fn reserve(bytes: u64) -> Result<Self, zx_status_t> {
+impl AccountedBytesReservation {
+    fn reserve_channel(bytes: u64) -> Result<Self, zx_status_t> {
         try_reserve_global_channel_bytes(bytes)?;
         Ok(Self {
+            release: release_global_channel_bytes,
+            bytes,
+            active: true,
+        })
+    }
+
+    fn reserve_socket(bytes: u64) -> Result<Self, zx_status_t> {
+        try_reserve_global_socket_bytes(bytes)?;
+        Ok(Self {
+            release: release_global_socket_bytes,
             bytes,
             active: true,
         })
@@ -639,10 +595,10 @@ impl ChannelMessageBudgetReservation {
     }
 }
 
-impl Drop for ChannelMessageBudgetReservation {
+impl Drop for AccountedBytesReservation {
     fn drop(&mut self) {
         if self.active {
-            release_global_channel_bytes(self.bytes);
+            (self.release)(self.bytes);
             self.active = false;
         }
     }
@@ -749,8 +705,38 @@ impl ByteRing {
 }
 
 #[derive(Debug)]
+struct DatagramMessage {
+    payload: DataPayload,
+    actual_bytes: usize,
+    accounted_bytes: u64,
+}
+
+impl DatagramMessage {
+    fn accounted_bytes_for_copied_len(len: usize) -> u64 {
+        (len as u64).saturating_add(core::mem::size_of::<Self>() as u64)
+    }
+
+    fn accounted_bytes_for(payload: &DataPayload) -> Result<u64, zx_status_t> {
+        let _ = payload.actual_bytes()?;
+        Ok(payload
+            .queue_accounted_bytes()
+            .saturating_add(core::mem::size_of::<Self>() as u64))
+    }
+
+    fn new(payload: DataPayload) -> Result<Self, zx_status_t> {
+        let actual_bytes =
+            usize::try_from(payload.actual_bytes()?).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        Ok(Self {
+            accounted_bytes: Self::accounted_bytes_for(&payload)?,
+            payload,
+            actual_bytes,
+        })
+    }
+}
+
+#[derive(Debug)]
 struct DatagramQueue {
-    messages: VecDeque<DataPayload>,
+    messages: VecDeque<DatagramMessage>,
     buffered_bytes: usize,
     capacity_bytes: usize,
     capacity_messages: usize,
@@ -779,8 +765,8 @@ impl DatagramQueue {
     }
 
     fn write_payload(&mut self, payload: DataPayload) -> Result<usize, zx_status_t> {
-        let payload_len =
-            usize::try_from(payload.actual_bytes()?).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let message = DatagramMessage::new(payload)?;
+        let payload_len = message.actual_bytes;
         if payload_len == 0 {
             return Ok(0);
         }
@@ -795,7 +781,7 @@ impl DatagramQueue {
             return Err(ZX_ERR_SHOULD_WAIT);
         }
         self.buffered_bytes = next_bytes;
-        self.messages.push_back(payload);
+        self.messages.push_back(message);
         Ok(payload_len)
     }
 
@@ -818,25 +804,27 @@ impl DatagramQueue {
         let Some(message) = self.messages.front() else {
             return Err(ZX_ERR_SHOULD_WAIT);
         };
-        let source_len =
-            usize::try_from(message.actual_bytes()?).map_err(|_| ZX_ERR_OUT_OF_RANGE)?;
+        let source_len = message.actual_bytes;
         if consume {
             let payload = self.messages.pop_front().ok_or(ZX_ERR_BAD_STATE)?;
             self.buffered_bytes = self.buffered_bytes.saturating_sub(source_len);
             return Ok(SocketReadResult {
-                payload: SocketReadPayload::Payload(payload),
+                payload: SocketReadPayload::Payload(payload.payload),
                 actual_bytes: source_len,
+                released_accounted_bytes: payload.accounted_bytes,
             });
         }
         Ok(SocketReadResult {
             payload: SocketReadPayload::Copied(crate::copy::materialize_data_payload_prefix(
-                message, len,
+                &message.payload,
+                len,
             )?),
             actual_bytes: source_len,
+            released_accounted_bytes: 0,
         })
     }
 
-    fn into_payloads(self) -> Vec<DataPayload> {
+    fn into_messages(self) -> Vec<DatagramMessage> {
         self.messages.into_iter().collect()
     }
 }
@@ -850,6 +838,7 @@ enum SocketQueue {
 #[derive(Debug)]
 struct SocketCore {
     mode: SocketMode,
+    fixed_accounted_bytes: u64,
     dir_ab: SocketQueue,
     dir_ba: SocketQueue,
     open_a: bool,
@@ -860,6 +849,7 @@ impl SocketCore {
     fn new_stream(capacity: usize) -> Result<Self, zx_status_t> {
         Ok(Self {
             mode: SocketMode::Stream,
+            fixed_accounted_bytes: Self::fixed_accounted_bytes_for_stream(capacity),
             dir_ab: SocketQueue::Stream(ByteRing::with_capacity(capacity)?),
             dir_ba: SocketQueue::Stream(ByteRing::with_capacity(capacity)?),
             open_a: true,
@@ -870,6 +860,7 @@ impl SocketCore {
     fn new_datagram(capacity_bytes: usize, capacity_messages: usize) -> Self {
         Self {
             mode: SocketMode::Datagram,
+            fixed_accounted_bytes: Self::fixed_accounted_bytes_for_datagram(),
             dir_ab: SocketQueue::Datagram(DatagramQueue::with_capacity(
                 capacity_bytes,
                 capacity_messages,
@@ -885,6 +876,20 @@ impl SocketCore {
 
     fn mode(&self) -> SocketMode {
         self.mode
+    }
+
+    fn fixed_accounted_bytes_for_stream(capacity: usize) -> u64 {
+        (capacity as u64)
+            .saturating_mul(SOCKET_STREAM_DIRECTIONS)
+            .saturating_add(core::mem::size_of::<Self>() as u64)
+    }
+
+    const fn fixed_accounted_bytes_for_datagram() -> u64 {
+        core::mem::size_of::<Self>() as u64
+    }
+
+    fn fixed_accounted_bytes(&self) -> u64 {
+        self.fixed_accounted_bytes
     }
 
     fn buffered_bytes(&self) -> usize {
@@ -1040,14 +1045,14 @@ impl SocketCore {
         !self.open_a && !self.open_b
     }
 
-    fn into_queued_payloads(self) -> Vec<DataPayload> {
-        let mut payloads = Vec::new();
+    fn into_queued_messages(self) -> Vec<DatagramMessage> {
+        let mut messages = Vec::new();
         for queue in [self.dir_ab, self.dir_ba] {
             if let SocketQueue::Datagram(queue) = queue {
-                payloads.extend(queue.into_payloads());
+                messages.extend(queue.into_messages());
             }
         }
-        payloads
+        messages
     }
 }
 
@@ -1174,13 +1179,11 @@ pub(crate) struct ThreadObject {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProcessObject {
     process_id: u64,
-    koid: zx_koid_t,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JobObject {
     job_id: JobId,
-    koid: zx_koid_t,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1372,37 +1375,12 @@ impl ObjectRegistry {
         Ok(())
     }
 
-    fn discard_reserved_object(&mut self, key: ObjectKey) {
-        let Some(index) = Self::slot_index(key.object_id()) else {
-            return;
-        };
-        let Some(slot) = self.slots.get_mut(index) else {
-            return;
-        };
-        if !Self::key_matches(slot, key)
-            || !matches!(slot.state, ObjectSlotState::Live)
-            || slot.payload.is_some()
-        {
-            return;
-        }
-        slot.state = ObjectSlotState::Dying;
-        self.maybe_retire(index);
-    }
-
     pub(crate) fn get(&self, key: ObjectKey) -> Option<&KernelObject> {
         self.slot_live(key)?.payload.as_ref()
     }
 
     pub(crate) fn get_mut(&mut self, key: ObjectKey) -> Option<&mut KernelObject> {
         self.slot_mut_live(key)?.payload.as_mut()
-    }
-
-    fn get_any(&self, key: ObjectKey) -> Option<&KernelObject> {
-        self.slot_any(key)?.payload.as_ref()
-    }
-
-    fn get_any_mut(&mut self, key: ObjectKey) -> Option<&mut KernelObject> {
-        self.slot_any_mut(key)?.payload.as_mut()
     }
 
     pub(crate) fn insert(
@@ -1424,14 +1402,6 @@ impl ObjectRegistry {
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (ObjectKey, &KernelObject)> {
         self.iter_live()
-    }
-
-    fn live_key_for_object_id(&self, object_id: u64) -> Option<ObjectKey> {
-        let slot = self.slots.get(Self::slot_index(object_id)?)?;
-        if !matches!(slot.state, ObjectSlotState::Live) || slot.payload.is_none() {
-            return None;
-        }
-        Self::object_key_for_slot(Self::slot_index(object_id)?, slot)
     }
 
     fn capability_for_object(
@@ -1599,18 +1569,6 @@ pub(crate) struct KernelState {
 }
 
 impl KernelState {
-    fn with_local_interrupts_disabled<T>(&self, f: impl FnOnce() -> T) -> T {
-        let were_enabled = x86_64::instructions::interrupts::are_enabled();
-        if were_enabled {
-            x86_64::instructions::interrupts::disable();
-        }
-        let result = f();
-        if were_enabled {
-            x86_64::instructions::interrupts::enable();
-        }
-        result
-    }
-
     fn new() -> Self {
         let (vm, address_space_id) = crate::task::VmFacade::bootstrap();
         let reactor = Arc::new(Mutex::new(crate::task::Reactor::new(
@@ -1633,9 +1591,6 @@ impl KernelState {
         let root_job_id = state
             .with_kernel(|kernel| Ok(kernel.root_job_id()))
             .expect("bootstrap root job must exist");
-        let root_job_koid = state
-            .with_kernel(|kernel| kernel.job_koid(root_job_id))
-            .expect("bootstrap root job koid must exist");
         let root_job_object_id = state.alloc_object_id();
         state
             .with_registry_mut(|registry| {
@@ -1643,7 +1598,6 @@ impl KernelState {
                     root_job_object_id,
                     KernelObject::Job(JobObject {
                         job_id: root_job_id,
-                        koid: root_job_koid,
                     }),
                 )?;
                 Ok(())
@@ -1665,9 +1619,6 @@ impl KernelState {
         let process = state
             .with_kernel(|kernel| kernel.current_process_info())
             .expect("bootstrap current process must exist");
-        let process_koid = state
-            .with_kernel(|kernel| kernel.current_process_koid())
-            .expect("bootstrap current process koid must exist");
         let process_object_id = state.alloc_object_id();
         state
             .with_registry_mut(|registry| {
@@ -1675,7 +1626,6 @@ impl KernelState {
                     process_object_id,
                     KernelObject::Process(ProcessObject {
                         process_id: process.process_id(),
-                        koid: process_koid,
                     }),
                 )?;
                 Ok(())
@@ -1892,6 +1842,11 @@ impl KernelState {
         state
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_tests() -> Self {
+        Self::new()
+    }
+
     fn reserve_object_key(&self) -> ObjectKey {
         let mut registry = self.registry.lock();
         registry.reserve_object_key()
@@ -1899,18 +1854,6 @@ impl KernelState {
 
     fn alloc_object_id(&self) -> ObjectKey {
         self.reserve_object_key()
-    }
-
-    fn publish_reserved_object(
-        &self,
-        key: ObjectKey,
-        object: KernelObject,
-    ) -> Result<(), zx_status_t> {
-        self.with_registry_mut(|registry| registry.publish_reserved_object(key, object))
-    }
-
-    fn discard_reserved_object(&self, key: ObjectKey) {
-        self.registry.lock().discard_reserved_object(key);
     }
 
     fn capability_for_object(
@@ -2053,6 +1996,15 @@ impl KernelState {
         f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
     ) -> Result<T, zx_status_t> {
         with_interrupt_safe_kernel_mut(&self.kernel, f)
+    }
+
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn with_core_mut_for_tests<T>(
+        &self,
+        f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
+    ) -> Result<T, zx_status_t> {
+        self.with_core_mut(f)
     }
 
     pub(crate) fn with_vm_mut<T>(
@@ -2328,7 +2280,6 @@ pub(crate) fn mark_scheduler_cpu_online(cpu_id: usize) -> Result<(), zx_status_t
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn resolve_current_futex_key_relaxed(
     user_addr: zx_vaddr_t,
 ) -> Result<axle_mm::FutexKey, zx_status_t> {
@@ -2412,7 +2363,6 @@ fn resolve_current_futex_key_inner(
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn resolve_current_futex_key(
     user_addr: zx_vaddr_t,
 ) -> Result<axle_mm::FutexKey, zx_status_t> {
@@ -2430,31 +2380,11 @@ pub(crate) fn kernel_handle() -> Result<Arc<Mutex<crate::task::Kernel>>, zx_stat
 }
 
 #[track_caller]
-pub(crate) fn with_kernel_handle<T>(
-    kernel: &Arc<Mutex<crate::task::Kernel>>,
-    f: impl FnOnce(&crate::task::Kernel) -> Result<T, zx_status_t>,
-) -> Result<T, zx_status_t> {
-    with_interrupt_safe_kernel_ref(kernel, f)
-}
-
-#[track_caller]
 pub(crate) fn with_kernel_handle_mut<T>(
     kernel: &Arc<Mutex<crate::task::Kernel>>,
     f: impl FnOnce(&mut crate::task::Kernel) -> Result<T, zx_status_t>,
 ) -> Result<T, zx_status_t> {
     with_interrupt_safe_kernel_mut(kernel, f)
-}
-
-fn with_local_interrupts_disabled<T>(f: impl FnOnce() -> T) -> T {
-    let were_enabled = x86_64::instructions::interrupts::are_enabled();
-    if were_enabled {
-        x86_64::instructions::interrupts::disable();
-    }
-    let result = f();
-    if were_enabled {
-        x86_64::instructions::interrupts::enable();
-    }
-    result
 }
 
 #[track_caller]
@@ -2843,7 +2773,10 @@ pub fn create_timer(options: u32, clock_id: zx_clock_t) -> Result<zx_handle_t, z
         if let Err(e) = state.with_objects_mut(|objects| {
             objects.insert(
                 object_id,
-                KernelObject::Timer(TimerObject { timer_id, clock_id }),
+                KernelObject::Timer(TimerObject {
+                    timer_id,
+                    armed_revocation: RevocationSet::none(),
+                }),
             )?;
             Ok(())
         }) {
@@ -3196,7 +3129,7 @@ pub fn futex_get_owner(value_ptr: zx_vaddr_t) -> Result<zx_koid_t, zx_status_t> 
 fn lookup_timer_with_write_rights(
     state: &KernelState,
     handle: zx_handle_t,
-) -> Result<(ObjectKey, TimerId), zx_status_t> {
+) -> Result<(ObjectKey, TimerId, RevocationSet), zx_status_t> {
     let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
     let object_key = resolved.object_key();
     let timer_id = state.with_objects(|objects| match objects.get(object_key) {
@@ -3205,13 +3138,17 @@ fn lookup_timer_with_write_rights(
         None => Err(ZX_ERR_BAD_HANDLE),
     })?;
     require_handle_rights(resolved, crate::task::HandleRights::WRITE)?;
-    Ok((object_key, timer_id))
+    Ok((
+        object_key,
+        timer_id,
+        RevocationSet::one(resolved.revocation_ref()),
+    ))
 }
 
 /// Arm or re-arm a timer.
 pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
-        let (object_key, timer_id) = lookup_timer_with_write_rights(state, handle)?;
+        let (object_key, timer_id, revocation) = lookup_timer_with_write_rights(state, handle)?;
 
         let now = crate::time::now_ns();
         let current = state.with_kernel_mut(|kernel| {
@@ -3226,6 +3163,19 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
                 })
                 .map_err(map_timer_error)
         })?;
+        state.with_objects_mut(|objects| {
+            let timer = match objects.get_mut(object_key) {
+                Some(KernelObject::Timer(timer)) => timer,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            timer.armed_revocation = if current == Signals::TIMER_SIGNALED {
+                RevocationSet::none()
+            } else {
+                revocation
+            };
+            Ok(())
+        })?;
         crate::wait::publish_signals_changed(state, object_key, current)
     })
 }
@@ -3233,23 +3183,23 @@ pub fn timer_set(handle: zx_handle_t, deadline: i64, _slack: i64) -> Result<(), 
 /// Cancel a timer.
 pub fn timer_cancel(handle: zx_handle_t) -> Result<(), zx_status_t> {
     with_state_mut(|state| {
-        let (object_key, timer_id) = lookup_timer_with_write_rights(state, handle)?;
+        let (object_key, timer_id, _revocation) = lookup_timer_with_write_rights(state, handle)?;
 
         state.with_kernel_mut(|kernel| {
             kernel
                 .cancel_timer_object(timer_id)
                 .map_err(map_timer_error)
         })?;
+        state.with_objects_mut(|objects| {
+            let timer = match objects.get_mut(object_key) {
+                Some(KernelObject::Timer(timer)) => timer,
+                Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+                None => return Err(ZX_ERR_BAD_HANDLE),
+            };
+            timer.armed_revocation = RevocationSet::none();
+            Ok(())
+        })?;
         crate::wait::publish_signals_changed(state, object_key, Signals::NONE)
-    })
-}
-
-/// Snapshot current signals for a waitable object.
-pub fn object_signals(handle: zx_handle_t) -> Result<zx_signals_t, zx_status_t> {
-    with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::WAIT)?;
-        let object_key = resolved.object_key();
-        signals_for_object_id(state, object_key).map(|s| s.bits())
     })
 }
 
@@ -3530,145 +3480,6 @@ pub fn close_handle(raw: zx_handle_t) -> Result<(), zx_status_t> {
     })
 }
 
-fn ensure_handle_kind(handle: zx_handle_t, expected: ObjectKind) -> Result<(), zx_status_t> {
-    with_state_mut(|state| {
-        let resolved = state.lookup_handle(handle, crate::task::HandleRights::empty())?;
-        let object_key = resolved.object_key();
-        let kind = state.with_objects(|objects| {
-            let obj = objects.get(object_key).ok_or(ZX_ERR_BAD_HANDLE)?;
-            Ok(match obj {
-                KernelObject::Job(job) => {
-                    let _ = (job.job_id, job.koid);
-                    ObjectKind::Job
-                }
-                KernelObject::Process(process) => {
-                    let _ = (process.process_id, process.koid);
-                    ObjectKind::Process
-                }
-                KernelObject::SuspendToken(_) => ObjectKind::SuspendToken,
-                KernelObject::GuestSession(session) => {
-                    let _ = (
-                        session.thread_id,
-                        session.sidecar_vmo.global_vmo_id().raw(),
-                        session.port_object.object_id(),
-                        session.packet_key,
-                        session.stop_seq,
-                        session.stopped_seq,
-                    );
-                    ObjectKind::GuestSession
-                }
-                KernelObject::Socket(endpoint) => {
-                    let _ = (endpoint.core_id, endpoint.peer_object, endpoint.side);
-                    ObjectKind::Socket
-                }
-                KernelObject::Channel(endpoint) => {
-                    let _ = (
-                        endpoint.peer_object,
-                        endpoint.messages.len(),
-                        endpoint.peer_closed,
-                        endpoint.closed,
-                    );
-                    ObjectKind::Channel
-                }
-                KernelObject::EventPair(endpoint) => {
-                    let _ = (
-                        endpoint.peer_object,
-                        endpoint.user_signals.bits(),
-                        endpoint.peer_closed,
-                        endpoint.closed,
-                    );
-                    ObjectKind::EventPair
-                }
-                KernelObject::Port(port) => {
-                    let _ = port.len();
-                    ObjectKind::Port
-                }
-                KernelObject::Timer(timer) => {
-                    let _ = timer.clock_id;
-                    let _ = timer.timer_id.raw();
-                    ObjectKind::Timer
-                }
-                KernelObject::Interrupt(interrupt) => {
-                    let _ = (
-                        interrupt.pending_count,
-                        interrupt.masked,
-                        interrupt.mode,
-                        interrupt.vector,
-                        interrupt.triggerable,
-                    );
-                    ObjectKind::Interrupt
-                }
-                KernelObject::DmaRegion(region) => {
-                    let _ = (
-                        region.source_vmo_object.object_id(),
-                        region.source_offset,
-                        region.size_bytes,
-                        region.options,
-                        region.pin.frame_ids().len(),
-                    );
-                    ObjectKind::DmaRegion
-                }
-                KernelObject::PciDevice(device) => {
-                    let _ = (
-                        device.vendor_id,
-                        device.device_id,
-                        device
-                            .bars
-                            .first()
-                            .map(|bar| bar.object.object_id())
-                            .unwrap_or(0),
-                        device
-                            .bars
-                            .first()
-                            .and_then(|bar| bar.backing_object)
-                            .map(ObjectKey::object_id)
-                            .unwrap_or(0),
-                        device.queue_pairs,
-                        device.queue_size,
-                    );
-                    ObjectKind::PciDevice
-                }
-                KernelObject::RevocationGroup(group) => {
-                    let _ = (group.token().id().raw(), group.token().generation());
-                    ObjectKind::RevocationGroup
-                }
-                KernelObject::Vmo(vmo) => {
-                    let _ = (
-                        vmo.creator_process_id,
-                        vmo.global_vmo_id.raw(),
-                        matches!(vmo.backing_scope, VmoBackingScope::GlobalShared),
-                        matches!(vmo.kind, axle_mm::VmoKind::Anonymous),
-                        vmo.size_bytes,
-                    );
-                    ObjectKind::Vmo
-                }
-                KernelObject::Vmar(vmar) => {
-                    let _ = (
-                        vmar.process_id,
-                        vmar.address_space_id,
-                        vmar.vmar_id.raw(),
-                        vmar.base,
-                        vmar.len,
-                        vmar.mapping_caps.max_perms.bits(),
-                        vmar.mapping_caps.can_map_specific,
-                    );
-                    ObjectKind::Vmar
-                }
-                KernelObject::Thread(thread) => {
-                    let _ = (thread.process_id, thread.thread_id, thread.koid);
-                    ObjectKind::Thread
-                }
-            })
-        })?;
-
-        if kind == expected {
-            Ok(())
-        } else {
-            Err(ZX_ERR_WRONG_TYPE)
-        }
-    })
-}
-
 pub(crate) fn require_handle_rights(
     resolved: crate::task::ResolvedHandle,
     required_rights: crate::task::HandleRights,
@@ -3693,6 +3504,15 @@ pub(crate) fn publish_timer_fired(
     timer_id: TimerId,
 ) -> Result<(), zx_status_t> {
     let object_key = state.timer_object_key(timer_id).ok_or(ZX_ERR_BAD_STATE)?;
+    state.with_objects_mut(|objects| {
+        let timer = match objects.get_mut(object_key) {
+            Some(KernelObject::Timer(timer)) => timer,
+            Some(_) => return Err(ZX_ERR_WRONG_TYPE),
+            None => return Err(ZX_ERR_BAD_HANDLE),
+        };
+        timer.armed_revocation = RevocationSet::none();
+        Ok(())
+    })?;
     crate::wait::publish_signals_changed(state, object_key, Signals::TIMER_SIGNALED)
 }
 
@@ -3702,39 +3522,18 @@ pub(crate) fn signals_for_object_id(
 ) -> Result<Signals, zx_status_t> {
     state.with_objects(|objects| {
         let obj = objects.get(object_key).ok_or(ZX_ERR_BAD_HANDLE)?;
+        if let Some(signals) = process::task_signals(state, obj) {
+            return signals;
+        }
+        if let Some(signals) = transport::transport_signals(state, objects, obj) {
+            return signals;
+        }
         match obj {
-            KernelObject::Process(process) => {
-                state.with_kernel(|kernel| kernel.process_signals(process.process_id))
-            }
-            KernelObject::Thread(thread) => {
-                state.with_kernel(|kernel| kernel.thread_signals(thread.thread_id))
-            }
+            KernelObject::Process(_)
+            | KernelObject::Thread(_)
+            | KernelObject::Socket(_)
+            | KernelObject::Channel(_) => Err(ZX_ERR_BAD_STATE),
             KernelObject::GuestSession(_) => Ok(Signals::NONE),
-            KernelObject::Socket(endpoint) => state.with_transport(|transport| {
-                let core = transport
-                    .socket_cores
-                    .get(&endpoint.core_id)
-                    .ok_or(ZX_ERR_BAD_STATE)?;
-                Ok(core.signals_for(endpoint.side))
-            }),
-            KernelObject::Channel(endpoint) => {
-                let mut signals = Signals::NONE;
-                if endpoint.is_readable() {
-                    signals = signals | Signals::CHANNEL_READABLE;
-                }
-                if endpoint.peer_closed {
-                    signals = signals | Signals::CHANNEL_PEER_CLOSED;
-                } else {
-                    let peer = match objects.get(endpoint.peer_object) {
-                        Some(KernelObject::Channel(peer)) => peer,
-                        _ => return Err(ZX_ERR_BAD_STATE),
-                    };
-                    if endpoint.writable_via_peer(peer) {
-                        signals = signals | Signals::CHANNEL_WRITABLE;
-                    }
-                }
-                Ok(signals)
-            }
             KernelObject::SuspendToken(_) => Ok(Signals::NONE),
             KernelObject::EventPair(endpoint) => {
                 let mut signals = endpoint.user_signals;
@@ -3782,5 +3581,108 @@ pub(crate) fn map_port_error(err: PortError) -> zx_status_t {
 pub(crate) fn map_timer_error(err: TimerError) -> zx_status_t {
     match err {
         TimerError::NotFound => ZX_ERR_BAD_HANDLE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex as StdMutex, MutexGuard};
+
+    static SOCKET_ACCOUNTING_TEST_GUARD: StdMutex<()> = StdMutex::new(());
+
+    fn lock_socket_accounting() -> MutexGuard<'static, ()> {
+        SOCKET_ACCOUNTING_TEST_GUARD
+            .lock()
+            .expect("socket accounting test guard poisoned")
+    }
+
+    #[test]
+    fn datagram_queue_consuming_read_releases_accounted_bytes() {
+        let mut queue = DatagramQueue::with_capacity(4096, 8);
+        queue.write_bytes(b"ping").expect("write datagram");
+
+        let result = queue.read(16, true).expect("consume datagram");
+        assert_eq!(
+            result.released_accounted_bytes,
+            DatagramMessage::accounted_bytes_for_copied_len(4)
+        );
+        assert_eq!(result.actual_bytes, 4);
+        match result.payload {
+            SocketReadPayload::Payload(ChannelPayload::Copied(bytes)) => assert_eq!(bytes, b"ping"),
+            payload => panic!("unexpected payload: {payload:?}"),
+        }
+        assert_eq!(queue.buffered_bytes(), 0);
+        assert_eq!(queue.queued_messages(), 0);
+    }
+
+    #[test]
+    fn datagram_queue_peek_keeps_budget_and_payload_queued() {
+        let mut queue = DatagramQueue::with_capacity(4096, 8);
+        queue.write_bytes(b"pong").expect("write datagram");
+
+        let result = queue.read(2, false).expect("peek datagram");
+        assert_eq!(result.released_accounted_bytes, 0);
+        assert_eq!(result.actual_bytes, 4);
+        match result.payload {
+            SocketReadPayload::Copied(bytes) => assert_eq!(bytes, b"po"),
+            payload => panic!("unexpected payload: {payload:?}"),
+        }
+        assert_eq!(queue.buffered_bytes(), 4);
+        assert_eq!(queue.queued_messages(), 1);
+    }
+
+    #[test]
+    fn socket_stream_budget_is_reserved_on_create_and_released_on_close() {
+        let _guard = lock_socket_accounting();
+        let baseline = GLOBAL_SOCKET_ACCOUNTED_BYTES.load(Ordering::Acquire);
+
+        let (left, right) = transport::create_socket(ZX_SOCKET_STREAM).expect("create stream");
+        let fixed = SocketCore::fixed_accounted_bytes_for_stream(SOCKET_STREAM_CAPACITY);
+        assert_eq!(
+            GLOBAL_SOCKET_ACCOUNTED_BYTES.load(Ordering::Acquire),
+            baseline + fixed
+        );
+
+        close_handle(left).expect("close left stream endpoint");
+        close_handle(right).expect("close right stream endpoint");
+        assert_eq!(
+            GLOBAL_SOCKET_ACCOUNTED_BYTES.load(Ordering::Acquire),
+            baseline
+        );
+    }
+
+    #[test]
+    fn socket_datagram_budget_releases_on_dequeue_and_core_drop() {
+        let _guard = lock_socket_accounting();
+        let baseline = GLOBAL_SOCKET_ACCOUNTED_BYTES.load(Ordering::Acquire);
+
+        let (left, right) = transport::create_socket(ZX_SOCKET_DATAGRAM).expect("create datagram");
+        let fixed = SocketCore::fixed_accounted_bytes_for_datagram();
+        assert_eq!(
+            GLOBAL_SOCKET_ACCOUNTED_BYTES.load(Ordering::Acquire),
+            baseline + fixed
+        );
+
+        transport::socket_write(left, 0, b"ping").expect("write datagram");
+        let accounted_payload = DatagramMessage::accounted_bytes_for_copied_len(4);
+        assert_eq!(
+            GLOBAL_SOCKET_ACCOUNTED_BYTES.load(Ordering::Acquire),
+            baseline + fixed + accounted_payload
+        );
+
+        let result = transport::socket_read(right, 0, 8).expect("read datagram");
+        assert_eq!(result.actual_bytes, 4);
+        assert_eq!(
+            GLOBAL_SOCKET_ACCOUNTED_BYTES.load(Ordering::Acquire),
+            baseline + fixed
+        );
+
+        close_handle(left).expect("close left datagram endpoint");
+        close_handle(right).expect("close right datagram endpoint");
+        assert_eq!(
+            GLOBAL_SOCKET_ACCOUNTED_BYTES.load(Ordering::Acquire),
+            baseline
+        );
     }
 }

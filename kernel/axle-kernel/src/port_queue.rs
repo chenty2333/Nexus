@@ -1,7 +1,8 @@
 extern crate alloc;
 
 use axle_core::{
-    Packet, PacketKind, PacketQueue, PortError, PortState, PortTelemetrySnapshot, Signals,
+    Packet, PacketKind, PacketQueue, PacketQueueError, PortError, PortState, PortTelemetrySnapshot,
+    RevocationSet, Signals,
 };
 use axle_types::packet::{ZX_PKT_TYPE_SIGNAL_ONE, ZX_PKT_TYPE_USER};
 use axle_types::status::ZX_OK;
@@ -11,6 +12,7 @@ use core::mem::size_of;
 #[derive(Debug)]
 pub(crate) struct KernelPortQueue {
     backing: crate::task::KernelVmoBacking,
+    revocations: alloc::vec::Vec<RevocationSet>,
     head: usize,
     len: usize,
     capacity: usize,
@@ -29,6 +31,7 @@ impl KernelPortQueue {
         let backing = kernel.create_kernel_vmo_backing(bytes)?;
         Ok(Self {
             backing,
+            revocations: alloc::vec![RevocationSet::none(); capacity],
             head: 0,
             len: 0,
             capacity,
@@ -47,19 +50,21 @@ impl KernelPortQueue {
         (self.head + self.len) % self.capacity
     }
 
-    fn write_slot(&mut self, slot: usize, pkt: Packet) -> Result<(), Packet> {
+    fn write_slot(&mut self, slot: usize, pkt: Packet) -> Result<(), PacketQueueError> {
         let Some(offset) = self.slot_offset(slot) else {
-            return Err(pkt);
+            return Err(PacketQueueError::Backend);
         };
+        self.revocations[slot] = pkt.revocation;
         let raw = port_packet_from_core(pkt);
-        crate::userspace::write_bootstrap_value(self.backing.base_paddr(), offset, &raw).ok_or(pkt)
+        crate::userspace::write_bootstrap_value(self.backing.base_paddr(), offset, &raw)
+            .ok_or(PacketQueueError::Backend)
     }
 
     fn read_slot(&self, slot: usize) -> Option<Packet> {
         let offset = self.slot_offset(slot)?;
         let raw: zx_port_packet_t =
             crate::userspace::read_bootstrap_value(self.backing.base_paddr(), offset)?;
-        packet_from_port_packet(raw)
+        packet_from_port_packet(raw, self.revocations.get(slot).copied().unwrap_or_default())
     }
 }
 
@@ -68,9 +73,9 @@ impl PacketQueue for KernelPortQueue {
         self.len
     }
 
-    fn push_back(&mut self, pkt: Packet) -> Result<(), Packet> {
+    fn push_back(&mut self, pkt: Packet) -> Result<(), PacketQueueError> {
         if self.len >= self.capacity {
-            return Err(pkt);
+            return Err(PacketQueueError::Full);
         }
         let tail = self.tail_index();
         self.write_slot(tail, pkt)?;
@@ -84,9 +89,38 @@ impl PacketQueue for KernelPortQueue {
         }
         let slot = self.head;
         let pkt = self.read_slot(slot)?;
+        if let Some(revocation) = self.revocations.get_mut(slot) {
+            *revocation = RevocationSet::none();
+        }
         self.head = (self.head + 1) % self.capacity;
         self.len -= 1;
         Some(pkt)
+    }
+
+    fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&Packet) -> bool,
+    {
+        if self.len == 0 {
+            return;
+        }
+        let mut retained = alloc::vec::Vec::with_capacity(self.len);
+        for offset in 0..self.len {
+            let slot = (self.head + offset) % self.capacity;
+            if let Some(packet) = self.read_slot(slot)
+                && keep(&packet)
+            {
+                retained.push(packet);
+            }
+            if let Some(revocation) = self.revocations.get_mut(slot) {
+                *revocation = RevocationSet::none();
+            }
+        }
+        self.head = 0;
+        self.len = 0;
+        for packet in retained {
+            let _ = self.push_back(packet);
+        }
     }
 }
 
@@ -111,10 +145,6 @@ impl KernelPort {
         self.state.into_queue().destroy(kernel)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.state.len()
-    }
-
     pub(crate) fn signals(&self) -> Signals {
         self.state.signals()
     }
@@ -129,6 +159,13 @@ impl KernelPort {
 
     pub(crate) fn queue_kernel(&mut self, pkt: Packet) -> Result<(), PortError> {
         self.state.queue_kernel(pkt)
+    }
+
+    pub(crate) fn retain_kernel_packets<F>(&mut self, keep: F) -> usize
+    where
+        F: FnMut(&Packet) -> bool,
+    {
+        self.state.retain_kernel_packets(keep)
     }
 
     pub(crate) fn telemetry_snapshot(&self) -> PortTelemetrySnapshot {
@@ -162,18 +199,19 @@ pub(crate) fn port_packet_from_core(pkt: Packet) -> zx_port_packet_t {
     }
 }
 
-fn packet_from_port_packet(raw: zx_port_packet_t) -> Option<Packet> {
+fn packet_from_port_packet(raw: zx_port_packet_t, revocation: RevocationSet) -> Option<Packet> {
     match raw.type_ {
         ZX_PKT_TYPE_USER => Some(Packet::user_with_data(raw.key, raw.status, raw.user.u64)),
         ZX_PKT_TYPE_SIGNAL_ONE => {
             let sig = zx_packet_signal_t::from_user(raw.user);
-            Some(Packet::signal(
+            Some(Packet::signal_with_revocation(
                 raw.key,
                 0.into(),
                 Signals::from_bits(sig.trigger),
                 Signals::from_bits(sig.observed),
                 u32::try_from(sig.count).ok()?,
                 sig.timestamp,
+                revocation,
             ))
         }
         _ => None,

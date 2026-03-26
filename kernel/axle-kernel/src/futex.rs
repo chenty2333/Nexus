@@ -15,8 +15,7 @@ use axle_types::zx_koid_t;
 
 /// Maximum depth for priority inheritance chain propagation.
 /// Currently single-level PI is implemented; this constant reserves the chain-walk bound.
-#[allow(dead_code)]
-pub(crate) const MAX_PI_CHAIN_DEPTH: usize = 16;
+pub(crate) const _MAX_PI_CHAIN_DEPTH: usize = 16;
 
 /// Result of waking waiters from one futex queue.
 #[derive(Debug, Default)]

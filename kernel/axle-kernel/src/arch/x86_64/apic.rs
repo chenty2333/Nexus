@@ -33,9 +33,11 @@ const PTE_PCD: u64 = 1 << 4;
 const PTE_PS: u64 = 1 << 7;
 
 #[repr(align(4096))]
-struct AlignedPageTable([u64; 512]);
+struct AlignedPageTable {
+    _words: [u64; 512],
+}
 
-static mut XAPIC_PD: AlignedPageTable = AlignedPageTable([0; 512]);
+static mut XAPIC_PD: AlignedPageTable = AlignedPageTable { _words: [0; 512] };
 
 // PVH boot page tables (identity-mapped, used as the active CR3).
 unsafe extern "C" {
@@ -536,7 +538,7 @@ fn map_xapic_mmio(base: u64) {
         pvh_pdpt[pdpt_index] = pd_phys | (PTE_P | PTE_W);
         // xAPIC MMIO must be mapped uncacheable (UC). Set PCD + PWT to force
         // UC memory type regardless of MTRRs.
-        XAPIC_PD.0[pd_index] = base | (PTE_P | PTE_W | PTE_PS | PTE_PCD | PTE_PWT);
+        XAPIC_PD._words[pd_index] = base | (PTE_P | PTE_W | PTE_PS | PTE_PCD | PTE_PWT);
 
         crate::arch::tlb::flush_all_local();
     }

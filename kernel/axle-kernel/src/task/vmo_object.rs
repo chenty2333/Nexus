@@ -28,16 +28,6 @@ impl VmDomain {
             .register_empty(global_vmo_id, kind, size_bytes)
     }
 
-    pub(super) fn register_pager_backed_global_vmo(
-        &mut self,
-        global_vmo_id: KernelVmoId,
-        bytes: &'static [u8],
-    ) -> Result<(), zx_status_t> {
-        self.global_vmos
-            .lock()
-            .register_pager_read_only(global_vmo_id, bytes)
-    }
-
     pub(super) fn register_pager_file_global_vmo(
         &mut self,
         global_vmo_id: KernelVmoId,
@@ -61,10 +51,6 @@ impl VmDomain {
         self.global_vmos
             .lock()
             .register_pager_source(global_vmo_id, source)
-    }
-
-    pub(super) fn bootstrap_user_runner_global_vmo_id(&self) -> Option<KernelVmoId> {
-        self.bootstrap_user_runner_global_vmo_id
     }
 
     pub(super) fn import_global_vmo_into_address_space(
@@ -157,6 +143,9 @@ impl VmDomain {
 
         let _ = self.ensure_vmo_backing_for_mapping(target_address_space_id, vmo)?;
         let global_vmo = self.global_vmos.lock().snapshot(vmo.global_vmo_id())?;
+        let clone_global_vmo_id = self.alloc_global_vmo_id();
+        let fault_source_global_vmo_id =
+            matches!(global_vmo.kind(), VmoKind::PagerBacked).then_some(vmo.global_vmo_id());
         let address_space = self
             .address_spaces
             .get_mut(&target_address_space_id)
@@ -165,7 +154,8 @@ impl VmDomain {
             .create_private_clone_vmo(
                 global_vmo.kind(),
                 global_vmo.size_bytes(),
-                vmo.global_vmo_id(),
+                clone_global_vmo_id,
+                fault_source_global_vmo_id,
                 global_vmo.frames(),
             )
             .map_err(map_address_space_error)
@@ -326,35 +316,6 @@ impl VmDomain {
         Ok(rounded_size)
     }
 
-    pub(super) fn create_pager_backed_vmo_for_address_space(
-        &mut self,
-        process_id: ProcessId,
-        address_space_id: AddressSpaceId,
-        bytes: &'static [u8],
-        global_vmo_id: KernelVmoId,
-    ) -> Result<CreatedVmo, zx_status_t> {
-        self.register_pager_backed_global_vmo(global_vmo_id, bytes)?;
-        let local_vmo_id =
-            match self.import_global_vmo_into_address_space(address_space_id, global_vmo_id) {
-                Ok(vmo_id) => vmo_id,
-                Err(err) => {
-                    let _ = self.global_vmos.lock().remove(global_vmo_id);
-                    return Err(err);
-                }
-            };
-        let vmo = self
-            .address_spaces
-            .get(&address_space_id)
-            .and_then(|space| space.vm.vmo(local_vmo_id))
-            .cloned()
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        Ok(CreatedVmo {
-            process_id,
-            address_space_id,
-            vmo,
-        })
-    }
-
     pub(super) fn create_pager_file_vmo_for_address_space(
         &mut self,
         process_id: ProcessId,
@@ -372,29 +333,6 @@ impl VmDomain {
                     return Err(err);
                 }
             };
-        let vmo = self
-            .address_spaces
-            .get(&address_space_id)
-            .and_then(|space| space.vm.vmo(local_vmo_id))
-            .cloned()
-            .ok_or(ZX_ERR_BAD_STATE)?;
-        Ok(CreatedVmo {
-            process_id,
-            address_space_id,
-            vmo,
-        })
-    }
-
-    pub(super) fn import_bootstrap_user_runner_vmo_for_address_space(
-        &mut self,
-        process_id: ProcessId,
-        address_space_id: AddressSpaceId,
-    ) -> Result<CreatedVmo, zx_status_t> {
-        let global_vmo_id = self
-            .bootstrap_user_runner_global_vmo_id
-            .ok_or(ZX_ERR_NOT_FOUND)?;
-        let local_vmo_id =
-            self.import_global_vmo_into_address_space(address_space_id, global_vmo_id)?;
         let vmo = self
             .address_spaces
             .get(&address_space_id)
@@ -472,7 +410,7 @@ impl AddressSpace {
     }
 
     pub(super) fn local_vmo_id(&self, global_vmo_id: KernelVmoId) -> Option<VmoId> {
-        self.vm.vmo_id_by_global_id(global_vmo_id)
+        self.vm.shared_vmo_id_by_backing_global_id(global_vmo_id)
     }
 
     pub(super) fn validate_vmo_resize(
@@ -510,10 +448,16 @@ impl AddressSpace {
         &mut self,
         kind: VmoKind,
         size: u64,
-        global_vmo_id: KernelVmoId,
+        clone_global_vmo_id: KernelVmoId,
+        fault_source_global_vmo_id: Option<KernelVmoId>,
         frames: &[Option<FrameId>],
     ) -> Result<VmoId, AddressSpaceError> {
-        let vmo_id = self.vm.create_vmo(kind, size, global_vmo_id)?;
+        let vmo_id = self.vm.create_private_clone_vmo(
+            kind,
+            size,
+            clone_global_vmo_id,
+            fault_source_global_vmo_id,
+        )?;
         for (page_index, frame_id) in frames.iter().copied().enumerate() {
             let Some(frame_id) = frame_id else {
                 continue;
@@ -541,13 +485,6 @@ impl AddressSpace {
                 Ok(false) | Err(_) => {}
             }
         }
-    }
-
-    pub(super) fn mapped_ranges_for_global_vmo(
-        &self,
-        global_vmo_id: KernelVmoId,
-    ) -> Vec<(u64, u64)> {
-        self.vm.mapped_ranges_for_global_vmo(global_vmo_id)
     }
 
     pub(super) fn imports_global_vmo(&self, global_vmo_id: KernelVmoId) -> bool {
@@ -645,16 +582,6 @@ impl Kernel {
         Ok(())
     }
 
-    pub(super) fn register_global_vmo_from_address_space(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        global_vmo_id: KernelVmoId,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm_mut(|vm| {
-            vm.register_global_vmo_from_address_space(address_space_id, global_vmo_id)
-        })
-    }
-
     pub(super) fn register_empty_global_vmo(
         &mut self,
         global_vmo_id: KernelVmoId,
@@ -662,33 +589,6 @@ impl Kernel {
         size_bytes: u64,
     ) -> Result<(), zx_status_t> {
         self.with_vm_mut(|vm| vm.register_empty_global_vmo(global_vmo_id, kind, size_bytes))
-    }
-
-    pub(super) fn import_global_vmo_into_address_space(
-        &mut self,
-        address_space_id: AddressSpaceId,
-        global_vmo_id: KernelVmoId,
-    ) -> Result<VmoId, zx_status_t> {
-        self.with_vm_mut(|vm| {
-            vm.import_global_vmo_into_address_space(address_space_id, global_vmo_id)
-        })
-    }
-
-    pub(super) fn update_global_vmo_frame(
-        &mut self,
-        global_vmo_id: KernelVmoId,
-        offset: u64,
-        frame_id: FrameId,
-    ) -> Result<(), zx_status_t> {
-        self.with_vm_mut(|vm| vm.update_global_vmo_frame(global_vmo_id, offset, frame_id))
-    }
-
-    pub(super) fn global_vmo_frame(
-        &self,
-        global_vmo_id: KernelVmoId,
-        offset: u64,
-    ) -> Result<Option<FrameId>, zx_status_t> {
-        self.with_vm(|vm| vm.global_vmo_frame(global_vmo_id, offset))
     }
 
     pub(crate) fn create_current_anonymous_vmo(

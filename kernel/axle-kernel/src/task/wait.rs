@@ -15,10 +15,12 @@ pub(crate) enum WaitRegistration {
         object_key: ObjectKey,
         watched: Signals,
         observed_ptr: u64,
+        revocation: axle_core::RevocationSet,
     },
     Port {
         port_object: ObjectKey,
         packet_ptr: u64,
+        revocation: axle_core::RevocationSet,
     },
     VmFault {
         key: FaultInFlightKey,
@@ -42,6 +44,15 @@ impl WaitRegistration {
             Self::Signal { object_key, .. } => WaitSourceKey::Signals(object_key),
             Self::Port { port_object, .. } => WaitSourceKey::PortReadable(port_object),
             Self::VmFault { key } => WaitSourceKey::Fault(key),
+        }
+    }
+
+    pub(super) const fn revocation(self) -> axle_core::RevocationSet {
+        match self {
+            Self::Signal { revocation, .. } | Self::Port { revocation, .. } => revocation,
+            Self::Sleep | Self::Futex { .. } | Self::VmFault { .. } => {
+                axle_core::RevocationSet::none()
+            }
         }
     }
 }
@@ -519,13 +530,6 @@ impl Kernel {
         Ok(())
     }
 
-    pub(crate) fn block_current(
-        &mut self,
-        registration: WaitRegistration,
-    ) -> Result<(), zx_status_t> {
-        self.park_current(registration, None)
-    }
-
     pub(crate) fn signal_waiters_ready(
         &self,
         object_key: ObjectKey,
@@ -542,6 +546,7 @@ impl Kernel {
                         object_key: wait_object_key,
                         watched,
                         observed_ptr,
+                        ..
                     }) if wait_object_key == object_key && current.intersects(watched) => {
                         Some(SignalWaiter {
                             thread_id: *thread_id,
@@ -566,6 +571,7 @@ impl Kernel {
                     Some(WaitRegistration::Port {
                         port_object: wait_port_object,
                         packet_ptr,
+                        ..
                     }) if wait_port_object == port_object => Some(PortWaiter {
                         thread_id: *thread_id,
                         seq: thread.wait.seq,
@@ -618,6 +624,35 @@ impl Kernel {
         self.remove_wait_source_membership(thread_id, registration);
         self.wake_thread(thread_id, reason)?;
         Ok(true)
+    }
+
+    pub(crate) fn cancel_revoked_blocking_waits(
+        &mut self,
+        group: axle_core::RevocationGroupId,
+        generation: u64,
+        current_epoch: u64,
+    ) -> Result<usize, zx_status_t> {
+        let revoked = self
+            .threads
+            .iter()
+            .filter_map(|(&thread_id, thread)| {
+                let registration = thread.wait.registration?;
+                registration
+                    .revocation()
+                    .contains_revoked(group, generation, current_epoch)
+                    .then_some(thread_id)
+            })
+            .collect::<Vec<_>>();
+        let mut canceled = 0usize;
+        for thread_id in revoked {
+            if self.complete_waiter_source_removed(
+                thread_id,
+                WakeReason::Status(axle_types::status::ZX_ERR_CANCELED),
+            )? {
+                canceled += 1;
+            }
+        }
+        Ok(canceled)
     }
 
     pub(crate) fn poll_reactor(&mut self, now: i64) -> ReactorPollResult {
@@ -673,7 +708,6 @@ impl Kernel {
         Ok(true)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn wake_futex_waiters(
         &mut self,
         key: FutexKey,
@@ -698,7 +732,6 @@ impl Kernel {
         Ok(result.remaining)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn requeue_futex_waiters(
         &mut self,
         source: FutexKey,
@@ -750,12 +783,10 @@ impl Kernel {
         Ok(result)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn futex_owner(&self, key: FutexKey) -> zx_koid_t {
         self.futexes.owner(key)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn thread_is_waiting_on_futex(&self, thread_id: ThreadId, key: FutexKey) -> bool {
         self.threads
             .get(&thread_id)
@@ -840,5 +871,112 @@ impl Kernel {
                 self.prepare_enqueue_eevdf(owner_tid, cpu_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::KernelState;
+
+    fn revocation_fixture(
+        state: &KernelState,
+    ) -> (axle_core::RevocationGroupToken, axle_core::RevocationRef) {
+        state
+            .with_core_mut_for_tests(|kernel| {
+                let token = kernel.create_revocation_group();
+                let revocation = kernel.snapshot_revocation_ref(token)?;
+                Ok((token, revocation))
+            })
+            .expect("revocation fixture")
+    }
+
+    #[test]
+    fn cancel_revoked_signal_wait_wakes_blocked_thread() {
+        let state = KernelState::new_for_tests();
+        let (token, revocation) = revocation_fixture(&state);
+        let thread_id = state
+            .with_kernel(|kernel| Ok(kernel.current_thread_info()?.thread_id()))
+            .expect("current thread id");
+
+        state
+            .with_kernel_mut(|kernel| {
+                let seq = kernel.park_current_with_seq(
+                    WaitRegistration::Signal {
+                        object_key: ObjectKey::from(0x100_u64),
+                        watched: Signals::OBJECT_READABLE,
+                        observed_ptr: 0,
+                        revocation: axle_core::RevocationSet::one(Some(revocation)),
+                    },
+                    None,
+                )?;
+                assert_eq!(kernel.thread_wait_seq(thread_id)?, Some(seq));
+                Ok(())
+            })
+            .expect("park signal wait");
+
+        let current_epoch = state
+            .with_core_mut_for_tests(|kernel| kernel.revoke_group_and_get_epoch(token))
+            .expect("revoke group");
+
+        state
+            .with_kernel_mut(|kernel| {
+                assert_eq!(
+                    kernel.cancel_revoked_blocking_waits(
+                        token.id(),
+                        token.generation(),
+                        current_epoch,
+                    )?,
+                    1
+                );
+                assert_eq!(kernel.thread_wait_registration(thread_id)?, None);
+                assert_eq!(kernel.thread_state(thread_id)?, ThreadState::Runnable);
+                Ok(())
+            })
+            .expect("cancel revoked waits");
+    }
+
+    #[test]
+    fn cancel_revoked_port_wait_wakes_blocked_thread() {
+        let state = KernelState::new_for_tests();
+        let (token, revocation) = revocation_fixture(&state);
+        let thread_id = state
+            .with_kernel(|kernel| Ok(kernel.current_thread_info()?.thread_id()))
+            .expect("current thread id");
+
+        state
+            .with_kernel_mut(|kernel| {
+                let seq = kernel.park_current_with_seq(
+                    WaitRegistration::Port {
+                        port_object: ObjectKey::from(0x200_u64),
+                        packet_ptr: 0,
+                        revocation: axle_core::RevocationSet::one(Some(revocation)),
+                    },
+                    None,
+                )?;
+                assert_eq!(kernel.thread_wait_seq(thread_id)?, Some(seq));
+                Ok(())
+            })
+            .expect("park port wait");
+
+        let current_epoch = state
+            .with_core_mut_for_tests(|kernel| kernel.revoke_group_and_get_epoch(token))
+            .expect("revoke group");
+
+        state
+            .with_kernel_mut(|kernel| {
+                assert_eq!(
+                    kernel.cancel_revoked_blocking_waits(
+                        token.id(),
+                        token.generation(),
+                        current_epoch,
+                    )?,
+                    1
+                );
+                assert_eq!(kernel.thread_wait_registration(thread_id)?, None);
+                assert_eq!(kernel.thread_state(thread_id)?, ThreadState::Runnable);
+                Ok(())
+            })
+            .expect("cancel revoked waits");
     }
 }

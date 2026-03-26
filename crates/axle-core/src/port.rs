@@ -14,6 +14,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::capability::ObjectKey;
+use crate::revocation::RevocationSet;
 use crate::signals::Signals;
 use crate::timer::Time;
 
@@ -54,6 +55,8 @@ pub struct Packet {
     pub count: u32,
     /// For signal packets: trigger timestamp; 0 when timestamp delivery was not requested.
     pub timestamp: Time,
+    /// Kernel-internal revocation provenance for deferred control-plane packets.
+    pub revocation: RevocationSet,
     /// For user packets: caller-provided status.
     pub status: i32,
     /// For user packets: raw 32-byte payload.
@@ -76,6 +79,7 @@ impl Packet {
             observed: Signals::NONE,
             count: 0,
             timestamp: 0,
+            revocation: RevocationSet::none(),
             status,
             user,
         }
@@ -90,6 +94,27 @@ impl Packet {
         count: u32,
         timestamp: Time,
     ) -> Self {
+        Self::signal_with_revocation(
+            key,
+            waitable,
+            trigger,
+            observed,
+            count,
+            timestamp,
+            RevocationSet::none(),
+        )
+    }
+
+    /// Create a signal packet with explicit deferred revocation provenance.
+    pub fn signal_with_revocation(
+        key: PortKey,
+        waitable: WaitableId,
+        trigger: Signals,
+        observed: Signals,
+        count: u32,
+        timestamp: Time,
+        revocation: RevocationSet,
+    ) -> Self {
         Self {
             key,
             kind: PacketKind::Signal,
@@ -98,6 +123,7 @@ impl Packet {
             observed,
             count,
             timestamp,
+            revocation,
             status: 0,
             user: [0; 4],
         }
@@ -139,6 +165,15 @@ pub enum PortError {
     AlreadyExists,
     /// Cancel requested for a non-existent wait.
     NotFound,
+}
+
+/// Queue-backend failure returned by one concrete packet-storage implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketQueueError {
+    /// The backend cannot currently accept another packet.
+    Full,
+    /// The backend failed to persist one packet even though a slot was available.
+    Backend,
 }
 
 /// Stable telemetry snapshot for one port queue.
@@ -280,11 +315,16 @@ pub trait PacketQueue: core::fmt::Debug {
 
     /// Push one packet to the back of the queue.
     ///
-    /// Returns the original packet when the backend cannot store it.
-    fn push_back(&mut self, pkt: Packet) -> Result<(), Packet>;
+    /// Returns a backend-specific storage failure when the packet could not be stored.
+    fn push_back(&mut self, pkt: Packet) -> Result<(), PacketQueueError>;
 
     /// Pop one packet from the front of the queue.
     fn pop_front(&mut self) -> Option<Packet>;
+
+    /// Retain only packets that satisfy `keep`.
+    fn retain<F>(&mut self, keep: F)
+    where
+        F: FnMut(&Packet) -> bool;
 }
 
 /// Default in-memory packet queue used by host tests and simple kernel bring-up.
@@ -307,13 +347,20 @@ impl PacketQueue for VecPortQueue {
         self.packets.len()
     }
 
-    fn push_back(&mut self, pkt: Packet) -> Result<(), Packet> {
+    fn push_back(&mut self, pkt: Packet) -> Result<(), PacketQueueError> {
         self.packets.push_back(pkt);
         Ok(())
     }
 
     fn pop_front(&mut self) -> Option<Packet> {
         self.packets.pop_front()
+    }
+
+    fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&Packet) -> bool,
+    {
+        self.packets.retain(|packet| keep(packet));
     }
 }
 
@@ -483,6 +530,23 @@ impl<Q: PacketQueue> PortState<Q> {
         self.telemetry.record_depth(self.q.len());
         Ok(pkt)
     }
+
+    /// Retain only kernel-generated packets that satisfy `keep`.
+    ///
+    /// User packets are left untouched.
+    pub fn retain_kernel_packets<F>(&mut self, mut keep: F) -> usize
+    where
+        F: FnMut(&Packet) -> bool,
+    {
+        let before = self.q.len();
+        self.q
+            .retain(|packet| packet.kind == PacketKind::User || keep(packet));
+        let removed = before.saturating_sub(self.q.len());
+        if removed != 0 {
+            self.telemetry.record_depth(self.q.len());
+        }
+        removed
+    }
 }
 
 #[cfg(test)]
@@ -540,5 +604,54 @@ mod tests {
             )),
             Err(PortError::ShouldWait)
         );
+    }
+
+    #[test]
+    fn retain_kernel_packets_drops_only_revoked_control_packets() {
+        let mut mgr = crate::revocation::RevocationManager::new();
+        let live_token = mgr.create_group();
+        let revoked_token = mgr.create_group();
+        let live_ref = mgr.snapshot(live_token).unwrap();
+        let revoked_ref = mgr.snapshot(revoked_token).unwrap();
+        mgr.revoke(revoked_token).unwrap();
+        let current_epoch = mgr.epoch_of(revoked_token.id()).unwrap();
+
+        let mut port = Port::new(8, 2);
+        port.queue_user(Packet::user(11)).unwrap();
+        port.queue_kernel(Packet::signal_with_revocation(
+            1,
+            10.into(),
+            Signals::TIMER_SIGNALED,
+            Signals::TIMER_SIGNALED,
+            1,
+            10,
+            crate::RevocationSet::one(Some(live_ref)),
+        ))
+        .unwrap();
+        port.queue_kernel(Packet::signal_with_revocation(
+            2,
+            20.into(),
+            Signals::CHANNEL_READABLE,
+            Signals::CHANNEL_READABLE,
+            1,
+            20,
+            crate::RevocationSet::one(Some(revoked_ref)),
+        ))
+        .unwrap();
+
+        let removed = port.retain_kernel_packets(|packet| {
+            !packet.revocation.contains_revoked(
+                revoked_token.id(),
+                revoked_token.generation(),
+                current_epoch,
+            )
+        });
+        assert_eq!(removed, 1);
+
+        let first = port.pop().unwrap();
+        assert_eq!(first.kind, PacketKind::User);
+        let second = port.pop().unwrap();
+        assert_eq!(second.key, 1);
+        assert!(port.is_empty());
     }
 }

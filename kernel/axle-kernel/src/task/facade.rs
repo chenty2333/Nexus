@@ -19,7 +19,6 @@ impl VmFacade {
         let mut vm = VmDomain {
             address_spaces: BTreeMap::new(),
             global_vmos: Arc::new(Mutex::new(GlobalVmoStore::default())),
-            bootstrap_user_runner_global_vmo_id: None,
             bootstrap_user_code_global_vmo_id: None,
             frames: Arc::new(Mutex::new(FrameTable::new())),
             cow_fault_count: 0,
@@ -73,7 +72,6 @@ impl VmFacade {
             });
             vm.register_pager_source_handle(global_vmo_id, source.clone())
                 .expect("bootstrap runner pager vmo registration must succeed");
-            vm.bootstrap_user_runner_global_vmo_id = Some(global_vmo_id);
             *BOOTSTRAP_USER_RUNNER_SOURCE.lock() = Some(source);
         }
 
@@ -536,7 +534,6 @@ impl Kernel {
             .insert(root_job_id, Job::new_root(root_job_koid));
         kernel.root_job_id = root_job_id;
         let process_id = kernel.alloc_process_id();
-        let process_koid = kernel.alloc_koid();
         kernel.processes.insert(
             process_id,
             Process::bootstrap(
@@ -547,7 +544,6 @@ impl Kernel {
                     .get(&root_job_id)
                     .expect("root job must exist")
                     .policy_rights_ceiling,
-                process_koid,
             ),
         );
         kernel

@@ -26,7 +26,7 @@ impl GlobalVmo {
 
 pub(super) type PagerReadAtFn = fn(offset: u64, dst: &mut [u8]) -> Result<(), zx_status_t>;
 
-trait PagerReadOnlySource: Send + Sync {
+pub(super) trait PagerReadOnlySource: Send + Sync {
     fn size_bytes(&self) -> u64;
 
     fn read_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), zx_status_t>;

@@ -46,24 +46,32 @@ pub const IST_GP_INDEX: u8 = 4;
 
 #[repr(align(16))]
 #[derive(Clone, Copy)]
-struct AlignedRing0Stack([u8; RING0_STACK_SIZE as usize]);
+struct AlignedRing0Stack {
+    _bytes: [u8; RING0_STACK_SIZE as usize],
+}
 
 // 128 KiB ring0 stack for ring3->ring0 transitions, per CPU. Trap-blocking
 // waits and timer-driven wakeups can stack several kernel frames on the same
 // per-CPU stack before returning to user mode.
-static mut RING0_STACKS: [AlignedRing0Stack; MAX_CPUS] =
-    [AlignedRing0Stack([0; RING0_STACK_SIZE as usize]); MAX_CPUS];
+static mut RING0_STACKS: [AlignedRing0Stack; MAX_CPUS] = [AlignedRing0Stack {
+    _bytes: [0; RING0_STACK_SIZE as usize],
+}; MAX_CPUS];
 
 #[repr(align(16))]
 #[derive(Clone, Copy)]
-struct AlignedIstStack([u8; IST_STACK_SIZE as usize]);
+struct AlignedIstStack {
+    _bytes: [u8; IST_STACK_SIZE as usize],
+}
 
-static mut IST1_STACKS: [AlignedIstStack; MAX_CPUS] =
-    [AlignedIstStack([0; IST_STACK_SIZE as usize]); MAX_CPUS];
-static mut IST3_STACKS: [AlignedIstStack; MAX_CPUS] =
-    [AlignedIstStack([0; IST_STACK_SIZE as usize]); MAX_CPUS];
-static mut IST4_STACKS: [AlignedIstStack; MAX_CPUS] =
-    [AlignedIstStack([0; IST_STACK_SIZE as usize]); MAX_CPUS];
+static mut IST1_STACKS: [AlignedIstStack; MAX_CPUS] = [AlignedIstStack {
+    _bytes: [0; IST_STACK_SIZE as usize],
+}; MAX_CPUS];
+static mut IST3_STACKS: [AlignedIstStack; MAX_CPUS] = [AlignedIstStack {
+    _bytes: [0; IST_STACK_SIZE as usize],
+}; MAX_CPUS];
+static mut IST4_STACKS: [AlignedIstStack; MAX_CPUS] = [AlignedIstStack {
+    _bytes: [0; IST_STACK_SIZE as usize],
+}; MAX_CPUS];
 
 static TSS: [Once<TaskStateSegment>; MAX_CPUS] = [const { Once::new() }; MAX_CPUS];
 static GDT: [Once<(GlobalDescriptorTable, Selectors)>; MAX_CPUS] =
@@ -88,7 +96,9 @@ pub fn init() -> &'static Selectors {
     if let (Some(cpu_slot), Some(apic_id)) = (
         crate::arch::percpu::try_current_cpu_slot(),
         crate::arch::percpu::try_current_apic_id(),
-    ) {
+    ) && cpu_slot < MAX_CPUS
+        && (apic_id as usize) < super::MAX_APIC_IDS
+    {
         return init_cpu(cpu_slot, apic_id as usize);
     }
 
@@ -114,29 +124,32 @@ fn init_cpu(cpu: usize, apic_id: usize) -> &'static Selectors {
         apic_id
     );
 
+    // SAFETY: stack storage is static and indexed only after validating `cpu`.
+    let ring0_stack_end =
+        unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(RING0_STACKS[cpu])) + RING0_STACK_SIZE };
+    // SAFETY: stack storage is static and indexed only after validating `cpu`.
+    let ist1_end =
+        unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(IST1_STACKS[cpu])) + IST_STACK_SIZE };
+    // SAFETY: stack storage is static and indexed only after validating `cpu`.
+    let ist3_end =
+        unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(IST3_STACKS[cpu])) + IST_STACK_SIZE };
+    // SAFETY: stack storage is static and indexed only after validating `cpu`.
+    let ist4_end =
+        unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(IST4_STACKS[cpu])) + IST_STACK_SIZE };
+
     let tss = TSS[cpu].call_once(|| {
         let mut tss = TaskStateSegment::new();
 
-        // SAFETY: stacks are statically allocated and live for the whole kernel lifetime.
-        let stack_start = unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(RING0_STACKS[cpu])) };
-        let stack_end = stack_start + RING0_STACK_SIZE;
-        tss.privilege_stack_table[0] = stack_end;
+        tss.privilege_stack_table[0] = ring0_stack_end;
 
         // IST1 for double fault. (IDT uses IST index 1, which maps to table[0].)
-        // SAFETY: stacks are statically allocated and live for the whole kernel lifetime.
-        let ist_start = unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(IST1_STACKS[cpu])) };
-        let ist_end = ist_start + IST_STACK_SIZE;
-        tss.interrupt_stack_table[0] = ist_end;
+        tss.interrupt_stack_table[0] = ist1_end;
         // Keep faults on a dedicated IST so a #PF taken while already handling kernel work
         // does not reuse the current kernel stack top.
-        let fault_ist_start = unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(IST3_STACKS[cpu])) };
-        let fault_ist_end = fault_ist_start + IST_STACK_SIZE;
-        tss.interrupt_stack_table[2] = fault_ist_end;
+        tss.interrupt_stack_table[2] = ist3_end;
         // IST4 for #GP -- separate from #PF (IST3) so a nested #GP inside a #PF
         // handler (or vice versa) does not overwrite the outer exception frame.
-        let gp_ist_start = unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(IST4_STACKS[cpu])) };
-        let gp_ist_end = gp_ist_start + IST_STACK_SIZE;
-        tss.interrupt_stack_table[3] = gp_ist_end;
+        tss.interrupt_stack_table[3] = ist4_end;
         tss
     });
 

@@ -1,5 +1,5 @@
 id = "kernel.handle.revocation_bootstrap"
-description = "Public revocation groups should invalidate delegated duplicates and transferred handles by epoch while leaving the source handle alive"
+description = "Public revocation groups should invalidate stale delegated authority, purge deferred control-plane state, and leave fresh post-revoke delegations live"
 tags = ["kernel", "handle", "revocation", "bootstrap", "qemu"]
 timeout_ms = 180000
 
@@ -13,7 +13,7 @@ expect = [
   "kernel: revocation smoke",
 ]
 forbid = ["KERNEL PANIC"]
-contracts = []
+contracts = ["must.handle.revocation_deferred_control_state_bootstrap"]
 
 [assertions.status_code]
 eventpair_create = 0
@@ -24,14 +24,28 @@ dup_inherited = 0
 channel_create = 0
 channel_write = 0
 channel_read = 0
+port_create = 0
+port_arm_before = 0
+base_signal_before_revoke = 0
+timer_create = 0
+timer_dup_before = 0
+timer_set_before = 0
 revoke = 0
 info_after = 0
-base_signal = 0
+port_wait_purged = -14
 base_wait = 0
 inherited_wait_bad_handle = -11
 transferred_wait_bad_handle = -11
+timer_wait_after_revoke = -23
 inherited_dup_bad_handle = -11
+base_clear_after_revoke = 0
 dup_after_revoke = 0
+port_arm_after = 0
+base_signal_after_revoke = 0
+port_wait_fresh = 0
+timer_dup_after = 0
+timer_set_after = 0
+timer_wait_fresh = 0
 dup_after_revoke_dup = 0
 
 [assertions.packet_fields]
@@ -44,3 +58,8 @@ transferred_actual_handles = 1
 group_epoch_after = 1
 group_generation_after = 1
 base_wait_observed = 16777216
+port_wait_fresh_key = 4276993775
+port_wait_fresh_type = 1
+port_wait_fresh_observed = 16777216
+timer_wait_after_revoke_observed = 0
+timer_wait_fresh_observed = 8

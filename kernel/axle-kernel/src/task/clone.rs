@@ -14,6 +14,7 @@ struct VmarClonePlan {
     source_kind: VmoKind,
     source_size_bytes: u64,
     source_global_vmo_id: KernelVmoId,
+    source_fault_global_vmo_id: Option<KernelVmoId>,
     source_frames: Vec<Option<FrameId>>,
 }
 
@@ -124,6 +125,7 @@ impl VmDomain {
                 source_kind: source_vmo.kind(),
                 source_size_bytes: source_vmo.size_bytes(),
                 source_global_vmo_id: map_rec.global_vmo_id(),
+                source_fault_global_vmo_id: source_vmo.fault_source_id(),
                 source_frames: source_vmo.frames().to_vec(),
             });
         }
@@ -214,13 +216,15 @@ impl VmDomain {
             plan.len,
         )?;
 
+        let clone_global_vmo_id = self.alloc_global_vmo_id();
         let dst_vmo_id =
             self.with_address_space_frames_mut(dst_address_space_id, |address_space, _frames| {
                 address_space
                     .create_private_clone_vmo(
                         plan.source_kind,
                         plan.source_size_bytes,
-                        plan.source_global_vmo_id,
+                        clone_global_vmo_id,
+                        plan.source_fault_global_vmo_id,
                         &plan.source_frames,
                     )
                     .map_err(map_address_space_error)

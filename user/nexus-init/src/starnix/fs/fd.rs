@@ -1,6 +1,8 @@
 use super::super::*;
 use super::devfs::{NullFd, ZeroFd};
-use super::tty::{DevDirFd, PtyRegistry, PtySlaveFd, RemoteTtyBridge, tty_endpoint_identity};
+use super::tty::{
+    DevDirFd, DevPtsDirFd, PtyRegistry, PtySlaveFd, RemoteTtyBridge, tty_endpoint_identity,
+};
 
 #[derive(Clone, Copy)]
 pub(in crate::starnix) struct LinuxStatMetadata {
@@ -290,6 +292,56 @@ impl FsContext {
 }
 
 impl ProcessResources {
+    fn stat_metadata_for_temporary_open(
+        opened: Arc<dyn FdOps>,
+    ) -> Result<LinuxStatMetadata, zx_status_t> {
+        let metadata = stat_metadata_for_ops(opened.as_ref());
+        let close_status = opened.close();
+        match metadata {
+            Ok(metadata) => {
+                close_status?;
+                Ok(metadata)
+            }
+            Err(status) => {
+                let _ = close_status;
+                Err(status)
+            }
+        }
+    }
+
+    fn stat_metadata_for_absolute_dev_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<LinuxStatMetadata>, zx_status_t> {
+        if path != "/dev" && !path.starts_with("/dev/") {
+            return Ok(None);
+        }
+        let Some(entry) = self.fs.base_namespace.mounts().get("/dev")? else {
+            return Ok(None);
+        };
+        let Some(dev_dir) = entry.target().as_any().downcast_ref::<DevDirFd>() else {
+            return Ok(None);
+        };
+        let relative = path.strip_prefix("/dev").unwrap_or(path).trim_matches('/');
+        Ok(Some(dev_dir.stat_metadata_at(relative)?))
+    }
+
+    fn stat_metadata_for_dir_relative_path(
+        &self,
+        dirfd: i32,
+        path: &str,
+    ) -> Result<Option<LinuxStatMetadata>, zx_status_t> {
+        let entry = self.fs.fd_table.get(dirfd).ok_or(ZX_ERR_BAD_HANDLE)?;
+        let ops = entry.description().ops().as_ref();
+        if let Some(dev_dir) = ops.as_any().downcast_ref::<DevDirFd>() {
+            return Ok(Some(dev_dir.stat_metadata_at(path)?));
+        }
+        if let Some(pts_dir) = ops.as_any().downcast_ref::<DevPtsDirFd>() {
+            return Ok(Some(pts_dir.stat_metadata_at(path)?));
+        }
+        Ok(None)
+    }
+
     pub(in crate::starnix) fn new(
         process_handle: zx_handle_t,
         root_vmar: zx_handle_t,
@@ -766,22 +818,32 @@ impl ProcessResources {
             }
             return self.stat_metadata_for_fd(dirfd);
         }
-        let opened = if path.starts_with('/') || dirfd == LINUX_AT_FDCWD {
-            self.fs.namespace.open(path, OpenFlags::READABLE)
-        } else {
-            self.fs
-                .fd_table
-                .get(dirfd)
-                .ok_or(ZX_ERR_BAD_HANDLE)
-                .and_then(|entry| {
-                    entry
-                        .description()
-                        .ops()
-                        .openat(path, OpenFlags::READABLE | OpenFlags::PATH)
-                })
-        };
-        let ops = opened?;
-        stat_metadata_for_ops(ops.as_ref())
+        if path.starts_with('/') || dirfd == LINUX_AT_FDCWD {
+            let resolved = self.fs.namespace.resolve_path(path)?;
+            if let Some(metadata) = self.stat_metadata_for_absolute_dev_path(resolved.as_str())? {
+                return Ok(metadata);
+            }
+            let opened = self
+                .fs
+                .namespace
+                .open(resolved.as_str(), OpenFlags::READABLE);
+            return opened.and_then(Self::stat_metadata_for_temporary_open);
+        }
+        if let Some(metadata) = self.stat_metadata_for_dir_relative_path(dirfd, path)? {
+            return Ok(metadata);
+        }
+        let opened = self
+            .fs
+            .fd_table
+            .get(dirfd)
+            .ok_or(ZX_ERR_BAD_HANDLE)
+            .and_then(|entry| {
+                entry
+                    .description()
+                    .ops()
+                    .openat(path, OpenFlags::READABLE | OpenFlags::PATH)
+            })?;
+        Self::stat_metadata_for_temporary_open(opened)
     }
 
     pub(in crate::starnix) fn statat(
