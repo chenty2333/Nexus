@@ -9,9 +9,11 @@ spike, the scheduler crash-to-fallback slice, and one bounded pager
 crash/rebind/timeout slice. Stage 5 now also has a checked mediated-I/O protocol
 and safe-Rust oracle plus one bounded, one-page patched-OSTD IOTLB-ownership
 receipt. Stage 5B adds a bounded real-device receipt for mediated readonly
-VirtIO, reset/tombstone recovery, and three-owner IOTLB closure. The pager and
-device results are **Observed**, not a production pager or I/O subsystem. The
-foundation decision is **OSTD-first**, not
+VirtIO, reset/tombstone recovery, and three-owner IOTLB closure. Stage 6A adds
+the bounded personality spec/oracle, one static `linux-hello` execution, and two
+same-implementation companion personality-closure scopes. The pager, device,
+and Linux results are **Observed**, not a production pager, I/O subsystem, or
+Linux personality. The foundation decision is **OSTD-first**, not
 irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an
 upstream API or a small audited adapter/patch without violating single-owner
 hardware control, Nexus must re-evaluate the foundation explicitly. That
@@ -84,6 +86,7 @@ The following extractions are already present in the new tree:
 | six selected old vertical-slice observations | `specs/oracles/legacy-slices.toml` | schema v1 parses; no legacy build command is retained |
 | 34 Linux C/assembly guest inputs | `tests/guest/linux/sources/` | every copy matches both its legacy source and the SHA-256 in `SOURCES.toml` |
 | 28 old Linux compatibility scenarios plus one superseded guest input | `tests/guest/linux/COMPATIBILITY.toml` | all source IDs resolve and all 34 copied inputs are referenced; only six `core` workloads are Stage 6 commitments, with the remainder marked `stretch` or `archive-input` |
+| first static Linux pressure input | retained `linux-hello/hello.S` -> isolated OSTD guest artifact | Docker builds the unchanged source as a static x86-64 `ET_EXEC`; source and generated ELF SHA-256 values are gated, while the other five core workloads remain unexecuted |
 
 These receipts do not authorize deletion by themselves; the build, CI, and
 neutral-runner gates above must pass in the same cleanup checkpoint.
@@ -193,16 +196,65 @@ not establish physical PCIe drain, IRQ/MSI quiescence, per-device isolation,
 multi-page/SMP liveness, irreversible write or network semantics, a real-time
 deadline worker, system-wide fault injection or k/N scaling.
 
+## Stage 6A bounded Linux receipt
+
+The first Linux pressure gate is recorded as **bounded slice complete /
+Observed**:
+
+- `PersonalityCser.tla` separates `write` backend commitment from guest reply
+  and models crash/snapshot/ready/rebind/adopt plus authority closure. Its
+  two-ID safety graph completed with 20,478 generated states, 12,802 distinct
+  states and depth 20; the independent one-ID action/liveness graph completed
+  with 629 generated, 507 distinct and depth 14. Three coverage witnesses
+  reached post-commit recovery, single-exit/no-resume, and committed-drain plus
+  uncommitted-abort closure;
+- the safe-Rust personality oracle passed seven deterministic tests and three
+  proptests for full-identity tokens, commit/reply ordering, crash/rebind/adopt,
+  revoke races, failure-atomic rejection, and single delivery;
+- Docker reproducibly builds the unchanged retained `linux-hello/hello.S` as a
+  static x86-64 `ET_EXEC`; the source and generated ELF hashes, W^X, program
+  headers, entry and minimal aligned initial stack are gated;
+- one workload boot observes a real scheduler-policy fault and first FIFO
+  fallback pick, a lazy file-backed instruction fault followed by code-pager
+  crash/rebind/adopt and one RX mapping/resume, then Linux `write` and
+  `exit_group` dispatch;
+- linuxd-v1 publishes the write backend once and faults before guest reply.
+  Fresh linuxd-v2 snapshots/rebinds/adopts the committed continuation, receives
+  `AlreadyCommitted` on the duplicate backend attempt, and publishes one guest
+  reply/resume. Full-token stale/no-supervisor/identity, unknown opcode,
+  duplicate adopt/reply, and invalid exit ordering attempts are rejected with
+  identical logged semantic projections;
+- `exit_group` follows explicit `Captured -> ReplyPrepared -> Completed`,
+  publishes one process exit, and never re-enters guest `UserMode`;
+- companion scopes 31 and 32 instantiate the same `PersonalityScenario` and
+  transition helpers. The former observes revoke-before-commit and one abort;
+  the latter observes commit-before-revoke and one kernel drain. Both reject an
+  early `RevokeComplete`, reject post-revoke user commit/reply without mutation,
+  consume and publish one real OSTD waker, empty their live index, and only then
+  reach `RevokeComplete`.
+
+This receipt is not the whole Stage 6 gate. It uses one CPU, fixed enqueue
+order, one process/thread, one lazy code page, a single-slot portal, static
+`ET_EXEC`, `write(1, ...)`, and `exit_group(0)`. Most linuxd control flow is a
+freestanding Rust `global_asm!` dispatch probe; the kernel harness still owns
+portal delivery, bounded copy-in and state transitions. Scope 30 is co-tagged
+across scheduler, pager and personality but is not itself revoked; the two
+closure scopes are personality-only companions, not a unified cross-service
+registry. The v1 delayed reply uses a bounded kernel queue, code-pager stale
+cases remain predicate probes, and there is no personality timeout/tombstone,
+dynamic loader, threads/futex, fd/epoll, filesystem/network, SMP or production
+capability implementation. The other five core Linux workloads remain pending.
+
 ## Current research assets
 
 | Path | Status | Disposition |
 | --- | --- | --- |
-| `specs/cser/` | **KEEP** | Normative baseline, pager, and mediated-I/O TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice. |
-| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, pager, and mediated-I/O reference semantics and differential oracles. |
-| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, the bounded pager recover/timeout slice, and the IOMMU fail-closed result. It may later be superseded by a broader prototype, but must remain runnable until then. |
+| `specs/cser/` | **KEEP** | Normative baseline, pager, mediated-I/O, and bounded personality TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice. |
+| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, pager, mediated-I/O, and bounded personality reference semantics and differential oracles. |
+| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, the bounded pager recover/timeout slice, the IOMMU fail-closed result, and the first static `linux-hello` pressure slice. It may later be superseded by a broader prototype, but must remain runnable until then. |
 | `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for mediated readonly VirtIO, fail-closed reset/IOTLB tombstones, and three-owner queued IOTLB closure. Preserve both the Stage 5A no-device boundary and Stage 5B real-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
-| `tests/guest/linux/` | **KEEP** | Compatibility workload inputs for the eventual Linux personality. These do not define Nexus's research identity. |
+| `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello` is the active Stage 6A input; the other five core workloads remain pending and the rest provide optional or archival breadth. These do not define Nexus's research identity. |
 | `VISION.md` | **KEEP** | Research question, exclusions, candidate contribution, and evidence threshold. |
 | `ARCHITECTURE.md` | **KEEP** | OSTD boundary, minimal kernel mechanisms, user-service boundary, and failure semantics. |
 | `REWORK.md` | **KEEP** | This migration/deletion ledger. Update it when a row changes state. |
@@ -254,14 +306,14 @@ deadline worker, system-wide fault injection or k/N scaling.
 | `object/device.rs`, DMA objects, old PCI exports | **MIGRATE** | Preserve interrupt, queue, pin-budget, and fail-closed questions. Rewrite device mediation and real IOMMU quiescence. The old identity-IOVA path is not reusable evidence of closure. |
 | channel/socket/object/handle implementation | **DELETE** | Zircon-shaped object semantics are not a research goal. Reintroduce only minimal native IPC required by a vertical slice. |
 | old syscall dispatcher and generated Axle ABI | **DELETE** | Define a small native Nexus ABI; do not preserve syscall numbers for compatibility. |
-| legacy trace implementation | **MIGRATE** | Retain measurement categories and artifact discipline, then define a CSER trace containing scope/effect IDs, both epochs, transition, result, and latency. |
+| legacy trace implementation | **MIGRATE** | Retain measurement categories and artifact discipline. Current CSER traces already carry scope/effect IDs, both epochs, transitions, and results; migrate only useful legacy measurements into that schema, then add sequence and latency fields for failure and `k`-scaling reports. |
 
 ## Userspace and guest programs
 
 | Module | Status | Disposition |
 | --- | --- | --- |
 | `user/nexus-init` root/component orchestration | **DELETE** | Remove the old component manager, resolver, namespace, asset embedding, and Fuchsia-shaped lifecycle. |
-| `user/nexus-init/src/starnix` | **REWRITE** | A future Linux personality is a new, bounded compatibility server. Do not copy the old guest-session/sidecar/stop-packet implementation. |
+| `user/nexus-init/src/starnix` | **REWRITE** | Stage 6A now provides one new, bounded Linux-personality slice under the OSTD experiment; expand that compatibility server without copying the old guest-session/sidecar/stop-packet implementation. |
 | `user/nexus-init/src/starnix/tests` | **MIGRATE** | Convert coverage intent into `tests/guest/linux/COMPATIBILITY.toml`; do not retain host tests coupled to old internal objects. |
 | `user/nexus-init` network and remote-shell code | **DELETE** | Rebuild later over mediated VirtIO and a reused userspace network stack. |
 | `user/test-runner` | **MIGRATE** | Extract only selected race/slice observations and neutral serial assertions, then delete the fixed-VA/libzircon runner. |

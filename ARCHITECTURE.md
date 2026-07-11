@@ -8,9 +8,10 @@ already demonstrated. The evidence terms **Specified**, **Checked**,
 `VISION.md`.
 
 For baseline operations, `specs/cser/Cser.tla` is the semantic source of truth;
-`specs/cser/PagerCser.tla` and `specs/cser/IoCser.tla` are the explicit pager
-and mediated-I/O successor refinements. `crates/cser-model` provides the
-corresponding executable oracles. A future implementation must refine those
+`specs/cser/PagerCser.tla`, `specs/cser/IoCser.tla`, and
+`specs/cser/PersonalityCser.tla` are the explicit pager, mediated-I/O, and
+bounded Linux-personality successor refinements. `crates/cser-model` provides
+the corresponding executable oracles. An implementation must refine those
 operations or change the relevant model first; it must not silently redefine
 their linearization points. Sections marked planned extend beyond the current
 finite models.
@@ -292,7 +293,7 @@ The observed path is:
 ```text
 UserMode syscall -> proposal -> Commit selected task
 UserMode page fault -> policy Crash -> binding epoch 1 -> 2
-kernel FIFO fallback -> FallbackPick within one tick of Crash (0-1 observed)
+first post-Crash fallback selection attempt -> kernel FIFO FallbackPick
 proposal before rebind -> reject no supervisor
 kernel probe exercises Rebind transition at epoch 2
 epoch-1 proposal -> reject stale
@@ -308,8 +309,9 @@ OSTD `Waiter`/`Waker` and `Jiffies` with an effect token.
 Limitations:
 
 - there is one run queue and one CPU;
-- the measured crash fallback bound is one tick in this test configuration, not
-  a general real-time guarantee;
+- the deterministic receipt checks the first post-crash fallback selection
+  attempt in this one-CPU configuration; the raw timer delta is diagnostic only
+  and is recorded per artifact, not treated as a general real-time guarantee;
 - the compiled lease-expiry branch was not independently exercised;
 - no real replacement supervisor lifecycle or ready handshake is observed;
 - SMP proposal races, migration, fairness, and complete scope revocation remain
@@ -530,7 +532,8 @@ remain open.
 
 ## Linux personality
 
-Status: **Planned last-stage pressure test**.
+Status: **Stage 6A bounded `linux-hello` slice complete / Observed; the full
+Linux pressure gate remains in progress**.
 
 The Linux personality is a user-space compatibility service. It may implement
 Linux syscall dispatch, process/thread semantics, memory mappings, file
@@ -538,13 +541,79 @@ descriptors, pipes, epoll, signals, filesystems, sockets, ELF/auxv integration,
 and namespaces by composing Nexus services. Linux UAPI definitions and libc are
 reused rather than handwritten.
 
+The current bounded slice executes this concrete path:
+
+```text
+retained static ELF64 ET_EXEC
+  -> validated load plan and Linux initial stack
+  -> lazy executable-page instruction fault
+  -> pager-v1 crash -> snapshot/ready/rebind/adopt -> one RX publish/resume
+  -> write capture -> prepare -> backend commit
+  -> linuxd-v1 crash before guest reply
+  -> snapshot/ready/rebind/adopt in fresh linuxd-v2
+  -> duplicate backend commit fenced -> one reply/resume
+  -> companion revoke-before-commit abort and commit-before-revoke drain
+  -> exit_group prepare -> one process terminalization, no user-mode resume
+```
+
+The loader uses `object 0.39.1`; the freestanding linuxd dispatch probes use
+`linux-raw-sys 0.12.1`. The guest, scheduler-policy task, code-pager v1/v2, and
+linuxd v1/v2 all enter real OSTD `UserMode` paths. Portal delivery gives linuxd
+an immutable syscall snapshot and no writable guest context. For `write`, the
+kernel-owned serial publication is the concrete `BackendCommit`; guest reply is
+a distinct later transition. A committed obligation survives the personality
+crash, and v2 observes `AlreadyCommitted` rather than publishing output again.
+For `exit_group`, an explicit `Prepare` moves `Captured -> ReplyPrepared`; the
+later `Commit kind=exit_group` is the terminal reply, not a backend-output
+commit.
+
+One workload scope currently carries five distinct effect identities:
+
+| Effect ID | Bounded Stage 6A use |
+| --- | --- |
+| 0 | scoped scheduler proposal |
+| 1 | `write` syscall continuation |
+| 2 | `exit_group` syscall continuation |
+| 3 | lazy executable-page fault continuation |
+| 4 | slice-completion waiter |
+
+This establishes shared scope-token propagation, not shared-scope revocation
+closure. The scheduler, code-pager, and personality state machines remain
+separate harness-owned registries, no mediated I/O effect participates in the
+boot, and scope 30 itself is not revoked in this trace. Two independent
+companion scopes, 31 and 32, instantiate the same personality state and
+transition helpers with effects 5 and 6. They observe `RevokeBegin` winning
+before backend commit and losing after it, real waiter/waker publication,
+failure-atomic post-revoke user rejection, kernel abort/drain, an early
+`NotQuiescent`, and a final `RevokeComplete`. They are bounded
+personality-closure refinements, not a unified cross-service registry or a
+timeout/tombstone worker.
+
+The observation is deliberately narrow: one CPU, fixed enqueue order, one
+process/thread, one lazy code page, one single-slot portal, static x86-64
+`ET_EXEC`, `write(1, ...)`, and `exit_group(0)`. The linuxd binaries are real
+freestanding Rust artifacts, but most of their current control flow is
+`global_asm!` and the kernel harness still executes portal delivery, bounded
+copy-in, and protocol transitions. The recovery snapshot is a bounded
+handshake, not durable service state. Personality stale/no-supervisor and
+invalid-order cases now arrive as full-identity user packets and are compared
+against an explicit before/after semantic projection; the v1 post-crash case
+uses a bounded kernel queue populated before the crash, not a production
+asynchronous portal. Code-pager stale cases remain kernel predicate probes.
+There is no dynamic loader, PIE/TLS, fd table, filesystem, network, generic
+guest-memory-fault recovery, personality concurrency, SMP, or production
+capability representation. Serial output is a test backend, not mediated
+VirtIO.
+
 It is intentionally integrated after scheduler, pager, and I/O effect semantics
 are independently testable. Its purpose is to create mixed real workloads—such
 as a page fault plus timer plus epoll wait plus socket or file I/O—and then crash
 or replace services underneath them. Initial compatibility targets must be
 bounded, for example static musl programs, selected libc tests, a small shell
 tool set, and focused LTP/kselftest or network workloads. “Runs Linux software”
-is not the Nexus research claim.
+is not the Nexus research claim. Stage 6 remains incomplete until its five
+remaining core workloads cover futex, epoll, dynamic PIE, runtime filesystem,
+and runtime network pressure.
 
 The old guest-session/sidecar-VMO/stop-packet Starnix-like path is not the target
 architecture. Tests and failure traces from it may be retained as differential
@@ -564,6 +633,15 @@ The pinned experiment observed public API fit for:
 - one kernel-held prepared frame across pager crash/rebind, explicit adoption,
   real PTE publication, local TLB synchronization, and the bounded timeout
   closure ordering documented above;
+- one reproducibly built static Linux ELF, a validated load plan and initial
+  stack, one lazy file-backed RX code-page publication, and one same-RIP
+  instruction-fault resume;
+- immutable Linux syscall snapshots delivered to fresh personality
+  `Task`/`VmSpace`/`UserMode` instances, with a write backend commit preserved
+  across crash/rebind/adopt and separated from its one guest reply;
+- five unique effect IDs propagating one workload scope through scheduler,
+  code-pager, personality, and completion-wait paths, without yet implementing
+  a unified cross-service revoke registry;
 - through the separate Stage 5A experiment, a single-owner one-page queued
   IOTLB invalidation whose pending handle retains the real DMA owner until
   hardware completion;
@@ -584,7 +662,12 @@ be patched into OSTD internals merely for convenience.
 - physical-device-general VirtIO drain/reset, MSI/MSI-X or interrupt
   quiescence, and a real-time retained recovery worker;
 - multi-page mappings, per-device/domain isolation and SMP IOMMU liveness;
-- an end-to-end nested authority scope implementation.
+- an end-to-end nested authority scope implementation;
+- a production syscall portal with opaque reply capabilities, durable
+  personality recovery state, guest-memory copy-fault recovery, and a
+  personality timeout/tombstone path;
+- the remaining Linux ABI, dynamic loader, threads/futex, fd/epoll,
+  filesystem/network, personality concurrency, and SMP paths.
 
 The spike also found that `qemu-direct + q35` faults before `#[ostd::main]` in
 the pinned setup; the demonstrated boot path is GRUB Multiboot2 with OVMF. This
@@ -604,6 +687,8 @@ At minimum, it must establish:
 - no resurrection when a completion races cancel, reset, timeout, or adoption;
 - ordering between PTE publication, TLB invalidation, and fault continuation
   consumption;
+- ordering between Linux backend commitment, crash/rebind/adopt, duplicate
+  commit rejection, authority closure, and the one guest reply or process exit;
 - ordering between descriptor publication, device notification, completion,
   reset, IOMMU invalidation, and frame reuse.
 
@@ -644,9 +729,28 @@ names rather than pretending every artifact emits an identical trace:
 `RecoverySnapshot` and `RecoverNext` are OSTD handshake/probe events, not new
 normative fault states or TLA+ linearization points. Stage 4 permits these
 explicitly documented backend names while requiring the semantic mapping above.
-Before Stage 5 depends on tombstone, reset, invalidation, or other new lifecycle
-events, their fields and refinement mapping must likewise be established in the
-spec, Rust oracle, and implementation trace.
+Stage 5 likewise documents its tombstone, reset, invalidation, and closure
+mapping in the I/O spec, Rust oracle, and implementation receipt.
+
+The personality refinement uses the same rule:
+
+| Concept | `PersonalityCser.tla` | Rust personality oracle | OSTD Stage 6A spike |
+| --- | --- | --- | --- |
+| syscall registration | `Capture` | `Capture` | `Capture` |
+| reply preparation | `PrepareReply` | `PrepareReply` | `Prepare`; `PrepareExit` for `exit_group` |
+| external write publication | `BackendCommit` | `BackendCommit` | `BackendCommit` |
+| write return | `ReplyAccept` | `Reply` | `Reply` |
+| process termination | `ReplyAccept` | `Reply` | `PrepareExit`, then terminal `Commit kind=exit_group`; never a backend-output commit |
+| crash recovery | `Crash`, `FallbackPick`, `Snapshot`, `Ready`, `Rebind`, `Adopt` | `Crash`, `FallbackPick`, `RecoverySnapshot`, `Ready`, `Rebind`, `Adopt` | `Crash`, `Fallback`, `RecoverySnapshot`, `Ready`, `Rebind`, `RecoverNext`, `Adopt` |
+| authority closure | `RevokeBegin`, `KernelClosure`, `RevokeComplete` | `RevokeBegin`, `RevokeNext`, `RevokeComplete` | companion scopes 31/32: `RevokeBegin`, early `NotQuiescent`, user commit/reply rejection, `ClosureNext` abort/drain with real wake, then `RevokeComplete` |
+
+`RecoverySnapshot` and `RecoverNext` remain handshake names, not additional
+normative continuation phases. Although the abstract refinement permits a
+documented atomic exit prepare+reply macro-step, the current spike keeps those
+events separate. No implementation may collapse `BackendCommit` into guest
+reply. User-originated invalid or stale
+portal operations must refine model rejection to a failure-atomic error; a
+kernel panic is not an allowed rejection trace.
 
 Successful transition events carry, where applicable, `seq`, `scope`, `effect`,
 `authority_epoch`, `binding_epoch`, transition endpoints, and outcome. Backend
@@ -664,17 +768,18 @@ normal kernel path.
 | Property or boundary | Current evidence | Required next evidence |
 | --- | --- | --- |
 | Core register/commit/revoke/crash/rebind semantics | bounded TLC graph; Rust reference model; four pager Loom gate refinements | implementation-specific concurrency refinement and differential kernel traces |
-| Post-revoke commit exclusion | baseline and pager finite models; pager Rust tests; Loom commit/timeout gate; QEMU timeout forbids commit/resume after `RevokeBegin` | real portal replay, SMP and production-lock races, and device publication injection |
-| Single terminalization | baseline and pager models; pager Rust tests; Loom stale/duplicate-reply and wake-authority gates; QEMU `recover` and `timeout` each terminalize once | delayed/duplicate real portal replies, SMP and production-lock races, and device completion injection |
+| Post-revoke commit exclusion | baseline/pager/personality finite models; Rust tests; pager Loom gate; QEMU pager timeout; Stage 6A companion scopes reject full-token user commit/reply after `RevokeBegin` without mutation | unified scope registry, SMP and production-lock races, and device publication injection |
+| Single terminalization | baseline/pager/personality models; Rust tests; pager Loom gates; pager QEMU paths; Stage 6A main and companion scopes each consume one continuation/waker and reject duplicate replies/exits | implementation-source Loom/Kani, SMP and production-lock races, and device completion injection |
 | Scalar budget conservation | baseline and pager models; QEMU timeout keeps credit `Held` through lock-free frame/waker cleanup and returns it only before `RevokeComplete` | typed multi-resource implementation and leak/duplication tests under concurrency and device failure |
-| Scheduler fallback | weak-fair TLA+ property; one-CPU QEMU fallback observed in one tick | lease-expiry path, SMP races, overload and repeated-crash tests |
+| Scheduler fallback | weak-fair TLA+ property; one-CPU QEMU selects the FIFO task on the first post-crash fallback selection attempt; raw tick delta is recorded only as an artifact diagnostic | lease-expiry path, SMP races, overload and repeated-crash tests |
 | Pager one-shot reply and crash/rebind | pager TLC refinement: 17,150 generated / 7,528 distinct / reported depth 17-18 across parallel clean runs / 10 temporal branches; Rust: 12 deterministic + 5 proptests (64 cases each); one-CPU QEMU `recover` + `timeout` observations | real one-shot handle/portal, serialized recovery state, full response-boundary injection, multi-client and SMP refinement |
 | Pager QuiescentClosure | Loom three-stage surrogate; QEMU three-phase Closing -> lock-free frame/waker cleanup -> credit return and RevokeComplete; reusable OSTD Waker fenced by Nexus state | production-lock/SMP interleavings, allocation failure and arbitrary task-termination paths |
+| Personality QuiescentClosure | Personality TLA+/Rust closure accounting; companion QEMU scopes observe early completion rejection, scope-local abort/drain, real waker take/publication/drop, empty live index, and final completion | scope-30 and cross-service closure, stuck backend timeout/tombstone, production-lock/SMP interleavings |
 | DMA quiescence | Stage 5A one-owner negative/ownership receipt plus Stage 5B real readonly device DMA, status-zero reset, and request + two queue owners released after queued IOTLB completion on pinned QEMU | physical-device drain contracts, IRQ quiescence, per-device domains, multi-page and SMP tests |
 | I/O tombstone/timeout | TLA+/Rust timeout/retry semantics plus Stage 5B fail-closed session/IOTLB ownership retention and successful retry; timeout explicitly software-injected | real-time deadline source, durable recovery worker, repeated failure, device-loss and hardware-timeout tests |
 | Work proportionality | Rust counts only target-scope logical visits and avoids a global scan, but its tree operations still have logarithmic local/global index costs | scope-local/intrusive kernel records plus fixed-`N` varying-`k` and fixed-`k` varying-`N` curves |
-| Cross-service composition | scheduler fallback and pager are co-resident but deliberately independent; no shared-scope cross-service evidence | scheduler + pager + I/O crash matrix under mixed workloads |
-| Linux pressure | retained legacy workload inputs only; not evidence for new architecture | bounded personality workloads on the completed CSER slices |
+| Cross-service composition | Stage 6A propagates one `(authority_epoch=91, scope=30)` across distinct scheduler, write, exit, code-fault, and completion effects in one boot; the services still have separate registries and no shared revoke | unified scope gate plus scheduler + pager + personality + I/O revoke/crash matrix under mixed workloads |
+| Linux pressure | `PersonalityCser` finite safety/liveness graphs; safe-Rust personality oracle; one bounded static `linux-hello` load/fault/write/crash/rebind/exit path; full-token invalid/replay rejection and same-implementation companion abort/drain closure | revoke scope 30 through a unified cross-service registry, then the remaining futex, epoll, dynamic PIE, runtime filesystem, and runtime network core workloads |
 
 TLC's current result is a complete graph only for its committed finite
 configuration. QEMU results are concrete observations only for their pinned
@@ -685,10 +790,12 @@ qualifiers.
 
 The current semantic artifacts are:
 
-- `specs/cser/` — current PlusCal/TLA+ protocol and bounded TLC configuration;
-- `crates/cser-model/` — safe-Rust executable reference model;
+- `specs/cser/` — baseline, pager, I/O, and personality PlusCal/TLA+ protocols
+  and bounded TLC configurations;
+- `crates/cser-model/` — safe-Rust executable core, pager, I/O, and personality
+  reference models;
 - `experiments/ostd-cser-spike/` — pinned OSTD scheduler/pager/API/IOMMU
-  experiment;
+  experiment plus the bounded static `linux-hello` pressure slice;
 - `experiments/ostd-virtio-cser-spike/` — pinned patched-OSTD mediated VirtIO,
   reset tombstone and three-owner queued-IOTLB-completion experiment.
 
@@ -719,7 +826,8 @@ The following are intentionally unresolved:
 - the tombstone retry, administrative recovery, and resource-pressure policy;
 - treatment of durable external effects that require idempotency or
   application-level compensation rather than local drain;
-- the exact bounded Linux compatibility workload used for final pressure tests.
+- the exact final Linux pressure set beyond the fixed six-workload core gate;
+  only `linux-hello` has a current bounded execution receipt.
 
 Each decision must be resolved first in the smallest relevant model and spike.
 An unresolved item is not permission to assume the strongest behavior in code

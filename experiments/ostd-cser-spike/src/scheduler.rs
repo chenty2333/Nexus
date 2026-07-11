@@ -13,8 +13,9 @@ use ostd::{
 };
 
 use crate::TaskData;
+use crate::effect::EffectToken;
 
-pub const FALLBACK_BOUND_TICKS: u64 = 1;
+pub const FIRST_FALLBACK_SELECTION_ATTEMPT: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Binding {
@@ -40,6 +41,7 @@ enum PolicyMode {
 struct Proposal {
     binding: Binding,
     task_id: u64,
+    causal_token: Option<EffectToken>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +49,8 @@ pub struct FallbackEvidence {
     pub lease_deadline_tick: u64,
     pub crash_tick: u64,
     pub pick_tick: u64,
+    pub pick_task_id: u64,
+    pub pick_selection_attempt: u64,
 }
 
 pub struct CserScheduler {
@@ -69,6 +73,24 @@ impl CserScheduler {
     }
 
     pub fn propose(&self, binding: Binding, task_id: u64) -> ProposalResult {
+        self.propose_inner(binding, task_id, None)
+    }
+
+    pub fn propose_scoped(
+        &self,
+        binding: Binding,
+        task_id: u64,
+        causal_token: EffectToken,
+    ) -> ProposalResult {
+        self.propose_inner(binding, task_id, Some(causal_token))
+    }
+
+    fn propose_inner(
+        &self,
+        binding: Binding,
+        task_id: u64,
+        causal_token: Option<EffectToken>,
+    ) -> ProposalResult {
         let mut queue = self.queues[0].disable_irq().lock();
         if binding != queue.binding {
             println!(
@@ -91,11 +113,27 @@ impl CserScheduler {
             return ProposalResult::RejectUnknownTask;
         }
 
-        queue.pending = Some(Proposal { binding, task_id });
-        println!(
-            "CSER Prepare authority_epoch={} binding_epoch={} proposal_task={}",
-            binding.authority_epoch, binding.binding_epoch, task_id,
-        );
+        queue.pending = Some(Proposal {
+            binding,
+            task_id,
+            causal_token,
+        });
+        if let Some(token) = causal_token {
+            println!(
+                "CSER PrepareScoped service=scheduler scheduler_authority_epoch={} binding_epoch={} workload_authority_epoch={} scope={} effect={} proposal_task={}",
+                binding.authority_epoch,
+                binding.binding_epoch,
+                token.authority_epoch,
+                token.scope_id,
+                token.effect_id,
+                task_id,
+            );
+        } else {
+            println!(
+                "CSER Prepare authority_epoch={} binding_epoch={} proposal_task={}",
+                binding.authority_epoch, binding.binding_epoch, task_id,
+            );
+        }
         ProposalResult::Prepared
     }
 
@@ -103,6 +141,28 @@ impl CserScheduler {
         let mut queue = self.queues[0].disable_irq().lock();
         assert_eq!(binding, queue.binding, "only the current binding can crash");
         queue.enter_fallback(reason);
+    }
+
+    pub fn crash_scoped(&self, binding: Binding, reason: &'static str, causal_token: EffectToken) {
+        let mut queue = self.queues[0].disable_irq().lock();
+        assert_eq!(binding, queue.binding, "only the current binding can crash");
+        assert_eq!(
+            queue
+                .pending
+                .as_ref()
+                .and_then(|proposal| proposal.causal_token),
+            Some(causal_token),
+            "scoped crash must fence its pending workload proposal"
+        );
+        queue.enter_fallback(reason);
+        println!(
+            "CSER CrashScoped service=scheduler scheduler_authority_epoch={} binding_epoch={} workload_authority_epoch={} scope={} effect={} pending_scoped_cleared=true fallback=kernel_fifo",
+            queue.binding.authority_epoch,
+            queue.binding.binding_epoch,
+            causal_token.authority_epoch,
+            causal_token.scope_id,
+            causal_token.effect_id,
+        );
     }
 
     pub fn rebind(&self, authority_epoch: u64) -> Binding {
@@ -129,6 +189,8 @@ impl CserScheduler {
             lease_deadline_tick: queue.lease_deadline_tick,
             crash_tick: queue.crash_tick?,
             pick_tick: queue.fallback_pick_tick?,
+            pick_task_id: queue.fallback_pick_task_id?,
+            pick_selection_attempt: queue.fallback_pick_selection_attempt?,
         })
     }
 }
@@ -178,6 +240,9 @@ struct CserRunQueue {
     lease_deadline_tick: u64,
     crash_tick: Option<u64>,
     fallback_pick_tick: Option<u64>,
+    fallback_pick_task_id: Option<u64>,
+    fallback_selection_attempts: u64,
+    fallback_pick_selection_attempt: Option<u64>,
 }
 
 impl CserRunQueue {
@@ -196,6 +261,9 @@ impl CserRunQueue {
             lease_deadline_tick: lease_ticks,
             crash_tick: None,
             fallback_pick_tick: None,
+            fallback_pick_task_id: None,
+            fallback_selection_attempts: 0,
+            fallback_pick_selection_attempt: None,
         }
     }
 
@@ -244,6 +312,9 @@ impl CserRunQueue {
         self.pending = None;
         self.crash_tick = Some(self.tick);
         self.fallback_pick_tick = None;
+        self.fallback_pick_task_id = None;
+        self.fallback_selection_attempts = 0;
+        self.fallback_pick_selection_attempt = None;
         println!(
             "CSER Crash authority_epoch={} previous_binding_epoch={} binding_epoch={} tick={} reason={}",
             self.binding.authority_epoch,
@@ -299,16 +370,24 @@ impl LocalRunQueue<Task> for CserRunQueue {
                 next
             }
             PolicyMode::Fallback => {
+                self.fallback_selection_attempts = self
+                    .fallback_selection_attempts
+                    .checked_add(1)
+                    .expect("fallback selection-attempt counter overflow");
+                let selection_attempt = self.fallback_selection_attempts;
                 let next = self.runnable.pop_front()?;
                 if self.fallback_pick_tick.is_none() {
                     self.fallback_pick_tick = Some(self.tick);
+                    self.fallback_pick_task_id = Some(Self::task_id(&next));
+                    self.fallback_pick_selection_attempt = Some(selection_attempt);
                 }
                 println!(
-                    "CSER FallbackPick authority_epoch={} binding_epoch={} task={} tick={}",
+                    "CSER FallbackPick authority_epoch={} binding_epoch={} task={} tick={} selection_attempt={}",
                     self.binding.authority_epoch,
                     self.binding.binding_epoch,
                     Self::task_id(&next),
                     self.tick,
+                    selection_attempt,
                 );
                 next
             }

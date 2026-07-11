@@ -14,6 +14,7 @@ extern crate alloc;
 pub mod io;
 mod model;
 pub mod pager;
+pub mod personality;
 
 pub use model::Model;
 

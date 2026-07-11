@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "nexus-linux-personality-probe"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+publish = false
+
+[[bin]]
+name = "linuxd-v1"
+path = "src/bin/v1.rs"
+
+[[bin]]
+name = "linuxd-v2"
+path = "src/bin/v2.rs"
+
+[dependencies]
+linux-raw-sys = { version = "=0.12.1", default-features = false, features = ["general", "no_std"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"

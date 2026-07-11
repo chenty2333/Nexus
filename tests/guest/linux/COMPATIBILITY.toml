@@ -8,7 +8,7 @@ description = "Behavior coverage retained from old Starnix scenarios, expressed 
 identity = "Linux compatibility is a pressure test for scheduler, pager, wait/timer, IPC, and mediated I/O CSER semantics."
 implementation = "Rewrite the personality; do not copy user/nexus-init/src/starnix."
 uapi = "Use maintained Linux UAPI crates and pinned guest libc artifacts; raw constants in retained sources are test-local inputs only."
-success = "The future runner must check guest exit status and declared markers without depending on old component-manager summary fields."
+success = "The runner must check guest exit status and declared markers without depending on old component-manager summary fields."
 legacy_provenance = "legacy_scenarios entries identify Git commit 8d5d07e35b0051bd4ef001224714decc0615ff49 and need not remain present after the old tree is deleted."
 
 [tier_policy]
@@ -29,10 +29,12 @@ cser_effects = ["scheduler.proposal", "pager.fault-continuation", "service.sysca
 injection_profile = [
   "crash scheduler policy while the hello task is runnable and require kernel fallback",
   "crash pager after code-page fault registration and before mapping publication",
-  "crash Linux personality after write/exit syscall capture and before reply",
-  "replay an old-binding syscall or fault reply after service rebind",
+  "crash Linux personality after write BackendCommit and before guest reply",
+  "send an old-binding full-identity write reply through the normal user portal after crash and rebind",
+  "race personality authority revocation against an uncommitted write and a backend-committed write, requiring respectively one abort and one kernel closure drain before RevokeComplete",
 ]
-expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "FallbackProgress"]
+expected_properties = ["PostRevokeCommitExclusion", "QuiescentClosure", "SingleTerminalization", "CrashRebindFencing", "FallbackProgress"]
+notes = "Stage 6A executes linux-hello plus bounded companion portal/revocation scenarios through the same personality state machine; it does not complete the other five core workloads or a unified cross-service revoke registry."
 
 [[workload]]
 id = "linux-fd-smoke"
@@ -85,7 +87,7 @@ cser_effects = ["scheduler.proposal", "wait.registration", "timer.deadline", "se
 injection_profile = [
   "crash scheduler policy while futex waiter and waker tasks are runnable and require kernel fallback",
   "crash Linux personality after futex wait registration and before wake delivery",
-  "race futex wake, timeout, and scope cancellation",
+  "race futex wake, a CSER watchdog deadline, and scope cancellation; the retained guest passes no Linux futex timeout",
   "replay an old-binding wake or wait reply after rebind",
 ]
 expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "FallbackProgress", "BudgetConservation"]
@@ -113,7 +115,7 @@ class = "static-smoke"
 source_ids = ["linux-round5-epoll-smoke"]
 legacy_scenarios = ["specs/conformance/scenarios/starnix_round5_epoll_bootstrap.toml"]
 required_behaviors = ["epoll_create1", "epoll_ctl", "epoll_wait", "level-triggered", "edge-triggered", "oneshot", "pipe/socketpair/file readiness"]
-success_markers = []
+success_markers = ["round5 epoll ok"]
 cser_effects = ["wait.registration", "timer.deadline", "ipc.operation", "service.syscall-continuation"]
 injection_profile = [
   "crash Linux personality after epoll registration and before readiness delivery",

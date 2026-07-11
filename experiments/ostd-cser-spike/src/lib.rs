@@ -7,6 +7,8 @@ extern crate alloc;
 
 mod effect;
 mod iommu_probe;
+mod linux;
+mod linux_pager;
 mod pager;
 mod scheduler;
 
@@ -27,7 +29,7 @@ use ostd::{
     },
     user::{ReturnReason, UserMode},
 };
-use scheduler::{CserScheduler, FALLBACK_BOUND_TICKS, ProposalResult};
+use scheduler::{CserScheduler, FIRST_FALLBACK_SELECTION_ATTEMPT, ProposalResult};
 
 const AUTHORITY_EPOCH: u64 = 41;
 const POLICY_LEASE_TICKS: u64 = 64;
@@ -207,12 +209,17 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     let evidence = scheduler
         .fallback_evidence()
         .expect("fallback selection records evidence");
+    assert_eq!(evidence.pick_task_id, FALLBACK_TASK_ID);
     assert!(evidence.pick_tick >= evidence.crash_tick);
-    assert!(evidence.pick_tick - evidence.crash_tick <= FALLBACK_BOUND_TICKS);
+    assert_eq!(
+        evidence.pick_selection_attempt,
+        FIRST_FALLBACK_SELECTION_ATTEMPT
+    );
     println!(
-        "OSTD_PROBE PASS fallback_latency_ticks={} bound_ticks={} authority_epoch={} binding_epoch={}",
+        "OSTD_PROBE PASS fallback_first_task={} fallback_first_selection_attempt={} observed_tick_delta={} tick_delta_diagnostic=true authority_epoch={} binding_epoch={}",
+        evidence.pick_task_id,
+        evidence.pick_selection_attempt,
         evidence.pick_tick - evidence.crash_tick,
-        FALLBACK_BOUND_TICKS,
         old_binding.authority_epoch,
         old_binding.binding_epoch + 1,
     );
@@ -261,8 +268,21 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     // from this scheduler-policy binding.
     pager::run_pager_slices();
 
-    let new_binding = scheduler.rebind(AUTHORITY_EPOCH);
-    assert_eq!(new_binding.binding_epoch, old_binding.binding_epoch + 1);
+    let linux_scheduler_binding = scheduler.rebind(AUTHORITY_EPOCH);
+    assert_eq!(
+        linux_scheduler_binding.binding_epoch,
+        old_binding.binding_epoch + 1
+    );
+
+    // Linux compatibility is a bounded pressure test, not Nexus's native ABI.
+    // Its policy first proposes the runnable guest under a shared workload
+    // scope, then crashes in user mode and forces a fresh FIFO fallback pick.
+    linux::run_linux_hello_slice(scheduler, linux_scheduler_binding);
+
+    assert_eq!(
+        scheduler.binding().binding_epoch,
+        linux_scheduler_binding.binding_epoch + 1
+    );
     assert_eq!(
         scheduler.propose(old_binding, USER_TASK_ID),
         ProposalResult::RejectStale

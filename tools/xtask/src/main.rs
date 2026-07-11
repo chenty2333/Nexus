@@ -31,7 +31,7 @@ const TRACE_ACTIONS: [&str; 9] = [
     "Complete",
 ];
 
-const TLA_SPECS: [&str; 3] = ["Cser", "PagerCser", "IoCser"];
+const TLA_SPECS: [&str; 4] = ["Cser", "PagerCser", "IoCser", "PersonalityCser"];
 
 static NEXT_SPEC_WORKSPACE: AtomicU64 = AtomicU64::new(0);
 

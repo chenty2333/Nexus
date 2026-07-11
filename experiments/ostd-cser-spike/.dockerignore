@@ -1,3 +1,4 @@
 artifacts/
 guest/*.bin
+guest/*.elf
 target/

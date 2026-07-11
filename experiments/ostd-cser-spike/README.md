@@ -1,15 +1,19 @@
 # OSTD/OSDK 0.18 CSER spike
 
-This experiment answers two narrow architecture questions without modifying
+This experiment answers three narrow architecture questions without modifying
 OSTD 0.18: can Nexus place a CSER-aware scheduler at OSTD's public scheduling
-boundary, and can a kernel-owned fault continuation survive a user-space pager
-crash and be explicitly adopted by a fresh pager? It is deliberately outside
-the legacy Nexus workspace.
+boundary; can a kernel-owned fault continuation survive a user-space pager
+crash and be explicitly adopted by a fresh pager; and can one real static Linux
+guest exercise those mechanisms through a restartable syscall-personality
+probe? It is deliberately outside the legacy Nexus workspace.
 
 ## Pinned environment
 
 - OSTD: `=0.18.0` from crates.io
 - cargo-osdk: `=0.18.0`
+- `object`: `=0.39.1` for the bounded kernel ELF loader
+- `linux-raw-sys`: `=0.12.1` for Linux UAPI names in the kernel and the
+  independent freestanding personality workspace
 - cargo-osdk 0.18.0 crate SHA-256:
   `726c0c05c18c46b783bd86060f775560609a0bf4696bd0cc2d8f265d59aa3764`
 - Rust: `nightly-2026-04-03`
@@ -33,8 +37,10 @@ Build and run the complete probe:
 
 The narrower commands are `./x check`, `./x build`, `./x run`, and
 `./x iommu-probe`. The serial transcript is written to
-`artifacts/serial.log`; `scripts/assert-serial.sh` verifies both required
-events and their ordering.
+`artifacts/serial.log`; `scripts/assert-serial.sh` verifies the full
+scheduler, pager, Linux-personality, and fail-closed IOMMU receipt, including
+ordering, exact counts, fallback first-pick identity/ordinal, and forbidden
+branches. Raw scheduler ticks are diagnostic, not an acceptance bound.
 
 ### Reproducible OSDK runner graph
 
@@ -64,6 +70,16 @@ The development image may use the network only while it is built. Normal
 checks run as the invoking host UID with the project lockfile mounted
 read-only, Cargo offline mode enabled, and Docker networking disabled.
 
+The Linux input is also reproducible inside that boundary. The build copies
+the retained `tests/guest/linux/sources/linux-hello/hello.S` only into a
+temporary directory, emits a fixed-name `linux-hello.o`, and links a static
+x86-64 `ET_EXEC` without a build ID. `scripts/assert-linux-elf.sh` checks its
+ELF class, endianness, machine, program headers, absence of `PT_INTERP`, W^X,
+the retained source SHA-256
+`50690500a3cfac0f412da66d3d5d7f32b9b4da2a96a38d6d21c3ef12ea141490`,
+and the container-built artifact SHA-256
+`1dae72e6d4a5c9144e94580a8e2a8280cb36f725d66046baed77562051b2f1a4`.
+
 ## What is exercised
 
 1. `CserScheduler` is injected through OSTD's public `Scheduler` and
@@ -76,9 +92,10 @@ read-only, Cargo offline mode enabled, and Docker networking disabled.
    `UserException(CpuException::PageFault)` to model a real policy crash.
 4. `Crash` immediately advances the binding epoch from 1 to 2 and closes the
    proposal gate. Task exit drives OSTD's scheduler path to `FallbackPick`; the
-   test requires the FIFO pick within one timer tick. A 64-tick lease remains
-   as the compiled stalled-policy fallback, but this run does not separately
-   trigger that lease-expiry branch.
+   first fallback selection attempt must pick the expected FIFO task. The raw
+   timer delta is recorded only as a diagnostic. A 64-tick lease remains as the
+   compiled stalled-policy fallback, but this run does not separately trigger
+   that lease-expiry branch.
 5. Before `Rebind`, even an epoch-2 proposal receives
    `REJECT_NO_SUPERVISOR`. Rebind attaches the replacement to epoch 2 without
    advancing it again, and a proposal from epoch 1 receives `REJECT_STALE`.
@@ -142,10 +159,79 @@ after it is woken. SMP shootdown, arbitrary pager policies, multi-client
 recovery, swap/file-backed paging, and production multi-effect or cross-service
 revocation remain outside this slice.
 
-`./x` assembles the scheduler probe and three pager programs under `guest/`
-before invoking OSDK. This intentionally avoids a Cargo build script:
+`./x` assembles the base scheduler probe, pager client/v1/v2, Linux scheduler
+policy, and Linux code-pager v1/v2 programs under `guest/`. It also builds the
+independent freestanding Rust linuxd v1/v2 workspace, extracts each `.text`
+payload, and builds the retained `linux-hello` source as a static ELF before
+invoking OSDK. This intentionally avoids a kernel Cargo build script:
 cargo-osdk 0.18 recognizes a kernel only when its package has exactly one Cargo
 target, so adding `build.rs` makes kernel discovery fail.
+
+### Stage 6A static Linux/personality slice
+
+The Linux slice is one bounded pressure test, not a general Linux server. The
+kernel uses `object 0.39.1` to reject non-ELF64, non-x86-64, non-`ET_EXEC`,
+dynamic-interpreter, overlapping, non-congruent, out-of-range, W+X, or
+non-executable-entry images. It publishes all non-entry load pages eagerly,
+builds a 16-byte-aligned RW/NX initial stack with `argc/argv`, empty `envp`, and
+the required bounded auxv, but deliberately leaves the executable entry page
+absent. `AT_RANDOM` is a fixed test fixture, not secure entropy.
+
+The resulting instruction-fetch fault (`PFEC=0x14`) creates effect 3 in
+`(authority=91, scope=30)`. Code-pager v1 prepares the retained ELF image frame
+and then suffers a real user page fault before PTE publication. Fresh v2 uses
+the bounded snapshot/ready/rebind/recover/adopt handshake, publishes one RX PTE,
+synchronizes the local TLB, terminalizes and wakes once, and resumes the same
+RIP once. In the same boot, scheduler effect 0 is attached to a user-policy
+proposal; the policy faults, the proposal is cleared, and guest task 400 must
+be the first kernel FIFO fallback pick on the next fallback selection attempt.
+The raw timer-tick delta remains a diagnostic rather than a real-time bound.
+Write effect 1, exit effect 2, code-fault effect 3, and completion effect 4 are
+distinct.
+
+The guest traps only `write(1, fixed_buffer, 23)` and `exit_group(0)`. Linuxd v1
+and v2 are separate freestanding Rust artifacts with separate fresh OSTD
+`Task`/`VmSpace`/`UserMode` instances. The kernel portal supplies an immutable
+syscall snapshot and no writable guest context. V1 copies the bounded payload
+into kernel ownership and crosses `BackendCommit`, which publishes the serial
+output once, then takes a real user page fault before guest reply. V2 performs
+snapshot/ready/rebind/recover/adopt, receives `AlreadyCommitted` instead of
+replaying the output, publishes one write reply/resume, explicitly prepares the
+exit reply, and terminalizes the process without another guest user-mode entry.
+
+The user programs also submit full-identity packets containing authority,
+scope, effect, blocked task, operation, and binding. The receipt exercises
+post-crash, pre-rebind, post-rebind, and post-adopt stale/no-supervisor cases;
+wrong effect identity; an unknown opcode; duplicate adopt/backend/reply; an
+exit commit before prepare; and a duplicate terminal exit. Each exercised
+rejection emits a semantic before/after projection covering scope and recovery
+state, both continuation tokens/phases, payload ownership and checksum,
+delivery counts, all wakers, the live count, guest outcome, and closure ledger.
+The serial gate requires every rejection projection to be identical.
+
+Two companion scopes use the same `PersonalityScenario`, token validator, and
+prepare/commit/reply/revoke/closure implementation:
+
+- scope 31/effect 5 prepares a write, lets `RevokeBegin` win, rejects early
+  completion plus later user backend/reply attempts, then kernel closure aborts
+  and publishes one real OSTD wake before `RevokeComplete`;
+- scope 32/effect 6 commits first, closes authority, rejects the same later user
+  operations, then kernel closure drains the existing obligation without a
+  second output and publishes one wake before completion.
+
+Both waiters are consumed by the kernel harness, and both early completion
+attempts return `NotQuiescent`. These scopes refine personality-local
+commit/revoke ordering; they do not revoke the co-tagged scope 30 and do not
+provide a unified scheduler/pager/personality/I/O reverse index.
+
+The bounds remain substantial: one CPU, fixed enqueue order, one guest
+process/thread, one lazy code page, one single-slot portal, and a fixed static
+ELF. Most linuxd control flow is `global_asm!`; the kernel harness still performs
+portal delivery, guest copy-in, and state transitions. The v1 delayed packet is
+held by a bounded kernel queue, while code-pager stale replies remain predicate
+probes. There is no timeout/tombstone for the personality, dynamic linking,
+PIE/TLS, fd table, futex/epoll, filesystem, network, SMP, or production opaque
+capability transport. Serial output is a test backend, not mediated VirtIO.
 
 ## IOMMU result: fail closed
 
@@ -172,6 +258,9 @@ beside OSTD would create two owners and is not a minimal adapter. Therefore
 source; the kernel also compiles and runs the fail-closed path. Device-level
 drain/reset must precede even a future synchronous IOTLB invalidation adapter.
 
-Before mediated VirtIO I/O can claim revocation closure, Nexus must either
-upstream a public synchronous unmap+IOTLB-invalidate API to OSTD, carry a small
-audited OSTD patch, or reject OSTD as the DMA ownership layer.
+This unmodified-OSTD spike therefore cannot claim DMA-backed revocation
+closure. The separate Stage 5B experiment chose a small, audited OSTD patch and
+established only the bounded emulator receipt documented in the root
+architecture. A production Nexus must still upstream a public synchronous
+unmap+IOTLB-invalidate API, carry an audited patch, or reject OSTD as the DMA
+ownership layer; this fail-closed adapter must never be treated as quiescence.

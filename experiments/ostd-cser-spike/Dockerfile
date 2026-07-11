@@ -9,9 +9,15 @@ RUN rustup target add --toolchain nightly-2026-04-03 x86_64-unknown-none \
 # cargo-osdk's -Zbuild-std and generated runner packages have dependencies that
 # a plain `cargo fetch --target` does not discover. Prime the real graph while
 # the image is built, then make every mounted-workspace invocation offline.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml OSDK.toml /tmp/ostd-cser-inputs/
-COPY osdk-runner-base /tmp/ostd-cser-inputs/osdk-runner-base
-RUN --mount=type=bind,source=.,target=/tmp/ostd-cser-source,readonly \
+COPY experiments/ostd-cser-spike/Cargo.toml \
+    experiments/ostd-cser-spike/Cargo.lock \
+    experiments/ostd-cser-spike/rust-toolchain.toml \
+    experiments/ostd-cser-spike/OSDK.toml \
+    /tmp/ostd-cser-inputs/
+COPY experiments/ostd-cser-spike/osdk-runner-base /tmp/ostd-cser-inputs/osdk-runner-base
+COPY experiments/ostd-cser-spike/userspace/personality /tmp/ostd-cser-inputs/personality
+COPY tests/guest/linux/sources/linux-hello/hello.S /tmp/ostd-cser-inputs/linux-hello.S
+RUN --mount=type=bind,source=experiments/ostd-cser-spike,target=/tmp/ostd-cser-source,readonly \
     cmp /tmp/ostd-cser-inputs/Cargo.toml /tmp/ostd-cser-source/Cargo.toml \
     && cmp /tmp/ostd-cser-inputs/Cargo.lock /tmp/ostd-cser-source/Cargo.lock \
     && cmp /tmp/ostd-cser-inputs/rust-toolchain.toml \
@@ -19,13 +25,16 @@ RUN --mount=type=bind,source=.,target=/tmp/ostd-cser-source,readonly \
     && cmp /tmp/ostd-cser-inputs/OSDK.toml /tmp/ostd-cser-source/OSDK.toml \
     && diff -ru /tmp/ostd-cser-inputs/osdk-runner-base \
         /tmp/ostd-cser-source/osdk-runner-base \
+    && diff -ru /tmp/ostd-cser-inputs/personality \
+        /tmp/ostd-cser-source/userspace/personality \
     && rm -rf /work \
     && cp -a /tmp/ostd-cser-source /work \
     && mkdir -p /work/target/osdk \
     && cp -a /tmp/ostd-cser-inputs/osdk-runner-base \
         /work/target/osdk/ostd-cser-spike-run-base \
     && cd /work \
-    && bash scripts/build-guest.sh \
+    && NEXUS_LINUX_HELLO_SOURCE=/tmp/ostd-cser-inputs/linux-hello.S \
+        bash scripts/build-guest.sh \
     && cargo osdk check --locked \
     && cargo osdk build \
     && cmp /tmp/ostd-cser-inputs/Cargo.lock /work/Cargo.lock \

@@ -159,7 +159,8 @@ The candidate contribution is narrower and compositional:
 > user-space OS services.
 
 Whether that combination is new and useful will be decided only after the
-bounded pager evidence is extended through mediated I/O and integrated
+current bounded scheduler, pager, mediated-I/O, and first Linux-personality
+receipts are extended through the remaining pressure workloads and integrated
 verification, and a fresh close comparison with prior work has been completed.
 A negative result or a narrower claim is an acceptable research outcome.
 
@@ -259,10 +260,24 @@ outcomes are reachable.
 The two graphs are independent results and are not added together. They specify
 the protocol; neither graph proves a real VirtIO reset or DMA quiescence.
 
+`specs/cser/PersonalityCser.tla` is the bounded Stage 6A refinement for one
+restartable Linux syscall personality and the two operations used by
+`linux-hello`: `write` and `exit_group`. It separates the external-output
+`BackendCommit` from the later guest `Reply`, preserves a committed obligation
+through crash/snapshot/ready/rebind/adopt, and gives authority closure the only
+fair completion path. Its two-ID safety graph explored 20,478 generated and
+12,802 distinct states at depth 20; its independent one-ID action/liveness
+graph explored 629 generated and 507 distinct states at depth 14. Three
+coverage witnesses exercise post-commit crash recovery, one process exit with
+zero resume, and revoke draining a committed write while aborting an
+uncommitted syscall. These finite graphs do not model Linux ABI decoding,
+guest-memory access, real output deduplication, multiple tasks or personalities,
+SMP, durable recovery storage, or a concrete timeout/tombstone worker.
+
 ### Executable reference evidence
 
 `crates/cser-model` is a `no_std + alloc`, safe-Rust executable oracle for the
-core, pager, and mediated-I/O protocols. In addition to the baseline suite, the
+core, pager, mediated-I/O, and bounded personality protocols. In addition to the baseline suite, the
 pager model has 12 deterministic tests and five proptests, each configured for
 64 cases. It covers three independent authority, binding, and address-space
 generations; same-page coalescing; recovery snapshot fencing; deadlines; frame
@@ -271,9 +286,12 @@ device generations, typed lease and commit-charge accounting, `avail.idx`
 publication, reset/completion races, request and queue invalidation, retained
 timeout tombstones, retry, and scope-local work indexes. It has 13 deterministic
 tests, four proptests configured for 64 cases, and three bounded Loom surrogate
-gates. These are executable reference transitions and small interleaving
-models; they do not establish the eventual production lock/atomic scheme,
-VirtIO transport fences, PCI reset behavior, SMP, or real device quiescence.
+gates. The personality model adds seven deterministic tests and three
+proptests for capture/prepare, backend commit versus reply, crash/rebind/adopt,
+old-binding rejection, revoke ordering, and single resume/exit/abort. These are
+executable reference transitions and small interleaving models; they do not
+establish the eventual production lock/atomic scheme, VirtIO transport fences,
+PCI reset behavior, SMP, real device quiescence, or a complete Linux server.
 
 ### Observed OSTD evidence
 
@@ -283,9 +301,9 @@ Nexus can, without modifying OSTD internals:
 - inject a custom `Scheduler`/`LocalRunQueue`;
 - run a real `VmSpace` and `UserMode` path;
 - receive a real syscall return and page-fault exception;
-- fence a crashed scheduler binding, enter FIFO fallback within one measured
-  tick, exercise the epoch-2 rebind gate/transition, and reject an epoch-1 stale
-  proposal;
+- fence a crashed scheduler binding, make the first fallback selection attempt
+  choose the FIFO task, retain timer ticks only as diagnostics, exercise the
+  epoch-2 rebind gate/transition, and reject an epoch-1 stale proposal;
 - wrap OSTD wait/wake and tick primitives with an effect token;
 - take a real client page fault, retain a kernel-owned prepared zero frame
   across a real pager-v1 page-fault crash, advance only the pager binding epoch,
@@ -350,6 +368,53 @@ or IRQ quiescence, SMP liveness, per-device isolation, irreversible writes,
 network output, physical PCIe behavior, or a production deadline/recovery
 worker.
 
+The Stage 6A follow-on adds one bounded `linux-hello` pressure trace to the
+unmodified-OSTD spike. Docker builds a reproducible static x86-64 Linux
+`ET_EXEC` from the retained source; the kernel validates its program headers,
+W^X layout, executable entry, and a minimal aligned Linux initial stack. The
+entry RX page is initially absent, so a real instruction-fetch fault enters a
+one-shot file-backed continuation. Pager v1 prepares the ELF image page and
+then takes a real user fault before PTE publication; a fresh pager v2 performs
+snapshot/ready/rebind/adopt, publishes one RX mapping, synchronizes the local
+TLB, and resumes the same RIP once. In the same workload scope, a user-policy
+task submits a scoped proposal and then faults; the kernel clears it and makes
+the guest the first FIFO fallback pick on the next fallback selection attempt.
+Raw timer ticks are retained only as a diagnostic because serial instrumentation
+and task-exit timing make them unsuitable as a real-time bound.
+
+The guest then traps `write` and `exit_group`. Two separately constructed
+linuxd tasks run real `UserMode` dispatch probes over immutable syscall
+snapshots. V1 copies the bounded write payload into kernel ownership, publishes
+the serial output once, and faults before guest reply. V2 performs
+snapshot/ready/rebind/adopt; its repeated backend commit is fenced as
+`AlreadyCommitted`, after which it replies and resumes the guest once.
+The old full-identity token is submitted through the user portal before rebind
+and again after explicit adoption; stale binding, no-supervisor, wrong identity,
+unknown opcode, duplicate adopt/commit/reply, and invalid exit ordering are
+rejected without changing the logged semantic projection. `exit_group`
+explicitly prepares its terminal reply, terminalizes the process once, and
+never resumes it.
+
+Two companion scopes run the same personality state type and transition
+helpers. In scope 31, `RevokeBegin` wins before backend commit, both later user
+commit and reply are rejected, kernel closure aborts the continuation and
+publishes its real OSTD wake, and only then may `RevokeComplete` succeed. In
+scope 32, backend commit wins first; revocation closes later user operations,
+kernel closure drains the existing obligation without another output, consumes
+the waker once, and then completes. An early completion attempt in each scope
+returns `NotQuiescent` with no semantic mutation.
+
+This is a bounded observation, not a complete personality: it is one CPU, one
+process/thread, one lazy code page, fixed enqueue order, and one single-slot
+portal; most linuxd control flow is a Rust `global_asm!` dispatch probe while
+the kernel harness still performs portal/state transitions. The pager's stale
+map/reply cases remain kernel predicate probes, and the queued post-crash
+personality delivery is a bounded harness queue rather than an asynchronous
+production portal. The companion scopes do not revoke scope 30 and do not form
+a unified scheduler/pager/personality/I/O registry. There is no personality
+timeout/tombstone, filesystem/network path, or mediated-VirtIO output. Five
+remaining core workloads are still required before Stage 6 is complete.
+
 ## Research gates
 
 Work proceeds through evidence gates, not feature-count milestones.
@@ -378,13 +443,17 @@ Work proceeds through evidence gates, not feature-count milestones.
    generation fencing, and conditional `Quiesced`. This admits the prototype to integrated
    validation; the hardware-general, IRQ, SMP, multi-client, domain-isolation,
    persistence, and real-deadline gaps remain open.
-5. **Integrated evidence gate — planned:** extend the initial pager Loom gate
-   with implementation-specific Loom and/or Kani checks across scheduler,
-   pager, and I/O; add QEMU fault injection for system recovery and `k`/`N`
-   scaling experiments for proportional revocation.
-6. **Linux pressure gate — planned:** add a deliberately bounded user-space
-   Linux personality and use real workloads to stress pager, wait/timer, IPC,
-   and I/O effects. Linux compatibility remains an evaluation vehicle.
+5. **Linux pressure gate — Stage 6A bounded slice complete / Observed, Stage 6
+   still in progress:** the personality TLA+ and Rust refinements plus the
+   pinned `linux-hello` QEMU trace establish the narrow scheduler + file-backed
+   pager + post-commit personality recovery path described above. The futex,
+   epoll, dynamic PIE, runtime filesystem, and runtime network core workloads
+   remain unimplemented. Linux compatibility remains an evaluation vehicle.
+6. **Integrated evidence gate — incremental checks exist; final Stage 7
+   planned:** extend the bounded Loom gates with implementation-specific Loom
+   and/or Kani checks across scheduler, pager, personality, and I/O; add a
+   parameterized QEMU recovery matrix plus fixed-`N`/varying-`k` and
+   fixed-`k`/varying-`N` experiments.
 7. **Contribution decision — future:** repeat the prior-art comparison, state
    only the properties supported by the evidence, report overheads and failed
    cases, and narrow or reject the CSER claim if the results require it.

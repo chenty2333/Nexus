@@ -6,6 +6,7 @@ target
 **/fuzz/corpus
 **/fuzz/artifacts
 experiments/ostd-cser-spike/guest/*.bin
+experiments/ostd-cser-spike/guest/*.elf
 specs/cser/*_TTrace_*.bin
 specs/cser/*_TTrace_*.tla
 specs/cser/*.old

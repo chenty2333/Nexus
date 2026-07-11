@@ -180,6 +180,52 @@ the fixed-`N`/varying-`k` and fixed-`k`/varying-`N` latency curves.
 explicit diagnostic audit; it is not called by any protocol transition or
 closure predicate and is excluded from the revocation-work bound.
 
+The `personality` module is the bounded Stage 6A oracle for a restartable
+user-space Linux syscall personality. It adds:
+
+- one full-identity `SyscallToken` per blocked task, carrying scope, syscall,
+  task, operation label, authority epoch, and personality-binding epoch;
+- `write` follows `Capture -> PrepareReply -> BackendCommit -> Reply`: prepare
+  retains only a candidate label, backend commit publishes exactly one
+  kernel-owned output obligation, and the later reply only resumes the guest;
+- `exit_group` follows `Capture -> PrepareReply -> Reply` and publishes one
+  process-terminal delivery without acquiring a backend output obligation;
+- distinct successful deliveries for `write` return and `exit_group`
+  termination request, plus kernel abort, so exactly one of resume, exit, or
+  abort is recorded for every terminal continuation;
+- `Crash -> FallbackPick -> RecoverySnapshot -> Ready -> Rebind -> Adopt`,
+  where only `Crash` advances the binding epoch, prepared and backend-committed
+  work cannot be published by its old binding, and rebind never adopts an
+  orphan implicitly; after adopting backend-committed `write`, a replacement
+  may publish the outstanding reply but cannot commit another obligation;
+- `RevokeBegin -> RevokeNext* -> RevokeComplete`, which closes the old
+  authority epoch before walking the target scope-local reverse index;
+  uncommitted continuations abort, while a backend commitment that linearized
+  first is drained to its single reply without another backend commit;
+- a blocked-task index that forbids two simultaneous syscall continuations for
+  one task and is released only by the unique terminal transition.
+
+`write` and `exit_group` are operation labels, not syscall implementations.
+The model contains no ELF loading, Linux UAPI decoding, descriptor table,
+process-group, signal, I/O, or external-side-effect semantics. In particular,
+`BackendCommit` is an abstract at-most-once output obligation: it neither
+executes a console write nor proves a real portal, driver, or mediated VirtIO
+commit. The bounded OSTD Stage 6A slice refines it to one kernel-owned serial
+publication; after crash/rebind/adopt, the replacement completes the outstanding
+guest reply without issuing the output again. A separate companion scope
+observes kernel closure drain a committed obligation after authority closure.
+Neither path is a general backend or device proof. The model also assumes
+kernel closure can finish an already committed obligation and publish its one
+guest reply after authority closure; it does not model a
+stuck backend or timeout/tombstone for this syscall path. Tokens store
+inspectable fields rather than implementing opaque kernel capabilities, and
+the sequence/property tests do not establish production Rust concurrency,
+kernel scheduling fairness, or whole-system liveness. The separate
+`PersonalityCser.tla` PlusCal refinement fixes the bounded temporal protocol and
+recovery/closure progress assumptions; neither artifact proves the production
+implementation. CSER therefore remains a candidate mechanism rather than an
+established contribution.
+
 `Commit` is the effect commit linearization point. `RevokeBegin` atomically
 closes the old authority epoch. Effects that committed first must complete or
 drain; effects for which revocation won must abort. The model does not promise
@@ -197,6 +243,6 @@ Clippy, all deterministic/property/Loom tests, and the canonical trace. Direct
 Cargo commands are implementation details of `xtask`; they are not a second
 host-toolchain workflow.
 
-The library is `no_std + alloc` compatible and contains no unsafe code. Its
-trace action names and fields are shared with the TLA+ model and the OSTD
-scheduler spike under `experiments/ostd-cser-spike`.
+The library is `no_std + alloc` compatible and contains no unsafe code. The
+baseline `Model` trace action names and fields are shared with the baseline
+TLA+ model and the OSTD scheduler spike under `experiments/ostd-cser-spike`.

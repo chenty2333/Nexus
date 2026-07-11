@@ -17,8 +17,8 @@ fi
 
 cleanup() {
     rm -rf "$SCRIPT_DIR/states"
-    rm -f "$SCRIPT_DIR"/IoCser_TTrace_*.bin
-    rm -f "$SCRIPT_DIR"/IoCser_TTrace_*.tla
+    rm -f "$SCRIPT_DIR"/*_TTrace_*.bin
+    rm -f "$SCRIPT_DIR"/*_TTrace_*.tla
     if [ -n "$COVERAGE_CONFIG" ]; then
         rm -f "$COVERAGE_CONFIG"
     fi
@@ -44,24 +44,26 @@ run_tlc() {
 }
 
 expect_reachable() {
-    invariant=$1
-    description=$2
+    spec=$1
+    base_config=$2
+    invariant=$3
+    description=$4
     cleanup
     COVERAGE_CONFIG=
     COVERAGE_LOG=
     COVERAGE_CONFIG=$(mktemp \
-        "${TMPDIR:-/tmp}/nexus-iocser-coverage.XXXXXX.cfg")
+        "${TMPDIR:-/tmp}/nexus-cser-coverage.XXXXXX.cfg")
     COVERAGE_LOG=$(mktemp \
-        "${TMPDIR:-/tmp}/nexus-iocser-coverage.XXXXXX.log")
-    cp "$SCRIPT_DIR/IoCserSafetyMC.cfg" "$COVERAGE_CONFIG"
+        "${TMPDIR:-/tmp}/nexus-cser-coverage.XXXXXX.log")
+    cp "$SCRIPT_DIR/$base_config" "$COVERAGE_CONFIG"
     printf '\nINVARIANT %s\n' "$invariant" >>"$COVERAGE_CONFIG"
-    echo "==> IoCser reachability: $description"
+    echo "==> $spec reachability: $description"
 
     if java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC \
         -cleanup \
         -workers "$TLC_WORKERS" \
         -config "$COVERAGE_CONFIG" \
-        "$SCRIPT_DIR/IoCser.tla" >"$COVERAGE_LOG" 2>&1; then
+        "$SCRIPT_DIR/${spec}.tla" >"$COVERAGE_LOG" 2>&1; then
         cat "$COVERAGE_LOG"
         cleanup
         echo "expected reachability witness was not found: $description" >&2
@@ -93,12 +95,32 @@ run_spec() {
         IoCser)
             run_tlc "IoCser 3-ID safety graph (symmetry, no liveness)" \
                 IoCser IoCserSafetyMC.cfg
-            expect_reachable CoverageWitnessAbsent \
+            expect_reachable IoCser IoCserSafetyMC.cfg \
+                CoverageWitnessAbsent \
                 "budget-only RegisterReject and binding-only PublishReject"
-            expect_reachable MixedResetOutcomesAbsent \
+            expect_reachable IoCser IoCserSafetyMC.cfg \
+                MixedResetOutcomesAbsent \
                 "mixed Completed and IndeterminateAfterReset outcomes"
             run_tlc "IoCser action properties and weak-fair liveness (no symmetry)" \
                 IoCser IoCserMC.cfg
+            ;;
+        PersonalityCser)
+            run_tlc "PersonalityCser 2-ID safety graph (symmetry, no liveness)" \
+                PersonalityCser PersonalityCserSafetyMC.cfg
+            expect_reachable PersonalityCser \
+                PersonalityCserSafetyMC.cfg \
+                OldBindingRecoveryAbsent \
+                "write commit/crash/adopt with old-binding rejection"
+            expect_reachable PersonalityCser \
+                PersonalityCserSafetyMC.cfg \
+                ExitGroupDeliveryAbsent \
+                "exit_group exits once without resuming"
+            expect_reachable PersonalityCser \
+                PersonalityCserSafetyMC.cfg \
+                RevocationSplitAbsent \
+                "committed write drain plus uncommitted abort"
+            run_tlc "PersonalityCser action properties and weak-fair liveness (no symmetry)" \
+                PersonalityCser PersonalityCserMC.cfg
             ;;
         *)
             echo "unknown CSER specification: $1" >&2
@@ -112,10 +134,11 @@ case $# in
         run_spec Cser
         run_spec PagerCser
         run_spec IoCser
+        run_spec PersonalityCser
         ;;
     1) run_spec "$1" ;;
     *)
-        echo "usage: $0 [Cser|PagerCser|IoCser]" >&2
+        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser]" >&2
         exit 2
         ;;
 esac

@@ -1,22 +1,40 @@
 # Retained Linux guest inputs
 
 This directory contains small Linux x86-64 C/assembly programs retained as
-future compatibility-pressure inputs. They are not a retained Starnix
+compatibility-pressure inputs. They are not a retained Starnix
 implementation, and they do not define Nexus's native ABI or research identity.
 
 `sources/` is an exact copy of the 34 source files previously built from
 `user/linux-*` at repository commit
 `8d5d07e35b0051bd4ef001224714decc0615ff49`. `SOURCES.toml` maps every copy to
-its original path and SHA-256 digest. The old paths remain temporarily only so
-the larger legacy deletion can happen after the new build and CI cut over.
+its original path and SHA-256 digest. The legacy implementation tree has been
+deleted; Git history and these hashed inputs now carry the remaining provenance.
 
 `COMPATIBILITY.toml` records the behavior each workload was intended to
 exercise. It deliberately refers to Linux behavior rather than old component
 URLs, sidecar VMOs, stop packets, or `zx_*` calls. Only the six `core` entries
 form the bounded Stage 6 gate and carry mandatory CSER injection profiles;
 `stretch` entries add optional breadth, while `archive-input` entries carry no
-implementation commitment. A future Linux-personality harness may refine the
-build and success protocol while keeping these inputs as pressure tests.
+implementation commitment. A Linux-personality harness may refine the build
+and success protocol while keeping these inputs as pressure tests.
+
+## Current Stage 6 use
+
+`linux-hello` is the first and currently only executed core workload. The
+Docker-pinned `experiments/ostd-cser-spike/scripts/build-guest.sh` builds an
+x86-64 static `ET_EXEC` directly from the unchanged retained `hello.S`; it does
+not copy or rewrite a second source tree. The gate fixes both the retained
+source SHA-256
+`50690500a3cfac0f412da66d3d5d7f32b9b4da2a96a38d6d21c3ef12ea141490`
+and the reproducible container-built ELF SHA-256
+`1dae72e6d4a5c9144e94580a8e2a8280cb36f725d66046baed77562051b2f1a4`.
+The generated ELF lives only in the isolated experiment and is not a new
+provenance source.
+
+That one bounded receipt does not complete Stage 6. The other five core
+workloads—futex, epoll, dynamic PIE, runtime filesystem, and runtime
+network—have not run on the new personality. The remaining retained sources
+are still pressure candidates or archive inputs, not compatibility claims.
 
 ## Build profiles
 

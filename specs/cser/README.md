@@ -28,6 +28,17 @@ documents the split, reachability witnesses, precise outcomes, and model
 boundary. This refinement does not claim that an already published write can
 be rolled back or that the real OSTD/IOMMU path is already complete.
 
+`PersonalityCser.tla`, `PersonalityCserSafetyMC.cfg`, and
+`PersonalityCserMC.cfg` are the bounded Stage 6A refinement for a restartable
+Linux personality. They separate a `write` backend commitment from the later
+one-shot guest reply, give `exit_group` a process-exit terminal outcome with no
+resume, and model crash, fallback, exact orphan snapshot, ready/rebind,
+explicit adoption, old-binding rejection, and authority closure. The safety
+configuration uses two syscall IDs with symmetry; the action/liveness
+configuration uses one ID without symmetry. `PERSONALITY.md` records the
+semantics, coverage witnesses, checked results, and deliberately narrow model
+boundary. It is not a claim of general Linux compatibility.
+
 ## Linearization contract
 
 The scope state machine is:
@@ -148,8 +159,8 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar ./specs/cser/check.sh
 
 These commands describe implementation steps inside the container; they do not
 define a second supported host toolchain. With no argument, `check.sh` checks
-the baseline, pager, and mediated-I/O
-models in that order. Pass `Cser`, `PagerCser`, or `IoCser` to run only one.
+the baseline, pager, mediated-I/O, and Linux-personality models in that order.
+Pass `Cser`, `PagerCser`, `IoCser`, or `PersonalityCser` to run only one.
 To modify an algorithm, edit only its PlusCal block and regenerate the
 translation before checking:
 
@@ -158,6 +169,7 @@ cd specs/cser
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 1000 Cser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 1000 PagerCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 IoCser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 1000 PersonalityCser.tla
 ```
 
 The baseline `CserMC.cfg` instance uses three effect identifiers, two total
