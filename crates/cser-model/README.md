@@ -108,20 +108,94 @@ would receive a fresh identity. A successful mapping remains publication history
 after address-space generation teardown, but it is no longer a current mapping;
 only a fault that is already stale when it attempts `Commit` is rejected.
 
+The `io` module is the executable oracle for the Stage 5 mediated VirtIO
+protocol. One scope exclusively owns one split queue and device. It adds:
+
+- independent authority, user-service binding, and device-reset generations;
+- typed conservation of queue slots, pinned pages, DMA bytes, and a separate
+  non-renewable commit charge;
+- `Register -> Prepare -> PublishAvail`, where registration reserves a typed
+  grant and fresh DMA identity, `Prepare` establishes the mapping and exactly
+  one queue-slot obligation, and the `Release` publication of split-ring
+  `avail.idx` is the only request commit point; `Notify` is a one-shot
+  post-commit hint because a polling device can observe the request without it;
+- `Crash -> FallbackPick -> RecoverySnapshot -> Ready -> Rebind -> Adopt` for
+  `Registered`/`Prepared` work, while `Committed` work remains kernel-owned;
+- separate scope-local indexes for retained DMA cleanup, unpublished work, and
+  live queue-slot obligations, plus incremental held-charge and nonterminal
+  counters. Cancellation selection and closure do not traverse immutable
+  request history, so already terminalized and synchronously invalidated
+  history does not increase the frozen revocation target `k`;
+- `Registered -> Cancelled` for a request with no DMA mapping, and
+  `Prepared -> Cancelling -> Cancelled` only after request unmap plus a matching
+  synchronous IOTLB invalidation acknowledgement;
+- `Committed -> Completed` on a matching current-device-generation completion,
+  or `Committed -> IndeterminateAfterReset` when whole-device `ResetAck` wins;
+  reset never calls a published request cancelled and never claims rollback;
+- early independent cleanup for never-published `Cancelling` requests and
+  device-completed requests, while the scope-owned queue and any still-visible
+  committed work remain retained until whole-device reset acknowledgement;
+  queue unmap additionally waits until every prepared/committed request has
+  relinquished its descriptor-slot obligation;
+- reset and per-lease invalidation timeout tombstones. A timeout value carries
+  the retained queue/request identity and typed credit summary, the scope stays
+  `Closing`, and only an explicit retry can resume cleanup;
+- queue and request DMA release only after unmap plus synchronous invalidation
+  completion. Lease and mapping IDs are never reused; an IOVA becomes reusable
+  only after acknowledgement and only with fresh identities.
+
+`RevokeBegin` closes the publication gate but does not serialize all cleanup.
+Whole-device reset may run in parallel with cancellation and invalidation of
+unpublished requests. `ResetAck` affects only requests still `Committed` at its
+linearization point. `RevokeComplete` requires reset-established device
+quiescence, a synchronously invalidated and released queue lease, every request
+effect terminalized exactly once, every request lease released, no held commit
+charge, and full renewable-credit return. An invalidation timeout therefore
+cannot be disguised as closure or ordinary `Drop`.
+
+The I/O Loom suite uses three small surrogate gates: `PublishAvail` versus
+`RevokeBegin`; device completion versus `ResetAck`; and reset/invalidation
+timeout versus acknowledgement and resource release. Passing it establishes
+only those bounded lock/atomic interleavings. It does **not** prove the real
+virtio-drivers publication fence, PCI reset semantics, interrupt suppression,
+OSTD synchronization, VT-d command completion, hardware cache behavior, DMA
+quiescence, or whole-system liveness. Those require the Stage 5 OSTD/QEMU spike
+and fault injection.
+
+The I/O oracle's closure predicate is constant-time over incremental counters
+and index emptiness. Each unpublished cancellation selects and removes one
+entry directly from its dedicated `BTreeSet`; `ResetAck` visits the remaining
+live-obligation index once. Across `k` live requests, the reference structure
+therefore performs `O(k)` logical visits without scanning immutable per-scope
+history or unrelated scopes. Request records still live in one global
+`BTreeMap`, however, so those visits currently add `O(log N)` global lookup
+cost in addition to local-set selection/removal and other global ownership
+indexes. The concrete model therefore has logarithmic costs in both local and
+global indexed populations; it is not independent of global scale. This is
+useful no-global-scan evidence, but it does not establish WorkProportionality.
+A production implementation needs a scope-local or intrusive record index plus
+the fixed-`N`/varying-`k` and fixed-`k`/varying-`N` latency curves.
+
+`check_invariants` deliberately performs a full history reconstruction as an
+explicit diagnostic audit; it is not called by any protocol transition or
+closure predicate and is excluded from the revocation-work bound.
+
 `Commit` is the effect commit linearization point. `RevokeBegin` atomically
 closes the old authority epoch. Effects that committed first must complete or
 drain; effects for which revocation won must abort. The model does not promise
 rollback after an external effect crossed its commit point.
 
-Run the tests and canonical trace from the repository root:
+Run every model gate and the canonical trace from the repository root through
+the pinned Docker environment:
 
 ```sh
-cargo test -p cser-model --all-features
-cargo test -p cser-model --test pager_loom
-cargo check -p cser-model --no-default-features --lib
-cargo clippy -p cser-model --all-targets --all-features -- -D warnings
-cargo run -p cser-model --bin cser-model
+./x model
 ```
+
+The root entry point runs formatting checks, `no_std` and hosted builds,
+Clippy, all deterministic/property/Loom tests, and the canonical trace. Direct
+Cargo commands are implementation details of `xtask`; they are not a second
+host-toolchain workflow.
 
 The library is `no_std + alloc` compatible and contains no unsafe code. Its
 trace action names and fields are shared with the TLA+ model and the OSTD

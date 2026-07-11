@@ -2,14 +2,14 @@ use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::fd::FromRawFd as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,7 +31,9 @@ const TRACE_ACTIONS: [&str; 9] = [
     "Complete",
 ];
 
-const TLA_SPECS: [&str; 2] = ["Cser", "PagerCser"];
+const TLA_SPECS: [&str; 3] = ["Cser", "PagerCser", "IoCser"];
+
+static NEXT_SPEC_WORKSPACE: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     if let Err(error) = real_main() {
@@ -289,9 +291,14 @@ fn spec(root: &Path) -> Result<()> {
     let jar = tla2tools_jar()?;
     let artifact_dir = root.join("target/verification");
     fs::create_dir_all(&artifact_dir)?;
+    let _lock = SpecRunLock::acquire(&artifact_dir.join(".spec.lock"))?;
+    let source_cser_dir = root.join("specs/cser");
+    let workspace = IsolatedSpecWorkspace::create(&source_cser_dir)?;
+
     for spec in TLA_SPECS {
         pluscal_translation_is_current(
-            root,
+            &source_cser_dir,
+            workspace.cser_dir(),
             &jar,
             spec,
             &artifact_dir.join(format!("{spec}-pluscal.log")),
@@ -302,18 +309,161 @@ fn spec(root: &Path) -> Result<()> {
         section(&format!("run TLC for {spec}"));
         let mut command = Command::new("sh");
         command
-            .current_dir(root)
+            .current_dir(workspace.cser_dir())
             .env("TLA2TOOLS_JAR", &jar)
-            .arg("specs/cser/check.sh")
+            .env("TMPDIR", workspace.temp_dir())
+            .arg(workspace.cser_dir().join("check.sh"))
             .arg(spec);
         run_bounded_logged(
             &mut command,
             &artifact_dir.join(format!("{spec}-tlc.log")),
-            Duration::from_secs(300),
+            Duration::from_secs(if spec == "IoCser" { 600 } else { 300 }),
             8 * 1024 * 1024,
         )?;
     }
     Ok(())
+}
+
+struct SpecRunLock {
+    file: File,
+}
+
+impl SpecRunLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        loop {
+            // SAFETY: flock only observes the live file descriptor owned by
+            // `file`; no pointers or borrowed memory cross the FFI boundary.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(Self { file });
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(format!(
+                    "lock specification artifacts at {}: {error}",
+                    path.display()
+                )
+                .into());
+            }
+        }
+    }
+}
+
+impl Drop for SpecRunLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor remains valid for the duration of this call
+        // and belongs to this guard. The kernel also releases it on process
+        // exit, including abrupt termination.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+struct IsolatedSpecWorkspace {
+    root: PathBuf,
+    cser_dir: PathBuf,
+    temp_dir: PathBuf,
+}
+
+impl IsolatedSpecWorkspace {
+    fn create(source_cser_dir: &Path) -> Result<Self> {
+        let root = create_unique_spec_workspace()?;
+        let cser_dir = root.join("specs/cser");
+        let temp_dir = root.join("tmp");
+        let result = (|| -> Result<()> {
+            fs::create_dir_all(&cser_dir)?;
+            fs::create_dir(&temp_dir)?;
+            copy_spec_inputs(source_cser_dir, &cser_dir)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let cleanup = fs::remove_dir_all(&root);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!(
+                    "{error}; remove incomplete isolated specification workspace {}: {cleanup_error}",
+                    root.display()
+                )
+                .into()),
+            };
+        }
+        Ok(Self {
+            root,
+            cser_dir,
+            temp_dir,
+        })
+    }
+
+    fn cser_dir(&self) -> &Path {
+        &self.cser_dir
+    }
+
+    fn temp_dir(&self) -> &Path {
+        &self.temp_dir
+    }
+}
+
+impl Drop for IsolatedSpecWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn create_unique_spec_workspace() -> Result<PathBuf> {
+    for _ in 0..100 {
+        let sequence = NEXT_SPEC_WORKSPACE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            env::temp_dir().join(format!("nexus-cser-spec-{}-{sequence}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "create isolated specification workspace {}: {error}",
+                    path.display()
+                )
+                .into());
+            }
+        }
+    }
+    Err("could not allocate a unique isolated specification workspace".into())
+}
+
+fn copy_spec_inputs(source: &Path, destination: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if generated_spec_entry(&name) {
+            continue;
+        }
+        let source_path = entry.path();
+        let destination_path = destination.join(&name);
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            fs::create_dir(&destination_path)?;
+            copy_spec_inputs(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path)?;
+        } else {
+            return Err(format!(
+                "unsupported specification input type: {}",
+                source_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn generated_spec_entry(name: &OsStr) -> bool {
+    name == "states"
+        || name
+            .to_str()
+            .is_some_and(|name| name.contains("_TTrace_") || name.ends_with(".old"))
 }
 
 fn tla2tools_jar() -> Result<PathBuf> {
@@ -326,50 +476,37 @@ fn tla2tools_jar() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn pluscal_translation_is_current(root: &Path, jar: &Path, spec: &str, log: &Path) -> Result<()> {
+fn pluscal_translation_is_current(
+    source_cser_dir: &Path,
+    isolated_cser_dir: &Path,
+    jar: &Path,
+    spec: &str,
+    log: &Path,
+) -> Result<()> {
     section(&format!("check PlusCal translation drift for {spec}"));
     let file_name = format!("{spec}.tla");
-    let original_path = root.join("specs/cser").join(&file_name);
-    let temp = env::temp_dir().join(format!(
-        "nexus-{}-pcal-{}",
-        spec.to_ascii_lowercase(),
-        std::process::id()
-    ));
-    if temp.exists() {
-        fs::remove_dir_all(&temp)?;
+    let line_width = if spec == "IoCser" { "10000" } else { "1000" };
+    let original_path = source_cser_dir.join(&file_name);
+    let generated_path = isolated_cser_dir.join(&file_name);
+    let mut command = Command::new("java");
+    command
+        .current_dir(isolated_cser_dir)
+        .arg("-cp")
+        .arg(jar)
+        .args(["pcal.trans", "-nocfg", "-lineWidth", line_width, &file_name]);
+    run_bounded_logged(&mut command, log, Duration::from_secs(30), 1024 * 1024)?;
+
+    let original = fs::read_to_string(&original_path)?;
+    let generated = fs::read_to_string(&generated_path)?;
+    if original != generated {
+        let detail = first_difference(&original, &generated);
+        return Err(format!(
+            "PlusCal translation drifted for {spec} ({detail}); regenerate {} with TLA+ tools",
+            original_path.display()
+        )
+        .into());
     }
-    fs::create_dir(&temp)?;
-    let generated_path = temp.join(&file_name);
-    fs::copy(&original_path, &generated_path)?;
-
-    let translation = (|| -> Result<()> {
-        let mut command = Command::new("java");
-        command.current_dir(&temp).arg("-cp").arg(jar).args([
-            "pcal.trans",
-            "-nocfg",
-            "-lineWidth",
-            "1000",
-            &file_name,
-        ]);
-        run_bounded_logged(&mut command, log, Duration::from_secs(30), 1024 * 1024)?;
-
-        let original = fs::read_to_string(&original_path)?;
-        let generated = fs::read_to_string(&generated_path)?;
-        if original != generated {
-            let detail = first_difference(&original, &generated);
-            return Err(format!(
-                "PlusCal translation drifted for {spec} ({detail}); regenerate {} with TLA+ tools",
-                original_path.display()
-            )
-            .into());
-        }
-        println!("PlusCal translation: PASS ({spec})");
-        Ok(())
-    })();
-
-    let cleanup = fs::remove_dir_all(&temp);
-    translation?;
-    cleanup?;
+    println!("PlusCal translation: PASS ({spec})");
     Ok(())
 }
 
@@ -733,6 +870,7 @@ fn section(title: &str) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Barrier, mpsc};
 
     static NEXT_CAPTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -742,6 +880,146 @@ mod tests {
             std::process::id(),
             NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        let path = artifact(name);
+        fs::create_dir(&path).expect("create fixture directory");
+        path
+    }
+
+    #[test]
+    fn isolated_spec_workspace_copies_only_source_inputs() {
+        let fixture = fixture_dir("spec-inputs");
+        let source = fixture.join("cser");
+        fs::create_dir(&source).expect("create source directory");
+        fs::write(source.join("IoCser.tla"), "---- MODULE IoCser ----\n")
+            .expect("write source specification");
+        fs::write(source.join("IoCser.old"), "generated backup").expect("write generated backup");
+        fs::write(source.join("IoCser_TTrace_1.tla"), "generated trace")
+            .expect("write generated trace");
+        fs::create_dir(source.join("states")).expect("create generated state directory");
+        fs::write(source.join("states/checkpoint"), "generated state")
+            .expect("write generated state");
+        fs::create_dir(source.join("nested")).expect("create nested input directory");
+        fs::write(source.join("nested/model.cfg"), "SPECIFICATION Spec\n")
+            .expect("write nested input");
+
+        let workspace = IsolatedSpecWorkspace::create(&source).expect("create isolated workspace");
+        assert_eq!(
+            fs::read_to_string(workspace.cser_dir().join("IoCser.tla"))
+                .expect("read copied specification"),
+            "---- MODULE IoCser ----\n"
+        );
+        assert!(workspace.cser_dir().join("nested/model.cfg").is_file());
+        assert!(!workspace.cser_dir().join("IoCser.old").exists());
+        assert!(!workspace.cser_dir().join("IoCser_TTrace_1.tla").exists());
+        assert!(!workspace.cser_dir().join("states").exists());
+
+        drop(workspace);
+        fs::remove_dir_all(fixture).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn isolated_spec_workspace_drop_removes_generated_state() {
+        let fixture = fixture_dir("spec-cleanup");
+        let source = fixture.join("cser");
+        fs::create_dir(&source).expect("create source directory");
+        fs::write(source.join("IoCser.tla"), "---- MODULE IoCser ----\n")
+            .expect("write source specification");
+
+        let workspace = IsolatedSpecWorkspace::create(&source).expect("create isolated workspace");
+        let workspace_root = workspace.root.clone();
+        fs::create_dir(workspace.cser_dir().join("states"))
+            .expect("create generated state directory");
+        fs::write(
+            workspace.cser_dir().join("IoCser_TTrace_timeout.tla"),
+            "generated trace",
+        )
+        .expect("write generated trace");
+        fs::write(
+            workspace.temp_dir().join("coverage.log"),
+            "temporary evidence",
+        )
+        .expect("write temporary evidence");
+
+        drop(workspace);
+        assert!(!workspace_root.exists());
+        fs::remove_dir_all(fixture).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn timed_out_spec_process_leaves_no_workspace_artifacts() {
+        let fixture = fixture_dir("spec-timeout-cleanup");
+        let source = fixture.join("cser");
+        fs::create_dir(&source).expect("create source directory");
+        fs::write(source.join("IoCser.tla"), "---- MODULE IoCser ----\n")
+            .expect("write source specification");
+
+        let workspace = IsolatedSpecWorkspace::create(&source).expect("create isolated workspace");
+        let workspace_root = workspace.root.clone();
+        let mut command = Command::new("sh");
+        command.current_dir(workspace.cser_dir()).args([
+            "-c",
+            "mkdir states; touch IoCser_TTrace_timeout.tla; sleep 10",
+        ]);
+        let error = run_bounded_logged(
+            &mut command,
+            &fixture.join("timeout.log"),
+            Duration::from_millis(100),
+            1024,
+        )
+        .expect_err("fixture must time out");
+        assert!(error.to_string().contains("timeout"));
+        assert!(workspace.cser_dir().join("states").is_dir());
+        assert!(
+            workspace
+                .cser_dir()
+                .join("IoCser_TTrace_timeout.tla")
+                .is_file()
+        );
+
+        drop(workspace);
+        assert!(!workspace_root.exists());
+        assert!(!source.join("states").exists());
+        assert!(!source.join("IoCser_TTrace_timeout.tla").exists());
+        fs::remove_dir_all(fixture).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn spec_run_lock_serializes_independent_acquisitions() {
+        let fixture = fixture_dir("spec-lock");
+        let lock_path = fixture.join(".spec.lock");
+        let first = SpecRunLock::acquire(&lock_path).expect("acquire first lock");
+        let barrier = Arc::new(Barrier::new(2));
+        let second_barrier = Arc::clone(&barrier);
+        let (sender, receiver) = mpsc::channel();
+        let second = thread::spawn(move || {
+            second_barrier.wait();
+            sender.send("attempting").expect("announce lock attempt");
+            let guard = SpecRunLock::acquire(&lock_path).expect("acquire second lock");
+            sender.send("acquired").expect("announce lock acquisition");
+            guard
+        });
+
+        barrier.wait();
+        assert_eq!(receiver.recv().expect("receive lock attempt"), "attempting");
+        assert!(
+            matches!(
+                receiver.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the second lock acquisition must block while the first is held"
+        );
+        drop(first);
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second lock must eventually acquire"),
+            "acquired"
+        );
+        drop(second.join().expect("join second lock thread"));
+        fs::remove_dir_all(fixture).expect("remove fixture directory");
     }
 
     #[test]

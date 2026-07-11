@@ -176,8 +176,13 @@ TLC completes the graph with no error:
 17,150 states generated
 7,528 distinct states found
 0 states left on queue
-complete graph depth 17
+reported complete-graph depth 17-18 across clean 16-worker runs
 ```
+
+The generated, distinct, and queued counts are stable. TLC's parallel
+traversal has reported depth 17 and 18 on separate clean runs of the same
+graph; that traversal statistic is recorded as a range and is not itself a
+checked safety or liveness property.
 
 ## Run and regenerate
 
