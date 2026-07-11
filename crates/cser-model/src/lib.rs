@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod model;
+pub mod pager;
 
 pub use model::Model;
 

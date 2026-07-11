@@ -17,7 +17,29 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC \
-    -cleanup \
-    -config "$SCRIPT_DIR/CserMC.cfg" \
-    "$SCRIPT_DIR/Cser.tla"
+run_spec() {
+    case "$1" in
+        Cser|PagerCser) spec=$1 ;;
+        *)
+            echo "unknown CSER specification: $1" >&2
+            exit 2
+            ;;
+    esac
+
+    java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC \
+        -cleanup \
+        -config "$SCRIPT_DIR/${spec}MC.cfg" \
+        "$SCRIPT_DIR/${spec}.tla"
+}
+
+case $# in
+    0)
+        run_spec Cser
+        run_spec PagerCser
+        ;;
+    1) run_spec "$1" ;;
+    *)
+        echo "usage: $0 [Cser|PagerCser]" >&2
+        exit 2
+        ;;
+esac

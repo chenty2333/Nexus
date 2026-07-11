@@ -31,6 +31,8 @@ const TRACE_ACTIONS: [&str; 9] = [
     "Complete",
 ];
 
+const TLA_SPECS: [&str; 2] = ["Cser", "PagerCser"];
+
 fn main() {
     if let Err(error) = real_main() {
         eprintln!("xtask: {error}");
@@ -287,20 +289,31 @@ fn spec(root: &Path) -> Result<()> {
     let jar = tla2tools_jar()?;
     let artifact_dir = root.join("target/verification");
     fs::create_dir_all(&artifact_dir)?;
-    pluscal_translation_is_current(root, &jar, &artifact_dir.join("pluscal.log"))?;
+    for spec in TLA_SPECS {
+        pluscal_translation_is_current(
+            root,
+            &jar,
+            spec,
+            &artifact_dir.join(format!("{spec}-pluscal.log")),
+        )?;
+    }
 
-    section("run TLC");
-    let mut command = Command::new("sh");
-    command
-        .current_dir(root)
-        .env("TLA2TOOLS_JAR", &jar)
-        .arg("specs/cser/check.sh");
-    run_bounded_logged(
-        &mut command,
-        &artifact_dir.join("tlc.log"),
-        Duration::from_secs(300),
-        8 * 1024 * 1024,
-    )
+    for spec in TLA_SPECS {
+        section(&format!("run TLC for {spec}"));
+        let mut command = Command::new("sh");
+        command
+            .current_dir(root)
+            .env("TLA2TOOLS_JAR", &jar)
+            .arg("specs/cser/check.sh")
+            .arg(spec);
+        run_bounded_logged(
+            &mut command,
+            &artifact_dir.join(format!("{spec}-tlc.log")),
+            Duration::from_secs(300),
+            8 * 1024 * 1024,
+        )?;
+    }
+    Ok(())
 }
 
 fn tla2tools_jar() -> Result<PathBuf> {
@@ -313,15 +326,20 @@ fn tla2tools_jar() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn pluscal_translation_is_current(root: &Path, jar: &Path, log: &Path) -> Result<()> {
-    section("check PlusCal translation drift");
-    let original_path = root.join("specs/cser/Cser.tla");
-    let temp = env::temp_dir().join(format!("nexus-cser-pcal-{}", std::process::id()));
+fn pluscal_translation_is_current(root: &Path, jar: &Path, spec: &str, log: &Path) -> Result<()> {
+    section(&format!("check PlusCal translation drift for {spec}"));
+    let file_name = format!("{spec}.tla");
+    let original_path = root.join("specs/cser").join(&file_name);
+    let temp = env::temp_dir().join(format!(
+        "nexus-{}-pcal-{}",
+        spec.to_ascii_lowercase(),
+        std::process::id()
+    ));
     if temp.exists() {
         fs::remove_dir_all(&temp)?;
     }
     fs::create_dir(&temp)?;
-    let generated_path = temp.join("Cser.tla");
+    let generated_path = temp.join(&file_name);
     fs::copy(&original_path, &generated_path)?;
 
     let translation = (|| -> Result<()> {
@@ -331,7 +349,7 @@ fn pluscal_translation_is_current(root: &Path, jar: &Path, log: &Path) -> Result
             "-nocfg",
             "-lineWidth",
             "1000",
-            "Cser.tla",
+            &file_name,
         ]);
         run_bounded_logged(&mut command, log, Duration::from_secs(30), 1024 * 1024)?;
 
@@ -340,11 +358,12 @@ fn pluscal_translation_is_current(root: &Path, jar: &Path, log: &Path) -> Result
         if original != generated {
             let detail = first_difference(&original, &generated);
             return Err(format!(
-                "PlusCal translation drifted ({detail}); regenerate specs/cser/Cser.tla with TLA+ tools"
+                "PlusCal translation drifted for {spec} ({detail}); regenerate {} with TLA+ tools",
+                original_path.display()
             )
             .into());
         }
-        println!("PlusCal translation: PASS");
+        println!("PlusCal translation: PASS ({spec})");
         Ok(())
     })();
 

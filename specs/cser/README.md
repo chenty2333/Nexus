@@ -9,6 +9,13 @@ This is a protocol model, not a claim that an already submitted device effect
 can be rolled back. `Committed` is the abstract point after which a concrete
 backend must complete, drain, reset, or retain a tombstone.
 
+`PagerCser.tla` and `PagerCserMC.cfg` are the Stage 4 successor refinement for
+one address-space pager scope. They add one-shot fault continuations, a distinct
+address-space generation, prepared-frame ownership, same-page publication,
+crash/rebind/adopt, and a kernel-owned recovery deadline. The exact pager
+semantics, checked properties, finite boundary, and TLC result are documented
+in `PAGER.md`; they extend rather than replace the baseline model below.
+
 ## Linearization contract
 
 The scope state machine is:
@@ -117,12 +124,14 @@ Use a TLA+ tools 1.8.0 jar or newer:
 TLA2TOOLS_JAR=/path/to/tla2tools.jar ./specs/cser/check.sh
 ```
 
-To modify the algorithm, edit only the PlusCal block and regenerate the
-translation before checking:
+With no argument, `check.sh` checks both the baseline and pager models. Pass
+`Cser` or `PagerCser` to run only one. To modify either algorithm, edit only its
+PlusCal block and regenerate the translation before checking:
 
 ```sh
 cd specs/cser
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 1000 Cser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 1000 PagerCser.tla
 ```
 
 The committed model-checking instance uses three effect identifiers, two total

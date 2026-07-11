@@ -5,6 +5,10 @@ target
 **/mutants.out*
 **/fuzz/corpus
 **/fuzz/artifacts
-experiments/ostd-cser-spike/guest/probe.bin
+experiments/ostd-cser-spike/guest/*.bin
+specs/cser/*_TTrace_*.bin
+specs/cser/*_TTrace_*.tla
+specs/cser/*.old
+specs/cser/states/
 .claude
 AGENTS.md

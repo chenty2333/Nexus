@@ -81,6 +81,10 @@ clean_root() {
         "$root/target" \
         "$root/tools/xtask/target" \
         "$root/specs/cser/states"
+    rm -f \
+        "$root"/specs/cser/*_TTrace_*.bin \
+        "$root"/specs/cser/*_TTrace_*.tla \
+        "$root"/specs/cser/*.old
 }
 
 command=${1:-}

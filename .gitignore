@@ -9,8 +9,11 @@
 
 # OSDK/QEMU outputs
 experiments/ostd-cser-spike/artifacts/
-experiments/ostd-cser-spike/guest/probe.bin
+experiments/ostd-cser-spike/guest/*.bin
 specs/cser/states/
+specs/cser/*_TTrace_*.bin
+specs/cser/*_TTrace_*.tla
+specs/cser/*.old
 
 # Local agent/editor control files
 /AGENTS.md
