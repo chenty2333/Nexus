@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")" && pwd)
+image=nexus/ostd-cser-spike:0.18.0
+
+build_image() {
+    docker build --platform linux/amd64 -t "$image" "$root"
+}
+
+container() {
+    docker run --rm \
+        --platform linux/amd64 \
+        -v "$root:/work:z" \
+        -w /work \
+        "$image" \
+        "$@"
+}
+
+ensure_image() {
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        build_image
+    fi
+}
+
+prepare_guest() {
+    container bash scripts/build-guest.sh
+}
+
+run_kernel() {
+    container timeout --signal=TERM --kill-after=2s 30s cargo osdk run
+}
+
+command=${1:-test}
+case "$command" in
+    image)
+        build_image
+        ;;
+    check)
+        ensure_image
+        prepare_guest
+        container cargo osdk check --locked
+        ;;
+    build)
+        ensure_image
+        prepare_guest
+        container cargo osdk build
+        ;;
+    iommu-probe)
+        ensure_image
+        container bash scripts/check-iotlb-gap.sh
+        ;;
+    run)
+        ensure_image
+        prepare_guest
+        mkdir -p "$root/artifacts"
+        run_kernel | tee "$root/artifacts/serial.log"
+        ;;
+    test)
+        ensure_image
+        prepare_guest
+        mkdir -p "$root/artifacts"
+        container cargo osdk check --locked
+        container bash scripts/check-iotlb-gap.sh
+        run_kernel | tee "$root/artifacts/serial.log"
+        "$root/scripts/assert-serial.sh" "$root/artifacts/serial.log"
+        ;;
+    clean)
+        ensure_image
+        container rm -rf target artifacts guest/probe.bin
+        ;;
+    *)
+        echo "usage: ./x {image|check|build|iommu-probe|run|test|clean}" >&2
+        exit 2
+        ;;
+esac

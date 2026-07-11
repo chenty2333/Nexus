@@ -1,0 +1,5 @@
+!/Cargo.lock
+!/README.md
+/artifacts/
+/guest/probe.bin
+/target/

@@ -1,0 +1,24 @@
+project_type = "kernel"
+supported_archs = ["x86_64"]
+
+[boot]
+method = "grub-rescue-iso"
+
+[grub]
+boot_protocol = "multiboot2"
+
+[qemu]
+args = """\
+    -machine q35,kernel-irqchip=split \
+    -cpu Icelake-Server,+x2apic \
+    -m 1G \
+    -smp 1 \
+    -no-reboot \
+    -display none \
+    -monitor none \
+    -chardev stdio,id=serial0,signal=off \
+    -serial chardev:serial0 \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    -drive if=pflash,format=raw,unit=0,readonly=on,file=/root/ovmf/release/OVMF.fd \
+    -drive if=pflash,format=raw,unit=1,file=/root/ovmf/release/OVMF_VARS.fd \
+"""
