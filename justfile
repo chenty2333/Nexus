@@ -5,11 +5,11 @@ default:
 
 # Host-only gates for Phase A (contracts).
 xlint:
-  cargo clippy -p axle-types -p axle-core -p axle-mm -p axle-page-table -p axle-sync -p libzircon -p nexus-rt -p axle-conformance -p axle-concurrency --all-targets -- -D warnings
+  cargo clippy -p axle-types -p axle-core -p axle-mm -p axle-page-table -p axle-sync -p cser-model -p libzircon -p nexus-rt -p axle-conformance -p axle-concurrency --all-targets -- -D warnings
   cargo clippy -p nexus-init --lib -- -D warnings
 
 xtest:
-  cargo test -p axle-types -p axle-core -p axle-mm -p axle-page-table -p axle-sync -p libzircon -p nexus-rt -p axle-conformance -p axle-concurrency
+  cargo test -p axle-types -p axle-core -p axle-mm -p axle-page-table -p axle-sync -p cser-model -p libzircon -p nexus-rt -p axle-conformance -p axle-concurrency
   cargo test -p nexus-init --lib
 
 # Kernel conformance gate.

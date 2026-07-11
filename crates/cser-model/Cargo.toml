@@ -1,0 +1,18 @@
+[package]
+name = "cser-model"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+description = "Executable reference model for Nexus causally scoped effect revocation"
+
+[features]
+default = ["std"]
+std = []
+
+[dev-dependencies]
+proptest = "=1.11.0"
+
+[[bin]]
+name = "cser-model"
+path = "src/bin/cser-model.rs"
+required-features = ["std"]

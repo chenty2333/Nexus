@@ -31,6 +31,8 @@ references/Nexus*
 AGENTS.md
 Cargo.lock
 README.md
+!crates/cser-model/README.md
+!specs/cser/README.md
 
 # Fuzzing outputs
 **/fuzz/corpus/

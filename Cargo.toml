@@ -7,6 +7,7 @@ members = [
   "crates/axle-page-table",
   "crates/axle-sync",
   "crates/axle-virtio-transport",
+  "crates/cser-model",
   "crates/nexus-fs-proto",
   "crates/nexus-fs-model",
   "crates/axle-types",
