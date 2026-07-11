@@ -8,11 +8,12 @@ already demonstrated. The evidence terms **Specified**, **Checked**,
 `VISION.md`.
 
 For baseline operations, `specs/cser/Cser.tla` is the semantic source of truth;
-`specs/cser/PagerCser.tla` is the explicit pager successor refinement.
-`crates/cser-model` provides the corresponding executable oracles. A future
-implementation must refine those operations or change the relevant model first;
-it must not silently redefine their linearization points. Sections marked
-planned extend beyond the current finite models.
+`specs/cser/PagerCser.tla` and `specs/cser/IoCser.tla` are the explicit pager
+and mediated-I/O successor refinements. `crates/cser-model` provides the
+corresponding executable oracles. A future implementation must refine those
+operations or change the relevant model first; it must not silently redefine
+their linearization points. Sections marked planned extend beyond the current
+finite models.
 
 ## System boundary
 
@@ -149,20 +150,22 @@ fenced; otherwise a crashed service could prevent its own revocation.
 
 ### Budget ledger
 
-The current model uses one scalar consumable credit:
+The baseline model uses one scalar consumable credit:
 
 ```text
 free + held + spent = total
 ```
 
-The implementation will require typed ledgers for resources such as CPU time,
-pinned frames, DMA mappings, queue slots, bytes, and outstanding continuations.
-Registration transfers credit into `held`; commit accounts it as `spent` or
-backend-owned; abort returns renewable credit; a tombstone retains credit until
-safe cleanup. Replenishment and typed exchange are planned refinements and must
-preserve no-duplication.
+The Stage 5 I/O refinement already separates typed renewable queue-slot,
+pinned-page, and DMA-byte lease credits from a nonrenewable commit charge.
+Registration transfers credit into `held`; commit accounts a charge as `spent`
+while renewable resource leases remain held until acknowledged teardown; abort
+returns unspent and renewable credit; a tombstone retains credit until safe
+cleanup. Production exchange rates, replenishment, CPU budgets, and
+cross-service accounting remain planned refinements and must preserve
+no-duplication.
 
-### Tombstone (planned)
+### Tombstone
 
 ```text
 Tombstone {
@@ -178,9 +181,11 @@ Tombstone {
 
 A tombstone records an effect that has not reached provable hardware closure.
 It rejects duplicate or stale completions and prevents retained buffers from
-being reused. Tombstones and real time are not in the current TLA+ model; they
-must be added to the protocol before the mediated I/O slice claims
-`QuiescentClosure`.
+being reused. The Stage 5 TLA+ and Rust refinements model bounded reset and
+invalidation timeout witnesses plus explicit retry, but not wall-clock time,
+persistent recovery records, administrative policy, or real retained device
+buffers. Those implementation obligations remain prerequisites for a real
+mediated-I/O `QuiescentClosure` result.
 
 ## Core protocol
 
@@ -366,8 +371,8 @@ not assumed fair and no replacement is assumed to appear.
 ### Checked and executable evidence
 
 - TLC completed the committed pager graph with no error: 17,150 generated
-  states, 7,528 distinct states, zero queued states, depth 17, and ten checked
-  temporal-property branches.
+  states, 7,528 distinct states, zero queued states, reported depth 17-18
+  across clean 16-worker runs, and ten checked temporal-property branches.
 - The safe-Rust pager oracle has 12 deterministic tests and five proptests, each
   configured for 64 cases, covering the same-page, generation, crash/rebind,
   deadline, terminalization, frame, and credit rules.
@@ -432,7 +437,8 @@ not a second general pager.
 
 ## Vertical slice 3: mediated VirtIO and DMA closure
 
-Status: **Planned; NO-GO while the DMA ownership gate remains open**.
+Status: **protocol/model complete; bounded DMA-ownership primitive Observed;
+real device slice in progress**.
 
 The service may construct and schedule an I/O request, but a Nexus-owned portal
 must validate its effect token, descriptors, budgets, pinned buffers, device,
@@ -481,24 +487,31 @@ cannot succeed while a closing-epoch DMA effect lacks proven closure.
 
 ### OSTD 0.18 IOMMU boundary
 
-Status: **Observed negative result**.
+Status: **bounded one-page feasibility / Observed**.
 
-OSTD 0.18 removes DMA mappings without exposing a public synchronous IOTLB
-invalidation-and-completion operation. Its invalidation/domain state is
+Unmodified OSTD 0.18 removes DMA mappings without exposing a public synchronous
+IOTLB invalidation-and-completion operation. Its invalidation/domain state is
 crate-private, so an external Nexus adapter cannot safely become a second VT-d
-owner. The current adapter therefore returns
-`IotlbInvalidationUnavailable` and never fabricates `Quiesced`.
+owner. The initial fail-closed probe therefore returned
+`IotlbInvalidationUnavailable` and never fabricated `Quiesced`.
 
-Before a real DMA-closure implementation proceeds or reports `Quiesced`, Nexus
-must select and audit exactly one option:
+The prototype has now selected one of the three admissible ownership choices:
+it carries a small, experiment-local MPL-2.0 patch to OSTD 0.18. The patch adds
+an ownership-carrying, single-page
+`begin_unmap_invalidate -> PendingDmaUnmap::poll_complete` contract. The pinned
+QEMU receipt observed a real VT-d global IOTLB descriptor and wait descriptor,
+an injected `Pending` retaining frame/IOVA/PADDR accounting, acknowledgement
+before release, and fresh-identity IOVA reuse only after completion. OSTD
+remains the sole VT-d owner; Nexus owns deadline and tombstone policy.
 
-1. upstream a public synchronous unmap/invalidate/wait API to OSTD;
-2. carry a small, isolated, reviewed OSTD patch implementing that contract; or
-3. move IOMMU/DMA ownership out of OSTD into one Nexus-owned layer.
-
-This decision must include queue/domain ownership, invalidation completion,
-device reset ordering, frame lifetime, and an executable failure test. Merely
-calling an unmap function is insufficient.
+This is a GO only for the bounded ownership primitive. The probe never presents
+the IOVA to a device, runs with one CPU and one page, and proves neither device
+drain/reset nor a real timeout/tombstone path. Stage 5B must combine the same
+owner with a real `ACCESS_PLATFORM` VirtIO queue, device stop/drain-or-reset,
+generation-fenced completion, request and queue teardown, and retained-resource
+timeout tests before the adapter may report device `Quiesced`. Whether the
+patch is upstreamed, and the production domain, multi-page, SMP, and queue
+ownership policy, remain open.
 
 ## Linux personality
 
@@ -535,18 +548,22 @@ The pinned experiment observed public API fit for:
 - wrappers around `Waiter`/`Waker` and `Jiffies` that retain an effect token;
 - one kernel-held prepared frame across pager crash/rebind, explicit adoption,
   real PTE publication, local TLB synchronization, and the bounded timeout
-  closure ordering documented above.
+  closure ordering documented above;
+- through the separate Stage 5A experiment, a single-owner one-page queued
+  IOTLB invalidation whose pending handle retains the real DMA owner until
+  hardware completion.
 
 These mechanisms should be reused behind Nexus adapters. CSER state should not
 be patched into OSTD internals merely for convenience.
 
 ### Not accepted yet
 
-- synchronous DMA unmap plus completed IOTLB invalidation;
 - SMP scheduler protocol and cross-CPU epoch publication;
 - a production one-shot continuation handle, real recovery snapshot payload,
   multi-client address-space mutation fencing, and SMP TLB shootdown;
-- device drain/reset and interrupt quiescence;
+- real VirtIO device DMA, drain/reset, interrupt quiescence, and retained
+  timeout/tombstone recovery;
+- multi-page/domain DMA teardown and SMP IOMMU liveness;
 - an end-to-end nested authority scope implementation.
 
 The spike also found that `qemu-direct + q35` faults before `#[ostd::main]` in
@@ -631,11 +648,11 @@ normal kernel path.
 | Single terminalization | baseline and pager models; pager Rust tests; Loom stale/duplicate-reply and wake-authority gates; QEMU `recover` and `timeout` each terminalize once | delayed/duplicate real portal replies, SMP and production-lock races, and device completion injection |
 | Scalar budget conservation | baseline and pager models; QEMU timeout keeps credit `Held` through lock-free frame/waker cleanup and returns it only before `RevokeComplete` | typed multi-resource implementation and leak/duplication tests under concurrency and device failure |
 | Scheduler fallback | weak-fair TLA+ property; one-CPU QEMU fallback observed in one tick | lease-expiry path, SMP races, overload and repeated-crash tests |
-| Pager one-shot reply and crash/rebind | pager TLC refinement: 17,150 generated / 7,528 distinct / depth 17 / 10 temporal branches; Rust: 12 deterministic + 5 proptests (64 cases each); one-CPU QEMU `recover` + `timeout` observations | real one-shot handle/portal, serialized recovery state, full response-boundary injection, multi-client and SMP refinement |
+| Pager one-shot reply and crash/rebind | pager TLC refinement: 17,150 generated / 7,528 distinct / reported depth 17-18 across parallel clean runs / 10 temporal branches; Rust: 12 deterministic + 5 proptests (64 cases each); one-CPU QEMU `recover` + `timeout` observations | real one-shot handle/portal, serialized recovery state, full response-boundary injection, multi-client and SMP refinement |
 | Pager QuiescentClosure | Loom three-stage surrogate; QEMU three-phase Closing -> lock-free frame/waker cleanup -> credit return and RevokeComplete; reusable OSTD Waker fenced by Nexus state | production-lock/SMP interleavings, allocation failure and arbitrary task-termination paths |
-| DMA quiescence | fail-closed negative OSTD probe | one-owner synchronous invalidation path and real device tests |
-| I/O tombstone/timeout | none | protocol extension, retained-resource tests, eventual retry/reset |
-| Work proportionality | per-scope Rust data structure | fixed-`N` varying-`k` and fixed-`k` varying-`N` kernel curves |
+| DMA quiescence | fail-closed negative probe plus one-owner, one-page queued-IOTLB completion QEMU receipt with no device DMA | real device stop/drain-or-reset, request/queue invalidation, retained timeout, and SMP tests |
+| I/O tombstone/timeout | TLA+ and Rust bounded timeout/retry semantics | real retained buffers, deadline injection, recovery persistence, and eventual retry/reset |
+| Work proportionality | Rust counts only target-scope logical visits and avoids a global scan, but its tree operations still have logarithmic local/global index costs | scope-local/intrusive kernel records plus fixed-`N` varying-`k` and fixed-`k` varying-`N` curves |
 | Cross-service composition | scheduler fallback and pager are co-resident but deliberately independent; no shared-scope cross-service evidence | scheduler + pager + I/O crash matrix under mixed workloads |
 | Linux pressure | retained legacy workload inputs only; not evidence for new architecture | bounded personality workloads on the completed CSER slices |
 
@@ -651,7 +668,9 @@ The current semantic artifacts are:
 - `specs/cser/` — current PlusCal/TLA+ protocol and bounded TLC configuration;
 - `crates/cser-model/` — safe-Rust executable reference model;
 - `experiments/ostd-cser-spike/` — pinned OSTD scheduler/pager/API/IOMMU
-  experiment.
+  experiment;
+- `experiments/ostd-virtio-cser-spike/` — pinned patched-OSTD one-page DMA
+  ownership and queued-IOTLB-completion experiment.
 
 Legacy kernel, Starnix-like, conformance, and performance modules are not
 automatically part of this architecture. `REWORK.md` classifies each as retain,
@@ -674,7 +693,8 @@ The following are intentionally unresolved:
 - the SMP locking/atomic scheme for commit and epoch publication;
 - the production pager reply-handle representation, recovery-state format,
   multi-client policy, and SMP address-space/TLB protocol;
-- the single owner and public contract for IOMMU invalidation;
+- whether the experiment-local OSTD IOMMU contract is upstreamed and how its
+  single-page/single-generation form becomes a production domain/SMP API;
 - queue-level versus device-level reset granularity for each VirtIO transport;
 - the tombstone retry, administrative recovery, and resource-pressure policy;
 - treatment of durable external effects that require idempotency or

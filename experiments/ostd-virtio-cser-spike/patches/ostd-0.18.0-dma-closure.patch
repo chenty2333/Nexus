@@ -1,0 +1,963 @@
+diff --git a/src/arch/x86/iommu/interrupt_remapping/mod.rs b/src/arch/x86/iommu/interrupt_remapping/mod.rs
+index 85caab2..112e78b 100644
+--- a/src/arch/x86/iommu/interrupt_remapping/mod.rs
++++ b/src/arch/x86/iommu/interrupt_remapping/mod.rs
+@@ -8,7 +8,10 @@ use spin::Once;
+ pub(super) use table::IntRemappingTable;
+ 
+ use crate::{
+-    arch::iommu::registers::{ExtendedCapabilityFlags, IOMMU_REGS},
++    arch::iommu::{
++        invalidate_interrupt_cache,
++        registers::{ExtendedCapabilityFlags, IOMMU_REGS},
++    },
+     info, warn,
+ };
+ 
+@@ -26,11 +29,7 @@ impl IrtEntryHandle {
+         self.table
+             .set_entry(self.index, table::IrtEntry::new_enabled(vector));
+ 
+-        IOMMU_REGS
+-            .get()
+-            .unwrap()
+-            .lock()
+-            .invalidate_interrupt_cache();
++        invalidate_interrupt_cache();
+     }
+ }
+ 
+diff --git a/src/arch/x86/iommu/invalidate/descriptor/mod.rs b/src/arch/x86/iommu/invalidate/descriptor/mod.rs
+index 3a60ef4..3d93be4 100644
+--- a/src/arch/x86/iommu/invalidate/descriptor/mod.rs
++++ b/src/arch/x86/iommu/invalidate/descriptor/mod.rs
+@@ -10,6 +10,21 @@ impl InterruptEntryCache {
+     }
+ }
+ 
++/// A queued-invalidation descriptor that invalidates every cached I/O
++/// translation.  OSTD 0.18 currently installs one shared second-stage page
++/// table in domain zero, so the Stage 5A patch deliberately uses global
++/// granularity rather than manufacturing a per-device/domain identity.
++pub struct Iotlb(pub u128);
++
++impl Iotlb {
++    const INVALIDATION_TYPE: u128 = 2;
++    const GLOBAL_GRANULARITY: u128 = 1 << 4;
++
++    pub fn global_invalidation() -> Self {
++        Self(Self::INVALIDATION_TYPE | Self::GLOBAL_GRANULARITY)
++    }
++}
++
+ pub struct InvalidationWait(pub u128);
+ 
+ impl InvalidationWait {
+diff --git a/src/arch/x86/iommu/mod.rs b/src/arch/x86/iommu/mod.rs
+index 2749c4c..d8652d6 100644
+--- a/src/arch/x86/iommu/mod.rs
++++ b/src/arch/x86/iommu/mod.rs
+@@ -20,7 +20,29 @@ pub(in crate::arch) use interrupt_remapping::{
+     IrtEntryHandle, alloc_irt_entry, has_interrupt_remapping,
+ };
+ 
+-use crate::{io::IoMemAllocatorBuilder, mm::page_table::PageTableError};
++use registers::{DmaInvalidationPoll, DmaInvalidationTicket, IOMMU_REGS};
++
++use crate::{
++    io::IoMemAllocatorBuilder,
++    irq,
++    mm::{Daddr, page_table::PageTableError},
++};
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) struct IotlbInvalidationTicket(DmaInvalidationTicket);
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum BeginIotlbInvalidationError {
++    Busy,
++    PteRemovalFailed,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum PollIotlbInvalidation {
++    Pending,
++    Complete,
++    RetainedFailure,
++}
+ 
+ /// An enumeration representing possible errors related to IOMMU.
+ #[derive(Debug)]
+@@ -39,3 +61,81 @@ pub(crate) fn init(io_mem_builder: &IoMemAllocatorBuilder) -> Result<(), IommuEr
+     interrupt_remapping::init();
+     Ok(())
+ }
++
++/// Removes one retained DMA owner's PTEs and submits one global IOTLB
++/// invalidation while OSTD still exclusively owns the VT-d registers and
++/// invalidation queue.
++pub(crate) fn begin_unmap_invalidate(
++    daddr: Daddr,
++) -> Result<IotlbInvalidationTicket, BeginIotlbInvalidationError> {
++    // Prevent same-CPU synchronous interrupt-remapping re-entry between slot
++    // reservation and descriptor submission. This guard covers exactly one
++    // PTE removal and never a hardware-completion wait.
++    let _irq_guard = irq::disable_local();
++    let ticket = {
++        let mut regs = IOMMU_REGS.get().unwrap().lock();
++        regs.reap_completed_invalidation();
++        if !regs.invalidation_slot_available() {
++            return Err(BeginIotlbInvalidationError::Busy);
++        }
++        regs.reserve_dma_invalidation()
++    };
++
++    if unmap(daddr).is_err() {
++        IOMMU_REGS
++            .get()
++            .unwrap()
++            .lock()
++            .retain_failed_invalidation(ticket);
++        return Err(BeginIotlbInvalidationError::PteRemovalFailed);
++    }
++
++    IOMMU_REGS
++        .get()
++        .unwrap()
++        .lock()
++        .submit_dma_invalidation(ticket);
++    Ok(IotlbInvalidationTicket(ticket))
++}
++
++pub(crate) fn poll_unmap_invalidate(ticket: IotlbInvalidationTicket) -> PollIotlbInvalidation {
++    let mut regs = IOMMU_REGS.get().unwrap().lock();
++    match regs.poll_dma_invalidation(ticket.0) {
++        DmaInvalidationPoll::Pending => PollIotlbInvalidation::Pending,
++        DmaInvalidationPoll::Complete => PollIotlbInvalidation::Complete,
++        DmaInvalidationPoll::RetainedFailure => PollIotlbInvalidation::RetainedFailure,
++    }
++}
++
++/// Preserves OSTD's synchronous interrupt-remapping contract without waiting
++/// for hardware while holding the LocalIrqDisabled IOMMU register lock.
++pub(super) fn invalidate_interrupt_cache() {
++    let ticket = loop {
++        let ticket = IOMMU_REGS
++            .get()
++            .unwrap()
++            .lock()
++            .begin_interrupt_cache_invalidation();
++        if let Some(ticket) = ticket {
++            break ticket;
++        }
++        core::hint::spin_loop();
++    };
++
++    loop {
++        let poll = IOMMU_REGS
++            .get()
++            .unwrap()
++            .lock()
++            .poll_dma_invalidation(ticket);
++        match poll {
++            DmaInvalidationPoll::Pending => core::hint::spin_loop(),
++            DmaInvalidationPoll::Complete => return,
++            DmaInvalidationPoll::RetainedFailure => loop {
++                // This legacy API has no error return. Fail closed rather than
++                // publishing an interrupt-table update without invalidation.
++                core::hint::spin_loop();
++            },
++        }
++    }
++}
+diff --git a/src/arch/x86/iommu/registers/mod.rs b/src/arch/x86/iommu/registers/mod.rs
+index bdfc424..1886223 100644
+--- a/src/arch/x86/iommu/registers/mod.rs
++++ b/src/arch/x86/iommu/registers/mod.rs
+@@ -8,7 +8,10 @@ mod extended_cap;
+ mod invalidation;
+ mod status;
+ 
+-use core::ptr::NonNull;
++use core::{
++    ptr::NonNull,
++    sync::atomic::{Ordering, fence},
++};
+ 
+ use bit_field::BitField;
+ pub use capability::{Capability, CapabilitySagaw};
+@@ -33,14 +36,14 @@ use crate::{
+             fault,
+             invalidate::{
+                 QUEUE,
+-                descriptor::{InterruptEntryCache, InvalidationWait},
++                descriptor::{InterruptEntryCache, InvalidationWait, Iotlb},
+             },
+         },
+         kernel::acpi::dmar::{Dmar, Remapping},
+     },
+     debug,
+-    io::IoMemAllocatorBuilder,
+-    mm::{PAGE_SIZE, paddr_to_vaddr},
++    io::{IoMem, IoMemAllocatorBuilder, Sensitive},
++    mm::{CachePolicy, PAGE_SIZE},
+     sync::{LocalIrqDisabled, SpinLock},
+ };
+ 
+@@ -67,6 +70,8 @@ impl IommuVersion {
+ /// Important registers used by IOMMU.
+ #[derive(Debug)]
+ pub struct IommuRegisters {
++    // Owns the kernel mapping that backs every register reference below.
++    _io_mem: IoMem<Sensitive>,
+     version: VolatileRef<'static, u32, ReadOnly>,
+     capability: VolatileRef<'static, u64, ReadOnly>,
+     extended_capability: VolatileRef<'static, u64, ReadOnly>,
+@@ -78,6 +83,43 @@ pub struct IommuRegisters {
+     interrupt_remapping_table_addr: VolatileRef<'static, u64, ReadWrite>,
+ 
+     invalidate: InvalidationRegisters,
++
++    // Nexus Stage 5A intentionally supports one ownership-carrying DMA
++    // invalidation at a time.  Keeping the generation beside the single VT-d
++    // register/queue owner lets a later synchronous interrupt-cache
++    // invalidation finish the DMA ticket without losing its completion.
++    next_dma_invalidation_generation: u64,
++    completed_dma_invalidation_generation: u64,
++    active_invalidation: Option<ActiveInvalidation>,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum InvalidationPath {
++    Reserved,
++    Queued,
++    DmaRegister,
++    InterruptContextRegister,
++    InterruptIotlbRegister,
++    RetainedFailure,
++}
++
++#[derive(Clone, Copy, Debug)]
++struct ActiveInvalidation {
++    generation: u64,
++    path: InvalidationPath,
++}
++
++/// Opaque identity of one submitted global IOTLB invalidation.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) struct DmaInvalidationTicket {
++    generation: u64,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) enum DmaInvalidationPoll {
++    Pending,
++    Complete,
++    RetainedFailure,
+ }
+ 
+ impl IommuRegisters {
+@@ -195,55 +237,183 @@ impl IommuRegisters {
+         self.invalidate.completion_status.as_mut_ptr().write(1);
+     }
+ 
+-    // Invalidates Interrupt-remapping cache.
+-    pub(super) fn invalidate_interrupt_cache(&mut self) {
+-        if !self.read_global_status().contains(GlobalStatus::QIES) {
+-            self.global_invalidation();
++    /// Polls the active generation once. A later caller may publish an
++    /// already-finished generation; the original ticket still observes it via
++    /// `completed_dma_invalidation_generation`.
++    pub(super) fn reap_completed_invalidation(&mut self) {
++        let Some(active) = self.active_invalidation else {
+             return;
++        };
++        let _ = self.poll_dma_invalidation(DmaInvalidationTicket {
++            generation: active.generation,
++        });
++    }
++
++    pub(super) fn invalidation_slot_available(&self) -> bool {
++        self.active_invalidation.is_none()
++    }
++
++    /// Reserves the single invalidation generation. The caller releases the
++    /// register lock before changing the second-stage page table.
++    pub(super) fn reserve_dma_invalidation(&mut self) -> DmaInvalidationTicket {
++        assert!(self.active_invalidation.is_none());
++
++        self.next_dma_invalidation_generation = self
++            .next_dma_invalidation_generation
++            .checked_add(1)
++            .expect("DMA invalidation generation overflow");
++        let generation = self.next_dma_invalidation_generation;
++
++        self.active_invalidation = Some(ActiveInvalidation {
++            generation,
++            path: InvalidationPath::Reserved,
++        });
++        DmaInvalidationTicket { generation }
++    }
++
++    pub(super) fn retain_failed_invalidation(&mut self, ticket: DmaInvalidationTicket) {
++        assert!(matches!(
++            self.active_invalidation,
++            Some(ActiveInvalidation {
++                generation,
++                path: InvalidationPath::Reserved,
++            }) if generation == ticket.generation
++        ));
++        self.active_invalidation = Some(ActiveInvalidation {
++            generation: ticket.generation,
++            path: InvalidationPath::RetainedFailure,
++        });
++    }
++
++    /// Submits one global IOTLB invalidation after the caller removed all PTEs
++    /// belonging to the retained DMA owner.
++    pub(super) fn submit_dma_invalidation(&mut self, ticket: DmaInvalidationTicket) {
++        assert!(matches!(
++            self.active_invalidation,
++            Some(ActiveInvalidation {
++                generation,
++                path: InvalidationPath::Reserved,
++            }) if generation == ticket.generation
++        ));
++
++        let path = if self.read_global_status().contains(GlobalStatus::QIES) {
++            self.submit_queued_invalidation(Iotlb::global_invalidation().0);
++            InvalidationPath::Queued
++        } else {
++            // IVT=1 and IIRG=01 request global IOTLB invalidation. Completion
++            // is observed by a later bounded poll after this lock is released.
++            fence(Ordering::Release);
++            self.invalidate
++                .iotlb_invalidate
++                .as_mut_ptr()
++                .write(0x9000_0000_0000_0000);
++            InvalidationPath::DmaRegister
++        };
++
++        self.active_invalidation = Some(ActiveInvalidation {
++            generation: ticket.generation,
++            path,
++        });
++    }
++
++    /// Starts interrupt-cache invalidation, or returns `None` when the one
++    /// hardware slot is occupied. The caller owns any synchronous retry loop.
++    pub(super) fn begin_interrupt_cache_invalidation(&mut self) -> Option<DmaInvalidationTicket> {
++        self.reap_completed_invalidation();
++        if !self.invalidation_slot_available() {
++            return None;
+         }
+ 
+-        let mut queue = QUEUE.get().unwrap().lock();
++        let ticket = self.reserve_dma_invalidation();
++        let path = if self.read_global_status().contains(GlobalStatus::QIES) {
++            self.submit_queued_invalidation(InterruptEntryCache::global_invalidation().0);
++            InvalidationPath::Queued
++        } else {
++            // The legacy non-QI fallback is a two-register sequence. Polling
++            // advances it one bounded step at a time outside this lock.
++            self.context_command
++                .as_mut_ptr()
++                .write(0xA000_0000_0000_0000);
++            InvalidationPath::InterruptContextRegister
++        };
++        self.active_invalidation = Some(ActiveInvalidation {
++            generation: ticket.generation,
++            path,
++        });
++        Some(ticket)
++    }
+ 
+-        // Currently, we don't support asynchronous processing in the queue. Therefore, when we
+-        // lock the queue, we know that it is empty and that the Invalidation Completion Status
+-        // Register has been cleared.
++    fn submit_queued_invalidation(&mut self, descriptor: u128) {
++        let mut queue = QUEUE.get().unwrap().lock();
+ 
+-        // Construct an Interrupt Entry Cache Invalidate Descriptor.
+-        queue.append_descriptor(InterruptEntryCache::global_invalidation().0);
+-        // Construct an Invalidation Wait Descriptor. We need to set the interrupt flag so that the
+-        // Invalidation Completion Status Register can report the completion status.
++        // Clear completion from the preceding single-owner use, then publish
++        // the descriptor and its ordered completion witness.
++        self.invalidate.completion_status.as_mut_ptr().write(1);
++        queue.append_descriptor(descriptor);
+         queue.append_descriptor(InvalidationWait::with_interrupt_flag().0);
+ 
+-        // Update the queue tail.
++        // PTE removals and descriptor stores must be visible before hardware
++        // observes the invalidation-queue tail.
++        fence(Ordering::Release);
+         let tail = queue.tail();
+         self.invalidate
+             .queue_tail
+             .as_mut_ptr()
+             .write((tail << 4) as u64);
+-
+-        // Wait for completion.
+-        while self.invalidate.completion_status.as_ptr().read() == 0 {}
+-        // Clear the Invalidation Completion Status Register.
+-        self.invalidate.completion_status.as_mut_ptr().write(1);
+     }
+ 
+-    fn global_invalidation(&mut self) {
+-        // Set ICC(63) to 1 to requests invalidation and CIRG(62:61) to 01 to indicate global invalidation request.
+-        self.context_command
+-            .as_mut_ptr()
+-            .write(0xA000_0000_0000_0000);
++    /// Performs one bounded completion observation while the caller holds the
++    /// register lock. No branch waits for hardware.
++    pub(super) fn poll_dma_invalidation(
++        &mut self,
++        ticket: DmaInvalidationTicket,
++    ) -> DmaInvalidationPoll {
++        if ticket.generation <= self.completed_dma_invalidation_generation {
++            return DmaInvalidationPoll::Complete;
++        }
+ 
+-        // Wait for invalidation complete (ICC set to 0).
+-        let mut value = 0x8000_0000_0000_0000;
+-        while (value & 0x8000_0000_0000_0000) != 0 {
+-            value = self.context_command.as_ptr().read();
++        let Some(active) = self.active_invalidation else {
++            return DmaInvalidationPoll::RetainedFailure;
++        };
++        if active.generation != ticket.generation {
++            return DmaInvalidationPoll::RetainedFailure;
+         }
+ 
+-        // Set IVT(63) to 1 to requests IOTLB invalidation and IIRG(61:60) to 01 to indicate global invalidation request.
+-        self.invalidate
+-            .iotlb_invalidate
+-            .as_mut_ptr()
+-            .write(0x9000_0000_0000_0000);
++        let complete = match active.path {
++            InvalidationPath::Reserved => false,
++            InvalidationPath::Queued => self.invalidate.completion_status.as_ptr().read() != 0,
++            InvalidationPath::DmaRegister | InvalidationPath::InterruptIotlbRegister => {
++                self.invalidate.iotlb_invalidate.as_ptr().read() & (1 << 63) == 0
++            }
++            InvalidationPath::InterruptContextRegister => {
++                if self.context_command.as_ptr().read() & (1 << 63) != 0 {
++                    false
++                } else {
++                    self.invalidate
++                        .iotlb_invalidate
++                        .as_mut_ptr()
++                        .write(0x9000_0000_0000_0000);
++                    self.active_invalidation = Some(ActiveInvalidation {
++                        generation: active.generation,
++                        path: InvalidationPath::InterruptIotlbRegister,
++                    });
++                    return DmaInvalidationPoll::Pending;
++                }
++            }
++            InvalidationPath::RetainedFailure => {
++                return DmaInvalidationPoll::RetainedFailure;
++            }
++        };
++        if !complete {
++            return DmaInvalidationPoll::Pending;
++        }
++
++        if active.path == InvalidationPath::Queued {
++            self.invalidate.completion_status.as_mut_ptr().write(1);
++        }
++        self.completed_dma_invalidation_generation = active.generation;
++        self.active_invalidation = None;
++        DmaInvalidationPoll::Complete
+     }
+ 
+     /// Writes value to the global command register. This function will not wait until the command
+@@ -286,8 +456,11 @@ impl IommuRegisters {
+         assert_ne!(base_address, 0, "IOMMU address should not be zero");
+         debug!("base address: {:#x?}", base_address);
+ 
+-        io_mem_builder.remove(base_address as usize..(base_address as usize + PAGE_SIZE));
+-        let base = NonNull::new(paddr_to_vaddr(base_address as usize) as *mut u8).unwrap();
++        let io_mem = io_mem_builder.reserve(
++            base_address as usize..(base_address as usize + PAGE_SIZE),
++            CachePolicy::Uncacheable,
++        );
++        let base = NonNull::new(io_mem.base() as *mut u8).unwrap();
+ 
+         // SAFETY:
+         // - We trust the ACPI tables (as well as the DRHD in them), from which the base address is
+@@ -298,6 +471,7 @@ impl IommuRegisters {
+             fault::init(base);
+ 
+             Self {
++                _io_mem: io_mem,
+                 version: VolatileRef::new_read_only(base.cast::<u32>()),
+                 capability: VolatileRef::new_read_only(base.add(0x08).cast::<u64>()),
+                 extended_capability: VolatileRef::new_read_only(base.add(0x10).cast::<u64>()),
+@@ -312,6 +486,9 @@ impl IommuRegisters {
+                 interrupt_remapping_table_addr: VolatileRef::new(base.add(0xb8).cast::<u64>()),
+ 
+                 invalidate: InvalidationRegisters::new(base),
++                next_dma_invalidation_generation: 0,
++                completed_dma_invalidation_generation: 0,
++                active_invalidation: None,
+             }
+         };
+ 
+diff --git a/src/io/io_mem/mod.rs b/src/io/io_mem/mod.rs
+index 5aeb557..61fd4c9 100644
+--- a/src/io/io_mem/mod.rs
++++ b/src/io/io_mem/mod.rs
+@@ -156,7 +156,7 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
+     }
+ 
+     /// Returns the base virtual address of the MMIO range.
+-    fn base(&self) -> usize {
++    pub(crate) fn base(&self) -> usize {
+         self.kvirt_area.deref().start() + self.offset
+     }
+ 
+diff --git a/src/mm/dma/dma_coherent.rs b/src/mm/dma/dma_coherent.rs
+index d0ecf8d..9970f71 100644
+--- a/src/mm/dma/dma_coherent.rs
++++ b/src/mm/dma/dma_coherent.rs
+@@ -3,7 +3,9 @@
+ use core::{fmt::Debug, mem::ManuallyDrop};
+ 
+ use super::util::{
+-    alloc_kva, cvm_need_private_protection, prepare_dma, split_daddr, unprepare_dma,
++    BeginDmaUnmap, PendingDmaUnmap as IotlbPendingDmaUnmap, PollDmaUnmap, alloc_kva,
++    begin_dma_unmap, complete_unprepare_dma, cvm_need_private_protection, poll_dma_unmap,
++    prepare_dma, split_daddr, unprepare_dma,
+ };
+ use crate::{
+     arch::irq,
+@@ -14,6 +16,7 @@ use crate::{
+         io::util::{HasVmReaderWriter, VmReaderWriterIdentity},
+         kspace::kvirt_area::KVirtArea,
+     },
++    warn,
+ };
+ 
+ /// A DMA memory object that can be accessed in a cache-coherent manner.
+@@ -30,6 +33,47 @@ pub struct DmaCoherent {
+     inner: Inner,
+     map_daddr: Option<Daddr>,
+     is_cache_coherent: bool,
++    prepared: bool,
++}
++
++/// Why a retained DMA owner cannot currently make progress.  The Stage 5A
++/// patch keeps the backing pages and IOVA owned in either case.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum DmaUnmapFailure {
++    /// Some PTE or the single invalidation engine entered an uncertain state;
++    /// all DMA ownership is retained.
++    PteRemovalOrInvalidationEngine,
++}
++
++#[derive(Clone, Copy, Debug)]
++enum PendingState {
++    Direct,
++    WaitingForInvalidationEngine,
++    Invalidating(IotlbPendingDmaUnmap),
++    Retained(DmaUnmapFailure),
++}
++
++/// An ownership-carrying DMA unmap.  Dropping it intentionally leaks the
++/// retained owner; only a matching IOTLB completion can produce
++/// [`UnmappedDma`].
++#[derive(Debug)]
++pub struct PendingDmaUnmap {
++    dma: ManuallyDrop<DmaCoherent>,
++    paddr: Paddr,
++    size: usize,
++    daddr: Option<Daddr>,
++    state: PendingState,
++    inject_pending_once: bool,
++}
++
++/// A DMA allocation whose device mapping and PADDR tracking are gone.  The
++/// backing allocation is private and is safely released when this value drops.
++#[derive(Debug)]
++pub struct UnmappedDma {
++    _dma: DmaCoherent,
++    original_paddr: Paddr,
++    original_daddr: Option<Daddr>,
++    size: usize,
+ }
+ 
+ #[derive(Debug)]
+@@ -39,6 +83,13 @@ enum Inner {
+ }
+ 
+ impl DmaCoherent {
++    /// Receipt-only observation used to prove that Stage 5A begin/poll paths
++    /// pair every local-IRQ guard. This is not part of the ownership protocol.
++    #[doc(hidden)]
++    pub fn stage5a_local_irq_enabled() -> bool {
++        irq::is_local_enabled()
++    }
++
+     /// Allocates a region of physical memory for coherent DMA access.
+     ///
+     /// The memory of the newly-allocated DMA buffer is initialized to zeros.
+@@ -88,8 +139,172 @@ impl DmaCoherent {
+             inner,
+             map_daddr,
+             is_cache_coherent,
++            prepared: true,
+         })
+     }
++
++    /// Begins ownership-safe DMA teardown after the caller has stopped every
++    /// device that can issue transactions through this mapping.
++    ///
++    /// The returned handle owns the backing pages and IOVA until
++    /// [`PendingDmaUnmap::poll_complete`] observes a real IOTLB completion.
++    /// Nexus, rather than OSTD, owns deadlines and tombstone policy.
++    ///
++    /// # Safety
++    ///
++    /// The caller must prove that the device is quiesced and cannot initiate
++    /// new DMA through this object.  IOTLB invalidation only removes cached
++    /// translations; it does not stop a device.
++    pub unsafe fn begin_unmap_invalidate(self) -> PendingDmaUnmap {
++        assert!(self.prepared, "DMA object was already unprepared");
++        assert_eq!(
++            self.size(),
++            PAGE_SIZE,
++            "Nexus Stage 5A exposes ownership-carrying unmap only for one page"
++        );
++        let paddr = self.paddr();
++        let size = self.size();
++        let daddr = self.map_daddr;
++        let state = match begin_dma_unmap(daddr) {
++            BeginDmaUnmap::Direct => PendingState::Direct,
++            BeginDmaUnmap::Busy => PendingState::WaitingForInvalidationEngine,
++            BeginDmaUnmap::Invalidating(pending) => PendingState::Invalidating(pending),
++            BeginDmaUnmap::RetainedFailure => {
++                PendingState::Retained(DmaUnmapFailure::PteRemovalOrInvalidationEngine)
++            }
++        };
++
++        PendingDmaUnmap {
++            dma: ManuallyDrop::new(self),
++            paddr,
++            size,
++            daddr,
++            state,
++            inject_pending_once: false,
++        }
++    }
++}
++
++impl PendingDmaUnmap {
++    /// Test-only fault-injection hook used by the Nexus QEMU receipt.  It does
++    /// not acknowledge hardware and leaves all ownership in this handle.
++    #[doc(hidden)]
++    pub fn inject_one_pending_poll(&mut self) {
++        self.inject_pending_once = true;
++    }
++
++    #[must_use]
++    /// Returns the physical address whose backing owner is retained.
++    pub const fn retained_paddr(&self) -> Paddr {
++        self.paddr
++    }
++
++    #[must_use]
++    /// Returns the retained IOVA, or `None` for a direct mapping.
++    pub const fn retained_daddr(&self) -> Option<Daddr> {
++        self.daddr
++    }
++
++    #[must_use]
++    /// Returns the retained mapping size in bytes.
++    pub const fn retained_size(&self) -> usize {
++        self.size
++    }
++
++    #[must_use]
++    /// Returns a permanent fail-closed reason, if one was observed.
++    pub const fn failure(&self) -> Option<DmaUnmapFailure> {
++        match self.state {
++            PendingState::Retained(reason) => Some(reason),
++            _ => None,
++        }
++    }
++
++    /// Polls once without blocking.  `Err(self)` retains backing ownership and
++    /// may be retried or moved into a Nexus tombstone.
++    pub fn poll_complete(mut self) -> Result<UnmappedDma, Self> {
++        if self.inject_pending_once {
++            self.inject_pending_once = false;
++            return Err(self);
++        }
++
++        match self.state {
++            PendingState::Direct => Ok(self.finish()),
++            PendingState::WaitingForInvalidationEngine => {
++                self.state = match begin_dma_unmap(self.daddr) {
++                    BeginDmaUnmap::Direct => return Ok(self.finish()),
++                    BeginDmaUnmap::Busy => return Err(self),
++                    BeginDmaUnmap::Invalidating(pending) => PendingState::Invalidating(pending),
++                    BeginDmaUnmap::RetainedFailure => {
++                        PendingState::Retained(DmaUnmapFailure::PteRemovalOrInvalidationEngine)
++                    }
++                };
++                Err(self)
++            }
++            PendingState::Invalidating(pending) => match poll_dma_unmap(pending) {
++                PollDmaUnmap::Pending => Err(self),
++                PollDmaUnmap::Complete => Ok(self.finish()),
++                PollDmaUnmap::RetainedFailure => {
++                    self.state =
++                        PendingState::Retained(DmaUnmapFailure::PteRemovalOrInvalidationEngine);
++                    Err(self)
++                }
++            },
++            PendingState::Retained(_) => Err(self),
++        }
++    }
++
++    fn finish(self) -> UnmappedDma {
++        let paddr_range = self.paddr..self.paddr + self.size;
++        let daddr_range = self.daddr.map(|start| start..start + self.size);
++        // SAFETY: Direct mappings require the caller's device-quiescence
++        // promise.  Remapped paths reach here only after the ticket completed.
++        unsafe { complete_unprepare_dma(&paddr_range, daddr_range) };
++
++        let mut this = ManuallyDrop::new(self);
++        // SAFETY: `this` will not run `PendingDmaUnmap::drop`, and the nested
++        // owner is taken exactly once into `UnmappedDma`.
++        let mut dma = unsafe { ManuallyDrop::take(&mut this.dma) };
++        dma.prepared = false;
++        dma.map_daddr = None;
++        UnmappedDma {
++            _dma: dma,
++            original_paddr: this.paddr,
++            original_daddr: this.daddr,
++            size: this.size,
++        }
++    }
++}
++
++impl Drop for PendingDmaUnmap {
++    fn drop(&mut self) {
++        // `dma` is ManuallyDrop: losing the cleanup worker quarantines the
++        // actual frame/IOVA owner instead of calling the unsafe legacy Drop.
++        warn!(
++            "quarantining abandoned DMA unmap owner: paddr={:#x}, daddr={:?}, size={}",
++            self.paddr, self.daddr, self.size
++        );
++    }
++}
++
++impl UnmappedDma {
++    #[must_use]
++    /// Returns the physical address held by the original DMA owner.
++    pub const fn original_paddr(&self) -> Paddr {
++        self.original_paddr
++    }
++
++    #[must_use]
++    /// Returns the original IOVA, or `None` for a direct mapping.
++    pub const fn original_daddr(&self) -> Option<Daddr> {
++        self.original_daddr
++    }
++
++    #[must_use]
++    /// Returns the original mapping size in bytes.
++    pub const fn size(&self) -> usize {
++        self.size
++    }
+ }
+ 
+ impl Split for DmaCoherent {
+@@ -97,13 +312,14 @@ impl Split for DmaCoherent {
+         assert!(offset.is_multiple_of(PAGE_SIZE));
+         assert!(0 < offset && offset < self.size());
+ 
+-        let (inner, map_daddr, is_cache_coherent) = {
++        let (inner, map_daddr, is_cache_coherent, prepared) = {
+             let this = ManuallyDrop::new(self);
+             (
+                 // SAFETY: `this.inner` will never be used or dropped later.
+                 unsafe { core::ptr::read(&this.inner as *const Inner) },
+                 this.map_daddr,
+                 this.is_cache_coherent,
++                this.prepared,
+             )
+         };
+ 
+@@ -126,11 +342,13 @@ impl Split for DmaCoherent {
+                 inner: inner1,
+                 map_daddr: daddr1,
+                 is_cache_coherent,
++                prepared,
+             },
+             Self {
+                 inner: inner2,
+                 map_daddr: daddr2,
+                 is_cache_coherent,
++                prepared,
+             },
+         )
+     }
+@@ -138,8 +356,12 @@ impl Split for DmaCoherent {
+ 
+ impl Drop for DmaCoherent {
+     fn drop(&mut self) {
++        if !self.prepared {
++            return;
++        }
+         // SAFETY: The physical address range was prepared in `alloc`.
+         unsafe { unprepare_dma(&self.paddr_range(), self.map_daddr) };
++        self.prepared = false;
+     }
+ }
+ 
+diff --git a/src/mm/dma/mod.rs b/src/mm/dma/mod.rs
+index 84f25bf..2dfc728 100644
+--- a/src/mm/dma/mod.rs
++++ b/src/mm/dma/mod.rs
+@@ -24,5 +24,5 @@ mod dma_coherent;
+ mod dma_stream;
+ mod util;
+ 
+-pub use dma_coherent::DmaCoherent;
++pub use dma_coherent::{DmaCoherent, DmaUnmapFailure, PendingDmaUnmap, UnmappedDma};
+ pub use dma_stream::{DmaDirection, DmaStream, FromAndToDevice, FromDevice, ToDevice};
+diff --git a/src/mm/dma/util.rs b/src/mm/dma/util.rs
+index 6289955..3729e60 100644
+--- a/src/mm/dma/util.rs
++++ b/src/mm/dma/util.rs
+@@ -173,7 +173,103 @@ pub(super) unsafe fn prepare_dma(pa_range: &Range<Paddr>) -> Option<Daddr> {
+ /// The provided physical address range must be untyped DMA memory that was
+ /// previously prepared by an [`alloc_unprotect_physical_range()`] call.
+ pub(super) unsafe fn unprepare_dma(pa_range: &Range<Paddr>, daddr: Option<Daddr>) {
+-    unmap_dma_remap(daddr.map(|daddr| daddr..daddr + pa_range.len()));
++    let daddr_range = daddr.map(|daddr| daddr..daddr + pa_range.len());
++    if let Some(first_daddr) = daddr {
++        // Preserve the legacy arbitrary-size Drop contract without weakening
++        // the ownership API: each bounded begin removes exactly one PTE, then
++        // Drop waits outside every IOMMU lock before trying the next page.
++        for page_offset in (0..pa_range.len()).step_by(PAGE_SIZE) {
++            loop {
++                match begin_dma_unmap(Some(first_daddr + page_offset)) {
++                    BeginDmaUnmap::Direct => unreachable!(),
++                    BeginDmaUnmap::Busy => {
++                        core::hint::spin_loop();
++                        continue;
++                    }
++                    BeginDmaUnmap::Invalidating(pending) => loop {
++                        match poll_dma_unmap(pending) {
++                            PollDmaUnmap::Pending => core::hint::spin_loop(),
++                            PollDmaUnmap::Complete => break,
++                            PollDmaUnmap::RetainedFailure => loop {
++                                // Fail closed: uncertainty must never fall
++                                // through to IOVA/PADDR/backing release.
++                                core::hint::spin_loop();
++                            },
++                        }
++                    },
++                    BeginDmaUnmap::RetainedFailure => loop {
++                        core::hint::spin_loop();
++                    },
++                }
++                break;
++            }
++        }
++    }
++
++    // SAFETY: direct mappings need no IOTLB acknowledgement; remapped ranges
++    // reach this point only after `poll_dma_unmap` observed completion.
++    unsafe { complete_unprepare_dma(pa_range, daddr_range) };
++}
++
++#[derive(Clone, Copy, Debug)]
++pub(super) struct PendingDmaUnmap {
++    ticket: iommu::IotlbInvalidationTicket,
++}
++
++#[derive(Clone, Copy, Debug)]
++pub(super) enum BeginDmaUnmap {
++    Direct,
++    Busy,
++    Invalidating(PendingDmaUnmap),
++    RetainedFailure,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) enum PollDmaUnmap {
++    Pending,
++    Complete,
++    RetainedFailure,
++}
++
++/// Removes the PTEs for one remapped DMA owner and starts one global IOTLB
++/// invalidation.  No physical or device address ownership is released here.
++pub(super) fn begin_dma_unmap(daddr: Option<Daddr>) -> BeginDmaUnmap {
++    let Some(daddr) = daddr else {
++        return BeginDmaUnmap::Direct;
++    };
++
++    match iommu::begin_unmap_invalidate(daddr) {
++        Ok(ticket) => BeginDmaUnmap::Invalidating(PendingDmaUnmap { ticket }),
++        Err(iommu::BeginIotlbInvalidationError::Busy) => BeginDmaUnmap::Busy,
++        Err(iommu::BeginIotlbInvalidationError::PteRemovalFailed) => BeginDmaUnmap::RetainedFailure,
++    }
++}
++
++pub(super) fn poll_dma_unmap(pending: PendingDmaUnmap) -> PollDmaUnmap {
++    match iommu::poll_unmap_invalidate(pending.ticket) {
++        iommu::PollIotlbInvalidation::Pending => PollDmaUnmap::Pending,
++        iommu::PollIotlbInvalidation::Complete => PollDmaUnmap::Complete,
++        iommu::PollIotlbInvalidation::RetainedFailure => PollDmaUnmap::RetainedFailure,
++    }
++}
++
++/// Releases IOVA and PADDR ownership after direct-device quiescence or a
++/// completed IOTLB invalidation.
++///
++/// # Safety
++///
++/// For a remapped range, the corresponding invalidation ticket must have
++/// completed.  For a direct mapping, the caller must have stopped the device.
++pub(super) unsafe fn complete_unprepare_dma(
++    pa_range: &Range<Paddr>,
++    daddr_range: Option<Range<Daddr>>,
++) {
++    if let Some(daddr_range) = daddr_range {
++        let irq_guard = irq::disable_local();
++        #[cfg(target_arch = "x86_64")]
++        allocator::daddr_allocator(&irq_guard).free(daddr_range);
++        drop(irq_guard);
++    }
+ 
+     // SAFETY: The safety condition is upheld by the caller.
+     #[cfg(any(debug_assertions, all(target_arch = "x86_64", feature = "cvm_guest")))]
+@@ -284,20 +380,3 @@ unsafe fn dma_remap(pa_range: &Range<Paddr>) -> Option<Daddr> {
+ 
+     Some(daddr.start)
+ }
+-
+-fn unmap_dma_remap(daddr_range: Option<Range<Daddr>>) {
+-    let Some(da_range) = daddr_range else {
+-        return;
+-    };
+-
+-    let _irq_gurad = irq::disable_local();
+-
+-    // TODO: Free `da_range` to `allocator::daddr_allocator()`. This can only
+-    // be done after IOTLB flushes are supported; otherwise, reusing the freed
+-    // device address range may cause data corruption.
+-
+-    for da in da_range.step_by(PAGE_SIZE) {
+-        iommu::unmap(da).unwrap();
+-        // FIXME: Flush IOTLBs to prevent any future DMA access to the frames.
+-    }
+-}
+

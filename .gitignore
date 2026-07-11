@@ -10,6 +10,7 @@
 # OSDK/QEMU outputs
 experiments/ostd-cser-spike/artifacts/
 experiments/ostd-cser-spike/guest/*.bin
+experiments/ostd-virtio-cser-spike/artifacts/
 specs/cser/states/
 specs/cser/*_TTrace_*.bin
 specs/cser/*_TTrace_*.tla

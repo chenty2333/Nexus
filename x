@@ -13,11 +13,12 @@ image_key=$(sha256sum \
     "$root/tools/xtask/Cargo.toml" \
     "$root/tools/xtask/Cargo.lock" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/cser-dev:$image_key"
-spike="$root/experiments/ostd-cser-spike/x"
+cser_spike="$root/experiments/ostd-cser-spike/x"
+io_spike="$root/experiments/ostd-virtio-cser-spike/x"
 
 usage() {
     cat >&2 <<'EOF'
-usage: ./x {fmt|check|test|model|spec|spike|verify|clean}
+usage: ./x {fmt|check|test|model|spec|spike|io-spike|verify|clean}
 
   fmt      format the Rust workspaces in the pinned development image
   check    check the no_std and std reference-model configurations
@@ -25,8 +26,9 @@ usage: ./x {fmt|check|test|model|spec|spike|verify|clean}
   model    run every reference-model verification gate
   spec     check PlusCal translation drift and run TLC
   spike    run the pinned OSTD scheduler/fallback QEMU spike
-  verify   run model, spec, and spike gates
-  clean    remove root and OSTD-spike build artifacts
+  io-spike run the pinned OSTD DMA-ownership/IOTLB QEMU spike
+  verify   run model, spec, and both OSTD spike gates
+  clean    remove root and both OSTD-spike build artifacts
 EOF
 }
 
@@ -69,11 +71,13 @@ run_xtask() {
 }
 
 run_spike() {
-    if [[ ! -x "$spike" ]]; then
-        echo "OSTD spike entrypoint is missing or not executable: $spike" >&2
+    local entrypoint=$1
+    local description=$2
+    if [[ ! -x "$entrypoint" ]]; then
+        echo "$description entrypoint is missing or not executable: $entrypoint" >&2
         exit 1
     fi
-    "$spike" test
+    "$entrypoint" test
 }
 
 clean_root() {
@@ -95,20 +99,26 @@ case "$command" in
         ;;
     spike)
         require_docker
-        run_spike
+        run_spike "$cser_spike" "OSTD scheduler/pager spike"
+        ;;
+    io-spike)
+        require_docker
+        run_spike "$io_spike" "OSTD DMA-ownership spike"
         ;;
     verify)
         require_docker
         run_xtask verify
-        # This is intentionally host-side. The OSTD spike owns a separate,
+        # These are intentionally host-side. Each OSTD spike owns a separate,
         # pinned OSDK image, so the root container never starts Docker.
-        run_spike
+        run_spike "$cser_spike" "OSTD scheduler/pager spike"
+        run_spike "$io_spike" "OSTD DMA-ownership spike"
         ;;
     clean)
         # Cleaning must remain available before Docker is installed and must
         # never pull or build an image merely to remove host-owned artifacts.
         clean_root
-        "$spike" clean
+        "$cser_spike" clean
+        "$io_spike" clean
         ;;
     -h|--help|help)
         usage

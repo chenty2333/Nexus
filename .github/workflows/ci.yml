@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - name: Verify CSER model, specification, and OSTD spike
+      - name: Verify CSER models, specifications, and OSTD spikes
         run: ./x verify
       - name: Upload failure evidence
         if: failure()
@@ -27,3 +27,4 @@ jobs:
             target/scenario-artifacts
             target/verification
             experiments/ostd-cser-spike/artifacts
+            experiments/ostd-virtio-cser-spike/artifacts

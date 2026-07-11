@@ -218,7 +218,7 @@ bounded graph with:
 11,122 states generated
 5,457 distinct states found
 0 states left on queue
-complete graph depth 17
+complete graph depth 19
 ```
 
 The checked instance covers the named safety invariants, budget conservation,
@@ -236,7 +236,7 @@ address-space generations. TLC 1.8.0 completed it with no error:
 17,150 states generated
 7,528 distinct states found
 0 states left on queue
-complete graph depth 17
+reported complete-graph depth 17-18 across clean 16-worker runs
 10 temporal-property branches checked
 ```
 
@@ -247,20 +247,33 @@ closure, and the pager-specific safety and liveness properties documented in
 tasks or address spaces, physical time, file-backed paging, COW, swap, or task
 termination.
 
+`specs/cser/IoCser.tla` is the explicit mediated-I/O refinement. Its three-ID
+safety graph uses request symmetry and checks no temporal formulas; TLC explored
+21,998,796 generated states, 4,151,240 distinct states, depth 39, and left zero
+states queued. A separate two-ID graph deliberately disables symmetry and
+checks five action/liveness branches; it explored 1,138,855 generated states,
+269,645 distinct states, depth 29, and left zero states queued. Expected-
+counterexample reachability gates additionally show that a budget-only register
+rejection, a binding-only stale publish rejection, and mixed completion/reset
+outcomes are reachable.
+The two graphs are independent results and are not added together. They specify
+the protocol; neither graph proves a real VirtIO reset or DMA quiescence.
+
 ### Executable reference evidence
 
 `crates/cser-model` is a `no_std + alloc`, safe-Rust executable oracle for the
-core protocol and its pager refinement. In addition to the baseline suite, the
+core, pager, and mediated-I/O protocols. In addition to the baseline suite, the
 pager model has 12 deterministic tests and five proptests, each configured for
 64 cases. It covers three independent authority, binding, and address-space
 generations; same-page coalescing; recovery snapshot fencing; deadlines; frame
-ownership; and mapping publication history. These are sequential executable
-state transitions. Four additional Loom surrogate models check bounded
-interleavings at the commit/timeout gate, adopt/timeout/stale-reply gate,
-single-wake-authority gate, and three-stage closure publication gate. Those
-small models support differential implementation work but do not establish the
-eventual production lock/atomic scheme, an SMP page-table implementation, or a
-real device.
+ownership; and mapping publication history. The I/O model adds independent
+device generations, typed lease and commit-charge accounting, `avail.idx`
+publication, reset/completion races, request and queue invalidation, retained
+timeout tombstones, retry, and scope-local work indexes. It has 13 deterministic
+tests, four proptests configured for 64 cases, and three bounded Loom surrogate
+gates. These are executable reference transitions and small interleaving
+models; they do not establish the eventual production lock/atomic scheme,
+VirtIO transport fences, PCI reset behavior, SMP, or real device quiescence.
 
 ### Observed OSTD evidence
 
@@ -298,9 +311,18 @@ or durable pager reconstruction. The scheduler result likewise does not
 establish SMP policy fairness or independently exercise the compiled
 lease-expiry path.
 
-The same spike found a negative boundary: OSTD 0.18 does not expose a synchronous
-`unmap -> IOTLB invalidate -> completion wait` operation, and its IOMMU state is
-crate-private. Nexus therefore fails closed and does not report DMA quiescence.
+The first spike also found a negative boundary: unmodified OSTD 0.18 does not
+expose a synchronous `unmap -> IOTLB invalidate -> completion wait` operation,
+and its IOMMU state is crate-private. Nexus therefore carried one small,
+isolated MPL-2.0 OSTD patch in
+`experiments/ostd-virtio-cser-spike`. The pinned one-CPU QEMU receipt observed
+one-page ownership transfer into `PendingDmaUnmap`, real VT-d global IOTLB and
+wait descriptors, retention across an injected `Pending`, hardware completion
+before backing/IOVA/credit release, and fresh-identity IOVA reuse only after the
+acknowledgement. This closes the bounded DMA-ownership API gate for the
+prototype. The probe never gave the IOVA to a device and explicitly records
+`device_dma=false` and `device_reset=false`; it is not evidence of mediated
+VirtIO closure, device drain/reset, SMP liveness, or a production IOMMU API.
 
 ## Research gates
 
@@ -315,16 +337,19 @@ Work proceeds through evidence gates, not feature-count milestones.
    `timeout` paths observe one real fault continuation and the three-phase
    closure ordering above. This does not close the production, multi-client,
    SMP, or full fault-injection gaps.
-3. **DMA ownership gate — NO-GO / open:** obtain one auditable owner and a
-   synchronous unmap/invalidate/wait contract through an upstream OSTD API, a
-   small reviewed patch, or a different ownership boundary.
-4. **Mediated VirtIO gate — model work may proceed; real DMA closure is blocked
-   by gate 3:** encode the audited `Release` publication of `avail.idx` as the
-   first conservative `Commit`; model cancellation, completion, timeout,
-   tombstone, and a bounded whole-device reset for the first exclusive
-   single-queue `virtio-blk-pci` device unless a queue-reset contract is
-   separately negotiated and checked. A real adapter may not report `Quiesced`
-   until gate 3 has one owner and a completed invalidation path.
+3. **DMA ownership gate — bounded GO / Observed:** the prototype selects a
+   single patched-OSTD owner and has an ownership-carrying one-page
+   unmap/invalidate/poll contract with a real VT-d completion receipt. The
+   upstream API, multi-page/domain policy, SMP liveness, and production patch
+   disposition remain open; none of those gaps is hidden by this gate.
+4. **Mediated VirtIO gate — protocol/model complete; device slice in progress:**
+   the audited `Release` publication of `avail.idx` is the first conservative
+   `Commit`; the TLA+ and Rust models cover cancellation, completion, reset,
+   timeout, tombstone, retry, and conditional closure for one exclusive queue.
+   The next receipt must put a real `ACCESS_PLATFORM` VirtIO block request
+   through the patched DMA path and observe stop/drain-or-reset, generation
+   fencing, request/queue invalidation, and retained timeout behavior. Until
+   then no real adapter may report device `Quiesced`.
 5. **Integrated evidence gate — planned:** extend the initial pager Loom gate
    with implementation-specific Loom and/or Kani checks across scheduler,
    pager, and I/O; add QEMU fault injection for system recovery and `k`/`N`

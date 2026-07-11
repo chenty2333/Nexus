@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")" && pwd)
+image_key=$(sha256sum \
+    "$root/Dockerfile" \
+    "$root/.dockerignore" \
+    "$root/Cargo.toml" \
+    "$root/Cargo.lock" \
+    "$root/OSDK.toml" \
+    "$root/rust-toolchain.toml" \
+    "$root/cargo-home-config.toml" \
+    "$root/LICENSE-MPL-2.0" \
+    "$root/src/lib.rs" \
+    "$root/patches/ostd-0.18.0-dma-closure.patch" \
+    "$root/scripts/assert-patch.sh" \
+    "$root/scripts/assert-serial.sh" \
+    "$root/osdk-runner-base/Cargo.toml" \
+    "$root/osdk-runner-base/Cargo.lock" \
+    "$root/osdk-runner-base/src/main.rs" \
+    "$root/osdk-runner-base/x86_64.ld" \
+    "$root/osdk-runner-base/riscv64.ld" \
+    "$root/osdk-runner-base/loongarch64.ld" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+image="nexus/ostd-virtio-cser-spike:$image_key"
+runner_base="$root/osdk-runner-base"
+runner_target="$root/target/osdk/ostd-virtio-cser-spike-run-base"
+
+build_image() {
+    docker build --platform linux/amd64 -t "$image" "$root"
+}
+
+container() {
+    docker run --rm \
+        --platform linux/amd64 \
+        --network none \
+        --user "$(id -u):$(id -g)" \
+        --env HOME=/tmp/nexus-home \
+        --tmpfs /tmp/nexus-home:rw,exec,nosuid,size=64m,mode=1777 \
+        -v "$root:/work:z" \
+        --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
+        -w /work \
+        "$image" \
+        "$@"
+}
+
+ensure_image() {
+    if [[ ${NEXUS_REBUILD:-0} == 1 ]] || ! docker image inspect "$image" >/dev/null 2>&1; then
+        build_image
+    fi
+}
+
+check_source() {
+    container bash scripts/assert-patch.sh
+}
+
+check_kernel() {
+    # cargo-osdk 0.18 does not expose --locked on build/run. Gate the project
+    # lock explicitly and over-mount it read-only for all mounted builds.
+    container cargo osdk check --locked
+}
+
+prepare_runner_base() {
+    rm -rf "$runner_target"
+    mkdir -p "$(dirname "$runner_target")"
+    cp -a "$runner_base" "$runner_target"
+    chmod a-w "$runner_target/Cargo.lock"
+}
+
+assert_runner_base() {
+    diff -ru "$runner_base" "$runner_target"
+}
+
+build_kernel() {
+    check_source
+    check_kernel
+    prepare_runner_base
+    container cargo osdk build
+    assert_runner_base
+}
+
+run_kernel() {
+    build_kernel
+    container bash -c '
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        exec timeout --signal=TERM --kill-after=2s 30s cargo osdk run
+    '
+    assert_runner_base
+}
+
+command=${1:-test}
+case "$command" in
+    image)
+        build_image
+        ;;
+    source)
+        ensure_image
+        check_source
+        ;;
+    check)
+        ensure_image
+        check_source
+        check_kernel
+        ;;
+    build)
+        ensure_image
+        build_kernel
+        ;;
+    run)
+        ensure_image
+        mkdir -p "$root/artifacts"
+        run_kernel 2>&1 | tee "$root/artifacts/qemu.log"
+        ;;
+    test)
+        ensure_image
+        mkdir -p "$root/artifacts"
+        run_kernel 2>&1 | tee "$root/artifacts/qemu.log"
+        "$root/scripts/assert-serial.sh" "$root/artifacts/qemu.log"
+        ;;
+    clean)
+        rm -rf "$root/target" "$root/artifacts" "$root/patch-work"
+        ;;
+    *)
+        echo 'usage: ./x {image|source|check|build|run|test|clean}' >&2
+        exit 2
+        ;;
+esac

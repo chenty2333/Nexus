@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "ostd-virtio-cser-spike"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+publish = false
+
+[dependencies]
+ostd = { version = "=0.18.0" }

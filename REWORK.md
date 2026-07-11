@@ -6,12 +6,15 @@ promise to preserve the current Axle/Zircon/Starnix architecture.
 The current research checkpoint consists of the baseline CSER state machine,
 its pager refinement, the pure Rust reference oracles, the OSTD/OSDK feasibility
 spike, the scheduler crash-to-fallback slice, and one bounded pager
-crash/rebind/timeout slice. The pager result is **Observed**, not a production
-pager. The foundation decision is **OSTD-first**, not irrevocably OSTD-only: if
-a documented critical boundary cannot be fixed by an upstream API or a small
-audited adapter/patch without violating single-owner hardware control, Nexus
-must re-evaluate the foundation explicitly. That decision still must not pull in
-a legacy crate merely because it already exists.
+crash/rebind/timeout slice. Stage 5 now also has a checked mediated-I/O protocol
+and safe-Rust oracle plus one bounded, one-page patched-OSTD IOTLB-ownership
+receipt. The pager and DMA results are **Observed**, not a production pager or
+complete device path. The foundation decision is **OSTD-first**, not
+irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an
+upstream API or a small audited adapter/patch without violating single-owner
+hardware control, Nexus must re-evaluate the foundation explicitly. That
+decision still must not pull in a legacy crate merely because it already
+exists.
 
 ## Status vocabulary
 
@@ -89,8 +92,9 @@ The first pager evidence gate is recorded as **bounded slice complete /
 Observed**:
 
 - `PagerCser.tla` completed its committed finite graph with no TLC error:
-  17,150 generated states, 7,528 distinct states, zero queued states, depth 17,
-  and ten temporal-property branches checked;
+  17,150 generated states, 7,528 distinct states, zero queued states, reported
+  depth 17-18 across clean 16-worker runs, and ten temporal-property branches
+  checked;
 - the safe-Rust pager oracle passed 12 deterministic tests and five proptests,
   each configured for 64 cases;
 - four bounded Loom surrogate models passed for commit/timeout,
@@ -112,19 +116,47 @@ single-CPU, single-client, zero-page-only, and local-TLB-only; it retains the
 documented intermediate-page-table OOM `unwrap`, has no arbitrary task-kill
 primitive, and does not cover SMP, multi-client, file-backed, COW, swap, or
 durable recovery. Those limits stay live even though the bounded gate allows
-work to move to the Stage 5 DMA ownership decision. Mediated I/O remains
-**NO-GO** until one layer owns unmap, IOTLB invalidation completion, and retained
-resource lifetime. Stage 5 spec/model work may encode the audited `avail.idx`
-`Release` publication and the first exclusive queue's whole-device-reset path
-while that decision is open, but no real adapter may report `Quiesced`.
+work to move to the Stage 5 DMA ownership decision.
+
+## Stage 5A protocol and DMA-ownership receipt
+
+The Stage 5A evidence gate is recorded as **bounded slice complete / Observed**:
+
+- the three-request `IoCser` safety graph completed with 21,998,796 generated
+  states, 4,151,240 distinct states, zero queued states, and depth 39; its
+  symmetry-enabled graph contains no temporal properties;
+- the independent two-request, no-symmetry action/liveness graph completed
+  with 1,138,855 generated states, 269,645 distinct states, zero queued states,
+  depth 29, and five temporal-property branches;
+- explicit expected-counterexample gates witness budget-only registration and
+  binding-only stale-publish rejection plus mixed
+  `Completed`/`IndeterminateAfterReset` outcomes;
+- the safe-Rust I/O oracle covers typed credits, independent generations,
+  publication, cancellation, reset/completion races, invalidation, timeout,
+  tombstone, retry, and incremental closure ledgers with deterministic,
+  property, and bounded Loom tests;
+- Nexus selected a small, experiment-local MPL-2.0 OSTD 0.18 patch as the
+  prototype's single-owner IOMMU boundary. Pinned QEMU observed one real
+  one-page queued global IOTLB invalidation, retained ownership across
+  `Pending`, acknowledgement before frame/IOVA/accounting release, and reuse
+  only through a fresh identity after completion.
+
+This receipt is deliberately narrower than mediated VirtIO closure. The DMA
+probe never exposes its IOVA to a device and records `device_dma=false` and
+`device_reset=false`; it is one CPU, one page, and one global invalidation slot.
+It does not establish device drain/reset, interrupt quiescence, real deadline
+tombstones, SMP liveness, or production domain ownership. Stage 5B must observe
+those boundaries with a real device-visible buffer before an adapter may report
+device `Quiesced`.
 
 ## Current research assets
 
 | Path | Status | Disposition |
 | --- | --- | --- |
-| `specs/cser/` | **KEEP** | Normative baseline and pager-refinement TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice. |
-| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline and pager reference semantics and differential oracles. |
+| `specs/cser/` | **KEEP** | Normative baseline, pager, and mediated-I/O TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice. |
+| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, pager, and mediated-I/O reference semantics and differential oracles. |
 | `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, the bounded pager recover/timeout slice, and the IOMMU fail-closed result. It may later be superseded by a broader prototype, but must remain runnable until then. |
+| `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for one-page DMA ownership and queued IOTLB completion. Extend it with real mediated VirtIO without weakening its explicit no-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
 | `tests/guest/linux/` | **KEEP** | Compatibility workload inputs for the eventual Linux personality. These do not define Nexus's research identity. |
 | `VISION.md` | **KEEP** | Research question, exclusions, candidate contribution, and evidence threshold. |
@@ -138,7 +170,7 @@ while that decision is open, but no real adapter may report `Quiesced`.
 | `Cargo.toml` | **KEEP** | The root workspace contains only `crates/cser-model`; admit future prototype crates only when a vertical slice requires them. |
 | root and isolated `Cargo.lock` files | **KEEP** | Commit the model, xtask, OSDK project, and generated OSDK Run-base graphs; runtime containers mount project locks read-only. |
 | `.cargo/config.toml` | **KEEP** | Contains only the bare-metal target flags used by the root no-std model gate. |
-| `Dockerfile`, `rust-toolchain.toml`, `x` | **KEEP** | Pinned environment and stable host-side entry point for all retained gates. |
+| `Dockerfile`, `rust-toolchain.toml`, `x` | **KEEP** | Pinned environment and stable host-side entry point for all retained gates, including both isolated OSTD spikes. |
 | `tools/xtask/` | **KEEP** | Isolated workflow crate for model, catalog, scenario, TLA+, and artifact gates. |
 | `.github/workflows/ci.yml` | **KEEP** | Invokes the same Docker-backed `./x verify` path used locally. |
 | `flake.nix`, `flake.lock`, `.envrc` | **DELETE** | Removed in Phase 0; Docker is the environment boundary. |
