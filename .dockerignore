@@ -1,5 +1,4 @@
 .git
-.direnv
 target
 **/target
 **/artifacts
@@ -7,5 +6,5 @@ target
 **/fuzz/corpus
 **/fuzz/artifacts
 experiments/ostd-cser-spike/guest/probe.bin
-result
-result-*
+.claude
+AGENTS.md

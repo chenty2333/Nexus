@@ -286,7 +286,7 @@ The observed path is:
 ```text
 UserMode syscall -> proposal -> Commit selected task
 UserMode page fault -> policy Crash -> binding epoch 1 -> 2
-kernel FIFO fallback -> FallbackPick one tick after Crash
+kernel FIFO fallback -> FallbackPick within one tick of Crash (0-1 observed)
 proposal before rebind -> reject no supervisor
 kernel probe exercises Rebind transition at epoch 2
 epoch-1 proposal -> reject stale
@@ -534,7 +534,7 @@ normal kernel path.
 | Tombstone/timeout | none | protocol extension, retained-resource tests, eventual retry/reset |
 | Work proportionality | per-scope Rust data structure | fixed-`N` varying-`k` and fixed-`k` varying-`N` kernel curves |
 | Cross-service composition | none | scheduler + pager + I/O crash matrix under mixed workloads |
-| Linux pressure | legacy code only; not evidence for new architecture | bounded personality workloads on the completed CSER slices |
+| Linux pressure | retained legacy workload inputs only; not evidence for new architecture | bounded personality workloads on the completed CSER slices |
 
 TLC's current result is a complete graph only for its committed finite
 configuration. QEMU results are concrete observations only for their pinned
@@ -556,9 +556,9 @@ should contain only an active implementation or evidence that still constrains
 the research.
 
 The intended developer interface is a Docker-pinned environment orchestrated by
-one root `./x` and Rust `xtask`. Nix and Just are transitional and can be removed
-after retained gates use the new entry point. CI and local verification must call
-the same commands.
+one root `./x` and Rust `xtask`. Nix and Just were removed after every retained
+gate moved to that entry point. CI and local verification call the same
+commands.
 
 ## Open architecture decisions
 

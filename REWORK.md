@@ -46,6 +46,27 @@ following are true:
 The old and new trees coexist only until these gates pass. We do not keep a
 permanently buildable `legacy/` kernel.
 
+## Phase 0 execution record
+
+The deletion gates were satisfied on 2026-07-11 and the reset was executed as
+one repository transaction after a separate build/CI checkpoint:
+
+- root Docker, `./x`, xtask, pinned lockfiles, TLC, and the OSTD QEMU slice all
+  passed with runtime networking disabled;
+- CI was reduced to the same `./x verify` entry point;
+- the oracle catalogs and 34 retained Linux source copies passed schema,
+  reference-closure, and SHA-256 validation;
+- Nix, direnv, Just, the Axle kernel and crates, Zircon facades, the old
+  Starnix-like server, old conformance runner, generated syscall ABI,
+  implementation references, and obsolete documentation were removed;
+- the root Cargo workspace now contains only `crates/cser-model`; xtask and the
+  OSTD experiment remain deliberately isolated workspaces.
+
+Git history, ending with the pre-deletion build checkpoint, is the archive.
+Legacy paths that remain below or in oracle catalogs are provenance records,
+not live build dependencies. The per-module rows in this ledger record the
+decisions that were applied; they do not imply that deleted paths still exist.
+
 ## Migration receipts
 
 The following extractions are already present in the new tree:
@@ -77,13 +98,15 @@ neutral-runner gates above must pass in the same cleanup checkpoint.
 
 | Path | Status | Disposition |
 | --- | --- | --- |
-| `Cargo.toml` | **REWRITE** | Reduce the root workspace to maintained models/tools and the new implementation. Remove all legacy members together with their directories. |
-| root `Cargo.lock` policy | **REWRITE** | Commit lockfiles for reproducible host tools and isolated OSDK crates; do not rely on the old globally ignored lockfile behavior. |
-| `.cargo/config.toml` | **REWRITE** | Keep only target settings actually required by the new OSTD/guest build. |
-| `.github/workflows/ci.yml` | **REWRITE** | Invoke the same Docker-backed `./x verify` path used locally. |
-| `flake.nix`, `flake.lock`, `.envrc` | **DELETE** | Delete in the CI/build cutover change. Docker becomes the environment boundary. |
-| `justfile` | **MIGRATE** | Move only retained commands into `./x`/xtask, then delete. Do not reproduce obsolete Axle or Starnix convenience targets. |
-| `.gitignore` | **REWRITE** | Rebuild around committed lockfiles and explicit Docker/OSDK/QEMU artifacts. |
+| `Cargo.toml` | **KEEP** | The root workspace contains only `crates/cser-model`; admit future prototype crates only when a vertical slice requires them. |
+| root and isolated `Cargo.lock` files | **KEEP** | Commit the model, xtask, OSDK project, and generated OSDK Run-base graphs; runtime containers mount project locks read-only. |
+| `.cargo/config.toml` | **KEEP** | Contains only the bare-metal target flags used by the root no-std model gate. |
+| `Dockerfile`, `rust-toolchain.toml`, `x` | **KEEP** | Pinned environment and stable host-side entry point for all retained gates. |
+| `tools/xtask/` | **KEEP** | Isolated workflow crate for model, catalog, scenario, TLA+, and artifact gates. |
+| `.github/workflows/ci.yml` | **KEEP** | Invokes the same Docker-backed `./x verify` path used locally. |
+| `flake.nix`, `flake.lock`, `.envrc` | **DELETE** | Removed in Phase 0; Docker is the environment boundary. |
+| `justfile` | **DELETE** | Retained commands moved to `./x`/xtask; obsolete Axle and Starnix targets were not reproduced. |
+| `.gitignore`, `.dockerignore` | **KEEP** | Cover only current Cargo, OSDK, QEMU, verification, and local-agent outputs. |
 | `LICENSE` | **KEEP** | Keep the repository license while documenting third-party licenses, including OSTD's MPL-2.0 boundary. |
 
 ## Shared crates
@@ -137,7 +160,7 @@ neutral-runner gates above must pass in the same cleanup checkpoint.
 
 | Module | Status | Disposition |
 | --- | --- | --- |
-| `tools/axle-conformance` | **MIGRATE** | Reimplement its useful generic capabilities in xtask: scenario selection, timeout, ordered/required/forbidden serial assertions, numeric bounds, retries, and artifacts. Delete Axle-specific contracts and commands. |
+| `tools/axle-conformance` | **MIGRATE** | Timeout, ordered/required/forbidden serial assertions, numeric bounds, bounded artifacts, and process cleanup were reimplemented in xtask. Axle-specific selection and retry machinery was not retained; add a smaller form only when multiple live scenarios require it. |
 | `tools/axle-concurrency` | **MIGRATE** | Preserve the schedule ideas in `specs/oracles/cser-races.toml`; rewrite execution against the CSER core and later Loom/Kani harnesses. |
 | `tools/syscalls-gen` | **DELETE** | Do not regenerate the obsolete Axle/Zircon ABI. Linux constants come from maintained UAPI crates. |
 | `tools/nexus-manifestc` | **DELETE** | Coupled to the old component model. |

@@ -1,8 +1,0 @@
-url = "boot://controller-worker"
-startup = "eager"
-
-[program]
-runner = "elf"
-binary = "bin/controller-worker"
-args = ["controller-worker"]
-env = []

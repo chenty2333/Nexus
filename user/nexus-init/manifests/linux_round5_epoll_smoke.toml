@@ -1,8 +1,0 @@
-url = "boot://linux-round5-epoll-smoke"
-startup = "eager"
-
-[program]
-runner = "starnix"
-binary = "bin/linux-round5-epoll-smoke"
-args = ["linux-round5-epoll-smoke"]
-env = []

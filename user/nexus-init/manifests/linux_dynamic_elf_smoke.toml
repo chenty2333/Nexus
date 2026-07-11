@@ -1,8 +1,0 @@
-url = "boot://linux-dynamic-elf-smoke"
-startup = "eager"
-
-[program]
-runner = "starnix"
-binary = "bin/linux-dynamic-elf-smoke"
-args = ["linux-dynamic-elf-smoke"]
-env = []

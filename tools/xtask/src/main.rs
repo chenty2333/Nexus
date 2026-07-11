@@ -129,7 +129,7 @@ fn check(root: &Path) -> Result<()> {
         ],
     )?;
 
-    section("check cser-model without std");
+    section("check cser-model on the bare-metal target without std");
     cargo(
         root,
         [
@@ -139,6 +139,8 @@ fn check(root: &Path) -> Result<()> {
             "cser-model",
             "--no-default-features",
             "--lib",
+            "--target",
+            "x86_64-unknown-none",
         ],
     )?;
 
@@ -172,7 +174,7 @@ fn clippy(root: &Path) -> Result<()> {
         ],
     )?;
 
-    section("clippy cser-model without std");
+    section("clippy cser-model on the bare-metal target without std");
     cargo(
         root,
         [
@@ -182,6 +184,8 @@ fn clippy(root: &Path) -> Result<()> {
             "cser-model",
             "--no-default-features",
             "--lib",
+            "--target",
+            "x86_64-unknown-none",
             "--",
             "-D",
             "warnings",

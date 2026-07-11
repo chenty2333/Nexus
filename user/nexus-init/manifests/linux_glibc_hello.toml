@@ -1,7 +1,0 @@
-url = "boot://linux-glibc-hello"
-
-[program]
-runner = "starnix"
-binary = "bin/linux-glibc-hello"
-args = ["linux-glibc-hello"]
-env = []

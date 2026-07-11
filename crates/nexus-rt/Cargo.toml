@@ -1,9 +1,0 @@
-[package]
-name = "nexus-rt"
-version = "0.1.0"
-edition = "2024"
-license = "Unlicense"
-publish = false
-
-[dependencies]
-libax = { path = "../libax", default-features = false }
