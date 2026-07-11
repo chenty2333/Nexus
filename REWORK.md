@@ -12,11 +12,11 @@ receipt. Stage 5B adds a bounded real-device receipt for mediated readonly
 VirtIO, reset/tombstone recovery, and three-owner IOTLB closure. Stage 6A adds
 the bounded personality spec/oracle, one static `linux-hello` execution, and two
 same-implementation companion personality-closure scopes. Stage 6B.1 now adds
-a checked private-futex TLA+ successor and pure Rust oracle for bounded
-wait/wake recovery semantics; its OSTD/QEMU observation remains pending and the
-futex core workload is not complete. The pager, device, and Stage 6A Linux
-results are **Observed**, not a production pager, I/O subsystem, or Linux
-personality. The foundation decision is **OSTD-first**, not
+a checked private-futex TLA+ successor, pure Rust oracle, and bounded OSTD/QEMU
+wait/wake recovery slice. Its semantics and micro-slice are **Observed**; the
+retained futex core workload and Stage 6 are not complete. The pager, device,
+and Linux results are not a production pager, I/O subsystem, futex registry, or
+Linux personality. The foundation decision is **OSTD-first**, not
 irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an
 upstream API or a small audited adapter/patch without violating single-owner
 hardware control, Nexus must re-evaluate the foundation explicitly. That
@@ -248,10 +248,10 @@ cases remain predicate probes, and there is no personality timeout/tombstone,
 dynamic loader, threads/futex, fd/epoll, filesystem/network, SMP or production
 capability implementation. The other five core Linux workloads remain pending.
 
-## Stage 6B.1 private-futex semantics receipt
+## Stage 6B.1 private-futex receipt
 
-This checkpoint is recorded as **TLA+ and Rust semantics complete / OSTD
-observation pending**:
+This checkpoint is recorded as **TLA+ and Rust semantics complete / bounded
+OSTD/QEMU slice complete / Observed**:
 
 - `PersonalityFutexCser.tla` keeps Stage 6A unchanged and checks one private
   key, one waiter, one waker, `max_wake = 1`, crash/rebind/adopt, a CSER recovery
@@ -270,13 +270,26 @@ observation pending**:
   lost-wakeup or memory ordering. Futex live/blocked/revoke indexes also remain
   local beside an empty embedded Stage 6A syscall registry, not a unified
   syscall/futex or cross-service registry.
+- the independent OSTD slice uses one shared guest `VmSpace`, separate
+  waiter/waker `UserContext`s, atomic user-word loads, one guest `xchg` store,
+  real v1 page faults, and a fresh v2 task. Its `recover` trace explicitly
+  adopts the queued wait, cancels the watchdog, freezes one wake, rejects old
+  authority after `RevokeBegin`, and publishes each result once. Its `expire`
+  trace lets the watchdog close an uncommitted wake, rejects the old commit
+  without mutation, aborts both continuations without inventing a Linux errno,
+  and returns all wait/wake/timer credits before `RevokeComplete`;
+- the serial oracle pairs all 22 portal results with full before/after
+  projections, requires the scheduler's first fallback selection to be task
+  500, permits either legal waiter/waker completion order only inside the
+  closure-to-PASS interval, and forbids duplicate publication, expire resume,
+  timeout fabrication, and panic.
 
-The next gate is the one-key OSTD/QEMU micro-slice with real guest waiter/waker
-tasks, user-word comparison, kernel wake publication, watchdog cancel/expire,
-crash/rebind/adopt, fault injection, and a strict serial oracle. Stage 6B.2 then
-must add two-key `FUTEX_REQUEUE_PRIVATE`, shared-`VmSpace` tasks,
-clone/mmap/thread exit, and the adapted full round4 input. Passing Stage 6B.1
-alone does not complete the futex core workload or Stage 6.
+Stage 6B.2 must add two-key `FUTEX_REQUEUE_PRIVATE`, multiple waiters,
+clone/mmap/thread exit, and the explicitly adapted full round4 input. Stage
+6B.1 remains bounded to one private key, one waiter, one waker, `max_wake = 1`,
+and one CPU; it has no Linux timeout, lost-wakeup/SMP proof, or unified
+syscall/futex registry. Passing it does not complete the futex core workload or
+Stage 6.
 
 ## Current research assets
 
@@ -284,7 +297,7 @@ alone does not complete the futex core workload or Stage 6.
 | --- | --- | --- |
 | `specs/cser/` | **KEEP** | Normative baseline, pager, mediated-I/O, bounded personality, and successor futex TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice without rewriting earlier evidence baselines. |
 | `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, pager, mediated-I/O, bounded personality, and successor futex reference semantics and differential oracles. |
-| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, the bounded pager recover/timeout slice, the IOMMU fail-closed result, and the first static `linux-hello` pressure slice. It may later be superseded by a broader prototype, but must remain runnable until then. |
+| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, the bounded pager recover/timeout slice, the IOMMU fail-closed result, the first static `linux-hello` pressure slice, and the Stage 6B.1 private-futex recover/expire micro-slice. It may later be superseded by a broader prototype, but must remain runnable until then. |
 | `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for mediated readonly VirtIO, fail-closed reset/IOTLB tombstones, and three-owner queued IOTLB closure. Preserve both the Stage 5A no-device boundary and Stage 5B real-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
 | `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello` is the observed Stage 6A input; the other five core workloads remain pending. Exact retained sources are provenance rather than automatic conformance oracles: the round4 futex source is explicitly adaptation-required because it asserts a legacy requeue return convention. These inputs do not define Nexus's research identity. |

@@ -276,8 +276,21 @@ snapshot/adopt/publication/closure paths; it does not cover a pre-registration
 or pre-commit captured syscall packet. The separate
 `PersonalityFutexCser.tla` successor fixes the bounded temporal and fairness
 contract. Together these artifacts complete the Stage 6B.1 semantics
-checkpoint only; the OSTD/QEMU implementation observation remains a later
-evidence gate, and neither the futex core workload nor Stage 6 is complete.
+checkpoint.
+
+The independent pinned OSTD/QEMU slice refines that oracle with a real shared
+`VmSpace`, separate waiter/waker `UserContext`s, atomic user-word loads, one
+guest `xchg` store, real personality faults, fresh-v2 rebind/adopt, kernel wake
+publication, watchdog cancel/expire, and failure-atomic post-revoke token
+rejection. Its `recover` and `expire` traces both finish with exactly two
+terminalizations, empty local futex indexes, and all wait/wake/timer credits
+free. That makes Stage 6B.1 **semantics complete and bounded implementation
+slice complete / Observed**, but does not widen this executable oracle's model
+boundary. The observation remains one private key, one waiter, one waker,
+`max_wake = 1`, and one CPU; it has no Linux timeout, requeue, clone, mmap,
+thread-exit, lost-wakeup/SMP proof, or unified syscall/futex registry. The
+retained full Round 4 workload has not run, Stage 6B.2 is pending, and neither
+the futex core workload nor Stage 6 is complete.
 
 `Commit` is the effect commit linearization point. `RevokeBegin` atomically
 closes the old authority epoch. Effects that committed first must complete or

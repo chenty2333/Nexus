@@ -47,10 +47,23 @@ crash/rebind/adopt, a CSER recovery watchdog, wait/wake/timer credit
 conservation, and wake/revoke ordering. The watchdog never becomes a Linux
 futex timeout. `PERSONALITY_FUTEX.md` records the Rust refinement mapping,
 reject-enabled action check, reachability witnesses, complete TLC results, and
-the explicit exclusion of requeue, multiple waiters/keys, SMP, and the OSTD
-implementation slice. Together with the pure Rust successor, this completes the
-Stage 6B.1 semantics checkpoint only; OSTD/QEMU observation, the futex core
-workload, and Stage 6 remain incomplete.
+the explicit exclusion of requeue, multiple waiters/keys, SMP, and concrete
+implementation details from the formal model. Together with the pure Rust
+successor, these artifacts complete the Stage 6B.1 semantics checkpoint.
+
+The independent pinned OSTD/QEMU refinement now supplies a bounded
+implementation observation for the same one-key contract. Its `recover` path
+observes mismatch-without-registration, atomic compare/enqueue, a real
+personality fault, binding-epoch fencing, explicit adoption, watchdog
+cancellation, frozen wake commitment, post-revoke stale-authority rejection,
+and one waiter/waker publication. Its `expire` path observes an uncommitted wake
+losing to watchdog-driven `RevokeBegin`, failure-atomic stale rejection, two
+kernel abort terminalizations, and full wait/wake/timer-credit return without
+fabricating a Linux timeout. This records Stage 6B.1 as **semantics complete and
+bounded OSTD/QEMU slice complete / Observed**. It does not run the retained full
+Round 4 program, add requeue/clone/mmap/thread-exit, prove lost-wakeup or SMP
+ordering, or establish a unified syscall/futex registry. The futex core workload
+and Stage 6 therefore remain incomplete; Stage 6B.2 is still pending.
 
 ## Linearization contract
 

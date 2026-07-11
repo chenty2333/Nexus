@@ -92,7 +92,7 @@ injection_profile = [
 ]
 expected_properties = ["PostRevokeCommitExclusion", "QuiescentClosure", "SingleTerminalization", "CrashRebindFencing", "FallbackProgress", "BudgetConservation"]
 adaptation_required = ["The exact retained source expects FUTEX_REQUEUE_PRIVATE to return only the number of woken waiters. Linux futex_requeue counts both woken and requeued waiters, so the unmodified source loops after the first two-waiter requeue. Stage 6B must use an explicit reproducible adaptation or a new Nexus-owned conformance source; the personality must not emulate the legacy return value."]
-notes = "Stage 6B is split into a wait/wake recovery micro-slice and a later two-key requeue plus clone/mmap/thread-exit gate. The core workload is not complete until the adapted full program runs with Linux-compatible requeue results."
+notes = "Stage 6B.1 semantics and its bounded one-key, one-waiter/one-waker, one-CPU OSTD/QEMU recovery micro-slice are complete/Observed. This is not execution of the retained Round 4 input: there is no requeue, clone/mmap/thread-exit, Linux timeout, lost-wakeup/SMP proof, or unified syscall/futex registry. Stage 6B.2 remains pending, and the core workload is not complete until the adapted full program runs with Linux-compatible requeue results."
 
 [[workload]]
 id = "linux-round4-signal-smoke"

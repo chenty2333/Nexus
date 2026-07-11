@@ -8,6 +8,7 @@ extern crate alloc;
 mod effect;
 mod iommu_probe;
 mod linux;
+mod linux_futex;
 mod linux_pager;
 mod pager;
 mod scheduler;
@@ -282,6 +283,17 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     assert_eq!(
         scheduler.binding().binding_epoch,
         linux_scheduler_binding.binding_epoch + 1
+    );
+
+    let futex_scheduler_binding = scheduler.rebind(AUTHORITY_EPOCH);
+    assert_eq!(
+        futex_scheduler_binding.binding_epoch,
+        linux_scheduler_binding.binding_epoch + 1
+    );
+    linux_futex::run_linux_futex_slice(scheduler, futex_scheduler_binding);
+    assert_eq!(
+        scheduler.binding().binding_epoch,
+        futex_scheduler_binding.binding_epoch + 1
     );
     assert_eq!(
         scheduler.propose(old_binding, USER_TASK_ID),

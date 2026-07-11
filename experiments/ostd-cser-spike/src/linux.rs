@@ -42,6 +42,7 @@ const CODE_FAULT_EFFECT_ID: u64 = 3;
 const SLICE_COMPLETION_EFFECT_ID: u64 = 4;
 const REVOKE_PRECOMMIT_EFFECT_ID: u64 = 5;
 const REVOKE_COMMITTED_EFFECT_ID: u64 = 6;
+const PERSONALITY_V2_TASK_EXIT_EFFECT_ID: u64 = 7;
 const GUEST_TASK_ID: u64 = 400;
 const PERSONALITY_V1_TASK_ID: u64 = 401;
 const WATCHDOG_TASK_ID: u64 = 402;
@@ -1660,6 +1661,12 @@ pub fn run_linux_hello_slice(scheduler: &'static CserScheduler, scheduler_bindin
         scope_id: REVOKE_COMMITTED_SCOPE_ID,
         effect_id: REVOKE_COMMITTED_EFFECT_ID,
     });
+    let (personality_v2_exit_waiter, personality_v2_exit_waker) =
+        EffectWaiter::new_pair(EffectToken {
+            authority_epoch: AUTHORITY_EPOCH,
+            scope_id: SCOPE_ID,
+            effect_id: PERSONALITY_V2_TASK_EXIT_EFFECT_ID,
+        });
     let revoke_committed = Arc::new(PersonalityScenario::new_revoke_probe(
         loaded.vm_space.clone(),
         REVOKE_COMMITTED_SCOPE_ID,
@@ -1709,6 +1716,7 @@ pub fn run_linux_hello_slice(scheduler: &'static CserScheduler, scheduler_bindin
                 watchdog_revoke_precommit,
                 watchdog_revoke_committed,
                 old_task,
+                personality_v2_exit_waker,
             )
         })
         .data(TaskData::new(WATCHDOG_TASK_ID, None))
@@ -1748,8 +1756,14 @@ pub fn run_linux_hello_slice(scheduler: &'static CserScheduler, scheduler_bindin
     drop(done_waiter);
     revoke_precommit_waiter.wait();
     revoke_committed_waiter.wait();
+    personality_v2_exit_waiter.wait();
     drop(revoke_precommit_waiter);
     drop(revoke_committed_waiter);
+    drop(personality_v2_exit_waiter);
+    println!(
+        "LINUX_PERSONALITY_V2 TaskExit workload=linux-hello task={} observed=true lifecycle_barrier=one-shot",
+        PERSONALITY_V2_TASK_ID,
+    );
 
     let fallback = scheduler
         .fallback_evidence()
@@ -2262,6 +2276,7 @@ fn run_watchdog(
     revoke_precommit: Arc<PersonalityScenario>,
     revoke_committed: Arc<PersonalityScenario>,
     old_task: Arc<Task>,
+    personality_v2_exit_waker: EffectWaker,
 ) {
     assert_current_kernel_task(WATCHDOG_TASK_ID);
     while !scenario.has_crashed() {
@@ -2276,7 +2291,8 @@ fn run_watchdog(
     let v2_task_vm = v2_vm.clone();
     let v2_task = Arc::new(
         TaskOptions::new(move || {
-            run_personality_v2(v2_state, revoke_precommit, revoke_committed, v2_task_vm)
+            run_personality_v2(v2_state, revoke_precommit, revoke_committed, v2_task_vm);
+            assert!(personality_v2_exit_waker.wake_up());
         })
         .data(TaskData::new(PERSONALITY_V2_TASK_ID, Some(v2_vm.clone())))
         .build()

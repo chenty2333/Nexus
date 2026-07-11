@@ -1,11 +1,13 @@
 # OSTD/OSDK 0.18 CSER spike
 
-This experiment answers three narrow architecture questions without modifying
+This experiment answers four narrow architecture questions without modifying
 OSTD 0.18: can Nexus place a CSER-aware scheduler at OSTD's public scheduling
 boundary; can a kernel-owned fault continuation survive a user-space pager
 crash and be explicitly adopted by a fresh pager; and can one real static Linux
 guest exercise those mechanisms through a restartable syscall-personality
-probe? It is deliberately outside the legacy Nexus workspace.
+probe; and can a bounded private-futex wait/wake scope survive personality
+crash, rebind, revocation, and watchdog expiry? It is deliberately outside the
+legacy Nexus workspace.
 
 ## Pinned environment
 
@@ -37,10 +39,11 @@ Build and run the complete probe:
 
 The narrower commands are `./x check`, `./x build`, `./x run`, and
 `./x iommu-probe`. The serial transcript is written to
-`artifacts/serial.log`; `scripts/assert-serial.sh` verifies the full
-scheduler, pager, Linux-personality, and fail-closed IOMMU receipt, including
-ordering, exact counts, fallback first-pick identity/ordinal, and forbidden
-branches. Raw scheduler ticks are diagnostic, not an acceptance bound.
+`artifacts/serial.log`; `scripts/assert-serial.sh` verifies the full scheduler,
+pager, Linux-personality, private-futex, and fail-closed IOMMU receipt, including
+ordering, exact counts, fallback first-pick identity/ordinal, semantic
+before/after projections, and forbidden branches. Raw scheduler ticks are
+diagnostic, not an acceptance bound.
 
 ### Reproducible OSDK runner graph
 
@@ -224,14 +227,57 @@ attempts return `NotQuiescent`. These scopes refine personality-local
 commit/revoke ordering; they do not revoke the co-tagged scope 30 and do not
 provide a unified scheduler/pager/personality/I/O reverse index.
 
-The bounds remain substantial: one CPU, fixed enqueue order, one guest
+The Stage 6A bounds remain substantial: one CPU, fixed enqueue order, one guest
 process/thread, one lazy code page, one single-slot portal, and a fixed static
 ELF. Most linuxd control flow is `global_asm!`; the kernel harness still performs
 portal delivery, guest copy-in, and state transitions. The v1 delayed packet is
 held by a bounded kernel queue, while code-pager stale replies remain predicate
 probes. There is no timeout/tombstone for the personality, dynamic linking,
-PIE/TLS, fd table, futex/epoll, filesystem, network, SMP, or production opaque
-capability transport. Serial output is a test backend, not mediated VirtIO.
+PIE/TLS, fd table, general futex/requeue or epoll support, filesystem, network,
+SMP, or production opaque capability transport. Serial output is a test
+backend, not mediated VirtIO.
+
+### Stage 6B.1 bounded private-futex slice
+
+The successor slice is independent from the Stage 6A syscall registry. Two raw
+guest Tasks share one `VmSpace` and one private futex word while retaining
+separate `UserContext`s. The waiter first proves mismatch-without-effect for
+`FUTEX_WAIT_PRIVATE`, then the personality performs an atomic load and enqueues
+the matching wait under a full authority/scope/effect/task/operation/address-
+space/address/binding token. The waker performs one guest `xchg` store before
+issuing `FUTEX_WAKE_PRIVATE`; kernel state, not user policy, selects and freezes
+the queued waiter at `WakeCommit`.
+
+The `recover` trace crashes personality v1 with a real page fault, advances the
+binding epoch, starts a fresh v2 task and `VmSpace`, requires
+snapshot/ready/rebind/recover/adopt, and cancels the cohort watchdog without
+removing the adopted queued wait. After the wake commits, `RevokeBegin` closes
+the old authority; a replayed commit is rejected without mutation, and the
+kernel publishes exactly one waiter result and one waker count while draining
+the committed obligation. The scheduler policy also crashes through a real
+page fault, and task 500 must be the first kernel fallback selection attempt.
+
+The `expire` trace captures but deliberately does not commit the wake before v1
+faults. Watchdog expiry closes authority, rejects the old wake token without
+mutation, terminalizes both continuations as `Aborted`, wakes only the kernel
+runners for cooperative exit, and returns wait/wake/timer credits before
+`RevokeComplete`. It never resumes either guest `UserMode` and never fabricates
+`ETIMEDOUT` or `ECANCELED`.
+
+`scripts/assert-linux-futex.awk` pairs the exact 22 portal receipts with their
+immediately following full-state projections. The surrounding serial oracle
+checks exact closure/publication counts and permits either scheduler-dependent
+waiter/waker completion order only between quiescent closure and scenario
+PASS. This records Stage 6B.1 as **semantics complete and bounded OSTD/QEMU
+slice complete / Observed**.
+
+This is not a general futex implementation or execution of the retained Round
+4 workload. It is bounded to one private key, one waiter, one waker,
+`max_wake = 1`, a null Linux timeout, and one CPU. It has no two-key requeue,
+clone/mmap/thread-exit plumbing, lost-wakeup/SMP proof, or unified
+syscall/futex registry. Those remain Stage 6B.2 work, together with the
+explicitly adapted full Round 4 input; the futex core workload and Stage 6 are
+not complete.
 
 ## IOMMU result: fail closed
 

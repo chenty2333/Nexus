@@ -626,11 +626,12 @@ and runtime network pressure.
 
 ### Stage 6B futex successor boundary
 
-The Stage 6B.1 TLA+ and pure Rust semantics checkpoint is complete; its
-OSTD/QEMU implementation observation is still pending. This status means only
-that the two semantic artifacts fix and exercise the following bounded
-wait/wake recovery contract. It does not complete the futex core workload or
-Stage 6.
+The Stage 6B.1 TLA+ and pure Rust semantics checkpoint and its bounded
+OSTD/QEMU implementation slice are complete / **Observed**. The concrete slice
+uses one shared guest `VmSpace`, separate waiter/waker `UserContext`s, real
+personality page faults, a fresh replacement task, and kernel-owned
+continuations to refine the following wait/wake recovery contract. This status
+does not complete the retained futex core workload or Stage 6.
 
 Futex wait queues are kernel-owned mechanisms, not recoverable personality
 policy. A private futex key is at least `(address-space identity,
@@ -671,12 +672,12 @@ signals, robust/PI/shared futexes, requeue, unmap/key invalidation, and SMP
 ordering. Stage 6B.2 must add two-key atomic `FUTEX_REQUEUE_PRIVATE`, multiple
 shared-`VmSpace` guest tasks, anonymous stack mapping, clone/thread exit, and an
 explicitly adapted full round4 workload. Until 6B.2 passes, the result is only
-a checked futex wait/wake CSER semantics slice, not completion of the futex
-core gate. The modeled futex word is only an input to the compare/register
-action; there is no user-store transition, so neither model proves lost-wakeup
-or SMP memory-order behavior. Futex effects also retain local indexes beside an
-empty embedded Stage 6A syscall registry; they do not establish a unified
-syscall/futex or cross-service reverse index.
+a checked semantics plus bounded implementation slice, not completion of the
+futex core gate. The formal model word has no user-store transition; the OSTD
+probe adds one guest `xchg` store, but its one-CPU fixed scenario still does not
+prove lost-wakeup or SMP memory-order behavior. Futex effects also retain local
+indexes beside an empty embedded Stage 6A syscall registry; they do not
+establish a unified syscall/futex or cross-service reverse index.
 
 The old guest-session/sidecar-VMO/stop-packet Starnix-like path is not the target
 architecture. Tests and failure traces from it may be retained as differential
@@ -705,6 +706,11 @@ The pinned experiment observed public API fit for:
 - five unique effect IDs propagating one workload scope through scheduler,
   code-pager, personality, and completion-wait paths, without yet implementing
   a unified cross-service revoke registry;
+- one bounded private-futex refinement with a shared guest `VmSpace`, separate
+  waiter/waker contexts, atomic user-word comparison, one guest `xchg` store,
+  real v1 faults, fresh-v2 rebind/adopt, watchdog cancel/expire, committed wake
+  drain, uncommitted abort, strict stale-token projections, and complete
+  wait/wake/timer-credit return;
 - through the separate Stage 5A experiment, a single-owner one-page queued
   IOTLB invalidation whose pending handle retains the real DMA owner until
   hardware completion;
@@ -729,9 +735,6 @@ be patched into OSTD internals merely for convenience.
 - a production syscall portal with opaque reply capabilities, durable
   personality recovery state, guest-memory copy-fault recovery, and a
   personality timeout/tombstone path;
-- the Stage 6B.1 OSTD wait/wake micro-slice with real guest tasks, user-word
-  access, wait/wake publication, recovery-watchdog behavior, and crash
-  injection;
 - the Stage 6B.2 two-key requeue, shared-`VmSpace` guest tasks, clone/mmap/thread
   exit and adapted full round4 workload, plus the remaining Linux ABI, dynamic
   loader, fd/epoll, filesystem/network, personality concurrency, and SMP paths.
@@ -835,19 +838,19 @@ normal kernel path.
 | Property or boundary | Current evidence | Required next evidence |
 | --- | --- | --- |
 | Core register/commit/revoke/crash/rebind semantics | five bounded TLC model families; corresponding Rust reference oracles; four pager Loom gate refinements | implementation-specific concurrency refinement and differential kernel traces |
-| Post-revoke commit exclusion | baseline/pager/personality/private-futex finite models; Rust tests; pager Loom gate; QEMU pager timeout; Stage 6A companion scopes reject full-token user commit/reply after `RevokeBegin` without mutation | unified scope registry, futex OSTD observation, SMP and production-lock races, and device publication injection |
-| Single terminalization | baseline/pager/personality/private-futex models; Rust tests; pager Loom gates; pager QEMU paths; Stage 6A main and companion scopes each consume one continuation/waker and reject duplicate replies/exits | futex OSTD observation, implementation-source Loom/Kani, SMP and production-lock races, and device completion injection |
-| Budget conservation | baseline and pager scalar models; Stage 5 typed I/O model; Stage 6B.1 TLA+/Rust keep independent wait-slot, wake-continuation, and recovery-watchdog timer credits conserved; QEMU pager timeout keeps credit `Held` through lock-free frame/waker cleanup and returns it only before `RevokeComplete` | real futex wait/wake/timer accounting, unified typed multi-resource implementation, and leak/duplication tests under concurrency and device failure |
+| Post-revoke commit exclusion | baseline/pager/personality/private-futex finite models; Rust tests; pager Loom gate; QEMU pager timeout; Stage 6A companion scopes and Stage 6B.1 futex traces reject full-token user commit/reply after `RevokeBegin` without mutation | unified scope registry, SMP and production-lock races, and device publication injection |
+| Single terminalization | baseline/pager/personality/private-futex models; Rust tests; pager Loom gates; pager QEMU paths; Stage 6A main/companion scopes and both Stage 6B.1 futex closure paths each consume every continuation once | implementation-source Loom/Kani, SMP and production-lock races, and device completion injection |
+| Budget conservation | baseline and pager scalar models; Stage 5 typed I/O model; Stage 6B.1 TLA+/Rust and bounded QEMU traces conserve independent wait-slot, wake-continuation, and recovery-watchdog timer credits; QEMU pager timeout keeps credit `Held` through lock-free frame/waker cleanup and returns it only before `RevokeComplete` | unified typed multi-resource implementation and leak/duplication tests under concurrency and device failure |
 | Scheduler fallback | weak-fair TLA+ property; one-CPU QEMU selects the FIFO task on the first post-crash fallback selection attempt; raw tick delta is recorded only as an artifact diagnostic | lease-expiry path, SMP races, overload and repeated-crash tests |
 | Pager one-shot reply and crash/rebind | pager TLC refinement: 17,150 generated / 7,528 distinct / reported depth 17-18 across parallel clean runs / 10 temporal branches; Rust: 12 deterministic + 5 proptests (64 cases each); one-CPU QEMU `recover` + `timeout` observations | real one-shot handle/portal, serialized recovery state, full response-boundary injection, multi-client and SMP refinement |
 | Pager QuiescentClosure | Loom three-stage surrogate; QEMU three-phase Closing -> lock-free frame/waker cleanup -> credit return and RevokeComplete; reusable OSTD Waker fenced by Nexus state | production-lock/SMP interleavings, allocation failure and arbitrary task-termination paths |
 | Personality QuiescentClosure | Personality TLA+/Rust closure accounting; companion QEMU scopes observe early completion rejection, scope-local abort/drain, real waker take/publication/drop, empty live index, and final completion | scope-30 and cross-service closure, stuck backend timeout/tombstone, production-lock/SMP interleavings |
-| Futex wait/wake crash/rebind | Stage 6B.1 semantics complete: private-futex TLC safety graph 493,869 generated / 29,407 distinct / depth 20; action/liveness graph 5,192 generated / 3,521 distinct / depth 18 with 7 temporal branches; Rust oracle has 13 sequence tests and 5 proptests | OSTD/QEMU one-key micro-slice with real waiter/waker tasks, user-word compare, watchdog cancel/expire, crash/rebind/adopt, wake/revoke race, and strict serial oracle |
+| Futex wait/wake crash/rebind | Stage 6B.1 semantics plus bounded OSTD/QEMU slice complete / Observed: private-futex TLC safety graph 493,869 generated / 29,407 distinct / depth 20; action/liveness graph 5,192 generated / 3,521 distinct / depth 18 with 7 temporal branches; Rust oracle has 13 sequence tests and 5 proptests; one-key QEMU traces cover compare/enqueue, real crash/rebind/adopt, watchdog cancel/expire, committed drain, uncommitted abort, stale-token projections, and full credit return | Stage 6B.2 two-key requeue/shared-`VmSpace`/clone/mmap/thread-exit plus the adapted full round4 input; then lost-wakeup/SMP and production-registry refinement |
 | DMA quiescence | Stage 5A one-owner negative/ownership receipt plus Stage 5B real readonly device DMA, status-zero reset, and request + two queue owners released after queued IOTLB completion on pinned QEMU | physical-device drain contracts, IRQ quiescence, per-device domains, multi-page and SMP tests |
 | I/O tombstone/timeout | TLA+/Rust timeout/retry semantics plus Stage 5B fail-closed session/IOTLB ownership retention and successful retry; timeout explicitly software-injected | real-time deadline source, durable recovery worker, repeated failure, device-loss and hardware-timeout tests |
 | Work proportionality | target-local Rust structure only: the futex oracle closes a target with `k=6` while leaving an unrelated `N=96` scope unchanged, records 4 scope-index head selections and 6 terminalizations, and uses a local `BTreeSet` with `O(log k)` maintenance; TLA+ makes no complexity claim | scope-local/intrusive kernel records plus fixed-`N` varying-`k` and fixed-`k` varying-`N` kernel curves; no production `O(k)` claim before those measurements |
 | Cross-service composition | Stage 6A propagates one `(authority_epoch=91, scope=30)` across distinct scheduler, write, exit, code-fault, and completion effects in one boot; the services still have separate registries and no shared revoke | unified scope gate plus scheduler + pager + personality + I/O revoke/crash matrix under mixed workloads |
-| Linux pressure | `PersonalityCser` finite safety/liveness graphs; safe-Rust personality oracle; one bounded static `linux-hello` load/fault/write/crash/rebind/exit path; full-token invalid/replay rejection and same-implementation companion abort/drain closure; Stage 6B.1 futex wait/wake semantics complete in TLA+/Rust only | observe the Stage 6B.1 OSTD micro-slice, then complete Stage 6B.2 two-key requeue/shared-`VmSpace`/clone/mmap/thread-exit and the adapted full round4 input; a unified cross-service registry plus epoll, dynamic PIE, runtime filesystem, and runtime network remain pending |
+| Linux pressure | `PersonalityCser` finite safety/liveness graphs; safe-Rust personality oracle; one bounded static `linux-hello` load/fault/write/crash/rebind/exit path; full-token invalid/replay rejection and same-implementation companion abort/drain closure; Stage 6B.1 futex wait/wake semantics and bounded OSTD micro-slice complete / Observed | complete Stage 6B.2 two-key requeue/shared-`VmSpace`/clone/mmap/thread-exit and the adapted full round4 input; a unified cross-service registry plus epoll, dynamic PIE, runtime filesystem, and runtime network remain pending |
 
 TLC's current result is a complete graph only for its committed finite
 configuration. QEMU results are concrete observations only for their pinned

@@ -18,6 +18,10 @@ image_key=$(sha256sum \
     "$root/osdk-runner-base/x86_64.ld" \
     "$root/osdk-runner-base/riscv64.ld" \
     "$root/osdk-runner-base/loongarch64.ld" \
+    "$root/scripts/build-guest.sh" \
+    "$root/guest/linux-futex-shared.S" \
+    "$root/guest/linux-futex-personality-v1.S" \
+    "$root/guest/linux-futex-personality-v2.S" \
     "$root/userspace/personality/.cargo/config.toml" \
     "$root/userspace/personality/Cargo.toml" \
     "$root/userspace/personality/Cargo.lock" \

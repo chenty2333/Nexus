@@ -20,7 +20,7 @@ and success protocol while keeping these inputs as pressure tests.
 
 ## Current Stage 6 use
 
-`linux-hello` is the first and currently only executed core workload. The
+`linux-hello` is the first and currently only executed retained core workload. The
 Docker-pinned `experiments/ostd-cser-spike/scripts/build-guest.sh` builds an
 x86-64 static `ET_EXEC` directly from the unchanged retained `hello.S`; it does
 not copy or rewrite a second source tree. The gate fixes both the retained
@@ -31,10 +31,14 @@ and the reproducible container-built ELF SHA-256
 The generated ELF lives only in the isolated experiment and is not a new
 provenance source.
 
-That one bounded receipt does not complete Stage 6. The other five core
-workloads—futex, epoll, dynamic PIE, runtime filesystem, and runtime
-network—have not run on the new personality. The remaining retained sources
-are still pressure candidates or archive inputs, not compatibility claims.
+That one bounded retained-workload receipt does not complete Stage 6. The other
+five core workloads—futex, epoll, dynamic PIE, runtime filesystem, and runtime
+network—have not run on the new personality. Stage 6B.1 now separately executes
+Nexus-owned raw waiter, waker, and personality probes for one private-futex
+wait/wake recovery contract; those probes are an implementation observation,
+not execution of the retained Round 4 core input. The remaining retained
+sources are still pressure candidates or archive inputs, not compatibility
+claims.
 
 ### Retained futex input audit
 
@@ -56,12 +60,21 @@ introduce a separately catalogued Nexus-owned input. It must also pass a host
 Linux behavior oracle. Implementing the old return convention in the Nexus
 personality is not acceptable.
 
-The futex gate is deliberately split. The Stage 6B.1 TLA+ and pure Rust
-semantics checkpoint covers one-key wait/wake, crash/rebind, a CSER recovery
-watchdog, revocation, and one-shot task wakeup; its OSTD/QEMU observation is
-still pending. Stage 6B.2 adds two-key atomic requeue plus the retained
-program's `mmap`, `clone`, thread-exit, write, and process-exit plumbing.
-Passing only 6B.1 does not complete the core futex workload.
+The futex gate is deliberately split. Stage 6B.1 is now **semantics complete and
+bounded OSTD/QEMU slice complete / Observed** for one private key, one waiter,
+one waker, `max_wake = 1`, and one CPU. Its raw probes observe a mismatch
+returning `EAGAIN` without an effect, atomic compare/enqueue, personality
+crash/rebind/adopt, watchdog cancellation and expiry, frozen wake selection,
+post-revoke stale rejection without mutation, one committed drain, one
+uncommitted abort path, and full wait/wake/timer-credit return. The watchdog is
+a CSER recovery deadline and never reports a Linux futex timeout.
+
+This micro-slice has no requeue, clone, mmap, thread-exit, Linux timeout, or
+lost-wakeup/SMP proof, and its futex indexes are not a unified syscall/futex
+registry. Stage 6B.2 must add two-key atomic requeue plus the retained program's
+`mmap`, `clone`, thread-exit, write, and process-exit plumbing and then run the
+explicitly adapted full Round 4 program. Passing only 6B.1 does not complete the
+core futex workload or Stage 6.
 
 ## Build profiles
 

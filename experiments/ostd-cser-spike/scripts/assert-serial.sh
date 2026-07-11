@@ -125,7 +125,62 @@ patterns=(
     "LINUX_SCHEDULER PASS workload=linux-hello policy=404 fallback_first_task=400 fallback_first_selection_attempt=1 observed_tick_delta="
     "LINUX_CODE_PAGER PASS workload=linux-hello effect=3 backing=elf-image pager_crash_rebind=true old_binding_rejections=2 terminalizations=1 wake_publications=1 resume_returns=1 permissions=RX same_rip=true single_cpu=true bounded=true"
     "LINUX_SLICE PASS workload=linux-hello write=true exit_group=true personality_crash_rebind=true stale_reply_fenced=true terminalizations=2 output_publications=1"
-    "CSER REJECT_STALE action=Prepare authority_epoch=41 proposal_binding_epoch=1 current_binding_epoch=3 proposal_task=100"
+    "CSER Rebind authority_epoch=41 binding_epoch=3"
+    "LINUX_FUTEX_SLICE BEGIN scenarios=recover+expire scheduler_binding_epoch=3 bounded=true unified_registry=false smp=1"
+    "LINUX_FUTEX_SCENARIO BEGIN scenario=recover authority_epoch=101 scope=40 asid=600 generation=1 address=0x401000 waiter=500 waker=501 shared_vm=true smp=1 scheduler_mode=user_policy_then_kernel_fifo_fallback"
+    "CSER Prepare authority_epoch=41 binding_epoch=3 proposal_task=505"
+    "CSER Commit authority_epoch=41 binding_epoch=3 proposal_task=505 state=Committed"
+    "LINUX_FUTEX_SCHEDULER Register scenario=recover policy=505 workload_authority_epoch=101 scope=40 effect=1 scheduler_binding_epoch=3"
+    "CSER PrepareScoped service=scheduler scheduler_authority_epoch=41 binding_epoch=3 workload_authority_epoch=101 scope=40 effect=1 proposal_task=500"
+    "CSER Crash authority_epoch=41 previous_binding_epoch=3 binding_epoch=4"
+    "CSER CrashScoped service=scheduler scheduler_authority_epoch=41 binding_epoch=4 workload_authority_epoch=101 scope=40 effect=1 pending_scoped_cleared=true fallback=kernel_fifo"
+    "LINUX_FUTEX_SCHEDULER_POLICY EXIT scenario=recover policy=505 reason=real_user_page_fault waiter_proposal_committed=false"
+    "CSER FallbackPick authority_epoch=41 binding_epoch=4 task=500"
+    "LINUX_FUTEX Mismatch scenario=recover observed=0 expected=1 result=EAGAIN effect_created=false wait_credit_held=false mutation=false"
+    "LINUX_FUTEX PortalResult scenario=recover action=WaitRegister sender=502 opcode=0x4c600002 authority_epoch=101 scope=40 effect=1 task=500 operation=1 address_space=600 generation=1 address=0x401000 binding_epoch=1 result=Applied mutation=true"
+    "LINUX_FUTEX WaitRegister scenario=recover observed=0 expected=0 atomic=true queue=1 wait_credit=Held vm_restored=true"
+    "LINUX_FUTEX Crash scenario=recover personality=502 previous_binding_epoch=1 binding_epoch=2 reason=real_user_page_fault fallback=kernel watchdog=armed cohort=1"
+    "LINUX_FUTEX Fallback scenario=recover binding_epoch=2 action=close_portal_gate+retain_queue+watchdog"
+    "LINUX_FUTEX FreshSpawn scenario=recover task=504 vm=fresh user_mode=constructed_in_task binding_epoch=2"
+    "LINUX_FUTEX PortalResult scenario=recover action=Snapshot sender=504 opcode=0x4c600010"
+    "LINUX_FUTEX PortalResult scenario=recover action=Ready sender=504 opcode=0x4c600011"
+    "LINUX_FUTEX PortalResult scenario=recover action=WaitRegister sender=504 opcode=0x4c600002 authority_epoch=101 scope=40 effect=1 task=500 operation=1 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=NoSupervisor mutation=false"
+    "LINUX_FUTEX PortalResult scenario=recover action=Rebind sender=504 opcode=0x4c600012"
+    "LINUX_FUTEX PortalResult scenario=recover action=WaitRegister sender=504 opcode=0x4c600002 authority_epoch=101 scope=40 effect=1 task=500 operation=1 address_space=600 generation=1 address=0x401000 binding_epoch=1 result=StaleBinding mutation=false"
+    "LINUX_FUTEX PortalResult scenario=recover action=RecoverNext sender=504 opcode=0x4c600013"
+    "LINUX_FUTEX PortalResult scenario=recover action=Adopt sender=504 opcode=0x4c600014 authority_epoch=101 scope=40 effect=1 task=500 operation=1 address_space=600 generation=1 address=0x401000 binding_epoch=1 result=Applied mutation=true"
+    "LINUX_FUTEX WatchdogCancel scenario=recover effect=1 binding_epoch=2 timer_credit=Free queued_wait_retained=true"
+    "LINUX_FUTEX PortalResult scenario=recover action=Adopt sender=504 opcode=0x4c600014 authority_epoch=101 scope=40 effect=999 task=500 operation=1 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=IdentityMismatch mutation=false"
+    "LINUX_FUTEX PortalResult scenario=recover action=Adopt sender=504 opcode=0x4c600014 authority_epoch=101 scope=40 effect=1 task=500 operation=1 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=NotAdoptable mutation=false"
+    "LINUX_FUTEX Capture scenario=recover kind=WAKE authority_epoch=101 scope=40 effect=2 task=501 operation=2 asid=600 generation=1 address=0x401000 binding_epoch=2 wake_credit=Held max_wake=1"
+    "LINUX_FUTEX PortalResult scenario=recover action=WakeCommit sender=504 opcode=0x4c600020 authority_epoch=101 scope=40 effect=2 task=501 operation=2 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=Applied mutation=true"
+    "LINUX_FUTEX WakeCommit scenario=recover selected_wait=1 frozen_count=1 queue_removed=true wake_credit=Held"
+    "LINUX_FUTEX PortalResult scenario=recover action=WakeCommit sender=504 opcode=0x4c600020 authority_epoch=101 scope=40 effect=2 task=501 operation=2 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=InvalidState mutation=false"
+    "LINUX_FUTEX RevokeBegin scenario=recover reason=committed_wake_drain closed_epoch=101 authority_epoch=102 target=2 gate=closed"
+    "LINUX_FUTEX PortalResult scenario=recover action=WakeCommit sender=504 opcode=0x4c600020 authority_epoch=101 scope=40 effect=2 task=501 operation=2 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=StaleAuthority mutation=false"
+    "LINUX_FUTEX ClosurePublish scenario=recover phase=terminalize terminalizations=2 wakers_taken=2 credits_returned=false pending=true"
+    "LINUX_FUTEX ClosurePublish scenario=recover phase=wake_outside_lock wait=true wake=true"
+    "LINUX_FUTEX ClosurePublish scenario=recover phase=account publication=1 credits=wait+wake:Free pending=false"
+    "LINUX_FUTEX RevokeComplete scenario=recover result=Applied queue=0 live=0 blocked=0 wakers=0 pending=false credits=wait+wake+timer:Free terminalizations=2"
+    "LINUX_FUTEX_SCENARIO PASS scenario=recover terminalizations=2 wait_credit=Free wake_credit=Free timer_credit=Free queue=0 live=0 blocked=0 wakers=0 smp=1"
+    "LINUX_FUTEX_SCHEDULER PASS scenario=recover policy=505 fallback_first_task=500 fallback_first_selection_attempt=1 observed_tick_delta="
+    "LINUX_FUTEX_SCENARIO BEGIN scenario=expire authority_epoch=101 scope=41 asid=601 generation=1 address=0x401000 waiter=510 waker=511 shared_vm=true smp=1 scheduler_mode=existing_kernel_fifo_fallback"
+    "LINUX_FUTEX Mismatch scenario=expire observed=0 expected=1 result=EAGAIN effect_created=false wait_credit_held=false mutation=false"
+    "LINUX_FUTEX PortalResult scenario=expire action=WaitRegister sender=512 opcode=0x4c600002 authority_epoch=101 scope=41 effect=1 task=510 operation=1 address_space=601 generation=1 address=0x401000 binding_epoch=1 result=Applied mutation=true"
+    "LINUX_FUTEX WaitRegister scenario=expire observed=0 expected=0 atomic=true queue=1 wait_credit=Held vm_restored=true"
+    "LINUX_FUTEX Capture scenario=expire kind=WAKE authority_epoch=101 scope=41 effect=2 task=511 operation=2 asid=601 generation=1 address=0x401000 binding_epoch=1 wake_credit=Held max_wake=1"
+    "LINUX_FUTEX Crash scenario=expire personality=512 previous_binding_epoch=1 binding_epoch=2 reason=real_user_page_fault fallback=kernel watchdog=armed cohort=2"
+    "LINUX_FUTEX WatchdogExpire scenario=expire deadline="
+    "linux_timeout=false"
+    "LINUX_FUTEX RevokeBegin scenario=expire reason=recovery_watchdog_expired closed_epoch=101 authority_epoch=102 target=2 gate=closed"
+    "LINUX_FUTEX PortalResult scenario=expire action=WakeCommit sender=512 opcode=0x4c600020 authority_epoch=101 scope=41 effect=2 task=511 operation=2 address_space=601 generation=1 address=0x401000 binding_epoch=1 result=StaleAuthority mutation=false"
+    "LINUX_FUTEX ClosureAbort scenario=expire phase=terminalize terminalizations=2 delivery=Aborted linux_errno=none wakers_taken=2 credits_returned=false pending=true"
+    "LINUX_FUTEX ClosureAbort scenario=expire phase=wake_outside_lock wait=true wake=true resumed=false"
+    "LINUX_FUTEX ClosureAbort scenario=expire phase=account abort_wakes=2 credits=wait+wake+timer:Free pending=false etimedout=false"
+    "LINUX_FUTEX RevokeComplete scenario=expire result=Applied queue=0 live=0 blocked=0 wakers=0 pending=false credits=wait+wake+timer:Free terminalizations=2"
+    "LINUX_FUTEX_SCENARIO PASS scenario=expire terminalizations=2 wait_credit=Free wake_credit=Free timer_credit=Free queue=0 live=0 blocked=0 wakers=0 smp=1"
+    "LINUX_FUTEX_SLICE PASS scenarios=recover+expire mismatch_eagain=true crash_rebind=true watchdog_expire=true committed_drain=true uncommitted_abort=true linux_timeout=false unified_registry=false smp=1"
+    "CSER REJECT_STALE action=Prepare authority_epoch=41 proposal_binding_epoch=1 current_binding_epoch=4 proposal_task=100"
     "IOMMU_PROBE PASS result=FAIL_CLOSED reason=IOTLB_INVALIDATION_UNAVAILABLE ostd=0.18.0 authority_epoch=41"
     "SPIKE_RESULT PASS"
 )
@@ -173,6 +228,12 @@ awk '
             fail("Linux crash has a non-numeric tick: " $0)
         linux_crash_tick = field("tick") + 0
     }
+    /^CSER Crash authority_epoch=41 previous_binding_epoch=3 binding_epoch=4 / {
+        futex_crashes++
+        if (field("tick") !~ /^[0-9]+$/)
+            fail("Linux futex crash has a non-numeric tick: " $0)
+        futex_crash_tick = field("tick") + 0
+    }
     /^CSER FallbackPick authority_epoch=41 binding_epoch=2 / {
         base_attempts_seen++
         if (field("tick") !~ /^[0-9]+$/ || field("selection_attempt") != base_attempts_seen)
@@ -199,6 +260,19 @@ awk '
             linux_pick_tick = field("tick") + 0
         }
     }
+    /^CSER FallbackPick authority_epoch=41 binding_epoch=4 / {
+        futex_attempts_seen++
+        if (field("tick") !~ /^[0-9]+$/ || field("selection_attempt") != futex_attempts_seen)
+            fail("Linux futex fallback attempts are not dense numeric ordinals: " $0)
+        if (field("selection_attempt") == "1")
+            futex_first_attempts++
+        if (!futex_pick_seen) {
+            futex_pick_seen = 1
+            if (field("task") != "500" || field("selection_attempt") != "1")
+                fail("Linux futex first pick was not task 500 on selection attempt 1: " $0)
+            futex_pick_tick = field("tick") + 0
+        }
+    }
     /^OSTD_PROBE PASS fallback_first_task=/ {
         base_passes++
         if ($0 !~ /^OSTD_PROBE PASS fallback_first_task=200 fallback_first_selection_attempt=1 observed_tick_delta=[0-9]+ tick_delta_diagnostic=true authority_epoch=41 binding_epoch=2$/)
@@ -211,21 +285,29 @@ awk '
             fail("malformed Linux fallback PASS: " $0)
         linux_reported_delta = field("observed_tick_delta") + 0
     }
+    /^LINUX_FUTEX_SCHEDULER PASS scenario=recover / {
+        futex_passes++
+        if ($0 !~ /^LINUX_FUTEX_SCHEDULER PASS scenario=recover policy=505 fallback_first_task=500 fallback_first_selection_attempt=1 observed_tick_delta=[0-9]+ tick_delta_diagnostic=true$/)
+            fail("malformed Linux futex fallback PASS: " $0)
+        futex_reported_delta = field("observed_tick_delta") + 0
+    }
     END {
         if (failed)
             exit 1
-        if (base_crashes != 1 || linux_crashes != 1)
-            fail("expected one base crash and one Linux crash")
-        if (!base_pick_seen || !linux_pick_seen)
+        if (base_crashes != 1 || linux_crashes != 1 || futex_crashes != 1)
+            fail("expected one base, one Linux, and one Linux futex scheduler crash")
+        if (!base_pick_seen || !linux_pick_seen || !futex_pick_seen)
             fail("missing first fallback pick")
-        if (base_first_attempts != 1 || linux_first_attempts != 1)
+        if (base_first_attempts != 1 || linux_first_attempts != 1 || futex_first_attempts != 1)
             fail("selection attempt 1 must appear exactly once in each binding epoch")
-        if (base_passes != 1 || linux_passes != 1)
-            fail("expected exactly one base and one Linux fallback PASS")
+        if (base_passes != 1 || linux_passes != 1 || futex_passes != 1)
+            fail("expected exactly one base, one Linux, and one Linux futex fallback PASS")
         if (base_pick_tick < base_crash_tick || base_reported_delta != base_pick_tick - base_crash_tick)
             fail("base fallback tick diagnostic does not match Crash -> first pick")
         if (linux_pick_tick < linux_crash_tick || linux_reported_delta != linux_pick_tick - linux_crash_tick)
             fail("Linux fallback tick diagnostic does not match Crash -> first pick")
+        if (futex_pick_tick < futex_crash_tick || futex_reported_delta != futex_pick_tick - futex_crash_tick)
+            fail("Linux futex fallback tick diagnostic does not match Crash -> first pick")
     }
 ' "$log"
 
@@ -281,10 +363,51 @@ require_exact_count() {
     fi
 }
 
+require_exact_line_count() {
+    local expected=$1
+    local line=$2
+    local description=$3
+    local actual
+    actual=$(awk -v wanted="$line" '
+        { sub(/\r$/, "") }
+        $0 == wanted { count++ }
+        END { print count + 0 }
+    ' "$log")
+    if [[ "$actual" -ne "$expected" ]]; then
+        echo "$description: expected $expected, observed $actual ($line)" >&2
+        exit 1
+    fi
+}
+
+require_regex_count() {
+    local expected=$1
+    local pattern=$2
+    local description=$3
+    local actual
+    actual=$(awk -v pattern="$pattern" '
+        { sub(/\r$/, "") }
+        $0 ~ pattern { count++ }
+        END { print count + 0 }
+    ' "$log")
+    if [[ "$actual" -ne "$expected" ]]; then
+        echo "$description: expected $expected, observed $actual ($pattern)" >&2
+        exit 1
+    fi
+}
+
+line_of_exact() {
+    local line=$1
+    awk -v wanted="$line" '
+        { sub(/\r$/, "") }
+        $0 == wanted { print NR }
+    ' "$log"
+}
+
 # The Projection oracle is deliberately scenario-aware.  It pairs every
 # compressed semantic state with its PortalResult, validates the complete token
 # identity and allowed order, and rejects any missing or additional receipt.
 awk -f "$script_dir/assert-linux-projections.awk" "$log"
+awk -f "$script_dir/assert-linux-futex.awk" "$log"
 
 require_exact_count 1 \
     'CSER PrepareScoped service=scheduler scheduler_authority_epoch=41 binding_epoch=2 workload_authority_epoch=91 scope=30 effect=0 proposal_task=400' \
@@ -377,6 +500,214 @@ require_exact_count 2 \
     'LINUX_REVOKE RevokeComplete parent_scope=30 scope=' \
     'unexpected additional or missing quiescent revoke completion'
 
+require_exact_count 1 \
+    'CSER PrepareScoped service=scheduler scheduler_authority_epoch=41 binding_epoch=3 workload_authority_epoch=101 scope=40 effect=1 proposal_task=500' \
+    'linux futex scheduler scoped proposal count mismatch'
+require_exact_count 1 \
+    'CSER CrashScoped service=scheduler scheduler_authority_epoch=41 binding_epoch=4 workload_authority_epoch=101 scope=40 effect=1 pending_scoped_cleared=true fallback=kernel_fifo' \
+    'linux futex scheduler scoped crash count mismatch'
+require_exact_count 1 \
+    'LINUX_FUTEX_SCHEDULER PASS scenario=recover' \
+    'linux futex scheduler fallback receipt count mismatch'
+
+require_exact_count 22 \
+    'LINUX_FUTEX PortalResult ' \
+    'linux futex PortalResult count mismatch'
+require_exact_count 22 \
+    'LINUX_FUTEX Projection ' \
+    'linux futex Projection count mismatch'
+
+require_exact_count 2 \
+    'LINUX_FUTEX Mismatch scenario=' \
+    'linux futex mismatch count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX Mismatch scenario=recover observed=0 expected=1 result=EAGAIN effect_created=false wait_credit_held=false mutation=false' \
+    'recover mismatch receipt count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX Mismatch scenario=expire observed=0 expected=1 result=EAGAIN effect_created=false wait_credit_held=false mutation=false' \
+    'expire mismatch receipt count mismatch'
+
+require_exact_count 2 \
+    'LINUX_FUTEX WaitRegister scenario=' \
+    'linux futex successful wait registration count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX WaitRegister scenario=recover observed=0 expected=0 atomic=true queue=1 wait_credit=Held vm_restored=true' \
+    'recover wait registration receipt count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX WaitRegister scenario=expire observed=0 expected=0 atomic=true queue=1 wait_credit=Held vm_restored=true' \
+    'expire wait registration receipt count mismatch'
+
+require_regex_count 2 \
+    '^LINUX_FUTEX Capture scenario=(recover|expire) kind=WAKE ' \
+    'linux futex WAKE capture count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX Capture scenario=recover kind=WAKE authority_epoch=101 scope=40 effect=2 task=501 operation=2 asid=600 generation=1 address=0x401000 binding_epoch=2 wake_credit=Held max_wake=1' \
+    'recover WAKE capture count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX Capture scenario=expire kind=WAKE authority_epoch=101 scope=41 effect=2 task=511 operation=2 asid=601 generation=1 address=0x401000 binding_epoch=1 wake_credit=Held max_wake=1' \
+    'expire WAKE capture count mismatch'
+
+require_exact_count 2 \
+    'LINUX_FUTEX Crash scenario=' \
+    'linux futex personality crash count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX Crash scenario=recover personality=502 previous_binding_epoch=1 binding_epoch=2 reason=real_user_page_fault fallback=kernel watchdog=armed cohort=1' \
+    'recover personality crash count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX Crash scenario=expire personality=512 previous_binding_epoch=1 binding_epoch=2 reason=real_user_page_fault fallback=kernel watchdog=armed cohort=2' \
+    'expire personality crash count mismatch'
+
+require_exact_line_count 1 \
+    'LINUX_FUTEX PortalResult scenario=recover action=Snapshot sender=504 opcode=0x4c600010 authority_epoch=101 scope=40 effect=0 task=504 operation=0 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=Applied mutation=true' \
+    'recover Snapshot success count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX PortalResult scenario=recover action=Ready sender=504 opcode=0x4c600011 authority_epoch=101 scope=40 effect=0 task=504 operation=0 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=Applied mutation=true' \
+    'recover Ready success count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX PortalResult scenario=recover action=Rebind sender=504 opcode=0x4c600012 authority_epoch=101 scope=40 effect=0 task=504 operation=0 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=Applied mutation=true' \
+    'recover Rebind success count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX PortalResult scenario=recover action=RecoverNext sender=504 opcode=0x4c600013 authority_epoch=101 scope=40 effect=0 task=504 operation=0 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=Applied mutation=false' \
+    'recover RecoverNext success count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX PortalResult scenario=recover action=Adopt sender=504 opcode=0x4c600014 authority_epoch=101 scope=40 effect=1 task=500 operation=1 address_space=600 generation=1 address=0x401000 binding_epoch=1 result=Applied mutation=true' \
+    'recover Adopt success count mismatch'
+
+require_exact_line_count 1 \
+    'LINUX_FUTEX WatchdogCancel scenario=recover effect=1 binding_epoch=2 timer_credit=Free queued_wait_retained=true' \
+    'recover watchdog cancellation count mismatch'
+require_regex_count 1 \
+    '^LINUX_FUTEX WatchdogExpire scenario=expire deadline=[0-9]+ authority_epoch=101 scope=41 cohort=2 linux_timeout=false$' \
+    'expire watchdog receipt count mismatch'
+
+require_exact_line_count 1 \
+    'LINUX_FUTEX PortalResult scenario=recover action=WakeCommit sender=504 opcode=0x4c600020 authority_epoch=101 scope=40 effect=2 task=501 operation=2 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=Applied mutation=true' \
+    'recover successful WakeCommit count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX WakeCommit scenario=recover selected_wait=1 frozen_count=1 queue_removed=true wake_credit=Held' \
+    'recover committed wake summary count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX PortalResult scenario=recover action=WakeCommit sender=504 opcode=0x4c600020 authority_epoch=101 scope=40 effect=2 task=501 operation=2 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=InvalidState mutation=false' \
+    'recover duplicate WakeCommit rejection count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX PortalResult scenario=recover action=WakeCommit sender=504 opcode=0x4c600020 authority_epoch=101 scope=40 effect=2 task=501 operation=2 address_space=600 generation=1 address=0x401000 binding_epoch=2 result=StaleAuthority mutation=false' \
+    'recover post-revoke WakeCommit rejection count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX PortalResult scenario=expire action=WakeCommit sender=512 opcode=0x4c600020 authority_epoch=101 scope=41 effect=2 task=511 operation=2 address_space=601 generation=1 address=0x401000 binding_epoch=1 result=StaleAuthority mutation=false' \
+    'expire post-revoke WakeCommit rejection count mismatch'
+
+require_exact_count 2 \
+    'LINUX_FUTEX RevokeBegin scenario=' \
+    'linux futex RevokeBegin count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX RevokeBegin scenario=recover reason=committed_wake_drain closed_epoch=101 authority_epoch=102 target=2 gate=closed' \
+    'recover RevokeBegin count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX RevokeBegin scenario=expire reason=recovery_watchdog_expired closed_epoch=101 authority_epoch=102 target=2 gate=closed' \
+    'expire RevokeBegin count mismatch'
+
+require_exact_count 3 \
+    'LINUX_FUTEX ClosurePublish scenario=recover phase=' \
+    'recover closure phase count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX ClosurePublish scenario=recover phase=terminalize terminalizations=2 wakers_taken=2 credits_returned=false pending=true' \
+    'recover terminalize closure phase count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX ClosurePublish scenario=recover phase=wake_outside_lock wait=true wake=true' \
+    'recover outside-lock wake phase count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX ClosurePublish scenario=recover phase=account publication=1 credits=wait+wake:Free pending=false' \
+    'recover publication accounting phase count mismatch'
+require_exact_count 1 \
+    'LINUX_FUTEX ClosurePublish scenario=recover phase=account publication=' \
+    'unexpected additional recover wake publication'
+
+require_exact_count 3 \
+    'LINUX_FUTEX ClosureAbort scenario=expire phase=' \
+    'expire closure phase count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX ClosureAbort scenario=expire phase=terminalize terminalizations=2 delivery=Aborted linux_errno=none wakers_taken=2 credits_returned=false pending=true' \
+    'expire terminalize closure phase count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX ClosureAbort scenario=expire phase=wake_outside_lock wait=true wake=true resumed=false' \
+    'expire outside-lock wake phase count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX ClosureAbort scenario=expire phase=account abort_wakes=2 credits=wait+wake+timer:Free pending=false etimedout=false' \
+    'expire abort accounting phase count mismatch'
+
+require_exact_count 2 \
+    'LINUX_FUTEX RevokeComplete scenario=' \
+    'linux futex RevokeComplete count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX RevokeComplete scenario=recover result=Applied queue=0 live=0 blocked=0 wakers=0 pending=false credits=wait+wake+timer:Free terminalizations=2' \
+    'recover final quiescent closure mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX RevokeComplete scenario=expire result=Applied queue=0 live=0 blocked=0 wakers=0 pending=false credits=wait+wake+timer:Free terminalizations=2' \
+    'expire final quiescent closure mismatch'
+
+require_exact_count 2 \
+    'LINUX_FUTEX GuestResume scenario=recover ' \
+    'recover guest resume count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX GuestResume scenario=recover role=waiter task=500 linux_result=0 done=true resumes=1' \
+    'recover waiter resume count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX GuestResume scenario=recover role=waker task=501 linux_result=1 done=true resumes=1' \
+    'recover waker resume count mismatch'
+require_exact_count 2 \
+    'LINUX_FUTEX GuestAbortExit scenario=expire ' \
+    'expire guest abort-exit count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX GuestAbortExit scenario=expire role=waiter task=510 delivery=Aborted resumed=false linux_errno_written=false ecanceled=false etimedout=false' \
+    'expire waiter abort-exit count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX GuestAbortExit scenario=expire role=waker task=511 delivery=Aborted resumed=false linux_errno_written=false ecanceled=false etimedout=false' \
+    'expire waker abort-exit count mismatch'
+
+# The two guest Tasks are independent after kernel-owned publication.  Their
+# relative order is scheduler-dependent, but both must consume exactly one
+# continuation after quiescent closure and before the scenario PASS.
+recover_close_line=$(line_of_exact \
+    'LINUX_FUTEX RevokeComplete scenario=recover result=Applied queue=0 live=0 blocked=0 wakers=0 pending=false credits=wait+wake+timer:Free terminalizations=2')
+recover_waiter_line=$(line_of_exact \
+    'LINUX_FUTEX GuestResume scenario=recover role=waiter task=500 linux_result=0 done=true resumes=1')
+recover_waker_line=$(line_of_exact \
+    'LINUX_FUTEX GuestResume scenario=recover role=waker task=501 linux_result=1 done=true resumes=1')
+recover_pass_line=$(line_of_exact \
+    'LINUX_FUTEX_SCENARIO PASS scenario=recover terminalizations=2 wait_credit=Free wake_credit=Free timer_credit=Free queue=0 live=0 blocked=0 wakers=0 smp=1')
+if (( recover_waiter_line <= recover_close_line || recover_waiter_line >= recover_pass_line ||
+      recover_waker_line <= recover_close_line || recover_waker_line >= recover_pass_line )); then
+    echo 'recover guest completion escaped the RevokeComplete -> scenario PASS interval' >&2
+    exit 1
+fi
+
+expire_close_line=$(line_of_exact \
+    'LINUX_FUTEX RevokeComplete scenario=expire result=Applied queue=0 live=0 blocked=0 wakers=0 pending=false credits=wait+wake+timer:Free terminalizations=2')
+expire_waiter_line=$(line_of_exact \
+    'LINUX_FUTEX GuestAbortExit scenario=expire role=waiter task=510 delivery=Aborted resumed=false linux_errno_written=false ecanceled=false etimedout=false')
+expire_waker_line=$(line_of_exact \
+    'LINUX_FUTEX GuestAbortExit scenario=expire role=waker task=511 delivery=Aborted resumed=false linux_errno_written=false ecanceled=false etimedout=false')
+expire_pass_line=$(line_of_exact \
+    'LINUX_FUTEX_SCENARIO PASS scenario=expire terminalizations=2 wait_credit=Free wake_credit=Free timer_credit=Free queue=0 live=0 blocked=0 wakers=0 smp=1')
+if (( expire_waiter_line <= expire_close_line || expire_waiter_line >= expire_pass_line ||
+      expire_waker_line <= expire_close_line || expire_waker_line >= expire_pass_line )); then
+    echo 'expire guest completion escaped the RevokeComplete -> scenario PASS interval' >&2
+    exit 1
+fi
+
+require_exact_count 2 \
+    'LINUX_FUTEX_SCENARIO PASS scenario=' \
+    'linux futex scenario PASS count mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX_SCENARIO PASS scenario=recover terminalizations=2 wait_credit=Free wake_credit=Free timer_credit=Free queue=0 live=0 blocked=0 wakers=0 smp=1' \
+    'recover final scenario closure mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX_SCENARIO PASS scenario=expire terminalizations=2 wait_credit=Free wake_credit=Free timer_credit=Free queue=0 live=0 blocked=0 wakers=0 smp=1' \
+    'expire final scenario closure mismatch'
+require_exact_line_count 1 \
+    'LINUX_FUTEX_SLICE PASS scenarios=recover+expire mismatch_eagain=true crash_rebind=true watchdog_expire=true committed_drain=true uncommitted_abort=true linux_timeout=false unified_registry=false smp=1' \
+    'linux futex slice PASS count mismatch'
+
 guest_exit_line=$(grep -nF -m1 \
     'LINUX_GUEST Exit workload=linux-hello status=0 resumed_after_exit=false terminal=Exited' \
     "$log" | cut -d: -f1 || true)
@@ -407,6 +738,11 @@ for forbidden in \
     'entry_publication=eager' \
     'permissions=RWX' \
     'wx=true' \
+    'linux_timeout=true' \
+    'etimedout=true' \
+    'ecanceled=true' \
+    'LINUX_FUTEX GuestResume scenario=expire' \
+    'GUEST_FAIL' \
     'Linux personality rejected an unexpected Linux syscall snapshot' \
     'unknown Linux personality' \
     'unknown Linux code pager' \
@@ -417,5 +753,15 @@ for forbidden in \
         exit 1
     fi
 done
+
+if grep -Eiq '(^|[[:space:]])panic([!:.[:space:]]|$)|panicked at' "$log"; then
+    echo "forbidden serial evidence: panic" >&2
+    exit 1
+fi
+
+if grep -Eiq '(^|[^[:alnum:]_])(requeue|clone)([^[:alnum:]_]|$)' "$log"; then
+    echo "forbidden serial evidence: requeue or clone" >&2
+    exit 1
+fi
 
 echo "serial assertions: PASS"
