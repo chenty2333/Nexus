@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source_root=$(find /root/.cargo/registry/src -path '*/ostd-0.18.0/src/mm/dma/util.rs' -print -quit)
+source_root=$(find "${CARGO_HOME:-/root/.cargo}/registry/src" \
+    -path '*/ostd-0.18.0/src/mm/dma/util.rs' -print -quit)
 if [[ -z "$source_root" ]]; then
     echo "ostd 0.18.0 source was not fetched" >&2
     exit 1

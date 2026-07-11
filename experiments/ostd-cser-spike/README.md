@@ -8,6 +8,8 @@ OSTD? It is deliberately outside the legacy Nexus workspace.
 
 - OSTD: `=0.18.0` from crates.io
 - cargo-osdk: `=0.18.0`
+- cargo-osdk 0.18.0 crate SHA-256:
+  `726c0c05c18c46b783bd86060f775560609a0bf4696bd0cc2d8f265d59aa3764`
 - Rust: `nightly-2026-04-03`
 - Official OSDK image: `asterinas/osdk:0.18.0-20260603`, pinned to the amd64
   manifest digest in `Dockerfile`
@@ -31,6 +33,34 @@ The narrower commands are `./x check`, `./x build`, `./x run`, and
 `./x iommu-probe`. The serial transcript is written to
 `artifacts/serial.log`; `scripts/assert-serial.sh` verifies both required
 events and their ordering.
+
+### Reproducible OSDK runner graph
+
+Cargo-OSDK 0.18 generates a separate `*-run-base` Cargo workspace for
+`build` and `run`. Its CLI does not propagate `--locked` to that generated
+workspace, so relying on a project `Cargo.lock` alone would still resolve the
+runner's transitive dependencies to the newest compatible versions.
+
+`osdk-runner-base/` is a reviewed snapshot derived from the Run base emitted
+by the pinned `cargo-osdk 0.18.0` tool (and therefore follows that tool's
+MPL-2.0 provenance). It contains the generated manifest, entry point, linker
+scripts, and its own lockfile; trailing whitespace in the linker scripts is
+normalized for the repository. Before every build, `./x` installs the
+snapshot at the path Cargo-OSDK would generate. Cargo-OSDK reuses it only when
+its generated manifest and entry point are identical; after both `build` and
+`run`, `./x` requires the complete directory to remain byte-for-byte
+unchanged. The Docker image performs the same check while priming the
+dependency graph.
+
+If an OSDK upgrade legitimately changes this workspace, regenerate the
+snapshot with that pinned version, review the full diff (including dependency
+versions and linker scripts), and update the image key inputs together. Do not
+refresh only the lockfile or accept a `Locking ... packages to latest
+compatible versions` build as reproducible evidence.
+
+The development image may use the network only while it is built. Normal
+checks run as the invoking host UID with the project lockfile mounted
+read-only, Cargo offline mode enabled, and Docker networking disabled.
 
 ## What is exercised
 

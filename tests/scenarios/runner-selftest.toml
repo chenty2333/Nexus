@@ -1,0 +1,30 @@
+schema_version = 1
+
+[[scenario]]
+id = "runner.selftest"
+command = [
+  "sh",
+  "-c",
+  "printf 'BOOT\nREADY exact=7 bounded=3\nDONE\n'",
+]
+timeout_ms = 1000
+max_output_bytes = 65536
+expected_exit = 0
+
+[scenario.serial]
+expect = ["READY", "exact=7"]
+ordered = ["BOOT", "READY", "DONE"]
+forbid = ["PANIC", "ASSERTION FAILED"]
+
+[[scenario.numeric]]
+key = "exact"
+exact = 7
+
+[[scenario.numeric]]
+key = "bounded"
+min = 2
+max = 4
+
+[scenario.artifacts]
+retain = "never"
+serial = "serial.log"

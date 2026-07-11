@@ -1,0 +1,11 @@
+.git
+.direnv
+target
+**/target
+**/artifacts
+**/mutants.out*
+**/fuzz/corpus
+**/fuzz/artifacts
+experiments/ostd-cser-spike/guest/probe.bin
+result
+result-*

@@ -2,7 +2,22 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")" && pwd)
-image=nexus/ostd-cser-spike:0.18.0
+image_key=$(sha256sum \
+    "$root/Dockerfile" \
+    "$root/.dockerignore" \
+    "$root/Cargo.toml" \
+    "$root/Cargo.lock" \
+    "$root/OSDK.toml" \
+    "$root/rust-toolchain.toml" \
+    "$root/osdk-runner-base/Cargo.toml" \
+    "$root/osdk-runner-base/Cargo.lock" \
+    "$root/osdk-runner-base/src/main.rs" \
+    "$root/osdk-runner-base/x86_64.ld" \
+    "$root/osdk-runner-base/riscv64.ld" \
+    "$root/osdk-runner-base/loongarch64.ld" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+image="nexus/ostd-cser-spike:$image_key"
+runner_base="$root/osdk-runner-base"
+runner_target="$root/target/osdk/ostd-cser-spike-run-base"
 
 build_image() {
     docker build --platform linux/amd64 -t "$image" "$root"
@@ -11,14 +26,19 @@ build_image() {
 container() {
     docker run --rm \
         --platform linux/amd64 \
+        --network none \
+        --user "$(id -u):$(id -g)" \
+        --env HOME=/tmp/nexus-home \
+        --tmpfs /tmp/nexus-home:rw,exec,nosuid,size=64m,mode=1777 \
         -v "$root:/work:z" \
+        --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         -w /work \
         "$image" \
         "$@"
 }
 
 ensure_image() {
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
+    if [[ ${NEXUS_REBUILD:-0} == 1 ]] || ! docker image inspect "$image" >/dev/null 2>&1; then
         build_image
     fi
 }
@@ -27,8 +47,45 @@ prepare_guest() {
     container bash scripts/build-guest.sh
 }
 
+check_kernel() {
+    # cargo-osdk 0.18 does not expose --locked on build/run. Gate the project
+    # lockfile explicitly before every build; it is also over-mounted read-only
+    # so build/run cannot rewrite it. The separate generated runner graph is
+    # fixed by the committed osdk-runner-base snapshot below.
+    container cargo osdk check --locked
+}
+
+prepare_runner_base() {
+    rm -rf "$runner_target"
+    mkdir -p "$(dirname "$runner_target")"
+    cp -a "$runner_base" "$runner_target"
+    # Fail at the attempted rewrite, not merely at the post-build diff, if
+    # cargo-osdk stops reusing this exact Run base.
+    chmod a-w "$runner_target/Cargo.lock"
+}
+
+assert_runner_base() {
+    diff -ru "$runner_base" "$runner_target"
+}
+
+build_kernel() {
+    check_kernel
+    prepare_runner_base
+    container cargo osdk build
+    assert_runner_base
+}
+
 run_kernel() {
-    container timeout --signal=TERM --kill-after=2s 30s cargo osdk run
+    # Keep compilation outside the runtime deadline. On a cold CI worker the
+    # OSDK wrapper and ISO build can consume nearly all of 30 seconds before
+    # QEMU starts, which would turn a build-time variance into a false runtime
+    # timeout.
+    build_kernel
+    container bash -c '
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        exec timeout --signal=TERM --kill-after=2s 30s cargo osdk run
+    '
+    assert_runner_base
 }
 
 command=${1:-test}
@@ -39,12 +96,12 @@ case "$command" in
     check)
         ensure_image
         prepare_guest
-        container cargo osdk check --locked
+        check_kernel
         ;;
     build)
         ensure_image
         prepare_guest
-        container cargo osdk build
+        build_kernel
         ;;
     iommu-probe)
         ensure_image
@@ -60,14 +117,13 @@ case "$command" in
         ensure_image
         prepare_guest
         mkdir -p "$root/artifacts"
-        container cargo osdk check --locked
         container bash scripts/check-iotlb-gap.sh
         run_kernel | tee "$root/artifacts/serial.log"
         "$root/scripts/assert-serial.sh" "$root/artifacts/serial.log"
         ;;
     clean)
-        ensure_image
-        container rm -rf target artifacts guest/probe.bin
+        # Do not make cleanup depend on Docker or on a prebuilt image.
+        rm -rf "$root/target" "$root/artifacts" "$root/guest/probe.bin"
         ;;
     *)
         echo "usage: ./x {image|check|build|iommu-probe|run|test|clean}" >&2

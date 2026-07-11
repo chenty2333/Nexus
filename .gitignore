@@ -29,10 +29,10 @@ result-*
 references/Axle*
 references/Nexus*
 AGENTS.md
-Cargo.lock
 README.md
 !crates/cser-model/README.md
 !specs/cser/README.md
+!tests/guest/linux/README.md
 
 # Fuzzing outputs
 **/fuzz/corpus/
