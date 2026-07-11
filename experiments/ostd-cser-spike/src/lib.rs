@@ -7,6 +7,7 @@ extern crate alloc;
 
 mod effect;
 mod iommu_probe;
+mod pager;
 mod scheduler;
 
 use alloc::{boxed::Box, sync::Arc};
@@ -20,7 +21,10 @@ use ostd::{
     },
     power::{ExitCode, poweroff},
     prelude::*,
-    task::{Task, TaskOptions, disable_preempt, scheduler as ostd_scheduler},
+    task::{
+        Task, TaskOptions, disable_preempt, inject_post_schedule_handler,
+        scheduler as ostd_scheduler,
+    },
     user::{ReturnReason, UserMode},
 };
 use scheduler::{CserScheduler, FALLBACK_BOUND_TICKS, ProposalResult};
@@ -29,18 +33,18 @@ const AUTHORITY_EPOCH: u64 = 41;
 const POLICY_LEASE_TICKS: u64 = 64;
 const USER_TASK_ID: u64 = 100;
 const FALLBACK_TASK_ID: u64 = 200;
-const USER_MAP_ADDR: Vaddr = 0x0040_0000;
+pub(crate) const USER_MAP_ADDR: Vaddr = 0x0040_0000;
 const EXPECTED_FAULT_ADDR: Vaddr = 0x0080_0000;
 const FAULTING_LOAD_LEN: usize = 3;
 const SYSCALL_PROBE: usize = 0x4353_4552;
 
 pub struct TaskData {
-    id: u64,
-    vm_space: Option<Arc<VmSpace>>,
+    pub(crate) id: u64,
+    pub(crate) vm_space: Option<Arc<VmSpace>>,
 }
 
 impl TaskData {
-    fn new(id: u64, vm_space: Option<Arc<VmSpace>>) -> Self {
+    pub(crate) fn new(id: u64, vm_space: Option<Arc<VmSpace>>) -> Self {
         Self { id, vm_space }
     }
 }
@@ -52,6 +56,7 @@ fn kernel_main() {
         POLICY_LEASE_TICKS,
     )));
     ostd_scheduler::inject_scheduler(scheduler);
+    inject_post_schedule_handler(activate_current_task_vm);
 
     let binding = scheduler.binding();
     println!(
@@ -86,7 +91,19 @@ fn kernel_main() {
     unreachable!("bootstrap context is not scheduled again");
 }
 
-fn create_vm_space(program: &[u8]) -> VmSpace {
+fn activate_current_task_vm() {
+    let Some(current) = Task::current() else {
+        return;
+    };
+    let Some(data) = current.data().downcast_ref::<TaskData>() else {
+        return;
+    };
+    if let Some(vm_space) = &data.vm_space {
+        vm_space.activate();
+    }
+}
+
+pub(crate) fn create_vm_space(program: &[u8]) -> VmSpace {
     let page_count = program.len().div_ceil(PAGE_SIZE);
     let segment = FrameAllocOptions::new()
         .alloc_segment(page_count)
@@ -103,7 +120,7 @@ fn create_vm_space(program: &[u8]) -> VmSpace {
             &(USER_MAP_ADDR..USER_MAP_ADDR + page_count * PAGE_SIZE),
         )
         .expect("create user mapping cursor");
-    let property = PageProperty::new_user(PageFlags::RWX, CachePolicy::Writeback);
+    let property = PageProperty::new_user(PageFlags::RX, CachePolicy::Writeback);
     for frame in segment {
         cursor.map(frame.into(), property);
     }
@@ -206,13 +223,6 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
         scheduler.propose(crashed_binding, USER_TASK_ID),
         ProposalResult::RejectNoSupervisor
     );
-    let new_binding = scheduler.rebind(AUTHORITY_EPOCH);
-    assert_eq!(new_binding.binding_epoch, old_binding.binding_epoch + 1);
-    assert_eq!(
-        scheduler.propose(old_binding, USER_TASK_ID),
-        ProposalResult::RejectStale
-    );
-
     let wait_token = EffectToken {
         authority_epoch: AUTHORITY_EPOCH,
         scope_id: 9,
@@ -220,7 +230,7 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     };
     println!(
         "CSER Register authority_epoch={} binding_epoch={} effect=wait effect_id={}",
-        AUTHORITY_EPOCH, new_binding.binding_epoch, wait_token.effect_id,
+        AUTHORITY_EPOCH, crashed_binding.binding_epoch, wait_token.effect_id,
     );
     let (waiter, waker) = EffectWaiter::new_pair(wait_token);
     assert_eq!(waiter.token(), wait_token);
@@ -235,7 +245,7 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     };
     println!(
         "CSER Register authority_epoch={} binding_epoch={} effect=timer effect_id={}",
-        AUTHORITY_EPOCH, new_binding.binding_epoch, timer_token.effect_id,
+        AUTHORITY_EPOCH, crashed_binding.binding_epoch, timer_token.effect_id,
     );
     let timer = EffectTimer::after(timer_token, 1);
     assert_eq!(timer.token(), timer_token);
@@ -244,6 +254,18 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     println!(
         "OSTD_PROBE PASS wrappers=wait+timer carry_effect_token=true authority_epoch={}",
         AUTHORITY_EPOCH,
+    );
+
+    // Keep the scheduler in its kernel-owned FIFO fallback while pager tasks
+    // block and wake one another. Pager service binding epochs are independent
+    // from this scheduler-policy binding.
+    pager::run_pager_slices();
+
+    let new_binding = scheduler.rebind(AUTHORITY_EPOCH);
+    assert_eq!(new_binding.binding_epoch, old_binding.binding_epoch + 1);
+    assert_eq!(
+        scheduler.propose(old_binding, USER_TASK_ID),
+        ProposalResult::RejectStale
     );
 
     let dma_token = EffectToken {

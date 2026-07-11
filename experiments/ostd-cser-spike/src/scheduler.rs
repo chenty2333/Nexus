@@ -115,6 +115,7 @@ impl CserScheduler {
         );
         queue.mode = PolicyMode::Bound;
         queue.pending = None;
+        queue.lease_deadline_tick = queue.tick.saturating_add(queue.lease_ticks);
         println!(
             "CSER Rebind authority_epoch={} binding_epoch={}",
             queue.binding.authority_epoch, queue.binding.binding_epoch,
@@ -173,6 +174,7 @@ struct CserRunQueue {
     pending: Option<Proposal>,
     mode: PolicyMode,
     tick: u64,
+    lease_ticks: u64,
     lease_deadline_tick: u64,
     crash_tick: Option<u64>,
     fallback_pick_tick: Option<u64>,
@@ -190,6 +192,7 @@ impl CserRunQueue {
             pending: None,
             mode: PolicyMode::Bound,
             tick: 0,
+            lease_ticks,
             lease_deadline_tick: lease_ticks,
             crash_tick: None,
             fallback_pick_tick: None,

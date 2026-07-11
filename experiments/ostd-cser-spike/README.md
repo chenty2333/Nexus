@@ -1,8 +1,10 @@
 # OSTD/OSDK 0.18 CSER spike
 
-This experiment answers a narrow architecture question: can Nexus place a
-CSER-aware scheduler and user-mode boundary on OSTD 0.18 without modifying
-OSTD? It is deliberately outside the legacy Nexus workspace.
+This experiment answers two narrow architecture questions without modifying
+OSTD 0.18: can Nexus place a CSER-aware scheduler at OSTD's public scheduling
+boundary, and can a kernel-owned fault continuation survive a user-space pager
+crash and be explicitly adopted by a fresh pager? It is deliberately outside
+the legacy Nexus workspace.
 
 ## Pinned environment
 
@@ -83,12 +85,67 @@ read-only, Cargo offline mode enabled, and Docker networking disabled.
 6. Thin wrappers around OSTD `Waiter`/`Waker` and `Jiffies` preserve an
    `EffectToken`; the wait pair is exercised at runtime.
 
-This proves API fit for a one-CPU spike. It does not prove the future SMP
-scheduler protocol, policy fairness, pager recovery, or end-to-end revocation.
+### Pager crash/rebind slice
 
-`./x` assembles `guest/probe.S` before invoking OSDK. This intentionally avoids
-a Cargo build script: cargo-osdk 0.18 recognizes a kernel only when its package
-has exactly one Cargo target, so adding `build.rs` makes kernel discovery fail.
+The pager probe runs while the scheduler remains in its kernel FIFO fallback;
+the pager binding and pager fallback state are independent of the scheduler
+binding and scheduler fallback policy. It exercises two scenarios:
+
+- In `recover`, a client takes a real user-mode not-present read fault and
+  blocks on a kernel-held continuation. Pager v1 prepares a kernel-owned zero
+  frame and then takes its own real page fault. The crash advances only the
+  pager binding epoch, closes the reply gate, and retains the prepared frame.
+  A kernel predicate probe rejects the shape of a late v1 commit before VM
+  mutation. A freshly constructed v2 task, `VmSpace`, and task-local `UserMode`
+  exercise the experiment's boolean recovery-snapshot/ready handshake. Before
+  `Rebind`, a kernel no-supervisor predicate probe rejects the current-binding
+  commit shape. Rebind attaches v2 without a second epoch advance and returns
+  the pager fallback to `Standby`; another kernel predicate probe rejects the
+  old binding after rebind. V2 must explicitly `RecoverNext` and `Adopt` before
+  it can map the retained frame into the client's address space. The kernel
+  issues, dispatches, and synchronizes the local TLB flush, terminalizes the
+  continuation once, and wakes the client outside the state lock. The unchanged
+  fault RIP is retried and reads zero. The snapshot flag is an ordering witness,
+  not serialized or reconstructed pager policy state, and the rejection probes
+  are not replayed user-space capability messages.
+- In `timeout`, no replacement pager is started. A kernel watchdog advances
+  the authority epoch and first publishes only `Closing`: the reply gate is
+  closed, the retained frame and waker are removed from shared state, cleanup
+  is marked in flight, and the frame credit remains held. It then drops the
+  frame outside the pager-state lock, publishes the single abort notification
+  authorized by the `FaultPhase` gate, and immediately destroys the local waker
+  object while the scope is still `Closing` and the credit is still held. Only a
+  second locked transition may confirm both obligations, return the credit,
+  clear the cleanup/wake markers, and publish `Revoked`; `RevokeComplete` is
+  emitted after that transition. Thus `RevokeComplete` cannot precede either
+  actual retained-resource cleanup or terminal wake publication. A client that
+  is scheduled immediately after the wake waits for closure publication before
+  announcing its cooperative exit.
+
+The continuation's authoritative one-shot property is enforced by Nexus's
+`FaultPhase`/terminalization gate, not by OSTD's `Waker`: OSTD permits a waiter
+to be armed again after a wait consumes a wake. The serial oracle therefore
+checks exactly one successful completion, exactly one timeout abort, and three
+kernel predicate probes: post-crash stale, pre-rebind no-supervisor, and
+post-rebind stale. It also forbids timeout commit/resume, panic, and unexpected
+scheduler epoch advance.
+
+This is evidence for API fit and the stated transitions, not a production
+pager. It is single-CPU, uses one client and a zero-page mapping, and exercises
+only a local TLB synchronization path. The fault-page address deliberately
+shares an existing 2 MiB page-table region with the guest code; OSTD's public
+map path can still `unwrap` if an intermediate page-table allocation runs out
+of memory. The watchdog polls `Jiffies` rather than using a production timer.
+OSTD exposes no arbitrary public task-kill/join primitive here, so pager v1
+returns from its closure after the real fault and the aborted client exits
+after it is woken. SMP shootdown, arbitrary pager policies, multi-client
+recovery, swap/file-backed paging, and production multi-effect or cross-service
+revocation remain outside this slice.
+
+`./x` assembles the scheduler probe and three pager programs under `guest/`
+before invoking OSDK. This intentionally avoids a Cargo build script:
+cargo-osdk 0.18 recognizes a kernel only when its package has exactly one Cargo
+target, so adding `build.rs` makes kernel discovery fail.
 
 ## IOMMU result: fail closed
 

@@ -7,11 +7,12 @@ already demonstrated. The evidence terms **Specified**, **Checked**,
 **Observed**, **Planned**, and **Candidate contribution** have the meanings in
 `VISION.md`.
 
-For operations covered by the current model, `specs/cser/Cser.tla` is the
-semantic source of truth and `crates/cser-model` is its executable oracle. A
-future implementation must refine those operations or change the model first;
+For baseline operations, `specs/cser/Cser.tla` is the semantic source of truth;
+`specs/cser/PagerCser.tla` is the explicit pager successor refinement.
+`crates/cser-model` provides the corresponding executable oracles. A future
+implementation must refine those operations or change the relevant model first;
 it must not silently redefine their linearization points. Sections marked
-planned extend beyond the current finite model.
+planned extend beyond the current finite models.
 
 ## System boundary
 
@@ -311,53 +312,127 @@ Limitations:
 
 ## Vertical slice 2: pager recovery
 
-Status: **Planned**.
+Status: **bounded slice complete / Observed** in the pinned one-CPU OSTD 0.18
+experiment. This is not a production pager claim.
 
-### One-shot fault continuation
+### Pager protocol refinement
 
-When a user thread faults, the kernel suspends it and registers a continuation:
+When a user thread faults, the kernel suspends it and registers a continuation
+whose token binds all three independent generations:
 
 ```text
-FaultContinuation {
-    effect_token
-    faulting_thread
-    address_and_access
-    address_space_generation
-    state: Pending | Resolved | Aborted
+FaultToken {
+    scope, fault
+    authority_epoch, binding_epoch
+    address_space, address_space_generation
+    thread, page, access
 }
+
+Registered -> Prepared -> Committed -> Completed
+     |            |
+     +------------+--Abort (Closing or stale-AS only)--> Aborted
+
+Registered/Prepared --SatisfyMapped(current mapping)--> Completed
+
+Adopt(Registered | Prepared): binding ownership old -> replacement;
+                              fault state unchanged
 ```
 
-The security representation is a one-shot reply authority. A resolve operation
-must atomically validate the token and proposed mapping, install the mapping,
-consume the continuation, and make the thread eligible to resume. The precise
-PTE/TLB publication step will be the pager effect's concrete `Commit` and must
-be specified before implementation.
+`Crash` advances only the binding epoch, `TimeoutRevoke` advances only the
+authority epoch, and an address-space mutation advances only the mapping-policy
+generation. `Ready`, `Rebind`, and `Adopt` advance none of them. A prepared frame
+belongs to the fault effect, not to the pager process, so it may survive a
+binding crash and be adopted explicitly by a ready replacement. In the
+specification and Rust oracle, `Adopt` changes only the binding ownership of a
+`Registered` or `Prepared` fault; it does not create another fault state.
 
-Required behavior:
+The pager refinement defines `Commit` as one atomic transition that revalidates
+the scope state, all three generations, the replacement binding, continuation
+state, frame ownership, and empty PTE slot before consuming the continuation and
+publishing the mapping. `Complete` publishes one successful wake. If two faults
+target the same slot and generation, only one publishes a PTE; kernel
+`SatisfyMapped` completes the loser from the existing mapping and releases a
+redundant frame. Address-space mutation waits for committed continuations to
+complete, removes the current mapping, returns its resource credit, and retains
+publication history before advancing the generation.
 
-- resolve or abort consumes the continuation exactly once;
-- a token cannot reply to another thread, address space, or fault generation;
-- a stale pager binding cannot resolve a fault after crash;
-- a replacement cannot reply before ready/rebind;
-- each eligible old, uncommitted continuation requires explicit adoption;
-- timeout or unrecoverable policy failure aborts deterministically, for example
-  by delivering a fault outcome or terminating the affected task, rather than
-  leaving it suspended forever;
-- revoke and resolve races obey the same commit gate as the abstract effect.
+The first live fault arms a kernel deadline batch. Pager crash/rebind cannot
+rewind it, and a fault arriving while no pager is bound fails fast rather than
+joining a hidden outage queue. If an expired batch still has uncommitted work,
+`TimeoutRevoke` competes with `Commit` on the same `Active` gate and kernel-owned
+closure aborts or completes every member before `RevokeComplete`. The pager is
+not assumed fair and no replacement is assumed to appear.
 
-Before this slice passes its gate, the TLA+/Rust models must be extended with
-the chosen continuation states, and QEMU injection must cover crash before
-delivery, after delivery, around adoption, immediately before mapping commit,
-and after commit but before reply acknowledgement.
+### Checked and executable evidence
 
-The kernel fallback for pager loss is intentionally not a second general pager.
-Its minimum obligation is bounded, safe terminalization. Any zero-fill or
-emergency mapping behavior would be an explicit policy decision and is not
-currently assumed.
+- TLC completed the committed pager graph with no error: 17,150 generated
+  states, 7,528 distinct states, zero queued states, depth 17, and ten checked
+  temporal-property branches.
+- The safe-Rust pager oracle has 12 deterministic tests and five proptests, each
+  configured for 64 cases, covering the same-page, generation, crash/rebind,
+  deadline, terminalization, frame, and credit rules.
+- Four small Loom surrogate models cover commit versus timeout, adopt versus
+  timeout and a stale reply, complete/abort/duplicate reply ownership of one
+  wake authority, and the three-stage closure publication order. They do not
+  execute the OSTD pager or prove PTE/TLB/SMP behavior.
+- The pinned QEMU spike has `recover` and `timeout` scenarios. These are concrete
+  implementation observations, not substitutes for the bounded model or an SMP
+  concurrency check.
+
+### Observed OSTD path
+
+In `recover`, one client takes a real not-present read fault and waits on a
+kernel-held continuation. Pager v1 prepares a kernel-owned zero frame and then
+crashes through its own real page fault. The kernel advances pager binding epoch
+1 to 2, retains the frame, and keeps the scheduler's FIFO fallback independent
+from pager fallback. A fresh pager-v2 `Task`, `VmSpace`, and `UserMode` performs
+the snapshot/ready/rebind sequence, explicitly recovers and adopts the fault,
+publishes the client PTE, synchronizes the local TLB, and wakes the client once;
+the unchanged RIP retries and reads zero.
+
+In `timeout`, the observed QuiescentClosure ordering is deliberately split into
+three phases:
+
+1. under the state lock, publish `Closing`, advance authority epoch 71 to 72,
+   close the reply gate, remove the frame and waker from shared state, mark
+   cleanup and wake obligations in flight, and keep the frame credit held;
+2. outside the lock, drop the frame, publish the abort wake, and immediately
+   drop the local waker object while the scope is still `Closing`;
+3. under the lock again, confirm cleanup and wake publication, return the
+   credit, clear both obligations, and enter `Revoked`; emit `RevokeComplete`
+   only after that transition.
+
+The serial oracle requires one terminalization in each scenario and forbids a
+timeout commit/resume, duplicate completion, panic, or scheduler-epoch change.
+
+### Boundaries not crossed
+
+- The target security representation is an unforgeable one-shot reply handle;
+  this spike uses Nexus state predicates and a `FaultPhase` terminalization gate.
+  OSTD's reusable `Waker` is not itself one-shot authority.
+- The recovery snapshot is only a boolean handshake plus traced fault metadata,
+  not serialized or reconstructed pager policy state.
+- Pre-rebind and stale-reply rejection are kernel-invoked predicate probes, not
+  delayed user-space capability messages traversing a real portal.
+- The OSTD probe uses an internal `Adopted` phase marker before its single
+  commit. That is an implementation refinement of the model's adopted-but-still
+  uncommitted `Prepared` state, not a new normative fault state.
+- The implementation is single-CPU, single-client, zero-page-only, and performs
+  only local TLB synchronization. The spec/model's same-page contention and
+  address-space generation changes are not exercised by the QEMU slice.
+- OSTD's public map path may internally `unwrap` if intermediate page-table
+  allocation fails. The spike has no arbitrary task-kill primitive, SMP
+  shootdown, multi-client recovery, file-backed paging, COW, swap, eviction, or
+  durable pager reconstruction.
+
+The completed bounded gate fixes the first-slice semantics; it does not remove
+the need for later system fault injection around every response boundary or for
+an SMP refinement. Pager fallback remains a bounded terminalization mechanism,
+not a second general pager.
 
 ## Vertical slice 3: mediated VirtIO and DMA closure
 
-Status: **Planned and blocked on the DMA ownership gate**.
+Status: **Planned; NO-GO while the DMA ownership gate remains open**.
 
 The service may construct and schedule an I/O request, but a Nexus-owned portal
 must validate its effect token, descriptors, budgets, pinned buffers, device,
@@ -371,12 +446,18 @@ registered -> descriptors prepared -> queue published -> device-owned
        +---- cancel ---+                    +-> complete or drain/reset
 ```
 
-For a split VirtIO queue, publication to the available ring and the point at
-which the device is notified are distinct machine operations. The concrete
-`Commit` must be defined per transport so that revocation cannot race through a
-gap between an epoch check, ring visibility, and notification. The design may
-choose a conservative earlier commit point; it may not claim cancellation once
-the device can observe the request.
+For the audited `virtio-drivers` 0.13 split-queue path, descriptor and available
+ring writes precede a fence and the `Release` store of `avail.idx`. A device may
+poll the queue, so `avail.idx` publication—not the later notification—is the
+first conservative `Commit` point. The Stage 5 model must serialize its epoch
+gate with that publication; it may not claim cancellation after the device can
+observe the new index.
+
+The first device slice is provisionally one service scope with exclusive use of
+one single-queue `virtio-blk-pci` device. Committed-request recovery therefore
+uses a bounded whole-device reset direction unless a separately negotiated and
+verified queue-reset contract exists. This is an initial isolation boundary,
+not a claim that whole-device reset is suitable for shared queues.
 
 Closure of committed I/O requires a backend-specific sequence equivalent to:
 
@@ -408,7 +489,8 @@ crate-private, so an external Nexus adapter cannot safely become a second VT-d
 owner. The current adapter therefore returns
 `IotlbInvalidationUnavailable` and never fabricates `Quiesced`.
 
-Before the I/O slice proceeds, Nexus must select and audit exactly one option:
+Before a real DMA-closure implementation proceeds or reports `Quiesced`, Nexus
+must select and audit exactly one option:
 
 1. upstream a public synchronous unmap/invalidate/wait API to OSTD;
 2. carry a small, isolated, reviewed OSTD patch implementing that contract; or
@@ -450,7 +532,10 @@ The pinned experiment observed public API fit for:
 - custom `Scheduler` and `LocalRunQueue` injection;
 - `Task`, a real `VmSpace`, and `UserMode` entry/return;
 - syscall and `CpuException::PageFault` returns;
-- wrappers around `Waiter`/`Waker` and `Jiffies` that retain an effect token.
+- wrappers around `Waiter`/`Waker` and `Jiffies` that retain an effect token;
+- one kernel-held prepared frame across pager crash/rebind, explicit adoption,
+  real PTE publication, local TLB synchronization, and the bounded timeout
+  closure ordering documented above.
 
 These mechanisms should be reused behind Nexus adapters. CSER state should not
 be patched into OSTD internals merely for convenience.
@@ -459,7 +544,8 @@ be patched into OSTD internals merely for convenience.
 
 - synchronous DMA unmap plus completed IOTLB invalidation;
 - SMP scheduler protocol and cross-CPU epoch publication;
-- pager continuation ownership and address-space generation fencing;
+- a production one-shot continuation handle, real recovery snapshot payload,
+  multi-client address-space mutation fencing, and SMP TLB shootdown;
 - device drain/reset and interrupt quiescence;
 - an end-to-end nested authority scope implementation.
 
@@ -491,7 +577,7 @@ Loom/Kani connect those abstractions to Rust implementation choices.
 
 ## Observability and fault injection
 
-The current TLA+ protocol names these ordered transition actions:
+The baseline `Cser.tla` protocol names these ordered transition actions:
 
 ```text
 Register Prepare Commit Complete RevokeBegin RevokeStep RevokeComplete
@@ -504,10 +590,26 @@ event. Scope creation is part of TLA+ `Init`, not a checked TLA+ transition, so
 graph. The OSTD spike emits only the subset it exercises and also records
 rejection outcomes such as stale or no-supervisor proposals.
 
-This difference is explicit rather than papered over as one already-unified
-vocabulary. Before a new kernel slice depends on scope creation/derivation,
-timeout, tombstone, reset, or other lifecycle events, those actions and fields
-must be normalized in the spec, Rust oracle, and implementation trace.
+The pager refinement deliberately preserves a mapping between backend-specific
+names rather than pretending every artifact emits an identical trace:
+
+| Concept | `PagerCser.tla` | Rust pager oracle | OSTD pager spike |
+| --- | --- | --- | --- |
+| address-space scope initialization | `Init` | `CreateAddressSpace` | scenario construction; no transition event |
+| zero-frame preparation | `PrepareZero` | `Prepare` | `PrepareZero` |
+| crash fallback and replacement | `Crash`, `KernelFallback`, `Ready`, `Rebind`, `Adopt` | same, with `FallbackPick` | `Crash`, `Fallback`, `RecoverySnapshot`, `Ready`, `Rebind`, `RecoverNext`, `Adopt` |
+| mapping publication and success | `Commit`, `Complete`, `SatisfyMapped` | same | `Commit`, `Complete`; `SatisfyMapped` not exercised |
+| mapping-policy generation | `AddressSpaceChange` | `AdvanceAddressSpaceGeneration` | not exercised |
+| expired uncommitted batch closes authority | `TimeoutRevoke` | `RevokeBegin` | `RevokeBegin` |
+| closing-fault cleanup | `Abort` | `Abort` or scope-index `RevokeStep` | `Abort` |
+| deadline and closure completion | `DeadlineCancel`, `DeadlineComplete`, `RevokeComplete` | early cancel may be fused; `DeadlineComplete`, `RevokeComplete` | only timeout `RevokeComplete` exercised |
+
+`RecoverySnapshot` and `RecoverNext` are OSTD handshake/probe events, not new
+normative fault states or TLA+ linearization points. Stage 4 permits these
+explicitly documented backend names while requiring the semantic mapping above.
+Before Stage 5 depends on tombstone, reset, invalidation, or other new lifecycle
+events, their fields and refinement mapping must likewise be established in the
+spec, Rust oracle, and implementation trace.
 
 Successful transition events carry, where applicable, `seq`, `scope`, `effect`,
 `authority_epoch`, `binding_epoch`, transition endpoints, and outcome. Backend
@@ -524,16 +626,17 @@ normal kernel path.
 
 | Property or boundary | Current evidence | Required next evidence |
 | --- | --- | --- |
-| Core register/commit/revoke/crash/rebind semantics | bounded TLC graph; Rust reference model | concurrency refinement and differential kernel traces |
-| Post-revoke commit exclusion | checked in current finite model | Loom/Kani race harnesses and system injection around commit |
-| Single terminalization | checked in finite model; Rust tests | duplicate/stale pager and device completion injection |
-| Scalar budget conservation | checked in finite model; Rust model | typed budget implementation and leak/duplication tests |
+| Core register/commit/revoke/crash/rebind semantics | bounded TLC graph; Rust reference model; four pager Loom gate refinements | implementation-specific concurrency refinement and differential kernel traces |
+| Post-revoke commit exclusion | baseline and pager finite models; pager Rust tests; Loom commit/timeout gate; QEMU timeout forbids commit/resume after `RevokeBegin` | real portal replay, SMP and production-lock races, and device publication injection |
+| Single terminalization | baseline and pager models; pager Rust tests; Loom stale/duplicate-reply and wake-authority gates; QEMU `recover` and `timeout` each terminalize once | delayed/duplicate real portal replies, SMP and production-lock races, and device completion injection |
+| Scalar budget conservation | baseline and pager models; QEMU timeout keeps credit `Held` through lock-free frame/waker cleanup and returns it only before `RevokeComplete` | typed multi-resource implementation and leak/duplication tests under concurrency and device failure |
 | Scheduler fallback | weak-fair TLA+ property; one-CPU QEMU fallback observed in one tick | lease-expiry path, SMP races, overload and repeated-crash tests |
-| Pager one-shot reply | none | extended spec/model, QEMU resolve/abort/rebind matrix |
+| Pager one-shot reply and crash/rebind | pager TLC refinement: 17,150 generated / 7,528 distinct / depth 17 / 10 temporal branches; Rust: 12 deterministic + 5 proptests (64 cases each); one-CPU QEMU `recover` + `timeout` observations | real one-shot handle/portal, serialized recovery state, full response-boundary injection, multi-client and SMP refinement |
+| Pager QuiescentClosure | Loom three-stage surrogate; QEMU three-phase Closing -> lock-free frame/waker cleanup -> credit return and RevokeComplete; reusable OSTD Waker fenced by Nexus state | production-lock/SMP interleavings, allocation failure and arbitrary task-termination paths |
 | DMA quiescence | fail-closed negative OSTD probe | one-owner synchronous invalidation path and real device tests |
-| Tombstone/timeout | none | protocol extension, retained-resource tests, eventual retry/reset |
+| I/O tombstone/timeout | none | protocol extension, retained-resource tests, eventual retry/reset |
 | Work proportionality | per-scope Rust data structure | fixed-`N` varying-`k` and fixed-`k` varying-`N` kernel curves |
-| Cross-service composition | none | scheduler + pager + I/O crash matrix under mixed workloads |
+| Cross-service composition | scheduler fallback and pager are co-resident but deliberately independent; no shared-scope cross-service evidence | scheduler + pager + I/O crash matrix under mixed workloads |
 | Linux pressure | retained legacy workload inputs only; not evidence for new architecture | bounded personality workloads on the completed CSER slices |
 
 TLC's current result is a complete graph only for its committed finite
@@ -547,7 +650,8 @@ The current semantic artifacts are:
 
 - `specs/cser/` — current PlusCal/TLA+ protocol and bounded TLC configuration;
 - `crates/cser-model/` — safe-Rust executable reference model;
-- `experiments/ostd-cser-spike/` — pinned OSTD scheduler/API/IOMMU experiment.
+- `experiments/ostd-cser-spike/` — pinned OSTD scheduler/pager/API/IOMMU
+  experiment.
 
 Legacy kernel, Starnix-like, conformance, and performance modules are not
 automatically part of this architecture. `REWORK.md` classifies each as retain,
@@ -568,7 +672,8 @@ The following are intentionally unresolved:
 - whether one effect may depend on multiple scopes and, if so, which revoke
   semantics avoid deadlock or hidden global scans;
 - the SMP locking/atomic scheme for commit and epoch publication;
-- the pager mapping commit point and minimal abort/fallback policy;
+- the production pager reply-handle representation, recovery-state format,
+  multi-client policy, and SMP address-space/TLB protocol;
 - the single owner and public contract for IOMMU invalidation;
 - queue-level versus device-level reset granularity for each VirtIO transport;
 - the tombstone retry, administrative recovery, and resource-pressure policy;

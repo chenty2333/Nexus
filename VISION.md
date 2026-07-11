@@ -158,10 +158,10 @@ The candidate contribution is narrower and compositional:
 > honest device quiescence, applied uniformly to multiple restartable
 > user-space OS services.
 
-Whether that combination is new and useful will be decided only after the pager
-and I/O slices exist, the implementation properties have been tested, and a
-fresh close comparison with prior work has been completed. A negative result or
-a narrower claim is an acceptable research outcome.
+Whether that combination is new and useful will be decided only after the
+bounded pager evidence is extended through mediated I/O and integrated
+verification, and a fresh close comparison with prior work has been completed.
+A negative result or a narrower claim is an acceptable research outcome.
 
 ## Reuse is a design requirement
 
@@ -227,13 +227,40 @@ scope generation, three one-shot effect identifiers, two scalar credits, and
 bounded crash generations. It does not model payloads, real time, device
 quiescence, tombstones, nested scope lineage, or resource replenishment.
 
+`specs/cser/PagerCser.tla` is a separate pager refinement rather than a silent
+change to that baseline. Its committed finite instance contains two fault/thread
+identities, two frames, one contended page, one crash/rebind generation, and two
+address-space generations. TLC 1.8.0 completed it with no error:
+
+```text
+17,150 states generated
+7,528 distinct states found
+0 states left on queue
+complete graph depth 17
+10 temporal-property branches checked
+```
+
+That graph checks one-shot continuation consumption and wakeup, same-page loser
+resolution, generation fencing, explicit adoption, kernel-only deadline
+closure, and the pager-specific safety and liveness properties documented in
+`specs/cser/PAGER.md`. It does not model real locks, SMP TLB visibility, actual
+tasks or address spaces, physical time, file-backed paging, COW, swap, or task
+termination.
+
 ### Executable reference evidence
 
 `crates/cser-model` is a `no_std + alloc`, safe-Rust executable oracle for the
-same core protocol. Its current suite includes eight deterministic race tests
-and three property tests, a canonical trace, per-scope live-effect indexes, and
-scalar budget accounting. This supports differential implementation work; it
-does not establish the behavior of a concurrent kernel or a real device.
+core protocol and its pager refinement. In addition to the baseline suite, the
+pager model has 12 deterministic tests and five proptests, each configured for
+64 cases. It covers three independent authority, binding, and address-space
+generations; same-page coalescing; recovery snapshot fencing; deadlines; frame
+ownership; and mapping publication history. These are sequential executable
+state transitions. Four additional Loom surrogate models check bounded
+interleavings at the commit/timeout gate, adopt/timeout/stale-reply gate,
+single-wake-authority gate, and three-stage closure publication gate. Those
+small models support differential implementation work but do not establish the
+eventual production lock/atomic scheme, an SMP page-table implementation, or a
+real device.
 
 ### Observed OSTD evidence
 
@@ -246,13 +273,30 @@ Nexus can, without modifying OSTD internals:
 - fence a crashed scheduler binding, enter FIFO fallback within one measured
   tick, exercise the epoch-2 rebind gate/transition, and reject an epoch-1 stale
   proposal;
-- wrap OSTD wait/wake and tick primitives with an effect token.
+- wrap OSTD wait/wake and tick primitives with an effect token;
+- take a real client page fault, retain a kernel-owned prepared zero frame
+  across a real pager-v1 page-fault crash, advance only the pager binding epoch,
+  construct a fresh pager-v2 `Task`/`VmSpace`/`UserMode`, explicitly adopt the
+  fault after ready/rebind, publish one mapping, synchronize the local TLB, and
+  resume the unchanged fault RIP once;
+- reject old-binding and pre-rebind commit predicates before VM mutation; and
+- exercise a watchdog timeout in which `Closing` and a closed reply gate are
+  published first, the retained frame and local waker are dropped outside the
+  state lock while credit remains held, and only then are the credit returned
+  and `Revoked`/`RevokeComplete` published.
 
-That is a one-CPU feasibility result. It does not establish an SMP scheduler,
-pager recovery, full effect revocation, policy fairness, or the independently
-compiled lease-expiry path. The spike invokes `Rebind` from its kernel-side
-probe; it does not launch a replacement user-space supervisor or observe a real
-snapshot/ready handshake. That remains future pager and service-lifecycle work.
+The pager result is a bounded vertical-slice observation, not a production
+pager. It is single-CPU, single-client, zero-page-only, and exercises only a
+local TLB synchronization path. The recovery “snapshot” is a boolean protocol
+handshake, not serialized pager state, and the stale/pre-rebind rejection cases
+are kernel predicate probes rather than replayed user-space capabilities. OSTD's
+`Waker` is reusable, so Nexus's `FaultPhase` and terminalization gate—not the
+waker—enforce one-shot authority. The public mapping path may still `unwrap` on
+intermediate page-table allocation failure; the spike has no arbitrary task-kill
+primitive, SMP shootdown, multi-client recovery, file-backed paging, COW, swap,
+or durable pager reconstruction. The scheduler result likewise does not
+establish SMP policy fairness or independently exercise the compiled
+lease-expiry path.
 
 The same spike found a negative boundary: OSTD 0.18 does not expose a synchronous
 `unmap -> IOTLB invalidate -> completion wait` operation, and its IOMMU state is
@@ -262,20 +306,29 @@ crate-private. Nexus therefore fails closed and does not report DMA quiescence.
 
 Work proceeds through evidence gates, not feature-count milestones.
 
-1. **Current checkpoint — complete:** core TLA+/Rust semantics, OSTD API-fit
-   spike, and the one-CPU scheduler crash/fallback vertical slice.
-2. **Pager gate — planned:** a one-shot fault continuation, crash fencing,
-   explicit adoption after ready/rebind, deterministic abort, and injected
-   failures at every response boundary.
-3. **DMA ownership gate — open:** obtain one auditable owner and a synchronous
-   unmap/invalidate/wait contract through an upstream OSTD API, a small reviewed
-   patch, or a different ownership boundary.
-4. **Mediated VirtIO gate — planned:** define descriptor publication commit,
-   cancellation, completion, drain/reset, timeout, tombstone, and safe buffer
-   reuse; then exercise a real device path.
-5. **Integrated evidence gate — planned:** use Loom and/or Kani for the critical
-   Rust core, QEMU fault injection for system recovery, and `k`/`N` scaling
-   experiments for proportional revocation.
+1. **Foundation/scheduler checkpoint — complete:** core TLA+/Rust semantics,
+   OSTD API fit, and the one-CPU scheduler crash/fallback vertical slice.
+2. **Bounded pager gate — complete / Observed:** the separate pager spec and
+   Rust oracle agree on one-shot, crash/rebind/adopt, generation, deadline, and
+   closure semantics; four Loom surrogate models check its critical bounded
+   publication/terminalization interleavings; pinned QEMU `recover` and
+   `timeout` paths observe one real fault continuation and the three-phase
+   closure ordering above. This does not close the production, multi-client,
+   SMP, or full fault-injection gaps.
+3. **DMA ownership gate — NO-GO / open:** obtain one auditable owner and a
+   synchronous unmap/invalidate/wait contract through an upstream OSTD API, a
+   small reviewed patch, or a different ownership boundary.
+4. **Mediated VirtIO gate — model work may proceed; real DMA closure is blocked
+   by gate 3:** encode the audited `Release` publication of `avail.idx` as the
+   first conservative `Commit`; model cancellation, completion, timeout,
+   tombstone, and a bounded whole-device reset for the first exclusive
+   single-queue `virtio-blk-pci` device unless a queue-reset contract is
+   separately negotiated and checked. A real adapter may not report `Quiesced`
+   until gate 3 has one owner and a completed invalidation path.
+5. **Integrated evidence gate — planned:** extend the initial pager Loom gate
+   with implementation-specific Loom and/or Kani checks across scheduler,
+   pager, and I/O; add QEMU fault injection for system recovery and `k`/`N`
+   scaling experiments for proportional revocation.
 6. **Linux pressure gate — planned:** add a deliberately bounded user-space
    Linux personality and use real workloads to stress pager, wait/timer, IPC,
    and I/O effects. Linux compatibility remains an evaluation vehicle.

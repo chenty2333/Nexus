@@ -3,13 +3,15 @@
 This ledger records what survives the CSER reset. It is a deletion plan, not a
 promise to preserve the current Axle/Zircon/Starnix architecture.
 
-The current research checkpoint consists of the CSER state machine, the pure
-Rust reference model, the OSTD/OSDK feasibility spike, and the scheduler
-crash-to-fallback slice. The foundation decision is **OSTD-first**, not
-irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an
-upstream API or a small audited adapter/patch without violating single-owner
-hardware control, Nexus must re-evaluate the foundation explicitly. That
-decision still must not pull in a legacy crate merely because it already exists.
+The current research checkpoint consists of the baseline CSER state machine,
+its pager refinement, the pure Rust reference oracles, the OSTD/OSDK feasibility
+spike, the scheduler crash-to-fallback slice, and one bounded pager
+crash/rebind/timeout slice. The pager result is **Observed**, not a production
+pager. The foundation decision is **OSTD-first**, not irrevocably OSTD-only: if
+a documented critical boundary cannot be fixed by an upstream API or a small
+audited adapter/patch without violating single-owner hardware control, Nexus
+must re-evaluate the foundation explicitly. That decision still must not pull in
+a legacy crate merely because it already exists.
 
 ## Status vocabulary
 
@@ -81,13 +83,48 @@ The following extractions are already present in the new tree:
 These receipts do not authorize deletion by themselves; the build, CI, and
 neutral-runner gates above must pass in the same cleanup checkpoint.
 
+## Stage 4 bounded pager receipt
+
+The first pager evidence gate is recorded as **bounded slice complete /
+Observed**:
+
+- `PagerCser.tla` completed its committed finite graph with no TLC error:
+  17,150 generated states, 7,528 distinct states, zero queued states, depth 17,
+  and ten temporal-property branches checked;
+- the safe-Rust pager oracle passed 12 deterministic tests and five proptests,
+  each configured for 64 cases;
+- four bounded Loom surrogate models passed for commit/timeout,
+  adopt/timeout/stale-reply, single wake-authority, and three-stage closure
+  publication interleavings;
+- pinned QEMU `recover` observed a real client fault, a real pager-v1 fault and
+  crash, binding epoch 1 to 2, a fresh pager-v2 `Task`/`VmSpace`/`UserMode`,
+  ready/rebind, explicit adoption, one mapping publication, local TLB sync, and
+  one successful retry;
+- pinned QEMU `timeout` observed `Closing` and reply-gate closure first,
+  frame/waker cleanup outside the state lock while credit stayed held, and only
+  then credit return plus `Revoked`/`RevokeComplete`.
+
+This receipt does not promote the experiment to a production pager. Its
+recovery snapshot is a boolean handshake, stale/pre-rebind rejection uses
+kernel predicate probes, and OSTD's reusable `Waker` is fenced by Nexus state
+rather than providing one-shot authority. The implementation remains
+single-CPU, single-client, zero-page-only, and local-TLB-only; it retains the
+documented intermediate-page-table OOM `unwrap`, has no arbitrary task-kill
+primitive, and does not cover SMP, multi-client, file-backed, COW, swap, or
+durable recovery. Those limits stay live even though the bounded gate allows
+work to move to the Stage 5 DMA ownership decision. Mediated I/O remains
+**NO-GO** until one layer owns unmap, IOTLB invalidation completion, and retained
+resource lifetime. Stage 5 spec/model work may encode the audited `avail.idx`
+`Release` publication and the first exclusive queue's whole-device-reset path
+while that decision is open, but no real adapter may report `Quiesced`.
+
 ## Current research assets
 
 | Path | Status | Disposition |
 | --- | --- | --- |
-| `specs/cser/` | **KEEP** | Normative TLA+/PlusCal model, TLC configuration, and property documentation. Extend before each vertical slice. |
-| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` reference semantics and differential oracle. |
-| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, and the IOMMU fail-closed result. It may later be superseded by the production prototype, but must remain runnable until then. |
+| `specs/cser/` | **KEEP** | Normative baseline and pager-refinement TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice. |
+| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline and pager reference semantics and differential oracles. |
+| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, the bounded pager recover/timeout slice, and the IOMMU fail-closed result. It may later be superseded by a broader prototype, but must remain runnable until then. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
 | `tests/guest/linux/` | **KEEP** | Compatibility workload inputs for the eventual Linux personality. These do not define Nexus's research identity. |
 | `VISION.md` | **KEEP** | Research question, exclusions, candidate contribution, and evidence threshold. |
@@ -135,7 +172,7 @@ neutral-runner gates above must pass in the same cleanup checkpoint.
 | `kernel/axle-kernel` | **REWRITE** | Replace as a whole with the OSTD-based Nexus prototype. No legacy kernel module is linked into the new kernel. |
 | `arch/`, boot, SMP, traps, allocator, PMM | **DELETE** | Reuse OSTD boot/SMP/trap/frame/heap mechanisms. Keep only externally observed failure cases where named below. |
 | `task/scheduler/` | **MIGRATE** | Preserve scheduler wake/fallback observations; the completed OSTD slice replaces the implementation. |
-| `task/fault.rs`, VM fault paths | **MIGRATE** | Preserve same-page contention and blocked-fault recovery questions for the pager slice; rewrite the mechanism around one-shot fault continuations. |
+| `task/fault.rs`, VM fault paths | **MIGRATE** | Same-page contention and blocked-fault recovery questions were preserved in the pager refinement and bounded OSTD slice. The new mechanism is built around Nexus-gated one-shot fault continuations; no legacy VM code is retained. |
 | `wait.rs`, `time.rs`, futex/wait state | **MIGRATE** | Preserve timeout/wake/cancel schedules; implement future waits as CSER-scoped effects over OSTD primitives. |
 | `object/revocation.rs` | **MIGRATE** | Preserve stale deferred-state test cases only. Capability epoch invalidation by itself is not the new revocation mechanism. |
 | `object/device.rs`, DMA objects, old PCI exports | **MIGRATE** | Preserve interrupt, queue, pin-budget, and fail-closed questions. Rewrite device mediation and real IOMMU quiescence. The old identity-IOVA path is not reusable evidence of closure. |
