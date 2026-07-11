@@ -8,8 +8,10 @@ its pager refinement, the pure Rust reference oracles, the OSTD/OSDK feasibility
 spike, the scheduler crash-to-fallback slice, and one bounded pager
 crash/rebind/timeout slice. Stage 5 now also has a checked mediated-I/O protocol
 and safe-Rust oracle plus one bounded, one-page patched-OSTD IOTLB-ownership
-receipt. The pager and DMA results are **Observed**, not a production pager or
-complete device path. The foundation decision is **OSTD-first**, not
+receipt. Stage 5B adds a bounded real-device receipt for mediated readonly
+VirtIO, reset/tombstone recovery, and three-owner IOTLB closure. The pager and
+device results are **Observed**, not a production pager or I/O subsystem. The
+foundation decision is **OSTD-first**, not
 irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an
 upstream API or a small audited adapter/patch without violating single-owner
 hardware control, Nexus must re-evaluate the foundation explicitly. That
@@ -145,9 +147,51 @@ This receipt is deliberately narrower than mediated VirtIO closure. The DMA
 probe never exposes its IOVA to a device and records `device_dma=false` and
 `device_reset=false`; it is one CPU, one page, and one global invalidation slot.
 It does not establish device drain/reset, interrupt quiescence, real deadline
-tombstones, SMP liveness, or production domain ownership. Stage 5B must observe
-those boundaries with a real device-visible buffer before an adapter may report
-device `Quiesced`.
+tombstones, SMP liveness, or production domain ownership. The separate Stage 5B
+receipt below adds a real device-visible buffer and conditional emulator
+`Quiesced`; it does not retroactively widen what Stage 5A alone proved.
+
+## Stage 5B mediated VirtIO receipt
+
+The Stage 5B evidence gate is recorded as **bounded slice complete /
+Observed**:
+
+- `virtio-drivers = 0.13.0` is reused without forking for PCI transport,
+  `VirtQueue<16>`, and block wire types; Nexus owns only serialized PCI config,
+  BAR/DMA owners, the mediation portal, reset/tombstone policy and oracle;
+- a pinned QEMU q35 device at `00:05.0` negotiates exactly readonly,
+  `VERSION_1`, and `ACCESS_PLATFORM`; one real sector-0 request commits at the
+  audited `avail.idx` Release publication, emits one separately observed PCI
+  doorbell, traverses three distinct non-identity VT-d IOVAs, completes with
+  513 writable bytes and validates the fixed readonly fixture;
+- the typed portal rejects a write before any session or queue exists, and the
+  receipt proves that effect count and next request identity are unchanged;
+- a software-injected reset timeout retains transport, queue, request and two
+  queue DMA pages, epochs and generation in a fail-closed
+  `ManuallyDrop` tombstone; retry observes real status zero before bus-master
+  disable and queue retirement;
+- an injected first IOTLB poll retains all three DMA owners; retry observes one
+  queued global invalidation and ordered wait descriptor per page before
+  backing release;
+- generation 2 publishes without notification, crashes binding epoch 2 to 3,
+  resets the whole device, and reaches `IndeterminateAfterReset`; stale
+  binding/generation completion, a real late-notify attempt, and duplicate
+  terminalization are rejected;
+- reset and IOTLB acknowledgements are carried by non-forgeable type-state
+  tokens; the closure receipt is consumed once when the portal publishes
+  `Quiesced`, so it cannot be replayed across generations;
+- the first request emits exactly one observed PCI doorbell and queue notify;
+  the second emits neither, while both post-reset windows remain free of old
+  device activity;
+- explicitly enabled negative traces show no block write, backend write or
+  VT-d fault, and the fixture SHA-256 is unchanged after QEMU.
+
+This is emulator evidence for one CPU, one exclusive readonly queue, one-page
+owners, polling completion, masked INTx, a shared OSTD IOMMU domain and
+whole-device reset. Both timeout observations are software injections. It does
+not establish physical PCIe drain, IRQ/MSI quiescence, per-device isolation,
+multi-page/SMP liveness, irreversible write or network semantics, a real-time
+deadline worker, system-wide fault injection or k/N scaling.
 
 ## Current research assets
 
@@ -156,7 +200,7 @@ device `Quiesced`.
 | `specs/cser/` | **KEEP** | Normative baseline, pager, and mediated-I/O TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice. |
 | `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, pager, and mediated-I/O reference semantics and differential oracles. |
 | `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, the bounded pager recover/timeout slice, and the IOMMU fail-closed result. It may later be superseded by a broader prototype, but must remain runnable until then. |
-| `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for one-page DMA ownership and queued IOTLB completion. Extend it with real mediated VirtIO without weakening its explicit no-device receipt. |
+| `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for mediated readonly VirtIO, fail-closed reset/IOTLB tombstones, and three-owner queued IOTLB closure. Preserve both the Stage 5A no-device boundary and Stage 5B real-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
 | `tests/guest/linux/` | **KEEP** | Compatibility workload inputs for the eventual Linux personality. These do not define Nexus's research identity. |
 | `VISION.md` | **KEEP** | Research question, exclusions, candidate contribution, and evidence threshold. |

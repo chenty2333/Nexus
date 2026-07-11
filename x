@@ -26,7 +26,7 @@ usage: ./x {fmt|check|test|model|spec|spike|io-spike|verify|clean}
   model    run every reference-model verification gate
   spec     check PlusCal translation drift and run TLC
   spike    run the pinned OSTD scheduler/fallback QEMU spike
-  io-spike run the pinned OSTD DMA-ownership/IOTLB QEMU spike
+  io-spike run the pinned mediated VirtIO/reset/IOTLB QEMU spike
   verify   run model, spec, and both OSTD spike gates
   clean    remove root and both OSTD-spike build artifacts
 EOF
@@ -103,7 +103,7 @@ case "$command" in
         ;;
     io-spike)
         require_docker
-        run_spike "$io_spike" "OSTD DMA-ownership spike"
+        run_spike "$io_spike" "OSTD mediated VirtIO spike"
         ;;
     verify)
         require_docker
@@ -111,7 +111,7 @@ case "$command" in
         # These are intentionally host-side. Each OSTD spike owns a separate,
         # pinned OSDK image, so the root container never starts Docker.
         run_spike "$cser_spike" "OSTD scheduler/pager spike"
-        run_spike "$io_spike" "OSTD DMA-ownership spike"
+        run_spike "$io_spike" "OSTD mediated VirtIO spike"
         ;;
     clean)
         # Cleaning must remain available before Docker is installed and must

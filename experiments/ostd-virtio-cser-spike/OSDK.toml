@@ -9,7 +9,8 @@ boot_protocol = "multiboot2"
 
 [qemu]
 args = """\
-    -machine q35,kernel-irqchip=split \
+    -nodefaults \
+    -machine q35,kernel-irqchip=split,default-bus-bypass-iommu=off \
     -cpu Icelake-Server,+x2apic \
     -accel tcg,thread=single \
     -m 1G \
@@ -21,6 +22,19 @@ args = """\
     -serial chardev:serial0 \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -device intel-iommu,intremap=on,caching-mode=on,dma-drain=on \
+    -blockdev driver=file,filename=/opt/nexus-fixtures/sector0.raw,node-name=nexusblk-file,read-only=on,auto-read-only=off \
+    -blockdev driver=raw,file=nexusblk-file,node-name=nexusblk,read-only=on \
+    -device virtio-blk-pci,drive=nexusblk,bus=pcie.0,addr=05.0,bootindex=-1,disable-legacy=on,iommu_platform=on,packed=off,indirect_desc=off,event_idx=off,queue_reset=off,queue-size=16,num-queues=1,ioeventfd=off,request-merging=off,vectors=0,write-cache=off,config-wce=off,discard=off,write-zeroes=off \
+    -trace enable=virtio_set_status \
+    -trace enable=virtio_pci_notify_write \
+    -trace enable=virtio_queue_notify \
+    -trace enable=virtio_blk_handle_read \
+    -trace enable=virtio_blk_handle_write \
+    -trace enable=virtio_blk_rw_complete \
+    -trace enable=virtio_blk_req_complete \
+    -trace enable=blk_co_pwritev \
+    -trace enable=vtd_dmar_translate \
+    -trace enable=vtd_dmar_fault \
     -trace enable=vtd_inv_desc_iotlb_global \
     -trace enable=vtd_inv_desc_wait_irq \
     -drive if=pflash,format=raw,unit=0,readonly=on,file=/root/ovmf/release/OVMF.fd \

@@ -437,8 +437,7 @@ not a second general pager.
 
 ## Vertical slice 3: mediated VirtIO and DMA closure
 
-Status: **protocol/model complete; bounded DMA-ownership primitive Observed;
-real device slice in progress**.
+Status: **bounded protocol/model and real-device slice complete / Observed**.
 
 The service may construct and schedule an I/O request, but a Nexus-owned portal
 must validate its effect token, descriptors, budgets, pinned buffers, device,
@@ -487,7 +486,7 @@ cannot succeed while a closing-epoch DMA effect lacks proven closure.
 
 ### OSTD 0.18 IOMMU boundary
 
-Status: **bounded one-page feasibility / Observed**.
+Status: **bounded three-owner, one-page-per-owner feasibility / Observed**.
 
 Unmodified OSTD 0.18 removes DMA mappings without exposing a public synchronous
 IOTLB invalidation-and-completion operation. Its invalidation/domain state is
@@ -504,14 +503,30 @@ an injected `Pending` retaining frame/IOVA/PADDR accounting, acknowledgement
 before release, and fresh-identity IOVA reuse only after completion. OSTD
 remains the sole VT-d owner; Nexus owns deadline and tombstone policy.
 
-This is a GO only for the bounded ownership primitive. The probe never presents
-the IOVA to a device, runs with one CPU and one page, and proves neither device
-drain/reset nor a real timeout/tombstone path. Stage 5B must combine the same
-owner with a real `ACCESS_PLATFORM` VirtIO queue, device stop/drain-or-reset,
-generation-fenced completion, request and queue teardown, and retained-resource
-timeout tests before the adapter may report device `Quiesced`. Whether the
-patch is upstreamed, and the production domain, multi-page, SMP, and queue
-ownership policy, remain open.
+The first Stage 5A receipt deliberately stopped before device DMA. Stage 5B now
+combines the same OSTD owner with a real `ACCESS_PLATFORM` modern
+`virtio-blk-pci` queue. The mediated portal owns two one-page queue mappings and
+one one-page request bounce mapping. Pinned QEMU observes a readonly sector-0
+request through three distinct non-identity IOVAs, separates `avail.idx`
+publication from one observed PCI doorbell, performs status-zero whole-device
+reset, retires the queue only after reset acknowledgement, and completes a
+queued global IOTLB + ordered wait chain for all three owners before backing
+release. The reset acknowledgement and queue retirement produce the
+non-forgeable authority consumed by IOMMU closure; the resulting non-copyable
+closure receipt is itself consumed to publish `Quiesced`. This prevents
+cross-generation receipt replay. An injected reset timeout
+retains the whole session in a fail-closed tombstone; an injected first IOTLB
+poll likewise retains all three pages until retry. A published but unnotified
+generation-2 request becomes `IndeterminateAfterReset`, and stale binding or
+device-generation completion is rejected. Its actual late-notify attempt also
+passes through the portal and is rejected before any PCI doorbell.
+
+This is a GO for the bounded emulator slice, not a production IOMMU/device
+contract. It uses one CPU, one exclusive queue, a shared OSTD domain,
+whole-device reset and completion polling with PCI INTx masked. Timeout is
+software-injected. Whether the patch is upstreamed, and the production
+per-device domain, multi-page, SMP, IRQ, shared-device and real-deadline policy,
+remain open.
 
 ## Linux personality
 
@@ -551,7 +566,12 @@ The pinned experiment observed public API fit for:
   closure ordering documented above;
 - through the separate Stage 5A experiment, a single-owner one-page queued
   IOTLB invalidation whose pending handle retains the real DMA owner until
-  hardware completion.
+  hardware completion;
+- through Stage 5B, one real readonly `ACCESS_PLATFORM` VirtIO block request,
+  three distinct non-identity VT-d DMA owners, one observed PCI doorbell,
+  status-zero reset, fail-closed reset/IOTLB tombstones, post-reset quiet
+  windows, and request plus two queue owners released only after six observed
+  queued invalidation/wait chains across two device generations.
 
 These mechanisms should be reused behind Nexus adapters. CSER state should not
 be patched into OSTD internals merely for convenience.
@@ -561,9 +581,9 @@ be patched into OSTD internals merely for convenience.
 - SMP scheduler protocol and cross-CPU epoch publication;
 - a production one-shot continuation handle, real recovery snapshot payload,
   multi-client address-space mutation fencing, and SMP TLB shootdown;
-- real VirtIO device DMA, drain/reset, interrupt quiescence, and retained
-  timeout/tombstone recovery;
-- multi-page/domain DMA teardown and SMP IOMMU liveness;
+- physical-device-general VirtIO drain/reset, MSI/MSI-X or interrupt
+  quiescence, and a real-time retained recovery worker;
+- multi-page mappings, per-device/domain isolation and SMP IOMMU liveness;
 - an end-to-end nested authority scope implementation.
 
 The spike also found that `qemu-direct + q35` faults before `#[ostd::main]` in
@@ -650,8 +670,8 @@ normal kernel path.
 | Scheduler fallback | weak-fair TLA+ property; one-CPU QEMU fallback observed in one tick | lease-expiry path, SMP races, overload and repeated-crash tests |
 | Pager one-shot reply and crash/rebind | pager TLC refinement: 17,150 generated / 7,528 distinct / reported depth 17-18 across parallel clean runs / 10 temporal branches; Rust: 12 deterministic + 5 proptests (64 cases each); one-CPU QEMU `recover` + `timeout` observations | real one-shot handle/portal, serialized recovery state, full response-boundary injection, multi-client and SMP refinement |
 | Pager QuiescentClosure | Loom three-stage surrogate; QEMU three-phase Closing -> lock-free frame/waker cleanup -> credit return and RevokeComplete; reusable OSTD Waker fenced by Nexus state | production-lock/SMP interleavings, allocation failure and arbitrary task-termination paths |
-| DMA quiescence | fail-closed negative probe plus one-owner, one-page queued-IOTLB completion QEMU receipt with no device DMA | real device stop/drain-or-reset, request/queue invalidation, retained timeout, and SMP tests |
-| I/O tombstone/timeout | TLA+ and Rust bounded timeout/retry semantics | real retained buffers, deadline injection, recovery persistence, and eventual retry/reset |
+| DMA quiescence | Stage 5A one-owner negative/ownership receipt plus Stage 5B real readonly device DMA, status-zero reset, and request + two queue owners released after queued IOTLB completion on pinned QEMU | physical-device drain contracts, IRQ quiescence, per-device domains, multi-page and SMP tests |
+| I/O tombstone/timeout | TLA+/Rust timeout/retry semantics plus Stage 5B fail-closed session/IOTLB ownership retention and successful retry; timeout explicitly software-injected | real-time deadline source, durable recovery worker, repeated failure, device-loss and hardware-timeout tests |
 | Work proportionality | Rust counts only target-scope logical visits and avoids a global scan, but its tree operations still have logarithmic local/global index costs | scope-local/intrusive kernel records plus fixed-`N` varying-`k` and fixed-`k` varying-`N` curves |
 | Cross-service composition | scheduler fallback and pager are co-resident but deliberately independent; no shared-scope cross-service evidence | scheduler + pager + I/O crash matrix under mixed workloads |
 | Linux pressure | retained legacy workload inputs only; not evidence for new architecture | bounded personality workloads on the completed CSER slices |
@@ -669,8 +689,8 @@ The current semantic artifacts are:
 - `crates/cser-model/` — safe-Rust executable reference model;
 - `experiments/ostd-cser-spike/` — pinned OSTD scheduler/pager/API/IOMMU
   experiment;
-- `experiments/ostd-virtio-cser-spike/` — pinned patched-OSTD one-page DMA
-  ownership and queued-IOTLB-completion experiment.
+- `experiments/ostd-virtio-cser-spike/` — pinned patched-OSTD mediated VirtIO,
+  reset tombstone and three-owner queued-IOTLB-completion experiment.
 
 Legacy kernel, Starnix-like, conformance, and performance modules are not
 automatically part of this architecture. `REWORK.md` classifies each as retain,

@@ -318,11 +318,37 @@ isolated MPL-2.0 OSTD patch in
 `experiments/ostd-virtio-cser-spike`. The pinned one-CPU QEMU receipt observed
 one-page ownership transfer into `PendingDmaUnmap`, real VT-d global IOTLB and
 wait descriptors, retention across an injected `Pending`, hardware completion
-before backing/IOVA/credit release, and fresh-identity IOVA reuse only after the
-acknowledgement. This closes the bounded DMA-ownership API gate for the
-prototype. The probe never gave the IOVA to a device and explicitly records
+before backing/IOVA bookkeeping release, and fresh-identity IOVA reuse only
+after the acknowledgement. This closes the bounded DMA-ownership API gate for
+the prototype. The probe never gave the IOVA to a device and explicitly records
 `device_dma=false` and `device_reset=false`; it is not evidence of mediated
 VirtIO closure, device drain/reset, SMP liveness, or a production IOMMU API.
+
+The follow-on Stage 5B receipt now exercises the missing device-visible path on
+one pinned QEMU q35/VT-d configuration. Nexus directly reuses
+`virtio-drivers` 0.13 PCI transport, split queue, and block wire types behind a
+fixed mediation portal. A readonly sector-0 request negotiates
+`RO | VERSION_1 | ACCESS_PLATFORM`, commits at the audited `avail.idx` Release
+publication, emits one separately observed PCI doorbell, completes through
+three distinct non-identity IOVAs, and validates a checksummed fixture. A
+software-injected reset timeout retains
+transport, queue, request/queue pages, epochs, and generation in a
+fail-closed tombstone; retry observes real status-zero reset before queue
+retirement. A non-forgeable closure token ties that acknowledgement and queue
+retirement to IOMMU teardown, and the resulting closure receipt is consumed
+once to publish portal quiescence. Each of the three DMA pages is then released
+only after its queued global IOTLB and ordered wait completion. A second
+generation publishes without notification, crashes its binding, rejects an
+actual late-notify attempt at the portal, and reaches `IndeterminateAfterReset`
+rather than a fictitious cancellation. The old completion is fenced by binding
+and device generation.
+
+That is bounded emulator evidence, not a hardware-general drain result. It is
+single-CPU and polling-only, masks PCI INTx, uses a shared OSTD IOMMU domain and
+whole-device reset, and injects timeout in software. It does not prove MSI/MSI-X
+or IRQ quiescence, SMP liveness, per-device isolation, irreversible writes,
+network output, physical PCIe behavior, or a production deadline/recovery
+worker.
 
 ## Research gates
 
@@ -342,14 +368,16 @@ Work proceeds through evidence gates, not feature-count milestones.
    unmap/invalidate/poll contract with a real VT-d completion receipt. The
    upstream API, multi-page/domain policy, SMP liveness, and production patch
    disposition remain open; none of those gaps is hidden by this gate.
-4. **Mediated VirtIO gate — protocol/model complete; device slice in progress:**
-   the audited `Release` publication of `avail.idx` is the first conservative
-   `Commit`; the TLA+ and Rust models cover cancellation, completion, reset,
-   timeout, tombstone, retry, and conditional closure for one exclusive queue.
-   The next receipt must put a real `ACCESS_PLATFORM` VirtIO block request
-   through the patched DMA path and observe stop/drain-or-reset, generation
-   fencing, request/queue invalidation, and retained timeout behavior. Until
-   then no real adapter may report device `Quiesced`.
+4. **Mediated VirtIO gate — bounded slice complete / Observed:** the audited
+   `Release` publication of `avail.idx` is the first conservative `Commit`;
+   the TLA+ and Rust models cover cancellation, completion, reset, timeout,
+   tombstone, retry, and conditional closure for one exclusive queue. The
+   pinned Stage 5B receipt observes one real `ACCESS_PLATFORM` readonly block
+   request, three non-identity VT-d DMA owners, status-zero whole-device reset,
+   retained reset/IOTLB tombstones, three-page request/queue invalidation,
+   generation fencing, and conditional `Quiesced`. This admits the prototype to integrated
+   validation; the hardware-general, IRQ, SMP, multi-client, domain-isolation,
+   persistence, and real-deadline gaps remain open.
 5. **Integrated evidence gate — planned:** extend the initial pager Loom gate
    with implementation-specific Loom and/or Kani checks across scheduler,
    pager, and I/O; add QEMU fault injection for system recovery and `k`/`N`

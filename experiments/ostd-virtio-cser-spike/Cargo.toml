@@ -8,4 +8,7 @@ license = "MPL-2.0"
 publish = false
 
 [dependencies]
+bitflags = { version = "=2.11.0", default-features = false }
 ostd = { version = "=0.18.0" }
+virtio-drivers = { version = "=0.13.0", default-features = false }
+zerocopy = { version = "=0.8.40", default-features = false }

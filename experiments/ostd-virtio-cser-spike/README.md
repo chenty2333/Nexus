@@ -1,9 +1,11 @@
-# OSTD 0.18 DMA invalidation ownership spike
+# OSTD mediated VirtIO CSER spike
 
-This Stage 5A experiment answers one narrow question: can Nexus carry a small,
-auditable OSTD 0.18 patch that removes a DMA PTE, submits a real VT-d IOTLB
-invalidation, retains the backing owner across `Pending`, and releases the
-IOVA/PADDR/backing allocation only after hardware completion?
+This Stage 5B experiment is the first Nexus slice with a real device-visible
+effect. It demonstrates, on one pinned QEMU/OSTD configuration, that a mediated
+VirtIO block request can cross an explicit commit point, complete through
+non-identity VT-d mappings, survive service crash as an indeterminate committed
+effect, and release every request/queue DMA owner only after device reset and
+the matching IOTLB completion.
 
 Run the complete Docker-only receipt with:
 
@@ -11,103 +13,232 @@ Run the complete Docker-only receipt with:
 ./x test
 ```
 
-The result is deliberately **not** mediated VirtIO closure. The probe never
-publishes its IOVA to a device, so the device-quiescence precondition is true
-vacuously. It proves neither device drain nor reset, and the required serial
-receipt says `device_dma=false` and `device_reset=false`.
+The command rebuilds when any pinned source, patch, kernel module, fixture, or
+oracle changes. Normal check/build/run steps have networking disabled, use
+Cargo offline mode, and byte-check both project and cargo-osdk runner locks.
+Artifacts are written to:
 
-## Pinned source and build boundary
+```text
+artifacts/qemu.log    complete firmware + kernel + QEMU trace
+artifacts/kernel.log  suffix beginning at the unique Stage 5B kernel marker
+artifacts/oracle.log  positive/negative oracle result
+```
+
+## Pinned boundary
 
 - OSTD: crates.io `=0.18.0`
-- OSTD crate SHA-256:
+- OSTD archive SHA-256:
   `aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1`
 - OSTD tag commit: `253be4750d69810af7b7b020fe2fee40a8547e15`
 - cargo-osdk: `=0.18.0`
+- virtio-drivers: crates.io `=0.13.0`, default features disabled
+- virtio-drivers archive SHA-256:
+  `cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7`
 - Rust: `nightly-2026-04-03`
-- OSDK image: `asterinas/osdk:0.18.0-20260603`, pinned by amd64 manifest
-  digest in `Dockerfile`
+- OSDK image: `asterinas/osdk:0.18.0-20260603`, pinned by amd64 digest in
+  `Dockerfile`
+- QEMU in that image: 10.2.1
 
-The repository stores only the MPL-2.0 patch in
-`patches/ostd-0.18.0-dma-closure.patch`. During the image build, Docker checks
-the upstream crate archive hash, extracts it under `/opt/nexus-ostd`, applies
-the patch, and verifies that the patch reverses cleanly. `.dockerignore`
-excludes `patch-work`; a complete OSTD tree is never part of the final source
-artifact.
-
-The experiment directory is a local MPL-2.0 licensing boundary: its package
-manifest declares `MPL-2.0`, and `LICENSE-MPL-2.0` contains the complete
-license text. The OSTD-derived patch remains MPL-2.0-covered and is not
-relicensed by Nexus's root Unlicense. The Docker image copies the same license
-beside the extracted patched OSTD source.
-
-Normal `./x` commands run with Docker networking disabled, Cargo offline mode,
-the project lockfile read-only, and the committed cargo-osdk runner graph
-read-only and byte-checked. The Docker image build is the only networked step.
-
-## Runtime ownership protocol
-
-The exported Stage 5A handle is intentionally restricted to one
-page-sized `DmaCoherent`:
+The deterministic backend is a one-MiB readonly raw image. Its first 30 bytes
+are `NEXUS-CSER-VIRTIO-BLK-STAGE5B\n`; all remaining bytes are zero.
 
 ```text
-device already quiesced (unsafe caller proof)
-    -> begin_unmap_invalidate(one page)
-       reserve sole generation
-       remove exactly one second-stage PTE
-       Release-publish global IOTLB + wait descriptors
-    -> PendingDmaUnmap owns frame + IOVA + PADDR accounting
-    -> poll_complete()
-       Pending: return the same owning handle
-       Complete: free IOVA, remove PADDR tracking, return UnmappedDma
-       Failure/drop: retain or leak the owner as a fail-closed quarantine
+sector-0 SHA-256:
+9cb83be92a4c9239752718e6e20ac00fe9e32842ea561ae7fedec94b620a05cc
+
+full-image SHA-256:
+27a4e8fed7b428b42ff04e3f62eadfe2e3f3310dac4e2fe8ecfff04be3cca254
 ```
 
-`begin` and each `poll` perform bounded work and never wait for hardware while
-holding OSTD's `LocalIrqDisabled` IOMMU-register lock. The reserve-to-submit
-window is protected by an outer local-IRQ guard, so same-CPU interrupt-remap
-re-entry cannot wait on the operation it interrupted. The guard covers one PTE
-removal and descriptor publication only; completion is always polled later.
+The runner checks the full image before and after QEMU. Both the file and raw
+block nodes are readonly; the experiment does not use a snapshot overlay that
+could hide an accidental write.
 
-Other CPUs are serialized by a single generation slot. This spike runs with
-`-smp 1`; it establishes the locking shape, not an SMP liveness proof. OSTD's
-pre-existing init-time DMA/interrupt-remapping/queued-invalidation enable
-handshakes remain synchronous. Those boot-only register-status loops are not
-the runtime teardown API being evaluated.
+## Reused and Nexus-owned pieces
 
-The existing arbitrary-size `DmaCoherent`/`DmaStream` Drop contract is kept
-separate: ordinary Drop synchronously processes one page at a time and polls
-outside every IOMMU lock. It can take work proportional to the mapping size.
-On uncertainty it spins fail-closed rather than releasing memory. An abandoned
-explicit `PendingDmaUnmap` instead keeps its `DmaCoherent` in `ManuallyDrop`,
-quarantining the real frame and IOVA. Deadline, tombstone persistence, and
-recovery scheduling remain Nexus policy, not OSTD policy.
+The implementation directly reuses these `virtio-drivers` 0.13 pieces:
 
-## Necessary VT-d MMIO mapping repair
+```text
+PciRoot / ConfigurationAccess
+PciTransport
+VirtQueue<OstdHal, 16>
+BlkReq / BlkResp
+```
 
-OSTD 0.18 constructs VT-d register pointers with
-`paddr_to_vaddr(base_address)`. Its post-boot linear map covers RAM only, so on
-this QEMU configuration the first capability read at physical `0xfed90008`
-faults before `#[ostd::main]`. The patch reserves the VT-d page through
-`IoMemAllocatorBuilder`, retains an `IoMem<Sensitive>` owner in
-`IommuRegisters`, and derives register pointers from that mapped virtual
-window. This is a necessary OSTD 0.18 bring-up repair for the experiment, not
-part of the CSER contribution claim.
+Nexus supplies only the boundaries needed for CSER:
 
-## What the receipt observes
+```text
+PIO PCI configuration serialization
+unique BAR ownership and owner-bound MMIO translation
+DMA owner ledger and fixed request bounce layout
+authority/binding/device-generation gates
+portal-gated commit and notify actions
+reset and timeout tombstones
+one-shot reset/closure receipts and IOTLB-completion-driven release
+serial/trace evidence oracle
+```
 
-`./x test` requires all of the following:
+`VirtIOBlk` is intentionally not used. It combines queue publication and
+notification and hides the queue/transport owners that the reset protocol must
+retain. The experiment still reuses its public sector-0 wire types rather than
+copying a block driver.
 
-- active VT-d remapping (`daddr != paddr`);
-- successful one-page PTE removal and queued global IOTLB submission;
-- QEMU `vtd_inv_desc_iotlb_global` and ordered wait-descriptor traces;
-- one deliberately injected `Pending` result with frame, IOVA, and credit
-  still retained;
-- hardware completion before IOVA/PADDR/backing release;
-- exact IOVA reuse by a fresh allocation only after the acknowledgement;
-- no panic, retained-engine failure, or device/reset claim.
+## Commit and completion
 
-The injected `Pending` is a deterministic software fault-injection point; it
-does not claim that QEMU delayed the hardware descriptor. The subsequent poll
-must still observe the real VT-d completion bit. Stage 5B must add a real
-VirtIO queue, `ACCESS_PLATFORM`, device stop/drain/reset, and timeout
-tombstones before Nexus can make a mediated-I/O closure claim.
+The mediated read has three fixed request descriptors in one DMA page:
+
+```text
+offset 0:   BlkReq,  16 bytes, driver -> device
+offset 16:  data,   512 bytes, device -> driver
+offset 528: BlkResp,  1 byte, device -> driver
+```
+
+The queue itself owns two more pages:
+
+```text
+descriptor + avail ring: one page
+used ring:               one page
+```
+
+The CSER commit point is the successful return of `VirtQueue::add`. In
+virtio-drivers 0.13 this path performs descriptor writes, the avail-ring entry,
+a `SeqCst` fence, and finally `avail.idx.store(..., Release)`. Notification is
+then issued separately through `PciTransport::notify(0)`. Therefore:
+
+```text
+before queue.add                 Prepared / cancellable
+after avail.idx Release          Committed
+after notify                     still Committed; notify is only a hint
+after matching used descriptor   Completed
+```
+
+The typed readonly policy rejects a write before any `Session` or queue exists.
+The receipt verifies that the portal effect count and next request identity are
+unchanged. It does not claim a private `avail.idx` getter that the reused crate
+does not expose.
+
+The normal scenario observes:
+
+```text
+RO | VERSION_1 | ACCESS_PLATFORM = 0x0000000300000020
+non-identity IOVA -> GPA translations for 00:05.0
+one real sector-0 VirtIO read
+used length 513 and BlkResp::OK
+fixed magic, zero tail, and FNV-1a receipt
+Completed terminal state
+```
+
+## Crash, reset, and tombstones
+
+Generation 1 deliberately turns reset into a software-injected timeout before
+the first status poll. The returned tombstone retains the transport, queue,
+request page, two queue pages, epochs, and generation. It uses
+`ManuallyDrop<Session>` so abandoning the recovery worker cannot run the
+unbounded `PciTransport::drop` loop or release DMA before reset acknowledgement.
+
+Retry must observe real VirtIO status zero, disable PCI bus mastering, read the
+ISR, and only then drop the queue. `Hal::dma_dealloc` merely changes each queue
+owner from active to retired; it cannot unmap or free it.
+
+The first request IOTLB poll is also deterministically injected as pending. Its
+tombstone owns the in-flight request unmap while the ledger retains both queue
+owners. Retry observes a real queued global invalidation and ordered wait
+descriptor for each of the three pages before returning backing memory.
+
+Generation 2 publishes a request but does not notify it, then advances the
+binding epoch to model I/O-service crash. Because notification is only a hint,
+the request is not called cancelled. Whole-device reset terminalizes it as:
+
+```text
+IndeterminateAfterReset
+```
+
+Only after the same reset/IOTLB closure may the three pages be released. The
+QEMU slice tracks DMA pages and owners; budget conservation remains a property
+of the TLA+/Rust reference models, not a runtime claim from this receipt. Old
+binding and device-generation completions are rejected, and the effect cannot
+acquire a second terminal state.
+
+`ResetAck` carries a non-forgeable DMA closure authority. `begin_closure`
+consumes it, and `Portal::mark_quiesced` then consumes the non-copyable
+`ClosureReceipt`; neither stage accepts a caller-supplied generation number.
+The generation-2 crash path also makes a real late-notify call through the
+portal and observes rejection before a PCI doorbell can be written.
+
+## What the oracle requires
+
+OVMF probes the block device before Nexus boots. The kernel therefore prints a
+unique marker before touching PCI; all Stage 5B counts and negative checks use
+only the suffix beginning at that marker.
+
+The oracle requires:
+
+- the exact BDF, modern device ID, features, and three DMA owners;
+- a real sector-0 read and successful QEMU completion;
+- three distinct non-identity owner IOVAs, each observed in the `00:05.0` VT-d
+  trace;
+- exactly one PCI doorbell and queue notify for the completed request, and zero
+  for the published-but-unnotified request;
+- real status-zero reset writes in both generations;
+- six global IOTLB invalidations and six ordered wait descriptors;
+- reset and IOTLB timeout tombstones retaining all three pages;
+- no old-generation DMA, doorbell, queue, or block activity after either reset
+  acknowledgement;
+- `Completed` for generation 1 and `IndeterminateAfterReset` for generation 2;
+- stale/duplicate completion rejection;
+- identical fixture hashes before and after QEMU.
+
+It rejects any block write, backend write, VT-d fault, panic, premature success
+claim, `Cancelled` terminal for the published request, or claim that the
+injected timeout was a hardware timeout.
+
+## OSTD patch and licensing
+
+The repository stores only the MPL-2.0 OSTD patch in
+`patches/ostd-0.18.0-dma-closure.patch`. Docker verifies the upstream archive,
+applies the patch, and checks a clean reverse application. The patch provides:
+
+- one-page ownership-carrying `begin_unmap_invalidate` / `poll_complete`;
+- bounded runtime queued-IOTLB begin/poll paths;
+- retained owners on pending or uncertain completion;
+- owner-backed VT-d register MMIO;
+- one narrow unsafe `DmaCoherent::as_non_null_ptr_exclusive` accessor whose raw
+  pointer remains bound to a retained DMA owner;
+- one narrow unsafe `IoMem<Insensitive>::as_non_null_ptr` accessor for a
+  retained BAR owner.
+
+Source assertions also pin the no-alloc `VirtQueue` Drop shape used by the
+reset-without-`pop_used` boundary: queue destruction retires its DMA layout and
+does not revisit the pinned request buffers. This is an audited dependency
+boundary that should eventually become an upstream reset/abandon API.
+
+The experiment directory is an MPL-2.0 package boundary and includes the full
+MPL text. The derived OSTD patch stays MPL-2.0-covered. virtio-drivers is an
+unmodified MIT dependency fetched from its checksummed crate archive and
+locked by Cargo; no upstream source is copied into Nexus.
+
+## Explicit non-claims
+
+This receipt is deliberately narrower than a production I/O subsystem:
+
+- QEMU reset with `dma-drain=on` is emulator evidence, not proof for arbitrary
+  physical PCIe devices;
+- reset and first-poll timeouts are software injections, not observed hardware
+  timeouts;
+- completion is polling, PCI INTx is masked, and MSI/MSI-X/IRQ quiescence is
+  not proved;
+- the run uses one CPU; SMP liveness is not proved;
+- OSTD currently uses a shared IOMMU domain, so this proves lifecycle closure,
+  not per-device DMA isolation;
+- only a readonly block read is exercised; irreversible disk writes, network
+  output, flush ordering, and persistence are not covered;
+- the BAR registry and fixed three-buffer HAL are spike-specific mechanisms,
+  not a general PCI subsystem;
+- no real-time reset deadline, system-wide fault matrix, k/N revocation curve,
+  or WorkProportionality claim is established here.
+- completion-to-portal-terminal crash injection and a durable tombstone
+  recovery registry remain future integrated-validation work.
+
+Those boundaries remain gates for the later integrated validation stage. This
+experiment supports a mediated-I/O feasibility result; it does not by itself
+establish CSER as an original contribution.

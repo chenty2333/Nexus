@@ -5,6 +5,8 @@ FROM ${OSDK_IMAGE}
 
 ARG OSTD_CRATE_SHA256=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1
 ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
+ARG VIRTIO_DRIVERS_CRATE_SHA256=cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7
+ARG VIRTIO_DRIVERS_CRATE_URL=https://static.crates.io/crates/virtio-drivers/virtio-drivers-0.13.0.crate
 
 RUN rustup target add --toolchain nightly-2026-04-03 x86_64-unknown-none \
     && cargo install cargo-osdk --version 0.18.0 --locked
@@ -24,7 +26,23 @@ RUN set -eu; \
         < /tmp/nexus-patches/ostd-0.18.0-dma-closure.patch; \
     patch --batch --dry-run --reverse -d /opt/nexus-ostd/ostd-0.18.0 -p1 \
         < /tmp/nexus-patches/ostd-0.18.0-dma-closure.patch; \
+    virtio_archive=/opt/nexus-source/virtio-drivers-0.13.0.crate; \
+    curl --fail --silent --show-error --location "$VIRTIO_DRIVERS_CRATE_URL" \
+        --output "$virtio_archive"; \
+    echo "${VIRTIO_DRIVERS_CRATE_SHA256}  ${virtio_archive}" | sha256sum -c -; \
     chmod -R a+rX /opt/nexus-source /opt/nexus-ostd
+
+COPY assets/sector0.txt /opt/nexus-fixtures/sector0.txt
+RUN set -eu; \
+    truncate -s 1048576 /opt/nexus-fixtures/sector0.raw; \
+    dd if=/opt/nexus-fixtures/sector0.txt of=/opt/nexus-fixtures/sector0.raw \
+        conv=notrunc status=none; \
+    sector_hash=$(dd if=/opt/nexus-fixtures/sector0.raw bs=512 count=1 status=none \
+        | sha256sum | cut -d ' ' -f1); \
+    test "$sector_hash" = 9cb83be92a4c9239752718e6e20ac00fe9e32842ea561ae7fedec94b620a05cc; \
+    echo '27a4e8fed7b428b42ff04e3f62eadfe2e3f3310dac4e2fe8ecfff04be3cca254  /opt/nexus-fixtures/sector0.raw' \
+        | sha256sum -c -; \
+    chmod 0444 /opt/nexus-fixtures/sector0.txt /opt/nexus-fixtures/sector0.raw
 
 COPY cargo-home-config.toml /root/.cargo/config.toml
 
@@ -46,6 +64,7 @@ RUN --mount=type=bind,source=.,target=/tmp/nexus-source,readonly \
         /work/target/osdk/ostd-virtio-cser-spike-run-base \
     && chmod a-w /work/target/osdk/ostd-virtio-cser-spike-run-base/Cargo.lock \
     && cd /work \
+    && cargo fmt --all -- --check \
     && bash scripts/assert-patch.sh \
     && cargo osdk check --locked \
     && cargo osdk build \

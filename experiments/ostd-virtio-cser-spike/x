@@ -2,6 +2,9 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")" && pwd)
+lock_key=$(printf '%s' "$root" | sha256sum | cut -c1-16)
+exec 9>"/tmp/nexus-ostd-virtio-cser-spike-$lock_key.lock"
+flock 9
 image_key=$(sha256sum \
     "$root/Dockerfile" \
     "$root/.dockerignore" \
@@ -12,6 +15,10 @@ image_key=$(sha256sum \
     "$root/cargo-home-config.toml" \
     "$root/LICENSE-MPL-2.0" \
     "$root/src/lib.rs" \
+    "$root/src/dma.rs" \
+    "$root/src/pci.rs" \
+    "$root/src/portal.rs" \
+    "$root/assets/sector0.txt" \
     "$root/patches/ostd-0.18.0-dma-closure.patch" \
     "$root/scripts/assert-patch.sh" \
     "$root/scripts/assert-serial.sh" \
@@ -56,6 +63,7 @@ check_source() {
 check_kernel() {
     # cargo-osdk 0.18 does not expose --locked on build/run. Gate the project
     # lock explicitly and over-mount it read-only for all mounted builds.
+    container cargo fmt --all -- --check
     container cargo osdk check --locked
 }
 
@@ -81,10 +89,31 @@ build_kernel() {
 run_kernel() {
     build_kernel
     container bash -c '
+        set -u
         cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
-        exec timeout --signal=TERM --kill-after=2s 30s cargo osdk run
+        expected=27a4e8fed7b428b42ff04e3f62eadfe2e3f3310dac4e2fe8ecfff04be3cca254
+        before=$(sha256sum /opt/nexus-fixtures/sector0.raw | cut -d " " -f1)
+        set +e
+        timeout --signal=TERM --kill-after=2s 30s cargo osdk run
+        status=$?
+        set -e
+        after=$(sha256sum /opt/nexus-fixtures/sector0.raw | cut -d " " -f1)
+        echo "FIXTURE Hash before=$before after=$after readonly=true"
+        test "$before" = "$expected"
+        test "$after" = "$expected"
+        exit "$status"
     '
     assert_runner_base
+}
+
+extract_kernel_suffix() {
+    local source=$1
+    local target=$2
+    awk '
+        /VIRTIO_CSER KERNEL_MARKER stage=5b oracle_suffix=true/ { found = 1 }
+        found { print }
+        END { if (!found) exit 1 }
+    ' "$source" > "$target"
 }
 
 command=${1:-test}
@@ -108,13 +137,18 @@ case "$command" in
     run)
         ensure_image
         mkdir -p "$root/artifacts"
+        rm -f "$root/artifacts/qemu.log" "$root/artifacts/kernel.log" "$root/artifacts/oracle.log"
         run_kernel 2>&1 | tee "$root/artifacts/qemu.log"
+        extract_kernel_suffix "$root/artifacts/qemu.log" "$root/artifacts/kernel.log"
         ;;
     test)
         ensure_image
         mkdir -p "$root/artifacts"
+        rm -f "$root/artifacts/qemu.log" "$root/artifacts/kernel.log" "$root/artifacts/oracle.log"
         run_kernel 2>&1 | tee "$root/artifacts/qemu.log"
-        "$root/scripts/assert-serial.sh" "$root/artifacts/qemu.log"
+        extract_kernel_suffix "$root/artifacts/qemu.log" "$root/artifacts/kernel.log"
+        "$root/scripts/assert-serial.sh" "$root/artifacts/kernel.log" 2>&1 \
+            | tee "$root/artifacts/oracle.log"
         ;;
     clean)
         rm -rf "$root/target" "$root/artifacts" "$root/patch-work"

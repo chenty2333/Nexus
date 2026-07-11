@@ -506,10 +506,18 @@ index bdfc424..1886223 100644
          };
  
 diff --git a/src/io/io_mem/mod.rs b/src/io/io_mem/mod.rs
-index 5aeb557..61fd4c9 100644
+index 5aeb557..3f200e8 100644
 --- a/src/io/io_mem/mod.rs
 +++ b/src/io/io_mem/mod.rs
-@@ -156,7 +156,7 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
+@@ -8,6 +8,7 @@
+ use core::{
+     marker::PhantomData,
+     ops::{Deref, Range},
++    ptr::NonNull,
+ };
+ 
+ use align_ext::AlignExt;
+@@ -156,7 +157,7 @@
      }
  
      /// Returns the base virtual address of the MMIO range.
@@ -518,12 +526,38 @@ index 5aeb557..61fd4c9 100644
          self.kvirt_area.deref().start() + self.offset
      }
  
+@@ -211,6 +212,24 @@
+ }
+ 
+ impl IoMem<Insensitive> {
++    /// Returns a non-null raw pointer to the start of this MMIO range.
++    ///
++    /// This narrow escape hatch exists for device transports that require a
++    /// raw MMIO base. The pointer is owner-bound: it does not keep the mapping
++    /// alive and is valid for at most this `IoMem` owner's range.
++    ///
++    /// # Safety
++    ///
++    /// The caller must retain this `IoMem` owner for every use of the returned
++    /// pointer, keep all accesses within this owner's range, and use the MMIO
++    /// access semantics required by the device. The caller must also prevent
++    /// overlapping alias access through this pointer, this `IoMem`, or any of
++    /// its clones or slices.
++    pub unsafe fn as_non_null_ptr(&self) -> NonNull<u8> {
++        NonNull::new(self.base() as *mut u8)
++            .expect("IoMem mappings never use the null virtual address")
++    }
++
+     /// Acquires an `IoMem` instance for the given range.
+     ///
+     /// The I/O memory cache policy is set to uncacheable by default.
 diff --git a/src/mm/dma/dma_coherent.rs b/src/mm/dma/dma_coherent.rs
 index d0ecf8d..9970f71 100644
 --- a/src/mm/dma/dma_coherent.rs
 +++ b/src/mm/dma/dma_coherent.rs
 @@ -3,7 +3,9 @@
- use core::{fmt::Debug, mem::ManuallyDrop};
+-use core::{fmt::Debug, mem::ManuallyDrop};
++use core::{fmt::Debug, mem::ManuallyDrop, ptr::NonNull};
  
  use super::util::{
 -    alloc_kva, cvm_need_private_protection, prepare_dma, split_daddr, unprepare_dma,
@@ -603,13 +637,31 @@ index d0ecf8d..9970f71 100644
      /// Allocates a region of physical memory for coherent DMA access.
      ///
      /// The memory of the newly-allocated DMA buffer is initialized to zeros.
-@@ -88,8 +139,172 @@ impl DmaCoherent {
+@@ -88,8 +139,190 @@ impl DmaCoherent {
              inner,
              map_daddr,
              is_cache_coherent,
 +            prepared: true,
          })
      }
++
++    /// Returns the base CPU pointer for exclusive raw DMA access.
++    ///
++    /// This narrow escape hatch is intended for audited driver libraries that
++    /// require a stable raw pointer for a retained DMA owner.
++    ///
++    /// # Safety
++    ///
++    /// The caller must retain this `DmaCoherent` owner for the entire pointer
++    /// lifetime, keep every access within `self.size()`, and prevent all
++    /// overlapping access through `VmReader`, `VmWriter`, or another raw
++    /// pointer while the returned pointer is active.
++    ///
++    /// Raw access must stop before DMA teardown or owner destruction begins.
++    pub unsafe fn as_non_null_ptr_exclusive(&self) -> NonNull<u8> {
++        NonNull::new(self.writer().cursor())
++            .expect("DMA mappings never use the null virtual address")
++    }
 +
 +    /// Begins ownership-safe DMA teardown after the caller has stopped every
 +    /// device that can issue transactions through this mapping.
@@ -960,4 +1012,3 @@ index 6289955..3729e60 100644
 -        // FIXME: Flush IOTLBs to prevent any future DMA access to the frames.
 -    }
 -}
-
