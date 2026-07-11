@@ -1,0 +1,313 @@
+schema_version = 1
+catalog = "nexus.linux-guest.sources"
+source_snapshot = "8d5d07e35b0051bd4ef001224714decc0615ff49"
+legacy_root = "user"
+copy_root = "tests/guest/linux/sources"
+hash_algorithm = "sha256"
+copy_policy = "exact-source-copy"
+
+[[source]]
+id = "linux-dynamic-elf-smoke"
+path = "sources/linux-dynamic-elf-smoke/dynamic_elf_smoke.S"
+legacy_path = "user/linux-dynamic-elf-smoke/dynamic_elf_smoke.S"
+sha256 = "9810d738d14b99bcafb7649e2189cb18f3f3996cb15a8b9d7f7f28939e52bd5b"
+language = "assembly"
+build_profile = "static-raw"
+role = "launcher-smoke"
+
+[[source]]
+id = "linux-dynamic-interp"
+path = "sources/linux-dynamic-interp/dynamic_interp.S"
+legacy_path = "user/linux-dynamic-interp/dynamic_interp.S"
+sha256 = "c1f54c77342da880efa3d20c5b12e75c8ea13e57c7e3685b4d55db7e7b606c29"
+language = "assembly"
+build_profile = "shared-interpreter-raw"
+role = "dynamic-interpreter"
+
+[[source]]
+id = "linux-dynamic-main"
+path = "sources/linux-dynamic-main/dynamic_main.S"
+legacy_path = "user/linux-dynamic-main/dynamic_main.S"
+sha256 = "9d007bc0d67ea8af81da140dc8e97a8d40d8e4a7410e59e708df10cb6415d934"
+language = "assembly"
+build_profile = "dynamic-exec-raw"
+role = "dynamic-main"
+
+[[source]]
+id = "linux-dynamic-pie-main"
+path = "sources/linux-dynamic-pie-main/dynamic_pie_main.c"
+legacy_path = "user/linux-dynamic-pie-main/dynamic_pie_main.c"
+sha256 = "b93c70b964272cb7cf898965b9d28b0764270cfe97093d17581e80968fa7ab1d"
+language = "c"
+build_profile = "dynamic-pie-raw"
+role = "dynamic-main"
+
+[[source]]
+id = "linux-dynamic-pie-smoke"
+path = "sources/linux-dynamic-pie-smoke/dynamic_pie_smoke.S"
+legacy_path = "user/linux-dynamic-pie-smoke/dynamic_pie_smoke.S"
+sha256 = "df014a4bc6d7f06cc9c46ef885fa007eddec024386b7a76bd87a8b5df2b30378"
+language = "assembly"
+build_profile = "static-raw"
+role = "launcher-smoke"
+
+[[source]]
+id = "linux-dynamic-runtime-interp"
+path = "sources/linux-dynamic-runtime-interp/dynamic_runtime_interp.c"
+legacy_path = "user/linux-dynamic-runtime-interp/dynamic_runtime_interp.c"
+sha256 = "407dee2dca786758f185b8084060509c959c43f206cf9cfa37fbffdf1d63dd13"
+language = "c"
+build_profile = "shared-interpreter-raw"
+role = "dynamic-interpreter"
+
+[[source]]
+id = "linux-dynamic-runtime-main"
+path = "sources/linux-dynamic-runtime-main/dynamic_runtime_main.c"
+legacy_path = "user/linux-dynamic-runtime-main/dynamic_runtime_main.c"
+sha256 = "02fc31cf6939d824da7be2aa451a6dd8c24d689e91120bf504aa9c77f718ad71"
+language = "c"
+build_profile = "dynamic-exec-raw"
+role = "dynamic-main"
+
+[[source]]
+id = "linux-dynamic-runtime-smoke"
+path = "sources/linux-dynamic-runtime-smoke/dynamic_runtime_smoke.S"
+legacy_path = "user/linux-dynamic-runtime-smoke/dynamic_runtime_smoke.S"
+sha256 = "67c3f545f4bd147b2170e343eeeb6dff7e10c81acd3f4768ba53417fbb4b2dce"
+language = "assembly"
+build_profile = "static-raw"
+role = "launcher-smoke"
+
+[[source]]
+id = "linux-dynamic-tls-interp"
+path = "sources/linux-dynamic-tls-interp/dynamic_tls_interp.c"
+legacy_path = "user/linux-dynamic-tls-interp/dynamic_tls_interp.c"
+sha256 = "15bb419c1f3d165faf70c0690a2066ac4b85320f27dbd0be0d2b460929fd8873"
+language = "c"
+build_profile = "shared-interpreter-raw"
+role = "dynamic-interpreter"
+
+[[source]]
+id = "linux-dynamic-tls-main"
+path = "sources/linux-dynamic-tls-main/dynamic_tls_main.c"
+legacy_path = "user/linux-dynamic-tls-main/dynamic_tls_main.c"
+sha256 = "f15de624e1153597c00a0dc4f50a5a9d732dbe48f76fcddfbbf06487c9391a3e"
+language = "c"
+build_profile = "dynamic-exec-raw"
+role = "dynamic-main"
+
+[[source]]
+id = "linux-dynamic-tls-smoke"
+path = "sources/linux-dynamic-tls-smoke/dynamic_tls_smoke.S"
+legacy_path = "user/linux-dynamic-tls-smoke/dynamic_tls_smoke.S"
+sha256 = "2266774edd9989ac0a02a83b1e8257f1ed325d3d230033eea48099e939c00573"
+language = "assembly"
+build_profile = "static-raw"
+role = "launcher-smoke"
+
+[[source]]
+id = "linux-fd-smoke"
+path = "sources/linux-fd-smoke/fd_smoke.S"
+legacy_path = "user/linux-fd-smoke/fd_smoke.S"
+sha256 = "77c0c08e77304252e95fd9ffea6502458aa03ad50954e293d815a7ea4a1b57e2"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-glibc-hello"
+path = "sources/linux-glibc-hello/glibc_hello.c"
+legacy_path = "user/linux-glibc-hello/glibc_hello.c"
+sha256 = "86ebc887c301346f39ba0ce629d63ef28c8690b897f1fc31a1b907f6f2a6a084"
+language = "c"
+build_profile = "glibc-pie"
+role = "workload"
+
+[[source]]
+id = "linux-hello"
+path = "sources/linux-hello/hello.S"
+legacy_path = "user/linux-hello/hello.S"
+sha256 = "50690500a3cfac0f412da66d3d5d7f32b9b4da2a96a38d6d21c3ef12ea141490"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round2-smoke"
+path = "sources/linux-round2-smoke/round2_smoke.S"
+legacy_path = "user/linux-round2-smoke/round2_smoke.S"
+sha256 = "9728d52b7a5266f2ee0abe36e9630bccace6f46503d5992a24d3778732dbe6cc"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round3-smoke"
+path = "sources/linux-round3-smoke/round3_smoke.S"
+legacy_path = "user/linux-round3-smoke/round3_smoke.S"
+sha256 = "d7637583c18e3a59b83c32c082316d8aa69e945dd005fb7f9bb80e5521f12c35"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round4-futex-smoke"
+path = "sources/linux-round4-futex-smoke/round4_futex_smoke.S"
+legacy_path = "user/linux-round4-futex-smoke/round4_futex_smoke.S"
+sha256 = "f435e87ea3ded433ba330b48222ece776b72d77ae9dcba4dc348bb5e37d20c56"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round4-signal-smoke"
+path = "sources/linux-round4-signal-smoke/round4_signal_smoke.S"
+legacy_path = "user/linux-round4-signal-smoke/round4_signal_smoke.S"
+sha256 = "bcf9244694a8b7ca73a8c89d683f4274b7016848bf0e95d13f6e49821f920ace"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round5-epoll-smoke"
+path = "sources/linux-round5-epoll-smoke/round5_epoll_smoke.S"
+legacy_path = "user/linux-round5-epoll-smoke/round5_epoll_smoke.S"
+sha256 = "21d322d582465c939367977e6b7f23474ccedebacfa6d5f27ec97d979a9bb13c"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round6-eventfd-smoke"
+path = "sources/linux-round6-eventfd-smoke/round6_eventfd_smoke.S"
+legacy_path = "user/linux-round6-eventfd-smoke/round6_eventfd_smoke.S"
+sha256 = "dafa16ecc0b6cc10c4599f6db946d2c706a66aa9257acbbcbcbcb5a2447a1f3d"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round6-futex-smoke"
+path = "sources/linux-round6-futex-smoke/round6_futex_smoke.S"
+legacy_path = "user/linux-round6-futex-smoke/round6_futex_smoke.S"
+sha256 = "91e67843005690df0b603e76e3ad6479d2b71c98769967cf0aa2da578856d5a7"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round6-pidfd-smoke"
+path = "sources/linux-round6-pidfd-smoke/round6_pidfd_smoke.S"
+legacy_path = "user/linux-round6-pidfd-smoke/round6_pidfd_smoke.S"
+sha256 = "9748e4c23d1cbebefce6cb8884f9b60271c639f10a12b94affed0f7b394bea4f"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round6-proc-control-smoke"
+path = "sources/linux-round6-proc-control-smoke/round6_proc_control_smoke.S"
+legacy_path = "user/linux-round6-proc-control-smoke/round6_proc_control_smoke.S"
+sha256 = "fabbe5ab240ee7cb67292b2b1e5f6324d763285be95b2007fa84b8538f993ea9"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round6-proc-job-smoke"
+path = "sources/linux-round6-proc-job-smoke/round6_proc_job_smoke.S"
+legacy_path = "user/linux-round6-proc-job-smoke/round6_proc_job_smoke.S"
+sha256 = "7e2639eb62c101c42be422dbb336fcd67ab3f3ef2e4df5c3ed1248911252a108"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round6-proc-tty-smoke"
+path = "sources/linux-round6-proc-tty-smoke/round6_proc_tty_smoke.S"
+legacy_path = "user/linux-round6-proc-tty-smoke/round6_proc_tty_smoke.S"
+sha256 = "889e35c622968cde2cd7c13d12f8249e006d7b618b60c0585ce93c6ebc03c8d2"
+language = "assembly"
+build_profile = "static-raw"
+role = "retained-superseded-workload"
+
+[[source]]
+id = "linux-round6-scm-rights-smoke"
+path = "sources/linux-round6-scm-rights-smoke/round6_scm_rights_smoke.S"
+legacy_path = "user/linux-round6-scm-rights-smoke/round6_scm_rights_smoke.S"
+sha256 = "11195fc72fec5417035fb4e45ce494daf059fc71710115fa108cc2a3795dcb05"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round6-signalfd-smoke"
+path = "sources/linux-round6-signalfd-smoke/round6_signalfd_smoke.S"
+legacy_path = "user/linux-round6-signalfd-smoke/round6_signalfd_smoke.S"
+sha256 = "aa993acc5fea05ee95ce2eaf115fd2a078294f1ca60af2af93e8f19987feaf1d"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-round6-timerfd-smoke"
+path = "sources/linux-round6-timerfd-smoke/round6_timerfd_smoke.S"
+legacy_path = "user/linux-round6-timerfd-smoke/round6_timerfd_smoke.S"
+sha256 = "ea64831cad2633a47156af4378759bbcd136ca34e8c232de54b03524b2e34ddb"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-runtime-fd-smoke"
+path = "sources/linux-runtime-fd-smoke/runtime_fd_smoke.S"
+legacy_path = "user/linux-runtime-fd-smoke/runtime_fd_smoke.S"
+sha256 = "20ffd271bb140571ce3594c365b8e54bd9d7bbb0f359dcac0910690f83b3dbc2"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-runtime-fs-smoke"
+path = "sources/linux-runtime-fs-smoke/runtime_fs_smoke.S"
+legacy_path = "user/linux-runtime-fs-smoke/runtime_fs_smoke.S"
+sha256 = "c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-runtime-misc-smoke"
+path = "sources/linux-runtime-misc-smoke/runtime_misc_smoke.S"
+legacy_path = "user/linux-runtime-misc-smoke/runtime_misc_smoke.S"
+sha256 = "408f69bc0d26956dc08dd3f9c8c716d7cbe203b80e5671cab6dbda6179e5c6ec"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-runtime-net-smoke"
+path = "sources/linux-runtime-net-smoke/runtime_net_smoke.S"
+legacy_path = "user/linux-runtime-net-smoke/runtime_net_smoke.S"
+sha256 = "65ba020b526fe1cbf05feef0739791a3ae6274b2ffa2b39d385ce88e1a086ecf"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-runtime-process-smoke"
+path = "sources/linux-runtime-process-smoke/runtime_process_smoke.S"
+legacy_path = "user/linux-runtime-process-smoke/runtime_process_smoke.S"
+sha256 = "a15da995d3eb6e103ad7b54140eebf7ae25ebd3f6c5fb68c867d8343fad9c773"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"
+
+[[source]]
+id = "linux-runtime-tls-smoke"
+path = "sources/linux-runtime-tls-smoke/runtime_tls_smoke.S"
+legacy_path = "user/linux-runtime-tls-smoke/runtime_tls_smoke.S"
+sha256 = "c2a8286697bb124be10ba3722900fa00b05b43cfd4381ad27d6d1ce36ef5ac3e"
+language = "assembly"
+build_profile = "static-raw"
+role = "workload"

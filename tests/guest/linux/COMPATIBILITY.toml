@@ -1,0 +1,372 @@
+schema_version = 1
+catalog = "nexus.linux-guest.compatibility"
+normative = false
+target_stage = "linux-personality-pressure-test"
+description = "Behavior coverage retained from old Starnix scenarios, expressed without the old implementation boundary."
+
+[policy]
+identity = "Linux compatibility is a pressure test for scheduler, pager, wait/timer, IPC, and mediated I/O CSER semantics."
+implementation = "Rewrite the personality; do not copy user/nexus-init/src/starnix."
+uapi = "Use maintained Linux UAPI crates and pinned guest libc artifacts; raw constants in retained sources are test-local inputs only."
+success = "The future runner must check guest exit status and declared markers without depending on old component-manager summary fields."
+legacy_provenance = "legacy_scenarios entries identify Git commit 8d5d07e35b0051bd4ef001224714decc0615ff49 and need not remain present after the old tree is deleted."
+
+[tier_policy]
+core = "The bounded Stage 6 acceptance set. Only these workloads are commitments, and each must run with its declared CSER fault-injection profile."
+stretch = "Useful compatibility breadth attempted only after the core gate; absence does not fail the CSER prototype."
+archive_input = "A source-level regression seed retained for future experiments, with no implementation commitment."
+
+[[workload]]
+id = "linux-hello"
+status = "retained"
+tier = "core"
+class = "static-smoke"
+source_ids = ["linux-hello"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round1_bootstrap.toml"]
+required_behaviors = ["ELF ET_EXEC load", "write", "exit_group"]
+success_markers = ["hello from linux-hello"]
+cser_effects = ["scheduler.proposal", "pager.fault-continuation", "service.syscall-continuation"]
+injection_profile = [
+  "crash scheduler policy while the hello task is runnable and require kernel fallback",
+  "crash pager after code-page fault registration and before mapping publication",
+  "crash Linux personality after write/exit syscall capture and before reply",
+  "replay an old-binding syscall or fault reply after service rebind",
+]
+expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "FallbackProgress"]
+
+[[workload]]
+id = "linux-fd-smoke"
+status = "retained"
+tier = "archive-input"
+class = "static-smoke"
+source_ids = ["linux-fd-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round2_fd_bootstrap.toml"]
+required_behaviors = ["read", "write", "close", "pipe2", "AF_UNIX socketpair"]
+success_markers = []
+
+[[workload]]
+id = "linux-round2-smoke"
+status = "retained"
+tier = "stretch"
+class = "static-smoke"
+source_ids = ["linux-round2-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round2_bootstrap.toml"]
+required_behaviors = [
+  "openat/read/write/close",
+  "fstat/getdents",
+  "pipe2",
+  "AF_UNIX stream and datagram socketpair",
+  "brk",
+  "anonymous mmap/mprotect/munmap",
+  "read-only file-backed mmap",
+]
+success_markers = []
+
+[[workload]]
+id = "linux-round3-smoke"
+status = "retained"
+tier = "stretch"
+class = "static-smoke"
+source_ids = ["linux-round3-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round3_bootstrap.toml"]
+required_behaviors = ["clone with CLONE_THREAD", "fork", "execve", "wait4", "zombie reap", "reparenting"]
+success_markers = []
+
+[[workload]]
+id = "linux-round4-futex-smoke"
+status = "retained"
+tier = "core"
+class = "static-smoke"
+source_ids = ["linux-round4-futex-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round4_futex_bootstrap.toml"]
+required_behaviors = ["FUTEX_WAIT_PRIVATE", "FUTEX_WAKE_PRIVATE", "FUTEX_REQUEUE_PRIVATE", "clone-threaded waiters"]
+success_markers = ["round4 futex ok"]
+cser_effects = ["scheduler.proposal", "wait.registration", "timer.deadline", "service.syscall-continuation"]
+injection_profile = [
+  "crash scheduler policy while futex waiter and waker tasks are runnable and require kernel fallback",
+  "crash Linux personality after futex wait registration and before wake delivery",
+  "race futex wake, timeout, and scope cancellation",
+  "replay an old-binding wake or wait reply after rebind",
+]
+expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "FallbackProgress", "BudgetConservation"]
+
+[[workload]]
+id = "linux-round4-signal-smoke"
+status = "retained"
+tier = "stretch"
+class = "static-smoke"
+source_ids = ["linux-round4-signal-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round4_signal_bootstrap.toml"]
+required_behaviors = [
+  "getpid/gettid",
+  "rt_sigaction/rt_sigprocmask/rt_sigreturn",
+  "kill/tgkill",
+  "EINTR and SA_RESTART on wait4 and pipe read",
+]
+success_markers = ["round4 signal ok"]
+
+[[workload]]
+id = "linux-round5-epoll-smoke"
+status = "retained"
+tier = "core"
+class = "static-smoke"
+source_ids = ["linux-round5-epoll-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round5_epoll_bootstrap.toml"]
+required_behaviors = ["epoll_create1", "epoll_ctl", "epoll_wait", "level-triggered", "edge-triggered", "oneshot", "pipe/socketpair/file readiness"]
+success_markers = []
+cser_effects = ["wait.registration", "timer.deadline", "ipc.operation", "service.syscall-continuation"]
+injection_profile = [
+  "crash Linux personality after epoll registration and before readiness delivery",
+  "race source wake with revoke cancellation and timeout",
+  "replay queued readiness from an old binding after rebind",
+]
+expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "BudgetConservation"]
+
+[[workload]]
+id = "linux-round6-eventfd-smoke"
+status = "retained"
+tier = "stretch"
+class = "static-smoke"
+source_ids = ["linux-round6-eventfd-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round6_eventfd_bootstrap.toml"]
+required_behaviors = ["eventfd2", "nonblocking empty read", "epoll-visible readability"]
+success_markers = ["round6 eventfd ok"]
+
+[[workload]]
+id = "linux-round6-futex-smoke"
+status = "retained"
+tier = "stretch"
+class = "static-smoke"
+source_ids = ["linux-round6-futex-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round6_futex_bootstrap.toml"]
+required_behaviors = ["FUTEX_WAIT_BITSET", "FUTEX_WAKE_BITSET_PRIVATE", "robust-list owner-died on thread exit"]
+success_markers = ["round6 futex ok"]
+
+[[workload]]
+id = "linux-round6-pidfd-smoke"
+status = "retained"
+tier = "archive-input"
+class = "static-smoke"
+source_ids = ["linux-round6-pidfd-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round6_pidfd_bootstrap.toml"]
+required_behaviors = ["pidfd_open", "pidfd_send_signal", "pidfd readability on child exit"]
+success_markers = ["round6 pidfd ok"]
+
+[[workload]]
+id = "linux-round6-proc-control-smoke"
+status = "retained"
+tier = "archive-input"
+class = "static-smoke"
+source_ids = ["linux-round6-proc-control-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round6_proc_control_bootstrap.toml"]
+required_behaviors = ["/proc self and child task views", "SIGTSTP/SIGCONT transitions", "wait4 observation", "signalfd observation"]
+success_markers = ["round6 proc_control ok"]
+
+[[workload]]
+id = "linux-round6-proc-job-smoke"
+status = "retained"
+tier = "archive-input"
+class = "static-smoke"
+source_ids = ["linux-round6-proc-job-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round6_proc_job_bootstrap.toml"]
+required_behaviors = ["sessions and process groups", "process-group wait/kill routing", "/proc status", "/proc fd"]
+success_markers = ["round6 proc_job ok", "proc-fd bridge ok"]
+
+[[workload]]
+id = "linux-round6-proc-tty-smoke"
+status = "retained-superseded"
+tier = "archive-input"
+class = "static-smoke"
+source_ids = ["linux-round6-proc-tty-smoke"]
+legacy_scenarios = []
+required_behaviors = ["stopped task status/stat projection", "controlling TTY state", "job-control observation"]
+success_markers = ["round6 proc_tty ok"]
+notes = "The old dedicated QEMU scenario was superseded by semantic tests and BusyBox PTY coverage; the small guest input remains useful."
+
+[[workload]]
+id = "linux-round6-scm-rights-smoke"
+status = "retained"
+tier = "stretch"
+class = "static-smoke"
+source_ids = ["linux-round6-scm-rights-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round6_scm_rights_bootstrap.toml"]
+required_behaviors = ["sendmsg/recvmsg", "AF_UNIX SOCK_STREAM", "SCM_RIGHTS fd passing"]
+success_markers = ["round6 scm_rights ok"]
+
+[[workload]]
+id = "linux-round6-signalfd-smoke"
+status = "retained"
+tier = "stretch"
+class = "static-smoke"
+source_ids = ["linux-round6-signalfd-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round6_signalfd_bootstrap.toml"]
+required_behaviors = ["signalfd4", "blocked-signal consumption", "epoll-visible readiness"]
+success_markers = ["round6 signalfd ok"]
+
+[[workload]]
+id = "linux-round6-timerfd-smoke"
+status = "retained"
+tier = "stretch"
+class = "static-smoke"
+source_ids = ["linux-round6-timerfd-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_round6_timerfd_bootstrap.toml"]
+required_behaviors = ["timerfd_create", "absolute one-shot timerfd_settime", "read expiration", "epoll-visible readiness"]
+success_markers = ["round6 timerfd ok"]
+
+[[workload]]
+id = "linux-runtime-fd-smoke"
+status = "retained"
+tier = "archive-input"
+class = "static-runtime-smoke"
+source_ids = ["linux-runtime-fd-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_runtime_fd_bootstrap.toml"]
+required_behaviors = ["getcwd/chdir", "dup2/dup3", "fcntl fd duplication and flags"]
+success_markers = ["runtime fd ok"]
+
+[[workload]]
+id = "linux-runtime-fs-smoke"
+status = "retained"
+tier = "core"
+class = "static-runtime-smoke"
+source_ids = ["linux-runtime-fs-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_runtime_fs_bootstrap.toml"]
+required_behaviors = ["pread64/pwrite64", "statx", "fstatat AT_EMPTY_PATH", "relative /proc readlinkat"]
+success_markers = ["runtime fs ok"]
+cser_effects = ["pager.fault-continuation", "io.block-request", "dma.mapping", "budget.credit", "service.syscall-continuation"]
+injection_profile = [
+  "crash pager around guest-buffer or file-page mapping publication",
+  "crash filesystem or block service before request commit and after mediated queue publication",
+  "force drain/reset or IOTLB invalidation timeout and require a retained tombstone",
+  "replay a stale block completion after service rebind",
+]
+expected_properties = ["PostRevokeCommitExclusion", "QuiescentClosure", "SingleTerminalization", "CrashRebindFencing", "BudgetConservation"]
+
+[[workload]]
+id = "linux-runtime-misc-smoke"
+status = "retained"
+tier = "archive-input"
+class = "static-runtime-smoke"
+source_ids = ["linux-runtime-misc-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_runtime_misc_bootstrap.toml"]
+required_behaviors = ["lseek", "readlink/readlinkat", "uname", "getrandom", "set_tid_address"]
+success_markers = ["runtime misc ok"]
+adaptation_required = ["The exact retained source hard-codes uname.sysname == NexusOS; a neutral future harness must adapt the generated test artifact or explicitly waive that legacy-only assertion without editing the archived source copy."]
+
+[[workload]]
+id = "linux-runtime-net-smoke"
+status = "retained"
+tier = "core"
+class = "static-runtime-smoke"
+source_ids = ["linux-runtime-net-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_runtime_net_bootstrap.toml"]
+required_behaviors = ["AF_INET SOCK_STREAM loopback", "bind/listen/connect/accept4", "getsockname/getpeername", "shutdown", "minimal socket options"]
+success_markers = ["runtime net ok"]
+cser_effects = ["wait.registration", "io.network-request", "service.syscall-continuation", "budget.credit"]
+injection_profile = [
+  "crash network service after connect/accept registration and before readiness reply",
+  "race socket readiness wake with scope cancellation",
+  "crash Linux personality with send/receive continuations outstanding",
+  "replay stale network readiness or completion after rebind",
+]
+expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "BudgetConservation"]
+
+[[workload]]
+id = "linux-runtime-process-smoke"
+status = "retained"
+tier = "archive-input"
+class = "static-runtime-smoke"
+source_ids = ["linux-runtime-process-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_runtime_process_bootstrap.toml"]
+required_behaviors = ["uid/gid identity", "access/faccessat", "prlimit64"]
+success_markers = ["runtime process ok"]
+
+[[workload]]
+id = "linux-runtime-tls-smoke"
+status = "retained"
+tier = "stretch"
+class = "static-runtime-smoke"
+source_ids = ["linux-runtime-tls-smoke"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_runtime_tls_bootstrap.toml"]
+required_behaviors = ["arch_prctl ARCH_SET_FS/GET_FS", "CLONE_SETTLS", "fork FS-base inheritance"]
+success_markers = ["runtime tls ok"]
+
+[[workload]]
+id = "linux-dynamic-elf-smoke"
+status = "retained"
+tier = "archive-input"
+class = "dynamic-loader-smoke"
+source_ids = ["linux-dynamic-elf-smoke", "linux-dynamic-main", "linux-dynamic-interp"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_dynamic_elf_bootstrap.toml"]
+required_behaviors = ["ET_EXEC main", "PT_INTERP handoff", "ET_DYN interpreter mapping", "execve"]
+success_markers = ["dynamic interp ok"]
+
+[[workload]]
+id = "linux-dynamic-tls-smoke"
+status = "retained"
+tier = "archive-input"
+class = "dynamic-loader-smoke"
+source_ids = ["linux-dynamic-tls-smoke", "linux-dynamic-tls-main", "linux-dynamic-tls-interp"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_dynamic_tls_bootstrap.toml"]
+required_behaviors = ["main-image PT_TLS", "initial TLS image", "FS-base TLS", "auxv", "PT_INTERP"]
+success_markers = ["dynamic tls ok"]
+
+[[workload]]
+id = "linux-dynamic-runtime-smoke"
+status = "retained"
+tier = "stretch"
+class = "dynamic-loader-smoke"
+source_ids = ["linux-dynamic-runtime-smoke", "linux-dynamic-runtime-main", "linux-dynamic-runtime-interp"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_dynamic_runtime_bootstrap.toml"]
+required_behaviors = ["interpreter PT_TLS", "main TLS", "richer auxv", "ET_EXEC plus ET_DYN runtime handoff"]
+success_markers = ["dynamic runtime ok"]
+
+[[workload]]
+id = "linux-dynamic-pie-smoke"
+status = "retained"
+tier = "core"
+class = "dynamic-loader-smoke"
+source_ids = ["linux-dynamic-pie-smoke", "linux-dynamic-pie-main", "linux-dynamic-runtime-interp"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_dynamic_pie_bootstrap.toml"]
+required_behaviors = ["ET_DYN main image", "PIE load bias", "PT_INTERP", "TLS and auxv through the runtime interpreter"]
+success_markers = ["dynamic pie ok"]
+cser_effects = ["pager.fault-continuation", "service.syscall-continuation", "budget.credit"]
+injection_profile = [
+  "crash pager while preparing PT_LOAD mappings before publication",
+  "crash pager after one segment commits but before the fault/exec continuation is acknowledged",
+  "crash Linux personality during PT_INTERP handoff and require explicit adoption or abort",
+  "replay an old-binding loader or fault reply after rebind",
+]
+expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "BudgetConservation"]
+
+[[workload]]
+id = "linux-glibc-hello"
+status = "retained"
+tier = "stretch"
+class = "libc-smoke"
+source_ids = ["linux-glibc-hello"]
+legacy_scenarios = ["specs/conformance/scenarios/starnix_glibc_hello_bootstrap.toml"]
+external_assets = ["pinned glibc", "pinned ld-linux-x86-64"]
+required_behaviors = ["glibc-linked PIE", "dynamic loader", "libc startup", "stdio write", "normal process exit"]
+success_markers = ["glibc hello"]
+
+[[workload]]
+id = "linux-busybox-shell"
+status = "external-artifact-intent"
+tier = "stretch"
+class = "interactive-shell"
+source_ids = []
+legacy_scenarios = ["specs/conformance/scenarios/starnix_busybox_shell_bootstrap.toml"]
+external_assets = ["pinned BusyBox", "pinned guest loader and shared libraries"]
+required_behaviors = ["interactive ash", "TTY", "filesystem mutation", "process listing", "basic applets"]
+success_markers = ["shell-ok", "ls-ok", "tty-ok", "cat-ok", "mkdir-ok", "rm-ok", "ps-ok"]
+
+[[workload]]
+id = "linux-remote-shell"
+status = "external-artifact-intent"
+tier = "archive-input"
+class = "network-shell"
+source_ids = []
+legacy_scenarios = ["specs/conformance/scenarios/starnix_remote_shell_bootstrap.toml"]
+external_assets = ["pinned BusyBox", "pinned guest loader and shared libraries"]
+required_behaviors = ["host-forwarded TCP session", "socket-backed TTY", "interactive shell", "process listing"]
+success_markers = ["prompt-ok", "remote-shell-ok", "remote-tty-ok", "remote-ps-ok"]

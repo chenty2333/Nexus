@@ -1,0 +1,187 @@
+schema_version = 1
+catalog = "nexus.legacy.slices"
+normative = false
+description = "Selected old-system observations retained as regression questions, without old build commands or ABI status codes."
+
+[interpretation]
+truth_source = "The future slice-specific CSER specification, not this catalog."
+command_policy = "Legacy shell commands are intentionally omitted because they build the implementation scheduled for deletion."
+reuse_policy = "Retain actions, failure points, and observable outcomes; reject Axle/Zircon/Starnix API shape."
+provenance_snapshot = "Origin paths are anchored at Git commit 8d5d07e35b0051bd4ef001224714decc0615ff49 and may cease to exist in the working tree after deletion."
+
+[[slice]]
+id = "authority.deferred-revocation"
+title = "Revocation purges old deferred control state while a distinct successor may do fresh work"
+future_phase = "pager"
+origin_paths = [
+  "specs/conformance/scenarios/revocation_bootstrap.toml",
+  "user/test-runner/src/revocation_smoke.rs",
+  "crates/axle-core/src/revocation.rs",
+]
+legacy_scope = "Capability-epoch invalidation across handles, queued port notifications, waits, and timers."
+actions = [
+  "create authority and derive old-epoch references",
+  "arm an asynchronous notification and timer through those references",
+  "revoke the authority epoch",
+  "attempt old deferred delivery",
+  "for future CSER translation, create an explicitly distinct Active successor scope before exercising fresh work",
+]
+retained_observations = [
+  "old derived authority becomes unusable",
+  "old queued control notification is purged",
+  "old timer/wait delivery is not observed",
+  "fresh successor-scope work can be distinguished from stale work without reopening the revoked scope",
+  "cleanup is indexed by affected authority rather than requiring a global scan",
+]
+discarded_assumptions = [
+  "zx_* handle types and numeric status codes",
+  "epoch invalidation alone is sufficient for CSER closure",
+  "all effects are rollbackable",
+  "the legacy group's fresh-reference behavior implies a CSER Closing or Revoked scope can become Active again",
+]
+future_gate = "Translate the observation into scope register/commit/revoke tests and one-shot pager continuation fault injection."
+
+[[slice]]
+id = "pager.same-page-contention"
+title = "Concurrent same-page faults converge on one mapping publication"
+future_phase = "pager"
+origin_paths = [
+  "specs/conformance/scenarios/vm_fault_same_page_contention_bootstrap.toml",
+  "tools/axle-concurrency/src/seed.rs",
+  "kernel/axle-kernel/src/task/fault.rs",
+]
+legacy_scope = "The old implementation serialized local and shared same-page faults behind one in-flight leader; that algorithm is not retained as a requirement."
+actions = [
+  "start two threads that fault on the same page identity",
+  "pause one path after it prepares or claims a candidate",
+  "let the competing path reach the same mapping publication gate",
+  "allow one candidate to commit and clean up every loser",
+]
+retained_observations = [
+  "at most one mapping is published for one fault key and address-space generation",
+  "competing continuations block, retry, or lose safely rather than publishing twice",
+  "any losing prepared frame and held credit is canceled and accounted exactly once",
+  "both faulting threads eventually receive one terminal result",
+  "mapping publication precedes thread resume",
+]
+discarded_assumptions = [
+  "the old custom VM metadata layout",
+  "one specific leader table or single-physical-allocation algorithm is required",
+  "spin-and-retry is acceptable for a suspended userspace fault",
+  "fault recovery need not survive pager crash",
+]
+future_gate = "Run this schedule with pager crash injection before continuation delivery, after candidate preparation, and around mapping publication and Resolve/Abort."
+
+[[slice]]
+id = "wait.timer-single-terminalization"
+title = "Wait wake, timeout, cancellation, and rearm races"
+future_phase = "pager"
+origin_paths = [
+  "crates/axle-core/src/wait_core_loom.rs",
+  "specs/conformance/scenarios/timer_set_cancel.toml",
+  "specs/conformance/scenarios/wait_async_edge_transition.toml",
+  "specs/conformance/scenarios/wait_async_timestamp_options.toml",
+]
+legacy_scope = "One-shot wait registration competing with timer and cancellation paths."
+actions = [
+  "arm a wait and optional deadline",
+  "race source wake with timeout or cancellation",
+  "cancel and rearm the logical waiter with a new identity",
+  "deliver a stale timer callback",
+]
+retained_observations = [
+  "only one terminal result wins",
+  "stale timeout cannot complete a rearmed wait",
+  "cancellation removes deadline and source registration",
+  "edge-triggered delivery requires a real post-arm transition",
+]
+discarded_assumptions = ["ports and Zircon signal masks are the future API", "one kernel timer object per userspace continuation"]
+future_gate = "Attach EffectToken to the real wait/timer registry and revoke path, then run these schedules under Loom and QEMU fault injection; the completed thin-wrapper spike is not sufficient."
+
+[[slice]]
+id = "io.interrupt-lifecycle"
+title = "Interrupt mask, pending delivery, unmask, acknowledgement, and drain"
+future_phase = "mediated-virtio"
+origin_paths = [
+  "specs/conformance/scenarios/device_vm_interrupt_bootstrap.toml",
+  "user/test-runner/src/device_smoke.rs",
+]
+legacy_scope = "A virtual interrupt exercises state transitions next to pinned and physical memory objects."
+actions = [
+  "verify the interrupt begins unsignaled",
+  "trigger and observe one interrupt",
+  "mask, trigger while masked, and verify no immediate delivery",
+  "unmask and observe the pending interrupt",
+  "acknowledge until the pending state is drained",
+]
+retained_observations = [
+  "masking prevents immediate consumer-visible delivery",
+  "pending state survives until unmask or reset policy handles it",
+  "acknowledgement has an explicit drain boundary",
+  "memory backing a device-visible object cannot be released merely because software stopped waiting",
+]
+discarded_assumptions = [
+  "a triggerable virtual interrupt proves hardware MSI/MSI-X behavior",
+  "interrupt drain proves device DMA quiescence",
+  "raw physical-address lookup is an acceptable userspace contract",
+]
+future_gate = "Test real VirtIO IRQ suppression/disable and completion draining as part of revoke, before IOMMU invalidation."
+
+[[slice]]
+id = "io.virtio-queue-roundtrip"
+title = "Queue publication, kick, completion, and ownership roundtrip"
+future_phase = "mediated-virtio"
+origin_paths = [
+  "specs/conformance/scenarios/net_dataplane_bootstrap.toml",
+  "specs/conformance/scenarios/net_dataplane_nexus_bootstrap.toml",
+  "user/test-runner/src/net_smoke.rs",
+  "crates/axle-virtio-transport/src/lib.rs",
+]
+legacy_scope = "Synthetic multi-queue transport plus a narrow real QEMU virtio-net bring-up."
+actions = [
+  "discover transport resources and negotiate required features",
+  "program descriptor, available, and used queue addresses",
+  "publish a batch and kick the queue",
+  "consume completion interrupt and verify returned payloads",
+]
+retained_observations = [
+  "driver and device have explicit ownership of each queue substructure",
+  "descriptor publication and device notification are visible failure boundaries",
+  "queue slots and pinned buffers require lifetime accounting",
+  "completion must be validated before buffer reuse",
+]
+discarded_assumptions = [
+  "the synthetic BAR/register image is a reusable production transport",
+  "identity IOVA metadata proves isolation",
+  "software queue completion proves synchronous IOTLB invalidation",
+  "the old queue publication point is automatically the final CSER commit point",
+]
+future_gate = "Select and document a mediated VirtIO commit point, then inject crash/revoke before publication, after publication, after kick, during drain/reset, and before DMA release."
+
+[[slice]]
+id = "budget.pinned-page-quota-recovery"
+title = "Pinned-page credit exhaustion and recovery"
+future_phase = "mediated-virtio"
+origin_paths = [
+  "specs/conformance/scenarios/channel_page_loan_quota_bootstrap.toml",
+  "specs/conformance/scenarios/channel_page_loan_snapshot_bootstrap.toml",
+]
+legacy_scope = "A page-loan queue consumes a bounded pinned-page quota and releases it after its software-only legacy drain."
+actions = [
+  "submit page-backed effects until the per-owner quota is exhausted",
+  "verify one additional submission is rejected without partial publication",
+  "complete or cancel an existing effect and prove the backend-specific quiescence boundary",
+  "submit again only after credit is safely recovered",
+]
+retained_observations = [
+  "pinned-page credit is charged before publication",
+  "quota failure is fail-closed",
+  "credit is returned exactly once only after the resource is proven no longer observable by its backend",
+  "a timeout tombstone continues holding pinned credit and frames until later quiescence",
+  "unrelated scopes do not lose their credit",
+]
+discarded_assumptions = [
+  "channel page-loan mechanics are the mediated-I/O ABI",
+  "software dequeue is enough to release DMA-visible memory",
+]
+future_gate = "Apply the same budget test to descriptor slots, pinned pages, and I/O bytes, including timeout tombstones that retain credit until real quiescence."

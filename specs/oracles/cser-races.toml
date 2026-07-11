@@ -1,0 +1,268 @@
+schema_version = 1
+catalog = "nexus.cser.races"
+normative = false
+description = "Implementation-neutral race questions retained or derived during the CSER reset."
+
+[interpretation]
+truth_source = "specs/cser/Cser.tla and explicitly identified successor specifications"
+executable_oracle = "crates/cser-model executes the current abstract protocol but does not replace the specification."
+purpose = "Generate model, Loom/Kani, and fault-injection tests without retaining the old implementation."
+result_rule = "A future implementation may refine a case, but every intentional semantic difference must be documented against the normative model."
+provenance_snapshot = "Legacy source references are anchored at Git commit 8d5d07e35b0051bd4ef001224714decc0615ff49 and may cease to exist in the working tree after deletion."
+
+[[race]]
+id = "wait.wake-vs-timeout-single-winner"
+title = "Wake and timeout cannot both terminalize one wait"
+phases = ["pager", "io", "linux-pressure"]
+origin = "legacy-observation"
+source_refs = ["crates/axle-core/src/wait_core_loom.rs:loom_wait_wake_and_timeout_have_single_winner"]
+setup = [
+  "register one wait with one sequence identity and an armed deadline",
+  "make its wake condition eligible at the same logical time as the deadline",
+]
+schedule = ["actor wake attempts completion", "actor timer attempts timeout completion"]
+require = [
+  "exactly one actor wins terminalization",
+  "the final state is Woken or TimedOut",
+  "the wait source and deadline registration are removed",
+]
+forbid = ["two completion notifications", "two budget returns", "a terminal wait remaining indexed as live"]
+
+[[race]]
+id = "wait.cancel-vs-wake-single-winner"
+title = "Cancellation and wake cannot both terminalize one wait"
+phases = ["pager", "io", "linux-pressure"]
+origin = "legacy-observation"
+source_refs = ["crates/axle-core/src/wait_core_loom.rs:loom_wait_cancel_and_wake_have_single_winner"]
+setup = ["register one pending wait under an active authority scope"]
+schedule = ["actor revoke/cancel attempts Aborted", "actor source attempts Woken"]
+require = ["exactly one terminal result is published", "all reverse-index memberships are removed"]
+forbid = ["wake after cancellation reports a second success", "cancel after wake returns credit twice"]
+
+[[race]]
+id = "wait.stale-deadline-after-rearm"
+title = "An old deadline cannot complete a rearmed wait"
+phases = ["pager", "io", "linux-pressure"]
+origin = "legacy-observation"
+source_refs = ["crates/axle-core/src/wait_core_loom.rs:loom_stale_timeout_cannot_complete_rearmed_wait"]
+setup = [
+  "arm a wait and retain its old sequence identity",
+  "cancel it and rearm the logical waiter with a new sequence identity",
+]
+schedule = ["old timer fires", "new source wakes"]
+require = ["the old timer is rejected as stale", "the new wait may complete exactly once"]
+forbid = ["old timeout terminalizes the new registration", "new registration inherits old terminal state"]
+
+[[race]]
+id = "pager.same-page-single-publication"
+title = "Concurrent faults on one page publish at most one mapping result"
+phases = ["pager"]
+origin = "legacy-observation"
+source_refs = [
+  "tools/axle-concurrency/src/seed.rs:FaultLeaderClaimed",
+  "tools/axle-concurrency/src/seed.rs:FaultHeavyPrepareBeforeCommit",
+  "specs/conformance/scenarios/vm_fault_same_page_contention_bootstrap.toml",
+]
+setup = ["two threads fault on the same mapping identity, page offset, and address-space generation"]
+schedule = [
+  "fault A prepares one candidate resolution",
+  "fault B concurrently prepares or waits for one candidate resolution",
+  "both paths converge at the mapping publication commit gate",
+]
+require = [
+  "at most one mapping result is published for the shared fault key and generation",
+  "any losing prepared candidate is canceled safely and its held resources are accounted exactly once",
+  "each thread's fault continuation terminalizes exactly once",
+]
+forbid = [
+  "two mapping publications for one shared slot generation",
+  "a waiter resumes before mapping commit",
+  "a losing frame or budget credit becoming untracked",
+  "requiring one specific leader-election algorithm",
+]
+
+[[race]]
+id = "pager.handler-crash-before-resolution"
+title = "A pager crash cannot strand an in-flight fault"
+phases = ["pager"]
+origin = "cser-derived"
+source_refs = ["specs/conformance/scenarios/vm_fault_same_page_contention_bootstrap.toml"]
+setup = ["one pager binding owns a registered one-shot fault continuation", "one or more threads wait for its result"]
+schedule = ["pager begins handling the fault", "pager crashes before Resolve or Abort", "recovery starts"]
+require = [
+  "Crash advances the binding epoch",
+  "the old binding loses reply authority immediately",
+  "each waiting continuation is eventually explicitly adopted, resolved, or aborted",
+]
+forbid = ["permanent unindexed suspension", "implicit adoption by a replacement", "resume by an old binding"]
+
+[[race]]
+id = "pager.old-binding-reply-after-rebind"
+title = "A delayed old pager reply is fenced after rebind"
+phases = ["pager"]
+origin = "cser-derived"
+source_refs = ["experiments/ostd-cser-spike/src/scheduler.rs:stale proposal rejection"]
+setup = [
+  "binding epoch b registers a fault continuation",
+  "the pager crashes and the scope advances to binding epoch b+1",
+  "a replacement becomes ready and rebinds at b+1",
+]
+schedule = ["old pager submits Resolve tagged b", "replacement submits an authorized decision tagged b+1"]
+require = ["the reply tagged b is rejected before mapping or thread-state mutation"]
+forbid = ["old reply consumes the continuation", "old reply changes a page table", "double resume"]
+
+[[race]]
+id = "pager.adopt-vs-abort-single-winner"
+title = "Explicit adoption races safely with orphan abort"
+phases = ["pager"]
+origin = "cser-derived"
+source_refs = ["crates/cser-model/tests/race_sequences.rs"]
+setup = [
+  "a crash leaves a same-authority-epoch Registered or Prepared fault orphan",
+  "a replacement binding is ready",
+]
+schedule = ["replacement attempts explicit Adopt", "recovery timeout attempts Abort"]
+require = [
+  "at most one operation changes ownership or terminal state",
+  "successful adoption records the current binding epoch",
+  "successful abort makes all later replies fail",
+]
+forbid = ["automatic adoption", "adoption of a committed or terminal effect", "credit duplication"]
+
+[[race]]
+id = "continuation.resolve-vs-abort-one-shot"
+title = "A one-shot continuation can be consumed only once"
+phases = ["pager"]
+origin = "cser-derived"
+source_refs = ["crates/cser-model/src/model.rs:single terminalization"]
+setup = ["create one Pending fault continuation with scope, authority epoch, binding epoch, thread, and fault identity"]
+schedule = ["actor pager attempts Resolve", "actor revoke/timeout attempts Abort"]
+require = ["one operation wins", "the continuation becomes Resolved or Aborted exactly once"]
+forbid = ["two thread resumes", "resolve after abort", "abort after resolve", "using the token for another fault"]
+
+[[race]]
+id = "scope.commit-vs-revoke-linearization"
+title = "Commit and RevokeBegin have one observable order"
+phases = ["scheduler", "pager", "io"]
+origin = "cser-normative-projection"
+source_refs = ["specs/cser/Cser.tla:Commit", "specs/cser/Cser.tla:RevokeBegin"]
+setup = ["one old-authority-epoch effect is Prepared in an Active scope and holds its registered budget"]
+schedule = ["actor effect attempts Commit", "actor authority attempts RevokeBegin"]
+require = [
+  "if Commit linearizes first the effect is recorded as committed and handled by drain/reset/terminalization policy",
+  "if RevokeBegin linearizes first the old effect cannot cross the commit gate",
+]
+forbid = ["an old-epoch commit linearizing after RevokeBegin", "claiming rollback of an externally visible committed effect"]
+
+[[race]]
+id = "scope.revoke-deferred-wait-timer"
+title = "Revocation closes deferred effects without reopening the revoked scope"
+phases = ["pager", "io", "linux-pressure"]
+origin = "legacy-observation"
+source_refs = [
+  "user/test-runner/src/revocation_smoke.rs",
+  "specs/conformance/scenarios/revocation_bootstrap.toml",
+]
+setup = ["register a wait, timer, and queued control notification under one authority epoch"]
+schedule = [
+  "RevokeBegin moves the scope from Active to Closing and closes the old epoch",
+  "the source signals and the timer fires late",
+  "an explicitly distinct successor scope or renewed Active scope allowed by a future normative model registers fresh work",
+]
+require = [
+  "old uncommitted deferred effects cannot publish after revocation",
+  "old entries are removed through scope-local indexes",
+  "fresh work is accepted only through an explicitly Active successor/renewed scope, never by implicitly reopening the revoked scope",
+]
+forbid = [
+  "global-table scan as the required revoke path",
+  "purging an unrelated scope",
+  "late old notification",
+  "automatic Closing or Revoked to Active transition",
+]
+
+[[race]]
+id = "budget.commit-vs-abort-conservation"
+title = "Commit and abort choose one budget disposition exactly once"
+phases = ["scheduler", "pager", "io"]
+origin = "cser-normative-projection"
+source_refs = ["specs/cser/Cser.tla:BudgetConservation", "crates/cser-model/tests/properties.rs"]
+setup = ["one Prepared effect holds a nonzero divisible credit"]
+schedule = ["actor effect attempts Commit", "actor revocation attempts Abort before commit"]
+require = [
+  "if Commit wins, it alone changes the disposition from Held to Spent",
+  "a later Complete changes only effect state and leaves the Spent disposition unchanged",
+  "if Abort wins, it changes Held to Returned and restores the amount to scope free budget",
+  "free + held + spent remains equal to the initial budget",
+]
+forbid = [
+  "credit copied into both successor paths",
+  "Complete spending or returning credit a second time",
+  "Abort returning credit after Commit",
+  "terminal effect retaining untracked credit",
+]
+
+[[race]]
+id = "scheduler.fallback-before-rebind"
+title = "Scheduler policy recovery cannot bypass the kernel fallback"
+phases = ["scheduler"]
+origin = "model-derived-with-kernel-gate-probe"
+source_refs = [
+  "experiments/ostd-cser-spike/src/scheduler.rs",
+  "experiments/ostd-cser-spike/scripts/assert-serial.sh",
+]
+setup = ["a user policy is bound at epoch b, kernel FIFO fallback is available, and a kernel-side probe can exercise proposal and Rebind gates"]
+schedule = [
+  "policy crashes",
+  "the kernel-side probe submits an epoch-b+1 proposal before Rebind and observes rejection",
+  "kernel fallback picks",
+  "the kernel-side probe invokes Rebind at b+1",
+  "the probe submits an epoch-b proposal and observes stale rejection",
+]
+require = [
+  "Crash advances binding epoch to b+1",
+  "fallback picks before rebind is accepted",
+  "pre-rebind proposals are rejected",
+  "an epoch-b proposal remains stale after rebind",
+]
+forbid = [
+  "rebind advancing binding epoch a second time",
+  "scheduler progress depending on the crashed policy",
+  "describing the kernel-side Rebind probe as an observed replacement user-space supervisor or ready/snapshot handshake",
+]
+
+[[race]]
+id = "io.publish-vs-revoke-commit-gate"
+title = "Device publication and revocation respect the selected I/O commit point"
+phases = ["io"]
+origin = "cser-derived"
+source_refs = ["specs/oracles/legacy-slices.toml:io.virtio-queue-roundtrip"]
+setup = ["an I/O effect owns descriptors, pinned buffers, queue credit, and a declared device-publication commit point"]
+schedule = ["actor submission approaches the commit point", "actor authority executes RevokeBegin"]
+require = [
+  "only the operation that linearizes first determines whether the request is uncommitted or committed",
+  "an uncommitted loser is canceled without device exposure",
+  "a committed winner enters completion, drain, reset, or tombstone handling",
+]
+forbid = ["freeing DMA-visible buffers on software cancellation alone", "reporting a committed request as rolled back"]
+
+[[race]]
+id = "io.timeout-vs-late-completion-tombstone"
+title = "A late device completion cannot bypass a timeout tombstone"
+phases = ["io"]
+origin = "cser-derived"
+source_refs = ["experiments/ostd-cser-spike/src/iommu_probe.rs"]
+setup = ["a committed request cannot prove drain/reset and IOTLB invalidation before its deadline"]
+schedule = ["revoke completion times out and publishes a tombstone", "the device reports completion later", "recovery retries cleanup"]
+require = [
+  "the closure attempt returns TimedOut or an equivalently named non-success retained result",
+  "RevokeComplete is not executed or accepted while the timed-out effect lacks proven quiescence",
+  "DMA-visible frames and their budget remain retained while access is possible",
+  "late completion or cleanup may terminalize retained state at most once",
+]
+forbid = [
+  "reusing retained frames before quiescence",
+  "late completion producing a second user result",
+  "pretending IOTLB invalidation completed",
+  "calling RevokeComplete merely because the closure deadline elapsed",
+]
