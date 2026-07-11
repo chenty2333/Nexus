@@ -122,6 +122,32 @@ run_spec() {
             run_tlc "PersonalityCser action properties and weak-fair liveness (no symmetry)" \
                 PersonalityCser PersonalityCserMC.cfg
             ;;
+        PersonalityFutexCser)
+            run_tlc "PersonalityFutexCser reject-enabled safety graph" \
+                PersonalityFutexCser PersonalityFutexCserSafetyMC.cfg
+            expect_reachable PersonalityFutexCser \
+                PersonalityFutexCserSafetyMC.cfg \
+                MismatchAbsent \
+                "compare mismatch returns EAGAIN without queue or credit ownership"
+            expect_reachable PersonalityFutexCser \
+                PersonalityFutexCserSafetyMC.cfg \
+                CrashAdoptCancelAbsent \
+                "crash/rebind/adopt cancels the recovery watchdog while wait remains queued"
+            expect_reachable PersonalityFutexCser \
+                PersonalityFutexCserSafetyMC.cfg \
+                WakeBeforeRevokeAbsent \
+                "wake commit wins and closure preserves the selected waiter"
+            expect_reachable PersonalityFutexCser \
+                PersonalityFutexCserSafetyMC.cfg \
+                RevokeBeforeWakeAbsent \
+                "revocation wins and the unselected wait aborts"
+            expect_reachable PersonalityFutexCser \
+                PersonalityFutexCserSafetyMC.cfg \
+                WatchdogRevokeAbsent \
+                "orphan recovery watchdog drives quiescent authority closure"
+            run_tlc "PersonalityFutexCser action properties and weak-fair kernel liveness" \
+                PersonalityFutexCser PersonalityFutexCserMC.cfg
+            ;;
         *)
             echo "unknown CSER specification: $1" >&2
             exit 2
@@ -135,10 +161,11 @@ case $# in
         run_spec PagerCser
         run_spec IoCser
         run_spec PersonalityCser
+        run_spec PersonalityFutexCser
         ;;
     1) run_spec "$1" ;;
     *)
-        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser]" >&2
+        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser]" >&2
         exit 2
         ;;
 esac

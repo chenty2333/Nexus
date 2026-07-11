@@ -36,6 +36,33 @@ workloads—futex, epoll, dynamic PIE, runtime filesystem, and runtime
 network—have not run on the new personality. The remaining retained sources
 are still pressure candidates or archive inputs, not compatibility claims.
 
+### Retained futex input audit
+
+An exact retained source is provenance, not automatically a Linux conformance
+oracle. `linux-round4-futex-smoke` preserves one old personality assumption:
+after `FUTEX_REQUEUE_PRIVATE` wakes one waiter and requeues one waiter, it
+accepts a return value of `1`. Linux's `futex_requeue` implementation counts
+both affected waiters and returns `2`; the fallback path likewise expects `0`
+after moving one waiter, where Linux returns `1`. In the audited host run, both
+waiters had reached the kernel queue, so the first requeue returned `2` and the
+unchanged program looped. If only one waiter is queued at that instant, the
+later recovery requeue can instead move the late waiter and return `1`; the
+second legacy assertion rejects that result as well.
+
+The archived source and its digest remain unchanged. The compatibility catalog
+therefore marks this workload `adaptation_required`. A Stage 6 futex gate must
+either apply a visible, reproducible adaptation to a temporary build copy or
+introduce a separately catalogued Nexus-owned input. It must also pass a host
+Linux behavior oracle. Implementing the old return convention in the Nexus
+personality is not acceptable.
+
+The futex gate is deliberately split. The Stage 6B.1 TLA+ and pure Rust
+semantics checkpoint covers one-key wait/wake, crash/rebind, a CSER recovery
+watchdog, revocation, and one-shot task wakeup; its OSTD/QEMU observation is
+still pending. Stage 6B.2 adds two-key atomic requeue plus the retained
+program's `mmap`, `clone`, thread-exit, write, and process-exit plumbing.
+Passing only 6B.1 does not complete the core futex workload.
+
 ## Build profiles
 
 - `static-raw`: `clang --target=x86_64-unknown-linux-gnu`, `-nostdlib`, static,

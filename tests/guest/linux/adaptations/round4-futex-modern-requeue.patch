@@ -1,0 +1,14 @@
+--- a/round4_futex_smoke.S
++++ b/round4_futex_smoke.S
+@@ -135,2 +135,4 @@ requeue_first:
+     cmpq $1, %rax
++    je one_waiter_woken_spin
++    cmpq $2, %rax
+     jne requeue_first
+@@ -171,4 +173,4 @@ requeue_second:
+     js fail_10
+-    test %rax, %rax
+-    jne fail_11
++    cmpq $1, %rax
++    ja fail_11
+     jmp wake_requeued

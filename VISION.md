@@ -446,9 +446,20 @@ Work proceeds through evidence gates, not feature-count milestones.
 5. **Linux pressure gate — Stage 6A bounded slice complete / Observed, Stage 6
    still in progress:** the personality TLA+ and Rust refinements plus the
    pinned `linux-hello` QEMU trace establish the narrow scheduler + file-backed
-   pager + post-commit personality recovery path described above. The futex,
-   epoll, dynamic PIE, runtime filesystem, and runtime network core workloads
-   remain unimplemented. Linux compatibility remains an evaluation vehicle.
+   pager + post-commit personality recovery path described above. Stage 6B is
+   intentionally split. **6B.1 semantics complete / implementation observation
+   pending:** the private-futex TLA+ successor and pure Rust oracle fix one-key,
+   one-waiter/one-waker wait/wake, crash/rebind/adopt, wake/revoke ordering, and
+   independent wait/wake/timer credit conservation. They do not implement the
+   OSTD/QEMU slice, a unified syscall/futex registry, a user-word store
+   transition or lost-wakeup/SMP ordering. 6B.2 must add two-key requeue plus
+   clone/mmap/thread-exit plumbing and run the explicitly adapted full round4
+   workload before the futex core workload is complete. The exact retained
+   round4 source needs that visible Linux-semantic adaptation because its legacy
+   requeue return-value assertion does not match current Linux kernel behavior;
+   Nexus will not emulate that old divergence. Futex, epoll, dynamic PIE,
+   runtime filesystem, and runtime network core workloads remain incomplete.
+   Linux compatibility remains an evaluation vehicle.
 6. **Integrated evidence gate — incremental checks exist; final Stage 7
    planned:** extend the bounded Loom gates with implementation-specific Loom
    and/or Kani checks across scheduler, pager, personality, and I/O; add a

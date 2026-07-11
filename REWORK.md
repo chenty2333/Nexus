@@ -11,9 +11,12 @@ and safe-Rust oracle plus one bounded, one-page patched-OSTD IOTLB-ownership
 receipt. Stage 5B adds a bounded real-device receipt for mediated readonly
 VirtIO, reset/tombstone recovery, and three-owner IOTLB closure. Stage 6A adds
 the bounded personality spec/oracle, one static `linux-hello` execution, and two
-same-implementation companion personality-closure scopes. The pager, device,
-and Linux results are **Observed**, not a production pager, I/O subsystem, or
-Linux personality. The foundation decision is **OSTD-first**, not
+same-implementation companion personality-closure scopes. Stage 6B.1 now adds
+a checked private-futex TLA+ successor and pure Rust oracle for bounded
+wait/wake recovery semantics; its OSTD/QEMU observation remains pending and the
+futex core workload is not complete. The pager, device, and Stage 6A Linux
+results are **Observed**, not a production pager, I/O subsystem, or Linux
+personality. The foundation decision is **OSTD-first**, not
 irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an
 upstream API or a small audited adapter/patch without violating single-owner
 hardware control, Nexus must re-evaluate the foundation explicitly. That
@@ -245,16 +248,46 @@ cases remain predicate probes, and there is no personality timeout/tombstone,
 dynamic loader, threads/futex, fd/epoll, filesystem/network, SMP or production
 capability implementation. The other five core Linux workloads remain pending.
 
+## Stage 6B.1 private-futex semantics receipt
+
+This checkpoint is recorded as **TLA+ and Rust semantics complete / OSTD
+observation pending**:
+
+- `PersonalityFutexCser.tla` keeps Stage 6A unchanged and checks one private
+  key, one waiter, one waker, `max_wake = 1`, crash/rebind/adopt, a CSER recovery
+  watchdog, wake/revoke ordering, and independent wait-slot,
+  wake-continuation, and timer-credit conservation;
+- its reject-enabled safety graph completed with 493,869 generated states,
+  29,407 distinct states, zero queued states, and depth 20; the independent
+  action/liveness graph completed with 5,192 generated states, 3,521 distinct
+  states, zero queued states, depth 18, and seven temporal branches;
+- the pure Rust successor passed 13 deterministic sequence tests and five
+  proptests. Its target-local structure test closes `k=6` target effects with
+  four index-head selections and six terminalizations while an unrelated
+  `N=96` scope remains unchanged. The local `BTreeSet` still costs `O(log k)`,
+  so this is structural evidence only, not a production `O(k)` curve;
+- the model word has no user-store transition, so the checkpoint does not prove
+  lost-wakeup or memory ordering. Futex live/blocked/revoke indexes also remain
+  local beside an empty embedded Stage 6A syscall registry, not a unified
+  syscall/futex or cross-service registry.
+
+The next gate is the one-key OSTD/QEMU micro-slice with real guest waiter/waker
+tasks, user-word comparison, kernel wake publication, watchdog cancel/expire,
+crash/rebind/adopt, fault injection, and a strict serial oracle. Stage 6B.2 then
+must add two-key `FUTEX_REQUEUE_PRIVATE`, shared-`VmSpace` tasks,
+clone/mmap/thread exit, and the adapted full round4 input. Passing Stage 6B.1
+alone does not complete the futex core workload or Stage 6.
+
 ## Current research assets
 
 | Path | Status | Disposition |
 | --- | --- | --- |
-| `specs/cser/` | **KEEP** | Normative baseline, pager, mediated-I/O, and bounded personality TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice. |
-| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, pager, mediated-I/O, and bounded personality reference semantics and differential oracles. |
+| `specs/cser/` | **KEEP** | Normative baseline, pager, mediated-I/O, bounded personality, and successor futex TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice without rewriting earlier evidence baselines. |
+| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, pager, mediated-I/O, bounded personality, and successor futex reference semantics and differential oracles. |
 | `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, the bounded pager recover/timeout slice, the IOMMU fail-closed result, and the first static `linux-hello` pressure slice. It may later be superseded by a broader prototype, but must remain runnable until then. |
 | `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for mediated readonly VirtIO, fail-closed reset/IOTLB tombstones, and three-owner queued IOTLB closure. Preserve both the Stage 5A no-device boundary and Stage 5B real-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
-| `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello` is the active Stage 6A input; the other five core workloads remain pending and the rest provide optional or archival breadth. These do not define Nexus's research identity. |
+| `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello` is the observed Stage 6A input; the other five core workloads remain pending. Exact retained sources are provenance rather than automatic conformance oracles: the round4 futex source is explicitly adaptation-required because it asserts a legacy requeue return convention. These inputs do not define Nexus's research identity. |
 | `VISION.md` | **KEEP** | Research question, exclusions, candidate contribution, and evidence threshold. |
 | `ARCHITECTURE.md` | **KEEP** | OSTD boundary, minimal kernel mechanisms, user-service boundary, and failure semantics. |
 | `REWORK.md` | **KEEP** | This migration/deletion ledger. Update it when a row changes state. |

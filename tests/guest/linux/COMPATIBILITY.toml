@@ -90,7 +90,9 @@ injection_profile = [
   "race futex wake, a CSER watchdog deadline, and scope cancellation; the retained guest passes no Linux futex timeout",
   "replay an old-binding wake or wait reply after rebind",
 ]
-expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "FallbackProgress", "BudgetConservation"]
+expected_properties = ["PostRevokeCommitExclusion", "QuiescentClosure", "SingleTerminalization", "CrashRebindFencing", "FallbackProgress", "BudgetConservation"]
+adaptation_required = ["The exact retained source expects FUTEX_REQUEUE_PRIVATE to return only the number of woken waiters. Linux futex_requeue counts both woken and requeued waiters, so the unmodified source loops after the first two-waiter requeue. Stage 6B must use an explicit reproducible adaptation or a new Nexus-owned conformance source; the personality must not emulate the legacy return value."]
+notes = "Stage 6B is split into a wait/wake recovery micro-slice and a later two-key requeue plus clone/mmap/thread-exit gate. The core workload is not complete until the adapted full program runs with Linux-compatible requeue results."
 
 [[workload]]
 id = "linux-round4-signal-smoke"
@@ -141,7 +143,7 @@ tier = "stretch"
 class = "static-smoke"
 source_ids = ["linux-round6-futex-smoke"]
 legacy_scenarios = ["specs/conformance/scenarios/starnix_round6_futex_bootstrap.toml"]
-required_behaviors = ["FUTEX_WAIT_BITSET", "FUTEX_WAKE_BITSET_PRIVATE", "robust-list owner-died on thread exit"]
+required_behaviors = ["FUTEX_WAIT_BITSET_PRIVATE", "FUTEX_WAKE_BITSET_PRIVATE", "robust-list owner-died on thread exit"]
 success_markers = ["round6 futex ok"]
 
 [[workload]]

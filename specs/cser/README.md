@@ -39,6 +39,19 @@ configuration uses one ID without symmetry. `PERSONALITY.md` records the
 semantics, coverage witnesses, checked results, and deliberately narrow model
 boundary. It is not a claim of general Linux compatibility.
 
+`PersonalityFutexCser.tla`, `PersonalityFutexCserSafetyMC.cfg`, and
+`PersonalityFutexCserMC.cfg` are the Stage 6B.1 successor refinement. They keep
+Stage 6A unchanged while adding one private futex key, one wait and one wake,
+compare/register, frozen wake selection and count, kernel wake publication,
+crash/rebind/adopt, a CSER recovery watchdog, wait/wake/timer credit
+conservation, and wake/revoke ordering. The watchdog never becomes a Linux
+futex timeout. `PERSONALITY_FUTEX.md` records the Rust refinement mapping,
+reject-enabled action check, reachability witnesses, complete TLC results, and
+the explicit exclusion of requeue, multiple waiters/keys, SMP, and the OSTD
+implementation slice. Together with the pure Rust successor, this completes the
+Stage 6B.1 semantics checkpoint only; OSTD/QEMU observation, the futex core
+workload, and Stage 6 remain incomplete.
+
 ## Linearization contract
 
 The scope state machine is:
@@ -142,9 +155,9 @@ the history needed by the invariants instead of an unbounded event log.
 ## Run the specifications
 
 The repository entry point uses the pinned Docker image, verifies that every
-checked-in PlusCal translation is current, runs the baseline, pager, and split
-I/O TLC gates in order, and writes separate logs under
-`target/verification/`:
+checked-in PlusCal translation is current, runs all five committed TLC model
+families in order—baseline, pager, mediated I/O, Linux personality, and the
+private-futex successor—and writes separate logs under `target/verification/`:
 
 ```sh
 ./x spec
@@ -159,8 +172,9 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar ./specs/cser/check.sh
 
 These commands describe implementation steps inside the container; they do not
 define a second supported host toolchain. With no argument, `check.sh` checks
-the baseline, pager, mediated-I/O, and Linux-personality models in that order.
-Pass `Cser`, `PagerCser`, `IoCser`, or `PersonalityCser` to run only one.
+the baseline, pager, mediated-I/O, Linux-personality, and private-futex
+successor models in that order. Pass `Cser`, `PagerCser`, `IoCser`,
+`PersonalityCser`, or `PersonalityFutexCser` to run only one.
 To modify an algorithm, edit only its PlusCal block and regenerate the
 translation before checking:
 
@@ -170,13 +184,15 @@ java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 1000 Cser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 1000 PagerCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 IoCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 1000 PersonalityCser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityFutexCser.tla
 ```
 
 The baseline `CserMC.cfg` instance uses three effect identifiers, two total
 credits, and at most two crash generations. The extra identifier exercises a
 failed registration opportunity while all credits are held or spent. With
 `tla2tools.jar` 1.8.0 it completes the full state graph with no error; the
-successor results are recorded separately in `PAGER.md` and `IO.md`:
+successor results are recorded separately in `PAGER.md`, `IO.md`,
+`PERSONALITY.md`, and `PERSONALITY_FUTEX.md`:
 
 ```text
 11,122 states generated

@@ -31,7 +31,13 @@ const TRACE_ACTIONS: [&str; 9] = [
     "Complete",
 ];
 
-const TLA_SPECS: [&str; 4] = ["Cser", "PagerCser", "IoCser", "PersonalityCser"];
+const TLA_SPECS: [&str; 5] = [
+    "Cser",
+    "PagerCser",
+    "IoCser",
+    "PersonalityCser",
+    "PersonalityFutexCser",
+];
 
 static NEXT_SPEC_WORKSPACE: AtomicU64 = AtomicU64::new(0);
 
@@ -485,7 +491,11 @@ fn pluscal_translation_is_current(
 ) -> Result<()> {
     section(&format!("check PlusCal translation drift for {spec}"));
     let file_name = format!("{spec}.tla");
-    let line_width = if spec == "IoCser" { "10000" } else { "1000" };
+    let line_width = if matches!(spec, "IoCser" | "PersonalityFutexCser") {
+        "10000"
+    } else {
+        "1000"
+    };
     let original_path = source_cser_dir.join(&file_name);
     let generated_path = isolated_cser_dir.join(&file_name);
     let mut command = Command::new("java");

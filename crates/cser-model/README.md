@@ -226,6 +226,59 @@ recovery/closure progress assumptions; neither artifact proves the production
 implementation. CSER therefore remains a candidate mechanism rather than an
 established contribution.
 
+The `personality::futex` module is the Stage 6B.1 successor oracle. It embeds
+one `PersonalityModel`, which remains the sole owner of authority and binding
+epochs, crash/fallback/ready/rebind state, snapshot revision, and the scope
+revoke gate. The successor contributes a bounded private-futex registry rather
+than a second authority registry. Its two internal refinement hooks validate a
+current binding and publish futex-state changes into the shared snapshot
+revision. The embedded Stage 6A syscall registry is empty in this successor;
+futex live effects and blocked tasks use separate local indexes. This proves
+reuse of one lifecycle gate, not a unified syscall+futex reverse index,
+cross-type blocked-task exclusivity, or whole-system scope closure.
+
+The model covers one configured private key per scope. A key contains address
+space identity and generation plus a four-byte-aligned virtual address. A
+successful `wait_register` is one abstract compare/credit/enqueue
+linearization point. A value mismatch returns `Again` without allocating an
+effect ID, blocking a task, changing the queue, or consuming a wait credit; the
+immediate Linux `EAGAIN` reply itself remains outside this asynchronous-effect
+model. `wake_commit` consumes one separate wake-continuation credit, creates a
+wake continuation, and freezes both its FIFO selection and its zero-or-one
+return count. The later kernel-owned publication terminalizes that wake and, if
+selected, exactly one wait without consulting the queue again.
+
+Crash arms one kernel recovery watchdog over the exact old-binding live cohort.
+Snapshot/ready/rebind use the shared gate, while each futex effect must be
+adopted explicitly. Adoption changes only its binding fence. When every cohort
+member is adopted or terminalized, the timer credit returns even if an adopted
+wait remains normally queued without a Linux timeout. Watchdog expiry instead
+enters the same scope revocation path as explicit closure and yields `Aborted`,
+never `TimedOut`. Closure drains a wake that committed first, aborts a wait for
+which revocation won, and requires empty queue/live/blocked-task indexes plus
+returned wait, wake, and timer credits before completion. Internally, a
+`VecDeque` supplies the FIFO head and a scope-local `BTreeSet` supplies the next
+committed wake; closure does not rescan all live effects or any unrelated
+scope. The executable oracle records index selections and tests an unrelated
+`N=96` population. B-tree maintenance still costs `O(log k)`, so this is a
+target-local structural bound rather than a production `O(k)` latency claim.
+
+This is a sequential executable oracle, not a production futex implementation.
+It has no requeue, guest-memory fault model, Linux timeout/timespec, signal or
+spurious-wake handling, shared/PI/robust futex state, address-space teardown,
+SMP ordering, real waiter/waker, or unified cross-service registry. The modeled
+word is an input to the compare point and has no user-store transition, so this
+artifact does not prove lost-wakeup or memory-order behavior. Capture and
+successful wait registration, and capture and wake commit, are deliberately
+folded into their respective abstract linearization points. Full token identity
+therefore applies to an already registered wait or committed wake and its later
+snapshot/adopt/publication/closure paths; it does not cover a pre-registration
+or pre-commit captured syscall packet. The separate
+`PersonalityFutexCser.tla` successor fixes the bounded temporal and fairness
+contract. Together these artifacts complete the Stage 6B.1 semantics
+checkpoint only; the OSTD/QEMU implementation observation remains a later
+evidence gate, and neither the futex core workload nor Stage 6 is complete.
+
 `Commit` is the effect commit linearization point. `RevokeBegin` atomically
 closes the old authority epoch. Effects that committed first must complete or
 drain; effects for which revocation won must abort. The model does not promise

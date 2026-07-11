@@ -14,6 +14,9 @@ use alloc::vec::Vec;
 
 use crate::{ScopeId, ScopeState};
 
+/// Bounded private-futex refinement of the personality recovery gate.
+pub mod futex;
+
 macro_rules! scalar_type {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -1586,6 +1589,42 @@ impl PersonalityModel {
             return Err(PersonalityError::WrongPersonality);
         }
         Ok(scope)
+    }
+
+    /// Validates a refinement operation against the shared personality gate.
+    ///
+    /// Success exposes no mutable gate state: successor models retain their
+    /// own effect registries while authority, binding, and fallback lifecycle
+    /// remain owned exclusively by this model.
+    pub(super) fn validate_refinement_binding(
+        &self,
+        binding: PersonalityBindingToken,
+    ) -> Result<(), PersonalityError> {
+        self.validate_binding(binding).map(|_| ())
+    }
+
+    /// Publishes a successor-model state change into snapshot freshness.
+    ///
+    /// A change after `ready` invalidates that readiness and returns fallback
+    /// to `Running`, matching the existing syscall-registry refinement. The
+    /// caller must finish all of its own fallible checks before invoking this
+    /// method so a rejected successor transition remains failure atomic.
+    pub(super) fn refinement_changed(&mut self, scope: ScopeId) -> Result<(), PersonalityError> {
+        let record = self
+            .scopes
+            .get(&scope)
+            .ok_or(PersonalityError::UnknownScope(scope))?;
+        let revision_after = Self::next_revision(record)?;
+        let record = self
+            .scopes
+            .get_mut(&scope)
+            .ok_or(PersonalityError::UnknownScope(scope))?;
+        if record.fallback == PersonalityFallbackState::ReplacementReady {
+            record.fallback = PersonalityFallbackState::Running;
+            record.ready = None;
+        }
+        Self::publish_revision(record, revision_after);
+        Ok(())
     }
 
     fn validate_syscall_token(
