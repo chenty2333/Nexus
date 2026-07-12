@@ -20,12 +20,12 @@ and success protocol while keeping these inputs as pressure tests.
 
 ## Current Stage 6 use
 
-Four of the six bounded core inputs now execute in the Docker-pinned OSTD/QEMU
+Five of the six bounded core inputs now execute in the Docker-pinned OSTD/QEMU
 personality: `linux-hello`, an explicitly adapted Round 4 futex input, an
 explicitly adapted Round 5 epoll input, and the retained dynamic-PIE launcher,
-main, and interpreter. Runtime filesystem and runtime network are still
-pending. These are narrow pressure receipts, not a general Linux-compatibility
-claim.
+main, and interpreter, plus the unchanged runtime-filesystem input. Runtime
+network is still pending. These are narrow pressure receipts, not a general
+Linux-compatibility claim.
 
 `kernel/nexus-ostd/scripts/build-guest.sh` builds the static
 `linux-hello` `ET_EXEC` directly from the unchanged retained `hello.S`; it does
@@ -105,6 +105,26 @@ publication. The guest checks auxv and both TLS images before printing exactly
 `dynamic pie ok`. Explicit FS-base load/save is observed only for one CPU and
 one TLS-bearing task; this is not a general dynamic linker, relocation, libc,
 or multi-task TLS implementation.
+
+### Retained runtime-filesystem input audit
+
+`linux-runtime-fs-smoke` is executed without source adaptation. The build gate
+fixes source SHA
+`c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f`
+and static-ELF SHA
+`0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef`.
+Pinned QEMU observes its exact 14 syscall invocations: executable and temporary
+file opens, ELF and sparse-offset reads, `statx`, `newfstatat(AT_EMPTY_PATH)`,
+`pwrite64`, relative `/proc/self/exe` `readlinkat`, closes, stdout, and `exit`.
+The strict oracle checks every receipt in order plus duplicate/count/digest/
+lifecycle mutations.
+
+The implementation is deliberately bounded in memory. A four-domain lifecycle
+companion supplies pager/filesystem/personality recovery, both write/revoke
+orders, and separate reset/IOTLB owner-retaining tombstones. A host oracle joins
+the source/ELF/sector/image digests to the independent real Stage 5B receipt as
+component consistency only. It does not establish a VFS, persistence, durable
+writes, real DMA in the primary boot, same-boot identity, or SMP behavior.
 
 ## Build profiles
 

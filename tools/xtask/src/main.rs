@@ -34,7 +34,7 @@ const TRACE_ACTIONS: [&str; 9] = [
     "Complete",
 ];
 
-const TLA_SPECS: [&str; 9] = [
+const TLA_SPECS: [&str; 10] = [
     "Cser",
     "PagerCser",
     "IoCser",
@@ -43,6 +43,7 @@ const TLA_SPECS: [&str; 9] = [
     "PersonalityFutexRequeueCser",
     "PersonalityReadinessCser",
     "PersonalityExecCser",
+    "RuntimeFsCser",
     "CompositionCser",
 ];
 
@@ -387,6 +388,7 @@ fn spec(root: &Path) -> Result<()> {
                 // states before the two witness gates and action graph. Keep
                 // a cold/shared-host run from being mislabeled as a failure.
                 "IoCser" => 1_800,
+                "RuntimeFsCser" => 900,
                 "CompositionCser" => 600,
                 _ => 300,
             }),
@@ -564,6 +566,7 @@ fn pluscal_translation_is_current(
             | "PersonalityFutexRequeueCser"
             | "PersonalityReadinessCser"
             | "PersonalityExecCser"
+            | "RuntimeFsCser"
             | "CompositionCser"
     ) {
         "10000"

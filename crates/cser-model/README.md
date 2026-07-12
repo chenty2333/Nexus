@@ -328,7 +328,7 @@ revocation after commit drains once and never restores the old image. Unlike
 the concrete QEMU receipt, this Rust abstraction records TLS and stack as
 frozen layout metadata rather than two additional effects.
 
-The current executable suite contains 129 tests. The four Stage 6B.2 additions
+The current executable suite contains 144 tests. The four Stage 6B.2 additions
 contribute 12 common-registry tests, 10 futex-requeue tests, 7 readiness tests,
 and 7 exec tests; deterministic sequences and bounded proptests cover rollback,
 stale projections, current-binding fencing, single-terminal closure, and typed
@@ -373,15 +373,36 @@ indexes, the OSTD `SpinLock` backbone, or any device code. Passing them is not a
 proof of the whole reference model, the OSTD lock implementation, SMP memory
 ordering, hardware quiescence, or system-wide liveness.
 
+The `runtime_fs` module adds 15 independent successor gates: ten deterministic
+sequences, two bounded properties, and three Loom gate machines. Its fixed
+causal graph is `Root -> Syscall -> {PagerMap, FsOperation -> BlockRequest}`.
+Authority, four service bindings, address-space, inode, and device generations
+are separate; Control, Memory, Filesystem, and DMA credits are conserved; and
+mapping, inode write, `avail.idx`, and reply are distinct publication points.
+All public transitions clone-then-validate so rejected operations preserve the
+complete model projection.
+
+The sequence gates cover normal child-first closure, revoke-before-write, a
+visible pwrite whose uncommitted syscall reply is correctly absent, one-shot
+Closing reply completion, pager/filesystem crash and explicit adoption,
+committed device drain after block-service crash, Reset timeout/retry, IOTLB
+timeout/retry, and every stale generation. Reset timeout and retry preserve the
+device generation; only ResetAck advances it. A reset or IOTLB tombstone retains
+the exact block identity and DMA credit, and only IOTLB Ack returns that credit.
+The Loom gates are bounded surrogate machines for write/revoke, completion/
+ResetAck, and timeout/retry/IOTLB ordering; they are not the OSTD lock, a block
+driver, or an SMP/DMA proof.
+
 The pinned OSTD/QEMU successor independently executes the adapted retained
 Round 4 futex program, the adapted retained Round 5 epoll program plus a
 readiness lifecycle companion, and a retained dynamic PIE launcher/main/
-interpreter path. Those bounded observations complete four of the six core
-Linux pressure inputs when combined with `linux-hello`; runtime filesystem and
-runtime network remain pending. They do not establish a cross-service registry
-or complete Stage 6 by themselves. The later bounded composition receipt
-observes the fixed five-domain root gate separately; it does not add the two
-remaining Linux workloads or run the real VirtIO device in the same boot.
+interpreter path, followed by the unchanged runtime-filesystem ELF and its
+four-domain lifecycle companion. Those bounded observations complete five of
+the six core Linux pressure inputs when combined with `linux-hello`; runtime
+network remains pending. They do not establish a production cross-service
+registry or complete Stage 6 by themselves. The frozen bounded composition
+receipt observes its fixed five-domain root gate separately; it does not absorb
+the filesystem successor or run the real VirtIO device in the same boot.
 
 `Commit` is the effect commit linearization point. `RevokeBegin` atomically
 closes the old authority epoch. Effects that committed first must complete or

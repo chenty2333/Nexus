@@ -16,9 +16,11 @@ a checked private-futex TLA+ successor, pure Rust oracle, and bounded OSTD/QEMU
 wait/wake recovery slice. Stage 6B.2 adds the personality-local common effect
 registry, two-key requeue, readiness, and failure-atomic exec successors plus
 pinned QEMU receipts for adapted Round 4 futex, adapted Round 5 epoll, and
-retained dynamic PIE. Four of six bounded Linux core inputs are now Observed;
-runtime filesystem, runtime network, and the Linux pressure program remain
-incomplete. A separate system-composition checkpoint now adds the bounded
+retained dynamic PIE. The runtime-filesystem successor adds checked four-domain
+semantics, safe-Rust/property/Loom gates, the unchanged 14-syscall retained ELF,
+and digest-bound Stage 5B component consistency. Five of six bounded Linux core
+inputs are now Observed; runtime network and the Linux pressure program remain
+incomplete. A separate system-composition checkpoint adds the bounded
 five-domain TLA+/Rust/Loom successor, one OSTD root-authority receipt, and a
 strict split-stream component-consistency check against the existing Stage 5B
 VirtIO/DMA receipt and QEMU device trace.
@@ -139,7 +141,7 @@ The following extractions are already present in the new tree:
 | six selected old vertical-slice observations | `specs/oracles/legacy-slices.toml` | schema v1 parses; no legacy build command is retained |
 | 34 Linux C/assembly guest inputs | `tests/guest/linux/sources/` | every copy matches both its legacy source and the SHA-256 in `SOURCES.toml` |
 | 28 old Linux compatibility scenarios plus one superseded guest input | `tests/guest/linux/COMPATIBILITY.toml` | all source IDs resolve and all 34 copied inputs are referenced; only six `core` workloads are Stage 6 commitments, with the remainder marked `stretch` or `archive-input` |
-| bounded Linux pressure inputs | four retained core inputs -> isolated OSTD guest artifacts | Docker builds unchanged `linux-hello`, temporarily adapted Round 4 and Round 5 inputs, and the retained dynamic PIE set; source/patch/adapted/artifact gates and strict QEMU oracles leave only runtime filesystem and runtime network unexecuted |
+| bounded Linux pressure inputs | five retained core inputs -> isolated OSTD guest artifacts | Docker builds unchanged `linux-hello` and runtime filesystem, temporarily adapted Round 4 and Round 5 inputs, and the retained dynamic PIE set; source/patch/adapted/artifact gates and strict QEMU oracles leave only runtime network unexecuted |
 
 These receipts do not authorize deletion by themselves; the build, CI, and
 neutral-runner gates above must pass in the same cleanup checkpoint.
@@ -299,7 +301,8 @@ dynamic loader, threads/futex, fd/epoll, filesystem/network, SMP or production
 capability implementation. The other five core Linux workloads remain pending.
 That sentence records the Stage 6A checkpoint: the Stage 6B.2 receipt below
 subsequently closes the bounded futex, epoll, and dynamic PIE inputs, leaving
-runtime filesystem and runtime network pending.
+runtime filesystem and runtime network pending at that checkpoint. The later
+runtime-filesystem successor below closes the former, leaving runtime network.
 
 ## Stage 6B.1 private-futex receipt
 
@@ -390,10 +393,52 @@ QEMU slices Observed**:
   interpreter/main TLS, FS-base load/save, stdout, write/exit publication, and
   12/12 credit return are observed.
 
-These are personality-local, single-CPU bounded receipts. They do not provide
+These Stage 6B.2 receipts are personality-local and single-CPU. By themselves they do not provide
 general futex/epoll/dynamic-linker ABI, lost-wakeup or SMP evidence, runtime
 filesystem/network, a scheduler/pager/personality/I/O registry, integrated
 fault-matrix evaluation, `k/N` curves, or a final originality judgment.
+
+## Stage 6 runtime-filesystem receipt
+
+This checkpoint is recorded as **bounded four-domain semantics complete /
+unchanged retained OSTD/QEMU input Observed**:
+
+- `RuntimeFsCser` fixes the four-effect graph
+  `Root -> Syscall -> {PagerMap, FsOperation -> BlockRequest}`, independent
+  service bindings, root/address-space/inode/device generations, four typed
+  credits, and separate mapping/write/queue/reply publication. The safety graph
+  explores 2,262,368 generated / 635,313 distinct states at depth 35; the
+  action graph explores 80,108 / 44,768 at depth 29; all eight witnesses pass;
+- the safe-Rust successor adds ten deterministic, two property, and three Loom
+  gates. Rejections are checked against clone equality, reset timeout/retry
+  preserves device generation until ResetAck, and DMA credit remains owned until
+  IOTLB Ack;
+- the retained source SHA is
+  `c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f`.
+  The pinned static ELF SHA is
+  `0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef`;
+  the build rejects source/artifact mutation and structural ELF drift;
+- pinned one-CPU QEMU executes the unchanged input's exact 14 syscall
+  invocations. The bounded in-memory service supplies executable and temporary
+  regular inodes plus `/proc/self/exe`; commit precedes fd/inode mutation,
+  guest-memory publication is acknowledged once, stdout is exact, and the
+  registry closes with all credits free;
+- the lifecycle companion uses actual independent pager, filesystem,
+  personality, and block binding state. Full registry/effect/domain/inode or
+  DMA projections remain unchanged on stale calls. Reset and IOTLB timeouts use
+  distinct tombstones; device generation advances only after ResetAck, while
+  three abstract owners release only after IOTLB Ack;
+- the host composition oracle reconstructs and binds the 512-byte sector SHA
+  `9cb83be92a4c9239752718e6e20ac00fe9e32842ea561ae7fedec94b620a05cc`,
+  full readonly-image SHA
+  `27a4e8fed7b428b42ff04e3f62eadfe2e3f3310dac4e2fe8ecfff04be3cca254`,
+  and sector FNV to the existing real Stage 5B log.
+
+The last relation is `component_consistency`, with `same_boot=false`,
+`identity_preserving=false`, and no real DMA in the primary filesystem boot.
+This is not a VFS, persistent/durable write path, general procfs, page cache,
+multi-client/SMP implementation, or runtime-network result. The historical
+five-domain composition receipt remains frozen with `runtime_fs=false`.
 
 ## System-wide CSER composition receipt
 
@@ -424,10 +469,11 @@ Checked and Observed**:
   the independent composition generation-3-to-4 envelope with Stage 5B request
   1 or its generation-1-to-2 lifecycle.
 
-This does not run five production services or real VirtIO DMA in one boot. It
-does not add runtime filesystem/network, an unbounded causal graph, SMP,
+This does not run five production services or real VirtIO DMA in one boot. This
+frozen predecessor does not add runtime filesystem/network, an unbounded causal graph, SMP,
 production capability transport, a parameterized system fault matrix, `k/N`
-curves, overhead evaluation, or a final originality judgment.
+curves, overhead evaluation, or a final originality judgment. The separate
+runtime-filesystem successor above does not widen its identities or graph.
 
 ## Current research assets
 
@@ -438,7 +484,7 @@ curves, overhead evaluation, or a final originality judgment.
 | `kernel/nexus-ostd/` | **KEEP** | Maintained formal OSTD prototype for the CSER registry/composition mechanism, scheduler/pager/readiness domains, bounded personality pressure paths, and the five-domain root receipt. It remains an isolated cargo-osdk workspace so the reference model does not absorb implementation transitions. |
 | `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for mediated readonly VirtIO, fail-closed reset/IOTLB tombstones, and three-owner queued IOTLB closure. Preserve both the Stage 5A no-device boundary and Stage 5B real-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
-| `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello`, adapted Round 4 futex, adapted Round 5 epoll, and dynamic PIE have bounded observed receipts; runtime filesystem and network remain pending. Exact retained sources are provenance rather than automatic conformance oracles, so visible temporary adaptations correct obsolete futex and regular-file epoll expectations. These inputs do not define Nexus's research identity. |
+| `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello`, adapted Round 4 futex, adapted Round 5 epoll, dynamic PIE, and the unchanged runtime filesystem have bounded observed receipts; runtime network remains pending. Exact retained sources are provenance rather than automatic conformance oracles, so visible temporary adaptations correct obsolete futex and regular-file epoll expectations. These inputs do not define Nexus's research identity. |
 | `VISION.md` | **KEEP** | Research question, exclusions, candidate contribution, and evidence threshold. |
 | `ARCHITECTURE.md` | **KEEP** | OSTD boundary, minimal kernel mechanisms, user-service boundary, and failure semantics. |
 | `REWORK.md` | **KEEP** | This migration/deletion ledger. Update it when a row changes state. |

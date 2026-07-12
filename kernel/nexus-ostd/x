@@ -26,6 +26,7 @@ image_key=$(sha256sum \
     "$repo_root/tests/guest/linux/sources/linux-round5-epoll-smoke/round5_epoll_smoke.S" \
     "$repo_root/tests/guest/linux/adaptations/round5-epoll-linux-regular-file.patch" \
     "$repo_root/tests/guest/linux/adaptations/verify-round5-epoll-adaptation.sh" \
+    "$repo_root/tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S" \
     "$root/Cargo.toml" \
     "$root/Cargo.lock" \
     "$root/OSDK.toml" \
@@ -43,6 +44,8 @@ image_key=$(sha256sum \
     "$root/scripts/check-scheduler-attempt.sh" \
     "$root/scripts/build-round4.sh" \
     "$root/scripts/build-round5.sh" \
+    "$root/scripts/build-runtime-fs.sh" \
+    "$root/scripts/assert-runtime-fs-artifacts.sh" \
     "$root/guest/linux-futex-shared.S" \
     "$root/guest/linux-futex-personality-v1.S" \
     "$root/guest/linux-futex-personality-v2.S" \
@@ -153,6 +156,42 @@ check_oracles() {
     '
 }
 
+check_runtime_fs_artifact_negatives() {
+    container bash -c '
+        set -euo pipefail
+        tmp=$(mktemp -d)
+        trap '\''rm -rf "$tmp"'\'' EXIT
+        source=/repo/tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S
+        oracle=scripts/assert-runtime-fs-artifacts.sh
+
+        cp guest/linux-runtime-fs.elf "$tmp/appended.elf"
+        printf x >>"$tmp/appended.elf"
+        if bash "$oracle" "$source" "$tmp/appended.elf" >/dev/null 2>&1; then
+            echo "runtime filesystem artifact oracle accepted appended ELF bytes" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/mutated.S"
+        printf "\n" >>"$tmp/mutated.S"
+        if bash "$oracle" "$tmp/mutated.S" guest/linux-runtime-fs.elf >/dev/null 2>&1; then
+            echo "runtime filesystem artifact oracle accepted mutated retained source" >&2
+            exit 1
+        fi
+
+        if bash scripts/build-runtime-fs.sh "$tmp/wrong-digest.elf" \
+            0000000000000000000000000000000000000000000000000000000000000000 \
+            >/dev/null 2>&1; then
+            echo "runtime filesystem build accepted wrong expected digest" >&2
+            exit 1
+        fi
+        if [[ -e $tmp/wrong-digest.elf ]]; then
+            echo "runtime filesystem build published an artifact after digest failure" >&2
+            exit 1
+        fi
+        echo "runtime filesystem artifact negative assertions: PASS appended_elf=rejected mutated_source=rejected wrong_digest=rejected failed_output_absent=true"
+    '
+}
+
 format_all() {
     container cargo fmt --all
     container cargo fmt \
@@ -256,6 +295,7 @@ case "$command" in
         fmt_check
         check_oracles
         prepare_guest
+        check_runtime_fs_artifact_negatives
         check_kernel
         check_personality
         clippy_all
@@ -283,11 +323,13 @@ case "$command" in
     test)
         ensure_image
         prepare_guest
+        check_runtime_fs_artifact_negatives
         mkdir -p "$root/artifacts"
         container bash scripts/check-iotlb-gap.sh
         run_kernel | tee "$root/artifacts/serial.log"
         "$root/scripts/assert-serial.sh" "$root/artifacts/serial.log"
         awk -f "$root/scripts/assert-linux-dynamic.awk" "$root/artifacts/serial.log"
+        awk -f "$root/scripts/assert-linux-fs.awk" "$root/artifacts/serial.log"
         if sed 's/exec_commits=1/exec_commits=2/' "$root/artifacts/serial.log" \
             | awk -f "$root/scripts/assert-linux-dynamic.awk" >/dev/null 2>&1; then
             echo 'dynamic PIE oracle accepted exec_commits=2 mutation' >&2
@@ -315,6 +357,41 @@ case "$command" in
             exit 1
         fi
         echo 'dynamic PIE serial negative assertions: PASS exec_commits=2=rejected duplicate_pass=rejected snapshot_ready_swap=rejected'
+        if sed 's/syscalls=14 openat=3/syscalls=15 openat=3/' \
+            "$root/artifacts/serial.log" \
+            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
+            echo 'runtime filesystem oracle accepted syscalls=15 mutation' >&2
+            exit 1
+        fi
+        if sed '/^LINUX_FS_SLICE PASS /p' "$root/artifacts/serial.log" \
+            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
+            echo 'runtime filesystem oracle accepted duplicate PASS evidence' >&2
+            exit 1
+        fi
+        if sed \
+            's/elf_sha256=0dc5ad40/elf_sha256=1dc5ad40/' \
+            "$root/artifacts/serial.log" \
+            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
+            echo 'runtime filesystem oracle accepted ELF digest mutation' >&2
+            exit 1
+        fi
+        if awk '
+            { lines[NR] = $0 }
+            /^FILESYSTEM_LIFECYCLE PwriteRace winner=commit / { commit_first = NR }
+            /^FILESYSTEM_LIFECYCLE PwriteRace winner=revoke / { revoke_first = NR }
+            END {
+                swapped = lines[commit_first]
+                lines[commit_first] = lines[revoke_first]
+                lines[revoke_first] = swapped
+                for (line = 1; line <= NR; line++)
+                    print lines[line]
+            }
+        ' "$root/artifacts/serial.log" \
+            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
+            echo 'runtime filesystem oracle accepted pwrite witness reordering' >&2
+            exit 1
+        fi
+        echo 'runtime filesystem serial negative assertions: PASS syscall_count=rejected duplicate_pass=rejected elf_digest=rejected pwrite_order=rejected'
         ;;
     clean)
         # Do not make cleanup depend on Docker or on a prebuilt image.

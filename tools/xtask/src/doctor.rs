@@ -13,6 +13,7 @@ const REQUIRED_PATHS: &[&str] = &[
     "kernel/nexus-ostd/Cargo.toml",
     "experiments/ostd-virtio-cser-spike/Cargo.toml",
     "tools/workflow/system-composition.sh",
+    "tools/workflow/runtime-fs-composition.sh",
     "specs/oracles/cser-races.toml",
     "tests/guest/linux/SOURCES.toml",
 ];

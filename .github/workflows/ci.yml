@@ -45,7 +45,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify CSER models and the bounded five-domain composition prototype
+      - name: Verify CSER models, the five-domain predecessor, and runtime-filesystem successor
         run: ./x verify
       - name: Upload successful verification manifest
         if: success()

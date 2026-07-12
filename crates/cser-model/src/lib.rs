@@ -16,6 +16,7 @@ pub mod io;
 mod model;
 pub mod pager;
 pub mod personality;
+pub mod runtime_fs;
 
 pub use model::Model;
 

@@ -482,10 +482,30 @@ new `VmSpace` after a single atomic ExecCommit. It observes auxv, interpreter
 and main TLS, explicit FS-base load/save, exact output, and complete credit
 return.
 
-Those are single-CPU bounded observations. They are not general futex, epoll,
-dynamic-linker, filesystem, network, or SMP results. Four of six core Linux
-inputs are now observed; runtime filesystem and runtime network remain before
-the Linux pressure program can close.
+The runtime-filesystem successor adds the fifth bounded core receipt without
+widening those predecessors. `RuntimeFsCser` checks a fixed four-domain
+personality/pager/filesystem/block graph with independent bindings, typed
+credits, PTE/inode/block/reply publication points, both write/revoke orders,
+and owner-retaining reset/IOTLB tombstones. Its safety graph has 2,262,368
+generated / 635,313 distinct states at depth 35; its action graph has 80,108 /
+44,768 states at depth 29, and eight required witnesses are reachable. Fifteen
+safe-Rust/property/Loom gates independently exercise the same bounded protocol.
+
+Pinned QEMU then executes the unchanged `linux-runtime-fs-smoke` ELF through
+all 14 syscalls and a common-registry commit/publication boundary. Its lifecycle
+companion actually advances independent pager, filesystem, personality, and
+block bindings; fences complete state projections; retains abstract block
+owners through separate reset and IOTLB timeouts; advances device generation
+only after ResetAck; and releases only after IOTLB Ack. A strict cross-log
+oracle binds retained-source, ELF, sector, and full-image digests to the
+existing real Stage 5B VirtIO receipt. That relation is explicitly component
+consistency, not same-boot or identity-preserving device composition, and the
+primary filesystem boot does not claim real DMA.
+
+These are single-CPU bounded observations. They are not general futex, epoll,
+dynamic-linker, VFS/persistence, network, or SMP results. Five of six core Linux
+inputs are now observed; runtime network remains before the Linux pressure
+program can close.
 
 The follow-on composition receipt is a separate bounded checkpoint. In one
 OSTD boot, one root authority coordinates the existing scheduler, pager,
@@ -514,8 +534,9 @@ on retry.
 Therefore the system-wide CSER composition prototype across the five
 existing bounded domains is **Checked / Observed**, but the real device receipt
 is consistency/prerequisite evidence rather than the same composed effect. The
-prototype is single-CPU, uses a fixed six-node/five-edge causal graph, and adds
-neither runtime filesystem nor runtime network.
+prototype is single-CPU and uses a fixed six-node/five-edge causal graph. It
+adds neither runtime filesystem nor runtime network; the later filesystem
+successor is separate evidence and leaves this predecessor frozen.
 
 ## Research gates
 
@@ -545,7 +566,8 @@ Work proceeds through evidence gates, not feature-count milestones.
    generation fencing, and conditional `Quiesced`. This admits the prototype to integrated
    validation; the hardware-general, IRQ, SMP, multi-client, domain-isolation,
    persistence, and real-deadline gaps remain open.
-5. **Linux pressure gate — Stage 6A, 6B.1, and bounded Stage 6B.2 slices
+5. **Linux pressure gate — Stage 6A, 6B.1, bounded Stage 6B.2, and runtime
+   filesystem slices
    Checked / Observed; Stage 6 still in progress:** Stage 6A establishes the
    narrow scheduler + file-backed pager + post-commit `linux-hello` recovery
    path. Stage 6B.1 freezes the one-key private-futex predecessor. Stage 6B.2
@@ -553,10 +575,12 @@ Work proceeds through evidence gates, not feature-count milestones.
    exec successors, then observes the adapted retained Round 4 futex, adapted
    Round 5 epoll, and retained dynamic PIE paths described above. The visible
    adaptations correct obsolete requeue-count and regular-file epoll
-   expectations; Nexus does not emulate either divergence. This completes four
-   of the six bounded core inputs, not Linux compatibility. Runtime filesystem,
-   runtime network, and general ABI/SMP behavior remain open. Linux remains an
-   evaluation vehicle rather than the research identity.
+   expectations; Nexus does not emulate either divergence. The runtime-
+   filesystem successor adds checked four-domain semantics, 15 Rust gates, an
+   unchanged exact 14-syscall QEMU input, and digest-bound Stage 5B component
+   consistency. This completes five of the six bounded core inputs, not Linux
+   compatibility. Runtime network and general ABI/VFS/SMP behavior remain open.
+   Linux remains an evaluation vehicle rather than the research identity.
 6. **System-wide composition gate — bounded prototype complete / Checked and
    Observed:** `CompositionCser`, the safe-Rust/Loom successor, and the OSTD
    composition receipt agree on one root gate across scheduler, pager,
@@ -566,7 +590,9 @@ Work proceeds through evidence gates, not feature-count milestones.
    Stage 5B boot supplies the required DMA/reset/IOTLB component evidence; it
    does not identify the Stage 5B effect, ticket, or generation with the
    composition adapter. Unbounded graphs, SMP, production portals, runtime
-   filesystem/network, and a general mixed-workload fault matrix remain open.
+   network, same-boot filesystem/device identity, and a general mixed-workload
+   fault matrix remain open. The filesystem successor does not rewrite this
+   frozen five-domain predecessor.
 7. **Engineering consolidation gate — Stage 7A complete:** the primary OSTD
    implementation is promoted from an experiment to `kernel/nexus-ostd` with
    explicit CSER/domain/personality/probe ownership; the largest independent

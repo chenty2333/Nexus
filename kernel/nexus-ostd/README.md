@@ -403,6 +403,46 @@ scope unification, SMP concurrency validation, or the final CSER contribution
 judgment. The separate follow-on checkpoint below addresses only the bounded
 composition item.
 
+### Bounded runtime filesystem
+
+The Stage 6 runtime-filesystem successor builds the unchanged retained
+`runtime_fs_smoke.S` into a static x86-64 `ET_EXEC`. The fail-closed build fixes
+source SHA
+`c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f`
+and artifact SHA
+`0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef`,
+and rejects dynamic dependencies, relocations, executable stack, W+X, or source
+and artifact mutation. The shared loader retains one-page stacks for existing
+inputs and maps exactly two pages for this unchanged guest, whose entry reserves
+4096 bytes below its initial stack pointer.
+
+Pinned one-CPU QEMU executes exactly 14 Linux syscall invocations through real
+OSTD `UserMode`: three `openat`, two `pread64`, `statx`, `newfstatat` with
+`AT_EMPTY_PATH`, `pwrite64("xy", offset=2)`, relative
+`readlinkat(proc-self-fd, "exe")`, three closes, exact stdout, and `exit(0)`.
+The bounded service owns only an in-memory executable inode, one temporary inode,
+and `/proc/self/exe`. Every continuation uses the common effect registry; the
+commit receipt exists before fd/inode mutation, guest-memory output is a later
+publication, and all 14 tickets are acknowledged before scope closure.
+
+The lifecycle companion has actual independent pager, filesystem, personality,
+and block binding state. Prepared pager/filesystem effects require snapshot,
+Ready, rebind, and explicit adoption; a committed reply can complete from its
+immutable receipt while the personality is absent. Both pwrite/revoke orders and
+every stale call compare the registry, effect, domain, inode, or block projection
+for zero mutation. Separate reset and IOTLB tombstones retain three abstract
+owners; timeout does not advance device generation, ResetAck advances it, and
+only IOTLB Ack releases ownership.
+
+The primary boot has no real DMA. `tools/workflow/runtime-fs-composition.sh`
+joins it to the independent real Stage 5B boot using source/ELF digests, the
+reconstructed sector SHA
+`9cb83be92a4c9239752718e6e20ac00fe9e32842ea561ae7fedec94b620a05cc`,
+sector FNV, and full readonly-image SHA
+`27a4e8fed7b428b42ff04e3f62eadfe2e3f3310dac4e2fe8ecfff04be3cca254`.
+This is `component_consistency`, with `same_boot=false` and
+`identity_preserving=false`; it is not a general or persistent filesystem.
+
 ### Bounded system-wide CSER composition
 
 The follow-on composition slice installs one root authority over five existing
@@ -444,10 +484,11 @@ share the composition effect, ticket, or generation identity. This is therefore
 not an identity-preserving refinement or a same-boot claim about five
 production services and real device DMA.
 
-The receipt is one CPU with a fixed six-node/five-edge graph. It does not add
-runtime filesystem or network, SMP composition, a production opaque authority
+The receipt is one CPU with a fixed six-node/five-edge graph. This frozen
+predecessor does not add runtime filesystem or network, SMP composition, a production opaque authority
 transport, a parameterized fault matrix, `k/N` curves, overhead evaluation, or
-a final originality judgment.
+a final originality judgment. The separate filesystem successor above does not
+retroactively change its `runtime_fs=false` receipt.
 
 ## IOMMU result: fail closed
 

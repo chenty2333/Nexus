@@ -370,6 +370,10 @@ fn write_authorized(
             evidence: vec![String::from("kernel/nexus-ostd/artifacts/serial.log")],
         },
         Stage {
+            id: "ostd-runtime-filesystem",
+            evidence: vec![String::from("kernel/nexus-ostd/artifacts/serial.log")],
+        },
+        Stage {
             id: "mediated-virtio",
             evidence: vec![
                 String::from("experiments/ostd-virtio-cser-spike/artifacts/kernel.log"),
@@ -381,6 +385,12 @@ fn write_authorized(
             id: "system-composition",
             evidence: vec![String::from(
                 "target/verification/system-composition-oracle.log",
+            )],
+        },
+        Stage {
+            id: "runtime-filesystem-composition",
+            evidence: vec![String::from(
+                "target/verification/runtime-fs-composition-oracle.log",
             )],
         },
     ];
@@ -403,7 +413,7 @@ fn write_authorized(
             single_cpu: true,
             cross_fd_total_order_claimed: false,
             identity_preserving_stage5b_composition: false,
-            runtime_filesystem: false,
+            runtime_filesystem: true,
             runtime_network: false,
         },
         specifications: specs.iter().map(|spec| String::from(*spec)).collect(),
@@ -705,6 +715,10 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
         (
             String::from("target/verification/system-composition-oracle.log"),
             Some("missing_iotlb_trace=rejected"),
+        ),
+        (
+            String::from("target/verification/runtime-fs-composition-oracle.log"),
+            Some("RUNTIME_FS_COMPOSITION PASS"),
         ),
     ]
 }

@@ -81,6 +81,18 @@ post-commit revocation drains without rollback. The complete safety graph has
 generated / 137 distinct states at depth 14, with three temporal branches and
 six reachability witnesses.
 
+`RuntimeFsCser.tla`, its safety/action configurations, and `RUNTIME_FS.md`
+fix the bounded runtime-filesystem successor across independently restartable
+personality, pager, filesystem, and block domains. The model separates pager
+mapping, inode-write, block `avail.idx`, and guest-reply publication points;
+tracks authority, binding, address-space, inode, and device generations; and
+retains DMA ownership through reset/IOTLB timeout tombstones and retry. Its
+reject-enabled safety graph has 2,262,368 generated / 635,313 distinct states
+at depth 35; its action graph has 80,108 generated / 44,768 distinct states at
+depth 29. Eight required witnesses cover both revoke/write orders, three
+service-recovery cases, both timeout stages, and all stale-token fences. This
+is a finite protocol model, not a filesystem, block driver, or DMA proof.
+
 `CompositionCser.tla`, its safety/action configurations, and `COMPOSITION.md`
 fix the bounded Stage 6C system-wide composition contract across scheduler,
 pager, personality, readiness, and VirtIO domain registries. One root authority
@@ -113,7 +125,8 @@ boundary of the frozen predecessor. The separate Stage 6B.2 successors add a
 personality-local common registry, bounded two-key requeue, readiness, and exec
 semantics plus independent OSTD/QEMU receipts. They do not establish a registry
 shared with scheduler, pager, mediated I/O, filesystem, or network services;
-runtime filesystem/network and full Stage 6 therefore remain incomplete.
+the later runtime-filesystem successor is separate from those frozen
+predecessors; runtime network and full Stage 6 remain incomplete.
 
 ## Linearization contract
 
@@ -218,9 +231,10 @@ the history needed by the invariants instead of an unbounded event log.
 ## Run the specifications
 
 The repository entry point uses the pinned Docker image, verifies that every
-checked-in PlusCal translation is current, runs all nine checked-in TLC model
+checked-in PlusCal translation is current, runs all ten checked-in TLC model
 families in order—baseline, pager, mediated I/O, Linux personality, private
-futex, two-key futex requeue, readiness, exec, and five-domain composition—and
+futex, two-key futex requeue, readiness, exec, runtime filesystem, and
+five-domain composition—and
 writes separate logs under `target/verification/`:
 
 ```sh
@@ -236,10 +250,10 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar ./specs/cser/check.sh
 
 These commands describe implementation steps inside the container; they do not
 define a second supported host toolchain. With no argument, `check.sh` checks
-all nine families in the order above. Pass `Cser`, `PagerCser`, `IoCser`,
+all ten families in the order above. Pass `Cser`, `PagerCser`, `IoCser`,
 `PersonalityCser`, `PersonalityFutexCser`,
 `PersonalityFutexRequeueCser`, `PersonalityReadinessCser`,
-`PersonalityExecCser`, or `CompositionCser` to run only one.
+`PersonalityExecCser`, `RuntimeFsCser`, or `CompositionCser` to run only one.
 To modify an algorithm, edit only its PlusCal block and regenerate the
 translation before checking:
 
@@ -253,6 +267,7 @@ java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityFutexCse
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityFutexRequeueCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityReadinessCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityExecCser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 RuntimeFsCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 CompositionCser.tla
 ```
 
@@ -262,9 +277,9 @@ failed registration opportunity while all credits are held or spent. With
 `tla2tools.jar` 1.8.0 it completes the full state graph with no error; the
 successor results are recorded separately in `PAGER.md`, `IO.md`,
 `PERSONALITY.md`, `PERSONALITY_FUTEX.md`,
-`PERSONALITY_FUTEX_REQUEUE.md`, `PERSONALITY_READINESS.md`, and
-`PERSONALITY_EXEC.md`, with the composition successor recorded separately in
-`COMPOSITION.md`:
+`PERSONALITY_FUTEX_REQUEUE.md`, `PERSONALITY_READINESS.md`,
+`PERSONALITY_EXEC.md`, and `RUNTIME_FS.md`, with the composition successor
+recorded separately in `COMPOSITION.md`:
 
 ```text
 11,122 states generated

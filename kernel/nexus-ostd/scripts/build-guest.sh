@@ -212,3 +212,5 @@ bash scripts/assert-dynamic-pie-artifacts.sh \
     guest/linux-dynamic-runtime-interp.elf
 
 bash scripts/build-round5.sh guest/linux-round5-epoll.elf
+
+bash scripts/build-runtime-fs.sh guest/linux-runtime-fs.elf

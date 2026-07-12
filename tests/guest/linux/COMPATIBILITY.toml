@@ -247,6 +247,7 @@ injection_profile = [
   "replay a stale block completion after service rebind",
 ]
 expected_properties = ["PostRevokeCommitExclusion", "QuiescentClosure", "SingleTerminalization", "CrashRebindFencing", "BudgetConservation"]
+notes = "Stage 6 executes this unchanged retained input as a digest-pinned static ELF in one-CPU OSTD/QEMU. The exact 14-syscall receipt covers executable and temporary inodes, sparse-offset pwrite/pread, statx, newfstatat AT_EMPTY_PATH, relative /proc/self/exe readlinkat, close, stdout, and exit through the common effect registry. A separate four-domain lifecycle companion observes pager/filesystem/personality binding recovery, both pwrite/revoke orders, reset and IOTLB owner-retaining tombstones, device-generation fencing, and full stale-call projection equality. The primary boot uses bounded in-memory filesystem/block state and no real DMA; a strict source/ELF/sector/full-image digest oracle joins the existing real Stage 5B boot only as component_consistency with same_boot=false and identity_preserving=false. This is not a general VFS, persistence, durable write, or SMP claim."
 
 [[workload]]
 id = "linux-runtime-misc-smoke"

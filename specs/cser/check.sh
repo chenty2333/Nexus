@@ -232,6 +232,44 @@ run_spec() {
             run_tlc "PersonalityExecCser action properties and weak-fair kernel liveness" \
                 PersonalityExecCser PersonalityExecCserMC.cfg
             ;;
+        RuntimeFsCser)
+            run_tlc "RuntimeFsCser four-domain reject-enabled safety graph" \
+                RuntimeFsCser RuntimeFsCserSafetyMC.cfg
+            expect_reachable RuntimeFsCser \
+                RuntimeFsCserSafetyMC.cfg \
+                FourDomainPwriteClosureAbsent \
+                "four-domain pwrite workload closes child-first and returns all credits"
+            expect_reachable RuntimeFsCser \
+                RuntimeFsCserSafetyMC.cfg \
+                RevokeBeforePwriteAbsent \
+                "revocation before pwrite preserves zero bytes and publishes no reply"
+            expect_reachable RuntimeFsCser \
+                RuntimeFsCserSafetyMC.cfg \
+                PagerCrashAdoptMapAbsent \
+                "pager crash requires explicit adoption before one PTE and TLB publication"
+            expect_reachable RuntimeFsCser \
+                RuntimeFsCserSafetyMC.cfg \
+                FsCrashAdoptWriteAbsent \
+                "filesystem crash requires explicit adoption before one inode publication"
+            expect_reachable RuntimeFsCser \
+                RuntimeFsCserSafetyMC.cfg \
+                BlockCrashDeviceDrainAbsent \
+                "committed block request drains through the device without adoption"
+            expect_reachable RuntimeFsCser \
+                RuntimeFsCserSafetyMC.cfg \
+                ResetTimeoutRetryClosureAbsent \
+                "reset timeout retains DMA through retry and fresh closure"
+            expect_reachable RuntimeFsCser \
+                RuntimeFsCserSafetyMC.cfg \
+                IotlbTimeoutRetryClosureAbsent \
+                "IOTLB timeout retains owner and outcome through retry"
+            expect_reachable RuntimeFsCser \
+                RuntimeFsCserSafetyMC.cfg \
+                StaleTokenFencesAbsent \
+                "all generation classes and stale timeout receipt reject without mutation"
+            run_tlc "RuntimeFsCser action properties and conditional revocation progress" \
+                RuntimeFsCser RuntimeFsCserMC.cfg
+            ;;
         CompositionCser)
             run_tlc "CompositionCser five-domain safety graph" \
                 CompositionCser CompositionCserSafetyMC.cfg
@@ -271,11 +309,12 @@ case $# in
         run_spec PersonalityFutexRequeueCser
         run_spec PersonalityReadinessCser
         run_spec PersonalityExecCser
+        run_spec RuntimeFsCser
         run_spec CompositionCser
         ;;
     1) run_spec "$1" ;;
     *)
-        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|CompositionCser]" >&2
+        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|RuntimeFsCser|CompositionCser]" >&2
         exit 2
         ;;
 esac

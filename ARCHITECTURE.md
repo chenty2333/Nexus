@@ -626,9 +626,9 @@ as a page fault plus timer plus epoll wait plus socket or file I/O—and then cr
 or replace services underneath them. Initial compatibility targets must be
 bounded, for example static musl programs, selected libc tests, a small shell
 tool set, and focused LTP/kselftest or network workloads. “Runs Linux software”
-is not the Nexus research claim. Four bounded core inputs are now observed;
-the Linux pressure program remains incomplete until runtime filesystem and
-runtime network pass. The separate bounded cross-service composition gate is
+is not the Nexus research claim. Five bounded core inputs are now observed;
+the Linux pressure program remains incomplete until runtime network passes.
+The separate bounded cross-service composition gate is
 now addressed below; it does not substitute for those Linux workloads.
 
 ### Stage 6B futex successor boundary
@@ -768,6 +768,55 @@ but `UserContext` does not own FS base, so the claim is limited to one CPU and
 one TLS-bearing task. General relocations, shared libraries, libc/ld.so,
 filesystem-backed loading, multi-task TLS, and SMP are not established.
 
+### Stage 6 runtime-filesystem successor boundary
+
+The runtime-filesystem successor is **Checked and bounded OSTD/QEMU Observed**.
+It extends, rather than rewrites, the Stage 6B.2 personality registry. The
+formal `RuntimeFsCser` graph is fixed as
+`Root -> Syscall -> {PagerMap, FsOperation -> BlockRequest}` with independently
+fenced personality, pager, filesystem, and block bindings; separate root,
+address-space, inode, and device generations; four typed credits; and distinct
+PTE, inode, `avail.idx`, and guest-reply publication points. Its reject-enabled
+safety graph has 2,262,368 generated / 635,313 distinct states at depth 35; the
+action graph has 80,108 generated / 44,768 distinct states at depth 29. Eight
+required witnesses cover both write/revoke orders, recovery in each derived
+service path, both DMA-timeout stages, and stale-token fencing.
+
+The independent safe-Rust oracle implements the same fixed four-effect graph.
+Its deterministic, property, and Loom gates cover normal child-first closure,
+write-before-revoke and revoke-before-write, explicit pager/filesystem adoption,
+post-commit device drain, one-shot reply closure, reset and IOTLB tombstones,
+typed-credit conservation, and failure-atomic rejection across every generation.
+It is a protocol oracle, not the OSTD filesystem implementation.
+
+The unchanged retained `linux-runtime-fs-smoke` source is digest-gated and built
+reproducibly as a static ELF. Pinned one-CPU QEMU executes all 14 trapped Linux
+syscalls: three `openat`, two `pread64`, `statx`, `newfstatat(AT_EMPTY_PATH)`,
+one offset `pwrite64`, relative `/proc/self/exe` `readlinkat`, three `close`,
+exact stdout, and `exit`. Every continuation crosses the common registry's
+prepare/commit gate before fd, inode, or guest-memory publication, and all 14
+publication tickets are acknowledged before scope closure. The bounded service
+stores one executable, one temporary inode, and one procfs link in memory; it is
+not a general VFS, persistent filesystem, page cache, permission model, or
+namespace implementation.
+
+The OSTD lifecycle companion observes distinct personality, pager, filesystem,
+and block binding epochs. It requires snapshot/ready/rebind/adopt for prepared
+pager and filesystem work, permits kernel completion from an immutable
+post-commit receipt while the personality is absent, and checks commit-first
+and revoke-first pwrite outcomes against the complete registry/effect/domain/
+inode projection. The block companion retains three abstract owners through a
+reset timeout, advances device generation only after ResetAck, retains them
+again through an IOTLB timeout, and releases only after IOTLB Ack. This primary
+OSTD boot does not perform real DMA.
+
+A separate strict host oracle joins that bounded filesystem receipt to the
+existing Stage 5B real VirtIO boot using the retained source SHA, generated ELF
+SHA, reconstructed 512-byte sector SHA/FNV, and full readonly-image SHA. The
+relationship is only `component_consistency`: `same_boot=false`,
+`identity_preserving=false`, and the historical five-domain `CompositionCser`
+receipt remains frozen with `runtime_fs=false`.
+
 ## Bounded system-wide CSER composition
 
 Status: **five-domain prototype complete / Checked and Observed**, within the
@@ -840,10 +889,11 @@ Stage 5B completes request 1 in device generation 1 and then fences generation
 advances its own envelope to 4 on retry under a different effect/ticket. The
 consistency oracle does not equate those identities.
 Five production services do not run a mixed workload together, and real VirtIO
-hardware runs in the separate Stage 5B boot. The prototype has a fixed
-six-node/five-edge graph, one CPU, no runtime filesystem or network, no SMP
+hardware runs in the separate Stage 5B boot. This frozen predecessor has a fixed
+six-node/five-edge graph, one CPU, no runtime-filesystem or network domain, no SMP
 composition proof, no system-wide parameterized fault matrix, and no `k/N` or
-overhead result.
+overhead result. The later runtime-filesystem successor above is separate
+evidence and does not retroactively widen this graph.
 
 The old guest-session/sidecar-VMO/stop-packet Starnix-like path is not the target
 architecture. Tests and failure traces from it may be retained as differential
@@ -919,8 +969,9 @@ be patched into OSTD internals merely for convenience.
 - a production syscall portal with opaque reply capabilities, durable
   personality recovery state, guest-memory copy-fault recovery, and a
   personality timeout/tombstone path;
-- runtime filesystem and network, general Linux ABI and dynamic-linker breadth,
-  production fd/epoll, multi-task personality concurrency, and SMP paths;
+- runtime network, general filesystem/Linux ABI and dynamic-linker breadth,
+  persistent or durable writes, production fd/epoll, multi-task personality
+  concurrency, and SMP paths;
 - a production/unbounded cross-service authority backbone, same-boot mixed
   service/device workload, and parameterized integrated fault matrix.
 
@@ -1085,9 +1136,9 @@ failure.
 
 | Property or boundary | Current evidence | Required next evidence |
 | --- | --- | --- |
-| Core register/commit/revoke/crash/rebind semantics | nine bounded TLC model families, including five-domain composition; corresponding Rust reference oracles; pager and composition Loom gates | production-lock/SMP refinement and differential mixed-service traces |
+| Core register/commit/revoke/crash/rebind semantics | ten bounded TLC model families, including five-domain composition and runtime-filesystem refinement; corresponding Rust reference oracles; pager, I/O, composition, and runtime-filesystem Loom gates | production-lock/SMP refinement and differential mixed-service traces |
 | Post-revoke commit exclusion | all domain refinements plus the composition finite model/Rust/Loom gates; the bounded OSTD composition gate rejects stale child and commit operations after root revoke | production-lock/SMP races, asynchronous mixed-service injection, and same-boot device publication |
-| Single terminalization | all nine finite families and Rust oracles; pager/composition Loom gates; bounded QEMU receipts consume each continuation/publication/closure receipt once | implementation-source Loom/Kani, SMP and production-lock races, and device completion injection |
+| Single terminalization | all ten finite families and Rust oracles; pager, I/O, composition, and runtime-filesystem Loom gates; bounded QEMU receipts consume each continuation/publication/closure receipt once | implementation-source Loom/Kani, SMP and production-lock races, and device completion injection |
 | Budget conservation | baseline/pager scalars; Stage 5 typed I/O; Stage 6B typed credits; the composition model and OSTD receipt delegate and return five cross-domain credits while retaining the timed-out VirtIO credit until retry | production multi-resource accounting and leak/duplication tests under concurrency and repeated device failure |
 | Scheduler fallback | weak-fair TLA+ property; one-CPU QEMU selects the FIFO task on the first post-crash fallback selection attempt; raw tick delta is recorded only as an artifact diagnostic | lease-expiry path, SMP races, overload and repeated-crash tests |
 | Pager one-shot reply and crash/rebind | pager TLC refinement: 17,150 generated / 7,528 distinct / reported depth 17-18 across parallel clean runs / 10 temporal branches; Rust: 12 deterministic + 5 proptests (64 cases each); one-CPU QEMU `recover` + `timeout` observations | real one-shot handle/portal, serialized recovery state, full response-boundary injection, multi-client and SMP refinement |
@@ -1100,7 +1151,8 @@ failure.
 | I/O tombstone/timeout | TLA+/Rust timeout/retry semantics plus Stage 5B fail-closed session/IOTLB ownership retention and successful retry; timeout explicitly software-injected | real-time deadline source, durable recovery worker, repeated failure, device-loss and hardware-timeout tests |
 | Work proportionality | target-local Rust structure only: the futex oracle closes a target with `k=6` while leaving an unrelated `N=96` scope unchanged, records 4 scope-index head selections and 6 terminalizations, and uses a local `BTreeSet` with `O(log k)` maintenance; TLA+ makes no complexity claim | scope-local/intrusive kernel records plus fixed-`N` varying-`k` and fixed-`k` varying-`N` kernel curves; no production `O(k)` claim before those measurements |
 | Cross-service composition | `CompositionCser`, safe Rust/Loom, and the single-CPU OSTD five-domain receipt share one root gate, immutable causal edges, typed credits, leaf closure, globally sequenced receipts, and an external VirtIO timeout/retry envelope; a strict split-stream consistency oracle separately requires Stage 5B reset/IOTLB component evidence without equating effect/ticket/generation identity or inventing a cross-FD total order | identity-preserving or same-boot device integration, unbounded graphs, production portals/locks, SMP, and a parameterized fault matrix |
-| Linux pressure | Stage 6A, 6B.1, and bounded 6B.2 Checked/Observed: four core inputs (`linux-hello`, adapted Round 4, adapted Round 5, dynamic PIE), strict positive/negative oracles, and personality-local registry/recovery companions | runtime filesystem and runtime network core inputs; integrated mixed-service workload matrix; general ABI/SMP breadth |
+| Runtime filesystem | `RuntimeFsCser` safety/action graphs, 15 safe-Rust/property/Loom gates, unchanged retained ELF artifact gate, exact 14-syscall OSTD execution, four-domain lifecycle companion, positive/negative serial oracle, and Stage 5B sector/image component-consistency oracle | general VFS/persistence, real DMA in the primary boot, same-boot identity, multi-client/SMP, durable external effects |
+| Linux pressure | Stage 6A, 6B.1, bounded 6B.2, and runtime filesystem Checked/Observed: five core inputs (`linux-hello`, adapted Round 4, adapted Round 5, dynamic PIE, runtime filesystem), strict positive/negative oracles, and bounded recovery companions | runtime network core input; integrated mixed-service workload matrix; general ABI/SMP breadth |
 
 TLC's current result is a complete graph only for its committed finite
 configuration. QEMU results are concrete observations only for their pinned
@@ -1152,8 +1204,8 @@ The following are intentionally unresolved:
 - treatment of durable external effects that require idempotency or
   application-level compensation rather than local drain;
 - the exact final Linux pressure set beyond the fixed six-workload core gate;
-  four inputs have bounded execution receipts while runtime filesystem and
-  runtime network remain unimplemented.
+  five inputs have bounded execution receipts while runtime network remains
+  unimplemented.
 
 Each decision must be resolved first in the smallest relevant model and spike.
 An unresolved item is not permission to assume the strongest behavior in code

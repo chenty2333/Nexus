@@ -19,6 +19,8 @@ mod linux;
 mod linux_dynamic;
 #[path = "personality/linux_epoll.rs"]
 mod linux_epoll;
+#[path = "personality/linux_fs.rs"]
+mod linux_fs;
 #[path = "personality/linux_futex.rs"]
 mod linux_futex;
 #[path = "personality/linux_futex_core.rs"]
@@ -376,6 +378,7 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     // lifetime, publication, and scope closure.
     linux_epoll::run_linux_epoll_slice();
     linux_dynamic::run_linux_dynamic_slice();
+    linux_fs::run_linux_fs_slice();
     composition::run_composition_slice(scheduler, pager_receipt);
     assert_eq!(
         scheduler.propose(old_binding, USER_TASK_ID),

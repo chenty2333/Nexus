@@ -114,7 +114,21 @@ struct ParsedElf {
 
 /// Loads one static x86-64 ET_EXEC into a fresh address space.
 pub(crate) fn load_static_image(image: &[u8], executable_name: &[u8]) -> LoadedStaticImage {
+    load_static_image_with_stack_pages(image, executable_name, 1)
+}
+
+/// Loads one static image with an explicitly bounded initial stack mapping.
+///
+/// Existing retained slices use the one-page wrapper above. The unchanged
+/// runtime-filesystem input reserves 4096 bytes below its entry stack pointer,
+/// so that successor requests exactly two pages rather than changing the guest.
+pub(crate) fn load_static_image_with_stack_pages(
+    image: &[u8],
+    executable_name: &[u8],
+    stack_pages: usize,
+) -> LoadedStaticImage {
     assert_eq!(executable_name.last(), Some(&0));
+    assert!((1..=2).contains(&stack_pages));
     let parsed = parse_elf(image, elf::ET_EXEC, 0);
     assert!(
         parsed.interpreter.is_none(),
@@ -134,6 +148,7 @@ pub(crate) fn load_static_image(image: &[u8], executable_name: &[u8]) -> LoadedS
             phnum: parsed.phnum,
             at_base: None,
         },
+        stack_pages,
     );
     LoadedStaticImage {
         vm_space: Arc::new(vm_space),
@@ -215,6 +230,7 @@ pub(crate) fn stage_dynamic_pie(
             phnum: main.phnum,
             at_base: Some(DYNAMIC_INTERP_BIAS),
         },
+        1,
     );
 
     StagedDynamicImage {
@@ -430,15 +446,19 @@ struct StackMetadata<'a> {
     at_base: Option<Vaddr>,
 }
 
-fn map_initial_stack(vm_space: &VmSpace, metadata: StackMetadata<'_>) -> Vaddr {
-    let stack_base = LINUX_STACK_TOP - PAGE_SIZE;
+fn map_initial_stack(vm_space: &VmSpace, metadata: StackMetadata<'_>, stack_pages: usize) -> Vaddr {
+    assert!(stack_pages > 0);
+    let stack_bytes = stack_pages
+        .checked_mul(PAGE_SIZE)
+        .expect("initial stack size overflow");
+    let stack_base = LINUX_STACK_TOP - stack_bytes;
     let stack_pointer = LINUX_STACK_TOP - 512;
     let execfn_address = LINUX_STACK_TOP - 64;
     let platform_address = LINUX_STACK_TOP - 96;
     let random_address = LINUX_STACK_TOP - 128;
     assert_eq!(stack_pointer % 16, 0);
 
-    let mut contents = vec![0; PAGE_SIZE];
+    let mut contents = vec![0; stack_bytes];
     write_at(
         &mut contents,
         execfn_address - stack_base,

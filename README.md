@@ -6,9 +6,11 @@ user-space OS services. One authority delegation can cover scheduler, pager,
 personality, readiness, and mediated-I/O effects; revocation closes their shared
 commit gate and drives every enrolled effect to one honest terminal outcome.
 
-The current checkpoint is a bounded, single-CPU system-composition prototype.
-It is not a production Linux personality, filesystem, network stack, or proof of
-identity-preserving same-boot VirtIO composition. See [VISION.md](VISION.md) for
+The current checkpoint is a bounded, single-CPU system-composition prototype
+plus a bounded runtime-filesystem successor. Five of six retained Linux core
+inputs are Checked/Observed; runtime network remains open. This is not a
+production Linux personality, general or persistent filesystem, network stack,
+or proof of identity-preserving same-boot VirtIO composition. See [VISION.md](VISION.md) for
 the research claim, [ARCHITECTURE.md](ARCHITECTURE.md) for boundaries, and
 [REWORK.md](REWORK.md) for the migration ledger.
 
@@ -40,9 +42,9 @@ Run the final acceptance gate with a cold image rebuild:
 NEXUS_REBUILD=1 ./x verify
 ```
 
-The cold gate runs Rust formatting/checks/Clippy/tests, nine TLA+ families, the
+The cold gate runs Rust formatting/checks/Clippy/tests, ten TLA+ families, the
 Nexus OSTD QEMU receipt, the mediated VirtIO/reset/IOMMU QEMU receipt, positive
-and negative system-composition oracles, and a fresh-evidence manifest. It can
+and negative predecessor/filesystem composition oracles, and a fresh-evidence manifest. It can
 take tens of minutes.
 
 ## Public command contract

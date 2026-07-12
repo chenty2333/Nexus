@@ -14,6 +14,7 @@ io_lock_key=$(printf '%s' "$io_root" | sha256sum | cut -c1-16)
 io_lock="/tmp/nexus-ostd-virtio-cser-spike-$io_lock_key.lock"
 composition_oracle="$root/kernel/nexus-ostd/scripts/assert-composition.sh"
 virtio_oracle="$io_root/scripts/assert-serial.sh"
+runtime_fs_composition="$root/tools/workflow/runtime-fs-composition.sh"
 
 check_evidence() {
     local composition_log=$1
@@ -137,6 +138,7 @@ main() {
 
         rm -rf "$mutation_dir"
         trap - EXIT
+        bash "$runtime_fs_composition" "$composition_log" "$virtio_log"
     } 2>&1 | tee "$artifact"
     exec {io_lock_fd}>&-
     exec {kernel_lock_fd}>&-
