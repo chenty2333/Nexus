@@ -71,6 +71,8 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
             "git diff --cached --check rejected the staged snapshot",
         ),
         (
+            // Treat pure moves as renames so historical whitespace in an
+            // unchanged file is not misclassified as newly added content.
             &[
                 "diff-tree",
                 "--check",
@@ -78,6 +80,7 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
                 "--root",
                 "-r",
                 "-m",
+                "-M",
                 "HEAD",
             ][..],
             "git diff-tree --check rejected the checked-out revision",
