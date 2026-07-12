@@ -829,8 +829,10 @@ The evidence has three layers:
   timeout retention, and retry;
 - the single-CPU OSTD receipt uses the existing scheduler, pager, personality,
   and readiness mechanisms and an external Stage 5B VirtIO adapter. A strict
-  two-log oracle checks the composition envelope against the separate QEMU
-  VirtIO/DMA trace as prerequisite component evidence.
+  split-stream oracle checks the composition envelope against the separate
+  Stage 5B guest receipts and QEMU VirtIO/DMA trace as prerequisite component
+  evidence. Each stream keeps its own order; only stable owner IOVA/PADDR values
+  cross the stream boundary.
 
 The last point is not an identity-preserving refinement or a same-boot claim.
 Stage 5B completes request 1 in device generation 1 and then fences generation
@@ -898,9 +900,9 @@ The pinned experiment observed public API fit for:
   personality, readiness, and an external VirtIO domain adapter with one
   commit/revoke gate, failure-atomic causal derivation, typed credits,
   leaf-gated local closure, unique receipts, and timeout/tombstone/retry; the
-  root two-log oracle checks separate Stage 5B reset/IOTLB evidence for
-  component consistency and explicitly rejects an identity-preserving or
-  same-boot interpretation.
+  root split-stream oracle checks separate Stage 5B guest and QEMU reset/IOTLB
+  evidence for component consistency and explicitly rejects an
+  identity-preserving, cross-FD-total-order, or same-boot interpretation.
 
 These mechanisms should be reused behind Nexus adapters. CSER state should not
 be patched into OSTD internals merely for convenience.

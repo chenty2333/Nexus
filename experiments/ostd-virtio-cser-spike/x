@@ -2,6 +2,8 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=scripts/qemu-stream-capture.sh
+source "$root/scripts/qemu-stream-capture.sh"
 lock_key=$(printf '%s' "$root" | sha256sum | cut -c1-16)
 exec 9>"/tmp/nexus-ostd-virtio-cser-spike-$lock_key.lock"
 flock 9
@@ -22,6 +24,9 @@ image_key=$(sha256sum \
     "$root/patches/ostd-0.18.0-dma-closure.patch" \
     "$root/scripts/assert-patch.sh" \
     "$root/scripts/assert-serial.sh" \
+    "$root/scripts/assert-debug-trace.awk" \
+    "$root/scripts/assert-stream-capture.sh" \
+    "$root/scripts/qemu-stream-capture.sh" \
     "$root/osdk-runner-base/Cargo.toml" \
     "$root/osdk-runner-base/Cargo.lock" \
     "$root/osdk-runner-base/src/main.rs" \
@@ -111,9 +116,20 @@ extract_kernel_suffix() {
     local target=$2
     awk '
         /VIRTIO_CSER KERNEL_MARKER stage=5b oracle_suffix=true/ { found = 1 }
-        found { print }
+        found { gsub(/\r/, ""); print }
         END { if (!found) exit 1 }
     ' "$source" > "$target"
+}
+
+check_stream_capture() {
+    bash "$root/scripts/assert-stream-capture.sh"
+}
+
+capture_kernel_run() {
+    capture_qemu_streams \
+        "$root/artifacts/serial.log" \
+        "$root/artifacts/qemu-debug.log" \
+        run_kernel
 }
 
 command=${1:-test}
@@ -127,6 +143,7 @@ case "$command" in
         ;;
     check)
         ensure_image
+        check_stream_capture
         check_source
         check_kernel
         ;;
@@ -137,17 +154,30 @@ case "$command" in
     run)
         ensure_image
         mkdir -p "$root/artifacts"
-        rm -f "$root/artifacts/qemu.log" "$root/artifacts/kernel.log" "$root/artifacts/oracle.log"
-        run_kernel 2>&1 | tee "$root/artifacts/qemu.log"
-        extract_kernel_suffix "$root/artifacts/qemu.log" "$root/artifacts/kernel.log"
+        rm -f \
+            "$root/artifacts/serial.log" \
+            "$root/artifacts/qemu-debug.log" \
+            "$root/artifacts/qemu.log" \
+            "$root/artifacts/kernel.log" \
+            "$root/artifacts/oracle.log"
+        capture_kernel_run
+        extract_kernel_suffix "$root/artifacts/serial.log" "$root/artifacts/kernel.log"
         ;;
     test)
         ensure_image
+        check_stream_capture
         mkdir -p "$root/artifacts"
-        rm -f "$root/artifacts/qemu.log" "$root/artifacts/kernel.log" "$root/artifacts/oracle.log"
-        run_kernel 2>&1 | tee "$root/artifacts/qemu.log"
-        extract_kernel_suffix "$root/artifacts/qemu.log" "$root/artifacts/kernel.log"
-        "$root/scripts/assert-serial.sh" "$root/artifacts/kernel.log" 2>&1 \
+        rm -f \
+            "$root/artifacts/serial.log" \
+            "$root/artifacts/qemu-debug.log" \
+            "$root/artifacts/qemu.log" \
+            "$root/artifacts/kernel.log" \
+            "$root/artifacts/oracle.log"
+        capture_kernel_run
+        extract_kernel_suffix "$root/artifacts/serial.log" "$root/artifacts/kernel.log"
+        "$root/scripts/assert-serial.sh" \
+            "$root/artifacts/kernel.log" \
+            "$root/artifacts/qemu-debug.log" 2>&1 \
             | tee "$root/artifacts/oracle.log"
         ;;
     clean)

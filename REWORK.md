@@ -20,8 +20,8 @@ retained dynamic PIE. Four of six bounded Linux core inputs are now Observed;
 runtime filesystem, runtime network, and the Linux pressure program remain
 incomplete. A separate system-composition checkpoint now adds the bounded
 five-domain TLA+/Rust/Loom successor, one OSTD root-authority receipt, and a
-strict two-log component-consistency check against the existing Stage 5B
-VirtIO/DMA receipt.
+strict split-stream component-consistency check against the existing Stage 5B
+VirtIO/DMA receipt and QEMU device trace.
 The pager, device, and Linux results are not a production pager, I/O subsystem,
 futex registry, or Linux personality. The foundation decision is **OSTD-first**, not
 irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an

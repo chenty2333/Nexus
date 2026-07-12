@@ -19,28 +19,38 @@ Cargo offline mode, and byte-check both project and cargo-osdk runner locks.
 Artifacts are written to:
 
 ```text
-artifacts/qemu.log    complete firmware + kernel + QEMU trace
-artifacts/kernel.log  suffix beginning at the unique Stage 5B kernel marker
-artifacts/oracle.log  positive/negative oracle result
+artifacts/serial.log      raw build/firmware/guest stdout plus fixture receipt
+artifacts/qemu-debug.log  raw cargo/QEMU stderr and trace events
+artifacts/kernel.log      normalized serial suffix at the unique Stage 5B marker
+artifacts/oracle.log      positive/negative oracle result
 ```
 
-The root system-composition gate consumes `artifacts/kernel.log` as independent
-prerequisite component evidence:
+The serial and debug streams deliberately remain separate. The guest console
+can emit one formatted receipt through several writes, so redirecting stderr
+into stdout can splice a QEMU trace record into the middle of that receipt.
+The oracle instead checks the exact guest receipt sequence in `kernel.log` and
+an independently anchored QEMU trace sequence in `qemu-debug.log`. It compares
+the three guest-owned IOVA-to-physical-address mappings across the two inputs,
+but does not claim a total order between different file descriptors.
+
+Root `../../x verify` first reruns this split-stream gate over both
+`artifacts/kernel.log` and `artifacts/qemu-debug.log`. Only after that succeeds
+does the system-composition gate consume the validated `kernel.log` as
+independent prerequisite component evidence:
 
 ```bash
 # after both OSTD spikes have produced their retained logs
 ../../x composition
 ```
 
-That two-log consistency oracle requires this receipt's audited `avail.idx`
-Release commit, reset timeout, retained DMA owners, retry, device-generation
-fence, IOTLB completion, and final release. Root `../../x verify` runs both
-spikes first and then runs this cross-check. It does not preserve effect,
-ticket, or generation identity: this boot completes request 1 in generation 1
-and fences generation 1 to 2, while the composition adapter independently
-starts at generation 3 and advances its own envelope to 4 on retry. It is not
-evidence that real VirtIO DMA and all five composition domains executed
-together in one kernel run.
+That cross-experiment consistency oracle requires this receipt's audited
+`avail.idx` Release commit, reset timeout, retained DMA owners, retry,
+device-generation fence, IOTLB completion, and final release. It does not
+preserve effect, ticket, or generation identity: this boot completes request 1
+in generation 1 and fences generation 1 to 2, while the composition adapter
+independently starts at generation 3 and advances its own envelope to 4 on
+retry. It is not evidence that real VirtIO DMA and all five composition domains
+executed together in one kernel run.
 
 ## Pinned boundary
 
@@ -186,22 +196,27 @@ portal and observes rejection before a PCI doorbell can be written.
 ## What the oracle requires
 
 OVMF probes the block device before Nexus boots. The kernel therefore prints a
-unique marker before touching PCI; all Stage 5B counts and negative checks use
-only the suffix beginning at that marker.
+unique marker before touching PCI; guest-receipt counts and negative checks use
+only the serial suffix beginning at that marker. The independently ordered QEMU
+trace has no shared marker: its target control sequence is anchored by the
+first translations of the three guest-owned IOVAs.
 
 The oracle requires:
 
 - the exact BDF, modern device ID, features, and three DMA owners;
-- a real sector-0 read and successful QEMU completion;
+- a real sector-0 read and successful QEMU completion, with one `vdev` across
+  initialization, queue notification, read, completion, reset, and rebind, and
+  one `req` across the read and both completion records;
 - three distinct non-identity owner IOVAs, each observed in the `00:05.0` VT-d
   trace;
-- exactly one PCI doorbell and queue notify for the completed request, and zero
-  for the published-but-unnotified request;
+- exactly one target-sequence PCI doorbell followed by a queue notify on the
+  completed read's `vdev`, and no second-generation doorbell;
 - real status-zero reset writes in both generations;
 - six global IOTLB invalidations and six ordered wait descriptors;
 - reset and IOTLB timeout tombstones retaining all three pages;
-- no old-generation DMA, doorbell, queue, or block activity after either reset
-  acknowledgement;
+- within the QEMU stream, no DMA translation after the generation-1 status-zero
+  reset begins, no extra target notify/queue/block event, and no device activity
+  after the generation-2 IOTLB acknowledgements;
 - `Completed` for generation 1 and `IndeterminateAfterReset` for generation 2;
 - stale/duplicate completion rejection;
 - identical fixture hashes before and after QEMU.

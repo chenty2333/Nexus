@@ -14,8 +14,12 @@ image_key=$(sha256sum \
     "$root/tools/xtask/Cargo.lock" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/cser-dev:$image_key"
 cser_spike="$root/experiments/ostd-cser-spike/x"
-io_spike="$root/experiments/ostd-virtio-cser-spike/x"
+io_spike_root="$root/experiments/ostd-virtio-cser-spike"
+io_spike="$io_spike_root/x"
+io_spike_lock_key=$(printf '%s' "$io_spike_root" | sha256sum | cut -c1-16)
+io_spike_lock="/tmp/nexus-ostd-virtio-cser-spike-$io_spike_lock_key.lock"
 composition_oracle="$root/experiments/ostd-cser-spike/scripts/assert-composition.sh"
+virtio_oracle="$root/experiments/ostd-virtio-cser-spike/scripts/assert-serial.sh"
 
 usage() {
     cat >&2 <<'EOF'
@@ -29,7 +33,7 @@ usage: ./x {fmt|check|test|model|spec|spike|io-spike|composition|verify|clean}
   spike    run the pinned OSTD five-domain composition/Linux QEMU spike
   io-spike run the pinned mediated VirtIO/reset/IOTLB QEMU spike
   composition
-           cross-check retained OSTD and VirtIO logs for component consistency
+           cross-check retained OSTD and split VirtIO evidence for consistency
   verify   run every model/spec/spike gate and the system composition oracle
   clean    remove root and both OSTD-spike build artifacts
 EOF
@@ -83,11 +87,24 @@ run_spike() {
     "$entrypoint" test
 }
 
+check_system_composition_evidence() {
+    local composition_log=$1
+    local virtio_log=$2
+    local virtio_debug_log=$3
+    # This helper is also invoked as an `if` condition by the negative gates.
+    # An explicit AND-list preserves the first oracle's failure instead of
+    # letting Bash's conditional-context errexit suppression run the second.
+    "$virtio_oracle" "$virtio_log" "$virtio_debug_log" &&
+        "$composition_oracle" "$composition_log" "$virtio_log"
+}
+
 expect_composition_reject() {
     local label=$1
     local composition_log=$2
     local virtio_log=$3
-    if "$composition_oracle" "$composition_log" "$virtio_log" >/dev/null 2>&1; then
+    local virtio_debug_log=$4
+    if check_system_composition_evidence \
+        "$composition_log" "$virtio_log" "$virtio_debug_log" >/dev/null 2>&1; then
         echo "system composition oracle accepted negative mutation: $label" >&2
         return 1
     fi
@@ -97,12 +114,22 @@ expect_composition_reject() {
 run_composition_oracle() {
     local composition_log="$root/experiments/ostd-cser-spike/artifacts/serial.log"
     local virtio_log="$root/experiments/ostd-virtio-cser-spike/artifacts/kernel.log"
+    local virtio_debug_log="$root/experiments/ostd-virtio-cser-spike/artifacts/qemu-debug.log"
     local artifact="$root/target/verification/system-composition-oracle.log"
+    local io_lock_fd
 
+    # Standalone `./x composition` may race a developer-started Stage 5B run.
+    # Share that runner's lock so the oracle sees one immutable artifact set.
+    exec {io_lock_fd}>"$io_spike_lock"
+    flock "$io_lock_fd"
     mkdir -p "$(dirname "$artifact")"
     {
         if [[ ! -x "$composition_oracle" ]]; then
             echo "system composition oracle is missing or not executable: $composition_oracle" >&2
+            exit 1
+        fi
+        if [[ ! -x "$virtio_oracle" ]]; then
+            echo "mediated VirtIO oracle is missing or not executable: $virtio_oracle" >&2
             exit 1
         fi
         if [[ ! -s "$composition_log" ]]; then
@@ -113,7 +140,12 @@ run_composition_oracle() {
             echo "mediated VirtIO kernel log is missing or empty: $virtio_log" >&2
             exit 1
         fi
-        "$composition_oracle" "$composition_log" "$virtio_log"
+        if [[ ! -s "$virtio_debug_log" ]]; then
+            echo "mediated VirtIO debug log is missing or empty: $virtio_debug_log" >&2
+            exit 1
+        fi
+        check_system_composition_evidence \
+            "$composition_log" "$virtio_log" "$virtio_debug_log"
 
         local mutation_dir
         mutation_dir=$(mktemp -d)
@@ -125,7 +157,8 @@ run_composition_oracle() {
         expect_composition_reject \
             duplicate_composition_pass \
             "$mutation_dir/composition-duplicate-pass.log" \
-            "$virtio_log"
+            "$virtio_log" \
+            "$virtio_debug_log"
 
         awk '
             !changed && /^COMPOSITION_REJECT / && /kind=stale_receipt/ {
@@ -137,7 +170,8 @@ run_composition_oracle() {
         expect_composition_reject \
             mutating_stale_receipt \
             "$mutation_dir/composition-stale-receipt.log" \
-            "$virtio_log"
+            "$virtio_log" \
+            "$virtio_debug_log"
 
         awk '
             !changed && /^COMPOSITION_CLOSURE (Issue|Receipt) / {
@@ -149,7 +183,8 @@ run_composition_oracle() {
         expect_composition_reject \
             wrong_closure_sequence \
             "$mutation_dir/composition-wrong-sequence.log" \
-            "$virtio_log"
+            "$virtio_log" \
+            "$virtio_debug_log"
 
         awk '
             !changed && /RESET Fence old_generation=2 new_generation=3/ {
@@ -161,8 +196,23 @@ run_composition_oracle() {
         expect_composition_reject \
             wrong_virtio_generation \
             "$composition_log" \
-            "$mutation_dir/virtio-wrong-generation.log"
+            "$mutation_dir/virtio-wrong-generation.log" \
+            "$virtio_debug_log"
+
+        awk '
+            !changed && /^vtd_inv_desc_iotlb_global / {
+                changed = sub(/vtd_inv_desc_iotlb_global/, "vtd_inv_desc_iotlb_corrupt")
+            }
+            { print }
+            END { if (!changed) exit 1 }
+        ' "$virtio_debug_log" >"$mutation_dir/virtio-missing-iotlb.log"
+        expect_composition_reject \
+            missing_iotlb_trace \
+            "$composition_log" \
+            "$virtio_log" \
+            "$mutation_dir/virtio-missing-iotlb.log"
     } 2>&1 | tee "$artifact"
+    exec {io_lock_fd}>&-
 }
 
 clean_root() {

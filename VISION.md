@@ -496,17 +496,21 @@ typed-credit transfers, and local reverse-index membership failure-atomically;
 cohort. Coordinator-owned exact enrollment plus separate stale-parent and
 stale-target negative receipts fence derivation without mutation. Leaf-gated
 closure rejects stale child, commit, and receipt operations, retains a committed
-VirtIO effect through an honest timeout tombstone, accepts only a fresh retry receipt, and
-returns all five credits before final `Revoked`.
+VirtIO effect through an honest timeout tombstone, accepts only a fresh retry
+receipt, and returns all five credits before final `Revoked`.
 
 The separate pinned Stage 5B boot supplies prerequisite component evidence for
-the external VirtIO adapter. A strict two-log consistency oracle requires both
-the composition trace and the independent `avail.idx` Release, reset timeout,
-retained DMA ownership, reset retry, device-generation fence, IOTLB completion,
-and DMA-release trace. It does not preserve effect identity: Stage 5B completes
-request 1 in generation 1 and then fences generation 1 to 2, whereas the
-composition adapter starts from an independent generation-3 envelope and its
-own ticket, then advances only that envelope to generation 4 on retry.
+the external VirtIO adapter. A strict split-stream consistency oracle requires
+the composition receipt, the Stage 5B guest receipt stream, and an independently
+captured QEMU device trace covering `avail.idx` Release, reset timeout, retained
+DMA ownership, reset retry, the device-generation fence, IOTLB completion, and
+DMA release. The two Stage 5B streams retain their own internal order and agree
+on stable owner IOVA/PADDR identities; the oracle does not invent a temporal
+total order across stdout and stderr. It also does not preserve effect identity:
+Stage 5B completes request 1 in generation 1 and then fences generation 1 to 2,
+whereas the composition adapter starts from an independent generation-3
+envelope and its own ticket, then advances only that envelope to generation 4
+on retry.
 Therefore the system-wide CSER composition prototype across the five
 existing bounded domains is **Checked / Observed**, but the real device receipt
 is consistency/prerequisite evidence rather than the same composed effect. The

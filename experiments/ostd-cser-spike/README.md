@@ -52,8 +52,10 @@ scheduler ticks are diagnostic, not an acceptance bound.
 
 After this spike and the separate Stage 5B VirtIO spike have both run, the
 repository-root `./x composition` command cross-checks `artifacts/serial.log`
-and the Stage 5B `artifacts/kernel.log` for component consistency. Root
-`./x verify` runs that two-log oracle automatically after both QEMU gates.
+against the Stage 5B `artifacts/kernel.log` guest receipts and
+`artifacts/qemu-debug.log` device trace for component consistency. Root
+`./x verify` reruns the Stage 5B split-stream oracle and then this composition
+check automatically after both QEMU gates.
 
 ### Reproducible OSDK runner graph
 
@@ -418,13 +420,16 @@ receipt attempts are required to leave the backbone unchanged.
 
 The local VirtIO object is an `external_stage5b_consistency` adapter. Its
 composition retry advances the domain closure revision and its independent
-device generation from 3 to 4. The strict two-log oracle separately requires
-the real Stage 5B `avail.idx` Release, reset timeout, retained DMA owners, retry,
-device-generation fence, IOTLB completion, and DMA-release trace as prerequisite
-component evidence. Stage 5B instead completes request 1 in generation 1 and
-then fences generation 1 to 2; the two logs do not share an effect, ticket, or
-generation identity. This is therefore not an identity-preserving refinement
-or a same-boot claim about five production services and real device DMA.
+device generation from 3 to 4. The strict split-stream oracle separately
+requires the real Stage 5B `avail.idx` Release, reset timeout, retained DMA
+owners, retry, device-generation fence, IOTLB completion, and DMA-release trace
+as prerequisite component evidence. Guest receipts and QEMU trace events keep
+independent order and are joined only by stable owner IOVA/PADDR values; no
+cross-FD temporal total order is claimed. Stage 5B instead completes request 1
+in generation 1 and then fences generation 1 to 2; the evidence streams do not
+share the composition effect, ticket, or generation identity. This is therefore
+not an identity-preserving refinement or a same-boot claim about five
+production services and real device DMA.
 
 The receipt is one CPU with a fixed six-node/five-edge graph. It does not add
 runtime filesystem or network, SMP composition, a production opaque authority
