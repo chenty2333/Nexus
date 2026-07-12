@@ -343,6 +343,72 @@ awk '
     }
 ' "$log"
 
+awk '
+    function fail(message) {
+        print "scheduler lease trace assertion failed: " message > "/dev/stderr"
+        failed = 1
+        exit 1
+    }
+    function field(name,    i, prefix) {
+        prefix = name "="
+        for (i = 1; i <= NF; i++) {
+            if (index($i, prefix) == 1)
+                return substr($i, length(prefix) + 1)
+        }
+        return ""
+    }
+    function expected_key(binding, task, source) {
+        return binding ":" task ":" source
+    }
+    BEGIN {
+        expected[expected_key(1, 100, "unscoped")] = 1
+        expected[expected_key(1, 200, "unscoped")] = 1
+        expected[expected_key(2, 404, "unscoped")] = 1
+        expected[expected_key(2, 400, "scoped")] = 1
+        expected[expected_key(3, 505, "unscoped")] = 1
+        expected[expected_key(3, 500, "scoped")] = 1
+    }
+    {
+        sub(/\r$/, "")
+    }
+    /^CSER Prepare authority_epoch=41 / {
+        prepare_line[expected_key(field("binding_epoch"), field("proposal_task"), "unscoped")] = NR
+    }
+    /^CSER PrepareScoped service=scheduler scheduler_authority_epoch=41 / {
+        prepare_line[expected_key(field("binding_epoch"), field("proposal_task"), "scoped")] = NR
+    }
+    /^CSER LeaseRenew action=Prepare / {
+        renewals++
+        if ($0 !~ /^CSER LeaseRenew action=Prepare authority_epoch=41 binding_epoch=[0-9]+ proposal_task=[0-9]+ source=(unscoped|scoped) tick=[0-9]+ previous_deadline_tick=[0-9]+ lease_deadline_tick=[0-9]+ lease_ticks=64$/)
+            fail("malformed renewal receipt: " $0)
+        key = expected_key(field("binding_epoch"), field("proposal_task"), field("source"))
+        if (!(key in expected))
+            fail("unexpected renewal identity: " key)
+        seen[key]++
+        if (seen[key] != 1)
+            fail("duplicate renewal identity: " key)
+        if (!(key in prepare_line) || prepare_line[key] >= NR)
+            fail("renewal did not follow its accepted Prepare receipt: " key)
+        tick = field("tick") + 0
+        deadline = field("lease_deadline_tick") + 0
+        if (deadline != tick + 64)
+            fail("renewal did not restore the complete 64-tick lease: " $0)
+    }
+    /reason=policy_lease_expired/ {
+        fail("accepted policy proposal still expired before its intentional crash: " $0)
+    }
+    END {
+        if (failed)
+            exit 1
+        if (renewals != 6)
+            fail("expected six accepted-proposal renewals, observed " renewals)
+        for (key in expected) {
+            if (seen[key] != 1)
+                fail("missing renewal identity: " key)
+        }
+    }
+' "$log"
+
 if [[ $(grep -cF 'PAGER Complete scenario=recover fault=1 terminal=Completed' "$log") -ne 1 ]]; then
     echo "recover fault did not complete exactly once" >&2
     exit 1

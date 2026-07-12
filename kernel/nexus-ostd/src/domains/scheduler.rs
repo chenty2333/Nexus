@@ -113,6 +113,13 @@ impl CserScheduler {
             return ProposalResult::RejectUnknownTask;
         }
 
+        // A proposal that passes the binding, supervisor, and task gates is
+        // also the policy heartbeat.  Renew under the run-queue lock so a
+        // timer tick cannot expire the old deadline after accepting current
+        // policy work but before that work is scheduled.  Rejected proposals
+        // must never extend a stale or absent supervisor's lease.
+        let previous_lease_deadline_tick = queue.lease_deadline_tick;
+        queue.lease_deadline_tick = queue.tick.saturating_add(queue.lease_ticks);
         queue.pending = Some(Proposal {
             binding,
             task_id,
@@ -134,6 +141,21 @@ impl CserScheduler {
                 binding.authority_epoch, binding.binding_epoch, task_id,
             );
         }
+        println!(
+            "CSER LeaseRenew action=Prepare authority_epoch={} binding_epoch={} proposal_task={} source={} tick={} previous_deadline_tick={} lease_deadline_tick={} lease_ticks={}",
+            binding.authority_epoch,
+            binding.binding_epoch,
+            task_id,
+            if causal_token.is_some() {
+                "scoped"
+            } else {
+                "unscoped"
+            },
+            queue.tick,
+            previous_lease_deadline_tick,
+            queue.lease_deadline_tick,
+            queue.lease_ticks,
+        );
         ProposalResult::Prepared
     }
 
