@@ -17,7 +17,11 @@ wait/wake recovery slice. Stage 6B.2 adds the personality-local common effect
 registry, two-key requeue, readiness, and failure-atomic exec successors plus
 pinned QEMU receipts for adapted Round 4 futex, adapted Round 5 epoll, and
 retained dynamic PIE. Four of six bounded Linux core inputs are now Observed;
-runtime filesystem, runtime network, and Stage 6 as a whole remain incomplete.
+runtime filesystem, runtime network, and the Linux pressure program remain
+incomplete. A separate system-composition checkpoint now adds the bounded
+five-domain TLA+/Rust/Loom successor, one OSTD root-authority receipt, and a
+strict two-log component-consistency check against the existing Stage 5B
+VirtIO/DMA receipt.
 The pager, device, and Linux results are not a production pager, I/O subsystem,
 futex registry, or Linux personality. The foundation decision is **OSTD-first**, not
 irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an
@@ -348,13 +352,46 @@ general futex/epoll/dynamic-linker ABI, lost-wakeup or SMP evidence, runtime
 filesystem/network, a scheduler/pager/personality/I/O registry, integrated
 fault-matrix evaluation, `k/N` curves, or a final originality judgment.
 
+## System-wide CSER composition receipt
+
+This checkpoint is recorded as **bounded five-domain prototype complete /
+Checked and Observed**:
+
+- `CompositionCser` fixes one root authority over scheduler, pager,
+  personality, readiness, and VirtIO domains while keeping authority, binding,
+  and device generations distinct. Its separate finite safety and action gates
+  each explore 1,236,504 generated / 965,051 distinct states at depth 31; the
+  action gate checks six temporal branches, while four reachability gates cover
+  exact closure, crash/adopt isolation, commit/abort split, and timeout/retry;
+- the safe-Rust composition backbone owns immutable parent identity, typed
+  credit delegation, local reverse indexes, a common commit/revoke gate,
+  domain-local crash/rebind/adopt, globally sequenced closure receipts, and a
+  retained committed VirtIO timeout tombstone;
+- the single-CPU OSTD receipt coordinates existing scheduler, pager,
+  personality, and readiness mechanisms through one bounded gate, freezes the
+  exact participating cohort, closes only causal leaves, rejects stale child,
+  commit, and receipt operations, separately rejects stale parent and target
+  derivation envelopes, retries the VirtIO tombstone, and reaches final
+  zero-live/zero-pending state with all five credits returned;
+- `./x composition` consumes the OSTD serial log and the separate Stage 5B
+  VirtIO kernel log. It requires the real `avail.idx`-Release commit, reset
+  timeout, retained DMA owners, reset retry, generation fence, IOTLB completion,
+  and release ordering as prerequisite component evidence. It does not equate
+  the independent composition generation-3-to-4 envelope with Stage 5B request
+  1 or its generation-1-to-2 lifecycle.
+
+This does not run five production services or real VirtIO DMA in one boot. It
+does not add runtime filesystem/network, an unbounded causal graph, SMP,
+production capability transport, a parameterized system fault matrix, `k/N`
+curves, overhead evaluation, or a final originality judgment.
+
 ## Current research assets
 
 | Path | Status | Disposition |
 | --- | --- | --- |
-| `specs/cser/` | **KEEP** | Normative baseline, pager, mediated-I/O, bounded personality, private-futex, two-key requeue, readiness, and exec TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice without rewriting earlier evidence baselines. |
-| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, pager, mediated-I/O, bounded personality, and personality-local registry/futex/requeue/readiness/exec successor semantics and differential oracles. |
-| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, bounded pager recovery, fail-closed IOMMU, Stage 6A/6B.1, and the Stage 6B.2 Round 4 futex, readiness/Round 5 epoll, and dynamic PIE receipts. It may later be superseded by a broader prototype, but must remain runnable until then. |
+| `specs/cser/` | **KEEP** | Normative baseline, domain refinements, and five-domain composition TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice without rewriting earlier evidence baselines. |
+| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, domain successors, and system-composition semantics plus differential/concurrency oracles. |
+| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler/pager recovery, Linux pressure slices, and the bounded five-domain root composition receipt. It may later be superseded by a broader prototype, but must remain runnable until then. |
 | `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for mediated readonly VirtIO, fail-closed reset/IOTLB tombstones, and three-owner queued IOTLB closure. Preserve both the Stage 5A no-device boundary and Stage 5B real-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
 | `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello`, adapted Round 4 futex, adapted Round 5 epoll, and dynamic PIE have bounded observed receipts; runtime filesystem and network remain pending. Exact retained sources are provenance rather than automatic conformance oracles, so visible temporary adaptations correct obsolete futex and regular-file epoll expectations. These inputs do not define Nexus's research identity. |

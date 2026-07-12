@@ -81,6 +81,22 @@ post-commit revocation drains without rollback. The complete safety graph has
 generated / 137 distinct states at depth 14, with three temporal branches and
 six reachability witnesses.
 
+`CompositionCser.tla`, its safety/action configurations, and `COMPOSITION.md`
+fix the bounded Stage 6C system-wide composition contract across scheduler,
+pager, personality, readiness, and VirtIO domain registries. One root authority
+scope owns immutable cross-domain parent edges and typed root-ledger delegation
+while each domain retains an independent binding epoch; VirtIO additionally
+retains an independent device generation. Root revocation freezes the exact
+participating-domain cohort, requires unique domain closure receipts, and
+allocates every timeout/closure receipt from one global monotone sequence. It
+cannot hide a timed-out VirtIO tombstone or accept its stale receipt after
+retry. The complete safety and action graphs each have 1,236,504 generated /
+965,051 distinct states at depth 31; the action configuration checks six
+temporal branches and the script requires four reachability witnesses. This
+finite model does not prove arbitrary DAGs, runtime filesystem/network
+composition, parent-owned credit partitions, or asymptotic work
+proportionality.
+
 The independent pinned OSTD/QEMU refinement now supplies a bounded
 implementation observation for the same one-key contract. Its `recover` path
 observes mismatch-without-registration, atomic compare/enqueue, a real
@@ -202,10 +218,10 @@ the history needed by the invariants instead of an unbounded event log.
 ## Run the specifications
 
 The repository entry point uses the pinned Docker image, verifies that every
-checked-in PlusCal translation is current, runs all eight checked-in TLC model
+checked-in PlusCal translation is current, runs all nine checked-in TLC model
 families in order—baseline, pager, mediated I/O, Linux personality, private
-futex, two-key futex requeue, readiness, and exec—and writes separate logs
-under `target/verification/`:
+futex, two-key futex requeue, readiness, exec, and five-domain composition—and
+writes separate logs under `target/verification/`:
 
 ```sh
 ./x spec
@@ -220,10 +236,10 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar ./specs/cser/check.sh
 
 These commands describe implementation steps inside the container; they do not
 define a second supported host toolchain. With no argument, `check.sh` checks
-all eight families in the order above. Pass `Cser`, `PagerCser`, `IoCser`,
+all nine families in the order above. Pass `Cser`, `PagerCser`, `IoCser`,
 `PersonalityCser`, `PersonalityFutexCser`,
-`PersonalityFutexRequeueCser`, `PersonalityReadinessCser`, or
-`PersonalityExecCser` to run only one.
+`PersonalityFutexRequeueCser`, `PersonalityReadinessCser`,
+`PersonalityExecCser`, or `CompositionCser` to run only one.
 To modify an algorithm, edit only its PlusCal block and regenerate the
 translation before checking:
 
@@ -237,6 +253,7 @@ java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityFutexCse
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityFutexRequeueCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityReadinessCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityExecCser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 CompositionCser.tla
 ```
 
 The baseline `CserMC.cfg` instance uses three effect identifiers, two total
@@ -246,7 +263,8 @@ failed registration opportunity while all credits are held or spent. With
 successor results are recorded separately in `PAGER.md`, `IO.md`,
 `PERSONALITY.md`, `PERSONALITY_FUTEX.md`,
 `PERSONALITY_FUTEX_REQUEUE.md`, `PERSONALITY_READINESS.md`, and
-`PERSONALITY_EXEC.md`:
+`PERSONALITY_EXEC.md`, with the composition successor recorded separately in
+`COMPOSITION.md`:
 
 ```text
 11,122 states generated

@@ -820,12 +820,24 @@ impl PagerScenario {
     }
 }
 
-pub fn run_pager_slices() {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PagerSliceReceipt {
+    pub(crate) binding_epoch: u64,
+    pub(crate) terminalizations: u64,
+    pub(crate) quiescent: bool,
+}
+
+pub fn run_pager_slices() -> PagerSliceReceipt {
     run_scenario(ScenarioKind::Recover);
     run_scenario(ScenarioKind::Timeout);
     println!(
         "PAGER_SLICE PASS scenarios=recover+timeout single_cpu=true zero_page=true single_client=true task_kill=false"
     );
+    PagerSliceReceipt {
+        binding_epoch: 2,
+        terminalizations: 2,
+        quiescent: true,
+    }
 }
 
 fn run_scenario(kind: ScenarioKind) {

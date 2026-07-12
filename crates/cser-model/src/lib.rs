@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod composition;
 pub mod io;
 mod model;
 pub mod pager;

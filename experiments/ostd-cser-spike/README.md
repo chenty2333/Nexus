@@ -4,9 +4,12 @@ This experiment answers a bounded sequence of architecture questions without
 modifying OSTD 0.18: scheduler fallback; one-shot pager crash/rebind; a static
 Linux syscall-personality path; private-futex recovery; and, in Stage 6B.2, a
 personality-local common effect registry refined by two-key futex requeue,
-generational readiness/epoll, and failure-atomic dynamic-PIE exec. It is
-deliberately outside the deleted legacy Nexus workspace. The common registry
-does not yet include scheduler, pager, or mediated VirtIO effects.
+generational readiness/epoll, and failure-atomic dynamic-PIE exec; and the
+bounded system-wide composition successor over scheduler, pager, personality,
+readiness, and an external VirtIO adapter. It is deliberately outside the
+deleted legacy Nexus workspace. Composition coordinates the existing
+domain-local mechanisms through one root authority backbone; it does not
+replace them with one global object registry.
 
 ## Pinned environment
 
@@ -40,11 +43,17 @@ The narrower commands are `./x check`, `./x build`, `./x run`, and
 `./x iommu-probe`. The serial transcript is written to
 `artifacts/serial.log`; `scripts/assert-serial.sh` verifies the scheduler,
 pager, Stage 6A personality, both futex slices, readiness lifecycle, adapted
-Round 5 epoll, and fail-closed IOMMU receipts. It invokes strict Round 4 and
-epoll parsers plus negative trace mutations. `assert-linux-dynamic.awk`
+Round 5 epoll, system composition, and fail-closed IOMMU receipts. It invokes
+strict Round 4, epoll, and composition parsers plus negative trace mutations.
+`assert-linux-dynamic.awk`
 independently fixes the dynamic exec/adoption trace and rejects a duplicate
 PASS, a fabricated second ExecCommit, or Snapshot/Ready reordering. Raw
 scheduler ticks are diagnostic, not an acceptance bound.
+
+After this spike and the separate Stage 5B VirtIO spike have both run, the
+repository-root `./x composition` command cross-checks `artifacts/serial.log`
+and the Stage 5B `artifacts/kernel.log` for component consistency. Root
+`./x verify` runs that two-log oracle automatically after both QEMU gates.
 
 ### Reproducible OSDK runner graph
 
@@ -374,8 +383,53 @@ task. It is not a general relocation engine, runtime linker, shared-library or
 libc path, multi-task TLS lifecycle, or filesystem-backed loader.
 
 Together these are Stage 6B.2 personality-local bounded receipts. They do not
-complete runtime filesystem, runtime network, cross-service scope unification,
-SMP concurrency validation, or the final CSER contribution judgment.
+by themselves complete runtime filesystem, runtime network, cross-service
+scope unification, SMP concurrency validation, or the final CSER contribution
+judgment. The separate follow-on checkpoint below addresses only the bounded
+composition item.
+
+### Bounded system-wide CSER composition
+
+The follow-on composition slice installs one root authority over five existing
+domain adapters. Its fixed causal DAG is
+`root -> personality -> pager -> scheduler` and
+`personality -> readiness -> VirtIO`. Domain scope IDs are local reverse-index
+keys, not nested authority scopes; authority epoch, per-domain binding epoch,
+and VirtIO device generation remain independent.
+
+One `CompositionBackbone` gate requires coordinator-owned exact target enrollment,
+validates both the current parent and current target envelopes, and installs
+every causal edge, domain token, typed-credit transfer, and local reverse-index
+entry failure-atomically. Separate stale-parent and stale-target receipts must
+leave the full state unchanged. Domain crash/rebind/adopt remains local: a
+replacement cannot mutate peers or inherit an old effect implicitly. Root
+`RevokeBegin` advances authority and freezes only the participating live
+cohort. Closure is leaf-gated: scheduler closes before pager, and VirtIO closes
+before readiness; personality cannot close until both branches have closed.
+Globally sequenced receipts are issued and accepted through the same gate and
+are bound to the current revoke/domain/generation envelope.
+
+The committed VirtIO effect deliberately times out once. It and its typed
+credit remain live behind a tombstone, so the root can report `TimedOut` only
+while still `Closing`. Retry makes the old timeout receipt stale; reset plus
+IOTLB acknowledgement permits a fresh `Closed` receipt, causal-ancestor
+closure, complete credit return, and final `Revoked`. Stale child, commit, and
+receipt attempts are required to leave the backbone unchanged.
+
+The local VirtIO object is an `external_stage5b_consistency` adapter. Its
+composition retry advances the domain closure revision and its independent
+device generation from 3 to 4. The strict two-log oracle separately requires
+the real Stage 5B `avail.idx` Release, reset timeout, retained DMA owners, retry,
+device-generation fence, IOTLB completion, and DMA-release trace as prerequisite
+component evidence. Stage 5B instead completes request 1 in generation 1 and
+then fences generation 1 to 2; the two logs do not share an effect, ticket, or
+generation identity. This is therefore not an identity-preserving refinement
+or a same-boot claim about five production services and real device DMA.
+
+The receipt is one CPU with a fixed six-node/five-edge graph. It does not add
+runtime filesystem or network, SMP composition, a production opaque authority
+transport, a parameterized fault matrix, `k/N` curves, overhead evaluation, or
+a final originality judgment.
 
 ## IOMMU result: fail closed
 

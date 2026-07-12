@@ -328,12 +328,50 @@ revocation after commit drains once and never restores the old image. Unlike
 the concrete QEMU receipt, this Rust abstraction records TLS and stack as
 frozen layout metadata rather than two additional effects.
 
-The current executable suite contains 117 tests. The four Stage 6B.2 additions
+The current executable suite contains 129 tests. The four Stage 6B.2 additions
 contribute 12 common-registry tests, 10 futex-requeue tests, 7 readiness tests,
 and 7 exec tests; deterministic sequences and bounded proptests cover rollback,
 stale projections, current-binding fencing, single-terminal closure, and typed
 credit conservation. These are sequential safe-Rust reference transitions,
 not the eventual production lock/atomic scheme or an SMP proof.
+
+The `composition` module adds the twelve system-wide successor gates: eight
+exact sequence tests, one 64-case property test, and three small Loom harnesses.
+It coordinates scheduler, pager, personality, readiness, and mediated VirtIO
+domains beneath one root authority while preserving independent per-domain
+binding epochs and a separate VirtIO device generation. Effects keep immutable
+parent identity; derivation validates both parent and target bindings and moves
+the causal edge, domain envelope, local reverse-index membership, and typed
+credit as one failure-atomic transition. Root revocation freezes only the live
+participating domains and closes their leaf indexes without scanning unrelated
+effect records.
+
+The Rust credit model is deliberately stronger than the bounded
+`CompositionCser.tla` root-ledger abstraction. A parent owns a typed credit
+partition; deriving a child subtracts the exact bundle from that parent, and
+child terminalization returns the same bundle along the immutable causal edge
+before an ancestor can become a leaf. Tests check conservation across these
+parent partitions. This stronger executable refinement must not be described
+as a property already established by the TLA+ bound.
+
+Committed VirtIO timeout keeps the effect and credit nonterminal behind a
+tombstone. An exact `TimedOut` domain receipt can make root timeout observable
+while the scope remains `Closing`; retry advances the closure revision and
+invalidates that old receipt. Only acknowledged quiescence, a fresh `Closed`
+receipt, child-first ancestor closure, and complete credit return permit final
+`Revoked`. Closure receipts additionally bind the revoke ticket, domain
+revision, binding/device generation, and one global sequence.
+
+The three composition Loom tests are small surrogate gate machines for:
+
+- failure-atomic derive versus root revoke;
+- commit versus a closed root gate; and
+- timeout-receipt acceptance versus tombstone retry and fresh receipt.
+
+They do not execute all of `CompositionModel`, its `BTreeMap`/`BTreeSet`
+indexes, the OSTD `SpinLock` backbone, or any device code. Passing them is not a
+proof of the whole reference model, the OSTD lock implementation, SMP memory
+ordering, hardware quiescence, or system-wide liveness.
 
 The pinned OSTD/QEMU successor independently executes the adapted retained
 Round 4 futex program, the adapted retained Round 5 epoll program plus a
@@ -341,7 +379,9 @@ readiness lifecycle companion, and a retained dynamic PIE launcher/main/
 interpreter path. Those bounded observations complete four of the six core
 Linux pressure inputs when combined with `linux-hello`; runtime filesystem and
 runtime network remain pending. They do not establish a cross-service registry
-or complete Stage 6.
+or complete Stage 6 by themselves. The later bounded composition receipt
+observes the fixed five-domain root gate separately; it does not add the two
+remaining Linux workloads or run the real VirtIO device in the same boot.
 
 `Commit` is the effect commit linearization point. `RevokeBegin` atomically
 closes the old authority epoch. Effects that committed first must complete or

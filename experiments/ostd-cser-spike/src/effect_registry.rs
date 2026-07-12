@@ -561,6 +561,10 @@ impl TerminalReceipt {
     pub(crate) const fn result(&self) -> i64 {
         self.result
     }
+
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.sequence
+    }
 }
 
 /// A receipt extracted while the runtime lock is held and acknowledged only
@@ -823,7 +827,7 @@ pub(crate) enum RegistryError {
     Invariant(&'static str),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct EffectRegistry {
     scopes: BTreeMap<ScopeKey, ScopeRecord>,
     effects: BTreeMap<EffectKey, EffectRecord>,

@@ -188,6 +188,8 @@ patterns=(
     "LINUX_EPOLL_SLICE BEGIN workload=linux-round5-epoll format=ELF64 type=ET_EXEC adapted_regular_file_eperm=true registry=common readiness=kernel_owned smp=1"
     "EFFECT_REGISTRY Quiescent workload=linux-round5-epoll live=0 pending_publications=0 subscriptions=0 queued=0 unpublished_deliveries=0 credits=Free"
     "LINUX_EPOLL_SLICE PASS workload=linux-round5-epoll adapted=true syscalls=23 pipe_et=true pipe_oneshot=true socket_lt=true regular_file_eperm=true sample_arm=atomic registry_quiescent=true"
+    "COMPOSITION_SLICE BEGIN root_scope=70 authority_epoch=121 domains=5 bounded=true single_cpu=true runtime_fs=false runtime_net=false virtio_adapter=external_stage5b_consistency"
+    "COMPOSITION_SLICE PASS root_scope=70 authority_epoch_old=121 authority_epoch_new=122 domains=5 causal_nodes=6 causal_edges=5 parent_chain_immutable=true stale_parent_rejected=true stale_target_rejected=true delegated_credits=5 binding_epochs=scheduler:4,pager:2,personality:2,readiness:2,virtio:3 device_generations=virtio:3->4 frozen_domains=5 cohort_source=registry_live_selection closure_order=scheduler,pager,virtio,readiness,personality child_first=true live_descendant_rejected=true closure_receipts=5 receipt_sequences=6 receipt_revision=6 receipt_acceptance=authoritative closure_sequences_unique=true timeout_receipts=1 timeout_replay_rejected=true duplicate_receipt_rejected=true out_of_order_receipt_rejected=true virtio_tombstones=1 virtio_retries=1 stale_child_rejected=true stale_commit_rejected=true stale_receipt_rejected=true virtio_evidence=component_consistency identity_preserving=false credits_free=5 live=0 pending=0 final_quiescent=true bounded=true single_cpu=true runtime_fs=false runtime_net=false"
     "CSER REJECT_STALE action=Prepare authority_epoch=41 proposal_binding_epoch=1 current_binding_epoch=4 proposal_task=100"
     "IOMMU_PROBE PASS result=FAIL_CLOSED reason=IOTLB_INVALIDATION_UNAVAILABLE ostd=0.18.0 authority_epoch=41"
     "SPIKE_RESULT PASS"
@@ -436,6 +438,7 @@ awk -f "$script_dir/assert-linux-projections.awk" "$log"
 awk -f "$script_dir/assert-linux-futex.awk" "$log"
 awk -f "$script_dir/assert-linux-futex-core.awk" "$log"
 awk -f "$script_dir/assert-linux-epoll.awk" "$log"
+awk -f "$script_dir/assert-composition.awk" "$log"
 
 # Keep the retained Round 4 parser honest. A duplicate terminal receipt, a
 # false requeue affected count, and a stale-v1 mutation claim must all fail.
@@ -474,6 +477,21 @@ fi
 if sed '0,/delivery=2 sequence=2 count=0/{s/delivery=2 sequence=2 count=0/delivery=2 sequence=2 count=1/}' "$log" |
     awk -f "$script_dir/assert-linux-epoll.awk" >/dev/null 2>&1; then
     echo 'linux epoll oracle accepted a false second edge delivery' >&2
+    exit 1
+fi
+
+# The composition oracle must reject both an extra domain-closure receipt and
+# a stale-receipt claim that reports mutation.
+if {
+    cat "$log"
+    grep -F -m1 'COMPOSITION_CLOSURE Issue root_scope=70 domain_scope=71 domain=scheduler' "$log"
+} | awk -f "$script_dir/assert-composition.awk" >/dev/null 2>&1; then
+    echo 'composition oracle accepted a duplicate closure receipt' >&2
+    exit 1
+fi
+if sed '0,/COMPOSITION_REJECT stage=closing kind=stale_receipt .* mutation=false/{s/mutation=false/mutation=true/}' "$log" |
+    awk -f "$script_dir/assert-composition.awk" >/dev/null 2>&1; then
+    echo 'composition oracle accepted a mutating stale receipt' >&2
     exit 1
 fi
 

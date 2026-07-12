@@ -199,7 +199,7 @@ pub(crate) struct ReadinessCounts {
     pub(crate) unpublished_deliveries: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ReadinessCore {
     sources: BTreeMap<ReadySourceId, SourceRecord>,
     retired_source_generation: BTreeMap<u64, u64>,

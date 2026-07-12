@@ -24,6 +24,24 @@ artifacts/kernel.log  suffix beginning at the unique Stage 5B kernel marker
 artifacts/oracle.log  positive/negative oracle result
 ```
 
+The root system-composition gate consumes `artifacts/kernel.log` as independent
+prerequisite component evidence:
+
+```bash
+# after both OSTD spikes have produced their retained logs
+../../x composition
+```
+
+That two-log consistency oracle requires this receipt's audited `avail.idx`
+Release commit, reset timeout, retained DMA owners, retry, device-generation
+fence, IOTLB completion, and final release. Root `../../x verify` runs both
+spikes first and then runs this cross-check. It does not preserve effect,
+ticket, or generation identity: this boot completes request 1 in generation 1
+and fences generation 1 to 2, while the composition adapter independently
+starts at generation 3 and advances its own envelope to 4 on retry. It is not
+evidence that real VirtIO DMA and all five composition domains executed
+together in one kernel run.
+
 ## Pinned boundary
 
 - OSTD: crates.io `=0.18.0`
@@ -236,6 +254,9 @@ This receipt is deliberately narrower than a production I/O subsystem:
   not a general PCI subsystem;
 - no real-time reset deadline, system-wide fault matrix, k/N revocation curve,
   or WorkProportionality claim is established here.
+- the system-composition oracle treats this boot as independent prerequisite
+  evidence; it neither establishes identity-preserving composition nor a
+  same-boot five-service workload or SMP composition.
 - completion-to-portal-terminal crash injection and a durable tombstone
   recovery registry remain future integrated-validation work.
 

@@ -15,13 +15,13 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - name: Verify CSER models, scheduler/pager, Linux Stage 6B.2, and mediated VirtIO
+      - name: Verify CSER models and the bounded five-domain composition prototype
         run: ./x verify
       - name: Upload failure evidence
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nexus-verification-evidence
+          name: nexus-system-composition-evidence
           if-no-files-found: ignore
           path: |
             target/scenario-artifacts

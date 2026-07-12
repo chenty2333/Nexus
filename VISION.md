@@ -290,6 +290,19 @@ depth 15 for safety and 182 / 137 at depth 14 for three temporal branches, plus
 six witnesses. These are complete graphs only for their finite configurations;
 they do not prove the concrete Rust synchronization or Linux ABI.
 
+`CompositionCser.tla` is the bounded system-composition successor. It places
+scheduler, pager, personality, readiness, and VirtIO effects under one root
+authority while retaining independent binding epochs and a separate VirtIO
+device generation. Its separate safety and action/liveness configurations each
+explored 1,236,504 generated / 965,051 distinct states at depth 31 and left zero
+states queued. The action configuration checks six temporal-property branches,
+and four independent reachability gates observe exact five-domain closure,
+domain-local crash/adopt isolation, committed-versus-uncommitted descendant
+closure, and timeout/tombstone/retry with stale-receipt rejection. This is a
+complete result only for the fixed five-effect graph. It does not model an
+unbounded causal graph, SMP locks, runtime filesystem/network services, or
+physical-device behavior.
+
 ### Executable reference evidence
 
 `crates/cser-model` is a `no_std + alloc`, safe-Rust executable oracle for the
@@ -315,9 +328,21 @@ authority/binding fences, typed credits, task/scope/resource reverse indexes,
 atomic batch commit and resource movement, publication acknowledgement,
 snapshot/rebind/adopt, and scope-local closure. Domain layers retain FIFO futex
 queues, readiness generations and trigger modes, or private executable-image
-staging. The four additions contribute 36 deterministic/property tests to the
-current 117-test suite. They are not a scheduler/pager/personality/I/O registry
-and do not establish the eventual SMP synchronization design.
+staging. The four additions contributed 36 deterministic/property tests to the
+pre-composition 117-test suite. They are not by themselves a
+scheduler/pager/personality/I/O registry and do not establish the eventual SMP
+synchronization design.
+
+The composition successor adds a safe-Rust root authority backbone over the
+five existing domains. It keeps immutable parent identity, typed delegated
+credits, domain-local reverse indexes, binding/device envelopes, a unified
+commit/revoke gate, exact closure receipts, and retained VirtIO timeout
+tombstones. Its deterministic/property tests and bounded Loom schedules are
+the 12 composition additions to the current 129-test suite: eight exact
+sequences, one 64-case property gate, and three small Loom harnesses. They are
+implementation-level checks of that reference transition system; they are not
+a proof of the complete `CompositionModel`, the OSTD kernel lock, an SMP memory
+model, or a production device stack.
 
 ### Observed OSTD evidence
 
@@ -460,8 +485,33 @@ return.
 Those are single-CPU bounded observations. They are not general futex, epoll,
 dynamic-linker, filesystem, network, or SMP results. Four of six core Linux
 inputs are now observed; runtime filesystem and runtime network remain before
-Stage 6 can close. The common implementation is still personality-local, so
-the cross-service CSER scope and integrated fault matrix remain future work.
+the Linux pressure program can close.
+
+The follow-on composition receipt is a separate bounded checkpoint. In one
+OSTD boot, one root authority coordinates the existing scheduler, pager,
+personality, and readiness mechanisms plus an external VirtIO domain adapter.
+The single gate installs immutable causal edges, binding/device envelopes,
+typed-credit transfers, and local reverse-index membership failure-atomically;
+`RevokeBegin` advances the root epoch and freezes the participating five-domain
+cohort. Coordinator-owned exact enrollment plus separate stale-parent and
+stale-target negative receipts fence derivation without mutation. Leaf-gated
+closure rejects stale child, commit, and receipt operations, retains a committed
+VirtIO effect through an honest timeout tombstone, accepts only a fresh retry receipt, and
+returns all five credits before final `Revoked`.
+
+The separate pinned Stage 5B boot supplies prerequisite component evidence for
+the external VirtIO adapter. A strict two-log consistency oracle requires both
+the composition trace and the independent `avail.idx` Release, reset timeout,
+retained DMA ownership, reset retry, device-generation fence, IOTLB completion,
+and DMA-release trace. It does not preserve effect identity: Stage 5B completes
+request 1 in generation 1 and then fences generation 1 to 2, whereas the
+composition adapter starts from an independent generation-3 envelope and its
+own ticket, then advances only that envelope to generation 4 on retry.
+Therefore the system-wide CSER composition prototype across the five
+existing bounded domains is **Checked / Observed**, but the real device receipt
+is consistency/prerequisite evidence rather than the same composed effect. The
+prototype is single-CPU, uses a fixed six-node/five-edge causal graph, and adds
+neither runtime filesystem nor runtime network.
 
 ## Research gates
 
@@ -500,18 +550,26 @@ Work proceeds through evidence gates, not feature-count milestones.
    Round 5 epoll, and retained dynamic PIE paths described above. The visible
    adaptations correct obsolete requeue-count and regular-file epoll
    expectations; Nexus does not emulate either divergence. This completes four
-   of the six bounded core inputs, not Linux compatibility or a system-wide
-   CSER registry. Runtime filesystem, runtime network, general ABI/SMP behavior,
-   and cross-service composition remain open. Linux remains an evaluation
-   vehicle rather than the research identity.
-6. **Integrated evidence gate — incremental checks exist; final Stage 7
-   planned:** extend the bounded Loom gates with implementation-specific Loom
-   and/or Kani checks across scheduler, pager, personality, and I/O; add a
-   parameterized QEMU recovery matrix plus fixed-`N`/varying-`k` and
-   fixed-`k`/varying-`N` experiments.
-7. **Contribution decision — future:** repeat the prior-art comparison, state
-   only the properties supported by the evidence, report overheads and failed
-   cases, and narrow or reject the CSER claim if the results require it.
+   of the six bounded core inputs, not Linux compatibility. Runtime filesystem,
+   runtime network, and general ABI/SMP behavior remain open. Linux remains an
+   evaluation vehicle rather than the research identity.
+6. **System-wide composition gate — bounded prototype complete / Checked and
+   Observed:** `CompositionCser`, the safe-Rust/Loom successor, and the OSTD
+   composition receipt agree on one root gate across scheduler, pager,
+   personality, readiness, and VirtIO domain adapters. The root receipt closes
+   a fixed leaf-gated cohort with globally sequenced domain receipts and an
+   honest VirtIO timeout/retry. A strict second-log oracle checks that the independent
+   Stage 5B boot supplies the required DMA/reset/IOTLB component evidence; it
+   does not identify the Stage 5B effect, ticket, or generation with the
+   composition adapter. Unbounded graphs, SMP, production portals, runtime
+   filesystem/network, and a general mixed-workload fault matrix remain open.
+7. **Integrated evidence and contribution decision — final Stage 7 planned:**
+   extend the bounded Loom gates with implementation-specific Loom and/or Kani
+   checks across scheduler, pager, personality, and I/O; add a parameterized
+   QEMU recovery matrix plus fixed-`N`/varying-`k` and
+   fixed-`k`/varying-`N` experiments; then repeat the prior-art comparison,
+   report overheads and failed cases, and narrow or reject the CSER claim if
+   the evidence requires it.
 
 Every vertical slice follows the same rule: specify the state machine and exit
 criteria, implement the smallest end-to-end path, inject failures, and stop if

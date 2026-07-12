@@ -232,6 +232,28 @@ run_spec() {
             run_tlc "PersonalityExecCser action properties and weak-fair kernel liveness" \
                 PersonalityExecCser PersonalityExecCserMC.cfg
             ;;
+        CompositionCser)
+            run_tlc "CompositionCser five-domain safety graph" \
+                CompositionCser CompositionCserSafetyMC.cfg
+            expect_reachable CompositionCser \
+                CompositionCserSafetyMC.cfg \
+                FiveDomainClosureAbsent \
+                "five-domain cohort closes with five globally sequenced receipts"
+            expect_reachable CompositionCser \
+                CompositionCserSafetyMC.cfg \
+                CrashAdoptIsolationAbsent \
+                "one domain crashes and adopts without advancing peer bindings"
+            expect_reachable CompositionCser \
+                CompositionCserSafetyMC.cfg \
+                CommitAbortSplitAbsent \
+                "committed descendants complete while uncommitted descendants abort"
+            expect_reachable CompositionCser \
+                CompositionCserSafetyMC.cfg \
+                TimeoutRetryClosureAbsent \
+                "VirtIo timeout tombstone, stale receipt reject, retry, and fresh closure receipt"
+            run_tlc "CompositionCser action properties and conditional kernel liveness" \
+                CompositionCser CompositionCserMC.cfg
+            ;;
         *)
             echo "unknown CSER specification: $1" >&2
             exit 2
@@ -249,10 +271,11 @@ case $# in
         run_spec PersonalityFutexRequeueCser
         run_spec PersonalityReadinessCser
         run_spec PersonalityExecCser
+        run_spec CompositionCser
         ;;
     1) run_spec "$1" ;;
     *)
-        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser]" >&2
+        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|CompositionCser]" >&2
         exit 2
         ;;
 esac

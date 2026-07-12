@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+mod composition;
 mod effect;
 #[allow(dead_code)]
 mod effect_registry;
@@ -323,7 +324,7 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     // Keep the scheduler in its kernel-owned FIFO fallback while pager tasks
     // block and wake one another. Pager service binding epochs are independent
     // from this scheduler-policy binding.
-    pager::run_pager_slices();
+    let pager_receipt = pager::run_pager_slices();
 
     let linux_scheduler_binding = scheduler.rebind(AUTHORITY_EPOCH);
     assert_eq!(
@@ -362,6 +363,7 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     // lifetime, publication, and scope closure.
     linux_epoll::run_linux_epoll_slice();
     linux_dynamic::run_linux_dynamic_slice();
+    composition::run_composition_slice(scheduler, pager_receipt);
     assert_eq!(
         scheduler.propose(old_binding, USER_TASK_ID),
         ProposalResult::RejectStale

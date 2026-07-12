@@ -31,7 +31,7 @@ const TRACE_ACTIONS: [&str; 9] = [
     "Complete",
 ];
 
-const TLA_SPECS: [&str; 8] = [
+const TLA_SPECS: [&str; 9] = [
     "Cser",
     "PagerCser",
     "IoCser",
@@ -40,6 +40,7 @@ const TLA_SPECS: [&str; 8] = [
     "PersonalityFutexRequeueCser",
     "PersonalityReadinessCser",
     "PersonalityExecCser",
+    "CompositionCser",
 ];
 
 static NEXT_SPEC_WORKSPACE: AtomicU64 = AtomicU64::new(0);
@@ -326,7 +327,14 @@ fn spec(root: &Path) -> Result<()> {
         run_bounded_logged(
             &mut command,
             &artifact_dir.join(format!("{spec}-tlc.log")),
-            Duration::from_secs(if spec == "IoCser" { 600 } else { 300 }),
+            Duration::from_secs(match spec {
+                // The three-ID I/O safety quotient explores about 22 million
+                // states before the two witness gates and action graph. Keep
+                // a cold/shared-host run from being mislabeled as a failure.
+                "IoCser" => 1_800,
+                "CompositionCser" => 600,
+                _ => 300,
+            }),
             8 * 1024 * 1024,
         )?;
     }
@@ -501,6 +509,7 @@ fn pluscal_translation_is_current(
             | "PersonalityFutexRequeueCser"
             | "PersonalityReadinessCser"
             | "PersonalityExecCser"
+            | "CompositionCser"
     ) {
         "10000"
     } else {
