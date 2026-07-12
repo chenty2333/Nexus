@@ -22,6 +22,11 @@ incomplete. A separate system-composition checkpoint now adds the bounded
 five-domain TLA+/Rust/Loom successor, one OSTD root-authority receipt, and a
 strict split-stream component-consistency check against the existing Stage 5B
 VirtIO/DMA receipt and QEMU device trace.
+Stage 7A performs zero-semantic-change engineering consolidation: the primary
+OSTD workspace graduates to `kernel/nexus-ostd`, source ownership is physically
+partitioned, the largest independent-model/workflow modules are mechanically
+decomposed, and one public Docker/`./x`/xtask/CI contract produces fresh hashed
+evidence.
 The pager, device, and Linux results are not a production pager, I/O subsystem,
 futex registry, or Linux personality. The foundation decision is **OSTD-first**, not
 irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an
@@ -79,12 +84,50 @@ one repository transaction after a separate build/CI checkpoint:
   Starnix-like server, old conformance runner, generated syscall ABI,
   implementation references, and obsolete documentation were removed;
 - the root Cargo workspace now contains only `crates/cser-model`; xtask and the
-  OSTD experiment remain deliberately isolated workspaces.
+  cargo-osdk kernel prototype remain deliberately isolated workspaces.
 
 Git history, ending with the pre-deletion build checkpoint, is the archive.
 Legacy paths that remain below or in oracle catalogs are provenance records,
 not live build dependencies. The per-module rows in this ledger record the
 decisions that were applied; they do not imply that deleted paths still exist.
+
+## Stage 7A engineering-consolidation record
+
+Status: **complete**, subject to the same cold local and exact pushed-revision
+CI acceptance authority recorded below; no Stage 7B evidence is implied.
+
+This checkpoint is accepted only if all of the following remain true in one
+final cold local run and the exact pushed CI revision:
+
+1. `./x` is the only public interface and exposes a documented
+   `doctor/build/test/run/verify/clean` contract.
+2. Root/reference, primary OSTD, and mediated-VirtIO workspaces all participate
+   in formatting, check, and Clippy gates without running QEMU in the quick
+   tier.
+3. `kernel/nexus-ostd` retains byte-compatible serial receipts after its move
+   from `experiments/`; the external Stage 5B harness remains independently
+   ordered evidence.
+4. The `io`, `pager`, and `composition` reference modules and the neutral
+   scenario runner are mechanically decomposed while preserving their public
+   APIs, error text, transition bodies, and test results.
+5. CI retains the complete `./x verify`, supplies parallel quick feedback,
+   cancels superseded PR runs, pins actions, uploads failure evidence, and
+   publishes a success manifest.
+6. The manifest binds the real invocation and per-run nonce to a complete
+   path/content/mode source fingerprint, rejects stale, markerless,
+   concurrently modified, or different-source evidence, and records the
+   revision, dirty/rebuild state, honest boundedness flags, and SHA-256 for
+   every required TLC, QEMU, and composition artifact. Ordered model/spec and
+   full-system completion receipts bind the same nonce and exact artifact
+   digests, preventing focused commands from splicing a failed full run into a
+   success manifest. A one-run orchestration token, persisted only as a bound
+   hash, prevents later processes from sealing an abandoned run. Repository and
+   backend locks keep that evidence set immutable through manifest publication.
+
+This stage does not authorize runtime filesystem/network work, state-machine
+changes, an identity-preserving device-composition claim, or removal of
+specifications, negative oracles, runner snapshots, retained Linux sources, or
+the patched-OSTD device receipt.
 
 ## Migration receipts
 
@@ -373,7 +416,8 @@ Checked and Observed**:
   commit, and receipt operations, separately rejects stale parent and target
   derivation envelopes, retries the VirtIO tombstone, and reaches final
   zero-live/zero-pending state with all five credits returned;
-- `./x composition` consumes the OSTD serial log and the separate Stage 5B
+- the composition oracle invoked by `./x run composition` consumes the OSTD
+  serial log and the separate Stage 5B
   VirtIO kernel log. It requires the real `avail.idx`-Release commit, reset
   timeout, retained DMA owners, reset retry, generation fence, IOTLB completion,
   and release ordering as prerequisite component evidence. It does not equate
@@ -391,7 +435,7 @@ curves, overhead evaluation, or a final originality judgment.
 | --- | --- | --- |
 | `specs/cser/` | **KEEP** | Normative baseline, domain refinements, and five-domain composition TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice without rewriting earlier evidence baselines. |
 | `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, domain successors, and system-composition semantics plus differential/concurrency oracles. |
-| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler/pager recovery, Linux pressure slices, and the bounded five-domain root composition receipt. It may later be superseded by a broader prototype, but must remain runnable until then. |
+| `kernel/nexus-ostd/` | **KEEP** | Maintained formal OSTD prototype for the CSER registry/composition mechanism, scheduler/pager/readiness domains, bounded personality pressure paths, and the five-domain root receipt. It remains an isolated cargo-osdk workspace so the reference model does not absorb implementation transitions. |
 | `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for mediated readonly VirtIO, fail-closed reset/IOTLB tombstones, and three-owner queued IOTLB closure. Preserve both the Stage 5A no-device boundary and Stage 5B real-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
 | `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello`, adapted Round 4 futex, adapted Round 5 epoll, and dynamic PIE have bounded observed receipts; runtime filesystem and network remain pending. Exact retained sources are provenance rather than automatic conformance oracles, so visible temporary adaptations correct obsolete futex and regular-file epoll expectations. These inputs do not define Nexus's research identity. |
@@ -406,9 +450,9 @@ curves, overhead evaluation, or a final originality judgment.
 | `Cargo.toml` | **KEEP** | The root workspace contains only `crates/cser-model`; admit future prototype crates only when a vertical slice requires them. |
 | root and isolated `Cargo.lock` files | **KEEP** | Commit the model, xtask, OSDK project, and generated OSDK Run-base graphs; runtime containers mount project locks read-only. |
 | `.cargo/config.toml` | **KEEP** | Contains only the bare-metal target flags used by the root no-std model gate. |
-| `Dockerfile`, `rust-toolchain.toml`, `x` | **KEEP** | Pinned environment and stable host-side entry point for all retained gates, including both isolated OSTD spikes. |
-| `tools/xtask/` | **KEEP** | Isolated workflow crate for model, catalog, scenario, TLA+, and artifact gates. |
-| `.github/workflows/ci.yml` | **KEEP** | Invokes the same Docker-backed `./x verify` path used locally. |
+| `Dockerfile`, `rust-toolchain.toml`, `x`, `README.md` | **KEEP** | Pinned environment and documented stable host-side `doctor/build/test/run/verify/clean` contract for all retained gates. |
+| `tools/xtask/`, `tools/workflow/` | **KEEP** | Isolated in-container model/catalog/scenario/TLA+/manifest logic plus host-side cross-backend consistency logic. Semantic oracles do not live inline in the public wrapper. |
+| `.github/workflows/ci.yml` | **KEEP** | Runs parallel quick feedback and the same complete Docker-backed `./x verify` used locally; publishes a fresh success manifest or bounded failure evidence. |
 | `flake.nix`, `flake.lock`, `.envrc` | **DELETE** | Removed in Phase 0; Docker is the environment boundary. |
 | `justfile` | **DELETE** | Retained commands moved to `./x`/xtask; obsolete Axle and Starnix targets were not reproduced. |
 | `.gitignore`, `.dockerignore` | **KEEP** | Cover only current Cargo, OSDK, QEMU, verification, and local-agent outputs. |

@@ -101,7 +101,7 @@ id = "pager.old-binding-reply-after-rebind"
 title = "A delayed old pager reply is fenced after rebind"
 phases = ["pager"]
 origin = "cser-derived"
-source_refs = ["experiments/ostd-cser-spike/src/scheduler.rs:stale proposal rejection"]
+source_refs = ["kernel/nexus-ostd/src/domains/scheduler.rs:stale proposal rejection"]
 setup = [
   "binding epoch b registers a fault continuation",
   "the pager crashes and the scope advances to binding epoch b+1",
@@ -208,8 +208,8 @@ title = "Scheduler policy recovery cannot bypass the kernel fallback"
 phases = ["scheduler"]
 origin = "model-derived-with-kernel-gate-probe"
 source_refs = [
-  "experiments/ostd-cser-spike/src/scheduler.rs",
-  "experiments/ostd-cser-spike/scripts/assert-serial.sh",
+  "kernel/nexus-ostd/src/domains/scheduler.rs",
+  "kernel/nexus-ostd/scripts/assert-serial.sh",
 ]
 setup = ["a user policy is bound at epoch b, kernel FIFO fallback is available, and a kernel-side probe can exercise proposal and Rebind gates"]
 schedule = [
@@ -251,7 +251,7 @@ id = "io.timeout-vs-late-completion-tombstone"
 title = "A late device completion cannot bypass a timeout tombstone"
 phases = ["io"]
 origin = "cser-derived"
-source_refs = ["experiments/ostd-cser-spike/src/iommu_probe.rs"]
+source_refs = ["kernel/nexus-ostd/src/probes/iommu_probe.rs"]
 setup = ["a committed request cannot prove drain/reset and IOTLB invalidation before its deadline"]
 schedule = ["revoke completion times out and publishes a tombstone", "the device reports completion later", "recovery retries cleanup"]
 require = [

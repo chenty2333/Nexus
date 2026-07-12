@@ -58,7 +58,7 @@ pinned Docker artifact SHA-256: c31cfc57e562e5be0e9558e5017a579b4353a016898113b0
 ```
 
 The generated ELF digest also depends on the clang/linker versions.
-`experiments/ostd-cser-spike/scripts/build-round4.sh` now performs the same
+`kernel/nexus-ostd/scripts/build-round4.sh` now performs the same
 digest, temporary-patch, ELF, host-execution, and exact-stdout checks inside the
 pinned OSTD image before emitting the artifact above. The standalone script is
 an input audit, not a second supported host workflow.

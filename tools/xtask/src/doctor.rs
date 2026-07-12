@@ -1,0 +1,82 @@
+use std::error::Error;
+use std::path::Path;
+use std::process::Command;
+
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+const REQUIRED_PATHS: &[&str] = &[
+    "Cargo.toml",
+    "Dockerfile",
+    "x",
+    ".github/workflows/ci.yml",
+    "crates/cser-model/Cargo.toml",
+    "kernel/nexus-ostd/Cargo.toml",
+    "experiments/ostd-virtio-cser-spike/Cargo.toml",
+    "tools/workflow/system-composition.sh",
+    "specs/oracles/cser-races.toml",
+    "tests/guest/linux/SOURCES.toml",
+];
+
+pub(crate) fn run(root: &Path, specs: &[&str]) -> Result<()> {
+    for relative in REQUIRED_PATHS {
+        let path = root.join(relative);
+        if !path.is_file() {
+            return Err(format!("required Stage 7A path is missing: {}", path.display()).into());
+        }
+    }
+    for spec in specs {
+        let path = root.join("specs/cser").join(format!("{spec}.tla"));
+        if !path.is_file() {
+            return Err(
+                format!("required TLA+ specification is missing: {}", path.display()).into(),
+            );
+        }
+    }
+
+    let rustc = version("rustc", &["--version"])?;
+    let cargo = version("cargo", &["--version"])?;
+    let git = version("git", &["--version"])?;
+    let java = version("java", &["-version"])?;
+    let jar = std::env::var_os("TLA2TOOLS_JAR")
+        .map(std::path::PathBuf::from)
+        .ok_or("TLA2TOOLS_JAR is not set")?;
+    if !jar.is_file() {
+        return Err(format!("TLA2TOOLS_JAR is not a file: {}", jar.display()).into());
+    }
+
+    println!(
+        "DOCTOR PASS layout=stage7a specs={} rustc={:?} cargo={:?} git={:?} java={:?} tla2tools={}",
+        specs.len(),
+        first_line(&rustc),
+        first_line(&cargo),
+        first_line(&git),
+        first_line(&java),
+        jar.display()
+    );
+    Ok(())
+}
+
+fn version(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program).args(args).output()?;
+    if !output.status.success() {
+        return Err(format!("{program} version probe failed with {}", output.status).into());
+    }
+    let mut text = String::from_utf8(output.stdout)?;
+    text.push_str(&String::from_utf8(output.stderr)?);
+    Ok(text)
+}
+
+fn first_line(value: &str) -> &str {
+    value.lines().next().unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_line_is_stable_for_empty_and_multiline_versions() {
+        assert_eq!(first_line(""), "");
+        assert_eq!(first_line("one\ntwo\n"), "one");
+    }
+}

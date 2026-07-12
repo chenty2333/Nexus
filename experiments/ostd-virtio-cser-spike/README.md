@@ -39,8 +39,8 @@ does the system-composition gate consume the validated `kernel.log` as
 independent prerequisite component evidence:
 
 ```bash
-# after both OSTD spikes have produced their retained logs
-../../x composition
+# after both OSTD backends have produced their retained logs
+../../x run composition
 ```
 
 That cross-experiment consistency oracle requires this receipt's audited

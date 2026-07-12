@@ -2,6 +2,12 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")" && pwd)
+repo_root=$(cd "$root/../.." && pwd)
+repo_lock="/tmp/nexus-workflow-${repo_root//\//_}.lock"
+if [[ ${NEXUS_ROOT_LOCK_HELD:-0} != 1 ]]; then
+    exec 8>"$repo_lock"
+    flock 8
+fi
 # shellcheck source=scripts/qemu-stream-capture.sh
 source "$root/scripts/qemu-stream-capture.sh"
 lock_key=$(printf '%s' "$root" | sha256sum | cut -c1-16)
@@ -65,11 +71,49 @@ check_source() {
     container bash scripts/assert-patch.sh
 }
 
+check_oracles() {
+    container bash -c '
+        set -euo pipefail
+        shopt -s nullglob
+        oracles=(scripts/*.awk)
+        ((${#oracles[@]} > 0))
+        for oracle in "${oracles[@]}"; do
+            awk -W dump -f "$oracle" >/dev/null
+        done
+    '
+}
+
 check_kernel() {
     # cargo-osdk 0.18 does not expose --locked on build/run. Gate the project
     # lock explicitly and over-mount it read-only for all mounted builds.
     container cargo fmt --all -- --check
     container cargo osdk check --locked
+    # cargo-osdk 0.18 has no clippy subcommand. Run the no_std library directly;
+    # the upstream macro emits a private `ktest` cfg and this typestate API
+    # intentionally returns the retained tombstone as the large Err value.
+    container cargo clippy --locked --target x86_64-unknown-none --lib -- \
+        -D warnings \
+        -A unexpected_cfgs \
+        -A clippy::result_large_err
+}
+
+format_kernel() {
+    container cargo fmt --all
+}
+
+doctor() {
+    ensure_image
+    check_stream_capture
+    check_source
+    container bash -c '
+        set -eu
+        rustc --version
+        cargo --version
+        cargo osdk --version
+        test -r /root/ovmf/release/OVMF_CODE.fd
+        test -x /usr/local/qemu/bin/qemu-system-x86_64
+    '
+    echo 'DOCTOR VIRTIO PASS network=offline iommu_patch=audited qemu=true ovmf=true'
 }
 
 prepare_runner_base() {
@@ -134,8 +178,15 @@ capture_kernel_run() {
 
 command=${1:-test}
 case "$command" in
+    doctor)
+        doctor
+        ;;
     image)
         build_image
+        ;;
+    fmt)
+        ensure_image
+        format_kernel
         ;;
     source)
         ensure_image
@@ -145,6 +196,7 @@ case "$command" in
         ensure_image
         check_stream_capture
         check_source
+        check_oracles
         check_kernel
         ;;
     build)
@@ -184,7 +236,7 @@ case "$command" in
         rm -rf "$root/target" "$root/artifacts" "$root/patch-work"
         ;;
     *)
-        echo 'usage: ./x {image|source|check|build|run|test|clean}' >&2
+        echo 'usage: ./x {doctor|image|fmt|source|check|build|run|test|clean}' >&2
         exit 2
         ;;
 esac

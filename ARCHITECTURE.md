@@ -146,7 +146,7 @@ EffectRecord {
 ```
 
 Tokens exposed to user space must be unforgeable kernel handles or authenticated
-references, not trusted integer structs. The simple Rust and OSTD spike structs
+references, not trusted integer structs. The simple Rust and OSTD prototype structs
 are executable protocol probes, not the final security representation.
 
 The binding epoch is checked at service-originated `Prepare`, `Commit`, reply,
@@ -964,7 +964,7 @@ Crash FallbackPick Rebind Adopt
 The Rust reference model adds `CreateScope` as an executable initialization
 event. Scope creation is part of TLA+ `Init`, not a checked TLA+ transition, so
 `CreateScope` must not be described as an action checked by the current TLC
-graph. The OSTD spike emits only the subset it exercises and also records
+graph. The OSTD prototype emits only the subset it exercises and also records
 rejection outcomes such as stale or no-supervisor proposals.
 
 The pager refinement deliberately preserves a mapping between backend-specific
@@ -1018,6 +1018,69 @@ every asynchronous acknowledgement boundary. Tests must be able to delay,
 duplicate, replay, drop, or crash the responsible service without bypassing the
 normal kernel path.
 
+## Engineering and verification boundary
+
+The repository has one public host interface: `./x`. It owns Docker image
+selection, host/guest backend ordering, locks, freshness boundaries, and the
+stable `doctor/build/test/run/verify/clean` contract. It does not implement
+CSER transitions or inline semantic oracles.
+
+The implementation layers below that front door are intentionally separate:
+
+- `tools/xtask/` runs the pinned in-container Rust, catalog, scenario, and TLA+
+  workflows;
+- `kernel/nexus-ostd/x` privately owns the cargo-osdk kernel/personality image,
+  generated runner snapshot, and primary QEMU receipt;
+- `experiments/ostd-virtio-cser-spike/x` privately owns the patched-OSTD
+  VirtIO/IOMMU image and split serial/debug receipt;
+- `tools/workflow/system-composition.sh` consumes those two independently
+  ordered evidence domains and owns their positive and negative consistency
+  checks.
+
+The formal kernel prototype is physically partitioned into `cser/`, `domains/`,
+`personality/`, and `probes/`. The safe-Rust reference model stays in a separate
+root workspace and does not share transition implementations with the kernel.
+This is an evidence boundary, not merely a Cargo-layout preference.
+
+A full verify first removes every expected old artifact and creates a JSON
+start record containing the real invocation, Git revision, dirty state, a
+path/content/executable-mode fingerprint of every tracked or nonignored
+untracked source, the cold-rebuild request, and a per-run nonce. The final
+manifest generator requires two ordered completion receipts: the in-container
+reference-model/specification gate seals its artifact set only after both parts
+succeed, and the root workflow seals the complete artifact set only after both
+QEMU backends and the composition oracle succeed. Each receipt binds the start
+nonce, source snapshot, invocation, rebuild state, predecessor receipt, and
+exact artifact digests. The generator then recomputes the source snapshot and
+accepts only nonempty specification, QEMU, and composition artifacts created
+after the start record whose required success markers are present, whose
+metadata stays stable while read, and whose digests still match both receipts.
+Consequently, focused commands after a failed full run cannot splice together a
+successful manifest. A fresh 256-bit orchestration token exists only in the root
+`verify` process, is passed only to the start, final-sealing, and
+manifest-publication steps, and is persisted solely as a hash bound into the
+nonce; a later process therefore cannot seal or publish an abandoned run. The
+published manifest records the same run identity, honest research limits,
+completion-receipt digest, and SHA-256 of every accepted artifact in
+`target/verification/manifest.json`.
+
+This token/receipt chain is a trusted-workspace consistency boundary: it closes
+accidental or interrupted cross-command evidence reuse through the public
+workflow. It is not authentication against an actor who can rewrite ignored
+evidence files and invoke private tooling with arbitrary environments. The
+release trust anchor remains the exact Git revision and its isolated remote CI
+run.
+
+One repository-wide host lock covers public build, format, check, run, clean,
+and composition commands. Manifest publication is an internal final step of the
+same token-holding full-verify process rather than a standalone command. Direct kernel and VirtIO backend
+invocations take the same lock, and backend-local locks protect their artifact
+sets. Composition takes both backend locks in a fixed kernel-before-VirtIO
+order. Therefore a full verify and its manifest observe one immutable evidence
+set rather than logs truncated or replaced by a concurrent maintenance run.
+CI uploads the same manifest on success and the raw bounded evidence on
+failure.
+
 ## Verification and evaluation matrix
 
 | Property or boundary | Current evidence | Required next evidence |
@@ -1036,7 +1099,7 @@ normal kernel path.
 | DMA quiescence | Stage 5A one-owner negative/ownership receipt plus Stage 5B real readonly device DMA, status-zero reset, and request + two queue owners released after queued IOTLB completion on pinned QEMU | physical-device drain contracts, IRQ quiescence, per-device domains, multi-page and SMP tests |
 | I/O tombstone/timeout | TLA+/Rust timeout/retry semantics plus Stage 5B fail-closed session/IOTLB ownership retention and successful retry; timeout explicitly software-injected | real-time deadline source, durable recovery worker, repeated failure, device-loss and hardware-timeout tests |
 | Work proportionality | target-local Rust structure only: the futex oracle closes a target with `k=6` while leaving an unrelated `N=96` scope unchanged, records 4 scope-index head selections and 6 terminalizations, and uses a local `BTreeSet` with `O(log k)` maintenance; TLA+ makes no complexity claim | scope-local/intrusive kernel records plus fixed-`N` varying-`k` and fixed-`k` varying-`N` kernel curves; no production `O(k)` claim before those measurements |
-| Cross-service composition | `CompositionCser`, safe Rust/Loom, and the single-CPU OSTD five-domain receipt share one root gate, immutable causal edges, typed credits, leaf closure, globally sequenced receipts, and an external VirtIO timeout/retry envelope; a strict second-log consistency oracle separately requires Stage 5B reset/IOTLB component evidence without equating effect/ticket/generation identity | identity-preserving or same-boot device integration, unbounded graphs, production portals/locks, SMP, and a parameterized fault matrix |
+| Cross-service composition | `CompositionCser`, safe Rust/Loom, and the single-CPU OSTD five-domain receipt share one root gate, immutable causal edges, typed credits, leaf closure, globally sequenced receipts, and an external VirtIO timeout/retry envelope; a strict split-stream consistency oracle separately requires Stage 5B reset/IOTLB component evidence without equating effect/ticket/generation identity or inventing a cross-FD total order | identity-preserving or same-boot device integration, unbounded graphs, production portals/locks, SMP, and a parameterized fault matrix |
 | Linux pressure | Stage 6A, 6B.1, and bounded 6B.2 Checked/Observed: four core inputs (`linux-hello`, adapted Round 4, adapted Round 5, dynamic PIE), strict positive/negative oracles, and personality-local registry/recovery companions | runtime filesystem and runtime network core inputs; integrated mixed-service workload matrix; general ABI/SMP breadth |
 
 TLC's current result is a complete graph only for its committed finite
@@ -1053,9 +1116,10 @@ The current semantic artifacts are:
   bounded TLC configurations;
 - `crates/cser-model/` — safe-Rust executable core, pager, I/O, personality,
   personality-local successors, and five-domain composition reference models;
-- `experiments/ostd-cser-spike/` — pinned OSTD scheduler/pager/API/IOMMU
-  experiment plus bounded `linux-hello`, futex, epoll/readiness, dynamic PIE,
-  and system-composition receipts;
+- `kernel/nexus-ostd/` — maintained, pinned OSTD kernel prototype with physical
+  CSER/domain/personality/probe ownership boundaries plus bounded
+  `linux-hello`, futex, epoll/readiness, dynamic PIE, and system-composition
+  receipts;
 - `experiments/ostd-virtio-cser-spike/` — pinned patched-OSTD mediated VirtIO,
   reset tombstone and three-owner queued-IOTLB-completion experiment.
 
@@ -1065,10 +1129,11 @@ migrate, rewrite, or delete. Git history provides archival access; the live tree
 should contain only an active implementation or evidence that still constrains
 the research.
 
-The intended developer interface is a Docker-pinned environment orchestrated by
-one root `./x` and Rust `xtask`. Nix and Just were removed after every retained
-gate moved to that entry point. CI and local verification call the same
-commands.
+The developer interface is a Docker-pinned environment orchestrated by one root
+`./x` and Rust `xtask`. Nix and Just were removed after every retained gate
+moved to that entry point. CI uses the same command surface, adds a parallel
+quick-feedback gate, and retains the complete `./x verify` as the acceptance
+authority.
 
 ## Open architecture decisions
 

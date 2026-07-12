@@ -5,8 +5,8 @@ target
 **/mutants.out*
 **/fuzz/corpus
 **/fuzz/artifacts
-experiments/ostd-cser-spike/guest/*.bin
-experiments/ostd-cser-spike/guest/*.elf
+kernel/nexus-ostd/guest/*.bin
+kernel/nexus-ostd/guest/*.elf
 specs/cser/*_TTrace_*.bin
 specs/cser/*_TTrace_*.tla
 specs/cser/*.old

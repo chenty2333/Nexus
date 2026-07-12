@@ -27,7 +27,7 @@ main, and interpreter. Runtime filesystem and runtime network are still
 pending. These are narrow pressure receipts, not a general Linux-compatibility
 claim.
 
-`experiments/ostd-cser-spike/scripts/build-guest.sh` builds the static
+`kernel/nexus-ostd/scripts/build-guest.sh` builds the static
 `linux-hello` `ET_EXEC` directly from the unchanged retained `hello.S`; it does
 not copy or rewrite a second source tree. The gate fixes both the retained source SHA-256
 `50690500a3cfac0f412da66d3d5d7f32b9b4da2a96a38d6d21c3ef12ea141490`

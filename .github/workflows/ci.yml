@@ -2,29 +2,76 @@ name: ci
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: nexus-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  verify:
+  quick:
+    name: quick feedback
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - name: Verify CSER models and the bounded five-domain composition prototype
-        run: ./x verify
-      - name: Upload failure evidence
+      - name: Verify formatting, schemas, Rust, Loom, and neutral scenarios
+        run: ./x test --quick
+      - name: Upload quick failure evidence
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nexus-system-composition-evidence
+          name: nexus-quick-failure-evidence-${{ github.run_attempt }}
           if-no-files-found: ignore
           path: |
             target/scenario-artifacts
-            target/verification
-            experiments/ostd-cser-spike/artifacts
+            target/verification/*.log
+
+  verify:
+    name: full system verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify CSER models and the bounded five-domain composition prototype
+        run: ./x verify
+      - name: Upload successful verification manifest
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nexus-verification-manifest-${{ github.run_attempt }}
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            target/verification/manifest.json
+            target/verification/.stage7a-verify-start.json
+            target/verification/.stage7a-model-spec-complete.json
+            target/verification/.stage7a-verify-complete.json
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nexus-system-composition-evidence-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          include-hidden-files: true
+          path: |
+            target/scenario-artifacts
+            target/verification/*.log
+            target/verification/manifest.json
+            target/verification/.stage7a-verify-start.json
+            target/verification/.stage7a-model-spec-complete.json
+            target/verification/.stage7a-verify-complete.json
+            kernel/nexus-ostd/artifacts
             experiments/ostd-virtio-cser-spike/artifacts

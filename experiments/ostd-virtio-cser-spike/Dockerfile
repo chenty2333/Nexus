@@ -67,6 +67,8 @@ RUN --mount=type=bind,source=.,target=/tmp/nexus-source,readonly \
     && cargo fmt --all -- --check \
     && bash scripts/assert-patch.sh \
     && cargo osdk check --locked \
+    && cargo clippy --locked --target x86_64-unknown-none --lib -- \
+        -D warnings -A unexpected_cfgs -A clippy::result_large_err \
     && cargo osdk build \
     && cmp /tmp/nexus-inputs/Cargo.lock /work/Cargo.lock \
     && diff -ru /tmp/nexus-inputs/osdk-runner-base \

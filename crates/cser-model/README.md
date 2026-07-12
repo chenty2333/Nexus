@@ -89,7 +89,7 @@ one scope gate; adopt versus timeout and a stale reply; complete, abort, and a
 duplicate reply contending for one wake authority; and the three-stage
 `Closing -> cleanup/wake-authority destruction -> Revoked` ordering. It uses
 small `loom::sync` surrogate state machines rather than executing `PagerModel`
-or the OSTD spike. A passing run establishes only those bounded interleavings;
+or the OSTD prototype. A passing run establishes only those bounded interleavings;
 it does not prove liveness or fairness, the eventual production lock/atomic
 scheme, OSTD task or waker behavior, real page-table allocation or PTE
 publication, TLB/SMP visibility or shootdown, multi-client recovery, device
@@ -402,4 +402,4 @@ host-toolchain workflow.
 
 The library is `no_std + alloc` compatible and contains no unsafe code. The
 baseline `Model` trace action names and fields are shared with the baseline
-TLA+ model and the OSTD scheduler spike under `experiments/ostd-cser-spike`.
+TLA+ model and the OSTD scheduler spike under `kernel/nexus-ostd`.

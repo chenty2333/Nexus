@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "nexus-kernel-osdk-bin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies.nexus-kernel]
+path = "/work"
+default-features = false
+
+[dependencies.osdk-frame-allocator]
+version = "0.18.0"
+
+[dependencies.osdk-heap-allocator]
+version = "0.18.0"
+
+[dependencies.ostd]
+version = "0.18.0"
+
+[features]

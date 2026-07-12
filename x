@@ -1,42 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root=$(cd "$(dirname "$0")" && pwd)
-image_key=$(sha256sum \
-    "$root/Dockerfile" \
-    "$root/.dockerignore" \
-    "$root/rust-toolchain.toml" \
-    "$root/.cargo/config.toml" \
-    "$root/Cargo.toml" \
-    "$root/Cargo.lock" \
-    "$root/crates/cser-model/Cargo.toml" \
-    "$root/tools/xtask/Cargo.toml" \
-    "$root/tools/xtask/Cargo.lock" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
-image="nexus/cser-dev:$image_key"
-cser_spike="$root/experiments/ostd-cser-spike/x"
-io_spike_root="$root/experiments/ostd-virtio-cser-spike"
-io_spike="$io_spike_root/x"
-io_spike_lock_key=$(printf '%s' "$io_spike_root" | sha256sum | cut -c1-16)
-io_spike_lock="/tmp/nexus-ostd-virtio-cser-spike-$io_spike_lock_key.lock"
-composition_oracle="$root/experiments/ostd-cser-spike/scripts/assert-composition.sh"
-virtio_oracle="$root/experiments/ostd-virtio-cser-spike/scripts/assert-serial.sh"
+root=$(cd -- "$(dirname -- "$0")" && pwd)
+image=
+kernel_backend="$root/kernel/nexus-ostd/x"
+virtio_backend="$root/experiments/ostd-virtio-cser-spike/x"
+composition_backend="$root/tools/workflow/system-composition.sh"
+root_image_ready=false
+repo_lock="/tmp/nexus-workflow-${root//\//_}.lock"
 
 usage() {
     cat >&2 <<'EOF'
-usage: ./x {fmt|check|test|model|spec|spike|io-spike|composition|verify|clean}
+usage: ./x COMMAND [TARGET]
 
-  fmt      format the Rust workspaces in the pinned development image
-  check    check the no_std and std reference-model configurations
-  test     run the reference-model test suite
-  model    run every reference-model verification gate
-  spec     check PlusCal translation drift and run TLC
-  spike    run the pinned OSTD five-domain composition/Linux QEMU spike
-  io-spike run the pinned mediated VirtIO/reset/IOTLB QEMU spike
-  composition
-           cross-check retained OSTD and split VirtIO evidence for consistency
-  verify   run every model/spec/spike gate and the system composition oracle
-  clean    remove root and both OSTD-spike build artifacts
+Public commands:
+  doctor                 validate Docker, repository layout, and pinned tools
+  build [all|model|kernel|virtio]
+                         build the selected artifact graph (default: all)
+  test [--unit|--quick|--system|--full]
+                         run a verification tier (default: --unit)
+  run [composition|kernel|virtio]
+                         run a QEMU receipt (default: composition)
+  verify                 run the complete model/spec/QEMU/composition gate
+  clean                  remove all repository-owned generated artifacts
+
+Focused commands:
+  fmt                     format Rust workspaces
+  check                   run schema and Rust static checks
+  quick                   run all non-TLA+, non-QEMU verification
+  model                   alias for the complete reference-model gate
+  spec                    check PlusCal drift and run all TLC families
+  system                  run both QEMU receipts and composition oracle
 EOF
+}
+
+die() {
+    echo "x: $*" >&2
+    exit 2
+}
+
+require_no_args() {
+    if (( $# != 0 )); then
+        die "unexpected arguments: $*"
+    fi
 }
 
 require_docker() {
@@ -46,7 +52,40 @@ require_docker() {
     fi
 }
 
+require_command() {
+    local command=$1
+    if ! command -v "$command" >/dev/null 2>&1; then
+        echo "required host command is unavailable: $command" >&2
+        exit 1
+    fi
+}
+
+acquire_repo_lock() {
+    exec 9>"$repo_lock"
+    flock 9
+    export NEXUS_ROOT_LOCK_HELD=1
+}
+
+compute_image_identity() {
+    if [[ -n $image ]]; then
+        return
+    fi
+    local image_key
+    image_key=$(sha256sum \
+        "$root/Dockerfile" \
+        "$root/.dockerignore" \
+        "$root/rust-toolchain.toml" \
+        "$root/.cargo/config.toml" \
+        "$root/Cargo.toml" \
+        "$root/Cargo.lock" \
+        "$root/crates/cser-model/Cargo.toml" \
+        "$root/tools/xtask/Cargo.toml" \
+        "$root/tools/xtask/Cargo.lock" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+    image="nexus/cser-dev:$image_key"
+}
+
 build_image() {
+    compute_image_identity
     docker build \
         --platform linux/amd64 \
         --tag "$image" \
@@ -54,13 +93,27 @@ build_image() {
 }
 
 ensure_image() {
-    if [[ ${NEXUS_REBUILD:-0} == 1 ]] || ! docker image inspect "$image" >/dev/null 2>&1; then
+    if [[ $root_image_ready == true ]]; then
+        return
+    fi
+    compute_image_identity
+    if [[ ${NEXUS_REBUILD:-0} == 1 ]] ||
+        ! docker image inspect "$image" >/dev/null 2>&1; then
         build_image
     fi
+    root_image_ready=true
 }
 
 run_xtask() {
     local command=$1
+    local -a token_environment=()
+    if [[ $command == begin || $command == complete || $command == manifest ]]; then
+        if [[ ! ${verify_token:-} =~ ^[0-9a-f]{64}$ ]]; then
+            echo "internal verification token is unavailable for $command" >&2
+            exit 1
+        fi
+        token_environment=(--env "NEXUS_VERIFY_TOKEN=$verify_token")
+    fi
     ensure_image
     docker run --rm \
         --platform linux/amd64 \
@@ -69,6 +122,9 @@ run_xtask() {
         --env HOME=/tmp/nexus-home \
         --tmpfs /tmp/nexus-home:rw,exec,nosuid,size=64m,mode=1777 \
         --env CARGO_TARGET_DIR=/work/target/docker \
+        --env "NEXUS_REBUILD=${NEXUS_REBUILD:-0}" \
+        --env "NEXUS_VERIFY_INVOCATION=${NEXUS_VERIFY_INVOCATION:-}" \
+        "${token_environment[@]}" \
         --volume "$root:/work:z" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         --mount "type=bind,source=$root/tools/xtask/Cargo.lock,target=/work/tools/xtask/Cargo.lock,readonly" \
@@ -77,142 +133,120 @@ run_xtask() {
         cargo run --quiet --locked --manifest-path tools/xtask/Cargo.toml -- "$command"
 }
 
-run_spike() {
+run_backend() {
     local entrypoint=$1
-    local description=$2
+    local backend_command=$2
+    local description=$3
     if [[ ! -x "$entrypoint" ]]; then
         echo "$description entrypoint is missing or not executable: $entrypoint" >&2
         exit 1
     fi
-    "$entrypoint" test
-}
-
-check_system_composition_evidence() {
-    local composition_log=$1
-    local virtio_log=$2
-    local virtio_debug_log=$3
-    # This helper is also invoked as an `if` condition by the negative gates.
-    # An explicit AND-list preserves the first oracle's failure instead of
-    # letting Bash's conditional-context errexit suppression run the second.
-    "$virtio_oracle" "$virtio_log" "$virtio_debug_log" &&
-        "$composition_oracle" "$composition_log" "$virtio_log"
-}
-
-expect_composition_reject() {
-    local label=$1
-    local composition_log=$2
-    local virtio_log=$3
-    local virtio_debug_log=$4
-    if check_system_composition_evidence \
-        "$composition_log" "$virtio_log" "$virtio_debug_log" >/dev/null 2>&1; then
-        echo "system composition oracle accepted negative mutation: $label" >&2
-        return 1
-    fi
-    echo "system composition negative assertion: PASS $label=rejected"
+    "$entrypoint" "$backend_command"
 }
 
 run_composition_oracle() {
-    local composition_log="$root/experiments/ostd-cser-spike/artifacts/serial.log"
-    local virtio_log="$root/experiments/ostd-virtio-cser-spike/artifacts/kernel.log"
-    local virtio_debug_log="$root/experiments/ostd-virtio-cser-spike/artifacts/qemu-debug.log"
-    local artifact="$root/target/verification/system-composition-oracle.log"
-    local io_lock_fd
+    bash "$composition_backend"
+}
 
-    # Standalone `./x composition` may race a developer-started Stage 5B run.
-    # Share that runner's lock so the oracle sees one immutable artifact set.
-    exec {io_lock_fd}>"$io_spike_lock"
-    flock "$io_lock_fd"
-    mkdir -p "$(dirname "$artifact")"
-    {
-        if [[ ! -x "$composition_oracle" ]]; then
-            echo "system composition oracle is missing or not executable: $composition_oracle" >&2
+run_system() {
+    run_backend "$kernel_backend" test "Nexus OSTD kernel"
+    run_backend "$virtio_backend" test "OSTD mediated VirtIO"
+    run_composition_oracle
+}
+
+check_host_shell_sources() {
+    local count=0
+    local interpreter
+    local relative
+    local shebang
+    while IFS= read -r -d '' relative; do
+        if [[ ! -f "$root/$relative" ]]; then
+            continue
+        fi
+        case "$relative" in
+            x|*/x|*.sh) ;;
+            *) continue ;;
+        esac
+        shebang=$(head -n 1 "$root/$relative")
+        if [[ $shebang == *bash* ]]; then
+            interpreter=bash
+        elif [[ $shebang == *'/sh'* ]]; then
+            interpreter=sh
+        else
+            echo "workflow shell source has no supported shebang: $relative" >&2
             exit 1
         fi
-        if [[ ! -x "$virtio_oracle" ]]; then
-            echo "mediated VirtIO oracle is missing or not executable: $virtio_oracle" >&2
+        "$interpreter" -n "$root/$relative"
+        ((count += 1))
+    done < <(git -C "$root" ls-files -z --cached --others --exclude-standard)
+    if (( count == 0 )); then
+        echo 'no shell workflow sources were discovered' >&2
+        exit 1
+    fi
+    echo "HOST SHELL PASS sources=$count"
+}
+
+run_quick() {
+    check_host_shell_sources
+    run_xtask quick
+    run_backend "$kernel_backend" check "Nexus OSTD kernel"
+    run_backend "$virtio_backend" check "OSTD mediated VirtIO"
+}
+
+run_check() {
+    check_host_shell_sources
+    run_xtask check
+    run_backend "$kernel_backend" check "Nexus OSTD kernel"
+    run_backend "$virtio_backend" check "OSTD mediated VirtIO"
+}
+
+run_format() {
+    run_xtask fmt
+    run_backend "$kernel_backend" fmt "Nexus OSTD kernel"
+    run_backend "$virtio_backend" fmt "OSTD mediated VirtIO"
+}
+
+verify_all() {
+    local invocation=$1
+    local verify_token
+    verify_token=$(head -c 32 /dev/urandom | sha256sum | cut -d ' ' -f1)
+    if [[ ! $verify_token =~ ^[0-9a-f]{64}$ ]]; then
+        echo 'failed to generate the verification orchestration token' >&2
+        exit 1
+    fi
+    export NEXUS_VERIFY_INVOCATION=$invocation
+    require_docker
+    check_host_shell_sources
+    run_xtask begin
+    run_xtask verify
+    # OSDK images remain host-side backends; the root verification image never
+    # receives access to the Docker socket.
+    run_system
+    run_xtask complete
+    run_xtask manifest
+}
+
+doctor_host() {
+    for command in \
+        awk bash chmod cp cut diff docker flock git grep head id mkdir mkfifo \
+        mktemp rm sed sh sha256sum tee tr wc; do
+        require_command "$command"
+    done
+    docker info >/dev/null
+    for entrypoint in \
+        "$root/x" \
+        "$kernel_backend" \
+        "$virtio_backend" \
+        "$composition_backend"; do
+        if [[ ! -x "$entrypoint" ]]; then
+            echo "required workflow entrypoint is missing or not executable: $entrypoint" >&2
             exit 1
         fi
-        if [[ ! -s "$composition_log" ]]; then
-            echo "OSTD composition log is missing or empty: $composition_log" >&2
-            exit 1
-        fi
-        if [[ ! -s "$virtio_log" ]]; then
-            echo "mediated VirtIO kernel log is missing or empty: $virtio_log" >&2
-            exit 1
-        fi
-        if [[ ! -s "$virtio_debug_log" ]]; then
-            echo "mediated VirtIO debug log is missing or empty: $virtio_debug_log" >&2
-            exit 1
-        fi
-        check_system_composition_evidence \
-            "$composition_log" "$virtio_log" "$virtio_debug_log"
-
-        local mutation_dir
-        mutation_dir=$(mktemp -d)
-        trap 'rm -rf "$mutation_dir"' EXIT
-
-        cp "$composition_log" "$mutation_dir/composition-duplicate-pass.log"
-        grep -F -m1 'COMPOSITION_SLICE PASS ' "$composition_log" \
-            >>"$mutation_dir/composition-duplicate-pass.log"
-        expect_composition_reject \
-            duplicate_composition_pass \
-            "$mutation_dir/composition-duplicate-pass.log" \
-            "$virtio_log" \
-            "$virtio_debug_log"
-
-        awk '
-            !changed && /^COMPOSITION_REJECT / && /kind=stale_receipt/ {
-                changed = sub(/mutation=false/, "mutation=true")
-            }
-            { print }
-            END { if (!changed) exit 1 }
-        ' "$composition_log" >"$mutation_dir/composition-stale-receipt.log"
-        expect_composition_reject \
-            mutating_stale_receipt \
-            "$mutation_dir/composition-stale-receipt.log" \
-            "$virtio_log" \
-            "$virtio_debug_log"
-
-        awk '
-            !changed && /^COMPOSITION_CLOSURE (Issue|Receipt) / {
-                changed = sub(/receipt_sequence=[0-9]+/, "receipt_sequence=999")
-            }
-            { print }
-            END { if (!changed) exit 1 }
-        ' "$composition_log" >"$mutation_dir/composition-wrong-sequence.log"
-        expect_composition_reject \
-            wrong_closure_sequence \
-            "$mutation_dir/composition-wrong-sequence.log" \
-            "$virtio_log" \
-            "$virtio_debug_log"
-
-        awk '
-            !changed && /RESET Fence old_generation=2 new_generation=3/ {
-                changed = sub(/new_generation=3/, "new_generation=4")
-            }
-            { print }
-            END { if (!changed) exit 1 }
-        ' "$virtio_log" >"$mutation_dir/virtio-wrong-generation.log"
-        expect_composition_reject \
-            wrong_virtio_generation \
-            "$composition_log" \
-            "$mutation_dir/virtio-wrong-generation.log" \
-            "$virtio_debug_log"
-
-        awk '
-            !changed && /^vtd_inv_desc_iotlb_global / {
-                changed = sub(/vtd_inv_desc_iotlb_global/, "vtd_inv_desc_iotlb_corrupt")
-            }
-            { print }
-            END { if (!changed) exit 1 }
-        ' "$virtio_debug_log" >"$mutation_dir/virtio-missing-iotlb.log"
-        expect_composition_reject \
-            missing_iotlb_trace \
-            "$composition_log" \
-            "$virtio_log" \
-            "$mutation_dir/virtio-missing-iotlb.log"
-    } 2>&1 | tee "$artifact"
-    exec {io_lock_fd}>&-
+    done
+    echo "DOCTOR HOST PASS docker=true entrypoints=4 public_frontdoor=./x"
+    run_xtask doctor
+    run_backend "$kernel_backend" doctor "Nexus OSTD kernel"
+    run_backend "$virtio_backend" doctor "OSTD mediated VirtIO"
 }
 
 clean_root() {
@@ -227,39 +261,104 @@ clean_root() {
 }
 
 command=${1:-}
+if (( $# > 0 )); then
+    shift
+fi
 case "$command" in
-    fmt|check|test|model|spec)
+    doctor|build|test|run|fmt|check|quick|model|spec|system|verify|clean)
+        acquire_repo_lock
+        ;;
+esac
+case "$command" in
+    doctor)
+        require_no_args "$@"
+        require_docker
+        doctor_host
+        ;;
+    build)
+        require_docker
+        target=${1:-all}
+        if (( $# > 1 )); then
+            die "build accepts at most one target"
+        fi
+        case "$target" in
+            all)
+                run_xtask build
+                run_backend "$kernel_backend" build "Nexus OSTD kernel"
+                run_backend "$virtio_backend" build "OSTD mediated VirtIO"
+                ;;
+            model) run_xtask build ;;
+            kernel) run_backend "$kernel_backend" build "Nexus OSTD kernel" ;;
+            virtio) run_backend "$virtio_backend" build "OSTD mediated VirtIO" ;;
+            *) die "unknown build target: $target" ;;
+        esac
+        ;;
+    test)
+        require_docker
+        profile=${1:---unit}
+        if (( $# > 1 )); then
+            die "test accepts at most one profile"
+        fi
+        case "$profile" in
+            --unit) run_xtask test ;;
+            --quick) run_quick ;;
+            --system) run_system ;;
+            --full) verify_all "./x test --full" ;;
+            *) die "unknown test profile: $profile" ;;
+        esac
+        ;;
+    run)
+        require_docker
+        target=${1:-composition}
+        if (( $# > 1 )); then
+            die "run accepts at most one target"
+        fi
+        case "$target" in
+            composition) run_system ;;
+            kernel) run_backend "$kernel_backend" run "Nexus OSTD kernel" ;;
+            virtio) run_backend "$virtio_backend" run "OSTD mediated VirtIO" ;;
+            *) die "unknown run target: $target" ;;
+        esac
+        ;;
+    fmt)
+        require_no_args "$@"
+        require_docker
+        run_format
+        ;;
+    check)
+        require_no_args "$@"
+        require_docker
+        run_check
+        ;;
+    quick)
+        require_no_args "$@"
+        require_docker
+        run_quick
+        ;;
+    model|spec)
+        require_no_args "$@"
         require_docker
         run_xtask "$command"
         ;;
-    spike)
+    system)
+        require_no_args "$@"
         require_docker
-        run_spike "$cser_spike" "OSTD five-domain composition/Linux spike"
-        ;;
-    io-spike)
-        require_docker
-        run_spike "$io_spike" "OSTD mediated VirtIO spike"
-        ;;
-    composition)
-        run_composition_oracle
+        run_system
         ;;
     verify)
-        require_docker
-        run_xtask verify
-        # These are intentionally host-side. Each OSTD spike owns a separate,
-        # pinned OSDK image, so the root container never starts Docker.
-        run_spike "$cser_spike" "OSTD five-domain composition/Linux spike"
-        run_spike "$io_spike" "OSTD mediated VirtIO spike"
-        run_composition_oracle
+        require_no_args "$@"
+        verify_all "./x verify"
         ;;
     clean)
+        require_no_args "$@"
         # Cleaning must remain available before Docker is installed and must
         # never pull or build an image merely to remove host-owned artifacts.
         clean_root
-        "$cser_spike" clean
-        "$io_spike" clean
+        run_backend "$kernel_backend" clean "Nexus OSTD kernel"
+        run_backend "$virtio_backend" clean "OSTD mediated VirtIO"
         ;;
     -h|--help|help)
+        require_no_args "$@"
         usage
         ;;
     *)

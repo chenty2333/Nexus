@@ -14,8 +14,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod catalog;
+mod doctor;
+mod evidence;
 mod guest;
 mod scenario;
+mod workflow;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -61,15 +64,22 @@ fn real_main() -> Result<()> {
     }
 
     match command.as_str() {
+        "build" => build(&root),
+        "doctor" => doctor(&root),
+        "begin" => evidence::begin(&root, &TLA_SPECS).map(|_| ()),
         "fmt" => fmt(&root),
         "check" => check(&root),
         "test" => test(&root),
+        "quick" => model(&root),
         "model" => model(&root),
         "spec" => spec(&root),
         "verify" => {
             model(&root)?;
-            spec(&root)
+            spec(&root)?;
+            evidence::mark_model_spec_complete(&root, &TLA_SPECS).map(|_| ())
         }
+        "complete" => evidence::complete(&root, &TLA_SPECS).map(|_| ()),
+        "manifest" => evidence::write(&root, &TLA_SPECS).map(|_| ()),
         "clean" => clean(&root),
         "help" | "-h" | "--help" => {
             print_usage();
@@ -89,7 +99,45 @@ fn repo_root() -> PathBuf {
 
 fn print_usage() {
     eprintln!("usage: cargo run --manifest-path tools/xtask/Cargo.toml -- <command>");
-    eprintln!("commands: fmt check test model spec verify clean");
+    eprintln!("commands: doctor build fmt check test quick model spec verify clean");
+    eprintln!("internal evidence commands: begin complete manifest");
+}
+
+fn doctor(root: &Path) -> Result<()> {
+    section("validate Stage 7A repository and pinned toolchain");
+    doctor::run(root, &TLA_SPECS)?;
+    let oracle_count =
+        catalog::validate_all(root).map_err(|error| format!("oracle schema: {error}"))?;
+    let scenario_count =
+        scenario::validate_all(root).map_err(|error| format!("runner schema: {error}"))?;
+    let guest = guest::validate(root).map_err(|error| format!("Linux guest catalog: {error}"))?;
+    println!(
+        "DOCTOR CATALOGS PASS oracles={oracle_count} scenarios={scenario_count} guest_sources={} guest_workloads={}",
+        guest.sources, guest.workloads
+    );
+    Ok(())
+}
+
+fn build(root: &Path) -> Result<()> {
+    section("build cser-model for the host");
+    cargo(
+        root,
+        ["build", "--locked", "-p", "cser-model", "--all-features"],
+    )?;
+    section("build cser-model for the bare-metal target without std");
+    cargo(
+        root,
+        [
+            "build",
+            "--locked",
+            "-p",
+            "cser-model",
+            "--no-default-features",
+            "--lib",
+            "--target",
+            "x86_64-unknown-none",
+        ],
+    )
 }
 
 fn fmt(root: &Path) -> Result<()> {
@@ -114,6 +162,13 @@ fn fmt_check(root: &Path) -> Result<()> {
 }
 
 fn check(root: &Path) -> Result<()> {
+    section("validate repository workflow surfaces");
+    let workflow = workflow::validate(root)?;
+    println!(
+        "workflow surfaces: PASS ({} shell sources, {} pinned CI actions)",
+        workflow.shell_sources, workflow.pinned_actions
+    );
+
     section("validate implementation-neutral oracle catalogs");
     let oracle_count =
         catalog::validate_all(root).map_err(|error| format!("oracle schema: {error}"))?;

@@ -346,7 +346,7 @@ model, or a production device stack.
 
 ### Observed OSTD evidence
 
-The pinned OSTD/OSDK 0.18 spike under `experiments/ostd-cser-spike` observed that
+The pinned OSTD/OSDK 0.18 spike under `kernel/nexus-ostd` observed that
 Nexus can, without modifying OSTD internals:
 
 - inject a custom `Scheduler`/`LocalRunQueue`;
@@ -567,7 +567,15 @@ Work proceeds through evidence gates, not feature-count milestones.
    does not identify the Stage 5B effect, ticket, or generation with the
    composition adapter. Unbounded graphs, SMP, production portals, runtime
    filesystem/network, and a general mixed-workload fault matrix remain open.
-7. **Integrated evidence and contribution decision — final Stage 7 planned:**
+7. **Engineering consolidation gate — Stage 7A complete:** the primary OSTD
+   implementation is promoted from an experiment to `kernel/nexus-ostd` with
+   explicit CSER/domain/personality/probe ownership; the largest independent
+   reference and workflow modules are decomposed without changing their public
+   semantics; and one Docker/`./x`/xtask/CI contract now emits source-bound,
+   fresh hashed evidence under repository/backend locks. This gate adds no
+   runtime filesystem/network behavior and does not weaken the independence of
+   the reference model.
+8. **Integrated evidence and contribution decision — Stage 7B planned:**
    extend the bounded Loom gates with implementation-specific Loom and/or Kani
    checks across scheduler, pager, personality, and I/O; add a parameterized
    QEMU recovery matrix plus fixed-`N`/varying-`k` and

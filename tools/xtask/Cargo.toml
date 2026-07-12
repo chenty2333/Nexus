@@ -5,13 +5,15 @@ edition = "2024"
 license = "Unlicense"
 publish = false
 
-# Keep the workflow tool independent from the legacy Nexus workspace. This is
-# intentional: deleting or reshaping the old workspace must not remove the
-# command surface used to verify the new CSER baseline.
+# Keep the workflow tool independent from both the reference-model workspace
+# and the cargo-osdk kernel workspace. Reshaping either implementation must not
+# remove the command surface that verifies their evidence boundary.
 [workspace]
 
 [dependencies]
 libc = "=0.2.186"
 serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+serde_yaml = "=0.9.34"
 sha2 = "=0.10.9"
 toml = "=0.9.12"
