@@ -328,8 +328,10 @@ revocation after commit drains once and never restores the old image. Unlike
 the concrete QEMU receipt, this Rust abstraction records TLS and stack as
 frozen layout metadata rather than two additional effects.
 
-Before runtime network, the executable suite contained 144 tests; the 16 new
-runtime-network gates bring the current suite to 160. The four Stage 6B.2
+Before runtime network, the executable suite contained 144 tests; its 16 gates
+raised that checkpoint to 160, and the additive seven-domain Linux I/O
+composition successor adds 9 deterministic sequences, 2 bounded properties,
+and 4 actual-model Loom checks for a current total of 175. The four Stage 6B.2
 additions contribute 12 common-registry tests, 10 futex-requeue tests, 7
 readiness tests, and 7 exec tests; deterministic sequences and bounded
 proptests cover rollback, stale projections, current-binding fencing,
@@ -408,6 +410,26 @@ fencing, and one-shot acknowledgement. They are bounded protocol checks, not a
 production lock/atomic scheme, TCP/IP stack, external-packet path, VirtIO-net,
 NIC, or SMP proof.
 
+The additive `linux_io_composition` module does not widen or replace the frozen
+five-domain `composition` model. Its fixed graph has one root, seven service
+domains, and nine effects across filesystem and network syscall branches.
+Control has capacity two; Memory, CPU/Scheduling, Filesystem, DMA, Network,
+Readiness, and Buffer each have capacity one. Root authority, seven binding
+epochs, address-space, inode, device, socket, and readiness-source generations,
+and domain closure revisions remain distinct. Clone/validate/swap transitions
+make failed prepare, commit, recovery, stale-envelope, and receipt operations
+full-state atomic.
+
+The successor tests cover mixed filesystem/network publication, both suppressed
+branches, filesystem and network crash/snapshot/Ready/rebind/adopt, exact
+network-receipt readiness, child-first reverse-index closure, global receipt
+sequencing, and an honest VirtIO timeout/tombstone/retry that invalidates the
+old receipt before final closure. Its four Loom checks run the actual model
+behind the same outer mutex used to represent the implementation gate; they
+exercise filesystem commit/revoke, atomic network-plus-buffer commit/revoke,
+filesystem crash/commit, and timeout-receipt acceptance/retry. They remain
+bounded lock-order checks, not an SMP memory-model proof or device execution.
+
 The pinned OSTD/QEMU successor independently executes the adapted retained
 Round 4 futex program, the adapted retained Round 5 epoll program plus a
 readiness lifecycle companion, and a retained dynamic PIE launcher/main/
@@ -417,12 +439,13 @@ ELF. The latter uses one bounded in-memory listener/client/accepted-socket
 loopback, a real OSTD `UserMode` netd-v1 page fault followed by netd-v2
 snapshot/ready/rebind/adopt, kernel-owned readiness, and exact ping/pong plus
 shutdown/EOF behavior. These observations give all six fixed Linux core inputs
-bounded Checked/Observed evidence. They do not establish a production
-cross-service registry or complete Stage 6 by themselves. The frozen bounded
-composition receipt observes its fixed five-domain root gate separately with
-`runtime_fs=false` and `runtime_net=false`; it does not absorb either successor
-or run the real VirtIO device in the same boot. A seven-domain Linux I/O
-composition successor remains unimplemented.
+bounded Checked/Observed evidence. The additive seven-domain OSTD companion
+then uses a fresh root scope and nine fresh effects while consuming the
+already-revoked filesystem/network workload receipts only as same-boot
+prerequisites. The frozen five-domain receipt remains unchanged with
+`runtime_fs=false` and `runtime_net=false`; neither successor claims
+retained-effect identity, native multi-domain registry bindings, real DMA in
+the primary boot, or identity-preserving Stage 5B composition.
 
 `Commit` is the effect commit linearization point. `RevokeBegin` atomically
 closes the old authority epoch. Effects that committed first must complete or

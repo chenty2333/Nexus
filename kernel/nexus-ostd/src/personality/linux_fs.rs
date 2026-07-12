@@ -88,6 +88,21 @@ const STAT_BYTES: usize = 144;
 
 const RUNTIME_FS_ELF: &[u8] = include_bytes!("../../guest/linux-runtime-fs.elf");
 
+/// Read-only prerequisite proving that the retained filesystem workload
+/// completed earlier in this boot.  No registry handle or effect identity is
+/// exported: the Linux I/O composition successor creates a fresh root cohort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFsSliceReceipt {
+    pub(crate) scope: ScopeKey,
+    pub(crate) closed_authority_epoch: u64,
+    pub(crate) final_authority_epoch: u64,
+    pub(crate) terminalizations: usize,
+    pub(crate) publication_acks: usize,
+    pub(crate) quiescent: bool,
+    pub(crate) source_sha256: &'static str,
+    pub(crate) elf_sha256: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FdKind {
     Stdout,
@@ -592,7 +607,7 @@ enum FsAction {
     Exit,
 }
 
-pub(crate) fn run_linux_fs_slice() {
+pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
     run_filesystem_lifecycle_companion();
     assert_stage5b_fixture_projection();
 
@@ -632,6 +647,16 @@ pub(crate) fn run_linux_fs_slice() {
     task.run();
     done_waiter.wait();
     scenario.state.lock().assert_final();
+    RuntimeFsSliceReceipt {
+        scope: SCOPE,
+        closed_authority_epoch: AUTHORITY_EPOCH,
+        final_authority_epoch: AUTHORITY_EPOCH + 1,
+        terminalizations: 14,
+        publication_acks: 14,
+        quiescent: true,
+        source_sha256: EXPECTED_SOURCE_SHA256,
+        elf_sha256: EXPECTED_ELF_SHA256,
+    }
 }
 
 fn run_guest(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, entry: usize, stack: usize) {

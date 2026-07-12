@@ -26,8 +26,9 @@ explicitly adapted Round 5 epoll input, the retained dynamic-PIE launcher/main/
 interpreter set, the unchanged runtime-filesystem input, and the unchanged
 runtime-network input. These are narrow pressure receipts, not a general
 Linux-compatibility claim. The old five-domain composition remains frozen with
-`runtime_fs=false` and `runtime_net=false`; a seven-domain Linux I/O composition
-successor has not yet been implemented.
+`runtime_fs=false` and `runtime_net=false`; the additive seven-domain Linux I/O
+successor consumes the two already-revoked workload receipts only as same-boot
+prerequisites and creates a fresh root/effect cohort.
 
 `kernel/nexus-ostd/scripts/build-guest.sh` builds the static
 `linux-hello` `ET_EXEC` directly from the unchanged retained `hello.S`; it does

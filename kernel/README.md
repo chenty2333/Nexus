@@ -22,9 +22,10 @@ core inputs now have bounded Checked/Observed receipts, including the separate
 runtime-filesystem and runtime-network successors. Their presence in the
 formal prototype does not turn Linux compatibility into Nexus's research
 identity or claim general filesystem, TCP/IP, external-packet, VirtIO-net/NIC,
-or SMP support. The historical five-domain composition receipt still has
-`runtime_fs=false` and `runtime_net=false`; the seven-domain Linux I/O
-composition successor is not implemented.
+or SMP support. The historical five-domain composition receipt remains frozen
+with `runtime_fs=false` and `runtime_net=false`. Its additive seven-domain
+successor uses a fresh root cohort and bounded filesystem/network adapters; it
+does not preserve the retained workload effects or Stage 5B device identity.
 
 Use only the repository-root `./x` as the public developer interface. The
 private `nexus-ostd/x` entrypoint is a backend retained for isolation and

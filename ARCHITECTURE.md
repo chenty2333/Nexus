@@ -302,8 +302,10 @@ Status: **Observed** for one CPU in the pinned OSTD 0.18 spike.
 
 The user-space policy submits a proposal tagged with the current authority and
 binding epochs. The kernel scheduler validates the epochs and task identity at
-`Prepare`; selecting the proposed runnable task is the scheduling effect's
-`Commit`.
+`Prepare`; an accepted current-supervisor proposal renews the 64-tick lease
+under the same run-queue lock before publishing the pending proposal, while a
+stale, absent-supervisor, or unknown-task rejection does not renew it. Selecting
+the proposed runnable task is the scheduling effect's `Commit`.
 
 The observed path is:
 
@@ -848,9 +850,9 @@ credit is held until peer consumption or root-owned closure.
 This is one bounded listener/client/accepted-socket loopback, not smoltcp, real
 TCP breadth, external packets, VirtIO-net, NIC, multi-client behavior, or SMP.
 The historical `CompositionCser`/OSTD receipt remains frozen with
-`runtime_fs=false` and `runtime_net=false`. A new seven-domain Linux I/O
-composition successor is not implemented, so this separate runtime receipt
-does not complete Stage 6 or cross-service composition.
+`runtime_fs=false` and `runtime_net=false`. The additive seven-domain Linux I/O
+successor below consumes this runtime receipt only as an already-revoked
+same-boot prerequisite; it does not import its effects into the new root cohort.
 
 ## Bounded system-wide CSER composition
 
@@ -929,6 +931,68 @@ six-node/five-edge graph, one CPU, no runtime-filesystem or network domain, no S
 composition proof, no system-wide parameterized fault matrix, and no `k/N` or
 overhead result. The later runtime-filesystem successor above is separate
 evidence and does not retroactively widen this graph.
+
+## Additive seven-domain Linux I/O composition
+
+Status: **bounded successor complete / Checked and Observed**, without changing
+the five-domain predecessor above.
+
+`LinuxIoCompositionCser` exhaustively checks the union of five explicit bounded
+scenario partitions. Its reject-enabled safety graph completes with 3,723,455
+generated / 1,225,367 distinct states at depth 55; its action graph completes
+with 3,656,517 / 1,207,917 states at depth 46 and expands two liveness formulas
+into three TLC branches. Ten separate reachability gates cover full closure,
+both suppressed-publication splits, filesystem/network crash isolation, both
+readiness/revoke orders, VirtIO reset+IOTLB tombstones, and genuinely enabled
+stale-envelope/receipt/replay audits. This is exhaustive only for those five
+partitions, not their abandoned all-feature Cartesian product.
+
+```text
+Root
+|-- FsSyscall                     Personality / Control
+|   |-- PagerMap                  Pager / Memory
+|   |   `-- SchedulerAction       Scheduler / CPU
+|   `-- FsOp                      Filesystem / Filesystem
+|       `-- BlockReq              VirtIO / DMA
+`-- NetSyscall                    Personality / Control
+    `-- NetOp                     Network / Network
+        |-- ReadinessWait         Readiness / Readiness
+        `-- BufferLease           Network / Buffer
+```
+
+The fixed graph has seven domains, nine effects, ten causal nodes, nine edges,
+and nine credit units in eight classes; Control has capacity two. The root
+authority epoch, seven binding epochs, address-space, inode, device, socket,
+and readiness-source generations, and domain mutation/closure revisions remain
+independent. The common OSTD registry still owns one root binding, so service
+bindings are explicit bounded outer envelopes rather than a false claim that
+the registry transports native multi-domain authority.
+
+The safe-Rust model uses one clone/validate/swap gate for prepare, publication,
+crash/recovery, root revoke, reverse-index terminalization, and receipt
+acceptance. Network operation and buffer visibility publish as one atomic
+batch; readiness accepts only the exact committed network receipt. Crash
+recovery freezes an old-binding snapshot, requires `Ready`, rebinds only the
+target domain, and adopts each recoverable effect explicitly. Root revoke
+freezes exactly the nine-effect cohort, closes child-first by target-domain
+index, and accepts globally sequenced domain receipts. A committed block request
+may issue one honest `TimedOut` receipt while its effect and DMA credit remain
+live; retry advances the device envelope and invalidates that receipt before a
+fresh `Closed` receipt can complete revocation.
+
+The OSTD companion creates scope 120 at authority epoch 401 and registers nine
+fresh effects in one real `EffectRegistry`. It uses the real `ReadinessCore`, a
+bounded in-memory inode mutation adapter, and a bounded loopback/buffer adapter.
+The retained runtime-filesystem scope 95 and runtime-network scope 105 have
+already reached `Revoked`; their digest-bound receipts establish only earlier
+completion in the same boot. The Stage 5B VirtIO run remains a separate boot
+and supplies component-consistency evidence for `avail.idx`, reset, IOTLB, and
+DMA ownership. It does not share effect, ticket, or device-generation identity.
+
+Consequently this successor is not a production multi-service authority
+transport, retained-workload identity, real DMA in the primary boot,
+identity-preserving Stage 5B composition, an unbounded graph, TCP/VirtIO-net
+breadth, or SMP evidence.
 
 The old guest-session/sidecar-VMO/stop-packet Starnix-like path is not the target
 architecture. Tests and failure traces from it may be retained as differential
@@ -1172,10 +1236,10 @@ failure.
 
 | Property or boundary | Current evidence | Required next evidence |
 | --- | --- | --- |
-| Core register/commit/revoke/crash/rebind semantics | eleven bounded TLC model families, including five-domain composition plus separate runtime-filesystem and runtime-network refinements; corresponding Rust reference oracles; pager, I/O, composition, runtime-filesystem, and runtime-network Loom gates | production-lock/SMP refinement and differential mixed-service traces |
+| Core register/commit/revoke/crash/rebind semantics | twelve bounded TLC model families, including the frozen five-domain composition and additive seven-domain Linux I/O successor; corresponding Rust reference oracles; pager, I/O, both composition models, runtime-filesystem, and runtime-network Loom gates | production-lock/SMP refinement and differential mixed-service traces |
 | Post-revoke commit exclusion | all domain refinements plus the composition finite model/Rust/Loom gates; the bounded OSTD composition gate rejects stale child and commit operations after root revoke | production-lock/SMP races, asynchronous mixed-service injection, and same-boot device publication |
-| Single terminalization | all eleven finite families and Rust oracles; pager, I/O, composition, runtime-filesystem, and runtime-network Loom gates; bounded QEMU receipts consume each continuation/publication/closure receipt once | implementation-source Loom/Kani, SMP and production-lock races, and device completion injection |
-| Budget conservation | baseline/pager scalars; Stage 5 typed I/O; Stage 6B typed credits; the composition model and OSTD receipt delegate and return five cross-domain credits while retaining the timed-out VirtIO credit until retry | production multi-resource accounting and leak/duplication tests under concurrency and repeated device failure |
+| Single terminalization | all twelve finite families and Rust oracles; pager, I/O, both composition successors, runtime-filesystem, and runtime-network Loom gates; bounded QEMU receipts consume each continuation/publication/closure receipt once | implementation-source Loom/Kani, SMP and production-lock races, and device completion injection |
+| Budget conservation | baseline/pager scalars; Stage 5 typed I/O; Stage 6B typed credits; the five-domain predecessor returns five credits, while the seven-domain successor returns nine units in eight classes and retains the timed-out DMA credit until retry | production multi-resource accounting and leak/duplication tests under concurrency and repeated device failure |
 | Scheduler fallback | weak-fair TLA+ property; one-CPU QEMU selects the FIFO task on the first post-crash fallback selection attempt; raw tick delta is recorded only as an artifact diagnostic | lease-expiry path, SMP races, overload and repeated-crash tests |
 | Pager one-shot reply and crash/rebind | pager TLC refinement: 17,150 generated / 7,528 distinct / reported depth 17-18 across parallel clean runs / 10 temporal branches; Rust: 12 deterministic + 5 proptests (64 cases each); one-CPU QEMU `recover` + `timeout` observations | real one-shot handle/portal, serialized recovery state, full response-boundary injection, multi-client and SMP refinement |
 | Pager QuiescentClosure | Loom three-stage surrogate; QEMU three-phase Closing -> lock-free frame/waker cleanup -> credit return and RevokeComplete; reusable OSTD Waker fenced by Nexus state | production-lock/SMP interleavings, allocation failure and arbitrary task-termination paths |
@@ -1186,10 +1250,10 @@ failure.
 | DMA quiescence | Stage 5A one-owner negative/ownership receipt plus Stage 5B real readonly device DMA, status-zero reset, and request + two queue owners released after queued IOTLB completion on pinned QEMU | physical-device drain contracts, IRQ quiescence, per-device domains, multi-page and SMP tests |
 | I/O tombstone/timeout | TLA+/Rust timeout/retry semantics plus Stage 5B fail-closed session/IOTLB ownership retention and successful retry; timeout explicitly software-injected | real-time deadline source, durable recovery worker, repeated failure, device-loss and hardware-timeout tests |
 | Work proportionality | target-local Rust structure only: the futex oracle closes a target with `k=6` while leaving an unrelated `N=96` scope unchanged, records 4 scope-index head selections and 6 terminalizations, and uses a local `BTreeSet` with `O(log k)` maintenance; TLA+ makes no complexity claim | scope-local/intrusive kernel records plus fixed-`N` varying-`k` and fixed-`k` varying-`N` kernel curves; no production `O(k)` claim before those measurements |
-| Cross-service composition | `CompositionCser`, safe Rust/Loom, and the single-CPU OSTD five-domain receipt share one root gate, immutable causal edges, typed credits, leaf closure, globally sequenced receipts, and an external VirtIO timeout/retry envelope; a strict split-stream consistency oracle separately requires Stage 5B reset/IOTLB component evidence without equating effect/ticket/generation identity or inventing a cross-FD total order; this predecessor is frozen with `runtime_fs=false` and `runtime_net=false` | seven-domain Linux I/O composition; identity-preserving or same-boot device integration; unbounded graphs, production portals/locks, SMP, and a parameterized fault matrix |
+| Cross-service composition | The frozen `CompositionCser` predecessor and additive `LinuxIoCompositionCser` successor have separate formal, safe-Rust/Loom, OSTD, and strict-oracle evidence. The successor uses a fresh seven-domain/nine-effect root cohort and prior same-boot filesystem/network receipts; Stage 5B remains non-identity component consistency | identity-preserving or same-boot device integration; unbounded graphs, production portals/locks, SMP, and a parameterized fault matrix |
 | Runtime filesystem | `RuntimeFsCser` safety/action graphs, 15 safe-Rust/property/Loom gates, unchanged retained ELF artifact gate, exact 14-syscall OSTD execution, four-domain lifecycle companion, positive/negative serial oracle, and Stage 5B sector/image component-consistency oracle | general VFS/persistence, real DMA in the primary boot, same-boot identity, multi-client/SMP, durable external effects |
 | Runtime network | `RuntimeNetCser` safety/action graphs (3,698,288 / 720,002 depth 42 and 28,449 / 14,328 depth 35), eight witnesses, 10 + 2 + 4 safe-Rust gates, unchanged 22-syscall retained ELF, bounded in-memory loopback, real `UserMode` netd-v1 page fault/netd-v2 rebind-adopt, kernel-owned readiness, four typed credits, and positive/negative trace/artifact oracles | smoltcp or real TCP breadth, external packets, VirtIO-net/NIC, multi-connection/backpressure behavior, SMP and production portal/lock refinement |
-| Linux pressure | Stage 6A, 6B.1, bounded 6B.2, runtime filesystem, and runtime network Checked/Observed: all six fixed core inputs (`linux-hello`, adapted Round 4, adapted Round 5, dynamic PIE, runtime filesystem, runtime network), strict positive/negative oracles, and bounded recovery companions | seven-domain Linux I/O composition; integrated mixed-service workload matrix; general ABI/VFS/TCP/device/SMP breadth |
+| Linux pressure | Bounded Stage 6 Checked/Observed: all six fixed core inputs (`linux-hello`, adapted Round 4, adapted Round 5, dynamic PIE, runtime filesystem, runtime network), strict positive/negative oracles, bounded recovery companions, and additive seven-domain composition evidence | integrated mixed-service workload matrix; general ABI/VFS/TCP/device/SMP breadth |
 
 TLC's current result is a complete graph only for its committed finite
 configuration. QEMU results are concrete observations only for their pinned
@@ -1201,15 +1265,17 @@ qualifiers.
 The current semantic artifacts are:
 
 - `specs/cser/` — baseline, pager, I/O, personality, private-futex, two-key
-  requeue, readiness, exec, runtime-filesystem, runtime-network, and frozen
-  five-domain system-composition PlusCal/TLA+ protocols and bounded TLC
+  requeue, readiness, exec, runtime-filesystem, runtime-network, frozen
+  five-domain composition, and additive seven-domain Linux I/O PlusCal/TLA+
+  protocols and bounded TLC
   configurations;
 - `crates/cser-model/` — safe-Rust executable core, pager, I/O, personality,
-  personality-local successors, and five-domain composition reference models;
+  personality-local successors, and both composition reference models;
 - `kernel/nexus-ostd/` — maintained, pinned OSTD kernel prototype with physical
   CSER/domain/personality/probe ownership boundaries plus bounded
   `linux-hello`, futex, epoll/readiness, dynamic PIE, runtime-filesystem,
-  runtime-network, and frozen five-domain system-composition receipts;
+  runtime-network, frozen five-domain composition, and additive seven-domain
+  Linux I/O receipts;
 - `experiments/ostd-virtio-cser-spike/` — pinned patched-OSTD mediated VirtIO,
   reset tombstone and three-owner queued-IOTLB-completion experiment.
 

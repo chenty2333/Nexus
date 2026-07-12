@@ -15,6 +15,7 @@ io_lock="/tmp/nexus-ostd-virtio-cser-spike-$io_lock_key.lock"
 composition_oracle="$root/kernel/nexus-ostd/scripts/assert-composition.sh"
 virtio_oracle="$io_root/scripts/assert-serial.sh"
 runtime_fs_composition="$root/tools/workflow/runtime-fs-composition.sh"
+linux_io_composition="$root/tools/workflow/linux-io-composition.sh"
 
 check_evidence() {
     local composition_log=$1
@@ -56,7 +57,11 @@ main() {
     flock "$io_lock_fd"
     mkdir -p "$(dirname -- "$artifact")"
     {
-        for executable in "$composition_oracle" "$virtio_oracle"; do
+        for executable in \
+            "$composition_oracle" \
+            "$virtio_oracle" \
+            "$runtime_fs_composition" \
+            "$linux_io_composition"; do
             if [[ ! -x "$executable" ]]; then
                 echo "system composition oracle is missing or not executable: $executable" >&2
                 exit 1
@@ -139,6 +144,7 @@ main() {
         rm -rf "$mutation_dir"
         trap - EXIT
         bash "$runtime_fs_composition" "$composition_log" "$virtio_log"
+        bash "$linux_io_composition" "$composition_log" "$virtio_log"
     } 2>&1 | tee "$artifact"
     exec {io_lock_fd}>&-
     exec {kernel_lock_fd}>&-

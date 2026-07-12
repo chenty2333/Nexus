@@ -13,6 +13,7 @@ extern crate alloc;
 
 pub mod composition;
 pub mod io;
+pub mod linux_io_composition;
 mod model;
 pub mod pager;
 pub mod personality;

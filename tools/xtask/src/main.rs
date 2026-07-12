@@ -34,7 +34,7 @@ const TRACE_ACTIONS: [&str; 9] = [
     "Complete",
 ];
 
-const TLA_SPECS: [&str; 11] = [
+const TLA_SPECS: [&str; 12] = [
     "Cser",
     "PagerCser",
     "IoCser",
@@ -46,6 +46,7 @@ const TLA_SPECS: [&str; 11] = [
     "RuntimeFsCser",
     "RuntimeNetCser",
     "CompositionCser",
+    "LinuxIoCompositionCser",
 ];
 
 static NEXT_SPEC_WORKSPACE: AtomicU64 = AtomicU64::new(0);
@@ -392,6 +393,7 @@ fn spec(root: &Path) -> Result<()> {
                 "RuntimeFsCser" => 900,
                 "RuntimeNetCser" => 900,
                 "CompositionCser" => 600,
+                "LinuxIoCompositionCser" => 900,
                 _ => 300,
             }),
             8 * 1024 * 1024,
@@ -571,6 +573,7 @@ fn pluscal_translation_is_current(
             | "RuntimeFsCser"
             | "RuntimeNetCser"
             | "CompositionCser"
+            | "LinuxIoCompositionCser"
     ) {
         "10000"
     } else {

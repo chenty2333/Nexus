@@ -25,6 +25,8 @@ mod linux_fs;
 mod linux_futex;
 #[path = "personality/linux_futex_core.rs"]
 mod linux_futex_core;
+#[path = "cser/linux_io_composition.rs"]
+mod linux_io_composition;
 #[path = "personality/linux_loader.rs"]
 mod linux_loader;
 #[path = "personality/linux_net.rs"]
@@ -380,9 +382,15 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     // lifetime, publication, and scope closure.
     linux_epoll::run_linux_epoll_slice();
     linux_dynamic::run_linux_dynamic_slice();
-    linux_fs::run_linux_fs_slice();
-    linux_net::run_linux_net_slice();
+    let fs_receipt = linux_fs::run_linux_fs_slice();
+    let net_receipt = linux_net::run_linux_net_slice();
     composition::run_composition_slice(scheduler, pager_receipt);
+    linux_io_composition::run_linux_io_composition_slice(
+        scheduler,
+        pager_receipt,
+        fs_receipt,
+        net_receipt,
+    );
     assert_eq!(
         scheduler.propose(old_binding, USER_TASK_ID),
         ProposalResult::RejectStale

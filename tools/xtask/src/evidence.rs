@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const SCHEMA: &str = "nexus.verification.v2";
+const SCHEMA: &str = "nexus.verification.v3";
 const START_SCHEMA: &str = "nexus.verification.start.v1";
 const MODEL_SPEC_SCHEMA: &str = "nexus.verification.model-spec.v1";
 const COMPLETE_SCHEMA: &str = "nexus.verification.complete.v1";
@@ -90,7 +90,7 @@ struct Manifest {
     artifacts: Vec<Artifact>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct Boundaries {
     bounded_graph: bool,
     single_cpu: bool,
@@ -98,6 +98,47 @@ struct Boundaries {
     identity_preserving_stage5b_composition: bool,
     runtime_filesystem: bool,
     runtime_network: bool,
+    linux_io_composition: bool,
+    linux_io_composition_domains: u64,
+    linux_io_composition_effects: u64,
+    linux_io_composition_causal_nodes: u64,
+    linux_io_composition_causal_edges: u64,
+    linux_io_composition_credit_classes: u64,
+    linux_io_composition_credit_units: u64,
+    linux_io_composition_same_boot_kernel_adapters: bool,
+    retained_workload_identity_preserved: bool,
+    retained_effects_in_composition_cohort: bool,
+    registry_multi_domain_binding: bool,
+    stage5b_relation: &'static str,
+    stage5b_same_boot: bool,
+    real_dma_primary: bool,
+}
+
+impl Boundaries {
+    fn current() -> Self {
+        Self {
+            bounded_graph: true,
+            single_cpu: true,
+            cross_fd_total_order_claimed: false,
+            identity_preserving_stage5b_composition: false,
+            runtime_filesystem: true,
+            runtime_network: true,
+            linux_io_composition: true,
+            linux_io_composition_domains: 7,
+            linux_io_composition_effects: 9,
+            linux_io_composition_causal_nodes: 10,
+            linux_io_composition_causal_edges: 9,
+            linux_io_composition_credit_classes: 8,
+            linux_io_composition_credit_units: 9,
+            linux_io_composition_same_boot_kernel_adapters: true,
+            retained_workload_identity_preserved: false,
+            retained_effects_in_composition_cohort: false,
+            registry_multi_domain_binding: false,
+            stage5b_relation: "component_consistency",
+            stage5b_same_boot: false,
+            real_dma_primary: false,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -381,6 +422,13 @@ fn write_authorized(
             ],
         },
         Stage {
+            id: "ostd-seven-domain-linux-io-composition",
+            evidence: vec![
+                String::from("kernel/nexus-ostd/artifacts/serial.log"),
+                String::from("target/verification/linux-io-composition-oracle.log"),
+            ],
+        },
+        Stage {
             id: "mediated-virtio",
             evidence: vec![
                 String::from("experiments/ostd-virtio-cser-spike/artifacts/kernel.log"),
@@ -415,14 +463,7 @@ fn write_authorized(
         completion_receipt_sha256,
         started_unix_nanos: start.started_unix_nanos,
         generated_unix_seconds,
-        boundaries: Boundaries {
-            bounded_graph: true,
-            single_cpu: true,
-            cross_fd_total_order_claimed: false,
-            identity_preserving_stage5b_composition: false,
-            runtime_filesystem: true,
-            runtime_network: true,
-        },
+        boundaries: Boundaries::current(),
         specifications: specs.iter().map(|spec| String::from(*spec)).collect(),
         stages,
         artifacts,
@@ -731,6 +772,10 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
             String::from("target/verification/runtime-net-oracle.log"),
             Some("RUNTIME_NET_ORACLE PASS"),
         ),
+        (
+            String::from("target/verification/linux-io-composition-oracle.log"),
+            Some("LINUX_IO_COMPOSITION_EVIDENCE PASS"),
+        ),
     ]
 }
 
@@ -1027,6 +1072,31 @@ mod tests {
                 .expect("create evidence parent");
             fs::write(path, "old evidence\n").expect("write old evidence");
         }
+    }
+
+    #[test]
+    fn manifest_boundaries_fix_linux_io_shape_and_non_identity_claims() {
+        let boundaries = Boundaries::current();
+        assert_eq!(boundaries.linux_io_composition_domains, 7);
+        assert_eq!(boundaries.linux_io_composition_effects, 9);
+        assert_eq!(boundaries.linux_io_composition_causal_nodes, 10);
+        assert_eq!(boundaries.linux_io_composition_causal_edges, 9);
+        assert_eq!(boundaries.linux_io_composition_credit_classes, 8);
+        assert_eq!(boundaries.linux_io_composition_credit_units, 9);
+        assert!(!boundaries.retained_workload_identity_preserved);
+        assert!(!boundaries.retained_effects_in_composition_cohort);
+        assert!(!boundaries.registry_multi_domain_binding);
+        assert_eq!(boundaries.stage5b_relation, "component_consistency");
+        assert!(!boundaries.stage5b_same_boot);
+        assert!(!boundaries.identity_preserving_stage5b_composition);
+        assert!(!boundaries.real_dma_primary);
+
+        let json = serde_json::to_value(boundaries).expect("serialize manifest boundaries");
+        assert_eq!(json["linux_io_composition_causal_nodes"], 10);
+        assert_eq!(json["linux_io_composition_causal_edges"], 9);
+        assert_eq!(json["linux_io_composition_credit_classes"], 8);
+        assert_eq!(json["linux_io_composition_credit_units"], 9);
+        assert_eq!(json["real_dma_primary"], false);
     }
 
     #[test]

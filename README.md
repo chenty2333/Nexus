@@ -6,14 +6,14 @@ user-space OS services. One authority delegation can cover scheduler, pager,
 personality, readiness, and mediated-I/O effects; revocation closes their shared
 commit gate and drives every enrolled effect to one honest terminal outcome.
 
-The current checkpoint is a bounded, single-CPU system-composition prototype
-plus separate bounded runtime-filesystem and runtime-network successors. All
-six retained Linux core inputs have bounded Checked/Observed evidence. This is
-not a production Linux personality, general or persistent filesystem, network
-stack, or proof of identity-preserving same-boot VirtIO composition. The old
-five-domain composition receipt remains frozen with `runtime_fs=false` and
-`runtime_net=false`; a seven-domain Linux I/O composition successor has not yet
-been implemented. See [VISION.md](VISION.md) for the research claim,
+The current checkpoint includes a bounded, single-CPU seven-domain Linux I/O
+composition successor plus the six retained Linux core inputs with bounded
+Checked/Observed evidence. It composes fresh personality, pager, scheduler,
+filesystem, VirtIO, network, and readiness effects beneath one root authority
+without rewriting the frozen five-domain predecessor. This is not a production
+Linux personality, general or persistent filesystem, TCP/IP stack, real-DMA
+same-boot integration, or proof of identity-preserving Stage 5B composition.
+See [VISION.md](VISION.md) for the research claim,
 [ARCHITECTURE.md](ARCHITECTURE.md) for boundaries, and [REWORK.md](REWORK.md)
 for the migration ledger.
 
@@ -45,11 +45,11 @@ Run the final acceptance gate with a cold image rebuild:
 NEXUS_REBUILD=1 ./x verify
 ```
 
-The cold gate runs Rust formatting/checks/Clippy/tests, eleven TLA+ families, the
-Nexus OSTD QEMU receipt, the mediated VirtIO/reset/IOMMU QEMU receipt, positive
-and negative predecessor/filesystem composition oracles, the runtime-network
-positive oracle and trace/artifact mutation negatives, and a fresh-evidence
-manifest. It can take tens of minutes.
+The cold gate runs Rust formatting/checks/Clippy/tests, twelve TLA+ families,
+the Nexus OSTD QEMU receipt, the mediated VirtIO/reset/IOMMU QEMU receipt,
+strict positive and negative predecessor/filesystem/network/Linux-I/O
+composition oracles, and a fresh-evidence manifest. It can take tens of
+minutes.
 
 ## Public command contract
 
@@ -59,11 +59,11 @@ manifest. It can take tens of minutes.
 | `./x build [all\|model\|kernel\|virtio]` | Build the selected reference-model or OSTD artifact graph without running QEMU. |
 | `./x test --unit` | Run Rust and neutral-runner unit/scenario tests. This is the default `test` tier. |
 | `./x test --quick` | Run all non-TLA+, non-QEMU formatting, schema, check, Clippy, test, and canonical-trace gates. |
-| `./x test --system` | Run both real QEMU receipts and the system-composition oracle. |
+| `./x test --system` | Run both real QEMU receipts and the frozen-predecessor plus Linux-I/O composition oracles. |
 | `./x test --full` | Alias for the complete `./x verify` contract. |
 | `./x run kernel` | Run the bounded Nexus OSTD kernel receipt. |
 | `./x run virtio` | Run the mediated VirtIO/reset/IOMMU receipt. |
-| `./x run composition` | Regenerate both QEMU receipts and cross-check their composition evidence. This is the default `run` target. |
+| `./x run composition` | Regenerate both QEMU receipts and cross-check the frozen predecessor and additive Linux-I/O successor. This is the default `run` target. |
 | `./x verify` | The only full local/CI acceptance gate. |
 | `./x clean` | Remove root, xtask, OSDK, QEMU, guest, TLC, and evidence outputs without building an image. |
 

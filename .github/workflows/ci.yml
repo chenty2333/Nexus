@@ -45,7 +45,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify CSER models, the five-domain predecessor, and filesystem/network successors
+      - name: Verify CSER models, the frozen predecessor, and Linux I/O successors
         run: ./x verify
       - name: Upload successful verification manifest
         if: success()

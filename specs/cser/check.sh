@@ -330,6 +330,52 @@ run_spec() {
             run_tlc "CompositionCser action properties and conditional kernel liveness" \
                 CompositionCser CompositionCserMC.cfg
             ;;
+        LinuxIoCompositionCser)
+            run_tlc "LinuxIoCompositionCser seven-domain reject-enabled safety graph" \
+                LinuxIoCompositionCser LinuxIoCompositionCserSafetyMC.cfg
+            expect_reachable LinuxIoCompositionCser \
+                LinuxIoCompositionCserSafetyMC.cfg \
+                SevenDomainLinuxIoClosureAbsent \
+                "seven domains close the fixed nine-effect graph with exact publications and receipts"
+            expect_reachable LinuxIoCompositionCser \
+                LinuxIoCompositionCserSafetyMC.cfg \
+                RevokeBeforeIoPublicationAbsent \
+                "root revocation can suppress both filesystem and network publication"
+            expect_reachable LinuxIoCompositionCser \
+                LinuxIoCompositionCserSafetyMC.cfg \
+                FsVisibleNetSuppressedAbsent \
+                "filesystem publication remains visible while the network branch aborts"
+            expect_reachable LinuxIoCompositionCser \
+                LinuxIoCompositionCserSafetyMC.cfg \
+                NetVisibleFsSuppressedAbsent \
+                "network publication remains visible while the filesystem branch aborts"
+            expect_reachable LinuxIoCompositionCser \
+                LinuxIoCompositionCserSafetyMC.cfg \
+                FilesystemCrashAdoptIsolationAbsent \
+                "filesystem crash requires explicit adoption without advancing peer bindings"
+            expect_reachable LinuxIoCompositionCser \
+                LinuxIoCompositionCserSafetyMC.cfg \
+                NetworkCrashAdoptIsolationAbsent \
+                "network crash adopts operation and buffer without advancing peer bindings"
+            expect_reachable LinuxIoCompositionCser \
+                LinuxIoCompositionCserSafetyMC.cfg \
+                ReadinessBeforeRevokeAbsent \
+                "readiness commit can win before root revocation without a fabricated reply"
+            expect_reachable LinuxIoCompositionCser \
+                LinuxIoCompositionCserSafetyMC.cfg \
+                RevokeBeforeReadinessAbsent \
+                "root revocation can fence readiness after an immutable network publication"
+            expect_reachable LinuxIoCompositionCser \
+                LinuxIoCompositionCserSafetyMC.cfg \
+                VirtIoResetIotlbTombstoneClosureAbsent \
+                "reset and IOTLB tombstones retain DMA through fresh-receipt closure"
+            expect_reachable LinuxIoCompositionCser \
+                LinuxIoCompositionCserSafetyMC.cfg \
+                StaleEnvelopeAndReceiptFencesAbsent \
+                "all authority, generation, receipt, and replay rejects are side-effect free"
+            run_tlc "LinuxIoCompositionCser action properties and conditional kernel liveness" \
+                LinuxIoCompositionCser LinuxIoCompositionCserMC.cfg
+            ;;
         *)
             echo "unknown CSER specification: $1" >&2
             exit 2
@@ -350,10 +396,11 @@ case $# in
         run_spec RuntimeFsCser
         run_spec RuntimeNetCser
         run_spec CompositionCser
+        run_spec LinuxIoCompositionCser
         ;;
     1) run_spec "$1" ;;
     *)
-        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|RuntimeFsCser|RuntimeNetCser|CompositionCser]" >&2
+        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|RuntimeFsCser|RuntimeNetCser|CompositionCser|LinuxIoCompositionCser]" >&2
         exit 2
         ;;
 esac

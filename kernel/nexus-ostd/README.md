@@ -130,7 +130,10 @@ the bounded dynamic path.
    selects the user-mode policy task at `Commit`, the scheduling decision's
    linearization point.
 3. The policy task activates a real `VmSpace`. Its x86 program returns via
-   `UserSyscall` to submit a heartbeat/proposal, then via
+   `UserSyscall` to submit a heartbeat/proposal. An accepted proposal renews the
+   64-tick lease under the run-queue lock after all reject gates and before the
+   pending proposal becomes visible; rejected proposals never renew it. The
+   policy then returns via
    `UserException(CpuException::PageFault)` to model a real policy crash.
 4. `Crash` immediately advances the binding epoch from 1 to 2 and closes the
    proposal gate. Task exit drives OSTD's scheduler path to `FallbackPick`; the
@@ -479,8 +482,8 @@ ELF digests, readiness/buffer witnesses, and limitation markers.
 This is a bounded in-memory loopback, not smoltcp, real TCP breadth, external
 packets, VirtIO-net, a NIC, multi-connection/backpressure behavior, or SMP. The
 old composition receipt below remains frozen with `runtime_fs=false` and
-`runtime_net=false`; the seven-domain Linux I/O composition successor is not
-implemented.
+`runtime_net=false`; the additive seven-domain Linux I/O successor consumes
+this receipt only as an already-revoked same-boot prerequisite.
 
 ### Bounded system-wide CSER composition
 
@@ -528,7 +531,39 @@ predecessor does not add runtime filesystem or network, SMP composition, a produ
 transport, a parameterized fault matrix, `k/N` curves, overhead evaluation, or
 a final originality judgment. The separate filesystem and network successors
 above do not retroactively change its `runtime_fs=false` / `runtime_net=false`
-receipt; the seven-domain Linux I/O successor remains open.
+receipt.
+
+### Additive seven-domain Linux I/O composition
+
+The additive companion creates a fresh root scope 120 at authority epoch 401;
+it does not modify the five-domain receipt. One real `EffectRegistry` holds nine
+fresh effects and nine credit units in eight classes across personality, pager,
+scheduler, filesystem, VirtIO, network, and readiness. The coordinator records
+the fixed two-branch causal graph and target-domain reverse indexes while
+service binding and resource-generation dimensions remain honest bounded outer
+envelopes around the registry's single root binding.
+
+`FsOp` commits before a four-byte inode mutation, `BlockReq` commits at an
+abstract `avail.idx` boundary, `NetOp + BufferLease` commit atomically through
+`commit_with_moves`, and `ReadinessWait` requires the exact `NetOp` commit
+receipt before using the real `ReadinessCore`. The two syscall-controller
+effects remain uncommitted, so root closure aborts them without fabricating
+filesystem or network replies.
+
+`RevokeBegin` freezes all seven domains and nine effects. Closure selects the
+fixed child-first order through the target-domain indexes. The committed VirtIO
+effect first yields an honest `TimedOut` receipt while its effect and DMA credit
+remain live; retry invalidates that receipt, advances only the bounded device
+generation, and permits a new `Closed` receipt. Seven current Closed receipts,
+one invalidated timeout, nine terminalizations, and all nine credits free are
+required before final `Revoked`.
+
+The runtime-filesystem and runtime-network workload receipts were already
+revoked earlier in the same boot and carry no effect handle into scope 120.
+Likewise Stage 5B remains a separate-boot component-consistency check. The
+companion therefore claims neither retained-workload identity, registry-native
+multi-domain bindings, real DMA in the primary boot, identity-preserving Stage
+5B composition, TCP/VirtIO-net breadth, nor SMP.
 
 ## IOMMU result: fail closed
 

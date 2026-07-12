@@ -14,10 +14,14 @@ const REQUIRED_PATHS: &[&str] = &[
     "experiments/ostd-virtio-cser-spike/Cargo.toml",
     "tools/workflow/system-composition.sh",
     "tools/workflow/runtime-fs-composition.sh",
+    "tools/workflow/linux-io-composition.sh",
     "specs/oracles/cser-races.toml",
     "specs/cser/RuntimeNetCserSafetyMC.cfg",
     "specs/cser/RuntimeNetCserMC.cfg",
     "specs/cser/RUNTIME_NET.md",
+    "specs/cser/LinuxIoCompositionCserSafetyMC.cfg",
+    "specs/cser/LinuxIoCompositionCserMC.cfg",
+    "specs/cser/LINUX_IO_COMPOSITION.md",
     "tests/guest/linux/SOURCES.toml",
 ];
 
@@ -25,7 +29,7 @@ pub(crate) fn run(root: &Path, specs: &[&str]) -> Result<()> {
     for relative in REQUIRED_PATHS {
         let path = root.join(relative);
         if !path.is_file() {
-            return Err(format!("required Stage 7A path is missing: {}", path.display()).into());
+            return Err(format!("required acceptance path is missing: {}", path.display()).into());
         }
     }
     for spec in specs {
@@ -49,7 +53,7 @@ pub(crate) fn run(root: &Path, specs: &[&str]) -> Result<()> {
     }
 
     println!(
-        "DOCTOR PASS layout=stage7a specs={} rustc={:?} cargo={:?} git={:?} java={:?} tla2tools={}",
+        "DOCTOR PASS layout=stage7a+linux-io-composition specs={} rustc={:?} cargo={:?} git={:?} java={:?} tla2tools={}",
         specs.len(),
         first_line(&rustc),
         first_line(&cargo),

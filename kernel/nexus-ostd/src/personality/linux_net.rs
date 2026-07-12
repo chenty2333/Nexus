@@ -126,6 +126,21 @@ const COMPANION_SYSCALL_OP: OperationClass = OperationClass::new(12);
 const COMPANION_RESOURCE: ResourceKey = ResourceKey::new(0x8200, 1, 1);
 
 const RUNTIME_NET_ELF: &[u8] = include_bytes!("../../guest/linux-runtime-net.elf");
+
+/// Read-only prerequisite proving that the retained network workload
+/// completed earlier in this boot.  It intentionally carries no portal or
+/// registered-effect handle into the fresh Linux I/O composition cohort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeNetSliceReceipt {
+    pub(crate) scope: ScopeKey,
+    pub(crate) closed_authority_epoch: u64,
+    pub(crate) final_authority_epoch: u64,
+    pub(crate) terminalizations: usize,
+    pub(crate) publication_acks: usize,
+    pub(crate) quiescent: bool,
+    pub(crate) source_sha256: &'static str,
+    pub(crate) elf_sha256: &'static str,
+}
 const NETD_V1_PROGRAM: &[u8] = include_bytes!("../../guest/linux-netd-v1.bin");
 const NETD_V2_PROGRAM: &[u8] = include_bytes!("../../guest/linux-netd-v2.bin");
 
@@ -2708,7 +2723,7 @@ fn run_network_lifecycle_companion() -> bool {
     stale_authority_unchanged
 }
 
-pub(crate) fn run_linux_net_slice() {
+pub(crate) fn run_linux_net_slice() -> RuntimeNetSliceReceipt {
     let loaded = load_static_image(RUNTIME_NET_ELF, EXECUTABLE_NAME);
     let (done_waiter, done_waker) = EffectWaiter::new_pair(EffectToken {
         authority_epoch: AUTHORITY_EPOCH,
@@ -2804,4 +2819,14 @@ pub(crate) fn run_linux_net_slice() {
     println!(
         "NETWORK_LIFECYCLE PASS netd_crash_adopt_accept=true stale_old_binding_full_projection_unchanged=true ready_commit_first=true ready_revoke_first=true personality_crash_drain_abort=true buffer_visible_reply_absent=true stale_socket_generation_full_projection_unchanged=true stale_source_generation_full_projection_unchanged=true stale_authority_full_projection_unchanged=true companion_quiescent=true netd_crash_peer_epochs_unchanged=true binding_isolation_observed=netd_crash_only socket_generation_fenced=true source_generation_fenced=true kernel_owned_readiness=true buffer_credit_retained_until_consume=true quiescent=true bounded=true single_cpu=true smoltcp=false virtio_net=false external_packets=false"
     );
+    RuntimeNetSliceReceipt {
+        scope: SCOPE,
+        closed_authority_epoch: AUTHORITY_EPOCH,
+        final_authority_epoch: AUTHORITY_EPOCH + 1,
+        terminalizations: 22,
+        publication_acks: 22,
+        quiescent: true,
+        source_sha256: EXPECTED_SOURCE_SHA256,
+        elf_sha256: EXPECTED_ELF_SHA256,
+    }
 }

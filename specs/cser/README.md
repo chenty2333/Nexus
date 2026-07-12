@@ -122,8 +122,25 @@ temporal branches and the script requires four reachability witnesses. This
 finite model does not prove arbitrary DAGs, runtime filesystem/network
 composition, parent-owned credit partitions, or asymptotic work
 proportionality. Its receipt remains frozen with `runtime_fs=false` and
-`runtime_net=false`; the separate runtime successors do not retroactively widen
-it, and a seven-domain Linux I/O composition successor is not implemented.
+`runtime_net=false`; neither the separate runtime successors nor the additive
+seven-domain successor below retroactively widen it.
+
+`LinuxIoCompositionCser.tla`, its safety/action configurations, and
+`LINUX_IO_COMPOSITION.md` add the bounded seven-domain Linux I/O composition
+successor. One root authority owns nine effects across Scheduler, Pager,
+Personality, Filesystem, VirtIo, Network, and Readiness. The model composes the
+filesystem and network publication boundaries, independently fenced bindings
+and resource generations, eight typed credit classes, root-ordered closure
+receipts, VirtIO reset/IOTLB tombstone recovery, and predicate-gated stale
+input audits. An explicit five-scenario state-space quotient preserves the
+named derive, mixed-I/O, new-domain crash, DMA-timeout, and reject evidence; it
+does not claim the abandoned all-feature Cartesian product. The reject-enabled
+safety graph has 3,723,455 generated / 1,225,367 distinct states at depth 55.
+The action graph has 3,656,517 generated / 1,207,917 distinct states at depth
+46 and checks two liveness formulas expanded into three TLC branches. The
+script additionally requires ten reachability witnesses. This remains bounded
+protocol evidence, not an arbitrary-graph, all-domain-crash, SMP, filesystem,
+network-stack, hardware, scale, or performance proof.
 
 The independent pinned OSTD/QEMU refinement now supplies a bounded
 implementation observation for the same one-key contract. Its `recover` path
@@ -143,8 +160,10 @@ semantics plus independent OSTD/QEMU receipts. They do not establish a registry
 shared with scheduler, pager, mediated I/O, filesystem, or network services;
 the later runtime-filesystem successor is separate from those frozen
 predecessors. The runtime-network successor likewise adds only separate bounded
-formal, safe-Rust, and OSTD/QEMU evidence; a seven-domain Linux I/O composition
-successor and full Stage 6 remain incomplete.
+formal, safe-Rust, and OSTD/QEMU evidence. The additive seven-domain formal
+successor now composes those Linux I/O branches without changing the frozen
+predecessor receipts; its corresponding safe-Rust/OSTD composition evidence
+and the other Stage 6 acceptance obligations remain separate facts.
 
 ## Linearization contract
 
@@ -249,10 +268,10 @@ the history needed by the invariants instead of an unbounded event log.
 ## Run the specifications
 
 The repository entry point uses the pinned Docker image, verifies that every
-checked-in PlusCal translation is current, runs all eleven checked-in TLC model
+checked-in PlusCal translation is current, runs all twelve checked-in TLC model
 families in order—baseline, pager, mediated I/O, Linux personality, private
 futex, two-key futex requeue, readiness, exec, runtime filesystem, runtime
-network, and five-domain composition—and
+network, five-domain composition, and seven-domain Linux I/O composition—and
 writes separate logs under `target/verification/`:
 
 ```sh
@@ -268,11 +287,11 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar ./specs/cser/check.sh
 
 These commands describe implementation steps inside the container; they do not
 define a second supported host toolchain. With no argument, `check.sh` checks
-all eleven families in the order above. Pass `Cser`, `PagerCser`, `IoCser`,
+all twelve families in the order above. Pass `Cser`, `PagerCser`, `IoCser`,
 `PersonalityCser`, `PersonalityFutexCser`,
 `PersonalityFutexRequeueCser`, `PersonalityReadinessCser`,
-`PersonalityExecCser`, `RuntimeFsCser`, `RuntimeNetCser`, or `CompositionCser`
-to run only one.
+`PersonalityExecCser`, `RuntimeFsCser`, `RuntimeNetCser`, `CompositionCser`, or
+`LinuxIoCompositionCser` to run only one.
 To modify an algorithm, edit only its PlusCal block and regenerate the
 translation before checking:
 
@@ -289,6 +308,7 @@ java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityExecCser
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 RuntimeFsCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 RuntimeNetCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 CompositionCser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 LinuxIoCompositionCser.tla
 ```
 
 The baseline `CserMC.cfg` instance uses three effect identifiers, two total
@@ -299,7 +319,8 @@ successor results are recorded separately in `PAGER.md`, `IO.md`,
 `PERSONALITY.md`, `PERSONALITY_FUTEX.md`,
 `PERSONALITY_FUTEX_REQUEUE.md`, `PERSONALITY_READINESS.md`,
 `PERSONALITY_EXEC.md`, `RUNTIME_FS.md`, and `RUNTIME_NET.md`, with the
-composition successor recorded separately in `COMPOSITION.md`:
+composition successors recorded separately in `COMPOSITION.md` and
+`LINUX_IO_COMPOSITION.md`:
 
 ```text
 11,122 states generated

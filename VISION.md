@@ -560,8 +560,30 @@ is consistency/prerequisite evidence rather than the same composed effect. The
 prototype is single-CPU and uses a fixed six-node/five-edge causal graph. It
 adds neither runtime filesystem nor runtime network; both later runtime
 successors are separate evidence and leave this predecessor frozen with
-`runtime_fs=false` and `runtime_net=false`. A seven-domain Linux I/O composition
-successor has not yet been implemented.
+`runtime_fs=false` and `runtime_net=false`.
+
+The additive `LinuxIoCompositionCser` successor closes the bounded composition
+gap without changing that evidence. It fixes one root, seven service domains,
+nine effects, nine causal edges, and eight credit classes across filesystem and
+network syscall branches. The safe-Rust model and OSTD companion preserve
+independent authority, per-domain binding, resource-generation, and closure
+revision envelopes; use an exact network commit receipt to authorize readiness;
+freeze the root cohort; close it child-first through target-domain indexes; and
+retain an honest VirtIO timeout/tombstone until retry invalidates the old
+receipt. The OSTD boot uses one fresh registry scope and fresh effects. Retained
+filesystem/network receipts prove only earlier same-boot completion, while the
+Stage 5B device run remains separate-boot component consistency. Thus the
+successor does not claim retained-effect identity, native registry
+multi-domain bindings, real DMA in the primary boot, same-boot Stage 5B, or
+identity-preserving device composition.
+
+The formal successor's five explicit scenario partitions complete a
+reject-enabled safety graph of 3,723,455 generated / 1,225,367 distinct states
+at depth 55 and an action graph of 3,656,517 / 1,207,917 states at depth 46.
+Two liveness formulas expand to three TLC branches, and ten independent
+reachability gates cover the named publication, crash, readiness, tombstone,
+closure, and stale-reject families. These are complete graphs for the bounded
+partition union, not for all feature combinations.
 
 ## Research gates
 
@@ -591,9 +613,8 @@ Work proceeds through evidence gates, not feature-count milestones.
    generation fencing, and conditional `Quiesced`. This admits the prototype to integrated
    validation; the hardware-general, IRQ, SMP, multi-client, domain-isolation,
    persistence, and real-deadline gaps remain open.
-5. **Linux pressure gate — Stage 6A, 6B.1, bounded Stage 6B.2, runtime
-   filesystem, and runtime network slices
-   Checked / Observed; Stage 6 still in progress:** Stage 6A establishes the
+5. **Linux pressure gate — bounded Stage 6 complete / Checked and Observed:**
+   Stage 6A establishes the
    narrow scheduler + file-backed pager + post-commit `linux-hello` recovery
    path. Stage 6B.1 freezes the one-key private-futex predecessor. Stage 6B.2
    adds the personality-local common registry and checked requeue/readiness/
@@ -610,8 +631,9 @@ Work proceeds through evidence gates, not feature-count milestones.
    compatibility. General ABI/VFS/TCP/external-packet/VirtIO-net/NIC/SMP
    behavior remains open. Linux remains an evaluation vehicle rather than the
    research identity.
-6. **System-wide composition gate — bounded prototype complete / Checked and
-   Observed:** `CompositionCser`, the safe-Rust/Loom successor, and the OSTD
+6. **System-wide composition gate — bounded predecessor and additive successor
+   complete / Checked and Observed:** `CompositionCser`, its safe-Rust/Loom
+   predecessor, and the OSTD
    composition receipt agree on one root gate across scheduler, pager,
    personality, readiness, and VirtIO domain adapters. The root receipt closes
    a fixed leaf-gated cohort with globally sequenced domain receipts and an
@@ -621,8 +643,10 @@ Work proceeds through evidence gates, not feature-count milestones.
    composition adapter. Unbounded graphs, SMP, production portals, same-boot
    filesystem/device identity, and a general mixed-workload fault matrix remain
    open. The filesystem and network successors do not rewrite this frozen
-   five-domain predecessor; the seven-domain Linux I/O composition successor
-   remains unimplemented, so Stage 6/composition is not declared complete.
+   five-domain predecessor. `LinuxIoCompositionCser`, 15 safe-Rust/property/
+   actual-model Loom gates, and the fresh-scope OSTD companion add the bounded
+   seven-domain graph and strict positive/negative oracle while preserving the
+   non-identity boundaries above.
 7. **Engineering consolidation gate — Stage 7A complete:** the primary OSTD
    implementation is promoted from an experiment to `kernel/nexus-ostd` with
    explicit CSER/domain/personality/probe ownership; the largest independent

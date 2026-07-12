@@ -26,8 +26,10 @@ separate system-composition checkpoint adds the bounded
 five-domain TLA+/Rust/Loom successor, one OSTD root-authority receipt, and a
 strict split-stream component-consistency check against the existing Stage 5B
 VirtIO/DMA receipt and QEMU device trace. That composition predecessor remains
-frozen with `runtime_fs=false` and `runtime_net=false`; a seven-domain Linux I/O
-composition successor is not implemented, so Stage 6 is not declared complete.
+frozen with `runtime_fs=false` and `runtime_net=false`. The additive seven-domain
+Linux I/O successor now supplies a separate formal/safe-Rust/OSTD evidence path
+with a fresh root cohort; it does not retrofit retained effects or Stage 5B
+identity into the predecessor.
 Stage 7A performs zero-semantic-change engineering consolidation: the primary
 OSTD workspace graduates to `kernel/nexus-ostd`, source ownership is physically
 partitioned, the largest independent-model/workflow modules are mechanically
@@ -482,8 +484,9 @@ unchanged retained OSTD/QEMU input Observed**:
 This is one bounded in-memory loopback, not smoltcp, real TCP breadth, external
 packets, VirtIO-net, a NIC, multi-client/backpressure behavior, or SMP. The
 historical five-domain composition receipt remains frozen with
-`runtime_fs=false` and `runtime_net=false`; the new seven-domain Linux I/O
-composition successor remains unimplemented.
+`runtime_fs=false` and `runtime_net=false`; the additive seven-domain Linux I/O
+successor consumes the already-revoked filesystem/network workload receipts as
+same-boot prerequisites only.
 
 ## System-wide CSER composition receipt
 
@@ -519,15 +522,52 @@ frozen predecessor does not add runtime filesystem/network, an unbounded causal 
 production capability transport, a parameterized system fault matrix, `k/N`
 curves, overhead evaluation, or a final originality judgment. The separate
 runtime-filesystem and runtime-network successors above do not widen its
-identities or graph; the seven-domain Linux I/O successor remains open.
+identities or graph.
+
+## Additive seven-domain Linux I/O composition receipt
+
+This successor is recorded separately from the frozen predecessor. It fixes
+seven domains, nine effects, nine causal edges, and eight credit classes beneath
+one root authority. The filesystem branch is `FsSyscall -> {PagerMap ->
+SchedulerAction, FsOp -> BlockReq}`; the network branch is `NetSyscall -> NetOp
+-> {ReadinessWait, BufferLease}`. Root authority, all seven domain bindings,
+address-space/inode/device/socket/source generations, and domain closure
+revisions remain independent envelopes.
+
+- the formal successor checks a five-partition bounded union: safety completes
+  at 3,723,455 generated / 1,225,367 distinct states and depth 55; action
+  checking completes at 3,656,517 / 1,207,917 states and depth 46 with two
+  liveness formulas expanded into three branches; ten reachability gates cover
+  the named mixed-I/O, crash, readiness, tombstone, closure, and stale-reject
+  families;
+- the safe-Rust model contributes nine deterministic sequences, two bounded
+  properties, and four actual-model Loom checks. Its clone/validate/swap gate
+  makes rejection failure-atomic, its network-plus-buffer commit is atomic, and
+  readiness requires the exact network commit receipt;
+- the OSTD companion creates root scope 120 at authority epoch 401, registers
+  nine fresh effects in one real `EffectRegistry`, uses the real readiness core
+  plus bounded inode and loopback/buffer adapters, and closes the target-domain
+  indexes child-first;
+- seven accepted `Closed` domain receipts plus one invalidated VirtIO
+  `TimedOut` receipt produce eight globally sequenced acceptances. Retry advances
+  the bounded device envelope, preserves the DMA credit until terminalization,
+  and permits final zero-live/zero-pending closure with all nine credit units
+  free;
+- the strict oracle binds exact receipt fields and rejects trace/artifact
+  mutations. It also binds the retained filesystem/network receipts as prior
+  same-boot completion and Stage 5B as separate-boot component consistency.
+
+This is not retained-workload effect identity, registry-native multi-domain
+binding, real DMA in the primary boot, identity-preserving Stage 5B composition,
+TCP/VirtIO-net breadth, an unbounded graph, or SMP evidence.
 
 ## Current research assets
 
 | Path | Status | Disposition |
 | --- | --- | --- |
-| `specs/cser/` | **KEEP** | Normative baseline, domain refinements, and five-domain composition TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice without rewriting earlier evidence baselines. |
+| `specs/cser/` | **KEEP** | Normative baseline, domain refinements, the frozen five-domain composition, and additive seven-domain Linux I/O TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice without rewriting earlier evidence baselines. |
 | `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, domain successors, and system-composition semantics plus differential/concurrency oracles. |
-| `kernel/nexus-ostd/` | **KEEP** | Maintained formal OSTD prototype for the CSER registry/composition mechanism, scheduler/pager/readiness domains, bounded personality pressure paths, and the five-domain root receipt. It remains an isolated cargo-osdk workspace so the reference model does not absorb implementation transitions. |
+| `kernel/nexus-ostd/` | **KEEP** | Maintained formal OSTD prototype for the CSER registry/composition mechanism, scheduler/pager/readiness domains, bounded personality pressure paths, the frozen five-domain receipt, and the additive seven-domain root receipt. It remains an isolated cargo-osdk workspace so the reference model does not absorb implementation transitions. |
 | `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for mediated readonly VirtIO, fail-closed reset/IOTLB tombstones, and three-owner queued IOTLB closure. Preserve both the Stage 5A no-device boundary and Stage 5B real-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
 | `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello`, adapted Round 4 futex, adapted Round 5 epoll, dynamic PIE, unchanged runtime filesystem, and unchanged runtime network have bounded observed receipts. Exact retained sources are provenance rather than automatic conformance oracles, so visible temporary adaptations correct obsolete futex and regular-file epoll expectations. These inputs do not define Nexus's research identity. |
