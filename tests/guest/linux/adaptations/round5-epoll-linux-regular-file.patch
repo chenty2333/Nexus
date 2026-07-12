@@ -1,0 +1,22 @@
+--- a/round5_epoll_smoke.S
++++ b/round5_epoll_smoke.S
+@@ -215,8 +215,9 @@
+     lea 16(%rsp), %r10
+     mov $233, %eax
+     syscall
+-    test %rax, %rax
+-    js fail_32
++    cmpq $-1, %rax
++    jne fail_32
++    jmp regular_file_epoll_rejected
+ 
+     mov %r12d, %edi
+     lea 32(%rsp), %rsi
+@@ -232,6 +233,7 @@
+     cmpq $0x44, 36(%rsp)
+     jne fail_35
+ 
++regular_file_epoll_rejected:
+     mov $1, %edi
+     lea success_message(%rip), %rsi
+     mov $success_message_len, %edx

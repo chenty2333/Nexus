@@ -51,6 +51,36 @@ the explicit exclusion of requeue, multiple waiters/keys, SMP, and concrete
 implementation details from the formal model. Together with the pure Rust
 successor, these artifacts complete the Stage 6B.1 semantics checkpoint.
 
+`PersonalityFutexRequeueCser.tla`, its safety/action configurations, and
+`PERSONALITY_FUTEX_REQUEUE.md` are the bounded Stage 6B.2 two-key successor.
+They separate immutable origin-key identity from mutable current queue
+membership and check an atomic wake/move partition, Linux's total affected
+count, current-binding queue-head fencing, typed-credit preservation, both
+revoke orders, and target-key wake after migration. The full safety graph has
+4,786,581 generated / 1,927,174 distinct states at depth 27; the action graph
+has 247,047 generated / 140,473 distinct states at depth 23, with four
+temporal branches and six reachability witnesses. It remains a bounded private
+futex protocol, not a general or SMP Linux futex implementation.
+
+`PersonalityReadinessCser.tla`, its two configurations, and
+`PERSONALITY_READINESS.md` fix the reusable readiness/positive-timeout
+protocol below epoll-like ABIs. They check atomic sample-and-arm,
+LT/ET/ONESHOT discipline, one immutable ready/timeout publication, a unique
+ready/timeout/revoke winner, source-generation fencing, exact crash recovery,
+and typed-credit closure. The complete safety graph has 83,586 generated /
+50,544 distinct states at depth 20; the action graph has 55,569 generated /
+34,428 distinct states at depth 19, with three temporal branches and eight
+reachability witnesses.
+
+`PersonalityExecCser.tla`, its two configurations, and
+`PERSONALITY_EXEC.md` fix failure-atomic executable-image replacement. Staged
+segments and frozen TLS/stack layout remain invisible until one `ExecCommit`
+publishes the complete image. Pre-commit revocation preserves the old image;
+post-commit revocation drains without rollback. The complete safety graph has
+361 generated / 253 distinct states at depth 15; the action graph has 182
+generated / 137 distinct states at depth 14, with three temporal branches and
+six reachability witnesses.
+
 The independent pinned OSTD/QEMU refinement now supplies a bounded
 implementation observation for the same one-key contract. Its `recover` path
 observes mismatch-without-registration, atomic compare/enqueue, a real
@@ -62,8 +92,12 @@ kernel abort terminalizations, and full wait/wake/timer-credit return without
 fabricating a Linux timeout. This records Stage 6B.1 as **semantics complete and
 bounded OSTD/QEMU slice complete / Observed**. It does not run the retained full
 Round 4 program, add requeue/clone/mmap/thread-exit, prove lost-wakeup or SMP
-ordering, or establish a unified syscall/futex registry. The futex core workload
-and Stage 6 therefore remain incomplete; Stage 6B.2 is still pending.
+ordering, or establish a common registry. Those statements remain the exact
+boundary of the frozen predecessor. The separate Stage 6B.2 successors add a
+personality-local common registry, bounded two-key requeue, readiness, and exec
+semantics plus independent OSTD/QEMU receipts. They do not establish a registry
+shared with scheduler, pager, mediated I/O, filesystem, or network services;
+runtime filesystem/network and full Stage 6 therefore remain incomplete.
 
 ## Linearization contract
 
@@ -168,9 +202,10 @@ the history needed by the invariants instead of an unbounded event log.
 ## Run the specifications
 
 The repository entry point uses the pinned Docker image, verifies that every
-checked-in PlusCal translation is current, runs all five committed TLC model
-families in order—baseline, pager, mediated I/O, Linux personality, and the
-private-futex successor—and writes separate logs under `target/verification/`:
+checked-in PlusCal translation is current, runs all eight checked-in TLC model
+families in order—baseline, pager, mediated I/O, Linux personality, private
+futex, two-key futex requeue, readiness, and exec—and writes separate logs
+under `target/verification/`:
 
 ```sh
 ./x spec
@@ -185,9 +220,10 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar ./specs/cser/check.sh
 
 These commands describe implementation steps inside the container; they do not
 define a second supported host toolchain. With no argument, `check.sh` checks
-the baseline, pager, mediated-I/O, Linux-personality, and private-futex
-successor models in that order. Pass `Cser`, `PagerCser`, `IoCser`,
-`PersonalityCser`, or `PersonalityFutexCser` to run only one.
+all eight families in the order above. Pass `Cser`, `PagerCser`, `IoCser`,
+`PersonalityCser`, `PersonalityFutexCser`,
+`PersonalityFutexRequeueCser`, `PersonalityReadinessCser`, or
+`PersonalityExecCser` to run only one.
 To modify an algorithm, edit only its PlusCal block and regenerate the
 translation before checking:
 
@@ -198,6 +234,9 @@ java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 1000 PagerCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 IoCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 1000 PersonalityCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityFutexCser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityFutexRequeueCser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityReadinessCser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityExecCser.tla
 ```
 
 The baseline `CserMC.cfg` instance uses three effect identifiers, two total
@@ -205,7 +244,9 @@ credits, and at most two crash generations. The extra identifier exercises a
 failed registration opportunity while all credits are held or spent. With
 `tla2tools.jar` 1.8.0 it completes the full state graph with no error; the
 successor results are recorded separately in `PAGER.md`, `IO.md`,
-`PERSONALITY.md`, and `PERSONALITY_FUTEX.md`:
+`PERSONALITY.md`, `PERSONALITY_FUTEX.md`,
+`PERSONALITY_FUTEX_REQUEUE.md`, `PERSONALITY_READINESS.md`, and
+`PERSONALITY_EXEC.md`:
 
 ```text
 11,122 states generated

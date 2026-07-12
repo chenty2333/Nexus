@@ -13,10 +13,13 @@ VirtIO, reset/tombstone recovery, and three-owner IOTLB closure. Stage 6A adds
 the bounded personality spec/oracle, one static `linux-hello` execution, and two
 same-implementation companion personality-closure scopes. Stage 6B.1 now adds
 a checked private-futex TLA+ successor, pure Rust oracle, and bounded OSTD/QEMU
-wait/wake recovery slice. Its semantics and micro-slice are **Observed**; the
-retained futex core workload and Stage 6 are not complete. The pager, device,
-and Linux results are not a production pager, I/O subsystem, futex registry, or
-Linux personality. The foundation decision is **OSTD-first**, not
+wait/wake recovery slice. Stage 6B.2 adds the personality-local common effect
+registry, two-key requeue, readiness, and failure-atomic exec successors plus
+pinned QEMU receipts for adapted Round 4 futex, adapted Round 5 epoll, and
+retained dynamic PIE. Four of six bounded Linux core inputs are now Observed;
+runtime filesystem, runtime network, and Stage 6 as a whole remain incomplete.
+The pager, device, and Linux results are not a production pager, I/O subsystem,
+futex registry, or Linux personality. The foundation decision is **OSTD-first**, not
 irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an
 upstream API or a small audited adapter/patch without violating single-owner
 hardware control, Nexus must re-evaluate the foundation explicitly. That
@@ -89,7 +92,7 @@ The following extractions are already present in the new tree:
 | six selected old vertical-slice observations | `specs/oracles/legacy-slices.toml` | schema v1 parses; no legacy build command is retained |
 | 34 Linux C/assembly guest inputs | `tests/guest/linux/sources/` | every copy matches both its legacy source and the SHA-256 in `SOURCES.toml` |
 | 28 old Linux compatibility scenarios plus one superseded guest input | `tests/guest/linux/COMPATIBILITY.toml` | all source IDs resolve and all 34 copied inputs are referenced; only six `core` workloads are Stage 6 commitments, with the remainder marked `stretch` or `archive-input` |
-| first static Linux pressure input | retained `linux-hello/hello.S` -> isolated OSTD guest artifact | Docker builds the unchanged source as a static x86-64 `ET_EXEC`; source and generated ELF SHA-256 values are gated, while the other five core workloads remain unexecuted |
+| bounded Linux pressure inputs | four retained core inputs -> isolated OSTD guest artifacts | Docker builds unchanged `linux-hello`, temporarily adapted Round 4 and Round 5 inputs, and the retained dynamic PIE set; source/patch/adapted/artifact gates and strict QEMU oracles leave only runtime filesystem and runtime network unexecuted |
 
 These receipts do not authorize deletion by themselves; the build, CI, and
 neutral-runner gates above must pass in the same cleanup checkpoint.
@@ -247,6 +250,9 @@ registry. The v1 delayed reply uses a bounded kernel queue, code-pager stale
 cases remain predicate probes, and there is no personality timeout/tombstone,
 dynamic loader, threads/futex, fd/epoll, filesystem/network, SMP or production
 capability implementation. The other five core Linux workloads remain pending.
+That sentence records the Stage 6A checkpoint: the Stage 6B.2 receipt below
+subsequently closes the bounded futex, epoll, and dynamic PIE inputs, leaving
+runtime filesystem and runtime network pending.
 
 ## Stage 6B.1 private-futex receipt
 
@@ -284,23 +290,74 @@ OSTD/QEMU slice complete / Observed**:
   closure-to-PASS interval, and forbids duplicate publication, expire resume,
   timeout fabrication, and panic.
 
-Stage 6B.2 must add two-key `FUTEX_REQUEUE_PRIVATE`, multiple waiters,
-clone/mmap/thread exit, and the explicitly adapted full round4 input. Stage
-6B.1 remains bounded to one private key, one waiter, one waker, `max_wake = 1`,
-and one CPU; it has no Linux timeout, lost-wakeup/SMP proof, or unified
-syscall/futex registry. Passing it does not complete the futex core workload or
-Stage 6.
+Stage 6B.1 remains bounded to one private key, one waiter, one waker,
+`max_wake = 1`, and one CPU; it has no Linux timeout, lost-wakeup/SMP proof, or
+unified syscall/futex registry. The separate Stage 6B.2 successor and retained
+workload receipt below close the bounded futex core gate without widening this
+predecessor model.
+
+## Stage 6B.2 personality-local core receipts
+
+This checkpoint is recorded as **bounded successor semantics Checked / OSTD
+QEMU slices Observed**:
+
+- the two-key requeue TLA+ successor completes a 4,786,581-generated /
+  1,927,174-distinct safety graph at depth 27 and a 247,047 / 140,473 action
+  graph at depth 23, with four temporal branches and six witnesses. The
+  readiness graphs are 83,586 / 50,544 at depth 20 and 55,569 / 34,428 at depth
+  19, with three temporal branches and eight witnesses. The exec graphs are
+  361 / 253 at depth 15 and 182 / 137 at depth 14, with three temporal branches
+  and six witnesses;
+- the common safe-Rust personality registry owns authority/binding fencing,
+  immutable descriptors, opaque handles, typed credits, blocked-task and
+  scope/task/resource indexes, atomic batch commit/resource movement,
+  publication acknowledgement, exact snapshot/rebind/adopt, and scope-local
+  closure. Futex requeue, readiness, and exec remain domain refinements over
+  that lifecycle rather than separate authority registries;
+- the two-key futex successor preserves immutable origin and mutable current
+  resource identity, atomically freezes disjoint wake/move sets, returns
+  Linux's affected count, and forbids a fresh binding from skipping an
+  unadopted old queue head. Its pure-Rust gate contributes eight deterministic
+  tests and two proptests; the common registry contributes eleven plus one;
+- the readiness successor covers generational sources/subscriptions, atomic
+  sample-and-arm, LT/ET/ONESHOT, immutable delivery, a positive timer, and a
+  single ready/timeout/revoke winner. The exec successor keeps staging private,
+  requires explicit adoption after a pre-commit crash, and publishes a whole
+  image atomically. Readiness contributes six deterministic tests and one
+  proptest; exec contributes six deterministic tests and one proptest;
+- the adapted Round 4 artifact fixes source, patch, adapted-source, and ELF
+  digests; a host Linux oracle requires exact stdout. Pinned QEMU observes
+  eight-page mmap, three clone tasks, four waits, FIFO two-key requeue with
+  `woken=1`, `moved=1`, `affected=2`, three explicit recovery adoptions,
+  failure-atomic old-binding rejection, one frozen receipt publication, both
+  closure orderings, and empty final indexes/credits;
+- the adapted Round 5 artifact changes only the obsolete regular-file epoll
+  expectation. Pinned QEMU executes 23 syscalls covering pipe ET, pipe
+  ONESHOT, socketpair LT, timeout-zero empties, and regular-file `EPERM`. A
+  readiness companion separately adopts six effects across crash/rebind and
+  observes ready/timeout/revoke winners plus quiescent closure;
+- the dynamic slice performs real launcher `execve`, stages an ET_DYN main and
+  ET_DYN interpreter with eight total `PT_LOAD` mappings, TLS/TCB and initial
+  stack, then crashes before commit. Fresh v2 explicitly adopts eleven effects
+  before one `ExecCommit` and lock-external `VmSpace` publication. Exact auxv,
+  interpreter/main TLS, FS-base load/save, stdout, write/exit publication, and
+  12/12 credit return are observed.
+
+These are personality-local, single-CPU bounded receipts. They do not provide
+general futex/epoll/dynamic-linker ABI, lost-wakeup or SMP evidence, runtime
+filesystem/network, a scheduler/pager/personality/I/O registry, integrated
+fault-matrix evaluation, `k/N` curves, or a final originality judgment.
 
 ## Current research assets
 
 | Path | Status | Disposition |
 | --- | --- | --- |
-| `specs/cser/` | **KEEP** | Normative baseline, pager, mediated-I/O, bounded personality, and successor futex TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice without rewriting earlier evidence baselines. |
-| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, pager, mediated-I/O, bounded personality, and successor futex reference semantics and differential oracles. |
-| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, the bounded pager recover/timeout slice, the IOMMU fail-closed result, the first static `linux-hello` pressure slice, and the Stage 6B.1 private-futex recover/expire micro-slice. It may later be superseded by a broader prototype, but must remain runnable until then. |
+| `specs/cser/` | **KEEP** | Normative baseline, pager, mediated-I/O, bounded personality, private-futex, two-key requeue, readiness, and exec TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice without rewriting earlier evidence baselines. |
+| `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, pager, mediated-I/O, bounded personality, and personality-local registry/futex/requeue/readiness/exec successor semantics and differential oracles. |
+| `experiments/ostd-cser-spike/` | **KEEP** | Reproducible evidence for OSTD API fit, scheduler fallback, bounded pager recovery, fail-closed IOMMU, Stage 6A/6B.1, and the Stage 6B.2 Round 4 futex, readiness/Round 5 epoll, and dynamic PIE receipts. It may later be superseded by a broader prototype, but must remain runnable until then. |
 | `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for mediated readonly VirtIO, fail-closed reset/IOTLB tombstones, and three-owner queued IOTLB closure. Preserve both the Stage 5A no-device boundary and Stage 5B real-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
-| `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello` is the observed Stage 6A input; the other five core workloads remain pending. Exact retained sources are provenance rather than automatic conformance oracles: the round4 futex source is explicitly adaptation-required because it asserts a legacy requeue return convention. These inputs do not define Nexus's research identity. |
+| `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello`, adapted Round 4 futex, adapted Round 5 epoll, and dynamic PIE have bounded observed receipts; runtime filesystem and network remain pending. Exact retained sources are provenance rather than automatic conformance oracles, so visible temporary adaptations correct obsolete futex and regular-file epoll expectations. These inputs do not define Nexus's research identity. |
 | `VISION.md` | **KEEP** | Research question, exclusions, candidate contribution, and evidence threshold. |
 | `ARCHITECTURE.md` | **KEEP** | OSTD boundary, minimal kernel mechanisms, user-service boundary, and failure semantics. |
 | `REWORK.md` | **KEEP** | This migration/deletion ledger. Update it when a row changes state. |

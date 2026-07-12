@@ -86,13 +86,14 @@ success_markers = ["round4 futex ok"]
 cser_effects = ["scheduler.proposal", "wait.registration", "timer.deadline", "service.syscall-continuation"]
 injection_profile = [
   "crash scheduler policy while futex waiter and waker tasks are runnable and require kernel fallback",
-  "crash Linux personality after futex wait registration and before wake delivery",
-  "race futex wake, a CSER watchdog deadline, and scope cancellation; the retained guest passes no Linux futex timeout",
-  "replay an old-binding wake or wait reply after rebind",
+  "crash Linux personality after the two-key requeue commits but before its frozen receipt is published",
+  "recover the exact three-effect cohort through snapshot, ready, rebind, and explicit adoption",
+  "replay the old-binding requeue handle after rebind and require a failure-atomic rejection",
+  "exercise both commit-before-close and close-before-commit companions; the retained guest passes no Linux futex timeout",
 ]
 expected_properties = ["PostRevokeCommitExclusion", "QuiescentClosure", "SingleTerminalization", "CrashRebindFencing", "FallbackProgress", "BudgetConservation"]
 adaptation_required = ["The exact retained source expects FUTEX_REQUEUE_PRIVATE to return only the number of woken waiters. Linux futex_requeue counts both woken and requeued waiters, so the unmodified source loops after the first two-waiter requeue. Stage 6B must use an explicit reproducible adaptation or a new Nexus-owned conformance source; the personality must not emulate the legacy return value."]
-notes = "Stage 6B.1 semantics and its bounded one-key, one-waiter/one-waker, one-CPU OSTD/QEMU recovery micro-slice are complete/Observed. This is not execution of the retained Round 4 input: there is no requeue, clone/mmap/thread-exit, Linux timeout, lost-wakeup/SMP proof, or unified syscall/futex registry. Stage 6B.2 remains pending, and the core workload is not complete until the adapted full program runs with Linux-compatible requeue results."
+notes = "Stage 6B.2 executes the explicitly adapted retained Round 4 program in the pinned one-CPU OSTD/QEMU personality: mmap creates eight pages, three clone tasks share one VmSpace, waits are FIFO, FUTEX_REQUEUE_PRIVATE atomically wakes one and moves one, and the frozen Linux affected count is two. A real personality crash advances the binding epoch; the replacement explicitly adopts the committed controller and both remaining waits, old-binding work is rejected without mutation, and commit-before-close / close-before-commit companions reach quiescence through the common personality-local registry. This completes the bounded futex core workload, not general futex support: Linux timeout, signals, shared/PI/robust futexes, unmap invalidation, lost-wakeup/SMP proof, and the cross-service registry remain pending."
 
 [[workload]]
 id = "linux-round4-signal-smoke"
@@ -116,7 +117,7 @@ tier = "core"
 class = "static-smoke"
 source_ids = ["linux-round5-epoll-smoke"]
 legacy_scenarios = ["specs/conformance/scenarios/starnix_round5_epoll_bootstrap.toml"]
-required_behaviors = ["epoll_create1", "epoll_ctl", "epoll_wait", "level-triggered", "edge-triggered", "oneshot", "pipe/socketpair/file readiness"]
+required_behaviors = ["epoll_create1", "epoll_ctl", "epoll_wait", "level-triggered", "edge-triggered", "oneshot", "pipe/socketpair readiness", "regular-file EPERM rejection"]
 success_markers = ["round5 epoll ok"]
 cser_effects = ["wait.registration", "timer.deadline", "ipc.operation", "service.syscall-continuation"]
 injection_profile = [
@@ -124,7 +125,9 @@ injection_profile = [
   "race source wake with revoke cancellation and timeout",
   "replay queued readiness from an old binding after rebind",
 ]
-expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "BudgetConservation"]
+expected_properties = ["PostRevokeCommitExclusion", "QuiescentClosure", "SingleTerminalization", "CrashRebindFencing", "BudgetConservation"]
+adaptation_required = ["The exact retained source expects epoll_ctl(EPOLL_CTL_ADD) to accept a regular file and report EPOLLIN. Linux rejects regular-file epoll targets with EPERM. Stage 6 must apply the visible temporary-build adaptation, retain pipe/socketpair coverage, and test immediately-ready generic sources in a separate Nexus-owned readiness companion rather than emulate the legacy result."]
+notes = "Stage 6B.2 executes the adapted retained workload in pinned one-CPU QEMU: pipe edge-triggered and one-shot delivery, socketpair level-triggered delivery, timeout-zero empty results, and regular-file EPERM all match the strict receipt oracle. A separate readiness lifecycle companion covers atomic sample+arm, generational source/set/subscription fencing, snapshot and post-Ready invalidation by source/queue changes, rejection of an unadopted old-binding subscription, crash/rebind plus six explicit adoptions, ready/timeout/revoke winner races, immutable delivery, one-shot publication, and final credit/index closure through the common personality-local registry. This is a bounded readiness core, not full epoll/fd semantics, asynchronous SMP proof, runtime filesystem, or runtime network readiness."
 
 [[workload]]
 id = "linux-round6-eventfd-smoke"
@@ -333,14 +336,15 @@ source_ids = ["linux-dynamic-pie-smoke", "linux-dynamic-pie-main", "linux-dynami
 legacy_scenarios = ["specs/conformance/scenarios/starnix_dynamic_pie_bootstrap.toml"]
 required_behaviors = ["ET_DYN main image", "PIE load bias", "PT_INTERP", "TLS and auxv through the runtime interpreter"]
 success_markers = ["dynamic pie ok"]
-cser_effects = ["pager.fault-continuation", "service.syscall-continuation", "budget.credit"]
+cser_effects = ["exec.transaction", "exec.mapping", "service.syscall-continuation", "budget.credit"]
 injection_profile = [
-  "crash pager while preparing PT_LOAD mappings before publication",
-  "crash pager after one segment commits but before the fault/exec continuation is acknowledged",
-  "crash Linux personality during PT_INTERP handoff and require explicit adoption or abort",
-  "replay an old-binding loader or fault reply after rebind",
+  "crash Linux personality v1 after all eleven staging effects are prepared but before ExecCommit",
+  "after snapshot, ready, and rebind, require eleven explicit adoptions before image commit",
+  "replay an old-binding handle both before and after commit and require an unchanged full registry/image projection",
+  "publish the new VmSpace only after one atomic ExecCommit, then acknowledge transaction, write, and exit publications",
 ]
-expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "BudgetConservation"]
+expected_properties = ["PostRevokeCommitExclusion", "QuiescentClosure", "SingleTerminalization", "CrashRebindFencing", "BudgetConservation"]
+notes = "Stage 6B.2 runs one fixed ET_EXEC launcher that performs execve into an ET_DYN main plus ET_DYN interpreter. Eight PT_LOAD effects, one TLS/TCB effect, one stack effect, and the exec controller survive a pre-commit personality crash, then require snapshot/ready/rebind and eleven explicit adoptions before one atomic ExecCommit publishes a fresh VmSpace. The guest observes richer auxv, interpreter and main TLS, explicit FS-base load/save, exact stdout, and one exit; stale calls are failure-atomic and all twelve credits return. This completes the bounded dynamic PIE core workload only for one CPU and one TLS-bearing task; general relocations, shared libraries, libc/ld.so, multi-task TLS lifecycle, filesystem-backed loading, and SMP remain pending."
 
 [[workload]]
 id = "linux-glibc-hello"

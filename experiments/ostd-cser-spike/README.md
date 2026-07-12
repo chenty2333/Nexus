@@ -1,13 +1,12 @@
 # OSTD/OSDK 0.18 CSER spike
 
-This experiment answers four narrow architecture questions without modifying
-OSTD 0.18: can Nexus place a CSER-aware scheduler at OSTD's public scheduling
-boundary; can a kernel-owned fault continuation survive a user-space pager
-crash and be explicitly adopted by a fresh pager; and can one real static Linux
-guest exercise those mechanisms through a restartable syscall-personality
-probe; and can a bounded private-futex wait/wake scope survive personality
-crash, rebind, revocation, and watchdog expiry? It is deliberately outside the
-legacy Nexus workspace.
+This experiment answers a bounded sequence of architecture questions without
+modifying OSTD 0.18: scheduler fallback; one-shot pager crash/rebind; a static
+Linux syscall-personality path; private-futex recovery; and, in Stage 6B.2, a
+personality-local common effect registry refined by two-key futex requeue,
+generational readiness/epoll, and failure-atomic dynamic-PIE exec. It is
+deliberately outside the deleted legacy Nexus workspace. The common registry
+does not yet include scheduler, pager, or mediated VirtIO effects.
 
 ## Pinned environment
 
@@ -39,11 +38,13 @@ Build and run the complete probe:
 
 The narrower commands are `./x check`, `./x build`, `./x run`, and
 `./x iommu-probe`. The serial transcript is written to
-`artifacts/serial.log`; `scripts/assert-serial.sh` verifies the full scheduler,
-pager, Linux-personality, private-futex, and fail-closed IOMMU receipt, including
-ordering, exact counts, fallback first-pick identity/ordinal, semantic
-before/after projections, and forbidden branches. Raw scheduler ticks are
-diagnostic, not an acceptance bound.
+`artifacts/serial.log`; `scripts/assert-serial.sh` verifies the scheduler,
+pager, Stage 6A personality, both futex slices, readiness lifecycle, adapted
+Round 5 epoll, and fail-closed IOMMU receipts. It invokes strict Round 4 and
+epoll parsers plus negative trace mutations. `assert-linux-dynamic.awk`
+independently fixes the dynamic exec/adoption trace and rejects a duplicate
+PASS, a fabricated second ExecCommit, or Snapshot/Ready reordering. Raw
+scheduler ticks are diagnostic, not an acceptance bound.
 
 ### Reproducible OSDK runner graph
 
@@ -82,6 +83,21 @@ the retained source SHA-256
 `50690500a3cfac0f412da66d3d5d7f32b9b4da2a96a38d6d21c3ef12ea141490`,
 and the container-built artifact SHA-256
 `1dae72e6d4a5c9144e94580a8e2a8280cb36f725d66046baed77562051b2f1a4`.
+
+The same build boundary fixes the Stage 6B.2 artifacts:
+
+- adapted Round 4 futex ELF
+  `c31cfc57e562e5be0e9558e5017a579b4353a016898113b07cbb467d31a2b7ca`;
+- adapted Round 5 epoll ELF
+  `1ff6f21480064d8ec84a8e58bef60c54733707fd13b1b2e46ab856daad8fc3f7`;
+- retained dynamic launcher/main/interpreter sources, whose ELF layout,
+  `PT_INTERP`, `PT_TLS`, load counts, W^X, and deterministic build products are
+  checked by `assert-dynamic-pie-artifacts.sh`.
+
+Round 4 and Round 5 patches apply only to temporary copies and have their
+source, patch, and adapted-source SHA-256 values checked before compilation.
+`check-fsbase-api.sh` also fixes the public OSTD `FsBase::load/save` API used by
+the bounded dynamic path.
 
 ## What is exercised
 
@@ -163,10 +179,11 @@ recovery, swap/file-backed paging, and production multi-effect or cross-service
 revocation remain outside this slice.
 
 `./x` assembles the base scheduler probe, pager client/v1/v2, Linux scheduler
-policy, and Linux code-pager v1/v2 programs under `guest/`. It also builds the
-independent freestanding Rust linuxd v1/v2 workspace, extracts each `.text`
-payload, and builds the retained `linux-hello` source as a static ELF before
-invoking OSDK. This intentionally avoids a kernel Cargo build script:
+policy, Linux code-pager v1/v2, private-futex, Round 4, and dynamic-personality
+programs under `guest/`. It also builds the independent freestanding Rust
+linuxd v1/v2 workspace, extracts each `.text` payload, builds the retained
+`linux-hello`, adapted Round 4, adapted Round 5, and retained dynamic PIE ELF
+set before invoking OSDK. This intentionally avoids a kernel Cargo build script:
 cargo-osdk 0.18 recognizes a kernel only when its package has exactly one Cargo
 target, so adding `build.rs` makes kernel discovery fail.
 
@@ -271,13 +288,94 @@ waiter/waker completion order only between quiescent closure and scenario
 PASS. This records Stage 6B.1 as **semantics complete and bounded OSTD/QEMU
 slice complete / Observed**.
 
-This is not a general futex implementation or execution of the retained Round
-4 workload. It is bounded to one private key, one waiter, one waker,
+This predecessor is not a general futex implementation or execution of the
+retained Round 4 workload. It is bounded to one private key, one waiter, one waker,
 `max_wake = 1`, a null Linux timeout, and one CPU. It has no two-key requeue,
 clone/mmap/thread-exit plumbing, lost-wakeup/SMP proof, or unified
-syscall/futex registry. Those remain Stage 6B.2 work, together with the
-explicitly adapted full Round 4 input; the futex core workload and Stage 6 are
-not complete.
+syscall/futex registry. Stage 6B.2 supplies a separate successor and retained
+workload receipt below; it does not retroactively widen the 6B.1 model.
+
+### Stage 6B.2 common personality registry and futex core
+
+The common registry owns immutable six-argument syscall descriptors, opaque
+portal handles, authority and binding gates, typed renewable credits,
+scope/task/resource reverse indexes, failure-atomic batch commit and resource
+move, publication acknowledgement, restart snapshots, explicit adoption, and
+scope-local revoke closure. Futex policy retains its FIFO queues and private
+two-key identity, but A-to-B migration updates both the typed futex index and
+generic current-resource membership under one runtime lock. This is shared
+inside the Linux personality successor only. A committed pre-crash receipt may
+also be completed by the kernel without a replacement: terminalization removes
+it from the remaining recovery cohort, invalidates a previously issued Ready
+proof, and retains its credit until the one publication acknowledgement.
+
+The exact adapted Round 4 ELF runs with eight anonymous pages and three clone
+tasks sharing one `VmSpace`. Four waits enqueue FIFO; one
+`FUTEX_REQUEUE_PRIVATE` freezes `woken=1`, `moved=1`, and Linux affected count
+`2`. Personality v1 then crashes with that receipt committed. Snapshot/ready/
+rebind and three explicit adoptions recover the committed controller, the
+moved waiter, and the remaining waiter without changing the receipt or queue
+history. A replay from the old binding is rejected without changing the full
+projection; kernel publication consumes the frozen receipt once, the target
+wake reaches the migrated waiter, and exact stdout is `round4 futex ok\n`.
+Commit-before-close and close-before-commit companions respectively drain two
+and abort one, or abort all three without a partial resource move. The strict
+oracle also rejects duplicate terminal evidence, a false affected count, and a
+stale-call mutation claim. Final queues, effects, tasks, publications, and
+credits are empty/free.
+
+This bounded receipt is one CPU with fixed scheduling. It does not implement
+Linux futex timeouts, signals, shared/PI/robust futexes, unmap invalidation,
+bucket-lock SMP ordering, or a lost-wakeup proof.
+
+### Stage 6B.2 readiness and adapted Round 5 epoll
+
+The kernel-owned readiness core gives sources, sets, and subscriptions
+generational identity; samples and arms atomically; records source masks and
+sequences; and freezes immutable LT, ET, or ONESHOT delivery receipts. `MOD`
+advances subscription generation, and stale source/service/subscription calls
+cannot mutate state. The lifecycle companion recovers six effects through
+snapshot/rebind/explicit adoption, publishes one pre-crash frozen delivery
+once, and exercises ready-versus-timeout, timeout-versus-ready, and
+revoke-versus-ready winners. It also proves that source/queue mutation
+invalidates both a captured snapshot and an already issued Ready proof, and
+that the new binding cannot select a queued old-binding subscription before
+explicit adoption. A positive timeout registers its wait and timer in one
+batch. Three publication acknowledgements precede final empty indexes and
+returned credits.
+
+The adapted retained Round 5 ELF executes 23 syscalls. Its exact trace covers
+pipe ET, pipe ONESHOT, socketpair LT, timeout-zero empty results, and Linux's
+regular-file `epoll_ctl(ADD) -> EPERM`; it prints exactly `round5 epoll ok\n`.
+The adaptation changes only the obsolete regular-file expectation. Opening the
+fixed `/bin/linux-hello` artifact does not constitute a runtime-filesystem
+implementation. The result is not general fd/epoll, asynchronous interrupt,
+SMP, filesystem, or network readiness.
+
+### Stage 6B.2 failure-atomic dynamic PIE exec
+
+A fixed ET_EXEC launcher really traps `execve`, after which the bounded loader
+validates and stages an ET_DYN main plus ET_DYN interpreter at deterministic
+biases. Each image contributes four W^X `PT_LOAD` mappings; the transaction
+also stages variant-II TLS/TCB and a Linux initial stack with richer auxv.
+Before commit, personality v1 takes a real fault. Fresh v2 must complete
+snapshot/ready/rebind and explicitly adopt the exec transaction, eight load
+mappings, TLS, and stack—eleven effects—before one atomic `ExecCommit`.
+Only then is the new `VmSpace` published outside the registry lock; the old
+launcher image becomes unreachable. Old handles submitted before and after
+commit are rejected with an unchanged registry, staging, and image projection.
+
+The interpreter checks its own and the main image's TLS and hands off to the
+main, which prints exactly `dynamic pie ok\n`; write and exit publications are
+acknowledged once and all 12 credits return. OSTD's public `FsBase::load/save`
+is invoked around each `UserMode::execute`, but `UserContext` does not own FS
+base. This observation is therefore limited to one CPU and one TLS-bearing
+task. It is not a general relocation engine, runtime linker, shared-library or
+libc path, multi-task TLS lifecycle, or filesystem-backed loader.
+
+Together these are Stage 6B.2 personality-local bounded receipts. They do not
+complete runtime filesystem, runtime network, cross-service scope unification,
+SMP concurrency validation, or the final CSER contribution judgment.
 
 ## IOMMU result: fail closed
 

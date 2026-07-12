@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - name: Verify CSER models, specifications, scheduler/pager/Linux futex, and mediated VirtIO
+      - name: Verify CSER models, scheduler/pager, Linux Stage 6B.2, and mediated VirtIO
         run: ./x verify
       - name: Upload failure evidence
         if: failure()

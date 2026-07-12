@@ -17,6 +17,8 @@ patterns=(
     "OSTD_PROBE PASS fallback_first_task=200 fallback_first_selection_attempt=1 observed_tick_delta="
     "CSER REJECT_NO_SUPERVISOR action=Prepare authority_epoch=41 binding_epoch=2 proposal_task=100"
     "OSTD_PROBE PASS wrappers=wait+timer carry_effect_token=true authority_epoch=41"
+    "EFFECT_REGISTRY PASS effects=2 recovery_adoptions=2 committed_drains=1 uncommitted_aborts=1 publication_acks=2 stale_authority_rejected=true quiescent=true"
+    "READINESS_CORE PASS sample_arm=atomic edge_deliveries=2 level_deliveries=2 oneshot_deliveries=1 immediate_deliveries=1 stale_source_rejected=true stale_subscription_rejected=true duplicate_publication_rejected=true"
     "PAGER_SCENARIO BEGIN scenario=recover scope=20 fault=1 scheduler_mode=kernel_fifo_fallback"
     "PAGER Register scenario=recover scope=20 fault=1 authority_epoch=71 binding_epoch=1 as=1 as_generation=1 thread=300 addr=0x401000 access_bits=0x4 rip=0x400005"
     "PAGER PrepareZero scenario=recover fault=1 binding_epoch=1 owner=kernel credit=Held"
@@ -180,6 +182,12 @@ patterns=(
     "LINUX_FUTEX RevokeComplete scenario=expire result=Applied queue=0 live=0 blocked=0 wakers=0 pending=false credits=wait+wake+timer:Free terminalizations=2"
     "LINUX_FUTEX_SCENARIO PASS scenario=expire terminalizations=2 wait_credit=Free wake_credit=Free timer_credit=Free queue=0 live=0 blocked=0 wakers=0 smp=1"
     "LINUX_FUTEX_SLICE PASS scenarios=recover+expire mismatch_eagain=true crash_rebind=true watchdog_expire=true committed_drain=true uncommitted_abort=true linux_timeout=false unified_registry=false smp=1"
+    "LINUX_FUTEX_CORE BEGIN workload=linux-round4-futex-smoke adapted=true elf=ET_EXEC entry=0x401000 segments=4"
+    "LINUX_FUTEX_CORE PASS workload=linux-round4-futex-smoke stdout_exact=true mmap_pages=8 clones=3 waits=4 wakes=2 requeues=1 affected_count=2"
+    "READINESS_LIFECYCLE PASS frozen_delivery=1 recovery_adoptions=6 old_binding_rejected=true unadopted_subscription_rejected=true domain_snapshot_invalidated=true post_ready_domain_invalidation=true ready_wins_timeout=true timeout_wins_ready=true revoke_wins_ready=true positive_timeout_timer=true publication_acks=3 duplicate_publication_rejected=true stale_service_generation_rejected=true single_terminalization=true quiescent=true"
+    "LINUX_EPOLL_SLICE BEGIN workload=linux-round5-epoll format=ELF64 type=ET_EXEC adapted_regular_file_eperm=true registry=common readiness=kernel_owned smp=1"
+    "EFFECT_REGISTRY Quiescent workload=linux-round5-epoll live=0 pending_publications=0 subscriptions=0 queued=0 unpublished_deliveries=0 credits=Free"
+    "LINUX_EPOLL_SLICE PASS workload=linux-round5-epoll adapted=true syscalls=23 pipe_et=true pipe_oneshot=true socket_lt=true regular_file_eperm=true sample_arm=atomic registry_quiescent=true"
     "CSER REJECT_STALE action=Prepare authority_epoch=41 proposal_binding_epoch=1 current_binding_epoch=4 proposal_task=100"
     "IOMMU_PROBE PASS result=FAIL_CLOSED reason=IOTLB_INVALIDATION_UNAVAILABLE ostd=0.18.0 authority_epoch=41"
     "SPIKE_RESULT PASS"
@@ -261,17 +269,33 @@ awk '
         }
     }
     /^CSER FallbackPick authority_epoch=41 binding_epoch=4 / {
-        futex_attempts_seen++
-        if (field("tick") !~ /^[0-9]+$/ || field("selection_attempt") != futex_attempts_seen)
-            fail("Linux futex fallback attempts are not dense numeric ordinals: " $0)
-        if (field("selection_attempt") == "1")
+        attempt = field("selection_attempt")
+        if (field("tick") !~ /^[0-9]+$/ || attempt !~ /^[0-9]+$/)
+            fail("Linux futex fallback pick has a non-numeric tick/attempt: " $0)
+        if (!futex_slice_complete) {
+            futex_dense_attempts++
+            if (attempt != futex_dense_attempts)
+                fail("Stage 6B.1 Linux futex fallback attempts are not dense ordinals: " $0)
+        } else {
+            if (attempt + 0 <= futex_last_attempt)
+                fail("post-6B.1 fallback attempts are not strictly increasing: " $0)
+            post_futex_attempts++
+        }
+        futex_last_attempt = attempt + 0
+        if (attempt == "1")
             futex_first_attempts++
         if (!futex_pick_seen) {
             futex_pick_seen = 1
-            if (field("task") != "500" || field("selection_attempt") != "1")
+            if (field("task") != "500" || attempt != "1")
                 fail("Linux futex first pick was not task 500 on selection attempt 1: " $0)
             futex_pick_tick = field("tick") + 0
         }
+    }
+    /^LINUX_FUTEX_SLICE PASS scenarios=recover\+expire / {
+        futex_slice_passes++
+        if (futex_slice_passes != 1)
+            fail("duplicate Stage 6B.1 futex slice PASS")
+        futex_slice_complete = 1
     }
     /^OSTD_PROBE PASS fallback_first_task=/ {
         base_passes++
@@ -302,6 +326,8 @@ awk '
             fail("selection attempt 1 must appear exactly once in each binding epoch")
         if (base_passes != 1 || linux_passes != 1 || futex_passes != 1)
             fail("expected exactly one base, one Linux, and one Linux futex fallback PASS")
+        if (futex_slice_passes != 1 || post_futex_attempts == 0)
+            fail("missing Stage 6B.1 boundary or post-6B.1 increasing fallback evidence")
         if (base_pick_tick < base_crash_tick || base_reported_delta != base_pick_tick - base_crash_tick)
             fail("base fallback tick diagnostic does not match Crash -> first pick")
         if (linux_pick_tick < linux_crash_tick || linux_reported_delta != linux_pick_tick - linux_crash_tick)
@@ -408,6 +434,48 @@ line_of_exact() {
 # identity and allowed order, and rejects any missing or additional receipt.
 awk -f "$script_dir/assert-linux-projections.awk" "$log"
 awk -f "$script_dir/assert-linux-futex.awk" "$log"
+awk -f "$script_dir/assert-linux-futex-core.awk" "$log"
+awk -f "$script_dir/assert-linux-epoll.awk" "$log"
+
+# Keep the retained Round 4 parser honest. A duplicate terminal receipt, a
+# false requeue affected count, and a stale-v1 mutation claim must all fail.
+if {
+    cat "$log"
+    grep -F -m1 'LINUX_FUTEX_CORE PASS workload=linux-round4-futex-smoke' "$log"
+} | awk -f "$script_dir/assert-linux-futex-core.awk" >/dev/null 2>&1; then
+    echo 'linux futex core oracle accepted duplicate terminal evidence' >&2
+    exit 1
+fi
+if sed '0,/op=REQUEUE woken=1 moved=1 affected=2/{s/affected=2/affected=1/}' "$log" |
+    awk -f "$script_dir/assert-linux-futex-core.awk" >/dev/null 2>&1; then
+    echo 'linux futex core oracle accepted a false requeue affected count' >&2
+    exit 1
+fi
+if sed '0,/LateOldGeneration .* mutation=false/{s/mutation=false/mutation=true/}' "$log" |
+    awk -f "$script_dir/assert-linux-futex-core.awk" >/dev/null 2>&1; then
+    echo 'linux futex core oracle accepted a mutating stale-v1 call' >&2
+    exit 1
+fi
+
+require_exact_line_count 1 \
+    'READINESS_LIFECYCLE PASS frozen_delivery=1 recovery_adoptions=6 old_binding_rejected=true unadopted_subscription_rejected=true domain_snapshot_invalidated=true post_ready_domain_invalidation=true ready_wins_timeout=true timeout_wins_ready=true revoke_wins_ready=true positive_timeout_timer=true publication_acks=3 duplicate_publication_rejected=true stale_service_generation_rejected=true single_terminalization=true quiescent=true' \
+    'readiness lifecycle race/closure receipt count mismatch'
+
+# Keep the epoll parser honest with two cheap mutations of the observed QEMU
+# trace: duplicate terminal evidence and a false edge-triggered result must
+# both be rejected by the strict oracle.
+if {
+    cat "$log"
+    grep -F -m1 'LINUX_EPOLL_SLICE PASS workload=linux-round5-epoll' "$log"
+} | awk -f "$script_dir/assert-linux-epoll.awk" >/dev/null 2>&1; then
+    echo 'linux epoll oracle accepted duplicate terminal evidence' >&2
+    exit 1
+fi
+if sed '0,/delivery=2 sequence=2 count=0/{s/delivery=2 sequence=2 count=0/delivery=2 sequence=2 count=1/}' "$log" |
+    awk -f "$script_dir/assert-linux-epoll.awk" >/dev/null 2>&1; then
+    echo 'linux epoll oracle accepted a false second edge delivery' >&2
+    exit 1
+fi
 
 require_exact_count 1 \
     'CSER PrepareScoped service=scheduler scheduler_authority_epoch=41 binding_epoch=2 workload_authority_epoch=91 scope=30 effect=0 proposal_task=400' \
@@ -759,8 +827,14 @@ if grep -Eiq '(^|[[:space:]])panic([!:.[:space:]]|$)|panicked at' "$log"; then
     exit 1
 fi
 
-if grep -Eiq '(^|[^[:alnum:]_])(requeue|clone)([^[:alnum:]_]|$)' "$log"; then
-    echo "forbidden serial evidence: requeue or clone" >&2
+if awk '
+    { sub(/\r$/, "") }
+    /^LINUX_FUTEX_SLICE BEGIN / { bounded = 1 }
+    bounded && tolower($0) ~ /(^|[^[:alnum:]_])(requeue|clone)([^[:alnum:]_]|$)/ { found = 1 }
+    /^LINUX_FUTEX_SLICE PASS / { bounded = 0 }
+    END { exit found ? 0 : 1 }
+' "$log"; then
+    echo "forbidden Stage 6B.1 serial evidence: requeue or clone" >&2
     exit 1
 fi
 

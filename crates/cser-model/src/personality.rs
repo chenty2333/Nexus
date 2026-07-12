@@ -14,8 +14,16 @@ use alloc::vec::Vec;
 
 use crate::{ScopeId, ScopeState};
 
+/// Failure-atomic executable-image successor over the common registry.
+pub mod exec;
 /// Bounded private-futex refinement of the personality recovery gate.
 pub mod futex;
+/// Two-key private-futex requeue successor over the common effect registry.
+pub mod futex_requeue;
+/// Generational readiness and timeout successor over the common registry.
+pub mod readiness;
+/// Common scoped-effect registry successor shared by personality refinements.
+pub mod registry;
 
 macro_rules! scalar_type {
     ($(#[$meta:meta])* $name:ident) => {

@@ -31,12 +31,15 @@ const TRACE_ACTIONS: [&str; 9] = [
     "Complete",
 ];
 
-const TLA_SPECS: [&str; 5] = [
+const TLA_SPECS: [&str; 8] = [
     "Cser",
     "PagerCser",
     "IoCser",
     "PersonalityCser",
     "PersonalityFutexCser",
+    "PersonalityFutexRequeueCser",
+    "PersonalityReadinessCser",
+    "PersonalityExecCser",
 ];
 
 static NEXT_SPEC_WORKSPACE: AtomicU64 = AtomicU64::new(0);
@@ -491,7 +494,14 @@ fn pluscal_translation_is_current(
 ) -> Result<()> {
     section(&format!("check PlusCal translation drift for {spec}"));
     let file_name = format!("{spec}.tla");
-    let line_width = if matches!(spec, "IoCser" | "PersonalityFutexCser") {
+    let line_width = if matches!(
+        spec,
+        "IoCser"
+            | "PersonalityFutexCser"
+            | "PersonalityFutexRequeueCser"
+            | "PersonalityReadinessCser"
+            | "PersonalityExecCser"
+    ) {
         "10000"
     } else {
         "1000"

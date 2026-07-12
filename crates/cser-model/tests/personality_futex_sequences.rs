@@ -388,6 +388,46 @@ fn forged_stale_and_replayed_adoption_reject_without_mutation_after_rebind() {
 }
 
 #[test]
+fn fresh_binding_cannot_select_an_unadopted_old_wait() {
+    let (mut model, scope, old_binding, key) = model(1, 14);
+    let old_wait = model
+        .wait_register(old_binding, TaskId::new(1), key, 14)
+        .unwrap();
+    model.crash(old_binding).unwrap();
+    model.fallback_pick(scope).unwrap();
+    let snapshot = model
+        .recovery_snapshot(scope, PersonalityId::new(2))
+        .unwrap();
+    let ready = model.ready(&snapshot).unwrap();
+    let replacement = model.rebind(ready).unwrap();
+
+    let wake = model
+        .wake_commit(replacement, TaskId::new(2), key, 1)
+        .unwrap();
+    assert_eq!(wake.selected_wait, None);
+    assert_eq!(wake.frozen_count, 0);
+    assert_eq!(model.scope(scope).unwrap().queue, vec![old_wait.effect()]);
+    assert_eq!(
+        model.effect(old_wait.effect()).unwrap().state,
+        FutexEffectState::WaitQueued
+    );
+
+    model.kernel_wake_publish(wake.token).unwrap();
+    let adopted = model.adopt(replacement, old_wait).unwrap();
+    let wake = model
+        .wake_commit(replacement, TaskId::new(2), key, 1)
+        .unwrap();
+    assert_eq!(wake.selected_wait, Some(adopted.effect()));
+    assert_eq!(wake.frozen_count, 1);
+    model.kernel_wake_publish(wake.token).unwrap();
+    assert_eq!(
+        model.effect(adopted.effect()).unwrap().delivery,
+        Some(FutexDelivery::WaitWoken)
+    );
+    model.check_invariants().unwrap();
+}
+
+#[test]
 fn premature_revoke_complete_with_wait_and_committed_wake_is_failure_atomic() {
     let (mut model, scope, binding, key) = model(1, 15);
     let wait = model

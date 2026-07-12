@@ -274,6 +274,22 @@ uncommitted syscall. These finite graphs do not model Linux ABI decoding,
 guest-memory access, real output deduplication, multiple tasks or personalities,
 SMP, durable recovery storage, or a concrete timeout/tombstone worker.
 
+Stage 6B freezes three further bounded refinements. The 6B.1
+`PersonalityFutexCser.tla` predecessor models one private key and recovery
+watchdog. Stage 6B.2 adds `PersonalityFutexRequeueCser.tla`, whose safety graph
+explored 4,786,581 generated / 1,927,174 distinct states at depth 27 and whose
+action graph explored 247,047 / 140,473 at depth 23 with four temporal branches
+and six reachability witnesses. `PersonalityReadinessCser.tla` checks atomic
+sample-and-arm, trigger discipline, a unique ready/timeout/revoke winner,
+generation fencing, crash adoption, and credit closure: 83,586 / 50,544 states
+at depth 20 for safety and 55,569 / 34,428 at depth 19 for three temporal
+branches, plus eight witnesses. `PersonalityExecCser.tla` checks invisible
+staging, one whole-image commit, pre-commit preservation of the old image,
+post-commit drain without rollback, and crash adoption: 361 / 253 states at
+depth 15 for safety and 182 / 137 at depth 14 for three temporal branches, plus
+six witnesses. These are complete graphs only for their finite configurations;
+they do not prove the concrete Rust synchronization or Linux ABI.
+
 ### Executable reference evidence
 
 `crates/cser-model` is a `no_std + alloc`, safe-Rust executable oracle for the
@@ -292,6 +308,16 @@ old-binding rejection, revoke ordering, and single resume/exit/abort. These are
 executable reference transitions and small interleaving models; they do not
 establish the eventual production lock/atomic scheme, VirtIO transport fences,
 PCI reset behavior, SMP, real device quiescence, or a complete Linux server.
+
+Stage 6B.2 adds a personality-local common `EffectRegistry` plus two-key futex
+requeue, readiness, and failure-atomic exec successors. The common layer owns
+authority/binding fences, typed credits, task/scope/resource reverse indexes,
+atomic batch commit and resource movement, publication acknowledgement,
+snapshot/rebind/adopt, and scope-local closure. Domain layers retain FIFO futex
+queues, readiness generations and trigger modes, or private executable-image
+staging. The four additions contribute 36 deterministic/property tests to the
+current 117-test suite. They are not a scheduler/pager/personality/I/O registry
+and do not establish the eventual SMP synchronization design.
 
 ### Observed OSTD evidence
 
@@ -412,8 +438,30 @@ map/reply cases remain kernel predicate probes, and the queued post-crash
 personality delivery is a bounded harness queue rather than an asynchronous
 production portal. The companion scopes do not revoke scope 30 and do not form
 a unified scheduler/pager/personality/I/O registry. There is no personality
-timeout/tombstone, filesystem/network path, or mediated-VirtIO output. Five
-remaining core workloads are still required before Stage 6 is complete.
+timeout/tombstone, filesystem/network path, or mediated-VirtIO output. At the
+Stage 6A checkpoint, five core workloads still remained.
+
+Stage 6B.2 now supplies three further bounded personality receipts over a
+common personality-local effect registry. The adapted retained Round 4 ELF
+uses eight anonymous pages and three clone tasks, freezes one two-key requeue as
+`woken=1 + moved=1`, survives a real pre-publication personality crash through
+three explicit adoptions, rejects the old binding without mutation, and closes
+both commit-before-revoke and revoke-before-commit companions. The adapted
+retained Round 5 ELF executes 23 syscalls covering pipe ET/ONESHOT, socketpair
+LT, zero-timeout empties, and Linux-compatible regular-file `EPERM`; a separate
+readiness lifecycle recovers six effects and gives ready, timeout, and revoke
+exactly one winner. The dynamic PIE slice performs a real launcher `execve`,
+stages an ET_DYN main and interpreter with eight `PT_LOAD` mappings plus TLS and
+stack, explicitly adopts eleven effects after crash/rebind, and publishes one
+new `VmSpace` after a single atomic ExecCommit. It observes auxv, interpreter
+and main TLS, explicit FS-base load/save, exact output, and complete credit
+return.
+
+Those are single-CPU bounded observations. They are not general futex, epoll,
+dynamic-linker, filesystem, network, or SMP results. Four of six core Linux
+inputs are now observed; runtime filesystem and runtime network remain before
+Stage 6 can close. The common implementation is still personality-local, so
+the cross-service CSER scope and integrated fault matrix remain future work.
 
 ## Research gates
 
@@ -443,26 +491,19 @@ Work proceeds through evidence gates, not feature-count milestones.
    generation fencing, and conditional `Quiesced`. This admits the prototype to integrated
    validation; the hardware-general, IRQ, SMP, multi-client, domain-isolation,
    persistence, and real-deadline gaps remain open.
-5. **Linux pressure gate — Stage 6A and bounded Stage 6B.1 slices complete /
-   Observed, Stage 6 still in progress:** the personality TLA+ and Rust
-   refinements plus the pinned `linux-hello` QEMU trace establish the narrow
-   scheduler + file-backed pager + post-commit personality recovery path
-   described above. Stage 6B is intentionally split. **6B.1 semantics and
-   bounded OSTD/QEMU slice complete / Observed:** the private-futex successor,
-   pure Rust oracle, and raw-guest observation fix one private key, one
-   waiter/one waker, `max_wake = 1`, and one CPU. They observe atomic
-   compare/enqueue, crash/rebind/adopt, watchdog cancel/expire, wake/revoke
-   ordering, post-revoke rejection without mutation, and independent
-   wait/wake/timer credit return. This is not the retained futex core workload:
-   there is no unified syscall/futex registry, Linux timeout, requeue,
-   clone/mmap/thread-exit, or lost-wakeup/SMP proof. 6B.2 must add two-key
-   requeue plus that process/thread plumbing and run the explicitly adapted
-   full round4 workload before the futex core workload is complete. The exact
-   retained round4 source needs that visible Linux-semantic adaptation because
-   its legacy requeue return-value assertion does not match current Linux
-   kernel behavior; Nexus will not emulate that old divergence. Futex, epoll,
-   dynamic PIE, runtime filesystem, and runtime network core workloads remain
-   incomplete. Linux compatibility remains an evaluation vehicle.
+5. **Linux pressure gate — Stage 6A, 6B.1, and bounded Stage 6B.2 slices
+   Checked / Observed; Stage 6 still in progress:** Stage 6A establishes the
+   narrow scheduler + file-backed pager + post-commit `linux-hello` recovery
+   path. Stage 6B.1 freezes the one-key private-futex predecessor. Stage 6B.2
+   adds the personality-local common registry and checked requeue/readiness/
+   exec successors, then observes the adapted retained Round 4 futex, adapted
+   Round 5 epoll, and retained dynamic PIE paths described above. The visible
+   adaptations correct obsolete requeue-count and regular-file epoll
+   expectations; Nexus does not emulate either divergence. This completes four
+   of the six bounded core inputs, not Linux compatibility or a system-wide
+   CSER registry. Runtime filesystem, runtime network, general ABI/SMP behavior,
+   and cross-service composition remain open. Linux remains an evaluation
+   vehicle rather than the research identity.
 6. **Integrated evidence gate — incremental checks exist; final Stage 7
    planned:** extend the bounded Loom gates with implementation-specific Loom
    and/or Kani checks across scheduler, pager, personality, and I/O; add a

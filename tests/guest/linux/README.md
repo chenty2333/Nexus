@@ -20,25 +20,27 @@ and success protocol while keeping these inputs as pressure tests.
 
 ## Current Stage 6 use
 
-`linux-hello` is the first and currently only executed retained core workload. The
-Docker-pinned `experiments/ostd-cser-spike/scripts/build-guest.sh` builds an
-x86-64 static `ET_EXEC` directly from the unchanged retained `hello.S`; it does
-not copy or rewrite a second source tree. The gate fixes both the retained
-source SHA-256
+Four of the six bounded core inputs now execute in the Docker-pinned OSTD/QEMU
+personality: `linux-hello`, an explicitly adapted Round 4 futex input, an
+explicitly adapted Round 5 epoll input, and the retained dynamic-PIE launcher,
+main, and interpreter. Runtime filesystem and runtime network are still
+pending. These are narrow pressure receipts, not a general Linux-compatibility
+claim.
+
+`experiments/ostd-cser-spike/scripts/build-guest.sh` builds the static
+`linux-hello` `ET_EXEC` directly from the unchanged retained `hello.S`; it does
+not copy or rewrite a second source tree. The gate fixes both the retained source SHA-256
 `50690500a3cfac0f412da66d3d5d7f32b9b4da2a96a38d6d21c3ef12ea141490`
 and the reproducible container-built ELF SHA-256
 `1dae72e6d4a5c9144e94580a8e2a8280cb36f725d66046baed77562051b2f1a4`.
 The generated ELF lives only in the isolated experiment and is not a new
 provenance source.
 
-That one bounded retained-workload receipt does not complete Stage 6. The other
-five core workloads—futex, epoll, dynamic PIE, runtime filesystem, and runtime
-network—have not run on the new personality. Stage 6B.1 now separately executes
-Nexus-owned raw waiter, waker, and personality probes for one private-futex
-wait/wake recovery contract; those probes are an implementation observation,
-not execution of the retained Round 4 core input. The remaining retained
-sources are still pressure candidates or archive inputs, not compatibility
-claims.
+Stage 6A and 6B.1 remain independent predecessor evidence. Stage 6B.2 adds a
+personality-local common effect registry and the three later receipts; it does
+not merge scheduler, pager, personality, and VirtIO into one cross-service
+registry. Remaining retained sources are pressure candidates or archive
+inputs, not compatibility claims.
 
 ### Retained futex input audit
 
@@ -54,11 +56,11 @@ later recovery requeue can instead move the late waiter and return `1`; the
 second legacy assertion rejects that result as well.
 
 The archived source and its digest remain unchanged. The compatibility catalog
-therefore marks this workload `adaptation_required`. A Stage 6 futex gate must
-either apply a visible, reproducible adaptation to a temporary build copy or
-introduce a separately catalogued Nexus-owned input. It must also pass a host
-Linux behavior oracle. Implementing the old return convention in the Nexus
-personality is not acceptable.
+therefore marks this workload `adaptation_required`. Stage 6B.2 applies
+`adaptations/round4-futex-modern-requeue.patch` only to a temporary build copy,
+runs the adapted program on host Linux, fixes the resulting artifact digest,
+and then executes that exact ELF in QEMU. Implementing the old return convention
+in the Nexus personality remains unacceptable.
 
 The futex gate is deliberately split. Stage 6B.1 is now **semantics complete and
 bounded OSTD/QEMU slice complete / Observed** for one private key, one waiter,
@@ -69,12 +71,40 @@ post-revoke stale rejection without mutation, one committed drain, one
 uncommitted abort path, and full wait/wake/timer-credit return. The watchdog is
 a CSER recovery deadline and never reports a Linux futex timeout.
 
-This micro-slice has no requeue, clone, mmap, thread-exit, Linux timeout, or
-lost-wakeup/SMP proof, and its futex indexes are not a unified syscall/futex
-registry. Stage 6B.2 must add two-key atomic requeue plus the retained program's
-`mmap`, `clone`, thread-exit, write, and process-exit plumbing and then run the
-explicitly adapted full Round 4 program. Passing only 6B.1 does not complete the
-core futex workload or Stage 6.
+The Stage 6B.2 successor now supplies that missing bounded core path: two-key
+atomic requeue, eight anonymous pages, three clone tasks sharing one `VmSpace`,
+thread and process exit, a frozen `woken + moved = 2` receipt, crash/rebind with
+three explicit adoptions, and failure-atomic old-binding rejection. Strict
+positive and negative serial oracles require FIFO movement, single
+terminalization, both closure orderings, empty indexes, and returned credits.
+The result remains single-CPU and excludes Linux timeout, unmap invalidation,
+signals, shared/PI/robust futexes, and lost-wakeup/SMP proof.
+
+### Retained epoll input audit
+
+`linux-round5-epoll-smoke` also preserves one non-Linux expectation: it tries
+to add a regular file to epoll and expects immediate `EPOLLIN`. Linux returns
+`EPERM`. `adaptations/round5-epoll-linux-regular-file.patch` changes only that
+tail in the temporary copy; pipe edge-triggered, pipe one-shot, and socketpair
+level-triggered checks remain intact. A host semantic companion fixes the
+source, patch, and adapted-source digests, while QEMU executes the full adapted
+ELF and requires the exact 23-syscall receipt. A Nexus-owned readiness
+lifecycle companion separately checks atomic sample-and-arm, generational
+subscriptions, ready/timeout/revoke races, crash/rebind/adopt, one-shot
+publication, and quiescent closure. Opening the fixed `/bin/linux-hello`
+artifact is a bounded in-memory lookup, not a runtime-filesystem result.
+
+### Retained dynamic PIE input audit
+
+The dynamic core slice keeps all three retained sources unchanged. A fixed
+static launcher really invokes `execve`; the bounded loader stages an ET_DYN
+main and ET_DYN interpreter, each with four `PT_LOAD` segments, plus TLS/TCB and
+the initial stack. A pre-commit personality crash requires eleven explicit
+adoptions before one atomic image commit and lock-external `VmSpace`
+publication. The guest checks auxv and both TLS images before printing exactly
+`dynamic pie ok`. Explicit FS-base load/save is observed only for one CPU and
+one TLS-bearing task; this is not a general dynamic linker, relocation, libc,
+or multi-task TLS implementation.
 
 ## Build profiles
 
@@ -84,7 +114,8 @@ core futex workload or Stage 6.
 - `shared-interpreter-raw`: `-nostdlib -shared -fPIC` interpreter payload.
 - `dynamic-pie-raw`: `-nostdlib -fPIE -pie` with an explicit `PT_INTERP`.
 - `glibc-pie`: normal host C compilation as PIE with a pinned guest glibc and
-  loader supplied later by the Docker guest-artifact build.
+  general runtime loader still to be supplied by a future guest-artifact build;
+  the current raw interpreter is only the bounded dynamic-PIE core probe.
 
 The original sources intentionally contain raw Linux syscall numbers and
 layout constants. They are executable test inputs, not a constants library.

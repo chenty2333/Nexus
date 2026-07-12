@@ -6,11 +6,20 @@
 extern crate alloc;
 
 mod effect;
+#[allow(dead_code)]
+mod effect_registry;
 mod iommu_probe;
 mod linux;
+mod linux_dynamic;
+mod linux_epoll;
 mod linux_futex;
+mod linux_futex_core;
+mod linux_loader;
 mod linux_pager;
+#[allow(dead_code)]
+mod linux_runtime;
 mod pager;
+mod readiness;
 mod scheduler;
 
 use alloc::{boxed::Box, sync::Arc};
@@ -24,6 +33,7 @@ use ostd::{
     },
     power::{ExitCode, poweroff},
     prelude::*,
+    sync::SpinLock,
     task::{
         Task, TaskOptions, disable_preempt, inject_post_schedule_handler,
         scheduler as ostd_scheduler,
@@ -44,11 +54,26 @@ const SYSCALL_PROBE: usize = 0x4353_4552;
 pub struct TaskData {
     pub(crate) id: u64,
     pub(crate) vm_space: Option<Arc<VmSpace>>,
+    dynamic_vm_space: Option<Arc<SpinLock<Arc<VmSpace>>>>,
 }
 
 impl TaskData {
     pub(crate) fn new(id: u64, vm_space: Option<Arc<VmSpace>>) -> Self {
-        Self { id, vm_space }
+        Self {
+            id,
+            vm_space,
+            dynamic_vm_space: None,
+        }
+    }
+
+    /// Creates the single-task dynamic-exec variant whose scheduler hook must
+    /// follow the atomically published process image.
+    pub(crate) fn new_dynamic(id: u64, vm_space: Arc<SpinLock<Arc<VmSpace>>>) -> Self {
+        Self {
+            id,
+            vm_space: None,
+            dynamic_vm_space: Some(vm_space),
+        }
     }
 }
 
@@ -101,7 +126,9 @@ fn activate_current_task_vm() {
     let Some(data) = current.data().downcast_ref::<TaskData>() else {
         return;
     };
-    if let Some(vm_space) = &data.vm_space {
+    if let Some(vm_space) = &data.dynamic_vm_space {
+        vm_space.lock().activate();
+    } else if let Some(vm_space) = &data.vm_space {
         vm_space.activate();
     }
 }
@@ -264,6 +291,35 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
         AUTHORITY_EPOCH,
     );
 
+    let registry = effect_registry::bounded_registry_self_test();
+    assert!(registry.stale_authority_rejected);
+    assert!(registry.quiescent);
+    println!(
+        "EFFECT_REGISTRY PASS effects={} recovery_adoptions={} committed_drains={} uncommitted_aborts={} publication_acks={} stale_authority_rejected={} quiescent={}",
+        registry.effects,
+        registry.recovery_adoptions,
+        registry.committed_drains,
+        registry.uncommitted_aborts,
+        registry.publication_acks,
+        registry.stale_authority_rejected,
+        registry.quiescent,
+    );
+
+    let readiness = readiness::bounded_readiness_self_test();
+    assert!(readiness.stale_source_rejected);
+    assert!(readiness.stale_subscription_rejected);
+    assert!(readiness.duplicate_publication_rejected);
+    println!(
+        "READINESS_CORE PASS sample_arm=atomic edge_deliveries={} level_deliveries={} oneshot_deliveries={} immediate_deliveries={} stale_source_rejected={} stale_subscription_rejected={} duplicate_publication_rejected={}",
+        readiness.edge_deliveries,
+        readiness.level_deliveries,
+        readiness.oneshot_deliveries,
+        readiness.immediate_deliveries,
+        readiness.stale_source_rejected,
+        readiness.stale_subscription_rejected,
+        readiness.duplicate_publication_rejected,
+    );
+
     // Keep the scheduler in its kernel-owned FIFO fallback while pager tasks
     // block and wake one another. Pager service binding epochs are independent
     // from this scheduler-policy binding.
@@ -295,6 +351,17 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
         scheduler.binding().binding_epoch,
         futex_scheduler_binding.binding_epoch + 1
     );
+
+    // Execute the retained Round 4 ELF through the bounded Linux ABI. Its
+    // private-futex typed index and common current-resource reverse index move
+    // together under the runtime transaction lock.
+    linux_futex_core::run_linux_futex_core_slice();
+
+    // Stage 6B.2 keeps readiness policy in the Linux personality while the
+    // kernel-owned core freezes delivery and the common registry owns effect
+    // lifetime, publication, and scope closure.
+    linux_epoll::run_linux_epoll_slice();
+    linux_dynamic::run_linux_dynamic_slice();
     assert_eq!(
         scheduler.propose(old_binding, USER_TASK_ID),
         ProposalResult::RejectStale

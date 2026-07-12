@@ -16,7 +16,32 @@ COPY experiments/ostd-cser-spike/Cargo.toml \
     /tmp/ostd-cser-inputs/
 COPY experiments/ostd-cser-spike/osdk-runner-base /tmp/ostd-cser-inputs/osdk-runner-base
 COPY experiments/ostd-cser-spike/userspace/personality /tmp/ostd-cser-inputs/personality
+COPY experiments/ostd-cser-spike/guest/linux-futex-core-personality-v1.S \
+    experiments/ostd-cser-spike/guest/linux-futex-core-personality-v2.S \
+    /tmp/ostd-cser-inputs/guest/
+COPY experiments/ostd-cser-spike/scripts/build-guest.sh \
+    experiments/ostd-cser-spike/scripts/assert-linux-elf.sh \
+    experiments/ostd-cser-spike/scripts/assert-dynamic-pie-artifacts.sh \
+    experiments/ostd-cser-spike/scripts/check-fsbase-api.sh \
+    experiments/ostd-cser-spike/scripts/build-round4.sh \
+    experiments/ostd-cser-spike/scripts/build-round5.sh \
+    /tmp/ostd-cser-inputs/scripts/
 COPY tests/guest/linux/sources/linux-hello/hello.S /tmp/ostd-cser-inputs/linux-hello.S
+COPY tests/guest/linux/sources/linux-dynamic-pie-smoke/dynamic_pie_smoke.S \
+    /tmp/ostd-cser-inputs/dynamic_pie_smoke.S
+COPY tests/guest/linux/sources/linux-dynamic-pie-main/dynamic_pie_main.c \
+    /tmp/ostd-cser-inputs/dynamic_pie_main.c
+COPY tests/guest/linux/sources/linux-dynamic-runtime-interp/dynamic_runtime_interp.c \
+    /tmp/ostd-cser-inputs/dynamic_runtime_interp.c
+COPY tests/guest/linux/sources/linux-round4-futex-smoke/round4_futex_smoke.S \
+    /tmp/ostd-cser-inputs/round4_futex_smoke.S
+COPY tests/guest/linux/adaptations/round4-futex-modern-requeue.patch \
+    /tmp/ostd-cser-inputs/round4-futex-modern-requeue.patch
+COPY tests/guest/linux/sources/linux-round5-epoll-smoke/round5_epoll_smoke.S \
+    /tmp/ostd-cser-inputs/round5_epoll_smoke.S
+COPY tests/guest/linux/adaptations/round5-epoll-linux-regular-file.patch \
+    tests/guest/linux/adaptations/verify-round5-epoll-adaptation.sh \
+    /tmp/ostd-cser-inputs/round5/
 RUN --mount=type=bind,source=experiments/ostd-cser-spike,target=/tmp/ostd-cser-source,readonly \
     cmp /tmp/ostd-cser-inputs/Cargo.toml /tmp/ostd-cser-source/Cargo.toml \
     && cmp /tmp/ostd-cser-inputs/Cargo.lock /tmp/ostd-cser-source/Cargo.lock \
@@ -27,6 +52,22 @@ RUN --mount=type=bind,source=experiments/ostd-cser-spike,target=/tmp/ostd-cser-s
         /tmp/ostd-cser-source/osdk-runner-base \
     && diff -ru /tmp/ostd-cser-inputs/personality \
         /tmp/ostd-cser-source/userspace/personality \
+    && cmp /tmp/ostd-cser-inputs/guest/linux-futex-core-personality-v1.S \
+        /tmp/ostd-cser-source/guest/linux-futex-core-personality-v1.S \
+    && cmp /tmp/ostd-cser-inputs/guest/linux-futex-core-personality-v2.S \
+        /tmp/ostd-cser-source/guest/linux-futex-core-personality-v2.S \
+    && cmp /tmp/ostd-cser-inputs/scripts/build-guest.sh \
+        /tmp/ostd-cser-source/scripts/build-guest.sh \
+    && cmp /tmp/ostd-cser-inputs/scripts/assert-linux-elf.sh \
+        /tmp/ostd-cser-source/scripts/assert-linux-elf.sh \
+    && cmp /tmp/ostd-cser-inputs/scripts/assert-dynamic-pie-artifacts.sh \
+        /tmp/ostd-cser-source/scripts/assert-dynamic-pie-artifacts.sh \
+    && cmp /tmp/ostd-cser-inputs/scripts/check-fsbase-api.sh \
+        /tmp/ostd-cser-source/scripts/check-fsbase-api.sh \
+    && cmp /tmp/ostd-cser-inputs/scripts/build-round4.sh \
+        /tmp/ostd-cser-source/scripts/build-round4.sh \
+    && cmp /tmp/ostd-cser-inputs/scripts/build-round5.sh \
+        /tmp/ostd-cser-source/scripts/build-round5.sh \
     && rm -rf /work \
     && cp -a /tmp/ostd-cser-source /work \
     && mkdir -p /work/target/osdk \
@@ -34,8 +75,17 @@ RUN --mount=type=bind,source=experiments/ostd-cser-spike,target=/tmp/ostd-cser-s
         /work/target/osdk/ostd-cser-spike-run-base \
     && cd /work \
     && NEXUS_LINUX_HELLO_SOURCE=/tmp/ostd-cser-inputs/linux-hello.S \
+        NEXUS_DYNAMIC_PIE_LAUNCHER_SOURCE=/tmp/ostd-cser-inputs/dynamic_pie_smoke.S \
+        NEXUS_DYNAMIC_PIE_MAIN_SOURCE=/tmp/ostd-cser-inputs/dynamic_pie_main.c \
+        NEXUS_DYNAMIC_PIE_INTERP_SOURCE=/tmp/ostd-cser-inputs/dynamic_runtime_interp.c \
+        NEXUS_ROUND4_FUTEX_SOURCE=/tmp/ostd-cser-inputs/round4_futex_smoke.S \
+        NEXUS_ROUND4_FUTEX_PATCH=/tmp/ostd-cser-inputs/round4-futex-modern-requeue.patch \
+        NEXUS_ROUND5_EPOLL_SOURCE=/tmp/ostd-cser-inputs/round5_epoll_smoke.S \
+        NEXUS_ROUND5_EPOLL_PATCH=/tmp/ostd-cser-inputs/round5/round5-epoll-linux-regular-file.patch \
+        NEXUS_ROUND5_EPOLL_ORACLE=/tmp/ostd-cser-inputs/round5/verify-round5-epoll-adaptation.sh \
         bash scripts/build-guest.sh \
     && cargo osdk check --locked \
+    && bash scripts/check-fsbase-api.sh \
     && cargo osdk build \
     && cmp /tmp/ostd-cser-inputs/Cargo.lock /work/Cargo.lock \
     && diff -ru /tmp/ostd-cser-inputs/osdk-runner-base \

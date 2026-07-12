@@ -278,19 +278,70 @@ or pre-commit captured syscall packet. The separate
 contract. Together these artifacts complete the Stage 6B.1 semantics
 checkpoint.
 
-The independent pinned OSTD/QEMU slice refines that oracle with a real shared
-`VmSpace`, separate waiter/waker `UserContext`s, atomic user-word loads, one
-guest `xchg` store, real personality faults, fresh-v2 rebind/adopt, kernel wake
-publication, watchdog cancel/expire, and failure-atomic post-revoke token
-rejection. Its `recover` and `expire` traces both finish with exactly two
+The independent pinned OSTD/QEMU slice refines that predecessor oracle with a
+real shared `VmSpace`, separate waiter/waker `UserContext`s, atomic user-word
+loads, one guest `xchg` store, real personality faults, fresh-v2 rebind/adopt,
+kernel wake publication, watchdog cancel/expire, and failure-atomic post-revoke
+token rejection. Its `recover` and `expire` traces both finish with exactly two
 terminalizations, empty local futex indexes, and all wait/wake/timer credits
 free. That makes Stage 6B.1 **semantics complete and bounded implementation
 slice complete / Observed**, but does not widen this executable oracle's model
 boundary. The observation remains one private key, one waiter, one waker,
 `max_wake = 1`, and one CPU; it has no Linux timeout, requeue, clone, mmap,
 thread-exit, lost-wakeup/SMP proof, or unified syscall/futex registry. The
-retained full Round 4 workload has not run, Stage 6B.2 is pending, and neither
-the futex core workload nor Stage 6 is complete.
+Stage 6B.2 successor below adds a separate common-registry refinement and
+retained workload receipt; it does not change this 6B.1 model's finite boundary.
+
+The `personality::registry` module is the common Stage 6B.2 executable
+foundation for Linux-personality effects. It centralizes authority and binding
+fences, opaque full-identity handles, typed renewable credits, the exclusive
+blocked-task slot, scope/task/resource reverse indexes, immutable origin plus
+mutable current resources, atomic batch commit/resource movement, publication
+acknowledgement, exact crash snapshots, ready/rebind/explicit adoption, and
+scope-local revoke closure. Domain refinements retain their semantic queues and
+receipts. This registry is personality-local; scheduler, pager, and mediated
+VirtIO still use independent state machines.
+
+`personality::futex_requeue` builds two-key private futex semantics over that
+registry. A wait keeps one immutable origin key while its current resource may
+move from A to B. `RequeueCommit` atomically freezes disjoint woken and moved
+sets, commits the controller and selected wake, updates generic and typed
+resource membership together, and returns Linux's `woken + requeued` count.
+The moved waiter preserves identity and held wait credit. FIFO selection cannot
+skip an unadopted old-binding queue head, and a replacement cannot select old
+work until explicit adoption. The bounded model fixes `max_wake <= 1` and
+`max_requeue <= 1` but permits longer source and target queues.
+
+`personality::readiness` fixes the reusable mechanism below epoll-like ABIs:
+generational sources and subscriptions, atomic sample-and-arm, LT/ET/ONESHOT
+selection, immutable delivery batches, a positive timeout effect, and one
+winner among ready, timeout, and revoke. Crash recovery requires an exact
+snapshot and explicit adoption; stale source/service/subscription generations
+and duplicate publication reject without mutation. It deliberately owns no fd
+table or Linux epoll syscall decoding.
+
+`personality::exec` keeps staged segments and `ExecLayout` TLS/stack metadata
+kernel-private until one all-or-nothing `ExecCommit` changes the current image.
+A pre-commit crash requires adoption of the controller and every segment.
+Revocation before commit aborts staging and preserves the previous image;
+revocation after commit drains once and never restores the old image. Unlike
+the concrete QEMU receipt, this Rust abstraction records TLS and stack as
+frozen layout metadata rather than two additional effects.
+
+The current executable suite contains 117 tests. The four Stage 6B.2 additions
+contribute 12 common-registry tests, 10 futex-requeue tests, 7 readiness tests,
+and 7 exec tests; deterministic sequences and bounded proptests cover rollback,
+stale projections, current-binding fencing, single-terminal closure, and typed
+credit conservation. These are sequential safe-Rust reference transitions,
+not the eventual production lock/atomic scheme or an SMP proof.
+
+The pinned OSTD/QEMU successor independently executes the adapted retained
+Round 4 futex program, the adapted retained Round 5 epoll program plus a
+readiness lifecycle companion, and a retained dynamic PIE launcher/main/
+interpreter path. Those bounded observations complete four of the six core
+Linux pressure inputs when combined with `linux-hello`; runtime filesystem and
+runtime network remain pending. They do not establish a cross-service registry
+or complete Stage 6.
 
 `Commit` is the effect commit linearization point. `RevokeBegin` atomically
 closes the old authority epoch. Effects that committed first must complete or

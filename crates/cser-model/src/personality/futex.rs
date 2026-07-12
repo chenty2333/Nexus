@@ -861,7 +861,14 @@ impl FutexModel {
             return Err(FutexError::WakeBudgetExhausted);
         }
         let selected_wait = (max_wake > 0)
-            .then(|| scope.queue.front().copied())
+            .then(|| {
+                scope.queue.front().copied().filter(|wait| {
+                    self.effects.get(wait).is_some_and(|record| {
+                        record.token.authority_epoch() == binding.authority_epoch()
+                            && record.token.binding_epoch() == binding.binding_epoch()
+                    })
+                })
+            })
             .flatten();
         if let Some(wait) = selected_wait {
             let record = self

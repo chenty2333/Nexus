@@ -148,6 +148,90 @@ run_spec() {
             run_tlc "PersonalityFutexCser action properties and weak-fair kernel liveness" \
                 PersonalityFutexCser PersonalityFutexCserMC.cfg
             ;;
+        PersonalityFutexRequeueCser)
+            run_tlc "PersonalityFutexRequeueCser reject-enabled safety graph" \
+                PersonalityFutexRequeueCser PersonalityFutexRequeueCserSafetyMC.cfg
+            expect_reachable PersonalityFutexRequeueCser \
+                PersonalityFutexRequeueCserSafetyMC.cfg \
+                TwoAffectedAbsent \
+                "wake one and move one freezes Linux affected count two"
+            expect_reachable PersonalityFutexRequeueCser \
+                PersonalityFutexRequeueCserSafetyMC.cfg \
+                MoveOnlyAbsent \
+                "move-only requeue retains the waiter and returns one"
+            expect_reachable PersonalityFutexRequeueCser \
+                PersonalityFutexRequeueCserSafetyMC.cfg \
+                CurrentBindingFenceAbsent \
+                "fresh replacement cannot skip an old-binding head to migrate a current tail"
+            expect_reachable PersonalityFutexRequeueCser \
+                PersonalityFutexRequeueCserSafetyMC.cfg \
+                CommitBeforeRevokeAbsent \
+                "committed requeue drains woken and aborts moved wait at closure"
+            expect_reachable PersonalityFutexRequeueCser \
+                PersonalityFutexRequeueCserSafetyMC.cfg \
+                RevokeBeforeCommitAbsent \
+                "revocation fences requeue before any queue movement"
+            expect_reachable PersonalityFutexRequeueCser \
+                PersonalityFutexRequeueCserSafetyMC.cfg \
+                TargetWakeAbsent \
+                "target wake selects a waiter migrated from the source key"
+            run_tlc "PersonalityFutexRequeueCser action properties and weak-fair kernel liveness" \
+                PersonalityFutexRequeueCser PersonalityFutexRequeueCserMC.cfg
+            ;;
+        PersonalityReadinessCser)
+            run_tlc "PersonalityReadinessCser reject-enabled safety graph" \
+                PersonalityReadinessCser PersonalityReadinessCserSafetyMC.cfg
+            expect_reachable PersonalityReadinessCser \
+                PersonalityReadinessCserSafetyMC.cfg ReadyAbsent \
+                "readiness wins with one immutable event"
+            expect_reachable PersonalityReadinessCser \
+                PersonalityReadinessCserSafetyMC.cfg TimeoutAbsent \
+                "positive timeout wins without fabricating readiness"
+            expect_reachable PersonalityReadinessCser \
+                PersonalityReadinessCserSafetyMC.cfg RevokeAbsent \
+                "revocation wins before ready or timeout commit"
+            expect_reachable PersonalityReadinessCser \
+                PersonalityReadinessCserSafetyMC.cfg CrashAdoptAbsent \
+                "replacement adopts the exact crash cohort before commit"
+            expect_reachable PersonalityReadinessCser \
+                PersonalityReadinessCserSafetyMC.cfg LTRequeueAbsent \
+                "level-triggered readiness remains queued after selection"
+            expect_reachable PersonalityReadinessCser \
+                PersonalityReadinessCserSafetyMC.cfg OneShotDisabledAbsent \
+                "one-shot subscription disables at frozen delivery"
+            expect_reachable PersonalityReadinessCser \
+                PersonalityReadinessCserSafetyMC.cfg SourceFenceAbsent \
+                "old source generation is rejected without side effects"
+            expect_reachable PersonalityReadinessCser \
+                PersonalityReadinessCserSafetyMC.cfg CurrentBindingFenceAbsent \
+                "replacement cannot select an unadopted old-binding subscription"
+            run_tlc "PersonalityReadinessCser action properties and weak-fair kernel liveness" \
+                PersonalityReadinessCser PersonalityReadinessCserMC.cfg
+            ;;
+        PersonalityExecCser)
+            run_tlc "PersonalityExecCser reject-enabled safety graph" \
+                PersonalityExecCser PersonalityExecCserSafetyMC.cfg
+            expect_reachable PersonalityExecCser \
+                PersonalityExecCserSafetyMC.cfg CommitAbsent \
+                "one atomic exec commit publishes the complete image"
+            expect_reachable PersonalityExecCser \
+                PersonalityExecCserSafetyMC.cfg RevokeBeforeCommitAbsent \
+                "precommit revocation preserves the old image"
+            expect_reachable PersonalityExecCser \
+                PersonalityExecCserSafetyMC.cfg CrashAdoptCommitAbsent \
+                "replacement adopts transaction and segments before commit"
+            expect_reachable PersonalityExecCser \
+                PersonalityExecCserSafetyMC.cfg CommitBeforeRevokeAbsent \
+                "postcommit revocation drains without image rollback"
+            expect_reachable PersonalityExecCser \
+                PersonalityExecCserSafetyMC.cfg ReadyInvalidatedAbsent \
+                "kernel publication invalidates a stale ready proof"
+            expect_reachable PersonalityExecCser \
+                PersonalityExecCserSafetyMC.cfg StaleBindingFenceAbsent \
+                "old exec binding is rejected without side effects"
+            run_tlc "PersonalityExecCser action properties and weak-fair kernel liveness" \
+                PersonalityExecCser PersonalityExecCserMC.cfg
+            ;;
         *)
             echo "unknown CSER specification: $1" >&2
             exit 2
@@ -162,10 +246,13 @@ case $# in
         run_spec IoCser
         run_spec PersonalityCser
         run_spec PersonalityFutexCser
+        run_spec PersonalityFutexRequeueCser
+        run_spec PersonalityReadinessCser
+        run_spec PersonalityExecCser
         ;;
     1) run_spec "$1" ;;
     *)
-        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser]" >&2
+        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser]" >&2
         exit 2
         ;;
 esac
