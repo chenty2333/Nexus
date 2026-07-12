@@ -290,6 +290,16 @@ depth 15 for safety and 182 / 137 at depth 14 for three temporal branches, plus
 six witnesses. These are complete graphs only for their finite configurations;
 they do not prove the concrete Rust synchronization or Linux ABI.
 
+`RuntimeNetCser.tla` is the bounded runtime-network successor. Its fixed graph
+is `Root -> Syscall -> NetOperation -> {ReadinessWait, BufferLease}` across
+independently rebound personality, network, and readiness domains, with
+Control, Network, Readiness, and Buffer credits and distinct network,
+readiness, and guest-reply publication points. The safety graph explored
+3,698,288 generated / 720,002 distinct states at depth 42; the action graph
+explored 28,449 / 14,328 states at depth 35, checks eight temporal branches,
+and reaches eight required witnesses. It is a finite in-memory loopback model,
+not a TCP/IP, external-packet, VirtIO-net, NIC, or SMP result.
+
 `CompositionCser.tla` is the bounded system-composition successor. It places
 scheduler, pager, personality, readiness, and VirtIO effects under one root
 authority while retaining independent binding epochs and a separate VirtIO
@@ -502,10 +512,23 @@ existing real Stage 5B VirtIO receipt. That relation is explicitly component
 consistency, not same-boot or identity-preserving device composition, and the
 primary filesystem boot does not claim real DMA.
 
+The runtime-network successor supplies the sixth fixed core receipt. Its
+unchanged retained static ELF executes exactly 22 syscalls over one bounded
+in-memory IPv4 loopback listener, client, and accepted socket: setup,
+ping/pong, half-close/EOF, three closes, exact stdout, and exit. A real OSTD
+`UserMode` netd-v1 handles the first nine network operations, prepares accept,
+and page-faults; netd-v2 performs snapshot/Ready/rebind/explicit adoption,
+rejects the old binding without projection mutation, and completes the frozen
+accept plus the remaining operations. Readiness is kernel-owned, and buffer
+credit remains held until peer consumption or closure. The independent
+safe-Rust successor adds ten deterministic, two property, and four Loom gates
+covering the eight formal witness families.
+
 These are single-CPU bounded observations. They are not general futex, epoll,
-dynamic-linker, VFS/persistence, network, or SMP results. Five of six core Linux
-inputs are now observed; runtime network remains before the Linux pressure
-program can close.
+dynamic-linker, VFS/persistence, TCP breadth, external packets, VirtIO-net,
+NIC, or SMP results. All six fixed core Linux inputs now have bounded
+Checked/Observed evidence, but that is not general Linux compatibility or a
+completed cross-service composition.
 
 The follow-on composition receipt is a separate bounded checkpoint. In one
 OSTD boot, one root authority coordinates the existing scheduler, pager,
@@ -535,8 +558,10 @@ Therefore the system-wide CSER composition prototype across the five
 existing bounded domains is **Checked / Observed**, but the real device receipt
 is consistency/prerequisite evidence rather than the same composed effect. The
 prototype is single-CPU and uses a fixed six-node/five-edge causal graph. It
-adds neither runtime filesystem nor runtime network; the later filesystem
-successor is separate evidence and leaves this predecessor frozen.
+adds neither runtime filesystem nor runtime network; both later runtime
+successors are separate evidence and leave this predecessor frozen with
+`runtime_fs=false` and `runtime_net=false`. A seven-domain Linux I/O composition
+successor has not yet been implemented.
 
 ## Research gates
 
@@ -566,8 +591,8 @@ Work proceeds through evidence gates, not feature-count milestones.
    generation fencing, and conditional `Quiesced`. This admits the prototype to integrated
    validation; the hardware-general, IRQ, SMP, multi-client, domain-isolation,
    persistence, and real-deadline gaps remain open.
-5. **Linux pressure gate — Stage 6A, 6B.1, bounded Stage 6B.2, and runtime
-   filesystem slices
+5. **Linux pressure gate — Stage 6A, 6B.1, bounded Stage 6B.2, runtime
+   filesystem, and runtime network slices
    Checked / Observed; Stage 6 still in progress:** Stage 6A establishes the
    narrow scheduler + file-backed pager + post-commit `linux-hello` recovery
    path. Stage 6B.1 freezes the one-key private-futex predecessor. Stage 6B.2
@@ -578,9 +603,13 @@ Work proceeds through evidence gates, not feature-count milestones.
    expectations; Nexus does not emulate either divergence. The runtime-
    filesystem successor adds checked four-domain semantics, 15 Rust gates, an
    unchanged exact 14-syscall QEMU input, and digest-bound Stage 5B component
-   consistency. This completes five of the six bounded core inputs, not Linux
-   compatibility. Runtime network and general ABI/VFS/SMP behavior remain open.
-   Linux remains an evaluation vehicle rather than the research identity.
+   consistency. The runtime-network successor adds the checked three-domain
+   graph above, 10 + 2 + 4 Rust gates, and an unchanged exact 22-syscall QEMU
+   input with real netd crash/rebind/adopt and kernel-owned readiness. This
+   gives all six fixed core inputs bounded Checked/Observed evidence, not Linux
+   compatibility. General ABI/VFS/TCP/external-packet/VirtIO-net/NIC/SMP
+   behavior remains open. Linux remains an evaluation vehicle rather than the
+   research identity.
 6. **System-wide composition gate — bounded prototype complete / Checked and
    Observed:** `CompositionCser`, the safe-Rust/Loom successor, and the OSTD
    composition receipt agree on one root gate across scheduler, pager,
@@ -589,10 +618,11 @@ Work proceeds through evidence gates, not feature-count milestones.
    honest VirtIO timeout/retry. A strict second-log oracle checks that the independent
    Stage 5B boot supplies the required DMA/reset/IOTLB component evidence; it
    does not identify the Stage 5B effect, ticket, or generation with the
-   composition adapter. Unbounded graphs, SMP, production portals, runtime
-   network, same-boot filesystem/device identity, and a general mixed-workload
-   fault matrix remain open. The filesystem successor does not rewrite this
-   frozen five-domain predecessor.
+   composition adapter. Unbounded graphs, SMP, production portals, same-boot
+   filesystem/device identity, and a general mixed-workload fault matrix remain
+   open. The filesystem and network successors do not rewrite this frozen
+   five-domain predecessor; the seven-domain Linux I/O composition successor
+   remains unimplemented, so Stage 6/composition is not declared complete.
 7. **Engineering consolidation gate — Stage 7A complete:** the primary OSTD
    implementation is promoted from an experiment to `kernel/nexus-ostd` with
    explicit CSER/domain/personality/probe ownership; the largest independent

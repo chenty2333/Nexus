@@ -93,6 +93,20 @@ depth 29. Eight required witnesses cover both revoke/write orders, three
 service-recovery cases, both timeout stages, and all stale-token fences. This
 is a finite protocol model, not a filesystem, block driver, or DMA proof.
 
+`RuntimeNetCser.tla`, its safety/action configurations, and `RUNTIME_NET.md`
+fix the bounded runtime-network successor across independently rebound
+personality, network, and readiness domains. The fixed causal graph is
+`Root -> Syscall -> NetOperation -> {ReadinessWait, BufferLease}`; Control,
+Network, Readiness, and Buffer credits are distinct, as are `NetCommit`,
+`ReadyCommit`, and the later guest reply. Its reject-enabled safety graph has
+3,698,288 generated / 720,002 distinct states at depth 42; its action graph has
+28,449 generated / 14,328 distinct states at depth 35. Eight temporal branches
+and eight independent reachability witnesses cover publication/revoke orders,
+network-service crash/adopt, readiness/revoke orders, personality crash
+drain/abort, retained-buffer visibility, and stale-token fencing. This is a
+finite in-memory loopback protocol, not a TCP/IP stack, socket ABI, VirtIO-net,
+NIC, external-packet, or SMP proof.
+
 `CompositionCser.tla`, its safety/action configurations, and `COMPOSITION.md`
 fix the bounded Stage 6C system-wide composition contract across scheduler,
 pager, personality, readiness, and VirtIO domain registries. One root authority
@@ -107,7 +121,9 @@ retry. The complete safety and action graphs each have 1,236,504 generated /
 temporal branches and the script requires four reachability witnesses. This
 finite model does not prove arbitrary DAGs, runtime filesystem/network
 composition, parent-owned credit partitions, or asymptotic work
-proportionality.
+proportionality. Its receipt remains frozen with `runtime_fs=false` and
+`runtime_net=false`; the separate runtime successors do not retroactively widen
+it, and a seven-domain Linux I/O composition successor is not implemented.
 
 The independent pinned OSTD/QEMU refinement now supplies a bounded
 implementation observation for the same one-key contract. Its `recover` path
@@ -126,7 +142,9 @@ personality-local common registry, bounded two-key requeue, readiness, and exec
 semantics plus independent OSTD/QEMU receipts. They do not establish a registry
 shared with scheduler, pager, mediated I/O, filesystem, or network services;
 the later runtime-filesystem successor is separate from those frozen
-predecessors; runtime network and full Stage 6 remain incomplete.
+predecessors. The runtime-network successor likewise adds only separate bounded
+formal, safe-Rust, and OSTD/QEMU evidence; a seven-domain Linux I/O composition
+successor and full Stage 6 remain incomplete.
 
 ## Linearization contract
 
@@ -231,10 +249,10 @@ the history needed by the invariants instead of an unbounded event log.
 ## Run the specifications
 
 The repository entry point uses the pinned Docker image, verifies that every
-checked-in PlusCal translation is current, runs all ten checked-in TLC model
+checked-in PlusCal translation is current, runs all eleven checked-in TLC model
 families in order—baseline, pager, mediated I/O, Linux personality, private
-futex, two-key futex requeue, readiness, exec, runtime filesystem, and
-five-domain composition—and
+futex, two-key futex requeue, readiness, exec, runtime filesystem, runtime
+network, and five-domain composition—and
 writes separate logs under `target/verification/`:
 
 ```sh
@@ -250,10 +268,11 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar ./specs/cser/check.sh
 
 These commands describe implementation steps inside the container; they do not
 define a second supported host toolchain. With no argument, `check.sh` checks
-all ten families in the order above. Pass `Cser`, `PagerCser`, `IoCser`,
+all eleven families in the order above. Pass `Cser`, `PagerCser`, `IoCser`,
 `PersonalityCser`, `PersonalityFutexCser`,
 `PersonalityFutexRequeueCser`, `PersonalityReadinessCser`,
-`PersonalityExecCser`, `RuntimeFsCser`, or `CompositionCser` to run only one.
+`PersonalityExecCser`, `RuntimeFsCser`, `RuntimeNetCser`, or `CompositionCser`
+to run only one.
 To modify an algorithm, edit only its PlusCal block and regenerate the
 translation before checking:
 
@@ -268,6 +287,7 @@ java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityFutexReq
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityReadinessCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 PersonalityExecCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 RuntimeFsCser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 RuntimeNetCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 CompositionCser.tla
 ```
 
@@ -278,8 +298,8 @@ failed registration opportunity while all credits are held or spent. With
 successor results are recorded separately in `PAGER.md`, `IO.md`,
 `PERSONALITY.md`, `PERSONALITY_FUTEX.md`,
 `PERSONALITY_FUTEX_REQUEUE.md`, `PERSONALITY_READINESS.md`,
-`PERSONALITY_EXEC.md`, and `RUNTIME_FS.md`, with the composition successor
-recorded separately in `COMPOSITION.md`:
+`PERSONALITY_EXEC.md`, `RUNTIME_FS.md`, and `RUNTIME_NET.md`, with the
+composition successor recorded separately in `COMPOSITION.md`:
 
 ```text
 11,122 states generated

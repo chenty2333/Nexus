@@ -7,12 +7,15 @@ personality, readiness, and mediated-I/O effects; revocation closes their shared
 commit gate and drives every enrolled effect to one honest terminal outcome.
 
 The current checkpoint is a bounded, single-CPU system-composition prototype
-plus a bounded runtime-filesystem successor. Five of six retained Linux core
-inputs are Checked/Observed; runtime network remains open. This is not a
-production Linux personality, general or persistent filesystem, network stack,
-or proof of identity-preserving same-boot VirtIO composition. See [VISION.md](VISION.md) for
-the research claim, [ARCHITECTURE.md](ARCHITECTURE.md) for boundaries, and
-[REWORK.md](REWORK.md) for the migration ledger.
+plus separate bounded runtime-filesystem and runtime-network successors. All
+six retained Linux core inputs have bounded Checked/Observed evidence. This is
+not a production Linux personality, general or persistent filesystem, network
+stack, or proof of identity-preserving same-boot VirtIO composition. The old
+five-domain composition receipt remains frozen with `runtime_fs=false` and
+`runtime_net=false`; a seven-domain Linux I/O composition successor has not yet
+been implemented. See [VISION.md](VISION.md) for the research claim,
+[ARCHITECTURE.md](ARCHITECTURE.md) for boundaries, and [REWORK.md](REWORK.md)
+for the migration ledger.
 
 ## Requirements
 
@@ -42,10 +45,11 @@ Run the final acceptance gate with a cold image rebuild:
 NEXUS_REBUILD=1 ./x verify
 ```
 
-The cold gate runs Rust formatting/checks/Clippy/tests, ten TLA+ families, the
+The cold gate runs Rust formatting/checks/Clippy/tests, eleven TLA+ families, the
 Nexus OSTD QEMU receipt, the mediated VirtIO/reset/IOMMU QEMU receipt, positive
-and negative predecessor/filesystem composition oracles, and a fresh-evidence manifest. It can
-take tens of minutes.
+and negative predecessor/filesystem composition oracles, the runtime-network
+positive oracle and trace/artifact mutation negatives, and a fresh-evidence
+manifest. It can take tens of minutes.
 
 ## Public command contract
 

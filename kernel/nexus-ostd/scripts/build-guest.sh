@@ -19,6 +19,8 @@ raw_guests=(
     linux-futex-core-personality-v2
     linux-dynamic-personality-v1
     linux-dynamic-personality-v2
+    linux-netd-v1
+    linux-netd-v2
 )
 
 for guest in "${raw_guests[@]}"; do
@@ -74,6 +76,10 @@ assert_raw_binary \
     "$tmp/linux-dynamic-personality-v1.o" guest/linux-dynamic-personality-v1.bin 4096
 assert_raw_binary \
     "$tmp/linux-dynamic-personality-v2.o" guest/linux-dynamic-personality-v2.bin 4096
+assert_raw_binary \
+    "$tmp/linux-netd-v1.o" guest/linux-netd-v1.bin 4096
+assert_raw_binary \
+    "$tmp/linux-netd-v2.o" guest/linux-netd-v2.bin 4096
 
 personality_manifest=userspace/personality/Cargo.toml
 cargo build \
@@ -214,3 +220,5 @@ bash scripts/assert-dynamic-pie-artifacts.sh \
 bash scripts/build-round5.sh guest/linux-round5-epoll.elf
 
 bash scripts/build-runtime-fs.sh guest/linux-runtime-fs.elf
+
+bash scripts/build-runtime-net.sh guest/linux-runtime-net.elf

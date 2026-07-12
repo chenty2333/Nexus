@@ -328,12 +328,14 @@ revocation after commit drains once and never restores the old image. Unlike
 the concrete QEMU receipt, this Rust abstraction records TLS and stack as
 frozen layout metadata rather than two additional effects.
 
-The current executable suite contains 144 tests. The four Stage 6B.2 additions
-contribute 12 common-registry tests, 10 futex-requeue tests, 7 readiness tests,
-and 7 exec tests; deterministic sequences and bounded proptests cover rollback,
-stale projections, current-binding fencing, single-terminal closure, and typed
-credit conservation. These are sequential safe-Rust reference transitions,
-not the eventual production lock/atomic scheme or an SMP proof.
+Before runtime network, the executable suite contained 144 tests; the 16 new
+runtime-network gates bring the current suite to 160. The four Stage 6B.2
+additions contribute 12 common-registry tests, 10 futex-requeue tests, 7
+readiness tests, and 7 exec tests; deterministic sequences and bounded
+proptests cover rollback, stale projections, current-binding fencing,
+single-terminal closure, and typed credit conservation. These are sequential
+safe-Rust reference transitions, not the eventual production lock/atomic
+scheme or an SMP proof.
 
 The `composition` module adds the twelve system-wide successor gates: eight
 exact sequence tests, one 64-case property test, and three small Loom harnesses.
@@ -393,16 +395,34 @@ The Loom gates are bounded surrogate machines for write/revoke, completion/
 ResetAck, and timeout/retry/IOTLB ordering; they are not the OSTD lock, a block
 driver, or an SMP/DMA proof.
 
+The `runtime_net` module adds 16 independent successor gates: ten deterministic
+sequences, two bounded properties, and four Loom checks over the actual
+safe-Rust model behind an outer mutex. Its fixed graph is
+`Root -> Syscall -> NetOperation -> {ReadinessWait, BufferLease}`. Personality,
+network, and readiness bindings remain independent; Control, Network,
+Readiness, and Buffer credits are conserved; and network, readiness, and guest
+reply publication are separate. The gates cover both network/revoke orders,
+network-service crash/rebind/adopt, both readiness/revoke orders, personality
+crash drain/abort, buffer-visible/reply-absent closure, full-projection stale
+fencing, and one-shot acknowledgement. They are bounded protocol checks, not a
+production lock/atomic scheme, TCP/IP stack, external-packet path, VirtIO-net,
+NIC, or SMP proof.
+
 The pinned OSTD/QEMU successor independently executes the adapted retained
 Round 4 futex program, the adapted retained Round 5 epoll program plus a
 readiness lifecycle companion, and a retained dynamic PIE launcher/main/
 interpreter path, followed by the unchanged runtime-filesystem ELF and its
-four-domain lifecycle companion. Those bounded observations complete five of
-the six core Linux pressure inputs when combined with `linux-hello`; runtime
-network remains pending. They do not establish a production cross-service
-registry or complete Stage 6 by themselves. The frozen bounded composition
-receipt observes its fixed five-domain root gate separately; it does not absorb
-the filesystem successor or run the real VirtIO device in the same boot.
+four-domain lifecycle companion and the unchanged 22-syscall runtime-network
+ELF. The latter uses one bounded in-memory listener/client/accepted-socket
+loopback, a real OSTD `UserMode` netd-v1 page fault followed by netd-v2
+snapshot/ready/rebind/adopt, kernel-owned readiness, and exact ping/pong plus
+shutdown/EOF behavior. These observations give all six fixed Linux core inputs
+bounded Checked/Observed evidence. They do not establish a production
+cross-service registry or complete Stage 6 by themselves. The frozen bounded
+composition receipt observes its fixed five-domain root gate separately with
+`runtime_fs=false` and `runtime_net=false`; it does not absorb either successor
+or run the real VirtIO device in the same boot. A seven-domain Linux I/O
+composition successor remains unimplemented.
 
 `Commit` is the effect commit linearization point. `RevokeBegin` atomically
 closes the old authority epoch. Effects that committed first must complete or

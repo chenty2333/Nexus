@@ -19,6 +19,8 @@ COPY kernel/nexus-ostd/osdk-runner-base /tmp/nexus-ostd-inputs/osdk-runner-base
 COPY kernel/nexus-ostd/userspace/personality /tmp/nexus-ostd-inputs/personality
 COPY kernel/nexus-ostd/guest/linux-futex-core-personality-v1.S \
     kernel/nexus-ostd/guest/linux-futex-core-personality-v2.S \
+    kernel/nexus-ostd/guest/linux-netd-v1.S \
+    kernel/nexus-ostd/guest/linux-netd-v2.S \
     /tmp/nexus-ostd-inputs/guest/
 COPY kernel/nexus-ostd/scripts/build-guest.sh \
     kernel/nexus-ostd/scripts/assert-linux-elf.sh \
@@ -29,6 +31,8 @@ COPY kernel/nexus-ostd/scripts/build-guest.sh \
     kernel/nexus-ostd/scripts/build-round5.sh \
     kernel/nexus-ostd/scripts/build-runtime-fs.sh \
     kernel/nexus-ostd/scripts/assert-runtime-fs-artifacts.sh \
+    kernel/nexus-ostd/scripts/build-runtime-net.sh \
+    kernel/nexus-ostd/scripts/assert-runtime-net-artifacts.sh \
     /tmp/nexus-ostd-inputs/scripts/
 COPY tests/guest/linux/sources/linux-hello/hello.S /tmp/nexus-ostd-inputs/linux-hello.S
 COPY tests/guest/linux/sources/linux-dynamic-pie-smoke/dynamic_pie_smoke.S \
@@ -45,6 +49,8 @@ COPY tests/guest/linux/sources/linux-round5-epoll-smoke/round5_epoll_smoke.S \
     /tmp/nexus-ostd-inputs/round5_epoll_smoke.S
 COPY tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S \
     /tmp/nexus-ostd-inputs/runtime_fs_smoke.S
+COPY tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S \
+    /tmp/nexus-ostd-inputs/runtime_net_smoke.S
 COPY tests/guest/linux/adaptations/round5-epoll-linux-regular-file.patch \
     tests/guest/linux/adaptations/verify-round5-epoll-adaptation.sh \
     /tmp/nexus-ostd-inputs/round5/
@@ -62,6 +68,10 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         /tmp/nexus-ostd-source/guest/linux-futex-core-personality-v1.S \
     && cmp /tmp/nexus-ostd-inputs/guest/linux-futex-core-personality-v2.S \
         /tmp/nexus-ostd-source/guest/linux-futex-core-personality-v2.S \
+    && cmp /tmp/nexus-ostd-inputs/guest/linux-netd-v1.S \
+        /tmp/nexus-ostd-source/guest/linux-netd-v1.S \
+    && cmp /tmp/nexus-ostd-inputs/guest/linux-netd-v2.S \
+        /tmp/nexus-ostd-source/guest/linux-netd-v2.S \
     && cmp /tmp/nexus-ostd-inputs/scripts/build-guest.sh \
         /tmp/nexus-ostd-source/scripts/build-guest.sh \
     && cmp /tmp/nexus-ostd-inputs/scripts/assert-linux-elf.sh \
@@ -80,6 +90,10 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         /tmp/nexus-ostd-source/scripts/build-runtime-fs.sh \
     && cmp /tmp/nexus-ostd-inputs/scripts/assert-runtime-fs-artifacts.sh \
         /tmp/nexus-ostd-source/scripts/assert-runtime-fs-artifacts.sh \
+    && cmp /tmp/nexus-ostd-inputs/scripts/build-runtime-net.sh \
+        /tmp/nexus-ostd-source/scripts/build-runtime-net.sh \
+    && cmp /tmp/nexus-ostd-inputs/scripts/assert-runtime-net-artifacts.sh \
+        /tmp/nexus-ostd-source/scripts/assert-runtime-net-artifacts.sh \
     && rm -rf /work \
     && cp -a /tmp/nexus-ostd-source /work \
     && mkdir -p /work/target/osdk \
@@ -96,6 +110,7 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         NEXUS_ROUND5_EPOLL_PATCH=/tmp/nexus-ostd-inputs/round5/round5-epoll-linux-regular-file.patch \
         NEXUS_ROUND5_EPOLL_ORACLE=/tmp/nexus-ostd-inputs/round5/verify-round5-epoll-adaptation.sh \
         NEXUS_RUNTIME_FS_SOURCE=/tmp/nexus-ostd-inputs/runtime_fs_smoke.S \
+        NEXUS_RUNTIME_NET_SOURCE=/tmp/nexus-ostd-inputs/runtime_net_smoke.S \
         bash scripts/build-guest.sh \
     && cargo osdk check --locked \
     && bash scripts/check-fsbase-api.sh \

@@ -15,6 +15,9 @@ const REQUIRED_PATHS: &[&str] = &[
     "tools/workflow/system-composition.sh",
     "tools/workflow/runtime-fs-composition.sh",
     "specs/oracles/cser-races.toml",
+    "specs/cser/RuntimeNetCserSafetyMC.cfg",
+    "specs/cser/RuntimeNetCserMC.cfg",
+    "specs/cser/RUNTIME_NET.md",
     "tests/guest/linux/SOURCES.toml",
 ];
 

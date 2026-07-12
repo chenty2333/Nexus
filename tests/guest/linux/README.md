@@ -20,12 +20,14 @@ and success protocol while keeping these inputs as pressure tests.
 
 ## Current Stage 6 use
 
-Five of the six bounded core inputs now execute in the Docker-pinned OSTD/QEMU
+All six bounded core inputs now execute in the Docker-pinned OSTD/QEMU
 personality: `linux-hello`, an explicitly adapted Round 4 futex input, an
-explicitly adapted Round 5 epoll input, and the retained dynamic-PIE launcher,
-main, and interpreter, plus the unchanged runtime-filesystem input. Runtime
-network is still pending. These are narrow pressure receipts, not a general
-Linux-compatibility claim.
+explicitly adapted Round 5 epoll input, the retained dynamic-PIE launcher/main/
+interpreter set, the unchanged runtime-filesystem input, and the unchanged
+runtime-network input. These are narrow pressure receipts, not a general
+Linux-compatibility claim. The old five-domain composition remains frozen with
+`runtime_fs=false` and `runtime_net=false`; a seven-domain Linux I/O composition
+successor has not yet been implemented.
 
 `kernel/nexus-ostd/scripts/build-guest.sh` builds the static
 `linux-hello` `ET_EXEC` directly from the unchanged retained `hello.S`; it does
@@ -125,6 +127,28 @@ orders, and separate reset/IOTLB owner-retaining tombstones. A host oracle joins
 the source/ELF/sector/image digests to the independent real Stage 5B receipt as
 component consistency only. It does not establish a VFS, persistence, durable
 writes, real DMA in the primary boot, same-boot identity, or SMP behavior.
+
+### Retained runtime-network input audit
+
+`linux-runtime-net-smoke` is executed without source adaptation. The build gate
+fixes source SHA
+`65ba020b526fe1cbf05feef0739791a3ae6274b2ffa2b39d385ce88e1a086ecf`
+and static-ELF SHA
+`8cdd5864c07e51e91d9e0a6ec94e4d7d6438db2fbb39d513bfb7c5624d32f549`.
+Pinned one-CPU QEMU observes its exact 22-syscall success path over one bounded
+in-memory IPv4 listener, client, and accepted socket: setup and name checks,
+accept, exact four-byte ping/pong, `SHUT_WR`/EOF, three closes, stdout, and
+exit. Kernel-owned readiness and Control, Network, Readiness, and Buffer credit
+ownership remain explicit.
+
+A real OSTD `UserMode` netd-v1 completes the first nine network operations,
+prepares accept, and page-faults. Netd-v2 performs snapshot/Ready/rebind and
+explicit adoption, rejects the stale v1 binding without changing the full
+semantic projection, commits the frozen accept, and completes the remaining
+operations. Strict positive and mutation-negative oracles bind the retained
+source/ELF, exact syscall and recovery order, one-shot publication, and honest
+limitation markers. This does not establish smoltcp, real TCP breadth, external
+packets, VirtIO-net, a NIC, multiple connections/backpressure, or SMP.
 
 ## Build profiles
 

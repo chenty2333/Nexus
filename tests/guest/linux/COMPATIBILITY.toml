@@ -277,6 +277,7 @@ injection_profile = [
   "replay stale network readiness or completion after rebind",
 ]
 expected_properties = ["PostRevokeCommitExclusion", "SingleTerminalization", "CrashRebindFencing", "BudgetConservation"]
+notes = "Stage 6 executes this unchanged retained input as a digest-pinned static ELF in one-CPU OSTD/QEMU. The exact 22-syscall success path uses one bounded in-memory IPv4 listener, client, and accepted socket for setup/name checks, accept, four-byte ping/pong, SHUT_WR/EOF, three closes, stdout, and exit through the common effect registry. A real UserMode netd-v1 completes nine network operations, prepares accept, and page-faults; netd-v2 performs snapshot/Ready/rebind and explicit adoption, rejects the stale v1 binding without projection mutation, then completes the frozen accept and remaining operations. Kernel-owned readiness and Control/Network/Readiness/Buffer credits are explicit; strict positive and mutation-negative oracles bind lifecycle order and source/ELF digests. This is bounded loopback evidence, not smoltcp, real TCP breadth, external packets, VirtIO-net/NIC, multi-connection/backpressure, or SMP support."
 
 [[workload]]
 id = "linux-runtime-process-smoke"

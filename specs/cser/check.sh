@@ -270,6 +270,44 @@ run_spec() {
             run_tlc "RuntimeFsCser action properties and conditional revocation progress" \
                 RuntimeFsCser RuntimeFsCserMC.cfg
             ;;
+        RuntimeNetCser)
+            run_tlc "RuntimeNetCser three-domain reject-enabled safety graph" \
+                RuntimeNetCser RuntimeNetCserSafetyMC.cfg
+            expect_reachable RuntimeNetCser \
+                RuntimeNetCserSafetyMC.cfg \
+                LoopbackClosureAbsent \
+                "bounded loopback reaches ordered net, readiness, and guest publication before quiescent closure"
+            expect_reachable RuntimeNetCser \
+                RuntimeNetCserSafetyMC.cfg \
+                RevokeBeforeNetCommitAbsent \
+                "precommit revocation aborts the fixed graph without publication"
+            expect_reachable RuntimeNetCser \
+                RuntimeNetCserSafetyMC.cfg \
+                NetdCrashAdoptAcceptAbsent \
+                "network-service crash requires exact snapshot, ready, rebind, and explicit cohort adoption"
+            expect_reachable RuntimeNetCser \
+                RuntimeNetCserSafetyMC.cfg \
+                ReadinessBeforeRevokeAbsent \
+                "readiness commit can win before revocation while guest reply stays absent"
+            expect_reachable RuntimeNetCser \
+                RuntimeNetCserSafetyMC.cfg \
+                RevokeBeforeReadinessAbsent \
+                "revocation can fence readiness publication after the network commit"
+            expect_reachable RuntimeNetCser \
+                RuntimeNetCserSafetyMC.cfg \
+                PersonalityCrashDrainAbortAbsent \
+                "personality crash drains a committed reply and aborts an uncommitted sibling"
+            expect_reachable RuntimeNetCser \
+                RuntimeNetCserSafetyMC.cfg \
+                BufferVisibleReplyAbsentAbsent \
+                "network-visible buffer can remain live while guest reply is absent"
+            expect_reachable RuntimeNetCser \
+                RuntimeNetCserSafetyMC.cfg \
+                StaleTokenFencesAbsent \
+                "authority, binding, socket, and source generations reject without mutation"
+            run_tlc "RuntimeNetCser action properties and conditional revocation progress" \
+                RuntimeNetCser RuntimeNetCserMC.cfg
+            ;;
         CompositionCser)
             run_tlc "CompositionCser five-domain safety graph" \
                 CompositionCser CompositionCserSafetyMC.cfg
@@ -310,11 +348,12 @@ case $# in
         run_spec PersonalityReadinessCser
         run_spec PersonalityExecCser
         run_spec RuntimeFsCser
+        run_spec RuntimeNetCser
         run_spec CompositionCser
         ;;
     1) run_spec "$1" ;;
     *)
-        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|RuntimeFsCser|CompositionCser]" >&2
+        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|RuntimeFsCser|RuntimeNetCser|CompositionCser]" >&2
         exit 2
         ;;
 esac

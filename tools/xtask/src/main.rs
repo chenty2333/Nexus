@@ -34,7 +34,7 @@ const TRACE_ACTIONS: [&str; 9] = [
     "Complete",
 ];
 
-const TLA_SPECS: [&str; 10] = [
+const TLA_SPECS: [&str; 11] = [
     "Cser",
     "PagerCser",
     "IoCser",
@@ -44,6 +44,7 @@ const TLA_SPECS: [&str; 10] = [
     "PersonalityReadinessCser",
     "PersonalityExecCser",
     "RuntimeFsCser",
+    "RuntimeNetCser",
     "CompositionCser",
 ];
 
@@ -389,6 +390,7 @@ fn spec(root: &Path) -> Result<()> {
                 // a cold/shared-host run from being mislabeled as a failure.
                 "IoCser" => 1_800,
                 "RuntimeFsCser" => 900,
+                "RuntimeNetCser" => 900,
                 "CompositionCser" => 600,
                 _ => 300,
             }),
@@ -567,6 +569,7 @@ fn pluscal_translation_is_current(
             | "PersonalityReadinessCser"
             | "PersonalityExecCser"
             | "RuntimeFsCser"
+            | "RuntimeNetCser"
             | "CompositionCser"
     ) {
         "10000"

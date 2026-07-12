@@ -17,9 +17,14 @@ changing the established crate-root API:
 - `personality/` owns bounded Linux compatibility-pressure harnesses;
 - `probes/` records platform feasibility boundaries.
 
-The Linux and QEMU paths remain bounded evidence harnesses. Their presence in
-the formal prototype does not turn Linux compatibility into Nexus's research
-identity or claim runtime filesystem/network support.
+The Linux and QEMU paths remain bounded evidence harnesses. All six fixed Linux
+core inputs now have bounded Checked/Observed receipts, including the separate
+runtime-filesystem and runtime-network successors. Their presence in the
+formal prototype does not turn Linux compatibility into Nexus's research
+identity or claim general filesystem, TCP/IP, external-packet, VirtIO-net/NIC,
+or SMP support. The historical five-domain composition receipt still has
+`runtime_fs=false` and `runtime_net=false`; the seven-domain Linux I/O
+composition successor is not implemented.
 
 Use only the repository-root `./x` as the public developer interface. The
 private `nexus-ostd/x` entrypoint is a backend retained for isolation and

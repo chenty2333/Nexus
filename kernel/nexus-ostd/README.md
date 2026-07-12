@@ -54,8 +54,9 @@ The generated OSDK runner snapshot intentionally keeps its upstream byte
 layout and remains byte-for-byte guarded by every build. The serial transcript is written to
 `artifacts/serial.log`; `scripts/assert-serial.sh` verifies the scheduler,
 pager, Stage 6A personality, both futex slices, readiness lifecycle, adapted
-Round 5 epoll, system composition, and fail-closed IOMMU receipts. It invokes
-strict Round 4, epoll, and composition parsers plus negative trace mutations.
+Round 5 epoll, runtime filesystem, runtime network, system composition, and
+fail-closed IOMMU receipts. It invokes strict Round 4, epoll, filesystem,
+network, and composition parsers plus negative trace/artifact mutations.
 `assert-linux-dynamic.awk`
 independently fixes the dynamic exec/adoption trace and rejects a duplicate
 PASS, a fabricated second ExecCommit, or Snapshot/Ready reordering. Raw
@@ -443,6 +444,44 @@ sector FNV, and full readonly-image SHA
 This is `component_consistency`, with `same_boot=false` and
 `identity_preserving=false`; it is not a general or persistent filesystem.
 
+### Bounded runtime network
+
+The Stage 6 runtime-network successor builds the unchanged retained
+`runtime_net_smoke.S` into a static x86-64 `ET_EXEC`. The fail-closed build
+fixes source SHA
+`65ba020b526fe1cbf05feef0739791a3ae6274b2ffa2b39d385ce88e1a086ecf`
+and artifact SHA
+`8cdd5864c07e51e91d9e0a6ec94e4d7d6438db2fbb39d513bfb7c5624d32f549`,
+and rejects source/artifact mutation, dynamic dependencies, relocations,
+executable stack, W+X, or other ELF structural drift.
+
+Its independent `RuntimeNetCser` counterpart checks 3,698,288 generated /
+720,002 distinct states at depth 42 for safety and 28,449 / 14,328 at depth 35
+for the action graph, with eight temporal branches and eight witnesses. The
+safe-Rust oracle separately contributes ten deterministic, two property, and
+four Loom gates over Control, Network, Readiness, and Buffer credits.
+
+Pinned one-CPU QEMU executes exactly 22 Linux syscalls through real OSTD
+`UserMode`. One bounded in-memory IPv4 loopback listener, client, and accepted
+socket cover `socket`, options, bind/name/listen, connect/peer, accept, exact
+four-byte ping/pong, `SHUT_WR`/EOF, three closes, exact stdout, and exit. The
+common registry separates commit, guest-memory publication, acknowledgement,
+kernel-owned readiness, and Buffer credit ownership.
+
+A separate real OSTD `UserMode` netd-v1 completes the first nine network
+operations, prepares accept, and takes a page fault before its commit. Netd-v2
+performs snapshot/Ready/rebind, explicitly adopts the frozen accept and
+readiness effects, rejects the stale v1 binding with the full state projection
+unchanged, then commits accept and completes the remaining operations. Strict
+positive and negative oracles bind the exact call/lifecycle order, source and
+ELF digests, readiness/buffer witnesses, and limitation markers.
+
+This is a bounded in-memory loopback, not smoltcp, real TCP breadth, external
+packets, VirtIO-net, a NIC, multi-connection/backpressure behavior, or SMP. The
+old composition receipt below remains frozen with `runtime_fs=false` and
+`runtime_net=false`; the seven-domain Linux I/O composition successor is not
+implemented.
+
 ### Bounded system-wide CSER composition
 
 The follow-on composition slice installs one root authority over five existing
@@ -487,8 +526,9 @@ production services and real device DMA.
 The receipt is one CPU with a fixed six-node/five-edge graph. This frozen
 predecessor does not add runtime filesystem or network, SMP composition, a production opaque authority
 transport, a parameterized fault matrix, `k/N` curves, overhead evaluation, or
-a final originality judgment. The separate filesystem successor above does not
-retroactively change its `runtime_fs=false` receipt.
+a final originality judgment. The separate filesystem and network successors
+above do not retroactively change its `runtime_fs=false` / `runtime_net=false`
+receipt; the seven-domain Linux I/O successor remains open.
 
 ## IOMMU result: fail closed
 

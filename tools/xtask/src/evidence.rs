@@ -374,6 +374,13 @@ fn write_authorized(
             evidence: vec![String::from("kernel/nexus-ostd/artifacts/serial.log")],
         },
         Stage {
+            id: "ostd-runtime-network",
+            evidence: vec![
+                String::from("kernel/nexus-ostd/artifacts/serial.log"),
+                String::from("target/verification/runtime-net-oracle.log"),
+            ],
+        },
+        Stage {
             id: "mediated-virtio",
             evidence: vec![
                 String::from("experiments/ostd-virtio-cser-spike/artifacts/kernel.log"),
@@ -414,7 +421,7 @@ fn write_authorized(
             cross_fd_total_order_claimed: false,
             identity_preserving_stage5b_composition: false,
             runtime_filesystem: true,
-            runtime_network: false,
+            runtime_network: true,
         },
         specifications: specs.iter().map(|spec| String::from(*spec)).collect(),
         stages,
@@ -719,6 +726,10 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
         (
             String::from("target/verification/runtime-fs-composition-oracle.log"),
             Some("RUNTIME_FS_COMPOSITION PASS"),
+        ),
+        (
+            String::from("target/verification/runtime-net-oracle.log"),
+            Some("RUNTIME_NET_ORACLE PASS"),
         ),
     ]
 }

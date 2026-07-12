@@ -27,6 +27,8 @@ mod linux_futex;
 mod linux_futex_core;
 #[path = "personality/linux_loader.rs"]
 mod linux_loader;
+#[path = "personality/linux_net.rs"]
+mod linux_net;
 #[path = "personality/linux_pager.rs"]
 mod linux_pager;
 #[path = "personality/linux_runtime.rs"]
@@ -379,6 +381,7 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     linux_epoll::run_linux_epoll_slice();
     linux_dynamic::run_linux_dynamic_slice();
     linux_fs::run_linux_fs_slice();
+    linux_net::run_linux_net_slice();
     composition::run_composition_slice(scheduler, pager_receipt);
     assert_eq!(
         scheduler.propose(old_binding, USER_TASK_ID),

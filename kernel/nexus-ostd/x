@@ -27,6 +27,7 @@ image_key=$(sha256sum \
     "$repo_root/tests/guest/linux/adaptations/round5-epoll-linux-regular-file.patch" \
     "$repo_root/tests/guest/linux/adaptations/verify-round5-epoll-adaptation.sh" \
     "$repo_root/tests/guest/linux/sources/linux-runtime-fs-smoke/runtime_fs_smoke.S" \
+    "$repo_root/tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S" \
     "$root/Cargo.toml" \
     "$root/Cargo.lock" \
     "$root/OSDK.toml" \
@@ -46,6 +47,8 @@ image_key=$(sha256sum \
     "$root/scripts/build-round5.sh" \
     "$root/scripts/build-runtime-fs.sh" \
     "$root/scripts/assert-runtime-fs-artifacts.sh" \
+    "$root/scripts/build-runtime-net.sh" \
+    "$root/scripts/assert-runtime-net-artifacts.sh" \
     "$root/guest/linux-futex-shared.S" \
     "$root/guest/linux-futex-personality-v1.S" \
     "$root/guest/linux-futex-personality-v2.S" \
@@ -53,6 +56,8 @@ image_key=$(sha256sum \
     "$root/guest/linux-dynamic-personality-v2.S" \
     "$root/guest/linux-futex-core-personality-v1.S" \
     "$root/guest/linux-futex-core-personality-v2.S" \
+    "$root/guest/linux-netd-v1.S" \
+    "$root/guest/linux-netd-v2.S" \
     "$root/userspace/personality/.cargo/config.toml" \
     "$root/userspace/personality/Cargo.toml" \
     "$root/userspace/personality/Cargo.lock" \
@@ -95,7 +100,7 @@ ensure_image() {
 
 doctor() {
     local tool
-    for tool in awk bash chmod cp cut diff docker flock grep id mkdir rm sed sha256sum tee; do
+    for tool in awk bash chmod cp cut diff dirname docker flock grep id mkdir mktemp mv rm sed sha256sum tee; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             echo "nexus-ostd doctor: missing host tool: $tool" >&2
             return 1
@@ -113,7 +118,14 @@ doctor() {
         "$root/osdk-runner-base/Cargo.lock" \
         "$root/osdk-runner-base/Cargo.toml" \
         "$root/scripts/assert-serial.sh" \
+        "$root/scripts/assert-linux-net.awk" \
+        "$root/scripts/assert-runtime-net-artifacts.sh" \
         "$root/scripts/build-guest.sh" \
+        "$root/scripts/build-runtime-net.sh" \
+        "$root/scripts/check-linux-net-evidence.sh" \
+        "$root/guest/linux-netd-v1.S" \
+        "$root/guest/linux-netd-v2.S" \
+        "$repo_root/tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S" \
         "$root/scripts/check-scheduler-attempt.sh"; do
         if [[ ! -f $input ]]; then
             echo "nexus-ostd doctor: missing pinned input: $input" >&2
@@ -189,6 +201,56 @@ check_runtime_fs_artifact_negatives() {
             exit 1
         fi
         echo "runtime filesystem artifact negative assertions: PASS appended_elf=rejected mutated_source=rejected wrong_digest=rejected failed_output_absent=true"
+    '
+}
+
+check_runtime_net_artifact_negatives() {
+    container bash -c '
+        set -euo pipefail
+        tmp=$(mktemp -d)
+        trap '\''rm -rf "$tmp"'\'' EXIT
+        source=/repo/tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S
+        oracle=scripts/assert-runtime-net-artifacts.sh
+
+        cp guest/linux-runtime-net.elf "$tmp/appended.elf"
+        printf x >>"$tmp/appended.elf"
+        if bash "$oracle" "$source" "$tmp/appended.elf" >/dev/null 2>&1; then
+            echo "runtime network artifact oracle accepted appended ELF bytes" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/mutated.S"
+        printf "\n" >>"$tmp/mutated.S"
+        if bash "$oracle" "$tmp/mutated.S" guest/linux-runtime-net.elf >/dev/null 2>&1; then
+            echo "runtime network artifact oracle accepted mutated retained source" >&2
+            exit 1
+        fi
+
+        if bash scripts/build-runtime-net.sh "$tmp/wrong-digest.elf" \
+            0000000000000000000000000000000000000000000000000000000000000000 \
+            >/dev/null 2>&1; then
+            echo "runtime network build accepted wrong expected digest" >&2
+            exit 1
+        fi
+        if [[ -e $tmp/wrong-digest.elf ]]; then
+            echo "runtime network build published an artifact after digest failure" >&2
+            exit 1
+        fi
+
+        cp guest/linux-runtime-net.elf "$tmp/preserved.elf"
+        preserved_before=$(sha256sum "$tmp/preserved.elf" | cut -d " " -f1)
+        if bash scripts/build-runtime-net.sh "$tmp/preserved.elf" \
+            0000000000000000000000000000000000000000000000000000000000000000 \
+            >/dev/null 2>&1; then
+            echo "runtime network build replaced an existing artifact with a wrong expected digest" >&2
+            exit 1
+        fi
+        preserved_after=$(sha256sum "$tmp/preserved.elf" | cut -d " " -f1)
+        if [[ $preserved_after != "$preserved_before" ]]; then
+            echo "runtime network build changed an existing artifact after digest failure" >&2
+            exit 1
+        fi
+        echo "runtime network artifact negative assertions: PASS appended_elf=rejected mutated_source=rejected wrong_digest=rejected failed_output_absent=true failed_rebuild_preserved=true"
     '
 }
 
@@ -296,6 +358,7 @@ case "$command" in
         check_oracles
         prepare_guest
         check_runtime_fs_artifact_negatives
+        check_runtime_net_artifact_negatives
         check_kernel
         check_personality
         clippy_all
@@ -324,12 +387,16 @@ case "$command" in
         ensure_image
         prepare_guest
         check_runtime_fs_artifact_negatives
+        check_runtime_net_artifact_negatives
         mkdir -p "$root/artifacts"
         container bash scripts/check-iotlb-gap.sh
         run_kernel | tee "$root/artifacts/serial.log"
         "$root/scripts/assert-serial.sh" "$root/artifacts/serial.log"
         awk -f "$root/scripts/assert-linux-dynamic.awk" "$root/artifacts/serial.log"
         awk -f "$root/scripts/assert-linux-fs.awk" "$root/artifacts/serial.log"
+        bash "$root/scripts/check-linux-net-evidence.sh" \
+            "$root/artifacts/serial.log" \
+            "$repo_root/target/verification/runtime-net-oracle.log"
         if sed 's/exec_commits=1/exec_commits=2/' "$root/artifacts/serial.log" \
             | awk -f "$root/scripts/assert-linux-dynamic.awk" >/dev/null 2>&1; then
             echo 'dynamic PIE oracle accepted exec_commits=2 mutation' >&2
@@ -397,6 +464,7 @@ case "$command" in
         # Do not make cleanup depend on Docker or on a prebuilt image.
         rm -rf "$root/target" "$root/artifacts" "$root/userspace/personality/target"
         rm -f "$root"/guest/*.bin "$root"/guest/*.elf
+        rm -f "$repo_root/target/verification/runtime-net-oracle.log"
         ;;
     *)
         echo "usage: ./x {doctor|image|fmt|check|clippy|build|iommu-probe|run|test|clean}" >&2
