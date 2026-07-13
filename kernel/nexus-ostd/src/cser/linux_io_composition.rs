@@ -1257,6 +1257,9 @@ pub(crate) fn run_linux_io_composition_slice(
     assert_eq!(fs_receipt.final_authority_epoch, 142);
     assert_eq!(fs_receipt.terminalizations, 14);
     assert_eq!(fs_receipt.publication_acks, 14);
+    assert_eq!(fs_receipt.production_effects, 16);
+    assert_eq!(fs_receipt.production_domains, 3);
+    assert!(fs_receipt.preparation_identity_observed);
     assert!(fs_receipt.quiescent);
     assert_eq!(
         fs_receipt.source_sha256,

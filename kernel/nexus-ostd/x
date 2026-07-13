@@ -72,6 +72,13 @@ image_key=$(sha256sum \
     "$repo_root/crates/cser-transition-gates/src/scheduler.rs" \
     "$repo_root/crates/cser-transition-gates/src/pager.rs" \
     "$repo_root/crates/cser-transition-gates/src/io.rs" \
+    "$repo_root/crates/nexus-ostd-virtio/Cargo.toml" \
+    "$repo_root/crates/nexus-ostd-virtio/Cargo.lock" \
+    "$repo_root/crates/nexus-ostd-virtio/README.md" \
+    "$repo_root/crates/nexus-ostd-virtio/src/lib.rs" \
+    "$repo_root/crates/nexus-ostd-virtio/src/dma.rs" \
+    "$repo_root/crates/nexus-ostd-virtio/src/pci.rs" \
+    "$repo_root/crates/nexus-ostd-virtio/src/portal.rs" \
     "$root/src/cser/effect_registry.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/nexus-ostd:$image_key"
 runner_base="$root/osdk-runner-base"
@@ -100,6 +107,7 @@ container() {
         -v "$root:/work:z" \
         -v "$repo_root:/repo:ro,z" \
         -v "$repo_root/crates/cser-transition-gates:/crates/cser-transition-gates:ro,z" \
+        -v "$repo_root/crates/nexus-ostd-virtio:/crates/nexus-ostd-virtio:ro,z" \
         --mount "type=bind,source=$root/src/cser/effect_registry.rs,target=/kernel/nexus-ostd/src/cser/effect_registry.rs,readonly" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         --mount "type=bind,source=$root/userspace/personality/Cargo.lock,target=/work/userspace/personality/Cargo.lock,readonly" \
@@ -221,6 +229,11 @@ check_runtime_fs_artifact_negatives() {
         fi
         echo "runtime filesystem artifact negative assertions: PASS appended_elf=rejected mutated_source=rejected wrong_digest=rejected failed_output_absent=true"
     '
+}
+
+check_runtime_fs_production_source() {
+    bash "$root/scripts/assert-linux-fs-production-source.sh" \
+        "$root/src/personality/linux_fs.rs"
 }
 
 check_runtime_net_artifact_negatives() {
@@ -437,6 +450,7 @@ case "$command" in
         ensure_image
         fmt_check
         check_oracles
+        check_runtime_fs_production_source
         prepare_guest
         check_runtime_fs_artifact_negatives
         check_runtime_net_artifact_negatives
@@ -466,6 +480,7 @@ case "$command" in
         ;;
     test)
         ensure_image
+        check_runtime_fs_production_source
         prepare_guest
         check_runtime_fs_artifact_negatives
         check_runtime_net_artifact_negatives
@@ -525,6 +540,27 @@ case "$command" in
             echo 'runtime filesystem oracle accepted ELF digest mutation' >&2
             exit 1
         fi
+        if sed \
+            's/block_preparation_sha256=e3229d40/block_preparation_sha256=f3229d40/' \
+            "$root/artifacts/serial.log" \
+            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
+            echo 'runtime filesystem oracle accepted block-preparation digest mutation' >&2
+            exit 1
+        fi
+        if sed \
+            's/foreign_receipt_accepted=false/foreign_receipt_accepted=true/' \
+            "$root/artifacts/serial.log" \
+            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
+            echo 'runtime filesystem oracle accepted foreign registry receipt' >&2
+            exit 1
+        fi
+        if sed \
+            's/device_commit=false avail_idx_release=false/device_commit=true avail_idx_release=true/' \
+            "$root/artifacts/serial.log" \
+            | awk -f "$root/scripts/assert-linux-fs.awk" >/dev/null 2>&1; then
+            echo 'runtime filesystem oracle accepted Phase-2 device commit escalation' >&2
+            exit 1
+        fi
         if awk '
             { lines[NR] = $0 }
             /^FILESYSTEM_LIFECYCLE PwriteRace winner=commit / { commit_first = NR }
@@ -541,7 +577,7 @@ case "$command" in
             echo 'runtime filesystem oracle accepted pwrite witness reordering' >&2
             exit 1
         fi
-        echo 'runtime filesystem serial negative assertions: PASS syscall_count=rejected duplicate_pass=rejected elf_digest=rejected pwrite_order=rejected'
+        echo 'runtime filesystem serial negative assertions: PASS syscall_count=rejected duplicate_pass=rejected elf_digest=rejected preparation_digest=rejected foreign_registry_receipt=rejected device_commit_escalation=rejected pwrite_order=rejected'
         ;;
     eval-stage7b)
         ensure_image

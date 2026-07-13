@@ -4,11 +4,13 @@
 //!
 //! The unchanged guest executes as a real ELF in OSTD `UserMode`.  Linux path,
 //! fd, stat, procfs, and offset-I/O policy remains a deliberately tiny
-//! in-memory personality service.  Every syscall continuation is owned by the
-//! common effect registry and crosses its commit gate before domain state is
-//! mutated.  The block lifecycle companion is semantic evidence only: the
-//! real mediated VirtIO/IOMMU receipt is produced by the independent Stage 5B
-//! boot and is joined by the host oracle as component consistency.
+//! in-memory personality service.  One workload-owned production root and its
+//! typed ledger now retain the real first executable `pread64` identity through
+//! `FilesystemSyscall -> FilesystemRead -> BlockRequest`, including a bounded
+//! filesystem crash/rebind/adopt before preparation-only block closure. The
+//! prepared adapter remains deterministic and in memory: real mediated
+//! VirtIO/IOMMU evidence is still produced by the independent Stage 5B boot
+//! and joined by the host oracle as component consistency only.
 
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 
@@ -30,24 +32,44 @@ use crate::{
     effect::{EffectToken, EffectWaiter, EffectWaker},
     effect_registry::{
         CommitMetadata, CommitOutcome, CommitReceipt, CreditCharge, CreditClass, CreditLimit,
-        EffectRegistry, OperationClass, PublicationMode, PublicationTicket, RegisterRequest,
-        RegisteredEffect, RegistryError, ResourceKey, RevokeDisposition, ScopeConfig, ScopeKey,
-        ScopePhase, SyscallDescriptor, TaskKey, TerminalRequest,
+        DerivedRegisterRequest, DomainConfig, DomainKey, EffectRegistry, OperationClass,
+        PortalHandle, PublicationMode, PublicationTicket, RegisterRequest, RegisteredEffect,
+        RegistryError, ResourceKey, RevokeDisposition, ScopeConfig, ScopeKey, ScopePhase,
+        SyscallDescriptor, TaskKey, TerminalRequest,
     },
     linux_loader::load_static_image_with_stack_pages,
 };
 
 const SCOPE: ScopeKey = ScopeKey::new(95, 1);
 const GUEST: TaskKey = TaskKey::new(950, 1);
+const ROOT_OWNER: TaskKey = TaskKey::new(954, 1);
+const PERSONALITY_V1: TaskKey = TaskKey::new(952, 1);
 const FILESYSTEM_V1: TaskKey = TaskKey::new(951, 1);
+const FILESYSTEM_V2: TaskKey = TaskKey::new(951, 2);
+const BLOCK_V1: TaskKey = TaskKey::new(953, 1);
 const AUTHORITY_EPOCH: u64 = 141;
-const FILESYSTEM_BINDING_EPOCH: u64 = 1;
-const SYSCALL_CREDIT: CreditClass = CreditClass::new(1);
+const ROOT_BINDING_EPOCH: u64 = 1;
+const PERSONALITY_DOMAIN: DomainKey = DomainKey::new(1);
+const FILESYSTEM_DOMAIN: DomainKey = DomainKey::new(2);
+const BLOCK_DOMAIN: DomainKey = DomainKey::new(3);
+const CONTROL_CREDIT: CreditClass = CreditClass::new(0x301);
+const FILESYSTEM_OP_CREDIT: CreditClass = CreditClass::new(0x302);
+const QUEUE_SLOT_CREDIT: CreditClass = CreditClass::new(0x303);
+const PINNED_PAGE_CREDIT: CreditClass = CreditClass::new(0x304);
+const DMA_MAPPING_CREDIT: CreditClass = CreditClass::new(0x305);
+const GUEST_REPLY_CREDIT: CreditClass = CreditClass::new(0x306);
+const BLOCK_PREPARATION_CREDIT: CreditClass = CreditClass::new(0x307);
 const OP_SYSCALL: OperationClass = OperationClass::new(1);
+const OP_FILESYSTEM_READ: OperationClass = OperationClass::new(0x302);
+const OP_BLOCK_REQUEST: OperationClass = OperationClass::new(0x303);
 const PROCESS_RESOURCE: ResourceKey = ResourceKey::new(0x7100, 1, 1);
 const EXEC_INODE_RESOURCE: ResourceKey = ResourceKey::new(0x7101, 1, 1);
 const TMP_INODE_RESOURCE: ResourceKey = ResourceKey::new(0x7101, 2, 1);
 const PROC_INODE_RESOURCE: ResourceKey = ResourceKey::new(0x7101, 3, 1);
+const GUEST_REPLY_RESOURCE: ResourceKey = ResourceKey::new(0x7300, 1, 1);
+const FILESYSTEM_READ_RESOURCE: ResourceKey = ResourceKey::new(0x7301, 1, 1);
+const BLOCK_REQUEST_RESOURCE: ResourceKey = ResourceKey::new(0x7302, 1, 1);
+const BLOCK_PREPARATION_RESOURCE: ResourceKey = ResourceKey::new(0x7306, 1, 1);
 
 const LIFECYCLE_PRECOMMIT_SCOPE: ScopeKey = ScopeKey::new(96, 1);
 const LIFECYCLE_POSTCOMMIT_SCOPE: ScopeKey = ScopeKey::new(97, 1);
@@ -71,6 +93,12 @@ const EXPECTED_SOURCE_SHA256: &str =
     "c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f";
 const EXPECTED_ELF_SHA256: &str =
     "0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef";
+const FIRST_PREAD_INPUT_SHA256: &str =
+    "a101969acc8dac3209f8be33a5d070e5972fc82f49f5ef85e28db576068024fc";
+const FIRST_PREAD_PAYLOAD_SHA256: &str =
+    "3bdbb4fe8397cd2b842430b39ccff01a8663c751945ef5e9a09e267fb8b1d359";
+const BLOCK_PREPARATION_SHA256: &str =
+    "e3229d4050798eedcd6503e8b44c3e6bad6d1c105f07f79d3f4fbb04925f1f14";
 const STAGE5B_SECTOR_SHA256: &str =
     "9cb83be92a4c9239752718e6e20ac00fe9e32842ea561ae7fedec94b620a05cc";
 const STAGE5B_IMAGE_SHA256: &str =
@@ -86,11 +114,25 @@ const REGULAR_MODE: u16 = 0x81a4;
 const STATX_BYTES: usize = 256;
 const STAT_BYTES: usize = 144;
 
+const FIRST_PREAD_INPUT_BYTES: &[u8] =
+    b"pread64\nfd=3\npath=/bin/linux-runtime-fs-smoke\noffset=0\nlength=4\n";
+const BLOCK_PREPARATION_BYTES: &[u8] = b"nexus-cser-block-preparation-v1\n\
+inode=0x7101:1:1\n\
+block=0\n\
+offset=0\n\
+length=4\n\
+queue=0\n\
+writable=false\n";
+const FIRST_PREAD_INPUT_FNV1A: u64 = 0x1db8_ca9f_0603_7aaa;
+const FIRST_PREAD_PAYLOAD_FNV1A: u64 = 0x28b2_6538_2f12_49f3;
+const BLOCK_PREPARATION_FNV1A: u64 = 0xfbde_9edc_fd5f_41c8;
+
 const RUNTIME_FS_ELF: &[u8] = include_bytes!("../../guest/linux-runtime-fs.elf");
 
-/// Read-only prerequisite proving that the retained filesystem workload
-/// completed earlier in this boot.  No registry handle or effect identity is
-/// exported: the Linux I/O composition successor creates a fresh root cohort.
+/// Read-only receipt proving that the retained filesystem workload completed
+/// its own production root. No live handle is exported after root closure; the
+/// historical Linux I/O composition successor remains a distinct non-identity-
+/// preserving cohort and may not reuse this receipt as authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFsSliceReceipt {
     pub(crate) scope: ScopeKey,
@@ -98,6 +140,9 @@ pub(crate) struct RuntimeFsSliceReceipt {
     pub(crate) final_authority_epoch: u64,
     pub(crate) terminalizations: usize,
     pub(crate) publication_acks: usize,
+    pub(crate) production_effects: usize,
+    pub(crate) production_domains: usize,
+    pub(crate) preparation_identity_observed: bool,
     pub(crate) quiescent: bool,
     pub(crate) source_sha256: &'static str,
     pub(crate) elf_sha256: &'static str,
@@ -118,31 +163,88 @@ struct FsState {
     next_fd: i32,
     domain_revision: u64,
     syscall_terminalizations: usize,
+    production_effects: usize,
+    production_read_observed: bool,
     stdout_publications: usize,
     exited: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProductionReadReceipt {
+    syscall_effect: u64,
+    filesystem_effect: u64,
+    block_effect: u64,
+    filesystem_old_binding: u64,
+    filesystem_new_binding: u64,
+    block_terminal_sequence: u64,
+    filesystem_commit_sequence: u64,
+    filesystem_terminal_sequence: u64,
+}
+
+struct PreparedProductionRead {
+    syscall_effect: u64,
+    filesystem: RegisteredEffect,
+    adopted_filesystem: PortalHandle,
+    block: RegisteredEffect,
+    block_descriptor: SyscallDescriptor,
+    filesystem_old_binding: u64,
+    filesystem_new_binding: u64,
+}
+
+fn new_production_registry() -> EffectRegistry {
+    let mut effects = EffectRegistry::new();
+    effects
+        .create_scope(ScopeConfig {
+            key: SCOPE,
+            authority_epoch: AUTHORITY_EPOCH,
+            binding_epoch: ROOT_BINDING_EPOCH,
+            supervisor: ROOT_OWNER,
+            credits: vec![
+                CreditLimit::new(CONTROL_CREDIT, 1),
+                CreditLimit::new(FILESYSTEM_OP_CREDIT, 1),
+                CreditLimit::new(QUEUE_SLOT_CREDIT, 1),
+                CreditLimit::new(PINNED_PAGE_CREDIT, 1),
+                CreditLimit::new(DMA_MAPPING_CREDIT, 1),
+                CreditLimit::new(GUEST_REPLY_CREDIT, 1),
+                CreditLimit::new(BLOCK_PREPARATION_CREDIT, 1),
+            ],
+        })
+        .unwrap();
+    for config in [
+        DomainConfig {
+            key: PERSONALITY_DOMAIN,
+            binding_epoch: 1,
+            supervisor: PERSONALITY_V1,
+        },
+        DomainConfig {
+            key: FILESYSTEM_DOMAIN,
+            binding_epoch: 1,
+            supervisor: FILESYSTEM_V1,
+        },
+        DomainConfig {
+            key: BLOCK_DOMAIN,
+            binding_epoch: 1,
+            supervisor: BLOCK_V1,
+        },
+    ] {
+        effects.add_domain(SCOPE, config).unwrap();
+    }
+    effects
+}
+
 impl FsState {
     fn new() -> Self {
-        let mut effects = EffectRegistry::new();
-        effects
-            .create_scope(ScopeConfig {
-                key: SCOPE,
-                authority_epoch: AUTHORITY_EPOCH,
-                binding_epoch: FILESYSTEM_BINDING_EPOCH,
-                supervisor: FILESYSTEM_V1,
-                credits: vec![CreditLimit::new(SYSCALL_CREDIT, 1)],
-            })
-            .unwrap();
         let mut fds = BTreeMap::new();
         fds.insert(1, FdKind::Stdout);
         Self {
-            effects,
+            effects: new_production_registry(),
             fds,
             temporary: Vec::new(),
             next_fd: 3,
             domain_revision: 0,
             syscall_terminalizations: 0,
+            production_effects: 0,
+            production_read_observed: false,
             stdout_publications: 0,
             exited: false,
         }
@@ -154,28 +256,382 @@ impl FsState {
         resources: Vec<ResourceKey>,
     ) -> RegisteredEffect {
         assert!(self.effects.effects_for_task(GUEST).is_empty());
-        self.effects
-            .register(RegisterRequest {
-                scope: SCOPE,
-                task: GUEST,
-                operation: OP_SYSCALL,
-                descriptor,
-                resources,
-                credits: vec![CreditCharge::new(SYSCALL_CREDIT, 1)],
-                publication: PublicationMode::Required,
+        let mut resources = resources;
+        resources.push(GUEST_REPLY_RESOURCE);
+        let registered = self
+            .effects
+            .register_derived(DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: GUEST,
+                    operation: OP_SYSCALL,
+                    descriptor,
+                    resources,
+                    credits: vec![
+                        CreditCharge::new(CONTROL_CREDIT, 1),
+                        CreditCharge::new(GUEST_REPLY_CREDIT, 1),
+                    ],
+                    publication: PublicationMode::Required,
+                },
+                domain: PERSONALITY_DOMAIN,
+                parent: None,
             })
+            .unwrap();
+        self.production_effects += 1;
+        registered
+    }
+
+    fn begin_first_executable_read(
+        &mut self,
+        syscall: &RegisteredEffect,
+        descriptor: SyscallDescriptor,
+    ) -> PreparedProductionRead {
+        assert!(!self.production_read_observed);
+        assert_eq!(descriptor.number(), __NR_pread64 as usize);
+        assert_eq!(descriptor.argument(0), 3);
+        assert_eq!(descriptor.argument(2), 4);
+        assert_eq!(descriptor.argument(3), 0);
+        assert_eq!(fnv1a(FIRST_PREAD_INPUT_BYTES), FIRST_PREAD_INPUT_FNV1A);
+        assert_eq!(fnv1a(BLOCK_PREPARATION_BYTES), BLOCK_PREPARATION_FNV1A);
+
+        assert_eq!(syscall.identity.scope(), SCOPE);
+        assert_eq!(syscall.identity.domain(), PERSONALITY_DOMAIN);
+        assert_eq!(syscall.identity.parent(), None);
+        assert_eq!(syscall.identity.task(), GUEST);
+        assert_eq!(syscall.identity.operation(), OP_SYSCALL);
+        assert_eq!(syscall.identity.authority_epoch(), AUTHORITY_EPOCH);
+        assert_eq!(syscall.identity.origin_binding_epoch(), 1);
+        assert_eq!(syscall.identity.resources().len(), 2);
+        assert!(syscall.identity.resources().contains(&PROCESS_RESOURCE));
+        assert!(syscall.identity.resources().contains(&GUEST_REPLY_RESOURCE));
+        let filesystem = self
+            .effects
+            .register_derived(DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: FILESYSTEM_V1,
+                    operation: OP_FILESYSTEM_READ,
+                    descriptor,
+                    resources: vec![EXEC_INODE_RESOURCE, FILESYSTEM_READ_RESOURCE],
+                    credits: vec![CreditCharge::new(FILESYSTEM_OP_CREDIT, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: FILESYSTEM_DOMAIN,
+                parent: Some(syscall.identity.effect()),
+            })
+            .unwrap();
+        let block_descriptor = SyscallDescriptor::new(
+            OP_BLOCK_REQUEST.value() as usize,
+            [0, 0, descriptor.argument(2), 0, 0, 0],
+        );
+        let block = self
+            .effects
+            .register_derived(DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: BLOCK_V1,
+                    operation: OP_BLOCK_REQUEST,
+                    descriptor: block_descriptor,
+                    resources: vec![BLOCK_REQUEST_RESOURCE, BLOCK_PREPARATION_RESOURCE],
+                    credits: vec![CreditCharge::new(BLOCK_PREPARATION_CREDIT, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: BLOCK_DOMAIN,
+                parent: Some(filesystem.identity.effect()),
+            })
+            .unwrap();
+        self.production_effects += 2;
+
+        assert_eq!(filesystem.identity.scope(), SCOPE);
+        assert_eq!(filesystem.identity.domain(), FILESYSTEM_DOMAIN);
+        assert_eq!(filesystem.identity.task(), FILESYSTEM_V1);
+        assert_eq!(filesystem.identity.operation(), OP_FILESYSTEM_READ);
+        assert_eq!(filesystem.identity.authority_epoch(), AUTHORITY_EPOCH);
+        assert_eq!(filesystem.identity.origin_binding_epoch(), 1);
+        assert_eq!(
+            filesystem.identity.parent(),
+            Some(syscall.identity.effect())
+        );
+        assert_eq!(filesystem.identity.resources().len(), 2);
+        assert!(
+            filesystem
+                .identity
+                .resources()
+                .contains(&EXEC_INODE_RESOURCE)
+        );
+        assert!(
+            filesystem
+                .identity
+                .resources()
+                .contains(&FILESYSTEM_READ_RESOURCE)
+        );
+        assert_eq!(block.identity.scope(), SCOPE);
+        assert_eq!(block.identity.domain(), BLOCK_DOMAIN);
+        assert_eq!(block.identity.task(), BLOCK_V1);
+        assert_eq!(block.identity.operation(), OP_BLOCK_REQUEST);
+        assert_eq!(block.identity.authority_epoch(), AUTHORITY_EPOCH);
+        assert_eq!(block.identity.origin_binding_epoch(), 1);
+        assert_eq!(block.identity.parent(), Some(filesystem.identity.effect()));
+        assert_eq!(block.identity.resources().len(), 2);
+        assert!(block.identity.resources().contains(&BLOCK_REQUEST_RESOURCE));
+        assert!(
+            block
+                .identity
+                .resources()
+                .contains(&BLOCK_PREPARATION_RESOURCE)
+        );
+        let ledger = self.effects.scope_projection(SCOPE).unwrap().credits;
+        assert_eq!(ledger.capacity, 7);
+        assert_eq!(ledger.free, 3);
+        assert_eq!(ledger.held, 4);
+        assert_eq!(ledger.committed, 0);
+        for domain in [PERSONALITY_DOMAIN, FILESYSTEM_DOMAIN, BLOCK_DOMAIN] {
+            assert_eq!(
+                self.effects
+                    .domain_projection(SCOPE, domain)
+                    .unwrap()
+                    .live_effects,
+                1
+            );
+        }
+
+        self.effects
+            .prepare(PERSONALITY_V1, syscall.handle)
+            .unwrap();
+        self.effects
+            .prepare(FILESYSTEM_V1, filesystem.handle)
+            .unwrap();
+        self.effects.prepare(BLOCK_V1, block.handle).unwrap();
+
+        let personality_before = self
+            .effects
+            .domain_projection(SCOPE, PERSONALITY_DOMAIN)
+            .unwrap();
+        let block_before = self.effects.domain_projection(SCOPE, BLOCK_DOMAIN).unwrap();
+        let crash = self
+            .effects
+            .crash_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V1)
+            .unwrap();
+        assert_eq!(crash.previous_binding_epoch, 1);
+        assert_eq!(crash.binding_epoch, 2);
+        assert_eq!(crash.cohort.len(), 1);
+        assert!(crash.cohort.contains(&filesystem.identity.effect()));
+        assert_eq!(
+            self.effects
+                .domain_projection(SCOPE, PERSONALITY_DOMAIN)
+                .unwrap(),
+            personality_before
+        );
+        assert_eq!(
+            self.effects.domain_projection(SCOPE, BLOCK_DOMAIN).unwrap(),
+            block_before
+        );
+        let snapshot = self
+            .effects
+            .domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)
+            .unwrap();
+        assert_eq!(snapshot.effects.len(), 1);
+        assert_eq!(snapshot.effects[0].effect, filesystem.identity.effect());
+        assert_eq!(snapshot.effects[0].binding_epoch, 1);
+        self.effects
+            .domain_ready(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2, &snapshot)
+            .unwrap();
+        let rebound = self
+            .effects
+            .rebind_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)
+            .unwrap();
+        assert_eq!(rebound.binding_epoch, 2);
+        let recovery_item = self
+            .effects
+            .recover_next_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)
             .unwrap()
+            .expect("filesystem read survives the bounded crash");
+        assert_eq!(recovery_item.handle, filesystem.handle);
+        let adopted = self
+            .effects
+            .adopt_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2, filesystem.handle)
+            .unwrap();
+        assert_eq!(adopted.effect(), filesystem.identity.effect());
+        assert_eq!(adopted.binding_epoch(), 2);
+        assert_eq!(
+            self.effects
+                .domain_recovery_remaining(SCOPE, FILESYSTEM_DOMAIN)
+                .unwrap(),
+            0
+        );
+        assert!(
+            self.effects
+                .recover_next_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)
+                .unwrap()
+                .is_none()
+        );
+        let adopted_view = self
+            .effects
+            .effect_view(filesystem.identity.effect())
+            .unwrap();
+        assert_eq!(adopted_view.identity.effect(), filesystem.identity.effect());
+        assert_eq!(adopted_view.identity.parent(), filesystem.identity.parent());
+        assert_eq!(adopted_view.identity.task(), filesystem.identity.task());
+        assert_eq!(
+            adopted_view.identity.operation(),
+            filesystem.identity.operation()
+        );
+        assert_eq!(
+            adopted_view.identity.authority_epoch(),
+            filesystem.identity.authority_epoch()
+        );
+        assert_eq!(
+            adopted_view.identity.origin_binding_epoch(),
+            filesystem.identity.origin_binding_epoch()
+        );
+        assert_eq!(adopted_view.identity.binding_epoch(), 2);
+        assert_eq!(
+            adopted_view.identity.resources(),
+            filesystem.identity.resources()
+        );
+
+        let stale_before = (
+            self.effects.scope_projection(SCOPE).unwrap(),
+            self.effects
+                .domain_projection(SCOPE, FILESYSTEM_DOMAIN)
+                .unwrap(),
+            adopted_view,
+        );
+        assert_eq!(
+            self.effects.descriptor(FILESYSTEM_V2, filesystem.handle),
+            Err(RegistryError::StaleBinding)
+        );
+        let stale_after = (
+            self.effects.scope_projection(SCOPE).unwrap(),
+            self.effects
+                .domain_projection(SCOPE, FILESYSTEM_DOMAIN)
+                .unwrap(),
+            self.effects
+                .effect_view(filesystem.identity.effect())
+                .unwrap(),
+        );
+        assert_eq!(stale_after, stale_before);
+        assert_eq!(
+            self.effects.descriptor(BLOCK_V1, block.handle).unwrap(),
+            block_descriptor
+        );
+
+        self.effects.check_invariants().unwrap();
+        PreparedProductionRead {
+            syscall_effect: syscall.identity.effect().id(),
+            filesystem_old_binding: filesystem.handle.binding_epoch(),
+            filesystem_new_binding: adopted.binding_epoch(),
+            filesystem,
+            adopted_filesystem: adopted,
+            block,
+            block_descriptor,
+        }
+    }
+
+    fn finish_first_executable_read(
+        &mut self,
+        prepared: PreparedProductionRead,
+        descriptor: SyscallDescriptor,
+        payload: &[u8],
+    ) -> ProductionReadReceipt {
+        assert!(!self.production_read_observed);
+        assert_eq!(payload, b"\x7fELF");
+        assert_eq!(fnv1a(payload), FIRST_PREAD_PAYLOAD_FNV1A);
+        assert_eq!(prepared.block_descriptor.argument(2), payload.len());
+
+        // Phase 2 stops at the deterministic preparation boundary. A real
+        // BlockRequest commit is reserved for the same-boot VirtIO path whose
+        // publication point is the avail.idx Release, so this prepared block
+        // effect closes honestly as an unpublished preparation-only abort.
+        let block_terminal = self
+            .effects
+            .stage_terminal(
+                BLOCK_V1,
+                prepared.block.handle,
+                TerminalRequest::aborted(-125),
+            )
+            .unwrap();
+        assert!(block_terminal.publication.is_none());
+
+        let foreign_commit = fresh_registry_filesystem_commit(descriptor, payload.len());
+        let foreign_before = (
+            self.effects.scope_projection(SCOPE).unwrap(),
+            self.effects
+                .domain_projection(SCOPE, FILESYSTEM_DOMAIN)
+                .unwrap(),
+            self.effects
+                .effect_view(prepared.filesystem.identity.effect())
+                .unwrap(),
+        );
+        assert_eq!(
+            self.effects.stage_terminal(
+                FILESYSTEM_V2,
+                prepared.adopted_filesystem,
+                TerminalRequest::completed_by(payload.len() as i64, foreign_commit),
+            ),
+            Err(RegistryError::CommitConflict)
+        );
+        let foreign_after = (
+            self.effects.scope_projection(SCOPE).unwrap(),
+            self.effects
+                .domain_projection(SCOPE, FILESYSTEM_DOMAIN)
+                .unwrap(),
+            self.effects
+                .effect_view(prepared.filesystem.identity.effect())
+                .unwrap(),
+        );
+        assert_eq!(foreign_after, foreign_before);
+
+        let filesystem_commit = match self
+            .effects
+            .commit(
+                FILESYSTEM_V2,
+                prepared.adopted_filesystem,
+                CommitMetadata::new(payload.len() as i64, 1),
+            )
+            .unwrap()
+        {
+            CommitOutcome::Applied(receipt) => receipt,
+            CommitOutcome::AlreadyCommitted(_) => panic!("fresh filesystem read replayed"),
+        };
+        let filesystem_terminal = self
+            .effects
+            .stage_terminal(
+                FILESYSTEM_V2,
+                prepared.adopted_filesystem,
+                TerminalRequest::completed_by(payload.len() as i64, filesystem_commit.clone()),
+            )
+            .unwrap();
+        assert!(filesystem_terminal.publication.is_none());
+        let after_internal_close = self.effects.scope_projection(SCOPE).unwrap().credits;
+        assert_eq!(after_internal_close.capacity, 7);
+        assert_eq!(after_internal_close.free, 5);
+        assert_eq!(after_internal_close.held, 2);
+        assert_eq!(after_internal_close.committed, 0);
+        self.effects.check_invariants().unwrap();
+        self.production_read_observed = true;
+
+        ProductionReadReceipt {
+            syscall_effect: prepared.syscall_effect,
+            filesystem_effect: prepared.filesystem.identity.effect().id(),
+            block_effect: prepared.block.identity.effect().id(),
+            filesystem_old_binding: prepared.filesystem_old_binding,
+            filesystem_new_binding: prepared.filesystem_new_binding,
+            block_terminal_sequence: block_terminal.receipt.sequence(),
+            filesystem_commit_sequence: filesystem_commit.sequence(),
+            filesystem_terminal_sequence: filesystem_terminal.receipt.sequence(),
+        }
     }
 
     fn commit(&mut self, registered: &RegisteredEffect, result: i64) -> CommitReceipt {
         self.effects
-            .prepare(FILESYSTEM_V1, registered.handle)
+            .prepare(PERSONALITY_V1, registered.handle)
             .unwrap();
         let next_revision = self.domain_revision.checked_add(1).unwrap();
         match self
             .effects
             .commit(
-                FILESYSTEM_V1,
+                PERSONALITY_V1,
                 registered.handle,
                 CommitMetadata::new(result, next_revision),
             )
@@ -203,7 +659,7 @@ impl FsState {
         let terminal = self
             .effects
             .stage_terminal(
-                FILESYSTEM_V1,
+                PERSONALITY_V1,
                 registered.handle,
                 TerminalRequest::completed_by(result, commit),
             )
@@ -234,10 +690,98 @@ impl FsState {
         assert_eq!(scope.pending_publications, 0);
         assert_eq!(scope.credits.free, scope.credits.capacity);
         assert_eq!(self.syscall_terminalizations, 14);
+        assert_eq!(self.production_effects, 16);
+        assert!(self.production_read_observed);
         assert_eq!(self.stdout_publications, 1);
         assert_eq!(self.temporary.as_slice(), [0, 0, b'x', b'y']);
         assert!(self.exited);
     }
+}
+
+/// Builds an otherwise valid fresh cohort solely for the negative oracle. Its
+/// receipt must never authorize a transition in the workload's registry.
+fn fresh_registry_filesystem_commit(
+    descriptor: SyscallDescriptor,
+    payload_len: usize,
+) -> CommitReceipt {
+    let mut registry = new_production_registry();
+    let syscall = registry
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: SCOPE,
+                task: GUEST,
+                operation: OP_SYSCALL,
+                descriptor,
+                resources: vec![PROCESS_RESOURCE, GUEST_REPLY_RESOURCE],
+                credits: vec![
+                    CreditCharge::new(CONTROL_CREDIT, 1),
+                    CreditCharge::new(GUEST_REPLY_CREDIT, 1),
+                ],
+                publication: PublicationMode::Required,
+            },
+            domain: PERSONALITY_DOMAIN,
+            parent: None,
+        })
+        .unwrap();
+    let filesystem = registry
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: SCOPE,
+                task: FILESYSTEM_V1,
+                operation: OP_FILESYSTEM_READ,
+                descriptor,
+                resources: vec![EXEC_INODE_RESOURCE, FILESYSTEM_READ_RESOURCE],
+                credits: vec![CreditCharge::new(FILESYSTEM_OP_CREDIT, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: FILESYSTEM_DOMAIN,
+            parent: Some(syscall.identity.effect()),
+        })
+        .unwrap();
+    let block = registry
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: SCOPE,
+                task: BLOCK_V1,
+                operation: OP_BLOCK_REQUEST,
+                descriptor: SyscallDescriptor::new(
+                    OP_BLOCK_REQUEST.value() as usize,
+                    [0, 0, payload_len, 0, 0, 0],
+                ),
+                resources: vec![BLOCK_REQUEST_RESOURCE, BLOCK_PREPARATION_RESOURCE],
+                credits: vec![CreditCharge::new(BLOCK_PREPARATION_CREDIT, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: BLOCK_DOMAIN,
+            parent: Some(filesystem.identity.effect()),
+        })
+        .unwrap();
+    registry.prepare(BLOCK_V1, block.handle).unwrap();
+    registry
+        .stage_terminal(BLOCK_V1, block.handle, TerminalRequest::aborted(-125))
+        .unwrap();
+    registry.prepare(FILESYSTEM_V1, filesystem.handle).unwrap();
+    let receipt = match registry
+        .commit(
+            FILESYSTEM_V1,
+            filesystem.handle,
+            CommitMetadata::new(payload_len as i64, 1),
+        )
+        .unwrap()
+    {
+        CommitOutcome::Applied(receipt) => receipt,
+        CommitOutcome::AlreadyCommitted(_) => panic!("fresh negative cohort replayed"),
+    };
+    registry.check_invariants().unwrap();
+    receipt
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        digest = (digest ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    digest
 }
 
 enum Publication {
@@ -260,9 +804,99 @@ struct FsScenario {
 }
 
 impl FsScenario {
+    fn dispatch_first_executable_pread(
+        &self,
+        state: &mut FsState,
+        descriptor: SyscallDescriptor,
+    ) -> DispatchOutcome {
+        // Capture the personality authority directly from the immutable guest
+        // descriptor. No fd resolution, inode lookup, or payload read has
+        // occurred before this registration.
+        let registered = state.capture(descriptor, vec![PROCESS_RESOURCE]);
+        assert_eq!(descriptor.argument(0) as i32, 3);
+        assert_eq!(state.fds.get(&3), Some(&FdKind::Executable));
+
+        // Filesystem policy resolves the known inode and reaches the block
+        // preparation boundary, including the bounded registry-domain crash,
+        // while the real workload-created effects remain live.
+        let prepared = state.begin_first_executable_read(&registered, descriptor);
+
+        // Phase 2 deliberately sources the bytes from the bounded in-memory
+        // inode only after the causal chain is live. The prepared BlockRequest
+        // neither supplies these bytes nor publishes a device descriptor.
+        let offset = descriptor.argument(3);
+        let count = descriptor.argument(2);
+        let start = offset.min(RUNTIME_FS_ELF.len());
+        let end = start.saturating_add(count).min(RUNTIME_FS_ELF.len());
+        let bytes = RUNTIME_FS_ELF[start..end].to_vec();
+        let result = bytes.len() as i64;
+        let receipt = state.finish_first_executable_read(prepared, descriptor, &bytes);
+
+        let commit = state.commit(&registered, result);
+        let commit_sequence = commit.sequence();
+        println!(
+            "LINUX_FS_PRODUCTION_IDENTITY Capture root_scope=95 authority_epoch=141 cohort_source=normal_pread64_path registry=workload_owned syscall_effect={} syscall_domain=personality filesystem_effect={} filesystem_domain=filesystem block_effect={} block_domain=block immutable_ancestry=syscall->filesystem->block distinct_effects=true capture_before_fd_resolution=true capture_before_payload_read=true",
+            receipt.syscall_effect, receipt.filesystem_effect, receipt.block_effect,
+        );
+        println!(
+            "LINUX_FS_PRODUCTION_IDENTITY Recovery filesystem_binding={}->{} crash_injection=registry_domain real_user_service_crash=false crash_cohort=filesystem_read_only snapshot=true ready=true rebind=true adopted_same_effect=true parent_unchanged=true origin_binding_unchanged=true resources_unchanged=true old_handle=StaleBinding full_projection_unchanged=true peer_bindings_unchanged=true",
+            receipt.filesystem_old_binding, receipt.filesystem_new_binding,
+        );
+        println!(
+            "LINUX_FS_PRODUCTION_IDENTITY Ledger credit_classes=control:0x301,filesystem:0x302,queue:0x303,pinned_page:0x304,dma_mapping:0x305,guest_reply:0x306,block_preparation:0x307 capacity=7 held_at_preparation=4 device_credits_held=0 device_credits_free=queue+pinned_page+dma_mapping resources=syscall:0x7100:1:1+0x7300:1:1,filesystem:0x7101:1:1+0x7301:1:1,block_preparation:0x7302:1:1+0x7306:1:1 exact_generations=true"
+        );
+        println!(
+            "LINUX_FS_PRODUCTION_IDENTITY Digests input_sha256={} payload_sha256={} preparation_sha256={} input_bytes={} payload_bytes={} preparation_bytes={} runtime_fnv_checked=true",
+            FIRST_PREAD_INPUT_SHA256,
+            FIRST_PREAD_PAYLOAD_SHA256,
+            BLOCK_PREPARATION_SHA256,
+            FIRST_PREAD_INPUT_BYTES.len(),
+            result,
+            BLOCK_PREPARATION_BYTES.len(),
+        );
+        println!(
+            "LINUX_FS_PRODUCTION_IDENTITY BlockPreparation effect={} phase=Prepared terminal=Aborted terminal_sequence={} preparation_only=true adapter=bounded_in_memory queue_credit_held=false pinned_page_credit_held=false dma_mapping_credit_held=false device_commit=false avail_idx_release=false returned_payload_source=runtime_fs_elf",
+            receipt.block_effect, receipt.block_terminal_sequence,
+        );
+        println!(
+            "LINUX_FS_PRODUCTION_IDENTITY NoSyntheticCohort positive_cohort=normal_workload_path foreign_registry_receipt=CommitConflict foreign_receipt_accepted=false full_projection_unchanged=true negative_only_registry=true"
+        );
+        println!(
+            "LINUX_FS_PRODUCTION_IDENTITY Close block_terminal_sequence={} filesystem_commit_sequence={} filesystem_terminal_sequence={} personality_commit_sequence={} leaf_first=true descendants_closed_before_parent_commit=true filesystem_result_source=bounded_in_memory",
+            receipt.block_terminal_sequence,
+            receipt.filesystem_commit_sequence,
+            receipt.filesystem_terminal_sequence,
+            commit_sequence,
+        );
+        println!(
+            "LINUX_FS Pread effect={} commit_sequence={} fd=3 offset={} bytes={} elf_magic=true pager=bounded block_preparation=observed device_commit=false payload_source=bounded_in_memory",
+            registered.identity.effect().id(),
+            commit_sequence,
+            offset,
+            result,
+        );
+
+        state.record_domain_change(&commit);
+        let ticket = state.terminalize(&registered, result, commit);
+        state.effects.check_invariants().unwrap();
+        DispatchOutcome {
+            result,
+            ticket,
+            publication: Publication::GuestBytes {
+                address: descriptor.argument(1),
+                bytes,
+            },
+            exit: false,
+        }
+    }
+
     fn dispatch(&self, descriptor: SyscallDescriptor) -> DispatchOutcome {
         let mut state = self.state.lock();
         assert!(!state.exited);
+
+        if descriptor.number() == __NR_pread64 as usize && !state.production_read_observed {
+            return self.dispatch_first_executable_pread(&mut state, descriptor);
+        }
 
         let (resources, result, publication, exit, action) = match descriptor.number() {
             number if number == __NR_openat as usize => {
@@ -480,10 +1114,7 @@ impl FsScenario {
                 );
             }
             FsAction::Pread(kind, offset) => match kind {
-                FdKind::Executable => println!(
-                    "LINUX_FS Pread effect={} commit_sequence={} fd=3 offset={} bytes={} elf_magic=true pager=bounded block_fixture=component_consistency",
-                    effect, commit_sequence, offset, result,
-                ),
+                FdKind::Executable => panic!("first executable pread bypassed production capture"),
                 FdKind::Temporary => println!(
                     "LINUX_FS Pread effect={} commit_sequence={} fd=4 offset={} bytes={} payload=00007879",
                     effect, commit_sequence, offset, result,
@@ -581,10 +1212,10 @@ impl FsScenario {
         state.assert_final();
         drop(state);
         println!(
-            "EFFECT_REGISTRY Quiescent workload=linux-runtime-fs live=0 pending_publications=0 credits=Free"
+            "EFFECT_REGISTRY Quiescent workload=linux-runtime-fs production_root=95 production_effects=16 live=0 pending_publications=0 credits=Free"
         );
         println!(
-            "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=14 openat=3 pread64=2 statx=1 newfstatat=1 pwrite64=1 readlinkat=1 close=3 write=1 exit=1 commit_gate=true publication_acks=14 registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true real_dma=false virtio_evidence=component_consistency same_boot=false identity_preserving=false"
+            "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=14 openat=3 pread64=2 statx=1 newfstatat=1 pwrite64=1 readlinkat=1 close=3 write=1 exit=1 commit_gate=true publication_acks=14 production_root=true production_domains=3 production_effects=16 production_identity_preparation=true immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=false no_synthetic_cohort=true typed_credit_classes=7 leaf_first=true registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=bounded_in_memory block_preparation_observed=true device_commit=false real_dma=false virtio_evidence=component_consistency same_boot=false identity_preserving_stage5b=false"
         );
         self.done
             .lock()
@@ -634,12 +1265,15 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
     );
 
     println!(
-        "LINUX_FS_SLICE BEGIN workload=linux-runtime-fs-smoke format=ELF64 type=ET_EXEC retained=true adapted=false syscalls=14 registry=common filesystem=bounded_in_memory pager=bounded block=component_consistency smp=1"
+        "LINUX_FS_SLICE BEGIN workload=linux-runtime-fs-smoke format=ELF64 type=ET_EXEC retained=true adapted=false syscalls=14 registry=production_shared root_scope=95 domains=3 typed_credit_classes=7 filesystem=bounded_in_memory pager=bounded block=deterministic_preparation smp=1"
     );
     println!(
-        "LINUX_FS_ARTIFACT source_sha256={} elf_sha256={} sector_sha256={} full_image_sha256={} sector_fnv1a={:#018x} relation=component_consistency real_stage5b_required=true same_boot=false identity_preserving=false",
+        "LINUX_FS_ARTIFACT source_sha256={} elf_sha256={} first_pread_input_sha256={} first_pread_payload_sha256={} block_preparation_sha256={} sector_sha256={} full_image_sha256={} sector_fnv1a={:#018x} relation=component_consistency real_stage5b_required=true same_boot=false identity_preserving_stage5b=false",
         EXPECTED_SOURCE_SHA256,
         EXPECTED_ELF_SHA256,
+        FIRST_PREAD_INPUT_SHA256,
+        FIRST_PREAD_PAYLOAD_SHA256,
+        BLOCK_PREPARATION_SHA256,
         STAGE5B_SECTOR_SHA256,
         STAGE5B_IMAGE_SHA256,
         STAGE5B_SECTOR_FNV1A,
@@ -653,6 +1287,9 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
         final_authority_epoch: AUTHORITY_EPOCH + 1,
         terminalizations: 14,
         publication_acks: 14,
+        production_effects: 16,
+        production_domains: 3,
+        preparation_identity_observed: true,
         quiescent: true,
         source_sha256: EXPECTED_SOURCE_SHA256,
         elf_sha256: EXPECTED_ELF_SHA256,

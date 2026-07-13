@@ -480,13 +480,16 @@ impl NetState {
                 .ready
                 .as_ref()
                 .map(|ready| (ready.effect, ready.handle, ready.subscription)),
-            commit: pending.commit.clone(),
+            commit: pending
+                .commit
+                .as_ref()
+                .map(CommitReceipt::failure_atomic_projection),
             phase: pending.phase,
             waiter_waker_present: pending.waiter_waker.is_some(),
             ticket: pending.ticket.clone(),
         });
         MainSemanticProjection {
-            registry: format!("{:?}", self.effects),
+            registry: self.effects.failure_atomic_projection(),
             readiness: format!("{:?}", self.readiness),
             protocol: MainProtocolProjection {
                 ready_source: self.ready_source,
@@ -2063,16 +2066,30 @@ impl CompanionHarness {
             .registry
             .effects_for_scope(self.scope)
             .into_iter()
-            .map(|effect| self.registry.effect_view(effect).unwrap())
+            .map(|effect| {
+                self.registry
+                    .effect_view(effect)
+                    .unwrap()
+                    .failure_atomic_projection()
+            })
             .collect();
         CompanionProjection {
             registry: self.registry.scope_projection(self.scope).unwrap(),
             effects,
             readiness_revision: self.readiness.revision(),
             readiness_counts: self.readiness.counts(),
-            net_commit: self.net_commit.clone(),
-            buffer_commit: self.buffer_commit.clone(),
-            ready_commit: self.ready_commit.clone(),
+            net_commit: self
+                .net_commit
+                .as_ref()
+                .map(CommitReceipt::failure_atomic_projection),
+            buffer_commit: self
+                .buffer_commit
+                .as_ref()
+                .map(CommitReceipt::failure_atomic_projection),
+            ready_commit: self
+                .ready_commit
+                .as_ref()
+                .map(CommitReceipt::failure_atomic_projection),
             ready_delivery: self.ready_delivery.clone(),
             protocol: self.protocol,
         }

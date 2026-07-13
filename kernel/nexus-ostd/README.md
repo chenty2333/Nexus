@@ -425,9 +425,14 @@ OSTD `UserMode`: three `openat`, two `pread64`, `statx`, `newfstatat` with
 `AT_EMPTY_PATH`, `pwrite64("xy", offset=2)`, relative
 `readlinkat(proc-self-fd, "exe")`, three closes, exact stdout, and `exit(0)`.
 The bounded service owns only an in-memory executable inode, one temporary inode,
-and `/proc/self/exe`. Every continuation uses the common effect registry; the
-commit receipt exists before fd/inode mutation, guest-memory output is a later
-publication, and all 14 tickets are acknowledged before scope closure.
+and `/proc/self/exe`. Every continuation uses one workload-owned production
+registry. For the first executable `pread64`, personality capture occurs before
+fd resolution or payload access, then the same root receives immutable
+`FilesystemSyscall -> FilesystemRead -> BlockRequest` ancestry. The filesystem
+child survives a registry-domain crash injection, snapshot, Ready, rebind, and
+explicit adoption. This is a bounded registry transition, not a real crashing
+OSTD user service. Guest-memory output remains a later publication, and all 14
+personality tickets are acknowledged before root closure.
 
 The lifecycle companion has actual independent pager, filesystem, personality,
 and block binding state. Prepared pager/filesystem effects require snapshot,
@@ -438,14 +443,21 @@ for zero mutation. Separate reset and IOTLB tombstones retain three abstract
 owners; timeout does not advance device generation, ResetAck advances it, and
 only IOTLB Ack releases ownership.
 
+Phase 2 stops at deterministic block preparation. It aborts that prepared
+effect without a device commit and keeps queue-slot, pinned-page, and DMA credit
+capacity free; the returned ELF bytes still come from the in-memory inode. The
+host gate binds the guest, first-pread input, four-byte payload, and preparation
+record by digest, and rejects a receipt from a fresh registry without mutation.
+
 The primary boot has no real DMA. `tools/workflow/runtime-fs-composition.sh`
-joins it to the independent real Stage 5B boot using source/ELF digests, the
+joins it to the independent real Stage 5B boot using those digests plus the
 reconstructed sector SHA
 `9cb83be92a4c9239752718e6e20ac00fe9e32842ea561ae7fedec94b620a05cc`,
 sector FNV, and full readonly-image SHA
 `27a4e8fed7b428b42ff04e3f62eadfe2e3f3310dac4e2fe8ecfff04be3cca254`.
-This is `component_consistency`, with `same_boot=false` and
-`identity_preserving=false`; it is not a general or persistent filesystem.
+This is `component_consistency`, with `same_boot=false` and no
+identity-preserving Stage 5B device path; it is not a general or persistent
+filesystem.
 
 ### Bounded runtime network
 

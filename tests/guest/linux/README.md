@@ -122,12 +122,24 @@ file opens, ELF and sparse-offset reads, `statx`, `newfstatat(AT_EMPTY_PATH)`,
 The strict oracle checks every receipt in order plus duplicate/count/digest/
 lifecycle mutations.
 
-The implementation is deliberately bounded in memory. A four-domain lifecycle
-companion supplies pager/filesystem/personality recovery, both write/revoke
-orders, and separate reset/IOTLB owner-retaining tombstones. A host oracle joins
-the source/ELF/sector/image digests to the independent real Stage 5B receipt as
-component consistency only. It does not establish a VFS, persistence, durable
-writes, real DMA in the primary boot, same-boot identity, or SMP behavior.
+The implementation is deliberately bounded in memory. The normal first
+executable `pread64` now creates one workload-owned production root and the
+immutable `FilesystemSyscall -> FilesystemRead -> BlockRequest` ancestry in one
+registry. Personality capture precedes fd resolution and payload access. The
+filesystem child survives a registry-domain crash injection through snapshot,
+Ready, rebind, and explicit adoption without changing its effect, parent,
+origin binding, or resources. This is not evidence of a real crashing user
+service task.
+
+Phase 2 stops honestly at block preparation. The prepared block effect is
+aborted without a device commit; queue, pinned-page, and DMA credit capacities
+remain free because this boot owns no such device resources. The four ELF bytes
+still come from the bounded in-memory inode. Exact input, payload, and
+preparation digests plus a cross-registry negative receipt are checked by the
+serial and host oracles. The separate Stage 5B boot remains component
+consistency only, with no same-boot device identity. This does not establish a
+VFS, persistence, durable writes, real DMA in the primary boot, a real
+filesystem-service crash, or SMP behavior.
 
 ### Retained runtime-network input audit
 

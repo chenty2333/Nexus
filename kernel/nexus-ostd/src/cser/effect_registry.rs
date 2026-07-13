@@ -13,6 +13,7 @@
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet},
+    string::String,
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -549,6 +550,14 @@ impl CommitReceipt {
     pub(crate) const fn domain_revision(&self) -> u64 {
         self.domain_revision
     }
+
+    /// Preserves every semantic receipt field while removing only the
+    /// process-local registry-allocation ordinal from a diagnostic projection.
+    pub(crate) fn failure_atomic_projection(&self) -> Self {
+        let mut projected = self.clone();
+        projected.registry_instance_id = 1;
+        projected
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -700,6 +709,25 @@ pub(crate) struct EffectView {
     pub(crate) commit: Option<CommitReceipt>,
     pub(crate) terminal: Option<TerminalReceipt>,
     pub(crate) publication_pending: bool,
+}
+
+impl EffectView {
+    /// Returns an exact failure-atomic view whose nested receipt provenance is
+    /// namespace-neutral. The live receipt remains unchanged and authoritative.
+    pub(crate) fn failure_atomic_projection(&self) -> Self {
+        let mut projected = self.clone();
+        projected.commit = projected
+            .commit
+            .as_ref()
+            .map(CommitReceipt::failure_atomic_projection);
+        if let Some(terminal) = projected.terminal.as_mut() {
+            terminal.causal_commit = terminal
+                .causal_commit
+                .as_ref()
+                .map(CommitReceipt::failure_atomic_projection);
+        }
+        projected
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1067,6 +1095,39 @@ impl EffectRegistry {
             next_terminal_sequence: 1,
             next_publication_sequence: 1,
             next_revoke_sequence: 1,
+        }
+    }
+
+    /// Returns the complete registry debug projection used by failure-atomic
+    /// before/after checks, with only the allocator-assigned registry
+    /// namespace normalized.
+    ///
+    /// `instance_id` and the matching provenance field embedded in commit
+    /// receipts intentionally distinguish otherwise identical live
+    /// registries. They are authority, but their process-local allocation
+    /// order is not semantic mutation within one registry. Diagnostic hashes
+    /// must therefore remain stable when an earlier negative test creates and
+    /// destroys an unrelated registry. The live object is never modified.
+    pub(crate) fn failure_atomic_projection(&self) -> String {
+        const NORMALIZED_REGISTRY_INSTANCE: u64 = 1;
+
+        let mut normalized = self.clone();
+        normalized.rewrite_registry_instance(NORMALIZED_REGISTRY_INSTANCE);
+        alloc::format!("{normalized:?}")
+    }
+
+    fn rewrite_registry_instance(&mut self, registry_instance_id: u64) {
+        assert_ne!(registry_instance_id, 0);
+        self.instance_id = registry_instance_id;
+        for record in self.effects.values_mut() {
+            if let Some(commit) = record.commit.as_mut() {
+                commit.registry_instance_id = registry_instance_id;
+            }
+            if let Some(terminal) = record.terminal.as_mut()
+                && let Some(causal_commit) = terminal.causal_commit.as_mut()
+            {
+                causal_commit.registry_instance_id = registry_instance_id;
+            }
         }
     }
 
@@ -5601,6 +5662,23 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
     assert_eq!(projection.live_effects, 0);
     assert_eq!(projection.pending_publications, 0);
     assert_eq!(projection.credits.free, projection.credits.capacity);
+
+    // A diagnostic before/after hash must not depend on how many unrelated
+    // negative registries happened to be allocated earlier in the boot. The
+    // authoritative live receipts retain their original instance namespace.
+    let mut renamespaced = registry.clone();
+    let renamespaced_id = registry.instance_id.checked_add(1).unwrap();
+    renamespaced.rewrite_registry_instance(renamespaced_id);
+    renamespaced.check_invariants().unwrap();
+    assert_ne!(registry.instance_id, renamespaced.instance_id);
+    assert_ne!(
+        alloc::format!("{registry:?}"),
+        alloc::format!("{renamespaced:?}")
+    );
+    assert_eq!(
+        registry.failure_atomic_projection(),
+        renamespaced.failure_atomic_projection()
+    );
 
     RegistrySelfTestReceipt {
         effects: 2,

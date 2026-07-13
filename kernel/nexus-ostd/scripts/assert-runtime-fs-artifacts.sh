@@ -5,6 +5,7 @@ export LC_ALL=C
 
 readonly expected_source_sha=c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f
 readonly pinned_artifact_sha=0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef
+readonly first_pread_payload_sha=3bdbb4fe8397cd2b842430b39ccff01a8663c751945ef5e9a09e267fb8b1d359
 
 die() {
     echo "runtime fs artifact assertion: FAIL: $*" >&2
@@ -42,7 +43,7 @@ source_file=$1
 elf_file=$2
 expected_artifact_sha=${3-$pinned_artifact_sha}
 
-for command_name in awk cut grep nm readelf sha256sum strings; do
+for command_name in awk cut grep head nm readelf sha256sum strings; do
     command -v "$command_name" >/dev/null 2>&1 || die "missing command: $command_name"
 done
 
@@ -115,7 +116,10 @@ if [[ -z "$expected_artifact_sha" ]]; then
     die "expected artifact SHA is unset; candidate_artifact_sha=$artifact_sha"
 fi
 require_sha256 artifact "$elf_file" "$expected_artifact_sha"
+actual_first_pread_payload_sha=$(head -c 4 "$elf_file" | sha256sum | cut -d ' ' -f1)
+[[ $actual_first_pread_payload_sha == "$first_pread_payload_sha" ]] ||
+    die "first pread payload SHA mismatch expected=$first_pread_payload_sha actual=$actual_first_pread_payload_sha"
 
 entry=$(awk -F: '/Entry point address:/ { gsub(/[[:space:]]/, "", $2); print $2 }' <<<"$header")
 load_count=$(awk '$1 == "LOAD" { count++ } END { print count + 0 }' <<<"$programs")
-echo "runtime fs artifact assertions: PASS source_sha=$expected_source_sha artifact_sha=$artifact_sha elf=ELF64 machine=x86_64 type=ET_EXEC entry=$entry static=true pt_interp=false load_segments=$load_count wx=false exec_stack=false runtime_dependencies=none"
+echo "runtime fs artifact assertions: PASS source_sha=$expected_source_sha artifact_sha=$artifact_sha first_pread_payload_sha=$first_pread_payload_sha elf=ELF64 machine=x86_64 type=ET_EXEC entry=$entry static=true pt_interp=false load_segments=$load_count wx=false exec_stack=false runtime_dependencies=none"
