@@ -430,6 +430,37 @@ exercise filesystem commit/revoke, atomic network-plus-buffer commit/revoke,
 filesystem crash/commit, and timeout-receipt acceptance/retry. They remain
 bounded lock-order checks, not an SMP memory-model proof or device execution.
 
+The `production_identity` module is an independent RFC 0001 successor rather
+than a modification of `linux_io_composition`. It starts with an empty root and
+registers the exact workload-created tree
+`Personality -> Filesystem -> Block -> {three DMA owners}` into one registry
+instance. Each effect retains an immutable root lineage, authority epoch,
+effect generation, originating binding, operation, and parent; adoption changes
+only its current authorized binding. Control, filesystem-operation, queue-slot,
+pinned-page, DMA-mapping, and guest-reply credits share one typed ledger and
+root/domain/parent reverse-index population.
+
+Its sequence and property gates cover normal backend/IOTLB completion followed
+by a one-shot guest reply, domain crash/snapshot/Ready/rebind/explicit adoption,
+both commit/revoke winners, leaf-first abort, reset timeout with
+`IndeterminateAfterReset`, identity-preserving reset retry, a separate IOTLB
+timeout/tombstone/retry, final IOTLB acknowledgement, and full-projection
+rejection of wrong registry, root, root or effect generation, and parent
+substitutions. The public projection includes
+all identities, bindings, effect states, typed-credit dispositions, reverse
+indexes, recovery/device/revoke/receipt state, allocator positions, and
+transition/index-work counters for a future differential oracle.
+The closure counters describe selection through the live root and child
+indexes; they exclude the model's clone/validate/swap copy and full invariant
+audit. They are semantic observability, not an asymptotic or latency result.
+
+Three Loom tests execute this safe-Rust model behind a modeled outer mutex for
+commit/revoke, commit/domain-crash, and retry-IOTLB/old-completion races. This
+establishes only the independent bounded successor semantics. It does not reuse
+the OSTD `EffectRegistry` or transition source and does not establish a
+production registry, OSTD lock or IRQ correctness, SMP execution, same-boot
+VirtIO/IOMMU behavior, or RFC 0001 Phase 2 and later acceptance.
+
 The pinned OSTD/QEMU successor independently executes the adapted retained
 Round 4 futex program, the adapted retained Round 5 epoll program plus a
 readiness lifecycle companion, and a retained dynamic PIE launcher/main/

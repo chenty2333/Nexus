@@ -17,6 +17,7 @@ pub mod linux_io_composition;
 mod model;
 pub mod pager;
 pub mod personality;
+pub mod production_identity;
 pub mod runtime_fs;
 pub mod runtime_net;
 
