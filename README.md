@@ -59,7 +59,7 @@ The accepted evaluation boundary is:
 | Fault injection | 20/20 Checked | Case-local ledgers in release, single-vCPU, single-thread-TCG QEMU |
 | Structural scale | 14/14 Checked | Finite tuples; no asymptotic or production `O(k)` claim |
 | Performance | 29/29 Observed | Guest-visible TSC samples; no threshold, baseline, or hardware-cycle claim |
-| Prior art | 16 sources | 15 full-text audits and 1 primary-metadata-only comparison |
+| Prior art | 16 sources | `v0.1.0`: 14 full-text and 2 metadata-only; current main follow-up: 15 and 1 |
 | Contribution decision | `narrow` | A bounded compositional result, not novelty or firstness |
 
 This release does **not** establish whole-system proof, SMP or production-lock
@@ -135,6 +135,16 @@ The exact tier contracts and claim discipline are kept in
 The reference model and OSTD implementation deliberately do not share state
 transition code. The mediated device experiment remains component-consistency
 evidence rather than being relabeled as same-effect, same-boot refinement.
+
+## Current research line
+
+Post-release work is testing a stricter production-identity result; it is not a
+retroactive expansion of `v0.1.0`. The hypothesis and acceptance rules are in
+[RFC 0001](docs/rfcs/0001-production-identity.md), and the explicit preflight
+decision is [narrow-go](docs/research/v0.2-preflight-decision.md). Until the
+real filesystem, same-boot device, OSTD IRQ/SMP, measurement, and final
+contribution gates close together, these changes remain prospective v0.2
+research rather than a v0.2 release claim.
 
 ## Documentation
 
