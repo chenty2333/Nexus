@@ -275,23 +275,43 @@ complete graph depth 55
 45 seconds
 ```
 
-The liveness configuration `LinuxIoCompositionCserMC.cfg` completed with no
+Kernel-closure liveness is checked over every non-vacuous closure partition
+(`DeriveRace`, `Core`, and `DmaTimeout`, with the unused crash selector
+canonicalized). `LinuxIoCompositionCserMC.cfg` completed with no error:
+
+```text
+1,828,175 states generated
+603,886 distinct states found
+0 states left on queue
+complete graph depth 46
+1 temporal branch
+1 minute 55 seconds
+```
+
+Crash-fallback liveness is independently checked for both crash targets in
+`NewDomainCrash`. `LinuxIoCompositionCserFallbackMC.cfg` completed with no
 error:
 
 ```text
-3,656,517 states generated
-1,207,917 distinct states found
+163 states generated
+121 distinct states found
 0 states left on queue
-complete graph depth 46
-3 temporal branches
-4 minutes 48 seconds
+complete graph depth 21
+2 temporal branches
+less than 1 second
 ```
 
 Deadlock checking is disabled because quiescent `Revoked` states and
 environment-dependent recovery states may stutter legally. The ten required
-reachability runs are separate counterexample searches against the safety
-configuration; a pass means TLC found the required witness that violates its
-corresponding `...Absent` coverage invariant.
+reachability witnesses are checked across six counterexample traversals against
+the safety configuration. Each traversal constrains only the disjoint
+scenario/crash-selector initial-state partition that can contain its witnesses;
+it still starts in `Init`, follows `Next`, and must violate each corresponding
+`...Absent` coverage invariant. The five Core witnesses share one complete
+`-continue` traversal whose output gate requires exactly all five expected
+invariant names and rejects every other TLC error; the other five witnesses
+remain independent searches. The complete focused family took 3 minutes 15
+seconds on the pinned 16-core development host.
 
 Run only this family inside the pinned development container with:
 

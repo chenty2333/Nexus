@@ -385,21 +385,29 @@ fn spec(root: &Path) -> Result<()> {
         run_bounded_logged(
             &mut command,
             &artifact_dir.join(format!("{spec}-tlc.log")),
-            Duration::from_secs(match spec {
-                // The three-ID I/O safety quotient explores about 22 million
-                // states before the two witness gates and action graph. Keep
-                // a cold/shared-host run from being mislabeled as a failure.
-                "IoCser" => 1_800,
-                "RuntimeFsCser" => 900,
-                "RuntimeNetCser" => 900,
-                "CompositionCser" => 600,
-                "LinuxIoCompositionCser" => 900,
-                _ => 300,
-            }),
+            spec_timeout(spec),
             8 * 1024 * 1024,
         )?;
     }
     Ok(())
+}
+
+fn spec_timeout(spec: &str) -> Duration {
+    Duration::from_secs(match spec {
+        // The three-ID I/O safety quotient explores about 22 million states
+        // before the two witness gates and action graph. Keep a cold/shared-
+        // host run from being mislabeled as a failure.
+        "IoCser" => 1_800,
+        "RuntimeFsCser" => 900,
+        "RuntimeNetCser" => 900,
+        "CompositionCser" => 600,
+        // This family deliberately performs a full reject-enabled safety and
+        // action traversal, ten distinct witnesses across six reachability
+        // traversals, and two non-vacuous liveness quotients. Four-core CI is
+        // substantially slower than the pinned 16-core development host.
+        "LinuxIoCompositionCser" => 2_700,
+        _ => 300,
+    })
 }
 
 struct SpecRunLock {
@@ -1039,6 +1047,15 @@ mod tests {
         drop(workspace);
         assert!(!workspace_root.exists());
         fs::remove_dir_all(fixture).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn linux_io_composition_timeout_covers_the_complete_formal_family() {
+        assert_eq!(
+            spec_timeout("LinuxIoCompositionCser"),
+            Duration::from_secs(2_700)
+        );
+        assert_eq!(spec_timeout("Cser"), Duration::from_secs(300));
     }
 
     #[test]

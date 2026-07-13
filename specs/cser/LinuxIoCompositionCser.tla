@@ -2179,4 +2179,39 @@ VirtIoResetIotlbTombstoneClosureAbsent ==
 StaleEnvelopeAndReceiptFencesAbsent ==
     ~StaleEnvelopeAndReceiptFencesObserved
 
+(***************************************************************************)
+(* Reachability checks exercise one deliberately bounded scenario at a     *)
+(* time.  These constraints only remove the other, disjoint initial-state  *)
+(* partitions; every checked trace still starts in Init and follows Next.  *)
+(***************************************************************************)
+CoreWitnessScenario ==
+    /\ scenarioMode = "Core"
+    /\ crashTarget = "Filesystem"
+
+DeriveRaceWitnessScenario ==
+    /\ scenarioMode = "DeriveRace"
+    /\ crashTarget = "Filesystem"
+
+FilesystemCrashWitnessScenario ==
+    /\ scenarioMode = "NewDomainCrash"
+    /\ crashTarget = "Filesystem"
+
+NetworkCrashWitnessScenario ==
+    /\ scenarioMode = "NewDomainCrash"
+    /\ crashTarget = "Network"
+
+DmaTimeoutWitnessScenario ==
+    /\ scenarioMode = "DmaTimeout"
+    /\ crashTarget = "Filesystem"
+
+RejectProbeWitnessScenario ==
+    /\ scenarioMode = "RejectProbe"
+    /\ crashTarget = "Filesystem"
+
+FallbackLivenessScenarios == scenarioMode = "NewDomainCrash"
+
+ClosureLivenessScenarios ==
+    /\ scenarioMode \in {"DeriveRace", "Core", "DmaTimeout"}
+    /\ crashTarget = "Filesystem"
+
 =============================================================================

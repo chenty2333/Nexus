@@ -48,6 +48,7 @@ expect_reachable() {
     base_config=$2
     invariant=$3
     description=$4
+    state_constraint=${5:-}
     cleanup
     COVERAGE_CONFIG=
     COVERAGE_LOG=
@@ -57,6 +58,9 @@ expect_reachable() {
         "${TMPDIR:-/tmp}/nexus-cser-coverage.XXXXXX.log")
     cp "$SCRIPT_DIR/$base_config" "$COVERAGE_CONFIG"
     printf '\nINVARIANT %s\n' "$invariant" >>"$COVERAGE_CONFIG"
+    if [ -n "$state_constraint" ]; then
+        printf 'CONSTRAINT %s\n' "$state_constraint" >>"$COVERAGE_CONFIG"
+    fi
     echo "==> $spec reachability: $description"
 
     if java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC \
@@ -81,6 +85,97 @@ expect_reachable() {
     cleanup
     COVERAGE_CONFIG=
     COVERAGE_LOG=
+}
+
+expect_core_reachable() {
+    spec=LinuxIoCompositionCser
+    base_config=LinuxIoCompositionCserSafetyMC.cfg
+    cleanup
+    COVERAGE_CONFIG=
+    COVERAGE_CONFIG=$(mktemp \
+        "${TMPDIR:-/tmp}/nexus-cser-core-coverage.XXXXXX.cfg")
+    cp "$SCRIPT_DIR/$base_config" "$COVERAGE_CONFIG"
+    for invariant in \
+        SevenDomainLinuxIoClosureAbsent \
+        FsVisibleNetSuppressedAbsent \
+        NetVisibleFsSuppressedAbsent \
+        ReadinessBeforeRevokeAbsent \
+        RevokeBeforeReadinessAbsent; do
+        printf '\nINVARIANT %s\n' "$invariant" >>"$COVERAGE_CONFIG"
+    done
+    printf 'CONSTRAINT CoreWitnessScenario\n' >>"$COVERAGE_CONFIG"
+    echo "==> $spec reachability: five Core witnesses in one complete graph"
+
+    if ! java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC \
+        -cleanup \
+        -continue \
+        -workers "$TLC_WORKERS" \
+        -config "$COVERAGE_CONFIG" \
+        "$SCRIPT_DIR/${spec}.tla" 2>&1 | awk '
+            BEGIN {
+                order[1] = "SevenDomainLinuxIoClosureAbsent"
+                order[2] = "FsVisibleNetSuppressedAbsent"
+                order[3] = "NetVisibleFsSuppressedAbsent"
+                order[4] = "ReadinessBeforeRevokeAbsent"
+                order[5] = "RevokeBeforeReadinessAbsent"
+                for (i = 1; i <= 5; i++) expected[order[i]] = 1
+            }
+            /^Error: Invariant .* is violated\.$/ {
+                name = $0
+                sub(/^Error: Invariant /, "", name)
+                sub(/ is violated\.$/, "", name)
+                if (!(name in expected)) {
+                    print "unexpected invariant violation: " name > "/dev/stderr"
+                    failed = 1
+                } else {
+                    if (!(name in seen)) {
+                        print "COVERAGE_INVARIANT " name
+                    }
+                    seen[name] = 1
+                }
+                next
+            }
+            /^Error: The behavior up to this point is:$/ { next }
+            /^Error:/ {
+                print > "/dev/stderr"
+                failed = 1
+                next
+            }
+            /^Model checking completed\. No error has been found\.$/ {
+                complete = 1
+                print
+                next
+            }
+            /states generated, .* distinct states found,/ { print; next }
+            /^The depth of the complete state graph search is / { print; next }
+            /^Finished in / { print; next }
+            END {
+                for (i = 1; i <= 5; i++) {
+                    name = order[i]
+                    if (!(name in seen)) {
+                        print "expected reachability witness was not found: " \
+                            name > "/dev/stderr"
+                        failed = 1
+                    }
+                }
+                if (!complete) {
+                    print "grouped Core reachability did not complete" > "/dev/stderr"
+                    failed = 1
+                }
+                exit failed
+            }
+        '; then
+        cleanup
+        echo "grouped Core reachability failed" >&2
+        exit 1
+    fi
+    echo "COVERAGE_RESULT PASS seven domains close the fixed nine-effect graph with exact publications and receipts"
+    echo "COVERAGE_RESULT PASS filesystem publication remains visible while the network branch aborts"
+    echo "COVERAGE_RESULT PASS network publication remains visible while the filesystem branch aborts"
+    echo "COVERAGE_RESULT PASS readiness commit can win before root revocation without a fabricated reply"
+    echo "COVERAGE_RESULT PASS root revocation can fence readiness after an immutable network publication"
+    cleanup
+    COVERAGE_CONFIG=
 }
 
 run_spec() {
@@ -331,50 +426,38 @@ run_spec() {
                 CompositionCser CompositionCserMC.cfg
             ;;
         LinuxIoCompositionCser)
-            run_tlc "LinuxIoCompositionCser seven-domain reject-enabled safety graph" \
+            run_tlc "LinuxIoCompositionCser seven-domain reject-enabled safety and action graph" \
                 LinuxIoCompositionCser LinuxIoCompositionCserSafetyMC.cfg
             expect_reachable LinuxIoCompositionCser \
                 LinuxIoCompositionCserSafetyMC.cfg \
-                SevenDomainLinuxIoClosureAbsent \
-                "seven domains close the fixed nine-effect graph with exact publications and receipts"
-            expect_reachable LinuxIoCompositionCser \
-                LinuxIoCompositionCserSafetyMC.cfg \
                 RevokeBeforeIoPublicationAbsent \
-                "root revocation can suppress both filesystem and network publication"
-            expect_reachable LinuxIoCompositionCser \
-                LinuxIoCompositionCserSafetyMC.cfg \
-                FsVisibleNetSuppressedAbsent \
-                "filesystem publication remains visible while the network branch aborts"
-            expect_reachable LinuxIoCompositionCser \
-                LinuxIoCompositionCserSafetyMC.cfg \
-                NetVisibleFsSuppressedAbsent \
-                "network publication remains visible while the filesystem branch aborts"
+                "root revocation can suppress both filesystem and network publication" \
+                DeriveRaceWitnessScenario
+            expect_core_reachable
             expect_reachable LinuxIoCompositionCser \
                 LinuxIoCompositionCserSafetyMC.cfg \
                 FilesystemCrashAdoptIsolationAbsent \
-                "filesystem crash requires explicit adoption without advancing peer bindings"
+                "filesystem crash requires explicit adoption without advancing peer bindings" \
+                FilesystemCrashWitnessScenario
             expect_reachable LinuxIoCompositionCser \
                 LinuxIoCompositionCserSafetyMC.cfg \
                 NetworkCrashAdoptIsolationAbsent \
-                "network crash adopts operation and buffer without advancing peer bindings"
-            expect_reachable LinuxIoCompositionCser \
-                LinuxIoCompositionCserSafetyMC.cfg \
-                ReadinessBeforeRevokeAbsent \
-                "readiness commit can win before root revocation without a fabricated reply"
-            expect_reachable LinuxIoCompositionCser \
-                LinuxIoCompositionCserSafetyMC.cfg \
-                RevokeBeforeReadinessAbsent \
-                "root revocation can fence readiness after an immutable network publication"
+                "network crash adopts operation and buffer without advancing peer bindings" \
+                NetworkCrashWitnessScenario
             expect_reachable LinuxIoCompositionCser \
                 LinuxIoCompositionCserSafetyMC.cfg \
                 VirtIoResetIotlbTombstoneClosureAbsent \
-                "reset and IOTLB tombstones retain DMA through fresh-receipt closure"
+                "reset and IOTLB tombstones retain DMA through fresh-receipt closure" \
+                DmaTimeoutWitnessScenario
             expect_reachable LinuxIoCompositionCser \
                 LinuxIoCompositionCserSafetyMC.cfg \
                 StaleEnvelopeAndReceiptFencesAbsent \
-                "all authority, generation, receipt, and replay rejects are side-effect free"
-            run_tlc "LinuxIoCompositionCser action properties and conditional kernel liveness" \
+                "all authority, generation, receipt, and replay rejects are side-effect free" \
+                RejectProbeWitnessScenario
+            run_tlc "LinuxIoCompositionCser conditional kernel-closure liveness" \
                 LinuxIoCompositionCser LinuxIoCompositionCserMC.cfg
+            run_tlc "LinuxIoCompositionCser conditional crash-fallback liveness" \
+                LinuxIoCompositionCser LinuxIoCompositionCserFallbackMC.cfg
             ;;
         *)
             echo "unknown CSER specification: $1" >&2

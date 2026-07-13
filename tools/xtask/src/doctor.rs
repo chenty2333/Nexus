@@ -21,6 +21,7 @@ const REQUIRED_PATHS: &[&str] = &[
     "specs/cser/RUNTIME_NET.md",
     "specs/cser/LinuxIoCompositionCserSafetyMC.cfg",
     "specs/cser/LinuxIoCompositionCserMC.cfg",
+    "specs/cser/LinuxIoCompositionCserFallbackMC.cfg",
     "specs/cser/LINUX_IO_COMPOSITION.md",
     "tests/guest/linux/SOURCES.toml",
 ];

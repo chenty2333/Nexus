@@ -136,11 +136,16 @@ input audits. An explicit five-scenario state-space quotient preserves the
 named derive, mixed-I/O, new-domain crash, DMA-timeout, and reject evidence; it
 does not claim the abandoned all-feature Cartesian product. The reject-enabled
 safety graph has 3,723,455 generated / 1,225,367 distinct states at depth 55.
-The action graph has 3,656,517 generated / 1,207,917 distinct states at depth
-46 and checks two liveness formulas expanded into three TLC branches. The
-script additionally requires ten reachability witnesses. This remains bounded
-protocol evidence, not an arbitrary-graph, all-domain-crash, SMP, filesystem,
-network-stack, hardware, scale, or performance proof.
+The same traversal checks all ten action properties. Kernel-closure liveness
+checks the three non-vacuous closure partitions as one temporal branch over
+1,828,175 generated / 603,886 distinct states at depth 46; crash-fallback
+liveness separately checks both crash targets as two temporal branches over
+163 generated / 121 distinct states at depth 21. The script additionally
+requires ten reachability witnesses, restricted to their disjoint initial-state
+partitions; five Core witnesses share one complete traversal with an exact-name
+result gate. This remains bounded protocol evidence, not an arbitrary-graph,
+all-domain-crash, SMP, filesystem, network-stack, hardware, scale, or
+performance proof.
 
 The independent pinned OSTD/QEMU refinement now supplies a bounded
 implementation observation for the same one-key contract. Its `recover` path
