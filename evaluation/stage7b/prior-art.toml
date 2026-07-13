@@ -4,7 +4,7 @@ source_policy = "primary-source-required"
 source_card_directory = "evaluation/stage7b/prior-art-sources"
 expected_count = 16
 default_contribution_decision = "narrow"
-decision_note = "Fourteen rows were audited against retrievable primary full text, specifications, or API documentation. The Shadow Drivers and Atomic RPC publisher records were reachable but their full text was unavailable to this audit, so those comparison dimensions remain unresolved and cannot support a stronger decision."
+decision_note = "Fifteen rows were audited against retrievable primary full text, specifications, or API documentation. The author-hosted Shadow Drivers paper is now full-text audited. The Atomic RPC publisher record was reachable but its full text remains unavailable to this audit, so that comparison dimension remains unresolved and cannot support a stronger decision."
 
 [[row]]
 id = "sel4.reply-capability-revoke"
@@ -83,18 +83,18 @@ claim_impact = "Restartable multi-service OS structure is prior work; a CSER dec
 
 [[row]]
 id = "shadow-drivers.device-recovery"
-primary_source = "Swift, Bershad, and Levy, Improving the Reliability of Commodity Operating Systems, SOSP 2003, https://doi.org/10.1145/945445.945466"
-source_locator = "publisher bibliographic record only; pages 207-222; full text unavailable in this audit"
-mechanism = "Unresolved in this audit because the publisher full text was unavailable; no mechanism detail is inferred from secondary summaries."
-authority_scope = "Unresolved in this audit."
-async_effect_tracking = "Unresolved in this audit."
-commit_or_linearization_gate = "Unresolved in this audit."
-crash_or_rebind_fencing = "Unresolved in this audit."
-resource_accounting = "Unresolved in this audit."
-device_quiescence = "Unresolved in this audit."
-overlap_with_cser = "The bibliographic topic makes device-driver recovery an adjacent comparison, but no detailed overlap is treated as audited."
-difference_from_fixed_cser_boundary = "Unresolved pending primary full-text review."
-claim_impact = "This unresolved primary-source row prevents the matrix from supporting a stronger-than-narrow contribution decision."
+primary_source = "Swift, Annamalai, Bershad, and Levy, Recovering Device Drivers, OSDI 2004, https://www.usenix.org/conference/osdi-04/recovering-device-drivers"
+source_locator = "sections 3.2-4.5, especially 4.2 Passive-Mode Monitoring, 4.3 Active-Mode Recovery, and 4.5 Limitations"
+mechanism = "A class-specific shadow driver passively monitors replicated kernel-driver calls and records recovery state; after a fail-stop driver failure, taps redirect calls to the shadow while it proxies service, restarts a clean driver, reconnects existing kernel resources, restores configuration, and resumes or cancels outstanding requests."
+authority_scope = "One device-driver instance and its class-specific shadow, including connections, configuration, pending commands, outstanding packets, and kernel objects. The paper does not define one request-derived authority root spanning multiple restartable OS services."
+async_effect_tracking = "Present for the device boundary: pending commands remain logged until handled, outstanding packets retain tracked references, and the shadow records timers, interrupt lines, and I/O regions. Tracking follows one driver interface and cannot observe ad-hoc shared-memory communication; it is not a registry-native causal descendant tree."
+commit_or_linearization_gate = "The paper explicitly states that shadow drivers cannot guarantee exactly-once behavior: after device submission but before kernel completion notification, the shadow cannot know whether a request ran and must choose between replay with duplication risk and cancellation with loss risk. It defines no revoke-versus-device-commit gate or one-shot guest-result publication."
+crash_or_rebind_fencing = "Active taps cut driver-kernel communication, a clean driver is reinitialized, existing registrations and callbacks are reattached, and taps return to passive mode after state transfer. No binding generation, stale callback or ticket validation, or identity-preserving cross-service adoption protocol is specified."
+resource_accounting = "Nooks object tracking lets the shadow retain kernel-visible service objects, garbage-collect other driver resources, and reuse existing registrations during restart. The paper does not define a conserved typed-credit ledger shared by multiple services."
+device_quiescence = "Recovery disables the device and interrupt line and, where the platform supports I/O memory mapping, removes mappings to prevent DMA before restart; resources are later re-enabled as the driver is reattached. The paper defines neither reset and IOTLB acknowledgement nor generation-checked ownership or a retained same-effect tombstone, and it assumes no irreversible side effect that recovery would need to undo."
+overlap_with_cser = "Direct overlap includes request and configuration tracking, proxying across driver restart, outstanding-request replay or cancellation, IRQ and DMA-mapping fencing, retained resource identity, and explicit recognition that post-submission completion may be unknowable."
+difference_from_fixed_cser_boundary = "Shadow Drivers conceals failure and applies class-specific replay or cancellation despite post-submit ambiguity. Fixed CSER instead composes one canonical production authority and shared ledger across personality, filesystem, block, and device domains, orders revocation against commit, and reports indeterminate post-commit closure while retaining ownership until reset and IOTLB acknowledgement."
+claim_impact = "Shadow Drivers establishes device recovery, interface-level effect tracking, resource reattachment, IRQ and DMA fencing, and post-submit ambiguity as prior ingredients. A CSER contribution must therefore rest on canonical cross-service identity, generational fencing, shared conserved ownership, and an explicit honest closure and tombstone result rather than those ingredients separately."
 
 [[row]]
 id = "txos.os-transactions"

@@ -29,7 +29,7 @@ const BASE_NARROW_EXCLUSIONS: &[&str] = &[
     "cross-object crash/panic atomicity between transition gates and case-local Registry ledgers",
 ];
 
-const METADATA_ONLY_EXCLUSION: &str = "full-text audit for Shadow Drivers and Atomic RPC";
+const METADATA_ONLY_EXCLUSION: &str = "full-text audit for Atomic RPC";
 
 const CONCURRENCY_IDS: &[&str] = &[
     "wait.wake-vs-timeout-single-winner",
@@ -364,7 +364,7 @@ const PRIOR_ART_ACCESS_KINDS: &[&str] = &[
     "primary-full-text",
     "primary-full-text",
     "primary-full-text",
-    "primary-metadata",
+    "primary-full-text",
     "primary-full-text",
     "primary-full-text",
     "primary-full-text",
@@ -383,7 +383,7 @@ const PRIOR_ART_URLS: &[&str] = &[
     "https://arxiv.org/abs/2606.22504",
     "https://doi.org/10.1145/248155.238779",
     "https://www.usenix.org/conference/osdi-08/curios-improving-reliability-through-operating-system-structure",
-    "https://doi.org/10.1145/945445.945466",
+    "https://www.usenix.org/conference/osdi-04/recovering-device-drivers",
     "https://doi.org/10.1145/1629575.1629591",
     "https://doi.org/10.1145/1095810.1095829",
     "https://www.usenix.org/conference/osdi-06/rethink-sync",
@@ -402,7 +402,7 @@ const PRIOR_ART_SOURCE_DIGESTS: &[&str] = &[
     "45efdfa3d5a16a712f964ae79dbc46df8ef843904da137ad4baeebf83b125f84",
     "0c359f25cd2566280017540f2f16981cc8fb41bab9f68959377fd6758d153525",
     "cf7831aa5ae46d4e69fd61ae01a313aaf7eb524d43d7336848b4b8f407b18695",
-    "unavailable",
+    "7489c8611bf48fe03cd84bc0c56757a7f95c2b8790cf95cb00106418e2c8a346",
     "5b05f2783c543b27d37393d6cf48f3c63c16c69eb276b51e2b07bc3fa067b459",
     "bd6e83fc0954d7e37a24f7245d11a7f1eaf42588f36307f5782c51bcd4eb6636",
     "dee41e8bdbb52c116cc4bd0fceb9c2d7349976f583601247e6a58d1abe43ec61",
@@ -421,7 +421,7 @@ const PRIOR_ART_AUDIT_DIGESTS: &[&str] = &[
     "ad44b2e9a019fb9155a131d9a58e634ebfbea860ed9a8e9b008189ef3bb4cec3",
     "98794084fabe7bff8e81010fdc48a69dbbf41aaaf7bb6188d13c882444d785a8",
     "7faadbe6778f21d039bc031214c46043f3f5bcd92cac1ec6cc254c96de0a7e72",
-    "fc120b69a8aa110d702218f1009b91cf9ac84a7e0326b4d456b629802810ae21",
+    "003996a1dc2f41de1a2be15a86025c046188cd5c3b2697ddc7c50127532d17f5",
     "3eebfc4954c5339348b5f5aa40d7040563fd3cc819effa7f37cfdd5046191486",
     "81fd1241fb28abd9dbb9eee146cb918d3ce5a11c60b95ee26bd7a46115b79fc2",
     "a932951129d0758067c1421797275b725608a5658b84713cc761e1130a31839e",
@@ -662,7 +662,7 @@ pub(crate) fn run(root: &Path) -> Result<Summary, String> {
         .map_err(|error| format!("serialize contribution decision: {error}"))?;
     json.push(b'\n');
     atomic_write(&directory.join("contribution.json"), &json)?;
-    let oracle = b"schema=nexus.stage7b.contribution-oracle.v1\nstatus=passed\nverdict=narrow\nconcurrency=14/14\nfault_matrix=20/20\nfault_registry_backed_nonzero_credit_cells=15/15\nfault_scheduler_typed_no_credit_witnesses=5/5\nfault_registry_scope=case-local\nshared_production_fault_scope=not-established\ncross_object_crash_panic_atomicity=not-established\nscale=14/14\nperformance_protocol=29/29\nprior_art_rows=16/16\nprior_art_full_text=14/16\nfull_production_adapter_equivalence=not-established\nnovelty=not-established\nfirst=not-established\nproved=not-established\nforbidden_claims=false\n";
+    let oracle = b"schema=nexus.stage7b.contribution-oracle.v1\nstatus=passed\nverdict=narrow\nconcurrency=14/14\nfault_matrix=20/20\nfault_registry_backed_nonzero_credit_cells=15/15\nfault_scheduler_typed_no_credit_witnesses=5/5\nfault_registry_scope=case-local\nshared_production_fault_scope=not-established\ncross_object_crash_panic_atomicity=not-established\nscale=14/14\nperformance_protocol=29/29\nprior_art_rows=16/16\nprior_art_full_text=15/16\nfull_production_adapter_equivalence=not-established\nnovelty=not-established\nfirst=not-established\nproved=not-established\nforbidden_claims=false\n";
     atomic_write(&directory.join("contribution-oracle.log"), oracle)?;
     Ok(Summary { verdict: "narrow" })
 }
@@ -678,7 +678,7 @@ fn narrow_decision() -> Decision {
             fault_matrix: "Checked 20/20: 15 case-local Registry-backed nonzero-credit cells and 5 typed N/A scheduler witnesses",
             scale_structure: "Checked 14/14",
             performance_protocol: "Observed 29/29; no thresholds",
-            prior_art: "Checked 16/16 rows; 14 full-text and 2 primary-metadata-only",
+            prior_art: "Checked 16/16 rows; 15 full-text and 1 primary-metadata-only",
         },
         claim_status: ClaimStatus {
             novelty: "not-established",
@@ -690,7 +690,7 @@ fn narrow_decision() -> Decision {
             .copied()
             .chain([METADATA_ONLY_EXCLUSION])
             .collect(),
-        decision_reason: "all central safety, case-local fault, scale, and measurement-protocol gates pass, but shared production fault scope, cross-object crash/panic atomicity, and two full-text comparisons remain not established, so support-bounded is not authorized",
+        decision_reason: "all central safety, case-local fault, scale, and measurement-protocol gates pass, but shared production fault scope, cross-object crash/panic atomicity, and one full-text comparison remain not established, so support-bounded is not authorized",
     }
 }
 
@@ -736,10 +736,10 @@ fn prior_art_gate_passes(prior: &PriorArtReceipt) -> bool {
         && prior.source_policy == "primary-source-required"
         && prior.summary.rows == 16
         && prior.summary.source_cards == 16
-        && prior.summary.full_text == 14
-        && prior.summary.metadata_only == 2
+        && prior.summary.full_text == 15
+        && prior.summary.metadata_only == 1
         && prior.summary.default_verdict == "narrow"
-        && prior.metadata_only_exclusions == ["shadow-drivers.device-recovery", "atomic-rpc"]
+        && prior.metadata_only_exclusions == ["atomic-rpc"]
         && prior
             .sources
             .iter()
@@ -754,7 +754,7 @@ fn prior_art_gate_passes(prior: &PriorArtReceipt) -> bool {
             .all(|(index, (source, expected_kind))| {
                 source.access_kind == *expected_kind
                     && source.content_status
-                        == if [5, 11].contains(&index) {
+                        == if index == 11 {
                             "metadata-only-unavailable"
                         } else {
                             "full-text-audited"
@@ -1068,7 +1068,7 @@ fn validate_gate_descriptions(
         "Checked 20/20: 15 case-local Registry-backed nonzero-credit cells and 5 typed N/A scheduler witnesses",
         "Checked 14/14",
         "Observed 29/29; no thresholds",
-        "Checked 16/16 rows; 14 full-text and 2 primary-metadata-only",
+        "Checked 16/16 rows; 15 full-text and 1 primary-metadata-only",
     ];
     for ((gate, description), expected) in evidence.gates.iter().zip(descriptions).zip(exact_pass) {
         match gate.status {
@@ -1239,15 +1239,12 @@ mod tests {
             summary: PriorArtSummary {
                 rows: 16,
                 source_cards: 16,
-                full_text: 14,
-                metadata_only: 2,
+                full_text: 15,
+                metadata_only: 1,
                 default_verdict: String::from("narrow"),
                 support_bounded_allowed: false,
             },
-            metadata_only_exclusions: vec![
-                String::from("shadow-drivers.device-recovery"),
-                String::from("atomic-rpc"),
-            ],
+            metadata_only_exclusions: vec![String::from("atomic-rpc")],
             sources: PRIOR_ART_IDS
                 .iter()
                 .zip(PRIOR_ART_ACCESS_KINDS)
@@ -1255,7 +1252,7 @@ mod tests {
                 .map(|(index, (id, access_kind))| PriorArtSource {
                     id: String::from(*id),
                     access_kind: String::from(*access_kind),
-                    content_status: String::from(if [5, 11].contains(&index) {
+                    content_status: String::from(if index == 11 {
                         "metadata-only-unavailable"
                     } else {
                         "full-text-audited"
@@ -1399,10 +1396,7 @@ mod tests {
                 .collect(),
             central_fault_cells: vec![true; 20],
             support_bounded_allowed: false,
-            metadata_only_exclusions: vec![
-                String::from("shadow-drivers.device-recovery"),
-                String::from("atomic-rpc"),
-            ],
+            metadata_only_exclusions: vec![String::from("atomic-rpc")],
             reject_conditions: Vec::new(),
         }
     }

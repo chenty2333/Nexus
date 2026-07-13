@@ -11,6 +11,7 @@ const CARD_DIRECTORY: &str = "evaluation/stage7b/prior-art-sources";
 const JSON_OUTPUT: &str = "target/verification/stage7b/prior-art.json";
 const LOG_OUTPUT: &str = "target/verification/stage7b/prior-art-oracle.log";
 const RETRIEVED: &str = "2026-07-13";
+const SHADOW_DRIVERS_RETRIEVED: &str = "2026-07-14";
 
 const PRIOR_ART_FIELDS: &[&str] = &[
     "id",
@@ -28,7 +29,7 @@ const PRIOR_ART_FIELDS: &[&str] = &[
     "claim_impact",
 ];
 
-const METADATA_ONLY_IDS: &[&str] = &["shadow-drivers.device-recovery", "atomic-rpc"];
+const METADATA_ONLY_IDS: &[&str] = &["atomic-rpc"];
 const FORBIDDEN_CLAIM_WORDS: &[&str] = &["novel", "novelty", "first", "proved"];
 
 #[derive(Clone, Copy)]
@@ -90,12 +91,12 @@ const EXPECTED_SOURCES: &[ExpectedSource] = &[
     },
     ExpectedSource {
         id: "shadow-drivers.device-recovery",
-        bibliographic_url: "https://doi.org/10.1145/945445.945466",
-        access_url: "https://doi.org/10.1145/945445.945466",
-        access_kind: "primary-metadata",
-        content_status: "metadata-only-unavailable",
-        source_content_sha256: "unavailable",
-        audit_notes_sha256: "fc120b69a8aa110d702218f1009b91cf9ac84a7e0326b4d456b629802810ae21",
+        bibliographic_url: "https://www.usenix.org/conference/osdi-04/recovering-device-drivers",
+        access_url: "https://pages.cs.wisc.edu/~swift/papers/recovering-drivers.pdf",
+        access_kind: "primary-full-text",
+        content_status: "full-text-audited",
+        source_content_sha256: "7489c8611bf48fe03cd84bc0c56757a7f95c2b8790cf95cb00106418e2c8a346",
+        audit_notes_sha256: "003996a1dc2f41de1a2be15a86025c046188cd5c3b2697ddc7c50127532d17f5",
     },
     ExpectedSource {
         id: "txos.os-transactions",
@@ -337,9 +338,9 @@ fn validate(root: &Path) -> Result<Validated, String> {
         .iter()
         .filter(|card| card.content_status == "metadata-only-unavailable")
         .count();
-    if full_text != 14 || metadata_only != 2 {
+    if full_text != 15 || metadata_only != 1 {
         return Err(format!(
-            "prior-art source boundary mismatch: expected 14 full-text and 2 metadata-only, got {full_text} and {metadata_only}"
+            "prior-art source boundary mismatch: expected 15 full-text and 1 metadata-only, got {full_text} and {metadata_only}"
         ));
     }
 
@@ -395,7 +396,7 @@ fn validate_matrix(matrix: &Matrix) -> Result<(), String> {
             .contains("cannot support a stronger decision")
     {
         return Err(
-            "decision_note must explicitly exclude Shadow Drivers and Atomic RPC from a stronger decision"
+            "decision_note must record the Shadow Drivers resolution and exclude unresolved Atomic RPC from a stronger decision"
                 .into(),
         );
     }
@@ -504,10 +505,15 @@ fn validate_card(
         &card.access_kind,
         expected.access_kind,
     )?;
+    let expected_retrieved = if card.id == "shadow-drivers.device-recovery" {
+        SHADOW_DRIVERS_RETRIEVED
+    } else {
+        RETRIEVED
+    };
     expect(
         &format!("source card {} retrieved", card.id),
         &card.retrieved,
-        RETRIEVED,
+        expected_retrieved,
     )?;
     expect(
         &format!("source card {} content_status", card.id),
@@ -756,10 +762,7 @@ fn write_receipts(root: &Path, validated: &Validated) -> Result<(), String> {
 
     let mut log = String::new();
     log.push_str(
-        "STAGE7B PRIOR_ART PASS rows=16 source_cards=16 full_text=14 metadata_only=2 default_verdict=narrow support_bounded_allowed=false\n",
-    );
-    log.push_str(
-        "PRIOR_ART METADATA_ONLY id=shadow-drivers.device-recovery status=metadata-only-unavailable exclusion=stronger-than-narrow\n",
+        "STAGE7B PRIOR_ART PASS rows=16 source_cards=16 full_text=15 metadata_only=1 default_verdict=narrow support_bounded_allowed=false\n",
     );
     log.push_str(
         "PRIOR_ART METADATA_ONLY id=atomic-rpc status=metadata-only-unavailable exclusion=stronger-than-narrow\n",
@@ -920,8 +923,8 @@ mod tests {
             Summary {
                 rows: 16,
                 source_cards: 16,
-                full_text: 14,
-                metadata_only: 2,
+                full_text: 15,
+                metadata_only: 1,
                 default_verdict: "narrow".into(),
                 support_bounded_allowed: false,
             }
@@ -931,16 +934,15 @@ mod tests {
         )
         .expect("parse JSON receipt");
         assert_eq!(json["status"], "passed");
-        assert_eq!(json["summary"]["full_text"], 14);
-        assert_eq!(json["summary"]["metadata_only"], 2);
+        assert_eq!(json["summary"]["full_text"], 15);
+        assert_eq!(json["summary"]["metadata_only"], 1);
         assert_eq!(json["summary"]["default_verdict"], "narrow");
         assert_eq!(json["summary"]["support_bounded_allowed"], false);
         assert_eq!(json["metadata_only_exclusions"][0], METADATA_ONLY_IDS[0]);
-        assert_eq!(json["metadata_only_exclusions"][1], METADATA_ONLY_IDS[1]);
         let log = fs::read_to_string(fixture.root.join(LOG_OUTPUT)).expect("read oracle log");
-        assert!(log.contains("full_text=14 metadata_only=2"));
+        assert!(log.contains("full_text=15 metadata_only=1"));
         assert!(log.contains("default_verdict=narrow support_bounded_allowed=false"));
-        assert_eq!(log.matches("PRIOR_ART METADATA_ONLY").count(), 2);
+        assert_eq!(log.matches("PRIOR_ART METADATA_ONLY").count(), 1);
         assert_eq!(log.matches("PRIOR_ART SOURCE").count(), 16);
     }
 

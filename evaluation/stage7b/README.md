@@ -73,8 +73,8 @@ The `stage7b-evidence` host gate reruns all 14 implementation-source Loom
 harnesses, recomputes every scale and performance oracle, validates all 16
 primary-source comparison rows and source cards, and emits the contribution
 decision. The current decision is `narrow`: all central safety, fault, scale,
-and measurement-protocol gates pass, but Shadow Drivers and Atomic RPC remain
-primary-metadata-only rather than full-text-audited. `novel`, `first`, and
+and measurement-protocol gates pass, and Shadow Drivers is now full-text
+audited, but Atomic RPC remains primary-metadata-only. `novel`, `first`, and
 `proved` are not established. SMP, hardware cycles, lock freedom, durable
 external effects, Linux breadth, and identity-preserving Stage 5B root
 composition remain excluded, as do a shared production fault-budget scope and

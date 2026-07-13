@@ -59,7 +59,7 @@ The accepted evaluation boundary is:
 | Fault injection | 20/20 Checked | Case-local ledgers in release, single-vCPU, single-thread-TCG QEMU |
 | Structural scale | 14/14 Checked | Finite tuples; no asymptotic or production `O(k)` claim |
 | Performance | 29/29 Observed | Guest-visible TSC samples; no threshold, baseline, or hardware-cycle claim |
-| Prior art | 16 sources | 14 full-text audits and 2 primary-metadata-only comparisons |
+| Prior art | 16 sources | 15 full-text audits and 1 primary-metadata-only comparison |
 | Contribution decision | `narrow` | A bounded compositional result, not novelty or firstness |
 
 This release does **not** establish whole-system proof, SMP or production-lock
