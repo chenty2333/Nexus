@@ -9,6 +9,9 @@
 
 use alloc::sync::Arc;
 
+use cser_transition_gates::deadline::{
+    DeadlineError, DeadlineGate, DeadlineProjection, DeadlineToken,
+};
 use linux_raw_sys::general::__NR_futex;
 use ostd::{
     arch::cpu::context::{CpuException, UserContext},
@@ -16,12 +19,13 @@ use ostd::{
     prelude::*,
     sync::SpinLock,
     task::{Task, TaskOptions, disable_preempt},
+    timer::Jiffies,
     user::{ReturnReason, UserMode},
 };
 
 use crate::{
     TaskData, USER_MAP_ADDR, create_vm_space,
-    effect::{EffectTimer, EffectToken, EffectWaiter, EffectWaker},
+    effect::{EffectToken, EffectWaiter, EffectWaker},
     scheduler::{Binding, CserScheduler, FIRST_FALLBACK_SELECTION_ATTEMPT, ProposalResult},
 };
 
@@ -246,6 +250,7 @@ struct RecoveryImage {
     queue_wait: Option<u64>,
     frozen_wait: Option<u64>,
     frozen_count: Option<u32>,
+    watchdog: DeadlineProjection,
     watchdog_cohort: usize,
     wait_free: u64,
     wait_held: u64,
@@ -313,7 +318,7 @@ struct FutexState {
     enable_waker: Option<EffectWaker>,
     completion_waker: Option<EffectWaker>,
     waker_enabled: bool,
-    watchdog: Option<EffectTimer>,
+    watchdog: DeadlineGate,
     watchdog_cohort: usize,
     wait_free: u64,
     wait_held: u64,
@@ -340,6 +345,7 @@ impl FutexState {
             queue_wait: self.queue_wait,
             frozen_wait: self.frozen_wait,
             frozen_count: self.frozen_count,
+            watchdog: self.watchdog.projection(),
             watchdog_cohort: self.watchdog_cohort,
             wait_free: self.wait_free,
             wait_held: self.wait_held,
@@ -374,7 +380,7 @@ impl FutexState {
             wake_held: self.wake_held,
             timer_free: self.timer_free,
             timer_held: self.timer_held,
-            watchdog: self.watchdog.is_some(),
+            watchdog: self.watchdog.current().is_some(),
             watchdog_cohort: self.watchdog_cohort,
             wait_waker: self.wait_waker.is_some(),
             wake_waker: self.wake_waker.is_some(),
@@ -433,7 +439,8 @@ impl FutexScenario {
                 enable_waker: None,
                 completion_waker: Some(completion_waker),
                 waker_enabled: false,
-                watchdog: None,
+                watchdog: DeadlineGate::new(kind.scope_id())
+                    .expect("futex watchdog owner is nonzero"),
                 watchdog_cohort: 0,
                 wait_free: 1,
                 wait_held: 0,
@@ -673,8 +680,23 @@ impl FutexScenario {
         }
         assert_eq!((state.timer_free, state.timer_held), (1, 0));
         let cohort = usize::from(state.wait.is_some()) + usize::from(state.wake.is_some());
-        let timer = EffectTimer::after(self.effect_token(3), 1);
-        assert_eq!(timer.token(), self.effect_token(3));
+        let armed_deadline = Jiffies::elapsed().as_u64().saturating_add(1);
+        let old_watchdog = state
+            .watchdog
+            .arm(armed_deadline)
+            .expect("fresh futex watchdog must arm");
+        let deadline = armed_deadline.saturating_add(1);
+        let watchdog = state
+            .watchdog
+            .rearm(old_watchdog, deadline)
+            .expect("futex recovery must rearm with a fresh generation");
+        let before_stale_probe = state.watchdog;
+        assert_eq!(
+            state.watchdog.expire(old_watchdog, u64::MAX),
+            Err(DeadlineError::StaleToken)
+        );
+        assert_eq!(state.watchdog, before_stale_probe);
+        assert_eq!(state.watchdog.current(), Some(watchdog));
         state.binding_epoch = 2;
         state.supervisor = None;
         state.fallback_running = true;
@@ -682,7 +704,6 @@ impl FutexScenario {
         state.snapshot_taken = false;
         state.snapshot_revision = None;
         state.snapshot_image = None;
-        state.watchdog = Some(timer);
         state.watchdog_cohort = cohort;
         state.timer_free = 0;
         state.timer_held = 1;
@@ -695,6 +716,14 @@ impl FutexScenario {
             self.kind.label(),
             self.kind.personality_v1_task_id(),
             cohort,
+        );
+        println!(
+            "LINUX_FUTEX WatchdogGate scenario={} action=arm+rearm owner={} old_generation={} generation={} deadline={} stale_old=StaleToken mutation=false",
+            self.kind.label(),
+            watchdog.owner(),
+            old_watchdog.generation(),
+            watchdog.generation(),
+            watchdog.deadline(),
         );
     }
 
@@ -854,10 +883,14 @@ impl FutexScenario {
             }
             let mut adopted = packet;
             adopted.binding_epoch = state.binding_epoch;
-            state.wait.as_mut().expect("validated wait remains").token = adopted;
             assert_eq!(state.watchdog_cohort, 1);
+            let watchdog = state.watchdog.current().expect("watchdog is armed");
+            state
+                .watchdog
+                .cancel(watchdog)
+                .expect("adoption cancels the current watchdog generation");
             state.watchdog_cohort = 0;
-            state.watchdog = None;
+            state.wait.as_mut().expect("validated wait remains").token = adopted;
             state.timer_free = 1;
             state.timer_held = 0;
             state.recovery_revision += 1;
@@ -1174,7 +1207,7 @@ impl FutexScenario {
             state.wake_held = 0;
             state.timer_free = 1;
             state.timer_held = 0;
-            state.watchdog = None;
+            assert!(state.watchdog.current().is_none());
             state.watchdog_cohort = 0;
             state.abort_publications = 2;
             state.publication_pending = false;
@@ -1197,7 +1230,7 @@ impl FutexScenario {
             && state.wait_waker.is_none()
             && state.wake_waker.is_none()
             && !state.publication_pending
-            && state.watchdog.is_none()
+            && state.watchdog.current().is_none()
             && state.watchdog_cohort == 0
             && (state.wait_free, state.wait_held) == (1, 0)
             && (state.wake_free, state.wake_held) == (1, 0)
@@ -1216,8 +1249,12 @@ impl FutexScenario {
         PortalResult::Applied
     }
 
-    fn watchdog_timer(&self) -> EffectTimer {
-        self.state.lock().watchdog.expect("watchdog is armed")
+    fn watchdog_timer(&self) -> DeadlineToken {
+        self.state
+            .lock()
+            .watchdog
+            .current()
+            .expect("watchdog is armed")
     }
 
     fn delivery(&self, waiter: bool) -> Delivery {
@@ -1277,7 +1314,7 @@ impl FutexScenario {
         assert!(!state.publication_pending);
         assert!(state.queue_wait.is_none());
         assert!(state.wait_waker.is_none() && state.wake_waker.is_none());
-        assert!(state.watchdog.is_none());
+        assert!(state.watchdog.current().is_none());
         assert_eq!(state.watchdog_cohort, 0);
         state.assert_credit_conservation();
         assert_eq!(
@@ -1481,13 +1518,23 @@ impl FutexScenario {
     fn expire_watchdog_and_close(&self) {
         assert_eq!(self.kind, ScenarioKind::Expire);
         let timer = self.watchdog_timer();
-        assert!(timer.is_expired());
+        let observed_now = Jiffies::elapsed().as_u64();
+        assert!(observed_now >= timer.deadline());
+        {
+            let mut state = self.state.lock();
+            let receipt = state
+                .watchdog
+                .expire(timer, observed_now)
+                .expect("current elapsed futex watchdog must expire");
+            assert_eq!(receipt.token(), timer);
+            assert_eq!(receipt.observed_now(), observed_now);
+        }
         let old_wake = self.current_wake_token();
         println!(
             "LINUX_FUTEX WatchdogExpire scenario=expire deadline={} authority_epoch={} scope={} cohort=2 linux_timeout=false",
             timer.deadline(),
-            timer.token().authority_epoch,
-            timer.token().scope_id,
+            AUTHORITY_EPOCH,
+            self.kind.scope_id(),
         );
         self.revoke_begin("recovery_watchdog_expired");
         let before = self.projection();
@@ -2051,7 +2098,7 @@ fn run_watchdog(
         }
         ScenarioKind::Expire => {
             let timer = scenario.watchdog_timer();
-            while !timer.is_expired() {
+            while Jiffies::elapsed().as_u64() < timer.deadline() {
                 Task::yield_now();
             }
             scenario.expire_watchdog_and_close();

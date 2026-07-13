@@ -565,6 +565,28 @@ companion therefore claims neither retained-workload identity, registry-native
 multi-domain bindings, real DMA in the primary boot, identity-preserving Stage
 5B composition, TCP/VirtIO-net breadth, nor SMP.
 
+### Stage 7B release evaluator
+
+`./x eval-stage7b` builds the kernel with the isolated `stage7b-eval` feature
+and a release profile, then runs only the evaluator. The runner fixes
+`-smp 1 -accel tcg,thread=single`, pins the Docker/QEMU process to the first CPU
+in the host's allowed CPU list, and records that pin beside the raw serial log.
+The 20 fault cells exercise the shared scheduler, deadline, pager, one-shot,
+registry, and I/O transition gates. The 14 scale points use the production
+`EffectRegistry` fixture and require zero target-record visits at begin,
+`next_calls = k + 1`, `head_selections = k`, one exact `k`-member completion
+validation, and zero unrelated/history visits.
+
+The evaluator retains 257 empty-timer samples and 65 raw samples for each of 29
+operations. TSC reads are LFENCE-delimited with local IRQs and preemption
+disabled only for the measured interval; fixture construction, clone, full
+invariant reconstruction, and serial output stay outside. The host oracle
+recomputes min, median, nearest-rank p95, and max. These data are Observed
+guest-visible TSC results, not hardware cycles, thresholds, or a performance
+superiority claim. Implementation-source Loom evidence remains separately
+bounded to production transition source under a Loom-modeled outer mutex; it
+does not verify OSTD `SpinLock`, SMP execution, lock freedom, or liveness.
+
 ## IOMMU result: fail closed
 
 OSTD 0.18's `src/mm/dma/util.rs::unmap_dma_remap` removes second-stage page

@@ -3,9 +3,14 @@
 ARG OSDK_IMAGE=asterinas/osdk:0.18.0-20260603@sha256:a7540bfcd262ae52471f86353a87663d91941958e503557863738d13de4aace3
 FROM ${OSDK_IMAGE}
 
+COPY crates/cser-transition-gates /crates/cser-transition-gates
+
 RUN rustup target add --toolchain nightly-2026-04-03 x86_64-unknown-none \
     && rustup component add --toolchain nightly-2026-04-03 rustfmt clippy \
     && cargo install cargo-osdk --version 0.18.0 --locked
+
+COPY kernel/nexus-ostd/src/cser/effect_registry.rs \
+    /kernel/nexus-ostd/src/cser/effect_registry.rs
 
 # cargo-osdk's -Zbuild-std and generated runner packages have dependencies that
 # a plain `cargo fetch --target` does not discover. Prime the real graph while

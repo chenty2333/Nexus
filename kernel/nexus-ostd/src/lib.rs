@@ -41,6 +41,9 @@ mod pager;
 mod readiness;
 #[path = "domains/scheduler.rs"]
 mod scheduler;
+#[cfg(feature = "stage7b-eval")]
+#[path = "evaluation/stage7b.rs"]
+mod stage7b_evaluation;
 
 use alloc::{boxed::Box, sync::Arc};
 
@@ -99,6 +102,17 @@ impl TaskData {
 
 #[ostd::main]
 fn kernel_main() {
+    #[cfg(feature = "stage7b-eval")]
+    {
+        stage7b_evaluation::run();
+        poweroff(ExitCode::Success);
+    }
+
+    #[cfg(not(feature = "stage7b-eval"))]
+    kernel_main_standard();
+}
+
+fn kernel_main_standard() {
     let scheduler: &'static CserScheduler = Box::leak(Box::new(CserScheduler::new(
         AUTHORITY_EPOCH,
         POLICY_LEASE_TICKS,

@@ -10,6 +10,7 @@ boot_protocol = "multiboot2"
 [qemu]
 args = """\
     -machine q35,kernel-irqchip=split \
+    -accel tcg,thread=single \
     -cpu Icelake-Server,+x2apic \
     -m 1G \
     -smp 1 \

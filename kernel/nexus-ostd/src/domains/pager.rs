@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::sync::Arc;
+use core::convert::Infallible;
+
+use cser_transition_gates::pager::{
+    ContinuationOutcome as GateContinuationOutcome, FaultKey as GateFaultKey, FaultTicket,
+    MappingReceipt, PagerError, PagerGate, PagerSnapshot, RegisterFault,
+};
 
 use ostd::{
     arch::cpu::context::{CpuException, UserContext},
@@ -143,6 +149,10 @@ struct FaultRecord {
 }
 
 struct PagerState {
+    gate: PagerGate<2>,
+    gate_ticket: Option<FaultTicket>,
+    gate_snapshot: Option<PagerSnapshot>,
+    gate_mapping: Option<MappingReceipt>,
     authority_epoch: u64,
     binding_epoch: u64,
     scope_phase: ScopePhase,
@@ -180,6 +190,11 @@ impl PagerScenario {
             kind,
             client_vm,
             state: SpinLock::new(PagerState {
+                gate: PagerGate::new(PAGER_AUTHORITY_EPOCH, 1, kind.pager_v1_task_id())
+                    .expect("valid pager transition gate"),
+                gate_ticket: None,
+                gate_snapshot: None,
+                gate_mapping: None,
                 authority_epoch: PAGER_AUTHORITY_EPOCH,
                 binding_epoch: 1,
                 scope_phase: ScopePhase::Active,
@@ -227,7 +242,24 @@ impl PagerScenario {
             assert!(state.client_waker.is_none());
             assert_eq!(state.client_outcome, ClientOutcome::Pending);
 
-            let binding_epoch = state.binding_epoch;
+            let gate_ticket = match state
+                .gate
+                .register(
+                    GateFaultKey {
+                        address_space_id: ADDRESS_SPACE_ID,
+                        address_space_generation: ADDRESS_SPACE_GENERATION,
+                        page_address: u64::try_from(FAULT_ADDR).expect("fault address fits u64"),
+                    },
+                    self.kind.client_task_id(),
+                )
+                .expect("first fault owns the production pager slot")
+            {
+                RegisterFault::Leader(ticket) => ticket,
+                RegisterFault::Follower(_) => unreachable!("first fault is the leader"),
+            };
+            let binding_epoch = gate_ticket.binding_epoch();
+            assert_eq!(binding_epoch, state.binding_epoch);
+            state.gate_ticket = Some(gate_ticket);
             state.fault = Some(FaultRecord {
                 effect_id: token.effect_id,
                 authority_epoch: token.authority_epoch,
@@ -293,6 +325,11 @@ impl PagerScenario {
             assert_eq!(fault.page_address, FAULT_ADDR);
             assert_eq!(fault.access_bits, EXPECTED_ACCESS_BITS);
             assert_eq!(fault.phase, FaultPhase::Registered);
+            let gate_ticket = state.gate_ticket.expect("fault gate ticket");
+            state
+                .gate
+                .prepare_leader(gate_ticket)
+                .expect("production pager prepare gate accepts current leader");
             state.fault.as_mut().unwrap().phase = FaultPhase::Prepared;
             state.prepared_frame = Some(candidate);
             state.free_credit = 0;
@@ -315,10 +352,12 @@ impl PagerScenario {
             assert_eq!(state.fault.as_ref().unwrap().phase, FaultPhase::Prepared);
             assert!(state.prepared_frame.is_some());
 
-            state.binding_epoch = state
-                .binding_epoch
-                .checked_add(1)
-                .expect("pager binding epoch overflow");
+            let gate_crash = state
+                .gate
+                .crash(presented_binding_epoch)
+                .expect("production pager crash gate accepts current binding");
+            assert_eq!(gate_crash.previous_binding_epoch, state.binding_epoch);
+            state.binding_epoch = gate_crash.binding_epoch;
             state.supervisor = None;
             state.fallback_running = true;
             state.snapshot_taken = false;
@@ -346,6 +385,14 @@ impl PagerScenario {
             let mut state = self.state.lock();
             assert_ne!(state.binding_epoch, presented_binding_epoch);
             assert!(!state.mapping_published);
+            let before = state.gate.projection();
+            assert_eq!(
+                state
+                    .gate
+                    .reply_gate(PAGER_AUTHORITY_EPOCH, presented_binding_epoch),
+                Err(PagerError::StaleBinding)
+            );
+            assert_eq!(state.gate.projection(), before);
             state.stale_rejections += 1;
             if after_rebind {
                 assert!(state.supervisor.is_some());
@@ -373,6 +420,14 @@ impl PagerScenario {
             assert!(state.replacement_ready);
             assert_eq!(state.fault.as_ref().unwrap().phase, FaultPhase::Prepared);
             assert!(!state.mapping_published);
+            let before = state.gate.projection();
+            assert_eq!(
+                state
+                    .gate
+                    .reply_gate(PAGER_AUTHORITY_EPOCH, presented_binding_epoch),
+                Err(PagerError::NoSupervisor)
+            );
+            assert_eq!(state.gate.projection(), before);
             state.pre_rebind_rejections += 1;
         }
         println!(
@@ -413,6 +468,11 @@ impl PagerScenario {
             assert_eq!(state.supervisor, None);
             assert!(state.fallback_running);
             assert!(!state.snapshot_taken);
+            let gate_snapshot = state
+                .gate
+                .snapshot(replacement_task_id, 1)
+                .expect("production pager freezes the recovery snapshot");
+            state.gate_snapshot = Some(gate_snapshot);
             state.snapshot_taken = true;
             let fault = state.fault.as_ref().unwrap();
             (fault.effect_id, fault.phase)
@@ -434,6 +494,11 @@ impl PagerScenario {
             assert_eq!(state.supervisor, None);
             assert!(state.snapshot_taken);
             assert!(!state.replacement_ready);
+            let gate_snapshot = state.gate_snapshot.expect("pager gate snapshot");
+            state
+                .gate
+                .ready(gate_snapshot)
+                .expect("production pager accepts readiness for exact snapshot");
             state.replacement_ready = true;
         }
         println!(
@@ -453,6 +518,11 @@ impl PagerScenario {
             assert!(state.fallback_running);
             assert!(state.snapshot_taken);
             assert!(state.replacement_ready);
+            let gate_rebind = state
+                .gate
+                .rebind(replacement_task_id)
+                .expect("production pager rebind follows ready snapshot");
+            assert_eq!(gate_rebind.binding_epoch, presented_binding_epoch);
             state.supervisor = Some(replacement_task_id);
             state.fallback_running = false;
         }
@@ -499,6 +569,13 @@ impl PagerScenario {
             assert_eq!(fault.access_bits, EXPECTED_ACCESS_BITS);
             assert_eq!(fault.phase, FaultPhase::Prepared);
             let old_binding_epoch = fault.binding_epoch;
+            let old_gate_ticket = state.gate_ticket.expect("orphan pager gate ticket");
+            let adopted_gate_ticket = state
+                .gate
+                .adopt(old_gate_ticket)
+                .expect("production pager explicitly adopts orphan");
+            assert_eq!(adopted_gate_ticket.binding_epoch(), presented_binding_epoch);
+            state.gate_ticket = Some(adopted_gate_ticket);
             let fault = state.fault.as_mut().unwrap();
             fault.binding_epoch = presented_binding_epoch;
             fault.phase = FaultPhase::Adopted;
@@ -558,10 +635,18 @@ impl PagerScenario {
                 .prepared_frame
                 .take()
                 .expect("adopted fault retains one prepared frame");
-            cursor.map(
-                frame.into(),
-                PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback),
-            );
+            let gate_ticket = state.gate_ticket.expect("adopted pager gate ticket");
+            let (gate_mapping, ()) = state
+                .gate
+                .commit_mapping_with(gate_ticket, || {
+                    cursor.map(
+                        frame.into(),
+                        PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback),
+                    );
+                    Ok::<(), Infallible>(())
+                })
+                .expect("production pager gate publishes exactly one mapping");
+            state.gate_mapping = Some(gate_mapping);
             state.fault.as_mut().unwrap().phase = FaultPhase::Committed;
             state.mapping_published = true;
             state.held_credit = 0;
@@ -595,6 +680,16 @@ impl PagerScenario {
             assert_eq!(state.fault.as_ref().unwrap().phase, FaultPhase::Committed);
             assert!(state.mapping_published);
             assert_eq!(state.terminalizations, 0);
+            let gate_ticket = state.gate_ticket.expect("committed pager gate ticket");
+            let gate_mapping = state.gate_mapping.expect("pager mapping receipt");
+            state
+                .gate
+                .terminalize(
+                    gate_ticket,
+                    Some(gate_mapping),
+                    GateContinuationOutcome::Resolved,
+                )
+                .expect("production pager continuation resolves once");
             state.fault.as_mut().unwrap().phase = FaultPhase::Completed;
             state.client_outcome = ClientOutcome::Resolved;
             state.terminalizations = 1;
@@ -640,10 +735,17 @@ impl PagerScenario {
             assert_eq!(state.terminalizations, 0);
 
             let old_authority_epoch = state.authority_epoch;
-            state.authority_epoch = state
-                .authority_epoch
-                .checked_add(1)
-                .expect("pager authority epoch overflow");
+            let gate_revoke = state
+                .gate
+                .begin_revoke()
+                .expect("production pager begins timeout revocation");
+            assert_eq!(gate_revoke.closed_authority_epoch, old_authority_epoch);
+            state.authority_epoch = gate_revoke.authority_epoch;
+            let gate_ticket = state.gate_ticket.expect("timeout pager gate ticket");
+            state
+                .gate
+                .terminalize(gate_ticket, None, GateContinuationOutcome::Aborted)
+                .expect("production pager aborts timeout continuation once");
             state.scope_phase = ScopePhase::Closing;
             state.cleanup_inflight = true;
             state.wake_pending = true;
@@ -712,6 +814,10 @@ impl PagerScenario {
             state.held_credit = 0;
             state.cleanup_inflight = false;
             state.wake_pending = false;
+            state
+                .gate
+                .complete_revoke(true)
+                .expect("production pager observes external cleanup before revoke complete");
             state.scope_phase = ScopePhase::Revoked;
             state.fallback_running = false;
         }

@@ -106,6 +106,16 @@ one-shot reset/closure receipts and IOTLB-completion-driven release
 serial/trace evidence oracle
 ```
 
+The semantic authority, binding, device-generation, effect commit/terminal,
+reset, and IOTLB-quiescence transitions are delegated to the shared
+`cser-transition-gates::io::IoGate<4>`. `Portal` retains only operation metadata
+and commit receipts needed to adapt the real `Session`, PCI transport, queue,
+and DMA owners. Reset and IOTLB pending paths carry both the hardware owner and
+the gate's non-copyable tombstone; `check-io-gate.sh` rejects reintroduction of
+the former shadow epoch/effect ledger. The Stage 7B concurrency claim for this
+source remains “production transition source under a Loom-modeled outer mutex,”
+not OSTD `SpinLock`, SMP, lock freedom, or liveness verification.
+
 `VirtIOBlk` is intentionally not used. It combines queue publication and
 notification and hides the queue/transport owners that the reset protocol must
 retain. The experiment still reuses its public sector-0 wire types rather than

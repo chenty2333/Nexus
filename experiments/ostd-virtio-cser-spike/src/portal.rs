@@ -3,10 +3,18 @@
 use alloc::boxed::Box;
 use bitflags::bitflags;
 use core::{
+    convert::Infallible,
     hint::spin_loop,
     marker::PhantomPinned,
     mem::{ManuallyDrop, forget},
     pin::Pin,
+};
+use cser_transition_gates::io::{
+    CloseReceipt as GateCloseReceipt, IoBinding, IoCommitError, IoCommitReceipt, IoError, IoGate,
+    IoIdentity, IoTerminal, IotlbAttempt as GateIotlbAttempt, IotlbProgress as GateIotlbProgress,
+    IotlbTombstone as GateIotlbTombstone, QuiescenceReceipt as GateQuiescenceReceipt,
+    ResetAttempt as GateResetAttempt, ResetOutcome as GateResetOutcome,
+    ResetReceipt as GateResetReceipt, ResetTombstone as GateResetTombstone,
 };
 use zerocopy::IntoBytes;
 
@@ -41,13 +49,7 @@ const REQUIRED_FEATURES: NexusBlkFeatures = NexusBlkFeatures::RO
     .union(NexusBlkFeatures::VERSION_1)
     .union(NexusBlkFeatures::ACCESS_PLATFORM);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EffectAuthority {
-    pub request_id: u64,
-    pub authority_epoch: u64,
-    pub binding_epoch: u64,
-    pub device_generation: u64,
-}
+pub type EffectAuthority = IoIdentity;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
@@ -63,78 +65,40 @@ pub enum RegisterError {
     Closing,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BindingToken {
-    epoch: u64,
-}
+pub type BindingToken = IoBinding;
+pub type Terminal = IoTerminal;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PortalPhase {
-    Active,
-    ServiceUnavailable,
-    Closing,
-    Quiesced,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Terminal {
-    Completed,
-    IndeterminateAfterReset,
-    AbortedBeforeCommit,
-}
-
-impl Terminal {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Completed => "Completed",
-            Self::IndeterminateAfterReset => "IndeterminateAfterReset",
-            Self::AbortedBeforeCommit => "AbortedBeforeCommit",
-        }
+pub const fn terminal_label(terminal: Terminal) -> &'static str {
+    match terminal {
+        Terminal::Completed => "Completed",
+        Terminal::IndeterminateAfterReset => "IndeterminateAfterReset",
+        Terminal::AbortedBeforeCommit => "AbortedBeforeCommit",
     }
 }
 
 pub struct Portal {
-    authority_epoch: u64,
-    binding_epoch: u64,
-    device_generation: u64,
-    next_request_id: u64,
-    effects: [Option<EffectRecord>; 4],
-    phase: PortalPhase,
-    authority_advanced_for_rebind: bool,
-    binding_advanced_for_rebind: bool,
-}
-
-#[derive(Clone, Copy)]
-struct EffectRecord {
-    authority: EffectAuthority,
-    operation: Operation,
-    committed: bool,
-    terminal: Option<Terminal>,
+    gate: IoGate<4>,
+    operations: [Option<(EffectAuthority, Operation)>; 4],
+    commits: [Option<(EffectAuthority, IoCommitReceipt)>; 4],
+    pending_close: Option<GateCloseReceipt>,
 }
 
 impl Portal {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            authority_epoch: 1,
-            binding_epoch: 1,
-            device_generation: 1,
-            next_request_id: 1,
-            effects: [const { None }; 4],
-            phase: PortalPhase::Active,
-            authority_advanced_for_rebind: false,
-            binding_advanced_for_rebind: false,
+            gate: IoGate::new().expect("non-empty portal transition ledger"),
+            operations: [None; 4],
+            commits: [None; 4],
+            pending_close: None,
         }
     }
 
     pub fn binding_token(&self) -> Result<BindingToken, RegisterError> {
-        match self.phase {
-            PortalPhase::Active => Ok(BindingToken {
-                epoch: self.binding_epoch,
-            }),
-            PortalPhase::ServiceUnavailable | PortalPhase::Quiesced => {
-                Err(RegisterError::ServiceUnavailable)
-            }
-            PortalPhase::Closing => Err(RegisterError::Closing),
+        match self.gate.binding_token() {
+            Ok(binding) => Ok(binding),
+            Err(IoError::Closing) => Err(RegisterError::Closing),
+            Err(IoError::ServiceUnavailable) => Err(RegisterError::ServiceUnavailable),
+            Err(error) => panic!("unexpected binding-token gate error: {error:?}"),
         }
     }
 
@@ -143,70 +107,49 @@ impl Portal {
         binding: BindingToken,
         operation: Operation,
     ) -> Result<EffectAuthority, RegisterError> {
-        if binding.epoch != self.binding_epoch {
-            return Err(RegisterError::StaleBinding);
-        }
-        match self.phase {
-            PortalPhase::Active => {}
-            PortalPhase::ServiceUnavailable | PortalPhase::Quiesced => {
-                return Err(RegisterError::ServiceUnavailable);
-            }
-            PortalPhase::Closing => return Err(RegisterError::Closing),
-        }
         if operation == Operation::WriteSector0 {
             return Err(RegisterError::ReadOnly);
         }
-        let authority = EffectAuthority {
-            request_id: self.next_request_id,
-            authority_epoch: self.authority_epoch,
-            binding_epoch: self.binding_epoch,
-            device_generation: self.device_generation,
+        let authority = match self.gate.register(binding) {
+            Ok(authority) => authority,
+            Err(IoError::StaleBinding) => return Err(RegisterError::StaleBinding),
+            Err(IoError::ServiceUnavailable) => return Err(RegisterError::ServiceUnavailable),
+            Err(IoError::Closing) => return Err(RegisterError::Closing),
+            Err(error) => panic!("unexpected register gate error: {error:?}"),
         };
-        self.next_request_id += 1;
         let slot = self
-            .effects
+            .operations
             .iter_mut()
             .find(|record| record.is_none())
-            .expect("bounded portal effect ledger is full");
-        *slot = Some(EffectRecord {
-            authority,
-            operation,
-            committed: false,
-            terminal: None,
-        });
+            .expect("operation metadata matches bounded transition ledger");
+        *slot = Some((authority, operation));
         Ok(authority)
     }
 
     pub fn effect_count(&self) -> usize {
-        self.effects.iter().flatten().count()
+        self.gate.projection().effect_count
     }
 
-    pub const fn next_request_id(&self) -> u64 {
-        self.next_request_id
+    pub fn next_request_id(&self) -> u64 {
+        self.gate.next_request_id()
     }
 
-    fn effect(&self, authority: EffectAuthority) -> Option<&EffectRecord> {
-        self.effects
+    fn operation(&self, authority: EffectAuthority) -> Option<Operation> {
+        self.operations
             .iter()
             .flatten()
-            .find(|record| record.authority == authority)
+            .find_map(|(registered, operation)| (*registered == authority).then_some(*operation))
     }
 
-    fn effect_mut(&mut self, authority: EffectAuthority) -> Option<&mut EffectRecord> {
-        self.effects
-            .iter_mut()
+    fn commit_receipt(&self, authority: EffectAuthority) -> Option<IoCommitReceipt> {
+        self.commits
+            .iter()
             .flatten()
-            .find(|record| record.authority == authority)
+            .find_map(|(registered, receipt)| (*registered == authority).then_some(*receipt))
     }
 
     pub fn accepts_service_action(&self, authority: EffectAuthority) -> bool {
-        self.phase == PortalPhase::Active
-            && authority.authority_epoch == self.authority_epoch
-            && authority.binding_epoch == self.binding_epoch
-            && authority.device_generation == self.device_generation
-            && self
-                .effect(authority)
-                .is_some_and(|record| record.terminal.is_none())
+        self.gate.accepts_service_action(authority)
     }
 
     pub fn commit_effect<T>(
@@ -214,20 +157,23 @@ impl Portal {
         authority: EffectAuthority,
         publish: impl FnOnce() -> T,
     ) -> Option<T> {
-        if !self.accepts_service_action(authority) {
-            return None;
-        }
-        if self
-            .effect(authority)
-            .is_none_or(|record| record.committed || record.terminal.is_some())
+        assert_eq!(self.operation(authority), Some(Operation::ReadSector0));
+        match self
+            .gate
+            .commit_with(authority, || Ok::<T, Infallible>(publish()))
         {
-            return None;
+            Ok((receipt, output)) => {
+                let slot = self
+                    .commits
+                    .iter_mut()
+                    .find(|record| record.is_none())
+                    .expect("commit receipts fit bounded transition ledger");
+                *slot = Some((authority, receipt));
+                Some(output)
+            }
+            Err(IoCommitError::Gate(_)) => None,
+            Err(IoCommitError::Publication(never)) => match never {},
         }
-        let output = publish();
-        let record = self.effect_mut(authority).expect("registered effect");
-        assert_eq!(record.operation, Operation::ReadSector0);
-        record.committed = true;
-        Some(output)
     }
 
     pub fn commit_session(
@@ -242,11 +188,10 @@ impl Portal {
     }
 
     pub fn notify_effect(&self, authority: EffectAuthority, session: &mut Session) -> bool {
-        if session.authority() != authority
-            || !self.accepts_service_action(authority)
-            || self
-                .effect(authority)
-                .is_none_or(|record| !record.committed)
+        let Some(receipt) = self.commit_receipt(authority) else {
+            return false;
+        };
+        if session.authority() != authority || self.gate.accept_notify(authority, receipt).is_err()
         {
             return false;
         }
@@ -258,108 +203,99 @@ impl Portal {
     /// to the crashed service binding. It is fenced by registration, terminal
     /// state and device generation.
     pub fn accepts_device_completion(&self, authority: EffectAuthority) -> bool {
-        authority.device_generation == self.device_generation
-            && self
-                .effect(authority)
-                .is_some_and(|record| record.committed && record.terminal.is_none())
+        let mut probe = self.gate;
+        probe.complete_device(authority).is_ok()
     }
 
     pub fn complete_device(&mut self, authority: EffectAuthority) -> bool {
-        if !self.accepts_device_completion(authority) {
-            return false;
-        }
-        self.effect_mut(authority)
-            .expect("registered effect")
-            .terminal = Some(Terminal::Completed);
-        true
+        self.gate.complete_device(authority).is_ok()
     }
 
     /// Linearizes a whole-device reset acknowledgement. Old-generation
     /// completion is fenced first; every still-committed effect in that
     /// generation then receives exactly one indeterminate terminal state.
-    pub fn acknowledge_reset(&mut self, reset: &ResetAck) -> usize {
-        let generation = reset.authority.device_generation;
-        assert_eq!(self.phase, PortalPhase::Closing);
-        assert_eq!(self.device_generation, generation);
-        assert!(
-            self.effect(reset.authority).is_some(),
-            "reset receipt belongs to a registered portal effect"
-        );
-        self.device_generation += 1;
-        let mut terminalized = 0;
-        for record in self.effects.iter_mut().flatten() {
-            if record.authority.device_generation == generation
-                && record.committed
-                && record.terminal.is_none()
-            {
-                record.terminal = Some(Terminal::IndeterminateAfterReset);
-                terminalized += 1;
-            }
-        }
+    pub fn acknowledge_reset(&mut self, reset: &mut ResetAck) -> usize {
+        let receipt = reset
+            .gate_receipt
+            .take()
+            .expect("reset acknowledgement carries one transition receipt");
+        let outcome = self
+            .gate
+            .apply_reset(receipt)
+            .expect("hardware reset receipt matches the closing generation");
+        reset.gate_outcome = Some(outcome);
         assert_eq!(self.terminal(reset.authority), Some(reset.terminal));
-        terminalized
+        outcome.terminalized()
     }
 
     pub fn terminal(&self, authority: EffectAuthority) -> Option<Terminal> {
-        self.effect(authority).and_then(|record| record.terminal)
+        self.gate.terminal(authority)
     }
 
     pub fn rebind_after_quiescence(&mut self) {
-        assert_eq!(self.phase, PortalPhase::Quiesced);
-        if !self.authority_advanced_for_rebind {
-            self.authority_epoch += 1;
-        }
-        self.authority_advanced_for_rebind = false;
-        if !self.binding_advanced_for_rebind {
-            self.binding_epoch += 1;
-        }
-        self.binding_advanced_for_rebind = false;
-        self.phase = PortalPhase::Active;
+        self.gate
+            .rebind_after_quiescence()
+            .expect("IOTLB quiescence precedes portal rebind");
     }
 
     pub fn crash_service(&mut self) -> (u64, u64) {
-        assert_eq!(self.phase, PortalPhase::Active);
-        let old = self.binding_epoch;
-        self.binding_epoch += 1;
-        self.binding_advanced_for_rebind = true;
-        self.phase = PortalPhase::ServiceUnavailable;
-        (old, self.binding_epoch)
+        let receipt = self
+            .gate
+            .crash_service()
+            .expect("service crash starts from active phase");
+        (receipt.previous_binding_epoch, receipt.binding_epoch)
     }
 
     pub fn begin_closing(&mut self) -> usize {
-        assert!(matches!(
-            self.phase,
-            PortalPhase::Active | PortalPhase::ServiceUnavailable
-        ));
-        self.phase = PortalPhase::Closing;
-        self.authority_epoch += 1;
-        self.authority_advanced_for_rebind = true;
-        let mut aborted = 0;
-        for record in self.effects.iter_mut().flatten() {
-            if record.authority.device_generation == self.device_generation
-                && !record.committed
-                && record.terminal.is_none()
-            {
-                record.terminal = Some(Terminal::AbortedBeforeCommit);
-                aborted += 1;
-            }
-        }
+        let receipt = self
+            .gate
+            .begin_closing()
+            .expect("portal close starts from active or unavailable phase");
+        let aborted = receipt.aborted();
+        self.pending_close = Some(receipt);
         aborted
     }
 
-    pub fn mark_quiesced(&mut self, closure: dma::ClosureReceipt) {
-        let closed_generation = closure.generation();
-        assert_eq!(self.phase, PortalPhase::Closing);
-        assert_eq!(self.device_generation, closed_generation + 1);
-        self.phase = PortalPhase::Quiesced;
+    pub fn submit_reset(&mut self, session: Session, inject_pending_once: bool) -> ResetTombstone {
+        let close = self
+            .pending_close
+            .take()
+            .expect("begin_closing supplies one reset authority");
+        let reset = self
+            .gate
+            .begin_reset(close)
+            .expect("reset begins for the exact closing generation");
+        session.submit_reset(inject_pending_once, reset)
     }
 
-    pub const fn binding_epoch(&self) -> u64 {
-        self.binding_epoch
+    pub fn begin_iotlb(&mut self, reset: ResetAck, inject_one_pending: bool) -> ClosureProgress {
+        let outcome = reset
+            .gate_outcome
+            .expect("portal applies reset before IOTLB closure");
+        let gate = self
+            .gate
+            .begin_iotlb::<3>(outcome)
+            .expect("IOTLB attempt matches the reset outcome");
+        gate_closure_progress(
+            dma::begin_closure(reset.closure_authority, inject_one_pending),
+            gate,
+        )
     }
 
-    pub const fn device_generation(&self) -> u64 {
-        self.device_generation
+    pub fn mark_quiesced(&mut self, closure: ClosureReceipt) {
+        assert_eq!(closure.dma.completed_pages(), closure.gate.completed());
+        assert_eq!(closure.dma.generation(), closure.gate.generation());
+        self.gate
+            .mark_quiesced(closure.gate)
+            .expect("all retained DMA owners complete before quiescence");
+    }
+
+    pub fn binding_epoch(&self) -> u64 {
+        self.gate.projection().binding_epoch
+    }
+
+    pub fn device_generation(&self) -> u64 {
+        self.gate.projection().device_generation
     }
 }
 
@@ -575,7 +511,11 @@ impl Session {
         self.submission_gate_open = false;
     }
 
-    pub fn submit_reset(mut self, inject_pending_once: bool) -> ResetTombstone {
+    fn submit_reset(
+        mut self,
+        inject_pending_once: bool,
+        gate_attempt: GateResetAttempt,
+    ) -> ResetTombstone {
         self.submission_gate_open = false;
         self.transport
             .as_mut()
@@ -584,6 +524,8 @@ impl Session {
         ResetTombstone {
             session: ManuallyDrop::new(self),
             inject_pending_once,
+            gate_attempt: Some(gate_attempt),
+            gate_tombstone: None,
         }
     }
 }
@@ -613,6 +555,8 @@ impl Drop for Session {
 pub struct ResetTombstone {
     session: ManuallyDrop<Session>,
     inject_pending_once: bool,
+    gate_attempt: Option<GateResetAttempt>,
+    gate_tombstone: Option<GateResetTombstone>,
 }
 
 impl ResetTombstone {
@@ -621,8 +565,22 @@ impl ResetTombstone {
     }
 
     pub fn retry_ack(mut self, root: &mut Root) -> Result<ResetAck, Self> {
+        if self.gate_attempt.is_none() {
+            self.gate_attempt = Some(
+                self.gate_tombstone
+                    .take()
+                    .expect("pending reset retains its transition tombstone")
+                    .retry(),
+            );
+        }
         if self.inject_pending_once {
             self.inject_pending_once = false;
+            self.gate_tombstone = Some(
+                self.gate_attempt
+                    .take()
+                    .expect("live reset transition attempt")
+                    .retain(),
+            );
             return Err(self);
         }
         let mut acknowledged = false;
@@ -641,6 +599,12 @@ impl ResetTombstone {
             spin_loop();
         }
         if !acknowledged {
+            self.gate_tombstone = Some(
+                self.gate_attempt
+                    .take()
+                    .expect("live reset transition attempt")
+                    .retain(),
+            );
             return Err(self);
         }
 
@@ -684,6 +648,13 @@ impl ResetTombstone {
             retained_dma_pages,
             isr_read: true,
             closure_authority,
+            gate_receipt: Some(
+                self.gate_attempt
+                    .take()
+                    .expect("acknowledged reset transition attempt")
+                    .acknowledge(),
+            ),
+            gate_outcome: None,
         })
     }
 }
@@ -695,6 +666,8 @@ pub struct ResetAck {
     retained_dma_pages: usize,
     isr_read: bool,
     closure_authority: dma::DmaClosureAuthority,
+    gate_receipt: Option<GateResetReceipt>,
+    gate_outcome: Option<GateResetOutcome>,
 }
 
 impl ResetAck {
@@ -713,8 +686,83 @@ impl ResetAck {
     pub const fn isr_read(&self) -> bool {
         self.isr_read
     }
+}
 
-    pub fn into_closure_authority(self) -> dma::DmaClosureAuthority {
-        self.closure_authority
+#[must_use = "IOTLB closure must complete or retain both hardware and transition tombstones"]
+pub enum ClosureProgress {
+    Complete(ClosureReceipt),
+    Pending(IotlbTombstone),
+}
+
+#[must_use = "dropping an IOTLB tombstone intentionally retains the transition authority"]
+pub struct IotlbTombstone {
+    dma: dma::IotlbTombstone,
+    gate: GateIotlbTombstone<3>,
+}
+
+impl IotlbTombstone {
+    pub fn retained_pages(&self) -> usize {
+        self.dma.retained_pages()
+    }
+
+    pub const fn pending_kind(&self) -> dma::OwnerKind {
+        self.dma.pending_kind()
+    }
+
+    pub fn failure_retained(&self) -> bool {
+        self.dma.failure_retained()
+    }
+
+    pub fn retry(self, poll_budget: usize) -> ClosureProgress {
+        gate_closure_progress(self.dma.retry(poll_budget), self.gate.retry())
+    }
+}
+
+#[must_use = "the combined hardware and transition receipt must publish portal quiescence"]
+pub struct ClosureReceipt {
+    dma: dma::ClosureReceipt,
+    gate: GateQuiescenceReceipt,
+}
+
+impl ClosureReceipt {
+    pub const fn generation(&self) -> u64 {
+        self.dma.generation()
+    }
+
+    pub const fn completed_pages(&self) -> usize {
+        self.dma.completed_pages()
+    }
+}
+
+fn gate_closure_progress(dma: dma::ClosureProgress, gate: GateIotlbAttempt<3>) -> ClosureProgress {
+    match dma {
+        dma::ClosureProgress::Pending(dma) => ClosureProgress::Pending(IotlbTombstone {
+            dma,
+            gate: gate.retain(),
+        }),
+        dma::ClosureProgress::Complete(dma) => {
+            let gate = match gate
+                .owner_complete(0)
+                .expect("request owner completes once")
+            {
+                GateIotlbProgress::Pending(gate) => gate,
+                GateIotlbProgress::Complete(_) => unreachable!(),
+            };
+            let gate = match gate
+                .owner_complete(1)
+                .expect("driver-ring owner completes once")
+            {
+                GateIotlbProgress::Pending(gate) => gate,
+                GateIotlbProgress::Complete(_) => unreachable!(),
+            };
+            let gate = match gate
+                .owner_complete(2)
+                .expect("device-ring owner completes once")
+            {
+                GateIotlbProgress::Complete(receipt) => receipt,
+                GateIotlbProgress::Pending(_) => unreachable!(),
+            };
+            ClosureProgress::Complete(ClosureReceipt { dma, gate })
+        }
     }
 }

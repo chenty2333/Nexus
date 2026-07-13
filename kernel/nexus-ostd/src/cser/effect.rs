@@ -2,8 +2,9 @@
 
 use alloc::sync::Arc;
 
+use cser_transition_gates::oneshot::OneShotGate;
 use ostd::{
-    sync::{Waiter, Waker},
+    sync::{SpinLock, Waiter, Waker},
     timer::Jiffies,
 };
 
@@ -22,6 +23,12 @@ pub struct EffectWaiter {
 pub struct EffectWaker {
     token: EffectToken,
     inner: Arc<Waker>,
+    wake_gate: SpinLock<OneShotGate<WakeOutcome>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WakeOutcome {
+    Published,
 }
 
 impl EffectWaiter {
@@ -35,6 +42,10 @@ impl EffectWaiter {
             EffectWaker {
                 token,
                 inner: waker,
+                wake_gate: SpinLock::new(
+                    OneShotGate::new(token.effect_id, token.authority_epoch)
+                        .expect("effect continuation identity must be nonzero"),
+                ),
             },
         )
     }
@@ -54,7 +65,17 @@ impl EffectWaker {
     }
 
     pub fn wake_up(&self) -> bool {
-        self.inner.wake_up()
+        let mut gate = self.wake_gate.lock();
+        if gate.terminal().is_some() {
+            return false;
+        }
+        let published = self.inner.wake_up();
+        if published {
+            let token = gate.token();
+            gate.try_terminalize(token, WakeOutcome::Published)
+                .expect("the checked effect continuation has exactly one winner");
+        }
+        published
     }
 }
 

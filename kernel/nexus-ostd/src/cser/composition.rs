@@ -1004,7 +1004,7 @@ impl CompositionBackbone {
         let selection = candidate.registry.revoke_begin(ROOT_SCOPE)?;
         candidate.root_phase = RootPhase::Closing;
         candidate.root_authority_epoch = selection.authority_epoch;
-        candidate.frozen_effects = selection.effects.clone();
+        candidate.frozen_effects = candidate.registry.revoke_targets(&selection)?.clone();
         candidate.frozen_domains = candidate
             .frozen_effects
             .iter()

@@ -1,0 +1,482 @@
+schema = "nexus.stage7b.contract.v1"
+stage = "7b"
+status = "acceptance-contract"
+stop_after = "contribution-decision"
+final_research_narrative = false
+
+[inputs]
+semantic_races = "specs/oracles/cser-races.toml"
+race_evidence_map = "evaluation/stage7b/cser-races.toml"
+race_count = 14
+fault_cell_count = 20
+scale_point_count = 14
+performance_case_count = 29
+prior_art_row_count = 16
+
+[concurrency]
+required_source_kind = "production-transition-source"
+synchronization_model = "production transition source under a Loom-modeled outer mutex"
+required_race_ids = [
+  "wait.wake-vs-timeout-single-winner",
+  "wait.cancel-vs-wake-single-winner",
+  "wait.stale-deadline-after-rearm",
+  "pager.same-page-single-publication",
+  "pager.handler-crash-before-resolution",
+  "pager.old-binding-reply-after-rebind",
+  "pager.adopt-vs-abort-single-winner",
+  "continuation.resolve-vs-abort-one-shot",
+  "scope.commit-vs-revoke-linearization",
+  "scope.revoke-deferred-wait-timer",
+  "budget.commit-vs-abort-conservation",
+  "scheduler.fallback-before-rebind",
+  "io.publish-vs-revoke-commit-gate",
+  "io.timeout-vs-late-completion-tombstone",
+]
+required_production_sources = [
+  "crates/cser-transition-gates/src/oneshot.rs",
+  "crates/cser-transition-gates/src/deadline.rs",
+  "crates/cser-transition-gates/src/scheduler.rs",
+  "crates/cser-transition-gates/src/pager.rs",
+  "crates/cser-transition-gates/src/io.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+]
+required_harnesses = [
+  "crates/cser-transition-gates/tests/oneshot_loom.rs",
+  "crates/cser-transition-gates/tests/deadline_loom.rs",
+  "crates/cser-transition-gates/tests/scheduler_loom.rs",
+  "crates/cser-transition-gates/tests/pager_loom.rs",
+  "crates/cser-transition-gates/tests/io_loom.rs",
+  "crates/cser-transition-gates/tests/registry_loom.rs",
+]
+forbid_claims = [
+  "OSTD SpinLock verified",
+  "SMP verified",
+  "lock-free",
+  "production liveness proved",
+]
+negative_mutations = [
+  "drop-race",
+  "duplicate-race",
+  "unknown-race",
+  "reorder-race",
+  "model-only-source",
+  "missing-production-source",
+  "source-symlink",
+  "missing-harness",
+  "unknown-fault-cell",
+  "drop-fault-mapping",
+]
+
+[fault_matrix]
+families = ["scheduler", "pager", "personality-readiness", "linux-io"]
+cells_per_family = 5
+required_cell_ids = [
+  "scheduler.lease-expiry-before-proposal",
+  "scheduler.crash-after-proposal-before-pick",
+  "scheduler.stale-proposal-before-rebind",
+  "scheduler.stale-proposal-after-rebind",
+  "scheduler.repeated-crash-fallback-progress",
+  "pager.same-page-concurrent-fault",
+  "pager.crash-before-prepare",
+  "pager.crash-after-prepare-before-commit",
+  "pager.crash-after-commit-before-resume",
+  "pager.timeout-vs-late-reply",
+  "personality-readiness.crash-before-backend-commit",
+  "personality-readiness.crash-after-backend-commit",
+  "personality-readiness.ready-vs-timeout",
+  "personality-readiness.revoke-vs-ready",
+  "personality-readiness.stale-deadline-after-rearm",
+  "linux-io.revoke-before-device-publication",
+  "linux-io.completion-vs-reset-ack",
+  "linux-io.reset-timeout-retry",
+  "linux-io.iotlb-timeout-late-ack",
+  "linux-io.stale-duplicate-completion",
+]
+required_result_fields = [
+  "id",
+  "family",
+  "injection_point",
+  "expected_terminal",
+  "observed_terminal",
+  "terminalizations",
+  "publications",
+  "credits_before",
+  "credits_after",
+  "retained_before_quiescence",
+  "final_quiescent",
+  "status",
+]
+negative_mutations = [
+  "drop-cell",
+  "duplicate-cell",
+  "unknown-cell",
+  "reorder-cell",
+  "wrong-family-cardinality",
+  "duplicate-terminal-result",
+  "mutated-rejected-operation",
+  "early-retained-resource-release",
+]
+
+[scale]
+required_metrics = [
+  "target_count",
+  "begin_target_record_visits",
+  "next_calls",
+  "head_selections",
+  "terminalized",
+  "completion_members_checked",
+  "unrelated_effect_visits",
+  "history_effect_visits",
+  "final_target_state",
+]
+negative_mutations = [
+  "drop-point",
+  "duplicate-point",
+  "unknown-point",
+  "reorder-point",
+  "parameter-drift",
+  "nonzero-unrelated-visits",
+  "nonzero-history-visits",
+]
+
+[[scale.point]]
+id = "fixed-n.k0000"
+n = 1024
+k = 0
+history = 0
+
+[[scale.point]]
+id = "fixed-n.k0001"
+n = 1024
+k = 1
+history = 0
+
+[[scale.point]]
+id = "fixed-n.k0008"
+n = 1024
+k = 8
+history = 0
+
+[[scale.point]]
+id = "fixed-n.k0032"
+n = 1024
+k = 32
+history = 0
+
+[[scale.point]]
+id = "fixed-n.k0128"
+n = 1024
+k = 128
+history = 0
+
+[[scale.point]]
+id = "fixed-n.k0512"
+n = 1024
+k = 512
+history = 0
+
+[[scale.point]]
+id = "fixed-k.n0032"
+n = 32
+k = 32
+history = 0
+
+[[scale.point]]
+id = "fixed-k.n0128"
+n = 128
+k = 32
+history = 0
+
+[[scale.point]]
+id = "fixed-k.n0512"
+n = 512
+k = 32
+history = 0
+
+[[scale.point]]
+id = "fixed-k.n2048"
+n = 2048
+k = 32
+history = 0
+
+[[scale.point]]
+id = "fixed-k.n4096"
+n = 4096
+k = 32
+history = 0
+
+[[scale.point]]
+id = "history.h0000"
+n = 1024
+k = 32
+history = 0
+
+[[scale.point]]
+id = "history.h0064"
+n = 1024
+k = 32
+history = 64
+
+[[scale.point]]
+id = "history.h1024"
+n = 1024
+k = 32
+history = 1024
+
+[performance]
+warmups = 7
+samples = 65
+empty_timer_samples = 257
+statistics = ["min", "median", "p95", "max"]
+retain_raw_samples = true
+clock = "guest-visible-tsc-lfence"
+environment = "single-vCPU single-thread TCG release-build hot-cache"
+measurement_excludes = [
+  "fixture-construction",
+  "clone",
+  "full-invariant-scan",
+  "json",
+  "serial-io",
+]
+negative_mutations = [
+  "drop-case",
+  "duplicate-case",
+  "reorder-case",
+  "unknown-scale-point",
+  "operation-drift",
+  "sample-count-drift",
+  "statistic-recompute-mismatch",
+  "fixture-inside-measurement",
+]
+
+[performance.operation_definitions]
+begin = "measure RevokeBegin only"
+complete = "pre-terminalize all k target effects, then measure RevokeComplete only"
+closure = "measure RevokeBegin plus every RevokeNext and terminalization plus RevokeComplete"
+projection = "measure scope_projection only over the configured retained history"
+
+[[performance.case]]
+id = "begin.fixed-n.k0000"
+operation = "begin"
+scale_point = "fixed-n.k0000"
+
+[[performance.case]]
+id = "begin.fixed-n.k0001"
+operation = "begin"
+scale_point = "fixed-n.k0001"
+
+[[performance.case]]
+id = "begin.fixed-n.k0008"
+operation = "begin"
+scale_point = "fixed-n.k0008"
+
+[[performance.case]]
+id = "begin.fixed-n.k0032"
+operation = "begin"
+scale_point = "fixed-n.k0032"
+
+[[performance.case]]
+id = "begin.fixed-n.k0128"
+operation = "begin"
+scale_point = "fixed-n.k0128"
+
+[[performance.case]]
+id = "begin.fixed-n.k0512"
+operation = "begin"
+scale_point = "fixed-n.k0512"
+
+[[performance.case]]
+id = "complete.fixed-n.k0000"
+operation = "complete"
+scale_point = "fixed-n.k0000"
+
+[[performance.case]]
+id = "complete.fixed-n.k0001"
+operation = "complete"
+scale_point = "fixed-n.k0001"
+
+[[performance.case]]
+id = "complete.fixed-n.k0008"
+operation = "complete"
+scale_point = "fixed-n.k0008"
+
+[[performance.case]]
+id = "complete.fixed-n.k0032"
+operation = "complete"
+scale_point = "fixed-n.k0032"
+
+[[performance.case]]
+id = "complete.fixed-n.k0128"
+operation = "complete"
+scale_point = "fixed-n.k0128"
+
+[[performance.case]]
+id = "complete.fixed-n.k0512"
+operation = "complete"
+scale_point = "fixed-n.k0512"
+
+[[performance.case]]
+id = "closure.fixed-n.k0000"
+operation = "closure"
+scale_point = "fixed-n.k0000"
+
+[[performance.case]]
+id = "closure.fixed-n.k0001"
+operation = "closure"
+scale_point = "fixed-n.k0001"
+
+[[performance.case]]
+id = "closure.fixed-n.k0008"
+operation = "closure"
+scale_point = "fixed-n.k0008"
+
+[[performance.case]]
+id = "closure.fixed-n.k0032"
+operation = "closure"
+scale_point = "fixed-n.k0032"
+
+[[performance.case]]
+id = "closure.fixed-n.k0128"
+operation = "closure"
+scale_point = "fixed-n.k0128"
+
+[[performance.case]]
+id = "closure.fixed-n.k0512"
+operation = "closure"
+scale_point = "fixed-n.k0512"
+
+[[performance.case]]
+id = "closure.fixed-k.n0032"
+operation = "closure"
+scale_point = "fixed-k.n0032"
+
+[[performance.case]]
+id = "closure.fixed-k.n0128"
+operation = "closure"
+scale_point = "fixed-k.n0128"
+
+[[performance.case]]
+id = "closure.fixed-k.n0512"
+operation = "closure"
+scale_point = "fixed-k.n0512"
+
+[[performance.case]]
+id = "closure.fixed-k.n2048"
+operation = "closure"
+scale_point = "fixed-k.n2048"
+
+[[performance.case]]
+id = "closure.fixed-k.n4096"
+operation = "closure"
+scale_point = "fixed-k.n4096"
+
+[[performance.case]]
+id = "closure.history.h0000"
+operation = "closure"
+scale_point = "history.h0000"
+
+[[performance.case]]
+id = "closure.history.h0064"
+operation = "closure"
+scale_point = "history.h0064"
+
+[[performance.case]]
+id = "closure.history.h1024"
+operation = "closure"
+scale_point = "history.h1024"
+
+[[performance.case]]
+id = "projection.history.h0000"
+operation = "projection"
+scale_point = "history.h0000"
+
+[[performance.case]]
+id = "projection.history.h0064"
+operation = "projection"
+scale_point = "history.h0064"
+
+[[performance.case]]
+id = "projection.history.h1024"
+operation = "projection"
+scale_point = "history.h1024"
+
+[prior_art]
+source_policy = "primary-source-required"
+required_row_ids = [
+  "sel4.reply-capability-revoke",
+  "cornucopia.async-authority",
+  "portico-lingering-authority",
+  "vino.extension-fallback",
+  "curios.restartable-services",
+  "shadow-drivers.device-recovery",
+  "txos.os-transactions",
+  "speculator.causal-dependencies",
+  "rethink-the-sync.causal-dependencies",
+  "chubby.fencing",
+  "rifl.exactly-once-rpc",
+  "atomic-rpc",
+  "resource-containers",
+  "fuchsia.rfc-0261",
+  "linux.io-uring-cancel",
+  "virtio-1.3-reset",
+]
+required_fields = [
+  "id",
+  "primary_source",
+  "source_locator",
+  "mechanism",
+  "authority_scope",
+  "async_effect_tracking",
+  "commit_or_linearization_gate",
+  "crash_or_rebind_fencing",
+  "resource_accounting",
+  "device_quiescence",
+  "overlap_with_cser",
+  "difference_from_fixed_cser_boundary",
+  "claim_impact",
+]
+negative_mutations = [
+  "drop-row",
+  "duplicate-row",
+  "unknown-row",
+  "reorder-row",
+  "secondary-only-source",
+  "missing-claim-impact",
+]
+
+[contribution]
+allowed_verdicts = ["support-bounded", "narrow", "reject"]
+support_bounded_requires = [
+  "race-coverage-14-of-14",
+  "all-required-implementation-source-safety-gates-pass",
+  "fault-matrix-20-of-20",
+  "all-central-fault-safety-cells-pass",
+  "scale-structure-14-of-14",
+  "performance-protocol-29-of-29",
+  "prior-art-16-of-16",
+]
+narrow_requires = [
+  "failed-or-missing-boundaries-explicitly-excluded",
+  "no-failed-central-safety-cell-described-as-supported",
+]
+reject_if = [
+  "post-revoke-commit-exclusion-counterexample",
+  "single-terminalization-counterexample",
+  "budget-conservation-counterexample",
+  "device-quiescence-counterexample",
+]
+forbid_claims = ["novel", "first", "proved"]
+negative_mutations = [
+  "unknown-verdict",
+  "support-bounded-with-missing-required-gate",
+  "support-bounded-with-failed-central-cell",
+  "narrow-with-hidden-exclusion",
+  "forbidden-novelty-word",
+]
+
+[acceptance]
+requires_clean_source = true
+requires_cold_verify = true
+requires_exact_pushed_sha_ci = true
+requires_quick_ci = true
+requires_full_ci = true

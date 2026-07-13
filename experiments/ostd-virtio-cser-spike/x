@@ -29,6 +29,7 @@ image_key=$(sha256sum \
     "$root/assets/sector0.txt" \
     "$root/patches/ostd-0.18.0-dma-closure.patch" \
     "$root/scripts/assert-patch.sh" \
+    "$root/scripts/check-io-gate.sh" \
     "$root/scripts/assert-serial.sh" \
     "$root/scripts/assert-debug-trace.awk" \
     "$root/scripts/assert-stream-capture.sh" \
@@ -38,13 +39,25 @@ image_key=$(sha256sum \
     "$root/osdk-runner-base/src/main.rs" \
     "$root/osdk-runner-base/x86_64.ld" \
     "$root/osdk-runner-base/riscv64.ld" \
-    "$root/osdk-runner-base/loongarch64.ld" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+    "$root/osdk-runner-base/loongarch64.ld" \
+    "$repo_root/crates/cser-transition-gates/Cargo.toml" \
+    "$repo_root/crates/cser-transition-gates/src/lib.rs" \
+    "$repo_root/crates/cser-transition-gates/src/oneshot.rs" \
+    "$repo_root/crates/cser-transition-gates/src/deadline.rs" \
+    "$repo_root/crates/cser-transition-gates/src/scheduler.rs" \
+    "$repo_root/crates/cser-transition-gates/src/pager.rs" \
+    "$repo_root/crates/cser-transition-gates/src/io.rs" \
+    "$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/ostd-virtio-cser-spike:$image_key"
 runner_base="$root/osdk-runner-base"
 runner_target="$root/target/osdk/ostd-virtio-cser-spike-run-base"
 
 build_image() {
-    docker build --platform linux/amd64 -t "$image" "$root"
+    docker build \
+        --build-context "nexus-root=$repo_root" \
+        --platform linux/amd64 \
+        -t "$image" \
+        "$root"
 }
 
 container() {
@@ -55,6 +68,8 @@ container() {
         --env HOME=/tmp/nexus-home \
         --tmpfs /tmp/nexus-home:rw,exec,nosuid,size=64m,mode=1777 \
         -v "$root:/work:z" \
+        -v "$repo_root/crates/cser-transition-gates:/crates/cser-transition-gates:ro,z" \
+        --mount "type=bind,source=$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs,target=/kernel/nexus-ostd/src/cser/effect_registry.rs,readonly" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         -w /work \
         "$image" \
@@ -69,6 +84,36 @@ ensure_image() {
 
 check_source() {
     container bash scripts/assert-patch.sh
+    container bash scripts/check-io-gate.sh
+    container bash -c '
+        set -euo pipefail
+        tmp=$(mktemp -d)
+        trap '\''rm -rf "$tmp"'\'' EXIT
+
+        cp src/portal.rs "$tmp/missing-gate.rs"
+        sed -i '\''/gate: IoGate<4>,/d'\'' "$tmp/missing-gate.rs"
+        if bash scripts/check-io-gate.sh "$tmp/missing-gate.rs" >/dev/null 2>&1; then
+            echo "I/O adapter oracle accepted a missing shared gate" >&2
+            exit 1
+        fi
+
+        cp src/portal.rs "$tmp/missing-commit.rs"
+        sed -i '\''s/\.commit_with(authority/.commit_without_gate(authority/'\'' \
+            "$tmp/missing-commit.rs"
+        if bash scripts/check-io-gate.sh "$tmp/missing-commit.rs" >/dev/null 2>&1; then
+            echo "I/O adapter oracle accepted a missing commit gate" >&2
+            exit 1
+        fi
+
+        cp src/portal.rs "$tmp/shadow-epoch.rs"
+        sed -i '\''/pub struct Portal {/a\    authority_epoch: u64,'\'' \
+            "$tmp/shadow-epoch.rs"
+        if bash scripts/check-io-gate.sh "$tmp/shadow-epoch.rs" >/dev/null 2>&1; then
+            echo "I/O adapter oracle accepted a shadow authority epoch" >&2
+            exit 1
+        fi
+        echo "Stage 7B I/O gate negative assertions: PASS missing_gate=rejected missing_commit_gate=rejected shadow_epoch=rejected"
+    '
 }
 
 check_oracles() {

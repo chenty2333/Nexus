@@ -34,7 +34,7 @@ BEGIN {
     expect("NETWORK_LIFECYCLE Rebind replacement=1052 binding=2 personality_binding=1 readiness_binding=1 peer_epochs_unchanged=true")
     expect("NETWORK_LIFECYCLE Adopt replacement=1052 effect=10 kind=accept old_binding=1 new_binding=2 explicit=true")
     expect("NETWORK_LIFECYCLE Adopt replacement=1052 effect=11 kind=readiness old_binding=1 new_binding=2 explicit=true")
-    expect("NETWORK_LIFECYCLE StaleReplay sender=1051 old_binding=1 current_binding=2 result=StaleBinding projection_before=c663515550c6f123 projection_after=c663515550c6f123 full_projection_unchanged=true mutation=false")
+    expect("NETWORK_LIFECYCLE StaleReplay sender=1051 old_binding=1 current_binding=2 result=StaleBinding projection_before=261b7429845d634f projection_after=261b7429845d634f full_projection_unchanged=true mutation=false")
     expect("LINUX_NET Accept syscall=10 effect=10 commit_sequence=10 fd=5 listener=3 peer=127.0.0.1:49153 flags=0 readiness_effect=11 delivery_sequence=1 recovered_by_v2=true")
     expect("LINUX_NET GetSockName syscall=11 effect=12 commit_sequence=12 fd=4 endpoint=client_local family=AF_INET address=127.0.0.1 port=49153 sockaddr_len=16")
     expect("LINUX_NET Write syscall=12 effect=13 commit_sequence=13 direction=client_to_accepted bytes=4 payload=ping buffer_effect=14 buffer_credit=Held")

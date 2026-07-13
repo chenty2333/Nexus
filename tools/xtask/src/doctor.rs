@@ -16,6 +16,17 @@ const REQUIRED_PATHS: &[&str] = &[
     "tools/workflow/runtime-fs-composition.sh",
     "tools/workflow/linux-io-composition.sh",
     "specs/oracles/cser-races.toml",
+    "evaluation/stage7b/contract.toml",
+    "evaluation/stage7b/cser-races.toml",
+    "evaluation/stage7b/prior-art.toml",
+    "evaluation/stage7b/README.md",
+    "tools/xtask/src/stage7b.rs",
+    "tools/xtask/src/stage7b_concurrency.rs",
+    "tools/xtask/src/stage7b_contribution.rs",
+    "tools/xtask/src/stage7b_evidence.rs",
+    "tools/xtask/src/stage7b_prior_art.rs",
+    "kernel/nexus-ostd/src/evaluation/stage7b.rs",
+    "experiments/ostd-virtio-cser-spike/scripts/check-io-gate.sh",
     "specs/cser/RuntimeNetCserSafetyMC.cfg",
     "specs/cser/RuntimeNetCserMC.cfg",
     "specs/cser/RUNTIME_NET.md",
@@ -54,7 +65,7 @@ pub(crate) fn run(root: &Path, specs: &[&str]) -> Result<()> {
     }
 
     println!(
-        "DOCTOR PASS layout=stage7a+linux-io-composition specs={} rustc={:?} cargo={:?} git={:?} java={:?} tla2tools={}",
+        "DOCTOR PASS layout=stage7a+linux-io-composition+stage7b specs={} rustc={:?} cargo={:?} git={:?} java={:?} tla2tools={}",
         specs.len(),
         first_line(&rustc),
         first_line(&cargo),

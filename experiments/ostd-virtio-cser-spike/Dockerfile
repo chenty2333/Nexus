@@ -3,6 +3,8 @@
 ARG OSDK_IMAGE=asterinas/osdk:0.18.0-20260603@sha256:a7540bfcd262ae52471f86353a87663d91941958e503557863738d13de4aace3
 FROM ${OSDK_IMAGE}
 
+COPY --from=nexus-root crates/cser-transition-gates /crates/cser-transition-gates
+
 ARG OSTD_CRATE_SHA256=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1
 ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
 ARG VIRTIO_DRIVERS_CRATE_SHA256=cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7
@@ -10,6 +12,9 @@ ARG VIRTIO_DRIVERS_CRATE_URL=https://static.crates.io/crates/virtio-drivers/virt
 
 RUN rustup target add --toolchain nightly-2026-04-03 x86_64-unknown-none \
     && cargo install cargo-osdk --version 0.18.0 --locked
+
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/effect_registry.rs \
+    /kernel/nexus-ostd/src/cser/effect_registry.rs
 
 # Build the audited MPL-2.0 overlay from the exact crates.io archive.  The
 # complete patched source exists only in the image; it is never vendored into
@@ -66,6 +71,7 @@ RUN --mount=type=bind,source=.,target=/tmp/nexus-source,readonly \
     && cd /work \
     && cargo fmt --all -- --check \
     && bash scripts/assert-patch.sh \
+    && bash scripts/check-io-gate.sh \
     && cargo osdk check --locked \
     && cargo clippy --locked --target x86_64-unknown-none --lib -- \
         -D warnings -A unexpected_cfgs -A clippy::result_large_err \

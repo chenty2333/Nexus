@@ -222,6 +222,8 @@ verify_all() {
     # OSDK images remain host-side backends; the root verification image never
     # receives access to the Docker socket.
     run_system
+    run_backend "$kernel_backend" eval-stage7b "Nexus Stage 7B evaluator"
+    run_xtask stage7b-evidence
     run_xtask complete
     run_xtask manifest
 }

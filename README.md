@@ -17,6 +17,16 @@ See [VISION.md](VISION.md) for the research claim,
 [ARCHITECTURE.md](ARCHITECTURE.md) for boundaries, and [REWORK.md](REWORK.md)
 for the migration ledger.
 
+The Stage 7B checkpoint adds a deliberately narrower evaluation claim: 14
+implementation-source races are Checked under a Loom-modeled outer mutex; a
+release, single-vCPU, single-thread-TCG QEMU evaluator checks 20 fault cells and
+14 structural scale points; and 29 guest-visible TSC cases are retained as
+Observed raw samples with no thresholds. The primary-source comparison matrix
+contains 16 rows, of which 14 are full-text-audited and two are
+primary-metadata-only. The resulting contribution verdict is `narrow`;
+novelty, firstness, proof, SMP, hardware cycles, lock freedom, durable external
+effects, and Linux breadth are not established.
+
 ## Requirements
 
 The public workflow requires only:
@@ -48,8 +58,9 @@ NEXUS_REBUILD=1 ./x verify
 The cold gate runs Rust formatting/checks/Clippy/tests, twelve TLA+ families,
 the Nexus OSTD QEMU receipt, the mediated VirtIO/reset/IOMMU QEMU receipt,
 strict positive and negative predecessor/filesystem/network/Linux-I/O
-composition oracles, and a fresh-evidence manifest. It can take tens of
-minutes.
+composition oracles, the Stage 7B release evaluator, implementation-source Loom
+rerun, runtime evidence recomputation, prior-art validator, contribution
+decision, and a fresh-evidence manifest. It can take tens of minutes.
 
 ## Public command contract
 
@@ -108,7 +119,8 @@ specification list, and SHA-256 of every required fresh artifact. The manifest
 generator rejects missing, stale, empty, markerless, concurrently modified, or
 different-source evidence. It also requires a nonce-bound model/spec receipt
 issued only after that combined gate succeeds and a final completion receipt
-issued only after the system gate succeeds. Both receipts bind the exact
+issued only after the system and Stage 7B evaluation/decision gates succeed.
+Both receipts bind the exact
 artifact digests, so focused commands cannot assemble or replace evidence after
 a failed full run and then publish it as a successful `verify`. The root
 workflow also retains a one-run orchestration token that is disclosed only to
@@ -119,7 +131,9 @@ composition operations; backend-local locks also protect direct maintenance
 invocations. Manifest publication is intentionally internal to the same
 token-holding full-verify process; there is no standalone publish command.
 
-CI invokes the same `./x` surface. A phase is complete only after the final
+CI invokes the same `./x` surface. The successful artifact upload also retains
+the Stage 7B JSON/JSONL/oracle outputs and the raw evaluator log, QEMU debug
+stream, and CPU/TCG metadata. A phase is complete only after the final
 working tree passes a cold local verify and the exact pushed commit passes the
 remote workflow. The successful CI artifact contains the manifest, start
 record, and both bound completion receipts; failure uploads retain the same

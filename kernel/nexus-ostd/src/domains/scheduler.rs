@@ -2,6 +2,9 @@
 
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 
+use cser_transition_gates::scheduler::{
+    SchedulerCrashReceipt, SchedulerError, SchedulerGate, SchedulerMode,
+};
 use ostd::{
     cpu::{CpuId, PinCurrentCpu},
     prelude::*,
@@ -17,11 +20,7 @@ use crate::effect::EffectToken;
 
 pub const FIRST_FALLBACK_SELECTION_ATTEMPT: u64 = 1;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Binding {
-    pub authority_epoch: u64,
-    pub binding_epoch: u64,
-}
+pub use cser_transition_gates::scheduler::{FallbackEvidence, SchedulerBinding as Binding};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProposalResult {
@@ -32,25 +31,10 @@ pub enum ProposalResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PolicyMode {
-    Bound,
-    Fallback,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Proposal {
     binding: Binding,
     task_id: u64,
     causal_token: Option<EffectToken>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FallbackEvidence {
-    pub lease_deadline_tick: u64,
-    pub crash_tick: u64,
-    pub pick_tick: u64,
-    pub pick_task_id: u64,
-    pub pick_selection_attempt: u64,
 }
 
 pub struct CserScheduler {
@@ -69,7 +53,7 @@ impl CserScheduler {
 
     pub fn binding(&self) -> Binding {
         let queue = self.queues[0].disable_irq().lock();
-        queue.binding
+        queue.gate.binding()
     }
 
     pub fn propose(&self, binding: Binding, task_id: u64) -> ProposalResult {
@@ -92,39 +76,37 @@ impl CserScheduler {
         causal_token: Option<EffectToken>,
     ) -> ProposalResult {
         let mut queue = self.queues[0].disable_irq().lock();
-        if binding != queue.binding {
-            println!(
-                "CSER REJECT_STALE action=Prepare authority_epoch={} proposal_binding_epoch={} current_binding_epoch={} proposal_task={}",
-                binding.authority_epoch,
-                binding.binding_epoch,
-                queue.binding.binding_epoch,
-                task_id,
-            );
-            return ProposalResult::RejectStale;
-        }
-        if queue.mode == PolicyMode::Fallback {
-            println!(
-                "CSER REJECT_NO_SUPERVISOR action=Prepare authority_epoch={} binding_epoch={} proposal_task={}",
-                binding.authority_epoch, binding.binding_epoch, task_id,
-            );
-            return ProposalResult::RejectNoSupervisor;
-        }
-        if !queue.contains_task(task_id) {
-            return ProposalResult::RejectUnknownTask;
-        }
-
-        // A proposal that passes the binding, supervisor, and task gates is
-        // also the policy heartbeat.  Renew under the run-queue lock so a
-        // timer tick cannot expire the old deadline after accepting current
-        // policy work but before that work is scheduled.  Rejected proposals
-        // must never extend a stale or absent supervisor's lease.
-        let previous_lease_deadline_tick = queue.lease_deadline_tick;
-        queue.lease_deadline_tick = queue.tick.saturating_add(queue.lease_ticks);
-        queue.pending = Some(Proposal {
+        let known_task = queue.contains_task(task_id);
+        let receipt = match queue.gate.prepare(
             binding,
-            task_id,
-            causal_token,
-        });
+            known_task,
+            Proposal {
+                binding,
+                task_id,
+                causal_token,
+            },
+        ) {
+            Ok(receipt) => receipt,
+            Err(SchedulerError::StaleBinding) => {
+                println!(
+                    "CSER REJECT_STALE action=Prepare authority_epoch={} proposal_binding_epoch={} current_binding_epoch={} proposal_task={}",
+                    binding.authority_epoch,
+                    binding.binding_epoch,
+                    queue.gate.binding().binding_epoch,
+                    task_id,
+                );
+                return ProposalResult::RejectStale;
+            }
+            Err(SchedulerError::NoSupervisor) => {
+                println!(
+                    "CSER REJECT_NO_SUPERVISOR action=Prepare authority_epoch={} binding_epoch={} proposal_task={}",
+                    binding.authority_epoch, binding.binding_epoch, task_id,
+                );
+                return ProposalResult::RejectNoSupervisor;
+            }
+            Err(SchedulerError::UnknownTask) => return ProposalResult::RejectUnknownTask,
+            Err(error) => panic!("scheduler prepare gate failed unexpectedly: {error:?}"),
+        };
         if let Some(token) = causal_token {
             println!(
                 "CSER PrepareScoped service=scheduler scheduler_authority_epoch={} binding_epoch={} workload_authority_epoch={} scope={} effect={} proposal_task={}",
@@ -151,36 +133,45 @@ impl CserScheduler {
             } else {
                 "unscoped"
             },
-            queue.tick,
-            previous_lease_deadline_tick,
-            queue.lease_deadline_tick,
-            queue.lease_ticks,
+            queue.gate.projection().tick,
+            receipt.previous_deadline_tick,
+            receipt.lease_deadline_tick,
+            queue.gate.projection().lease_ticks,
         );
         ProposalResult::Prepared
     }
 
     pub fn crash(&self, binding: Binding, reason: &'static str) {
         let mut queue = self.queues[0].disable_irq().lock();
-        assert_eq!(binding, queue.binding, "only the current binding can crash");
-        queue.enter_fallback(reason);
+        assert_eq!(
+            binding,
+            queue.gate.binding(),
+            "only the current binding can crash"
+        );
+        queue.enter_fallback(binding, reason);
     }
 
     pub fn crash_scoped(&self, binding: Binding, reason: &'static str, causal_token: EffectToken) {
         let mut queue = self.queues[0].disable_irq().lock();
-        assert_eq!(binding, queue.binding, "only the current binding can crash");
+        assert_eq!(
+            binding,
+            queue.gate.binding(),
+            "only the current binding can crash"
+        );
         assert_eq!(
             queue
-                .pending
+                .gate
+                .pending()
                 .as_ref()
                 .and_then(|proposal| proposal.causal_token),
             Some(causal_token),
             "scoped crash must fence its pending workload proposal"
         );
-        queue.enter_fallback(reason);
+        queue.enter_fallback(binding, reason);
         println!(
             "CSER CrashScoped service=scheduler scheduler_authority_epoch={} binding_epoch={} workload_authority_epoch={} scope={} effect={} pending_scoped_cleared=true fallback=kernel_fifo",
-            queue.binding.authority_epoch,
-            queue.binding.binding_epoch,
+            queue.gate.binding().authority_epoch,
+            queue.gate.binding().binding_epoch,
             causal_token.authority_epoch,
             causal_token.scope_id,
             causal_token.effect_id,
@@ -189,31 +180,26 @@ impl CserScheduler {
 
     pub fn rebind(&self, authority_epoch: u64) -> Binding {
         let mut queue = self.queues[0].disable_irq().lock();
-        assert_eq!(authority_epoch, queue.binding.authority_epoch);
-        assert_eq!(queue.mode, PolicyMode::Fallback);
+        assert_eq!(authority_epoch, queue.gate.binding().authority_epoch);
+        assert_eq!(queue.gate.mode(), SchedulerMode::Fallback);
         assert!(
-            queue.fallback_pick_tick.is_some(),
+            queue.gate.projection().first_fallback_pick.is_some(),
             "rebind requires the kernel fallback to be running"
         );
-        queue.mode = PolicyMode::Bound;
-        queue.pending = None;
-        queue.lease_deadline_tick = queue.tick.saturating_add(queue.lease_ticks);
+        let binding = queue
+            .gate
+            .rebind(authority_epoch)
+            .expect("validated scheduler rebind must succeed");
         println!(
             "CSER Rebind authority_epoch={} binding_epoch={}",
-            queue.binding.authority_epoch, queue.binding.binding_epoch,
+            binding.authority_epoch, binding.binding_epoch,
         );
-        queue.binding
+        binding
     }
 
     pub fn fallback_evidence(&self) -> Option<FallbackEvidence> {
         let queue = self.queues[0].disable_irq().lock();
-        Some(FallbackEvidence {
-            lease_deadline_tick: queue.lease_deadline_tick,
-            crash_tick: queue.crash_tick?,
-            pick_tick: queue.fallback_pick_tick?,
-            pick_task_id: queue.fallback_pick_task_id?,
-            pick_selection_attempt: queue.fallback_pick_selection_attempt?,
-        })
+        queue.gate.fallback_evidence()
     }
 }
 
@@ -254,17 +240,7 @@ impl Scheduler<Task> for CserScheduler {
 struct CserRunQueue {
     current: Option<Arc<Task>>,
     runnable: VecDeque<Arc<Task>>,
-    binding: Binding,
-    pending: Option<Proposal>,
-    mode: PolicyMode,
-    tick: u64,
-    lease_ticks: u64,
-    lease_deadline_tick: u64,
-    crash_tick: Option<u64>,
-    fallback_pick_tick: Option<u64>,
-    fallback_pick_task_id: Option<u64>,
-    fallback_selection_attempts: u64,
-    fallback_pick_selection_attempt: Option<u64>,
+    gate: SchedulerGate<Proposal>,
 }
 
 impl CserRunQueue {
@@ -272,20 +248,8 @@ impl CserRunQueue {
         Self {
             current: None,
             runnable: VecDeque::new(),
-            binding: Binding {
-                authority_epoch,
-                binding_epoch: 1,
-            },
-            pending: None,
-            mode: PolicyMode::Bound,
-            tick: 0,
-            lease_ticks,
-            lease_deadline_tick: lease_ticks,
-            crash_tick: None,
-            fallback_pick_tick: None,
-            fallback_pick_task_id: None,
-            fallback_selection_attempts: 0,
-            fallback_pick_selection_attempt: None,
+            gate: SchedulerGate::new(authority_epoch, lease_ticks)
+                .expect("scheduler authority epoch and lease are nonzero"),
         }
     }
 
@@ -320,29 +284,22 @@ impl CserRunQueue {
         }
     }
 
-    fn enter_fallback(&mut self, reason: &'static str) {
-        if self.mode == PolicyMode::Fallback {
-            return;
-        }
-        let previous_binding_epoch = self.binding.binding_epoch;
-        self.binding.binding_epoch = self
-            .binding
-            .binding_epoch
-            .checked_add(1)
-            .expect("binding epoch overflow would defeat stale-reply fencing");
-        self.mode = PolicyMode::Fallback;
-        self.pending = None;
-        self.crash_tick = Some(self.tick);
-        self.fallback_pick_tick = None;
-        self.fallback_pick_task_id = None;
-        self.fallback_selection_attempts = 0;
-        self.fallback_pick_selection_attempt = None;
+    fn enter_fallback(&mut self, presented: Binding, reason: &'static str) {
+        let receipt = match self.gate.enter_fallback(presented) {
+            Ok(receipt) => receipt,
+            Err(SchedulerError::AlreadyFallback) => return,
+            Err(error) => panic!("validated current scheduler fallback failed: {error:?}"),
+        };
+        self.log_fallback(receipt, reason);
+    }
+
+    fn log_fallback(&self, receipt: SchedulerCrashReceipt, reason: &'static str) {
         println!(
             "CSER Crash authority_epoch={} previous_binding_epoch={} binding_epoch={} tick={} reason={}",
-            self.binding.authority_epoch,
-            previous_binding_epoch,
-            self.binding.binding_epoch,
-            self.tick,
+            self.gate.binding().authority_epoch,
+            receipt.previous_binding_epoch,
+            receipt.binding_epoch,
+            receipt.crash_tick,
             reason,
         );
     }
@@ -356,30 +313,38 @@ impl LocalRunQueue<Task> for CserRunQueue {
     fn update_current(&mut self, flags: UpdateFlags) -> bool {
         match flags {
             UpdateFlags::Tick => {
-                self.tick = self.tick.saturating_add(1);
-                if self.mode == PolicyMode::Bound && self.tick >= self.lease_deadline_tick {
-                    self.enter_fallback("policy_lease_expired");
+                if let Some(receipt) = self
+                    .gate
+                    .tick()
+                    .expect("scheduler tick counter overflow defeats recovery")
+                {
+                    self.log_fallback(receipt, "policy_lease_expired");
                 }
-                self.mode == PolicyMode::Fallback && !self.runnable.is_empty()
+                self.gate.mode() == SchedulerMode::Fallback && !self.runnable.is_empty()
             }
             UpdateFlags::Wait | UpdateFlags::Exit => {
-                if self.mode == PolicyMode::Bound && self.pending.is_none() {
-                    self.enter_fallback("mandatory_progress");
+                if self.gate.mode() == SchedulerMode::Bound && self.gate.pending().is_none() {
+                    let binding = self.gate.binding();
+                    self.enter_fallback(binding, "mandatory_progress");
                 }
                 !self.runnable.is_empty()
             }
             UpdateFlags::Yield => {
                 !self.runnable.is_empty()
-                    && (self.mode == PolicyMode::Fallback || self.pending.is_some())
+                    && (self.gate.mode() == SchedulerMode::Fallback
+                        || self.gate.pending().is_some())
             }
         }
     }
 
     fn try_pick_next(&mut self) -> Option<&Arc<Task>> {
-        let next = match self.mode {
-            PolicyMode::Bound => {
-                let proposal = self.pending.take()?;
-                if proposal.binding != self.binding {
+        let next = match self.gate.mode() {
+            SchedulerMode::Bound => {
+                let proposal = self
+                    .gate
+                    .take_bound_proposal()
+                    .expect("bound scheduler gate must accept proposal take")?;
+                if proposal.binding != self.gate.binding() {
                     return None;
                 }
                 let next = self.remove_task(proposal.task_id)?;
@@ -391,29 +356,23 @@ impl LocalRunQueue<Task> for CserRunQueue {
                 );
                 next
             }
-            PolicyMode::Fallback => {
+            SchedulerMode::Fallback => {
                 // A failed empty-queue probe is not a selection attempt: it
                 // chooses no task and emits no FallbackPick receipt. Pop
                 // first so the diagnostic ordinal remains dense over the
                 // successful selections represented by those receipts.
                 let next = self.runnable.pop_front()?;
-                self.fallback_selection_attempts = self
-                    .fallback_selection_attempts
-                    .checked_add(1)
-                    .expect("fallback selection-attempt counter overflow");
-                let selection_attempt = self.fallback_selection_attempts;
-                if self.fallback_pick_tick.is_none() {
-                    self.fallback_pick_tick = Some(self.tick);
-                    self.fallback_pick_task_id = Some(Self::task_id(&next));
-                    self.fallback_pick_selection_attempt = Some(selection_attempt);
-                }
+                let pick = self
+                    .gate
+                    .note_fallback_pick(Self::task_id(&next))
+                    .expect("fallback task selection must be admitted by scheduler gate");
                 println!(
                     "CSER FallbackPick authority_epoch={} binding_epoch={} task={} tick={} selection_attempt={}",
-                    self.binding.authority_epoch,
-                    self.binding.binding_epoch,
+                    self.gate.binding().authority_epoch,
+                    self.gate.binding().binding_epoch,
                     Self::task_id(&next),
-                    self.tick,
-                    selection_attempt,
+                    pick.tick,
+                    pick.selection_attempt,
                 );
                 next
             }

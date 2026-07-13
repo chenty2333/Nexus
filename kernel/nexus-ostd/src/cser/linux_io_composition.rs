@@ -687,7 +687,7 @@ impl CompositionState {
             return Err(CompositionError::RootNotActive);
         }
         let selection = self.registry.revoke_begin(ROOT_SCOPE)?;
-        let frozen_effects = selection.effects.clone();
+        let frozen_effects = self.registry.revoke_targets(&selection)?.clone();
         let frozen_domains = frozen_effects
             .iter()
             .map(|effect| self.kind_by_effect[effect].domain())

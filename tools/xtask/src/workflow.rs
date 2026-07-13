@@ -31,6 +31,7 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
         "target/verification/manifest.json",
         "target/verification/.stage7a-verify-start.json",
         "target/verification/.stage7a-verify-complete.json",
+        "target/verification/stage7b",
         "include-hidden-files: true",
     ] {
         if !workflow.contains(required) {
@@ -111,6 +112,8 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         "run_xtask begin",
         "run_xtask verify",
         "run_system",
+        "eval-stage7b",
+        "run_xtask stage7b-evidence",
         "run_xtask complete",
         "run_xtask manifest",
     ] {
@@ -123,6 +126,8 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         "run_xtask begin",
         "run_xtask verify",
         "run_system",
+        "eval-stage7b",
+        "run_xtask stage7b-evidence",
         "run_xtask complete",
         "run_xtask manifest",
     ] {
@@ -357,12 +362,12 @@ verify_all() {
 "#;
         let suffix = "\n}\n";
         let ordered = format!(
-            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_xtask complete\nrun_xtask manifest{suffix}"
+            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask complete\nrun_xtask manifest{suffix}"
         );
         validate_full_verify_order(&ordered).expect("ordered full verify");
 
         let spliced = format!(
-            "{prefix}run_xtask begin\nrun_xtask verify\nrun_xtask complete\nrun_system\nrun_xtask manifest{suffix}"
+            "{prefix}run_xtask begin\nrun_xtask verify\nrun_xtask complete\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask manifest{suffix}"
         );
         let error = validate_full_verify_order(&spliced)
             .expect_err("completion before system must be rejected")

@@ -18,6 +18,11 @@ mod doctor;
 mod evidence;
 mod guest;
 mod scenario;
+mod stage7b;
+mod stage7b_concurrency;
+mod stage7b_contribution;
+mod stage7b_evidence;
+mod stage7b_prior_art;
 mod workflow;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -83,6 +88,7 @@ fn real_main() -> Result<()> {
         }
         "complete" => evidence::complete(&root, &TLA_SPECS).map(|_| ()),
         "manifest" => evidence::write(&root, &TLA_SPECS).map(|_| ()),
+        "stage7b-evidence" => stage7b_evidence_all(&root),
         "clean" => clean(&root),
         "help" | "-h" | "--help" => {
             print_usage();
@@ -103,20 +109,57 @@ fn repo_root() -> PathBuf {
 fn print_usage() {
     eprintln!("usage: cargo run --manifest-path tools/xtask/Cargo.toml -- <command>");
     eprintln!("commands: doctor build fmt check test quick model spec verify clean");
-    eprintln!("internal evidence commands: begin complete manifest");
+    eprintln!("internal evidence commands: begin stage7b-evidence complete manifest");
+}
+
+fn stage7b_evidence_all(root: &Path) -> Result<()> {
+    let concurrency = stage7b_concurrency::run(root)
+        .map_err(|error| format!("Stage 7B concurrency evidence: {error}"))?;
+    let runtime = stage7b_evidence::run(root)
+        .map_err(|error| format!("Stage 7B runtime evidence: {error}"))?;
+    let prior = stage7b_prior_art::run(root)
+        .map_err(|error| format!("Stage 7B prior-art evidence: {error}"))?;
+    let contribution = stage7b_contribution::run(root)
+        .map_err(|error| format!("Stage 7B contribution decision: {error}"))?;
+    println!(
+        "STAGE7B EVIDENCE PASS races={} fault_cells={} scale_points={} performance_cases={} prior_art_rows={} verdict={}",
+        concurrency.races,
+        runtime.fault_cells,
+        runtime.scale_points,
+        runtime.performance_cases,
+        prior.rows,
+        contribution.verdict,
+    );
+    Ok(())
 }
 
 fn doctor(root: &Path) -> Result<()> {
-    section("validate Stage 7A repository and pinned toolchain");
+    section("validate Stage 7A repository, Stage 7B static contract, and pinned toolchain");
     doctor::run(root, &TLA_SPECS)?;
     let oracle_count =
         catalog::validate_all(root).map_err(|error| format!("oracle schema: {error}"))?;
     let scenario_count =
         scenario::validate_all(root).map_err(|error| format!("runner schema: {error}"))?;
     let guest = guest::validate(root).map_err(|error| format!("Linux guest catalog: {error}"))?;
+    let stage7b =
+        stage7b::validate(root).map_err(|error| format!("Stage 7B static contract: {error}"))?;
+    let prior_art = stage7b_prior_art::check(root)
+        .map_err(|error| format!("Stage 7B prior-art truth source: {error}"))?;
     println!(
         "DOCTOR CATALOGS PASS oracles={oracle_count} scenarios={scenario_count} guest_sources={} guest_workloads={}",
         guest.sources, guest.workloads
+    );
+    println!(
+        "DOCTOR STAGE7B STATIC PASS races={} fault_cells={} scale_points={} performance_cases={} prior_art_rows={}",
+        stage7b.races,
+        stage7b.fault_cells,
+        stage7b.scale_points,
+        stage7b.performance_cases,
+        stage7b.prior_art_rows,
+    );
+    println!(
+        "DOCTOR STAGE7B PRIOR ART PASS rows={} full_text={} metadata_only={} verdict={}",
+        prior_art.rows, prior_art.full_text, prior_art.metadata_only, prior_art.default_verdict,
     );
     Ok(())
 }
@@ -171,11 +214,29 @@ fn check(root: &Path) -> Result<()> {
         "workflow surfaces: PASS ({} shell sources, {} pinned CI actions)",
         workflow.shell_sources, workflow.pinned_actions
     );
+    let prior_art = stage7b_prior_art::check(root)
+        .map_err(|error| format!("Stage 7B prior-art truth source: {error}"))?;
+    println!(
+        "Stage 7B prior-art truth source: PASS ({} rows, {} full-text, {} metadata-only, verdict={})",
+        prior_art.rows, prior_art.full_text, prior_art.metadata_only, prior_art.default_verdict,
+    );
 
     section("validate implementation-neutral oracle catalogs");
     let oracle_count =
         catalog::validate_all(root).map_err(|error| format!("oracle schema: {error}"))?;
     println!("oracle catalogs: PASS ({oracle_count} entries)");
+
+    section("validate Stage 7B static acceptance contract");
+    let stage7b =
+        stage7b::validate(root).map_err(|error| format!("Stage 7B static contract: {error}"))?;
+    println!(
+        "Stage 7B static contract: PASS ({} races, {} fault cells, {} scale points, {} performance cases, {} prior-art rows)",
+        stage7b.races,
+        stage7b.fault_cells,
+        stage7b.scale_points,
+        stage7b.performance_cases,
+        stage7b.prior_art_rows,
+    );
 
     section("validate neutral runner scenarios");
     let scenario_count =

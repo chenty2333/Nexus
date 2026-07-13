@@ -15,8 +15,11 @@ use ostd::{
 };
 
 use crate::{
-    dma::{ClosureProgress, IotlbTombstone, OwnerKind},
-    portal::{Operation, Portal, RegisterError, ResetTombstone, Terminal},
+    dma::OwnerKind,
+    portal::{
+        ClosureProgress, ClosureReceipt, IotlbTombstone, Operation, Portal, RegisterError,
+        ResetTombstone, Terminal, terminal_label,
+    },
 };
 
 const SECTOR_MAGIC: &[u8] = b"NEXUS-CSER-VIRTIO-BLK-STAGE5B\n";
@@ -49,7 +52,7 @@ fn retry_reset(mut tombstone: ResetTombstone, root: &mut pci::Root) -> portal::R
     panic!("reset remained pending; tombstone must be retained by recovery policy");
 }
 
-fn finish_iotlb(mut progress: ClosureProgress) -> dma::ClosureReceipt {
+fn finish_iotlb(mut progress: ClosureProgress) -> ClosureReceipt {
     for _ in 0..16 {
         match progress {
             ClosureProgress::Complete(receipt) => return receipt,
@@ -170,7 +173,7 @@ fn kernel_main() {
     println!(
         "IO Terminal request={} state={}",
         first_authority.request_id,
-        Terminal::Completed.label()
+        terminal_label(Terminal::Completed)
     );
 
     println!(
@@ -203,7 +206,7 @@ fn kernel_main() {
         "REVOKE Gate request={} state=AbortedBeforeCommit stale_publish_rejected=true register_while_closing_rejected=true",
         prepared_authority.request_id
     );
-    let first_reset = first.submit_reset(true);
+    let first_reset = portal.submit_reset(first, true);
     assert_eq!(first_reset.retained_dma_pages(), 3);
     let first_reset = match first_reset.retry_ack(&mut root) {
         Ok(_) => panic!("injected reset poll did not return Pending"),
@@ -218,17 +221,17 @@ fn kernel_main() {
         first_reset.retained_dma_pages()
     );
 
-    let first_ack = retry_reset(first_reset, &mut root);
+    let mut first_ack = retry_reset(first_reset, &mut root);
     assert_eq!(first_ack.terminal(), Terminal::Completed);
     assert_eq!(first_ack.retained_dma_pages(), 3);
     assert!(first_ack.isr_read());
-    assert_eq!(portal.acknowledge_reset(&first_ack), 0);
+    assert_eq!(portal.acknowledge_reset(&mut first_ack), 0);
     assert_eq!(portal.device_generation(), 2);
     assert_eq!(portal.terminal(first_authority), Some(Terminal::Completed));
     println!(
         "RESET Retry generation={} ack=true bus_master=false isr_read=true terminal={} receipt_bound=true",
         first_ack.authority().device_generation,
-        first_ack.terminal().label()
+        terminal_label(first_ack.terminal())
     );
     println!(
         "RESET Fence old_generation={} new_generation={} unterminated_effects=0",
@@ -236,10 +239,7 @@ fn kernel_main() {
         portal.device_generation()
     );
 
-    let iotlb_tombstone = expect_injected_iotlb_tombstone(dma::begin_closure(
-        first_ack.into_closure_authority(),
-        true,
-    ));
+    let iotlb_tombstone = expect_injected_iotlb_tombstone(portal.begin_iotlb(first_ack, true));
     assert_eq!(iotlb_tombstone.retained_pages(), 3);
     println!(
         "IOTLB Pending generation={} owner={} timeout_injected=true hardware_timeout=false retained_dma_pages={} tombstone=true",
@@ -316,10 +316,10 @@ fn kernel_main() {
         second_authority.device_generation
     );
     assert_eq!(portal.begin_closing(), 0);
-    let second_ack = retry_reset(second.submit_reset(false), &mut root);
+    let mut second_ack = retry_reset(portal.submit_reset(second, false), &mut root);
     assert_eq!(second_ack.terminal(), Terminal::IndeterminateAfterReset);
     assert!(second_ack.isr_read());
-    assert_eq!(portal.acknowledge_reset(&second_ack), 1);
+    assert_eq!(portal.acknowledge_reset(&mut second_ack), 1);
     assert_eq!(
         portal.terminal(second_authority),
         Some(Terminal::IndeterminateAfterReset)
@@ -329,7 +329,7 @@ fn kernel_main() {
     println!(
         "RESET Ack generation={} ack=true bus_master=false isr_read=true terminal={} receipt_bound=true",
         second_ack.authority().device_generation,
-        second_ack.terminal().label()
+        terminal_label(second_ack.terminal())
     );
     println!(
         "RESET Fence old_generation={} new_generation={} terminalized_effects=1 stale_completion_rejected=true",
@@ -339,13 +339,10 @@ fn kernel_main() {
     println!(
         "IO Terminal request={} state={} cancelled=false duplicate_terminal_call_rejected=true",
         second_authority.request_id,
-        second_ack.terminal().label()
+        terminal_label(second_ack.terminal())
     );
 
-    let second_closure = finish_iotlb(dma::begin_closure(
-        second_ack.into_closure_authority(),
-        false,
-    ));
+    let second_closure = finish_iotlb(portal.begin_iotlb(second_ack, false));
     assert_eq!(second_closure.completed_pages(), 3);
     println!(
         "IOTLB Complete generation={} owners={} ack_before_free=true quiescence_receipt_bound=true",

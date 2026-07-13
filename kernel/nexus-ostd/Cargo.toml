@@ -7,10 +7,15 @@ edition = "2024"
 license = "MPL-2.0"
 publish = false
 
+[features]
+stage7b-eval = []
+
 [dependencies]
+cser-transition-gates = { path = "../../crates/cser-transition-gates" }
 linux-raw-sys = { version = "=0.12.1", default-features = false, features = ["auxvec", "general", "net", "no_std"] }
 object = { version = "=0.39.1", default-features = false, features = ["elf", "read_core"] }
 ostd = { version = "=0.18.0" }
+x86 = "=0.52.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ktest)"] }

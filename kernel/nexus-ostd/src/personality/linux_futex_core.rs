@@ -1078,7 +1078,7 @@ impl CoreScenario {
         let (keys, completion_waker) = keys;
         self.runtime.with_state(|runtime| {
             let selection = runtime.effects.revoke_begin(SCOPE).unwrap();
-            assert!(selection.effects.is_empty());
+            assert_eq!(selection.target_count, 0);
             assert!(runtime.effects.revoke_next(&selection).unwrap().is_none());
             for key in &keys {
                 runtime.futex.retire(key).unwrap();

@@ -58,12 +58,21 @@ image_key=$(sha256sum \
     "$root/guest/linux-futex-core-personality-v2.S" \
     "$root/guest/linux-netd-v1.S" \
     "$root/guest/linux-netd-v2.S" \
+    "$root/src/evaluation/stage7b.rs" \
     "$root/userspace/personality/.cargo/config.toml" \
     "$root/userspace/personality/Cargo.toml" \
     "$root/userspace/personality/Cargo.lock" \
     "$root/userspace/personality/linker.ld" \
     "$root/userspace/personality/src/bin/v1.rs" \
-    "$root/userspace/personality/src/bin/v2.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+    "$root/userspace/personality/src/bin/v2.rs" \
+    "$repo_root/crates/cser-transition-gates/Cargo.toml" \
+    "$repo_root/crates/cser-transition-gates/src/lib.rs" \
+    "$repo_root/crates/cser-transition-gates/src/oneshot.rs" \
+    "$repo_root/crates/cser-transition-gates/src/deadline.rs" \
+    "$repo_root/crates/cser-transition-gates/src/scheduler.rs" \
+    "$repo_root/crates/cser-transition-gates/src/pager.rs" \
+    "$repo_root/crates/cser-transition-gates/src/io.rs" \
+    "$root/src/cser/effect_registry.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/nexus-ostd:$image_key"
 runner_base="$root/osdk-runner-base"
 runner_target="$root/target/osdk/nexus-kernel-run-base"
@@ -77,7 +86,12 @@ build_image() {
 }
 
 container() {
+    local -a cpu_args=()
+    if [[ -n ${NEXUS_CONTAINER_CPUSET:-} ]]; then
+        cpu_args=(--cpuset-cpus "$NEXUS_CONTAINER_CPUSET")
+    fi
     docker run --rm \
+        "${cpu_args[@]}" \
         --platform linux/amd64 \
         --network none \
         --user "$(id -u):$(id -g)" \
@@ -85,6 +99,8 @@ container() {
         --tmpfs /tmp/nexus-home:rw,exec,nosuid,size=64m,mode=1777 \
         -v "$root:/work:z" \
         -v "$repo_root:/repo:ro,z" \
+        -v "$repo_root/crates/cser-transition-gates:/crates/cser-transition-gates:ro,z" \
+        --mount "type=bind,source=$root/src/cser/effect_registry.rs,target=/kernel/nexus-ostd/src/cser/effect_registry.rs,readonly" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         --mount "type=bind,source=$root/userspace/personality/Cargo.lock,target=/work/userspace/personality/Cargo.lock,readonly" \
         -w /work \
@@ -343,6 +359,68 @@ run_kernel() {
     assert_runner_base
 }
 
+build_stage7b() {
+    check_kernel
+    prepare_runner_base
+    container cargo osdk build --release --features stage7b-eval
+    assert_runner_base
+}
+
+first_allowed_cpu() {
+    local allowed first
+    allowed=$(awk '$1 == "Cpus_allowed_list:" { print $2 }' /proc/self/status)
+    first=${allowed%%,*}
+    first=${first%%-*}
+    if [[ ! $first =~ ^[0-9]+$ ]]; then
+        echo "cannot select first CPU from Cpus_allowed_list=$allowed" >&2
+        return 1
+    fi
+    printf '%s\n' "$first"
+}
+
+eval_stage7b() {
+    # Build the release evaluator before the runtime deadline. The run command
+    # reuses this exact generated image and runner graph.
+    build_stage7b
+    local allowed cpu metadata temporary serial debug status
+    allowed=$(awk '$1 == "Cpus_allowed_list:" { print $2 }' /proc/self/status)
+    cpu=$(first_allowed_cpu)
+    mkdir -p "$root/artifacts"
+    serial="$root/artifacts/stage7b-evaluation.log"
+    debug="$root/artifacts/stage7b-qemu-debug.log"
+    metadata="$root/artifacts/stage7b-runtime-metadata.env"
+    temporary="$metadata.tmp.$$"
+    rm -f "$serial" "$debug" "$metadata" "$temporary"
+    {
+        echo 'schema=nexus.stage7b.runtime-metadata.v1'
+        echo 'accel=tcg'
+        echo 'vcpus=1'
+        echo 'threads=1'
+        echo "cpu_pin=$cpu"
+        echo "cpus_allowed_list=$allowed"
+    } >"$temporary"
+    mv "$temporary" "$metadata"
+
+    set +e
+    NEXUS_CONTAINER_CPUSET=$cpu container bash -c '
+        set -euo pipefail
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        exec timeout --signal=TERM --kill-after=2s 180s \
+            cargo osdk run --release --features stage7b-eval
+    ' > >(tee "$serial") 2> >(tee "$debug" >&2)
+    status=$?
+    set -e
+    assert_runner_base
+    if (( status != 0 )); then
+        echo "Stage 7B evaluator failed with status $status" >&2
+        return "$status"
+    fi
+    tr -d '\r' <"$serial" \
+        | grep -Fx 'STAGE7B_EVALUATION PASS faults=20 scale_points=14 performance_cases=29' \
+            >/dev/null
+    echo "STAGE7B QEMU PASS cpu_pin=$cpu accel=tcg threads=1 vcpus=1 profile=release"
+}
+
 command=${1:-test}
 case "$command" in
     doctor)
@@ -465,6 +543,11 @@ case "$command" in
         fi
         echo 'runtime filesystem serial negative assertions: PASS syscall_count=rejected duplicate_pass=rejected elf_digest=rejected pwrite_order=rejected'
         ;;
+    eval-stage7b)
+        ensure_image
+        prepare_guest
+        eval_stage7b
+        ;;
     clean)
         # Do not make cleanup depend on Docker or on a prebuilt image.
         rm -rf "$root/target" "$root/artifacts" "$root/userspace/personality/target"
@@ -473,7 +556,7 @@ case "$command" in
         rm -f "$repo_root/target/verification/linux-io-composition-oracle.log"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|iommu-probe|run|test|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|iommu-probe|run|test|eval-stage7b|clean}" >&2
         exit 2
         ;;
 esac

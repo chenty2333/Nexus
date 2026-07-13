@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const SCHEMA: &str = "nexus.verification.v3";
+const SCHEMA: &str = "nexus.verification.v4";
 const START_SCHEMA: &str = "nexus.verification.start.v1";
 const MODEL_SPEC_SCHEMA: &str = "nexus.verification.model-spec.v1";
 const COMPLETE_SCHEMA: &str = "nexus.verification.complete.v1";
@@ -21,6 +21,13 @@ const SENTINEL: &str = "target/verification/.stage7a-verify-start.json";
 const MODEL_SPEC_RECEIPT: &str = "target/verification/.stage7a-model-spec-complete.json";
 const COMPLETION_RECEIPT: &str = "target/verification/.stage7a-verify-complete.json";
 const OUTPUT: &str = "target/verification/manifest.json";
+const COMPLETE_STAGES: [&str; 5] = [
+    "reference-model",
+    "formal-specifications",
+    "system-composition",
+    "stage7b-evaluation",
+    "stage7b-contribution-decision",
+];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +119,25 @@ struct Boundaries {
     stage5b_relation: &'static str,
     stage5b_same_boot: bool,
     real_dma_primary: bool,
+    stage7b_concurrency_boundary: &'static str,
+    stage7b_concurrency_races_checked: u64,
+    stage7b_fault_cells_checked: u64,
+    stage7b_scale_points_checked: u64,
+    stage7b_performance_cases_observed: u64,
+    stage7b_performance_claim: &'static str,
+    stage7b_prior_art_rows_checked: u64,
+    stage7b_prior_art_full_text: u64,
+    stage7b_prior_art_metadata_only: u64,
+    stage7b_contribution_verdict: &'static str,
+    novelty_established: bool,
+    first_established: bool,
+    proved_established: bool,
+    smp_checked: bool,
+    hardware_cycles_observed: bool,
+    lock_freedom_established: bool,
+    durable_external_effects_covered: bool,
+    linux_breadth_established: bool,
+    full_production_adapter_equivalence_established: bool,
 }
 
 impl Boundaries {
@@ -137,6 +163,25 @@ impl Boundaries {
             stage5b_relation: "component_consistency",
             stage5b_same_boot: false,
             real_dma_primary: false,
+            stage7b_concurrency_boundary: "production transition source under a Loom-modeled outer mutex",
+            stage7b_concurrency_races_checked: 14,
+            stage7b_fault_cells_checked: 20,
+            stage7b_scale_points_checked: 14,
+            stage7b_performance_cases_observed: 29,
+            stage7b_performance_claim: "Observed",
+            stage7b_prior_art_rows_checked: 16,
+            stage7b_prior_art_full_text: 14,
+            stage7b_prior_art_metadata_only: 2,
+            stage7b_contribution_verdict: "narrow",
+            novelty_established: false,
+            first_established: false,
+            proved_established: false,
+            smp_checked: false,
+            hardware_cycles_observed: false,
+            lock_freedom_established: false,
+            durable_external_effects_covered: false,
+            linux_breadth_established: false,
+            full_production_adapter_equivalence_established: false,
         }
     }
 }
@@ -300,11 +345,7 @@ pub(crate) fn complete(root: &Path, specs: &[&str]) -> Result<PathBuf> {
     let receipt = gate_receipt(
         COMPLETE_SCHEMA,
         &start,
-        [
-            "reference-model",
-            "formal-specifications",
-            "system-composition",
-        ],
+        COMPLETE_STAGES,
         Some(model_sha256),
         artifacts,
     )?;
@@ -383,11 +424,7 @@ fn write_authorized(
         &completion,
         COMPLETE_SCHEMA,
         &start,
-        &[
-            "reference-model",
-            "formal-specifications",
-            "system-composition",
-        ],
+        &COMPLETE_STAGES,
         Some(&model_sha256),
         &artifacts,
     )?;
@@ -447,6 +484,47 @@ fn write_authorized(
             evidence: vec![String::from(
                 "target/verification/runtime-fs-composition-oracle.log",
             )],
+        },
+        Stage {
+            id: "implementation-source-concurrency",
+            evidence: vec![
+                String::from("target/verification/stage7b/concurrency.log"),
+                String::from("target/verification/stage7b/concurrency.json"),
+                String::from("target/verification/stage7b/concurrency-oracle.log"),
+            ],
+        },
+        Stage {
+            id: "fault-matrix",
+            evidence: vec![String::from(
+                "target/verification/stage7b/fault-matrix.jsonl",
+            )],
+        },
+        Stage {
+            id: "scale-structure",
+            evidence: vec![String::from("target/verification/stage7b/scale.jsonl")],
+        },
+        Stage {
+            id: "performance-observation",
+            evidence: vec![
+                String::from("kernel/nexus-ostd/artifacts/stage7b-evaluation.log"),
+                String::from("kernel/nexus-ostd/artifacts/stage7b-runtime-metadata.env"),
+                String::from("target/verification/stage7b/performance.json"),
+                String::from("target/verification/stage7b/oracle.log"),
+            ],
+        },
+        Stage {
+            id: "primary-source-prior-art",
+            evidence: vec![
+                String::from("target/verification/stage7b/prior-art.json"),
+                String::from("target/verification/stage7b/prior-art-oracle.log"),
+            ],
+        },
+        Stage {
+            id: "contribution-decision",
+            evidence: vec![
+                String::from("target/verification/stage7b/contribution.json"),
+                String::from("target/verification/stage7b/contribution-oracle.log"),
+            ],
         },
     ];
     let manifest = Manifest {
@@ -776,6 +854,62 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
             String::from("target/verification/linux-io-composition-oracle.log"),
             Some("LINUX_IO_COMPOSITION_EVIDENCE PASS"),
         ),
+        (
+            String::from("kernel/nexus-ostd/artifacts/stage7b-evaluation.log"),
+            Some("STAGE7B_EVALUATION PASS faults=20 scale_points=14 performance_cases=29"),
+        ),
+        (
+            String::from("kernel/nexus-ostd/artifacts/stage7b-runtime-metadata.env"),
+            Some("schema=nexus.stage7b.runtime-metadata.v1"),
+        ),
+        (
+            String::from("kernel/nexus-ostd/artifacts/stage7b-qemu-debug.log"),
+            Some("Finished"),
+        ),
+        (
+            String::from("target/verification/stage7b/concurrency.log"),
+            Some("STAGE7B_CONCURRENCY case=commit_vs_revoke_linearization status=PASS"),
+        ),
+        (
+            String::from("target/verification/stage7b/concurrency.json"),
+            Some("nexus.stage7b.concurrency.v1"),
+        ),
+        (
+            String::from("target/verification/stage7b/concurrency-oracle.log"),
+            Some("races=14"),
+        ),
+        (
+            String::from("target/verification/stage7b/fault-matrix.jsonl"),
+            Some("\"status\":\"Checked\""),
+        ),
+        (
+            String::from("target/verification/stage7b/scale.jsonl"),
+            Some("\"status\":\"Checked\""),
+        ),
+        (
+            String::from("target/verification/stage7b/performance.json"),
+            Some("nexus.stage7b.performance.v1"),
+        ),
+        (
+            String::from("target/verification/stage7b/oracle.log"),
+            Some("performance_claim=Observed"),
+        ),
+        (
+            String::from("target/verification/stage7b/prior-art.json"),
+            Some("nexus.stage7b.prior-art.receipt.v1"),
+        ),
+        (
+            String::from("target/verification/stage7b/prior-art-oracle.log"),
+            Some("support_bounded_allowed=false"),
+        ),
+        (
+            String::from("target/verification/stage7b/contribution.json"),
+            Some("nexus.stage7b.contribution-decision.v1"),
+        ),
+        (
+            String::from("target/verification/stage7b/contribution-oracle.log"),
+            Some("verdict=narrow"),
+        ),
     ]
 }
 
@@ -1090,6 +1224,24 @@ mod tests {
         assert!(!boundaries.stage5b_same_boot);
         assert!(!boundaries.identity_preserving_stage5b_composition);
         assert!(!boundaries.real_dma_primary);
+        assert_eq!(boundaries.stage7b_concurrency_races_checked, 14);
+        assert_eq!(boundaries.stage7b_fault_cells_checked, 20);
+        assert_eq!(boundaries.stage7b_scale_points_checked, 14);
+        assert_eq!(boundaries.stage7b_performance_cases_observed, 29);
+        assert_eq!(boundaries.stage7b_performance_claim, "Observed");
+        assert_eq!(boundaries.stage7b_prior_art_rows_checked, 16);
+        assert_eq!(boundaries.stage7b_prior_art_full_text, 14);
+        assert_eq!(boundaries.stage7b_prior_art_metadata_only, 2);
+        assert_eq!(boundaries.stage7b_contribution_verdict, "narrow");
+        assert!(!boundaries.novelty_established);
+        assert!(!boundaries.first_established);
+        assert!(!boundaries.proved_established);
+        assert!(!boundaries.smp_checked);
+        assert!(!boundaries.hardware_cycles_observed);
+        assert!(!boundaries.lock_freedom_established);
+        assert!(!boundaries.durable_external_effects_covered);
+        assert!(!boundaries.linux_breadth_established);
+        assert!(!boundaries.full_production_adapter_equivalence_established);
 
         let json = serde_json::to_value(boundaries).expect("serialize manifest boundaries");
         assert_eq!(json["linux_io_composition_causal_nodes"], 10);
@@ -1097,6 +1249,8 @@ mod tests {
         assert_eq!(json["linux_io_composition_credit_classes"], 8);
         assert_eq!(json["linux_io_composition_credit_units"], 9);
         assert_eq!(json["real_dma_primary"], false);
+        assert_eq!(json["stage7b_contribution_verdict"], "narrow");
+        assert_eq!(json["stage7b_performance_claim"], "Observed");
     }
 
     #[test]
@@ -1240,11 +1394,7 @@ mod tests {
         let complete = gate_receipt(
             COMPLETE_SCHEMA,
             &start,
-            [
-                "reference-model",
-                "formal-specifications",
-                "system-composition",
-            ],
+            COMPLETE_STAGES,
             Some(model_sha256.clone()),
             artifacts.clone(),
         )
@@ -1253,11 +1403,7 @@ mod tests {
             &complete,
             COMPLETE_SCHEMA,
             &start,
-            &[
-                "reference-model",
-                "formal-specifications",
-                "system-composition",
-            ],
+            &COMPLETE_STAGES,
             Some(&model_sha256),
             &artifacts,
         )
@@ -1270,11 +1416,7 @@ mod tests {
                 &complete,
                 COMPLETE_SCHEMA,
                 &start,
-                &[
-                    "reference-model",
-                    "formal-specifications",
-                    "system-composition",
-                ],
+                &COMPLETE_STAGES,
                 Some(&model_sha256),
                 &changed_artifacts,
             )
@@ -1287,11 +1429,7 @@ mod tests {
                 &complete,
                 COMPLETE_SCHEMA,
                 &start,
-                &[
-                    "reference-model",
-                    "formal-specifications",
-                    "system-composition",
-                ],
+                &COMPLETE_STAGES,
                 Some(&wrong_prerequisite),
                 &artifacts,
             )
@@ -1305,11 +1443,7 @@ mod tests {
                 &extra_artifact,
                 COMPLETE_SCHEMA,
                 &start,
-                &[
-                    "reference-model",
-                    "formal-specifications",
-                    "system-composition",
-                ],
+                &COMPLETE_STAGES,
                 Some(&model_sha256),
                 &artifacts,
             )
@@ -1323,11 +1457,7 @@ mod tests {
                 &invalid_time,
                 COMPLETE_SCHEMA,
                 &start,
-                &[
-                    "reference-model",
-                    "formal-specifications",
-                    "system-composition",
-                ],
+                &COMPLETE_STAGES,
                 Some(&model_sha256),
                 &artifacts,
             )
@@ -1341,11 +1471,7 @@ mod tests {
                 &wrong_nonce,
                 COMPLETE_SCHEMA,
                 &start,
-                &[
-                    "reference-model",
-                    "formal-specifications",
-                    "system-composition",
-                ],
+                &COMPLETE_STAGES,
                 Some(&model_sha256),
                 &artifacts,
             )
@@ -1485,11 +1611,7 @@ mod tests {
         let completion = gate_receipt(
             COMPLETE_SCHEMA,
             &start,
-            [
-                "reference-model",
-                "formal-specifications",
-                "system-composition",
-            ],
+            COMPLETE_STAGES,
             Some(sha256(&model_bytes)),
             artifacts,
         )

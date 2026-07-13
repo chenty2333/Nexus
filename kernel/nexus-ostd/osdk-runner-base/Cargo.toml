@@ -19,3 +19,4 @@ version = "0.18.0"
 version = "0.18.0"
 
 [features]
+stage7b-eval = ["nexus-kernel/stage7b-eval"]

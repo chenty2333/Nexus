@@ -295,6 +295,13 @@ impl CreditLedger {
             if owned < charge.units {
                 return Err(RegistryError::InvalidState);
             }
+            let free = balance
+                .free
+                .checked_add(charge.units)
+                .ok_or(RegistryError::CounterOverflow)?;
+            if free > balance.capacity {
+                return Err(RegistryError::InvalidState);
+            }
         }
         for charge in charges {
             let balance = self.balances.get_mut(&charge.class).unwrap();
@@ -306,7 +313,7 @@ impl CreditLedger {
             balance.free = balance
                 .free
                 .checked_add(charge.units)
-                .ok_or(RegistryError::CounterOverflow)?;
+                .expect("release capacity was validated");
         }
         Ok(())
     }
@@ -702,6 +709,21 @@ struct RecoveryState {
 struct RevokeState {
     sequence: u64,
     cohort: BTreeSet<EffectKey>,
+    closed_authority_epoch: u64,
+    authority_epoch: u64,
+    target_count: usize,
+    selected_head: Option<EffectKey>,
+    retired_recovery: Option<RecoveryState>,
+    work: RevokeWorkCounters,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RevokeWorkCounters {
+    next_calls: u64,
+    head_selections: u64,
+    terminalized: u64,
+    completion_members_checked: u64,
+    target_index_removals: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -715,6 +737,8 @@ struct ScopeRecord {
     revision: u64,
     domain_revision: u64,
     credits: CreditLedger,
+    closure_candidates: BTreeSet<EffectKey>,
+    pending_publications: usize,
     recovery: Option<RecoveryState>,
     revoke: Option<RevokeState>,
 }
@@ -768,7 +792,22 @@ pub(crate) struct RevokeSelection {
     pub(crate) sequence: u64,
     pub(crate) closed_authority_epoch: u64,
     pub(crate) authority_epoch: u64,
-    pub(crate) effects: BTreeSet<EffectKey>,
+    pub(crate) target_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RevokeWorkProjection {
+    pub(crate) target_count: usize,
+    pub(crate) begin_target_record_visits: u64,
+    pub(crate) next_calls: u64,
+    pub(crate) head_selections: u64,
+    pub(crate) terminalized: u64,
+    pub(crate) completion_members_checked: u64,
+    pub(crate) target_index_removals: u64,
+    pub(crate) unrelated_effect_visits: u64,
+    pub(crate) history_effect_visits: u64,
+    pub(crate) pending_targets: usize,
+    pub(crate) target_state: ScopePhase,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -827,7 +866,7 @@ pub(crate) enum RegistryError {
     Invariant(&'static str),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EffectRegistry {
     scopes: BTreeMap<ScopeKey, ScopeRecord>,
     effects: BTreeMap<EffectKey, EffectRecord>,
@@ -881,6 +920,8 @@ impl EffectRegistry {
                 revision: 0,
                 domain_revision: 0,
                 credits,
+                closure_candidates: BTreeSet::new(),
+                pending_publications: 0,
                 recovery: None,
                 revoke: None,
             },
@@ -1130,6 +1171,11 @@ impl EffectRegistry {
             .next_commit_sequence
             .checked_add(count)
             .ok_or(RegistryError::CounterOverflow)?;
+        let scope_key = scope_key.expect("nonempty commit batch has a scope");
+        let next_scope_revision = self.scopes[&scope_key]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
         let mut receipts = Vec::with_capacity(commits.len());
         for (offset, (handle, metadata)) in commits.iter().enumerate() {
             let effect = handle.effect;
@@ -1168,7 +1214,11 @@ impl EffectRegistry {
             record.credit_state = CreditState::Committed;
             record.commit = Some(receipt.clone());
         }
-        self.bump_scope_revision(scope_key.expect("nonempty commit batch has a scope"))?;
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        scope.revision = next_scope_revision;
+        if scope.fallback_running {
+            scope.recovery.as_mut().unwrap().ready = None;
+        }
         Ok(receipts.into_iter().map(CommitOutcome::Applied).collect())
     }
 
@@ -1454,6 +1504,18 @@ impl EffectRegistry {
         let scope_key = record.identity.scope;
         let charges = record.credits.clone();
         let credit_state = record.credit_state;
+        let (next_scope_revision, next_pending_publications) = {
+            let scope = self.scopes.get(&scope_key).unwrap();
+            let pending = scope
+                .pending_publications
+                .checked_sub(1)
+                .ok_or(RegistryError::InvalidPublication)?;
+            let revision = scope
+                .revision
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            (revision, pending)
+        };
         self.scopes
             .get_mut(&scope_key)
             .unwrap()
@@ -1463,7 +1525,12 @@ impl EffectRegistry {
         record.credit_state = CreditState::Released;
         record.pending_publication = None;
         record.publication_acks = 1;
-        self.bump_scope_revision(scope_key)?;
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        scope.pending_publications = next_pending_publications;
+        scope.revision = next_scope_revision;
+        if scope.fallback_running {
+            scope.recovery.as_mut().unwrap().ready = None;
+        }
         Ok(())
     }
 
@@ -1471,64 +1538,146 @@ impl EffectRegistry {
         &mut self,
         scope_key: ScopeKey,
     ) -> Result<RevokeSelection, RegistryError> {
-        let cohort = self.by_scope.get(&scope_key).cloned().unwrap_or_default();
-        let sequence = self.take_revoke_sequence()?;
+        let (closed_authority_epoch, authority_epoch, revision, target_count) = {
+            let scope = self
+                .scopes
+                .get(&scope_key)
+                .ok_or(RegistryError::UnknownScope)?;
+            if scope.phase != ScopePhase::Active {
+                return Err(RegistryError::ScopeNotActive);
+            }
+            if scope.revoke.is_some() {
+                return Err(RegistryError::InvalidState);
+            }
+            let authority_epoch = scope
+                .authority_epoch
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            let revision = scope
+                .revision
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            let target_count = scope.closure_candidates.len();
+            u64::try_from(target_count).map_err(|_| RegistryError::CounterOverflow)?;
+            (
+                scope.authority_epoch,
+                authority_epoch,
+                revision,
+                target_count,
+            )
+        };
+        let sequence = self.next_revoke_sequence;
+        let next_revoke_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+
+        // All validation and overflow checks precede this point. Moving the
+        // two indexes is allocation-free and does not visit any target record.
+        self.next_revoke_sequence = next_revoke_sequence;
         let scope = self
             .scopes
             .get_mut(&scope_key)
-            .ok_or(RegistryError::UnknownScope)?;
-        if scope.phase != ScopePhase::Active {
-            return Err(RegistryError::ScopeNotActive);
-        }
-        let closed_authority_epoch = scope.authority_epoch;
-        scope.authority_epoch = scope
-            .authority_epoch
-            .checked_add(1)
-            .ok_or(RegistryError::CounterOverflow)?;
+            .expect("validated revoke scope must remain present");
+        let cohort = core::mem::take(&mut scope.closure_candidates);
+        let retired_recovery = scope.recovery.take();
+        debug_assert_eq!(cohort.len(), target_count);
+        scope.authority_epoch = authority_epoch;
         scope.phase = ScopePhase::Closing;
         scope.supervisor = None;
         scope.fallback_running = false;
-        scope.recovery = None;
-        scope.revision = scope
-            .revision
-            .checked_add(1)
-            .ok_or(RegistryError::CounterOverflow)?;
+        scope.revision = revision;
         scope.revoke = Some(RevokeState {
             sequence,
-            cohort: cohort.clone(),
+            cohort,
+            closed_authority_epoch,
+            authority_epoch,
+            target_count,
+            selected_head: None,
+            retired_recovery,
+            work: RevokeWorkCounters::default(),
         });
         Ok(RevokeSelection {
             scope: scope_key,
             sequence,
             closed_authority_epoch,
-            authority_epoch: scope.authority_epoch,
-            effects: cohort,
+            authority_epoch,
+            target_count,
         })
     }
 
-    pub(crate) fn revoke_next(
+    pub(crate) fn revoke_targets(
         &self,
+        selection: &RevokeSelection,
+    ) -> Result<&BTreeSet<EffectKey>, RegistryError> {
+        self.validate_revoke_selection(selection)?;
+        Ok(&self.scopes[&selection.scope]
+            .revoke
+            .as_ref()
+            .unwrap()
+            .cohort)
+    }
+
+    pub(crate) fn revoke_next(
+        &mut self,
         selection: &RevokeSelection,
     ) -> Result<Option<RevokeEffect>, RegistryError> {
         self.validate_revoke_selection(selection)?;
-        for effect in &selection.effects {
+        let (selected, next_calls, head_selections) = {
+            let revoke = self.scopes[&selection.scope].revoke.as_ref().unwrap();
+            let selected = revoke.selected_head.or_else(|| {
+                self.by_scope
+                    .get(&selection.scope)
+                    .and_then(BTreeSet::first)
+                    .copied()
+            });
+            let next_calls = revoke
+                .work
+                .next_calls
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            let head_selections = if selected.is_some() && revoke.selected_head.is_none() {
+                revoke
+                    .work
+                    .head_selections
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?
+            } else {
+                revoke.work.head_selections
+            };
+            (selected, next_calls, head_selections)
+        };
+        let next = if let Some(effect) = selected {
             let record = self
                 .effects
-                .get(effect)
+                .get(&effect)
                 .ok_or(RegistryError::UnknownEffect)?;
-            if record.phase.is_terminal() {
-                continue;
+            if record.identity.scope != selection.scope || record.phase.is_terminal() {
+                return Err(RegistryError::Invariant("invalid revoke target head"));
             }
-            return Ok(Some(RevokeEffect {
-                effect: *effect,
+            Some(RevokeEffect {
+                effect,
                 disposition: record
                     .commit
                     .clone()
                     .map_or(RevokeDisposition::Abort, RevokeDisposition::Drain),
                 publication_required: record.publication_mode == PublicationMode::Required,
-            }));
+            })
+        } else {
+            None
+        };
+        let revoke = self
+            .scopes
+            .get_mut(&selection.scope)
+            .unwrap()
+            .revoke
+            .as_mut()
+            .unwrap();
+        revoke.work.next_calls = next_calls;
+        revoke.work.head_selections = head_selections;
+        if revoke.selected_head.is_none() {
+            revoke.selected_head = selected;
         }
-        Ok(None)
+        Ok(next)
     }
 
     pub(crate) fn stage_revoke_terminal(
@@ -1538,7 +1687,13 @@ impl EffectRegistry {
         request: TerminalRequest,
     ) -> Result<Terminalization, RegistryError> {
         self.validate_revoke_selection(selection)?;
-        if !selection.effects.contains(&effect) {
+        if !self.scopes[&selection.scope]
+            .revoke
+            .as_ref()
+            .unwrap()
+            .cohort
+            .contains(&effect)
+        {
             return Err(RegistryError::InvalidRevokeSelection);
         }
         self.stage_terminal_inner(effect, request)
@@ -1556,7 +1711,33 @@ impl EffectRegistry {
         {
             return Err(RegistryError::NotQuiescent);
         }
-        for effect in &selection.effects {
+        let (next_revision, target_count) = {
+            let scope = &self.scopes[&selection.scope];
+            let revoke = scope.revoke.as_ref().unwrap();
+            let target_count =
+                u64::try_from(revoke.target_count).map_err(|_| RegistryError::CounterOverflow)?;
+            if revoke.selected_head.is_some()
+                || scope.pending_publications != 0
+                || !scope.credits.is_idle()
+                || revoke.work.terminalized != target_count
+                || revoke.work.target_index_removals != target_count
+                || revoke.work.completion_members_checked != 0
+            {
+                return Err(RegistryError::NotQuiescent);
+            }
+            let revision = scope
+                .revision
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            (revision, target_count)
+        };
+        let mut members_checked = 0_u64;
+        for effect in &self.scopes[&selection.scope]
+            .revoke
+            .as_ref()
+            .unwrap()
+            .cohort
+        {
             let record = self
                 .effects
                 .get(effect)
@@ -1567,17 +1748,60 @@ impl EffectRegistry {
             {
                 return Err(RegistryError::NotQuiescent);
             }
+            if record.identity.scope != selection.scope {
+                return Err(RegistryError::InvalidRevokeSelection);
+            }
+            members_checked = members_checked
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
         }
+        if members_checked != target_count {
+            return Err(RegistryError::InvalidRevokeSelection);
+        }
+
+        // No fallible operation remains after the exact cohort validation.
         let scope = self.scopes.get_mut(&selection.scope).unwrap();
-        if !scope.credits.is_idle() {
-            return Err(RegistryError::NotQuiescent);
-        }
         scope.phase = ScopePhase::Revoked;
-        scope.revision = scope
-            .revision
-            .checked_add(1)
-            .ok_or(RegistryError::CounterOverflow)?;
+        scope.revision = next_revision;
+        let revoke = scope.revoke.as_mut().unwrap();
+        revoke.work.completion_members_checked = members_checked;
+        revoke.cohort.clear();
+        revoke.retired_recovery = None;
         Ok(())
+    }
+
+    pub(crate) fn revoke_work_projection(
+        &self,
+        selection: &RevokeSelection,
+    ) -> Result<RevokeWorkProjection, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&selection.scope)
+            .ok_or(RegistryError::UnknownScope)?;
+        let revoke = scope
+            .revoke
+            .as_ref()
+            .ok_or(RegistryError::InvalidRevokeSelection)?;
+        if revoke.sequence != selection.sequence
+            || revoke.closed_authority_epoch != selection.closed_authority_epoch
+            || revoke.authority_epoch != selection.authority_epoch
+            || revoke.target_count != selection.target_count
+        {
+            return Err(RegistryError::InvalidRevokeSelection);
+        }
+        Ok(RevokeWorkProjection {
+            target_count: revoke.target_count,
+            begin_target_record_visits: 0,
+            next_calls: revoke.work.next_calls,
+            head_selections: revoke.work.head_selections,
+            terminalized: revoke.work.terminalized,
+            completion_members_checked: revoke.work.completion_members_checked,
+            target_index_removals: revoke.work.target_index_removals,
+            unrelated_effect_visits: 0,
+            history_effect_visits: 0,
+            pending_targets: self.by_scope.get(&selection.scope).map_or(0, BTreeSet::len),
+            target_state: scope.phase,
+        })
     }
 
     pub(crate) fn scope_projection(
@@ -1589,13 +1813,6 @@ impl EffectRegistry {
             .get(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
         let live_effects = self.by_scope.get(&scope_key).map_or(0, BTreeSet::len);
-        let pending_publications = self
-            .effects
-            .values()
-            .filter(|record| {
-                record.identity.scope == scope_key && record.pending_publication.is_some()
-            })
-            .count();
         Ok(RegistryProjection {
             phase: scope.phase,
             authority_epoch: scope.authority_epoch,
@@ -1605,7 +1822,7 @@ impl EffectRegistry {
             revision: scope.revision,
             domain_revision: scope.domain_revision,
             live_effects,
-            pending_publications,
+            pending_publications: scope.pending_publications,
             credits: scope.credits.totals(),
         })
     }
@@ -1628,6 +1845,7 @@ impl EffectRegistry {
         let mut expected_by_resource: BTreeMap<ResourceKey, BTreeSet<EffectKey>> = BTreeMap::new();
         let mut expected_credits: BTreeMap<ScopeKey, BTreeMap<CreditClass, (u64, u64)>> =
             BTreeMap::new();
+        let mut expected_pending_publications = BTreeMap::<ScopeKey, usize>::new();
         let mut nonces = BTreeSet::new();
         let mut tickets = BTreeSet::new();
 
@@ -1640,15 +1858,82 @@ impl EffectRegistry {
                     return Err(RegistryError::Invariant("credit conservation"));
                 }
             }
-            if scope.phase == ScopePhase::Closing && scope.revoke.is_none() {
-                return Err(RegistryError::Invariant(
-                    "closing scope lacks revoke cohort",
-                ));
+            match scope.phase {
+                ScopePhase::Active => {
+                    if scope.revoke.is_some() {
+                        return Err(RegistryError::Invariant(
+                            "active scope retains revoke state",
+                        ));
+                    }
+                }
+                ScopePhase::Closing => {
+                    if scope.revoke.is_none()
+                        || !scope.closure_candidates.is_empty()
+                        || scope.recovery.is_some()
+                        || scope.supervisor.is_some()
+                        || scope.fallback_running
+                    {
+                        return Err(RegistryError::Invariant("invalid closing scope state"));
+                    }
+                }
+                ScopePhase::Revoked => {
+                    if scope.revoke.is_none()
+                        || !scope.closure_candidates.is_empty()
+                        || scope.recovery.is_some()
+                        || scope.supervisor.is_some()
+                        || scope.fallback_running
+                        || scope.pending_publications != 0
+                        || !scope.credits.is_idle()
+                    {
+                        return Err(RegistryError::Invariant("invalid revoked scope state"));
+                    }
+                }
             }
-            if scope.phase == ScopePhase::Revoked && !scope.credits.is_idle() {
-                return Err(RegistryError::Invariant("revoked scope retains credits"));
+            if let Some(revoke) = &scope.revoke {
+                let target_count = u64::try_from(revoke.target_count)
+                    .map_err(|_| RegistryError::Invariant("revoke target count overflow"))?;
+                if revoke.sequence == 0
+                    || revoke.authority_epoch != scope.authority_epoch
+                    || revoke
+                        .closed_authority_epoch
+                        .checked_add(1)
+                        .is_none_or(|epoch| epoch != revoke.authority_epoch)
+                    || revoke.work.head_selections > revoke.work.next_calls
+                    || revoke.work.terminalized > target_count
+                    || revoke.work.target_index_removals > target_count
+                    || revoke.work.terminalized != revoke.work.target_index_removals
+                {
+                    return Err(RegistryError::Invariant("invalid revoke accounting"));
+                }
+                match scope.phase {
+                    ScopePhase::Active => unreachable!(),
+                    ScopePhase::Closing => {
+                        if revoke.cohort.len() != revoke.target_count
+                            || revoke.work.completion_members_checked != 0
+                            || revoke
+                                .selected_head
+                                .is_some_and(|effect| !revoke.cohort.contains(&effect))
+                        {
+                            return Err(RegistryError::Invariant("invalid closing revoke state"));
+                        }
+                    }
+                    ScopePhase::Revoked => {
+                        if !revoke.cohort.is_empty()
+                            || revoke.selected_head.is_some()
+                            || revoke.retired_recovery.is_some()
+                            || revoke.work.terminalized != target_count
+                            || revoke.work.target_index_removals != target_count
+                            || revoke.work.completion_members_checked != target_count
+                        {
+                            return Err(RegistryError::Invariant("invalid completed revoke state"));
+                        }
+                    }
+                }
             }
             if let Some(recovery) = &scope.recovery {
+                if scope.phase != ScopePhase::Active {
+                    return Err(RegistryError::Invariant("inactive recovery state"));
+                }
                 if !recovery.unadopted.is_subset(&recovery.cohort) {
                     return Err(RegistryError::Invariant("recovery cohort mismatch"));
                 }
@@ -1761,6 +2046,12 @@ impl EffectRegistry {
                                         "invalid pending publication",
                                     ));
                                 }
+                                let pending = expected_pending_publications
+                                    .entry(record.identity.scope)
+                                    .or_default();
+                                *pending = pending.checked_add(1).ok_or(
+                                    RegistryError::Invariant("pending publication overflow"),
+                                )?;
                             }
                             None => {
                                 if record.publication_acks != 1
@@ -1835,6 +2126,63 @@ impl EffectRegistry {
         }
 
         for (scope_key, scope) in &self.scopes {
+            let expected_live = expected_by_scope.get(scope_key);
+            let live_count = expected_live.map_or(0, BTreeSet::len);
+            match scope.phase {
+                ScopePhase::Active => {
+                    if expected_live != Some(&scope.closure_candidates)
+                        && !(expected_live.is_none() && scope.closure_candidates.is_empty())
+                    {
+                        return Err(RegistryError::Invariant(
+                            "active closure candidate mismatch",
+                        ));
+                    }
+                }
+                ScopePhase::Closing => {
+                    let revoke = scope.revoke.as_ref().unwrap();
+                    if expected_live.is_some_and(|live| !live.is_subset(&revoke.cohort))
+                        || u64::try_from(live_count)
+                            .ok()
+                            .and_then(|live| live.checked_add(revoke.work.terminalized))
+                            != u64::try_from(revoke.target_count).ok()
+                        || revoke.selected_head.is_some_and(|effect| {
+                            expected_live.is_none_or(|live| !live.contains(&effect))
+                        })
+                    {
+                        return Err(RegistryError::Invariant("closing live target mismatch"));
+                    }
+                    for effect in &revoke.cohort {
+                        let record = self
+                            .effects
+                            .get(effect)
+                            .ok_or(RegistryError::Invariant("unknown frozen revoke effect"))?;
+                        if record.identity.scope != *scope_key
+                            || record.identity.authority_epoch != revoke.closed_authority_epoch
+                        {
+                            return Err(RegistryError::Invariant(
+                                "frozen revoke identity mismatch",
+                            ));
+                        }
+                    }
+                }
+                ScopePhase::Revoked => {
+                    if live_count != 0 {
+                        return Err(RegistryError::Invariant(
+                            "revoked scope retains live effects",
+                        ));
+                    }
+                }
+            }
+            if scope.pending_publications
+                != expected_pending_publications
+                    .get(scope_key)
+                    .copied()
+                    .unwrap_or(0)
+            {
+                return Err(RegistryError::Invariant(
+                    "pending publication count mismatch",
+                ));
+            }
             let expected = expected_credits.get(scope_key);
             for (class, balance) in &scope.credits.balances {
                 let (held, committed) = expected
@@ -1891,7 +2239,16 @@ impl EffectRegistry {
         effect: EffectKey,
         request: TerminalRequest,
     ) -> Result<Terminalization, RegistryError> {
-        let (phase, own_commit, scope_key, identity, publication_mode) = {
+        let (
+            phase,
+            own_commit,
+            scope_key,
+            identity,
+            current_resources,
+            charges,
+            credit_state,
+            publication_mode,
+        ) = {
             let record = self
                 .effects
                 .get(&effect)
@@ -1901,6 +2258,9 @@ impl EffectRegistry {
                 record.commit.clone(),
                 record.identity.scope,
                 record.identity.clone(),
+                record.current_resources.clone(),
+                record.credits.clone(),
+                record.credit_state,
                 record.publication_mode,
             )
         };
@@ -1919,33 +2279,106 @@ impl EffectRegistry {
                 }
             }
         }
+        let terminal_sequence = self.next_terminal_sequence;
+        let next_terminal_sequence = terminal_sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let (ticket_sequence, next_publication_sequence) =
+            if publication_mode == PublicationMode::Required {
+                let ticket_sequence = self.next_publication_sequence;
+                let next = ticket_sequence
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+                (Some(ticket_sequence), Some(next))
+            } else {
+                (None, None)
+            };
+        let (
+            next_scope_revision,
+            next_pending_publications,
+            next_terminalized,
+            next_target_index_removals,
+        ) = {
+            let scope = self
+                .scopes
+                .get(&scope_key)
+                .ok_or(RegistryError::UnknownScope)?;
+            let revision = scope
+                .revision
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            let pending = if publication_mode == PublicationMode::Required {
+                scope
+                    .pending_publications
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?
+            } else {
+                scope.pending_publications
+            };
+            match scope.phase {
+                ScopePhase::Active => (revision, pending, None, None),
+                ScopePhase::Closing => {
+                    let revoke = scope
+                        .revoke
+                        .as_ref()
+                        .ok_or(RegistryError::InvalidRevokeSelection)?;
+                    if !revoke.cohort.contains(&effect) {
+                        return Err(RegistryError::InvalidRevokeSelection);
+                    }
+                    let terminalized = revoke
+                        .work
+                        .terminalized
+                        .checked_add(1)
+                        .ok_or(RegistryError::CounterOverflow)?;
+                    let removals = revoke
+                        .work
+                        .target_index_removals
+                        .checked_add(1)
+                        .ok_or(RegistryError::CounterOverflow)?;
+                    (revision, pending, Some(terminalized), Some(removals))
+                }
+                ScopePhase::Revoked => return Err(RegistryError::InvalidState),
+            }
+        };
         let terminal = TerminalReceipt {
             effect,
             outcome: request.outcome,
             result: request.result,
-            sequence: self.take_terminal_sequence()?,
+            sequence: terminal_sequence,
             causal_commit: request.causal_commit,
         };
-        let ticket = if publication_mode == PublicationMode::Required {
-            Some(PublicationTicket {
-                effect,
-                scope: scope_key,
-                terminal_sequence: terminal.sequence,
-                ticket_sequence: self.take_publication_sequence()?,
-                outcome: terminal.outcome,
-                result: terminal.result,
-            })
-        } else {
-            None
-        };
+        let ticket = ticket_sequence.map(|ticket_sequence| PublicationTicket {
+            effect,
+            scope: scope_key,
+            terminal_sequence: terminal.sequence,
+            ticket_sequence,
+            outcome: terminal.outcome,
+            result: terminal.result,
+        });
 
-        let current_resources = self.effects.get(&effect).unwrap().current_resources.clone();
+        // Credit release is the last validation that can still return an
+        // error. Its first pass is non-mutating; after success all remaining
+        // closure updates are infallible under the registry invariants.
+        if ticket.is_none() {
+            self.scopes
+                .get_mut(&scope_key)
+                .unwrap()
+                .credits
+                .release(&charges, credit_state)?;
+        }
+        self.next_terminal_sequence = next_terminal_sequence;
+        if let Some(next) = next_publication_sequence {
+            self.next_publication_sequence = next;
+        }
         self.remove_reverse_indexes(&identity, &current_resources);
         let record = self.effects.get_mut(&effect).unwrap();
         record.phase = EffectPhase::Terminal(terminal.outcome);
         record.terminal = Some(terminal.clone());
         record.pending_publication = ticket.clone();
         record.terminalizations = 1;
+        if ticket.is_none() {
+            record.credit_state = CreditState::Released;
+        }
         if let Some(recovery) = self
             .scopes
             .get_mut(&scope_key)
@@ -1954,17 +2387,22 @@ impl EffectRegistry {
             recovery.unadopted.remove(&effect);
             recovery.cohort.remove(&effect);
         }
-        if ticket.is_none() {
-            let charges = record.credits.clone();
-            let credit_state = record.credit_state;
-            self.scopes
-                .get_mut(&scope_key)
-                .unwrap()
-                .credits
-                .release(&charges, credit_state)?;
-            self.effects.get_mut(&effect).unwrap().credit_state = CreditState::Released;
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        scope.revision = next_scope_revision;
+        scope.pending_publications = next_pending_publications;
+        if scope.fallback_running {
+            scope.recovery.as_mut().unwrap().ready = None;
         }
-        self.bump_scope_revision(scope_key)?;
+        if let (Some(terminalized), Some(removals)) =
+            (next_terminalized, next_target_index_removals)
+        {
+            let revoke = scope.revoke.as_mut().unwrap();
+            revoke.work.terminalized = terminalized;
+            revoke.work.target_index_removals = removals;
+            if revoke.selected_head == Some(effect) {
+                revoke.selected_head = None;
+            }
+        }
         Ok(Terminalization {
             receipt: terminal,
             publication: ticket,
@@ -1982,7 +2420,9 @@ impl EffectRegistry {
             .ok_or(RegistryError::InvalidRevokeSelection)?;
         if scope.phase != ScopePhase::Closing
             || revoke.sequence != selection.sequence
-            || revoke.cohort != selection.effects
+            || revoke.closed_authority_epoch != selection.closed_authority_epoch
+            || revoke.authority_epoch != selection.authority_epoch
+            || revoke.target_count != selection.target_count
             || scope.authority_epoch != selection.authority_epoch
         {
             return Err(RegistryError::InvalidRevokeSelection);
@@ -2009,6 +2449,14 @@ impl EffectRegistry {
                 .or_default()
                 .insert(identity.effect);
         }
+        assert!(
+            self.scopes
+                .get_mut(&identity.scope)
+                .expect("effect scope must exist before reverse-index insertion")
+                .closure_candidates
+                .insert(identity.effect),
+            "effect must be new to the closure candidate index"
+        );
     }
 
     fn remove_reverse_indexes(
@@ -2020,6 +2468,24 @@ impl EffectRegistry {
         remove_index_member(&mut self.by_task, identity.task, identity.effect);
         for resource in current_resources {
             remove_index_member(&mut self.by_resource, *resource, identity.effect);
+        }
+        let scope = self
+            .scopes
+            .get_mut(&identity.scope)
+            .expect("effect scope must exist during reverse-index removal");
+        match scope.phase {
+            ScopePhase::Active => assert!(
+                scope.closure_candidates.remove(&identity.effect),
+                "active effect must exist in the closure candidate index"
+            ),
+            ScopePhase::Closing => assert!(
+                scope
+                    .revoke
+                    .as_ref()
+                    .is_some_and(|revoke| revoke.cohort.contains(&identity.effect)),
+                "closing effect must remain in the frozen revoke cohort"
+            ),
+            ScopePhase::Revoked => panic!("revoked scope cannot retain a live effect"),
         }
     }
 
@@ -2158,6 +2624,281 @@ fn add_expected_credits(
     Ok(())
 }
 
+/// A production-registry fixture used by the Stage 7B structural and timing
+/// evaluators. `n` is the total live population, `k` is the target scope's
+/// live population, and `h` is retained terminal history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Stage7bFixtureConfig {
+    pub(crate) n: usize,
+    pub(crate) k: usize,
+    pub(crate) h: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Stage7bActiveFixture {
+    config: Stage7bFixtureConfig,
+    registry: EffectRegistry,
+    target_scope: ScopeKey,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Stage7bCompleteFixture {
+    config: Stage7bFixtureConfig,
+    registry: EffectRegistry,
+    target_scope: ScopeKey,
+    selection: RevokeSelection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Stage7bScaleObservation {
+    pub(crate) config: Stage7bFixtureConfig,
+    pub(crate) work: RevokeWorkProjection,
+    pub(crate) target: RegistryProjection,
+}
+
+impl Stage7bActiveFixture {
+    pub(crate) fn new(config: Stage7bFixtureConfig) -> Result<Self, RegistryError> {
+        const TARGET_SCOPE: ScopeKey = ScopeKey::new(0x7b01, 1);
+        const UNRELATED_SCOPE: ScopeKey = ScopeKey::new(0x7b02, 1);
+        const HISTORY_SCOPE: ScopeKey = ScopeKey::new(0x7b03, 1);
+        const TARGET_TASK: TaskKey = TaskKey::new(0x7b01, 1);
+        const UNRELATED_TASK: TaskKey = TaskKey::new(0x7b02, 1);
+        const HISTORY_TASK: TaskKey = TaskKey::new(0x7b03, 1);
+        const TARGET_CREDIT: CreditClass = CreditClass::new(0x7b01);
+        const UNRELATED_CREDIT: CreditClass = CreditClass::new(0x7b02);
+        const HISTORY_CREDIT: CreditClass = CreditClass::new(0x7b03);
+
+        if config.k > config.n {
+            return Err(RegistryError::InvalidState);
+        }
+        let target_capacity =
+            u64::try_from(config.k.max(1)).map_err(|_| RegistryError::CounterOverflow)?;
+        let unrelated = config.n - config.k;
+        let unrelated_capacity =
+            u64::try_from(unrelated.max(1)).map_err(|_| RegistryError::CounterOverflow)?;
+        let mut registry = EffectRegistry::new();
+        for (key, supervisor, credit, units) in [
+            (TARGET_SCOPE, TARGET_TASK, TARGET_CREDIT, target_capacity),
+            (
+                UNRELATED_SCOPE,
+                UNRELATED_TASK,
+                UNRELATED_CREDIT,
+                unrelated_capacity,
+            ),
+            (HISTORY_SCOPE, HISTORY_TASK, HISTORY_CREDIT, 1),
+        ] {
+            registry.create_scope(ScopeConfig {
+                key,
+                authority_epoch: 1,
+                binding_epoch: 1,
+                supervisor,
+                credits: alloc::vec![CreditLimit::new(credit, units)],
+            })?;
+        }
+
+        // History is deliberately older than the live population. One credit
+        // is reused sequentially while the terminal records remain retained.
+        for ordinal in 0..config.h {
+            let registered = register_stage7b_effect(
+                &mut registry,
+                HISTORY_SCOPE,
+                HISTORY_TASK,
+                HISTORY_CREDIT,
+                0x7b03,
+                ordinal,
+            )?;
+            let terminal = registry.stage_terminal(
+                HISTORY_TASK,
+                registered.handle,
+                TerminalRequest::aborted(-125),
+            )?;
+            if terminal.publication.is_some() {
+                return Err(RegistryError::InvalidState);
+            }
+        }
+        for ordinal in 0..config.k {
+            register_stage7b_effect(
+                &mut registry,
+                TARGET_SCOPE,
+                TARGET_TASK,
+                TARGET_CREDIT,
+                0x7b01,
+                ordinal,
+            )?;
+        }
+        for ordinal in 0..unrelated {
+            register_stage7b_effect(
+                &mut registry,
+                UNRELATED_SCOPE,
+                UNRELATED_TASK,
+                UNRELATED_CREDIT,
+                0x7b02,
+                ordinal,
+            )?;
+        }
+        registry.check_invariants()?;
+        Ok(Self {
+            config,
+            registry,
+            target_scope: TARGET_SCOPE,
+        })
+    }
+
+    pub(crate) fn begin(&mut self) -> Result<RevokeSelection, RegistryError> {
+        self.registry.revoke_begin(self.target_scope)
+    }
+
+    /// Prepares the fixture's sole target for the production commit-vs-revoke
+    /// Loom race. The caller's modeled outer mutex supplies serialization.
+    pub(crate) fn prepare_single_target(&mut self) -> Result<PortalHandle, RegistryError> {
+        if self.config.k != 1 {
+            return Err(RegistryError::InvalidState);
+        }
+        let effect = self
+            .registry
+            .by_scope
+            .get(&self.target_scope)
+            .and_then(BTreeSet::first)
+            .copied()
+            .ok_or(RegistryError::UnknownEffect)?;
+        let handle = self.registry.effects[&effect].handle();
+        self.registry.prepare(TaskKey::new(0x7b01, 1), handle)?;
+        Ok(handle)
+    }
+
+    pub(crate) fn commit_single_target(
+        &mut self,
+        handle: PortalHandle,
+    ) -> Result<CommitOutcome, RegistryError> {
+        self.registry
+            .commit(TaskKey::new(0x7b01, 1), handle, CommitMetadata::new(1, 1))
+    }
+
+    pub(crate) fn single_target_terminal(
+        &self,
+        handle: PortalHandle,
+    ) -> Result<TerminalOutcome, RegistryError> {
+        match self.registry.effect_view(handle.effect)?.phase {
+            EffectPhase::Terminal(outcome) => Ok(outcome),
+            _ => Err(RegistryError::InvalidState),
+        }
+    }
+
+    pub(crate) fn finish_revoke(
+        &mut self,
+        selection: &RevokeSelection,
+    ) -> Result<(), RegistryError> {
+        drain_stage7b_selection(&mut self.registry, selection)?;
+        self.registry.revoke_complete(selection)
+    }
+
+    pub(crate) fn prepare_complete_baseline(
+        &self,
+    ) -> Result<Stage7bCompleteFixture, RegistryError> {
+        let mut candidate = self.clone();
+        let selection = candidate.begin()?;
+        drain_stage7b_selection(&mut candidate.registry, &selection)?;
+        Ok(Stage7bCompleteFixture {
+            config: candidate.config,
+            registry: candidate.registry,
+            target_scope: candidate.target_scope,
+            selection,
+        })
+    }
+
+    pub(crate) fn close_all(&mut self) -> Result<RevokeSelection, RegistryError> {
+        let selection = self.begin()?;
+        self.finish_revoke(&selection)?;
+        Ok(selection)
+    }
+
+    pub(crate) fn target_projection(&self) -> Result<RegistryProjection, RegistryError> {
+        self.registry.scope_projection(self.target_scope)
+    }
+
+    pub(crate) fn check_invariants(&self) -> Result<(), RegistryError> {
+        self.registry.check_invariants()
+    }
+
+    pub(crate) fn observation(
+        &self,
+        selection: &RevokeSelection,
+    ) -> Result<Stage7bScaleObservation, RegistryError> {
+        Ok(Stage7bScaleObservation {
+            config: self.config,
+            work: self.registry.revoke_work_projection(selection)?,
+            target: self.registry.scope_projection(self.target_scope)?,
+        })
+    }
+}
+
+impl Stage7bCompleteFixture {
+    pub(crate) fn complete(&mut self) -> Result<(), RegistryError> {
+        self.registry.revoke_complete(&self.selection)
+    }
+
+    pub(crate) fn observation(&self) -> Result<Stage7bScaleObservation, RegistryError> {
+        Ok(Stage7bScaleObservation {
+            config: self.config,
+            work: self.registry.revoke_work_projection(&self.selection)?,
+            target: self.registry.scope_projection(self.target_scope)?,
+        })
+    }
+
+    pub(crate) fn check_invariants(&self) -> Result<(), RegistryError> {
+        self.registry.check_invariants()
+    }
+}
+
+fn register_stage7b_effect(
+    registry: &mut EffectRegistry,
+    scope: ScopeKey,
+    task: TaskKey,
+    credit: CreditClass,
+    namespace: u32,
+    ordinal: usize,
+) -> Result<RegisteredEffect, RegistryError> {
+    let ordinal_argument = ordinal;
+    let ordinal = u64::try_from(ordinal).map_err(|_| RegistryError::CounterOverflow)?;
+    let resource_id = ordinal
+        .checked_add(1)
+        .ok_or(RegistryError::CounterOverflow)?;
+    let namespace_argument =
+        usize::try_from(namespace).map_err(|_| RegistryError::CounterOverflow)?;
+    registry.register(RegisterRequest {
+        scope,
+        task,
+        operation: OperationClass::new(namespace),
+        descriptor: SyscallDescriptor::new(
+            0x7b00,
+            [namespace_argument, ordinal_argument, 0, 0, 0, 0],
+        ),
+        resources: alloc::vec![ResourceKey::new(namespace, resource_id, 1)],
+        credits: alloc::vec![CreditCharge::new(credit, 1)],
+        publication: PublicationMode::None,
+    })
+}
+
+fn drain_stage7b_selection(
+    registry: &mut EffectRegistry,
+    selection: &RevokeSelection,
+) -> Result<(), RegistryError> {
+    while let Some(effect) = registry.revoke_next(selection)? {
+        if effect.publication_required {
+            return Err(RegistryError::InvalidState);
+        }
+        let request = match effect.disposition {
+            RevokeDisposition::Abort => TerminalRequest::aborted(-125),
+            RevokeDisposition::Drain(receipt) => TerminalRequest::completed(receipt.result()),
+        };
+        let terminal = registry.stage_revoke_terminal(selection, effect.effect, request)?;
+        if terminal.publication.is_some() {
+            return Err(RegistryError::InvalidState);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegistrySelfTestReceipt {
     pub(crate) effects: usize,
@@ -2230,6 +2971,342 @@ fn bounded_kernel_completion_during_recovery_self_test() {
     registry.check_invariants().unwrap();
 }
 
+fn stage7b_registry_refactor_self_test() {
+    let config = Stage7bFixtureConfig { n: 8, k: 3, h: 2 };
+    let fixture = Stage7bActiveFixture::new(config).unwrap();
+    assert_eq!(fixture.target_projection().unwrap().live_effects, config.k);
+    fixture.check_invariants().unwrap();
+
+    let mut closed = fixture.clone();
+    let selection = closed.close_all().unwrap();
+    let observation = closed.observation(&selection).unwrap();
+    assert_eq!(observation.config, config);
+    assert_eq!(observation.work.target_count, 3);
+    assert_eq!(observation.work.begin_target_record_visits, 0);
+    assert_eq!(observation.work.next_calls, 4);
+    assert_eq!(observation.work.head_selections, 3);
+    assert_eq!(observation.work.terminalized, 3);
+    assert_eq!(observation.work.completion_members_checked, 3);
+    assert_eq!(observation.work.target_index_removals, 3);
+    assert_eq!(observation.work.unrelated_effect_visits, 0);
+    assert_eq!(observation.work.history_effect_visits, 0);
+    assert_eq!(observation.work.pending_targets, 0);
+    assert_eq!(observation.work.target_state, ScopePhase::Revoked);
+    assert_eq!(observation.target.phase, ScopePhase::Revoked);
+    closed.check_invariants().unwrap();
+    let before = closed.registry.clone();
+    assert_eq!(closed.begin(), Err(RegistryError::ScopeNotActive));
+    assert_eq!(closed.registry, before);
+
+    let mut empty = Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 4, k: 0, h: 3 }).unwrap();
+    let selection = empty.close_all().unwrap();
+    let empty_observation = empty.observation(&selection).unwrap();
+    assert_eq!(empty_observation.work.target_count, 0);
+    assert_eq!(empty_observation.work.next_calls, 1);
+    assert_eq!(empty_observation.work.head_selections, 0);
+    assert_eq!(empty_observation.work.terminalized, 0);
+    assert_eq!(empty_observation.work.completion_members_checked, 0);
+    assert_eq!(empty_observation.work.target_state, ScopePhase::Revoked);
+    empty.check_invariants().unwrap();
+
+    // Unknown and overflow failures do not consume the revoke sequence or
+    // alter any registry-owned state.
+    let mut unknown = fixture.clone();
+    let before = unknown.registry.clone();
+    assert_eq!(
+        unknown.registry.revoke_begin(ScopeKey::new(0xffff, 1)),
+        Err(RegistryError::UnknownScope)
+    );
+    assert_eq!(unknown.registry, before);
+
+    let mut sequence_overflow = fixture.clone();
+    sequence_overflow.registry.next_revoke_sequence = u64::MAX;
+    let before = sequence_overflow.registry.clone();
+    assert_eq!(
+        sequence_overflow.begin(),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(sequence_overflow.registry, before);
+
+    let mut authority_overflow = fixture.clone();
+    authority_overflow
+        .registry
+        .scopes
+        .get_mut(&authority_overflow.target_scope)
+        .unwrap()
+        .authority_epoch = u64::MAX;
+    let before = authority_overflow.registry.clone();
+    assert_eq!(
+        authority_overflow.begin(),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(authority_overflow.registry, before);
+
+    let mut revision_overflow = fixture.clone();
+    revision_overflow
+        .registry
+        .scopes
+        .get_mut(&revision_overflow.target_scope)
+        .unwrap()
+        .revision = u64::MAX;
+    let before = revision_overflow.registry.clone();
+    assert_eq!(
+        revision_overflow.begin(),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(revision_overflow.registry, before);
+
+    let mut tampered = fixture.clone();
+    let mut selection = tampered.begin().unwrap();
+    selection.closed_authority_epoch += 1;
+    let before = tampered.registry.clone();
+    assert_eq!(
+        tampered.registry.revoke_next(&selection),
+        Err(RegistryError::InvalidRevokeSelection)
+    );
+    assert_eq!(tampered.registry, before);
+
+    let mut complete_overflow = fixture.prepare_complete_baseline().unwrap();
+    complete_overflow
+        .registry
+        .scopes
+        .get_mut(&complete_overflow.target_scope)
+        .unwrap()
+        .revision = u64::MAX;
+    let before = complete_overflow.registry.clone();
+    assert_eq!(
+        complete_overflow.complete(),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(complete_overflow.registry, before);
+
+    let mut terminal_overflow =
+        Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 0 }).unwrap();
+    let selection = terminal_overflow.begin().unwrap();
+    let effect = terminal_overflow
+        .registry
+        .revoke_next(&selection)
+        .unwrap()
+        .unwrap()
+        .effect;
+    terminal_overflow.registry.next_terminal_sequence = u64::MAX;
+    let before = terminal_overflow.registry.clone();
+    assert_eq!(
+        terminal_overflow.registry.stage_revoke_terminal(
+            &selection,
+            effect,
+            TerminalRequest::aborted(-125),
+        ),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(terminal_overflow.registry, before);
+
+    let mut publication_overflow =
+        Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 0 }).unwrap();
+    let effect = *publication_overflow
+        .registry
+        .by_scope
+        .get(&publication_overflow.target_scope)
+        .unwrap()
+        .first()
+        .unwrap();
+    publication_overflow
+        .registry
+        .effects
+        .get_mut(&effect)
+        .unwrap()
+        .publication_mode = PublicationMode::Required;
+    let selection = publication_overflow.begin().unwrap();
+    publication_overflow
+        .registry
+        .revoke_next(&selection)
+        .unwrap()
+        .unwrap();
+    publication_overflow.registry.next_publication_sequence = u64::MAX;
+    let before = publication_overflow.registry.clone();
+    assert_eq!(
+        publication_overflow.registry.stage_revoke_terminal(
+            &selection,
+            effect,
+            TerminalRequest::aborted(-125),
+        ),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(publication_overflow.registry, before);
+
+    let mut revision_overflow =
+        Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 0 }).unwrap();
+    let selection = revision_overflow.begin().unwrap();
+    let effect = revision_overflow
+        .registry
+        .revoke_next(&selection)
+        .unwrap()
+        .unwrap()
+        .effect;
+    revision_overflow
+        .registry
+        .scopes
+        .get_mut(&revision_overflow.target_scope)
+        .unwrap()
+        .revision = u64::MAX;
+    let before = revision_overflow.registry.clone();
+    assert_eq!(
+        revision_overflow.registry.stage_revoke_terminal(
+            &selection,
+            effect,
+            TerminalRequest::aborted(-125),
+        ),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(revision_overflow.registry, before);
+
+    let mut ack_overflow =
+        Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 0 }).unwrap();
+    let effect = *ack_overflow
+        .registry
+        .by_scope
+        .get(&ack_overflow.target_scope)
+        .unwrap()
+        .first()
+        .unwrap();
+    ack_overflow
+        .registry
+        .effects
+        .get_mut(&effect)
+        .unwrap()
+        .publication_mode = PublicationMode::Required;
+    let selection = ack_overflow.begin().unwrap();
+    ack_overflow
+        .registry
+        .revoke_next(&selection)
+        .unwrap()
+        .unwrap();
+    let ticket = ack_overflow
+        .registry
+        .stage_revoke_terminal(&selection, effect, TerminalRequest::aborted(-125))
+        .unwrap()
+        .publication
+        .unwrap();
+    assert_eq!(
+        ack_overflow
+            .target_projection()
+            .unwrap()
+            .pending_publications,
+        1
+    );
+    ack_overflow
+        .registry
+        .scopes
+        .get_mut(&ack_overflow.target_scope)
+        .unwrap()
+        .revision = u64::MAX;
+    let before = ack_overflow.registry.clone();
+    assert_eq!(
+        ack_overflow.registry.acknowledge_publication(&ticket),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(ack_overflow.registry, before);
+
+    let mut commit_overflow =
+        Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 0 }).unwrap();
+    let effect = *commit_overflow
+        .registry
+        .by_scope
+        .get(&commit_overflow.target_scope)
+        .unwrap()
+        .first()
+        .unwrap();
+    let handle = commit_overflow.registry.effects[&effect].handle();
+    let supervisor = TaskKey::new(0x7b01, 1);
+    commit_overflow
+        .registry
+        .prepare(supervisor, handle)
+        .unwrap();
+    commit_overflow
+        .registry
+        .scopes
+        .get_mut(&commit_overflow.target_scope)
+        .unwrap()
+        .revision = u64::MAX;
+    let before = commit_overflow.registry.clone();
+    assert_eq!(
+        commit_overflow
+            .registry
+            .commit(supervisor, handle, CommitMetadata::new(1, 1)),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(commit_overflow.registry, before);
+
+    // Re-reading a selected head is idempotent: it neither skips the target
+    // nor counts a second head selection.
+    let mut duplicate =
+        Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 2, k: 1, h: 1 }).unwrap();
+    let selection = duplicate.begin().unwrap();
+    let first = duplicate.registry.revoke_next(&selection).unwrap().unwrap();
+    let second = duplicate.registry.revoke_next(&selection).unwrap().unwrap();
+    assert_eq!(first, second);
+    let work = duplicate
+        .registry
+        .revoke_work_projection(&selection)
+        .unwrap();
+    assert_eq!(work.next_calls, 2);
+    assert_eq!(work.head_selections, 1);
+    duplicate
+        .registry
+        .stage_revoke_terminal(&selection, first.effect, TerminalRequest::aborted(-125))
+        .unwrap();
+    assert!(
+        duplicate
+            .registry
+            .revoke_next(&selection)
+            .unwrap()
+            .is_none()
+    );
+    duplicate.registry.revoke_complete(&selection).unwrap();
+    duplicate.check_invariants().unwrap();
+
+    // The same production methods are included by registry_loom.rs under a
+    // modeled outer mutex. These sequential endpoints pin both linearization
+    // outcomes before Loom explores their interleavings.
+    let mut commit_first =
+        Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 1, k: 1, h: 0 }).unwrap();
+    let handle = commit_first.prepare_single_target().unwrap();
+    assert!(matches!(
+        commit_first.commit_single_target(handle).unwrap(),
+        CommitOutcome::Applied(_)
+    ));
+    let selection = commit_first.begin().unwrap();
+    commit_first.finish_revoke(&selection).unwrap();
+    assert_eq!(
+        commit_first.single_target_terminal(handle).unwrap(),
+        TerminalOutcome::Completed
+    );
+    let observation = commit_first.observation(&selection).unwrap();
+    assert_eq!(observation.target.credits.free, 1);
+    assert_eq!(observation.target.credits.held, 0);
+    assert_eq!(observation.target.credits.committed, 0);
+    commit_first.check_invariants().unwrap();
+
+    let mut revoke_first =
+        Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 1, k: 1, h: 0 }).unwrap();
+    let handle = revoke_first.prepare_single_target().unwrap();
+    let selection = revoke_first.begin().unwrap();
+    revoke_first.finish_revoke(&selection).unwrap();
+    assert_eq!(
+        revoke_first.commit_single_target(handle),
+        Err(RegistryError::StaleAuthority)
+    );
+    assert_eq!(
+        revoke_first.single_target_terminal(handle).unwrap(),
+        TerminalOutcome::Aborted
+    );
+    let observation = revoke_first.observation(&selection).unwrap();
+    assert_eq!(observation.target.credits.free, 1);
+    assert_eq!(observation.target.credits.held, 0);
+    assert_eq!(observation.target.credits.committed, 0);
+    revoke_first.check_invariants().unwrap();
+}
+
 /// Exercises the staged registry without changing the kernel's current run
 /// sequence.  A later OSTD runner can call this and print the returned receipt.
 pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
@@ -2237,6 +3314,7 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
     const SYSCALL_CREDIT: CreditClass = CreditClass::new(2);
 
     bounded_kernel_completion_during_recovery_self_test();
+    stage7b_registry_refactor_self_test();
 
     let scope = ScopeKey::new(50, 1);
     let v1 = TaskKey::new(600, 1);
