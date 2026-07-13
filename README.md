@@ -1,173 +1,173 @@
 # Nexus
 
 Nexus is a research operating-system prototype for **Causally Scoped Effect
-Revocation (CSER)**: kernel-enforced causal effect scopes for restartable
-user-space OS services. One authority delegation can cover scheduler, pager,
-personality, readiness, and mediated-I/O effects; revocation closes their shared
-commit gate and drives every enrolled effect to one honest terminal outcome.
+Revocation (CSER)**: kernel-enforced causal effect scopes for work delegated to
+restartable user-space OS services.
 
-The current checkpoint includes a bounded, single-CPU seven-domain Linux I/O
-composition successor plus the six retained Linux core inputs with bounded
-Checked/Observed evidence. It composes fresh personality, pager, scheduler,
-filesystem, VirtIO, network, and readiness effects beneath one root authority
-without rewriting the frozen five-domain predecessor. This is not a production
-Linux personality, general or persistent filesystem, TCP/IP stack, real-DMA
-same-boot integration, or proof of identity-preserving Stage 5B composition.
-See [NARRATIVE.md](NARRATIVE.md) for the end-to-end research account,
-[VISION.md](VISION.md) for the research claim,
-[ARCHITECTURE.md](ARCHITECTURE.md) for boundaries, and [REWORK.md](REWORK.md)
-for the migration ledger. [ARTIFACT.md](ARTIFACT.md) is the clean-clone,
-evidence-bundle, and archival reproducibility guide.
+[GitHub release](https://github.com/chenty2333/Nexus/releases/tag/v0.1.0) ·
+[Zenodo archive](https://zenodo.org/records/21343496) ·
+[DOI: 10.5281/zenodo.21343496](https://doi.org/10.5281/zenodo.21343496)
 
-The Stage 7B checkpoint adds a deliberately narrower evaluation claim: 14
-races are Checked at the exact boundary `production transition source under a
-Loom-modeled outer mutex`; a
-release, single-vCPU, single-thread-TCG QEMU evaluator checks 20 fault cells and
-14 structural scale points; and 29 guest-visible TSC cases are retained as
-Observed raw samples with no thresholds. The primary-source comparison matrix
-contains 16 rows, of which 14 are full-text-audited and two are
-primary-metadata-only. The resulting contribution verdict is `narrow`;
-novelty, firstness, proof, SMP, hardware cycles, lock freedom, durable external
-effects, and Linux breadth are not established.
+## Why CSER?
 
-## Requirements
+Revoking a handle can prevent future use of an authority, but it does not by
+itself account for effects already derived from that authority. A request may
+have crossed a restartable scheduler, pager, Linux personality, filesystem, or
+network service; it may also own a queue slot, pinned memory, a device request,
+or an externally visible result. A service crash makes the problem harder: the
+replacement must reject stale work without losing the obligations that were
+already committed.
 
-The public workflow requires only:
+CSER gives one root authority a kernel-maintained causal scope. Effects derived
+through different services retain explicit ancestry, resource ownership, and
+commit state, so revocation can close the authority generation and follow the
+affected work instead of relying on ordinary handle invalidation or a global
+object scan.
 
-- a Linux x86-64 host;
-- Docker with a working daemon;
-- Bash and Git;
-- a normal Linux userland with `awk`, coreutils, `grep`, and `sed`, plus
-  `flock` from util-linux.
+## How it works
 
-Rust, Java, TLA+, cargo-osdk, OVMF, QEMU, and guest toolchains are pinned inside
-Docker images. Verification containers run without network access after their
-images have been built. Nix, direnv, Just, and host Rust installations are not
-part of the supported workflow.
+- **Scopes and effects** record causal authority and the work derived from it.
+- **Authority epochs** fence a revoked authority generation; independent
+  **binding epochs** fence crashed or replaced service instances.
+- A kernel-owned **commit gate** serializes `Commit` with `RevokeBegin`. If
+  revocation wins, old uncommitted work cannot first commit afterward.
+- **Typed budgets** account for resources, while per-scope reverse indexes make
+  the affected descendants and effects discoverable during closure.
+- Pre-commit work can abort. Post-commit work must complete, drain, reset, or
+  retain an honest tombstone; CSER does not claim to undo an external event.
+- Rebinding never silently adopts stale work. Explicit adoption and a minimal
+  kernel fallback preserve fencing and bounded progress after service failure.
 
-Start by checking the complete boundary:
+The detailed state machines and linearization points are in
+[the CSER specifications](specs/cser/README.md) and
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+## What v0.1.0 establishes
+
+The `v0.1.0` release is a bounded, reproducible research artifact. It combines
+twelve PlusCal/TLA+ specification families, an independent safe-Rust reference
+model, an OSTD kernel prototype, retained Linux pressure workloads, and
+mediated VirtIO/reset/IOMMU evidence. Its additive composition places
+personality, pager, scheduler, filesystem, VirtIO, network, and readiness
+effects beneath one root authority.
+
+The accepted evaluation boundary is:
+
+| Evidence | Released result | Boundary |
+| --- | ---: | --- |
+| Concurrency | 14/14 Checked | `production transition source under a Loom-modeled outer mutex` |
+| Fault injection | 20/20 Checked | Case-local ledgers in release, single-vCPU, single-thread-TCG QEMU |
+| Structural scale | 14/14 Checked | Finite tuples; no asymptotic or production `O(k)` claim |
+| Performance | 29/29 Observed | Guest-visible TSC samples; no threshold, baseline, or hardware-cycle claim |
+| Prior art | 16 sources | 14 full-text audits and 2 primary-metadata-only comparisons |
+| Contribution decision | `narrow` | A bounded compositional result, not novelty or firstness |
+
+This release does **not** establish whole-system proof, SMP or production-lock
+correctness, lock freedom, low overhead, Linux/VFS/TCP breadth, rollback of
+durable external effects, a shared production fault scope, or identity-preserving
+same-boot composition with the real-DMA receipt. The seven-domain successor
+uses a fresh root cohort rather than reusing the retained workload and device
+effect identities. [NARRATIVE.md](NARRATIVE.md) gives the complete evidence and
+claim ledger.
+
+## Reproduce the release
+
+The supported host boundary is Linux x86-64 with Docker, Git, Bash, and a normal
+Linux userland. Rust, Java, TLA+, cargo-osdk, OVMF, QEMU, and guest toolchains
+are pinned in Docker images.
+
+For a quick environment and non-QEMU check:
 
 ```bash
 ./x doctor
 ./x test --quick
 ```
 
-Run the final acceptance gate with a cold image rebuild:
+For the complete clean-clone reproduction:
 
 ```bash
+git clone https://github.com/chenty2333/Nexus.git
+cd Nexus
+git checkout --detach v0.1.0
+./x doctor
+./x test --quick
 NEXUS_REBUILD=1 ./x verify
-```
-
-The cold gate runs Rust formatting/checks/Clippy/tests, twelve TLA+ families,
-the Nexus OSTD QEMU receipt, the mediated VirtIO/reset/IOMMU QEMU receipt,
-strict positive and negative predecessor/filesystem/network/Linux-I/O
-composition oracles, the Stage 7B release evaluator, implementation-source Loom
-rerun, runtime evidence recomputation, prior-art validator, contribution
-decision, and a fresh-evidence manifest. It can take tens of minutes.
-
-## Public command contract
-
-| Command | Contract |
-| --- | --- |
-| `./x doctor` | Validate the host boundary, repository layout, catalogs, pinned Rust/Java/TLA+ tools, and backend entrypoints. |
-| `./x build [all\|model\|kernel\|virtio]` | Build the selected reference-model or OSTD artifact graph without running QEMU. |
-| `./x test --unit` | Run Rust and neutral-runner unit/scenario tests. This is the default `test` tier. |
-| `./x test --quick` | Run all non-TLA+, non-QEMU formatting, schema, check, Clippy, test, and canonical-trace gates. |
-| `./x test --system` | Run both real QEMU receipts and the frozen-predecessor plus Linux-I/O composition oracles. |
-| `./x test --full` | Development alias for the complete execution graph; release sealing uses the canonical `./x verify` command. |
-| `./x run kernel` | Run the bounded Nexus OSTD kernel receipt. |
-| `./x run virtio` | Run the mediated VirtIO/reset/IOMMU receipt. |
-| `./x run composition` | Regenerate both QEMU receipts and cross-check the frozen predecessor and additive Linux-I/O successor. This is the default `run` target. |
-| `./x verify` | Canonical local, release, and CI full-acceptance gate. |
-| `./x verify-bundle [DIRECTORY]` | Verify a canonical cold bundle against the matching clean checkout without rebuilding evidence or running QEMU. |
-| `./x clean` | Remove root, xtask, OSDK, QEMU, guest, TLC, and evidence outputs without building an image. |
-
-Focused `fmt`, `check`, `quick`, `model`, `spec`, and `system`
-commands exist for development and CI diagnostics. There is intentionally no
-`fuzz` command until Nexus owns an actual fuzz target and corpus contract.
-
-## Source and evidence layout
-
-```text
-specs/cser/                         normative TLA+/PlusCal protocols
-crates/cser-model/                  independent safe-Rust reference model
-kernel/nexus-ostd/                  formal OSTD kernel prototype
-experiments/ostd-virtio-cser-spike/ bounded hardware/evidence harness
-tests/guest/linux/                   retained, hash-pinned compatibility inputs
-specs/oracles/                      implementation-neutral race questions
-tools/xtask/                        in-container build and verification logic
-tools/workflow/                     host-side cross-backend evidence logic
-./x                                 only public workflow front door
-```
-
-The reference model and OSTD implementation deliberately do not share state
-transition code: reusing the implementation inside its oracle would destroy the
-independence of the evidence. The VirtIO experiment also remains an external
-component-consistency receipt rather than being mislabeled as a same-effect,
-same-boot refinement.
-
-## Verification artifacts
-
-Successful or failed runs retain evidence under ignored paths:
-
-```text
-target/verification/
-kernel/nexus-ostd/artifacts/
-experiments/ostd-virtio-cser-spike/artifacts/
-```
-
-After a complete `./x verify`, `target/verification/manifest.json` records the
-real invocation, Git revision, complete nonignored-source fingerprint, dirty
-state, cold-rebuild request, per-run nonce, explicit research boundaries,
-specification list, and SHA-256 of every required fresh artifact. The manifest
-generator rejects missing, stale, empty, markerless, concurrently modified, or
-different-source evidence. It also requires a nonce-bound model/spec receipt
-issued only after that combined gate succeeds and a final completion receipt
-issued only after the system and Stage 7B evaluation/decision gates succeed.
-Both receipts bind the exact
-artifact digests, so focused commands cannot assemble or replace evidence after
-a failed full run and then publish it as a successful `verify`. The root
-workflow also retains a one-run orchestration token that is disclosed only to
-the start, final-sealing, and manifest-publication steps; the persisted records
-contain only its hash.
-A repository-wide workflow lock serializes public build, run, clean, and
-composition operations; backend-local locks also protect direct maintenance
-invocations. Manifest publication is intentionally internal to the same
-token-holding full-verify process; there is no standalone publish command.
-
-The same full-verify process then publishes
-`target/verification/artifact-bundle/`. The bundle mirrors repository-relative
-paths and contains all 46 manifest artifacts, the start record, both completion
-receipts, the manifest, and a canonical `SHA256SUMS`: 51 files in total. Check
-an extracted bundle without rebuilding evidence or running QEMU with:
-
-```bash
 ./x verify-bundle target/verification/artifact-bundle
 ```
 
-This checks the exact file population, every byte count and SHA-256, the
-start/model/complete/manifest receipt chain, all twelve specification and
-fifteen stage populations, and the complete research-boundary object. See
-[ARTIFACT.md](ARTIFACT.md) for clean-clone, resource, release, and interpretation
-instructions. The public command also recomputes the current checkout's revision
-and source fingerprint and rejects a dirty, mismatched, noncanonical, or noncold
-release bundle.
+The cold gate can take tens of minutes and uses substantial Docker/workspace
+storage. Exact resource expectations, interpretation rules, published bundle
+hashes, and release procedures are documented in [ARTIFACT.md](ARTIFACT.md).
+Development commands and change discipline are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-CI invokes the same `./x` surface and uploads the complete bundle, including
-the formal-model, QEMU, composition, Stage 7B, and CPU/TCG evidence. A phase is
-complete only after the final
-working tree passes a cold local verify and the exact pushed commit passes the
-remote workflow. Failure uploads retain the available hidden records for
-diagnosis but never contain the orchestration token itself.
+### Public command surface
 
-## Change discipline
+The stable front door is deliberately small:
 
-- Change formal semantics, the reference model, and the OSTD implementation in
-  separate reviewable steps.
-- Keep effect IDs, authority/binding epochs, commit points, receipts, budget
-  transfers, and failure boundaries visible in tests and traces.
-- Do not delete TLA+ configurations, negative oracles, OSDK runner snapshots,
-  retained Linux inputs, or hardware traces merely because they are not runtime
-  product code; they are the reproducibility boundary.
-- Mechanical source moves must preserve receipts and pass the existing local
-  gate before new behavior is introduced.
+| Command | Purpose |
+| --- | --- |
+| `./x doctor` | Check the supported host, pinned tools, and backend entry points. |
+| `./x build [all\|model\|kernel\|virtio]` | Build a selected artifact graph without running QEMU. |
+| `./x test [--unit\|--quick\|--system\|--full]` | Run progressively broader development gates. |
+| `./x run [kernel\|virtio\|composition]` | Run a bounded OSTD or composition receipt. |
+| `./x verify` | Run the canonical complete acceptance graph. |
+| `./x verify-bundle [DIRECTORY]` | Audit a canonical cold bundle against its clean checkout. |
+| `./x clean` | Remove generated build and evidence outputs. |
+
+The exact tier contracts and claim discipline are kept in
+[CONTRIBUTING.md](CONTRIBUTING.md), not repeated in the project introduction.
+
+## Repository map
+
+| Path | Role |
+| --- | --- |
+| `specs/cser/` | Normative PlusCal/TLA+ protocols and properties |
+| `crates/cser-model/` | Independent `no_std + alloc` safe-Rust reference model |
+| `crates/cser-transition-gates/` | Production-transition-source Loom harnesses |
+| `kernel/nexus-ostd/` | Maintained OSTD kernel prototype and bounded workload paths |
+| `experiments/ostd-virtio-cser-spike/` | Mediated VirtIO/reset/IOMMU component evidence |
+| `tests/guest/linux/` | Hash-pinned Linux compatibility-pressure inputs |
+| `evaluation/stage7b/` | Released evaluation contracts, sources, and race catalog |
+| `tools/xtask/`, `tools/workflow/` | Reproducible build, evaluation, and evidence tooling |
+| `./x` | Public workflow entry point |
+
+The reference model and OSTD implementation deliberately do not share state
+transition code. The mediated device experiment remains component-consistency
+evidence rather than being relabeled as same-effect, same-boot refinement.
+
+## Documentation
+
+- [NARRATIVE.md](NARRATIVE.md) is the end-to-end technical research account and
+  claim ledger.
+- [VISION.md](VISION.md) defines the research question, candidate contribution,
+  exclusions, and evidence language.
+- [ARCHITECTURE.md](ARCHITECTURE.md) maps kernel, service, resource, and device
+  boundaries.
+- [specs/cser/README.md](specs/cser/README.md) is the normative semantics index.
+- [ARTIFACT.md](ARTIFACT.md) is the reproduction, bundle-audit, and archival
+  guide.
+- [CONTRIBUTING.md](CONTRIBUTING.md) documents the development workflow.
+- [RFC 0001](docs/rfcs/0001-production-identity.md) defines the prospective
+  production-identity composition and `v0.2.0` acceptance contract; none of its
+  requirements are claimed by `v0.1.0`.
+- [REWORK.md](REWORK.md) is the historical migration and deletion ledger; it is
+  not the current roadmap or semantics source.
+
+## Paper and citation status
+
+There is no peer-reviewed Nexus paper at this time. `NARRATIVE.md` is a
+technical research narrative, while the published Zenodo object is a software
+release and reproducibility artifact. Cite the archived `v0.1.0` release using
+[CITATION.cff](CITATION.cff) or:
+
+> Tianyi Chen. (2026). *Nexus: Causally Scoped Effect Revocation* (v0.1.0)
+> [Software]. Zenodo. https://doi.org/10.5281/zenodo.21343496
+
+## Contributing and license
+
+Before changing semantics or evidence, read
+[CONTRIBUTING.md](CONTRIBUTING.md). Nexus is released under the
+[Unlicense](LICENSE). Third-party and derived components retain their own
+license boundaries; in particular, the patched-OSTD device experiment carries
+its MPL-2.0 notice in its directory.

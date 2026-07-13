@@ -1,9 +1,15 @@
-# Nexus rework ledger
+# Nexus historical rework ledger
 
-This ledger records what survives the CSER reset. It is a deletion plan, not a
-promise to preserve the current Axle/Zircon/Starnix architecture.
+> **Historical record:** This ledger records the completed CSER reset and the
+> evidence checkpoints that led to `v0.1.0`. It is not the current roadmap,
+> project overview, or normative semantics source. Current readers should start
+> with [README.md](README.md), [VISION.md](VISION.md),
+> [ARCHITECTURE.md](ARCHITECTURE.md), and [specs/cser/](specs/cser/).
 
-The current research checkpoint consists of the baseline CSER state machine,
+This ledger records what survived the CSER reset. It was a deletion plan, not a
+promise to preserve the former Axle/Zircon/Starnix architecture.
+
+The `v0.1.0` research checkpoint consists of the baseline CSER state machine,
 its pager refinement, the pure Rust reference oracles, the OSTD/OSDK feasibility
 spike, the scheduler crash-to-fallback slice, and one bounded pager
 crash/rebind/timeout slice. Stage 5 now also has a checked mediated-I/O protocol
@@ -99,8 +105,10 @@ one repository transaction after a separate build/CI checkpoint:
 - Nix, direnv, Just, the Axle kernel and crates, Zircon facades, the old
   Starnix-like server, old conformance runner, generated syscall ABI,
   implementation references, and obsolete documentation were removed;
-- the root Cargo workspace now contains only `crates/cser-model`; xtask and the
-  cargo-osdk kernel prototype remain deliberately isolated workspaces.
+- the root Cargo workspace now contains the independent `crates/cser-model`
+  oracle and the separate `crates/cser-transition-gates` production-source Loom
+  harness; xtask and the cargo-osdk kernel prototype remain deliberately
+  isolated workspaces.
 
 Git history, ending with the pre-deletion build checkpoint, is the archive.
 Legacy paths that remain below or in oracle catalogs are provenance records,
@@ -624,25 +632,26 @@ This is not retained-workload effect identity, registry-native multi-domain
 binding, real DMA in the primary boot, identity-preserving Stage 5B composition,
 TCP/VirtIO-net breadth, an unbounded graph, or SMP evidence.
 
-## Current research assets
+## Released research assets (`v0.1.0`)
 
 | Path | Status | Disposition |
 | --- | --- | --- |
 | `specs/cser/` | **KEEP** | Normative baseline, domain refinements, the frozen five-domain composition, and additive seven-domain Linux I/O TLA+/PlusCal models, TLC configurations, and property documentation. Extend before each vertical slice without rewriting earlier evidence baselines. |
 | `crates/cser-model/` | **KEEP** | Executable, `no_std + alloc` baseline, domain successors, and system-composition semantics plus differential/concurrency oracles. |
+| `crates/cser-transition-gates/` | **KEEP** | Separate production-transition-source Loom harnesses for the exact released concurrency boundary; this crate does not turn the evidence into OSTD-lock or SMP checking. |
 | `kernel/nexus-ostd/` | **KEEP** | Maintained formal OSTD prototype for the CSER registry/composition mechanism, scheduler/pager/readiness domains, bounded personality pressure paths, the frozen five-domain receipt, and the additive seven-domain root receipt. It remains an isolated cargo-osdk workspace so the reference model does not absorb implementation transitions. |
 | `experiments/ostd-virtio-cser-spike/` | **KEEP** | MPL-2.0-bounded patched-OSTD experiment for mediated readonly VirtIO, fail-closed reset/IOTLB tombstones, and three-owner queued IOTLB closure. Preserve both the Stage 5A no-device boundary and Stage 5B real-device receipt. |
 | `specs/oracles/` | **KEEP** | Non-normative, implementation-neutral regression questions extracted from the old system. |
 | `tests/guest/linux/` | **KEEP** | Compatibility-pressure workload inputs. `linux-hello`, adapted Round 4 futex, adapted Round 5 epoll, dynamic PIE, unchanged runtime filesystem, and unchanged runtime network have bounded observed receipts. Exact retained sources are provenance rather than automatic conformance oracles, so visible temporary adaptations correct obsolete futex and regular-file epoll expectations. These inputs do not define Nexus's research identity. |
 | `VISION.md` | **KEEP** | Research question, exclusions, candidate contribution, and evidence threshold. |
 | `ARCHITECTURE.md` | **KEEP** | OSTD boundary, minimal kernel mechanisms, user-service boundary, and failure semantics. |
-| `REWORK.md` | **KEEP** | This migration/deletion ledger. Update it when a row changes state. |
+| `REWORK.md` | **KEEP** | Frozen historical migration/deletion ledger for the reset through `v0.1.0`; use later design records rather than repurposing it as a live roadmap. |
 
 ## Root build and repository control
 
 | Path | Status | Disposition |
 | --- | --- | --- |
-| `Cargo.toml` | **KEEP** | The root workspace contains only `crates/cser-model`; admit future prototype crates only when a vertical slice requires them. |
+| `Cargo.toml` | **KEEP** | The root workspace contains `crates/cser-model` and `crates/cser-transition-gates`; xtask and the OSTD kernel remain isolated workspaces. |
 | root and isolated `Cargo.lock` files | **KEEP** | Commit the model, xtask, OSDK project, and generated OSDK Run-base graphs; runtime containers mount project locks read-only. |
 | `.cargo/config.toml` | **KEEP** | Contains only the bare-metal target flags used by the root no-std model gate. |
 | `Dockerfile`, `rust-toolchain.toml`, `x`, `README.md` | **KEEP** | Pinned environment and documented stable host-side `doctor/build/test/run/verify/clean` contract for all retained gates. |
@@ -743,6 +752,7 @@ REWORK.md
 specs/cser/
 specs/oracles/
 crates/cser-model/
+crates/cser-transition-gates/
 kernel/ or prototype/        # OSTD-based implementation only
 tests/guest/linux/
 tools/xtask/

@@ -4,6 +4,7 @@ title: "Nexus: Causally Scoped Effect Revocation"
 type: software
 version: 0.1.0
 date-released: 2026-07-14
+doi: 10.5281/zenodo.21343496
 authors:
   - family-names: Chen
     given-names: Tianyi

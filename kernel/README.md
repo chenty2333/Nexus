@@ -4,10 +4,12 @@
 feasibility experiment into the maintained Nexus kernel prototype.
 
 `nexus-ostd/` is deliberately an isolated cargo-osdk workspace. The root Cargo
-workspace remains the independent CSER reference model, while the kernel uses a
+workspace contains the independent `cser-model` oracle and the separate
+`cser-transition-gates` production-source Loom harness, while the kernel uses a
 pinned OSTD/OSDK toolchain and its own immutable lock and generated runner-base
 graph. The separation prevents the executable oracle from silently sharing the
-kernel's transition implementation.
+kernel's transition implementation; the transition-gate crate checks the exact
+released source boundary without becoming the kernel implementation.
 
 Within `nexus-ostd/src/`, physical source layout records responsibility without
 changing the established crate-root API:

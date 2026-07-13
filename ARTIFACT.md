@@ -8,6 +8,22 @@ manifest. The reference release bundle is an integrity-preserving record of one 
 A new full run produces a new nonce, timestamps, performance observations, and
 hashes, so reproducibility does not mean that two runs are byte-identical.
 
+The archive of record for this release is
+[Zenodo record 21343496](https://zenodo.org/records/21343496), with version DOI
+[10.5281/zenodo.21343496](https://doi.org/10.5281/zenodo.21343496). It contains
+the evidence bundle, the exact tagged source archive, and one SHA-256 sidecar
+for each:
+
+| Archived file | SHA-256 |
+| --- | --- |
+| `nexus-artifact-bundle-v0.1.0.zip` | `470363102f95fdc6f98ca02c29623f6d2bca58b1a118eab7b74993a0666deef1` |
+| `nexus-source-v0.1.0.zip` | `21fa31d5f31adcdf9516535ce9df13ced3e9b4e403b09b5189d3914f6fabd046` |
+
+The corresponding protected Git tag and
+[GitHub Release](https://github.com/chenty2333/Nexus/releases/tag/v0.1.0)
+remain the source-history anchors. The DOI was added to later `main` metadata;
+the already published `v0.1.0` tag was not moved or rewritten.
+
 ## What the artifact supports
 
 The complete gate covers the safe-Rust reference model, twelve PlusCal/TLA+
@@ -150,17 +166,19 @@ The final acceptance record additionally requires a clean cold local run and a
 successful GitHub Actions full job at the exact released commit. GitHub Actions
 artifacts are short-lived transport, not the archive of record. The release
 source, complete bundle, asset SHA-256, and citation metadata should be retained
-in a DOI-bearing long-term archive; the DOI is added only after that deposit
-exists.
+in a DOI-bearing long-term archive. For `v0.1.0`, the Zenodo record and version
+DOI named above satisfy that archival step.
 
-## Maintainer sealing procedure
+## Maintainer sealing procedure for future releases
 
-Run this only after every implementation, narrative, release-tooling, and
-metadata change has been committed. It requires authenticated `gh`, plus `jq`,
-`unzip`, `curl`, and `sha256sum`. The commands deliberately keep downloaded
-material below ignored `target/`, so the public bundle verifier can require an
-otherwise clean checkout. Run all blocks in the same Bash process so their
-derived identifiers remain bound across steps.
+The `v0.1.0` procedure is complete and must not be rerun against that tag. The
+following is a template for a new, unreleased version. First update and validate
+the version/date in `CITATION.cff` and `.zenodo.json`, then commit every
+implementation, narrative, release-tooling, and metadata change. The procedure
+requires authenticated `gh`, plus `jq`, `unzip`, `curl`, and `sha256sum`. It
+keeps downloaded material below ignored `target/`, so the public bundle
+verifier can require an otherwise clean checkout. Run all blocks in the same
+Bash process so their derived identifiers remain bound across steps.
 
 First produce the local cold receipt, push the exact commit, and select only a
 successful push workflow at that SHA:
@@ -169,9 +187,16 @@ successful push workflow at that SHA:
 set -euo pipefail
 
 repo=chenty2333/Nexus
-version=v0.1.0
-asset=nexus-artifact-bundle-v0.1.0.zip
-release_dir=target/release/v0.1.0
+version=${VERSION:?set VERSION to a new release tag such as v0.2.0}
+test "$version" != v0.1.0
+test "${version#v}" != "$version"
+test "$(jq -r .version .zenodo.json)" = "${version#v}"
+manifest_schema=${MANIFEST_SCHEMA:?set the schema frozen by the new release contract}
+expected_specifications=${EXPECTED_SPECIFICATIONS:?set the frozen specification count}
+expected_stages=${EXPECTED_STAGES:?set the frozen stage/evidence-family count}
+expected_artifacts=${EXPECTED_ARTIFACTS:?set the frozen manifest artifact count}
+asset="nexus-artifact-bundle-$version.zip"
+release_dir="target/release/$version"
 release_sha=$(git rev-parse HEAD)
 
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
@@ -237,27 +262,30 @@ printf '%s  %s\n' "$outer_sha256" "$asset" \
 unzip -q "$zip_path" -d target/verification/artifact-bundle
 ./x verify-bundle target/verification/artifact-bundle
 manifest=target/verification/artifact-bundle/target/verification/manifest.json
-jq -e --arg sha "$release_sha" '
-  .schema == "nexus.verification.v4"
+jq -e --arg sha "$release_sha" --arg schema "$manifest_schema" \
+  --argjson specifications "$expected_specifications" \
+  --argjson stages "$expected_stages" \
+  --argjson artifacts "$expected_artifacts" '
+  .schema == $schema
   and .status == "passed"
   and .revision == $sha
   and .worktree_dirty == false
   and .rebuild_requested == true
   and .nexus_rebuild == "1"
-  and (.specifications | length) == 12
-  and (.stages | length) == 15
-  and (.artifacts | length) == 46
+  and (.specifications | length) == $specifications
+  and (.stages | length) == $stages
+  and (.artifacts | length) == $artifacts
 ' "$manifest" >/dev/null
 ```
 
 Only after that audit, create and record the annotated tag object, push it, and
 publish the two GitHub Release assets. The procedure creates an active,
-no-bypass ruleset that blocks updates and deletion of exactly `v0.1.0`; even
+no-bypass ruleset that blocks updates and deletion of exactly `$version`; even
 with that protection, never force-move or recreate a released tag.
 
 ```bash
 git tag -a "$version" "$release_sha" \
-  -m "Nexus v0.1.0: CSER bounded research artifact"
+  -m "Nexus $version: CSER research artifact"
 tag_object=$(git rev-parse "$version^{tag}")
 test "$(git rev-list -n 1 "$version")" = "$release_sha"
 git push origin "refs/tags/$version"
@@ -265,7 +293,7 @@ test "$(git ls-remote origin "refs/tags/$version^{}" | cut -f1)" = "$release_sha
 
 ruleset=$(gh api --method POST "repos/$repo/rulesets" --input - <<JSON
 {
-  "name": "Protect Nexus v0.1.0 release tag",
+  "name": "Protect Nexus $version release tag",
   "target": "tag",
   "enforcement": "active",
   "bypass_actors": [],
@@ -295,7 +323,7 @@ jq -e --arg ref "refs/tags/$version" '
 
 gh release create "$version" \
   "$zip_path" "$release_dir/$asset.sha256" \
-  --repo "$repo" --verify-tag --title "Nexus v0.1.0" --notes-from-tag
+  --repo "$repo" --verify-tag --title "Nexus $version" --notes-from-tag
 release=$(gh api "repos/$repo/releases/tags/$version")
 jq -e --arg zip "$asset" --arg sum "$asset.sha256" \
   --arg digest "sha256:$outer_sha256" '
@@ -307,21 +335,21 @@ printf 'release_sha=%s\ntag_object=%s\nasset_sha256=%s\n' \
   "$release_sha" "$tag_object" "$outer_sha256"
 ```
 
-GitHub Release publication does not create a DOI by itself. This repository has
-Zenodo metadata, but no Zenodo hook or token is presently configured. Until an
-integration is enabled or a maintainer supplies `ZENODO_ACCESS_TOKEN`, the
-long-term-archive/DOI step is blocked and no DOI may be claimed.
+GitHub Release publication does not create a DOI by itself. The completed
+`v0.1.0` archive used a manual production-Zenodo deposit and received DOI
+`10.5281/zenodo.21343496`. A future version must obtain and verify its own
+version DOI; never reuse the `v0.1.0` DOI as though it identified new bytes.
 
-For a manual Zenodo deposit, use the production API only after the token is
-available. The evidence ZIP, not merely GitHub's source snapshot, must appear in
-the deposit's `files[]` before publication. Archive an explicit tag source ZIP
-and its checksum alongside the evidence ZIP and its checksum:
+For a future manual Zenodo deposit, use the production API only after the token
+is available. The evidence ZIP, not merely GitHub's source snapshot, must
+appear in the deposit's `files[]` before publication. Archive an explicit tag
+source ZIP and its checksum alongside the evidence ZIP and its checksum:
 
 ```bash
 : "${ZENODO_ACCESS_TOKEN:?Zenodo token or enabled integration is required}"
 zenodo=https://zenodo.org/api
 auth="Authorization: Bearer $ZENODO_ACCESS_TOKEN"
-source_asset=nexus-source-v0.1.0.zip
+source_asset="nexus-source-$version.zip"
 source_zip="$release_dir/$source_asset"
 gh api "repos/$repo/zipball/$version" >"$source_zip"
 source_sha256=$(sha256sum "$source_zip" | cut -d ' ' -f1)
@@ -403,11 +431,12 @@ printf 'published_doi=%s\n' "$doi"
 ```
 
 After publication, query the public Zenodo record again and require its
-`files[]` to contain `nexus-artifact-bundle-v0.1.0.zip`; downloading that file
-must reproduce `outer_sha256`. Only then record the DOI in the GitHub Release
-notes, the Zenodo record, and a later `main`/version metadata update. The
-released `v0.1.0` tag and its CFF remain unchanged and never receive a
-retroactive, not-yet-existing DOI.
+`files[]` to contain `$asset`; downloading that file must reproduce
+`outer_sha256`. Only then record the DOI in the GitHub Release notes, the Zenodo
+record, and a later `main`/version metadata update. Never move or rewrite the
+already released tag to insert a DOI minted after its source was sealed. The
+`v0.1.0` release followed this rule: its tag remains unchanged, while later
+`main` metadata records its verified DOI.
 
 ## Troubleshooting and retained limits
 
