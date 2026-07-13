@@ -46,23 +46,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Verify CSER models, the frozen predecessor, and Linux I/O successors
+        env:
+          NEXUS_REBUILD: "1"
         run: ./x verify
-      - name: Upload successful verification manifest and Stage 7B evidence
+      - name: Upload complete verification bundle
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nexus-verification-manifest-${{ github.run_attempt }}
+          name: nexus-verification-bundle-${{ github.run_attempt }}
           if-no-files-found: error
           include-hidden-files: true
-          path: |
-            target/verification/manifest.json
-            target/verification/.stage7a-verify-start.json
-            target/verification/.stage7a-model-spec-complete.json
-            target/verification/.stage7a-verify-complete.json
-            target/verification/stage7b
-            kernel/nexus-ostd/artifacts/stage7b-evaluation.log
-            kernel/nexus-ostd/artifacts/stage7b-qemu-debug.log
-            kernel/nexus-ostd/artifacts/stage7b-runtime-metadata.env
+          path: target/verification/artifact-bundle
       - name: Upload failure evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

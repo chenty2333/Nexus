@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod bundle;
+
+pub(crate) use bundle::{verify_bundle, write_bundle};
+
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const SCHEMA: &str = "nexus.verification.v4";
@@ -193,6 +197,7 @@ struct Stage {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Artifact {
     path: String,
     bytes: u64,
@@ -920,6 +925,7 @@ fn required_artifacts(specs: &[&str]) -> Vec<(String, Option<&'static str>)> {
 }
 
 fn clear_expected_evidence(root: &Path, specs: &[&str]) -> Result<()> {
+    bundle::clear_bundle(root)?;
     for relative in [
         String::from(SENTINEL),
         String::from(MODEL_SPEC_RECEIPT),

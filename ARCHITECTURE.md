@@ -256,8 +256,13 @@ RevokeComplete work          O(descendants + live_effects)
 unrelated global effects     not visited
 ```
 
-The Rust reference model exercises the per-scope index structurally. No
-kernel-scale `k`/`N` performance curve has yet been measured.
+The Rust reference model exercises the per-scope index structurally. The Stage
+7B release evaluator adds fourteen fixed tuples that vary `k`, unrelated `N`,
+and retained history; their checked counters follow the selected cohort while
+unrelated/history visits remain zero. This finite structural evidence does not
+establish an asymptotic or production `O(k)` result. Its guest-visible-TSC
+samples likewise do not provide a production-lock, SMP, or hardware-cycle
+`k`/`N` curve.
 
 ## Kernel/user-space responsibility
 
@@ -551,8 +556,11 @@ remain open.
 
 ## Linux personality
 
-Status: **Stage 6A, Stage 6B.1, and bounded Stage 6B.2 slices complete /
-Observed; the full Linux pressure gate remains in progress**.
+Status: **bounded Stage 6 six-input pressure gate complete / Checked and
+Observed**. The Stage 6A, Stage 6B.1, and Stage 6B.2 predecessor slices below
+retain their original narrower boundaries; the later runtime-filesystem and
+runtime-network successors complete the fixed gate without widening those
+predecessors.
 
 The Linux personality is a user-space compatibility service. It may implement
 Linux syscall dispatch, process/thread semantics, memory mappings, file
@@ -1232,6 +1240,39 @@ set rather than logs truncated or replaced by a concurrent maintenance run.
 CI uploads the same manifest on success and the raw bounded evidence on
 failure.
 
+### Stage 7B bounded evaluation boundary
+
+Stage 7B is accepted only at the following exact concurrency boundary:
+
+> production transition source under a Loom-modeled outer mutex
+
+Fourteen race rows map live transition sources to Loom harnesses at that outer
+mutex. This is not checking of the OSTD `SpinLock`, interrupt masking, SMP
+execution, lock freedom, production liveness, or production scheduling
+fairness. The release evaluator separately runs with one vCPU and single-thread
+TCG. Its twenty fault cells are case-local: fifteen cells use independent,
+nonzero-credit `EffectRegistry` ledgers and five scheduler cells carry typed
+`NoCredit` witnesses. They do not form one shared production fault-budget scope,
+and they do not establish cross-object crash/panic atomicity between a
+transition gate and a separate Registry ledger.
+
+The fourteen scale points are exact structural tuples, not an asymptotic or
+production `O(k)` result. The twenty-nine performance cases retain raw
+guest-visible-TSC samples and recomputed descriptive statistics, but have no
+threshold, comparative baseline, hardware-cycle, or low-overhead claim. The
+sixteen-row primary-source matrix contains fourteen full-text audits and two
+primary-metadata-only rows. The resulting contribution verdict is `narrow`;
+novelty, firstness, and proof remain unestablished.
+
+The bounded checkpoint is release evidence only when a clean cold
+`NEXUS_REBUILD=1 ./x verify` and GitHub CI for the exact pushed revision both
+pass. The manifest and ordered start/model/complete receipts bind the Stage 7B
+JSON/log artifacts into the same source fingerprint, nonce, and artifact hash
+set as the formal and QEMU evidence. That acceptance does not widen the frozen
+five-domain predecessor, identify the separate Stage 5B device effect with the
+seven-domain cohort, or establish a production multi-service authority
+transport.
+
 ## Verification and evaluation matrix
 
 | Property or boundary | Current evidence | Required next evidence |
@@ -1254,7 +1295,7 @@ failure.
 | Runtime filesystem | `RuntimeFsCser` safety/action graphs, 15 safe-Rust/property/Loom gates, unchanged retained ELF artifact gate, exact 14-syscall OSTD execution, four-domain lifecycle companion, positive/negative serial oracle, and Stage 5B sector/image component-consistency oracle | general VFS/persistence, real DMA in the primary boot, same-boot identity, multi-client/SMP, durable external effects |
 | Runtime network | `RuntimeNetCser` safety/action graphs (3,698,288 / 720,002 depth 42 and 28,449 / 14,328 depth 35), eight witnesses, 10 + 2 + 4 safe-Rust gates, unchanged 22-syscall retained ELF, bounded in-memory loopback, real `UserMode` netd-v1 page fault/netd-v2 rebind-adopt, kernel-owned readiness, four typed credits, and positive/negative trace/artifact oracles | smoltcp or real TCP breadth, external packets, VirtIO-net/NIC, multi-connection/backpressure behavior, SMP and production portal/lock refinement |
 | Linux pressure | Bounded Stage 6 Checked/Observed: all six fixed core inputs (`linux-hello`, adapted Round 4, adapted Round 5, dynamic PIE, runtime filesystem, runtime network), strict positive/negative oracles, bounded recovery companions, and additive seven-domain composition evidence | integrated mixed-service workload matrix; general ABI/VFS/TCP/device/SMP breadth |
-| Stage 7B evaluation and contribution decision | fourteen implementation-source races Checked under a Loom-modeled outer mutex; twenty case-local fault cells and fourteen structural scale tuples Checked in release single-vCPU QEMU; twenty-nine raw guest-visible-TSC cases Observed without thresholds; sixteen prior-art rows (fourteen full-text, two metadata-only); verdict `narrow` | exact-revision cold/CI acceptance for each release; full-text resolution of the two metadata-only rows; SMP, hardware-cycle, durable-external-effect, shared-production-fault, and broader Linux evidence before any stronger contribution claim |
+| Stage 7B evaluation and contribution decision | concurrency boundary exactly `production transition source under a Loom-modeled outer mutex`, with fourteen mapped races Checked; twenty case-local fault cells and fourteen finite structural scale tuples Checked in release single-vCPU QEMU; twenty-nine raw guest-visible-TSC cases Observed without thresholds or a comparative baseline; sixteen prior-art rows (fourteen full-text, two metadata-only); the recorded implementation checkpoint has cold/CI acceptance; verdict `narrow` | repeat exact-revision cold/CI acceptance for each later release; full-text resolution of the two metadata-only rows; production-lock/SMP, hardware-cycle, durable-external-effect, shared-production-fault, cross-object crash/panic atomicity, and broader Linux evidence before any stronger contribution claim |
 
 TLC's current result is a complete graph only for its committed finite
 configuration. QEMU results are concrete observations only for their pinned

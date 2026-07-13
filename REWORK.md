@@ -30,11 +30,19 @@ frozen with `runtime_fs=false` and `runtime_net=false`. The additive seven-domai
 Linux I/O successor now supplies a separate formal/safe-Rust/OSTD evidence path
 with a fresh root cohort; it does not retrofit retained effects or Stage 5B
 identity into the predecessor.
-Stage 7A performs zero-semantic-change engineering consolidation: the primary
-OSTD workspace graduates to `kernel/nexus-ostd`, source ownership is physically
-partitioned, the largest independent-model/workflow modules are mechanically
-decomposed, and one public Docker/`./x`/xtask/CI contract produces fresh hashed
+Stage 7A completed zero-semantic-change engineering consolidation: the primary
+OSTD workspace graduated to `kernel/nexus-ostd`, source ownership was physically
+partitioned, the largest independent-model/workflow modules were mechanically
+decomposed, and one public Docker/`./x`/xtask/CI contract produced fresh hashed
 evidence.
+Stage 7B then closed the bounded integrated-evaluation checkpoint: fourteen
+production-transition-source races, twenty case-local fault cells, fourteen
+structural scale tuples, twenty-nine guest-visible-TSC measurement cases, and a
+sixteen-row primary-source comparison feed a `narrow` contribution decision.
+Its concurrency boundary is exactly **production transition source under a
+Loom-modeled outer mutex**; its scale tuples do not establish asymptotic or
+production `O(k)`, and its measurements have no threshold, comparative baseline,
+or hardware-cycle claim.
 The pager, device, and Linux results are not a production pager, I/O subsystem,
 futex registry, or Linux personality. The foundation decision is **OSTD-first**, not
 irrevocably OSTD-only: if a documented critical boundary cannot be fixed by an
@@ -102,7 +110,8 @@ decisions that were applied; they do not imply that deleted paths still exist.
 ## Stage 7A engineering-consolidation record
 
 Status: **complete**, subject to the same cold local and exact pushed-revision
-CI acceptance authority recorded below; no Stage 7B evidence is implied.
+CI acceptance authority recorded below. This Stage 7A record does not itself
+imply Stage 7B evidence; the later accepted checkpoint has its own receipt below.
 
 This checkpoint is accepted only if all of the following remain true in one
 final cold local run and the exact pushed CI revision:
@@ -136,6 +145,60 @@ This stage does not authorize runtime filesystem/network work, state-machine
 changes, an identity-preserving device-composition claim, or removal of
 specifications, negative oracles, runner snapshots, retained Linux sources, or
 the patched-OSTD device receipt.
+
+## Stage 7B bounded evaluation and contribution-decision receipt
+
+Status: **complete / accepted** for the Stage 7B implementation checkpoint at
+revision `0fbe5b287c50c69feec99b8a00bf18b861c0451d`. The research narrative is a
+separate synthesis stage; it cannot enlarge the evidence accepted by this
+record.
+
+Acceptance is bound to both sides of the repository contract:
+
+- a clean cold `NEXUS_REBUILD=1 ./x verify` produced a passed
+  `nexus.verification.v4` manifest for that revision with 12 specification
+  families, 15 stage records, and 46 hashed artifacts. Its ordered
+  start/model/complete receipts bind the same source fingerprint, invocation,
+  rebuild state, nonce, orchestration-token hash, prerequisite receipt, and
+  completion receipt;
+- exact-revision [GitHub Actions run 29243146852](https://github.com/chenty2333/Nexus/actions/runs/29243146852),
+  attempt 2, passed both quick feedback and full system verification. The
+  uploaded `nexus-verification-manifest-2` artifact is bound to that run and
+  revision with digest
+  `sha256:9e728279e0f4e333d37a28711d138e06e3444029c8bd2a03adcd5e6521a4b4c9`;
+- attempt 1 at the same revision is not acceptance evidence: its quick job
+  passed, but the full job stopped on an external Docker Hub `502 Bad Gateway`
+  while fetching the pinned OSDK image. No source change separates the two
+  attempts.
+
+The accepted evidence boundary is:
+
+1. Fourteen implementation-source race rows are **Checked** only as
+   **production transition source under a Loom-modeled outer mutex**. This does
+   not check OSTD `SpinLock`, interrupt masking, SMP, lock freedom, production
+   liveness, or scheduler fairness.
+2. Twenty release-QEMU fault cells are **Checked** under one vCPU and
+   single-thread TCG: fifteen own independent case-local Registry-backed
+   nonzero-credit ledgers and five scheduler cells use typed `NoCredit`
+   witnesses. No shared production fault-budget scope or cross-object
+   crash/panic atomicity is established.
+3. Fourteen exact structural scale tuples are **Checked** with cohort-local work
+   and zero unrelated/history visits. They do not prove an asymptotic or
+   production `O(k)` bound.
+4. Twenty-nine guest-visible-TSC cases are **Observed**, with 65 retained raw
+   samples per case and no threshold, comparative baseline, hardware-cycle, or
+   low-overhead claim.
+5. Sixteen prior-art rows are **Checked**: fourteen are full-text-audited, while
+   Shadow Drivers and Atomic RPC remain primary-metadata-only. The contribution
+   verdict is `narrow`; `novel`, `first`, and `proved` remain unestablished.
+
+This receipt does not widen the frozen five-domain composition predecessor or
+its `runtime_fs=false` / `runtime_net=false` boundary. Runtime filesystem,
+runtime network, and the additive seven-domain successor remain separate later
+evidence. The receipt also does not establish retained-workload effect identity,
+registry-native multi-domain binding, real DMA in the primary boot,
+identity-preserving Stage 5B composition, durable external effects, Linux
+breadth, or full pager-adapter equivalence.
 
 ## Migration receipts
 
@@ -304,11 +367,11 @@ closure scopes are personality-only companions, not a unified cross-service
 registry. The v1 delayed reply uses a bounded kernel queue, code-pager stale
 cases remain predicate probes, and there is no personality timeout/tombstone,
 dynamic loader, threads/futex, fd/epoll, filesystem/network, SMP or production
-capability implementation. The other five core Linux workloads remain pending.
-That sentence records the Stage 6A checkpoint: the Stage 6B.2 receipt below
-subsequently closes the bounded futex, epoll, and dynamic PIE inputs, leaving
-runtime filesystem and runtime network pending at that checkpoint. The later
-runtime-filesystem successor below closes the former, leaving runtime network.
+capability implementation. At that Stage 6A checkpoint, the other five core
+Linux workloads remained pending. The Stage 6B.2 receipt below subsequently
+closes the bounded futex, epoll, and dynamic PIE inputs; the later
+runtime-filesystem and runtime-network successors then close the remaining two.
+All six fixed inputs now have bounded Checked/Observed evidence.
 
 ## Stage 6B.1 private-futex receipt
 
@@ -598,7 +661,7 @@ TCP/VirtIO-net breadth, an unbounded graph, or SMP evidence.
 | `crates/axle-core` | **MIGRATE** | Extract wait single-winner, stale-registration, deferred-revocation, and reverse-index race questions into neutral oracles; then delete the implementation. It is not CSER. |
 | `crates/axle-mm` | **MIGRATE** | Retain same-page-fault contention and resource-accounting questions only. OSTD `VmSpace` and the new pager protocol replace the implementation. |
 | `crates/axle-page-table` | **DELETE** | OSTD owns page-table traversal and mutation; do not maintain a second page-table stack. |
-| `crates/axle-sync` | **MIGRATE** | Move relevant single-terminalization/Loom schedules into CSER concurrency tests, then delete this generic legacy crate. |
+| `crates/axle-sync` | **MIGRATE** | Relevant single-terminalization schedules were preserved in the CSER race catalog and Stage 7B transition-gate Loom harnesses before this generic legacy crate was deleted. The accepted boundary remains production transition source under a Loom-modeled outer mutex, not OSTD-lock or SMP evidence. |
 | `crates/axle-virtio-transport` | **MIGRATE** | Preserve queue bring-up and interrupt failure questions, not this synthetic transport. The mediated device path will wrap `virtio-drivers` and own CSER/DMA lifetime semantics. |
 | `crates/axle-types` | **DELETE** | Remove the Axle UAPI and frozen Zircon aliases. New native interfaces use Nexus names; Linux UAPI comes from maintained upstream crates. |
 | `crates/libax` | **DELETE** | Legacy native facade tied to the old syscall ABI. |
@@ -622,7 +685,7 @@ TCP/VirtIO-net breadth, an unbounded graph, or SMP evidence.
 | `object/device.rs`, DMA objects, old PCI exports | **MIGRATE** | Preserve interrupt, queue, pin-budget, and fail-closed questions. Rewrite device mediation and real IOMMU quiescence. The old identity-IOVA path is not reusable evidence of closure. |
 | channel/socket/object/handle implementation | **DELETE** | Zircon-shaped object semantics are not a research goal. Reintroduce only minimal native IPC required by a vertical slice. |
 | old syscall dispatcher and generated Axle ABI | **DELETE** | Define a small native Nexus ABI; do not preserve syscall numbers for compatibility. |
-| legacy trace implementation | **MIGRATE** | Retain measurement categories and artifact discipline. Current CSER traces already carry scope/effect IDs, both epochs, transitions, and results; migrate only useful legacy measurements into that schema, then add sequence and latency fields for failure and `k`-scaling reports. |
+| legacy trace implementation | **MIGRATE** | Useful measurement categories and artifact discipline survive in the CSER schema. Current traces carry scope/effect IDs, both epochs, transitions, and results; Stage 7B adds case-local fault fields, structural work counters, and raw guest-visible-TSC samples without claiming production latency or asymptotic `k` scaling. |
 
 ## Userspace and guest programs
 
@@ -642,11 +705,11 @@ TCP/VirtIO-net breadth, an unbounded graph, or SMP evidence.
 | Module | Status | Disposition |
 | --- | --- | --- |
 | `tools/axle-conformance` | **MIGRATE** | Timeout, ordered/required/forbidden serial assertions, numeric bounds, bounded artifacts, and process cleanup were reimplemented in xtask. Axle-specific selection and retry machinery was not retained; add a smaller form only when multiple live scenarios require it. |
-| `tools/axle-concurrency` | **MIGRATE** | Preserve the schedule ideas in `specs/oracles/cser-races.toml`; rewrite execution against the CSER core and later Loom/Kani harnesses. |
+| `tools/axle-concurrency` | **MIGRATE** | The schedule ideas survive in `specs/oracles/cser-races.toml`; Stage 7B maps fourteen rows to live production transition sources and Loom harnesses. No Kani, OSTD-lock, or SMP claim is made. |
 | `tools/syscalls-gen` | **DELETE** | Do not regenerate the obsolete Axle/Zircon ABI. Linux constants come from maintained UAPI crates. |
 | `tools/nexus-manifestc` | **DELETE** | Coupled to the old component model. |
 | `tools/datafs-check` | **DELETE** | Coupled to the deferred DataFS model. |
-| old performance parsing scripts | **DELETE** | There is no tracked baseline to preserve. Build the `k`-scaling and failure-latency reports from the new CSER trace schema. |
+| old performance parsing scripts | **DELETE** | No legacy baseline was preserved. The Stage 7B evaluator now emits fourteen finite structural scale tuples and twenty-nine raw guest-visible-TSC cases; these are not an asymptotic `O(k)`, hardware-cycle, threshold, or comparative-overhead result. |
 | `syscalls/spec/`, `syscalls/generated/` | **DELETE** | Remove the old Axle syscall catalog and generated number table with `tools/syscalls-gen`; neither is a compatibility surface. |
 
 ## Specifications and tests

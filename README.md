@@ -13,12 +13,15 @@ filesystem, VirtIO, network, and readiness effects beneath one root authority
 without rewriting the frozen five-domain predecessor. This is not a production
 Linux personality, general or persistent filesystem, TCP/IP stack, real-DMA
 same-boot integration, or proof of identity-preserving Stage 5B composition.
-See [VISION.md](VISION.md) for the research claim,
+See [NARRATIVE.md](NARRATIVE.md) for the end-to-end research account,
+[VISION.md](VISION.md) for the research claim,
 [ARCHITECTURE.md](ARCHITECTURE.md) for boundaries, and [REWORK.md](REWORK.md)
-for the migration ledger.
+for the migration ledger. [ARTIFACT.md](ARTIFACT.md) is the clean-clone,
+evidence-bundle, and archival reproducibility guide.
 
 The Stage 7B checkpoint adds a deliberately narrower evaluation claim: 14
-implementation-source races are Checked under a Loom-modeled outer mutex; a
+races are Checked at the exact boundary `production transition source under a
+Loom-modeled outer mutex`; a
 release, single-vCPU, single-thread-TCG QEMU evaluator checks 20 fault cells and
 14 structural scale points; and 29 guest-visible TSC cases are retained as
 Observed raw samples with no thresholds. The primary-source comparison matrix
@@ -71,11 +74,12 @@ decision, and a fresh-evidence manifest. It can take tens of minutes.
 | `./x test --unit` | Run Rust and neutral-runner unit/scenario tests. This is the default `test` tier. |
 | `./x test --quick` | Run all non-TLA+, non-QEMU formatting, schema, check, Clippy, test, and canonical-trace gates. |
 | `./x test --system` | Run both real QEMU receipts and the frozen-predecessor plus Linux-I/O composition oracles. |
-| `./x test --full` | Alias for the complete `./x verify` contract. |
+| `./x test --full` | Development alias for the complete execution graph; release sealing uses the canonical `./x verify` command. |
 | `./x run kernel` | Run the bounded Nexus OSTD kernel receipt. |
 | `./x run virtio` | Run the mediated VirtIO/reset/IOMMU receipt. |
 | `./x run composition` | Regenerate both QEMU receipts and cross-check the frozen predecessor and additive Linux-I/O successor. This is the default `run` target. |
-| `./x verify` | The only full local/CI acceptance gate. |
+| `./x verify` | Canonical local, release, and CI full-acceptance gate. |
+| `./x verify-bundle [DIRECTORY]` | Verify a canonical cold bundle against the matching clean checkout without rebuilding evidence or running QEMU. |
 | `./x clean` | Remove root, xtask, OSDK, QEMU, guest, TLC, and evidence outputs without building an image. |
 
 Focused `fmt`, `check`, `quick`, `model`, `spec`, and `system`
@@ -131,14 +135,30 @@ composition operations; backend-local locks also protect direct maintenance
 invocations. Manifest publication is intentionally internal to the same
 token-holding full-verify process; there is no standalone publish command.
 
-CI invokes the same `./x` surface. The successful artifact upload also retains
-the Stage 7B JSON/JSONL/oracle outputs and the raw evaluator log, QEMU debug
-stream, and CPU/TCG metadata. A phase is complete only after the final
+The same full-verify process then publishes
+`target/verification/artifact-bundle/`. The bundle mirrors repository-relative
+paths and contains all 46 manifest artifacts, the start record, both completion
+receipts, the manifest, and a canonical `SHA256SUMS`: 51 files in total. Check
+an extracted bundle without rebuilding evidence or running QEMU with:
+
+```bash
+./x verify-bundle target/verification/artifact-bundle
+```
+
+This checks the exact file population, every byte count and SHA-256, the
+start/model/complete/manifest receipt chain, all twelve specification and
+fifteen stage populations, and the complete research-boundary object. See
+[ARTIFACT.md](ARTIFACT.md) for clean-clone, resource, release, and interpretation
+instructions. The public command also recomputes the current checkout's revision
+and source fingerprint and rejects a dirty, mismatched, noncanonical, or noncold
+release bundle.
+
+CI invokes the same `./x` surface and uploads the complete bundle, including
+the formal-model, QEMU, composition, Stage 7B, and CPU/TCG evidence. A phase is
+complete only after the final
 working tree passes a cold local verify and the exact pushed commit passes the
-remote workflow. The successful CI artifact contains the manifest, start
-record, and both bound completion receipts; failure uploads retain the same
-available hidden records for diagnosis but never contain the orchestration
-token itself.
+remote workflow. Failure uploads retain the available hidden records for
+diagnosis but never contain the orchestration token itself.
 
 ## Change discipline
 

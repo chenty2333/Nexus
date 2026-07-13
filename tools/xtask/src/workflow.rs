@@ -24,14 +24,14 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
     let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
     validate_workflow_yaml(&workflow)?;
     validate_checkout_fetch_depth(&workflow)?;
+    validate_release_metadata(root)?;
     for required in [
         "workflow_dispatch:",
         "concurrency:",
         "run: ./x verify",
-        "target/verification/manifest.json",
-        "target/verification/.stage7a-verify-start.json",
-        "target/verification/.stage7a-verify-complete.json",
-        "target/verification/stage7b",
+        "NEXUS_REBUILD: \"1\"",
+        "target/verification/artifact-bundle",
+        "nexus-verification-bundle-${{ github.run_attempt }}",
         "include-hidden-files: true",
     ] {
         if !workflow.contains(required) {
@@ -56,7 +56,15 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
     }
 
     let readme = fs::read_to_string(root.join("README.md"))?;
-    for command in ["doctor", "build", "test", "run", "verify", "clean"] {
+    for command in [
+        "doctor",
+        "build",
+        "test",
+        "run",
+        "verify",
+        "verify-bundle",
+        "clean",
+    ] {
         if !readme.contains(&format!("./x {command}")) {
             return Err(format!("README lacks public command: ./x {command}").into());
         }
@@ -116,6 +124,7 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         "run_xtask stage7b-evidence",
         "run_xtask complete",
         "run_xtask manifest",
+        "run_xtask bundle",
     ] {
         if !body.contains(required) {
             return Err(format!("root verify_all lacks ordered stage: {required}").into());
@@ -130,6 +139,7 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         "run_xtask stage7b-evidence",
         "run_xtask complete",
         "run_xtask manifest",
+        "run_xtask bundle",
     ] {
         let (_, after) = remainder
             .split_once(stage)
@@ -156,6 +166,77 @@ fn validate_workflow_yaml(workflow: &str) -> Result<()> {
         .map_err(|error| format!("CI workflow is not valid YAML: {error}"))?;
     if !matches!(parsed, serde_yaml::Value::Mapping(_)) {
         return Err("CI workflow must be a top-level YAML mapping".into());
+    }
+    Ok(())
+}
+
+fn validate_release_metadata(root: &Path) -> Result<()> {
+    let citation = fs::read_to_string(root.join("CITATION.cff"))?;
+    validate_citation(&citation)?;
+    let zenodo = fs::read_to_string(root.join(".zenodo.json"))?;
+    validate_zenodo(&zenodo)
+}
+
+fn validate_citation(citation: &str) -> Result<()> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(citation)
+        .map_err(|error| format!("CITATION.cff is not valid YAML: {error}"))?;
+    for (field, expected) in [
+        ("cff-version", "1.2.0"),
+        ("title", "Nexus: Causally Scoped Effect Revocation"),
+        ("type", "software"),
+        ("version", "0.1.0"),
+        ("date-released", "2026-07-14"),
+        ("repository-code", "https://github.com/chenty2333/Nexus"),
+        ("license", "Unlicense"),
+    ] {
+        if yaml_field(&parsed, field).and_then(serde_yaml::Value::as_str) != Some(expected) {
+            return Err(format!("CITATION.cff has unexpected {field}").into());
+        }
+    }
+    let authors = yaml_field(&parsed, "authors")
+        .and_then(serde_yaml::Value::as_sequence)
+        .ok_or("CITATION.cff authors must be a sequence")?;
+    if authors.len() != 1 {
+        return Err("CITATION.cff must name exactly one release author".into());
+    }
+    for (field, expected) in [
+        ("family-names", "Chen"),
+        ("given-names", "Tianyi"),
+        ("affiliation", "Hangzhou Normal University"),
+    ] {
+        if yaml_field(&authors[0], field).and_then(serde_yaml::Value::as_str) != Some(expected) {
+            return Err(format!("CITATION.cff author has unexpected {field}").into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_zenodo(zenodo: &str) -> Result<()> {
+    let parsed: serde_json::Value = serde_json::from_str(zenodo)
+        .map_err(|error| format!(".zenodo.json is not valid JSON: {error}"))?;
+    for (field, expected) in [
+        ("title", "Nexus: Causally Scoped Effect Revocation"),
+        ("upload_type", "software"),
+        ("access_right", "open"),
+        ("license", "unlicense"),
+        ("version", "0.1.0"),
+    ] {
+        if parsed.get(field).and_then(serde_json::Value::as_str) != Some(expected) {
+            return Err(format!(".zenodo.json has unexpected {field}").into());
+        }
+    }
+    let creators = parsed
+        .get("creators")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(".zenodo.json creators must be an array")?;
+    if creators.len() != 1
+        || creators[0].get("name").and_then(serde_json::Value::as_str) != Some("Chen, Tianyi")
+        || creators[0]
+            .get("affiliation")
+            .and_then(serde_json::Value::as_str)
+            != Some("Hangzhou Normal University")
+    {
+        return Err(".zenodo.json has an unexpected release creator".into());
     }
     Ok(())
 }
@@ -306,6 +387,39 @@ mod tests {
     }
 
     #[test]
+    fn release_metadata_is_structured_and_frozen() {
+        let citation = r#"
+cff-version: 1.2.0
+title: "Nexus: Causally Scoped Effect Revocation"
+type: software
+version: 0.1.0
+date-released: 2026-07-14
+repository-code: "https://github.com/chenty2333/Nexus"
+license: Unlicense
+authors:
+  - family-names: Chen
+    given-names: Tianyi
+    affiliation: Hangzhou Normal University
+"#;
+        validate_citation(citation).expect("valid citation metadata");
+        assert!(validate_citation(&citation.replace("0.1.0", "0.2.0")).is_err());
+
+        let zenodo = r#"{
+            "title": "Nexus: Causally Scoped Effect Revocation",
+            "upload_type": "software",
+            "access_right": "open",
+            "license": "unlicense",
+            "version": "0.1.0",
+            "creators": [{
+                "name": "Chen, Tianyi",
+                "affiliation": "Hangzhou Normal University"
+            }]
+        }"#;
+        validate_zenodo(zenodo).expect("valid Zenodo metadata");
+        assert!(validate_zenodo(&zenodo.replace("unlicense", "mit")).is_err());
+    }
+
+    #[test]
     fn requires_every_checkout_to_fetch_its_parent_history() {
         let valid = format!(
             "jobs:\n  one:\n    steps:\n      - uses: actions/checkout@{SHA}\n        with:\n          fetch-depth: 0\n  two:\n    steps:\n      - uses: actions/checkout@{SHA}\n        with:\n          fetch-depth: '0'\n"
@@ -362,12 +476,12 @@ verify_all() {
 "#;
         let suffix = "\n}\n";
         let ordered = format!(
-            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask complete\nrun_xtask manifest{suffix}"
+            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask complete\nrun_xtask manifest\nrun_xtask bundle{suffix}"
         );
         validate_full_verify_order(&ordered).expect("ordered full verify");
 
         let spliced = format!(
-            "{prefix}run_xtask begin\nrun_xtask verify\nrun_xtask complete\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask manifest{suffix}"
+            "{prefix}run_xtask begin\nrun_xtask verify\nrun_xtask complete\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask manifest\nrun_xtask bundle{suffix}"
         );
         let error = validate_full_verify_order(&spliced)
             .expect_err("completion before system must be rejected")

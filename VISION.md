@@ -154,15 +154,21 @@ emulation path; that shape is explicitly not the new research contribution.
 The candidate contribution is narrower and compositional:
 
 > one kernel-enforced causal effect scope, with explicit commit gates,
-> proportional closure, crash/rebind fencing, conserved resource credits, and
-> honest device quiescence, applied uniformly to multiple restartable
+> reverse-indexed closure, crash/rebind fencing, conserved resource credits,
+> and honest device quiescence, applied uniformly to multiple restartable
 > user-space OS services.
 
-Whether that combination is new and useful will be decided only after the
-current bounded scheduler, pager, mediated-I/O, and first Linux-personality
-receipts are extended through the remaining pressure workloads and integrated
-verification, and a fresh close comparison with prior work has been completed.
-A negative result or a narrower claim is an acceptable research outcome.
+The bounded pressure workloads, integrated verification, and fresh close
+comparison have now completed. The Stage 7B result is deliberately `narrow`:
+the evidence supports the fixed CSER interaction combination under the stated
+finite-model, Loom, and single-vCPU boundaries, but does not establish that the
+combination is novel, first, proved, generally useful, or production-ready.
+Fourteen structural scale tuples do not establish an asymptotic or production
+`O(k)` result, and twenty-nine guest-visible-TSC cases without thresholds or a
+hardware baseline do not establish low overhead. Shadow Drivers and Atomic RPC
+also remain primary-metadata-only, while a shared production fault-budget scope
+and cross-object crash/panic atomicity remain unestablished. A negative result
+or this narrower claim is an acceptable research outcome.
 
 ## Reuse is a design requirement
 
@@ -656,19 +662,25 @@ Work proceeds through evidence gates, not feature-count milestones.
    runtime filesystem/network behavior and does not weaken the independence of
    the reference model.
 8. **Integrated evidence and contribution decision — Stage 7B bounded
-   acceptance contract implemented:** fourteen production-transition-source
-   race rows are Checked under a Loom-modeled outer mutex. A release,
-   single-vCPU, single-thread-TCG evaluator checks twenty case-local fault
-   cells (fifteen nonzero-credit Registry ledgers plus five typed `NoCredit`
-   scheduler witnesses), fourteen structural scale points, and retains raw
-   guest-visible TSC samples for twenty-nine cases as Observed measurements
-   without thresholds. The primary-source comparison contains sixteen rows:
-   fourteen full-text and two metadata-only. Its contribution decision is
-   `narrow`; `novel`, `first`, and `proved` remain unestablished. A revision is
-   not evidence for SMP, hardware cycles, a shared production fault scope, or
-   cross-object crash/panic atomicity. It is accepted only when its clean cold
-   `./x verify` and exact pushed GitHub CI both pass. The final research
-   narrative remains a separate later stage.
+   acceptance complete / Checked and Observed:** the concurrency boundary is
+   exactly **production transition source under a Loom-modeled outer mutex**;
+   fourteen mapped race rows are Checked there, not under the OSTD `SpinLock`,
+   interrupt, or SMP execution context. A release, single-vCPU,
+   single-thread-TCG evaluator checks twenty case-local fault cells (fifteen
+   nonzero-credit Registry ledgers plus five typed `NoCredit` scheduler
+   witnesses) and fourteen structural scale points. Those finite tuples check
+   cohort-local work counters and zero unrelated/history visits; they do not
+   establish an asymptotic or production `O(k)` claim. The evaluator retains
+   raw guest-visible TSC samples for twenty-nine cases as Observed measurements
+   without thresholds, a baseline comparison, or a hardware-cycle claim. The
+   primary-source comparison contains sixteen rows: fourteen full-text and two
+   metadata-only. Its contribution decision is `narrow`; `novel`, `first`, and
+   `proved` remain unestablished. A revision is not evidence for SMP, lock
+   freedom, production liveness, durable external effects, Linux breadth, a
+   shared production fault scope, or cross-object crash/panic atomicity. The
+   accepted checkpoint has both a clean cold `NEXUS_REBUILD=1 ./x verify` and
+   exact pushed GitHub CI receipt. The research narrative is a separate
+   synthesis stage and cannot retroactively widen this evidence boundary.
 
 Every vertical slice follows the same rule: specify the state machine and exit
 criteria, implement the smallest end-to-end path, inject failures, and stop if

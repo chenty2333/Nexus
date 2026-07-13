@@ -22,6 +22,8 @@ Public commands:
   run [composition|kernel|virtio]
                          run a QEMU receipt (default: composition)
   verify                 run the complete model/spec/QEMU/composition gate
+  verify-bundle [DIRECTORY]
+                         verify an existing evidence bundle without QEMU
   clean                  remove all repository-owned generated artifacts
 
 Focused commands:
@@ -106,6 +108,7 @@ ensure_image() {
 
 run_xtask() {
     local command=$1
+    shift
     local -a token_environment=()
     if [[ $command == begin || $command == complete || $command == manifest ]]; then
         if [[ ! ${verify_token:-} =~ ^[0-9a-f]{64}$ ]]; then
@@ -130,7 +133,7 @@ run_xtask() {
         --mount "type=bind,source=$root/tools/xtask/Cargo.lock,target=/work/tools/xtask/Cargo.lock,readonly" \
         --workdir /work \
         "$image" \
-        cargo run --quiet --locked --manifest-path tools/xtask/Cargo.toml -- "$command"
+        cargo run --quiet --locked --manifest-path tools/xtask/Cargo.toml -- "$command" "$@"
 }
 
 run_backend() {
@@ -226,6 +229,7 @@ verify_all() {
     run_xtask stage7b-evidence
     run_xtask complete
     run_xtask manifest
+    run_xtask bundle
 }
 
 doctor_host() {
@@ -267,7 +271,7 @@ if (( $# > 0 )); then
     shift
 fi
 case "$command" in
-    doctor|build|test|run|fmt|check|quick|model|spec|system|verify|clean)
+    doctor|build|test|run|fmt|check|quick|model|spec|system|verify|verify-bundle|clean)
         acquire_repo_lock
         ;;
 esac
@@ -350,6 +354,17 @@ case "$command" in
     verify)
         require_no_args "$@"
         verify_all "./x verify"
+        ;;
+    verify-bundle)
+        if (( $# > 1 )); then
+            die "verify-bundle accepts at most one directory"
+        fi
+        bundle=${1:-target/verification/artifact-bundle}
+        if [[ $bundle == /* || $bundle == .. || $bundle == ../* || $bundle == */../* || $bundle == */.. ]]; then
+            die "verify-bundle directory must stay within the repository"
+        fi
+        require_docker
+        run_xtask verify-bundle "$bundle"
         ;;
     clean)
         require_no_args "$@"

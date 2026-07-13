@@ -67,8 +67,14 @@ fn real_main() -> Result<()> {
     let root = repo_root();
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| String::from("help"));
+    let argument = args.next();
     if let Some(extra) = args.next() {
         return Err(format!("unexpected argument: {extra}").into());
+    }
+    if command != "verify-bundle"
+        && let Some(argument) = &argument
+    {
+        return Err(format!("unexpected argument: {argument}").into());
     }
 
     match command.as_str() {
@@ -88,6 +94,18 @@ fn real_main() -> Result<()> {
         }
         "complete" => evidence::complete(&root, &TLA_SPECS).map(|_| ()),
         "manifest" => evidence::write(&root, &TLA_SPECS).map(|_| ()),
+        "bundle" => evidence::write_bundle(&root, &TLA_SPECS).map(|_| ()),
+        "verify-bundle" => {
+            let path = argument
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/verification/artifact-bundle"));
+            let path = if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            };
+            evidence::verify_bundle(&root, &path, &TLA_SPECS)
+        }
         "stage7b-evidence" => stage7b_evidence_all(&root),
         "clean" => clean(&root),
         "help" | "-h" | "--help" => {
@@ -108,8 +126,8 @@ fn repo_root() -> PathBuf {
 
 fn print_usage() {
     eprintln!("usage: cargo run --manifest-path tools/xtask/Cargo.toml -- <command>");
-    eprintln!("commands: doctor build fmt check test quick model spec verify clean");
-    eprintln!("internal evidence commands: begin stage7b-evidence complete manifest");
+    eprintln!("commands: doctor build fmt check test quick model spec verify verify-bundle clean");
+    eprintln!("internal evidence commands: begin stage7b-evidence complete manifest bundle");
 }
 
 fn stage7b_evidence_all(root: &Path) -> Result<()> {

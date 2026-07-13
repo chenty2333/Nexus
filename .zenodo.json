@@ -1,0 +1,21 @@
+{
+  "title": "Nexus: Causally Scoped Effect Revocation",
+  "description": "A research operating-system prototype and reproducibility artifact for kernel-enforced causal effect scopes across restartable user-space OS services.",
+  "creators": [
+    {
+      "name": "Chen, Tianyi",
+      "affiliation": "Hangzhou Normal University"
+    }
+  ],
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "unlicense",
+  "version": "0.1.0",
+  "keywords": [
+    "operating systems",
+    "restartable services",
+    "effect revocation",
+    "formal methods",
+    "reproducibility"
+  ]
+}

@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use Nexus or its CSER artifact, please cite this software release."
+title: "Nexus: Causally Scoped Effect Revocation"
+type: software
+version: 0.1.0
+date-released: 2026-07-14
+authors:
+  - family-names: Chen
+    given-names: Tianyi
+    affiliation: Hangzhou Normal University
+repository-code: "https://github.com/chenty2333/Nexus"
+url: "https://github.com/chenty2333/Nexus"
+license: Unlicense
+keywords:
+  - operating systems
+  - restartable services
+  - effect revocation
+  - formal methods
+  - reproducibility
