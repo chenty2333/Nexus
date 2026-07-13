@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use alloc::{
+    boxed::Box,
     collections::{BTreeMap, BTreeSet},
     vec::Vec,
 };
@@ -42,6 +43,24 @@ impl ScopeKey {
 pub(crate) struct TaskKey {
     id: u64,
     generation: u64,
+}
+
+/// Identifies one independently restartable service domain inside a root
+/// authority scope. Domain zero is reserved for the legacy single-binding API;
+/// production-identity successors use explicit nonzero domains.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct DomainKey(u32);
+
+impl DomainKey {
+    pub(crate) const LEGACY: Self = Self(0);
+
+    pub(crate) const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn value(self) -> u32 {
+        self.0
+    }
 }
 
 impl TaskKey {
@@ -398,9 +417,12 @@ pub(crate) enum PublicationMode {
 pub(crate) struct EffectIdentity {
     effect: EffectKey,
     scope: ScopeKey,
+    domain: DomainKey,
+    parent: Option<EffectKey>,
     task: TaskKey,
     operation: OperationClass,
     authority_epoch: u64,
+    origin_binding_epoch: u64,
     binding_epoch: u64,
     resources: BTreeSet<ResourceKey>,
 }
@@ -412,6 +434,14 @@ impl EffectIdentity {
 
     pub(crate) const fn scope(&self) -> ScopeKey {
         self.scope
+    }
+
+    pub(crate) const fn domain(&self) -> DomainKey {
+        self.domain
+    }
+
+    pub(crate) const fn parent(&self) -> Option<EffectKey> {
+        self.parent
     }
 
     pub(crate) const fn task(&self) -> TaskKey {
@@ -430,6 +460,10 @@ impl EffectIdentity {
         self.binding_epoch
     }
 
+    pub(crate) const fn origin_binding_epoch(&self) -> u64 {
+        self.origin_binding_epoch
+    }
+
     pub(crate) fn resources(&self) -> &BTreeSet<ResourceKey> {
         &self.resources
     }
@@ -443,6 +477,7 @@ impl EffectIdentity {
 pub(crate) struct PortalHandle {
     scope: ScopeKey,
     effect: EffectKey,
+    domain: DomainKey,
     authority_epoch: u64,
     binding_epoch: u64,
     nonce: u64,
@@ -455,6 +490,10 @@ impl PortalHandle {
 
     pub(crate) const fn scope(self) -> ScopeKey {
         self.scope
+    }
+
+    pub(crate) const fn domain(self) -> DomainKey {
+        self.domain
     }
 
     pub(crate) const fn authority_epoch(self) -> u64 {
@@ -621,6 +660,19 @@ pub(crate) struct RegisterRequest {
     pub(crate) publication: PublicationMode,
 }
 
+/// Registration metadata for a production effect derived inside a root scope.
+///
+/// The legacy [`RegisterRequest`] remains the single-domain compatibility API.
+/// New workload paths use this wrapper so domain membership and immutable
+/// ancestry are installed by the registry in the same transition as identity,
+/// credit, and reverse-index state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DerivedRegisterRequest {
+    pub(crate) request: RegisterRequest,
+    pub(crate) domain: DomainKey,
+    pub(crate) parent: Option<EffectKey>,
+}
+
 /// One failure-atomic update of an effect's current resource membership.
 ///
 /// `handle` authenticates the complete immutable effect identity. Only the
@@ -672,6 +724,7 @@ impl EffectRecord {
         PortalHandle {
             scope: self.identity.scope,
             effect: self.identity.effect,
+            domain: self.identity.domain,
             authority_epoch: self.identity.authority_epoch,
             binding_epoch: self.identity.binding_epoch,
             nonce: self.nonce,
@@ -700,6 +753,13 @@ pub(crate) struct ScopeConfig {
     pub(crate) credits: Vec<CreditLimit>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DomainConfig {
+    pub(crate) key: DomainKey,
+    pub(crate) binding_epoch: u64,
+    pub(crate) supervisor: TaskKey,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RecoveryState {
     crash_revision: u64,
@@ -707,6 +767,24 @@ struct RecoveryState {
     unadopted: BTreeSet<EffectKey>,
     snapshot: Option<RecoverySnapshot>,
     ready: Option<TaskKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DomainRecoveryState {
+    crash_revision: u64,
+    cohort: BTreeSet<EffectKey>,
+    unadopted: BTreeSet<EffectKey>,
+    snapshot: Option<DomainRecoverySnapshot>,
+    ready: Option<TaskKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DomainBindingRecord {
+    binding_epoch: u64,
+    supervisor: Option<TaskKey>,
+    fallback_running: bool,
+    revision: u64,
+    recovery: Option<DomainRecoveryState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -753,7 +831,42 @@ struct ScopeRecord {
     closure_candidates: BTreeSet<EffectKey>,
     pending_publications: usize,
     recovery: Option<RecoveryState>,
+    domains: BTreeMap<DomainKey, DomainBindingRecord>,
     revoke: Option<RevokeState>,
+}
+
+#[derive(Default)]
+struct ExpectedReverseIndexes {
+    by_scope: BTreeMap<ScopeKey, BTreeSet<EffectKey>>,
+    by_domain: BTreeMap<(ScopeKey, DomainKey), BTreeSet<EffectKey>>,
+    by_task: BTreeMap<TaskKey, BTreeSet<EffectKey>>,
+    by_resource: BTreeMap<ResourceKey, BTreeSet<EffectKey>>,
+    children_by_parent: BTreeMap<EffectKey, BTreeSet<EffectKey>>,
+    leaves_by_scope: BTreeMap<ScopeKey, BTreeSet<EffectKey>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ProductionIndexes {
+    by_domain: BTreeMap<(ScopeKey, DomainKey), BTreeSet<EffectKey>>,
+    children_by_parent: BTreeMap<EffectKey, BTreeSet<EffectKey>>,
+    leaves_by_scope: BTreeMap<ScopeKey, BTreeSet<EffectKey>>,
+}
+
+impl ScopeRecord {
+    /// Any root-registry mutation makes a previously issued recovery proof
+    /// conservative rather than allowing a replacement to bind against a
+    /// snapshot that omitted the mutation.  Domain-local snapshots carry both
+    /// revisions, so a root revision change invalidates every ready proof.
+    fn invalidate_recovery_readiness(&mut self) {
+        if let Some(recovery) = self.recovery.as_mut() {
+            recovery.ready = None;
+        }
+        for binding in self.domains.values_mut() {
+            if let Some(recovery) = binding.recovery.as_mut() {
+                recovery.ready = None;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -772,6 +885,18 @@ pub(crate) struct RecoverySnapshot {
     pub(crate) authority_epoch: u64,
     pub(crate) binding_epoch: u64,
     pub(crate) revision: u64,
+    pub(crate) domain_revision: u64,
+    pub(crate) effects: Vec<RecoveryEffectSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DomainRecoverySnapshot {
+    pub(crate) scope: ScopeKey,
+    pub(crate) domain: DomainKey,
+    pub(crate) replacement: TaskKey,
+    pub(crate) authority_epoch: u64,
+    pub(crate) binding_epoch: u64,
+    pub(crate) root_revision: u64,
     pub(crate) domain_revision: u64,
     pub(crate) effects: Vec<RecoveryEffectSummary>,
 }
@@ -797,6 +922,33 @@ pub(crate) struct RebindReceipt {
     pub(crate) scope: ScopeKey,
     pub(crate) binding_epoch: u64,
     pub(crate) supervisor: TaskKey,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DomainCrashReceipt {
+    pub(crate) scope: ScopeKey,
+    pub(crate) domain: DomainKey,
+    pub(crate) previous_binding_epoch: u64,
+    pub(crate) binding_epoch: u64,
+    pub(crate) cohort: BTreeSet<EffectKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DomainRebindReceipt {
+    pub(crate) scope: ScopeKey,
+    pub(crate) domain: DomainKey,
+    pub(crate) binding_epoch: u64,
+    pub(crate) supervisor: TaskKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DomainProjection {
+    pub(crate) binding_epoch: u64,
+    pub(crate) supervisor: Option<TaskKey>,
+    pub(crate) fallback_running: bool,
+    pub(crate) revision: u64,
+    pub(crate) live_effects: usize,
+    pub(crate) recovery_remaining: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -855,7 +1007,9 @@ pub(crate) enum RegistryError {
     InvalidGeneration,
     InvalidCreditConfiguration,
     ScopeAlreadyExists,
+    DomainAlreadyExists,
     UnknownScope,
+    UnknownDomain,
     UnknownEffect,
     UnknownCreditClass,
     CreditExhausted,
@@ -870,6 +1024,7 @@ pub(crate) enum RegistryError {
     SnapshotChanged,
     RecoveryNotReady,
     NotAdoptable,
+    LiveDescendants,
     AlreadyTerminal,
     CommitConflict,
     InvalidRevokeSelection,
@@ -882,11 +1037,12 @@ pub(crate) enum RegistryError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EffectRegistry {
     instance_id: u64,
-    scopes: BTreeMap<ScopeKey, ScopeRecord>,
+    scopes: BTreeMap<ScopeKey, Box<ScopeRecord>>,
     effects: BTreeMap<EffectKey, EffectRecord>,
     by_scope: BTreeMap<ScopeKey, BTreeSet<EffectKey>>,
     by_task: BTreeMap<TaskKey, BTreeSet<EffectKey>>,
     by_resource: BTreeMap<ResourceKey, BTreeSet<EffectKey>>,
+    production: Box<ProductionIndexes>,
     next_effect_id: u64,
     next_nonce: u64,
     next_commit_sequence: u64,
@@ -904,6 +1060,7 @@ impl EffectRegistry {
             by_scope: BTreeMap::new(),
             by_task: BTreeMap::new(),
             by_resource: BTreeMap::new(),
+            production: Box::default(),
             next_effect_id: 1,
             next_nonce: 1,
             next_commit_sequence: 1,
@@ -923,9 +1080,20 @@ impl EffectRegistry {
             return Err(RegistryError::ScopeAlreadyExists);
         }
         let credits = CreditLedger::new(&config.credits)?;
+        let mut domains = BTreeMap::new();
+        domains.insert(
+            DomainKey::LEGACY,
+            DomainBindingRecord {
+                binding_epoch: config.binding_epoch,
+                supervisor: Some(config.supervisor),
+                fallback_running: false,
+                revision: 0,
+                recovery: None,
+            },
+        );
         self.scopes.insert(
             config.key,
-            ScopeRecord {
+            Box::new(ScopeRecord {
                 key: config.key,
                 phase: ScopePhase::Active,
                 authority_epoch: config.authority_epoch,
@@ -938,15 +1106,104 @@ impl EffectRegistry {
                 closure_candidates: BTreeSet::new(),
                 pending_publications: 0,
                 recovery: None,
+                domains,
                 revoke: None,
-            },
+            }),
         );
         Ok(())
+    }
+
+    pub(crate) fn add_domain(
+        &mut self,
+        scope_key: ScopeKey,
+        config: DomainConfig,
+    ) -> Result<(), RegistryError> {
+        validate_generation(config.supervisor.generation)?;
+        if config.key == DomainKey::LEGACY || config.binding_epoch == 0 {
+            return Err(RegistryError::InvalidGeneration);
+        }
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        if scope.domains.contains_key(&config.key) {
+            return Err(RegistryError::DomainAlreadyExists);
+        }
+        let next_revision = scope
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        self.scopes.get_mut(&scope_key).unwrap().domains.insert(
+            config.key,
+            DomainBindingRecord {
+                binding_epoch: config.binding_epoch,
+                supervisor: Some(config.supervisor),
+                fallback_running: false,
+                revision: 0,
+                recovery: None,
+            },
+        );
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(())
+    }
+
+    pub(crate) fn domain_projection(
+        &self,
+        scope_key: ScopeKey,
+        domain: DomainKey,
+    ) -> Result<DomainProjection, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        let binding = scope
+            .domains
+            .get(&domain)
+            .ok_or(RegistryError::UnknownDomain)?;
+        Ok(DomainProjection {
+            binding_epoch: binding.binding_epoch,
+            supervisor: binding.supervisor,
+            fallback_running: binding.fallback_running,
+            revision: binding.revision,
+            live_effects: self
+                .production
+                .by_domain
+                .get(&(scope_key, domain))
+                .map_or(0, BTreeSet::len),
+            recovery_remaining: binding
+                .recovery
+                .as_ref()
+                .map_or(0, |recovery| recovery.unadopted.len()),
+        })
     }
 
     pub(crate) fn register(
         &mut self,
         request: RegisterRequest,
+    ) -> Result<RegisteredEffect, RegistryError> {
+        self.register_in_domain(request, DomainKey::LEGACY, None)
+    }
+
+    pub(crate) fn register_derived(
+        &mut self,
+        request: DerivedRegisterRequest,
+    ) -> Result<RegisteredEffect, RegistryError> {
+        if request.domain == DomainKey::LEGACY {
+            return Err(RegistryError::InvalidState);
+        }
+        self.register_in_domain(request.request, request.domain, request.parent)
+    }
+
+    fn register_in_domain(
+        &mut self,
+        request: RegisterRequest,
+        domain: DomainKey,
+        parent: Option<EffectKey>,
     ) -> Result<RegisteredEffect, RegistryError> {
         validate_generation(request.scope.generation)?;
         validate_generation(request.task.generation)?;
@@ -955,7 +1212,7 @@ impl EffectRegistry {
         }
         let credits = normalize_charges(&request.credits)?;
         let resources: BTreeSet<_> = request.resources.into_iter().collect();
-        let (authority_epoch, binding_epoch) = {
+        let (authority_epoch, binding_epoch, next_scope_revision) = {
             let scope = self
                 .scopes
                 .get(&request.scope)
@@ -963,25 +1220,68 @@ impl EffectRegistry {
             if scope.phase != ScopePhase::Active {
                 return Err(RegistryError::ScopeNotActive);
             }
-            if scope.supervisor.is_none() {
+            let binding = scope
+                .domains
+                .get(&domain)
+                .ok_or(RegistryError::UnknownDomain)?;
+            if binding.supervisor.is_none() || binding.fallback_running {
                 return Err(RegistryError::NoSupervisor);
             }
-            (scope.authority_epoch, scope.binding_epoch)
+            let next_scope_revision = scope
+                .revision
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            (
+                scope.authority_epoch,
+                binding.binding_epoch,
+                next_scope_revision,
+            )
         };
+
+        if let Some(parent) = parent {
+            let record = self
+                .effects
+                .get(&parent)
+                .ok_or(RegistryError::UnknownEffect)?;
+            if record.identity.scope != request.scope
+                || record.identity.authority_epoch != authority_epoch
+                || record.phase.is_terminal()
+            {
+                return Err(RegistryError::InvalidHandle);
+            }
+            let parent_binding = self.scopes[&request.scope]
+                .domains
+                .get(&record.identity.domain)
+                .ok_or(RegistryError::UnknownDomain)?;
+            if record.identity.binding_epoch != parent_binding.binding_epoch {
+                return Err(RegistryError::StaleBinding);
+            }
+        }
+
+        let effect_id = self.next_effect_id;
+        let next_effect_id = effect_id
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let nonce = self.next_nonce;
+        let next_nonce = nonce.checked_add(1).ok_or(RegistryError::CounterOverflow)?;
 
         self.scopes
             .get_mut(&request.scope)
             .unwrap()
             .credits
             .reserve(&credits)?;
-        let effect = EffectKey::new(self.take_effect_id()?, 1);
-        let nonce = self.take_nonce()?;
+        self.next_effect_id = next_effect_id;
+        self.next_nonce = next_nonce;
+        let effect = EffectKey::new(effect_id, 1);
         let identity = EffectIdentity {
             effect,
             scope: request.scope,
+            domain,
+            parent,
             task: request.task,
             operation: request.operation,
             authority_epoch,
+            origin_binding_epoch: binding_epoch,
             binding_epoch,
             resources,
         };
@@ -1003,7 +1303,9 @@ impl EffectRegistry {
         let handle = record.handle();
         self.insert_reverse_indexes(&record.identity, &record.current_resources);
         self.effects.insert(effect, record);
-        self.bump_scope_revision(request.scope)?;
+        let scope = self.scopes.get_mut(&request.scope).unwrap();
+        scope.revision = next_scope_revision;
+        scope.invalidate_recovery_readiness();
         Ok(RegisteredEffect { identity, handle })
     }
 
@@ -1032,8 +1334,14 @@ impl EffectRegistry {
         let scope = self.effects.get(&effect).unwrap().identity.scope;
         match self.effects.get(&effect).unwrap().phase {
             EffectPhase::Registered => {
+                let next_scope_revision = self.scopes[&scope]
+                    .revision
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
                 self.effects.get_mut(&effect).unwrap().phase = EffectPhase::Prepared;
-                self.bump_scope_revision(scope)?;
+                let scope = self.scopes.get_mut(&scope).unwrap();
+                scope.revision = next_scope_revision;
+                scope.invalidate_recovery_readiness();
                 Ok(())
             }
             EffectPhase::Prepared => Ok(()),
@@ -1073,9 +1381,7 @@ impl EffectRegistry {
         let scope = self.scopes.get_mut(&scope_key).unwrap();
         scope.domain_revision = domain_revision;
         scope.revision = revision;
-        if scope.fallback_running {
-            scope.recovery.as_mut().unwrap().ready = None;
-        }
+        scope.invalidate_recovery_readiness();
         Ok(())
     }
 
@@ -1232,9 +1538,7 @@ impl EffectRegistry {
         }
         let scope = self.scopes.get_mut(&scope_key).unwrap();
         scope.revision = next_scope_revision;
-        if scope.fallback_running {
-            scope.recovery.as_mut().unwrap().ready = None;
-        }
+        scope.invalidate_recovery_readiness();
         Ok(receipts.into_iter().map(CommitOutcome::Applied).collect())
     }
 
@@ -1243,7 +1547,12 @@ impl EffectRegistry {
         scope_key: ScopeKey,
         sender: TaskKey,
     ) -> Result<CrashReceipt, RegistryError> {
-        let cohort = self.by_scope.get(&scope_key).cloned().unwrap_or_default();
+        let cohort = self
+            .production
+            .by_domain
+            .get(&(scope_key, DomainKey::LEGACY))
+            .cloned()
+            .unwrap_or_default();
         let scope = self
             .scopes
             .get_mut(&scope_key)
@@ -1254,17 +1563,23 @@ impl EffectRegistry {
         if scope.supervisor != Some(sender) {
             return Err(RegistryError::NoSupervisor);
         }
-        let previous_binding_epoch = scope.binding_epoch;
-        scope.binding_epoch = scope
-            .binding_epoch
-            .checked_add(1)
-            .ok_or(RegistryError::CounterOverflow)?;
-        scope.supervisor = None;
-        scope.fallback_running = true;
-        scope.revision = scope
+        let next_legacy_revision = scope.domains[&DomainKey::LEGACY]
             .revision
             .checked_add(1)
             .ok_or(RegistryError::CounterOverflow)?;
+        let previous_binding_epoch = scope.binding_epoch;
+        let binding_epoch = scope
+            .binding_epoch
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let revision = scope
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        scope.binding_epoch = binding_epoch;
+        scope.supervisor = None;
+        scope.fallback_running = true;
+        scope.revision = revision;
         scope.recovery = Some(RecoveryState {
             crash_revision: scope.revision,
             cohort: cohort.clone(),
@@ -1272,6 +1587,15 @@ impl EffectRegistry {
             snapshot: None,
             ready: None,
         });
+        let legacy = scope
+            .domains
+            .get_mut(&DomainKey::LEGACY)
+            .expect("legacy binding is created with the scope");
+        legacy.binding_epoch = scope.binding_epoch;
+        legacy.supervisor = None;
+        legacy.fallback_running = true;
+        legacy.revision = next_legacy_revision;
+        scope.invalidate_recovery_readiness();
         Ok(CrashReceipt {
             scope: scope_key,
             previous_binding_epoch,
@@ -1320,13 +1644,15 @@ impl EffectRegistry {
             domain_revision: scope.domain_revision,
             effects,
         };
-        self.scopes
+        let recovery = self
+            .scopes
             .get_mut(&scope_key)
             .unwrap()
             .recovery
             .as_mut()
-            .unwrap()
-            .snapshot = Some(snapshot.clone());
+            .unwrap();
+        recovery.snapshot = Some(snapshot.clone());
+        recovery.ready = None;
         Ok(snapshot)
     }
 
@@ -1378,6 +1704,12 @@ impl EffectRegistry {
         scope.supervisor = Some(replacement);
         scope.fallback_running = false;
         scope.recovery.as_mut().unwrap().ready = None;
+        let legacy = scope
+            .domains
+            .get_mut(&DomainKey::LEGACY)
+            .expect("legacy binding is created with the scope");
+        legacy.supervisor = Some(replacement);
+        legacy.fallback_running = false;
         Ok(RebindReceipt {
             scope: scope_key,
             binding_epoch: scope.binding_epoch,
@@ -1429,7 +1761,7 @@ impl EffectRegistry {
         if scope.phase != ScopePhase::Active || scope.supervisor != Some(sender) {
             return Err(RegistryError::NoSupervisor);
         }
-        if old_handle.scope != scope_key {
+        if old_handle.scope != scope_key || old_handle.domain != DomainKey::LEGACY {
             return Err(RegistryError::InvalidHandle);
         }
         let effect = old_handle.effect;
@@ -1437,7 +1769,7 @@ impl EffectRegistry {
             .effects
             .get(&effect)
             .ok_or(RegistryError::UnknownEffect)?;
-        if record.identity.scope != scope_key {
+        if record.identity.scope != scope_key || record.identity.domain != DomainKey::LEGACY {
             return Err(RegistryError::InvalidHandle);
         }
         let recovery = scope.recovery.as_ref().ok_or(RegistryError::NotAdoptable)?;
@@ -1452,6 +1784,10 @@ impl EffectRegistry {
             return Err(RegistryError::NotAdoptable);
         }
         let binding_epoch = scope.binding_epoch;
+        let next_revision = scope
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
         let nonce = self.take_nonce()?;
         let record = self.effects.get_mut(&effect).unwrap();
         record.identity.binding_epoch = binding_epoch;
@@ -1459,10 +1795,8 @@ impl EffectRegistry {
         let new_handle = record.handle();
         let scope = self.scopes.get_mut(&scope_key).unwrap();
         scope.recovery.as_mut().unwrap().unadopted.remove(&effect);
-        scope.revision = scope
-            .revision
-            .checked_add(1)
-            .ok_or(RegistryError::CounterOverflow)?;
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
         Ok(new_handle)
     }
 
@@ -1472,6 +1806,339 @@ impl EffectRegistry {
             .get(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
         Ok(scope
+            .recovery
+            .as_ref()
+            .map_or(0, |recovery| recovery.unadopted.len()))
+    }
+
+    pub(crate) fn crash_domain(
+        &mut self,
+        scope_key: ScopeKey,
+        domain: DomainKey,
+        sender: TaskKey,
+    ) -> Result<DomainCrashReceipt, RegistryError> {
+        if domain == DomainKey::LEGACY {
+            return Err(RegistryError::InvalidState);
+        }
+        let cohort = self
+            .production
+            .by_domain
+            .get(&(scope_key, domain))
+            .cloned()
+            .unwrap_or_default();
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        let binding = scope
+            .domains
+            .get(&domain)
+            .ok_or(RegistryError::UnknownDomain)?;
+        if binding.supervisor != Some(sender) || binding.fallback_running {
+            return Err(RegistryError::NoSupervisor);
+        }
+        let previous_binding_epoch = binding.binding_epoch;
+        let binding_epoch = previous_binding_epoch
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let root_revision = scope
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let domain_revision = binding
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        scope.revision = root_revision;
+        let binding = scope.domains.get_mut(&domain).unwrap();
+        binding.binding_epoch = binding_epoch;
+        binding.supervisor = None;
+        binding.fallback_running = true;
+        binding.revision = domain_revision;
+        binding.recovery = Some(DomainRecoveryState {
+            crash_revision: domain_revision,
+            cohort: cohort.clone(),
+            unadopted: cohort.clone(),
+            snapshot: None,
+            ready: None,
+        });
+        scope.invalidate_recovery_readiness();
+        Ok(DomainCrashReceipt {
+            scope: scope_key,
+            domain,
+            previous_binding_epoch,
+            binding_epoch,
+            cohort,
+        })
+    }
+
+    pub(crate) fn domain_recovery_snapshot(
+        &mut self,
+        scope_key: ScopeKey,
+        domain: DomainKey,
+        replacement: TaskKey,
+    ) -> Result<DomainRecoverySnapshot, RegistryError> {
+        validate_generation(replacement.generation)?;
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        let binding = scope
+            .domains
+            .get(&domain)
+            .ok_or(RegistryError::UnknownDomain)?;
+        if !binding.fallback_running || binding.supervisor.is_some() {
+            return Err(RegistryError::InvalidState);
+        }
+        let recovery = binding
+            .recovery
+            .as_ref()
+            .ok_or(RegistryError::InvalidState)?;
+        let mut effects = Vec::with_capacity(recovery.cohort.len());
+        for effect in &recovery.cohort {
+            let record = self
+                .effects
+                .get(effect)
+                .ok_or(RegistryError::UnknownEffect)?;
+            effects.push(RecoveryEffectSummary {
+                effect: *effect,
+                binding_epoch: record.identity.binding_epoch,
+                phase: record.phase,
+                descriptor_digest: record.descriptor.digest(),
+                commit_sequence: record.commit.as_ref().map(CommitReceipt::sequence),
+            });
+        }
+        let snapshot = DomainRecoverySnapshot {
+            scope: scope_key,
+            domain,
+            replacement,
+            authority_epoch: scope.authority_epoch,
+            binding_epoch: binding.binding_epoch,
+            root_revision: scope.revision,
+            domain_revision: binding.revision,
+            effects,
+        };
+        let recovery = self
+            .scopes
+            .get_mut(&scope_key)
+            .unwrap()
+            .domains
+            .get_mut(&domain)
+            .unwrap()
+            .recovery
+            .as_mut()
+            .unwrap();
+        recovery.snapshot = Some(snapshot.clone());
+        recovery.ready = None;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn domain_ready(
+        &mut self,
+        scope_key: ScopeKey,
+        domain: DomainKey,
+        replacement: TaskKey,
+        snapshot: &DomainRecoverySnapshot,
+    ) -> Result<(), RegistryError> {
+        let scope = self
+            .scopes
+            .get_mut(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        let binding = scope
+            .domains
+            .get_mut(&domain)
+            .ok_or(RegistryError::UnknownDomain)?;
+        if !binding.fallback_running || binding.supervisor.is_some() {
+            return Err(RegistryError::InvalidState);
+        }
+        let recovery = binding
+            .recovery
+            .as_mut()
+            .ok_or(RegistryError::InvalidState)?;
+        if recovery.snapshot.as_ref() != Some(snapshot)
+            || snapshot.scope != scope_key
+            || snapshot.domain != domain
+            || snapshot.replacement != replacement
+            || snapshot.root_revision != scope.revision
+            || snapshot.domain_revision != binding.revision
+            || recovery.crash_revision > snapshot.domain_revision
+        {
+            return Err(RegistryError::SnapshotChanged);
+        }
+        recovery.ready = Some(replacement);
+        Ok(())
+    }
+
+    pub(crate) fn rebind_domain(
+        &mut self,
+        scope_key: ScopeKey,
+        domain: DomainKey,
+        replacement: TaskKey,
+    ) -> Result<DomainRebindReceipt, RegistryError> {
+        let scope = self
+            .scopes
+            .get_mut(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        let binding = scope
+            .domains
+            .get_mut(&domain)
+            .ok_or(RegistryError::UnknownDomain)?;
+        if !binding.fallback_running
+            || binding.supervisor.is_some()
+            || binding
+                .recovery
+                .as_ref()
+                .and_then(|recovery| recovery.ready)
+                != Some(replacement)
+        {
+            return Err(RegistryError::RecoveryNotReady);
+        }
+        binding.supervisor = Some(replacement);
+        binding.fallback_running = false;
+        binding.recovery.as_mut().unwrap().ready = None;
+        Ok(DomainRebindReceipt {
+            scope: scope_key,
+            domain,
+            binding_epoch: binding.binding_epoch,
+            supervisor: replacement,
+        })
+    }
+
+    pub(crate) fn recover_next_domain(
+        &self,
+        scope_key: ScopeKey,
+        domain: DomainKey,
+        sender: TaskKey,
+    ) -> Result<Option<RecoveryItem>, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        let binding = scope
+            .domains
+            .get(&domain)
+            .ok_or(RegistryError::UnknownDomain)?;
+        if binding.supervisor != Some(sender) {
+            return Err(RegistryError::NoSupervisor);
+        }
+        let recovery = binding
+            .recovery
+            .as_ref()
+            .ok_or(RegistryError::InvalidState)?;
+        let Some(effect) = recovery.unadopted.first() else {
+            return Ok(None);
+        };
+        let record = self
+            .effects
+            .get(effect)
+            .ok_or(RegistryError::UnknownEffect)?;
+        Ok(Some(RecoveryItem {
+            handle: record.handle(),
+            descriptor: record.descriptor,
+            phase: record.phase,
+            commit: record.commit.clone(),
+        }))
+    }
+
+    pub(crate) fn adopt_domain(
+        &mut self,
+        scope_key: ScopeKey,
+        domain: DomainKey,
+        sender: TaskKey,
+        old_handle: PortalHandle,
+    ) -> Result<PortalHandle, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if old_handle.authority_epoch != scope.authority_epoch {
+            return Err(RegistryError::StaleAuthority);
+        }
+        if scope.phase != ScopePhase::Active
+            || old_handle.scope != scope_key
+            || old_handle.domain != domain
+        {
+            return Err(RegistryError::InvalidHandle);
+        }
+        let binding = scope
+            .domains
+            .get(&domain)
+            .ok_or(RegistryError::UnknownDomain)?;
+        if binding.supervisor != Some(sender) || binding.fallback_running {
+            return Err(RegistryError::NoSupervisor);
+        }
+        let effect = old_handle.effect;
+        let record = self
+            .effects
+            .get(&effect)
+            .ok_or(RegistryError::UnknownEffect)?;
+        if record.identity.scope != scope_key || record.identity.domain != domain {
+            return Err(RegistryError::InvalidHandle);
+        }
+        let recovery = binding
+            .recovery
+            .as_ref()
+            .ok_or(RegistryError::NotAdoptable)?;
+        if !recovery.unadopted.contains(&effect)
+            || record.phase.is_terminal()
+            || old_handle.binding_epoch >= binding.binding_epoch
+            || record.identity.binding_epoch != old_handle.binding_epoch
+            || record.nonce != old_handle.nonce
+        {
+            return Err(RegistryError::NotAdoptable);
+        }
+        let next_root_revision = scope
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_domain_revision = binding
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let binding_epoch = binding.binding_epoch;
+        let nonce = self.take_nonce()?;
+        let record = self.effects.get_mut(&effect).unwrap();
+        record.identity.binding_epoch = binding_epoch;
+        record.nonce = nonce;
+        let new_handle = record.handle();
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        scope.revision = next_root_revision;
+        let binding = scope.domains.get_mut(&domain).unwrap();
+        binding.revision = next_domain_revision;
+        binding.recovery.as_mut().unwrap().unadopted.remove(&effect);
+        scope.invalidate_recovery_readiness();
+        Ok(new_handle)
+    }
+
+    pub(crate) fn domain_recovery_remaining(
+        &self,
+        scope_key: ScopeKey,
+        domain: DomainKey,
+    ) -> Result<usize, RegistryError> {
+        Ok(self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?
+            .domains
+            .get(&domain)
+            .ok_or(RegistryError::UnknownDomain)?
             .recovery
             .as_ref()
             .map_or(0, |recovery| recovery.unadopted.len()))
@@ -1544,9 +2211,7 @@ impl EffectRegistry {
         let scope = self.scopes.get_mut(&scope_key).unwrap();
         scope.pending_publications = next_pending_publications;
         scope.revision = next_scope_revision;
-        if scope.fallback_running {
-            scope.recovery.as_mut().unwrap().ready = None;
-        }
+        scope.invalidate_recovery_readiness();
         Ok(())
     }
 
@@ -1601,6 +2266,11 @@ impl EffectRegistry {
         scope.phase = ScopePhase::Closing;
         scope.supervisor = None;
         scope.fallback_running = false;
+        for binding in scope.domains.values_mut() {
+            binding.supervisor = None;
+            binding.fallback_running = false;
+            binding.recovery = None;
+        }
         scope.revision = revision;
         scope.revoke = Some(RevokeState {
             sequence,
@@ -1641,7 +2311,8 @@ impl EffectRegistry {
         let (selected, next_calls, head_selections) = {
             let revoke = self.scopes[&selection.scope].revoke.as_ref().unwrap();
             let selected = revoke.selected_head.or_else(|| {
-                self.by_scope
+                self.production
+                    .leaves_by_scope
                     .get(&selection.scope)
                     .and_then(BTreeSet::first)
                     .copied()
@@ -1870,9 +2541,11 @@ impl EffectRegistry {
         if self.instance_id == 0 {
             return Err(RegistryError::Invariant("invalid Registry instance"));
         }
-        let mut expected_by_scope: BTreeMap<ScopeKey, BTreeSet<EffectKey>> = BTreeMap::new();
-        let mut expected_by_task: BTreeMap<TaskKey, BTreeSet<EffectKey>> = BTreeMap::new();
-        let mut expected_by_resource: BTreeMap<ResourceKey, BTreeSet<EffectKey>> = BTreeMap::new();
+        // Loom's modeled coroutine stack is intentionally small. Keep the
+        // independently reconstructed index oracle on the heap so adding
+        // production indexes does not turn a semantic check into stack-size
+        // dependent evidence.
+        let mut expected = Box::<ExpectedReverseIndexes>::default();
         let mut expected_credits: BTreeMap<ScopeKey, BTreeMap<CreditClass, (u64, u64)>> =
             BTreeMap::new();
         let mut expected_pending_publications = BTreeMap::<ScopeKey, usize>::new();
@@ -1882,6 +2555,91 @@ impl EffectRegistry {
         for (key, scope) in &self.scopes {
             if key != &scope.key || key.generation == 0 {
                 return Err(RegistryError::Invariant("scope identity mismatch"));
+            }
+            let legacy = scope
+                .domains
+                .get(&DomainKey::LEGACY)
+                .ok_or(RegistryError::Invariant("scope lacks legacy domain"))?;
+            if scope.binding_epoch != legacy.binding_epoch
+                || scope.supervisor != legacy.supervisor
+                || scope.fallback_running != legacy.fallback_running
+            {
+                return Err(RegistryError::Invariant(
+                    "legacy domain projection mismatch",
+                ));
+            }
+            for (domain, binding) in scope.domains.iter() {
+                if binding.binding_epoch == 0 {
+                    return Err(RegistryError::Invariant("invalid domain binding epoch"));
+                }
+                match scope.phase {
+                    ScopePhase::Active => {
+                        if binding.fallback_running == binding.supervisor.is_some() {
+                            return Err(RegistryError::Invariant("invalid active domain binding"));
+                        }
+                    }
+                    ScopePhase::Closing | ScopePhase::Revoked => {
+                        if binding.supervisor.is_some()
+                            || binding.fallback_running
+                            || binding.recovery.is_some()
+                        {
+                            return Err(RegistryError::Invariant("unfenced inactive domain"));
+                        }
+                    }
+                }
+                if let Some(recovery) = &binding.recovery {
+                    if scope.phase != ScopePhase::Active
+                        || recovery.crash_revision > binding.revision
+                        || !recovery.unadopted.is_subset(&recovery.cohort)
+                    {
+                        return Err(RegistryError::Invariant("invalid domain recovery state"));
+                    }
+                    for effect in &recovery.cohort {
+                        let record = self
+                            .effects
+                            .get(effect)
+                            .ok_or(RegistryError::Invariant("unknown domain recovery effect"))?;
+                        if record.identity.scope != *key
+                            || record.identity.domain != *domain
+                            || record.phase.is_terminal()
+                            || record.identity.binding_epoch > binding.binding_epoch
+                        {
+                            return Err(RegistryError::Invariant("invalid domain recovery cohort"));
+                        }
+                    }
+                    for effect in &recovery.unadopted {
+                        if self.effects[effect].identity.binding_epoch >= binding.binding_epoch {
+                            return Err(RegistryError::Invariant(
+                                "invalid unadopted domain effect",
+                            ));
+                        }
+                    }
+                    if let Some(snapshot) = &recovery.snapshot
+                        && (snapshot.scope != *key
+                            || snapshot.domain != *domain
+                            || snapshot.authority_epoch != scope.authority_epoch
+                            || snapshot.binding_epoch != binding.binding_epoch
+                            || snapshot.root_revision > scope.revision
+                            || snapshot.domain_revision > binding.revision)
+                    {
+                        return Err(RegistryError::Invariant(
+                            "domain recovery snapshot mismatch",
+                        ));
+                    }
+                    if let Some(ready) = recovery.ready
+                        && recovery.snapshot.as_ref().is_none_or(|snapshot| {
+                            snapshot.replacement != ready
+                                || snapshot.root_revision != scope.revision
+                                || snapshot.domain_revision != binding.revision
+                        })
+                    {
+                        return Err(RegistryError::Invariant("stale domain ready proof"));
+                    }
+                } else if binding.fallback_running && *domain != DomainKey::LEGACY {
+                    return Err(RegistryError::Invariant(
+                        "fallback domain lacks recovery state",
+                    ));
+                }
             }
             for balance in scope.credits.balances.values() {
                 if balance.free + balance.held + balance.committed != balance.capacity {
@@ -1973,6 +2731,7 @@ impl EffectRegistry {
                         .get(effect)
                         .ok_or(RegistryError::Invariant("unknown recovery effect"))?;
                     if record.identity.scope != *key
+                        || record.identity.domain != DomainKey::LEGACY
                         || record.phase.is_terminal()
                         || record.identity.binding_epoch >= scope.binding_epoch
                     {
@@ -1981,10 +2740,21 @@ impl EffectRegistry {
                 }
                 if recovery.cohort.iter().any(|effect| {
                     self.effects.get(effect).is_none_or(|record| {
-                        record.identity.scope != *key || record.phase.is_terminal()
+                        record.identity.scope != *key
+                            || record.identity.domain != DomainKey::LEGACY
+                            || record.phase.is_terminal()
                     })
                 }) {
                     return Err(RegistryError::Invariant("invalid recovery cohort effect"));
+                }
+                if let Some(ready) = recovery.ready
+                    && recovery.snapshot.as_ref().is_none_or(|snapshot| {
+                        snapshot.replacement != ready
+                            || snapshot.revision != scope.revision
+                            || snapshot.domain_revision != scope.domain_revision
+                    })
+                {
+                    return Err(RegistryError::Invariant("stale legacy ready proof"));
                 }
             }
         }
@@ -2010,8 +2780,28 @@ impl EffectRegistry {
                 .scopes
                 .get(&record.identity.scope)
                 .ok_or(RegistryError::Invariant("effect references unknown scope"))?;
-            if record.identity.binding_epoch > scope.binding_epoch {
+            let binding = scope
+                .domains
+                .get(&record.identity.domain)
+                .ok_or(RegistryError::Invariant("effect references unknown domain"))?;
+            if record.identity.origin_binding_epoch == 0
+                || record.identity.origin_binding_epoch > record.identity.binding_epoch
+                || record.identity.binding_epoch > binding.binding_epoch
+            {
                 return Err(RegistryError::Invariant("effect has future binding"));
+            }
+            if let Some(parent) = record.identity.parent {
+                let parent_record = self
+                    .effects
+                    .get(&parent)
+                    .ok_or(RegistryError::Invariant("effect references unknown parent"))?;
+                if parent.id >= key.id
+                    || parent_record.identity.scope != record.identity.scope
+                    || parent_record.identity.authority_epoch != record.identity.authority_epoch
+                    || (!record.phase.is_terminal() && parent_record.phase.is_terminal())
+                {
+                    return Err(RegistryError::Invariant("invalid effect ancestry"));
+                }
             }
             if !nonces.insert(record.nonce) {
                 return Err(RegistryError::Invariant("duplicate portal nonce"));
@@ -2128,16 +2918,31 @@ impl EffectRegistry {
             }
 
             if !record.phase.is_terminal() {
-                expected_by_scope
+                expected
+                    .by_scope
                     .entry(record.identity.scope)
                     .or_default()
                     .insert(*key);
-                expected_by_task
+                expected
+                    .by_domain
+                    .entry((record.identity.scope, record.identity.domain))
+                    .or_default()
+                    .insert(*key);
+                expected
+                    .by_task
                     .entry(record.identity.task)
                     .or_default()
                     .insert(*key);
+                if let Some(parent) = record.identity.parent {
+                    expected
+                        .children_by_parent
+                        .entry(parent)
+                        .or_default()
+                        .insert(*key);
+                }
                 for resource in &record.current_resources {
-                    expected_by_resource
+                    expected
+                        .by_resource
                         .entry(*resource)
                         .or_default()
                         .insert(*key);
@@ -2160,15 +2965,30 @@ impl EffectRegistry {
             }
         }
 
-        if self.by_scope != expected_by_scope
-            || self.by_task != expected_by_task
-            || self.by_resource != expected_by_resource
+        for (scope, effects) in &expected.by_scope {
+            for effect in effects {
+                if !expected.children_by_parent.contains_key(effect) {
+                    expected
+                        .leaves_by_scope
+                        .entry(*scope)
+                        .or_default()
+                        .insert(*effect);
+                }
+            }
+        }
+
+        if self.by_scope != expected.by_scope
+            || self.production.by_domain != expected.by_domain
+            || self.by_task != expected.by_task
+            || self.by_resource != expected.by_resource
+            || self.production.children_by_parent != expected.children_by_parent
+            || self.production.leaves_by_scope != expected.leaves_by_scope
         {
             return Err(RegistryError::Invariant("reverse index mismatch"));
         }
 
         for (scope_key, scope) in &self.scopes {
-            let expected_live = expected_by_scope.get(scope_key);
+            let expected_live = expected.by_scope.get(scope_key);
             let live_count = expected_live.map_or(0, BTreeSet::len);
             match scope.phase {
                 ScopePhase::Active => {
@@ -2189,6 +3009,12 @@ impl EffectRegistry {
                             != u64::try_from(revoke.target_count).ok()
                         || revoke.selected_head.is_some_and(|effect| {
                             expected_live.is_none_or(|live| !live.contains(&effect))
+                        })
+                        || revoke.selected_head.is_some_and(|effect| {
+                            expected
+                                .leaves_by_scope
+                                .get(scope_key)
+                                .is_none_or(|leaves| !leaves.contains(&effect))
                         })
                     {
                         return Err(RegistryError::Invariant("closing live target mismatch"));
@@ -2259,10 +3085,14 @@ impl EffectRegistry {
             .effects
             .get(&handle.effect)
             .ok_or(RegistryError::UnknownEffect)?;
-        if record.identity.scope != handle.scope {
+        if record.identity.scope != handle.scope || record.identity.domain != handle.domain {
             return Err(RegistryError::InvalidHandle);
         }
-        if handle.binding_epoch != scope.binding_epoch
+        let binding = scope
+            .domains
+            .get(&handle.domain)
+            .ok_or(RegistryError::UnknownDomain)?;
+        if handle.binding_epoch != binding.binding_epoch
             || record.identity.binding_epoch != handle.binding_epoch
         {
             return Err(RegistryError::StaleBinding);
@@ -2270,7 +3100,7 @@ impl EffectRegistry {
         if record.nonce != handle.nonce {
             return Err(RegistryError::InvalidHandle);
         }
-        if scope.supervisor != Some(sender) {
+        if binding.supervisor != Some(sender) || binding.fallback_running {
             return Err(RegistryError::NoSupervisor);
         }
         Ok(handle.effect)
@@ -2308,6 +3138,14 @@ impl EffectRegistry {
         };
         if phase.is_terminal() {
             return Err(RegistryError::AlreadyTerminal);
+        }
+        if self
+            .production
+            .children_by_parent
+            .get(&effect)
+            .is_some_and(|children| !children.is_empty())
+        {
+            return Err(RegistryError::LiveDescendants);
         }
         match request.outcome {
             TerminalOutcome::Aborted => {
@@ -2426,20 +3264,22 @@ impl EffectRegistry {
         if ticket.is_none() {
             record.credit_state = CreditState::Released;
         }
-        if let Some(recovery) = self
-            .scopes
-            .get_mut(&scope_key)
-            .and_then(|scope| scope.recovery.as_mut())
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        if let Some(recovery) = scope.recovery.as_mut() {
+            recovery.unadopted.remove(&effect);
+            recovery.cohort.remove(&effect);
+        }
+        if let Some(recovery) = scope
+            .domains
+            .get_mut(&identity.domain)
+            .and_then(|binding| binding.recovery.as_mut())
         {
             recovery.unadopted.remove(&effect);
             recovery.cohort.remove(&effect);
         }
-        let scope = self.scopes.get_mut(&scope_key).unwrap();
         scope.revision = next_scope_revision;
         scope.pending_publications = next_pending_publications;
-        if scope.fallback_running {
-            scope.recovery.as_mut().unwrap().ready = None;
-        }
+        scope.invalidate_recovery_readiness();
         if let (Some(terminalized), Some(removals)) =
             (next_terminalized, next_target_index_removals)
         {
@@ -2486,6 +3326,11 @@ impl EffectRegistry {
             .entry(identity.scope)
             .or_default()
             .insert(identity.effect);
+        self.production
+            .by_domain
+            .entry((identity.scope, identity.domain))
+            .or_default()
+            .insert(identity.effect);
         self.by_task
             .entry(identity.task)
             .or_default()
@@ -2504,6 +3349,29 @@ impl EffectRegistry {
                 .insert(identity.effect),
             "effect must be new to the closure candidate index"
         );
+        if let Some(parent) = identity.parent {
+            let children = self
+                .production
+                .children_by_parent
+                .entry(parent)
+                .or_default();
+            let was_leaf = children.is_empty();
+            assert!(
+                children.insert(identity.effect),
+                "derived effect must be new to its parent index"
+            );
+            if was_leaf {
+                remove_index_member(&mut self.production.leaves_by_scope, identity.scope, parent);
+            }
+        }
+        assert!(
+            self.production
+                .leaves_by_scope
+                .entry(identity.scope)
+                .or_default()
+                .insert(identity.effect),
+            "new effect must be a new live leaf"
+        );
     }
 
     fn remove_reverse_indexes(
@@ -2512,9 +3380,44 @@ impl EffectRegistry {
         current_resources: &BTreeSet<ResourceKey>,
     ) {
         remove_index_member(&mut self.by_scope, identity.scope, identity.effect);
+        remove_index_member(
+            &mut self.production.by_domain,
+            (identity.scope, identity.domain),
+            identity.effect,
+        );
         remove_index_member(&mut self.by_task, identity.task, identity.effect);
         for resource in current_resources {
             remove_index_member(&mut self.by_resource, *resource, identity.effect);
+        }
+        remove_index_member(
+            &mut self.production.leaves_by_scope,
+            identity.scope,
+            identity.effect,
+        );
+        if let Some(parent) = identity.parent {
+            remove_index_member(
+                &mut self.production.children_by_parent,
+                parent,
+                identity.effect,
+            );
+            if !self.production.children_by_parent.contains_key(&parent) {
+                let parent_record = self
+                    .effects
+                    .get(&parent)
+                    .expect("live child must reference a known parent");
+                assert!(
+                    !parent_record.phase.is_terminal(),
+                    "a live child cannot outlive its parent"
+                );
+                assert!(
+                    self.production
+                        .leaves_by_scope
+                        .entry(identity.scope)
+                        .or_default()
+                        .insert(parent),
+                    "parent must become a unique leaf after its last child closes"
+                );
+            }
         }
         let scope = self
             .scopes
@@ -2559,21 +3462,6 @@ impl EffectRegistry {
         }
     }
 
-    fn bump_scope_revision(&mut self, scope: ScopeKey) -> Result<(), RegistryError> {
-        let scope = self
-            .scopes
-            .get_mut(&scope)
-            .ok_or(RegistryError::UnknownScope)?;
-        scope.revision = scope
-            .revision
-            .checked_add(1)
-            .ok_or(RegistryError::CounterOverflow)?;
-        if scope.fallback_running {
-            scope.recovery.as_mut().unwrap().ready = None;
-        }
-        Ok(())
-    }
-
     fn take_effect_id(&mut self) -> Result<u64, RegistryError> {
         take_counter(&mut self.next_effect_id)
     }
@@ -2609,8 +3497,9 @@ fn validate_generation(generation: u64) -> Result<(), RegistryError> {
 
 /// Authenticates an explicit completion cause against the exact commit stored
 /// by this Registry. Cross-effect completion is allowed only inside one scope
-/// causal envelope. A source commit may precede target adoption, but it may
-/// never come from a future target binding or another authority epoch.
+/// causal envelope. Binding epochs are ordered only inside one independently
+/// restartable domain; cross-domain causality is fenced by the shared root
+/// authority epoch and authenticated source receipt instead.
 fn causal_commit_matches(
     registry_instance_id: u64,
     effects: &BTreeMap<EffectKey, EffectRecord>,
@@ -2620,12 +3509,13 @@ fn causal_commit_matches(
     if causal.registry_instance_id != registry_instance_id
         || causal.scope != target.scope
         || causal.authority_epoch != target.authority_epoch
-        || causal.binding_epoch > target.binding_epoch
     {
         return false;
     }
     effects.get(&causal.effect).is_some_and(|source| {
         source.identity.scope == target.scope
+            && (source.identity.domain != target.domain
+                || causal.binding_epoch <= target.binding_epoch)
             && source.commit.as_ref() == Some(causal)
             && matches!(
                 source.phase,
@@ -3777,6 +4667,72 @@ pub(crate) fn stage7b_causal_commit_self_test() {
 }
 
 fn stage7b_registry_refactor_self_test() {
+    // Public transition failures must not leave half-applied phase, counter,
+    // credit, or index state when the root revision cannot advance.
+    let atomic_scope = ScopeKey::new(0x7bf0, 1);
+    let atomic_task = TaskKey::new(0x7bf0, 1);
+    let atomic_credit = CreditClass::new(0x7bf0);
+    let mut atomic = EffectRegistry::new();
+    atomic
+        .create_scope(ScopeConfig {
+            key: atomic_scope,
+            authority_epoch: 1,
+            binding_epoch: 1,
+            supervisor: atomic_task,
+            credits: alloc::vec![CreditLimit::new(atomic_credit, 1)],
+        })
+        .unwrap();
+    let request = || RegisterRequest {
+        scope: atomic_scope,
+        task: atomic_task,
+        operation: OperationClass::new(0x7bf0),
+        descriptor: SyscallDescriptor::new(0x7bf0, [0; 6]),
+        resources: alloc::vec![ResourceKey::new(0x7bf0, 1, 1)],
+        credits: alloc::vec![CreditCharge::new(atomic_credit, 1)],
+        publication: PublicationMode::None,
+    };
+    atomic.scopes.get_mut(&atomic_scope).unwrap().revision = u64::MAX;
+    let before = atomic.clone();
+    assert_eq!(
+        atomic.register(request()),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(atomic, before);
+    atomic.scopes.get_mut(&atomic_scope).unwrap().revision = 0;
+    let registered = atomic.register(request()).unwrap();
+    atomic.scopes.get_mut(&atomic_scope).unwrap().revision = u64::MAX;
+    let before = atomic.clone();
+    assert_eq!(
+        atomic.prepare(atomic_task, registered.handle),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(atomic, before);
+    atomic.scopes.get_mut(&atomic_scope).unwrap().revision = 1;
+    atomic.prepare(atomic_task, registered.handle).unwrap();
+    atomic.scopes.get_mut(&atomic_scope).unwrap().revision = u64::MAX;
+    let before = atomic.clone();
+    assert_eq!(
+        atomic.crash(atomic_scope, atomic_task),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(atomic, before);
+    {
+        let scope = atomic.scopes.get_mut(&atomic_scope).unwrap();
+        scope.revision = 2;
+        scope.binding_epoch = u64::MAX;
+        scope
+            .domains
+            .get_mut(&DomainKey::LEGACY)
+            .unwrap()
+            .binding_epoch = u64::MAX;
+    }
+    let before = atomic.clone();
+    assert_eq!(
+        atomic.crash(atomic_scope, atomic_task),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(atomic, before);
+
     let config = Stage7bFixtureConfig { n: 8, k: 3, h: 2 };
     let fixture = Stage7bActiveFixture::new(config).unwrap();
     assert_eq!(fixture.target_projection().unwrap().live_effects, config.k);
@@ -4184,6 +5140,327 @@ fn stage7b_registry_refactor_self_test() {
     revoke_first.check_invariants().unwrap();
 }
 
+/// Pins the first registry-native production identity chain independently of
+/// the later runtime wiring.  These are real registry records with one shared
+/// credit ledger, distinct service bindings, and immutable effect ancestry;
+/// no synthetic cohort or side ledger is constructed for the assertion.
+pub(crate) fn production_identity_registry_self_test() {
+    const PERSONALITY_CREDIT: CreditClass = CreditClass::new(0x201);
+    const FILESYSTEM_CREDIT: CreditClass = CreditClass::new(0x202);
+    const BLOCK_CREDIT: CreditClass = CreditClass::new(0x203);
+    const UNRELATED_CREDIT: CreditClass = CreditClass::new(0x204);
+
+    const PERSONALITY_DOMAIN: DomainKey = DomainKey::new(1);
+    const FILESYSTEM_DOMAIN: DomainKey = DomainKey::new(2);
+    const BLOCK_DOMAIN: DomainKey = DomainKey::new(3);
+
+    let scope = ScopeKey::new(0x200, 1);
+    let legacy_supervisor = TaskKey::new(0x200, 1);
+    let personality_supervisor = TaskKey::new(0x201, 1);
+    let filesystem_v1 = TaskKey::new(0x202, 1);
+    let filesystem_v2 = TaskKey::new(0x202, 2);
+    let block_supervisor = TaskKey::new(0x203, 1);
+    let personality_task = TaskKey::new(0x211, 1);
+    let filesystem_task = TaskKey::new(0x212, 1);
+    let block_task = TaskKey::new(0x213, 1);
+    let personality_resource = ResourceKey::new(0x20, 1, 1);
+    let filesystem_resource = ResourceKey::new(0x20, 2, 1);
+    let block_resource = ResourceKey::new(0x20, 3, 1);
+
+    let unrelated_scope = ScopeKey::new(0x2ff, 1);
+    let unrelated_supervisor = TaskKey::new(0x2ff, 1);
+    let mut registry = EffectRegistry::new();
+    registry
+        .create_scope(ScopeConfig {
+            key: scope,
+            authority_epoch: 7,
+            binding_epoch: 1,
+            supervisor: legacy_supervisor,
+            credits: alloc::vec![
+                CreditLimit::new(PERSONALITY_CREDIT, 1),
+                CreditLimit::new(FILESYSTEM_CREDIT, 1),
+                CreditLimit::new(BLOCK_CREDIT, 1),
+            ],
+        })
+        .unwrap();
+    for config in [
+        DomainConfig {
+            key: PERSONALITY_DOMAIN,
+            binding_epoch: 1,
+            supervisor: personality_supervisor,
+        },
+        DomainConfig {
+            key: FILESYSTEM_DOMAIN,
+            binding_epoch: 1,
+            supervisor: filesystem_v1,
+        },
+        DomainConfig {
+            key: BLOCK_DOMAIN,
+            binding_epoch: 1,
+            supervisor: block_supervisor,
+        },
+    ] {
+        registry.add_domain(scope, config).unwrap();
+    }
+    registry
+        .create_scope(ScopeConfig {
+            key: unrelated_scope,
+            authority_epoch: 9,
+            binding_epoch: 1,
+            supervisor: unrelated_supervisor,
+            credits: alloc::vec![CreditLimit::new(UNRELATED_CREDIT, 1)],
+        })
+        .unwrap();
+    let unrelated = registry
+        .register(RegisterRequest {
+            scope: unrelated_scope,
+            task: unrelated_supervisor,
+            operation: OperationClass::new(0x2ff),
+            descriptor: SyscallDescriptor::new(0x2ff, [0; 6]),
+            resources: alloc::vec![ResourceKey::new(0x2f, 1, 1)],
+            credits: alloc::vec![CreditCharge::new(UNRELATED_CREDIT, 1)],
+            publication: PublicationMode::None,
+        })
+        .unwrap();
+
+    let personality = registry
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope,
+                task: personality_task,
+                operation: OperationClass::new(0x201),
+                descriptor: SyscallDescriptor::new(0, [17, 0, 0, 0, 0, 0]),
+                resources: alloc::vec![personality_resource],
+                credits: alloc::vec![CreditCharge::new(PERSONALITY_CREDIT, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: PERSONALITY_DOMAIN,
+            parent: None,
+        })
+        .unwrap();
+    let filesystem = registry
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope,
+                task: filesystem_task,
+                operation: OperationClass::new(0x202),
+                descriptor: SyscallDescriptor::new(17, [3, 0x1000, 4096, 0, 0, 0]),
+                resources: alloc::vec![filesystem_resource],
+                credits: alloc::vec![CreditCharge::new(FILESYSTEM_CREDIT, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: FILESYSTEM_DOMAIN,
+            parent: Some(personality.identity.effect()),
+        })
+        .unwrap();
+    let block = registry
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope,
+                task: block_task,
+                operation: OperationClass::new(0x203),
+                descriptor: SyscallDescriptor::new(0x203, [0, 8, 0x1000, 4096, 0, 0]),
+                resources: alloc::vec![block_resource],
+                credits: alloc::vec![CreditCharge::new(BLOCK_CREDIT, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: BLOCK_DOMAIN,
+            parent: Some(filesystem.identity.effect()),
+        })
+        .unwrap();
+
+    assert_eq!(personality.identity.scope(), scope);
+    assert_eq!(filesystem.identity.scope(), scope);
+    assert_eq!(block.identity.scope(), scope);
+    assert_eq!(personality.identity.domain(), PERSONALITY_DOMAIN);
+    assert_eq!(filesystem.identity.domain(), FILESYSTEM_DOMAIN);
+    assert_eq!(block.identity.domain(), BLOCK_DOMAIN);
+    assert_eq!(personality.identity.parent(), None);
+    assert_eq!(
+        filesystem.identity.parent(),
+        Some(personality.identity.effect())
+    );
+    assert_eq!(block.identity.parent(), Some(filesystem.identity.effect()));
+
+    registry
+        .prepare(personality_supervisor, personality.handle)
+        .unwrap();
+    registry.prepare(filesystem_v1, filesystem.handle).unwrap();
+    registry.prepare(block_supervisor, block.handle).unwrap();
+    registry.check_invariants().unwrap();
+
+    let before_adopt = registry.effect_view(filesystem.identity.effect()).unwrap();
+    let crash = registry
+        .crash_domain(scope, FILESYSTEM_DOMAIN, filesystem_v1)
+        .unwrap();
+    assert_eq!(crash.cohort, BTreeSet::from([filesystem.identity.effect()]));
+    let before_stale_parent = registry.clone();
+    assert_eq!(
+        registry.register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope,
+                task: block_task,
+                operation: OperationClass::new(0x204),
+                descriptor: SyscallDescriptor::new(0x204, [0; 6]),
+                resources: alloc::vec![ResourceKey::new(0x20, 4, 1)],
+                credits: alloc::vec![CreditCharge::new(BLOCK_CREDIT, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: BLOCK_DOMAIN,
+            parent: Some(filesystem.identity.effect()),
+        }),
+        Err(RegistryError::StaleBinding)
+    );
+    assert_eq!(registry, before_stale_parent);
+    assert_eq!(
+        registry
+            .domain_projection(scope, PERSONALITY_DOMAIN)
+            .unwrap()
+            .supervisor,
+        Some(personality_supervisor)
+    );
+    assert_eq!(
+        registry
+            .domain_projection(scope, BLOCK_DOMAIN)
+            .unwrap()
+            .supervisor,
+        Some(block_supervisor)
+    );
+    let snapshot = registry
+        .domain_recovery_snapshot(scope, FILESYSTEM_DOMAIN, filesystem_v2)
+        .unwrap();
+    assert_eq!(snapshot.effects.len(), 1);
+    assert_eq!(snapshot.effects[0].effect, filesystem.identity.effect());
+    registry
+        .domain_ready(scope, FILESYSTEM_DOMAIN, filesystem_v2, &snapshot)
+        .unwrap();
+    registry
+        .rebind_domain(scope, FILESYSTEM_DOMAIN, filesystem_v2)
+        .unwrap();
+    let recovery = registry
+        .recover_next_domain(scope, FILESYSTEM_DOMAIN, filesystem_v2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovery.handle.effect(), filesystem.identity.effect());
+    let filesystem_v2_handle = registry
+        .adopt_domain(scope, FILESYSTEM_DOMAIN, filesystem_v2, recovery.handle)
+        .unwrap();
+    assert_eq!(
+        registry.domain_recovery_remaining(scope, FILESYSTEM_DOMAIN),
+        Ok(0)
+    );
+    let after_adopt = registry.effect_view(filesystem.identity.effect()).unwrap();
+    assert_eq!(
+        after_adopt.identity.effect(),
+        before_adopt.identity.effect()
+    );
+    assert_eq!(after_adopt.identity.scope(), before_adopt.identity.scope());
+    assert_eq!(
+        after_adopt.identity.domain(),
+        before_adopt.identity.domain()
+    );
+    assert_eq!(
+        after_adopt.identity.parent(),
+        before_adopt.identity.parent()
+    );
+    assert_eq!(after_adopt.identity.task(), before_adopt.identity.task());
+    assert_eq!(
+        after_adopt.identity.operation(),
+        before_adopt.identity.operation()
+    );
+    assert_eq!(
+        after_adopt.identity.authority_epoch(),
+        before_adopt.identity.authority_epoch()
+    );
+    assert_eq!(
+        after_adopt.identity.origin_binding_epoch(),
+        before_adopt.identity.origin_binding_epoch()
+    );
+    assert_eq!(
+        after_adopt.identity.resources(),
+        before_adopt.identity.resources()
+    );
+    assert_eq!(
+        after_adopt.current_resources,
+        before_adopt.current_resources
+    );
+    assert_eq!(after_adopt.identity.binding_epoch(), 2);
+    assert_eq!(
+        registry.descriptor(filesystem_v2, filesystem.handle),
+        Err(RegistryError::StaleBinding)
+    );
+    registry
+        .descriptor(filesystem_v2, filesystem_v2_handle)
+        .unwrap();
+    registry
+        .descriptor(personality_supervisor, personality.handle)
+        .unwrap();
+    registry.descriptor(block_supervisor, block.handle).unwrap();
+    registry.check_invariants().unwrap();
+
+    let selection = registry.revoke_begin(scope).unwrap();
+    assert_eq!(selection.target_count, 3);
+    for domain in [PERSONALITY_DOMAIN, FILESYSTEM_DOMAIN, BLOCK_DOMAIN] {
+        let projection = registry.domain_projection(scope, domain).unwrap();
+        assert_eq!(projection.supervisor, None);
+        assert!(!projection.fallback_running);
+    }
+    let before_rejected_commits = registry.clone();
+    for (sender, handle) in [
+        (personality_supervisor, personality.handle),
+        (filesystem_v2, filesystem_v2_handle),
+        (block_supervisor, block.handle),
+    ] {
+        assert_eq!(
+            registry.commit(sender, handle, CommitMetadata::new(0, 0)),
+            Err(RegistryError::StaleAuthority)
+        );
+    }
+    assert_eq!(registry, before_rejected_commits);
+
+    for expected in [
+        block.identity.effect(),
+        filesystem.identity.effect(),
+        personality.identity.effect(),
+    ] {
+        let next = registry.revoke_next(&selection).unwrap().unwrap();
+        assert_eq!(next.effect, expected);
+        assert_eq!(next.disposition, RevokeDisposition::Abort);
+        let terminal = registry
+            .stage_revoke_terminal(&selection, expected, TerminalRequest::aborted(-125))
+            .unwrap();
+        assert_eq!(terminal.receipt.effect(), expected);
+        assert!(terminal.publication.is_none());
+    }
+    assert!(registry.revoke_next(&selection).unwrap().is_none());
+    registry.revoke_complete(&selection).unwrap();
+    let target = registry.scope_projection(scope).unwrap();
+    assert_eq!(target.phase, ScopePhase::Revoked);
+    assert_eq!(target.credits.capacity, 3);
+    assert_eq!(target.credits.free, 3);
+    assert_eq!(target.credits.held, 0);
+    assert_eq!(target.credits.committed, 0);
+    let work = registry.revoke_work_projection(&selection).unwrap();
+    assert_eq!(work.target_count, 3);
+    assert_eq!(work.terminalized, 3);
+    assert_eq!(work.target_index_removals, 3);
+    assert_eq!(work.unrelated_effect_visits, 0);
+    assert_eq!(work.history_effect_visits, 0);
+    assert_eq!(registry.effects_for_scope(unrelated_scope).len(), 1);
+
+    registry
+        .stage_terminal(
+            unrelated_supervisor,
+            unrelated.handle,
+            TerminalRequest::aborted(-125),
+        )
+        .unwrap();
+    let unrelated_projection = registry.scope_projection(unrelated_scope).unwrap();
+    assert_eq!(unrelated_projection.credits.free, 1);
+    assert_eq!(unrelated_projection.credits.held, 0);
+    registry.check_invariants().unwrap();
+}
+
 /// Exercises the staged registry without changing the kernel's current run
 /// sequence.  A later OSTD runner can call this and print the returned receipt.
 pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
@@ -4192,6 +5469,7 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
 
     bounded_kernel_completion_during_recovery_self_test();
     stage7b_registry_refactor_self_test();
+    production_identity_registry_self_test();
 
     let scope = ScopeKey::new(50, 1);
     let v1 = TaskKey::new(600, 1);
