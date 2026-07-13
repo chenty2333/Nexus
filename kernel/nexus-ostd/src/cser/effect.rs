@@ -43,7 +43,7 @@ impl EffectWaiter {
                 token,
                 inner: waker,
                 wake_gate: SpinLock::new(
-                    OneShotGate::new(token.effect_id, token.authority_epoch)
+                    OneShotGate::new(token.scope_id, token.effect_id, token.authority_epoch)
                         .expect("effect continuation identity must be nonzero"),
                 ),
             },
@@ -72,8 +72,11 @@ impl EffectWaker {
         let published = self.inner.wake_up();
         if published {
             let token = gate.token();
-            gate.try_terminalize(token, WakeOutcome::Published)
+            let receipt = gate
+                .try_terminalize(token, WakeOutcome::Published)
                 .expect("the checked effect continuation has exactly one winner");
+            gate.consume_terminal(&receipt)
+                .expect("the publishing effect waker owns its terminal receipt");
         }
         published
     }

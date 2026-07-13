@@ -83,6 +83,8 @@ fn kernel_main() {
     println!(
         "VIRTIO_CSER BEGIN device=blk mode=polling irq_masked=true smp=not_proven hardware=QEMU"
     );
+    let namespace_isolation = portal::assert_session_namespace_isolation();
+    println!("{}", namespace_isolation.into_marker());
 
     let (mut root, device_function, memory_bars) = pci::discover_and_own_bars();
     println!(
@@ -90,7 +92,7 @@ fn kernel_main() {
         device_function, memory_bars
     );
 
-    let mut portal = Portal::new();
+    let mut portal = Portal::new(device_function);
     let first_binding = portal.binding_token().expect("initial live binding");
     let effects_before = portal.effect_count();
     let next_request_before = portal.next_request_id();
@@ -111,13 +113,15 @@ fn kernel_main() {
         .expect("register readonly sector-0 effect");
     println!(
         "IO Register request={} authority_epoch={} binding_epoch={} device_generation={} operation=read_sector0",
-        first_authority.request_id,
-        first_authority.authority_epoch,
-        first_authority.binding_epoch,
-        first_authority.device_generation
+        first_authority.request_id(),
+        first_authority.authority_epoch(),
+        first_authority.binding_epoch(),
+        first_authority.device_generation()
     );
 
-    let mut first = portal::Session::open(&mut root, device_function, first_authority);
+    let mut first = portal
+        .open_session(&mut root, first_authority)
+        .expect("authority instance matches the owned PCI function and queue");
     println!(
         "FEATURES offered_required=true negotiated=0x0000000300000020 ro=true version1=true access_platform=true indirect=false event_idx=false"
     );
@@ -127,11 +131,11 @@ fn kernel_main() {
         OwnerKind::QueueDevice,
         OwnerKind::Request,
     ] {
-        let (paddr, iova) = dma::owner_address(first_authority.device_generation, kind);
+        let (paddr, iova) = dma::owner_address(first_authority.device_generation(), kind);
         assert_ne!(paddr, iova);
         println!(
             "DMA Owner generation={} kind={} paddr={:#x} iova={:#x} remapped=true",
-            first_authority.device_generation,
+            first_authority.device_generation(),
             kind.label(),
             paddr,
             iova
@@ -144,11 +148,12 @@ fn kernel_main() {
     assert!(!first.notify_sent());
     println!(
         "IO Commit request={} token={} point=avail_idx_release notify_sent=false published=true",
-        first_authority.request_id, first_token
+        first_authority.request_id(),
+        first_token
     );
     println!(
         "IO Notify request={} one_shot=true notify_sent=false action=kick",
-        first_authority.request_id
+        first_authority.request_id()
     );
     assert!(portal.notify_effect(first_authority, &mut first));
     assert!(first.notify_sent());
@@ -164,7 +169,9 @@ fn kernel_main() {
     );
     println!(
         "IO Completion request={} generation={} used_len={} status=OK duplicate_call_rejected=true",
-        first_authority.request_id, first_authority.device_generation, used_len
+        first_authority.request_id(),
+        first_authority.device_generation(),
+        used_len
     );
     println!(
         "IO Read magic_ok=true zero_tail=true fnv1a={:#018x}",
@@ -172,13 +179,13 @@ fn kernel_main() {
     );
     println!(
         "IO Terminal request={} state={}",
-        first_authority.request_id,
+        first_authority.request_id(),
         terminal_label(Terminal::Completed)
     );
 
     println!(
         "REVOKE Begin generation={} submission_gate=closed reset_required=true",
-        first_authority.device_generation
+        first_authority.device_generation()
     );
     let prepared_authority = portal
         .register(first_binding, Operation::ReadSector0)
@@ -204,7 +211,7 @@ fn kernel_main() {
     );
     println!(
         "REVOKE Gate request={} state=AbortedBeforeCommit stale_publish_rejected=true register_while_closing_rejected=true",
-        prepared_authority.request_id
+        prepared_authority.request_id()
     );
     let first_reset = portal.submit_reset(first, true);
     assert_eq!(first_reset.retained_dma_pages(), 3);
@@ -214,7 +221,7 @@ fn kernel_main() {
     };
     println!(
         "RESET Pending generation={} timeout_injected=true hardware_timeout=false retained=true",
-        first_authority.device_generation
+        first_authority.device_generation()
     );
     println!(
         "REVOKE Result=TimedOut tombstone=true retained_dma_pages={} owners_retained=true",
@@ -230,12 +237,12 @@ fn kernel_main() {
     assert_eq!(portal.terminal(first_authority), Some(Terminal::Completed));
     println!(
         "RESET Retry generation={} ack=true bus_master=false isr_read=true terminal={} receipt_bound=true",
-        first_ack.authority().device_generation,
+        first_ack.authority().device_generation(),
         terminal_label(first_ack.terminal())
     );
     println!(
         "RESET Fence old_generation={} new_generation={} unterminated_effects=0",
-        first_authority.device_generation,
+        first_authority.device_generation(),
         portal.device_generation()
     );
 
@@ -243,7 +250,7 @@ fn kernel_main() {
     assert_eq!(iotlb_tombstone.retained_pages(), 3);
     println!(
         "IOTLB Pending generation={} owner={} timeout_injected=true hardware_timeout=false retained_dma_pages={} tombstone=true",
-        first_authority.device_generation,
+        first_authority.device_generation(),
         iotlb_tombstone.pending_kind().label(),
         iotlb_tombstone.retained_pages()
     );
@@ -256,7 +263,7 @@ fn kernel_main() {
     );
     println!(
         "REVOKE Quiesced generation={} retained_dma_pages=0 dma_pages_released=3",
-        first_authority.device_generation
+        first_authority.device_generation()
     );
 
     let old_completion = first_authority;
@@ -275,16 +282,18 @@ fn kernel_main() {
         .expect("register generation-2 sector-0 effect");
     println!(
         "IO Register request={} authority_epoch={} binding_epoch={} device_generation={} operation=read_sector0",
-        second_authority.request_id,
-        second_authority.authority_epoch,
-        second_authority.binding_epoch,
-        second_authority.device_generation
+        second_authority.request_id(),
+        second_authority.authority_epoch(),
+        second_authority.binding_epoch(),
+        second_authority.device_generation()
     );
     println!(
         "DEVICE Reenable generation={} after_quiescence=true",
-        second_authority.device_generation
+        second_authority.device_generation()
     );
-    let mut second = portal::Session::open(&mut root, device_function, second_authority);
+    let mut second = portal
+        .open_session(&mut root, second_authority)
+        .expect("rebound authority instance matches the owned PCI function and queue");
     let second_token = portal
         .commit_session(second_authority, &mut second)
         .expect("replacement binding wins the commit gate");
@@ -292,12 +301,13 @@ fn kernel_main() {
     assert!(!second.notify_sent());
     println!(
         "IO Commit request={} token={} point=avail_idx_release notify_sent=false published=true",
-        second_authority.request_id, second_token
+        second_authority.request_id(),
+        second_token
     );
 
     let (old_binding, new_binding) = portal.crash_service();
     second.close_after_service_crash(new_binding);
-    assert_eq!(old_binding, second_authority.binding_epoch);
+    assert_eq!(old_binding, second_authority.binding_epoch());
     assert_eq!(
         portal.register(second_binding, Operation::ReadSector0),
         Err(RegisterError::StaleBinding)
@@ -308,12 +318,14 @@ fn kernel_main() {
     assert!(!second.notify_sent());
     println!(
         "IO Crash request={} old_binding={} new_binding={} service_action_rejected=true committed_completion_raceable=true notify_sent=false late_notify_rejected=true",
-        second_authority.request_id, old_binding, new_binding
+        second_authority.request_id(),
+        old_binding,
+        new_binding
     );
 
     println!(
         "RESET Begin generation={} published=true notified=false whole_device=true",
-        second_authority.device_generation
+        second_authority.device_generation()
     );
     assert_eq!(portal.begin_closing(), 0);
     let mut second_ack = retry_reset(portal.submit_reset(second, false), &mut root);
@@ -328,17 +340,17 @@ fn kernel_main() {
     assert!(!portal.complete_device(second_authority));
     println!(
         "RESET Ack generation={} ack=true bus_master=false isr_read=true terminal={} receipt_bound=true",
-        second_ack.authority().device_generation,
+        second_ack.authority().device_generation(),
         terminal_label(second_ack.terminal())
     );
     println!(
         "RESET Fence old_generation={} new_generation={} terminalized_effects=1 stale_completion_rejected=true",
-        second_authority.device_generation,
+        second_authority.device_generation(),
         portal.device_generation()
     );
     println!(
         "IO Terminal request={} state={} cancelled=false duplicate_terminal_call_rejected=true",
-        second_authority.request_id,
+        second_authority.request_id(),
         terminal_label(second_ack.terminal())
     );
 

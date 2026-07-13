@@ -2,10 +2,15 @@
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoBinding {
+    instance_id: u64,
     epoch: u64,
 }
 
 impl IoBinding {
+    pub const fn instance_id(self) -> u64 {
+        self.instance_id
+    }
+
     pub const fn epoch(self) -> u64 {
         self.epoch
     }
@@ -13,10 +18,33 @@ impl IoBinding {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoIdentity {
-    pub request_id: u64,
-    pub authority_epoch: u64,
-    pub binding_epoch: u64,
-    pub device_generation: u64,
+    instance_id: u64,
+    request_id: u64,
+    authority_epoch: u64,
+    binding_epoch: u64,
+    device_generation: u64,
+}
+
+impl IoIdentity {
+    pub const fn instance_id(self) -> u64 {
+        self.instance_id
+    }
+
+    pub const fn request_id(self) -> u64 {
+        self.request_id
+    }
+
+    pub const fn authority_epoch(self) -> u64 {
+        self.authority_epoch
+    }
+
+    pub const fn binding_epoch(self) -> u64 {
+        self.binding_epoch
+    }
+
+    pub const fn device_generation(self) -> u64 {
+        self.device_generation
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,18 +108,64 @@ pub struct IoTerminalReceipt {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoCrashReceipt {
-    pub previous_binding_epoch: u64,
-    pub binding_epoch: u64,
+    instance_id: u64,
+    previous_binding_epoch: u64,
+    binding_epoch: u64,
+}
+
+impl IoCrashReceipt {
+    pub const fn instance_id(self) -> u64 {
+        self.instance_id
+    }
+
+    pub const fn previous_binding_epoch(self) -> u64 {
+        self.previous_binding_epoch
+    }
+
+    pub const fn binding_epoch(self) -> u64 {
+        self.binding_epoch
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CloseReceipt {
+    instance_id: u64,
     authority_epoch: u64,
     device_generation: u64,
     aborted: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalQuiescenceReceipt {
+    instance_id: u64,
+    authority_epoch: u64,
+    device_generation: u64,
+    terminalized: usize,
+}
+
+impl TerminalQuiescenceReceipt {
+    pub const fn instance_id(self) -> u64 {
+        self.instance_id
+    }
+
+    pub const fn authority_epoch(self) -> u64 {
+        self.authority_epoch
+    }
+
+    pub const fn device_generation(self) -> u64 {
+        self.device_generation
+    }
+
+    pub const fn terminalized(self) -> usize {
+        self.terminalized
+    }
+}
+
 impl CloseReceipt {
+    pub const fn instance_id(self) -> u64 {
+        self.instance_id
+    }
+
     pub const fn authority_epoch(self) -> u64 {
         self.authority_epoch
     }
@@ -107,6 +181,7 @@ impl CloseReceipt {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResetOutcome {
+    instance_id: u64,
     closed_generation: u64,
     device_generation: u64,
     terminalized: usize,
@@ -114,6 +189,10 @@ pub struct ResetOutcome {
 }
 
 impl ResetOutcome {
+    pub const fn instance_id(self) -> u64 {
+        self.instance_id
+    }
+
     pub const fn closed_generation(self) -> u64 {
         self.closed_generation
     }
@@ -125,6 +204,10 @@ impl ResetOutcome {
     pub const fn terminalized(self) -> usize {
         self.terminalized
     }
+
+    pub const fn nonce(self) -> u64 {
+        self.nonce
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -135,17 +218,27 @@ pub enum IoCommitError<E> {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ResetAttempt {
+    instance_id: u64,
     generation: u64,
     nonce: u64,
 }
 
 impl ResetAttempt {
+    pub const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     pub const fn generation(&self) -> u64 {
         self.generation
     }
 
+    pub const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
     pub fn retain(self) -> ResetTombstone {
         ResetTombstone {
+            instance_id: self.instance_id,
             generation: self.generation,
             nonce: self.nonce,
         }
@@ -153,6 +246,7 @@ impl ResetAttempt {
 
     pub fn acknowledge(self) -> ResetReceipt {
         ResetReceipt {
+            instance_id: self.instance_id,
             generation: self.generation,
             nonce: self.nonce,
         }
@@ -161,17 +255,27 @@ impl ResetAttempt {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ResetTombstone {
+    instance_id: u64,
     generation: u64,
     nonce: u64,
 }
 
 impl ResetTombstone {
+    pub const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     pub const fn generation(&self) -> u64 {
         self.generation
     }
 
+    pub const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
     pub fn retry(self) -> ResetAttempt {
         ResetAttempt {
+            instance_id: self.instance_id,
             generation: self.generation,
             nonce: self.nonce,
         }
@@ -180,20 +284,44 @@ impl ResetTombstone {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ResetReceipt {
+    instance_id: u64,
     generation: u64,
     nonce: u64,
 }
 
+impl ResetReceipt {
+    pub const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QuiescenceReceipt {
+    instance_id: u64,
     generation: u64,
     nonce: u64,
     completed: usize,
 }
 
 impl QuiescenceReceipt {
+    pub const fn instance_id(self) -> u64 {
+        self.instance_id
+    }
+
     pub const fn generation(self) -> u64 {
         self.generation
+    }
+
+    pub const fn nonce(self) -> u64 {
+        self.nonce
     }
 
     pub const fn completed(self) -> usize {
@@ -203,14 +331,23 @@ impl QuiescenceReceipt {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct IotlbAttempt<const OWNERS: usize> {
+    instance_id: u64,
     generation: u64,
     nonce: u64,
     completed: [bool; OWNERS],
 }
 
 impl<const OWNERS: usize> IotlbAttempt<OWNERS> {
+    pub const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub const fn nonce(&self) -> u64 {
+        self.nonce
     }
 
     pub fn owner_complete(mut self, owner: usize) -> Result<IotlbProgress<OWNERS>, IoError> {
@@ -224,6 +361,7 @@ impl<const OWNERS: usize> IotlbAttempt<OWNERS> {
         let count = self.completed.iter().filter(|done| **done).count();
         if count == OWNERS {
             Ok(IotlbProgress::Complete(QuiescenceReceipt {
+                instance_id: self.instance_id,
                 generation: self.generation,
                 nonce: self.nonce,
                 completed: count,
@@ -235,6 +373,7 @@ impl<const OWNERS: usize> IotlbAttempt<OWNERS> {
 
     pub fn retain(self) -> IotlbTombstone<OWNERS> {
         IotlbTombstone {
+            instance_id: self.instance_id,
             generation: self.generation,
             nonce: self.nonce,
             completed: self.completed,
@@ -244,18 +383,28 @@ impl<const OWNERS: usize> IotlbAttempt<OWNERS> {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct IotlbTombstone<const OWNERS: usize> {
+    instance_id: u64,
     generation: u64,
     nonce: u64,
     completed: [bool; OWNERS],
 }
 
 impl<const OWNERS: usize> IotlbTombstone<OWNERS> {
+    pub const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     pub const fn generation(&self) -> u64 {
         self.generation
     }
 
+    pub const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
     pub fn retry(self) -> IotlbAttempt<OWNERS> {
         IotlbAttempt {
+            instance_id: self.instance_id,
             generation: self.generation,
             nonce: self.nonce,
             completed: self.completed,
@@ -279,6 +428,7 @@ struct IoEffect {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoProjection {
+    pub instance_id: u64,
     pub authority_epoch: u64,
     pub binding_epoch: u64,
     pub device_generation: u64,
@@ -290,9 +440,32 @@ pub struct IoProjection {
     pub iotlb_pending: bool,
 }
 
-/// Publication/reset/IOTLB semantic ledger. Queue and DMA payloads stay outside.
+/// Exact, read-only gate state for failure-atomicity checks.
+///
+/// Unlike `IoGate`, this projection carries no methods that can consume typed
+/// authorities or receipts. Copying it cannot create a second live gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoStateProjection<const EFFECTS: usize> {
+    instance_id: u64,
+    authority_epoch: u64,
+    binding_epoch: u64,
+    device_generation: u64,
+    next_request_id: u64,
+    next_commit_sequence: u64,
+    next_reset_nonce: u64,
+    next_iotlb_nonce: u64,
+    phase: IoPhase,
+    effects: [Option<IoEffect>; EFFECTS],
+    authority_advanced_for_rebind: bool,
+    binding_advanced_for_rebind: bool,
+    active_reset_nonce: Option<u64>,
+    active_iotlb_nonce: Option<u64>,
+}
+
+/// Publication/reset/IOTLB semantic ledger. Queue and DMA payloads stay outside.
+#[derive(Debug, Eq, PartialEq)]
 pub struct IoGate<const EFFECTS: usize> {
+    instance_id: u64,
     authority_epoch: u64,
     binding_epoch: u64,
     device_generation: u64,
@@ -309,11 +482,18 @@ pub struct IoGate<const EFFECTS: usize> {
 }
 
 impl<const EFFECTS: usize> IoGate<EFFECTS> {
-    pub fn new() -> Result<Self, IoError> {
-        if EFFECTS == 0 {
+    /// Creates one gate in a caller-allocated, stable instance namespace.
+    ///
+    /// `instance_id` is not a secret; callers must keep it non-zero and unique
+    /// among gate/device instances whose typed authorities or receipts could
+    /// meet. This prevents equal local epochs and nonces from aliasing across
+    /// independent gates.
+    pub fn new(instance_id: u64) -> Result<Self, IoError> {
+        if EFFECTS == 0 || instance_id == 0 {
             return Err(IoError::InvalidConfiguration);
         }
         Ok(Self {
+            instance_id,
             authority_epoch: 1,
             binding_epoch: 1,
             device_generation: 1,
@@ -332,6 +512,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
 
     pub fn projection(&self) -> IoProjection {
         IoProjection {
+            instance_id: self.instance_id,
             authority_epoch: self.authority_epoch,
             binding_epoch: self.binding_epoch,
             device_generation: self.device_generation,
@@ -354,13 +535,37 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
         }
     }
 
+    pub fn state_projection(&self) -> IoStateProjection<EFFECTS> {
+        IoStateProjection {
+            instance_id: self.instance_id,
+            authority_epoch: self.authority_epoch,
+            binding_epoch: self.binding_epoch,
+            device_generation: self.device_generation,
+            next_request_id: self.next_request_id,
+            next_commit_sequence: self.next_commit_sequence,
+            next_reset_nonce: self.next_reset_nonce,
+            next_iotlb_nonce: self.next_iotlb_nonce,
+            phase: self.phase,
+            effects: self.effects,
+            authority_advanced_for_rebind: self.authority_advanced_for_rebind,
+            binding_advanced_for_rebind: self.binding_advanced_for_rebind,
+            active_reset_nonce: self.active_reset_nonce,
+            active_iotlb_nonce: self.active_iotlb_nonce,
+        }
+    }
+
     pub const fn next_request_id(&self) -> u64 {
         self.next_request_id
+    }
+
+    pub const fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     pub fn binding_token(&self) -> Result<IoBinding, IoError> {
         match self.phase {
             IoPhase::Active => Ok(IoBinding {
+                instance_id: self.instance_id,
                 epoch: self.binding_epoch,
             }),
             IoPhase::ServiceUnavailable | IoPhase::Quiesced => Err(IoError::ServiceUnavailable),
@@ -369,6 +574,9 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
     }
 
     pub fn register(&mut self, binding: IoBinding) -> Result<IoIdentity, IoError> {
+        if binding.instance_id != self.instance_id {
+            return Err(IoError::InvalidReceipt);
+        }
         if binding.epoch != self.binding_epoch {
             return Err(IoError::StaleBinding);
         }
@@ -381,6 +589,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
         let request_id = self.next_request_id;
         let next_request_id = request_id.checked_add(1).ok_or(IoError::CounterOverflow)?;
         let identity = IoIdentity {
+            instance_id: self.instance_id,
             request_id,
             authority_epoch: self.authority_epoch,
             binding_epoch: self.binding_epoch,
@@ -447,7 +656,23 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
         Ok(())
     }
 
+    pub fn can_complete_device(&self, identity: IoIdentity) -> bool {
+        self.validate_device_completion(identity).is_ok()
+    }
+
     pub fn complete_device(&mut self, identity: IoIdentity) -> Result<IoTerminalReceipt, IoError> {
+        self.validate_device_completion(identity)?;
+        self.effect_mut(identity).unwrap().terminal = Some(IoTerminal::Completed);
+        Ok(IoTerminalReceipt {
+            identity,
+            terminal: IoTerminal::Completed,
+        })
+    }
+
+    fn validate_device_completion(&self, identity: IoIdentity) -> Result<(), IoError> {
+        if identity.instance_id != self.instance_id {
+            return Err(IoError::InvalidReceipt);
+        }
         if identity.device_generation != self.device_generation {
             return Err(IoError::StaleDeviceGeneration);
         }
@@ -458,11 +683,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
         if effect.terminal.is_some() {
             return Err(IoError::AlreadyTerminal);
         }
-        self.effect_mut(identity).unwrap().terminal = Some(IoTerminal::Completed);
-        Ok(IoTerminalReceipt {
-            identity,
-            terminal: IoTerminal::Completed,
-        })
+        Ok(())
     }
 
     pub fn crash_service(&mut self) -> Result<IoCrashReceipt, IoError> {
@@ -472,6 +693,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
             .checked_add(1)
             .ok_or(IoError::CounterOverflow)?;
         let receipt = IoCrashReceipt {
+            instance_id: self.instance_id,
             previous_binding_epoch: self.binding_epoch,
             binding_epoch,
         };
@@ -503,6 +725,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
         self.authority_advanced_for_rebind = true;
         self.phase = IoPhase::Closing;
         Ok(CloseReceipt {
+            instance_id: self.instance_id,
             authority_epoch,
             device_generation: self.device_generation,
             aborted,
@@ -511,6 +734,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
 
     pub fn begin_reset(&mut self, close: CloseReceipt) -> Result<ResetAttempt, IoError> {
         if self.phase != IoPhase::Closing
+            || close.instance_id != self.instance_id
             || close.authority_epoch != self.authority_epoch
             || close.device_generation != self.device_generation
             || self.active_reset_nonce.is_some()
@@ -522,13 +746,52 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
         self.next_reset_nonce = next_nonce;
         self.active_reset_nonce = Some(nonce);
         Ok(ResetAttempt {
+            instance_id: self.instance_id,
             generation: self.device_generation,
             nonce,
         })
     }
 
+    /// Closes a cohort without reset only when every request already carries a
+    /// decisive production terminal. Uncommitted requests are fenced by the
+    /// close receipt; committed requests require a device-completion receipt.
+    pub fn mark_terminal_quiesced(
+        &mut self,
+        close: CloseReceipt,
+    ) -> Result<TerminalQuiescenceReceipt, IoError> {
+        if self.phase != IoPhase::Closing
+            || close.instance_id != self.instance_id
+            || close.authority_epoch != self.authority_epoch
+            || close.device_generation != self.device_generation
+            || self.active_reset_nonce.is_some()
+            || self.active_iotlb_nonce.is_some()
+        {
+            return Err(IoError::InvalidReceipt);
+        }
+        let terminalized = self.effects.iter().flatten().count();
+        for effect in self.effects.iter().flatten() {
+            match (effect.committed, effect.terminal) {
+                (false, Some(IoTerminal::AbortedBeforeCommit))
+                | (true, Some(IoTerminal::Completed)) => {}
+                (true, Some(IoTerminal::IndeterminateAfterReset)) => {
+                    return Err(IoError::IotlbRequired);
+                }
+                _ => return Err(IoError::ResetRequired),
+            }
+        }
+        let receipt = TerminalQuiescenceReceipt {
+            instance_id: self.instance_id,
+            authority_epoch: self.authority_epoch,
+            device_generation: self.device_generation,
+            terminalized,
+        };
+        self.phase = IoPhase::Quiesced;
+        Ok(receipt)
+    }
+
     pub fn apply_reset(&mut self, receipt: ResetReceipt) -> Result<ResetOutcome, IoError> {
         if self.phase != IoPhase::Closing
+            || receipt.instance_id != self.instance_id
             || receipt.generation != self.device_generation
             || self.active_reset_nonce != Some(receipt.nonce)
         {
@@ -551,6 +814,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
         self.device_generation = device_generation;
         self.active_reset_nonce = None;
         Ok(ResetOutcome {
+            instance_id: self.instance_id,
             closed_generation: receipt.generation,
             device_generation,
             terminalized,
@@ -564,6 +828,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
     ) -> Result<IotlbAttempt<OWNERS>, IoError> {
         if OWNERS == 0
             || self.phase != IoPhase::Closing
+            || reset.instance_id != self.instance_id
             || reset.device_generation != self.device_generation
             || reset.closed_generation.checked_add(1) != Some(reset.device_generation)
             || self.active_iotlb_nonce.is_some()
@@ -575,6 +840,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
         self.next_iotlb_nonce = next_nonce;
         self.active_iotlb_nonce = Some(nonce);
         Ok(IotlbAttempt {
+            instance_id: self.instance_id,
             generation: reset.closed_generation,
             nonce,
             completed: [false; OWNERS],
@@ -583,6 +849,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
 
     pub fn mark_quiesced(&mut self, receipt: QuiescenceReceipt) -> Result<(), IoError> {
         if self.phase != IoPhase::Closing
+            || receipt.instance_id != self.instance_id
             || self.active_reset_nonce.is_some()
             || self.active_iotlb_nonce != Some(receipt.nonce)
             || receipt.generation.checked_add(1) != Some(self.device_generation)
@@ -619,6 +886,7 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
         self.binding_advanced_for_rebind = false;
         self.phase = IoPhase::Active;
         Ok(IoBinding {
+            instance_id: self.instance_id,
             epoch: self.binding_epoch,
         })
     }
@@ -637,6 +905,9 @@ impl<const EFFECTS: usize> IoGate<EFFECTS> {
 
     fn validate_service(&self, identity: IoIdentity) -> Result<(), IoError> {
         self.require_active()?;
+        if identity.instance_id != self.instance_id {
+            return Err(IoError::InvalidReceipt);
+        }
         if identity.authority_epoch != self.authority_epoch {
             return Err(IoError::StaleAuthority);
         }
@@ -673,7 +944,7 @@ mod tests {
 
     #[test]
     fn completion_and_reset_choose_one_terminal_and_iotlb_gates_quiescence() {
-        let mut gate = IoGate::<4>::new().unwrap();
+        let mut gate = IoGate::<4>::new(1).unwrap();
         let binding = gate.binding_token().unwrap();
         let first = gate.register(binding).unwrap();
         let second = gate.register(binding).unwrap();
@@ -708,7 +979,7 @@ mod tests {
 
     #[test]
     fn timeout_tombstone_preserves_reset_identity() {
-        let mut gate = IoGate::<1>::new().unwrap();
+        let mut gate = IoGate::<1>::new(1).unwrap();
         let identity = gate.register(gate.binding_token().unwrap()).unwrap();
         gate.commit_with(identity, || Ok::<_, ()>(())).unwrap();
         let close = gate.begin_closing().unwrap();
@@ -717,5 +988,199 @@ mod tests {
         assert!(before.reset_pending);
         let outcome = gate.apply_reset(pending.retry().acknowledge()).unwrap();
         assert_eq!(outcome.closed_generation(), 1);
+    }
+
+    #[test]
+    fn decisive_terminals_quiesce_without_fabricating_reset_or_iotlb_receipts() {
+        let mut aborted = IoGate::<1>::new(1).unwrap();
+        aborted.register(aborted.binding_token().unwrap()).unwrap();
+        let close = aborted.begin_closing().unwrap();
+        let receipt = aborted.mark_terminal_quiesced(close).unwrap();
+        assert_eq!(receipt.terminalized(), 1);
+        assert_eq!(aborted.projection().phase, IoPhase::Quiesced);
+
+        let mut completed = IoGate::<1>::new(2).unwrap();
+        let identity = completed
+            .register(completed.binding_token().unwrap())
+            .unwrap();
+        completed.commit_with(identity, || Ok::<_, ()>(())).unwrap();
+        completed.complete_device(identity).unwrap();
+        let close = completed.begin_closing().unwrap();
+        completed.mark_terminal_quiesced(close).unwrap();
+        assert_eq!(completed.projection().phase, IoPhase::Quiesced);
+    }
+
+    #[test]
+    fn instance_namespace_rejects_equal_counter_foreign_authorities_atomically() {
+        let mut first = IoGate::<2>::new(1).unwrap();
+        let mut second = IoGate::<2>::new(2).unwrap();
+        let first_binding = first.binding_token().unwrap();
+        let second_binding = second.binding_token().unwrap();
+        assert_eq!(first_binding.epoch(), second_binding.epoch());
+        assert_ne!(first_binding.instance_id(), second_binding.instance_id());
+
+        let before_foreign_binding = first.state_projection();
+        assert_eq!(first.register(second_binding), Err(IoError::InvalidReceipt));
+        assert_eq!(first.state_projection(), before_foreign_binding);
+
+        let first_identity = first.register(first_binding).unwrap();
+        let second_identity = second.register(second_binding).unwrap();
+        assert_eq!(first_identity.request_id(), second_identity.request_id());
+        assert_eq!(
+            first_identity.authority_epoch(),
+            second_identity.authority_epoch()
+        );
+        assert_eq!(
+            first_identity.binding_epoch(),
+            second_identity.binding_epoch()
+        );
+        assert_eq!(
+            first_identity.device_generation(),
+            second_identity.device_generation()
+        );
+        assert_ne!(first_identity.instance_id(), second_identity.instance_id());
+
+        let before_foreign_identity = first.state_projection();
+        let mut foreign_publication_ran = false;
+        assert!(matches!(
+            first.commit_with(second_identity, || {
+                foreign_publication_ran = true;
+                Ok::<_, ()>(())
+            }),
+            Err(IoCommitError::Gate(IoError::InvalidReceipt))
+        ));
+        assert!(!foreign_publication_ran);
+        assert_eq!(first.state_projection(), before_foreign_identity);
+        assert_eq!(
+            first.complete_device(second_identity),
+            Err(IoError::InvalidReceipt)
+        );
+        assert_eq!(first.state_projection(), before_foreign_identity);
+
+        let (first_commit, ()) = first
+            .commit_with(first_identity, || Ok::<_, ()>(()))
+            .unwrap();
+        let (second_commit, ()) = second
+            .commit_with(second_identity, || Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(first_commit.sequence(), second_commit.sequence());
+        assert_ne!(
+            first_commit.identity().instance_id(),
+            second_commit.identity().instance_id()
+        );
+        let before_foreign_commit = first.state_projection();
+        assert_eq!(
+            first.accept_notify(first_identity, second_commit),
+            Err(IoError::InvalidReceipt)
+        );
+        assert_eq!(first.state_projection(), before_foreign_commit);
+
+        let mut first = IoGate::<1>::new(3).unwrap();
+        let mut second = IoGate::<1>::new(4).unwrap();
+        first.register(first.binding_token().unwrap()).unwrap();
+        second.register(second.binding_token().unwrap()).unwrap();
+        let first_close = first.begin_closing().unwrap();
+        let second_close = second.begin_closing().unwrap();
+        assert_eq!(
+            first_close.authority_epoch(),
+            second_close.authority_epoch()
+        );
+        assert_eq!(
+            first_close.device_generation(),
+            second_close.device_generation()
+        );
+        assert_ne!(first_close.instance_id(), second_close.instance_id());
+
+        let before_foreign_close = first.state_projection();
+        assert_eq!(
+            first.begin_reset(second_close),
+            Err(IoError::InvalidReceipt)
+        );
+        assert_eq!(first.state_projection(), before_foreign_close);
+        assert_eq!(
+            first.mark_terminal_quiesced(second_close),
+            Err(IoError::InvalidReceipt)
+        );
+        assert_eq!(first.state_projection(), before_foreign_close);
+        first.mark_terminal_quiesced(first_close).unwrap();
+    }
+
+    #[test]
+    fn instance_namespace_rejects_equal_counter_foreign_receipts_atomically() {
+        assert_eq!(IoGate::<1>::new(0), Err(IoError::InvalidConfiguration));
+
+        let mut first = IoGate::<1>::new(1).unwrap();
+        let mut second = IoGate::<1>::new(2).unwrap();
+        let first_identity = first.register(first.binding_token().unwrap()).unwrap();
+        let second_identity = second.register(second.binding_token().unwrap()).unwrap();
+        first
+            .commit_with(first_identity, || Ok::<_, ()>(()))
+            .unwrap();
+        second
+            .commit_with(second_identity, || Ok::<_, ()>(()))
+            .unwrap();
+
+        let first_close = first.begin_closing().unwrap();
+        let second_close = second.begin_closing().unwrap();
+        let first_reset = first.begin_reset(first_close).unwrap();
+        let second_reset = second.begin_reset(second_close).unwrap();
+        assert_eq!(first_reset.generation(), second_reset.generation());
+        assert_eq!(first_reset.nonce(), second_reset.nonce());
+        assert_ne!(first_reset.instance_id(), second_reset.instance_id());
+
+        let before_foreign_reset = first.state_projection();
+        assert_eq!(
+            first.apply_reset(second_reset.acknowledge()),
+            Err(IoError::InvalidReceipt)
+        );
+        assert_eq!(first.state_projection(), before_foreign_reset);
+
+        let first_reset = first.apply_reset(first_reset.acknowledge()).unwrap();
+        let mut second = IoGate::<1>::new(2).unwrap();
+        let second_identity = second.register(second.binding_token().unwrap()).unwrap();
+        second
+            .commit_with(second_identity, || Ok::<_, ()>(()))
+            .unwrap();
+        let second_close = second.begin_closing().unwrap();
+        let second_attempt = second.begin_reset(second_close).unwrap();
+        let second_reset = second.apply_reset(second_attempt.acknowledge()).unwrap();
+        assert_eq!(
+            first_reset.closed_generation(),
+            second_reset.closed_generation()
+        );
+        assert_eq!(
+            first_reset.device_generation(),
+            second_reset.device_generation()
+        );
+        assert_eq!(first_reset.nonce(), second_reset.nonce());
+        assert_ne!(first_reset.instance_id(), second_reset.instance_id());
+        let before_foreign_outcome = first.state_projection();
+        assert_eq!(
+            first.begin_iotlb::<1>(second_reset),
+            Err(IoError::InvalidReceipt)
+        );
+        assert_eq!(first.state_projection(), before_foreign_outcome);
+        let first_iotlb = first.begin_iotlb::<1>(first_reset).unwrap();
+        let second_iotlb = second.begin_iotlb::<1>(second_reset).unwrap();
+        assert_eq!(first_iotlb.generation(), second_iotlb.generation());
+        assert_eq!(first_iotlb.nonce(), second_iotlb.nonce());
+        assert_ne!(first_iotlb.instance_id(), second_iotlb.instance_id());
+        let foreign_quiescence = match second_iotlb.owner_complete(0).unwrap() {
+            IotlbProgress::Complete(receipt) => receipt,
+            IotlbProgress::Pending(_) => unreachable!(),
+        };
+        let before_foreign_quiescence = first.state_projection();
+        assert_eq!(
+            first.mark_quiesced(foreign_quiescence),
+            Err(IoError::InvalidReceipt)
+        );
+        assert_eq!(first.state_projection(), before_foreign_quiescence);
+
+        let own_quiescence = match first_iotlb.owner_complete(0).unwrap() {
+            IotlbProgress::Complete(receipt) => receipt,
+            IotlbProgress::Pending(_) => unreachable!(),
+        };
+        first.mark_quiesced(own_quiescence).unwrap();
+        assert_eq!(first.projection().phase, IoPhase::Quiesced);
     }
 }

@@ -110,11 +110,24 @@ The semantic authority, binding, device-generation, effect commit/terminal,
 reset, and IOTLB-quiescence transitions are delegated to the shared
 `cser-transition-gates::io::IoGate<4>`. `Portal` retains only operation metadata
 and commit receipts needed to adapt the real `Session`, PCI transport, queue,
-and DMA owners. Reset and IOTLB pending paths carry both the hardware owner and
-the gate's non-copyable tombstone; `check-io-gate.sh` rejects reintroduction of
-the former shadow epoch/effect ledger. The Stage 7B concurrency claim for this
-source remains “production transition source under a Loom-modeled outer mutex,”
-not OSTD `SpinLock`, SMP, lock freedom, or liveness verification.
+and DMA owners. The valid PCI BDF and queue index occupy non-overlapping fields
+below a fixed high namespace in a stable, non-zero `IoGate` instance ID; this
+is a caller-allocated namespace that must be unique for every live
+`(BDF, queue)` whose authorities or receipts could meet.
+`Portal` retains that BDF and is the only constructor of a private session
+binding. It rejects a foreign authority in both directions between two valid
+BDF namespaces before the bound session can enable PCI or allocate DMA; the
+guest receipt also checks that both complete portal projections remain
+unchanged. The raw `Session` constructor is not exposed. The negative returns
+a non-copyable receipt whose marker is published only after all assertions
+succeed and before PCI BAR discovery. The source gates reject deletion,
+post-discovery movement, a conditional no-op, or a caller-fabricated marker.
+Reset and IOTLB pending paths carry both the hardware owner and the gate's
+non-copyable tombstone; `check-io-gate.sh` rejects reintroduction of the former
+shadow epoch/effect ledger or removal of the instance namespace. The Stage 7B
+concurrency claim for this source remains “production transition source under a
+Loom-modeled outer mutex,” not OSTD `SpinLock`, SMP, lock freedom, or liveness
+verification.
 
 `VirtIOBlk` is intentionally not used. It combines queue publication and
 notification and hides the queue/transport owners that the reset protocol must

@@ -12,6 +12,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 receipts=(
     'exact|VIRTIO_CSER KERNEL_MARKER stage=5b oracle_suffix=true'
     'exact|VIRTIO_CSER BEGIN device=blk mode=polling irq_masked=true smp=not_proven hardware=QEMU'
+    'exact|IO Namespace foreign_bdf_rejected=true bidirectional=true portal_state_unchanged=true pre_pci_dma=true'
     'exact|PCI Found bdf=00:05.0 vendor=1af4 device=1042 modern=true memory_bar_owners=1'
     'exact|IO WriteReject operation=write_sector0 error=ReadOnly before_add=true effects_before=0 effects_after=0 next_request_unchanged=true'
     'exact|IO Register request=1 authority_epoch=1 binding_epoch=1 device_generation=1 operation=read_sector0'

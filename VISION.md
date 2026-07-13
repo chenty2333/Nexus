@@ -655,13 +655,20 @@ Work proceeds through evidence gates, not feature-count milestones.
    fresh hashed evidence under repository/backend locks. This gate adds no
    runtime filesystem/network behavior and does not weaken the independence of
    the reference model.
-8. **Integrated evidence and contribution decision — Stage 7B planned:**
-   extend the bounded Loom gates with implementation-specific Loom and/or Kani
-   checks across scheduler, pager, personality, and I/O; add a parameterized
-   QEMU recovery matrix plus fixed-`N`/varying-`k` and
-   fixed-`k`/varying-`N` experiments; then repeat the prior-art comparison,
-   report overheads and failed cases, and narrow or reject the CSER claim if
-   the evidence requires it.
+8. **Integrated evidence and contribution decision — Stage 7B bounded
+   acceptance contract implemented:** fourteen production-transition-source
+   race rows are Checked under a Loom-modeled outer mutex. A release,
+   single-vCPU, single-thread-TCG evaluator checks twenty case-local fault
+   cells (fifteen nonzero-credit Registry ledgers plus five typed `NoCredit`
+   scheduler witnesses), fourteen structural scale points, and retains raw
+   guest-visible TSC samples for twenty-nine cases as Observed measurements
+   without thresholds. The primary-source comparison contains sixteen rows:
+   fourteen full-text and two metadata-only. Its contribution decision is
+   `narrow`; `novel`, `first`, and `proved` remain unestablished. A revision is
+   not evidence for SMP, hardware cycles, a shared production fault scope, or
+   cross-object crash/panic atomicity. It is accepted only when its clean cold
+   `./x verify` and exact pushed GitHub CI both pass. The final research
+   narrative remains a separate later stage.
 
 Every vertical slice follows the same rule: specify the state machine and exit
 criteria, implement the smallest end-to-end path, inject failures, and stop if

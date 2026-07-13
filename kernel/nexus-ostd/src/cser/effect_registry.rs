@@ -14,6 +14,9 @@ use alloc::{
     collections::{BTreeMap, BTreeSet},
     vec::Vec,
 };
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_REGISTRY_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ScopeKey {
@@ -480,6 +483,7 @@ impl CommitMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitReceipt {
+    registry_instance_id: u64,
     effect: EffectKey,
     scope: ScopeKey,
     authority_epoch: u64,
@@ -719,11 +723,20 @@ struct RevokeState {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RevokeWorkCounters {
+    begin_target_record_visits: u64,
     next_calls: u64,
     head_selections: u64,
     terminalized: u64,
     completion_members_checked: u64,
     target_index_removals: u64,
+    unrelated_effect_visits: u64,
+    history_effect_visits: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RevokeRecordAccess {
+    Begin,
+    Transition,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -868,6 +881,7 @@ pub(crate) enum RegistryError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EffectRegistry {
+    instance_id: u64,
     scopes: BTreeMap<ScopeKey, ScopeRecord>,
     effects: BTreeMap<EffectKey, EffectRecord>,
     by_scope: BTreeMap<ScopeKey, BTreeSet<EffectKey>>,
@@ -884,6 +898,7 @@ pub(crate) struct EffectRegistry {
 impl EffectRegistry {
     pub(crate) fn new() -> Self {
         Self {
+            instance_id: next_registry_instance_id(),
             scopes: BTreeMap::new(),
             effects: BTreeMap::new(),
             by_scope: BTreeMap::new(),
@@ -1182,6 +1197,7 @@ impl EffectRegistry {
             let record = self.effects.get(&effect).unwrap();
             let offset = u64::try_from(offset).map_err(|_| RegistryError::CounterOverflow)?;
             receipts.push(CommitReceipt {
+                registry_instance_id: self.instance_id,
                 effect,
                 scope: record.identity.scope,
                 authority_epoch: record.identity.authority_epoch,
@@ -1647,10 +1663,21 @@ impl EffectRegistry {
             (selected, next_calls, head_selections)
         };
         let next = if let Some(effect) = selected {
-            let record = self
-                .effects
-                .get(&effect)
-                .ok_or(RegistryError::UnknownEffect)?;
+            let (scopes, effects) = (&mut self.scopes, &self.effects);
+            let revoke = scopes
+                .get_mut(&selection.scope)
+                .unwrap()
+                .revoke
+                .as_mut()
+                .unwrap();
+            let record = instrument_revoke_record_access(
+                &mut revoke.work,
+                &revoke.cohort,
+                effects,
+                selection.scope,
+                effect,
+                RevokeRecordAccess::Transition,
+            )?;
             if record.identity.scope != selection.scope || record.phase.is_terminal() {
                 return Err(RegistryError::Invariant("invalid revoke target head"));
             }
@@ -1731,17 +1758,19 @@ impl EffectRegistry {
                 .ok_or(RegistryError::CounterOverflow)?;
             (revision, target_count)
         };
+        let (scopes, effects) = (&mut self.scopes, &self.effects);
+        let scope = scopes.get_mut(&selection.scope).unwrap();
+        let revoke = scope.revoke.as_mut().unwrap();
         let mut members_checked = 0_u64;
-        for effect in &self.scopes[&selection.scope]
-            .revoke
-            .as_ref()
-            .unwrap()
-            .cohort
-        {
-            let record = self
-                .effects
-                .get(effect)
-                .ok_or(RegistryError::UnknownEffect)?;
+        for effect in &revoke.cohort {
+            let record = instrument_revoke_record_access(
+                &mut revoke.work,
+                &revoke.cohort,
+                effects,
+                selection.scope,
+                *effect,
+                RevokeRecordAccess::Transition,
+            )?;
             if !record.phase.is_terminal()
                 || record.pending_publication.is_some()
                 || record.credit_state != CreditState::Released
@@ -1760,13 +1789,11 @@ impl EffectRegistry {
         }
 
         // No fallible operation remains after the exact cohort validation.
-        let scope = self.scopes.get_mut(&selection.scope).unwrap();
-        scope.phase = ScopePhase::Revoked;
-        scope.revision = next_revision;
-        let revoke = scope.revoke.as_mut().unwrap();
         revoke.work.completion_members_checked = members_checked;
         revoke.cohort.clear();
         revoke.retired_recovery = None;
+        scope.phase = ScopePhase::Revoked;
+        scope.revision = next_revision;
         Ok(())
     }
 
@@ -1791,14 +1818,14 @@ impl EffectRegistry {
         }
         Ok(RevokeWorkProjection {
             target_count: revoke.target_count,
-            begin_target_record_visits: 0,
+            begin_target_record_visits: revoke.work.begin_target_record_visits,
             next_calls: revoke.work.next_calls,
             head_selections: revoke.work.head_selections,
             terminalized: revoke.work.terminalized,
             completion_members_checked: revoke.work.completion_members_checked,
             target_index_removals: revoke.work.target_index_removals,
-            unrelated_effect_visits: 0,
-            history_effect_visits: 0,
+            unrelated_effect_visits: revoke.work.unrelated_effect_visits,
+            history_effect_visits: revoke.work.history_effect_visits,
             pending_targets: self.by_scope.get(&selection.scope).map_or(0, BTreeSet::len),
             target_state: scope.phase,
         })
@@ -1840,6 +1867,9 @@ impl EffectRegistry {
     }
 
     pub(crate) fn check_invariants(&self) -> Result<(), RegistryError> {
+        if self.instance_id == 0 {
+            return Err(RegistryError::Invariant("invalid Registry instance"));
+        }
         let mut expected_by_scope: BTreeMap<ScopeKey, BTreeSet<EffectKey>> = BTreeMap::new();
         let mut expected_by_task: BTreeMap<TaskKey, BTreeSet<EffectKey>> = BTreeMap::new();
         let mut expected_by_resource: BTreeMap<ResourceKey, BTreeSet<EffectKey>> = BTreeMap::new();
@@ -2026,6 +2056,18 @@ impl EffectRegistry {
                         && terminal.causal_commit.is_none()
                     {
                         return Err(RegistryError::Invariant("completion lacks commit cause"));
+                    }
+                    if terminal.causal_commit.as_ref().is_some_and(|causal| {
+                        !causal_commit_matches(
+                            self.instance_id,
+                            &self.effects,
+                            &record.identity,
+                            causal,
+                        )
+                    }) {
+                        return Err(RegistryError::Invariant(
+                            "completion has invalid causal commit",
+                        ));
                     }
                     match record.publication_mode {
                         PublicationMode::None => {
@@ -2276,6 +2318,11 @@ impl EffectRegistry {
             TerminalOutcome::Completed => {
                 if own_commit.is_none() && request.causal_commit.is_none() {
                     return Err(RegistryError::InvalidState);
+                }
+                if request.causal_commit.as_ref().is_some_and(|causal| {
+                    !causal_commit_matches(self.instance_id, &self.effects, &identity, causal)
+                }) {
+                    return Err(RegistryError::CommitConflict);
                 }
             }
         }
@@ -2560,6 +2607,41 @@ fn validate_generation(generation: u64) -> Result<(), RegistryError> {
     }
 }
 
+/// Authenticates an explicit completion cause against the exact commit stored
+/// by this Registry. Cross-effect completion is allowed only inside one scope
+/// causal envelope. A source commit may precede target adoption, but it may
+/// never come from a future target binding or another authority epoch.
+fn causal_commit_matches(
+    registry_instance_id: u64,
+    effects: &BTreeMap<EffectKey, EffectRecord>,
+    target: &EffectIdentity,
+    causal: &CommitReceipt,
+) -> bool {
+    if causal.registry_instance_id != registry_instance_id
+        || causal.scope != target.scope
+        || causal.authority_epoch != target.authority_epoch
+        || causal.binding_epoch > target.binding_epoch
+    {
+        return false;
+    }
+    effects.get(&causal.effect).is_some_and(|source| {
+        source.identity.scope == target.scope
+            && source.commit.as_ref() == Some(causal)
+            && matches!(
+                source.phase,
+                EffectPhase::Committed | EffectPhase::Terminal(TerminalOutcome::Completed)
+            )
+    })
+}
+
+fn next_registry_instance_id() -> u64 {
+    NEXT_REGISTRY_INSTANCE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("EffectRegistry instance namespace exhausted")
+}
+
 fn normalize_charges(charges: &[CreditCharge]) -> Result<Vec<CreditCharge>, RegistryError> {
     let mut totals = BTreeMap::<CreditClass, u64>::new();
     for charge in charges {
@@ -2583,6 +2665,35 @@ fn take_counter(counter: &mut u64) -> Result<u64, RegistryError> {
         .checked_add(1)
         .ok_or(RegistryError::CounterOverflow)?;
     Ok(value)
+}
+
+/// Returns one effect record through the revoke evaluator's instrumented
+/// access boundary. Target records are expected during normal selection and
+/// completion. Any access to a target during begin, to another live scope, or
+/// to retained terminal history is counted on the exact revoke token that
+/// performed it instead of being inferred as zero by the projection layer.
+fn instrument_revoke_record_access<'a>(
+    work: &mut RevokeWorkCounters,
+    cohort: &BTreeSet<EffectKey>,
+    effects: &'a BTreeMap<EffectKey, EffectRecord>,
+    target_scope: ScopeKey,
+    effect: EffectKey,
+    access: RevokeRecordAccess,
+) -> Result<&'a EffectRecord, RegistryError> {
+    let record = effects.get(&effect).ok_or(RegistryError::UnknownEffect)?;
+    let counter = if record.identity.scope == target_scope && cohort.contains(&effect) {
+        (access == RevokeRecordAccess::Begin).then_some(&mut work.begin_target_record_visits)
+    } else if record.phase.is_terminal() {
+        Some(&mut work.history_effect_visits)
+    } else {
+        Some(&mut work.unrelated_effect_visits)
+    };
+    if let Some(counter) = counter {
+        *counter = counter
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+    }
+    Ok(record)
 }
 
 fn remove_index_member<K: Ord + Copy>(
@@ -2634,6 +2745,458 @@ pub(crate) struct Stage7bFixtureConfig {
     pub(crate) h: usize,
 }
 
+/// Exact Stage 7B fault-matrix identity.  Credit capacity is frozen here so a
+/// fault adapter cannot manufacture a passing ledger from a gate population
+/// such as `waiter_count` or `effect_count`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum Stage7bFaultCase {
+    SchedulerLeaseExpiryBeforeProposal,
+    SchedulerCrashAfterProposalBeforePick,
+    SchedulerStaleProposalBeforeRebind,
+    SchedulerStaleProposalAfterRebind,
+    SchedulerRepeatedCrashFallbackProgress,
+    PagerSamePageConcurrentFault,
+    PagerCrashBeforePrepare,
+    PagerCrashAfterPrepareBeforeCommit,
+    PagerCrashAfterCommitBeforeResume,
+    PagerTimeoutVsLateReply,
+    ReadinessCrashBeforeBackendCommit,
+    ReadinessCrashAfterBackendCommit,
+    ReadinessReadyVsTimeout,
+    ReadinessRevokeVsReady,
+    ReadinessStaleDeadlineAfterRearm,
+    IoRevokeBeforeDevicePublication,
+    IoCompletionVsResetAck,
+    IoResetTimeoutRetry,
+    IoIotlbTimeoutLateAck,
+    IoStaleDuplicateCompletion,
+}
+
+impl Stage7bFaultCase {
+    pub(crate) const fn tag(self) -> u32 {
+        match self {
+            Self::SchedulerLeaseExpiryBeforeProposal => 1,
+            Self::SchedulerCrashAfterProposalBeforePick => 2,
+            Self::SchedulerStaleProposalBeforeRebind => 3,
+            Self::SchedulerStaleProposalAfterRebind => 4,
+            Self::SchedulerRepeatedCrashFallbackProgress => 5,
+            Self::PagerSamePageConcurrentFault => 6,
+            Self::PagerCrashBeforePrepare => 7,
+            Self::PagerCrashAfterPrepareBeforeCommit => 8,
+            Self::PagerCrashAfterCommitBeforeResume => 9,
+            Self::PagerTimeoutVsLateReply => 10,
+            Self::ReadinessCrashBeforeBackendCommit => 11,
+            Self::ReadinessCrashAfterBackendCommit => 12,
+            Self::ReadinessReadyVsTimeout => 13,
+            Self::ReadinessRevokeVsReady => 14,
+            Self::ReadinessStaleDeadlineAfterRearm => 15,
+            Self::IoRevokeBeforeDevicePublication => 16,
+            Self::IoCompletionVsResetAck => 17,
+            Self::IoResetTimeoutRetry => 18,
+            Self::IoIotlbTimeoutLateAck => 19,
+            Self::IoStaleDuplicateCompletion => 20,
+        }
+    }
+
+    pub(crate) const fn credit_capacity(self) -> usize {
+        match self {
+            Self::SchedulerLeaseExpiryBeforeProposal
+            | Self::SchedulerCrashAfterProposalBeforePick
+            | Self::SchedulerStaleProposalBeforeRebind
+            | Self::SchedulerStaleProposalAfterRebind
+            | Self::SchedulerRepeatedCrashFallbackProgress => 0,
+            Self::PagerSamePageConcurrentFault => 2,
+            _ => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum Stage7bFaultOperation {
+    SchedulerFallbackPick,
+    PagerContinuation,
+    ReadinessCompletion,
+    IoRequest,
+}
+
+impl Stage7bFaultOperation {
+    const fn tag(self) -> u32 {
+        match self {
+            Self::SchedulerFallbackPick => 1,
+            Self::PagerContinuation => 2,
+            Self::ReadinessCompletion => 3,
+            Self::IoRequest => 4,
+        }
+    }
+}
+
+/// The semantic half of a composite credit authority.  The opaque registry
+/// handle is held separately in [`Stage7bFaultCredit`]; every commit and
+/// terminal transition must present this exact case/operation/identity again.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct Stage7bFaultBinding {
+    case: Stage7bFaultCase,
+    operation: Stage7bFaultOperation,
+    authority: [u64; 5],
+}
+
+impl Stage7bFaultBinding {
+    pub(crate) const fn new(
+        case: Stage7bFaultCase,
+        operation: Stage7bFaultOperation,
+        authority: [u64; 5],
+    ) -> Self {
+        Self {
+            case,
+            operation,
+            authority,
+        }
+    }
+
+    pub(crate) const fn case(self) -> Stage7bFaultCase {
+        self.case
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Stage7bFaultTerminal {
+    Aborted(i64),
+    Completed(i64),
+}
+
+/// Linear pairing of one semantic authority and one opaque production
+/// registry handle.  It is intentionally neither `Clone` nor `Copy`.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct Stage7bFaultCredit {
+    instance_id: u64,
+    binding: Stage7bFaultBinding,
+    handle: PortalHandle,
+    commit: Option<CommitReceipt>,
+    terminalized: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Stage7bFaultBudgetProjection {
+    pub(crate) case: Stage7bFaultCase,
+    pub(crate) instance_id: u64,
+    pub(crate) scope: ScopeKey,
+    pub(crate) registry: RegistryProjection,
+    pub(crate) reservations: usize,
+    pub(crate) commit_operations: usize,
+    pub(crate) terminal_operations: usize,
+}
+
+impl Stage7bFaultBudgetProjection {
+    /// Observes live credit ownership before closure and returned credit after
+    /// closure. Capacity is checked separately as an invariant; it is not the
+    /// fault counter reported by the evaluator.
+    pub(crate) fn observed_credit_units(&self) -> Result<usize, RegistryError> {
+        let credits = self.registry.credits;
+        let units = match self.registry.phase {
+            ScopePhase::Active | ScopePhase::Closing => credits
+                .held
+                .checked_add(credits.committed)
+                .ok_or(RegistryError::CounterOverflow)?,
+            ScopePhase::Revoked => credits.free,
+        };
+        usize::try_from(units).map_err(|_| RegistryError::CounterOverflow)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct Stage7bFaultBudget {
+    case: Stage7bFaultCase,
+    instance_id: u64,
+    registry: EffectRegistry,
+    scope: ScopeKey,
+    task: TaskKey,
+    credit: CreditClass,
+    bindings: BTreeSet<Stage7bFaultBinding>,
+    commit_operations: usize,
+    terminal_operations: usize,
+}
+
+/// Read-only, complete failure-atomicity snapshot of one case-local ledger.
+/// Its fields remain private so cloning this value cannot mint usable Registry
+/// handles or transition authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Stage7bFaultBudgetState {
+    case: Stage7bFaultCase,
+    instance_id: u64,
+    registry: EffectRegistry,
+    scope: ScopeKey,
+    task: TaskKey,
+    credit: CreditClass,
+    bindings: BTreeSet<Stage7bFaultBinding>,
+    commit_operations: usize,
+    terminal_operations: usize,
+}
+
+impl Stage7bFaultBudget {
+    /// Creates one case-local evaluation ledger in a caller-allocated instance
+    /// namespace. `instance_id` must be nonzero and unique among simultaneously
+    /// live fault budgets whose linear credits could meet.
+    pub(crate) fn new(case: Stage7bFaultCase, instance_id: u64) -> Result<Self, RegistryError> {
+        let capacity = case.credit_capacity();
+        if capacity == 0 || instance_id == 0 {
+            return Err(RegistryError::InvalidCreditConfiguration);
+        }
+        let tag = u64::from(case.tag());
+        let scope = ScopeKey::new(instance_id, tag);
+        let task = TaskKey::new(instance_id, tag);
+        let credit = CreditClass::new(
+            u16::try_from(0x7b00_u32 + case.tag()).map_err(|_| RegistryError::CounterOverflow)?,
+        );
+        let units = u64::try_from(capacity).map_err(|_| RegistryError::CounterOverflow)?;
+        let mut registry = EffectRegistry::new();
+        registry.create_scope(ScopeConfig {
+            key: scope,
+            authority_epoch: 1,
+            binding_epoch: 1,
+            supervisor: task,
+            credits: alloc::vec![CreditLimit::new(credit, units)],
+        })?;
+        registry.check_invariants()?;
+        Ok(Self {
+            case,
+            instance_id,
+            registry,
+            scope,
+            task,
+            credit,
+            bindings: BTreeSet::new(),
+            commit_operations: 0,
+            terminal_operations: 0,
+        })
+    }
+
+    pub(crate) fn reserve(
+        &mut self,
+        binding: Stage7bFaultBinding,
+    ) -> Result<Stage7bFaultCredit, RegistryError> {
+        if binding.case != self.case
+            || self.bindings.contains(&binding)
+            || self.bindings.len() >= self.case.credit_capacity()
+        {
+            return Err(RegistryError::InvalidState);
+        }
+        let ordinal = self.bindings.len();
+        let resource_id = u64::try_from(ordinal)
+            .map_err(|_| RegistryError::CounterOverflow)?
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let namespace = 0x7b10_u32
+            .checked_add(self.case.tag())
+            .ok_or(RegistryError::CounterOverflow)?;
+        let operation = binding.operation.tag();
+        let registered = self.registry.register(RegisterRequest {
+            scope: self.scope,
+            task: self.task,
+            operation: OperationClass::new(operation),
+            descriptor: SyscallDescriptor::new(
+                usize::try_from(0x7b10_u32 + self.case.tag())
+                    .map_err(|_| RegistryError::CounterOverflow)?,
+                [
+                    usize::try_from(self.instance_id)
+                        .map_err(|_| RegistryError::CounterOverflow)?,
+                    usize::try_from(binding.authority[0])
+                        .map_err(|_| RegistryError::CounterOverflow)?,
+                    usize::try_from(binding.authority[1])
+                        .map_err(|_| RegistryError::CounterOverflow)?,
+                    usize::try_from(binding.authority[2])
+                        .map_err(|_| RegistryError::CounterOverflow)?,
+                    usize::try_from(binding.authority[3])
+                        .map_err(|_| RegistryError::CounterOverflow)?,
+                    usize::try_from(binding.authority[4])
+                        .map_err(|_| RegistryError::CounterOverflow)?,
+                ],
+            ),
+            resources: alloc::vec![ResourceKey::new(namespace, resource_id, 1)],
+            credits: alloc::vec![CreditCharge::new(self.credit, 1)],
+            publication: PublicationMode::None,
+        })?;
+        self.bindings.insert(binding);
+        self.registry.check_invariants()?;
+        Ok(Stage7bFaultCredit {
+            instance_id: self.instance_id,
+            binding,
+            handle: registered.handle,
+            commit: None,
+            terminalized: false,
+        })
+    }
+
+    pub(crate) fn commit(
+        &mut self,
+        credit: &mut Stage7bFaultCredit,
+        binding: Stage7bFaultBinding,
+        result: i64,
+    ) -> Result<(), RegistryError> {
+        self.validate_credit(credit, binding)?;
+        if credit.commit.is_some() || credit.terminalized {
+            return Err(RegistryError::InvalidState);
+        }
+        self.registry.prepare(self.task, credit.handle)?;
+        let commit = match self.registry.commit(
+            self.task,
+            credit.handle,
+            CommitMetadata::new(result, u64::from(self.case.tag())),
+        )? {
+            CommitOutcome::Applied(receipt) => receipt,
+            CommitOutcome::AlreadyCommitted(_) => return Err(RegistryError::CommitConflict),
+        };
+        credit.commit = Some(commit);
+        self.commit_operations = self
+            .commit_operations
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        self.registry.check_invariants()
+    }
+
+    pub(crate) fn terminalize(
+        &mut self,
+        credit: &mut Stage7bFaultCredit,
+        binding: Stage7bFaultBinding,
+        terminal: Stage7bFaultTerminal,
+    ) -> Result<TerminalOutcome, RegistryError> {
+        self.validate_credit(credit, binding)?;
+        if credit.terminalized {
+            return Err(RegistryError::InvalidState);
+        }
+        let request = match (terminal, credit.commit.clone()) {
+            (Stage7bFaultTerminal::Aborted(result), None) => TerminalRequest::aborted(result),
+            (Stage7bFaultTerminal::Completed(result), Some(commit)) => {
+                TerminalRequest::completed_by(result, commit)
+            }
+            _ => return Err(RegistryError::InvalidState),
+        };
+        let terminal = self
+            .registry
+            .stage_terminal(self.task, credit.handle, request)?;
+        if terminal.publication.is_some() {
+            return Err(RegistryError::InvalidState);
+        }
+        credit.terminalized = true;
+        self.terminal_operations = self
+            .terminal_operations
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        self.registry.check_invariants()?;
+        Ok(terminal.receipt.outcome())
+    }
+
+    pub(crate) fn projection(&self) -> Result<Stage7bFaultBudgetProjection, RegistryError> {
+        Ok(Stage7bFaultBudgetProjection {
+            case: self.case,
+            instance_id: self.instance_id,
+            scope: self.scope,
+            registry: self.registry.scope_projection(self.scope)?,
+            reservations: self.bindings.len(),
+            commit_operations: self.commit_operations,
+            terminal_operations: self.terminal_operations,
+        })
+    }
+
+    pub(crate) fn state_snapshot(&self) -> Stage7bFaultBudgetState {
+        Stage7bFaultBudgetState {
+            case: self.case,
+            instance_id: self.instance_id,
+            registry: self.registry.clone(),
+            scope: self.scope,
+            task: self.task,
+            credit: self.credit,
+            bindings: self.bindings.clone(),
+            commit_operations: self.commit_operations,
+            terminal_operations: self.terminal_operations,
+        }
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<Stage7bFaultBudgetProjection, RegistryError> {
+        if self.bindings.len() != self.case.credit_capacity()
+            || self.terminal_operations != self.case.credit_capacity()
+        {
+            return Err(RegistryError::NotQuiescent);
+        }
+        let active = self.registry.scope_projection(self.scope)?;
+        if active.live_effects != 0
+            || active.pending_publications != 0
+            || active.credits.held != 0
+            || active.credits.committed != 0
+            || active.credits.free != active.credits.capacity
+        {
+            return Err(RegistryError::NotQuiescent);
+        }
+        let selection = self.registry.revoke_begin(self.scope)?;
+        if selection.target_count != 0 || self.registry.revoke_next(&selection)?.is_some() {
+            return Err(RegistryError::NotQuiescent);
+        }
+        self.registry.revoke_complete(&selection)?;
+        self.registry.check_invariants()?;
+        self.projection()
+    }
+
+    fn validate_credit(
+        &self,
+        credit: &Stage7bFaultCredit,
+        binding: Stage7bFaultBinding,
+    ) -> Result<(), RegistryError> {
+        if binding.case != self.case
+            || credit.instance_id != self.instance_id
+            || credit.binding != binding
+            || !self.bindings.contains(&binding)
+        {
+            return Err(RegistryError::InvalidHandle);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Stage7bNoCreditProjection {
+    pub(crate) case: Stage7bFaultCase,
+    pub(crate) binding: Stage7bFaultBinding,
+    pub(crate) consumed: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct Stage7bNoCredit {
+    case: Stage7bFaultCase,
+    binding: Stage7bFaultBinding,
+    consumed: bool,
+}
+
+impl Stage7bNoCredit {
+    pub(crate) fn new(
+        case: Stage7bFaultCase,
+        binding: Stage7bFaultBinding,
+    ) -> Result<Self, RegistryError> {
+        if case.credit_capacity() != 0 || binding.case != case {
+            return Err(RegistryError::InvalidCreditConfiguration);
+        }
+        Ok(Self {
+            case,
+            binding,
+            consumed: false,
+        })
+    }
+
+    pub(crate) fn consume(&mut self, binding: Stage7bFaultBinding) -> Result<(), RegistryError> {
+        if self.consumed || binding != self.binding {
+            return Err(RegistryError::InvalidHandle);
+        }
+        self.consumed = true;
+        Ok(())
+    }
+
+    pub(crate) const fn projection(&self) -> Stage7bNoCreditProjection {
+        Stage7bNoCreditProjection {
+            case: self.case,
+            binding: self.binding,
+            consumed: self.consumed,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Stage7bActiveFixture {
     config: Stage7bFixtureConfig,
@@ -2672,13 +3235,23 @@ impl Stage7bActiveFixture {
             return Err(RegistryError::InvalidState);
         }
         let target_capacity =
-            u64::try_from(config.k.max(1)).map_err(|_| RegistryError::CounterOverflow)?;
+            u64::try_from(config.k).map_err(|_| RegistryError::CounterOverflow)?;
         let unrelated = config.n - config.k;
         let unrelated_capacity =
             u64::try_from(unrelated.max(1)).map_err(|_| RegistryError::CounterOverflow)?;
         let mut registry = EffectRegistry::new();
+        registry.create_scope(ScopeConfig {
+            key: TARGET_SCOPE,
+            authority_epoch: 1,
+            binding_epoch: 1,
+            supervisor: TARGET_TASK,
+            credits: if target_capacity == 0 {
+                Vec::new()
+            } else {
+                alloc::vec![CreditLimit::new(TARGET_CREDIT, target_capacity)]
+            },
+        })?;
         for (key, supervisor, credit, units) in [
-            (TARGET_SCOPE, TARGET_TASK, TARGET_CREDIT, target_capacity),
             (
                 UNRELATED_SCOPE,
                 UNRELATED_TASK,
@@ -2971,11 +3544,309 @@ fn bounded_kernel_completion_during_recovery_self_test() {
     registry.check_invariants().unwrap();
 }
 
+fn committed_causal_test_registry(
+    scope: ScopeKey,
+    task: TaskKey,
+    credit: CreditClass,
+    namespace: u32,
+) -> (EffectRegistry, PortalHandle, CommitReceipt) {
+    let mut registry = EffectRegistry::new();
+    registry
+        .create_scope(ScopeConfig {
+            key: scope,
+            authority_epoch: 1,
+            binding_epoch: 1,
+            supervisor: task,
+            credits: alloc::vec![CreditLimit::new(credit, 1)],
+        })
+        .unwrap();
+    let registered = registry
+        .register(RegisterRequest {
+            scope,
+            task,
+            operation: OperationClass::new(namespace),
+            descriptor: SyscallDescriptor::new(namespace as usize, [0; 6]),
+            resources: alloc::vec![ResourceKey::new(namespace, 1, 1)],
+            credits: alloc::vec![CreditCharge::new(credit, 1)],
+            publication: PublicationMode::None,
+        })
+        .unwrap();
+    registry.prepare(task, registered.handle).unwrap();
+    let commit = match registry
+        .commit(task, registered.handle, CommitMetadata::new(1, 1))
+        .unwrap()
+    {
+        CommitOutcome::Applied(receipt) => receipt,
+        CommitOutcome::AlreadyCommitted(_) => unreachable!(),
+    };
+    registry.check_invariants().unwrap();
+    (registry, registered.handle, commit)
+}
+
+/// Stage 7B executable checks for the explicit causal completion envelope.
+/// They keep legitimate same-scope cross-effect completion while proving that
+/// foreign scope and same-value foreign Registry receipts are rejected in both
+/// directions without mutating either complete Registry state.
+pub(crate) fn stage7b_causal_commit_self_test() {
+    const POSITIVE_SCOPE: ScopeKey = ScopeKey::new(0x7bca_0001, 1);
+    const POSITIVE_TASK: TaskKey = TaskKey::new(0x7bca_1001, 1);
+    const POSITIVE_CREDIT: CreditClass = CreditClass::new(0x7bca);
+
+    let mut positive = EffectRegistry::new();
+    positive
+        .create_scope(ScopeConfig {
+            key: POSITIVE_SCOPE,
+            authority_epoch: 1,
+            binding_epoch: 1,
+            supervisor: POSITIVE_TASK,
+            credits: alloc::vec![CreditLimit::new(POSITIVE_CREDIT, 2)],
+        })
+        .unwrap();
+    let source = positive
+        .register(RegisterRequest {
+            scope: POSITIVE_SCOPE,
+            task: POSITIVE_TASK,
+            operation: OperationClass::new(1),
+            descriptor: SyscallDescriptor::new(1, [1, 0, 0, 0, 0, 0]),
+            resources: alloc::vec![ResourceKey::new(0x7bca, 1, 1)],
+            credits: alloc::vec![CreditCharge::new(POSITIVE_CREDIT, 1)],
+            publication: PublicationMode::None,
+        })
+        .unwrap();
+    let target = positive
+        .register(RegisterRequest {
+            scope: POSITIVE_SCOPE,
+            task: POSITIVE_TASK,
+            operation: OperationClass::new(2),
+            descriptor: SyscallDescriptor::new(2, [2, 0, 0, 0, 0, 0]),
+            resources: alloc::vec![ResourceKey::new(0x7bca, 2, 1)],
+            credits: alloc::vec![CreditCharge::new(POSITIVE_CREDIT, 1)],
+            publication: PublicationMode::None,
+        })
+        .unwrap();
+    positive.prepare(POSITIVE_TASK, source.handle).unwrap();
+    let source_commit = match positive
+        .commit(POSITIVE_TASK, source.handle, CommitMetadata::new(1, 1))
+        .unwrap()
+    {
+        CommitOutcome::Applied(receipt) => receipt,
+        CommitOutcome::AlreadyCommitted(_) => unreachable!(),
+    };
+    let target_terminal = positive
+        .stage_terminal(
+            POSITIVE_TASK,
+            target.handle,
+            TerminalRequest::completed_by(2, source_commit.clone()),
+        )
+        .unwrap();
+    assert_eq!(
+        target_terminal.receipt.outcome(),
+        TerminalOutcome::Completed
+    );
+    positive.stage_kernel_completion(&source_commit).unwrap();
+    positive.check_invariants().unwrap();
+
+    const SCOPE_A: ScopeKey = ScopeKey::new(0x7bca_0002, 1);
+    const SCOPE_B: ScopeKey = ScopeKey::new(0x7bca_0003, 1);
+    const TASK_A: TaskKey = TaskKey::new(0x7bca_1002, 1);
+    const TASK_B: TaskKey = TaskKey::new(0x7bca_1003, 1);
+    const CREDIT_A: CreditClass = CreditClass::new(0x7bcb);
+    const CREDIT_B: CreditClass = CreditClass::new(0x7bcc);
+
+    let mut cross_scope = EffectRegistry::new();
+    for (scope, task, credit) in [(SCOPE_A, TASK_A, CREDIT_A), (SCOPE_B, TASK_B, CREDIT_B)] {
+        cross_scope
+            .create_scope(ScopeConfig {
+                key: scope,
+                authority_epoch: 1,
+                binding_epoch: 1,
+                supervisor: task,
+                credits: alloc::vec![CreditLimit::new(credit, 1)],
+            })
+            .unwrap();
+    }
+    let effect_a = cross_scope
+        .register(RegisterRequest {
+            scope: SCOPE_A,
+            task: TASK_A,
+            operation: OperationClass::new(3),
+            descriptor: SyscallDescriptor::new(3, [0; 6]),
+            resources: alloc::vec![ResourceKey::new(0x7bcb, 1, 1)],
+            credits: alloc::vec![CreditCharge::new(CREDIT_A, 1)],
+            publication: PublicationMode::None,
+        })
+        .unwrap();
+    let effect_b = cross_scope
+        .register(RegisterRequest {
+            scope: SCOPE_B,
+            task: TASK_B,
+            operation: OperationClass::new(4),
+            descriptor: SyscallDescriptor::new(4, [0; 6]),
+            resources: alloc::vec![ResourceKey::new(0x7bcc, 1, 1)],
+            credits: alloc::vec![CreditCharge::new(CREDIT_B, 1)],
+            publication: PublicationMode::None,
+        })
+        .unwrap();
+    cross_scope.prepare(TASK_A, effect_a.handle).unwrap();
+    cross_scope.prepare(TASK_B, effect_b.handle).unwrap();
+    let commit_a = match cross_scope
+        .commit(TASK_A, effect_a.handle, CommitMetadata::new(3, 1))
+        .unwrap()
+    {
+        CommitOutcome::Applied(receipt) => receipt,
+        CommitOutcome::AlreadyCommitted(_) => unreachable!(),
+    };
+    let commit_b = match cross_scope
+        .commit(TASK_B, effect_b.handle, CommitMetadata::new(4, 1))
+        .unwrap()
+    {
+        CommitOutcome::Applied(receipt) => receipt,
+        CommitOutcome::AlreadyCommitted(_) => unreachable!(),
+    };
+    let cross_scope_before = cross_scope.clone();
+    assert_eq!(
+        cross_scope.stage_terminal(
+            TASK_A,
+            effect_a.handle,
+            TerminalRequest::completed_by(3, commit_b.clone()),
+        ),
+        Err(RegistryError::CommitConflict)
+    );
+    assert_eq!(cross_scope, cross_scope_before);
+    assert_eq!(
+        cross_scope.stage_terminal(
+            TASK_B,
+            effect_b.handle,
+            TerminalRequest::completed_by(4, commit_a.clone()),
+        ),
+        Err(RegistryError::CommitConflict)
+    );
+    assert_eq!(cross_scope, cross_scope_before);
+    cross_scope.stage_kernel_completion(&commit_a).unwrap();
+    cross_scope.stage_kernel_completion(&commit_b).unwrap();
+    cross_scope.check_invariants().unwrap();
+
+    const SHARED_SCOPE: ScopeKey = ScopeKey::new(0x7bca_0010, 1);
+    const SHARED_TASK: TaskKey = TaskKey::new(0x7bca_1010, 1);
+    const SHARED_CREDIT: CreditClass = CreditClass::new(0x7bd0);
+    let (mut first, first_handle, first_commit) =
+        committed_causal_test_registry(SHARED_SCOPE, SHARED_TASK, SHARED_CREDIT, 0x7bd0);
+    let (mut second, second_handle, second_commit) =
+        committed_causal_test_registry(SHARED_SCOPE, SHARED_TASK, SHARED_CREDIT, 0x7bd0);
+    assert_ne!(
+        first_commit.registry_instance_id,
+        second_commit.registry_instance_id
+    );
+    assert_eq!(first_commit.effect, second_commit.effect);
+    assert_eq!(first_commit.scope, second_commit.scope);
+    assert_eq!(first_commit.authority_epoch, second_commit.authority_epoch);
+    assert_eq!(first_commit.binding_epoch, second_commit.binding_epoch);
+    assert_eq!(first_commit.sequence, second_commit.sequence);
+    assert_eq!(first_commit.result, second_commit.result);
+    assert_eq!(first_commit.domain_revision, second_commit.domain_revision);
+    assert_eq!(
+        first_commit.descriptor_digest,
+        second_commit.descriptor_digest
+    );
+    let first_before = first.clone();
+    let second_before = second.clone();
+    assert_eq!(
+        first.stage_terminal(
+            SHARED_TASK,
+            first_handle,
+            TerminalRequest::completed_by(1, second_commit.clone()),
+        ),
+        Err(RegistryError::CommitConflict)
+    );
+    assert_eq!(first, first_before);
+    assert_eq!(second, second_before);
+    assert_eq!(
+        second.stage_terminal(
+            SHARED_TASK,
+            second_handle,
+            TerminalRequest::completed_by(1, first_commit.clone()),
+        ),
+        Err(RegistryError::CommitConflict)
+    );
+    assert_eq!(first, first_before);
+    assert_eq!(second, second_before);
+    first.stage_kernel_completion(&first_commit).unwrap();
+    second.stage_kernel_completion(&second_commit).unwrap();
+    first.check_invariants().unwrap();
+    second.check_invariants().unwrap();
+}
+
 fn stage7b_registry_refactor_self_test() {
     let config = Stage7bFixtureConfig { n: 8, k: 3, h: 2 };
     let fixture = Stage7bActiveFixture::new(config).unwrap();
     assert_eq!(fixture.target_projection().unwrap().live_effects, config.k);
     fixture.check_invariants().unwrap();
+
+    // The three zero-valued scale metrics are real counters, not constants in
+    // the projection. Exercise their classification boundary without changing
+    // the production close path measured below.
+    let mut instrumented = fixture.clone();
+    let instrumented_selection = instrumented.begin().unwrap();
+    let target = *instrumented
+        .registry
+        .scopes
+        .get(&instrumented.target_scope)
+        .unwrap()
+        .revoke
+        .as_ref()
+        .unwrap()
+        .cohort
+        .first()
+        .unwrap();
+    let unrelated = instrumented
+        .registry
+        .effects
+        .iter()
+        .find_map(|(effect, record)| {
+            (record.identity.scope != instrumented.target_scope && !record.phase.is_terminal())
+                .then_some(*effect)
+        })
+        .unwrap();
+    let history = instrumented
+        .registry
+        .effects
+        .iter()
+        .find_map(|(effect, record)| record.phase.is_terminal().then_some(*effect))
+        .unwrap();
+    {
+        let (scopes, effects) = (
+            &mut instrumented.registry.scopes,
+            &instrumented.registry.effects,
+        );
+        let revoke = scopes
+            .get_mut(&instrumented.target_scope)
+            .unwrap()
+            .revoke
+            .as_mut()
+            .unwrap();
+        for (effect, access) in [
+            (target, RevokeRecordAccess::Begin),
+            (unrelated, RevokeRecordAccess::Transition),
+            (history, RevokeRecordAccess::Transition),
+        ] {
+            instrument_revoke_record_access(
+                &mut revoke.work,
+                &revoke.cohort,
+                effects,
+                instrumented.target_scope,
+                effect,
+                access,
+            )
+            .unwrap();
+        }
+    }
+    let work = instrumented
+        .registry
+        .revoke_work_projection(&instrumented_selection)
+        .unwrap();
+    assert_eq!(work.begin_target_record_visits, 1);
+    assert_eq!(work.unrelated_effect_visits, 1);
+    assert_eq!(work.history_effect_visits, 1);
 
     let mut closed = fixture.clone();
     let selection = closed.close_all().unwrap();
@@ -2999,6 +3870,11 @@ fn stage7b_registry_refactor_self_test() {
     assert_eq!(closed.registry, before);
 
     let mut empty = Stage7bActiveFixture::new(Stage7bFixtureConfig { n: 4, k: 0, h: 3 }).unwrap();
+    let empty_active = empty.target_projection().unwrap();
+    assert_eq!(empty_active.credits.capacity, 0);
+    assert_eq!(empty_active.credits.free, 0);
+    assert_eq!(empty_active.credits.held, 0);
+    assert_eq!(empty_active.credits.committed, 0);
     let selection = empty.close_all().unwrap();
     let empty_observation = empty.observation(&selection).unwrap();
     assert_eq!(empty_observation.work.target_count, 0);
@@ -3007,6 +3883,7 @@ fn stage7b_registry_refactor_self_test() {
     assert_eq!(empty_observation.work.terminalized, 0);
     assert_eq!(empty_observation.work.completion_members_checked, 0);
     assert_eq!(empty_observation.work.target_state, ScopePhase::Revoked);
+    assert_eq!(empty_observation.target.credits, empty_active.credits);
     empty.check_invariants().unwrap();
 
     // Unknown and overflow failures do not consume the revoke sequence or

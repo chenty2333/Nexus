@@ -2,6 +2,7 @@
 set -euo pipefail
 
 source_file=${1:-src/portal.rs}
+entry_file=${2:-src/lib.rs}
 
 require_literal() {
     local literal=$1
@@ -13,8 +14,35 @@ require_literal() {
 
 for literal in \
     'pub type EffectAuthority = IoIdentity;' \
+    'fn portal_instance_id(device_function: DeviceFunction) -> u64 {' \
+    'device_function.valid(),' \
+    '"invalid PCI device function namespace"' \
+    '(u64::from(device_function.bus) << 24)' \
+    '(u64::from(device_function.device) << 19)' \
+    '(u64::from(device_function.function) << 16)' \
+    'u64::from(QUEUE_INDEX)' \
+    'let instance_id = portal_instance_id(device_function);' \
+    'IoGate::new(instance_id)' \
+    'device_function: DeviceFunction,' \
+    'fn bind_session_authority(' \
+    'authority.instance_id() != self.gate.instance_id()' \
+    'portal_instance_id(self.device_function) != self.gate.instance_id()' \
+    'pub fn open_session(' \
+    'let binding = self.bind_session_authority(authority)?;' \
+    'Ok(Session::open_bound(root, binding))' \
+    'fn open_bound(root: &mut Root, binding: SessionBinding)' \
+    'pub fn assert_session_namespace_isolation() -> SessionNamespaceIsolationReceipt {' \
+    'pub struct SessionNamespaceIsolationReceipt {' \
+    'pub const fn into_marker(self) -> &'"'"'static str {' \
+    'SessionNamespaceIsolationReceipt {' \
+    'marker: "IO Namespace foreign_bdf_rejected=true bidirectional=true portal_state_unchanged=true pre_pci_dma=true",' \
+    'left.bind_session_authority(right_authority)' \
+    'right.bind_session_authority(left_authority)' \
+    'assert_eq!(left.state_projection(), left_before);' \
+    'assert_eq!(right.state_projection(), right_before);' \
     'gate: IoGate<4>,' \
     '.commit_with(authority' \
+    '.can_complete_device(authority)' \
     '.begin_closing()' \
     '.begin_reset(close)' \
     '.apply_reset(receipt)' \
@@ -39,5 +67,39 @@ if grep -Eq 'struct EffectRecord|enum PortalPhase|effects: \[Option<EffectRecord
     echo 'Stage 5B Portal regained a shadow commit/terminal effect ledger' >&2
     exit 1
 fi
+if grep -Fq 'let mut probe = self.gate' "$source_file"; then
+    echo 'Stage 7B I/O adapter copied the unique IoGate owner' >&2
+    exit 1
+fi
+if grep -Fq 'pub fn open(' "$source_file"; then
+    echo 'Stage 7B I/O adapter exposed an unbound raw Session constructor' >&2
+    exit 1
+fi
 
-echo 'Stage 7B I/O gate adapter: PASS authority_identity=delegated commit_gate=shared reset_typestate=shared iotlb_typestate=shared shadow_ledger=false'
+negative_call='let namespace_isolation = portal::assert_session_namespace_isolation();'
+negative_marker='println!("{}", namespace_isolation.into_marker());'
+raw_marker='IO Namespace foreign_bdf_rejected=true bidirectional=true portal_state_unchanged=true pre_pci_dma=true'
+discovery_call='let (mut root, device_function, memory_bars) = pci::discover_and_own_bars();'
+for literal in "$negative_call" "$negative_marker" "$discovery_call"; do
+    if [[ $(grep -Fc "$literal" "$entry_file") -ne 1 ]]; then
+        echo "Stage 7B I/O entrypoint must contain one exact namespace-negative step: $literal" >&2
+        exit 1
+    fi
+done
+negative_line=$(grep -nF "$negative_call" "$entry_file" | cut -d: -f1)
+marker_line=$(grep -nF "$negative_marker" "$entry_file" | cut -d: -f1)
+discovery_line=$(grep -nF "$discovery_call" "$entry_file" | cut -d: -f1)
+if ! ((negative_line < marker_line && marker_line < discovery_line)); then
+    echo 'Stage 7B I/O namespace negative must execute before its marker and before PCI/DMA discovery' >&2
+    exit 1
+fi
+if grep -Fq 'if false {' "$entry_file"; then
+    echo 'Stage 7B I/O entrypoint conditionally suppressed a required namespace negative' >&2
+    exit 1
+fi
+if grep -Fq "$raw_marker" "$entry_file"; then
+    echo 'Stage 7B I/O entrypoint fabricated the namespace marker without its typed receipt' >&2
+    exit 1
+fi
+
+echo 'Stage 7B I/O gate adapter: PASS authority_identity=delegated session_device_instance=bound pre_pci_dma_negative=executed commit_gate=shared reset_typestate=shared iotlb_typestate=shared shadow_ledger=false'

@@ -15,11 +15,13 @@ harness_case = "wake_vs_timeout_single_winner"
 fault_cells = ["personality-readiness.ready-vs-timeout"]
 positive_gate = "one terminal winner, one publication acknowledgement, full credit return, and no live reverse-index membership"
 negative_gates = ["double-terminal", "double-publication-ack", "terminal-effect-remains-live"]
+assertion_markers = ["oneshot-single-terminal", "oneshot-receipt-provenance", "deadline-single-consume", "registry-terminal-once", "typed-receipt-registry-disposition", "publication-ack-once", "credits-fully-returned", "reverse-indexes-empty", "scope-revoked"]
 
 [[race]]
 id = "wait.cancel-vs-wake-single-winner"
 production_sources = [
   "crates/cser-transition-gates/src/oneshot.rs",
+  "crates/cser-transition-gates/src/deadline.rs",
   "kernel/nexus-ostd/src/cser/effect_registry.rs",
 ]
 harness = "crates/cser-transition-gates/tests/oneshot_loom.rs"
@@ -27,6 +29,7 @@ harness_case = "cancel_vs_wake_single_winner"
 fault_cells = ["personality-readiness.revoke-vs-ready"]
 positive_gate = "cancel and wake have one applied terminal result and remove all live memberships"
 negative_gates = ["late-wake-mutates-cancelled-wait", "credit-returned-twice"]
+assertion_markers = ["oneshot-single-terminal", "oneshot-receipt-provenance", "late-wake-rejected", "typed-receipt-registry-disposition", "publication-ack-once", "credits-fully-returned", "reverse-indexes-empty", "scope-revoked"]
 
 [[race]]
 id = "wait.stale-deadline-after-rearm"
@@ -36,6 +39,7 @@ harness_case = "stale_deadline_after_rearm"
 fault_cells = ["personality-readiness.stale-deadline-after-rearm"]
 positive_gate = "the old deadline generation is rejected with the full projection unchanged and the new generation remains live"
 negative_gates = ["old-deadline-terminalizes-new-wait", "rearm-inherits-terminal-state"]
+assertion_markers = ["old-token-rejected", "rejection-failure-atomic", "replacement-generation-advanced", "replacement-remains-live"]
 
 [[race]]
 id = "pager.same-page-single-publication"
@@ -48,6 +52,7 @@ harness_case = "same_page_single_publication"
 fault_cells = ["pager.same-page-concurrent-fault"]
 positive_gate = "one mapping publication resolves both one-shot continuations and releases the losing candidate exactly once"
 negative_gates = ["double-mapping-publication", "resume-before-mapping-commit", "losing-frame-untracked"]
+assertion_markers = ["resume-before-commit-rejected", "publication-closure-once", "losing-candidate-released-once", "continuations-terminal-once", "duplicate-resume-rejected", "scope-revoked"]
 
 [[race]]
 id = "pager.handler-crash-before-resolution"
@@ -63,10 +68,15 @@ fault_cells = [
 ]
 positive_gate = "crash fences the old binding and every registered continuation reaches adopt, resolve, or abort"
 negative_gates = ["unindexed-suspension", "implicit-adoption", "old-binding-resume"]
+assertion_markers = ["crash-fences-old-binding", "committed-crash-kernel-terminal", "uncommitted-crash-aborts", "continuation-single-terminal", "no-implicit-adoption", "scope-revoked"]
 
 [[race]]
 id = "pager.old-binding-reply-after-rebind"
-production_sources = ["crates/cser-transition-gates/src/pager.rs"]
+production_sources = [
+  "crates/cser-transition-gates/src/pager.rs",
+  "crates/cser-transition-gates/src/oneshot.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+]
 harness = "crates/cser-transition-gates/tests/pager_loom.rs"
 harness_case = "old_binding_reply_after_rebind"
 fault_cells = [
@@ -75,6 +85,7 @@ fault_cells = [
 ]
 positive_gate = "the old reply is rejected before page-table, continuation, or credit mutation"
 negative_gates = ["old-reply-consumes-continuation", "old-reply-publishes-pte", "double-resume"]
+assertion_markers = ["mapping-committed-before-crash", "old-reply-failure-atomic", "old-reply-no-resume", "old-reply-credit-failure-atomic", "kernel-terminal-once", "scope-revoked"]
 
 [[race]]
 id = "pager.adopt-vs-abort-single-winner"
@@ -87,6 +98,7 @@ harness_case = "adopt_vs_abort_single_winner"
 fault_cells = ["pager.timeout-vs-late-reply"]
 positive_gate = "adoption or abort changes ownership or terminal state exactly once"
 negative_gates = ["terminal-effect-adopted", "automatic-adoption", "credit-duplication"]
+assertion_markers = ["decision-single-winner", "adoption-explicit-only", "ownership-authority-consumed-once", "continuation-terminal-once", "late-action-failure-atomic", "scope-revoked"]
 
 [[race]]
 id = "continuation.resolve-vs-abort-one-shot"
@@ -97,8 +109,9 @@ production_sources = [
 harness = "crates/cser-transition-gates/tests/oneshot_loom.rs"
 harness_case = "resolve_vs_abort_one_shot"
 fault_cells = ["pager.timeout-vs-late-reply"]
-positive_gate = "resolve and abort consume one terminal authority and one waker at most once"
+positive_gate = "resolve and abort consume one terminal authority and one modeled publication acknowledgement at most once"
 negative_gates = ["second-resume", "resolve-after-abort", "abort-after-resolve", "token-reuse"]
+assertion_markers = ["oneshot-single-terminal", "oneshot-receipt-provenance", "second-terminal-rejected", "token-reuse-rejected", "typed-receipt-registry-disposition", "publication-ack-once", "credits-fully-returned", "reverse-indexes-empty", "scope-revoked"]
 
 [[race]]
 id = "scope.commit-vs-revoke-linearization"
@@ -112,6 +125,7 @@ fault_cells = [
 ]
 positive_gate = "commit-first records drain work while revoke-first closes the old authority gate"
 negative_gates = ["closed-epoch-commit", "committed-effect-reported-rolled-back"]
+assertion_markers = ["commit-revoke-single-order", "closed-epoch-commit-rejected", "committed-effect-drained", "uncommitted-effect-aborted", "reverse-index-empty", "scope-revoked"]
 
 [[race]]
 id = "scope.revoke-deferred-wait-timer"
@@ -128,6 +142,7 @@ fault_cells = [
 ]
 positive_gate = "revocation closes only the target cohort and late wait or timer activity cannot reopen it"
 negative_gates = ["unrelated-effect-visit", "history-effect-visit", "late-notification", "revoked-scope-reopened"]
+assertion_markers = ["target-cohort-only", "oneshot-receipt-provenance", "typed-receipt-registry-disposition", "late-wake-failure-atomic", "late-timer-failure-atomic", "credits-fully-returned", "reverse-index-empty", "unrelated-history-unvisited", "scope-revoked"]
 
 [[race]]
 id = "budget.commit-vs-abort-conservation"
@@ -140,6 +155,7 @@ fault_cells = [
 ]
 positive_gate = "commit or abort selects one credit disposition and preserves free plus held plus committed capacity"
 negative_gates = ["credit-copied", "completion-disposes-credit-twice", "abort-after-commit-returns-credit"]
+assertion_markers = ["single-credit-disposition", "free-held-committed-conserved", "credit-returned-once", "duplicate-completion-rejected", "abort-after-commit-not-reported", "scope-revoked"]
 
 [[race]]
 id = "scheduler.fallback-before-rebind"
@@ -155,6 +171,7 @@ fault_cells = [
 ]
 positive_gate = "crash advances binding once, fallback picks before rebind, and pre-rebind or stale proposals are rejected"
 negative_gates = ["rebind-advances-binding", "fallback-bypassed", "repeated-crash-advances-binding"]
+assertion_markers = ["crash-advances-binding-once", "repeated-crash-unchanged", "pending-proposal-cleared", "fallback-pick-before-rebind", "rebind-keeps-binding-epoch", "stale-proposals-failure-atomic"]
 
 [[race]]
 id = "io.publish-vs-revoke-commit-gate"
@@ -166,7 +183,8 @@ fault_cells = [
   "linux-io.completion-vs-reset-ack",
 ]
 positive_gate = "publication and revoke have one order, with uncommitted losers aborted and committed winners drained or reset"
-negative_gates = ["dma-owner-freed-on-software-cancel", "committed-request-reported-rolled-back"]
+negative_gates = ["committed-effect-reused-before-reset", "committed-request-reported-rolled-back"]
+assertion_markers = ["commit-revoke-single-order", "publication-closure-at-most-once", "uncommitted-loser-aborted", "committed-effect-retained-until-reset", "committed-result-not-rolled-back", "modeled-iotlb-owner-progress-complete", "pre-quiescence-reuse-rejected", "post-quiescence-new-binding", "final-quiescence-before-rebind"]
 
 [[race]]
 id = "io.timeout-vs-late-completion-tombstone"
@@ -181,3 +199,4 @@ fault_cells = [
 ]
 positive_gate = "timeout retains ownership until reset and IOTLB receipts allow exactly one retry completion"
 negative_gates = ["owner-reused-before-quiescence", "second-user-result", "fabricated-iotlb-ack", "deadline-reported-revoked"]
+assertion_markers = ["reset-tombstone-preserves-identity", "completion-reset-single-terminal", "second-user-result-rejected", "modeled-iotlb-owner-tombstone-preserves-progress", "duplicate-owner-rejected", "fabricated-ack-failure-atomic", "duplicate-ack-failure-atomic", "pre-quiescence-reuse-rejected", "post-quiescence-new-binding", "retry-completes-exactly-once", "final-quiescence-before-rebind"]

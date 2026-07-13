@@ -65,11 +65,36 @@ negative_mutations = [
   "missing-harness",
   "unknown-fault-cell",
   "drop-fault-mapping",
+  "drop-assertion-marker",
+  "duplicate-assertion-marker",
+  "unknown-assertion-marker",
+  "reorder-assertion-marker",
+  "copyable-io-gate-instance",
+  "forgeable-io-identity",
+  "unbound-io-receipt-instance",
+  "unbound-session-device-instance",
+  "drop-pre-pci-session-negative-call",
+  "move-session-negative-after-pci-discovery",
+  "conditionally-skip-pre-pci-session-negative",
+  "fabricate-pre-pci-session-marker",
+  "drop-session-device-validity",
+  "drop-session-bidirectional-negative",
+  "move-session-receipt-before-assertions",
+  "alias-copyable-session-receipt",
+  "decouple-typed-terminal-registry-disposition",
+  "decouple-oneshot-receipt-provenance",
+  "reconstruct-identical-oneshot-instance",
+  "alias-copyable-oneshot-gate",
 ]
 
 [fault_matrix]
 families = ["scheduler", "pager", "personality-readiness", "linux-io"]
 cells_per_family = 5
+registry_backed_nonzero_credit_cells = 15
+typed_no_credit_scheduler_witnesses = 5
+registry_scope_model = "case-local"
+shared_production_scope_claimed = false
+cross_object_crash_panic_atomicity_claimed = false
 required_cell_ids = [
   "scheduler.lease-expiry-before-proposal",
   "scheduler.crash-after-proposal-before-pick",
@@ -115,6 +140,25 @@ negative_mutations = [
   "duplicate-terminal-result",
   "mutated-rejected-operation",
   "early-retained-resource-release",
+  "expected-copied-to-observed",
+  "constant-final-quiescent",
+  "population-as-credit",
+  "constant-credit-self-report",
+  "drop-composite-reserve",
+  "drop-composite-commit",
+  "drop-composite-terminal-release",
+  "replace-composite-binding",
+  "reintroduce-detached-credit-sidecar",
+  "literal-scheduler-no-credit",
+  "detach-io-registry-commit",
+  "early-io-credit-release",
+  "capacity-as-credit-self-report",
+  "drop-scope-ledger-lineage",
+  "fault-budget-helper-capacity-self-report",
+  "hidden-fault-budget-registry-sidecar",
+  "hidden-cloned-fault-budget-registry-sidecar",
+  "drop-fault-budget-instance-validation",
+  "unauthenticated-causal-commit-receipt",
 ]
 
 [scale]
@@ -125,6 +169,7 @@ required_metrics = [
   "head_selections",
   "terminalized",
   "completion_members_checked",
+  "target_index_removals",
   "unrelated_effect_visits",
   "history_effect_visits",
   "final_target_state",
@@ -137,6 +182,9 @@ negative_mutations = [
   "parameter-drift",
   "nonzero-unrelated-visits",
   "nonzero-history-visits",
+  "hardcoded-zero-work-counter",
+  "untracked-begin-record-scan",
+  "untracked-global-or-history-scan",
 ]
 
 [[scale.point]]
@@ -471,6 +519,8 @@ negative_mutations = [
   "support-bounded-with-missing-required-gate",
   "support-bounded-with-failed-central-cell",
   "narrow-with-hidden-exclusion",
+  "narrow-with-hidden-shared-fault-scope",
+  "narrow-with-hidden-cross-object-atomicity",
   "forbidden-novelty-word",
 ]
 

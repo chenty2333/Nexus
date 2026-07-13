@@ -105,6 +105,68 @@ check_source() {
             exit 1
         fi
 
+        cp src/portal.rs "$tmp/missing-instance-namespace.rs"
+        sed -i '\''s/IoGate::new(instance_id)/IoGate::new(1)/'\'' \
+            "$tmp/missing-instance-namespace.rs"
+        if bash scripts/check-io-gate.sh "$tmp/missing-instance-namespace.rs" >/dev/null 2>&1; then
+            echo "I/O adapter oracle accepted an unbound gate instance namespace" >&2
+            exit 1
+        fi
+
+        cp src/portal.rs "$tmp/missing-session-instance-binding.rs"
+        sed -i '\''s/authority\.instance_id() != self\.gate\.instance_id()/self.gate.instance_id() == 0/'\'' \
+            "$tmp/missing-session-instance-binding.rs"
+        if bash scripts/check-io-gate.sh "$tmp/missing-session-instance-binding.rs" >/dev/null 2>&1; then
+            echo "I/O adapter oracle accepted a foreign authority for another Session BDF" >&2
+            exit 1
+        fi
+
+        cp src/lib.rs "$tmp/missing-session-negative-call.rs"
+        sed -i '\''/let namespace_isolation = portal::assert_session_namespace_isolation();/d'\'' \
+            "$tmp/missing-session-negative-call.rs"
+        if bash scripts/check-io-gate.sh src/portal.rs "$tmp/missing-session-negative-call.rs" >/dev/null 2>&1; then
+            echo "I/O adapter oracle accepted a marker without executing the namespace negative" >&2
+            exit 1
+        fi
+
+        cp src/lib.rs "$tmp/late-session-negative-call.rs"
+        sed -i '\''/let namespace_isolation = portal::assert_session_namespace_isolation();/d'\'' \
+            "$tmp/late-session-negative-call.rs"
+        sed -i '\''/println!("{}", namespace_isolation.into_marker());/d'\'' \
+            "$tmp/late-session-negative-call.rs"
+        sed -i '\''/let (mut root, device_function, memory_bars) = pci::discover_and_own_bars();/a\    let namespace_isolation = portal::assert_session_namespace_isolation();\n    println!("{}", namespace_isolation.into_marker());'\'' \
+            "$tmp/late-session-negative-call.rs"
+        if bash scripts/check-io-gate.sh src/portal.rs "$tmp/late-session-negative-call.rs" >/dev/null 2>&1; then
+            echo "I/O adapter oracle accepted the namespace negative after PCI/DMA discovery" >&2
+            exit 1
+        fi
+
+        cp src/lib.rs "$tmp/conditional-session-negative-call.rs"
+        sed -i '\''/let namespace_isolation = portal::assert_session_namespace_isolation();/i\    if false {'\'' \
+            "$tmp/conditional-session-negative-call.rs"
+        sed -i '\''/println!("{}", namespace_isolation.into_marker());/a\    }'\'' \
+            "$tmp/conditional-session-negative-call.rs"
+        if bash scripts/check-io-gate.sh src/portal.rs "$tmp/conditional-session-negative-call.rs" >/dev/null 2>&1; then
+            echo "I/O adapter oracle accepted a conditionally skipped namespace negative" >&2
+            exit 1
+        fi
+
+        cp src/lib.rs "$tmp/fabricated-session-negative-marker.rs"
+        sed -i '\''s/println!("{}", namespace_isolation.into_marker());/println!("IO Namespace foreign_bdf_rejected=true bidirectional=true portal_state_unchanged=true pre_pci_dma=true");/'\'' \
+            "$tmp/fabricated-session-negative-marker.rs"
+        if bash scripts/check-io-gate.sh src/portal.rs "$tmp/fabricated-session-negative-marker.rs" >/dev/null 2>&1; then
+            echo "I/O adapter oracle accepted a caller-fabricated namespace marker" >&2
+            exit 1
+        fi
+
+        cp src/portal.rs "$tmp/copied-gate-probe.rs"
+        sed -i '\''s/self\.gate\.can_complete_device(authority)/{ let mut probe = self.gate; probe.complete_device(authority).is_ok() }/'\'' \
+            "$tmp/copied-gate-probe.rs"
+        if bash scripts/check-io-gate.sh "$tmp/copied-gate-probe.rs" >/dev/null 2>&1; then
+            echo "I/O adapter oracle accepted a copied gate probe" >&2
+            exit 1
+        fi
+
         cp src/portal.rs "$tmp/shadow-epoch.rs"
         sed -i '\''/pub struct Portal {/a\    authority_epoch: u64,'\'' \
             "$tmp/shadow-epoch.rs"
@@ -112,7 +174,7 @@ check_source() {
             echo "I/O adapter oracle accepted a shadow authority epoch" >&2
             exit 1
         fi
-        echo "Stage 7B I/O gate negative assertions: PASS missing_gate=rejected missing_commit_gate=rejected shadow_epoch=rejected"
+        echo "Stage 7B I/O gate negative assertions: PASS missing_gate=rejected missing_commit_gate=rejected missing_instance_namespace=rejected missing_session_instance_binding=rejected missing_session_negative_execution=rejected late_session_negative_execution=rejected conditional_session_negative_execution=rejected fabricated_session_marker=rejected copied_gate_probe=rejected shadow_epoch=rejected"
     '
 }
 

@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 const INPUT: &str = "kernel/nexus-ostd/artifacts/stage7b-evaluation.log";
 const RUNTIME_METADATA: &str = "kernel/nexus-ostd/artifacts/stage7b-runtime-metadata.env";
+const EVALUATOR_SOURCE: &str = "kernel/nexus-ostd/src/evaluation/stage7b.rs";
+const FAULT_REGISTRY_SOURCE: &str = "kernel/nexus-ostd/src/cser/effect_registry.rs";
 const OUTPUT_DIRECTORY: &str = "target/verification/stage7b";
 const FAULT_OUTPUT: &str = "fault-matrix.jsonl";
 const SCALE_OUTPUT: &str = "scale.jsonl";
@@ -263,7 +265,7 @@ const FAULTS: &[FaultSpec] = &[
         "IndeterminateAfterReset",
         1,
         1,
-        ownership(1, false),
+        ownership(1, true),
     ),
     fault(
         "linux-io.reset-timeout-retry",
@@ -491,6 +493,7 @@ pub(crate) fn run(root: &Path) -> Result<Summary, String> {
     let output = root.join(OUTPUT_DIRECTORY);
     fs::create_dir_all(&output).map_err(|error| format!("create {}: {error}", output.display()))?;
     clear_outputs(&output)?;
+    validate_fault_sources(root)?;
 
     let log = read_regular(root, INPUT, false)?
         .ok_or_else(|| format!("required Stage 7B evaluation log is missing: {INPUT}"))?;
@@ -505,7 +508,7 @@ pub(crate) fn run(root: &Path) -> Result<Summary, String> {
     let scales = json_lines(&parsed.scales)?;
     let performance = pretty_json(&parsed.performance)?;
     let oracle = format!(
-        "schema=nexus.stage7b.runtime-oracle.v1\nstatus=passed\nfault_cells={}\nscale_points={}\nperformance_cases={}\nruntime_metadata={}\nperformance_claim=Observed\nperformance_thresholds=none\n",
+        "schema=nexus.stage7b.runtime-oracle.v1\nstatus=passed\nfault_source=typed-receipt-projection-checked\nfault_cells={}\nfault_registry_backed_nonzero_credit_cells=15\nfault_scheduler_typed_no_credit_witnesses=5\nfault_registry_scope=case-local\nfault_shared_production_scope_claimed=false\nfault_cross_object_crash_panic_atomicity_claimed=false\nscale_points={}\nperformance_cases={}\nruntime_metadata={}\nperformance_claim=Observed\nperformance_thresholds=none\n",
         parsed.faults.len(),
         parsed.scales.len(),
         parsed.performance.cases.len(),
@@ -523,6 +526,456 @@ pub(crate) fn run(root: &Path) -> Result<Summary, String> {
         performance_cases: parsed.performance.cases.len(),
         runtime_metadata: parsed.performance.runtime_metadata.is_some(),
     })
+}
+
+fn validate_fault_sources(root: &Path) -> Result<(), String> {
+    let source = read_regular(root, EVALUATOR_SOURCE, false)?.ok_or_else(|| {
+        format!("required Stage 7B evaluator source is missing: {EVALUATOR_SOURCE}")
+    })?;
+    let registry = read_regular(root, FAULT_REGISTRY_SOURCE, false)?.ok_or_else(|| {
+        format!("required Stage 7B fault Registry source is missing: {FAULT_REGISTRY_SOURCE}")
+    })?;
+    validate_fault_evaluator_source_text(&source)?;
+    validate_fault_registry_source_text(&registry)
+}
+
+fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
+    let registry_constructors = source.matches("EffectRegistry::new").count();
+    if registry_constructors != 7 {
+        return Err(format!(
+            "Stage 7B Registry source constructor population drifted; hidden sidecars are forbidden (expected 7, observed {registry_constructors})"
+        ));
+    }
+    let helper_start = source
+        .find("pub(crate) struct Stage7bFaultCredit {")
+        .ok_or_else(|| "Stage 7B fault Registry lacks linear credit helper".to_owned())?;
+    let helper_end = source
+        .find("pub(crate) struct Stage7bNoCreditProjection {")
+        .ok_or_else(|| "Stage 7B fault Registry lacks typed no-credit boundary".to_owned())?;
+    if helper_end <= helper_start {
+        return Err("Stage 7B fault Registry helper boundary is inverted".into());
+    }
+    let helper = &source[helper_start..helper_end];
+    if helper.contains("Stage7bActiveFixture") || helper.contains("run_registry_") {
+        return Err("Stage 7B fault Registry helper contains a detached fixture sidecar".into());
+    }
+    let registries = helper.matches("EffectRegistry::new()").count();
+    if registries != 1 {
+        return Err(format!(
+            "Stage 7B fault Registry helper must own exactly one production Registry, observed {registries}"
+        ));
+    }
+    let expected_budget = concat!(
+        "#[derive(Debug, Eq, PartialEq)]\n",
+        "pub(crate) struct Stage7bFaultBudget {\n",
+        "    case: Stage7bFaultCase,\n",
+        "    instance_id: u64,\n",
+        "    registry: EffectRegistry,\n",
+        "    scope: ScopeKey,\n",
+        "    task: TaskKey,\n",
+        "    credit: CreditClass,\n",
+        "    bindings: BTreeSet<Stage7bFaultBinding>,\n",
+        "    commit_operations: usize,\n",
+        "    terminal_operations: usize,\n",
+        "}\n",
+    );
+    let expected_state = concat!(
+        "#[derive(Clone, Debug, Eq, PartialEq)]\n",
+        "pub(crate) struct Stage7bFaultBudgetState {\n",
+        "    case: Stage7bFaultCase,\n",
+        "    instance_id: u64,\n",
+        "    registry: EffectRegistry,\n",
+        "    scope: ScopeKey,\n",
+        "    task: TaskKey,\n",
+        "    credit: CreditClass,\n",
+        "    bindings: BTreeSet<Stage7bFaultBinding>,\n",
+        "    commit_operations: usize,\n",
+        "    terminal_operations: usize,\n",
+        "}\n",
+    );
+    if helper
+        .matches("pub(crate) struct Stage7bFaultBudget {")
+        .count()
+        != 1
+        || !helper.contains(expected_budget)
+        || helper
+            .matches("pub(crate) struct Stage7bFaultBudgetState {")
+            .count()
+            != 1
+        || !helper.contains(expected_state)
+    {
+        return Err(
+            "Stage 7B fault budget and its failure-atomic snapshot must retain their exact complete field sets"
+                .into(),
+        );
+    }
+    if helper.matches("registry.clone()").count() != 1 {
+        return Err(
+            "Stage 7B fault budget permits exactly one Registry clone in its complete state snapshot"
+                .into(),
+        );
+    }
+
+    let observed_start = helper
+        .find("pub(crate) fn observed_credit_units(")
+        .ok_or_else(|| {
+            "Stage 7B fault Registry lacks phase-derived credit observation".to_owned()
+        })?;
+    let observed_end = helper[observed_start..]
+        .find("\n}\n\n#[derive(Debug, Eq, PartialEq)]")
+        .map(|offset| observed_start + offset)
+        .ok_or_else(|| {
+            "Stage 7B fault Registry credit observation boundary is missing".to_owned()
+        })?;
+    let observed = &helper[observed_start..observed_end];
+    let observed_compact: String = observed
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let expected_observed = concat!(
+        "pub(crate)fnobserved_credit_units(&self)->Result<usize,RegistryError>{",
+        "letcredits=self.registry.credits;",
+        "letunits=matchself.registry.phase{",
+        "ScopePhase::Active|ScopePhase::Closing=>credits.held.checked_add(credits.committed)",
+        ".ok_or(RegistryError::CounterOverflow)?,",
+        "ScopePhase::Revoked=>credits.free,",
+        "};",
+        "usize::try_from(units).map_err(|_|RegistryError::CounterOverflow)",
+        "}",
+    );
+    if observed_compact != expected_observed {
+        return Err(
+            "Stage 7B fault Registry credit observation must remain the exact phase-derived held+committed/free projection"
+                .into(),
+        );
+    }
+
+    for required in [
+        "instance_id: u64,\n    binding: Stage7bFaultBinding,",
+        "pub(crate) instance_id: u64,",
+        "instance_id: u64,\n    registry: EffectRegistry,",
+        "pub(crate) fn new(case: Stage7bFaultCase, instance_id: u64)",
+        "if capacity == 0 || instance_id == 0",
+        "let scope = ScopeKey::new(instance_id, tag);",
+        "usize::try_from(self.instance_id)",
+        "instance_id: self.instance_id,",
+        "credit.instance_id != self.instance_id",
+        "pub(crate) struct Stage7bFaultBudgetState {",
+        "registry: self.registry.clone(),",
+        "ScopePhase::Active | ScopePhase::Closing => credits",
+        ".held\n                .checked_add(credits.committed)",
+        "ScopePhase::Revoked => credits.free,",
+    ] {
+        if !helper.contains(required) {
+            return Err(format!(
+                "Stage 7B fault Registry helper lacks instance/credit invariant {required:?}"
+            ));
+        }
+    }
+
+    for required in [
+        "fn causal_commit_matches(",
+        "causal.registry_instance_id != registry_instance_id",
+        "causal.scope != target.scope",
+        "causal.authority_epoch != target.authority_epoch",
+        "causal.binding_epoch > target.binding_epoch",
+        "source.identity.scope == target.scope",
+        "source.commit.as_ref() == Some(causal)",
+        "completion has invalid causal commit",
+        "pub(crate) fn stage7b_causal_commit_self_test()",
+        "TerminalRequest::completed_by(2, source_commit.clone())",
+        "assert_eq!(cross_scope, cross_scope_before);",
+        "first_commit.registry_instance_id",
+        "assert_eq!(first_commit.scope, second_commit.scope);",
+        "assert_eq!(first, first_before);",
+        "assert_eq!(second, second_before);",
+    ] {
+        if !source.contains(required) {
+            return Err(format!(
+                "Stage 7B Registry lacks causal receipt provenance gate {required:?}"
+            ));
+        }
+    }
+    if source.matches("!causal_commit_matches(").count() != 2 {
+        return Err(
+            "Stage 7B Registry must validate causal commits both at transition and invariant reconstruction"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_fault_evaluator_source_text(source: &str) -> Result<(), String> {
+    for forbidden in [
+        "FaultCell::pass",
+        "const fn pass(",
+        "run_registry_budget",
+        "run_registry_fault",
+        "RegistryBudgetRun",
+        "RegistryFaultRun",
+        "final_quiescent=true",
+        "observed_terminal: spec.expected_terminal",
+        "observed_terminal: self.spec.expected_terminal",
+        "final_quiescent: true",
+        "credits: usize::from(self.pending.is_some())",
+        "credits: usize::from(self.gate.pending.is_some())",
+        "credits: self.waiter_count",
+        "credits: self.gate.waiter_count",
+        "credits: self.effect_count",
+        "credits: self.gate.effect_count",
+        "credits: usize::try_from(self.budget.registry.credits.capacity).unwrap(),",
+        "credits: 0,",
+        "credits: 1,",
+    ] {
+        if source.contains(forbidden) {
+            return Err(format!(
+                "Stage 7B fault evaluator contains forbidden self-report pattern {forbidden:?}"
+            ));
+        }
+    }
+
+    let fault_start = source
+        .find("fn run_fault_matrix()")
+        .ok_or_else(|| "Stage 7B evaluator lacks fault-matrix entry point".to_owned())?;
+    let fault_end = source
+        .find("#[derive(Clone, Copy)]\nstruct ScalePoint")
+        .ok_or_else(|| "Stage 7B evaluator lacks fault/scale boundary".to_owned())?;
+    if fault_end <= fault_start {
+        return Err("Stage 7B evaluator fault/scale source boundary is inverted".into());
+    }
+    let fault_source = &source[fault_start..fault_end];
+    for detached in [
+        "Stage7bActiveFixture::new",
+        "Stage7bFixtureConfig",
+        "EffectRegistry::new",
+        "fn run_registry_",
+    ] {
+        if fault_source.contains(detached) {
+            return Err(format!(
+                "Stage 7B fault evaluator contains detached Registry sidecar {detached:?}"
+            ));
+        }
+    }
+
+    for required in [
+        "fn from_projections<P: FaultProjection>(",
+        "observed_terminal: observation.observed_terminal,",
+        "final_quiescent: observation.final_quiescent,",
+        ".checked_sub(observation.before.terminalizations)",
+        ".checked_sub(observation.before.publications)",
+        "retained_before_quiescence: retained.retained_for_retry(),",
+        "final_quiescent: after.determinately_quiescent(),",
+        "self.spec.expected_terminal.label(),\n            self.observed_terminal.label(),",
+        "self.final_quiescent,",
+        "FaultCell::checked(spec, observation).print();",
+        "pick: FallbackPick,",
+        "receipts: &[ContinuationReceipt],",
+        "receipt: &OneShotTerminalReceipt<ReadinessOutcome>,",
+        "receipt: ExpiryReceipt,",
+        "budget: Stage7bNoCreditProjection,",
+        "Stage7bNoCredit::new(case, scheduler_fault_binding(case, crash, 7, 1))",
+        ".consume(scheduler_fault_binding(",
+        "budget: Stage7bFaultBudgetProjection,",
+        "let mut leader_credit = budget.reserve(leader_binding).unwrap();",
+        "let mut follower_credit = budget.reserve(follower_binding).unwrap();",
+        "budget.commit(&mut leader_credit, leader_binding, 0)?;",
+        "budget.commit(&mut follower_credit, follower_binding, 0)",
+        "terminalize_pager_credit(",
+        "assert_eq!(pager_fault_binding(case, adopted), binding);",
+        "terminalize_readiness_credit(",
+        "token.instance_id(),",
+        "OneShotGate::new(fault_budget_instance_id(case), 1, 1)",
+        "gate.consume_terminal(&terminal).unwrap();",
+        "readiness_deadline_binding(case, expiry.token()),",
+        "struct IoFaultComposite {",
+        ".commit_with(identity, || budget.commit(credit, binding, 0))",
+        "assert_eq!(self.gate.projection().phase, IoPhase::Quiesced);",
+        "retained.budget.registry.credits.committed",
+        "budget: self.budget.finish().unwrap(),",
+        "fault_budget_projection_is_quiescent(&self.budget)",
+        "credits: self.budget.observed_credit_units().unwrap(),",
+        "assert_ne!(before.instance_id, 0);",
+        "assert_eq!(before.instance_id, retained.instance_id);",
+        "assert_eq!(before.instance_id, after.instance_id);",
+        "check_fault_budget_instance_isolation();",
+        "Stage7bFaultBudget::new(case, 0)",
+        "first.commit(&mut second_credit, binding, 0)",
+        "second.commit(&mut first_credit, binding, 0)",
+        "assert_ne!(first_before.instance_id, second_before.instance_id);",
+        "assert_ne!(first_before.scope, second_before.scope);",
+        "assert_eq!(first.state_snapshot(), first_state_before);",
+        "assert_eq!(second.state_snapshot(), second_state_before);",
+        "stage7b_causal_commit_self_test();",
+        "assert_eq!(before.scope, retained.scope);",
+        "assert_eq!(before.scope, after.scope);",
+        "assert_eq!(before.registry.phase, ScopePhase::Active);",
+        "assert_eq!(after.registry.phase, ScopePhase::Revoked);",
+        "assert_eq!(after.registry.credits.free, after.registry.credits.capacity);",
+        "assert_eq!(after.registry.credits.held, 0);",
+        "assert_eq!(after.registry.credits.committed, 0);",
+        "IoCommitReceipt,",
+        "QuiescenceReceipt,",
+        "self.gate.phase == IoPhase::Quiesced",
+    ] {
+        if !source.contains(required) {
+            return Err(format!(
+                "Stage 7B fault evaluator lacks required receipt/projection source gate {required:?}"
+            ));
+        }
+    }
+
+    for case in [
+        "SchedulerLeaseExpiryBeforeProposal",
+        "SchedulerCrashAfterProposalBeforePick",
+        "SchedulerStaleProposalBeforeRebind",
+        "SchedulerStaleProposalAfterRebind",
+        "SchedulerRepeatedCrashFallbackProgress",
+        "PagerSamePageConcurrentFault",
+        "PagerCrashBeforePrepare",
+        "PagerCrashAfterPrepareBeforeCommit",
+        "PagerCrashAfterCommitBeforeResume",
+        "PagerTimeoutVsLateReply",
+        "ReadinessCrashBeforeBackendCommit",
+        "ReadinessCrashAfterBackendCommit",
+        "ReadinessReadyVsTimeout",
+        "ReadinessRevokeVsReady",
+        "ReadinessStaleDeadlineAfterRearm",
+        "IoRevokeBeforeDevicePublication",
+        "IoCompletionVsResetAck",
+        "IoResetTimeoutRetry",
+        "IoIotlbTimeoutLateAck",
+        "IoStaleDuplicateCompletion",
+    ] {
+        let fragment = format!("Stage7bFaultCase::{case}");
+        let expected = if case == "ReadinessCrashBeforeBackendCommit" {
+            2
+        } else {
+            1
+        };
+        let observed = fault_source.matches(&fragment).count();
+        if observed != expected {
+            return Err(format!(
+                "Stage 7B fault semantic case binding drift for {case}: expected {expected}, observed {observed}"
+            ));
+        }
+    }
+
+    for (fragment, expected, label) in [
+        (
+            "Stage7bFaultBudget::new(case,",
+            12,
+            "case-local and isolation composite budgets",
+        ),
+        ("budget.reserve(", 10, "paired credit reservations"),
+        ("budget.commit(", 7, "paired credit commits"),
+        ("budget.finish()", 9, "paired terminal releases"),
+        (
+            ".consume(scheduler_fault_binding(",
+            5,
+            "typed scheduler no-credit consumptions",
+        ),
+        (
+            "terminalize_pager_credit(",
+            6,
+            "pager receipt/credit terminal pairings",
+        ),
+        (
+            "terminalize_readiness_credit(",
+            3,
+            "readiness receipt/credit terminal pairings",
+        ),
+        (
+            "gate.consume_terminal(&terminal)",
+            2,
+            "same-gate readiness receipt consumptions",
+        ),
+        (
+            "OneShotGate::new(fault_budget_instance_id(case), 1, 1)",
+            2,
+            "caller-namespaced readiness gates",
+        ),
+        (
+            "Stage7bFaultOperation::SchedulerFallbackPick",
+            1,
+            "scheduler operation binding",
+        ),
+        (
+            "Stage7bFaultOperation::PagerContinuation",
+            1,
+            "pager operation binding",
+        ),
+        (
+            "Stage7bFaultOperation::ReadinessCompletion",
+            3,
+            "readiness operation bindings",
+        ),
+        (
+            "Stage7bFaultOperation::IoRequest",
+            1,
+            "I/O operation binding",
+        ),
+    ] {
+        let observed = fault_source.matches(fragment).count();
+        if observed != expected {
+            return Err(format!(
+                "Stage 7B fault source pairing drift for {label}: expected {expected}, observed {observed}"
+            ));
+        }
+    }
+
+    let spec_entries = source.matches("fault_spec(").count();
+    if spec_entries != FAULTS.len() + 1 {
+        return Err(format!(
+            "Stage 7B fault evaluator spec population drift: expected {} entries plus constructor, observed {spec_entries}",
+            FAULTS.len()
+        ));
+    }
+    let composite_credit_sources = fault_source
+        .matches("credits: self.budget.observed_credit_units().unwrap(),")
+        .count();
+    let no_credit_sources = fault_source
+        .matches("credits: self.budget.case.credit_capacity(),")
+        .count();
+    if composite_credit_sources != 4 || no_credit_sources != 1 {
+        return Err(format!(
+            "Stage 7B fault credit source drift: expected four composite Registry projections and one typed no-credit projection, observed composite={composite_credit_sources} no_credit={no_credit_sources}"
+        ));
+    }
+    if fault_source
+        .matches("mark_terminal_quiesced(close)")
+        .count()
+        != 2
+        || fault_source.matches("complete_iotlb(&mut io.gate").count() != 3
+    {
+        return Err(
+            "Stage 7B I/O cells do not expose exactly two terminal-receipt and three reset/IOTLB quiescence paths"
+                .into(),
+        );
+    }
+
+    let io_finish_start = fault_source
+        .find("fn finish_after_quiescence(&mut self) -> IoFaultProjection")
+        .ok_or_else(|| "Stage 7B I/O composite lacks quiescence finalizer".to_owned())?;
+    let io_finish_end = fault_source[io_finish_start..]
+        .find("\n}\n\nfn complete_iotlb")
+        .map(|offset| io_finish_start + offset)
+        .ok_or_else(|| "Stage 7B I/O composite finalizer boundary is missing".to_owned())?;
+    let io_finish = &fault_source[io_finish_start..io_finish_end];
+    let quiescence = io_finish
+        .find("IoPhase::Quiesced")
+        .ok_or_else(|| "Stage 7B I/O credit release is not quiescence-gated".to_owned())?;
+    let terminal = io_finish
+        .find(".terminalize(")
+        .ok_or_else(|| "Stage 7B I/O composite lacks paired terminalization".to_owned())?;
+    let release = io_finish
+        .find("self.budget.finish()")
+        .ok_or_else(|| "Stage 7B I/O composite lacks paired credit release".to_owned())?;
+    if !(quiescence < terminal && terminal < release) {
+        return Err(
+            "Stage 7B I/O Registry terminal/release must follow real gate quiescence".into(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_log(
@@ -1257,6 +1710,260 @@ mod tests {
         assert!(error.is_some(), "mutated log unexpectedly passed");
     }
 
+    fn checked_evaluator_source() -> String {
+        include_str!("../../../kernel/nexus-ostd/src/evaluation/stage7b.rs").into()
+    }
+
+    fn checked_registry_source() -> String {
+        include_str!("../../../kernel/nexus-ostd/src/cser/effect_registry.rs").into()
+    }
+
+    #[test]
+    fn fault_source_gate_accepts_typed_receipt_projection_pipeline() {
+        validate_fault_evaluator_source_text(&checked_evaluator_source()).unwrap();
+        validate_fault_registry_source_text(&checked_registry_source()).unwrap();
+    }
+
+    #[test]
+    fn fault_source_gate_rejects_expected_copy_and_constant_quiescence() {
+        let source = checked_evaluator_source();
+        for mutated in [
+            source.replacen(
+                "observed_terminal: observation.observed_terminal,",
+                "observed_terminal: spec.expected_terminal,",
+                1,
+            ),
+            source.replacen(
+                "self.observed_terminal.label(),",
+                "self.spec.expected_terminal.label(),",
+                1,
+            ),
+            source.replacen(
+                "final_quiescent: observation.final_quiescent,",
+                "final_quiescent: true,",
+                1,
+            ),
+            source.replacen("self.final_quiescent,", "true,", 1),
+        ] {
+            assert!(
+                validate_fault_evaluator_source_text(&mutated).is_err(),
+                "self-report source mutation unexpectedly passed"
+            );
+        }
+    }
+
+    #[test]
+    fn fault_source_gate_rejects_missing_receipt_and_real_io_quiescence_paths() {
+        let source = checked_evaluator_source();
+        let missing_receipt = source.replacen("pick: FallbackPick,", "pick: FaultTerminal,", 1);
+        assert!(validate_fault_evaluator_source_text(&missing_receipt).is_err());
+        let missing_terminal_quiescence = source.replacen(
+            "mark_terminal_quiesced(close)",
+            "mark_terminal_quiesced_without_receipt(close)",
+            1,
+        );
+        assert!(validate_fault_evaluator_source_text(&missing_terminal_quiescence).is_err());
+        let missing_iotlb_quiescence =
+            source.replacen("complete_iotlb(&mut io.gate", "skip_iotlb(&mut io.gate", 1);
+        assert!(validate_fault_evaluator_source_text(&missing_iotlb_quiescence).is_err());
+    }
+
+    #[test]
+    fn fault_source_gate_rejects_identity_or_population_credit_proxies() {
+        let source = checked_evaluator_source();
+        for proxy in [
+            "usize::from(self.gate.pending.is_some())",
+            "self.gate.waiter_count",
+            "self.gate.effect_count",
+            "usize::try_from(self.budget.registry.credits.capacity).unwrap()",
+        ] {
+            let mutated = source.replacen("self.budget.observed_credit_units().unwrap()", proxy, 1);
+            assert!(
+                validate_fault_evaluator_source_text(&mutated).is_err(),
+                "credit proxy mutation unexpectedly passed: {proxy}"
+            );
+        }
+        for literal in ["0", "1"] {
+            let mutated =
+                source.replacen("self.budget.observed_credit_units().unwrap()", literal, 1);
+            assert!(
+                validate_fault_evaluator_source_text(&mutated).is_err(),
+                "constant credit mutation unexpectedly passed: {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn fault_source_gate_rejects_unpaired_composite_credit_transitions() {
+        let source = checked_evaluator_source();
+        for (needle, replacement, label) in [
+            (
+                "budget.reserve(binding)",
+                "sidecar.reserve(binding)",
+                "reserve",
+            ),
+            (
+                "budget.commit(&mut leader_credit, leader_binding, 0)?;",
+                "sidecar.commit(&mut leader_credit, leader_binding, 0)?;",
+                "commit",
+            ),
+            ("budget.finish()", "sidecar.finish()", "release"),
+        ] {
+            let mutated = source.replacen(needle, replacement, 1);
+            assert_ne!(mutated, source, "missing mutation fixture for {label}");
+            assert!(
+                validate_fault_evaluator_source_text(&mutated).is_err(),
+                "unpaired {label} mutation unexpectedly passed"
+            );
+        }
+    }
+
+    #[test]
+    fn fault_source_gate_rejects_binding_sidecar_and_literal_no_credit_mutations() {
+        let source = checked_evaluator_source();
+        let wrong_binding = source.replacen(
+            "Stage7bFaultOperation::PagerContinuation",
+            "Stage7bFaultOperation::ReadinessCompletion",
+            1,
+        );
+        assert!(validate_fault_evaluator_source_text(&wrong_binding).is_err());
+
+        let detached = source.replacen(
+            "Stage7bFaultBudget::new(case, fault_budget_instance_id(case)).unwrap();",
+            "Stage7bActiveFixture::new(detached_config).unwrap();\n    let mut budget = Stage7bFaultBudget::new(case, fault_budget_instance_id(case)).unwrap();",
+            1,
+        );
+        assert_ne!(detached, source);
+        assert!(validate_fault_evaluator_source_text(&detached).is_err());
+
+        let literal_scheduler = source.replacen(
+            "credits: self.budget.case.credit_capacity(),",
+            "credits: 0,",
+            1,
+        );
+        assert_ne!(literal_scheduler, source);
+        assert!(validate_fault_evaluator_source_text(&literal_scheduler).is_err());
+    }
+
+    #[test]
+    fn fault_source_gate_rejects_capacity_self_report_and_dropped_scope_lineage() {
+        let source = checked_evaluator_source();
+        let capacity = source.replacen(
+            "credits: self.budget.observed_credit_units().unwrap(),",
+            "credits: usize::try_from(self.budget.registry.credits.capacity).unwrap(),",
+            1,
+        );
+        assert_ne!(capacity, source);
+        assert!(validate_fault_evaluator_source_text(&capacity).is_err());
+
+        let dropped_scope = source.replacen(
+            "assert_eq!(before.scope, retained.scope);",
+            "assert_eq!(before.case, retained.case);",
+            1,
+        );
+        assert_ne!(dropped_scope, source);
+        assert!(validate_fault_evaluator_source_text(&dropped_scope).is_err());
+
+        let dropped_final_balance = source.replacen(
+            "assert_eq!(after.registry.credits.committed, 0);",
+            "assert!(after.registry.credits.capacity > 0);",
+            1,
+        );
+        assert_ne!(dropped_final_balance, source);
+        assert!(validate_fault_evaluator_source_text(&dropped_final_balance).is_err());
+    }
+
+    #[test]
+    fn fault_registry_gate_rejects_capacity_sidecar_instance_and_causal_mutations() {
+        let source = checked_registry_source();
+        let capacity = source.replacen(
+            "ScopePhase::Revoked => credits.free,",
+            "ScopePhase::Revoked => credits.capacity,",
+            1,
+        );
+        assert_ne!(capacity, source);
+        assert!(validate_fault_registry_source_text(&capacity).is_err());
+
+        let sidecar = source.replacen(
+            "registry.check_invariants()?;\n        Ok(Self {",
+            "registry.check_invariants()?;\n        let _sidecar = EffectRegistry::new();\n        Ok(Self {",
+            1,
+        );
+        assert_ne!(sidecar, source);
+        assert!(validate_fault_registry_source_text(&sidecar).is_err());
+
+        let external_sidecar = source.replacen(
+            "pub(crate) struct Stage7bFaultCredit {",
+            "fn hidden_fault_sidecar() -> EffectRegistry { EffectRegistry::new() }\n\npub(crate) struct Stage7bFaultCredit {",
+            1,
+        );
+        assert_ne!(external_sidecar, source);
+        assert!(validate_fault_registry_source_text(&external_sidecar).is_err());
+
+        let cloned_sidecar = source
+            .replacen(
+                "    registry: EffectRegistry,\n    scope: ScopeKey,",
+                "    registry: EffectRegistry,\n    sidecar: EffectRegistry,\n    scope: ScopeKey,",
+                1,
+            )
+            .replacen(
+                "            registry,\n            scope,",
+                "            sidecar: registry.clone(),\n            registry,\n            scope,",
+                1,
+            );
+        assert_ne!(cloned_sidecar, source);
+        assert!(validate_fault_registry_source_text(&cloned_sidecar).is_err());
+
+        let credit_sum = source.replacen(
+            "ScopePhase::Revoked => credits.free,",
+            "ScopePhase::Revoked => credits.free.checked_add(credits.held).and_then(|value| value.checked_add(credits.committed)).ok_or(RegistryError::CounterOverflow)?,",
+            1,
+        );
+        assert_ne!(credit_sum, source);
+        assert!(validate_fault_registry_source_text(&credit_sum).is_err());
+
+        let missing_instance =
+            source.replacen("|| credit.instance_id != self.instance_id", "|| false", 1);
+        assert_ne!(missing_instance, source);
+        assert!(validate_fault_registry_source_text(&missing_instance).is_err());
+
+        let unauthenticated_causal = source.replacen(
+            "source.commit.as_ref() == Some(causal)",
+            "source.commit.is_some()",
+            1,
+        );
+        assert_ne!(unauthenticated_causal, source);
+        assert!(validate_fault_registry_source_text(&unauthenticated_causal).is_err());
+
+        let foreign_registry_allowed = source.replacen(
+            "causal.registry_instance_id != registry_instance_id",
+            "registry_instance_id == 0",
+            1,
+        );
+        assert_ne!(foreign_registry_allowed, source);
+        assert!(validate_fault_registry_source_text(&foreign_registry_allowed).is_err());
+    }
+
+    #[test]
+    fn fault_source_gate_requires_registry_commit_inside_io_commit_gate_and_late_release() {
+        let source = checked_evaluator_source();
+        let detached_commit = source.replacen(
+            ".commit_with(identity, || budget.commit(credit, binding, 0))",
+            ".commit_with(identity, || Ok::<_, ()>(()))",
+            1,
+        );
+        assert_ne!(detached_commit, source);
+        assert!(validate_fault_evaluator_source_text(&detached_commit).is_err());
+
+        let early_release = source.replacen(
+            "assert_eq!(self.gate.projection().phase, IoPhase::Quiesced);",
+            "let _ = self.budget.finish();\n        assert_eq!(self.gate.projection().phase, IoPhase::Quiesced);",
+            1,
+        );
+        assert_ne!(early_release, source);
+        assert!(validate_fault_evaluator_source_text(&early_release).is_err());
+    }
+
     #[test]
     fn accepts_exact_log_and_marks_only_performance_observed() {
         let parsed = parse_log(&valid_log().replace('\n', "\r\n"), None).unwrap();
@@ -1405,6 +2112,12 @@ mod tests {
         ));
         let artifacts = root.join("kernel/nexus-ostd/artifacts");
         fs::create_dir_all(&artifacts).unwrap();
+        let evaluator = root.join(EVALUATOR_SOURCE);
+        fs::create_dir_all(evaluator.parent().unwrap()).unwrap();
+        fs::write(&evaluator, checked_evaluator_source()).unwrap();
+        let registry = root.join(FAULT_REGISTRY_SOURCE);
+        fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        fs::write(&registry, checked_registry_source()).unwrap();
         fs::write(
             artifacts.join("stage7b-evaluation.log"),
             valid_log().replace('\n', "\r\n"),
@@ -1454,7 +2167,7 @@ mod tests {
         assert!(
             fs::read_to_string(output.join(ORACLE_OUTPUT))
                 .unwrap()
-                .contains("status=passed")
+                .contains("fault_registry_backed_nonzero_credit_cells=15")
         );
 
         fs::write(artifacts.join("stage7b-evaluation.log"), "invalid\n").unwrap();
