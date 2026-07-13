@@ -20,11 +20,9 @@ image_key=$(sha256sum \
     "$root/Cargo.lock" \
     "$root/OSDK.toml" \
     "$root/rust-toolchain.toml" \
-    "$root/cargo-home-config.toml" \
     "$root/LICENSE-MPL-2.0" \
     "$root/src/lib.rs" \
     "$root/assets/sector0.txt" \
-    "$root/patches/ostd-0.18.0-dma-closure.patch" \
     "$root/scripts/assert-patch.sh" \
     "$root/scripts/check-facade-boundary.sh" \
     "$root/scripts/check-io-gate.sh" \
@@ -52,6 +50,9 @@ image_key=$(sha256sum \
     "$repo_root/crates/nexus-ostd-virtio/src/dma.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/pci.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/portal.rs" \
+    "$repo_root/patches/ostd-0.18.0-cser.patch" \
+    "$repo_root/patches/ostd-0.18.0-cargo-config.toml" \
+    "$repo_root/tools/ostd/assert-cser-patch.sh" \
     "$repo_root/kernel/nexus-ostd/Cargo.toml" \
     "$repo_root/kernel/nexus-ostd/Cargo.lock" \
     "$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
@@ -75,6 +76,7 @@ container() {
         --env HOME=/tmp/nexus-home \
         --tmpfs /tmp/nexus-home:rw,exec,nosuid,size=64m,mode=1777 \
         -v "$root:/work:z" \
+        -v "$repo_root:/repo:ro,z" \
         -v "$repo_root/crates/cser-transition-gates:/crates/cser-transition-gates:ro,z" \
         -v "$repo_root/crates/nexus-ostd-virtio:/crates/nexus-ostd-virtio:ro,z" \
         --mount "type=bind,source=$repo_root/kernel/nexus-ostd/Cargo.toml,target=/kernel/nexus-ostd/Cargo.toml,readonly" \
@@ -101,6 +103,24 @@ check_source() {
         tmp=$(mktemp -d)
         trap '\''rm -rf "$tmp"'\'' EXIT
         portal_source=/crates/nexus-ostd-virtio/src/portal.rs
+
+        cp /repo/patches/ostd-0.18.0-cser.patch "$tmp/mutated-ostd.patch"
+        sed -i '\''0,/const RTE_LEVEL_TRIGGERED: u32 = 1 << 15;/s//const RTE_LEVEL_TRIGGERED: u32 = 1 << 14;/'\'' \
+            "$tmp/mutated-ostd.patch"
+        if /repo/tools/ostd/assert-cser-patch.sh \
+            "$tmp/mutated-ostd.patch" /opt/nexus-ostd/ostd-0.18.0 >/dev/null 2>&1; then
+            echo "canonical OSTD gate accepted a polarity/trigger patch mutation" >&2
+            exit 1
+        fi
+
+        cp -a /opt/nexus-ostd/ostd-0.18.0 "$tmp/mutated-ostd"
+        sed -i '\''s/const RTE_LEVEL_TRIGGERED: u32 = 1 << 15;/const RTE_LEVEL_TRIGGERED: u32 = 1 << 14;/'\'' \
+            "$tmp/mutated-ostd/src/arch/x86/irq/chip/ioapic.rs"
+        if /repo/tools/ostd/assert-cser-patch.sh \
+            /repo/patches/ostd-0.18.0-cser.patch "$tmp/mutated-ostd" >/dev/null 2>&1; then
+            echo "canonical OSTD gate accepted a mutated installed source tree" >&2
+            exit 1
+        fi
 
         cp "$portal_source" "$tmp/missing-gate.rs"
         sed -i '\''/gate: IoGate<4>,/d'\'' "$tmp/missing-gate.rs"

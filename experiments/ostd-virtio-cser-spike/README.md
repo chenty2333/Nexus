@@ -260,9 +260,10 @@ injected timeout was a hardware timeout.
 
 ## OSTD patch and licensing
 
-The repository stores only the MPL-2.0 OSTD patch in
-`patches/ostd-0.18.0-dma-closure.patch`. Docker verifies the upstream archive,
-applies the patch, and checks a clean reverse application. The patch provides:
+The repository-wide canonical MPL-2.0 OSTD overlay is
+`../../patches/ostd-0.18.0-cser.patch`. Both this experiment and the primary
+kernel verify the same patch hash against the same upstream archive, apply it,
+and check a clean reverse application. The patch provides:
 
 - one-page ownership-carrying `begin_unmap_invalidate` / `poll_complete`;
 - bounded runtime queued-IOTLB begin/poll paths;
@@ -272,6 +273,8 @@ applies the patch, and checks a clean reverse application. The patch provides:
   pointer remains bound to a retained DMA owner;
 - one narrow unsafe `IoMem<Insensitive>::as_non_null_ptr` accessor for a
   retained BAR owner.
+- a configurable GSI mapping API whose I/O APIC polarity/trigger bits and IRTE
+  trigger mode remain synchronized; the legacy API remains edge/high.
 
 Source assertions also pin the no-alloc `VirtQueue` Drop shape used by the
 reset-without-`pop_used` boundary: queue destruction retires its DMA layout and

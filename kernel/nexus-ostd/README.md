@@ -19,7 +19,10 @@ the crate-root module API:
 
 ## Pinned environment
 
-- OSTD: `=0.18.0` from crates.io
+- OSTD: `=0.18.0` from the crates.io archive with SHA-256
+  `aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1`
+- canonical MPL-2.0 OSTD overlay: `patches/ostd-0.18.0-cser.patch`, SHA-256
+  `296dd6033d77dc10d0ed90236f1f0dfb18d261ca6bc266ac5f15220f0db56bfe`
 - cargo-osdk: `=0.18.0`
 - `object`: `=0.39.1` for the bounded kernel ELF loader
 - `linux-raw-sys`: `=0.12.1` for Linux UAPI names in the kernel and the
@@ -599,34 +602,40 @@ superiority claim. Implementation-source Loom evidence remains separately
 bounded to production transition source under a Loom-modeled outer mutex; it
 does not verify OSTD `SpinLock`, SMP execution, lock freedom, or liveness.
 
-## IOMMU result: fail closed
+## IOMMU result: patched build foundation, runtime still fail closed
 
-OSTD 0.18's `src/mm/dma/util.rs::unmap_dma_remap` removes second-stage page
-table entries without a synchronous IOTLB flush. It deliberately does not
+Pristine OSTD 0.18's `src/mm/dma/util.rs::unmap_dma_remap` removes second-stage
+page-table entries without a synchronous IOTLB flush. It deliberately does not
 free the device-address range (there is a TODO preventing IOVA reuse), but
 `unprepare_dma` then lets the DMA object's backing physical frames continue
 through destruction and eventual reuse. A stale IOTLB entry can therefore
-retain access to repurposed physical memory. The source itself contains:
+retain access to repurposed physical memory. The pristine source itself
+contains:
 
 ```text
 FIXME: Flush IOTLBs to prevent any future DMA access to the frames.
 ```
 
-The invalidation machinery is under crate-private `arch::iommu`; an external
-Nexus adapter cannot safely share its VT-d queue/domain state. The existing
-register fallback writes `iotlb_invalidate` but does not wait for IVT to clear;
-the queued-invalidation descriptor module only implements interrupt-cache and
-wait descriptors, not an IOTLB descriptor. Reimplementing VT-d invalidation
-beside OSTD would create two owners and is not a minimal adapter. Therefore
-`Ostd018FailClosed::unmap_invalidate_and_wait` always returns
-`IotlbInvalidationUnavailable`, and the prototype never reports DMA quiescence.
-`./x iommu-probe` checks these upstream facts against the fetched, pinned
-source; the kernel also compiles and runs the fail-closed path. Device-level
-drain/reset must precede even a future synchronous IOTLB invalidation adapter.
+The primary kernel build now applies the repository-wide, hash-bound
+`patches/ostd-0.18.0-cser.patch` to that exact archive. The same canonical
+overlay is used by the Stage 5B experiment. It provides the ownership-carrying
+DMA begin/poll closure API and a configurable GSI mapping API, including
+I/O APIC polarity/trigger bits and a synchronized interrupt-remapping trigger
+mode. The kernel build checks positive application, clean reverse application,
+installed-source equivalence, and negative source mutations before compiling.
 
-This unmodified-OSTD prototype therefore cannot claim DMA-backed revocation
-closure. The separate Stage 5B experiment chose a small, audited OSTD patch and
-established only the bounded emulator receipt documented in the root
-architecture. A production Nexus must still upstream a public synchronous
-unmap+IOTLB-invalidate API, carry an audited patch, or reject OSTD as the DMA
-ownership layer; this fail-closed adapter must never be treated as quiescence.
+This is a reusable build and source foundation, not a primary-kernel device
+runtime result. No device runtime in this kernel currently calls the patched
+DMA closure API, maps a real configured GSI, delivers a device IRQ, or composes
+the Stage 5B device in the same boot. The selected runtime adapter remains
+`Ostd018FailClosed`; `unmap_invalidate_and_wait` always returns
+`IotlbInvalidationUnavailable`, so this path never reports DMA quiescence.
+Device-level drain/reset must precede even a future synchronous IOTLB
+invalidation adapter.
+
+`./x iommu-probe` deliberately checks the fetched pristine archive, rather
+than the patched build tree, so the upstream 0.18.0 gap remains explicit. The
+separate Stage 5B experiment consumes the canonical patch and establishes only
+the bounded polling, single-CPU emulator receipt documented in the root
+architecture. Real primary-kernel DMA closure, IRQ delivery/quiescence,
+same-boot composition, and SMP remain unestablished.

@@ -514,20 +514,30 @@ cannot succeed while a closing-epoch DMA effect lacks proven closure.
 
 Status: **bounded three-owner, one-page-per-owner feasibility / Observed**.
 
-Unmodified OSTD 0.18 removes DMA mappings without exposing a public synchronous
-IOTLB invalidation-and-completion operation. Its invalidation/domain state is
-crate-private, so an external Nexus adapter cannot safely become a second VT-d
-owner. The initial fail-closed probe therefore returned
-`IotlbInvalidationUnavailable` and never fabricated `Quiesced`.
+The pinned pristine upstream OSTD 0.18 archive removes DMA mappings without
+exposing a public synchronous IOTLB invalidation-and-completion operation. Its
+invalidation/domain state is crate-private, so an external Nexus adapter cannot
+safely become a second VT-d owner. The initial fail-closed probe therefore
+returned `IotlbInvalidationUnavailable` and never fabricated `Quiesced`.
 
-The prototype has now selected one of the three admissible ownership choices:
-it carries a small, experiment-local MPL-2.0 patch to OSTD 0.18. The patch adds
-an ownership-carrying, single-page
+The prototype selected one of the three admissible ownership choices: v0.1
+carried a small experiment-local MPL-2.0 patch, and v0.2 promotes that exact
+audited delta into the repository-wide, hash-bound canonical overlay
+`patches/ostd-0.18.0-cser.patch`, consumed by both the primary-kernel and Stage
+5B build graphs. The patch adds an ownership-carrying, single-page
 `begin_unmap_invalidate -> PendingDmaUnmap::poll_complete` contract. The pinned
 QEMU receipt observed a real VT-d global IOTLB descriptor and wait descriptor,
 an injected `Pending` retaining frame/IOVA/PADDR accounting, acknowledgement
 before release, and fresh-identity IOVA reuse only after completion. OSTD
 remains the sole VT-d owner; Nexus owns deadline and tombstone policy.
+
+The same overlay supplies explicit active-high/active-low and edge/level GSI
+routing, encodes polarity and trigger mode in the I/O APIC RTE, and keeps the
+IRTE trigger-mode bit synchronized. The legacy API remains edge/high. No
+primary-kernel device currently calls either patched runtime API: the selected
+adapter remains `Ostd018FailClosed`, and the optional VirtIO facade is only
+compile-checked. This is not primary-boot DMA closure, interrupt-delivery,
+IRQ-quiescence, same-boot device, or SMP evidence.
 
 The first Stage 5A receipt deliberately stopped before device DMA. Stage 5B now
 combines the same OSTD owner with a real `ACCESS_PLATFORM` modern
@@ -1061,8 +1071,9 @@ The pinned experiment observed public API fit for:
   evidence for component consistency and explicitly rejects an
   identity-preserving, cross-FD-total-order, or same-boot interpretation.
 
-These mechanisms should be reused behind Nexus adapters. CSER state should not
-be patched into OSTD internals merely for convenience.
+These mechanisms should be reused behind Nexus adapters. The narrow DMA/GSI
+substrate hooks do not place scopes, effects, epochs, tickets, generations, or
+closure policy inside OSTD; those CSER semantics remain Nexus-owned.
 
 ### Not accepted yet
 
@@ -1190,8 +1201,9 @@ The implementation layers below that front door are intentionally separate:
   workflows;
 - `kernel/nexus-ostd/x` privately owns the cargo-osdk kernel/personality image,
   generated runner snapshot, and primary QEMU receipt;
-- `experiments/ostd-virtio-cser-spike/x` privately owns the patched-OSTD
-  VirtIO/IOMMU image and split serial/debug receipt;
+- both OSTD build graphs verify and consume the same canonical OSTD overlay;
+  `experiments/ostd-virtio-cser-spike/x` privately owns the VirtIO/IOMMU image
+  and split serial/debug receipt;
 - `tools/workflow/system-composition.sh` consumes those two independently
   ordered evidence domains and owns their positive and negative consistency
   checks.
@@ -1343,8 +1355,9 @@ The following are intentionally unresolved:
 - the SMP locking/atomic scheme for commit and epoch publication;
 - the production pager reply-handle representation, recovery-state format,
   multi-client policy, and SMP address-space/TLB protocol;
-- whether the experiment-local OSTD IOMMU contract is upstreamed and how its
-  single-page/single-generation form becomes a production domain/SMP API;
+- whether the canonical downstream OSTD DMA/GSI overlay is upstreamed, when the
+  primary runtime adopts it, and how its single-page/single-generation form
+  becomes a production domain/SMP API;
 - queue-level versus device-level reset granularity for each VirtIO transport;
 - the tombstone retry, administrative recovery, and resource-pressure policy;
 - treatment of durable external effects that require idempotency or

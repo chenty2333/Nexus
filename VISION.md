@@ -396,18 +396,26 @@ or durable pager reconstruction. The scheduler result likewise does not
 establish SMP policy fairness or independently exercise the compiled
 lease-expiry path.
 
-The first spike also found a negative boundary: unmodified OSTD 0.18 does not
-expose a synchronous `unmap -> IOTLB invalidate -> completion wait` operation,
-and its IOMMU state is crate-private. Nexus therefore carried one small,
-isolated MPL-2.0 OSTD patch in
-`experiments/ostd-virtio-cser-spike`. The pinned one-CPU QEMU receipt observed
-one-page ownership transfer into `PendingDmaUnmap`, real VT-d global IOTLB and
-wait descriptors, retention across an injected `Pending`, hardware completion
-before backing/IOVA bookkeeping release, and fresh-identity IOVA reuse only
-after the acknowledgement. This closes the bounded DMA-ownership API gate for
-the prototype. The probe never gave the IOVA to a device and explicitly records
-`device_dma=false` and `device_reset=false`; it is not evidence of mediated
-VirtIO closure, device drain/reset, SMP liveness, or a production IOMMU API.
+The first spike also found a negative boundary: the pristine upstream OSTD
+0.18 archive does not expose a synchronous
+`unmap -> IOTLB invalidate -> completion wait` operation, and its IOMMU state
+is crate-private. The v0.1 checkpoint therefore carried one small, isolated
+MPL-2.0 OSTD patch in `experiments/ostd-virtio-cser-spike`. Post-release v0.2
+work promotes that audited delta into the hash-bound canonical overlay
+`patches/ostd-0.18.0-cser.patch`, shared by the primary-kernel and Stage 5B
+build graphs, and adds configurable GSI polarity/trigger routing with
+synchronized I/O APIC and interrupt-remapping trigger modes. This promotion is
+a source/build foundation only: the primary runtime still uses
+`Ostd018FailClosed` and does not exercise device DMA, device IRQ delivery,
+same-boot device identity, or SMP correctness. The pinned one-CPU QEMU receipt
+observed one-page ownership transfer into `PendingDmaUnmap`, real VT-d global
+IOTLB and wait descriptors, retention across an injected `Pending`, hardware
+completion before backing/IOVA bookkeeping release, and fresh-identity IOVA
+reuse only after the acknowledgement. This closes the bounded DMA-ownership
+API gate for the prototype. The probe never gave the IOVA to a device and
+explicitly records `device_dma=false` and `device_reset=false`; it is not
+evidence of mediated VirtIO closure, device drain/reset, SMP liveness, or a
+production IOMMU API.
 
 The follow-on Stage 5B receipt now exercises the missing device-visible path on
 one pinned QEMU q35/VT-d configuration. Nexus directly reuses
@@ -435,13 +443,14 @@ or IRQ quiescence, SMP liveness, per-device isolation, irreversible writes,
 network output, physical PCIe behavior, or a production deadline/recovery
 worker.
 
-The Stage 6A follow-on adds one bounded `linux-hello` pressure trace to the
-unmodified-OSTD spike. Docker builds a reproducible static x86-64 Linux
-`ET_EXEC` from the retained source; the kernel validates its program headers,
-W^X layout, executable entry, and a minimal aligned Linux initial stack. The
-entry RX page is initially absent, so a real instruction-fetch fault enters a
-one-shot file-backed continuation. Pager v1 prepares the ELF image page and
-then takes a real user fault before PTE publication; a fresh pager v2 performs
+The released Stage 6A follow-on added one bounded `linux-hello` pressure trace
+to the then-unmodified primary-kernel spike. Docker builds a reproducible
+static x86-64 Linux `ET_EXEC` from the retained source; the kernel validates
+its program headers, W^X layout, executable entry, and a minimal aligned Linux
+initial stack. The entry RX page is initially absent, so a real
+instruction-fetch fault enters a one-shot file-backed continuation. Pager v1
+prepares the ELF image page and then takes a real user fault before PTE
+publication; a fresh pager v2 performs
 snapshot/ready/rebind/adopt, publishes one RX mapping, synchronizes the local
 TLB, and resumes the same RIP once. In the same workload scope, a user-policy
 task submits a scoped proposal and then faults; the kernel clears it and makes
@@ -607,8 +616,9 @@ Work proceeds through evidence gates, not feature-count milestones.
 3. **DMA ownership gate — bounded GO / Observed:** the prototype selects a
    single patched-OSTD owner and has an ownership-carrying one-page
    unmap/invalidate/poll contract with a real VT-d completion receipt. The
-   upstream API, multi-page/domain policy, SMP liveness, and production patch
-   disposition remain open; none of those gaps is hidden by this gate.
+   downstream build disposition is now one canonical hash-bound overlay;
+   upstreaming, primary-runtime adoption, multi-page/domain policy, and SMP
+   liveness remain open. None of those gaps is hidden by this gate.
 4. **Mediated VirtIO gate — bounded slice complete / Observed:** the audited
    `Release` publication of `avail.idx` is the first conservative `Commit`;
    the TLA+ and Rust models cover cancellation, completion, reset, timeout,

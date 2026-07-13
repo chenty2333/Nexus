@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source_root=$(find "${CARGO_HOME:-/root/.cargo}/registry/src" \
-    -path '*/ostd-0.18.0/src/mm/dma/util.rs' -print -quit)
-if [[ -z "$source_root" ]]; then
-    echo "ostd 0.18.0 source was not fetched" >&2
+tmp=
+archive=/opt/nexus-source/ostd-0.18.0.crate
+if [[ -f $archive ]]; then
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    tar -xzf "$archive" -C "$tmp"
+    source_root=$tmp/ostd-0.18.0/src/mm/dma/util.rs
+else
+    source_root=$(find "${CARGO_HOME:-/root/.cargo}/registry/src" \
+        -path '*/ostd-0.18.0/src/mm/dma/util.rs' -print -quit)
+fi
+if [[ -z ${source_root:-} || ! -f $source_root ]]; then
+    echo "pinned pristine OSTD 0.18.0 source is unavailable" >&2
     exit 1
 fi
 
@@ -47,4 +56,4 @@ if grep -Eq 'while|completion_status|IVT.*set to 0' <<<"$after_iotlb_write"; the
     exit 1
 fi
 
-echo "IOTLB source probe: PASS (no IOVA free; no unmap flush; register path has no completion wait; no queued IOTLB descriptor; API is crate-private)"
+echo "IOTLB pristine-source probe: PASS (no IOVA free; no unmap flush; register path has no completion wait; no queued IOTLB descriptor; API is crate-private; runtime_adapter=fail_closed)"

@@ -1,10 +1,10 @@
 diff --git a/src/arch/x86/iommu/interrupt_remapping/mod.rs b/src/arch/x86/iommu/interrupt_remapping/mod.rs
-index 85caab2..112e78b 100644
+index 85caab2..69299fb 100644
 --- a/src/arch/x86/iommu/interrupt_remapping/mod.rs
 +++ b/src/arch/x86/iommu/interrupt_remapping/mod.rs
 @@ -8,7 +8,10 @@ use spin::Once;
  pub(super) use table::IntRemappingTable;
- 
+
  use crate::{
 -    arch::iommu::registers::{ExtendedCapabilityFlags, IOMMU_REGS},
 +    arch::iommu::{
@@ -13,11 +13,20 @@ index 85caab2..112e78b 100644
 +    },
      info, warn,
  };
- 
-@@ -26,11 +29,7 @@ impl IrtEntryHandle {
-         self.table
-             .set_entry(self.index, table::IrtEntry::new_enabled(vector));
- 
+
+@@ -22,15 +25,13 @@ impl IrtEntryHandle {
+         self.index
+     }
+
+-    pub fn enable(&self, vector: u32) {
+-        self.table
+-            .set_entry(self.index, table::IrtEntry::new_enabled(vector));
++    pub fn enable(&self, vector: u32, level_triggered: bool) {
++        self.table.set_entry(
++            self.index,
++            table::IrtEntry::new_enabled(vector, level_triggered),
++        );
+
 -        IOMMU_REGS
 -            .get()
 -            .unwrap()
@@ -26,7 +35,26 @@ index 85caab2..112e78b 100644
 +        invalidate_interrupt_cache();
      }
  }
- 
+
+diff --git a/src/arch/x86/iommu/interrupt_remapping/table.rs b/src/arch/x86/iommu/interrupt_remapping/table.rs
+index 2c95d6e..0158f31 100644
+--- a/src/arch/x86/iommu/interrupt_remapping/table.rs
++++ b/src/arch/x86/iommu/interrupt_remapping/table.rs
+@@ -165,9 +165,11 @@ pub struct IrtEntry(u128);
+ impl IrtEntry {
+     /// Creates an enabled entry with no validation,
+     ///
+-    /// DST = 0, IM = 0, DLM = 0, TM = 0, RH = 0, DM = 0, FPD = 1, P = 1
+-    pub(super) fn new_enabled(vector: u32) -> Self {
+-        Self(0b11 | ((vector as u128) << 16))
++    /// DST = 0, IM = 0, DLM = 0, RH = 0, DM = 0, FPD = 1, P = 1.
++    /// TM is set exactly when `level_triggered` is true.
++    pub(super) fn new_enabled(vector: u32, level_triggered: bool) -> Self {
++        let trigger_mode = (level_triggered as u128) << 4;
++        Self(0b11 | trigger_mode | ((vector as u128) << 16))
+     }
+
+     fn as_raw_u64(&self) -> [u64; 2] {
 diff --git a/src/arch/x86/iommu/invalidate/descriptor/mod.rs b/src/arch/x86/iommu/invalidate/descriptor/mod.rs
 index 3a60ef4..3d93be4 100644
 --- a/src/arch/x86/iommu/invalidate/descriptor/mod.rs
@@ -34,7 +62,7 @@ index 3a60ef4..3d93be4 100644
 @@ -10,6 +10,21 @@ impl InterruptEntryCache {
      }
  }
- 
+
 +/// A queued-invalidation descriptor that invalidates every cached I/O
 +/// translation.  OSTD 0.18 currently installs one shared second-stage page
 +/// table in domain zero, so the Stage 5A patch deliberately uses global
@@ -51,7 +79,7 @@ index 3a60ef4..3d93be4 100644
 +}
 +
  pub struct InvalidationWait(pub u128);
- 
+
  impl InvalidationWait {
 diff --git a/src/arch/x86/iommu/mod.rs b/src/arch/x86/iommu/mod.rs
 index 2749c4c..d8652d6 100644
@@ -60,7 +88,7 @@ index 2749c4c..d8652d6 100644
 @@ -20,7 +20,29 @@ pub(in crate::arch) use interrupt_remapping::{
      IrtEntryHandle, alloc_irt_entry, has_interrupt_remapping,
  };
- 
+
 -use crate::{io::IoMemAllocatorBuilder, mm::page_table::PageTableError};
 +use registers::{DmaInvalidationPoll, DmaInvalidationTicket, IOMMU_REGS};
 +
@@ -85,7 +113,7 @@ index 2749c4c..d8652d6 100644
 +    Complete,
 +    RetainedFailure,
 +}
- 
+
  /// An enumeration representing possible errors related to IOMMU.
  #[derive(Debug)]
 @@ -39,3 +61,81 @@ pub(crate) fn init(io_mem_builder: &IoMemAllocatorBuilder) -> Result<(), IommuEr
@@ -177,13 +205,13 @@ index bdfc424..1886223 100644
 @@ -8,7 +8,10 @@ mod extended_cap;
  mod invalidation;
  mod status;
- 
+
 -use core::ptr::NonNull;
 +use core::{
 +    ptr::NonNull,
 +    sync::atomic::{Ordering, fence},
 +};
- 
+
  use bit_field::BitField;
  pub use capability::{Capability, CapabilitySagaw};
 @@ -33,14 +36,14 @@ use crate::{
@@ -203,7 +231,7 @@ index bdfc424..1886223 100644
 +    mm::{CachePolicy, PAGE_SIZE},
      sync::{LocalIrqDisabled, SpinLock},
  };
- 
+
 @@ -67,6 +70,8 @@ impl IommuVersion {
  /// Important registers used by IOMMU.
  #[derive(Debug)]
@@ -215,7 +243,7 @@ index bdfc424..1886223 100644
      extended_capability: VolatileRef<'static, u64, ReadOnly>,
 @@ -78,6 +83,43 @@ pub struct IommuRegisters {
      interrupt_remapping_table_addr: VolatileRef<'static, u64, ReadWrite>,
- 
+
      invalidate: InvalidationRegisters,
 +
 +    // Nexus Stage 5A intentionally supports one ownership-carrying DMA
@@ -255,12 +283,12 @@ index bdfc424..1886223 100644
 +    Complete,
 +    RetainedFailure,
  }
- 
+
  impl IommuRegisters {
 @@ -195,55 +237,183 @@ impl IommuRegisters {
          self.invalidate.completion_status.as_mut_ptr().write(1);
      }
- 
+
 -    // Invalidates Interrupt-remapping cache.
 -    pub(super) fn invalidate_interrupt_cache(&mut self) {
 -        if !self.read_global_status().contains(GlobalStatus::QIES) {
@@ -351,7 +379,7 @@ index bdfc424..1886223 100644
 +        if !self.invalidation_slot_available() {
 +            return None;
          }
- 
+
 -        let mut queue = QUEUE.get().unwrap().lock();
 +        let ticket = self.reserve_dma_invalidation();
 +        let path = if self.read_global_status().contains(GlobalStatus::QIES) {
@@ -371,13 +399,13 @@ index bdfc424..1886223 100644
 +        });
 +        Some(ticket)
 +    }
- 
+
 -        // Currently, we don't support asynchronous processing in the queue. Therefore, when we
 -        // lock the queue, we know that it is empty and that the Invalidation Completion Status
 -        // Register has been cleared.
 +    fn submit_queued_invalidation(&mut self, descriptor: u128) {
 +        let mut queue = QUEUE.get().unwrap().lock();
- 
+
 -        // Construct an Interrupt Entry Cache Invalidate Descriptor.
 -        queue.append_descriptor(InterruptEntryCache::global_invalidation().0);
 -        // Construct an Invalidation Wait Descriptor. We need to set the interrupt flag so that the
@@ -387,7 +415,7 @@ index bdfc424..1886223 100644
 +        self.invalidate.completion_status.as_mut_ptr().write(1);
 +        queue.append_descriptor(descriptor);
          queue.append_descriptor(InvalidationWait::with_interrupt_flag().0);
- 
+
 -        // Update the queue tail.
 +        // PTE removals and descriptor stores must be visible before hardware
 +        // observes the invalidation-queue tail.
@@ -403,7 +431,7 @@ index bdfc424..1886223 100644
 -        // Clear the Invalidation Completion Status Register.
 -        self.invalidate.completion_status.as_mut_ptr().write(1);
      }
- 
+
 -    fn global_invalidation(&mut self) {
 -        // Set ICC(63) to 1 to requests invalidation and CIRG(62:61) to 01 to indicate global invalidation request.
 -        self.context_command
@@ -418,7 +446,7 @@ index bdfc424..1886223 100644
 +        if ticket.generation <= self.completed_dma_invalidation_generation {
 +            return DmaInvalidationPoll::Complete;
 +        }
- 
+
 -        // Wait for invalidation complete (ICC set to 0).
 -        let mut value = 0x8000_0000_0000_0000;
 -        while (value & 0x8000_0000_0000_0000) != 0 {
@@ -429,7 +457,7 @@ index bdfc424..1886223 100644
 +        if active.generation != ticket.generation {
 +            return DmaInvalidationPoll::RetainedFailure;
          }
- 
+
 -        // Set IVT(63) to 1 to requests IOTLB invalidation and IIRG(61:60) to 01 to indicate global invalidation request.
 -        self.invalidate
 -            .iotlb_invalidate
@@ -471,12 +499,12 @@ index bdfc424..1886223 100644
 +        self.active_invalidation = None;
 +        DmaInvalidationPoll::Complete
      }
- 
+
      /// Writes value to the global command register. This function will not wait until the command
 @@ -286,8 +456,11 @@ impl IommuRegisters {
          assert_ne!(base_address, 0, "IOMMU address should not be zero");
          debug!("base address: {:#x?}", base_address);
- 
+
 -        io_mem_builder.remove(base_address as usize..(base_address as usize + PAGE_SIZE));
 -        let base = NonNull::new(paddr_to_vaddr(base_address as usize) as *mut u8).unwrap();
 +        let io_mem = io_mem_builder.reserve(
@@ -484,12 +512,12 @@ index bdfc424..1886223 100644
 +            CachePolicy::Uncacheable,
 +        );
 +        let base = NonNull::new(io_mem.base() as *mut u8).unwrap();
- 
+
          // SAFETY:
          // - We trust the ACPI tables (as well as the DRHD in them), from which the base address is
 @@ -298,6 +471,7 @@ impl IommuRegisters {
              fault::init(base);
- 
+
              Self {
 +                _io_mem: io_mem,
                  version: VolatileRef::new_read_only(base.cast::<u32>()),
@@ -497,38 +525,270 @@ index bdfc424..1886223 100644
                  extended_capability: VolatileRef::new_read_only(base.add(0x10).cast::<u64>()),
 @@ -312,6 +486,9 @@ impl IommuRegisters {
                  interrupt_remapping_table_addr: VolatileRef::new(base.add(0xb8).cast::<u64>()),
- 
+
                  invalidate: InvalidationRegisters::new(base),
 +                next_dma_invalidation_generation: 0,
 +                completed_dma_invalidation_generation: 0,
 +                active_invalidation: None,
              }
          };
- 
+
+diff --git a/src/arch/x86/irq/chip/ioapic.rs b/src/arch/x86/irq/chip/ioapic.rs
+index d105f93..ff70d6c 100644
+--- a/src/arch/x86/irq/chip/ioapic.rs
++++ b/src/arch/x86/irq/chip/ioapic.rs
+@@ -8,6 +8,23 @@ use crate::{
+     irq::IrqLine,
+ };
+
++use super::{GsiConfig, GsiPolarity, GsiTriggerMode};
++
++const RTE_ACTIVE_LOW: u32 = 1 << 13;
++const RTE_LEVEL_TRIGGERED: u32 = 1 << 15;
++
++const fn rte_config_bits(config: GsiConfig) -> u32 {
++    let polarity = match config.polarity() {
++        GsiPolarity::ActiveHigh => 0,
++        GsiPolarity::ActiveLow => RTE_ACTIVE_LOW,
++    };
++    let trigger = match config.trigger_mode() {
++        GsiTriggerMode::Edge => 0,
++        GsiTriggerMode::Level => RTE_LEVEL_TRIGGERED,
++    };
++    polarity | trigger
++}
++
+ /// I/O Advanced Programmable Interrupt Controller (APIC).
+ ///
+ /// It is used to distribute external interrupts in a more advanced manner than that of the
+@@ -66,7 +83,7 @@ impl IoApic {
+     ///
+     /// This method will fail if the index exceeds the I/O APIC's maximum redirection entry, or if
+     /// the entry is in use.
+-    pub(super) fn enable(&mut self, index: u8, irq: &IrqLine) -> Result<()> {
++    pub(super) fn enable(&mut self, index: u8, irq: &IrqLine, config: GsiConfig) -> Result<()> {
+         if index > self.max_redirection_entry {
+             return Err(Error::InvalidArgs);
+         }
+@@ -81,7 +98,8 @@ impl IoApic {
+             // Intel(R) Virtualization Technology for Directed I/O (Revision 5.0), Section 5.1.5.1
+             // I/OxAPIC Programming says "Bit 48 in the I/OxAPIC RTE is Set to indicate the
+             // Interrupt is in Remappable format."
+-            let mut value: u64 = irq.num() as u64 | 0x1_0000_0000_0000;
++            let mut value: u64 =
++                irq.num() as u64 | u64::from(rte_config_bits(config)) | 0x1_0000_0000_0000;
+
+             // "The Interrupt_Index[14:0] is programmed in bits 63:49 of the I/OxAPIC RTE. The most
+             // significant bit of the Interrupt_Index (Interrupt_Index[15]) is programmed in bit 11
+@@ -105,8 +123,10 @@ impl IoApic {
+             // SAFETY: `index` is inbound. It is safe to enable the redirection entry with the
+             // legal IRQ number.
+             unsafe {
+-                self.access
+-                    .write(IoApicAccess::IOREDTBL + 2 * index, irq.num() as u32);
++                self.access.write(
++                    IoApicAccess::IOREDTBL + 2 * index,
++                    irq.num() as u32 | rte_config_bits(config),
++                );
+                 self.access.write(IoApicAccess::IOREDTBL + 2 * index + 1, 0);
+             }
+         }
+diff --git a/src/arch/x86/irq/chip/mod.rs b/src/arch/x86/irq/chip/mod.rs
+index bda5ce2..aa5fc2b 100644
+--- a/src/arch/x86/irq/chip/mod.rs
++++ b/src/arch/x86/irq/chip/mod.rs
+@@ -17,6 +17,65 @@ use crate::{
+ mod ioapic;
+ mod pic;
+
++/// Electrical polarity of a Global System Interrupt input.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum GsiPolarity {
++    /// The input is asserted at a high voltage level.
++    ActiveHigh,
++    /// The input is asserted at a low voltage level.
++    ActiveLow,
++}
++
++/// Trigger mode of a Global System Interrupt input.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum GsiTriggerMode {
++    /// An inactive-to-active transition asserts the interrupt.
++    Edge,
++    /// The active electrical level asserts the interrupt.
++    Level,
++}
++
++/// Routing configuration shared by the I/O APIC RTE and interrupt-remapping
++/// entry for one GSI mapping.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct GsiConfig {
++    polarity: GsiPolarity,
++    trigger_mode: GsiTriggerMode,
++}
++
++impl GsiConfig {
++    /// The historical OSTD routing behavior.
++    pub const EDGE_HIGH: Self = Self::new(GsiPolarity::ActiveHigh, GsiTriggerMode::Edge);
++
++    /// Creates an explicit GSI routing configuration.
++    pub const fn new(polarity: GsiPolarity, trigger_mode: GsiTriggerMode) -> Self {
++        Self {
++            polarity,
++            trigger_mode,
++        }
++    }
++
++    /// Returns the configured electrical polarity.
++    pub const fn polarity(self) -> GsiPolarity {
++        self.polarity
++    }
++
++    /// Returns the configured trigger mode.
++    pub const fn trigger_mode(self) -> GsiTriggerMode {
++        self.trigger_mode
++    }
++
++    const fn is_level_triggered(self) -> bool {
++        matches!(self.trigger_mode, GsiTriggerMode::Level)
++    }
++}
++
++impl Default for GsiConfig {
++    fn default() -> Self {
++        Self::EDGE_HIGH
++    }
++}
++
+ /// An IRQ chip.
+ ///
+ /// This abstracts the hardware IRQ chips (or IRQ controllers), allowing the bus or device drivers
+@@ -50,6 +109,19 @@ impl IrqChip {
+         &'static self,
+         irq_line: IrqLine,
+         gsi_index: u32,
++    ) -> Result<MappedIrqLine> {
++        self.map_gsi_pin_to_with_config(irq_line, gsi_index, GsiConfig::EDGE_HIGH)
++    }
++
++    /// Maps a GSI pin with explicit electrical polarity and trigger mode.
++    ///
++    /// The trigger mode is installed in both the I/O APIC redirection entry
++    /// and, when interrupt remapping is active, the corresponding IRTE.
++    pub fn map_gsi_pin_to_with_config(
++        &'static self,
++        irq_line: IrqLine,
++        gsi_index: u32,
++        config: GsiConfig,
+     ) -> Result<MappedIrqLine> {
+         let mut io_apics = self.io_apics.lock();
+
+@@ -61,11 +133,16 @@ impl IrqChip {
+         let index_in_io_apic = (gsi_index - io_apic.interrupt_base())
+             .try_into()
+             .map_err(|_| Error::InvalidArgs)?;
+-        io_apic.enable(index_in_io_apic, &irq_line)?;
++        irq_line.claim_remapping_trigger_mode(config.is_level_triggered())?;
++        if let Err(error) = io_apic.enable(index_in_io_apic, &irq_line, config) {
++            irq_line.release_remapping_trigger_mode();
++            return Err(error);
++        }
+
+         Ok(MappedIrqLine {
+             irq_line,
+             gsi_index,
++            config,
+             irq_chip: self,
+         })
+     }
+@@ -125,6 +202,7 @@ impl IrqChip {
+ pub struct MappedIrqLine {
+     irq_line: IrqLine,
+     gsi_index: u32,
++    config: GsiConfig,
+     irq_chip: &'static IrqChip,
+ }
+
+@@ -133,6 +211,7 @@ impl fmt::Debug for MappedIrqLine {
+         f.debug_struct("MappedIrqLine")
+             .field("irq_line", &self.irq_line)
+             .field("gsi_index", &self.gsi_index)
++            .field("config", &self.config)
+             .finish_non_exhaustive()
+     }
+ }
+@@ -153,7 +232,8 @@ impl DerefMut for MappedIrqLine {
+
+ impl Drop for MappedIrqLine {
+     fn drop(&mut self) {
+-        self.irq_chip.disable_gsi(self.gsi_index)
++        self.irq_chip.disable_gsi(self.gsi_index);
++        self.irq_line.release_remapping_trigger_mode();
+     }
+ }
+
+diff --git a/src/arch/x86/irq/mod.rs b/src/arch/x86/irq/mod.rs
+index 6e5b8e3..58dd660 100644
+--- a/src/arch/x86/irq/mod.rs
++++ b/src/arch/x86/irq/mod.rs
+@@ -14,7 +14,7 @@ pub(super) mod ipi;
+ mod ops;
+ mod remapping;
+
+-pub use chip::{IRQ_CHIP, IrqChip, MappedIrqLine};
++pub use chip::{GsiConfig, GsiPolarity, GsiTriggerMode, IRQ_CHIP, IrqChip, MappedIrqLine};
+ pub(crate) use ipi::{HwCpuId, send_ipi};
+ pub(crate) use ops::{
+     disable_local, disable_local_and_halt, enable_local, enable_local_and_halt, is_local_enabled,
+diff --git a/src/arch/x86/irq/remapping.rs b/src/arch/x86/irq/remapping.rs
+index 03bf9f9..fc8bfcb 100644
+--- a/src/arch/x86/irq/remapping.rs
++++ b/src/arch/x86/irq/remapping.rs
+@@ -25,11 +25,19 @@ impl IrqRemapping {
+         self.entry.call_once(|| {
+             // Allocate and enable the IRT entry.
+             let handle = alloc_irt_entry().unwrap();
+-            handle.enable(irq_num as u32);
++            handle.enable(irq_num as u32, false);
+             handle
+         });
+     }
+
++    /// Keeps the IRTE trigger mode synchronized with an I/O APIC mapping.
++    pub(crate) fn set_trigger_mode(&self, irq_num: u8, level_triggered: bool) {
++        let Some(handle) = self.entry.get() else {
++            return;
++        };
++        handle.enable(irq_num as u32, level_triggered);
++    }
++
+     /// Gets the remapping index of the IRQ line.
+     ///
+     /// This method will return `None` if interrupt remapping is disabled or
 diff --git a/src/io/io_mem/mod.rs b/src/io/io_mem/mod.rs
 index 5aeb557..3f200e8 100644
 --- a/src/io/io_mem/mod.rs
 +++ b/src/io/io_mem/mod.rs
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,7 @@ pub(crate) mod util;
  use core::{
      marker::PhantomData,
      ops::{Deref, Range},
 +    ptr::NonNull,
  };
- 
+
  use align_ext::AlignExt;
-@@ -156,7 +157,7 @@
+@@ -156,7 +157,7 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
      }
- 
+
      /// Returns the base virtual address of the MMIO range.
 -    fn base(&self) -> usize {
 +    pub(crate) fn base(&self) -> usize {
          self.kvirt_area.deref().start() + self.offset
      }
- 
-@@ -211,6 +212,24 @@
+
+@@ -211,6 +212,24 @@ impl IoMem<Sensitive> {
  }
- 
+
  impl IoMem<Insensitive> {
 +    /// Returns a non-null raw pointer to the start of this MMIO range.
 +    ///
@@ -551,14 +811,82 @@ index 5aeb557..3f200e8 100644
      /// Acquires an `IoMem` instance for the given range.
      ///
      /// The I/O memory cache policy is set to uncacheable by default.
+diff --git a/src/irq/top_half.rs b/src/irq/top_half.rs
+index ae31a2b..ec07bde 100644
+--- a/src/irq/top_half.rs
++++ b/src/irq/top_half.rs
+@@ -107,6 +107,34 @@ impl IrqLine {
+     pub fn remapping_index(&self) -> Option<u16> {
+         self.inner.remapping.remapping_index()
+     }
++
++    #[cfg(target_arch = "x86_64")]
++    pub(crate) fn claim_remapping_trigger_mode(&self, level_triggered: bool) -> Result<()> {
++        let mut claim = self.inner.remapping_claim.lock();
++        if claim.users != 0 && claim.level_triggered != level_triggered {
++            return Err(Error::InvalidArgs);
++        }
++        if claim.users == 0 {
++            self.inner
++                .remapping
++                .set_trigger_mode(self.num(), level_triggered);
++            claim.level_triggered = level_triggered;
++        }
++        claim.users = claim
++            .users
++            .checked_add(1)
++            .expect("IRQ remapping trigger-mode claimant overflow");
++        Ok(())
++    }
++
++    #[cfg(target_arch = "x86_64")]
++    pub(crate) fn release_remapping_trigger_mode(&self) {
++        let mut claim = self.inner.remapping_claim.lock();
++        claim.users = claim
++            .users
++            .checked_sub(1)
++            .expect("IRQ remapping trigger mode released without a claim");
++    }
+ }
+
+ impl Clone for IrqLine {
+@@ -121,6 +149,14 @@ impl Clone for IrqLine {
+ struct Inner {
+     callbacks: RwLock<Vec<Box<IrqCallbackFunction>>, WriteIrqDisabled>,
+     remapping: IrqRemapping,
++    #[cfg(target_arch = "x86_64")]
++    remapping_claim: SpinLock<RemappingClaim>,
++}
++
++#[cfg(target_arch = "x86_64")]
++struct RemappingClaim {
++    users: usize,
++    level_triggered: bool,
+ }
+
+ impl Inner {
+@@ -128,6 +164,11 @@ impl Inner {
+         Self {
+             callbacks: RwLock::new(Vec::new()),
+             remapping: IrqRemapping::new(),
++            #[cfg(target_arch = "x86_64")]
++            remapping_claim: SpinLock::new(RemappingClaim {
++                users: 0,
++                level_triggered: false,
++            }),
+         }
+     }
+ }
 diff --git a/src/mm/dma/dma_coherent.rs b/src/mm/dma/dma_coherent.rs
-index d0ecf8d..9970f71 100644
+index d0ecf8d..93a806d 100644
 --- a/src/mm/dma/dma_coherent.rs
 +++ b/src/mm/dma/dma_coherent.rs
-@@ -3,7 +3,9 @@
+@@ -1,9 +1,11 @@
+ // SPDX-License-Identifier: MPL-2.0
+
 -use core::{fmt::Debug, mem::ManuallyDrop};
 +use core::{fmt::Debug, mem::ManuallyDrop, ptr::NonNull};
- 
+
  use super::util::{
 -    alloc_kva, cvm_need_private_protection, prepare_dma, split_daddr, unprepare_dma,
 +    BeginDmaUnmap, PendingDmaUnmap as IotlbPendingDmaUnmap, PollDmaUnmap, alloc_kva,
@@ -573,7 +901,7 @@ index d0ecf8d..9970f71 100644
      },
 +    warn,
  };
- 
+
  /// A DMA memory object that can be accessed in a cache-coherent manner.
 @@ -30,6 +33,47 @@ pub struct DmaCoherent {
      inner: Inner,
@@ -621,11 +949,11 @@ index d0ecf8d..9970f71 100644
 +    original_daddr: Option<Daddr>,
 +    size: usize,
  }
- 
+
  #[derive(Debug)]
 @@ -39,6 +83,13 @@ enum Inner {
  }
- 
+
  impl DmaCoherent {
 +    /// Receipt-only observation used to prove that Stage 5A begin/poll paths
 +    /// pair every local-IRQ guard. This is not part of the ownership protocol.
@@ -826,12 +1154,12 @@ index d0ecf8d..9970f71 100644
 +        self.size
 +    }
  }
- 
+
  impl Split for DmaCoherent {
-@@ -97,13 +312,14 @@ impl Split for DmaCoherent {
+@@ -97,13 +330,14 @@ impl Split for DmaCoherent {
          assert!(offset.is_multiple_of(PAGE_SIZE));
          assert!(0 < offset && offset < self.size());
- 
+
 -        let (inner, map_daddr, is_cache_coherent) = {
 +        let (inner, map_daddr, is_cache_coherent, prepared) = {
              let this = ManuallyDrop::new(self);
@@ -843,8 +1171,8 @@ index d0ecf8d..9970f71 100644
 +                this.prepared,
              )
          };
- 
-@@ -126,11 +342,13 @@ impl Split for DmaCoherent {
+
+@@ -126,11 +360,13 @@ impl Split for DmaCoherent {
                  inner: inner1,
                  map_daddr: daddr1,
                  is_cache_coherent,
@@ -858,8 +1186,8 @@ index d0ecf8d..9970f71 100644
              },
          )
      }
-@@ -138,8 +356,12 @@ impl Split for DmaCoherent {
- 
+@@ -138,8 +374,12 @@ impl Split for DmaCoherent {
+
  impl Drop for DmaCoherent {
      fn drop(&mut self) {
 +        if !self.prepared {
@@ -870,7 +1198,7 @@ index d0ecf8d..9970f71 100644
 +        self.prepared = false;
      }
  }
- 
+
 diff --git a/src/mm/dma/mod.rs b/src/mm/dma/mod.rs
 index 84f25bf..2dfc728 100644
 --- a/src/mm/dma/mod.rs
@@ -878,7 +1206,7 @@ index 84f25bf..2dfc728 100644
 @@ -24,5 +24,5 @@ mod dma_coherent;
  mod dma_stream;
  mod util;
- 
+
 -pub use dma_coherent::DmaCoherent;
 +pub use dma_coherent::{DmaCoherent, DmaUnmapFailure, PendingDmaUnmap, UnmappedDma};
  pub use dma_stream::{DmaDirection, DmaStream, FromAndToDevice, FromDevice, ToDevice};
@@ -988,11 +1316,11 @@ index 6289955..3729e60 100644
 +        allocator::daddr_allocator(&irq_guard).free(daddr_range);
 +        drop(irq_guard);
 +    }
- 
+
      // SAFETY: The safety condition is upheld by the caller.
      #[cfg(any(debug_assertions, all(target_arch = "x86_64", feature = "cvm_guest")))]
 @@ -284,20 +380,3 @@ unsafe fn dma_remap(pa_range: &Range<Paddr>) -> Option<Daddr> {
- 
+
      Some(daddr.start)
  }
 -

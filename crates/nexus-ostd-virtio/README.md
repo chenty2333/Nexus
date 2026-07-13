@@ -23,10 +23,9 @@ The facade preserves these ownership invariants:
 
 The implementation is pinned to `ostd = 0.18.0` and
 `virtio-drivers = 0.13.0`. Complete DMA closure additionally requires the
-audited OSTD patch at
-`experiments/ostd-virtio-cser-spike/patches/ostd-0.18.0-dma-closure.patch`;
-the experiment Docker build verifies that patch against the exact crates.io
-archive before compiling this crate.
+repository-wide audited OSTD patch at `patches/ostd-0.18.0-cser.patch`; both
+the primary kernel and experiment Docker builds verify that patch against the
+exact crates.io archive before compiling this crate.
 
 This crate is extraction and equivalence infrastructure. Its existence does
 not prove same-boot use by `nexus-kernel`, a real IRQ path, SMP safety, or

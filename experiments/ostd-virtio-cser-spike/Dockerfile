@@ -5,6 +5,8 @@ FROM ${OSDK_IMAGE}
 
 COPY --from=nexus-root crates/cser-transition-gates /crates/cser-transition-gates
 COPY --from=nexus-root crates/nexus-ostd-virtio /crates/nexus-ostd-virtio
+COPY --from=nexus-root tools/ostd/assert-cser-patch.sh \
+    /usr/local/bin/assert-ostd-cser-patch
 
 ARG OSTD_CRATE_SHA256=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1
 ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
@@ -23,7 +25,8 @@ COPY --from=nexus-root kernel/nexus-ostd/Cargo.toml \
 # Build the audited MPL-2.0 overlay from the exact crates.io archive.  The
 # complete patched source exists only in the image; it is never vendored into
 # the Nexus repository.
-COPY patches/ostd-0.18.0-dma-closure.patch /tmp/nexus-patches/ostd-0.18.0-dma-closure.patch
+COPY --from=nexus-root patches/ostd-0.18.0-cser.patch \
+    /tmp/nexus-patches/ostd-0.18.0-cser.patch
 COPY LICENSE-MPL-2.0 /opt/nexus-ostd/LICENSE-MPL-2.0
 RUN set -eu; \
     mkdir -p /opt/nexus-source /opt/nexus-ostd; \
@@ -32,9 +35,9 @@ RUN set -eu; \
     echo "${OSTD_CRATE_SHA256}  ${archive}" | sha256sum -c -; \
     tar -xzf "$archive" -C /opt/nexus-ostd; \
     patch --batch --forward -d /opt/nexus-ostd/ostd-0.18.0 -p1 \
-        < /tmp/nexus-patches/ostd-0.18.0-dma-closure.patch; \
+        < /tmp/nexus-patches/ostd-0.18.0-cser.patch; \
     patch --batch --dry-run --reverse -d /opt/nexus-ostd/ostd-0.18.0 -p1 \
-        < /tmp/nexus-patches/ostd-0.18.0-dma-closure.patch; \
+        < /tmp/nexus-patches/ostd-0.18.0-cser.patch; \
     virtio_archive=/opt/nexus-source/virtio-drivers-0.13.0.crate; \
     curl --fail --silent --show-error --location "$VIRTIO_DRIVERS_CRATE_URL" \
         --output "$virtio_archive"; \
@@ -53,7 +56,8 @@ RUN set -eu; \
         | sha256sum -c -; \
     chmod 0444 /opt/nexus-fixtures/sector0.txt /opt/nexus-fixtures/sector0.raw
 
-COPY cargo-home-config.toml /root/.cargo/config.toml
+COPY --from=nexus-root patches/ostd-0.18.0-cargo-config.toml \
+    /root/.cargo/config.toml
 
 # Prime cargo-osdk's real build and generated runner graphs while networking is
 # available.  Mounted-workspace checks below run offline and as the host UID.

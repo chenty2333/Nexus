@@ -3,10 +3,15 @@ set -euo pipefail
 
 export LC_ALL=C
 
-context_file=$(find "${CARGO_HOME:-/root/.cargo}/registry/src" \
-    -path '*/ostd-0.18.0/src/arch/x86/cpu/context/mod.rs' -print -quit)
-if [[ -z "$context_file" ]]; then
-    echo 'ostd 0.18.0 x86 context source was not fetched' >&2
+patched_root=${NEXUS_OSTD_PATCHED_ROOT:-/opt/nexus-ostd/ostd-0.18.0}
+if [[ -f $patched_root/src/arch/x86/cpu/context/mod.rs ]]; then
+    context_file=$patched_root/src/arch/x86/cpu/context/mod.rs
+else
+    context_file=$(find "${CARGO_HOME:-/root/.cargo}/registry/src" \
+        -path '*/ostd-0.18.0/src/arch/x86/cpu/context/mod.rs' -print -quit)
+fi
+if [[ -z ${context_file:-} || ! -f $context_file ]]; then
+    echo 'ostd 0.18.0 x86 context source is unavailable' >&2
     exit 1
 fi
 
@@ -41,4 +46,4 @@ grep -Fq 'user_context: RawUserContext' <<<"$user_context_block" || {
     exit 1
 }
 
-echo 'FSBASE source probe: PASS public_explicit_load_save=true user_context_owns_fsbase=false runtime_task_lifecycle=not_observed ostd=0.18.0'
+echo 'FSBASE source probe: PASS public_explicit_load_save=true user_context_owns_fsbase=false runtime_task_lifecycle=not_observed ostd=0.18.0 source=compiled-tree'

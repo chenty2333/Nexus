@@ -9,6 +9,28 @@ RUN rustup target add --toolchain nightly-2026-04-03 x86_64-unknown-none \
     && rustup component add --toolchain nightly-2026-04-03 rustfmt clippy \
     && cargo install cargo-osdk --version 0.18.0 --locked
 
+COPY crates/nexus-ostd-virtio /crates/nexus-ostd-virtio
+
+ARG OSTD_CRATE_SHA256=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1
+ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
+COPY patches/ostd-0.18.0-cser.patch /tmp/nexus-patches/ostd-0.18.0-cser.patch
+COPY tools/ostd/assert-cser-patch.sh /usr/local/bin/assert-ostd-cser-patch
+RUN set -eu; \
+    mkdir -p /opt/nexus-source /opt/nexus-ostd; \
+    archive=/opt/nexus-source/ostd-0.18.0.crate; \
+    curl --fail --silent --show-error --location "$OSTD_CRATE_URL" --output "$archive"; \
+    echo "${OSTD_CRATE_SHA256}  ${archive}" | sha256sum -c -; \
+    tar -xzf "$archive" -C /opt/nexus-ostd; \
+    patch --batch --forward -d /opt/nexus-ostd/ostd-0.18.0 -p1 \
+        < /tmp/nexus-patches/ostd-0.18.0-cser.patch; \
+    patch --batch --dry-run --reverse -d /opt/nexus-ostd/ostd-0.18.0 -p1 \
+        < /tmp/nexus-patches/ostd-0.18.0-cser.patch; \
+    chmod -R a+rX /opt/nexus-source /opt/nexus-ostd; \
+    /usr/local/bin/assert-ostd-cser-patch \
+        /tmp/nexus-patches/ostd-0.18.0-cser.patch \
+        /opt/nexus-ostd/ostd-0.18.0
+COPY patches/ostd-0.18.0-cargo-config.toml /root/.cargo/config.toml
+
 COPY kernel/nexus-ostd/src/cser/effect_registry.rs \
     /kernel/nexus-ostd/src/cser/effect_registry.rs
 
@@ -36,6 +58,8 @@ COPY kernel/nexus-ostd/scripts/build-guest.sh \
     kernel/nexus-ostd/scripts/build-round5.sh \
     kernel/nexus-ostd/scripts/build-runtime-fs.sh \
     kernel/nexus-ostd/scripts/assert-runtime-fs-artifacts.sh \
+    kernel/nexus-ostd/scripts/build-runtime-fs-block-image.sh \
+    kernel/nexus-ostd/scripts/assert-runtime-fs-block-image.sh \
     kernel/nexus-ostd/scripts/build-runtime-net.sh \
     kernel/nexus-ostd/scripts/assert-runtime-net-artifacts.sh \
     /tmp/nexus-ostd-inputs/scripts/
@@ -95,6 +119,10 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         /tmp/nexus-ostd-source/scripts/build-runtime-fs.sh \
     && cmp /tmp/nexus-ostd-inputs/scripts/assert-runtime-fs-artifacts.sh \
         /tmp/nexus-ostd-source/scripts/assert-runtime-fs-artifacts.sh \
+    && cmp /tmp/nexus-ostd-inputs/scripts/build-runtime-fs-block-image.sh \
+        /tmp/nexus-ostd-source/scripts/build-runtime-fs-block-image.sh \
+    && cmp /tmp/nexus-ostd-inputs/scripts/assert-runtime-fs-block-image.sh \
+        /tmp/nexus-ostd-source/scripts/assert-runtime-fs-block-image.sh \
     && cmp /tmp/nexus-ostd-inputs/scripts/build-runtime-net.sh \
         /tmp/nexus-ostd-source/scripts/build-runtime-net.sh \
     && cmp /tmp/nexus-ostd-inputs/scripts/assert-runtime-net-artifacts.sh \
@@ -117,6 +145,10 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         NEXUS_RUNTIME_FS_SOURCE=/tmp/nexus-ostd-inputs/runtime_fs_smoke.S \
         NEXUS_RUNTIME_NET_SOURCE=/tmp/nexus-ostd-inputs/runtime_net_smoke.S \
         bash scripts/build-guest.sh \
+    && bash scripts/build-runtime-fs-block-image.sh \
+        guest/linux-runtime-fs.elf /tmp/nexus-runtime-fs-block.raw \
+    && cargo check --locked --target x86_64-unknown-none \
+        --features virtio-cser-facade \
     && cargo osdk check --locked \
     && bash scripts/check-fsbase-api.sh \
     && bash scripts/check-scheduler-attempt.sh \

@@ -47,6 +47,8 @@ image_key=$(sha256sum \
     "$root/scripts/build-round5.sh" \
     "$root/scripts/build-runtime-fs.sh" \
     "$root/scripts/assert-runtime-fs-artifacts.sh" \
+    "$root/scripts/build-runtime-fs-block-image.sh" \
+    "$root/scripts/assert-runtime-fs-block-image.sh" \
     "$root/scripts/build-runtime-net.sh" \
     "$root/scripts/assert-runtime-net-artifacts.sh" \
     "$root/guest/linux-futex-shared.S" \
@@ -79,6 +81,9 @@ image_key=$(sha256sum \
     "$repo_root/crates/nexus-ostd-virtio/src/dma.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/pci.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/portal.rs" \
+    "$repo_root/patches/ostd-0.18.0-cser.patch" \
+    "$repo_root/patches/ostd-0.18.0-cargo-config.toml" \
+    "$repo_root/tools/ostd/assert-cser-patch.sh" \
     "$root/src/cser/effect_registry.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/nexus-ostd:$image_key"
 runner_base="$root/osdk-runner-base"
@@ -122,6 +127,36 @@ ensure_image() {
     fi
 }
 
+check_ostd_patch() {
+    container /repo/tools/ostd/assert-cser-patch.sh \
+        /repo/patches/ostd-0.18.0-cser.patch \
+        /opt/nexus-ostd/ostd-0.18.0
+    container bash -c '
+        set -euo pipefail
+        tmp=$(mktemp -d)
+        trap '\''rm -rf "$tmp"'\'' EXIT
+
+        cp /repo/patches/ostd-0.18.0-cser.patch "$tmp/mutated.patch"
+        sed -i '\''0,/const RTE_LEVEL_TRIGGERED: u32 = 1 << 15;/s//const RTE_LEVEL_TRIGGERED: u32 = 1 << 14;/'\'' \
+            "$tmp/mutated.patch"
+        if /repo/tools/ostd/assert-cser-patch.sh \
+            "$tmp/mutated.patch" /opt/nexus-ostd/ostd-0.18.0 >/dev/null 2>&1; then
+            echo "kernel OSTD gate accepted a mutated canonical patch" >&2
+            exit 1
+        fi
+
+        cp -a /opt/nexus-ostd/ostd-0.18.0 "$tmp/mutated-source"
+        sed -i '\''s/const RTE_ACTIVE_LOW: u32 = 1 << 13;/const RTE_ACTIVE_LOW: u32 = 1 << 12;/'\'' \
+            "$tmp/mutated-source/src/arch/x86/irq/chip/ioapic.rs"
+        if /repo/tools/ostd/assert-cser-patch.sh \
+            /repo/patches/ostd-0.18.0-cser.patch "$tmp/mutated-source" >/dev/null 2>&1; then
+            echo "kernel OSTD gate accepted a mutated installed source tree" >&2
+            exit 1
+        fi
+        echo "canonical OSTD negative assertions: PASS patch_mutation=rejected source_mutation=rejected"
+    '
+}
+
 doctor() {
     local tool
     for tool in awk bash chmod cp cut diff dirname docker flock grep id mkdir mktemp mv rm sed sha256sum tee; do
@@ -147,12 +182,17 @@ doctor() {
         "$root/scripts/assert-linux-net.awk" \
         "$root/scripts/assert-runtime-net-artifacts.sh" \
         "$root/scripts/build-guest.sh" \
+        "$root/scripts/build-runtime-fs-block-image.sh" \
+        "$root/scripts/assert-runtime-fs-block-image.sh" \
         "$root/scripts/build-runtime-net.sh" \
         "$root/scripts/check-linux-net-evidence.sh" \
         "$root/src/cser/linux_io_composition.rs" \
         "$root/guest/linux-netd-v1.S" \
         "$root/guest/linux-netd-v2.S" \
         "$repo_root/tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S" \
+        "$repo_root/patches/ostd-0.18.0-cser.patch" \
+        "$repo_root/patches/ostd-0.18.0-cargo-config.toml" \
+        "$repo_root/tools/ostd/assert-cser-patch.sh" \
         "$root/scripts/check-scheduler-attempt.sh"; do
         if [[ ! -f $input ]]; then
             echo "nexus-ostd doctor: missing pinned input: $input" >&2
@@ -160,6 +200,7 @@ doctor() {
         fi
     done
     ensure_image
+    check_ostd_patch
     container bash -c '
         set -euo pipefail
         command -v rustc >/dev/null
@@ -316,6 +357,8 @@ check_kernel() {
     # lockfile explicitly before every build; it is also over-mounted read-only
     # so build/run cannot rewrite it. The separate generated runner graph is
     # fixed by the committed osdk-runner-base snapshot below.
+    container cargo check --locked --offline --target x86_64-unknown-none \
+        --features virtio-cser-facade
     container cargo osdk check --locked
 }
 
@@ -448,6 +491,7 @@ case "$command" in
         ;;
     check)
         ensure_image
+        check_ostd_patch
         fmt_check
         check_oracles
         check_runtime_fs_production_source
@@ -465,6 +509,7 @@ case "$command" in
         ;;
     build)
         ensure_image
+        check_ostd_patch
         prepare_guest
         build_kernel
         ;;
@@ -480,6 +525,7 @@ case "$command" in
         ;;
     test)
         ensure_image
+        check_ostd_patch
         check_runtime_fs_production_source
         prepare_guest
         check_runtime_fs_artifact_negatives
