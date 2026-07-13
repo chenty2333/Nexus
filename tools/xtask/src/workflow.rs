@@ -42,6 +42,7 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
 
     let frontdoor = fs::read_to_string(root.join("x"))?;
     validate_full_verify_order(&frontdoor)?;
+    validate_production_identity_route(&frontdoor)?;
 
     let dockerfile = fs::read_to_string(root.join("Dockerfile"))?;
     for required in [
@@ -157,6 +158,24 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         return Err(
             "root workflow does not restrict token injection to begin/complete/manifest".into(),
         );
+    }
+    Ok(())
+}
+
+fn validate_production_identity_route(frontdoor: &str) -> Result<()> {
+    for required in [
+        "research production-identity",
+        "doctor|build|test|run|fmt|check|quick|model|spec|system|research|verify|verify-bundle|clean",
+        "research requires exactly one target: production-identity",
+        "production-identity) run_xtask research production-identity",
+        "unknown research target: $1",
+    ] {
+        if !frontdoor.contains(required) {
+            return Err(format!(
+                "root workflow lacks prospective production-identity route: {required}"
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -487,5 +506,22 @@ verify_all() {
             .expect_err("completion before system must be rejected")
             .to_string();
         assert!(error.contains("missing or out of order"));
+    }
+
+    #[test]
+    fn requires_the_prospective_production_identity_route() {
+        let route = r#"
+research production-identity
+doctor|build|test|run|fmt|check|quick|model|spec|system|research|verify|verify-bundle|clean
+research requires exactly one target: production-identity
+production-identity) run_xtask research production-identity
+unknown research target: $1
+"#;
+        validate_production_identity_route(route).expect("complete research route");
+        let missing_target = route.replace(
+            "production-identity) run_xtask research production-identity",
+            "production-identity) run_xtask spec",
+        );
+        assert!(validate_production_identity_route(&missing_target).is_err());
     }
 }

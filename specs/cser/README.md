@@ -147,6 +147,23 @@ result gate. This remains bounded protocol evidence, not an arbitrary-graph,
 all-domain-crash, SMP, filesystem, network-stack, hardware, scale, or
 performance proof.
 
+`ProductionIdentityCser.tla`, its two-/four-CPU-actor safety, action, and
+conditional-progress configurations, and `PRODUCTION_IDENTITY.md` add the
+prospective RFC-0001 formal successor without changing any accepted `v0.1.0`
+family. Six workload-created effects form the fixed dynamic tree
+`PersonalitySyscall -> FilesystemRead -> BlockRequest -> three DMA owners` in
+one registry-native binding table and shared typed ledger. The model checks
+immutable ancestry, filesystem crash/rebind/adopt, the device Commit/Revoke
+winner, separate guest reply, same-effect reset/IOMMU tombstone retry,
+child-first receipts, and failure-atomic foreign-registry/stale-generation
+rejection. Its complete two- and four-CPU-actor safety graphs and action graph
+each have 4,793 generated / 3,396 distinct states at depth 33. The conditional
+progress graph has 3,356 generated / 2,670 distinct states at depth 32 and five
+temporal branches; eight witness traversals cover the seven named witness
+families at the required CPU counts. CPU values are abstract actor identities,
+not OSTD-lock, IRQ, memory-ordering, or real SMP evidence. This successor is a
+prospective specification, not an implementation or a widened `v0.1.0` claim.
+
 The independent pinned OSTD/QEMU refinement now supplies a bounded
 implementation observation for the same one-key contract. Its `recover` path
 observes mismatch-without-registration, atomic compare/enqueue, a real
@@ -272,8 +289,8 @@ the history needed by the invariants instead of an unbounded event log.
 
 ## Run the specifications
 
-The repository entry point uses the pinned Docker image, verifies that every
-checked-in PlusCal translation is current, runs all twelve checked-in TLC model
+The accepted `v0.1.0` repository entry point uses the pinned Docker image,
+verifies its checked-in PlusCal translations, runs its twelve TLC model
 families in order—baseline, pager, mediated I/O, Linux personality, private
 futex, two-key futex requeue, readiness, exec, runtime filesystem, runtime
 network, five-domain composition, and seven-domain Linux I/O composition—and
@@ -291,12 +308,26 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar ./specs/cser/check.sh
 ```
 
 These commands describe implementation steps inside the container; they do not
-define a second supported host toolchain. With no argument, `check.sh` checks
-all twelve families in the order above. Pass `Cser`, `PagerCser`, `IoCser`,
+define a second supported host toolchain. The directory-local `check.sh` now
+checks the twelve frozen families plus the prospective production-identity
+successor when invoked without an argument. The root `./x spec` catalog remains
+the accepted twelve-family `v0.1.0` boundary until a later repository-wide
+version deliberately admits the successor. Pass `Cser`, `PagerCser`, `IoCser`,
 `PersonalityCser`, `PersonalityFutexCser`,
 `PersonalityFutexRequeueCser`, `PersonalityReadinessCser`,
 `PersonalityExecCser`, `RuntimeFsCser`, `RuntimeNetCser`, `CompositionCser`, or
-`LinuxIoCompositionCser` to run only one.
+`LinuxIoCompositionCser` to run one frozen family; pass
+`ProductionIdentityCser` to run only the prospective successor.
+
+The independent prospective gate checks translation drift, all four complete
+graphs, and the exact ordered eight-witness population, then writes a receipt
+under `target/research/production-identity/` without adding artifacts to the
+accepted `v0.1.0` manifest or bundle:
+
+```sh
+./x research production-identity
+```
+
 To modify an algorithm, edit only its PlusCal block and regenerate the
 translation before checking:
 
@@ -314,6 +345,7 @@ java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 RuntimeFsCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 RuntimeNetCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 CompositionCser.tla
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 LinuxIoCompositionCser.tla
+java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 ProductionIdentityCser.tla
 ```
 
 The baseline `CserMC.cfg` instance uses three effect identifiers, two total
@@ -325,7 +357,8 @@ successor results are recorded separately in `PAGER.md`, `IO.md`,
 `PERSONALITY_FUTEX_REQUEUE.md`, `PERSONALITY_READINESS.md`,
 `PERSONALITY_EXEC.md`, `RUNTIME_FS.md`, and `RUNTIME_NET.md`, with the
 composition successors recorded separately in `COMPOSITION.md` and
-`LINUX_IO_COMPOSITION.md`:
+`LINUX_IO_COMPOSITION.md`; the prospective successor is recorded in
+`PRODUCTION_IDENTITY.md`:
 
 ```text
 11,122 states generated

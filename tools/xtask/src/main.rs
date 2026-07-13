@@ -17,6 +17,7 @@ mod catalog;
 mod doctor;
 mod evidence;
 mod guest;
+mod production_identity;
 mod scenario;
 mod stage7b;
 mod stage7b_concurrency;
@@ -63,42 +64,20 @@ fn main() {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum XtaskInvocation {
+    Command(String),
+    VerifyBundle(Option<PathBuf>),
+    ProductionIdentityResearch,
+}
+
 fn real_main() -> Result<()> {
     let root = repo_root();
-    let mut args = env::args().skip(1);
-    let command = args.next().unwrap_or_else(|| String::from("help"));
-    let argument = args.next();
-    if let Some(extra) = args.next() {
-        return Err(format!("unexpected argument: {extra}").into());
-    }
-    if command != "verify-bundle"
-        && let Some(argument) = &argument
-    {
-        return Err(format!("unexpected argument: {argument}").into());
-    }
-
-    match command.as_str() {
-        "build" => build(&root),
-        "doctor" => doctor(&root),
-        "begin" => evidence::begin(&root, &TLA_SPECS).map(|_| ()),
-        "fmt" => fmt(&root),
-        "check" => check(&root),
-        "test" => test(&root),
-        "quick" => model(&root),
-        "model" => model(&root),
-        "spec" => spec(&root),
-        "verify" => {
-            model(&root)?;
-            spec(&root)?;
-            evidence::mark_model_spec_complete(&root, &TLA_SPECS).map(|_| ())
-        }
-        "complete" => evidence::complete(&root, &TLA_SPECS).map(|_| ()),
-        "manifest" => evidence::write(&root, &TLA_SPECS).map(|_| ()),
-        "bundle" => evidence::write_bundle(&root, &TLA_SPECS).map(|_| ()),
-        "verify-bundle" => {
-            let path = argument
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("target/verification/artifact-bundle"));
+    match parse_invocation(env::args().skip(1))? {
+        XtaskInvocation::ProductionIdentityResearch => production_identity::run(&root, &TLA_SPECS),
+        XtaskInvocation::VerifyBundle(argument) => {
+            let path =
+                argument.unwrap_or_else(|| PathBuf::from("target/verification/artifact-bundle"));
             let path = if path.is_absolute() {
                 path
             } else {
@@ -106,13 +85,50 @@ fn real_main() -> Result<()> {
             };
             evidence::verify_bundle(&root, &path, &TLA_SPECS)
         }
-        "stage7b-evidence" => stage7b_evidence_all(&root),
-        "clean" => clean(&root),
-        "help" | "-h" | "--help" => {
-            print_usage();
-            Ok(())
+        XtaskInvocation::Command(command) => match command.as_str() {
+            "build" => build(&root),
+            "doctor" => doctor(&root),
+            "begin" => evidence::begin(&root, &TLA_SPECS).map(|_| ()),
+            "fmt" => fmt(&root),
+            "check" => check(&root),
+            "test" => test(&root),
+            "quick" => model(&root),
+            "model" => model(&root),
+            "spec" => spec(&root),
+            "verify" => {
+                model(&root)?;
+                spec(&root)?;
+                evidence::mark_model_spec_complete(&root, &TLA_SPECS).map(|_| ())
+            }
+            "complete" => evidence::complete(&root, &TLA_SPECS).map(|_| ()),
+            "manifest" => evidence::write(&root, &TLA_SPECS).map(|_| ()),
+            "bundle" => evidence::write_bundle(&root, &TLA_SPECS).map(|_| ()),
+            "stage7b-evidence" => stage7b_evidence_all(&root),
+            "clean" => clean(&root),
+            "help" | "-h" | "--help" => {
+                print_usage();
+                Ok(())
+            }
+            _ => Err(format!("unknown command: {command}").into()),
+        },
+    }
+}
+
+fn parse_invocation(mut args: impl Iterator<Item = String>) -> Result<XtaskInvocation> {
+    let command = args.next().unwrap_or_else(|| String::from("help"));
+    let arguments: Vec<_> = args.collect();
+    match (command.as_str(), arguments.as_slice()) {
+        ("verify-bundle", []) => Ok(XtaskInvocation::VerifyBundle(None)),
+        ("verify-bundle", [path]) => Ok(XtaskInvocation::VerifyBundle(Some(PathBuf::from(path)))),
+        ("verify-bundle", [_, extra, ..]) => Err(format!("unexpected argument: {extra}").into()),
+        ("research", [target]) if target == "production-identity" => {
+            Ok(XtaskInvocation::ProductionIdentityResearch)
         }
-        _ => Err(format!("unknown command: {command}").into()),
+        ("research", []) => Err("research requires target production-identity".into()),
+        ("research", [target]) => Err(format!("unknown research target: {target}").into()),
+        ("research", [_, extra, ..]) => Err(format!("unexpected argument: {extra}").into()),
+        (_, []) => Ok(XtaskInvocation::Command(command)),
+        (_, [argument, ..]) => Err(format!("unexpected argument: {argument}").into()),
     }
 }
 
@@ -127,6 +143,7 @@ fn repo_root() -> PathBuf {
 fn print_usage() {
     eprintln!("usage: cargo run --manifest-path tools/xtask/Cargo.toml -- <command>");
     eprintln!("commands: doctor build fmt check test quick model spec verify verify-bundle clean");
+    eprintln!("prospective research: research production-identity");
     eprintln!("internal evidence commands: begin stage7b-evidence complete manifest bundle");
 }
 
@@ -650,22 +667,7 @@ fn pluscal_translation_is_current(
 ) -> Result<()> {
     section(&format!("check PlusCal translation drift for {spec}"));
     let file_name = format!("{spec}.tla");
-    let line_width = if matches!(
-        spec,
-        "IoCser"
-            | "PersonalityFutexCser"
-            | "PersonalityFutexRequeueCser"
-            | "PersonalityReadinessCser"
-            | "PersonalityExecCser"
-            | "RuntimeFsCser"
-            | "RuntimeNetCser"
-            | "CompositionCser"
-            | "LinuxIoCompositionCser"
-    ) {
-        "10000"
-    } else {
-        "1000"
-    };
+    let line_width = pluscal_line_width(spec);
     let original_path = source_cser_dir.join(&file_name);
     let generated_path = isolated_cser_dir.join(&file_name);
     let mut command = Command::new("java");
@@ -688,6 +690,26 @@ fn pluscal_translation_is_current(
     }
     println!("PlusCal translation: PASS ({spec})");
     Ok(())
+}
+
+fn pluscal_line_width(spec: &str) -> &'static str {
+    if matches!(
+        spec,
+        "IoCser"
+            | "PersonalityFutexCser"
+            | "PersonalityFutexRequeueCser"
+            | "PersonalityReadinessCser"
+            | "PersonalityExecCser"
+            | "RuntimeFsCser"
+            | "RuntimeNetCser"
+            | "CompositionCser"
+            | "LinuxIoCompositionCser"
+            | "ProductionIdentityCser"
+    ) {
+        "10000"
+    } else {
+        "1000"
+    }
 }
 
 fn first_difference(expected: &str, actual: &str) -> String {
@@ -867,6 +889,25 @@ fn run_bounded_logged(
     timeout: Duration,
     max_output_bytes: u64,
 ) -> Result<()> {
+    run_bounded_logged_with_replay(command, artifact, timeout, max_output_bytes, true)
+}
+
+fn run_bounded_logged_quiet(
+    command: &mut Command,
+    artifact: &Path,
+    timeout: Duration,
+    max_output_bytes: u64,
+) -> Result<()> {
+    run_bounded_logged_with_replay(command, artifact, timeout, max_output_bytes, false)
+}
+
+fn run_bounded_logged_with_replay(
+    command: &mut Command,
+    artifact: &Path,
+    timeout: Duration,
+    max_output_bytes: u64,
+    replay: bool,
+) -> Result<()> {
     let parent = artifact
         .parent()
         .ok_or_else(|| format!("log path has no parent: {}", artifact.display()))?;
@@ -983,7 +1024,9 @@ fn run_bounded_logged(
     truncate_utf8(&mut transcript, output_limit.saturating_sub(suffix.len()));
     transcript.push_str(&suffix);
     fs::write(artifact, transcript.as_bytes())?;
-    print!("{transcript}");
+    if replay || failure.is_some() {
+        print!("{transcript}");
+    }
 
     if let Some(reason) = failure {
         return Err(reason.into());
@@ -1066,6 +1109,52 @@ mod tests {
         let path = artifact(name);
         fs::create_dir(&path).expect("create fixture directory");
         path
+    }
+
+    #[test]
+    fn parses_the_independent_production_identity_research_route() {
+        assert_eq!(
+            parse_invocation(
+                [
+                    String::from("research"),
+                    String::from("production-identity")
+                ]
+                .into_iter()
+            )
+            .expect("prospective research route"),
+            XtaskInvocation::ProductionIdentityResearch
+        );
+        assert!(parse_invocation([String::from("research")].into_iter()).is_err());
+        assert!(
+            parse_invocation([String::from("research"), String::from("unknown")].into_iter())
+                .is_err()
+        );
+        assert!(
+            parse_invocation(
+                [
+                    String::from("research"),
+                    String::from("production-identity"),
+                    String::from("extra"),
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn production_identity_translation_uses_the_checked_in_wide_form() {
+        assert_eq!(pluscal_line_width("ProductionIdentityCser"), "10000");
+        assert_eq!(pluscal_line_width("Cser"), "1000");
+        assert!(first_difference("same\ncommitted\n", "same\ndrifted\n").contains("line 2"));
+    }
+
+    #[test]
+    fn accepted_v0_1_specification_population_remains_frozen_at_twelve() {
+        assert_eq!(TLA_SPECS.len(), 12);
+        assert!(!TLA_SPECS.contains(&"ProductionIdentityCser"));
+        production_identity::validate_release_boundary(&TLA_SPECS)
+            .expect("the root manifest and bundle still receive the frozen catalog");
     }
 
     #[test]

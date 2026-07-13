@@ -459,6 +459,56 @@ run_spec() {
             run_tlc "LinuxIoCompositionCser conditional crash-fallback liveness" \
                 LinuxIoCompositionCser LinuxIoCompositionCserFallbackMC.cfg
             ;;
+        ProductionIdentityCser)
+            run_tlc "ProductionIdentityCser 2-CPU-actor safety graph" \
+                ProductionIdentityCser ProductionIdentityCserSafetyMC.cfg
+            run_tlc "ProductionIdentityCser 4-CPU-actor safety graph" \
+                ProductionIdentityCser ProductionIdentityCserSmp4SafetyMC.cfg
+            expect_reachable ProductionIdentityCser \
+                ProductionIdentityCserSafetyMC.cfg \
+                IdentityPreservingReadAbsent \
+                "workload-created identities survive one same-effect block read and root closure" \
+                NormalWitnessScenario
+            expect_reachable ProductionIdentityCser \
+                ProductionIdentityCserSafetyMC.cfg \
+                FilesystemCrashAdoptAbsent \
+                "filesystem crash/rebind/adopt changes only the current domain binding" \
+                CrashWitnessScenario
+            expect_reachable ProductionIdentityCser \
+                ProductionIdentityCserSafetyMC.cfg \
+                CommitWinsRevokeRaceAbsent \
+                "device batch commit wins the shared root gate before revocation" \
+                CommitRaceWitnessScenario
+            expect_reachable ProductionIdentityCser \
+                ProductionIdentityCserSafetyMC.cfg \
+                RevokeWinsCommitRaceAbsent \
+                "root revocation wins the shared gate and aborts every uncommitted descendant" \
+                CommitRaceWitnessScenario
+            expect_reachable ProductionIdentityCser \
+                ProductionIdentityCserSafetyMC.cfg \
+                ResetIotlbSameEffectAbsent \
+                "reset and IOTLB timeouts retain the same effect through retry and closure" \
+                TimeoutWitnessScenario
+            expect_reachable ProductionIdentityCser \
+                ProductionIdentityCserSafetyMC.cfg \
+                CrossRegistryGenerationRejectAbsent \
+                "foreign-registry and stale-device-generation inputs reject without semantic mutation" \
+                RejectWitnessScenario
+            expect_reachable ProductionIdentityCser \
+                ProductionIdentityCserSafetyMC.cfg \
+                ActorSeparationAbsent \
+                "2-CPU abstract service/kernel/IRQ roles retain one identity chain" \
+                ActorWitnessScenario
+            expect_reachable ProductionIdentityCser \
+                ProductionIdentityCserSmp4SafetyMC.cfg \
+                ActorSeparationAbsent \
+                "4-CPU abstract service/kernel/IRQ roles retain one identity chain" \
+                ActorWitnessScenario
+            run_tlc "ProductionIdentityCser action properties" \
+                ProductionIdentityCser ProductionIdentityCserActionMC.cfg
+            run_tlc "ProductionIdentityCser conditional kernel progress" \
+                ProductionIdentityCser ProductionIdentityCserProgressMC.cfg
+            ;;
         *)
             echo "unknown CSER specification: $1" >&2
             exit 2
@@ -480,10 +530,11 @@ case $# in
         run_spec RuntimeNetCser
         run_spec CompositionCser
         run_spec LinuxIoCompositionCser
+        run_spec ProductionIdentityCser
         ;;
     1) run_spec "$1" ;;
     *)
-        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|RuntimeFsCser|RuntimeNetCser|CompositionCser|LinuxIoCompositionCser]" >&2
+        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|RuntimeFsCser|RuntimeNetCser|CompositionCser|LinuxIoCompositionCser|ProductionIdentityCser]" >&2
         exit 2
         ;;
 esac

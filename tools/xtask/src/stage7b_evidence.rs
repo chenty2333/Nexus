@@ -540,12 +540,97 @@ fn validate_fault_sources(root: &Path) -> Result<(), String> {
 }
 
 fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
-    let registry_constructors = source.matches("EffectRegistry::new").count();
-    if registry_constructors != 7 {
+    let registry_constructors = source.matches("EffectRegistry::new()").count();
+    if registry_constructors != 9 {
         return Err(format!(
-            "Stage 7B Registry source constructor population drifted; hidden sidecars are forbidden (expected 7, observed {registry_constructors})"
+            "Stage 7B Registry source constructor population drifted; hidden sidecars are forbidden (expected 9, observed {registry_constructors})"
         ));
     }
+
+    let atomic_start = source
+        .find("fn stage7b_registry_refactor_self_test() {")
+        .ok_or_else(|| "Stage 7B Registry lacks its implementation self-test".to_owned())?;
+    let atomic_end = source[atomic_start..]
+        .find("    let config = Stage7bFixtureConfig { n: 8, k: 3, h: 2 };")
+        .map(|offset| atomic_start + offset)
+        .ok_or_else(|| {
+            "Stage 7B Registry lacks the end of its counter-overflow fixture".to_owned()
+        })?;
+    let atomic = &source[atomic_start..atomic_end];
+    if atomic.matches("EffectRegistry::new()").count() != 1
+        || atomic
+            .matches("let mut atomic = EffectRegistry::new();")
+            .count()
+            != 1
+        || atomic
+            .matches("Err(RegistryError::CounterOverflow)")
+            .count()
+            != 4
+        || atomic.matches("assert_eq!(atomic, before);").count() != 4
+    {
+        return Err(
+            "Stage 7B Registry counter-overflow fixture must own exactly one implementation Registry and four failure-atomic rejection checks"
+                .into(),
+        );
+    }
+
+    let production_start = source
+        .find("pub(crate) fn production_identity_registry_self_test() {")
+        .ok_or_else(|| {
+            "Stage 7B Registry lacks the production-identity implementation self-test".to_owned()
+        })?;
+    let production_end = source[production_start..]
+        .find("pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {")
+        .map(|offset| production_start + offset)
+        .ok_or_else(|| {
+            "Stage 7B Registry production-identity self-test boundary is unterminated".to_owned()
+        })?;
+    let production = &source[production_start..production_end];
+    if production.matches("EffectRegistry::new()").count() != 1
+        || production
+            .matches("let mut registry = EffectRegistry::new();")
+            .count()
+            != 1
+        || production.matches(".register_derived(").count() != 4
+    {
+        return Err(
+            "production-identity implementation self-test must own exactly one Registry and the exact three-effect plus stale-parent registration population"
+                .into(),
+        );
+    }
+    for required in [
+        "registry.add_domain(scope, config).unwrap();",
+        ".crash_domain(scope, FILESYSTEM_DOMAIN, filesystem_v1)",
+        ".rebind_domain(scope, FILESYSTEM_DOMAIN, filesystem_v2)",
+        ".adopt_domain(scope, FILESYSTEM_DOMAIN, filesystem_v2, recovery.handle)",
+        "let selection = registry.revoke_begin(scope).unwrap();",
+        "let next = registry.revoke_next(&selection).unwrap().unwrap();",
+        "assert!(registry.revoke_next(&selection).unwrap().is_none());",
+    ] {
+        if !production.contains(required) {
+            return Err(format!(
+                "production-identity implementation self-test lacks required transition: {required}"
+            ));
+        }
+    }
+    let bounded_self_test = &source[production_end..];
+    if production.contains("Stage7bFaultCredit")
+        || production.contains("Stage7bFaultBudget")
+        || source
+            .matches("production_identity_registry_self_test();")
+            .count()
+            != 1
+        || bounded_self_test
+            .matches("production_identity_registry_self_test();")
+            .count()
+            != 1
+    {
+        return Err(
+            "production-identity Registry coverage must remain one implementation self-test call, not shared Stage 7B fault-matrix evidence"
+                .into(),
+        );
+    }
+
     let helper_start = source
         .find("pub(crate) struct Stage7bFaultCredit {")
         .ok_or_else(|| "Stage 7B fault Registry lacks linear credit helper".to_owned())?;
@@ -678,8 +763,9 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "causal.registry_instance_id != registry_instance_id",
         "causal.scope != target.scope",
         "causal.authority_epoch != target.authority_epoch",
-        "causal.binding_epoch > target.binding_epoch",
         "source.identity.scope == target.scope",
+        "source.identity.domain != target.domain",
+        "causal.binding_epoch <= target.binding_epoch",
         "source.commit.as_ref() == Some(causal)",
         "completion has invalid causal commit",
         "pub(crate) fn stage7b_causal_commit_self_test()",
@@ -1942,6 +2028,82 @@ mod tests {
         );
         assert_ne!(foreign_registry_allowed, source);
         assert!(validate_fault_registry_source_text(&foreign_registry_allowed).is_err());
+
+        let cross_domain_unfenced = source.replacen(
+            "&& (source.identity.domain != target.domain\n                || causal.binding_epoch <= target.binding_epoch)",
+            "&& true",
+            1,
+        );
+        assert_ne!(cross_domain_unfenced, source);
+        assert!(validate_fault_registry_source_text(&cross_domain_unfenced).is_err());
+    }
+
+    #[test]
+    fn fault_registry_gate_structurally_binds_the_two_new_self_test_registries() {
+        let source = checked_registry_source();
+
+        let moved_atomic = source
+            .replacen(
+                "let mut atomic = EffectRegistry::new();",
+                "let mut atomic = EffectRegistry::default();",
+                1,
+            )
+            .replacen(
+                "pub(crate) struct Stage7bFaultCredit {",
+                "fn hidden_atomic_sidecar() -> EffectRegistry { EffectRegistry::new() }\n\npub(crate) struct Stage7bFaultCredit {",
+                1,
+            );
+        assert_eq!(
+            moved_atomic.matches("EffectRegistry::new()").count(),
+            source.matches("EffectRegistry::new()").count(),
+            "mutation must preserve the global constructor count"
+        );
+        assert!(validate_fault_registry_source_text(&moved_atomic).is_err());
+
+        let moved_production = source
+            .replacen(
+                "let unrelated_supervisor = TaskKey::new(0x2ff, 1);\n    let mut registry = EffectRegistry::new();",
+                "let unrelated_supervisor = TaskKey::new(0x2ff, 1);\n    let mut registry = EffectRegistry::default();",
+                1,
+            )
+            .replacen(
+                "pub(crate) struct Stage7bFaultCredit {",
+                "fn hidden_production_sidecar() -> EffectRegistry { EffectRegistry::new() }\n\npub(crate) struct Stage7bFaultCredit {",
+                1,
+            );
+        assert_eq!(
+            moved_production.matches("EffectRegistry::new()").count(),
+            source.matches("EffectRegistry::new()").count(),
+            "mutation must preserve the global constructor count"
+        );
+        assert!(validate_fault_registry_source_text(&moved_production).is_err());
+
+        let detached = source.replacen(
+            "production_identity_registry_self_test();",
+            "/* detached production identity self-test */",
+            1,
+        );
+        assert!(validate_fault_registry_source_text(&detached).is_err());
+
+        let moved_to_fault_helper = source
+            .replacen(
+                "    production_identity_registry_self_test();\n",
+                "",
+                1,
+            )
+            .replacen(
+                "pub(crate) struct Stage7bFaultCredit {",
+                "fn mislabeled_fault_matrix_call() { production_identity_registry_self_test(); }\n\npub(crate) struct Stage7bFaultCredit {",
+                1,
+            );
+        assert_eq!(
+            moved_to_fault_helper
+                .matches("production_identity_registry_self_test();")
+                .count(),
+            1,
+            "mutation must preserve the implementation self-test call count"
+        );
+        assert!(validate_fault_registry_source_text(&moved_to_fault_helper).is_err());
     }
 
     #[test]

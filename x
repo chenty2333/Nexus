@@ -33,6 +33,8 @@ Focused commands:
   model                   alias for the complete reference-model gate
   spec                    check PlusCal drift and run all TLC families
   system                  run both QEMU receipts and composition oracle
+  research production-identity
+                          run the prospective v0.2 formal identity gate
 EOF
 }
 
@@ -271,7 +273,7 @@ if (( $# > 0 )); then
     shift
 fi
 case "$command" in
-    doctor|build|test|run|fmt|check|quick|model|spec|system|verify|verify-bundle|clean)
+    doctor|build|test|run|fmt|check|quick|model|spec|system|research|verify|verify-bundle|clean)
         acquire_repo_lock
         ;;
 esac
@@ -350,6 +352,16 @@ case "$command" in
         require_no_args "$@"
         require_docker
         run_system
+        ;;
+    research)
+        require_docker
+        if (( $# != 1 )); then
+            die "research requires exactly one target: production-identity"
+        fi
+        case "$1" in
+            production-identity) run_xtask research production-identity ;;
+            *) die "unknown research target: $1" ;;
+        esac
         ;;
     verify)
         require_no_args "$@"
