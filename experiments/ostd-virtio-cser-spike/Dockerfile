@@ -4,6 +4,7 @@ ARG OSDK_IMAGE=asterinas/osdk:0.18.0-20260603@sha256:a7540bfcd262ae52471f86353a8
 FROM ${OSDK_IMAGE}
 
 COPY --from=nexus-root crates/cser-transition-gates /crates/cser-transition-gates
+COPY --from=nexus-root crates/nexus-ostd-virtio /crates/nexus-ostd-virtio
 
 ARG OSTD_CRATE_SHA256=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1
 ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
@@ -15,6 +16,9 @@ RUN rustup target add --toolchain nightly-2026-04-03 x86_64-unknown-none \
 
 COPY --from=nexus-root kernel/nexus-ostd/src/cser/effect_registry.rs \
     /kernel/nexus-ostd/src/cser/effect_registry.rs
+COPY --from=nexus-root kernel/nexus-ostd/Cargo.toml \
+    kernel/nexus-ostd/Cargo.lock \
+    /kernel/nexus-ostd/
 
 # Build the audited MPL-2.0 overlay from the exact crates.io archive.  The
 # complete patched source exists only in the image; it is never vendored into
@@ -70,7 +74,12 @@ RUN --mount=type=bind,source=.,target=/tmp/nexus-source,readonly \
     && chmod a-w /work/target/osdk/ostd-virtio-cser-spike-run-base/Cargo.lock \
     && cd /work \
     && cargo fmt --all -- --check \
+    && cargo fmt --manifest-path /crates/nexus-ostd-virtio/Cargo.toml -- --check \
+    && CARGO_TARGET_DIR=/work/target/facade-check \
+        cargo check --manifest-path /crates/nexus-ostd-virtio/Cargo.toml \
+        --locked --target x86_64-unknown-none \
     && bash scripts/assert-patch.sh \
+    && bash scripts/check-facade-boundary.sh \
     && bash scripts/check-io-gate.sh \
     && cargo osdk check --locked \
     && cargo clippy --locked --target x86_64-unknown-none --lib -- \

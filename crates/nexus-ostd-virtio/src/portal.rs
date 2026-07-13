@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Safe portal typestate over the private PCI, queue, and DMA substrate.
+
 use alloc::boxed::Box;
 use bitflags::bitflags;
 use core::{
@@ -136,7 +138,7 @@ struct SessionBinding {
 }
 
 impl Portal {
-    pub fn new(device_function: DeviceFunction) -> Self {
+    fn new(device_function: DeviceFunction) -> Self {
         let instance_id = portal_instance_id(device_function);
         Self {
             device_function,
@@ -146,6 +148,13 @@ impl Portal {
             commits: [None; 4],
             pending_close: None,
         }
+    }
+
+    /// Creates a portal bound to the exact opaque PCI owner returned by
+    /// [`crate::discover_and_own_bars`]. No raw BDF or PCI root is accepted at
+    /// the public boundary.
+    pub fn for_owned_device(root: &mut Root) -> Self {
+        Self::new(root.claim_device_function())
     }
 
     fn state_projection(&self) -> PortalStateProjection {
@@ -184,6 +193,9 @@ impl Portal {
         root: &mut Root,
         authority: EffectAuthority,
     ) -> Result<Session, SessionOpenError> {
+        if root.device_function() != self.device_function {
+            return Err(SessionOpenError::ForeignInstance);
+        }
         let binding = self.bind_session_authority(authority)?;
         Ok(Session::open_bound(root, binding))
     }
@@ -502,8 +514,8 @@ impl Session {
         dma::begin_generation(authority.device_generation());
         pci::begin_transport_claims();
 
-        let mut transport =
-            PciTransport::new::<OstdHal, _>(root, device_function).expect("open PCI transport");
+        let mut transport = PciTransport::new::<OstdHal, _>(root.raw_mut(), device_function)
+            .expect("open PCI transport");
         assert_eq!(transport.device_type(), DeviceType::Block);
         let negotiated = transport.begin_init(REQUIRED_FEATURES);
         assert_eq!(negotiated, REQUIRED_FEATURES);

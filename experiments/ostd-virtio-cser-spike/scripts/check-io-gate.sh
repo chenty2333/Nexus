@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source_file=${1:-src/portal.rs}
-entry_file=${2:-src/lib.rs}
+script_dir=$(cd "$(dirname "$0")" && pwd)
+experiment_root=$(cd "$script_dir/.." && pwd)
+repo_root=$(cd "$experiment_root/../.." && pwd)
+source_file=${1:-$repo_root/crates/nexus-ostd-virtio/src/portal.rs}
+entry_file=${2:-$experiment_root/src/lib.rs}
 
 require_literal() {
     local literal=$1
@@ -76,10 +79,10 @@ if grep -Fq 'pub fn open(' "$source_file"; then
     exit 1
 fi
 
-negative_call='let namespace_isolation = portal::assert_session_namespace_isolation();'
+negative_call='let namespace_isolation = assert_session_namespace_isolation();'
 negative_marker='println!("{}", namespace_isolation.into_marker());'
 raw_marker='IO Namespace foreign_bdf_rejected=true bidirectional=true portal_state_unchanged=true pre_pci_dma=true'
-discovery_call='let (mut root, device_function, memory_bars) = pci::discover_and_own_bars();'
+discovery_call='let mut root = discover_and_own_bars();'
 for literal in "$negative_call" "$negative_marker" "$discovery_call"; do
     if [[ $(grep -Fc "$literal" "$entry_file") -ne 1 ]]; then
         echo "Stage 7B I/O entrypoint must contain one exact namespace-negative step: $literal" >&2

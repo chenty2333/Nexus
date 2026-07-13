@@ -310,6 +310,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-ostd-virtio"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "cser-transition-gates",
+ "ostd",
+ "virtio-drivers",
+ "zerocopy",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -419,11 +430,8 @@ checksum = "34a60dbfcc468a747516422d40d758753d84f8c0cb40792132ed7d90f3c1d417"
 name = "ostd-virtio-cser-spike"
 version = "0.1.0"
 dependencies = [
- "bitflags 2.11.0",
- "cser-transition-gates",
+ "nexus-ostd-virtio",
  "ostd",
- "virtio-drivers",
- "zerocopy",
 ]
 
 [[package]]

@@ -23,12 +23,10 @@ image_key=$(sha256sum \
     "$root/cargo-home-config.toml" \
     "$root/LICENSE-MPL-2.0" \
     "$root/src/lib.rs" \
-    "$root/src/dma.rs" \
-    "$root/src/pci.rs" \
-    "$root/src/portal.rs" \
     "$root/assets/sector0.txt" \
     "$root/patches/ostd-0.18.0-dma-closure.patch" \
     "$root/scripts/assert-patch.sh" \
+    "$root/scripts/check-facade-boundary.sh" \
     "$root/scripts/check-io-gate.sh" \
     "$root/scripts/assert-serial.sh" \
     "$root/scripts/assert-debug-trace.awk" \
@@ -47,6 +45,15 @@ image_key=$(sha256sum \
     "$repo_root/crates/cser-transition-gates/src/scheduler.rs" \
     "$repo_root/crates/cser-transition-gates/src/pager.rs" \
     "$repo_root/crates/cser-transition-gates/src/io.rs" \
+    "$repo_root/crates/nexus-ostd-virtio/Cargo.toml" \
+    "$repo_root/crates/nexus-ostd-virtio/Cargo.lock" \
+    "$repo_root/crates/nexus-ostd-virtio/README.md" \
+    "$repo_root/crates/nexus-ostd-virtio/src/lib.rs" \
+    "$repo_root/crates/nexus-ostd-virtio/src/dma.rs" \
+    "$repo_root/crates/nexus-ostd-virtio/src/pci.rs" \
+    "$repo_root/crates/nexus-ostd-virtio/src/portal.rs" \
+    "$repo_root/kernel/nexus-ostd/Cargo.toml" \
+    "$repo_root/kernel/nexus-ostd/Cargo.lock" \
     "$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/ostd-virtio-cser-spike:$image_key"
 runner_base="$root/osdk-runner-base"
@@ -69,6 +76,9 @@ container() {
         --tmpfs /tmp/nexus-home:rw,exec,nosuid,size=64m,mode=1777 \
         -v "$root:/work:z" \
         -v "$repo_root/crates/cser-transition-gates:/crates/cser-transition-gates:ro,z" \
+        -v "$repo_root/crates/nexus-ostd-virtio:/crates/nexus-ostd-virtio:ro,z" \
+        --mount "type=bind,source=$repo_root/kernel/nexus-ostd/Cargo.toml,target=/kernel/nexus-ostd/Cargo.toml,readonly" \
+        --mount "type=bind,source=$repo_root/kernel/nexus-ostd/Cargo.lock,target=/kernel/nexus-ostd/Cargo.lock,readonly" \
         --mount "type=bind,source=$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs,target=/kernel/nexus-ostd/src/cser/effect_registry.rs,readonly" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         -w /work \
@@ -84,20 +94,22 @@ ensure_image() {
 
 check_source() {
     container bash scripts/assert-patch.sh
+    container bash scripts/check-facade-boundary.sh
     container bash scripts/check-io-gate.sh
     container bash -c '
         set -euo pipefail
         tmp=$(mktemp -d)
         trap '\''rm -rf "$tmp"'\'' EXIT
+        portal_source=/crates/nexus-ostd-virtio/src/portal.rs
 
-        cp src/portal.rs "$tmp/missing-gate.rs"
+        cp "$portal_source" "$tmp/missing-gate.rs"
         sed -i '\''/gate: IoGate<4>,/d'\'' "$tmp/missing-gate.rs"
         if bash scripts/check-io-gate.sh "$tmp/missing-gate.rs" >/dev/null 2>&1; then
             echo "I/O adapter oracle accepted a missing shared gate" >&2
             exit 1
         fi
 
-        cp src/portal.rs "$tmp/missing-commit.rs"
+        cp "$portal_source" "$tmp/missing-commit.rs"
         sed -i '\''s/\.commit_with(authority/.commit_without_gate(authority/'\'' \
             "$tmp/missing-commit.rs"
         if bash scripts/check-io-gate.sh "$tmp/missing-commit.rs" >/dev/null 2>&1; then
@@ -105,7 +117,7 @@ check_source() {
             exit 1
         fi
 
-        cp src/portal.rs "$tmp/missing-instance-namespace.rs"
+        cp "$portal_source" "$tmp/missing-instance-namespace.rs"
         sed -i '\''s/IoGate::new(instance_id)/IoGate::new(1)/'\'' \
             "$tmp/missing-instance-namespace.rs"
         if bash scripts/check-io-gate.sh "$tmp/missing-instance-namespace.rs" >/dev/null 2>&1; then
@@ -113,7 +125,7 @@ check_source() {
             exit 1
         fi
 
-        cp src/portal.rs "$tmp/missing-session-instance-binding.rs"
+        cp "$portal_source" "$tmp/missing-session-instance-binding.rs"
         sed -i '\''s/authority\.instance_id() != self\.gate\.instance_id()/self.gate.instance_id() == 0/'\'' \
             "$tmp/missing-session-instance-binding.rs"
         if bash scripts/check-io-gate.sh "$tmp/missing-session-instance-binding.rs" >/dev/null 2>&1; then
@@ -122,31 +134,31 @@ check_source() {
         fi
 
         cp src/lib.rs "$tmp/missing-session-negative-call.rs"
-        sed -i '\''/let namespace_isolation = portal::assert_session_namespace_isolation();/d'\'' \
+        sed -i '\''/let namespace_isolation = assert_session_namespace_isolation();/d'\'' \
             "$tmp/missing-session-negative-call.rs"
-        if bash scripts/check-io-gate.sh src/portal.rs "$tmp/missing-session-negative-call.rs" >/dev/null 2>&1; then
+        if bash scripts/check-io-gate.sh "$portal_source" "$tmp/missing-session-negative-call.rs" >/dev/null 2>&1; then
             echo "I/O adapter oracle accepted a marker without executing the namespace negative" >&2
             exit 1
         fi
 
         cp src/lib.rs "$tmp/late-session-negative-call.rs"
-        sed -i '\''/let namespace_isolation = portal::assert_session_namespace_isolation();/d'\'' \
+        sed -i '\''/let namespace_isolation = assert_session_namespace_isolation();/d'\'' \
             "$tmp/late-session-negative-call.rs"
         sed -i '\''/println!("{}", namespace_isolation.into_marker());/d'\'' \
             "$tmp/late-session-negative-call.rs"
-        sed -i '\''/let (mut root, device_function, memory_bars) = pci::discover_and_own_bars();/a\    let namespace_isolation = portal::assert_session_namespace_isolation();\n    println!("{}", namespace_isolation.into_marker());'\'' \
+        sed -i '\''/let mut root = discover_and_own_bars();/a\    let namespace_isolation = assert_session_namespace_isolation();\n    println!("{}", namespace_isolation.into_marker());'\'' \
             "$tmp/late-session-negative-call.rs"
-        if bash scripts/check-io-gate.sh src/portal.rs "$tmp/late-session-negative-call.rs" >/dev/null 2>&1; then
+        if bash scripts/check-io-gate.sh "$portal_source" "$tmp/late-session-negative-call.rs" >/dev/null 2>&1; then
             echo "I/O adapter oracle accepted the namespace negative after PCI/DMA discovery" >&2
             exit 1
         fi
 
         cp src/lib.rs "$tmp/conditional-session-negative-call.rs"
-        sed -i '\''/let namespace_isolation = portal::assert_session_namespace_isolation();/i\    if false {'\'' \
+        sed -i '\''/let namespace_isolation = assert_session_namespace_isolation();/i\    if false {'\'' \
             "$tmp/conditional-session-negative-call.rs"
         sed -i '\''/println!("{}", namespace_isolation.into_marker());/a\    }'\'' \
             "$tmp/conditional-session-negative-call.rs"
-        if bash scripts/check-io-gate.sh src/portal.rs "$tmp/conditional-session-negative-call.rs" >/dev/null 2>&1; then
+        if bash scripts/check-io-gate.sh "$portal_source" "$tmp/conditional-session-negative-call.rs" >/dev/null 2>&1; then
             echo "I/O adapter oracle accepted a conditionally skipped namespace negative" >&2
             exit 1
         fi
@@ -154,12 +166,12 @@ check_source() {
         cp src/lib.rs "$tmp/fabricated-session-negative-marker.rs"
         sed -i '\''s/println!("{}", namespace_isolation.into_marker());/println!("IO Namespace foreign_bdf_rejected=true bidirectional=true portal_state_unchanged=true pre_pci_dma=true");/'\'' \
             "$tmp/fabricated-session-negative-marker.rs"
-        if bash scripts/check-io-gate.sh src/portal.rs "$tmp/fabricated-session-negative-marker.rs" >/dev/null 2>&1; then
+        if bash scripts/check-io-gate.sh "$portal_source" "$tmp/fabricated-session-negative-marker.rs" >/dev/null 2>&1; then
             echo "I/O adapter oracle accepted a caller-fabricated namespace marker" >&2
             exit 1
         fi
 
-        cp src/portal.rs "$tmp/copied-gate-probe.rs"
+        cp "$portal_source" "$tmp/copied-gate-probe.rs"
         sed -i '\''s/self\.gate\.can_complete_device(authority)/{ let mut probe = self.gate; probe.complete_device(authority).is_ok() }/'\'' \
             "$tmp/copied-gate-probe.rs"
         if bash scripts/check-io-gate.sh "$tmp/copied-gate-probe.rs" >/dev/null 2>&1; then
@@ -167,7 +179,7 @@ check_source() {
             exit 1
         fi
 
-        cp src/portal.rs "$tmp/shadow-epoch.rs"
+        cp "$portal_source" "$tmp/shadow-epoch.rs"
         sed -i '\''/pub struct Portal {/a\    authority_epoch: u64,'\'' \
             "$tmp/shadow-epoch.rs"
         if bash scripts/check-io-gate.sh "$tmp/shadow-epoch.rs" >/dev/null 2>&1; then
@@ -194,6 +206,10 @@ check_kernel() {
     # cargo-osdk 0.18 does not expose --locked on build/run. Gate the project
     # lock explicitly and over-mount it read-only for all mounted builds.
     container cargo fmt --all -- --check
+    container cargo fmt --manifest-path /crates/nexus-ostd-virtio/Cargo.toml -- --check
+    container env CARGO_TARGET_DIR=/work/target/facade-check \
+        cargo check --manifest-path /crates/nexus-ostd-virtio/Cargo.toml \
+        --locked --target x86_64-unknown-none
     container cargo osdk check --locked
     # cargo-osdk 0.18 has no clippy subcommand. Run the no_std library directly;
     # the upstream macro emits a private `ktest` cfg and this typestate API

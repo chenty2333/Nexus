@@ -84,6 +84,16 @@ could hide an accidental write.
 
 ## Reused and Nexus-owned pieces
 
+The reusable implementation now lives in
+`../../crates/nexus-ostd-virtio/`. This experiment's `src/lib.rs` is a
+`#![deny(unsafe_code)]` client of that crate. The facade crate root also denies
+unsafe code and grants local allowances only to its three private
+`pci`/`dma`/`portal` modules; raw pointers, the HAL, the raw PCI root, and DMA
+owners are not public API. `scripts/check-facade-boundary.sh` enforces this
+layout, while the unchanged serial and QEMU trace oracle establishes runtime
+equivalence with the Stage 5B receipt. This extraction is preparation, not
+same-boot integration evidence.
+
 The implementation directly reuses these `virtio-drivers` 0.13 pieces:
 
 ```text
@@ -269,8 +279,9 @@ does not revisit the pinned request buffers. This is an audited dependency
 boundary that should eventually become an upstream reset/abandon API.
 
 The experiment directory is an MPL-2.0 package boundary and includes the full
-MPL text. The derived OSTD patch stays MPL-2.0-covered. virtio-drivers is an
-unmodified MIT dependency fetched from its checksummed crate archive and
+MPL text; the extracted facade is likewise MPL-2.0-covered under the repository
+root license. The derived OSTD patch stays MPL-2.0-covered. virtio-drivers is
+an unmodified MIT dependency fetched from its checksummed crate archive and
 locked by Cargo; no upstream source is copied into Nexus.
 
 ## Explicit non-claims

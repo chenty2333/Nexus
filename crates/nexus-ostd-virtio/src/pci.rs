@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Private PCI configuration, BAR-ownership, and MMIO-claim substrate.
+
 use alloc::sync::Arc;
-use core::ptr::NonNull;
+use core::{fmt, ptr::NonNull};
 
 use ostd::{
     arch::device::io_port::ReadWriteAccess,
@@ -35,12 +37,12 @@ struct ConfigPorts {
 
 /// Serialized PCI configuration mechanism #1 access.
 #[derive(Clone)]
-pub struct PioConfigurationAccess {
+pub(crate) struct PioConfigurationAccess {
     ports: Arc<SpinLock<ConfigPorts>>,
 }
 
 impl PioConfigurationAccess {
-    pub fn acquire() -> Self {
+    fn acquire() -> Self {
         let address = IoPort::acquire(CONFIG_ADDRESS).expect("acquire PCI CONFIG_ADDRESS");
         let data = IoPort::acquire(CONFIG_DATA).expect("acquire PCI CONFIG_DATA");
         Self {
@@ -88,7 +90,97 @@ impl ConfigurationAccess for PioConfigurationAccess {
     }
 }
 
-pub type Root = PciRoot<PioConfigurationAccess>;
+pub(crate) type RawRoot = PciRoot<PioConfigurationAccess>;
+
+/// Copyable descriptive identity, never an ownership or MMIO capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceBdf {
+    bus: u8,
+    device: u8,
+    function: u8,
+}
+
+impl DeviceBdf {
+    pub const fn bus(self) -> u8 {
+        self.bus
+    }
+
+    pub const fn device(self) -> u8 {
+        self.device
+    }
+
+    pub const fn function(self) -> u8 {
+        self.function
+    }
+}
+
+impl From<DeviceFunction> for DeviceBdf {
+    fn from(value: DeviceFunction) -> Self {
+        Self {
+            bus: value.bus,
+            device: value.device,
+            function: value.function,
+        }
+    }
+}
+
+impl fmt::Display for DeviceBdf {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:02x}:{:02x}.{}",
+            self.bus, self.device, self.function
+        )
+    }
+}
+
+/// Opaque, non-copyable owner of the PCI configuration root and the one
+/// discovered VirtIO block function.
+///
+/// The raw `PciRoot<PioConfigurationAccess>` is deliberately private: callers
+/// can neither clone the configuration accessor nor manufacture an MMIO
+/// capability outside the facade lifecycle.
+pub struct Root {
+    inner: RawRoot,
+    device_function: DeviceFunction,
+    memory_bars: usize,
+    portal_claimed: bool,
+}
+
+impl Root {
+    pub const fn device_bdf(&self) -> DeviceBdf {
+        DeviceBdf {
+            bus: self.device_function.bus,
+            device: self.device_function.device,
+            function: self.device_function.function,
+        }
+    }
+
+    pub const fn memory_bar_count(&self) -> usize {
+        self.memory_bars
+    }
+
+    pub(crate) const fn device_function(&self) -> DeviceFunction {
+        self.device_function
+    }
+
+    pub(crate) fn claim_device_function(&mut self) -> DeviceFunction {
+        assert!(!self.portal_claimed, "PCI device portal claimed twice");
+        self.portal_claimed = true;
+        self.device_function
+    }
+
+    pub(crate) fn raw_mut(&mut self) -> &mut RawRoot {
+        &mut self.inner
+    }
+
+    fn assert_device(&self, device_function: DeviceFunction) {
+        assert_eq!(
+            self.device_function, device_function,
+            "foreign PCI root owner"
+        );
+    }
+}
 
 struct BarOwner {
     start: usize,
@@ -146,8 +238,8 @@ static BAR_REGISTRY: SpinLock<BarRegistry> = SpinLock::new(BarRegistry::new());
 
 /// Discovers exactly one modern VirtIO block device on bus 0 and installs one
 /// owner for each of its memory BARs before raw capability pointers are made.
-pub fn discover_and_own_bars() -> (Root, DeviceFunction, usize) {
-    let mut root = PciRoot::new(PioConfigurationAccess::acquire());
+pub fn discover_and_own_bars() -> Root {
+    let mut root = RawRoot::new(PioConfigurationAccess::acquire());
     let mut found = None;
 
     for (device_function, info) in root.enumerate_bus(0) {
@@ -190,24 +282,31 @@ pub fn discover_and_own_bars() -> (Root, DeviceFunction, usize) {
     assert_ne!(memory_bars, 0, "VirtIO device has no memory BAR");
     registry.installed = true;
     drop(registry);
-    (root, device_function, memory_bars)
+    Root {
+        inner: root,
+        device_function,
+        memory_bars,
+        portal_claimed: false,
+    }
 }
 
-pub fn enable_device(root: &mut Root, device_function: DeviceFunction) {
-    let (_, command) = root.get_status_command(device_function);
-    root.set_command(
+pub(crate) fn enable_device(root: &mut Root, device_function: DeviceFunction) {
+    root.assert_device(device_function);
+    let (_, command) = root.inner.get_status_command(device_function);
+    root.inner.set_command(
         device_function,
         command | Command::MEMORY_SPACE | Command::BUS_MASTER | Command::INTERRUPT_DISABLE,
     );
 }
 
-pub fn disable_bus_master(root: &mut Root, device_function: DeviceFunction) {
-    let (_, command) = root.get_status_command(device_function);
-    root.set_command(
+pub(crate) fn disable_bus_master(root: &mut Root, device_function: DeviceFunction) {
+    root.assert_device(device_function);
+    let (_, command) = root.inner.get_status_command(device_function);
+    root.inner.set_command(
         device_function,
         (command & !Command::BUS_MASTER) | Command::INTERRUPT_DISABLE,
     );
-    let (_, observed) = root.get_status_command(device_function);
+    let (_, observed) = root.inner.get_status_command(device_function);
     assert!(!observed.contains(Command::BUS_MASTER));
     assert!(observed.contains(Command::INTERRUPT_DISABLE));
 }
@@ -215,7 +314,7 @@ pub fn disable_bus_master(root: &mut Root, device_function: DeviceFunction) {
 /// Returns a BAR-subrange pointer while the registry retains the unique
 /// `IoMem` owner. The VirtIO HAL is the only caller and never accesses the
 /// same range through `IoMem` while a transport exists.
-pub unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
+pub(crate) unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
     let start = usize::try_from(paddr).expect("MMIO address fits usize");
     let end = start.checked_add(size).expect("MMIO range overflow");
     let mut registry = BAR_REGISTRY.lock();

@@ -10,7 +10,7 @@ const EVALUATOR_SOURCE_PATH: &str = "kernel/nexus-ostd/src/evaluation/stage7b.rs
 const ONESHOT_GATE_SOURCE_PATH: &str = "crates/cser-transition-gates/src/oneshot.rs";
 const EFFECT_WAKER_SOURCE_PATH: &str = "kernel/nexus-ostd/src/cser/effect.rs";
 const IO_GATE_SOURCE_PATH: &str = "crates/cser-transition-gates/src/io.rs";
-const IO_PORTAL_SOURCE_PATH: &str = "experiments/ostd-virtio-cser-spike/src/portal.rs";
+const IO_PORTAL_SOURCE_PATH: &str = "crates/nexus-ostd-virtio/src/portal.rs";
 const IO_ENTRY_SOURCE_PATH: &str = "experiments/ostd-virtio-cser-spike/src/lib.rs";
 
 const RACE_IDS: &[&str] = &[
@@ -1633,12 +1633,10 @@ fn validate_oneshot_provenance_source(
 }
 
 fn validate_io_entrypoint_source(entry: &str) -> Result<(), String> {
-    const NEGATIVE_CALL: &str =
-        "let namespace_isolation = portal::assert_session_namespace_isolation();";
+    const NEGATIVE_CALL: &str = "let namespace_isolation = assert_session_namespace_isolation();";
     const NEGATIVE_MARKER: &str = "println!(\"{}\", namespace_isolation.into_marker());";
     const RAW_MARKER: &str = "IO Namespace foreign_bdf_rejected=true bidirectional=true portal_state_unchanged=true pre_pci_dma=true";
-    const DISCOVERY_CALL: &str =
-        "let (mut root, device_function, memory_bars) = pci::discover_and_own_bars();";
+    const DISCOVERY_CALL: &str = "let mut root = discover_and_own_bars();";
 
     let kernel_start = entry
         .find("fn kernel_main() {")
@@ -2629,7 +2627,7 @@ mod tests {
     #[test]
     fn io_instance_source_gate_rejects_copyable_gate_and_forgeable_identity() {
         let gate = include_str!("../../../crates/cser-transition-gates/src/io.rs");
-        let portal = include_str!("../../../experiments/ostd-virtio-cser-spike/src/portal.rs");
+        let portal = include_str!("../../../crates/nexus-ostd-virtio/src/portal.rs");
         validate_io_instance_source(gate, portal).unwrap();
 
         let copyable = gate.replacen(
@@ -2742,15 +2740,13 @@ mod tests {
         let entry = include_str!("../../../experiments/ostd-virtio-cser-spike/src/lib.rs");
         validate_io_entrypoint_source(entry).unwrap();
 
-        let negative_call =
-            "    let namespace_isolation = portal::assert_session_namespace_isolation();\n";
+        let negative_call = "    let namespace_isolation = assert_session_namespace_isolation();\n";
         let negative_marker = "    println!(\"{}\", namespace_isolation.into_marker());\n";
         let missing = entry.replacen(negative_call, "", 1);
         assert_ne!(missing, entry);
         assert!(validate_io_entrypoint_source(&missing).is_err());
 
-        let discovery =
-            "    let (mut root, device_function, memory_bars) = pci::discover_and_own_bars();";
+        let discovery = "    let mut root = discover_and_own_bars();";
         let late = entry
             .replacen(negative_call, "", 1)
             .replacen(negative_marker, "", 1)

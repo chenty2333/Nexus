@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Private DMA ownership and IOTLB-closure substrate.
+
 use core::{ptr, ptr::NonNull};
 
 use ostd::{

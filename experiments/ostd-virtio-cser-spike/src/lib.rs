@@ -1,25 +1,18 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #![no_std]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_code)]
 
 extern crate alloc;
 
-mod dma;
-mod pci;
-mod portal;
-
+use nexus_ostd_virtio::{
+    ClosureProgress, ClosureReceipt, IotlbTombstone, Operation, OwnerKind, Portal, RegisterError,
+    ResetAck, ResetTombstone, Root, Terminal, assert_session_namespace_isolation,
+    discover_and_own_bars, owner_address, terminal_label,
+};
 use ostd::{
     power::{ExitCode, poweroff},
     prelude::*,
-};
-
-use crate::{
-    dma::OwnerKind,
-    portal::{
-        ClosureProgress, ClosureReceipt, IotlbTombstone, Operation, Portal, RegisterError,
-        ResetTombstone, Terminal, terminal_label,
-    },
 };
 
 const SECTOR_MAGIC: &[u8] = b"NEXUS-CSER-VIRTIO-BLK-STAGE5B\n";
@@ -42,7 +35,7 @@ fn assert_fixture(sector: &[u8]) -> u64 {
     hash
 }
 
-fn retry_reset(mut tombstone: ResetTombstone, root: &mut pci::Root) -> portal::ResetAck {
+fn retry_reset(mut tombstone: ResetTombstone, root: &mut Root) -> ResetAck {
     for _ in 0..16 {
         match tombstone.retry_ack(root) {
             Ok(ack) => return ack,
@@ -83,16 +76,17 @@ fn kernel_main() {
     println!(
         "VIRTIO_CSER BEGIN device=blk mode=polling irq_masked=true smp=not_proven hardware=QEMU"
     );
-    let namespace_isolation = portal::assert_session_namespace_isolation();
+    let namespace_isolation = assert_session_namespace_isolation();
     println!("{}", namespace_isolation.into_marker());
 
-    let (mut root, device_function, memory_bars) = pci::discover_and_own_bars();
+    let mut root = discover_and_own_bars();
     println!(
         "PCI Found bdf={} vendor=1af4 device=1042 modern=true memory_bar_owners={}",
-        device_function, memory_bars
+        root.device_bdf(),
+        root.memory_bar_count()
     );
 
-    let mut portal = Portal::new(device_function);
+    let mut portal = Portal::for_owned_device(&mut root);
     let first_binding = portal.binding_token().expect("initial live binding");
     let effects_before = portal.effect_count();
     let next_request_before = portal.next_request_id();
@@ -131,7 +125,7 @@ fn kernel_main() {
         OwnerKind::QueueDevice,
         OwnerKind::Request,
     ] {
-        let (paddr, iova) = dma::owner_address(first_authority.device_generation(), kind);
+        let (paddr, iova) = owner_address(first_authority.device_generation(), kind);
         assert_ne!(paddr, iova);
         println!(
             "DMA Owner generation={} kind={} paddr={:#x} iova={:#x} remapped=true",

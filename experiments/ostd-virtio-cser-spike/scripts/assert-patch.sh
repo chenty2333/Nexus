@@ -7,6 +7,7 @@ virtio_sha=cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7
 virtio_archive=/opt/nexus-source/virtio-drivers-0.13.0.crate
 patched=/opt/nexus-ostd/ostd-0.18.0
 patch_file=/work/patches/ostd-0.18.0-dma-closure.patch
+facade_root=${NEXUS_OSTD_VIRTIO_FACADE_ROOT:-/crates/nexus-ostd-virtio}
 
 echo "$expected_sha  $archive" | sha256sum -c - >/dev/null
 echo "$virtio_sha  $virtio_archive" | sha256sum -c - >/dev/null
@@ -56,8 +57,8 @@ grep -Fq 'retain this `DmaCoherent` owner for the entire pointer' "$coherent"
 grep -Fq 'overlapping access through `VmReader`, `VmWriter`' "$coherent"
 grep -Fq 'Raw access must stop before DMA teardown' "$coherent"
 grep -Fq 'NonNull::new(self.writer().cursor())' <<<"$raw_dma_api"
-grep -Fq 'dma.as_non_null_ptr_exclusive()' /work/src/dma.rs
-if grep -Fq 'dma.writer().cursor()' /work/src/dma.rs; then
+grep -Fq 'dma.as_non_null_ptr_exclusive()' "$facade_root/src/dma.rs"
+if grep -Fq 'dma.writer().cursor()' "$facade_root/src/dma.rs"; then
     echo 'Nexus bypasses the owner-bound exclusive raw DMA API' >&2
     exit 1
 fi
@@ -110,7 +111,7 @@ test "$fence_line" -lt "$store_line"
 # queue owns only its layout DMA guard, and Dma::drop calls dma_dealloc without
 # touching request buffers through Hal::unshare.
 grep -Fq 'virtio-drivers = { version = "=0.13.0", default-features = false }' \
-    /work/Cargo.toml
+    "$facade_root/Cargo.toml"
 grep -Fq 'layout: VirtQueueLayout<H>,' <<<"$queue_source"
 if grep -Fq 'Drop for VirtQueue' <<<"$queue_source"; then
     echo 'pinned VirtQueue gained an explicit Drop implementation' >&2
