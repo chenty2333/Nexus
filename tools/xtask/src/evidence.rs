@@ -17,14 +17,44 @@ pub(crate) use bundle::{verify_bundle, write_bundle};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const SCHEMA: &str = "nexus.verification.v5";
+const SCHEMA: &str = "nexus.verification.v6";
 const START_SCHEMA: &str = "nexus.verification.start.v1";
-const MODEL_SPEC_SCHEMA: &str = "nexus.verification.model-spec.v1";
-const COMPLETE_SCHEMA: &str = "nexus.verification.complete.v1";
+const FORMAL_VERIFIER_SCHEMA: &str = "nexus.verification.formal-verifier.v1";
+const MODEL_SPEC_SCHEMA: &str = "nexus.verification.model-spec.v2";
+const COMPLETE_SCHEMA: &str = "nexus.verification.complete.v2";
 const SENTINEL: &str = "target/verification/.stage7a-verify-start.json";
 const MODEL_SPEC_RECEIPT: &str = "target/verification/.stage7a-model-spec-complete.json";
 const COMPLETION_RECEIPT: &str = "target/verification/.stage7a-verify-complete.json";
+const FORMAL_VERIFIER_RECEIPT: &str = "target/verification/.formal-verifier.json";
 const OUTPUT: &str = "target/verification/manifest.json";
+const TLA_TOOLCHAIN_ID: &str = "tlaplus-tlc-227f61b";
+const TLA_TOOLCHAIN_SNAPSHOT: &str = "1.8.0-227f61b";
+const TLA_TOOLCHAIN_DISTRIBUTION: &str = "vendored-snapshot";
+const TLA_TOOLCHAIN_VERSION: &str = "2026.07.09.134028";
+const TLA_TOOLCHAIN_SOURCE_REVISION: &str = "227f61b983d0203a06db8184da45aed421e8f1b8";
+const TLA_TOOLCHAIN_INSTALLED_PATH: &str = "/opt/tla2tools/tla2tools.jar";
+const TLA_TOOLCHAIN_VERSION_LINE: &str = "TLC2 Version 2026.07.09.134028 (rev: 227f61b)";
+const PLUSCAL_VERSION_LINE: &str = "pcal.trans Version 1.12 of 01 July 2024";
+const TLA_TOOLCHAIN_JAR: ToolchainFileContract = ToolchainFileContract {
+    path: "third_party/tlaplus/1.8.0-227f61b/tla2tools-227f61b.jar",
+    bytes: 4_357_904,
+    sha256: "33de7da9ce1b7fffb9d1c184021178dbb051747be48504e65c584c423721a32e",
+};
+const TLA_TOOLCHAIN_PROVENANCE: ToolchainFileContract = ToolchainFileContract {
+    path: "third_party/tlaplus/1.8.0-227f61b/PROVENANCE.json",
+    bytes: 1_388,
+    sha256: "ba818b240937b61043c6203d4e23bddb87274652b1d06deb5033ca59a43a09f5",
+};
+const TLA_TOOLCHAIN_LICENSE: ToolchainFileContract = ToolchainFileContract {
+    path: "third_party/tlaplus/1.8.0-227f61b/LICENSE.upstream",
+    bytes: 1_149,
+    sha256: "3fa3a845ce5eb7b9b3508701dc1aa4d084b6b2c27cbae8cd44d277d10ee411bf",
+};
+const TLA_TOOLCHAIN_CHECKSUM_INDEX: ToolchainFileContract = ToolchainFileContract {
+    path: "third_party/tlaplus/1.8.0-227f61b/SHA256SUMS",
+    bytes: 88,
+    sha256: "bf43a10a47324a8e68e767f23406fc089494c53b41a26b109518f7355f3f4c40",
+};
 const COMPLETE_STAGES: [&str; 6] = [
     "reference-model",
     "formal-specifications",
@@ -96,10 +126,281 @@ struct Manifest {
     completion_receipt_sha256: String,
     started_unix_nanos: u128,
     generated_unix_seconds: u64,
+    formal_verifier: FormalVerifierBinding,
     boundaries: Boundaries,
     specifications: Vec<String>,
     stages: Vec<Stage>,
     artifacts: Vec<Artifact>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ToolchainFileContract {
+    path: &'static str,
+    bytes: u64,
+    sha256: &'static str,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ToolchainFile {
+    path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ToolchainReceipt {
+    id: String,
+    snapshot: String,
+    distribution: String,
+    applies_to_stages: Vec<String>,
+    jar: ToolchainFile,
+    tlc_version: String,
+    source_revision: String,
+    provenance: ToolchainFile,
+    license: ToolchainFile,
+    checksum_index: ToolchainFile,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FormalVerifierReceipt {
+    schema: String,
+    start_record_sha256: String,
+    revision: String,
+    source_sha256: String,
+    worktree_dirty: bool,
+    invocation: String,
+    nexus_rebuild: Option<String>,
+    rebuild_requested: bool,
+    orchestration_token_sha256: String,
+    run_nonce: String,
+    completed_unix_nanos: u128,
+    toolchain: ToolchainReceipt,
+    installed_path: String,
+    installed_bytes: u64,
+    installed_sha256: String,
+    reported_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FormalVerifierBinding {
+    toolchain: ToolchainReceipt,
+    installed_path: String,
+    runtime_receipt: Artifact,
+}
+
+fn toolchain_file(contract: ToolchainFileContract) -> ToolchainFile {
+    ToolchainFile {
+        path: String::from(contract.path),
+        bytes: contract.bytes,
+        sha256: String::from(contract.sha256),
+    }
+}
+
+fn expected_toolchain_receipt() -> ToolchainReceipt {
+    ToolchainReceipt {
+        id: String::from(TLA_TOOLCHAIN_ID),
+        snapshot: String::from(TLA_TOOLCHAIN_SNAPSHOT),
+        distribution: String::from(TLA_TOOLCHAIN_DISTRIBUTION),
+        applies_to_stages: vec![String::from("formal-specifications")],
+        jar: toolchain_file(TLA_TOOLCHAIN_JAR),
+        tlc_version: String::from(TLA_TOOLCHAIN_VERSION),
+        source_revision: String::from(TLA_TOOLCHAIN_SOURCE_REVISION),
+        provenance: toolchain_file(TLA_TOOLCHAIN_PROVENANCE),
+        license: toolchain_file(TLA_TOOLCHAIN_LICENSE),
+        checksum_index: toolchain_file(TLA_TOOLCHAIN_CHECKSUM_INDEX),
+    }
+}
+
+fn toolchain_files(receipt: &ToolchainReceipt) -> [&ToolchainFile; 4] {
+    [
+        &receipt.jar,
+        &receipt.provenance,
+        &receipt.license,
+        &receipt.checksum_index,
+    ]
+}
+
+fn validate_toolchain_receipt(receipt: &ToolchainReceipt) -> Result<()> {
+    if receipt != &expected_toolchain_receipt() {
+        return Err("verification toolchain receipt differs from the pinned contract".into());
+    }
+    Ok(())
+}
+
+fn validate_toolchain_files(base: &Path, receipt: &ToolchainReceipt) -> Result<()> {
+    validate_toolchain_receipt(receipt)?;
+    for file in toolchain_files(receipt) {
+        let read =
+            read_regular_file_stable(&base.join(&file.path), "pinned verification toolchain file")?;
+        if u64::try_from(read.bytes.len())? != file.bytes || sha256(&read.bytes) != file.sha256 {
+            return Err(format!(
+                "pinned verification toolchain bytes disagree with the receipt: {}",
+                file.path
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validated_toolchain_receipt(base: &Path) -> Result<ToolchainReceipt> {
+    let receipt = expected_toolchain_receipt();
+    validate_toolchain_files(base, &receipt)?;
+    Ok(receipt)
+}
+
+fn installed_formal_verifier(root: &Path) -> Result<(PathBuf, ToolchainReceipt)> {
+    let toolchain = validated_toolchain_receipt(root)?;
+    let installed = std::env::var_os("TLA2TOOLS_JAR")
+        .ok_or("TLA2TOOLS_JAR is required to use the pinned formal verifier")?;
+    let installed = PathBuf::from(installed);
+    if installed != Path::new(TLA_TOOLCHAIN_INSTALLED_PATH) {
+        return Err(format!(
+            "formal verification must use the pinned installed path: {}",
+            installed.display()
+        )
+        .into());
+    }
+
+    let installed_file = read_regular_file_stable(&installed, "installed formal verifier JAR")?;
+    let vendored_file = read_regular_file_stable(
+        &root.join(&toolchain.jar.path),
+        "vendored formal verifier JAR",
+    )?;
+    if installed_file.bytes != vendored_file.bytes
+        || u64::try_from(installed_file.bytes.len())? != toolchain.jar.bytes
+        || sha256(&installed_file.bytes) != toolchain.jar.sha256
+    {
+        return Err("installed formal verifier does not equal the vendored JAR bytes".into());
+    }
+    Ok((installed, toolchain))
+}
+
+pub(crate) fn pinned_tla2tools_jar(root: &Path) -> Result<PathBuf> {
+    installed_formal_verifier(root).map(|(installed, _)| installed)
+}
+
+fn capture_formal_verifier(
+    root: &Path,
+    start: &StartRecord,
+    start_record_sha256: &str,
+) -> Result<FormalVerifierReceipt> {
+    if !is_sha256(start_record_sha256) {
+        return Err("formal verifier start-record prerequisite is malformed".into());
+    }
+    let (installed, toolchain) = installed_formal_verifier(root)?;
+
+    let output = Command::new("java")
+        .arg("-cp")
+        .arg(&installed)
+        .args(["tlc2.TLC", "-version"])
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    let reported_version = stdout
+        .lines()
+        .chain(stderr.lines())
+        .find(|line| !line.trim().is_empty())
+        .ok_or("formal verifier version command returned no output")?;
+    if reported_version != TLA_TOOLCHAIN_VERSION_LINE {
+        return Err(format!(
+            "installed formal verifier reported an unexpected version: {reported_version:?}"
+        )
+        .into());
+    }
+
+    Ok(FormalVerifierReceipt {
+        schema: String::from(FORMAL_VERIFIER_SCHEMA),
+        start_record_sha256: String::from(start_record_sha256),
+        revision: start.revision.clone(),
+        source_sha256: start.source_sha256.clone(),
+        worktree_dirty: start.worktree_dirty,
+        invocation: start.invocation.clone(),
+        nexus_rebuild: start.nexus_rebuild.clone(),
+        rebuild_requested: start.rebuild_requested,
+        orchestration_token_sha256: start.orchestration_token_sha256.clone(),
+        run_nonce: start.nonce.clone(),
+        completed_unix_nanos: SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        toolchain,
+        installed_path: String::from(TLA_TOOLCHAIN_INSTALLED_PATH),
+        installed_bytes: TLA_TOOLCHAIN_JAR.bytes,
+        installed_sha256: String::from(TLA_TOOLCHAIN_JAR.sha256),
+        reported_version: String::from(TLA_TOOLCHAIN_VERSION_LINE),
+    })
+}
+
+fn validate_formal_verifier_receipt(
+    receipt: &FormalVerifierReceipt,
+    start: &StartRecord,
+    start_record_sha256: &str,
+) -> Result<()> {
+    validate_toolchain_receipt(&receipt.toolchain)?;
+    if receipt.schema != FORMAL_VERIFIER_SCHEMA
+        || receipt.start_record_sha256 != start_record_sha256
+        || receipt.revision != start.revision
+        || receipt.source_sha256 != start.source_sha256
+        || receipt.worktree_dirty != start.worktree_dirty
+        || receipt.invocation != start.invocation
+        || receipt.nexus_rebuild != start.nexus_rebuild
+        || receipt.rebuild_requested != start.rebuild_requested
+        || receipt.orchestration_token_sha256 != start.orchestration_token_sha256
+        || receipt.run_nonce != start.nonce
+        || receipt.completed_unix_nanos < start.started_unix_nanos
+        || receipt.installed_path != TLA_TOOLCHAIN_INSTALLED_PATH
+        || receipt.installed_bytes != TLA_TOOLCHAIN_JAR.bytes
+        || receipt.installed_sha256 != TLA_TOOLCHAIN_JAR.sha256
+        || receipt.reported_version != TLA_TOOLCHAIN_VERSION_LINE
+    {
+        return Err(
+            "formal verifier receipt does not bind the verification run and pinned runtime".into(),
+        );
+    }
+    Ok(())
+}
+
+fn read_formal_verifier_receipt(
+    base: &Path,
+    start: &StartRecord,
+    start_record_sha256: &str,
+) -> Result<(StableRead, FormalVerifierReceipt)> {
+    let file = read_regular_file_stable(
+        &base.join(FORMAL_VERIFIER_RECEIPT),
+        "formal verifier runtime receipt",
+    )?;
+    let receipt: FormalVerifierReceipt = serde_json::from_slice(&file.bytes)?;
+    validate_formal_verifier_receipt(&receipt, start, start_record_sha256)?;
+    Ok((file, receipt))
+}
+
+fn formal_verifier_binding(
+    file: &StableRead,
+    receipt: &FormalVerifierReceipt,
+) -> Result<FormalVerifierBinding> {
+    Ok(FormalVerifierBinding {
+        toolchain: receipt.toolchain.clone(),
+        installed_path: receipt.installed_path.clone(),
+        runtime_receipt: Artifact {
+            path: String::from(FORMAL_VERIFIER_RECEIPT),
+            bytes: u64::try_from(file.bytes.len())?,
+            sha256: sha256(&file.bytes),
+        },
+    })
+}
+
+fn validate_formal_verifier_binding(binding: &FormalVerifierBinding) -> Result<()> {
+    validate_toolchain_receipt(&binding.toolchain)?;
+    if binding.installed_path != TLA_TOOLCHAIN_INSTALLED_PATH
+        || binding.runtime_receipt.path != FORMAL_VERIFIER_RECEIPT
+        || binding.runtime_receipt.bytes == 0
+        || !is_sha256(&binding.runtime_receipt.sha256)
+    {
+        return Err("formal verifier manifest binding differs from the pinned contract".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -216,6 +517,16 @@ struct Stage {
 }
 
 fn manifest_stages(specs: &[&str]) -> Vec<Stage> {
+    let mut formal_evidence: Vec<_> = specs
+        .iter()
+        .map(|spec| format!("target/verification/{spec}-tlc.log"))
+        .collect();
+    formal_evidence.push(String::from(FORMAL_VERIFIER_RECEIPT));
+    formal_evidence.extend(
+        toolchain_files(&expected_toolchain_receipt())
+            .into_iter()
+            .map(|file| file.path.clone()),
+    );
     vec![
         Stage {
             id: "reference-model",
@@ -223,10 +534,7 @@ fn manifest_stages(specs: &[&str]) -> Vec<Stage> {
         },
         Stage {
             id: "formal-specifications",
-            evidence: specs
-                .iter()
-                .map(|spec| format!("target/verification/{spec}-tlc.log"))
-                .collect(),
+            evidence: formal_evidence,
         },
         Stage {
             id: "ostd-five-domain-composition",
@@ -414,6 +722,7 @@ pub(crate) fn mark_model_spec_complete(root: &Path, specs: &[&str]) -> Result<Pa
             )
         })?;
     let start: StartRecord = serde_json::from_slice(&start_file.bytes)?;
+    let start_record_sha256 = sha256(&start_file.bytes);
     let current_source = source_snapshot(root)?;
     let current_environment = verification_environment()?;
     validate_start_record(&start, &current_source, Some(&current_environment))?;
@@ -423,22 +732,46 @@ pub(crate) fn mark_model_spec_complete(root: &Path, specs: &[&str]) -> Result<Pa
         &model_spec_artifacts(specs),
         start_file.metadata.modified,
     )?;
+    let verifier = capture_formal_verifier(root, &start, &start_record_sha256)?;
+    remove_evidence_file(root, FORMAL_VERIFIER_RECEIPT)?;
+    remove_evidence_file(root, MODEL_SPEC_RECEIPT)?;
+    remove_evidence_file(root, COMPLETION_RECEIPT)?;
+    remove_evidence_file(root, OUTPUT)?;
+    let verifier_path = root.join(FORMAL_VERIFIER_RECEIPT);
+    let verifier_parent = verifier_path
+        .parent()
+        .ok_or("formal verifier receipt path has no parent")?;
+    let verifier_temporary = format!(".formal-verifier.{}.tmp", verifier.run_nonce);
+    atomic_json(
+        verifier_parent,
+        &verifier_path,
+        &verifier_temporary,
+        &verifier,
+    )?;
+    let (verifier_file, verifier) =
+        read_formal_verifier_receipt(root, &start, &start_record_sha256)?;
+    validate_toolchain_files(root, &verifier.toolchain)?;
+    let verifier_sha256 = sha256(&verifier_file.bytes);
     let receipt = gate_receipt(
         MODEL_SPEC_SCHEMA,
         &start,
         ["reference-model", "formal-specifications"],
-        None,
+        Some(verifier_sha256),
         artifacts,
     )?;
 
-    remove_evidence_file(root, COMPLETION_RECEIPT)?;
-    remove_evidence_file(root, OUTPUT)?;
     let path = root.join(MODEL_SPEC_RECEIPT);
     let parent = path
         .parent()
         .ok_or("model/spec receipt path has no parent")?;
     let temporary = format!(".stage7a-model-spec.{}.tmp", receipt.run_nonce);
     atomic_json(parent, &path, &temporary, &receipt)?;
+    println!(
+        "formal verifier receipt: PASS path={} jar_sha256={} version={}",
+        verifier_path.display(),
+        verifier.installed_sha256,
+        verifier.reported_version
+    );
     println!(
         "verification model/spec receipt: PASS path={} artifacts={} nonce={}",
         path.display(),
@@ -458,10 +791,17 @@ pub(crate) fn complete(root: &Path, specs: &[&str]) -> Result<PathBuf> {
             )
         })?;
     let start: StartRecord = serde_json::from_slice(&start_file.bytes)?;
+    let start_record_sha256 = sha256(&start_file.bytes);
     let current_source = source_snapshot(root)?;
     let current_environment = verification_environment()?;
     validate_start_record(&start, &current_source, Some(&current_environment))?;
     validate_completion_token(&start)?;
+
+    let (verifier_file, verifier) =
+        read_formal_verifier_receipt(root, &start, &start_record_sha256)
+            .map_err(|error| format!("required formal verifier receipt: {error}"))?;
+    validate_toolchain_files(root, &verifier.toolchain)?;
+    let verifier_sha256 = sha256(&verifier_file.bytes);
 
     let model_path = root.join(MODEL_SPEC_RECEIPT);
     let model_file = read_regular_file_stable(&model_path, "model/spec completion receipt")
@@ -477,7 +817,7 @@ pub(crate) fn complete(root: &Path, specs: &[&str]) -> Result<PathBuf> {
         MODEL_SPEC_SCHEMA,
         &start,
         &["reference-model", "formal-specifications"],
-        None,
+        Some(&verifier_sha256),
         &model_artifacts,
     )?;
     let model_sha256 = sha256(&model_file.bytes);
@@ -532,9 +872,16 @@ fn write_authorized(
             )
         })?;
     let start: StartRecord = serde_json::from_slice(&start_file.bytes)?;
+    let start_record_sha256 = sha256(&start_file.bytes);
     let current_source = source_snapshot(root)?;
     validate_start_record(&start, &current_source, Some(environment))?;
     validate_completion_token_value(&start, token)?;
+
+    let (verifier_file, verifier) =
+        read_formal_verifier_receipt(root, &start, &start_record_sha256)
+            .map_err(|error| format!("required formal verifier receipt: {error}"))?;
+    validate_toolchain_files(root, &verifier.toolchain)?;
+    let verifier_sha256 = sha256(&verifier_file.bytes);
 
     let model_path = root.join(MODEL_SPEC_RECEIPT);
     let model_file = read_regular_file_stable(&model_path, "model/spec completion receipt")
@@ -550,7 +897,7 @@ fn write_authorized(
         MODEL_SPEC_SCHEMA,
         &start,
         &["reference-model", "formal-specifications"],
-        None,
+        Some(&verifier_sha256),
         &model_artifacts,
     )?;
     let model_sha256 = sha256(&model_file.bytes);
@@ -577,6 +924,7 @@ fn write_authorized(
 
     let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let stages = manifest_stages(specs);
+    let formal_verifier = formal_verifier_binding(&verifier_file, &verifier)?;
     let manifest = Manifest {
         schema: SCHEMA,
         status: "passed",
@@ -591,6 +939,7 @@ fn write_authorized(
         completion_receipt_sha256,
         started_unix_nanos: start.started_unix_nanos,
         generated_unix_seconds,
+        formal_verifier,
         boundaries: Boundaries::current(),
         specifications: specs.iter().map(|spec| String::from(*spec)).collect(),
         stages,
@@ -1005,6 +1354,7 @@ fn clear_expected_evidence(root: &Path, specs: &[&str]) -> Result<()> {
     bundle::clear_bundle(root)?;
     for relative in [
         String::from(SENTINEL),
+        String::from(FORMAL_VERIFIER_RECEIPT),
         String::from(MODEL_SPEC_RECEIPT),
         String::from(COMPLETION_RECEIPT),
         String::from(OUTPUT),
@@ -1140,6 +1490,22 @@ fn validate_artifact(
         if !text.contains(marker) {
             return Err(format!("verification artifact lacks {marker:?}: {relative}").into());
         }
+        if relative.ends_with("-tlc.log")
+            && !text.lines().any(|line| line == TLA_TOOLCHAIN_VERSION_LINE)
+        {
+            return Err(format!(
+                "verification artifact lacks the pinned TLC version line: {relative}"
+            )
+            .into());
+        }
+        if relative.ends_with("-pluscal.log")
+            && !text.lines().any(|line| line == PLUSCAL_VERSION_LINE)
+        {
+            return Err(format!(
+                "verification artifact lacks the pinned PlusCal version line: {relative}"
+            )
+            .into());
+        }
     }
     let byte_count = u64::try_from(read.bytes.len())?;
     let digest = Sha256::digest(&read.bytes);
@@ -1248,6 +1614,18 @@ mod tests {
         path
     }
 
+    fn copy_toolchain_fixture(root: &Path) {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let receipt = expected_toolchain_receipt();
+        for file in toolchain_files(&receipt) {
+            let destination = root.join(&file.path);
+            fs::create_dir_all(destination.parent().expect("toolchain parent"))
+                .expect("create toolchain parent");
+            fs::copy(repository.join(&file.path), destination)
+                .expect("copy pinned toolchain fixture");
+        }
+    }
+
     fn start_record(source: &SourceSnapshot, environment: &VerificationEnvironment) -> StartRecord {
         let process_id = 17;
         let started_unix_nanos = 1_234_567;
@@ -1274,9 +1652,35 @@ mod tests {
         }
     }
 
+    fn formal_verifier_receipt(
+        start: &StartRecord,
+        start_record_sha256: String,
+    ) -> FormalVerifierReceipt {
+        let toolchain = expected_toolchain_receipt();
+        FormalVerifierReceipt {
+            schema: String::from(FORMAL_VERIFIER_SCHEMA),
+            start_record_sha256,
+            revision: start.revision.clone(),
+            source_sha256: start.source_sha256.clone(),
+            worktree_dirty: start.worktree_dirty,
+            invocation: start.invocation.clone(),
+            nexus_rebuild: start.nexus_rebuild.clone(),
+            rebuild_requested: start.rebuild_requested,
+            orchestration_token_sha256: start.orchestration_token_sha256.clone(),
+            run_nonce: start.nonce.clone(),
+            completed_unix_nanos: start.started_unix_nanos + 1,
+            installed_path: String::from(TLA_TOOLCHAIN_INSTALLED_PATH),
+            installed_bytes: toolchain.jar.bytes,
+            installed_sha256: toolchain.jar.sha256.clone(),
+            reported_version: String::from(TLA_TOOLCHAIN_VERSION_LINE),
+            toolchain,
+        }
+    }
+
     fn write_required_evidence(root: &Path, specs: &[&str]) {
         for relative in [
             String::from(SENTINEL),
+            String::from(FORMAL_VERIFIER_RECEIPT),
             String::from(MODEL_SPEC_RECEIPT),
             String::from(COMPLETION_RECEIPT),
             String::from(OUTPUT),
@@ -1384,6 +1788,72 @@ mod tests {
             .expect("fresh marked artifact");
         assert_eq!(checked.bytes, 5);
         assert_eq!(checked.sha256.len(), 64);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn model_spec_artifacts_require_exact_verifier_version_lines() {
+        let root = fixture();
+        let started = SystemTime::now();
+        thread::sleep(Duration::from_millis(5));
+
+        let tlc = root.join("Cser-tlc.log");
+        fs::write(
+            &tlc,
+            "TLC2 Version substitute\nModel checking completed. No error has been found.\n",
+        )
+        .expect("write TLC log");
+        let error = validate_artifact(
+            &root,
+            "Cser-tlc.log",
+            Some("Model checking completed. No error has been found."),
+            started,
+        )
+        .expect_err("wrong TLC build must be rejected")
+        .to_string();
+        assert!(error.contains("pinned TLC version line"));
+        fs::write(
+            &tlc,
+            format!(
+                "{TLA_TOOLCHAIN_VERSION_LINE}\nModel checking completed. No error has been found.\n"
+            ),
+        )
+        .expect("write exact TLC log");
+        validate_artifact(
+            &root,
+            "Cser-tlc.log",
+            Some("Model checking completed. No error has been found."),
+            started,
+        )
+        .expect("exact TLC build line");
+
+        let pluscal = root.join("Cser-pluscal.log");
+        fs::write(
+            &pluscal,
+            "pcal.trans Version substitute\nTranslation completed.\n",
+        )
+        .expect("write PlusCal log");
+        let error = validate_artifact(
+            &root,
+            "Cser-pluscal.log",
+            Some("Translation completed."),
+            started,
+        )
+        .expect_err("wrong PlusCal build must be rejected")
+        .to_string();
+        assert!(error.contains("pinned PlusCal version line"));
+        fs::write(
+            &pluscal,
+            format!("{PLUSCAL_VERSION_LINE}\nTranslation completed.\n"),
+        )
+        .expect("write exact PlusCal log");
+        validate_artifact(
+            &root,
+            "Cser-pluscal.log",
+            Some("Translation completed."),
+            started,
+        )
+        .expect("exact PlusCal build line");
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -1597,6 +2067,7 @@ mod tests {
         clear_expected_evidence(&root, &specs).expect("clear expected evidence");
         for relative in [
             String::from(SENTINEL),
+            String::from(FORMAL_VERIFIER_RECEIPT),
             String::from(MODEL_SPEC_RECEIPT),
             String::from(COMPLETION_RECEIPT),
             String::from(OUTPUT),
@@ -1638,7 +2109,8 @@ mod tests {
         )
         .expect("write ignore file");
         fs::write(root.join("tracked"), "tracked\n").expect("write tracked source");
-        git(&["add", ".gitignore", "tracked"]);
+        copy_toolchain_fixture(&root);
+        git(&["add", "."]);
         git(&[
             "-c",
             "user.name=Nexus Test",
@@ -1673,8 +2145,16 @@ mod tests {
             let path = root.join(relative);
             fs::create_dir_all(path.parent().expect("artifact parent"))
                 .expect("create artifact parent");
-            fs::write(path, format!("{}\n", marker.expect("required marker")))
-                .expect("write fresh marked artifact");
+            let mut contents = format!("{}\n", marker.expect("required marker"));
+            if path.to_string_lossy().ends_with("-tlc.log") {
+                contents.push_str(TLA_TOOLCHAIN_VERSION_LINE);
+                contents.push('\n');
+            }
+            if path.to_string_lossy().ends_with("-pluscal.log") {
+                contents.push_str(PLUSCAL_VERSION_LINE);
+                contents.push('\n');
+            }
+            fs::write(path, contents).expect("write fresh marked artifact");
         }
 
         let token = "f".repeat(64);
@@ -1683,9 +2163,23 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("required model/spec completion receipt")
+                .contains("required formal verifier receipt")
         );
         assert!(!root.join(OUTPUT).exists());
+
+        let start_bytes = fs::read(&sentinel).expect("read start record");
+        let verifier = formal_verifier_receipt(&start, sha256(&start_bytes));
+        let verifier_bytes =
+            serde_json::to_vec_pretty(&verifier).expect("serialize formal verifier receipt");
+        fs::write(root.join(FORMAL_VERIFIER_RECEIPT), &verifier_bytes)
+            .expect("write formal verifier receipt");
+        let error = write_authorized(&root, &specs, &token, &environment)
+            .expect_err("formal receipt without model/spec receipt must not publish a manifest");
+        assert!(
+            error
+                .to_string()
+                .contains("required model/spec completion receipt")
+        );
 
         let sentinel_time = fs::metadata(&sentinel)
             .expect("sentinel metadata")
@@ -1698,7 +2192,7 @@ mod tests {
             MODEL_SPEC_SCHEMA,
             &start,
             ["reference-model", "formal-specifications"],
-            None,
+            Some(sha256(&verifier_bytes)),
             model_artifacts,
         )
         .expect("model/spec receipt");

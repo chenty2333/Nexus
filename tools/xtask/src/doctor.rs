@@ -65,12 +65,7 @@ pub(crate) fn run(root: &Path, specs: &[&str]) -> Result<()> {
     let cargo = version("cargo", &["--version"])?;
     let git = version("git", &["--version"])?;
     let java = version("java", &["-version"])?;
-    let jar = std::env::var_os("TLA2TOOLS_JAR")
-        .map(std::path::PathBuf::from)
-        .ok_or("TLA2TOOLS_JAR is not set")?;
-    if !jar.is_file() {
-        return Err(format!("TLA2TOOLS_JAR is not a file: {}", jar.display()).into());
-    }
+    let jar = crate::evidence::pinned_tla2tools_jar(root)?;
 
     println!(
         "DOCTOR PASS layout=stage7a+linux-io-composition+stage7b specs={} rustc={:?} cargo={:?} git={:?} java={:?} tla2tools={}",

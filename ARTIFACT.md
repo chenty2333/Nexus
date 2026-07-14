@@ -24,6 +24,24 @@ The corresponding protected Git tag and
 remain the source-history anchors. The DOI was added to later `main` metadata;
 the already published `v0.1.0` tag was not moved or rewritten.
 
+## Post-v0.1 current-main verifier successor
+
+The counts and procedures below remain the frozen `v0.1.0` contract. Current
+main is developing a separate `nexus.verification.v6` successor after the
+upstream mutable prerelease URL replaced its same-named TLA+ asset. It vendors
+the exact JAR bytes used by the accepted run, checks the installed JAR before
+the formal commands, requires exact TLC and PlusCal version lines in every
+model/spec log, and seals a same-container formal-verifier receipt between the
+start and model/spec receipts.
+
+The current-main v6 population is 12 specifications, 17 research stages, and
+52 generated evidence artifacts. Four static verifier files and five control
+records bring the complete bundle to 61 `SHA256SUMS` payload entries and 62
+regular files including the checksum index. These are acceptance-contract
+figures for the unreleased successor, not a relabeling of the published v0.1
+bundle. Current main must still pass a clean cold run and exact-SHA CI before
+those figures describe an accepted checkpoint.
+
 ## What the artifact supports
 
 The complete gate covers the safe-Rust reference model, twelve PlusCal/TLA+

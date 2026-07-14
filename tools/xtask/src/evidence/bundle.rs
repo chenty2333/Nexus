@@ -1,9 +1,11 @@
 use super::{
-    Artifact, Boundaries, COMPLETE_SCHEMA, COMPLETE_STAGES, COMPLETION_RECEIPT, GateReceipt,
+    Artifact, Boundaries, COMPLETE_SCHEMA, COMPLETE_STAGES, COMPLETION_RECEIPT,
+    FORMAL_VERIFIER_RECEIPT, FormalVerifierBinding, FormalVerifierReceipt, GateReceipt,
     MODEL_SPEC_RECEIPT, MODEL_SPEC_SCHEMA, OUTPUT as MANIFEST_PATH, SCHEMA, SENTINEL,
     SourceSnapshot, StartRecord, is_sha256, manifest_stages, model_spec_artifacts,
-    read_regular_file_stable, required_artifacts, sha256, source_snapshot, validate_gate_receipt,
-    validate_start_record,
+    read_regular_file_stable, required_artifacts, sha256, source_snapshot, toolchain_files,
+    validate_formal_verifier_binding, validate_formal_verifier_receipt, validate_gate_receipt,
+    validate_start_record, validate_toolchain_files,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -34,6 +36,7 @@ struct PublishedManifest {
     completion_receipt_sha256: String,
     started_unix_nanos: u128,
     generated_unix_seconds: u64,
+    formal_verifier: FormalVerifierBinding,
     boundaries: Value,
     specifications: Vec<String>,
     stages: Vec<PublishedStage>,
@@ -212,6 +215,7 @@ fn validate_payload(base: &Path, specs: &[&str]) -> Result<ValidatedPayload> {
         "artifact bundle verification start record",
     )?;
     let start: StartRecord = serde_json::from_slice(&start_file.bytes)?;
+    let start_record_sha256 = sha256(&start_file.bytes);
     let source = SourceSnapshot {
         revision: manifest.revision.clone(),
         source_sha256: manifest.source_sha256.clone(),
@@ -219,6 +223,23 @@ fn validate_payload(base: &Path, specs: &[&str]) -> Result<ValidatedPayload> {
     };
     validate_start_record(&start, &source, None)?;
     validate_manifest_start_binding(&manifest, &start)?;
+
+    let verifier_file = read_regular_file_stable(
+        &base.join(FORMAL_VERIFIER_RECEIPT),
+        "artifact bundle formal verifier receipt",
+    )?;
+    let verifier: FormalVerifierReceipt = serde_json::from_slice(&verifier_file.bytes)?;
+    validate_formal_verifier_receipt(&verifier, &start, &start_record_sha256)?;
+    let verifier_sha256 = sha256(&verifier_file.bytes);
+    if manifest.formal_verifier.toolchain != verifier.toolchain
+        || manifest.formal_verifier.installed_path != verifier.installed_path
+        || manifest.formal_verifier.runtime_receipt.path != FORMAL_VERIFIER_RECEIPT
+        || manifest.formal_verifier.runtime_receipt.bytes
+            != u64::try_from(verifier_file.bytes.len())?
+        || manifest.formal_verifier.runtime_receipt.sha256 != verifier_sha256
+    {
+        return Err("artifact bundle formal verifier receipt does not match the manifest".into());
+    }
 
     let model_file = read_regular_file_stable(
         &base.join(MODEL_SPEC_RECEIPT),
@@ -244,7 +265,7 @@ fn validate_payload(base: &Path, specs: &[&str]) -> Result<ValidatedPayload> {
         MODEL_SPEC_SCHEMA,
         &start,
         &["reference-model", "formal-specifications"],
-        None,
+        Some(&verifier_sha256),
         &model_artifacts,
     )?;
     let model_sha256 = sha256(&model_file.bytes);
@@ -273,12 +294,22 @@ fn validate_payload(base: &Path, specs: &[&str]) -> Result<ValidatedPayload> {
         sha256(&manifest_file.bytes),
     )?;
     insert_payload(&mut payload_digests, SENTINEL, sha256(&start_file.bytes))?;
+    insert_payload(
+        &mut payload_digests,
+        FORMAL_VERIFIER_RECEIPT,
+        verifier_sha256,
+    )?;
     insert_payload(&mut payload_digests, MODEL_SPEC_RECEIPT, model_sha256)?;
     insert_payload(
         &mut payload_digests,
         COMPLETION_RECEIPT,
         manifest.completion_receipt_sha256.clone(),
     )?;
+
+    validate_toolchain_files(base, &manifest.formal_verifier.toolchain)?;
+    for file in toolchain_files(&manifest.formal_verifier.toolchain) {
+        insert_payload(&mut payload_digests, &file.path, file.sha256.clone())?;
+    }
 
     for artifact in &manifest.artifacts {
         validate_relative_path(&artifact.path)?;
@@ -332,6 +363,7 @@ fn validate_manifest_population(manifest: &PublishedManifest, specs: &[&str]) ->
     if manifest.rebuild_requested != (manifest.nexus_rebuild.as_deref() == Some("1")) {
         return Err("artifact bundle manifest has inconsistent NEXUS_REBUILD fields".into());
     }
+    validate_formal_verifier_binding(&manifest.formal_verifier)?;
 
     let expected_specs: Vec<_> = specs.iter().map(|spec| String::from(*spec)).collect();
     if manifest.specifications != expected_specs {
@@ -525,7 +557,9 @@ fn remove_directory_if_present(path: &Path, label: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::evidence::{
-        GateReceipt, Manifest, Stage, VerificationEnvironment, gate_receipt, start_nonce,
+        FORMAL_VERIFIER_SCHEMA, GateReceipt, Manifest, Stage, TLA_TOOLCHAIN_INSTALLED_PATH,
+        TLA_TOOLCHAIN_VERSION_LINE, VerificationEnvironment, expected_toolchain_receipt,
+        formal_verifier_binding, gate_receipt, start_nonce, toolchain_files,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -570,6 +604,16 @@ mod tests {
     }
 
     fn write_source_fixture(root: &Path) {
+        let toolchain = expected_toolchain_receipt();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for file in toolchain_files(&toolchain) {
+            let destination = root.join(&file.path);
+            fs::create_dir_all(destination.parent().expect("toolchain parent"))
+                .expect("create toolchain parent");
+            fs::copy(repository.join(&file.path), &destination)
+                .expect("copy pinned toolchain fixture");
+        }
+
         let mut artifacts = Vec::new();
         for (relative, _) in required_artifacts(&SPECS) {
             let bytes = format!("fixture artifact {relative}\n").into_bytes();
@@ -621,6 +665,38 @@ mod tests {
         };
         write_json(&root.join(SENTINEL), &start);
 
+        let verifier = FormalVerifierReceipt {
+            schema: String::from(FORMAL_VERIFIER_SCHEMA),
+            start_record_sha256: sha256(&fs::read(root.join(SENTINEL)).expect("read start record")),
+            revision: start.revision.clone(),
+            source_sha256: start.source_sha256.clone(),
+            worktree_dirty: start.worktree_dirty,
+            invocation: start.invocation.clone(),
+            nexus_rebuild: start.nexus_rebuild.clone(),
+            rebuild_requested: start.rebuild_requested,
+            orchestration_token_sha256: start.orchestration_token_sha256.clone(),
+            run_nonce: start.nonce.clone(),
+            completed_unix_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("fixture clock")
+                .as_nanos(),
+            installed_path: String::from(TLA_TOOLCHAIN_INSTALLED_PATH),
+            installed_bytes: toolchain.jar.bytes,
+            installed_sha256: toolchain.jar.sha256.clone(),
+            reported_version: String::from(TLA_TOOLCHAIN_VERSION_LINE),
+            toolchain: toolchain.clone(),
+        };
+        write_json(&root.join(FORMAL_VERIFIER_RECEIPT), &verifier);
+        let verifier_bytes =
+            fs::read(root.join(FORMAL_VERIFIER_RECEIPT)).expect("read verifier receipt");
+        let verifier_file = read_regular_file_stable(
+            &root.join(FORMAL_VERIFIER_RECEIPT),
+            "fixture verifier receipt",
+        )
+        .expect("read stable verifier receipt");
+        let formal_verifier =
+            formal_verifier_binding(&verifier_file, &verifier).expect("formal verifier binding");
+
         let by_path: BTreeMap<_, _> = artifacts
             .iter()
             .map(|artifact| (artifact.path.clone(), artifact.clone()))
@@ -633,7 +709,7 @@ mod tests {
             MODEL_SPEC_SCHEMA,
             &start,
             ["reference-model", "formal-specifications"],
-            None,
+            Some(sha256(&verifier_bytes)),
             model_artifacts,
         )
         .expect("model receipt");
@@ -669,6 +745,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("fixture clock")
                 .as_secs(),
+            formal_verifier,
             boundaries: Boundaries::current(),
             specifications: SPECS.iter().map(|spec| String::from(*spec)).collect(),
             stages: stage_population(),
@@ -692,6 +769,64 @@ mod tests {
         write_checksum_index(bundle, &rewritten).expect("rewrite checksums");
     }
 
+    fn reseal_after_formal_verifier_mutation(bundle: &Path) {
+        let verifier_path = bundle.join(FORMAL_VERIFIER_RECEIPT);
+        let verifier: Value =
+            serde_json::from_slice(&fs::read(&verifier_path).expect("read verifier receipt"))
+                .expect("parse verifier receipt");
+        let verifier_bytes = fs::read(&verifier_path).expect("reread verifier receipt");
+        let verifier_sha256 = sha256(&verifier_bytes);
+
+        let model_path = bundle.join(MODEL_SPEC_RECEIPT);
+        let mut model: Value =
+            serde_json::from_slice(&fs::read(&model_path).expect("read model receipt"))
+                .expect("parse model receipt");
+        model["prerequisite_sha256"] = Value::String(verifier_sha256.clone());
+        write_json(&model_path, &model);
+        let model_sha256 = sha256(&fs::read(&model_path).expect("reread model receipt"));
+
+        let completion_path = bundle.join(COMPLETION_RECEIPT);
+        let mut completion: Value =
+            serde_json::from_slice(&fs::read(&completion_path).expect("read completion receipt"))
+                .expect("parse completion receipt");
+        completion["prerequisite_sha256"] = Value::String(model_sha256);
+        write_json(&completion_path, &completion);
+        let completion_sha256 =
+            sha256(&fs::read(&completion_path).expect("reread completion receipt"));
+
+        let manifest_path = bundle.join(MANIFEST_PATH);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        manifest["formal_verifier"]["toolchain"] = verifier["toolchain"].clone();
+        manifest["formal_verifier"]["runtime_receipt"]["bytes"] = Value::from(verifier_bytes.len());
+        manifest["formal_verifier"]["runtime_receipt"]["sha256"] = Value::String(verifier_sha256);
+        manifest["completion_receipt_sha256"] = Value::String(completion_sha256);
+        write_json(&manifest_path, &manifest);
+        rewrite_checksum_index_from_payload(bundle);
+    }
+
+    fn reseal_after_model_receipt_mutation(bundle: &Path) {
+        let model_path = bundle.join(MODEL_SPEC_RECEIPT);
+        let model_sha256 = sha256(&fs::read(&model_path).expect("read model receipt"));
+        let completion_path = bundle.join(COMPLETION_RECEIPT);
+        let mut completion: Value =
+            serde_json::from_slice(&fs::read(&completion_path).expect("read completion receipt"))
+                .expect("parse completion receipt");
+        completion["prerequisite_sha256"] = Value::String(model_sha256);
+        write_json(&completion_path, &completion);
+
+        let manifest_path = bundle.join(MANIFEST_PATH);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        manifest["completion_receipt_sha256"] = Value::String(sha256(
+            &fs::read(&completion_path).expect("reread completion receipt"),
+        ));
+        write_json(&manifest_path, &manifest);
+        rewrite_checksum_index_from_payload(bundle);
+    }
+
     #[test]
     fn complete_bundle_round_trips_and_has_an_exact_file_population() {
         let root = fixture();
@@ -708,13 +843,20 @@ mod tests {
         };
         validate_checkout_binding(&manifest, &checkout).expect("matching clean checkout");
         verify_bundle_directory(&bundle, &SPECS).expect("verify complete bundle internally");
+        assert_eq!(manifest.specifications.len(), 12);
+        assert_eq!(manifest.stages.len(), 17);
+        assert_eq!(manifest.artifacts.len(), 52);
+        assert_eq!(
+            toolchain_files(&manifest.formal_verifier.toolchain).len(),
+            4
+        );
 
         let files = collect_files(&bundle).expect("collect bundle files");
-        assert_eq!(files.len(), 57);
+        assert_eq!(files.len(), 62);
         let sums =
             parse_checksum_index(&fs::read(bundle.join(CHECKSUMS)).expect("read checksum index"))
                 .expect("parse checksum index");
-        assert_eq!(sums.len(), 56);
+        assert_eq!(sums.len(), 61);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -737,6 +879,129 @@ mod tests {
             .expect_err("manifest digest must reject mutation")
             .to_string();
         assert!(error.contains("disagree with manifest"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn bundle_rejects_every_toolchain_file_mutation_with_rewritten_checksums() {
+        let expected = expected_toolchain_receipt();
+        let paths: Vec<_> = toolchain_files(&expected)
+            .into_iter()
+            .map(|file| file.path.clone())
+            .collect();
+
+        for path in paths {
+            let root = fixture();
+            write_source_fixture(&root);
+            let bundle = write_bundle(&root, &SPECS).expect("write complete bundle");
+            fs::write(bundle.join(&path), b"mutated pinned toolchain\n")
+                .expect("mutate toolchain file");
+            rewrite_checksum_index_from_payload(&bundle);
+
+            let error = verify_bundle_directory(&bundle, &SPECS)
+                .expect_err("manifest toolchain receipt must reject payload mutation")
+                .to_string();
+            assert!(
+                error.contains("pinned verification toolchain bytes"),
+                "toolchain mutation for {path} returned an unexpected error: {error}"
+            );
+            fs::remove_dir_all(root).expect("remove fixture");
+        }
+    }
+
+    #[test]
+    fn bundle_rejects_resealed_static_descriptor_and_payload_substitutions() {
+        let descriptor = expected_toolchain_receipt();
+        for (field, path) in [
+            ("jar", descriptor.jar.path),
+            ("provenance", descriptor.provenance.path),
+            ("license", descriptor.license.path),
+            ("checksum_index", descriptor.checksum_index.path),
+        ] {
+            let root = fixture();
+            write_source_fixture(&root);
+            let bundle = write_bundle(&root, &SPECS).expect("write complete bundle");
+            let substitute = format!("resealed substitute for {field}\n").into_bytes();
+            fs::write(bundle.join(&path), &substitute).expect("mutate verifier payload");
+
+            let verifier_path = bundle.join(FORMAL_VERIFIER_RECEIPT);
+            let mut verifier: Value =
+                serde_json::from_slice(&fs::read(&verifier_path).expect("read verifier receipt"))
+                    .expect("parse verifier receipt");
+            verifier["toolchain"][field]["bytes"] = Value::from(substitute.len());
+            verifier["toolchain"][field]["sha256"] = Value::String(sha256(&substitute));
+            if field == "jar" {
+                verifier["installed_bytes"] = Value::from(substitute.len());
+                verifier["installed_sha256"] = Value::String(sha256(&substitute));
+            }
+            write_json(&verifier_path, &verifier);
+            reseal_after_formal_verifier_mutation(&bundle);
+
+            let error = verify_bundle_directory(&bundle, &SPECS)
+                .expect_err("canonical verifier contract must reject a resealed substitute")
+                .to_string();
+            assert!(
+                error.contains("toolchain receipt differs from the pinned contract"),
+                "resealed {field} substitute returned an unexpected error: {error}"
+            );
+            fs::remove_dir_all(root).expect("remove fixture");
+        }
+    }
+
+    #[test]
+    fn bundle_rejects_resealed_runtime_identity_mutations() {
+        for field in [
+            "installed_path",
+            "installed_bytes",
+            "installed_sha256",
+            "reported_version",
+            "start_record_sha256",
+            "run_nonce",
+        ] {
+            let root = fixture();
+            write_source_fixture(&root);
+            let bundle = write_bundle(&root, &SPECS).expect("write complete bundle");
+            let verifier_path = bundle.join(FORMAL_VERIFIER_RECEIPT);
+            let mut verifier: Value =
+                serde_json::from_slice(&fs::read(&verifier_path).expect("read verifier receipt"))
+                    .expect("parse verifier receipt");
+            verifier[field] = match field {
+                "installed_bytes" => Value::from(1_u64),
+                "installed_path" => Value::String(String::from("/tmp/substitute.jar")),
+                "reported_version" => Value::String(String::from("TLC2 Version substitute")),
+                _ => Value::String("0".repeat(64)),
+            };
+            write_json(&verifier_path, &verifier);
+            reseal_after_formal_verifier_mutation(&bundle);
+
+            let error = verify_bundle_directory(&bundle, &SPECS)
+                .expect_err("runtime verifier identity mutation must be rejected after resealing")
+                .to_string();
+            assert!(
+                error.contains("formal verifier receipt does not bind"),
+                "resealed runtime field {field} returned an unexpected error: {error}"
+            );
+            fs::remove_dir_all(root).expect("remove fixture");
+        }
+    }
+
+    #[test]
+    fn bundle_rejects_a_resealed_missing_model_verifier_prerequisite() {
+        let root = fixture();
+        write_source_fixture(&root);
+        let bundle = write_bundle(&root, &SPECS).expect("write complete bundle");
+        let model_path = bundle.join(MODEL_SPEC_RECEIPT);
+        let mut model: Value =
+            serde_json::from_slice(&fs::read(&model_path).expect("read model receipt"))
+                .expect("parse model receipt");
+        model["prerequisite_sha256"] = Value::Null;
+        write_json(&model_path, &model);
+        reseal_after_model_receipt_mutation(&bundle);
+
+        let error = verify_bundle_directory(&bundle, &SPECS)
+            .expect_err("model receipt must retain the verifier prerequisite")
+            .to_string();
+        assert!(error.contains("prerequisite"));
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

@@ -78,6 +78,10 @@ compute_image_identity() {
     image_key=$(sha256sum \
         "$root/Dockerfile" \
         "$root/.dockerignore" \
+        "$root/third_party/tlaplus/1.8.0-227f61b/tla2tools-227f61b.jar" \
+        "$root/third_party/tlaplus/1.8.0-227f61b/SHA256SUMS" \
+        "$root/third_party/tlaplus/1.8.0-227f61b/PROVENANCE.json" \
+        "$root/third_party/tlaplus/1.8.0-227f61b/LICENSE.upstream" \
         "$root/rust-toolchain.toml" \
         "$root/.cargo/config.toml" \
         "$root/Cargo.toml" \

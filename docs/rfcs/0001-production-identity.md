@@ -704,6 +704,9 @@ The release process must preserve the existing repository discipline:
 9. the release tag points to the exact revision in the manifest and is not moved
    or retroactively rewritten;
 10. `v0.1.0` artifacts, tag, DOI, and claims remain immutable historical results.
+11. the formal verifier is recoverable from repository-owned exact bytes, its
+    provenance and license travel with the bundle, and a same-container runtime
+    receipt binds the installed JAR identity to the model/spec receipt chain.
 
 If only an intermediate phase closes, the project may publish a clearly named
 development or negative artifact, but it must not call it `v0.2.0` acceptance or

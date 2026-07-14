@@ -649,13 +649,7 @@ fn generated_spec_entry(name: &OsStr) -> bool {
 }
 
 fn tla2tools_jar() -> Result<PathBuf> {
-    let value = env::var_os("TLA2TOOLS_JAR")
-        .ok_or("TLA2TOOLS_JAR must point to the pinned tla2tools.jar")?;
-    let path = PathBuf::from(value);
-    if !path.is_file() {
-        return Err(format!("TLA2TOOLS_JAR is not a file: {}", path.display()).into());
-    }
-    Ok(path)
+    evidence::pinned_tla2tools_jar(&repo_root())
 }
 
 fn pluscal_translation_is_current(

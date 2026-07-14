@@ -81,6 +81,15 @@ The active post-`v0.1.0` research contract is
 same-boot device, IRQ, and SMP requirements remain prospective until every
 named evidence gate closes.
 
+Current main uses `nexus.verification.v6` for the post-release evidence
+successor. The formal-verifier descriptor, four vendored TLA+ files,
+`target/verification/.formal-verifier.json`, model/spec prerequisite, and
+bundle population are one contract: change them together and add a negative
+mutation test that remains failing even after the downstream receipt chain and
+outer checksum index are resealed. These static tool inputs are not fresh
+research artifacts and must stay associated with the existing
+`formal-specifications` stage.
+
 ## Verification evidence
 
 Successful and failed runs retain ignored evidence under:

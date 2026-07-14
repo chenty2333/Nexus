@@ -73,8 +73,10 @@ claim ledger.
 ## Reproduce the release
 
 The supported host boundary is Linux x86-64 with Docker, Git, Bash, and a normal
-Linux userland. Rust, Java, TLA+, cargo-osdk, OVMF, QEMU, and guest toolchains
-are pinned in Docker images.
+Linux userland. Rust, Java, cargo-osdk, OVMF, QEMU, and guest toolchains are
+pinned in Docker images. Current main additionally vendors the exact TLA+
+verifier bytes, checks the installed copy before use, and binds a runtime
+verifier receipt into the model/spec receipt chain and complete bundle.
 
 For a quick environment and non-QEMU check:
 
@@ -83,7 +85,7 @@ For a quick environment and non-QEMU check:
 ./x test --quick
 ```
 
-For the complete clean-clone reproduction:
+The original `v0.1.0` clean-clone workflow is:
 
 ```bash
 git clone https://github.com/chenty2333/Nexus.git
@@ -94,6 +96,13 @@ git checkout --detach v0.1.0
 NEXUS_REBUILD=1 ./x verify
 ./x verify-bundle target/verification/artifact-bundle
 ```
+
+The upstream project later replaced the mutable prerelease asset named by the
+historical Dockerfile. That checksum therefore still fails closed, but a new
+`v0.1.0` cold build can no longer retrieve the accepted bytes from that URL.
+The published evidence bundle remains independently auditable. Current main
+preserves those exact verifier bytes under `third_party/tlaplus/` for future
+cold runs without changing the `v0.1.0` tag, release, or archive record.
 
 The cold gate can take tens of minutes and uses substantial Docker/workspace
 storage. Exact resource expectations, interpretation rules, published bundle

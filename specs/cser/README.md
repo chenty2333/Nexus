@@ -319,6 +319,14 @@ version deliberately admits the successor. Pass `Cser`, `PagerCser`, `IoCser`,
 `LinuxIoCompositionCser` to run one frozen family; pass
 `ProductionIdentityCser` to run only the prospective successor.
 
+On current main, the formal catalog is still those same twelve accepted
+families plus the separately routed prospective successor, but the verifier
+source is no longer a mutable release URL: the exact accepted JAR is vendored
+under `third_party/tlaplus/`. The root workflow compares the installed JAR
+byte-for-byte before use, requires the pinned TLC and PlusCal version lines in
+the resulting logs, and binds a runtime verifier receipt into the post-v0.1
+model/spec receipt chain.
+
 The independent prospective gate checks translation drift, all four complete
 graphs, and the exact ordered eight-witness population, then writes a receipt
 under `target/research/production-identity/` without adding artifacts to the
