@@ -187,6 +187,7 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
     && bash scripts/check-scheduler-attempt.sh \
     && cargo osdk build \
     && cargo osdk build --scheme runtime-fs-same-boot \
+    && cargo osdk build --scheme runtime-fs-same-boot-precommit \
     && cmp /tmp/nexus-ostd-inputs/Cargo.lock /work/Cargo.lock \
     && diff -ru /tmp/nexus-ostd-inputs/osdk-runner-base \
         /work/target/osdk/nexus-kernel-run-base \

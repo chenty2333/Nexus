@@ -42,5 +42,6 @@ pub use production::{
     PrepareReadError, PreparedGenerationAdvance, PreparedQuiescenceApply, PreparedRequest,
     ProductionClosureProgress, ProductionClosureReceipt, ProductionDevice,
     ProductionIotlbTombstone, ProductionResetAck, ProductionResetTombstone, PublishIdentityError,
-    PublishedRequest, QuiescenceApplyError, ResetGenerationError,
+    PublishedRequest, QuiescenceApplyError, ResetGenerationError, UnregisteredCancellationError,
+    UnregisteredCancelledRequest, UnregisteredPreparedCancellation,
 };

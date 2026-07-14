@@ -711,19 +711,24 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
             .matches(".register_device_derived_cohort(")
             .count()
             != 4
+        || device.matches("device_root_installed(").count() != 3
         || device.matches(".register_derived(").count() != 6
         || device.matches(".register_device_derived(").count() != 2
         || device.matches(".register_device_derived_cohort(").count() != 4
         || device.matches("commit_device_batch_with_publish(").count() != 8
         || device.matches("validate_device_batch_receipt(").count() != 8
+        || device
+            .matches("validate_device_replay_fence_candidate(")
+            .count()
+            != 5
         || device.matches("enroll_device_batch(").count() != 4
         || device.matches("freeze_pending_device_cancel(").count() != 2
         || device.matches(".cancel_only()").count() != 2
         || device.matches("begin_unpublished_device_cancel(").count() != 3
-        || device.matches("retain_device_reset_timeout(").count() != 1
-        || device.matches("retry_device_reset(").count() != 1
-        || device.matches("retain_device_iotlb_timeout(").count() != 1
-        || device.matches("retry_device_iotlb(").count() != 1
+        || device.matches("retain_device_reset_timeout(").count() != 7
+        || device.matches("retry_device_reset(").count() != 5
+        || device.matches("retain_device_iotlb_timeout(").count() != 7
+        || device.matches("retry_device_iotlb(").count() != 5
         || device
             .matches("acknowledge_device_iotlb_with_apply(")
             .count()
@@ -751,8 +756,11 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "assert_eq!(counter_failure, counter_before);",
         "disabled_cohort.register_device_derived_cohort(device_cohort())",
         "assert_eq!(disabled_cohort, disabled_cohort_before);",
+        "assert_eq!(registry.device_root_installed(SCOPE), Ok(false));",
+        "registry.device_root_installed(ScopeKey::new(0xdead, 1))",
         "let [block, dma_a, dma_b, dma_request] = registry",
         ".register_device_derived_cohort(device_cohort())",
+        "assert_eq!(registry.device_root_installed(SCOPE), Ok(true));",
         "assert_eq!(dma.identity.parent(), Some(block.identity.effect()));",
         "let registered = [",
         "assert_eq!(registry.effects_for_scope(SCOPE).len(), 6);",
@@ -780,6 +788,18 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "Err(RegistryError::InvalidBatchReceipt)",
         "Err(RegistryError::CounterOverflow)",
         "DeviceBatchCommitOutcome::AlreadyCommitted",
+        "let cancel_tombstone = revoke_first.retain_device_reset_timeout(&cancel).unwrap();",
+        "let cancel_retry = revoke_first.retry_device_reset(&cancel_tombstone).unwrap();",
+        "let final_reset_tombstone = final_reset_timeout",
+        "retained unpublished credits lack uniform closing precommit abort",
+        "let iotlb_tombstone = revoke_first.retain_device_iotlb_timeout(&iotlb).unwrap();",
+        ".retry_device_iotlb(&reset, &iotlb_tombstone)",
+        "let final_iotlb_tombstone = final_iotlb_timeout",
+        "let pristine_replay_candidate = registry.clone();",
+        "validate_device_replay_fence_candidate(&receipt)",
+        "completed_replay_candidate.validate_device_replay_fence_candidate(&receipt)",
+        "reset_replay_candidate.validate_device_replay_fence_candidate(&receipt)",
+        "closing_replay_candidate.validate_device_replay_fence_candidate(&receipt)",
         "wrong_completion_result.record_device_completion(&receipt, device, 512)",
         "Err(RegistryError::CommitConflict)",
         "assert_eq!(wrong_completion_result, wrong_completion_before);",
@@ -1225,14 +1245,14 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
     let sequence_apply = completion
         .find("self.next_device_closure_sequence = next_sequence;")
         .ok_or_else(|| "device completion lacks sequence application".to_owned())?;
-    if !(receipt_validation < root_lookup
+    let completion_binding_valid = receipt_validation < root_lookup
         && root_lookup < result_check
-        && result_check < sequence_apply)
-        || result_guard_compact != expected_result_guard
-        || !completion.contains("return Err(RegistryError::CommitConflict);")
-        || !completion.contains("causal_root: causal_root.effect,")
-        || !completion.contains("causal_commit_sequence: causal_root.sequence,")
-    {
+        && result_check < sequence_apply
+        && result_guard_compact == expected_result_guard
+        && completion.contains("return Err(RegistryError::CommitConflict);")
+        && completion.contains("causal_root: causal_root.effect,")
+        && completion.contains("causal_commit_sequence: causal_root.sequence,");
+    if !completion_binding_valid {
         return Err(
             "device completion must bind the exact unique causal-root commit before any live mutation"
                 .into(),

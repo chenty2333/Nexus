@@ -404,7 +404,10 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     linux_epoll::run_linux_epoll_slice();
     linux_dynamic::run_linux_dynamic_slice();
     let fs_receipt = linux_fs::run_linux_fs_slice();
-    #[cfg(feature = "virtio-cser-facade")]
+    #[cfg(all(
+        feature = "virtio-cser-facade",
+        not(feature = "virtio-cser-precommit-fault")
+    ))]
     {
         assert_eq!(fs_receipt.scope.id(), 95);
         assert_eq!(fs_receipt.closed_authority_epoch, 141);
@@ -422,6 +425,33 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
         assert_eq!(
             fs_receipt.elf_sha256,
             "0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef"
+        );
+        println!("SPIKE_RESULT PASS");
+        poweroff(ExitCode::Success);
+    }
+
+    #[cfg(feature = "virtio-cser-precommit-fault")]
+    {
+        assert_eq!(fs_receipt.scope.id(), 95);
+        assert_eq!(fs_receipt.closed_authority_epoch, 141);
+        assert_eq!(fs_receipt.final_authority_epoch, 142);
+        assert_eq!(fs_receipt.terminalizations, 2);
+        assert_eq!(fs_receipt.publication_acks, 2);
+        assert_eq!(fs_receipt.production_effects, 6);
+        assert_eq!(fs_receipt.production_domains, 3);
+        assert!(fs_receipt.preparation_identity_observed);
+        assert!(fs_receipt.enrolled_revoke_wins_observed);
+        assert!(fs_receipt.quiescent);
+        assert_eq!(
+            fs_receipt.source_sha256,
+            "c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f"
+        );
+        assert_eq!(
+            fs_receipt.elf_sha256,
+            "0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef"
+        );
+        println!(
+            "LINUX_FS_SAME_BOOT_PRECOMMIT Terminal receipt_checked=true generic_prefix_quiescent=true poweroff=success"
         );
         println!("SPIKE_RESULT PASS");
         poweroff(ExitCode::Success);

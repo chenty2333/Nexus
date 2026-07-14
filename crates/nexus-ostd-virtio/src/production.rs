@@ -190,6 +190,70 @@ pub enum QuiescenceApplyError {
     AlreadyApplied,
 }
 
+/// Validation failure while closing a prepared request whose device cohort
+/// was never installed in the semantic registry.
+///
+/// This is deliberately separate from the normal registry-coupled reset and
+/// IOTLB plans. It exists only for the failure-atomic window in which hardware
+/// preparation succeeded but no device cohort was installed. Possession
+/// of [`UnregisteredPreparedCancellation`] proves that the request entered
+/// this path through [`PreparedRequest::cancel_unregistered`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnregisteredCancellationError {
+    /// No hardware session is active for the cancellation authority.
+    NoActiveSession,
+    /// The cancellation authority, facade, and hardware receipt disagree.
+    WrongIdentity,
+    /// The descriptor was made visible and therefore requires registry closure.
+    WasPublished,
+    /// The descriptor was consumed and therefore is not a prepublication cancel.
+    DescriptorPopped,
+    /// The request completed and therefore is not a prepublication cancel.
+    Completed,
+    /// Reset did not retain exactly the three production DMA owners.
+    WrongRetainedPages,
+    /// The reset generation was already applied to this cancellation.
+    AlreadyApplied,
+    /// The next hardware generation cannot be represented.
+    GenerationOverflow,
+    /// IOTLB closure began before the matching reset generation was applied.
+    ResetNotApplied,
+    /// The closure receipt belongs to another hardware generation.
+    WrongGeneration,
+    /// IOTLB closure did not cover exactly the three production DMA owners.
+    WrongCompletedPages,
+}
+
+/// Linear authority for the exceptional hardware-only closure which follows a
+/// failure-atomic window before device-cohort installation.
+///
+/// This token is intentionally not cloneable. Normal enrolled requests never
+/// receive one and must continue to couple facade apply with the registry's
+/// reset and IOTLB acknowledgement boundaries.
+///
+/// The facade cannot inspect the external semantic registry: this token proves
+/// the hardware cancellation path, not registry absence by itself. The owning
+/// adapter must establish that no device root was installed under its
+/// authoritative transition gate before constructing it.
+#[must_use = "finish the unregistered reset and IOTLB closure"]
+pub struct UnregisteredPreparedCancellation {
+    identity: DeviceSessionIdentity,
+    reset_applied: bool,
+    quiescence_applied: bool,
+}
+
+impl UnregisteredPreparedCancellation {
+    /// Returns the exact unpublished hardware identity being closed.
+    pub const fn identity(&self) -> DeviceSessionIdentity {
+        self.identity
+    }
+
+    /// Reports whether the hardware-only exception reached full quiescence.
+    pub const fn is_complete(&self) -> bool {
+        self.quiescence_applied
+    }
+}
+
 /// Prevalidated, linear hardware generation update.
 ///
 /// A main-kernel adapter must create this plan while holding its root runtime
@@ -477,6 +541,92 @@ impl ProductionDevice {
         })
     }
 
+    /// Applies a reset generation without a registry reset receipt only when
+    /// the still-unpublished request has no installed registry device cohort.
+    ///
+    /// The non-cloneable cancellation authority is created exclusively by
+    /// [`PreparedRequest::cancel_unregistered`]. This method independently
+    /// checks the active identity and the complete reset projection before
+    /// consuming the same failure-atomic generation plan used by the normal
+    /// registry-coupled path.
+    pub fn apply_unregistered_reset(
+        &mut self,
+        reset: &mut ProductionResetAck,
+        cancellation: &mut UnregisteredPreparedCancellation,
+    ) -> Result<u64, UnregisteredCancellationError> {
+        if cancellation.reset_applied {
+            return Err(UnregisteredCancellationError::AlreadyApplied);
+        }
+        validate_unregistered_reset_projection(
+            self.active.map(|active| active.identity),
+            cancellation.identity,
+            reset.identity,
+            reset.published,
+            reset.descriptor_popped,
+            reset.completed,
+            reset.retained_dma_pages,
+        )?;
+        let plan = self
+            .prepare_generation_advance(reset)
+            .map_err(map_unregistered_reset_error)?;
+        let generation = plan.apply();
+        cancellation.reset_applied = true;
+        Ok(generation)
+    }
+
+    /// Begins the hardware-only IOTLB phase for an unregistered prepared
+    /// cancellation after its exact reset generation was applied.
+    /// A rejected validation returns the unchanged linear reset owner with the
+    /// error, so no DMA closure authority can be lost through this API.
+    pub fn begin_unregistered_iotlb(
+        &self,
+        reset: ProductionResetAck,
+        cancellation: &UnregisteredPreparedCancellation,
+        inject_one_pending: bool,
+    ) -> Result<ProductionClosureProgress, (UnregisteredCancellationError, ProductionResetAck)>
+    {
+        if let Err(error) = validate_unregistered_reset_projection(
+            self.active.map(|active| active.identity),
+            cancellation.identity,
+            reset.identity,
+            reset.published,
+            reset.descriptor_popped,
+            reset.completed,
+            reset.retained_dma_pages,
+        ) {
+            return Err((error, reset));
+        }
+        if !cancellation.reset_applied || !reset.generation_applied {
+            return Err((UnregisteredCancellationError::ResetNotApplied, reset));
+        }
+        Ok(self.begin_iotlb(reset, inject_one_pending))
+    }
+
+    /// Clears the active facade session after an unregistered cancellation's
+    /// exact three-owner IOTLB closure.
+    pub fn apply_unregistered_quiescence(
+        &mut self,
+        closure: &mut ProductionClosureReceipt,
+        cancellation: &mut UnregisteredPreparedCancellation,
+    ) -> Result<DeviceSessionIdentity, UnregisteredCancellationError> {
+        if cancellation.quiescence_applied {
+            return Err(UnregisteredCancellationError::AlreadyApplied);
+        }
+        validate_unregistered_quiescence_projection(
+            self.active.map(|active| active.identity),
+            cancellation.identity,
+            cancellation.reset_applied,
+            closure.identity,
+            closure.completed_pages(),
+        )?;
+        let plan = self
+            .prepare_quiescence_apply(closure)
+            .map_err(map_unregistered_quiescence_error)?;
+        let identity = plan.apply();
+        cancellation.quiescence_applied = true;
+        Ok(identity)
+    }
+
     /// Begins IOTLB closure after this device consumed the matching reset ack.
     pub fn begin_iotlb(
         &self,
@@ -528,6 +678,82 @@ impl ProductionDevice {
             closure_applied: &mut closure.applied,
             identity,
         })
+    }
+}
+
+fn validate_unregistered_reset_projection(
+    active: Option<DeviceSessionIdentity>,
+    cancellation: DeviceSessionIdentity,
+    reset: DeviceSessionIdentity,
+    published: bool,
+    descriptor_popped: bool,
+    completed: bool,
+    retained_pages: usize,
+) -> Result<(), UnregisteredCancellationError> {
+    let active = active.ok_or(UnregisteredCancellationError::NoActiveSession)?;
+    if active != cancellation || reset != cancellation {
+        return Err(UnregisteredCancellationError::WrongIdentity);
+    }
+    if published {
+        return Err(UnregisteredCancellationError::WasPublished);
+    }
+    if descriptor_popped {
+        return Err(UnregisteredCancellationError::DescriptorPopped);
+    }
+    if completed {
+        return Err(UnregisteredCancellationError::Completed);
+    }
+    if retained_pages != 3 {
+        return Err(UnregisteredCancellationError::WrongRetainedPages);
+    }
+    Ok(())
+}
+
+fn validate_unregistered_quiescence_projection(
+    active: Option<DeviceSessionIdentity>,
+    cancellation: DeviceSessionIdentity,
+    reset_applied: bool,
+    closure: DeviceSessionIdentity,
+    completed_pages: usize,
+) -> Result<(), UnregisteredCancellationError> {
+    let active = active.ok_or(UnregisteredCancellationError::NoActiveSession)?;
+    if active != cancellation || closure != cancellation {
+        return Err(UnregisteredCancellationError::WrongIdentity);
+    }
+    if !reset_applied {
+        return Err(UnregisteredCancellationError::ResetNotApplied);
+    }
+    if completed_pages != 3 {
+        return Err(UnregisteredCancellationError::WrongCompletedPages);
+    }
+    Ok(())
+}
+
+const fn map_unregistered_reset_error(
+    error: ResetGenerationError,
+) -> UnregisteredCancellationError {
+    match error {
+        ResetGenerationError::NoActiveSession => UnregisteredCancellationError::NoActiveSession,
+        ResetGenerationError::WrongIdentity => UnregisteredCancellationError::WrongIdentity,
+        ResetGenerationError::AlreadyApplied => UnregisteredCancellationError::AlreadyApplied,
+        ResetGenerationError::GenerationOverflow => {
+            UnregisteredCancellationError::GenerationOverflow
+        }
+    }
+}
+
+const fn map_unregistered_quiescence_error(
+    error: QuiescenceApplyError,
+) -> UnregisteredCancellationError {
+    match error {
+        QuiescenceApplyError::NoActiveSession => UnregisteredCancellationError::NoActiveSession,
+        QuiescenceApplyError::WrongIdentity => UnregisteredCancellationError::WrongIdentity,
+        QuiescenceApplyError::ResetNotApplied => UnregisteredCancellationError::ResetNotApplied,
+        QuiescenceApplyError::WrongGeneration => UnregisteredCancellationError::WrongGeneration,
+        QuiescenceApplyError::WrongCompletedPages => {
+            UnregisteredCancellationError::WrongCompletedPages
+        }
+        QuiescenceApplyError::AlreadyApplied => UnregisteredCancellationError::AlreadyApplied,
     }
 }
 
@@ -664,6 +890,31 @@ impl PreparedRequest {
                 published: false,
                 descriptor_popped: false,
                 completed: false,
+            }),
+        }
+    }
+
+    /// Rolls back hardware preparation which could not be installed as a
+    /// device cohort in the semantic registry.
+    ///
+    /// The returned wrapper is the only constructor for the linear exception
+    /// authority consumed by [`ProductionDevice::apply_unregistered_reset`]
+    /// and [`ProductionDevice::apply_unregistered_quiescence`]. Enrolled
+    /// requests must use [`Self::cancel_prepared`] and the registry-coupled
+    /// acknowledgement path instead.
+    ///
+    /// The caller is responsible for proving, under the external registry's
+    /// transition gate, that this request has no installed device cohort. That
+    /// cross-component fact is deliberately not claimed as a facade type
+    /// property.
+    pub fn cancel_unregistered(self) -> UnregisteredCancelledRequest {
+        let identity = self.identity;
+        UnregisteredCancelledRequest {
+            request: Some(self.cancel_prepared()),
+            cancellation: Some(UnregisteredPreparedCancellation {
+                identity,
+                reset_applied: false,
+                quiescence_applied: false,
             }),
         }
     }
@@ -1002,6 +1253,42 @@ pub struct CancelledRequest {
     session: Option<ResetSession>,
 }
 
+/// An unpublished request cancelled because its registry device cohort was
+/// never installed.
+#[must_use = "begin reset and retain the unregistered cancellation authority"]
+pub struct UnregisteredCancelledRequest {
+    request: Option<CancelledRequest>,
+    cancellation: Option<UnregisteredPreparedCancellation>,
+}
+
+impl UnregisteredCancelledRequest {
+    /// Returns the exact unpublished hardware identity being cancelled.
+    pub fn identity(&self) -> DeviceSessionIdentity {
+        self.cancellation
+            .as_ref()
+            .expect("unregistered cancellation authority")
+            .identity
+    }
+
+    /// Starts mandatory whole-device reset and returns the unique authority
+    /// for applying hardware-only generation and quiescence updates.
+    pub fn begin_reset(
+        mut self,
+        inject_pending_once: bool,
+    ) -> (ProductionResetTombstone, UnregisteredPreparedCancellation) {
+        let reset = self
+            .request
+            .take()
+            .expect("unregistered cancelled request")
+            .begin_reset(inject_pending_once);
+        let cancellation = self
+            .cancellation
+            .take()
+            .expect("unregistered cancellation authority");
+        (reset, cancellation)
+    }
+}
+
 impl CancelledRequest {
     /// Starts mandatory whole-device reset after unpublished cancellation.
     pub fn begin_reset(mut self, inject_pending_once: bool) -> ProductionResetTombstone {
@@ -1258,5 +1545,146 @@ unsafe fn abandon_queue_after_reset(queue: Queue) {
 fn quarantine<T>(slot: &mut Option<T>) {
     if let Some(owner) = slot.take() {
         forget(owner);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IDENTITY: DeviceSessionIdentity = DeviceSessionIdentity::from_coordinates(
+        0x4300_0000_0000_0001,
+        DeviceBdf::from_coordinates(0, 5, 0),
+        0,
+        7,
+        3,
+    );
+    const FOREIGN_IDENTITY: DeviceSessionIdentity = DeviceSessionIdentity::from_coordinates(
+        0x4300_0000_0000_0002,
+        DeviceBdf::from_coordinates(0, 5, 0),
+        0,
+        8,
+        3,
+    );
+
+    #[test]
+    fn unregistered_reset_projection_requires_exact_unpublished_three_owner_ack() {
+        assert_eq!(
+            validate_unregistered_reset_projection(
+                Some(IDENTITY),
+                IDENTITY,
+                IDENTITY,
+                false,
+                false,
+                false,
+                3,
+            ),
+            Ok(())
+        );
+        for (published, descriptor_popped, completed, pages, expected) in [
+            (
+                true,
+                false,
+                false,
+                3,
+                UnregisteredCancellationError::WasPublished,
+            ),
+            (
+                false,
+                true,
+                false,
+                3,
+                UnregisteredCancellationError::DescriptorPopped,
+            ),
+            (
+                false,
+                false,
+                true,
+                3,
+                UnregisteredCancellationError::Completed,
+            ),
+            (
+                false,
+                false,
+                false,
+                2,
+                UnregisteredCancellationError::WrongRetainedPages,
+            ),
+        ] {
+            assert_eq!(
+                validate_unregistered_reset_projection(
+                    Some(IDENTITY),
+                    IDENTITY,
+                    IDENTITY,
+                    published,
+                    descriptor_popped,
+                    completed,
+                    pages,
+                ),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            validate_unregistered_reset_projection(
+                Some(IDENTITY),
+                IDENTITY,
+                FOREIGN_IDENTITY,
+                false,
+                false,
+                false,
+                3,
+            ),
+            Err(UnregisteredCancellationError::WrongIdentity)
+        );
+        assert_eq!(
+            validate_unregistered_reset_projection(
+                None, IDENTITY, IDENTITY, false, false, false, 3,
+            ),
+            Err(UnregisteredCancellationError::NoActiveSession)
+        );
+    }
+
+    #[test]
+    fn unregistered_quiescence_requires_reset_and_exact_three_owner_closure() {
+        assert_eq!(
+            validate_unregistered_quiescence_projection(
+                Some(IDENTITY),
+                IDENTITY,
+                true,
+                IDENTITY,
+                3,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_unregistered_quiescence_projection(
+                Some(IDENTITY),
+                IDENTITY,
+                false,
+                IDENTITY,
+                3,
+            ),
+            Err(UnregisteredCancellationError::ResetNotApplied)
+        );
+        assert_eq!(
+            validate_unregistered_quiescence_projection(
+                Some(IDENTITY),
+                IDENTITY,
+                true,
+                FOREIGN_IDENTITY,
+                3,
+            ),
+            Err(UnregisteredCancellationError::WrongIdentity)
+        );
+        assert_eq!(
+            validate_unregistered_quiescence_projection(
+                Some(IDENTITY),
+                IDENTITY,
+                true,
+                IDENTITY,
+                2,
+            ),
+            Err(UnregisteredCancellationError::WrongCompletedPages)
+        );
     }
 }

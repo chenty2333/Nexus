@@ -1902,6 +1902,18 @@ impl EffectRegistry {
         })
     }
 
+    /// Reports whether device-backed registration has installed the unique
+    /// root for this scope.  Hardware-only cancellation may proceed without a
+    /// registry receipt only when this returns `false` for the exact scope.
+    pub(crate) fn device_root_installed(&self, scope_key: ScopeKey) -> Result<bool, RegistryError> {
+        Ok(self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?
+            .device_root
+            .is_some())
+    }
+
     /// Mints the kernel-only authority used to linearize one root-wide device
     /// publication. Service-domain supervisors continue to use their opaque
     /// portal handles and cannot use this token to act on a different root or
@@ -2763,6 +2775,47 @@ impl EffectRegistry {
         Ok(())
     }
 
+    /// Validates the narrow post-commit fence fallback for a replay whose
+    /// hardware publication closure was not invoked in the current call.
+    ///
+    /// The authoritative batch must still be in its initial committed state:
+    /// no completion, reset, IOTLB, outcome, or closure authority may already
+    /// exist, and revocation must not have begun.  This is deliberately a
+    /// read-only eligibility check.  It does not turn descriptive device
+    /// coordinates into publication authority; the adapter must separately
+    /// prove exclusive ownership of the matching physical device and DMA
+    /// generation before using whole-device reset as a conservative fence.
+    pub(crate) fn validate_device_replay_fence_candidate(
+        &self,
+        presented: &DeviceBatchCommitReceipt,
+    ) -> Result<(), RegistryError> {
+        self.validate_device_batch_receipt(presented)?;
+        let scope = self
+            .scopes
+            .get(&presented.scope)
+            .ok_or(RegistryError::InvalidBatchReceipt)?;
+        let root = scope
+            .device_root
+            .as_ref()
+            .ok_or(RegistryError::InvalidBatchReceipt)?;
+        if scope.phase != ScopePhase::Active
+            || root.current_device != root.initial_device
+            || root.completion.is_some()
+            || root.outcome.is_some()
+            || root.reset_ticket.is_some()
+            || root.reset_tombstone.is_some()
+            || root.reset_retry_issued
+            || root.reset_receipt.is_some()
+            || root.iotlb_ticket.is_some()
+            || root.iotlb_tombstone.is_some()
+            || root.iotlb_retry_issued
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::InvalidState);
+        }
+        Ok(())
+    }
+
     fn validate_device_enrollment_receipt(
         &self,
         presented: &DeviceBatchEnrollmentReceipt,
@@ -3476,21 +3529,30 @@ impl EffectRegistry {
     ) -> Result<Option<DeviceRetentionPlan>, RegistryError> {
         let mut aggregate = BTreeMap::<CreditClass, u64>::new();
         let mut state = None;
+        let retained_unpublished = self.scopes.get(&enrollment.scope).is_some_and(|scope| {
+            scope.phase == ScopePhase::Closing
+                && scope.device_root.as_ref().is_some_and(|root| {
+                    root.enrollment.as_ref() == Some(enrollment)
+                        && root.batch_sequence.is_none()
+                        && root.outcome == Some(DeviceClosureResult::AbortedBeforeCommit)
+                })
+        });
         for effect in &enrollment.effects {
             let record = self
                 .effects
                 .get(effect)
                 .ok_or(RegistryError::UnknownEffect)?;
-            if !matches!(
-                (record.phase, record.credit_state),
-                (
-                    EffectPhase::Registered | EffectPhase::Prepared,
-                    CreditState::Held
-                ) | (
-                    EffectPhase::Committed,
+            let valid_unpublished = matches!(
+                record.phase,
+                EffectPhase::Registered | EffectPhase::Prepared
+            ) && (record.credit_state == CreditState::Held
+                || (record.credit_state == CreditState::Retained && retained_unpublished));
+            let valid_published = record.phase == EffectPhase::Committed
+                && matches!(
+                    record.credit_state,
                     CreditState::Committed | CreditState::Retained
-                )
-            ) {
+                );
+            if !valid_unpublished && !valid_published {
                 return Err(RegistryError::InvalidState);
             }
             match state {
@@ -5768,6 +5830,14 @@ impl EffectRegistry {
             .effects
             .iter()
             .any(|effect| self.effects[effect].credit_state == CreditState::Retained);
+        let has_held = enrollment
+            .effects
+            .iter()
+            .any(|effect| self.effects[effect].credit_state == CreditState::Held);
+        let has_live_enrolled = enrollment
+            .effects
+            .iter()
+            .any(|effect| !self.effects[effect].phase.is_terminal());
         if has_retained
             && root.batch_sequence.is_some()
             && root.reset_tombstone.is_none()
@@ -5777,12 +5847,14 @@ impl EffectRegistry {
                 "retained published credits lack timeout tombstone",
             ));
         }
-        if has_retained
-            && root.batch_sequence.is_none()
-            && root.outcome != Some(DeviceClosureResult::AbortedBeforeCommit)
+        if root.batch_sequence.is_none()
+            && ((has_retained && root.outcome != Some(DeviceClosureResult::AbortedBeforeCommit))
+                || (root.outcome == Some(DeviceClosureResult::AbortedBeforeCommit)
+                    && has_live_enrolled
+                    && (self.scopes[&scope_key].phase != ScopePhase::Closing || has_held)))
         {
             return Err(RegistryError::Invariant(
-                "retained unpublished credits lack precommit abort",
+                "retained unpublished credits lack uniform closing precommit abort",
             ));
         }
         Ok(())
@@ -8436,6 +8508,11 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             parent: Some(syscall.identity.effect()),
         })
         .unwrap();
+    assert_eq!(registry.device_root_installed(SCOPE), Ok(false));
+    assert_eq!(
+        registry.device_root_installed(ScopeKey::new(0xdead, 1)),
+        Err(RegistryError::UnknownScope)
+    );
     let device_cohort = || {
         [
             DeviceDerivedCohortEntry {
@@ -8596,6 +8673,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let [block, dma_a, dma_b, dma_request] = registry
         .register_device_derived_cohort(device_cohort())
         .unwrap();
+    assert_eq!(registry.device_root_installed(SCOPE), Ok(true));
     assert!(matches!(
         registry.clone_non_device_candidate(),
         Err(RegistryError::InvalidDeviceEnvelope)
@@ -9051,13 +9129,168 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     let retained = revoke_first.scope_projection(SCOPE).unwrap().credits;
     assert_eq!(retained.held, 0);
     assert_eq!(retained.retained, 6);
+    let mut forged_cancel = cancel;
+    forged_cancel.sequence = forged_cancel.sequence.checked_add(1).unwrap();
+    let before_forged_cancel = revoke_first.clone();
+    assert_eq!(
+        revoke_first.retain_device_reset_timeout(&forged_cancel),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(revoke_first, before_forged_cancel);
+    let mut foreign_cancel = cancel;
+    foreign_cancel.registry_instance_id =
+        foreign_cancel.registry_instance_id.checked_add(1).unwrap();
+    let before_foreign_cancel = revoke_first.clone();
+    assert_eq!(
+        revoke_first.retain_device_reset_timeout(&foreign_cancel),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(revoke_first, before_foreign_cancel);
+    let mut cancel_overflow = revoke_first.clone();
+    cancel_overflow.next_device_closure_sequence = u64::MAX;
+    let before_cancel_overflow = cancel_overflow.clone();
+    assert_eq!(
+        cancel_overflow.retain_device_reset_timeout(&cancel),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(cancel_overflow, before_cancel_overflow);
+    let cancel_tombstone = revoke_first.retain_device_reset_timeout(&cancel).unwrap();
+    assert_eq!(cancel_tombstone.device(), device);
+    assert_eq!(
+        revoke_first.scope_projection(SCOPE).unwrap().credits,
+        retained
+    );
+    revoke_first.check_invariants().unwrap();
+    let mut mixed_unpublished_retention = revoke_first.clone();
+    mixed_unpublished_retention
+        .effects
+        .get_mut(&enrollment.effects[0])
+        .unwrap()
+        .credit_state = CreditState::Held;
+    assert_eq!(
+        mixed_unpublished_retention.check_invariants(),
+        Err(RegistryError::Invariant(
+            "retained unpublished credits lack uniform closing precommit abort"
+        ))
+    );
+    let mut held_unpublished_abort = revoke_first.clone();
+    for effect in &enrollment.effects {
+        held_unpublished_abort
+            .effects
+            .get_mut(effect)
+            .unwrap()
+            .credit_state = CreditState::Held;
+    }
+    assert_eq!(
+        held_unpublished_abort.check_invariants(),
+        Err(RegistryError::Invariant(
+            "retained unpublished credits lack uniform closing precommit abort"
+        ))
+    );
+    let before_cancel_replay = revoke_first.clone();
+    assert_eq!(
+        revoke_first.retain_device_reset_timeout(&cancel),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(revoke_first, before_cancel_replay);
+    let mut cancel_retry_overflow = revoke_first.clone();
+    cancel_retry_overflow.next_device_closure_sequence = u64::MAX;
+    let before_cancel_retry_overflow = cancel_retry_overflow.clone();
+    assert_eq!(
+        cancel_retry_overflow.retry_device_reset(&cancel_tombstone),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(cancel_retry_overflow, before_cancel_retry_overflow);
+    let cancel_retry = revoke_first.retry_device_reset(&cancel_tombstone).unwrap();
+    let before_cancel_retry_replay = revoke_first.clone();
+    assert_eq!(
+        revoke_first.retry_device_reset(&cancel_tombstone),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(revoke_first, before_cancel_retry_replay);
+    let mut final_reset_timeout = revoke_first.clone();
+    let final_reset_tombstone = final_reset_timeout
+        .retain_device_reset_timeout(&cancel_retry)
+        .unwrap();
+    final_reset_timeout.check_invariants().unwrap();
+    let before_final_reset_retry = final_reset_timeout.clone();
+    assert_eq!(
+        final_reset_timeout.retry_device_reset(&final_reset_tombstone),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(final_reset_timeout, before_final_reset_retry);
     let (reset, ()) = revoke_first
-        .acknowledge_device_reset_with_apply(&cancel, |_| ())
+        .acknowledge_device_reset_with_apply(&cancel_retry, |_| ())
         .unwrap();
     assert_eq!(reset.outcome(), DeviceClosureResult::AbortedBeforeCommit);
     let iotlb = revoke_first.begin_device_iotlb(&reset).unwrap();
+    let mut forged_iotlb = iotlb;
+    forged_iotlb.sequence = forged_iotlb.sequence.checked_add(1).unwrap();
+    let before_forged_iotlb = revoke_first.clone();
+    assert_eq!(
+        revoke_first.retain_device_iotlb_timeout(&forged_iotlb),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(revoke_first, before_forged_iotlb);
+    let mut foreign_iotlb = iotlb;
+    foreign_iotlb.registry_instance_id = foreign_iotlb.registry_instance_id.checked_add(1).unwrap();
+    let before_foreign_iotlb = revoke_first.clone();
+    assert_eq!(
+        revoke_first.retain_device_iotlb_timeout(&foreign_iotlb),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(revoke_first, before_foreign_iotlb);
+    let mut iotlb_overflow = revoke_first.clone();
+    iotlb_overflow.next_device_closure_sequence = u64::MAX;
+    let before_iotlb_overflow = iotlb_overflow.clone();
+    assert_eq!(
+        iotlb_overflow.retain_device_iotlb_timeout(&iotlb),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(iotlb_overflow, before_iotlb_overflow);
+    let iotlb_tombstone = revoke_first.retain_device_iotlb_timeout(&iotlb).unwrap();
+    assert_eq!(iotlb_tombstone.device(), reset.new_device());
+    assert_eq!(
+        revoke_first.scope_projection(SCOPE).unwrap().credits,
+        retained
+    );
+    revoke_first.check_invariants().unwrap();
+    let before_iotlb_replay = revoke_first.clone();
+    assert_eq!(
+        revoke_first.retain_device_iotlb_timeout(&iotlb),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(revoke_first, before_iotlb_replay);
+    let mut iotlb_retry_overflow = revoke_first.clone();
+    iotlb_retry_overflow.next_device_closure_sequence = u64::MAX;
+    let before_iotlb_retry_overflow = iotlb_retry_overflow.clone();
+    assert_eq!(
+        iotlb_retry_overflow.retry_device_iotlb(&reset, &iotlb_tombstone),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(iotlb_retry_overflow, before_iotlb_retry_overflow);
+    let iotlb_retry = revoke_first
+        .retry_device_iotlb(&reset, &iotlb_tombstone)
+        .unwrap();
+    let before_iotlb_retry_replay = revoke_first.clone();
+    assert_eq!(
+        revoke_first.retry_device_iotlb(&reset, &iotlb_tombstone),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(revoke_first, before_iotlb_retry_replay);
+    let mut final_iotlb_timeout = revoke_first.clone();
+    let final_iotlb_tombstone = final_iotlb_timeout
+        .retain_device_iotlb_timeout(&iotlb_retry)
+        .unwrap();
+    final_iotlb_timeout.check_invariants().unwrap();
+    let before_final_iotlb_retry = final_iotlb_timeout.clone();
+    assert_eq!(
+        final_iotlb_timeout.retry_device_iotlb(&reset, &final_iotlb_tombstone),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(final_iotlb_timeout, before_final_iotlb_retry);
     let (cancelled, ()) = revoke_first
-        .acknowledge_device_iotlb_with_apply(&iotlb, |_| ())
+        .acknowledge_device_iotlb_with_apply(&iotlb_retry, |_| ())
         .unwrap();
     assert!(!cancelled.published());
     assert_eq!(
@@ -9148,6 +9381,56 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         DeviceBatchCommitOutcome::Applied { .. } => panic!("device batch published twice"),
     }
     assert_eq!(replay_publications.get(), 0);
+
+    let pristine_replay_candidate = registry.clone();
+    registry
+        .validate_device_replay_fence_candidate(&receipt)
+        .unwrap();
+    assert_eq!(*registry, pristine_replay_candidate);
+
+    let mut forged_replay_receipt = receipt.clone();
+    forged_replay_receipt.registry_instance_id = forged_replay_receipt
+        .registry_instance_id
+        .checked_add(1)
+        .unwrap();
+    let before_forged_replay_candidate = registry.clone();
+    assert_eq!(
+        registry.validate_device_replay_fence_candidate(&forged_replay_receipt),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(*registry, before_forged_replay_candidate);
+
+    let mut completed_replay_candidate = registry.clone();
+    completed_replay_candidate
+        .record_device_completion(&receipt, device, 4)
+        .unwrap();
+    let before_completed_replay_candidate = completed_replay_candidate.clone();
+    assert_eq!(
+        completed_replay_candidate.validate_device_replay_fence_candidate(&receipt),
+        Err(RegistryError::InvalidState)
+    );
+    assert_eq!(
+        completed_replay_candidate,
+        before_completed_replay_candidate
+    );
+
+    let mut reset_replay_candidate = registry.clone();
+    reset_replay_candidate.begin_device_reset(&receipt).unwrap();
+    let before_reset_replay_candidate = reset_replay_candidate.clone();
+    assert_eq!(
+        reset_replay_candidate.validate_device_replay_fence_candidate(&receipt),
+        Err(RegistryError::InvalidState)
+    );
+    assert_eq!(reset_replay_candidate, before_reset_replay_candidate);
+
+    let mut closing_replay_candidate = registry.clone();
+    closing_replay_candidate.revoke_begin(SCOPE).unwrap();
+    let before_closing_replay_candidate = closing_replay_candidate.clone();
+    assert_eq!(
+        closing_replay_candidate.validate_device_replay_fence_candidate(&receipt),
+        Err(RegistryError::InvalidState)
+    );
+    assert_eq!(closing_replay_candidate, before_closing_replay_candidate);
 
     let replay_before = registry.clone();
     assert_eq!(

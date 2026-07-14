@@ -10,6 +10,7 @@ publish = false
 [features]
 stage7b-eval = []
 virtio-cser-facade = ["dep:nexus-ostd-virtio"]
+virtio-cser-precommit-fault = ["virtio-cser-facade"]
 
 [dependencies]
 cser-transition-gates = { path = "../../crates/cser-transition-gates" }

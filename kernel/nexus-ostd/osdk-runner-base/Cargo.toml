@@ -21,3 +21,4 @@ version = "0.18.0"
 [features]
 stage7b-eval = ["nexus-kernel/stage7b-eval"]
 virtio-cser-facade = ["nexus-kernel/virtio-cser-facade"]
+virtio-cser-precommit-fault = ["nexus-kernel/virtio-cser-precommit-fault"]
