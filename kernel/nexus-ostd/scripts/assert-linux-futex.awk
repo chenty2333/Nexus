@@ -1,10 +1,11 @@
 # Validate the Stage 6B.1 futex personality portal receipts.
 #
-# A Projection is evidence only when it immediately follows one PortalResult,
-# agrees with its scenario/action/result/mutation tuple, and occurs in the one
-# allowed bounded trace.  Projection values for wait/wake tokens contain
-# spaces, so the semantic state is parsed between ordered field labels rather
-# than with AWK whitespace fields.
+# A Projection is evidence only when it follows the preceding unmatched
+# PortalResult, agrees with its scenario/action/result/mutation tuple, and
+# occurs in the one allowed bounded trace. Scheduler diagnostics may interleave
+# after the futex lock is released, so physical adjacency is not required.
+# Projection values for wait/wake tokens contain spaces, so the semantic state
+# is parsed between ordered field labels rather than with AWK whitespace fields.
 
 function fail(message) {
     print "linux futex projection assertion failed at serial line " NR ": " message > "/dev/stderr"
@@ -127,8 +128,8 @@ BEGIN {
     is_portal = $0 ~ /^LINUX_FUTEX PortalResult /
     is_projection = $0 ~ /^LINUX_FUTEX Projection /
 
-    if (pending && !is_projection)
-        fail("PortalResult at line " pending_line " is not immediately followed by its Projection")
+    if (is_portal && pending)
+        fail("PortalResult at line " pending_line " has no paired Projection")
     if (is_projection && !pending)
         fail("orphan Projection")
 }

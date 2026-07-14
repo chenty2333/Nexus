@@ -1,10 +1,12 @@
 # Validate the compact, machine-readable Stage 6A personality receipts.
 #
 # The human-readable lines remain useful diagnostics, but this oracle treats a
-# Projection as evidence only when it is paired with the immediately preceding
+# Projection as evidence only when it is paired with the preceding unmatched
 # PortalResult and when its complete identity tuple appears in the one allowed
-# execution order below.  This makes missing, duplicated, or payload-swapped
-# receipts fail closed.
+# execution order below. Scheduler diagnostics may be printed between the two
+# records after the personality lock is released, so adjacency is not a valid
+# semantic requirement. Missing, duplicated, or payload-swapped receipts still
+# fail closed.
 
 function fail(message) {
     print "linux projection assertion failed at serial line " NR ": " message > "/dev/stderr"
@@ -306,9 +308,12 @@ BEGIN {
 ($1 == "LINUX_PORTAL" || $1 == "LINUX_REVOKE") && $2 == "PortalResult" {
     if (NF < 13)
         fail("truncated PortalResult")
+    if (result_pending)
+        fail("PortalResult at line " last_result_line " has no paired Projection")
     portal_result_count++
     last_result_line = NR
     last_result = result_key()
+    result_pending = 1
     next
 }
 
@@ -320,10 +325,11 @@ BEGIN {
         fail("unexpected extra Projection: " core_key())
     if (core_key() != expected[projection_count])
         fail("Projection " projection_count " identity/order mismatch; got " core_key() "; expected " expected[projection_count])
-    if (last_result_line != NR - 1)
-        fail("Projection is not immediately paired with its PortalResult")
+    if (!result_pending)
+        fail("Projection has no preceding unmatched PortalResult")
     if (result_key() != last_result)
         fail("Projection identity/result differs from its PortalResult")
+    result_pending = 0
 
     if (projection_count in chain_from) {
         previous_projection = chain_from[projection_count]
@@ -406,6 +412,10 @@ END {
     }
     if (portal_result_count != expected_count) {
         print "linux projection assertion failed: expected " expected_count " PortalResults, observed " (portal_result_count + 0) > "/dev/stderr"
+        exit 1
+    }
+    if (result_pending) {
+        print "linux projection assertion failed: PortalResult at line " last_result_line " has no paired Projection" > "/dev/stderr"
         exit 1
     }
     if (revoke_pass_count != 2 || pass31_line == 0 || pass32_line == 0) {

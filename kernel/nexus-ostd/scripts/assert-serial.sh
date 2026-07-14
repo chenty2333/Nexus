@@ -4,6 +4,10 @@ set -euo pipefail
 log=${1:?usage: assert-serial.sh SERIAL_LOG}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
+# FallbackPick records are deliberately omitted from this total-order list.
+# Once Crash switches the gate to fallback, the outgoing user task and the
+# newly runnable task can print their diagnostic records in either order.  The
+# trace oracle below checks the semantic Crash -> first-pick partial order.
 patterns=(
     "CSER Register authority_epoch=41 binding_epoch=1 effect=scheduler_policy"
     "CSER Prepare authority_epoch=41 binding_epoch=1 proposal_task=100"
@@ -13,7 +17,6 @@ patterns=(
     "OSTD_PROBE UserMode return=UserException exception=PageFault addr=0x800000 authority_epoch=41"
     "CSER Crash authority_epoch=41 previous_binding_epoch=1 binding_epoch=2"
     "OSTD_PROBE PASS api=UserMode+VmSpace syscall=true page_fault=true authority_epoch=41"
-    "CSER FallbackPick authority_epoch=41 binding_epoch=2 task=200"
     "OSTD_PROBE PASS fallback_first_task=200 fallback_first_selection_attempt=1 observed_tick_delta="
     "CSER REJECT_NO_SUPERVISOR action=Prepare authority_epoch=41 binding_epoch=2 proposal_task=100"
     "OSTD_PROBE PASS wrappers=wait+timer carry_effect_token=true authority_epoch=41"
@@ -72,7 +75,6 @@ patterns=(
     "reason=linux_scheduler_policy_user_page_fault"
     "CSER CrashScoped service=scheduler scheduler_authority_epoch=41 binding_epoch=3 workload_authority_epoch=91 scope=30 effect=0 pending_scoped_cleared=true fallback=kernel_fifo"
     "LINUX_SCHEDULER_POLICY EXIT workload=linux-hello policy=404 reason=real_user_page_fault guest_proposal_committed=false"
-    "CSER FallbackPick authority_epoch=41 binding_epoch=3 task=400"
     "LINUX_CODE_PAGER Register workload=linux-hello effect=3 authority_epoch=91 scope=30 binding_epoch=1 thread=400"
     "access_bits=0x14 backing=elf-image"
     "LINUX_CODE_PAGER GuestBlocked workload=linux-hello effect=3 thread=400"
@@ -137,7 +139,6 @@ patterns=(
     "CSER Crash authority_epoch=41 previous_binding_epoch=3 binding_epoch=4"
     "CSER CrashScoped service=scheduler scheduler_authority_epoch=41 binding_epoch=4 workload_authority_epoch=101 scope=40 effect=1 pending_scoped_cleared=true fallback=kernel_fifo"
     "LINUX_FUTEX_SCHEDULER_POLICY EXIT scenario=recover policy=505 reason=real_user_page_fault waiter_proposal_committed=false"
-    "CSER FallbackPick authority_epoch=41 binding_epoch=4 task=500"
     "LINUX_FUTEX Mismatch scenario=recover observed=0 expected=1 result=EAGAIN effect_created=false wait_credit_held=false mutation=false"
     "LINUX_FUTEX PortalResult scenario=recover action=WaitRegister sender=502 opcode=0x4c600002 authority_epoch=101 scope=40 effect=1 task=500 operation=1 address_space=600 generation=1 address=0x401000 binding_epoch=1 result=Applied mutation=true"
     "LINUX_FUTEX WaitRegister scenario=recover observed=0 expected=0 atomic=true queue=1 wait_credit=Held vm_restored=true"
@@ -235,18 +236,21 @@ awk '
         if (field("tick") !~ /^[0-9]+$/)
             fail("base crash has a non-numeric tick: " $0)
         base_crash_tick = field("tick") + 0
+        base_crash_line = NR
     }
     /^CSER Crash authority_epoch=41 previous_binding_epoch=2 binding_epoch=3 / {
         linux_crashes++
         if (field("tick") !~ /^[0-9]+$/)
             fail("Linux crash has a non-numeric tick: " $0)
         linux_crash_tick = field("tick") + 0
+        linux_crash_line = NR
     }
     /^CSER Crash authority_epoch=41 previous_binding_epoch=3 binding_epoch=4 / {
         futex_crashes++
         if (field("tick") !~ /^[0-9]+$/)
             fail("Linux futex crash has a non-numeric tick: " $0)
         futex_crash_tick = field("tick") + 0
+        futex_crash_line = NR
     }
     /^CSER FallbackPick authority_epoch=41 binding_epoch=2 / {
         base_attempts_seen++
@@ -259,6 +263,7 @@ awk '
             if (field("task") != "200" || field("selection_attempt") != "1")
                 fail("base first pick was not task 200 on selection attempt 1: " $0)
             base_pick_tick = field("tick") + 0
+            base_pick_line = NR
         }
     }
     /^CSER FallbackPick authority_epoch=41 binding_epoch=3 / {
@@ -272,6 +277,7 @@ awk '
             if (field("task") != "400" || field("selection_attempt") != "1")
                 fail("Linux first pick was not task 400 on selection attempt 1: " $0)
             linux_pick_tick = field("tick") + 0
+            linux_pick_line = NR
         }
     }
     /^CSER FallbackPick authority_epoch=41 binding_epoch=4 / {
@@ -295,6 +301,7 @@ awk '
             if (field("task") != "500" || attempt != "1")
                 fail("Linux futex first pick was not task 500 on selection attempt 1: " $0)
             futex_pick_tick = field("tick") + 0
+            futex_pick_line = NR
         }
     }
     /^LINUX_FUTEX_SLICE PASS scenarios=recover\+expire / {
@@ -303,11 +310,16 @@ awk '
             fail("duplicate Stage 6B.1 futex slice PASS")
         futex_slice_complete = 1
     }
+    /^OSTD_PROBE PASS api=UserMode\+VmSpace syscall=true page_fault=true authority_epoch=41$/ {
+        base_api_passes++
+        base_api_line = NR
+    }
     /^OSTD_PROBE PASS fallback_first_task=/ {
         base_passes++
         if ($0 !~ /^OSTD_PROBE PASS fallback_first_task=200 fallback_first_selection_attempt=1 observed_tick_delta=[0-9]+ tick_delta_diagnostic=true authority_epoch=41 binding_epoch=2$/)
             fail("malformed base fallback PASS: " $0)
         base_reported_delta = field("observed_tick_delta") + 0
+        base_pass_line = NR
     }
     /^LINUX_SCHEDULER PASS workload=linux-hello / {
         linux_passes++
@@ -326,12 +338,18 @@ awk '
             exit 1
         if (base_crashes != 1 || linux_crashes != 1 || futex_crashes != 1)
             fail("expected one base, one Linux, and one Linux futex scheduler crash")
+        if (base_api_passes != 1)
+            fail("expected exactly one base user-probe PASS")
         if (!base_pick_seen || !linux_pick_seen || !futex_pick_seen)
             fail("missing first fallback pick")
         if (base_first_attempts != 1 || linux_first_attempts != 1 || futex_first_attempts != 1)
             fail("selection attempt 1 must appear exactly once in each binding epoch")
         if (base_passes != 1 || linux_passes != 1 || futex_passes != 1)
             fail("expected exactly one base, one Linux, and one Linux futex fallback PASS")
+        if (base_pick_line <= base_crash_line || linux_pick_line <= linux_crash_line || futex_pick_line <= futex_crash_line)
+            fail("a first fallback pick was serialized before its Crash")
+        if (base_api_line <= base_crash_line || base_api_line >= base_pass_line)
+            fail("base user-probe PASS was not serialized between Crash and fallback evidence")
         if (futex_slice_passes != 1 || post_futex_attempts == 0)
             fail("missing Stage 6B.1 boundary or post-6B.1 increasing fallback evidence")
         if (base_pick_tick < base_crash_tick || base_reported_delta != base_pick_tick - base_crash_tick)
