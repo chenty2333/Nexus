@@ -140,6 +140,80 @@ impl OperationClass {
     }
 }
 
+/// Immutable hardware identity captured before a device-backed effect can be
+/// prepared or published.
+///
+/// This is descriptive identity owned by the production registry, not a
+/// second authority namespace.  The opaque [`PortalHandle`] and a
+/// [`KernelRootAuthority`] still authorize every transition.  In particular,
+/// a device adapter cannot replace the workload effect by presenting matching
+/// integers from another registry, root, or session.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct DeviceEnvelope {
+    device_session: u64,
+    queue: u16,
+    descriptor_token: u16,
+    device_generation: u64,
+}
+
+impl DeviceEnvelope {
+    pub(crate) fn new(
+        device_session: u64,
+        queue: u16,
+        descriptor_token: u16,
+        device_generation: u64,
+    ) -> Result<Self, RegistryError> {
+        if device_session == 0 || device_generation == 0 {
+            return Err(RegistryError::InvalidDeviceEnvelope);
+        }
+        Ok(Self {
+            device_session,
+            queue,
+            descriptor_token,
+            device_generation,
+        })
+    }
+
+    pub(crate) const fn device_session(self) -> u64 {
+        self.device_session
+    }
+
+    pub(crate) const fn queue(self) -> u16 {
+        self.queue
+    }
+
+    pub(crate) const fn descriptor_token(self) -> u16 {
+        self.descriptor_token
+    }
+
+    pub(crate) const fn device_generation(self) -> u64 {
+        self.device_generation
+    }
+
+    fn validate(self) -> Result<(), RegistryError> {
+        if self.device_session == 0 || self.device_generation == 0 {
+            return Err(RegistryError::InvalidDeviceEnvelope);
+        }
+        Ok(())
+    }
+
+    fn same_device_except_generation(self, other: Self) -> bool {
+        self.device_session == other.device_session
+            && self.queue == other.queue
+            && self.descriptor_token == other.descriptor_token
+    }
+
+    fn next_generation(self) -> Result<Self, RegistryError> {
+        Ok(Self {
+            device_generation: self
+                .device_generation
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?,
+            ..self
+        })
+    }
+}
+
 /// A kernel-owned snapshot of the Linux syscall number and all six arguments.
 ///
 /// The descriptor is copied out for inspection but has no mutating API.  A
@@ -231,6 +305,7 @@ struct CreditBalance {
     free: u64,
     held: u64,
     committed: u64,
+    retained: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -252,6 +327,7 @@ impl CreditLedger {
                     free: limit.units,
                     held: 0,
                     committed: 0,
+                    retained: 0,
                 },
             );
         }
@@ -280,24 +356,82 @@ impl CreditLedger {
     }
 
     fn commit(&mut self, charges: &[CreditCharge]) -> Result<(), RegistryError> {
+        self.validate_commit(charges)?;
+        self.commit_validated(charges);
+        Ok(())
+    }
+
+    fn validate_commit(&self, charges: &[CreditCharge]) -> Result<(), RegistryError> {
         for charge in charges {
             let balance = self
                 .balances
                 .get(&charge.class)
                 .ok_or(RegistryError::UnknownCreditClass)?;
-            if balance.held < charge.units {
+            if charge.units == 0 || balance.held < charge.units {
                 return Err(RegistryError::InvalidState);
             }
+            balance
+                .committed
+                .checked_add(charge.units)
+                .ok_or(RegistryError::CounterOverflow)?;
         }
+        Ok(())
+    }
+
+    fn commit_validated(&mut self, charges: &[CreditCharge]) {
         for charge in charges {
             let balance = self.balances.get_mut(&charge.class).unwrap();
             balance.held -= charge.units;
             balance.committed = balance
                 .committed
                 .checked_add(charge.units)
+                .expect("validated committed-credit addition cannot overflow");
+        }
+    }
+
+    fn validate_retain(
+        &self,
+        charges: &[CreditCharge],
+        from: CreditState,
+    ) -> Result<(), RegistryError> {
+        for charge in charges {
+            let balance = self
+                .balances
+                .get(&charge.class)
+                .ok_or(RegistryError::UnknownCreditClass)?;
+            let owned = match from {
+                CreditState::Held => balance.held,
+                CreditState::Committed => balance.committed,
+                CreditState::Retained | CreditState::Released => {
+                    return Err(RegistryError::InvalidState);
+                }
+            };
+            if charge.units == 0 || owned < charge.units {
+                return Err(RegistryError::InvalidState);
+            }
+            balance
+                .retained
+                .checked_add(charge.units)
                 .ok_or(RegistryError::CounterOverflow)?;
         }
         Ok(())
+    }
+
+    fn retain_validated(&mut self, charges: &[CreditCharge], from: CreditState) {
+        for charge in charges {
+            let balance = self.balances.get_mut(&charge.class).unwrap();
+            match from {
+                CreditState::Held => balance.held -= charge.units,
+                CreditState::Committed => balance.committed -= charge.units,
+                CreditState::Retained | CreditState::Released => {
+                    unreachable!("retention source was prevalidated")
+                }
+            }
+            balance.retained = balance
+                .retained
+                .checked_add(charge.units)
+                .expect("validated retained-credit addition cannot overflow");
+        }
     }
 
     fn release(
@@ -313,6 +447,7 @@ impl CreditLedger {
             let owned = match state {
                 CreditState::Held => balance.held,
                 CreditState::Committed => balance.committed,
+                CreditState::Retained => balance.retained,
                 CreditState::Released => return Err(RegistryError::InvalidState),
             };
             if owned < charge.units {
@@ -331,6 +466,7 @@ impl CreditLedger {
             match state {
                 CreditState::Held => balance.held -= charge.units,
                 CreditState::Committed => balance.committed -= charge.units,
+                CreditState::Retained => balance.retained -= charge.units,
                 CreditState::Released => unreachable!(),
             }
             balance.free = balance
@@ -343,7 +479,10 @@ impl CreditLedger {
 
     fn is_idle(&self) -> bool {
         self.balances.values().all(|balance| {
-            balance.free == balance.capacity && balance.held == 0 && balance.committed == 0
+            balance.free == balance.capacity
+                && balance.held == 0
+                && balance.committed == 0
+                && balance.retained == 0
         })
     }
 
@@ -354,12 +493,14 @@ impl CreditLedger {
                 free: 0,
                 held: 0,
                 committed: 0,
+                retained: 0,
             },
             |mut totals, balance| {
                 totals.capacity += balance.capacity;
                 totals.free += balance.free;
                 totals.held += balance.held;
                 totals.committed += balance.committed;
+                totals.retained += balance.retained;
                 totals
             },
         )
@@ -372,12 +513,14 @@ pub(crate) struct CreditTotals {
     pub(crate) free: u64,
     pub(crate) held: u64,
     pub(crate) committed: u64,
+    pub(crate) retained: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreditState {
     Held,
     Committed,
+    Retained,
     Released,
 }
 
@@ -391,6 +534,7 @@ pub(crate) enum ScopePhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalOutcome {
     Completed,
+    IndeterminateAfterReset,
     Aborted,
 }
 
@@ -425,6 +569,7 @@ pub(crate) struct EffectIdentity {
     authority_epoch: u64,
     origin_binding_epoch: u64,
     binding_epoch: u64,
+    device: Option<DeviceEnvelope>,
     resources: BTreeSet<ResourceKey>,
 }
 
@@ -463,6 +608,10 @@ impl EffectIdentity {
 
     pub(crate) const fn origin_binding_epoch(&self) -> u64 {
         self.origin_binding_epoch
+    }
+
+    pub(crate) const fn device_envelope(&self) -> Option<DeviceEnvelope> {
+        self.device
     }
 
     pub(crate) fn resources(&self) -> &BTreeSet<ResourceKey> {
@@ -566,6 +715,280 @@ pub(crate) enum CommitOutcome {
     AlreadyCommitted(CommitReceipt),
 }
 
+/// Opaque kernel authority for one active root.
+///
+/// Domain supervisors cannot construct this value.  It permits a single
+/// root-gated device publication to validate effects from several service
+/// domains without pretending that one domain supervisor owns another
+/// domain's portal handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KernelRootAuthority {
+    registry_instance_id: u64,
+    scope: ScopeKey,
+    authority_epoch: u64,
+    owner: TaskKey,
+}
+
+impl KernelRootAuthority {
+    pub(crate) const fn scope(self) -> ScopeKey {
+        self.scope
+    }
+
+    pub(crate) const fn authority_epoch(self) -> u64 {
+        self.authority_epoch
+    }
+}
+
+/// Receipt for one root-wide publication batch whose hardware commit point is
+/// supplied by the caller's infallible closure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceBatchCommitReceipt {
+    registry_instance_id: u64,
+    scope: ScopeKey,
+    authority_epoch: u64,
+    batch_sequence: u64,
+    device: DeviceEnvelope,
+    commits: Vec<CommitReceipt>,
+    device_effects: Vec<EffectKey>,
+}
+
+/// Freezes the exact live root cohort that is permitted to cross one device
+/// publication point. Registration may continue while a scope is merely
+/// device-backed, but no generic commit is permitted once any device effect
+/// exists, and no registration is permitted after this receipt is minted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceBatchEnrollmentReceipt {
+    registry_instance_id: u64,
+    scope: ScopeKey,
+    authority_epoch: u64,
+    enrollment_sequence: u64,
+    device: DeviceEnvelope,
+    effects: Vec<EffectKey>,
+    cancel_only: bool,
+}
+
+impl DeviceBatchEnrollmentReceipt {
+    pub(crate) const fn scope(&self) -> ScopeKey {
+        self.scope
+    }
+
+    pub(crate) const fn enrollment_sequence(&self) -> u64 {
+        self.enrollment_sequence
+    }
+
+    pub(crate) const fn device(&self) -> DeviceEnvelope {
+        self.device
+    }
+
+    pub(crate) fn effects(&self) -> &[EffectKey] {
+        &self.effects
+    }
+
+    pub(crate) const fn cancel_only(&self) -> bool {
+        self.cancel_only
+    }
+}
+
+impl DeviceBatchCommitReceipt {
+    pub(crate) const fn registry_instance_id(&self) -> u64 {
+        self.registry_instance_id
+    }
+
+    pub(crate) const fn scope(&self) -> ScopeKey {
+        self.scope
+    }
+
+    pub(crate) const fn authority_epoch(&self) -> u64 {
+        self.authority_epoch
+    }
+
+    pub(crate) const fn batch_sequence(&self) -> u64 {
+        self.batch_sequence
+    }
+
+    pub(crate) const fn device(&self) -> DeviceEnvelope {
+        self.device
+    }
+
+    pub(crate) fn commits(&self) -> &[CommitReceipt] {
+        &self.commits
+    }
+
+    pub(crate) fn device_effects(&self) -> &[EffectKey] {
+        &self.device_effects
+    }
+
+    pub(crate) fn commit_for(&self, effect: EffectKey) -> Option<&CommitReceipt> {
+        self.commits.iter().find(|receipt| receipt.effect == effect)
+    }
+
+    pub(crate) fn failure_atomic_projection(&self) -> Self {
+        let mut projected = self.clone();
+        projected.registry_instance_id = 1;
+        for commit in &mut projected.commits {
+            commit.registry_instance_id = 1;
+        }
+        projected
+    }
+}
+
+/// A full replay returns the authoritative receipt without executing the
+/// publication closure a second time.
+#[derive(Debug)]
+pub(crate) enum DeviceBatchCommitOutcome<T> {
+    Applied {
+        receipt: DeviceBatchCommitReceipt,
+        publication: T,
+    },
+    AlreadyCommitted {
+        receipt: DeviceBatchCommitReceipt,
+    },
+}
+
+impl<T> DeviceBatchCommitOutcome<T> {
+    pub(crate) const fn receipt(&self) -> &DeviceBatchCommitReceipt {
+        match self {
+            Self::Applied { receipt, .. } | Self::AlreadyCommitted { receipt } => receipt,
+        }
+    }
+}
+
+/// Honest backend result retained through reset and IOTLB closure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceClosureResult {
+    Completed(i64),
+    IndeterminateAfterReset,
+    AbortedBeforeCommit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceCompletionReceipt {
+    registry_instance_id: u64,
+    scope: ScopeKey,
+    batch_sequence: u64,
+    device: DeviceEnvelope,
+    sequence: u64,
+    result: i64,
+}
+
+impl DeviceCompletionReceipt {
+    pub(crate) const fn device(self) -> DeviceEnvelope {
+        self.device
+    }
+
+    pub(crate) const fn result(self) -> i64 {
+        self.result
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceResetTicket {
+    registry_instance_id: u64,
+    scope: ScopeKey,
+    enrollment_sequence: u64,
+    batch_sequence: Option<u64>,
+    device: DeviceEnvelope,
+    sequence: u64,
+}
+
+impl DeviceResetTicket {
+    pub(crate) const fn device(self) -> DeviceEnvelope {
+        self.device
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceResetTombstone {
+    ticket: DeviceResetTicket,
+    sequence: u64,
+}
+
+impl DeviceResetTombstone {
+    pub(crate) const fn device(self) -> DeviceEnvelope {
+        self.ticket.device
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceResetReceipt {
+    registry_instance_id: u64,
+    scope: ScopeKey,
+    enrollment_sequence: u64,
+    batch_sequence: Option<u64>,
+    old_device: DeviceEnvelope,
+    new_device: DeviceEnvelope,
+    sequence: u64,
+    outcome: DeviceClosureResult,
+}
+
+impl DeviceResetReceipt {
+    pub(crate) const fn old_device(self) -> DeviceEnvelope {
+        self.old_device
+    }
+
+    pub(crate) const fn new_device(self) -> DeviceEnvelope {
+        self.new_device
+    }
+
+    pub(crate) const fn outcome(self) -> DeviceClosureResult {
+        self.outcome
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceIotlbTicket {
+    registry_instance_id: u64,
+    scope: ScopeKey,
+    enrollment_sequence: u64,
+    batch_sequence: Option<u64>,
+    device: DeviceEnvelope,
+    reset_sequence: u64,
+    sequence: u64,
+}
+
+impl DeviceIotlbTicket {
+    pub(crate) const fn device(self) -> DeviceEnvelope {
+        self.device
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceIotlbTombstone {
+    ticket: DeviceIotlbTicket,
+    sequence: u64,
+}
+
+impl DeviceIotlbTombstone {
+    pub(crate) const fn device(self) -> DeviceEnvelope {
+        self.ticket.device
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceClosureReceipt {
+    registry_instance_id: u64,
+    scope: ScopeKey,
+    enrollment_sequence: u64,
+    batch_sequence: Option<u64>,
+    device: DeviceEnvelope,
+    sequence: u64,
+    outcome: DeviceClosureResult,
+}
+
+impl DeviceClosureReceipt {
+    pub(crate) const fn device(self) -> DeviceEnvelope {
+        self.device
+    }
+
+    pub(crate) const fn outcome(self) -> DeviceClosureResult {
+        self.outcome
+    }
+
+    pub(crate) const fn published(self) -> bool {
+        self.batch_sequence.is_some()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TerminalRequest {
     outcome: TerminalOutcome,
@@ -595,6 +1018,14 @@ impl TerminalRequest {
             outcome: TerminalOutcome::Completed,
             result,
             causal_commit: Some(causal_commit),
+        }
+    }
+
+    pub(crate) const fn indeterminate_after_reset(result: i64) -> Self {
+        Self {
+            outcome: TerminalOutcome::IndeterminateAfterReset,
+            result,
+            causal_commit: None,
         }
     }
 }
@@ -682,6 +1113,14 @@ pub(crate) struct DerivedRegisterRequest {
     pub(crate) parent: Option<EffectKey>,
 }
 
+/// Registers a derived effect whose immutable identity is tied to one exact
+/// device session, queue, descriptor token, and device generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceDerivedRegisterRequest {
+    pub(crate) derived: DerivedRegisterRequest,
+    pub(crate) device: DeviceEnvelope,
+}
+
 /// One failure-atomic update of an effect's current resource membership.
 ///
 /// `handle` authenticates the complete immutable effect identity. Only the
@@ -741,10 +1180,115 @@ struct EffectRecord {
     credit_state: CreditState,
     publication_mode: PublicationMode,
     commit: Option<CommitReceipt>,
+    device_batch: Option<DeviceBatchMembership>,
     terminal: Option<TerminalReceipt>,
     pending_publication: Option<PublicationTicket>,
     terminalizations: u8,
     publication_acks: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeviceBatchMembership {
+    sequence: u64,
+    ordinal: usize,
+    size: usize,
+    device: DeviceEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeviceRootState {
+    initial_device: DeviceEnvelope,
+    current_device: DeviceEnvelope,
+    enrollment: Option<DeviceBatchEnrollmentReceipt>,
+    batch_sequence: Option<u64>,
+    completion: Option<DeviceCompletionReceipt>,
+    outcome: Option<DeviceClosureResult>,
+    reset_ticket: Option<DeviceResetTicket>,
+    reset_tombstone: Option<DeviceResetTombstone>,
+    reset_retry_issued: bool,
+    reset_receipt: Option<DeviceResetReceipt>,
+    iotlb_ticket: Option<DeviceIotlbTicket>,
+    iotlb_tombstone: Option<DeviceIotlbTombstone>,
+    iotlb_retry_issued: bool,
+    closure: Option<DeviceClosureReceipt>,
+}
+
+impl DeviceRootState {
+    const fn pending(device: DeviceEnvelope) -> Self {
+        Self {
+            initial_device: device,
+            current_device: device,
+            enrollment: None,
+            batch_sequence: None,
+            completion: None,
+            outcome: None,
+            reset_ticket: None,
+            reset_tombstone: None,
+            reset_retry_issued: false,
+            reset_receipt: None,
+            iotlb_ticket: None,
+            iotlb_tombstone: None,
+            iotlb_retry_issued: false,
+            closure: None,
+        }
+    }
+
+    fn rewrite_registry_instance(&mut self, registry_instance_id: u64) {
+        if let Some(enrollment) = self.enrollment.as_mut() {
+            enrollment.registry_instance_id = registry_instance_id;
+        }
+        if let Some(completion) = self.completion.as_mut() {
+            completion.registry_instance_id = registry_instance_id;
+        }
+        if let Some(ticket) = self.reset_ticket.as_mut() {
+            ticket.registry_instance_id = registry_instance_id;
+        }
+        if let Some(tombstone) = self.reset_tombstone.as_mut() {
+            tombstone.ticket.registry_instance_id = registry_instance_id;
+        }
+        if let Some(receipt) = self.reset_receipt.as_mut() {
+            receipt.registry_instance_id = registry_instance_id;
+        }
+        if let Some(ticket) = self.iotlb_ticket.as_mut() {
+            ticket.registry_instance_id = registry_instance_id;
+        }
+        if let Some(tombstone) = self.iotlb_tombstone.as_mut() {
+            tombstone.ticket.registry_instance_id = registry_instance_id;
+        }
+        if let Some(receipt) = self.closure.as_mut() {
+            receipt.registry_instance_id = registry_instance_id;
+        }
+    }
+}
+
+struct DeviceBatchApplyPlan {
+    receipt: DeviceBatchCommitReceipt,
+    charges: Vec<CreditCharge>,
+    next_commit_sequence: u64,
+    next_device_batch_sequence: u64,
+    next_scope_revision: u64,
+}
+
+struct DeviceResetApplyPlan {
+    receipt: DeviceResetReceipt,
+    next_device_closure_sequence: u64,
+    next_scope_revision: u64,
+}
+
+struct DeviceIotlbApplyPlan {
+    receipt: DeviceClosureReceipt,
+    next_device_closure_sequence: u64,
+    next_scope_revision: u64,
+}
+
+struct DeviceRetentionPlan {
+    charges: Vec<CreditCharge>,
+    from: CreditState,
+}
+
+enum PreparedDeviceBatch {
+    Apply(DeviceBatchApplyPlan),
+    Replay(DeviceBatchCommitReceipt),
 }
 
 impl EffectRecord {
@@ -861,6 +1405,7 @@ struct ScopeRecord {
     recovery: Option<RecoveryState>,
     domains: BTreeMap<DomainKey, DomainBindingRecord>,
     revoke: Option<RevokeState>,
+    device_root: Option<DeviceRootState>,
 }
 
 #[derive(Default)]
@@ -1055,6 +1600,11 @@ pub(crate) enum RegistryError {
     LiveDescendants,
     AlreadyTerminal,
     CommitConflict,
+    InvalidDeviceEnvelope,
+    StaleDeviceGeneration,
+    InvalidBatchReceipt,
+    DeviceBatchNotEnrolled,
+    DeviceClosurePending,
     InvalidRevokeSelection,
     InvalidPublication,
     PublicationPending,
@@ -1062,7 +1612,7 @@ pub(crate) enum RegistryError {
     Invariant(&'static str),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct EffectRegistry {
     instance_id: u64,
     scopes: BTreeMap<ScopeKey, Box<ScopeRecord>>,
@@ -1074,6 +1624,9 @@ pub(crate) struct EffectRegistry {
     next_effect_id: u64,
     next_nonce: u64,
     next_commit_sequence: u64,
+    next_device_enrollment_sequence: u64,
+    next_device_batch_sequence: u64,
+    next_device_closure_sequence: u64,
     next_terminal_sequence: u64,
     next_publication_sequence: u64,
     next_revoke_sequence: u64,
@@ -1092,9 +1645,37 @@ impl EffectRegistry {
             next_effect_id: 1,
             next_nonce: 1,
             next_commit_sequence: 1,
+            next_device_enrollment_sequence: 1,
+            next_device_batch_sequence: 1,
+            next_device_closure_sequence: 1,
             next_terminal_sequence: 1,
             next_publication_sequence: 1,
             next_revoke_sequence: 1,
+        }
+    }
+
+    /// Private evidence snapshot. `EffectRegistry` deliberately does not
+    /// implement `Clone`: a production caller cannot duplicate the registry
+    /// instance namespace and publish twice with copied authority. Only code
+    /// in this module can take a read-only/failure-atomic test snapshot.
+    fn clone(&self) -> Self {
+        Self {
+            instance_id: self.instance_id,
+            scopes: self.scopes.clone(),
+            effects: self.effects.clone(),
+            by_scope: self.by_scope.clone(),
+            by_task: self.by_task.clone(),
+            by_resource: self.by_resource.clone(),
+            production: self.production.clone(),
+            next_effect_id: self.next_effect_id,
+            next_nonce: self.next_nonce,
+            next_commit_sequence: self.next_commit_sequence,
+            next_device_enrollment_sequence: self.next_device_enrollment_sequence,
+            next_device_batch_sequence: self.next_device_batch_sequence,
+            next_device_closure_sequence: self.next_device_closure_sequence,
+            next_terminal_sequence: self.next_terminal_sequence,
+            next_publication_sequence: self.next_publication_sequence,
+            next_revoke_sequence: self.next_revoke_sequence,
         }
     }
 
@@ -1119,6 +1700,11 @@ impl EffectRegistry {
     fn rewrite_registry_instance(&mut self, registry_instance_id: u64) {
         assert_ne!(registry_instance_id, 0);
         self.instance_id = registry_instance_id;
+        for scope in self.scopes.values_mut() {
+            if let Some(device_root) = scope.device_root.as_mut() {
+                device_root.rewrite_registry_instance(registry_instance_id);
+            }
+        }
         for record in self.effects.values_mut() {
             if let Some(commit) = record.commit.as_mut() {
                 commit.registry_instance_id = registry_instance_id;
@@ -1169,6 +1755,7 @@ impl EffectRegistry {
                 recovery: None,
                 domains,
                 revoke: None,
+                device_root: None,
             }),
         );
         Ok(())
@@ -1243,11 +1830,38 @@ impl EffectRegistry {
         })
     }
 
+    /// Mints the kernel-only authority used to linearize one root-wide device
+    /// publication. Service-domain supervisors continue to use their opaque
+    /// portal handles and cannot use this token to act on a different root or
+    /// registry instance.
+    pub(crate) fn kernel_root_authority(
+        &self,
+        scope_key: ScopeKey,
+        owner: TaskKey,
+    ) -> Result<KernelRootAuthority, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        if scope.supervisor != Some(owner) || scope.fallback_running {
+            return Err(RegistryError::NoSupervisor);
+        }
+        Ok(KernelRootAuthority {
+            registry_instance_id: self.instance_id,
+            scope: scope_key,
+            authority_epoch: scope.authority_epoch,
+            owner,
+        })
+    }
+
     pub(crate) fn register(
         &mut self,
         request: RegisterRequest,
     ) -> Result<RegisteredEffect, RegistryError> {
-        self.register_in_domain(request, DomainKey::LEGACY, None)
+        self.register_in_domain(request, DomainKey::LEGACY, None, None)
     }
 
     pub(crate) fn register_derived(
@@ -1257,7 +1871,23 @@ impl EffectRegistry {
         if request.domain == DomainKey::LEGACY {
             return Err(RegistryError::InvalidState);
         }
-        self.register_in_domain(request.request, request.domain, request.parent)
+        self.register_in_domain(request.request, request.domain, request.parent, None)
+    }
+
+    pub(crate) fn register_device_derived(
+        &mut self,
+        request: DeviceDerivedRegisterRequest,
+    ) -> Result<RegisteredEffect, RegistryError> {
+        if request.derived.domain == DomainKey::LEGACY {
+            return Err(RegistryError::InvalidState);
+        }
+        request.device.validate()?;
+        self.register_in_domain(
+            request.derived.request,
+            request.derived.domain,
+            request.derived.parent,
+            Some(request.device),
+        )
     }
 
     fn register_in_domain(
@@ -1265,6 +1895,7 @@ impl EffectRegistry {
         request: RegisterRequest,
         domain: DomainKey,
         parent: Option<EffectKey>,
+        device: Option<DeviceEnvelope>,
     ) -> Result<RegisteredEffect, RegistryError> {
         validate_generation(request.scope.generation)?;
         validate_generation(request.task.generation)?;
@@ -1287,6 +1918,44 @@ impl EffectRegistry {
                 .ok_or(RegistryError::UnknownDomain)?;
             if binding.supervisor.is_none() || binding.fallback_running {
                 return Err(RegistryError::NoSupervisor);
+            }
+            if scope
+                .device_root
+                .as_ref()
+                .is_some_and(|root| root.enrollment.is_some())
+            {
+                return Err(RegistryError::InvalidState);
+            }
+            if scope.device_root.is_some() && parent.is_none() {
+                return Err(RegistryError::InvalidState);
+            }
+            if device.is_some() && scope.device_root.is_none() {
+                let live = self.by_scope.get(&request.scope);
+                let root_count = live.map_or(0, |effects| {
+                    effects
+                        .iter()
+                        .filter(|effect| self.effects[effect].identity.parent.is_none())
+                        .count()
+                });
+                if live.is_some_and(|effects| !effects.is_empty())
+                    && (parent.is_none() || root_count != 1)
+                {
+                    return Err(RegistryError::InvalidState);
+                }
+            }
+            if let (Some(device), Some(root)) = (device, scope.device_root.as_ref())
+                && device != root.initial_device
+            {
+                return Err(device_envelope_mismatch(root.initial_device, device));
+            }
+            if device.is_some()
+                && scope.device_root.is_none()
+                && self.effects.values().any(|record| {
+                    record.identity.scope == request.scope
+                        && (record.commit.is_some() || record.phase.is_terminal())
+                })
+            {
+                return Err(RegistryError::InvalidState);
             }
             let next_scope_revision = scope
                 .revision
@@ -1317,6 +1986,19 @@ impl EffectRegistry {
             if record.identity.binding_epoch != parent_binding.binding_epoch {
                 return Err(RegistryError::StaleBinding);
             }
+            if device.is_some() {
+                let mut ancestor = Some(parent);
+                while let Some(effect) = ancestor {
+                    let record = self
+                        .effects
+                        .get(&effect)
+                        .ok_or(RegistryError::UnknownEffect)?;
+                    if record.commit.is_some() || record.phase.is_terminal() {
+                        return Err(RegistryError::InvalidState);
+                    }
+                    ancestor = record.identity.parent;
+                }
+            }
         }
 
         let effect_id = self.next_effect_id;
@@ -1344,6 +2026,7 @@ impl EffectRegistry {
             authority_epoch,
             origin_binding_epoch: binding_epoch,
             binding_epoch,
+            device,
             resources,
         };
         let record = EffectRecord {
@@ -1356,6 +2039,7 @@ impl EffectRegistry {
             credit_state: CreditState::Held,
             publication_mode: request.publication,
             commit: None,
+            device_batch: None,
             terminal: None,
             pending_publication: None,
             terminalizations: 0,
@@ -1365,6 +2049,11 @@ impl EffectRegistry {
         self.insert_reverse_indexes(&record.identity, &record.current_resources);
         self.effects.insert(effect, record);
         let scope = self.scopes.get_mut(&request.scope).unwrap();
+        if let Some(device) = device
+            && scope.device_root.is_none()
+        {
+            scope.device_root = Some(DeviceRootState::pending(device));
+        }
         scope.revision = next_scope_revision;
         scope.invalidate_recovery_readiness();
         Ok(RegisteredEffect { identity, handle })
@@ -1486,6 +2175,14 @@ impl EffectRegistry {
                 return Err(RegistryError::InvalidState);
             }
             let record = self.effects.get(&effect).unwrap();
+            if self.scopes[&record.identity.scope].device_root.is_some() {
+                // Once any device-derived effect exists, every ancestor and
+                // descendant in this root is reserved for explicit cohort
+                // enrollment and the single hardware publication gate. This
+                // prevents a non-device ancestor from becoming a partial
+                // authoritative commit before `avail.idx` is published.
+                return Err(RegistryError::InvalidDeviceEnvelope);
+            }
             match scope_key {
                 None => scope_key = Some(record.identity.scope),
                 Some(scope) if scope != record.identity.scope => {
@@ -1601,6 +2298,1349 @@ impl EffectRegistry {
         scope.revision = next_scope_revision;
         scope.invalidate_recovery_readiness();
         Ok(receipts.into_iter().map(CommitOutcome::Applied).collect())
+    }
+
+    /// Freezes one complete prepared root before any hardware-visible commit.
+    ///
+    /// The enrollment is explicit and root-gated. It covers every live effect
+    /// in the scope, fixes their order, requires exactly one causal root and at
+    /// least one device-derived member, and prevents later registration or a
+    /// generic per-domain commit from splitting the cohort.
+    pub(crate) fn enroll_device_batch(
+        &mut self,
+        authority: KernelRootAuthority,
+        handles: &[PortalHandle],
+        expected_device: DeviceEnvelope,
+    ) -> Result<DeviceBatchEnrollmentReceipt, RegistryError> {
+        self.validate_kernel_root_authority(authority)?;
+        expected_device.validate()?;
+        if handles.is_empty() {
+            return Err(RegistryError::InvalidState);
+        }
+        let root_state = self.scopes[&authority.scope]
+            .device_root
+            .as_ref()
+            .ok_or(RegistryError::DeviceBatchNotEnrolled)?;
+        if root_state.initial_device != expected_device {
+            return Err(device_envelope_mismatch(
+                root_state.initial_device,
+                expected_device,
+            ));
+        }
+        if root_state.enrollment.is_some() || root_state.batch_sequence.is_some() {
+            return Err(RegistryError::InvalidState);
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut effects = Vec::with_capacity(handles.len());
+        let mut root_count = 0_usize;
+        let mut device_count = 0_usize;
+        for handle in handles {
+            let effect = self.validate_root_portal(authority, *handle)?;
+            if !seen.insert(effect) {
+                return Err(RegistryError::InvalidState);
+            }
+            let record = &self.effects[&effect];
+            if record.phase != EffectPhase::Prepared
+                || record.credit_state != CreditState::Held
+                || record.commit.is_some()
+                || record.device_batch.is_some()
+            {
+                return Err(RegistryError::InvalidState);
+            }
+            if record.identity.parent.is_none() {
+                root_count = root_count
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+            }
+            if let Some(device) = record.identity.device {
+                if device != expected_device {
+                    return Err(device_envelope_mismatch(expected_device, device));
+                }
+                device_count = device_count
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+            }
+            effects.push(effect);
+        }
+        let live = self
+            .by_scope
+            .get(&authority.scope)
+            .ok_or(RegistryError::InvalidState)?;
+        if live != &seen || root_count != 1 || device_count == 0 {
+            return Err(RegistryError::InvalidState);
+        }
+        for effect in &seen {
+            if let Some(parent) = self.effects[effect].identity.parent
+                && !seen.contains(&parent)
+            {
+                return Err(RegistryError::InvalidHandle);
+            }
+        }
+
+        let enrollment_sequence = self.next_device_enrollment_sequence;
+        let next_device_enrollment_sequence = enrollment_sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_scope_revision = self.scopes[&authority.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let receipt = DeviceBatchEnrollmentReceipt {
+            registry_instance_id: self.instance_id,
+            scope: authority.scope,
+            authority_epoch: authority.authority_epoch,
+            enrollment_sequence,
+            device: expected_device,
+            effects,
+            cancel_only: false,
+        };
+
+        // The receipt and every potentially fallible counter were prepared
+        // before this point; freezing the scope is now infallible.
+        self.next_device_enrollment_sequence = next_device_enrollment_sequence;
+        let scope = self.scopes.get_mut(&authority.scope).unwrap();
+        scope.device_root.as_mut().unwrap().enrollment = Some(receipt.clone());
+        scope.revision = next_scope_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(receipt)
+    }
+
+    /// Emergency, cancellation-only freeze when revocation wins after device
+    /// preparation created `device_root` but before normal enrollment. It can
+    /// never authorize publication. Registered and Prepared members are both
+    /// conservatively retained; disconnected/multi-root or otherwise
+    /// inconsistent live state remains fail closed with credits untouched.
+    pub(crate) fn freeze_pending_device_cancel(
+        &mut self,
+        scope_key: ScopeKey,
+    ) -> Result<DeviceBatchEnrollmentReceipt, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        let root = scope
+            .device_root
+            .as_ref()
+            .ok_or(RegistryError::DeviceBatchNotEnrolled)?;
+        if scope.phase != ScopePhase::Closing
+            || root.enrollment.is_some()
+            || root.batch_sequence.is_some()
+        {
+            return Err(RegistryError::InvalidState);
+        }
+        let closed_authority_epoch = scope
+            .revoke
+            .as_ref()
+            .ok_or(RegistryError::InvalidRevokeSelection)?
+            .closed_authority_epoch;
+        let live = self
+            .by_scope
+            .get(&scope_key)
+            .ok_or(RegistryError::InvalidState)?;
+        if live.is_empty() {
+            return Err(RegistryError::InvalidState);
+        }
+        let mut roots = 0_usize;
+        let mut device_count = 0_usize;
+        let mut effects = Vec::with_capacity(live.len());
+        for effect in live {
+            let record = &self.effects[effect];
+            if record.identity.scope != scope_key
+                || record.identity.authority_epoch != closed_authority_epoch
+                || !matches!(
+                    record.phase,
+                    EffectPhase::Registered | EffectPhase::Prepared
+                )
+                || record.credit_state != CreditState::Held
+                || record.commit.is_some()
+                || record.device_batch.is_some()
+            {
+                return Err(RegistryError::InvalidState);
+            }
+            if record.identity.parent.is_none() {
+                roots = roots.checked_add(1).ok_or(RegistryError::CounterOverflow)?;
+            } else if record
+                .identity
+                .parent
+                .is_some_and(|parent| !live.contains(&parent))
+            {
+                return Err(RegistryError::InvalidHandle);
+            }
+            if let Some(device) = record.identity.device {
+                if device != root.initial_device {
+                    return Err(device_envelope_mismatch(root.initial_device, device));
+                }
+                device_count = device_count
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+            }
+            effects.push(*effect);
+        }
+        if roots != 1 || device_count == 0 {
+            return Err(RegistryError::InvalidState);
+        }
+        let enrollment_sequence = self.next_device_enrollment_sequence;
+        let next_device_enrollment_sequence = enrollment_sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = scope
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let receipt = DeviceBatchEnrollmentReceipt {
+            registry_instance_id: self.instance_id,
+            scope: scope_key,
+            authority_epoch: closed_authority_epoch,
+            enrollment_sequence,
+            device: root.initial_device,
+            effects,
+            cancel_only: true,
+        };
+        self.next_device_enrollment_sequence = next_device_enrollment_sequence;
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        scope.device_root.as_mut().unwrap().enrollment = Some(receipt.clone());
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(receipt)
+    }
+
+    /// Commits one complete production root at the caller-supplied hardware
+    /// publication point.
+    ///
+    /// The caller must already hold the root runtime lock which also excludes
+    /// `revoke_begin`. This method validates every root, binding, effect,
+    /// ancestry, credit, counter, and device field and allocates the complete
+    /// receipt before invoking `publish`. The closure is deliberately
+    /// infallible: the production VirtIO typestate performs descriptor/DMA
+    /// preparation first and uses the closure only for the single
+    /// `avail.idx` Release. Once it returns, applying the prevalidated plan
+    /// performs no allocation and has no error path. A full replay returns the
+    /// stored authoritative receipt without invoking `publish` again.
+    pub(crate) fn commit_device_batch_with_publish<T>(
+        &mut self,
+        authority: KernelRootAuthority,
+        enrollment: &DeviceBatchEnrollmentReceipt,
+        commits: &[(PortalHandle, CommitMetadata)],
+        publish: impl FnOnce(&DeviceBatchCommitReceipt) -> T,
+    ) -> Result<DeviceBatchCommitOutcome<T>, RegistryError> {
+        match self.prepare_device_batch(authority, enrollment, commits)? {
+            PreparedDeviceBatch::Replay(receipt) => {
+                Ok(DeviceBatchCommitOutcome::AlreadyCommitted { receipt })
+            }
+            PreparedDeviceBatch::Apply(plan) => {
+                let publication = publish(&plan.receipt);
+                let receipt = self.apply_device_batch(plan);
+                Ok(DeviceBatchCommitOutcome::Applied {
+                    receipt,
+                    publication,
+                })
+            }
+        }
+    }
+
+    /// Validates a completion/reset receipt against the authoritative batch
+    /// after publication. This deliberately remains usable while the root is
+    /// Closing: post-commit device ownership must be drained or retained, not
+    /// erased merely because `revoke_begin` advanced the authority epoch.
+    pub(crate) fn validate_device_batch_receipt(
+        &self,
+        presented: &DeviceBatchCommitReceipt,
+    ) -> Result<(), RegistryError> {
+        if presented.registry_instance_id != self.instance_id {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        presented.device.validate()?;
+        let authoritative =
+            self.reconstruct_device_batch_receipt(presented.scope, presented.batch_sequence)?;
+        if presented.device != authoritative.device {
+            return Err(device_envelope_mismatch(
+                authoritative.device,
+                presented.device,
+            ));
+        }
+        let root = self
+            .scopes
+            .get(&presented.scope)
+            .and_then(|scope| scope.device_root.as_ref())
+            .ok_or(RegistryError::InvalidBatchReceipt)?;
+        if root.batch_sequence != Some(presented.batch_sequence)
+            || root.initial_device != presented.device
+            || root.enrollment.as_ref().is_none_or(|enrollment| {
+                enrollment.effects
+                    != authoritative
+                        .commits
+                        .iter()
+                        .map(|commit| commit.effect)
+                        .collect::<Vec<_>>()
+            })
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        if presented != &authoritative {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        Ok(())
+    }
+
+    fn validate_device_enrollment_receipt(
+        &self,
+        presented: &DeviceBatchEnrollmentReceipt,
+    ) -> Result<&DeviceRootState, RegistryError> {
+        if presented.registry_instance_id != self.instance_id || presented.enrollment_sequence == 0
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let root = self
+            .scopes
+            .get(&presented.scope)
+            .and_then(|scope| scope.device_root.as_ref())
+            .ok_or(RegistryError::InvalidBatchReceipt)?;
+        if presented.device != root.initial_device {
+            return Err(device_envelope_mismatch(
+                root.initial_device,
+                presented.device,
+            ));
+        }
+        if root.enrollment.as_ref() != Some(presented) {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        Ok(root)
+    }
+
+    fn validate_device_closure_context(
+        &self,
+        scope: ScopeKey,
+        enrollment_sequence: u64,
+        batch_sequence: Option<u64>,
+    ) -> Result<DeviceBatchEnrollmentReceipt, RegistryError> {
+        let root = self
+            .scopes
+            .get(&scope)
+            .and_then(|scope| scope.device_root.as_ref())
+            .ok_or(RegistryError::InvalidBatchReceipt)?;
+        let enrollment = root
+            .enrollment
+            .as_ref()
+            .ok_or(RegistryError::DeviceBatchNotEnrolled)?;
+        if enrollment.enrollment_sequence != enrollment_sequence {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        self.validate_device_enrollment_receipt(enrollment)?;
+        match batch_sequence {
+            Some(sequence) => {
+                if root.batch_sequence != Some(sequence) {
+                    return Err(RegistryError::InvalidBatchReceipt);
+                }
+                let batch = self.reconstruct_device_batch_receipt(scope, sequence)?;
+                self.validate_device_batch_receipt(&batch)?;
+            }
+            None => {
+                if root.batch_sequence.is_some() {
+                    return Err(RegistryError::InvalidBatchReceipt);
+                }
+            }
+        }
+        Ok(enrollment.clone())
+    }
+
+    /// Records one backend completion only for the exact committed batch and
+    /// current device generation. Once reset begins, late completion is not a
+    /// substitute for reset/IOTLB closure.
+    pub(crate) fn record_device_completion(
+        &mut self,
+        batch: &DeviceBatchCommitReceipt,
+        presented_device: DeviceEnvelope,
+        result: i64,
+    ) -> Result<DeviceCompletionReceipt, RegistryError> {
+        self.validate_device_batch_receipt(batch)?;
+        let root = self.scopes[&batch.scope]
+            .device_root
+            .as_ref()
+            .ok_or(RegistryError::InvalidBatchReceipt)?;
+        if presented_device != root.current_device {
+            return Err(device_envelope_mismatch(
+                root.current_device,
+                presented_device,
+            ));
+        }
+        if root.completion.is_some()
+            || root.reset_ticket.is_some()
+            || root.reset_tombstone.is_some()
+            || root.reset_receipt.is_some()
+            || root.iotlb_ticket.is_some()
+            || root.iotlb_tombstone.is_some()
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::InvalidState);
+        }
+        let sequence = self.next_device_closure_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = self.scopes[&batch.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let completion = DeviceCompletionReceipt {
+            registry_instance_id: self.instance_id,
+            scope: batch.scope,
+            batch_sequence: batch.batch_sequence,
+            device: presented_device,
+            sequence,
+            result,
+        };
+        self.next_device_closure_sequence = next_sequence;
+        let scope = self.scopes.get_mut(&batch.scope).unwrap();
+        let root = scope.device_root.as_mut().unwrap();
+        root.completion = Some(completion);
+        root.outcome = Some(DeviceClosureResult::Completed(result));
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(completion)
+    }
+
+    /// Issues the exact reset attempt that must close device ownership even
+    /// after a normal backend completion.
+    pub(crate) fn begin_device_reset(
+        &mut self,
+        batch: &DeviceBatchCommitReceipt,
+    ) -> Result<DeviceResetTicket, RegistryError> {
+        self.validate_device_batch_receipt(batch)?;
+        let root = self.scopes[&batch.scope].device_root.as_ref().unwrap();
+        if root.reset_ticket.is_some()
+            || root.reset_tombstone.is_some()
+            || root.reset_receipt.is_some()
+            || root.iotlb_ticket.is_some()
+            || root.iotlb_tombstone.is_some()
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::InvalidState);
+        }
+        let sequence = self.next_device_closure_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = self.scopes[&batch.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let ticket = DeviceResetTicket {
+            registry_instance_id: self.instance_id,
+            scope: batch.scope,
+            enrollment_sequence: root
+                .enrollment
+                .as_ref()
+                .expect("committed device batch remains enrolled")
+                .enrollment_sequence,
+            batch_sequence: Some(batch.batch_sequence),
+            device: root.current_device,
+            sequence,
+        };
+        self.next_device_closure_sequence = next_sequence;
+        let scope = self.scopes.get_mut(&batch.scope).unwrap();
+        scope.device_root.as_mut().unwrap().reset_ticket = Some(ticket);
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(ticket)
+    }
+
+    /// Cancels a fully prepared but unpublished cohort after root revocation.
+    /// Prepared descriptor/DMA ownership is retained before the reset ticket
+    /// becomes visible; `Abort` cannot release it until reset and IOTLB close.
+    pub(crate) fn begin_unpublished_device_cancel(
+        &mut self,
+        enrollment: &DeviceBatchEnrollmentReceipt,
+    ) -> Result<DeviceResetTicket, RegistryError> {
+        let root = self.validate_device_enrollment_receipt(enrollment)?;
+        if self.scopes[&enrollment.scope].phase != ScopePhase::Closing
+            || root.batch_sequence.is_some()
+            || root.reset_ticket.is_some()
+            || root.reset_tombstone.is_some()
+            || root.reset_receipt.is_some()
+            || root.iotlb_ticket.is_some()
+            || root.iotlb_tombstone.is_some()
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::InvalidState);
+        }
+        let retention = self.prepare_device_root_retention(enrollment)?;
+        let sequence = self.next_device_closure_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = self.scopes[&enrollment.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let ticket = DeviceResetTicket {
+            registry_instance_id: self.instance_id,
+            scope: enrollment.scope,
+            enrollment_sequence: enrollment.enrollment_sequence,
+            batch_sequence: None,
+            device: root.current_device,
+            sequence,
+        };
+        self.apply_device_root_retention(enrollment, retention.as_ref());
+        self.next_device_closure_sequence = next_sequence;
+        let scope = self.scopes.get_mut(&enrollment.scope).unwrap();
+        let root = scope.device_root.as_mut().unwrap();
+        root.outcome = Some(DeviceClosureResult::AbortedBeforeCommit);
+        root.reset_ticket = Some(ticket);
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(ticket)
+    }
+
+    /// A reset timeout retains every cohort credit. It changes closure
+    /// progress, not an already authoritative workload result.
+    pub(crate) fn retain_device_reset_timeout(
+        &mut self,
+        ticket: &DeviceResetTicket,
+    ) -> Result<DeviceResetTombstone, RegistryError> {
+        let enrollment = self.validate_device_closure_context(
+            ticket.scope,
+            ticket.enrollment_sequence,
+            ticket.batch_sequence,
+        )?;
+        let root = self.scopes[&ticket.scope].device_root.as_ref().unwrap();
+        if ticket.registry_instance_id != self.instance_id
+            || root.reset_ticket.as_ref() != Some(ticket)
+            || ticket.device != root.current_device
+            || root.reset_receipt.is_some()
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let retention = self.prepare_device_root_retention(&enrollment)?;
+        let sequence = self.next_device_closure_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = self.scopes[&ticket.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let tombstone = DeviceResetTombstone {
+            ticket: *ticket,
+            sequence,
+        };
+        self.apply_device_root_retention(&enrollment, retention.as_ref());
+        self.next_device_closure_sequence = next_sequence;
+        let scope = self.scopes.get_mut(&ticket.scope).unwrap();
+        let root = scope.device_root.as_mut().unwrap();
+        root.reset_ticket = None;
+        root.reset_tombstone = Some(tombstone);
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(tombstone)
+    }
+
+    pub(crate) fn retry_device_reset(
+        &mut self,
+        tombstone: &DeviceResetTombstone,
+    ) -> Result<DeviceResetTicket, RegistryError> {
+        self.validate_device_closure_context(
+            tombstone.ticket.scope,
+            tombstone.ticket.enrollment_sequence,
+            tombstone.ticket.batch_sequence,
+        )?;
+        let root = self.scopes[&tombstone.ticket.scope]
+            .device_root
+            .as_ref()
+            .unwrap();
+        if tombstone.ticket.registry_instance_id != self.instance_id
+            || root.reset_tombstone.as_ref() != Some(tombstone)
+            || root.reset_ticket.is_some()
+            || root.reset_receipt.is_some()
+            || root.reset_retry_issued
+            || tombstone.ticket.device != root.current_device
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let sequence = self.next_device_closure_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = self.scopes[&tombstone.ticket.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let ticket = DeviceResetTicket {
+            registry_instance_id: self.instance_id,
+            scope: tombstone.ticket.scope,
+            enrollment_sequence: tombstone.ticket.enrollment_sequence,
+            batch_sequence: tombstone.ticket.batch_sequence,
+            device: root.current_device,
+            sequence,
+        };
+        self.next_device_closure_sequence = next_sequence;
+        let scope = self.scopes.get_mut(&tombstone.ticket.scope).unwrap();
+        let root = scope.device_root.as_mut().unwrap();
+        root.reset_ticket = Some(ticket);
+        root.reset_retry_issued = true;
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(ticket)
+    }
+
+    /// Couples the facade's prevalidated generation plan to the registry's
+    /// generation advance. Everything fallible happens before the one
+    /// external `apply_generation` closure; registry apply afterward is
+    /// allocation-free and error-free.
+    pub(crate) fn acknowledge_device_reset_with_apply<T>(
+        &mut self,
+        ticket: &DeviceResetTicket,
+        apply_generation: impl FnOnce(&DeviceResetReceipt) -> T,
+    ) -> Result<(DeviceResetReceipt, T), RegistryError> {
+        let plan = self.prepare_device_reset_apply(ticket)?;
+        let publication = apply_generation(&plan.receipt);
+        let receipt = self.apply_device_reset(plan);
+        Ok((receipt, publication))
+    }
+
+    fn prepare_device_reset_apply(
+        &self,
+        ticket: &DeviceResetTicket,
+    ) -> Result<DeviceResetApplyPlan, RegistryError> {
+        self.validate_device_closure_context(
+            ticket.scope,
+            ticket.enrollment_sequence,
+            ticket.batch_sequence,
+        )?;
+        let root = self.scopes[&ticket.scope].device_root.as_ref().unwrap();
+        if ticket.registry_instance_id != self.instance_id
+            || root.reset_ticket.as_ref() != Some(ticket)
+            || ticket.device != root.current_device
+            || root.reset_receipt.is_some()
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let new_device = root.current_device.next_generation()?;
+        let outcome = match root.outcome {
+            Some(outcome) => outcome,
+            None if ticket.batch_sequence.is_some() => DeviceClosureResult::IndeterminateAfterReset,
+            None => return Err(RegistryError::InvalidState),
+        };
+        let sequence = self.next_device_closure_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = self.scopes[&ticket.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let receipt = DeviceResetReceipt {
+            registry_instance_id: self.instance_id,
+            scope: ticket.scope,
+            enrollment_sequence: ticket.enrollment_sequence,
+            batch_sequence: ticket.batch_sequence,
+            old_device: ticket.device,
+            new_device,
+            sequence,
+            outcome,
+        };
+        Ok(DeviceResetApplyPlan {
+            receipt,
+            next_device_closure_sequence: next_sequence,
+            next_scope_revision: next_revision,
+        })
+    }
+
+    fn apply_device_reset(&mut self, plan: DeviceResetApplyPlan) -> DeviceResetReceipt {
+        let DeviceResetApplyPlan {
+            receipt,
+            next_device_closure_sequence,
+            next_scope_revision,
+        } = plan;
+        self.next_device_closure_sequence = next_device_closure_sequence;
+        let scope = self.scopes.get_mut(&receipt.scope).unwrap();
+        let root = scope.device_root.as_mut().unwrap();
+        root.current_device = receipt.new_device;
+        root.outcome = Some(receipt.outcome);
+        root.reset_ticket = None;
+        root.reset_receipt = Some(receipt);
+        scope.revision = next_scope_revision;
+        scope.invalidate_recovery_readiness();
+        receipt
+    }
+
+    pub(crate) fn begin_device_iotlb(
+        &mut self,
+        reset: &DeviceResetReceipt,
+    ) -> Result<DeviceIotlbTicket, RegistryError> {
+        let root = self
+            .scopes
+            .get(&reset.scope)
+            .and_then(|scope| scope.device_root.as_ref())
+            .ok_or(RegistryError::InvalidBatchReceipt)?;
+        if reset.registry_instance_id != self.instance_id
+            || root.reset_receipt.as_ref() != Some(reset)
+            || reset.new_device != root.current_device
+            || root.iotlb_ticket.is_some()
+            || root.iotlb_tombstone.is_some()
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let sequence = self.next_device_closure_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = self.scopes[&reset.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let ticket = DeviceIotlbTicket {
+            registry_instance_id: self.instance_id,
+            scope: reset.scope,
+            enrollment_sequence: reset.enrollment_sequence,
+            batch_sequence: reset.batch_sequence,
+            device: reset.new_device,
+            reset_sequence: reset.sequence,
+            sequence,
+        };
+        self.next_device_closure_sequence = next_sequence;
+        let scope = self.scopes.get_mut(&reset.scope).unwrap();
+        scope.device_root.as_mut().unwrap().iotlb_ticket = Some(ticket);
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(ticket)
+    }
+
+    pub(crate) fn retain_device_iotlb_timeout(
+        &mut self,
+        ticket: &DeviceIotlbTicket,
+    ) -> Result<DeviceIotlbTombstone, RegistryError> {
+        let enrollment = self.validate_device_closure_context(
+            ticket.scope,
+            ticket.enrollment_sequence,
+            ticket.batch_sequence,
+        )?;
+        let root = self.scopes[&ticket.scope].device_root.as_ref().unwrap();
+        if ticket.registry_instance_id != self.instance_id
+            || root.iotlb_ticket.as_ref() != Some(ticket)
+            || ticket.device != root.current_device
+            || root.reset_receipt.as_ref().is_none_or(|reset| {
+                reset.sequence != ticket.reset_sequence || reset.new_device != ticket.device
+            })
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let retention = self.prepare_device_root_retention(&enrollment)?;
+        let sequence = self.next_device_closure_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = self.scopes[&ticket.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let tombstone = DeviceIotlbTombstone {
+            ticket: *ticket,
+            sequence,
+        };
+        self.apply_device_root_retention(&enrollment, retention.as_ref());
+        self.next_device_closure_sequence = next_sequence;
+        let scope = self.scopes.get_mut(&ticket.scope).unwrap();
+        let root = scope.device_root.as_mut().unwrap();
+        root.iotlb_ticket = None;
+        root.iotlb_tombstone = Some(tombstone);
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(tombstone)
+    }
+
+    pub(crate) fn retry_device_iotlb(
+        &mut self,
+        reset: &DeviceResetReceipt,
+        tombstone: &DeviceIotlbTombstone,
+    ) -> Result<DeviceIotlbTicket, RegistryError> {
+        let root = self
+            .scopes
+            .get(&reset.scope)
+            .and_then(|scope| scope.device_root.as_ref())
+            .ok_or(RegistryError::InvalidBatchReceipt)?;
+        if reset.registry_instance_id != self.instance_id
+            || root.reset_receipt.as_ref() != Some(reset)
+            || root.iotlb_tombstone.as_ref() != Some(tombstone)
+            || tombstone.ticket.registry_instance_id != self.instance_id
+            || tombstone.ticket.enrollment_sequence != reset.enrollment_sequence
+            || tombstone.ticket.batch_sequence != reset.batch_sequence
+            || tombstone.ticket.device != root.current_device
+            || root.iotlb_ticket.is_some()
+            || root.iotlb_retry_issued
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let sequence = self.next_device_closure_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = self.scopes[&reset.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let ticket = DeviceIotlbTicket {
+            registry_instance_id: self.instance_id,
+            scope: reset.scope,
+            enrollment_sequence: reset.enrollment_sequence,
+            batch_sequence: reset.batch_sequence,
+            device: root.current_device,
+            reset_sequence: reset.sequence,
+            sequence,
+        };
+        self.next_device_closure_sequence = next_sequence;
+        let scope = self.scopes.get_mut(&reset.scope).unwrap();
+        let root = scope.device_root.as_mut().unwrap();
+        root.iotlb_ticket = Some(ticket);
+        root.iotlb_retry_issued = true;
+        scope.revision = next_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(ticket)
+    }
+
+    /// Couples a prevalidated facade quiescence plan to the authoritative
+    /// Registry closure. All validation, receipt construction, and overflow
+    /// checks precede the one external apply; Registry mutation afterward is
+    /// allocation-free and error-free.
+    pub(crate) fn acknowledge_device_iotlb_with_apply<T>(
+        &mut self,
+        ticket: &DeviceIotlbTicket,
+        apply_quiescence: impl FnOnce(&DeviceClosureReceipt) -> T,
+    ) -> Result<(DeviceClosureReceipt, T), RegistryError> {
+        let plan = self.prepare_device_iotlb_apply(ticket)?;
+        let publication = apply_quiescence(&plan.receipt);
+        let receipt = self.apply_device_iotlb(plan);
+        Ok((receipt, publication))
+    }
+
+    fn prepare_device_iotlb_apply(
+        &self,
+        ticket: &DeviceIotlbTicket,
+    ) -> Result<DeviceIotlbApplyPlan, RegistryError> {
+        self.validate_device_closure_context(
+            ticket.scope,
+            ticket.enrollment_sequence,
+            ticket.batch_sequence,
+        )?;
+        let root = self.scopes[&ticket.scope].device_root.as_ref().unwrap();
+        if ticket.registry_instance_id != self.instance_id
+            || root.iotlb_ticket.as_ref() != Some(ticket)
+            || ticket.device != root.current_device
+            || root.reset_receipt.as_ref().is_none_or(|reset| {
+                reset.sequence != ticket.reset_sequence || reset.new_device != ticket.device
+            })
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let outcome = root.outcome.ok_or(RegistryError::InvalidState)?;
+        let sequence = self.next_device_closure_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_revision = self.scopes[&ticket.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let receipt = DeviceClosureReceipt {
+            registry_instance_id: self.instance_id,
+            scope: ticket.scope,
+            enrollment_sequence: ticket.enrollment_sequence,
+            batch_sequence: ticket.batch_sequence,
+            device: ticket.device,
+            sequence,
+            outcome,
+        };
+        Ok(DeviceIotlbApplyPlan {
+            receipt,
+            next_device_closure_sequence: next_sequence,
+            next_scope_revision: next_revision,
+        })
+    }
+
+    fn apply_device_iotlb(&mut self, plan: DeviceIotlbApplyPlan) -> DeviceClosureReceipt {
+        let DeviceIotlbApplyPlan {
+            receipt,
+            next_device_closure_sequence,
+            next_scope_revision,
+        } = plan;
+        self.next_device_closure_sequence = next_device_closure_sequence;
+        let scope = self.scopes.get_mut(&receipt.scope).unwrap();
+        let root = scope.device_root.as_mut().unwrap();
+        root.iotlb_ticket = None;
+        root.closure = Some(receipt);
+        scope.revision = next_scope_revision;
+        scope.invalidate_recovery_readiness();
+        receipt
+    }
+
+    pub(crate) fn validate_device_closure_receipt(
+        &self,
+        presented: &DeviceClosureReceipt,
+    ) -> Result<(), RegistryError> {
+        if presented.registry_instance_id != self.instance_id || presented.sequence == 0 {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        self.validate_device_closure_context(
+            presented.scope,
+            presented.enrollment_sequence,
+            presented.batch_sequence,
+        )?;
+        let root = self.scopes[&presented.scope].device_root.as_ref().unwrap();
+        if presented.device != root.current_device {
+            return Err(device_envelope_mismatch(
+                root.current_device,
+                presented.device,
+            ));
+        }
+        if root.closure.as_ref() != Some(presented) {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        Ok(())
+    }
+
+    /// Terminalizes one leaf of a closed device cohort. Generic terminal and
+    /// revoke APIs remain unable to release these credits even after IOTLB
+    /// closure; callers must present the exact registry-native receipt.
+    pub(crate) fn stage_device_batch_terminal(
+        &mut self,
+        closure: &DeviceClosureReceipt,
+        effect: EffectKey,
+        request: TerminalRequest,
+    ) -> Result<Terminalization, RegistryError> {
+        const INDETERMINATE_EIO: i64 = -5;
+
+        self.validate_device_closure_receipt(closure)?;
+        let record = self
+            .effects
+            .get(&effect)
+            .ok_or(RegistryError::UnknownEffect)?;
+        let enrollment = self.scopes[&closure.scope]
+            .device_root
+            .as_ref()
+            .and_then(|root| root.enrollment.as_ref())
+            .ok_or(RegistryError::DeviceBatchNotEnrolled)?;
+        if !enrollment.effects.contains(&effect)
+            || match closure.batch_sequence {
+                Some(sequence) => record
+                    .device_batch
+                    .is_none_or(|membership| membership.sequence != sequence),
+                None => record.device_batch.is_some() || record.commit.is_some(),
+            }
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        match closure.outcome {
+            DeviceClosureResult::Completed(_) => {
+                if request.outcome != TerminalOutcome::Completed
+                    || record
+                        .commit
+                        .as_ref()
+                        .is_none_or(|commit| commit.result != request.result)
+                {
+                    return Err(RegistryError::InvalidState);
+                }
+            }
+            DeviceClosureResult::IndeterminateAfterReset => {
+                if request.outcome != TerminalOutcome::IndeterminateAfterReset
+                    || request.result != INDETERMINATE_EIO
+                {
+                    return Err(RegistryError::InvalidState);
+                }
+            }
+            DeviceClosureResult::AbortedBeforeCommit => {
+                if request.outcome != TerminalOutcome::Aborted || record.commit.is_some() {
+                    return Err(RegistryError::InvalidState);
+                }
+            }
+        }
+        self.stage_terminal_inner(effect, request, Some(closure.enrollment_sequence))
+    }
+
+    fn prepare_device_root_retention(
+        &self,
+        enrollment: &DeviceBatchEnrollmentReceipt,
+    ) -> Result<Option<DeviceRetentionPlan>, RegistryError> {
+        let mut aggregate = BTreeMap::<CreditClass, u64>::new();
+        let mut state = None;
+        for effect in &enrollment.effects {
+            let record = self
+                .effects
+                .get(effect)
+                .ok_or(RegistryError::UnknownEffect)?;
+            if !matches!(
+                (record.phase, record.credit_state),
+                (
+                    EffectPhase::Registered | EffectPhase::Prepared,
+                    CreditState::Held
+                ) | (
+                    EffectPhase::Committed,
+                    CreditState::Committed | CreditState::Retained
+                )
+            ) {
+                return Err(RegistryError::InvalidState);
+            }
+            match state {
+                None => state = Some(record.credit_state),
+                Some(existing) if existing != record.credit_state => {
+                    return Err(RegistryError::InvalidState);
+                }
+                Some(_) => {}
+            }
+            for charge in &record.credits {
+                let units = aggregate.entry(charge.class).or_default();
+                *units = units
+                    .checked_add(charge.units)
+                    .ok_or(RegistryError::CounterOverflow)?;
+            }
+        }
+        if state == Some(CreditState::Retained) {
+            return Ok(None);
+        }
+        if state != Some(CreditState::Committed) && state != Some(CreditState::Held) {
+            return Err(RegistryError::InvalidState);
+        }
+        let charges: Vec<_> = aggregate
+            .into_iter()
+            .map(|(class, units)| CreditCharge { class, units })
+            .collect();
+        let from = state.unwrap();
+        self.scopes[&enrollment.scope]
+            .credits
+            .validate_retain(&charges, from)?;
+        Ok(Some(DeviceRetentionPlan { charges, from }))
+    }
+
+    fn apply_device_root_retention(
+        &mut self,
+        enrollment: &DeviceBatchEnrollmentReceipt,
+        plan: Option<&DeviceRetentionPlan>,
+    ) {
+        let Some(plan) = plan else {
+            return;
+        };
+        self.scopes
+            .get_mut(&enrollment.scope)
+            .unwrap()
+            .credits
+            .retain_validated(&plan.charges, plan.from);
+        for effect in &enrollment.effects {
+            self.effects.get_mut(effect).unwrap().credit_state = CreditState::Retained;
+        }
+    }
+
+    fn prepare_device_batch(
+        &self,
+        authority: KernelRootAuthority,
+        enrollment: &DeviceBatchEnrollmentReceipt,
+        commits: &[(PortalHandle, CommitMetadata)],
+    ) -> Result<PreparedDeviceBatch, RegistryError> {
+        self.validate_kernel_root_authority(authority)?;
+        if enrollment.registry_instance_id != self.instance_id
+            || enrollment.scope != authority.scope
+            || enrollment.authority_epoch != authority.authority_epoch
+            || enrollment.cancel_only
+        {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let root_state = self.scopes[&authority.scope]
+            .device_root
+            .as_ref()
+            .ok_or(RegistryError::DeviceBatchNotEnrolled)?;
+        if root_state.enrollment.as_ref() != Some(enrollment) {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let expected_device = enrollment.device;
+        expected_device.validate()?;
+        if commits.is_empty() || commits.len() != enrollment.effects.len() {
+            return Err(RegistryError::InvalidState);
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut committed = 0_usize;
+        let mut device_effects = Vec::with_capacity(commits.len());
+        let mut root_count = 0_usize;
+        for ((handle, metadata), enrolled_effect) in commits.iter().zip(&enrollment.effects) {
+            let effect = self.validate_root_portal(authority, *handle)?;
+            if effect != *enrolled_effect || !seen.insert(effect) {
+                return Err(RegistryError::InvalidState);
+            }
+            let record = self.effects.get(&effect).unwrap();
+            if record.identity.parent.is_none() {
+                root_count = root_count
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+            }
+            if let Some(device) = record.identity.device {
+                if device != expected_device {
+                    return Err(device_envelope_mismatch(expected_device, device));
+                }
+                device_effects.push(effect);
+            }
+            if let Some(receipt) = &record.commit {
+                committed = committed
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+                if receipt.result != metadata.result
+                    || receipt.domain_revision != metadata.domain_revision
+                {
+                    return Err(RegistryError::CommitConflict);
+                }
+            } else if record.phase != EffectPhase::Prepared
+                || record.credit_state != CreditState::Held
+                || record.device_batch.is_some()
+            {
+                return Err(RegistryError::InvalidState);
+            }
+        }
+
+        let live = self
+            .by_scope
+            .get(&authority.scope)
+            .ok_or(RegistryError::InvalidState)?;
+        if live != &seen || root_count != 1 || device_effects.is_empty() {
+            return Err(RegistryError::InvalidState);
+        }
+        for effect in &seen {
+            if let Some(parent) = self.effects[effect].identity.parent
+                && !seen.contains(&parent)
+            {
+                return Err(RegistryError::InvalidHandle);
+            }
+        }
+
+        if committed != 0 {
+            if committed != commits.len() {
+                return Err(RegistryError::InvalidState);
+            }
+            let first = self.effects[&commits[0].0.effect]
+                .device_batch
+                .ok_or(RegistryError::InvalidBatchReceipt)?;
+            if root_state.batch_sequence != Some(first.sequence) {
+                return Err(RegistryError::InvalidBatchReceipt);
+            }
+            let receipt = self.reconstruct_device_batch_receipt(authority.scope, first.sequence)?;
+            if receipt.device != expected_device {
+                return Err(device_envelope_mismatch(expected_device, receipt.device));
+            }
+            if receipt.commits.len() != commits.len() {
+                return Err(RegistryError::InvalidBatchReceipt);
+            }
+            for ((handle, metadata), authoritative) in commits.iter().zip(&receipt.commits) {
+                if handle.effect != authoritative.effect
+                    || metadata.result != authoritative.result
+                    || metadata.domain_revision != authoritative.domain_revision
+                {
+                    return Err(RegistryError::CommitConflict);
+                }
+            }
+            return Ok(PreparedDeviceBatch::Replay(receipt));
+        }
+        if root_state.batch_sequence.is_some() {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+
+        let count = u64::try_from(commits.len()).map_err(|_| RegistryError::CounterOverflow)?;
+        let next_commit_sequence = self
+            .next_commit_sequence
+            .checked_add(count)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let batch_sequence = self.next_device_batch_sequence;
+        let next_device_batch_sequence = batch_sequence
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        let next_scope_revision = self.scopes[&authority.scope]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+
+        let mut aggregate = BTreeMap::<CreditClass, u64>::new();
+        for (handle, _) in commits {
+            for charge in &self.effects[&handle.effect].credits {
+                let units = aggregate.entry(charge.class).or_default();
+                *units = units
+                    .checked_add(charge.units)
+                    .ok_or(RegistryError::CounterOverflow)?;
+            }
+        }
+        let mut charges = Vec::with_capacity(aggregate.len());
+        for (class, units) in aggregate {
+            charges.push(CreditCharge { class, units });
+        }
+        self.scopes[&authority.scope]
+            .credits
+            .validate_commit(&charges)?;
+
+        let mut receipts = Vec::with_capacity(commits.len());
+        for (offset, (handle, metadata)) in commits.iter().enumerate() {
+            let offset = u64::try_from(offset).map_err(|_| RegistryError::CounterOverflow)?;
+            let sequence = self
+                .next_commit_sequence
+                .checked_add(offset)
+                .ok_or(RegistryError::CounterOverflow)?;
+            let record = &self.effects[&handle.effect];
+            receipts.push(CommitReceipt {
+                registry_instance_id: self.instance_id,
+                effect: handle.effect,
+                scope: authority.scope,
+                authority_epoch: authority.authority_epoch,
+                binding_epoch: record.identity.binding_epoch,
+                sequence,
+                result: metadata.result,
+                domain_revision: metadata.domain_revision,
+                descriptor_digest: record.descriptor.digest(),
+            });
+        }
+        let receipt = DeviceBatchCommitReceipt {
+            registry_instance_id: self.instance_id,
+            scope: authority.scope,
+            authority_epoch: authority.authority_epoch,
+            batch_sequence,
+            device: expected_device,
+            commits: receipts,
+            device_effects,
+        };
+        Ok(PreparedDeviceBatch::Apply(DeviceBatchApplyPlan {
+            receipt,
+            charges,
+            next_commit_sequence,
+            next_device_batch_sequence,
+            next_scope_revision,
+        }))
+    }
+
+    fn apply_device_batch(&mut self, plan: DeviceBatchApplyPlan) -> DeviceBatchCommitReceipt {
+        let DeviceBatchApplyPlan {
+            receipt,
+            charges,
+            next_commit_sequence,
+            next_device_batch_sequence,
+            next_scope_revision,
+        } = plan;
+        let size = receipt.commits.len();
+
+        self.next_commit_sequence = next_commit_sequence;
+        self.next_device_batch_sequence = next_device_batch_sequence;
+        let scope = self
+            .scopes
+            .get_mut(&receipt.scope)
+            .expect("prevalidated device-batch scope remains present");
+        scope.credits.commit_validated(&charges);
+        scope
+            .device_root
+            .as_mut()
+            .expect("prevalidated device root remains present")
+            .batch_sequence = Some(receipt.batch_sequence);
+        for (ordinal, commit) in receipt.commits.iter().enumerate() {
+            let record = self
+                .effects
+                .get_mut(&commit.effect)
+                .expect("prevalidated device-batch effect remains present");
+            record.phase = EffectPhase::Committed;
+            record.credit_state = CreditState::Committed;
+            record.commit = Some(commit.clone());
+            record.device_batch = Some(DeviceBatchMembership {
+                sequence: receipt.batch_sequence,
+                ordinal,
+                size,
+                device: receipt.device,
+            });
+        }
+        let scope = self.scopes.get_mut(&receipt.scope).unwrap();
+        scope.revision = next_scope_revision;
+        scope.invalidate_recovery_readiness();
+        receipt
+    }
+
+    fn reconstruct_device_batch_receipt(
+        &self,
+        scope_key: ScopeKey,
+        batch_sequence: u64,
+    ) -> Result<DeviceBatchCommitReceipt, RegistryError> {
+        if batch_sequence == 0 {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let first = self
+            .effects
+            .values()
+            .find_map(|record| {
+                record.device_batch.filter(|membership| {
+                    record.identity.scope == scope_key && membership.sequence == batch_sequence
+                })
+            })
+            .ok_or(RegistryError::InvalidBatchReceipt)?;
+        if first.size == 0 || first.sequence >= self.next_device_batch_sequence {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+
+        let mut slots = alloc::vec![None::<CommitReceipt>; first.size];
+        let mut device_slots = alloc::vec![false; first.size];
+        let mut authority_epoch = None;
+        for record in self.effects.values() {
+            let Some(membership) = record.device_batch else {
+                continue;
+            };
+            if record.identity.scope != scope_key || membership.sequence != batch_sequence {
+                continue;
+            }
+            if membership.size != first.size
+                || membership.device != first.device
+                || membership.ordinal >= first.size
+                || slots[membership.ordinal].is_some()
+            {
+                return Err(RegistryError::InvalidBatchReceipt);
+            }
+            let commit = record
+                .commit
+                .clone()
+                .ok_or(RegistryError::InvalidBatchReceipt)?;
+            if commit.registry_instance_id != self.instance_id
+                || commit.scope != scope_key
+                || commit.effect != record.identity.effect
+            {
+                return Err(RegistryError::InvalidBatchReceipt);
+            }
+            match authority_epoch {
+                None => authority_epoch = Some(commit.authority_epoch),
+                Some(epoch) if epoch != commit.authority_epoch => {
+                    return Err(RegistryError::InvalidBatchReceipt);
+                }
+                Some(_) => {}
+            }
+            if let Some(device) = record.identity.device {
+                if device != first.device {
+                    return Err(device_envelope_mismatch(first.device, device));
+                }
+                device_slots[membership.ordinal] = true;
+            }
+            slots[membership.ordinal] = Some(commit);
+        }
+        if slots.iter().any(Option::is_none) || !device_slots.iter().any(|is_device| *is_device) {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let commits: Vec<_> = slots
+            .into_iter()
+            .map(|slot| slot.expect("all device-batch ordinals were validated"))
+            .collect();
+        let device_effects = commits
+            .iter()
+            .enumerate()
+            .filter_map(|(index, commit)| device_slots[index].then_some(commit.effect))
+            .collect();
+        Ok(DeviceBatchCommitReceipt {
+            registry_instance_id: self.instance_id,
+            scope: scope_key,
+            authority_epoch: authority_epoch.ok_or(RegistryError::InvalidBatchReceipt)?,
+            batch_sequence,
+            device: first.device,
+            commits,
+            device_effects,
+        })
     }
 
     pub(crate) fn crash(
@@ -2212,7 +4252,7 @@ impl EffectRegistry {
         request: TerminalRequest,
     ) -> Result<Terminalization, RegistryError> {
         let effect = self.validate_portal(sender, handle)?;
-        self.stage_terminal_inner(effect, request)
+        self.stage_terminal_inner(effect, request, None)
     }
 
     /// Lets the kernel finish a previously committed effect from its exact
@@ -2228,7 +4268,11 @@ impl EffectRegistry {
         if record.phase != EffectPhase::Committed || record.commit.as_ref() != Some(receipt) {
             return Err(RegistryError::CommitConflict);
         }
-        self.stage_terminal_inner(receipt.effect, TerminalRequest::completed(receipt.result))
+        self.stage_terminal_inner(
+            receipt.effect,
+            TerminalRequest::completed(receipt.result),
+            None,
+        )
     }
 
     pub(crate) fn acknowledge_publication(
@@ -2455,7 +4499,7 @@ impl EffectRegistry {
         {
             return Err(RegistryError::InvalidRevokeSelection);
         }
-        self.stage_terminal_inner(effect, request)
+        self.stage_terminal_inner(effect, request, None)
     }
 
     pub(crate) fn revoke_complete(
@@ -2607,11 +4651,12 @@ impl EffectRegistry {
         // production indexes does not turn a semantic check into stack-size
         // dependent evidence.
         let mut expected = Box::<ExpectedReverseIndexes>::default();
-        let mut expected_credits: BTreeMap<ScopeKey, BTreeMap<CreditClass, (u64, u64)>> =
+        let mut expected_credits: BTreeMap<ScopeKey, BTreeMap<CreditClass, (u64, u64, u64)>> =
             BTreeMap::new();
         let mut expected_pending_publications = BTreeMap::<ScopeKey, usize>::new();
         let mut nonces = BTreeSet::new();
         let mut tickets = BTreeSet::new();
+        let mut device_batches = BTreeSet::<(ScopeKey, u64)>::new();
 
         for (key, scope) in &self.scopes {
             if key != &scope.key || key.generation == 0 {
@@ -2703,7 +4748,9 @@ impl EffectRegistry {
                 }
             }
             for balance in scope.credits.balances.values() {
-                if balance.free + balance.held + balance.committed != balance.capacity {
+                if balance.free + balance.held + balance.committed + balance.retained
+                    != balance.capacity
+                {
                     return Err(RegistryError::Invariant("credit conservation"));
                 }
             }
@@ -2870,12 +4917,21 @@ impl EffectRegistry {
 
             match record.phase {
                 EffectPhase::Registered | EffectPhase::Prepared => {
+                    let retained_unpublished = record.credit_state == CreditState::Retained
+                        && scope.device_root.as_ref().is_some_and(|root| {
+                            root.batch_sequence.is_none()
+                                && root.outcome == Some(DeviceClosureResult::AbortedBeforeCommit)
+                                && root.enrollment.as_ref().is_some_and(|enrollment| {
+                                    enrollment.effects.contains(&record.identity.effect)
+                                })
+                        });
                     if record.commit.is_some()
+                        || record.device_batch.is_some()
                         || record.terminal.is_some()
                         || record.terminalizations != 0
                         || record.publication_acks != 0
                         || record.pending_publication.is_some()
-                        || record.credit_state != CreditState::Held
+                        || (record.credit_state != CreditState::Held && !retained_unpublished)
                     {
                         return Err(RegistryError::Invariant("invalid uncommitted effect"));
                     }
@@ -2886,7 +4942,12 @@ impl EffectRegistry {
                         || record.terminalizations != 0
                         || record.publication_acks != 0
                         || record.pending_publication.is_some()
-                        || record.credit_state != CreditState::Committed
+                        || !matches!(
+                            record.credit_state,
+                            CreditState::Committed | CreditState::Retained
+                        )
+                        || (record.credit_state == CreditState::Retained
+                            && record.device_batch.is_none())
                     {
                         return Err(RegistryError::Invariant("invalid committed effect"));
                     }
@@ -2918,6 +4979,15 @@ impl EffectRegistry {
                     }) {
                         return Err(RegistryError::Invariant(
                             "completion has invalid causal commit",
+                        ));
+                    }
+                    if outcome == TerminalOutcome::IndeterminateAfterReset
+                        && (record.commit.is_none()
+                            || record.device_batch.is_none()
+                            || terminal.causal_commit.is_some())
+                    {
+                        return Err(RegistryError::Invariant(
+                            "indeterminate terminal lacks committed device cause",
                         ));
                     }
                     match record.publication_mode {
@@ -2958,6 +5028,33 @@ impl EffectRegistry {
                         },
                     }
                 }
+            }
+
+            if let Some(membership) = record.device_batch {
+                if membership.sequence == 0
+                    || membership.sequence >= self.next_device_batch_sequence
+                    || membership.size == 0
+                    || membership.ordinal >= membership.size
+                    || record.commit.is_none()
+                    || record.phase == EffectPhase::Terminal(TerminalOutcome::Aborted)
+                {
+                    return Err(RegistryError::Invariant("invalid device batch membership"));
+                }
+                if let Some(device) = record.identity.device
+                    && device != membership.device
+                {
+                    return Err(RegistryError::Invariant("device batch envelope mismatch"));
+                }
+                device_batches.insert((record.identity.scope, membership.sequence));
+            } else if record.identity.device.is_some()
+                && matches!(
+                    record.phase,
+                    EffectPhase::Committed
+                        | EffectPhase::Terminal(TerminalOutcome::Completed)
+                        | EffectPhase::Terminal(TerminalOutcome::IndeterminateAfterReset)
+                )
+            {
+                return Err(RegistryError::Invariant("device effect escaped root batch"));
             }
 
             if let Some(commit) = &record.commit
@@ -3014,15 +5111,47 @@ impl EffectRegistry {
                     &mut expected_credits,
                     record.identity.scope,
                     &record.credits,
-                    true,
+                    CreditState::Held,
                 )?,
                 CreditState::Committed => add_expected_credits(
                     &mut expected_credits,
                     record.identity.scope,
                     &record.credits,
-                    false,
+                    CreditState::Committed,
+                )?,
+                CreditState::Retained => add_expected_credits(
+                    &mut expected_credits,
+                    record.identity.scope,
+                    &record.credits,
+                    CreditState::Retained,
                 )?,
                 CreditState::Released => {}
+            }
+        }
+
+        if self.next_device_enrollment_sequence == 0
+            || self.next_device_batch_sequence == 0
+            || self.next_device_closure_sequence == 0
+        {
+            return Err(RegistryError::Invariant(
+                "invalid next device transition sequence",
+            ));
+        }
+        for (scope, sequence) in device_batches {
+            self.reconstruct_device_batch_receipt(scope, sequence)
+                .map_err(|_| RegistryError::Invariant("invalid reconstructed device batch"))?;
+        }
+        for (scope, record) in &self.scopes {
+            if let Some(device_root) = &record.device_root {
+                self.check_device_root_invariants(*scope, device_root)?;
+            } else if self
+                .effects
+                .values()
+                .any(|effect| effect.identity.scope == *scope && effect.identity.device.is_some())
+            {
+                return Err(RegistryError::Invariant(
+                    "device effect lacks root enrollment state",
+                ));
             }
         }
 
@@ -3114,16 +5243,314 @@ impl EffectRegistry {
             }
             let expected = expected_credits.get(scope_key);
             for (class, balance) in &scope.credits.balances {
-                let (held, committed) = expected
+                let (held, committed, retained) = expected
                     .and_then(|classes| classes.get(class))
                     .copied()
-                    .unwrap_or((0, 0));
-                if balance.held != held || balance.committed != committed {
+                    .unwrap_or((0, 0, 0));
+                if balance.held != held
+                    || balance.committed != committed
+                    || balance.retained != retained
+                {
                     return Err(RegistryError::Invariant("credit ownership mismatch"));
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn check_device_root_invariants(
+        &self,
+        scope_key: ScopeKey,
+        root: &DeviceRootState,
+    ) -> Result<(), RegistryError> {
+        root.initial_device.validate()?;
+        root.current_device.validate()?;
+        if !root
+            .initial_device
+            .same_device_except_generation(root.current_device)
+            || root.current_device.device_generation < root.initial_device.device_generation
+        {
+            return Err(RegistryError::Invariant("device root generation mismatch"));
+        }
+        let device_effects = self
+            .effects
+            .values()
+            .filter(|record| record.identity.scope == scope_key && record.identity.device.is_some())
+            .count();
+        if device_effects == 0 {
+            return Err(RegistryError::Invariant("device root lacks device effects"));
+        }
+
+        let Some(enrollment) = root.enrollment.as_ref() else {
+            if root.batch_sequence.is_some()
+                || root.completion.is_some()
+                || root.outcome.is_some()
+                || root.reset_ticket.is_some()
+                || root.reset_tombstone.is_some()
+                || root.reset_retry_issued
+                || root.reset_receipt.is_some()
+                || root.iotlb_ticket.is_some()
+                || root.iotlb_tombstone.is_some()
+                || root.iotlb_retry_issued
+                || root.closure.is_some()
+                || root.current_device != root.initial_device
+            {
+                return Err(RegistryError::Invariant(
+                    "unenrolled device root advanced closure state",
+                ));
+            }
+            return Ok(());
+        };
+        if enrollment.registry_instance_id != self.instance_id
+            || enrollment.scope != scope_key
+            || enrollment.authority_epoch == 0
+            || enrollment.enrollment_sequence == 0
+            || enrollment.enrollment_sequence >= self.next_device_enrollment_sequence
+            || enrollment.device != root.initial_device
+            || enrollment.effects.is_empty()
+        {
+            return Err(RegistryError::Invariant(
+                "invalid device enrollment receipt",
+            ));
+        }
+        if enrollment.cancel_only
+            && (root.batch_sequence.is_some()
+                || self.scopes[&scope_key].phase == ScopePhase::Active)
+        {
+            return Err(RegistryError::Invariant(
+                "cancel-only enrollment escaped closing root",
+            ));
+        }
+        let enrolled: BTreeSet<_> = enrollment.effects.iter().copied().collect();
+        if enrolled.len() != enrollment.effects.len() {
+            return Err(RegistryError::Invariant(
+                "duplicate device enrollment member",
+            ));
+        }
+        let mut roots = 0_usize;
+        let mut enrolled_devices = 0_usize;
+        for effect in &enrollment.effects {
+            let record = self
+                .effects
+                .get(effect)
+                .ok_or(RegistryError::Invariant("unknown device enrollment member"))?;
+            if record.identity.scope != scope_key
+                || record.identity.authority_epoch != enrollment.authority_epoch
+            {
+                return Err(RegistryError::Invariant(
+                    "device enrollment identity mismatch",
+                ));
+            }
+            if let Some(parent) = record.identity.parent {
+                if !enrolled.contains(&parent) {
+                    return Err(RegistryError::Invariant(
+                        "disconnected device enrollment ancestry",
+                    ));
+                }
+            } else {
+                roots = roots
+                    .checked_add(1)
+                    .ok_or(RegistryError::Invariant("device enrollment root overflow"))?;
+            }
+            if let Some(device) = record.identity.device {
+                if device != root.initial_device {
+                    return Err(RegistryError::Invariant(
+                        "device enrollment envelope mismatch",
+                    ));
+                }
+                enrolled_devices = enrolled_devices
+                    .checked_add(1)
+                    .ok_or(RegistryError::Invariant("device enrollment count overflow"))?;
+            }
+        }
+        if roots != 1 || enrolled_devices == 0 {
+            return Err(RegistryError::Invariant("invalid device enrollment graph"));
+        }
+
+        if let Some(batch_sequence) = root.batch_sequence {
+            let batch = self
+                .reconstruct_device_batch_receipt(scope_key, batch_sequence)
+                .map_err(|_| RegistryError::Invariant("device root batch reconstruction failed"))?;
+            if batch.device != root.initial_device
+                || batch
+                    .commits
+                    .iter()
+                    .map(|commit| commit.effect)
+                    .ne(enrollment.effects.iter().copied())
+            {
+                return Err(RegistryError::Invariant(
+                    "device root batch enrollment drift",
+                ));
+            }
+            if root.outcome == Some(DeviceClosureResult::AbortedBeforeCommit) {
+                return Err(RegistryError::Invariant(
+                    "published device root reported precommit abort",
+                ));
+            }
+        } else {
+            if enrollment.effects.iter().any(|effect| {
+                self.effects[effect].commit.is_some() || self.effects[effect].device_batch.is_some()
+            }) {
+                return Err(RegistryError::Invariant(
+                    "unpublished device enrollment contains committed effect",
+                ));
+            }
+            if root.completion.is_some()
+                || (root.outcome.is_some()
+                    && root.outcome != Some(DeviceClosureResult::AbortedBeforeCommit))
+            {
+                return Err(RegistryError::Invariant(
+                    "unpublished device root has invalid workload outcome",
+                ));
+            }
+        }
+        let valid_sequence =
+            |sequence: u64| sequence != 0 && sequence < self.next_device_closure_sequence;
+        if let Some(completion) = root.completion
+            && (completion.registry_instance_id != self.instance_id
+                || completion.scope != scope_key
+                || Some(completion.batch_sequence) != root.batch_sequence
+                || completion.device != root.initial_device
+                || !valid_sequence(completion.sequence))
+        {
+            return Err(RegistryError::Invariant(
+                "invalid device completion receipt",
+            ));
+        }
+        if let Some(ticket) = root.reset_ticket
+            && (ticket.registry_instance_id != self.instance_id
+                || ticket.scope != scope_key
+                || ticket.enrollment_sequence != enrollment.enrollment_sequence
+                || ticket.batch_sequence != root.batch_sequence
+                || ticket.device != root.initial_device
+                || !valid_sequence(ticket.sequence)
+                || root.reset_receipt.is_some())
+        {
+            return Err(RegistryError::Invariant("invalid device reset ticket"));
+        }
+        if let Some(tombstone) = root.reset_tombstone
+            && (tombstone.ticket.registry_instance_id != self.instance_id
+                || tombstone.ticket.scope != scope_key
+                || tombstone.ticket.enrollment_sequence != enrollment.enrollment_sequence
+                || tombstone.ticket.batch_sequence != root.batch_sequence
+                || tombstone.ticket.device != root.initial_device
+                || !valid_sequence(tombstone.ticket.sequence)
+                || !valid_sequence(tombstone.sequence))
+        {
+            return Err(RegistryError::Invariant("invalid device reset tombstone"));
+        }
+        if root.reset_retry_issued && root.reset_tombstone.is_none() {
+            return Err(RegistryError::Invariant("reset retry lacks tombstone"));
+        }
+        if let Some(reset) = root.reset_receipt {
+            if reset.registry_instance_id != self.instance_id
+                || reset.scope != scope_key
+                || reset.enrollment_sequence != enrollment.enrollment_sequence
+                || reset.batch_sequence != root.batch_sequence
+                || reset.old_device != root.initial_device
+                || reset.new_device != root.current_device
+                || reset.new_device.device_generation
+                    != reset
+                        .old_device
+                        .device_generation
+                        .checked_add(1)
+                        .ok_or(RegistryError::Invariant("reset generation overflow"))?
+                || !valid_sequence(reset.sequence)
+                || root.reset_ticket.is_some()
+                || Some(reset.outcome) != root.outcome
+            {
+                return Err(RegistryError::Invariant("invalid device reset receipt"));
+            }
+        } else if root.current_device != root.initial_device
+            || root.iotlb_ticket.is_some()
+            || root.iotlb_tombstone.is_some()
+            || root.iotlb_retry_issued
+            || root.closure.is_some()
+        {
+            return Err(RegistryError::Invariant(
+                "IOTLB state precedes device reset",
+            ));
+        }
+        if let Some(ticket) = root.iotlb_ticket
+            && (ticket.registry_instance_id != self.instance_id
+                || ticket.scope != scope_key
+                || ticket.enrollment_sequence != enrollment.enrollment_sequence
+                || ticket.batch_sequence != root.batch_sequence
+                || ticket.device != root.current_device
+                || root
+                    .reset_receipt
+                    .is_none_or(|reset| reset.sequence != ticket.reset_sequence)
+                || !valid_sequence(ticket.sequence)
+                || root.closure.is_some())
+        {
+            return Err(RegistryError::Invariant("invalid device IOTLB ticket"));
+        }
+        if let Some(tombstone) = root.iotlb_tombstone
+            && (tombstone.ticket.registry_instance_id != self.instance_id
+                || tombstone.ticket.scope != scope_key
+                || tombstone.ticket.enrollment_sequence != enrollment.enrollment_sequence
+                || tombstone.ticket.batch_sequence != root.batch_sequence
+                || tombstone.ticket.device != root.current_device
+                || !valid_sequence(tombstone.ticket.sequence)
+                || !valid_sequence(tombstone.sequence))
+        {
+            return Err(RegistryError::Invariant("invalid device IOTLB tombstone"));
+        }
+        if root.iotlb_retry_issued && root.iotlb_tombstone.is_none() {
+            return Err(RegistryError::Invariant("IOTLB retry lacks tombstone"));
+        }
+        if let Some(closure) = root.closure
+            && (closure.registry_instance_id != self.instance_id
+                || closure.scope != scope_key
+                || closure.enrollment_sequence != enrollment.enrollment_sequence
+                || closure.batch_sequence != root.batch_sequence
+                || closure.device != root.current_device
+                || closure.outcome
+                    != root.outcome.ok_or(RegistryError::Invariant(
+                        "device closure lacks honest outcome",
+                    ))?
+                || !valid_sequence(closure.sequence)
+                || root.iotlb_ticket.is_some()
+                || root.reset_receipt.is_none())
+        {
+            return Err(RegistryError::Invariant("invalid device closure receipt"));
+        }
+        if let Some(DeviceClosureResult::Completed(result)) = root.outcome
+            && root
+                .completion
+                .is_none_or(|completion| completion.result != result)
+        {
+            return Err(RegistryError::Invariant("device completion result drift"));
+        }
+        if root.outcome == Some(DeviceClosureResult::IndeterminateAfterReset)
+            && (root.batch_sequence.is_none() || root.completion.is_some())
+        {
+            return Err(RegistryError::Invariant(
+                "indeterminate result conflicts with publication/completion",
+            ));
+        }
+        let has_retained = enrollment
+            .effects
+            .iter()
+            .any(|effect| self.effects[effect].credit_state == CreditState::Retained);
+        if has_retained
+            && root.batch_sequence.is_some()
+            && root.reset_tombstone.is_none()
+            && root.iotlb_tombstone.is_none()
+        {
+            return Err(RegistryError::Invariant(
+                "retained published credits lack timeout tombstone",
+            ));
+        }
+        if has_retained
+            && root.batch_sequence.is_none()
+            && root.outcome != Some(DeviceClosureResult::AbortedBeforeCommit)
+        {
+            return Err(RegistryError::Invariant(
+                "retained unpublished credits lack precommit abort",
+            ));
+        }
         Ok(())
     }
 
@@ -3167,10 +5594,75 @@ impl EffectRegistry {
         Ok(handle.effect)
     }
 
+    fn validate_kernel_root_authority(
+        &self,
+        authority: KernelRootAuthority,
+    ) -> Result<(), RegistryError> {
+        if authority.registry_instance_id != self.instance_id {
+            return Err(RegistryError::InvalidBatchReceipt);
+        }
+        let scope = self
+            .scopes
+            .get(&authority.scope)
+            .ok_or(RegistryError::UnknownScope)?;
+        if authority.authority_epoch != scope.authority_epoch {
+            return Err(RegistryError::StaleAuthority);
+        }
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        if scope.supervisor != Some(authority.owner) || scope.fallback_running {
+            return Err(RegistryError::NoSupervisor);
+        }
+        Ok(())
+    }
+
+    fn validate_root_portal(
+        &self,
+        authority: KernelRootAuthority,
+        handle: PortalHandle,
+    ) -> Result<EffectKey, RegistryError> {
+        if handle.scope != authority.scope {
+            return Err(RegistryError::InvalidHandle);
+        }
+        if handle.authority_epoch != authority.authority_epoch {
+            return Err(RegistryError::StaleAuthority);
+        }
+        let record = self
+            .effects
+            .get(&handle.effect)
+            .ok_or(RegistryError::UnknownEffect)?;
+        if record.identity.scope != authority.scope
+            || record.identity.domain != handle.domain
+            || record.identity.authority_epoch != authority.authority_epoch
+            || record.nonce != handle.nonce
+        {
+            return Err(RegistryError::InvalidHandle);
+        }
+        let scope = self
+            .scopes
+            .get(&authority.scope)
+            .ok_or(RegistryError::UnknownScope)?;
+        let binding = scope
+            .domains
+            .get(&handle.domain)
+            .ok_or(RegistryError::UnknownDomain)?;
+        if handle.binding_epoch != binding.binding_epoch
+            || record.identity.binding_epoch != handle.binding_epoch
+        {
+            return Err(RegistryError::StaleBinding);
+        }
+        if binding.supervisor.is_none() || binding.fallback_running {
+            return Err(RegistryError::NoSupervisor);
+        }
+        Ok(handle.effect)
+    }
+
     fn stage_terminal_inner(
         &mut self,
         effect: EffectKey,
         request: TerminalRequest,
+        authorized_device_enrollment: Option<u64>,
     ) -> Result<Terminalization, RegistryError> {
         let (
             phase,
@@ -3181,6 +5673,7 @@ impl EffectRegistry {
             charges,
             credit_state,
             publication_mode,
+            device_batch,
         ) = {
             let record = self
                 .effects
@@ -3195,8 +5688,19 @@ impl EffectRegistry {
                 record.credits.clone(),
                 record.credit_state,
                 record.publication_mode,
+                record.device_batch,
             )
         };
+        if let Some(root) = self.scopes[&scope_key].device_root.as_ref() {
+            let Some(enrollment) = root.enrollment.as_ref() else {
+                return Err(RegistryError::DeviceClosurePending);
+            };
+            if enrollment.effects.contains(&effect)
+                && authorized_device_enrollment != Some(enrollment.enrollment_sequence)
+            {
+                return Err(RegistryError::DeviceClosurePending);
+            }
+        }
         if phase.is_terminal() {
             return Err(RegistryError::AlreadyTerminal);
         }
@@ -3222,6 +5726,12 @@ impl EffectRegistry {
                     !causal_commit_matches(self.instance_id, &self.effects, &identity, causal)
                 }) {
                     return Err(RegistryError::CommitConflict);
+                }
+            }
+            TerminalOutcome::IndeterminateAfterReset => {
+                if own_commit.is_none() || device_batch.is_none() || request.causal_commit.is_some()
+                {
+                    return Err(RegistryError::InvalidState);
                 }
             }
         }
@@ -3556,6 +6066,16 @@ fn validate_generation(generation: u64) -> Result<(), RegistryError> {
     }
 }
 
+fn device_envelope_mismatch(expected: DeviceEnvelope, presented: DeviceEnvelope) -> RegistryError {
+    if expected.same_device_except_generation(presented)
+        && expected.device_generation != presented.device_generation
+    {
+        RegistryError::StaleDeviceGeneration
+    } else {
+        RegistryError::InvalidBatchReceipt
+    }
+}
+
 /// Authenticates an explicit completion cause against the exact commit stored
 /// by this Registry. Cross-effect completion is allowed only inside one scope
 /// causal envelope. Binding epochs are ordered only inside one independently
@@ -3580,7 +6100,9 @@ fn causal_commit_matches(
             && source.commit.as_ref() == Some(causal)
             && matches!(
                 source.phase,
-                EffectPhase::Committed | EffectPhase::Terminal(TerminalOutcome::Completed)
+                EffectPhase::Committed
+                    | EffectPhase::Terminal(TerminalOutcome::Completed)
+                    | EffectPhase::Terminal(TerminalOutcome::IndeterminateAfterReset)
             )
     })
 }
@@ -3667,18 +6189,23 @@ fn remove_index_member<K: Ord + Copy>(
 }
 
 fn add_expected_credits(
-    expected: &mut BTreeMap<ScopeKey, BTreeMap<CreditClass, (u64, u64)>>,
+    expected: &mut BTreeMap<ScopeKey, BTreeMap<CreditClass, (u64, u64, u64)>>,
     scope: ScopeKey,
     charges: &[CreditCharge],
-    held: bool,
+    state: CreditState,
 ) -> Result<(), RegistryError> {
     for charge in charges {
         let entry = expected
             .entry(scope)
             .or_default()
             .entry(charge.class)
-            .or_insert((0, 0));
-        let counter = if held { &mut entry.0 } else { &mut entry.1 };
+            .or_insert((0, 0, 0));
+        let counter = match state {
+            CreditState::Held => &mut entry.0,
+            CreditState::Committed => &mut entry.1,
+            CreditState::Retained => &mut entry.2,
+            CreditState::Released => return Err(RegistryError::InvalidState),
+        };
         *counter = counter
             .checked_add(charge.units)
             .ok_or(RegistryError::CounterOverflow)?;
@@ -3847,6 +6374,7 @@ impl Stage7bFaultBudgetProjection {
             ScopePhase::Active | ScopePhase::Closing => credits
                 .held
                 .checked_add(credits.committed)
+                .and_then(|owned| owned.checked_add(credits.retained))
                 .ok_or(RegistryError::CounterOverflow)?,
             ScopePhase::Revoked => credits.free,
         };
@@ -3870,7 +6398,7 @@ pub(crate) struct Stage7bFaultBudget {
 /// Read-only, complete failure-atomicity snapshot of one case-local ledger.
 /// Its fields remain private so cloning this value cannot mint usable Registry
 /// handles or transition authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Stage7bFaultBudgetState {
     case: Stage7bFaultCase,
     instance_id: u64,
@@ -3881,6 +6409,22 @@ pub(crate) struct Stage7bFaultBudgetState {
     bindings: BTreeSet<Stage7bFaultBinding>,
     commit_operations: usize,
     terminal_operations: usize,
+}
+
+impl Clone for Stage7bFaultBudgetState {
+    fn clone(&self) -> Self {
+        Self {
+            case: self.case,
+            instance_id: self.instance_id,
+            registry: self.registry.clone(),
+            scope: self.scope,
+            task: self.task,
+            credit: self.credit,
+            bindings: self.bindings.clone(),
+            commit_operations: self.commit_operations,
+            terminal_operations: self.terminal_operations,
+        }
+    }
 }
 
 impl Stage7bFaultBudget {
@@ -4148,19 +6692,40 @@ impl Stage7bNoCredit {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Stage7bActiveFixture {
     config: Stage7bFixtureConfig,
     registry: EffectRegistry,
     target_scope: ScopeKey,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Stage7bCompleteFixture {
     config: Stage7bFixtureConfig,
     registry: EffectRegistry,
     target_scope: ScopeKey,
     selection: RevokeSelection,
+}
+
+impl Clone for Stage7bActiveFixture {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config,
+            registry: self.registry.clone(),
+            target_scope: self.target_scope,
+        }
+    }
+}
+
+impl Clone for Stage7bCompleteFixture {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config,
+            registry: self.registry.clone(),
+            target_scope: self.target_scope,
+            selection: self.selection.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5519,6 +8084,979 @@ pub(crate) fn production_identity_registry_self_test() {
     let unrelated_projection = registry.scope_projection(unrelated_scope).unwrap();
     assert_eq!(unrelated_projection.credits.free, 1);
     assert_eq!(unrelated_projection.credits.held, 0);
+    production_device_batch_registry_self_test(&mut registry);
+    registry.check_invariants().unwrap();
+}
+
+/// Pins the exact production transition source used by the same-boot device
+/// successor: six workload effects, four device-enveloped effects, one root
+/// authority, and one publish closure. All negative fixtures clone this same
+/// registry state; none creates a detached evaluator registry or ledger.
+fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
+    use core::cell::Cell;
+
+    const SCOPE: ScopeKey = ScopeKey::new(0x300, 1);
+    const ROOT_OWNER: TaskKey = TaskKey::new(0x300, 1);
+    const PERSONALITY: TaskKey = TaskKey::new(0x301, 1);
+    const FILESYSTEM: TaskKey = TaskKey::new(0x302, 1);
+    const VIRTIO: TaskKey = TaskKey::new(0x303, 1);
+    const PERSONALITY_DOMAIN: DomainKey = DomainKey::new(1);
+    const FILESYSTEM_DOMAIN: DomainKey = DomainKey::new(2);
+    const VIRTIO_DOMAIN: DomainKey = DomainKey::new(3);
+    const CONTROL: CreditClass = CreditClass::new(0x301);
+    const FILESYSTEM_OP: CreditClass = CreditClass::new(0x302);
+    const QUEUE_SLOT: CreditClass = CreditClass::new(0x303);
+    const DMA_OWNER: CreditClass = CreditClass::new(0x304);
+
+    let device = DeviceEnvelope::new(0x51, 0, 0, 1).unwrap();
+    registry
+        .create_scope(ScopeConfig {
+            key: SCOPE,
+            authority_epoch: 17,
+            binding_epoch: 1,
+            supervisor: ROOT_OWNER,
+            credits: alloc::vec![
+                CreditLimit::new(CONTROL, 2),
+                CreditLimit::new(FILESYSTEM_OP, 1),
+                CreditLimit::new(QUEUE_SLOT, 1),
+                CreditLimit::new(DMA_OWNER, 3),
+            ],
+        })
+        .unwrap();
+    for config in [
+        DomainConfig {
+            key: PERSONALITY_DOMAIN,
+            binding_epoch: 1,
+            supervisor: PERSONALITY,
+        },
+        DomainConfig {
+            key: FILESYSTEM_DOMAIN,
+            binding_epoch: 1,
+            supervisor: FILESYSTEM,
+        },
+        DomainConfig {
+            key: VIRTIO_DOMAIN,
+            binding_epoch: 1,
+            supervisor: VIRTIO,
+        },
+    ] {
+        registry.add_domain(SCOPE, config).unwrap();
+    }
+
+    let syscall = registry
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: SCOPE,
+                task: PERSONALITY,
+                operation: OperationClass::new(1),
+                descriptor: SyscallDescriptor::new(17, [3, 0x1000, 4, 0, 0, 0]),
+                resources: alloc::vec![ResourceKey::new(0x31, 1, 1)],
+                credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: PERSONALITY_DOMAIN,
+            parent: None,
+        })
+        .unwrap();
+    let filesystem = registry
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: SCOPE,
+                task: FILESYSTEM,
+                operation: OperationClass::new(2),
+                descriptor: SyscallDescriptor::new(17, [3, 0x1000, 4, 0, 0, 0]),
+                resources: alloc::vec![ResourceKey::new(0x31, 2, 1)],
+                credits: alloc::vec![CreditCharge::new(FILESYSTEM_OP, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: FILESYSTEM_DOMAIN,
+            parent: Some(syscall.identity.effect()),
+        })
+        .unwrap();
+    let block = registry
+        .register_device_derived(DeviceDerivedRegisterRequest {
+            derived: DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: VIRTIO,
+                    operation: OperationClass::new(3),
+                    descriptor: SyscallDescriptor::new(3, [0, 0, 512, 0, 0, 0]),
+                    resources: alloc::vec![ResourceKey::new(0x31, 3, 1)],
+                    credits: alloc::vec![CreditCharge::new(QUEUE_SLOT, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: VIRTIO_DOMAIN,
+                parent: Some(filesystem.identity.effect()),
+            },
+            device,
+        })
+        .unwrap();
+    let dma_a = registry
+        .register_device_derived(DeviceDerivedRegisterRequest {
+            derived: DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: VIRTIO,
+                    operation: OperationClass::new(4),
+                    descriptor: SyscallDescriptor::new(4, [0; 6]),
+                    resources: alloc::vec![ResourceKey::new(0x31, 4, 1)],
+                    credits: alloc::vec![CreditCharge::new(DMA_OWNER, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: VIRTIO_DOMAIN,
+                parent: Some(block.identity.effect()),
+            },
+            device,
+        })
+        .unwrap();
+    let dma_b = registry
+        .register_device_derived(DeviceDerivedRegisterRequest {
+            derived: DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: VIRTIO,
+                    operation: OperationClass::new(5),
+                    descriptor: SyscallDescriptor::new(5, [0; 6]),
+                    resources: alloc::vec![ResourceKey::new(0x31, 5, 1)],
+                    credits: alloc::vec![CreditCharge::new(DMA_OWNER, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: VIRTIO_DOMAIN,
+                parent: Some(block.identity.effect()),
+            },
+            device,
+        })
+        .unwrap();
+    let dma_request = registry
+        .register_device_derived(DeviceDerivedRegisterRequest {
+            derived: DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: VIRTIO,
+                    operation: OperationClass::new(6),
+                    descriptor: SyscallDescriptor::new(6, [0; 6]),
+                    resources: alloc::vec![ResourceKey::new(0x31, 6, 1)],
+                    credits: alloc::vec![CreditCharge::new(DMA_OWNER, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: VIRTIO_DOMAIN,
+                parent: Some(block.identity.effect()),
+            },
+            device,
+        })
+        .unwrap();
+
+    let registered = [&syscall, &filesystem, &block, &dma_a, &dma_b, &dma_request];
+    for (sender, effect) in [
+        (PERSONALITY, &syscall),
+        (FILESYSTEM, &filesystem),
+        (VIRTIO, &block),
+        (VIRTIO, &dma_a),
+        (VIRTIO, &dma_b),
+        (VIRTIO, &dma_request),
+    ] {
+        registry.prepare(sender, effect.handle).unwrap();
+    }
+    assert_eq!(registry.effects_for_scope(SCOPE).len(), 6);
+    assert_eq!(
+        registered
+            .iter()
+            .filter(|effect| effect.identity.device.is_some())
+            .count(),
+        4
+    );
+    registry.check_invariants().unwrap();
+
+    let authority = registry.kernel_root_authority(SCOPE, ROOT_OWNER).unwrap();
+    let commits = [
+        (syscall.handle, CommitMetadata::new(4, 1)),
+        (filesystem.handle, CommitMetadata::new(4, 1)),
+        (block.handle, CommitMetadata::new(512, 1)),
+        (dma_a.handle, CommitMetadata::new(1, 1)),
+        (dma_b.handle, CommitMetadata::new(1, 1)),
+        (dma_request.handle, CommitMetadata::new(1, 1)),
+    ];
+    let handles = [
+        syscall.handle,
+        filesystem.handle,
+        block.handle,
+        dma_a.handle,
+        dma_b.handle,
+        dma_request.handle,
+    ];
+
+    for (label, wrong_device, expected) in [
+        (
+            "generation",
+            DeviceEnvelope::new(0x51, 0, 0, 2).unwrap(),
+            RegistryError::StaleDeviceGeneration,
+        ),
+        (
+            "session",
+            DeviceEnvelope::new(0x52, 0, 0, 1).unwrap(),
+            RegistryError::InvalidBatchReceipt,
+        ),
+        (
+            "queue",
+            DeviceEnvelope::new(0x51, 1, 0, 1).unwrap(),
+            RegistryError::InvalidBatchReceipt,
+        ),
+        (
+            "descriptor",
+            DeviceEnvelope::new(0x51, 0, 1, 1).unwrap(),
+            RegistryError::InvalidBatchReceipt,
+        ),
+    ] {
+        let mut negative = registry.clone();
+        let before = negative.clone();
+        let result = negative.enroll_device_batch(authority, &handles, wrong_device);
+        assert!(matches!(result, Err(error) if error == expected), "{label}");
+        assert_eq!(negative, before, "{label}");
+    }
+
+    let mut missing = registry.clone();
+    let missing_before = missing.clone();
+    assert!(matches!(
+        missing.enroll_device_batch(authority, &handles[..handles.len() - 1], device),
+        Err(RegistryError::InvalidState)
+    ));
+    assert_eq!(missing, missing_before);
+
+    let mut wrong_ancestry = registry.clone();
+    let ancestry_before = wrong_ancestry.clone();
+    assert_eq!(
+        wrong_ancestry.register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: SCOPE,
+                task: PERSONALITY,
+                operation: OperationClass::new(7),
+                descriptor: SyscallDescriptor::new(7, [0; 6]),
+                resources: alloc::vec![ResourceKey::new(0x31, 7, 1)],
+                credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: PERSONALITY_DOMAIN,
+            parent: None,
+        }),
+        Err(RegistryError::InvalidState)
+    );
+    assert_eq!(wrong_ancestry, ancestry_before);
+
+    // Merely deriving a device child reserves the whole root. A non-device
+    // ancestor cannot acquire a partial authoritative commit before explicit
+    // enrollment or hardware publication.
+    let mut split = registry.clone();
+    let split_before = split.clone();
+    assert_eq!(
+        split.commit(PERSONALITY, syscall.handle, commits[0].1),
+        Err(RegistryError::InvalidDeviceEnvelope)
+    );
+    assert_eq!(split, split_before);
+
+    // Conversely, a service cannot attach a device-derived child beneath an
+    // ancestor that was already committed through the generic path.
+    let mut attached_after_commit = registry.clone();
+    let attach_scope = ScopeKey::new(0x310, 1);
+    let attach_owner = TaskKey::new(0x310, 1);
+    let attach_service = TaskKey::new(0x311, 1);
+    let attach_domain = DomainKey::new(1);
+    attached_after_commit
+        .create_scope(ScopeConfig {
+            key: attach_scope,
+            authority_epoch: 1,
+            binding_epoch: 1,
+            supervisor: attach_owner,
+            credits: alloc::vec![CreditLimit::new(CONTROL, 2)],
+        })
+        .unwrap();
+    attached_after_commit
+        .add_domain(
+            attach_scope,
+            DomainConfig {
+                key: attach_domain,
+                binding_epoch: 1,
+                supervisor: attach_service,
+            },
+        )
+        .unwrap();
+    let committed_parent = attached_after_commit
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: attach_scope,
+                task: attach_service,
+                operation: OperationClass::new(1),
+                descriptor: SyscallDescriptor::new(1, [0; 6]),
+                resources: alloc::vec![],
+                credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: attach_domain,
+            parent: None,
+        })
+        .unwrap();
+    attached_after_commit
+        .prepare(attach_service, committed_parent.handle)
+        .unwrap();
+    attached_after_commit
+        .commit(
+            attach_service,
+            committed_parent.handle,
+            CommitMetadata::new(0, 0),
+        )
+        .unwrap();
+    let attach_before = attached_after_commit.clone();
+    assert_eq!(
+        attached_after_commit.register_device_derived(DeviceDerivedRegisterRequest {
+            derived: DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: attach_scope,
+                    task: attach_service,
+                    operation: OperationClass::new(2),
+                    descriptor: SyscallDescriptor::new(2, [0; 6]),
+                    resources: alloc::vec![],
+                    credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: attach_domain,
+                parent: Some(committed_parent.identity.effect()),
+            },
+            device,
+        }),
+        Err(RegistryError::InvalidState)
+    );
+    assert_eq!(attached_after_commit, attach_before);
+
+    // If revoke wins the device-root/enrollment window, generic Abort remains
+    // blocked. A Closing-only emergency freeze records the exact prepared live
+    // cohort as cancel-only before ownership can be retained and closed.
+    let mut pending_direct = registry.clone();
+    let pending_direct_before = pending_direct.clone();
+    assert_eq!(
+        pending_direct.stage_terminal(VIRTIO, dma_a.handle, TerminalRequest::aborted(-125),),
+        Err(RegistryError::DeviceClosurePending)
+    );
+    assert_eq!(pending_direct, pending_direct_before);
+
+    let mut pending_cancel = registry.clone();
+    let pending_selection = pending_cancel.revoke_begin(SCOPE).unwrap();
+    let pending_head = pending_cancel
+        .revoke_next(&pending_selection)
+        .unwrap()
+        .unwrap();
+    let pending_before_abort = pending_cancel.clone();
+    assert_eq!(
+        pending_cancel.stage_revoke_terminal(
+            &pending_selection,
+            pending_head.effect,
+            TerminalRequest::aborted(-125),
+        ),
+        Err(RegistryError::DeviceClosurePending)
+    );
+    assert_eq!(pending_cancel, pending_before_abort);
+    let cancel_enrollment = pending_cancel.freeze_pending_device_cancel(SCOPE).unwrap();
+    assert!(cancel_enrollment.cancel_only());
+    let cancel_ticket = pending_cancel
+        .begin_unpublished_device_cancel(&cancel_enrollment)
+        .unwrap();
+    assert_eq!(
+        pending_cancel
+            .scope_projection(SCOPE)
+            .unwrap()
+            .credits
+            .retained,
+        6
+    );
+    let (cancel_reset, ()) = pending_cancel
+        .acknowledge_device_reset_with_apply(&cancel_ticket, |_| ())
+        .unwrap();
+    let cancel_iotlb = pending_cancel.begin_device_iotlb(&cancel_reset).unwrap();
+    let (cancel_closure, ()) = pending_cancel
+        .acknowledge_device_iotlb_with_apply(&cancel_iotlb, |_| ())
+        .unwrap();
+    assert_eq!(
+        cancel_closure.outcome(),
+        DeviceClosureResult::AbortedBeforeCommit
+    );
+    for expected in [
+        dma_a.identity.effect(),
+        dma_b.identity.effect(),
+        dma_request.identity.effect(),
+        block.identity.effect(),
+        filesystem.identity.effect(),
+        syscall.identity.effect(),
+    ] {
+        let next = pending_cancel
+            .revoke_next(&pending_selection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.effect, expected);
+        pending_cancel
+            .stage_device_batch_terminal(&cancel_closure, expected, TerminalRequest::aborted(-125))
+            .unwrap();
+    }
+    pending_cancel.revoke_complete(&pending_selection).unwrap();
+    pending_cancel.check_invariants().unwrap();
+
+    let mut registered_cancel = registry.clone();
+    let registered_child = registered_cancel
+        .register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: SCOPE,
+                task: PERSONALITY,
+                operation: OperationClass::new(8),
+                descriptor: SyscallDescriptor::new(8, [0; 6]),
+                resources: alloc::vec![],
+                credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: PERSONALITY_DOMAIN,
+            parent: Some(dma_request.identity.effect()),
+        })
+        .unwrap();
+    assert_eq!(
+        registered_cancel
+            .effect_view(registered_child.identity.effect())
+            .unwrap()
+            .phase,
+        EffectPhase::Registered
+    );
+    let registered_selection = registered_cancel.revoke_begin(SCOPE).unwrap();
+    let registered_enrollment = registered_cancel
+        .freeze_pending_device_cancel(SCOPE)
+        .unwrap();
+    assert!(registered_enrollment.cancel_only());
+    assert_eq!(registered_enrollment.effects().len(), 7);
+    let registered_ticket = registered_cancel
+        .begin_unpublished_device_cancel(&registered_enrollment)
+        .unwrap();
+    assert_eq!(
+        registered_cancel
+            .scope_projection(SCOPE)
+            .unwrap()
+            .credits
+            .retained,
+        7
+    );
+    let (registered_reset, ()) = registered_cancel
+        .acknowledge_device_reset_with_apply(&registered_ticket, |_| ())
+        .unwrap();
+    let registered_iotlb = registered_cancel
+        .begin_device_iotlb(&registered_reset)
+        .unwrap();
+    let (registered_closure, ()) = registered_cancel
+        .acknowledge_device_iotlb_with_apply(&registered_iotlb, |_| ())
+        .unwrap();
+    let mut registered_closed = 0_usize;
+    while let Some(next) = registered_cancel
+        .revoke_next(&registered_selection)
+        .unwrap()
+    {
+        registered_cancel
+            .stage_device_batch_terminal(
+                &registered_closure,
+                next.effect,
+                TerminalRequest::aborted(-125),
+            )
+            .unwrap();
+        registered_closed += 1;
+    }
+    assert_eq!(registered_closed, 7);
+    registered_cancel
+        .revoke_complete(&registered_selection)
+        .unwrap();
+    registered_cancel.check_invariants().unwrap();
+
+    let enrollment = registry
+        .enroll_device_batch(authority, &handles, device)
+        .unwrap();
+    assert_eq!(enrollment.scope(), SCOPE);
+    assert_eq!(enrollment.enrollment_sequence(), 1);
+    assert_eq!(enrollment.device(), device);
+    assert_eq!(enrollment.effects().len(), 6);
+
+    let enrollment_before_registration = registry.clone();
+    assert_eq!(
+        registry.register_derived(DerivedRegisterRequest {
+            request: RegisterRequest {
+                scope: SCOPE,
+                task: PERSONALITY,
+                operation: OperationClass::new(7),
+                descriptor: SyscallDescriptor::new(7, [0; 6]),
+                resources: alloc::vec![],
+                credits: alloc::vec![CreditCharge::new(CONTROL, 1)],
+                publication: PublicationMode::None,
+            },
+            domain: PERSONALITY_DOMAIN,
+            parent: None,
+        }),
+        Err(RegistryError::InvalidState)
+    );
+    assert_eq!(*registry, enrollment_before_registration);
+
+    let mut foreign_registry = registry.clone();
+    foreign_registry.rewrite_registry_instance(registry.instance_id + 1);
+    let foreign_before = foreign_registry.clone();
+    let foreign_publications = Cell::new(0_u8);
+    assert!(matches!(
+        foreign_registry.commit_device_batch_with_publish(authority, &enrollment, &commits, |_| {
+            foreign_publications.set(1)
+        },),
+        Err(RegistryError::InvalidBatchReceipt)
+    ));
+    assert_eq!(foreign_publications.get(), 0);
+    assert_eq!(foreign_registry, foreign_before);
+
+    let unrelated_authority = registry
+        .kernel_root_authority(ScopeKey::new(0x2ff, 1), TaskKey::new(0x2ff, 1))
+        .unwrap();
+    let mut wrong_root = registry.clone();
+    let wrong_root_before = wrong_root.clone();
+    let wrong_root_publications = Cell::new(0_u8);
+    assert!(matches!(
+        wrong_root.commit_device_batch_with_publish(
+            unrelated_authority,
+            &enrollment,
+            &commits,
+            |_| wrong_root_publications.set(1),
+        ),
+        Err(RegistryError::InvalidBatchReceipt)
+    ));
+    assert_eq!(wrong_root_publications.get(), 0);
+    assert_eq!(wrong_root, wrong_root_before);
+
+    let mut forged_enrollment = enrollment.clone();
+    forged_enrollment.device.device_generation += 1;
+    let forged_before = registry.clone();
+    let forged_publications = Cell::new(0_u8);
+    assert!(matches!(
+        registry.commit_device_batch_with_publish(authority, &forged_enrollment, &commits, |_| {
+            forged_publications.set(1)
+        },),
+        Err(RegistryError::InvalidBatchReceipt)
+    ));
+    assert_eq!(forged_publications.get(), 0);
+    assert_eq!(*registry, forged_before);
+
+    let mut overflow = registry.clone();
+    overflow.next_device_batch_sequence = u64::MAX;
+    let overflow_before = overflow.clone();
+    let overflow_publications = Cell::new(0_u8);
+    assert!(matches!(
+        overflow.commit_device_batch_with_publish(authority, &enrollment, &commits, |_| {
+            overflow_publications.set(1)
+        },),
+        Err(RegistryError::CounterOverflow)
+    ));
+    assert_eq!(overflow_publications.get(), 0);
+    assert_eq!(overflow, overflow_before);
+
+    let mut revoke_first = registry.clone();
+    let revoke_first_selection = revoke_first.revoke_begin(SCOPE).unwrap();
+    let revoke_first_before = revoke_first.clone();
+    let revoke_first_publications = Cell::new(0_u8);
+    assert!(matches!(
+        revoke_first.commit_device_batch_with_publish(authority, &enrollment, &commits, |_| {
+            revoke_first_publications.set(1)
+        },),
+        Err(RegistryError::StaleAuthority)
+    ));
+    assert_eq!(revoke_first_publications.get(), 0);
+    assert_eq!(revoke_first, revoke_first_before);
+    let selected = revoke_first
+        .revoke_next(&revoke_first_selection)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.disposition, RevokeDisposition::Abort);
+    let before_early_abort = revoke_first.clone();
+    assert_eq!(
+        revoke_first.stage_revoke_terminal(
+            &revoke_first_selection,
+            selected.effect,
+            TerminalRequest::aborted(-125),
+        ),
+        Err(RegistryError::DeviceClosurePending)
+    );
+    assert_eq!(revoke_first, before_early_abort);
+    let cancel = revoke_first
+        .begin_unpublished_device_cancel(&enrollment)
+        .unwrap();
+    let retained = revoke_first.scope_projection(SCOPE).unwrap().credits;
+    assert_eq!(retained.held, 0);
+    assert_eq!(retained.retained, 6);
+    let (reset, ()) = revoke_first
+        .acknowledge_device_reset_with_apply(&cancel, |_| ())
+        .unwrap();
+    assert_eq!(reset.outcome(), DeviceClosureResult::AbortedBeforeCommit);
+    let iotlb = revoke_first.begin_device_iotlb(&reset).unwrap();
+    let (cancelled, ()) = revoke_first
+        .acknowledge_device_iotlb_with_apply(&iotlb, |_| ())
+        .unwrap();
+    assert!(!cancelled.published());
+    assert_eq!(
+        cancelled.outcome(),
+        DeviceClosureResult::AbortedBeforeCommit
+    );
+    for expected in [
+        dma_a.identity.effect(),
+        dma_b.identity.effect(),
+        dma_request.identity.effect(),
+        block.identity.effect(),
+        filesystem.identity.effect(),
+        syscall.identity.effect(),
+    ] {
+        let next = revoke_first
+            .revoke_next(&revoke_first_selection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.effect, expected);
+        assert_eq!(next.disposition, RevokeDisposition::Abort);
+        revoke_first
+            .stage_device_batch_terminal(&cancelled, expected, TerminalRequest::aborted(-125))
+            .unwrap();
+    }
+    assert!(
+        revoke_first
+            .revoke_next(&revoke_first_selection)
+            .unwrap()
+            .is_none()
+    );
+    revoke_first
+        .revoke_complete(&revoke_first_selection)
+        .unwrap();
+    assert_eq!(
+        revoke_first.scope_projection(SCOPE).unwrap().credits.free,
+        7
+    );
+    revoke_first.check_invariants().unwrap();
+
+    let publications = Cell::new(0_u8);
+    let receipt = match registry
+        .commit_device_batch_with_publish(authority, &enrollment, &commits, |prepared| {
+            assert_eq!(prepared.commits().len(), 6);
+            assert_eq!(prepared.device_effects().len(), 4);
+            publications.set(publications.get() + 1);
+            prepared.device().descriptor_token()
+        })
+        .unwrap()
+    {
+        DeviceBatchCommitOutcome::Applied {
+            receipt,
+            publication,
+        } => {
+            assert_eq!(publication, 0);
+            receipt
+        }
+        DeviceBatchCommitOutcome::AlreadyCommitted { .. } => {
+            panic!("fresh device batch replayed")
+        }
+    };
+    assert_eq!(publications.get(), 1);
+    assert_eq!(receipt.registry_instance_id(), registry.instance_id);
+    assert_eq!(receipt.scope(), SCOPE);
+    assert_eq!(receipt.authority_epoch(), 17);
+    assert_eq!(receipt.batch_sequence(), 1);
+    assert_eq!(receipt.device(), device);
+    assert_eq!(receipt.commits().len(), 6);
+    assert_eq!(receipt.device_effects().len(), 4);
+    registry.validate_device_batch_receipt(&receipt).unwrap();
+    registry.check_invariants().unwrap();
+    let committed = registry.scope_projection(SCOPE).unwrap().credits;
+    assert_eq!(committed.capacity, 7);
+    assert_eq!(committed.free, 1);
+    assert_eq!(committed.held, 0);
+    assert_eq!(committed.committed, 6);
+    assert_eq!(committed.retained, 0);
+
+    let replay_publications = Cell::new(0_u8);
+    match registry
+        .commit_device_batch_with_publish(authority, &enrollment, &commits, |_| {
+            replay_publications.set(1)
+        })
+        .unwrap()
+    {
+        DeviceBatchCommitOutcome::AlreadyCommitted { receipt: replay } => {
+            assert_eq!(replay, receipt)
+        }
+        DeviceBatchCommitOutcome::Applied { .. } => panic!("device batch published twice"),
+    }
+    assert_eq!(replay_publications.get(), 0);
+
+    let replay_before = registry.clone();
+    assert_eq!(
+        registry.commit(PERSONALITY, syscall.handle, commits[0].1),
+        Err(RegistryError::InvalidDeviceEnvelope)
+    );
+    assert_eq!(*registry, replay_before);
+
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.device.device_generation += 1;
+    assert_eq!(
+        registry.validate_device_batch_receipt(&wrong_receipt),
+        Err(RegistryError::StaleDeviceGeneration)
+    );
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.device.device_session += 1;
+    assert_eq!(
+        registry.validate_device_batch_receipt(&wrong_receipt),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.commits.swap(0, 1);
+    assert_eq!(
+        registry.validate_device_batch_receipt(&wrong_receipt),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.device_effects.pop();
+    assert_eq!(
+        registry.validate_device_batch_receipt(&wrong_receipt),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    let mut wrong_receipt = receipt.clone();
+    wrong_receipt.registry_instance_id += 1;
+    assert_eq!(
+        registry.validate_device_batch_receipt(&wrong_receipt),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+
+    // Normal completion still requires whole-device reset and IOTLB closure.
+    let mut normal = registry.clone();
+    let completion = normal
+        .record_device_completion(&receipt, device, 4)
+        .unwrap();
+    assert_eq!(completion.device(), device);
+    assert_eq!(completion.result(), 4);
+    let reset_ticket = normal.begin_device_reset(&receipt).unwrap();
+    let reset_applies = Cell::new(0_u8);
+    let (reset, ()) = normal
+        .acknowledge_device_reset_with_apply(&reset_ticket, |prepared| {
+            assert_eq!(prepared.old_device(), device);
+            reset_applies.set(1);
+        })
+        .unwrap();
+    assert_eq!(reset_applies.get(), 1);
+    assert_eq!(reset.old_device(), device);
+    assert_eq!(reset.new_device().device_generation(), 2);
+    assert_eq!(reset.outcome(), DeviceClosureResult::Completed(4));
+    let iotlb = normal.begin_device_iotlb(&reset).unwrap();
+    let mut iotlb_overflow = normal.clone();
+    iotlb_overflow.next_device_closure_sequence = u64::MAX;
+    let iotlb_overflow_before = iotlb_overflow.clone();
+    let overflow_applies = Cell::new(0_u8);
+    assert!(matches!(
+        iotlb_overflow.acknowledge_device_iotlb_with_apply(&iotlb, |_| { overflow_applies.set(1) }),
+        Err(RegistryError::CounterOverflow)
+    ));
+    assert_eq!(overflow_applies.get(), 0);
+    assert_eq!(iotlb_overflow, iotlb_overflow_before);
+
+    let iotlb_applies = Cell::new(0_u8);
+    let (normal_closure, ()) = normal
+        .acknowledge_device_iotlb_with_apply(&iotlb, |prepared| {
+            assert_eq!(prepared.device(), reset.new_device());
+            iotlb_applies.set(1);
+        })
+        .unwrap();
+    assert_eq!(iotlb_applies.get(), 1);
+    let normal_after_closure = normal.clone();
+    let duplicate_applies = Cell::new(0_u8);
+    assert_eq!(
+        normal.acknowledge_device_iotlb_with_apply(&iotlb, |_| duplicate_applies.set(1)),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(duplicate_applies.get(), 0);
+    assert_eq!(normal, normal_after_closure);
+    assert_eq!(normal_closure.outcome(), DeviceClosureResult::Completed(4));
+    let normal_before_generic = normal.clone();
+    assert_eq!(
+        normal.stage_kernel_completion(receipt.commit_for(dma_a.identity.effect()).unwrap()),
+        Err(RegistryError::DeviceClosurePending)
+    );
+    assert_eq!(normal, normal_before_generic);
+    for expected in [
+        dma_a.identity.effect(),
+        dma_b.identity.effect(),
+        dma_request.identity.effect(),
+        block.identity.effect(),
+        filesystem.identity.effect(),
+        syscall.identity.effect(),
+    ] {
+        let commit = receipt.commit_for(expected).unwrap();
+        normal
+            .stage_device_batch_terminal(
+                &normal_closure,
+                expected,
+                TerminalRequest::completed(commit.result()),
+            )
+            .unwrap();
+    }
+    let normal_projection = normal.scope_projection(SCOPE).unwrap();
+    assert_eq!(normal_projection.live_effects, 0);
+    assert_eq!(normal_projection.credits.free, 7);
+    assert_eq!(normal_projection.credits.retained, 0);
+    normal.check_invariants().unwrap();
+
+    // Published ownership with no authoritative completion becomes a real
+    // indeterminate terminal only when reset advances the device generation.
+    let mut indeterminate = registry.clone();
+    let reset_ticket = indeterminate.begin_device_reset(&receipt).unwrap();
+    let (reset, ()) = indeterminate
+        .acknowledge_device_reset_with_apply(&reset_ticket, |_| ())
+        .unwrap();
+    assert_eq!(
+        reset.outcome(),
+        DeviceClosureResult::IndeterminateAfterReset
+    );
+    let iotlb = indeterminate.begin_device_iotlb(&reset).unwrap();
+    let (indeterminate_closure, ()) = indeterminate
+        .acknowledge_device_iotlb_with_apply(&iotlb, |_| ())
+        .unwrap();
+    indeterminate
+        .stage_device_batch_terminal(
+            &indeterminate_closure,
+            dma_a.identity.effect(),
+            TerminalRequest::indeterminate_after_reset(-5),
+        )
+        .unwrap();
+    assert_eq!(
+        indeterminate
+            .effect_view(dma_a.identity.effect())
+            .unwrap()
+            .phase,
+        EffectPhase::Terminal(TerminalOutcome::IndeterminateAfterReset)
+    );
+    indeterminate.check_invariants().unwrap();
+
+    let selection = registry.revoke_begin(SCOPE).unwrap();
+    registry.validate_device_batch_receipt(&receipt).unwrap();
+    let after_revoke = registry.clone();
+    let late_publications = Cell::new(0_u8);
+    assert!(matches!(
+        registry.commit_device_batch_with_publish(authority, &enrollment, &commits, |_| {
+            late_publications.set(1)
+        },),
+        Err(RegistryError::StaleAuthority)
+    ));
+    assert_eq!(late_publications.get(), 0);
+    assert_eq!(*registry, after_revoke);
+
+    let selected = registry.revoke_next(&selection).unwrap().unwrap();
+    assert_eq!(selected.effect, dma_a.identity.effect());
+    let before_generic_drain = registry.clone();
+    assert_eq!(
+        registry.stage_revoke_terminal(
+            &selection,
+            selected.effect,
+            TerminalRequest::completed(match selected.disposition {
+                RevokeDisposition::Drain(ref commit) => commit.result(),
+                RevokeDisposition::Abort => panic!("committed device batch became abortable"),
+            }),
+        ),
+        Err(RegistryError::DeviceClosurePending)
+    );
+    assert_eq!(*registry, before_generic_drain);
+    assert_eq!(
+        registry.revoke_complete(&selection),
+        Err(RegistryError::NotQuiescent)
+    );
+
+    registry
+        .record_device_completion(&receipt, device, 4)
+        .unwrap();
+    let reset_ticket = registry.begin_device_reset(&receipt).unwrap();
+    let reset_tombstone = registry.retain_device_reset_timeout(&reset_ticket).unwrap();
+    assert_eq!(reset_tombstone.device(), device);
+    let retained = registry.scope_projection(SCOPE).unwrap().credits;
+    assert_eq!(retained.free, 1);
+    assert_eq!(retained.held, 0);
+    assert_eq!(retained.committed, 0);
+    assert_eq!(retained.retained, 6);
+    registry.check_invariants().unwrap();
+    assert_eq!(
+        registry.revoke_complete(&selection),
+        Err(RegistryError::NotQuiescent)
+    );
+    let retry = registry.retry_device_reset(&reset_tombstone).unwrap();
+    let reset_applies = Cell::new(0_u8);
+    let (reset, ()) = registry
+        .acknowledge_device_reset_with_apply(&retry, |_| reset_applies.set(1))
+        .unwrap();
+    assert_eq!(reset_applies.get(), 1);
+    assert_eq!(reset.new_device().device_generation(), 2);
+    assert_eq!(reset.outcome(), DeviceClosureResult::Completed(4));
+    registry.check_invariants().unwrap();
+
+    let before_late_completion = registry.clone();
+    assert_eq!(
+        registry.record_device_completion(&receipt, device, 4),
+        Err(RegistryError::StaleDeviceGeneration)
+    );
+    assert_eq!(*registry, before_late_completion);
+
+    let iotlb = registry.begin_device_iotlb(&reset).unwrap();
+    let iotlb_tombstone = registry.retain_device_iotlb_timeout(&iotlb).unwrap();
+    assert_eq!(iotlb_tombstone.device().device_generation(), 2);
+    let iotlb_retry = registry
+        .retry_device_iotlb(&reset, &iotlb_tombstone)
+        .unwrap();
+    let (closure, ()) = registry
+        .acknowledge_device_iotlb_with_apply(&iotlb_retry, |_| ())
+        .unwrap();
+    assert_eq!(closure.device().device_generation(), 2);
+    assert_eq!(closure.outcome(), DeviceClosureResult::Completed(4));
+    registry.validate_device_closure_receipt(&closure).unwrap();
+    registry.check_invariants().unwrap();
+    let mut stale_closure = closure;
+    stale_closure.device = device;
+    let before_stale_closure = registry.clone();
+    assert_eq!(
+        registry.validate_device_closure_receipt(&stale_closure),
+        Err(RegistryError::StaleDeviceGeneration)
+    );
+    assert_eq!(*registry, before_stale_closure);
+    let mut forged_closure = closure;
+    forged_closure.batch_sequence = forged_closure
+        .batch_sequence
+        .and_then(|sequence| sequence.checked_add(1));
+    let before_forged_closure = registry.clone();
+    assert_eq!(
+        registry.stage_device_batch_terminal(
+            &forged_closure,
+            dma_a.identity.effect(),
+            TerminalRequest::completed(1),
+        ),
+        Err(RegistryError::InvalidBatchReceipt)
+    );
+    assert_eq!(*registry, before_forged_closure);
+
+    for expected in [
+        dma_a.identity.effect(),
+        dma_b.identity.effect(),
+        dma_request.identity.effect(),
+        block.identity.effect(),
+        filesystem.identity.effect(),
+        syscall.identity.effect(),
+    ] {
+        let next = registry.revoke_next(&selection).unwrap().unwrap();
+        assert_eq!(next.effect, expected);
+        let result = match next.disposition {
+            RevokeDisposition::Drain(commit) => commit.result(),
+            RevokeDisposition::Abort => panic!("committed device batch became abortable"),
+        };
+        registry
+            .stage_device_batch_terminal(&closure, expected, TerminalRequest::completed(result))
+            .unwrap();
+    }
+    assert!(registry.revoke_next(&selection).unwrap().is_none());
+    registry.revoke_complete(&selection).unwrap();
+    registry.validate_device_batch_receipt(&receipt).unwrap();
+    let closed = registry.scope_projection(SCOPE).unwrap();
+    assert_eq!(closed.phase, ScopePhase::Revoked);
+    assert_eq!(closed.live_effects, 0);
+    assert_eq!(closed.credits.free, 7);
+    assert_eq!(closed.credits.held, 0);
+    assert_eq!(closed.credits.committed, 0);
+    assert_eq!(closed.credits.retained, 0);
     registry.check_invariants().unwrap();
 }
 
@@ -5688,5 +9226,235 @@ pub(crate) fn bounded_registry_self_test() -> RegistrySelfTestReceipt {
         publication_acks: tickets.len(),
         stale_authority_rejected: true,
         quiescent: true,
+    }
+}
+
+/// Minimal two-effect harness for exploring the production device
+/// enrollment+commit/revoke winner under a modeled outer lock. The six-effect
+/// workload population is pinned by `production_device_batch_registry_self_test`;
+/// this smaller harness isolates the pending-enrollment publication boundary so
+/// Loom does not turn graph construction into the race under test.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ProductionDeviceBatchRaceFixture {
+    registry: EffectRegistry,
+    scope: ScopeKey,
+    authority: KernelRootAuthority,
+    enrollment: Option<DeviceBatchEnrollmentReceipt>,
+    commits: [(PortalHandle, CommitMetadata); 2],
+    device: DeviceEnvelope,
+    batch: Option<DeviceBatchCommitReceipt>,
+    publications: u8,
+    closures: u8,
+}
+
+impl ProductionDeviceBatchRaceFixture {
+    pub(crate) fn from_empty_registry(mut registry: EffectRegistry) -> Self {
+        const SCOPE: ScopeKey = ScopeKey::new(0x3f0, 1);
+        const ROOT_OWNER: TaskKey = TaskKey::new(0x3f0, 1);
+        const CONTROL: TaskKey = TaskKey::new(0x3f1, 1);
+        const DEVICE: TaskKey = TaskKey::new(0x3f2, 1);
+        const CONTROL_DOMAIN: DomainKey = DomainKey::new(1);
+        const DEVICE_DOMAIN: DomainKey = DomainKey::new(2);
+        const CONTROL_CREDIT: CreditClass = CreditClass::new(0x3f1);
+        const DEVICE_CREDIT: CreditClass = CreditClass::new(0x3f2);
+
+        assert!(registry.scopes.is_empty());
+        let device = DeviceEnvelope::new(0x3f, 0, 0, 1).unwrap();
+        registry
+            .create_scope(ScopeConfig {
+                key: SCOPE,
+                authority_epoch: 31,
+                binding_epoch: 1,
+                supervisor: ROOT_OWNER,
+                credits: alloc::vec![
+                    CreditLimit::new(CONTROL_CREDIT, 1),
+                    CreditLimit::new(DEVICE_CREDIT, 1),
+                ],
+            })
+            .unwrap();
+        for config in [
+            DomainConfig {
+                key: CONTROL_DOMAIN,
+                binding_epoch: 1,
+                supervisor: CONTROL,
+            },
+            DomainConfig {
+                key: DEVICE_DOMAIN,
+                binding_epoch: 1,
+                supervisor: DEVICE,
+            },
+        ] {
+            registry.add_domain(SCOPE, config).unwrap();
+        }
+        let root = registry
+            .register_derived(DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: CONTROL,
+                    operation: OperationClass::new(1),
+                    descriptor: SyscallDescriptor::new(17, [0; 6]),
+                    resources: alloc::vec![ResourceKey::new(0x3f, 1, 1)],
+                    credits: alloc::vec![CreditCharge::new(CONTROL_CREDIT, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: CONTROL_DOMAIN,
+                parent: None,
+            })
+            .unwrap();
+        let child = registry
+            .register_device_derived(DeviceDerivedRegisterRequest {
+                derived: DerivedRegisterRequest {
+                    request: RegisterRequest {
+                        scope: SCOPE,
+                        task: DEVICE,
+                        operation: OperationClass::new(2),
+                        descriptor: SyscallDescriptor::new(2, [0; 6]),
+                        resources: alloc::vec![ResourceKey::new(0x3f, 2, 1)],
+                        credits: alloc::vec![CreditCharge::new(DEVICE_CREDIT, 1)],
+                        publication: PublicationMode::None,
+                    },
+                    domain: DEVICE_DOMAIN,
+                    parent: Some(root.identity.effect()),
+                },
+                device,
+            })
+            .unwrap();
+        registry.prepare(CONTROL, root.handle).unwrap();
+        registry.prepare(DEVICE, child.handle).unwrap();
+        let authority = registry.kernel_root_authority(SCOPE, ROOT_OWNER).unwrap();
+        let commits = [
+            (root.handle, CommitMetadata::new(1, 1)),
+            (child.handle, CommitMetadata::new(1, 1)),
+        ];
+        registry.check_invariants().unwrap();
+        Self {
+            registry,
+            scope: SCOPE,
+            authority,
+            enrollment: None,
+            commits,
+            device,
+            batch: None,
+            publications: 0,
+            closures: 0,
+        }
+    }
+
+    pub(crate) fn commit(&mut self) -> Result<bool, RegistryError> {
+        if self.enrollment.is_none() {
+            self.enrollment = Some(self.registry.enroll_device_batch(
+                self.authority,
+                &[self.commits[0].0, self.commits[1].0],
+                self.device,
+            )?);
+        }
+        let outcome = self.registry.commit_device_batch_with_publish(
+            self.authority,
+            self.enrollment.as_ref().unwrap(),
+            &self.commits,
+            |_| (),
+        )?;
+        match outcome {
+            DeviceBatchCommitOutcome::Applied { receipt, .. } => {
+                self.publications = self
+                    .publications
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOverflow)?;
+                self.batch = Some(receipt);
+                Ok(true)
+            }
+            DeviceBatchCommitOutcome::AlreadyCommitted { receipt } => {
+                self.batch = Some(receipt);
+                Ok(false)
+            }
+        }
+    }
+
+    pub(crate) fn revoke_to_completion(&mut self) -> Result<(), RegistryError> {
+        let selection = self.registry.revoke_begin(self.scope)?;
+        let closure = if let Some(batch) = self.batch.as_ref() {
+            let reset_ticket = self.registry.begin_device_reset(batch)?;
+            let (reset, ()) = self
+                .registry
+                .acknowledge_device_reset_with_apply(&reset_ticket, |_| ())?;
+            let iotlb = self.registry.begin_device_iotlb(&reset)?;
+            self.registry
+                .acknowledge_device_iotlb_with_apply(&iotlb, |_| ())?
+                .0
+        } else {
+            if self.enrollment.is_none() {
+                self.enrollment = Some(self.registry.freeze_pending_device_cancel(self.scope)?);
+            }
+            let reset_ticket = self
+                .registry
+                .begin_unpublished_device_cancel(self.enrollment.as_ref().unwrap())?;
+            let (reset, ()) = self
+                .registry
+                .acknowledge_device_reset_with_apply(&reset_ticket, |_| ())?;
+            let iotlb = self.registry.begin_device_iotlb(&reset)?;
+            self.registry
+                .acknowledge_device_iotlb_with_apply(&iotlb, |_| ())?
+                .0
+        };
+        self.closures = self
+            .closures
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        while let Some(effect) = self.registry.revoke_next(&selection)? {
+            match (closure.outcome, effect.disposition) {
+                (DeviceClosureResult::AbortedBeforeCommit, RevokeDisposition::Abort) => {
+                    self.registry.stage_device_batch_terminal(
+                        &closure,
+                        effect.effect,
+                        TerminalRequest::aborted(-125),
+                    )?;
+                }
+                (DeviceClosureResult::IndeterminateAfterReset, RevokeDisposition::Drain(_)) => {
+                    self.registry.stage_device_batch_terminal(
+                        &closure,
+                        effect.effect,
+                        TerminalRequest::indeterminate_after_reset(-5),
+                    )?;
+                }
+                (DeviceClosureResult::Completed(_), RevokeDisposition::Drain(receipt)) => self
+                    .registry
+                    .stage_device_batch_terminal(
+                        &closure,
+                        effect.effect,
+                        TerminalRequest::completed(receipt.result()),
+                    )
+                    .map(|_| ())?,
+                _ => return Err(RegistryError::InvalidState),
+            }
+        }
+        self.registry.revoke_complete(&selection)?;
+        self.registry.check_invariants()
+    }
+
+    pub(crate) fn phase(&self) -> ScopePhase {
+        self.registry.scope_projection(self.scope).unwrap().phase
+    }
+
+    pub(crate) fn publications(&self) -> u8 {
+        self.publications
+    }
+
+    pub(crate) fn closures(&self) -> u8 {
+        self.closures
+    }
+
+    pub(crate) fn failure_atomic_projection(&self) -> String {
+        alloc::format!("{self:?}")
+    }
+
+    pub(crate) fn is_quiescent(&self) -> bool {
+        let projection = self.registry.scope_projection(self.scope).unwrap();
+        projection.phase == ScopePhase::Revoked
+            && projection.live_effects == 0
+            && projection.pending_publications == 0
+            && projection.credits.free == projection.credits.capacity
+            && projection.credits.held == 0
+            && projection.credits.committed == 0
+            && projection.credits.retained == 0
     }
 }

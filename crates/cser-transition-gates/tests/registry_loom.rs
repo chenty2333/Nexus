@@ -13,8 +13,8 @@ use cser_transition_gates::{
     },
 };
 use effect_registry::{
-    CommitOutcome, PortalHandle, RegistryError, RevokeSelection, ScopePhase, Stage7bActiveFixture,
-    Stage7bFixtureConfig, TerminalOutcome,
+    CommitOutcome, EffectRegistry, PortalHandle, ProductionDeviceBatchRaceFixture, RegistryError,
+    RevokeSelection, ScopePhase, Stage7bActiveFixture, Stage7bFixtureConfig, TerminalOutcome,
 };
 use loom::{
     model,
@@ -114,6 +114,51 @@ fn commit_vs_revoke_linearization() {
             "scope-revoked",
         ],
     );
+}
+
+#[test]
+fn production_device_batch_vs_revoke_linearization() {
+    model(|| {
+        thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let fixture =
+                    ProductionDeviceBatchRaceFixture::from_empty_registry(EffectRegistry::new());
+                let fixture = Arc::new(Mutex::new(fixture));
+                let commit_fixture = fixture.clone();
+                let revoke_fixture = fixture.clone();
+                let commit = thread::spawn(move || commit_fixture.lock().unwrap().commit());
+                let revoke =
+                    thread::spawn(move || revoke_fixture.lock().unwrap().revoke_to_completion());
+                let commit = commit.join().unwrap();
+                revoke.join().unwrap().unwrap();
+
+                let mut fixture = fixture.lock().unwrap();
+                assert_eq!(fixture.phase(), ScopePhase::Revoked);
+                assert!(fixture.is_quiescent());
+                match commit {
+                    Ok(true) => {
+                        assert_eq!(fixture.publications(), 1);
+                        assert_eq!(fixture.closures(), 1);
+                    }
+                    Err(RegistryError::StaleAuthority | RegistryError::ScopeNotActive) => {
+                        assert_eq!(fixture.publications(), 0);
+                        assert_eq!(fixture.closures(), 1);
+                    }
+                    other => panic!("unexpected production device commit result: {other:?}"),
+                }
+
+                let before = fixture.failure_atomic_projection();
+                assert!(matches!(
+                    fixture.commit(),
+                    Err(RegistryError::StaleAuthority | RegistryError::ScopeNotActive)
+                ));
+                assert_eq!(fixture.failure_atomic_projection(), before);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    });
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -42,6 +42,7 @@ impl Outcome {
     const fn registry_result(self) -> i64 {
         match self.registry_terminal() {
             TerminalOutcome::Completed => 1,
+            TerminalOutcome::IndeterminateAfterReset => -5,
             TerminalOutcome::Aborted => -125,
         }
     }
@@ -51,7 +52,7 @@ impl Outcome {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct RegistryContinuation {
     registry: EffectRegistry,
     scope: ScopeKey,
@@ -100,6 +101,13 @@ impl RegistryContinuation {
             handle: registered.handle,
             selection: None,
         }
+    }
+
+    fn failure_atomic_projection(&self) -> (String, Option<RevokeSelection>) {
+        (
+            self.registry.failure_atomic_projection(),
+            self.selection.clone(),
+        )
     }
 
     fn terminalize_and_close(&mut self, winner: &OneShotTerminalReceipt<Outcome>) {
@@ -166,19 +174,22 @@ impl RegistryContinuation {
         assert_eq!(before_ack.credits.committed, u64::from(outcome.commits()));
 
         self.registry.acknowledge_publication(&ticket).unwrap();
-        let after_ack = self.registry.clone();
+        let after_ack = self.registry.failure_atomic_projection();
         assert_eq!(
             self.registry.acknowledge_publication(&ticket),
             Err(RegistryError::InvalidPublication)
         );
-        assert_eq!(self.registry, after_ack);
-        let before_duplicate_terminal = self.registry.clone();
+        assert_eq!(self.registry.failure_atomic_projection(), after_ack);
+        let before_duplicate_terminal = self.registry.failure_atomic_projection();
         assert_eq!(
             self.registry
                 .stage_revoke_terminal(&selection, self.effect, request),
             Err(RegistryError::AlreadyTerminal)
         );
-        assert_eq!(self.registry, before_duplicate_terminal);
+        assert_eq!(
+            self.registry.failure_atomic_projection(),
+            before_duplicate_terminal
+        );
         assert!(self.registry.revoke_next(&selection).unwrap().is_none());
         self.registry.revoke_complete(&selection).unwrap();
         self.selection = Some(selection);
@@ -255,7 +266,7 @@ impl CompositeWait {
     }
 
     fn apply(&mut self, outcome: Outcome) -> bool {
-        let before_continuation = self.continuation.clone();
+        let before_continuation = self.continuation.failure_atomic_projection();
         let token = self.terminal.token();
         if outcome == Outcome::Timeout {
             let (deadline, deadline_token) = self.deadline.as_mut().unwrap();
@@ -266,7 +277,10 @@ impl CompositeWait {
                         self.terminal.try_terminalize(token, outcome),
                         Err(OneShotError::AlreadyTerminal)
                     );
-                    assert_eq!(self.continuation, before_continuation);
+                    assert_eq!(
+                        self.continuation.failure_atomic_projection(),
+                        before_continuation
+                    );
                     return false;
                 }
                 Err(error) => panic!("unexpected timeout result: {error:?}"),
@@ -288,7 +302,10 @@ impl CompositeWait {
                 true
             }
             Err(OneShotError::AlreadyTerminal) => {
-                assert_eq!(self.continuation, before_continuation);
+                assert_eq!(
+                    self.continuation.failure_atomic_projection(),
+                    before_continuation
+                );
                 false
             }
             Err(error) => panic!("unexpected one-shot result: {error:?}"),
@@ -386,7 +403,7 @@ fn run_single_winner(left: Outcome, right: Outcome, with_deadline: bool) {
             gate.continuation.registry_result(),
             winner.registry_result()
         );
-        let before_duplicate_continuation = gate.continuation.clone();
+        let before_duplicate_continuation = gate.continuation.failure_atomic_projection();
         let before_duplicate = gate.terminal.projection();
         let token = gate.terminal.token();
         assert_eq!(
@@ -394,13 +411,19 @@ fn run_single_winner(left: Outcome, right: Outcome, with_deadline: bool) {
             Err(OneShotError::AlreadyTerminal)
         );
         assert_eq!(gate.terminal.projection(), before_duplicate);
-        assert_eq!(gate.continuation, before_duplicate_continuation);
+        assert_eq!(
+            gate.continuation.failure_atomic_projection(),
+            before_duplicate_continuation
+        );
         assert_eq!(
             gate.terminal.try_terminalize(token, right),
             Err(OneShotError::AlreadyTerminal)
         );
         assert_eq!(gate.terminal.projection(), before_duplicate);
-        assert_eq!(gate.continuation, before_duplicate_continuation);
+        assert_eq!(
+            gate.continuation.failure_atomic_projection(),
+            before_duplicate_continuation
+        );
         if let Some((deadline, _)) = gate.deadline {
             assert_eq!(deadline.current(), None);
         }

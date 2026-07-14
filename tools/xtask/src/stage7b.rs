@@ -1707,7 +1707,10 @@ fn validate_terminal_registry_coupling_source(oneshot: &str, registry: &str) -> 
         ("assert_eq!(ticket.result(),outcome.registry_result());", 1),
         ("self.terminal.consume_terminal(&receipt).unwrap();", 1),
         ("self.continuation.terminalize_and_close(&receipt);", 1),
-        ("assert_eq!(self.continuation,before_continuation);", 2),
+        (
+            "assert_eq!(self.continuation.failure_atomic_projection(),before_continuation);",
+            2,
+        ),
         (
             "assert_eq!(gate.continuation.registry_terminal(),winner.registry_terminal());",
             1,
@@ -2891,6 +2894,17 @@ mod tests {
         );
         assert_ne!(wrong_success, oneshot);
         assert!(validate_terminal_registry_coupling_source(&wrong_success, registry).is_err());
+
+        let missing_continuation_projection = oneshot.replacen(
+            "                        self.continuation.failure_atomic_projection(),\n                        before_continuation",
+            "                        before_continuation,\n                        before_continuation",
+            1,
+        );
+        assert_ne!(missing_continuation_projection, oneshot);
+        assert!(
+            validate_terminal_registry_coupling_source(&missing_continuation_projection, registry,)
+                .is_err()
+        );
 
         let missing_winner_close = registry.replacen(
             "                    self.close_from_winner(&receipt);\n",
