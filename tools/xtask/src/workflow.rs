@@ -42,6 +42,7 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
 
     let frontdoor = fs::read_to_string(root.join("x"))?;
     validate_full_verify_order(&frontdoor)?;
+    validate_same_boot_acceptance_route(&frontdoor)?;
     validate_production_identity_route(&frontdoor)?;
 
     let dockerfile = fs::read_to_string(root.join("Dockerfile"))?;
@@ -121,6 +122,7 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         "run_xtask begin",
         "run_xtask verify",
         "run_system",
+        "run_same_boot_acceptance",
         "eval-stage7b",
         "run_xtask stage7b-evidence",
         "run_xtask complete",
@@ -136,6 +138,7 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         "run_xtask begin",
         "run_xtask verify",
         "run_system",
+        "run_same_boot_acceptance",
         "eval-stage7b",
         "run_xtask stage7b-evidence",
         "run_xtask complete",
@@ -158,6 +161,28 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         return Err(
             "root workflow does not restrict token injection to begin/complete/manifest".into(),
         );
+    }
+    Ok(())
+}
+
+fn validate_same_boot_acceptance_route(frontdoor: &str) -> Result<()> {
+    let (_, tail) = frontdoor
+        .split_once("run_same_boot_acceptance() {")
+        .ok_or("root workflow lacks run_same_boot_acceptance")?;
+    let (body, _) = tail
+        .split_once("\n}")
+        .ok_or("root same-boot acceptance body is not terminated")?;
+    let positive =
+        "run_backend \"$kernel_backend\" test-same-boot \"Nexus same-boot production filesystem\"";
+    let precommit = "run_backend \"$kernel_backend\" test-same-boot-precommit \"Nexus same-boot precommit revocation\"";
+    let (_, after_positive) = body
+        .split_once(positive)
+        .ok_or("root same-boot acceptance lacks the positive production gate")?;
+    if !after_positive.contains(precommit) {
+        return Err("root same-boot acceptance lacks ordered precommit revocation gate".into());
+    }
+    if body.matches("run_backend ").count() != 2 {
+        return Err("root same-boot acceptance has an unexpected backend population".into());
     }
     Ok(())
 }
@@ -495,17 +520,42 @@ verify_all() {
 "#;
         let suffix = "\n}\n";
         let ordered = format!(
-            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask complete\nrun_xtask manifest\nrun_xtask bundle{suffix}"
+            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_same_boot_acceptance\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask complete\nrun_xtask manifest\nrun_xtask bundle{suffix}"
         );
         validate_full_verify_order(&ordered).expect("ordered full verify");
 
         let spliced = format!(
-            "{prefix}run_xtask begin\nrun_xtask verify\nrun_xtask complete\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask manifest\nrun_xtask bundle{suffix}"
+            "{prefix}run_xtask begin\nrun_xtask verify\nrun_xtask complete\nrun_system\nrun_same_boot_acceptance\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask manifest\nrun_xtask bundle{suffix}"
         );
         let error = validate_full_verify_order(&spliced)
             .expect_err("completion before system must be rejected")
             .to_string();
         assert!(error.contains("missing or out of order"));
+
+        let late_same_boot = format!(
+            "{prefix}run_xtask begin\nrun_xtask verify\nrun_system\nrun_backend kernel eval-stage7b\nrun_xtask stage7b-evidence\nrun_xtask complete\nrun_same_boot_acceptance\nrun_xtask manifest\nrun_xtask bundle{suffix}"
+        );
+        let error = validate_full_verify_order(&late_same_boot)
+            .expect_err("same-boot acceptance after completion must be rejected")
+            .to_string();
+        assert!(error.contains("missing or out of order"));
+    }
+
+    #[test]
+    fn requires_the_same_boot_acceptance_route() {
+        let positive = r#"run_backend "$kernel_backend" test-same-boot "Nexus same-boot production filesystem""#;
+        let precommit = r#"run_backend "$kernel_backend" test-same-boot-precommit "Nexus same-boot precommit revocation""#;
+        let route = format!("run_same_boot_acceptance() {{\n    {positive}\n    {precommit}\n}}\n");
+        validate_same_boot_acceptance_route(&route).expect("complete same-boot route");
+
+        for broken in [
+            format!("run_same_boot_acceptance() {{\n    {precommit}\n}}\n"),
+            format!("run_same_boot_acceptance() {{\n    {positive}\n}}\n"),
+            format!("run_same_boot_acceptance() {{\n    {precommit}\n    {positive}\n}}\n"),
+            route.replacen("$kernel_backend", "$virtio_backend", 1),
+        ] {
+            assert!(validate_same_boot_acceptance_route(&broken).is_err());
+        }
     }
 
     #[test]

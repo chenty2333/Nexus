@@ -17,7 +17,7 @@ pub(crate) use bundle::{verify_bundle, write_bundle};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const SCHEMA: &str = "nexus.verification.v4";
+const SCHEMA: &str = "nexus.verification.v5";
 const START_SCHEMA: &str = "nexus.verification.start.v1";
 const MODEL_SPEC_SCHEMA: &str = "nexus.verification.model-spec.v1";
 const COMPLETE_SCHEMA: &str = "nexus.verification.complete.v1";
@@ -25,10 +25,11 @@ const SENTINEL: &str = "target/verification/.stage7a-verify-start.json";
 const MODEL_SPEC_RECEIPT: &str = "target/verification/.stage7a-model-spec-complete.json";
 const COMPLETION_RECEIPT: &str = "target/verification/.stage7a-verify-complete.json";
 const OUTPUT: &str = "target/verification/manifest.json";
-const COMPLETE_STAGES: [&str; 5] = [
+const COMPLETE_STAGES: [&str; 6] = [
     "reference-model",
     "formal-specifications",
     "system-composition",
+    "same-boot-device-composition",
     "stage7b-evaluation",
     "stage7b-contribution-decision",
 ];
@@ -123,6 +124,15 @@ struct Boundaries {
     stage5b_relation: &'static str,
     stage5b_same_boot: bool,
     real_dma_primary: bool,
+    same_boot_runtime_fs_identity_observed: bool,
+    same_boot_runtime_fs_effects: u64,
+    same_boot_runtime_fs_registry_domains: u64,
+    same_boot_runtime_fs_real_dma_observed: bool,
+    same_boot_runtime_fs_precommit_revoke_wins_observed: bool,
+    same_boot_runtime_fs_all_fault_paths_observed: bool,
+    same_boot_runtime_fs_irq_observed: bool,
+    same_boot_runtime_fs_smp_vcpus: u64,
+    same_boot_runtime_fs_real_user_service_crash_observed: bool,
     stage7b_concurrency_boundary: &'static str,
     stage7b_concurrency_races_checked: u64,
     stage7b_fault_cells_checked: u64,
@@ -167,6 +177,15 @@ impl Boundaries {
             stage5b_relation: "component_consistency",
             stage5b_same_boot: false,
             real_dma_primary: false,
+            same_boot_runtime_fs_identity_observed: true,
+            same_boot_runtime_fs_effects: 6,
+            same_boot_runtime_fs_registry_domains: 3,
+            same_boot_runtime_fs_real_dma_observed: true,
+            same_boot_runtime_fs_precommit_revoke_wins_observed: true,
+            same_boot_runtime_fs_all_fault_paths_observed: false,
+            same_boot_runtime_fs_irq_observed: false,
+            same_boot_runtime_fs_smp_vcpus: 1,
+            same_boot_runtime_fs_real_user_service_crash_observed: false,
             stage7b_concurrency_boundary: "production transition source under a Loom-modeled outer mutex",
             stage7b_concurrency_races_checked: 14,
             stage7b_fault_cells_checked: 20,
@@ -194,6 +213,127 @@ impl Boundaries {
 struct Stage {
     id: &'static str,
     evidence: Vec<String>,
+}
+
+fn manifest_stages(specs: &[&str]) -> Vec<Stage> {
+    vec![
+        Stage {
+            id: "reference-model",
+            evidence: vec![String::from("cargo test/clippy/canonical trace")],
+        },
+        Stage {
+            id: "formal-specifications",
+            evidence: specs
+                .iter()
+                .map(|spec| format!("target/verification/{spec}-tlc.log"))
+                .collect(),
+        },
+        Stage {
+            id: "ostd-five-domain-composition",
+            evidence: vec![String::from("kernel/nexus-ostd/artifacts/serial.log")],
+        },
+        Stage {
+            id: "ostd-runtime-filesystem",
+            evidence: vec![String::from("kernel/nexus-ostd/artifacts/serial.log")],
+        },
+        Stage {
+            id: "ostd-runtime-filesystem-same-boot-device",
+            evidence: vec![
+                String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/serial.log"),
+                String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/qemu-debug.log"),
+                String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/oracle.log"),
+            ],
+        },
+        Stage {
+            id: "ostd-runtime-filesystem-precommit-revoke-wins",
+            evidence: vec![
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/serial.log",
+                ),
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/qemu-debug.log",
+                ),
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/oracle.log",
+                ),
+            ],
+        },
+        Stage {
+            id: "ostd-runtime-network",
+            evidence: vec![
+                String::from("kernel/nexus-ostd/artifacts/serial.log"),
+                String::from("target/verification/runtime-net-oracle.log"),
+            ],
+        },
+        Stage {
+            id: "ostd-seven-domain-linux-io-composition",
+            evidence: vec![
+                String::from("kernel/nexus-ostd/artifacts/serial.log"),
+                String::from("target/verification/linux-io-composition-oracle.log"),
+            ],
+        },
+        Stage {
+            id: "mediated-virtio",
+            evidence: vec![
+                String::from("experiments/ostd-virtio-cser-spike/artifacts/kernel.log"),
+                String::from("experiments/ostd-virtio-cser-spike/artifacts/qemu-debug.log"),
+                String::from("experiments/ostd-virtio-cser-spike/artifacts/oracle.log"),
+            ],
+        },
+        Stage {
+            id: "system-composition",
+            evidence: vec![String::from(
+                "target/verification/system-composition-oracle.log",
+            )],
+        },
+        Stage {
+            id: "runtime-filesystem-composition",
+            evidence: vec![String::from(
+                "target/verification/runtime-fs-composition-oracle.log",
+            )],
+        },
+        Stage {
+            id: "implementation-source-concurrency",
+            evidence: vec![
+                String::from("target/verification/stage7b/concurrency.log"),
+                String::from("target/verification/stage7b/concurrency.json"),
+                String::from("target/verification/stage7b/concurrency-oracle.log"),
+            ],
+        },
+        Stage {
+            id: "fault-matrix",
+            evidence: vec![String::from(
+                "target/verification/stage7b/fault-matrix.jsonl",
+            )],
+        },
+        Stage {
+            id: "scale-structure",
+            evidence: vec![String::from("target/verification/stage7b/scale.jsonl")],
+        },
+        Stage {
+            id: "performance-observation",
+            evidence: vec![
+                String::from("kernel/nexus-ostd/artifacts/stage7b-evaluation.log"),
+                String::from("kernel/nexus-ostd/artifacts/stage7b-runtime-metadata.env"),
+                String::from("target/verification/stage7b/performance.json"),
+                String::from("target/verification/stage7b/oracle.log"),
+            ],
+        },
+        Stage {
+            id: "primary-source-prior-art",
+            evidence: vec![
+                String::from("target/verification/stage7b/prior-art.json"),
+                String::from("target/verification/stage7b/prior-art-oracle.log"),
+            ],
+        },
+        Stage {
+            id: "contribution-decision",
+            evidence: vec![
+                String::from("target/verification/stage7b/contribution.json"),
+                String::from("target/verification/stage7b/contribution-oracle.log"),
+            ],
+        },
+    ]
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -436,102 +576,7 @@ fn write_authorized(
     let completion_receipt_sha256 = sha256(&completion_file.bytes);
 
     let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let stages = vec![
-        Stage {
-            id: "reference-model",
-            evidence: vec![String::from("cargo test/clippy/canonical trace")],
-        },
-        Stage {
-            id: "formal-specifications",
-            evidence: specs
-                .iter()
-                .map(|spec| format!("target/verification/{spec}-tlc.log"))
-                .collect(),
-        },
-        Stage {
-            id: "ostd-five-domain-composition",
-            evidence: vec![String::from("kernel/nexus-ostd/artifacts/serial.log")],
-        },
-        Stage {
-            id: "ostd-runtime-filesystem",
-            evidence: vec![String::from("kernel/nexus-ostd/artifacts/serial.log")],
-        },
-        Stage {
-            id: "ostd-runtime-network",
-            evidence: vec![
-                String::from("kernel/nexus-ostd/artifacts/serial.log"),
-                String::from("target/verification/runtime-net-oracle.log"),
-            ],
-        },
-        Stage {
-            id: "ostd-seven-domain-linux-io-composition",
-            evidence: vec![
-                String::from("kernel/nexus-ostd/artifacts/serial.log"),
-                String::from("target/verification/linux-io-composition-oracle.log"),
-            ],
-        },
-        Stage {
-            id: "mediated-virtio",
-            evidence: vec![
-                String::from("experiments/ostd-virtio-cser-spike/artifacts/kernel.log"),
-                String::from("experiments/ostd-virtio-cser-spike/artifacts/qemu-debug.log"),
-                String::from("experiments/ostd-virtio-cser-spike/artifacts/oracle.log"),
-            ],
-        },
-        Stage {
-            id: "system-composition",
-            evidence: vec![String::from(
-                "target/verification/system-composition-oracle.log",
-            )],
-        },
-        Stage {
-            id: "runtime-filesystem-composition",
-            evidence: vec![String::from(
-                "target/verification/runtime-fs-composition-oracle.log",
-            )],
-        },
-        Stage {
-            id: "implementation-source-concurrency",
-            evidence: vec![
-                String::from("target/verification/stage7b/concurrency.log"),
-                String::from("target/verification/stage7b/concurrency.json"),
-                String::from("target/verification/stage7b/concurrency-oracle.log"),
-            ],
-        },
-        Stage {
-            id: "fault-matrix",
-            evidence: vec![String::from(
-                "target/verification/stage7b/fault-matrix.jsonl",
-            )],
-        },
-        Stage {
-            id: "scale-structure",
-            evidence: vec![String::from("target/verification/stage7b/scale.jsonl")],
-        },
-        Stage {
-            id: "performance-observation",
-            evidence: vec![
-                String::from("kernel/nexus-ostd/artifacts/stage7b-evaluation.log"),
-                String::from("kernel/nexus-ostd/artifacts/stage7b-runtime-metadata.env"),
-                String::from("target/verification/stage7b/performance.json"),
-                String::from("target/verification/stage7b/oracle.log"),
-            ],
-        },
-        Stage {
-            id: "primary-source-prior-art",
-            evidence: vec![
-                String::from("target/verification/stage7b/prior-art.json"),
-                String::from("target/verification/stage7b/prior-art-oracle.log"),
-            ],
-        },
-        Stage {
-            id: "contribution-decision",
-            evidence: vec![
-                String::from("target/verification/stage7b/contribution.json"),
-                String::from("target/verification/stage7b/contribution-oracle.log"),
-            ],
-        },
-    ];
+    let stages = manifest_stages(specs);
     let manifest = Manifest {
         schema: SCHEMA,
         status: "passed",
@@ -830,6 +875,38 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
         (
             String::from("kernel/nexus-ostd/artifacts/serial.log"),
             Some("COMPOSITION_SLICE PASS"),
+        ),
+        (
+            String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/serial.log"),
+            Some(
+                "LINUX_FS_SAME_BOOT PASS same_boot=true identity_preserving=true real_dma=true polling=true irq=false smp=1",
+            ),
+        ),
+        (
+            String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/qemu-debug.log"),
+            Some("vtd_inv_desc_iotlb_global"),
+        ),
+        (
+            String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/oracle.log"),
+            Some(
+                "runtime filesystem same-boot serial/debug assertions: PASS exact_six_effect_cohort=true owner_iommu_binding=true",
+            ),
+        ),
+        (
+            String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/serial.log"),
+            Some("LINUX_FS_SAME_BOOT_PRECOMMIT PASS"),
+        ),
+        (
+            String::from(
+                "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/qemu-debug.log",
+            ),
+            Some("vtd_inv_desc_iotlb_global"),
+        ),
+        (
+            String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/oracle.log"),
+            Some(
+                "runtime filesystem same-boot precommit serial/debug assertions: PASS prepared_owner_retained=true was_published=false owner_iova_translations=0 target_notify=false target_read=false target_completion=false",
+            ),
         ),
         (
             String::from("experiments/ostd-virtio-cser-spike/artifacts/kernel.log"),
@@ -1230,6 +1307,15 @@ mod tests {
         assert!(!boundaries.stage5b_same_boot);
         assert!(!boundaries.identity_preserving_stage5b_composition);
         assert!(!boundaries.real_dma_primary);
+        assert!(boundaries.same_boot_runtime_fs_identity_observed);
+        assert_eq!(boundaries.same_boot_runtime_fs_effects, 6);
+        assert_eq!(boundaries.same_boot_runtime_fs_registry_domains, 3);
+        assert!(boundaries.same_boot_runtime_fs_real_dma_observed);
+        assert!(boundaries.same_boot_runtime_fs_precommit_revoke_wins_observed);
+        assert!(!boundaries.same_boot_runtime_fs_all_fault_paths_observed);
+        assert!(!boundaries.same_boot_runtime_fs_irq_observed);
+        assert_eq!(boundaries.same_boot_runtime_fs_smp_vcpus, 1);
+        assert!(!boundaries.same_boot_runtime_fs_real_user_service_crash_observed);
         assert_eq!(boundaries.stage7b_concurrency_races_checked, 14);
         assert_eq!(boundaries.stage7b_fault_cells_checked, 20);
         assert_eq!(boundaries.stage7b_scale_points_checked, 14);
@@ -1255,6 +1341,21 @@ mod tests {
         assert_eq!(json["linux_io_composition_credit_classes"], 8);
         assert_eq!(json["linux_io_composition_credit_units"], 9);
         assert_eq!(json["real_dma_primary"], false);
+        assert_eq!(json["same_boot_runtime_fs_identity_observed"], true);
+        assert_eq!(json["same_boot_runtime_fs_effects"], 6);
+        assert_eq!(json["same_boot_runtime_fs_registry_domains"], 3);
+        assert_eq!(json["same_boot_runtime_fs_real_dma_observed"], true);
+        assert_eq!(
+            json["same_boot_runtime_fs_precommit_revoke_wins_observed"],
+            true
+        );
+        assert_eq!(json["same_boot_runtime_fs_all_fault_paths_observed"], false);
+        assert_eq!(json["same_boot_runtime_fs_irq_observed"], false);
+        assert_eq!(json["same_boot_runtime_fs_smp_vcpus"], 1);
+        assert_eq!(
+            json["same_boot_runtime_fs_real_user_service_crash_observed"],
+            false
+        );
         assert_eq!(json["stage7b_contribution_verdict"], "narrow");
         assert_eq!(json["stage7b_performance_claim"], "Observed");
     }

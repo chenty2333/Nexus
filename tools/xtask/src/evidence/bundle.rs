@@ -1,8 +1,9 @@
 use super::{
     Artifact, Boundaries, COMPLETE_SCHEMA, COMPLETE_STAGES, COMPLETION_RECEIPT, GateReceipt,
     MODEL_SPEC_RECEIPT, MODEL_SPEC_SCHEMA, OUTPUT as MANIFEST_PATH, SCHEMA, SENTINEL,
-    SourceSnapshot, StartRecord, is_sha256, model_spec_artifacts, read_regular_file_stable,
-    required_artifacts, sha256, source_snapshot, validate_gate_receipt, validate_start_record,
+    SourceSnapshot, StartRecord, is_sha256, manifest_stages, model_spec_artifacts,
+    read_regular_file_stable, required_artifacts, sha256, source_snapshot, validate_gate_receipt,
+    validate_start_record,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -16,23 +17,6 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 pub(super) const BUNDLE_DIRECTORY: &str = "target/verification/artifact-bundle";
 const CHECKSUMS: &str = "SHA256SUMS";
-const EXPECTED_STAGE_IDS: [&str; 15] = [
-    "reference-model",
-    "formal-specifications",
-    "ostd-five-domain-composition",
-    "ostd-runtime-filesystem",
-    "ostd-runtime-network",
-    "ostd-seven-domain-linux-io-composition",
-    "mediated-virtio",
-    "system-composition",
-    "runtime-filesystem-composition",
-    "implementation-source-concurrency",
-    "fault-matrix",
-    "scale-structure",
-    "performance-observation",
-    "primary-source-prior-art",
-    "contribution-decision",
-];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -353,16 +337,16 @@ fn validate_manifest_population(manifest: &PublishedManifest, specs: &[&str]) ->
     if manifest.specifications != expected_specs {
         return Err("artifact bundle specification population differs from the contract".into());
     }
-    let stage_ids: Vec<_> = manifest
-        .stages
-        .iter()
-        .map(|stage| stage.id.as_str())
-        .collect();
-    if stage_ids != EXPECTED_STAGE_IDS
+    let expected_stages = manifest_stages(specs);
+    if manifest.stages.len() != expected_stages.len()
         || manifest
             .stages
             .iter()
-            .any(|stage| stage.evidence.is_empty())
+            .zip(&expected_stages)
+            .any(|(actual, expected)| {
+                actual.id != expected.id
+                    || actual.evidence.as_slice() != expected.evidence.as_slice()
+            })
     {
         return Err("artifact bundle stage population differs from the contract".into());
     }
@@ -573,13 +557,7 @@ mod tests {
     }
 
     fn stage_population() -> Vec<Stage> {
-        EXPECTED_STAGE_IDS
-            .iter()
-            .map(|id| Stage {
-                id,
-                evidence: vec![String::from("fixture evidence")],
-            })
-            .collect()
+        manifest_stages(&SPECS)
     }
 
     fn write_json(path: &Path, value: &impl serde::Serialize) {
@@ -732,11 +710,11 @@ mod tests {
         verify_bundle_directory(&bundle, &SPECS).expect("verify complete bundle internally");
 
         let files = collect_files(&bundle).expect("collect bundle files");
-        assert_eq!(files.len(), 51);
+        assert_eq!(files.len(), 57);
         let sums =
             parse_checksum_index(&fs::read(bundle.join(CHECKSUMS)).expect("read checksum index"))
                 .expect("parse checksum index");
-        assert_eq!(sums.len(), 50);
+        assert_eq!(sums.len(), 56);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -757,6 +735,28 @@ mod tests {
 
         let error = verify_bundle_directory(&bundle, &SPECS)
             .expect_err("manifest digest must reject mutation")
+            .to_string();
+        assert!(error.contains("disagree with manifest"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn bundle_rejects_same_boot_oracle_mutation_with_rewritten_checksums() {
+        let root = fixture();
+        write_source_fixture(&root);
+        let bundle = write_bundle(&root, &SPECS).expect("write complete bundle");
+        let artifact = "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/oracle.log";
+        assert!(
+            required_artifacts(&SPECS)
+                .iter()
+                .any(|(path, _)| path == artifact)
+        );
+        fs::write(bundle.join(artifact), "mutated same-boot oracle\n")
+            .expect("mutate same-boot oracle");
+        rewrite_checksum_index_from_payload(&bundle);
+
+        let error = verify_bundle_directory(&bundle, &SPECS)
+            .expect_err("manifest digest must reject same-boot oracle mutation")
             .to_string();
         assert!(error.contains("disagree with manifest"));
         fs::remove_dir_all(root).expect("remove fixture");
@@ -810,6 +810,40 @@ mod tests {
             .expect_err("research boundary drift must be rejected")
             .to_string();
         assert!(error.contains("research boundaries"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn bundle_rejects_every_nonempty_stage_evidence_drift_with_consistent_checksums() {
+        let root = fixture();
+        write_source_fixture(&root);
+        let bundle = write_bundle(&root, &SPECS).expect("write complete bundle");
+        let manifest_path = bundle.join(MANIFEST_PATH);
+        let original: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        let stage_count = original["stages"]
+            .as_array()
+            .expect("manifest stage array")
+            .len();
+
+        for index in 0..stage_count {
+            let mut manifest = original.clone();
+            manifest["stages"][index]["evidence"] = Value::Array(vec![Value::String(format!(
+                "target/verification/forged-stage-{index}.log"
+            ))]);
+            write_json(&manifest_path, &manifest);
+            rewrite_checksum_index_from_payload(&bundle);
+
+            let error = verify_bundle_directory(&bundle, &SPECS)
+                .expect_err("canonical stage evidence must reject nonempty drift")
+                .to_string();
+            assert!(
+                error.contains("stage population"),
+                "stage {index} drift returned an unexpected error: {error}"
+            );
+        }
+
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

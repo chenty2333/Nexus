@@ -159,6 +159,11 @@ run_system() {
     run_composition_oracle
 }
 
+run_same_boot_acceptance() {
+    run_backend "$kernel_backend" test-same-boot "Nexus same-boot production filesystem"
+    run_backend "$kernel_backend" test-same-boot-precommit "Nexus same-boot precommit revocation"
+}
+
 check_host_shell_sources() {
     local count=0
     local interpreter
@@ -227,6 +232,7 @@ verify_all() {
     # OSDK images remain host-side backends; the root verification image never
     # receives access to the Docker socket.
     run_system
+    run_same_boot_acceptance
     run_backend "$kernel_backend" eval-stage7b "Nexus Stage 7B evaluator"
     run_xtask stage7b-evidence
     run_xtask complete
