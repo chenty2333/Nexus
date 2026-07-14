@@ -598,7 +598,7 @@ fn validate_non_device_candidate_caller_counts(
     observed: &BTreeMap<String, usize>,
 ) -> Result<(), String> {
     let expected = BTreeMap::from([
-        (FAULT_REGISTRY_SOURCE.to_owned(), 3usize),
+        (FAULT_REGISTRY_SOURCE.to_owned(), 4usize),
         (
             "kernel/nexus-ostd/src/cser/composition.rs".to_owned(),
             1usize,
@@ -703,9 +703,17 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
     let population = &device[..population_end];
     if device.matches("EffectRegistry::new()").count() != 0
         || population.matches(".register_derived(").count() != 2
-        || population.matches(".register_device_derived(").count() != 5
+        || source.matches("clone_non_device_candidate").count() != 4
+        || population.matches("clone_non_device_candidate").count() != 3
+        || device.matches("clone_non_device_candidate").count() != 3
+        || population.matches(".register_device_derived(").count() != 1
+        || population
+            .matches(".register_device_derived_cohort(")
+            .count()
+            != 4
         || device.matches(".register_derived(").count() != 6
-        || device.matches(".register_device_derived(").count() != 6
+        || device.matches(".register_device_derived(").count() != 2
+        || device.matches(".register_device_derived_cohort(").count() != 4
         || device.matches("commit_device_batch_with_publish(").count() != 8
         || device.matches("validate_device_batch_receipt(").count() != 8
         || device.matches("enroll_device_batch(").count() != 4
@@ -722,11 +730,30 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
             != 8
     {
         return Err(
-            "production device-batch self-test must reuse the production Registry and preserve its exact base-six, emergency-cancel, publication, timeout, retry, and receipt population"
+            "production device-batch self-test must reuse the production Registry and preserve its exact failure-atomic four-item registration cohort, base-six, emergency-cancel, publication, timeout, retry, and receipt population"
                 .into(),
         );
     }
     for required in [
+        "let device_cohort = || {",
+        "negative.register_device_derived_cohort(entries)",
+        "assert_eq!(negative, before, \"{label}\");",
+        "\"middle credit\"",
+        "\"middle resource\"",
+        "\"middle ancestry\"",
+        "\"middle device\"",
+        "\"forward parent\"",
+        "\"self parent\"",
+        "\"invalid parent\"",
+        "\"duplicate slot\"",
+        "\"missing slot\"",
+        "counter_failure.next_effect_id = u64::MAX - 1;",
+        "assert_eq!(counter_failure, counter_before);",
+        "disabled_cohort.register_device_derived_cohort(device_cohort())",
+        "assert_eq!(disabled_cohort, disabled_cohort_before);",
+        "let [block, dma_a, dma_b, dma_request] = registry",
+        ".register_device_derived_cohort(device_cohort())",
+        "assert_eq!(dma.identity.parent(), Some(block.identity.effect()));",
         "let registered = [",
         "assert_eq!(registry.effects_for_scope(SCOPE).len(), 6);",
         "assert_eq!(prepared.commits().len(), 6);",
@@ -753,6 +780,10 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "Err(RegistryError::InvalidBatchReceipt)",
         "Err(RegistryError::CounterOverflow)",
         "DeviceBatchCommitOutcome::AlreadyCommitted",
+        "wrong_completion_result.record_device_completion(&receipt, device, 512)",
+        "Err(RegistryError::CommitConflict)",
+        "assert_eq!(wrong_completion_result, wrong_completion_before);",
+        "assert_eq!(completion.causal_root(), syscall.identity.effect());",
         "let selection = registry.revoke_begin(SCOPE).unwrap();",
         "registry.validate_device_batch_receipt(&receipt).unwrap();",
     ] {
@@ -1010,6 +1041,200 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
     {
         return Err(
             "TerminalRequest must expose exactly one real IndeterminateAfterReset constructor"
+                .into(),
+        );
+    }
+
+    let cohort_gate_start = source
+        .find("pub(crate) fn register_device_derived_cohort(")
+        .ok_or_else(|| "production Registry lacks failure-atomic device cohort gate".to_owned())?;
+    let cohort_prepare_start = source[cohort_gate_start..]
+        .find("    fn prepare_device_derived_cohort(")
+        .map(|offset| cohort_gate_start + offset)
+        .ok_or_else(|| "device cohort prepare boundary is unterminated".to_owned())?;
+    let cohort_apply_start = source[cohort_prepare_start..]
+        .find("    fn apply_device_derived_cohort(")
+        .map(|offset| cohort_prepare_start + offset)
+        .ok_or_else(|| "device cohort apply boundary is unterminated".to_owned())?;
+    let cohort_end = source[cohort_apply_start..]
+        .find("    pub(crate) fn descriptor(")
+        .map(|offset| cohort_apply_start + offset)
+        .ok_or_else(|| "device cohort apply boundary is unterminated".to_owned())?;
+    let cohort_gate = &source[cohort_gate_start..cohort_prepare_start];
+    let cohort_prepare = &source[cohort_prepare_start..cohort_apply_start];
+    let cohort_apply = &source[cohort_apply_start..cohort_end];
+    for required in [
+        "self.require_unique_device_publication()?;",
+        "let plan = self.prepare_device_derived_cohort(entries)?;",
+        "Ok(self.apply_device_derived_cohort(plan))",
+    ] {
+        if !cohort_gate.contains(required) {
+            return Err(format!(
+                "device cohort gate lacks required prepare/apply step {required:?}"
+            ));
+        }
+    }
+    for required in [
+        "let mut slots = [None, None, None, None];",
+        "batch_index >= slots.len() || slots[batch_index].is_some()",
+        "parent_index >= slots.len() || parent_index >= batch_index",
+        "slots[batch_index] = Some(entry);",
+        "DeviceCohortParent::Existing(parent) => parent,",
+        "dma_a_entry.parent != DeviceCohortParent::BatchIndex(0)",
+        "dma_b_entry.parent != DeviceCohortParent::BatchIndex(0)",
+        "dma_request_entry.parent != DeviceCohortParent::BatchIndex(0)",
+        "let mut candidate = self.clone();",
+        "let block = candidate.register_device_derived(",
+        "let block_effect = block.identity.effect();",
+        "candidate.check_invariants()?;",
+        "registered: [block, dma_a, dma_b, dma_request],",
+    ] {
+        if !cohort_prepare.contains(required) {
+            return Err(format!(
+                "device cohort prevalidation lacks required atomicity/ancestry step {required:?}"
+            ));
+        }
+    }
+    if cohort_prepare
+        .matches("candidate.register_device_derived(")
+        .count()
+        != 4
+        || cohort_prepare.contains("self.register_device_derived(")
+    {
+        return Err(
+            "device cohort prevalidation must register exactly four entries only in its private candidate"
+                .into(),
+        );
+    }
+    let cohort_apply_compact: String = cohort_apply
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let expected_cohort_apply = concat!(
+        "fnapply_device_derived_cohort(&mutself,plan:DeviceDerivedCohortPlan,)",
+        "->[RegisteredEffect;4]{",
+        "letDeviceDerivedCohortPlan{candidate,registered,}=plan;",
+        "*self=candidate;",
+        "registered",
+        "}",
+    );
+    if cohort_apply_compact != expected_cohort_apply {
+        return Err(
+            "device cohort live apply must remain the canonical allocation-free, error-free candidate replacement"
+                .into(),
+        );
+    }
+
+    let registry_impl_start = source
+        .find("impl EffectRegistry {")
+        .ok_or_else(|| "production Registry lacks its inherent impl".to_owned())?;
+    let registry_impl_end = source[registry_impl_start..]
+        .find("\nfn validate_generation(")
+        .map(|offset| registry_impl_start + offset)
+        .ok_or_else(|| "production Registry inherent impl boundary is unterminated".to_owned())?;
+    let registry_impl = &source[registry_impl_start..registry_impl_end];
+    let candidate_clone_start = registry_impl
+        .find("pub(super) fn clone_non_device_candidate(")
+        .ok_or_else(|| "legacy candidate clone is not parent-module-only".to_owned())?;
+    let candidate_clone_end = registry_impl[candidate_clone_start..]
+        .find("    fn require_unique_device_publication(")
+        .map(|offset| candidate_clone_start + offset)
+        .ok_or_else(|| "legacy candidate clone boundary is unterminated".to_owned())?;
+    let projection_clone_start = registry_impl
+        .find("pub(crate) fn failure_atomic_projection(&self) -> String")
+        .ok_or_else(|| "Registry lacks its diagnostic projection".to_owned())?;
+    let projection_clone_end = registry_impl[projection_clone_start..]
+        .find("    fn rewrite_registry_instance(")
+        .map(|offset| projection_clone_start + offset)
+        .ok_or_else(|| "Registry diagnostic projection boundary is unterminated".to_owned())?;
+    if source
+        .matches("#[derive(Debug, Eq, PartialEq)]\npub(crate) struct EffectRegistry {")
+        .count()
+        != 1
+        || registry_impl
+            .matches("    fn clone(&self) -> Self {")
+            .count()
+            != 1
+        || registry_impl.contains("pub(crate) fn clone(&self) -> Self")
+        || registry_impl.contains("pub(super) fn clone(&self) -> Self")
+        || source.contains("impl Clone for EffectRegistry")
+        || registry_impl.contains("authority_copy")
+        || registry_impl.matches("self.clone()").count() != 3
+        || registry_impl[candidate_clone_start..candidate_clone_end]
+            .matches("self.clone()")
+            .count()
+            != 1
+        || registry_impl[projection_clone_start..projection_clone_end]
+            .matches("self.clone()")
+            .count()
+            != 1
+        || cohort_prepare.matches("self.clone()").count() != 1
+    {
+        return Err(
+            "EffectRegistry inherent cloning must remain private and confined to the exact legacy candidate, diagnostic projection, and device-cohort preparation sites"
+                .into(),
+        );
+    }
+
+    let completion_helper_start = source
+        .find("    fn device_batch_causal_root_commit<'a>(")
+        .ok_or_else(|| "production Registry lacks causal-root completion binding".to_owned())?;
+    let completion_start = source[completion_helper_start..]
+        .find("pub(crate) fn record_device_completion(")
+        .map(|offset| completion_helper_start + offset)
+        .ok_or_else(|| "device completion boundary is missing".to_owned())?;
+    let completion_end = source[completion_start..]
+        .find("pub(crate) fn begin_device_reset(")
+        .map(|offset| completion_start + offset)
+        .ok_or_else(|| "device completion boundary is unterminated".to_owned())?;
+    let completion_helper = &source[completion_helper_start..completion_start];
+    let completion = &source[completion_start..completion_end];
+    for required in [
+        "for commit in &batch.commits",
+        "if record.identity.parent.is_none() && causal_root.replace(commit).is_some()",
+        "causal_root.ok_or(RegistryError::InvalidBatchReceipt)",
+    ] {
+        if !completion_helper.contains(required) {
+            return Err(format!(
+                "device completion causal-root helper lacks uniqueness step {required:?}"
+            ));
+        }
+    }
+    let receipt_validation = completion
+        .find("self.validate_device_batch_receipt(batch)?;")
+        .ok_or_else(|| "device completion skips authoritative batch validation".to_owned())?;
+    let root_lookup = completion
+        .find("let causal_root = self.device_batch_causal_root_commit(batch)?;")
+        .ok_or_else(|| "device completion skips unique causal-root lookup".to_owned())?;
+    let result_check = completion
+        .find("if result != causal_root.result")
+        .ok_or_else(|| "device completion accepts a leaf-selected result".to_owned())?;
+    let root_state_lookup = completion
+        .find("let root = self.scopes[&batch.scope]")
+        .ok_or_else(|| "device completion lacks root state validation".to_owned())?;
+    let result_guard_compact: String = completion[root_lookup..root_state_lookup]
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let expected_result_guard = concat!(
+        "letcausal_root=self.device_batch_causal_root_commit(batch)?;",
+        "ifresult!=causal_root.result{",
+        "returnErr(RegistryError::CommitConflict);",
+        "}",
+    );
+    let sequence_apply = completion
+        .find("self.next_device_closure_sequence = next_sequence;")
+        .ok_or_else(|| "device completion lacks sequence application".to_owned())?;
+    if !(receipt_validation < root_lookup
+        && root_lookup < result_check
+        && result_check < sequence_apply)
+        || result_guard_compact != expected_result_guard
+        || !completion.contains("return Err(RegistryError::CommitConflict);")
+        || !completion.contains("causal_root: causal_root.effect,")
+        || !completion.contains("causal_commit_sequence: causal_root.sequence,")
+    {
+        return Err(
+            "device completion must bind the exact unique causal-root commit before any live mutation"
                 .into(),
         );
     }
@@ -1281,6 +1506,13 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .find("    fn register_in_domain(")
         .map(|offset| registration_start + offset)
         .ok_or_else(|| "device-derived registration boundary is unterminated".to_owned())?;
+    let cohort_registration_start = source
+        .find("pub(crate) fn register_device_derived_cohort(")
+        .ok_or_else(|| "production Registry lacks device-derived cohort registration".to_owned())?;
+    let cohort_registration_end = source[cohort_registration_start..]
+        .find("    fn prepare_device_derived_cohort(")
+        .map(|offset| cohort_registration_start + offset)
+        .ok_or_else(|| "device-derived cohort registration boundary is unterminated".to_owned())?;
     let validation_start = source
         .find("    fn validate_kernel_root_authority(")
         .ok_or_else(|| "production Registry lacks kernel root authority validation".to_owned())?;
@@ -1311,7 +1543,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "Ok(())",
         "}",
     );
-    if source.matches(authority_guard).count() != 3
+    if source.matches(authority_guard).count() != 4
         || source[mint_start..mint_end]
             .matches(authority_guard)
             .count()
@@ -1322,6 +1554,11 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
             .count()
             != 1
         || !guard_is_first_statement(&source[registration_start..registration_end])
+        || source[cohort_registration_start..cohort_registration_end]
+            .matches(authority_guard)
+            .count()
+            != 1
+        || !guard_is_first_statement(&source[cohort_registration_start..cohort_registration_end])
         || source[validation_start..validation_end]
             .matches(authority_guard)
             .count()
@@ -1330,7 +1567,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         || unique_guard_compact != expected_unique_guard
     {
         return Err(
-            "device publication authority must guard exactly the mint, device-derived registration, and root-validation functions"
+            "device publication authority must guard exactly the mint, single/cohort device-derived registrations, and root-validation functions"
                 .into(),
         );
     }
@@ -1338,9 +1575,17 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "enum DevicePublicationMode {",
         "DisabledNonDeviceCandidate",
         "device_publication_mode: DevicePublicationMode,",
-        "pub(crate) fn clone_non_device_candidate(&self) -> Result<Self, RegistryError>",
+        "pub(super) fn clone_non_device_candidate(&self) -> Result<Self, RegistryError>",
         "candidate.device_publication_mode = DevicePublicationMode::DisabledNonDeviceCandidate;",
         "fn require_unique_device_publication(&self) -> Result<(), RegistryError>",
+        "pub(crate) enum DeviceCohortParent {",
+        "Existing(EffectKey)",
+        "BatchIndex(usize)",
+        "pub(crate) struct DeviceDerivedCohortEntry {",
+        "batch_index: usize,",
+        "pub(crate) fn register_device_derived_cohort(",
+        "fn prepare_device_derived_cohort(",
+        "fn apply_device_derived_cohort(",
         "non-device candidate acquired device publication state",
         "let mut non_device_candidate = registry.clone_non_device_candidate().unwrap();",
         "non_device_candidate.kernel_root_authority(SCOPE, ROOT_OWNER)",
@@ -1359,6 +1604,11 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "pub(crate) fn validate_device_batch_receipt(",
         "fn reconstruct_device_batch_receipt(",
         "pub(crate) fn record_device_completion(",
+        "fn device_batch_causal_root_commit<'a>(",
+        "if result != causal_root.result",
+        "causal_root: causal_root.effect,",
+        "causal_commit_sequence: causal_root.sequence,",
+        "device completion causal root drift",
         "if presented_device != root.current_device",
         "pub(crate) fn begin_unpublished_device_cancel(",
         "root.outcome = Some(DeviceClosureResult::AbortedBeforeCommit);",
@@ -2410,7 +2660,7 @@ mod tests {
 
     fn checked_non_device_candidate_callers() -> BTreeMap<String, usize> {
         BTreeMap::from([
-            (FAULT_REGISTRY_SOURCE.to_owned(), 3usize),
+            (FAULT_REGISTRY_SOURCE.to_owned(), 4usize),
             (
                 "kernel/nexus-ostd/src/cser/composition.rs".to_owned(),
                 1usize,
@@ -2464,7 +2714,7 @@ mod tests {
         for (relative, source) in [
             (
                 FAULT_REGISTRY_SOURCE,
-                "clone_non_device_candidate clone_non_device_candidate clone_non_device_candidate",
+                "clone_non_device_candidate clone_non_device_candidate clone_non_device_candidate clone_non_device_candidate",
             ),
             (
                 "kernel/nexus-ostd/src/cser/composition.rs",
@@ -2612,9 +2862,130 @@ mod tests {
             moved_device_authority_guard
                 .matches("self.require_unique_device_publication()?;")
                 .count(),
-            3
+            4
         );
         assert!(validate_fault_registry_source_text(&moved_device_authority_guard).is_err());
+
+        let cohort_prefix = concat!(
+            "pub(crate) fn register_device_derived_cohort(\n",
+            "        &mut self,\n",
+            "        entries: [DeviceDerivedCohortEntry; 4],\n",
+            "    ) -> Result<[RegisteredEffect; 4], RegistryError> {\n",
+            "        self.require_unique_device_publication()?;",
+        );
+        let missing_cohort_authority_guard = source.replacen(
+            cohort_prefix,
+            &cohort_prefix.replace(
+                "self.require_unique_device_publication()?;",
+                "let _ = self.device_publication_mode;",
+            ),
+            1,
+        );
+        assert_ne!(missing_cohort_authority_guard, source);
+        assert!(validate_fault_registry_source_text(&missing_cohort_authority_guard).is_err());
+
+        let public_inherent_registry_clone = source.replacen(
+            "    fn clone(&self) -> Self {",
+            "    pub(crate) fn clone(&self) -> Self {",
+            1,
+        );
+        assert_ne!(public_inherent_registry_clone, source);
+        assert!(validate_fault_registry_source_text(&public_inherent_registry_clone).is_err());
+
+        let trait_cloneable_registry = source.replacen(
+            "#[derive(Debug, Eq, PartialEq)]\npub(crate) struct EffectRegistry {",
+            "#[derive(Clone, Debug, Eq, PartialEq)]\npub(crate) struct EffectRegistry {",
+            1,
+        );
+        assert_ne!(trait_cloneable_registry, source);
+        assert!(validate_fault_registry_source_text(&trait_cloneable_registry).is_err());
+
+        let public_legacy_candidate_clone = source.replacen(
+            "pub(super) fn clone_non_device_candidate(&self) -> Result<Self, RegistryError>",
+            "pub(crate) fn clone_non_device_candidate(&self) -> Result<Self, RegistryError>",
+            1,
+        );
+        assert_ne!(public_legacy_candidate_clone, source);
+        assert!(validate_fault_registry_source_text(&public_legacy_candidate_clone).is_err());
+
+        let authority_copy_wrapper = source.replacen(
+            "    /// Clones a legacy composition candidate without duplicating device",
+            concat!(
+                "    fn authority_copy(&self) -> Self {\n",
+                "        self.clone()\n",
+                "    }\n\n",
+                "    /// Clones a legacy composition candidate without duplicating device",
+            ),
+            1,
+        );
+        assert_ne!(authority_copy_wrapper, source);
+        assert!(validate_fault_registry_source_text(&authority_copy_wrapper).is_err());
+
+        let extra_registry_clone = source.replacen(
+            "let mut candidate = self.clone();\n        let block =",
+            "let _extra = self.clone();\n        let mut candidate = self.clone();\n        let block =",
+            1,
+        );
+        assert_ne!(extra_registry_clone, source);
+        assert!(validate_fault_registry_source_text(&extra_registry_clone).is_err());
+
+        let forward_parent_allowed = source.replacen(
+            "parent_index >= slots.len() || parent_index >= batch_index",
+            "parent_index >= slots.len()",
+            1,
+        );
+        assert_ne!(forward_parent_allowed, source);
+        assert!(validate_fault_registry_source_text(&forward_parent_allowed).is_err());
+
+        let live_partial_registration = source.replacen(
+            "let block = candidate.register_device_derived(",
+            "let block = self.register_device_derived(",
+            1,
+        );
+        assert_ne!(live_partial_registration, source);
+        assert!(validate_fault_registry_source_text(&live_partial_registration).is_err());
+
+        let unchecked_cohort_candidate =
+            source.replacen("candidate.check_invariants()?;", "let _ = &candidate;", 1);
+        assert_ne!(unchecked_cohort_candidate, source);
+        assert!(validate_fault_registry_source_text(&unchecked_cohort_candidate).is_err());
+
+        let allocating_cohort_apply = source.replacen(
+            "*self = candidate;",
+            "self.effects.insert(effect, record);\n        *self = candidate;",
+            1,
+        );
+        assert_ne!(allocating_cohort_apply, source);
+        assert!(validate_fault_registry_source_text(&allocating_cohort_apply).is_err());
+
+        let post_swap_allocating_cohort_apply = source.replacen(
+            "*self = candidate;\n        registered",
+            "*self = candidate;\n        let _late = alloc::vec![registered.len()];\n        registered",
+            1,
+        );
+        assert_ne!(post_swap_allocating_cohort_apply, source);
+        assert!(validate_fault_registry_source_text(&post_swap_allocating_cohort_apply).is_err());
+
+        let leaf_selected_completion_result =
+            source.replacen("if result != causal_root.result", "if false", 1);
+        assert_ne!(leaf_selected_completion_result, source);
+        assert!(validate_fault_registry_source_text(&leaf_selected_completion_result).is_err());
+
+        let disabled_completion_result_check = source.replacen(
+            "if result != causal_root.result {",
+            "if result != causal_root.result && false {",
+            1,
+        );
+        assert_ne!(disabled_completion_result_check, source);
+        assert!(validate_fault_registry_source_text(&disabled_completion_result_check).is_err());
+
+        let unbound_completion_receipt = source.replacen(
+            "causal_root: causal_root.effect,",
+            "causal_root: batch.commits[1].effect,",
+            1,
+        );
+        assert_ne!(unbound_completion_receipt, source);
+        assert!(validate_fault_registry_source_text(&unbound_completion_receipt).is_err());
 
         let missing_candidate_invariant = source.replacen(
             "non-device candidate acquired device publication state",

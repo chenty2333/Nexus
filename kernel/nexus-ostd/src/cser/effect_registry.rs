@@ -868,6 +868,8 @@ pub(crate) struct DeviceCompletionReceipt {
     batch_sequence: u64,
     device: DeviceEnvelope,
     sequence: u64,
+    causal_root: EffectKey,
+    causal_commit_sequence: u64,
     result: i64,
 }
 
@@ -878,6 +880,10 @@ impl DeviceCompletionReceipt {
 
     pub(crate) const fn result(self) -> i64 {
         self.result
+    }
+
+    pub(crate) const fn causal_root(self) -> EffectKey {
+        self.causal_root
     }
 }
 
@@ -1121,6 +1127,29 @@ pub(crate) struct DeviceDerivedRegisterRequest {
     pub(crate) device: DeviceEnvelope,
 }
 
+/// Resolves one parent without requiring a caller to predict an effect key
+/// that the Registry has not allocated yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceCohortParent {
+    Existing(EffectKey),
+    BatchIndex(usize),
+}
+
+/// One fixed-position member of the production block/DMA registration cohort.
+///
+/// Batch index zero is the block request. Indices one through three are its
+/// DMA owners. Keeping the index explicit lets validation reject duplicate,
+/// missing, self, forward, and out-of-range references before the live
+/// Registry changes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceDerivedCohortEntry {
+    pub(crate) batch_index: usize,
+    pub(crate) request: RegisterRequest,
+    pub(crate) domain: DomainKey,
+    pub(crate) parent: DeviceCohortParent,
+    pub(crate) device: DeviceEnvelope,
+}
+
 /// One failure-atomic update of an effect's current resource membership.
 ///
 /// `handle` authenticates the complete immutable effect identity. Only the
@@ -1267,6 +1296,11 @@ struct DeviceBatchApplyPlan {
     next_commit_sequence: u64,
     next_device_batch_sequence: u64,
     next_scope_revision: u64,
+}
+
+struct DeviceDerivedCohortPlan {
+    candidate: EffectRegistry,
+    registered: [RegisteredEffect; 4],
 }
 
 struct DeviceResetApplyPlan {
@@ -1665,7 +1699,8 @@ impl EffectRegistry {
     /// Private evidence snapshot. `EffectRegistry` deliberately does not
     /// implement `Clone`: a production caller cannot duplicate the registry
     /// instance namespace and publish twice with copied authority. Only code
-    /// in this module can take a read-only/failure-atomic test snapshot.
+    /// in this module can take a read-only evidence snapshot or build a
+    /// private failure-atomic registration candidate that never escapes.
     fn clone(&self) -> Self {
         Self {
             instance_id: self.instance_id,
@@ -1696,7 +1731,7 @@ impl EffectRegistry {
     /// envelope, mint a kernel root authority, or enter the production batch
     /// gate. This keeps `EffectRegistry` itself non-`Clone` while making that
     /// historical transaction shape explicit and fail closed.
-    pub(crate) fn clone_non_device_candidate(&self) -> Result<Self, RegistryError> {
+    pub(super) fn clone_non_device_candidate(&self) -> Result<Self, RegistryError> {
         if self
             .scopes
             .values()
@@ -2096,6 +2131,112 @@ impl EffectRegistry {
         scope.revision = next_scope_revision;
         scope.invalidate_recovery_readiness();
         Ok(RegisteredEffect { identity, handle })
+    }
+
+    /// Failure-atomically installs the fixed production block/DMA cohort.
+    ///
+    /// The returned order is always `[block, dma_a, dma_b, dma_request]`.
+    /// Every allocation and every ordinary registration check happens in a
+    /// private candidate first. The live apply is one infallible replacement,
+    /// so a failure in any middle entry cannot leak a device root, credit,
+    /// reverse-index member, or advanced counter.
+    pub(crate) fn register_device_derived_cohort(
+        &mut self,
+        entries: [DeviceDerivedCohortEntry; 4],
+    ) -> Result<[RegisteredEffect; 4], RegistryError> {
+        self.require_unique_device_publication()?;
+        let plan = self.prepare_device_derived_cohort(entries)?;
+        Ok(self.apply_device_derived_cohort(plan))
+    }
+
+    fn prepare_device_derived_cohort(
+        &self,
+        entries: [DeviceDerivedCohortEntry; 4],
+    ) -> Result<DeviceDerivedCohortPlan, RegistryError> {
+        let mut slots = [None, None, None, None];
+        for entry in entries {
+            let batch_index = entry.batch_index;
+            if batch_index >= slots.len() || slots[batch_index].is_some() {
+                return Err(RegistryError::InvalidState);
+            }
+            if let DeviceCohortParent::BatchIndex(parent_index) = entry.parent
+                && (parent_index >= slots.len() || parent_index >= batch_index)
+            {
+                return Err(RegistryError::InvalidState);
+            }
+            slots[batch_index] = Some(entry);
+        }
+        let [
+            Some(block_entry),
+            Some(dma_a_entry),
+            Some(dma_b_entry),
+            Some(dma_request_entry),
+        ] = slots
+        else {
+            return Err(RegistryError::InvalidState);
+        };
+        let block_parent = match block_entry.parent {
+            DeviceCohortParent::Existing(parent) => parent,
+            DeviceCohortParent::BatchIndex(_) => return Err(RegistryError::InvalidState),
+        };
+        if dma_a_entry.parent != DeviceCohortParent::BatchIndex(0)
+            || dma_b_entry.parent != DeviceCohortParent::BatchIndex(0)
+            || dma_request_entry.parent != DeviceCohortParent::BatchIndex(0)
+        {
+            return Err(RegistryError::InvalidState);
+        }
+
+        let mut candidate = self.clone();
+        let block = candidate.register_device_derived(DeviceDerivedRegisterRequest {
+            derived: DerivedRegisterRequest {
+                request: block_entry.request,
+                domain: block_entry.domain,
+                parent: Some(block_parent),
+            },
+            device: block_entry.device,
+        })?;
+        let block_effect = block.identity.effect();
+        let dma_a = candidate.register_device_derived(DeviceDerivedRegisterRequest {
+            derived: DerivedRegisterRequest {
+                request: dma_a_entry.request,
+                domain: dma_a_entry.domain,
+                parent: Some(block_effect),
+            },
+            device: dma_a_entry.device,
+        })?;
+        let dma_b = candidate.register_device_derived(DeviceDerivedRegisterRequest {
+            derived: DerivedRegisterRequest {
+                request: dma_b_entry.request,
+                domain: dma_b_entry.domain,
+                parent: Some(block_effect),
+            },
+            device: dma_b_entry.device,
+        })?;
+        let dma_request = candidate.register_device_derived(DeviceDerivedRegisterRequest {
+            derived: DerivedRegisterRequest {
+                request: dma_request_entry.request,
+                domain: dma_request_entry.domain,
+                parent: Some(block_effect),
+            },
+            device: dma_request_entry.device,
+        })?;
+        candidate.check_invariants()?;
+        Ok(DeviceDerivedCohortPlan {
+            candidate,
+            registered: [block, dma_a, dma_b, dma_request],
+        })
+    }
+
+    fn apply_device_derived_cohort(
+        &mut self,
+        plan: DeviceDerivedCohortPlan,
+    ) -> [RegisteredEffect; 4] {
+        let DeviceDerivedCohortPlan {
+            candidate,
+            registered,
+        } = plan;
+        *self = candidate;
+        registered
     }
 
     pub(crate) fn descriptor(
@@ -2683,8 +2824,30 @@ impl EffectRegistry {
         Ok(enrollment.clone())
     }
 
+    fn device_batch_causal_root_commit<'a>(
+        &self,
+        batch: &'a DeviceBatchCommitReceipt,
+    ) -> Result<&'a CommitReceipt, RegistryError> {
+        let mut causal_root = None;
+        for commit in &batch.commits {
+            let record = self
+                .effects
+                .get(&commit.effect)
+                .ok_or(RegistryError::InvalidBatchReceipt)?;
+            if record.identity.scope != batch.scope {
+                return Err(RegistryError::InvalidBatchReceipt);
+            }
+            if record.identity.parent.is_none() && causal_root.replace(commit).is_some() {
+                return Err(RegistryError::InvalidBatchReceipt);
+            }
+        }
+        causal_root.ok_or(RegistryError::InvalidBatchReceipt)
+    }
+
     /// Records one backend completion only for the exact committed batch and
-    /// current device generation. Once reset begins, late completion is not a
+    /// current device generation. The reported result must equal the commit
+    /// result of the batch's unique causal root; a device leaf cannot rewrite
+    /// the user-visible result. Once reset begins, late completion is not a
     /// substitute for reset/IOTLB closure.
     pub(crate) fn record_device_completion(
         &mut self,
@@ -2693,6 +2856,10 @@ impl EffectRegistry {
         result: i64,
     ) -> Result<DeviceCompletionReceipt, RegistryError> {
         self.validate_device_batch_receipt(batch)?;
+        let causal_root = self.device_batch_causal_root_commit(batch)?;
+        if result != causal_root.result {
+            return Err(RegistryError::CommitConflict);
+        }
         let root = self.scopes[&batch.scope]
             .device_root
             .as_ref()
@@ -2727,6 +2894,8 @@ impl EffectRegistry {
             batch_sequence: batch.batch_sequence,
             device: presented_device,
             sequence,
+            causal_root: causal_root.effect,
+            causal_commit_sequence: causal_root.sequence,
             result,
         };
         self.next_device_closure_sequence = next_sequence;
@@ -5466,6 +5635,22 @@ impl EffectRegistry {
             return Err(RegistryError::Invariant(
                 "invalid device completion receipt",
             ));
+        }
+        if let Some(completion) = root.completion {
+            let batch = self
+                .reconstruct_device_batch_receipt(scope_key, completion.batch_sequence)
+                .map_err(|_| RegistryError::Invariant("completion lacks authoritative batch"))?;
+            let causal_root = self
+                .device_batch_causal_root_commit(&batch)
+                .map_err(|_| RegistryError::Invariant("completion lacks unique causal root"))?;
+            if completion.causal_root != causal_root.effect
+                || completion.causal_commit_sequence != causal_root.sequence
+                || completion.result != causal_root.result
+            {
+                return Err(RegistryError::Invariant(
+                    "device completion causal root drift",
+                ));
+            }
         }
         if let Some(ticket) = root.reset_ticket
             && (ticket.registry_instance_id != self.instance_id
@@ -8251,9 +8436,10 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             parent: Some(syscall.identity.effect()),
         })
         .unwrap();
-    let block = registry
-        .register_device_derived(DeviceDerivedRegisterRequest {
-            derived: DerivedRegisterRequest {
+    let device_cohort = || {
+        [
+            DeviceDerivedCohortEntry {
+                batch_index: 0,
                 request: RegisterRequest {
                     scope: SCOPE,
                     task: VIRTIO,
@@ -8264,14 +8450,11 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     publication: PublicationMode::None,
                 },
                 domain: VIRTIO_DOMAIN,
-                parent: Some(filesystem.identity.effect()),
+                parent: DeviceCohortParent::Existing(filesystem.identity.effect()),
+                device,
             },
-            device,
-        })
-        .unwrap();
-    let dma_a = registry
-        .register_device_derived(DeviceDerivedRegisterRequest {
-            derived: DerivedRegisterRequest {
+            DeviceDerivedCohortEntry {
+                batch_index: 1,
                 request: RegisterRequest {
                     scope: SCOPE,
                     task: VIRTIO,
@@ -8282,14 +8465,11 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     publication: PublicationMode::None,
                 },
                 domain: VIRTIO_DOMAIN,
-                parent: Some(block.identity.effect()),
+                parent: DeviceCohortParent::BatchIndex(0),
+                device,
             },
-            device,
-        })
-        .unwrap();
-    let dma_b = registry
-        .register_device_derived(DeviceDerivedRegisterRequest {
-            derived: DerivedRegisterRequest {
+            DeviceDerivedCohortEntry {
+                batch_index: 2,
                 request: RegisterRequest {
                     scope: SCOPE,
                     task: VIRTIO,
@@ -8300,14 +8480,11 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     publication: PublicationMode::None,
                 },
                 domain: VIRTIO_DOMAIN,
-                parent: Some(block.identity.effect()),
+                parent: DeviceCohortParent::BatchIndex(0),
+                device,
             },
-            device,
-        })
-        .unwrap();
-    let dma_request = registry
-        .register_device_derived(DeviceDerivedRegisterRequest {
-            derived: DerivedRegisterRequest {
+            DeviceDerivedCohortEntry {
+                batch_index: 3,
                 request: RegisterRequest {
                     scope: SCOPE,
                     task: VIRTIO,
@@ -8318,10 +8495,106 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
                     publication: PublicationMode::None,
                 },
                 domain: VIRTIO_DOMAIN,
-                parent: Some(block.identity.effect()),
+                parent: DeviceCohortParent::BatchIndex(0),
+                device,
             },
-            device,
-        })
+        ]
+    };
+    let reject_cohort =
+        |label: &str, entries: [DeviceDerivedCohortEntry; 4], expected: RegistryError| {
+            let mut negative = registry.clone();
+            let before = negative.clone();
+            assert_eq!(
+                negative.register_device_derived_cohort(entries),
+                Err(expected),
+                "{label}"
+            );
+            assert_eq!(negative, before, "{label}");
+        };
+
+    let mut credit_failure = device_cohort();
+    credit_failure[1].request.credits = alloc::vec![CreditCharge::new(DMA_OWNER, 4)];
+    reject_cohort(
+        "middle credit",
+        credit_failure,
+        RegistryError::CreditExhausted,
+    );
+
+    let mut resource_failure = device_cohort();
+    resource_failure[1].request.resources = alloc::vec![ResourceKey::new(0x31, 4, 0)];
+    reject_cohort(
+        "middle resource",
+        resource_failure,
+        RegistryError::InvalidGeneration,
+    );
+
+    let mut ancestry_failure = device_cohort();
+    ancestry_failure[1].parent = DeviceCohortParent::Existing(filesystem.identity.effect());
+    reject_cohort(
+        "middle ancestry",
+        ancestry_failure,
+        RegistryError::InvalidState,
+    );
+
+    let mut device_failure = device_cohort();
+    device_failure[1].device = DeviceEnvelope::new(0x51, 0, 0, 2).unwrap();
+    reject_cohort(
+        "middle device",
+        device_failure,
+        RegistryError::StaleDeviceGeneration,
+    );
+
+    let mut forward_parent = device_cohort();
+    forward_parent[1].parent = DeviceCohortParent::BatchIndex(2);
+    reject_cohort(
+        "forward parent",
+        forward_parent,
+        RegistryError::InvalidState,
+    );
+
+    let mut self_parent = device_cohort();
+    self_parent[1].parent = DeviceCohortParent::BatchIndex(1);
+    reject_cohort("self parent", self_parent, RegistryError::InvalidState);
+
+    let mut invalid_parent = device_cohort();
+    invalid_parent[1].parent = DeviceCohortParent::BatchIndex(4);
+    reject_cohort(
+        "invalid parent",
+        invalid_parent,
+        RegistryError::InvalidState,
+    );
+
+    let mut duplicate_slot = device_cohort();
+    duplicate_slot[2].batch_index = 1;
+    reject_cohort(
+        "duplicate slot",
+        duplicate_slot,
+        RegistryError::InvalidState,
+    );
+
+    let mut missing_slot = device_cohort();
+    missing_slot[3].batch_index = 4;
+    reject_cohort("missing slot", missing_slot, RegistryError::InvalidState);
+
+    let mut counter_failure = registry.clone();
+    counter_failure.next_effect_id = u64::MAX - 1;
+    let counter_before = counter_failure.clone();
+    assert_eq!(
+        counter_failure.register_device_derived_cohort(device_cohort()),
+        Err(RegistryError::CounterOverflow)
+    );
+    assert_eq!(counter_failure, counter_before);
+
+    let mut disabled_cohort = registry.clone_non_device_candidate().unwrap();
+    let disabled_cohort_before = disabled_cohort.clone();
+    assert_eq!(
+        disabled_cohort.register_device_derived_cohort(device_cohort()),
+        Err(RegistryError::InvalidDeviceEnvelope)
+    );
+    assert_eq!(disabled_cohort, disabled_cohort_before);
+
+    let [block, dma_a, dma_b, dma_request] = registry
+        .register_device_derived_cohort(device_cohort())
         .unwrap();
     assert!(matches!(
         registry.clone_non_device_candidate(),
@@ -8329,6 +8602,10 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
     ));
 
     let registered = [&syscall, &filesystem, &block, &dma_a, &dma_b, &dma_request];
+    assert_eq!(block.identity.parent(), Some(filesystem.identity.effect()));
+    for dma in [&dma_a, &dma_b, &dma_request] {
+        assert_eq!(dma.identity.parent(), Some(block.identity.effect()));
+    }
     for (sender, effect) in [
         (PERSONALITY, &syscall),
         (FILESYSTEM, &filesystem),
@@ -8910,6 +9187,14 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         Err(RegistryError::InvalidBatchReceipt)
     );
 
+    let mut wrong_completion_result = registry.clone();
+    let wrong_completion_before = wrong_completion_result.clone();
+    assert_eq!(
+        wrong_completion_result.record_device_completion(&receipt, device, 512),
+        Err(RegistryError::CommitConflict)
+    );
+    assert_eq!(wrong_completion_result, wrong_completion_before);
+
     // Normal completion still requires whole-device reset and IOTLB closure.
     let mut normal = registry.clone();
     let completion = normal
@@ -8917,6 +9202,7 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         .unwrap();
     assert_eq!(completion.device(), device);
     assert_eq!(completion.result(), 4);
+    assert_eq!(completion.causal_root(), syscall.identity.effect());
     let reset_ticket = normal.begin_device_reset(&receipt).unwrap();
     let reset_applies = Cell::new(0_u8);
     let (reset, ()) = normal
