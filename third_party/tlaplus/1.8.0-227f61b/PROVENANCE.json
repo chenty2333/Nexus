@@ -1,0 +1,27 @@
+{
+  "schema": "nexus.toolchain-provenance.v1",
+  "name": "tla2tools-227f61b.jar",
+  "jar_sha256": "33de7da9ce1b7fffb9d1c184021178dbb051747be48504e65c584c423721a32e",
+  "jar_bytes": 4357904,
+  "tlc_version": "2026.07.09.134028",
+  "upstream_repository": "https://github.com/tlaplus/tlaplus",
+  "upstream_source_revision": "227f61b983d0203a06db8184da45aed421e8f1b8",
+  "upstream_source_revision_verification": "github-verified",
+  "upstream_release_name": "v1.8.0",
+  "upstream_release_prerelease_at_audit": true,
+  "upstream_release_immutable_at_audit": false,
+  "upstream_release_tag_revision_at_audit": "4ba7d8811289fb8e95dac4d5e554c05216ba3100",
+  "upstream_asset_id": 471380474,
+  "upstream_asset_created_at": "2026-07-09T13:46:11Z",
+  "upstream_asset_uploader": "github-actions[bot]",
+  "upstream_asset_status_at_audit": "deleted-and-replaced-by-upstream-workflow",
+  "upstream_workflow_run": "https://github.com/tlaplus/tlaplus/actions/runs/29021387576",
+  "build_jdk": "17.0.19+10 (Eclipse Adoptium)",
+  "build_timestamp": "2026-07-09T13:40:28.65Z",
+  "payload_without_manifest_canonical_sha256": "c21eb5e8de4f92341de33aa89c90e4c48fb15dd9c46b34665fa37786fede49c6",
+  "recovered_from_local_oci_image": {
+    "tag": "nexus/cser-dev:39ba912937340427",
+    "manifest_digest": "sha256:7ef14abd728ad24afb20b9f1274fc60b14facff8d146e4a6e5fccea18ab2a09f"
+  },
+  "audited_at": "2026-07-14"
+}
