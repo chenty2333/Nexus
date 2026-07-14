@@ -1152,6 +1152,7 @@ fn readiness_backend_operation(case: Stage7bFaultCase, commit_first: bool) -> Fa
     assert_fault_budget_lineage(&before.budget, &after.budget, &after.budget);
     let observed_terminal = match terminal {
         TerminalOutcome::Completed => FaultTerminal::Completed,
+        TerminalOutcome::IndeterminateAfterReset => FaultTerminal::IndeterminateAfterReset,
         TerminalOutcome::Aborted => FaultTerminal::Aborted,
     };
     FaultObservation::from_projections(observed_terminal, &before, &after, &after)
