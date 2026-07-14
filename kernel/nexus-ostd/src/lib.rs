@@ -5,12 +5,14 @@
 
 extern crate alloc;
 
+#[cfg(not(feature = "virtio-cser-facade"))]
 #[path = "cser/composition.rs"]
 mod composition;
 #[path = "cser/effect.rs"]
 mod effect;
 #[path = "cser/effect_registry.rs"]
 mod effect_registry;
+#[cfg(not(feature = "virtio-cser-facade"))]
 #[path = "probes/iommu_probe.rs"]
 mod iommu_probe;
 #[path = "personality/linux.rs"]
@@ -25,10 +27,12 @@ mod linux_fs;
 mod linux_futex;
 #[path = "personality/linux_futex_core.rs"]
 mod linux_futex_core;
+#[cfg(not(feature = "virtio-cser-facade"))]
 #[path = "cser/linux_io_composition.rs"]
 mod linux_io_composition;
 #[path = "personality/linux_loader.rs"]
 mod linux_loader;
+#[cfg(not(feature = "virtio-cser-facade"))]
 #[path = "personality/linux_net.rs"]
 mod linux_net;
 #[path = "personality/linux_pager.rs"]
@@ -48,6 +52,7 @@ mod stage7b_evaluation;
 use alloc::{boxed::Box, sync::Arc};
 
 use effect::{EffectTimer, EffectToken, EffectWaiter};
+#[cfg(not(feature = "virtio-cser-facade"))]
 use iommu_probe::{DmaQuiesceError, DmaQuiescer, Ostd018FailClosed};
 use ostd::{
     arch::cpu::context::{CpuException, UserContext},
@@ -358,6 +363,8 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     // block and wake one another. Pager service binding epochs are independent
     // from this scheduler-policy binding.
     let pager_receipt = pager::run_pager_slices();
+    #[cfg(feature = "virtio-cser-facade")]
+    let _ = pager_receipt;
 
     let linux_scheduler_binding = scheduler.rebind(AUTHORITY_EPOCH);
     assert_eq!(
@@ -397,33 +404,59 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
     linux_epoll::run_linux_epoll_slice();
     linux_dynamic::run_linux_dynamic_slice();
     let fs_receipt = linux_fs::run_linux_fs_slice();
-    let net_receipt = linux_net::run_linux_net_slice();
-    composition::run_composition_slice(scheduler, pager_receipt);
-    linux_io_composition::run_linux_io_composition_slice(
-        scheduler,
-        pager_receipt,
-        fs_receipt,
-        net_receipt,
-    );
-    assert_eq!(
-        scheduler.propose(old_binding, USER_TASK_ID),
-        ProposalResult::RejectStale
-    );
+    #[cfg(feature = "virtio-cser-facade")]
+    {
+        assert_eq!(fs_receipt.scope.id(), 95);
+        assert_eq!(fs_receipt.closed_authority_epoch, 141);
+        assert_eq!(fs_receipt.final_authority_epoch, 142);
+        assert_eq!(fs_receipt.terminalizations, 14);
+        assert_eq!(fs_receipt.publication_acks, 14);
+        assert_eq!(fs_receipt.production_effects, 6);
+        assert_eq!(fs_receipt.production_domains, 3);
+        assert!(fs_receipt.preparation_identity_observed);
+        assert!(fs_receipt.quiescent);
+        assert_eq!(
+            fs_receipt.source_sha256,
+            "c5a4014d88794ddccd1c5239957a43500a6637a433640c2293e699fea72b870f"
+        );
+        assert_eq!(
+            fs_receipt.elf_sha256,
+            "0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef"
+        );
+        println!("SPIKE_RESULT PASS");
+        poweroff(ExitCode::Success);
+    }
 
-    let dma_token = EffectToken {
-        authority_epoch: AUTHORITY_EPOCH,
-        scope_id: 10,
-        effect_id: 3,
-    };
-    assert_eq!(
-        Ostd018FailClosed.unmap_invalidate_and_wait(dma_token),
-        Err(DmaQuiesceError::IotlbInvalidationUnavailable)
-    );
-    println!(
-        "IOMMU_PROBE PASS result=FAIL_CLOSED reason=IOTLB_INVALIDATION_UNAVAILABLE ostd=0.18.0 authority_epoch={}",
-        AUTHORITY_EPOCH,
-    );
+    #[cfg(not(feature = "virtio-cser-facade"))]
+    {
+        let net_receipt = linux_net::run_linux_net_slice();
+        composition::run_composition_slice(scheduler, pager_receipt);
+        linux_io_composition::run_linux_io_composition_slice(
+            scheduler,
+            pager_receipt,
+            fs_receipt,
+            net_receipt,
+        );
+        assert_eq!(
+            scheduler.propose(old_binding, USER_TASK_ID),
+            ProposalResult::RejectStale
+        );
 
-    println!("SPIKE_RESULT PASS");
-    poweroff(ExitCode::Success);
+        let dma_token = EffectToken {
+            authority_epoch: AUTHORITY_EPOCH,
+            scope_id: 10,
+            effect_id: 3,
+        };
+        assert_eq!(
+            Ostd018FailClosed.unmap_invalidate_and_wait(dma_token),
+            Err(DmaQuiesceError::IotlbInvalidationUnavailable)
+        );
+        println!(
+            "IOMMU_PROBE PASS result=FAIL_CLOSED reason=IOTLB_INVALIDATION_UNAVAILABLE ostd=0.18.0 authority_epoch={}",
+            AUTHORITY_EPOCH,
+        );
+
+        println!("SPIKE_RESULT PASS");
+        poweroff(ExitCode::Success);
+    }
 }

@@ -418,6 +418,12 @@ check_runtime_fs_production_source() {
         "$root/src/personality/linux_fs.rs"
 }
 
+check_runtime_fs_same_boot_source() {
+    bash "$root/scripts/assert-runtime-fs-same-boot-source.sh" \
+        "$root/src/personality/linux_fs.rs" \
+        "$root/src/lib.rs"
+}
+
 check_runtime_net_artifact_negatives() {
     container bash -c '
         set -euo pipefail
@@ -543,6 +549,13 @@ build_kernel() {
     assert_runner_base
 }
 
+build_same_boot_kernel() {
+    check_kernel
+    prepare_runner_base
+    container cargo osdk build --scheme runtime-fs-same-boot
+    assert_runner_base
+}
+
 run_kernel() {
     # Keep compilation outside the runtime deadline. On a cold CI worker the
     # OSDK wrapper and ISO build can consume nearly all of 30 seconds before
@@ -554,6 +567,58 @@ run_kernel() {
         exec timeout --signal=TERM --kill-after=2s 30s cargo osdk run
     '
     assert_runner_base
+}
+
+run_same_boot_kernel() {
+    # Keep compilation outside the runtime deadline and verify the immutable
+    # block fixture on both sides of the QEMU execution.
+    build_same_boot_kernel
+    container bash -c '
+        set -euo pipefail
+        readonly fixture=/opt/nexus-fixtures/runtime-fs-block.raw
+        readonly expected=9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        before=$(sha256sum "$fixture" | cut -d " " -f1)
+        before_mode=$(stat -c %a "$fixture")
+        test "$before" = "$expected"
+        test "$before_mode" = 444
+        set +e
+        timeout --signal=TERM --kill-after=2s 45s \
+            cargo osdk run --scheme runtime-fs-same-boot
+        status=$?
+        set -e
+        after=$(sha256sum "$fixture" | cut -d " " -f1)
+        after_mode=$(stat -c %a "$fixture")
+        test "$after" = "$expected"
+        test "$after_mode" = 444
+        echo "RUNTIME_FS_SAME_BOOT_FIXTURE before=$before after=$after mode=$after_mode readonly=true"
+        exit "$status"
+    '
+    assert_runner_base
+}
+
+same_boot_artifact_dir="$root/artifacts/runtime-fs-same-boot"
+
+prepare_same_boot_build_artifact() {
+    mkdir -p "$same_boot_artifact_dir"
+    rm -f "$same_boot_artifact_dir/build.log"
+}
+
+prepare_same_boot_artifacts() {
+    mkdir -p "$same_boot_artifact_dir"
+    rm -f \
+        "$same_boot_artifact_dir/serial.log" \
+        "$same_boot_artifact_dir/qemu-debug.log" \
+        "$same_boot_artifact_dir/oracle.log"
+}
+
+capture_same_boot_run() {
+    # shellcheck source=scripts/qemu-stream-capture.sh
+    source "$root/scripts/qemu-stream-capture.sh"
+    capture_qemu_streams \
+        "$same_boot_artifact_dir/serial.log" \
+        "$same_boot_artifact_dir/qemu-debug.log" \
+        run_same_boot_kernel
 }
 
 build_stage7b() {
@@ -637,6 +702,7 @@ case "$command" in
         fmt_check
         check_oracles
         check_runtime_fs_production_source
+        check_runtime_fs_same_boot_source
         prepare_guest
         check_runtime_fs_artifact_negatives
         check_runtime_net_artifact_negatives
@@ -656,6 +722,15 @@ case "$command" in
         prepare_guest
         build_kernel
         ;;
+    build-same-boot)
+        ensure_image
+        check_ostd_patch
+        check_virtio_patch
+        prepare_guest
+        prepare_same_boot_build_artifact
+        build_same_boot_kernel 2>&1 \
+            | tee "$same_boot_artifact_dir/build.log"
+        ;;
     iommu-probe)
         ensure_image
         container bash scripts/check-iotlb-gap.sh
@@ -665,6 +740,12 @@ case "$command" in
         prepare_guest
         mkdir -p "$root/artifacts"
         run_kernel | tee "$root/artifacts/serial.log"
+        ;;
+    run-same-boot)
+        ensure_image
+        prepare_guest
+        prepare_same_boot_artifacts
+        capture_same_boot_run
         ;;
     test)
         ensure_image
@@ -769,6 +850,22 @@ case "$command" in
         fi
         echo 'runtime filesystem serial negative assertions: PASS syscall_count=rejected duplicate_pass=rejected elf_digest=rejected preparation_digest=rejected foreign_registry_receipt=rejected device_commit_escalation=rejected pwrite_order=rejected'
         ;;
+    test-same-boot)
+        ensure_image
+        check_ostd_patch
+        check_virtio_patch
+        check_runtime_fs_production_source
+        check_runtime_fs_same_boot_source
+        prepare_guest
+        check_runtime_fs_artifact_negatives
+        bash "$root/scripts/assert-stream-capture.sh"
+        prepare_same_boot_artifacts
+        capture_same_boot_run
+        bash "$root/scripts/assert-runtime-fs-same-boot.sh" \
+            "$same_boot_artifact_dir/serial.log" \
+            "$same_boot_artifact_dir/qemu-debug.log" 2>&1 \
+            | tee "$same_boot_artifact_dir/oracle.log"
+        ;;
     eval-stage7b)
         ensure_image
         prepare_guest
@@ -782,7 +879,7 @@ case "$command" in
         rm -f "$repo_root/target/verification/linux-io-composition-oracle.log"
         ;;
     *)
-        echo "usage: ./x {doctor|image|fmt|check|clippy|build|iommu-probe|run|test|eval-stage7b|clean}" >&2
+        echo "usage: ./x {doctor|image|fmt|check|clippy|build|build-same-boot|iommu-probe|run|run-same-boot|test|test-same-boot|eval-stage7b|clean}" >&2
         exit 2
         ;;
 esac

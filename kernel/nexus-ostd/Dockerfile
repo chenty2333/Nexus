@@ -174,14 +174,19 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         NEXUS_RUNTIME_FS_SOURCE=/tmp/nexus-ostd-inputs/runtime_fs_smoke.S \
         NEXUS_RUNTIME_NET_SOURCE=/tmp/nexus-ostd-inputs/runtime_net_smoke.S \
         bash scripts/build-guest.sh \
+    && mkdir -p /opt/nexus-fixtures \
     && bash scripts/build-runtime-fs-block-image.sh \
-        guest/linux-runtime-fs.elf /tmp/nexus-runtime-fs-block.raw \
+        guest/linux-runtime-fs.elf /opt/nexus-fixtures/runtime-fs-block.raw \
+    && bash scripts/assert-runtime-fs-block-image.sh \
+        guest/linux-runtime-fs.elf /opt/nexus-fixtures/runtime-fs-block.raw \
+    && test "$(stat -c %a /opt/nexus-fixtures/runtime-fs-block.raw)" = 444 \
     && cargo check --locked --target x86_64-unknown-none \
         --features virtio-cser-facade \
     && cargo osdk check --locked \
     && bash scripts/check-fsbase-api.sh \
     && bash scripts/check-scheduler-attempt.sh \
     && cargo osdk build \
+    && cargo osdk build --scheme runtime-fs-same-boot \
     && cmp /tmp/nexus-ostd-inputs/Cargo.lock /work/Cargo.lock \
     && diff -ru /tmp/nexus-ostd-inputs/osdk-runner-base \
         /work/target/osdk/nexus-kernel-run-base \
