@@ -8,7 +8,9 @@ FROM ${JAVA_IMAGE} AS java
 FROM ${RUST_IMAGE}
 
 ARG TLA2TOOLS_VERSION=1.8.0
-ARG TLA2TOOLS_SHA256=33de7da9ce1b7fffb9d1c184021178dbb051747be48504e65c584c423721a32e
+# Official v1.8.0 release asset 476406882, published 2026-07-14 from the
+# verified upstream revision 227f61b983d0203a06db8184da45aed421e8f1b8.
+ARG TLA2TOOLS_SHA256=150b0294c3d407c15f0c971351ccd4ae8c6d885397546dff87871a14be2b4ee4
 ARG GIT_PACKAGE_VERSION=1:2.39.5-0+deb12u3
 
 LABEL org.opencontainers.image.title="Nexus verification environment" \
