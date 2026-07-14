@@ -1,0 +1,418 @@
+--- a/src/queue.rs
++++ b/src/queue.rs
+@@ -19,10 +19,12 @@
+ use core::cmp::min;
+ use core::convert::TryInto;
+ use core::hint::spin_loop;
+-use core::mem::{size_of, take};
++use core::mem::{ManuallyDrop, size_of, take};
+ #[cfg(test)]
+ use core::ptr;
+ use core::ptr::NonNull;
++#[cfg(test)]
++use core::sync::atomic::AtomicUsize;
+ use core::sync::atomic::{AtomicU16, Ordering, fence};
+ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+ 
+@@ -70,6 +72,96 @@
+     indirect_lists: [Option<NonNull<[Descriptor]>>; SIZE],
+ }
+ 
++/// A descriptor chain whose buffers and available-ring slot are initialized,
++/// but whose available index has not been published to the device.
++///
++/// This type owns the exact queue that created the chain. It is deliberately
++/// neither `Clone` nor `Copy`, so callers must choose exactly one of
++/// [`publish_prepared`](Self::publish_prepared) and
++/// [`cancel_prepared`](Self::cancel_prepared). Dropping it without making that
++/// choice violates the buffer-lifetime contract of [`VirtQueue::prepare_add`].
++#[must_use = "a prepared descriptor chain must be published or cancelled"]
++#[derive(Debug)]
++pub struct PreparedVirtQueue<H: Hal, const SIZE: usize> {
++    queue: ManuallyDrop<VirtQueue<H, SIZE>>,
++    head: u16,
++}
++
++impl<H: Hal, const SIZE: usize> PreparedVirtQueue<H, SIZE> {
++    /// Returns the descriptor-head token reserved for this chain.
++    pub const fn token(&self) -> u16 {
++        self.head
++    }
++
++    /// Release-publishes the already initialized chain and returns its queue
++    /// together with the descriptor-head token.
++    ///
++    /// This operation is infallible because ownership of this value proves that
++    /// descriptor allocation, DMA sharing, and the available-ring slot write
++    /// have already completed for the enclosed queue.
++    pub fn publish_prepared(self) -> (VirtQueue<H, SIZE>, u16) {
++        let mut this = ManuallyDrop::new(self);
++        // SAFETY: `this` suppresses `PreparedVirtQueue::drop`, and this is the
++        // only explicit path that extracts the enclosed queue.
++        let mut queue = unsafe { ManuallyDrop::take(&mut this.queue) };
++        queue.publish_prepared_in_place();
++        (queue, this.head)
++    }
++
++    /// Cancels an unpublished chain and returns its queue for reuse.
++    ///
++    /// # Safety
++    ///
++    /// `inputs` and `outputs` must be the exact live buffers passed to
++    /// [`VirtQueue::prepare_add`] for this value. No caller may access or drop
++    /// those buffers until this function returns.
++    pub unsafe fn cancel_prepared<'a>(
++        self,
++        inputs: &'a [&'a [u8]],
++        outputs: &'a mut [&'a mut [u8]],
++    ) -> VirtQueue<H, SIZE> {
++        // SAFETY: forwarded from the caller under the original prepare
++        // contract. The available index was never advanced, so the device
++        // cannot have observed this chain.
++        let mut this = ManuallyDrop::new(self);
++        // SAFETY: `this` suppresses `PreparedVirtQueue::drop`, and this is the
++        // only explicit cancellation path that extracts the enclosed queue.
++        let mut queue = unsafe { ManuallyDrop::take(&mut this.queue) };
++        // SAFETY: forwarded from the caller under the exact original prepare
++        // contract, and the device-visible available index is unchanged.
++        unsafe { queue.cancel_prepared_in_place(this.head, inputs, outputs) };
++        queue
++    }
++}
++
++impl<H: Hal, const SIZE: usize> Drop for PreparedVirtQueue<H, SIZE> {
++    fn drop(&mut self) {
++        // Fail closed: an unresolved prepared chain retains its queue DMA and
++        // shared buffers. Only explicit publish or cancellation may extract
++        // the queue and discharge the original buffer-lifetime obligation.
++    }
++}
++
++/// A failed prepare operation that returns ownership of the unchanged queue.
++#[must_use = "recover the queue from a failed prepare operation"]
++#[derive(Debug)]
++pub struct PrepareAddError<H: Hal, const SIZE: usize> {
++    error: Error,
++    queue: VirtQueue<H, SIZE>,
++}
++
++impl<H: Hal, const SIZE: usize> PrepareAddError<H, SIZE> {
++    /// Returns the original validation error.
++    pub const fn error(&self) -> Error {
++        self.error
++    }
++
++    /// Returns the unchanged queue and consumes this error.
++    pub fn into_queue(self) -> VirtQueue<H, SIZE> {
++        self.queue
++    }
++}
++
+ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
+     const SIZE_OK: () = assert!(SIZE.is_power_of_two() && SIZE <= u16::MAX as usize);
+ 
+@@ -150,7 +242,9 @@
+ 
+     /// Add buffers to the virtqueue, return a token.
+     ///
+-    /// The buffers must not be empty.
++    /// The buffers must not be empty. This compatibility operation prepares
++    /// and immediately publishes through the same split implementation exposed
++    /// by [`Self::prepare_add`].
+     ///
+     /// Ref: linux virtio_ring.c virtqueue_add
+     ///
+@@ -163,6 +257,48 @@
+         inputs: &'a [&'b [u8]],
+         outputs: &'a mut [&'b mut [u8]],
+     ) -> Result<u16> {
++        // SAFETY: forwarded from the caller under the original `add` contract.
++        let head = unsafe { self.prepare_add_in_place(inputs, outputs) }?;
++        self.publish_prepared_in_place();
++        Ok(head)
++    }
++
++    /// Prepares a descriptor chain without publishing `avail.idx`.
++    ///
++    /// Descriptor allocation, DMA sharing, descriptor-table writes, and the
++    /// available-ring slot write all complete before this method returns. The
++    /// device cannot observe the new slot until the returned linear value is
++    /// consumed by [`PreparedVirtQueue::publish_prepared`].
++    ///
++    /// On validation failure, the error returns ownership of the unchanged
++    /// queue. The buffers have not been shared in that case.
++    ///
++    /// # Safety
++    ///
++    /// The input and output buffers must remain valid and inaccessible until
++    /// the returned value is either published and later popped, or cancelled
++    /// with the exact same buffers.
++    pub unsafe fn prepare_add<'a, 'b>(
++        mut self,
++        inputs: &'a [&'b [u8]],
++        outputs: &'a mut [&'b mut [u8]],
++    ) -> core::result::Result<PreparedVirtQueue<H, SIZE>, PrepareAddError<H, SIZE>> {
++        // SAFETY: forwarded from the caller under the documented prepare
++        // contract.
++        match unsafe { self.prepare_add_in_place(inputs, outputs) } {
++            Ok(head) => Ok(PreparedVirtQueue {
++                queue: ManuallyDrop::new(self),
++                head,
++            }),
++            Err(error) => Err(PrepareAddError { error, queue: self }),
++        }
++    }
++
++    unsafe fn prepare_add_in_place<'a, 'b>(
++        &mut self,
++        inputs: &'a [&'b [u8]],
++        outputs: &'a mut [&'b mut [u8]],
++    ) -> Result<u16> {
+         if inputs.is_empty() && outputs.is_empty() {
+             return Err(Error::InvalidParam);
+         }
+@@ -196,6 +332,10 @@
+             (*self.avail.as_ptr()).ring[avail_slot as usize] = head;
+         }
+ 
++        Ok(head)
++    }
++
++    fn publish_prepared_in_place(&mut self) {
+         // Write barrier so that device sees changes to descriptor table and available ring before
+         // change to available index.
+         fence(Ordering::SeqCst);
+@@ -208,8 +348,21 @@
+                 .idx
+                 .store(self.avail_idx, Ordering::Release);
+         }
++    }
+ 
+-        Ok(head)
++    unsafe fn cancel_prepared_in_place<'a>(
++        &mut self,
++        head: u16,
++        inputs: &'a [&'a [u8]],
++        outputs: &'a mut [&'a mut [u8]],
++    ) {
++        let avail_slot = self.avail_idx & (SIZE as u16 - 1);
++        // SAFETY: the available index was not advanced, so this slot is still
++        // driver-owned and invisible to the device.
++        unsafe {
++            (*self.avail.as_ptr()).ring[avail_slot as usize] = 0;
++            self.recycle_descriptors(head, inputs, outputs);
++        }
+     }
+ 
+     fn add_direct<'a, 'b>(
+@@ -1007,6 +1160,74 @@
+     use safe_mmio::UniqueMmioPointer;
+     use std::sync::{Arc, Mutex};
+ 
++    static VALIDATION_TEST_LOCK: Mutex<()> = Mutex::new(());
++    static VALIDATION_SHARE_CALLS: AtomicUsize = AtomicUsize::new(0);
++    static VALIDATION_UNSHARE_CALLS: AtomicUsize = AtomicUsize::new(0);
++
++    #[derive(Debug)]
++    struct ValidationHal;
++
++    // SAFETY: this test HAL delegates every operation to FakeHal and only
++    // records share/unshare call counts under VALIDATION_TEST_LOCK.
++    unsafe impl Hal for ValidationHal {
++        fn dma_alloc(pages: usize, direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
++            FakeHal::dma_alloc(pages, direction)
++        }
++
++        unsafe fn dma_dealloc(paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
++            // SAFETY: forwarded unchanged from the queue's DMA owner.
++            unsafe { FakeHal::dma_dealloc(paddr, vaddr, pages) }
++        }
++
++        unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
++            // SAFETY: forwarded unchanged from the fake transport.
++            unsafe { FakeHal::mmio_phys_to_virt(paddr, size) }
++        }
++
++        unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr {
++            VALIDATION_SHARE_CALLS.fetch_add(1, Ordering::SeqCst);
++            // SAFETY: forwarded under the original queue buffer contract.
++            unsafe { FakeHal::share(buffer, direction) }
++        }
++
++        unsafe fn unshare(paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
++            VALIDATION_UNSHARE_CALLS.fetch_add(1, Ordering::SeqCst);
++            // SAFETY: forwarded with the exact matching shared buffer.
++            unsafe { FakeHal::unshare(paddr, buffer, direction) }
++        }
++    }
++
++    fn validation_queue() -> VirtQueue<ValidationHal, 4> {
++        let state = Arc::new(Mutex::new(State::new(vec![QueueStatus::default()], ())));
++        let mut transport = FakeTransport {
++            device_type: DeviceType::Block,
++            max_queue_size: 4,
++            device_features: 0,
++            state,
++        };
++        VirtQueue::new(&mut transport, 0, false, false).unwrap()
++    }
++
++    fn validation_snapshot(
++        queue: &VirtQueue<ValidationHal, 4>,
++    ) -> (usize, u16, u16, u16, usize, usize) {
++        (
++            queue.available_desc(),
++            queue.avail_idx,
++            // SAFETY: the queue owns this initialized available ring.
++            unsafe { (*queue.avail.as_ptr()).idx.load(Ordering::Acquire) },
++            // SAFETY: slot zero is initialized and remains driver-owned here.
++            unsafe { (*queue.avail.as_ptr()).ring[0] },
++            VALIDATION_SHARE_CALLS.load(Ordering::SeqCst),
++            VALIDATION_UNSHARE_CALLS.load(Ordering::SeqCst),
++        )
++    }
++
++    fn reset_validation_counts() {
++        VALIDATION_SHARE_CALLS.store(0, Ordering::SeqCst);
++        VALIDATION_UNSHARE_CALLS.store(0, Ordering::SeqCst);
++    }
++
+     #[test]
+     fn queue_too_big() {
+         let mut header = VirtIOHeader::make_fake_header(MODERN_VERSION, 1, 0, 0, 4);
+@@ -1188,6 +1409,135 @@
+         }
+     }
+ 
++    #[test]
++    fn prepare_is_invisible_until_publish() {
++        {
++            let _guard = VALIDATION_TEST_LOCK.lock().unwrap();
++            reset_validation_counts();
++            let queue = validation_queue();
++            let before = validation_snapshot(&queue);
++
++            // SAFETY: there are no buffers to retain on this validation failure.
++            let error = unsafe { queue.prepare_add(&[], &mut []) }.unwrap_err();
++            assert_eq!(error.error(), Error::InvalidParam);
++            let queue = error.into_queue();
++            assert_eq!(validation_snapshot(&queue), before);
++
++            let input = [42_u8];
++            // SAFETY: input remains live until the exact cancellation below.
++            let prepared = unsafe { queue.prepare_add(&[&input], &mut []) }.unwrap();
++            // SAFETY: this is the exact input used by prepare_add.
++            let queue = unsafe { prepared.cancel_prepared(&[&input], &mut []) };
++            assert_eq!(queue.available_desc(), 4);
++            assert_eq!(queue.avail_idx, 0);
++            assert_eq!(VALIDATION_SHARE_CALLS.load(Ordering::SeqCst), 1);
++            assert_eq!(VALIDATION_UNSHARE_CALLS.load(Ordering::SeqCst), 1);
++        }
++
++        let state = Arc::new(Mutex::new(State::new(vec![QueueStatus::default()], ())));
++        let mut transport = FakeTransport {
++            device_type: DeviceType::Block,
++            max_queue_size: 4,
++            device_features: 0,
++            state,
++        };
++        let queue = VirtQueue::<FakeHal, 4>::new(&mut transport, 0, false, false).unwrap();
++        let input = [42_u8];
++        let mut output = [0_u8; 1];
++        // SAFETY: both buffers remain live and inaccessible until the matching
++        // publish and pop below.
++        let prepared = unsafe { queue.prepare_add(&[&input], &mut [&mut output]) }.unwrap();
++        let token = prepared.token();
++        assert_eq!(token, 0);
++        assert_eq!(prepared.queue.available_desc(), 2);
++        assert_eq!(
++            unsafe { (*prepared.queue.avail.as_ptr()).idx.load(Ordering::Acquire) },
++            0
++        );
++        assert!(!fake_read_write_queue::<4>(
++            prepared.queue.desc.as_ptr().cast(),
++            prepared.queue.avail.as_ptr().cast(),
++            prepared.queue.used.as_ptr().cast(),
++            |_| vec![7],
++        ));
++
++        let (mut queue, published) = prepared.publish_prepared();
++        assert_eq!(published, token);
++        assert_eq!(
++            unsafe { (*queue.avail.as_ptr()).idx.load(Ordering::Acquire) },
++            1
++        );
++        assert!(fake_read_write_queue::<4>(
++            queue.desc.as_ptr().cast(),
++            queue.avail.as_ptr().cast(),
++            queue.used.as_ptr().cast(),
++            |_| vec![7],
++        ));
++        // SAFETY: token and buffers exactly match the published chain.
++        unsafe { queue.pop_used(token, &[&input], &mut [&mut output]) }.unwrap();
++        assert_eq!(output, [7]);
++        assert_eq!(queue.available_desc(), 4);
++    }
++
++    #[test]
++    fn cancel_prepared_restores_queue_without_publication() {
++        {
++            let _guard = VALIDATION_TEST_LOCK.lock().unwrap();
++            reset_validation_counts();
++            let queue = validation_queue();
++            let before = validation_snapshot(&queue);
++            let input = [42_u8];
++            let too_many: [&[u8]; 5] = [&input; 5];
++
++            // SAFETY: QueueFull is decided before any supplied buffer is shared.
++            let error = unsafe { queue.prepare_add(&too_many, &mut []) }.unwrap_err();
++            assert_eq!(error.error(), Error::QueueFull);
++            let queue = error.into_queue();
++            assert_eq!(validation_snapshot(&queue), before);
++
++            // SAFETY: input remains live until the exact cancellation below.
++            let prepared = unsafe { queue.prepare_add(&[&input], &mut []) }.unwrap();
++            // SAFETY: this is the exact input used by prepare_add.
++            let queue = unsafe { prepared.cancel_prepared(&[&input], &mut []) };
++            assert_eq!(queue.available_desc(), 4);
++            assert_eq!(queue.avail_idx, 0);
++            assert_eq!(VALIDATION_SHARE_CALLS.load(Ordering::SeqCst), 1);
++            assert_eq!(VALIDATION_UNSHARE_CALLS.load(Ordering::SeqCst), 1);
++        }
++
++        let state = Arc::new(Mutex::new(State::new(vec![QueueStatus::default()], ())));
++        let mut transport = FakeTransport {
++            device_type: DeviceType::Block,
++            max_queue_size: 4,
++            device_features: 0,
++            state,
++        };
++        let queue = VirtQueue::<FakeHal, 4>::new(&mut transport, 0, false, false).unwrap();
++        let input = [42_u8];
++        let mut output = [0_u8; 1];
++        // SAFETY: buffers remain live until the matching cancellation.
++        let prepared = unsafe { queue.prepare_add(&[&input], &mut [&mut output]) }.unwrap();
++        assert_eq!(prepared.queue.available_desc(), 2);
++        // SAFETY: these are the exact buffers used by `prepare_add`.
++        let mut queue = unsafe { prepared.cancel_prepared(&[&input], &mut [&mut output]) };
++        assert_eq!(queue.available_desc(), 4);
++        assert_eq!(
++            unsafe { (*queue.avail.as_ptr()).idx.load(Ordering::Acquire) },
++            0
++        );
++        assert!(!queue.can_pop());
++
++        // A subsequent compatibility add reuses the fully restored queue.
++        // SAFETY: `input` remains live until this test drops the queue; the
++        // test only inspects publication state and does not access it again.
++        let token = unsafe { queue.add(&[&input], &mut []) }.unwrap();
++        assert_eq!(token, 0);
++        assert_eq!(
++            unsafe { (*queue.avail.as_ptr()).idx.load(Ordering::Acquire) },
++            1
++        );
++    }
++
+     /// Tests that the queue advises the device that notifications are needed.
+     #[test]
+     fn set_dev_notify() {

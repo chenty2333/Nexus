@@ -1,2 +1,0 @@
-[patch.crates-io]
-ostd = { path = "/opt/nexus-ostd/ostd-0.18.0" }

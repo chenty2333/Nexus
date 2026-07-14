@@ -50,9 +50,14 @@ image_key=$(sha256sum \
     "$repo_root/crates/nexus-ostd-virtio/src/dma.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/pci.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/portal.rs" \
+    "$repo_root/crates/nexus-ostd-virtio/src/production.rs" \
     "$repo_root/patches/ostd-0.18.0-cser.patch" \
-    "$repo_root/patches/ostd-0.18.0-cargo-config.toml" \
+    "$repo_root/patches/virtio-drivers-0.13.0-cser.patch" \
+    "$repo_root/patches/virtio-drivers-0.13.0-LICENSE-MIT" \
+    "$repo_root/patches/cser-cargo-config.toml" \
     "$repo_root/tools/ostd/assert-cser-patch.sh" \
+    "$repo_root/tools/virtio/assert-cser-patch.sh" \
+    "$repo_root/tools/virtio/assert-production-substrate.sh" \
     "$repo_root/kernel/nexus-ostd/Cargo.toml" \
     "$repo_root/kernel/nexus-ostd/Cargo.lock" \
     "$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
@@ -103,6 +108,12 @@ check_source() {
         tmp=$(mktemp -d)
         trap '\''rm -rf "$tmp"'\'' EXIT
         portal_source=/crates/nexus-ostd-virtio/src/portal.rs
+        require_mutation() {
+            if cmp -s "$1" "$2"; then
+                echo "source mutation did not apply: $3" >&2
+                exit 1
+            fi
+        }
 
         cp /repo/patches/ostd-0.18.0-cser.patch "$tmp/mutated-ostd.patch"
         sed -i '\''0,/const RTE_LEVEL_TRIGGERED: u32 = 1 << 15;/s//const RTE_LEVEL_TRIGGERED: u32 = 1 << 14;/'\'' \
@@ -119,6 +130,125 @@ check_source() {
         if /repo/tools/ostd/assert-cser-patch.sh \
             /repo/patches/ostd-0.18.0-cser.patch "$tmp/mutated-ostd" >/dev/null 2>&1; then
             echo "canonical OSTD gate accepted a mutated installed source tree" >&2
+            exit 1
+        fi
+
+        canonical_virtio=/repo/patches/virtio-drivers-0.13.0-cser.patch
+        virtio_license=/repo/patches/virtio-drivers-0.13.0-LICENSE-MIT
+        installed_virtio=/opt/nexus-virtio/virtio-drivers-0.13.0
+        production=/crates/nexus-ostd-virtio/src/production.rs
+        facade_lib=/crates/nexus-ostd-virtio/src/lib.rs
+
+        cp "$canonical_virtio" "$tmp/relaxed-virtio.patch"
+        sed -i '\''0,/Ordering::Release/s//Ordering::Relaxed/'\'' \
+            "$tmp/relaxed-virtio.patch"
+        if /repo/tools/virtio/assert-cser-patch.sh \
+            "$tmp/relaxed-virtio.patch" "$installed_virtio" "$virtio_license" \
+            >/dev/null 2>&1; then
+            echo "canonical VirtIO gate accepted Release-to-Relaxed mutation" >&2
+            exit 1
+        fi
+
+        cp -a "$installed_virtio" "$tmp/missing-linear-owner"
+        sed -i '\''0,/queue: ManuallyDrop<VirtQueue<H, SIZE>>,/s//queue: VirtQueue<H, SIZE>,/'\'' \
+            "$tmp/missing-linear-owner/src/queue.rs"
+        if /repo/tools/virtio/assert-cser-patch.sh \
+            "$canonical_virtio" "$tmp/missing-linear-owner" "$virtio_license" \
+            >/dev/null 2>&1; then
+            echo "canonical VirtIO gate accepted missing ManuallyDrop owner" >&2
+            exit 1
+        fi
+
+        cp -a "$installed_virtio" "$tmp/missing-recycle"
+        sed -i '\''s/self.recycle_descriptors(head, inputs, outputs);/let _ = (head, inputs, outputs);/'\'' \
+            "$tmp/missing-recycle/src/queue.rs"
+        if /repo/tools/virtio/assert-cser-patch.sh \
+            "$canonical_virtio" "$tmp/missing-recycle" "$virtio_license" \
+            >/dev/null 2>&1; then
+            echo "canonical VirtIO gate accepted missing exact-buffer recycle" >&2
+            exit 1
+        fi
+
+        cp "$production" "$tmp/facade-authority.rs"
+        sed -i '\''2i use crate::EffectAuthority;'\'' "$tmp/facade-authority.rs"
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/facade-authority.rs" "$facade_lib" "$portal_source" \
+            >/dev/null 2>&1; then
+            echo "production facade gate accepted semantic authority ownership" >&2
+            exit 1
+        fi
+
+        cp "$production" "$tmp/post-release-assert.rs"
+        sed -i '\''/let (queue, _token) = prepared.publish_prepared();/a\        assert!(true);'\'' \
+            "$tmp/post-release-assert.rs"
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/post-release-assert.rs" "$facade_lib" "$portal_source" \
+            >/dev/null 2>&1; then
+            echo "production facade gate accepted a post-Release assertion" >&2
+            exit 1
+        fi
+
+        cp "$production" "$tmp/branching-generation.rs"
+        sed -i '\''s/\*self.device_generation = self.next_generation;/if true { *self.device_generation = self.next_generation; }/'\'' \
+            "$tmp/branching-generation.rs"
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/branching-generation.rs" "$facade_lib" "$portal_source" \
+            >/dev/null 2>&1; then
+            echo "production facade gate accepted branching generation apply" >&2
+            exit 1
+        fi
+
+        cp "$production" "$tmp/branching-quiescence.rs"
+        sed -i '\''s/\*self.active = None;/if true { *self.active = None; }/'\'' \
+            "$tmp/branching-quiescence.rs"
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/branching-quiescence.rs" "$facade_lib" "$portal_source" \
+            >/dev/null 2>&1; then
+            echo "production facade gate accepted branching quiescence apply" >&2
+            exit 1
+        fi
+
+        cp "$production" "$tmp/overlapping-session.rs"
+        sed -i '\''0,/if self.active.is_some() {/s//if false {/'\'' \
+            "$tmp/overlapping-session.rs"
+        require_mutation "$production" "$tmp/overlapping-session.rs" overlapping-session
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/overlapping-session.rs" "$facade_lib" "$portal_source" \
+            >/dev/null 2>&1; then
+            echo "production facade gate accepted overlapping hardware sessions" >&2
+            exit 1
+        fi
+
+        cp "$production" "$tmp/forced-notification.rs"
+        sed -i '\''0,/if self.queue.as_ref().expect("live queue").should_notify() {/s//if true {/'\'' \
+            "$tmp/forced-notification.rs"
+        require_mutation "$production" "$tmp/forced-notification.rs" forced-notification
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/forced-notification.rs" "$facade_lib" "$portal_source" \
+            >/dev/null 2>&1; then
+            echo "production facade gate accepted mandatory notification despite suppression" >&2
+            exit 1
+        fi
+
+        cp "$production" "$tmp/unchecked-used-length.rs"
+        sed -i '\''0,/if used_len != EXPECTED_USED_LEN {/s//if false {/'\'' \
+            "$tmp/unchecked-used-length.rs"
+        require_mutation "$production" "$tmp/unchecked-used-length.rs" unchecked-used-length
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/unchecked-used-length.rs" "$facade_lib" "$portal_source" \
+            >/dev/null 2>&1; then
+            echo "production facade gate accepted an unchecked device used length" >&2
+            exit 1
+        fi
+
+        cp "$production" "$tmp/status-before-used-length.rs"
+        sed -i '\''0,/if used_len != EXPECTED_USED_LEN {/i\        let response = request_buffers.response.status();'\'' \
+            "$tmp/status-before-used-length.rs"
+        require_mutation "$production" "$tmp/status-before-used-length.rs" status-before-used-length
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/status-before-used-length.rs" "$facade_lib" "$portal_source" \
+            >/dev/null 2>&1; then
+            echo "production facade gate accepted status access before used-length validation" >&2
             exit 1
         fi
 
@@ -206,7 +336,7 @@ check_source() {
             echo "I/O adapter oracle accepted a shadow authority epoch" >&2
             exit 1
         fi
-        echo "Stage 7B I/O gate negative assertions: PASS missing_gate=rejected missing_commit_gate=rejected missing_instance_namespace=rejected missing_session_instance_binding=rejected missing_session_negative_execution=rejected late_session_negative_execution=rejected conditional_session_negative_execution=rejected fabricated_session_marker=rejected copied_gate_probe=rejected shadow_epoch=rejected"
+        echo "Stage 7B I/O gate negative assertions: PASS virtio_release_relaxed=rejected virtio_missing_linear_owner=rejected virtio_missing_recycle=rejected facade_authority=rejected facade_post_release_assert=rejected facade_branching_generation=rejected facade_branching_quiescence=rejected facade_overlapping_session=rejected facade_forced_notification=rejected facade_unchecked_used_length=rejected facade_status_before_used_length=rejected missing_gate=rejected missing_commit_gate=rejected missing_instance_namespace=rejected missing_session_instance_binding=rejected missing_session_negative_execution=rejected late_session_negative_execution=rejected conditional_session_negative_execution=rejected fabricated_session_marker=rejected copied_gate_probe=rejected shadow_epoch=rejected"
     '
 }
 

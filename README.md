@@ -148,9 +148,11 @@ research rather than a v0.2 release claim.
 
 Current main has established only the reusable device build foundation: the
 primary kernel and Stage 5B consume one hash-bound canonical OSTD 0.18 overlay,
-and the primary kernel compile-checks the optional VirtIO facade. The
-configurable-GSI API is source/build evidence only; the primary boot still has
-no device GSI mapping or IRQ delivery, same-boot DMA identity, or SMP claim.
+one hash-bound MIT virtio-drivers 0.13 split-publication overlay, and the
+optional production VirtIO facade. Its descriptive identity preflight and
+infallible publication/reset/IOTLB-quiescence plans are source/build evidence
+only; the primary boot still has no device GSI mapping or IRQ delivery,
+same-boot DMA identity, or SMP claim.
 
 ## Documentation
 
@@ -186,5 +188,6 @@ Before changing semantics or evidence, read
 [CONTRIBUTING.md](CONTRIBUTING.md). Nexus is released under the
 [Unlicense](LICENSE). Third-party and derived components retain their own
 license boundaries; in particular, the repository-wide canonical OSTD overlay
-and extracted VirtIO facade remain MPL-2.0-covered, while the device experiment
-retains its package notice.
+and extracted VirtIO facade remain MPL-2.0-covered. The canonical
+virtio-drivers overlay remains MIT-covered with the exact upstream notice under
+`patches/`; the device experiment retains its separate package notice.

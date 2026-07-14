@@ -18,3 +18,7 @@ dependencies = [
 [[patch.unused]]
 name = "ostd"
 version = "0.18.0"
+
+[[patch.unused]]
+name = "virtio-drivers"
+version = "0.13.0"

@@ -81,9 +81,14 @@ image_key=$(sha256sum \
     "$repo_root/crates/nexus-ostd-virtio/src/dma.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/pci.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/portal.rs" \
+    "$repo_root/crates/nexus-ostd-virtio/src/production.rs" \
     "$repo_root/patches/ostd-0.18.0-cser.patch" \
-    "$repo_root/patches/ostd-0.18.0-cargo-config.toml" \
+    "$repo_root/patches/virtio-drivers-0.13.0-cser.patch" \
+    "$repo_root/patches/virtio-drivers-0.13.0-LICENSE-MIT" \
+    "$repo_root/patches/cser-cargo-config.toml" \
     "$repo_root/tools/ostd/assert-cser-patch.sh" \
+    "$repo_root/tools/virtio/assert-cser-patch.sh" \
+    "$repo_root/tools/virtio/assert-production-substrate.sh" \
     "$root/src/cser/effect_registry.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/nexus-ostd:$image_key"
 runner_base="$root/osdk-runner-base"
@@ -157,6 +162,136 @@ check_ostd_patch() {
     '
 }
 
+check_virtio_patch() {
+    container /repo/tools/virtio/assert-cser-patch.sh \
+        /repo/patches/virtio-drivers-0.13.0-cser.patch \
+        /opt/nexus-virtio/virtio-drivers-0.13.0 \
+        /repo/patches/virtio-drivers-0.13.0-LICENSE-MIT
+    container /repo/tools/virtio/assert-production-substrate.sh \
+        /crates/nexus-ostd-virtio/src/production.rs \
+        /crates/nexus-ostd-virtio/src/lib.rs \
+        /crates/nexus-ostd-virtio/src/portal.rs
+    container bash -c '
+        set -euo pipefail
+        tmp=$(mktemp -d)
+        trap '\''rm -rf "$tmp"'\'' EXIT
+        require_mutation() {
+            if cmp -s "$1" "$2"; then
+                echo "source mutation did not apply: $3" >&2
+                exit 1
+            fi
+        }
+        canonical=/repo/patches/virtio-drivers-0.13.0-cser.patch
+        license=/repo/patches/virtio-drivers-0.13.0-LICENSE-MIT
+        installed=/opt/nexus-virtio/virtio-drivers-0.13.0
+        source=/crates/nexus-ostd-virtio/src/production.rs
+        lib=/crates/nexus-ostd-virtio/src/lib.rs
+        portal=/crates/nexus-ostd-virtio/src/portal.rs
+
+        cp "$canonical" "$tmp/relaxed.patch"
+        sed -i '\''0,/Ordering::Release/s//Ordering::Relaxed/'\'' "$tmp/relaxed.patch"
+        if /repo/tools/virtio/assert-cser-patch.sh \
+            "$tmp/relaxed.patch" "$installed" "$license" >/dev/null 2>&1; then
+            echo "canonical VirtIO gate accepted Release-to-Relaxed mutation" >&2
+            exit 1
+        fi
+
+        cp -a "$installed" "$tmp/missing-linear-owner"
+        sed -i '\''0,/queue: ManuallyDrop<VirtQueue<H, SIZE>>,/s//queue: VirtQueue<H, SIZE>,/'\'' \
+            "$tmp/missing-linear-owner/src/queue.rs"
+        if /repo/tools/virtio/assert-cser-patch.sh \
+            "$canonical" "$tmp/missing-linear-owner" "$license" >/dev/null 2>&1; then
+            echo "canonical VirtIO gate accepted missing ManuallyDrop owner" >&2
+            exit 1
+        fi
+
+        cp -a "$installed" "$tmp/missing-recycle"
+        sed -i '\''s/self.recycle_descriptors(head, inputs, outputs);/let _ = (head, inputs, outputs);/'\'' \
+            "$tmp/missing-recycle/src/queue.rs"
+        if /repo/tools/virtio/assert-cser-patch.sh \
+            "$canonical" "$tmp/missing-recycle" "$license" >/dev/null 2>&1; then
+            echo "canonical VirtIO gate accepted missing exact-buffer recycle" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/authority.rs"
+        sed -i '\''2i use crate::EffectAuthority;'\'' "$tmp/authority.rs"
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/authority.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            echo "production facade gate accepted semantic authority ownership" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/post-release-assert.rs"
+        sed -i '\''/let (queue, _token) = prepared.publish_prepared();/a\        assert!(true);'\'' \
+            "$tmp/post-release-assert.rs"
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/post-release-assert.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            echo "production facade gate accepted a post-Release assertion" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/branching-generation.rs"
+        sed -i '\''s/\*self.device_generation = self.next_generation;/if true { *self.device_generation = self.next_generation; }/'\'' \
+            "$tmp/branching-generation.rs"
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/branching-generation.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            echo "production facade gate accepted branching generation apply" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/branching-quiescence.rs"
+        sed -i '\''s/\*self.active = None;/if true { *self.active = None; }/'\'' \
+            "$tmp/branching-quiescence.rs"
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/branching-quiescence.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            echo "production facade gate accepted branching quiescence apply" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/overlapping-session.rs"
+        sed -i '\''0,/if self.active.is_some() {/s//if false {/'\'' \
+            "$tmp/overlapping-session.rs"
+        require_mutation "$source" "$tmp/overlapping-session.rs" overlapping-session
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/overlapping-session.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            echo "production facade gate accepted overlapping hardware sessions" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/forced-notification.rs"
+        sed -i '\''0,/if self.queue.as_ref().expect("live queue").should_notify() {/s//if true {/'\'' \
+            "$tmp/forced-notification.rs"
+        require_mutation "$source" "$tmp/forced-notification.rs" forced-notification
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/forced-notification.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            echo "production facade gate accepted mandatory notification despite suppression" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/unchecked-used-length.rs"
+        sed -i '\''0,/if used_len != EXPECTED_USED_LEN {/s//if false {/'\'' \
+            "$tmp/unchecked-used-length.rs"
+        require_mutation "$source" "$tmp/unchecked-used-length.rs" unchecked-used-length
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/unchecked-used-length.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            echo "production facade gate accepted an unchecked device used length" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/status-before-used-length.rs"
+        sed -i '\''0,/if used_len != EXPECTED_USED_LEN {/i\        let response = request_buffers.response.status();'\'' \
+            "$tmp/status-before-used-length.rs"
+        require_mutation "$source" "$tmp/status-before-used-length.rs" status-before-used-length
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/status-before-used-length.rs" "$lib" "$portal" >/dev/null 2>&1; then
+            echo "production facade gate accepted status access before used-length validation" >&2
+            exit 1
+        fi
+        echo "canonical VirtIO negative assertions: PASS release_relaxed=rejected missing_linear_owner=rejected missing_recycle=rejected facade_authority=rejected post_release_assert=rejected branching_generation_apply=rejected branching_quiescence_apply=rejected overlapping_session=rejected forced_notification=rejected unchecked_used_length=rejected status_before_used_length=rejected"
+    '
+}
+
 doctor() {
     local tool
     for tool in awk bash chmod cp cut diff dirname docker flock grep id mkdir mktemp mv rm sed sha256sum tee; do
@@ -191,8 +326,13 @@ doctor() {
         "$root/guest/linux-netd-v2.S" \
         "$repo_root/tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S" \
         "$repo_root/patches/ostd-0.18.0-cser.patch" \
-        "$repo_root/patches/ostd-0.18.0-cargo-config.toml" \
+        "$repo_root/patches/virtio-drivers-0.13.0-cser.patch" \
+        "$repo_root/patches/virtio-drivers-0.13.0-LICENSE-MIT" \
+        "$repo_root/patches/cser-cargo-config.toml" \
         "$repo_root/tools/ostd/assert-cser-patch.sh" \
+        "$repo_root/tools/virtio/assert-cser-patch.sh" \
+        "$repo_root/tools/virtio/assert-production-substrate.sh" \
+        "$repo_root/crates/nexus-ostd-virtio/src/production.rs" \
         "$root/scripts/check-scheduler-attempt.sh"; do
         if [[ ! -f $input ]]; then
             echo "nexus-ostd doctor: missing pinned input: $input" >&2
@@ -201,6 +341,7 @@ doctor() {
     done
     ensure_image
     check_ostd_patch
+    check_virtio_patch
     container bash -c '
         set -euo pipefail
         command -v rustc >/dev/null
@@ -492,6 +633,7 @@ case "$command" in
     check)
         ensure_image
         check_ostd_patch
+        check_virtio_patch
         fmt_check
         check_oracles
         check_runtime_fs_production_source
@@ -510,6 +652,7 @@ case "$command" in
     build)
         ensure_image
         check_ostd_patch
+        check_virtio_patch
         prepare_guest
         build_kernel
         ;;
@@ -526,6 +669,7 @@ case "$command" in
     test)
         ensure_image
         check_ostd_patch
+        check_virtio_patch
         check_runtime_fs_production_source
         prepare_guest
         check_runtime_fs_artifact_negatives

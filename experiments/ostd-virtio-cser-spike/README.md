@@ -62,6 +62,11 @@ executed together in one kernel run.
 - virtio-drivers: crates.io `=0.13.0`, default features disabled
 - virtio-drivers archive SHA-256:
   `cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7`
+- canonical MIT split-publication overlay:
+  `../../patches/virtio-drivers-0.13.0-cser.patch`, SHA-256
+  `7576d6810af8ff4a2d4cbcd0dc02373946031aa2e3f7ae0528b0127b5ea33762`
+- upstream virtio-drivers LICENSE SHA-256:
+  `bf2a1b2f68528d6cb47939394b181236858d3e9c6c5e43b3af0650976567f152`
 - Rust: `nightly-2026-04-03`
 - OSDK image: `asterinas/osdk:0.18.0-20260603`, pinned by amd64 digest in
   `Dockerfile`
@@ -87,8 +92,8 @@ could hide an accidental write.
 The reusable implementation now lives in
 `../../crates/nexus-ostd-virtio/`. This experiment's `src/lib.rs` is a
 `#![deny(unsafe_code)]` client of that crate. The facade crate root also denies
-unsafe code and grants local allowances only to its three private
-`pci`/`dma`/`portal` modules; raw pointers, the HAL, the raw PCI root, and DMA
+unsafe code and grants local allowances only to its four private
+`pci`/`dma`/`portal`/`production` modules; raw pointers, the HAL, the raw PCI root, and DMA
 owners are not public API. `scripts/check-facade-boundary.sh` enforces this
 layout, while the unchanged serial and QEMU trace oracle establishes runtime
 equivalence with the Stage 5B receipt. This extraction is preparation, not
@@ -276,16 +281,24 @@ and check a clean reverse application. The patch provides:
 - a configurable GSI mapping API whose I/O APIC polarity/trigger bits and IRTE
   trigger mode remain synchronized; the legacy API remains edge/high.
 
-Source assertions also pin the no-alloc `VirtQueue` Drop shape used by the
+The separate canonical MIT virtio-drivers overlay splits descriptor/DMA/avail
+slot preparation from the unique `avail.idx` Release publication and provides
+exact-buffer cancellation. Its linear prepared token retains the queue through
+`ManuallyDrop`; ordinary token Drop fails closed. Source gates pin the patch
+hash, license, apply/reverse equivalence, upstream tests, Release ordering,
+exact recycle/unshare, and mutation negatives. They also pin the no-alloc
+`VirtQueue` Drop shape used by the
 reset-without-`pop_used` boundary: queue destruction retires its DMA layout and
 does not revisit the pinned request buffers. This is an audited dependency
 boundary that should eventually become an upstream reset/abandon API.
 
 The experiment directory is an MPL-2.0 package boundary and includes the full
 MPL text; the extracted facade is likewise MPL-2.0-covered under the repository
-root license. The derived OSTD patch stays MPL-2.0-covered. virtio-drivers is
-an unmodified MIT dependency fetched from its checksummed crate archive and
-locked by Cargo; no upstream source is copied into Nexus.
+root license. The derived OSTD patch stays MPL-2.0-covered. virtio-drivers and
+the split-publication overlay remain MIT-covered; the exact upstream notice is
+retained at `../../patches/virtio-drivers-0.13.0-LICENSE-MIT`. Patched upstream
+source is reconstructed from the checksummed archive inside the build image,
+not vendored into Nexus.
 
 ## Explicit non-claims
 

@@ -417,6 +417,15 @@ explicitly records `device_dma=false` and `device_reset=false`; it is not
 evidence of mediated VirtIO closure, device drain/reset, SMP liveness, or a
 production IOMMU API.
 
+The v0.2 source/build substrate also pins a canonical MIT virtio-drivers 0.13
+overlay that splits descriptor/DMA preparation from the unique `avail.idx`
+Release publication and permits exact-buffer cancellation. A hardware-only
+facade exposes independently reconstructible descriptive coordinates plus
+failure-atomic publication, reset-generation, and final IOTLB-quiescence
+preflight with infallible apply plans, while deliberately owning no CSER
+authority. Until the main registry consumes those plans in the same boot, this
+remains Checked source/build substrate rather than same-boot identity evidence.
+
 The follow-on Stage 5B receipt now exercises the missing device-visible path on
 one pinned QEMU q35/VT-d configuration. Nexus directly reuses
 `virtio-drivers` 0.13 PCI transport, split queue, and block wire types behind a

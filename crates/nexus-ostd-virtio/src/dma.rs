@@ -87,7 +87,7 @@ struct DmaOwner {
 }
 
 impl DmaOwner {
-    fn new(kind: OwnerKind, generation: u64, dma: DmaCoherent) -> Self {
+    fn try_new(kind: OwnerKind, generation: u64, dma: DmaCoherent) -> Result<Self, DmaCoherent> {
         let paddr = dma.paddr();
         let daddr = dma.daddr();
         // SAFETY: the ledger retains the unique `DmaCoherent` owner until
@@ -95,14 +95,13 @@ impl DmaOwner {
         // access through VmReader/VmWriter; VirtIO and the ledger use this one
         // owner-bound raw mapping under the queue/reset protocol.
         let vaddr = unsafe { dma.as_non_null_ptr_exclusive() };
-        assert_eq!(dma.size(), PAGE_SIZE);
-        assert_eq!(
-            vaddr.as_ptr() as usize % PAGE_SIZE,
-            0,
-            "DMA CPU address is page aligned"
-        );
-        assert_ne!(daddr, paddr, "Stage 5B requires a non-identity IOVA");
-        Self {
+        if dma.size() != PAGE_SIZE
+            || !(vaddr.as_ptr() as usize).is_multiple_of(PAGE_SIZE)
+            || daddr == paddr
+        {
+            return Err(dma);
+        }
+        Ok(Self {
             kind,
             generation,
             state: OwnerState::Active,
@@ -113,7 +112,7 @@ impl DmaOwner {
             shares: [ShareRecord::EMPTY; 3],
             share_count: 0,
             unshare_count: 0,
-        }
+        })
     }
 }
 
@@ -161,9 +160,9 @@ pub fn mark_queue_exposed(generation: u64) {
     ledger.device_exposed = true;
 }
 
-pub fn arm_request_bounce(generation: u64) -> (usize, usize) {
-    let dma = DmaCoherent::alloc(1, true).expect("allocate request bounce page");
-    let mut owner = DmaOwner::new(OwnerKind::Request, generation, dma);
+pub(crate) fn try_arm_request_bounce(generation: u64) -> Option<(usize, usize)> {
+    let dma = DmaCoherent::alloc(1, true).ok()?;
+    let mut owner = DmaOwner::try_new(OwnerKind::Request, generation, dma).ok()?;
     // The status output must start at NOT_READY. If the device fails to write
     // it, completion cannot be mistaken for success merely because DMA pages
     // are initially zeroed.
@@ -183,7 +182,41 @@ pub fn arm_request_bounce(generation: u64) -> (usize, usize) {
     assert!(ledger.owners[slot].is_none());
     owner.state = OwnerState::Active;
     ledger.owners[slot] = Some(owner);
-    receipt
+    Some(receipt)
+}
+
+pub fn arm_request_bounce(generation: u64) -> (usize, usize) {
+    try_arm_request_bounce(generation).expect("allocate request bounce page")
+}
+
+/// Releases a generation which was fully rolled back before `DRIVER_OK`.
+///
+/// Queue owners must already have been destroyed, and every request share must
+/// either never have been created or have been exactly cancelled. These checks
+/// prevent a validation error from turning into an unsafe post-exposure free.
+pub(crate) fn abort_unexposed_generation(generation: u64) {
+    let request = {
+        let mut ledger = DMA_LEDGER.lock();
+        assert_eq!(ledger.generation, generation);
+        assert!(!ledger.device_exposed);
+        assert!(!ledger.reset_acked);
+        assert!(ledger.owners[OwnerKind::QueueDriver.slot()].is_none());
+        assert!(ledger.owners[OwnerKind::QueueDevice.slot()].is_none());
+
+        let request = ledger.owners[OwnerKind::Request.slot()].take();
+        if let Some(owner) = request.as_ref() {
+            assert_eq!(owner.generation, generation);
+            assert_eq!(owner.state, OwnerState::Active);
+            assert_eq!(owner.share_count, owner.unshare_count);
+            assert!(owner.shares.iter().all(|share| !share.active));
+        }
+        ledger.generation = 0;
+        request
+    };
+
+    // No address in this generation was exposed to a DRIVER_OK device, so
+    // ordinary OSTD teardown is sufficient and no reset/IOTLB receipt exists.
+    drop(request);
 }
 
 pub fn request_share_counts(generation: u64) -> (usize, usize) {
@@ -193,6 +226,15 @@ pub fn request_share_counts(generation: u64) -> (usize, usize) {
         .as_ref()
         .expect("request owner retained");
     (owner.share_count, owner.unshare_count)
+}
+
+pub(crate) fn request_share_counts_checked(generation: u64) -> Option<(usize, usize)> {
+    let ledger = DMA_LEDGER.lock();
+    if ledger.generation != generation {
+        return None;
+    }
+    let owner = ledger.owners[OwnerKind::Request.slot()].as_ref()?;
+    Some((owner.share_count, owner.unshare_count))
 }
 
 #[must_use = "dropping DMA closure authority permanently retains the reset generation"]
@@ -278,7 +320,9 @@ fn allocate_queue_owner(pages: usize, direction: BufferDirection) -> (PhysAddr, 
     assert_ne!(generation, 0, "queue DMA allocated outside a generation");
     let slot = kind.slot();
     assert!(ledger.owners[slot].is_none(), "duplicate queue DMA owner");
-    let owner = DmaOwner::new(kind, generation, dma);
+    let Ok(owner) = DmaOwner::try_new(kind, generation, dma) else {
+        return (0, NonNull::dangling());
+    };
     let daddr = u64::try_from(owner.daddr).expect("IOVA fits VirtIO PhysAddr");
     let vaddr = owner.vaddr;
     ledger.owners[slot] = Some(owner);

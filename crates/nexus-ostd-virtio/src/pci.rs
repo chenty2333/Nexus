@@ -101,6 +101,15 @@ pub struct DeviceBdf {
 }
 
 impl DeviceBdf {
+    /// Constructs descriptive PCI coordinates without claiming hardware.
+    pub const fn from_coordinates(bus: u8, device: u8, function: u8) -> Self {
+        Self {
+            bus,
+            device,
+            function,
+        }
+    }
+
     pub const fn bus(self) -> u8 {
         self.bus
     }
@@ -290,13 +299,32 @@ pub fn discover_and_own_bars() -> Root {
     }
 }
 
-pub(crate) fn enable_device(root: &mut Root, device_function: DeviceFunction) {
+pub(crate) fn enable_device_for_prepare(
+    root: &mut Root,
+    device_function: DeviceFunction,
+) -> Command {
     root.assert_device(device_function);
     let (_, command) = root.inner.get_status_command(device_function);
     root.inner.set_command(
         device_function,
         command | Command::MEMORY_SPACE | Command::BUS_MASTER | Command::INTERRUPT_DISABLE,
     );
+    command
+}
+
+pub(crate) fn enable_device(root: &mut Root, device_function: DeviceFunction) {
+    let _ = enable_device_for_prepare(root, device_function);
+}
+
+pub(crate) fn restore_device_command(
+    root: &mut Root,
+    device_function: DeviceFunction,
+    command: Command,
+) {
+    root.assert_device(device_function);
+    root.inner.set_command(device_function, command);
+    let (_, observed) = root.inner.get_status_command(device_function);
+    assert_eq!(observed, command);
 }
 
 pub(crate) fn disable_bus_master(root: &mut Root, device_function: DeviceFunction) {

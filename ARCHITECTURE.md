@@ -539,6 +539,23 @@ adapter remains `Ostd018FailClosed`, and the optional VirtIO facade is only
 compile-checked. This is not primary-boot DMA closure, interrupt-delivery,
 IRQ-quiescence, same-boot device, or SMP evidence.
 
+A second canonical overlay pins virtio-drivers 0.13 under its upstream MIT
+license. It introduces a linear fail-closed prepared queue, a unique infallible
+`avail.idx` Release, and exact-buffer cancellation. The production facade above
+it owns only descriptive BDF/queue/token/generation coordinates: the registry
+adapter must prevalidate those coordinates and the semantic commit under one
+runtime lock, then invoke the infallible hardware publication inside the same
+apply boundary. Reset generation uses the same prevalidate/infallible-apply
+shape. Final IOTLB closure also prevalidates identity, generation, completed
+owners, and single consumption before an infallible plan clears the facade
+slot inside the registry acknowledgement boundary. This is source/build
+substrate until a primary same-boot adapter uses it.
+The registry envelope does not by itself prevent two roots from naming one
+physical function or bound a whole-function reset's blast radius. The opaque
+facade `Root` grants one BDF claim and `ProductionDevice` permits one active
+hardware lifecycle; any later multi-root design must preserve that singleton
+outside the semantic registry.
+
 The first Stage 5A receipt deliberately stopped before device DMA. Stage 5B now
 combines the same OSTD owner with a real `ACCESS_PLATFORM` modern
 `virtio-blk-pci` queue. The mediated portal owns two one-page queue mappings and

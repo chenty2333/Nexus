@@ -3,20 +3,28 @@
 ARG OSDK_IMAGE=asterinas/osdk:0.18.0-20260603@sha256:a7540bfcd262ae52471f86353a87663d91941958e503557863738d13de4aace3
 FROM ${OSDK_IMAGE}
 
-COPY crates/cser-transition-gates /crates/cser-transition-gates
-
 RUN rustup target add --toolchain nightly-2026-04-03 x86_64-unknown-none \
     && rustup component add --toolchain nightly-2026-04-03 rustfmt clippy \
     && cargo install cargo-osdk --version 0.18.0 --locked
 
+COPY crates/cser-transition-gates /crates/cser-transition-gates
 COPY crates/nexus-ostd-virtio /crates/nexus-ostd-virtio
 
 ARG OSTD_CRATE_SHA256=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1
 ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
+ARG VIRTIO_DRIVERS_CRATE_SHA256=cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7
+ARG VIRTIO_DRIVERS_CRATE_URL=https://static.crates.io/crates/virtio-drivers/virtio-drivers-0.13.0.crate
 COPY patches/ostd-0.18.0-cser.patch /tmp/nexus-patches/ostd-0.18.0-cser.patch
+COPY patches/virtio-drivers-0.13.0-cser.patch \
+    /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch
+COPY patches/virtio-drivers-0.13.0-LICENSE-MIT \
+    /tmp/nexus-patches/virtio-drivers-0.13.0-LICENSE-MIT
 COPY tools/ostd/assert-cser-patch.sh /usr/local/bin/assert-ostd-cser-patch
+COPY tools/virtio/assert-cser-patch.sh /usr/local/bin/assert-virtio-cser-patch
+COPY tools/virtio/assert-production-substrate.sh \
+    /usr/local/bin/assert-production-virtio-substrate
 RUN set -eu; \
-    mkdir -p /opt/nexus-source /opt/nexus-ostd; \
+    mkdir -p /opt/nexus-source /opt/nexus-ostd /opt/nexus-virtio; \
     archive=/opt/nexus-source/ostd-0.18.0.crate; \
     curl --fail --silent --show-error --location "$OSTD_CRATE_URL" --output "$archive"; \
     echo "${OSTD_CRATE_SHA256}  ${archive}" | sha256sum -c -; \
@@ -25,11 +33,32 @@ RUN set -eu; \
         < /tmp/nexus-patches/ostd-0.18.0-cser.patch; \
     patch --batch --dry-run --reverse -d /opt/nexus-ostd/ostd-0.18.0 -p1 \
         < /tmp/nexus-patches/ostd-0.18.0-cser.patch; \
-    chmod -R a+rX /opt/nexus-source /opt/nexus-ostd; \
+    virtio_archive=/opt/nexus-source/virtio-drivers-0.13.0.crate; \
+    curl --fail --silent --show-error --location "$VIRTIO_DRIVERS_CRATE_URL" \
+        --output "$virtio_archive"; \
+    echo "${VIRTIO_DRIVERS_CRATE_SHA256}  ${virtio_archive}" | sha256sum -c -; \
+    tar -xzf "$virtio_archive" -C /opt/nexus-virtio; \
+    patch --batch --forward -d /opt/nexus-virtio/virtio-drivers-0.13.0 -p1 \
+        < /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch; \
+    patch --batch --dry-run --reverse \
+        -d /opt/nexus-virtio/virtio-drivers-0.13.0 -p1 \
+        < /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch; \
+    chmod -R a+rX /opt/nexus-source /opt/nexus-ostd /opt/nexus-virtio; \
     /usr/local/bin/assert-ostd-cser-patch \
         /tmp/nexus-patches/ostd-0.18.0-cser.patch \
-        /opt/nexus-ostd/ostd-0.18.0
-COPY patches/ostd-0.18.0-cargo-config.toml /root/.cargo/config.toml
+        /opt/nexus-ostd/ostd-0.18.0; \
+    /usr/local/bin/assert-virtio-cser-patch \
+        /tmp/nexus-patches/virtio-drivers-0.13.0-cser.patch \
+        /opt/nexus-virtio/virtio-drivers-0.13.0 \
+        /tmp/nexus-patches/virtio-drivers-0.13.0-LICENSE-MIT; \
+    /usr/local/bin/assert-production-virtio-substrate \
+        /crates/nexus-ostd-virtio/src/production.rs \
+        /crates/nexus-ostd-virtio/src/lib.rs \
+        /crates/nexus-ostd-virtio/src/portal.rs
+COPY patches/cser-cargo-config.toml /root/.cargo/config.toml
+RUN cargo test --manifest-path /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.toml \
+        --lib --no-default-features \
+    && rm -rf /opt/nexus-virtio/virtio-drivers-0.13.0/target
 
 COPY kernel/nexus-ostd/src/cser/effect_registry.rs \
     /kernel/nexus-ostd/src/cser/effect_registry.rs
