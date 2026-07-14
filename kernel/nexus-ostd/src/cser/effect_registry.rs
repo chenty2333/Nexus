@@ -1612,9 +1612,16 @@ pub(crate) enum RegistryError {
     Invariant(&'static str),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DevicePublicationMode {
+    Unique,
+    DisabledNonDeviceCandidate,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct EffectRegistry {
     instance_id: u64,
+    device_publication_mode: DevicePublicationMode,
     scopes: BTreeMap<ScopeKey, Box<ScopeRecord>>,
     effects: BTreeMap<EffectKey, EffectRecord>,
     by_scope: BTreeMap<ScopeKey, BTreeSet<EffectKey>>,
@@ -1636,6 +1643,7 @@ impl EffectRegistry {
     pub(crate) fn new() -> Self {
         Self {
             instance_id: next_registry_instance_id(),
+            device_publication_mode: DevicePublicationMode::Unique,
             scopes: BTreeMap::new(),
             effects: BTreeMap::new(),
             by_scope: BTreeMap::new(),
@@ -1661,6 +1669,7 @@ impl EffectRegistry {
     fn clone(&self) -> Self {
         Self {
             instance_id: self.instance_id,
+            device_publication_mode: self.device_publication_mode,
             scopes: self.scopes.clone(),
             effects: self.effects.clone(),
             by_scope: self.by_scope.clone(),
@@ -1677,6 +1686,34 @@ impl EffectRegistry {
             next_publication_sequence: self.next_publication_sequence,
             next_revoke_sequence: self.next_revoke_sequence,
         }
+    }
+
+    /// Clones a legacy composition candidate without duplicating device
+    /// publication authority.
+    ///
+    /// The old bounded composition evaluators use clone/validate/swap for
+    /// generic registry mutations. Their candidates may never attach a device
+    /// envelope, mint a kernel root authority, or enter the production batch
+    /// gate. This keeps `EffectRegistry` itself non-`Clone` while making that
+    /// historical transaction shape explicit and fail closed.
+    pub(crate) fn clone_non_device_candidate(&self) -> Result<Self, RegistryError> {
+        if self
+            .scopes
+            .values()
+            .any(|scope| scope.device_root.is_some())
+        {
+            return Err(RegistryError::InvalidDeviceEnvelope);
+        }
+        let mut candidate = self.clone();
+        candidate.device_publication_mode = DevicePublicationMode::DisabledNonDeviceCandidate;
+        Ok(candidate)
+    }
+
+    fn require_unique_device_publication(&self) -> Result<(), RegistryError> {
+        if self.device_publication_mode != DevicePublicationMode::Unique {
+            return Err(RegistryError::InvalidDeviceEnvelope);
+        }
+        Ok(())
     }
 
     /// Returns the complete registry debug projection used by failure-atomic
@@ -1839,6 +1876,7 @@ impl EffectRegistry {
         scope_key: ScopeKey,
         owner: TaskKey,
     ) -> Result<KernelRootAuthority, RegistryError> {
+        self.require_unique_device_publication()?;
         let scope = self
             .scopes
             .get(&scope_key)
@@ -1878,6 +1916,7 @@ impl EffectRegistry {
         &mut self,
         request: DeviceDerivedRegisterRequest,
     ) -> Result<RegisteredEffect, RegistryError> {
+        self.require_unique_device_publication()?;
         if request.derived.domain == DomainKey::LEGACY {
             return Err(RegistryError::InvalidState);
         }
@@ -4646,6 +4685,16 @@ impl EffectRegistry {
         if self.instance_id == 0 {
             return Err(RegistryError::Invariant("invalid Registry instance"));
         }
+        if self.device_publication_mode == DevicePublicationMode::DisabledNonDeviceCandidate
+            && self
+                .scopes
+                .values()
+                .any(|scope| scope.device_root.is_some())
+        {
+            return Err(RegistryError::Invariant(
+                "non-device candidate acquired device publication state",
+            ));
+        }
         // Loom's modeled coroutine stack is intentionally small. Keep the
         // independently reconstructed index oracle on the heap so adding
         // production indexes does not turn a semantic check into stack-size
@@ -5598,6 +5647,7 @@ impl EffectRegistry {
         &self,
         authority: KernelRootAuthority,
     ) -> Result<(), RegistryError> {
+        self.require_unique_device_publication()?;
         if authority.registry_instance_id != self.instance_id {
             return Err(RegistryError::InvalidBatchReceipt);
         }
@@ -8143,6 +8193,34 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         registry.add_domain(SCOPE, config).unwrap();
     }
 
+    let mut non_device_candidate = registry.clone_non_device_candidate().unwrap();
+    assert_eq!(
+        non_device_candidate.kernel_root_authority(SCOPE, ROOT_OWNER),
+        Err(RegistryError::InvalidDeviceEnvelope)
+    );
+    let non_device_before_registration = non_device_candidate.clone();
+    assert_eq!(
+        non_device_candidate.register_device_derived(DeviceDerivedRegisterRequest {
+            derived: DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: VIRTIO,
+                    operation: OperationClass::new(3),
+                    descriptor: SyscallDescriptor::new(3, [0, 0, 512, 0, 0, 0]),
+                    resources: alloc::vec![ResourceKey::new(0x31, 3, 1)],
+                    credits: alloc::vec![CreditCharge::new(QUEUE_SLOT, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: VIRTIO_DOMAIN,
+                parent: None,
+            },
+            device,
+        }),
+        Err(RegistryError::InvalidDeviceEnvelope)
+    );
+    assert_eq!(non_device_candidate, non_device_before_registration);
+    non_device_candidate.check_invariants().unwrap();
+
     let syscall = registry
         .register_derived(DerivedRegisterRequest {
             request: RegisterRequest {
@@ -8245,6 +8323,10 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
             device,
         })
         .unwrap();
+    assert!(matches!(
+        registry.clone_non_device_candidate(),
+        Err(RegistryError::InvalidDeviceEnvelope)
+    ));
 
     let registered = [&syscall, &filesystem, &block, &dma_a, &dma_b, &dma_request];
     for (sender, effect) in [
@@ -8284,6 +8366,15 @@ fn production_device_batch_registry_self_test(registry: &mut EffectRegistry) {
         dma_b.handle,
         dma_request.handle,
     ];
+
+    let mut disabled_enrollment = registry.clone();
+    disabled_enrollment.device_publication_mode = DevicePublicationMode::DisabledNonDeviceCandidate;
+    let disabled_enrollment_before = disabled_enrollment.clone();
+    assert_eq!(
+        disabled_enrollment.enroll_device_batch(authority, &handles, device),
+        Err(RegistryError::InvalidDeviceEnvelope)
+    );
+    assert_eq!(disabled_enrollment, disabled_enrollment_before);
 
     for (label, wrong_device, expected) in [
         (

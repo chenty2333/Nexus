@@ -369,7 +369,7 @@ struct CompositionProjection {
     readiness_unpublished: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct CompositionState {
     phase: RootPhase,
     authority_epoch: u64,
@@ -398,6 +398,43 @@ struct CompositionState {
     accepted_receipts: BTreeMap<u64, DomainClosureReceipt>,
     current_receipt: BTreeMap<DomainId, u64>,
     invalidated_receipts: BTreeSet<u64>,
+}
+
+impl Clone for CompositionState {
+    fn clone(&self) -> Self {
+        Self {
+            phase: self.phase,
+            authority_epoch: self.authority_epoch,
+            scheduler_binding_epoch: self.scheduler_binding_epoch,
+            pager_binding_epoch: self.pager_binding_epoch,
+            registry: self
+                .registry
+                .clone_non_device_candidate()
+                .expect("legacy Linux I/O candidate is never device-backed"),
+            registered: self.registered.clone(),
+            kind_by_effect: self.kind_by_effect.clone(),
+            effect_by_kind: self.effect_by_kind.clone(),
+            parent_by_effect: self.parent_by_effect.clone(),
+            children_by_parent: self.children_by_parent.clone(),
+            effects_by_domain: self.effects_by_domain.clone(),
+            commits: self.commits.clone(),
+            live: self.live.clone(),
+            terminal_sequences: self.terminal_sequences.clone(),
+            readiness: self.readiness.clone(),
+            fs_bytes: self.fs_bytes,
+            network_payload: self.network_payload,
+            guest_replies: self.guest_replies,
+            buffer_closure_drains: self.buffer_closure_drains,
+            virtio: self.virtio,
+            active_revoke: self.active_revoke.clone(),
+            next_receipt_sequence: self.next_receipt_sequence,
+            receipt_revision: self.receipt_revision,
+            pending_receipt: self.pending_receipt.clone(),
+            accepted_receipts: self.accepted_receipts.clone(),
+            current_receipt: self.current_receipt.clone(),
+            invalidated_receipts: self.invalidated_receipts.clone(),
+        }
+    }
 }
 
 impl CompositionState {
@@ -1157,6 +1194,7 @@ impl LinuxIoComposition {
 fn print_terminal(kind: EffectKind, sequence: u64, outcome: TerminalOutcome) {
     let outcome = match outcome {
         TerminalOutcome::Completed => "Completed",
+        TerminalOutcome::IndeterminateAfterReset => "IndeterminateAfterReset",
         TerminalOutcome::Aborted => "Aborted",
     };
     println!(

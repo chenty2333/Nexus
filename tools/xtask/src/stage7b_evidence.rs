@@ -7,6 +7,7 @@ const INPUT: &str = "kernel/nexus-ostd/artifacts/stage7b-evaluation.log";
 const RUNTIME_METADATA: &str = "kernel/nexus-ostd/artifacts/stage7b-runtime-metadata.env";
 const EVALUATOR_SOURCE: &str = "kernel/nexus-ostd/src/evaluation/stage7b.rs";
 const FAULT_REGISTRY_SOURCE: &str = "kernel/nexus-ostd/src/cser/effect_registry.rs";
+const KERNEL_SOURCE_DIRECTORY: &str = "kernel/nexus-ostd/src";
 const OUTPUT_DIRECTORY: &str = "target/verification/stage7b";
 const FAULT_OUTPUT: &str = "fault-matrix.jsonl";
 const SCALE_OUTPUT: &str = "scale.jsonl";
@@ -536,7 +537,83 @@ fn validate_fault_sources(root: &Path) -> Result<(), String> {
         format!("required Stage 7B fault Registry source is missing: {FAULT_REGISTRY_SOURCE}")
     })?;
     validate_fault_evaluator_source_text(&source)?;
-    validate_fault_registry_source_text(&registry)
+    validate_fault_registry_source_text(&registry)?;
+    validate_non_device_candidate_callers(root)
+}
+
+fn validate_non_device_candidate_callers(root: &Path) -> Result<(), String> {
+    let source_root = root.join(KERNEL_SOURCE_DIRECTORY);
+    let mut pending = vec![source_root.clone()];
+    let mut observed = BTreeMap::<String, usize>::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("read {}: {error}", directory.display()))?
+        {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "read directory entry under {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "kernel source caller audit rejects symlink: {}",
+                    path.display()
+                ));
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("rs")
+            {
+                continue;
+            }
+            let source = fs::read_to_string(&path)
+                .map_err(|error| format!("read {}: {error}", path.display()))?;
+            // Count the bare identifier rather than method-call syntax so
+            // UFCS, comments between the name and parentheses, and multiline
+            // calls cannot bypass the trusted-caller allowlist.
+            let calls = source.matches("clone_non_device_candidate").count();
+            if calls == 0 {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| format!("kernel source escaped repository root: {}", path.display()))?
+                .to_string_lossy()
+                .into_owned();
+            observed.insert(relative, calls);
+        }
+    }
+
+    validate_non_device_candidate_caller_counts(&observed)
+}
+
+fn validate_non_device_candidate_caller_counts(
+    observed: &BTreeMap<String, usize>,
+) -> Result<(), String> {
+    let expected = BTreeMap::from([
+        (FAULT_REGISTRY_SOURCE.to_owned(), 3usize),
+        (
+            "kernel/nexus-ostd/src/cser/composition.rs".to_owned(),
+            1usize,
+        ),
+        (
+            "kernel/nexus-ostd/src/cser/linux_io_composition.rs".to_owned(),
+            1usize,
+        ),
+    ]);
+    if observed != &expected {
+        return Err(format!(
+            "non-device Registry candidate callers must remain the exact two legacy evaluators plus Registry self-tests; production callers are forbidden (expected {expected:?}, observed {observed:?})"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
@@ -626,12 +703,12 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
     let population = &device[..population_end];
     if device.matches("EffectRegistry::new()").count() != 0
         || population.matches(".register_derived(").count() != 2
-        || population.matches(".register_device_derived(").count() != 4
+        || population.matches(".register_device_derived(").count() != 5
         || device.matches(".register_derived(").count() != 6
-        || device.matches(".register_device_derived(").count() != 5
+        || device.matches(".register_device_derived(").count() != 6
         || device.matches("commit_device_batch_with_publish(").count() != 8
         || device.matches("validate_device_batch_receipt(").count() != 8
-        || device.matches("enroll_device_batch(").count() != 3
+        || device.matches("enroll_device_batch(").count() != 4
         || device.matches("freeze_pending_device_cancel(").count() != 2
         || device.matches(".cancel_only()").count() != 2
         || device.matches("begin_unpublished_device_cancel(").count() != 3
@@ -1189,7 +1266,91 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
             ));
         }
     }
+    let authority_guard = "self.require_unique_device_publication()?;";
+    let mint_start = source
+        .find("pub(crate) fn kernel_root_authority(")
+        .ok_or_else(|| "production Registry lacks kernel root authority mint".to_owned())?;
+    let mint_end = source[mint_start..]
+        .find("pub(crate) fn register(")
+        .map(|offset| mint_start + offset)
+        .ok_or_else(|| "kernel root authority mint boundary is unterminated".to_owned())?;
+    let registration_start = source
+        .find("pub(crate) fn register_device_derived(")
+        .ok_or_else(|| "production Registry lacks device-derived registration".to_owned())?;
+    let registration_end = source[registration_start..]
+        .find("    fn register_in_domain(")
+        .map(|offset| registration_start + offset)
+        .ok_or_else(|| "device-derived registration boundary is unterminated".to_owned())?;
+    let validation_start = source
+        .find("    fn validate_kernel_root_authority(")
+        .ok_or_else(|| "production Registry lacks kernel root authority validation".to_owned())?;
+    let validation_end = source[validation_start..]
+        .find("    fn validate_root_portal(")
+        .map(|offset| validation_start + offset)
+        .ok_or_else(|| "kernel root authority validation boundary is unterminated".to_owned())?;
+    let unique_guard_start = source
+        .find("    fn require_unique_device_publication(")
+        .ok_or_else(|| "production Registry lacks the unique-publication guard".to_owned())?;
+    let unique_guard_end = source[unique_guard_start..]
+        .find("    /// Returns the complete registry debug projection")
+        .map(|offset| unique_guard_start + offset)
+        .ok_or_else(|| "unique-publication guard boundary is unterminated".to_owned())?;
+    let guard_is_first_statement = |body: &str| {
+        body.split_once('{')
+            .is_some_and(|(_, body)| body.trim_start().starts_with(authority_guard))
+    };
+    let unique_guard_compact: String = source[unique_guard_start..unique_guard_end]
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let expected_unique_guard = concat!(
+        "fnrequire_unique_device_publication(&self)->Result<(),RegistryError>{",
+        "ifself.device_publication_mode!=DevicePublicationMode::Unique{",
+        "returnErr(RegistryError::InvalidDeviceEnvelope);",
+        "}",
+        "Ok(())",
+        "}",
+    );
+    if source.matches(authority_guard).count() != 3
+        || source[mint_start..mint_end]
+            .matches(authority_guard)
+            .count()
+            != 1
+        || !guard_is_first_statement(&source[mint_start..mint_end])
+        || source[registration_start..registration_end]
+            .matches(authority_guard)
+            .count()
+            != 1
+        || !guard_is_first_statement(&source[registration_start..registration_end])
+        || source[validation_start..validation_end]
+            .matches(authority_guard)
+            .count()
+            != 1
+        || !guard_is_first_statement(&source[validation_start..validation_end])
+        || unique_guard_compact != expected_unique_guard
+    {
+        return Err(
+            "device publication authority must guard exactly the mint, device-derived registration, and root-validation functions"
+                .into(),
+        );
+    }
     for required in [
+        "enum DevicePublicationMode {",
+        "DisabledNonDeviceCandidate",
+        "device_publication_mode: DevicePublicationMode,",
+        "pub(crate) fn clone_non_device_candidate(&self) -> Result<Self, RegistryError>",
+        "candidate.device_publication_mode = DevicePublicationMode::DisabledNonDeviceCandidate;",
+        "fn require_unique_device_publication(&self) -> Result<(), RegistryError>",
+        "non-device candidate acquired device publication state",
+        "let mut non_device_candidate = registry.clone_non_device_candidate().unwrap();",
+        "non_device_candidate.kernel_root_authority(SCOPE, ROOT_OWNER)",
+        "non_device_candidate.register_device_derived(DeviceDerivedRegisterRequest {",
+        "assert_eq!(non_device_candidate, non_device_before_registration);",
+        "registry.clone_non_device_candidate(),",
+        "disabled_enrollment.device_publication_mode =",
+        "DevicePublicationMode::DisabledNonDeviceCandidate;",
+        "disabled_enrollment.enroll_device_batch(authority, &handles, device)",
+        "assert_eq!(disabled_enrollment, disabled_enrollment_before);",
         "pub(crate) fn enroll_device_batch(",
         "if self.scopes[&record.identity.scope].device_root.is_some() {",
         "return Err(RegistryError::InvalidDeviceEnvelope);",
@@ -2247,10 +2408,88 @@ mod tests {
         include_str!("../../../kernel/nexus-ostd/src/cser/effect_registry.rs").into()
     }
 
+    fn checked_non_device_candidate_callers() -> BTreeMap<String, usize> {
+        BTreeMap::from([
+            (FAULT_REGISTRY_SOURCE.to_owned(), 3usize),
+            (
+                "kernel/nexus-ostd/src/cser/composition.rs".to_owned(),
+                1usize,
+            ),
+            (
+                "kernel/nexus-ostd/src/cser/linux_io_composition.rs".to_owned(),
+                1usize,
+            ),
+        ])
+    }
+
     #[test]
     fn fault_source_gate_accepts_typed_receipt_projection_pipeline() {
         validate_fault_evaluator_source_text(&checked_evaluator_source()).unwrap();
         validate_fault_registry_source_text(&checked_registry_source()).unwrap();
+        validate_non_device_candidate_caller_counts(&checked_non_device_candidate_callers())
+            .unwrap();
+    }
+
+    #[test]
+    fn non_device_candidate_gate_rejects_production_and_unlisted_callers() {
+        let mut production = checked_non_device_candidate_callers();
+        production.insert(
+            "kernel/nexus-ostd/src/personality/linux_fs.rs".to_owned(),
+            1,
+        );
+        assert!(validate_non_device_candidate_caller_counts(&production).is_err());
+
+        let mut third_legacy = checked_non_device_candidate_callers();
+        third_legacy.insert(
+            "kernel/nexus-ostd/src/cser/unlisted_evaluator.rs".to_owned(),
+            1,
+        );
+        assert!(validate_non_device_candidate_caller_counts(&third_legacy).is_err());
+
+        let mut missing_legacy = checked_non_device_candidate_callers();
+        missing_legacy.remove("kernel/nexus-ostd/src/cser/composition.rs");
+        assert!(validate_non_device_candidate_caller_counts(&missing_legacy).is_err());
+    }
+
+    #[test]
+    fn non_device_candidate_caller_scan_rejects_ufcs_in_linux_fs() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nexus-non-device-caller-scan-{}-{nonce}",
+            std::process::id()
+        ));
+        for (relative, source) in [
+            (
+                FAULT_REGISTRY_SOURCE,
+                "clone_non_device_candidate clone_non_device_candidate clone_non_device_candidate",
+            ),
+            (
+                "kernel/nexus-ostd/src/cser/composition.rs",
+                "clone_non_device_candidate",
+            ),
+            (
+                "kernel/nexus-ostd/src/cser/linux_io_composition.rs",
+                "clone_non_device_candidate",
+            ),
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
+        }
+        validate_non_device_candidate_callers(&root).unwrap();
+
+        let production = root.join("kernel/nexus-ostd/src/personality/linux_fs.rs");
+        fs::create_dir_all(production.parent().unwrap()).unwrap();
+        fs::write(
+            &production,
+            "let _ = EffectRegistry::clone_non_device_candidate(&registry);",
+        )
+        .unwrap();
+        assert!(validate_non_device_candidate_callers(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2316,6 +2555,74 @@ mod tests {
     #[test]
     fn production_device_closure_gate_rejects_enrollment_retention_and_generation_bypasses() {
         let source = checked_registry_source();
+
+        let copyable_device_authority = source.replacen(
+            "candidate.device_publication_mode = DevicePublicationMode::DisabledNonDeviceCandidate;",
+            "candidate.device_publication_mode = DevicePublicationMode::Unique;",
+            1,
+        );
+        assert_ne!(copyable_device_authority, source);
+        assert!(validate_fault_registry_source_text(&copyable_device_authority).is_err());
+
+        let missing_device_authority_guard = source.replacen(
+            "self.require_unique_device_publication()?;",
+            "let _ = self.device_publication_mode;",
+            1,
+        );
+        assert_ne!(missing_device_authority_guard, source);
+        assert!(validate_fault_registry_source_text(&missing_device_authority_guard).is_err());
+
+        let registration_prefix = concat!(
+            "pub(crate) fn register_device_derived(\n",
+            "        &mut self,\n",
+            "        request: DeviceDerivedRegisterRequest,\n",
+            "    ) -> Result<RegisteredEffect, RegistryError> {\n",
+            "        self.require_unique_device_publication()?;",
+        );
+        let mint_prefix = concat!(
+            "pub(crate) fn kernel_root_authority(\n",
+            "        &self,\n",
+            "        scope_key: ScopeKey,\n",
+            "        owner: TaskKey,\n",
+            "    ) -> Result<KernelRootAuthority, RegistryError> {\n",
+            "        self.require_unique_device_publication()?;",
+        );
+        let moved_device_authority_guard = source
+            .replacen(
+                registration_prefix,
+                &registration_prefix.replace(
+                    "self.require_unique_device_publication()?;",
+                    "let _ = self.device_publication_mode;",
+                ),
+                1,
+            )
+            .replacen(
+                mint_prefix,
+                &mint_prefix.replace(
+                    "self.require_unique_device_publication()?;",
+                    concat!(
+                        "self.require_unique_device_publication()?;\n",
+                        "        self.require_unique_device_publication()?;",
+                    ),
+                ),
+                1,
+            );
+        assert_ne!(moved_device_authority_guard, source);
+        assert_eq!(
+            moved_device_authority_guard
+                .matches("self.require_unique_device_publication()?;")
+                .count(),
+            3
+        );
+        assert!(validate_fault_registry_source_text(&moved_device_authority_guard).is_err());
+
+        let missing_candidate_invariant = source.replacen(
+            "non-device candidate acquired device publication state",
+            "candidate state accepted device publication",
+            1,
+        );
+        assert_ne!(missing_candidate_invariant, source);
+        assert!(validate_fault_registry_source_text(&missing_candidate_invariant).is_err());
 
         let ancestor_only = source.replacen(
             "if self.scopes[&record.identity.scope].device_root.is_some() {",
@@ -2880,6 +3187,20 @@ mod tests {
         let registry = root.join(FAULT_REGISTRY_SOURCE);
         fs::create_dir_all(registry.parent().unwrap()).unwrap();
         fs::write(&registry, checked_registry_source()).unwrap();
+        for (relative, source) in [
+            (
+                "kernel/nexus-ostd/src/cser/composition.rs",
+                include_str!("../../../kernel/nexus-ostd/src/cser/composition.rs"),
+            ),
+            (
+                "kernel/nexus-ostd/src/cser/linux_io_composition.rs",
+                include_str!("../../../kernel/nexus-ostd/src/cser/linux_io_composition.rs"),
+            ),
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
+        }
         fs::write(
             artifacts.join("stage7b-evaluation.log"),
             valid_log().replace('\n', "\r\n"),

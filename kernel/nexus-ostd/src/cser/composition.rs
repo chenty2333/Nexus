@@ -322,7 +322,7 @@ impl From<ReadinessError> for CompositionError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct CompositionState {
     root_phase: RootPhase,
     root_authority_epoch: u64,
@@ -347,6 +347,39 @@ struct CompositionState {
     receipt_revision: u64,
     next_receipt_sequence: u64,
     virtio: Option<ExternalVirtIoAdapter>,
+}
+
+impl Clone for CompositionState {
+    fn clone(&self) -> Self {
+        Self {
+            root_phase: self.root_phase,
+            root_authority_epoch: self.root_authority_epoch,
+            registry: self
+                .registry
+                .clone_non_device_candidate()
+                .expect("legacy composition candidate is never device-backed"),
+            readiness: self.readiness.clone(),
+            enrollment_by_domain: self.enrollment_by_domain.clone(),
+            current_envelope_by_domain: self.current_envelope_by_domain.clone(),
+            domains: self.domains.clone(),
+            children_by_parent: self.children_by_parent.clone(),
+            domain_by_effect: self.domain_by_effect.clone(),
+            domain_by_local_scope: self.domain_by_local_scope.clone(),
+            credit_by_domain: self.credit_by_domain.clone(),
+            domain_revisions: self.domain_revisions.clone(),
+            frozen_domains: self.frozen_domains.clone(),
+            frozen_effects: self.frozen_effects.clone(),
+            active_revoke: self.active_revoke.clone(),
+            pending_closure: self.pending_closure.clone(),
+            closure_receipts: self.closure_receipts.clone(),
+            accepted_receipts: self.accepted_receipts.clone(),
+            latest_receipt_by_domain: self.latest_receipt_by_domain.clone(),
+            invalidated_receipts: self.invalidated_receipts.clone(),
+            receipt_revision: self.receipt_revision,
+            next_receipt_sequence: self.next_receipt_sequence,
+            virtio: self.virtio,
+        }
+    }
 }
 
 impl CompositionState {
@@ -1644,6 +1677,9 @@ pub(crate) fn run_composition_slice(scheduler: &CserScheduler, pager_receipt: Pa
         assert_eq!(receipt.authority_epoch, ROOT_AUTHORITY_EPOCH + 1);
         let outcome = match receipt.status {
             ClosureStatus::Closed(TerminalOutcome::Completed) => "Completed",
+            ClosureStatus::Closed(TerminalOutcome::IndeterminateAfterReset) => {
+                "IndeterminateAfterReset"
+            }
             ClosureStatus::Closed(TerminalOutcome::Aborted) => "Aborted",
             ClosureStatus::TimedOut => unreachable!(),
         };
