@@ -27,7 +27,7 @@ cleanup() {
 trap cleanup EXIT
 
 awk -f "$oracle" "$serial"
-echo "runtime network serial positive assertion: PASS exact_semantic_transcript=true projection_pair_recomputed=true" | tee -a "$report"
+echo "runtime network serial positive assertion: PASS exact_semantic_transcript=true projection_format_checked=true projection_equality_checked=true" | tee -a "$report"
 
 negative_count=0
 expect_reject() {
@@ -157,7 +157,7 @@ mkdir -p "$(dirname -- "$artifact")"
 artifact_tmp="$(dirname -- "$artifact")/.runtime-net-oracle.$$.tmp"
 cp "$report" "$artifact_tmp"
 printf '%s\n' \
-    "RUNTIME_NET_ORACLE PASS serial=kernel/nexus-ostd/artifacts/serial.log positive_oracle=true exact_semantic_transcript=true projection_pair_recomputed=true negative_oracles=$negative_count retained_syscalls=22 bounded_loopback=true single_cpu=true smoltcp=false virtio_net=false external_packets=false tcp_breadth=false" \
+    "RUNTIME_NET_ORACLE PASS serial=kernel/nexus-ostd/artifacts/serial.log positive_oracle=true exact_semantic_transcript=true projection_format_checked=true projection_equality_checked=true negative_oracles=$negative_count retained_syscalls=22 bounded_loopback=true single_cpu=true smoltcp=false virtio_net=false external_packets=false tcp_breadth=false" \
     >>"$artifact_tmp"
 mv "$artifact_tmp" "$artifact"
 artifact_tmp=
