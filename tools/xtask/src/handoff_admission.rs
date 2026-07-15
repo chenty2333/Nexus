@@ -649,7 +649,7 @@ fn validate_fault_matrix_contract(matrix: &FaultMatrix) -> Result<()> {
         || matrix.ownership_log != "trusted-non-equivocating-no-rollback-tcb"
         || matrix.host_reboot_claimed
         || matrix.malicious_rollback_claimed
-        || !matrix.production_registry_modified
+        || matrix.production_registry_modified
     {
         return Err("handoff-admission fault matrix changed its first-round boundary".into());
     }

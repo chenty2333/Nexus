@@ -5,7 +5,7 @@ fault_model = "same-boot-crash-stop-retry-reorder-lost-ack"
 ownership_log = "trusted-non-equivocating-no-rollback-tcb"
 host_reboot_claimed = false
 malicious_rollback_claimed = false
-production_registry_modified = true
+production_registry_modified = false
 
 required_invariants = [
   "AtMostOneExecutionAuthority",

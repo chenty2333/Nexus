@@ -10,10 +10,11 @@ runner rejects row, witness, test, invariant, TCB, or exclusion drift before it
 runs the model.
 
 The first round assumes a non-equivocating ownership log and no host reboot or
-malicious rollback. The normative matrix is also the frozen contract for the
-production `EffectRegistry` refinement lane, so it records
-`production_registry_modified=true`; the receipt and summary must retain the
-same value rather than giving the model and production evidence two meanings.
+malicious rollback. The normative matrix continues to describe the independent
+model boundary and therefore retains `production_registry_modified=false`.
+The v2 receipt separately records `production_registry_modified=true` for the
+production `EffectRegistry` refinement lane; verifiers must not collapse these
+two boundaries into one value.
 
 The v2 research receipt additionally binds the dependency-free admission gate,
 the production `EffectRegistry`, two substrate Loom races, and eleven production
