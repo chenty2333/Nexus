@@ -311,7 +311,8 @@ The first round exits only when:
 5. negative receipt substitutions reject without state mutation;
 6. one receipt binds every normative source and generated log by SHA-256;
 7. the receipt records a dirty-worktree bit and exact Git revision; and
-8. the receipt states `production_registry_modified=false`,
+8. the receipt states `production_registry_modified=true`, because this
+   qualification includes the production `EffectRegistry` refinement lane,
    `host_reboot_claimed=false`, and `malicious_rollback_claimed=false`.
 
 The first-round receipt does not close RFC 0001, enter the canonical `v0.1.0`

@@ -67,7 +67,9 @@ const SOURCE_FILES: &[&str] = &[
     "tools/xtask/Cargo.toml",
     "tools/xtask/Cargo.lock",
     "tools/xtask/src/main.rs",
+    "tools/xtask/src/evidence.rs",
     "tools/xtask/src/handoff_admission.rs",
+    "tools/xtask/src/production_identity.rs",
 ];
 
 const REQUIRED_INVARIANTS: &[&str] = &[
@@ -647,7 +649,7 @@ fn validate_fault_matrix_contract(matrix: &FaultMatrix) -> Result<()> {
         || matrix.ownership_log != "trusted-non-equivocating-no-rollback-tcb"
         || matrix.host_reboot_claimed
         || matrix.malicious_rollback_claimed
-        || matrix.production_registry_modified
+        || !matrix.production_registry_modified
     {
         return Err("handoff-admission fault matrix changed its first-round boundary".into());
     }
