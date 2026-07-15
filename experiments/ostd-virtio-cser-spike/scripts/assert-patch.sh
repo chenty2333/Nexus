@@ -26,7 +26,8 @@ fi
 "$production_assert" \
     "$facade_root/src/production.rs" \
     "$facade_root/src/lib.rs" \
-    "$facade_root/src/portal.rs"
+    "$facade_root/src/portal.rs" \
+    "$facade_root/src/pci.rs"
 echo "$virtio_sha  $virtio_archive" | sha256sum -c - >/dev/null
 cmp /work/LICENSE-MPL-2.0 /opt/nexus-ostd/LICENSE-MPL-2.0 >/dev/null
 

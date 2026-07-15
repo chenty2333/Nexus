@@ -122,7 +122,7 @@ remove_first_target_reset_status() {
 }
 
 awk '
-    !changed && /^LINUX_FS_SAME_BOOT_PRECOMMIT CommitRejected / {
+    !changed && /^LINUX_FS_SAME_BOOT_PRECOMMIT CommitGate / {
         sub(/publish_closure_calls=0/, "publish_closure_calls=1")
         changed = 1
     }
@@ -196,7 +196,7 @@ require_rejection unaligned-owner "$work/unaligned-owner.log" "$debug_log"
 
 awk '
     { print }
-    !changed && /^LINUX_FS_SAME_BOOT_PRECOMMIT CommitRejected / {
+    !changed && /^LINUX_FS_SAME_BOOT_PRECOMMIT CommitGate / {
         print "LINUX_FS_SAME_BOOT Completion outcome=Completed result=4 used_len=513 payload_source=CompletedRequest data_prefix=7f454c46"
         changed = 1
     }
@@ -207,7 +207,7 @@ require_rejection positive-Completion "$work/positive-completion.log" "$debug_lo
 
 awk '
     { print }
-    !changed && /^LINUX_FS_SAME_BOOT_PRECOMMIT CommitRejected / {
+    !changed && /^LINUX_FS_SAME_BOOT_PRECOMMIT CommitGate / {
         print "PRECOMMIT_FAULT avail_idx_release forbidden=true"
         changed = 1
     }
@@ -217,8 +217,8 @@ require_mutation "$serial_log" "$work/avail-release.log" avail-idx-release
 require_rejection avail-idx-release "$work/avail-release.log" "$debug_log"
 
 awk '
-    !changed && /^LINUX_FS_SAME_BOOT_PRECOMMIT CommitRejected / {
-        sub(/was_published=false/, "was_published=true")
+    !changed && /^LINUX_FS_SAME_BOOT_PRECOMMIT CommitGate / {
+        sub(/device_visible=false/, "device_visible=true")
         changed = 1
     }
     { print }
@@ -434,7 +434,7 @@ require_rejection missing-Terminal "$work/missing-terminal.log" "$debug_log"
 
 awk '
     !changed && /^LINUX_FS_SAME_BOOT_PRECOMMIT Terminal / {
-        sub(/generic_prefix_quiescent=true/, "generic_prefix_quiescent=false")
+        sub(/registry=shared_production/, "registry=detached")
         changed = 1
     }
     { print }

@@ -276,9 +276,45 @@ BEGIN {
         next
     }
 
+    if (event == "RecoveryTaskEntry") {
+        exact_fields(4, event)
+        phase = field("phase")
+        require(fresh_count == 1 && recovery_stage == 0,
+                "recovery task entry appeared outside the fresh replacement interval")
+        require(field("replacement") == "701", "recovery task identity mismatch")
+        if (phase == "kernel") {
+            require(progress_stage == 0, "duplicate/out-of-order kernel task entry")
+            progress_stage = 1
+        } else if (phase == "vm_active") {
+            require(progress_stage == 1, "VmSpace activation did not follow kernel task entry")
+            progress_stage = 2
+        } else {
+            fail("unknown recovery task entry phase: " phase)
+        }
+        next
+    }
+
+    if (event == "RecoverySnapshotBegin") {
+        exact_fields(3, event)
+        require(field("replacement") == "701" && progress_stage == 2 && recovery_stage == 0,
+                "snapshot begin did not follow active replacement VmSpace")
+        progress_stage = 3
+        next
+    }
+
+    if (event == "RecoveryRuntimeSectionComplete") {
+        exact_fields(5, event)
+        require(field("replacement") == "701" && field("lock_released") == "true" &&
+                field("snapshot_captured") == "true" && progress_stage == 3 && recovery_stage == 0,
+                "completed runtime snapshot section did not follow snapshot begin")
+        progress_stage = 4
+        next
+    }
+
     if (event == "RecoverySnapshot") {
         exact_fields(9, event)
-        require(fresh_count == 1 && recovery_stage == 0, "snapshot recovery order mismatch")
+        require(fresh_count == 1 && progress_stage == 4 && recovery_stage == 0,
+                "snapshot recovery order mismatch")
         require(field("replacement") == "701" && field("binding_epoch") == "2" &&
                 field("effects") == "3" && field("committed_controls") == "1" &&
                 field("queued_waits") == "1" && field("claimed_waits") == "1" &&
@@ -471,6 +507,7 @@ END {
             "block/prepare/commit count mismatch")
     require(crash_count == 1 && v1_exit_count == 1 && fresh_count == 1,
             "crash/fresh replacement count mismatch")
+    require(progress_stage == 4, "replacement progress instrumentation did not reach the runtime")
     require(recovery_stage == 3 && adopt_count == 3 &&
             adopted_phase["Committed"] == 2 && adopted_phase["Prepared"] == 1,
             "explicit recovery cohort mismatch")

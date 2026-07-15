@@ -881,11 +881,19 @@ impl CoreScenario {
     }
 
     fn recovery_snapshot(&self) {
+        println!(
+            "LINUX_FUTEX_CORE RecoverySnapshotBegin replacement={}",
+            V2_TASK.id(),
+        );
         let snapshot = self.runtime.with_state(|runtime| {
             let snapshot = runtime.effects.recovery_snapshot(SCOPE, V2_TASK).unwrap();
             runtime.check_invariants().unwrap();
             snapshot
         });
+        println!(
+            "LINUX_FUTEX_CORE RecoveryRuntimeSectionComplete replacement={} lock_released=true snapshot_captured=true",
+            V2_TASK.id(),
+        );
         assert_eq!(snapshot.binding_epoch, 2);
         assert_eq!(snapshot.effects.len(), 3);
         self.state.lock().recovery_snapshot = Some(snapshot.clone());
@@ -1342,8 +1350,22 @@ fn run_personality_v1(scenario: Arc<CoreScenario>, vm_space: Arc<VmSpace>) {
 }
 
 fn run_personality_v2(scenario: Arc<CoreScenario>, vm_space: Arc<VmSpace>) {
+    let installed_cpu = crate::scheduler::consume_liveness_pick_installed(V2_TASK.id());
+    println!(
+        "CSER PickInstalled task={} cpu={} rq_current=true",
+        V2_TASK.id(),
+        installed_cpu,
+    );
+    println!(
+        "LINUX_FUTEX_CORE RecoveryTaskEntry replacement={} phase=kernel",
+        V2_TASK.id(),
+    );
     assert_current_user_task(V2_TASK, &vm_space);
     vm_space.activate();
+    println!(
+        "LINUX_FUTEX_CORE RecoveryTaskEntry replacement={} phase=vm_active",
+        V2_TASK.id(),
+    );
     let mut context = UserContext::default();
     context.set_rip(USER_MAP_ADDR);
     let mut user_mode = UserMode::new(context);

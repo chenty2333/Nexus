@@ -21,7 +21,8 @@ ARG VIRTIO_DRIVERS_CRATE_SHA256=cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729
 ARG VIRTIO_DRIVERS_CRATE_URL=https://static.crates.io/crates/virtio-drivers/virtio-drivers-0.13.0.crate
 
 COPY --from=nexus-root kernel/nexus-ostd/src/cser/effect_registry.rs \
-    /kernel/nexus-ostd/src/cser/effect_registry.rs
+    kernel/nexus-ostd/src/cser/device_flight.rs \
+    /kernel/nexus-ostd/src/cser/
 COPY --from=nexus-root kernel/nexus-ostd/Cargo.toml \
     kernel/nexus-ostd/Cargo.lock \
     /kernel/nexus-ostd/
@@ -64,7 +65,8 @@ RUN set -eu; \
     /usr/local/bin/assert-production-virtio-substrate \
         /crates/nexus-ostd-virtio/src/production.rs \
         /crates/nexus-ostd-virtio/src/lib.rs \
-        /crates/nexus-ostd-virtio/src/portal.rs
+        /crates/nexus-ostd-virtio/src/portal.rs \
+        /crates/nexus-ostd-virtio/src/pci.rs
 
 COPY assets/sector0.txt /opt/nexus-fixtures/sector0.txt
 RUN set -eu; \

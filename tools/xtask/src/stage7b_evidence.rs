@@ -617,11 +617,84 @@ fn validate_non_device_candidate_caller_counts(
 }
 
 fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
+    if source.contains("validate_device_replay_fence_candidate") {
+        return Err(
+            "production Registry must not retain the obsolete read-only replay-fence validator"
+                .into(),
+        );
+    }
+
     let registry_constructors = source.matches("EffectRegistry::new()").count();
-    if registry_constructors != 9 {
+    if registry_constructors != 11 {
         return Err(format!(
-            "Stage 7B Registry source constructor population drifted; hidden sidecars are forbidden (expected 9, observed {registry_constructors})"
+            "Stage 7B Registry source constructor population drifted; hidden sidecars are forbidden (expected 11, observed {registry_constructors})"
         ));
+    }
+
+    let publication_start = source
+        .find("fn publication_ack_and_revoke_complete_self_test() {")
+        .ok_or_else(|| "Registry lacks combined publication/revoke self-test".to_owned())?;
+    let publication_end = source[publication_start..]
+        .find("pub(crate) fn production_identity_registry_self_test() {")
+        .map(|offset| publication_start + offset)
+        .ok_or_else(|| {
+            "combined publication/revoke self-test boundary is unterminated".to_owned()
+        })?;
+    let publication = &source[publication_start..publication_end];
+    if publication.matches("EffectRegistry::new()").count() != 1
+        || publication
+            .matches("let mut registry = EffectRegistry::new();")
+            .count()
+            != 1
+        || publication
+            .matches("acknowledge_publication_and_revoke_complete_with_apply(")
+            .count()
+            != 4
+        || publication
+            .matches("assert_eq!(two_pending_applies.get(), 0);")
+            .count()
+            != 1
+        || publication
+            .matches("assert_eq!(wrong_applies.get(), 0);")
+            .count()
+            != 1
+        || publication
+            .matches("assert_eq!(overflow_applies.get(), 0);")
+            .count()
+            != 1
+        || publication
+            .matches("assert_eq!(successful_applies.get(), 1);")
+            .count()
+            != 1
+    {
+        return Err(
+            "combined publication/revoke self-test must own one Registry and prove three prevalidation rejections plus one external apply"
+                .into(),
+        );
+    }
+
+    let retained_start = source
+        .find("pub(crate) fn retained_semantic_test_fixture() -> RetainedSemanticTestFixture {")
+        .ok_or_else(|| "Registry lacks retained-semantic fixture".to_owned())?;
+    let retained = &source[retained_start..];
+    if retained.matches("EffectRegistry::new()").count() != 1
+        || retained
+            .matches("ProductionDeviceBatchRaceFixture::from_empty_registry(EffectRegistry::new())")
+            .count()
+            != 1
+        || retained
+            .matches("let mut foreign_operation = exact_operation;")
+            .count()
+            != 1
+        || retained
+            .matches("Err(DeviceCloseError::Published { obligation, error })")
+            .count()
+            != 1
+    {
+        return Err(
+            "retained-semantic fixture must own one Registry and derive exact/foreign identities from one authoritative published obligation"
+                .into(),
+        );
     }
 
     let atomic_start = source
@@ -716,15 +789,32 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         || device.matches(".register_device_derived(").count() != 2
         || device.matches(".register_device_derived_cohort(").count() != 4
         || device.matches("commit_device_batch_with_publish(").count() != 8
+        || device
+            .matches("commit_or_recover_device_close_with_apply(")
+            .count()
+            != 9
+        || device.matches("mint_device_close_operation(").count() != 4
         || device.matches("validate_device_batch_receipt(").count() != 8
         || device
-            .matches("validate_device_replay_fence_candidate(")
+            .matches("claim_device_replay_reset_and_revoke(")
             .count()
-            != 5
+            != 0
         || device.matches("enroll_device_batch(").count() != 4
         || device.matches("freeze_pending_device_cancel(").count() != 2
-        || device.matches(".cancel_only()").count() != 2
-        || device.matches("begin_unpublished_device_cancel(").count() != 3
+        || device.matches(".cancel_only()").count() != 4
+        || device
+            .matches("close_pending_device_precommit_with_apply(")
+            .count()
+            != 2
+        || device
+            .matches("close_enrolled_device_precommit_with_apply(")
+            .count()
+            != 3
+        || device
+            .matches("assert_eq!(hardware_calls.get(), 0);")
+            .count()
+            != 2
+        || device.matches("begin_unpublished_device_cancel(").count() != 4
         || device.matches("retain_device_reset_timeout(").count() != 7
         || device.matches("retry_device_reset(").count() != 5
         || device.matches("retain_device_iotlb_timeout(").count() != 7
@@ -732,12 +822,126 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         || device
             .matches("acknowledge_device_iotlb_with_apply(")
             .count()
-            != 8
+            != 9
     {
         return Err(
-            "production device-batch self-test must reuse the production Registry and preserve its exact failure-atomic four-item registration cohort, base-six, emergency-cancel, publication, timeout, retry, and receipt population"
+            "production device-batch self-test must reuse the production Registry and preserve its exact failure-atomic cohort, operation-id fresh/recovery, precommit, closure, timeout, retry, and receipt population"
                 .into(),
         );
+    }
+
+    let operation_close_start = device
+        .find("let close_operation = registry")
+        .ok_or_else(|| {
+            "production device-batch self-test lacks operation-id close coverage".to_owned()
+        })?;
+    let operation_close_end = device[operation_close_start..]
+        .find("let legacy_operation = registry")
+        .map(|offset| operation_close_start + offset)
+        .ok_or_else(|| "operation-id close coverage boundary is unterminated".to_owned())?;
+    let operation_close = &device[operation_close_start..operation_close_end];
+    if operation_close
+        .matches("commit_or_recover_device_close_with_apply(")
+        .count()
+        != 8
+        || operation_close
+            .matches("mint_device_close_operation(")
+            .count()
+            != 3
+        || operation_close
+            .matches("assert_fresh_close_overflow(&mut ")
+            .count()
+            != 5
+        || operation_close
+            .matches("DeviceCloseOutcome::Applied")
+            .count()
+            != 3
+        || operation_close
+            .matches("DeviceCloseOutcome::Recovered")
+            .count()
+            != 3
+        || operation_close
+            .matches("DeviceCloseError::Unpublished")
+            .count()
+            != 2
+        || operation_close
+            .matches("DeviceCloseError::Published")
+            .count()
+            != 3
+    {
+        return Err(
+            "operation-id close self-test must preserve exact fresh, same-operation Closing/Revoked recovery, drift, corrupt-state, and overflow coverage"
+                .into(),
+        );
+    }
+    for required in [
+        ".mint_device_close_operation(&enrollment, 0x51_0001)",
+        "close_operation.registry_instance_id()",
+        "close_operation.enrollment_sequence()",
+        "close_operation.caller_nonce()",
+        "registry.mint_device_close_operation(&enrollment, 0)",
+        "let mut fresh_close = registry.clone();",
+        "let fresh_close_revoke_sequence = fresh_close.next_revoke_sequence;",
+        "let fresh_close_commit_sequence = fresh_close.next_commit_sequence;",
+        "let fresh_close_batch_sequence = fresh_close.next_device_batch_sequence;",
+        "DeviceCloseOutcome::Applied {",
+        "assert_eq!(fresh_close_publications.get(), 1);",
+        "fresh_close_before.authority_epoch + 1",
+        "fresh_close_before.revision + 3",
+        "fresh_close_revoke_sequence + 1",
+        "fresh_close_commit_sequence + 6",
+        "fresh_close_batch_sequence + 1",
+        "&fresh_close_root.publication,",
+        "DevicePublicationProvenance::Applied { operation, batch }",
+        "if *operation == close_operation && batch == &fresh_close_receipt",
+        "let mut rewritten_close = fresh_close.clone();",
+        "rewritten_close.rewrite_registry_instance(rewritten_close_id);",
+        "rewritten_close.check_invariants().unwrap();",
+        "let before_closing_recovery = fresh_close.clone();",
+        "DeviceCloseOutcome::Recovered { receipt, selection }",
+        "assert_eq!(closing_recovery_publications.get(), 0);",
+        "assert_eq!(fresh_close, before_closing_recovery);",
+        "interrupted_close.revoke_begin(SCOPE)",
+        "Err(RegistryError::DeviceClosurePending)",
+        "forced_closing.begin_unpublished_device_cancel(&enrollment)",
+        "assert_eq!(forced_closing, forced_closing_before);",
+        "let assert_published_close_error =",
+        "Err(DeviceCloseError::Published { obligation, .. })",
+        "obligation.operation(), Some(close_operation)",
+        "obligation.revoke(), Some(&fresh_close_selection)",
+        "let mut wrong_operation_candidate = fresh_close.clone();",
+        "let mut wrong_registry_candidate = fresh_close.clone();",
+        "let mut wrong_enrollment_candidate = fresh_close.clone();",
+        "let mut wrong_metadata_candidate = fresh_close.clone();",
+        "let mut corrupt_operation_state = fresh_close.clone();",
+        "root.batch_sequence = None;",
+        "root.publication = DevicePublicationProvenance::Applied {",
+        "Some(fresh_close_receipt.batch_sequence())",
+        "let assert_fresh_close_overflow = |candidate: &mut EffectRegistry| {",
+        "Err(DeviceCloseError::Unpublished(",
+        "assert_eq!(publish_calls.get(), 0);",
+        "assert_eq!(*candidate, before);",
+        "close_revoke_overflow.next_revoke_sequence = u64::MAX;",
+        "close_commit_overflow.next_commit_sequence = u64::MAX - 5;",
+        "close_batch_overflow.next_device_batch_sequence = u64::MAX;",
+        "let mut close_commit_revision_overflow = registry.clone();",
+        ".revision = u64::MAX;",
+        "let mut close_revoke_revision_overflow = registry.clone();",
+        ".revision = u64::MAX - 1;",
+        "let mut close_authority_overflow = registry.clone();",
+        "overflow_enrollment.authority_epoch = u64::MAX;",
+        "let mut revoked_recovery = fresh_close.clone();",
+        ".revoke_complete(&fresh_close_selection)",
+        "revoked_recovery.scope_projection(SCOPE).unwrap().phase,",
+        "let before_revoked_recovery = revoked_recovery.clone();",
+        "assert_eq!(revoked_recovery_publications.get(), 0);",
+        "assert_eq!(revoked_recovery, before_revoked_recovery);",
+    ] {
+        if !operation_close.contains(required) {
+            return Err(format!(
+                "operation-id close self-test lacks required idempotency witness: {required}"
+            ));
+        }
     }
     for required in [
         "let device_cohort = || {",
@@ -768,6 +972,13 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "assert_eq!(prepared.device_effects().len(), 4);",
         "split.commit(PERSONALITY, syscall.handle, commits[0].1)",
         "Err(RegistryError::InvalidDeviceEnvelope)",
+        "let assert_pending_precommit_error =",
+        "candidate.close_pending_device_precommit_with_apply(SCOPE, |_| {",
+        "assert_eq!(compound_pending_hardware_calls.get(), 1);",
+        "compound_pending_before.revision + 3",
+        "compound_pending_enrollment_sequence + 1",
+        "let mut pending_retention_overflow = registry.clone();",
+        "let mut pending_wrong_revoke_cohort = registry.clone();",
         "let cancel_enrollment = pending_cancel.freeze_pending_device_cancel(SCOPE).unwrap();",
         "assert!(cancel_enrollment.cancel_only());",
         "let registered_enrollment = registered_cancel",
@@ -777,6 +988,12 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "assert_eq!(registered_closed, 7);",
         "let enrollment = registry",
         ".enroll_device_batch(authority, &handles, device)",
+        "let assert_enrolled_precommit_error =",
+        "candidate.close_enrolled_device_precommit_with_apply(presented, |_| {",
+        "assert_eq!(compound_enrolled_hardware_calls.get(), 1);",
+        "compound_enrolled_before.revision + 2",
+        "let mut enrolled_retention_overflow = registry.clone();",
+        "let mut enrolled_wrong_revoke_cohort = registry.clone();",
         "Err(RegistryError::DeviceClosurePending)",
         "retain_device_reset_timeout(&reset_ticket)",
         "DeviceClosureResult::IndeterminateAfterReset",
@@ -795,11 +1012,17 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "let iotlb_tombstone = revoke_first.retain_device_iotlb_timeout(&iotlb).unwrap();",
         ".retry_device_iotlb(&reset, &iotlb_tombstone)",
         "let final_iotlb_tombstone = final_iotlb_timeout",
-        "let pristine_replay_candidate = registry.clone();",
-        "validate_device_replay_fence_candidate(&receipt)",
-        "completed_replay_candidate.validate_device_replay_fence_candidate(&receipt)",
-        "reset_replay_candidate.validate_device_replay_fence_candidate(&receipt)",
-        "closing_replay_candidate.validate_device_replay_fence_candidate(&receipt)",
+        "let legacy_operation = registry",
+        ".mint_device_close_operation(&enrollment, 0x51_1001)",
+        "let legacy_before = registry.clone();",
+        "registry.commit_or_recover_device_close_with_apply(",
+        "Err(DeviceCloseError::Published { obligation, error })",
+        "assert_eq!(obligation.operation(), None);",
+        "assert_eq!(obligation.phase(), ScopePhase::Active);",
+        "assert_eq!(obligation.revoke(), None);",
+        "legacy committed state was not an honest Published error",
+        "assert_eq!(legacy_publish_calls.get(), 0);",
+        "assert_eq!(*registry, legacy_before);",
         "wrong_completion_result.record_device_completion(&receipt, device, 512)",
         "Err(RegistryError::CommitConflict)",
         "assert_eq!(wrong_completion_result, wrong_completion_before);",
@@ -1196,6 +1419,583 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         );
     }
 
+    let operation_start = source
+        .find("pub(crate) struct DeviceCloseOperationId {")
+        .ok_or_else(|| {
+            "production Registry lacks opaque device-close operation identity".to_owned()
+        })?;
+    let operation_impl = source[operation_start..]
+        .find("impl DeviceCloseOperationId {")
+        .map(|offset| operation_start + offset)
+        .ok_or_else(|| "device-close operation identity boundary is unterminated".to_owned())?;
+    let operation_compact: String = source[operation_start..operation_impl]
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    if operation_compact
+        != concat!(
+            "pub(crate)structDeviceCloseOperationId{",
+            "registry_instance_id:u64,",
+            "scope:ScopeKey,",
+            "authority_epoch:u64,",
+            "enrollment_sequence:u64,",
+            "device:DeviceEnvelope,",
+            "owner:TaskKey,",
+            "caller_nonce:u64,",
+            "}"
+        )
+        || !source[..operation_start].ends_with("#[derive(Clone, Copy, Debug, Eq, PartialEq)]\n")
+    {
+        return Err(
+            "DeviceCloseOperationId must remain opaque, Copy, and exactly bound to Registry/enrollment/root/caller coordinates"
+                .into(),
+        );
+    }
+    for required in [
+        "pub(crate) const fn registry_instance_id(self) -> u64",
+        "pub(crate) const fn scope(self) -> ScopeKey",
+        "pub(crate) const fn enrollment_sequence(self) -> u64",
+        "pub(crate) const fn caller_nonce(self) -> u64",
+        "pub(crate) enum DeviceCloseOutcome<T> {",
+        "Recovered {\n        receipt: DeviceBatchCommitReceipt,\n        selection: RevokeSelection,",
+        "pub(crate) struct DevicePublishedObligation {",
+        "batch_sequence: Option<u64>,",
+        "operation: Option<DeviceCloseOperationId>,",
+        "phase: ScopePhase,",
+        "revoke: Option<RevokeSelection>,",
+        "pub(crate) const fn batch_sequence(&self) -> Option<u64>",
+        "pub(crate) const fn operation(&self) -> Option<DeviceCloseOperationId>",
+        "pub(crate) const fn status(&self) -> DevicePublishedStatus",
+        "pub(crate) const fn phase(&self) -> ScopePhase",
+        "pub(crate) const fn revoke(&self) -> Option<&RevokeSelection>",
+        "enum DevicePublicationProvenance {",
+        "Publishing {\n        operation: DeviceCloseOperationId,\n        batch: DeviceBatchCommitReceipt,",
+        "Applied {\n        operation: DeviceCloseOperationId,\n        batch: DeviceBatchCommitReceipt,",
+        "publication: DevicePublicationProvenance,",
+        "operation.rewrite_registry_instance(registry_instance_id);",
+        "batch.rewrite_registry_instance(registry_instance_id);",
+        "publishing device close provenance drift",
+        "published root lacks applied publication provenance",
+        "unpublished root retained applied publication provenance",
+    ] {
+        if !source.contains(required) {
+            return Err(format!(
+                "operation-id Registry state lacks required opaque/stored/invariant step {required:?}"
+            ));
+        }
+    }
+
+    let provenance_start = source
+        .find("enum DevicePublicationProvenance {")
+        .ok_or_else(|| "Registry lacks root-local publication provenance".to_owned())?;
+    let provenance_end = source[provenance_start..]
+        .find("impl DevicePublicationProvenance {")
+        .map(|offset| provenance_start + offset)
+        .ok_or_else(|| "publication provenance boundary is unterminated".to_owned())?;
+    let provenance_compact: String = source[provenance_start..provenance_end]
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    if provenance_compact
+        != concat!(
+            "enumDevicePublicationProvenance{",
+            "None,",
+            "Legacy,",
+            "Publishing{operation:DeviceCloseOperationId,batch:DeviceBatchCommitReceipt,},",
+            "Applied{operation:DeviceCloseOperationId,batch:DeviceBatchCommitReceipt,},",
+            "}"
+        )
+    {
+        return Err(
+            "device publication provenance must remain one exact None/Legacy/Publishing/Applied authority, with operation and batch inseparable"
+                .into(),
+        );
+    }
+
+    let close_error_start = source
+        .find("pub(crate) enum DeviceCloseError {")
+        .ok_or_else(|| "production Registry lacks honest device-close error type".to_owned())?;
+    let close_error_end = source[close_error_start..]
+        .find("/// Honest backend result retained through reset and IOTLB closure.")
+        .map(|offset| close_error_start + offset)
+        .ok_or_else(|| "device-close error boundary is unterminated".to_owned())?;
+    let close_error_compact: String = source[close_error_start..close_error_end]
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    if close_error_compact
+        != concat!(
+            "pub(crate)enumDeviceCloseError{",
+            "Unpublished(RegistryError),",
+            "Published{obligation:DevicePublishedObligation,error:RegistryError,},",
+            "}"
+        )
+    {
+        return Err(
+            "device-close errors must distinguish only unpublished state from published ownership obligation"
+                .into(),
+        );
+    }
+
+    let combined_start = source
+        .find("pub(crate) fn acknowledge_publication_and_revoke_complete(")
+        .ok_or_else(|| "Registry lacks combined publication/revoke transition".to_owned())?;
+    let combined_apply_start = source[combined_start..]
+        .find("pub(crate) fn acknowledge_publication_and_revoke_complete_with_apply<T>(")
+        .map(|offset| combined_start + offset)
+        .ok_or_else(|| {
+            "combined publication/revoke transition lacks external apply gate".to_owned()
+        })?;
+    let combined_end = source[combined_apply_start..]
+        .find("    fn prepare_publication_ack(")
+        .map(|offset| combined_apply_start + offset)
+        .ok_or_else(|| "combined publication/revoke apply boundary is unterminated".to_owned())?;
+    let combined_wrapper = &source[combined_start..combined_apply_start];
+    let combined_apply = &source[combined_apply_start..combined_end];
+    if !combined_wrapper.contains(
+        "self.acknowledge_publication_and_revoke_complete_with_apply(ticket, selection, || ())",
+    ) {
+        return Err(
+            "plain combined publication/revoke transition must delegate to the prevalidated external-apply gate"
+                .into(),
+        );
+    }
+    let publication_prepare = combined_apply
+        .find("let publication = self.prepare_publication_ack(ticket)?;")
+        .ok_or_else(|| "combined transition skips publication prevalidation".to_owned())?;
+    let revoke_prepare = combined_apply
+        .find("let revoke = self.prepare_revoke_complete_apply(selection, Some(&publication))?;")
+        .ok_or_else(|| "combined transition skips projected revoke prevalidation".to_owned())?;
+    let external_apply = combined_apply
+        .find("let applied = apply_publication();")
+        .ok_or_else(|| "combined transition lacks its external publication point".to_owned())?;
+    let publication_apply = combined_apply
+        .find("self.apply_publication_ack(publication);")
+        .ok_or_else(|| "combined transition lacks infallible publication apply".to_owned())?;
+    let revoke_apply = combined_apply
+        .find("self.apply_revoke_complete(revoke);")
+        .ok_or_else(|| "combined transition lacks infallible revoke apply".to_owned())?;
+    if !(publication_prepare < revoke_prepare
+        && revoke_prepare < external_apply
+        && external_apply < publication_apply
+        && publication_apply < revoke_apply)
+        || combined_apply.matches("apply_publication()").count() != 1
+    {
+        return Err(
+            "combined publication/revoke must prevalidate both objects before one external publication and two infallible applies"
+                .into(),
+        );
+    }
+
+    let close_start = source
+        .find("pub(crate) fn commit_or_recover_device_close_with_apply<T>(")
+        .ok_or_else(|| "production Registry lacks operation-aware device close".to_owned())?;
+    let close_prepare_start = source[close_start..]
+        .find("    fn prepare_device_close(")
+        .map(|offset| close_start + offset)
+        .ok_or_else(|| "operation-aware device close lacks prepare phase".to_owned())?;
+    let close_install_start = source[close_prepare_start..]
+        .find("    fn install_device_close_publishing(")
+        .map(|offset| close_prepare_start + offset)
+        .ok_or_else(|| "operation-aware device close lacks Publishing install phase".to_owned())?;
+    let close_apply_start = source[close_install_start..]
+        .find("    fn apply_device_close(")
+        .map(|offset| close_install_start + offset)
+        .ok_or_else(|| "operation-aware device close lacks apply phase".to_owned())?;
+    let close_recover_start = source[close_apply_start..]
+        .find("    fn recover_device_close(")
+        .map(|offset| close_apply_start + offset)
+        .ok_or_else(|| "operation-aware device close lacks recovery phase".to_owned())?;
+    let close_coordinates_start = source[close_recover_start..]
+        .find("    fn validate_device_close_coordinates(")
+        .map(|offset| close_recover_start + offset)
+        .ok_or_else(|| "operation-aware device close lacks coordinate validation".to_owned())?;
+    let obligation_attempt_start = source[close_coordinates_start..]
+        .find("    fn device_published_obligation_for_attempt(")
+        .map(|offset| close_coordinates_start + offset)
+        .ok_or_else(|| "operation-aware device close lacks obligation routing".to_owned())?;
+    let obligation_start = source[obligation_attempt_start..]
+        .find("    fn device_published_obligation(")
+        .map(|offset| obligation_attempt_start + offset)
+        .ok_or_else(|| "operation-aware device close lacks root-local obligation".to_owned())?;
+    let close_end = source[obligation_start..]
+        .find("    fn device_revoke_selection(")
+        .map(|offset| obligation_start + offset)
+        .ok_or_else(|| "operation-aware device obligation boundary is unterminated".to_owned())?;
+    let close_gate = &source[close_start..close_prepare_start];
+    let close_prepare = &source[close_prepare_start..close_install_start];
+    let close_install = &source[close_install_start..close_apply_start];
+    let close_apply = &source[close_apply_start..close_recover_start];
+    let close_recover = &source[close_recover_start..close_coordinates_start];
+    let close_coordinates = &source[close_coordinates_start..obligation_attempt_start];
+    let obligation = &source[obligation_start..close_end];
+
+    for required in [
+        "self.device_published_obligation_for_attempt(operation, enrollment)",
+        "self.recover_device_close(operation, authority, enrollment, commits)",
+        "Ok(DeviceCloseOutcome::Recovered { receipt, selection })",
+        "Err(DeviceCloseError::Published { obligation, error })",
+        ".prepare_device_close(operation, authority, enrollment, commits)",
+        ".map_err(DeviceCloseError::Unpublished)?;",
+        "let plan = self.install_device_close_publishing(prepared);",
+        "let publication = publish(&plan.batch.receipt);",
+        "let (receipt, selection) = self.apply_device_close(plan);",
+        "Ok(DeviceCloseOutcome::Applied {",
+    ] {
+        if !close_gate.contains(required) {
+            return Err(format!(
+                "operation-aware device close lacks required classification/apply step {required:?}"
+            ));
+        }
+    }
+    let published_check = close_gate
+        .find("self.device_published_obligation_for_attempt(operation, enrollment)")
+        .unwrap();
+    let recovery = close_gate
+        .find("self.recover_device_close(operation, authority, enrollment, commits)")
+        .unwrap();
+    let prepare = close_gate
+        .find(".prepare_device_close(operation, authority, enrollment, commits)")
+        .unwrap();
+    let install = close_gate
+        .find("let plan = self.install_device_close_publishing(prepared);")
+        .unwrap();
+    let publish = close_gate
+        .find("let publication = publish(&plan.batch.receipt);")
+        .unwrap();
+    let apply = close_gate
+        .find("let (receipt, selection) = self.apply_device_close(plan);")
+        .unwrap();
+    if !(published_check < recovery
+        && recovery < prepare
+        && prepare < install
+        && install < publish
+        && publish < apply)
+        || close_gate.matches("publish(").count() != 1
+        || close_gate.contains("claim_device_replay_reset_and_revoke")
+    {
+        return Err(
+            "operation-aware close must recover before fresh prepare, install Publishing before one fresh publish, and never synthesize a receipt-only reset claim"
+                .into(),
+        );
+    }
+
+    for required in [
+        "self.validate_device_close_coordinates(operation, authority, enrollment)?;",
+        "self.validate_kernel_root_authority(authority)?;",
+        "PreparedDeviceBatch::Apply(plan) => plan,",
+        "PreparedDeviceBatch::Replay(_) => return Err(RegistryError::InvalidState),",
+        "let stored_batch = batch.receipt.clone();",
+        "let publishing_revision = batch.next_scope_revision;",
+        ".prepare_revoke_begin_after_publishing_and_batch(",
+        "Ok(DeviceClosePreparePlan {",
+        "publishing_revision,",
+    ] {
+        if !close_prepare.contains(required) {
+            return Err(format!(
+                "fresh operation-aware close lacks complete prepublication plan {required:?}"
+            ));
+        }
+    }
+    if close_prepare.contains("&mut self") || close_prepare.contains(".get_mut(") {
+        return Err("fresh operation-aware close preparation must be read-only".into());
+    }
+
+    for required in [
+        "let DeviceClosePreparePlan {",
+        "root.publication = DevicePublicationProvenance::Publishing {",
+        "scope.revision = publishing_revision;",
+        "DeviceCloseApplyPlan {",
+    ] {
+        if !close_install.contains(required) {
+            return Err(format!(
+                "device close Publishing install lacks required durable step {required:?}"
+            ));
+        }
+    }
+    if close_install.contains('?')
+        || close_install.contains("Vec::")
+        || close_install.contains("BTreeMap")
+        || close_install.contains(".clone(")
+        || close_install.contains(".collect(")
+        || close_install.contains("checked_add")
+    {
+        return Err(
+            "Publishing provenance install must remain allocation-free and infallible before external publication"
+                .into(),
+        );
+    }
+
+    for required in [
+        "let receipt = self.apply_device_batch(batch);",
+        "let selection = self.apply_revoke_begin(revoke);",
+        "core::mem::replace(&mut root.publication, DevicePublicationProvenance::None);",
+        "DevicePublicationProvenance::Publishing {",
+        "DevicePublicationProvenance::Applied {",
+        "(receipt, selection)",
+    ] {
+        if !close_apply.contains(required) {
+            return Err(format!(
+                "operation-aware close apply lacks exact batch/revoke/provenance step {required:?}"
+            ));
+        }
+    }
+    let apply_batch = close_apply
+        .find("let receipt = self.apply_device_batch(batch);")
+        .unwrap();
+    let apply_revoke = close_apply
+        .find("let selection = self.apply_revoke_begin(revoke);")
+        .unwrap();
+    let take_publishing = close_apply
+        .find("core::mem::replace(&mut root.publication, DevicePublicationProvenance::None);")
+        .unwrap();
+    let mark_applied = close_apply
+        .find("DevicePublicationProvenance::Applied {")
+        .unwrap();
+    if !(apply_batch < apply_revoke
+        && apply_revoke < take_publishing
+        && take_publishing < mark_applied)
+        || close_apply.contains('?')
+        || close_apply.contains("Vec::")
+        || close_apply.contains("BTreeMap")
+        || close_apply.contains(".clone(")
+        || close_apply.contains(".collect(")
+        || close_apply.contains("checked_add")
+    {
+        return Err(
+            "post-publication operation apply must remain allocation-free, infallible, and ordered batch-revoke-Publishing-to-Applied"
+                .into(),
+        );
+    }
+
+    for required in [
+        "let (stored_operation, stored) = match &root.publication {",
+        "DevicePublicationProvenance::Applied { operation, batch }",
+        "if stored_operation != operation",
+        "root.batch_sequence != Some(stored.batch_sequence)",
+        "stored.commits.len() != enrollment.effects.len()",
+        "commits.iter().zip(&stored.commits).enumerate()",
+        "*handle != record.handle()",
+        "metadata.result != authoritative.result",
+        "record.commit.as_ref() != Some(authoritative)",
+        "membership.sequence != stored.batch_sequence",
+        "matches!(scope.phase, ScopePhase::Closing | ScopePhase::Revoked)",
+        "Ok((stored.clone(), selection))",
+    ] {
+        if !close_recover.contains(required) {
+            return Err(format!(
+                "same-operation recovery lacks exact stored receipt/input validation {required:?}"
+            ));
+        }
+    }
+    for required in [
+        "operation.registry_instance_id != self.instance_id",
+        "operation.caller_nonce == 0",
+        "operation.scope != enrollment.scope",
+        "operation.enrollment_sequence != enrollment.enrollment_sequence",
+        "authority.owner != operation.owner",
+        "authority.authority_epoch != operation.authority_epoch",
+        "self.validate_device_enrollment_receipt(enrollment)?;",
+    ] {
+        if !close_coordinates.contains(required) {
+            return Err(format!(
+                "device-close coordinate validation lacks exact authority/enrollment binding {required:?}"
+            ));
+        }
+    }
+
+    for required in [
+        "root.batch_sequence.is_some()",
+        "!root.publication.is_none()",
+        "ticket.batch_sequence.is_some()",
+        "if !has_published_or_closure_progress",
+        "let batch_sequence = root",
+        "root.publication.batch().map(|batch| batch.batch_sequence)",
+        "operation: root.publication.operation(),",
+        ".published_status()",
+        ".unwrap_or(DevicePublishedStatus::CorruptPublished)",
+        "phase: scope.phase,",
+        "revoke: Self::device_revoke_selection(scope_key, scope),",
+        "reset_ticket: root.reset_ticket,",
+        "closure: root.closure,",
+    ] {
+        if !obligation.contains(required) {
+            return Err(format!(
+                "published obligation lacks allocation-free root-local progress {required:?}"
+            ));
+        }
+    }
+    if obligation.contains("reconstruct_device_batch_receipt")
+        || obligation.contains(".clone(")
+        || obligation.contains("Vec::")
+        || obligation.contains("BTreeMap")
+        || obligation.contains(".collect(")
+    {
+        return Err("published obligation must not allocate or scan global effect history".into());
+    }
+    if source.contains("pub(crate) fn claim_device_replay_reset_and_revoke(")
+        || source
+            .matches("    fn claim_device_replay_reset_and_revoke(")
+            .count()
+            != 1
+    {
+        return Err(
+            "receipt-only replay reset claim must remain a single module-private legacy helper"
+                .into(),
+        );
+    }
+
+    let revoke_plan_start = source
+        .find("struct RevokeBeginPlan {")
+        .ok_or_else(|| "production Registry lacks RevokeBeginPlan".to_owned())?;
+    let revoke_plan_end = source[revoke_plan_start..]
+        .find("struct DeviceIotlbApplyPlan {")
+        .map(|offset| revoke_plan_start + offset)
+        .ok_or_else(|| "RevokeBeginPlan boundary is unterminated".to_owned())?;
+    let revoke_plan_compact: String = source[revoke_plan_start..revoke_plan_end]
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    if revoke_plan_compact
+        != concat!(
+            "structRevokeBeginPlan{",
+            "selection:RevokeSelection,",
+            "next_revoke_sequence:u64,",
+            "next_scope_revision:u64,",
+            "}"
+        )
+    {
+        return Err("RevokeBeginPlan must carry exactly selection and validated counters".into());
+    }
+
+    let revoke_gate_start = source
+        .find("pub(crate) fn revoke_begin(")
+        .ok_or_else(|| "production Registry lacks revoke_begin".to_owned())?;
+    let revoke_prepare_start = source[revoke_gate_start..]
+        .find("    fn prepare_revoke_begin(")
+        .map(|offset| revoke_gate_start + offset)
+        .ok_or_else(|| "revoke_begin lacks prepare helper".to_owned())?;
+    let revoke_after_batch_start = source[revoke_prepare_start..]
+        .find("    fn prepare_revoke_begin_after_device_batch(")
+        .map(|offset| revoke_prepare_start + offset)
+        .ok_or_else(|| "revoke prepare lacks post-batch helper".to_owned())?;
+    let revoke_from_revision_start = source[revoke_after_batch_start..]
+        .find("    fn prepare_revoke_begin_from_revision(")
+        .map(|offset| revoke_after_batch_start + offset)
+        .ok_or_else(|| "revoke prepare lacks revision helper".to_owned())?;
+    let revoke_apply_start = source[revoke_from_revision_start..]
+        .find("    fn apply_revoke_begin(")
+        .map(|offset| revoke_from_revision_start + offset)
+        .ok_or_else(|| "revoke_begin lacks apply helper".to_owned())?;
+    let revoke_end = source[revoke_apply_start..]
+        .find("    pub(crate) fn revoke_targets(")
+        .map(|offset| revoke_apply_start + offset)
+        .ok_or_else(|| "revoke apply boundary is unterminated".to_owned())?;
+    let revoke_gate = &source[revoke_gate_start..revoke_prepare_start];
+    let revoke_prepare = &source[revoke_prepare_start..revoke_after_batch_start];
+    let revoke_after_batch = &source[revoke_after_batch_start..revoke_from_revision_start];
+    let revoke_from_revision = &source[revoke_from_revision_start..revoke_apply_start];
+    let revoke_apply = &source[revoke_apply_start..revoke_end];
+    for required in [
+        "let plan = self.prepare_revoke_begin(scope_key)?;",
+        "Ok(self.apply_revoke_begin(plan))",
+    ] {
+        if !revoke_gate.contains(required) {
+            return Err(format!(
+                "revoke_begin gate lacks prepare/apply step {required:?}"
+            ));
+        }
+    }
+    if !revoke_prepare.contains(
+        "fn prepare_revoke_begin(&self, scope_key: ScopeKey) -> Result<RevokeBeginPlan, RegistryError>",
+    ) || revoke_prepare.contains("&mut self")
+        || !revoke_prepare.contains("self.prepare_revoke_begin_from_revision(scope_key, revision)")
+    {
+        return Err("prepare_revoke_begin must remain read-only and delegate by revision".into());
+    }
+    for required in [
+        "fn prepare_revoke_begin_after_device_batch(",
+        "        &self,",
+        "let expected_batch_revision = scope",
+        ".revision\n            .checked_add(1)",
+        "if batch_revision != expected_batch_revision",
+        "self.prepare_revoke_begin_from_revision(scope_key, batch_revision)",
+    ] {
+        if !revoke_after_batch.contains(required) {
+            return Err(format!(
+                "post-batch revoke prepare lacks exact revision precheck {required:?}"
+            ));
+        }
+    }
+    if revoke_after_batch.contains("&mut self") {
+        return Err("post-batch revoke preparation must take &self".into());
+    }
+    for required in [
+        "fn prepare_revoke_begin_from_revision(",
+        "        &self,",
+        "if scope.phase != ScopePhase::Active",
+        "if scope.revoke.is_some()",
+        "scope.device_root.as_ref().is_some_and(|root| {",
+        "DevicePublicationProvenance::Publishing { .. }",
+        "return Err(RegistryError::DeviceClosurePending);",
+        ".authority_epoch\n            .checked_add(1)",
+        "let next_scope_revision = revision_before_revoke\n            .checked_add(1)",
+        "let target_count = scope.closure_candidates.len();",
+        "u64::try_from(target_count).map_err(|_| RegistryError::CounterOverflow)?;",
+        "let sequence = self.next_revoke_sequence;",
+        "let next_revoke_sequence = sequence\n            .checked_add(1)",
+        "Ok(RevokeBeginPlan {",
+    ] {
+        if !revoke_from_revision.contains(required) {
+            return Err(format!(
+                "revision-based revoke prepare lacks failure-atomic precheck {required:?}"
+            ));
+        }
+    }
+    if revoke_from_revision.contains("&mut self")
+        || revoke_from_revision.contains(".get_mut(")
+        || revoke_from_revision.contains("self.next_revoke_sequence =")
+    {
+        return Err("revision-based revoke preparation must not mutate Registry state".into());
+    }
+    for required in [
+        "self.next_revoke_sequence = next_revoke_sequence;",
+        "let cohort = core::mem::take(&mut scope.closure_candidates);",
+        "let retired_recovery = scope.recovery.take();",
+        "scope.authority_epoch = selection.authority_epoch;",
+        "scope.phase = ScopePhase::Closing;",
+        "scope.revision = next_scope_revision;",
+        "scope.revoke = Some(RevokeState {",
+    ] {
+        if !revoke_apply.contains(required) {
+            return Err(format!(
+                "revoke apply lacks exact prevalidated assignment {required:?}"
+            ));
+        }
+    }
+    if revoke_apply
+        .matches("self.next_revoke_sequence = next_revoke_sequence;")
+        .count()
+        != 1
+        || revoke_apply
+            .matches("scope.revision = next_scope_revision;")
+            .count()
+            != 1
+        || revoke_apply.contains('?')
+        || revoke_apply.contains("checked_add")
+        || revoke_apply.contains("saturating_add")
+        || revoke_apply.contains("wrapping_add")
+    {
+        return Err(
+            "revoke apply must use each prevalidated counter exactly once without recomputation"
+                .into(),
+        );
+    }
+
+    // Receipt-only replay/reset remains a private legacy primitive. The
+    // operation-aware production gate above deliberately does not treat it
+    // as caller authority or an automatic recovery path.
+
     let completion_helper_start = source
         .find("    fn device_batch_causal_root_commit<'a>(")
         .ok_or_else(|| "production Registry lacks causal-root completion binding".to_owned())?;
@@ -1243,7 +2043,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "}",
     );
     let sequence_apply = completion
-        .find("self.next_device_closure_sequence = next_sequence;")
+        .find("self.next_device_closure_sequence = next_device_closure_sequence;")
         .ok_or_else(|| "device completion lacks sequence application".to_owned())?;
     let completion_binding_valid = receipt_validation < root_lookup
         && root_lookup < result_check
@@ -1263,7 +2063,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .find("pub(crate) fn commit_device_batch_with_publish<T>(")
         .ok_or_else(|| "production Registry lacks the root device publish gate".to_owned())?;
     let commit_end = source[commit_start..]
-        .find("pub(crate) fn validate_device_batch_receipt(")
+        .find("pub(crate) fn mint_device_close_operation(")
         .map(|offset| commit_start + offset)
         .ok_or_else(|| "production device publish-gate boundary is unterminated".to_owned())?;
     let commit = &source[commit_start..commit_end];
@@ -1362,17 +2162,17 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
     let reset_prepare = reset_gate
         .find("let plan = self.prepare_device_reset_apply(ticket)?;")
         .ok_or_else(|| "reset-generation gate skips complete prevalidation".to_owned())?;
-    let external_apply = reset_gate
-        .find("let publication = apply_generation(&plan.receipt);")
-        .ok_or_else(|| "reset-generation gate lacks its unique facade apply point".to_owned())?;
     let registry_apply = reset_gate
         .find("let receipt = self.apply_device_reset(plan);")
         .ok_or_else(|| "reset-generation gate lacks infallible Registry apply".to_owned())?;
-    if !(reset_prepare < external_apply && external_apply < registry_apply)
+    let external_apply = reset_gate
+        .find("let publication = apply_generation(&receipt);")
+        .ok_or_else(|| "reset-generation gate lacks its unique facade apply point".to_owned())?;
+    if !(reset_prepare < registry_apply && registry_apply < external_apply)
         || reset_gate.matches("apply_generation(").count() != 1
     {
         return Err(
-            "reset generation must prevalidate before one facade apply and infallible Registry apply"
+            "reset generation must prevalidate, install the Registry fence, then enter one facade apply"
                 .into(),
         );
     }
@@ -1421,17 +2221,17 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
     let iotlb_prepare = iotlb_gate
         .find("let plan = self.prepare_device_iotlb_apply(ticket)?;")
         .ok_or_else(|| "IOTLB gate skips complete prevalidation".to_owned())?;
-    let quiescence_apply = iotlb_gate
-        .find("let publication = apply_quiescence(&plan.receipt);")
-        .ok_or_else(|| "IOTLB gate lacks its unique facade quiescence apply".to_owned())?;
     let iotlb_registry_apply = iotlb_gate
         .find("let receipt = self.apply_device_iotlb(plan);")
         .ok_or_else(|| "IOTLB gate lacks its infallible Registry apply".to_owned())?;
-    if !(iotlb_prepare < quiescence_apply && quiescence_apply < iotlb_registry_apply)
+    let quiescence_apply = iotlb_gate
+        .find("let publication = apply_quiescence(&receipt);")
+        .ok_or_else(|| "IOTLB gate lacks its unique facade quiescence apply".to_owned())?;
+    if !(iotlb_prepare < iotlb_registry_apply && iotlb_registry_apply < quiescence_apply)
         || iotlb_gate.matches("apply_quiescence(").count() != 1
     {
         return Err(
-            "IOTLB closure must prevalidate before one facade quiescence apply and infallible Registry apply"
+            "IOTLB closure must prevalidate, install the Registry closure, then enter one facade quiescence apply"
                 .into(),
         );
     }
@@ -1485,6 +2285,21 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         }
     }
 
+    let unpublished_cancel_start = source
+        .find("pub(crate) fn begin_unpublished_device_cancel(")
+        .ok_or_else(|| "production Registry lacks unpublished device cancellation".to_owned())?;
+    let unpublished_cancel_end = source[unpublished_cancel_start..]
+        .find("pub(crate) fn retain_device_reset_timeout(")
+        .map(|offset| unpublished_cancel_start + offset)
+        .ok_or_else(|| "unpublished device cancellation boundary is unterminated".to_owned())?;
+    let unpublished_cancel = &source[unpublished_cancel_start..unpublished_cancel_end];
+    if !unpublished_cancel.contains("|| !root.publication.is_none()") {
+        return Err(
+            "unpublished device cancellation must reject every existing publication provenance"
+                .into(),
+        );
+    }
+
     let reset_timeout_start = source
         .find("pub(crate) fn retain_device_reset_timeout(")
         .ok_or_else(|| "production Registry lacks reset-timeout retention".to_owned())?;
@@ -1519,6 +2334,13 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .find("pub(crate) fn register(")
         .map(|offset| mint_start + offset)
         .ok_or_else(|| "kernel root authority mint boundary is unterminated".to_owned())?;
+    let close_mint_start = source
+        .find("pub(crate) fn mint_device_close_operation(")
+        .ok_or_else(|| "production Registry lacks device-close operation mint".to_owned())?;
+    let close_mint_end = source[close_mint_start..]
+        .find("pub(crate) fn commit_or_recover_device_close_with_apply<T>(")
+        .map(|offset| close_mint_start + offset)
+        .ok_or_else(|| "device-close operation mint boundary is unterminated".to_owned())?;
     let registration_start = source
         .find("pub(crate) fn register_device_derived(")
         .ok_or_else(|| "production Registry lacks device-derived registration".to_owned())?;
@@ -1563,12 +2385,22 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "Ok(())",
         "}",
     );
-    if source.matches(authority_guard).count() != 4
+    if source.matches(authority_guard).count() != 6
         || source[mint_start..mint_end]
             .matches(authority_guard)
             .count()
             != 1
         || !guard_is_first_statement(&source[mint_start..mint_end])
+        || source[close_mint_start..close_mint_end]
+            .matches(authority_guard)
+            .count()
+            != 1
+        || !guard_is_first_statement(&source[close_mint_start..close_mint_end])
+        || source[close_coordinates_start..obligation_attempt_start]
+            .matches(authority_guard)
+            .count()
+            != 1
+        || !guard_is_first_statement(&source[close_coordinates_start..obligation_attempt_start])
         || source[registration_start..registration_end]
             .matches(authority_guard)
             .count()
@@ -1587,7 +2419,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         || unique_guard_compact != expected_unique_guard
     {
         return Err(
-            "device publication authority must guard exactly the mint, single/cohort device-derived registrations, and root-validation functions"
+            "device publication authority must guard exactly the root/close mints, single/cohort device-derived registrations, and root-validation functions"
                 .into(),
         );
     }
@@ -1631,6 +2463,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "device completion causal root drift",
         "if presented_device != root.current_device",
         "pub(crate) fn begin_unpublished_device_cancel(",
+        "|| !root.publication.is_none()",
         "root.outcome = Some(DeviceClosureResult::AbortedBeforeCommit);",
         "pub(crate) fn retain_device_reset_timeout(",
         "None if ticket.batch_sequence.is_some() => DeviceClosureResult::IndeterminateAfterReset,",
@@ -1638,14 +2471,14 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "self.apply_device_root_retention(&enrollment, retention.as_ref());",
         "pub(crate) fn retry_device_reset(",
         "pub(crate) fn acknowledge_device_reset_with_apply<T>(",
-        "let publication = apply_generation(&plan.receipt);",
         "let receipt = self.apply_device_reset(plan);",
+        "let publication = apply_generation(&receipt);",
         "root.current_device = receipt.new_device;",
         "pub(crate) fn retain_device_iotlb_timeout(",
         "pub(crate) fn retry_device_iotlb(",
         "pub(crate) fn acknowledge_device_iotlb_with_apply<T>(",
-        "let publication = apply_quiescence(&plan.receipt);",
         "let receipt = self.apply_device_iotlb(plan);",
+        "let publication = apply_quiescence(&receipt);",
         "pub(crate) fn validate_device_closure_receipt(",
         "pub(crate) fn stage_device_batch_terminal(",
         "authorized_device_enrollment != Some(enrollment.enrollment_sequence)",
@@ -2763,8 +3596,137 @@ mod tests {
     }
 
     #[test]
-    fn production_device_batch_gate_rejects_publish_apply_and_replay_mutations() {
+    fn production_device_batch_gate_rejects_operation_publish_and_apply_mutations() {
         let source = checked_registry_source();
+
+        let forgeable_operation = source.replacen(
+            "    caller_nonce: u64,\n}",
+            "    pub(crate) caller_nonce: u64,\n}",
+            1,
+        );
+        assert_ne!(forgeable_operation, source);
+        assert!(validate_fault_registry_source_text(&forgeable_operation).is_err());
+
+        let noncopy_operation = source.replacen(
+            "#[derive(Clone, Copy, Debug, Eq, PartialEq)]\npub(crate) struct DeviceCloseOperationId {",
+            "#[derive(Clone, Debug, Eq, PartialEq)]\npub(crate) struct DeviceCloseOperationId {",
+            1,
+        );
+        assert_ne!(noncopy_operation, source);
+        assert!(validate_fault_registry_source_text(&noncopy_operation).is_err());
+
+        let public_receipt_claim = source.replacen(
+            "    fn claim_device_replay_reset_and_revoke(",
+            "    pub(crate) fn claim_device_replay_reset_and_revoke(",
+            1,
+        );
+        assert_ne!(public_receipt_claim, source);
+        assert!(validate_fault_registry_source_text(&public_receipt_claim).is_err());
+
+        let torn_publication_provenance = source.replacen(
+            "enum DevicePublicationProvenance {\n    None,",
+            "enum DevicePublicationProvenance {\n    OperationOnly(DeviceCloseOperationId),\n    None,",
+            1,
+        );
+        assert_ne!(torn_publication_provenance, source);
+        assert!(validate_fault_registry_source_text(&torn_publication_provenance).is_err());
+
+        let recovery_republishes = source.replacen(
+            "Ok((receipt, selection)) => {\n                    Ok(DeviceCloseOutcome::Recovered { receipt, selection })\n                }",
+            "Ok((receipt, selection)) => {\n                    let _ = publish(&receipt);\n                    Ok(DeviceCloseOutcome::Recovered { receipt, selection })\n                }",
+            1,
+        );
+        assert_ne!(recovery_republishes, source);
+        assert!(validate_fault_registry_source_text(&recovery_republishes).is_err());
+
+        let misclassified_unpublished = source.replacen(
+            ".map_err(DeviceCloseError::Unpublished)?;",
+            ".map_err(|error| DeviceCloseError::Published { obligation: unchecked_obligation(), error })?;",
+            1,
+        );
+        assert_ne!(misclassified_unpublished, source);
+        assert!(validate_fault_registry_source_text(&misclassified_unpublished).is_err());
+
+        let premature_combined_apply = source.replacen(
+            concat!(
+                "let applied = apply_publication();\n",
+                "        self.apply_publication_ack(publication);\n",
+                "        self.apply_revoke_complete(revoke);",
+            ),
+            concat!(
+                "self.apply_publication_ack(publication);\n",
+                "        self.apply_revoke_complete(revoke);\n",
+                "        let applied = apply_publication();",
+            ),
+            1,
+        );
+        assert_ne!(premature_combined_apply, source);
+        assert!(validate_fault_registry_source_text(&premature_combined_apply).is_err());
+
+        let reordered_operation_publish = source.replacen(
+            "let publication = publish(&plan.batch.receipt);\n        let (receipt, selection) = self.apply_device_close(plan);",
+            "let (receipt, selection) = self.apply_device_close(plan);\n        let publication = publish(&receipt);",
+            1,
+        );
+        assert_ne!(reordered_operation_publish, source);
+        assert!(validate_fault_registry_source_text(&reordered_operation_publish).is_err());
+
+        let skipped_stored_preallocation = source.replacen(
+            "let stored_batch = batch.receipt.clone();",
+            "let stored_batch = reconstruct_after_publish(&batch.receipt);",
+            1,
+        );
+        assert_ne!(skipped_stored_preallocation, source);
+        assert!(validate_fault_registry_source_text(&skipped_stored_preallocation).is_err());
+
+        let reordered_operation_apply = source.replacen(
+            "let receipt = self.apply_device_batch(batch);\n        let selection = self.apply_revoke_begin(revoke);",
+            "let selection = self.apply_revoke_begin(revoke);\n        let receipt = self.apply_device_batch(batch);",
+            1,
+        );
+        assert_ne!(reordered_operation_apply, source);
+        assert!(validate_fault_registry_source_text(&reordered_operation_apply).is_err());
+
+        let scanning_obligation = source.replacen(
+            "let scope = self.scopes.get(&scope_key)?;\n        let root = scope.device_root.as_ref()?;",
+            "let _ = self.reconstruct_device_batch_receipt(scope_key, 1);\n        let scope = self.scopes.get(&scope_key)?;\n        let root = scope.device_root.as_ref()?;",
+            1,
+        );
+        assert_ne!(scanning_obligation, source);
+        assert!(validate_fault_registry_source_text(&scanning_obligation).is_err());
+
+        let batch_only_obligation = source.replacen(
+            "let has_published_or_closure_progress = root.batch_sequence.is_some()\n            || !root.publication.is_none()",
+            "let has_published_or_closure_progress = root.batch_sequence.is_some()",
+            1,
+        );
+        assert_ne!(batch_only_obligation, source);
+        assert!(validate_fault_registry_source_text(&batch_only_obligation).is_err());
+
+        let double_revoke_increment = source.replacen(
+            "self.next_revoke_sequence = next_revoke_sequence;",
+            "self.next_revoke_sequence = next_revoke_sequence.saturating_add(1);",
+            1,
+        );
+        assert_ne!(double_revoke_increment, source);
+        assert!(validate_fault_registry_source_text(&double_revoke_increment).is_err());
+
+        let weakened_revoke_overflow = source.replacen(
+            "close_revoke_overflow.next_revoke_sequence = u64::MAX;",
+            "close_revoke_overflow.next_revoke_sequence = u64::MAX - 1;",
+            1,
+        );
+        assert_ne!(weakened_revoke_overflow, source);
+        assert!(validate_fault_registry_source_text(&weakened_revoke_overflow).is_err());
+
+        let weakened_second_revision_overflow = source.replacen(
+            "revision = u64::MAX - 1;\n    assert_fresh_close_overflow(&mut close_revoke_revision_overflow);",
+            "revision = u64::MAX - 2;\n    assert_fresh_close_overflow(&mut close_revoke_revision_overflow);",
+            1,
+        );
+        assert_ne!(weakened_second_revision_overflow, source);
+        assert!(validate_fault_registry_source_text(&weakened_second_revision_overflow).is_err());
+
         let reordered = source.replacen(
             "let publication = publish(&plan.receipt);\n                let receipt = self.apply_device_batch(plan);",
             "let receipt = self.apply_device_batch(plan);\n                let publication = publish(&receipt);",
@@ -2790,8 +3752,8 @@ mod tests {
         assert!(validate_fault_registry_source_text(&fallible_apply).is_err());
 
         let reordered_iotlb_apply = source.replacen(
-            "let publication = apply_quiescence(&plan.receipt);\n        let receipt = self.apply_device_iotlb(plan);",
             "let receipt = self.apply_device_iotlb(plan);\n        let publication = apply_quiescence(&receipt);",
+            "let publication = apply_quiescence(&plan.receipt);\n        let receipt = self.apply_device_iotlb(plan);",
             1,
         );
         assert_ne!(reordered_iotlb_apply, source);
@@ -2806,7 +3768,7 @@ mod tests {
         assert!(validate_fault_registry_source_text(&skipped_iotlb_prevalidation).is_err());
 
         let skipped_quiescence_apply = source.replacen(
-            "let publication = apply_quiescence(&plan.receipt);",
+            "let publication = apply_quiescence(&receipt);",
             "let publication = ();",
             1,
         );
@@ -2882,7 +3844,7 @@ mod tests {
             moved_device_authority_guard
                 .matches("self.require_unique_device_publication()?;")
                 .count(),
-            4
+            6
         );
         assert!(validate_fault_registry_source_text(&moved_device_authority_guard).is_err());
 
@@ -3060,6 +4022,36 @@ mod tests {
         assert_ne!(publishable_cancel_enrollment, source);
         assert!(validate_fault_registry_source_text(&publishable_cancel_enrollment).is_err());
 
+        let publishing_revoke_allowed = source.replacen(
+            concat!(
+                "if scope.device_root.as_ref().is_some_and(|root| {\n",
+                "            matches!(\n",
+                "                root.publication,\n",
+                "                DevicePublicationProvenance::Publishing { .. }\n",
+                "            )\n",
+                "        }) {",
+            ),
+            "if false {",
+            1,
+        );
+        assert_ne!(publishing_revoke_allowed, source);
+        assert!(validate_fault_registry_source_text(&publishing_revoke_allowed).is_err());
+
+        let publishing_cancel_allowed = source.replacen(
+            concat!(
+                "if self.scopes[&enrollment.scope].phase != ScopePhase::Closing\n",
+                "            || root.batch_sequence.is_some()\n",
+                "            || !root.publication.is_none()",
+            ),
+            concat!(
+                "if self.scopes[&enrollment.scope].phase != ScopePhase::Closing\n",
+                "            || root.batch_sequence.is_some()",
+            ),
+            1,
+        );
+        assert_ne!(publishing_cancel_allowed, source);
+        assert!(validate_fault_registry_source_text(&publishing_cancel_allowed).is_err());
+
         let fake_indeterminate_terminal = source.replacen(
             "outcome: TerminalOutcome::IndeterminateAfterReset,\n            result,\n            causal_commit: None,",
             "outcome: TerminalOutcome::Completed,\n            result,\n            causal_commit: None,",
@@ -3100,8 +4092,8 @@ mod tests {
         assert!(validate_fault_registry_source_text(&old_generation_allowed).is_err());
 
         let split_generation_apply = source.replacen(
-            "let publication = apply_generation(&plan.receipt);\n        let receipt = self.apply_device_reset(plan);",
             "let receipt = self.apply_device_reset(plan);\n        let publication = apply_generation(&receipt);",
+            "let publication = apply_generation(&plan.receipt);\n        let receipt = self.apply_device_reset(plan);",
             1,
         );
         assert_ne!(split_generation_apply, source);
@@ -3337,7 +4329,7 @@ mod tests {
     }
 
     #[test]
-    fn fault_registry_gate_structurally_binds_the_two_new_self_test_registries() {
+    fn fault_registry_gate_structurally_binds_all_self_test_registries() {
         let source = checked_registry_source();
 
         let moved_atomic = source
@@ -3375,6 +4367,42 @@ mod tests {
             "mutation must preserve the global constructor count"
         );
         assert!(validate_fault_registry_source_text(&moved_production).is_err());
+
+        let moved_publication = source
+            .replacen(
+                "const CHILD_DOMAIN: DomainKey = DomainKey::new(1);\n\n    let mut registry = EffectRegistry::new();",
+                "const CHILD_DOMAIN: DomainKey = DomainKey::new(1);\n\n    let mut registry = EffectRegistry::default();",
+                1,
+            )
+            .replacen(
+                "pub(crate) struct Stage7bFaultCredit {",
+                "fn hidden_publication_sidecar() -> EffectRegistry { EffectRegistry::new() }\n\npub(crate) struct Stage7bFaultCredit {",
+                1,
+            );
+        assert_eq!(
+            moved_publication.matches("EffectRegistry::new()").count(),
+            source.matches("EffectRegistry::new()").count(),
+            "mutation must preserve the global constructor count"
+        );
+        assert!(validate_fault_registry_source_text(&moved_publication).is_err());
+
+        let moved_retained = source
+            .replacen(
+                "ProductionDeviceBatchRaceFixture::from_empty_registry(EffectRegistry::new())",
+                "ProductionDeviceBatchRaceFixture::from_empty_registry(EffectRegistry::default())",
+                1,
+            )
+            .replacen(
+                "pub(crate) struct Stage7bFaultCredit {",
+                "fn hidden_retained_sidecar() -> EffectRegistry { EffectRegistry::new() }\n\npub(crate) struct Stage7bFaultCredit {",
+                1,
+            );
+        assert_eq!(
+            moved_retained.matches("EffectRegistry::new()").count(),
+            source.matches("EffectRegistry::new()").count(),
+            "mutation must preserve the global constructor count"
+        );
+        assert!(validate_fault_registry_source_text(&moved_retained).is_err());
 
         let detached = source.replacen(
             "production_identity_registry_self_test();",

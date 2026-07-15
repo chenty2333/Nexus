@@ -60,13 +60,19 @@ image_key=$(sha256sum \
     "$repo_root/tools/virtio/assert-production-substrate.sh" \
     "$repo_root/kernel/nexus-ostd/Cargo.toml" \
     "$repo_root/kernel/nexus-ostd/Cargo.lock" \
-    "$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+    "$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs" \
+    "$repo_root/kernel/nexus-ostd/src/cser/device_flight.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/ostd-virtio-cser-spike:$image_key"
 runner_base="$root/osdk-runner-base"
 runner_target="$root/target/osdk/ostd-virtio-cser-spike-run-base"
 
 build_image() {
+    local -a rebuild_args=()
+    if [[ ${NEXUS_REBUILD:-0} == 1 ]]; then
+        rebuild_args=(--no-cache)
+    fi
     docker build \
+        "${rebuild_args[@]}" \
         --build-context "nexus-root=$repo_root" \
         --platform linux/amd64 \
         -t "$image" \
@@ -75,6 +81,7 @@ build_image() {
 
 container() {
     docker run --rm \
+        --init \
         --platform linux/amd64 \
         --network none \
         --user "$(id -u):$(id -g)" \
@@ -87,6 +94,7 @@ container() {
         --mount "type=bind,source=$repo_root/kernel/nexus-ostd/Cargo.toml,target=/kernel/nexus-ostd/Cargo.toml,readonly" \
         --mount "type=bind,source=$repo_root/kernel/nexus-ostd/Cargo.lock,target=/kernel/nexus-ostd/Cargo.lock,readonly" \
         --mount "type=bind,source=$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs,target=/kernel/nexus-ostd/src/cser/effect_registry.rs,readonly" \
+        --mount "type=bind,source=$repo_root/kernel/nexus-ostd/src/cser/device_flight.rs,target=/kernel/nexus-ostd/src/cser/device_flight.rs,readonly" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         -w /work \
         "$image" \
@@ -138,6 +146,11 @@ check_source() {
         installed_virtio=/opt/nexus-virtio/virtio-drivers-0.13.0
         production=/crates/nexus-ostd-virtio/src/production.rs
         facade_lib=/crates/nexus-ostd-virtio/src/lib.rs
+        pci_source=/crates/nexus-ostd-virtio/src/pci.rs
+        check_production_substrate() {
+            /repo/tools/virtio/assert-production-substrate.sh \
+                "$1" "$facade_lib" "$portal_source" "$pci_source"
+        }
 
         cp "$canonical_virtio" "$tmp/relaxed-virtio.patch"
         sed -i '\''0,/Ordering::Release/s//Ordering::Relaxed/'\'' \
@@ -171,9 +184,7 @@ check_source() {
 
         cp "$production" "$tmp/facade-authority.rs"
         sed -i '\''2i use crate::EffectAuthority;'\'' "$tmp/facade-authority.rs"
-        if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/facade-authority.rs" "$facade_lib" "$portal_source" \
-            >/dev/null 2>&1; then
+        if check_production_substrate "$tmp/facade-authority.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted semantic authority ownership" >&2
             exit 1
         fi
@@ -181,9 +192,7 @@ check_source() {
         cp "$production" "$tmp/post-release-assert.rs"
         sed -i '\''/let (queue, _token) = prepared.publish_prepared();/a\        assert!(true);'\'' \
             "$tmp/post-release-assert.rs"
-        if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/post-release-assert.rs" "$facade_lib" "$portal_source" \
-            >/dev/null 2>&1; then
+        if check_production_substrate "$tmp/post-release-assert.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted a post-Release assertion" >&2
             exit 1
         fi
@@ -191,9 +200,7 @@ check_source() {
         cp "$production" "$tmp/branching-generation.rs"
         sed -i '\''s/\*self.device_generation = self.next_generation;/if true { *self.device_generation = self.next_generation; }/'\'' \
             "$tmp/branching-generation.rs"
-        if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/branching-generation.rs" "$facade_lib" "$portal_source" \
-            >/dev/null 2>&1; then
+        if check_production_substrate "$tmp/branching-generation.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted branching generation apply" >&2
             exit 1
         fi
@@ -201,9 +208,7 @@ check_source() {
         cp "$production" "$tmp/branching-quiescence.rs"
         sed -i '\''s/\*self.active = None;/if true { *self.active = None; }/'\'' \
             "$tmp/branching-quiescence.rs"
-        if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/branching-quiescence.rs" "$facade_lib" "$portal_source" \
-            >/dev/null 2>&1; then
+        if check_production_substrate "$tmp/branching-quiescence.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted branching quiescence apply" >&2
             exit 1
         fi
@@ -212,9 +217,7 @@ check_source() {
         sed -i '\''0,/if self.active.is_some() {/s//if false {/'\'' \
             "$tmp/overlapping-session.rs"
         require_mutation "$production" "$tmp/overlapping-session.rs" overlapping-session
-        if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/overlapping-session.rs" "$facade_lib" "$portal_source" \
-            >/dev/null 2>&1; then
+        if check_production_substrate "$tmp/overlapping-session.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted overlapping hardware sessions" >&2
             exit 1
         fi
@@ -223,9 +226,7 @@ check_source() {
         sed -i '\''0,/if self.queue.as_ref().expect("live queue").should_notify() {/s//if true {/'\'' \
             "$tmp/forced-notification.rs"
         require_mutation "$production" "$tmp/forced-notification.rs" forced-notification
-        if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/forced-notification.rs" "$facade_lib" "$portal_source" \
-            >/dev/null 2>&1; then
+        if check_production_substrate "$tmp/forced-notification.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted mandatory notification despite suppression" >&2
             exit 1
         fi
@@ -234,9 +235,7 @@ check_source() {
         sed -i '\''0,/if used_len != EXPECTED_USED_LEN {/s//if false {/'\'' \
             "$tmp/unchecked-used-length.rs"
         require_mutation "$production" "$tmp/unchecked-used-length.rs" unchecked-used-length
-        if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/unchecked-used-length.rs" "$facade_lib" "$portal_source" \
-            >/dev/null 2>&1; then
+        if check_production_substrate "$tmp/unchecked-used-length.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted an unchecked device used length" >&2
             exit 1
         fi
@@ -245,9 +244,7 @@ check_source() {
         sed -i '\''0,/if used_len != EXPECTED_USED_LEN {/i\        let response = request_buffers.response.status();'\'' \
             "$tmp/status-before-used-length.rs"
         require_mutation "$production" "$tmp/status-before-used-length.rs" status-before-used-length
-        if /repo/tools/virtio/assert-production-substrate.sh \
-            "$tmp/status-before-used-length.rs" "$facade_lib" "$portal_source" \
-            >/dev/null 2>&1; then
+        if check_production_substrate "$tmp/status-before-used-length.rs" >/dev/null 2>&1; then
             echo "production facade gate accepted status access before used-length validation" >&2
             exit 1
         fi

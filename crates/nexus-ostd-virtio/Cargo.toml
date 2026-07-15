@@ -8,11 +8,11 @@ license = "MPL-2.0"
 publish = false
 
 [dependencies]
-bitflags = { version = "2.11.0", default-features = false }
+bitflags = { version = "=2.13.0", default-features = false }
 cser-transition-gates = { path = "../cser-transition-gates" }
 ostd = { version = "=0.18.0" }
 virtio-drivers = { version = "=0.13.0", default-features = false }
-zerocopy = { version = "0.8.40", default-features = false }
+zerocopy = { version = "=0.8.54", default-features = false }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ktest)"] }

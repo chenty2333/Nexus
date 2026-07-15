@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,17 @@ const TLA2TOOLS_IMAGE_INPUTS: [&str; 4] = [
     "third_party/tlaplus/1.8.0-227f61b/SHA256SUMS",
     "third_party/tlaplus/1.8.0-227f61b/PROVENANCE.json",
     TLA2TOOLS_LICENSE_PATH,
+];
+const TRANSITION_GATE_MANIFEST: &str = "crates/cser-transition-gates/Cargo.toml";
+const PRODUCTION_REGISTRY_TEST: &str = "crates/cser-transition-gates/tests/production_registry.rs";
+const PRODUCTION_SOURCE_FILES: [&str; 2] = ["effect_registry.rs", "device_flight.rs"];
+const VIRTIO_AUTHORITY_LOCK: &str = "kernel/nexus-ostd/osdk-runner-base/Cargo.lock";
+const VIRTIO_PRODUCTION_LOCKS: [&str; 5] = [
+    "crates/nexus-ostd-virtio/Cargo.lock",
+    "kernel/nexus-ostd/Cargo.lock",
+    VIRTIO_AUTHORITY_LOCK,
+    "experiments/ostd-virtio-cser-spike/Cargo.lock",
+    "experiments/ostd-virtio-cser-spike/osdk-runner-base/Cargo.lock",
 ];
 const TLA2TOOLS_DOCKER_INSTALL: &str = r#"COPY --chmod=0444 third_party/tlaplus/1.8.0-227f61b/tla2tools-227f61b.jar \
     /opt/tla2tools/tla2tools.jar
@@ -101,6 +113,11 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
     validate_same_boot_acceptance_route(&frontdoor)?;
     validate_production_identity_route(&frontdoor)?;
     validate_image_identity_inputs(&frontdoor)?;
+    validate_clean_contract(&frontdoor)?;
+    validate_cold_rebuild_contract(root, &frontdoor)?;
+    validate_backend_source_binding(root)?;
+    validate_transition_gate_route(root)?;
+    validate_virtio_dependency_parity(root)?;
 
     let dockerfile = fs::read_to_string(root.join("Dockerfile"))?;
     for required in [
@@ -307,7 +324,439 @@ fn validate_image_identity_inputs(frontdoor: &str) -> Result<()> {
         })?;
         remainder = after;
     }
+    let transition_manifest = format!("\"$root/{TRANSITION_GATE_MANIFEST}\"");
+    if hash_inputs.matches(&transition_manifest).count() != 1 {
+        return Err(format!(
+            "root image identity must hash the transition-gate manifest exactly once: {TRANSITION_GATE_MANIFEST}"
+        )
+        .into());
+    }
     Ok(())
+}
+
+fn function_body<'a>(source: &'a str, declaration: &str) -> Result<&'a str> {
+    let (_, tail) = source
+        .split_once(declaration)
+        .ok_or_else(|| format!("workflow lacks function declaration: {declaration}"))?;
+    let (body, _) = tail
+        .split_once("\n}")
+        .ok_or_else(|| format!("workflow function is not terminated: {declaration}"))?;
+    Ok(body)
+}
+
+fn validate_clean_contract(frontdoor: &str) -> Result<()> {
+    let cache = function_body(frontdoor, "clean_cache() {")?;
+    for required in [
+        "$root/target/cargo",
+        "$root/target/docker",
+        "$root/target/debug",
+        "$root/tools/xtask/target",
+        "$root/crates/nexus-ostd-virtio/target",
+        "$root/kernel/nexus-ostd/target",
+        "$root/kernel/nexus-ostd/userspace/personality/target",
+        "$root/experiments/ostd-virtio-cser-spike/target",
+        "$root/experiments/ostd-virtio-cser-spike/patch-work",
+        "$root/specs/cser/states",
+        "$root\"/kernel/nexus-ostd/guest/*.elf",
+    ] {
+        if !cache.contains(required) {
+            return Err(format!("cache cleanup misses generated path: {required}").into());
+        }
+    }
+    for preserved in [
+        "\"$root/target/verification\"",
+        "\"$root/target/release\"",
+        "\"$root/target/release-audit\"",
+        "\"$root/kernel/nexus-ostd/artifacts\"",
+        "\"$root/experiments/ostd-virtio-cser-spike/artifacts\"",
+    ] {
+        if cache.contains(preserved) {
+            return Err(format!("default cache cleanup would delete evidence: {preserved}").into());
+        }
+    }
+
+    let evidence = function_body(frontdoor, "clean_evidence() {")?;
+    for required in [
+        "$root/target/scenario-artifacts",
+        "$root/target/verification",
+        "$root/target/research",
+        "$root/kernel/nexus-ostd/artifacts",
+        "$root/experiments/ostd-virtio-cser-spike/artifacts",
+    ] {
+        if !evidence.contains(required) {
+            return Err(
+                format!("explicit evidence cleanup misses generated path: {required}").into(),
+            );
+        }
+    }
+    for preserved in ["\"$root/target/release\"", "\"$root/target/release-audit\""] {
+        if evidence.contains(preserved) {
+            return Err(
+                format!("evidence cleanup would delete release output: {preserved}").into(),
+            );
+        }
+    }
+    for required in [
+        "mode=${1:-cache}",
+        "cache) clean_cache",
+        "--all)",
+        "clean_evidence",
+    ] {
+        if !frontdoor.contains(required) {
+            return Err(format!("root workflow lacks safe clean routing: {required}").into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_cold_rebuild_contract(root: &Path, frontdoor: &str) -> Result<()> {
+    for (relative, source) in [
+        ("x", frontdoor.to_owned()),
+        (
+            "kernel/nexus-ostd/x",
+            fs::read_to_string(root.join("kernel/nexus-ostd/x"))?,
+        ),
+        (
+            "experiments/ostd-virtio-cser-spike/x",
+            fs::read_to_string(root.join("experiments/ostd-virtio-cser-spike/x"))?,
+        ),
+    ] {
+        let build = function_body(&source, "build_image() {")?;
+        for required in ["rebuild_args=(--no-cache)", "\"${rebuild_args[@]}\""] {
+            if !build.contains(required) {
+                return Err(format!(
+                    "{relative} does not make NEXUS_REBUILD cache-cold: {required}"
+                )
+                .into());
+            }
+        }
+        if !source.contains("docker run --rm \\\n        --init") {
+            return Err(format!("{relative} does not run containers under Docker init").into());
+        }
+    }
+    for required in [
+        "prepare_cold_backend_images",
+        "backend_rebuild=1",
+        "backend_rebuild=0",
+    ] {
+        if !frontdoor.contains(required) {
+            return Err(format!(
+                "root cold workflow would rebuild backend images repeatedly: {required}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_backend_source_pair(relative: &str, source: &str, source_root: &str) -> Result<()> {
+    for file in PRODUCTION_SOURCE_FILES {
+        let source_path = format!("{source_root}/{file}");
+        let mount_target = format!("target=/kernel/nexus-ostd/src/cser/{file},readonly");
+        if source.matches(&source_path).count() != 2 || !source.contains(&mount_target) {
+            return Err(format!(
+                "{relative} must hash and live-mount {file} as one production source pair"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_backend_source_binding(root: &Path) -> Result<()> {
+    for (relative, source_root) in [
+        ("kernel/nexus-ostd/x", "$root/src/cser"),
+        (
+            "experiments/ostd-virtio-cser-spike/x",
+            "$repo_root/kernel/nexus-ostd/src/cser",
+        ),
+    ] {
+        let source = fs::read_to_string(root.join(relative))?;
+        validate_backend_source_pair(relative, &source, source_root)?;
+    }
+    let production_source_pair = [
+        "kernel/nexus-ostd/src/cser/effect_registry.rs",
+        "kernel/nexus-ostd/src/cser/device_flight.rs",
+        "/kernel/nexus-ostd/src/cser/",
+    ]
+    .join(" \\\n    ");
+    let substrate_binding = [
+        "/usr/local/bin/assert-production-virtio-substrate",
+        "/crates/nexus-ostd-virtio/src/production.rs",
+        "/crates/nexus-ostd-virtio/src/lib.rs",
+        "/crates/nexus-ostd-virtio/src/portal.rs",
+        "/crates/nexus-ostd-virtio/src/pci.rs",
+    ]
+    .join(" \\\n        ");
+    for relative in [
+        "kernel/nexus-ostd/Dockerfile",
+        "experiments/ostd-virtio-cser-spike/Dockerfile",
+    ] {
+        let dockerfile = fs::read_to_string(root.join(relative))?;
+        for source in [
+            "effect_registry.rs",
+            "device_flight.rs",
+            "/crates/nexus-ostd-virtio/src/production.rs",
+            "/crates/nexus-ostd-virtio/src/lib.rs",
+            "/crates/nexus-ostd-virtio/src/portal.rs",
+            "/crates/nexus-ostd-virtio/src/pci.rs",
+        ] {
+            if !dockerfile.contains(source) {
+                return Err(
+                    format!("{relative} does not prime production source: {source}").into(),
+                );
+            }
+        }
+        if !dockerfile.contains(&production_source_pair) {
+            return Err(format!(
+                "{relative} does not bake the Registry and device flight as one source pair"
+            )
+            .into());
+        }
+        if !dockerfile.contains(&substrate_binding) {
+            return Err(format!(
+                "{relative} does not pass all four sources to the production substrate gate"
+            )
+            .into());
+        }
+    }
+    let spike = fs::read_to_string(root.join("experiments/ostd-virtio-cser-spike/x"))?;
+    for required in [
+        "pci_source=/crates/nexus-ostd-virtio/src/pci.rs",
+        "check_production_substrate() {",
+        r#""$1" "$facade_lib" "$portal_source" "$pci_source""#,
+    ] {
+        if !spike.contains(required) {
+            return Err(format!(
+                "spike mutation gate lacks complete PCI source binding: {required}"
+            )
+            .into());
+        }
+    }
+    if spike
+        .matches("/repo/tools/virtio/assert-production-substrate.sh")
+        .count()
+        != 1
+        || spike.matches("if check_production_substrate ").count() != 8
+    {
+        return Err(
+            "spike production mutations must route exclusively through the four-source helper"
+                .into(),
+        );
+    }
+    let spike_assertion = fs::read_to_string(
+        root.join("experiments/ostd-virtio-cser-spike/scripts/assert-patch.sh"),
+    )?;
+    let spike_assertion_binding = [
+        r#""$facade_root/src/production.rs""#,
+        r#""$facade_root/src/lib.rs""#,
+        r#""$facade_root/src/portal.rs""#,
+        r#""$facade_root/src/pci.rs""#,
+    ]
+    .join(" \\\n    ");
+    if !spike_assertion.contains(&spike_assertion_binding) {
+        return Err("spike positive substrate gate lacks explicit PCI source binding".into());
+    }
+    Ok(())
+}
+
+fn validate_transition_gate_route(root: &Path) -> Result<()> {
+    let source = fs::read_to_string(root.join("tools/xtask/src/main.rs"))?;
+    for (declaration, section) in [
+        (
+            "fn check(root: &Path) -> Result<()> {",
+            "check production transition gates",
+        ),
+        (
+            "fn clippy(root: &Path) -> Result<()> {",
+            "clippy production transition gates",
+        ),
+        (
+            "fn test(root: &Path) -> Result<()> {",
+            "test production transition gates",
+        ),
+    ] {
+        let body = function_body(&source, declaration)?;
+        for required in [section, "cser-transition-gates", "--all-targets"] {
+            if !body.contains(required) {
+                return Err(format!(
+                    "{declaration} does not route every transition gate: {required}"
+                )
+                .into());
+            }
+        }
+    }
+    let test = function_body(&source, "fn test(root: &Path) -> Result<()> {")?;
+    if !test.contains("--no-fail-fast") {
+        return Err("transition-gate test route must retain every failing target".into());
+    }
+    let production_registry = fs::read_to_string(root.join(PRODUCTION_REGISTRY_TEST))?;
+    validate_production_registry_gate(&production_registry)?;
+    Ok(())
+}
+
+fn validate_production_registry_gate(source: &str) -> Result<()> {
+    for required in [
+        "../../../kernel/nexus-ostd/src/cser/effect_registry.rs",
+        "../../../kernel/nexus-ostd/src/cser/device_flight.rs",
+        "effect_registry::production_identity_registry_self_test();",
+        "device_flight::retained_semantic_self_test();",
+    ] {
+        if !source.contains(required) {
+            return Err(format!(
+                "{PRODUCTION_REGISTRY_TEST} does not bind both production self-tests: {required}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectLockEdge {
+    version: String,
+    source: Option<String>,
+}
+
+fn facade_direct_edges(
+    lock_source: &str,
+    relative: &str,
+) -> Result<BTreeMap<String, DirectLockEdge>> {
+    let lock: toml::Value = toml::from_str(lock_source)?;
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| format!("lockfile lacks package array: {relative}"))?;
+    let facade = packages
+        .iter()
+        .find(|package| {
+            package.get("name").and_then(toml::Value::as_str) == Some("nexus-ostd-virtio")
+        })
+        .ok_or_else(|| format!("lockfile lacks nexus-ostd-virtio: {relative}"))?;
+    let facade_dependencies = facade
+        .get("dependencies")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| format!("facade package lacks dependencies: {relative}"))?;
+
+    let mut edges = BTreeMap::new();
+    for dependency in facade_dependencies {
+        let descriptor = dependency
+            .as_str()
+            .ok_or_else(|| format!("facade dependency is not a string: {relative}"))?;
+        let fields = descriptor.split_whitespace().collect::<Vec<_>>();
+        if fields.is_empty() || fields.len() > 3 {
+            return Err(format!("unsupported lock dependency descriptor: {descriptor}").into());
+        }
+        let name = fields[0];
+        let requested_version = fields.get(1).copied();
+        let requested_source = fields
+            .get(2)
+            .map(|source| source.trim_start_matches('(').trim_end_matches(')'));
+        let candidates = packages
+            .iter()
+            .filter(|package| {
+                package.get("name").and_then(toml::Value::as_str) == Some(name)
+                    && requested_version.is_none_or(|version| {
+                        package.get("version").and_then(toml::Value::as_str) == Some(version)
+                    })
+                    && requested_source.is_none_or(|source| {
+                        package.get("source").and_then(toml::Value::as_str) == Some(source)
+                    })
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return Err(format!(
+                "{relative} cannot resolve direct edge {descriptor} uniquely: candidates={}",
+                candidates.len()
+            )
+            .into());
+        }
+        let package = candidates[0];
+        let edge = DirectLockEdge {
+            version: package
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| format!("direct package lacks version: {relative}:{name}"))?
+                .to_owned(),
+            source: package
+                .get("source")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned),
+        };
+        if edges.insert(name.to_owned(), edge).is_some() {
+            return Err(format!("duplicate facade direct edge: {relative}:{name}").into());
+        }
+    }
+    Ok(edges)
+}
+
+fn validate_virtio_dependency_sources(manifest_source: &str, locks: &[(&str, &str)]) -> Result<()> {
+    let manifest: toml::Value = toml::from_str(manifest_source)?;
+    let dependencies = manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .ok_or("VirtIO manifest lacks dependencies")?;
+    let authority_source = locks
+        .iter()
+        .find_map(|(relative, source)| (*relative == VIRTIO_AUTHORITY_LOCK).then_some(*source))
+        .ok_or_else(|| format!("missing VirtIO authority lock: {VIRTIO_AUTHORITY_LOCK}"))?;
+    let authority = facade_direct_edges(authority_source, VIRTIO_AUTHORITY_LOCK)?;
+    let manifest_edges = dependencies.keys().cloned().collect::<BTreeSet<_>>();
+    let authority_edges = authority.keys().cloned().collect::<BTreeSet<_>>();
+    if manifest_edges != authority_edges {
+        return Err(format!(
+            "VirtIO manifest direct edges differ from production authority: manifest={manifest_edges:?} authority={authority_edges:?}"
+        )
+        .into());
+    }
+
+    for (name, dependency) in dependencies {
+        let table = dependency
+            .as_table()
+            .ok_or_else(|| format!("VirtIO dependency is not structured: {name}"))?;
+        let resolved = authority
+            .get(name)
+            .ok_or_else(|| format!("authority lacks manifest edge: {name}"))?;
+        if let Some(requirement) = table.get("version").and_then(toml::Value::as_str) {
+            let exact = format!("={}", resolved.version);
+            if requirement != exact {
+                return Err(format!(
+                    "VirtIO production dependency must match the authority exactly: {name}={}",
+                    resolved.version
+                )
+                .into());
+            }
+        } else if table.get("path").and_then(toml::Value::as_str).is_none() {
+            return Err(format!(
+                "VirtIO direct dependency must have an exact version or path: {name}"
+            )
+            .into());
+        }
+    }
+
+    for (relative, lock_source) in locks {
+        let edges = facade_direct_edges(lock_source, relative)?;
+        if edges != authority {
+            return Err(format!(
+                "{relative} facade direct graph differs from {VIRTIO_AUTHORITY_LOCK}: actual={edges:?} authority={authority:?}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_virtio_dependency_parity(root: &Path) -> Result<()> {
+    let manifest_source = fs::read_to_string(root.join("crates/nexus-ostd-virtio/Cargo.toml"))?;
+    let lock_sources = VIRTIO_PRODUCTION_LOCKS
+        .iter()
+        .map(|relative| Ok((*relative, fs::read_to_string(root.join(relative))?)))
+        .collect::<Result<Vec<_>>>()?;
+    let locks = lock_sources
+        .iter()
+        .map(|(relative, source)| (*relative, source.as_str()))
+        .collect::<Vec<_>>();
+    validate_virtio_dependency_sources(&manifest_source, &locks)
 }
 
 fn validate_vendored_tla2tools(root: &Path, dockerfile: &str) -> Result<()> {
@@ -761,6 +1210,65 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
+    fn validate_virtio_fixture(manifest: &str, lock_sources: &[String]) -> Result<()> {
+        let locks = VIRTIO_PRODUCTION_LOCKS
+            .iter()
+            .zip(lock_sources)
+            .map(|(relative, source)| (*relative, source.as_str()))
+            .collect::<Vec<_>>();
+        validate_virtio_dependency_sources(manifest, &locks)
+    }
+
+    fn remove_facade_direct_edge(lock_source: &str, name: &str) -> String {
+        let mut lock: toml::Value = toml::from_str(lock_source).expect("parse lock fixture");
+        let packages = lock
+            .get_mut("package")
+            .and_then(toml::Value::as_array_mut)
+            .expect("lock packages");
+        let facade = packages
+            .iter_mut()
+            .find(|package| {
+                package.get("name").and_then(toml::Value::as_str) == Some("nexus-ostd-virtio")
+            })
+            .expect("facade package");
+        let dependencies = facade
+            .get_mut("dependencies")
+            .and_then(toml::Value::as_array_mut)
+            .expect("facade dependencies");
+        let before = dependencies.len();
+        dependencies.retain(|dependency| {
+            dependency
+                .as_str()
+                .and_then(|descriptor| descriptor.split_whitespace().next())
+                != Some(name)
+        });
+        assert_eq!(dependencies.len() + 1, before, "remove direct edge {name}");
+        toml::to_string(&lock).expect("serialize lock fixture")
+    }
+
+    fn drift_direct_edge(lock_source: &str, name: &str, edge: &DirectLockEdge) -> String {
+        let mut lock: toml::Value = toml::from_str(lock_source).expect("parse lock fixture");
+        let packages = lock
+            .get_mut("package")
+            .and_then(toml::Value::as_array_mut)
+            .expect("lock packages");
+        let mut changed = 0;
+        for package in packages {
+            let same_name = package.get("name").and_then(toml::Value::as_str) == Some(name);
+            let same_version =
+                package.get("version").and_then(toml::Value::as_str) == Some(edge.version.as_str());
+            let same_source =
+                package.get("source").and_then(toml::Value::as_str) == edge.source.as_deref();
+            if same_name && same_version && same_source {
+                *package.get_mut("version").expect("direct package version") =
+                    toml::Value::String(format!("{}-drift", edge.version));
+                changed += 1;
+            }
+        }
+        assert_eq!(changed, 1, "drift direct edge {name}");
+        toml::to_string(&lock).expect("serialize lock fixture")
+    }
+
     fn fixture_error(mutate: impl FnOnce(&Path)) -> String {
         let fixture = VendoredToolchainFixture::new();
         mutate(&fixture.directory());
@@ -795,7 +1303,7 @@ mod tests {
             .map(|relative| format!("    \"$root/{relative}\" \\\n"))
             .collect::<String>();
         let frontdoor = format!(
-            "compute_image_identity() {{\n    image_key=$(sha256sum \\\n{rendered}    \"$root/Cargo.lock\" | cut -d ' ' -f1 | sha256sum | cut -c1-16)\n}}\n"
+            "compute_image_identity() {{\n    image_key=$(sha256sum \\\n{rendered}    \"$root/{TRANSITION_GATE_MANIFEST}\" \\\n    \"$root/Cargo.lock\" | cut -d ' ' -f1 | sha256sum | cut -c1-16)\n}}\n"
         );
         validate_image_identity_inputs(&frontdoor).expect("complete vendored image identity");
 
@@ -815,6 +1323,94 @@ mod tests {
             .expect_err("reordered vendored image inputs must be rejected")
             .to_string();
         assert!(error.contains("out-of-order"));
+
+        let missing_transition = frontdoor.replace(
+            &format!("    \"$root/{TRANSITION_GATE_MANIFEST}\" \\\n"),
+            "",
+        );
+        let error = validate_image_identity_inputs(&missing_transition)
+            .expect_err("missing transition-gate manifest must be rejected")
+            .to_string();
+        assert!(error.contains(TRANSITION_GATE_MANIFEST));
+    }
+
+    #[test]
+    fn production_build_surfaces_keep_cache_evidence_and_source_identity_separate() {
+        let root = repository_root();
+        let frontdoor = fs::read_to_string(root.join("x")).expect("read root workflow");
+        validate_clean_contract(&frontdoor).expect("safe cache cleanup contract");
+        validate_cold_rebuild_contract(&root, &frontdoor).expect("cache-cold rebuild contract");
+        validate_backend_source_binding(&root).expect("production source binding");
+        validate_transition_gate_route(&root).expect("transition-gate CI route");
+
+        let unsafe_default = frontdoor.replace("mode=${1:-cache}", "mode=${1:---all}");
+        validate_clean_contract(&unsafe_default)
+            .expect_err("evidence-deleting default clean must be rejected");
+
+        for (relative, source_root) in [
+            ("kernel/nexus-ostd/x", "$root/src/cser"),
+            (
+                "experiments/ostd-virtio-cser-spike/x",
+                "$repo_root/kernel/nexus-ostd/src/cser",
+            ),
+        ] {
+            let source = fs::read_to_string(root.join(relative)).expect("read backend workflow");
+            for file in PRODUCTION_SOURCE_FILES {
+                let source_path = format!("{source_root}/{file}");
+                let missing_hash = source.replacen(&source_path, "removed-production-source", 1);
+                validate_backend_source_pair(relative, &missing_hash, source_root)
+                    .expect_err("missing source hash must be rejected");
+
+                let mount = format!("target=/kernel/nexus-ostd/src/cser/{file},readonly");
+                let missing_mount = source.replacen(&mount, "removed-production-mount", 1);
+                validate_backend_source_pair(relative, &missing_mount, source_root)
+                    .expect_err("missing source mount must be rejected");
+            }
+        }
+
+        let production_registry =
+            fs::read_to_string(root.join(PRODUCTION_REGISTRY_TEST)).expect("read registry gate");
+        for required_call in [
+            "effect_registry::production_identity_registry_self_test();",
+            "device_flight::retained_semantic_self_test();",
+        ] {
+            let missing = production_registry.replace(required_call, "removed_self_test();");
+            validate_production_registry_gate(&missing)
+                .expect_err("missing production self-test call must be rejected");
+        }
+    }
+
+    #[test]
+    fn production_virtio_dependency_graph_is_exact_across_workspaces() {
+        let root = repository_root();
+        let manifest = fs::read_to_string(root.join("crates/nexus-ostd-virtio/Cargo.toml"))
+            .expect("read facade manifest");
+        let lock_sources = VIRTIO_PRODUCTION_LOCKS
+            .iter()
+            .map(|relative| fs::read_to_string(root.join(relative)).expect("read lock fixture"))
+            .collect::<Vec<_>>();
+        validate_virtio_fixture(&manifest, &lock_sources)
+            .expect("production VirtIO dependency parity");
+
+        let authority_index = VIRTIO_PRODUCTION_LOCKS
+            .iter()
+            .position(|relative| *relative == VIRTIO_AUTHORITY_LOCK)
+            .expect("authority lock index");
+        let authority = facade_direct_edges(&lock_sources[authority_index], VIRTIO_AUTHORITY_LOCK)
+            .expect("authority direct graph");
+        for consumer in 0..lock_sources.len() {
+            for (name, edge) in &authority {
+                let mut missing = lock_sources.clone();
+                missing[consumer] = remove_facade_direct_edge(&missing[consumer], name);
+                validate_virtio_fixture(&manifest, &missing)
+                    .expect_err("missing facade direct edge must be rejected");
+
+                let mut drifted = lock_sources.clone();
+                drifted[consumer] = drift_direct_edge(&drifted[consumer], name, edge);
+                validate_virtio_fixture(&manifest, &drifted)
+                    .expect_err("drifted facade direct edge must be rejected");
+            }
+        }
     }
 
     #[test]

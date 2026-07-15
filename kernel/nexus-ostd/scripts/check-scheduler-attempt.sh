@@ -4,6 +4,85 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source_file=${1:-"$root/src/domains/scheduler.rs"}
 gate_source=${2:-"$root/../../crates/cser-transition-gates/src/scheduler.rs"}
+futex_source=${3:-"$root/src/personality/linux_futex_core.rs"}
+
+awk '
+    /fn install_reserved\(&mut self\)/ { in_install = 1 }
+    in_install && /self\.install_current\(next\);/ { install_count++; install_line = NR }
+    in_install && /record_liveness_pick_installed\(task_id, self\.cpu_index\);/ {
+        record_count++
+        record_line = NR
+    }
+    in_install && /self\.current\.as_ref\(\)/ { return_count++; return_line = NR; in_install = 0 }
+    /"CSER PickInstalled / { serial_in_scheduler++ }
+    /pub\(crate\) fn consume_liveness_pick_installed/ { consume_count++ }
+    END {
+        if (install_count != 1 || record_count != 1 || return_count != 1 ||
+            consume_count != 1 || serial_in_scheduler != 0 ||
+            !(install_line < record_line && record_line < return_line)) {
+            print "scheduler liveness source gate: pick receipt escaped install/atomic/lock-free-output contract" > "/dev/stderr"
+            exit 1
+        }
+    }
+' "$source_file"
+
+awk '
+    /fn recovery_snapshot\(&self\)/ { in_snapshot = 1 }
+    in_snapshot && /"LINUX_FUTEX_CORE RecoverySnapshotBegin / {
+        begin_count++
+        begin_line = NR
+    }
+    in_snapshot && /let snapshot = self\.runtime\.with_state/ {
+        section_count++
+        section_line = NR
+        in_runtime_section = 1
+    }
+    in_runtime_section && $0 == "        });" {
+        section_close_count++
+        section_close_line = NR
+        in_runtime_section = 0
+    }
+    in_snapshot && /"LINUX_FUTEX_CORE RecoveryRuntimeSectionComplete / {
+        complete_count++
+        complete_line = NR
+    }
+    in_snapshot && /self\.state\.lock\(\)\.recovery_snapshot = Some/ {
+        state_store_count++
+        state_store_line = NR
+    }
+    in_snapshot && /"LINUX_FUTEX_CORE RecoverySnapshot replacement=/ {
+        receipt_count++
+        receipt_line = NR
+        in_snapshot = 0
+    }
+    /consume_liveness_pick_installed\(V2_TASK\.id\(\)\)/ {
+        consume_count++
+        consume_line = NR
+    }
+    /"CSER PickInstalled task=/ {
+        pick_log_count++
+        pick_log_line = NR
+    }
+    /"LINUX_FUTEX_CORE RecoveryTaskEntry replacement=\{\} phase=kernel"/ {
+        task_entry_count++
+        task_entry_line = NR
+    }
+    /RecoveryRuntimeLockAcquired/ { stale_lock_marker++ }
+    END {
+        if (begin_count != 1 || section_count != 1 || section_close_count != 1 ||
+            complete_count != 1 || state_store_count != 1 || receipt_count != 1 ||
+            consume_count != 1 || pick_log_count != 1 || task_entry_count != 1 ||
+            stale_lock_marker != 0 ||
+            !(begin_line < section_line && section_line < section_close_line &&
+              section_close_line < complete_line && complete_line < state_store_line &&
+              state_store_line < receipt_line && consume_line < pick_log_line &&
+              pick_log_line < task_entry_line)) {
+            print "scheduler liveness source gate: serial receipt is not outside scheduler/runtime locks" > "/dev/stderr"
+            exit 1
+        }
+        print "scheduler liveness source gate: PASS pick_record=atomic pick_output=task_context runtime_output=after_lock_release direct_handoff_claim=false performance_claim=false"
+    }
+' "$futex_source"
 
 awk '
     index($0, ".pop_front()") {

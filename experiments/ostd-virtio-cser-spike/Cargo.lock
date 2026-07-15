@@ -9,7 +9,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94476c7ef97af4c4d998b3f422c1b01d5211aad57c80ed200baf148d1f1efab6"
 dependencies = [
  "bit_field",
- "bitflags 2.11.0",
+ "bitflags 2.13.0",
  "log",
 ]
 
@@ -39,9 +39,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.11.0"
+version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
+checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "bitvec"
@@ -273,7 +273,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "236e72a07bb26b68662f7cc9dcb58cea50cf5e3d8b698e1b51ff7c36d633dd92"
 dependencies = [
  "bit_field",
- "bitflags 2.11.0",
+ "bitflags 2.13.0",
 ]
 
 [[package]]
@@ -291,7 +291,7 @@ version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89797c447846ff7c39eebf22b1c6ce1c6d8721d0dced9771fc142d10cc2a4e97"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.13.0",
  "log",
  "multiboot2-common",
  "ptr_meta",
@@ -313,7 +313,7 @@ dependencies = [
 name = "nexus-ostd-virtio"
 version = "0.1.0"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.13.0",
  "cser-transition-gates",
  "ostd",
  "virtio-drivers",
@@ -682,7 +682,7 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8aff2f4f2b556a36a201d335a1e0a57754967a96857b1f47a52d5a23825cac84"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.13.0",
  "uguid",
 ]
 
@@ -711,7 +711,7 @@ dependencies = [
 name = "virtio-drivers"
 version = "0.13.0"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.13.0",
  "enumn",
  "log",
  "safe-mmio",
@@ -773,25 +773,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c101112411baafbb4bf8d33e4c4a80ab5b02d74d2612331c61e8192fc9710491"
 dependencies = [
  "bit_field",
- "bitflags 2.11.0",
+ "bitflags 2.13.0",
  "rustversion",
  "volatile 0.4.6",
 ]
 
 [[package]]
 name = "zerocopy"
-version = "0.8.40"
+version = "0.8.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a789c6e490b576db9f7e6b6d661bcc9799f7c0ac8352f56ea20193b2681532e5"
+checksum = "b7cbbc0a705a0fd05cc3676525980d2bf5a9bc4adac6d6475209a7887cf59d19"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.40"
+version = "0.8.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65c489a7071a749c849713807783f70672b28094011623e200cb86dcb835953"
+checksum = "e2e817b7b52d0c7358d3246da9d69935ebb18116b2b102b4230dac079b4862f5"
 dependencies = [
  "proc-macro2",
  "quote",

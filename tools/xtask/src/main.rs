@@ -104,7 +104,6 @@ fn real_main() -> Result<()> {
             "manifest" => evidence::write(&root, &TLA_SPECS).map(|_| ()),
             "bundle" => evidence::write_bundle(&root, &TLA_SPECS).map(|_| ()),
             "stage7b-evidence" => stage7b_evidence_all(&root),
-            "clean" => clean(&root),
             "help" | "-h" | "--help" => {
                 print_usage();
                 Ok(())
@@ -142,7 +141,7 @@ fn repo_root() -> PathBuf {
 
 fn print_usage() {
     eprintln!("usage: cargo run --manifest-path tools/xtask/Cargo.toml -- <command>");
-    eprintln!("commands: doctor build fmt check test quick model spec verify verify-bundle clean");
+    eprintln!("commands: doctor build fmt check test quick model spec verify verify-bundle");
     eprintln!("prospective research: research production-identity");
     eprintln!("internal evidence commands: begin stage7b-evidence complete manifest bundle");
 }
@@ -297,6 +296,18 @@ fn check(root: &Path) -> Result<()> {
         ],
     )?;
 
+    section("check production transition gates");
+    cargo(
+        root,
+        [
+            "check",
+            "--locked",
+            "-p",
+            "cser-transition-gates",
+            "--all-targets",
+        ],
+    )?;
+
     section("check cser-model on the bare-metal target without std");
     cargo(
         root,
@@ -335,6 +346,21 @@ fn clippy(root: &Path) -> Result<()> {
             "--locked",
             "--manifest-path",
             "tools/xtask/Cargo.toml",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+
+    section("clippy production transition gates");
+    cargo(
+        root,
+        [
+            "clippy",
+            "--locked",
+            "-p",
+            "cser-transition-gates",
             "--all-targets",
             "--",
             "-D",
@@ -382,6 +408,19 @@ fn test(root: &Path) -> Result<()> {
     cargo(
         root,
         ["test", "--locked", "-p", "cser-model", "--all-features"],
+    )?;
+
+    section("test production transition gates");
+    cargo(
+        root,
+        [
+            "test",
+            "--locked",
+            "-p",
+            "cser-transition-gates",
+            "--all-targets",
+            "--no-fail-fast",
+        ],
     )?;
 
     section("test neutral workflow runner");
@@ -728,27 +767,6 @@ fn first_difference(expected: &str, actual: &str) -> String {
         expected_lines.len(),
         actual_lines.len()
     )
-}
-
-fn clean(root: &Path) -> Result<()> {
-    section("clean root Docker artifacts");
-    let docker_target = root.join("target/docker");
-    if docker_target.exists() {
-        fs::remove_dir_all(&docker_target)?;
-    }
-    let states = root.join("specs/cser/states");
-    if states.exists() {
-        fs::remove_dir_all(states)?;
-    }
-    for path in [
-        root.join("target/scenario-artifacts"),
-        root.join("target/verification"),
-    ] {
-        if path.exists() {
-            fs::remove_dir_all(path)?;
-        }
-    }
-    Ok(())
 }
 
 struct LoggedChild {

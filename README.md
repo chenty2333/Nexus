@@ -122,7 +122,7 @@ The stable front door is deliberately small:
 | `./x run [kernel\|virtio\|composition]` | Run a bounded OSTD or composition receipt. |
 | `./x verify` | Run the canonical complete acceptance graph. |
 | `./x verify-bundle [DIRECTORY]` | Audit a canonical cold bundle against its clean checkout. |
-| `./x clean` | Remove generated build and evidence outputs. |
+| `./x clean [--all]` | Remove build caches while preserving evidence and release outputs; `--all` also removes run evidence. |
 
 The exact tier contracts and claim discipline are kept in
 [CONTRIBUTING.md](CONTRIBUTING.md), not repeated in the project introduction.

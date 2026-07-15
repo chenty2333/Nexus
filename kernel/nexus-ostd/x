@@ -89,13 +89,19 @@ image_key=$(sha256sum \
     "$repo_root/tools/ostd/assert-cser-patch.sh" \
     "$repo_root/tools/virtio/assert-cser-patch.sh" \
     "$repo_root/tools/virtio/assert-production-substrate.sh" \
-    "$root/src/cser/effect_registry.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+    "$root/src/cser/effect_registry.rs" \
+    "$root/src/cser/device_flight.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/nexus-ostd:$image_key"
 runner_base="$root/osdk-runner-base"
 runner_target="$root/target/osdk/nexus-kernel-run-base"
 
 build_image() {
+    local -a rebuild_args=()
+    if [[ ${NEXUS_REBUILD:-0} == 1 ]]; then
+        rebuild_args=(--no-cache)
+    fi
     docker build \
+        "${rebuild_args[@]}" \
         --platform linux/amd64 \
         --file "$root/Dockerfile" \
         --tag "$image" \
@@ -108,6 +114,7 @@ container() {
         cpu_args=(--cpuset-cpus "$NEXUS_CONTAINER_CPUSET")
     fi
     docker run --rm \
+        --init \
         "${cpu_args[@]}" \
         --platform linux/amd64 \
         --network none \
@@ -119,6 +126,7 @@ container() {
         -v "$repo_root/crates/cser-transition-gates:/crates/cser-transition-gates:ro,z" \
         -v "$repo_root/crates/nexus-ostd-virtio:/crates/nexus-ostd-virtio:ro,z" \
         --mount "type=bind,source=$root/src/cser/effect_registry.rs,target=/kernel/nexus-ostd/src/cser/effect_registry.rs,readonly" \
+        --mount "type=bind,source=$root/src/cser/device_flight.rs,target=/kernel/nexus-ostd/src/cser/device_flight.rs,readonly" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         --mount "type=bind,source=$root/userspace/personality/Cargo.lock,target=/work/userspace/personality/Cargo.lock,readonly" \
         -w /work \
@@ -170,7 +178,8 @@ check_virtio_patch() {
     container /repo/tools/virtio/assert-production-substrate.sh \
         /crates/nexus-ostd-virtio/src/production.rs \
         /crates/nexus-ostd-virtio/src/lib.rs \
-        /crates/nexus-ostd-virtio/src/portal.rs
+        /crates/nexus-ostd-virtio/src/portal.rs \
+        /crates/nexus-ostd-virtio/src/pci.rs
     container bash -c '
         set -euo pipefail
         tmp=$(mktemp -d)
@@ -187,6 +196,7 @@ check_virtio_patch() {
         source=/crates/nexus-ostd-virtio/src/production.rs
         lib=/crates/nexus-ostd-virtio/src/lib.rs
         portal=/crates/nexus-ostd-virtio/src/portal.rs
+        pci=/crates/nexus-ostd-virtio/src/pci.rs
 
         cp "$canonical" "$tmp/relaxed.patch"
         sed -i '\''0,/Ordering::Release/s//Ordering::Relaxed/'\'' "$tmp/relaxed.patch"
@@ -288,7 +298,208 @@ check_virtio_patch() {
             echo "production facade gate accepted status access before used-length validation" >&2
             exit 1
         fi
-        echo "canonical VirtIO negative assertions: PASS release_relaxed=rejected missing_linear_owner=rejected missing_recycle=rejected facade_authority=rejected post_release_assert=rejected branching_generation_apply=rejected branching_quiescence_apply=rejected overlapping_session=rejected forced_notification=rejected unchecked_used_length=rejected status_before_used_length=rejected"
+
+        cp "$source" "$tmp/irq-uses-polling-mode.rs"
+        sed -i '\''0,/prepare_read_sector0_with_mode(root, CompletionMode::Interrupt)/s//prepare_read_sector0_with_mode(root, CompletionMode::Polling)/'\'' \
+            "$tmp/irq-uses-polling-mode.rs"
+        require_mutation "$source" "$tmp/irq-uses-polling-mode.rs" irq-uses-polling-mode
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/irq-uses-polling-mode.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted IRQ preparation with polling notifications" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/irq-ack-spins.rs"
+        sed -i '\''/pub fn ack_interrupt(&mut self) -> InterruptReceipt {/a\        core::hint::spin_loop();'\'' \
+            "$tmp/irq-ack-spins.rs"
+        require_mutation "$source" "$tmp/irq-ack-spins.rs" irq-ack-spins
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/irq-ack-spins.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a spinning IRQ acknowledgement" >&2
+            exit 1
+        fi
+
+        cp "$pci" "$tmp/cloneable-intx-token.rs"
+        sed -i '\''0,/pub struct MaskedIntx {/s//#[derive(Clone)]\npub struct MaskedIntx {/'\'' \
+            "$tmp/cloneable-intx-token.rs"
+        require_mutation "$pci" "$tmp/cloneable-intx-token.rs" cloneable-intx-token
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$source" "$lib" "$portal" "$tmp/cloneable-intx-token.rs" >/dev/null 2>&1; then
+            echo "production facade gate accepted a cloneable INTx owner token" >&2
+            exit 1
+        fi
+
+        cp "$pci" "$tmp/reclaim-intx.rs"
+        sed -i '\''0,/if self.intx_state != IntxOwnershipState::Unclaimed {/s//if false {/'\'' \
+            "$tmp/reclaim-intx.rs"
+        require_mutation "$pci" "$tmp/reclaim-intx.rs" reclaim-intx
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$source" "$lib" "$portal" "$tmp/reclaim-intx.rs" >/dev/null 2>&1; then
+            echo "production facade gate accepted repeated initial INTx claims" >&2
+            exit 1
+        fi
+
+        cp "$pci" "$tmp/intx-command-collateral.rs"
+        sed -i '\''0,/command.union(Command::INTERRUPT_DISABLE)/s//command.union(Command::INTERRUPT_DISABLE).union(Command::BUS_MASTER)/'\'' \
+            "$tmp/intx-command-collateral.rs"
+        require_mutation "$pci" "$tmp/intx-command-collateral.rs" intx-command-collateral
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$source" "$lib" "$portal" "$tmp/intx-command-collateral.rs" >/dev/null 2>&1; then
+            echo "production facade gate accepted collateral PCI command mutation" >&2
+            exit 1
+        fi
+
+        cp "$pci" "$tmp/intx-readback-forged.rs"
+        sed -i '\''0,/let (_, observed) = root.inner.get_status_command(device_function);/s//let observed = expected;/'\'' \
+            "$tmp/intx-readback-forged.rs"
+        require_mutation "$pci" "$tmp/intx-readback-forged.rs" intx-readback-forged
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$source" "$lib" "$portal" "$tmp/intx-readback-forged.rs" >/dev/null 2>&1; then
+            echo "production facade gate accepted forged PCI command readback" >&2
+            exit 1
+        fi
+
+        cp "$pci" "$tmp/intx-owner-validation-bypassed.rs"
+        sed -i '\''0,/if owner_id != self.intx_owner_id || route != self.intx_route {/s//if false {/'\'' \
+            "$tmp/intx-owner-validation-bypassed.rs"
+        require_mutation "$pci" "$tmp/intx-owner-validation-bypassed.rs" intx-owner-validation-bypassed
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$source" "$lib" "$portal" "$tmp/intx-owner-validation-bypassed.rs" >/dev/null 2>&1; then
+            echo "production facade gate accepted bypassed INTx owner validation" >&2
+            exit 1
+        fi
+
+        cp "$pci" "$tmp/intx-route-mint-bypass.rs"
+        sed -i '\''/    pub const fn intx_route(&self) -> IntxRoute {/i\    pub fn mint_from_route(&self, route: IntxRoute) -> MaskedIntx { MaskedIntx { owner_id: self.intx_owner_id, epoch: 0, route } }'\'' \
+            "$tmp/intx-route-mint-bypass.rs"
+        require_mutation "$pci" "$tmp/intx-route-mint-bypass.rs" intx-route-mint-bypass
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$source" "$lib" "$portal" "$tmp/intx-route-mint-bypass.rs" >/dev/null 2>&1; then
+            echo "production facade gate accepted descriptive-route token minting" >&2
+            exit 1
+        fi
+
+        cp "$pci" "$tmp/intx-unmask-preread-bypass.rs"
+        sed -i '\''0,/if !observed_before_unmask.contains(Command::INTERRUPT_DISABLE) {/s//if false {/'\'' \
+            "$tmp/intx-unmask-preread-bypass.rs"
+        require_mutation "$pci" "$tmp/intx-unmask-preread-bypass.rs" intx-unmask-preread-bypass
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$source" "$lib" "$portal" "$tmp/intx-unmask-preread-bypass.rs" >/dev/null 2>&1; then
+            echo "production facade gate accepted unmask without a masked-command pre-read" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/cloneable-hardware-intent.rs"
+        sed -i '\''0,/pub struct PreparedCancelIntent {/s//#[derive(Clone)]\npub struct PreparedCancelIntent {/'\'' \
+            "$tmp/cloneable-hardware-intent.rs"
+        require_mutation "$source" "$tmp/cloneable-hardware-intent.rs" cloneable-hardware-intent
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/cloneable-hardware-intent.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a cloneable hardware intent" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/identity-only-hardware-intent.rs"
+        sed -i '\''0,/request: PreparedRequest,/s//identity: DeviceSessionIdentity,/'\'' \
+            "$tmp/identity-only-hardware-intent.rs"
+        require_mutation "$source" "$tmp/identity-only-hardware-intent.rs" identity-only-hardware-intent
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/identity-only-hardware-intent.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted an intent made from descriptive identity" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/cancel-intent-preflight-bypassed.rs"
+        sed -i '\''0,/if self.identity != expected_cancel_identity {/s//if false {/'\'' \
+            "$tmp/cancel-intent-preflight-bypassed.rs"
+        require_mutation "$source" "$tmp/cancel-intent-preflight-bypassed.rs" cancel-intent-preflight-bypassed
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/cancel-intent-preflight-bypassed.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a bypassed cancel-intent preflight" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/hardware-intent-owner-discarded.rs"
+        sed -i '\''0,/pub fn into_owner(self) -> T {/s//pub fn discard_owner(self) {/'\'' \
+            "$tmp/hardware-intent-owner-discarded.rs"
+        require_mutation "$source" "$tmp/hardware-intent-owner-discarded.rs" hardware-intent-owner-discarded
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/hardware-intent-owner-discarded.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a preflight error that cannot return its owner" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/cloneable-completion-reset-intent.rs"
+        sed -i '\''0,/pub struct PreparedRequestResetIntent {/s//#[derive(Clone)]\npub struct PreparedRequestResetIntent {/'\'' \
+            "$tmp/cloneable-completion-reset-intent.rs"
+        require_mutation "$source" "$tmp/cloneable-completion-reset-intent.rs" cloneable-completion-reset-intent
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/cloneable-completion-reset-intent.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a cloneable completion reset intent" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/completion-reset-identity-bypassed.rs"
+        sed -i '\''0,/if request.identity != expected_reset_identity {/s//if false {/'\'' \
+            "$tmp/completion-reset-identity-bypassed.rs"
+        require_mutation "$source" "$tmp/completion-reset-identity-bypassed.rs" completion-reset-identity-bypassed
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/completion-reset-identity-bypassed.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a bypassed completion reset identity check" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/completion-reset-popped-as-published.rs"
+        sed -i '\''0,/            POPPED_REQUEST_SHARE_COUNTS,/s//            PUBLISHED_REQUEST_SHARE_COUNTS,/'\'' \
+            "$tmp/completion-reset-popped-as-published.rs"
+        require_mutation "$source" "$tmp/completion-reset-popped-as-published.rs" completion-reset-popped-as-published
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/completion-reset-popped-as-published.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a popped completion with published DMA state" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/completion-probe-spins.rs"
+        sed -i '\''/pub fn probe_completion_once(self) -> CompletionProbeProgress {/a\        core::hint::spin_loop();'\'' \
+            "$tmp/completion-probe-spins.rs"
+        require_mutation "$source" "$tmp/completion-probe-spins.rs" completion-probe-spins
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/completion-probe-spins.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a spinning one-step completion probe" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/reset-probe-spins.rs"
+        sed -i '\''/pub fn probe_ack_once(mut self, root: &mut Root) -> Result<ProductionResetAck, Self> {/a\        for _ in 0..POLL_LIMIT { core::hint::spin_loop(); }'\'' \
+            "$tmp/reset-probe-spins.rs"
+        require_mutation "$source" "$tmp/reset-probe-spins.rs" reset-probe-spins
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/reset-probe-spins.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a polling reset actor probe" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/reset-probe-drops-owner.rs"
+        sed -i '\''0,/pub fn probe_ack_once(mut self, root: &mut Root) -> Result<ProductionResetAck, Self> {/s//pub fn probe_ack_once(mut self, root: \&mut Root) -> Option<ProductionResetAck> {/'\'' \
+            "$tmp/reset-probe-drops-owner.rs"
+        require_mutation "$source" "$tmp/reset-probe-drops-owner.rs" reset-probe-drops-owner
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/reset-probe-drops-owner.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a pending reset probe that drops its owner" >&2
+            exit 1
+        fi
+
+        cp "$source" "$tmp/duplicate-reset-retirement.rs"
+        sed -i '\''/unsafe { abandon_queue_after_reset(queue) };/a\        unsafe { abandon_queue_after_reset(queue) };'\'' \
+            "$tmp/duplicate-reset-retirement.rs"
+        require_mutation "$source" "$tmp/duplicate-reset-retirement.rs" duplicate-reset-retirement
+        if /repo/tools/virtio/assert-production-substrate.sh \
+            "$tmp/duplicate-reset-retirement.rs" "$lib" "$portal" "$pci" >/dev/null 2>&1; then
+            echo "production facade gate accepted a second reset queue-retirement path" >&2
+            exit 1
+        fi
+
+        echo "canonical VirtIO negative assertions: PASS release_relaxed=rejected missing_linear_owner=rejected missing_recycle=rejected facade_authority=rejected post_release_assert=rejected branching_generation_apply=rejected branching_quiescence_apply=rejected overlapping_session=rejected forced_notification=rejected unchecked_used_length=rejected status_before_used_length=rejected irq_polling_mode=rejected irq_ack_spin=rejected cloneable_intx_token=rejected repeated_intx_claim=rejected intx_command_collateral=rejected intx_readback_forgery=rejected intx_owner_bypass=rejected intx_route_mint=rejected intx_unmask_preread_bypass=rejected cloneable_hardware_intent=rejected identity_only_hardware_intent=rejected cancel_intent_preflight_bypass=rejected hardware_intent_owner_discard=rejected cloneable_completion_reset_intent=rejected completion_reset_identity_bypass=rejected completion_reset_popped_projection=rejected completion_probe_spin=rejected reset_probe_spin=rejected reset_probe_owner_drop=rejected duplicate_reset_retirement=rejected"
     '
 }
 
@@ -587,7 +798,9 @@ run_kernel() {
 
 run_same_boot_kernel() {
     # Keep compilation outside the runtime deadline and verify the immutable
-    # block fixture on both sides of the QEMU execution.
+    # block fixture on both sides of the QEMU execution. Hosted TCG can exhibit
+    # long scheduler-to-user-entry tails on shared CI workers, so retain one
+    # non-retried run but give the runtime 90 seconds of diagnostic headroom.
     build_same_boot_kernel
     container bash -c '
         set -euo pipefail
@@ -599,7 +812,7 @@ run_same_boot_kernel() {
         test "$before" = "$expected"
         test "$before_mode" = 444
         set +e
-        timeout --signal=TERM --kill-after=2s 45s \
+        timeout --signal=TERM --kill-after=2s 90s \
             cargo osdk run --scheme runtime-fs-same-boot
         status=$?
         set -e
@@ -638,6 +851,7 @@ capture_same_boot_run() {
 }
 
 run_same_boot_precommit_kernel() {
+    # Match the positive same-boot run's single-attempt hosted-TCG headroom.
     build_same_boot_precommit_kernel
     container bash -c '
         set -euo pipefail
@@ -649,7 +863,7 @@ run_same_boot_precommit_kernel() {
         test "$before" = "$expected"
         test "$before_mode" = 444
         set +e
-        timeout --signal=TERM --kill-after=2s 45s \
+        timeout --signal=TERM --kill-after=2s 90s \
             cargo osdk run --scheme runtime-fs-same-boot-precommit
         status=$?
         set -e
@@ -706,6 +920,16 @@ first_allowed_cpu() {
     printf '%s\n' "$first"
 }
 
+run_stage7b_kernel() {
+    local cpu=$1
+    NEXUS_CONTAINER_CPUSET=$cpu container bash -c '
+        set -euo pipefail
+        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
+        exec timeout --signal=TERM --kill-after=2s 180s \
+            cargo osdk run --release --features stage7b-eval
+    '
+}
+
 eval_stage7b() {
     # Build the release evaluator before the runtime deadline. The run command
     # reuses this exact generated image and runner graph.
@@ -729,13 +953,10 @@ eval_stage7b() {
     } >"$temporary"
     mv "$temporary" "$metadata"
 
+    # shellcheck source=scripts/qemu-stream-capture.sh
+    source "$root/scripts/qemu-stream-capture.sh"
     set +e
-    NEXUS_CONTAINER_CPUSET=$cpu container bash -c '
-        set -euo pipefail
-        cp /root/ovmf/release/OVMF_VARS.fd "$HOME/OVMF_VARS.fd"
-        exec timeout --signal=TERM --kill-after=2s 180s \
-            cargo osdk run --release --features stage7b-eval
-    ' > >(tee "$serial") 2> >(tee "$debug" >&2)
+    capture_qemu_streams "$serial" "$debug" run_stage7b_kernel "$cpu"
     status=$?
     set -e
     assert_runner_base

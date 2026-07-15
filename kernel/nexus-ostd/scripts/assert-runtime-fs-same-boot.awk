@@ -40,22 +40,22 @@ function add_effect(effect, label) {
 
 function parse_capture(    session) {
     require_event("Capture")
-    if (NF != 17 || $3 != "same_boot=true" ||
+    if (NF != 18 || $3 != "same_boot=true" ||
         $4 != "identity_preserving=true" || $5 != "real_dma=true" ||
-        $6 != "scope=95" || $7 != "authority_epoch=141" ||
-        $8 != "effects=6" || $9 != "credits=10" ||
-        $10 != "device=00:05.0" || $12 != "generation=1" ||
-        $13 != "queue=0")
+        $6 != "registry=shared_production" || $7 != "scope=95" ||
+        $8 != "authority_epoch=141" || $9 != "effects=6" ||
+        $10 != "credits=10" || $11 != "device=00:05.0" ||
+        $13 != "generation=1" || $14 != "queue=0")
         fail("malformed Capture receipt: " $0)
-    session = value_at(11, "session")
+    session = value_at(12, "session")
     require_hex(session, "session")
     if (length(session) != 18)
         fail("device session is not a 64-bit hexadecimal identity: " session)
-    descriptor = value_at(14, "descriptor")
+    descriptor = value_at(15, "descriptor")
     require_decimal(descriptor, "descriptor", 1)
-    syscall_effect = value_at(15, "syscall_effect")
-    filesystem_effect = value_at(16, "filesystem_effect")
-    block_effect = value_at(17, "block_effect")
+    syscall_effect = value_at(16, "syscall_effect")
+    filesystem_effect = value_at(17, "filesystem_effect")
+    block_effect = value_at(18, "block_effect")
     add_effect(syscall_effect, "filesystem_syscall")
     add_effect(filesystem_effect, "filesystem_read")
     add_effect(block_effect, "block_request")

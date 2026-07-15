@@ -12,6 +12,12 @@ mod composition;
 mod effect;
 #[path = "cser/effect_registry.rs"]
 mod effect_registry;
+// The shared semantic spine lands before its first filesystem/IRQ consumer.
+// Keep the temporary dead-code allowance at the module boundary so individual
+// state and transition APIs remain warning-clean while that migration proceeds.
+#[allow(dead_code)]
+#[path = "cser/device_flight.rs"]
+mod device_flight;
 #[cfg(not(feature = "virtio-cser-facade"))]
 #[path = "probes/iommu_probe.rs"]
 mod iommu_probe;
@@ -412,8 +418,8 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
         assert_eq!(fs_receipt.scope.id(), 95);
         assert_eq!(fs_receipt.closed_authority_epoch, 141);
         assert_eq!(fs_receipt.final_authority_epoch, 142);
-        assert_eq!(fs_receipt.terminalizations, 14);
-        assert_eq!(fs_receipt.publication_acks, 14);
+        assert_eq!(fs_receipt.terminalizations, 6);
+        assert_eq!(fs_receipt.publication_acks, 1);
         assert_eq!(fs_receipt.production_effects, 6);
         assert_eq!(fs_receipt.production_domains, 3);
         assert!(fs_receipt.preparation_identity_observed);
@@ -435,8 +441,8 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
         assert_eq!(fs_receipt.scope.id(), 95);
         assert_eq!(fs_receipt.closed_authority_epoch, 141);
         assert_eq!(fs_receipt.final_authority_epoch, 142);
-        assert_eq!(fs_receipt.terminalizations, 2);
-        assert_eq!(fs_receipt.publication_acks, 2);
+        assert_eq!(fs_receipt.terminalizations, 6);
+        assert_eq!(fs_receipt.publication_acks, 1);
         assert_eq!(fs_receipt.production_effects, 6);
         assert_eq!(fs_receipt.production_domains, 3);
         assert!(fs_receipt.preparation_identity_observed);
@@ -451,7 +457,7 @@ fn run_fallback_probe(scheduler: &'static CserScheduler, old_binding: scheduler:
             "0dc5ad40cb05e39592592ef3272ed45be4d71f9b147a534be20b9a5626c17bef"
         );
         println!(
-            "LINUX_FS_SAME_BOOT_PRECOMMIT Terminal receipt_checked=true generic_prefix_quiescent=true poweroff=success"
+            "LINUX_FS_SAME_BOOT_PRECOMMIT Terminal receipt_checked=true registry=shared_production compatibility_syscalls=payload_only_not_cser poweroff=success"
         );
         println!("SPIKE_RESULT PASS");
         poweroff(ExitCode::Success);

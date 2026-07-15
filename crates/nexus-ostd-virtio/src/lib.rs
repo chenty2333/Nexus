@@ -7,9 +7,10 @@
 //! private implementation modules below. Their invariants are documented at
 //! each unsafe operation and summarized in the crate README.
 //!
-//! This extraction preserves the separate-boot Stage 5B polling experiment.
-//! It does not establish same-boot integration, interrupt delivery, SMP
-//! correctness, or production-identity preservation.
+//! This extraction preserves the separate-boot Stage 5B polling experiment and
+//! adds a safe INTx/ISR/one-shot completion facade for an IRQ successor. It
+//! does not itself install an OSTD IRQ actor or establish interrupt delivery,
+//! same-boot integration, SMP correctness, or production-identity preservation.
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -30,16 +31,22 @@ mod portal;
 mod production;
 
 pub use dma::{OwnerKind, owner_address};
-pub use pci::{DeviceBdf, Root, discover_and_own_bars};
+pub use pci::{
+    DeviceBdf, IntxRoute, IntxTransitionError, IntxTransitionFailure, MaskedIntx, Root,
+    UnmaskedIntx, discover_and_own_bars,
+};
 pub use portal::{
     BindingToken, ClosureProgress, ClosureReceipt, EffectAuthority, IotlbTombstone, Operation,
     Portal, RegisterError, ResetAck, ResetTombstone, Session, SessionNamespaceIsolationReceipt,
     SessionOpenError, Terminal, assert_session_namespace_isolation, terminal_label,
 };
 pub use production::{
-    CancelledRequest, CompletedRequest, CompletionFailure, CompletionProgress,
-    DeviceSessionIdentity, FailedCompletion, NotificationDisposition, PendingCompletion,
-    PrepareReadError, PreparedGenerationAdvance, PreparedQuiescenceApply, PreparedRequest,
+    CancelledRequest, CompletedRequest, CompletionFailure, CompletionMode, CompletionProbeProgress,
+    CompletionProgress, DeviceSessionIdentity, FailedCompletion, HardwareIntentError,
+    HardwareIntentFailure, InterruptCause, InterruptCompletionProgress, InterruptNotReadyReason,
+    InterruptReceipt, NotificationDisposition, PendingCompletion, PrepareReadError,
+    PreparedCancelIntent, PreparedGenerationAdvance, PreparedPublishedResetIntent,
+    PreparedQuiescenceApply, PreparedRequest, PreparedRequestResetIntent,
     ProductionClosureProgress, ProductionClosureReceipt, ProductionDevice,
     ProductionIotlbTombstone, ProductionResetAck, ProductionResetTombstone, PublishIdentityError,
     PublishedRequest, QuiescenceApplyError, ResetGenerationError, UnregisteredCancellationError,

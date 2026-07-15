@@ -7,6 +7,7 @@ kernel_backend="$root/kernel/nexus-ostd/x"
 virtio_backend="$root/experiments/ostd-virtio-cser-spike/x"
 composition_backend="$root/tools/workflow/system-composition.sh"
 root_image_ready=false
+backend_rebuild=
 repo_lock="/tmp/nexus-workflow-${root//\//_}.lock"
 
 usage() {
@@ -24,7 +25,7 @@ Public commands:
   verify                 run the complete model/spec/QEMU/composition gate
   verify-bundle [DIRECTORY]
                          verify an existing evidence bundle without QEMU
-  clean                  remove all repository-owned generated artifacts
+  clean [--all]          remove build caches; --all also removes run evidence
 
 Focused commands:
   fmt                     format Rust workspaces
@@ -87,14 +88,20 @@ compute_image_identity() {
         "$root/Cargo.toml" \
         "$root/Cargo.lock" \
         "$root/crates/cser-model/Cargo.toml" \
+        "$root/crates/cser-transition-gates/Cargo.toml" \
         "$root/tools/xtask/Cargo.toml" \
         "$root/tools/xtask/Cargo.lock" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
     image="nexus/cser-dev:$image_key"
 }
 
 build_image() {
+    local -a rebuild_args=()
+    if [[ ${NEXUS_REBUILD:-0} == 1 ]]; then
+        rebuild_args=(--no-cache)
+    fi
     compute_image_identity
     docker build \
+        "${rebuild_args[@]}" \
         --platform linux/amd64 \
         --tag "$image" \
         "$root"
@@ -125,12 +132,13 @@ run_xtask() {
     fi
     ensure_image
     docker run --rm \
+        --init \
         --platform linux/amd64 \
         --network none \
         --user "$(id -u):$(id -g)" \
         --env HOME=/tmp/nexus-home \
         --tmpfs /tmp/nexus-home:rw,exec,nosuid,size=64m,mode=1777 \
-        --env CARGO_TARGET_DIR=/work/target/docker \
+        --env CARGO_TARGET_DIR=/work/target/cargo \
         --env "NEXUS_REBUILD=${NEXUS_REBUILD:-0}" \
         --env "NEXUS_VERIFY_INVOCATION=${NEXUS_VERIFY_INVOCATION:-}" \
         "${token_environment[@]}" \
@@ -146,11 +154,24 @@ run_backend() {
     local entrypoint=$1
     local backend_command=$2
     local description=$3
+    local rebuild=${backend_rebuild:-${NEXUS_REBUILD:-0}}
     if [[ ! -x "$entrypoint" ]]; then
         echo "$description entrypoint is missing or not executable: $entrypoint" >&2
         exit 1
     fi
-    "$entrypoint" "$backend_command"
+    NEXUS_REBUILD=$rebuild "$entrypoint" "$backend_command"
+}
+
+prepare_cold_backend_images() {
+    if [[ ${NEXUS_REBUILD:-0} != 1 ]]; then
+        return
+    fi
+    backend_rebuild=1
+    run_backend "$kernel_backend" image "Nexus OSTD kernel image"
+    run_backend "$virtio_backend" image "OSTD mediated VirtIO image"
+    # Every later backend process resolves the same content-addressed tag while
+    # the repository lock prevents its input set from changing.
+    backend_rebuild=0
 }
 
 run_composition_oracle() {
@@ -233,6 +254,7 @@ verify_all() {
     check_host_shell_sources
     run_xtask begin
     run_xtask verify
+    prepare_cold_backend_images
     # OSDK images remain host-side backends; the root verification image never
     # receives access to the Docker socket.
     run_system
@@ -267,15 +289,40 @@ doctor_host() {
     run_backend "$virtio_backend" doctor "OSTD mediated VirtIO"
 }
 
-clean_root() {
+clean_cache() {
     rm -rf \
-        "$root/target" \
+        "$root/target/.rustc_info.json" \
+        "$root/target/cargo" \
+        "$root/target/debug" \
+        "$root/target/docker" \
+        "$root/target/release-api-test" \
+        "$root/target/review" \
+        "$root/target/tmp" \
+        "$root/target/x86_64-unknown-none" \
         "$root/tools/xtask/target" \
+        "$root/crates/nexus-ostd-virtio/target" \
+        "$root/kernel/nexus-ostd/target" \
+        "$root/kernel/nexus-ostd/userspace/personality/target" \
+        "$root/experiments/ostd-virtio-cser-spike/target" \
+        "$root/experiments/ostd-virtio-cser-spike/patch-work" \
         "$root/specs/cser/states"
     rm -f \
+        "$root"/kernel/nexus-ostd/guest/*.bin \
+        "$root"/kernel/nexus-ostd/guest/*.elf \
         "$root"/specs/cser/*_TTrace_*.bin \
         "$root"/specs/cser/*_TTrace_*.tla \
         "$root"/specs/cser/*.old
+    echo 'CLEAN CACHE PASS evidence=preserved release=preserved docker_images=preserved'
+}
+
+clean_evidence() {
+    rm -rf \
+        "$root/target/scenario-artifacts" \
+        "$root/target/verification" \
+        "$root/target/research" \
+        "$root/kernel/nexus-ostd/artifacts" \
+        "$root/experiments/ostd-virtio-cser-spike/artifacts"
+    echo 'CLEAN EVIDENCE PASS release=preserved docker_images=preserved'
 }
 
 command=${1:-}
@@ -389,12 +436,20 @@ case "$command" in
         run_xtask verify-bundle "$bundle"
         ;;
     clean)
-        require_no_args "$@"
         # Cleaning must remain available before Docker is installed and must
         # never pull or build an image merely to remove host-owned artifacts.
-        clean_root
-        run_backend "$kernel_backend" clean "Nexus OSTD kernel"
-        run_backend "$virtio_backend" clean "OSTD mediated VirtIO"
+        mode=${1:-cache}
+        if (( $# > 1 )); then
+            die "clean accepts at most one option: --all"
+        fi
+        case "$mode" in
+            cache) clean_cache ;;
+            --all)
+                clean_cache
+                clean_evidence
+                ;;
+            *) die "unknown clean option: $mode" ;;
+        esac
         ;;
     -h|--help|help)
         require_no_args "$@"

@@ -3,7 +3,11 @@
 //! Private PCI configuration, BAR-ownership, and MMIO-claim substrate.
 
 use alloc::sync::Arc;
-use core::{fmt, ptr::NonNull};
+use core::{
+    fmt,
+    ptr::NonNull,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use ostd::{
     arch::device::io_port::ReadWriteAccess,
@@ -29,6 +33,11 @@ const EXPECTED_DEVICE: DeviceFunction = DeviceFunction {
     function: 0,
 };
 const MODERN_VIRTIO_BLOCK_DEVICE_ID: u16 = 0x1042;
+const INTERRUPT_CONFIG_OFFSET: u8 = 0x3c;
+const INTX_NOT_CONNECTED: u8 = 0xff;
+const EXPECTED_INTX_PIN: u8 = 1;
+
+static NEXT_INTX_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 
 struct ConfigPorts {
     address: IoPort<u32, ReadWriteAccess>,
@@ -100,6 +109,199 @@ pub struct DeviceBdf {
     function: u8,
 }
 
+/// Descriptive PCI INTx routing coordinates for the fixed Nexus block fixture.
+///
+/// The route is read from the standard PCI interrupt line/pin register at
+/// configuration offset `0x3c`. It is not an IRQ-controller capability and
+/// cannot install a handler by itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntxRoute {
+    device_bdf: DeviceBdf,
+    line: u8,
+    pin: u8,
+}
+
+impl IntxRoute {
+    /// Returns the exact PCI function which advertised this route.
+    pub const fn device_bdf(self) -> DeviceBdf {
+        self.device_bdf
+    }
+
+    /// Returns the firmware-programmed legacy interrupt line.
+    pub const fn line(self) -> u8 {
+        self.line
+    }
+
+    /// Returns the PCI interrupt pin number (`1` is INTA#).
+    pub const fn pin(self) -> u8 {
+        self.pin
+    }
+}
+
+/// Linear proof that one claimed INTx owner is in the masked state.
+///
+/// Private owner/epoch fields prevent downstream code from manufacturing or
+/// replaying a token for a foreign [`Root`]. The token is intentionally neither
+/// `Clone` nor `Copy`.
+#[must_use = "retain the masked token until INTx is deliberately unmasked"]
+pub struct MaskedIntx {
+    owner_id: u64,
+    epoch: u64,
+    route: IntxRoute,
+}
+
+impl MaskedIntx {
+    /// Returns the descriptive route without duplicating this state token.
+    pub const fn route(&self) -> IntxRoute {
+        self.route
+    }
+}
+
+/// Linear proof that one claimed INTx owner is in the unmasked state.
+#[must_use = "mask INTx again before dismantling interrupt ownership"]
+pub struct UnmaskedIntx {
+    owner_id: u64,
+    epoch: u64,
+    route: IntxRoute,
+}
+
+impl UnmaskedIntx {
+    /// Returns the descriptive route without consuming the state token.
+    pub const fn route(&self) -> IntxRoute {
+        self.route
+    }
+}
+
+/// Rejection from claiming or transitioning an INTx owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntxTransitionError {
+    /// This root already issued its unique initial masked token.
+    AlreadyClaimed,
+    /// The fixed fixture has no usable firmware-programmed INTx route.
+    InvalidRoute,
+    /// The token belongs to another root or route.
+    ForeignOwner,
+    /// The root is not in the state consumed by this transition.
+    WrongState,
+    /// The token names an earlier transition epoch.
+    StaleEpoch,
+    /// PCI command observation did not support the requested transition.
+    CommandReadbackMismatch {
+        /// Requested state of `Command::INTERRUPT_DISABLE`.
+        expected_masked: bool,
+        /// State observed at a failed precondition or after the command write.
+        observed_masked: bool,
+        /// A command write changed a bit other than `INTERRUPT_DISABLE`.
+        other_bits_changed: bool,
+        /// Exact restoration failed and the root entered a poisoned state.
+        poisoned: bool,
+    },
+}
+
+/// A failed transition which returns the original linear input token.
+///
+/// When [`IntxTransitionError::CommandReadbackMismatch`] reports
+/// `poisoned: true`, the returned token is retained only as evidence and is no
+/// longer accepted; use [`Root::recover_masked_intx_fail_closed`] to invalidate
+/// it and converge to a new masked epoch.
+#[must_use = "inspect the error and retry or retain the returned INTx token"]
+pub struct IntxTransitionFailure<T> {
+    error: IntxTransitionError,
+    token: T,
+}
+
+impl<T> IntxTransitionFailure<T> {
+    /// Returns the exact owner/state validation error.
+    pub const fn error(&self) -> IntxTransitionError {
+        self.error
+    }
+
+    /// Borrows the unchanged input token.
+    pub const fn token(&self) -> &T {
+        &self.token
+    }
+
+    /// Recovers the unchanged linear token for the correct owner or epoch.
+    pub fn into_token(self) -> T {
+        self.token
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IntxOwnershipState {
+    Unclaimed,
+    Masked { epoch: u64 },
+    Unmasked { epoch: u64 },
+    Poisoned { epoch: u64, observed_masked: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedIntxState {
+    Masked,
+    Unmasked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IntxCommandObservation {
+    before: Command,
+    expected: Command,
+    observed: Command,
+}
+
+impl IntxCommandObservation {
+    fn is_exact(self) -> bool {
+        self.observed == self.expected
+    }
+
+    fn observed_masked(self) -> bool {
+        self.observed.contains(Command::INTERRUPT_DISABLE)
+    }
+
+    fn other_bits_changed(self) -> bool {
+        self.observed.difference(Command::INTERRUPT_DISABLE)
+            != self.before.difference(Command::INTERRUPT_DISABLE)
+    }
+
+    fn error(self, expected_masked: bool, poisoned: bool) -> IntxTransitionError {
+        IntxTransitionError::CommandReadbackMismatch {
+            expected_masked,
+            observed_masked: self.observed_masked(),
+            other_bits_changed: self.other_bits_changed(),
+            poisoned,
+        }
+    }
+}
+
+const fn decode_intx_route(device_bdf: DeviceBdf, interrupt_config: u32) -> IntxRoute {
+    IntxRoute {
+        device_bdf,
+        line: interrupt_config as u8,
+        pin: (interrupt_config >> 8) as u8,
+    }
+}
+
+const fn command_with_intx_mask(command: Command, masked: bool) -> Command {
+    if masked {
+        command.union(Command::INTERRUPT_DISABLE)
+    } else {
+        command.difference(Command::INTERRUPT_DISABLE)
+    }
+}
+
+fn allocate_intx_owner_id() -> u64 {
+    NEXT_INTX_OWNER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .expect("INTx owner identity exhausted")
+}
+
+fn next_intx_epoch(epoch: u64) -> u64 {
+    epoch
+        .checked_add(1)
+        .expect("INTx transition epoch exhausted")
+}
+
 impl DeviceBdf {
     /// Constructs descriptive PCI coordinates without claiming hardware.
     pub const fn from_coordinates(bus: u8, device: u8, function: u8) -> Self {
@@ -153,6 +355,9 @@ pub struct Root {
     inner: RawRoot,
     device_function: DeviceFunction,
     memory_bars: usize,
+    intx_route: IntxRoute,
+    intx_owner_id: u64,
+    intx_state: IntxOwnershipState,
     portal_claimed: bool,
 }
 
@@ -167,6 +372,186 @@ impl Root {
 
     pub const fn memory_bar_count(&self) -> usize {
         self.memory_bars
+    }
+
+    /// Returns the fixed fixture's route read from PCI configuration `0x3c`.
+    ///
+    /// This copyable value is descriptive only. It cannot claim, mask, or
+    /// unmask INTx; only the root's linear owner-state methods can do so.
+    pub const fn intx_route(&self) -> IntxRoute {
+        self.intx_route
+    }
+
+    /// Claims the root's unique INTx lifecycle in the masked state.
+    ///
+    /// This method succeeds at most once for a root. It validates the fixed
+    /// route, masks the function with complete command readback, installs the
+    /// first owner epoch, and returns the only token which can be unmasked.
+    pub fn claim_masked_intx(&mut self) -> Result<MaskedIntx, IntxTransitionError> {
+        if self.intx_state != IntxOwnershipState::Unclaimed {
+            return Err(IntxTransitionError::AlreadyClaimed);
+        }
+        if !self.has_valid_intx_route() {
+            return Err(IntxTransitionError::InvalidRoute);
+        }
+        let epoch = 1;
+        let observation = set_intx_mask(self, true);
+        if !observation.is_exact() {
+            self.intx_state = IntxOwnershipState::Poisoned {
+                epoch,
+                observed_masked: observation.observed_masked(),
+            };
+            return Err(observation.error(true, true));
+        }
+        self.intx_state = IntxOwnershipState::Masked { epoch };
+        Ok(MaskedIntx {
+            owner_id: self.intx_owner_id,
+            epoch,
+            route: self.intx_route,
+        })
+    }
+
+    /// Unmasks legacy INTx by consuming the current masked owner epoch.
+    ///
+    /// Foreign, wrong-state, and stale tokens are rejected before hardware is
+    /// touched and returned unchanged. If hardware was unexpectedly already
+    /// unmasked, the facade masks it again before returning an error.
+    pub fn unmask_intx(
+        &mut self,
+        masked: MaskedIntx,
+    ) -> Result<UnmaskedIntx, IntxTransitionFailure<MaskedIntx>> {
+        if let Err(error) = self.validate_intx_token(
+            masked.owner_id,
+            masked.epoch,
+            masked.route,
+            ExpectedIntxState::Masked,
+        ) {
+            return Err(IntxTransitionFailure {
+                error,
+                token: masked,
+            });
+        }
+        let epoch = next_intx_epoch(masked.epoch);
+        let (_, observed_before_unmask) = self.inner.get_status_command(self.device_function);
+        if !observed_before_unmask.contains(Command::INTERRUPT_DISABLE) {
+            let recovery = set_intx_mask(self, true);
+            if !recovery.is_exact() {
+                self.intx_state = IntxOwnershipState::Poisoned {
+                    epoch: masked.epoch,
+                    observed_masked: recovery.observed_masked(),
+                };
+                return Err(IntxTransitionFailure {
+                    error: recovery.error(true, true),
+                    token: masked,
+                });
+            }
+            return Err(IntxTransitionFailure {
+                error: IntxTransitionError::CommandReadbackMismatch {
+                    expected_masked: true,
+                    observed_masked: false,
+                    other_bits_changed: false,
+                    poisoned: false,
+                },
+                token: masked,
+            });
+        }
+        let observation = set_intx_mask(self, false);
+        if !observation.is_exact() {
+            let restored = restore_intx_command(self, observation.before);
+            let poisoned = restored != observation.before;
+            if poisoned {
+                self.intx_state = IntxOwnershipState::Poisoned {
+                    epoch: masked.epoch,
+                    observed_masked: restored.contains(Command::INTERRUPT_DISABLE),
+                };
+            }
+            return Err(IntxTransitionFailure {
+                error: observation.error(false, poisoned),
+                token: masked,
+            });
+        }
+        self.intx_state = IntxOwnershipState::Unmasked { epoch };
+        Ok(UnmaskedIntx {
+            owner_id: self.intx_owner_id,
+            epoch,
+            route: self.intx_route,
+        })
+    }
+
+    /// Masks legacy INTx by consuming the current unmasked owner epoch.
+    ///
+    /// Foreign, wrong-state, and stale tokens are rejected before hardware is
+    /// touched and returned unchanged. A matching token always converges the
+    /// hardware and root state to masked, including recovery when hardware was
+    /// already fail-closed.
+    pub fn mask_intx(
+        &mut self,
+        unmasked: UnmaskedIntx,
+    ) -> Result<MaskedIntx, IntxTransitionFailure<UnmaskedIntx>> {
+        if let Err(error) = self.validate_intx_token(
+            unmasked.owner_id,
+            unmasked.epoch,
+            unmasked.route,
+            ExpectedIntxState::Unmasked,
+        ) {
+            return Err(IntxTransitionFailure {
+                error,
+                token: unmasked,
+            });
+        }
+
+        let epoch = next_intx_epoch(unmasked.epoch);
+        let observation = set_intx_mask(self, true);
+        if !observation.is_exact() {
+            let restored = restore_intx_command(self, observation.before);
+            let poisoned = restored != observation.before;
+            if poisoned {
+                self.intx_state = IntxOwnershipState::Poisoned {
+                    epoch: unmasked.epoch,
+                    observed_masked: restored.contains(Command::INTERRUPT_DISABLE),
+                };
+            }
+            return Err(IntxTransitionFailure {
+                error: observation.error(true, poisoned),
+                token: unmasked,
+            });
+        }
+        self.intx_state = IntxOwnershipState::Masked { epoch };
+        Ok(MaskedIntx {
+            owner_id: self.intx_owner_id,
+            epoch,
+            route: self.intx_route,
+        })
+    }
+
+    /// Converges any previously claimed INTx lifecycle to a new masked epoch.
+    ///
+    /// This is the one-way fail-closed recovery path for a dropped token,
+    /// teardown uncertainty, or poisoned command readback. It can never unmask
+    /// INTx. A successful call invalidates every older masked or unmasked token
+    /// and returns the only token for the new masked epoch.
+    pub fn recover_masked_intx_fail_closed(&mut self) -> Result<MaskedIntx, IntxTransitionError> {
+        let current_epoch = match self.intx_state {
+            IntxOwnershipState::Unclaimed => return Err(IntxTransitionError::WrongState),
+            IntxOwnershipState::Masked { epoch }
+            | IntxOwnershipState::Unmasked { epoch }
+            | IntxOwnershipState::Poisoned { epoch, .. } => epoch,
+        };
+        let epoch = next_intx_epoch(current_epoch);
+        let observation = set_intx_mask(self, true);
+        if !observation.is_exact() {
+            self.intx_state = IntxOwnershipState::Poisoned {
+                epoch,
+                observed_masked: observation.observed_masked(),
+            };
+            return Err(observation.error(true, true));
+        }
+        self.intx_state = IntxOwnershipState::Masked { epoch };
+        Ok(MaskedIntx {
+            owner_id: self.intx_owner_id,
+            epoch,
+            route: self.intx_route,
+        })
     }
 
     pub(crate) const fn device_function(&self) -> DeviceFunction {
@@ -188,6 +573,82 @@ impl Root {
             self.device_function, device_function,
             "foreign PCI root owner"
         );
+    }
+
+    const fn has_valid_intx_route(&self) -> bool {
+        self.intx_route.line != INTX_NOT_CONNECTED && self.intx_route.pin == EXPECTED_INTX_PIN
+    }
+
+    fn validate_intx_token(
+        &self,
+        owner_id: u64,
+        epoch: u64,
+        route: IntxRoute,
+        expected: ExpectedIntxState,
+    ) -> Result<(), IntxTransitionError> {
+        if owner_id != self.intx_owner_id || route != self.intx_route {
+            return Err(IntxTransitionError::ForeignOwner);
+        }
+        let current_epoch = match (self.intx_state, expected) {
+            (IntxOwnershipState::Masked { epoch }, ExpectedIntxState::Masked)
+            | (IntxOwnershipState::Unmasked { epoch }, ExpectedIntxState::Unmasked) => epoch,
+            _ => return Err(IntxTransitionError::WrongState),
+        };
+        if current_epoch != epoch {
+            return Err(IntxTransitionError::StaleEpoch);
+        }
+        Ok(())
+    }
+
+    fn assert_intx_state_matches_readback(&self) {
+        let (_, command) = self.inner.get_status_command(self.device_function);
+        self.assert_intx_state_matches_command(command);
+    }
+
+    fn assert_intx_state_matches_command(&self, command: Command) {
+        let masked = command.contains(Command::INTERRUPT_DISABLE);
+        match self.intx_state {
+            IntxOwnershipState::Unclaimed => {}
+            IntxOwnershipState::Masked { .. } => {
+                assert!(masked, "masked INTx owner disagrees with PCI command")
+            }
+            IntxOwnershipState::Unmasked { .. } => {
+                assert!(!masked, "unmasked INTx owner disagrees with PCI command")
+            }
+            IntxOwnershipState::Poisoned {
+                observed_masked, ..
+            } => assert_eq!(
+                masked, observed_masked,
+                "poisoned INTx observation disagrees with PCI command"
+            ),
+        }
+    }
+
+    fn assert_internal_mask_allowed(&self) {
+        assert!(
+            matches!(
+                self.intx_state,
+                IntxOwnershipState::Unclaimed | IntxOwnershipState::Masked { .. }
+            ),
+            "recover or mask INTx through its linear owner-state API first"
+        );
+        self.assert_intx_state_matches_readback();
+    }
+
+    fn observe_internal_command_or_poison(&mut self, expected: Command, observed: Command) {
+        if observed != expected {
+            if let IntxOwnershipState::Masked { epoch }
+            | IntxOwnershipState::Unmasked { epoch }
+            | IntxOwnershipState::Poisoned { epoch, .. } = self.intx_state
+            {
+                self.intx_state = IntxOwnershipState::Poisoned {
+                    epoch,
+                    observed_masked: observed.contains(Command::INTERRUPT_DISABLE),
+                };
+            }
+            panic!("PCI command readback mismatch");
+        }
+        self.assert_intx_state_matches_command(observed);
     }
 }
 
@@ -248,7 +709,8 @@ static BAR_REGISTRY: SpinLock<BarRegistry> = SpinLock::new(BarRegistry::new());
 /// Discovers exactly one modern VirtIO block device on bus 0 and installs one
 /// owner for each of its memory BARs before raw capability pointers are made.
 pub fn discover_and_own_bars() -> Root {
-    let mut root = RawRoot::new(PioConfigurationAccess::acquire());
+    let configuration = PioConfigurationAccess::acquire();
+    let mut root = RawRoot::new(configuration.clone());
     let mut found = None;
 
     for (device_function, info) in root.enumerate_bus(0) {
@@ -289,14 +751,41 @@ pub fn discover_and_own_bars() -> Root {
     }
 
     assert_ne!(memory_bars, 0, "VirtIO device has no memory BAR");
+    let intx_route = decode_intx_route(
+        DeviceBdf::from(device_function),
+        configuration.read_word(device_function, INTERRUPT_CONFIG_OFFSET),
+    );
     registry.installed = true;
     drop(registry);
     Root {
         inner: root,
         device_function,
         memory_bars,
+        intx_route,
+        intx_owner_id: allocate_intx_owner_id(),
+        intx_state: IntxOwnershipState::Unclaimed,
         portal_claimed: false,
     }
+}
+
+fn set_intx_mask(root: &mut Root, masked: bool) -> IntxCommandObservation {
+    let device_function = root.device_function;
+    let (_, before) = root.inner.get_status_command(device_function);
+    let expected = command_with_intx_mask(before, masked);
+    root.inner.set_command(device_function, expected);
+    let (_, observed) = root.inner.get_status_command(device_function);
+    IntxCommandObservation {
+        before,
+        expected,
+        observed,
+    }
+}
+
+fn restore_intx_command(root: &mut Root, command: Command) -> Command {
+    let device_function = root.device_function;
+    root.inner.set_command(device_function, command);
+    let (_, observed) = root.inner.get_status_command(device_function);
+    observed
 }
 
 pub(crate) fn enable_device_for_prepare(
@@ -304,11 +793,13 @@ pub(crate) fn enable_device_for_prepare(
     device_function: DeviceFunction,
 ) -> Command {
     root.assert_device(device_function);
+    root.assert_internal_mask_allowed();
     let (_, command) = root.inner.get_status_command(device_function);
-    root.inner.set_command(
-        device_function,
-        command | Command::MEMORY_SPACE | Command::BUS_MASTER | Command::INTERRUPT_DISABLE,
-    );
+    let expected =
+        command | Command::MEMORY_SPACE | Command::BUS_MASTER | Command::INTERRUPT_DISABLE;
+    root.inner.set_command(device_function, expected);
+    let (_, observed) = root.inner.get_status_command(device_function);
+    root.observe_internal_command_or_poison(expected, observed);
     command
 }
 
@@ -324,19 +815,17 @@ pub(crate) fn restore_device_command(
     root.assert_device(device_function);
     root.inner.set_command(device_function, command);
     let (_, observed) = root.inner.get_status_command(device_function);
-    assert_eq!(observed, command);
+    root.observe_internal_command_or_poison(command, observed);
 }
 
 pub(crate) fn disable_bus_master(root: &mut Root, device_function: DeviceFunction) {
     root.assert_device(device_function);
+    root.assert_internal_mask_allowed();
     let (_, command) = root.inner.get_status_command(device_function);
-    root.inner.set_command(
-        device_function,
-        (command & !Command::BUS_MASTER) | Command::INTERRUPT_DISABLE,
-    );
+    let expected = (command & !Command::BUS_MASTER) | Command::INTERRUPT_DISABLE;
+    root.inner.set_command(device_function, expected);
     let (_, observed) = root.inner.get_status_command(device_function);
-    assert!(!observed.contains(Command::BUS_MASTER));
-    assert!(observed.contains(Command::INTERRUPT_DISABLE));
+    root.observe_internal_command_or_poison(expected, observed);
 }
 
 /// Returns a BAR-subrange pointer while the registry retains the unique
@@ -377,4 +866,94 @@ pub(crate) unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<
     }
 
     panic!("VirtIO requested MMIO outside retained BAR owners");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE: &str = include_str!("pci.rs");
+
+    #[test]
+    fn interrupt_config_word_decodes_line_and_pin_bytes() {
+        let bdf = DeviceBdf::from_coordinates(0, 5, 0);
+        let route = decode_intx_route(bdf, 0xa5_5a_02_0b);
+        assert_eq!(route.device_bdf(), bdf);
+        assert_eq!(route.line(), 0x0b);
+        assert_eq!(route.pin(), 0x02);
+    }
+
+    #[test]
+    fn intx_command_transition_changes_only_interrupt_disable() {
+        let original = Command::MEMORY_SPACE
+            | Command::BUS_MASTER
+            | Command::PARITY_ERROR_RESPONSE
+            | Command::SERR_ENABLE;
+        let masked = command_with_intx_mask(original, true);
+        assert!(masked.contains(Command::INTERRUPT_DISABLE));
+        assert_eq!(masked.difference(Command::INTERRUPT_DISABLE), original);
+
+        let unmasked = command_with_intx_mask(masked, false);
+        assert!(!unmasked.contains(Command::INTERRUPT_DISABLE));
+        assert_eq!(unmasked, original);
+
+        let exact = IntxCommandObservation {
+            before: original,
+            expected: masked,
+            observed: masked,
+        };
+        assert!(exact.is_exact());
+        assert!(!exact.other_bits_changed());
+        let collateral = IntxCommandObservation {
+            before: original,
+            expected: masked,
+            observed: masked | Command::IO_SPACE,
+        };
+        assert!(!collateral.is_exact());
+        assert!(collateral.other_bits_changed());
+    }
+
+    #[test]
+    fn intx_masking_api_preserves_owner_checked_typestate_shape() {
+        let implementation = SOURCE
+            .split_once("#[cfg(test)]")
+            .expect("test module follows implementation")
+            .0;
+        assert!(implementation.contains(
+            "pub struct MaskedIntx {\n    owner_id: u64,\n    epoch: u64,\n    route: IntxRoute,"
+        ));
+        assert!(implementation.contains(
+            "pub struct UnmaskedIntx {\n    owner_id: u64,\n    epoch: u64,\n    route: IntxRoute,"
+        ));
+        assert!(implementation.contains(
+            "pub fn claim_masked_intx(&mut self) -> Result<MaskedIntx, IntxTransitionError>"
+        ));
+        assert!(implementation.contains("pub fn unmask_intx("));
+        assert!(implementation.contains("masked: MaskedIntx,"));
+        assert!(implementation.contains("IntxTransitionFailure<MaskedIntx>"));
+        assert!(implementation.contains("pub fn mask_intx("));
+        assert!(implementation.contains("unmasked: UnmaskedIntx,"));
+        assert!(implementation.contains("IntxTransitionFailure<UnmaskedIntx>"));
+        assert!(implementation.contains("intx_state: IntxOwnershipState,"));
+        assert!(implementation.contains("Poisoned { epoch: u64, observed_masked: bool }"));
+        assert!(implementation.contains("pub fn recover_masked_intx_fail_closed("));
+        assert!(implementation.contains("IntxCommandObservation"));
+        assert!(implementation.contains("self.validate_intx_token("));
+        assert!(implementation.contains("return Err(IntxTransitionFailure {"));
+        assert!(implementation.contains("let (_, observed) = root.inner.get_status_command"));
+        assert!(!implementation.contains("pub fn mask_intx(&mut self, route: IntxRoute)"));
+        assert!(!implementation.contains("#[derive(Clone, Copy)]\npub struct MaskedIntx"));
+        assert!(!implementation.contains("#[derive(Clone, Copy)]\npub struct UnmaskedIntx"));
+
+        let unmask_epoch = implementation
+            .find("let epoch = next_intx_epoch(masked.epoch);")
+            .unwrap();
+        let unmask_write = implementation.find("set_intx_mask(self, false);").unwrap();
+        assert!(unmask_epoch < unmask_write);
+        let mask_epoch = implementation
+            .find("let epoch = next_intx_epoch(unmasked.epoch);")
+            .unwrap();
+        let mask_write = implementation.rfind("set_intx_mask(self, true);").unwrap();
+        assert!(mask_epoch < mask_write);
+    }
 }

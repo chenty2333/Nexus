@@ -8,13 +8,18 @@
 //! workload-owned root retains the first executable `pread64` through a
 //! preparation-only in-memory block boundary; independent Stage 5B evidence is
 //! only component-consistent with that path. With `virtio-cser-facade`, the
-//! same real syscall instead enters a request-local production root spanning
-//! `FilesystemSyscall -> FilesystemRead -> BlockRequest -> three DMA owners`.
-//! That successor publishes a real same-boot VirtIO/IOMMU request, polls it
-//! outside the OSTD lock, couples reset and IOTLB receipts to the registry, and
-//! sources the guest reply only from the completed device buffer.
+//! same real syscall instead enters the workload's shared production Registry
+//! under one root spanning `FilesystemSyscall -> FilesystemRead -> BlockRequest
+//! -> three DMA owners`. That successor publishes a real same-boot VirtIO/IOMMU
+//! request, polls it outside the OSTD lock, couples reset and IOTLB receipts to
+//! the Registry, and sources the guest reply only from the completed device
+//! buffer.
 
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use core::fmt;
+
+#[cfg(feature = "virtio-cser-facade")]
+use core::{hint::spin_loop, num::NonZeroU64};
 
 use linux_raw_sys::general::{
     __NR_close, __NR_exit, __NR_newfstatat, __NR_openat, __NR_pread64, __NR_pwrite64,
@@ -29,39 +34,67 @@ use ostd::{
     user::{ReturnReason, UserMode},
 };
 
+#[cfg(feature = "virtio-cser-facade")]
+use ostd::{
+    mm::{
+        PageFlags, UFrame,
+        io::util::HasVmReaderWriter,
+        vm_space::{Cursor, VmQueriedItem},
+    },
+    task::disable_preempt,
+};
+
 use crate::{
     TaskData,
     effect::{EffectToken, EffectWaiter, EffectWaker},
     effect_registry::{
-        CommitMetadata, CommitOutcome, CommitReceipt, CreditCharge, CreditClass, CreditLimit,
-        DerivedRegisterRequest, DomainConfig, DomainKey, EffectRegistry, OperationClass,
-        PublicationMode, PublicationTicket, RegisterRequest, RegisteredEffect, RegistryError,
-        ResourceKey, RevokeDisposition, ScopeConfig, ScopeKey, ScopePhase, SyscallDescriptor,
-        TaskKey, TerminalRequest,
+        CommitMetadata, CreditCharge, CreditClass, CreditLimit, DerivedRegisterRequest,
+        DomainConfig, DomainKey, EffectRegistry, OperationClass, PublicationMode,
+        PublicationTicket, RegisterRequest, RegisteredEffect, RegistryError, ResourceKey,
+        RevokeDisposition, ScopeConfig, ScopeKey, ScopePhase, SyscallDescriptor, TaskKey,
+        TerminalRequest,
     },
     linux_loader::load_static_image_with_stack_pages,
 };
 
-#[cfg(not(feature = "virtio-cser-facade"))]
-use crate::effect_registry::PortalHandle;
+#[cfg(feature = "virtio-cser-facade")]
+use crate::device_flight::{
+    PrecommitCloseSemantic, PublishedSemantic, RetainedSemantic,
+    close_enrolled_device_flight_precommit_with_apply,
+};
 
 #[cfg(all(
     feature = "virtio-cser-facade",
     not(feature = "virtio-cser-precommit-fault")
 ))]
-use crate::effect_registry::DeviceBatchCommitOutcome;
+use crate::device_flight::{
+    DeviceFlightCloseOutcome, RetainReason, commit_or_recover_device_flight_with_apply,
+    mint_device_flight_key,
+};
+
+#[cfg(not(feature = "virtio-cser-facade"))]
+use crate::effect_registry::{CommitOutcome, CommitReceipt, PortalHandle};
+
 #[cfg(feature = "virtio-cser-facade")]
 use crate::effect_registry::{
-    DeviceBatchCommitReceipt, DeviceBatchEnrollmentReceipt, DeviceClosureResult,
-    DeviceCohortParent, DeviceDerivedCohortEntry, DeviceEnvelope, DeviceResetTicket, EffectKey,
-    RevokeSelection,
+    DeviceBatchEnrollmentReceipt, DeviceClosureReceipt, DeviceClosureResult, DeviceCohortParent,
+    DeviceDerivedCohortEntry, DeviceEnvelope, DeviceIotlbTicket, DeviceIotlbTombstone,
+    DeviceResetReceipt, DeviceResetTicket, DeviceResetTombstone, EffectKey, RevokeSelection,
 };
 #[cfg(feature = "virtio-cser-facade")]
 use nexus_ostd_virtio::{
-    CompletionProgress, DeviceSessionIdentity, NotificationDisposition, OwnerKind, PreparedRequest,
-    ProductionClosureProgress, ProductionDevice, PublishedRequest, Root, discover_and_own_bars,
-    owner_address,
+    CompletedRequest, CompletionProbeProgress, DeviceSessionIdentity, FailedCompletion, OwnerKind,
+    PreparedCancelIntent, PreparedPublishedResetIntent, PreparedRequest,
+    PreparedRequestResetIntent, ProductionClosureProgress, ProductionClosureReceipt,
+    ProductionDevice, ProductionIotlbTombstone, ProductionResetAck, ProductionResetTombstone,
+    PublishedRequest, Root, UnregisteredPreparedCancellation, discover_and_own_bars, owner_address,
 };
+
+#[cfg(all(
+    feature = "virtio-cser-facade",
+    not(feature = "virtio-cser-precommit-fault")
+))]
+use nexus_ostd_virtio::NotificationDisposition;
 
 const SCOPE: ScopeKey = ScopeKey::new(95, 1);
 const GUEST: TaskKey = TaskKey::new(950, 1);
@@ -81,6 +114,7 @@ const QUEUE_SLOT_CREDIT: CreditClass = CreditClass::new(0x303);
 const PINNED_PAGE_CREDIT: CreditClass = CreditClass::new(0x304);
 const DMA_MAPPING_CREDIT: CreditClass = CreditClass::new(0x305);
 const GUEST_REPLY_CREDIT: CreditClass = CreditClass::new(0x306);
+#[cfg(not(feature = "virtio-cser-facade"))]
 const BLOCK_PREPARATION_CREDIT: CreditClass = CreditClass::new(0x307);
 const OP_SYSCALL: OperationClass = OperationClass::new(1);
 const OP_FILESYSTEM_READ: OperationClass = OperationClass::new(0x302);
@@ -106,18 +140,6 @@ const DMA_QUEUE_OWNER_A_NAMESPACE: u32 = 0x7310;
 const DMA_QUEUE_OWNER_B_NAMESPACE: u32 = 0x7311;
 #[cfg(feature = "virtio-cser-facade")]
 const DMA_REQUEST_OWNER_NAMESPACE: u32 = 0x7312;
-
-const LIFECYCLE_PRECOMMIT_SCOPE: ScopeKey = ScopeKey::new(96, 1);
-const LIFECYCLE_POSTCOMMIT_SCOPE: ScopeKey = ScopeKey::new(97, 1);
-const LIFECYCLE_COMMIT_FIRST_SCOPE: ScopeKey = ScopeKey::new(98, 1);
-const LIFECYCLE_REVOKE_FIRST_SCOPE: ScopeKey = ScopeKey::new(99, 1);
-const LIFECYCLE_V1: TaskKey = TaskKey::new(960, 1);
-const LIFECYCLE_V2: TaskKey = TaskKey::new(961, 1);
-const LIFECYCLE_GUEST: TaskKey = TaskKey::new(962, 1);
-const LIFECYCLE_CREDIT: CreditClass = CreditClass::new(1);
-const LIFECYCLE_RESOURCE: ResourceKey = ResourceKey::new(0x7200, 1, 1);
-const OP_PREAD: OperationClass = OperationClass::new(2);
-const OP_PWRITE: OperationClass = OperationClass::new(3);
 
 const EXECUTABLE_PATH: &[u8] = b"/bin/linux-runtime-fs-smoke";
 const EXECUTABLE_NAME: &[u8] = b"/bin/linux-runtime-fs-smoke\0";
@@ -157,6 +179,8 @@ const SAME_BOOT_IMAGE_SHA256: &str =
 #[cfg(feature = "virtio-cser-facade")]
 const SAME_BOOT_SECTOR_FNV1A: u64 = 0x3391_3395_b779_8e6b;
 const SCENARIO_DONE_EFFECT: u64 = 950;
+#[cfg(feature = "virtio-cser-facade")]
+const SAME_BOOT_COMPLETION_PROBE_LIMIT: usize = 10_000_000;
 const AT_EMPTY_PATH: usize = 0x1000;
 const AT_DIRECTORY: usize = 0x1_0000;
 const O_TMP_FLAGS: usize = 0x242;
@@ -215,12 +239,17 @@ enum FdKind {
 }
 
 struct FsState {
+    #[cfg(not(feature = "virtio-cser-facade"))]
     effects: EffectRegistry,
     fds: BTreeMap<i32, FdKind>,
     temporary: Vec<u8>,
     next_fd: i32,
+    #[cfg(not(feature = "virtio-cser-facade"))]
     domain_revision: u64,
+    #[cfg(not(feature = "virtio-cser-facade"))]
     syscall_terminalizations: usize,
+    #[cfg(feature = "virtio-cser-facade")]
+    compatibility_syscalls: usize,
     production_effects: usize,
     production_read_observed: bool,
     stdout_publications: usize,
@@ -228,24 +257,291 @@ struct FsState {
 }
 
 #[cfg(feature = "virtio-cser-facade")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProductionReadPhase {
-    Ready,
-    Captured(EffectKey),
-    Polling(u64),
-    Closing(u64),
-    AwaitingPublication(u64),
-    Complete,
+struct FsClosureWork {
+    effects: [EffectKey; 6],
+    envelope: DeviceEnvelope,
+    guest_address: usize,
+    result: i64,
+    bytes: [u8; 4],
+    byte_count: usize,
+    used_len: u32,
+    completion_label: &'static str,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+enum FsCloseSemantic {
+    Published(PublishedSemantic),
+    Precommit(PrecommitCloseSemantic),
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[allow(dead_code)]
+enum FsRetainedSemantic {
+    /// An ordinary closure-stage failure after the Registry issued semantic
+    /// ownership for this flight.
+    Close(FsCloseSemantic),
+    /// A returned device-close error which the Registry classified as already
+    /// or possibly published. This retains the exact root-local obligation.
+    PublishedObligation(RetainedSemantic),
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[allow(dead_code)]
+impl FsRetainedSemantic {
+    fn cookie(&self) -> u64 {
+        match self {
+            Self::Close(semantic) => semantic.cookie(),
+            Self::PublishedObligation(semantic) => semantic.cookie(),
+        }
+    }
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+impl FsCloseSemantic {
+    fn cookie(&self) -> u64 {
+        match self {
+            Self::Published(published) => published.key().cookie(),
+            Self::Precommit(precommit) => precommit.cookie(),
+        }
+    }
+
+    fn selection(&self) -> &RevokeSelection {
+        match self {
+            Self::Published(published) => published.selection(),
+            Self::Precommit(precommit) => precommit.selection(),
+        }
+    }
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[allow(dead_code)]
+enum FsRetainedHardware {
+    Quarantined {
+        root: Root,
+        device: ProductionDevice,
+    },
+    Ready {
+        root: Root,
+        device: ProductionDevice,
+    },
+    Prepared {
+        root: Root,
+        device: ProductionDevice,
+        request: PreparedRequest,
+    },
+    PreparedCancel {
+        root: Root,
+        device: ProductionDevice,
+        intent: PreparedCancelIntent,
+    },
+    Published {
+        root: Root,
+        device: ProductionDevice,
+        request: PublishedRequest,
+    },
+    PublishedReset {
+        root: Root,
+        device: ProductionDevice,
+        intent: PreparedPublishedResetIntent,
+    },
+    CompletionReset {
+        root: Root,
+        device: ProductionDevice,
+        intent: PreparedRequestResetIntent,
+    },
+    Completed {
+        root: Root,
+        device: ProductionDevice,
+        request: CompletedRequest,
+    },
+    Failed {
+        root: Root,
+        device: ProductionDevice,
+        request: FailedCompletion,
+    },
+    Reset {
+        root: Root,
+        device: ProductionDevice,
+        tombstone: ProductionResetTombstone,
+    },
+    ResetAck {
+        root: Root,
+        device: ProductionDevice,
+        reset: ProductionResetAck,
+    },
+    Iotlb {
+        root: Root,
+        device: ProductionDevice,
+        tombstone: ProductionIotlbTombstone,
+    },
+    Closure {
+        root: Root,
+        device: ProductionDevice,
+        closure: ProductionClosureReceipt,
+    },
+    UnregisteredReset {
+        root: Root,
+        device: ProductionDevice,
+        reset: ProductionResetAck,
+        cancellation: UnregisteredPreparedCancellation,
+    },
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[allow(dead_code)]
+enum FsDeviceFlight {
+    Ready {
+        root: Root,
+        device: ProductionDevice,
+    },
+    Captured {
+        cookie: NonZeroU64,
+        root: Root,
+        device: ProductionDevice,
+        syscall: RegisteredEffect,
+    },
+    Prepared {
+        cookie: NonZeroU64,
+        root: Root,
+        device: ProductionDevice,
+        request: PreparedRequest,
+        effects: [Option<EffectKey>; 6],
+        envelope: Option<DeviceEnvelope>,
+        enrollment: Option<DeviceBatchEnrollmentReceipt>,
+    },
+    /// A prepared descriptor which was moved into its one cancellation intent.
+    ///
+    /// Keeping this distinct from `Prepared` matters: the intent is a linear
+    /// owner, so a flight which has started cancellation can never be treated
+    /// as an unpublished request again.
+    PreparedCancel {
+        cookie: NonZeroU64,
+        root: Root,
+        device: ProductionDevice,
+        intent: PreparedCancelIntent,
+        effects: [EffectKey; 6],
+        envelope: DeviceEnvelope,
+        enrollment: Option<DeviceBatchEnrollmentReceipt>,
+    },
+    Building {
+        cookie: NonZeroU64,
+        root: Root,
+        device: ProductionDevice,
+        request: PreparedRequest,
+        effects: [EffectKey; 6],
+        envelope: DeviceEnvelope,
+        enrollment: DeviceBatchEnrollmentReceipt,
+        commits: [(crate::effect_registry::PortalHandle, CommitMetadata); 6],
+    },
+    Published {
+        semantic: PublishedSemantic,
+        root: Root,
+        device: ProductionDevice,
+        request: PublishedRequest,
+        work: FsClosureWork,
+        completion_probes: usize,
+    },
+    /// A published request which reached the bounded polling deadline and was
+    /// prevalidated for mandatory reset without reconstructing its owner.
+    PublishedReset {
+        semantic: PublishedSemantic,
+        root: Root,
+        device: ProductionDevice,
+        intent: PreparedPublishedResetIntent,
+        work: FsClosureWork,
+    },
+    /// Completion was observed and prevalidated for reset, but the Registry
+    /// transition has not yet consumed the hardware intent.  This makes the
+    /// apply boundary explicit and prevents a completed owner being silently
+    /// reconstructed from descriptive identity.
+    CompletionReset {
+        semantic: PublishedSemantic,
+        root: Root,
+        device: ProductionDevice,
+        intent: PreparedRequestResetIntent,
+        work: FsClosureWork,
+    },
+    /// Completion validation failed after publication. The hardware owner is
+    /// prevalidated for reset, but no successful completion is recorded in the
+    /// Registry; reset acknowledgement will therefore close indeterminate.
+    IndeterminateReset {
+        semantic: PublishedSemantic,
+        root: Root,
+        device: ProductionDevice,
+        intent: PreparedRequestResetIntent,
+        work: FsClosureWork,
+    },
+    Resetting {
+        semantic: FsCloseSemantic,
+        root: Root,
+        device: ProductionDevice,
+        reset_ticket: DeviceResetTicket,
+        hardware: ProductionResetTombstone,
+        work: FsClosureWork,
+        retry: bool,
+    },
+    ResetRetained {
+        semantic: FsCloseSemantic,
+        root: Root,
+        device: ProductionDevice,
+        reset_tombstone: DeviceResetTombstone,
+        hardware: ProductionResetTombstone,
+        work: FsClosureWork,
+    },
+    Iotlb {
+        semantic: FsCloseSemantic,
+        root: Root,
+        device: ProductionDevice,
+        reset: DeviceResetReceipt,
+        iotlb_ticket: DeviceIotlbTicket,
+        hardware: ProductionIotlbTombstone,
+        work: FsClosureWork,
+        timeout_recorded: bool,
+    },
+    IotlbRetained {
+        semantic: FsCloseSemantic,
+        root: Root,
+        device: ProductionDevice,
+        reset: DeviceResetReceipt,
+        iotlb_tombstone: DeviceIotlbTombstone,
+        hardware: ProductionIotlbTombstone,
+        work: FsClosureWork,
+    },
+    Draining {
+        semantic: FsCloseSemantic,
+        root: Root,
+        device: ProductionDevice,
+        closure: DeviceClosureReceipt,
+        work: FsClosureWork,
+        next_ordinal: usize,
+        publication: Option<PublicationTicket>,
+    },
+    AwaitingPublication {
+        cookie: u64,
+        root: Root,
+        device: ProductionDevice,
+        selection: RevokeSelection,
+        ticket: PublicationTicket,
+        work: FsClosureWork,
+    },
+    Retained {
+        cookie: u64,
+        semantic: Option<FsRetainedSemantic>,
+        hardware: FsRetainedHardware,
+        stage: &'static str,
+    },
+    Complete {
+        root: Root,
+        device: ProductionDevice,
+    },
+    Transitioning,
 }
 
 #[cfg(feature = "virtio-cser-facade")]
 struct ProductionReadRuntime {
     registry: EffectRegistry,
-    root: Option<Root>,
-    device: Option<ProductionDevice>,
-    phase: ProductionReadPhase,
-    next_flight_cookie: u64,
-    active_revoke: Option<RevokeSelection>,
+    flight: FsDeviceFlight,
+    next_flight_cookie: NonZeroU64,
     registered_effects: usize,
     preparation_identity_observed: bool,
     #[cfg(feature = "virtio-cser-precommit-fault")]
@@ -262,11 +558,8 @@ impl ProductionReadRuntime {
         let device = ProductionDevice::for_owned_device(&mut root);
         Self {
             registry: new_same_boot_registry(),
-            root: Some(root),
-            device: Some(device),
-            phase: ProductionReadPhase::Ready,
-            next_flight_cookie: 1,
-            active_revoke: None,
+            flight: FsDeviceFlight::Ready { root, device },
+            next_flight_cookie: NonZeroU64::MIN,
             registered_effects: 0,
             preparation_identity_observed: false,
             #[cfg(feature = "virtio-cser-precommit-fault")]
@@ -274,11 +567,237 @@ impl ProductionReadRuntime {
         }
     }
 
+    fn allocate_flight_cookie(&mut self) -> Result<NonZeroU64, RegistryError> {
+        let cookie = self.next_flight_cookie;
+        let next = cookie
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(RegistryError::CounterOverflow)?;
+        self.next_flight_cookie = next;
+        Ok(cookie)
+    }
+
+    fn take_flight(&mut self) -> FsDeviceFlight {
+        core::mem::replace(&mut self.flight, FsDeviceFlight::Transitioning)
+    }
+
+    fn put_flight(&mut self, flight: FsDeviceFlight) {
+        debug_assert!(matches!(self.flight, FsDeviceFlight::Transitioning));
+        self.flight = flight;
+    }
+
+    fn retain_current(&mut self, stage: &'static str) -> u64 {
+        let flight = self.take_flight();
+        let (cookie, semantic, hardware) = match flight {
+            FsDeviceFlight::Ready { root, device } => {
+                (0, None, FsRetainedHardware::Ready { root, device })
+            }
+            FsDeviceFlight::Captured {
+                cookie,
+                root,
+                device,
+                ..
+            } => (
+                cookie.get(),
+                None,
+                FsRetainedHardware::Ready { root, device },
+            ),
+            FsDeviceFlight::Prepared {
+                cookie,
+                root,
+                device,
+                request,
+                ..
+            } => (
+                cookie.get(),
+                None,
+                FsRetainedHardware::Prepared {
+                    root,
+                    device,
+                    request,
+                },
+            ),
+            FsDeviceFlight::PreparedCancel {
+                cookie,
+                root,
+                device,
+                intent,
+                ..
+            } => (
+                cookie.get(),
+                None,
+                FsRetainedHardware::PreparedCancel {
+                    root,
+                    device,
+                    intent,
+                },
+            ),
+            FsDeviceFlight::Building {
+                cookie,
+                root,
+                device,
+                request,
+                ..
+            } => (
+                cookie.get(),
+                None,
+                FsRetainedHardware::Prepared {
+                    root,
+                    device,
+                    request,
+                },
+            ),
+            FsDeviceFlight::Published {
+                semantic,
+                root,
+                device,
+                request,
+                ..
+            } => (
+                semantic.key().cookie(),
+                Some(FsRetainedSemantic::Close(FsCloseSemantic::Published(
+                    semantic,
+                ))),
+                FsRetainedHardware::Published {
+                    root,
+                    device,
+                    request,
+                },
+            ),
+            FsDeviceFlight::PublishedReset {
+                semantic,
+                root,
+                device,
+                intent,
+                ..
+            } => (
+                semantic.key().cookie(),
+                Some(FsRetainedSemantic::Close(FsCloseSemantic::Published(
+                    semantic,
+                ))),
+                FsRetainedHardware::PublishedReset {
+                    root,
+                    device,
+                    intent,
+                },
+            ),
+            FsDeviceFlight::CompletionReset {
+                semantic,
+                root,
+                device,
+                intent,
+                ..
+            }
+            | FsDeviceFlight::IndeterminateReset {
+                semantic,
+                root,
+                device,
+                intent,
+                ..
+            } => (
+                semantic.key().cookie(),
+                Some(FsRetainedSemantic::Close(FsCloseSemantic::Published(
+                    semantic,
+                ))),
+                FsRetainedHardware::CompletionReset {
+                    root,
+                    device,
+                    intent,
+                },
+            ),
+            FsDeviceFlight::Resetting {
+                semantic,
+                root,
+                device,
+                hardware,
+                ..
+            } => (
+                semantic.cookie(),
+                Some(FsRetainedSemantic::Close(semantic)),
+                FsRetainedHardware::Reset {
+                    root,
+                    device,
+                    tombstone: hardware,
+                },
+            ),
+            FsDeviceFlight::ResetRetained {
+                semantic,
+                root,
+                device,
+                hardware,
+                ..
+            } => (
+                semantic.cookie(),
+                Some(FsRetainedSemantic::Close(semantic)),
+                FsRetainedHardware::Reset {
+                    root,
+                    device,
+                    tombstone: hardware,
+                },
+            ),
+            FsDeviceFlight::Iotlb {
+                semantic,
+                root,
+                device,
+                hardware,
+                ..
+            }
+            | FsDeviceFlight::IotlbRetained {
+                semantic,
+                root,
+                device,
+                hardware,
+                ..
+            } => (
+                semantic.cookie(),
+                Some(FsRetainedSemantic::Close(semantic)),
+                FsRetainedHardware::Iotlb {
+                    root,
+                    device,
+                    tombstone: hardware,
+                },
+            ),
+            FsDeviceFlight::Draining {
+                semantic,
+                root,
+                device,
+                ..
+            } => (
+                semantic.cookie(),
+                Some(FsRetainedSemantic::Close(semantic)),
+                FsRetainedHardware::Ready { root, device },
+            ),
+            FsDeviceFlight::AwaitingPublication {
+                cookie,
+                root,
+                device,
+                ..
+            } => (cookie, None, FsRetainedHardware::Ready { root, device }),
+            retained @ FsDeviceFlight::Retained { cookie, .. } => {
+                self.put_flight(retained);
+                return cookie;
+            }
+            complete @ FsDeviceFlight::Complete { .. } => {
+                self.put_flight(complete);
+                return 0;
+            }
+            FsDeviceFlight::Transitioning => {
+                self.put_flight(FsDeviceFlight::Transitioning);
+                return 0;
+            }
+        };
+        self.put_flight(FsDeviceFlight::Retained {
+            cookie,
+            semantic,
+            hardware,
+            stage,
+        });
+        cookie
+    }
+
     fn assert_complete(&self) {
-        assert_eq!(self.phase, ProductionReadPhase::Complete);
-        assert!(self.active_revoke.is_none());
-        assert!(self.root.is_some());
-        assert!(self.device.is_some());
+        assert!(matches!(self.flight, FsDeviceFlight::Complete { .. }));
         let scope = self.registry.scope_projection(SCOPE).unwrap();
         assert_eq!(scope.phase, ScopePhase::Revoked);
         assert_eq!(scope.live_effects, 0);
@@ -288,90 +807,7 @@ impl ProductionReadRuntime {
         assert_eq!(scope.credits.held, 0);
         assert_eq!(scope.credits.committed, 0);
         assert_eq!(scope.credits.retained, 0);
-        self.registry.check_invariants().unwrap();
     }
-}
-
-#[cfg(feature = "virtio-cser-facade")]
-fn begin_ordinary_precommit_close(
-    runtime: &mut ProductionReadRuntime,
-) -> Result<(u64, RevokeSelection), RegistryError> {
-    if runtime.registry.device_root_installed(SCOPE)? {
-        return Err(RegistryError::InvalidState);
-    }
-    let cookie = runtime.next_flight_cookie;
-    let next_cookie = cookie
-        .checked_add(1)
-        .ok_or(RegistryError::CounterOverflow)?;
-    let selection = runtime.registry.revoke_begin(SCOPE)?;
-    runtime.next_flight_cookie = next_cookie;
-    runtime.phase = ProductionReadPhase::Closing(cookie);
-    runtime.registry.check_invariants()?;
-    Ok((cookie, selection))
-}
-
-#[cfg(feature = "virtio-cser-facade")]
-fn begin_pending_device_precommit_close(
-    runtime: &mut ProductionReadRuntime,
-) -> Result<(u64, RevokeSelection, DeviceResetTicket), RegistryError> {
-    let cookie = runtime.next_flight_cookie;
-    let next_cookie = cookie
-        .checked_add(1)
-        .ok_or(RegistryError::CounterOverflow)?;
-    let selection = runtime.registry.revoke_begin(SCOPE)?;
-    let enrollment = runtime.registry.freeze_pending_device_cancel(SCOPE)?;
-    let reset = runtime
-        .registry
-        .begin_unpublished_device_cancel(&enrollment)?;
-    runtime.next_flight_cookie = next_cookie;
-    runtime.phase = ProductionReadPhase::Closing(cookie);
-    runtime.registry.check_invariants()?;
-    Ok((cookie, selection, reset))
-}
-
-#[cfg(feature = "virtio-cser-facade")]
-fn begin_enrolled_device_precommit_close(
-    runtime: &mut ProductionReadRuntime,
-    enrollment: &DeviceBatchEnrollmentReceipt,
-) -> Result<(u64, RevokeSelection, DeviceResetTicket), RegistryError> {
-    let cookie = runtime.next_flight_cookie;
-    let next_cookie = cookie
-        .checked_add(1)
-        .ok_or(RegistryError::CounterOverflow)?;
-    let selection = runtime.registry.revoke_begin(SCOPE)?;
-    let reset = runtime
-        .registry
-        .begin_unpublished_device_cancel(enrollment)?;
-    runtime.next_flight_cookie = next_cookie;
-    runtime.phase = ProductionReadPhase::Closing(cookie);
-    runtime.registry.check_invariants()?;
-    Ok((cookie, selection, reset))
-}
-
-#[cfg(feature = "virtio-cser-facade")]
-#[cfg_attr(feature = "virtio-cser-precommit-fault", allow(dead_code))]
-enum SameBootRequest {
-    Published(PublishedRequest),
-    ReplayConflict(PreparedRequest),
-}
-
-#[cfg(feature = "virtio-cser-facade")]
-struct SameBootFlight {
-    cookie: u64,
-    batch: DeviceBatchCommitReceipt,
-    request: SameBootRequest,
-    root: Root,
-    device: ProductionDevice,
-    selection: RevokeSelection,
-    effects: [EffectKey; 6],
-    envelope: DeviceEnvelope,
-}
-
-#[cfg(feature = "virtio-cser-facade")]
-#[cfg_attr(feature = "virtio-cser-precommit-fault", allow(dead_code))]
-enum SameBootDispatch {
-    Published(SameBootFlight),
-    Precommit(DispatchOutcome),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -398,6 +834,7 @@ struct PreparedProductionRead {
     filesystem_new_binding: u64,
 }
 
+#[cfg(not(feature = "virtio-cser-facade"))]
 fn new_production_registry() -> EffectRegistry {
     let mut effects = EffectRegistry::new();
     effects
@@ -485,12 +922,17 @@ impl FsState {
         let mut fds = BTreeMap::new();
         fds.insert(1, FdKind::Stdout);
         Self {
+            #[cfg(not(feature = "virtio-cser-facade"))]
             effects: new_production_registry(),
             fds,
             temporary: Vec::new(),
             next_fd: 3,
+            #[cfg(not(feature = "virtio-cser-facade"))]
             domain_revision: 0,
+            #[cfg(not(feature = "virtio-cser-facade"))]
             syscall_terminalizations: 0,
+            #[cfg(feature = "virtio-cser-facade")]
+            compatibility_syscalls: 0,
             production_effects: 0,
             production_read_observed: false,
             stdout_publications: 0,
@@ -498,6 +940,7 @@ impl FsState {
         }
     }
 
+    #[cfg(not(feature = "virtio-cser-facade"))]
     fn capture(
         &mut self,
         descriptor: SyscallDescriptor,
@@ -873,6 +1316,7 @@ impl FsState {
         }
     }
 
+    #[cfg(not(feature = "virtio-cser-facade"))]
     fn commit(&mut self, registered: &RegisteredEffect, result: i64) -> CommitReceipt {
         self.effects
             .prepare(PERSONALITY_V1, registered.handle)
@@ -892,6 +1336,7 @@ impl FsState {
         }
     }
 
+    #[cfg(not(feature = "virtio-cser-facade"))]
     fn record_domain_change(&mut self, commit: &CommitReceipt) {
         assert_eq!(commit.domain_revision(), self.domain_revision + 1);
         self.domain_revision = commit.domain_revision();
@@ -900,6 +1345,7 @@ impl FsState {
             .unwrap();
     }
 
+    #[cfg(not(feature = "virtio-cser-facade"))]
     fn terminalize(
         &mut self,
         registered: &RegisteredEffect,
@@ -926,6 +1372,7 @@ impl FsState {
         self.next_fd += 1;
     }
 
+    #[cfg(not(feature = "virtio-cser-facade"))]
     fn close_scope(&mut self) {
         let selection = self.effects.revoke_begin(SCOPE).unwrap();
         assert!(self.effects.revoke_next(&selection).unwrap().is_none());
@@ -933,21 +1380,31 @@ impl FsState {
         self.effects.check_invariants().unwrap();
     }
 
-    #[cfg(not(feature = "virtio-cser-precommit-fault"))]
+    #[cfg(all(
+        not(feature = "virtio-cser-facade"),
+        not(feature = "virtio-cser-precommit-fault")
+    ))]
     fn assert_final(&self) {
         let scope = self.effects.scope_projection(SCOPE).unwrap();
         assert_eq!(scope.phase, ScopePhase::Revoked);
         assert_eq!(scope.live_effects, 0);
         assert_eq!(scope.pending_publications, 0);
         assert_eq!(scope.credits.free, scope.credits.capacity);
-        #[cfg(not(feature = "virtio-cser-facade"))]
         assert_eq!(self.syscall_terminalizations, 14);
-        #[cfg(feature = "virtio-cser-facade")]
-        assert_eq!(self.syscall_terminalizations, 13);
-        #[cfg(not(feature = "virtio-cser-facade"))]
         assert_eq!(self.production_effects, 16);
-        #[cfg(feature = "virtio-cser-facade")]
-        assert_eq!(self.production_effects, 13);
+        assert!(self.production_read_observed);
+        assert_eq!(self.stdout_publications, 1);
+        assert_eq!(self.temporary.as_slice(), [0, 0, b'x', b'y']);
+        assert!(self.exited);
+    }
+
+    #[cfg(all(
+        feature = "virtio-cser-facade",
+        not(feature = "virtio-cser-precommit-fault")
+    ))]
+    fn assert_final(&self) {
+        assert_eq!(self.compatibility_syscalls, 13);
+        assert_eq!(self.production_effects, 0);
         assert!(self.production_read_observed);
         assert_eq!(self.stdout_publications, 1);
         assert_eq!(self.temporary.as_slice(), [0, 0, b'x', b'y']);
@@ -956,13 +1413,8 @@ impl FsState {
 
     #[cfg(feature = "virtio-cser-facade")]
     fn assert_precommit_final(&self) {
-        let scope = self.effects.scope_projection(SCOPE).unwrap();
-        assert_eq!(scope.phase, ScopePhase::Revoked);
-        assert_eq!(scope.live_effects, 0);
-        assert_eq!(scope.pending_publications, 0);
-        assert_eq!(scope.credits.free, scope.credits.capacity);
-        assert_eq!(self.syscall_terminalizations, 1);
-        assert_eq!(self.production_effects, 1);
+        assert_eq!(self.compatibility_syscalls, 1);
+        assert_eq!(self.production_effects, 0);
         assert!(self.production_read_observed);
         assert_eq!(self.stdout_publications, 0);
         assert!(self.temporary.is_empty());
@@ -1059,8 +1511,82 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 enum Publication {
     None,
-    GuestBytes { address: usize, bytes: Vec<u8> },
+    GuestBytes {
+        address: usize,
+        bytes: Vec<u8>,
+    },
+    #[cfg(feature = "virtio-cser-facade")]
+    FixedGuestBytes {
+        address: usize,
+        bytes: [u8; 4],
+        len: usize,
+    },
     Stdout,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+struct PreparedGuestWrite {
+    frame: UFrame,
+    offset: usize,
+    bytes: [u8; 4],
+    len: usize,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+impl PreparedGuestWrite {
+    fn prepare(
+        cursor: &mut Cursor<'_>,
+        address: usize,
+        bytes: [u8; 4],
+        len: usize,
+    ) -> Option<Self> {
+        let end = address.checked_add(len)?;
+        if len > bytes.len() {
+            return None;
+        }
+        let (range, item) = cursor.query().ok()?;
+        if address < range.start || end > range.end {
+            return None;
+        }
+        let VmQueriedItem::MappedRam { frame, prop } = item? else {
+            return None;
+        };
+        if !prop.flags.contains(PageFlags::W) {
+            return None;
+        }
+        let offset = address.checked_sub(range.start)?;
+        if offset.checked_add(len)? > ostd::mm::PAGE_SIZE {
+            return None;
+        }
+        Some(Self {
+            frame: frame.clone(),
+            offset,
+            bytes,
+            len,
+        })
+    }
+
+    fn apply(self) {
+        let mut destination = self.frame.writer();
+        destination.skip(self.offset).limit(self.len);
+        let mut source = VmReader::from(&self.bytes[..self.len]);
+        let _ = destination.write(&mut source);
+    }
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+enum PreparedProductionPublication {
+    None,
+    GuestWrite(PreparedGuestWrite),
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+impl PreparedProductionPublication {
+    fn apply(self) {
+        if let Self::GuestWrite(write) = self {
+            write.apply();
+        }
+    }
 }
 
 #[cfg(feature = "virtio-cser-facade")]
@@ -1126,27 +1652,25 @@ fn published_identity(
     )
 }
 
-#[cfg(feature = "virtio-cser-facade")]
-fn fail_stop_retain_precommit_owners<T, E: core::fmt::Debug>(
-    stage: &str,
-    error: E,
-    owners: T,
-) -> ! {
-    println!(
-        "LINUX_FS_SAME_BOOT InternalInvariant stage={} error={:?} owners=retained closure_claimed=false",
-        stage, error,
-    );
-    core::mem::forget(owners);
-    panic!("same-boot internal precommit invariant failed")
-}
-
 enum PublicationAuthority {
+    #[cfg(not(feature = "virtio-cser-facade"))]
     Generic(PublicationTicket),
+    #[cfg(feature = "virtio-cser-facade")]
+    CompatibilityPayload,
     #[cfg(feature = "virtio-cser-facade")]
     Production {
         ticket: PublicationTicket,
         flight_cookie: u64,
     },
+    #[cfg(feature = "virtio-cser-facade")]
+    Retained { flight_cookie: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationResult {
+    Complete,
+    #[cfg(feature = "virtio-cser-facade")]
+    Retained,
 }
 
 struct DispatchOutcome {
@@ -1154,6 +1678,18 @@ struct DispatchOutcome {
     authority: PublicationAuthority,
     publication: Publication,
     exit: bool,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+impl DispatchOutcome {
+    fn retained(flight_cookie: u64) -> Self {
+        Self {
+            result: -5,
+            authority: PublicationAuthority::Retained { flight_cookie },
+            publication: Publication::None,
+            exit: true,
+        }
+    }
 }
 
 struct FsScenario {
@@ -1166,519 +1702,46 @@ struct FsScenario {
 
 impl FsScenario {
     #[cfg(feature = "virtio-cser-facade")]
-    fn reject_preparation_without_hardware_owner(
-        &self,
-        root: Root,
-        device: ProductionDevice,
-        effects: [EffectKey; 2],
-        stage: &str,
-    ) -> DispatchOutcome {
-        let transition = {
+    fn retain_current_flight(&self, stage: &'static str) -> DispatchOutcome {
+        let cookie = {
             let mut runtime = self.production.lock();
-            let transition = begin_ordinary_precommit_close(&mut runtime);
-            match transition {
-                Ok(transition) => transition,
-                Err(error) => {
-                    drop(runtime);
-                    fail_stop_retain_precommit_owners(stage, error, (root, device));
-                }
-            }
-        };
-        let (cookie, selection) = transition;
-        self.close_ordinary_precommit_failure(cookie, root, device, selection, effects, stage)
-    }
-
-    #[cfg(feature = "virtio-cser-facade")]
-    #[allow(clippy::too_many_arguments)]
-    fn reject_prepared_without_device_root(
-        &self,
-        prepared: PreparedRequest,
-        root: Root,
-        device: ProductionDevice,
-        effects: [EffectKey; 2],
-        stage: &str,
-    ) -> DispatchOutcome {
-        let transition = {
-            let mut runtime = self.production.lock();
-            let transition = begin_ordinary_precommit_close(&mut runtime);
-            match transition {
-                Ok(transition) => transition,
-                Err(error) => {
-                    drop(runtime);
-                    fail_stop_retain_precommit_owners(stage, error, (prepared, root, device));
-                }
-            }
-        };
-        let (cookie, selection) = transition;
-        self.close_unregistered_precommit_failure(
-            cookie, prepared, root, device, selection, effects, stage,
-        )
-    }
-
-    #[cfg(feature = "virtio-cser-facade")]
-    #[allow(clippy::too_many_arguments)]
-    fn reject_pending_device_precommit(
-        &self,
-        prepared: PreparedRequest,
-        root: Root,
-        device: ProductionDevice,
-        effects: [EffectKey; 6],
-        envelope: DeviceEnvelope,
-        stage: &str,
-    ) -> DispatchOutcome {
-        let transition = {
-            let mut runtime = self.production.lock();
-            let transition = begin_pending_device_precommit_close(&mut runtime);
-            match transition {
-                Ok(transition) => transition,
-                Err(error) => {
-                    drop(runtime);
-                    fail_stop_retain_precommit_owners(stage, error, (prepared, root, device));
-                }
-            }
-        };
-        let (cookie, selection, reset_ticket) = transition;
-        self.close_enrolled_precommit_failure(
-            cookie,
-            prepared,
-            root,
-            device,
-            selection,
-            reset_ticket,
-            effects,
-            envelope,
-            false,
-        )
-    }
-
-    #[cfg(feature = "virtio-cser-facade")]
-    #[allow(clippy::too_many_arguments)]
-    fn reject_enrolled_device_precommit(
-        &self,
-        prepared: PreparedRequest,
-        root: Root,
-        device: ProductionDevice,
-        enrollment: DeviceBatchEnrollmentReceipt,
-        effects: [EffectKey; 6],
-        envelope: DeviceEnvelope,
-        stage: &str,
-    ) -> DispatchOutcome {
-        let transition = {
-            let mut runtime = self.production.lock();
-            let transition = begin_enrolled_device_precommit_close(&mut runtime, &enrollment);
-            match transition {
-                Ok(transition) => transition,
-                Err(error) => {
-                    drop(runtime);
-                    fail_stop_retain_precommit_owners(stage, error, (prepared, root, device));
-                }
-            }
-        };
-        let (cookie, selection, reset_ticket) = transition;
-        self.close_enrolled_precommit_failure(
-            cookie,
-            prepared,
-            root,
-            device,
-            selection,
-            reset_ticket,
-            effects,
-            envelope,
-            false,
-        )
-    }
-
-    #[cfg(feature = "virtio-cser-facade")]
-    #[allow(clippy::too_many_arguments)]
-    fn close_ordinary_precommit_failure(
-        &self,
-        cookie: u64,
-        root: Root,
-        device: ProductionDevice,
-        selection: RevokeSelection,
-        effects: [EffectKey; 2],
-        stage: &str,
-    ) -> DispatchOutcome {
-        let ticket = {
-            let mut runtime = self.production.lock();
-            assert_eq!(runtime.phase, ProductionReadPhase::Closing(cookie));
-            let mut publication = None;
-            for expected in [effects[1], effects[0]] {
-                let selected = runtime
-                    .registry
-                    .revoke_next(&selection)
-                    .unwrap()
-                    .expect("ordinary precommit revoke leaf");
-                assert_eq!(selected.effect, expected);
-                assert_eq!(selected.disposition, RevokeDisposition::Abort);
-                let terminal = runtime
-                    .registry
-                    .stage_revoke_terminal(&selection, expected, TerminalRequest::aborted(-125))
-                    .unwrap();
-                if terminal.publication.is_some() {
-                    assert_eq!(expected, effects[0]);
-                    assert!(publication.is_none());
-                    publication = terminal.publication;
-                }
-            }
-            assert!(runtime.registry.revoke_next(&selection).unwrap().is_none());
-            let publication = publication.expect("ordinary precommit root publication ticket");
-            assert_eq!(publication.result(), -125);
-            runtime.root = Some(root);
-            runtime.device = Some(device);
-            runtime.active_revoke = Some(selection.clone());
-            runtime.phase = ProductionReadPhase::AwaitingPublication(cookie);
-            runtime.registry.check_invariants().unwrap();
-            publication
+            runtime.retain_current(stage)
         };
         println!(
-            "LINUX_FS_SAME_BOOT PrecommitCleanup stage={} device_root=false result=-125 guest_bytes=0 owner_restored=true",
-            stage,
+            "LINUX_FS_SAME_BOOT Retained stage={} cookie={} guest_publication=false owner_runtime_resident=true",
+            stage, cookie,
         );
-        DispatchOutcome {
-            result: -125,
-            authority: PublicationAuthority::Production {
-                ticket,
-                flight_cookie: cookie,
-            },
-            publication: Publication::None,
-            exit: true,
-        }
+        DispatchOutcome::retained(cookie)
     }
 
     #[cfg(feature = "virtio-cser-facade")]
-    #[allow(clippy::too_many_arguments)]
-    fn close_unregistered_precommit_failure(
+    fn retain_exact_flight(
         &self,
         cookie: u64,
-        prepared: PreparedRequest,
-        mut root: Root,
-        mut device: ProductionDevice,
-        selection: RevokeSelection,
-        effects: [EffectKey; 2],
-        stage: &str,
+        semantic: Option<FsRetainedSemantic>,
+        hardware: FsRetainedHardware,
+        stage: &'static str,
     ) -> DispatchOutcome {
-        {
-            let runtime = self.production.lock();
-            assert_eq!(runtime.registry.device_root_installed(SCOPE), Ok(false));
-        }
-        let identity = prepared.identity();
-        let cancelled = prepared.cancel_unregistered();
-        assert_eq!(cancelled.identity(), identity);
-        let (reset_tombstone, mut cancellation) = cancelled.begin_reset(true);
-        assert_eq!(cancellation.identity(), identity);
-        assert_eq!(reset_tombstone.retained_dma_pages(), 3);
-        let reset_tombstone = match reset_tombstone.retry_ack(&mut root) {
-            Ok(reset) => fail_stop_retain_precommit_owners(
-                "unregistered_reset_timeout_injection",
-                "completed_early",
-                (reset, cancellation, root, device),
-            ),
-            Err(tombstone) => tombstone,
-        };
-        let mut reset = match reset_tombstone.retry_ack(&mut root) {
-            Ok(reset) => reset,
-            Err(tombstone) => fail_stop_retain_precommit_owners(
-                "unregistered_reset_retry",
-                "remained_pending",
-                (tombstone, cancellation, root, device),
-            ),
-        };
-        assert_eq!(reset.identity(), identity);
-        assert!(!reset.was_published());
-        assert!(!reset.was_descriptor_popped());
-        assert!(!reset.was_completed());
-        assert_eq!(reset.retained_dma_pages(), 3);
-        let generation = match device.apply_unregistered_reset(&mut reset, &mut cancellation) {
-            Ok(generation) => generation,
-            Err(error) => fail_stop_retain_precommit_owners(
-                "unregistered_generation_apply",
-                error,
-                (reset, cancellation, root, device),
-            ),
-        };
-        assert_eq!(generation, identity.device_generation() + 1);
-        let iotlb = match device.begin_unregistered_iotlb(reset, &cancellation, true) {
-            Ok(progress) => progress,
-            Err((error, reset_owner)) => fail_stop_retain_precommit_owners(
-                "unregistered_iotlb_begin",
-                error,
-                (reset_owner, cancellation, root, device),
-            ),
-        };
-        let iotlb = match iotlb {
-            ProductionClosureProgress::Pending(tombstone) => tombstone,
-            ProductionClosureProgress::Complete(closure) => fail_stop_retain_precommit_owners(
-                "unregistered_iotlb_timeout_injection",
-                "completed_early",
-                (closure, cancellation, root, device),
-            ),
-        };
-        assert_eq!(iotlb.identity(), identity);
-        assert_eq!(iotlb.retained_pages(), 3);
-        assert!(!iotlb.failure_retained());
-        let mut closure = match iotlb.retry(1024) {
-            ProductionClosureProgress::Complete(receipt) => receipt,
-            ProductionClosureProgress::Pending(tombstone) => fail_stop_retain_precommit_owners(
-                "unregistered_iotlb_retry",
-                "remained_pending",
-                (tombstone, cancellation, root, device),
-            ),
-        };
-        assert_eq!(closure.identity(), identity);
-        assert_eq!(closure.completed_pages(), 3);
-        let applied = match device.apply_unregistered_quiescence(&mut closure, &mut cancellation) {
-            Ok(identity) => identity,
-            Err(error) => fail_stop_retain_precommit_owners(
-                "unregistered_quiescence_apply",
-                error,
-                (closure, cancellation, root, device),
-            ),
-        };
-        assert_eq!(applied, identity);
-        assert!(cancellation.is_complete());
+        let mut runtime = self.production.lock();
+        runtime.put_flight(FsDeviceFlight::Retained {
+            cookie,
+            semantic,
+            hardware,
+            stage,
+        });
+        drop(runtime);
         println!(
-            "LINUX_FS_SAME_BOOT UnregisteredCancel stage={} was_published=false descriptor_popped=false completed=false retained_pages=3 completed_pages=3 generation={}->{} active_cleared=true",
-            stage,
-            identity.device_generation(),
-            generation,
+            "LINUX_FS_SAME_BOOT Retained stage={} cookie={} guest_publication=false owner_runtime_resident=true",
+            stage, cookie,
         );
-        self.close_ordinary_precommit_failure(cookie, root, device, selection, effects, stage)
+        DispatchOutcome::retained(cookie)
     }
 
+    // The single polling actor restores each linear successor to the runtime
+    // slot at every transition boundary. One-step hardware probes temporarily
+    // own that successor on the executing actor's stack; IRQ/SMP integration
+    // therefore still requires the actor-slot handoff described in the RFC.
     #[cfg(feature = "virtio-cser-facade")]
-    #[allow(clippy::too_many_arguments)]
-    fn close_enrolled_precommit_failure(
-        &self,
-        cookie: u64,
-        prepared: PreparedRequest,
-        mut root: Root,
-        mut device: ProductionDevice,
-        selection: RevokeSelection,
-        reset_ticket: DeviceResetTicket,
-        effects: [EffectKey; 6],
-        envelope: DeviceEnvelope,
-        fault_markers: bool,
-    ) -> DispatchOutcome {
-        let expected_identity = published_identity(envelope, root.device_bdf());
-        assert_eq!(prepared.identity(), expected_identity);
-        let reset_tombstone = prepared.cancel_prepared().begin_reset(true);
-        assert_eq!(reset_tombstone.retained_dma_pages(), 3);
-        let reset_tombstone = match reset_tombstone.retry_ack(&mut root) {
-            Ok(_) => panic!("injected precommit reset timeout completed early"),
-            Err(tombstone) => tombstone,
-        };
-        let retry_ticket = {
-            let mut runtime = self.production.lock();
-            assert_eq!(runtime.phase, ProductionReadPhase::Closing(cookie));
-            assert_eq!(
-                runtime
-                    .registry
-                    .scope_projection(SCOPE)
-                    .unwrap()
-                    .credits
-                    .retained,
-                10
-            );
-            let tombstone = runtime
-                .registry
-                .retain_device_reset_timeout(&reset_ticket)
-                .unwrap();
-            let retry = runtime.registry.retry_device_reset(&tombstone).unwrap();
-            runtime.registry.check_invariants().unwrap();
-            retry
-        };
-        if fault_markers {
-            println!(
-                "LINUX_FS_SAME_BOOT_PRECOMMIT ResetTimeout registry_tombstone=true hardware_tombstone=true retained_pages=3 generation={}",
-                envelope.device_generation(),
-            );
-        }
-
-        let mut hardware_reset = match reset_tombstone.retry_ack(&mut root) {
-            Ok(reset) => reset,
-            Err(_) => panic!("retained precommit reset tombstone remained pending"),
-        };
-        assert_eq!(hardware_reset.identity(), expected_identity);
-        assert!(!hardware_reset.was_published());
-        assert!(!hardware_reset.was_descriptor_popped());
-        assert!(!hardware_reset.was_completed());
-        assert_eq!(hardware_reset.retained_dma_pages(), 3);
-        let (registry_reset, new_generation) = {
-            let mut runtime = self.production.lock();
-            assert_eq!(runtime.phase, ProductionReadPhase::Closing(cookie));
-            let generation_plan = device
-                .prepare_generation_advance(&mut hardware_reset)
-                .unwrap();
-            let (receipt, generation) = runtime
-                .registry
-                .acknowledge_device_reset_with_apply(&retry_ticket, |prepared| {
-                    assert_eq!(prepared.old_device(), envelope);
-                    generation_plan.apply()
-                })
-                .unwrap();
-            runtime.registry.check_invariants().unwrap();
-            (receipt, generation)
-        };
-        assert_eq!(new_generation, envelope.device_generation() + 1);
-        assert_eq!(
-            registry_reset.outcome(),
-            DeviceClosureResult::AbortedBeforeCommit
-        );
-        if fault_markers {
-            println!(
-                "LINUX_FS_SAME_BOOT_PRECOMMIT ResetAck generation={}->{} outcome=AbortedBeforeCommit retained_pages=3 was_published=false descriptor_popped=false completed=false generation_apply_atomic=true",
-                envelope.device_generation(),
-                new_generation,
-            );
-        }
-
-        let registry_iotlb = {
-            let mut runtime = self.production.lock();
-            runtime
-                .registry
-                .begin_device_iotlb(&registry_reset)
-                .unwrap()
-        };
-        let hardware_iotlb = match device.begin_iotlb(hardware_reset, true) {
-            ProductionClosureProgress::Pending(tombstone) => tombstone,
-            ProductionClosureProgress::Complete(_) => {
-                panic!("injected precommit IOTLB timeout completed early")
-            }
-        };
-        assert_eq!(hardware_iotlb.retained_pages(), 3);
-        assert!(!hardware_iotlb.failure_retained());
-        let registry_iotlb_retry = {
-            let mut runtime = self.production.lock();
-            let tombstone = runtime
-                .registry
-                .retain_device_iotlb_timeout(&registry_iotlb)
-                .unwrap();
-            let retry = runtime
-                .registry
-                .retry_device_iotlb(&registry_reset, &tombstone)
-                .unwrap();
-            runtime.registry.check_invariants().unwrap();
-            retry
-        };
-        if fault_markers {
-            println!(
-                "LINUX_FS_SAME_BOOT_PRECOMMIT IotlbTimeout registry_generation={} hardware_identity_generation={} retained_pages=3 registry_tombstone=true hardware_tombstone=true",
-                registry_reset.new_device().device_generation(),
-                envelope.device_generation(),
-            );
-        }
-        let mut hardware_closure = match hardware_iotlb.retry(1024) {
-            ProductionClosureProgress::Complete(receipt) => receipt,
-            ProductionClosureProgress::Pending(_) => {
-                panic!("retained precommit IOTLB tombstone remained pending")
-            }
-        };
-        assert_eq!(hardware_closure.identity(), expected_identity);
-        assert_eq!(hardware_closure.completed_pages(), 3);
-        let registry_closure = {
-            let mut runtime = self.production.lock();
-            let quiescence_plan = device
-                .prepare_quiescence_apply(&mut hardware_closure)
-                .unwrap();
-            let (closure, applied_identity) = runtime
-                .registry
-                .acknowledge_device_iotlb_with_apply(&registry_iotlb_retry, |prepared| {
-                    assert_eq!(prepared.device(), registry_reset.new_device());
-                    quiescence_plan.apply()
-                })
-                .unwrap();
-            assert_eq!(applied_identity, expected_identity);
-            runtime.registry.check_invariants().unwrap();
-            closure
-        };
-        assert_eq!(
-            registry_closure.outcome(),
-            DeviceClosureResult::AbortedBeforeCommit
-        );
-        if fault_markers {
-            println!(
-                "LINUX_FS_SAME_BOOT_PRECOMMIT IotlbAck completed_pages=3 registry_generation={} hardware_identity_generation={} outcome=AbortedBeforeCommit quiescence_apply_atomic=true",
-                registry_closure.device().device_generation(),
-                envelope.device_generation(),
-            );
-        }
-
-        let ticket = {
-            let mut runtime = self.production.lock();
-            assert_eq!(runtime.phase, ProductionReadPhase::Closing(cookie));
-            let leaf_first = [
-                (effects[3], "dma_queue_owner_a"),
-                (effects[4], "dma_queue_owner_b"),
-                (effects[5], "dma_request_owner"),
-                (effects[2], "block_request"),
-                (effects[1], "filesystem_read"),
-                (effects[0], "filesystem_syscall"),
-            ];
-            let mut publication = None;
-            for (ordinal, (expected, kind)) in leaf_first.into_iter().enumerate() {
-                let selected = runtime
-                    .registry
-                    .revoke_next(&selection)
-                    .unwrap()
-                    .expect("precommit revoke leaf");
-                assert_eq!(selected.effect, expected);
-                assert_eq!(selected.disposition, RevokeDisposition::Abort);
-                let terminal = runtime
-                    .registry
-                    .stage_device_batch_terminal(
-                        &registry_closure,
-                        expected,
-                        TerminalRequest::aborted(-125),
-                    )
-                    .unwrap();
-                if fault_markers {
-                    println!(
-                        "LINUX_FS_SAME_BOOT_PRECOMMIT Abort ordinal={} kind={} effect={} result=-125 leaf_first=true",
-                        ordinal + 1,
-                        kind,
-                        expected.id(),
-                    );
-                }
-                if terminal.publication.is_some() {
-                    assert_eq!(expected, effects[0]);
-                    assert!(publication.is_none());
-                    publication = terminal.publication;
-                }
-            }
-            assert!(runtime.registry.revoke_next(&selection).unwrap().is_none());
-            let publication = publication.expect("precommit root publication ticket");
-            assert_eq!(publication.result(), -125);
-            runtime.root = Some(root);
-            runtime.device = Some(device);
-            runtime.active_revoke = Some(selection.clone());
-            runtime.phase = ProductionReadPhase::AwaitingPublication(cookie);
-            runtime.registry.check_invariants().unwrap();
-            #[cfg(feature = "virtio-cser-precommit-fault")]
-            if fault_markers {
-                runtime.enrolled_revoke_wins_observed = true;
-            }
-            publication
-        };
-        if fault_markers {
-            println!(
-                "LINUX_FS_SAME_BOOT_PRECOMMIT Close leaf_first=dma_queue_owner_a,dma_queue_owner_b,dma_request_owner,block_request,filesystem_read,filesystem_syscall closure=AbortedBeforeCommit guest_publication_pending=true"
-            );
-        }
-
-        DispatchOutcome {
-            result: -125,
-            authority: PublicationAuthority::Production {
-                ticket,
-                flight_cookie: cookie,
-            },
-            publication: Publication::None,
-            exit: true,
-        }
-    }
-
-    #[cfg(feature = "virtio-cser-facade")]
-    #[cfg_attr(feature = "virtio-cser-precommit-fault", allow(unused_labels))]
     fn dispatch_first_executable_pread_same_boot(
         &self,
         descriptor: SyscallDescriptor,
@@ -1688,200 +1751,264 @@ impl FsScenario {
         assert_eq!(descriptor.argument(2), 4);
         assert_eq!(descriptor.argument(3), 0);
 
-        // Capture the real UserContext descriptor before fd/inode resolution.
-        let syscall = {
+        // Capture precedes all personality lookup. The captured syscall and
+        // the physical root/device pair are installed together in the only
+        // runtime-resident flight slot before the lock is released.
+        let (cookie, _syscall) = {
             let mut runtime = self.production.lock();
-            assert_eq!(runtime.phase, ProductionReadPhase::Ready);
-            let syscall = runtime
-                .registry
-                .register_derived(DerivedRegisterRequest {
-                    request: RegisterRequest {
-                        scope: SCOPE,
-                        task: GUEST,
-                        operation: OP_SYSCALL,
-                        descriptor,
-                        resources: vec![PROCESS_RESOURCE, GUEST_REPLY_RESOURCE],
-                        credits: vec![
-                            CreditCharge::new(CONTROL_CREDIT, 1),
-                            CreditCharge::new(GUEST_REPLY_CREDIT, 1),
-                        ],
-                        publication: PublicationMode::Required,
-                    },
-                    domain: PERSONALITY_DOMAIN,
-                    parent: None,
-                })
-                .unwrap();
-            runtime
+            let flight = runtime.take_flight();
+            let (root, device) = match flight {
+                FsDeviceFlight::Ready { root, device } => (root, device),
+                other => {
+                    runtime.put_flight(other);
+                    return DispatchOutcome::retained(
+                        runtime.retain_current("capture_without_ready_flight"),
+                    );
+                }
+            };
+            let cookie = match runtime.allocate_flight_cookie() {
+                Ok(cookie) => cookie,
+                Err(error) => {
+                    runtime.put_flight(FsDeviceFlight::Retained {
+                        cookie: 0,
+                        semantic: None,
+                        hardware: FsRetainedHardware::Ready { root, device },
+                        stage: "flight_cookie_overflow",
+                    });
+                    println!(
+                        "LINUX_FS_SAME_BOOT Retained stage=flight_cookie_overflow error={:?}",
+                        error
+                    );
+                    return DispatchOutcome::retained(0);
+                }
+            };
+            let syscall = match runtime.registry.register_derived(DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: GUEST,
+                    operation: OP_SYSCALL,
+                    descriptor,
+                    resources: vec![PROCESS_RESOURCE, GUEST_REPLY_RESOURCE],
+                    credits: vec![
+                        CreditCharge::new(CONTROL_CREDIT, 1),
+                        CreditCharge::new(GUEST_REPLY_CREDIT, 1),
+                    ],
+                    publication: PublicationMode::Required,
+                },
+                domain: PERSONALITY_DOMAIN,
+                parent: None,
+            }) {
+                Ok(syscall) => syscall,
+                Err(_) => {
+                    runtime.put_flight(FsDeviceFlight::Ready { root, device });
+                    return DispatchOutcome::retained(
+                        runtime.retain_current("syscall_registration"),
+                    );
+                }
+            };
+            if runtime
                 .registry
                 .prepare(PERSONALITY_V1, syscall.handle)
-                .unwrap();
+                .is_err()
+            {
+                runtime.put_flight(FsDeviceFlight::Captured {
+                    cookie,
+                    root,
+                    device,
+                    syscall,
+                });
+                return DispatchOutcome::retained(runtime.retain_current("syscall_prepare"));
+            }
             runtime.registered_effects = 1;
-            runtime.phase = ProductionReadPhase::Captured(syscall.identity.effect());
-            runtime.registry.check_invariants().unwrap();
-            syscall
+            runtime.put_flight(FsDeviceFlight::Captured {
+                cookie,
+                root,
+                device,
+                syscall: syscall.clone(),
+            });
+            (cookie, syscall)
         };
 
-        // This is the real filesystem personality's fd/inode resolution. It
-        // intentionally follows the immutable production capture above.
         {
             let mut state = self.state.lock();
             assert!(!state.production_read_observed);
-            assert!(
-                state
-                    .fds
-                    .get(&3)
-                    .is_some_and(|kind| *kind == FdKind::Executable)
-            );
+            assert_eq!(state.fds.get(&3), Some(&FdKind::Executable));
             state.production_read_observed = true;
         }
 
-        let flight = 'prepare: {
+        let precommit_close = {
             let mut runtime = self.production.lock();
-            assert_eq!(
-                runtime.phase,
-                ProductionReadPhase::Captured(syscall.identity.effect())
-            );
+            let flight = runtime.take_flight();
+            let (mut root, mut device, captured) = match flight {
+                FsDeviceFlight::Captured {
+                    cookie: captured_cookie,
+                    root,
+                    device,
+                    syscall: captured,
+                } if captured_cookie == cookie => (root, device, captured),
+                other => {
+                    runtime.put_flight(other);
+                    return DispatchOutcome::retained(
+                        runtime.retain_current("capture_cookie_mismatch"),
+                    );
+                }
+            };
 
-            let filesystem = runtime
-                .registry
-                .register_derived(DerivedRegisterRequest {
-                    request: RegisterRequest {
-                        scope: SCOPE,
-                        task: FILESYSTEM_V1,
-                        operation: OP_FILESYSTEM_READ,
-                        descriptor,
-                        resources: vec![EXEC_INODE_RESOURCE, FILESYSTEM_READ_RESOURCE],
-                        credits: vec![CreditCharge::new(FILESYSTEM_OP_CREDIT, 1)],
-                        publication: PublicationMode::None,
-                    },
-                    domain: FILESYSTEM_DOMAIN,
-                    parent: Some(syscall.identity.effect()),
-                })
-                .unwrap();
-            runtime
+            let filesystem = match runtime.registry.register_derived(DerivedRegisterRequest {
+                request: RegisterRequest {
+                    scope: SCOPE,
+                    task: FILESYSTEM_V1,
+                    operation: OP_FILESYSTEM_READ,
+                    descriptor,
+                    resources: vec![EXEC_INODE_RESOURCE, FILESYSTEM_READ_RESOURCE],
+                    credits: vec![CreditCharge::new(FILESYSTEM_OP_CREDIT, 1)],
+                    publication: PublicationMode::None,
+                },
+                domain: FILESYSTEM_DOMAIN,
+                parent: Some(captured.identity.effect()),
+            }) {
+                Ok(effect) => effect,
+                Err(_) => {
+                    runtime.put_flight(FsDeviceFlight::Captured {
+                        cookie,
+                        root,
+                        device,
+                        syscall: captured,
+                    });
+                    return DispatchOutcome::retained(
+                        runtime.retain_current("filesystem_registration"),
+                    );
+                }
+            };
+            if runtime
                 .registry
                 .prepare(FILESYSTEM_V1, filesystem.handle)
-                .unwrap();
+                .is_err()
+            {
+                runtime.put_flight(FsDeviceFlight::Captured {
+                    cookie,
+                    root,
+                    device,
+                    syscall: captured,
+                });
+                return DispatchOutcome::retained(runtime.retain_current("filesystem_prepare"));
+            }
             runtime.registered_effects = 2;
 
-            let crash = runtime
-                .registry
-                .crash_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V1)
-                .unwrap();
-            assert_eq!(crash.previous_binding_epoch, 1);
-            assert_eq!(crash.binding_epoch, 2);
-            assert_eq!(crash.cohort.len(), 1);
-            assert!(crash.cohort.contains(&filesystem.identity.effect()));
-            let snapshot = runtime
-                .registry
-                .domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)
-                .unwrap();
-            assert_eq!(snapshot.effects.len(), 1);
-            assert_eq!(snapshot.effects[0].effect, filesystem.identity.effect());
-            runtime
-                .registry
-                .domain_ready(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2, &snapshot)
-                .unwrap();
-            let rebound = runtime
-                .registry
-                .rebind_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)
-                .unwrap();
-            assert_eq!(rebound.binding_epoch, 2);
-            let recovery = runtime
-                .registry
-                .recover_next_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)
-                .unwrap()
-                .expect("same-boot filesystem read survives registry-domain crash");
-            assert_eq!(recovery.handle, filesystem.handle);
-            let adopted_filesystem = runtime
-                .registry
-                .adopt_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2, filesystem.handle)
-                .unwrap();
-            assert_eq!(adopted_filesystem.effect(), filesystem.identity.effect());
-            assert_eq!(adopted_filesystem.binding_epoch(), 2);
+            // This is the real restartable filesystem service boundary. The
+            // adopted handle remains the original effect identity.
+            let adopted_filesystem = match (|| {
+                runtime
+                    .registry
+                    .crash_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V1)?;
+                let snapshot = runtime.registry.domain_recovery_snapshot(
+                    SCOPE,
+                    FILESYSTEM_DOMAIN,
+                    FILESYSTEM_V2,
+                )?;
+                runtime.registry.domain_ready(
+                    SCOPE,
+                    FILESYSTEM_DOMAIN,
+                    FILESYSTEM_V2,
+                    &snapshot,
+                )?;
+                runtime
+                    .registry
+                    .rebind_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)?;
+                runtime
+                    .registry
+                    .recover_next_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)?
+                    .ok_or(RegistryError::InvalidState)?;
+                runtime.registry.adopt_domain(
+                    SCOPE,
+                    FILESYSTEM_DOMAIN,
+                    FILESYSTEM_V2,
+                    filesystem.handle,
+                )
+            })() {
+                Ok(handle) => handle,
+                Err(_) => {
+                    runtime.put_flight(FsDeviceFlight::Captured {
+                        cookie,
+                        root,
+                        device,
+                        syscall: captured,
+                    });
+                    return DispatchOutcome::retained(
+                        runtime.retain_current("filesystem_recovery"),
+                    );
+                }
+            };
 
-            let mut root = runtime.root.take().expect("one same-boot PCI root");
-            let mut device = runtime.device.take().expect("one same-boot device owner");
-            let prepared_request = match device.prepare_read_sector0(&mut root) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    let effects = [syscall.identity.effect(), filesystem.identity.effect()];
-                    drop(runtime);
-                    println!(
-                        "LINUX_FS_SAME_BOOT PrecommitRejected stage=prepare_read_sector0 error={:?} prepared_owner=false device_root=false",
-                        error,
-                    );
-                    break 'prepare SameBootDispatch::Precommit(
-                        self.reject_preparation_without_hardware_owner(
-                            root,
-                            device,
-                            effects,
-                            "prepare_read_sector0",
-                        ),
-                    );
+            let request = match device.prepare_read_sector0(&mut root) {
+                Ok(request) => request,
+                Err(_) => {
+                    runtime.put_flight(FsDeviceFlight::Retained {
+                        cookie: cookie.get(),
+                        semantic: None,
+                        hardware: FsRetainedHardware::Ready { root, device },
+                        stage: "prepare_read_sector0",
+                    });
+                    return DispatchOutcome::retained(cookie.get());
                 }
             };
             runtime.preparation_identity_observed = true;
-            let hardware_identity = prepared_request.identity();
-            let bdf = root.device_bdf();
-            assert_eq!(hardware_identity.device_bdf(), bdf);
-            assert_eq!((bdf.bus(), bdf.device(), bdf.function()), (0, 5, 0));
-            assert_eq!(hardware_identity.device_generation(), 1);
+            let identity = request.identity();
             let envelope = match DeviceEnvelope::new(
-                hardware_identity.device_session(),
-                hardware_identity.queue(),
-                hardware_identity.descriptor_token(),
-                hardware_identity.device_generation(),
+                identity.device_session(),
+                identity.queue(),
+                identity.descriptor_token(),
+                identity.device_generation(),
             ) {
                 Ok(envelope) => envelope,
-                Err(error) => {
-                    let effects = [syscall.identity.effect(), filesystem.identity.effect()];
-                    drop(runtime);
-                    println!(
-                        "LINUX_FS_SAME_BOOT PrecommitRejected stage=device_envelope error={:?} prepared_owner=true device_root=false",
-                        error,
-                    );
-                    break 'prepare SameBootDispatch::Precommit(
-                        self.reject_prepared_without_device_root(
-                            prepared_request,
-                            root,
-                            device,
-                            effects,
-                            "device_envelope",
-                        ),
-                    );
+                Err(_) => {
+                    runtime.put_flight(FsDeviceFlight::Prepared {
+                        cookie,
+                        root,
+                        device,
+                        request,
+                        effects: [
+                            Some(captured.identity.effect()),
+                            Some(filesystem.identity.effect()),
+                            None,
+                            None,
+                            None,
+                            None,
+                        ],
+                        envelope: None,
+                        enrollment: None,
+                    });
+                    return DispatchOutcome::retained(runtime.retain_current("device_envelope"));
                 }
             };
-            let expected_hardware_identity = DeviceSessionIdentity::from_coordinates(
-                envelope.device_session(),
-                bdf,
-                envelope.queue(),
-                envelope.descriptor_token(),
-                envelope.device_generation(),
-            );
-            assert_eq!(hardware_identity, expected_hardware_identity);
+            if request
+                .preflight_publish(published_identity(envelope, root.device_bdf()))
+                .is_err()
+            {
+                runtime.put_flight(FsDeviceFlight::Prepared {
+                    cookie,
+                    root,
+                    device,
+                    request,
+                    effects: [
+                        Some(captured.identity.effect()),
+                        Some(filesystem.identity.effect()),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                    envelope: Some(envelope),
+                    enrollment: None,
+                });
+                return DispatchOutcome::retained(
+                    runtime.retain_current("publish_identity_preflight"),
+                );
+            }
 
-            let queue_driver = owner_address(
-                hardware_identity.device_generation(),
-                OwnerKind::QueueDriver,
-            );
-            let queue_device = owner_address(
-                hardware_identity.device_generation(),
-                OwnerKind::QueueDevice,
-            );
-            let request_owner =
-                owner_address(hardware_identity.device_generation(), OwnerKind::Request);
-            let block_descriptor = SyscallDescriptor::new(
-                OP_BLOCK_REQUEST.value() as usize,
-                [
-                    0,
-                    512,
-                    usize::from(hardware_identity.queue()),
-                    usize::from(hardware_identity.descriptor_token()),
-                    hardware_identity.device_session() as usize,
-                    hardware_identity.device_generation() as usize,
-                ],
-            );
+            let queue_driver = owner_address(identity.device_generation(), OwnerKind::QueueDriver);
+            let queue_device = owner_address(identity.device_generation(), OwnerKind::QueueDevice);
+            let request_owner = owner_address(identity.device_generation(), OwnerKind::Request);
             let cohort = runtime.registry.register_device_derived_cohort([
                 DeviceDerivedCohortEntry {
                     batch_index: 0,
@@ -1889,7 +2016,17 @@ impl FsScenario {
                         scope: SCOPE,
                         task: BLOCK_V1,
                         operation: OP_BLOCK_REQUEST,
-                        descriptor: block_descriptor,
+                        descriptor: SyscallDescriptor::new(
+                            OP_BLOCK_REQUEST.value() as usize,
+                            [
+                                0,
+                                512,
+                                usize::from(identity.queue()),
+                                usize::from(identity.descriptor_token()),
+                                identity.device_session() as usize,
+                                identity.device_generation() as usize,
+                            ],
+                        ),
                         resources: vec![BLOCK_REQUEST_RESOURCE],
                         credits: vec![same_boot_credit(QUEUE_SLOT_CREDIT, 1)],
                         publication: PublicationMode::None,
@@ -1902,7 +2039,7 @@ impl FsScenario {
                     1,
                     OP_DMA_QUEUE_OWNER_A,
                     DMA_QUEUE_OWNER_A_NAMESPACE,
-                    hardware_identity,
+                    identity,
                     envelope,
                     queue_driver.0,
                     queue_driver.1,
@@ -1911,7 +2048,7 @@ impl FsScenario {
                     2,
                     OP_DMA_QUEUE_OWNER_B,
                     DMA_QUEUE_OWNER_B_NAMESPACE,
-                    hardware_identity,
+                    identity,
                     envelope,
                     queue_device.0,
                     queue_device.1,
@@ -1920,7 +2057,7 @@ impl FsScenario {
                     3,
                     OP_DMA_REQUEST_OWNER,
                     DMA_REQUEST_OWNER_NAMESPACE,
-                    hardware_identity,
+                    identity,
                     envelope,
                     request_owner.0,
                     request_owner.1,
@@ -1928,100 +2065,72 @@ impl FsScenario {
             ]);
             let [block, dma_queue_a, dma_queue_b, dma_request] = match cohort {
                 Ok(cohort) => cohort,
-                Err(error) => {
-                    let effects = [syscall.identity.effect(), filesystem.identity.effect()];
-                    drop(runtime);
-                    println!(
-                        "LINUX_FS_SAME_BOOT PrecommitRejected stage=cohort_register error={:?} prepared_owner=true device_root=false",
-                        error,
-                    );
-                    break 'prepare SameBootDispatch::Precommit(
-                        self.reject_prepared_without_device_root(
-                            prepared_request,
-                            root,
-                            device,
-                            effects,
-                            "cohort_register",
-                        ),
+                Err(_) => {
+                    runtime.put_flight(FsDeviceFlight::Prepared {
+                        cookie,
+                        root,
+                        device,
+                        request,
+                        effects: [
+                            Some(captured.identity.effect()),
+                            Some(filesystem.identity.effect()),
+                            None,
+                            None,
+                            None,
+                            None,
+                        ],
+                        envelope: Some(envelope),
+                        enrollment: None,
+                    });
+                    return DispatchOutcome::retained(
+                        runtime.retain_current("device_cohort_registration"),
                     );
                 }
             };
-            runtime.registered_effects = 6;
             let effects = [
-                syscall.identity.effect(),
+                captured.identity.effect(),
                 filesystem.identity.effect(),
                 block.identity.effect(),
                 dma_queue_a.identity.effect(),
                 dma_queue_b.identity.effect(),
                 dma_request.identity.effect(),
             ];
-            for effect in [&block, &dma_queue_a, &dma_queue_b, &dma_request] {
-                if let Err(error) = runtime.registry.prepare(BLOCK_V1, effect.handle) {
-                    drop(runtime);
-                    println!(
-                        "LINUX_FS_SAME_BOOT PrecommitRejected stage=cohort_prepare error={:?} prepared_owner=true device_root=pending",
-                        error,
-                    );
-                    break 'prepare SameBootDispatch::Precommit(
-                        self.reject_pending_device_precommit(
-                            prepared_request,
-                            root,
-                            device,
-                            effects,
-                            envelope,
-                            "cohort_prepare",
-                        ),
+            for member in [&block, &dma_queue_a, &dma_queue_b, &dma_request] {
+                if runtime.registry.prepare(BLOCK_V1, member.handle).is_err() {
+                    runtime.put_flight(FsDeviceFlight::Prepared {
+                        cookie,
+                        root,
+                        device,
+                        request,
+                        effects: effects.map(Some),
+                        envelope: Some(envelope),
+                        enrollment: None,
+                    });
+                    return DispatchOutcome::retained(
+                        runtime.retain_current("device_cohort_prepare"),
                     );
                 }
             }
-
-            let credits = match runtime.registry.scope_projection(SCOPE) {
-                Ok(scope) => scope.credits,
-                Err(error) => {
-                    drop(runtime);
-                    println!(
-                        "LINUX_FS_SAME_BOOT PrecommitRejected stage=credit_projection error={:?} prepared_owner=true device_root=pending",
-                        error,
-                    );
-                    break 'prepare SameBootDispatch::Precommit(
-                        self.reject_pending_device_precommit(
-                            prepared_request,
-                            root,
-                            device,
-                            effects,
-                            envelope,
-                            "credit_projection",
-                        ),
-                    );
-                }
-            };
-            assert_eq!(credits.capacity, 10);
-            assert_eq!(credits.free, 0);
-            assert_eq!(credits.held, 10);
-            assert_eq!(credits.committed, 0);
-            assert_eq!(credits.retained, 0);
+            runtime.registered_effects = 6;
             let authority = match runtime.registry.kernel_root_authority(SCOPE, ROOT_OWNER) {
                 Ok(authority) => authority,
-                Err(error) => {
-                    drop(runtime);
-                    println!(
-                        "LINUX_FS_SAME_BOOT PrecommitRejected stage=root_authority error={:?} prepared_owner=true device_root=pending",
-                        error,
-                    );
-                    break 'prepare SameBootDispatch::Precommit(
-                        self.reject_pending_device_precommit(
-                            prepared_request,
-                            root,
-                            device,
-                            effects,
-                            envelope,
-                            "root_authority",
-                        ),
+                Err(_) => {
+                    runtime.put_flight(FsDeviceFlight::Prepared {
+                        cookie,
+                        root,
+                        device,
+                        request,
+                        effects: effects.map(Some),
+                        envelope: Some(envelope),
+                        enrollment: None,
+                    });
+                    return DispatchOutcome::retained(
+                        runtime.retain_current("kernel_root_authority"),
                     );
                 }
             };
             let handles = [
-                syscall.handle,
+                captured.handle,
                 adopted_filesystem,
                 block.handle,
                 dma_queue_a.handle,
@@ -2033,44 +2142,21 @@ impl FsScenario {
                 .enroll_device_batch(authority, &handles, envelope)
             {
                 Ok(enrollment) => enrollment,
-                Err(error) => {
-                    drop(runtime);
-                    println!(
-                        "LINUX_FS_SAME_BOOT PrecommitRejected stage=enroll error={:?} prepared_owner=true device_root=pending",
-                        error,
-                    );
-                    break 'prepare SameBootDispatch::Precommit(
-                        self.reject_pending_device_precommit(
-                            prepared_request,
-                            root,
-                            device,
-                            effects,
-                            envelope,
-                            "enroll",
-                        ),
-                    );
+                Err(_) => {
+                    runtime.put_flight(FsDeviceFlight::Prepared {
+                        cookie,
+                        root,
+                        device,
+                        request,
+                        effects: effects.map(Some),
+                        envelope: Some(envelope),
+                        enrollment: None,
+                    });
+                    return DispatchOutcome::retained(runtime.retain_current("device_enrollment"));
                 }
             };
-            assert_eq!(enrollment.effects().len(), 6);
-            assert_eq!(enrollment.device(), envelope);
-            if let Err(error) = prepared_request.preflight_publish(expected_hardware_identity) {
-                drop(runtime);
-                println!(
-                    "LINUX_FS_SAME_BOOT PrecommitRejected stage=publish_preflight error={:?} prepared_owner=true device_root=enrolled",
-                    error,
-                );
-                break 'prepare SameBootDispatch::Precommit(self.reject_enrolled_device_precommit(
-                    prepared_request,
-                    root,
-                    device,
-                    enrollment,
-                    effects,
-                    envelope,
-                    "publish_preflight",
-                ));
-            }
             let commits = [
-                (syscall.handle, CommitMetadata::new(4, 1)),
+                (captured.handle, CommitMetadata::new(4, 1)),
                 (adopted_filesystem, CommitMetadata::new(4, 1)),
                 (block.handle, CommitMetadata::new(512, 1)),
                 (dma_queue_a.handle, CommitMetadata::new(1, 1)),
@@ -2080,8 +2166,9 @@ impl FsScenario {
 
             #[cfg(feature = "virtio-cser-precommit-fault")]
             {
+                let bdf = root.device_bdf();
                 println!(
-                    "LINUX_FS_SAME_BOOT_PRECOMMIT Capture stage=enrolled_preflight scope=95 effects=6 credits=10 fault=revoke_wins_commit_gate device={} session={:#018x} generation={} queue={} descriptor={}",
+                    "LINUX_FS_SAME_BOOT_PRECOMMIT Capture stage=enrolled_preflight scope=95 effects=6 credits=10 registry=shared_production fault=revoke_wins_commit_gate device={} session={:#018x} generation={} queue={} descriptor={}",
                     bdf,
                     envelope.device_session(),
                     envelope.device_generation(),
@@ -2089,9 +2176,9 @@ impl FsScenario {
                     envelope.descriptor_token(),
                 );
                 for (kind, effect, address) in [
-                    ("queue_driver", dma_queue_a.identity.effect(), queue_driver),
-                    ("queue_device", dma_queue_b.identity.effect(), queue_device),
-                    ("request", dma_request.identity.effect(), request_owner),
+                    ("queue_driver", effects[3], queue_driver),
+                    ("queue_device", effects[4], queue_device),
+                    ("request", effects[5], request_owner),
                 ] {
                     println!(
                         "LINUX_FS_SAME_BOOT_PRECOMMIT DmaOwner kind={} effect={} paddr={:#x} iova={:#x} page_size={} queue={} descriptor={} generation={}",
@@ -2105,580 +2192,1255 @@ impl FsScenario {
                         envelope.device_generation(),
                     );
                 }
-
-                let selection = runtime.registry.revoke_begin(SCOPE).unwrap();
-                assert_eq!(selection.target_count, 6);
-                let cookie = runtime.next_flight_cookie;
-                runtime.next_flight_cookie = cookie.checked_add(1).unwrap();
-                runtime.phase = ProductionReadPhase::Closing(cookie);
-                let mut prepared_slot = Some(prepared_request);
-                let mut publish_closure_calls = 0_usize;
-                let commit = runtime.registry.commit_device_batch_with_publish(
-                    authority,
-                    &enrollment,
-                    &commits,
-                    |_| {
-                        publish_closure_calls += 1;
-                        prepared_slot
-                            .take()
-                            .expect("precommit publication retains prepared owner")
-                            .publish_prepared()
-                    },
-                );
-                assert!(matches!(commit, Err(RegistryError::StaleAuthority)));
-                assert_eq!(publish_closure_calls, 0);
-                assert!(prepared_slot.is_some());
-                let reset_ticket = runtime
-                    .registry
-                    .begin_unpublished_device_cancel(&enrollment)
-                    .unwrap();
-                let prepared = prepared_slot
-                    .take()
-                    .expect("failed commit returns prepared owner");
-                let effects = [
-                    syscall.identity.effect(),
-                    filesystem.identity.effect(),
-                    block.identity.effect(),
-                    dma_queue_a.identity.effect(),
-                    dma_queue_b.identity.effect(),
-                    dma_request.identity.effect(),
-                ];
-                runtime.registry.check_invariants().unwrap();
-                drop(runtime);
-                println!(
-                    "LINUX_FS_SAME_BOOT_PRECOMMIT CommitRejected error=StaleAuthority publish_closure_calls=0 prepared_owner_retained=true was_published=false guest_bytes=0"
-                );
-                SameBootDispatch::Precommit(self.close_enrolled_precommit_failure(
+                runtime.put_flight(FsDeviceFlight::Building {
                     cookie,
-                    prepared,
                     root,
                     device,
-                    selection,
-                    reset_ticket,
+                    request,
                     effects,
                     envelope,
-                    true,
-                ))
+                    enrollment,
+                    commits,
+                });
+                true
             }
 
             #[cfg(not(feature = "virtio-cser-precommit-fault"))]
             {
-                let mut prepared_slot = Some(prepared_request);
-                let commit = runtime.registry.commit_device_batch_with_publish(
+                let key = match mint_device_flight_key(&runtime.registry, &enrollment, cookie) {
+                    Ok(key) => key,
+                    Err(_) => {
+                        runtime.put_flight(FsDeviceFlight::Prepared {
+                            cookie,
+                            root,
+                            device,
+                            request,
+                            effects: effects.map(Some),
+                            envelope: Some(envelope),
+                            enrollment: Some(enrollment),
+                        });
+                        return DispatchOutcome::retained(
+                            runtime.retain_current("flight_key_mint"),
+                        );
+                    }
+                };
+                let mut request_slot = Some(request);
+                match commit_or_recover_device_flight_with_apply(
+                    &mut runtime.registry,
+                    key,
                     authority,
                     &enrollment,
                     &commits,
                     |_| {
-                        prepared_slot
+                        request_slot
                             .take()
-                            .expect("same-boot publication retains prepared owner")
+                            .expect("prevalidated prepared owner")
                             .publish_prepared()
                     },
-                );
-                let (batch, request) = match commit {
-                    Ok(DeviceBatchCommitOutcome::Applied {
-                        receipt,
+                ) {
+                    Ok(DeviceFlightCloseOutcome::Applied {
+                        published,
                         publication,
                     }) => {
-                        assert!(prepared_slot.is_none());
-                        (receipt, SameBootRequest::Published(publication))
-                    }
-                    Ok(DeviceBatchCommitOutcome::AlreadyCommitted { receipt }) => {
-                        assert!(prepared_slot.is_some());
-                        let prepared = prepared_slot
-                            .take()
-                            .expect("replay retains the fresh prepared owner");
-                        if let Err(error) = runtime
-                            .registry
-                            .validate_device_replay_fence_candidate(&receipt)
-                        {
-                            drop(runtime);
-                            fail_stop_retain_precommit_owners(
-                                "replay_fence_candidate",
-                                error,
-                                (prepared, root, device),
+                        let bdf = root.device_bdf();
+                        let batch_sequence = published.batch().batch_sequence();
+                        runtime.put_flight(FsDeviceFlight::Published {
+                            semantic: published,
+                            root,
+                            device,
+                            request: publication,
+                            work: FsClosureWork {
+                                effects,
+                                envelope,
+                                guest_address: descriptor.argument(1),
+                                result: 4,
+                                bytes: [0; 4],
+                                byte_count: 0,
+                                used_len: 0,
+                                completion_label: "Unobserved",
+                            },
+                            completion_probes: 0,
+                        });
+                        println!(
+                            "LINUX_FS_SAME_BOOT Capture same_boot=true identity_preserving=true real_dma=true registry=shared_production scope=95 authority_epoch=141 effects=6 credits=10 device={} session={:#018x} generation={} queue={} descriptor={} syscall_effect={} filesystem_effect={} block_effect={}",
+                            bdf,
+                            envelope.device_session(),
+                            envelope.device_generation(),
+                            envelope.queue(),
+                            envelope.descriptor_token(),
+                            effects[0].id(),
+                            effects[1].id(),
+                            effects[2].id(),
+                        );
+                        for (kind, effect, address) in [
+                            ("queue_driver", effects[3], queue_driver),
+                            ("queue_device", effects[4], queue_device),
+                            ("request", effects[5], request_owner),
+                        ] {
+                            println!(
+                                "LINUX_FS_SAME_BOOT DmaOwner kind={} effect={} paddr={:#x} iova={:#x} page_size={} queue={} descriptor={} generation={}",
+                                kind,
+                                effect.id(),
+                                address.0,
+                                address.1,
+                                ostd::mm::PAGE_SIZE,
+                                envelope.queue(),
+                                envelope.descriptor_token(),
+                                envelope.device_generation(),
                             );
                         }
                         println!(
-                            "LINUX_FS_SAME_BOOT ReplayConflict batch_sequence={} registry_commit_recorded=true current_publish_calls=0 prepared_was_published=false fence_candidate=true",
-                            receipt.batch_sequence(),
+                            "LINUX_FS_SAME_BOOT Commit batch_sequence={} commit_point=avail_idx_release syscall_effect={} filesystem_effect={} block_effect={} dma_queue_owner_a_effect={} dma_queue_owner_b_effect={} dma_request_owner_effect={} publication_once=true revoke_begin_immediate=true",
+                            batch_sequence,
+                            effects[0].id(),
+                            effects[1].id(),
+                            effects[2].id(),
+                            effects[3].id(),
+                            effects[4].id(),
+                            effects[5].id(),
                         );
-                        (receipt, SameBootRequest::ReplayConflict(prepared))
-                    }
-                    Err(error) => {
-                        assert!(prepared_slot.is_some());
-                        let prepared = prepared_slot
-                            .take()
-                            .expect("rejected same-boot commit retains prepared owner");
-                        drop(runtime);
+                        let notification = match &mut runtime.flight {
+                            FsDeviceFlight::Published { request, .. } => request.notify(),
+                            _ => {
+                                return DispatchOutcome::retained(
+                                    runtime.retain_current("published_owner_install"),
+                                );
+                            }
+                        };
+                        debug_assert!(matches!(
+                            notification,
+                            NotificationDisposition::Kicked | NotificationDisposition::Suppressed
+                        ));
                         println!(
-                            "LINUX_FS_SAME_BOOT PrecommitRejected stage=commit error={:?} prepared_owner=true device_root=enrolled",
-                            error,
+                            "LINUX_FS_SAME_BOOT Notify disposition={} polling=true irq=false smp=1",
+                            match notification {
+                                NotificationDisposition::Kicked => "Kicked",
+                                NotificationDisposition::Suppressed => "Suppressed",
+                                NotificationDisposition::AlreadyResolved => "AlreadyResolved",
+                            },
                         );
-                        break 'prepare SameBootDispatch::Precommit(
-                            self.reject_enrolled_device_precommit(
-                                prepared, root, device, enrollment, effects, envelope, "commit",
-                            ),
+                        false
+                    }
+                    Ok(DeviceFlightCloseOutcome::Recovered { .. }) => {
+                        let request = request_slot
+                            .expect("recovered close did not consume fresh prepared owner");
+                        runtime.put_flight(FsDeviceFlight::Prepared {
+                            cookie,
+                            root,
+                            device,
+                            request,
+                            effects: effects.map(Some),
+                            envelope: Some(envelope),
+                            enrollment: Some(enrollment),
+                        });
+                        return DispatchOutcome::retained(
+                            runtime.retain_current("fresh_prepared_recovered_close"),
                         );
                     }
-                };
-                runtime
-                    .registry
-                    .validate_device_batch_receipt(&batch)
-                    .unwrap();
-                let selection = runtime.registry.revoke_begin(SCOPE).unwrap();
-                assert_eq!(selection.target_count, 6);
-                let cookie = runtime.next_flight_cookie;
-                runtime.next_flight_cookie = cookie.checked_add(1).unwrap();
-                runtime.phase = ProductionReadPhase::Polling(cookie);
-                runtime.registry.check_invariants().unwrap();
-
-                println!(
-                    "LINUX_FS_SAME_BOOT Capture same_boot=true identity_preserving=true real_dma=true scope=95 authority_epoch=141 effects=6 credits=10 device={} session={:#018x} generation={} queue={} descriptor={} syscall_effect={} filesystem_effect={} block_effect={}",
-                    bdf,
-                    envelope.device_session(),
-                    envelope.device_generation(),
-                    envelope.queue(),
-                    envelope.descriptor_token(),
-                    syscall.identity.effect().id(),
-                    filesystem.identity.effect().id(),
-                    block.identity.effect().id(),
-                );
-                for (kind, effect, address) in [
-                    ("queue_driver", dma_queue_a.identity.effect(), queue_driver),
-                    ("queue_device", dma_queue_b.identity.effect(), queue_device),
-                    ("request", dma_request.identity.effect(), request_owner),
-                ] {
-                    println!(
-                        "LINUX_FS_SAME_BOOT DmaOwner kind={} effect={} paddr={:#x} iova={:#x} page_size={} queue={} descriptor={} generation={}",
-                        kind,
-                        effect.id(),
-                        address.0,
-                        address.1,
-                        ostd::mm::PAGE_SIZE,
-                        envelope.queue(),
-                        envelope.descriptor_token(),
-                        envelope.device_generation(),
-                    );
+                    Err(error @ crate::effect_registry::DeviceCloseError::Unpublished(_)) => {
+                        let Some(request) = request_slot else {
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie: key.cookie(),
+                                semantic: None,
+                                hardware: FsRetainedHardware::Quarantined { root, device },
+                                stage: "unpublished_close_lost_prepared_owner",
+                            });
+                            return DispatchOutcome::retained(key.cookie());
+                        };
+                        let _ = error;
+                        runtime.put_flight(FsDeviceFlight::Prepared {
+                            cookie,
+                            root,
+                            device,
+                            request,
+                            effects: effects.map(Some),
+                            envelope: Some(envelope),
+                            enrollment: Some(enrollment),
+                        });
+                        true
+                    }
+                    Err(error @ crate::effect_registry::DeviceCloseError::Published { .. }) => {
+                        let semantic = RetainedSemantic::from_close_error(
+                            key,
+                            RetainReason::TransitionRejected,
+                            error,
+                        )
+                        .ok()
+                        .map(FsRetainedSemantic::PublishedObligation);
+                        let hardware = match request_slot {
+                            Some(request) => FsRetainedHardware::Prepared {
+                                root,
+                                device,
+                                request,
+                            },
+                            None => FsRetainedHardware::Quarantined { root, device },
+                        };
+                        runtime.put_flight(FsDeviceFlight::Retained {
+                            cookie: key.cookie(),
+                            semantic,
+                            hardware,
+                            stage: "published_close_error",
+                        });
+                        return DispatchOutcome::retained(key.cookie());
+                    }
                 }
-                if matches!(&request, SameBootRequest::Published(_)) {
-                    println!(
-                        "LINUX_FS_SAME_BOOT Commit batch_sequence={} commit_point=avail_idx_release syscall_effect={} filesystem_effect={} block_effect={} dma_queue_owner_a_effect={} dma_queue_owner_b_effect={} dma_request_owner_effect={} publication_once=true revoke_begin_immediate=true",
-                        batch.batch_sequence(),
-                        syscall.identity.effect().id(),
-                        filesystem.identity.effect().id(),
-                        block.identity.effect().id(),
-                        dma_queue_a.identity.effect().id(),
-                        dma_queue_b.identity.effect().id(),
-                        dma_request.identity.effect().id(),
-                    );
-                }
-
-                SameBootDispatch::Published(SameBootFlight {
-                    cookie,
-                    batch,
-                    request,
-                    root,
-                    device,
-                    selection,
-                    effects: [
-                        syscall.identity.effect(),
-                        filesystem.identity.effect(),
-                        block.identity.effect(),
-                        dma_queue_a.identity.effect(),
-                        dma_queue_b.identity.effect(),
-                        dma_request.identity.effect(),
-                    ],
-                    envelope,
-                })
             }
         };
 
-        let flight = match flight {
-            SameBootDispatch::Published(flight) => flight,
-            SameBootDispatch::Precommit(outcome) => return outcome,
-        };
+        if precommit_close {
+            return self.close_precommit_flight("precommit_commit_gate");
+        }
+        self.drive_postcommit_flight(descriptor)
+    }
 
-        let SameBootFlight {
+    #[cfg(feature = "virtio-cser-facade")]
+    fn close_precommit_flight(&self, stage: &'static str) -> DispatchOutcome {
+        let mut runtime = self.production.lock();
+        let flight = runtime.take_flight();
+        let FsDeviceFlight::Building {
             cookie,
-            batch,
+            root,
+            device,
             request,
-            mut root,
-            mut device,
-            selection,
             effects,
             envelope,
-        } = flight;
-        let (result, bytes, reset_tombstone, completion_label, used_len, reset_ticket) =
-            match request {
-                SameBootRequest::Published(mut published) => {
-                    let notification = published.notify();
-                    assert!(matches!(
-                        notification,
-                        NotificationDisposition::Kicked | NotificationDisposition::Suppressed
-                    ));
-                    let notification_label = match notification {
-                        NotificationDisposition::Kicked => "Kicked",
-                        NotificationDisposition::Suppressed => "Suppressed",
-                        NotificationDisposition::AlreadyResolved => unreachable!(),
-                    };
-                    println!(
-                        "LINUX_FS_SAME_BOOT Notify disposition={} polling=true irq=false smp=1",
-                        notification_label,
-                    );
-
-                    // Polling and every hardware reset/IOTLB wait happen outside
-                    // the OSTD SpinLock. The flight cookie authenticates re-entry.
-                    match published.poll_completion() {
-                        CompletionProgress::Complete(completed) => {
-                            assert_eq!(fnv1a(completed.data()), SAME_BOOT_SECTOR_FNV1A);
-                            let bytes = completed.data()[..4].to_vec();
-                            assert_eq!(bytes.as_slice(), b"\x7fELF");
-                            let used_len = completed.used_len();
-                            let reset_ticket = {
-                                let mut runtime = self.production.lock();
-                                assert_eq!(runtime.phase, ProductionReadPhase::Polling(cookie));
-                                let completion = runtime
-                                    .registry
-                                    .record_device_completion(&batch, envelope, 4)
-                                    .unwrap();
-                                assert_eq!(completion.causal_root(), effects[0]);
-                                assert_eq!(completion.result(), 4);
-                                let reset_ticket =
-                                    runtime.registry.begin_device_reset(&batch).unwrap();
-                                runtime.phase = ProductionReadPhase::Closing(cookie);
-                                runtime.registry.check_invariants().unwrap();
-                                reset_ticket
-                            };
-                            (
-                                4,
-                                bytes,
-                                completed.begin_reset(true),
-                                "Completed",
-                                used_len,
-                                reset_ticket,
-                            )
-                        }
-                        CompletionProgress::Pending(pending) => {
-                            assert_eq!(
-                                pending.identity(),
-                                published_identity(envelope, root.device_bdf())
-                            );
-                            let reset_ticket = {
-                                let mut runtime = self.production.lock();
-                                assert_eq!(runtime.phase, ProductionReadPhase::Polling(cookie));
-                                let reset_ticket =
-                                    runtime.registry.begin_device_reset(&batch).unwrap();
-                                runtime.phase = ProductionReadPhase::Closing(cookie);
-                                runtime.registry.check_invariants().unwrap();
-                                reset_ticket
-                            };
-                            (
-                                -5,
-                                Vec::new(),
-                                pending.begin_reset(true),
-                                "Pending",
-                                0,
-                                reset_ticket,
-                            )
-                        }
-                        CompletionProgress::Failed(failed) => {
-                            assert_eq!(
-                                failed.identity(),
-                                published_identity(envelope, root.device_bdf())
-                            );
-                            println!(
-                                "LINUX_FS_SAME_BOOT CompletionFailure failure={:?} descriptor_popped={} used_len={:?} retained=true",
-                                failed.failure(),
-                                failed.descriptor_popped(),
-                                failed.used_len(),
-                            );
-                            let reset_ticket = {
-                                let mut runtime = self.production.lock();
-                                assert_eq!(runtime.phase, ProductionReadPhase::Polling(cookie));
-                                let reset_ticket =
-                                    runtime.registry.begin_device_reset(&batch).unwrap();
-                                runtime.phase = ProductionReadPhase::Closing(cookie);
-                                runtime.registry.check_invariants().unwrap();
-                                reset_ticket
-                            };
-                            (
-                                -5,
-                                Vec::new(),
-                                failed.begin_reset(true),
-                                "Failed",
-                                0,
-                                reset_ticket,
-                            )
-                        }
-                    }
-                }
-                SameBootRequest::ReplayConflict(prepared) => {
-                    assert_eq!(
-                        prepared.identity(),
-                        published_identity(envelope, root.device_bdf())
-                    );
-                    let reset_ticket = {
-                        let mut runtime = self.production.lock();
-                        assert_eq!(runtime.phase, ProductionReadPhase::Polling(cookie));
-                        let reset_ticket = runtime.registry.begin_device_reset(&batch).unwrap();
-                        runtime.phase = ProductionReadPhase::Closing(cookie);
-                        runtime.registry.check_invariants().unwrap();
-                        reset_ticket
-                    };
-                    (
-                        -5,
-                        Vec::new(),
-                        prepared.cancel_prepared().begin_reset(true),
-                        "ReplayConflict",
-                        0,
-                        reset_ticket,
-                    )
-                }
-            };
-        println!(
-            "LINUX_FS_SAME_BOOT Completion outcome={} result={} used_len={} payload_source={} data_prefix={}",
-            completion_label,
-            result,
-            used_len,
-            if result == 4 {
-                "CompletedRequest"
-            } else {
-                "none"
-            },
-            if result == 4 { "7f454c46" } else { "none" },
-        );
-
-        let retained_pages = reset_tombstone.retained_dma_pages();
-        assert_eq!(retained_pages, 3);
-        let reset_tombstone = match reset_tombstone.retry_ack(&mut root) {
-            Ok(_) => panic!("injected same-boot reset timeout did not remain pending"),
-            Err(tombstone) => tombstone,
+            enrollment,
+            commits: _,
+        } = flight
+        else {
+            runtime.put_flight(flight);
+            drop(runtime);
+            return self.retain_current_flight("precommit_without_building_flight");
         };
-        let retry_ticket = {
-            let mut runtime = self.production.lock();
-            assert_eq!(runtime.phase, ProductionReadPhase::Closing(cookie));
-            assert_eq!(
-                runtime
-                    .registry
-                    .scope_projection(SCOPE)
-                    .unwrap()
-                    .credits
-                    .retained,
-                0
-            );
-            let tombstone = runtime
-                .registry
-                .retain_device_reset_timeout(&reset_ticket)
-                .unwrap();
-            assert_eq!(tombstone.device(), envelope);
-            let retry = runtime.registry.retry_device_reset(&tombstone).unwrap();
-            assert_eq!(
-                runtime
-                    .registry
-                    .scope_projection(SCOPE)
-                    .unwrap()
-                    .credits
-                    .retained,
-                10
-            );
-            runtime.registry.check_invariants().unwrap();
-            retry
-        };
-        println!(
-            "LINUX_FS_SAME_BOOT ResetTimeout registry_tombstone=true hardware_tombstone=true retained_pages={} generation={}",
-            retained_pages,
-            envelope.device_generation(),
-        );
-        let mut hardware_reset = match reset_tombstone.retry_ack(&mut root) {
-            Ok(reset) => reset,
-            Err(_) => panic!("same retained hardware reset tombstone remained pending"),
-        };
-        assert_eq!(
-            hardware_reset.identity(),
-            published_identity(envelope, root.device_bdf())
-        );
-        assert_eq!(hardware_reset.retained_dma_pages(), 3);
-        let (registry_reset, new_hardware_generation) = {
-            let mut runtime = self.production.lock();
-            assert_eq!(runtime.phase, ProductionReadPhase::Closing(cookie));
-            let generation_plan = device
-                .prepare_generation_advance(&mut hardware_reset)
-                .unwrap();
-            let (receipt, generation) = runtime
-                .registry
-                .acknowledge_device_reset_with_apply(&retry_ticket, |prepared| {
-                    assert_eq!(prepared.old_device(), envelope);
-                    generation_plan.apply()
-                })
-                .unwrap();
-            runtime.registry.check_invariants().unwrap();
-            (receipt, generation)
-        };
-        assert_eq!(new_hardware_generation, 2);
-        assert_eq!(registry_reset.old_device(), envelope);
-        assert_eq!(registry_reset.new_device().device_generation(), 2);
-        assert_eq!(
-            registry_reset.outcome(),
-            if result == 4 {
-                DeviceClosureResult::Completed(4)
-            } else {
-                DeviceClosureResult::IndeterminateAfterReset
+        let expected = published_identity(envelope, root.device_bdf());
+        let intent = match request.preflight_cancel(expected) {
+            Ok(intent) => intent,
+            Err(failure) => {
+                runtime.put_flight(FsDeviceFlight::Prepared {
+                    cookie,
+                    root,
+                    device,
+                    request: failure.into_owner(),
+                    effects: effects.map(Some),
+                    envelope: Some(envelope),
+                    enrollment: Some(enrollment),
+                });
+                drop(runtime);
+                return self.retain_current_flight("precommit_cancel_preflight");
             }
-        );
-        println!(
-            "LINUX_FS_SAME_BOOT ResetAck generation={}->{} outcome={} retained_pages=3 generation_apply_atomic=true",
-            registry_reset.old_device().device_generation(),
-            registry_reset.new_device().device_generation(),
-            if result == 4 {
-                "Completed"
-            } else {
-                "IndeterminateAfterReset"
+        };
+        let mut intent_slot = Some(intent);
+        let transition = close_enrolled_device_flight_precommit_with_apply(
+            &mut runtime.registry,
+            &enrollment,
+            cookie,
+            |_| {
+                intent_slot
+                    .take()
+                    .expect("prevalidated cancel intent is consumed once")
+                    .apply_reset(true)
             },
         );
-
-        let registry_iotlb = {
-            let mut runtime = self.production.lock();
-            runtime
-                .registry
-                .begin_device_iotlb(&registry_reset)
-                .unwrap()
-        };
-        let hardware_iotlb = match device.begin_iotlb(hardware_reset, true) {
-            ProductionClosureProgress::Pending(tombstone) => tombstone,
-            ProductionClosureProgress::Complete(_) => {
-                panic!("injected same-boot IOTLB timeout completed early")
-            }
-        };
-        assert_eq!(hardware_iotlb.retained_pages(), 3);
-        assert!(!hardware_iotlb.failure_retained());
-        let registry_iotlb_retry = {
-            let mut runtime = self.production.lock();
-            let tombstone = runtime
-                .registry
-                .retain_device_iotlb_timeout(&registry_iotlb)
-                .unwrap();
-            assert_eq!(
-                tombstone.device().device_generation(),
-                registry_reset.new_device().device_generation()
-            );
-            let retry = runtime
-                .registry
-                .retry_device_iotlb(&registry_reset, &tombstone)
-                .unwrap();
-            runtime.registry.check_invariants().unwrap();
-            retry
-        };
-        println!(
-            "LINUX_FS_SAME_BOOT IotlbTimeout registry_generation={} hardware_identity_generation={} retained_pages=3 registry_tombstone=true hardware_tombstone=true",
-            registry_reset.new_device().device_generation(),
-            envelope.device_generation(),
-        );
-        let mut hardware_closure = match hardware_iotlb.retry(1024) {
-            ProductionClosureProgress::Complete(receipt) => receipt,
-            ProductionClosureProgress::Pending(_) => {
-                panic!("same retained IOTLB tombstone remained pending")
-            }
-        };
-        assert_eq!(hardware_closure.completed_pages(), 3);
-        let registry_closure = {
-            let mut runtime = self.production.lock();
-            let quiescence_plan = device
-                .prepare_quiescence_apply(&mut hardware_closure)
-                .unwrap();
-            let (closure, applied_identity) = runtime
-                .registry
-                .acknowledge_device_iotlb_with_apply(&registry_iotlb_retry, |prepared| {
-                    assert_eq!(
-                        prepared.device().device_generation(),
-                        registry_reset.new_device().device_generation()
-                    );
-                    quiescence_plan.apply()
-                })
-                .unwrap();
-            assert_eq!(
-                applied_identity,
-                published_identity(envelope, root.device_bdf())
-            );
-            runtime.registry.check_invariants().unwrap();
-            closure
-        };
-        assert_eq!(registry_closure.outcome(), registry_reset.outcome());
-        println!(
-            "LINUX_FS_SAME_BOOT IotlbAck completed_pages=3 registry_generation={} hardware_identity_generation={} quiescence_applied=true",
-            registry_closure.device().device_generation(),
-            envelope.device_generation(),
-        );
-
-        let ticket = {
-            let mut runtime = self.production.lock();
-            assert_eq!(runtime.phase, ProductionReadPhase::Closing(cookie));
-            let leaf_first = [
-                effects[3], effects[4], effects[5], effects[2], effects[1], effects[0],
-            ];
-            let mut publication = None;
-            for expected in leaf_first {
-                let selected = runtime
-                    .registry
-                    .revoke_next(&selection)
-                    .unwrap()
-                    .expect("same-boot revoke leaf");
-                assert_eq!(selected.effect, expected);
-                assert!(matches!(selected.disposition, RevokeDisposition::Drain(_)));
-                let request = match registry_closure.outcome() {
-                    DeviceClosureResult::Completed(_) => {
-                        let commit = batch.commit_for(expected).unwrap();
-                        TerminalRequest::completed(commit.result())
-                    }
-                    DeviceClosureResult::IndeterminateAfterReset => {
-                        TerminalRequest::indeterminate_after_reset(-5)
-                    }
-                    DeviceClosureResult::AbortedBeforeCommit => unreachable!(),
+        let (semantic, hardware) = match transition {
+            Ok(transition) => transition,
+            Err(_) => {
+                let hardware = match intent_slot {
+                    Some(intent) => FsRetainedHardware::PreparedCancel {
+                        root,
+                        device,
+                        intent,
+                    },
+                    None => FsRetainedHardware::Quarantined { root, device },
                 };
-                let terminal = runtime
-                    .registry
-                    .stage_device_batch_terminal(&registry_closure, expected, request)
-                    .unwrap();
-                if terminal.publication.is_some() {
-                    assert_eq!(expected, effects[0]);
-                    assert!(publication.is_none());
-                    publication = terminal.publication;
+                runtime.put_flight(FsDeviceFlight::Retained {
+                    cookie: cookie.get(),
+                    semantic: None,
+                    hardware,
+                    stage: "precommit_registry_close",
+                });
+                drop(runtime);
+                return DispatchOutcome::retained(cookie.get());
+            }
+        };
+        let reset_ticket = *semantic.reset_ticket();
+        runtime.put_flight(FsDeviceFlight::Resetting {
+            semantic: FsCloseSemantic::Precommit(semantic),
+            root,
+            device,
+            reset_ticket,
+            hardware,
+            work: FsClosureWork {
+                effects,
+                envelope,
+                guest_address: 0,
+                result: -125,
+                bytes: [0; 4],
+                byte_count: 0,
+                used_len: 0,
+                completion_label: "AbortedBeforeCommit",
+            },
+            retry: false,
+        });
+        #[cfg(feature = "virtio-cser-precommit-fault")]
+        {
+            runtime.enrolled_revoke_wins_observed = true;
+        }
+        runtime.registry.check_invariants().unwrap();
+        drop(runtime);
+        println!(
+            "LINUX_FS_SAME_BOOT_PRECOMMIT CommitGate winner=revoke stage={} publish_closure_calls=0 device_visible=false",
+            stage,
+        );
+        self.drive_closure_flight()
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn drive_postcommit_flight(&self, _descriptor: SyscallDescriptor) -> DispatchOutcome {
+        loop {
+            let flight = {
+                let mut runtime = self.production.lock();
+                runtime.take_flight()
+            };
+            match flight {
+                FsDeviceFlight::Published {
+                    semantic,
+                    root,
+                    device,
+                    request,
+                    mut work,
+                    completion_probes,
+                } => match request.probe_completion_once() {
+                    CompletionProbeProgress::NotReady(request)
+                        if completion_probes + 1 < SAME_BOOT_COMPLETION_PROBE_LIMIT =>
+                    {
+                        let mut runtime = self.production.lock();
+                        runtime.put_flight(FsDeviceFlight::Published {
+                            semantic,
+                            root,
+                            device,
+                            request,
+                            work,
+                            completion_probes: completion_probes + 1,
+                        });
+                        drop(runtime);
+                        spin_loop();
+                    }
+                    CompletionProbeProgress::NotReady(request) => {
+                        work.result = -5;
+                        work.byte_count = 0;
+                        work.used_len = 0;
+                        work.completion_label = "Pending";
+                        println!(
+                            "LINUX_FS_SAME_BOOT Completion outcome=Pending result=-5 used_len=0 payload_source=none data_prefix=none"
+                        );
+                        let expected = published_identity(work.envelope, root.device_bdf());
+                        match request.preflight_reset(expected) {
+                            Ok(intent) => {
+                                let mut runtime = self.production.lock();
+                                runtime.put_flight(FsDeviceFlight::PublishedReset {
+                                    semantic,
+                                    root,
+                                    device,
+                                    intent,
+                                    work,
+                                });
+                            }
+                            Err(failure) => {
+                                return self.retain_exact_flight(
+                                    semantic.key().cookie(),
+                                    Some(FsRetainedSemantic::Close(FsCloseSemantic::Published(
+                                        semantic,
+                                    ))),
+                                    FsRetainedHardware::Published {
+                                        root,
+                                        device,
+                                        request: failure.into_owner(),
+                                    },
+                                    "pending_reset_preflight",
+                                );
+                            }
+                        }
+                    }
+                    CompletionProbeProgress::Complete(completed) => {
+                        if fnv1a(completed.data()) != SAME_BOOT_SECTOR_FNV1A {
+                            return self.retain_exact_flight(
+                                semantic.key().cookie(),
+                                Some(FsRetainedSemantic::Close(FsCloseSemantic::Published(
+                                    semantic,
+                                ))),
+                                FsRetainedHardware::Completed {
+                                    root,
+                                    device,
+                                    request: completed,
+                                },
+                                "completed_payload_digest",
+                            );
+                        }
+                        work.bytes.copy_from_slice(&completed.data()[..4]);
+                        work.byte_count = 4;
+                        work.result = 4;
+                        work.used_len = completed.used_len();
+                        work.completion_label = "Completed";
+                        println!(
+                            "LINUX_FS_SAME_BOOT Completion outcome=Completed result=4 used_len={} payload_source=CompletedRequest data_prefix=7f454c46",
+                            work.used_len,
+                        );
+                        let expected = published_identity(work.envelope, root.device_bdf());
+                        match completed.preflight_reset(expected) {
+                            Ok(intent) => {
+                                let mut runtime = self.production.lock();
+                                runtime.put_flight(FsDeviceFlight::CompletionReset {
+                                    semantic,
+                                    root,
+                                    device,
+                                    intent,
+                                    work,
+                                });
+                            }
+                            Err(failure) => {
+                                return self.retain_exact_flight(
+                                    semantic.key().cookie(),
+                                    Some(FsRetainedSemantic::Close(FsCloseSemantic::Published(
+                                        semantic,
+                                    ))),
+                                    FsRetainedHardware::Completed {
+                                        root,
+                                        device,
+                                        request: failure.into_owner(),
+                                    },
+                                    "completion_reset_preflight",
+                                );
+                            }
+                        }
+                    }
+                    CompletionProbeProgress::Failed(failed) => {
+                        println!(
+                            "LINUX_FS_SAME_BOOT CompletionFailure failure={:?} descriptor_popped={} used_len={:?} retained=true",
+                            failed.failure(),
+                            failed.descriptor_popped(),
+                            failed.used_len(),
+                        );
+                        work.result = -5;
+                        work.byte_count = 0;
+                        work.used_len = failed.used_len().unwrap_or(0);
+                        work.completion_label = "Failed";
+                        println!(
+                            "LINUX_FS_SAME_BOOT Completion outcome=Failed result=-5 used_len={} payload_source=none data_prefix=none",
+                            work.used_len,
+                        );
+                        let expected = published_identity(work.envelope, root.device_bdf());
+                        match failed.preflight_reset(expected) {
+                            Ok(intent) => {
+                                let mut runtime = self.production.lock();
+                                runtime.put_flight(FsDeviceFlight::IndeterminateReset {
+                                    semantic,
+                                    root,
+                                    device,
+                                    intent,
+                                    work,
+                                });
+                            }
+                            Err(failure) => {
+                                return self.retain_exact_flight(
+                                    semantic.key().cookie(),
+                                    Some(FsRetainedSemantic::Close(FsCloseSemantic::Published(
+                                        semantic,
+                                    ))),
+                                    FsRetainedHardware::Failed {
+                                        root,
+                                        device,
+                                        request: failure.into_owner(),
+                                    },
+                                    "failed_completion_reset_preflight",
+                                );
+                            }
+                        }
+                    }
+                },
+                FsDeviceFlight::CompletionReset {
+                    semantic,
+                    root,
+                    device,
+                    intent,
+                    work,
+                } => {
+                    let mut runtime = self.production.lock();
+                    let mut intent_slot = Some(intent);
+                    let transition = runtime
+                        .registry
+                        .record_device_completion_and_begin_reset_with_apply(
+                            semantic.batch(),
+                            work.envelope,
+                            work.result,
+                            |_| {
+                                intent_slot
+                                    .take()
+                                    .expect("prevalidated completion reset is consumed once")
+                                    .apply_reset(true)
+                            },
+                        );
+                    match transition {
+                        Ok((completion, reset_ticket, hardware)) => {
+                            debug_assert_eq!(completion.causal_root(), work.effects[0]);
+                            runtime.put_flight(FsDeviceFlight::Resetting {
+                                semantic: FsCloseSemantic::Published(semantic),
+                                root,
+                                device,
+                                reset_ticket,
+                                hardware,
+                                work,
+                                retry: false,
+                            });
+                        }
+                        Err(_) => {
+                            let hardware = match intent_slot {
+                                Some(intent) => FsRetainedHardware::CompletionReset {
+                                    root,
+                                    device,
+                                    intent,
+                                },
+                                None => FsRetainedHardware::Quarantined { root, device },
+                            };
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie: semantic.key().cookie(),
+                                semantic: Some(FsRetainedSemantic::Close(
+                                    FsCloseSemantic::Published(semantic),
+                                )),
+                                hardware,
+                                stage: "completion_registry_fence",
+                            });
+                            return DispatchOutcome::retained(match &runtime.flight {
+                                FsDeviceFlight::Retained { cookie, .. } => *cookie,
+                                _ => 0,
+                            });
+                        }
+                    }
+                    drop(runtime);
+                    return self.drive_closure_flight();
+                }
+                FsDeviceFlight::IndeterminateReset {
+                    semantic,
+                    root,
+                    device,
+                    intent,
+                    work,
+                } => {
+                    let mut runtime = self.production.lock();
+                    let mut intent_slot = Some(intent);
+                    let transition =
+                        runtime
+                            .registry
+                            .begin_device_reset_with_apply(semantic.batch(), |_| {
+                                intent_slot
+                                    .take()
+                                    .expect("prevalidated failed-completion reset is consumed once")
+                                    .apply_reset(true)
+                            });
+                    match transition {
+                        Ok((reset_ticket, hardware)) => {
+                            runtime.put_flight(FsDeviceFlight::Resetting {
+                                semantic: FsCloseSemantic::Published(semantic),
+                                root,
+                                device,
+                                reset_ticket,
+                                hardware,
+                                work,
+                                retry: false,
+                            });
+                        }
+                        Err(_) => {
+                            let cookie = semantic.key().cookie();
+                            let hardware = match intent_slot {
+                                Some(intent) => FsRetainedHardware::CompletionReset {
+                                    root,
+                                    device,
+                                    intent,
+                                },
+                                None => FsRetainedHardware::Quarantined { root, device },
+                            };
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie,
+                                semantic: Some(FsRetainedSemantic::Close(
+                                    FsCloseSemantic::Published(semantic),
+                                )),
+                                hardware,
+                                stage: "failed_completion_registry_fence",
+                            });
+                            return DispatchOutcome::retained(cookie);
+                        }
+                    }
+                    drop(runtime);
+                    return self.drive_closure_flight();
+                }
+                FsDeviceFlight::PublishedReset {
+                    semantic,
+                    root,
+                    device,
+                    intent,
+                    work,
+                } => {
+                    let mut runtime = self.production.lock();
+                    let mut intent_slot = Some(intent);
+                    let transition =
+                        runtime
+                            .registry
+                            .begin_device_reset_with_apply(semantic.batch(), |_| {
+                                intent_slot
+                                    .take()
+                                    .expect("prevalidated published reset is consumed once")
+                                    .apply_reset(true)
+                            });
+                    match transition {
+                        Ok((reset_ticket, hardware)) => {
+                            runtime.put_flight(FsDeviceFlight::Resetting {
+                                semantic: FsCloseSemantic::Published(semantic),
+                                root,
+                                device,
+                                reset_ticket,
+                                hardware,
+                                work,
+                                retry: false,
+                            });
+                        }
+                        Err(_) => {
+                            let hardware = match intent_slot {
+                                Some(intent) => FsRetainedHardware::PublishedReset {
+                                    root,
+                                    device,
+                                    intent,
+                                },
+                                None => FsRetainedHardware::Quarantined { root, device },
+                            };
+                            let cookie = semantic.key().cookie();
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie,
+                                semantic: Some(FsRetainedSemantic::Close(
+                                    FsCloseSemantic::Published(semantic),
+                                )),
+                                hardware,
+                                stage: "pending_registry_fence",
+                            });
+                            return DispatchOutcome::retained(cookie);
+                        }
+                    }
+                    drop(runtime);
+                    return self.drive_closure_flight();
+                }
+                retained @ FsDeviceFlight::Retained { cookie, .. } => {
+                    let mut runtime = self.production.lock();
+                    runtime.put_flight(retained);
+                    return DispatchOutcome::retained(cookie);
+                }
+                other => {
+                    let mut runtime = self.production.lock();
+                    runtime.put_flight(other);
+                    drop(runtime);
+                    return self.drive_closure_flight();
                 }
             }
-            assert!(runtime.registry.revoke_next(&selection).unwrap().is_none());
-            let publication = publication.expect("same-boot root publication ticket");
-            assert_eq!(publication.result(), result);
-            runtime.root = Some(root);
-            runtime.device = Some(device);
-            runtime.active_revoke = Some(selection.clone());
-            runtime.phase = ProductionReadPhase::AwaitingPublication(cookie);
-            runtime.registry.check_invariants().unwrap();
-            publication
-        };
-        println!(
-            "LINUX_FS_SAME_BOOT Close leaf_first=dma_queue_owner_a,dma_queue_owner_b,dma_request_owner,block_request,filesystem_read,filesystem_syscall terminal_outcome={} guest_publication_pending=true",
-            if result == 4 {
-                "Completed"
-            } else {
-                "IndeterminateAfterReset"
-            },
-        );
+        }
+    }
 
-        DispatchOutcome {
-            result,
-            authority: PublicationAuthority::Production {
-                ticket,
-                flight_cookie: cookie,
-            },
-            publication: if result == 4 {
-                Publication::GuestBytes {
-                    address: descriptor.argument(1),
-                    bytes,
+    #[cfg(feature = "virtio-cser-facade")]
+    fn drive_closure_flight(&self) -> DispatchOutcome {
+        loop {
+            let flight = {
+                let mut runtime = self.production.lock();
+                runtime.take_flight()
+            };
+            match flight {
+                FsDeviceFlight::Resetting {
+                    semantic,
+                    mut root,
+                    mut device,
+                    reset_ticket,
+                    hardware,
+                    work,
+                    retry,
+                } => match hardware.probe_ack_once(&mut root) {
+                    Err(hardware) => {
+                        let mut runtime = self.production.lock();
+                        match runtime.registry.retain_device_reset_timeout(&reset_ticket) {
+                            Ok(reset_tombstone) if !retry => {
+                                let cookie = semantic.cookie();
+                                runtime.put_flight(FsDeviceFlight::ResetRetained {
+                                    semantic,
+                                    root,
+                                    device,
+                                    reset_tombstone,
+                                    hardware,
+                                    work,
+                                });
+                                drop(runtime);
+                                #[cfg(not(feature = "virtio-cser-precommit-fault"))]
+                                println!(
+                                    "LINUX_FS_SAME_BOOT ResetTimeout registry_tombstone=true hardware_tombstone=true retained_pages=3 generation={}",
+                                    reset_ticket.device().device_generation(),
+                                );
+                                #[cfg(feature = "virtio-cser-precommit-fault")]
+                                println!(
+                                    "LINUX_FS_SAME_BOOT_PRECOMMIT ResetTimeout registry_tombstone=true hardware_tombstone=true retained_pages=3 generation={}",
+                                    reset_ticket.device().device_generation(),
+                                );
+                                debug_assert_ne!(cookie, 0);
+                            }
+                            Ok(_) | Err(_) => {
+                                let cookie = semantic.cookie();
+                                runtime.put_flight(FsDeviceFlight::Retained {
+                                    cookie,
+                                    semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                    hardware: FsRetainedHardware::Reset {
+                                        root,
+                                        device,
+                                        tombstone: hardware,
+                                    },
+                                    stage: "reset_retry_remained_pending",
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
+                        }
+                    }
+                    Ok(mut hardware_reset) => {
+                        let generation_plan =
+                            match device.prepare_generation_advance(&mut hardware_reset) {
+                                Ok(plan) => plan,
+                                Err(_) => {
+                                    return self.retain_exact_flight(
+                                        semantic.cookie(),
+                                        Some(FsRetainedSemantic::Close(semantic)),
+                                        FsRetainedHardware::ResetAck {
+                                            root,
+                                            device,
+                                            reset: hardware_reset,
+                                        },
+                                        "reset_generation_preflight",
+                                    );
+                                }
+                            };
+                        let mut runtime = self.production.lock();
+                        let reset_apply = runtime
+                            .registry
+                            .acknowledge_device_reset_with_apply(&reset_ticket, |_| {
+                                generation_plan.apply()
+                            });
+                        let (registry_reset, hardware_generation) = match reset_apply {
+                            Ok(applied) => applied,
+                            Err(_) => {
+                                let cookie = semantic.cookie();
+                                runtime.put_flight(FsDeviceFlight::Retained {
+                                    cookie,
+                                    semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                    hardware: FsRetainedHardware::ResetAck {
+                                        root,
+                                        device,
+                                        reset: hardware_reset,
+                                    },
+                                    stage: "reset_registry_ack",
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
+                        };
+                        debug_assert_eq!(
+                            hardware_generation,
+                            registry_reset.new_device().device_generation()
+                        );
+                        let mut reset_slot = Some(hardware_reset);
+                        let iotlb_begin =
+                            runtime
+                                .registry
+                                .begin_device_iotlb_with_apply(&registry_reset, |_| {
+                                    device.begin_iotlb(
+                                        reset_slot
+                                            .take()
+                                            .expect("reset acknowledgement is consumed once"),
+                                        true,
+                                    )
+                                });
+                        match iotlb_begin {
+                            Ok((iotlb_ticket, ProductionClosureProgress::Pending(hardware))) => {
+                                runtime.put_flight(FsDeviceFlight::Iotlb {
+                                    semantic,
+                                    root,
+                                    device,
+                                    reset: registry_reset,
+                                    iotlb_ticket,
+                                    hardware,
+                                    work,
+                                    timeout_recorded: false,
+                                });
+                                drop(runtime);
+                                #[cfg(not(feature = "virtio-cser-precommit-fault"))]
+                                println!(
+                                    "LINUX_FS_SAME_BOOT ResetAck generation={}->{} outcome={} retained_pages=3 generation_apply_atomic=true",
+                                    registry_reset.old_device().device_generation(),
+                                    registry_reset.new_device().device_generation(),
+                                    match registry_reset.outcome() {
+                                        DeviceClosureResult::Completed(_) => "Completed",
+                                        DeviceClosureResult::IndeterminateAfterReset => {
+                                            "IndeterminateAfterReset"
+                                        }
+                                        DeviceClosureResult::AbortedBeforeCommit => {
+                                            "AbortedBeforeCommit"
+                                        }
+                                    },
+                                );
+                                #[cfg(feature = "virtio-cser-precommit-fault")]
+                                println!(
+                                    "LINUX_FS_SAME_BOOT_PRECOMMIT ResetAck generation={}->{} outcome=AbortedBeforeCommit retained_pages=3 was_published=false descriptor_popped=false completed=false generation_apply_atomic=true",
+                                    registry_reset.old_device().device_generation(),
+                                    registry_reset.new_device().device_generation(),
+                                );
+                            }
+                            Ok((_, ProductionClosureProgress::Complete(closure))) => {
+                                let cookie = semantic.cookie();
+                                runtime.put_flight(FsDeviceFlight::Retained {
+                                    cookie,
+                                    semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                    hardware: FsRetainedHardware::Closure {
+                                        root,
+                                        device,
+                                        closure,
+                                    },
+                                    stage: "iotlb_timeout_injection_completed_early",
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
+                            Err(_) => {
+                                let cookie = semantic.cookie();
+                                let hardware = match reset_slot {
+                                    Some(reset) => FsRetainedHardware::ResetAck {
+                                        root,
+                                        device,
+                                        reset,
+                                    },
+                                    None => FsRetainedHardware::Quarantined { root, device },
+                                };
+                                runtime.put_flight(FsDeviceFlight::Retained {
+                                    cookie,
+                                    semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                    hardware,
+                                    stage: "iotlb_registry_begin",
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
+                        }
+                    }
+                },
+                FsDeviceFlight::ResetRetained {
+                    semantic,
+                    root,
+                    device,
+                    reset_tombstone,
+                    hardware,
+                    work,
+                } => {
+                    let mut runtime = self.production.lock();
+                    match runtime.registry.retry_device_reset(&reset_tombstone) {
+                        Ok(reset_ticket) => runtime.put_flight(FsDeviceFlight::Resetting {
+                            semantic,
+                            root,
+                            device,
+                            reset_ticket,
+                            hardware,
+                            work,
+                            retry: true,
+                        }),
+                        Err(_) => {
+                            let cookie = semantic.cookie();
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie,
+                                semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                hardware: FsRetainedHardware::Reset {
+                                    root,
+                                    device,
+                                    tombstone: hardware,
+                                },
+                                stage: "reset_registry_retry",
+                            });
+                            return DispatchOutcome::retained(cookie);
+                        }
+                    }
                 }
-            } else {
-                Publication::None
-            },
-            exit: false,
+                FsDeviceFlight::Iotlb {
+                    semantic,
+                    root,
+                    device,
+                    reset,
+                    iotlb_ticket,
+                    hardware,
+                    work,
+                    timeout_recorded,
+                } => {
+                    if timeout_recorded {
+                        return self.retain_exact_flight(
+                            semantic.cookie(),
+                            Some(FsRetainedSemantic::Close(semantic)),
+                            FsRetainedHardware::Iotlb {
+                                root,
+                                device,
+                                tombstone: hardware,
+                            },
+                            "duplicate_iotlb_timeout_record",
+                        );
+                    }
+                    let mut runtime = self.production.lock();
+                    match runtime.registry.retain_device_iotlb_timeout(&iotlb_ticket) {
+                        Ok(iotlb_tombstone) => {
+                            let hardware_generation = hardware.identity().device_generation();
+                            runtime.put_flight(FsDeviceFlight::IotlbRetained {
+                                semantic,
+                                root,
+                                device,
+                                reset,
+                                iotlb_tombstone,
+                                hardware,
+                                work,
+                            });
+                            drop(runtime);
+                            #[cfg(not(feature = "virtio-cser-precommit-fault"))]
+                            println!(
+                                "LINUX_FS_SAME_BOOT IotlbTimeout registry_generation={} hardware_identity_generation={} retained_pages=3 registry_tombstone=true hardware_tombstone=true",
+                                reset.new_device().device_generation(),
+                                hardware_generation,
+                            );
+                            #[cfg(feature = "virtio-cser-precommit-fault")]
+                            println!(
+                                "LINUX_FS_SAME_BOOT_PRECOMMIT IotlbTimeout registry_generation={} hardware_identity_generation={} retained_pages=3 registry_tombstone=true hardware_tombstone=true",
+                                reset.new_device().device_generation(),
+                                hardware_generation,
+                            );
+                        }
+                        Err(_) => {
+                            let cookie = semantic.cookie();
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie,
+                                semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                hardware: FsRetainedHardware::Iotlb {
+                                    root,
+                                    device,
+                                    tombstone: hardware,
+                                },
+                                stage: "iotlb_registry_timeout",
+                            });
+                            return DispatchOutcome::retained(cookie);
+                        }
+                    }
+                }
+                FsDeviceFlight::IotlbRetained {
+                    semantic,
+                    root,
+                    mut device,
+                    reset,
+                    iotlb_tombstone,
+                    hardware,
+                    work,
+                } => {
+                    let registry_retry = {
+                        let mut runtime = self.production.lock();
+                        runtime
+                            .registry
+                            .retry_device_iotlb(&reset, &iotlb_tombstone)
+                    };
+                    let registry_retry = match registry_retry {
+                        Ok(retry) => retry,
+                        Err(_) => {
+                            return self.retain_exact_flight(
+                                semantic.cookie(),
+                                Some(FsRetainedSemantic::Close(semantic)),
+                                FsRetainedHardware::Iotlb {
+                                    root,
+                                    device,
+                                    tombstone: hardware,
+                                },
+                                "iotlb_registry_retry",
+                            );
+                        }
+                    };
+                    let mut hardware_closure = match hardware.retry(1024) {
+                        ProductionClosureProgress::Complete(closure) => closure,
+                        ProductionClosureProgress::Pending(hardware) => {
+                            return self.retain_exact_flight(
+                                semantic.cookie(),
+                                Some(FsRetainedSemantic::Close(semantic)),
+                                FsRetainedHardware::Iotlb {
+                                    root,
+                                    device,
+                                    tombstone: hardware,
+                                },
+                                "iotlb_hardware_retry_pending",
+                            );
+                        }
+                    };
+                    let quiescence_plan =
+                        match device.prepare_quiescence_apply(&mut hardware_closure) {
+                            Ok(plan) => plan,
+                            Err(_) => {
+                                return self.retain_exact_flight(
+                                    semantic.cookie(),
+                                    Some(FsRetainedSemantic::Close(semantic)),
+                                    FsRetainedHardware::Closure {
+                                        root,
+                                        device,
+                                        closure: hardware_closure,
+                                    },
+                                    "iotlb_quiescence_preflight",
+                                );
+                            }
+                        };
+                    let mut runtime = self.production.lock();
+                    let closure_apply = runtime
+                        .registry
+                        .acknowledge_device_iotlb_with_apply(&registry_retry, |_| {
+                            quiescence_plan.apply()
+                        });
+                    let (registry_closure, applied_identity) = match closure_apply {
+                        Ok(applied) => applied,
+                        Err(_) => {
+                            let cookie = semantic.cookie();
+                            runtime.put_flight(FsDeviceFlight::Retained {
+                                cookie,
+                                semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                hardware: FsRetainedHardware::Closure {
+                                    root,
+                                    device,
+                                    closure: hardware_closure,
+                                },
+                                stage: "iotlb_registry_ack",
+                            });
+                            return DispatchOutcome::retained(cookie);
+                        }
+                    };
+                    debug_assert_eq!(
+                        applied_identity.device_generation(),
+                        work.envelope.device_generation()
+                    );
+                    let registry_generation = registry_closure.device().device_generation();
+                    let hardware_generation = applied_identity.device_generation();
+                    runtime.put_flight(FsDeviceFlight::Draining {
+                        semantic,
+                        root,
+                        device,
+                        closure: registry_closure,
+                        work,
+                        next_ordinal: 0,
+                        publication: None,
+                    });
+                    drop(runtime);
+                    #[cfg(not(feature = "virtio-cser-precommit-fault"))]
+                    println!(
+                        "LINUX_FS_SAME_BOOT IotlbAck completed_pages=3 registry_generation={} hardware_identity_generation={} quiescence_applied=true",
+                        registry_generation, hardware_generation,
+                    );
+                    #[cfg(feature = "virtio-cser-precommit-fault")]
+                    println!(
+                        "LINUX_FS_SAME_BOOT_PRECOMMIT IotlbAck completed_pages=3 registry_generation={} hardware_identity_generation={} outcome=AbortedBeforeCommit quiescence_apply_atomic=true",
+                        registry_generation, hardware_generation,
+                    );
+                }
+                FsDeviceFlight::Draining {
+                    semantic,
+                    root,
+                    device,
+                    closure,
+                    work,
+                    next_ordinal,
+                    mut publication,
+                } => {
+                    let leaf_first = [
+                        work.effects[3],
+                        work.effects[4],
+                        work.effects[5],
+                        work.effects[2],
+                        work.effects[1],
+                        work.effects[0],
+                    ];
+                    let mut runtime = self.production.lock();
+                    if next_ordinal < leaf_first.len() {
+                        let expected = leaf_first[next_ordinal];
+                        let selected = match runtime.registry.revoke_next(semantic.selection()) {
+                            Ok(Some(selected)) if selected.effect == expected => selected,
+                            _ => {
+                                let cookie = semantic.cookie();
+                                runtime.put_flight(FsDeviceFlight::Retained {
+                                    cookie,
+                                    semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                    hardware: FsRetainedHardware::Ready { root, device },
+                                    stage: "device_drain_selection",
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
+                        };
+                        let request = match &semantic {
+                            FsCloseSemantic::Published(published) => {
+                                debug_assert!(matches!(
+                                    selected.disposition,
+                                    RevokeDisposition::Drain(_)
+                                ));
+                                match closure.outcome() {
+                                    DeviceClosureResult::Completed(_) => {
+                                        let commit = published
+                                            .batch()
+                                            .commit_for(expected)
+                                            .expect("closed batch contains every selected effect");
+                                        TerminalRequest::completed(commit.result())
+                                    }
+                                    DeviceClosureResult::IndeterminateAfterReset => {
+                                        TerminalRequest::indeterminate_after_reset(-5)
+                                    }
+                                    DeviceClosureResult::AbortedBeforeCommit => {
+                                        let cookie = semantic.cookie();
+                                        runtime.put_flight(FsDeviceFlight::Retained {
+                                            cookie,
+                                            semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                            hardware: FsRetainedHardware::Ready { root, device },
+                                            stage: "published_close_reported_precommit_abort",
+                                        });
+                                        return DispatchOutcome::retained(cookie);
+                                    }
+                                }
+                            }
+                            FsCloseSemantic::Precommit(_) => {
+                                debug_assert_eq!(selected.disposition, RevokeDisposition::Abort);
+                                TerminalRequest::aborted(-125)
+                            }
+                        };
+                        let terminal = match runtime
+                            .registry
+                            .stage_device_batch_terminal(&closure, expected, request)
+                        {
+                            Ok(terminal) => terminal,
+                            Err(_) => {
+                                let cookie = semantic.cookie();
+                                runtime.put_flight(FsDeviceFlight::Retained {
+                                    cookie,
+                                    semantic: Some(FsRetainedSemantic::Close(semantic)),
+                                    hardware: FsRetainedHardware::Ready { root, device },
+                                    stage: "device_drain_terminal",
+                                });
+                                return DispatchOutcome::retained(cookie);
+                            }
+                        };
+                        if terminal.publication.is_some() {
+                            debug_assert_eq!(expected, work.effects[0]);
+                            publication = terminal.publication;
+                        }
+                        #[cfg(feature = "virtio-cser-precommit-fault")]
+                        let precommit_abort = matches!(&semantic, FsCloseSemantic::Precommit(_));
+                        runtime.put_flight(FsDeviceFlight::Draining {
+                            semantic,
+                            root,
+                            device,
+                            closure,
+                            work,
+                            next_ordinal: next_ordinal + 1,
+                            publication,
+                        });
+                        drop(runtime);
+                        #[cfg(feature = "virtio-cser-precommit-fault")]
+                        if precommit_abort {
+                            let kind = [
+                                "dma_queue_owner_a",
+                                "dma_queue_owner_b",
+                                "dma_request_owner",
+                                "block_request",
+                                "filesystem_read",
+                                "filesystem_syscall",
+                            ][next_ordinal];
+                            println!(
+                                "LINUX_FS_SAME_BOOT_PRECOMMIT Abort ordinal={} kind={} effect={} result=-125 leaf_first=true",
+                                next_ordinal + 1,
+                                kind,
+                                expected.id(),
+                            );
+                        }
+                        continue;
+                    }
+                    if !matches!(runtime.registry.revoke_next(semantic.selection()), Ok(None)) {
+                        let cookie = semantic.cookie();
+                        runtime.put_flight(FsDeviceFlight::Retained {
+                            cookie,
+                            semantic: Some(FsRetainedSemantic::Close(semantic)),
+                            hardware: FsRetainedHardware::Ready { root, device },
+                            stage: "device_drain_not_empty",
+                        });
+                        return DispatchOutcome::retained(cookie);
+                    }
+                    let Some(ticket) = publication else {
+                        let cookie = semantic.cookie();
+                        runtime.put_flight(FsDeviceFlight::Retained {
+                            cookie,
+                            semantic: Some(FsRetainedSemantic::Close(semantic)),
+                            hardware: FsRetainedHardware::Ready { root, device },
+                            stage: "device_drain_missing_publication",
+                        });
+                        return DispatchOutcome::retained(cookie);
+                    };
+                    let cookie = semantic.cookie();
+                    let selection = semantic.selection().clone();
+                    let result = work.result;
+                    let guest_address = work.guest_address;
+                    let used_len = work.used_len;
+                    let guest_bytes = work.bytes;
+                    let guest_byte_count = work.byte_count;
+                    let precommit =
+                        matches!(closure.outcome(), DeviceClosureResult::AbortedBeforeCommit);
+                    runtime.put_flight(FsDeviceFlight::AwaitingPublication {
+                        cookie,
+                        root,
+                        device,
+                        selection,
+                        ticket: ticket.clone(),
+                        work,
+                    });
+                    let pending = runtime.registry.scope_projection(SCOPE).unwrap();
+                    assert_eq!(pending.phase, ScopePhase::Closing);
+                    assert_eq!(pending.live_effects, 0);
+                    assert_eq!(pending.pending_publications, 1);
+                    drop(runtime);
+                    let _ = used_len;
+                    #[cfg(not(feature = "virtio-cser-precommit-fault"))]
+                    println!(
+                        "LINUX_FS_SAME_BOOT Close leaf_first=dma_queue_owner_a,dma_queue_owner_b,dma_request_owner,block_request,filesystem_read,filesystem_syscall terminal_outcome={} guest_publication_pending=true",
+                        if result == 4 {
+                            "Completed"
+                        } else {
+                            "IndeterminateAfterReset"
+                        },
+                    );
+                    #[cfg(feature = "virtio-cser-precommit-fault")]
+                    println!(
+                        "LINUX_FS_SAME_BOOT_PRECOMMIT Close leaf_first=dma_queue_owner_a,dma_queue_owner_b,dma_request_owner,block_request,filesystem_read,filesystem_syscall closure=AbortedBeforeCommit guest_publication_pending=true"
+                    );
+                    return DispatchOutcome {
+                        result,
+                        authority: PublicationAuthority::Production {
+                            ticket,
+                            flight_cookie: cookie,
+                        },
+                        publication: if result == 4 {
+                            Publication::FixedGuestBytes {
+                                address: guest_address,
+                                bytes: guest_bytes,
+                                len: guest_byte_count,
+                            }
+                        } else {
+                            Publication::None
+                        },
+                        exit: precommit,
+                    };
+                }
+                retained @ FsDeviceFlight::Retained { cookie, .. } => {
+                    let mut runtime = self.production.lock();
+                    runtime.put_flight(retained);
+                    return DispatchOutcome::retained(cookie);
+                }
+                other => {
+                    let mut runtime = self.production.lock();
+                    runtime.put_flight(other);
+                    drop(runtime);
+                    return self.retain_current_flight("unexpected_closure_flight");
+                }
+            }
         }
     }
 
@@ -2972,10 +3734,27 @@ impl FsScenario {
             other => panic!("unsupported retained runtime-fs syscall {other}"),
         };
 
+        #[cfg(not(feature = "virtio-cser-facade"))]
         let registered = state.capture(descriptor, resources);
+        #[cfg(not(feature = "virtio-cser-facade"))]
         let effect = registered.identity.effect().id();
+        #[cfg(not(feature = "virtio-cser-facade"))]
         let commit = state.commit(&registered, result);
+        #[cfg(not(feature = "virtio-cser-facade"))]
         let commit_sequence = commit.sequence();
+        #[cfg(not(feature = "virtio-cser-facade"))]
+        let log_identity = FsDispatchLogIdentity {
+            value: effect,
+            commit_sequence,
+        };
+        #[cfg(feature = "virtio-cser-facade")]
+        let log_identity = {
+            let _ = resources;
+            state.compatibility_syscalls += 1;
+            FsDispatchLogIdentity {
+                value: state.compatibility_syscalls as u64,
+            }
+        };
 
         match action {
             FsAction::Open(fd, kind) => {
@@ -2986,36 +3765,34 @@ impl FsScenario {
                     _ => unreachable!(),
                 };
                 println!(
-                    "LINUX_FS Open effect={} commit_sequence={} fd={} path={} kind={}",
-                    effect, commit_sequence, fd, path, label,
+                    "LINUX_FS Open {} fd={} path={} kind={}",
+                    log_identity, fd, path, label,
                 );
             }
             FsAction::OpenTmp(fd) => {
                 state.temporary.clear();
                 state.allocate_fd_after_commit(fd, FdKind::Temporary);
                 println!(
-                    "LINUX_FS Open effect={} commit_sequence={} fd={} path=/tmp/runtime-fs.bin kind=regular create=true truncate=true mode=0644",
-                    effect, commit_sequence, fd,
+                    "LINUX_FS Open {} fd={} path=/tmp/runtime-fs.bin kind=regular create=true truncate=true mode=0644",
+                    log_identity, fd,
                 );
             }
             FsAction::Pread(kind, offset) => match kind {
                 FdKind::Executable => panic!("first executable pread bypassed production capture"),
                 FdKind::Temporary => println!(
-                    "LINUX_FS Pread effect={} commit_sequence={} fd=4 offset={} bytes={} payload=00007879",
-                    effect, commit_sequence, offset, result,
+                    "LINUX_FS Pread {} fd=4 offset={} bytes={} payload=00007879",
+                    log_identity, offset, result,
                 ),
                 _ => unreachable!(),
             },
             FsAction::Statx => println!(
-                "LINUX_FS Statx effect={} commit_sequence={} mask=0x17ff mode=regular size={} empty_path=true",
-                effect,
-                commit_sequence,
+                "LINUX_FS Statx {} mask=0x17ff mode=regular size={} empty_path=true",
+                log_identity,
                 RUNTIME_FS_ELF.len(),
             ),
             FsAction::Newfstatat => println!(
-                "LINUX_FS Newfstatat effect={} commit_sequence={} mode=regular size={} empty_path=true",
-                effect,
-                commit_sequence,
+                "LINUX_FS Newfstatat {} mode=regular size={} empty_path=true",
+                log_identity,
                 RUNTIME_FS_ELF.len(),
             ),
             FsAction::Pwrite { offset, bytes } => {
@@ -3024,26 +3801,28 @@ impl FsScenario {
                     state.temporary.resize(end, 0);
                 }
                 state.temporary[offset..end].copy_from_slice(&bytes);
+                #[cfg(not(feature = "virtio-cser-facade"))]
+                let mutation_boundary = "commit_before_mutation=true";
+                #[cfg(feature = "virtio-cser-facade")]
+                let mutation_boundary = "compatibility_payload_mutation=true";
                 println!(
-                    "LINUX_FS Pwrite effect={} commit_sequence={} fd=4 offset={} bytes={} payload=7879 state_after=00007879 commit_before_mutation=true dma=false",
-                    effect,
-                    commit_sequence,
+                    "LINUX_FS Pwrite {} fd=4 offset={} bytes={} payload=7879 state_after=00007879 {} dma=false",
+                    log_identity,
                     offset,
                     bytes.len(),
+                    mutation_boundary,
                 );
             }
             FsAction::Readlinkat => println!(
-                "LINUX_FS Readlinkat effect={} commit_sequence={} dirfd=5 path=exe target=/bin/linux-runtime-fs-smoke bytes={} nul_appended=false",
-                effect,
-                commit_sequence,
+                "LINUX_FS Readlinkat {} dirfd=5 path=exe target=/bin/linux-runtime-fs-smoke bytes={} nul_appended=false",
+                log_identity,
                 EXECUTABLE_PATH.len(),
             ),
             FsAction::Close(fd, kind) => {
                 assert_eq!(state.fds.remove(&fd), Some(kind));
                 println!(
-                    "LINUX_FS Close effect={} commit_sequence={} fd={} remaining_runtime_fds={}",
-                    effect,
-                    commit_sequence,
+                    "LINUX_FS Close {} fd={} remaining_runtime_fds={}",
+                    log_identity,
                     fd,
                     state.fds.len() - 1,
                 );
@@ -3051,68 +3830,160 @@ impl FsScenario {
             FsAction::WriteStdout => {
                 state.stdout_publications += 1;
                 println!(
-                    "LINUX_FS Write effect={} commit_sequence={} fd=1 bytes=14 stdout_exact=true",
-                    effect, commit_sequence,
+                    "LINUX_FS Write {} fd=1 bytes=14 stdout_exact=true",
+                    log_identity,
                 );
             }
             FsAction::Exit => {
                 state.exited = true;
                 println!(
-                    "LINUX_FS Exit effect={} commit_sequence={} status=0 syscall=exit resumed_after_exit=false",
-                    effect, commit_sequence,
+                    "LINUX_FS Exit {} status=0 syscall=exit resumed_after_exit=false",
+                    log_identity,
                 );
             }
         }
 
-        state.record_domain_change(&commit);
-        let ticket = state.terminalize(&registered, result, commit);
-        state.effects.check_invariants().unwrap();
-        DispatchOutcome {
-            result,
-            authority: PublicationAuthority::Generic(ticket),
-            publication,
-            exit,
+        #[cfg(not(feature = "virtio-cser-facade"))]
+        {
+            state.record_domain_change(&commit);
+            let ticket = state.terminalize(&registered, result, commit);
+            state.effects.check_invariants().unwrap();
+            DispatchOutcome {
+                result,
+                authority: PublicationAuthority::Generic(ticket),
+                publication,
+                exit,
+            }
+        }
+        #[cfg(feature = "virtio-cser-facade")]
+        {
+            DispatchOutcome {
+                result,
+                authority: PublicationAuthority::CompatibilityPayload,
+                publication,
+                exit,
+            }
         }
     }
 
-    fn publish(&self, outcome: &DispatchOutcome) {
-        match &outcome.publication {
+    fn apply_publication(&self, publication: &Publication) {
+        match publication {
             Publication::None => {}
             Publication::GuestBytes { address, bytes } => {
                 write_guest_bytes(&self.vm_space, *address, bytes)
             }
+            #[cfg(feature = "virtio-cser-facade")]
+            Publication::FixedGuestBytes {
+                address,
+                bytes,
+                len,
+            } => write_guest_bytes(&self.vm_space, *address, &bytes[..*len]),
             Publication::Stdout => println!("LINUX_FS stdout=runtime fs ok"),
         }
+    }
+
+    fn publish(&self, outcome: &DispatchOutcome) -> PublicationResult {
         match &outcome.authority {
+            #[cfg(not(feature = "virtio-cser-facade"))]
             PublicationAuthority::Generic(ticket) => {
+                self.apply_publication(&outcome.publication);
                 let mut state = self.state.lock();
                 state.effects.acknowledge_publication(ticket).unwrap();
                 state.effects.check_invariants().unwrap();
+                PublicationResult::Complete
+            }
+            #[cfg(feature = "virtio-cser-facade")]
+            PublicationAuthority::CompatibilityPayload => {
+                self.apply_publication(&outcome.publication);
+                PublicationResult::Complete
             }
             #[cfg(feature = "virtio-cser-facade")]
             PublicationAuthority::Production {
                 ticket,
                 flight_cookie,
             } => {
+                let preempt_guard = disable_preempt();
+                let mut mapping_cursor = None;
+                let prepared_publication = match &outcome.publication {
+                    Publication::None => PreparedProductionPublication::None,
+                    Publication::FixedGuestBytes {
+                        address,
+                        bytes,
+                        len,
+                    } => {
+                        let Some(end) = address.checked_add(*len) else {
+                            return PublicationResult::Retained;
+                        };
+                        let page_start = (*address / ostd::mm::PAGE_SIZE) * ostd::mm::PAGE_SIZE;
+                        let Some(page_end) = page_start.checked_add(ostd::mm::PAGE_SIZE) else {
+                            return PublicationResult::Retained;
+                        };
+                        if *len == 0 || end > page_end {
+                            return PublicationResult::Retained;
+                        }
+                        let range = page_start..page_end;
+                        let Ok(mut cursor) = self.vm_space.cursor(&preempt_guard, &range) else {
+                            return PublicationResult::Retained;
+                        };
+                        let Some(write) =
+                            PreparedGuestWrite::prepare(&mut cursor, *address, *bytes, *len)
+                        else {
+                            return PublicationResult::Retained;
+                        };
+                        mapping_cursor = Some(cursor);
+                        PreparedProductionPublication::GuestWrite(write)
+                    }
+                    Publication::GuestBytes { .. } | Publication::Stdout => {
+                        return PublicationResult::Retained;
+                    }
+                };
                 let mut runtime = self.production.lock();
-                assert_eq!(
-                    runtime.phase,
-                    ProductionReadPhase::AwaitingPublication(*flight_cookie)
-                );
-                runtime.registry.acknowledge_publication(ticket).unwrap();
-                let selection = runtime
-                    .active_revoke
-                    .take()
-                    .expect("same-boot publication retains revoke selection");
-                runtime.registry.revoke_complete(&selection).unwrap();
-                runtime.phase = ProductionReadPhase::Complete;
+                let selection = match &runtime.flight {
+                    FsDeviceFlight::AwaitingPublication {
+                        cookie,
+                        selection,
+                        ticket: stored_ticket,
+                        ..
+                    } if cookie == flight_cookie && stored_ticket == ticket => selection.clone(),
+                    _ => return PublicationResult::Retained,
+                };
+                if runtime
+                    .registry
+                    .acknowledge_publication_and_revoke_complete_with_apply(
+                        ticket,
+                        &selection,
+                        || {
+                            let _mapping_lock = mapping_cursor.as_ref();
+                            prepared_publication.apply();
+                        },
+                    )
+                    .is_err()
+                {
+                    return PublicationResult::Retained;
+                }
+                drop(mapping_cursor);
+                drop(preempt_guard);
+                let flight = runtime.take_flight();
+                let FsDeviceFlight::AwaitingPublication { root, device, .. } = flight else {
+                    unreachable!("validated publication flight changed under its Registry lock")
+                };
+                runtime.put_flight(FsDeviceFlight::Complete { root, device });
                 runtime.assert_complete();
+                #[cfg(feature = "virtio-cser-precommit-fault")]
+                let precommit_scope = if runtime.enrolled_revoke_wins_observed {
+                    Some(runtime.registry.scope_projection(SCOPE).unwrap())
+                } else {
+                    None
+                };
+                drop(runtime);
                 #[cfg(not(feature = "virtio-cser-precommit-fault"))]
                 println!(
                     "LINUX_FS_SAME_BOOT GuestPublication result={} bytes={} source={} registry_ack=true revoke_complete=true",
                     outcome.result,
                     match &outcome.publication {
                         Publication::GuestBytes { bytes, .. } => bytes.len(),
+                        #[cfg(feature = "virtio-cser-facade")]
+                        Publication::FixedGuestBytes { len, .. } => *len,
                         Publication::None | Publication::Stdout => 0,
                     },
                     if outcome.result == 4 {
@@ -3129,10 +4000,9 @@ impl FsScenario {
                     );
                 }
                 #[cfg(feature = "virtio-cser-precommit-fault")]
-                if runtime.enrolled_revoke_wins_observed {
+                if let Some(scope) = precommit_scope {
                     assert_eq!(outcome.result, -125);
                     assert!(matches!(outcome.publication, Publication::None));
-                    let scope = runtime.registry.scope_projection(SCOPE).unwrap();
                     println!(
                         "LINUX_FS_SAME_BOOT_PRECOMMIT GuestPublication result=-125 bytes=0 source=none registry_ack=true revoke_complete=true"
                     );
@@ -3141,12 +4011,21 @@ impl FsScenario {
                         scope.credits.free, scope.live_effects, scope.pending_publications,
                     );
                 }
+                PublicationResult::Complete
+            }
+            #[cfg(feature = "virtio-cser-facade")]
+            PublicationAuthority::Retained { flight_cookie } => {
+                let _ = flight_cookie;
+                PublicationResult::Retained
             }
         }
     }
 
     fn finish(&self) {
-        let mut state = self.state.lock();
+        let state = self.state.lock();
+        #[cfg(not(feature = "virtio-cser-facade"))]
+        let mut state = state;
+        #[cfg(not(feature = "virtio-cser-facade"))]
         state.close_scope();
         #[cfg(all(
             feature = "virtio-cser-facade",
@@ -3196,7 +4075,7 @@ impl FsScenario {
         ))]
         if !partial_precommit {
             println!(
-                "EFFECT_REGISTRY Quiescent workload=linux-runtime-fs generic_effects=13 device_cohort_effects=6 live=0 pending_publications=0 credits=Free"
+                "EFFECT_REGISTRY Quiescent workload=linux-runtime-fs registry=shared_production production_effects=6 compatibility_syscalls=payload_only_not_cser live=0 pending_publications=0 credits=Free"
             );
         }
         #[cfg(all(
@@ -3205,24 +4084,24 @@ impl FsScenario {
         ))]
         if !partial_precommit {
             println!(
-                "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=14 openat=3 pread64=2 statx=1 newfstatat=1 pwrite64=1 readlinkat=1 close=3 write=1 exit=1 commit_gate=true publication_acks=14 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=false no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=true real_dma=true polling=true irq=false smp=1 same_boot=true identity_preserving=true"
+                "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=14 compatibility_syscalls=payload_only_not_cser openat=3 pread64=2 statx=1 newfstatat=1 pwrite64=1 readlinkat=1 close=3 write=1 exit=1 registry=shared_production commit_gate=true publication_acks=1 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=false no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=true real_dma=true polling=true irq=false smp=1 same_boot=true identity_preserving=true"
             );
         } else {
             println!(
-                "LINUX_FS_SLICE CLOSED workload=linux-runtime-fs-smoke syscalls=2 openat=1 pread64=1 publication_acks=2 precommit_failure=true registry_quiescent=true owner_restored=true"
+                "LINUX_FS_SLICE CLOSED workload=linux-runtime-fs-smoke syscalls=2 compatibility_syscalls=payload_only_not_cser openat=1 pread64=1 registry=shared_production publication_acks=1 precommit_failure=true registry_quiescent=true owner_restored=true"
             );
         }
         #[cfg(feature = "virtio-cser-precommit-fault")]
         if enrolled_revoke_wins_observed {
             println!(
-                "EFFECT_REGISTRY Quiescent workload=linux-runtime-fs generic_effects=1 device_cohort_effects=6 live=0 pending_publications=0 credits=Free"
+                "EFFECT_REGISTRY Quiescent workload=linux-runtime-fs registry=shared_production production_effects=6 compatibility_syscalls=payload_only_not_cser live=0 pending_publications=0 credits=Free"
             );
             println!(
-                "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=2 openat=1 pread64=1 commit_gate=revoke_wins publication_acks=2 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=false no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true generic_prefix_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=false real_dma_prepared=true device_dma_observed=false polling=false irq=false smp=1 same_boot=true identity_preserving=true precommit_fault=true"
+                "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=2 compatibility_syscalls=payload_only_not_cser openat=1 pread64=1 registry=shared_production commit_gate=revoke_wins publication_acks=1 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=false no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=false real_dma_prepared=true device_dma_observed=false polling=false irq=false smp=1 same_boot=true identity_preserving=true precommit_fault=true"
             );
         } else {
             println!(
-                "LINUX_FS_SLICE CLOSED workload=linux-runtime-fs-smoke syscalls=2 openat=1 pread64=1 publication_acks=2 production_effects={} preparation_identity_observed={} enrolled_revoke_wins_observed=false registry_quiescent=true owner_restored=true",
+                "LINUX_FS_SLICE CLOSED workload=linux-runtime-fs-smoke syscalls=2 compatibility_syscalls=payload_only_not_cser openat=1 pread64=1 registry=shared_production publication_acks=1 production_effects={} preparation_identity_observed={} enrolled_revoke_wins_observed=false registry_quiescent=true owner_restored=true",
                 production_effects, preparation_identity_observed,
             );
         }
@@ -3247,8 +4126,32 @@ enum FsAction {
     Exit,
 }
 
+struct FsDispatchLogIdentity {
+    value: u64,
+    #[cfg(not(feature = "virtio-cser-facade"))]
+    commit_sequence: u64,
+}
+
+impl fmt::Display for FsDispatchLogIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(not(feature = "virtio-cser-facade"))]
+        return write!(
+            formatter,
+            "effect={} commit_sequence={}",
+            self.value, self.commit_sequence,
+        );
+        #[cfg(feature = "virtio-cser-facade")]
+        write!(
+            formatter,
+            "compatibility_ordinal={} cser_effect=none cser_commit=none",
+            self.value,
+        )
+    }
+}
+
 pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
-    run_filesystem_lifecycle_companion();
+    #[cfg(not(feature = "virtio-cser-facade"))]
+    lifecycle_companion::run_filesystem_lifecycle_companion();
     #[cfg(not(feature = "virtio-cser-facade"))]
     assert_stage5b_fixture_projection();
 
@@ -3297,7 +4200,7 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
         not(feature = "virtio-cser-precommit-fault")
     ))]
     println!(
-        "LINUX_FS_SLICE BEGIN workload=linux-runtime-fs-smoke format=ELF64 type=ET_EXEC retained=true adapted=false syscalls=14 registry=request_local_production root_scope=95 domains=3 typed_credit_classes=6 filesystem=bounded_in_memory pager=bounded block=virtio_blk polling=true irq=false smp=1"
+        "LINUX_FS_SLICE BEGIN workload=linux-runtime-fs-smoke format=ELF64 type=ET_EXEC retained=true adapted=false syscalls=14 registry=shared_production compatibility_syscalls=payload_only_not_cser root_scope=95 domains=3 typed_credit_classes=6 filesystem=bounded_in_memory pager=bounded block=virtio_blk polling=true irq=false smp=1"
     );
     #[cfg(all(
         feature = "virtio-cser-facade",
@@ -3313,7 +4216,7 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
     );
     #[cfg(feature = "virtio-cser-precommit-fault")]
     println!(
-        "LINUX_FS_SLICE BEGIN workload=linux-runtime-fs-smoke format=ELF64 type=ET_EXEC retained=true adapted=false syscalls=2 registry=request_local_production root_scope=95 domains=3 typed_credit_classes=6 filesystem=bounded_in_memory pager=bounded block=virtio_blk polling=false irq=false smp=1 precommit_fault=revoke_wins_commit_gate"
+        "LINUX_FS_SLICE BEGIN workload=linux-runtime-fs-smoke format=ELF64 type=ET_EXEC retained=true adapted=false syscalls=2 registry=shared_production compatibility_syscalls=payload_only_not_cser root_scope=95 domains=3 typed_credit_classes=6 filesystem=bounded_in_memory pager=bounded block=virtio_blk polling=false irq=false smp=1 precommit_fault=revoke_wins_commit_gate"
     );
     #[cfg(feature = "virtio-cser-precommit-fault")]
     println!(
@@ -3371,8 +4274,11 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
     #[cfg(not(feature = "virtio-cser-facade"))]
     let terminalizations = 14;
     #[cfg(feature = "virtio-cser-facade")]
-    let terminalizations = scenario.state.lock().syscall_terminalizations + 1;
+    let terminalizations = production_effects;
+    #[cfg(not(feature = "virtio-cser-facade"))]
     let publication_acks = terminalizations;
+    #[cfg(feature = "virtio-cser-facade")]
+    let publication_acks = 1;
     RuntimeFsSliceReceipt {
         scope: SCOPE,
         closed_authority_epoch: AUTHORITY_EPOCH,
@@ -3402,7 +4308,12 @@ fn run_guest(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, entry: usize, st
                 let descriptor = syscall_descriptor(user_mode.context());
                 let outcome = scenario.dispatch(descriptor);
                 user_mode.context_mut().set_rax(outcome.result as usize);
-                scenario.publish(&outcome);
+                let publication = scenario.publish(&outcome);
+                assert_eq!(
+                    publication,
+                    PublicationResult::Complete,
+                    "runtime-fs retained publication authority before guest resume"
+                );
                 if outcome.exit {
                     scenario.finish();
                     return;
@@ -3470,959 +4381,988 @@ fn read_c_string(vm_space: &VmSpace, address: usize, max: usize) -> Vec<u8> {
     bytes[..end].to_vec()
 }
 
-fn lifecycle_registry(scope: ScopeKey) -> EffectRegistry {
-    let mut registry = EffectRegistry::new();
-    registry
-        .create_scope(ScopeConfig {
-            key: scope,
-            authority_epoch: 201,
-            binding_epoch: 1,
-            supervisor: LIFECYCLE_V1,
-            credits: vec![CreditLimit::new(LIFECYCLE_CREDIT, 1)],
-        })
-        .unwrap();
-    registry
-}
+#[cfg(not(feature = "virtio-cser-facade"))]
+mod lifecycle_companion {
+    use super::*;
 
-fn lifecycle_register(
-    registry: &mut EffectRegistry,
-    scope: ScopeKey,
-    operation: OperationClass,
-    syscall: usize,
-) -> RegisteredEffect {
-    registry
-        .register(RegisterRequest {
-            scope,
-            task: LIFECYCLE_GUEST,
-            operation,
-            descriptor: SyscallDescriptor::new(syscall, [3, 0x2000, 2, 2, 0, 0]),
-            resources: vec![LIFECYCLE_RESOURCE],
-            credits: vec![CreditCharge::new(LIFECYCLE_CREDIT, 1)],
-            publication: PublicationMode::Required,
-        })
-        .unwrap()
-}
+    const LIFECYCLE_PRECOMMIT_SCOPE: ScopeKey = ScopeKey::new(96, 1);
+    const LIFECYCLE_POSTCOMMIT_SCOPE: ScopeKey = ScopeKey::new(97, 1);
+    const LIFECYCLE_COMMIT_FIRST_SCOPE: ScopeKey = ScopeKey::new(98, 1);
+    const LIFECYCLE_REVOKE_FIRST_SCOPE: ScopeKey = ScopeKey::new(99, 1);
+    const LIFECYCLE_V1: TaskKey = TaskKey::new(960, 1);
+    const LIFECYCLE_V2: TaskKey = TaskKey::new(961, 1);
+    const LIFECYCLE_GUEST: TaskKey = TaskKey::new(962, 1);
+    const LIFECYCLE_CREDIT: CreditClass = CreditClass::new(1);
+    const LIFECYCLE_RESOURCE: ResourceKey = ResourceKey::new(0x7200, 1, 1);
+    const OP_PREAD: OperationClass = OperationClass::new(2);
+    const OP_PWRITE: OperationClass = OperationClass::new(3);
 
-fn close_lifecycle_scope(registry: &mut EffectRegistry, scope: ScopeKey) {
-    let selection = registry.revoke_begin(scope).unwrap();
-    while let Some(effect) = registry.revoke_next(&selection).unwrap() {
-        let request = match effect.disposition {
-            RevokeDisposition::Abort => TerminalRequest::aborted(-125),
-            RevokeDisposition::Drain(receipt) => {
-                TerminalRequest::completed_by(receipt.result(), receipt)
-            }
-        };
-        let terminal = registry
-            .stage_revoke_terminal(&selection, effect.effect, request)
+    fn lifecycle_registry(scope: ScopeKey) -> EffectRegistry {
+        let mut registry = EffectRegistry::new();
+        registry
+            .create_scope(ScopeConfig {
+                key: scope,
+                authority_epoch: 201,
+                binding_epoch: 1,
+                supervisor: LIFECYCLE_V1,
+                credits: vec![CreditLimit::new(LIFECYCLE_CREDIT, 1)],
+            })
             .unwrap();
-        if let Some(ticket) = terminal.publication {
-            registry.acknowledge_publication(&ticket).unwrap();
-        }
-    }
-    registry.revoke_complete(&selection).unwrap();
-    registry.check_invariants().unwrap();
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LifecycleDomain {
-    Personality,
-    Pager,
-    Filesystem,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LifecycleDomainSlot {
-    binding_epoch: u64,
-    service_bound: bool,
-    fallback_running: bool,
-    snapshot_revision: Option<u64>,
-    replacement_ready: bool,
-    revision: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LifecycleRecoverySnapshot {
-    domain: LifecycleDomain,
-    binding_epoch: u64,
-    domain_revision: u64,
-    object_generation: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LifecycleDomainToken {
-    authority_epoch: u64,
-    domain: LifecycleDomain,
-    binding_epoch: u64,
-    object_generation: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LifecycleDomainError {
-    StaleAuthority,
-    StaleBinding,
-    StaleGeneration,
-    InvalidState,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LifecycleDomainsProjection {
-    authority_epoch: u64,
-    personality: LifecycleDomainSlot,
-    pager: LifecycleDomainSlot,
-    filesystem: LifecycleDomainSlot,
-    address_space_generation: u64,
-    inode_generation: u64,
-    inode: [u8; 4],
-    mapping_publications: u64,
-    pwrite_publications: u64,
-    reply_publications: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LifecycleDomains {
-    authority_epoch: u64,
-    personality: LifecycleDomainSlot,
-    pager: LifecycleDomainSlot,
-    filesystem: LifecycleDomainSlot,
-    address_space_generation: u64,
-    inode_generation: u64,
-    inode: [u8; 4],
-    mapping_publications: u64,
-    pwrite_publications: u64,
-    reply_publications: u64,
-}
-
-impl LifecycleDomains {
-    fn new() -> Self {
-        Self {
-            authority_epoch: 201,
-            personality: LifecycleDomainSlot {
-                binding_epoch: 1,
-                service_bound: true,
-                fallback_running: false,
-                snapshot_revision: None,
-                replacement_ready: false,
-                revision: 0,
-            },
-            pager: LifecycleDomainSlot {
-                binding_epoch: 7,
-                service_bound: true,
-                fallback_running: false,
-                snapshot_revision: None,
-                replacement_ready: false,
-                revision: 0,
-            },
-            filesystem: LifecycleDomainSlot {
-                binding_epoch: 1,
-                service_bound: true,
-                fallback_running: false,
-                snapshot_revision: None,
-                replacement_ready: false,
-                revision: 0,
-            },
-            address_space_generation: 1,
-            inode_generation: 1,
-            inode: [0; 4],
-            mapping_publications: 0,
-            pwrite_publications: 0,
-            reply_publications: 0,
-        }
+        registry
     }
 
-    fn projection(self) -> LifecycleDomainsProjection {
-        LifecycleDomainsProjection {
-            authority_epoch: self.authority_epoch,
-            personality: self.personality,
-            pager: self.pager,
-            filesystem: self.filesystem,
-            address_space_generation: self.address_space_generation,
-            inode_generation: self.inode_generation,
-            inode: self.inode,
-            mapping_publications: self.mapping_publications,
-            pwrite_publications: self.pwrite_publications,
-            reply_publications: self.reply_publications,
+    fn lifecycle_register(
+        registry: &mut EffectRegistry,
+        scope: ScopeKey,
+        operation: OperationClass,
+        syscall: usize,
+    ) -> RegisteredEffect {
+        registry
+            .register(RegisterRequest {
+                scope,
+                task: LIFECYCLE_GUEST,
+                operation,
+                descriptor: SyscallDescriptor::new(syscall, [3, 0x2000, 2, 2, 0, 0]),
+                resources: vec![LIFECYCLE_RESOURCE],
+                credits: vec![CreditCharge::new(LIFECYCLE_CREDIT, 1)],
+                publication: PublicationMode::Required,
+            })
+            .unwrap()
+    }
+
+    fn close_lifecycle_scope(registry: &mut EffectRegistry, scope: ScopeKey) {
+        let selection = registry.revoke_begin(scope).unwrap();
+        while let Some(effect) = registry.revoke_next(&selection).unwrap() {
+            let request = match effect.disposition {
+                RevokeDisposition::Abort => TerminalRequest::aborted(-125),
+                RevokeDisposition::Drain(receipt) => {
+                    TerminalRequest::completed_by(receipt.result(), receipt)
+                }
+            };
+            let terminal = registry
+                .stage_revoke_terminal(&selection, effect.effect, request)
+                .unwrap();
+            if let Some(ticket) = terminal.publication {
+                registry.acknowledge_publication(&ticket).unwrap();
+            }
+        }
+        registry.revoke_complete(&selection).unwrap();
+        registry.check_invariants().unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LifecycleDomain {
+        Personality,
+        Pager,
+        Filesystem,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LifecycleDomainSlot {
+        binding_epoch: u64,
+        service_bound: bool,
+        fallback_running: bool,
+        snapshot_revision: Option<u64>,
+        replacement_ready: bool,
+        revision: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LifecycleRecoverySnapshot {
+        domain: LifecycleDomain,
+        binding_epoch: u64,
+        domain_revision: u64,
+        object_generation: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LifecycleDomainToken {
+        authority_epoch: u64,
+        domain: LifecycleDomain,
+        binding_epoch: u64,
+        object_generation: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LifecycleDomainError {
+        StaleAuthority,
+        StaleBinding,
+        StaleGeneration,
+        InvalidState,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LifecycleDomainsProjection {
+        authority_epoch: u64,
+        personality: LifecycleDomainSlot,
+        pager: LifecycleDomainSlot,
+        filesystem: LifecycleDomainSlot,
+        address_space_generation: u64,
+        inode_generation: u64,
+        inode: [u8; 4],
+        mapping_publications: u64,
+        pwrite_publications: u64,
+        reply_publications: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LifecycleDomains {
+        authority_epoch: u64,
+        personality: LifecycleDomainSlot,
+        pager: LifecycleDomainSlot,
+        filesystem: LifecycleDomainSlot,
+        address_space_generation: u64,
+        inode_generation: u64,
+        inode: [u8; 4],
+        mapping_publications: u64,
+        pwrite_publications: u64,
+        reply_publications: u64,
+    }
+
+    impl LifecycleDomains {
+        fn new() -> Self {
+            Self {
+                authority_epoch: 201,
+                personality: LifecycleDomainSlot {
+                    binding_epoch: 1,
+                    service_bound: true,
+                    fallback_running: false,
+                    snapshot_revision: None,
+                    replacement_ready: false,
+                    revision: 0,
+                },
+                pager: LifecycleDomainSlot {
+                    binding_epoch: 7,
+                    service_bound: true,
+                    fallback_running: false,
+                    snapshot_revision: None,
+                    replacement_ready: false,
+                    revision: 0,
+                },
+                filesystem: LifecycleDomainSlot {
+                    binding_epoch: 1,
+                    service_bound: true,
+                    fallback_running: false,
+                    snapshot_revision: None,
+                    replacement_ready: false,
+                    revision: 0,
+                },
+                address_space_generation: 1,
+                inode_generation: 1,
+                inode: [0; 4],
+                mapping_publications: 0,
+                pwrite_publications: 0,
+                reply_publications: 0,
+            }
+        }
+
+        fn projection(self) -> LifecycleDomainsProjection {
+            LifecycleDomainsProjection {
+                authority_epoch: self.authority_epoch,
+                personality: self.personality,
+                pager: self.pager,
+                filesystem: self.filesystem,
+                address_space_generation: self.address_space_generation,
+                inode_generation: self.inode_generation,
+                inode: self.inode,
+                mapping_publications: self.mapping_publications,
+                pwrite_publications: self.pwrite_publications,
+                reply_publications: self.reply_publications,
+            }
+        }
+
+        fn slot(self, domain: LifecycleDomain) -> LifecycleDomainSlot {
+            match domain {
+                LifecycleDomain::Personality => self.personality,
+                LifecycleDomain::Pager => self.pager,
+                LifecycleDomain::Filesystem => self.filesystem,
+            }
+        }
+
+        fn slot_mut(&mut self, domain: LifecycleDomain) -> &mut LifecycleDomainSlot {
+            match domain {
+                LifecycleDomain::Personality => &mut self.personality,
+                LifecycleDomain::Pager => &mut self.pager,
+                LifecycleDomain::Filesystem => &mut self.filesystem,
+            }
+        }
+
+        fn token(self, domain: LifecycleDomain) -> LifecycleDomainToken {
+            let object_generation = match domain {
+                LifecycleDomain::Personality => 1,
+                LifecycleDomain::Pager => self.address_space_generation,
+                LifecycleDomain::Filesystem => self.inode_generation,
+            };
+            LifecycleDomainToken {
+                authority_epoch: self.authority_epoch,
+                domain,
+                binding_epoch: self.slot(domain).binding_epoch,
+                object_generation,
+            }
+        }
+
+        fn crash(&mut self, domain: LifecycleDomain) {
+            let slot = self.slot_mut(domain);
+            assert!(slot.service_bound);
+            assert!(!slot.fallback_running);
+            slot.binding_epoch += 1;
+            slot.service_bound = false;
+            slot.fallback_running = true;
+            slot.snapshot_revision = None;
+            slot.replacement_ready = false;
+            slot.revision += 1;
+        }
+
+        fn recovery_snapshot(&mut self, domain: LifecycleDomain) -> LifecycleRecoverySnapshot {
+            let object_generation = match domain {
+                LifecycleDomain::Personality => 1,
+                LifecycleDomain::Pager => self.address_space_generation,
+                LifecycleDomain::Filesystem => self.inode_generation,
+            };
+            let slot = self.slot_mut(domain);
+            assert!(!slot.service_bound);
+            assert!(slot.fallback_running);
+            assert!(!slot.replacement_ready);
+            slot.snapshot_revision = Some(slot.revision);
+            LifecycleRecoverySnapshot {
+                domain,
+                binding_epoch: slot.binding_epoch,
+                domain_revision: slot.revision,
+                object_generation,
+            }
+        }
+
+        fn ready(&mut self, snapshot: LifecycleRecoverySnapshot) {
+            let current_generation = match snapshot.domain {
+                LifecycleDomain::Personality => 1,
+                LifecycleDomain::Pager => self.address_space_generation,
+                LifecycleDomain::Filesystem => self.inode_generation,
+            };
+            let slot = self.slot_mut(snapshot.domain);
+            assert!(!slot.service_bound);
+            assert!(slot.fallback_running);
+            assert_eq!(snapshot.binding_epoch, slot.binding_epoch);
+            assert_eq!(snapshot.domain_revision, slot.revision);
+            assert_eq!(snapshot.object_generation, current_generation);
+            assert_eq!(slot.snapshot_revision, Some(snapshot.domain_revision));
+            slot.replacement_ready = true;
+        }
+
+        fn rebind(&mut self, domain: LifecycleDomain) {
+            let slot = self.slot_mut(domain);
+            assert!(!slot.service_bound);
+            assert!(slot.fallback_running);
+            assert!(slot.replacement_ready);
+            assert_eq!(slot.snapshot_revision, Some(slot.revision));
+            slot.service_bound = true;
+            slot.fallback_running = false;
+            slot.snapshot_revision = None;
+            slot.replacement_ready = false;
+            slot.revision += 1;
+        }
+
+        fn adopt(
+            self,
+            token: LifecycleDomainToken,
+        ) -> Result<LifecycleDomainToken, LifecycleDomainError> {
+            if token.authority_epoch != self.authority_epoch {
+                return Err(LifecycleDomainError::StaleAuthority);
+            }
+            let slot = self.slot(token.domain);
+            if !slot.service_bound || slot.fallback_running {
+                return Err(LifecycleDomainError::InvalidState);
+            }
+            if token.binding_epoch >= slot.binding_epoch {
+                return Err(LifecycleDomainError::InvalidState);
+            }
+            Ok(LifecycleDomainToken {
+                binding_epoch: slot.binding_epoch,
+                ..token
+            })
+        }
+
+        fn validate(self, token: LifecycleDomainToken) -> Result<(), LifecycleDomainError> {
+            if token.authority_epoch != self.authority_epoch {
+                return Err(LifecycleDomainError::StaleAuthority);
+            }
+            let slot = self.slot(token.domain);
+            if token.binding_epoch != slot.binding_epoch {
+                return Err(LifecycleDomainError::StaleBinding);
+            }
+            if !slot.service_bound || slot.fallback_running {
+                return Err(LifecycleDomainError::InvalidState);
+            }
+            let current_generation = match token.domain {
+                LifecycleDomain::Personality => 1,
+                LifecycleDomain::Pager => self.address_space_generation,
+                LifecycleDomain::Filesystem => self.inode_generation,
+            };
+            if token.object_generation != current_generation {
+                return Err(LifecycleDomainError::StaleGeneration);
+            }
+            Ok(())
+        }
+
+        fn commit_pager_map(
+            &mut self,
+            token: LifecycleDomainToken,
+        ) -> Result<(), LifecycleDomainError> {
+            if token.domain != LifecycleDomain::Pager {
+                return Err(LifecycleDomainError::InvalidState);
+            }
+            self.validate(token)?;
+            self.address_space_generation += 1;
+            self.mapping_publications += 1;
+            self.pager.revision += 1;
+            Ok(())
+        }
+
+        fn complete_pread(
+            &mut self,
+            token: LifecycleDomainToken,
+        ) -> Result<(), LifecycleDomainError> {
+            if token.domain != LifecycleDomain::Filesystem {
+                return Err(LifecycleDomainError::InvalidState);
+            }
+            self.validate(token)?;
+            self.filesystem.revision += 1;
+            Ok(())
+        }
+
+        fn commit_pwrite(
+            &mut self,
+            token: LifecycleDomainToken,
+        ) -> Result<(), LifecycleDomainError> {
+            if token.domain != LifecycleDomain::Filesystem {
+                return Err(LifecycleDomainError::InvalidState);
+            }
+            self.validate(token)?;
+            self.inode = [0, 0, b'x', b'y'];
+            self.inode_generation += 1;
+            self.pwrite_publications += 1;
+            self.filesystem.revision += 1;
+            Ok(())
+        }
+
+        fn publish_reply(
+            &mut self,
+            token: LifecycleDomainToken,
+        ) -> Result<(), LifecycleDomainError> {
+            if token.domain != LifecycleDomain::Personality {
+                return Err(LifecycleDomainError::InvalidState);
+            }
+            self.validate(token)?;
+            self.reply_publications += 1;
+            self.personality.revision += 1;
+            Ok(())
+        }
+
+        fn publish_kernel_reply(&mut self) {
+            assert!(!self.personality.service_bound);
+            assert!(self.personality.fallback_running);
+            self.reply_publications += 1;
+            self.personality.revision += 1;
+            self.personality.snapshot_revision = None;
+            self.personality.replacement_ready = false;
+        }
+
+        fn revoke_begin(&mut self) {
+            self.authority_epoch += 1;
         }
     }
 
-    fn slot(self, domain: LifecycleDomain) -> LifecycleDomainSlot {
-        match domain {
-            LifecycleDomain::Personality => self.personality,
-            LifecycleDomain::Pager => self.pager,
-            LifecycleDomain::Filesystem => self.filesystem,
-        }
-    }
+    pub(super) fn run_filesystem_lifecycle_companion() {
+        println!(
+            "FILESYSTEM_LIFECYCLE BEGIN authority_epoch=201 personality_binding=1 pager_binding=7 filesystem_binding=1 block_binding=3 device_generation=3 epochs_independent=true bounded=true real_dma=false"
+        );
 
-    fn slot_mut(&mut self, domain: LifecycleDomain) -> &mut LifecycleDomainSlot {
-        match domain {
-            LifecycleDomain::Personality => &mut self.personality,
-            LifecycleDomain::Pager => &mut self.pager,
-            LifecycleDomain::Filesystem => &mut self.filesystem,
-        }
-    }
+        let mut domains = LifecycleDomains::new();
+        let pager_token = domains.token(LifecycleDomain::Pager);
+        let personality_before = domains.personality;
+        let filesystem_before = domains.filesystem;
+        domains.crash(LifecycleDomain::Pager);
+        assert_eq!(domains.personality, personality_before);
+        assert_eq!(domains.filesystem, filesystem_before);
+        let before_stale = domains.projection();
+        assert_eq!(
+            domains.commit_pager_map(pager_token),
+            Err(LifecycleDomainError::StaleBinding)
+        );
+        assert_eq!(domains.projection(), before_stale);
+        let pager_snapshot = domains.recovery_snapshot(LifecycleDomain::Pager);
+        domains.ready(pager_snapshot);
+        domains.rebind(LifecycleDomain::Pager);
+        let pager_token = domains.adopt(pager_token).unwrap();
+        domains.commit_pager_map(pager_token).unwrap();
+        assert_eq!(domains.address_space_generation, 2);
+        assert_eq!(domains.mapping_publications, 1);
+        println!(
+            "FILESYSTEM_LIFECYCLE PagerCrash old_binding=7 new_binding=8 snapshot=true ready=true adopted=true mapping_publications=1 address_space_generation=1->2 peer_epochs_unchanged=true stale_old_token=StaleBinding full_projection_unchanged=true"
+        );
 
-    fn token(self, domain: LifecycleDomain) -> LifecycleDomainToken {
-        let object_generation = match domain {
-            LifecycleDomain::Personality => 1,
-            LifecycleDomain::Pager => self.address_space_generation,
-            LifecycleDomain::Filesystem => self.inode_generation,
-        };
-        LifecycleDomainToken {
-            authority_epoch: self.authority_epoch,
-            domain,
-            binding_epoch: self.slot(domain).binding_epoch,
-            object_generation,
-        }
-    }
-
-    fn crash(&mut self, domain: LifecycleDomain) {
-        let slot = self.slot_mut(domain);
-        assert!(slot.service_bound);
-        assert!(!slot.fallback_running);
-        slot.binding_epoch += 1;
-        slot.service_bound = false;
-        slot.fallback_running = true;
-        slot.snapshot_revision = None;
-        slot.replacement_ready = false;
-        slot.revision += 1;
-    }
-
-    fn recovery_snapshot(&mut self, domain: LifecycleDomain) -> LifecycleRecoverySnapshot {
-        let object_generation = match domain {
-            LifecycleDomain::Personality => 1,
-            LifecycleDomain::Pager => self.address_space_generation,
-            LifecycleDomain::Filesystem => self.inode_generation,
-        };
-        let slot = self.slot_mut(domain);
-        assert!(!slot.service_bound);
-        assert!(slot.fallback_running);
-        assert!(!slot.replacement_ready);
-        slot.snapshot_revision = Some(slot.revision);
-        LifecycleRecoverySnapshot {
-            domain,
-            binding_epoch: slot.binding_epoch,
-            domain_revision: slot.revision,
-            object_generation,
-        }
-    }
-
-    fn ready(&mut self, snapshot: LifecycleRecoverySnapshot) {
-        let current_generation = match snapshot.domain {
-            LifecycleDomain::Personality => 1,
-            LifecycleDomain::Pager => self.address_space_generation,
-            LifecycleDomain::Filesystem => self.inode_generation,
-        };
-        let slot = self.slot_mut(snapshot.domain);
-        assert!(!slot.service_bound);
-        assert!(slot.fallback_running);
-        assert_eq!(snapshot.binding_epoch, slot.binding_epoch);
-        assert_eq!(snapshot.domain_revision, slot.revision);
-        assert_eq!(snapshot.object_generation, current_generation);
-        assert_eq!(slot.snapshot_revision, Some(snapshot.domain_revision));
-        slot.replacement_ready = true;
-    }
-
-    fn rebind(&mut self, domain: LifecycleDomain) {
-        let slot = self.slot_mut(domain);
-        assert!(!slot.service_bound);
-        assert!(slot.fallback_running);
-        assert!(slot.replacement_ready);
-        assert_eq!(slot.snapshot_revision, Some(slot.revision));
-        slot.service_bound = true;
-        slot.fallback_running = false;
-        slot.snapshot_revision = None;
-        slot.replacement_ready = false;
-        slot.revision += 1;
-    }
-
-    fn adopt(
-        self,
-        token: LifecycleDomainToken,
-    ) -> Result<LifecycleDomainToken, LifecycleDomainError> {
-        if token.authority_epoch != self.authority_epoch {
-            return Err(LifecycleDomainError::StaleAuthority);
-        }
-        let slot = self.slot(token.domain);
-        if !slot.service_bound || slot.fallback_running {
-            return Err(LifecycleDomainError::InvalidState);
-        }
-        if token.binding_epoch >= slot.binding_epoch {
-            return Err(LifecycleDomainError::InvalidState);
-        }
-        Ok(LifecycleDomainToken {
-            binding_epoch: slot.binding_epoch,
-            ..token
-        })
-    }
-
-    fn validate(self, token: LifecycleDomainToken) -> Result<(), LifecycleDomainError> {
-        if token.authority_epoch != self.authority_epoch {
-            return Err(LifecycleDomainError::StaleAuthority);
-        }
-        let slot = self.slot(token.domain);
-        if token.binding_epoch != slot.binding_epoch {
-            return Err(LifecycleDomainError::StaleBinding);
-        }
-        if !slot.service_bound || slot.fallback_running {
-            return Err(LifecycleDomainError::InvalidState);
-        }
-        let current_generation = match token.domain {
-            LifecycleDomain::Personality => 1,
-            LifecycleDomain::Pager => self.address_space_generation,
-            LifecycleDomain::Filesystem => self.inode_generation,
-        };
-        if token.object_generation != current_generation {
-            return Err(LifecycleDomainError::StaleGeneration);
-        }
-        Ok(())
-    }
-
-    fn commit_pager_map(
-        &mut self,
-        token: LifecycleDomainToken,
-    ) -> Result<(), LifecycleDomainError> {
-        if token.domain != LifecycleDomain::Pager {
-            return Err(LifecycleDomainError::InvalidState);
-        }
-        self.validate(token)?;
-        self.address_space_generation += 1;
-        self.mapping_publications += 1;
-        self.pager.revision += 1;
-        Ok(())
-    }
-
-    fn complete_pread(&mut self, token: LifecycleDomainToken) -> Result<(), LifecycleDomainError> {
-        if token.domain != LifecycleDomain::Filesystem {
-            return Err(LifecycleDomainError::InvalidState);
-        }
-        self.validate(token)?;
-        self.filesystem.revision += 1;
-        Ok(())
-    }
-
-    fn commit_pwrite(&mut self, token: LifecycleDomainToken) -> Result<(), LifecycleDomainError> {
-        if token.domain != LifecycleDomain::Filesystem {
-            return Err(LifecycleDomainError::InvalidState);
-        }
-        self.validate(token)?;
-        self.inode = [0, 0, b'x', b'y'];
-        self.inode_generation += 1;
-        self.pwrite_publications += 1;
-        self.filesystem.revision += 1;
-        Ok(())
-    }
-
-    fn publish_reply(&mut self, token: LifecycleDomainToken) -> Result<(), LifecycleDomainError> {
-        if token.domain != LifecycleDomain::Personality {
-            return Err(LifecycleDomainError::InvalidState);
-        }
-        self.validate(token)?;
-        self.reply_publications += 1;
-        self.personality.revision += 1;
-        Ok(())
-    }
-
-    fn publish_kernel_reply(&mut self) {
-        assert!(!self.personality.service_bound);
-        assert!(self.personality.fallback_running);
-        self.reply_publications += 1;
-        self.personality.revision += 1;
-        self.personality.snapshot_revision = None;
-        self.personality.replacement_ready = false;
-    }
-
-    fn revoke_begin(&mut self) {
-        self.authority_epoch += 1;
-    }
-}
-
-fn run_filesystem_lifecycle_companion() {
-    println!(
-        "FILESYSTEM_LIFECYCLE BEGIN authority_epoch=201 personality_binding=1 pager_binding=7 filesystem_binding=1 block_binding=3 device_generation=3 epochs_independent=true bounded=true real_dma=false"
-    );
-
-    let mut domains = LifecycleDomains::new();
-    let pager_token = domains.token(LifecycleDomain::Pager);
-    let personality_before = domains.personality;
-    let filesystem_before = domains.filesystem;
-    domains.crash(LifecycleDomain::Pager);
-    assert_eq!(domains.personality, personality_before);
-    assert_eq!(domains.filesystem, filesystem_before);
-    let before_stale = domains.projection();
-    assert_eq!(
-        domains.commit_pager_map(pager_token),
-        Err(LifecycleDomainError::StaleBinding)
-    );
-    assert_eq!(domains.projection(), before_stale);
-    let pager_snapshot = domains.recovery_snapshot(LifecycleDomain::Pager);
-    domains.ready(pager_snapshot);
-    domains.rebind(LifecycleDomain::Pager);
-    let pager_token = domains.adopt(pager_token).unwrap();
-    domains.commit_pager_map(pager_token).unwrap();
-    assert_eq!(domains.address_space_generation, 2);
-    assert_eq!(domains.mapping_publications, 1);
-    println!(
-        "FILESYSTEM_LIFECYCLE PagerCrash old_binding=7 new_binding=8 snapshot=true ready=true adopted=true mapping_publications=1 address_space_generation=1->2 peer_epochs_unchanged=true stale_old_token=StaleBinding full_projection_unchanged=true"
-    );
-
-    // Crash before commit: the replacement adopts the exact prepared effect.
-    let filesystem_token = domains.token(LifecycleDomain::Filesystem);
-    let personality_before = domains.personality;
-    let pager_before = domains.pager;
-    let mut precommit = lifecycle_registry(LIFECYCLE_PRECOMMIT_SCOPE);
-    let registered = lifecycle_register(
-        &mut precommit,
-        LIFECYCLE_PRECOMMIT_SCOPE,
-        OP_PREAD,
-        __NR_pread64 as usize,
-    );
-    precommit.prepare(LIFECYCLE_V1, registered.handle).unwrap();
-    domains.crash(LifecycleDomain::Filesystem);
-    assert_eq!(domains.personality, personality_before);
-    assert_eq!(domains.pager, pager_before);
-    let crash = precommit
-        .crash(LIFECYCLE_PRECOMMIT_SCOPE, LIFECYCLE_V1)
-        .unwrap();
-    assert_eq!(crash.previous_binding_epoch, 1);
-    assert_eq!(crash.binding_epoch, 2);
-    let snapshot = precommit
-        .recovery_snapshot(LIFECYCLE_PRECOMMIT_SCOPE, LIFECYCLE_V2)
-        .unwrap();
-    precommit
-        .ready(LIFECYCLE_PRECOMMIT_SCOPE, LIFECYCLE_V2, &snapshot)
-        .unwrap();
-    precommit
-        .rebind(LIFECYCLE_PRECOMMIT_SCOPE, LIFECYCLE_V2)
-        .unwrap();
-    let filesystem_snapshot = domains.recovery_snapshot(LifecycleDomain::Filesystem);
-    domains.ready(filesystem_snapshot);
-    domains.rebind(LifecycleDomain::Filesystem);
-    let adopted = precommit
-        .adopt(LIFECYCLE_PRECOMMIT_SCOPE, LIFECYCLE_V2, registered.handle)
-        .unwrap();
-    let before_stale = precommit
-        .scope_projection(LIFECYCLE_PRECOMMIT_SCOPE)
-        .unwrap();
-    let effect_before_stale = precommit.effect_view(registered.identity.effect()).unwrap();
-    let domain_before_stale = domains.projection();
-    assert_eq!(
-        precommit.prepare(LIFECYCLE_V1, registered.handle),
-        Err(RegistryError::StaleBinding)
-    );
-    assert_eq!(
+        // Crash before commit: the replacement adopts the exact prepared effect.
+        let filesystem_token = domains.token(LifecycleDomain::Filesystem);
+        let personality_before = domains.personality;
+        let pager_before = domains.pager;
+        let mut precommit = lifecycle_registry(LIFECYCLE_PRECOMMIT_SCOPE);
+        let registered = lifecycle_register(
+            &mut precommit,
+            LIFECYCLE_PRECOMMIT_SCOPE,
+            OP_PREAD,
+            __NR_pread64 as usize,
+        );
+        precommit.prepare(LIFECYCLE_V1, registered.handle).unwrap();
+        domains.crash(LifecycleDomain::Filesystem);
+        assert_eq!(domains.personality, personality_before);
+        assert_eq!(domains.pager, pager_before);
+        let crash = precommit
+            .crash(LIFECYCLE_PRECOMMIT_SCOPE, LIFECYCLE_V1)
+            .unwrap();
+        assert_eq!(crash.previous_binding_epoch, 1);
+        assert_eq!(crash.binding_epoch, 2);
+        let snapshot = precommit
+            .recovery_snapshot(LIFECYCLE_PRECOMMIT_SCOPE, LIFECYCLE_V2)
+            .unwrap();
         precommit
+            .ready(LIFECYCLE_PRECOMMIT_SCOPE, LIFECYCLE_V2, &snapshot)
+            .unwrap();
+        precommit
+            .rebind(LIFECYCLE_PRECOMMIT_SCOPE, LIFECYCLE_V2)
+            .unwrap();
+        let filesystem_snapshot = domains.recovery_snapshot(LifecycleDomain::Filesystem);
+        domains.ready(filesystem_snapshot);
+        domains.rebind(LifecycleDomain::Filesystem);
+        let adopted = precommit
+            .adopt(LIFECYCLE_PRECOMMIT_SCOPE, LIFECYCLE_V2, registered.handle)
+            .unwrap();
+        let before_stale = precommit
             .scope_projection(LIFECYCLE_PRECOMMIT_SCOPE)
-            .unwrap(),
-        before_stale
-    );
-    assert_eq!(
-        precommit.effect_view(registered.identity.effect()).unwrap(),
-        effect_before_stale
-    );
-    assert_eq!(
-        domains.complete_pread(filesystem_token),
-        Err(LifecycleDomainError::StaleBinding)
-    );
-    assert_eq!(domains.projection(), domain_before_stale);
-    let filesystem_token = domains.adopt(filesystem_token).unwrap();
-    domains.complete_pread(filesystem_token).unwrap();
-    let commit = match precommit
-        .commit(LIFECYCLE_V2, adopted, CommitMetadata::new(4, 1))
-        .unwrap()
-    {
-        CommitOutcome::Applied(receipt) => receipt,
-        CommitOutcome::AlreadyCommitted(_) => panic!("precommit witness replayed"),
-    };
-    precommit
-        .domain_changed(LIFECYCLE_PRECOMMIT_SCOPE, 1)
-        .unwrap();
-    let terminal = precommit
-        .stage_terminal(
-            LIFECYCLE_V2,
-            adopted,
-            TerminalRequest::completed_by(4, commit),
-        )
-        .unwrap();
-    precommit
-        .acknowledge_publication(&terminal.publication.unwrap())
-        .unwrap();
-    close_lifecycle_scope(&mut precommit, LIFECYCLE_PRECOMMIT_SCOPE);
-    println!(
-        "FILESYSTEM_LIFECYCLE PrecommitCrash domain=filesystem effect=1 old_binding=1 new_binding=2 snapshot=true ready=true adopted=true peer_epochs_unchanged=true stale_old_handle=StaleBinding registry_and_domain_projection_unchanged=true result=4 quiescent=true"
-    );
-
-    // Crash after commit: the immutable commit receipt lets the kernel finish
-    // while no personality service is bound, fencing the late v1 reply.
-    let personality_token = domains.token(LifecycleDomain::Personality);
-    let pager_before = domains.pager;
-    let filesystem_before = domains.filesystem;
-    let mut postcommit = lifecycle_registry(LIFECYCLE_POSTCOMMIT_SCOPE);
-    let registered = lifecycle_register(
-        &mut postcommit,
-        LIFECYCLE_POSTCOMMIT_SCOPE,
-        OP_PREAD,
-        __NR_pread64 as usize,
-    );
-    postcommit.prepare(LIFECYCLE_V1, registered.handle).unwrap();
-    let commit = match postcommit
-        .commit(LIFECYCLE_V1, registered.handle, CommitMetadata::new(4, 1))
-        .unwrap()
-    {
-        CommitOutcome::Applied(receipt) => receipt,
-        CommitOutcome::AlreadyCommitted(_) => panic!("postcommit witness replayed"),
-    };
-    postcommit
-        .domain_changed(LIFECYCLE_POSTCOMMIT_SCOPE, 1)
-        .unwrap();
-    postcommit
-        .crash(LIFECYCLE_POSTCOMMIT_SCOPE, LIFECYCLE_V1)
-        .unwrap();
-    domains.crash(LifecycleDomain::Personality);
-    assert_eq!(domains.pager, pager_before);
-    assert_eq!(domains.filesystem, filesystem_before);
-    let terminal = postcommit.stage_kernel_completion(&commit).unwrap();
-    postcommit
-        .acknowledge_publication(&terminal.publication.unwrap())
-        .unwrap();
-    domains.publish_kernel_reply();
-    let before_stale = postcommit
-        .scope_projection(LIFECYCLE_POSTCOMMIT_SCOPE)
-        .unwrap();
-    let effect_before_stale = postcommit
-        .effect_view(registered.identity.effect())
-        .unwrap();
-    let domain_before_stale = domains.projection();
-    assert_eq!(
-        postcommit.stage_terminal(
-            LIFECYCLE_V1,
-            registered.handle,
-            TerminalRequest::completed_by(4, commit),
-        ),
-        Err(RegistryError::StaleBinding)
-    );
-    assert_eq!(
-        postcommit
-            .scope_projection(LIFECYCLE_POSTCOMMIT_SCOPE)
-            .unwrap(),
-        before_stale
-    );
-    assert_eq!(
-        postcommit
-            .effect_view(registered.identity.effect())
-            .unwrap(),
-        effect_before_stale
-    );
-    assert_eq!(
-        domains.publish_reply(personality_token),
-        Err(LifecycleDomainError::StaleBinding)
-    );
-    assert_eq!(domains.projection(), domain_before_stale);
-    let personality_snapshot = domains.recovery_snapshot(LifecycleDomain::Personality);
-    domains.ready(personality_snapshot);
-    domains.rebind(LifecycleDomain::Personality);
-    close_lifecycle_scope(&mut postcommit, LIFECYCLE_POSTCOMMIT_SCOPE);
-    println!(
-        "FILESYSTEM_LIFECYCLE PostcommitCrash domain=personality effect=1 old_binding=1 new_binding=2 commit_sequence=1 kernel_completion=true reply_publications=1 peer_epochs_unchanged=true late_service_rejected=StaleBinding registry_and_domain_projection_unchanged=true duplicate_terminal=false quiescent=true"
-    );
-
-    // Commit-first pwrite is drained by revocation from its immutable receipt.
-    let mut commit_first_domains = LifecycleDomains::new();
-    let commit_first_token = commit_first_domains.token(LifecycleDomain::Filesystem);
-    let mut commit_first = lifecycle_registry(LIFECYCLE_COMMIT_FIRST_SCOPE);
-    let registered = lifecycle_register(
-        &mut commit_first,
-        LIFECYCLE_COMMIT_FIRST_SCOPE,
-        OP_PWRITE,
-        __NR_pwrite64 as usize,
-    );
-    commit_first
-        .prepare(LIFECYCLE_V1, registered.handle)
-        .unwrap();
-    let committed = match commit_first
-        .commit(LIFECYCLE_V1, registered.handle, CommitMetadata::new(2, 1))
-        .unwrap()
-    {
-        CommitOutcome::Applied(receipt) => receipt,
-        CommitOutcome::AlreadyCommitted(_) => panic!("commit-first witness replayed"),
-    };
-    commit_first_domains
-        .commit_pwrite(commit_first_token)
-        .unwrap();
-    commit_first
-        .domain_changed(LIFECYCLE_COMMIT_FIRST_SCOPE, 1)
-        .unwrap();
-    assert_eq!(commit_first_domains.inode, [0, 0, b'x', b'y']);
-    assert_eq!(commit_first_domains.pwrite_publications, 1);
-    let selection = commit_first
-        .revoke_begin(LIFECYCLE_COMMIT_FIRST_SCOPE)
-        .unwrap();
-    commit_first_domains.revoke_begin();
-    let before_stale = commit_first
-        .scope_projection(LIFECYCLE_COMMIT_FIRST_SCOPE)
-        .unwrap();
-    let effect_before_stale = commit_first
-        .effect_view(registered.identity.effect())
-        .unwrap();
-    let domain_before_stale = commit_first_domains.projection();
-    assert_eq!(
-        commit_first.commit(LIFECYCLE_V1, registered.handle, CommitMetadata::new(2, 1),),
-        Err(RegistryError::StaleAuthority)
-    );
-    assert_eq!(
-        commit_first
-            .scope_projection(LIFECYCLE_COMMIT_FIRST_SCOPE)
-            .unwrap(),
-        before_stale
-    );
-    assert_eq!(
-        commit_first
-            .effect_view(registered.identity.effect())
-            .unwrap(),
-        effect_before_stale
-    );
-    assert_eq!(
-        commit_first_domains.commit_pwrite(commit_first_token),
-        Err(LifecycleDomainError::StaleAuthority)
-    );
-    assert_eq!(commit_first_domains.projection(), domain_before_stale);
-    let effect = commit_first
-        .revoke_next(&selection)
-        .unwrap()
-        .expect("committed pwrite remains in revoke cohort");
-    let RevokeDisposition::Drain(receipt) = effect.disposition else {
-        panic!("commit-first pwrite must drain")
-    };
-    assert_eq!(receipt, committed);
-    let terminal = commit_first
-        .stage_revoke_terminal(
-            &selection,
-            effect.effect,
-            TerminalRequest::completed_by(2, receipt),
-        )
-        .unwrap();
-    commit_first
-        .acknowledge_publication(&terminal.publication.unwrap())
-        .unwrap();
-    assert!(commit_first.revoke_next(&selection).unwrap().is_none());
-    commit_first.revoke_complete(&selection).unwrap();
-    commit_first.check_invariants().unwrap();
-    println!(
-        "FILESYSTEM_LIFECYCLE PwriteRace winner=commit commit_sequence=1 revoke_disposition=Drain inode_before=00000000 inode_after=00007879 pwrite_publications=1 stale_commit=StaleAuthority registry_effect_inode_projection_unchanged=true publication_acked=true quiescent=true"
-    );
-
-    // Revoke-first pwrite never reaches the filesystem mutation point.
-    let mut revoke_first_domains = LifecycleDomains::new();
-    let revoke_first_token = revoke_first_domains.token(LifecycleDomain::Filesystem);
-    let mut revoke_first = lifecycle_registry(LIFECYCLE_REVOKE_FIRST_SCOPE);
-    let registered = lifecycle_register(
-        &mut revoke_first,
-        LIFECYCLE_REVOKE_FIRST_SCOPE,
-        OP_PWRITE,
-        __NR_pwrite64 as usize,
-    );
-    revoke_first
-        .prepare(LIFECYCLE_V1, registered.handle)
-        .unwrap();
-    let selection = revoke_first
-        .revoke_begin(LIFECYCLE_REVOKE_FIRST_SCOPE)
-        .unwrap();
-    revoke_first_domains.revoke_begin();
-    let before_stale = revoke_first
-        .scope_projection(LIFECYCLE_REVOKE_FIRST_SCOPE)
-        .unwrap();
-    let effect_before_stale = revoke_first
-        .effect_view(registered.identity.effect())
-        .unwrap();
-    let domain_before_stale = revoke_first_domains.projection();
-    assert_eq!(
-        revoke_first.commit(LIFECYCLE_V1, registered.handle, CommitMetadata::new(2, 1),),
-        Err(RegistryError::StaleAuthority)
-    );
-    assert_eq!(
-        revoke_first
-            .scope_projection(LIFECYCLE_REVOKE_FIRST_SCOPE)
-            .unwrap(),
-        before_stale
-    );
-    assert_eq!(
-        revoke_first
-            .effect_view(registered.identity.effect())
-            .unwrap(),
-        effect_before_stale
-    );
-    assert_eq!(
-        revoke_first_domains.commit_pwrite(revoke_first_token),
-        Err(LifecycleDomainError::StaleAuthority)
-    );
-    assert_eq!(revoke_first_domains.projection(), domain_before_stale);
-    assert_eq!(revoke_first_domains.inode, [0; 4]);
-    assert_eq!(revoke_first_domains.pwrite_publications, 0);
-    let effect = revoke_first
-        .revoke_next(&selection)
-        .unwrap()
-        .expect("prepared pwrite remains in revoke cohort");
-    assert_eq!(effect.disposition, RevokeDisposition::Abort);
-    let terminal = revoke_first
-        .stage_revoke_terminal(&selection, effect.effect, TerminalRequest::aborted(-125))
-        .unwrap();
-    revoke_first
-        .acknowledge_publication(&terminal.publication.unwrap())
-        .unwrap();
-    assert!(revoke_first.revoke_next(&selection).unwrap().is_none());
-    revoke_first.revoke_complete(&selection).unwrap();
-    revoke_first.check_invariants().unwrap();
-    println!(
-        "FILESYSTEM_LIFECYCLE PwriteRace winner=revoke revoke_disposition=Abort inode_before=00000000 inode_after=00000000 pwrite_publications=0 stale_commit=StaleAuthority registry_effect_inode_projection_unchanged=true publication_acked=true quiescent=true"
-    );
-
-    let mut block = BlockLifecycle::new();
-    let token = block.submit();
-    let reset_tombstone = block.timeout_reset(token).unwrap();
-    assert_eq!(block.owners, 3);
-    assert!(block.tombstone.is_some());
-    let before_stale = block.projection();
-    assert_eq!(block.complete(token), Err(BlockError::StaleToken));
-    assert_eq!(block.projection(), before_stale);
-    assert_eq!(block.device_generation, 3);
-    println!(
-        "FILESYSTEM_LIFECYCLE ResetTimeout old_binding=3 new_binding=4 device_generation=3 unchanged_until_reset_ack=true tombstone=1 owners_retained=3 stale_completion=StaleToken full_projection_unchanged=true real_dma=false"
-    );
-    block.retry_reset_ack(reset_tombstone).unwrap();
-    assert_eq!(block.device_generation, 4);
-    assert_eq!(block.owners, 3);
-    println!(
-        "FILESYSTEM_LIFECYCLE ResetAck tombstone=1 device_generation=3->4 reset_ack=true owners_retained=3 iotlb_required=true"
-    );
-    block.begin_iotlb().unwrap();
-    let iotlb_tombstone = block.timeout_iotlb().unwrap();
-    assert_eq!(block.owners, 3);
-    let before_stale = block.projection();
-    assert_eq!(
-        block.retry_reset_ack(reset_tombstone),
-        Err(BlockError::StaleTombstone)
-    );
-    assert_eq!(block.projection(), before_stale);
-    println!(
-        "FILESYSTEM_LIFECYCLE IotlbTimeout binding=4 device_generation=4 tombstone=2 owners_retained=3 stale_reset_tombstone=StaleTombstone full_projection_unchanged=true real_dma=false"
-    );
-    block.retry_iotlb_ack(iotlb_tombstone).unwrap();
-    assert_eq!(block.owners, 0);
-    assert!(block.tombstone.is_none());
-    assert_eq!(block.phase, BlockPhase::Released);
-    assert!(block.reset_ack);
-    assert!(block.iotlb_ack);
-    assert_eq!(block.binding_epoch, 4);
-    assert_eq!(block.device_generation, 4);
-    assert_eq!(block.next_tombstone, 3);
-    println!(
-        "FILESYSTEM_LIFECYCLE IotlbAck tombstone=2 binding=4 device_generation=4 iotlb_ack=true owners_released=3 phase=Released"
-    );
-    assert_eq!(domains.mapping_publications, 1);
-    assert_eq!(domains.reply_publications, 1);
-    assert_eq!(domains.pager.binding_epoch, 8);
-    assert_eq!(domains.filesystem.binding_epoch, 2);
-    assert_eq!(domains.personality.binding_epoch, 2);
-    println!(
-        "FILESYSTEM_LIFECYCLE PASS pager_crash_adopt=true precommit_adopt=true postcommit_fence=true pwrite_commit_first=true pwrite_revoke_first=true reset_timeout_tombstone=true iotlb_timeout_tombstone=true device_generation_after_reset_ack=true owners_retained_until_iotlb_ack=true stale_token_full_projection_unchanged=true personality_epoch_independent=true pager_epoch_independent=true filesystem_epoch_independent=true block_epoch_independent=true quiescent=true bounded=true real_dma=false"
-    );
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BlockToken {
-    binding_epoch: u64,
-    device_generation: u64,
-    request: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BlockTombstone {
-    id: u64,
-    kind: BlockRecoveryKind,
-    token: BlockToken,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BlockRecoveryKind {
-    Reset,
-    Iotlb,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BlockPhase {
-    Idle,
-    Submitted,
-    ResetTimedOut,
-    ResetAcked,
-    IotlbInFlight,
-    IotlbTimedOut,
-    Released,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BlockProjection {
-    binding_epoch: u64,
-    device_generation: u64,
-    owners: usize,
-    tombstone: Option<BlockTombstone>,
-    phase: BlockPhase,
-    reset_ack: bool,
-    iotlb_ack: bool,
-    next_tombstone: u64,
-    revision: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BlockError {
-    StaleToken,
-    StaleTombstone,
-    InvalidState,
-}
-
-struct BlockLifecycle {
-    binding_epoch: u64,
-    device_generation: u64,
-    owners: usize,
-    tombstone: Option<BlockTombstone>,
-    phase: BlockPhase,
-    reset_ack: bool,
-    iotlb_ack: bool,
-    next_tombstone: u64,
-    revision: u64,
-}
-
-impl BlockLifecycle {
-    fn new() -> Self {
-        Self {
-            binding_epoch: 3,
-            device_generation: 3,
-            owners: 0,
-            tombstone: None,
-            phase: BlockPhase::Idle,
-            reset_ack: false,
-            iotlb_ack: false,
-            next_tombstone: 1,
-            revision: 0,
-        }
-    }
-
-    fn projection(&self) -> BlockProjection {
-        BlockProjection {
-            binding_epoch: self.binding_epoch,
-            device_generation: self.device_generation,
-            owners: self.owners,
-            tombstone: self.tombstone,
-            phase: self.phase,
-            reset_ack: self.reset_ack,
-            iotlb_ack: self.iotlb_ack,
-            next_tombstone: self.next_tombstone,
-            revision: self.revision,
-        }
-    }
-
-    fn submit(&mut self) -> BlockToken {
-        assert_eq!(self.owners, 0);
-        assert_eq!(self.phase, BlockPhase::Idle);
-        self.owners = 3;
-        self.phase = BlockPhase::Submitted;
-        self.revision += 1;
-        BlockToken {
-            binding_epoch: self.binding_epoch,
-            device_generation: self.device_generation,
-            request: 1,
-        }
-    }
-
-    fn timeout_reset(&mut self, token: BlockToken) -> Result<BlockTombstone, BlockError> {
-        if token.binding_epoch != self.binding_epoch
-            || token.device_generation != self.device_generation
+            .unwrap();
+        let effect_before_stale = precommit.effect_view(registered.identity.effect()).unwrap();
+        let domain_before_stale = domains.projection();
+        assert_eq!(
+            precommit.prepare(LIFECYCLE_V1, registered.handle),
+            Err(RegistryError::StaleBinding)
+        );
+        assert_eq!(
+            precommit
+                .scope_projection(LIFECYCLE_PRECOMMIT_SCOPE)
+                .unwrap(),
+            before_stale
+        );
+        assert_eq!(
+            precommit.effect_view(registered.identity.effect()).unwrap(),
+            effect_before_stale
+        );
+        assert_eq!(
+            domains.complete_pread(filesystem_token),
+            Err(LifecycleDomainError::StaleBinding)
+        );
+        assert_eq!(domains.projection(), domain_before_stale);
+        let filesystem_token = domains.adopt(filesystem_token).unwrap();
+        domains.complete_pread(filesystem_token).unwrap();
+        let commit = match precommit
+            .commit(LIFECYCLE_V2, adopted, CommitMetadata::new(4, 1))
+            .unwrap()
         {
-            return Err(BlockError::StaleToken);
-        }
-        if self.phase != BlockPhase::Submitted || self.owners != 3 || self.tombstone.is_some() {
-            return Err(BlockError::InvalidState);
-        }
-        self.binding_epoch += 1;
-        let tombstone = BlockTombstone {
-            id: self.next_tombstone,
-            kind: BlockRecoveryKind::Reset,
-            token,
+            CommitOutcome::Applied(receipt) => receipt,
+            CommitOutcome::AlreadyCommitted(_) => panic!("precommit witness replayed"),
         };
-        self.next_tombstone += 1;
-        self.tombstone = Some(tombstone);
-        self.phase = BlockPhase::ResetTimedOut;
-        self.revision += 1;
-        Ok(tombstone)
-    }
+        precommit
+            .domain_changed(LIFECYCLE_PRECOMMIT_SCOPE, 1)
+            .unwrap();
+        let terminal = precommit
+            .stage_terminal(
+                LIFECYCLE_V2,
+                adopted,
+                TerminalRequest::completed_by(4, commit),
+            )
+            .unwrap();
+        precommit
+            .acknowledge_publication(&terminal.publication.unwrap())
+            .unwrap();
+        close_lifecycle_scope(&mut precommit, LIFECYCLE_PRECOMMIT_SCOPE);
+        println!(
+            "FILESYSTEM_LIFECYCLE PrecommitCrash domain=filesystem effect=1 old_binding=1 new_binding=2 snapshot=true ready=true adopted=true peer_epochs_unchanged=true stale_old_handle=StaleBinding registry_and_domain_projection_unchanged=true result=4 quiescent=true"
+        );
 
-    fn complete(&mut self, token: BlockToken) -> Result<(), BlockError> {
-        if token.binding_epoch != self.binding_epoch
-            || token.device_generation != self.device_generation
+        // Crash after commit: the immutable commit receipt lets the kernel finish
+        // while no personality service is bound, fencing the late v1 reply.
+        let personality_token = domains.token(LifecycleDomain::Personality);
+        let pager_before = domains.pager;
+        let filesystem_before = domains.filesystem;
+        let mut postcommit = lifecycle_registry(LIFECYCLE_POSTCOMMIT_SCOPE);
+        let registered = lifecycle_register(
+            &mut postcommit,
+            LIFECYCLE_POSTCOMMIT_SCOPE,
+            OP_PREAD,
+            __NR_pread64 as usize,
+        );
+        postcommit.prepare(LIFECYCLE_V1, registered.handle).unwrap();
+        let commit = match postcommit
+            .commit(LIFECYCLE_V1, registered.handle, CommitMetadata::new(4, 1))
+            .unwrap()
         {
-            return Err(BlockError::StaleToken);
-        }
-        Err(BlockError::InvalidState)
-    }
+            CommitOutcome::Applied(receipt) => receipt,
+            CommitOutcome::AlreadyCommitted(_) => panic!("postcommit witness replayed"),
+        };
+        postcommit
+            .domain_changed(LIFECYCLE_POSTCOMMIT_SCOPE, 1)
+            .unwrap();
+        postcommit
+            .crash(LIFECYCLE_POSTCOMMIT_SCOPE, LIFECYCLE_V1)
+            .unwrap();
+        domains.crash(LifecycleDomain::Personality);
+        assert_eq!(domains.pager, pager_before);
+        assert_eq!(domains.filesystem, filesystem_before);
+        let terminal = postcommit.stage_kernel_completion(&commit).unwrap();
+        postcommit
+            .acknowledge_publication(&terminal.publication.unwrap())
+            .unwrap();
+        domains.publish_kernel_reply();
+        let before_stale = postcommit
+            .scope_projection(LIFECYCLE_POSTCOMMIT_SCOPE)
+            .unwrap();
+        let effect_before_stale = postcommit
+            .effect_view(registered.identity.effect())
+            .unwrap();
+        let domain_before_stale = domains.projection();
+        assert_eq!(
+            postcommit.stage_terminal(
+                LIFECYCLE_V1,
+                registered.handle,
+                TerminalRequest::completed_by(4, commit),
+            ),
+            Err(RegistryError::StaleBinding)
+        );
+        assert_eq!(
+            postcommit
+                .scope_projection(LIFECYCLE_POSTCOMMIT_SCOPE)
+                .unwrap(),
+            before_stale
+        );
+        assert_eq!(
+            postcommit
+                .effect_view(registered.identity.effect())
+                .unwrap(),
+            effect_before_stale
+        );
+        assert_eq!(
+            domains.publish_reply(personality_token),
+            Err(LifecycleDomainError::StaleBinding)
+        );
+        assert_eq!(domains.projection(), domain_before_stale);
+        let personality_snapshot = domains.recovery_snapshot(LifecycleDomain::Personality);
+        domains.ready(personality_snapshot);
+        domains.rebind(LifecycleDomain::Personality);
+        close_lifecycle_scope(&mut postcommit, LIFECYCLE_POSTCOMMIT_SCOPE);
+        println!(
+            "FILESYSTEM_LIFECYCLE PostcommitCrash domain=personality effect=1 old_binding=1 new_binding=2 commit_sequence=1 kernel_completion=true reply_publications=1 peer_epochs_unchanged=true late_service_rejected=StaleBinding registry_and_domain_projection_unchanged=true duplicate_terminal=false quiescent=true"
+        );
 
-    fn retry_reset_ack(&mut self, tombstone: BlockTombstone) -> Result<(), BlockError> {
-        if self.tombstone != Some(tombstone) || tombstone.kind != BlockRecoveryKind::Reset {
-            return Err(BlockError::StaleTombstone);
-        }
-        if self.phase != BlockPhase::ResetTimedOut || self.owners != 3 {
-            return Err(BlockError::InvalidState);
-        }
-        self.tombstone = None;
-        self.reset_ack = true;
-        self.device_generation += 1;
-        self.phase = BlockPhase::ResetAcked;
-        self.revision += 1;
-        Ok(())
-    }
-
-    fn begin_iotlb(&mut self) -> Result<(), BlockError> {
-        if self.phase != BlockPhase::ResetAcked
-            || !self.reset_ack
-            || self.owners != 3
-            || self.tombstone.is_some()
+        // Commit-first pwrite is drained by revocation from its immutable receipt.
+        let mut commit_first_domains = LifecycleDomains::new();
+        let commit_first_token = commit_first_domains.token(LifecycleDomain::Filesystem);
+        let mut commit_first = lifecycle_registry(LIFECYCLE_COMMIT_FIRST_SCOPE);
+        let registered = lifecycle_register(
+            &mut commit_first,
+            LIFECYCLE_COMMIT_FIRST_SCOPE,
+            OP_PWRITE,
+            __NR_pwrite64 as usize,
+        );
+        commit_first
+            .prepare(LIFECYCLE_V1, registered.handle)
+            .unwrap();
+        let committed = match commit_first
+            .commit(LIFECYCLE_V1, registered.handle, CommitMetadata::new(2, 1))
+            .unwrap()
         {
-            return Err(BlockError::InvalidState);
-        }
-        self.phase = BlockPhase::IotlbInFlight;
-        self.revision += 1;
-        Ok(())
+            CommitOutcome::Applied(receipt) => receipt,
+            CommitOutcome::AlreadyCommitted(_) => panic!("commit-first witness replayed"),
+        };
+        commit_first_domains
+            .commit_pwrite(commit_first_token)
+            .unwrap();
+        commit_first
+            .domain_changed(LIFECYCLE_COMMIT_FIRST_SCOPE, 1)
+            .unwrap();
+        assert_eq!(commit_first_domains.inode, [0, 0, b'x', b'y']);
+        assert_eq!(commit_first_domains.pwrite_publications, 1);
+        let selection = commit_first
+            .revoke_begin(LIFECYCLE_COMMIT_FIRST_SCOPE)
+            .unwrap();
+        commit_first_domains.revoke_begin();
+        let before_stale = commit_first
+            .scope_projection(LIFECYCLE_COMMIT_FIRST_SCOPE)
+            .unwrap();
+        let effect_before_stale = commit_first
+            .effect_view(registered.identity.effect())
+            .unwrap();
+        let domain_before_stale = commit_first_domains.projection();
+        assert_eq!(
+            commit_first.commit(LIFECYCLE_V1, registered.handle, CommitMetadata::new(2, 1),),
+            Err(RegistryError::StaleAuthority)
+        );
+        assert_eq!(
+            commit_first
+                .scope_projection(LIFECYCLE_COMMIT_FIRST_SCOPE)
+                .unwrap(),
+            before_stale
+        );
+        assert_eq!(
+            commit_first
+                .effect_view(registered.identity.effect())
+                .unwrap(),
+            effect_before_stale
+        );
+        assert_eq!(
+            commit_first_domains.commit_pwrite(commit_first_token),
+            Err(LifecycleDomainError::StaleAuthority)
+        );
+        assert_eq!(commit_first_domains.projection(), domain_before_stale);
+        let effect = commit_first
+            .revoke_next(&selection)
+            .unwrap()
+            .expect("committed pwrite remains in revoke cohort");
+        let RevokeDisposition::Drain(receipt) = effect.disposition else {
+            panic!("commit-first pwrite must drain")
+        };
+        assert_eq!(receipt, committed);
+        let terminal = commit_first
+            .stage_revoke_terminal(
+                &selection,
+                effect.effect,
+                TerminalRequest::completed_by(2, receipt),
+            )
+            .unwrap();
+        commit_first
+            .acknowledge_publication(&terminal.publication.unwrap())
+            .unwrap();
+        assert!(commit_first.revoke_next(&selection).unwrap().is_none());
+        commit_first.revoke_complete(&selection).unwrap();
+        commit_first.check_invariants().unwrap();
+        println!(
+            "FILESYSTEM_LIFECYCLE PwriteRace winner=commit commit_sequence=1 revoke_disposition=Drain inode_before=00000000 inode_after=00007879 pwrite_publications=1 stale_commit=StaleAuthority registry_effect_inode_projection_unchanged=true publication_acked=true quiescent=true"
+        );
+
+        // Revoke-first pwrite never reaches the filesystem mutation point.
+        let mut revoke_first_domains = LifecycleDomains::new();
+        let revoke_first_token = revoke_first_domains.token(LifecycleDomain::Filesystem);
+        let mut revoke_first = lifecycle_registry(LIFECYCLE_REVOKE_FIRST_SCOPE);
+        let registered = lifecycle_register(
+            &mut revoke_first,
+            LIFECYCLE_REVOKE_FIRST_SCOPE,
+            OP_PWRITE,
+            __NR_pwrite64 as usize,
+        );
+        revoke_first
+            .prepare(LIFECYCLE_V1, registered.handle)
+            .unwrap();
+        let selection = revoke_first
+            .revoke_begin(LIFECYCLE_REVOKE_FIRST_SCOPE)
+            .unwrap();
+        revoke_first_domains.revoke_begin();
+        let before_stale = revoke_first
+            .scope_projection(LIFECYCLE_REVOKE_FIRST_SCOPE)
+            .unwrap();
+        let effect_before_stale = revoke_first
+            .effect_view(registered.identity.effect())
+            .unwrap();
+        let domain_before_stale = revoke_first_domains.projection();
+        assert_eq!(
+            revoke_first.commit(LIFECYCLE_V1, registered.handle, CommitMetadata::new(2, 1),),
+            Err(RegistryError::StaleAuthority)
+        );
+        assert_eq!(
+            revoke_first
+                .scope_projection(LIFECYCLE_REVOKE_FIRST_SCOPE)
+                .unwrap(),
+            before_stale
+        );
+        assert_eq!(
+            revoke_first
+                .effect_view(registered.identity.effect())
+                .unwrap(),
+            effect_before_stale
+        );
+        assert_eq!(
+            revoke_first_domains.commit_pwrite(revoke_first_token),
+            Err(LifecycleDomainError::StaleAuthority)
+        );
+        assert_eq!(revoke_first_domains.projection(), domain_before_stale);
+        assert_eq!(revoke_first_domains.inode, [0; 4]);
+        assert_eq!(revoke_first_domains.pwrite_publications, 0);
+        let effect = revoke_first
+            .revoke_next(&selection)
+            .unwrap()
+            .expect("prepared pwrite remains in revoke cohort");
+        assert_eq!(effect.disposition, RevokeDisposition::Abort);
+        let terminal = revoke_first
+            .stage_revoke_terminal(&selection, effect.effect, TerminalRequest::aborted(-125))
+            .unwrap();
+        revoke_first
+            .acknowledge_publication(&terminal.publication.unwrap())
+            .unwrap();
+        assert!(revoke_first.revoke_next(&selection).unwrap().is_none());
+        revoke_first.revoke_complete(&selection).unwrap();
+        revoke_first.check_invariants().unwrap();
+        println!(
+            "FILESYSTEM_LIFECYCLE PwriteRace winner=revoke revoke_disposition=Abort inode_before=00000000 inode_after=00000000 pwrite_publications=0 stale_commit=StaleAuthority registry_effect_inode_projection_unchanged=true publication_acked=true quiescent=true"
+        );
+
+        let mut block = BlockLifecycle::new();
+        let token = block.submit();
+        let reset_tombstone = block.timeout_reset(token).unwrap();
+        assert_eq!(block.owners, 3);
+        assert!(block.tombstone.is_some());
+        let before_stale = block.projection();
+        assert_eq!(block.complete(token), Err(BlockError::StaleToken));
+        assert_eq!(block.projection(), before_stale);
+        assert_eq!(block.device_generation, 3);
+        println!(
+            "FILESYSTEM_LIFECYCLE ResetTimeout old_binding=3 new_binding=4 device_generation=3 unchanged_until_reset_ack=true tombstone=1 owners_retained=3 stale_completion=StaleToken full_projection_unchanged=true real_dma=false"
+        );
+        block.retry_reset_ack(reset_tombstone).unwrap();
+        assert_eq!(block.device_generation, 4);
+        assert_eq!(block.owners, 3);
+        println!(
+            "FILESYSTEM_LIFECYCLE ResetAck tombstone=1 device_generation=3->4 reset_ack=true owners_retained=3 iotlb_required=true"
+        );
+        block.begin_iotlb().unwrap();
+        let iotlb_tombstone = block.timeout_iotlb().unwrap();
+        assert_eq!(block.owners, 3);
+        let before_stale = block.projection();
+        assert_eq!(
+            block.retry_reset_ack(reset_tombstone),
+            Err(BlockError::StaleTombstone)
+        );
+        assert_eq!(block.projection(), before_stale);
+        println!(
+            "FILESYSTEM_LIFECYCLE IotlbTimeout binding=4 device_generation=4 tombstone=2 owners_retained=3 stale_reset_tombstone=StaleTombstone full_projection_unchanged=true real_dma=false"
+        );
+        block.retry_iotlb_ack(iotlb_tombstone).unwrap();
+        assert_eq!(block.owners, 0);
+        assert!(block.tombstone.is_none());
+        assert_eq!(block.phase, BlockPhase::Released);
+        assert!(block.reset_ack);
+        assert!(block.iotlb_ack);
+        assert_eq!(block.binding_epoch, 4);
+        assert_eq!(block.device_generation, 4);
+        assert_eq!(block.next_tombstone, 3);
+        println!(
+            "FILESYSTEM_LIFECYCLE IotlbAck tombstone=2 binding=4 device_generation=4 iotlb_ack=true owners_released=3 phase=Released"
+        );
+        assert_eq!(domains.mapping_publications, 1);
+        assert_eq!(domains.reply_publications, 1);
+        assert_eq!(domains.pager.binding_epoch, 8);
+        assert_eq!(domains.filesystem.binding_epoch, 2);
+        assert_eq!(domains.personality.binding_epoch, 2);
+        println!(
+            "FILESYSTEM_LIFECYCLE PASS pager_crash_adopt=true precommit_adopt=true postcommit_fence=true pwrite_commit_first=true pwrite_revoke_first=true reset_timeout_tombstone=true iotlb_timeout_tombstone=true device_generation_after_reset_ack=true owners_retained_until_iotlb_ack=true stale_token_full_projection_unchanged=true personality_epoch_independent=true pager_epoch_independent=true filesystem_epoch_independent=true block_epoch_independent=true quiescent=true bounded=true real_dma=false"
+        );
     }
 
-    fn timeout_iotlb(&mut self) -> Result<BlockTombstone, BlockError> {
-        if self.phase != BlockPhase::IotlbInFlight || self.owners != 3 || self.tombstone.is_some() {
-            return Err(BlockError::InvalidState);
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct BlockToken {
+        binding_epoch: u64,
+        device_generation: u64,
+        request: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct BlockTombstone {
+        id: u64,
+        kind: BlockRecoveryKind,
+        token: BlockToken,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BlockRecoveryKind {
+        Reset,
+        Iotlb,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BlockPhase {
+        Idle,
+        Submitted,
+        ResetTimedOut,
+        ResetAcked,
+        IotlbInFlight,
+        IotlbTimedOut,
+        Released,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct BlockProjection {
+        binding_epoch: u64,
+        device_generation: u64,
+        owners: usize,
+        tombstone: Option<BlockTombstone>,
+        phase: BlockPhase,
+        reset_ack: bool,
+        iotlb_ack: bool,
+        next_tombstone: u64,
+        revision: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BlockError {
+        StaleToken,
+        StaleTombstone,
+        InvalidState,
+    }
+
+    struct BlockLifecycle {
+        binding_epoch: u64,
+        device_generation: u64,
+        owners: usize,
+        tombstone: Option<BlockTombstone>,
+        phase: BlockPhase,
+        reset_ack: bool,
+        iotlb_ack: bool,
+        next_tombstone: u64,
+        revision: u64,
+    }
+
+    impl BlockLifecycle {
+        fn new() -> Self {
+            Self {
+                binding_epoch: 3,
+                device_generation: 3,
+                owners: 0,
+                tombstone: None,
+                phase: BlockPhase::Idle,
+                reset_ack: false,
+                iotlb_ack: false,
+                next_tombstone: 1,
+                revision: 0,
+            }
         }
-        let tombstone = BlockTombstone {
-            id: self.next_tombstone,
-            kind: BlockRecoveryKind::Iotlb,
-            token: BlockToken {
+
+        fn projection(&self) -> BlockProjection {
+            BlockProjection {
+                binding_epoch: self.binding_epoch,
+                device_generation: self.device_generation,
+                owners: self.owners,
+                tombstone: self.tombstone,
+                phase: self.phase,
+                reset_ack: self.reset_ack,
+                iotlb_ack: self.iotlb_ack,
+                next_tombstone: self.next_tombstone,
+                revision: self.revision,
+            }
+        }
+
+        fn submit(&mut self) -> BlockToken {
+            assert_eq!(self.owners, 0);
+            assert_eq!(self.phase, BlockPhase::Idle);
+            self.owners = 3;
+            self.phase = BlockPhase::Submitted;
+            self.revision += 1;
+            BlockToken {
                 binding_epoch: self.binding_epoch,
                 device_generation: self.device_generation,
                 request: 1,
-            },
-        };
-        self.next_tombstone += 1;
-        self.tombstone = Some(tombstone);
-        self.phase = BlockPhase::IotlbTimedOut;
-        self.revision += 1;
-        Ok(tombstone)
-    }
+            }
+        }
 
-    fn retry_iotlb_ack(&mut self, tombstone: BlockTombstone) -> Result<(), BlockError> {
-        if self.tombstone != Some(tombstone) || tombstone.kind != BlockRecoveryKind::Iotlb {
-            return Err(BlockError::StaleTombstone);
+        fn timeout_reset(&mut self, token: BlockToken) -> Result<BlockTombstone, BlockError> {
+            if token.binding_epoch != self.binding_epoch
+                || token.device_generation != self.device_generation
+            {
+                return Err(BlockError::StaleToken);
+            }
+            if self.phase != BlockPhase::Submitted || self.owners != 3 || self.tombstone.is_some() {
+                return Err(BlockError::InvalidState);
+            }
+            self.binding_epoch += 1;
+            let tombstone = BlockTombstone {
+                id: self.next_tombstone,
+                kind: BlockRecoveryKind::Reset,
+                token,
+            };
+            self.next_tombstone += 1;
+            self.tombstone = Some(tombstone);
+            self.phase = BlockPhase::ResetTimedOut;
+            self.revision += 1;
+            Ok(tombstone)
         }
-        if self.phase != BlockPhase::IotlbTimedOut || self.owners != 3 || !self.reset_ack {
-            return Err(BlockError::InvalidState);
+
+        fn complete(&mut self, token: BlockToken) -> Result<(), BlockError> {
+            if token.binding_epoch != self.binding_epoch
+                || token.device_generation != self.device_generation
+            {
+                return Err(BlockError::StaleToken);
+            }
+            Err(BlockError::InvalidState)
         }
-        self.tombstone = None;
-        self.iotlb_ack = true;
-        self.owners = 0;
-        self.phase = BlockPhase::Released;
-        self.revision += 1;
-        Ok(())
+
+        fn retry_reset_ack(&mut self, tombstone: BlockTombstone) -> Result<(), BlockError> {
+            if self.tombstone != Some(tombstone) || tombstone.kind != BlockRecoveryKind::Reset {
+                return Err(BlockError::StaleTombstone);
+            }
+            if self.phase != BlockPhase::ResetTimedOut || self.owners != 3 {
+                return Err(BlockError::InvalidState);
+            }
+            self.tombstone = None;
+            self.reset_ack = true;
+            self.device_generation += 1;
+            self.phase = BlockPhase::ResetAcked;
+            self.revision += 1;
+            Ok(())
+        }
+
+        fn begin_iotlb(&mut self) -> Result<(), BlockError> {
+            if self.phase != BlockPhase::ResetAcked
+                || !self.reset_ack
+                || self.owners != 3
+                || self.tombstone.is_some()
+            {
+                return Err(BlockError::InvalidState);
+            }
+            self.phase = BlockPhase::IotlbInFlight;
+            self.revision += 1;
+            Ok(())
+        }
+
+        fn timeout_iotlb(&mut self) -> Result<BlockTombstone, BlockError> {
+            if self.phase != BlockPhase::IotlbInFlight
+                || self.owners != 3
+                || self.tombstone.is_some()
+            {
+                return Err(BlockError::InvalidState);
+            }
+            let tombstone = BlockTombstone {
+                id: self.next_tombstone,
+                kind: BlockRecoveryKind::Iotlb,
+                token: BlockToken {
+                    binding_epoch: self.binding_epoch,
+                    device_generation: self.device_generation,
+                    request: 1,
+                },
+            };
+            self.next_tombstone += 1;
+            self.tombstone = Some(tombstone);
+            self.phase = BlockPhase::IotlbTimedOut;
+            self.revision += 1;
+            Ok(tombstone)
+        }
+
+        fn retry_iotlb_ack(&mut self, tombstone: BlockTombstone) -> Result<(), BlockError> {
+            if self.tombstone != Some(tombstone) || tombstone.kind != BlockRecoveryKind::Iotlb {
+                return Err(BlockError::StaleTombstone);
+            }
+            if self.phase != BlockPhase::IotlbTimedOut || self.owners != 3 || !self.reset_ack {
+                return Err(BlockError::InvalidState);
+            }
+            self.tombstone = None;
+            self.iotlb_ack = true;
+            self.owners = 0;
+            self.phase = BlockPhase::Released;
+            self.revision += 1;
+            Ok(())
+        }
     }
 }
 

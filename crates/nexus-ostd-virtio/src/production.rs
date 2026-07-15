@@ -23,7 +23,7 @@ use virtio_drivers::{
     device::blk::{BlkReq, BlkResp, RespStatus, SECTOR_SIZE},
     queue::{PreparedVirtQueue, VirtQueue},
     transport::{
-        DeviceStatus, DeviceType, Transport,
+        DeviceStatus, DeviceType, InterruptStatus, Transport,
         pci::{
             PciTransport, VirtioPciError,
             bus::{Command, DeviceFunction},
@@ -40,6 +40,8 @@ const QUEUE_INDEX: u16 = 0;
 const QUEUE_SIZE: usize = 16;
 const POLL_LIMIT: usize = 10_000_000;
 const EXPECTED_USED_LEN: u32 = (SECTOR_SIZE + size_of::<BlkResp>()) as u32;
+const PUBLISHED_REQUEST_SHARE_COUNTS: (usize, usize) = (3, 0);
+const POPPED_REQUEST_SHARE_COUNTS: (usize, usize) = (3, 3);
 const SESSION_NAMESPACE: u64 = 0x4e58_5052_0000_0000;
 const SESSION_SEQUENCE_MASK: u64 = 0xffff;
 
@@ -58,6 +60,21 @@ const REQUIRED_FEATURES: NexusBlkFeatures = NexusBlkFeatures::RO
 
 type Queue = VirtQueue<OstdHal, QUEUE_SIZE>;
 type PreparedQueue = PreparedVirtQueue<OstdHal, QUEUE_SIZE>;
+
+/// Completion-delivery mode selected before the queue becomes device-visible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionMode {
+    /// Preserve the Stage-5-compatible used-ring polling path.
+    Polling,
+    /// Request used-buffer interrupts for a real IRQ actor.
+    Interrupt,
+}
+
+impl CompletionMode {
+    const fn device_notifications_enabled(self) -> bool {
+        matches!(self, Self::Interrupt)
+    }
+}
 
 /// Descriptive coordinates of one prepared hardware request.
 ///
@@ -171,6 +188,51 @@ pub enum PublishIdentityError {
     WrongIdentity,
     /// The immutable facade identity no longer matches its prepared queue.
     DescriptorTokenMismatch,
+}
+
+/// Read-only rejection before a linear hardware cancellation/reset intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HardwareIntentError {
+    /// The adapter named another retained hardware request.
+    WrongIdentity,
+    /// The prepared queue token no longer matches its immutable identity.
+    DescriptorTokenMismatch,
+    /// The request DMA ledger does not match the retained typestate projection.
+    RequestShareStateMismatch {
+        /// The checked share/unshare counters, or `None` for a foreign generation.
+        observed: Option<(usize, usize)>,
+    },
+    /// A published typestate no longer contains every reset owner.
+    MissingResetOwner,
+}
+
+/// A failed hardware-intent preflight which returns the unchanged linear owner.
+///
+/// Preflight performs read-only identity and ownership checks. Consuming this
+/// value with [`Self::into_owner`] therefore recovers the exact request that
+/// entered the rejected call, without reconstructing authority from its
+/// descriptive coordinates.
+#[must_use = "inspect the error and recover or retain the unchanged hardware owner"]
+pub struct HardwareIntentFailure<T> {
+    error: HardwareIntentError,
+    owner: T,
+}
+
+impl<T> HardwareIntentFailure<T> {
+    /// Returns the read-only preflight rejection.
+    pub const fn error(&self) -> HardwareIntentError {
+        self.error
+    }
+
+    /// Borrows the unchanged linear owner.
+    pub const fn owner(&self) -> &T {
+        &self.owner
+    }
+
+    /// Recovers the unchanged linear owner.
+    pub fn into_owner(self) -> T {
+        self.owner
+    }
 }
 
 /// Failure-atomic validation error before software quiescence publication.
@@ -349,6 +411,28 @@ impl ProductionDevice {
         &mut self,
         root: &mut Root,
     ) -> Result<PreparedRequest, PrepareReadError> {
+        self.prepare_read_sector0_with_mode(root, CompletionMode::Polling)
+    }
+
+    /// Initializes an interrupt-driven read of sector zero without publishing
+    /// the available index.
+    ///
+    /// This successor differs from [`Self::prepare_read_sector0`] only in its
+    /// pre-publication used-buffer notification mode. PCI INTx remains masked
+    /// until the owning kernel has installed its IRQ actor and explicitly
+    /// consumes a [`crate::MaskedIntx`] through [`crate::Root::unmask_intx`].
+    pub fn prepare_read_sector0_irq(
+        &mut self,
+        root: &mut Root,
+    ) -> Result<PreparedRequest, PrepareReadError> {
+        self.prepare_read_sector0_with_mode(root, CompletionMode::Interrupt)
+    }
+
+    fn prepare_read_sector0_with_mode(
+        &mut self,
+        root: &mut Root,
+        completion_mode: CompletionMode,
+    ) -> Result<PreparedRequest, PrepareReadError> {
         if self.active.is_some() {
             return Err(PrepareReadError::ActiveSession);
         }
@@ -441,7 +525,7 @@ impl ProductionDevice {
                 return Err(PrepareReadError::Queue(error));
             }
         };
-        queue.set_dev_notify(false);
+        queue.set_dev_notify(completion_mode.device_notifications_enabled());
 
         if dma::try_arm_request_bounce(self.device_generation).is_none() {
             rollback_unexposed_preparation(
@@ -504,6 +588,7 @@ impl ProductionDevice {
 
         Ok(PreparedRequest {
             identity,
+            completion_mode,
             device_function: self.device_function,
             transport: ManuallyDrop::new(transport),
             queue: ManuallyDrop::new(prepared),
@@ -803,6 +888,7 @@ fn rollback_unexposed_preparation(
 #[must_use = "publish, cancel, or retain the complete prepared request"]
 pub struct PreparedRequest {
     identity: DeviceSessionIdentity,
+    completion_mode: CompletionMode,
     device_function: DeviceFunction,
     transport: ManuallyDrop<PciTransport>,
     queue: ManuallyDrop<PreparedQueue>,
@@ -813,6 +899,11 @@ impl PreparedRequest {
     /// Returns descriptive coordinates for registration in the kernel registry.
     pub const fn identity(&self) -> DeviceSessionIdentity {
         self.identity
+    }
+
+    /// Returns the completion-delivery mode fixed before queue publication.
+    pub const fn completion_mode(&self) -> CompletionMode {
+        self.completion_mode
     }
 
     /// Checks the immutable hardware identity before registry commit apply.
@@ -835,6 +926,38 @@ impl PreparedRequest {
         Ok(())
     }
 
+    /// Prevalidates unpublished cancellation and returns its linear hardware intent.
+    ///
+    /// This consumes the owner so identity, queue token, and request-share
+    /// state cannot change between validation and [`PreparedCancelIntent::apply_reset`].
+    /// Every rejection returns the unchanged owner and performs no queue, DMA,
+    /// transport, or facade mutation.
+    pub fn preflight_cancel(
+        self,
+        expected_cancel_identity: DeviceSessionIdentity,
+    ) -> Result<PreparedCancelIntent, HardwareIntentFailure<PreparedRequest>> {
+        if self.identity != expected_cancel_identity {
+            return Err(HardwareIntentFailure {
+                error: HardwareIntentError::WrongIdentity,
+                owner: self,
+            });
+        }
+        if self.queue.token() != self.identity.descriptor_token {
+            return Err(HardwareIntentFailure {
+                error: HardwareIntentError::DescriptorTokenMismatch,
+                owner: self,
+            });
+        }
+        let observed = dma::request_share_counts_checked(self.identity.device_generation);
+        if observed != Some((3, 0)) {
+            return Err(HardwareIntentFailure {
+                error: HardwareIntentError::RequestShareStateMismatch { observed },
+                owner: self,
+            });
+        }
+        Ok(PreparedCancelIntent { request: self })
+    }
+
     /// Performs the unique infallible `avail.idx` Release publication.
     ///
     /// The caller must first run [`Self::preflight_publish`] and prevalidate
@@ -848,6 +971,7 @@ impl PreparedRequest {
         let (queue, _token) = prepared.publish_prepared();
         PublishedRequest {
             identity: this.identity,
+            completion_mode: this.completion_mode,
             device_function: this.device_function,
             // SAFETY: the enclosing ManuallyDrop is consumed once here.
             transport: Some(unsafe { ManuallyDrop::take(&mut this.transport) }),
@@ -927,6 +1051,31 @@ impl Drop for PreparedRequest {
     }
 }
 
+/// Linear, prevalidated authority to cancel one unpublished request and reset
+/// its real retained device/queue/DMA owners.
+///
+/// Descriptive [`DeviceSessionIdentity`] values cannot construct this type;
+/// only [`PreparedRequest::preflight_cancel`] can move the prepared owner into
+/// it. It is deliberately neither `Clone` nor `Copy`.
+#[must_use = "apply reset or retain the prevalidated prepared hardware owner"]
+pub struct PreparedCancelIntent {
+    request: PreparedRequest,
+}
+
+impl PreparedCancelIntent {
+    /// Returns descriptive coordinates for binding to an external operation.
+    pub const fn identity(&self) -> DeviceSessionIdentity {
+        self.request.identity
+    }
+
+    /// Infallibly cancels the exact unpublished chain and starts device reset.
+    pub fn apply_reset(self, inject_pending_once: bool) -> ProductionResetTombstone {
+        self.request
+            .cancel_prepared()
+            .begin_reset(inject_pending_once)
+    }
+}
+
 /// A retained completion-path failure which still permits mandatory reset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionFailure {
@@ -955,6 +1104,116 @@ pub enum NotificationDisposition {
     AlreadyResolved,
 }
 
+/// Typed cause decoded from one VirtIO ISR-status read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterruptCause {
+    /// No queue or device-configuration cause was pending.
+    Spurious,
+    /// A used-buffer notification was pending for a virtqueue.
+    Queue,
+    /// Only a device-configuration change was pending.
+    Configuration,
+    /// Queue and device-configuration causes were pending together.
+    QueueAndConfiguration,
+}
+
+impl InterruptCause {
+    /// Reports whether this acknowledgement authorizes a used-ring probe.
+    pub const fn includes_queue(self) -> bool {
+        matches!(self, Self::Queue | Self::QueueAndConfiguration)
+    }
+}
+
+fn decode_interrupt_status(status: InterruptStatus) -> InterruptCause {
+    match (
+        status.contains(InterruptStatus::QUEUE_INTERRUPT),
+        status.contains(InterruptStatus::DEVICE_CONFIGURATION_INTERRUPT),
+    ) {
+        (false, false) => InterruptCause::Spurious,
+        (true, false) => InterruptCause::Queue,
+        (false, true) => InterruptCause::Configuration,
+        (true, true) => InterruptCause::QueueAndConfiguration,
+    }
+}
+
+/// Exact request identity and cause returned by one ISR acknowledgement.
+///
+/// This is descriptive evidence, not registry completion authority. Its fields
+/// are private so callers cannot manufacture a queue cause for another request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterruptReceipt {
+    identity: DeviceSessionIdentity,
+    cause: InterruptCause,
+}
+
+impl InterruptReceipt {
+    /// Returns the request whose transport ISR was read.
+    pub const fn identity(self) -> DeviceSessionIdentity {
+        self.identity
+    }
+
+    /// Returns the typed queue/configuration/spurious cause.
+    pub const fn cause(self) -> InterruptCause {
+        self.cause
+    }
+}
+
+/// Why task-context IRQ completion retained a request for a later actor turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterruptNotReadyReason {
+    /// The receipt was produced for another exact hardware request.
+    WrongIdentity {
+        expected: DeviceSessionIdentity,
+        observed: DeviceSessionIdentity,
+    },
+    /// The request selected the legacy polling completion mode.
+    PollingRequest,
+    /// The acknowledged ISR did not contain a queue cause.
+    NonQueueCause(InterruptCause),
+    /// A queue cause was acknowledged before the used entry became visible.
+    UsedRingNotReady,
+}
+
+/// Linear task-context IRQ completion result.
+///
+/// `NotReady` deliberately returns the exact [`PublishedRequest`] owner rather
+/// than converting it into the polling timeout/reset typestate. An IRQ actor
+/// may therefore put the request back into its protected slot and retry on a
+/// later interrupt without losing ownership or inventing a terminal result.
+#[must_use = "publish completion, retain the request in its IRQ slot, or reset it"]
+pub enum InterruptCompletionProgress {
+    /// The matching descriptor was popped and validated successfully.
+    Complete(CompletedRequest),
+    /// No authorized ready descriptor was available; the owner is unchanged.
+    NotReady {
+        request: PublishedRequest,
+        reason: InterruptNotReadyReason,
+    },
+    /// A ready descriptor failed the same validation used by polling.
+    Failed(FailedCompletion),
+}
+
+enum CompletionAttempt {
+    Complete(CompletedRequest),
+    NotReady(PublishedRequest),
+    Failed(FailedCompletion),
+}
+
+/// Linear result of one non-spinning task-context completion probe.
+///
+/// `NotReady` returns the exact published owner for reinsertion into a
+/// runtime-resident actor slot; it does not leave the owner on a long-lived
+/// polling stack.
+#[must_use = "consume completion, reinsert the unchanged owner, or reset the failure"]
+pub enum CompletionProbeProgress {
+    /// The matching descriptor was popped and validated successfully.
+    Complete(CompletedRequest),
+    /// No used descriptor is currently visible; the owner is unchanged.
+    NotReady(PublishedRequest),
+    /// A visible descriptor failed the shared completion validator.
+    Failed(FailedCompletion),
+}
+
 /// Linear result of one bounded completion poll.
 #[must_use = "consume the completion, reset the retained request, or retain its owner"]
 pub enum CompletionProgress {
@@ -964,6 +1223,27 @@ pub enum CompletionProgress {
     Pending(PendingCompletion),
     /// Validation failed while the complete request owner remained recoverable.
     Failed(FailedCompletion),
+}
+
+fn preflight_completion_reset_owner(
+    request: Option<&PublishedRequest>,
+    expected_reset_identity: DeviceSessionIdentity,
+    expected_share_counts: (usize, usize),
+) -> Result<(), HardwareIntentError> {
+    let Some(request) = request else {
+        return Err(HardwareIntentError::MissingResetOwner);
+    };
+    if request.identity != expected_reset_identity {
+        return Err(HardwareIntentError::WrongIdentity);
+    }
+    if request.transport.is_none() || request.queue.is_none() || request.buffers.is_none() {
+        return Err(HardwareIntentError::MissingResetOwner);
+    }
+    let observed = dma::request_share_counts_checked(request.identity.device_generation);
+    if observed != Some(expected_share_counts) {
+        return Err(HardwareIntentError::RequestShareStateMismatch { observed });
+    }
+    Ok(())
 }
 
 /// A timed-out poll which retains every published request owner.
@@ -1051,6 +1331,7 @@ impl FailedCompletion {
 #[must_use = "notify and complete, or retain/reset the published request"]
 pub struct PublishedRequest {
     identity: DeviceSessionIdentity,
+    completion_mode: CompletionMode,
     device_function: DeviceFunction,
     transport: Option<PciTransport>,
     queue: Option<Queue>,
@@ -1062,6 +1343,43 @@ impl PublishedRequest {
     /// Returns descriptive coordinates of the published request.
     pub const fn identity(&self) -> DeviceSessionIdentity {
         self.identity
+    }
+
+    /// Returns the completion-delivery mode fixed during preparation.
+    pub const fn completion_mode(&self) -> CompletionMode {
+        self.completion_mode
+    }
+
+    /// Prevalidates mandatory reset and returns its linear hardware intent.
+    ///
+    /// The returned intent owns the exact published transport, queue, buffers,
+    /// and generation. A rejected identity, missing owner, or foreign DMA
+    /// projection returns this [`PublishedRequest`] unchanged and performs no
+    /// transport, queue, DMA, or facade mutation.
+    pub fn preflight_reset(
+        self,
+        expected_reset_identity: DeviceSessionIdentity,
+    ) -> Result<PreparedPublishedResetIntent, HardwareIntentFailure<PublishedRequest>> {
+        if self.identity != expected_reset_identity {
+            return Err(HardwareIntentFailure {
+                error: HardwareIntentError::WrongIdentity,
+                owner: self,
+            });
+        }
+        if self.transport.is_none() || self.queue.is_none() || self.buffers.is_none() {
+            return Err(HardwareIntentFailure {
+                error: HardwareIntentError::MissingResetOwner,
+                owner: self,
+            });
+        }
+        let observed = dma::request_share_counts_checked(self.identity.device_generation);
+        if observed != Some((3, 0)) {
+            return Err(HardwareIntentFailure {
+                error: HardwareIntentError::RequestShareStateMismatch { observed },
+                owner: self,
+            });
+        }
+        Ok(PreparedPublishedResetIntent { request: self })
     }
 
     /// Resolves the one queue notification after external commit application.
@@ -1087,35 +1405,138 @@ impl PublishedRequest {
         disposition
     }
 
+    /// Hard-IRQ top-half acknowledgement for this request's VirtIO ISR.
+    ///
+    /// The operation performs exactly the transport ISR read/acknowledgement;
+    /// it does not allocate, log, spin, pop a descriptor, or publish guest
+    /// state. Reading the ISR may deassert a level-triggered INTx line. This is
+    /// the only [`PublishedRequest`] method intended for hard-IRQ context; the
+    /// receipt must be handed to a task-context completion actor.
+    pub fn ack_interrupt(&mut self) -> InterruptReceipt {
+        let status = self
+            .transport
+            .as_mut()
+            .expect("live transport")
+            .ack_interrupt();
+        InterruptReceipt {
+            identity: self.identity,
+            cause: decode_interrupt_status(status),
+        }
+    }
+
+    /// Task-context completion after an exact interrupt acknowledgement.
+    ///
+    /// This method has no explicit polling loop, but it may take the internal
+    /// DMA ledger lock while recycling a ready descriptor and therefore must
+    /// not run in hard-IRQ context. A foreign receipt, polling-mode request,
+    /// configuration-only/spurious interrupt, or queue interrupt observed
+    /// before its used entry is ready returns the unchanged linear request
+    /// owner in [`InterruptCompletionProgress::NotReady`]. Only a matching
+    /// queue cause with a ready used entry may reach descriptor validation.
+    pub fn complete_after_interrupt(
+        self,
+        receipt: InterruptReceipt,
+    ) -> InterruptCompletionProgress {
+        if self.identity != receipt.identity {
+            let expected = self.identity;
+            return InterruptCompletionProgress::NotReady {
+                request: self,
+                reason: InterruptNotReadyReason::WrongIdentity {
+                    expected,
+                    observed: receipt.identity,
+                },
+            };
+        }
+        if self.completion_mode != CompletionMode::Interrupt {
+            return InterruptCompletionProgress::NotReady {
+                request: self,
+                reason: InterruptNotReadyReason::PollingRequest,
+            };
+        }
+        if !receipt.cause.includes_queue() {
+            return InterruptCompletionProgress::NotReady {
+                request: self,
+                reason: InterruptNotReadyReason::NonQueueCause(receipt.cause),
+            };
+        }
+
+        match self.probe_completion_once() {
+            CompletionProbeProgress::Complete(request) => {
+                InterruptCompletionProgress::Complete(request)
+            }
+            CompletionProbeProgress::NotReady(request) => InterruptCompletionProgress::NotReady {
+                request,
+                reason: InterruptNotReadyReason::UsedRingNotReady,
+            },
+            CompletionProbeProgress::Failed(failure) => {
+                InterruptCompletionProgress::Failed(failure)
+            }
+        }
+    }
+
+    /// Performs one non-spinning task-context used-ring probe.
+    ///
+    /// This is the runtime-actor successor to the bounded polling wrapper. It
+    /// consumes the slot owner for one shared validation step and returns that
+    /// same owner in [`CompletionProbeProgress::NotReady`] when no used entry
+    /// is visible.
+    pub fn probe_completion_once(self) -> CompletionProbeProgress {
+        match self.complete_once() {
+            CompletionAttempt::Complete(request) => CompletionProbeProgress::Complete(request),
+            CompletionAttempt::NotReady(request) => CompletionProbeProgress::NotReady(request),
+            CompletionAttempt::Failed(failure) => CompletionProbeProgress::Failed(failure),
+        }
+    }
+
     /// Polls the Stage-5-compatible diagnostic completion path.
     ///
     /// This method does not establish an interrupt-delivery claim. The future
     /// main adapter must select a real IRQ completion API instead.
-    pub fn poll_completion(mut self) -> CompletionProgress {
+    pub fn poll_completion(self) -> CompletionProgress {
+        let mut request = self;
+        for _ in 0..POLL_LIMIT {
+            match request.probe_completion_once() {
+                CompletionProbeProgress::Complete(request) => {
+                    return CompletionProgress::Complete(request);
+                }
+                CompletionProbeProgress::NotReady(retained) => request = retained,
+                CompletionProbeProgress::Failed(failure) => {
+                    return CompletionProgress::Failed(failure);
+                }
+            }
+            spin_loop();
+        }
+        CompletionProgress::Pending(PendingCompletion {
+            request: Some(request),
+        })
+    }
+
+    /// Performs one non-spinning used-ring probe and the sole completion
+    /// validation implementation shared by polling and IRQ delivery.
+    fn complete_once(self) -> CompletionAttempt {
+        let observed = if self.notification_resolved {
+            self.queue.as_ref().expect("live queue").peek_used()
+        } else {
+            None
+        };
+        self.complete_observed(observed)
+    }
+
+    fn complete_observed(mut self, observed: Option<u16>) -> CompletionAttempt {
         if !self.notification_resolved {
-            return CompletionProgress::Failed(FailedCompletion::new(
+            return CompletionAttempt::Failed(FailedCompletion::new(
                 self,
                 CompletionFailure::NotificationUnresolved,
                 false,
                 None,
             ));
         }
-        let expected = self.identity.descriptor_token;
-        let mut observed = None;
-        for _ in 0..POLL_LIMIT {
-            if let Some(token) = self.queue.as_ref().expect("live queue").peek_used() {
-                observed = Some(token);
-                break;
-            }
-            spin_loop();
-        }
         let Some(observed) = observed else {
-            return CompletionProgress::Pending(PendingCompletion {
-                request: Some(self),
-            });
+            return CompletionAttempt::NotReady(self);
         };
+        let expected = self.identity.descriptor_token;
         if observed != expected {
-            return CompletionProgress::Failed(FailedCompletion::new(
+            return CompletionAttempt::Failed(FailedCompletion::new(
                 self,
                 CompletionFailure::WrongToken { expected, observed },
                 false,
@@ -1136,7 +1557,7 @@ impl PublishedRequest {
         let used_len = match unsafe { queue.pop_used(expected, &inputs, &mut outputs) } {
             Ok(used_len) => used_len,
             Err(error) => {
-                return CompletionProgress::Failed(FailedCompletion::new(
+                return CompletionAttempt::Failed(FailedCompletion::new(
                     self,
                     CompletionFailure::Pop(error),
                     false,
@@ -1145,7 +1566,7 @@ impl PublishedRequest {
             }
         };
         if used_len != EXPECTED_USED_LEN {
-            return CompletionProgress::Failed(FailedCompletion::new(
+            return CompletionAttempt::Failed(FailedCompletion::new(
                 self,
                 CompletionFailure::UnexpectedUsedLength {
                     expected: EXPECTED_USED_LEN,
@@ -1157,7 +1578,7 @@ impl PublishedRequest {
         }
         let response = request_buffers.response.status();
         if response != RespStatus::OK {
-            return CompletionProgress::Failed(FailedCompletion::new(
+            return CompletionAttempt::Failed(FailedCompletion::new(
                 self,
                 CompletionFailure::DeviceResponse(response),
                 true,
@@ -1166,7 +1587,7 @@ impl PublishedRequest {
         }
         let share_counts = dma::request_share_counts_checked(self.identity.device_generation);
         if share_counts != Some((3, 3)) {
-            return CompletionProgress::Failed(FailedCompletion::new(
+            return CompletionAttempt::Failed(FailedCompletion::new(
                 self,
                 CompletionFailure::ShareAccountingMismatch {
                     observed: share_counts,
@@ -1176,7 +1597,7 @@ impl PublishedRequest {
             ));
         }
 
-        CompletionProgress::Complete(CompletedRequest {
+        CompletionAttempt::Complete(CompletedRequest {
             request: Some(self),
             used_len,
         })
@@ -1210,6 +1631,31 @@ impl Drop for PublishedRequest {
     }
 }
 
+/// Linear, prevalidated authority to reset one real published request.
+///
+/// This type contains the retained [`PublishedRequest`] itself, not registry
+/// coordinates or a replayable operation identifier. Only
+/// [`PublishedRequest::preflight_reset`] can construct it, and it is
+/// deliberately neither `Clone` nor `Copy`.
+#[must_use = "apply reset or retain the prevalidated published hardware owner"]
+pub struct PreparedPublishedResetIntent {
+    request: PublishedRequest,
+}
+
+impl PreparedPublishedResetIntent {
+    /// Returns descriptive coordinates for binding to an external operation.
+    pub const fn identity(&self) -> DeviceSessionIdentity {
+        self.request.identity
+    }
+
+    /// Infallibly starts reset for the exact retained published owners.
+    pub fn apply_reset(self, inject_pending_once: bool) -> ProductionResetTombstone {
+        self.request
+            .into_reset_session(false, false)
+            .begin_reset(inject_pending_once)
+    }
+}
+
 /// A successfully popped request whose sector buffer is kernel-readable.
 #[must_use = "copy the data and close the complete hardware generation"]
 pub struct CompletedRequest {
@@ -1218,6 +1664,11 @@ pub struct CompletedRequest {
 }
 
 impl CompletedRequest {
+    /// Returns the retained hardware identity.
+    pub fn identity(&self) -> DeviceSessionIdentity {
+        self.request.as_ref().expect("completed request").identity
+    }
+
     /// Returns the used length reported by the device.
     pub const fn used_len(&self) -> u32 {
         self.used_len
@@ -1237,6 +1688,29 @@ impl CompletedRequest {
             .data
     }
 
+    /// Prevalidates reset after successful descriptor completion.
+    ///
+    /// The descriptor has already been popped, so the exact request DMA
+    /// projection is three shares and three matching unshares, not the live
+    /// published-request projection. Every rejection returns this completed
+    /// owner unchanged and performs no transport, queue, DMA, or facade
+    /// mutation.
+    pub fn preflight_reset(
+        self,
+        expected_reset_identity: DeviceSessionIdentity,
+    ) -> Result<PreparedRequestResetIntent, HardwareIntentFailure<CompletedRequest>> {
+        match preflight_completion_reset_owner(
+            self.request.as_ref(),
+            expected_reset_identity,
+            POPPED_REQUEST_SHARE_COUNTS,
+        ) {
+            Ok(()) => Ok(PreparedRequestResetIntent {
+                owner: PreparedRequestResetOwner::Completed(self),
+            }),
+            Err(error) => Err(HardwareIntentFailure { error, owner: self }),
+        }
+    }
+
     /// Starts mandatory whole-device reset after normal completion.
     pub fn begin_reset(mut self, inject_pending_once: bool) -> ProductionResetTombstone {
         self.request
@@ -1244,6 +1718,95 @@ impl CompletedRequest {
             .expect("completed request")
             .into_reset_session(true, true)
             .begin_reset(inject_pending_once)
+    }
+}
+
+impl PendingCompletion {
+    /// Prevalidates reset for a published request whose descriptor remains live.
+    ///
+    /// Every rejection returns this pending owner unchanged and performs no
+    /// transport, queue, DMA, or facade mutation.
+    pub fn preflight_reset(
+        self,
+        expected_reset_identity: DeviceSessionIdentity,
+    ) -> Result<PreparedRequestResetIntent, HardwareIntentFailure<PendingCompletion>> {
+        match preflight_completion_reset_owner(
+            self.request.as_ref(),
+            expected_reset_identity,
+            PUBLISHED_REQUEST_SHARE_COUNTS,
+        ) {
+            Ok(()) => Ok(PreparedRequestResetIntent {
+                owner: PreparedRequestResetOwner::Pending(self),
+            }),
+            Err(error) => Err(HardwareIntentFailure { error, owner: self }),
+        }
+    }
+}
+
+impl FailedCompletion {
+    /// Prevalidates reset after a retained completion-path failure.
+    ///
+    /// The required DMA projection follows the type-retained pop state: a
+    /// pre-pop failure still has three live shares, while a post-pop failure
+    /// has three matching unshares. Every rejection returns this failed owner
+    /// unchanged and performs no transport, queue, DMA, or facade mutation.
+    pub fn preflight_reset(
+        self,
+        expected_reset_identity: DeviceSessionIdentity,
+    ) -> Result<PreparedRequestResetIntent, HardwareIntentFailure<FailedCompletion>> {
+        let expected_share_counts = if self.descriptor_popped {
+            POPPED_REQUEST_SHARE_COUNTS
+        } else {
+            PUBLISHED_REQUEST_SHARE_COUNTS
+        };
+        match preflight_completion_reset_owner(
+            self.request.as_ref(),
+            expected_reset_identity,
+            expected_share_counts,
+        ) {
+            Ok(()) => Ok(PreparedRequestResetIntent {
+                owner: PreparedRequestResetOwner::Failed(self),
+            }),
+            Err(error) => Err(HardwareIntentFailure { error, owner: self }),
+        }
+    }
+}
+
+enum PreparedRequestResetOwner {
+    Completed(CompletedRequest),
+    Pending(PendingCompletion),
+    Failed(FailedCompletion),
+}
+
+/// Linear, prevalidated reset authority returned by every completion actor state.
+///
+/// The private owner enum retains the exact completed, pending, or failed
+/// request wrapper. Descriptive [`DeviceSessionIdentity`] values cannot
+/// construct this type, and it is deliberately neither `Clone` nor `Copy`.
+#[must_use = "apply reset or retain the prevalidated completion hardware owner"]
+pub struct PreparedRequestResetIntent {
+    owner: PreparedRequestResetOwner,
+}
+
+impl PreparedRequestResetIntent {
+    /// Returns descriptive coordinates for binding to an external operation.
+    pub fn identity(&self) -> DeviceSessionIdentity {
+        match &self.owner {
+            PreparedRequestResetOwner::Completed(request) => request.identity(),
+            PreparedRequestResetOwner::Pending(request) => request.identity(),
+            PreparedRequestResetOwner::Failed(request) => request.identity(),
+        }
+    }
+
+    /// Infallibly starts reset through the retained wrapper's sole implementation.
+    pub fn apply_reset(self, inject_pending_once: bool) -> ProductionResetTombstone {
+        match self.owner {
+            PreparedRequestResetOwner::Completed(request) => {
+                request.begin_reset(inject_pending_once)
+            }
+            PreparedRequestResetOwner::Pending(request) => request.begin_reset(inject_pending_once),
+            PreparedRequestResetOwner::Failed(request) => request.begin_reset(inject_pending_once),
+        }
     }
 }
 
@@ -1355,31 +1918,47 @@ impl ProductionResetTombstone {
         dma::retained_pages(self.session.identity.device_generation)
     }
 
+    /// Performs at most one reset-status observation for a runtime actor.
+    ///
+    /// The injected first-pending result and a not-yet-empty status both
+    /// return this exact tombstone for reinsertion into its actor slot. A ready
+    /// observation consumes the sole shared reset-finalization path.
+    pub fn probe_ack_once(mut self, root: &mut Root) -> Result<ProductionResetAck, Self> {
+        if self.inject_pending_once {
+            self.inject_pending_once = false;
+            return Err(self);
+        }
+        if !self.reset_status_acknowledged() {
+            return Err(self);
+        }
+        Ok(self.finalize_acknowledged_reset(root))
+    }
+
     /// Polls for reset acknowledgement, retaining this tombstone on timeout.
     pub fn retry_ack(mut self, root: &mut Root) -> Result<ProductionResetAck, Self> {
         if self.inject_pending_once {
             self.inject_pending_once = false;
             return Err(self);
         }
-        let mut acknowledged = false;
         for _ in 0..POLL_LIMIT {
-            if self
-                .session
-                .transport
-                .as_ref()
-                .expect("retained transport")
-                .get_status()
-                == DeviceStatus::empty()
-            {
-                acknowledged = true;
-                break;
+            if self.reset_status_acknowledged() {
+                return Ok(self.finalize_acknowledged_reset(root));
             }
             spin_loop();
         }
-        if !acknowledged {
-            return Err(self);
-        }
+        Err(self)
+    }
 
+    fn reset_status_acknowledged(&self) -> bool {
+        self.session
+            .transport
+            .as_ref()
+            .expect("retained transport")
+            .get_status()
+            == DeviceStatus::empty()
+    }
+
+    fn finalize_acknowledged_reset(mut self, root: &mut Root) -> ProductionResetAck {
         pci::disable_bus_master(root, self.session.device_function);
         let _ = self
             .session
@@ -1405,7 +1984,7 @@ impl ProductionResetTombstone {
         unsafe { pci::release_transport_claims() };
         assert_eq!(dma::retained_pages(generation), 3);
 
-        Ok(ProductionResetAck {
+        ProductionResetAck {
             identity: session.identity,
             published: session.published,
             descriptor_popped: session.descriptor_popped,
@@ -1413,7 +1992,7 @@ impl ProductionResetTombstone {
             retained_dma_pages: 3,
             closure_authority,
             generation_applied: false,
-        })
+        }
     }
 }
 
@@ -1552,6 +2131,8 @@ fn quarantine<T>(slot: &mut Option<T>) {
 mod tests {
     use super::*;
 
+    const SOURCE: &str = include_str!("production.rs");
+
     const IDENTITY: DeviceSessionIdentity = DeviceSessionIdentity::from_coordinates(
         0x4300_0000_0000_0001,
         DeviceBdf::from_coordinates(0, 5, 0),
@@ -1566,6 +2147,101 @@ mod tests {
         8,
         3,
     );
+
+    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source.find(signature).expect("function signature exists");
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .expect("function body opens");
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("function body closes");
+    }
+
+    #[test]
+    fn completion_modes_select_distinct_device_notification_flags() {
+        assert!(!CompletionMode::Polling.device_notifications_enabled());
+        assert!(CompletionMode::Interrupt.device_notifications_enabled());
+
+        let polling = function_body(SOURCE, "pub fn prepare_read_sector0(");
+        let interrupt = function_body(SOURCE, "pub fn prepare_read_sector0_irq(");
+        let common = function_body(SOURCE, "fn prepare_read_sector0_with_mode(");
+        assert!(polling.contains("CompletionMode::Polling"));
+        assert!(interrupt.contains("CompletionMode::Interrupt"));
+        assert!(
+            common
+                .contains("queue.set_dev_notify(completion_mode.device_notifications_enabled());")
+        );
+    }
+
+    #[test]
+    fn interrupt_status_decodes_all_queue_and_configuration_causes() {
+        let queue = InterruptStatus::QUEUE_INTERRUPT;
+        let configuration = InterruptStatus::DEVICE_CONFIGURATION_INTERRUPT;
+        assert_eq!(
+            decode_interrupt_status(InterruptStatus::empty()),
+            InterruptCause::Spurious
+        );
+        assert_eq!(decode_interrupt_status(queue), InterruptCause::Queue);
+        assert_eq!(
+            decode_interrupt_status(configuration),
+            InterruptCause::Configuration
+        );
+        assert_eq!(
+            decode_interrupt_status(queue | configuration),
+            InterruptCause::QueueAndConfiguration
+        );
+    }
+
+    #[test]
+    fn polling_and_irq_share_one_non_spinning_completion_validator() {
+        let acknowledgement = function_body(SOURCE, "pub fn ack_interrupt(");
+        let interrupt = function_body(SOURCE, "pub fn complete_after_interrupt(");
+        let probe = function_body(SOURCE, "pub fn probe_completion_once(");
+        let polling = function_body(SOURCE, "pub fn poll_completion(");
+        let once = function_body(SOURCE, "fn complete_once(");
+        let validator = function_body(SOURCE, "fn complete_observed(");
+
+        assert!(acknowledgement.contains(".ack_interrupt()"));
+        assert!(!acknowledgement.contains("spin_loop"));
+        assert!(!acknowledgement.contains("Box::"));
+        assert!(interrupt.contains("self.probe_completion_once()"));
+        assert!(!interrupt.contains("spin_loop"));
+        assert!(probe.contains("self.complete_once()"));
+        assert!(!probe.contains("spin_loop"));
+        assert!(!probe.contains("pop_used"));
+        assert!(polling.contains("request.probe_completion_once()"));
+        assert!(once.contains("self.complete_observed(observed)"));
+        assert!(!once.contains("spin_loop"));
+        assert!(!validator.contains("spin_loop"));
+        assert!(validator.contains("queue.pop_used(expected, &inputs, &mut outputs)"));
+        assert!(validator.contains("CompletionFailure::UnexpectedUsedLength"));
+        assert!(validator.contains("CompletionFailure::DeviceResponse"));
+        assert!(validator.contains("CompletionFailure::ShareAccountingMismatch"));
+        let implementation = SOURCE
+            .split_once("#[cfg(test)]")
+            .expect("test module follows implementation")
+            .0;
+        assert_eq!(
+            implementation
+                .matches("queue.pop_used(expected, &inputs, &mut outputs)")
+                .count(),
+            1,
+            "completion validation must not fork between polling and IRQ"
+        );
+    }
 
     #[test]
     fn unregistered_reset_projection_requires_exact_unpublished_three_owner_ack() {

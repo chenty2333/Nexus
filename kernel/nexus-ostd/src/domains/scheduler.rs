@@ -20,6 +20,7 @@
 //! placement policy.
 
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use cser_transition_gates::scheduler::{
     SchedulerCrashReceipt, SchedulerError, SchedulerGate, SchedulerMode,
@@ -38,6 +39,40 @@ use crate::TaskData;
 use crate::effect::EffectToken;
 
 pub const FIRST_FALLBACK_SELECTION_ATTEMPT: u64 = 1;
+
+// CI-only liveness receipt for the retained Round 4 replacement. The
+// run-queue critical section records one word and never writes the serial
+// console. The replacement task consumes and prints the receipt after the
+// scheduler lock and local-IRQ-disabled region have both been left.
+const LIVENESS_RECOVERY_TASK_ID: u64 = 701;
+const LIVENESS_PICK_REPORTED: usize = usize::MAX;
+static LIVENESS_PICK_CPU_PLUS_ONE: AtomicUsize = AtomicUsize::new(0);
+
+fn record_liveness_pick_installed(task_id: u64, cpu_index: usize) {
+    if task_id != LIVENESS_RECOVERY_TASK_ID {
+        return;
+    }
+    let encoded_cpu = cpu_index
+        .checked_add(1)
+        .expect("scheduler CPU index must fit the liveness receipt");
+    assert_ne!(encoded_cpu, LIVENESS_PICK_REPORTED);
+    let _ = LIVENESS_PICK_CPU_PLUS_ONE.compare_exchange(
+        0,
+        encoded_cpu,
+        Ordering::Release,
+        Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn consume_liveness_pick_installed(task_id: u64) -> usize {
+    assert_eq!(task_id, LIVENESS_RECOVERY_TASK_ID);
+    let encoded_cpu = LIVENESS_PICK_CPU_PLUS_ONE.swap(LIVENESS_PICK_REPORTED, Ordering::AcqRel);
+    assert!(
+        encoded_cpu != 0 && encoded_cpu != LIVENESS_PICK_REPORTED,
+        "replacement task entry requires one unconsumed run-queue installation receipt"
+    );
+    encoded_cpu - 1
+}
 
 pub use cser_transition_gates::scheduler::{FallbackEvidence, SchedulerBinding as Binding};
 
@@ -598,7 +633,9 @@ impl CserRunQueue {
 
     fn install_reserved(&mut self) -> Option<&Arc<Task>> {
         let next = self.reserved.take()?;
+        let task_id = Self::task_id(&next);
         self.install_current(next);
+        record_liveness_pick_installed(task_id, self.cpu_index);
         self.current.as_ref()
     }
 }

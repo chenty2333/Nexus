@@ -528,6 +528,56 @@ awk -f "$script_dir/assert-linux-futex-core.awk" "$log"
 awk -f "$script_dir/assert-linux-epoll.awk" "$log"
 awk -f "$script_dir/assert-composition.awk" "$log"
 
+# Classify the bounded recovery progress receipts that previously left one
+# opaque interval between fallback reservation and the first recovery receipt.
+# PickInstalled is a task-entry consumption of a prior run-queue atomic record;
+# it is not a direct-switch or wall-clock performance assertion.
+if ! awk '
+    { sub(/\r$/, "") }
+    stage == 0 && /^CSER FallbackPick .* task=701 / { stage = 1; next }
+    /^CSER PickInstalled task=701 / {
+        installed++
+        if (stage != 1 || $0 !~ /^CSER PickInstalled task=701 cpu=[0-9]+ rq_current=true$/)
+            invalid = 1
+        else
+            stage = 2
+        next
+    }
+    /^LINUX_FUTEX_CORE RecoveryTaskEntry replacement=701 phase=kernel$/ {
+        kernel_entry++
+        if (stage != 2) invalid = 1; else stage = 3
+        next
+    }
+    /^LINUX_FUTEX_CORE RecoveryTaskEntry replacement=701 phase=vm_active$/ {
+        vm_active++
+        if (stage != 3) invalid = 1; else stage = 4
+        next
+    }
+    /^LINUX_FUTEX_CORE RecoverySnapshotBegin replacement=701$/ {
+        snapshot_begin++
+        if (stage != 4) invalid = 1; else stage = 5
+        next
+    }
+    /^LINUX_FUTEX_CORE RecoveryRuntimeSectionComplete replacement=701 lock_released=true snapshot_captured=true$/ {
+        runtime_complete++
+        if (stage != 5) invalid = 1; else stage = 6
+        next
+    }
+    /^LINUX_FUTEX_CORE RecoverySnapshot replacement=701 / {
+        snapshot_receipt++
+        if (stage != 6) invalid = 1; else stage = 7
+        next
+    }
+    END {
+        exact = installed == 1 && kernel_entry == 1 && vm_active == 1 &&
+                snapshot_begin == 1 && runtime_complete == 1 && snapshot_receipt == 1
+        exit !invalid && stage == 7 && exact ? 0 : 1
+    }
+' "$log"; then
+    echo 'linux futex core recovery progress receipts are missing, duplicated, or out of order' >&2
+    exit 1
+fi
+
 # Keep the retained Round 4 parser honest. A duplicate terminal receipt, a
 # false requeue affected count, and a stale-v1 mutation claim must all fail.
 if {

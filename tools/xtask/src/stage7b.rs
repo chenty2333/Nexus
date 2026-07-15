@@ -2591,8 +2591,8 @@ mod tests {
         assert!(validate_scale_instrumentation_source(&hardcoded).is_err());
 
         let begin = source.replacen(
-            "    ) -> Result<RevokeSelection, RegistryError> {\n        let (closed_authority_epoch",
-            "    ) -> Result<RevokeSelection, RegistryError> {\n        let _untracked = self.effects.values().count();\n        let (closed_authority_epoch",
+            "    ) -> Result<RevokeSelection, RegistryError> {\n        let plan = self.prepare_revoke_begin(scope_key)?;",
+            "    ) -> Result<RevokeSelection, RegistryError> {\n        let _untracked = self.effects.values().count();\n        let plan = self.prepare_revoke_begin(scope_key)?;",
             1,
         );
         assert_ne!(begin, source);

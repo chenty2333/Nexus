@@ -52,16 +52,17 @@ function add_effect(effect, label) {
 
 function parse_capture(    session) {
     require_event("Capture")
-    if (NF != 12 || $3 != "stage=enrolled_preflight" || $4 != "scope=95" ||
+    if (NF != 13 || $3 != "stage=enrolled_preflight" || $4 != "scope=95" ||
         $5 != "effects=6" || $6 != "credits=10" ||
-        $7 != "fault=revoke_wins_commit_gate" || $8 != "device=00:05.0" ||
-        $10 != "generation=1" || $11 != "queue=0")
+        $7 != "registry=shared_production" ||
+        $8 != "fault=revoke_wins_commit_gate" || $9 != "device=00:05.0" ||
+        $11 != "generation=1" || $12 != "queue=0")
         fail("malformed precommit Capture receipt: " $0)
-    session = value_at(9, "session")
+    session = value_at(10, "session")
     require_hex(session, "session")
     if (length(session) != 18)
         fail("device session is not a 64-bit hexadecimal identity: " session)
-    descriptor = value_at(12, "descriptor")
+    descriptor = value_at(13, "descriptor")
     require_decimal(descriptor, "descriptor", 1)
     capture_line = FNR
 }
@@ -136,7 +137,7 @@ function parse_serial_line() {
     if ($0 ~ /^LINUX_FS_SLICE CLOSED /)
         fail("accepted precommit witness reported only an early closed slice: " $0)
     if ($0 ~ /^LINUX_FS_SLICE PASS /) {
-        expected_slice_pass = "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=2 openat=1 pread64=1 commit_gate=revoke_wins publication_acks=2 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=false no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true generic_prefix_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=false real_dma_prepared=true device_dma_observed=false polling=false irq=false smp=1 same_boot=true identity_preserving=true precommit_fault=true"
+        expected_slice_pass = "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=2 compatibility_syscalls=payload_only_not_cser openat=1 pread64=1 registry=shared_production commit_gate=revoke_wins publication_acks=1 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=false no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=false real_dma_prepared=true device_dma_observed=false polling=false irq=false smp=1 same_boot=true identity_preserving=true precommit_fault=true"
         if ($0 != expected_slice_pass)
             fail("malformed or non-success aggregate filesystem result: " $0)
         slice_pass_count++
@@ -169,10 +170,10 @@ function parse_serial_line() {
         parse_capture()
     } else if ($2 == "DmaOwner") {
         parse_dma_owner()
-    } else if ($2 == "CommitRejected") {
-        require_event("CommitRejected")
-        if ($0 != "LINUX_FS_SAME_BOOT_PRECOMMIT CommitRejected error=StaleAuthority publish_closure_calls=0 prepared_owner_retained=true was_published=false guest_bytes=0")
-            fail("malformed precommit CommitRejected receipt: " $0)
+    } else if ($2 == "CommitGate") {
+        require_event("CommitGate")
+        if ($0 != "LINUX_FS_SAME_BOOT_PRECOMMIT CommitGate winner=revoke stage=precommit_commit_gate publish_closure_calls=0 device_visible=false")
+            fail("malformed precommit CommitGate receipt: " $0)
     } else if ($2 == "ResetTimeout") {
         require_event("ResetTimeout")
         if ($0 != "LINUX_FS_SAME_BOOT_PRECOMMIT ResetTimeout registry_tombstone=true hardware_tombstone=true retained_pages=3 generation=1")
@@ -206,7 +207,7 @@ function parse_serial_line() {
         pass_line = FNR
     } else if ($2 == "Terminal") {
         require_event("Terminal")
-        if ($0 != "LINUX_FS_SAME_BOOT_PRECOMMIT Terminal receipt_checked=true generic_prefix_quiescent=true poweroff=success")
+        if ($0 != "LINUX_FS_SAME_BOOT_PRECOMMIT Terminal receipt_checked=true registry=shared_production compatibility_syscalls=payload_only_not_cser poweroff=success")
             fail("malformed precommit kernel-root terminal receipt: " $0)
         terminal_line = FNR
     } else {
@@ -413,7 +414,7 @@ BEGIN {
     expected_event[2] = "DmaOwner"
     expected_event[3] = "DmaOwner"
     expected_event[4] = "DmaOwner"
-    expected_event[5] = "CommitRejected"
+    expected_event[5] = "CommitGate"
     expected_event[6] = "ResetTimeout"
     expected_event[7] = "ResetAck"
     expected_event[8] = "IotlbTimeout"

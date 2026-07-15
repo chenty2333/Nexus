@@ -54,14 +54,16 @@ RUN set -eu; \
     /usr/local/bin/assert-production-virtio-substrate \
         /crates/nexus-ostd-virtio/src/production.rs \
         /crates/nexus-ostd-virtio/src/lib.rs \
-        /crates/nexus-ostd-virtio/src/portal.rs
+        /crates/nexus-ostd-virtio/src/portal.rs \
+        /crates/nexus-ostd-virtio/src/pci.rs
 COPY patches/cser-cargo-config.toml /root/.cargo/config.toml
 RUN cargo test --manifest-path /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.toml \
         --lib --no-default-features \
     && rm -rf /opt/nexus-virtio/virtio-drivers-0.13.0/target
 
 COPY kernel/nexus-ostd/src/cser/effect_registry.rs \
-    /kernel/nexus-ostd/src/cser/effect_registry.rs
+    kernel/nexus-ostd/src/cser/device_flight.rs \
+    /kernel/nexus-ostd/src/cser/
 
 # cargo-osdk's -Zbuild-std and generated runner packages have dependencies that
 # a plain `cargo fetch --target` does not discover. Prime the real graph while

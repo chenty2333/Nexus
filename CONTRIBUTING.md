@@ -45,7 +45,8 @@ for isolation and maintenance, not as a second user-facing contract.
 | `./x run composition` | Regenerate both QEMU receipts and cross-check the predecessor and additive Linux-I/O successor; this is the default `run` target. |
 | `./x verify` | Run the canonical local, release, and CI full-acceptance gate. |
 | `./x verify-bundle [DIRECTORY]` | Verify a canonical cold bundle against the matching clean checkout without rebuilding evidence or running QEMU. |
-| `./x clean` | Remove root, xtask, OSDK, QEMU, guest, TLC, and evidence outputs without building an image. |
+| `./x clean` | Remove root, xtask, OSDK, guest, and TLC build caches without Docker while preserving evidence and release outputs. |
+| `./x clean --all` | Also remove verification, scenario, QEMU, and research evidence; published release and audit outputs remain preserved. |
 
 Focused `fmt`, `check`, `quick`, `model`, `spec`, and `system` commands exist
 for diagnostics. There is intentionally no `fuzz` command until Nexus owns a
