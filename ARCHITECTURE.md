@@ -1289,9 +1289,11 @@ The fourteen scale points are exact structural tuples, not an asymptotic or
 production `O(k)` result. The twenty-nine performance cases retain raw
 guest-visible-TSC samples and recomputed descriptive statistics, but have no
 threshold, comparative baseline, hardware-cycle, or low-overhead claim. The
-sixteen-row primary-source matrix contains fourteen full-text audits and two
-primary-metadata-only rows. The resulting contribution verdict is `narrow`;
-novelty, firstness, and proof remain unestablished.
+released `v0.1.0` sixteen-row primary-source matrix contains fourteen full-text
+audits and two primary-metadata-only rows. The current-main follow-up contains
+fifteen full-text audits and one primary-metadata-only row, Atomic RPC. The
+resulting contribution verdict remains `narrow`; novelty, firstness, and proof
+remain unestablished.
 
 The bounded checkpoint is release evidence only when a clean cold
 `NEXUS_REBUILD=1 ./x verify` and GitHub CI for the exact pushed revision both
@@ -1324,7 +1326,7 @@ transport.
 | Runtime filesystem | `RuntimeFsCser` safety/action graphs, 15 safe-Rust/property/Loom gates, unchanged retained ELF artifact gate, exact 14-syscall OSTD execution, four-domain lifecycle companion, positive/negative serial oracle, and Stage 5B sector/image component-consistency oracle | general VFS/persistence, real DMA in the primary boot, same-boot identity, multi-client/SMP, durable external effects |
 | Runtime network | `RuntimeNetCser` safety/action graphs (3,698,288 / 720,002 depth 42 and 28,449 / 14,328 depth 35), eight witnesses, 10 + 2 + 4 safe-Rust gates, unchanged 22-syscall retained ELF, bounded in-memory loopback, real `UserMode` netd-v1 page fault/netd-v2 rebind-adopt, kernel-owned readiness, four typed credits, and positive/negative trace/artifact oracles | smoltcp or real TCP breadth, external packets, VirtIO-net/NIC, multi-connection/backpressure behavior, SMP and production portal/lock refinement |
 | Linux pressure | Bounded Stage 6 Checked/Observed: all six fixed core inputs (`linux-hello`, adapted Round 4, adapted Round 5, dynamic PIE, runtime filesystem, runtime network), strict positive/negative oracles, bounded recovery companions, and additive seven-domain composition evidence | integrated mixed-service workload matrix; general ABI/VFS/TCP/device/SMP breadth |
-| Stage 7B evaluation and contribution decision | concurrency boundary exactly `production transition source under a Loom-modeled outer mutex`, with fourteen mapped races Checked; twenty case-local fault cells and fourteen finite structural scale tuples Checked in release single-vCPU QEMU; twenty-nine raw guest-visible-TSC cases Observed without thresholds or a comparative baseline; sixteen prior-art rows (fourteen full-text, two metadata-only); the recorded implementation checkpoint has cold/CI acceptance; verdict `narrow` | repeat exact-revision cold/CI acceptance for each later release; full-text resolution of the two metadata-only rows; production-lock/SMP, hardware-cycle, durable-external-effect, shared-production-fault, cross-object crash/panic atomicity, and broader Linux evidence before any stronger contribution claim |
+| Stage 7B evaluation and contribution decision | concurrency boundary exactly `production transition source under a Loom-modeled outer mutex`, with fourteen mapped races Checked; twenty case-local fault cells and fourteen finite structural scale tuples Checked in release single-vCPU QEMU; twenty-nine raw guest-visible-TSC cases Observed without thresholds or a comparative baseline; released `v0.1.0` prior-art boundary 14/2 and current-main follow-up 15/1; the recorded implementation checkpoint has cold/CI acceptance; verdict `narrow` | repeat exact-revision cold/CI acceptance for each later release; full-text resolution of the remaining Atomic RPC row; production-lock/SMP, hardware-cycle, durable-external-effect, shared-production-fault, cross-object crash/panic atomicity, and broader Linux evidence before any stronger contribution claim |
 
 TLC's current result is a complete graph only for its committed finite
 configuration. QEMU results are concrete observations only for their pinned

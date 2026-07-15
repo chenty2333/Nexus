@@ -383,7 +383,8 @@ fn validate_manifest_population(manifest: &PublishedManifest, specs: &[&str]) ->
         return Err("artifact bundle stage population differs from the contract".into());
     }
 
-    let expected_boundaries = serde_json::to_value(Boundaries::current())?;
+    let prior_art = crate::stage7b_prior_art::accepted_summary();
+    let expected_boundaries = serde_json::to_value(Boundaries::current(&prior_art)?)?;
     if manifest.boundaries != expected_boundaries {
         return Err("artifact bundle research boundaries differ from the contract".into());
     }
@@ -746,7 +747,8 @@ mod tests {
                 .expect("fixture clock")
                 .as_secs(),
             formal_verifier,
-            boundaries: Boundaries::current(),
+            boundaries: Boundaries::current(&crate::stage7b_prior_art::accepted_summary())
+                .expect("accepted prior-art summary produces boundaries"),
             specifications: SPECS.iter().map(|spec| String::from(*spec)).collect(),
             stages: stage_population(),
             artifacts,

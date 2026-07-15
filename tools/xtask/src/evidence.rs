@@ -456,8 +456,17 @@ struct Boundaries {
 }
 
 impl Boundaries {
-    fn current() -> Self {
-        Self {
+    fn current(prior_art: &crate::stage7b_prior_art::Summary) -> Result<Self> {
+        let stage7b_prior_art_rows_checked = u64::try_from(prior_art.rows)?;
+        let stage7b_prior_art_full_text = u64::try_from(prior_art.full_text)?;
+        let stage7b_prior_art_metadata_only = u64::try_from(prior_art.metadata_only)?;
+        if prior_art.source_cards != prior_art.rows
+            || prior_art.default_verdict != "narrow"
+            || prior_art.support_bounded_allowed
+        {
+            return Err("Stage 7B prior-art summary is outside the manifest boundary".into());
+        }
+        Ok(Self {
             bounded_graph: true,
             single_cpu: true,
             cross_fd_total_order_claimed: false,
@@ -493,9 +502,9 @@ impl Boundaries {
             stage7b_scale_points_checked: 14,
             stage7b_performance_cases_observed: 29,
             stage7b_performance_claim: "Observed",
-            stage7b_prior_art_rows_checked: 16,
-            stage7b_prior_art_full_text: 14,
-            stage7b_prior_art_metadata_only: 2,
+            stage7b_prior_art_rows_checked,
+            stage7b_prior_art_full_text,
+            stage7b_prior_art_metadata_only,
             stage7b_contribution_verdict: "narrow",
             novelty_established: false,
             first_established: false,
@@ -506,7 +515,7 @@ impl Boundaries {
             durable_external_effects_covered: false,
             linux_breadth_established: false,
             full_production_adapter_equivalence_established: false,
-        }
+        })
     }
 }
 
@@ -925,6 +934,8 @@ fn write_authorized(
     let generated_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let stages = manifest_stages(specs);
     let formal_verifier = formal_verifier_binding(&verifier_file, &verifier)?;
+    let prior_art = crate::stage7b_prior_art::receipt_summary(root)
+        .map_err(|error| format!("Stage 7B prior-art manifest binding: {error}"))?;
     let manifest = Manifest {
         schema: SCHEMA,
         status: "passed",
@@ -940,7 +951,7 @@ fn write_authorized(
         started_unix_nanos: start.started_unix_nanos,
         generated_unix_seconds,
         formal_verifier,
-        boundaries: Boundaries::current(),
+        boundaries: Boundaries::current(&prior_art)?,
         specifications: specs.iter().map(|spec| String::from(*spec)).collect(),
         stages,
         artifacts,
@@ -1697,7 +1708,15 @@ mod tests {
 
     #[test]
     fn manifest_boundaries_fix_linux_io_shape_and_non_identity_claims() {
-        let boundaries = Boundaries::current();
+        let prior_art = crate::stage7b_prior_art::Summary {
+            rows: 16,
+            source_cards: 16,
+            full_text: 15,
+            metadata_only: 1,
+            default_verdict: String::from("narrow"),
+            support_bounded_allowed: false,
+        };
+        let boundaries = Boundaries::current(&prior_art).expect("valid boundaries");
         assert_eq!(boundaries.linux_io_composition_domains, 7);
         assert_eq!(boundaries.linux_io_composition_effects, 9);
         assert_eq!(boundaries.linux_io_composition_causal_nodes, 10);
@@ -1726,8 +1745,8 @@ mod tests {
         assert_eq!(boundaries.stage7b_performance_cases_observed, 29);
         assert_eq!(boundaries.stage7b_performance_claim, "Observed");
         assert_eq!(boundaries.stage7b_prior_art_rows_checked, 16);
-        assert_eq!(boundaries.stage7b_prior_art_full_text, 14);
-        assert_eq!(boundaries.stage7b_prior_art_metadata_only, 2);
+        assert_eq!(boundaries.stage7b_prior_art_full_text, 15);
+        assert_eq!(boundaries.stage7b_prior_art_metadata_only, 1);
         assert_eq!(boundaries.stage7b_contribution_verdict, "narrow");
         assert!(!boundaries.novelty_established);
         assert!(!boundaries.first_established);
@@ -2156,6 +2175,12 @@ mod tests {
             }
             fs::write(path, contents).expect("write fresh marked artifact");
         }
+        fs::write(
+            root.join("target/verification/stage7b/prior-art.json"),
+            crate::stage7b_prior_art::accepted_receipt_json()
+                .expect("serialize accepted prior-art receipt"),
+        )
+        .expect("write structured prior-art fixture");
 
         let token = "f".repeat(64);
         let error = write_authorized(&root, &specs, &token, &environment)

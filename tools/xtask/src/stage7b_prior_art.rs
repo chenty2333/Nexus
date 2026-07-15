@@ -255,7 +255,7 @@ struct SourceCard {
     audit_notes_sha256: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Summary {
     pub rows: usize,
     pub source_cards: usize,
@@ -265,18 +265,20 @@ pub struct Summary {
     pub support_bounded_allowed: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Receipt {
-    schema: &'static str,
-    status: &'static str,
-    matrix: &'static str,
-    source_policy: &'static str,
+    schema: String,
+    status: String,
+    matrix: String,
+    source_policy: String,
     summary: Summary,
     metadata_only_exclusions: Vec<String>,
     sources: Vec<ReceiptSource>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReceiptSource {
     id: String,
     access_kind: String,
@@ -302,6 +304,38 @@ pub fn run(root: &Path) -> Result<Summary, String> {
 
 pub fn check(root: &Path) -> Result<Summary, String> {
     validate(root).map(|validated| validated.summary)
+}
+
+pub(crate) fn accepted_summary() -> Summary {
+    Summary {
+        rows: EXPECTED_SOURCES.len(),
+        source_cards: EXPECTED_SOURCES.len(),
+        full_text: 15,
+        metadata_only: 1,
+        default_verdict: "narrow".into(),
+        support_bounded_allowed: false,
+    }
+}
+
+pub(crate) fn receipt_summary(root: &Path) -> Result<Summary, String> {
+    let path = root.join(JSON_OUTPUT);
+    require_regular_file(&path, JSON_OUTPUT)?;
+    let source = fs::read(&path).map_err(|error| format!("read {JSON_OUTPUT}: {error}"))?;
+    let receipt: Receipt =
+        serde_json::from_slice(&source).map_err(|error| format!("parse {JSON_OUTPUT}: {error}"))?;
+    let expected = accepted_receipt();
+    if receipt != expected {
+        return Err("prior-art receipt differs from the validated truth source contract".into());
+    }
+    Ok(receipt.summary)
+}
+
+#[cfg(test)]
+pub(crate) fn accepted_receipt_json() -> Result<Vec<u8>, String> {
+    let mut json = serde_json::to_vec_pretty(&accepted_receipt())
+        .map_err(|error| format!("serialize accepted prior-art receipt: {error}"))?;
+    json.push(b'\n');
+    Ok(json)
 }
 
 fn validate(root: &Path) -> Result<Validated, String> {
@@ -338,23 +372,28 @@ fn validate(root: &Path) -> Result<Validated, String> {
         .iter()
         .filter(|card| card.content_status == "metadata-only-unavailable")
         .count();
-    if full_text != 15 || metadata_only != 1 {
+    let accepted = accepted_summary();
+    if full_text != accepted.full_text || metadata_only != accepted.metadata_only {
         return Err(format!(
-            "prior-art source boundary mismatch: expected 15 full-text and 1 metadata-only, got {full_text} and {metadata_only}"
+            "prior-art source boundary mismatch: expected {} full-text and {} metadata-only, got {full_text} and {metadata_only}",
+            accepted.full_text, accepted.metadata_only
         ));
     }
 
-    Ok(Validated {
-        summary: Summary {
-            rows: matrix.row.len(),
-            source_cards: cards.len(),
-            full_text,
-            metadata_only,
-            default_verdict: "narrow".into(),
-            support_bounded_allowed: false,
-        },
-        cards,
-    })
+    let summary = Summary {
+        rows: matrix.row.len(),
+        source_cards: cards.len(),
+        full_text,
+        metadata_only,
+        default_verdict: "narrow".into(),
+        support_bounded_allowed: false,
+    };
+    if summary != accepted {
+        return Err(format!(
+            "prior-art summary differs from the accepted contract: expected {accepted:?}, got {summary:?}"
+        ));
+    }
+    Ok(Validated { summary, cards })
 }
 
 fn validate_matrix(matrix: &Matrix) -> Result<(), String> {
@@ -733,37 +772,24 @@ fn require_regular_directory(path: &Path, label: &str) -> Result<(), String> {
 }
 
 fn write_receipts(root: &Path, validated: &Validated) -> Result<(), String> {
-    let receipt = Receipt {
-        schema: "nexus.stage7b.prior-art.receipt.v1",
-        status: "passed",
-        matrix: MATRIX_PATH,
-        source_policy: "primary-source-required",
-        summary: validated.summary.clone(),
-        metadata_only_exclusions: METADATA_ONLY_IDS
-            .iter()
-            .map(|id| (*id).to_string())
-            .collect(),
-        sources: validated
-            .cards
-            .iter()
-            .map(|card| ReceiptSource {
-                id: card.id.clone(),
-                access_kind: card.access_kind.clone(),
-                content_status: card.content_status.clone(),
-                bibliographic_url: card.bibliographic_url.clone(),
-                source_content_sha256: card.source_content_sha256.clone(),
-                audit_notes_sha256: card.audit_notes_sha256.clone(),
-            })
-            .collect(),
-    };
+    let receipt = receipt_from_validated(validated);
+    if receipt != accepted_receipt() {
+        return Err("generated prior-art receipt differs from the accepted contract".into());
+    }
     let mut json = serde_json::to_vec_pretty(&receipt)
         .map_err(|error| format!("serialize {JSON_OUTPUT}: {error}"))?;
     json.push(b'\n');
 
     let mut log = String::new();
-    log.push_str(
-        "STAGE7B PRIOR_ART PASS rows=16 source_cards=16 full_text=15 metadata_only=1 default_verdict=narrow support_bounded_allowed=false\n",
-    );
+    log.push_str(&format!(
+        "STAGE7B PRIOR_ART PASS rows={} source_cards={} full_text={} metadata_only={} default_verdict={} support_bounded_allowed={}\n",
+        validated.summary.rows,
+        validated.summary.source_cards,
+        validated.summary.full_text,
+        validated.summary.metadata_only,
+        validated.summary.default_verdict,
+        validated.summary.support_bounded_allowed,
+    ));
     log.push_str(
         "PRIOR_ART METADATA_ONLY id=atomic-rpc status=metadata-only-unavailable exclusion=stronger-than-narrow\n",
     );
@@ -784,6 +810,57 @@ fn write_receipts(root: &Path, validated: &Validated) -> Result<(), String> {
     write_atomic(&root.join(LOG_OUTPUT), log.as_bytes())?;
     write_atomic(&root.join(JSON_OUTPUT), &json)?;
     Ok(())
+}
+
+fn receipt_from_validated(validated: &Validated) -> Receipt {
+    Receipt {
+        schema: "nexus.stage7b.prior-art.receipt.v1".into(),
+        status: "passed".into(),
+        matrix: MATRIX_PATH.into(),
+        source_policy: "primary-source-required".into(),
+        summary: validated.summary.clone(),
+        metadata_only_exclusions: METADATA_ONLY_IDS
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect(),
+        sources: validated.cards.iter().map(receipt_source).collect(),
+    }
+}
+
+fn accepted_receipt() -> Receipt {
+    Receipt {
+        schema: "nexus.stage7b.prior-art.receipt.v1".into(),
+        status: "passed".into(),
+        matrix: MATRIX_PATH.into(),
+        source_policy: "primary-source-required".into(),
+        summary: accepted_summary(),
+        metadata_only_exclusions: METADATA_ONLY_IDS
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect(),
+        sources: EXPECTED_SOURCES
+            .iter()
+            .map(|source| ReceiptSource {
+                id: source.id.into(),
+                access_kind: source.access_kind.into(),
+                content_status: source.content_status.into(),
+                bibliographic_url: source.bibliographic_url.into(),
+                source_content_sha256: source.source_content_sha256.into(),
+                audit_notes_sha256: source.audit_notes_sha256.into(),
+            })
+            .collect(),
+    }
+}
+
+fn receipt_source(card: &SourceCard) -> ReceiptSource {
+    ReceiptSource {
+        id: card.id.clone(),
+        access_kind: card.access_kind.clone(),
+        content_status: card.content_status.clone(),
+        bibliographic_url: card.bibliographic_url.clone(),
+        source_content_sha256: card.source_content_sha256.clone(),
+        audit_notes_sha256: card.audit_notes_sha256.clone(),
+    }
 }
 
 fn clear_output(root: &Path, relative: &str) -> Result<(), String> {
@@ -944,6 +1021,31 @@ mod tests {
         assert!(log.contains("default_verdict=narrow support_bounded_allowed=false"));
         assert_eq!(log.matches("PRIOR_ART METADATA_ONLY").count(), 1);
         assert_eq!(log.matches("PRIOR_ART SOURCE").count(), 16);
+        assert_eq!(
+            receipt_summary(&fixture.root).expect("revalidate generated receipt"),
+            summary
+        );
+    }
+
+    #[test]
+    fn rejects_receipt_summary_drift_from_the_validated_truth_source() {
+        let fixture = Fixture::new();
+        run(&fixture.root).expect("write valid receipt");
+        let path = fixture.root.join(JSON_OUTPUT);
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read receipt")).expect("parse receipt");
+        receipt["summary"]["full_text"] = serde_json::json!(14);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&receipt).expect("serialize drifted receipt"),
+        )
+        .expect("write drifted receipt");
+
+        assert!(
+            receipt_summary(&fixture.root)
+                .unwrap_err()
+                .contains("differs from the validated truth source")
+        );
     }
 
     #[test]
