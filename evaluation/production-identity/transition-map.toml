@@ -1,0 +1,208 @@
+schema = "nexus.research.production-identity.transition-map.v1"
+rfc = "docs/rfcs/0001-production-identity.md"
+abstract_specification = "specs/cser/ProductionIdentityCser.tla"
+rust_oracle = "crates/cser-model/src/production_identity.rs"
+production_registry = "kernel/nexus-ostd/src/cser/effect_registry.rs"
+expected_count = 22
+allowed_evidence_states = ["checked", "observed", "planned"]
+checked_count = 20
+observed_count = 0
+planned_count = 2
+
+[[transition]]
+id = "derive-register"
+abstract_action = "Derive / Register"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::register_effect"
+rust_tests = ["wrong_parent_registration_rejects_the_complete_projection", "foreign_root_tokens_never_mutate_registration_or_revoke"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::register_derived", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::register_device_derived_cohort"]
+evidence = "checked"
+boundary = "TLA+ and the independent oracle check identity-preserving failure atomicity; fallible production allocation and lock behavior are not observed here."
+
+[[transition]]
+id = "prepare-effect"
+abstract_action = "Prepare"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::prepare_effect"
+rust_tests = ["substituted_registry_root_generations_and_parent_reject_atomically", "crash_snapshot_ready_rebind_adopt_changes_only_current_binding"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::prepare"]
+evidence = "checked"
+boundary = "The oracle checks full-identity and stale-binding rejection; this is not a production call-site or SMP observation."
+
+[[transition]]
+id = "crash-domain"
+abstract_action = "Crash"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::crash_domain"
+rust_tests = ["crash_snapshot_ready_rebind_adopt_changes_only_current_binding", "loom_domain_crash_fences_or_follows_device_commit_without_identity_replacement"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::crash_domain"]
+evidence = "checked"
+boundary = "The safe-Rust model checks a logical domain crash; no real user-service crash is observed."
+
+[[transition]]
+id = "snapshot-domain"
+abstract_action = "Snapshot"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::snapshot_domain"
+rust_tests = ["crash_snapshot_ready_rebind_adopt_changes_only_current_binding", "arbitrary_domain_recovery_preserves_every_immutable_effect_identity"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::domain_recovery_snapshot"]
+evidence = "checked"
+boundary = "The exact logical recovery cohort is checked independently; no production snapshot/export engine is claimed."
+
+[[transition]]
+id = "ready-domain"
+abstract_action = "Ready"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::ready_domain"
+rust_tests = ["crash_snapshot_ready_rebind_adopt_changes_only_current_binding", "arbitrary_domain_recovery_preserves_every_immutable_effect_identity"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::domain_ready"]
+evidence = "checked"
+boundary = "The oracle checks one typed logical ready token; runtime readiness publication is not observed."
+
+[[transition]]
+id = "rebind-domain"
+abstract_action = "Rebind"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::rebind_domain"
+rust_tests = ["crash_snapshot_ready_rebind_adopt_changes_only_current_binding", "arbitrary_domain_recovery_preserves_every_immutable_effect_identity"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::rebind_domain"]
+evidence = "checked"
+boundary = "The independent oracle checks binding-epoch replacement without effect-identity replacement; no real supervisor restart is observed."
+
+[[transition]]
+id = "adopt-effect"
+abstract_action = "Adopt"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::adopt_effect"
+rust_tests = ["crash_snapshot_ready_rebind_adopt_changes_only_current_binding", "arbitrary_domain_recovery_preserves_every_immutable_effect_identity"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::adopt_domain"]
+evidence = "checked"
+boundary = "Identity preservation is checked in the oracle; adopt-versus-kernel-abort production serialization remains a later fault cell."
+
+[[transition]]
+id = "device-commit"
+abstract_action = "DeviceCommit"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::commit_block"
+rust_tests = ["normal_read_preserves_one_tree_through_device_and_one_shot_guest_reply", "loom_block_commit_and_root_revoke_have_one_gate_winner", "loom_domain_crash_fences_or_follows_device_commit_without_identity_replacement"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::commit_device_batch_with_publish"]
+evidence = "checked"
+boundary = "The abstract commit gate and safe-Rust serialization are checked; avail.idx publication, Release ordering, and real DMA are not observed by this gate."
+
+[[transition]]
+id = "revoke-begin"
+abstract_action = "RevokeBegin"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::revoke_begin"
+rust_tests = ["revoke_winner_aborts_the_complete_tree_in_leaf_first_order", "loom_block_commit_and_root_revoke_have_one_gate_winner", "foreign_root_tokens_never_mutate_registration_or_revoke"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::revoke_begin"]
+evidence = "checked"
+boundary = "The oracle freezes one exact cohort and authority epoch; real cross-CPU fencing and interrupt exclusion are not observed."
+
+[[transition]]
+id = "backend-completion"
+abstract_action = "DeviceComplete"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::complete_backend"
+rust_tests = ["normal_read_preserves_one_tree_through_device_and_one_shot_guest_reply", "loom_retry_iotlb_ack_and_old_completion_cannot_double_publish"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::record_device_completion"]
+evidence = "checked"
+boundary = "Receipt identity and one logical backend outcome are checked; no IRQ delivery path is observed."
+
+[[transition]]
+id = "normal-iotlb-ack"
+abstract_action = "IotlbAck"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::acknowledge_iotlb"
+rust_tests = ["normal_read_preserves_one_tree_through_device_and_one_shot_guest_reply"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::begin_device_iotlb_with_apply", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_device_iotlb_with_apply"]
+evidence = "checked"
+boundary = "The logical owner-release order is checked; hardware invalidation completion and frame reuse ordering are not observed."
+
+[[transition]]
+id = "guest-reply-publication"
+abstract_action = "GuestReply"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::publish_guest_reply"
+rust_tests = ["normal_read_preserves_one_tree_through_device_and_one_shot_guest_reply", "reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_publication"]
+evidence = "checked"
+boundary = "One-shot publication after backend disposition is checked in the oracle; the personality guest-copy call site remains outside this static registry mapping."
+
+[[transition]]
+id = "reset-timeout-retain"
+abstract_action = "ResetTimeout"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::retain_reset_timeout"
+rust_tests = ["reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retain_device_reset_timeout"]
+evidence = "checked"
+boundary = "Honest retained credits and tombstone identity are checked; watchdog timing and a physical reset timeout are not observed."
+
+[[transition]]
+id = "reset-retry-ack"
+abstract_action = "ResetRetry / ResetAck"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::retry_after_reset"
+rust_tests = ["reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retry_device_reset", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_device_reset_with_apply"]
+evidence = "checked"
+boundary = "Same-effect retry and generation advance are checked; physical reset acknowledgement and device ordering are not observed."
+
+[[transition]]
+id = "iotlb-timeout-retain"
+abstract_action = "IotlbTimeout"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::retain_iotlb_timeout"
+rust_tests = ["reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retain_device_iotlb_timeout"]
+evidence = "checked"
+boundary = "The oracle retains the same owners; no IOMMU hardware timeout is observed."
+
+[[transition]]
+id = "iotlb-retry"
+abstract_action = "IotlbRetry"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::retry_iotlb"
+rust_tests = ["reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack", "loom_retry_iotlb_ack_and_old_completion_cannot_double_publish"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retry_device_iotlb"]
+evidence = "checked"
+boundary = "Same-identity retry authorization is checked independently; a real IOMMU retry is not observed."
+
+[[transition]]
+id = "iotlb-retry-ack"
+abstract_action = "IotlbRetryAck"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::acknowledge_retry_iotlb"
+rust_tests = ["reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack", "loom_retry_iotlb_ack_and_old_completion_cannot_double_publish"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_device_iotlb_with_apply"]
+evidence = "checked"
+boundary = "Logical release and stale-completion exclusion are checked; IRQ masking, memory ordering, and frame reuse are not observed."
+
+[[transition]]
+id = "stale-identity-rejection"
+abstract_action = "RejectProbe"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::transact"
+rust_tests = ["substituted_registry_root_generations_and_parent_reject_atomically", "foreign_root_tokens_never_mutate_registration_or_revoke", "wrong_parent_registration_rejects_the_complete_projection"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::validate_device_batch_receipt"]
+evidence = "checked"
+boundary = "Complete failure-atomic projection is checked for the bounded substitutions; queue/session and all production call-site substitutions remain explicit fault-matrix work."
+
+[[transition]]
+id = "leaf-first-revoke-next"
+abstract_action = "RevokeNext"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::revoke_next"
+rust_tests = ["revoke_winner_aborts_the_complete_tree_in_leaf_first_order", "reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::revoke_next"]
+evidence = "checked"
+boundary = "Leaf-first logical index removal is checked; production lock order and concurrent index access are not observed."
+
+[[transition]]
+id = "revoke-complete"
+abstract_action = "RevokeComplete"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::revoke_complete"
+rust_tests = ["normal_read_preserves_one_tree_through_device_and_one_shot_guest_reply", "reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack", "revoke_winner_aborts_the_complete_tree_in_leaf_first_order"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::revoke_complete"]
+evidence = "checked"
+boundary = "Quiescent logical closure versus honest retained state is checked; physical device quiescence is not observed."
+
+[[transition]]
+id = "production-irq-completion"
+abstract_action = "IRQ completion / reset / IOMMU acknowledgement"
+rust_oracle_source = "crates/cser-model/src/production_identity.rs::ProductionIdentityModel::complete_backend"
+rust_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::record_device_completion", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_device_reset_with_apply", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_device_iotlb_with_apply"]
+evidence = "planned"
+boundary = "No production interrupt call site, IRQ exclusion discipline, or real completion delivery is checked or observed."
+
+[[transition]]
+id = "production-smp-gate"
+abstract_action = "Commit / RevokeBegin cross-CPU gate"
+rust_oracle_source = "crates/cser-model/tests/production_identity_loom.rs"
+rust_tests = ["loom_block_commit_and_root_revoke_have_one_gate_winner", "loom_domain_crash_fences_or_follows_device_commit_without_identity_replacement"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::commit_device_batch_with_publish", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::revoke_begin"]
+evidence = "planned"
+boundary = "Loom checks an abstract outer mutex only; OSTD SpinLock, IRQ masking, release/acquire refinement, and 2/4-vCPU execution remain planned."

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Dependency-free transition gates shared by the production OSTD adapters,
-//! the mediated VirtIO experiment, and bounded host-side concurrency tests.
+//! Dependency-free kernel CSER substrate shared by the production OSTD
+//! adapters, the mediated VirtIO experiment, and bounded host-side concurrency
+//! tests.
 //!
 //! The gates own only semantic phase, generational identity, and one-shot
 //! winner state. Tasks, frames, wakers, page tables, queues, and DMA owners
@@ -11,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod deadline;
+pub mod handoff;
 pub mod io;
 pub mod oneshot;
 pub mod pager;

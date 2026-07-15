@@ -12,6 +12,7 @@
 extern crate alloc;
 
 pub mod composition;
+pub mod handoff_admission;
 pub mod io;
 pub mod linux_io_composition;
 mod model;

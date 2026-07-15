@@ -18,6 +18,12 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use cser_transition_gates::handoff::{
+    FreezeContext as KernelFreezeContext, FreezeReceipt as KernelFreezeReceipt,
+    HandoffAdmissionGate, HandoffGateError, OwnershipDecision, OwnershipDecisionReceipt,
+    PrepareIntent,
+};
+
 static NEXT_REGISTRY_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1857,11 +1863,14 @@ struct ScopeRecord {
     domain_revision: u64,
     credits: CreditLedger,
     closure_candidates: BTreeSet<EffectKey>,
+    handoff_candidates: BTreeSet<EffectKey>,
     pending_publications: usize,
     recovery: Option<RecoveryState>,
     domains: BTreeMap<DomainKey, DomainBindingRecord>,
     revoke: Option<RevokeState>,
     device_root: Option<DeviceRootState>,
+    handoff_gate: HandoffAdmissionGate,
+    handoff: Option<ProductionHandoffState>,
 }
 
 #[derive(Default)]
@@ -2031,6 +2040,103 @@ pub(crate) struct RegistryProjection {
     pub(crate) credits: CreditTotals,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HandoffFreezeReadiness {
+    ReadyToCommit,
+    NeedsAbort,
+    PublicationPending,
+    BlockedRetained,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProductionHandoffFreezeReceipt {
+    freeze: KernelFreezeReceipt,
+    readiness: HandoffFreezeReadiness,
+    cohort_size: usize,
+    committed_at_freeze: usize,
+}
+
+impl ProductionHandoffFreezeReceipt {
+    pub(crate) const fn freeze(self) -> KernelFreezeReceipt {
+        self.freeze
+    }
+
+    pub(crate) const fn readiness(self) -> HandoffFreezeReadiness {
+        self.readiness
+    }
+
+    pub(crate) const fn cohort_size(self) -> usize {
+        self.cohort_size
+    }
+
+    pub(crate) const fn committed_at_freeze(self) -> usize {
+        self.committed_at_freeze
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HandoffAbortProgress {
+    pub(crate) aborted: usize,
+    pub(crate) publications: Vec<PublicationTicket>,
+    pub(crate) readiness: HandoffFreezeReadiness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HandoffThawReceipt {
+    freeze: KernelFreezeReceipt,
+    decision: OwnershipDecisionReceipt,
+    source_recovery_required: bool,
+}
+
+impl HandoffThawReceipt {
+    pub(crate) const fn source_recovery_required(self) -> bool {
+        self.source_recovery_required
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProductionHandoffClosureReceipt {
+    freeze: KernelFreezeReceipt,
+    decision: OwnershipDecisionReceipt,
+    revoke: RevokeSelection,
+    terminal_manifest_digest: u64,
+    closed_scope_revision: u64,
+}
+
+impl ProductionHandoffClosureReceipt {
+    pub(crate) const fn freeze(&self) -> KernelFreezeReceipt {
+        self.freeze
+    }
+
+    pub(crate) const fn decision(&self) -> OwnershipDecisionReceipt {
+        self.decision
+    }
+
+    pub(crate) const fn terminal_manifest_digest(&self) -> u64 {
+        self.terminal_manifest_digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProductionHandoffProgress {
+    Frozen(HandoffFreezeReadiness),
+    Aborted(HandoffThawReceipt),
+    Closing(RevokeSelection),
+    Retained(RevokeSelection),
+    Closed(ProductionHandoffClosureReceipt),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProductionHandoffState {
+    freeze: KernelFreezeReceipt,
+    cohort: BTreeSet<EffectKey>,
+    committed_at_freeze: BTreeSet<EffectKey>,
+    thaw: Option<HandoffThawReceipt>,
+    decision: Option<OwnershipDecisionReceipt>,
+    revoke: Option<RevokeSelection>,
+    closure: Option<ProductionHandoffClosureReceipt>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RegistryError {
     InvalidGeneration,
@@ -2065,6 +2171,10 @@ pub(crate) enum RegistryError {
     InvalidPublication,
     PublicationPending,
     NotQuiescent,
+    HandoffAdmissionFrozen,
+    InvalidHandoffReceipt,
+    HandoffNotReady,
+    HandoffDevicePrecommitPending,
     Invariant(&'static str),
 }
 
@@ -2191,6 +2301,16 @@ impl EffectRegistry {
         alloc::format!("{normalized:?}")
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_scope_revision_for_handoff_test(&mut self, scope: ScopeKey, revision: u64) {
+        self.scopes.get_mut(&scope).unwrap().revision = revision;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_terminal_sequence_for_handoff_test(&mut self, sequence: u64) {
+        self.next_terminal_sequence = sequence;
+    }
+
     fn rewrite_registry_instance(&mut self, registry_instance_id: u64) {
         assert_ne!(registry_instance_id, 0);
         self.instance_id = registry_instance_id;
@@ -2245,11 +2365,14 @@ impl EffectRegistry {
                 domain_revision: 0,
                 credits,
                 closure_candidates: BTreeSet::new(),
+                handoff_candidates: BTreeSet::new(),
                 pending_publications: 0,
                 recovery: None,
                 domains,
                 revoke: None,
                 device_root: None,
+                handoff_gate: HandoffAdmissionGate::new(),
+                handoff: None,
             }),
         );
         Ok(())
@@ -2268,6 +2391,7 @@ impl EffectRegistry {
             .scopes
             .get(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if scope.phase != ScopePhase::Active {
             return Err(RegistryError::ScopeNotActive);
         }
@@ -2350,6 +2474,7 @@ impl EffectRegistry {
             .scopes
             .get(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if scope.phase != ScopePhase::Active {
             return Err(RegistryError::ScopeNotActive);
         }
@@ -2417,6 +2542,7 @@ impl EffectRegistry {
                 .scopes
                 .get(&request.scope)
                 .ok_or(RegistryError::UnknownScope)?;
+            map_handoff_gate(scope.handoff_gate.require_open())?;
             if scope.phase != ScopePhase::Active {
                 return Err(RegistryError::ScopeNotActive);
             }
@@ -2728,6 +2854,7 @@ impl EffectRegistry {
             .scopes
             .get(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if scope.phase != ScopePhase::Active {
             return Err(RegistryError::ScopeNotActive);
         }
@@ -3266,6 +3393,7 @@ impl EffectRegistry {
             .scopes
             .get(&enrollment.scope)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         let root = scope
             .device_root
             .as_ref()
@@ -4008,6 +4136,7 @@ impl EffectRegistry {
             .scopes
             .get(&presented.scope)
             .ok_or(RegistryError::InvalidBatchReceipt)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         let root = scope
             .device_root
             .as_ref()
@@ -5472,6 +5601,7 @@ impl EffectRegistry {
             .scopes
             .get_mut(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if scope.phase != ScopePhase::Active
             || !scope.fallback_running
             || scope.supervisor.is_some()
@@ -5500,6 +5630,7 @@ impl EffectRegistry {
             .scopes
             .get_mut(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if scope.phase != ScopePhase::Active
             || !scope.fallback_running
             || scope.supervisor.is_some()
@@ -5561,6 +5692,7 @@ impl EffectRegistry {
             .scopes
             .get(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if old_handle.authority_epoch != scope.authority_epoch {
             return Err(RegistryError::StaleAuthority);
         }
@@ -5758,6 +5890,7 @@ impl EffectRegistry {
             .scopes
             .get_mut(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if scope.phase != ScopePhase::Active {
             return Err(RegistryError::ScopeNotActive);
         }
@@ -5796,6 +5929,7 @@ impl EffectRegistry {
             .scopes
             .get_mut(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if scope.phase != ScopePhase::Active {
             return Err(RegistryError::ScopeNotActive);
         }
@@ -5874,6 +6008,7 @@ impl EffectRegistry {
             .scopes
             .get(&scope_key)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if old_handle.authority_epoch != scope.authority_epoch {
             return Err(RegistryError::StaleAuthority);
         }
@@ -6088,14 +6223,379 @@ impl EffectRegistry {
         record.pending_publication = None;
         record.publication_acks = 1;
         scope_record.pending_publications = next_pending_publications;
+        assert!(
+            scope_record.handoff_candidates.remove(&effect),
+            "acknowledged publication must leave the handoff index"
+        );
         scope_record.revision = next_scope_revision;
         scope_record.invalidate_recovery_readiness();
+    }
+
+    pub(crate) fn freeze_admission(
+        &mut self,
+        scope_key: ScopeKey,
+        intent: PrepareIntent,
+    ) -> Result<ProductionHandoffFreezeReceipt, RegistryError> {
+        if let Some(existing) = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?
+            .handoff
+            .as_ref()
+        {
+            if existing.decision.map(OwnershipDecisionReceipt::decision)
+                == Some(OwnershipDecision::Abort)
+            {
+                if existing.freeze.intent() == intent {
+                    return Err(RegistryError::InvalidHandoffReceipt);
+                }
+            } else {
+                if existing.freeze.intent() != intent {
+                    return Err(RegistryError::InvalidHandoffReceipt);
+                }
+                let readiness = handoff_readiness(&existing.cohort, &self.effects)?;
+                return Ok(ProductionHandoffFreezeReceipt {
+                    freeze: existing.freeze,
+                    readiness,
+                    cohort_size: existing.cohort.len(),
+                    committed_at_freeze: existing.committed_at_freeze.len(),
+                });
+            }
+        }
+
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        if scope.phase != ScopePhase::Active {
+            return Err(RegistryError::ScopeNotActive);
+        }
+        if scope
+            .device_root
+            .as_ref()
+            .is_some_and(|root| root.batch_sequence.is_none())
+        {
+            return Err(RegistryError::HandoffDevicePrecommitPending);
+        }
+        map_handoff_gate(scope.handoff_gate.require_open())?;
+        let cohort = scope.handoff_candidates.clone();
+        let (cohort_digest, classification_digest) =
+            handoff_cohort_digests(&cohort, &self.effects)?;
+        let committed_at_freeze = cohort
+            .iter()
+            .filter(|effect| self.effects[effect].commit.is_some())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let readiness = handoff_readiness(&cohort, &self.effects)?;
+        let context = KernelFreezeContext {
+            registry_instance: self.instance_id,
+            // The current profile is explicitly same-boot. A reboot-capable
+            // successor must provision this value from a persistent boot ID.
+            boot_incarnation: 1,
+            scope_id: scope_key.id,
+            scope_generation: scope_key.generation,
+            authority_epoch: scope.authority_epoch,
+            binding_epoch: scope.binding_epoch,
+            scope_revision: scope.revision,
+            cohort_digest,
+            classification_digest,
+        };
+        let mut gate = scope.handoff_gate;
+        let freeze = gate.freeze(intent, context).map_err(|error| match error {
+            HandoffGateError::CounterOverflow => RegistryError::CounterOverflow,
+            HandoffGateError::AdmissionFrozen => RegistryError::HandoffAdmissionFrozen,
+            _ => RegistryError::InvalidHandoffReceipt,
+        })?;
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        scope.handoff_gate = gate;
+        scope.handoff = Some(ProductionHandoffState {
+            freeze,
+            cohort: cohort.clone(),
+            committed_at_freeze: committed_at_freeze.clone(),
+            thaw: None,
+            decision: None,
+            revoke: None,
+            closure: None,
+        });
+        Ok(ProductionHandoffFreezeReceipt {
+            freeze,
+            readiness,
+            cohort_size: cohort.len(),
+            committed_at_freeze: committed_at_freeze.len(),
+        })
+    }
+
+    pub(crate) fn abort_handoff_uncommitted(
+        &mut self,
+        scope_key: ScopeKey,
+        presented: ProductionHandoffFreezeReceipt,
+    ) -> Result<HandoffAbortProgress, RegistryError> {
+        self.validate_handoff_freeze(scope_key, presented)?;
+        let cohort = self.scopes[&scope_key]
+            .handoff
+            .as_ref()
+            .unwrap()
+            .cohort
+            .clone();
+        let mut publications = Vec::new();
+        let mut aborted = 0_usize;
+        loop {
+            let next = cohort.iter().copied().find(|effect| {
+                self.effects.get(effect).is_some_and(|record| {
+                    matches!(
+                        record.phase,
+                        EffectPhase::Registered | EffectPhase::Prepared
+                    ) && self
+                        .production
+                        .children_by_parent
+                        .get(effect)
+                        .is_none_or(BTreeSet::is_empty)
+                })
+            });
+            let Some(effect) = next else {
+                break;
+            };
+            let next_aborted = aborted
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            let terminal =
+                match self.stage_terminal_inner(effect, TerminalRequest::aborted(-125), None) {
+                    Ok(terminal) => terminal,
+                    Err(error) if aborted == 0 => return Err(error),
+                    Err(_) => break,
+                };
+            if let Some(ticket) = terminal.publication {
+                publications.push(ticket);
+            }
+            aborted = next_aborted;
+        }
+        let state = self.scopes[&scope_key].handoff.as_ref().unwrap();
+        Ok(HandoffAbortProgress {
+            aborted,
+            publications,
+            readiness: handoff_readiness(&state.cohort, &self.effects)?,
+        })
+    }
+
+    pub(crate) fn unfreeze_handoff(
+        &mut self,
+        scope_key: ScopeKey,
+        decision: OwnershipDecisionReceipt,
+    ) -> Result<HandoffThawReceipt, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        let state = scope
+            .handoff
+            .as_ref()
+            .ok_or(RegistryError::InvalidHandoffReceipt)?;
+        if let Some(thaw) = state.thaw {
+            return if thaw.decision == decision {
+                Ok(thaw)
+            } else {
+                Err(RegistryError::InvalidHandoffReceipt)
+            };
+        }
+        let mut gate = scope.handoff_gate;
+        if map_handoff_decision(gate.accept_decision(decision))? != OwnershipDecision::Abort {
+            return Err(RegistryError::InvalidHandoffReceipt);
+        }
+        let source_recovery_required = scope.supervisor.is_none()
+            || scope.fallback_running
+            || scope
+                .domains
+                .values()
+                .any(|binding| binding.supervisor.is_none() || binding.fallback_running);
+        let thaw = HandoffThawReceipt {
+            freeze: state.freeze,
+            decision,
+            source_recovery_required,
+        };
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        scope.handoff_gate = gate;
+        let state = scope.handoff.as_mut().unwrap();
+        state.decision = Some(decision);
+        state.thaw = Some(thaw);
+        Ok(thaw)
+    }
+
+    pub(crate) fn commit_handoff_close(
+        &mut self,
+        scope_key: ScopeKey,
+        decision: OwnershipDecisionReceipt,
+    ) -> Result<ProductionHandoffProgress, RegistryError> {
+        {
+            let scope = self
+                .scopes
+                .get(&scope_key)
+                .ok_or(RegistryError::UnknownScope)?;
+            let state = scope
+                .handoff
+                .as_ref()
+                .ok_or(RegistryError::InvalidHandoffReceipt)?;
+            if let Some(existing) = state.decision {
+                if existing != decision {
+                    return Err(RegistryError::InvalidHandoffReceipt);
+                }
+                return self.query_handoff(scope_key, state.freeze);
+            }
+            if handoff_readiness(&state.cohort, &self.effects)?
+                != HandoffFreezeReadiness::ReadyToCommit
+            {
+                return Err(RegistryError::HandoffNotReady);
+            }
+        }
+
+        let mut gate = self.scopes[&scope_key].handoff_gate;
+        if map_handoff_decision(gate.accept_decision(decision))? != OwnershipDecision::Commit {
+            return Err(RegistryError::InvalidHandoffReceipt);
+        }
+        let plan = self.prepare_revoke_begin(scope_key)?;
+        if plan.selection.target_count == 0 {
+            plan.next_scope_revision
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+        }
+        {
+            let scope = self.scopes.get_mut(&scope_key).unwrap();
+            scope.handoff_gate = gate;
+            scope.handoff.as_mut().unwrap().decision = Some(decision);
+        }
+        let selection = self.apply_revoke_begin(plan);
+        self.scopes
+            .get_mut(&scope_key)
+            .unwrap()
+            .handoff
+            .as_mut()
+            .unwrap()
+            .revoke = Some(selection.clone());
+        if selection.target_count == 0 {
+            self.revoke_complete(&selection)?;
+        }
+        let freeze = self.scopes[&scope_key].handoff.as_ref().unwrap().freeze;
+        self.query_handoff(scope_key, freeze)
+    }
+
+    pub(crate) fn query_handoff(
+        &mut self,
+        scope_key: ScopeKey,
+        freeze: KernelFreezeReceipt,
+    ) -> Result<ProductionHandoffProgress, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        let state = scope
+            .handoff
+            .as_ref()
+            .ok_or(RegistryError::InvalidHandoffReceipt)?;
+        if state.freeze != freeze {
+            return Err(RegistryError::InvalidHandoffReceipt);
+        }
+        if let Some(closure) = state.closure.clone() {
+            return Ok(ProductionHandoffProgress::Closed(closure));
+        }
+        if let Some(thaw) = state.thaw {
+            return Ok(ProductionHandoffProgress::Aborted(thaw));
+        }
+        let Some(decision) = state.decision else {
+            return Ok(ProductionHandoffProgress::Frozen(handoff_readiness(
+                &state.cohort,
+                &self.effects,
+            )?));
+        };
+        let selection = state
+            .revoke
+            .clone()
+            .ok_or(RegistryError::InvalidHandoffReceipt)?;
+        if scope.phase != ScopePhase::Revoked {
+            let retained = state.cohort.iter().any(|effect| {
+                self.effects
+                    .get(effect)
+                    .is_some_and(|record| record.credit_state == CreditState::Retained)
+            });
+            return Ok(if retained {
+                ProductionHandoffProgress::Retained(selection)
+            } else {
+                ProductionHandoffProgress::Closing(selection)
+            });
+        }
+        if !scope.handoff_candidates.is_empty()
+            || scope.pending_publications != 0
+            || !scope.credits.is_idle()
+        {
+            return Err(RegistryError::NotQuiescent);
+        }
+        let closure = ProductionHandoffClosureReceipt {
+            freeze,
+            decision,
+            revoke: selection,
+            terminal_manifest_digest: handoff_terminal_manifest_digest(
+                &state.cohort,
+                &self.effects,
+            )?,
+            closed_scope_revision: scope.revision,
+        };
+        self.scopes
+            .get_mut(&scope_key)
+            .unwrap()
+            .handoff
+            .as_mut()
+            .unwrap()
+            .closure = Some(closure.clone());
+        Ok(ProductionHandoffProgress::Closed(closure))
+    }
+
+    pub(crate) fn verify_handoff_closure(
+        &self,
+        scope_key: ScopeKey,
+        receipt: &ProductionHandoffClosureReceipt,
+    ) -> Result<(), RegistryError> {
+        let state = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?
+            .handoff
+            .as_ref()
+            .ok_or(RegistryError::InvalidHandoffReceipt)?;
+        if state.closure.as_ref() != Some(receipt) {
+            return Err(RegistryError::InvalidHandoffReceipt);
+        }
+        Ok(())
+    }
+
+    fn validate_handoff_freeze(
+        &self,
+        scope_key: ScopeKey,
+        presented: ProductionHandoffFreezeReceipt,
+    ) -> Result<(), RegistryError> {
+        let state = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?
+            .handoff
+            .as_ref()
+            .ok_or(RegistryError::InvalidHandoffReceipt)?;
+        if state.freeze != presented.freeze
+            || state.cohort.len() != presented.cohort_size
+            || state.committed_at_freeze.len() != presented.committed_at_freeze
+            || state.decision.is_some()
+        {
+            return Err(RegistryError::InvalidHandoffReceipt);
+        }
+        Ok(())
     }
 
     pub(crate) fn revoke_begin(
         &mut self,
         scope_key: ScopeKey,
     ) -> Result<RevokeSelection, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         let plan = self.prepare_revoke_begin(scope_key)?;
         Ok(self.apply_revoke_begin(plan))
     }
@@ -6587,6 +7087,7 @@ impl EffectRegistry {
         let mut expected_credits: BTreeMap<ScopeKey, BTreeMap<CreditClass, (u64, u64, u64)>> =
             BTreeMap::new();
         let mut expected_pending_publications = BTreeMap::<ScopeKey, usize>::new();
+        let mut expected_handoff_candidates = BTreeMap::<ScopeKey, BTreeSet<EffectKey>>::new();
         let mut nonces = BTreeSet::new();
         let mut tickets = BTreeSet::new();
         let mut device_batches = BTreeSet::<(ScopeKey, u64)>::new();
@@ -6708,6 +7209,7 @@ impl EffectRegistry {
                 ScopePhase::Revoked => {
                     if scope.revoke.is_none()
                         || !scope.closure_candidates.is_empty()
+                        || !scope.handoff_candidates.is_empty()
                         || scope.recovery.is_some()
                         || scope.supervisor.is_some()
                         || scope.fallback_running
@@ -6715,6 +7217,88 @@ impl EffectRegistry {
                         || !scope.credits.is_idle()
                     {
                         return Err(RegistryError::Invariant("invalid revoked scope state"));
+                    }
+                }
+            }
+            let admission = scope.handoff_gate.projection();
+            match scope.handoff.as_ref() {
+                None => {
+                    if admission.phase != cser_transition_gates::handoff::AdmissionPhase::Open
+                        || admission.freeze.is_some()
+                        || admission.decision.is_some()
+                    {
+                        return Err(RegistryError::Invariant(
+                            "handoff gate advanced without Registry state",
+                        ));
+                    }
+                }
+                Some(handoff) => {
+                    if !handoff.committed_at_freeze.is_subset(&handoff.cohort)
+                        || handoff.cohort.iter().any(|effect| {
+                            self.effects
+                                .get(effect)
+                                .is_none_or(|record| record.identity.scope != *key)
+                        })
+                    {
+                        return Err(RegistryError::Invariant(
+                            "handoff Registry and gate identity mismatch",
+                        ));
+                    }
+                    match (
+                        handoff.decision.map(OwnershipDecisionReceipt::decision),
+                        scope.phase,
+                    ) {
+                        (None, ScopePhase::Active) => {
+                            if admission.phase
+                                != cser_transition_gates::handoff::AdmissionPhase::Frozen
+                                || admission.freeze != Some(handoff.freeze)
+                                || admission.decision.is_some()
+                                || !scope.handoff_candidates.is_subset(&handoff.cohort)
+                            {
+                                return Err(RegistryError::Invariant(
+                                    "frozen handoff admitted an untracked effect",
+                                ));
+                            }
+                        }
+                        (
+                            Some(OwnershipDecision::Abort),
+                            ScopePhase::Active | ScopePhase::Closing | ScopePhase::Revoked,
+                        ) => {
+                            if admission.phase
+                                != cser_transition_gates::handoff::AdmissionPhase::Open
+                                || admission.freeze.is_some()
+                                || admission.decision.is_some()
+                                || admission.last_abort != handoff.decision
+                                || handoff.thaw.is_none()
+                                || handoff.revoke.is_some()
+                                || handoff.closure.is_some()
+                            {
+                                return Err(RegistryError::Invariant(
+                                    "aborted handoff did not reopen admission",
+                                ));
+                            }
+                        }
+                        (
+                            Some(OwnershipDecision::Commit),
+                            ScopePhase::Closing | ScopePhase::Revoked,
+                        ) => {
+                            if admission.phase
+                                != cser_transition_gates::handoff::AdmissionPhase::CommitAccepted
+                                || admission.freeze != Some(handoff.freeze)
+                                || admission.decision != handoff.decision
+                                || handoff.revoke.is_none()
+                                || (handoff.closure.is_some() && scope.phase != ScopePhase::Revoked)
+                            {
+                                return Err(RegistryError::Invariant(
+                                    "committed handoff lacks irreversible closure state",
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(RegistryError::Invariant(
+                                "handoff decision and authority phase disagree",
+                            ));
+                        }
                     }
                 }
             }
@@ -7060,6 +7644,12 @@ impl EffectRegistry {
                 )?,
                 CreditState::Released => {}
             }
+            if !record.phase.is_terminal() || record.pending_publication.is_some() {
+                expected_handoff_candidates
+                    .entry(record.identity.scope)
+                    .or_default()
+                    .insert(*key);
+            }
         }
 
         if self.next_device_enrollment_sequence == 0
@@ -7173,6 +7763,12 @@ impl EffectRegistry {
                 return Err(RegistryError::Invariant(
                     "pending publication count mismatch",
                 ));
+            }
+            let expected_handoff = expected_handoff_candidates.get(scope_key);
+            if expected_handoff != Some(&scope.handoff_candidates)
+                && !(expected_handoff.is_none() && scope.handoff_candidates.is_empty())
+            {
+                return Err(RegistryError::Invariant("handoff candidate index mismatch"));
             }
             let expected = expected_credits.get(scope_key);
             for (class, balance) in &scope.credits.balances {
@@ -7593,6 +8189,7 @@ impl EffectRegistry {
             .scopes
             .get(&handle.scope)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if handle.authority_epoch != scope.authority_epoch {
             return Err(RegistryError::StaleAuthority);
         }
@@ -7636,6 +8233,7 @@ impl EffectRegistry {
             .scopes
             .get(&authority.scope)
             .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
         if authority.authority_epoch != scope.authority_epoch {
             return Err(RegistryError::StaleAuthority);
         }
@@ -7881,6 +8479,12 @@ impl EffectRegistry {
         }
         scope.revision = next_scope_revision;
         scope.pending_publications = next_pending_publications;
+        if ticket.is_none() {
+            assert!(
+                scope.handoff_candidates.remove(&effect),
+                "terminal effect without publication must leave the handoff index"
+            );
+        }
         scope.invalidate_recovery_readiness();
         if let (Some(terminalized), Some(removals)) =
             (next_terminalized, next_target_index_removals)
@@ -7950,6 +8554,14 @@ impl EffectRegistry {
                 .closure_candidates
                 .insert(identity.effect),
             "effect must be new to the closure candidate index"
+        );
+        assert!(
+            self.scopes
+                .get_mut(&identity.scope)
+                .expect("effect scope must exist before handoff-index insertion")
+                .handoff_candidates
+                .insert(identity.effect),
+            "effect must be new to the handoff candidate index"
         );
         if let Some(parent) = identity.parent {
             let children = self
@@ -8095,6 +8707,150 @@ fn validate_generation(generation: u64) -> Result<(), RegistryError> {
     } else {
         Ok(())
     }
+}
+
+fn map_handoff_gate(result: Result<(), HandoffGateError>) -> Result<(), RegistryError> {
+    result.map_err(|error| match error {
+        HandoffGateError::AdmissionFrozen => RegistryError::HandoffAdmissionFrozen,
+        HandoffGateError::CounterOverflow => RegistryError::CounterOverflow,
+        HandoffGateError::InvalidIdentity
+        | HandoffGateError::AdmissionOpen
+        | HandoffGateError::ReceiptMismatch
+        | HandoffGateError::StaleDecision
+        | HandoffGateError::ConflictingDecision => RegistryError::InvalidHandoffReceipt,
+    })
+}
+
+fn map_handoff_decision(
+    result: Result<OwnershipDecision, HandoffGateError>,
+) -> Result<OwnershipDecision, RegistryError> {
+    result.map_err(|error| match error {
+        HandoffGateError::AdmissionFrozen => RegistryError::HandoffAdmissionFrozen,
+        HandoffGateError::CounterOverflow => RegistryError::CounterOverflow,
+        HandoffGateError::InvalidIdentity
+        | HandoffGateError::AdmissionOpen
+        | HandoffGateError::ReceiptMismatch
+        | HandoffGateError::StaleDecision
+        | HandoffGateError::ConflictingDecision => RegistryError::InvalidHandoffReceipt,
+    })
+}
+
+fn handoff_readiness(
+    cohort: &BTreeSet<EffectKey>,
+    effects: &BTreeMap<EffectKey, EffectRecord>,
+) -> Result<HandoffFreezeReadiness, RegistryError> {
+    let mut needs_abort = false;
+    let mut publication_pending = false;
+    for effect in cohort {
+        let record = effects.get(effect).ok_or(RegistryError::UnknownEffect)?;
+        if record.credit_state == CreditState::Retained {
+            return Ok(HandoffFreezeReadiness::BlockedRetained);
+        }
+        if record.pending_publication.is_some() {
+            publication_pending = true;
+        }
+        if matches!(
+            record.phase,
+            EffectPhase::Registered | EffectPhase::Prepared
+        ) {
+            needs_abort = true;
+        }
+    }
+    Ok(if publication_pending {
+        HandoffFreezeReadiness::PublicationPending
+    } else if needs_abort {
+        HandoffFreezeReadiness::NeedsAbort
+    } else {
+        HandoffFreezeReadiness::ReadyToCommit
+    })
+}
+
+fn handoff_cohort_digests(
+    cohort: &BTreeSet<EffectKey>,
+    effects: &BTreeMap<EffectKey, EffectRecord>,
+) -> Result<(u64, u64), RegistryError> {
+    let mut cohort_digest = 0xcbf2_9ce4_8422_2325_u64;
+    let mut classification_digest = 0x8422_2325_cbf2_9ce4_u64;
+    for effect in cohort {
+        cohort_digest = digest_handoff_word(cohort_digest, effect.id);
+        cohort_digest = digest_handoff_word(cohort_digest, effect.generation);
+        let record = effects.get(effect).ok_or(RegistryError::UnknownEffect)?;
+        classification_digest = digest_handoff_word(classification_digest, effect.id);
+        classification_digest = digest_handoff_word(classification_digest, effect.generation);
+        classification_digest = digest_handoff_word(
+            classification_digest,
+            u64::from(record.identity.domain.value()),
+        );
+        let phase = match record.phase {
+            EffectPhase::Registered => 1,
+            EffectPhase::Prepared => 2,
+            EffectPhase::Committed => 3,
+            EffectPhase::Terminal(TerminalOutcome::Completed) => 4,
+            EffectPhase::Terminal(TerminalOutcome::IndeterminateAfterReset) => 5,
+            EffectPhase::Terminal(TerminalOutcome::Aborted) => 6,
+        };
+        classification_digest = digest_handoff_word(classification_digest, phase);
+        let credit = match record.credit_state {
+            CreditState::Held => 1,
+            CreditState::Committed => 2,
+            CreditState::Retained => 3,
+            CreditState::Released => 4,
+        };
+        classification_digest = digest_handoff_word(classification_digest, credit);
+        classification_digest = digest_handoff_word(
+            classification_digest,
+            record.commit.as_ref().map_or(0, CommitReceipt::sequence),
+        );
+        classification_digest = digest_handoff_word(
+            classification_digest,
+            record
+                .pending_publication
+                .as_ref()
+                .map_or(0, |ticket| ticket.ticket_sequence),
+        );
+    }
+    Ok((
+        nonzero_digest(cohort_digest),
+        nonzero_digest(classification_digest),
+    ))
+}
+
+fn handoff_terminal_manifest_digest(
+    cohort: &BTreeSet<EffectKey>,
+    effects: &BTreeMap<EffectKey, EffectRecord>,
+) -> Result<u64, RegistryError> {
+    let mut digest = 0x9e37_79b9_7f4a_7c15_u64;
+    for effect in cohort {
+        let record = effects.get(effect).ok_or(RegistryError::UnknownEffect)?;
+        let terminal = record
+            .terminal
+            .as_ref()
+            .ok_or(RegistryError::NotQuiescent)?;
+        if record.pending_publication.is_some() || record.credit_state != CreditState::Released {
+            return Err(RegistryError::NotQuiescent);
+        }
+        digest = digest_handoff_word(digest, effect.id);
+        digest = digest_handoff_word(digest, effect.generation);
+        digest = digest_handoff_word(digest, terminal.sequence);
+        digest = digest_handoff_word(
+            digest,
+            match terminal.outcome {
+                TerminalOutcome::Completed => 1,
+                TerminalOutcome::IndeterminateAfterReset => 2,
+                TerminalOutcome::Aborted => 3,
+            },
+        );
+        digest = digest_handoff_word(digest, u64::from(record.publication_acks));
+    }
+    Ok(nonzero_digest(digest))
+}
+
+const fn digest_handoff_word(state: u64, value: u64) -> u64 {
+    (state ^ value).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+const fn nonzero_digest(value: u64) -> u64 {
+    if value == 0 { 1 } else { value }
 }
 
 fn device_envelope_mismatch(expected: DeviceEnvelope, presented: DeviceEnvelope) -> RegistryError {
@@ -12946,6 +13702,132 @@ impl ProductionDeviceBatchRaceFixture {
             && projection.credits.committed == 0
             && projection.credits.retained == 0
     }
+}
+
+pub(crate) fn production_handoff_retained_self_test(
+    blocked_registry: EffectRegistry,
+    retained_registry: EffectRegistry,
+) {
+    use cser_transition_gates::handoff::{HandoffId, LogPosition};
+
+    fn intent(id: u64) -> PrepareIntent {
+        PrepareIntent::new(
+            HandoffId::new(id).unwrap(),
+            0xa10,
+            LogPosition::new(0xa11).unwrap(),
+            0xa12,
+            0xa13,
+            0xa14,
+        )
+        .unwrap()
+    }
+
+    let mut blocked = ProductionDeviceBatchRaceFixture::from_empty_registry(blocked_registry);
+    blocked.commit().unwrap();
+    let batch = blocked.batch.clone().unwrap();
+    let reset = blocked.registry.begin_device_reset(&batch).unwrap();
+    blocked
+        .registry
+        .retain_device_reset_timeout(&reset)
+        .unwrap();
+    let prepare = intent(0xa20);
+    let freeze = blocked
+        .registry
+        .freeze_admission(blocked.scope, prepare)
+        .unwrap();
+    assert_eq!(freeze.readiness(), HandoffFreezeReadiness::BlockedRetained);
+    let commit = OwnershipDecisionReceipt::new(
+        freeze.freeze(),
+        LogPosition::new(0xa21).unwrap(),
+        prepare.request_digest(),
+        OwnershipDecision::Commit,
+    )
+    .unwrap();
+    let before = blocked.registry.failure_atomic_projection();
+    assert_eq!(
+        blocked.registry.commit_handoff_close(blocked.scope, commit),
+        Err(RegistryError::HandoffNotReady)
+    );
+    assert_eq!(blocked.registry.failure_atomic_projection(), before);
+
+    let mut retained = ProductionDeviceBatchRaceFixture::from_empty_registry(retained_registry);
+    retained.commit().unwrap();
+    let batch = retained.batch.clone().unwrap();
+    let prepare = intent(0xa30);
+    let freeze = retained
+        .registry
+        .freeze_admission(retained.scope, prepare)
+        .unwrap();
+    let commit = OwnershipDecisionReceipt::new(
+        freeze.freeze(),
+        LogPosition::new(0xa31).unwrap(),
+        prepare.request_digest(),
+        OwnershipDecision::Commit,
+    )
+    .unwrap();
+    let selection = match retained
+        .registry
+        .commit_handoff_close(retained.scope, commit)
+        .unwrap()
+    {
+        ProductionHandoffProgress::Closing(selection) => selection,
+        other => panic!("unexpected committed handoff progress: {other:?}"),
+    };
+    let reset_ticket = retained.registry.begin_device_reset(&batch).unwrap();
+    let tombstone = retained
+        .registry
+        .retain_device_reset_timeout(&reset_ticket)
+        .unwrap();
+    assert_eq!(
+        retained
+            .registry
+            .query_handoff(retained.scope, freeze.freeze())
+            .unwrap(),
+        ProductionHandoffProgress::Retained(selection.clone())
+    );
+    assert_eq!(
+        retained
+            .registry
+            .commit_handoff_close(retained.scope, commit)
+            .unwrap(),
+        ProductionHandoffProgress::Retained(selection.clone())
+    );
+
+    let retry = retained.registry.retry_device_reset(&tombstone).unwrap();
+    let (reset, ()) = retained
+        .registry
+        .acknowledge_device_reset_with_apply(&retry, |_| ())
+        .unwrap();
+    let iotlb = retained.registry.begin_device_iotlb(&reset).unwrap();
+    let (closure, ()) = retained
+        .registry
+        .acknowledge_device_iotlb_with_apply(&iotlb, |_| ())
+        .unwrap();
+    while let Some(effect) = retained.registry.revoke_next(&selection).unwrap() {
+        assert!(matches!(effect.disposition, RevokeDisposition::Drain(_)));
+        retained
+            .registry
+            .stage_device_batch_terminal(
+                &closure,
+                effect.effect,
+                TerminalRequest::indeterminate_after_reset(-5),
+            )
+            .unwrap();
+    }
+    retained.registry.revoke_complete(&selection).unwrap();
+    let local_closure = match retained
+        .registry
+        .query_handoff(retained.scope, freeze.freeze())
+        .unwrap()
+    {
+        ProductionHandoffProgress::Closed(receipt) => receipt,
+        other => panic!("unexpected recovered handoff progress: {other:?}"),
+    };
+    retained
+        .registry
+        .verify_handoff_closure(retained.scope, &local_closure)
+        .unwrap();
+    retained.registry.check_invariants().unwrap();
 }
 
 #[cfg(test)]

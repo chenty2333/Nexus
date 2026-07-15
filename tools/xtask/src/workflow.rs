@@ -25,6 +25,7 @@ const TLA2TOOLS_IMAGE_INPUTS: [&str; 4] = [
     TLA2TOOLS_LICENSE_PATH,
 ];
 const TRANSITION_GATE_MANIFEST: &str = "crates/cser-transition-gates/Cargo.toml";
+const EFFECT_PEER_MANIFEST: &str = "crates/nexus-effect-peer/Cargo.toml";
 const PRODUCTION_REGISTRY_TEST: &str = "crates/cser-transition-gates/tests/production_registry.rs";
 const PRODUCTION_SOURCE_FILES: [&str; 2] = ["effect_registry.rs", "device_flight.rs"];
 const VIRTIO_AUTHORITY_LOCK: &str = "kernel/nexus-ostd/osdk-runner-base/Cargo.lock";
@@ -589,6 +590,33 @@ fn validate_transition_gate_route(root: &Path) -> Result<()> {
     let test = function_body(&source, "fn test(root: &Path) -> Result<()> {")?;
     if !test.contains("--no-fail-fast") {
         return Err("transition-gate test route must retain every failing target".into());
+    }
+    for (declaration, section) in [
+        (
+            "fn check(root: &Path) -> Result<()> {",
+            "check production effect peer",
+        ),
+        (
+            "fn clippy(root: &Path) -> Result<()> {",
+            "clippy production effect peer",
+        ),
+        (
+            "fn test(root: &Path) -> Result<()> {",
+            "test production effect peer",
+        ),
+    ] {
+        let body = function_body(&source, declaration)?;
+        for required in [section, "nexus-effect-peer", "--all-targets"] {
+            if !body.contains(required) {
+                return Err(format!(
+                    "{declaration} does not route the production effect peer: {required}"
+                )
+                .into());
+            }
+        }
+    }
+    if !root.join(EFFECT_PEER_MANIFEST).is_file() {
+        return Err(format!("missing production effect peer: {EFFECT_PEER_MANIFEST}").into());
     }
     let production_registry = fs::read_to_string(root.join(PRODUCTION_REGISTRY_TEST))?;
     validate_production_registry_gate(&production_registry)?;

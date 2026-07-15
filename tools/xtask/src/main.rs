@@ -17,6 +17,7 @@ mod catalog;
 mod doctor;
 mod evidence;
 mod guest;
+mod handoff_admission;
 mod production_identity;
 mod scenario;
 mod stage7b;
@@ -68,12 +69,14 @@ fn main() {
 enum XtaskInvocation {
     Command(String),
     VerifyBundle(Option<PathBuf>),
+    HandoffAdmissionResearch,
     ProductionIdentityResearch,
 }
 
 fn real_main() -> Result<()> {
     let root = repo_root();
     match parse_invocation(env::args().skip(1))? {
+        XtaskInvocation::HandoffAdmissionResearch => handoff_admission::run(&root, &TLA_SPECS),
         XtaskInvocation::ProductionIdentityResearch => production_identity::run(&root, &TLA_SPECS),
         XtaskInvocation::VerifyBundle(argument) => {
             let path =
@@ -123,7 +126,12 @@ fn parse_invocation(mut args: impl Iterator<Item = String>) -> Result<XtaskInvoc
         ("research", [target]) if target == "production-identity" => {
             Ok(XtaskInvocation::ProductionIdentityResearch)
         }
-        ("research", []) => Err("research requires target production-identity".into()),
+        ("research", [target]) if target == "handoff-admission" => {
+            Ok(XtaskInvocation::HandoffAdmissionResearch)
+        }
+        ("research", []) => {
+            Err("research requires target production-identity or handoff-admission".into())
+        }
         ("research", [target]) => Err(format!("unknown research target: {target}").into()),
         ("research", [_, extra, ..]) => Err(format!("unexpected argument: {extra}").into()),
         (_, []) => Ok(XtaskInvocation::Command(command)),
@@ -142,7 +150,7 @@ fn repo_root() -> PathBuf {
 fn print_usage() {
     eprintln!("usage: cargo run --manifest-path tools/xtask/Cargo.toml -- <command>");
     eprintln!("commands: doctor build fmt check test quick model spec verify verify-bundle");
-    eprintln!("prospective research: research production-identity");
+    eprintln!("prospective research: research production-identity|handoff-admission");
     eprintln!("internal evidence commands: begin stage7b-evidence complete manifest bundle");
 }
 
@@ -308,6 +316,18 @@ fn check(root: &Path) -> Result<()> {
         ],
     )?;
 
+    section("check production effect peer");
+    cargo(
+        root,
+        [
+            "check",
+            "--locked",
+            "-p",
+            "nexus-effect-peer",
+            "--all-targets",
+        ],
+    )?;
+
     section("check cser-model on the bare-metal target without std");
     cargo(
         root,
@@ -368,6 +388,21 @@ fn clippy(root: &Path) -> Result<()> {
         ],
     )?;
 
+    section("clippy production effect peer");
+    cargo(
+        root,
+        [
+            "clippy",
+            "--locked",
+            "-p",
+            "nexus-effect-peer",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+
     section("clippy cser-model on the bare-metal target without std");
     cargo(
         root,
@@ -418,6 +453,19 @@ fn test(root: &Path) -> Result<()> {
             "--locked",
             "-p",
             "cser-transition-gates",
+            "--all-targets",
+            "--no-fail-fast",
+        ],
+    )?;
+
+    section("test production effect peer");
+    cargo(
+        root,
+        [
+            "test",
+            "--locked",
+            "-p",
+            "nexus-effect-peer",
             "--all-targets",
             "--no-fail-fast",
         ],
@@ -1151,6 +1199,17 @@ mod tests {
                 .into_iter()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_the_independent_handoff_admission_research_route() {
+        assert_eq!(
+            parse_invocation(
+                [String::from("research"), String::from("handoff-admission")].into_iter()
+            )
+            .expect("prospective handoff research route"),
+            XtaskInvocation::HandoffAdmissionResearch
         );
     }
 

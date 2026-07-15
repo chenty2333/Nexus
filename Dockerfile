@@ -53,6 +53,7 @@ COPY tools/xtask/Cargo.lock /tmp/nexus-locks/xtask.Cargo.lock
 COPY Cargo.toml /tmp/nexus-inputs/root.Cargo.toml
 COPY crates/cser-model/Cargo.toml /tmp/nexus-inputs/cser-model.Cargo.toml
 COPY crates/cser-transition-gates/Cargo.toml /tmp/nexus-inputs/cser-transition-gates.Cargo.toml
+COPY crates/nexus-effect-peer/Cargo.toml /tmp/nexus-inputs/nexus-effect-peer.Cargo.toml
 COPY tools/xtask/Cargo.toml /tmp/nexus-inputs/xtask.Cargo.toml
 COPY .cargo/config.toml /tmp/nexus-inputs/cargo-config.toml
 RUN --mount=type=bind,source=.,target=/tmp/nexus-workspace,readonly \
@@ -63,6 +64,8 @@ RUN --mount=type=bind,source=.,target=/tmp/nexus-workspace,readonly \
         /tmp/nexus-workspace/crates/cser-model/Cargo.toml \
     && cmp /tmp/nexus-inputs/cser-transition-gates.Cargo.toml \
         /tmp/nexus-workspace/crates/cser-transition-gates/Cargo.toml \
+    && cmp /tmp/nexus-inputs/nexus-effect-peer.Cargo.toml \
+        /tmp/nexus-workspace/crates/nexus-effect-peer/Cargo.toml \
     && cmp /tmp/nexus-inputs/xtask.Cargo.toml \
         /tmp/nexus-workspace/tools/xtask/Cargo.toml \
     && cmp /tmp/nexus-inputs/cargo-config.toml \

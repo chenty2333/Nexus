@@ -36,6 +36,8 @@ Focused commands:
   system                  run both QEMU receipts and composition oracle
   research production-identity
                           run the prospective v0.2 formal identity gate
+  research handoff-admission
+                          run the prospective RFC-0002 local handoff gate
 EOF
 }
 
@@ -89,6 +91,7 @@ compute_image_identity() {
         "$root/Cargo.lock" \
         "$root/crates/cser-model/Cargo.toml" \
         "$root/crates/cser-transition-gates/Cargo.toml" \
+        "$root/crates/nexus-effect-peer/Cargo.toml" \
         "$root/tools/xtask/Cargo.toml" \
         "$root/tools/xtask/Cargo.lock" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
     image="nexus/cser-dev:$image_key"
@@ -413,10 +416,11 @@ case "$command" in
     research)
         require_docker
         if (( $# != 1 )); then
-            die "research requires exactly one target: production-identity"
+            die "research requires exactly one target: production-identity or handoff-admission"
         fi
         case "$1" in
             production-identity) run_xtask research production-identity ;;
+            handoff-admission) run_xtask research handoff-admission ;;
             *) die "unknown research target: $1" ;;
         esac
         ;;

@@ -509,6 +509,52 @@ run_spec() {
             run_tlc "ProductionIdentityCser conditional kernel progress" \
                 ProductionIdentityCser ProductionIdentityCserProgressMC.cfg
             ;;
+        HandoffAdmissionCser)
+            run_tlc "HandoffAdmissionCser complete local safety graph" \
+                HandoffAdmissionCser HandoffAdmissionCserSafetyMC.cfg
+            expect_reachable HandoffAdmissionCser \
+                HandoffAdmissionCserSafetyMC.cfg \
+                IntentCrashBeforeFreezeAbsent \
+                "intent crash before freeze leaves source authority active"
+            expect_reachable HandoffAdmissionCser \
+                HandoffAdmissionCserSafetyMC.cfg \
+                FreezeBeforeCommitAbsent \
+                "freeze wins before first commit and rejects it atomically"
+            expect_reachable HandoffAdmissionCser \
+                HandoffAdmissionCserSafetyMC.cfg \
+                CommitBeforeFreezeAbsent \
+                "first commit wins before freeze and joins the drain cohort"
+            expect_reachable HandoffAdmissionCser \
+                HandoffAdmissionCserSafetyMC.cfg \
+                PredecisionTombstoneBlockedAbsent \
+                "predecision retained tombstone blocks ownership commit"
+            expect_reachable HandoffAdmissionCser \
+                HandoffAdmissionCserSafetyMC.cfg \
+                TypedAbortRequiredAbsent \
+                "untyped abort rejects before the typed abort thaws source"
+            expect_reachable HandoffAdmissionCser \
+                HandoffAdmissionCserSafetyMC.cfg \
+                CommitAckLossReplayAbsent \
+                "lost commit acknowledgement replays one decision"
+            expect_reachable HandoffAdmissionCser \
+                HandoffAdmissionCserSafetyMC.cfg \
+                SourceCrashStaleBindingAbsent \
+                "source crash rejects the old binding while decision is unknown"
+            expect_reachable HandoffAdmissionCser \
+                HandoffAdmissionCserSafetyMC.cfg \
+                DuplicateCommitCloseAbsent \
+                "duplicate commit-close replays one closure"
+            expect_reachable HandoffAdmissionCser \
+                HandoffAdmissionCserSafetyMC.cfg \
+                ConflictingDecisionRejectedAbsent \
+                "conflicting abort after commit rejects without mutation"
+            expect_reachable HandoffAdmissionCser \
+                HandoffAdmissionCserSafetyMC.cfg \
+                PostcommitRetainedRecoveryAbsent \
+                "postcommit retained effect blocks activation without ownership rollback"
+            run_tlc "HandoffAdmissionCser conditional local closure progress" \
+                HandoffAdmissionCser HandoffAdmissionCserProgressMC.cfg
+            ;;
         *)
             echo "unknown CSER specification: $1" >&2
             exit 2
@@ -531,10 +577,11 @@ case $# in
         run_spec CompositionCser
         run_spec LinuxIoCompositionCser
         run_spec ProductionIdentityCser
+        run_spec HandoffAdmissionCser
         ;;
     1) run_spec "$1" ;;
     *)
-        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|RuntimeFsCser|RuntimeNetCser|CompositionCser|LinuxIoCompositionCser|ProductionIdentityCser]" >&2
+        echo "usage: $0 [Cser|PagerCser|IoCser|PersonalityCser|PersonalityFutexCser|PersonalityFutexRequeueCser|PersonalityReadinessCser|PersonalityExecCser|RuntimeFsCser|RuntimeNetCser|CompositionCser|LinuxIoCompositionCser|ProductionIdentityCser|HandoffAdmissionCser]" >&2
         exit 2
         ;;
 esac

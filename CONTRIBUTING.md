@@ -47,6 +47,7 @@ for isolation and maintenance, not as a second user-facing contract.
 | `./x verify-bundle [DIRECTORY]` | Verify a canonical cold bundle against the matching clean checkout without rebuilding evidence or running QEMU. |
 | `./x clean` | Remove root, xtask, OSDK, guest, and TLC build caches without Docker while preserving evidence and release outputs. |
 | `./x clean --all` | Also remove verification, scenario, QEMU, and research evidence; published release and audit outputs remain preserved. |
+| `./x research handoff-admission` | Run the prospective RFC-0002 local TLA+/Rust/fault-matrix gate and emit its unified research receipt. |
 
 Focused `fmt`, `check`, `quick`, `model`, `spec`, and `system` commands exist
 for diagnostics. There is intentionally no `fuzz` command until Nexus owns a

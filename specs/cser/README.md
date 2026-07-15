@@ -164,6 +164,20 @@ families at the required CPU counts. CPU values are abstract actor identities,
 not OSTD-lock, IRQ, memory-ordering, or real SMP evidence. This successor is a
 prospective specification, not an implementation or a widened `v0.1.0` claim.
 
+`HandoffAdmissionCser.tla`, its safety and conditional-progress configurations,
+and `HANDOFF_ADMISSION.md` add the separately routed RFC-0002 local successor.
+It keeps scope authority and a reversible handoff admission gate orthogonal,
+requires durable intent before freeze, classifies a stable three-effect cohort,
+accepts only mutually exclusive typed abort/commit decisions, permits only
+committed-at-freeze closure publication, and gates external destination
+authorization on exact source closure. Its complete safety graph has 100,118
+generated / 32,438 distinct states at depth 25. Its two-branch conditional
+progress graph has 72,470 generated / 26,390 distinct states at depth 25. Ten
+reachability traversals map the exact first-round fault matrix. The ownership
+log is an abstract non-equivocating TCB input; host reboot, rollback resistance,
+production Registry changes, OSTD lock/IRQ/SMP behavior, and joint vISA
+execution are not claimed.
+
 The independent pinned OSTD/QEMU refinement now supplies a bounded
 implementation observation for the same one-key contract. Its `recover` path
 observes mismatch-without-registration, atomic compare/enqueue, a real
@@ -309,15 +323,17 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar ./specs/cser/check.sh
 
 These commands describe implementation steps inside the container; they do not
 define a second supported host toolchain. The directory-local `check.sh` now
-checks the twelve frozen families plus the prospective production-identity
-successor when invoked without an argument. The root `./x spec` catalog remains
-the accepted twelve-family `v0.1.0` boundary until a later repository-wide
-version deliberately admits the successor. Pass `Cser`, `PagerCser`, `IoCser`,
+checks the twelve frozen families plus the prospective production-identity and
+handoff-admission successors when invoked without an argument. The root
+`./x spec` catalog remains the accepted twelve-family `v0.1.0` boundary until a
+later repository-wide version deliberately admits a successor. Pass `Cser`,
+`PagerCser`, `IoCser`,
 `PersonalityCser`, `PersonalityFutexCser`,
 `PersonalityFutexRequeueCser`, `PersonalityReadinessCser`,
 `PersonalityExecCser`, `RuntimeFsCser`, `RuntimeNetCser`, `CompositionCser`, or
 `LinuxIoCompositionCser` to run one frozen family; pass
-`ProductionIdentityCser` to run only the prospective successor.
+`ProductionIdentityCser` or `HandoffAdmissionCser` to run only the corresponding
+prospective successor.
 
 On current main, the formal catalog is still those same twelve accepted
 families plus the separately routed prospective successor, but the verifier
@@ -334,6 +350,15 @@ accepted `v0.1.0` manifest or bundle:
 
 ```sh
 ./x research production-identity
+```
+
+The RFC-0002 first-round gate separately validates the exact fault matrix, both
+complete TLA+ configurations, ten ordered witnesses, and the independent
+safe-Rust sequence/property/Loom suites. Its unified receipt binds every
+normative source and generated log without adding the successor to `v0.1.0`:
+
+```sh
+./x research handoff-admission
 ```
 
 To modify an algorithm, edit only its PlusCal block and regenerate the
@@ -356,6 +381,9 @@ java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 LinuxIoCompositionC
 java -cp "$TLA2TOOLS_JAR" pcal.trans -nocfg -lineWidth 10000 ProductionIdentityCser.tla
 ```
 
+`HandoffAdmissionCser.tla` is intentionally declarative TLA+ and has no PlusCal
+translation step.
+
 The baseline `CserMC.cfg` instance uses three effect identifiers, two total
 credits, and at most two crash generations. The extra identifier exercises a
 failed registration opportunity while all credits are held or spent. With
@@ -365,8 +393,8 @@ successor results are recorded separately in `PAGER.md`, `IO.md`,
 `PERSONALITY_FUTEX_REQUEUE.md`, `PERSONALITY_READINESS.md`,
 `PERSONALITY_EXEC.md`, `RUNTIME_FS.md`, and `RUNTIME_NET.md`, with the
 composition successors recorded separately in `COMPOSITION.md` and
-`LINUX_IO_COMPOSITION.md`; the prospective successor is recorded in
-`PRODUCTION_IDENTITY.md`:
+`LINUX_IO_COMPOSITION.md`; the prospective successors are recorded in
+`PRODUCTION_IDENTITY.md` and `HANDOFF_ADMISSION.md`:
 
 ```text
 11,122 states generated

@@ -1,0 +1,115 @@
+schema = "nexus.research.handoff-admission.fault-matrix.v1"
+profile = "docs/rfcs/0002-handoff-admission-profile.md"
+expected_count = 10
+fault_model = "same-boot-crash-stop-retry-reorder-lost-ack"
+ownership_log = "trusted-non-equivocating-no-rollback-tcb"
+host_reboot_claimed = false
+malicious_rollback_claimed = false
+production_registry_modified = false
+
+required_invariants = [
+  "AtMostOneExecutionAuthority",
+  "NoPostFreezeUntrackedEffect",
+  "AbortImpliesNoDestinationAuthority",
+  "CommitDecisionImpliesSourcePrincipalFenced",
+  "PostCommitPublicationImpliesPreFreezeCommittedAndClosureOwned",
+  "UnknownDecisionImpliesRemainFrozen",
+  "DestinationActivationRequiresSourceClosure",
+  "EveryReceiptBindsOneDecisionAndOneCohort",
+  "StaleBindingCannotPublish",
+  "TombstoneCannotBeInterpretedAsClosure",
+]
+
+negative_mutations = [
+  "drop-cell",
+  "duplicate-cell",
+  "reorder-cell",
+  "rename-witness",
+  "rename-rust-test",
+  "allow-freeze-without-intent",
+  "allow-first-commit-after-freeze",
+  "accept-untyped-abort",
+  "accept-conflicting-decision",
+  "activate-before-closure",
+  "treat-tombstone-as-closure",
+]
+
+[[cell]]
+id = "intent-crash-before-freeze"
+event_order = ["PrepareIntent", "CoordinatorCrash", "RecoverIntent"]
+expected = "source remains active because no local freeze linearized"
+tla_witness = "IntentCrashBeforeFreezeAbsent"
+rust_test = "intent_crash_before_freeze_leaves_source_active"
+kill_condition = "intent alone freezes or fences source execution"
+
+[[cell]]
+id = "freeze-before-first-commit"
+event_order = ["PrepareIntent", "FreezeAdmission", "FirstCommitProbe"]
+expected = "first commit rejects without cohort or effect mutation"
+tla_witness = "FreezeBeforeCommitAbsent"
+rust_test = "freeze_before_first_commit_rejects_commit_atomically"
+kill_condition = "an uncommitted effect crosses commit after freeze"
+
+[[cell]]
+id = "first-commit-before-freeze"
+event_order = ["PrepareIntent", "FirstCommit", "FreezeAdmission"]
+expected = "the committed effect is classified in the frozen cohort and may drain"
+tla_witness = "CommitBeforeFreezeAbsent"
+rust_test = "first_commit_before_freeze_is_classified_for_drain"
+kill_condition = "freeze omits the already committed effect"
+
+[[cell]]
+id = "predecision-tombstone-blocks-commit"
+event_order = ["FirstCommit", "Retain", "PrepareIntent", "FreezeAdmission", "CommitProbe"]
+expected = "freeze returns Blocked and ownership commit rejects"
+tla_witness = "PredecisionTombstoneBlockedAbsent"
+rust_test = "predecision_tombstone_blocks_ownership_commit"
+kill_condition = "a retained tombstone is accepted as ReadyToCommit or closure"
+
+[[cell]]
+id = "typed-abort-required-to-thaw"
+event_order = ["PrepareIntent", "FreezeAdmission", "UntypedAbortProbe", "TypedAbort"]
+expected = "only the matching authoritative abort receipt opens the gate"
+tla_witness = "TypedAbortRequiredAbsent"
+rust_test = "typed_abort_receipt_is_required_to_thaw"
+kill_condition = "phase-only or untyped evidence resumes source execution"
+
+[[cell]]
+id = "commit-ack-loss-replay"
+event_order = ["PrepareIntent", "FreezeAdmission", "AbortUncommitted", "CommitDecision", "LoseAck", "CommitReplay"]
+expected = "the exact commit receipt replays one decision and one close progress"
+tla_witness = "CommitAckLossReplayAbsent"
+rust_test = "lost_commit_ack_replays_the_same_decision"
+kill_condition = "retry advances authority twice or creates a second close operation"
+
+[[cell]]
+id = "source-crash-stale-binding"
+event_order = ["PrepareIntent", "FreezeAdmission", "SourceCrash", "OldBindingReplyProbe"]
+expected = "old binding publication rejects and the unknown decision remains frozen"
+tla_witness = "SourceCrashStaleBindingAbsent"
+rust_test = "source_crash_rejects_old_binding_while_frozen"
+kill_condition = "old binding consumes or publishes a frozen completion"
+
+[[cell]]
+id = "duplicate-commit-close"
+event_order = ["PrepareIntent", "FreezeAdmission", "AbortUncommitted", "CommitDecision", "Drain", "PublicationAck", "CommitClose", "CommitCloseReplay"]
+expected = "the replay returns the identical closure receipt without republication"
+tla_witness = "DuplicateCommitCloseAbsent"
+rust_test = "duplicate_commit_close_returns_the_same_closure"
+kill_condition = "replay publishes, terminalizes, or advances closure twice"
+
+[[cell]]
+id = "conflicting-abort-commit-decisions"
+event_order = ["PrepareIntent", "FreezeAdmission", "AbortUncommitted", "CommitDecision", "AbortProbe"]
+expected = "the later conflicting decision rejects without state mutation"
+tla_witness = "ConflictingDecisionRejectedAbsent"
+rust_test = "conflicting_abort_after_commit_is_rejected_atomically"
+kill_condition = "both decisions become authoritative for one freeze generation"
+
+[[cell]]
+id = "postcommit-retained-blocks-activation"
+event_order = ["FirstCommit", "PrepareIntent", "FreezeAdmission", "CommitDecision", "Retain", "ActivationProbe"]
+expected = "ownership remains committed, closure is Retained, and activation is unauthorized"
+tla_witness = "PostcommitRetainedRecoveryAbsent"
+rust_test = "postcommit_retained_effect_blocks_activation_without_rollback"
+kill_condition = "retained state rolls ownership back or authorizes destination activation"

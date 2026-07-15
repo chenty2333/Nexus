@@ -205,6 +205,23 @@ persistent recovery records, administrative policy, or real retained device
 buffers. Those implementation obligations remain prerequisites for a real
 mediated-I/O `QuiescentClosure` result.
 
+### Prospective handoff admission profile
+
+RFC 0002 keeps the existing `Active -> Closing -> Revoked` authority lifecycle
+separate from a reversible `Open | Frozen` admission gate. Freeze requires a
+prior durable intent, does not advance the authority epoch, and blocks every
+transition that could alter the frozen cohort or its initial classification.
+Already committed effects retain honest drain, completion, publication, and
+tombstone progress. A typed abort may reopen admission; a typed commit enters
+the existing irreversible closing path and fences the source principal.
+
+The original profile remains first-round abstract research. The v2 research
+lane now also checks an in-memory production `EffectRegistry` mapping and a
+same-boot host-process peer that emits Nexus-native receipts. The ownership log
+is still a non-equivocating, rollback-free TCB input. No host-reboot recovery
+record, retained-device peer wire, joint vISA/Nexus qualification, OSTD
+lock/IRQ/SMP execution, or destination activation is claimed here.
+
 ## Core protocol
 
 ### Linearization points

@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/cser-model", "crates/cser-transition-gates"]
+members = [
+    "crates/cser-model",
+    "crates/cser-transition-gates",
+    "crates/nexus-effect-peer",
+]

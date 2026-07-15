@@ -461,6 +461,22 @@ the OSTD `EffectRegistry` or transition source and does not establish a
 production registry, OSTD lock or IRQ correctness, SMP execution, same-boot
 VirtIO/IOMMU behavior, or RFC 0001 Phase 2 and later acceptance.
 
+The separate `handoff_admission` module is the independent RFC 0002 local
+successor. It keeps the existing authority phase orthogonal to a reversible
+admission gate, requires a durable intent before freeze, records one immutable
+cohort and initial classification digest, and accepts only an exact typed abort
+or commit receipt from the abstract ownership log identity. Abort can return
+`SourceRecoveryRequired`; commit advances authority once, fences the source,
+and idempotently returns `Pending`, `Retained`, or one exact closure receipt.
+
+Ten deterministic sequence tests map the fixed fault matrix. Three property
+tests check decision-field substitutions, arbitrary bounded pre-freeze effect
+populations, and repeated commit replay. Three Loom tests serialize
+freeze/first-commit, abort/commit, and duplicate-close races behind a modeled
+outer mutex. This is same-boot, independent safe-Rust evidence. It does not use
+the OSTD Registry, implement the ownership log, provide cryptographic freshness,
+or claim production lock, IRQ, SMP, host-reboot, or vISA refinement.
+
 The pinned OSTD/QEMU successor independently executes the adapted retained
 Round 4 futex program, the adapted retained Round 5 epoll program plus a
 readiness lifecycle companion, and a retained dynamic PIE launcher/main/

@@ -163,6 +163,17 @@ infallible publication/reset/IOTLB-quiescence plans are source/build evidence
 only; the primary boot still has no device GSI mapping or IRQ delivery,
 same-boot DMA identity, or SMP claim.
 
+A second, separately routed prospective line is now specified by
+[RFC 0002](docs/rfcs/0002-handoff-admission-profile.md). Its independent first
+round asks whether Nexus can reversibly freeze local effect admission, consume
+one typed non-equivocating ownership decision, and produce honest closure
+progress. The v2 research lane additionally maps that profile into the
+in-memory production `EffectRegistry` and exposes it through the same-boot
+`nexus-effect-peer` host process for an out-of-tree vISA/Nexus qualification.
+Neither lane enters the accepted `v0.1.0` catalog or establishes host-reboot,
+rollback-resistance, retained-device wire, OSTD IRQ/SMP execution, or a joint
+runtime result.
+
 ## Documentation
 
 - [NARRATIVE.md](NARRATIVE.md) is the end-to-end technical research account and

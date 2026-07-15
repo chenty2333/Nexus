@@ -1,0 +1,503 @@
+schema = "nexus.research.production-identity.fault-matrix.v1"
+rfc = "docs/rfcs/0001-production-identity.md"
+transition_map = "evaluation/production-identity/transition-map.toml"
+expected_count = 35
+allowed_evidence_states = ["checked", "observed", "planned"]
+checked_count = 12
+observed_count = 0
+planned_count = 23
+shared_production_registry_execution_observed = false
+real_user_service_crash_observed = false
+real_irq_observed = false
+two_vcpu_observed = false
+four_vcpu_observed = false
+
+required_families = [
+  "derive-register-vs-root-revoke",
+  "multi-object-pretransition-failure",
+  "crash-before-device-commit",
+  "crash-after-device-commit-before-backend",
+  "crash-after-backend-before-reply",
+  "stale-old-binding-operations",
+  "adopt-vs-kernel-abort",
+  "duplicate-replayed-receipts",
+  "device-completion-vs-reset-ack",
+  "reset-timeout-retry",
+  "iommu-timeout-late-ack-retry",
+  "repeated-service-crash",
+  "root-revoke-vs-cross-cpu-irq",
+  "wrong-presented-identity",
+  "retained-credit-pressure",
+]
+
+required_observation_fields = [
+  "injection_point",
+  "cpu",
+  "presented_identity",
+  "expected_result",
+  "observed_result",
+  "semantic_projection_before",
+  "semantic_projection_after",
+  "terminalization_count",
+  "publication_count",
+  "credits_before",
+  "credits_after",
+  "retained_owners",
+  "final_root_state",
+  "honest_non_success_timeout",
+]
+
+[[cell]]
+id = "derive-register-vs-root-revoke"
+family = "derive-register-vs-root-revoke"
+phase = "phase-2"
+injection_point = "between root validation and complete ancestry/index/credit installation"
+cpu_requirement = "service and revoke actors serialized now; distinct CPUs required in phase 4"
+presented_identity = "complete root, binding, parent, effect generation, and credit class"
+expected_result = "exactly one failure-atomic derive or revoke winner"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::register_derived", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::revoke_begin"]
+boundary = "The current oracle checks registration and revoke separately, not this exact race."
+
+[[cell]]
+id = "multi-object-allocation-failure"
+family = "multi-object-pretransition-failure"
+phase = "phase-2"
+injection_point = "each fallible allocation before multi-object state publication"
+cpu_requirement = "single production actor"
+presented_identity = "complete root, binding, effect, ancestry, and requested credits"
+expected_result = "error with byte-for-byte equal semantic projection"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::register_device_derived_cohort"]
+boundary = "Clone/validate/swap in the oracle does not observe production allocator failure."
+
+[[cell]]
+id = "multi-object-validation-failure"
+family = "multi-object-pretransition-failure"
+phase = "phase-1"
+injection_point = "complete identity and ancestry validation before registration or preparation"
+cpu_requirement = "independent safe-Rust oracle"
+presented_identity = "wrong registry, root, generation, or parent"
+expected_result = "typed rejection with an unchanged full semantic projection"
+evidence = "checked"
+oracle_tests = ["wrong_parent_registration_rejects_the_complete_projection", "substituted_registry_root_generations_and_parent_reject_atomically"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::register_device_derived_cohort"]
+boundary = "Checked in the independent oracle; not yet executed as the frozen shared-registry production cell."
+
+[[cell]]
+id = "crash-before-device-commit"
+family = "crash-before-device-commit"
+phase = "phase-1"
+injection_point = "after preparation and before the device commit gate"
+cpu_requirement = "independent oracle and Loom abstract threads"
+presented_identity = "current VirtIo binding and complete prepared block/DMA identities"
+expected_result = "crash fences the old binding; commit either precedes it or rejects atomically"
+evidence = "checked"
+oracle_tests = ["crash_snapshot_ready_rebind_adopt_changes_only_current_binding", "loom_domain_crash_fences_or_follows_device_commit_without_identity_replacement"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::crash_domain", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::commit_device_batch_with_publish"]
+boundary = "Logical crash and abstract serialization only; no real user-service crash is observed."
+
+[[cell]]
+id = "crash-after-device-commit-before-backend"
+family = "crash-after-device-commit-before-backend"
+phase = "phase-1"
+injection_point = "after commit receipt creation and before backend completion"
+cpu_requirement = "Loom abstract threads"
+presented_identity = "committed block/DMA cohort plus current VirtIo binding"
+expected_result = "committed obligation and immutable effect identities survive the binding crash"
+evidence = "checked"
+oracle_tests = ["loom_domain_crash_fences_or_follows_device_commit_without_identity_replacement"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::commit_device_batch_with_publish", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::crash_domain"]
+boundary = "The oracle admits this ordering; a production service crash at the exact point is not observed."
+
+[[cell]]
+id = "crash-after-backend-before-reply"
+family = "crash-after-backend-before-reply"
+phase = "phase-3"
+injection_point = "after backend data/result publication and before one-shot guest reply"
+cpu_requirement = "same-boot production service actor"
+presented_identity = "commit receipt, backend outcome, syscall effect, filesystem effect, and binding"
+expected_result = "committed reply obligation survives without duplicate guest publication"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::record_device_completion", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_publication"]
+boundary = "The normal oracle sequence separates the actions but does not inject this crash."
+
+[[cell]]
+id = "stale-binding-prepare"
+family = "stale-old-binding-operations"
+phase = "phase-1"
+injection_point = "old binding prepare after domain crash"
+cpu_requirement = "independent safe-Rust oracle"
+presented_identity = "old binding and unchanged effect identity"
+expected_result = "StaleBinding with unchanged semantic projection"
+evidence = "checked"
+oracle_tests = ["crash_snapshot_ready_rebind_adopt_changes_only_current_binding"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::prepare"]
+boundary = "Checked independently, not observed through a real stale service request."
+
+[[cell]]
+id = "stale-binding-commit"
+family = "stale-old-binding-operations"
+phase = "phase-1"
+injection_point = "old binding commit concurrent with or after domain crash"
+cpu_requirement = "Loom abstract threads"
+presented_identity = "old VirtIo binding plus complete block/DMA identities"
+expected_result = "commit wins before crash or rejects as stale/unavailable without mutation"
+evidence = "checked"
+oracle_tests = ["loom_domain_crash_fences_or_follows_device_commit_without_identity_replacement"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::commit_device_batch_with_publish"]
+boundary = "Abstract mutex serialization only; production lock and memory ordering are not observed."
+
+[[cell]]
+id = "stale-binding-completion"
+family = "stale-old-binding-operations"
+phase = "phase-3"
+injection_point = "old-binding completion after crash/rebind"
+cpu_requirement = "same-boot production completion actor"
+presented_identity = "old binding, commit receipt, device session, queue, and generation"
+expected_result = "typed rejection without terminalization or publication"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::record_device_completion"]
+boundary = "Current oracle rejects stale device generation, not the full production old-binding completion cell."
+
+[[cell]]
+id = "stale-binding-reply"
+family = "stale-old-binding-operations"
+phase = "phase-3"
+injection_point = "old-binding guest reply after crash/rebind"
+cpu_requirement = "same-boot production service actor"
+presented_identity = "old binding, syscall/filesystem identities, commit receipt, and backend outcome"
+expected_result = "typed rejection with zero additional publications"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_publication"]
+boundary = "No real personality reply call site is bound by Phase 1."
+
+[[cell]]
+id = "stale-binding-adopt"
+family = "stale-old-binding-operations"
+phase = "phase-2"
+injection_point = "adopt with the superseded binding epoch"
+cpu_requirement = "single production recovery actor"
+presented_identity = "old replacement binding plus exact orphan identity"
+expected_result = "StaleBinding with no adoption or index mutation"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::adopt_domain"]
+boundary = "Phase 1 checks valid adoption identity preservation, not this stale token."
+
+[[cell]]
+id = "adopt-vs-kernel-abort"
+family = "adopt-vs-kernel-abort"
+phase = "phase-2"
+injection_point = "eligible orphan selected concurrently for adoption and leaf-first abort"
+cpu_requirement = "serialized production actors; distinct CPUs in phase 4"
+presented_identity = "replacement binding, orphan effect identity, and revoke ticket"
+expected_result = "one winner; current binding or terminal state changes exactly once"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::adopt_domain", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::revoke_next"]
+boundary = "The independent oracle has no exact adopt/abort race test."
+
+[[cell]]
+id = "duplicate-commit-receipt"
+family = "duplicate-replayed-receipts"
+phase = "phase-3"
+injection_point = "second presentation of one accepted commit receipt"
+cpu_requirement = "same-boot production actor"
+presented_identity = "complete immutable commit receipt"
+expected_result = "idempotent replay or typed rejection with one commit and no new publication"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::validate_device_batch_receipt"]
+boundary = "No exact duplicate commit receipt assertion exists in the Phase 1 oracle."
+
+[[cell]]
+id = "duplicate-publication-receipt"
+family = "duplicate-replayed-receipts"
+phase = "phase-3"
+injection_point = "second presentation of one publication acknowledgement"
+cpu_requirement = "same-boot production service actor"
+presented_identity = "publication ticket and causal commit receipt"
+expected_result = "one publication and one terminal disposition"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_publication"]
+boundary = "One-shot oracle state is checked, but the duplicate production receipt cell is not executed."
+
+[[cell]]
+id = "duplicate-completion-receipt"
+family = "duplicate-replayed-receipts"
+phase = "phase-3"
+injection_point = "second presentation of one backend completion receipt"
+cpu_requirement = "same-boot completion actor"
+presented_identity = "commit receipt and complete device envelope"
+expected_result = "one backend completion and no duplicate terminalization or reply"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::record_device_completion"]
+boundary = "The Loom stale-completion test is not an exact accepted-receipt replay."
+
+[[cell]]
+id = "duplicate-reset-receipt"
+family = "duplicate-replayed-receipts"
+phase = "phase-3"
+injection_point = "second reset acknowledgement or retry token presentation"
+cpu_requirement = "same-boot reset actor"
+presented_identity = "reset ticket, tombstone, old envelope, and selected next generation"
+expected_result = "one generation advance and no double release"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_device_reset_with_apply"]
+boundary = "The Phase 1 sequence uses one acknowledgement only."
+
+[[cell]]
+id = "duplicate-iommu-receipt"
+family = "duplicate-replayed-receipts"
+phase = "phase-3"
+injection_point = "second IOMMU acknowledgement or retry token presentation"
+cpu_requirement = "same-boot IOMMU completion actor"
+presented_identity = "IOMMU ticket, tombstone, device envelope, and mapping owners"
+expected_result = "one mapping release and no frame or credit double return"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_device_iotlb_with_apply"]
+boundary = "The Phase 1 sequence and Loom test do not replay one accepted IOMMU receipt."
+
+[[cell]]
+id = "duplicate-closure-receipt"
+family = "duplicate-replayed-receipts"
+phase = "phase-3"
+injection_point = "second presentation of one closure operation or receipt"
+cpu_requirement = "same-boot kernel closure actor"
+presented_identity = "root lineage, authority epoch, closure revision, and frozen cohort"
+expected_result = "one RevokeComplete transition and no additional terminalization"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::revoke_complete"]
+boundary = "Phase 1 reaches closure once but has no exact receipt replay test."
+
+[[cell]]
+id = "device-completion-vs-reset-ack"
+family = "device-completion-vs-reset-ack"
+phase = "phase-3"
+injection_point = "completion and reset acknowledgement enabled for one device generation"
+cpu_requirement = "two controlled production actors; distinct CPUs in phase 4"
+presented_identity = "commit receipt, reset ticket, and same device envelope"
+expected_result = "one terminal disposition; stale loser cannot publish or release again"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::record_device_completion", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_device_reset_with_apply"]
+boundary = "The existing Loom test races an old completion with IOTLB acknowledgement after reset, not this exact gate."
+
+[[cell]]
+id = "reset-timeout-then-retry"
+family = "reset-timeout-retry"
+phase = "phase-1"
+injection_point = "reset timeout followed by same-tombstone retry and generation advance"
+cpu_requirement = "independent safe-Rust oracle"
+presented_identity = "revoke ticket, commit receipt, tombstone, and old device envelope"
+expected_result = "honest retained state until retry; same effect identities survive generation advance"
+evidence = "checked"
+oracle_tests = ["reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retain_device_reset_timeout", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retry_device_reset"]
+boundary = "Logical timeout/retry checked; no watchdog or physical reset is observed."
+
+[[cell]]
+id = "iommu-timeout-then-retry"
+family = "iommu-timeout-late-ack-retry"
+phase = "phase-1"
+injection_point = "IOMMU timeout followed by same-owner retry and acknowledgement"
+cpu_requirement = "independent safe-Rust oracle"
+presented_identity = "IOMMU tombstone, retry token, device envelope, and exact mapping owners"
+expected_result = "owners remain retained until one retry acknowledgement releases them"
+evidence = "checked"
+oracle_tests = ["reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack", "loom_retry_iotlb_ack_and_old_completion_cannot_double_publish"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retain_device_iotlb_timeout", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retry_device_iotlb", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_device_iotlb_with_apply"]
+boundary = "Logical retry checked; hardware invalidation and actual frame release are not observed."
+
+[[cell]]
+id = "iommu-late-ack-after-timeout"
+family = "iommu-timeout-late-ack-retry"
+phase = "phase-3"
+injection_point = "late acknowledgement for the timed-out IOMMU attempt after retry authorization"
+cpu_requirement = "same-boot IOMMU completion actor"
+presented_identity = "old IOMMU attempt identity plus retained mapping owners"
+expected_result = "stale acknowledgement rejects without owner, frame, or credit release"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_device_iotlb_with_apply"]
+boundary = "The current oracle does not present the exact late old-attempt acknowledgement."
+
+[[cell]]
+id = "repeated-crash-before-rebind"
+family = "repeated-service-crash"
+phase = "phase-3"
+injection_point = "second crash while the first recovery cohort has no replacement binding"
+cpu_requirement = "same-boot production supervisor actor"
+presented_identity = "first crashed binding epoch and pending recovery revision"
+expected_result = "typed rejection or one monotone recovery revision without cohort loss"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::crash_domain"]
+boundary = "The committed finite oracle has one crash per selected domain."
+
+[[cell]]
+id = "repeated-crash-after-rebind"
+family = "repeated-service-crash"
+phase = "phase-3"
+injection_point = "replacement crashes before or after adopting the prior cohort"
+cpu_requirement = "same-boot production supervisor actor"
+presented_identity = "replacement binding epoch, recovery revision, and exact unadopted/adopted effects"
+expected_result = "another monotone binding fence with no identity replacement or orphan loss"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::crash_domain", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::adopt_domain"]
+boundary = "Repeated recovery is outside the current bounded oracle."
+
+[[cell]]
+id = "root-revoke-vs-cross-cpu-irq"
+family = "root-revoke-vs-cross-cpu-irq"
+phase = "phase-4"
+injection_point = "root revoke while device IRQ completion executes on another CPU"
+cpu_requirement = "controlled 2-vCPU and 4-vCPU schedules with real IRQ delivery"
+presented_identity = "root authority, commit receipt, and complete device envelope"
+expected_result = "one commit/closure disposition and no post-revoke stale publication"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::revoke_begin", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::record_device_completion"]
+boundary = "Abstract actors and Loom are not real IRQ or SMP evidence."
+
+[[cell]]
+id = "wrong-registry-instance"
+family = "wrong-presented-identity"
+phase = "phase-1"
+injection_point = "operation presents an identity allocated by another registry"
+cpu_requirement = "independent safe-Rust oracle"
+presented_identity = "foreign registry with otherwise matching root/effect fields"
+expected_result = "WrongRegistry and unchanged semantic projection"
+evidence = "checked"
+oracle_tests = ["substituted_registry_root_generations_and_parent_reject_atomically", "foreign_root_tokens_never_mutate_registration_or_revoke"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::validate_device_batch_receipt"]
+boundary = "Checked independently; shared production-path injection remains phase 2/3 work."
+
+[[cell]]
+id = "wrong-root"
+family = "wrong-presented-identity"
+phase = "phase-1"
+injection_point = "operation presents another root in the same registry"
+cpu_requirement = "independent safe-Rust oracle"
+presented_identity = "wrong root id with otherwise matching identity fields"
+expected_result = "WrongRoot and unchanged semantic projection"
+evidence = "checked"
+oracle_tests = ["substituted_registry_root_generations_and_parent_reject_atomically", "foreign_root_tokens_never_mutate_registration_or_revoke"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::validate_device_batch_receipt"]
+boundary = "Checked independently; not yet one frozen production matrix observation."
+
+[[cell]]
+id = "wrong-effect"
+family = "wrong-presented-identity"
+phase = "phase-1"
+injection_point = "operation presents a substituted effect generation or unknown effect key"
+cpu_requirement = "independent safe-Rust oracle"
+presented_identity = "wrong effect generation with matching registry/root/ancestry"
+expected_result = "WrongEffectGeneration or UnknownEffect with unchanged projection"
+evidence = "checked"
+oracle_tests = ["substituted_registry_root_generations_and_parent_reject_atomically"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::validate_device_batch_receipt"]
+boundary = "The bounded oracle checks effect-generation substitution; production unknown-key variants remain later execution cells."
+
+[[cell]]
+id = "wrong-queue"
+family = "wrong-presented-identity"
+phase = "phase-3"
+injection_point = "device operation presents another queue or descriptor token"
+cpu_requirement = "same-boot production device actor"
+presented_identity = "matching session/generation with wrong queue or descriptor"
+expected_result = "typed device-envelope rejection without mutation"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::validate_device_batch_receipt"]
+boundary = "The independent oracle does not expose a queue substitution test."
+
+[[cell]]
+id = "wrong-device-session"
+family = "wrong-presented-identity"
+phase = "phase-3"
+injection_point = "device operation presents another nonzero device session"
+cpu_requirement = "same-boot production device actor"
+presented_identity = "wrong session with matching queue, generation, root, and effects"
+expected_result = "typed device-envelope rejection without mutation"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::validate_device_batch_receipt"]
+boundary = "The independent oracle does not expose a session substitution test."
+
+[[cell]]
+id = "wrong-device-generation"
+family = "wrong-presented-identity"
+phase = "phase-1"
+injection_point = "old device generation completion after reset generation advance"
+cpu_requirement = "independent safe-Rust oracle and Loom abstract threads"
+presented_identity = "old complete commit receipt and device generation"
+expected_result = "StaleDeviceGeneration with unchanged projection and no publication"
+evidence = "checked"
+oracle_tests = ["reset_timeout_is_indeterminate_until_same_identity_retry_and_iotlb_ack", "loom_retry_iotlb_ack_and_old_completion_cannot_double_publish"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::record_device_completion"]
+boundary = "Checked independently; no physical device late completion is observed."
+
+[[cell]]
+id = "wrong-ancestry"
+family = "wrong-presented-identity"
+phase = "phase-1"
+injection_point = "registration or preparation presents a substituted causal parent"
+cpu_requirement = "independent safe-Rust oracle"
+presented_identity = "complete effect identity with wrong root/effect parent"
+expected_result = "WrongParent with unchanged semantic projection"
+evidence = "checked"
+oracle_tests = ["wrong_parent_registration_rejects_the_complete_projection", "substituted_registry_root_generations_and_parent_reject_atomically"]
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::register_derived"]
+boundary = "Checked independently; not yet executed through the shared production workload path."
+
+[[cell]]
+id = "queue-credit-pressure-with-tombstone"
+family = "retained-credit-pressure"
+phase = "phase-3"
+injection_point = "queue-slot reservation while reset/IOMMU tombstone retains the prior slot"
+cpu_requirement = "same-boot production service and closure actors"
+presented_identity = "new request identity plus retained queue owner and tombstone"
+expected_result = "honest backpressure; retained queue credit is neither reused nor fabricated"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retain_device_reset_timeout"]
+boundary = "The oracle checks conservation at fixed capacity but not injected allocation pressure."
+
+[[cell]]
+id = "dma-credit-pressure-with-tombstone"
+family = "retained-credit-pressure"
+phase = "phase-3"
+injection_point = "DMA-owner reservation while a tombstone retains prior DMA owners"
+cpu_requirement = "same-boot production service and closure actors"
+presented_identity = "new DMA owner identities plus retained owner set and tombstone"
+expected_result = "honest backpressure; retained DMA credits and owners remain bound"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retain_device_iotlb_timeout"]
+boundary = "The oracle checks fixed typed-credit conservation, not real allocator pressure."
+
+[[cell]]
+id = "frame-credit-pressure-with-tombstone"
+family = "retained-credit-pressure"
+phase = "phase-3"
+injection_point = "frame/pinned-page reservation while IOMMU quiescence is unknown"
+cpu_requirement = "same-boot production pager/device and closure actors"
+presented_identity = "new frame owner plus retained mapping owners and tombstone"
+expected_result = "no frame reuse before invalidation completion; timeout remains honest"
+evidence = "planned"
+oracle_tests = []
+production_sources = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retain_device_iotlb_timeout"]
+boundary = "No physical frame allocator, IOMMU invalidation, or pressure execution is observed."
