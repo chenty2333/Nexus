@@ -10,12 +10,12 @@ runner rejects row, witness, test, invariant, TCB, or exclusion drift before it
 runs the model.
 
 The first round assumes a non-equivocating ownership log and no host reboot or
-malicious rollback. The normative matrix is the frozen case contract for the
-complete research gate, including the production `EffectRegistry` refinement,
-so it records `production_registry_modified=true` exactly as the v2 receipt and
-summary do. Oracle independence is represented separately by
-`rust_oracle.independent_from_production_registry=true`; the same boundary key
-does not acquire a second meaning in this file.
+malicious rollback. The normative matrix remains the frozen contract for the
+independent first-round model and therefore records
+`production_registry_modified=false`. The later v2 receipt separately records
+`production_registry_modified=true` for the production `EffectRegistry`
+refinement. Each value describes its containing evidence layer; verifiers must
+not reinterpret the historical matrix as the complete v2 gate.
 
 The v2 research receipt additionally binds the dependency-free admission gate,
 the production `EffectRegistry`, two substrate Loom races, and eleven production
