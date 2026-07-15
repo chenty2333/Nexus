@@ -2,6 +2,8 @@
 # bounded netd/readiness recovery lifecycle. Scheduler and other workload noise
 # is ignored; every network-relevant receipt must occur exactly once and in
 # order, and no line may escalate the deliberately narrow transport claims.
+# Opaque diagnostic fingerprints are format-checked and compared as a pair;
+# their derived Debug bytes are not a stable cross-revision receipt codec.
 
 function fail(message) {
     print "runtime network assertion failed at serial line " NR ": " message > "/dev/stderr"
@@ -11,6 +13,30 @@ function fail(message) {
 
 function expect(line) {
     expected[++expected_count] = line
+}
+
+function field_value(line, name, fields, count, i, prefix) {
+    count = split(line, fields, / +/)
+    prefix = name "="
+    for (i = 1; i <= count; i++) {
+        if (substr(fields[i], 1, length(prefix)) == prefix)
+            return substr(fields[i], length(prefix) + 1)
+    }
+    return ""
+}
+
+function normalize_projection_pair(line, before, after) {
+    before = field_value(line, "projection_before")
+    after = field_value(line, "projection_after")
+    if (length(before) != 16 || before !~ /^[0-9a-f]+$/)
+        fail("projection_before is not one lowercase 64-bit fingerprint: " line)
+    if (length(after) != 16 || after !~ /^[0-9a-f]+$/)
+        fail("projection_after is not one lowercase 64-bit fingerprint: " line)
+    if (before != after)
+        fail("rejected operation changed its semantic projection: " line)
+    sub(/projection_before=[0-9a-f]+/, "projection_before=<fingerprint>", line)
+    sub(/projection_after=[0-9a-f]+/, "projection_after=<fingerprint>", line)
+    return line
 }
 
 BEGIN {
@@ -34,7 +60,7 @@ BEGIN {
     expect("NETWORK_LIFECYCLE Rebind replacement=1052 binding=2 personality_binding=1 readiness_binding=1 peer_epochs_unchanged=true")
     expect("NETWORK_LIFECYCLE Adopt replacement=1052 effect=10 kind=accept old_binding=1 new_binding=2 explicit=true")
     expect("NETWORK_LIFECYCLE Adopt replacement=1052 effect=11 kind=readiness old_binding=1 new_binding=2 explicit=true")
-    expect("NETWORK_LIFECYCLE StaleReplay sender=1051 old_binding=1 current_binding=2 result=StaleBinding projection_before=940377c51c615ca0 projection_after=940377c51c615ca0 full_projection_unchanged=true mutation=false")
+    expect("NETWORK_LIFECYCLE StaleReplay sender=1051 old_binding=1 current_binding=2 result=StaleBinding projection_before=<fingerprint> projection_after=<fingerprint> full_projection_unchanged=true mutation=false")
     expect("LINUX_NET Accept syscall=10 effect=10 commit_sequence=10 fd=5 listener=3 peer=127.0.0.1:49153 flags=0 readiness_effect=11 delivery_sequence=1 recovered_by_v2=true")
     expect("LINUX_NET GetSockName syscall=11 effect=12 commit_sequence=12 fd=4 endpoint=client_local family=AF_INET address=127.0.0.1 port=49153 sockaddr_len=16")
     expect("LINUX_NET Write syscall=12 effect=13 commit_sequence=13 direction=client_to_accepted bytes=4 payload=ping buffer_effect=14 buffer_credit=Held")
@@ -60,8 +86,8 @@ BEGIN {
     expect("NETWORK_COMPANION READY_REVOKE PASS case=revoke-first scope=107 winner=RevokeBegin order=revoke_before_ready ready_commit_result=StaleAuthority net_publications=1 ready_publications=0 ready_deliveries=0 wait_final=Aborted guest_commits=0 guest_replies=0 buffer_disposition=ClosureDrain credits=Free quiescent=true bounded=true single_cpu=true")
     expect("NETWORK_COMPANION PERSONALITY_CRASH PASS scope=108 old_binding=1 new_binding=2 send_phase_at_crash=Committed send_disposition=Drain send_replies=1 receive_phase_at_crash=Prepared receive_disposition=Abort receive_replies=0 committed_adoptions=0 terminalizations=2 credits=Free quiescent=true bounded=true single_cpu=true")
     expect("NETWORK_COMPANION BUFFER_REPLY PASS scope=109 net_sequence=1 buffer_effect=4 payload=ping bytes=4 visible_before=1 buffer_credit_before=Held guest_commits_before=0 guest_replies_before=0 peer_consumptions=0 closure_drains=1 visible_after=0 buffer_credit_after=Free net_publications_after=1 guest_replies_after=0 immutable_history=true quiescent=true bounded=true single_cpu=true")
-    expect("NETWORK_COMPANION STALE_GENERATION PASS kind=socket scope=110 effect=2 presented=1 current=2 result=StaleSocketGeneration projection_before=f47b68dbb3cd7d8e projection_after=f47b68dbb3cd7d8e full_projection_unchanged=true mutation=false bounded=true single_cpu=true")
-    expect("NETWORK_COMPANION STALE_GENERATION PASS kind=source scope=111 effect=3 presented=1 current=2 result=StaleSourceGeneration projection_before=cbbd144a8746f4f3 projection_after=cbbd144a8746f4f3 full_projection_unchanged=true mutation=false bounded=true single_cpu=true")
+    expect("NETWORK_COMPANION STALE_GENERATION PASS kind=socket scope=110 effect=2 presented=1 current=2 result=StaleSocketGeneration projection_before=<fingerprint> projection_after=<fingerprint> full_projection_unchanged=true mutation=false bounded=true single_cpu=true")
+    expect("NETWORK_COMPANION STALE_GENERATION PASS kind=source scope=111 effect=3 presented=1 current=2 result=StaleSourceGeneration projection_before=<fingerprint> projection_after=<fingerprint> full_projection_unchanged=true mutation=false bounded=true single_cpu=true")
     expect("NETWORK_LIFECYCLE PASS netd_crash_adopt_accept=true stale_old_binding_full_projection_unchanged=true ready_commit_first=true ready_revoke_first=true personality_crash_drain_abort=true buffer_visible_reply_absent=true stale_socket_generation_full_projection_unchanged=true stale_source_generation_full_projection_unchanged=true stale_authority_full_projection_unchanged=true companion_quiescent=true netd_crash_peer_epochs_unchanged=true binding_isolation_observed=netd_crash_only socket_generation_fenced=true source_generation_fenced=true kernel_owned_readiness=true buffer_credit_retained_until_consume=true quiescent=true bounded=true single_cpu=true smoltcp=false virtio_net=false external_packets=false")
 }
 
@@ -85,7 +111,10 @@ BEGIN {
     observed++
     if (observed > expected_count)
         fail("unexpected additional receipt: " $0)
-    if ($0 != expected[observed])
+    comparison = $0
+    if (comparison ~ / projection_before=/ || comparison ~ / projection_after=/)
+        comparison = normalize_projection_pair(comparison)
+    if (comparison != expected[observed])
         fail("receipt #" observed " mismatch; expected: " expected[observed] "; observed: " $0)
 }
 

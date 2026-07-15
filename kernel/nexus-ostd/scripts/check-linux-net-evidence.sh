@@ -27,7 +27,7 @@ cleanup() {
 trap cleanup EXIT
 
 awk -f "$oracle" "$serial"
-echo "runtime network serial positive assertion: PASS exact_transcript=true" | tee -a "$report"
+echo "runtime network serial positive assertion: PASS exact_semantic_transcript=true projection_pair_recomputed=true" | tee -a "$report"
 
 negative_count=0
 expect_reject() {
@@ -104,6 +104,24 @@ awk '
 ' "$serial" >"$tmp/stale-mutation.log"
 expect_reject stale_replay_mutation "$tmp/stale-mutation.log"
 
+awk '
+    !changed && /^NETWORK_LIFECYCLE StaleReplay / {
+        for (field = 1; field <= NF; field++) {
+            if ($field ~ /^projection_after=[0-9a-f]+$/) {
+                digest = substr($field, length("projection_after=") + 1)
+                first = substr(digest, 1, 1) == "0" ? "1" : "0"
+                replacement = first substr(digest, 2)
+                changed = sub("projection_after=" digest,
+                              "projection_after=" replacement)
+                break
+            }
+        }
+    }
+    { print }
+    END { if (!changed) exit 2 }
+' "$serial" >"$tmp/stale-projection.log"
+expect_reject stale_replay_projection_mismatch "$tmp/stale-projection.log"
+
 swap_first \
     '^NETWORK_COMPANION READY_REVOKE Transition case=ready-first .* step=ReadyCommit ' \
     '^NETWORK_COMPANION READY_REVOKE Transition case=ready-first .* step=RevokeBegin ' \
@@ -139,7 +157,7 @@ mkdir -p "$(dirname -- "$artifact")"
 artifact_tmp="$(dirname -- "$artifact")/.runtime-net-oracle.$$.tmp"
 cp "$report" "$artifact_tmp"
 printf '%s\n' \
-    "RUNTIME_NET_ORACLE PASS serial=kernel/nexus-ostd/artifacts/serial.log positive_oracle=true negative_oracles=$negative_count retained_syscalls=22 bounded_loopback=true single_cpu=true smoltcp=false virtio_net=false external_packets=false tcp_breadth=false" \
+    "RUNTIME_NET_ORACLE PASS serial=kernel/nexus-ostd/artifacts/serial.log positive_oracle=true exact_semantic_transcript=true projection_pair_recomputed=true negative_oracles=$negative_count retained_syscalls=22 bounded_loopback=true single_cpu=true smoltcp=false virtio_net=false external_packets=false tcp_breadth=false" \
     >>"$artifact_tmp"
 mv "$artifact_tmp" "$artifact"
 artifact_tmp=
