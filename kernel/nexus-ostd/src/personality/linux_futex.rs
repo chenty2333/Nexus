@@ -8,6 +8,7 @@
 //! unified syscall/futex registry or a general Linux futex implementation.
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use cser_transition_gates::deadline::{
     DeadlineError, DeadlineGate, DeadlineProjection, DeadlineToken,
@@ -41,6 +42,7 @@ const FUTEX_WAKE_PRIVATE: usize = 129;
 const WAIT_OPERATION: u64 = 1;
 const WAKE_OPERATION: u64 = 2;
 const EAGAIN: isize = 11;
+const EXPIRE_STARTUP_MAX_TICKS: u64 = 128;
 
 const GUEST_DONE: usize = 0x4c60_00f0;
 const PORTAL_RECV_WAIT: usize = 0x4c60_0001;
@@ -66,6 +68,21 @@ const SCHEDULER_POLICY_PROGRAM: &[u8] = include_bytes!("../../guest/linux-schedu
 enum ScenarioKind {
     Recover,
     Expire,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpireStartupStage {
+    WakerReady,
+    WaitCaptured,
+}
+
+impl ExpireStartupStage {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::WakerReady => "waker-ready",
+            Self::WaitCaptured => "wait-captured",
+        }
+    }
 }
 
 impl ScenarioKind {
@@ -410,6 +427,8 @@ impl FutexState {
 struct FutexScenario {
     kind: ScenarioKind,
     guest_vm: Arc<VmSpace>,
+    expire_waker_ready: AtomicBool,
+    expire_waiter_ready: AtomicBool,
     state: SpinLock<FutexState>,
 }
 
@@ -418,6 +437,8 @@ impl FutexScenario {
         Self {
             kind,
             guest_vm,
+            expire_waker_ready: AtomicBool::new(false),
+            expire_waiter_ready: AtomicBool::new(false),
             state: SpinLock::new(FutexState {
                 scope_phase: ScopePhase::Active,
                 authority_epoch: AUTHORITY_EPOCH,
@@ -558,6 +579,29 @@ impl FutexScenario {
         assert!(state.enable_waker.is_none());
         assert!(!state.waker_enabled);
         state.enable_waker = Some(waker);
+    }
+
+    fn enable_waker_is_registered(&self) -> bool {
+        self.state.lock().enable_waker.is_some()
+    }
+
+    fn mark_expire_startup_ready(&self, stage: ExpireStartupStage) {
+        assert_eq!(self.kind, ScenarioKind::Expire);
+        let ready = match stage {
+            ExpireStartupStage::WakerReady => &self.expire_waker_ready,
+            ExpireStartupStage::WaitCaptured => &self.expire_waiter_ready,
+        };
+        ready
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .expect("each expire startup stage has one publisher");
+    }
+
+    fn expire_startup_is_ready(&self, stage: ExpireStartupStage) -> bool {
+        let ready = match stage {
+            ExpireStartupStage::WakerReady => &self.expire_waker_ready,
+            ExpireStartupStage::WaitCaptured => &self.expire_waiter_ready,
+        };
+        ready.load(Ordering::Acquire)
     }
 
     fn wait_is_captured(&self) -> bool {
@@ -1688,6 +1732,9 @@ fn run_guest_waiter(scenario: Arc<FutexScenario>, vm_space: Arc<VmSpace>) {
         scenario.kind.waiter_task_id(),
         user_mode.context().rip(),
     );
+    if scenario.kind == ScenarioKind::Expire {
+        scenario.mark_expire_startup_ready(ExpireStartupStage::WaitCaptured);
+    }
     waiter.wait();
     drop(waiter);
 
@@ -1737,6 +1784,9 @@ fn run_guest_waker(scenario: Arc<FutexScenario>, vm_space: Arc<VmSpace>) {
         scenario.kind.label(),
         scenario.kind.waker_task_id(),
     );
+    if scenario.kind == ScenarioKind::Expire {
+        scenario.mark_expire_startup_ready(ExpireStartupStage::WakerReady);
+    }
     enable_waiter.wait();
     drop(enable_waiter);
 
@@ -2106,6 +2156,49 @@ fn run_watchdog(
     }
 }
 
+fn wait_for_expire_startup(scenario: &FutexScenario, stage: ExpireStartupStage) {
+    assert_eq!(scenario.kind, ScenarioKind::Expire);
+    let start = Jiffies::elapsed().as_u64();
+    let deadline = start
+        .checked_add(EXPIRE_STARTUP_MAX_TICKS)
+        .expect("expire startup deadline must fit the scheduler clock");
+
+    loop {
+        let observed = Jiffies::elapsed().as_u64();
+        let ready = scenario.expire_startup_is_ready(stage);
+        if ready {
+            assert!(match stage {
+                ExpireStartupStage::WakerReady => scenario.enable_waker_is_registered(),
+                ExpireStartupStage::WaitCaptured => scenario.wait_is_captured(),
+            });
+            assert!(
+                observed <= deadline,
+                "expire startup stage {} completed after its bounded deadline",
+                stage.label()
+            );
+            let waited = observed
+                .checked_sub(start)
+                .expect("the scheduler clock must not move backwards");
+            println!(
+                "LINUX_FUTEX_STARTUP Receipt scenario=expire stage={} start_tick={} observed_tick={} deadline_tick={} waited_ticks={} max_wait_ticks={} bounded=true",
+                stage.label(),
+                start,
+                observed,
+                deadline,
+                waited,
+                EXPIRE_STARTUP_MAX_TICKS,
+            );
+            return;
+        }
+        assert!(
+            observed < deadline,
+            "expire startup stage {} timed out before its readiness receipt",
+            stage.label()
+        );
+        Task::yield_now();
+    }
+}
+
 fn run_scenario(
     kind: ScenarioKind,
     scheduler: &'static CserScheduler,
@@ -2196,10 +2289,31 @@ fn run_scenario(
             "existing_kernel_fifo_fallback"
         },
     );
-    waiter_task.run();
-    waker_task.run();
-    v1_task.run();
-    watchdog_task.run();
+    match kind {
+        ScenarioKind::Recover => {
+            waiter_task.run();
+            waker_task.run();
+            v1_task.run();
+            watchdog_task.run();
+        }
+        ScenarioKind::Expire => {
+            assert!(
+                scheduler_binding.is_none(),
+                "expire startup must remain on the existing kernel fallback"
+            );
+            // A fallback reservation is not a task-entry receipt. Stage the
+            // two guest prerequisites so a slower same-boot QEMU cannot run
+            // the personality's readiness loop before either guest has made
+            // progress. The publish/crash/watchdog race starts only after
+            // these pre-admission prerequisites and remains unchanged.
+            waker_task.run();
+            wait_for_expire_startup(&scenario, ExpireStartupStage::WakerReady);
+            waiter_task.run();
+            wait_for_expire_startup(&scenario, ExpireStartupStage::WaitCaptured);
+            v1_task.run();
+            watchdog_task.run();
+        }
+    }
     if let (Some(binding), Some(policy_task)) = (scheduler_binding, policy_task) {
         policy_task.run();
         assert_eq!(

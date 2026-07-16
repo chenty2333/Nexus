@@ -642,6 +642,11 @@ check_runtime_fs_same_boot_precommit_source() {
         "$repo_root/crates/nexus-ostd-virtio/src/production.rs"
 }
 
+check_linux_futex_startup_source() {
+    bash "$root/scripts/assert-linux-futex-startup-source.sh" \
+        "$root/src/personality/linux_futex.rs"
+}
+
 check_runtime_net_artifact_negatives() {
     container bash -c '
         set -euo pipefail
@@ -991,6 +996,7 @@ case "$command" in
         check_runtime_fs_production_source
         check_runtime_fs_same_boot_source
         check_runtime_fs_same_boot_precommit_source
+        check_linux_futex_startup_source
         prepare_guest
         check_runtime_fs_artifact_negatives
         check_runtime_net_artifact_negatives
@@ -1061,6 +1067,8 @@ case "$command" in
         mkdir -p "$root/artifacts"
         container bash scripts/check-iotlb-gap.sh
         run_kernel | tee "$root/artifacts/serial.log"
+        bash "$root/scripts/assert-linux-futex-startup.sh" \
+            "$root/artifacts/serial.log"
         "$root/scripts/assert-serial.sh" "$root/artifacts/serial.log"
         awk -f "$root/scripts/assert-linux-dynamic.awk" "$root/artifacts/serial.log"
         awk -f "$root/scripts/assert-linux-fs.awk" "$root/artifacts/serial.log"
@@ -1159,11 +1167,14 @@ case "$command" in
         check_virtio_patch
         check_runtime_fs_production_source
         check_runtime_fs_same_boot_source
+        check_linux_futex_startup_source
         prepare_guest
         check_runtime_fs_artifact_negatives
         bash "$root/scripts/assert-stream-capture.sh"
         prepare_same_boot_artifacts
         capture_same_boot_run
+        bash "$root/scripts/assert-linux-futex-startup.sh" \
+            "$same_boot_artifact_dir/serial.log"
         bash "$root/scripts/assert-runtime-fs-same-boot.sh" \
             "$same_boot_artifact_dir/serial.log" \
             "$same_boot_artifact_dir/qemu-debug.log" 2>&1 \
@@ -1175,11 +1186,14 @@ case "$command" in
         check_virtio_patch
         check_runtime_fs_production_source
         check_runtime_fs_same_boot_precommit_source
+        check_linux_futex_startup_source
         prepare_guest
         check_runtime_fs_artifact_negatives
         bash "$root/scripts/assert-stream-capture.sh"
         prepare_same_boot_precommit_artifacts
         capture_same_boot_precommit_run
+        bash "$root/scripts/assert-linux-futex-startup.sh" \
+            "$same_boot_precommit_artifact_dir/serial.log"
         bash "$root/scripts/assert-runtime-fs-same-boot-precommit.sh" \
             "$same_boot_precommit_artifact_dir/serial.log" \
             "$same_boot_precommit_artifact_dir/qemu-debug.log" 2>&1 \
