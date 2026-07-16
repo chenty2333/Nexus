@@ -507,7 +507,7 @@ check_virtio_patch() {
 
 doctor() {
     local tool
-    for tool in awk bash chmod cp cut diff dirname docker flock grep id mkdir mktemp mv rm sed sha256sum tee; do
+    for tool in awk bash chmod cp cut diff dirname docker flock grep head id mkdir mkfifo mktemp mv rm sed sha256sum tail tee timeout tr wc; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             echo "nexus-ostd doctor: missing host tool: $tool" >&2
             return 1
@@ -857,6 +857,7 @@ capture_same_boot_run() {
         "$same_boot_artifact_dir/serial.log" \
         "$same_boot_artifact_dir/qemu-debug.log" \
         run_same_boot_kernel
+    echo 'QEMU_CAPTURE PASS profile=runtime-fs-same-boot live_replay=false serial=artifacts/runtime-fs-same-boot/serial.log debug=artifacts/runtime-fs-same-boot/qemu-debug.log'
 }
 
 run_same_boot_precommit_kernel() {
@@ -908,6 +909,7 @@ capture_same_boot_precommit_run() {
         "$same_boot_precommit_artifact_dir/serial.log" \
         "$same_boot_precommit_artifact_dir/qemu-debug.log" \
         run_same_boot_precommit_kernel
+    echo 'QEMU_CAPTURE PASS profile=runtime-fs-same-boot-precommit live_replay=false serial=artifacts/runtime-fs-same-boot-precommit/serial.log debug=artifacts/runtime-fs-same-boot-precommit/qemu-debug.log'
 }
 
 build_stage7b() {

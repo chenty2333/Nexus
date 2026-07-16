@@ -43,9 +43,12 @@ capture_qemu_streams() (
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
-    tee "$serial_log" <"$serial_pipe" &
+    # QEMU's stdio chardev must never inherit backpressure from the caller's
+    # terminal or CI log consumer. Drain both FIFOs directly to files while
+    # QEMU is live; bounded diagnostics are replayed only after it exits.
+    tee "$serial_log" <"$serial_pipe" >/dev/null &
     serial_reader=$!
-    tee "$debug_log" <"$debug_pipe" >&2 &
+    tee "$debug_log" <"$debug_pipe" >/dev/null &
     debug_reader=$!
 
     # Do not put the target function on the left side of `||` or `if`: Bash
@@ -69,6 +72,20 @@ capture_qemu_streams() (
     trap - HUP INT TERM
     cleanup
     trap - EXIT
+
+    if (( command_status != 0 || serial_status != 0 || debug_status != 0 )); then
+        {
+            echo "QEMU split-stream capture failed: command_status=$command_status serial_reader_status=$serial_status debug_reader_status=$debug_status"
+            echo "serial_log=$serial_log"
+            echo '--- serial tail (last 65536 bytes) ---'
+            tail -c 65536 "$serial_log" || true
+            echo
+            echo "debug_log=$debug_log"
+            echo '--- QEMU debug tail (last 65536 bytes) ---'
+            tail -c 65536 "$debug_log" || true
+            echo
+        } >&2
+    fi
 
     if (( command_status != 0 )); then
         exit "$command_status"

@@ -52,6 +52,15 @@ if grep -Fq 'virtio_set_status' "$serial_log" ||
     exit 1
 fi
 
+success_output="$work/success-output.log"
+capture_qemu_streams \
+    "$work/silent-serial.log" "$work/silent-debug.log" \
+    fixture >"$success_output" 2>&1
+if [[ -s "$success_output" ]]; then
+    echo 'successful split capture replayed live QEMU output to its caller' >&2
+    exit 1
+fi
+
 failure_fixture() {
     printf 'before-failure\n'
     false
@@ -60,12 +69,14 @@ failure_fixture() {
 set +e
 capture_qemu_streams \
     "$work/failure-serial.log" "$work/failure-debug.log" \
-    failure_fixture >/dev/null 2>&1
+    failure_fixture >"$work/failure-report.log" 2>&1
 failure_status=$?
 set -e
 if [[ "$failure_status" -eq 0 ]] ||
     ! grep -Fxq 'before-failure' "$work/failure-serial.log" ||
-    grep -Fq 'after-failure' "$work/failure-serial.log"; then
+    grep -Fq 'after-failure' "$work/failure-serial.log" ||
+    ! grep -Fq 'command_status=1' "$work/failure-report.log" ||
+    ! grep -Fxq 'before-failure' "$work/failure-report.log"; then
     echo 'split capture swallowed an intermediate errexit failure' >&2
     exit 1
 fi
@@ -116,4 +127,56 @@ if [[ $(wc -c <"$work/long-serial.log") -ne 131073 ]] ||
     exit 1
 fi
 
-echo 'QEMU split-stream capture assertions: PASS legacy_byte_interleave=reproduced raw_inputs_isolated=true errexit=preserved partial=preserved long_record=preserved'
+# Keep the caller-side output pipe open without consuming it. The historical
+# live tee implementation filled this pipe and blocked the QEMU/FIFO chain;
+# file-only readers must finish independently of that external consumer.
+blocked_output="$work/blocked-output.pipe"
+mkfifo "$blocked_output"
+exec 9<>"$blocked_output"
+set +e
+timeout --signal=TERM --kill-after=1s 5s bash -c '
+    set -euo pipefail
+    source "$1"
+    capture_qemu_streams "$2" "$3" bash -c '\''
+        head -c 131072 /dev/zero | tr "\\0" S
+        printf "\\n"
+        head -c 131072 /dev/zero | tr "\\0" D >&2
+        printf "\\n" >&2
+    '\''
+' _ "$script_dir/qemu-stream-capture.sh" \
+    "$work/backpressure-serial.log" "$work/backpressure-debug.log" \
+    >"$blocked_output" 2>&1
+backpressure_status=$?
+set -e
+exec 9>&-
+if [[ "$backpressure_status" -ne 0 ]] ||
+    [[ $(wc -c <"$work/backpressure-serial.log") -ne 131073 ]] ||
+    [[ $(wc -c <"$work/backpressure-debug.log") -ne 131073 ]]; then
+    echo 'split capture remained coupled to a blocked caller-side output consumer' >&2
+    exit 1
+fi
+
+long_failure_fixture() {
+    printf 'HEAD-MARKER\n'
+    head -c 131072 /dev/zero | tr '\0' X
+    printf '\nTAIL-MARKER\n'
+    return 24
+}
+set +e
+capture_qemu_streams \
+    "$work/long-failure-serial.log" "$work/long-failure-debug.log" \
+    long_failure_fixture >"$work/long-failure-report.log" 2>&1
+long_failure_status=$?
+set -e
+if [[ "$long_failure_status" -ne 24 ]] ||
+    ! grep -Fxq 'HEAD-MARKER' "$work/long-failure-serial.log" ||
+    ! grep -Fxq 'TAIL-MARKER' "$work/long-failure-serial.log" ||
+    [[ $(wc -c <"$work/long-failure-serial.log") -ne 131097 ]] ||
+    ! grep -Fxq 'TAIL-MARKER' "$work/long-failure-report.log" ||
+    grep -Fq 'HEAD-MARKER' "$work/long-failure-report.log" ||
+    [[ $(wc -c <"$work/long-failure-report.log") -gt 70000 ]]; then
+    echo 'split capture failure replay is not byte-bounded to the log tail' >&2
+    exit 1
+fi
+
+echo 'QEMU split-stream capture assertions: PASS legacy_byte_interleave=reproduced raw_inputs_isolated=true live_replay=false failure_tail_bytes=65536 errexit=preserved partial=preserved long_record=preserved live_capture_backpressure=isolated'

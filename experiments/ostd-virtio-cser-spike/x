@@ -444,6 +444,7 @@ capture_kernel_run() {
         "$root/artifacts/serial.log" \
         "$root/artifacts/qemu-debug.log" \
         run_kernel
+    echo 'QEMU_CAPTURE PASS profile=stage5b live_replay=false serial=artifacts/serial.log debug=artifacts/qemu-debug.log'
 }
 
 command=${1:-test}

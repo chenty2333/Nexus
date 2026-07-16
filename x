@@ -272,7 +272,7 @@ verify_all() {
 doctor_host() {
     for command in \
         awk bash chmod cp cut diff docker flock git grep head id mkdir mkfifo \
-        mktemp rm sed sh sha256sum tee tr wc; do
+        mktemp rm sed sh sha256sum tail tee timeout tr wc; do
         require_command "$command"
     done
     docker info >/dev/null
