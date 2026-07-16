@@ -42,21 +42,36 @@ oracle() {
         begin_count++
         begin_line = NR
     }
+    /^LINUX_FUTEX_STARTUP TaskEntry scenario=expire / {
+        if (NF != 6 || $2 != "TaskEntry" || $3 != "scenario=expire")
+            fail("malformed startup task-entry receipt: " $0)
+        stage = field("stage")
+        role = field("role")
+        task = decimal(field("task"), stage " task")
+        if (stage == "waker-ready" && role == "waker" && task == 511) {
+            waker_task_entry_count++
+            waker_task_entry_line = NR
+        } else if (stage == "wait-captured" && role == "waiter" && task == 510) {
+            waiter_task_entry_count++
+            waiter_task_entry_line = NR
+        } else {
+            fail("unknown startup task-entry identity: " $0)
+        }
+    }
     /^LINUX_FUTEX_STARTUP Receipt scenario=expire / {
         if (NF != 14 || $2 != "Receipt" || $3 != "scenario=expire" ||
-            $9 != "max_success_wait_ticks=128" ||
-            $10 != "success_latency_checked=true" ||
-            $11 != "failure_bound=outer-qemu-timeout" ||
-            $12 != "handshake=wait-queue" || $13 != "publish=release" ||
-            $14 != "observe=acquire")
+            $8 != "timing=diagnostic" || $9 != "internal_timeout=false" ||
+            $10 != "failure_bound=outer-qemu-timeout" ||
+            $11 != "handshake=wait-queue" ||
+            $12 != "spawn_preemption=disabled-through-run" ||
+            $13 != "publish=release" || $14 != "observe=acquire")
             fail("malformed startup receipt: " $0)
         stage = field("stage")
         start = decimal(field("start_tick"), stage " start_tick")
         observed = decimal(field("observed_tick"), stage " observed_tick")
-        deadline = decimal(field("deadline_tick"), stage " deadline_tick")
         waited = decimal(field("waited_ticks"), stage " waited_ticks")
-        if (deadline - start != 128 || observed - start != waited || observed > deadline)
-            fail("startup receipt violates its checked deadline: " $0)
+        if (observed < start || observed - start != waited)
+            fail("startup timing diagnostic is not monotonic: " $0)
         if (stage == "waker-ready") {
             waker_ready_count++
             waker_ready_line = NR
@@ -89,12 +104,15 @@ oracle() {
     END {
         if (failed)
             exit 1
-        if (begin_count != 1 || waker_ready_count != 1 || wait_captured_count != 1 ||
+        if (begin_count != 1 || waker_task_entry_count != 1 ||
+            waiter_task_entry_count != 1 || waker_ready_count != 1 || wait_captured_count != 1 ||
             waker_guest_block_count != 1 || waiter_guest_block_count != 1)
-            fail("expected one Expire begin, child-entry block, and receipt for each startup stage")
-        if (!(begin_line < waker_guest_block_line &&
+            fail("expected one Expire begin, task entry, child block, and receipt for each startup stage")
+        if (!(begin_line < waker_task_entry_line &&
+              waker_task_entry_line < waker_guest_block_line &&
               waker_guest_block_line < waker_ready_line &&
-              waker_ready_line < mismatch_line &&
+              waker_ready_line < waiter_task_entry_line &&
+              waiter_task_entry_line < mismatch_line &&
               mismatch_line < wait_capture_line &&
               wait_capture_line < waiter_guest_block_line &&
               waiter_guest_block_line < wait_captured_line &&
@@ -159,4 +177,28 @@ if oracle "$work/missing-waker-entry.log" >/dev/null 2>&1; then
     die "oracle accepted a readiness receipt without the waker child-entry block"
 fi
 
-echo "Linux futex staged-start assertions: PASS receipts=2 child_entry_blocks=2 handshake=wait-queue success_latency_checked=true max_success_wait_ticks=128 failure_bound=outer-qemu-timeout publish_recover_race=preserved mutations=4"
+awk '
+    !removed && /^LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=waker-ready / {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+' "$serial_log" >"$work/missing-waker-task-entry.log"
+if oracle "$work/missing-waker-task-entry.log" >/dev/null 2>&1; then
+    die "oracle accepted a waker readiness receipt without TaskEntry"
+fi
+
+sed '0,/spawn_preemption=disabled-through-run/s//spawn_preemption=unguarded/' \
+    "$serial_log" >"$work/unguarded-spawn-receipt.log"
+if oracle "$work/unguarded-spawn-receipt.log" >/dev/null 2>&1; then
+    die "oracle accepted an unguarded spawn-window receipt"
+fi
+
+sed '0,/internal_timeout=false/s//internal_timeout=true/' \
+    "$serial_log" >"$work/internal-timeout-overclaim.log"
+if oracle "$work/internal-timeout-overclaim.log" >/dev/null 2>&1; then
+    die "oracle accepted an unimplemented guest-side startup timeout"
+fi
+
+echo "Linux futex staged-start assertions: PASS receipts=2 task_entries=2 child_entry_blocks=2 timing=diagnostic internal_timeout=false handshake=wait-queue spawn_preemption=disabled-through-run failure_bound=outer-qemu-timeout publish_recover_race=preserved mutations=7"

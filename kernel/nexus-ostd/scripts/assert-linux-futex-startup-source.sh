@@ -20,9 +20,6 @@ oracle() {
             print "Linux futex startup source oracle: FAIL: " message > "/dev/stderr"
             exit 1
         }
-        $0 == "const EXPIRE_STARTUP_MAX_SUCCESS_TICKS: u64 = 128;" {
-            deadline_constants++
-        }
         $0 == "fn wait_for_expire_startup(scenario: &FutexScenario, stage: ExpireStartupStage) {" {
             helper_lines++
         }
@@ -59,8 +56,24 @@ oracle() {
             blocking_waits++
             blocking_wait = NR
         }
-        index($0, "max_success_wait_ticks={} success_latency_checked=true failure_bound=outer-qemu-timeout handshake=wait-queue publish=release observe=acquire") > 0 {
-            bounded_claim_receipts++
+        index($0, "waited_ticks={} timing=diagnostic internal_timeout=false failure_bound=outer-qemu-timeout handshake=wait-queue spawn_preemption=disabled-through-run publish=release observe=acquire") > 0 {
+            diagnostic_receipts++
+        }
+        /EXPIRE_STARTUP_MAX_SUCCESS_TICKS/ || /success_latency_checked=true/ ||
+        /max_success_wait_ticks=/ || /observed <= deadline/ ||
+        (index($0, "LINUX_FUTEX_STARTUP") > 0 && /bounded=true/) {
+            forbidden_latency_claims++
+        }
+        /\.checked_sub\(start\)/ {
+            monotonic_differences++
+        }
+        index($0, "\"LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=wait-captured role=waiter task={}") > 0 {
+            waiter_task_entries++
+            waiter_task_entry = NR
+        }
+        index($0, "\"LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=waker-ready role=waker task={}") > 0 {
+            waker_task_entries++
+            waker_task_entry = NR
         }
         $0 == "    scenario.capture_wait(user_mode.context(), waker);" {
             wait_captures++
@@ -86,30 +99,36 @@ oracle() {
             waker_publishers++
             waker_publish = NR
         }
-        /checked_add\(EXPIRE_STARTUP_MAX_SUCCESS_TICKS\)/ {
-            checked_deadlines++
-        }
-        /observed <= deadline,/ {
-            strict_deadline_checks++
-        }
         helper_lines > 0 && run_scenario_lines == 0 && /Task::yield_now\(\)/ {
             helper_yields++
+        }
+        $0 == "fn run_expire_startup_task(task: &Arc<Task>, scenario: &FutexScenario, stage: ExpireStartupStage) {" {
+            startup_runner_helpers++
+        }
+        $0 == "    let preempt_guard = disable_preempt();" {
+            startup_preempt_guards++
+            startup_preempt_guard = NR
+        }
+        $0 == "    task.run();" {
+            startup_task_runs++
+            startup_task_run = NR
+        }
+        $0 == "    drop(preempt_guard);" {
+            startup_guard_drops++
+            startup_guard_drop = NR
+        }
+        $0 == "    wait_for_expire_startup(scenario, stage);" {
+            startup_blocking_waits++
+            startup_blocking_wait = NR
         }
         $0 == "fn run_scenario(" {
             run_scenario_lines++
         }
-        $0 == "            waker_task.run();" {
-            waker_run = NR
-        }
-        $0 == "            wait_for_expire_startup(&scenario, ExpireStartupStage::WakerReady);" {
+        $0 == "            run_expire_startup_task(&waker_task, &scenario, ExpireStartupStage::WakerReady);" {
             waker_ready_calls++
             waker_ready = NR
-            staged_waker_run = waker_run
         }
-        $0 == "            waiter_task.run();" && waker_ready > 0 {
-            staged_waiter_run = NR
-        }
-        $0 == "            wait_for_expire_startup(&scenario, ExpireStartupStage::WaitCaptured);" {
+        $0 == "            run_expire_startup_task(&waiter_task, &scenario, ExpireStartupStage::WaitCaptured);" {
             wait_captured_calls++
             wait_captured = NR
         }
@@ -120,9 +139,9 @@ oracle() {
             watchdog_run = NR
         }
         END {
-            if (deadline_constants != 1 || helper_lines != 1 ||
-                checked_deadlines != 1 || strict_deadline_checks != 1)
-                fail("startup helper does not uniquely check successful-entry latency")
+            if (helper_lines != 1 || diagnostic_receipts != 1 ||
+                monotonic_differences != 1 || forbidden_latency_claims != 0)
+                fail("startup helper overclaims a guest-side timeout or omits its timing diagnostic")
             if (publisher_helpers != 1 || release_publishes != 1 ||
                 acquire_observations != 1 || waker_publishers != 1 ||
                 waiter_publishers != 1)
@@ -130,22 +149,33 @@ oracle() {
             if (wait_queue_imports != 1 || waker_queue_fields != 1 ||
                 waiter_queue_fields != 1 || waker_queue_constructors != 1 ||
                 waiter_queue_constructors != 1 || queue_wakes != 1 ||
-                blocking_waits != 1 || bounded_claim_receipts != 1 ||
+                blocking_waits != 1 ||
                 !(release_publish < queue_wake &&
                 queue_wake < blocking_wait) || helper_yields != 0)
                 fail("startup handshake is not a blocking publish-before-wake wait queue")
-            if (wait_captures != 1 || waiter_guest_blocks != 1 ||
+            if (startup_runner_helpers != 1 || startup_preempt_guards != 1 ||
+                startup_task_runs != 1 || startup_guard_drops != 1 ||
+                startup_blocking_waits != 1 ||
+                !(startup_preempt_guard < startup_task_run &&
+                startup_task_run < startup_guard_drop &&
+                startup_guard_drop < startup_blocking_wait) ||
+                startup_task_run != startup_preempt_guard + 1 ||
+                startup_guard_drop != startup_task_run + 1 ||
+                startup_blocking_wait != startup_guard_drop + 1)
+                fail("startup task can preempt before the parent reaches its blocking wait")
+            if (waiter_task_entries != 1 || waker_task_entries != 1 ||
+                wait_captures != 1 || waiter_guest_blocks != 1 ||
                 enable_waker_registrations != 1 || waker_guest_blocks != 1 ||
-                !(wait_capture < waiter_guest_block &&
+                !(waiter_task_entry < wait_capture &&
+                  wait_capture < waiter_guest_block &&
                   waiter_guest_block < waiter_publish &&
+                  waker_task_entry < enable_waker_registration &&
                   enable_waker_registration < waker_guest_block &&
                   waker_guest_block < waker_publish))
                 fail("startup readiness is published before the guest prerequisite receipt")
             if (waker_ready_calls != 1 || wait_captured_calls != 1)
                 fail("startup stages are not each invoked exactly once")
-            if (!(staged_waker_run < waker_ready &&
-                  waker_ready < staged_waiter_run &&
-                  staged_waiter_run < wait_captured &&
+            if (!(waker_ready < wait_captured &&
                   wait_captured < v1_run &&
                   v1_run < watchdog_run))
                 fail("Expire startup order is not waker-ready, waiter-captured, v1, watchdog")
@@ -159,7 +189,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 awk '
-    !removed && $0 == "            wait_for_expire_startup(&scenario, ExpireStartupStage::WakerReady);" {
+    !removed && $0 == "            run_expire_startup_task(&waker_task, &scenario, ExpireStartupStage::WakerReady);" {
         removed = 1
         next
     }
@@ -171,10 +201,10 @@ if oracle "$work/missing-waker-ready.rs" >/dev/null 2>&1; then
 fi
 
 awk '
-    $0 == "            wait_for_expire_startup(&scenario, ExpireStartupStage::WakerReady);" {
+    $0 == "            run_expire_startup_task(&waker_task, &scenario, ExpireStartupStage::WakerReady);" {
         sub(/WakerReady/, "Swapping")
     }
-    $0 == "            wait_for_expire_startup(&scenario, ExpireStartupStage::WaitCaptured);" {
+    $0 == "            run_expire_startup_task(&waiter_task, &scenario, ExpireStartupStage::WaitCaptured);" {
         sub(/WaitCaptured/, "WakerReady")
     }
     { lines[NR] = $0 }
@@ -189,10 +219,10 @@ if oracle "$work/swapped-stages.rs" >/dev/null 2>&1; then
     die "oracle accepted swapped startup stages"
 fi
 
-sed '0,/const EXPIRE_STARTUP_MAX_SUCCESS_TICKS: u64 = 128;/s//const EXPIRE_STARTUP_MAX_SUCCESS_TICKS: u64 = 0;/' \
-    "$source_file" >"$work/unbounded-deadline.rs"
-if oracle "$work/unbounded-deadline.rs" >/dev/null 2>&1; then
-    die "oracle accepted a missing startup deadline"
+sed '0,/timing=diagnostic/s//timing=bounded/' \
+    "$source_file" >"$work/overclaimed-startup-timing.rs"
+if oracle "$work/overclaimed-startup-timing.rs" >/dev/null 2>&1; then
+    die "oracle accepted an unsupported bounded startup-timing claim"
 fi
 
 sed '0,/ready\.load(Ordering::Acquire)/s//ready.load(Ordering::Relaxed)/' \
@@ -263,4 +293,60 @@ if oracle "$work/overclaimed-failure-bound.rs" >/dev/null 2>&1; then
     die "oracle accepted a guest-side failure bound not enforced by WaitQueue"
 fi
 
-echo "Linux futex startup source assertions: PASS expire_only=true order=waker-ready+wait-captured+v1+watchdog publication_order=guest-prerequisite-before-ready readiness=release+acquire handshake=blocking-wait-queue success_latency_checked=true max_success_wait_ticks=128 failure_bound=outer-qemu-timeout mutations=9"
+awk '
+    !removed && $0 == "    let preempt_guard = disable_preempt();" {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+' "$source_file" >"$work/missing-spawn-preempt-guard.rs"
+if oracle "$work/missing-spawn-preempt-guard.rs" >/dev/null 2>&1; then
+    die "oracle accepted an unguarded Task::run spawn window"
+fi
+
+awk '
+    $0 == "    task.run();" {
+        print "    drop(preempt_guard);"
+        print
+        swapped = 1
+        next
+    }
+    $0 == "    drop(preempt_guard);" {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!swapped || !removed) exit 2 }
+' "$source_file" >"$work/drop-guard-before-run.rs"
+if oracle "$work/drop-guard-before-run.rs" >/dev/null 2>&1; then
+    die "oracle accepted dropping the preemption guard before Task::run"
+fi
+
+awk '
+    $0 == "    drop(preempt_guard);" {
+        print
+        print "    Task::yield_now();"
+        injected = 1
+        next
+    }
+    { print }
+    END { if (!injected) exit 2 }
+' "$source_file" >"$work/preempt-point-before-wait.rs"
+if oracle "$work/preempt-point-before-wait.rs" >/dev/null 2>&1; then
+    die "oracle accepted an explicit preemption point between guard drop and blocking wait"
+fi
+
+awk '
+    !removed && index($0, "\"LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=waker-ready role=waker task={}") > 0 {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+' "$source_file" >"$work/missing-waker-task-entry.rs"
+if oracle "$work/missing-waker-task-entry.rs" >/dev/null 2>&1; then
+    die "oracle accepted a missing waker TaskEntry source receipt"
+fi
+
+echo "Linux futex startup source assertions: PASS expire_only=true order=waker-ready+wait-captured+v1+watchdog task_entries=2 publication_order=guest-prerequisite-before-ready readiness=release+acquire handshake=blocking-wait-queue spawn_preemption=disabled-through-run timing=diagnostic internal_timeout=false failure_bound=outer-qemu-timeout mutations=13"
