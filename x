@@ -126,12 +126,24 @@ run_xtask() {
     local command=$1
     shift
     local -a token_environment=()
+    local -a git_mount=()
+    local git_common_dir
     if [[ $command == begin || $command == complete || $command == manifest ]]; then
         if [[ ! ${verify_token:-} =~ ^[0-9a-f]{64}$ ]]; then
             echo "internal verification token is unavailable for $command" >&2
             exit 1
         fi
         token_environment=(--env "NEXUS_VERIFY_TOKEN=$verify_token")
+    fi
+    if [[ -f "$root/.git" ]]; then
+        if ! git_common_dir=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir) ||
+            [[ ! -d $git_common_dir || $git_common_dir == *:* ]]; then
+            echo "cannot resolve a mountable Git common directory for linked worktree: $root" >&2
+            exit 1
+        fi
+        git_mount=(
+            --volume "$git_common_dir:$git_common_dir:ro,z"
+        )
     fi
     ensure_image
     docker run --rm \
@@ -146,6 +158,7 @@ run_xtask() {
         --env "NEXUS_VERIFY_INVOCATION=${NEXUS_VERIFY_INVOCATION:-}" \
         "${token_environment[@]}" \
         --volume "$root:/work:z" \
+        "${git_mount[@]}" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         --mount "type=bind,source=$root/tools/xtask/Cargo.lock,target=/work/tools/xtask/Cargo.lock,readonly" \
         --workdir /work \

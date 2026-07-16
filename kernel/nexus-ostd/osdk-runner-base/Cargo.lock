@@ -330,6 +330,7 @@ dependencies = [
  "nexus-ostd-virtio",
  "object",
  "ostd",
+ "spin",
  "x86",
 ]
 

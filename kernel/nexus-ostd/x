@@ -529,6 +529,11 @@ doctor() {
         "$root/scripts/assert-linux-io-composition.sh" \
         "$root/scripts/assert-linux-net.awk" \
         "$root/scripts/assert-runtime-net-artifacts.sh" \
+        "$root/scripts/assert-linux-futex-entry-debugcon.sh" \
+        "$root/scripts/assert-linux-futex-startup.sh" \
+        "$root/scripts/assert-linux-futex-startup-source.sh" \
+        "$root/scripts/assert-stream-capture.sh" \
+        "$root/scripts/qemu-stream-capture.sh" \
         "$root/scripts/build-guest.sh" \
         "$root/scripts/build-runtime-fs-block-image.sh" \
         "$root/scripts/assert-runtime-fs-block-image.sh" \
@@ -648,7 +653,9 @@ check_runtime_fs_same_boot_precommit_source() {
 
 check_linux_futex_startup_source() {
     bash "$root/scripts/assert-linux-futex-startup-source.sh" \
-        "$root/src/personality/linux_futex.rs"
+        "$root/src/personality/linux_futex.rs" \
+        "$root/src/lib.rs" \
+        "$root/OSDK.toml"
 }
 
 check_runtime_net_artifact_negatives() {
@@ -805,6 +812,36 @@ run_kernel() {
     assert_runner_base
 }
 
+standard_artifact_dir="$root/artifacts"
+standard_debugcon_raw="$standard_artifact_dir/task-entry-debugcon.log"
+standard_debugcon_scratch="$standard_artifact_dir/task-entry-debugcon-scratch.log"
+standard_debugcon_oracle="$standard_artifact_dir/task-entry-debugcon-oracle.log"
+
+prepare_standard_artifacts() {
+    mkdir -p "$standard_artifact_dir"
+    rm -f \
+        "$standard_artifact_dir/serial.log" \
+        "$standard_artifact_dir/qemu-debug.log" \
+        "$standard_debugcon_raw" \
+        "$standard_debugcon_scratch" \
+        "$standard_debugcon_oracle"
+}
+
+capture_standard_run() {
+    # shellcheck source=scripts/qemu-stream-capture.sh
+    source "$root/scripts/qemu-stream-capture.sh"
+    capture_qemu_streams \
+        "$standard_artifact_dir/serial.log" \
+        "$standard_artifact_dir/qemu-debug.log" \
+        run_kernel
+    if [[ ! -f $standard_debugcon_scratch || -L $standard_debugcon_scratch ]]; then
+        echo "standard QEMU run did not produce a regular entry debugcon stream: $standard_debugcon_scratch" >&2
+        return 1
+    fi
+    mv -- "$standard_debugcon_scratch" "$standard_debugcon_raw"
+    echo 'QEMU_CAPTURE PASS profile=standard live_replay=false serial=artifacts/serial.log debug=artifacts/qemu-debug.log'
+}
+
 run_same_boot_kernel() {
     # Keep compilation outside the runtime deadline and verify the immutable
     # block fixture on both sides of the QEMU execution. Hosted TCG can exhibit
@@ -847,6 +884,8 @@ prepare_same_boot_artifacts() {
     rm -f \
         "$same_boot_artifact_dir/serial.log" \
         "$same_boot_artifact_dir/qemu-debug.log" \
+        "$same_boot_artifact_dir/task-entry-debugcon.log" \
+        "$same_boot_artifact_dir/task-entry-debugcon-oracle.log" \
         "$same_boot_artifact_dir/oracle.log"
 }
 
@@ -899,6 +938,8 @@ prepare_same_boot_precommit_artifacts() {
     rm -f \
         "$same_boot_precommit_artifact_dir/serial.log" \
         "$same_boot_precommit_artifact_dir/qemu-debug.log" \
+        "$same_boot_precommit_artifact_dir/task-entry-debugcon.log" \
+        "$same_boot_precommit_artifact_dir/task-entry-debugcon-oracle.log" \
         "$same_boot_precommit_artifact_dir/oracle.log"
 }
 
@@ -975,6 +1016,7 @@ eval_stage7b() {
         echo "Stage 7B evaluator failed with status $status" >&2
         return "$status"
     fi
+    rm -f "$standard_debugcon_scratch"
     tr -d '\r' <"$serial" \
         | grep -Fx 'STAGE7B_EVALUATION PASS faults=20 scale_points=14 performance_cases=29' \
             >/dev/null
@@ -1047,8 +1089,8 @@ case "$command" in
     run)
         ensure_image
         prepare_guest
-        mkdir -p "$root/artifacts"
-        run_kernel | tee "$root/artifacts/serial.log"
+        prepare_standard_artifacts
+        capture_standard_run
         ;;
     run-same-boot)
         ensure_image
@@ -1070,9 +1112,12 @@ case "$command" in
         prepare_guest
         check_runtime_fs_artifact_negatives
         check_runtime_net_artifact_negatives
-        mkdir -p "$root/artifacts"
+        prepare_standard_artifacts
         container bash scripts/check-iotlb-gap.sh
-        run_kernel | tee "$root/artifacts/serial.log"
+        capture_standard_run
+        bash "$root/scripts/assert-linux-futex-entry-debugcon.sh" \
+            "$standard_debugcon_raw" 2>&1 \
+            | tee "$standard_debugcon_oracle"
         bash "$root/scripts/assert-linux-futex-startup.sh" \
             "$root/artifacts/serial.log"
         "$root/scripts/assert-serial.sh" "$root/artifacts/serial.log"
@@ -1179,6 +1224,9 @@ case "$command" in
         bash "$root/scripts/assert-stream-capture.sh"
         prepare_same_boot_artifacts
         capture_same_boot_run
+        bash "$root/scripts/assert-linux-futex-entry-debugcon.sh" \
+            "$same_boot_artifact_dir/task-entry-debugcon.log" 2>&1 \
+            | tee "$same_boot_artifact_dir/task-entry-debugcon-oracle.log"
         bash "$root/scripts/assert-linux-futex-startup.sh" \
             "$same_boot_artifact_dir/serial.log"
         bash "$root/scripts/assert-runtime-fs-same-boot.sh" \
@@ -1198,6 +1246,9 @@ case "$command" in
         bash "$root/scripts/assert-stream-capture.sh"
         prepare_same_boot_precommit_artifacts
         capture_same_boot_precommit_run
+        bash "$root/scripts/assert-linux-futex-entry-debugcon.sh" \
+            "$same_boot_precommit_artifact_dir/task-entry-debugcon.log" 2>&1 \
+            | tee "$same_boot_precommit_artifact_dir/task-entry-debugcon-oracle.log"
         bash "$root/scripts/assert-linux-futex-startup.sh" \
             "$same_boot_precommit_artifact_dir/serial.log"
         bash "$root/scripts/assert-runtime-fs-same-boot-precommit.sh" \

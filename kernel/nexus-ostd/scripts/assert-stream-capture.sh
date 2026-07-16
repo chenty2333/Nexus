@@ -110,6 +110,26 @@ if [[ $(<"$work/partial-serial.log") != 'serial-without-newline' ]] ||
     exit 1
 fi
 
+setup_failure_tmp="$work/setup-failure-tmp"
+setup_failure_marker="$work/setup-failure-target-called"
+mkdir "$setup_failure_tmp"
+setup_failure_fixture() {
+    : >"$setup_failure_marker"
+    fixture
+}
+set +e
+TMPDIR="$setup_failure_tmp" capture_qemu_streams \
+    "$work/missing/serial.log" "$work/setup-failure-debug.log" \
+    setup_failure_fixture >/dev/null 2>&1
+setup_failure_status=$?
+set -e
+if [[ "$setup_failure_status" -eq 0 ]] ||
+    [[ -e $setup_failure_marker ]] ||
+    compgen -G "$setup_failure_tmp/*" >/dev/null; then
+    echo 'split capture ran its target or leaked temporary state after log setup failed' >&2
+    exit 1
+fi
+
 long_fixture() {
     head -c 131072 /dev/zero | tr '\0' S
     printf '\n'
@@ -179,4 +199,4 @@ if [[ "$long_failure_status" -ne 24 ]] ||
     exit 1
 fi
 
-echo 'QEMU split-stream capture assertions: PASS legacy_byte_interleave=reproduced raw_inputs_isolated=true live_replay=false failure_tail_bytes=65536 errexit=preserved partial=preserved long_record=preserved live_capture_backpressure=isolated'
+echo 'QEMU split-stream capture assertions: PASS legacy_byte_interleave=reproduced raw_inputs_isolated=true live_replay=false failure_tail_bytes=65536 errexit=preserved partial=preserved setup_failure_cleanup=true setup_failure_target=false long_record=preserved caller_backpressure=isolated'

@@ -117,72 +117,37 @@ oracle() {
             watchdog_pick_line = NR
         }
     }
-    /^LINUX_FUTEX_STARTUP PreSwitch scenario=expire / {
-        if (wait_captured_count == 1)
-            fail("pre-switch diagnostic escaped the two-handshake staging window")
-        if (NF != 5 || $4 !~ /^physical_task=/ ||
-            $5 != "phase=after-grace-before-kstack")
-            fail("malformed pre-switch diagnostic: " $0)
-        last_pre_switch_task = decimal(field("physical_task"), "pre-switch physical task")
-        pre_switch_count++
-        last_pre_switch_line = NR
-        last_switch_diagnostic_line = NR
-    }
-    /^LINUX_FUTEX_STARTUP PostSwitch scenario=expire / {
-        if (wait_captured_count == 1)
-            fail("post-switch diagnostic escaped the two-handshake staging window")
-        if (NF != 6 || $4 !~ /^task=/ ||
-            $5 !~ /^phase=(before-vm-activate|after-vm-activate)$/ ||
-            $6 !~ /^vm=(regular|dynamic|none)$/)
-            fail("malformed post-switch diagnostic: " $0)
-        task = decimal(field("task"), "post-switch task")
-        phase = field("phase")
-        vm = field("vm")
-        last_switch_diagnostic_line = NR
-        if ((decimal_equal(task, "511") || decimal_equal(task, "510")) && vm != "regular")
-            fail("guest prerequisite switched without its regular VM: " $0)
-        if (decimal_equal(task, "511") && phase == "before-vm-activate") {
-            if (!decimal_equal(last_pre_switch_task, "200"))
-                fail("waker switch did not leave the physical parent: " $0)
-            waker_post_before_count++
-            waker_post_before_line = NR
-            waker_pre_switch_line = last_pre_switch_line
-        } else if (decimal_equal(task, "511") && phase == "after-vm-activate") {
-            waker_post_after_count++
-            waker_post_after_line = NR
-        } else if (decimal_equal(task, "510") && phase == "before-vm-activate") {
-            if (!decimal_equal(last_pre_switch_task, "200"))
-                fail("waiter switch did not leave the physical parent: " $0)
-            waiter_post_before_count++
-            waiter_post_before_line = NR
-            waiter_pre_switch_line = last_pre_switch_line
-        } else if (decimal_equal(task, "510") && phase == "after-vm-activate") {
-            waiter_post_after_count++
-            waiter_post_after_line = NR
-        } else if (phase !~ /^(before-vm-activate|after-vm-activate)$/) {
-            fail("unknown post-switch phase: " $0)
-        }
+    /^LINUX_FUTEX_STARTUP (PreSwitch|PostSwitch) scenario=expire / {
+        fail("switch-critical path emitted a serial diagnostic: " $0)
     }
     /^LINUX_FUTEX_STARTUP TaskEntry scenario=expire / {
-        if (NF != 6 || $2 != "TaskEntry" || $3 != "scenario=expire" ||
+        if (NF != 14 || $2 != "TaskEntry" || $3 != "scenario=expire" ||
             $4 !~ /^stage=(waker-ready|wait-captured|effect-driver|closure-watchdog)$/ ||
-            $5 !~ /^role=(waker|waiter|personality-v1|watchdog)$/ || $6 !~ /^task=/)
+            $5 !~ /^role=(waker|waiter|personality-v1|watchdog)$/ || $6 !~ /^task=/ ||
+            $7 != "source=ostd-trampoline" || $8 != "post_vm_pre_irq=true" ||
+            $9 != "post_irq_entry=true" || $10 != "closure_entered=true" ||
+            $11 != "identity_validated=true" || $12 != "debugcon=true" ||
+            $13 != "reported_by=parent" ||
+            $14 !~ /^observation=(semantic-ready|completion)$/)
             fail("malformed startup task-entry receipt: " $0)
         stage = field("stage")
         role = field("role")
         task = decimal(field("task"), stage " task")
-        if (stage == "waker-ready" && role == "waker" && decimal_equal(task, "511")) {
+        observation = field("observation")
+        if (stage == "waker-ready" && role == "waker" && decimal_equal(task, "511") &&
+            observation == "semantic-ready") {
             waker_task_entry_count++
             waker_task_entry_line = NR
-        } else if (stage == "wait-captured" && role == "waiter" && decimal_equal(task, "510")) {
+        } else if (stage == "wait-captured" && role == "waiter" &&
+                   decimal_equal(task, "510") && observation == "semantic-ready") {
             waiter_task_entry_count++
             waiter_task_entry_line = NR
         } else if (stage == "effect-driver" && role == "personality-v1" &&
-                   decimal_equal(task, "512")) {
+                   decimal_equal(task, "512") && observation == "completion") {
             v1_task_entry_count++
             v1_task_entry_line = NR
         } else if (stage == "closure-watchdog" && role == "watchdog" &&
-                   decimal_equal(task, "513")) {
+                   decimal_equal(task, "513") && observation == "completion") {
             watchdog_task_entry_count++
             watchdog_task_entry_line = NR
         } else {
@@ -238,51 +203,34 @@ oracle() {
     END {
         if (failed)
             exit 1
-        if (begin_count != 1 || pre_switch_count < 2 ||
-            waker_pick_count != 1 || waiter_pick_count != 1 ||
+        if (begin_count != 1 || waker_pick_count != 1 || waiter_pick_count != 1 ||
             v1_pick_count != 1 || watchdog_pick_count != 1 ||
-            waker_post_before_count != 1 || waker_post_after_count != 1 ||
-            waiter_post_before_count != 1 || waiter_post_after_count != 1 ||
             waker_task_entry_count != 1 || v1_task_entry_count != 1 ||
             watchdog_task_entry_count != 1 ||
             waiter_task_entry_count != 1 || waker_ready_count != 1 || wait_captured_count != 1 ||
             waker_guest_block_count != 1 || waiter_guest_block_count != 1)
             fail("expected one Expire begin, task entry, child block, and receipt for each startup stage")
         if (!(begin_line < waker_pick_line &&
-              waker_pick_line < waker_pre_switch_line &&
-              waker_pre_switch_line < waker_post_before_line &&
-              waker_post_before_line < waker_post_after_line &&
-              waker_post_after_line < waker_task_entry_line &&
-              waker_post_before_line == waker_pre_switch_line + 1 &&
-              waker_post_after_line == waker_post_before_line + 1 &&
-              waker_task_entry_line == waker_post_after_line + 1 &&
-              waker_task_entry_line < waker_guest_block_line &&
-              waker_guest_block_line < waker_ready_line &&
+              waker_pick_line < waker_guest_block_line &&
+              waker_guest_block_line < waker_task_entry_line &&
+              waker_task_entry_line < waker_ready_line &&
               waker_ready_line < waiter_pick_line &&
-              waiter_pick_line < waiter_pre_switch_line &&
-              waiter_pre_switch_line < waiter_post_before_line &&
-              waiter_post_before_line < waiter_post_after_line &&
-              waiter_post_after_line < waiter_task_entry_line &&
-              waiter_post_before_line == waiter_pre_switch_line + 1 &&
-              waiter_post_after_line == waiter_post_before_line + 1 &&
-              waiter_task_entry_line == waiter_post_after_line + 1 &&
-              waiter_task_entry_line < mismatch_line &&
+              waiter_pick_line < mismatch_line &&
               mismatch_line < wait_capture_line &&
               wait_capture_line < waiter_guest_block_line &&
-              waiter_guest_block_line < wait_captured_line &&
+              waiter_guest_block_line < waiter_task_entry_line &&
+              waiter_task_entry_line < wait_captured_line &&
               wait_captured_line < v1_pick_line &&
               wait_captured_line < watchdog_pick_line &&
-              v1_pick_line < v1_task_entry_line &&
-              watchdog_pick_line < watchdog_task_entry_line &&
-              v1_task_entry_line < wait_register_line &&
-              watchdog_task_entry_line < wake_capture_line &&
+              v1_pick_line < wait_register_line &&
+              watchdog_pick_line < crash_line &&
               wait_register_line < enable_waker_line &&
               enable_waker_line < wake_capture_line &&
               wake_capture_line < crash_line &&
-              crash_line < watchdog_line))
+              crash_line < watchdog_line &&
+              watchdog_line < v1_task_entry_line &&
+              v1_task_entry_line < watchdog_task_entry_line))
             fail("startup or publish/recover receipt order is incomplete")
-        if (!(last_switch_diagnostic_line < wait_captured_line))
-            fail("switch diagnostics outlived the two-handshake staging window")
     }
 ' "$1"
 }
@@ -362,22 +310,16 @@ if oracle "$work/internal-timeout-overclaim.log" >/dev/null 2>&1; then
     die "oracle accepted an unimplemented guest-side startup timeout"
 fi
 
-awk '
-    !removed && /^LINUX_FUTEX_STARTUP PostSwitch scenario=expire task=511 phase=after-vm-activate / {
-        removed = 1
-        next
-    }
-    { print }
-    END { if (!removed) exit 2 }
-' "$serial_log" >"$work/missing-waker-vm-activation.log"
-if oracle "$work/missing-waker-vm-activation.log" >/dev/null 2>&1; then
-    die "oracle accepted TaskEntry without a completed post-switch VM activation"
+sed '0,/post_vm_pre_irq=true/s//post_vm_pre_irq=false/' \
+    "$serial_log" >"$work/missing-post-vm-boundary.log"
+if oracle "$work/missing-post-vm-boundary.log" >/dev/null 2>&1; then
+    die "oracle accepted TaskEntry without the post-VM/pre-IRQ boundary"
 fi
 
-sed '0,/PostSwitch scenario=expire task=511 phase=before-vm-activate vm=regular/s//PostSwitch scenario=expire task=511 phase=before-vm-activate vm=none/' \
-    "$serial_log" >"$work/waker-without-regular-vm.log"
-if oracle "$work/waker-without-regular-vm.log" >/dev/null 2>&1; then
-    die "oracle accepted a guest prerequisite without its regular VM"
+sed '0,/post_irq_entry=true/s//post_irq_entry=false/' \
+    "$serial_log" >"$work/missing-post-irq-boundary.log"
+if oracle "$work/missing-post-irq-boundary.log" >/dev/null 2>&1; then
+    die "oracle accepted TaskEntry without the post-IRQ trampoline boundary"
 fi
 
 awk '
@@ -392,16 +334,10 @@ if oracle "$work/unknown-selection.log" >/dev/null 2>&1; then
     die "oracle accepted an unknown startup selection cause"
 fi
 
-awk '
-    !mutated && /^LINUX_FUTEX_STARTUP PreSwitch scenario=expire physical_task=200 / {
-        sub(/physical_task=200/, "physical_task=999")
-        mutated = 1
-    }
-    { print }
-    END { if (!mutated) exit 2 }
-' "$serial_log" >"$work/wrong-physical-parent.log"
-if oracle "$work/wrong-physical-parent.log" >/dev/null 2>&1; then
-    die "oracle accepted a startup switch from the wrong physical parent"
+sed '0,/reported_by=parent/s//reported_by=child/' \
+    "$serial_log" >"$work/self-reported-entry.log"
+if oracle "$work/self-reported-entry.log" >/dev/null 2>&1; then
+    die "oracle accepted a task-body self-reported entry boundary"
 fi
 
 awk '
@@ -522,4 +458,4 @@ if oracle "$work/reordered-timing-fields.log" >/dev/null 2>&1; then
     die "oracle accepted a non-canonical startup receipt field order"
 fi
 
-echo "Linux futex staged-start assertions: PASS receipts=2 selections=4 selection_cause=explicit pre_switch=physical-parent-200 child_post_switch_vm=regular diagnostic_window=two-handshake-only task_entries=4 child_entry_blocks=2 timing=diagnostic exact_u64_decimal=true internal_timeout=false handshake=wait-queue prerequisite_spawn_preemption=disabled-through-run effect_task_spawns=batched-under-preempt-guard next_explicit_schedule=completion-wait atomic_release_and_park=false effect_entry_order=partial failure_bound=outer-qemu-timeout publish_recover_protocol=retained mutations=20"
+echo "Linux futex staged-start assertions: PASS receipts=2 selections=4 selection_cause=explicit switch_serial=false task_entries=4 entry_source=ostd-trampoline entry_boundaries=post-vm-pre-irq+post-irq-entry+closure-entered+identity-validated entry_reporter=parent child_entry_blocks=2 timing=diagnostic exact_u64_decimal=true internal_timeout=false handshake=wait-queue prerequisite_spawn_preemption=disabled-through-run effect_task_spawns=batched-under-preempt-guard next_explicit_schedule=completion-wait atomic_release_and_park=false effect_entry_order=partial failure_bound=outer-qemu-timeout publish_recover_protocol=retained mutations=20"

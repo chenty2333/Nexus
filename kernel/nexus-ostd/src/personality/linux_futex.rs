@@ -8,14 +8,18 @@
 //! unified syscall/futex registry or a general Linux futex implementation.
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use cser_transition_gates::deadline::{
     DeadlineError, DeadlineGate, DeadlineProjection, DeadlineToken,
 };
 use linux_raw_sys::general::__NR_futex;
 use ostd::{
-    arch::cpu::context::{CpuException, UserContext},
+    arch::{
+        cpu::context::{CpuException, UserContext},
+        device::io_port::WriteOnlyAccess,
+    },
+    io::IoPort,
     mm::{CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmSpace},
     prelude::*,
     sync::{SpinLock, WaitQueue},
@@ -23,6 +27,7 @@ use ostd::{
     timer::Jiffies,
     user::{ReturnReason, UserMode},
 };
+use spin::Once;
 
 use crate::{
     TaskData, USER_MAP_ADDR, create_vm_space,
@@ -63,14 +68,16 @@ const PERSONALITY_V1_PROGRAM: &[u8] = include_bytes!("../../guest/linux-futex-pe
 const PERSONALITY_V2_PROGRAM: &[u8] = include_bytes!("../../guest/linux-futex-personality-v2.bin");
 const SCHEDULER_POLICY_PROGRAM: &[u8] = include_bytes!("../../guest/linux-scheduler-policy.bin");
 
-// Diagnostic gate for the bounded two-handshake expire-startup window. The
-// global hooks still execute their Acquire load and branch, but emit no switch
-// receipts outside this staging window.
-static EXPIRE_STARTUP_SWITCH_DIAGNOSTICS: AtomicBool = AtomicBool::new(false);
+// These masks bind four first-entry boundaries without writing the serial
+// console from OSTD's IRQ-off switch path. The parent emits the semantic
+// receipt only after it observes each task's protocol-level progress.
+static EXPIRE_POST_VM_PRE_IRQ_BITS: AtomicU8 = AtomicU8::new(0);
+static EXPIRE_POST_IRQ_ENTRY_BITS: AtomicU8 = AtomicU8::new(0);
+static EXPIRE_CLOSURE_ENTERED_BITS: AtomicU8 = AtomicU8::new(0);
+static EXPIRE_IDENTITY_VALIDATED_BITS: AtomicU8 = AtomicU8::new(0);
+static EXPIRE_DEBUGCON: Once<IoPort<u8, WriteOnlyAccess>> = Once::new();
 
-pub(crate) fn expire_startup_switch_diagnostics_enabled() -> bool {
-    EXPIRE_STARTUP_SWITCH_DIAGNOSTICS.load(Ordering::Acquire)
-}
+const EXPIRE_DEBUGCON_PORT: u16 = 0xe9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScenarioKind {
@@ -91,6 +98,190 @@ impl ExpireStartupStage {
             Self::WaitCaptured => "wait-captured",
         }
     }
+
+    const fn task_entry(self) -> ExpireTaskEntry {
+        match self {
+            Self::WakerReady => ExpireTaskEntry::Waker,
+            Self::WaitCaptured => ExpireTaskEntry::Waiter,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpireTaskEntry {
+    Waiter = 0,
+    Waker = 1,
+    EffectDriver = 2,
+    ClosureWatchdog = 3,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpireEntryBoundary {
+    PostVmPreIrq = 0,
+    PostIrqEntry = 1,
+    ClosureEntered = 2,
+    IdentityValidated = 3,
+}
+
+impl ExpireTaskEntry {
+    const ALL_BITS: u8 = 0b1111;
+
+    const fn from_task_id(task_id: u64) -> Option<Self> {
+        match task_id {
+            510 => Some(Self::Waiter),
+            511 => Some(Self::Waker),
+            512 => Some(Self::EffectDriver),
+            513 => Some(Self::ClosureWatchdog),
+            _ => None,
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+
+    const fn task_id(self) -> u64 {
+        match self {
+            Self::Waiter => 510,
+            Self::Waker => 511,
+            Self::EffectDriver => 512,
+            Self::ClosureWatchdog => 513,
+        }
+    }
+
+    const fn stage(self) -> &'static str {
+        match self {
+            Self::Waiter => "wait-captured",
+            Self::Waker => "waker-ready",
+            Self::EffectDriver => "effect-driver",
+            Self::ClosureWatchdog => "closure-watchdog",
+        }
+    }
+
+    const fn role(self) -> &'static str {
+        match self {
+            Self::Waiter => "waiter",
+            Self::Waker => "waker",
+            Self::EffectDriver => "personality-v1",
+            Self::ClosureWatchdog => "watchdog",
+        }
+    }
+}
+
+fn emit_expire_debugcon(entry: ExpireTaskEntry, boundary: ExpireEntryBoundary) {
+    let debugcon = EXPIRE_DEBUGCON
+        .get()
+        .expect("Expire entry debugcon must be acquired before task admission");
+    let code = (boundary as u8) * 4 + entry as u8;
+    let byte = if code < 10 {
+        b'0' + code
+    } else {
+        b'a' + (code - 10)
+    };
+    debugcon.write(byte);
+}
+
+pub(crate) fn init_expire_debugcon() {
+    EXPIRE_DEBUGCON.call_once(|| {
+        IoPort::acquire(EXPIRE_DEBUGCON_PORT).expect("acquire Expire entry debugcon port")
+    });
+}
+
+pub(crate) fn record_expire_post_vm_pre_irq(task_id: u64) {
+    let Some(entry) = ExpireTaskEntry::from_task_id(task_id) else {
+        return;
+    };
+    let previous = EXPIRE_POST_VM_PRE_IRQ_BITS.fetch_or(entry.bit(), Ordering::Release);
+    if previous & entry.bit() == 0 {
+        emit_expire_debugcon(entry, ExpireEntryBoundary::PostVmPreIrq);
+    }
+}
+
+pub(crate) fn record_expire_post_irq_entry(task_id: u64) {
+    let Some(entry) = ExpireTaskEntry::from_task_id(task_id) else {
+        return;
+    };
+    assert_ne!(
+        EXPIRE_POST_VM_PRE_IRQ_BITS.load(Ordering::Acquire) & entry.bit(),
+        0,
+        "OSTD task entry must follow post-switch VM activation"
+    );
+    let previous = EXPIRE_POST_IRQ_ENTRY_BITS.fetch_or(entry.bit(), Ordering::Release);
+    assert_eq!(
+        previous & entry.bit(),
+        0,
+        "OSTD first-task-entry hook must publish each task exactly once"
+    );
+    emit_expire_debugcon(entry, ExpireEntryBoundary::PostIrqEntry);
+}
+
+fn mark_expire_closure_entered(entry: ExpireTaskEntry) {
+    assert_ne!(
+        EXPIRE_POST_IRQ_ENTRY_BITS.load(Ordering::Acquire) & entry.bit(),
+        0,
+        "Nexus task closure must follow its OSTD trampoline entry"
+    );
+    let previous = EXPIRE_CLOSURE_ENTERED_BITS.fetch_or(entry.bit(), Ordering::Release);
+    assert_eq!(
+        previous & entry.bit(),
+        0,
+        "each bounded Expire task closure must start exactly once"
+    );
+    emit_expire_debugcon(entry, ExpireEntryBoundary::ClosureEntered);
+}
+
+fn mark_expire_identity_validated(entry: ExpireTaskEntry) {
+    assert_ne!(
+        EXPIRE_CLOSURE_ENTERED_BITS.load(Ordering::Acquire) & entry.bit(),
+        0,
+        "task identity validation must follow closure entry"
+    );
+    let previous = EXPIRE_IDENTITY_VALIDATED_BITS.fetch_or(entry.bit(), Ordering::Release);
+    assert_eq!(
+        previous & entry.bit(),
+        0,
+        "each bounded Expire task identity must validate exactly once"
+    );
+    emit_expire_debugcon(entry, ExpireEntryBoundary::IdentityValidated);
+}
+
+fn report_expire_task_entry(entry: ExpireTaskEntry, observation: &'static str) {
+    let bit = entry.bit();
+    assert_ne!(EXPIRE_POST_VM_PRE_IRQ_BITS.load(Ordering::Acquire) & bit, 0);
+    assert_ne!(EXPIRE_POST_IRQ_ENTRY_BITS.load(Ordering::Acquire) & bit, 0);
+    assert_ne!(EXPIRE_CLOSURE_ENTERED_BITS.load(Ordering::Acquire) & bit, 0);
+    assert_ne!(
+        EXPIRE_IDENTITY_VALIDATED_BITS.load(Ordering::Acquire) & bit,
+        0
+    );
+    println!(
+        "LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage={} role={} task={} source=ostd-trampoline post_vm_pre_irq=true post_irq_entry=true closure_entered=true identity_validated=true debugcon=true reported_by=parent observation={}",
+        entry.stage(),
+        entry.role(),
+        entry.task_id(),
+        observation,
+    );
+}
+
+fn assert_expire_task_entry_receipts_complete() {
+    assert_eq!(
+        EXPIRE_POST_VM_PRE_IRQ_BITS.load(Ordering::Acquire),
+        ExpireTaskEntry::ALL_BITS
+    );
+    assert_eq!(
+        EXPIRE_POST_IRQ_ENTRY_BITS.load(Ordering::Acquire),
+        ExpireTaskEntry::ALL_BITS
+    );
+    assert_eq!(
+        EXPIRE_CLOSURE_ENTERED_BITS.load(Ordering::Acquire),
+        ExpireTaskEntry::ALL_BITS
+    );
+    assert_eq!(
+        EXPIRE_IDENTITY_VALIDATED_BITS.load(Ordering::Acquire),
+        ExpireTaskEntry::ALL_BITS
+    );
 }
 
 impl ScenarioKind {
@@ -1711,12 +1902,12 @@ fn create_shared_guest_vm() -> Arc<VmSpace> {
 }
 
 fn run_guest_waiter(scenario: Arc<FutexScenario>, vm_space: Arc<VmSpace>) {
+    if scenario.kind == ScenarioKind::Expire {
+        mark_expire_closure_entered(ExpireTaskEntry::Waiter);
+    }
     assert_current_user_task(scenario.kind.waiter_task_id(), &vm_space);
     if scenario.kind == ScenarioKind::Expire {
-        println!(
-            "LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=wait-captured role=waiter task={}",
-            scenario.kind.waiter_task_id(),
-        );
+        mark_expire_identity_validated(ExpireTaskEntry::Waiter);
     }
     vm_space.activate();
     let mut context = UserContext::default();
@@ -1791,12 +1982,12 @@ fn run_guest_waiter(scenario: Arc<FutexScenario>, vm_space: Arc<VmSpace>) {
 }
 
 fn run_guest_waker(scenario: Arc<FutexScenario>, vm_space: Arc<VmSpace>) {
+    if scenario.kind == ScenarioKind::Expire {
+        mark_expire_closure_entered(ExpireTaskEntry::Waker);
+    }
     assert_current_user_task(scenario.kind.waker_task_id(), &vm_space);
     if scenario.kind == ScenarioKind::Expire {
-        println!(
-            "LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=waker-ready role=waker task={}",
-            scenario.kind.waker_task_id(),
-        );
+        mark_expire_identity_validated(ExpireTaskEntry::Waker);
     }
     vm_space.activate();
     let mut context = UserContext::default();
@@ -1869,12 +2060,12 @@ fn run_guest_waker(scenario: Arc<FutexScenario>, vm_space: Arc<VmSpace>) {
 }
 
 fn run_personality_v1(scenario: Arc<FutexScenario>, vm_space: Arc<VmSpace>) {
+    if scenario.kind == ScenarioKind::Expire {
+        mark_expire_closure_entered(ExpireTaskEntry::EffectDriver);
+    }
     assert_current_user_task(scenario.kind.personality_v1_task_id(), &vm_space);
     if scenario.kind == ScenarioKind::Expire {
-        println!(
-            "LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=effect-driver role=personality-v1 task={}",
-            scenario.kind.personality_v1_task_id(),
-        );
+        mark_expire_identity_validated(ExpireTaskEntry::EffectDriver);
     }
     while !scenario.wait_is_captured() {
         Task::yield_now();
@@ -2148,12 +2339,12 @@ fn run_watchdog(
     old_personality_task: Arc<Task>,
     old_personality_vm: Arc<VmSpace>,
 ) {
+    if scenario.kind == ScenarioKind::Expire {
+        mark_expire_closure_entered(ExpireTaskEntry::ClosureWatchdog);
+    }
     assert_current_kernel_task(scenario.kind.watchdog_task_id());
     if scenario.kind == ScenarioKind::Expire {
-        println!(
-            "LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=closure-watchdog role=watchdog task={}",
-            scenario.kind.watchdog_task_id(),
-        );
+        mark_expire_identity_validated(ExpireTaskEntry::ClosureWatchdog);
     }
     while !scenario.has_crashed() {
         Task::yield_now();
@@ -2213,6 +2404,7 @@ fn wait_for_expire_startup(scenario: &FutexScenario, stage: ExpireStartupStage) 
         ExpireStartupStage::WakerReady => scenario.enable_waker_is_registered(),
         ExpireStartupStage::WaitCaptured => scenario.wait_is_captured(),
     });
+    report_expire_task_entry(stage.task_entry(), "semantic-ready");
     let waited = observed
         .checked_sub(start)
         .expect("the scheduler clock must not move backwards");
@@ -2251,6 +2443,9 @@ fn run_expire_effect_tasks_and_wait(
     watchdog_task.run();
     drop(effect_preempt_guard);
     done_waiter.wait();
+    report_expire_task_entry(ExpireTaskEntry::EffectDriver, "completion");
+    report_expire_task_entry(ExpireTaskEntry::ClosureWatchdog, "completion");
+    assert_expire_task_entry_receipts_complete();
 }
 
 fn run_scenario(
@@ -2327,12 +2522,6 @@ fn run_scenario(
         )
     });
 
-    if kind == ScenarioKind::Expire {
-        EXPIRE_STARTUP_SWITCH_DIAGNOSTICS
-            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
-            .expect("expire startup switch diagnostics must have one active window");
-    }
-
     println!(
         "LINUX_FUTEX_SCENARIO BEGIN scenario={} authority_epoch={} scope={} asid={} generation={} address={:#x} waiter={} waker={} shared_vm=true smp=1 scheduler_mode={}",
         kind.label(),
@@ -2377,9 +2566,6 @@ fn run_scenario(
             // intentionally batched before the parent waits for completion.
             run_expire_startup_task(&waker_task, &scenario, ExpireStartupStage::WakerReady);
             run_expire_startup_task(&waiter_task, &scenario, ExpireStartupStage::WaitCaptured);
-            EXPIRE_STARTUP_SWITCH_DIAGNOSTICS
-                .compare_exchange(true, false, Ordering::Release, Ordering::Relaxed)
-                .expect("expire startup switch diagnostics must close once");
             run_expire_effect_tasks_and_wait(&v1_task, &watchdog_task, &done_waiter);
         }
     }

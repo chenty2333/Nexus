@@ -1340,3 +1340,20 @@ index 6289955..3729e60 100644
 -        // FIXME: Flush IOTLBs to prevent any future DMA access to the frames.
 -    }
 -}
+diff --git a/src/task/mod.rs b/src/task/mod.rs
+--- a/src/task/mod.rs
++++ b/src/task/mod.rs
+@@ -38,0 +39,2 @@
++
++static FIRST_TASK_ENTRY_HANDLER: Once<fn()> = Once::new();
+@@ -50,0 +53,5 @@
++
++/// Injects a handler after OSTD finishes a new task's switch tail.
++pub fn inject_first_task_entry_handler(handler: fn()) {
++    FIRST_TASK_ENTRY_HANDLER.call_once(|| handler);
++}
+@@ -198,0 +206,4 @@
++
++            if let Some(handler) = FIRST_TASK_ENTRY_HANDLER.get() {
++                handler();
++            }

@@ -64,7 +64,6 @@ use effect_registry::TaskKey;
 use iommu_probe::{DmaQuiesceError, DmaQuiescer, Ostd018FailClosed};
 use ostd::{
     arch::cpu::context::{CpuException, UserContext},
-    irq::DisabledLocalIrqGuard,
     mm::{
         CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmIo, VmSpace,
     },
@@ -72,8 +71,8 @@ use ostd::{
     prelude::*,
     sync::SpinLock,
     task::{
-        Task, TaskOptions, disable_preempt, inject_post_schedule_handler,
-        inject_pre_schedule_handler, scheduler as ostd_scheduler,
+        Task, TaskOptions, disable_preempt, inject_first_task_entry_handler,
+        inject_post_schedule_handler, scheduler as ostd_scheduler,
     },
     user::{ReturnReason, UserMode},
 };
@@ -151,9 +150,10 @@ fn kernel_main_standard() {
         AUTHORITY_EPOCH,
         POLICY_LEASE_TICKS,
     )));
+    linux_futex::init_expire_debugcon();
     ostd_scheduler::inject_scheduler(scheduler);
-    inject_pre_schedule_handler(trace_expire_pre_schedule);
     inject_post_schedule_handler(activate_current_task_vm);
+    inject_first_task_entry_handler(record_current_task_entry);
 
     let binding = scheduler.binding();
     println!(
@@ -188,24 +188,6 @@ fn kernel_main_standard() {
     unreachable!("bootstrap context is not scheduled again");
 }
 
-fn trace_expire_pre_schedule(_guard: &DisabledLocalIrqGuard) {
-    if !linux_futex::expire_startup_switch_diagnostics_enabled() {
-        return;
-    }
-    let physical_task = Task::current()
-        .and_then(|current| {
-            current
-                .data()
-                .downcast_ref::<TaskData>()
-                .map(|data| data.id)
-        })
-        .expect("expire startup pre-switch receipt requires a physical current task");
-    println!(
-        "LINUX_FUTEX_STARTUP PreSwitch scenario=expire physical_task={} phase=after-grace-before-kstack",
-        physical_task,
-    );
-}
-
 fn activate_current_task_vm() {
     let Some(current) = Task::current() else {
         return;
@@ -213,31 +195,21 @@ fn activate_current_task_vm() {
     let Some(data) = current.data().downcast_ref::<TaskData>() else {
         return;
     };
-    let trace_expire_startup = linux_futex::expire_startup_switch_diagnostics_enabled();
-    let vm_kind = if data.dynamic_vm_space.is_some() {
-        "dynamic"
-    } else if data.vm_space.is_some() {
-        "regular"
-    } else {
-        "none"
-    };
-    if trace_expire_startup {
-        println!(
-            "LINUX_FUTEX_STARTUP PostSwitch scenario=expire task={} phase=before-vm-activate vm={}",
-            data.id, vm_kind,
-        );
-    }
     if let Some(vm_space) = &data.dynamic_vm_space {
         vm_space.lock().activate();
     } else if let Some(vm_space) = &data.vm_space {
         vm_space.activate();
     }
-    if trace_expire_startup {
-        println!(
-            "LINUX_FUTEX_STARTUP PostSwitch scenario=expire task={} phase=after-vm-activate vm={}",
-            data.id, vm_kind,
-        );
-    }
+    linux_futex::record_expire_post_vm_pre_irq(data.id);
+}
+
+fn record_current_task_entry() {
+    let current = Task::current().expect("OSTD task-entry hook requires a current task");
+    let data = current
+        .data()
+        .downcast_ref::<TaskData>()
+        .expect("all Nexus OSTD tasks carry TaskData");
+    linux_futex::record_expire_post_irq_entry(data.id);
 }
 
 pub(crate) fn create_vm_space(program: &[u8]) -> VmSpace {

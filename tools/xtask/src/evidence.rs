@@ -35,6 +35,7 @@ const TLA_TOOLCHAIN_SOURCE_REVISION: &str = "227f61b983d0203a06db8184da45aed421e
 const TLA_TOOLCHAIN_INSTALLED_PATH: &str = "/opt/tla2tools/tla2tools.jar";
 const TLA_TOOLCHAIN_VERSION_LINE: &str = "TLC2 Version 2026.07.09.134028 (rev: 227f61b)";
 const PLUSCAL_VERSION_LINE: &str = "pcal.trans Version 1.12 of 01 July 2024";
+const ENTRY_DEBUGCON_PASS: &str = "Linux futex entry debugcon assertions: PASS tasks=510+511+512+513 boundaries=post-vm-pre-irq+post-irq-entry+closure-entered+identity-validated encoding=single-byte-hex bytes=16 records=16 sink=isa-debugcon mutations=6";
 const TLA_TOOLCHAIN_JAR: ToolchainFileContract = ToolchainFileContract {
     path: "third_party/tlaplus/1.8.0-227f61b/tla2tools-227f61b.jar",
     bytes: 4_357_904,
@@ -547,7 +548,11 @@ fn manifest_stages(specs: &[&str]) -> Vec<Stage> {
         },
         Stage {
             id: "ostd-five-domain-composition",
-            evidence: vec![String::from("kernel/nexus-ostd/artifacts/serial.log")],
+            evidence: vec![
+                String::from("kernel/nexus-ostd/artifacts/serial.log"),
+                String::from("kernel/nexus-ostd/artifacts/task-entry-debugcon.log"),
+                String::from("kernel/nexus-ostd/artifacts/task-entry-debugcon-oracle.log"),
+            ],
         },
         Stage {
             id: "ostd-runtime-filesystem",
@@ -558,6 +563,12 @@ fn manifest_stages(specs: &[&str]) -> Vec<Stage> {
             evidence: vec![
                 String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/serial.log"),
                 String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/qemu-debug.log"),
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot/task-entry-debugcon.log",
+                ),
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot/task-entry-debugcon-oracle.log",
+                ),
                 String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/oracle.log"),
             ],
         },
@@ -569,6 +580,12 @@ fn manifest_stages(specs: &[&str]) -> Vec<Stage> {
                 ),
                 String::from(
                     "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/qemu-debug.log",
+                ),
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/task-entry-debugcon.log",
+                ),
+                String::from(
+                    "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/task-entry-debugcon-oracle.log",
                 ),
                 String::from(
                     "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/oracle.log",
@@ -1237,6 +1254,14 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
             Some("COMPOSITION_SLICE PASS"),
         ),
         (
+            String::from("kernel/nexus-ostd/artifacts/task-entry-debugcon.log"),
+            None,
+        ),
+        (
+            String::from("kernel/nexus-ostd/artifacts/task-entry-debugcon-oracle.log"),
+            Some(ENTRY_DEBUGCON_PASS),
+        ),
+        (
             String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/serial.log"),
             Some(
                 "LINUX_FS_SAME_BOOT PASS same_boot=true identity_preserving=true real_dma=true polling=true irq=false smp=1",
@@ -1245,6 +1270,18 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
         (
             String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/qemu-debug.log"),
             Some("vtd_inv_desc_iotlb_global"),
+        ),
+        (
+            String::from(
+                "kernel/nexus-ostd/artifacts/runtime-fs-same-boot/task-entry-debugcon.log",
+            ),
+            None,
+        ),
+        (
+            String::from(
+                "kernel/nexus-ostd/artifacts/runtime-fs-same-boot/task-entry-debugcon-oracle.log",
+            ),
+            Some(ENTRY_DEBUGCON_PASS),
         ),
         (
             String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/oracle.log"),
@@ -1261,6 +1298,18 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
                 "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/qemu-debug.log",
             ),
             Some("vtd_inv_desc_iotlb_global"),
+        ),
+        (
+            String::from(
+                "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/task-entry-debugcon.log",
+            ),
+            None,
+        ),
+        (
+            String::from(
+                "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/task-entry-debugcon-oracle.log",
+            ),
+            Some(ENTRY_DEBUGCON_PASS),
         ),
         (
             String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/oracle.log"),
@@ -2164,7 +2213,7 @@ mod tests {
             let path = root.join(relative);
             fs::create_dir_all(path.parent().expect("artifact parent"))
                 .expect("create artifact parent");
-            let mut contents = format!("{}\n", marker.expect("required marker"));
+            let mut contents = format!("{}\n", marker.unwrap_or("fixture raw artifact"));
             if path.to_string_lossy().ends_with("-tlc.log") {
                 contents.push_str(TLA_TOOLCHAIN_VERSION_LINE);
                 contents.push('\n');

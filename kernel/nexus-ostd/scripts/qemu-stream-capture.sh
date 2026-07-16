@@ -12,36 +12,44 @@ capture_qemu_streams() (
         echo 'usage: capture_qemu_streams SERIAL_LOG DEBUG_LOG COMMAND [ARG...]' >&2
         exit 2
     fi
+    set -e
 
     local serial_log=$1
     local debug_log=$2
     shift 2
 
-    local capture_dir
+    # EXIT traps run after function-local variables leave scope. This function
+    # already owns a subshell, so keep trap state in that isolated shell.
+    capture_dir=
+    serial_pipe=
+    debug_pipe=
+    serial_reader=
+    debug_reader=
     capture_dir=$(mktemp -d)
-    local serial_pipe="$capture_dir/serial.pipe"
-    local debug_pipe="$capture_dir/debug.pipe"
-    mkfifo "$serial_pipe" "$debug_pipe"
-    : >"$serial_log"
-    : >"$debug_log"
+    serial_pipe="$capture_dir/serial.pipe"
+    debug_pipe="$capture_dir/debug.pipe"
 
-    local serial_reader=
-    local debug_reader=
     cleanup() {
-        if [[ -n "$serial_reader" ]]; then
+        if [[ -n ${serial_reader:-} ]]; then
             kill "$serial_reader" 2>/dev/null || true
             wait "$serial_reader" 2>/dev/null || true
         fi
-        if [[ -n "$debug_reader" ]]; then
+        if [[ -n ${debug_reader:-} ]]; then
             kill "$debug_reader" 2>/dev/null || true
             wait "$debug_reader" 2>/dev/null || true
         fi
-        rm -rf "$capture_dir"
+        if [[ -n ${capture_dir:-} ]]; then
+            rm -rf "$capture_dir"
+        fi
     }
     trap cleanup EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
+
+    mkfifo "$serial_pipe" "$debug_pipe"
+    : >"$serial_log"
+    : >"$debug_log"
 
     # QEMU's stdio chardev must never inherit backpressure from the caller's
     # terminal or CI log consumer. Drain both FIFOs directly to files while

@@ -22,7 +22,7 @@ the crate-root module API:
 - OSTD: `=0.18.0` from the crates.io archive with SHA-256
   `aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1`
 - canonical MPL-2.0 OSTD overlay: `patches/ostd-0.18.0-cser.patch`, SHA-256
-  `296dd6033d77dc10d0ed90236f1f0dfb18d261ca6bc266ac5f15220f0db56bfe`
+  `8b914b775dcc52b64ccb701e3df1dc2df699a727f3f0deacdad0fdf591f8829f`
 - virtio-drivers: `=0.13.0` from the crates.io archive with SHA-256
   `cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7`
 - canonical MIT split-publication overlay:

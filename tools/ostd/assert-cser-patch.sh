@@ -2,7 +2,7 @@
 set -euo pipefail
 
 expected_archive_sha=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1
-expected_patch_sha=296dd6033d77dc10d0ed90236f1f0dfb18d261ca6bc266ac5f15220f0db56bfe
+expected_patch_sha=8b914b775dcc52b64ccb701e3df1dc2df699a727f3f0deacdad0fdf591f8829f
 archive=${NEXUS_OSTD_ARCHIVE:-/opt/nexus-source/ostd-0.18.0.crate}
 patched=${2:-${NEXUS_OSTD_PATCHED_ROOT:-/opt/nexus-ostd/ostd-0.18.0}}
 
@@ -20,6 +20,72 @@ fail() {
     exit 1
 }
 
+assert_first_task_entry_contract() {
+    local task_source=$1
+    awk '
+        $0 == "static FIRST_TASK_ENTRY_HANDLER: Once<fn()> = Once::new();" {
+            handler_statics++
+        }
+        $0 == "pub fn inject_first_task_entry_handler(handler: fn()) {" {
+            injection_apis++
+        }
+        $0 == "    FIRST_TASK_ENTRY_HANDLER.call_once(|| handler);" {
+            injection_installs++
+        }
+        $0 == "        unsafe extern \"C\" fn kernel_task_entry() -> ! {" {
+            entry_functions++
+            in_entry = 1
+        }
+        in_entry && $0 == "            unsafe { processor::after_switching_to() };" {
+            after_switch_calls++
+            after_switch_line = NR
+        }
+        in_entry && $0 == "            if let Some(handler) = FIRST_TASK_ENTRY_HANDLER.get() {" {
+            entry_handler_lookups++
+            entry_handler_lookup_line = NR
+        }
+        in_entry && $0 == "                handler();" {
+            entry_handler_calls++
+            entry_handler_call_line = NR
+        }
+        in_entry && $0 == "            let current_task = Task::current()" {
+            current_task_reads++
+            current_task_line = NR
+        }
+        in_entry && $0 == "            let task_func = unsafe { current_task.func.get() };" {
+            task_func_reads++
+            task_func_read_line = NR
+        }
+        in_entry && $0 == "                .take()" {
+            task_func_takes++
+            task_func_take_line = NR
+        }
+        in_entry && $0 == "            task_func();" {
+            task_func_calls++
+            task_func_call_line = NR
+        }
+        in_entry && $0 == "            scheduler::exit_current();" {
+            in_entry = 0
+        }
+        END {
+            if (handler_statics != 1 || injection_apis != 1 ||
+                injection_installs != 1 || entry_functions != 1 ||
+                after_switch_calls != 1 || entry_handler_lookups != 1 ||
+                entry_handler_calls != 1 || current_task_reads != 1 ||
+                task_func_reads != 1 || task_func_takes != 1 ||
+                task_func_calls != 1)
+                exit 1
+            if (!(after_switch_line < entry_handler_lookup_line &&
+                  entry_handler_lookup_line < entry_handler_call_line &&
+                  entry_handler_call_line < current_task_line &&
+                  current_task_line < task_func_read_line &&
+                  task_func_read_line < task_func_take_line &&
+                  task_func_take_line < task_func_call_line))
+                exit 1
+        }
+    ' "$task_source"
+}
+
 [[ -f $archive ]] || fail "missing upstream archive: $archive"
 [[ -f $patch_file ]] || fail "missing canonical patch: $patch_file"
 [[ -d $patched/src ]] || fail "missing patched OSTD tree: $patched"
@@ -32,14 +98,50 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 tar -xzf "$archive" -C "$tmp"
 pristine=$tmp/ostd-0.18.0
-patch --batch --forward -d "$pristine" -p1 < "$patch_file" >/dev/null \
+patch --fuzz=0 --batch --forward -d "$pristine" -p1 < "$patch_file" >/dev/null \
     || fail 'canonical patch does not apply to the pinned archive'
-patch --batch --dry-run --reverse -d "$pristine" -p1 < "$patch_file" >/dev/null \
+patch --fuzz=0 --batch --dry-run --reverse -d "$pristine" -p1 < "$patch_file" >/dev/null \
     || fail 'freshly patched tree does not reverse cleanly'
-patch --batch --dry-run --reverse -d "$patched" -p1 < "$patch_file" >/dev/null \
+patch --fuzz=0 --batch --dry-run --reverse -d "$patched" -p1 < "$patch_file" >/dev/null \
     || fail 'installed patched tree does not reverse cleanly'
 diff -ru "$pristine/src" "$patched/src" >/dev/null \
     || fail 'installed source differs from canonical patch output'
+
+task_mod=$patched/src/task/mod.rs
+assert_first_task_entry_contract "$task_mod" \
+    || fail 'first-task-entry handler is absent or outside the trampoline entry boundary'
+
+missing_entry_call=$tmp/task-missing-first-entry-call.rs
+sed \
+    '0,/if let Some(handler) = FIRST_TASK_ENTRY_HANDLER.get()/s//if let Some(handler) = None::<\&fn()>/' \
+    "$task_mod" >"$missing_entry_call"
+if assert_first_task_entry_contract "$missing_entry_call"; then
+    fail 'first-task-entry oracle accepted a deleted handler lookup'
+fi
+
+late_entry_call=$tmp/task-late-first-entry-call.rs
+awk '
+    $0 == "            if let Some(handler) = FIRST_TASK_ENTRY_HANDLER.get() {" {
+        first = $0
+        if ((getline second) <= 0 || second != "                handler();") exit 2
+        if ((getline third) <= 0 || third != "            }") exit 2
+        removed = 1
+        next
+    }
+    {
+        print
+        if (removed && !inserted && $0 == "            task_func();") {
+            print first
+            print second
+            print third
+            inserted = 1
+        }
+    }
+    END { if (!removed || !inserted) exit 2 }
+' "$task_mod" >"$late_entry_call"
+if assert_first_task_entry_contract "$late_entry_call"; then
+    fail 'first-task-entry oracle accepted a handler call after task_func'
+fi
 
 iommu=$patched/src/arch/x86/iommu/mod.rs
 registers=$patched/src/arch/x86/iommu/registers/mod.rs
@@ -132,4 +234,4 @@ grep -Fq '.checked_add(1)' "$irq_line" \
 grep -Fq '.checked_sub(1)' "$irq_line" \
     || fail 'trigger-mode release does not check underflow'
 
-echo 'canonical OSTD CSER patch: PASS archive=pinned patch=hash-bound apply=true reverse=true dma_closure=true gsi=edge+level/high+low ioapic_bits=13+15 irte_tm_bit=4 legacy=edge-high'
+echo 'canonical OSTD CSER patch: PASS archive=pinned patch=hash-bound apply=true reverse=true first_task_entry=post-switch-tail+before-func dma_closure=true gsi=edge+level/high+low ioapic_bits=13+15 irte_tm_bit=4 legacy=edge-high'

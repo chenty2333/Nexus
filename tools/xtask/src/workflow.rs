@@ -111,6 +111,7 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
 
     let frontdoor = fs::read_to_string(root.join("x"))?;
     validate_full_verify_order(&frontdoor)?;
+    validate_linked_worktree_git_mount(&frontdoor)?;
     validate_same_boot_acceptance_route(&frontdoor)?;
     validate_production_identity_route(&frontdoor)?;
     validate_image_identity_inputs(&frontdoor)?;
@@ -253,6 +254,26 @@ fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
         return Err(
             "root workflow does not restrict token injection to begin/complete/manifest".into(),
         );
+    }
+    Ok(())
+}
+
+fn validate_linked_worktree_git_mount(frontdoor: &str) -> Result<()> {
+    let body = function_body(frontdoor, "run_xtask() {")?;
+    for required in [
+        "local -a git_mount=()",
+        "if [[ -f \"$root/.git\" ]]",
+        "git -C \"$root\" rev-parse --path-format=absolute --git-common-dir",
+        "[[ ! -d $git_common_dir || $git_common_dir == *:* ]]",
+        "--volume \"$git_common_dir:$git_common_dir:ro,z\"",
+        "\"${git_mount[@]}\"",
+    ] {
+        if !body.contains(required) {
+            return Err(format!(
+                "root workflow does not preserve Git identity in linked worktrees: {required}"
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -1684,6 +1705,36 @@ verify_all() {
             .expect_err("same-boot acceptance after completion must be rejected")
             .to_string();
         assert!(error.contains("missing or out of order"));
+    }
+
+    #[test]
+    fn requires_a_read_only_linked_worktree_git_mount() {
+        let route = r#"
+run_xtask() {
+    local -a git_mount=()
+    if [[ -f "$root/.git" ]]; then
+        if ! git_common_dir=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir) ||
+            [[ ! -d $git_common_dir || $git_common_dir == *:* ]]; then
+            exit 1
+        fi
+        git_mount=(
+            --volume "$git_common_dir:$git_common_dir:ro,z"
+        )
+    fi
+    "${git_mount[@]}"
+}
+"#;
+        validate_linked_worktree_git_mount(route).expect("complete linked-worktree mount");
+
+        for broken in [
+            route.replace(":ro,z", ":z"),
+            route.replace(":ro,z", ":ro"),
+            route.replace("\"${git_mount[@]}\"", ""),
+            route.replace("--path-format=absolute --git-common-dir", "--git-dir"),
+            route.replace("if [[ -f \"$root/.git\" ]]", "if [[ -d \"$root/.git\" ]]"),
+        ] {
+            assert!(validate_linked_worktree_git_mount(&broken).is_err());
+        }
     }
 
     #[test]

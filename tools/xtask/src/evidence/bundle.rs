@@ -847,18 +847,18 @@ mod tests {
         verify_bundle_directory(&bundle, &SPECS).expect("verify complete bundle internally");
         assert_eq!(manifest.specifications.len(), 12);
         assert_eq!(manifest.stages.len(), 17);
-        assert_eq!(manifest.artifacts.len(), 52);
+        assert_eq!(manifest.artifacts.len(), 58);
         assert_eq!(
             toolchain_files(&manifest.formal_verifier.toolchain).len(),
             4
         );
 
         let files = collect_files(&bundle).expect("collect bundle files");
-        assert_eq!(files.len(), 62);
+        assert_eq!(files.len(), 68);
         let sums =
             parse_checksum_index(&fs::read(bundle.join(CHECKSUMS)).expect("read checksum index"))
                 .expect("parse checksum index");
-        assert_eq!(sums.len(), 61);
+        assert_eq!(sums.len(), 67);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -1027,6 +1027,38 @@ mod tests {
             .to_string();
         assert!(error.contains("disagree with manifest"));
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn bundle_rejects_every_entry_debugcon_mutation_with_rewritten_checksums() {
+        let artifacts = [
+            "kernel/nexus-ostd/artifacts/task-entry-debugcon.log",
+            "kernel/nexus-ostd/artifacts/task-entry-debugcon-oracle.log",
+            "kernel/nexus-ostd/artifacts/runtime-fs-same-boot/task-entry-debugcon.log",
+            "kernel/nexus-ostd/artifacts/runtime-fs-same-boot/task-entry-debugcon-oracle.log",
+            "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/task-entry-debugcon.log",
+            "kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/task-entry-debugcon-oracle.log",
+        ];
+
+        for artifact in artifacts {
+            let root = fixture();
+            write_source_fixture(&root);
+            let bundle = write_bundle(&root, &SPECS).expect("write complete bundle");
+            assert!(
+                required_artifacts(&SPECS)
+                    .iter()
+                    .any(|(path, _)| path == artifact)
+            );
+            fs::write(bundle.join(artifact), "mutated entry debugcon evidence\n")
+                .expect("mutate entry debugcon artifact");
+            rewrite_checksum_index_from_payload(&bundle);
+
+            let error = verify_bundle_directory(&bundle, &SPECS)
+                .expect_err("manifest digest must reject entry debugcon mutation")
+                .to_string();
+            assert!(error.contains("disagree with manifest"));
+            fs::remove_dir_all(root).expect("remove fixture");
+        }
     }
 
     #[test]

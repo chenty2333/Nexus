@@ -7,15 +7,17 @@ die() {
     exit 1
 }
 
-if (( $# < 1 || $# > 2 )); then
-    die "usage: $0 LINUX_FUTEX_RS [KERNEL_LIB_RS]"
+if (( $# < 1 || $# > 3 )); then
+    die "usage: $0 LINUX_FUTEX_RS [KERNEL_LIB_RS] [OSDK_TOML]"
 fi
 
 source_file=$1
 script_root=$(cd "$(dirname "$0")/.." && pwd)
 lib_file=${2:-"$script_root/src/lib.rs"}
+osdk_file=${3:-"$script_root/OSDK.toml"}
 [[ -f $source_file && ! -L $source_file ]] || die "not a regular non-symlink source: $source_file"
 [[ -f $lib_file && ! -L $lib_file ]] || die "not a regular non-symlink kernel source: $lib_file"
+[[ -f $osdk_file && ! -L $osdk_file ]] || die "not a regular non-symlink OSDK config: $osdk_file"
 
 oracle() {
     awk '
@@ -74,21 +76,106 @@ oracle() {
         /\.checked_sub\(start\)/ {
             monotonic_differences++
         }
-        index($0, "\"LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=wait-captured role=waiter task={}") > 0 {
-            waiter_task_entries++
-            waiter_task_entry = NR
+        /^static EXPIRE_POST_VM_PRE_IRQ_BITS: AtomicU8 = AtomicU8::new\(0\);$/ {
+            post_vm_masks++
         }
-        index($0, "\"LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=waker-ready role=waker task={}") > 0 {
-            waker_task_entries++
-            waker_task_entry = NR
+        /^static EXPIRE_POST_IRQ_ENTRY_BITS: AtomicU8 = AtomicU8::new\(0\);$/ {
+            post_irq_masks++
         }
-        index($0, "\"LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=effect-driver role=personality-v1 task={}") > 0 {
-            v1_task_entries++
-            v1_task_entry = NR
+        /^static EXPIRE_CLOSURE_ENTERED_BITS: AtomicU8 = AtomicU8::new\(0\);$/ {
+            closure_masks++
         }
-        index($0, "\"LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=closure-watchdog role=watchdog task={}") > 0 {
-            watchdog_task_entries++
-            watchdog_task_entry = NR
+        /^static EXPIRE_IDENTITY_VALIDATED_BITS: AtomicU8 = AtomicU8::new\(0\);$/ {
+            identity_masks++
+        }
+        /EXPIRE_POST_VM_PRE_IRQ_BITS\.fetch_or\(entry\.bit\(\), Ordering::Release\)/ {
+            post_vm_release_publishes++
+        }
+        /EXPIRE_POST_IRQ_ENTRY_BITS\.fetch_or\(entry\.bit\(\), Ordering::Release\)/ {
+            post_irq_release_publishes++
+        }
+        /EXPIRE_CLOSURE_ENTERED_BITS\.fetch_or\(entry\.bit\(\), Ordering::Release\)/ {
+            closure_release_publishes++
+        }
+        /EXPIRE_IDENTITY_VALIDATED_BITS\.fetch_or\(entry\.bit\(\), Ordering::Release\)/ {
+            identity_release_publishes++
+        }
+        /EXPIRE_POST_VM_PRE_IRQ_BITS\.load\(Ordering::Acquire\)/ {
+            post_vm_acquire_observations++
+        }
+        /EXPIRE_POST_IRQ_ENTRY_BITS\.load\(Ordering::Acquire\)/ {
+            post_irq_acquire_observations++
+        }
+        /EXPIRE_CLOSURE_ENTERED_BITS\.load\(Ordering::Acquire\)/ {
+            closure_acquire_observations++
+        }
+        /EXPIRE_IDENTITY_VALIDATED_BITS\.load\(Ordering::Acquire\)/ {
+            identity_acquire_observations++
+        }
+        /510 => Some\(Self::Waiter\),/ { waiter_mappings++ }
+        /511 => Some\(Self::Waker\),/ { waker_mappings++ }
+        /512 => Some\(Self::EffectDriver\),/ { v1_mappings++ }
+        /513 => Some\(Self::ClosureWatchdog\),/ { watchdog_mappings++ }
+        $0 == "static EXPIRE_DEBUGCON: Once<IoPort<u8, WriteOnlyAccess>> = Once::new();" {
+            debugcon_once_cells++
+        }
+        $0 == "const EXPIRE_DEBUGCON_PORT: u16 = 0xe9;" { debugcon_ports++ }
+        $0 == "    debugcon.write(byte);" {
+            debugcon_writes++
+        }
+        $0 == "    let code = (boundary as u8) * 4 + entry as u8;" {
+            debugcon_single_byte_encoders++
+        }
+        /x86::io::outb/ { forbidden_raw_debugcon_writes++ }
+        /IoPort::acquire\(EXPIRE_DEBUGCON_PORT\)/ {
+            debugcon_acquisitions++
+        }
+        index($0, "\"LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage={} role={} task={} source=ostd-trampoline post_vm_pre_irq=true post_irq_entry=true closure_entered=true identity_validated=true debugcon=true reported_by=parent observation={}") > 0 {
+            parent_task_entry_reporters++
+        }
+        $0 == "        mark_expire_closure_entered(ExpireTaskEntry::Waiter);" {
+            waiter_closure_entries++
+            waiter_closure_entry = NR
+        }
+        $0 == "        mark_expire_closure_entered(ExpireTaskEntry::Waker);" {
+            waker_closure_entries++
+            waker_closure_entry = NR
+        }
+        $0 == "        mark_expire_closure_entered(ExpireTaskEntry::EffectDriver);" {
+            v1_closure_entries++
+            v1_closure_entry = NR
+        }
+        $0 == "        mark_expire_closure_entered(ExpireTaskEntry::ClosureWatchdog);" {
+            watchdog_closure_entries++
+            watchdog_closure_entry = NR
+        }
+        $0 == "        mark_expire_identity_validated(ExpireTaskEntry::Waiter);" {
+            waiter_identity_markers++
+            waiter_identity_marker = NR
+        }
+        $0 == "        mark_expire_identity_validated(ExpireTaskEntry::Waker);" {
+            waker_identity_markers++
+            waker_identity_marker = NR
+        }
+        $0 == "        mark_expire_identity_validated(ExpireTaskEntry::EffectDriver);" {
+            v1_identity_markers++
+            v1_identity_marker = NR
+        }
+        $0 == "        mark_expire_identity_validated(ExpireTaskEntry::ClosureWatchdog);" {
+            watchdog_identity_markers++
+            watchdog_identity_marker = NR
+        }
+        $0 == "    report_expire_task_entry(stage.task_entry(), \"semantic-ready\");" {
+            semantic_ready_reports++
+        }
+        $0 == "    report_expire_task_entry(ExpireTaskEntry::EffectDriver, \"completion\");" {
+            v1_completion_reports++
+        }
+        $0 == "    report_expire_task_entry(ExpireTaskEntry::ClosureWatchdog, \"completion\");" {
+            watchdog_completion_reports++
+        }
+        $0 == "    assert_expire_task_entry_receipts_complete();" {
+            complete_entry_assertions++
         }
         $0 == "    assert_current_user_task(scenario.kind.waiter_task_id(), &vm_space);" {
             waiter_identity_asserts++
@@ -191,46 +278,6 @@ oracle() {
         $0 == "fn run_scenario(" {
             run_scenario_lines++
         }
-        $0 == "static EXPIRE_STARTUP_SWITCH_DIAGNOSTICS: AtomicBool = AtomicBool::new(false);" {
-            diagnostics_false_initializers++
-        }
-        /expire_startup_switch_diagnostics_enabled\(\) -> bool/ {
-            diagnostics_gate_readers++
-        }
-        /EXPIRE_STARTUP_SWITCH_DIAGNOSTICS\.load\(Ordering::Acquire\)/ {
-            diagnostics_acquire_reads++
-        }
-        $0 == "    if kind == ScenarioKind::Expire {" {
-            diagnostics_expire_guard_candidate = NR
-        }
-        $0 == "        EXPIRE_STARTUP_SWITCH_DIAGNOSTICS" {
-            diagnostics_open_receivers++
-            diagnostics_open_receiver = NR
-            if (NR == diagnostics_expire_guard_candidate + 1)
-                diagnostics_expire_only_openings++
-        }
-        $0 == "            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)" &&
-        NR == diagnostics_open_receiver + 1 {
-            diagnostics_open_cas++
-            diagnostics_open = NR
-        }
-        $0 == "            .expect(\"expire startup switch diagnostics must have one active window\");" &&
-        NR == diagnostics_open + 1 {
-            diagnostics_open_expects++
-        }
-        $0 == "            EXPIRE_STARTUP_SWITCH_DIAGNOSTICS" {
-            diagnostics_close_receivers++
-            diagnostics_close_receiver = NR
-        }
-        $0 == "                .compare_exchange(true, false, Ordering::Release, Ordering::Relaxed)" &&
-        NR == diagnostics_close_receiver + 1 {
-            diagnostics_close_cas++
-            diagnostics_close = NR
-        }
-        $0 == "                .expect(\"expire startup switch diagnostics must close once\");" &&
-        NR == diagnostics_close + 1 {
-            diagnostics_close_expects++
-        }
         $0 == "            run_expire_startup_task(&waker_task, &scenario, ExpireStartupStage::WakerReady);" {
             waker_ready_calls++
             waker_ready = NR
@@ -281,39 +328,57 @@ oracle() {
                 effect_guard_drop != effect_watchdog_run + 1 ||
                 effect_completion_wait != effect_guard_drop + 1)
                 fail("effect task spawns are not batched immediately before the completion wait")
-            if (waiter_task_entries != 1 || waker_task_entries != 1 ||
-                v1_task_entries != 1 || watchdog_task_entries != 1 ||
+            if (post_vm_masks != 1 || post_irq_masks != 1 ||
+                closure_masks != 1 || identity_masks != 1 ||
+                post_vm_release_publishes != 1 ||
+                post_irq_release_publishes != 1 ||
+                closure_release_publishes != 1 ||
+                identity_release_publishes != 1 ||
+                post_vm_acquire_observations < 2 ||
+                post_irq_acquire_observations < 3 ||
+                closure_acquire_observations < 3 ||
+                identity_acquire_observations < 2 ||
+                waiter_mappings != 1 || waker_mappings != 1 ||
+                v1_mappings != 1 || watchdog_mappings != 1 ||
+                debugcon_once_cells != 1 || debugcon_ports != 1 ||
+                debugcon_writes != 1 || debugcon_single_byte_encoders != 1 ||
+                debugcon_acquisitions != 1 ||
+                forbidden_raw_debugcon_writes != 0 ||
+                parent_task_entry_reporters != 1 ||
+                semantic_ready_reports != 1 ||
+                v1_completion_reports != 1 || watchdog_completion_reports != 1 ||
+                complete_entry_assertions != 1)
+                fail("entry boundary storage, ordering, debugcon, or parent receipt is incomplete")
+            if (waiter_closure_entries != 1 || waker_closure_entries != 1 ||
+                v1_closure_entries != 1 || watchdog_closure_entries != 1 ||
+                waiter_identity_markers != 1 || waker_identity_markers != 1 ||
+                v1_identity_markers != 1 || watchdog_identity_markers != 1 ||
                 waiter_identity_asserts != 1 || waker_identity_asserts != 1 ||
                 v1_identity_asserts != 1 || watchdog_identity_asserts != 1 ||
                 wait_captures != 1 || waiter_guest_blocks != 1 ||
                 enable_waker_registrations != 1 || waker_guest_blocks != 1 ||
-                !(waiter_identity_assert < waiter_task_entry &&
-                  waiter_task_entry < wait_capture &&
+                !(waiter_closure_entry < waiter_identity_assert &&
+                  waiter_identity_assert < waiter_identity_marker &&
+                  waiter_identity_marker < wait_capture &&
                   wait_capture < waiter_guest_block &&
                   waiter_guest_block < waiter_publish &&
-                  waker_identity_assert < waker_task_entry &&
-                  waker_task_entry < enable_waker_registration &&
+                  waker_closure_entry < waker_identity_assert &&
+                  waker_identity_assert < waker_identity_marker &&
+                  waker_identity_marker < enable_waker_registration &&
                   enable_waker_registration < waker_guest_block &&
                   waker_guest_block < waker_publish &&
-                  v1_identity_assert < v1_task_entry &&
-                  v1_task_entry < v1_first_work &&
-                  watchdog_identity_assert < watchdog_task_entry &&
-                  watchdog_task_entry < watchdog_first_work))
-                fail("TaskEntry is not identity-validated before the task first effect")
-            if (diagnostics_false_initializers != 1 || diagnostics_gate_readers != 1 ||
-                diagnostics_acquire_reads != 1 || diagnostics_open_receivers != 1 ||
-                diagnostics_expire_only_openings != 1 ||
-                diagnostics_open_cas != 1 || diagnostics_open_expects != 1 ||
-                diagnostics_close_receivers != 1 || diagnostics_close_cas != 1 ||
-                diagnostics_close_expects != 1)
-                fail("expire startup switch diagnostics are not one bounded acquire/release window")
+                  v1_closure_entry < v1_identity_assert &&
+                  v1_identity_assert < v1_identity_marker &&
+                  v1_identity_marker < v1_first_work &&
+                  watchdog_closure_entry < watchdog_identity_assert &&
+                  watchdog_identity_assert < watchdog_identity_marker &&
+                  watchdog_identity_marker < watchdog_first_work))
+                fail("entry boundaries are not release/acquire bound around identity validation")
             if (waker_ready_calls != 1 || wait_captured_calls != 1 ||
                 effect_runner_calls != 1)
                 fail("startup stages are not each invoked exactly once")
-            if (!(diagnostics_open < waker_ready &&
-                  waker_ready < wait_captured &&
-                  wait_captured < diagnostics_close &&
-                  diagnostics_close < effect_runner_call))
+            if (!(waker_ready < wait_captured &&
+                  wait_captured < effect_runner_call))
                 fail("Expire startup order is not waker-ready, waiter-captured, v1, watchdog")
         }
     ' "$1"
@@ -325,82 +390,101 @@ lib_oracle() {
             print "Linux futex startup lib oracle: FAIL: " message > "/dev/stderr"
             exit 1
         }
-        /inject_pre_schedule_handler\(trace_expire_pre_schedule\);/ {
-            pre_injections++
+        /inject_post_schedule_handler\(activate_current_task_vm\);/ {
+            post_injections++
         }
-        $0 == "fn trace_expire_pre_schedule(_guard: &DisabledLocalIrqGuard) {" {
-            in_pre = 1
-            pre_handlers++
+        /inject_first_task_entry_handler\(record_current_task_entry\);/ {
+            entry_injections++
         }
-        in_pre && $0 == "    if !linux_futex::expire_startup_switch_diagnostics_enabled() {" {
-            pre_negative_gate_checks++
-            pre_gate_line = NR
+        /linux_futex::init_expire_debugcon\(\);/ {
+            debugcon_initializers++
+            debugcon_initializer_line = NR
         }
-        in_pre && $0 == "        return;" && NR == pre_gate_line + 1 {
-            pre_gate_returns++
-        }
-        in_pre && index($0, "LINUX_FUTEX_STARTUP PreSwitch scenario=expire physical_task={}") > 0 {
-            pre_receipts++
-            pre_receipt_line = NR
-            in_pre = 0
+        /ostd_scheduler::inject_scheduler\(scheduler\);/ {
+            scheduler_injections++
+            scheduler_injection_line = NR
         }
         $0 == "fn activate_current_task_vm() {" {
             in_post = 1
             post_handlers++
         }
-        in_post && $0 == "    let trace_expire_startup = linux_futex::expire_startup_switch_diagnostics_enabled();" {
-            post_gate_assignments++
-            post_gate_assignment = NR
-        }
-        in_post && $0 == "    if trace_expire_startup {" {
-            post_receipt_gates++
-            if (post_before_gate == 0)
-                post_before_gate = NR
-            else
-                post_after_gate = NR
-        }
-        in_post && index($0, "LINUX_FUTEX_STARTUP PostSwitch scenario=expire task={} phase=before-vm-activate vm={}") > 0 {
-            post_before_receipts++
-            post_before_line = NR
-        }
         in_post && /vm_space\.lock\(\)\.activate\(\);/ {
             post_activation_calls++
-            if (post_first_activation_line == 0) post_first_activation_line = NR
             post_last_activation_line = NR
         }
         in_post && $0 == "        vm_space.activate();" {
             post_activation_calls++
-            if (post_first_activation_line == 0) post_first_activation_line = NR
             post_last_activation_line = NR
         }
-        in_post && index($0, "LINUX_FUTEX_STARTUP PostSwitch scenario=expire task={} phase=after-vm-activate vm={}") > 0 {
-            post_after_receipts++
-            post_after_line = NR
+        in_post && $0 == "    linux_futex::record_expire_post_vm_pre_irq(data.id);" {
+            post_vm_recorders++
+            post_vm_recorder_line = NR
             in_post = 0
         }
+        $0 == "fn record_current_task_entry() {" {
+            in_entry = 1
+            entry_handlers++
+            entry_handler_line = NR
+        }
+        in_entry && /Task::current\(\)/ {
+            current_task_reads++
+            current_task_line = NR
+        }
+        in_entry && /\.downcast_ref::<TaskData>\(\)/ {
+            task_data_downcasts++
+            task_data_line = NR
+        }
+        in_entry && $0 == "    linux_futex::record_expire_post_irq_entry(data.id);" {
+            entry_recorders++
+            entry_recorder_line = NR
+            in_entry = 0
+        }
+        /LINUX_FUTEX_STARTUP (PreSwitch|PostSwitch)/ {
+            forbidden_switch_serial++
+        }
         END {
-            if (pre_injections != 1 || pre_handlers != 1 ||
-                pre_negative_gate_checks != 1 || pre_gate_returns != 1 ||
-                pre_receipts != 1 ||
-                !(pre_gate_line < pre_receipt_line))
-                fail("pre-schedule diagnostics are not injected and gated exactly once")
-            if (post_handlers != 1 || post_gate_assignments != 1 ||
-                post_receipt_gates != 2 ||
-                post_before_receipts != 1 || post_after_receipts != 1 ||
-                post_activation_calls != 2)
-                fail("post-schedule VM diagnostics are incomplete or duplicated")
-            if (!(post_gate_assignment < post_before_gate &&
-                  post_before_gate < post_before_line &&
-                  post_before_line < post_first_activation_line &&
-                  post_last_activation_line < post_after_gate &&
-                  post_after_gate < post_after_line))
-                fail("post-schedule receipts do not bracket VM activation")
+            if (post_injections != 1 || entry_injections != 1 ||
+                debugcon_initializers != 1 || scheduler_injections != 1 ||
+                !(debugcon_initializer_line < scheduler_injection_line) ||
+                post_handlers != 1 || post_activation_calls != 2 ||
+                post_vm_recorders != 1 || forbidden_switch_serial != 0 ||
+                !(post_last_activation_line < post_vm_recorder_line))
+                fail("post-switch VM activation is not atomically recorded without serial output")
+            if (entry_handlers != 1 || current_task_reads != 1 ||
+                task_data_downcasts != 1 || entry_recorders != 1 ||
+                !(entry_handler_line < current_task_line &&
+                  current_task_line < task_data_line &&
+                  task_data_line < entry_recorder_line))
+                fail("OSTD first-task-entry injection does not identity-bind Nexus TaskData")
+        }
+    ' "$1"
+}
+
+osdk_oracle() {
+    awk '
+        /-chardev file,id=entry-debugcon,path=\/work\/artifacts\/task-entry-debugcon-scratch\.log/ {
+            standard_scratch_paths++
+        }
+        /-chardev file,id=entry-debugcon,path=\/work\/artifacts\/runtime-fs-same-boot\/task-entry-debugcon\.log/ {
+            same_boot_paths++
+        }
+        /-chardev file,id=entry-debugcon,path=\/work\/artifacts\/runtime-fs-same-boot-precommit\/task-entry-debugcon\.log/ {
+            precommit_paths++
+        }
+        /-device isa-debugcon,iobase=0xe9,chardev=entry-debugcon/ {
+            debugcon_devices++
+        }
+        END {
+            if (standard_scratch_paths != 1 || same_boot_paths != 1 ||
+                precommit_paths != 1 || debugcon_devices != 3)
+                exit 1
         }
     ' "$1"
 }
 
 oracle "$source_file"
 lib_oracle "$lib_file"
+osdk_oracle "$osdk_file" || die "OSDK profiles do not isolate the entry debugcon sink"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -555,22 +639,22 @@ if oracle "$work/preempt-point-before-wait.rs" >/dev/null 2>&1; then
     die "oracle accepted an explicit preemption point between guard drop and blocking wait"
 fi
 
-sed '0,/LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=waker-ready/s//LINUX_FUTEX_STARTUP TaskStarted scenario=expire stage=waker-ready/' \
-    "$source_file" >"$work/missing-waker-task-entry.rs"
-if oracle "$work/missing-waker-task-entry.rs" >/dev/null 2>&1; then
-    die "oracle accepted a missing waker TaskEntry source receipt"
+sed '0,/mark_expire_closure_entered(ExpireTaskEntry::Waker)/s//mark_expire_closure_entered(ExpireTaskEntry::Waiter)/' \
+    "$source_file" >"$work/wrong-waker-closure-entry.rs"
+if oracle "$work/wrong-waker-closure-entry.rs" >/dev/null 2>&1; then
+    die "oracle accepted a waker closure bound to the waiter entry identity"
 fi
 
-sed '0,/LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=effect-driver/s//LINUX_FUTEX_STARTUP TaskStarted scenario=expire stage=effect-driver/' \
-    "$source_file" >"$work/missing-v1-task-entry.rs"
-if oracle "$work/missing-v1-task-entry.rs" >/dev/null 2>&1; then
-    die "oracle accepted a missing effect-driver TaskEntry source receipt"
+sed '0,/mark_expire_identity_validated(ExpireTaskEntry::EffectDriver)/s//mark_expire_identity_validated(ExpireTaskEntry::Waiter)/' \
+    "$source_file" >"$work/wrong-v1-identity.rs"
+if oracle "$work/wrong-v1-identity.rs" >/dev/null 2>&1; then
+    die "oracle accepted a missing effect-driver identity boundary"
 fi
 
-sed '0,/LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=closure-watchdog/s//LINUX_FUTEX_STARTUP TaskStarted scenario=expire stage=closure-watchdog/' \
-    "$source_file" >"$work/missing-watchdog-task-entry.rs"
-if oracle "$work/missing-watchdog-task-entry.rs" >/dev/null 2>&1; then
-    die "oracle accepted a missing closure-watchdog TaskEntry source receipt"
+sed '0,/mark_expire_identity_validated(ExpireTaskEntry::ClosureWatchdog)/s//mark_expire_identity_validated(ExpireTaskEntry::Waiter)/' \
+    "$source_file" >"$work/wrong-watchdog-identity.rs"
+if oracle "$work/wrong-watchdog-identity.rs" >/dev/null 2>&1; then
+    die "oracle accepted a missing closure-watchdog identity boundary"
 fi
 
 awk '
@@ -618,87 +702,82 @@ if oracle "$work/preempt-point-before-completion-wait.rs" >/dev/null 2>&1; then
     die "oracle accepted an explicit preemption point before the completion wait"
 fi
 
-awk '
-    { lines[NR] = $0 }
-    END {
-        for (line = 1; line <= NR; line++) {
-            if (!mutated &&
-                lines[line] == "    if kind == ScenarioKind::Expire {" &&
-                lines[line + 1] == "        EXPIRE_STARTUP_SWITCH_DIAGNOSTICS") {
-                lines[line] = "    if true {"
-                mutated = 1
-            }
-        }
-        if (!mutated) exit 2
-        for (line = 1; line <= NR; line++) print lines[line]
-    }
-' "$source_file" >"$work/non-expire-diagnostic-open.rs"
-if oracle "$work/non-expire-diagnostic-open.rs" >/dev/null 2>&1; then
-    die "oracle accepted a diagnostic window not restricted to Expire"
+sed '0,/EXPIRE_POST_VM_PRE_IRQ_BITS.fetch_or(entry.bit(), Ordering::Release)/s/Ordering::Release/Ordering::Relaxed/' \
+    "$source_file" >"$work/relaxed-post-vm-publication.rs"
+if oracle "$work/relaxed-post-vm-publication.rs" >/dev/null 2>&1; then
+    die "oracle accepted a relaxed post-VM boundary publication"
 fi
 
 awk '
-    $0 == "        EXPIRE_STARTUP_SWITCH_DIAGNOSTICS" {
-        open_receiver = 1
-    }
-    !mutated && open_receiver &&
-    $0 == "            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)" {
-        sub(/Ordering::Release/, "Ordering::Relaxed")
-        mutated = 1
-        open_receiver = 0
+    !removed && $0 == "        mark_expire_closure_entered(ExpireTaskEntry::Waker);" {
+        held = $0
+        removed = 1
+        next
     }
     { print }
-    END { if (!mutated) exit 2 }
-' "$source_file" >"$work/relaxed-diagnostic-open.rs"
-if oracle "$work/relaxed-diagnostic-open.rs" >/dev/null 2>&1; then
-    die "oracle accepted a diagnostic window opened without Release ordering"
+    removed && !inserted &&
+    $0 == "    assert_current_user_task(scenario.kind.waker_task_id(), &vm_space);" {
+        print held
+        inserted = 1
+    }
+    END { if (!removed || !inserted) exit 2 }
+' "$source_file" >"$work/late-waker-closure-entry.rs"
+if oracle "$work/late-waker-closure-entry.rs" >/dev/null 2>&1; then
+    die "oracle accepted a closure-entry marker after identity validation began"
+fi
+
+sed '0,/const EXPIRE_DEBUGCON_PORT: u16 = 0xe9;/s/0xe9/0xe8/' \
+    "$source_file" >"$work/wrong-debugcon-port.rs"
+if oracle "$work/wrong-debugcon-port.rs" >/dev/null 2>&1; then
+    die "oracle accepted an entry marker on the wrong debugcon port"
 fi
 
 awk '
-    $0 == "            EXPIRE_STARTUP_SWITCH_DIAGNOSTICS" {
-        close_receiver = 1
-    }
-    !mutated && close_receiver &&
-    $0 == "                .compare_exchange(true, false, Ordering::Release, Ordering::Relaxed)" {
-        sub(/true, false/, "false, true")
-        mutated = 1
-        close_receiver = 0
-    }
-    { print }
-    END { if (!mutated) exit 2 }
-' "$source_file" >"$work/reversed-diagnostic-close.rs"
-if oracle "$work/reversed-diagnostic-close.rs" >/dev/null 2>&1; then
-    die "oracle accepted a diagnostic window close with reversed states"
-fi
-
-awk '
-    !removed && /inject_pre_schedule_handler\(trace_expire_pre_schedule\);/ {
+    !removed && /inject_first_task_entry_handler\(record_current_task_entry\);/ {
         removed = 1
         next
     }
     { print }
     END { if (!removed) exit 2 }
-' "$lib_file" >"$work/missing-pre-schedule-diagnostic.rs"
-if lib_oracle "$work/missing-pre-schedule-diagnostic.rs" >/dev/null 2>&1; then
-    die "oracle accepted a missing pre-schedule diagnostic injection"
+' "$lib_file" >"$work/missing-first-entry-injection.rs"
+if lib_oracle "$work/missing-first-entry-injection.rs" >/dev/null 2>&1; then
+    die "oracle accepted a missing OSTD first-task-entry injection"
 fi
 
-sed '0,/phase=after-vm-activate/s//phase=before-vm-activate/' \
-    "$lib_file" >"$work/missing-post-vm-completion.rs"
-if lib_oracle "$work/missing-post-vm-completion.rs" >/dev/null 2>&1; then
-    die "oracle accepted a post-schedule receipt that did not bracket VM activation"
+awk '
+    !removed && $0 == "    linux_futex::record_expire_post_vm_pre_irq(data.id);" {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+' "$lib_file" >"$work/missing-post-vm-recorder.rs"
+if lib_oracle "$work/missing-post-vm-recorder.rs" >/dev/null 2>&1; then
+    die "oracle accepted a post-switch path without its post-VM recorder"
 fi
 
-sed '0,/if !linux_futex::expire_startup_switch_diagnostics_enabled()/s/if !/if /' \
-    "$lib_file" >"$work/inverted-pre-schedule-gate.rs"
-if lib_oracle "$work/inverted-pre-schedule-gate.rs" >/dev/null 2>&1; then
-    die "oracle accepted an inverted pre-schedule diagnostic gate"
+awk '
+    !removed && $0 == "    linux_futex::record_expire_post_irq_entry(data.id);" {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+' "$lib_file" >"$work/missing-post-irq-recorder.rs"
+if lib_oracle "$work/missing-post-irq-recorder.rs" >/dev/null 2>&1; then
+    die "oracle accepted an OSTD hook that did not bind Nexus task identity"
 fi
 
-sed '0,/if trace_expire_startup {/s//if true {/' \
-    "$lib_file" >"$work/ungated-post-schedule-receipt.rs"
-if lib_oracle "$work/ungated-post-schedule-receipt.rs" >/dev/null 2>&1; then
-    die "oracle accepted an ungated post-schedule diagnostic receipt"
+awk '
+    !removed && /-device isa-debugcon,iobase=0xe9,chardev=entry-debugcon/ {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+' "$osdk_file" >"$work/missing-debugcon-device.toml"
+if osdk_oracle "$work/missing-debugcon-device.toml" >/dev/null 2>&1; then
+    die "oracle accepted an OSDK profile without its debugcon device"
 fi
 
-echo "Linux futex startup source assertions: PASS expire_only=true order=waker-ready+wait-captured+v1+watchdog selection_cause=explicit pre_switch=instrumented child_post_switch_vm=instrumented diagnostic_window=false-to-true-to-false+release task_entries=identity-validated-first-effect publication_order=guest-prerequisite-before-ready readiness=release+acquire handshake=blocking-wait-queue prerequisite_spawn_preemption=disabled-through-run effect_task_spawns=batched-under-preempt-guard next_explicit_schedule=completion-wait atomic_release_and_park=false timing=diagnostic internal_timeout=false failure_bound=outer-qemu-timeout tcb=ostd-0.18-task-run+park-current mutations=25"
+echo "Linux futex startup source assertions: PASS expire_only=true order=waker-ready+wait-captured+v1+watchdog selection_cause=explicit switch_path=atomic-only post_vm_pre_irq=true post_irq_trampoline=true closure_entered_before_identity=true identity_validated_before_effect=true task_entries=parent-reported debugcon=isolated publication_order=guest-prerequisite-before-ready readiness=release+acquire handshake=blocking-wait-queue prerequisite_spawn_preemption=disabled-through-run effect_task_spawns=batched-under-preempt-guard next_explicit_schedule=completion-wait atomic_release_and_park=false timing=diagnostic internal_timeout=false failure_bound=outer-qemu-timeout tcb=ostd-0.18-first-task-entry+park-current mutations=25"
