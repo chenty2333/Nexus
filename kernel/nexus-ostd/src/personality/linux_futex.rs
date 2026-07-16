@@ -2373,7 +2373,7 @@ fn run_scenario(
             // two guest prerequisites behind blocking one-shot conditions so
             // the parent leaves the run queue until each child has entered.
             // Protocol assertions for publish, crash, and watchdog closure are
-            // retained. Effect-driver and watchdog admission below is
+            // retained. Effect-driver and watchdog task spawning below is
             // intentionally batched before the parent waits for completion.
             run_expire_startup_task(&waker_task, &scenario, ExpireStartupStage::WakerReady);
             run_expire_startup_task(&waiter_task, &scenario, ExpireStartupStage::WaitCaptured);

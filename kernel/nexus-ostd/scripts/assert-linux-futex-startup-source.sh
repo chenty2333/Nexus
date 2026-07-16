@@ -200,9 +200,14 @@ oracle() {
         /EXPIRE_STARTUP_SWITCH_DIAGNOSTICS\.load\(Ordering::Acquire\)/ {
             diagnostics_acquire_reads++
         }
+        $0 == "    if kind == ScenarioKind::Expire {" {
+            diagnostics_expire_guard_candidate = NR
+        }
         $0 == "        EXPIRE_STARTUP_SWITCH_DIAGNOSTICS" {
             diagnostics_open_receivers++
             diagnostics_open_receiver = NR
+            if (NR == diagnostics_expire_guard_candidate + 1)
+                diagnostics_expire_only_openings++
         }
         $0 == "            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)" &&
         NR == diagnostics_open_receiver + 1 {
@@ -275,7 +280,7 @@ oracle() {
                 effect_watchdog_run != effect_v1_run + 1 ||
                 effect_guard_drop != effect_watchdog_run + 1 ||
                 effect_completion_wait != effect_guard_drop + 1)
-                fail("effect admissions are not batched immediately before the completion wait")
+                fail("effect task spawns are not batched immediately before the completion wait")
             if (waiter_task_entries != 1 || waker_task_entries != 1 ||
                 v1_task_entries != 1 || watchdog_task_entries != 1 ||
                 waiter_identity_asserts != 1 || waker_identity_asserts != 1 ||
@@ -297,6 +302,7 @@ oracle() {
                 fail("TaskEntry is not identity-validated before the task first effect")
             if (diagnostics_false_initializers != 1 || diagnostics_gate_readers != 1 ||
                 diagnostics_acquire_reads != 1 || diagnostics_open_receivers != 1 ||
+                diagnostics_expire_only_openings != 1 ||
                 diagnostics_open_cas != 1 || diagnostics_open_expects != 1 ||
                 diagnostics_close_receivers != 1 || diagnostics_close_cas != 1 ||
                 diagnostics_close_expects != 1)
@@ -613,6 +619,25 @@ if oracle "$work/preempt-point-before-completion-wait.rs" >/dev/null 2>&1; then
 fi
 
 awk '
+    { lines[NR] = $0 }
+    END {
+        for (line = 1; line <= NR; line++) {
+            if (!mutated &&
+                lines[line] == "    if kind == ScenarioKind::Expire {" &&
+                lines[line + 1] == "        EXPIRE_STARTUP_SWITCH_DIAGNOSTICS") {
+                lines[line] = "    if true {"
+                mutated = 1
+            }
+        }
+        if (!mutated) exit 2
+        for (line = 1; line <= NR; line++) print lines[line]
+    }
+' "$source_file" >"$work/non-expire-diagnostic-open.rs"
+if oracle "$work/non-expire-diagnostic-open.rs" >/dev/null 2>&1; then
+    die "oracle accepted a diagnostic window not restricted to Expire"
+fi
+
+awk '
     $0 == "        EXPIRE_STARTUP_SWITCH_DIAGNOSTICS" {
         open_receiver = 1
     }
@@ -676,4 +701,4 @@ if lib_oracle "$work/ungated-post-schedule-receipt.rs" >/dev/null 2>&1; then
     die "oracle accepted an ungated post-schedule diagnostic receipt"
 fi
 
-echo "Linux futex startup source assertions: PASS expire_only=true order=waker-ready+wait-captured+v1+watchdog selection_cause=explicit pre_switch=instrumented child_post_switch_vm=instrumented diagnostic_window=false-to-true-to-false+release task_entries=identity-validated-first-effect publication_order=guest-prerequisite-before-ready readiness=release+acquire handshake=blocking-wait-queue prerequisite_spawn_preemption=disabled-through-run effect_spawns=batched-under-preempt-guard next_explicit_schedule=completion-wait atomic_release_and_park=false timing=diagnostic internal_timeout=false failure_bound=outer-qemu-timeout tcb=ostd-0.18-task-run+park-current mutations=24"
+echo "Linux futex startup source assertions: PASS expire_only=true order=waker-ready+wait-captured+v1+watchdog selection_cause=explicit pre_switch=instrumented child_post_switch_vm=instrumented diagnostic_window=false-to-true-to-false+release task_entries=identity-validated-first-effect publication_order=guest-prerequisite-before-ready readiness=release+acquire handshake=blocking-wait-queue prerequisite_spawn_preemption=disabled-through-run effect_task_spawns=batched-under-preempt-guard next_explicit_schedule=completion-wait atomic_release_and_park=false timing=diagnostic internal_timeout=false failure_bound=outer-qemu-timeout tcb=ostd-0.18-task-run+park-current mutations=25"
