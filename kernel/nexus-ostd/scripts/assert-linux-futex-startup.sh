@@ -43,8 +43,12 @@ oracle() {
         begin_line = NR
     }
     /^LINUX_FUTEX_STARTUP Receipt scenario=expire / {
-        if (NF != 10 || $2 != "Receipt" || $3 != "scenario=expire" ||
-            $9 != "max_wait_ticks=128" || $10 != "bounded=true")
+        if (NF != 14 || $2 != "Receipt" || $3 != "scenario=expire" ||
+            $9 != "max_success_wait_ticks=128" ||
+            $10 != "success_latency_checked=true" ||
+            $11 != "failure_bound=outer-qemu-timeout" ||
+            $12 != "handshake=wait-queue" || $13 != "publish=release" ||
+            $14 != "observe=acquire")
             fail("malformed startup receipt: " $0)
         stage = field("stage")
         start = decimal(field("start_tick"), stage " start_tick")
@@ -63,8 +67,16 @@ oracle() {
             fail("unknown startup stage: " stage)
         }
     }
+    /^LINUX_FUTEX GuestBlock scenario=expire role=waker .* gate=EnableWaker / {
+        waker_guest_block_count++
+        waker_guest_block_line = NR
+    }
     /^LINUX_FUTEX Mismatch scenario=expire / { mismatch_line = NR }
     /^LINUX_FUTEX Capture scenario=expire kind=WAIT / { wait_capture_line = NR }
+    /^LINUX_FUTEX GuestBlock scenario=expire role=waiter .* effect=1 / {
+        waiter_guest_block_count++
+        waiter_guest_block_line = NR
+    }
     /^LINUX_FUTEX PortalResult scenario=expire action=WaitRegister .* result=Applied / {
         wait_register_line = NR
     }
@@ -77,12 +89,15 @@ oracle() {
     END {
         if (failed)
             exit 1
-        if (begin_count != 1 || waker_ready_count != 1 || wait_captured_count != 1)
-            fail("expected one Expire begin and one receipt for each startup stage")
-        if (!(begin_line < waker_ready_line &&
+        if (begin_count != 1 || waker_ready_count != 1 || wait_captured_count != 1 ||
+            waker_guest_block_count != 1 || waiter_guest_block_count != 1)
+            fail("expected one Expire begin, child-entry block, and receipt for each startup stage")
+        if (!(begin_line < waker_guest_block_line &&
+              waker_guest_block_line < waker_ready_line &&
               waker_ready_line < mismatch_line &&
               mismatch_line < wait_capture_line &&
-              wait_capture_line < wait_captured_line &&
+              wait_capture_line < waiter_guest_block_line &&
+              waiter_guest_block_line < wait_captured_line &&
               wait_captured_line < wait_register_line &&
               wait_register_line < enable_waker_line &&
               enable_waker_line < wake_capture_line &&
@@ -126,4 +141,22 @@ if oracle "$work/swapped-receipts.log" >/dev/null 2>&1; then
     die "oracle accepted swapped startup receipts"
 fi
 
-echo "Linux futex staged-start assertions: PASS receipts=2 max_wait_ticks=128 publish_recover_race=preserved mutations=2"
+sed '0,/handshake=wait-queue/s//handshake=yield-poll/' \
+    "$serial_log" >"$work/yield-poll-receipt.log"
+if oracle "$work/yield-poll-receipt.log" >/dev/null 2>&1; then
+    die "oracle accepted a yield-poll startup receipt"
+fi
+
+awk '
+    !removed && /^LINUX_FUTEX GuestBlock scenario=expire role=waker .* gate=EnableWaker / {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+' "$serial_log" >"$work/missing-waker-entry.log"
+if oracle "$work/missing-waker-entry.log" >/dev/null 2>&1; then
+    die "oracle accepted a readiness receipt without the waker child-entry block"
+fi
+
+echo "Linux futex staged-start assertions: PASS receipts=2 child_entry_blocks=2 handshake=wait-queue success_latency_checked=true max_success_wait_ticks=128 failure_bound=outer-qemu-timeout publish_recover_race=preserved mutations=4"

@@ -18,7 +18,7 @@ use ostd::{
     arch::cpu::context::{CpuException, UserContext},
     mm::{CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmSpace},
     prelude::*,
-    sync::SpinLock,
+    sync::{SpinLock, WaitQueue},
     task::{Task, TaskOptions, disable_preempt},
     timer::Jiffies,
     user::{ReturnReason, UserMode},
@@ -42,7 +42,7 @@ const FUTEX_WAKE_PRIVATE: usize = 129;
 const WAIT_OPERATION: u64 = 1;
 const WAKE_OPERATION: u64 = 2;
 const EAGAIN: isize = 11;
-const EXPIRE_STARTUP_MAX_TICKS: u64 = 128;
+const EXPIRE_STARTUP_MAX_SUCCESS_TICKS: u64 = 128;
 
 const GUEST_DONE: usize = 0x4c60_00f0;
 const PORTAL_RECV_WAIT: usize = 0x4c60_0001;
@@ -429,6 +429,8 @@ struct FutexScenario {
     guest_vm: Arc<VmSpace>,
     expire_waker_ready: AtomicBool,
     expire_waiter_ready: AtomicBool,
+    expire_waker_queue: WaitQueue,
+    expire_waiter_queue: WaitQueue,
     state: SpinLock<FutexState>,
 }
 
@@ -439,6 +441,8 @@ impl FutexScenario {
             guest_vm,
             expire_waker_ready: AtomicBool::new(false),
             expire_waiter_ready: AtomicBool::new(false),
+            expire_waker_queue: WaitQueue::new(),
+            expire_waiter_queue: WaitQueue::new(),
             state: SpinLock::new(FutexState {
                 scope_phase: ScopePhase::Active,
                 authority_epoch: AUTHORITY_EPOCH,
@@ -585,23 +589,26 @@ impl FutexScenario {
         self.state.lock().enable_waker.is_some()
     }
 
+    fn expire_startup_sync(&self, stage: ExpireStartupStage) -> (&AtomicBool, &WaitQueue) {
+        match stage {
+            ExpireStartupStage::WakerReady => (&self.expire_waker_ready, &self.expire_waker_queue),
+            ExpireStartupStage::WaitCaptured => {
+                (&self.expire_waiter_ready, &self.expire_waiter_queue)
+            }
+        }
+    }
+
     fn mark_expire_startup_ready(&self, stage: ExpireStartupStage) {
         assert_eq!(self.kind, ScenarioKind::Expire);
-        let ready = match stage {
-            ExpireStartupStage::WakerReady => &self.expire_waker_ready,
-            ExpireStartupStage::WaitCaptured => &self.expire_waiter_ready,
-        };
+        let (ready, queue) = self.expire_startup_sync(stage);
         ready
             .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
             .expect("each expire startup stage has one publisher");
-    }
-
-    fn expire_startup_is_ready(&self, stage: ExpireStartupStage) -> bool {
-        let ready = match stage {
-            ExpireStartupStage::WakerReady => &self.expire_waker_ready,
-            ExpireStartupStage::WaitCaptured => &self.expire_waiter_ready,
-        };
-        ready.load(Ordering::Acquire)
+        // A false return is valid when the Release publication wins before
+        // the parent has enqueued itself. WaitQueue::wait_until rechecks the
+        // Acquire condition on both sides of enqueue, so that race cannot
+        // lose the notification.
+        let _ = queue.wake_one();
     }
 
     fn wait_is_captured(&self) -> bool {
@@ -2160,43 +2167,39 @@ fn wait_for_expire_startup(scenario: &FutexScenario, stage: ExpireStartupStage) 
     assert_eq!(scenario.kind, ScenarioKind::Expire);
     let start = Jiffies::elapsed().as_u64();
     let deadline = start
-        .checked_add(EXPIRE_STARTUP_MAX_TICKS)
+        .checked_add(EXPIRE_STARTUP_MAX_SUCCESS_TICKS)
         .expect("expire startup deadline must fit the scheduler clock");
 
-    loop {
-        let observed = Jiffies::elapsed().as_u64();
-        let ready = scenario.expire_startup_is_ready(stage);
-        if ready {
-            assert!(match stage {
-                ExpireStartupStage::WakerReady => scenario.enable_waker_is_registered(),
-                ExpireStartupStage::WaitCaptured => scenario.wait_is_captured(),
-            });
-            assert!(
-                observed <= deadline,
-                "expire startup stage {} completed after its bounded deadline",
-                stage.label()
-            );
-            let waited = observed
-                .checked_sub(start)
-                .expect("the scheduler clock must not move backwards");
-            println!(
-                "LINUX_FUTEX_STARTUP Receipt scenario=expire stage={} start_tick={} observed_tick={} deadline_tick={} waited_ticks={} max_wait_ticks={} bounded=true",
-                stage.label(),
-                start,
-                observed,
-                deadline,
-                waited,
-                EXPIRE_STARTUP_MAX_TICKS,
-            );
-            return;
-        }
-        assert!(
-            observed < deadline,
-            "expire startup stage {} timed out before its readiness receipt",
-            stage.label()
-        );
-        Task::yield_now();
-    }
+    let (ready, queue) = scenario.expire_startup_sync(stage);
+    // WaitQueue has no timer-driven wake. It removes the parent from the run
+    // queue until the child publishes readiness, preventing the scheduler's
+    // decision/switch window from selecting the still-physical parent. The
+    // 128-tick check qualifies successful receipts only; a permanently absent
+    // child receipt is failed closed by the unchanged outer QEMU timeout.
+    queue.wait_until(|| ready.load(Ordering::Acquire).then_some(()));
+
+    let observed = Jiffies::elapsed().as_u64();
+    assert!(match stage {
+        ExpireStartupStage::WakerReady => scenario.enable_waker_is_registered(),
+        ExpireStartupStage::WaitCaptured => scenario.wait_is_captured(),
+    });
+    assert!(
+        observed <= deadline,
+        "expire startup stage {} exceeded the accepted success latency",
+        stage.label()
+    );
+    let waited = observed
+        .checked_sub(start)
+        .expect("the scheduler clock must not move backwards");
+    println!(
+        "LINUX_FUTEX_STARTUP Receipt scenario=expire stage={} start_tick={} observed_tick={} deadline_tick={} waited_ticks={} max_success_wait_ticks={} success_latency_checked=true failure_bound=outer-qemu-timeout handshake=wait-queue publish=release observe=acquire",
+        stage.label(),
+        start,
+        observed,
+        deadline,
+        waited,
+        EXPIRE_STARTUP_MAX_SUCCESS_TICKS,
+    );
 }
 
 fn run_scenario(
@@ -2302,10 +2305,10 @@ fn run_scenario(
                 "expire startup must remain on the existing kernel fallback"
             );
             // A fallback reservation is not a task-entry receipt. Stage the
-            // two guest prerequisites so a slower same-boot QEMU cannot run
-            // the personality's readiness loop before either guest has made
-            // progress. The publish/crash/watchdog race starts only after
-            // these pre-admission prerequisites and remains unchanged.
+            // two guest prerequisites behind blocking one-shot conditions so
+            // the parent leaves the run queue until each child has entered.
+            // The publish/crash/watchdog race starts only after these
+            // pre-admission prerequisites and remains unchanged.
             waker_task.run();
             wait_for_expire_startup(&scenario, ExpireStartupStage::WakerReady);
             waiter_task.run();

@@ -20,7 +20,7 @@ oracle() {
             print "Linux futex startup source oracle: FAIL: " message > "/dev/stderr"
             exit 1
         }
-        $0 == "const EXPIRE_STARTUP_MAX_TICKS: u64 = 128;" {
+        $0 == "const EXPIRE_STARTUP_MAX_SUCCESS_TICKS: u64 = 128;" {
             deadline_constants++
         }
         $0 == "fn wait_for_expire_startup(scenario: &FutexScenario, stage: ExpireStartupStage) {" {
@@ -31,9 +31,36 @@ oracle() {
         }
         /compare_exchange\(false, true, Ordering::Release, Ordering::Relaxed\)/ {
             release_publishes++
+            release_publish = NR
         }
         /ready\.load\(Ordering::Acquire\)/ {
             acquire_observations++
+        }
+        $0 == "    sync::{SpinLock, WaitQueue}," {
+            wait_queue_imports++
+        }
+        $0 == "    expire_waker_queue: WaitQueue," {
+            waker_queue_fields++
+        }
+        $0 == "    expire_waiter_queue: WaitQueue," {
+            waiter_queue_fields++
+        }
+        /expire_waker_queue: WaitQueue::new\(\),/ {
+            waker_queue_constructors++
+        }
+        /expire_waiter_queue: WaitQueue::new\(\),/ {
+            waiter_queue_constructors++
+        }
+        $0 == "        let _ = queue.wake_one();" {
+            queue_wakes++
+            queue_wake = NR
+        }
+        $0 == "    queue.wait_until(|| ready.load(Ordering::Acquire).then_some(()));" {
+            blocking_waits++
+            blocking_wait = NR
+        }
+        index($0, "max_success_wait_ticks={} success_latency_checked=true failure_bound=outer-qemu-timeout handshake=wait-queue publish=release observe=acquire") > 0 {
+            bounded_claim_receipts++
         }
         $0 == "    scenario.capture_wait(user_mode.context(), waker);" {
             wait_captures++
@@ -59,11 +86,17 @@ oracle() {
             waker_publishers++
             waker_publish = NR
         }
-        /checked_add\(EXPIRE_STARTUP_MAX_TICKS\)/ {
+        /checked_add\(EXPIRE_STARTUP_MAX_SUCCESS_TICKS\)/ {
             checked_deadlines++
         }
-        /observed < deadline,/ {
+        /observed <= deadline,/ {
             strict_deadline_checks++
+        }
+        helper_lines > 0 && run_scenario_lines == 0 && /Task::yield_now\(\)/ {
+            helper_yields++
+        }
+        $0 == "fn run_scenario(" {
+            run_scenario_lines++
         }
         $0 == "            waker_task.run();" {
             waker_run = NR
@@ -89,11 +122,18 @@ oracle() {
         END {
             if (deadline_constants != 1 || helper_lines != 1 ||
                 checked_deadlines != 1 || strict_deadline_checks != 1)
-                fail("startup helper is not uniquely deadline-bounded")
+                fail("startup helper does not uniquely check successful-entry latency")
             if (publisher_helpers != 1 || release_publishes != 1 ||
                 acquire_observations != 1 || waker_publishers != 1 ||
                 waiter_publishers != 1)
                 fail("startup readiness is not one-shot release/acquire published")
+            if (wait_queue_imports != 1 || waker_queue_fields != 1 ||
+                waiter_queue_fields != 1 || waker_queue_constructors != 1 ||
+                waiter_queue_constructors != 1 || queue_wakes != 1 ||
+                blocking_waits != 1 || bounded_claim_receipts != 1 ||
+                !(release_publish < queue_wake &&
+                queue_wake < blocking_wait) || helper_yields != 0)
+                fail("startup handshake is not a blocking publish-before-wake wait queue")
             if (wait_captures != 1 || waiter_guest_blocks != 1 ||
                 enable_waker_registrations != 1 || waker_guest_blocks != 1 ||
                 !(wait_capture < waiter_guest_block &&
@@ -149,7 +189,7 @@ if oracle "$work/swapped-stages.rs" >/dev/null 2>&1; then
     die "oracle accepted swapped startup stages"
 fi
 
-sed '0,/const EXPIRE_STARTUP_MAX_TICKS: u64 = 128;/s//const EXPIRE_STARTUP_MAX_TICKS: u64 = 0;/' \
+sed '0,/const EXPIRE_STARTUP_MAX_SUCCESS_TICKS: u64 = 128;/s//const EXPIRE_STARTUP_MAX_SUCCESS_TICKS: u64 = 0;/' \
     "$source_file" >"$work/unbounded-deadline.rs"
 if oracle "$work/unbounded-deadline.rs" >/dev/null 2>&1; then
     die "oracle accepted a missing startup deadline"
@@ -181,4 +221,46 @@ if oracle "$work/early-waker-readiness.rs" >/dev/null 2>&1; then
     die "oracle accepted readiness published before waker registration and GuestBlock"
 fi
 
-echo "Linux futex startup source assertions: PASS expire_only=true order=waker-ready+wait-captured+v1+watchdog publication_order=guest-prerequisite-before-ready readiness=release+acquire deadline=checked max_wait_ticks=128 mutations=5"
+sed '0,/queue\.wait_until(|| ready\.load(Ordering::Acquire)\.then_some(()));/s//while !ready.load(Ordering::Acquire) { Task::yield_now(); }/' \
+    "$source_file" >"$work/yield-polling.rs"
+if oracle "$work/yield-polling.rs" >/dev/null 2>&1; then
+    die "oracle accepted runnable-parent yield polling in place of the blocking handshake"
+fi
+
+awk '
+    !removed && $0 == "        let _ = queue.wake_one();" {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+' "$source_file" >"$work/missing-queue-wake.rs"
+if oracle "$work/missing-queue-wake.rs" >/dev/null 2>&1; then
+    die "oracle accepted a Release publication without a wait-queue notification"
+fi
+
+awk '
+    !injected && $0 == "        ready" {
+        print "        let _ = queue.wake_one();"
+        print
+        injected = 1
+        next
+    }
+    !removed && $0 == "        let _ = queue.wake_one();" {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!injected || !removed) exit 2 }
+' "$source_file" >"$work/wake-before-release.rs"
+if oracle "$work/wake-before-release.rs" >/dev/null 2>&1; then
+    die "oracle accepted a wait-queue notification before the Release publication"
+fi
+
+sed '0,/failure_bound=outer-qemu-timeout/s//failure_bound=guest-tick-deadline/' \
+    "$source_file" >"$work/overclaimed-failure-bound.rs"
+if oracle "$work/overclaimed-failure-bound.rs" >/dev/null 2>&1; then
+    die "oracle accepted a guest-side failure bound not enforced by WaitQueue"
+fi
+
+echo "Linux futex startup source assertions: PASS expire_only=true order=waker-ready+wait-captured+v1+watchdog publication_order=guest-prerequisite-before-ready readiness=release+acquire handshake=blocking-wait-queue success_latency_checked=true max_success_wait_ticks=128 failure_bound=outer-qemu-timeout mutations=9"
