@@ -41,7 +41,7 @@ use ostd::{
         io::util::HasVmReaderWriter,
         vm_space::{Cursor, VmQueriedItem},
     },
-    task::disable_preempt,
+    task::{Task, disable_preempt},
 };
 
 use crate::{
@@ -49,13 +49,16 @@ use crate::{
     effect::{EffectToken, EffectWaiter, EffectWaker},
     effect_registry::{
         CommitMetadata, CreditCharge, CreditClass, CreditLimit, DerivedRegisterRequest,
-        DomainConfig, DomainKey, EffectRegistry, OperationClass, PublicationMode,
+        DomainConfig, DomainKey, EffectRegistry, OperationClass, PortalHandle, PublicationMode,
         PublicationTicket, RegisterRequest, RegisteredEffect, RegistryError, ResourceKey,
         RevokeDisposition, ScopeConfig, ScopeKey, ScopePhase, SyscallDescriptor, TaskKey,
         TerminalRequest,
     },
     linux_loader::load_static_image_with_stack_pages,
 };
+
+#[cfg(feature = "virtio-cser-facade")]
+use crate::{USER_MAP_ADDR, create_vm_space};
 
 #[cfg(feature = "virtio-cser-facade")]
 use crate::device_flight::{
@@ -73,13 +76,14 @@ use crate::device_flight::{
 };
 
 #[cfg(not(feature = "virtio-cser-facade"))]
-use crate::effect_registry::{CommitOutcome, CommitReceipt, PortalHandle};
+use crate::effect_registry::{CommitOutcome, CommitReceipt};
 
 #[cfg(feature = "virtio-cser-facade")]
 use crate::effect_registry::{
     DeviceBatchEnrollmentReceipt, DeviceClosureReceipt, DeviceClosureResult, DeviceCohortParent,
     DeviceDerivedCohortEntry, DeviceEnvelope, DeviceIotlbTicket, DeviceIotlbTombstone,
-    DeviceResetReceipt, DeviceResetTicket, DeviceResetTombstone, EffectKey, RevokeSelection,
+    DeviceResetReceipt, DeviceResetTicket, DeviceResetTombstone, DomainRecoverySnapshot, EffectKey,
+    EffectPhase, RevokeSelection,
 };
 #[cfg(feature = "virtio-cser-facade")]
 use nexus_ostd_virtio::{
@@ -180,6 +184,45 @@ const SAME_BOOT_IMAGE_SHA256: &str =
 const SAME_BOOT_SECTOR_FNV1A: u64 = 0x3391_3395_b779_8e6b;
 const SCENARIO_DONE_EFFECT: u64 = 950;
 #[cfg(feature = "virtio-cser-facade")]
+const FSD_V1_DONE_EFFECT: u64 = 955;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_V2_DONE_EFFECT: u64 = 956;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_REPLY_EFFECT: u64 = 957;
+#[cfg(feature = "virtio-cser-facade")]
+const EXPECTED_FSD_FAULT: usize = 0x0080_0000;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_NEXT: usize = 0x4e74_0001;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_PREPARE: usize = 0x4e74_0002;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_COMMIT: usize = 0x4e74_0003;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_PUBLISH: usize = 0x4e74_0004;
+/// fsd-v1 queues one typed old-binding Prepare command before its page fault.
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_QUEUE_OLD_PREPARE: usize = 0x4e74_0005;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_RECOVERY_SNAPSHOT: usize = 0x4e74_0010;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_READY: usize = 0x4e74_0011;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_REBIND: usize = 0x4e74_0012;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_ADOPT_NEXT: usize = 0x4e74_0013;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_REPLAY_OLD: usize = 0x4e74_0014;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_DONE: usize = 0x4e74_0020;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_FAIL: usize = 0x4e74_ffff;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_OP_WAIT: usize = 0;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_OP_REQUEST: usize = 1;
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_RESULT_STALE_BINDING: usize = 2;
+#[cfg(feature = "virtio-cser-facade")]
 const SAME_BOOT_COMPLETION_PROBE_LIMIT: usize = 10_000_000;
 const AT_EMPTY_PATH: usize = 0x1000;
 const AT_DIRECTORY: usize = 0x1_0000;
@@ -208,6 +251,10 @@ const FIRST_PREAD_PAYLOAD_FNV1A: u64 = 0x28b2_6538_2f12_49f3;
 const BLOCK_PREPARATION_FNV1A: u64 = 0xfbde_9edc_fd5f_41c8;
 
 const RUNTIME_FS_ELF: &[u8] = include_bytes!("../../guest/linux-runtime-fs.elf");
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_V1_PROGRAM: &[u8] = include_bytes!("../../guest/linux-fsd-v1.bin");
+#[cfg(feature = "virtio-cser-facade")]
+const FSD_V2_PROGRAM: &[u8] = include_bytes!("../../guest/linux-fsd-v2.bin");
 
 /// Read-only receipt proving that the retained filesystem workload completed
 /// its own production root. No live handle is exported after root closure; the
@@ -1681,6 +1728,155 @@ struct DispatchOutcome {
 }
 
 #[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FsServicePhase {
+    Idle,
+    QueuedUnannounced,
+    Queued,
+    Registered,
+    Prepared,
+    Crashed,
+    Snapshotted,
+    Ready,
+    Rebound,
+    Adopted,
+    Executed,
+    ReplyReady,
+    Done,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DelayedPrepareCommand {
+    sender: TaskKey,
+    handle: PortalHandle,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FsServiceProjection {
+    phase: FsServicePhase,
+    descriptor: Option<SyscallDescriptor>,
+    cookie: Option<u64>,
+    filesystem_effect: Option<EffectKey>,
+    old_handle: Option<PortalHandle>,
+    adopted_handle: Option<PortalHandle>,
+    delayed_prepare: Option<DelayedPrepareCommand>,
+    snapshot: Option<DomainRecoverySnapshot>,
+    response_waker_present: bool,
+    outcome_present: bool,
+    reply_wakeups: usize,
+    response_taken: bool,
+    stale_replay_observed: bool,
+    service_done: bool,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+struct FsServiceProtocol {
+    phase: FsServicePhase,
+    descriptor: Option<SyscallDescriptor>,
+    cookie: Option<NonZeroU64>,
+    filesystem: Option<RegisteredEffect>,
+    adopted_handle: Option<PortalHandle>,
+    delayed_prepare: Option<DelayedPrepareCommand>,
+    snapshot: Option<DomainRecoverySnapshot>,
+    response_waker: Option<EffectWaker>,
+    outcome: Option<DispatchOutcome>,
+    reply_wakeups: usize,
+    response_taken: bool,
+    stale_replay_observed: bool,
+    service_done: bool,
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+impl FsServiceProtocol {
+    const fn new() -> Self {
+        Self {
+            phase: FsServicePhase::Idle,
+            descriptor: None,
+            cookie: None,
+            filesystem: None,
+            adopted_handle: None,
+            delayed_prepare: None,
+            snapshot: None,
+            response_waker: None,
+            outcome: None,
+            reply_wakeups: 0,
+            response_taken: false,
+            stale_replay_observed: false,
+            service_done: false,
+        }
+    }
+
+    fn projection(&self) -> FsServiceProjection {
+        FsServiceProjection {
+            phase: self.phase,
+            descriptor: self.descriptor,
+            cookie: self.cookie.map(NonZeroU64::get),
+            filesystem_effect: self
+                .filesystem
+                .as_ref()
+                .map(|registered| registered.identity.effect()),
+            old_handle: self.filesystem.as_ref().map(|registered| registered.handle),
+            adopted_handle: self.adopted_handle,
+            delayed_prepare: self.delayed_prepare,
+            snapshot: self.snapshot.clone(),
+            response_waker_present: self.response_waker.is_some(),
+            outcome_present: self.outcome.is_some(),
+            reply_wakeups: self.reply_wakeups,
+            response_taken: self.response_taken,
+            stale_replay_observed: self.stale_replay_observed,
+            service_done: self.service_done,
+        }
+    }
+
+    fn enqueue_unannounced(
+        &mut self,
+        descriptor: SyscallDescriptor,
+        cookie: NonZeroU64,
+        response_waker: EffectWaker,
+    ) {
+        assert_eq!(self.phase, FsServicePhase::Idle);
+        self.phase = FsServicePhase::QueuedUnannounced;
+        self.descriptor = Some(descriptor);
+        self.cookie = Some(cookie);
+        self.response_waker = Some(response_waker);
+    }
+
+    fn arm_queued(&mut self) {
+        assert_eq!(self.phase, FsServicePhase::QueuedUnannounced);
+        self.phase = FsServicePhase::Queued;
+    }
+
+    fn take_outcome(&mut self) -> DispatchOutcome {
+        assert!(matches!(
+            self.phase,
+            FsServicePhase::ReplyReady | FsServicePhase::Done
+        ));
+        assert_eq!(self.reply_wakeups, 1);
+        assert!(!self.response_taken);
+        self.response_taken = true;
+        self.outcome
+            .take()
+            .expect("fsd-v2 installed one filesystem response")
+    }
+
+    fn assert_complete(&self) {
+        assert_eq!(self.phase, FsServicePhase::Done);
+        assert!(self.filesystem.is_some());
+        assert!(self.adopted_handle.is_some());
+        assert!(self.delayed_prepare.is_none());
+        assert!(self.snapshot.is_some());
+        assert!(self.response_waker.is_none());
+        assert!(self.outcome.is_none());
+        assert_eq!(self.reply_wakeups, 1);
+        assert!(self.response_taken);
+        assert!(self.stale_replay_observed);
+        assert!(self.service_done);
+    }
+}
+
+#[cfg(feature = "virtio-cser-facade")]
 impl DispatchOutcome {
     fn retained(flight_cookie: u64) -> Self {
         Self {
@@ -1697,6 +1893,8 @@ struct FsScenario {
     state: SpinLock<FsState>,
     #[cfg(feature = "virtio-cser-facade")]
     production: SpinLock<ProductionReadRuntime>,
+    #[cfg(feature = "virtio-cser-facade")]
+    service: SpinLock<FsServiceProtocol>,
     done: SpinLock<Option<EffectWaker>>,
 }
 
@@ -1737,15 +1935,458 @@ impl FsScenario {
         DispatchOutcome::retained(cookie)
     }
 
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_next_operation(&self, sender: TaskKey) -> usize {
+        assert_eq!(sender, FILESYSTEM_V1);
+        let (descriptor, cookie) = {
+            let service = self.service.lock();
+            if service.phase != FsServicePhase::Queued {
+                return FSD_OP_WAIT;
+            }
+            (service.descriptor.unwrap(), service.cookie.unwrap())
+        };
+        let filesystem = {
+            let mut runtime = self.production.lock();
+            let syscall = match &runtime.flight {
+                FsDeviceFlight::Captured {
+                    cookie: captured_cookie,
+                    syscall,
+                    ..
+                } if *captured_cookie == cookie => syscall.clone(),
+                _ => panic!("fsd-v1 observed a request without its captured syscall flight"),
+            };
+            let filesystem = runtime
+                .registry
+                .register_derived(DerivedRegisterRequest {
+                    request: RegisterRequest {
+                        scope: SCOPE,
+                        task: sender,
+                        operation: OP_FILESYSTEM_READ,
+                        descriptor,
+                        resources: vec![EXEC_INODE_RESOURCE, FILESYSTEM_READ_RESOURCE],
+                        credits: vec![CreditCharge::new(FILESYSTEM_OP_CREDIT, 1)],
+                        publication: PublicationMode::None,
+                    },
+                    domain: FILESYSTEM_DOMAIN,
+                    parent: Some(syscall.identity.effect()),
+                })
+                .expect("fsd-v1 registers the filesystem descendant");
+            runtime.registered_effects = 2;
+            assert_eq!(
+                runtime
+                    .registry
+                    .domain_projection(SCOPE, BLOCK_DOMAIN)
+                    .unwrap()
+                    .live_effects,
+                0,
+            );
+            runtime.registry.check_invariants().unwrap();
+            filesystem
+        };
+        let effect = filesystem.identity.effect();
+        {
+            let mut service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Queued);
+            service.filesystem = Some(filesystem);
+            service.phase = FsServicePhase::Registered;
+        }
+        println!(
+            "LINUX_FS_SERVICE Register runner=fsd-v1 task={} effect={} binding=1 parent=syscall device_cohort=0 guest_reply=false",
+            sender.id(),
+            effect.id(),
+        );
+        FSD_OP_REQUEST
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_prepare_active(&self, sender: TaskKey) {
+        assert_eq!(sender, FILESYSTEM_V1);
+        let filesystem = {
+            let service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Registered);
+            service.filesystem.as_ref().unwrap().clone()
+        };
+        {
+            let mut runtime = self.production.lock();
+            runtime.registry.prepare(sender, filesystem.handle).unwrap();
+            let view = runtime
+                .registry
+                .effect_view(filesystem.identity.effect())
+                .unwrap();
+            assert_eq!(view.phase, EffectPhase::Prepared);
+            assert_eq!(
+                runtime
+                    .registry
+                    .domain_projection(SCOPE, BLOCK_DOMAIN)
+                    .unwrap()
+                    .live_effects,
+                0,
+            );
+            assert!(matches!(runtime.flight, FsDeviceFlight::Captured { .. }));
+            runtime.registry.check_invariants().unwrap();
+        }
+        self.service.lock().phase = FsServicePhase::Prepared;
+        println!(
+            "LINUX_FS_SERVICE Prepare runner=fsd-v1 task={} effect={} phase=Prepared device_prepared=false device_committed=false guest_reply=false",
+            sender.id(),
+            filesystem.identity.effect().id(),
+        );
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_queue_old_prepare(&self, sender: TaskKey) {
+        assert_eq!(sender, FILESYSTEM_V1);
+        let handle = {
+            let mut service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Prepared);
+            assert!(service.delayed_prepare.is_none());
+            let handle = service.filesystem.as_ref().unwrap().handle;
+            service.delayed_prepare = Some(DelayedPrepareCommand { sender, handle });
+            handle
+        };
+        println!(
+            "LINUX_FS_SERVICE QueueOldPrepare sender={} sender_generation={} effect={} binding={} typed=true delivery=after_rebind",
+            sender.id(),
+            sender.generation(),
+            handle.effect().id(),
+            handle.binding_epoch(),
+        );
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn crash_fsd_v1(&self, sender: TaskKey) {
+        assert_eq!(sender, FILESYSTEM_V1);
+        let filesystem = {
+            let service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Prepared);
+            assert_eq!(
+                service.delayed_prepare,
+                Some(DelayedPrepareCommand {
+                    sender,
+                    handle: service.filesystem.as_ref().unwrap().handle,
+                })
+            );
+            assert!(service.outcome.is_none());
+            assert_eq!(service.reply_wakeups, 0);
+            service.filesystem.as_ref().unwrap().clone()
+        };
+        let crash = {
+            let mut runtime = self.production.lock();
+            assert_eq!(
+                runtime
+                    .registry
+                    .effect_view(filesystem.identity.effect())
+                    .unwrap()
+                    .phase,
+                EffectPhase::Prepared,
+            );
+            assert_eq!(
+                runtime
+                    .registry
+                    .domain_projection(SCOPE, BLOCK_DOMAIN)
+                    .unwrap()
+                    .live_effects,
+                0,
+            );
+            assert!(matches!(runtime.flight, FsDeviceFlight::Captured { .. }));
+            let personality_before = runtime
+                .registry
+                .domain_projection(SCOPE, PERSONALITY_DOMAIN)
+                .unwrap();
+            let block_before = runtime
+                .registry
+                .domain_projection(SCOPE, BLOCK_DOMAIN)
+                .unwrap();
+            let crash = runtime
+                .registry
+                .crash_domain(SCOPE, FILESYSTEM_DOMAIN, sender)
+                .unwrap();
+            assert_eq!(crash.previous_binding_epoch, 1);
+            assert_eq!(crash.binding_epoch, 2);
+            assert_eq!(crash.cohort.len(), 1);
+            assert!(crash.cohort.contains(&filesystem.identity.effect()));
+            assert_eq!(
+                runtime
+                    .registry
+                    .domain_projection(SCOPE, PERSONALITY_DOMAIN)
+                    .unwrap(),
+                personality_before,
+            );
+            assert_eq!(
+                runtime
+                    .registry
+                    .domain_projection(SCOPE, BLOCK_DOMAIN)
+                    .unwrap(),
+                block_before,
+            );
+            runtime.registry.check_invariants().unwrap();
+            crash
+        };
+        self.service.lock().phase = FsServicePhase::Crashed;
+        println!(
+            "LINUX_FS_SERVICE Crash runner=fsd-v1 task={} old_binding={} new_binding={} cohort=1 filesystem_effect={} phase=Prepared device_cohort=0 device_committed=false guest_reply=false peer_domains_unchanged=true real_user_page_fault=true",
+            sender.id(),
+            crash.previous_binding_epoch,
+            crash.binding_epoch,
+            filesystem.identity.effect().id(),
+        );
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_recovery_snapshot(&self, sender: TaskKey) {
+        assert_eq!(sender, FILESYSTEM_V2);
+        let filesystem_effect = {
+            let service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Crashed);
+            service.filesystem.as_ref().unwrap().identity.effect()
+        };
+        let snapshot = {
+            let mut runtime = self.production.lock();
+            let snapshot = runtime
+                .registry
+                .domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, sender)
+                .unwrap();
+            assert_eq!(snapshot.effects.len(), 1);
+            assert_eq!(snapshot.effects[0].effect, filesystem_effect);
+            assert_eq!(snapshot.effects[0].phase, EffectPhase::Prepared);
+            assert_eq!(snapshot.effects[0].binding_epoch, 1);
+            snapshot
+        };
+        let binding = snapshot.binding_epoch;
+        {
+            let mut service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Crashed);
+            service.snapshot = Some(snapshot);
+            service.phase = FsServicePhase::Snapshotted;
+        }
+        println!(
+            "LINUX_FS_SERVICE Snapshot replacement={} binding={} cohort=1 exact=true phase=Prepared",
+            sender.id(),
+            binding,
+        );
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_recovery_ready(&self, sender: TaskKey) {
+        assert_eq!(sender, FILESYSTEM_V2);
+        let snapshot = {
+            let service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Snapshotted);
+            service.snapshot.as_ref().unwrap().clone()
+        };
+        self.production
+            .lock()
+            .registry
+            .domain_ready(SCOPE, FILESYSTEM_DOMAIN, sender, &snapshot)
+            .unwrap();
+        self.service.lock().phase = FsServicePhase::Ready;
+        println!(
+            "LINUX_FS_SERVICE Ready replacement={} binding={} snapshot_fresh=true",
+            sender.id(),
+            snapshot.binding_epoch,
+        );
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_recovery_rebind(&self, sender: TaskKey) {
+        assert_eq!(sender, FILESYSTEM_V2);
+        {
+            let service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Ready);
+        }
+        let receipt = self
+            .production
+            .lock()
+            .registry
+            .rebind_domain(SCOPE, FILESYSTEM_DOMAIN, sender)
+            .unwrap();
+        assert_eq!(receipt.binding_epoch, 2);
+        self.service.lock().phase = FsServicePhase::Rebound;
+        println!(
+            "LINUX_FS_SERVICE Rebind replacement={} binding={} personality_binding=1 block_binding=1 peer_domains_unchanged=true",
+            sender.id(),
+            receipt.binding_epoch,
+        );
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_adopt_next(&self, sender: TaskKey) -> bool {
+        assert_eq!(sender, FILESYSTEM_V2);
+        let (phase, old_handle) = {
+            let service = self.service.lock();
+            (service.phase, service.filesystem.as_ref().unwrap().handle)
+        };
+        assert!(matches!(
+            phase,
+            FsServicePhase::Rebound | FsServicePhase::Adopted
+        ));
+        let Some(item) = self
+            .production
+            .lock()
+            .registry
+            .recover_next_domain(SCOPE, FILESYSTEM_DOMAIN, sender)
+            .unwrap()
+        else {
+            assert_eq!(phase, FsServicePhase::Adopted);
+            return false;
+        };
+        assert_eq!(phase, FsServicePhase::Rebound);
+        assert_eq!(item.handle, old_handle);
+        assert_eq!(item.phase, EffectPhase::Prepared);
+        let fresh = {
+            let mut runtime = self.production.lock();
+            let fresh = runtime
+                .registry
+                .adopt_domain(SCOPE, FILESYSTEM_DOMAIN, sender, old_handle)
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .registry
+                    .domain_recovery_remaining(SCOPE, FILESYSTEM_DOMAIN)
+                    .unwrap(),
+                0,
+            );
+            runtime.registry.check_invariants().unwrap();
+            fresh
+        };
+        {
+            let mut service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Rebound);
+            service.adopted_handle = Some(fresh);
+            service.phase = FsServicePhase::Adopted;
+        }
+        println!(
+            "LINUX_FS_SERVICE Adopt replacement={} effect={} old_binding={} new_binding={} phase=Prepared identity_preserved=true explicit=true",
+            sender.id(),
+            old_handle.effect().id(),
+            old_handle.binding_epoch(),
+            fresh.binding_epoch(),
+        );
+        true
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_deliver_old_prepare(&self, delivery_sender: TaskKey) {
+        assert_eq!(delivery_sender, FILESYSTEM_V2);
+        let (before_service, command, adopted_handle) = {
+            let service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Adopted);
+            assert!(!service.stale_replay_observed);
+            (
+                service.projection(),
+                service
+                    .delayed_prepare
+                    .expect("fsd-v1 queued one typed delayed Prepare"),
+                service.adopted_handle.unwrap(),
+            )
+        };
+        assert_eq!(command.sender, FILESYSTEM_V1);
+        let (before_registry, after_old_handle, after_old_sender) = {
+            let mut runtime = self.production.lock();
+            let before = runtime.registry.failure_atomic_projection();
+            assert_eq!(
+                runtime.registry.prepare(command.sender, command.handle),
+                Err(RegistryError::StaleBinding),
+            );
+            let after_old_handle = runtime.registry.failure_atomic_projection();
+            assert_eq!(after_old_handle, before);
+            assert_eq!(
+                runtime.registry.prepare(command.sender, adopted_handle),
+                Err(RegistryError::NoSupervisor),
+            );
+            let after_old_sender = runtime.registry.failure_atomic_projection();
+            (before, after_old_handle, after_old_sender)
+        };
+        let after_service = self.service.lock().projection();
+        assert_eq!(after_old_handle, before_registry);
+        assert_eq!(after_old_sender, before_registry);
+        assert_eq!(after_service, before_service);
+        let before_fingerprint = fnv1a(before_registry.as_bytes());
+        let after_fingerprint = fnv1a(after_old_sender.as_bytes());
+        {
+            let mut service = self.service.lock();
+            assert_eq!(service.delayed_prepare.take(), Some(command));
+            service.stale_replay_observed = true;
+        }
+        println!(
+            "LINUX_FS_SERVICE StaleReplay delivery_sender={} delivery_generation={} queued_sender={} queued_generation={} action=Prepare old_binding={} current_binding=2 old_handle_result=StaleBinding old_sender_current_handle_result=NoSupervisor projection_before={:#018x} projection_after={:#018x} full_projection_unchanged=true mutation=false",
+            delivery_sender.id(),
+            delivery_sender.generation(),
+            command.sender.id(),
+            command.sender.generation(),
+            command.handle.binding_epoch(),
+            before_fingerprint,
+            after_fingerprint,
+        );
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_execute_recovered(&self) {
+        let (descriptor, cookie, filesystem, adopted_handle) = {
+            let service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Adopted);
+            assert!(service.stale_replay_observed);
+            (
+                service.descriptor.unwrap(),
+                service.cookie.unwrap(),
+                service.filesystem.as_ref().unwrap().clone(),
+                service.adopted_handle.unwrap(),
+            )
+        };
+        let outcome = self.execute_recovered_first_pread_same_boot(
+            descriptor,
+            cookie,
+            filesystem,
+            adopted_handle,
+        );
+        let mut service = self.service.lock();
+        assert_eq!(service.phase, FsServicePhase::Adopted);
+        assert!(service.outcome.is_none());
+        service.outcome = Some(outcome);
+        service.phase = FsServicePhase::Executed;
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_publish_response(&self) {
+        let waker = {
+            let mut service = self.service.lock();
+            assert_eq!(service.phase, FsServicePhase::Executed);
+            assert!(service.outcome.is_some());
+            assert_eq!(service.reply_wakeups, 0);
+            service.phase = FsServicePhase::ReplyReady;
+            service.reply_wakeups = 1;
+            service
+                .response_waker
+                .take()
+                .expect("one blocked runtime-fs guest continuation")
+        };
+        println!(
+            "LINUX_FS_SERVICE DispatchOutcomeInstalled replacement={} guest={} reply_wakeups=1 exactly_once=true all_locks_released=true",
+            FILESYSTEM_V2.id(),
+            GUEST.id(),
+        );
+        waker.wake_up();
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn fsd_service_done(&self) {
+        let mut service = self.service.lock();
+        assert_eq!(service.phase, FsServicePhase::ReplyReady);
+        assert_eq!(service.reply_wakeups, 1);
+        assert!(service.response_waker.is_none());
+        service.phase = FsServicePhase::Done;
+        service.service_done = true;
+    }
+
     // The single polling actor restores each linear successor to the runtime
     // slot at every transition boundary. One-step hardware probes temporarily
     // own that successor on the executing actor's stack; IRQ/SMP integration
     // therefore still requires the actor-slot handoff described in the RFC.
     #[cfg(feature = "virtio-cser-facade")]
-    fn dispatch_first_executable_pread_same_boot(
+    fn capture_first_executable_pread_same_boot(
         &self,
         descriptor: SyscallDescriptor,
-    ) -> DispatchOutcome {
+    ) -> Result<NonZeroU64, DispatchOutcome> {
         assert_eq!(descriptor.number(), __NR_pread64 as usize);
         assert_eq!(descriptor.argument(0), 3);
         assert_eq!(descriptor.argument(2), 4);
@@ -1754,16 +2395,16 @@ impl FsScenario {
         // Capture precedes all personality lookup. The captured syscall and
         // the physical root/device pair are installed together in the only
         // runtime-resident flight slot before the lock is released.
-        let (cookie, _syscall) = {
+        let cookie = {
             let mut runtime = self.production.lock();
             let flight = runtime.take_flight();
             let (root, device) = match flight {
                 FsDeviceFlight::Ready { root, device } => (root, device),
                 other => {
                     runtime.put_flight(other);
-                    return DispatchOutcome::retained(
+                    return Err(DispatchOutcome::retained(
                         runtime.retain_current("capture_without_ready_flight"),
-                    );
+                    ));
                 }
             };
             let cookie = match runtime.allocate_flight_cookie() {
@@ -1779,7 +2420,7 @@ impl FsScenario {
                         "LINUX_FS_SAME_BOOT Retained stage=flight_cookie_overflow error={:?}",
                         error
                     );
-                    return DispatchOutcome::retained(0);
+                    return Err(DispatchOutcome::retained(0));
                 }
             };
             let syscall = match runtime.registry.register_derived(DerivedRegisterRequest {
@@ -1801,9 +2442,9 @@ impl FsScenario {
                 Ok(syscall) => syscall,
                 Err(_) => {
                     runtime.put_flight(FsDeviceFlight::Ready { root, device });
-                    return DispatchOutcome::retained(
+                    return Err(DispatchOutcome::retained(
                         runtime.retain_current("syscall_registration"),
-                    );
+                    ));
                 }
             };
             if runtime
@@ -1817,7 +2458,9 @@ impl FsScenario {
                     device,
                     syscall,
                 });
-                return DispatchOutcome::retained(runtime.retain_current("syscall_prepare"));
+                return Err(DispatchOutcome::retained(
+                    runtime.retain_current("syscall_prepare"),
+                ));
             }
             runtime.registered_effects = 1;
             runtime.put_flight(FsDeviceFlight::Captured {
@@ -1826,7 +2469,7 @@ impl FsScenario {
                 device,
                 syscall: syscall.clone(),
             });
-            (cookie, syscall)
+            cookie
         };
 
         {
@@ -1836,6 +2479,47 @@ impl FsScenario {
             state.production_read_observed = true;
         }
 
+        Ok(cookie)
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn dispatch_first_executable_pread_same_boot(
+        &self,
+        descriptor: SyscallDescriptor,
+    ) -> DispatchOutcome {
+        let cookie = match self.capture_first_executable_pread_same_boot(descriptor) {
+            Ok(cookie) => cookie,
+            Err(outcome) => return outcome,
+        };
+        let (waiter, waker) = EffectWaiter::new_pair(EffectToken {
+            authority_epoch: AUTHORITY_EPOCH,
+            scope_id: SCOPE.id(),
+            effect_id: FSD_REPLY_EFFECT,
+        });
+        self.service
+            .lock()
+            .enqueue_unannounced(descriptor, cookie, waker);
+        println!(
+            "LINUX_FS_SERVICE GuestBlocked task={} syscall=pread64 cookie={} all_locks_released=true reply_wakeups=0",
+            GUEST.id(),
+            cookie,
+        );
+        // The service cannot consume the request until the no-lock blocking
+        // receipt above is externally visible.  This avoids treating a lucky
+        // single-CPU log order as an admission guarantee.
+        self.service.lock().arm_queued();
+        waiter.wait();
+        self.service.lock().take_outcome()
+    }
+
+    #[cfg(feature = "virtio-cser-facade")]
+    fn execute_recovered_first_pread_same_boot(
+        &self,
+        descriptor: SyscallDescriptor,
+        cookie: NonZeroU64,
+        filesystem: RegisteredEffect,
+        adopted_filesystem: PortalHandle,
+    ) -> DispatchOutcome {
         let precommit_close = {
             let mut runtime = self.production.lock();
             let flight = runtime.take_flight();
@@ -1854,91 +2538,15 @@ impl FsScenario {
                 }
             };
 
-            let filesystem = match runtime.registry.register_derived(DerivedRegisterRequest {
-                request: RegisterRequest {
-                    scope: SCOPE,
-                    task: FILESYSTEM_V1,
-                    operation: OP_FILESYSTEM_READ,
-                    descriptor,
-                    resources: vec![EXEC_INODE_RESOURCE, FILESYSTEM_READ_RESOURCE],
-                    credits: vec![CreditCharge::new(FILESYSTEM_OP_CREDIT, 1)],
-                    publication: PublicationMode::None,
-                },
-                domain: FILESYSTEM_DOMAIN,
-                parent: Some(captured.identity.effect()),
-            }) {
-                Ok(effect) => effect,
-                Err(_) => {
-                    runtime.put_flight(FsDeviceFlight::Captured {
-                        cookie,
-                        root,
-                        device,
-                        syscall: captured,
-                    });
-                    return DispatchOutcome::retained(
-                        runtime.retain_current("filesystem_registration"),
-                    );
-                }
-            };
-            if runtime
-                .registry
-                .prepare(FILESYSTEM_V1, filesystem.handle)
-                .is_err()
-            {
-                runtime.put_flight(FsDeviceFlight::Captured {
-                    cookie,
-                    root,
-                    device,
-                    syscall: captured,
-                });
-                return DispatchOutcome::retained(runtime.retain_current("filesystem_prepare"));
-            }
-            runtime.registered_effects = 2;
-
-            // This is the real restartable filesystem service boundary. The
-            // adopted handle remains the original effect identity.
-            let adopted_filesystem = match (|| {
+            assert_eq!(
                 runtime
                     .registry
-                    .crash_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V1)?;
-                let snapshot = runtime.registry.domain_recovery_snapshot(
-                    SCOPE,
-                    FILESYSTEM_DOMAIN,
-                    FILESYSTEM_V2,
-                )?;
-                runtime.registry.domain_ready(
-                    SCOPE,
-                    FILESYSTEM_DOMAIN,
-                    FILESYSTEM_V2,
-                    &snapshot,
-                )?;
-                runtime
-                    .registry
-                    .rebind_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)?;
-                runtime
-                    .registry
-                    .recover_next_domain(SCOPE, FILESYSTEM_DOMAIN, FILESYSTEM_V2)?
-                    .ok_or(RegistryError::InvalidState)?;
-                runtime.registry.adopt_domain(
-                    SCOPE,
-                    FILESYSTEM_DOMAIN,
-                    FILESYSTEM_V2,
-                    filesystem.handle,
-                )
-            })() {
-                Ok(handle) => handle,
-                Err(_) => {
-                    runtime.put_flight(FsDeviceFlight::Captured {
-                        cookie,
-                        root,
-                        device,
-                        syscall: captured,
-                    });
-                    return DispatchOutcome::retained(
-                        runtime.retain_current("filesystem_recovery"),
-                    );
-                }
-            };
+                    .effect_view(filesystem.identity.effect())
+                    .unwrap()
+                    .identity
+                    .binding_epoch(),
+                adopted_filesystem.binding_epoch(),
+            );
 
             let request = match device.prepare_read_sector0(&mut root) {
                 Ok(request) => request,
@@ -4084,7 +4692,7 @@ impl FsScenario {
         ))]
         if !partial_precommit {
             println!(
-                "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=14 compatibility_syscalls=payload_only_not_cser openat=3 pread64=2 statx=1 newfstatat=1 pwrite64=1 readlinkat=1 close=3 write=1 exit=1 registry=shared_production commit_gate=true publication_acks=1 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=false no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=true real_dma=true polling=true irq=false smp=1 same_boot=true identity_preserving=true"
+                "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=14 compatibility_syscalls=payload_only_not_cser openat=3 pread64=2 statx=1 newfstatat=1 pwrite64=1 readlinkat=1 close=3 write=1 exit=1 registry=shared_production commit_gate=true publication_acks=1 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=true no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=true real_dma=true polling=true irq=false smp=1 same_boot=true identity_preserving=true"
             );
         } else {
             println!(
@@ -4097,7 +4705,7 @@ impl FsScenario {
                 "EFFECT_REGISTRY Quiescent workload=linux-runtime-fs registry=shared_production production_effects=6 compatibility_syscalls=payload_only_not_cser live=0 pending_publications=0 credits=Free"
             );
             println!(
-                "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=2 compatibility_syscalls=payload_only_not_cser openat=1 pread64=1 registry=shared_production commit_gate=revoke_wins publication_acks=1 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=false no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=false real_dma_prepared=true device_dma_observed=false polling=false irq=false smp=1 same_boot=true identity_preserving=true precommit_fault=true"
+                "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=2 compatibility_syscalls=payload_only_not_cser openat=1 pread64=1 registry=shared_production commit_gate=revoke_wins publication_acks=1 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=true no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=false real_dma_prepared=true device_dma_observed=false polling=false irq=false smp=1 same_boot=true identity_preserving=true precommit_fault=true"
             );
         } else {
             println!(
@@ -4149,6 +4757,159 @@ impl fmt::Display for FsDispatchLogIdentity {
     }
 }
 
+#[cfg(feature = "virtio-cser-facade")]
+fn assert_current_fs_task_id(expected: TaskKey, vm_space: &Arc<VmSpace>) {
+    let current = Task::current().expect("runtime-fs UserMode runner owns an OSTD task");
+    let data = current
+        .data()
+        .downcast_ref::<TaskData>()
+        .expect("runtime-fs task carries Nexus TaskData");
+    assert_eq!(data.id, expected.id());
+    assert!(
+        data.vm_space
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, vm_space))
+    );
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+fn current_fsd_task(expected: TaskKey, vm_space: &Arc<VmSpace>) -> TaskKey {
+    let current = Task::current().expect("runtime-fs UserMode runner owns an OSTD task");
+    let data = current
+        .data()
+        .downcast_ref::<TaskData>()
+        .expect("runtime-fs task carries Nexus TaskData");
+    let task = data
+        .cser_task
+        .expect("runtime-fs service task carries its complete Registry TaskKey");
+    assert_eq!(task, expected);
+    assert_eq!(data.id, task.id());
+    assert!(
+        data.vm_space
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, vm_space))
+    );
+    task
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+fn run_fsd_v1(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, done: EffectWaker) {
+    let sender = current_fsd_task(FILESYSTEM_V1, &vm_space);
+    vm_space.activate();
+    let mut context = UserContext::default();
+    context.set_rip(USER_MAP_ADDR);
+    let mut user_mode = UserMode::new(context);
+    loop {
+        vm_space.activate();
+        match user_mode.execute(|| false) {
+            ReturnReason::UserSyscall => match user_mode.context().rax() {
+                FSD_NEXT => {
+                    let operation = scenario.fsd_next_operation(sender);
+                    user_mode.context_mut().set_rax(operation);
+                    if operation == FSD_OP_WAIT {
+                        Task::yield_now();
+                    }
+                }
+                FSD_PREPARE => {
+                    scenario.fsd_prepare_active(sender);
+                    user_mode.context_mut().set_rax(0);
+                }
+                FSD_QUEUE_OLD_PREPARE => {
+                    scenario.fsd_queue_old_prepare(sender);
+                    user_mode.context_mut().set_rax(0);
+                }
+                FSD_FAIL => panic!(
+                    "runtime-fs fsd-v1 protocol failure code={}",
+                    user_mode.context().rdi(),
+                ),
+                opcode => panic!("runtime-fs fsd-v1 unknown portal {opcode:#x}"),
+            },
+            ReturnReason::UserException => {
+                let info = match user_mode.context_mut().take_exception() {
+                    Some(CpuException::PageFault(info)) => info,
+                    other => panic!("runtime-fs fsd-v1 unexpected exception {other:?}"),
+                };
+                assert_eq!(info.addr, EXPECTED_FSD_FAULT);
+                scenario.crash_fsd_v1(sender);
+                println!(
+                    "FSD_V1 EXIT task={} task_generation={} reason=real_user_page_fault addr={:#x} filesystem_prepared=true device_committed=false guest_reply=false",
+                    sender.id(),
+                    sender.generation(),
+                    info.addr,
+                );
+                done.wake_up();
+                return;
+            }
+            ReturnReason::KernelEvent => Task::yield_now(),
+        }
+    }
+}
+
+#[cfg(feature = "virtio-cser-facade")]
+fn run_fsd_v2(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, done: EffectWaker) {
+    let sender = current_fsd_task(FILESYSTEM_V2, &vm_space);
+    vm_space.activate();
+    let mut context = UserContext::default();
+    context.set_rip(USER_MAP_ADDR);
+    let mut user_mode = UserMode::new(context);
+    loop {
+        vm_space.activate();
+        match user_mode.execute(|| false) {
+            ReturnReason::UserSyscall => match user_mode.context().rax() {
+                FSD_RECOVERY_SNAPSHOT => {
+                    scenario.fsd_recovery_snapshot(sender);
+                    user_mode.context_mut().set_rax(0);
+                }
+                FSD_READY => {
+                    scenario.fsd_recovery_ready(sender);
+                    user_mode.context_mut().set_rax(0);
+                }
+                FSD_REBIND => {
+                    scenario.fsd_recovery_rebind(sender);
+                    user_mode.context_mut().set_rax(0);
+                }
+                FSD_ADOPT_NEXT => {
+                    let adopted = scenario.fsd_adopt_next(sender);
+                    user_mode.context_mut().set_rax(0);
+                    user_mode.context_mut().set_rdi(usize::from(adopted));
+                }
+                FSD_REPLAY_OLD => {
+                    scenario.fsd_deliver_old_prepare(sender);
+                    user_mode.context_mut().set_rax(FSD_RESULT_STALE_BINDING);
+                }
+                FSD_COMMIT => {
+                    scenario.fsd_execute_recovered();
+                    user_mode.context_mut().set_rax(0);
+                }
+                FSD_PUBLISH => {
+                    scenario.fsd_publish_response();
+                    user_mode.context_mut().set_rax(0);
+                }
+                FSD_DONE => {
+                    scenario.fsd_service_done();
+                    println!(
+                        "FSD_V2 EXIT task={} task_generation={} reason=bounded_service_done recovered_filesystem=true reply_wakeups=1",
+                        sender.id(),
+                        sender.generation(),
+                    );
+                    done.wake_up();
+                    return;
+                }
+                FSD_FAIL => panic!(
+                    "runtime-fs fsd-v2 protocol failure code={}",
+                    user_mode.context().rdi(),
+                ),
+                opcode => panic!("runtime-fs fsd-v2 unknown portal {opcode:#x}"),
+            },
+            ReturnReason::UserException => panic!(
+                "runtime-fs fsd-v2 unexpectedly faulted: {:?}",
+                user_mode.context_mut().take_exception(),
+            ),
+            ReturnReason::KernelEvent => Task::yield_now(),
+        }
+    }
+}
+
 pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
     #[cfg(not(feature = "virtio-cser-facade"))]
     lifecycle_companion::run_filesystem_lifecycle_companion();
@@ -4166,8 +4927,30 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
         state: SpinLock::new(FsState::new()),
         #[cfg(feature = "virtio-cser-facade")]
         production: SpinLock::new(ProductionReadRuntime::new()),
+        #[cfg(feature = "virtio-cser-facade")]
+        service: SpinLock::new(FsServiceProtocol::new()),
         done: SpinLock::new(Some(done_waker)),
     });
+    #[cfg(feature = "virtio-cser-facade")]
+    let v1_vm = Arc::new(create_vm_space(FSD_V1_PROGRAM));
+    #[cfg(feature = "virtio-cser-facade")]
+    let (v1_waiter, v1_waker) = EffectWaiter::new_pair(EffectToken {
+        authority_epoch: AUTHORITY_EPOCH,
+        scope_id: SCOPE.id(),
+        effect_id: FSD_V1_DONE_EFFECT,
+    });
+    #[cfg(feature = "virtio-cser-facade")]
+    let v1_task = {
+        let task_scenario = scenario.clone();
+        let task_vm = v1_vm.clone();
+        let data_vm = v1_vm.clone();
+        Arc::new(
+            TaskOptions::new(move || run_fsd_v1(task_scenario, task_vm, v1_waker))
+                .data(TaskData::new_cser(FILESYSTEM_V1, Some(data_vm)))
+                .build()
+                .expect("build runtime-fs fsd-v1"),
+        )
+    };
     let task_scenario = scenario.clone();
     let task_vm = loaded.vm_space.clone();
     let entry = loaded.entry;
@@ -4227,7 +5010,55 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
         SAME_BOOT_IMAGE_SHA256,
         SAME_BOOT_SECTOR_FNV1A,
     );
+    #[cfg(feature = "virtio-cser-facade")]
+    {
+        println!(
+            "LINUX_FS_SERVICE BEGIN fsd_v1={}:{} fsd_v2={}:{} distinct_task=true distinct_vm=true registry_identity=domain_supervisor bounded=true single_cpu=true",
+            FILESYSTEM_V1.id(),
+            FILESYSTEM_V1.generation(),
+            FILESYSTEM_V2.id(),
+            FILESYSTEM_V2.generation(),
+        );
+        v1_task.run();
+    }
     task.run();
+    #[cfg(feature = "virtio-cser-facade")]
+    {
+        v1_waiter.wait();
+        assert_eq!(scenario.service.lock().phase, FsServicePhase::Crashed);
+        let v2_vm = Arc::new(create_vm_space(FSD_V2_PROGRAM));
+        assert!(!Arc::ptr_eq(&v1_vm, &v2_vm));
+        let (v2_waiter, v2_waker) = EffectWaiter::new_pair(EffectToken {
+            authority_epoch: AUTHORITY_EPOCH,
+            scope_id: SCOPE.id(),
+            effect_id: FSD_V2_DONE_EFFECT,
+        });
+        let v2_task = {
+            let task_scenario = scenario.clone();
+            let task_vm = v2_vm.clone();
+            let data_vm = v2_vm.clone();
+            Arc::new(
+                TaskOptions::new(move || run_fsd_v2(task_scenario, task_vm, v2_waker))
+                    .data(TaskData::new_cser(FILESYSTEM_V2, Some(data_vm)))
+                    .build()
+                    .expect("build runtime-fs fsd-v2 after fsd-v1 crash"),
+            )
+        };
+        assert!(!Arc::ptr_eq(&v1_task, &v2_task));
+        let replacement = v2_task
+            .data()
+            .downcast_ref::<TaskData>()
+            .and_then(|data| data.cser_task)
+            .expect("replacement OSTD task carries a complete Registry TaskKey");
+        assert_eq!(replacement, FILESYSTEM_V2);
+        println!(
+            "LINUX_FS_SERVICE FreshSpawn task={} task_generation={} vm=fresh distinct_task=true distinct_vm=true binding=2",
+            replacement.id(),
+            replacement.generation(),
+        );
+        v2_task.run();
+        v2_waiter.wait();
+    }
     done_waiter.wait();
     #[cfg(not(feature = "virtio-cser-facade"))]
     scenario.state.lock().assert_final();
@@ -4245,6 +5076,18 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
     }
     #[cfg(feature = "virtio-cser-precommit-fault")]
     scenario.state.lock().assert_precommit_final();
+    #[cfg(feature = "virtio-cser-facade")]
+    {
+        scenario.service.lock().assert_complete();
+        #[cfg(not(feature = "virtio-cser-precommit-fault"))]
+        println!(
+            "LINUX_FS_SERVICE PASS real_user_service_crash=true fsd_v1_page_fault=true fsd_v2_post_crash_construction=true fsd_v2_fresh_task=true fsd_v2_fresh_vm=true current_task_key_bound=true crash_cohort=filesystem_read_only delayed_old_prepare=true stale_old_binding_full_projection_unchanged=true old_sender_current_handle_rejected=true device_commit_gate_after_rebind=true device_committed_after_rebind=true guest_reply_after_rebind=true reply_wakeups=1 exactly_once=true registry_quiescent=true bounded=true single_cpu=true"
+        );
+        #[cfg(feature = "virtio-cser-precommit-fault")]
+        println!(
+            "LINUX_FS_SERVICE PASS real_user_service_crash=true fsd_v1_page_fault=true fsd_v2_post_crash_construction=true fsd_v2_fresh_task=true fsd_v2_fresh_vm=true current_task_key_bound=true crash_cohort=filesystem_read_only delayed_old_prepare=true stale_old_binding_full_projection_unchanged=true old_sender_current_handle_rejected=true device_commit_gate_after_rebind=true device_committed_after_rebind=false guest_reply_after_rebind=true reply_wakeups=1 exactly_once=true registry_quiescent=true bounded=true single_cpu=true"
+        );
+    }
     #[cfg(all(
         feature = "virtio-cser-facade",
         not(feature = "virtio-cser-precommit-fault")
@@ -4297,6 +5140,8 @@ pub(crate) fn run_linux_fs_slice() -> RuntimeFsSliceReceipt {
 }
 
 fn run_guest(scenario: Arc<FsScenario>, vm_space: Arc<VmSpace>, entry: usize, stack: usize) {
+    #[cfg(feature = "virtio-cser-facade")]
+    assert_current_fs_task_id(GUEST, &vm_space);
     vm_space.activate();
     let mut context = UserContext::default();
     context.set_rip(entry);

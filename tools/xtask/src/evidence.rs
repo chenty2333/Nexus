@@ -495,7 +495,7 @@ impl Boundaries {
             same_boot_runtime_fs_all_fault_paths_observed: false,
             same_boot_runtime_fs_irq_observed: false,
             same_boot_runtime_fs_smp_vcpus: 1,
-            same_boot_runtime_fs_real_user_service_crash_observed: false,
+            same_boot_runtime_fs_real_user_service_crash_observed: true,
             stage7b_concurrency_boundary: "production transition source under a Loom-modeled outer mutex",
             stage7b_concurrency_races_checked: 14,
             stage7b_fault_cells_checked: 20,
@@ -1249,7 +1249,7 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
         (
             String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot/oracle.log"),
             Some(
-                "runtime filesystem same-boot serial/debug assertions: PASS exact_six_effect_cohort=true owner_iommu_binding=true",
+                "runtime filesystem same-boot serial/debug assertions: PASS real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash",
             ),
         ),
         (
@@ -1265,7 +1265,7 @@ fn system_artifacts() -> Vec<(String, Option<&'static str>)> {
         (
             String::from("kernel/nexus-ostd/artifacts/runtime-fs-same-boot-precommit/oracle.log"),
             Some(
-                "runtime filesystem same-boot precommit serial/debug assertions: PASS prepared_owner_retained=true was_published=false owner_iova_translations=0 target_notify=false target_read=false target_completion=false",
+                "runtime filesystem same-boot precommit serial/debug assertions: PASS real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash",
             ),
         ),
         (
@@ -1738,7 +1738,7 @@ mod tests {
         assert!(!boundaries.same_boot_runtime_fs_all_fault_paths_observed);
         assert!(!boundaries.same_boot_runtime_fs_irq_observed);
         assert_eq!(boundaries.same_boot_runtime_fs_smp_vcpus, 1);
-        assert!(!boundaries.same_boot_runtime_fs_real_user_service_crash_observed);
+        assert!(boundaries.same_boot_runtime_fs_real_user_service_crash_observed);
         assert_eq!(boundaries.stage7b_concurrency_races_checked, 14);
         assert_eq!(boundaries.stage7b_fault_cells_checked, 20);
         assert_eq!(boundaries.stage7b_scale_points_checked, 14);
@@ -1777,7 +1777,7 @@ mod tests {
         assert_eq!(json["same_boot_runtime_fs_smp_vcpus"], 1);
         assert_eq!(
             json["same_boot_runtime_fs_real_user_service_crash_observed"],
-            false
+            true
         );
         assert_eq!(json["stage7b_contribution_verdict"], "narrow");
         assert_eq!(json["stage7b_performance_claim"], "Observed");

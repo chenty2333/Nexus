@@ -79,6 +79,8 @@ COPY kernel/nexus-ostd/guest/linux-futex-core-personality-v1.S \
     kernel/nexus-ostd/guest/linux-futex-core-personality-v2.S \
     kernel/nexus-ostd/guest/linux-netd-v1.S \
     kernel/nexus-ostd/guest/linux-netd-v2.S \
+    kernel/nexus-ostd/guest/linux-fsd-v1.S \
+    kernel/nexus-ostd/guest/linux-fsd-v2.S \
     /tmp/nexus-ostd-inputs/guest/
 COPY kernel/nexus-ostd/scripts/build-guest.sh \
     kernel/nexus-ostd/scripts/assert-linux-elf.sh \
@@ -132,6 +134,10 @@ RUN --mount=type=bind,source=kernel/nexus-ostd,target=/tmp/nexus-ostd-source,rea
         /tmp/nexus-ostd-source/guest/linux-netd-v1.S \
     && cmp /tmp/nexus-ostd-inputs/guest/linux-netd-v2.S \
         /tmp/nexus-ostd-source/guest/linux-netd-v2.S \
+    && cmp /tmp/nexus-ostd-inputs/guest/linux-fsd-v1.S \
+        /tmp/nexus-ostd-source/guest/linux-fsd-v1.S \
+    && cmp /tmp/nexus-ostd-inputs/guest/linux-fsd-v2.S \
+        /tmp/nexus-ostd-source/guest/linux-fsd-v2.S \
     && cmp /tmp/nexus-ostd-inputs/scripts/build-guest.sh \
         /tmp/nexus-ostd-source/scripts/build-guest.sh \
     && cmp /tmp/nexus-ostd-inputs/scripts/assert-linux-elf.sh \

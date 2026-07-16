@@ -156,6 +156,19 @@ flight="$work/device-flight.rs"
 runtime="$work/production-runtime.rs"
 runtime_impl="$work/production-runtime-impl.rs"
 dispatch="$work/same-boot-dispatch.rs"
+capture="$work/same-boot-capture.rs"
+guest_wait="$work/filesystem-guest-wait.rs"
+service_next="$work/filesystem-service-next.rs"
+service_prepare="$work/filesystem-service-prepare.rs"
+service_queue="$work/filesystem-service-queue.rs"
+service_crash="$work/filesystem-service-crash.rs"
+service_recovery="$work/filesystem-service-recovery.rs"
+service_stale="$work/filesystem-service-stale.rs"
+service_execute="$work/filesystem-service-execute.rs"
+service_publish="$work/filesystem-service-publish.rs"
+fsd_task_identity="$work/filesystem-service-task-identity.rs"
+fsd_v1_runner="$work/filesystem-service-v1-runner.rs"
+fsd_v2_runner="$work/filesystem-service-v2-runner.rs"
 closure_driver="$work/closure-driver.rs"
 post_terminal="$work/post-terminal.rs"
 publication_apply="$work/publication-apply.rs"
@@ -177,8 +190,34 @@ extract_between "$source_file" 'struct ProductionReadRuntime {' \
     'impl ProductionReadRuntime {' "$runtime"
 extract_between "$source_file" 'impl ProductionReadRuntime {' \
     'struct ProductionReadReceipt {' "$runtime_impl"
+extract_between "$source_file" 'fn fsd_next_operation(&self, sender: TaskKey)' \
+    'fn fsd_prepare_active(&self, sender: TaskKey)' "$service_next"
+extract_between "$source_file" 'fn fsd_prepare_active(&self, sender: TaskKey)' \
+    'fn fsd_queue_old_prepare(&self, sender: TaskKey)' "$service_prepare"
+extract_between "$source_file" 'fn fsd_queue_old_prepare(&self, sender: TaskKey)' \
+    'fn crash_fsd_v1(&self, sender: TaskKey)' "$service_queue"
+extract_between "$source_file" 'fn crash_fsd_v1(&self, sender: TaskKey)' \
+    'fn fsd_recovery_snapshot(&self, sender: TaskKey)' "$service_crash"
+extract_between "$source_file" 'fn fsd_recovery_snapshot(&self, sender: TaskKey)' \
+    'fn fsd_deliver_old_prepare(&self, delivery_sender: TaskKey)' "$service_recovery"
+extract_between "$source_file" 'fn fsd_deliver_old_prepare(&self, delivery_sender: TaskKey)' \
+    'fn fsd_execute_recovered(&self)' "$service_stale"
+extract_between "$source_file" 'fn fsd_execute_recovered(&self)' \
+    'fn fsd_publish_response(&self)' "$service_execute"
+extract_between "$source_file" 'fn fsd_publish_response(&self)' \
+    '// The single polling actor restores each linear successor' "$service_publish"
+extract_between "$source_file" 'fn capture_first_executable_pread_same_boot(' \
+    'fn dispatch_first_executable_pread_same_boot(' "$capture"
 extract_between "$source_file" 'fn dispatch_first_executable_pread_same_boot(' \
+    'fn execute_recovered_first_pread_same_boot(' "$guest_wait"
+extract_between "$source_file" 'fn execute_recovered_first_pread_same_boot(' \
     'fn dispatch_first_executable_pread(' "$dispatch"
+extract_between "$source_file" 'fn current_fsd_task(' \
+    'fn run_fsd_v1(' "$fsd_task_identity"
+extract_between "$source_file" 'fn run_fsd_v1(' \
+    'fn run_fsd_v2(' "$fsd_v1_runner"
+extract_between "$source_file" 'fn run_fsd_v2(' \
+    'pub(crate) fn run_linux_fs_slice()' "$fsd_v2_runner"
 extract_between "$source_file" 'fn drive_closure_flight(&self) -> DispatchOutcome {' \
     'fn dispatch_first_executable_pread(' "$closure_driver"
 extract_between "$closure_driver" '.stage_device_batch_terminal(' \
@@ -294,6 +333,191 @@ require_count "$semantic_close" 'publish,' 1
 require_count "$semantic_close" 'DeviceCloseOutcome::Recovered { receipt, selection }' 1
 reject_fixed "$semantic_close" 'publish(&'
 
+# The first executable pread is a real cross-task request. Capture installs the
+# syscall flight, then the guest drops every Registry/service guard before it
+# publishes the blocking receipt.  QueuedUnannounced prevents fsd-v1 from
+# consuming the request until that no-lock receipt has been emitted; the sticky
+# waiter then preserves a wake between admission and wait().
+require_count "$capture" 'runtime.registry.register_derived(' 1
+require_count "$capture" 'task: GUEST,' 1
+require_count "$capture" 'domain: PERSONALITY_DOMAIN,' 1
+require_count "$source_file" 'QueuedUnannounced,' 1
+require_count "$source_file" 'self.phase = FsServicePhase::QueuedUnannounced;' 1
+require_count "$source_file" 'fn arm_queued(&mut self) {' 1
+require_count "$service_next" 'if service.phase != FsServicePhase::Queued {' 1
+require_count "$guest_wait" '.enqueue_unannounced(descriptor, cookie, waker);' 1
+require_count "$guest_wait" 'self.service.lock().arm_queued();' 1
+require_count "$guest_wait" 'waiter.wait();' 1
+require_count "$guest_wait" 'self.service.lock().take_outcome()' 1
+require_order "$guest_wait" \
+    '.enqueue_unannounced(descriptor, cookie, waker);' \
+    'all_locks_released=true reply_wakeups=0' \
+    'self.service.lock().arm_queued();' \
+    'waiter.wait();' \
+    'self.service.lock().take_outcome()'
+reject_fixed "$guest_wait" 'self.production.lock()'
+reject_fixed "$guest_wait" 'let service = self.service.lock()'
+reject_fixed "$guest_wait" 'let mut service = self.service.lock()'
+
+# fsd-v1 owns the Registry supervisor TaskKey. It registers and prepares the
+# one filesystem descendant before any block/DMA member exists.
+require_count "$service_next" 'assert_eq!(sender, FILESYSTEM_V1);' 1
+require_count "$service_next" '.register_derived(DerivedRegisterRequest {' 1
+require_count "$service_next" 'task: sender,' 1
+require_count "$service_next" 'domain: FILESYSTEM_DOMAIN,' 1
+require_count "$service_next" 'parent: Some(syscall.identity.effect()),' 1
+require_at_least "$service_next" '.domain_projection(SCOPE, BLOCK_DOMAIN)' 1
+require_count "$service_next" '.live_effects,' 1
+require_count "$service_next" 'service.phase = FsServicePhase::Registered;' 1
+require_count "$service_prepare" 'assert_eq!(sender, FILESYSTEM_V1);' 1
+require_count "$service_prepare" '.prepare(sender, filesystem.handle)' 1
+require_count "$service_prepare" 'assert_eq!(view.phase, EffectPhase::Prepared);' 1
+require_at_least "$service_prepare" '.domain_projection(SCOPE, BLOCK_DOMAIN)' 1
+require_count "$service_prepare" 'FsDeviceFlight::Captured { .. }' 1
+require_count "$service_prepare" 'self.service.lock().phase = FsServicePhase::Prepared;' 1
+
+# fsd-v1 itself queues the typed delayed command before the fault.  Delivery is
+# a later recovery action; it does not manufacture the old sender at that time.
+require_count "$service_queue" 'assert_eq!(sender, FILESYSTEM_V1);' 1
+require_count "$service_queue" 'DelayedPrepareCommand { sender, handle }' 1
+require_count "$service_queue" 'service.delayed_prepare = Some(' 1
+require_count "$service_queue" 'delivery=after_rebind' 1
+require_count "$fsd_v1_runner" 'scenario.fsd_queue_old_prepare(sender);' 1
+require_order "$fsd_v1_runner" \
+    'FSD_PREPARE => {' \
+    'scenario.fsd_prepare_active(sender);' \
+    'FSD_QUEUE_OLD_PREPARE => {' \
+    'scenario.fsd_queue_old_prepare(sender);' \
+    'Some(CpuException::PageFault(info)) => info,'
+
+# The real user page fault is the only fsd-v1 terminal boundary. Registry crash
+# sees exactly the prepared filesystem effect, no device cohort, and no reply.
+for required in \
+    'assert_eq!(service.phase, FsServicePhase::Prepared);' \
+    'assert!(service.outcome.is_none());' \
+    'assert_eq!(service.reply_wakeups, 0);' \
+    '.domain_projection(SCOPE, BLOCK_DOMAIN)' \
+    'FsDeviceFlight::Captured { .. }' \
+    '.crash_domain(SCOPE, FILESYSTEM_DOMAIN, sender)' \
+    'assert_eq!(crash.cohort.len(), 1);' \
+    'assert!(crash.cohort.contains(&filesystem.identity.effect()));' \
+    'self.service.lock().phase = FsServicePhase::Crashed;' \
+    'device_committed=false guest_reply=false'; do
+    require_at_least "$service_crash" "$required" 1
+done
+require_count "$fsd_v1_runner" 'Some(CpuException::PageFault(info)) => info,' 1
+require_count "$fsd_v1_runner" 'assert_eq!(info.addr, EXPECTED_FSD_FAULT);' 1
+require_count "$fsd_v1_runner" 'scenario.crash_fsd_v1(sender);' 1
+require_count "$fsd_v1_runner" 'task_generation={}' 1
+require_order "$fsd_v1_runner" \
+    'Some(CpuException::PageFault(info)) => info,' \
+    'assert_eq!(info.addr, EXPECTED_FSD_FAULT);' \
+    'scenario.crash_fsd_v1(sender);' \
+    'reason=real_user_page_fault' \
+    'done.wake_up();' \
+    'return;'
+
+# fsd-v2 follows the typed Registry recovery protocol and adopts the exact old
+# handle before either a stale mutation attempt or device work can proceed.
+for required in \
+    '.domain_recovery_snapshot(SCOPE, FILESYSTEM_DOMAIN, sender)' \
+    '.domain_ready(SCOPE, FILESYSTEM_DOMAIN, sender, &snapshot)' \
+    '.rebind_domain(SCOPE, FILESYSTEM_DOMAIN, sender)' \
+    '.recover_next_domain(SCOPE, FILESYSTEM_DOMAIN, sender)' \
+    '.adopt_domain(SCOPE, FILESYSTEM_DOMAIN, sender, old_handle)' \
+    'assert_eq!(snapshot.effects.len(), 1);' \
+    'assert_eq!(snapshot.effects[0].phase, EffectPhase::Prepared);' \
+    'service.phase = FsServicePhase::Adopted;'; do
+    require_at_least "$service_recovery" "$required" 1
+done
+require_order "$service_recovery" \
+    'fn fsd_recovery_snapshot(&self, sender: TaskKey)' \
+    'fn fsd_recovery_ready(&self, sender: TaskKey)' \
+    'fn fsd_recovery_rebind(&self, sender: TaskKey)' \
+    'fn fsd_adopt_next(&self, sender: TaskKey)'
+
+# Delivery presents both halves of the queued v1 identity.  The old handle is
+# StaleBinding after adoption; the same old sender paired with the current
+# adopted handle is NoSupervisor.  Both mutating attempts preserve the complete
+# Registry and service projections.
+require_count "$service_stale" 'let mut runtime = self.production.lock();' 1
+require_count "$service_stale" 'runtime.registry.failure_atomic_projection();' 3
+require_count "$service_stale" \
+    'runtime.registry.prepare(command.sender, command.handle),' 1
+require_count "$service_stale" \
+    'runtime.registry.prepare(command.sender, adopted_handle),' 1
+require_count "$service_stale" 'Err(RegistryError::StaleBinding),' 1
+require_count "$service_stale" 'Err(RegistryError::NoSupervisor),' 1
+require_count "$service_stale" 'assert_eq!(after_old_handle, before_registry);' 1
+require_count "$service_stale" 'assert_eq!(after_old_sender, before_registry);' 1
+require_count "$service_stale" 'assert_eq!(after_service, before_service);' 1
+require_at_least "$service_stale" \
+    'queued_generation={} action=Prepare' 1
+reject_fixed "$service_stale" 'runtime.registry.descriptor('
+
+# Device execution is admitted only after Adopted plus the stale replay fence.
+# fsd-v2 installs one outcome and consumes one response waker outside its lock.
+require_count "$service_execute" 'assert_eq!(service.phase, FsServicePhase::Adopted);' 2
+require_count "$service_execute" 'assert!(service.stale_replay_observed);' 1
+require_count "$service_execute" 'self.execute_recovered_first_pread_same_boot(' 1
+require_count "$service_publish" 'assert_eq!(service.phase, FsServicePhase::Executed);' 1
+require_count "$service_publish" 'assert_eq!(service.reply_wakeups, 0);' 1
+require_count "$service_publish" 'service.phase = FsServicePhase::ReplyReady;' 1
+require_count "$service_publish" 'service.reply_wakeups = 1;' 1
+require_count "$service_publish" '.response_waker' 2
+require_count "$service_publish" '.take()' 1
+require_count "$service_publish" 'waker.wake_up();' 1
+require_order "$service_publish" \
+    'fn fsd_publish_response(&self)' \
+    'assert_eq!(service.reply_wakeups, 0);' \
+    'service.reply_wakeups = 1;' \
+    '.expect("one blocked runtime-fs guest continuation")' \
+    'all_locks_released=true' \
+    'waker.wake_up();' \
+    'fn fsd_service_done(&self)'
+
+# The OSTD runners carry the complete TaskKey in TaskData; their portal sender is
+# derived from Task::current(), not filled in by a closure constant.  The v2 VM,
+# continuation, and Task are all constructed only after v1's crash receipt.
+require_count "$source_file" 'const FILESYSTEM_V1: TaskKey = TaskKey::new(951, 1);' 1
+require_count "$source_file" 'const FILESYSTEM_V2: TaskKey = TaskKey::new(951, 2);' 1
+require_count "$lib_file" 'pub(crate) cser_task: Option<TaskKey>,' 1
+require_count "$lib_file" 'pub(crate) fn new_cser(task: TaskKey, vm_space: Option<Arc<VmSpace>>) -> Self {' 1
+require_count "$lib_file" 'cser_task: Some(task),' 1
+require_count "$fsd_task_identity" '.cser_task' 1
+require_count "$fsd_task_identity" 'assert_eq!(task, expected);' 1
+require_count "$fsd_task_identity" 'assert_eq!(data.id, task.id());' 1
+require_count "$fsd_task_identity" 'Arc::ptr_eq(active, vm_space)' 1
+require_count "$fsd_v1_runner" 'let sender = current_fsd_task(FILESYSTEM_V1, &vm_space);' 1
+require_count "$fsd_v2_runner" 'let sender = current_fsd_task(FILESYSTEM_V2, &vm_space);' 1
+require_count "$fsd_v2_runner" 'scenario.fsd_deliver_old_prepare(sender);' 1
+for required in \
+    'assert!(!Arc::ptr_eq(&v1_vm, &v2_vm));' \
+    'TaskOptions::new(move || run_fsd_v1(task_scenario, task_vm, v1_waker))' \
+    '.data(TaskData::new_cser(FILESYSTEM_V1, Some(data_vm)))' \
+    'TaskOptions::new(move || run_fsd_v2(task_scenario, task_vm, v2_waker))' \
+    '.data(TaskData::new_cser(FILESYSTEM_V2, Some(data_vm)))' \
+    'assert!(!Arc::ptr_eq(&v1_task, &v2_task));' \
+    'v1_waiter.wait();' \
+    'assert_eq!(scenario.service.lock().phase, FsServicePhase::Crashed);' \
+    'v2_task.run();' \
+    'v2_waiter.wait();' \
+    'scenario.service.lock().assert_complete();' \
+    'device_commit_gate_after_rebind=true device_committed_after_rebind=true' \
+    'device_commit_gate_after_rebind=true device_committed_after_rebind=false'; do
+    require_at_least "$run_slice" "$required" 1
+done
+require_order "$run_slice" \
+    'v1_waiter.wait();' \
+    'assert_eq!(scenario.service.lock().phase, FsServicePhase::Crashed);' \
+    'let v2_vm = Arc::new(create_vm_space(FSD_V2_PROGRAM));' \
+    'let (v2_waiter, v2_waker) = EffectWaiter::new_pair(EffectToken {' \
+    'TaskOptions::new(move || run_fsd_v2(task_scenario, task_vm, v2_waker))' \
+    '.data(TaskData::new_cser(FILESYSTEM_V2, Some(data_vm)))' \
+    'LINUX_FS_SERVICE FreshSpawn' \
+    'v2_task.run();' \
+    'v2_waiter.wait();'
+
 # The real workload creates and enrolls the exact six-effect flight before the
 # one close operation. Exact recovery never republishes. A published error is
 # converted to a retained semantic obligation and the concrete hardware owner
@@ -306,7 +530,7 @@ for required in \
     'FsDeviceFlight::Retained {'; do
     require_at_least "$dispatch" "$required" 1
 done
-require_count "$dispatch" 'runtime.registry.register_derived(' 2
+reject_fixed "$dispatch" 'runtime.registry.register_derived('
 require_count "$dispatch" 'runtime.registry.register_device_derived_cohort([' 1
 require_count "$dispatch" '.enroll_device_batch(' 1
 require_count "$dispatch" \
@@ -641,7 +865,126 @@ if [[ ${NEXUS_SAME_BOOT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
     require_source_rejection "$work/fallible-production-guest-write.rs" \
         fallible-production-guest-write
 
-    [[ $mutations == 14 ]] || fail "expected 14 source mutations, observed $mutations"
+    awk '
+        !changed && /waiter\.wait\(\);/ {
+            print "        let _held = self.production.lock();"
+            changed = 1
+        }
+        { print }
+        END { if (!changed) exit 2 }
+    ' "$source_file" >"$work/wait-under-production-lock.rs"
+    require_mutation "$source_file" "$work/wait-under-production-lock.rs" \
+        wait-under-production-lock
+    require_source_rejection "$work/wait-under-production-lock.rs" \
+        wait-under-production-lock
+
+    awk '
+        /fn crash_fsd_v1\(&self, sender: TaskKey\)/ { service_crash = 1 }
+        service_crash && !changed && /\.crash_domain\(/ {
+            sub(/\.crash_domain/, ".crash_scope")
+            changed = 1
+        }
+        { print }
+        END { if (!changed) exit 2 }
+    ' "$source_file" >"$work/missing-service-crash-domain.rs"
+    require_mutation "$source_file" "$work/missing-service-crash-domain.rs" \
+        missing-service-crash-domain
+    require_source_rejection "$work/missing-service-crash-domain.rs" \
+        missing-service-crash-domain
+
+    cp "$source_file" "$work/shared-fsd-vm.rs"
+    sed -i \
+        '0,/assert!(!Arc::ptr_eq(\&v1_vm, \&v2_vm));/s//assert!(Arc::ptr_eq(\&v1_vm, \&v2_vm));/' \
+        "$work/shared-fsd-vm.rs"
+    require_mutation "$source_file" "$work/shared-fsd-vm.rs" shared-fsd-vm
+    require_source_rejection "$work/shared-fsd-vm.rs" shared-fsd-vm
+
+    cp "$source_file" "$work/shared-fsd-task.rs"
+    sed -i \
+        '0,/assert!(!Arc::ptr_eq(\&v1_task, \&v2_task));/s//assert!(Arc::ptr_eq(\&v1_task, \&v2_task));/' \
+        "$work/shared-fsd-task.rs"
+    require_mutation "$source_file" "$work/shared-fsd-task.rs" shared-fsd-task
+    require_source_rejection "$work/shared-fsd-task.rs" shared-fsd-task
+
+    awk '
+        { lines[NR] = $0 }
+        /v1_waiter\.wait\(\);/ { wait_line = NR }
+        /let v2_vm = Arc::new\(create_vm_space\(FSD_V2_PROGRAM\)\);/ { vm_line = NR }
+        END {
+            if (!wait_line || !vm_line || wait_line >= vm_line) exit 2
+            swap = lines[wait_line]
+            lines[wait_line] = lines[vm_line]
+            lines[vm_line] = swap
+            for (line = 1; line <= NR; line++) print lines[line]
+        }
+    ' "$source_file" >"$work/preconstructed-fsd-v2.rs"
+    require_mutation "$source_file" "$work/preconstructed-fsd-v2.rs" \
+        preconstructed-fsd-v2
+    require_source_rejection "$work/preconstructed-fsd-v2.rs" \
+        preconstructed-fsd-v2
+
+    cp "$source_file" "$work/early-service-admission.rs"
+    sed -i \
+        '0,/self\.phase = FsServicePhase::QueuedUnannounced;/s//self.phase = FsServicePhase::Queued;/' \
+        "$work/early-service-admission.rs"
+    require_mutation "$source_file" "$work/early-service-admission.rs" \
+        early-service-admission
+    require_source_rejection "$work/early-service-admission.rs" \
+        early-service-admission
+
+    cp "$source_file" "$work/closure-minted-fsd-v2-sender.rs"
+    sed -i \
+        '0,/let sender = current_fsd_task(FILESYSTEM_V2, \&vm_space);/s//let sender = FILESYSTEM_V2;/' \
+        "$work/closure-minted-fsd-v2-sender.rs"
+    require_mutation "$source_file" "$work/closure-minted-fsd-v2-sender.rs" \
+        closure-minted-fsd-v2-sender
+    require_source_rejection "$work/closure-minted-fsd-v2-sender.rs" \
+        closure-minted-fsd-v2-sender
+
+    cp "$source_file" "$work/unbound-fsd-v2-task-data.rs"
+    sed -i \
+        '0,/TaskData::new_cser(FILESYSTEM_V2, Some(data_vm))/s//TaskData::new(FILESYSTEM_V2.id(), Some(data_vm))/' \
+        "$work/unbound-fsd-v2-task-data.rs"
+    require_mutation "$source_file" "$work/unbound-fsd-v2-task-data.rs" \
+        unbound-fsd-v2-task-data
+    require_source_rejection "$work/unbound-fsd-v2-task-data.rs" \
+        unbound-fsd-v2-task-data
+
+    cp "$source_file" "$work/missing-delayed-old-prepare.rs"
+    sed -i \
+        '0,/scenario\.fsd_queue_old_prepare(sender);/s//let _missing_delayed_prepare = sender;/' \
+        "$work/missing-delayed-old-prepare.rs"
+    require_mutation "$source_file" "$work/missing-delayed-old-prepare.rs" \
+        missing-delayed-old-prepare
+    require_source_rejection "$work/missing-delayed-old-prepare.rs" \
+        missing-delayed-old-prepare
+
+    cp "$source_file" "$work/read-only-stale-probe.rs"
+    sed -i \
+        '0,/runtime\.registry\.prepare(command.sender, command.handle)/s//runtime.registry.descriptor(command.sender, command.handle)/' \
+        "$work/read-only-stale-probe.rs"
+    require_mutation "$source_file" "$work/read-only-stale-probe.rs" read-only-stale-probe
+    require_source_rejection "$work/read-only-stale-probe.rs" read-only-stale-probe
+
+    cp "$source_file" "$work/duplicate-reply-wakeup.rs"
+    sed -i \
+        '0,/service\.reply_wakeups = 1;/s//service.reply_wakeups = 2;/' \
+        "$work/duplicate-reply-wakeup.rs"
+    require_mutation "$source_file" "$work/duplicate-reply-wakeup.rs" \
+        duplicate-reply-wakeup
+    require_source_rejection "$work/duplicate-reply-wakeup.rs" \
+        duplicate-reply-wakeup
+
+    cp "$source_file" "$work/stale-fsd-v2-task-key.rs"
+    sed -i \
+        '0,/const FILESYSTEM_V2: TaskKey = TaskKey::new(951, 2);/s//const FILESYSTEM_V2: TaskKey = TaskKey::new(951, 1);/' \
+        "$work/stale-fsd-v2-task-key.rs"
+    require_mutation "$source_file" "$work/stale-fsd-v2-task-key.rs" \
+        stale-fsd-v2-task-key
+    require_source_rejection "$work/stale-fsd-v2-task-key.rs" \
+        stale-fsd-v2-task-key
+
+    [[ $mutations == 26 ]] || fail "expected 26 source mutations, observed $mutations"
 fi
 
-echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=14'
+echo 'runtime filesystem same-boot source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser flight=single_actor_slot_handoff actor_resident=false semantic_identity=registry_issued real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed guest_wait_locks=none crash_cohort=filesystem_read_only stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor reply_wakeups=1 published_error=retained ack_revoke=failure_atomic guest_write=prevalidated+infallible_frame_apply fail_stop=before_guest_resume post_terminal_allocation=false facade_companion=false polling=true irq_evidence=false smp=1 legacy_phase=false rfc0001_full_closure=false mutations=26'

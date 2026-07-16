@@ -58,6 +58,8 @@ mod stage7b_evaluation;
 use alloc::{boxed::Box, sync::Arc};
 
 use effect::{EffectTimer, EffectToken, EffectWaiter};
+#[cfg(feature = "virtio-cser-facade")]
+use effect_registry::TaskKey;
 #[cfg(not(feature = "virtio-cser-facade"))]
 use iommu_probe::{DmaQuiesceError, DmaQuiescer, Ostd018FailClosed};
 use ostd::{
@@ -88,6 +90,8 @@ const SYSCALL_PROBE: usize = 0x4353_4552;
 pub struct TaskData {
     pub(crate) id: u64,
     pub(crate) vm_space: Option<Arc<VmSpace>>,
+    #[cfg(feature = "virtio-cser-facade")]
+    pub(crate) cser_task: Option<TaskKey>,
     dynamic_vm_space: Option<Arc<SpinLock<Arc<VmSpace>>>>,
 }
 
@@ -96,6 +100,22 @@ impl TaskData {
         Self {
             id,
             vm_space,
+            #[cfg(feature = "virtio-cser-facade")]
+            cser_task: None,
+            dynamic_vm_space: None,
+        }
+    }
+
+    /// Binds an OSTD task to the complete Registry service identity that its
+    /// portal calls must present.  Ordinary guest/scheduler tasks deliberately
+    /// leave this absent; restartable service runners opt in explicitly so a
+    /// closure cannot manufacture a binding generation at the call site.
+    #[cfg(feature = "virtio-cser-facade")]
+    pub(crate) fn new_cser(task: TaskKey, vm_space: Option<Arc<VmSpace>>) -> Self {
+        Self {
+            id: task.id(),
+            vm_space,
+            cser_task: Some(task),
             dynamic_vm_space: None,
         }
     }
@@ -106,6 +126,8 @@ impl TaskData {
         Self {
             id,
             vm_space: None,
+            #[cfg(feature = "virtio-cser-facade")]
+            cser_task: None,
             dynamic_vm_space: Some(vm_space),
         }
     }

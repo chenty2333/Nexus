@@ -635,22 +635,30 @@ fail-closed prepared-queue owner, an infallible unique Release publication,
 and exact-buffer cancellation. The optional production facade adds descriptive
 hardware coordinates, failure-atomic identity preflight, and a prevalidated
 infallible reset-generation plan without owning registry authority. IOTLB
-quiescence uses the same prevalidate/direct-apply shape so a future adapter can
-couple registry acknowledgement and facade slot release. These are source/build
-checks; no primary runtime call is implied.
+quiescence uses the same prevalidate/direct-apply shape so the Registry can
+couple acknowledgement and facade slot release.
 
-This is a reusable build and source foundation, not a primary-kernel device
-runtime result. No device runtime in this kernel currently calls the patched
-DMA closure API, maps a real configured GSI, delivers a device IRQ, or composes
-the Stage 5B device in the same boot. The selected runtime adapter remains
-`Ostd018FailClosed`; `unmap_invalidate_and_wait` always returns
-`IotlbInvalidationUnavailable`, so this path never reports DMA quiescence.
-Device-level drain/reset must precede even a future synchronous IOTLB
-invalidation adapter.
+The later bounded runtime-filesystem schemes now exercise that facade in the
+primary kernel. After a real user-mode fsd-v1 page fault and a post-crash
+fsd-v2 Task/VmSpace construction plus Registry recovery, the normal lane
+enrolls one six-effect cohort, performs one same-boot VirtIO/IOMMU read, polls
+its completion with INTx masked, retains the concrete owners across injected
+reset and IOTLB Pending results, and releases them after acknowledgement. The
+paired pre-commit lane prepares the same concrete owners but lets revoke win
+before device publication. This is a one-vCPU, one-request vertical slice; it
+does not map a real configured GSI, deliver an IRQ, cover every crash point, or
+establish SMP/device breadth.
+
+The generic `iommu_probe` adapter remains `Ostd018FailClosed`; its
+`unmap_invalidate_and_wait` still returns `IotlbInvalidationUnavailable` rather
+than claiming unsupported quiescence. That probe and the runtime-filesystem
+facade are separate call sites. Device-level drain/reset continues to precede
+the synchronous IOTLB completion consumed by the bounded facade path.
 
 `./x iommu-probe` deliberately checks the fetched pristine archive, rather
 than the patched build tree, so the upstream 0.18.0 gap remains explicit. The
 separate Stage 5B experiment consumes the canonical patch and establishes only
-the bounded polling, single-CPU emulator receipt documented in the root
-architecture. Real primary-kernel DMA closure, IRQ delivery/quiescence,
-same-boot composition, and SMP remain unestablished.
+its older component-consistency receipt. The newer runtime-filesystem schemes
+provide the primary-kernel same-boot DMA observation described above; real IRQ
+delivery/quiescence, 2/4-vCPU execution, and the remaining RFC fault matrix are
+still unestablished.

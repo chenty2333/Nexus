@@ -21,6 +21,8 @@ raw_guests=(
     linux-dynamic-personality-v2
     linux-netd-v1
     linux-netd-v2
+    linux-fsd-v1
+    linux-fsd-v2
 )
 
 for guest in "${raw_guests[@]}"; do
@@ -62,6 +64,8 @@ assert_symbol_offset "$tmp/linux-futex-shared.o" _start 0
 assert_symbol_offset "$tmp/linux-futex-shared.o" _waker_start 0x200
 assert_symbol_offset "$tmp/linux-futex-personality-v1.o" _start 0
 assert_symbol_offset "$tmp/linux-futex-personality-v1.o" _expire_start 0x200
+assert_symbol_offset "$tmp/linux-fsd-v1.o" _start 0
+assert_symbol_offset "$tmp/linux-fsd-v2.o" _start 0
 assert_raw_binary \
     "$tmp/linux-futex-shared.o" guest/linux-futex-shared.bin 4096
 assert_raw_binary \
@@ -80,6 +84,10 @@ assert_raw_binary \
     "$tmp/linux-netd-v1.o" guest/linux-netd-v1.bin 4096
 assert_raw_binary \
     "$tmp/linux-netd-v2.o" guest/linux-netd-v2.bin 4096
+assert_raw_binary \
+    "$tmp/linux-fsd-v1.o" guest/linux-fsd-v1.bin 4096
+assert_raw_binary \
+    "$tmp/linux-fsd-v2.o" guest/linux-fsd-v2.bin 4096
 
 personality_manifest=userspace/personality/Cargo.toml
 cargo build \

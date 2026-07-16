@@ -31,6 +31,13 @@ function require_event(name) {
              ", observed " name)
 }
 
+function require_service_event(name) {
+    service_events++
+    if (expected_service_event[service_events] != name)
+        fail("service event " service_events " expected " \
+             expected_service_event[service_events] ", observed " name)
+}
+
 function add_effect(effect, label) {
     require_decimal(effect, label, 0)
     if (effect in effect_label)
@@ -56,10 +63,139 @@ function parse_capture(    session) {
     syscall_effect = value_at(16, "syscall_effect")
     filesystem_effect = value_at(17, "filesystem_effect")
     block_effect = value_at(18, "block_effect")
+    if (filesystem_effect != service_effect)
+        fail("device Capture filesystem effect does not match fsd-v1 Register: " $0)
     add_effect(syscall_effect, "filesystem_syscall")
     add_effect(filesystem_effect, "filesystem_read")
     add_effect(block_effect, "block_request")
     capture_line = FNR
+}
+
+function parse_service_line(    event, cookie, effect, before, after) {
+    if ($1 == "FSD_V1") {
+        require_service_event("V1Exit")
+        if ($0 != "FSD_V1 EXIT task=951 task_generation=1 reason=real_user_page_fault addr=0x800000 filesystem_prepared=true device_committed=false guest_reply=false")
+            fail("malformed fsd-v1 page-fault exit receipt: " $0)
+        v1_exit_line = FNR
+        return
+    }
+    if ($1 == "FSD_V2") {
+        require_service_event("V2Exit")
+        if ($0 != "FSD_V2 EXIT task=951 task_generation=2 reason=bounded_service_done recovered_filesystem=true reply_wakeups=1")
+            fail("malformed fsd-v2 exit receipt: " $0)
+        v2_exit_line = FNR
+        return
+    }
+
+    event = $2
+    if (event == "BEGIN") {
+        require_service_event("BEGIN")
+        if ($0 != "LINUX_FS_SERVICE BEGIN fsd_v1=951:1 fsd_v2=951:2 distinct_task=true distinct_vm=true registry_identity=domain_supervisor bounded=true single_cpu=true")
+            fail("malformed filesystem-service BEGIN receipt: " $0)
+        service_begin_line = FNR
+    } else if (event == "GuestBlocked") {
+        require_service_event("GuestBlocked")
+        if (NF != 7 || $3 != "task=950" || $4 != "syscall=pread64" ||
+            $6 != "all_locks_released=true" || $7 != "reply_wakeups=0")
+            fail("malformed blocked-guest receipt: " $0)
+        cookie = value_at(5, "cookie")
+        require_decimal(cookie, "service_cookie", 0)
+        service_cookie = cookie
+        guest_blocked_line = FNR
+    } else if (event == "Register") {
+        require_service_event("Register")
+        if (NF != 9 || $3 != "runner=fsd-v1" || $4 != "task=951" ||
+            $6 != "binding=1" || $7 != "parent=syscall" ||
+            $8 != "device_cohort=0" || $9 != "guest_reply=false")
+            fail("malformed fsd-v1 Register receipt: " $0)
+        effect = value_at(5, "effect")
+        require_decimal(effect, "service_effect", 0)
+        service_effect = effect
+        service_register_line = FNR
+    } else if (event == "Prepare") {
+        require_service_event("Prepare")
+        if (NF != 9 || $3 != "runner=fsd-v1" || $4 != "task=951" ||
+            $6 != "phase=Prepared" || $7 != "device_prepared=false" ||
+            $8 != "device_committed=false" || $9 != "guest_reply=false" ||
+            value_at(5, "effect") != service_effect)
+            fail("malformed or mismatched fsd-v1 Prepare receipt: " $0)
+        service_prepare_line = FNR
+    } else if (event == "QueueOldPrepare") {
+        require_service_event("QueueOldPrepare")
+        if (NF != 8 || $3 != "sender=951" || $4 != "sender_generation=1" ||
+            value_at(5, "effect") != service_effect || $6 != "binding=1" ||
+            $7 != "typed=true" || $8 != "delivery=after_rebind")
+            fail("malformed typed delayed fsd-v1 Prepare receipt: " $0)
+        queue_old_prepare_line = FNR
+    } else if (event == "Crash") {
+        require_service_event("Crash")
+        if (NF != 14 || $3 != "runner=fsd-v1" || $4 != "task=951" ||
+            $5 != "old_binding=1" || $6 != "new_binding=2" ||
+            $7 != "cohort=1" || value_at(8, "filesystem_effect") != service_effect ||
+            $9 != "phase=Prepared" || $10 != "device_cohort=0" ||
+            $11 != "device_committed=false" || $12 != "guest_reply=false" ||
+            $13 != "peer_domains_unchanged=true" ||
+            $14 != "real_user_page_fault=true")
+            fail("malformed filesystem-domain Crash receipt: " $0)
+        service_crash_line = FNR
+    } else if (event == "FreshSpawn") {
+        require_service_event("FreshSpawn")
+        if ($0 != "LINUX_FS_SERVICE FreshSpawn task=951 task_generation=2 vm=fresh distinct_task=true distinct_vm=true binding=2")
+            fail("malformed fresh fsd-v2 spawn receipt: " $0)
+        fresh_spawn_line = FNR
+    } else if (event == "Snapshot") {
+        require_service_event("Snapshot")
+        if ($0 != "LINUX_FS_SERVICE Snapshot replacement=951 binding=2 cohort=1 exact=true phase=Prepared")
+            fail("malformed filesystem recovery Snapshot receipt: " $0)
+        snapshot_line = FNR
+    } else if (event == "Ready") {
+        require_service_event("Ready")
+        if ($0 != "LINUX_FS_SERVICE Ready replacement=951 binding=2 snapshot_fresh=true")
+            fail("malformed filesystem recovery Ready receipt: " $0)
+        ready_line = FNR
+    } else if (event == "Rebind") {
+        require_service_event("Rebind")
+        if ($0 != "LINUX_FS_SERVICE Rebind replacement=951 binding=2 personality_binding=1 block_binding=1 peer_domains_unchanged=true")
+            fail("malformed filesystem recovery Rebind receipt: " $0)
+        rebind_line = FNR
+    } else if (event == "Adopt") {
+        require_service_event("Adopt")
+        if (NF != 9 || $3 != "replacement=951" ||
+            value_at(4, "effect") != service_effect || $5 != "old_binding=1" ||
+            $6 != "new_binding=2" || $7 != "phase=Prepared" ||
+            $8 != "identity_preserved=true" || $9 != "explicit=true")
+            fail("malformed or mismatched filesystem recovery Adopt receipt: " $0)
+        adopt_line = FNR
+    } else if (event == "StaleReplay") {
+        require_service_event("StaleReplay")
+        if (NF != 15 || $3 != "delivery_sender=951" ||
+            $4 != "delivery_generation=2" || $5 != "queued_sender=951" ||
+            $6 != "queued_generation=1" || $7 != "action=Prepare" ||
+            $8 != "old_binding=1" || $9 != "current_binding=2" ||
+            $10 != "old_handle_result=StaleBinding" ||
+            $11 != "old_sender_current_handle_result=NoSupervisor" ||
+            $14 != "full_projection_unchanged=true" || $15 != "mutation=false")
+            fail("malformed stale fsd-v1 replay receipt: " $0)
+        before = value_at(12, "projection_before")
+        after = value_at(13, "projection_after")
+        require_hex(before, "stale_projection_before")
+        require_hex(after, "stale_projection_after")
+        if (length(before) != 18 || after != before)
+            fail("stale fsd-v1 replay changed the full Registry projection: " $0)
+        stale_replay_line = FNR
+    } else if (event == "DispatchOutcomeInstalled") {
+        require_service_event("DispatchOutcomeInstalled")
+        if ($0 != "LINUX_FS_SERVICE DispatchOutcomeInstalled replacement=951 guest=950 reply_wakeups=1 exactly_once=true all_locks_released=true")
+            fail("malformed filesystem response installation receipt: " $0)
+        dispatch_outcome_line = FNR
+    } else if (event == "PASS") {
+        require_service_event("ServicePASS")
+        if ($0 != "LINUX_FS_SERVICE PASS real_user_service_crash=true fsd_v1_page_fault=true fsd_v2_post_crash_construction=true fsd_v2_fresh_task=true fsd_v2_fresh_vm=true current_task_key_bound=true crash_cohort=filesystem_read_only delayed_old_prepare=true stale_old_binding_full_projection_unchanged=true old_sender_current_handle_rejected=true device_commit_gate_after_rebind=true device_committed_after_rebind=true guest_reply_after_rebind=true reply_wakeups=1 exactly_once=true registry_quiescent=true bounded=true single_cpu=true")
+            fail("malformed positive filesystem-service PASS receipt: " $0)
+        service_pass_line = FNR
+    } else {
+        fail("unknown filesystem-service receipt: " $0)
+    }
 }
 
 function parse_dma_owner(    kind, effect, paddr, iova, owner_position) {
@@ -119,6 +255,23 @@ function parse_serial_line() {
     if ($0 ~ /^(virtio_set_status|virtio_pci_notify_write|virtio_queue_notify|virtio_blk_|blk_co_pwritev|vtd_)/)
         fail("QEMU debug trace leaked into serial input: " $0)
 
+    if ($0 ~ /^LINUX_FS_SERVICE / || $0 ~ /^FSD_V[12] /) {
+        parse_service_line()
+        return
+    }
+    if ($0 ~ /^LINUX_FS_SLICE CLOSED /)
+        fail("accepted same-boot witness reported only an early closed slice: " $0)
+    if ($0 ~ /^LINUX_FS_SLICE PASS /) {
+        expected_slice_pass = "LINUX_FS_SLICE PASS workload=linux-runtime-fs-smoke retained=true adapted=false syscalls=14 compatibility_syscalls=payload_only_not_cser openat=3 pread64=2 statx=1 newfstatat=1 pwrite64=1 readlinkat=1 close=3 write=1 exit=1 registry=shared_production commit_gate=true publication_acks=1 production_root=true production_domains=3 production_effects=6 immutable_ancestry=true filesystem_registry_domain_crash_adopt=true real_user_service_crash=true no_synthetic_cohort=true typed_credit_classes=6 leaf_first=true registry_quiescent=true runtime_filesystem=true bounded=true single_cpu=true block_adapter=virtio_blk device_commit=true real_dma=true polling=true irq=false smp=1 same_boot=true identity_preserving=true"
+        if ($0 != expected_slice_pass)
+            fail("malformed or non-success aggregate filesystem result: " $0)
+        slice_pass_count++
+        if (slice_pass_count != 1)
+            fail("duplicate aggregate filesystem PASS")
+        slice_pass_line = FNR
+        return
+    }
+
     if ($0 ~ /^RUNTIME_FS_SAME_BOOT_FIXTURE /) {
         fixture = "RUNTIME_FS_SAME_BOOT_FIXTURE before=" image_sha \
             " after=" image_sha " mode=444 readonly=true"
@@ -175,10 +328,12 @@ function parse_serial_line() {
         require_event("Close")
         if ($0 != "LINUX_FS_SAME_BOOT Close leaf_first=dma_queue_owner_a,dma_queue_owner_b,dma_request_owner,block_request,filesystem_read,filesystem_syscall terminal_outcome=Completed guest_publication_pending=true")
             fail("malformed leaf-first Close receipt: " $0)
+        close_line = FNR
     } else if ($2 == "GuestPublication") {
         require_event("GuestPublication")
         if ($0 != "LINUX_FS_SAME_BOOT GuestPublication result=4 bytes=4 source=CompletedRequest registry_ack=true revoke_complete=true")
             fail("malformed guest-publication closure receipt: " $0)
+        guest_publication_line = FNR
     } else if ($2 == "PASS") {
         require_event("PASS")
         if ($0 != "LINUX_FS_SAME_BOOT PASS same_boot=true identity_preserving=true real_dma=true polling=true irq=false smp=1 scope=95 effects=6 credits=10 sector_sha256=4fb2b63ca7d483c6efaa756182133f05c7ef453fa82e94ce31826ebc4c104f66 image_sha256=9357413ed9a96a23af1750cc304265dd7dd1835eb58eb1fb50119cd80d0bc8ca sector_fnv1a=0x33913395b7798e6b")
@@ -197,14 +352,35 @@ function validate_serial() {
         fail("expected 14 ordered same-boot receipts, observed " serial_events)
     if (owners != 3)
         fail("expected three exact DMA owner receipts, observed " owners)
-    if (fixture_count != 1)
-        fail("expected one immutable-fixture receipt, observed " fixture_count)
-    if (spike_count != 1)
-        fail("expected one feature-terminal SPIKE_RESULT PASS, observed " spike_count)
-    if (!capture_line || !commit_line || !pass_line || !spike_line ||
-        !(capture_line < commit_line && commit_line < pass_line &&
-          pass_line < spike_line && spike_line < fixture_line))
-        fail("capture/commit/PASS/SPIKE_RESULT/fixture order is incomplete or invalid")
+    if (service_events != 16)
+        fail("expected 16 ordered filesystem-service receipts, observed " service_events)
+    if (slice_pass_count != 1 || fixture_count != 1 || spike_count != 1)
+        fail("expected one aggregate PASS, one SPIKE_RESULT, and one immutable fixture receipt")
+    if (!service_begin_line || !guest_blocked_line || !service_register_line ||
+        !service_prepare_line || !queue_old_prepare_line || !service_crash_line ||
+        !fresh_spawn_line || !snapshot_line || !ready_line || !rebind_line ||
+        !adopt_line || !stale_replay_line || !capture_line || !commit_line ||
+        !close_line || !dispatch_outcome_line || !v2_exit_line ||
+        !guest_publication_line || !pass_line || !slice_pass_line ||
+        !service_pass_line || !spike_line || !fixture_line ||
+        !(service_begin_line < guest_blocked_line &&
+          guest_blocked_line < service_register_line &&
+          service_register_line < service_prepare_line &&
+          service_prepare_line < queue_old_prepare_line &&
+          queue_old_prepare_line < service_crash_line &&
+          service_crash_line < v1_exit_line &&
+          v1_exit_line < fresh_spawn_line && fresh_spawn_line < snapshot_line &&
+          snapshot_line < ready_line && ready_line < rebind_line &&
+          rebind_line < adopt_line && adopt_line < stale_replay_line &&
+          stale_replay_line < capture_line && capture_line < commit_line &&
+          commit_line < close_line && close_line < dispatch_outcome_line &&
+          dispatch_outcome_line < v2_exit_line &&
+          dispatch_outcome_line < guest_publication_line &&
+          guest_publication_line < pass_line && pass_line < slice_pass_line &&
+          slice_pass_line < service_pass_line && v2_exit_line < service_pass_line &&
+          service_pass_line < spike_line &&
+          spike_line < fixture_line))
+        fail("filesystem service/device/publication order is incomplete or invalid")
 }
 
 function token_after(name,    i) {
@@ -229,7 +405,7 @@ function add_expected(position, value) {
 
 function parse_debug_line(    vdev, req, queue, vq, iova, gpa) {
     sub(/\r$/, "")
-    if ($0 ~ /^(LINUX_FS_SAME_BOOT|RUNTIME_FS_SAME_BOOT_FIXTURE)/)
+    if ($0 ~ /^(LINUX_FS_SAME_BOOT|LINUX_FS_SERVICE|LINUX_FS_SLICE|FSD_V[12]|SPIKE_RESULT|RUNTIME_FS_SAME_BOOT_FIXTURE)/)
         fail("guest serial receipt leaked into QEMU debug input: " $0)
     if ($0 ~ /virtio_blk_handle_write|blk_co_pwritev|vtd_dmar_fault|panicked at|Non-resettable panic!/)
         fail("forbidden QEMU/device trace: " $0)
@@ -411,6 +587,22 @@ BEGIN {
     expected_owner_kind[1] = "queue_driver"
     expected_owner_kind[2] = "queue_device"
     expected_owner_kind[3] = "request"
+    expected_service_event[1] = "BEGIN"
+    expected_service_event[2] = "GuestBlocked"
+    expected_service_event[3] = "Register"
+    expected_service_event[4] = "Prepare"
+    expected_service_event[5] = "QueueOldPrepare"
+    expected_service_event[6] = "Crash"
+    expected_service_event[7] = "V1Exit"
+    expected_service_event[8] = "FreshSpawn"
+    expected_service_event[9] = "Snapshot"
+    expected_service_event[10] = "Ready"
+    expected_service_event[11] = "Rebind"
+    expected_service_event[12] = "Adopt"
+    expected_service_event[13] = "StaleReplay"
+    expected_service_event[14] = "DispatchOutcomeInstalled"
+    expected_service_event[15] = "V2Exit"
+    expected_service_event[16] = "ServicePASS"
 }
 
 NR == FNR {

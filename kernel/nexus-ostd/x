@@ -60,6 +60,8 @@ image_key=$(sha256sum \
     "$root/guest/linux-futex-core-personality-v2.S" \
     "$root/guest/linux-netd-v1.S" \
     "$root/guest/linux-netd-v2.S" \
+    "$root/guest/linux-fsd-v1.S" \
+    "$root/guest/linux-fsd-v2.S" \
     "$root/src/evaluation/stage7b.rs" \
     "$root/userspace/personality/.cargo/config.toml" \
     "$root/userspace/personality/Cargo.toml" \
@@ -535,6 +537,8 @@ doctor() {
         "$root/src/cser/linux_io_composition.rs" \
         "$root/guest/linux-netd-v1.S" \
         "$root/guest/linux-netd-v2.S" \
+        "$root/guest/linux-fsd-v1.S" \
+        "$root/guest/linux-fsd-v2.S" \
         "$repo_root/tests/guest/linux/sources/linux-runtime-net-smoke/runtime_net_smoke.S" \
         "$repo_root/patches/ostd-0.18.0-cser.patch" \
         "$repo_root/patches/virtio-drivers-0.13.0-cser.patch" \

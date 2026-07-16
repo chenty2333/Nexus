@@ -511,5 +511,120 @@ require_mutation "$serial_log" "$work/duplicate-slice-pass.log" duplicate-slice-
 require_rejection duplicate-slice-PASS \
     "$work/duplicate-slice-pass.log" "$debug_log"
 
-[[ $mutations == 32 ]] || die "internal mutation count drifted: $mutations"
-echo 'runtime filesystem same-boot precommit serial/debug assertions: PASS prepared_owner_retained=true was_published=false owner_iova_translations=0 target_notify=false target_read=false target_completion=false reset_retry=true iotlb_retry=true leaf_first=true guest_result=-125 guest_bytes=0 aggregate_slice_pass=true feature_terminal=true legacy_successors=false immutable_fixture=true mutations=32'
+awk '
+    /^LINUX_FS_SERVICE Prepare / {
+        removed++
+        next
+    }
+    { print }
+    END { if (removed != 1) exit 2 }
+' "$serial_log" >"$work/missing-service-prepare.log"
+require_mutation "$serial_log" "$work/missing-service-prepare.log" missing-service-Prepare
+require_rejection missing-service-Prepare \
+    "$work/missing-service-prepare.log" "$debug_log"
+
+awk '
+    {
+        print
+        if (/^LINUX_FS_SERVICE Crash /) {
+            print
+            duplicated++
+        }
+    }
+    END { if (duplicated != 1) exit 2 }
+' "$serial_log" >"$work/duplicate-service-crash.log"
+require_mutation "$serial_log" "$work/duplicate-service-crash.log" duplicate-service-Crash
+require_rejection duplicate-service-Crash \
+    "$work/duplicate-service-crash.log" "$debug_log"
+
+awk '
+    /^LINUX_FS_SERVICE Snapshot / {
+        held = $0
+        next
+    }
+    /^LINUX_FS_SERVICE Ready / && held != "" {
+        print
+        print held
+        held = ""
+        swapped++
+        next
+    }
+    { print }
+    END { if (swapped != 1 || held != "") exit 2 }
+' "$serial_log" >"$work/reordered-service-recovery.log"
+require_mutation \
+    "$serial_log" "$work/reordered-service-recovery.log" reordered-service-recovery
+require_rejection reordered-service-recovery \
+    "$work/reordered-service-recovery.log" "$debug_log"
+
+awk '
+    !changed && /^FSD_V2 EXIT / {
+        sub(/task_generation=2/, "task_generation=1")
+        changed = 1
+    }
+    { print }
+    END { if (!changed) exit 2 }
+' "$serial_log" >"$work/wrong-v2-generation.log"
+require_mutation "$serial_log" "$work/wrong-v2-generation.log" wrong-v2-generation
+require_rejection wrong-v2-generation "$work/wrong-v2-generation.log" "$debug_log"
+
+awk '
+    !changed && /^LINUX_FS_SERVICE PASS / {
+        sub(/device_committed_after_rebind=false/, "device_committed_after_rebind=true")
+        changed = 1
+    }
+    { print }
+    END { if (!changed) exit 2 }
+' "$serial_log" >"$work/false-device-commit.log"
+require_mutation "$serial_log" "$work/false-device-commit.log" false-device-commit
+require_rejection false-device-commit "$work/false-device-commit.log" "$debug_log"
+
+awk '
+    !changed && /^LINUX_FS_SLICE PASS / {
+        sub(/real_user_service_crash=true/, "real_user_service_crash=false")
+        changed = 1
+    }
+    { print }
+    END { if (!changed) exit 2 }
+' "$serial_log" >"$work/non-crash-slice-pass.log"
+require_mutation "$serial_log" "$work/non-crash-slice-pass.log" non-crash-slice-PASS
+require_rejection non-crash-slice-PASS \
+    "$work/non-crash-slice-pass.log" "$debug_log"
+
+awk '
+    {
+        line[NR] = $0
+        if ($0 ~ /^FSD_V2 EXIT /) {
+            v2 = NR
+            v2_count++
+        }
+        if ($0 ~ /^LINUX_FS_SAME_BOOT_PRECOMMIT GuestPublication /) {
+            publication = NR
+            publication_count++
+        }
+        if ($0 ~ /^LINUX_FS_SLICE PASS /) {
+            slice = NR
+            slice_count++
+        }
+    }
+    END {
+        if (v2_count != 1 || publication_count != 1 || slice_count != 1)
+            exit 2
+        move_after_slice = v2 < publication
+        for (i = 1; i <= NR; i++) {
+            if (i == v2)
+                continue
+            if (!move_after_slice && i == publication)
+                print line[v2]
+            print line[i]
+            if (move_after_slice && i == slice)
+                print line[v2]
+        }
+    }
+' "$serial_log" >"$work/alternate-v2-schedule.log"
+require_mutation "$serial_log" "$work/alternate-v2-schedule.log" alternate-v2-schedule
+require_acceptance alternate-v2-schedule \
+    "$work/alternate-v2-schedule.log" "$debug_log"
+
+[[ $mutations == 38 ]] || die "internal mutation count drifted: $mutations"
+echo 'runtime filesystem same-boot precommit serial/debug assertions: PASS real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash distinct_task_vm=true guest_admission=receipt-before-armed crash_cohort=filesystem_read_only delayed_old_prepare=true stale_prepare_failure_atomic=true old_sender_current_handle=NoSupervisor device_commit_gate_after_rebind=true device_committed_after_rebind=false reply_wakeups=1 prepared_owner_retained=true was_published=false owner_iova_translations=0 target_notify=false target_read=false target_completion=false reset_retry=true iotlb_retry=true leaf_first=true guest_result=-125 guest_bytes=0 aggregate_slice_pass=true feature_terminal=true legacy_successors=false immutable_fixture=true mutations=38'

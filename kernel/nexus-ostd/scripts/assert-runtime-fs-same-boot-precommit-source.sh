@@ -110,7 +110,7 @@ feature_root="$work/feature-root.rs"
 prepared_impl="$work/prepared-request.rs"
 cancel_intent_impl="$work/prepared-cancel-intent.rs"
 
-extract_between "$source_file" 'fn dispatch_first_executable_pread_same_boot(' \
+extract_between "$source_file" 'fn execute_recovered_first_pread_same_boot(' \
     'fn dispatch_first_executable_pread(' "$dispatch"
 extract_between "$dispatch" '            let commits = [' \
     '        if precommit_close {' "$commit_gate"
@@ -266,7 +266,16 @@ if [[ ${NEXUS_SAME_BOOT_PRECOMMIT_SOURCE_PRIMARY_ONLY:-0} != 1 ]]; then
     require_mutation "$facade_file" "$work/missing-cancel-intent.rs" missing-cancel-intent
     require_facade_rejection "$work/missing-cancel-intent.rs" missing-cancel-intent
 
-    [[ $mutations == 5 ]] || fail "expected 5 source mutations, observed $mutations"
+    cp "$source_file" "$work/false-service-device-commit.rs"
+    sed -i \
+        '0,/device_commit_gate_after_rebind=true device_committed_after_rebind=false/s//device_commit_gate_after_rebind=true device_committed_after_rebind=true/' \
+        "$work/false-service-device-commit.rs"
+    require_mutation "$source_file" "$work/false-service-device-commit.rs" \
+        false-service-device-commit
+    require_source_rejection "$work/false-service-device-commit.rs" \
+        false-service-device-commit
+
+    [[ $mutations == 6 ]] || fail "expected 6 source mutations, observed $mutations"
 fi
 
-echo 'runtime filesystem same-boot precommit source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser flight=single_actor_slot_handoff actor_resident=false publication_calls=0 closure=AbortedBeforeCommit prepared_owner=linear polling=false irq_evidence=false smp=1 rfc0001_full_closure=false mutations=5'
+echo 'runtime filesystem same-boot precommit source assertions: PASS checkpoint=device_flight accepted_registry=one accepted_ledger=one compatibility_syscalls=payload_only_not_cser flight=single_actor_slot_handoff actor_resident=false real_user_service_crash=true fsd_task_key=current-task-bound+951:1->951:2 replacement_construction=post-crash guest_admission=receipt-before-armed crash_before_device=true stale_prepare=queued-v1+failure-atomic old_sender_current_handle=NoSupervisor device_commit_gate_after_rebind=true device_committed_after_rebind=false reply_wakeups=1 publication_calls=0 closure=AbortedBeforeCommit prepared_owner=linear polling=false irq_evidence=false smp=1 rfc0001_full_closure=false mutations=6'

@@ -550,11 +550,12 @@ remains the sole VT-d owner; Nexus owns deadline and tombstone policy.
 
 The same overlay supplies explicit active-high/active-low and edge/level GSI
 routing, encodes polarity and trigger mode in the I/O APIC RTE, and keeps the
-IRTE trigger-mode bit synchronized. The legacy API remains edge/high. No
-primary-kernel device currently calls either patched runtime API: the selected
-adapter remains `Ostd018FailClosed`, and the optional VirtIO facade is only
-compile-checked. This is not primary-boot DMA closure, interrupt-delivery,
-IRQ-quiescence, same-boot device, or SMP evidence.
+IRTE trigger-mode bit synchronized. The legacy API remains edge/high. The
+generic `iommu_probe` adapter remains `Ostd018FailClosed`, but the later bounded
+runtime-filesystem vertical slice below now calls the production VirtIO/DMA
+facade in the primary kernel and consumes the ownership-carrying invalidation
+completion there. That slice still polls with PCI INTx masked; it is not
+interrupt-delivery, IRQ-quiescence, or SMP evidence.
 
 A second canonical overlay pins virtio-drivers 0.13 under its upstream MIT
 license. It introduces a linear fail-closed prepared queue, a unique infallible
@@ -856,22 +857,60 @@ stores one executable, one temporary inode, and one procfs link in memory; it is
 not a general VFS, persistent filesystem, page cache, permission model, or
 namespace implementation.
 
-The OSTD lifecycle companion observes distinct personality, pager, filesystem,
-and block binding epochs. It requires snapshot/ready/rebind/adopt for prepared
-pager and filesystem work, permits kernel completion from an immutable
-post-commit receipt while the personality is absent, and checks commit-first
-and revoke-first pwrite outcomes against the complete registry/effect/domain/
-inode projection. The block companion retains three abstract owners through a
-reset timeout, advances device generation only after ResetAck, retains them
-again through an IOTLB timeout, and releases only after IOTLB Ack. This primary
-OSTD boot does not perform real DMA.
+The retained Stage 6 lifecycle companion observes distinct personality, pager,
+filesystem, and block binding epochs. It requires snapshot/ready/rebind/adopt
+for prepared pager and filesystem work, permits kernel completion from an
+immutable post-commit receipt while the personality is absent, and checks
+commit-first and revoke-first pwrite outcomes against the complete registry/
+effect/domain/inode projection. Its block companion retains three abstract
+owners through reset and IOTLB timeouts and releases only after acknowledgement;
+that retained companion itself does not perform real DMA.
 
-A separate strict host oracle joins that bounded filesystem receipt to the
-existing Stage 5B real VirtIO boot using the retained source SHA, generated ELF
-SHA, reconstructed 512-byte sector SHA/FNV, and full readonly-image SHA. The
-relationship is only `component_consistency`: `same_boot=false`,
-`identity_preserving=false`, and the historical five-domain `CompositionCser`
-receipt remains frozen with `runtime_fs=false` and `runtime_net=false`.
+The later same-boot production-identity slice keeps the retained guest input but
+replaces that abstract device relation for the first executable `pread64`. The
+guest blocks with all kernel locks released while `fsd-v1` runs as registry
+supervisor `TaskKey` 951:1 in an independent task and `VmSpace`. Portal entry
+derives that complete key from the current OSTD `Task` rather than supplying a
+runner-closure constant. V1 registers and prepares the exact filesystem child,
+then queues a typed delayed `Prepare` carrying that current-task key and the old
+`PortalHandle`. A real user-mode load at `0x00800000` then takes a CPU page fault
+before any device preparation, commit, or guest reply. The filesystem-domain
+crash freezes exactly that one prepared effect.
+
+Only after the v1 completion waiter returns and the protocol is confirmed
+`Crashed` does the slice construct the v2 `VmSpace`, v2 completion waiter/waker,
+and v2 OSTD `Task`. That fresh task generation performs Snapshot -> Ready ->
+Rebind -> explicit Adopt of the same effect. After adoption, v2 only triggers
+delivery of the command queued by v1 before the crash: its saved v1 sender plus
+old handle returns `StaleBinding`, while the same old sender plus the adopted
+handle returns `NoSupervisor`. Both rejection probes leave the full Registry
+projection unchanged.
+
+Only after that recovery does the slice enroll the six-effect
+`FilesystemSyscall -> FilesystemRead -> BlockRequest -> three DMA owners`
+cohort. The normal lane crosses the `avail.idx` Release commit point, performs
+real same-boot VirtIO/IOMMU DMA, retains owners through injected reset and IOTLB
+timeouts, closes leaf-first, installs one outcome, and wakes the blocked guest
+exactly once. The pre-commit lane instead lets revoke win at the device commit
+gate, performs no device publication, and returns an `AbortedBeforeCommit`
+result exactly once. Both lanes are strict-oracle Checked and bounded QEMU
+Observed on one vCPU.
+
+This establishes one real filesystem user-service crash point: prepared
+filesystem work before device enrollment/commit. It does not observe a crash
+after device commit but before guest reply, every frozen fault cell, a real IRQ,
+2/4-vCPU execution, or all filesystem fault paths. The normal lane polls with
+INTx masked. These observations do not close an RFC phase or establish a
+general VFS, persistence, durable-write rollback, multi-client behavior, or
+full production adapter equivalence.
+
+The earlier strict host oracle remains as regression evidence. It joins the
+retained Stage 6 companion to the separate Stage 5B VirtIO boot by source, ELF,
+sector, and readonly-image digests, but its relation remains only
+`component_consistency`: `same_boot=false`, `identity_preserving=false`. The
+historical five-domain `CompositionCser` receipt likewise remains frozen with
+`runtime_fs=false` and `runtime_net=false`; neither predecessor is relabeled as
+the later same-boot observation.
 
 ### Stage 6 runtime-network successor boundary
 
@@ -1340,7 +1379,7 @@ transport.
 | I/O tombstone/timeout | TLA+/Rust timeout/retry semantics plus Stage 5B fail-closed session/IOTLB ownership retention and successful retry; timeout explicitly software-injected | real-time deadline source, durable recovery worker, repeated failure, device-loss and hardware-timeout tests |
 | Work proportionality | the target-local futex oracle closes `k=6` while leaving unrelated `N=96` unchanged; the Stage 7B release evaluator adds fourteen exact structural tuples spanning fixed-`N`/varying-`k`, fixed-`k`/varying-`N`, and retained-history variation, with target/index work following the checked cohort and unrelated/history visits remaining zero | production-lock/SMP timing curves and broader tuples; the finite structural observations do not establish an asymptotic or production `O(k)` claim |
 | Cross-service composition | The frozen `CompositionCser` predecessor and additive `LinuxIoCompositionCser` successor have separate formal, safe-Rust/Loom, OSTD, and strict-oracle evidence. The successor uses a fresh seven-domain/nine-effect root cohort and prior same-boot filesystem/network receipts; Stage 5B remains non-identity component consistency. Stage 7B adds twenty bounded case-local fault cells, not one shared cross-service production ledger | identity-preserving or same-boot device integration; unbounded graphs, production portals/locks, SMP, and an integrated parameterized fault matrix over a shared production scope with cross-object crash/panic atomicity |
-| Runtime filesystem | `RuntimeFsCser` safety/action graphs, 15 safe-Rust/property/Loom gates, unchanged retained ELF artifact gate, exact 14-syscall OSTD execution, four-domain lifecycle companion, positive/negative serial oracle, and Stage 5B sector/image component-consistency oracle | general VFS/persistence, real DMA in the primary boot, same-boot identity, multi-client/SMP, durable external effects |
+| Runtime filesystem | `RuntimeFsCser` safety/action graphs, 15 safe-Rust/property/Loom gates, unchanged retained ELF artifact gate, and exact 14-syscall OSTD execution; the later one-vCPU same-boot slice observes one real fsd-v1 page-fault crash after filesystem Prepare, fresh-task/fresh-`VmSpace` fsd-v2 recovery and explicit adoption, failure-atomic stale Prepare rejection, the exact six-effect production Registry cohort, normal real VirtIO/IOMMU DMA, a revoke-wins pre-commit lane, leaf-first closure, and one guest wake/reply | the post-device-commit/pre-reply service-crash point and every remaining frozen fault cell, a real IRQ path, 2/4-vCPU and multi-client execution, general VFS/persistence, durable external effects, and full production-adapter equivalence |
 | Runtime network | `RuntimeNetCser` safety/action graphs (3,698,288 / 720,002 depth 42 and 28,449 / 14,328 depth 35), eight witnesses, 10 + 2 + 4 safe-Rust gates, unchanged 22-syscall retained ELF, bounded in-memory loopback, real `UserMode` netd-v1 page fault/netd-v2 rebind-adopt, kernel-owned readiness, four typed credits, and positive/negative trace/artifact oracles | smoltcp or real TCP breadth, external packets, VirtIO-net/NIC, multi-connection/backpressure behavior, SMP and production portal/lock refinement |
 | Linux pressure | Bounded Stage 6 Checked/Observed: all six fixed core inputs (`linux-hello`, adapted Round 4, adapted Round 5, dynamic PIE, runtime filesystem, runtime network), strict positive/negative oracles, bounded recovery companions, and additive seven-domain composition evidence | integrated mixed-service workload matrix; general ABI/VFS/TCP/device/SMP breadth |
 | Stage 7B evaluation and contribution decision | concurrency boundary exactly `production transition source under a Loom-modeled outer mutex`, with fourteen mapped races Checked; twenty case-local fault cells and fourteen finite structural scale tuples Checked in release single-vCPU QEMU; twenty-nine raw guest-visible-TSC cases Observed without thresholds or a comparative baseline; released `v0.1.0` prior-art boundary 14/2 and current-main follow-up 15/1; the recorded implementation checkpoint has cold/CI acceptance; verdict `narrow` | repeat exact-revision cold/CI acceptance for each later release; full-text resolution of the remaining Atomic RPC row; production-lock/SMP, hardware-cycle, durable-external-effect, shared-production-fault, cross-object crash/panic atomicity, and broader Linux evidence before any stronger contribution claim |

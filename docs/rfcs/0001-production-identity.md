@@ -8,10 +8,12 @@
 ## Claim discipline
 
 This RFC defines a hypothesis and the evidence that would be required to test
-it. It does not report an implementation result. In particular, the words
-**production path**, **shared**, **same boot**, **identity preserving**, **SMP**,
-and **measured** below name prospective acceptance requirements, not properties
-already established by Nexus.
+it. It does not, by itself, report a completed implementation or accepted phase.
+The bounded implementation checkpoint recorded below is narrower than the full
+contract. In particular, the words **production path**, **shared**, **same
+boot**, **identity preserving**, **SMP**, and **measured** below name prospective
+acceptance requirements unless a checkpoint names the exact narrower
+observation.
 
 Here, **production path** means the normal Nexus/OSTD path that would execute the
 operation without an evaluation-only state machine. It does not mean
@@ -23,6 +25,38 @@ narrative. It uses fresh composition effects, bounded outer service-binding
 envelopes, case-local Stage 7B fault ledgers, a single-vCPU evaluator, and a
 separate-boot Stage 5B device receipt. No result from this RFC may be attributed
 to `v0.1.0`, and old evidence may not be relabeled as evidence for this RFC.
+
+### Bounded implementation checkpoint (2026-07-16)
+
+One focused one-vCPU OSTD/QEMU vertical slice now observes the retained Linux
+filesystem guest block outside all kernel locks while a distinct user-mode
+`fsd-v1` task registers and prepares its filesystem effect in the shared
+production Registry. Each portal derives the complete sender `TaskKey` from the
+current OSTD `Task`; after Prepare, v1 queues a typed delayed `Prepare` containing
+that v1 key and its old `PortalHandle`. A real user-mode page fault then
+terminates v1 before device enrollment or commit.
+
+Only after the v1 completion waiter returns and the protocol phase is confirmed
+`Crashed` does the slice construct the v2 `VmSpace`, completion waiter/waker, and
+OSTD `Task`. That fresh `fsd-v2` performs Snapshot, Ready, Rebind, and explicit
+Adopt of the same effect. V2 then only triggers delivery of v1's already-queued
+command: the saved v1 sender plus old handle returns `StaleBinding`, and the same
+old sender plus the adopted handle returns `NoSupervisor`; both leave the full
+Registry failure-atomic projection unchanged.
+
+After recovery, the normal lane enrolls the exact six-effect workload/device
+cohort, crosses the real `avail.idx` Release point, executes same-boot
+VirtIO/IOMMU DMA, drains through reset and IOTLB recovery, and publishes one
+guest result. A paired pre-commit lane lets revoke win before device publication
+and publishes one `AbortedBeforeCommit` result. Both lanes use polling with PCI
+INTx masked.
+
+This checkpoint establishes only the named real filesystem-service crash point
+before device commit. It does not observe the required crash after device commit
+but before guest reply, every frozen fault cell, a real interrupt path, 2-vCPU or
+4-vCPU behavior, all filesystem fault paths, a performance result, or full
+production-adapter equivalence. It does not close Phase 2, Phase 3, this RFC, or
+the prospective `v0.2.0` result.
 
 ## Summary
 
@@ -347,6 +381,12 @@ At minimum, the workload must admit a filesystem-service crash before device
 commit, a crash after device commit but before guest reply, replacement
 ready/rebind/explicit adoption where legal, stale old-binding rejection, and a
 root revoke racing the device publication boundary.
+
+The bounded checkpoint above observes the first crash point and the associated
+replacement/stale-binding behavior in both normal and revoke-wins lanes. The
+post-device-commit/pre-reply crash and the rest of the frozen fault population
+remain required; adjacent normal-completion evidence cannot substitute for
+them.
 
 ## Same-boot VirtIO/IOMMU obligations
 
