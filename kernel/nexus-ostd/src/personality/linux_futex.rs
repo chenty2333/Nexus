@@ -63,6 +63,15 @@ const PERSONALITY_V1_PROGRAM: &[u8] = include_bytes!("../../guest/linux-futex-pe
 const PERSONALITY_V2_PROGRAM: &[u8] = include_bytes!("../../guest/linux-futex-personality-v2.bin");
 const SCHEDULER_POLICY_PROGRAM: &[u8] = include_bytes!("../../guest/linux-scheduler-policy.bin");
 
+// Diagnostic gate for the bounded two-handshake expire-startup window. The
+// global hooks still execute their Acquire load and branch, but emit no switch
+// receipts outside this staging window.
+static EXPIRE_STARTUP_SWITCH_DIAGNOSTICS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn expire_startup_switch_diagnostics_enabled() -> bool {
+    EXPIRE_STARTUP_SWITCH_DIAGNOSTICS.load(Ordering::Acquire)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScenarioKind {
     Recover,
@@ -1861,6 +1870,12 @@ fn run_guest_waker(scenario: Arc<FutexScenario>, vm_space: Arc<VmSpace>) {
 
 fn run_personality_v1(scenario: Arc<FutexScenario>, vm_space: Arc<VmSpace>) {
     assert_current_user_task(scenario.kind.personality_v1_task_id(), &vm_space);
+    if scenario.kind == ScenarioKind::Expire {
+        println!(
+            "LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=effect-driver role=personality-v1 task={}",
+            scenario.kind.personality_v1_task_id(),
+        );
+    }
     while !scenario.wait_is_captured() {
         Task::yield_now();
     }
@@ -2134,6 +2149,12 @@ fn run_watchdog(
     old_personality_vm: Arc<VmSpace>,
 ) {
     assert_current_kernel_task(scenario.kind.watchdog_task_id());
+    if scenario.kind == ScenarioKind::Expire {
+        println!(
+            "LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage=closure-watchdog role=watchdog task={}",
+            scenario.kind.watchdog_task_id(),
+        );
+    }
     while !scenario.has_crashed() {
         Task::yield_now();
     }
@@ -2205,14 +2226,31 @@ fn wait_for_expire_startup(scenario: &FutexScenario, stage: ExpireStartupStage) 
 }
 
 fn run_expire_startup_task(task: &Arc<Task>, scenario: &FutexScenario, stage: ExpireStartupStage) {
-    // Task::run ends with might_preempt(). Keep that call non-preemptible until
-    // the parent can enter WaitQueue::wait_until. A timer may reserve the new
-    // child while this guard is held, but park_current will then dequeue the
-    // physical parent before installing and switching to that reservation.
+    // Task::run ends with might_preempt(), so suppress that explicit scheduling
+    // point while admitting the child. In pinned OSTD 0.18, dropping this guard
+    // only decrements the preemption count; the next statement enters the
+    // blocking handshake. This is not an atomic release-and-park claim: the
+    // release/acquire readiness flag also covers child progress before enqueue.
     let preempt_guard = disable_preempt();
     task.run();
     drop(preempt_guard);
     wait_for_expire_startup(scenario, stage);
+}
+
+fn run_expire_effect_tasks_and_wait(
+    v1_task: &Arc<Task>,
+    watchdog_task: &Arc<Task>,
+    done_waiter: &EffectWaiter,
+) {
+    // Batch both Task::run enqueue paths without taking either immediate
+    // might_preempt point. After guard release, the next explicit scheduling
+    // operation is the completion wait. This relies on the pinned OSTD 0.18
+    // guard-drop semantics; it is not an atomic release-and-park primitive.
+    let effect_preempt_guard = disable_preempt();
+    v1_task.run();
+    watchdog_task.run();
+    drop(effect_preempt_guard);
+    done_waiter.wait();
 }
 
 fn run_scenario(
@@ -2289,6 +2327,12 @@ fn run_scenario(
         )
     });
 
+    if kind == ScenarioKind::Expire {
+        EXPIRE_STARTUP_SWITCH_DIAGNOSTICS
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .expect("expire startup switch diagnostics must have one active window");
+    }
+
     println!(
         "LINUX_FUTEX_SCENARIO BEGIN scenario={} authority_epoch={} scope={} asid={} generation={} address={:#x} waiter={} waker={} shared_vm=true smp=1 scheduler_mode={}",
         kind.label(),
@@ -2311,6 +2355,14 @@ fn run_scenario(
             waker_task.run();
             v1_task.run();
             watchdog_task.run();
+            if let (Some(binding), Some(policy_task)) = (scheduler_binding, policy_task) {
+                policy_task.run();
+                assert_eq!(
+                    scheduler.propose(binding, RECOVER_POLICY_TASK_ID),
+                    ProposalResult::Prepared
+                );
+            }
+            done_waiter.wait();
         }
         ScenarioKind::Expire => {
             assert!(
@@ -2320,23 +2372,17 @@ fn run_scenario(
             // A fallback reservation is not a task-entry receipt. Stage the
             // two guest prerequisites behind blocking one-shot conditions so
             // the parent leaves the run queue until each child has entered.
-            // The publish/crash/watchdog race starts only after these
-            // pre-admission prerequisites and remains unchanged.
+            // Protocol assertions for publish, crash, and watchdog closure are
+            // retained. Effect-driver and watchdog admission below is
+            // intentionally batched before the parent waits for completion.
             run_expire_startup_task(&waker_task, &scenario, ExpireStartupStage::WakerReady);
             run_expire_startup_task(&waiter_task, &scenario, ExpireStartupStage::WaitCaptured);
-            v1_task.run();
-            watchdog_task.run();
+            EXPIRE_STARTUP_SWITCH_DIAGNOSTICS
+                .compare_exchange(true, false, Ordering::Release, Ordering::Relaxed)
+                .expect("expire startup switch diagnostics must close once");
+            run_expire_effect_tasks_and_wait(&v1_task, &watchdog_task, &done_waiter);
         }
     }
-    if let (Some(binding), Some(policy_task)) = (scheduler_binding, policy_task) {
-        policy_task.run();
-        assert_eq!(
-            scheduler.propose(binding, RECOVER_POLICY_TASK_ID),
-            ProposalResult::Prepared
-        );
-    }
-
-    done_waiter.wait();
     drop(done_waiter);
     scenario.assert_final();
     println!(

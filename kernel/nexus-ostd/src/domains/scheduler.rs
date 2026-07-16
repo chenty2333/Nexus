@@ -109,6 +109,15 @@ enum SelectionCause {
 }
 
 impl SelectionCause {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Tick => "tick",
+            Self::WaitOrExit => "wait-or-exit",
+            Self::Yield => "yield",
+            Self::BestEffort => "best-effort",
+        }
+    }
+
     const fn may_consume_bound(self, current_absent: bool) -> bool {
         !matches!(self, Self::Tick) || current_absent
     }
@@ -621,12 +630,13 @@ impl CserRunQueue {
         drop(policy);
         self.reserved = Some(next);
         println!(
-            "CSER FallbackPick authority_epoch={} binding_epoch={} task={} tick={} selection_attempt={}",
+            "CSER FallbackPick authority_epoch={} binding_epoch={} task={} tick={} selection_attempt={} cause={}",
             binding.authority_epoch,
             binding.binding_epoch,
             task_id,
             pick.tick,
             pick.selection_attempt,
+            cause.label(),
         );
         true
     }

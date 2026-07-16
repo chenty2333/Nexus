@@ -64,6 +64,7 @@ use effect_registry::TaskKey;
 use iommu_probe::{DmaQuiesceError, DmaQuiescer, Ostd018FailClosed};
 use ostd::{
     arch::cpu::context::{CpuException, UserContext},
+    irq::DisabledLocalIrqGuard,
     mm::{
         CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmIo, VmSpace,
     },
@@ -72,7 +73,7 @@ use ostd::{
     sync::SpinLock,
     task::{
         Task, TaskOptions, disable_preempt, inject_post_schedule_handler,
-        scheduler as ostd_scheduler,
+        inject_pre_schedule_handler, scheduler as ostd_scheduler,
     },
     user::{ReturnReason, UserMode},
 };
@@ -151,6 +152,7 @@ fn kernel_main_standard() {
         POLICY_LEASE_TICKS,
     )));
     ostd_scheduler::inject_scheduler(scheduler);
+    inject_pre_schedule_handler(trace_expire_pre_schedule);
     inject_post_schedule_handler(activate_current_task_vm);
 
     let binding = scheduler.binding();
@@ -186,6 +188,24 @@ fn kernel_main_standard() {
     unreachable!("bootstrap context is not scheduled again");
 }
 
+fn trace_expire_pre_schedule(_guard: &DisabledLocalIrqGuard) {
+    if !linux_futex::expire_startup_switch_diagnostics_enabled() {
+        return;
+    }
+    let physical_task = Task::current()
+        .and_then(|current| {
+            current
+                .data()
+                .downcast_ref::<TaskData>()
+                .map(|data| data.id)
+        })
+        .expect("expire startup pre-switch receipt requires a physical current task");
+    println!(
+        "LINUX_FUTEX_STARTUP PreSwitch scenario=expire physical_task={} phase=after-grace-before-kstack",
+        physical_task,
+    );
+}
+
 fn activate_current_task_vm() {
     let Some(current) = Task::current() else {
         return;
@@ -193,10 +213,30 @@ fn activate_current_task_vm() {
     let Some(data) = current.data().downcast_ref::<TaskData>() else {
         return;
     };
+    let trace_expire_startup = linux_futex::expire_startup_switch_diagnostics_enabled();
+    let vm_kind = if data.dynamic_vm_space.is_some() {
+        "dynamic"
+    } else if data.vm_space.is_some() {
+        "regular"
+    } else {
+        "none"
+    };
+    if trace_expire_startup {
+        println!(
+            "LINUX_FUTEX_STARTUP PostSwitch scenario=expire task={} phase=before-vm-activate vm={}",
+            data.id, vm_kind,
+        );
+    }
     if let Some(vm_space) = &data.dynamic_vm_space {
         vm_space.lock().activate();
     } else if let Some(vm_space) = &data.vm_space {
         vm_space.activate();
+    }
+    if trace_expire_startup {
+        println!(
+            "LINUX_FUTEX_STARTUP PostSwitch scenario=expire task={} phase=after-vm-activate vm={}",
+            data.id, vm_kind,
+        );
     }
 }
 

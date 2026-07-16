@@ -97,6 +97,12 @@ awk '
         receipt_count++
         receipt_line = NR
     }
+    index($0, "selection_attempt={} cause={}") {
+        cause_receipt_count++
+    }
+    index($0, "cause.label()") {
+        cause_label_count++
+    }
     index($0, "self.reserved = Some(next);") {
         reservation_count++
         if (gate_count > 0 && NR > gate_line && fallback_reservation_line == 0)
@@ -107,6 +113,7 @@ awk '
     }
     END {
         if (pop_count != 1 || gate_count != 1 || receipt_count != 1 ||
+            cause_receipt_count != 1 || cause_label_count != 1 ||
             reservation_count != 2 || fallback_reservation_line == 0) {
             print "scheduler attempt source gate: expected one pop/gate-pick/fallback reservation/receipt" > "/dev/stderr"
             exit 1
@@ -120,7 +127,7 @@ awk '
             print "scheduler attempt source gate: shadow fallback evidence fields remain in production adapter" > "/dev/stderr"
             exit 1
         }
-        print "scheduler attempt source gate: PASS pop_before_gate_pick=true reserve_before_receipt=true shadow_fallback_fields=false"
+        print "scheduler attempt source gate: PASS pop_before_gate_pick=true reserve_before_receipt=true selection_cause=explicit shadow_fallback_fields=false"
     }
 ' "$source_file"
 

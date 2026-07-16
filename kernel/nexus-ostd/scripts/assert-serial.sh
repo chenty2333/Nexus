@@ -254,7 +254,8 @@ awk '
     }
     /^CSER FallbackPick authority_epoch=41 binding_epoch=2 / {
         base_attempts_seen++
-        if (field("tick") !~ /^[0-9]+$/ || field("selection_attempt") != base_attempts_seen)
+        if (field("tick") !~ /^[0-9]+$/ || field("selection_attempt") != base_attempts_seen ||
+            field("cause") !~ /^(tick|wait-or-exit|yield|best-effort)$/)
             fail("base fallback attempts are not dense numeric ordinals: " $0)
         if (field("selection_attempt") == "1")
             base_first_attempts++
@@ -268,7 +269,8 @@ awk '
     }
     /^CSER FallbackPick authority_epoch=41 binding_epoch=3 / {
         linux_attempts_seen++
-        if (field("tick") !~ /^[0-9]+$/ || field("selection_attempt") != linux_attempts_seen)
+        if (field("tick") !~ /^[0-9]+$/ || field("selection_attempt") != linux_attempts_seen ||
+            field("cause") !~ /^(tick|wait-or-exit|yield|best-effort)$/)
             fail("Linux fallback attempts are not dense numeric ordinals: " $0)
         if (field("selection_attempt") == "1")
             linux_first_attempts++
@@ -282,7 +284,8 @@ awk '
     }
     /^CSER FallbackPick authority_epoch=41 binding_epoch=4 / {
         attempt = field("selection_attempt")
-        if (field("tick") !~ /^[0-9]+$/ || attempt !~ /^[0-9]+$/)
+        if (field("tick") !~ /^[0-9]+$/ || attempt !~ /^[0-9]+$/ ||
+            field("cause") !~ /^(tick|wait-or-exit|yield|best-effort)$/)
             fail("Linux futex fallback pick has a non-numeric tick/attempt: " $0)
         if (!futex_slice_complete) {
             futex_dense_attempts++
