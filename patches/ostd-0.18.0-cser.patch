@@ -1340,20 +1340,160 @@ index 6289955..3729e60 100644
 -        // FIXME: Flush IOTLBs to prevent any future DMA access to the frames.
 -    }
 -}
+diff --git a/src/arch/x86/cpu/context/mod.rs b/src/arch/x86/cpu/context/mod.rs
+--- a/src/arch/x86/cpu/context/mod.rs
++++ b/src/arch/x86/cpu/context/mod.rs
+@@ -354,0 +355 @@ impl UserContextApiInternal for UserContext {
++                    crate::arch::timer::complete_irq(self.as_trap_frame().trap_num as u8);
+diff --git a/src/arch/x86/timer/apic.rs b/src/arch/x86/timer/apic.rs
+--- a/src/arch/x86/timer/apic.rs
++++ b/src/arch/x86/timer/apic.rs
+@@ -18 +18 @@ use crate::{
+-/// Initializes APIC with TSC-deadline mode or periodic mode.
++/// Initializes APIC with TSC-deadline mode or callback-rearmed one-shot mode.
+@@ -25 +25 @@ pub(super) fn init_on_bsp() -> IrqLine {
+-        init_periodic_mode_config();
++        init_callback_rearmed_oneshot_config();
+@@ -40,2 +40,2 @@ pub(super) fn init_on_ap(timer_irq: &IrqLine) {
+-/// A callback that needs to be called on timer interrupt.
+-pub(super) fn timer_callback() {
++/// Rearms the local timer after the complete timer IRQ path has returned.
++pub(super) fn rearm_timer() {
+@@ -50 +50,5 @@ pub(super) fn timer_callback() {
+-        Config::PeriodicMode { .. } => {}
++        Config::CallbackRearmedOneShot { init_count } => {
++            let preempt_guard = disable_preempt();
++            let apic = apic::get_or_init(&preempt_guard as _);
++            apic.set_timer_init_count(*init_count);
++        }
+@@ -69,2 +73,2 @@ fn init_timer(timer_irq: &IrqLine) {
+-        Config::PeriodicMode { init_count } => {
+-            init_periodic_mode(apic, timer_irq, *init_count);
++        Config::CallbackRearmedOneShot { init_count } => {
++            init_callback_rearmed_oneshot(apic, timer_irq, *init_count);
+@@ -79 +83 @@ fn init_deadline_mode(apic: &dyn Apic, timer_irq: &IrqLine) {
+-    timer_callback();
++    rearm_timer();
+@@ -82,4 +86 @@ fn init_deadline_mode(apic: &dyn Apic, timer_irq: &IrqLine) {
+-fn init_periodic_mode(apic: &dyn Apic, timer_irq: &IrqLine, init_count: u64) {
+-    // Enable periodic mode
+-    apic.set_timer_init_count(init_count);
+-    apic.set_lvt_timer(timer_irq.num() as u64 | (1 << 17));
++fn init_callback_rearmed_oneshot(apic: &dyn Apic, timer_irq: &IrqLine, init_count: u64) {
+@@ -86,0 +88,3 @@ fn init_periodic_mode(apic: &dyn Apic, timer_irq: &IrqLine, init_count: u64) {
++    apic.set_lvt_timer(timer_irq.num() as u64);
++    // Arm last so the full interval starts after mode and divisor are installed.
++    apic.set_timer_init_count(init_count);
+@@ -93 +97 @@ enum Config {
+-    PeriodicMode { init_count: u64 },
++    CallbackRearmedOneShot { init_count: u64 },
+@@ -103,2 +107,2 @@ fn init_deadline_mode_config() {
+-fn init_periodic_mode_config() {
+-    info!("Enable APIC periodic mode");
++fn init_callback_rearmed_oneshot_config() {
++    info!("Enable APIC callback-rearmed one-shot mode");
+@@ -166 +170 @@ fn init_periodic_mode_config() {
+-        CONFIG.call_once(|| Config::PeriodicMode {
++        CONFIG.call_once(|| Config::CallbackRearmedOneShot {
+diff --git a/src/arch/x86/timer/mod.rs b/src/arch/x86/timer/mod.rs
+--- a/src/arch/x86/timer/mod.rs
++++ b/src/arch/x86/timer/mod.rs
+@@ -41,0 +42 @@ fn timer_callback(trapframe: &TrapFrame) {
++}
+@@ -43 +44,7 @@ fn timer_callback(trapframe: &TrapFrame) {
+-    apic::timer_callback();
++pub(super) fn complete_irq(irq_num: u8) {
++    let Some(timer_irq) = TIMER_IRQ.get() else {
++        return;
++    };
++    if timer_irq.num() == irq_num {
++        apic::rearm_timer();
++    }
+diff --git a/src/arch/x86/trap/mod.rs b/src/arch/x86/trap/mod.rs
+--- a/src/arch/x86/trap/mod.rs
++++ b/src/arch/x86/trap/mod.rs
+@@ -192,0 +193 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
++            super::timer::complete_irq(f.trap_num as u8);
 diff --git a/src/task/mod.rs b/src/task/mod.rs
 --- a/src/task/mod.rs
 +++ b/src/task/mod.rs
-@@ -38,0 +39,2 @@
+@@ -39,0 +40,4 @@ static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
++static FIRST_TASK_PRE_IRQ_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 +
 +static FIRST_TASK_ENTRY_HANDLER: Once<fn()> = Once::new();
-@@ -50,0 +53,5 @@
++
+@@ -51,0 +66,10 @@ pub fn inject_post_schedule_handler(handler: fn()) {
++/// Injects a first-switch handler that runs before local IRQs are enabled.
++pub fn inject_first_task_pre_irq_handler(handler: fn(&DisabledLocalIrqGuard)) {
++    FIRST_TASK_PRE_IRQ_HANDLER.call_once(|| handler);
++}
 +
 +/// Injects a handler after OSTD finishes a new task's switch tail.
 +pub fn inject_first_task_entry_handler(handler: fn()) {
 +    FIRST_TASK_ENTRY_HANDLER.call_once(|| handler);
 +}
-@@ -198,0 +206,4 @@
++
+@@ -198 +215 @@ impl TaskOptions {
+-            unsafe { processor::after_switching_to() };
++            unsafe { processor::after_switching_to(processor::SwitchTailKind::FirstTask) };
+@@ -198,0 +216,4 @@ impl TaskOptions {
 +
 +            if let Some(handler) = FIRST_TASK_ENTRY_HANDLER.get() {
 +                handler();
 +            }
+diff --git a/src/task/processor.rs b/src/task/processor.rs
+--- a/src/task/processor.rs
++++ b/src/task/processor.rs
+@@ -21,0 +22,6 @@ cpu_local_cell! {
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) enum SwitchTailKind {
++    FirstTask,
++    ResumedTask,
++}
++
+@@ -92 +92 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
+-    unsafe { after_switching_to() };
++    unsafe { after_switching_to(SwitchTailKind::ResumedTask) };
+@@ -119 +119 @@ pub(super) unsafe fn after_switching_to() {
+-pub(super) unsafe fn after_switching_to() {
++pub(super) unsafe fn after_switching_to(tail_kind: SwitchTailKind) {
+@@ -140,0 +141,15 @@ pub(super) unsafe fn after_switching_to() {
++    if tail_kind == SwitchTailKind::FirstTask {
++        assert!(
++            !crate::arch::irq::is_local_enabled(),
++            "first-task admission must run with local IRQs disabled"
++        );
++        let admission_guard = crate::irq::disable_local();
++        if let Some(handler) = super::FIRST_TASK_PRE_IRQ_HANDLER.get() {
++            handler(&admission_guard);
++        }
++        assert!(
++            !crate::arch::irq::is_local_enabled(),
++            "first-task admission handler must preserve disabled local IRQs"
++        );
++        core::mem::forget(admission_guard);
++    }
+diff --git a/src/timer/jiffies.rs b/src/timer/jiffies.rs
+--- a/src/timer/jiffies.rs
++++ b/src/timer/jiffies.rs
+@@ -12,2 +12,2 @@ use super::TIMER_FREQ;
+-/// A jiffy represents one tick of the system timer interrupt,
+-/// whose frequency is equal to [`TIMER_FREQ`] Hz.
++/// A jiffy represents one observed system timer callback. [`TIMER_FREQ`] is
++/// the nominal conversion rate, not a wall-clock progress guarantee.
+@@ -28 +28 @@ impl Jiffies {
+-    /// Returns the elapsed time since the system boots up.
++    /// Returns the number of observed timer callbacks since boot.
+@@ -43 +43 @@ impl Jiffies {
+-    /// Gets the [`Duration`] calculated from the jiffies counts.
++    /// Gets the nominal [`Duration`] calculated from the jiffies count.
+diff --git a/src/timer/mod.rs b/src/timer/mod.rs
+--- a/src/timer/mod.rs
++++ b/src/timer/mod.rs
+@@ -18 +18 @@ use crate::{
+-/// The timer frequency in Hz.
++/// The nominal maximum timer callback frequency in Hz.
+@@ -24 +24,2 @@ use crate::{
+-/// spent in executing timer code.
++/// spent in executing timer code. An architecture may rearm only after a callback completes, so
++/// callback handling can make the effective wall-clock frequency lower than this value.

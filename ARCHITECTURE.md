@@ -347,12 +347,26 @@ the fallback prerequisite and epoch transition, but does not start a replacement
 user-space supervisor or validate snapshot/ready. The experiment also wraps
 OSTD `Waiter`/`Waker` and `Jiffies` with an effect token.
 
+The patched x86 APIC supplies a callback-completion-rearmed fixed-delay logical
+tick. Its nominal conversion rate can run effectively slower in wall-clock time
+under callback or IRQ-tail load. Consequently, the 64-tick lease, `Jiffies`, and
+artifact tick deltas are ordering/progress diagnostics, not wall-clock
+freshness, timeout, or SLO claims.
+
+The patched first-task path has two distinct observations. On the first switch
+only, OSTD completes the post-schedule VM activation and then invokes a
+disabled-IRQ Nexus admission hook before `enable_local`; resumed tasks do not
+repeat it. The later trampoline hook proves post-IRQ liveness before the task
+closure. The current Expire slice binds only its fixed `TaskData` IDs and
+role-specific VM shape at the early hook, so this is not yet production
+`TaskKey`, authority-epoch, or binding-epoch admission.
+
 Limitations:
 
 - there is one run queue and one CPU;
 - the deterministic receipt checks the first post-crash fallback selection
-  attempt in this one-CPU configuration; the raw timer delta is diagnostic only
-  and is recorded per artifact, not treated as a general real-time guarantee;
+  attempt in this one-CPU configuration; the raw logical-tick delta is recorded
+  per artifact and is not a wall-clock freshness, timeout, or SLO guarantee;
 - the compiled lease-expiry branch was not independently exercised;
 - no real replacement supervisor lifecycle or ready handshake is observed;
 - SMP proposal races, migration, fairness, and complete scope revocation remain

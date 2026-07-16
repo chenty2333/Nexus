@@ -97,4 +97,4 @@ if oracle "$work/trailing-newline.log" >/dev/null 2>&1; then
     die "oracle accepted a trailing byte outside the exact debugcon record"
 fi
 
-echo 'Linux futex entry debugcon assertions: PASS tasks=510+511+512+513 boundaries=post-vm-pre-irq+post-irq-entry+closure-entered+identity-validated encoding=single-byte-hex bytes=16 records=16 sink=isa-debugcon mutations=6'
+echo 'Linux futex entry debugcon assertions: PASS tasks=510+511+512+513 boundaries=pre-irq-admitted+post-irq-entry+closure-entered+identity-validated encoding=single-byte-hex bytes=16 records=16 sink=isa-debugcon mutations=6'

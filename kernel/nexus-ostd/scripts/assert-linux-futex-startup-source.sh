@@ -76,8 +76,38 @@ oracle() {
         /\.checked_sub\(start\)/ {
             monotonic_differences++
         }
-        /^static EXPIRE_POST_VM_PRE_IRQ_BITS: AtomicU8 = AtomicU8::new\(0\);$/ {
+        $0 == "pub(crate) fn admit_expire_task_pre_irq(data: &TaskData, _irq_guard: &DisabledLocalIrqGuard) {" {
+            admission_functions++
+            admission_function_line = NR
+            in_admission = 1
+        }
+        in_admission && $0 == "    let Some(entry) = ExpireTaskEntry::from_task_id(data.id) else {" {
+            admission_identity_mappings++
+            admission_identity_mapping_line = NR
+        }
+        in_admission && $0 == "    let bit = entry.bit();" {
+            admission_bit_derivations++
+            admission_bit_derivation_line = NR
+        }
+        in_admission && $0 == "    EXPIRE_SWITCH_TAIL_OPEN_BITS.fetch_or(bit, Ordering::Release);" {
+            forbidden_retired_switch_tail_state++
+        }
+        in_admission && $0 == "    emit_expire_debugcon(entry, ExpireEntryBoundary::PreIrqAdmitted);" {
+            admission_markers++
+            admission_marker_line = NR
+        }
+        $0 == "pub(crate) fn record_expire_post_irq_entry(task_id: u64) {" {
+            if (in_admission) {
+                admission_ends++
+                admission_end_line = NR
+                in_admission = 0
+            }
+        }
+        /^static EXPIRE_POST_VM_READY_BITS: AtomicU8 = AtomicU8::new\(0\);$/ {
             post_vm_masks++
+        }
+        /^static EXPIRE_PRE_IRQ_ADMITTED_BITS: AtomicU8 = AtomicU8::new\(0\);$/ {
+            pre_irq_masks++
         }
         /^static EXPIRE_POST_IRQ_ENTRY_BITS: AtomicU8 = AtomicU8::new\(0\);$/ {
             post_irq_masks++
@@ -88,8 +118,12 @@ oracle() {
         /^static EXPIRE_IDENTITY_VALIDATED_BITS: AtomicU8 = AtomicU8::new\(0\);$/ {
             identity_masks++
         }
-        /EXPIRE_POST_VM_PRE_IRQ_BITS\.fetch_or\(entry\.bit\(\), Ordering::Release\)/ {
+        /EXPIRE_POST_VM_READY_BITS\.fetch_or\(entry\.bit\(\), Ordering::Release\)/ {
             post_vm_release_publishes++
+        }
+        in_admission && /EXPIRE_PRE_IRQ_ADMITTED_BITS\.fetch_or\(bit, Ordering::Release\)/ {
+            pre_irq_release_publishes++
+            pre_irq_release_publish = NR
         }
         /EXPIRE_POST_IRQ_ENTRY_BITS\.fetch_or\(entry\.bit\(\), Ordering::Release\)/ {
             post_irq_release_publishes++
@@ -100,8 +134,15 @@ oracle() {
         /EXPIRE_IDENTITY_VALIDATED_BITS\.fetch_or\(entry\.bit\(\), Ordering::Release\)/ {
             identity_release_publishes++
         }
-        /EXPIRE_POST_VM_PRE_IRQ_BITS\.load\(Ordering::Acquire\)/ {
+        /EXPIRE_POST_VM_READY_BITS\.load\(Ordering::Acquire\)/ {
             post_vm_acquire_observations++
+            if (in_admission) {
+                admission_post_vm_observations++
+                admission_post_vm_observe_line = NR
+            }
+        }
+        /EXPIRE_PRE_IRQ_ADMITTED_BITS\.load\(Ordering::Acquire\)/ {
+            pre_irq_acquire_observations++
         }
         /EXPIRE_POST_IRQ_ENTRY_BITS\.load\(Ordering::Acquire\)/ {
             post_irq_acquire_observations++
@@ -130,8 +171,24 @@ oracle() {
         /IoPort::acquire\(EXPIRE_DEBUGCON_PORT\)/ {
             debugcon_acquisitions++
         }
-        index($0, "\"LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage={} role={} task={} source=ostd-trampoline post_vm_pre_irq=true post_irq_entry=true closure_entered=true identity_validated=true debugcon=true reported_by=parent observation={}") > 0 {
+        index($0, "\"LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage={} role={} task={} source=ostd-first-switch pre_irq_admitted=true post_irq_entry=true closure_entered=true identity_validated=true debugcon=true reported_by=parent observation={}") > 0 {
             parent_task_entry_reporters++
+        }
+        in_admission && $0 == "    let expects_vm = entry != ExpireTaskEntry::ClosureWatchdog;" {
+            vm_shape_roles++
+            vm_shape_role_line = NR
+        }
+        in_admission && $0 == "        data.vm_space.is_some()," {
+            vm_shape_checks++
+            vm_shape_check_line = NR
+        }
+        in_admission && $0 == "        data.dynamic_vm_space.is_none()," {
+            dynamic_vm_rejections++
+            dynamic_vm_rejection_line = NR
+        }
+        in_admission && $0 == "        data.cser_task.is_none()," {
+            registry_identity_rejections++
+            registry_identity_rejection_line = NR
         }
         $0 == "        mark_expire_closure_entered(ExpireTaskEntry::Waiter);" {
             waiter_closure_entries++
@@ -328,13 +385,15 @@ oracle() {
                 effect_guard_drop != effect_watchdog_run + 1 ||
                 effect_completion_wait != effect_guard_drop + 1)
                 fail("effect task spawns are not batched immediately before the completion wait")
-            if (post_vm_masks != 1 || post_irq_masks != 1 ||
+            if (post_vm_masks != 1 || pre_irq_masks != 1 || post_irq_masks != 1 ||
                 closure_masks != 1 || identity_masks != 1 ||
                 post_vm_release_publishes != 1 ||
+                pre_irq_release_publishes != 1 ||
                 post_irq_release_publishes != 1 ||
                 closure_release_publishes != 1 ||
                 identity_release_publishes != 1 ||
                 post_vm_acquire_observations < 2 ||
+                pre_irq_acquire_observations < 3 ||
                 post_irq_acquire_observations < 3 ||
                 closure_acquire_observations < 3 ||
                 identity_acquire_observations < 2 ||
@@ -345,6 +404,22 @@ oracle() {
                 debugcon_acquisitions != 1 ||
                 forbidden_raw_debugcon_writes != 0 ||
                 parent_task_entry_reporters != 1 ||
+                admission_functions != 1 || admission_identity_mappings != 1 ||
+                admission_bit_derivations != 1 || admission_post_vm_observations != 1 ||
+                admission_ends != 1 || admission_markers != 1 ||
+                forbidden_retired_switch_tail_state != 0 || in_admission ||
+                vm_shape_roles != 1 || vm_shape_checks != 1 ||
+                dynamic_vm_rejections != 1 || registry_identity_rejections != 1 ||
+                !(admission_function_line < admission_identity_mapping_line &&
+                  admission_identity_mapping_line < admission_bit_derivation_line &&
+                  admission_bit_derivation_line < admission_post_vm_observe_line &&
+                  admission_post_vm_observe_line < vm_shape_role_line &&
+                  vm_shape_role_line < vm_shape_check_line &&
+                  vm_shape_check_line < dynamic_vm_rejection_line &&
+                  dynamic_vm_rejection_line < registry_identity_rejection_line &&
+                  registry_identity_rejection_line < pre_irq_release_publish &&
+                  pre_irq_release_publish < admission_marker_line &&
+                  admission_marker_line < admission_end_line) ||
                 semantic_ready_reports != 1 ||
                 v1_completion_reports != 1 || watchdog_completion_reports != 1 ||
                 complete_entry_assertions != 1)
@@ -393,7 +468,10 @@ lib_oracle() {
         /inject_post_schedule_handler\(activate_current_task_vm\);/ {
             post_injections++
         }
-        /inject_first_task_entry_handler\(record_current_task_entry\);/ {
+        /inject_first_task_pre_irq_handler\(admit_current_task_pre_irq\);/ {
+            pre_irq_injections++
+        }
+        /inject_first_task_entry_handler\(record_current_task_post_irq_entry\);/ {
             entry_injections++
         }
         /linux_futex::init_expire_debugcon\(\);/ {
@@ -416,12 +494,30 @@ lib_oracle() {
             post_activation_calls++
             post_last_activation_line = NR
         }
-        in_post && $0 == "    linux_futex::record_expire_post_vm_pre_irq(data.id);" {
+        in_post && $0 == "    linux_futex::record_expire_post_vm_ready(data.id);" {
             post_vm_recorders++
             post_vm_recorder_line = NR
             in_post = 0
         }
-        $0 == "fn record_current_task_entry() {" {
+        $0 == "fn admit_current_task_pre_irq(irq_guard: &DisabledLocalIrqGuard) {" {
+            in_pre_irq = 1
+            pre_irq_handlers++
+            pre_irq_handler_line = NR
+        }
+        in_pre_irq && /Task::current\(\)/ {
+            pre_irq_current_task_reads++
+            pre_irq_current_task_line = NR
+        }
+        in_pre_irq && /\.downcast_ref::<TaskData>\(\)/ {
+            pre_irq_task_data_downcasts++
+            pre_irq_task_data_line = NR
+        }
+        in_pre_irq && $0 == "    linux_futex::admit_expire_task_pre_irq(data, irq_guard);" {
+            pre_irq_recorders++
+            pre_irq_recorder_line = NR
+            in_pre_irq = 0
+        }
+        $0 == "fn record_current_task_post_irq_entry() {" {
             in_entry = 1
             entry_handlers++
             entry_handler_line = NR
@@ -443,13 +539,20 @@ lib_oracle() {
             forbidden_switch_serial++
         }
         END {
-            if (post_injections != 1 || entry_injections != 1 ||
+            if (post_injections != 1 || pre_irq_injections != 1 ||
+                entry_injections != 1 ||
                 debugcon_initializers != 1 || scheduler_injections != 1 ||
                 !(debugcon_initializer_line < scheduler_injection_line) ||
                 post_handlers != 1 || post_activation_calls != 2 ||
                 post_vm_recorders != 1 || forbidden_switch_serial != 0 ||
                 !(post_last_activation_line < post_vm_recorder_line))
                 fail("post-switch VM activation is not atomically recorded without serial output")
+            if (pre_irq_handlers != 1 || pre_irq_current_task_reads != 1 ||
+                pre_irq_task_data_downcasts != 1 || pre_irq_recorders != 1 ||
+                !(pre_irq_handler_line < pre_irq_current_task_line &&
+                  pre_irq_current_task_line < pre_irq_task_data_line &&
+                  pre_irq_task_data_line < pre_irq_recorder_line))
+                fail("pre-IRQ admission does not bind TaskData and the disabled-IRQ guard")
             if (entry_handlers != 1 || current_task_reads != 1 ||
                 task_data_downcasts != 1 || entry_recorders != 1 ||
                 !(entry_handler_line < current_task_line &&
@@ -702,10 +805,16 @@ if oracle "$work/preempt-point-before-completion-wait.rs" >/dev/null 2>&1; then
     die "oracle accepted an explicit preemption point before the completion wait"
 fi
 
-sed '0,/EXPIRE_POST_VM_PRE_IRQ_BITS.fetch_or(entry.bit(), Ordering::Release)/s/Ordering::Release/Ordering::Relaxed/' \
+sed '0,/EXPIRE_POST_VM_READY_BITS.fetch_or(entry.bit(), Ordering::Release)/s/Ordering::Release/Ordering::Relaxed/' \
     "$source_file" >"$work/relaxed-post-vm-publication.rs"
 if oracle "$work/relaxed-post-vm-publication.rs" >/dev/null 2>&1; then
     die "oracle accepted a relaxed post-VM boundary publication"
+fi
+
+sed '0,/EXPIRE_PRE_IRQ_ADMITTED_BITS.fetch_or(bit, Ordering::Release)/s/Ordering::Release/Ordering::Relaxed/' \
+    "$source_file" >"$work/relaxed-pre-irq-admission.rs"
+if oracle "$work/relaxed-pre-irq-admission.rs" >/dev/null 2>&1; then
+    die "oracle accepted a relaxed pre-IRQ admission publication"
 fi
 
 awk '
@@ -733,7 +842,7 @@ if oracle "$work/wrong-debugcon-port.rs" >/dev/null 2>&1; then
 fi
 
 awk '
-    !removed && /inject_first_task_entry_handler\(record_current_task_entry\);/ {
+    !removed && /inject_first_task_entry_handler\(record_current_task_post_irq_entry\);/ {
         removed = 1
         next
     }
@@ -745,7 +854,19 @@ if lib_oracle "$work/missing-first-entry-injection.rs" >/dev/null 2>&1; then
 fi
 
 awk '
-    !removed && $0 == "    linux_futex::record_expire_post_vm_pre_irq(data.id);" {
+    !removed && /inject_first_task_pre_irq_handler\(admit_current_task_pre_irq\);/ {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+' "$lib_file" >"$work/missing-first-pre-irq-injection.rs"
+if lib_oracle "$work/missing-first-pre-irq-injection.rs" >/dev/null 2>&1; then
+    die "oracle accepted a missing OSTD first-task pre-IRQ injection"
+fi
+
+awk '
+    !removed && $0 == "    linux_futex::record_expire_post_vm_ready(data.id);" {
         removed = 1
         next
     }
@@ -754,6 +875,30 @@ awk '
 ' "$lib_file" >"$work/missing-post-vm-recorder.rs"
 if lib_oracle "$work/missing-post-vm-recorder.rs" >/dev/null 2>&1; then
     die "oracle accepted a post-switch path without its post-VM recorder"
+fi
+
+awk '
+    !removed && $0 == "    linux_futex::admit_expire_task_pre_irq(data, irq_guard);" {
+        removed = 1
+        next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+' "$lib_file" >"$work/missing-pre-irq-admission-recorder.rs"
+if lib_oracle "$work/missing-pre-irq-admission-recorder.rs" >/dev/null 2>&1; then
+    die "oracle accepted pre-IRQ admission without TaskData and guard binding"
+fi
+
+sed '0,/let expects_vm = entry != ExpireTaskEntry::ClosureWatchdog;/s/!=/==/' \
+    "$source_file" >"$work/reversed-pre-irq-vm-shape.rs"
+if oracle "$work/reversed-pre-irq-vm-shape.rs" >/dev/null 2>&1; then
+    die "oracle accepted reversed role-specific VM shape admission"
+fi
+
+sed '0,/ExpireTaskEntry::from_task_id(data\.id)/s/data\.id/510/' \
+    "$source_file" >"$work/hardcoded-pre-irq-admission.rs"
+if oracle "$work/hardcoded-pre-irq-admission.rs" >/dev/null 2>&1; then
+    die "oracle accepted pre-IRQ admission hardcoded to task 510"
 fi
 
 awk '
@@ -780,4 +925,4 @@ if osdk_oracle "$work/missing-debugcon-device.toml" >/dev/null 2>&1; then
     die "oracle accepted an OSDK profile without its debugcon device"
 fi
 
-echo "Linux futex startup source assertions: PASS expire_only=true order=waker-ready+wait-captured+v1+watchdog selection_cause=explicit switch_path=atomic-only post_vm_pre_irq=true post_irq_trampoline=true closure_entered_before_identity=true identity_validated_before_effect=true task_entries=parent-reported debugcon=isolated publication_order=guest-prerequisite-before-ready readiness=release+acquire handshake=blocking-wait-queue prerequisite_spawn_preemption=disabled-through-run effect_task_spawns=batched-under-preempt-guard next_explicit_schedule=completion-wait atomic_release_and_park=false timing=diagnostic internal_timeout=false failure_bound=outer-qemu-timeout tcb=ostd-0.18-first-task-entry+park-current mutations=25"
+echo "Linux futex startup source assertions: PASS expire_only=true order=waker-ready+wait-captured+v1+watchdog selection_cause=observed switch_path=irq-off-first-admission pre_irq_admitted=task-data-scoped+guarded post_irq_liveness=true closure_entered_before_identity=true identity_validated_before_effect=true task_entries=parent-reported debugcon=isolated publication_order=guest-prerequisite-before-ready readiness=release+acquire handshake=blocking-wait-queue prerequisite_spawn_preemption=disabled-through-run effect_task_spawns=batched-under-preempt-guard next_explicit_schedule=completion-wait atomic_release_and_park=false timing=diagnostic internal_timeout=false failure_bound=outer-qemu-timeout tcb=ostd-0.18-first-task-pre-irq+first-task-entry+park-current mutations=30"

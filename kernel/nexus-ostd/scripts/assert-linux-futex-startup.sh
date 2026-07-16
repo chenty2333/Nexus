@@ -124,7 +124,7 @@ oracle() {
         if (NF != 14 || $2 != "TaskEntry" || $3 != "scenario=expire" ||
             $4 !~ /^stage=(waker-ready|wait-captured|effect-driver|closure-watchdog)$/ ||
             $5 !~ /^role=(waker|waiter|personality-v1|watchdog)$/ || $6 !~ /^task=/ ||
-            $7 != "source=ostd-trampoline" || $8 != "post_vm_pre_irq=true" ||
+            $7 != "source=ostd-first-switch" || $8 != "pre_irq_admitted=true" ||
             $9 != "post_irq_entry=true" || $10 != "closure_entered=true" ||
             $11 != "identity_validated=true" || $12 != "debugcon=true" ||
             $13 != "reported_by=parent" ||
@@ -310,10 +310,10 @@ if oracle "$work/internal-timeout-overclaim.log" >/dev/null 2>&1; then
     die "oracle accepted an unimplemented guest-side startup timeout"
 fi
 
-sed '0,/post_vm_pre_irq=true/s//post_vm_pre_irq=false/' \
-    "$serial_log" >"$work/missing-post-vm-boundary.log"
-if oracle "$work/missing-post-vm-boundary.log" >/dev/null 2>&1; then
-    die "oracle accepted TaskEntry without the post-VM/pre-IRQ boundary"
+sed '0,/pre_irq_admitted=true/s//pre_irq_admitted=false/' \
+    "$serial_log" >"$work/missing-pre-irq-admission.log"
+if oracle "$work/missing-pre-irq-admission.log" >/dev/null 2>&1; then
+    die "oracle accepted TaskEntry without pre-IRQ admission"
 fi
 
 sed '0,/post_irq_entry=true/s//post_irq_entry=false/' \
@@ -458,4 +458,4 @@ if oracle "$work/reordered-timing-fields.log" >/dev/null 2>&1; then
     die "oracle accepted a non-canonical startup receipt field order"
 fi
 
-echo "Linux futex staged-start assertions: PASS receipts=2 selections=4 selection_cause=explicit switch_serial=false task_entries=4 entry_source=ostd-trampoline entry_boundaries=post-vm-pre-irq+post-irq-entry+closure-entered+identity-validated entry_reporter=parent child_entry_blocks=2 timing=diagnostic exact_u64_decimal=true internal_timeout=false handshake=wait-queue prerequisite_spawn_preemption=disabled-through-run effect_task_spawns=batched-under-preempt-guard next_explicit_schedule=completion-wait atomic_release_and_park=false effect_entry_order=partial failure_bound=outer-qemu-timeout publish_recover_protocol=retained mutations=20"
+echo "Linux futex staged-start assertions: PASS receipts=2 selections=4 selection_cause=observed switch_serial=false task_entries=4 entry_source=ostd-first-switch entry_boundaries=pre-irq-admitted+post-irq-entry+closure-entered+identity-validated entry_reporter=parent child_entry_blocks=2 timing=diagnostic exact_u64_decimal=true internal_timeout=false handshake=wait-queue prerequisite_spawn_preemption=disabled-through-run effect_task_spawns=batched-under-preempt-guard next_explicit_schedule=completion-wait atomic_release_and_park=false effect_entry_order=partial failure_bound=outer-qemu-timeout publish_recover_protocol=retained mutations=20"

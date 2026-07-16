@@ -35,7 +35,7 @@ const TLA_TOOLCHAIN_SOURCE_REVISION: &str = "227f61b983d0203a06db8184da45aed421e
 const TLA_TOOLCHAIN_INSTALLED_PATH: &str = "/opt/tla2tools/tla2tools.jar";
 const TLA_TOOLCHAIN_VERSION_LINE: &str = "TLC2 Version 2026.07.09.134028 (rev: 227f61b)";
 const PLUSCAL_VERSION_LINE: &str = "pcal.trans Version 1.12 of 01 July 2024";
-const ENTRY_DEBUGCON_PASS: &str = "Linux futex entry debugcon assertions: PASS tasks=510+511+512+513 boundaries=post-vm-pre-irq+post-irq-entry+closure-entered+identity-validated encoding=single-byte-hex bytes=16 records=16 sink=isa-debugcon mutations=6";
+const ENTRY_DEBUGCON_PASS: &str = "Linux futex entry debugcon assertions: PASS tasks=510+511+512+513 boundaries=pre-irq-admitted+post-irq-entry+closure-entered+identity-validated encoding=single-byte-hex bytes=16 records=16 sink=isa-debugcon mutations=6";
 const TLA_TOOLCHAIN_JAR: ToolchainFileContract = ToolchainFileContract {
     path: "third_party/tlaplus/1.8.0-227f61b/tla2tools-227f61b.jar",
     bytes: 4_357_904,

@@ -64,6 +64,7 @@ use effect_registry::TaskKey;
 use iommu_probe::{DmaQuiesceError, DmaQuiescer, Ostd018FailClosed};
 use ostd::{
     arch::cpu::context::{CpuException, UserContext},
+    irq::DisabledLocalIrqGuard,
     mm::{
         CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmIo, VmSpace,
     },
@@ -72,7 +73,8 @@ use ostd::{
     sync::SpinLock,
     task::{
         Task, TaskOptions, disable_preempt, inject_first_task_entry_handler,
-        inject_post_schedule_handler, scheduler as ostd_scheduler,
+        inject_first_task_pre_irq_handler, inject_post_schedule_handler,
+        scheduler as ostd_scheduler,
     },
     user::{ReturnReason, UserMode},
 };
@@ -153,7 +155,8 @@ fn kernel_main_standard() {
     linux_futex::init_expire_debugcon();
     ostd_scheduler::inject_scheduler(scheduler);
     inject_post_schedule_handler(activate_current_task_vm);
-    inject_first_task_entry_handler(record_current_task_entry);
+    inject_first_task_pre_irq_handler(admit_current_task_pre_irq);
+    inject_first_task_entry_handler(record_current_task_post_irq_entry);
 
     let binding = scheduler.binding();
     println!(
@@ -200,10 +203,19 @@ fn activate_current_task_vm() {
     } else if let Some(vm_space) = &data.vm_space {
         vm_space.activate();
     }
-    linux_futex::record_expire_post_vm_pre_irq(data.id);
+    linux_futex::record_expire_post_vm_ready(data.id);
 }
 
-fn record_current_task_entry() {
+fn admit_current_task_pre_irq(irq_guard: &DisabledLocalIrqGuard) {
+    let current = Task::current().expect("pre-IRQ admission requires a current task");
+    let data = current
+        .data()
+        .downcast_ref::<TaskData>()
+        .expect("all Nexus OSTD tasks carry TaskData");
+    linux_futex::admit_expire_task_pre_irq(data, irq_guard);
+}
+
+fn record_current_task_post_irq_entry() {
     let current = Task::current().expect("OSTD task-entry hook requires a current task");
     let data = current
         .data()

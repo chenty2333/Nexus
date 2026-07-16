@@ -22,7 +22,7 @@ the crate-root module API:
 - OSTD: `=0.18.0` from the crates.io archive with SHA-256
   `aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1`
 - canonical MPL-2.0 OSTD overlay: `patches/ostd-0.18.0-cser.patch`, SHA-256
-  `8b914b775dcc52b64ccb701e3df1dc2df699a727f3f0deacdad0fdf591f8829f`
+  `0950caa05bfa08467acd00a150246865af82b6ff7f0fc728a33ecf493ffb4912`
 - virtio-drivers: `=0.13.0` from the crates.io archive with SHA-256
   `cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7`
 - canonical MIT split-publication overlay:
@@ -157,6 +157,21 @@ the bounded dynamic path.
 6. Thin wrappers around OSTD `Waiter`/`Waker` and `Jiffies` preserve an
    `EffectToken`; the wait pair is exercised at runtime.
 
+The patched x86 APIC uses a callback-completion-rearmed fixed-delay one-shot,
+so these are logical ticks at a nominal conversion rate. Callback and IRQ-tail
+work can lower the effective wall-clock rate under load. The 64-tick lease,
+`Jiffies`, and recorded tick deltas therefore do not establish wall-clock
+freshness, timeout, or SLO guarantees.
+
+The OSTD task adapter also separates first-switch admission from post-IRQ
+liveness. For a new task only, the post-schedule VM activation completes before
+an IRQ-guarded Nexus hook validates the bounded `TaskData` role and VM shape;
+local IRQs are enabled only after that hook returns. A resumed task bypasses
+this admission hook, while the existing trampoline hook remains a separate
+post-IRQ observation before the task closure runs. This binds the four Expire
+tasks in this finite experiment; it is not a production `TaskKey`, authority,
+or binding-epoch admission claim.
+
 ### Pager crash/rebind slice
 
 The pager probe runs while the scheduler remains in its kernel FIFO fallback;
@@ -241,7 +256,8 @@ synchronizes the local TLB, terminalizes and wakes once, and resumes the same
 RIP once. In the same boot, scheduler effect 0 is attached to a user-policy
 proposal; the policy faults, the proposal is cleared, and guest task 400 must
 be the first kernel FIFO fallback pick on the next fallback selection attempt.
-The raw timer-tick delta remains a diagnostic rather than a real-time bound.
+The raw logical-tick delta remains a diagnostic rather than a wall-clock
+freshness, timeout, or SLO bound.
 Write effect 1, exit effect 2, code-fault effect 3, and completion effect 4 are
 distinct.
 

@@ -20,6 +20,7 @@ use ostd::{
         device::io_port::WriteOnlyAccess,
     },
     io::IoPort,
+    irq::DisabledLocalIrqGuard,
     mm::{CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmSpace},
     prelude::*,
     sync::{SpinLock, WaitQueue},
@@ -68,10 +69,11 @@ const PERSONALITY_V1_PROGRAM: &[u8] = include_bytes!("../../guest/linux-futex-pe
 const PERSONALITY_V2_PROGRAM: &[u8] = include_bytes!("../../guest/linux-futex-personality-v2.bin");
 const SCHEDULER_POLICY_PROGRAM: &[u8] = include_bytes!("../../guest/linux-scheduler-policy.bin");
 
-// These masks bind four first-entry boundaries without writing the serial
-// console from OSTD's IRQ-off switch path. The parent emits the semantic
-// receipt only after it observes each task's protocol-level progress.
-static EXPIRE_POST_VM_PRE_IRQ_BITS: AtomicU8 = AtomicU8::new(0);
+// These masks bind first-switch admission and task-entry liveness without
+// writing the serial console from OSTD's IRQ-off switch path. The parent emits
+// the semantic receipt only after it observes each task's protocol progress.
+static EXPIRE_POST_VM_READY_BITS: AtomicU8 = AtomicU8::new(0);
+static EXPIRE_PRE_IRQ_ADMITTED_BITS: AtomicU8 = AtomicU8::new(0);
 static EXPIRE_POST_IRQ_ENTRY_BITS: AtomicU8 = AtomicU8::new(0);
 static EXPIRE_CLOSURE_ENTERED_BITS: AtomicU8 = AtomicU8::new(0);
 static EXPIRE_IDENTITY_VALIDATED_BITS: AtomicU8 = AtomicU8::new(0);
@@ -119,7 +121,7 @@ enum ExpireTaskEntry {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExpireEntryBoundary {
-    PostVmPreIrq = 0,
+    PreIrqAdmitted = 0,
     PostIrqEntry = 1,
     ClosureEntered = 2,
     IdentityValidated = 3,
@@ -189,14 +191,45 @@ pub(crate) fn init_expire_debugcon() {
     });
 }
 
-pub(crate) fn record_expire_post_vm_pre_irq(task_id: u64) {
+pub(crate) fn record_expire_post_vm_ready(task_id: u64) {
     let Some(entry) = ExpireTaskEntry::from_task_id(task_id) else {
         return;
     };
-    let previous = EXPIRE_POST_VM_PRE_IRQ_BITS.fetch_or(entry.bit(), Ordering::Release);
-    if previous & entry.bit() == 0 {
-        emit_expire_debugcon(entry, ExpireEntryBoundary::PostVmPreIrq);
-    }
+    EXPIRE_POST_VM_READY_BITS.fetch_or(entry.bit(), Ordering::Release);
+}
+
+pub(crate) fn admit_expire_task_pre_irq(data: &TaskData, _irq_guard: &DisabledLocalIrqGuard) {
+    let Some(entry) = ExpireTaskEntry::from_task_id(data.id) else {
+        return;
+    };
+    let bit = entry.bit();
+    assert_ne!(
+        EXPIRE_POST_VM_READY_BITS.load(Ordering::Acquire) & bit,
+        0,
+        "first-task admission must follow post-switch VM activation"
+    );
+    let expects_vm = entry != ExpireTaskEntry::ClosureWatchdog;
+    assert_eq!(
+        data.vm_space.is_some(),
+        expects_vm,
+        "Expire task identity must retain its role-specific VM shape"
+    );
+    assert!(
+        data.dynamic_vm_space.is_none(),
+        "Expire task identity must not use the dynamic-exec VM slot"
+    );
+    #[cfg(feature = "virtio-cser-facade")]
+    assert!(
+        data.cser_task.is_none(),
+        "bounded Expire admission is not a production Registry identity"
+    );
+    let previous = EXPIRE_PRE_IRQ_ADMITTED_BITS.fetch_or(bit, Ordering::Release);
+    assert_eq!(
+        previous & bit,
+        0,
+        "first-task pre-IRQ admission must publish each task exactly once"
+    );
+    emit_expire_debugcon(entry, ExpireEntryBoundary::PreIrqAdmitted);
 }
 
 pub(crate) fn record_expire_post_irq_entry(task_id: u64) {
@@ -204,9 +237,9 @@ pub(crate) fn record_expire_post_irq_entry(task_id: u64) {
         return;
     };
     assert_ne!(
-        EXPIRE_POST_VM_PRE_IRQ_BITS.load(Ordering::Acquire) & entry.bit(),
+        EXPIRE_PRE_IRQ_ADMITTED_BITS.load(Ordering::Acquire) & entry.bit(),
         0,
-        "OSTD task entry must follow post-switch VM activation"
+        "OSTD post-IRQ task entry must follow pre-IRQ admission"
     );
     let previous = EXPIRE_POST_IRQ_ENTRY_BITS.fetch_or(entry.bit(), Ordering::Release);
     assert_eq!(
@@ -249,7 +282,10 @@ fn mark_expire_identity_validated(entry: ExpireTaskEntry) {
 
 fn report_expire_task_entry(entry: ExpireTaskEntry, observation: &'static str) {
     let bit = entry.bit();
-    assert_ne!(EXPIRE_POST_VM_PRE_IRQ_BITS.load(Ordering::Acquire) & bit, 0);
+    assert_ne!(
+        EXPIRE_PRE_IRQ_ADMITTED_BITS.load(Ordering::Acquire) & bit,
+        0
+    );
     assert_ne!(EXPIRE_POST_IRQ_ENTRY_BITS.load(Ordering::Acquire) & bit, 0);
     assert_ne!(EXPIRE_CLOSURE_ENTERED_BITS.load(Ordering::Acquire) & bit, 0);
     assert_ne!(
@@ -257,7 +293,7 @@ fn report_expire_task_entry(entry: ExpireTaskEntry, observation: &'static str) {
         0
     );
     println!(
-        "LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage={} role={} task={} source=ostd-trampoline post_vm_pre_irq=true post_irq_entry=true closure_entered=true identity_validated=true debugcon=true reported_by=parent observation={}",
+        "LINUX_FUTEX_STARTUP TaskEntry scenario=expire stage={} role={} task={} source=ostd-first-switch pre_irq_admitted=true post_irq_entry=true closure_entered=true identity_validated=true debugcon=true reported_by=parent observation={}",
         entry.stage(),
         entry.role(),
         entry.task_id(),
@@ -267,7 +303,11 @@ fn report_expire_task_entry(entry: ExpireTaskEntry, observation: &'static str) {
 
 fn assert_expire_task_entry_receipts_complete() {
     assert_eq!(
-        EXPIRE_POST_VM_PRE_IRQ_BITS.load(Ordering::Acquire),
+        EXPIRE_POST_VM_READY_BITS.load(Ordering::Acquire),
+        ExpireTaskEntry::ALL_BITS
+    );
+    assert_eq!(
+        EXPIRE_PRE_IRQ_ADMITTED_BITS.load(Ordering::Acquire),
         ExpireTaskEntry::ALL_BITS
     );
     assert_eq!(
