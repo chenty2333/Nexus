@@ -24,6 +24,13 @@ use production_registry::{
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const BOOT_INCARNATION: u64 = 1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundedLine {
+    Eof,
+    Complete,
+    TooLarge,
+}
+
 #[derive(Clone)]
 struct StoredEffect {
     handle: PortalHandle,
@@ -78,11 +85,7 @@ impl ProductionEffectPeer {
 
     pub fn execute_line(&mut self, line: &[u8]) -> Vec<u8> {
         if line.len() > MAX_REQUEST_BYTES {
-            return encode_response(&PeerResponse::error(
-                0,
-                "request-too-large",
-                format!("request exceeds {MAX_REQUEST_BYTES} bytes"),
-            ));
+            return request_too_large_response();
         }
         let request: PeerRequest = match serde_json::from_slice(line) {
             Ok(request) => request,
@@ -708,16 +711,13 @@ impl PeerSession {
 
 pub fn serve<R: BufRead, W: Write>(mut input: R, mut output: W) -> io::Result<()> {
     let mut peer = ProductionEffectPeer::new();
-    let mut line = Vec::new();
+    let mut line = Vec::with_capacity(MAX_REQUEST_BYTES);
     loop {
-        line.clear();
-        if input.read_until(b'\n', &mut line)? == 0 {
-            return Ok(());
-        }
-        while matches!(line.last(), Some(b'\n' | b'\r')) {
-            line.pop();
-        }
-        let response = peer.execute_line(&line);
+        let response = match read_bounded_line(&mut input, &mut line)? {
+            BoundedLine::Eof => return Ok(()),
+            BoundedLine::Complete => peer.execute_line(&line),
+            BoundedLine::TooLarge => request_too_large_response(),
+        };
         output.write_all(&response)?;
         output.write_all(b"\n")?;
         output.flush()?;
@@ -725,6 +725,73 @@ pub fn serve<R: BufRead, W: Write>(mut input: R, mut output: W) -> io::Result<()
             return Ok(());
         }
     }
+}
+
+fn read_bounded_line<R: BufRead>(input: &mut R, line: &mut Vec<u8>) -> io::Result<BoundedLine> {
+    line.clear();
+    let mut saw_input = false;
+    let mut pending_carriage_returns = 0usize;
+    let mut too_large = false;
+
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            return if saw_input {
+                Ok(if too_large {
+                    BoundedLine::TooLarge
+                } else {
+                    BoundedLine::Complete
+                })
+            } else {
+                Ok(BoundedLine::Eof)
+            };
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        saw_input = true;
+
+        if !too_large {
+            for byte in &available[..content_len] {
+                if *byte == b'\r' {
+                    pending_carriage_returns = pending_carriage_returns.saturating_add(1);
+                    continue;
+                }
+
+                let remaining = MAX_REQUEST_BYTES - line.len();
+                if pending_carriage_returns > remaining {
+                    too_large = true;
+                    continue;
+                }
+                line.resize(line.len() + pending_carriage_returns, b'\r');
+                pending_carriage_returns = 0;
+
+                if line.len() == MAX_REQUEST_BYTES {
+                    too_large = true;
+                } else {
+                    line.push(*byte);
+                }
+            }
+        }
+
+        let consumed = content_len + usize::from(newline.is_some());
+        input.consume(consumed);
+        if newline.is_some() {
+            return Ok(if too_large {
+                BoundedLine::TooLarge
+            } else {
+                BoundedLine::Complete
+            });
+        }
+    }
+}
+
+fn request_too_large_response() -> Vec<u8> {
+    encode_response(&PeerResponse::error(
+        0,
+        "request-too-large",
+        format!("request exceeds {MAX_REQUEST_BYTES} bytes"),
+    ))
 }
 
 fn validate_config(config: PeerConfig) -> Result<(), PeerFailure> {

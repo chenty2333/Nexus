@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod catalog;
+mod current_status;
 mod doctor;
 mod evidence;
 mod guest;
@@ -250,6 +251,14 @@ fn fmt_check(root: &Path) -> Result<()> {
 }
 
 fn check(root: &Path) -> Result<()> {
+    section("validate current capability and native-wire status");
+    let current = current_status::validate(root)
+        .map_err(|error| format!("current capability status: {error}"))?;
+    println!(
+        "current capability status: PASS ({} checkpoints: {} local, {} external; {} frozen wire contract)",
+        current.checkpoints, current.local, current.external, current.frozen_wire_contracts,
+    );
+
     section("validate repository workflow surfaces");
     let workflow = workflow::validate(root)?;
     println!(

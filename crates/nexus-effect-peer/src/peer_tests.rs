@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::*;
+use std::io::{BufReader, Cursor};
 
 fn request(request_id: u64, command: PeerCommand) -> PeerRequest {
     PeerRequest {
@@ -51,6 +52,72 @@ fn decision(freeze_generation: u64) -> NativeOwnershipDecision {
         key_identity: intent.key_identity,
         request_digest: intent.request_digest,
     }
+}
+
+fn response_lines(output: &[u8]) -> Vec<PeerResponse> {
+    output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).expect("decode peer response"))
+        .collect()
+}
+
+#[test]
+fn bounded_reader_drains_oversized_line_and_preserves_the_next_crlf_frame() {
+    let shutdown = serde_json::to_vec(&request(1, PeerCommand::Shutdown)).unwrap();
+    let mut input = vec![b'x'; MAX_REQUEST_BYTES + 1];
+    input.push(b'\n');
+    input.extend_from_slice(&shutdown);
+    input.extend_from_slice(b"\r\n");
+
+    let mut output = Vec::new();
+    serve(
+        BufReader::with_capacity(37, Cursor::new(input)),
+        &mut output,
+    )
+    .expect("serve bounded frames");
+
+    let responses = response_lines(&output);
+    assert_eq!(responses.len(), 2);
+    assert_eq!(
+        responses[0].error.as_ref().unwrap().code,
+        "request-too-large"
+    );
+    assert_eq!(responses[1].status, ResponseStatus::Ok);
+    assert!(matches!(
+        &responses[1].receipt.as_ref().unwrap().payload,
+        NativeReceiptPayload::Shutdown
+    ));
+}
+
+#[test]
+fn bounded_reader_rejects_one_unterminated_oversized_frame_without_overgrowth() {
+    let input = vec![b'x'; MAX_REQUEST_BYTES + 1];
+    let mut reader = BufReader::with_capacity(31, Cursor::new(input));
+    let mut line = Vec::with_capacity(MAX_REQUEST_BYTES);
+
+    assert_eq!(
+        read_bounded_line(&mut reader, &mut line).unwrap(),
+        BoundedLine::TooLarge
+    );
+    assert_eq!(line.len(), MAX_REQUEST_BYTES);
+    assert_eq!(
+        read_bounded_line(&mut reader, &mut line).unwrap(),
+        BoundedLine::Eof
+    );
+
+    let mut output = Vec::new();
+    serve(
+        BufReader::with_capacity(31, Cursor::new(vec![b'x'; MAX_REQUEST_BYTES + 1])),
+        &mut output,
+    )
+    .expect("serve unterminated oversized frame");
+    let responses = response_lines(&output);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(
+        responses[0].error.as_ref().unwrap().code,
+        "request-too-large"
+    );
 }
 
 #[test]

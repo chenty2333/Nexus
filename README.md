@@ -138,6 +138,8 @@ The exact tier contracts and claim discipline are kept in
 | `experiments/ostd-virtio-cser-spike/` | Mediated VirtIO/reset/IOMMU component evidence |
 | `tests/guest/linux/` | Hash-pinned Linux compatibility-pressure inputs |
 | `evaluation/stage7b/` | Released evaluation contracts, sources, and race catalog |
+| `status/` | Moving exact-revision checkpoints and frozen wire contracts |
+| `docs/research/engineering-reuse-map.md` | Adopt/borrow/own decisions for the nine engineering priorities |
 | `tools/xtask/`, `tools/workflow/` | Reproducible build, evaluation, and evidence tooling |
 | `./x` | Public workflow entry point |
 

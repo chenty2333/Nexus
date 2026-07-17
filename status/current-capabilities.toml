@@ -1,0 +1,96 @@
+schema = "nexus.current-capability-ledger.v1"
+ledger_revision = 1
+as_of = "2026-07-17"
+classification = "current-checkpoints-not-release-evidence"
+canonical_release = "v0.1.0"
+canonical_release_evidence_unchanged = true
+checkpoint_count = 2
+wire_contracts = ["nexus-effect-peer-native-v1"]
+
+[policy]
+local_checkpoint = "exact-revision-bounded-observation"
+external_checkpoint = "separately-owned-evidence-never-upgrades-nexus-local-claims"
+frozen_release = "never-rewrite-or-relabel-v0.1.0-evidence"
+supersession = "replace-current-entry-with-explicit-exact-revision"
+
+[[checkpoint]]
+kind = "local"
+id = "nexus-main-8e5123c"
+status = "current-local-baseline"
+repository = "https://github.com/chenty2333/Nexus"
+revision = "8e5123c46569e8ebdaba9f4f56bea6584ab58586"
+recorded_on = "2026-07-17"
+evidence_level = "checked-and-bounded-one-vcpu-observed"
+wire_contract = "nexus-effect-peer-native-v1"
+ci_url = "https://github.com/chenty2333/Nexus/actions/runs/29536334333"
+commands = [
+  "./x verify",
+  "./x research handoff-admission",
+]
+capabilities = [
+  "filesystem-service-crash-before-device-commit",
+  "fsd-v1-to-fsd-v2-snapshot-ready-rebind-explicit-adopt",
+  "same-root-six-effect-filesystem-block-dma-cohort",
+  "same-boot-virtio-iommu-dma-polling-normal-lane",
+  "precommit-revoke-wins-aborted-before-commit-lane",
+  "handoff-admission-v2-production-registry-refinement",
+  "same-boot-nexus-effect-peer-native-v1",
+]
+boundaries = [
+  "not-rfc-0001-phase-closure",
+  "polling-with-intx-masked-no-real-irq",
+  "no-post-device-commit-pre-reply-service-crash-observation",
+  "no-two-or-four-vcpu-ostd-observation",
+  "no-host-reboot-registry-recovery",
+  "no-retained-device-control-on-native-v1-wire",
+  "no-production-deployment-claim",
+]
+sources = [
+  "docs/rfcs/0001-production-identity.md",
+  "docs/rfcs/0002-handoff-admission-profile.md",
+  "crates/nexus-effect-peer/src/wire.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+]
+
+[[checkpoint]]
+kind = "external"
+id = "visa-admission-ordered-4314a181"
+status = "exact-sha-ci-checked-not-canonical-or-archived"
+repository = "https://github.com/chenty2333/vISA"
+revision = "4314a181ded0862d7b1c7054f57f1bafd0595f07"
+recorded_on = "2026-07-17"
+evidence_level = "external-exact-sha-same-boot-observed"
+wire_contract = "nexus-effect-peer-native-v1"
+pins_local_checkpoint = "nexus-main-8e5123c"
+pins_local_revision = "8e5123c46569e8ebdaba9f4f56bea6584ab58586"
+claim_id = "bounded-same-boot-admission-ordered-logical-request-lost-ack"
+qualification_lock_schema = "visa.nexus-handoff-qualification-lock.v2"
+qualification_lock_sha256 = "21b5404bc5c1ad1f48c4ffe37cf455d104acac8ab9deca98f326d7c9b06072d9"
+ci_url = "https://github.com/chenty2333/vISA/actions/runs/29559181048"
+artifact_name = "nexus-visa-same-boot-qualification-evidence"
+artifact_digest = "sha256:269f8ddee3743686e966649f4b7a4aa6a6748248aecdf0d8327f789afbe87098"
+artifact_expires_at = "2026-07-31T06:11:52Z"
+archive_status = "ephemeral-actions-artifact-not-long-term-checkpoint"
+capabilities = [
+  "nexus-production-registry-admission-before-external-send",
+  "one-source-effect-execution",
+  "lost-ack-ownership-recovery",
+  "source-effect-closure-and-fence-before-destination-activation",
+  "destination-activation-and-reconcile-in-one-host-cell",
+  "relocatable-artifact-verification-of-executed-peer-bytes",
+]
+boundaries = [
+  "external-visa-owned-checkpoint-not-nexus-release-evidence",
+  "host-build-same-boot-only",
+  "no-registry-replacement-or-retained-device-tombstone-control",
+  "no-cross-host-or-reboot-recovery",
+  "no-real-service-death-ostd-irq-or-smp",
+  "no-production-live-wire-adapter",
+  "no-general-exactly-once-or-performance-claim",
+]
+sources = [
+  "https://github.com/chenty2333/vISA/blob/4314a181ded0862d7b1c7054f57f1bafd0595f07/scripts/run-logical-request-admission-cell.sh",
+  "https://github.com/chenty2333/vISA/blob/4314a181ded0862d7b1c7054f57f1bafd0595f07/crates/testing/visa-joint-handoff-system/src/logical_request_admission_cell.rs",
+  "https://github.com/chenty2333/vISA/blob/4314a181ded0862d7b1c7054f57f1bafd0595f07/third_party/joint-handoff-qualification/nexus-qualification-lock.json",
+]

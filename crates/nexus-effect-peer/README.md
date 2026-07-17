@@ -33,6 +33,15 @@ The SHA-256 chain is integrity evidence only. Its
 `sha256-integrity-only-not-authenticity` label is intentional. It is not a MAC,
 signature, KMS decision, or freshness proof.
 
+## Native wire compatibility
+
+The request, response, and native-receipt schemas ending in `.v1` are frozen.
+Native v1 accepts compatibility-preserving fixes only; new commands, fields,
+receipt kinds, or semantics require native v2 or an explicitly versioned
+extension with distinct schema identifiers. The machine contract and canonical
+serde snapshot are kept in `status/effect-peer-native-v1.json` and checked by
+`wire_v1_freeze` during the normal effect-peer test gate.
+
 ## Process lifecycle
 
 One process owns one Registry and one scope:
