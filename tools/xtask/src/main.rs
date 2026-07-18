@@ -417,6 +417,18 @@ fn check(root: &Path) -> Result<()> {
         ],
     )?;
 
+    section("check production effect peer native wire");
+    cargo(
+        root,
+        [
+            "check",
+            "--locked",
+            "-p",
+            "nexus-effect-peer-wire",
+            "--all-targets",
+        ],
+    )?;
+
     section("check portal ABI v2 preview");
     cargo(
         root,
@@ -537,6 +549,21 @@ fn clippy(root: &Path) -> Result<()> {
             "--locked",
             "-p",
             "nexus-effect-peer",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+
+    section("clippy production effect peer native wire");
+    cargo(
+        root,
+        [
+            "clippy",
+            "--locked",
+            "-p",
+            "nexus-effect-peer-wire",
             "--all-targets",
             "--",
             "-D",
@@ -671,6 +698,19 @@ fn test(root: &Path) -> Result<()> {
             "--locked",
             "-p",
             "nexus-effect-peer",
+            "--all-targets",
+            "--no-fail-fast",
+        ],
+    )?;
+
+    section("test production effect peer native wire");
+    cargo(
+        root,
+        [
+            "test",
+            "--locked",
+            "-p",
+            "nexus-effect-peer-wire",
             "--all-targets",
             "--no-fail-fast",
         ],

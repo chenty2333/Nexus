@@ -12,6 +12,7 @@ const REQUIRED_PATHS: &[&str] = &[
     "crates/cser-model/Cargo.toml",
     "crates/cser-transition-gates/tests/production_registry.rs",
     "crates/nexus-effect-peer/Cargo.toml",
+    "crates/nexus-effect-peer-wire/Cargo.toml",
     "crates/nexus-portal-abi/Cargo.toml",
     "crates/nexus-supervisor/Cargo.toml",
     "crates/nexus-ostd-virtio/Cargo.toml",

@@ -9,7 +9,7 @@ use cser_transition_gates::handoff::{
     HandoffId, LogPosition, OwnershipDecision, OwnershipDecisionReceipt, PrepareIntent,
 };
 
-use crate::wire::*;
+use nexus_effect_peer_wire::*;
 
 #[path = "../../../kernel/nexus-ostd/src/cser/effect_registry.rs"]
 mod production_registry;

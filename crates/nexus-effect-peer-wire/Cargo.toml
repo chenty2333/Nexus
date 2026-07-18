@@ -1,0 +1,12 @@
+[package]
+name = "nexus-effect-peer-wire"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Frozen native-v1 wire contract for the Nexus production effect peer"
+publish = false
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
