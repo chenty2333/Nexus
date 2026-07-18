@@ -9,6 +9,7 @@ use super::*;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Call {
     Crash(ServiceIdentity),
+    Isolate(ServiceIdentity, Option<u64>),
     Select(ServiceIdentity, u32),
     Spawn(ServiceIdentity),
     Snapshot(ServiceIdentity),
@@ -30,6 +31,7 @@ struct FakeBackend {
     next_snapshot: u64,
     ready_active: bool,
     rebound: bool,
+    authority_active: bool,
     failures: VecDeque<BackendStage>,
     reported_cohort_override: Option<CohortIdentity>,
     snapshot_cohort_override: Option<CohortIdentity>,
@@ -51,6 +53,7 @@ impl FakeBackend {
             next_snapshot: 0,
             ready_active: false,
             rebound: false,
+            authority_active: true,
             failures: VecDeque::new(),
             reported_cohort_override: None,
             snapshot_cohort_override: None,
@@ -117,6 +120,7 @@ impl SupervisorBackend for FakeBackend {
         self.snapshot_active = None;
         self.ready_active = false;
         self.rebound = false;
+        self.authority_active = false;
         let previous_binding_epoch = if self.invalid_crash_observation {
             previous + 100
         } else {
@@ -129,6 +133,19 @@ impl SupervisorBackend for FakeBackend {
                 .reported_cohort_override
                 .unwrap_or_else(|| self.recovery_cohort()),
         })
+    }
+
+    fn isolate_authority(
+        &mut self,
+        service: ServiceIdentity,
+        last_known_binding_epoch: Option<u64>,
+    ) {
+        self.calls
+            .push(Call::Isolate(service, last_known_binding_epoch));
+        self.snapshot_active = None;
+        self.ready_active = false;
+        self.rebound = false;
+        self.authority_active = false;
     }
 
     fn select_replacement(
@@ -229,6 +246,7 @@ impl SupervisorBackend for FakeBackend {
         }
         self.ready_active = false;
         self.rebound = true;
+        self.authority_active = true;
         Ok(RebindObservation {
             binding_epoch: self.binding_epoch,
             supervisor: if self.invalid_rebind_observation {
@@ -289,6 +307,7 @@ fn start_scheduled(manager: &mut SupervisorManager<FakeBackend>) -> (ServiceIden
     let PollProgress::ReplacementStarted {
         replacement,
         deadline_tick,
+        ..
     } = manager.poll(retry_tick).unwrap()
     else {
         panic!("replacement did not start")
@@ -320,6 +339,7 @@ fn crash_spawn_ready_rebind_and_adopt_are_manager_ordered() {
     let PollProgress::ReplacementStarted {
         replacement,
         deadline_tick,
+        ..
     } = manager.poll(103).unwrap()
     else {
         panic!("replacement did not start")
@@ -362,6 +382,7 @@ fn ready_timeout_reaps_replacement_and_exhausts_bounded_budget() {
     let PollProgress::ReplacementStarted {
         replacement,
         deadline_tick,
+        ..
     } = manager.poll(2).unwrap()
     else {
         panic!("replacement did not start")
@@ -468,6 +489,7 @@ fn late_ready_is_stopped_and_cannot_rebind() {
     let PollProgress::ReplacementStarted {
         replacement,
         deadline_tick,
+        ..
     } = manager.poll(2).unwrap()
     else {
         panic!("replacement did not start")
@@ -522,7 +544,11 @@ fn deadline_overflow_quarantines_without_spawning() {
         Err(SupervisorError::CounterOverflow)
     );
     assert_eq!(manager.health().phase, SupervisorPhase::Quarantined);
-    assert_eq!(manager.backend().calls, vec![Call::Crash(active)]);
+    assert_eq!(
+        manager.backend().calls,
+        vec![Call::Crash(active), Call::Isolate(active, Some(2))]
+    );
+    assert!(!manager.backend().authority_active);
 }
 
 #[test]
@@ -616,7 +642,9 @@ fn crash_and_snapshot_must_name_the_same_exact_cohort() {
     assert!(manager.backend().calls.ends_with(&[
         Call::Stop(replacement, StopReason::RecoveryRejected),
         Call::Abort(replacement, StopReason::RecoveryRejected),
+        Call::Isolate(replacement, Some(6)),
     ]));
+    assert!(!manager.backend().authority_active);
 }
 
 #[test]
@@ -751,9 +779,16 @@ fn crash_and_peek_failures_have_queryable_recovery_states() {
             source: "injected failure",
         })
     );
-    assert_eq!(manager.health().phase, SupervisorPhase::Running);
+    assert_eq!(manager.health().phase, SupervisorPhase::Quarantined);
     assert_eq!(manager.health().binding_epoch, Some(10));
+    assert_eq!(
+        manager.backend().calls,
+        vec![Call::Crash(active), Call::Isolate(active, Some(10)),]
+    );
+    assert!(!manager.backend().authority_active);
 
+    let mut manager =
+        SupervisorManager::new(FakeBackend::new(10, &[]), policy(), active, 10, 0).unwrap();
     manager.observe_exit(0, active, ExitReason::Fault).unwrap();
     let (replacement, deadline_tick) = start_scheduled(&mut manager);
     manager
@@ -797,6 +832,11 @@ fn stop_abort_and_fence_failures_quarantine_fail_closed() {
         assert_eq!(manager.health().phase, SupervisorPhase::Quarantined);
         assert_eq!(manager.health().service, replacement);
         assert_eq!(manager.health().binding_epoch, Some(12));
+        assert_eq!(
+            manager.backend().calls.last(),
+            Some(&Call::Isolate(replacement, Some(12)))
+        );
+        assert!(!manager.backend().authority_active);
     }
 
     let active = service(10, 1);
@@ -813,6 +853,12 @@ fn stop_abort_and_fence_failures_quarantine_fail_closed() {
     );
     assert_eq!(manager.health().phase, SupervisorPhase::Quarantined);
     assert_eq!(manager.health().binding_epoch, Some(13));
+    assert!(manager.backend().calls.ends_with(&[
+        Call::Adopt(replacement, 121),
+        Call::Crash(replacement),
+        Call::Isolate(replacement, Some(13)),
+    ]));
+    assert!(!manager.backend().authority_active);
 }
 
 #[test]
@@ -904,7 +950,11 @@ fn oversized_crash_cohort_quarantines_before_replacement_selection() {
     );
     assert_eq!(manager.health().phase, SupervisorPhase::Quarantined);
     assert_eq!(manager.health().binding_epoch, Some(18));
-    assert_eq!(manager.backend().calls, vec![Call::Crash(active)]);
+    assert_eq!(
+        manager.backend().calls,
+        vec![Call::Crash(active), Call::Isolate(active, Some(18))]
+    );
+    assert!(!manager.backend().authority_active);
 }
 
 #[test]
@@ -921,4 +971,171 @@ fn time_is_monotonic_and_configuration_is_bounded() {
         SupervisorManager::new(FakeBackend::new(1, &[]), policy(), active, 1, 5).unwrap();
     assert_eq!(manager.poll(4), Err(SupervisorError::TimeWentBackwards));
     assert_eq!(manager.health().phase, SupervisorPhase::Running);
+}
+
+#[test]
+fn public_exit_events_are_epoch_fenced_and_stale_events_do_not_advance_time() {
+    let active = service(10, 1);
+    let mut manager =
+        SupervisorManager::new(FakeBackend::new(7, &[]), policy(), active, 7, 10).unwrap();
+
+    assert_eq!(
+        manager.observe_exit_at_epoch(100, active, 6, ExitReason::Fault),
+        Err(SupervisorError::StaleBindingEpoch {
+            expected: 7,
+            presented: 6,
+        })
+    );
+    assert_eq!(
+        manager.observe_exit_at_epoch(100, service(99, 1), 7, ExitReason::Fault),
+        Err(SupervisorError::StaleServiceEvent)
+    );
+    assert!(manager.backend().calls.is_empty());
+
+    manager
+        .observe_exit_at_epoch(11, active, 7, ExitReason::Fault)
+        .unwrap();
+    let PollProgress::ReplacementStarted {
+        replacement,
+        binding_epoch,
+        ..
+    } = manager.poll(13).unwrap()
+    else {
+        panic!("replacement did not start")
+    };
+    assert_eq!(binding_epoch, 8);
+    let before = manager.backend().calls.clone();
+    assert_eq!(
+        manager.replacement_ready_at_epoch(100, replacement, 7),
+        Err(SupervisorError::StaleBindingEpoch {
+            expected: 8,
+            presented: 7,
+        })
+    );
+    assert_eq!(manager.backend().calls, before);
+    manager
+        .replacement_ready_at_epoch(13, replacement, binding_epoch)
+        .unwrap();
+}
+
+#[test]
+fn exact_exit_replay_is_idempotent_and_participates_in_monotonic_time() {
+    let active = service(10, 1);
+    let mut manager =
+        SupervisorManager::new(FakeBackend::new(9, &[]), policy(), active, 9, 10).unwrap();
+    manager
+        .observe_exit_at_epoch(11, active, 9, ExitReason::Fault)
+        .unwrap();
+    let calls = manager.backend().calls.clone();
+    let health = manager.health();
+
+    assert_eq!(
+        manager.observe_exit_at_epoch(200, active, 9, ExitReason::Watchdog),
+        Err(SupervisorError::ConflictingEventReplay),
+    );
+    assert_eq!(manager.backend().calls, calls);
+    assert_eq!(manager.health(), health);
+
+    manager
+        .observe_exit_at_epoch(100, active, 9, ExitReason::Fault)
+        .unwrap();
+    assert_eq!(manager.backend().calls, calls);
+    assert_eq!(manager.poll(20), Err(SupervisorError::TimeWentBackwards));
+    assert_eq!(
+        manager.observe_exit_at_epoch(99, active, 9, ExitReason::Fault),
+        Err(SupervisorError::TimeWentBackwards),
+    );
+    assert_eq!(manager.backend().calls, calls);
+}
+
+#[test]
+fn exact_ready_replay_returns_the_cached_completion_without_backend_reentry() {
+    let active = service(10, 1);
+    let mut manager =
+        SupervisorManager::new(FakeBackend::new(4, &[201]), policy(), active, 4, 0).unwrap();
+    manager
+        .observe_exit_at_epoch(0, active, 4, ExitReason::Fault)
+        .unwrap();
+    let PollProgress::ReplacementStarted {
+        replacement,
+        binding_epoch,
+        deadline_tick,
+    } = manager.poll(2).unwrap()
+    else {
+        panic!("replacement did not start")
+    };
+    let completion = manager
+        .replacement_ready_at_epoch(deadline_tick, replacement, binding_epoch)
+        .unwrap();
+    let calls = manager.backend().calls.clone();
+
+    assert_eq!(
+        manager
+            .replacement_ready_at_epoch(deadline_tick + 10, replacement, binding_epoch)
+            .unwrap(),
+        completion,
+    );
+    assert_eq!(manager.backend().calls, calls);
+    assert_eq!(
+        manager.replacement_ready_at_epoch(deadline_tick + 100, replacement, binding_epoch - 1),
+        Err(SupervisorError::StaleBindingEpoch {
+            expected: binding_epoch,
+            presented: binding_epoch - 1,
+        })
+    );
+    assert_eq!(manager.backend().calls, calls);
+    assert_eq!(
+        manager.poll(deadline_tick + 9),
+        Err(SupervisorError::TimeWentBackwards),
+    );
+}
+
+#[test]
+fn timed_out_ready_replay_is_stable_and_never_repeats_cleanup() {
+    let active = service(10, 1);
+    let mut manager =
+        SupervisorManager::new(FakeBackend::new(5, &[]), policy(), active, 5, 0).unwrap();
+    manager
+        .observe_exit_at_epoch(0, active, 5, ExitReason::Fault)
+        .unwrap();
+    let PollProgress::ReplacementStarted {
+        replacement,
+        binding_epoch,
+        deadline_tick,
+    } = manager.poll(2).unwrap()
+    else {
+        panic!("replacement did not start")
+    };
+    assert!(matches!(
+        manager.poll(deadline_tick + 1).unwrap(),
+        PollProgress::ReplacementTimedOut { .. }
+    ));
+    let calls = manager.backend().calls.clone();
+    for now in [deadline_tick + 2, deadline_tick + 3] {
+        assert_eq!(
+            manager.replacement_ready_at_epoch(now, replacement, binding_epoch),
+            Err(SupervisorError::ReadyDeadlineExpired),
+        );
+        assert_eq!(manager.backend().calls, calls);
+    }
+}
+
+#[test]
+fn internal_transition_sentinel_fails_closed_without_production_panic() {
+    let active = service(10, 1);
+    let mut manager =
+        SupervisorManager::new(FakeBackend::new(1, &[]), policy(), active, 1, 0).unwrap();
+    manager.force_transitioning();
+    assert_eq!(manager.health().phase, SupervisorPhase::AuthorityUnresolved);
+    assert_eq!(manager.poll(0), Err(SupervisorError::InternalInvariant));
+    assert_eq!(manager.health().phase, SupervisorPhase::Quarantined);
+    assert_eq!(
+        manager.backend().calls,
+        vec![Call::Isolate(active, Some(1))]
+    );
+    assert!(!manager.backend().authority_active);
+
+    let source = include_str!("manager.rs");
+    assert!(!source.contains("unreachable!"));
+    assert!(!source.contains("panic!"));
 }

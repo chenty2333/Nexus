@@ -204,8 +204,15 @@ pub enum SupervisorPhase {
     Backoff,
     /// A replacement exists and must report Ready before its deadline.
     AwaitingReady,
-    /// The recovery-attempt budget or a nonrecoverable invariant was exhausted.
+    /// Authority is isolated after the attempt budget or a nonrecoverable
+    /// invariant failed.
     Quarantined,
+    /// An internal transition was interrupted before authority isolation completed.
+    ///
+    /// No normal manager return leaves this phase behind. An adapter observing
+    /// it must drive a mutating manager method so the mandatory backend
+    /// isolation primitive can complete.
+    AuthorityUnresolved,
 }
 
 /// Read-only manager health projection.
@@ -216,6 +223,9 @@ pub struct SupervisorHealth {
     /// Active, failed, or pending service identity.
     pub service: ServiceIdentity,
     /// Last exact Registry binding epoch, or `None` after an invalid observation.
+    ///
+    /// In `Quarantined`, this is diagnostic history and does not name an active
+    /// supervisor: backend authority isolation has already completed.
     pub binding_epoch: Option<u64>,
     /// Recovery attempts consumed so far.
     pub recovery_attempts: u32,
@@ -234,6 +244,8 @@ pub enum PollProgress {
     ReplacementStarted {
         /// Exact replacement identity.
         replacement: ServiceIdentity,
+        /// Manager-owned binding epoch the replacement may report but cannot mutate.
+        binding_epoch: u64,
         /// Inclusive Ready deadline.
         deadline_tick: u64,
     },
@@ -268,6 +280,15 @@ pub enum SupervisorError<E> {
     InvalidConfiguration,
     /// An event names an incarnation other than the exact pending one.
     StaleServiceEvent,
+    /// An event presented a binding epoch other than the manager-owned epoch.
+    StaleBindingEpoch {
+        /// Current authoritative epoch retained by the manager.
+        expected: u64,
+        /// Epoch presented by the external event.
+        presented: u64,
+    },
+    /// A replay reused an accepted service identity with different event content.
+    ConflictingEventReplay,
     /// The exact replacement reported Ready after its inclusive deadline.
     ReadyDeadlineExpired,
     /// Time moved backwards relative to a prior manager call.
@@ -285,6 +306,9 @@ pub enum SupervisorError<E> {
     },
     /// The backend exposed more recovery members than the configured bound.
     RecoveryLimitExceeded,
-    /// The manager is quarantined and accepts no further lifecycle mutation.
+    /// The manager completed authority isolation, is quarantined, and accepts
+    /// no further mutation.
     Quarantined,
+    /// An impossible internal transition was observed and authority was isolated.
+    InternalInvariant,
 }

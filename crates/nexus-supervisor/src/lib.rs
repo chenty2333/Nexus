@@ -4,8 +4,12 @@
 //!
 //! The manager is intentionally independent from OSTD and the Registry. A
 //! kernel adapter implements [`SupervisorBackend`], while this crate owns the
-//! ordering, recovery-attempt budget, deadline, stale-event fencing, and
-//! recovery loop.
+//! ordering, recovery-attempt budget, deadline, epoch-fenced event validation,
+//! bounded replay, and recovery loop. The adapter owns one manager; a child
+//! service may report its identity and manager-selected binding epoch, but it
+//! never receives backend, rebind, or adoption authority.
+//!
+//! See the crate README for the exact lifecycle and current evidence boundary.
 
 #![no_std]
 #![forbid(unsafe_code)]
