@@ -24,6 +24,9 @@ use cser_transition_gates::handoff::{
     PrepareIntent,
 };
 
+#[path = "infrastructure/mod.rs"]
+mod infrastructure;
+
 static NEXT_REGISTRY_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1735,6 +1738,64 @@ struct DeviceDerivedCohortPlan {
     registered: [RegisteredEffect; 4],
 }
 
+/// A non-authoritative, exact-scope transaction candidate spanning the
+/// business Registry and its private causal-infrastructure child.  It never
+/// escapes this module and is never promoted wholesale: successful install
+/// moves only the two prevalidated scope records into the still-authoritative
+/// live Registry.
+struct CombinedScopeCandidate {
+    scope: ScopeKey,
+    registry_instance: u64,
+    base_registry_revision: u64,
+    base_infrastructure: infrastructure::InfrastructureRootBinding,
+    replacement: EffectRegistry,
+}
+
+struct CombinedScopeInstallPlan {
+    scope: ScopeKey,
+    replacement_scope: Box<ScopeRecord>,
+    infrastructure: infrastructure::InfrastructureScopeInstallPlan,
+}
+
+/// Restricted pure-state editor for the foundation transaction.  Keeping the
+/// candidate field private to this child module prevents a future caller of
+/// `combined_scope_transaction` from invoking a Registry `*_with_apply`
+/// callback before the candidate is accepted.  Real fault/device transitions
+/// must add narrow editor methods that stage records only; external apply
+/// remains after authoritative installation.
+mod combined_scope_editor {
+    use super::{CombinedScopeCandidate, RegistryError};
+
+    pub(super) struct Editor<'a> {
+        candidate: &'a mut CombinedScopeCandidate,
+    }
+
+    impl<'a> Editor<'a> {
+        pub(super) fn new(candidate: &'a mut CombinedScopeCandidate) -> Self {
+            Self { candidate }
+        }
+
+        pub(super) fn advance_scope_revisions(&mut self) -> Result<(), RegistryError> {
+            let scope = self.candidate.scope;
+            let business = self
+                .candidate
+                .replacement
+                .scopes
+                .get_mut(&scope)
+                .ok_or(RegistryError::UnknownScope)?;
+            business.revision = business
+                .revision
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            self.candidate
+                .replacement
+                .infrastructure
+                .advance_candidate_scope_revision(scope)?;
+            Ok(())
+        }
+    }
+}
+
 struct DeviceResetApplyPlan {
     receipt: DeviceResetReceipt,
     next_device_closure_sequence: u64,
@@ -2261,7 +2322,16 @@ pub(crate) enum RegistryError {
     InvalidHandoffReceipt,
     HandoffNotReady,
     HandoffDevicePrecommitPending,
+    Infrastructure(infrastructure::InfrastructureError),
+    CombinedCandidateStale,
+    CombinedCandidateShapeChanged,
     Invariant(&'static str),
+}
+
+impl From<infrastructure::InfrastructureError> for RegistryError {
+    fn from(error: infrastructure::InfrastructureError) -> Self {
+        Self::Infrastructure(error)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2289,12 +2359,16 @@ pub(crate) struct EffectRegistry {
     next_terminal_sequence: u64,
     next_publication_sequence: u64,
     next_revoke_sequence: u64,
+    /// The only authoritative causal-infrastructure ledger.  It is a private
+    /// child, not a peer Registry or a service-owned side table.
+    infrastructure: infrastructure::InfrastructureState,
 }
 
 impl EffectRegistry {
     pub(crate) fn new() -> Self {
+        let instance_id = next_registry_instance_id();
         Self {
-            instance_id: next_registry_instance_id(),
+            instance_id,
             device_publication_mode: DevicePublicationMode::Unique,
             scopes: BTreeMap::new(),
             effects: BTreeMap::new(),
@@ -2311,6 +2385,7 @@ impl EffectRegistry {
             next_terminal_sequence: 1,
             next_publication_sequence: 1,
             next_revoke_sequence: 1,
+            infrastructure: infrastructure::InfrastructureState::new(instance_id),
         }
     }
 
@@ -2338,6 +2413,7 @@ impl EffectRegistry {
             next_terminal_sequence: self.next_terminal_sequence,
             next_publication_sequence: self.next_publication_sequence,
             next_revoke_sequence: self.next_revoke_sequence,
+            infrastructure: self.infrastructure.private_full_clone(),
         }
     }
 
@@ -2438,7 +2514,284 @@ impl EffectRegistry {
             next_terminal_sequence: self.next_terminal_sequence,
             next_publication_sequence: self.next_publication_sequence,
             next_revoke_sequence: self.next_revoke_sequence,
+            infrastructure: self.infrastructure.try_scope_candidate(scope_key)?,
         })
+    }
+
+    /// Attaches the bounded infrastructure child to an already-registered
+    /// business root.  Every business-side check and domain-vector allocation
+    /// completes before the authoritative infrastructure ledger is touched.
+    /// This is module-private until a production portal owns the lifecycle.
+    fn enable_infrastructure_for_scope(
+        &mut self,
+        scope_key: ScopeKey,
+        root_effect: EffectKey,
+        limits: infrastructure::InfrastructureLimits,
+    ) -> Result<(), RegistryError> {
+        // Any pre-existing cross-ledger defect is rejected before the target
+        // ledger can change. `InfrastructureState::enable` itself prepares
+        // every allocation/counter check before its single Vec insertion.
+        self.check_infrastructure_root_links()?;
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        let root = self
+            .effects
+            .get(&root_effect)
+            .ok_or(RegistryError::UnknownEffect)?;
+        if scope.phase != ScopePhase::Active
+            || root.identity.scope != scope_key
+            || root.identity.parent.is_some()
+            || root.identity.authority_epoch != scope.authority_epoch
+            || root.phase.is_terminal()
+        {
+            return Err(RegistryError::InvalidState);
+        }
+        let mut domains = Vec::new();
+        domains
+            .try_reserve_exact(scope.domains.len())
+            .map_err(|_| {
+                RegistryError::Infrastructure(infrastructure::InfrastructureError::AllocationFailed)
+            })?;
+        domains.extend(
+            scope
+                .domains
+                .iter()
+                .map(|(domain, binding)| (*domain, binding.binding_epoch)),
+        );
+        self.infrastructure.enable(
+            scope_key,
+            scope.authority_epoch,
+            root_effect,
+            limits,
+            &domains,
+        )?;
+        debug_assert!(self.check_infrastructure_root_links().is_ok());
+        Ok(())
+    }
+
+    fn check_infrastructure_root_links(&self) -> Result<(), RegistryError> {
+        self.infrastructure.check_invariants()?;
+        for binding in self.infrastructure.scope_links() {
+            let scope = self
+                .scopes
+                .get(&binding.scope)
+                .ok_or(RegistryError::Invariant(
+                    "infrastructure scope lacks business scope",
+                ))?;
+            let root = self
+                .effects
+                .get(&binding.root_effect)
+                .ok_or(RegistryError::Invariant(
+                    "infrastructure root lacks business effect",
+                ))?;
+            let linked_authority_epoch = match scope.phase {
+                ScopePhase::Active => scope.authority_epoch,
+                ScopePhase::Closing | ScopePhase::Revoked => {
+                    let revoke = scope.revoke.as_ref().ok_or(RegistryError::Invariant(
+                        "inactive infrastructure scope lacks revoke identity",
+                    ))?;
+                    let current = revoke.closed_authority_epoch.checked_add(1).ok_or(
+                        RegistryError::Invariant("infrastructure revoke authority overflow"),
+                    )?;
+                    if scope.authority_epoch != current || revoke.authority_epoch != current {
+                        return Err(RegistryError::Invariant(
+                            "infrastructure revoke authority linkage mismatch",
+                        ));
+                    }
+                    revoke.closed_authority_epoch
+                }
+            };
+            if binding.authority_epoch != linked_authority_epoch
+                || root.identity.scope != binding.scope
+                || root.identity.authority_epoch != linked_authority_epoch
+                || root.identity.effect != binding.root_effect
+                || root.identity.parent.is_some()
+            {
+                return Err(RegistryError::Invariant(
+                    "infrastructure/business root linkage mismatch",
+                ));
+            }
+            let root_is_indexed = self
+                .by_scope
+                .get(&binding.scope)
+                .is_some_and(|effects| effects.contains(&binding.root_effect));
+            let lifecycle_matches = match scope.phase {
+                ScopePhase::Active => {
+                    binding.active
+                        && binding.closure_finished.is_none()
+                        && !root.phase.is_terminal()
+                        && root_is_indexed
+                }
+                // Revoke terminalizes cohort members one at a time.  The last
+                // root can therefore be durably terminal (and absent from the
+                // live reverse index) before `revoke_complete` advances the
+                // scope to Revoked.  Both Closing presentations are valid,
+                // but index membership must exactly mirror terminality.
+                ScopePhase::Closing => {
+                    !binding.active
+                        && binding.closure_finished == Some(false)
+                        && scope
+                            .revoke
+                            .as_ref()
+                            .is_some_and(|revoke| revoke.cohort.contains(&binding.root_effect))
+                        && root_is_indexed != root.phase.is_terminal()
+                }
+                ScopePhase::Revoked => {
+                    !binding.active
+                        && binding.closure_finished == Some(true)
+                        && root.phase.is_terminal()
+                        && !root_is_indexed
+                }
+            };
+            if !lifecycle_matches {
+                return Err(RegistryError::Invariant(
+                    "infrastructure/business lifecycle mismatch",
+                ));
+            }
+            if binding.domains.len() != scope.domains.len()
+                || binding.domains.iter().any(|(domain, epoch)| {
+                    scope
+                        .domains
+                        .get(domain)
+                        .is_none_or(|business| business.binding_epoch != *epoch)
+                })
+            {
+                return Err(RegistryError::Invariant(
+                    "infrastructure/business domain set mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds a non-authoritative exact-scope candidate.  The caller can
+    /// stage only module-private work and cannot receive a bearer from
+    /// `combined_scope_transaction`, whose output is deliberately `()`.
+    fn combined_scope_candidate(
+        &self,
+        scope_key: ScopeKey,
+    ) -> Result<CombinedScopeCandidate, RegistryError> {
+        self.check_invariants()?;
+        let base_registry_revision = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?
+            .revision;
+        let base_infrastructure = self.infrastructure.root_binding(scope_key)?;
+        let replacement = self.scope_transaction_candidate(scope_key)?;
+        replacement.check_invariants()?;
+        Ok(CombinedScopeCandidate {
+            scope: scope_key,
+            registry_instance: self.instance_id,
+            base_registry_revision,
+            base_infrastructure,
+            replacement,
+        })
+    }
+
+    /// First usable outer transaction skeleton.  It supports scope-record
+    /// mutations on both ledgers while requiring target EffectRecords, index
+    /// shape, and global allocators to remain unchanged.  Fault/device paths
+    /// must not use it until the follow-on same-key EffectRecord replacement
+    /// and full infrastructure recomputation tranche lands.
+    fn combined_scope_transaction(
+        &mut self,
+        scope_key: ScopeKey,
+        stage: impl FnOnce(&mut combined_scope_editor::Editor<'_>) -> Result<(), RegistryError>,
+    ) -> Result<(), RegistryError> {
+        let mut candidate = self.combined_scope_candidate(scope_key)?;
+        stage(&mut combined_scope_editor::Editor::new(&mut candidate))?;
+        let plan = self.prepare_combined_scope_install(candidate)?;
+        self.install_combined_scope(plan);
+        Ok(())
+    }
+
+    fn prepare_combined_scope_install(
+        &self,
+        mut candidate: CombinedScopeCandidate,
+    ) -> Result<CombinedScopeInstallPlan, RegistryError> {
+        self.check_invariants()?;
+        if candidate.registry_instance != self.instance_id
+            || candidate.scope != candidate.base_infrastructure.scope
+        {
+            return Err(RegistryError::CombinedCandidateStale);
+        }
+        let live_scope = self
+            .scopes
+            .get(&candidate.scope)
+            .ok_or(RegistryError::UnknownScope)?;
+        if live_scope.revision != candidate.base_registry_revision {
+            return Err(RegistryError::CombinedCandidateStale);
+        }
+
+        candidate.replacement.check_invariants()?;
+        if candidate.replacement.instance_id != self.instance_id
+            || candidate.replacement.scopes.len() != 1
+            || !candidate.replacement.scopes.contains_key(&candidate.scope)
+            || candidate.replacement.device_publication_mode != self.device_publication_mode
+        {
+            return Err(RegistryError::CombinedCandidateShapeChanged);
+        }
+
+        // Foundation-only shape gate: effect values and every derived index
+        // remain exactly those of the live target scope.  This makes the final
+        // install two existing-slot replacements and prevents an unrelated
+        // tenant or global allocator from being overwritten.
+        let mut live_effect_count = 0_usize;
+        for (key, record) in self
+            .effects
+            .iter()
+            .filter(|(_, record)| record.identity.scope == candidate.scope)
+        {
+            live_effect_count = live_effect_count
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            if candidate.replacement.effects.get(key) != Some(record) {
+                return Err(RegistryError::CombinedCandidateShapeChanged);
+            }
+        }
+        if candidate.replacement.effects.len() != live_effect_count
+            || candidate.replacement.next_effect_id != self.next_effect_id
+            || candidate.replacement.next_nonce != self.next_nonce
+            || candidate.replacement.next_commit_sequence != self.next_commit_sequence
+            || candidate.replacement.next_device_enrollment_sequence
+                != self.next_device_enrollment_sequence
+            || candidate.replacement.next_device_batch_sequence != self.next_device_batch_sequence
+            || candidate.replacement.next_device_closure_sequence
+                != self.next_device_closure_sequence
+            || candidate.replacement.next_terminal_sequence != self.next_terminal_sequence
+            || candidate.replacement.next_publication_sequence != self.next_publication_sequence
+            || candidate.replacement.next_revoke_sequence != self.next_revoke_sequence
+        {
+            return Err(RegistryError::CombinedCandidateShapeChanged);
+        }
+
+        let infrastructure = self.infrastructure.prepare_exact_scope_install(
+            candidate.scope,
+            candidate.base_infrastructure,
+            &mut candidate.replacement.infrastructure,
+        )?;
+        let replacement_scope = candidate
+            .replacement
+            .scopes
+            .remove(&candidate.scope)
+            .ok_or(RegistryError::CombinedCandidateShapeChanged)?;
+        Ok(CombinedScopeInstallPlan {
+            scope: candidate.scope,
+            replacement_scope,
+            infrastructure,
+        })
+    }
+
+    /// No allocation, validation, user callback, or `Result` remains here.
+    /// The live Registry retains authority throughout; neither candidate is
+    /// ever promoted as a whole.
+    fn install_combined_scope(&mut self, plan: CombinedScopeInstallPlan) {
+        debug_assert!(self.scopes.contains_key(&plan.scope));
+        *self.scopes.get_mut(&plan.scope).unwrap() = plan.replacement_scope;
+        self.infrastructure.install_exact_scope(plan.infrastructure);
     }
 
     /// Installs a successfully revoked single-scope transaction without any
@@ -2564,6 +2917,8 @@ impl EffectRegistry {
     fn rewrite_registry_instance(&mut self, registry_instance_id: u64) {
         assert_ne!(registry_instance_id, 0);
         self.instance_id = registry_instance_id;
+        self.infrastructure
+            .rewrite_private_registry_instance(registry_instance_id);
         for scope in self.scopes.values_mut() {
             if let Some(device_root) = scope.device_root.as_mut() {
                 device_root.rewrite_registry_instance(registry_instance_id);
@@ -7524,6 +7879,7 @@ impl EffectRegistry {
         if self.instance_id == 0 {
             return Err(RegistryError::Invariant("invalid Registry instance"));
         }
+        self.check_infrastructure_root_links()?;
         if self.device_publication_mode == DevicePublicationMode::DisabledNonDeviceCandidate
             && self
                 .scopes
@@ -11226,11 +11582,318 @@ fn publication_ack_and_revoke_complete_self_test() {
     registry.check_invariants().unwrap();
 }
 
+#[cfg(test)]
+fn combined_scope_candidate_self_test() {
+    const TARGET: ScopeKey = ScopeKey::new(0xc051, 1);
+    const UNRELATED: ScopeKey = ScopeKey::new(0xc052, 1);
+    const TARGET_OWNER: TaskKey = TaskKey::new(0xc061, 1);
+    const UNRELATED_OWNER: TaskKey = TaskKey::new(0xc062, 1);
+    const TARGET_CREDIT: CreditClass = CreditClass::new(0xc071);
+    const UNRELATED_CREDIT: CreditClass = CreditClass::new(0xc072);
+
+    fn fixture() -> (EffectRegistry, EffectKey, EffectKey) {
+        let mut registry = EffectRegistry::new();
+        for (scope, owner, credit) in [
+            (TARGET, TARGET_OWNER, TARGET_CREDIT),
+            (UNRELATED, UNRELATED_OWNER, UNRELATED_CREDIT),
+        ] {
+            registry
+                .create_scope(ScopeConfig {
+                    key: scope,
+                    authority_epoch: 7,
+                    binding_epoch: 1,
+                    supervisor: owner,
+                    credits: alloc::vec![CreditLimit::new(credit, 1)],
+                })
+                .unwrap();
+        }
+        let target_root = registry
+            .register(RegisterRequest {
+                scope: TARGET,
+                task: TARGET_OWNER,
+                operation: OperationClass::new(0xc081),
+                descriptor: SyscallDescriptor::new(0xc081, [0; 6]),
+                resources: alloc::vec![ResourceKey::new(0xc081, 1, 1)],
+                credits: alloc::vec![CreditCharge::new(TARGET_CREDIT, 1)],
+                publication: PublicationMode::None,
+            })
+            .unwrap()
+            .identity
+            .effect();
+        let unrelated_root = registry
+            .register(RegisterRequest {
+                scope: UNRELATED,
+                task: UNRELATED_OWNER,
+                operation: OperationClass::new(0xc082),
+                descriptor: SyscallDescriptor::new(0xc082, [0; 6]),
+                resources: alloc::vec![ResourceKey::new(0xc082, 1, 1)],
+                credits: alloc::vec![CreditCharge::new(UNRELATED_CREDIT, 1)],
+                publication: PublicationMode::None,
+            })
+            .unwrap()
+            .identity
+            .effect();
+        let limits =
+            infrastructure::InfrastructureLimits::new(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4)
+                .unwrap();
+        registry
+            .enable_infrastructure_for_scope(TARGET, target_root, limits)
+            .unwrap();
+        registry
+            .enable_infrastructure_for_scope(UNRELATED, unrelated_root, limits)
+            .unwrap();
+        registry.check_invariants().unwrap();
+        (registry, target_root, unrelated_root)
+    }
+
+    // The ordinary Registry invariant entry point, not only the combined
+    // installer, recomputes infrastructure and checks the exact business
+    // domain/lifecycle linkage.  Every rejection is observationally
+    // read-only.
+    let (mut wrong_domain_epoch, _, _) = fixture();
+    wrong_domain_epoch
+        .infrastructure
+        .corrupt_domain_epoch_for_test(TARGET, DomainKey::LEGACY, 2);
+    let before = wrong_domain_epoch.clone();
+    assert!(matches!(
+        wrong_domain_epoch.check_invariants(),
+        Err(RegistryError::Invariant(_))
+    ));
+    assert_eq!(wrong_domain_epoch, before);
+
+    let (mut extra_domain, _, _) = fixture();
+    extra_domain
+        .infrastructure
+        .add_domain_for_test(TARGET, DomainKey::new(0xc0f0), 1);
+    let before = extra_domain.clone();
+    assert!(matches!(
+        extra_domain.check_invariants(),
+        Err(RegistryError::Invariant(_))
+    ));
+    assert_eq!(extra_domain, before);
+
+    let (mut wrong_lifecycle, _, _) = fixture();
+    wrong_lifecycle
+        .infrastructure
+        .set_closing_lifecycle_for_test(TARGET);
+    let before = wrong_lifecycle.clone();
+    assert!(matches!(
+        wrong_lifecycle.check_invariants(),
+        Err(RegistryError::Invariant(_))
+    ));
+    assert_eq!(wrong_lifecycle, before);
+
+    // Active roots use the current epoch. Closing and revoked roots retain
+    // the exact closed epoch while the business scope advances exactly once.
+    let (mut closing, target_root, _) = fixture();
+    let selection = closing.revoke_begin(TARGET).unwrap();
+    closing
+        .infrastructure
+        .set_closing_lifecycle_for_test(TARGET);
+    closing.check_invariants().unwrap();
+
+    let mut rolled_authority = closing.clone();
+    rolled_authority
+        .scopes
+        .get_mut(&TARGET)
+        .unwrap()
+        .authority_epoch += 1;
+    let before = rolled_authority.clone();
+    assert!(matches!(
+        rolled_authority.check_invariants(),
+        Err(RegistryError::Invariant(_))
+    ));
+    assert_eq!(rolled_authority, before);
+
+    let terminal = closing
+        .stage_revoke_terminal(&selection, target_root, TerminalRequest::aborted(-125))
+        .unwrap();
+    assert!(terminal.publication.is_none());
+    // The last member is terminal before revoke completion.  This is a legal
+    // public Registry return state: the immutable infrastructure root remains
+    // Closing while the business live index has already dropped the root.
+    closing.check_invariants().unwrap();
+    closing.revoke_complete(&selection).unwrap();
+    closing
+        .infrastructure
+        .set_revoked_lifecycle_for_test(TARGET);
+    closing.check_invariants().unwrap();
+
+    // A target business revision change after candidate construction fences
+    // the exact-scope candidate.  The failed install leaves both ledgers and
+    // the unrelated tenant byte-for-byte (including authority mode) intact.
+    let (mut stale, _, _) = fixture();
+    let stale_candidate = stale.combined_scope_candidate(TARGET).unwrap();
+    stale.scopes.get_mut(&TARGET).unwrap().revision += 1;
+    let before_stale_install = stale.clone();
+    assert!(matches!(
+        stale.prepare_combined_scope_install(stale_candidate),
+        Err(RegistryError::CombinedCandidateStale),
+    ));
+    assert_eq!(stale, before_stale_install);
+    assert!(stale.infrastructure.is_authoritative_for_test());
+
+    // The independent infrastructure base revision is fenced as well; a
+    // business revision match cannot authorize an older infrastructure view.
+    let (mut stale_infrastructure, _, _) = fixture();
+    let stale_candidate = stale_infrastructure
+        .combined_scope_candidate(TARGET)
+        .unwrap();
+    stale_infrastructure
+        .infrastructure
+        .advance_authoritative_scope_revision_for_test(TARGET);
+    let before_stale_install = stale_infrastructure.clone();
+    assert!(matches!(
+        stale_infrastructure.prepare_combined_scope_install(stale_candidate),
+        Err(RegistryError::Infrastructure(
+            infrastructure::InfrastructureError::StaleAuthority
+        )),
+    ));
+    assert_eq!(stale_infrastructure, before_stale_install);
+    assert!(
+        stale_infrastructure
+            .infrastructure
+            .is_authoritative_for_test()
+    );
+
+    // Infrastructure-side validation happens while live is untouched.
+    let (invalid_infrastructure, _, _) = fixture();
+    let mut candidate = invalid_infrastructure
+        .combined_scope_candidate(TARGET)
+        .unwrap();
+    candidate
+        .replacement
+        .infrastructure
+        .corrupt_candidate_sequence_for_test(TARGET);
+    let before_invalid_infrastructure = invalid_infrastructure.clone();
+    assert!(matches!(
+        invalid_infrastructure.prepare_combined_scope_install(candidate),
+        Err(RegistryError::Infrastructure(
+            infrastructure::InfrastructureError::Invariant(_)
+        )),
+    ));
+    assert_eq!(invalid_infrastructure, before_invalid_infrastructure);
+    assert!(
+        invalid_infrastructure
+            .infrastructure
+            .is_authoritative_for_test()
+    );
+
+    // Root binding is part of the exact infrastructure identity, not a
+    // caller-supplied scalar that can be rewritten inside a candidate.
+    let (invalid_root, _, unrelated_root) = fixture();
+    let mut candidate = invalid_root.combined_scope_candidate(TARGET).unwrap();
+    candidate
+        .replacement
+        .infrastructure
+        .corrupt_candidate_root_for_test(TARGET, unrelated_root);
+    let before_invalid_root = invalid_root.clone();
+    assert!(matches!(
+        invalid_root.prepare_combined_scope_install(candidate),
+        Err(RegistryError::Invariant(_)),
+    ));
+    assert_eq!(invalid_root, before_invalid_root);
+
+    // The business Registry's own invariant checker rejects a malformed
+    // candidate before either authoritative scope is replaced.
+    let (invalid_business, _, _) = fixture();
+    let mut candidate = invalid_business.combined_scope_candidate(TARGET).unwrap();
+    candidate.replacement.scopes.get_mut(&TARGET).unwrap().key = ScopeKey::new(0xc0ff, 1);
+    let before_invalid_business = invalid_business.clone();
+    assert!(matches!(
+        invalid_business.prepare_combined_scope_install(candidate),
+        Err(RegistryError::Invariant(_)),
+    ));
+    assert_eq!(invalid_business, before_invalid_business);
+
+    // A fallible staging step is also failure-atomic: no install plan exists
+    // until the closure returns success and both validation gates pass.
+    let (mut stage_failure, _, _) = fixture();
+    let before_stage_failure = stage_failure.clone();
+    assert_eq!(
+        stage_failure.combined_scope_transaction(TARGET, |_| Err(RegistryError::InvalidState)),
+        Err(RegistryError::InvalidState),
+    );
+    assert_eq!(stage_failure, before_stage_failure);
+
+    // This foundation is deliberately shape-preserving.  A global allocator
+    // or target EffectRecord change is rejected rather than partly installed.
+    let (changed_shape, _, _) = fixture();
+    let mut candidate = changed_shape.combined_scope_candidate(TARGET).unwrap();
+    candidate.replacement.next_effect_id += 1;
+    let before_changed_shape = changed_shape.clone();
+    assert!(matches!(
+        changed_shape.prepare_combined_scope_install(candidate),
+        Err(RegistryError::CombinedCandidateShapeChanged),
+    ));
+    assert_eq!(changed_shape, before_changed_shape);
+
+    // Success replaces exactly the target business scope and target
+    // infrastructure scope.  Effect records, allocators, and the unrelated
+    // business/infrastructure projections remain unchanged.
+    let (mut success, target_root, unrelated_root) = fixture();
+    let target_effect_before = success.effects[&target_root].clone();
+    let unrelated_scope_before = success.scopes[&UNRELATED].clone();
+    let unrelated_effect_before = success.effects[&unrelated_root].clone();
+    let unrelated_infrastructure_before = success.infrastructure.root_binding(UNRELATED).unwrap();
+    let target_registry_revision = success.scopes[&TARGET].revision;
+    let target_infrastructure_revision = success
+        .infrastructure
+        .root_binding(TARGET)
+        .unwrap()
+        .revision;
+    let allocator_projection = (
+        success.next_effect_id,
+        success.next_nonce,
+        success.next_commit_sequence,
+        success.next_terminal_sequence,
+        success.next_publication_sequence,
+        success.next_revoke_sequence,
+    );
+    success
+        .combined_scope_transaction(TARGET, |editor| editor.advance_scope_revisions())
+        .unwrap();
+    assert_eq!(
+        success.scopes[&TARGET].revision,
+        target_registry_revision + 1
+    );
+    assert_eq!(
+        success
+            .infrastructure
+            .root_binding(TARGET)
+            .unwrap()
+            .revision,
+        target_infrastructure_revision + 1,
+    );
+    assert_eq!(success.effects[&target_root], target_effect_before);
+    assert_eq!(success.scopes[&UNRELATED], unrelated_scope_before);
+    assert_eq!(success.effects[&unrelated_root], unrelated_effect_before);
+    assert_eq!(
+        success.infrastructure.root_binding(UNRELATED).unwrap(),
+        unrelated_infrastructure_before,
+    );
+    assert_eq!(
+        (
+            success.next_effect_id,
+            success.next_nonce,
+            success.next_commit_sequence,
+            success.next_terminal_sequence,
+            success.next_publication_sequence,
+            success.next_revoke_sequence,
+        ),
+        allocator_projection,
+    );
+    assert!(success.infrastructure.is_authoritative_for_test());
+    success.check_invariants().unwrap();
+}
+
 /// Pins the first registry-native production identity chain independently of
 /// the later runtime wiring.  These are real registry records with one shared
 /// credit ledger, distinct service bindings, and immutable effect ancestry;
 /// no synthetic cohort or side ledger is constructed for the assertion.
 pub(crate) fn production_identity_registry_self_test() {
+    #[cfg(test)]
+    combined_scope_candidate_self_test();
     publication_ack_and_revoke_complete_self_test();
 
     const PERSONALITY_CREDIT: CreditClass = CreditClass::new(0x201);

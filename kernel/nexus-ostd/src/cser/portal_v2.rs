@@ -501,7 +501,14 @@ fn map_registry_error(error: RegistryError) -> PortalFailure {
         | RegistryError::HandoffDevicePrecommitPending => {
             (PortalErrorCode::OutOfOrder, RetryClass::AfterQuery)
         }
-        RegistryError::Invariant(_) => (PortalErrorCode::InternalInvariant, RetryClass::Never),
+        // These errors are emitted only by the private combined-scope
+        // transaction path.  No portal operation exposes that path yet, so
+        // reaching this mapper is an internal integration error rather than a
+        // client-visible capacity or ordering result.
+        RegistryError::Infrastructure(_)
+        | RegistryError::CombinedCandidateStale
+        | RegistryError::CombinedCandidateShapeChanged
+        | RegistryError::Invariant(_) => (PortalErrorCode::InternalInvariant, RetryClass::Never),
     };
     failure(code, retry)
 }
