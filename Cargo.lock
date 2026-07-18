@@ -248,9 +248,7 @@ version = "0.1.0"
 dependencies = [
  "cser-transition-gates",
  "nexus-effect-peer-wire",
- "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
