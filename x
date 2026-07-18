@@ -92,6 +92,8 @@ compute_image_identity() {
         "$root/crates/cser-model/Cargo.toml" \
         "$root/crates/cser-transition-gates/Cargo.toml" \
         "$root/crates/nexus-effect-peer/Cargo.toml" \
+        "$root/crates/nexus-portal-abi/Cargo.toml" \
+        "$root/crates/nexus-supervisor/Cargo.toml" \
         "$root/tools/xtask/Cargo.toml" \
         "$root/tools/xtask/Cargo.lock" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
     image="nexus/cser-dev:$image_key"

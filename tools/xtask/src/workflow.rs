@@ -15,17 +15,64 @@ const TLA2TOOLS_LICENSE_SHA256: &str =
     "3fa3a845ce5eb7b9b3508701dc1aa4d084b6b2c27cbae8cd44d277d10ee411bf";
 const TLA2TOOLS_SHA256SUMS: &str =
     "33de7da9ce1b7fffb9d1c184021178dbb051747be48504e65c584c423721a32e  tla2tools-227f61b.jar\n";
-const TLA2TOOLS_LICENSE_PATH: &str = "third_party/tlaplus/1.8.0-227f61b/LICENSE.upstream";
 const TLA2TOOLS_LICENSE_PATHSPEC_EXCLUSION: &str =
     ":(exclude)third_party/tlaplus/1.8.0-227f61b/LICENSE.upstream";
-const TLA2TOOLS_IMAGE_INPUTS: [&str; 4] = [
+const TRANSITION_GATE_MANIFEST: &str = "crates/cser-transition-gates/Cargo.toml";
+const EFFECT_PEER_MANIFEST: &str = "crates/nexus-effect-peer/Cargo.toml";
+const PORTAL_ABI_MANIFEST: &str = "crates/nexus-portal-abi/Cargo.toml";
+const SUPERVISOR_MANIFEST: &str = "crates/nexus-supervisor/Cargo.toml";
+const IMAGE_IDENTITY_INPUTS: [&str; 17] = [
+    "Dockerfile",
+    ".dockerignore",
     "third_party/tlaplus/1.8.0-227f61b/tla2tools-227f61b.jar",
     "third_party/tlaplus/1.8.0-227f61b/SHA256SUMS",
     "third_party/tlaplus/1.8.0-227f61b/PROVENANCE.json",
-    TLA2TOOLS_LICENSE_PATH,
+    "third_party/tlaplus/1.8.0-227f61b/LICENSE.upstream",
+    "rust-toolchain.toml",
+    ".cargo/config.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/cser-model/Cargo.toml",
+    TRANSITION_GATE_MANIFEST,
+    EFFECT_PEER_MANIFEST,
+    PORTAL_ABI_MANIFEST,
+    SUPERVISOR_MANIFEST,
+    "tools/xtask/Cargo.toml",
+    "tools/xtask/Cargo.lock",
 ];
-const TRANSITION_GATE_MANIFEST: &str = "crates/cser-transition-gates/Cargo.toml";
-const EFFECT_PEER_MANIFEST: &str = "crates/nexus-effect-peer/Cargo.toml";
+const DEPENDENCY_CACHE_INPUTS: [(&str, &str); 10] = [
+    ("Cargo.lock", "/tmp/nexus-locks/Cargo.lock"),
+    (
+        "tools/xtask/Cargo.lock",
+        "/tmp/nexus-locks/xtask.Cargo.lock",
+    ),
+    ("Cargo.toml", "/tmp/nexus-inputs/root.Cargo.toml"),
+    (
+        "crates/cser-model/Cargo.toml",
+        "/tmp/nexus-inputs/cser-model.Cargo.toml",
+    ),
+    (
+        "crates/cser-transition-gates/Cargo.toml",
+        "/tmp/nexus-inputs/cser-transition-gates.Cargo.toml",
+    ),
+    (
+        "crates/nexus-effect-peer/Cargo.toml",
+        "/tmp/nexus-inputs/nexus-effect-peer.Cargo.toml",
+    ),
+    (
+        "crates/nexus-portal-abi/Cargo.toml",
+        "/tmp/nexus-inputs/nexus-portal-abi.Cargo.toml",
+    ),
+    (
+        "crates/nexus-supervisor/Cargo.toml",
+        "/tmp/nexus-inputs/nexus-supervisor.Cargo.toml",
+    ),
+    (
+        "tools/xtask/Cargo.toml",
+        "/tmp/nexus-inputs/xtask.Cargo.toml",
+    ),
+    (".cargo/config.toml", "/tmp/nexus-inputs/cargo-config.toml"),
+];
 const PRODUCTION_REGISTRY_TEST: &str = "crates/cser-transition-gates/tests/production_registry.rs";
 const PRODUCTION_SOURCE_FILES: [&str; 2] = ["effect_registry.rs", "device_flight.rs"];
 const VIRTIO_AUTHORITY_LOCK: &str = "kernel/nexus-ostd/osdk-runner-base/Cargo.lock";
@@ -122,6 +169,7 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
     validate_virtio_dependency_parity(root)?;
 
     let dockerfile = fs::read_to_string(root.join("Dockerfile"))?;
+    validate_workspace_dependency_cache_inputs(&dockerfile)?;
     for required in [
         "@sha256:",
         "TLA2TOOLS_SHA256",
@@ -319,41 +367,117 @@ fn validate_production_identity_route(frontdoor: &str) -> Result<()> {
 }
 
 fn validate_image_identity_inputs(frontdoor: &str) -> Result<()> {
-    let (_, tail) = frontdoor
-        .split_once("compute_image_identity() {")
-        .ok_or("root workflow lacks compute_image_identity")?;
-    let (body, _) = tail
-        .split_once("\n}")
-        .ok_or("root compute_image_identity body is not terminated")?;
-    let (_, hash_tail) = body
-        .split_once("image_key=$(sha256sum \\")
-        .ok_or("root image identity lacks its sha256sum input pipeline")?;
-    let (hash_inputs, _) = hash_tail
-        .split_once("| cut -d ' ' -f1 | sha256sum | cut -c1-16)")
-        .ok_or("root image identity lacks its canonical digest pipeline")?;
-
-    let mut remainder = hash_inputs;
-    for relative in TLA2TOOLS_IMAGE_INPUTS {
-        let rendered = format!("\"$root/{relative}\"");
-        if hash_inputs.matches(&rendered).count() != 1 {
-            return Err(format!(
-                "root image identity must hash vendored TLA+ input exactly once: {relative}"
-            )
-            .into());
-        }
-        let (_, after) = remainder.split_once(&rendered).ok_or_else(|| {
-            format!("root image identity has out-of-order vendored TLA+ input: {relative}")
-        })?;
-        remainder = after;
+    let joined = frontdoor.replace("\\\n", "");
+    if joined.matches("compute_image_identity").count() != 3 {
+        return Err(
+            "root workflow must contain one image-identity definition and two direct calls".into(),
+        );
     }
-    let transition_manifest = format!("\"$root/{TRANSITION_GATE_MANIFEST}\"");
-    if hash_inputs.matches(&transition_manifest).count() != 1 {
+    let body = function_body(frontdoor, "compute_image_identity() {")?;
+    let inputs = IMAGE_IDENTITY_INPUTS
+        .iter()
+        .map(|relative| format!("\"$root/{relative}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let pipeline =
+        format!("image_key=$(sha256sum {inputs} | cut -d ' ' -f1 | sha256sum | cut -c1-16)");
+    let expected = vec![
+        "if [[ -n $image ]]; then".to_string(),
+        "return".to_string(),
+        "fi".to_string(),
+        "local image_key".to_string(),
+        pipeline,
+        "image=\"nexus/cser-dev:$image_key\"".to_string(),
+    ];
+    let actual = continued_shell_lines(body);
+    if actual != expected {
         return Err(format!(
-            "root image identity must hash the transition-gate manifest exactly once: {TRANSITION_GATE_MANIFEST}"
+            "root image identity function is not the exact reviewed command sequence: expected {expected:?}, found {actual:?}"
         )
         .into());
     }
     Ok(())
+}
+
+fn validate_workspace_dependency_cache_inputs(dockerfile: &str) -> Result<()> {
+    let logical_lines = continued_shell_lines(dockerfile);
+    for (relative, cached) in DEPENDENCY_CACHE_INPUTS {
+        let copy = format!("COPY {relative} {cached}");
+        if logical_lines.iter().filter(|line| **line == copy).count() != 1 {
+            return Err(format!(
+                "root Dockerfile must copy each dependency input exactly once: {relative}"
+            )
+            .into());
+        }
+    }
+
+    let cache_run = logical_lines
+        .iter()
+        .filter(|line| {
+            line.starts_with("RUN --mount=type=bind,source=.,target=/tmp/nexus-workspace,readonly ")
+        })
+        .collect::<Vec<_>>();
+    if cache_run.len() != 1 {
+        return Err("root Dockerfile must contain one canonical dependency-cache RUN".into());
+    }
+    let commands = cache_run[0]
+        .split(" && ")
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    let mut expected_commands = Vec::new();
+    for (index, (relative, cached)) in DEPENDENCY_CACHE_INPUTS.iter().enumerate() {
+        let prefix = if index == 0 {
+            "RUN --mount=type=bind,source=.,target=/tmp/nexus-workspace,readonly "
+        } else {
+            ""
+        };
+        expected_commands.push(format!(
+            "{prefix}cmp {cached} /tmp/nexus-workspace/{relative}"
+        ));
+    }
+    expected_commands.extend([
+        "cargo fetch --locked --manifest-path /tmp/nexus-workspace/Cargo.toml".to_string(),
+        "cargo fetch --locked --manifest-path /tmp/nexus-workspace/tools/xtask/Cargo.toml"
+            .to_string(),
+        "rm -rf /tmp/nexus-locks /tmp/nexus-inputs".to_string(),
+        "chmod -R a+rwX /usr/local/cargo".to_string(),
+    ]);
+    if commands != expected_commands {
+        return Err(format!(
+            "root Dockerfile dependency-cache RUN is not the exact reviewed command sequence: expected {expected_commands:?}, found {commands:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn continued_shell_lines(source: &str) -> Vec<String> {
+    let mut logical = Vec::new();
+    let mut pending = String::new();
+    for physical in source.lines() {
+        let trimmed = physical.trim();
+        if trimmed.is_empty() || (pending.is_empty() && trimmed.starts_with('#')) {
+            continue;
+        }
+        let continued = trimmed.ends_with('\\');
+        let fragment = if continued {
+            trimmed[..trimmed.len() - 1].trim_end()
+        } else {
+            trimmed
+        };
+        if !pending.is_empty() && !fragment.is_empty() {
+            pending.push(' ');
+        }
+        pending.push_str(fragment);
+        if !continued {
+            logical.push(pending.split_whitespace().collect::<Vec<_>>().join(" "));
+            pending.clear();
+        }
+    }
+    if !pending.is_empty() {
+        logical.push(pending.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    logical
 }
 
 fn function_body<'a>(source: &'a str, declaration: &str) -> Result<&'a str> {
@@ -584,64 +708,330 @@ fn validate_backend_source_binding(root: &Path) -> Result<()> {
 
 fn validate_transition_gate_route(root: &Path) -> Result<()> {
     let source = fs::read_to_string(root.join("tools/xtask/src/main.rs"))?;
-    for (declaration, section) in [
+    let host_build = cargo_route_invocation(
+        &source,
+        "fn build(root: &Path) -> Result<()> {",
+        "build the root workspace for the host",
+    )?;
+    let expected_host_build = [
+        "build",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+    ];
+    if host_build != expected_host_build {
+        return Err(format!(
+            "root workspace build route mismatch: expected {expected_host_build:?}, found {host_build:?}"
+        )
+        .into());
+    }
+    for (section, package, required) in [
+        (
+            "build cser-model for the bare-metal target without std",
+            "cser-model",
+            &[
+                "--no-default-features",
+                "--lib",
+                "--target",
+                "x86_64-unknown-none",
+            ][..],
+        ),
+        (
+            "build portal ABI v2 preview on the bare-metal target",
+            "nexus-portal-abi",
+            &["--lib", "--target", "x86_64-unknown-none"][..],
+        ),
+        (
+            "build supervisor manager on the bare-metal target",
+            "nexus-supervisor",
+            &["--lib", "--target", "x86_64-unknown-none"][..],
+        ),
+    ] {
+        validate_cargo_route_section(
+            &source,
+            "fn build(root: &Path) -> Result<()> {",
+            section,
+            "build",
+            package,
+            required,
+        )?;
+    }
+    for (declaration, section, command, package) in [
         (
             "fn check(root: &Path) -> Result<()> {",
             "check production transition gates",
+            "check",
+            "cser-transition-gates",
         ),
         (
             "fn clippy(root: &Path) -> Result<()> {",
             "clippy production transition gates",
+            "clippy",
+            "cser-transition-gates",
         ),
         (
             "fn test(root: &Path) -> Result<()> {",
             "test production transition gates",
+            "test",
+            "cser-transition-gates",
         ),
-    ] {
-        let body = function_body(&source, declaration)?;
-        for required in [section, "cser-transition-gates", "--all-targets"] {
-            if !body.contains(required) {
-                return Err(format!(
-                    "{declaration} does not route every transition gate: {required}"
-                )
-                .into());
-            }
-        }
-    }
-    let test = function_body(&source, "fn test(root: &Path) -> Result<()> {")?;
-    if !test.contains("--no-fail-fast") {
-        return Err("transition-gate test route must retain every failing target".into());
-    }
-    for (declaration, section) in [
         (
             "fn check(root: &Path) -> Result<()> {",
             "check production effect peer",
+            "check",
+            "nexus-effect-peer",
         ),
         (
             "fn clippy(root: &Path) -> Result<()> {",
             "clippy production effect peer",
+            "clippy",
+            "nexus-effect-peer",
         ),
         (
             "fn test(root: &Path) -> Result<()> {",
             "test production effect peer",
+            "test",
+            "nexus-effect-peer",
+        ),
+        (
+            "fn check(root: &Path) -> Result<()> {",
+            "check portal ABI v2 preview",
+            "check",
+            "nexus-portal-abi",
+        ),
+        (
+            "fn clippy(root: &Path) -> Result<()> {",
+            "clippy portal ABI v2 preview",
+            "clippy",
+            "nexus-portal-abi",
+        ),
+        (
+            "fn test(root: &Path) -> Result<()> {",
+            "test portal ABI v2 preview",
+            "test",
+            "nexus-portal-abi",
+        ),
+        (
+            "fn check(root: &Path) -> Result<()> {",
+            "check supervisor manager",
+            "check",
+            "nexus-supervisor",
+        ),
+        (
+            "fn clippy(root: &Path) -> Result<()> {",
+            "clippy supervisor manager",
+            "clippy",
+            "nexus-supervisor",
+        ),
+        (
+            "fn test(root: &Path) -> Result<()> {",
+            "test supervisor manager",
+            "test",
+            "nexus-supervisor",
         ),
     ] {
-        let body = function_body(&source, declaration)?;
-        for required in [section, "nexus-effect-peer", "--all-targets"] {
-            if !body.contains(required) {
-                return Err(format!(
-                    "{declaration} does not route the production effect peer: {required}"
-                )
-                .into());
-            }
-        }
+        let required: &[&str] = if command == "test" {
+            &["--all-targets", "--no-fail-fast"]
+        } else {
+            &["--all-targets"]
+        };
+        validate_cargo_route_section(&source, declaration, section, command, package, required)?;
     }
-    if !root.join(EFFECT_PEER_MANIFEST).is_file() {
-        return Err(format!("missing production effect peer: {EFFECT_PEER_MANIFEST}").into());
+    for (declaration, section, command, package) in [
+        (
+            "fn check(root: &Path) -> Result<()> {",
+            "check portal ABI v2 preview on the bare-metal target",
+            "check",
+            "nexus-portal-abi",
+        ),
+        (
+            "fn clippy(root: &Path) -> Result<()> {",
+            "clippy portal ABI v2 preview on the bare-metal target",
+            "clippy",
+            "nexus-portal-abi",
+        ),
+        (
+            "fn check(root: &Path) -> Result<()> {",
+            "check supervisor manager on the bare-metal target",
+            "check",
+            "nexus-supervisor",
+        ),
+        (
+            "fn clippy(root: &Path) -> Result<()> {",
+            "clippy supervisor manager on the bare-metal target",
+            "clippy",
+            "nexus-supervisor",
+        ),
+    ] {
+        validate_cargo_route_section(
+            &source,
+            declaration,
+            section,
+            command,
+            package,
+            &["--lib", "--target", "x86_64-unknown-none"],
+        )?;
+    }
+    for (manifest, label) in [
+        (EFFECT_PEER_MANIFEST, "production effect peer"),
+        (PORTAL_ABI_MANIFEST, "portal ABI v2 preview"),
+        (SUPERVISOR_MANIFEST, "supervisor manager"),
+    ] {
+        if !root.join(manifest).is_file() {
+            return Err(format!("missing {label}: {manifest}").into());
+        }
     }
     let production_registry = fs::read_to_string(root.join(PRODUCTION_REGISTRY_TEST))?;
     validate_production_registry_gate(&production_registry)?;
     Ok(())
+}
+
+fn validate_cargo_route_section(
+    source: &str,
+    declaration: &str,
+    section: &str,
+    command: &str,
+    package: &str,
+    required: &[&str],
+) -> Result<()> {
+    let invocation = cargo_route_invocation(source, declaration, section)?;
+    let mut expected = vec![command, "--locked", "-p", package];
+    expected.extend(required.iter().copied());
+    if command == "clippy" {
+        expected.extend(["--", "-D", "warnings"]);
+    }
+    if invocation != expected {
+        return Err(format!(
+            "{declaration} section {section} cargo arguments mismatch: expected {expected:?}, found {invocation:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn cargo_route_invocation(source: &str, declaration: &str, section: &str) -> Result<Vec<String>> {
+    let body = function_body(source, declaration)?;
+    let marker = format!("section(\"{section}\");");
+    let (_, tail) = body
+        .split_once(&marker)
+        .ok_or_else(|| format!("{declaration} lacks workflow section: {section}"))?;
+    let invocation = tail.trim_start();
+    parse_direct_cargo_call(invocation).map_err(|error| {
+        format!("{declaration} section {section} has invalid cargo route: {error}").into()
+    })
+}
+
+struct CargoCallParser<'a> {
+    source: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CargoCallParser<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source: source.as_bytes(),
+            offset: 0,
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .source
+            .get(self.offset)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.offset += 1;
+        }
+    }
+
+    fn expect_literal(&mut self, literal: &str) -> std::result::Result<(), String> {
+        if self.source.get(self.offset..self.offset + literal.len()) == Some(literal.as_bytes()) {
+            self.offset += literal.len();
+            Ok(())
+        } else {
+            Err(format!("expected {literal:?} at byte {}", self.offset))
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> std::result::Result<(), String> {
+        if self.source.get(self.offset) == Some(&expected) {
+            self.offset += 1;
+            Ok(())
+        } else {
+            Err(format!(
+                "expected {:?} at byte {}",
+                char::from(expected),
+                self.offset
+            ))
+        }
+    }
+
+    fn parse_string(&mut self) -> std::result::Result<String, String> {
+        self.expect_byte(b'"')?;
+        let start = self.offset;
+        while let Some(byte) = self.source.get(self.offset).copied() {
+            match byte {
+                b'"' => {
+                    let value = std::str::from_utf8(&self.source[start..self.offset])
+                        .map_err(|_| "cargo argument is not UTF-8".to_string())?
+                        .to_string();
+                    self.offset += 1;
+                    return Ok(value);
+                }
+                b'\\' | b'\n' | b'\r' => {
+                    return Err(format!(
+                        "cargo argument uses an unsupported escape or newline at byte {}",
+                        self.offset
+                    ));
+                }
+                _ => self.offset += 1,
+            }
+        }
+        Err("cargo argument string is unterminated".into())
+    }
+}
+
+fn parse_direct_cargo_call(source: &str) -> std::result::Result<Vec<String>, String> {
+    let mut parser = CargoCallParser::new(source);
+    parser.expect_literal("cargo")?;
+    parser.skip_whitespace();
+    parser.expect_byte(b'(')?;
+    parser.skip_whitespace();
+    parser.expect_literal("root")?;
+    parser.skip_whitespace();
+    parser.expect_byte(b',')?;
+    parser.skip_whitespace();
+    parser.expect_byte(b'[')?;
+
+    let mut arguments = Vec::new();
+    loop {
+        parser.skip_whitespace();
+        if parser.source.get(parser.offset) == Some(&b']') {
+            parser.offset += 1;
+            break;
+        }
+        arguments.push(parser.parse_string()?);
+        parser.skip_whitespace();
+        match parser.source.get(parser.offset) {
+            Some(b',') => parser.offset += 1,
+            Some(b']') => {}
+            _ => {
+                return Err(format!(
+                    "expected a comma or array terminator at byte {}",
+                    parser.offset
+                ));
+            }
+        }
+    }
+
+    parser.skip_whitespace();
+    parser.expect_byte(b',')?;
+    parser.skip_whitespace();
+    parser.expect_byte(b')')?;
+    parser.expect_byte(b'?')?;
+    parser.expect_byte(b';')?;
+    Ok(arguments)
 }
 
 fn validate_production_registry_gate(source: &str) -> Result<()> {
@@ -1346,47 +1736,182 @@ mod tests {
     }
 
     #[test]
-    fn requires_all_vendored_tla2tools_inputs_in_the_image_identity() {
-        let rendered = TLA2TOOLS_IMAGE_INPUTS
+    fn requires_the_exact_complete_image_identity_input_set() {
+        let rendered = IMAGE_IDENTITY_INPUTS
             .iter()
             .map(|relative| format!("    \"$root/{relative}\" \\\n"))
             .collect::<String>();
         let frontdoor = format!(
-            "compute_image_identity() {{\n    image_key=$(sha256sum \\\n{rendered}    \"$root/{TRANSITION_GATE_MANIFEST}\" \\\n    \"$root/Cargo.lock\" | cut -d ' ' -f1 | sha256sum | cut -c1-16)\n}}\n"
+            "compute_image_identity() {{\n    if [[ -n $image ]]; then\n        return\n    fi\n    local image_key\n    image_key=$(sha256sum \\\n{rendered}    | cut -d ' ' -f1 | sha256sum | cut -c1-16)\n    image=\"nexus/cser-dev:$image_key\"\n}}\ncompute_image_identity\ncompute_image_identity\n"
         );
-        validate_image_identity_inputs(&frontdoor).expect("complete vendored image identity");
+        validate_image_identity_inputs(&frontdoor).expect("complete image identity");
 
-        for relative in TLA2TOOLS_IMAGE_INPUTS {
+        for relative in IMAGE_IDENTITY_INPUTS {
             let missing = frontdoor.replace(&format!("    \"$root/{relative}\" \\\n"), "");
             let error = validate_image_identity_inputs(&missing)
-                .expect_err("missing vendored image input must be rejected")
+                .expect_err("missing image input must be rejected")
                 .to_string();
             assert!(error.contains(relative));
         }
 
         let reordered = frontdoor
-            .replace(TLA2TOOLS_IMAGE_INPUTS[0], "FIRST")
-            .replace(TLA2TOOLS_IMAGE_INPUTS[1], TLA2TOOLS_IMAGE_INPUTS[0])
-            .replace("FIRST", TLA2TOOLS_IMAGE_INPUTS[1]);
+            .replace(IMAGE_IDENTITY_INPUTS[0], "FIRST")
+            .replace(IMAGE_IDENTITY_INPUTS[1], IMAGE_IDENTITY_INPUTS[0])
+            .replace("FIRST", IMAGE_IDENTITY_INPUTS[1]);
         let error = validate_image_identity_inputs(&reordered)
-            .expect_err("reordered vendored image inputs must be rejected")
+            .expect_err("reordered image inputs must be rejected")
             .to_string();
-        assert!(error.contains("out-of-order"));
+        assert!(error.contains("exact reviewed command"));
 
-        let missing_transition = frontdoor.replace(
-            &format!("    \"$root/{TRANSITION_GATE_MANIFEST}\" \\\n"),
-            "",
+        let extra = frontdoor.replace("    | cut", "    \"$root/unreviewed-input\" \\\n    | cut");
+        assert!(validate_image_identity_inputs(&extra).is_err());
+
+        let substitution = frontdoor.replace(
+            "    \"$root/Cargo.lock\" \\",
+            "    $(printf '' \"$root/Cargo.lock\") \\",
         );
-        let error = validate_image_identity_inputs(&missing_transition)
-            .expect_err("missing transition-gate manifest must be rejected")
-            .to_string();
-        assert!(error.contains(TRANSITION_GATE_MANIFEST));
+        validate_image_identity_inputs(&substitution)
+            .expect_err("command substitution must not masquerade as an image input");
+
+        let overridden = frontdoor.replace(
+            "    image=\"nexus/cser-dev:$image_key\"",
+            "    image_key=constant\n    image=\"nexus/cser-dev:$image_key\"",
+        );
+        validate_image_identity_inputs(&overridden)
+            .expect_err("a later image-key assignment must not override the reviewed digest");
+
+        for redefinition in [
+            "\ncompute_image_identity() {\n    image=\"nexus/cser-dev:constant\"\n}\n",
+            "\nfunction compute_image_identity {\n    image=\"nexus/cser-dev:constant\"\n}\n",
+        ] {
+            let redefined = format!("{frontdoor}{redefinition}");
+            validate_image_identity_inputs(&redefined)
+                .expect_err("a later Bash function definition must not replace the reviewed one");
+        }
+    }
+
+    #[test]
+    fn cargo_routes_require_an_immediate_propagated_cargo_call() {
+        let valid = r#"fn check(root: &Path) -> Result<()> {
+    section("check fixture");
+    cargo(
+        root,
+        ["check", "--locked", "-p", "fixture", "--all-targets"],
+    )?;
+}
+"#;
+        validate_cargo_route_section(
+            valid,
+            "fn check(root: &Path) -> Result<()> {",
+            "check fixture",
+            "check",
+            "fixture",
+            &["--all-targets"],
+        )
+        .expect("real propagated cargo route");
+
+        let string_only = valid.replacen("cargo(", "let _ = (", 1);
+        validate_cargo_route_section(
+            &string_only,
+            "fn check(root: &Path) -> Result<()> {",
+            "check fixture",
+            "check",
+            "fixture",
+            &["--all-targets"],
+        )
+        .expect_err("argument strings without a cargo call must fail");
+
+        let discarded = valid.replacen(")?;", ");", 1);
+        validate_cargo_route_section(
+            &discarded,
+            "fn check(root: &Path) -> Result<()> {",
+            "check fixture",
+            "check",
+            "fixture",
+            &["--all-targets"],
+        )
+        .expect_err("an unpropagated cargo result must fail");
+
+        let computed_arguments = r#"fn check(root: &Path) -> Result<()> {
+    section("check fixture");
+    cargo(root, {
+        let _ = ("check", "--locked", "-p", "fixture", "--all-targets");
+        ["check", "--locked", "-p", "different"]
+    })?;
+}
+"#;
+        validate_cargo_route_section(
+            computed_arguments,
+            "fn check(root: &Path) -> Result<()> {",
+            "check fixture",
+            "check",
+            "fixture",
+            &["--all-targets"],
+        )
+        .expect_err("arguments hidden in an expression must fail");
+
+        let fabricated_propagation = valid.replacen(
+            ")?;",
+            ").unwrap_or(());\n    let _ = \"fake )?; marker\";",
+            1,
+        );
+        validate_cargo_route_section(
+            &fabricated_propagation,
+            "fn check(root: &Path) -> Result<()> {",
+            "check fixture",
+            "check",
+            "fixture",
+            &["--all-targets"],
+        )
+        .expect_err("a later text marker must not fake result propagation");
     }
 
     #[test]
     fn production_build_surfaces_keep_cache_evidence_and_source_identity_separate() {
         let root = repository_root();
         let frontdoor = fs::read_to_string(root.join("x")).expect("read root workflow");
+        let dockerfile = fs::read_to_string(root.join("Dockerfile")).expect("read Dockerfile");
+        validate_workspace_dependency_cache_inputs(&dockerfile)
+            .expect("complete workspace dependency cache inputs");
+        for (relative, cached) in DEPENDENCY_CACHE_INPUTS {
+            let copy = format!("COPY {relative} {cached}");
+            let missing = dockerfile.replacen(&copy, "COPY removed-input /tmp/removed", 1);
+            let error = validate_workspace_dependency_cache_inputs(&missing)
+                .expect_err("every dependency cache input must be required")
+                .to_string();
+            assert!(error.contains(relative));
+        }
+        let (first_relative, first_cached) = DEPENDENCY_CACHE_INPUTS[0];
+        let first_mounted = format!("/tmp/nexus-workspace/{first_relative}");
+        let first_compare = format!("cmp {first_cached} {first_mounted}");
+        let wrong_pair = dockerfile.replacen(
+            &first_compare,
+            &format!("cmp {first_cached} /tmp/nexus-workspace/Cargo.toml"),
+            1,
+        );
+        validate_workspace_dependency_cache_inputs(&wrong_pair)
+            .expect_err("a comparison with the wrong mounted operand must fail");
+
+        let substituted = dockerfile.replacen(
+            &first_compare,
+            &format!("cmp {first_cached} $(printf '%s' {first_mounted})"),
+            1,
+        );
+        validate_workspace_dependency_cache_inputs(&substituted)
+            .expect_err("a command-substituted operand must fail");
+
+        let ignored = dockerfile.replacen(&first_compare, &format!("{first_compare} || true"), 1);
+        validate_workspace_dependency_cache_inputs(&ignored)
+            .expect_err("an ignored comparison failure must fail");
+
+        let tail_recovery = dockerfile.replacen(
+            "chmod -R a+rwX /usr/local/cargo",
+            "chmod -R a+rwX /usr/local/cargo || true",
+            1,
+        );
+        validate_workspace_dependency_cache_inputs(&tail_recovery)
+            .expect_err("a tail recovery must not swallow any earlier comparison failure");
+
         validate_clean_contract(&frontdoor).expect("safe cache cleanup contract");
         validate_cold_rebuild_contract(&root, &frontdoor).expect("cache-cold rebuild contract");
         validate_backend_source_binding(&root).expect("production source binding");

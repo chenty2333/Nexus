@@ -1,0 +1,333 @@
+schema = "nexus.production-identity.causal-coverage.v1"
+ledger_revision = 1
+as_of = "2026-07-18"
+workload = "linux-runtime-fs-smoke-first-executable-pread64"
+scope = "bounded-same-boot-single-vcpu-polling-checkpoint"
+claim = "machine-readable-audited-inventory-not-runtime-coverage-gate-or-phase-closure"
+overall_status = "incomplete-explicit-gaps"
+complete = false
+runtime_boundary_gate = false
+source_symbol_gate = false
+validator_limitation = "freezes-declared-inventory-and-regular-source-files-but-cannot-discover-undeclared-runtime-or-source-boundaries"
+boundary_count = 20
+allowed_classifications = [
+  "tracked-effect",
+  "root-owned-publication",
+  "kernel-tcb-infrastructure",
+  "uncovered-gap",
+]
+tcb_policy = "request-derived-authority-must-join-the-root-unless-a-reviewed-row-records-why-kernel-infrastructure-cannot-retain-or-publish-it"
+
+[summary]
+tracked_effect = 6
+root_owned_publication = 6
+kernel_tcb_infrastructure = 0
+uncovered_gap = 8
+
+[[boundary]]
+id = "task-admission"
+classification = "uncovered-gap"
+owner = "OSTD task construction and scheduler admission"
+parent = "unresolved"
+creation_admission = "The guest and fsd-v1/v2 tasks are built with TaskOptions; only the service tasks carry a TaskKey in TaskData, and no workload-root derivation is installed at task admission."
+commit_publication = "Task::run makes the task runnable without a Registry publication gate for this workload."
+cancel_recovery = "Task exit is joined manually by scenario waiters; there is no root-indexed cancellation or supervisor-owned replacement deadline."
+terminal_closure = "Task completion does not produce a Registry terminal receipt or return a task-admission credit."
+credit = "missing:task-admission-credit-and-root-parent"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "patches/ostd-0.18.0-cser.patch",
+]
+
+[[boundary]]
+id = "service-death"
+classification = "root-owned-publication"
+owner = "filesystem-domain recovery transition in EffectRegistry"
+parent = "filesystem-child"
+creation_admission = "The fsd-v1 page-fault branch calls crash_fsd_v1 with the current TaskKey and advances the filesystem domain binding in the shared Registry."
+commit_publication = "crash_domain advances the filesystem binding epoch and freezes the old-binding cohort; fsd-v2 then captures the exact recovery snapshot under the same scope."
+cancel_recovery = "fsd-v2 performs snapshot, Ready, rebind, explicit adopt, and stale old-binding rejection before continuing the same effect."
+terminal_closure = "The death transition creates no detached terminal object; the adopted filesystem effect remains responsible for normal or revoke closure."
+credit = "inherits:filesystem-op-credit-remains-held-by-filesystem-child"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+]
+
+[[boundary]]
+id = "page-fault"
+classification = "uncovered-gap"
+owner = "OSTD user-exception delivery for fsd-v1"
+parent = "filesystem-child"
+creation_admission = "A real user page fault is observed in fsd-v1, but the fault is not derived as an effect and has no reviewed TCB classification."
+commit_publication = "The exception branch immediately drives service death; there is no separately identified fault admission or publication record."
+cancel_recovery = "Recovery operates on the filesystem effect and domain binding, not on a page-fault identity."
+terminal_closure = "No page-fault terminal disposition, receipt, or credit closure is recorded."
+credit = "missing:page-fault-credit-or-reviewed-tcb-rationale"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+]
+
+[[boundary]]
+id = "syscall-root-admission"
+classification = "tracked-effect"
+owner = "Linux personality ProductionReadRuntime shared EffectRegistry"
+parent = "root"
+creation_admission = "The immutable first executable pread64 descriptor is registered before personality lookup as the scope root effect in the personality domain."
+commit_publication = "The root is prepared at capture; the later cohort commit and final publication ticket remain bound to its exact EffectKey."
+cancel_recovery = "Registration or preparation failure retains the linear flight; revoke freezes this root and selects its live descendants."
+terminal_closure = "Final guest-memory publication acknowledges the root publication ticket and revoke-completes the selected cohort."
+credit = "reserved:control=1,guest-reply=1"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+]
+
+[[boundary]]
+id = "filesystem-child"
+classification = "tracked-effect"
+owner = "filesystem service domain in shared EffectRegistry"
+parent = "syscall-root-admission"
+creation_admission = "fsd-v1 registers the fixed executable read as a derived filesystem effect under the captured syscall root and prepares it."
+commit_publication = "After explicit fsd-v2 adoption, the same immutable effect identity participates in the six-member device commit."
+cancel_recovery = "Domain crash freezes the old binding; snapshot, Ready, rebind, adopt, and stale-selector checks preserve ancestry."
+terminal_closure = "The filesystem effect is selected with the root and closes only after backend publication or an honest retained outcome."
+credit = "reserved:filesystem-op=1"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+]
+
+[[boundary]]
+id = "block-request"
+classification = "tracked-effect"
+owner = "block domain in shared EffectRegistry"
+parent = "filesystem-child"
+creation_admission = "A device-derived cohort registers one BlockRequest with the exact device session, queue, descriptor token, and generation under the adopted filesystem child."
+commit_publication = "The block effect is prepared and committed in the same Registry transaction whose apply closure performs the unique queue publication."
+cancel_recovery = "Precommit cancellation and committed reset paths retain the exact device envelope and select the block subtree leaf-first."
+terminal_closure = "Completion, reset, IOTLB acknowledgement, backend publication, and revoke completion determine release or retained disposition."
+credit = "reserved:queue-slot=1"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+  "kernel/nexus-ostd/src/cser/device_flight.rs",
+]
+
+[[boundary]]
+id = "filesystem-service-request-queue"
+classification = "uncovered-gap"
+owner = "FsServiceProtocol request and delayed-command slots"
+parent = "syscall-root-admission"
+creation_admission = "enqueue_unannounced stores the immutable descriptor, flight cookie, and response waker before the filesystem child exists; fsd-v1 later stores a typed delayed Prepare command for delivery after rebind."
+commit_publication = "arm_queued makes the request consumable and the local phase machine orders command delivery, but neither queue admission is published in or reverse-indexed by the shared Registry."
+cancel_recovery = "The delayed old-binding Prepare is rejected after rebind, yet there is no root-owned drain, cancellation, or retained-queue receipt if a service or coordinator stops at another phase."
+terminal_closure = "Local Option fields are consumed by assertions and the bounded happy path; their authority and response-waker ownership have no independent Registry terminal disposition."
+credit = "missing:service-request-command-and-continuation-queue-credit"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/effect.rs",
+]
+
+[[boundary]]
+id = "queue-dma-preparation"
+classification = "uncovered-gap"
+owner = "nexus-ostd-virtio PreparedRequest construction"
+parent = "block-request"
+creation_admission = "prepare_read_sector0 reserves descriptors, pins buffers, and creates DMA mappings before register_device_derived_cohort reserves the corresponding shared-ledger credits."
+commit_publication = "PreparedRequest is linear and not device-visible until avail.idx Release, but its preparation is not born under an already registered BlockRequest/DMA cohort."
+cancel_recovery = "The facade can cancel the unpublished linear owner, while the Registry learns that owner only after the preparation succeeds."
+terminal_closure = "Drop fails closed and explicit cancellation can recover hardware state, but the pre-enrollment interval has no root-indexed obligation."
+credit = "missing:reserve-queue-and-dma-credits-before-hardware-preparation"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "crates/nexus-ostd-virtio/src/production.rs",
+  "crates/nexus-ostd-virtio/src/dma.rs",
+]
+
+[[boundary]]
+id = "guest-waiter"
+classification = "uncovered-gap"
+owner = "EffectWaiter wrapper over OSTD Waiter"
+parent = "syscall-root-admission"
+creation_admission = "The blocked guest receives an EffectToken-shaped waiter, but the token is not validated against or enrolled in the shared Registry."
+commit_publication = "wait releases execution to the service without a Registry admission or continuation-publication receipt."
+cancel_recovery = "A caller crash or revoke has no reverse index from the root to the live OSTD waiter."
+terminal_closure = "The waiter consumes a wake in OSTD but has no root-owned terminal disposition or credit return."
+credit = "missing:guest-continuation-credit-and-registry-enrollment"
+source_paths = [
+  "kernel/nexus-ostd/src/cser/effect.rs",
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+]
+
+[[boundary]]
+id = "guest-waker"
+classification = "uncovered-gap"
+owner = "EffectWaker wrapper and filesystem service response slot"
+parent = "filesystem-child"
+creation_admission = "A one-shot local gate carries copied epoch/scope/effect numbers, but it is not derived from a Registry handle and reserves no root credit."
+commit_publication = "fsd_publish_response installs DispatchOutcome and wakes the guest once before backend guest-memory publication."
+cancel_recovery = "The wrapper rejects a duplicate local wake, but root revoke and stale binding are not checked at the wake boundary."
+terminal_closure = "Consuming the local gate receipt does not terminalize a Registry effect or release a root-owned continuation credit."
+credit = "missing:waker-credit-registry-selector-and-stale-binding-fence"
+source_paths = [
+  "kernel/nexus-ostd/src/cser/effect.rs",
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+]
+
+[[boundary]]
+id = "timer-deadline"
+classification = "uncovered-gap"
+owner = "same-boot completion polling actor"
+parent = "block-request"
+creation_admission = "The production read uses a fixed completion probe limit; EffectTimer exists elsewhere but this path creates no monotonic root-derived deadline."
+commit_publication = "Repeated polling has no timer effect, deadline receipt, or published timeout authority."
+cancel_recovery = "Probe exhaustion retains the flight, but there is no retry/backoff schedule or timer cancellation tied to the root."
+terminal_closure = "No deadline object is terminalized and no timer credit is released or retained."
+credit = "missing:deadline-credit-monotonic-timer-and-retry-owner"
+source_paths = [
+  "kernel/nexus-ostd/src/cser/effect.rs",
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+]
+
+[[boundary]]
+id = "virtio-queue-publication"
+classification = "root-owned-publication"
+owner = "Registry device-flight adapter and nexus-ostd-virtio PreparedRequest"
+parent = "block-request"
+creation_admission = "Preflight checks the immutable device/session/queue/descriptor/generation identity while the shared runtime lock owns the prepared request."
+commit_publication = "commit_or_recover_device_flight_with_apply prevalidates the Registry transition and its infallible apply closure performs the unique avail.idx Release publication."
+cancel_recovery = "Revoke-before-commit uses explicit prepared cancellation; after publication, cancellation proceeds through completion/reset ownership."
+terminal_closure = "The published linear owner remains in the flight slot until completion or an honest retained reset/IOTLB state."
+credit = "inherits:queue-slot-and-three-dma-owner-credits-remain-held"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/device_flight.rs",
+  "crates/nexus-ostd-virtio/src/production.rs",
+]
+
+[[boundary]]
+id = "dma-queue-owner-a"
+classification = "tracked-effect"
+owner = "block domain queue-driver DMA owner"
+parent = "block-request"
+creation_admission = "The device-derived cohort registers the queue-driver owner with exact physical owner address, device envelope, and BlockRequest batch parent."
+commit_publication = "It prepares and commits atomically with the block cohort before queue publication."
+cancel_recovery = "Precommit cancellation or reset/IOTLB recovery preserves its exact owner identity and retained mapping state."
+terminal_closure = "Leaf-first closure releases it only after the required reset and IOTLB acknowledgement, otherwise it remains retained."
+credit = "reserved:pinned-page=1,dma-mapping=1"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+  "crates/nexus-ostd-virtio/src/dma.rs",
+]
+
+[[boundary]]
+id = "dma-queue-owner-b"
+classification = "tracked-effect"
+owner = "block domain queue-device DMA owner"
+parent = "block-request"
+creation_admission = "The device-derived cohort registers the queue-device owner with exact physical owner address, device envelope, and BlockRequest batch parent."
+commit_publication = "It prepares and commits atomically with the block cohort before queue publication."
+cancel_recovery = "Precommit cancellation or reset/IOTLB recovery preserves its exact owner identity and retained mapping state."
+terminal_closure = "Leaf-first closure releases it only after the required reset and IOTLB acknowledgement, otherwise it remains retained."
+credit = "reserved:pinned-page=1,dma-mapping=1"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+  "crates/nexus-ostd-virtio/src/dma.rs",
+]
+
+[[boundary]]
+id = "dma-request-owner"
+classification = "tracked-effect"
+owner = "block domain request-buffer DMA owner"
+parent = "block-request"
+creation_admission = "The device-derived cohort registers the request-buffer owner with exact physical owner address, device envelope, and BlockRequest batch parent."
+commit_publication = "It prepares and commits atomically with the block cohort before queue publication."
+cancel_recovery = "Precommit cancellation or reset/IOTLB recovery preserves its exact owner identity and retained mapping state."
+terminal_closure = "Leaf-first closure releases it only after the required reset and IOTLB acknowledgement, otherwise it remains retained."
+credit = "reserved:pinned-page=1,dma-mapping=1"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+  "crates/nexus-ostd-virtio/src/dma.rs",
+]
+
+[[boundary]]
+id = "device-completion"
+classification = "root-owned-publication"
+owner = "ProductionReadRuntime polling actor and device-flight adapter"
+parent = "block-request"
+creation_admission = "The unique PublishedRequest is probed outside the OSTD lock and restored to the linear flight slot after each one-step observation."
+commit_publication = "Completion validates effect, root, device session, queue, descriptor token, generation, response status, and data digest before the Registry accepts it."
+cancel_recovery = "A failed or stale completion cannot republish the request; it proceeds to reset/retained handling with the same device envelope."
+terminal_closure = "The completion receipt authorizes backend-result handling but does not itself release DMA/frame credits."
+credit = "inherits:block-and-dma-credits-stay-held-through-quiescence"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/device_flight.rs",
+  "crates/nexus-ostd-virtio/src/production.rs",
+]
+
+[[boundary]]
+id = "device-reset"
+classification = "root-owned-publication"
+owner = "Registry reset tombstone and nexus-ostd-virtio reset session"
+parent = "block-request"
+creation_admission = "The Registry mints a reset ticket for the exact selected device cohort before the hardware reset apply step."
+commit_publication = "Reset acknowledgement is coupled back to the same Registry ticket and device generation."
+cancel_recovery = "Timeout or failed acknowledgement retains a typed reset tombstone and the queue/DMA owners for retry."
+terminal_closure = "Only a matching acknowledgement advances recovery toward IOTLB quiescence; retained state prevents unsafe owner release."
+credit = "inherits:queue-slot-pinned-page-and-dma-mapping-credits-retained-until-ack"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/device_flight.rs",
+  "crates/nexus-ostd-virtio/src/production.rs",
+]
+
+[[boundary]]
+id = "iotlb-invalidation"
+classification = "root-owned-publication"
+owner = "Registry IOTLB tombstone and nexus-ostd-virtio DMA closure"
+parent = "device-reset"
+creation_admission = "After reset acknowledgement, the Registry mints an exact IOTLB ticket while the linear hardware closure still owns every DMA mapping and frame."
+commit_publication = "The same-boot facade acknowledgement is consumed by the Registry before closure may report releasable owners."
+cancel_recovery = "Timeout or failure retains an IOTLB tombstone and the original owners; replay and wrong-ticket acknowledgement fail closed."
+terminal_closure = "Owner/frame release is ordered after the selected IOTLB acknowledgement; unsupported generic hardware remains fail-closed outside this bounded adapter."
+credit = "inherits:pinned-page-and-dma-mapping-credits-release-only-after-iotlb-ack"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/device_flight.rs",
+  "crates/nexus-ostd-virtio/src/dma.rs",
+]
+
+[[boundary]]
+id = "backend-data-publication"
+classification = "root-owned-publication"
+owner = "Linux personality prepared guest write under Registry publication gate"
+parent = "device-completion"
+creation_admission = "The completed device buffer is copied into a prevalidated fixed guest-page write plan while preemption is disabled."
+commit_publication = "acknowledge_publication_and_revoke_complete_with_apply performs the guest-memory write inside the validated Registry publication transition."
+cancel_recovery = "A bad mapping, wrong flight ticket, or failed validation leaves the flight retained without acknowledging publication."
+terminal_closure = "Successful apply records publication and revoke-completes the selected root cohort in the same critical section."
+credit = "inherits:root-guest-reply-credit-is-still-not-separated-from-this-publication"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/effect_registry.rs",
+]
+
+[[boundary]]
+id = "guest-reply"
+classification = "uncovered-gap"
+owner = "Linux personality guest register return and resume"
+parent = "backend-data-publication"
+creation_admission = "The syscall return value and service wake are prepared before the backend guest-memory publication; there is no distinct post-backend reply ticket."
+commit_publication = "The current path resumes the guest immediately after backend publication instead of committing a separate one-shot Registry reply."
+cancel_recovery = "There is no post-device-commit/pre-reply authority that a replacement supervisor can discover, adopt, retry, or fence by binding epoch."
+terminal_closure = "The reserved guest-reply credit is consumed only as part of combined root publication/closure, so a crash between backend data and reply cannot be represented."
+credit = "missing:separate-one-shot-guest-reply-ticket-and-terminal-receipt"
+source_paths = [
+  "kernel/nexus-ostd/src/personality/linux_fs.rs",
+  "kernel/nexus-ostd/src/cser/effect.rs",
+]

@@ -4,4 +4,6 @@ members = [
     "crates/cser-model",
     "crates/cser-transition-gates",
     "crates/nexus-effect-peer",
+    "crates/nexus-portal-abi",
+    "crates/nexus-supervisor",
 ]

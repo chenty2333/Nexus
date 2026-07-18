@@ -1,0 +1,11 @@
+[package]
+name = "nexus-portal-abi"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Bounded no_std wire contract for the Nexus portal v2 preview"
+publish = false
+
+[dependencies]
+bitflags = { version = "=2.13.0", default-features = false }
+zerocopy = { version = "=0.8.54", default-features = false, features = ["derive"] }

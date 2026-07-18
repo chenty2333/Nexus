@@ -134,10 +134,14 @@ The exact tier contracts and claim discipline are kept in
 | `specs/cser/` | Normative PlusCal/TLA+ protocols and properties |
 | `crates/cser-model/` | Independent `no_std + alloc` safe-Rust reference model |
 | `crates/cser-transition-gates/` | Production-transition-source Loom harnesses |
+| `crates/nexus-effect-peer/` | Frozen native-v1 logical effect peer and replay boundary |
+| `crates/nexus-portal-abi/` | `nexus.portal.v2` preview wire/dispatcher contract; not yet a kernel Registry adapter |
+| `crates/nexus-supervisor/` | Bounded provider-neutral restart/recovery manager; not yet wired to OSTD task lifecycle |
 | `kernel/nexus-ostd/` | Maintained OSTD kernel prototype and bounded workload paths |
 | `experiments/ostd-virtio-cser-spike/` | Mediated VirtIO/reset/IOMMU component evidence |
 | `tests/guest/linux/` | Hash-pinned Linux compatibility-pressure inputs |
 | `evaluation/stage7b/` | Released evaluation contracts, sources, and race catalog |
+| `evaluation/production-identity/causal-coverage.toml` | Audited causal-boundary inventory with explicit uncovered gaps; not runtime coverage evidence |
 | `status/` | Moving exact-revision checkpoints and frozen wire contracts |
 | `docs/research/engineering-reuse-map.md` | Adopt/borrow/own decisions for the nine engineering priorities |
 | `tools/xtask/`, `tools/workflow/` | Reproducible build, evaluation, and evidence tooling |
@@ -191,6 +195,9 @@ runtime result.
 - [RFC 0001](docs/rfcs/0001-production-identity.md) defines the prospective
   production-identity composition and `v0.2.0` acceptance contract; none of its
   requirements are claimed by `v0.1.0`.
+- [RFC 0003](docs/rfcs/0003-causal-coverage-closure.md) records the prospective
+  closure order for the current causal-coverage gaps; it is a design contract,
+  not implementation or runtime evidence.
 - [REWORK.md](REWORK.md) is the historical migration and deletion ledger; it is
   not the current roadmap or semantics source.
 

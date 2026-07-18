@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod catalog;
+mod causal_coverage;
 mod current_status;
 mod doctor;
 mod evidence;
@@ -188,6 +189,8 @@ fn doctor(root: &Path) -> Result<()> {
         stage7b::validate(root).map_err(|error| format!("Stage 7B static contract: {error}"))?;
     let prior_art = stage7b_prior_art::check(root)
         .map_err(|error| format!("Stage 7B prior-art truth source: {error}"))?;
+    let coverage = causal_coverage::validate(root)
+        .map_err(|error| format!("production causal coverage: {error}"))?;
     println!(
         "DOCTOR CATALOGS PASS oracles={oracle_count} scenarios={scenario_count} guest_sources={} guest_workloads={}",
         guest.sources, guest.workloads
@@ -204,14 +207,24 @@ fn doctor(root: &Path) -> Result<()> {
         "DOCTOR STAGE7B PRIOR ART PASS rows={} full_text={} metadata_only={} verdict={}",
         prior_art.rows, prior_art.full_text, prior_art.metadata_only, prior_art.default_verdict,
     );
+    println!(
+        "DOCTOR CAUSAL COVERAGE PASS boundaries={} explicit_gaps={} overall={}",
+        coverage.boundaries, coverage.uncovered_gaps, coverage.overall_status,
+    );
     Ok(())
 }
 
 fn build(root: &Path) -> Result<()> {
-    section("build cser-model for the host");
+    section("build the root workspace for the host");
     cargo(
         root,
-        ["build", "--locked", "-p", "cser-model", "--all-features"],
+        [
+            "build",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+        ],
     )?;
     section("build cser-model for the bare-metal target without std");
     cargo(
@@ -226,7 +239,36 @@ fn build(root: &Path) -> Result<()> {
             "--target",
             "x86_64-unknown-none",
         ],
-    )
+    )?;
+
+    section("build portal ABI v2 preview on the bare-metal target");
+    cargo(
+        root,
+        [
+            "build",
+            "--locked",
+            "-p",
+            "nexus-portal-abi",
+            "--lib",
+            "--target",
+            "x86_64-unknown-none",
+        ],
+    )?;
+
+    section("build supervisor manager on the bare-metal target");
+    cargo(
+        root,
+        [
+            "build",
+            "--locked",
+            "-p",
+            "nexus-supervisor",
+            "--lib",
+            "--target",
+            "x86_64-unknown-none",
+        ],
+    )?;
+    Ok(())
 }
 
 fn fmt(root: &Path) -> Result<()> {
@@ -257,6 +299,19 @@ fn check(root: &Path) -> Result<()> {
     println!(
         "current capability status: PASS ({} checkpoints: {} local, {} external; {} frozen wire contract)",
         current.checkpoints, current.local, current.external, current.frozen_wire_contracts,
+    );
+
+    section("validate production block-read causal coverage");
+    let coverage = causal_coverage::validate(root)
+        .map_err(|error| format!("production causal coverage: {error}"))?;
+    println!(
+        "production causal coverage: PASS ({} boundaries: {} tracked effects, {} root-owned publications, {} kernel-TCB infrastructure, {} explicit gaps; overall={})",
+        coverage.boundaries,
+        coverage.tracked_effects,
+        coverage.root_owned_publications,
+        coverage.kernel_tcb_infrastructure,
+        coverage.uncovered_gaps,
+        coverage.overall_status,
     );
 
     section("validate repository workflow surfaces");
@@ -337,6 +392,58 @@ fn check(root: &Path) -> Result<()> {
         ],
     )?;
 
+    section("check portal ABI v2 preview");
+    cargo(
+        root,
+        [
+            "check",
+            "--locked",
+            "-p",
+            "nexus-portal-abi",
+            "--all-targets",
+        ],
+    )?;
+
+    section("check portal ABI v2 preview on the bare-metal target");
+    cargo(
+        root,
+        [
+            "check",
+            "--locked",
+            "-p",
+            "nexus-portal-abi",
+            "--lib",
+            "--target",
+            "x86_64-unknown-none",
+        ],
+    )?;
+
+    section("check supervisor manager");
+    cargo(
+        root,
+        [
+            "check",
+            "--locked",
+            "-p",
+            "nexus-supervisor",
+            "--all-targets",
+        ],
+    )?;
+
+    section("check supervisor manager on the bare-metal target");
+    cargo(
+        root,
+        [
+            "check",
+            "--locked",
+            "-p",
+            "nexus-supervisor",
+            "--lib",
+            "--target",
+            "x86_64-unknown-none",
+        ],
+    )?;
+
     section("check cser-model on the bare-metal target without std");
     cargo(
         root,
@@ -412,6 +519,70 @@ fn clippy(root: &Path) -> Result<()> {
         ],
     )?;
 
+    section("clippy portal ABI v2 preview");
+    cargo(
+        root,
+        [
+            "clippy",
+            "--locked",
+            "-p",
+            "nexus-portal-abi",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+
+    section("clippy portal ABI v2 preview on the bare-metal target");
+    cargo(
+        root,
+        [
+            "clippy",
+            "--locked",
+            "-p",
+            "nexus-portal-abi",
+            "--lib",
+            "--target",
+            "x86_64-unknown-none",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+
+    section("clippy supervisor manager");
+    cargo(
+        root,
+        [
+            "clippy",
+            "--locked",
+            "-p",
+            "nexus-supervisor",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+
+    section("clippy supervisor manager on the bare-metal target");
+    cargo(
+        root,
+        [
+            "clippy",
+            "--locked",
+            "-p",
+            "nexus-supervisor",
+            "--lib",
+            "--target",
+            "x86_64-unknown-none",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+
     section("clippy cser-model on the bare-metal target without std");
     cargo(
         root,
@@ -475,6 +646,32 @@ fn test(root: &Path) -> Result<()> {
             "--locked",
             "-p",
             "nexus-effect-peer",
+            "--all-targets",
+            "--no-fail-fast",
+        ],
+    )?;
+
+    section("test portal ABI v2 preview");
+    cargo(
+        root,
+        [
+            "test",
+            "--locked",
+            "-p",
+            "nexus-portal-abi",
+            "--all-targets",
+            "--no-fail-fast",
+        ],
+    )?;
+
+    section("test supervisor manager");
+    cargo(
+        root,
+        [
+            "test",
+            "--locked",
+            "-p",
+            "nexus-supervisor",
             "--all-targets",
             "--no-fail-fast",
         ],
