@@ -6,6 +6,8 @@
 //! This crate owns only the independently consumable native-v1 wire. It has
 //! no Registry, process server, ownership-log, or neutral-handoff dependency.
 
+pub mod frozen_v1;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
