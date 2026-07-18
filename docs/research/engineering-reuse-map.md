@@ -23,7 +23,10 @@ Native effect-peer wire v1 remains frozen. The kernel path is `no_std + alloc`;
 
 - **Adopt:** use the already pinned `zerocopy 0.8.54` and `bitflags 2.13.0`
   for a fixed-endian, bounds-checked portal-v2 envelope. Keep `serde_json` only
-  for frozen process wire v1 and host evidence, not as the kernel ABI.
+  for frozen process wire v1 and host evidence, not as the kernel ABI. The
+  repository-local `nexus-effect-peer-wire` crate is the one native-v1 serde
+  implementation and producer-owned corpus; the process peer re-exports it,
+  and external consumers should pin it instead of copying its types.
 - **Borrow:** follow Linux UAPI's `size` field and reject-unknown-flags rules;
   model negotiation as VirtIO-style device-offered and driver-accepted feature
   sets with explicit `FEATURES_OK` confirmation, while Nexus separately owns
