@@ -373,6 +373,19 @@ fn validate_image_identity_inputs(frontdoor: &str) -> Result<()> {
             "root workflow must contain one image-identity definition and two direct calls".into(),
         );
     }
+    for declaration in ["build_image() {", "ensure_image() {"] {
+        let caller = function_body(frontdoor, declaration)?;
+        let direct_calls = continued_shell_lines(caller)
+            .iter()
+            .filter(|line| line.as_str() == "compute_image_identity")
+            .count();
+        if direct_calls != 1 {
+            return Err(format!(
+                "root workflow {declaration} must contain exactly one direct image-identity call"
+            )
+            .into());
+        }
+    }
     let body = function_body(frontdoor, "compute_image_identity() {")?;
     let inputs = IMAGE_IDENTITY_INPUTS
         .iter()
@@ -1744,6 +1757,10 @@ mod tests {
         let frontdoor = format!(
             "compute_image_identity() {{\n    if [[ -n $image ]]; then\n        return\n    fi\n    local image_key\n    image_key=$(sha256sum \\\n{rendered}    | cut -d ' ' -f1 | sha256sum | cut -c1-16)\n    image=\"nexus/cser-dev:$image_key\"\n}}\ncompute_image_identity\ncompute_image_identity\n"
         );
+        let frontdoor = frontdoor.replace(
+            "\ncompute_image_identity\ncompute_image_identity\n",
+            "\nbuild_image() {\n    compute_image_identity\n}\nensure_image() {\n    compute_image_identity\n}\n",
+        );
         validate_image_identity_inputs(&frontdoor).expect("complete image identity");
 
         for relative in IMAGE_IDENTITY_INPUTS {
@@ -1787,6 +1804,20 @@ mod tests {
             let redefined = format!("{frontdoor}{redefinition}");
             validate_image_identity_inputs(&redefined)
                 .expect_err("a later Bash function definition must not replace the reviewed one");
+        }
+
+        for replacement in [
+            ": compute_image_identity",
+            "# compute_image_identity",
+            "printf '%s' compute_image_identity",
+        ] {
+            let indirect = frontdoor.replacen(
+                "    compute_image_identity",
+                &format!("    {replacement}"),
+                1,
+            );
+            validate_image_identity_inputs(&indirect)
+                .expect_err("the image identity must be invoked as a direct shell command");
         }
     }
 
