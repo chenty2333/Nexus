@@ -54,6 +54,7 @@ COPY Cargo.toml /tmp/nexus-inputs/root.Cargo.toml
 COPY crates/cser-model/Cargo.toml /tmp/nexus-inputs/cser-model.Cargo.toml
 COPY crates/cser-transition-gates/Cargo.toml /tmp/nexus-inputs/cser-transition-gates.Cargo.toml
 COPY crates/nexus-effect-peer/Cargo.toml /tmp/nexus-inputs/nexus-effect-peer.Cargo.toml
+COPY crates/nexus-effect-peer-wire/Cargo.toml /tmp/nexus-inputs/nexus-effect-peer-wire.Cargo.toml
 COPY crates/nexus-portal-abi/Cargo.toml /tmp/nexus-inputs/nexus-portal-abi.Cargo.toml
 COPY crates/nexus-supervisor/Cargo.toml /tmp/nexus-inputs/nexus-supervisor.Cargo.toml
 COPY tools/xtask/Cargo.toml /tmp/nexus-inputs/xtask.Cargo.toml
@@ -68,6 +69,8 @@ RUN --mount=type=bind,source=.,target=/tmp/nexus-workspace,readonly \
         /tmp/nexus-workspace/crates/cser-transition-gates/Cargo.toml \
     && cmp /tmp/nexus-inputs/nexus-effect-peer.Cargo.toml \
         /tmp/nexus-workspace/crates/nexus-effect-peer/Cargo.toml \
+    && cmp /tmp/nexus-inputs/nexus-effect-peer-wire.Cargo.toml \
+        /tmp/nexus-workspace/crates/nexus-effect-peer-wire/Cargo.toml \
     && cmp /tmp/nexus-inputs/nexus-portal-abi.Cargo.toml \
         /tmp/nexus-workspace/crates/nexus-portal-abi/Cargo.toml \
     && cmp /tmp/nexus-inputs/nexus-supervisor.Cargo.toml \

@@ -3,7 +3,6 @@
 extern crate alloc;
 
 mod peer;
-mod wire;
 
+pub use nexus_effect_peer_wire::*;
 pub use peer::{ProductionEffectPeer, serve};
-pub use wire::*;

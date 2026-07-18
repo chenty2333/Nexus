@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Frozen serde types and canonical encoding for
+//! `nexus-effect-peer-native-v1`.
+//!
+//! This crate owns only the independently consumable native-v1 wire. It has
+//! no Registry, process server, ownership-log, or neutral-handoff dependency.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 

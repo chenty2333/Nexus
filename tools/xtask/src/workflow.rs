@@ -16,14 +16,15 @@ const TLA2TOOLS_LICENSE_SHA256: &str =
 const TLA2TOOLS_SHA256SUMS: &str =
     "33de7da9ce1b7fffb9d1c184021178dbb051747be48504e65c584c423721a32e  tla2tools-227f61b.jar\n";
 const ROOT_FRONTDOOR_SHA256: &str =
-    "7854983fb24c464e3ef7b1d110bc3f742ebbbbac60ed95d621fd3f09e2fee439";
+    "1041b0fd0686b413183e1ede7934496d31f46db085e0a649bcdb48d100dbf728";
 const TLA2TOOLS_LICENSE_PATHSPEC_EXCLUSION: &str =
     ":(exclude)third_party/tlaplus/1.8.0-227f61b/LICENSE.upstream";
 const TRANSITION_GATE_MANIFEST: &str = "crates/cser-transition-gates/Cargo.toml";
 const EFFECT_PEER_MANIFEST: &str = "crates/nexus-effect-peer/Cargo.toml";
+const EFFECT_PEER_WIRE_MANIFEST: &str = "crates/nexus-effect-peer-wire/Cargo.toml";
 const PORTAL_ABI_MANIFEST: &str = "crates/nexus-portal-abi/Cargo.toml";
 const SUPERVISOR_MANIFEST: &str = "crates/nexus-supervisor/Cargo.toml";
-const IMAGE_IDENTITY_INPUTS: [&str; 17] = [
+const IMAGE_IDENTITY_INPUTS: [&str; 18] = [
     "Dockerfile",
     ".dockerignore",
     "third_party/tlaplus/1.8.0-227f61b/tla2tools-227f61b.jar",
@@ -37,12 +38,13 @@ const IMAGE_IDENTITY_INPUTS: [&str; 17] = [
     "crates/cser-model/Cargo.toml",
     TRANSITION_GATE_MANIFEST,
     EFFECT_PEER_MANIFEST,
+    EFFECT_PEER_WIRE_MANIFEST,
     PORTAL_ABI_MANIFEST,
     SUPERVISOR_MANIFEST,
     "tools/xtask/Cargo.toml",
     "tools/xtask/Cargo.lock",
 ];
-const DEPENDENCY_CACHE_INPUTS: [(&str, &str); 10] = [
+const DEPENDENCY_CACHE_INPUTS: [(&str, &str); 11] = [
     ("Cargo.lock", "/tmp/nexus-locks/Cargo.lock"),
     (
         "tools/xtask/Cargo.lock",
@@ -60,6 +62,10 @@ const DEPENDENCY_CACHE_INPUTS: [(&str, &str); 10] = [
     (
         "crates/nexus-effect-peer/Cargo.toml",
         "/tmp/nexus-inputs/nexus-effect-peer.Cargo.toml",
+    ),
+    (
+        "crates/nexus-effect-peer-wire/Cargo.toml",
+        "/tmp/nexus-inputs/nexus-effect-peer-wire.Cargo.toml",
     ),
     (
         "crates/nexus-portal-abi/Cargo.toml",
@@ -1077,6 +1083,24 @@ fn validate_transition_gate_route(root: &Path) -> Result<()> {
         ),
         (
             "fn check(root: &Path) -> Result<()> {",
+            "check production effect peer native wire",
+            "check",
+            "nexus-effect-peer-wire",
+        ),
+        (
+            "fn clippy(root: &Path) -> Result<()> {",
+            "clippy production effect peer native wire",
+            "clippy",
+            "nexus-effect-peer-wire",
+        ),
+        (
+            "fn test(root: &Path) -> Result<()> {",
+            "test production effect peer native wire",
+            "test",
+            "nexus-effect-peer-wire",
+        ),
+        (
+            "fn check(root: &Path) -> Result<()> {",
             "check portal ABI v2 preview",
             "check",
             "nexus-portal-abi",
@@ -1156,6 +1180,10 @@ fn validate_transition_gate_route(root: &Path) -> Result<()> {
     }
     for (manifest, label) in [
         (EFFECT_PEER_MANIFEST, "production effect peer"),
+        (
+            EFFECT_PEER_WIRE_MANIFEST,
+            "production effect peer native wire",
+        ),
         (PORTAL_ABI_MANIFEST, "portal ABI v2 preview"),
         (SUPERVISOR_MANIFEST, "supervisor manager"),
     ] {
