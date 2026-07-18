@@ -1,0 +1,1350 @@
+schema = "nexus.research.production-identity.causal-fault-matrix.v1"
+rfc = "docs/rfcs/0003-causal-coverage-closure.md"
+legacy_fault_matrix = "evaluation/production-identity/fault-matrix.toml"
+legacy_fault_matrix_sha256 = "09ee81d198cb7501057884308b041d81a757005c927ce23bcb15bea0d035a13e"
+legacy_expected_count = 35
+contract_status = "prospective-no-runtime-evidence"
+expected_count = 66
+allowed_evidence_states = ["planned", "source-mapped"]
+planned_count = 66
+source_mapped_count = 0
+observed_count = 0
+production_execution_observed = false
+one_vcpu_observed = false
+two_vcpu_observed = false
+four_vcpu_observed = false
+real_irq_observed = false
+
+required_tranches = [
+  "queue-dma-preparation",
+  "task-admission",
+  "filesystem-service-queue",
+  "guest-continuation",
+  "guest-reply",
+  "deadline-retry-generation",
+  "request-derived-page-fault",
+]
+required_boundaries = [
+  "queue-dma-preparation",
+  "task-admission",
+  "filesystem-service-request-queue",
+  "guest-waiter",
+  "guest-waker",
+  "guest-reply",
+  "timer-deadline",
+  "page-fault",
+]
+required_projection_fields = [
+  "root",
+  "obligation",
+  "reverse-index",
+  "publication",
+  "terminal",
+  "typed-credit",
+]
+required_identity_fields = [
+  "registry-instance",
+  "scope-id",
+  "scope-generation",
+  "root-effect",
+  "immutable-parent",
+  "obligation-id",
+  "obligation-generation",
+  "obligation-kind",
+  "authority-epoch",
+  "domain-id",
+  "binding-epoch",
+  "nonce",
+]
+allowed_cpu_requirements = [
+  "single-production-actor",
+  "ordered-one-vcpu-plus-smp-refinement",
+  "controlled-two-and-four-vcpu-race",
+  "service-supervisor-recovery-actors",
+]
+allowed_irq_requirements = [
+  "task-context-irqs-enabled",
+  "task-context-irqs-disabled",
+  "raw-irq-tcb-ticket-match-required",
+  "crosses-task-and-irq-context",
+  "not-applicable",
+]
+allowed_retained_dispositions = [
+  "not-allowed-before-external-mutation",
+  "required-on-uncertain-external-mutation",
+  "required-until-explicit-reconciliation",
+  "typed-rejection-projection-unchanged",
+  "terminal-or-retained-single-winner",
+]
+
+# This is a prospective falsification contract. `source_paths` names context
+# files only. Each `production_symbols` entry and `target_injection_point` is a
+# reviewed future target, not evidence that the symbol or hook exists. A row
+# remains `planned-contract-no-production-hook` until a separate reviewed change
+# binds and executes the normal production call site; file existence alone can
+# never promote it to source-mapped or observed evidence.
+
+[[cell]]
+id = "qdp-reservation-failure-before-hardware"
+tranche = "queue-dma-preparation"
+boundary = "queue-dma-preparation"
+failure_window = "Registry reservation fails before descriptors, pins, or DMA mappings are externally mutated."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:qdp-reservation-failure-before-hardware"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reserve_device_preparation"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["device-id", "queue-id", "device-generation", "operation-digest", "preparation-nonce"]
+cpu_requirement = "ordered-one-vcpu-plus-smp-refinement"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "not-allowed-before-external-mutation"
+expected_disposition = "Typed reservation failure; no hardware owner or reverse index exists and all reserved class credits are returned."
+before = { root = "root:open", obligation = "obligation:absent", reverse_index = "reverse-index:absent", publication = "publication:none", terminal = "terminal:none", typed_credit = "typed-credit:device-preparation=available" }
+after = { root = "root:open-or-revoked", obligation = "obligation:absent", reverse_index = "reverse-index:absent", publication = "publication:none", terminal = "terminal:typed-reservation-failure", typed_credit = "typed-credit:device-preparation=returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/device_flight.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "crates/nexus-ostd-virtio/src/production.rs", "crates/nexus-ostd-virtio/src/dma.rs"]
+
+[[cell]]
+id = "qdp-revoke-or-crash-after-reservation"
+tranche = "queue-dma-preparation"
+boundary = "queue-dma-preparation"
+failure_window = "Root revoke or service crash wins after preparation reservation and before hardware preparation."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:qdp-revoke-or-crash-after-reservation"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::cancel_device_preparation_with_apply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["device-id", "queue-id", "device-generation", "operation-digest", "preparation-nonce"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "not-allowed-before-external-mutation"
+expected_disposition = "The exact unused ticket terminalizes once, reverse indexes are removed, and reservation credits return without retained hardware."
+before = { root = "root:open-or-revoking", obligation = "obligation:preparation-reserved", reverse_index = "reverse-index:ticket-installed", publication = "publication:none", terminal = "terminal:none", typed_credit = "typed-credit:queue-slot=1;pinned-page=3;dma-mapping=3" }
+after = { root = "root:revoked-or-crashed", obligation = "obligation:terminal-cancelled", reverse_index = "reverse-index:removed", publication = "publication:none", terminal = "terminal:single-cancel-receipt", typed_credit = "typed-credit:queue-slot=returned;pinned-page=returned;dma-mapping=returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/device_flight.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "crates/nexus-ostd-virtio/src/production.rs", "crates/nexus-ostd-virtio/src/dma.rs"]
+
+[[cell]]
+id = "qdp-hardware-failure-before-materialization"
+tranche = "queue-dma-preparation"
+boundary = "queue-dma-preparation"
+failure_window = "Hardware preparation returns a typed failure before Registry materialization."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:qdp-hardware-failure-before-materialization"
+production_symbols = ["kernel/nexus-ostd/src/personality/linux_fs.rs::prepare_device_with_registry_ticket", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retain_device_preparation"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["device-id", "queue-id", "device-generation", "operation-digest", "preparation-nonce", "descriptor-token", "device-session"]
+cpu_requirement = "ordered-one-vcpu-plus-smp-refinement"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Proven quiescence cancels and returns credits; uncertain partial hardware mutation retains the exact ticket and hardware owner."
+before = { root = "root:open", obligation = "obligation:preparation-reserved", reverse_index = "reverse-index:ticket-installed", publication = "publication:none", terminal = "terminal:none", typed_credit = "typed-credit:queue-slot=1;pinned-page=3;dma-mapping=3" }
+after = { root = "root:open-or-revoked", obligation = "obligation:terminal-or-retained", reverse_index = "reverse-index:removed-or-retained-owner", publication = "publication:none", terminal = "terminal:typed-device-failure-or-retained", typed_credit = "typed-credit:queue-slot=returned-or-1;pinned-page=returned-or-3;dma-mapping=returned-or-3" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/device_flight.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "crates/nexus-ostd-virtio/src/production.rs", "crates/nexus-ostd-virtio/src/dma.rs"]
+
+[[cell]]
+id = "qdp-crash-after-hardware-before-materialization"
+tranche = "queue-dma-preparation"
+boundary = "queue-dma-preparation"
+failure_window = "Adapter crashes after hardware preparation but before the cohort is materialized in the Registry."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:qdp-crash-after-hardware-before-materialization"
+production_symbols = ["kernel/nexus-ostd/src/personality/linux_fs.rs::prepare_device_with_registry_ticket", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::retain_device_preparation"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["device-id", "queue-id", "device-generation", "operation-digest", "preparation-nonce", "descriptor-token", "device-session"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "required-on-uncertain-external-mutation"
+expected_disposition = "Recovery discovers one retained preparation with the exact hardware owner; credits and mappings cannot be dropped or substituted."
+before = { root = "root:open", obligation = "obligation:hardware-prepared-unmaterialized", reverse_index = "reverse-index:ticket-and-hardware-owner", publication = "publication:hardware-private", terminal = "terminal:none", typed_credit = "typed-credit:queue-slot=1;pinned-page=3;dma-mapping=3" }
+after = { root = "root:open-or-crashed", obligation = "obligation:retained-preparation", reverse_index = "reverse-index:retained-owner-discoverable", publication = "publication:no-registry-cohort", terminal = "terminal:retained-recovery-required", typed_credit = "typed-credit:queue-slot=1-retained;pinned-page=3-retained;dma-mapping=3-retained" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/device_flight.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "crates/nexus-ostd-virtio/src/production.rs", "crates/nexus-ostd-virtio/src/dma.rs"]
+
+[[cell]]
+id = "qdp-materialization-validation-or-allocation-failure"
+tranche = "queue-dma-preparation"
+boundary = "queue-dma-preparation"
+failure_window = "Cohort materialization rejects prepared identity or cannot allocate the exact descendants."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:qdp-materialization-validation-or-allocation-failure"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::materialize_device_cohort_from_preparation"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["device-id", "queue-id", "device-generation", "operation-digest", "preparation-nonce", "descriptor-token", "device-session"]
+cpu_requirement = "ordered-one-vcpu-plus-smp-refinement"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-on-uncertain-external-mutation"
+expected_disposition = "No partial Registry cohort publishes; the prepared hardware and original credits remain under one retained owner until cancellation reconciles."
+before = { root = "root:open", obligation = "obligation:hardware-prepared-unmaterialized", reverse_index = "reverse-index:preparation-ticket", publication = "publication:hardware-private", terminal = "terminal:none", typed_credit = "typed-credit:queue-slot=1;pinned-page=3;dma-mapping=3" }
+after = { root = "root:open-or-revoked", obligation = "obligation:retained-preparation", reverse_index = "reverse-index:retained-owner-only", publication = "publication:no-partial-cohort", terminal = "terminal:typed-validation-or-allocation-failure", typed_credit = "typed-credit:queue-slot=1-retained;pinned-page=3-retained;dma-mapping=3-retained" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/device_flight.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "crates/nexus-ostd-virtio/src/production.rs", "crates/nexus-ostd-virtio/src/dma.rs"]
+
+[[cell]]
+id = "qdp-cancellation-uncertain-quiescence"
+tranche = "queue-dma-preparation"
+boundary = "queue-dma-preparation"
+failure_window = "Cancellation fails or cannot prove device and IOTLB quiescence after hardware mutation."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:qdp-cancellation-uncertain-quiescence"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::cancel_device_preparation_with_apply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["device-id", "queue-id", "device-generation", "operation-digest", "preparation-nonce", "descriptor-token", "device-session"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The exact hardware owner, frame and mapping credits remain queryable and quarantined until reset or IOTLB completion proves reuse safe."
+before = { root = "root:revoking-or-crashed", obligation = "obligation:cancellation-pending", reverse_index = "reverse-index:ticket-and-hardware-owner", publication = "publication:hardware-may-be-visible", terminal = "terminal:none", typed_credit = "typed-credit:queue-slot=1;pinned-page=3;dma-mapping=3" }
+after = { root = "root:revoked-or-crashed", obligation = "obligation:retained-cancellation", reverse_index = "reverse-index:retained-owner-discoverable", publication = "publication:quarantined", terminal = "terminal:retained-quiescence-unknown", typed_credit = "typed-credit:queue-slot=1-retained;pinned-page=3-retained;dma-mapping=3-retained" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/device_flight.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "crates/nexus-ostd-virtio/src/production.rs", "crates/nexus-ostd-virtio/src/dma.rs"]
+
+[[cell]]
+id = "qdp-duplicate-materialize-or-cancel"
+tranche = "queue-dma-preparation"
+boundary = "queue-dma-preparation"
+failure_window = "The same preparation ticket is replayed for materialization or cancellation after a winner exists."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:qdp-duplicate-materialize-or-cancel"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::materialize_device_cohort_from_preparation", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::cancel_device_preparation_with_apply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["device-id", "queue-id", "device-generation", "operation-digest", "preparation-nonce", "descriptor-token", "device-session"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Replay returns a typed duplicate or stale-ticket receipt without changing the winning cohort, tombstone, indexes, or credits."
+before = { root = "root:any-nonfreed", obligation = "obligation:materialized-cancelled-or-retained", reverse_index = "reverse-index:winner-installed", publication = "publication:winner-only", terminal = "terminal:winner-recorded", typed_credit = "typed-credit:device-preparation=owned-by-winner" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-duplicate", terminal = "terminal:typed-duplicate-rejection", typed_credit = "typed-credit:device-preparation=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/device_flight.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "crates/nexus-ostd-virtio/src/production.rs", "crates/nexus-ostd-virtio/src/dma.rs"]
+
+[[cell]]
+id = "qdp-wrong-preparation-identity"
+tranche = "queue-dma-preparation"
+boundary = "queue-dma-preparation"
+failure_window = "Materialize or cancel presents a wrong root, binding, device session, queue, descriptor, or generation."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:qdp-wrong-preparation-identity"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::materialize_device_cohort_from_preparation", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::cancel_device_preparation_with_apply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["device-id", "queue-id", "device-generation", "operation-digest", "preparation-nonce", "descriptor-token", "device-session"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Complete identity mismatch is rejected before authority transfer; the legitimate preparation remains owned and queryable."
+before = { root = "root:open-or-revoking", obligation = "obligation:preparation-owned", reverse_index = "reverse-index:legitimate-identity", publication = "publication:at-most-one", terminal = "terminal:none-or-winner", typed_credit = "typed-credit:device-preparation=legitimate-owner" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-forged-cohort", terminal = "terminal:typed-identity-rejection", typed_credit = "typed-credit:device-preparation=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/device_flight.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "crates/nexus-ostd-virtio/src/production.rs", "crates/nexus-ostd-virtio/src/dma.rs"]
+
+[[cell]]
+id = "task-reserved-before-construction-failure"
+tranche = "task-admission"
+boundary = "task-admission"
+failure_window = "Task construction fails after TaskWorkLease reservation but before an exact task instance exists."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:task-reserved-before-construction-failure"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reserve_task_work"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-role", "task-instance", "task-generation"]
+cpu_requirement = "ordered-one-vcpu-plus-smp-refinement"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "not-allowed-before-external-mutation"
+expected_disposition = "The reserved lease terminalizes with typed construction failure and returns its task-admission credit without a runnable publication."
+before = { root = "root:open", obligation = "obligation:task-work-reserved", reverse_index = "reverse-index:lease-only", publication = "publication:not-runnable", terminal = "terminal:none", typed_credit = "typed-credit:task-admission=1" }
+after = { root = "root:open-or-revoked", obligation = "obligation:terminal-construction-failure", reverse_index = "reverse-index:removed", publication = "publication:not-runnable", terminal = "terminal:task-construction-failure", typed_credit = "typed-credit:task-admission=returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "task-constructed-before-runnable-failure"
+tranche = "task-admission"
+boundary = "task-admission"
+failure_window = "Admission fails after exact task construction but before runnable publication."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:task-constructed-before-runnable-failure"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::admit_task"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-role", "task-instance", "task-generation"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-disabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "The unpublished task is isolated or destroyed, the exact reverse index is removed, and one terminal receipt returns the credit."
+before = { root = "root:open", obligation = "obligation:task-constructed-unadmitted", reverse_index = "reverse-index:exact-task-installed", publication = "publication:not-runnable", terminal = "terminal:none", typed_credit = "typed-credit:task-admission=1" }
+after = { root = "root:open-or-revoked", obligation = "obligation:terminal-isolated", reverse_index = "reverse-index:removed", publication = "publication:not-runnable", terminal = "terminal:task-isolation-receipt", typed_credit = "typed-credit:task-admission=returned-or-retained-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "task-crash-immediately-after-runnable"
+tranche = "task-admission"
+boundary = "task-admission"
+failure_window = "The admitted task crashes immediately after runnable publication."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:task-crash-immediately-after-runnable"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::finish_or_isolate_task"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-role", "task-instance", "task-generation"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "A reaper or supervisor discovers the admitted lease by exact task instance and produces one exit or isolation receipt."
+before = { root = "root:open", obligation = "obligation:task-admitted", reverse_index = "reverse-index:exact-task-live", publication = "publication:runnable", terminal = "terminal:none", typed_credit = "typed-credit:task-admission=1" }
+after = { root = "root:crashed-or-recovering", obligation = "obligation:terminal-exit-or-isolation", reverse_index = "reverse-index:removed-after-ack", publication = "publication:not-runnable", terminal = "terminal:single-task-receipt", typed_credit = "typed-credit:task-admission=returned-or-retained-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "task-exit-before-terminal-ack"
+tranche = "task-admission"
+boundary = "task-admission"
+failure_window = "The task exits after scheduler removal but before Registry terminal acknowledgement."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:task-exit-before-terminal-ack"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::finish_or_isolate_task"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-role", "task-instance", "task-generation"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The exited task lease stays discoverable and retained until a reaper or supervisor acknowledges the exact disposition."
+before = { root = "root:open-or-crashed", obligation = "obligation:task-exited-unacknowledged", reverse_index = "reverse-index:exact-exited-task", publication = "publication:not-runnable", terminal = "terminal:pending-ack", typed_credit = "typed-credit:task-admission=1" }
+after = { root = "root:open-crashed-or-recovering", obligation = "obligation:terminal-after-ack", reverse_index = "reverse-index:removed-after-ack", publication = "publication:not-runnable", terminal = "terminal:single-exit-receipt", typed_credit = "typed-credit:task-admission=returned-or-retained-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "task-root-revoke-vs-admission"
+tranche = "task-admission"
+boundary = "task-admission"
+failure_window = "Root revoke races the transition that admits and publishes a task runnable."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:task-root-revoke-vs-admission"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::admit_task"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-role", "task-instance", "task-generation"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-disabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Admission or revoke has one ordered winner; a losing publication is prevented or immediately isolated under the same lease."
+before = { root = "root:open-or-revoking", obligation = "obligation:task-reserved-or-admitting", reverse_index = "reverse-index:exact-task", publication = "publication:not-runnable-or-transitioning", terminal = "terminal:none", typed_credit = "typed-credit:task-admission=1" }
+after = { root = "root:open-with-admitted-child-or-revoked", obligation = "obligation:admitted-or-terminal-isolated", reverse_index = "reverse-index:live-only-if-admitted", publication = "publication:runnable-only-for-winner", terminal = "terminal:single-winner-receipt", typed_credit = "typed-credit:task-admission=1-live-or-returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "task-stale-binding-admission"
+tranche = "task-admission"
+boundary = "task-admission"
+failure_window = "A task lease carrying an old service binding epoch attempts admission."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:task-stale-binding-admission"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::admit_task"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-role", "task-instance", "task-generation"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-disabled"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "The stale binding is rejected before runnable publication and cannot consume authority belonging to the current service."
+before = { root = "root:open-or-recovering", obligation = "obligation:reserved-under-stale-binding", reverse_index = "reverse-index:stale-task-private", publication = "publication:not-runnable", terminal = "terminal:none", typed_credit = "typed-credit:task-admission=1" }
+after = { root = "root:unchanged", obligation = "obligation:typed-stale-binding-rejection", reverse_index = "reverse-index:removed", publication = "publication:not-runnable", terminal = "terminal:stale-binding-receipt", typed_credit = "typed-credit:task-admission=returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "task-repeated-replacement-crash"
+tranche = "task-admission"
+boundary = "task-admission"
+failure_window = "Successive replacement service tasks crash before recovery completes."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:task-repeated-replacement-crash"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::finish_or_isolate_task"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-role", "task-instance", "task-generation", "replacement-attempt"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "Every generation has one lease and terminal receipt; bounded attempts end in typed quarantine with no orphan task-admission credit."
+before = { root = "root:recovering", obligation = "obligation:replacement-task-admitted", reverse_index = "reverse-index:exact-replacement-generation", publication = "publication:replacement-runnable", terminal = "terminal:none", typed_credit = "typed-credit:task-admission=1;replacement-attempt=bounded" }
+after = { root = "root:recovering-or-quarantined", obligation = "obligation:terminal-per-generation", reverse_index = "reverse-index:no-dead-generation", publication = "publication:no-dead-task-runnable", terminal = "terminal:crash-receipt-or-attempt-exhausted", typed_credit = "typed-credit:task-admission=returned-or-retained-1;replacement-attempt=advanced-or-exhausted" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "task-generation-substitution"
+tranche = "task-admission"
+boundary = "task-admission"
+failure_window = "A different task instance or generation is substituted for the lease's exact task identity."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:task-generation-substitution"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::admit_task"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-role", "task-instance", "task-generation"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-disabled"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Substitution is rejected before runnable authority transfers; the legitimate lease remains unchanged or is explicitly terminalized."
+before = { root = "root:open-or-recovering", obligation = "obligation:reserved-for-exact-task", reverse_index = "reverse-index:exact-task-only", publication = "publication:not-runnable", terminal = "terminal:none", typed_credit = "typed-credit:task-admission=1" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged-or-explicitly-rejected", reverse_index = "reverse-index:no-substitute", publication = "publication:no-substitute-runnable", terminal = "terminal:typed-generation-rejection", typed_credit = "typed-credit:task-admission=unchanged-or-returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "svc-reserved-before-queue-write-crash"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "The coordinator crashes after Registry request reservation but before the local queue write."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-reserved-before-queue-write-crash"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reserve_service_request"]
+continuation_phase = "reserved"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["descriptor-digest", "service-binding", "request-nonce", "continuation-slot"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "not-allowed-before-external-mutation"
+expected_disposition = "Recovery terminalizes the undispatched request or retries its exact ticket; no queue selector is fabricated and request credit is conserved."
+before = { root = "root:open", obligation = "obligation:service-request-reserved-continuation-slot-reserved", reverse_index = "reverse-index:request-ticket", publication = "publication:queue-empty", terminal = "terminal:none", typed_credit = "typed-credit:service-request=1;guest-continuation=1-reserved" }
+after = { root = "root:crashed-or-recovering", obligation = "obligation:discoverable-reserved-slot-or-terminal-consumed", reverse_index = "reverse-index:ticket-or-removed", publication = "publication:queue-empty", terminal = "terminal:typed-crash-cancel-or-retry", typed_credit = "typed-credit:service-request=1-live-or-returned;guest-continuation=1-live-or-returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "svc-queue-written-before-arm-crash"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "The coordinator crashes after writing an opaque queue selector but before arming visibility."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-queue-written-before-arm-crash"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::enqueue_service_request_with_apply"]
+continuation_phase = "reserved"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["descriptor-digest", "service-binding", "queue-selector", "request-nonce", "continuation-slot"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The unarmed selector remains non-consumable; recovery either arms the exact rooted continuation or removes and terminalizes it."
+before = { root = "root:open", obligation = "obligation:request-enqueued-unarmed-continuation-slot-reserved", reverse_index = "reverse-index:queue-selector-to-request", publication = "publication:selector-private", terminal = "terminal:none", typed_credit = "typed-credit:service-request=1;guest-continuation=1-reserved" }
+after = { root = "root:crashed-or-recovering", obligation = "obligation:enqueued-unarmed-reserved-slot-or-terminal-consumed", reverse_index = "reverse-index:discoverable-or-removed", publication = "publication:not-consumable", terminal = "terminal:retry-arm-or-cancel-receipt", typed_credit = "typed-credit:service-request=1-live-or-returned;guest-continuation=1-live-or-returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "svc-dequeued-before-claim-crash"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "A service removes the selector from the queue and crashes before claiming the rooted request."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-dequeued-before-claim-crash"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::claim_service_request"]
+continuation_phase = "armed"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["descriptor-digest", "service-binding", "queue-selector", "request-nonce", "continuation-slot", "continuation-selector", "continuation-obligation"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The Registry still exposes one enqueued unclaimed request; replacement may reclaim it with current binding or terminalize it."
+before = { root = "root:open", obligation = "obligation:enqueued-request-continuation-armed", reverse_index = "reverse-index:selector-to-request", publication = "publication:queue-dequeued", terminal = "terminal:none", typed_credit = "typed-credit:service-request=1;guest-continuation=1" }
+after = { root = "root:crashed-or-recovering", obligation = "obligation:discoverable-unclaimed-continuation-armed", reverse_index = "reverse-index:request-remains", publication = "publication:no-duplicate-queue-entry", terminal = "terminal:pending-reclaim-or-cancel", typed_credit = "typed-credit:service-request=1;guest-continuation=1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "svc-claim-validation-before-child-publication"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "Claim validation succeeds but the filesystem child cannot be published atomically."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-claim-validation-before-child-publication"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::claim_service_request"]
+continuation_phase = "armed"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["descriptor-digest", "service-binding", "queue-selector", "request-nonce", "continuation-slot", "continuation-selector", "continuation-obligation"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-disabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Claim and filesystem-child creation are failure atomic: either both publish once or the request remains unclaimed with unchanged credits."
+before = { root = "root:open", obligation = "obligation:enqueued-request-validating-continuation-armed", reverse_index = "reverse-index:request-only", publication = "publication:no-filesystem-child", terminal = "terminal:none", typed_credit = "typed-credit:service-request=1;filesystem-effect=available" }
+after = { root = "root:open-or-revoked", obligation = "obligation:claimed-with-child-or-unclaimed-continuation-armed", reverse_index = "reverse-index:complete-claim-or-request-only", publication = "publication:one-child-or-none", terminal = "terminal:typed-claim-failure-or-live", typed_credit = "typed-credit:service-request=1;filesystem-effect=1-or-available" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "svc-claim-before-delayed-command-installation"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "The service claim and filesystem child exist, then the service crashes before installing a delayed Prepare command."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-claim-before-delayed-command-installation"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::deliver_delayed_service_command"]
+continuation_phase = "armed"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["descriptor-digest", "service-binding", "request-nonce", "command-digest", "continuation-slot", "continuation-selector", "continuation-obligation"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The claimed request remains queryable without a command child; replacement installs exactly one fresh command or aborts the claim."
+before = { root = "root:open", obligation = "obligation:claimed-filesystem-child-continuation-armed", reverse_index = "reverse-index:service-claim-installed", publication = "publication:child-visible-command-absent", terminal = "terminal:none", typed_credit = "typed-credit:service-request=1;delayed-command=available" }
+after = { root = "root:crashed-or-recovering", obligation = "obligation:claim-rebindable-continuation-armed", reverse_index = "reverse-index:claim-discoverable", publication = "publication:no-phantom-command", terminal = "terminal:replacement-install-or-abort", typed_credit = "typed-credit:service-request=1-or-returned;delayed-command=available-or-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "svc-command-before-rebind"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "A delayed command is delivered while the old service binding still owns the claim and recovery rebind has not occurred."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-command-before-rebind"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::deliver_delayed_service_command"]
+continuation_phase = "armed"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["descriptor-digest", "service-binding", "portal-generation", "command-digest", "command-nonce", "continuation-slot", "continuation-selector", "continuation-obligation"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Only the currently authorized old binding may consume it; crash fencing retains or rejects delivery without transferring to an unbound replacement."
+before = { root = "root:open-or-crashed", obligation = "obligation:delayed-command-live-continuation-armed", reverse_index = "reverse-index:command-to-old-binding", publication = "publication:command-pending", terminal = "terminal:none", typed_credit = "typed-credit:delayed-command=1" }
+after = { root = "root:open-crashed-or-recovering", obligation = "obligation:delivered-retained-or-rejected-continuation-armed", reverse_index = "reverse-index:winner-only", publication = "publication:at-most-one-delivery", terminal = "terminal:delivery-receipt-or-retained", typed_credit = "typed-credit:delayed-command=returned-or-retained-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "svc-command-after-rebind"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "The replacement binding receives a delayed command after claim rebind."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-command-after-rebind"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::deliver_delayed_service_command"]
+continuation_phase = "armed"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["descriptor-digest", "service-binding", "portal-generation", "command-digest", "command-nonce", "continuation-slot", "continuation-selector", "continuation-obligation"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "The command's authority is validated against the new binding and portal generation, then delivered once or terminalized with a typed rejection."
+before = { root = "root:recovering", obligation = "obligation:delayed-command-rebound-continuation-armed", reverse_index = "reverse-index:command-to-new-binding", publication = "publication:command-pending", terminal = "terminal:none", typed_credit = "typed-credit:delayed-command=1" }
+after = { root = "root:recovering-or-open", obligation = "obligation:delivered-or-terminal-continuation-armed", reverse_index = "reverse-index:removed-after-winner", publication = "publication:at-most-one-delivery", terminal = "terminal:delivery-or-rejection-receipt", typed_credit = "typed-credit:delayed-command=returned-or-retained-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "svc-stale-command-delivery"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "A sender presents a delayed command from a stale task, binding epoch, portal generation, target, or digest."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-stale-command-delivery"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::deliver_delayed_service_command"]
+continuation_phase = "armed"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["sender-task", "service-binding", "target-effect", "portal-generation", "command-digest", "continuation-slot", "continuation-selector", "continuation-obligation"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Stale delivery produces a typed terminal rejection and cannot clear, replace, or execute the current command."
+before = { root = "root:open-or-recovering", obligation = "obligation:current-command-live-continuation-armed", reverse_index = "reverse-index:current-command-identity", publication = "publication:current-command-pending", terminal = "terminal:none", typed_credit = "typed-credit:delayed-command=1" }
+after = { root = "root:unchanged", obligation = "obligation:current-command-and-continuation-unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-stale-delivery", terminal = "terminal:typed-stale-command-rejection", typed_credit = "typed-credit:delayed-command=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "svc-duplicate-dequeue-claim-or-delivery"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "A queue selector, claim, or delayed command is replayed after the corresponding winner."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-duplicate-dequeue-claim-or-delivery"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reconcile_service_request"]
+continuation_phase = "armed-or-consumed"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["descriptor-digest", "service-binding", "queue-selector", "command-nonce", "continuation-slot", "continuation-selector", "continuation-obligation"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Replay observes the recorded winner and returns a typed duplicate response without creating a second child, claim, or delivery."
+before = { root = "root:any-nonfreed", obligation = "obligation:queued-claimed-delivered-or-terminal-continuation-armed-or-consumed", reverse_index = "reverse-index:winner-installed", publication = "publication:winner-only", terminal = "terminal:winner-recorded", typed_credit = "typed-credit:service-request=owned-by-winner;delayed-command=owned-by-winner" }
+after = { root = "root:unchanged", obligation = "obligation:continuation-phase-unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-duplicate", terminal = "terminal:typed-duplicate-rejection", typed_credit = "typed-credit:service-request=unchanged;delayed-command=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "svc-coordinator-exit"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "The coordinator exits while requests or delayed commands remain queued, claimed, or pending."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-coordinator-exit"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reconcile_service_request"]
+continuation_phase = "armed"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["coordinator-task", "service-binding", "request-nonce", "command-nonce", "continuation-slot", "continuation-selector", "continuation-obligation"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "Coordinator lifetime cannot own authority: every live request and command remains rooted and queryable for replacement adoption or abort."
+before = { root = "root:open-or-crashed", obligation = "obligation:queued-claimed-or-command-live-continuation-armed", reverse_index = "reverse-index:registry-owned", publication = "publication:bounded-live-work", terminal = "terminal:none", typed_credit = "typed-credit:service-request=live-count;delayed-command=live-count" }
+after = { root = "root:recovering-or-revoked", obligation = "obligation:rebindable-armed-retained-or-terminal-consumed", reverse_index = "reverse-index:no-process-owned-authority", publication = "publication:no-orphan-selector", terminal = "terminal:adopt-abort-or-retained", typed_credit = "typed-credit:service-request=conserved;delayed-command=conserved" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "svc-root-revoke-queued-or-claimed"
+tranche = "filesystem-service-queue"
+boundary = "filesystem-service-request-queue"
+failure_window = "Root revoke races a request that is queued or already claimed by a service."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:svc-root-revoke-queued-or-claimed"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reconcile_service_request"]
+continuation_phase = "armed"
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["descriptor-digest", "service-binding", "queue-selector", "request-nonce", "continuation-slot", "continuation-selector", "continuation-obligation"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Revoke fences new claim or delivery, then terminalizes clean work or retains externally uncertain descendants under the same root."
+before = { root = "root:open-or-revoking", obligation = "obligation:queued-or-claimed-continuation-armed", reverse_index = "reverse-index:request-and-claim", publication = "publication:queue-or-child-visible", terminal = "terminal:none", typed_credit = "typed-credit:service-request=1;delayed-command=0-or-1;guest-continuation=1" }
+after = { root = "root:revoked", obligation = "obligation:terminal-continuation-consumed-or-retained-descendants", reverse_index = "reverse-index:removed-or-retained-owner", publication = "publication:no-new-delivery", terminal = "terminal:closure-or-retained-receipt", typed_credit = "typed-credit:service-request=returned-or-retained;delayed-command=returned-or-retained;guest-continuation=returned-or-retained" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "kernel/nexus-ostd/src/cser/effect.rs"]
+
+[[cell]]
+id = "cont-guest-exit-before-park"
+tranche = "guest-continuation"
+boundary = "guest-waiter"
+failure_window = "The guest task exits after continuation reservation but before raw park."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:cont-guest-exit-before-park"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reserve_guest_continuation"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["guest-task", "vm-generation", "source-service-binding", "wake-nonce"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "not-allowed-before-external-mutation"
+expected_disposition = "The continuation terminalizes without parking or wake publication and returns its credit exactly once."
+before = { root = "root:open-or-crashed", obligation = "obligation:continuation-reserved", reverse_index = "reverse-index:guest-task-to-continuation", publication = "publication:not-parked", terminal = "terminal:none", typed_credit = "typed-credit:guest-continuation=1" }
+after = { root = "root:open-crashed-or-revoked", obligation = "obligation:terminal-guest-exit", reverse_index = "reverse-index:removed", publication = "publication:no-park-no-wake", terminal = "terminal:guest-exit-receipt", typed_credit = "typed-credit:guest-continuation=returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "cont-revoke-before-park"
+tranche = "guest-continuation"
+boundary = "guest-waiter"
+failure_window = "Root revoke wins after continuation reservation and before the guest parks."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:cont-revoke-before-park"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reserve_guest_continuation"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["guest-task", "vm-generation", "source-service-binding", "wake-nonce"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "not-allowed-before-external-mutation"
+expected_disposition = "Revoke fences park publication, terminalizes the unused continuation, and returns its credit without an inferred wake."
+before = { root = "root:open-or-revoking", obligation = "obligation:continuation-reserved", reverse_index = "reverse-index:guest-task-to-continuation", publication = "publication:not-parked", terminal = "terminal:none", typed_credit = "typed-credit:guest-continuation=1" }
+after = { root = "root:revoked", obligation = "obligation:terminal-revoked-before-park", reverse_index = "reverse-index:removed", publication = "publication:no-park-no-wake", terminal = "terminal:revoke-receipt", typed_credit = "typed-credit:guest-continuation=returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "cont-service-crash-before-stage"
+tranche = "guest-continuation"
+boundary = "guest-waker"
+failure_window = "The source service crashes while the guest is parked but before staging a wake."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:cont-service-crash-before-stage"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::stage_guest_wake"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["guest-task", "vm-generation", "source-service-binding", "wake-nonce"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The rooted continuation remains discoverable; only an authorized replacement may stage the same logical wake or abort it."
+before = { root = "root:open-or-crashed", obligation = "obligation:continuation-parked-unstaged", reverse_index = "reverse-index:guest-task-and-source-binding", publication = "publication:guest-parked", terminal = "terminal:none", typed_credit = "typed-credit:guest-continuation=1" }
+after = { root = "root:recovering-or-revoked", obligation = "obligation:rebindable-or-retained-continuation", reverse_index = "reverse-index:continuation-discoverable", publication = "publication:no-wake-yet", terminal = "terminal:replacement-stage-abort-or-retained", typed_credit = "typed-credit:guest-continuation=1-or-returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "cont-crash-after-stage-before-raw-wake"
+tranche = "guest-continuation"
+boundary = "guest-waker"
+failure_window = "The service crashes after wake staging commits but before raw OSTD unpark."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:cont-crash-after-stage-before-raw-wake"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::stage_guest_wake"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["guest-task", "vm-generation", "source-service-binding", "outcome-digest", "wake-nonce"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The staged wake ticket survives and replacement retries raw unpark with that exact ticket; no second semantic wake is created."
+before = { root = "root:open-or-crashed", obligation = "obligation:wake-staged", reverse_index = "reverse-index:wake-ticket-and-guest-task", publication = "publication:outcome-before-unpark", terminal = "terminal:none", typed_credit = "typed-credit:guest-continuation=1" }
+after = { root = "root:recovering-or-revoked", obligation = "obligation:staged-wake-retryable", reverse_index = "reverse-index:exact-ticket-discoverable", publication = "publication:raw-wake-not-acknowledged", terminal = "terminal:pending-retry-or-retained", typed_credit = "typed-credit:guest-continuation=1-retained" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "cont-crash-after-raw-wake-before-ack"
+tranche = "guest-continuation"
+boundary = "guest-waker"
+failure_window = "The service crashes after raw unpark but before acknowledging the staged wake ticket."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:cont-crash-after-raw-wake-before-ack"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_guest_wake"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["guest-task", "vm-generation", "source-service-binding", "outcome-digest", "wake-nonce"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-on-uncertain-external-mutation"
+expected_disposition = "The staged obligation stays retained; exact-ticket retry may repeat raw unpark but can terminalize only one semantic continuation."
+before = { root = "root:open-or-crashed", obligation = "obligation:wake-staged-raw-unpark-applied", reverse_index = "reverse-index:exact-wake-ticket", publication = "publication:raw-wake-may-be-visible", terminal = "terminal:ack-pending", typed_credit = "typed-credit:guest-continuation=1" }
+after = { root = "root:recovering-or-revoked", obligation = "obligation:retained-wake-ack", reverse_index = "reverse-index:ticket-remains", publication = "publication:one-semantic-wake", terminal = "terminal:retry-ack-or-retained", typed_credit = "typed-credit:guest-continuation=1-retained-or-returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "cont-duplicate-wake-or-ack"
+tranche = "guest-continuation"
+boundary = "guest-waker"
+failure_window = "Raw wake or Registry acknowledgement is replayed after the continuation winner."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:cont-duplicate-wake-or-ack"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::acknowledge_guest_wake"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["guest-task", "vm-generation", "source-service-binding", "outcome-digest", "wake-nonce"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Duplicate tolerance at the scheduler does not create a second semantic receipt, return credit twice, or publish another outcome."
+before = { root = "root:any-nonfreed", obligation = "obligation:wake-staged-or-terminal", reverse_index = "reverse-index:winner-ticket", publication = "publication:at-most-one-semantic-wake", terminal = "terminal:none-or-winner", typed_credit = "typed-credit:guest-continuation=1-or-returned" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-duplicate-semantic-wake", terminal = "terminal:typed-duplicate-or-existing-receipt", typed_credit = "typed-credit:guest-continuation=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "cont-stale-binding"
+tranche = "guest-continuation"
+boundary = "guest-waker"
+failure_window = "A stale source service binding attempts to stage or acknowledge the guest wake."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:cont-stale-binding"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::stage_guest_wake"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["guest-task", "vm-generation", "source-service-binding", "outcome-digest", "wake-nonce"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "The stale binding is rejected and cannot consume or replace the current continuation ticket or its outcome."
+before = { root = "root:open-or-recovering", obligation = "obligation:continuation-current-binding", reverse_index = "reverse-index:current-source-binding", publication = "publication:parked-or-staged", terminal = "terminal:none", typed_credit = "typed-credit:guest-continuation=1" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-stale-wake", terminal = "terminal:typed-stale-binding-rejection", typed_credit = "typed-credit:guest-continuation=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "cont-wrong-task-or-vm-generation"
+tranche = "guest-continuation"
+boundary = "guest-waiter"
+failure_window = "Park, stage, or acknowledgement presents the wrong guest task or VM generation."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:cont-wrong-task-or-vm-generation"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reserve_guest_continuation", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::stage_guest_wake"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["guest-task", "vm-generation", "source-service-binding", "wake-nonce"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Complete identity mismatch is rejected before park or wake authority transfers; the legitimate continuation is unchanged."
+before = { root = "root:open-or-recovering", obligation = "obligation:continuation-exact-guest", reverse_index = "reverse-index:exact-task-and-vm", publication = "publication:current-state", terminal = "terminal:none", typed_credit = "typed-credit:guest-continuation=1" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-wrong-guest-mutation", terminal = "terminal:typed-guest-identity-rejection", typed_credit = "typed-credit:guest-continuation=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "cont-replacement-retry"
+tranche = "guest-continuation"
+boundary = "guest-waker"
+failure_window = "A replacement retries an unstaged or staged continuation after source-service crash."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:cont-replacement-retry"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::query_guest_continuation"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["guest-task", "vm-generation", "source-service-binding", "outcome-digest", "wake-nonce", "replacement-generation"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "Rebind preserves the original continuation identity; replacement can stage or acknowledge it once without minting substitute authority."
+before = { root = "root:recovering", obligation = "obligation:continuation-rebindable", reverse_index = "reverse-index:original-ticket", publication = "publication:parked-staged-or-raw-woken", terminal = "terminal:none", typed_credit = "typed-credit:guest-continuation=1" }
+after = { root = "root:recovering-open-or-revoked", obligation = "obligation:terminal-or-retained", reverse_index = "reverse-index:removed-or-retained-ticket", publication = "publication:one-semantic-wake", terminal = "terminal:continuation-receipt-or-retained", typed_credit = "typed-credit:guest-continuation=returned-or-retained-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "reply-service-crash-after-device-commit"
+tranche = "guest-reply"
+boundary = "guest-reply"
+failure_window = "The service crashes after device commit but before immutable backend completion is recorded."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:reply-service-crash-after-device-commit"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::record_device_completion"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["backend-receipt-digest", "guest-task", "vm-generation", "descriptor-digest", "result-digest", "byte-range", "destination"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The committed device obligation remains discoverable and replacement recovers its exact backend result without recommit or guest publication."
+before = { root = "root:open-or-crashed", obligation = "obligation:device-committed-backend-pending", reverse_index = "reverse-index:commit-receipt-to-root", publication = "publication:no-backend-outcome-no-guest-reply", terminal = "terminal:none", typed_credit = "typed-credit:device-request=1;guest-reply=reserved" }
+after = { root = "root:recovering-or-revoked", obligation = "obligation:committed-retained-until-backend", reverse_index = "reverse-index:commit-receipt-discoverable", publication = "publication:no-guest-reply", terminal = "terminal:backend-recovery-or-retained", typed_credit = "typed-credit:device-request=retained-until-outcome;guest-reply=reserved" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs"]
+
+[[cell]]
+id = "reply-crash-after-outcome-before-create"
+tranche = "guest-reply"
+boundary = "guest-reply"
+failure_window = "The service crashes after backend outcome recording and before GuestReply creation."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:reply-crash-after-outcome-before-create"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::prepare_guest_reply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["backend-receipt-digest", "guest-task", "vm-generation", "descriptor-digest", "result-digest", "byte-range", "destination"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "Replacement finds the immutable backend receipt under the root and creates exactly one reply child without repeating device work."
+before = { root = "root:open-or-crashed", obligation = "obligation:backend-outcome-recorded-reply-absent", reverse_index = "reverse-index:backend-receipt-to-root", publication = "publication:no-guest-reply", terminal = "terminal:none", typed_credit = "typed-credit:guest-reply=reserved" }
+after = { root = "root:recovering-or-revoked", obligation = "obligation:reply-creatable-or-retained", reverse_index = "reverse-index:backend-receipt-discoverable", publication = "publication:no-guest-mutation", terminal = "terminal:replacement-create-abort-or-retained", typed_credit = "typed-credit:guest-reply=reserved-or-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs"]
+
+[[cell]]
+id = "reply-crash-after-create-before-guest-mutation"
+tranche = "guest-reply"
+boundary = "guest-reply"
+failure_window = "The service crashes after GuestReply ticket creation and before guest bytes or registers are mutated."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:reply-crash-after-create-before-guest-mutation"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::prepare_guest_reply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["backend-receipt-digest", "guest-task", "vm-generation", "descriptor-digest", "result-digest", "byte-range", "destination"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The exact reply ticket remains queryable and replacement may apply it once after revalidation; no guest-visible mutation is inferred."
+before = { root = "root:open-or-crashed", obligation = "obligation:guest-reply-prepared", reverse_index = "reverse-index:reply-ticket-to-guest", publication = "publication:no-guest-mutation", terminal = "terminal:none", typed_credit = "typed-credit:guest-reply=1" }
+after = { root = "root:recovering-or-revoked", obligation = "obligation:reply-retryable-or-retained", reverse_index = "reverse-index:exact-ticket-discoverable", publication = "publication:no-guest-mutation-yet", terminal = "terminal:replacement-apply-abort-or-retained", typed_credit = "typed-credit:guest-reply=1-or-returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs"]
+
+[[cell]]
+id = "reply-crash-after-guest-mutation-before-ack"
+tranche = "guest-reply"
+boundary = "guest-reply"
+failure_window = "The service crashes after guest bytes and registers mutate but before Registry acknowledgement."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:reply-crash-after-guest-mutation-before-ack"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::publish_guest_reply_with_apply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["backend-receipt-digest", "guest-task", "vm-generation", "descriptor-digest", "result-digest", "byte-range", "destination"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "required-on-uncertain-external-mutation"
+expected_disposition = "The guest remains fenced; only the exact ticket may idempotently reapply and acknowledge, otherwise explicit retained reconciliation is required."
+before = { root = "root:open-or-crashed", obligation = "obligation:reply-applied-unacknowledged", reverse_index = "reverse-index:exact-reply-ticket", publication = "publication:guest-mutation-may-be-visible", terminal = "terminal:ack-pending", typed_credit = "typed-credit:guest-reply=1" }
+after = { root = "root:recovering-or-revoked", obligation = "obligation:retained-reply-ack", reverse_index = "reverse-index:ticket-remains", publication = "publication:one-semantic-reply", terminal = "terminal:retry-ack-or-retained", typed_credit = "typed-credit:guest-reply=1-retained-or-returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs"]
+
+[[cell]]
+id = "reply-stale-service-binding"
+tranche = "guest-reply"
+boundary = "guest-reply"
+failure_window = "A stale service binding attempts to prepare, publish, or acknowledge the guest reply."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:reply-stale-service-binding"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::prepare_guest_reply", "kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::publish_guest_reply_with_apply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["backend-receipt-digest", "guest-task", "vm-generation", "descriptor-digest", "result-digest", "byte-range", "destination"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Stale authority is rejected before guest mutation and cannot consume the backend outcome or current reply ticket."
+before = { root = "root:open-or-recovering", obligation = "obligation:backend-outcome-or-reply-current-binding", reverse_index = "reverse-index:current-binding", publication = "publication:not-yet-or-current", terminal = "terminal:none", typed_credit = "typed-credit:guest-reply=reserved-or-1" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-stale-reply", terminal = "terminal:typed-stale-binding-rejection", typed_credit = "typed-credit:guest-reply=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs"]
+
+[[cell]]
+id = "reply-wrong-backend-receipt"
+tranche = "guest-reply"
+boundary = "guest-reply"
+failure_window = "Reply preparation presents a backend receipt from the wrong root, filesystem ancestry, commit, or result."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:reply-wrong-backend-receipt"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::prepare_guest_reply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["backend-receipt-digest", "guest-task", "vm-generation", "descriptor-digest", "result-digest", "byte-range", "destination"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Receipt mismatch is rejected before reply creation; neither result bytes nor guest state can be fabricated from copied identifiers."
+before = { root = "root:open-or-recovering", obligation = "obligation:legitimate-backend-outcome", reverse_index = "reverse-index:legitimate-receipt", publication = "publication:no-guest-reply", terminal = "terminal:none", typed_credit = "typed-credit:guest-reply=reserved" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-forged-reply", terminal = "terminal:typed-backend-receipt-rejection", typed_credit = "typed-credit:guest-reply=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs"]
+
+[[cell]]
+id = "reply-guest-remap-or-vm-generation"
+tranche = "guest-reply"
+boundary = "guest-reply"
+failure_window = "Guest destination mapping or VM generation changes after ticket preparation and before apply."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:reply-guest-remap-or-vm-generation"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::publish_guest_reply_with_apply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["backend-receipt-digest", "guest-task", "vm-generation", "descriptor-digest", "result-digest", "byte-range", "destination"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Apply revalidates the exact guest identity and destination; mismatch fails before mutation or retains a previously uncertain apply for reconciliation."
+before = { root = "root:open-or-recovering", obligation = "obligation:guest-reply-prepared", reverse_index = "reverse-index:ticket-to-vm-and-range", publication = "publication:no-guest-mutation", terminal = "terminal:none", typed_credit = "typed-credit:guest-reply=1" }
+after = { root = "root:open-recovering-or-revoked", obligation = "obligation:terminal-validation-failure-or-retained", reverse_index = "reverse-index:removed-or-retained-ticket", publication = "publication:no-wrong-mapping-mutation", terminal = "terminal:typed-vm-remap-rejection-or-retained", typed_credit = "typed-credit:guest-reply=returned-or-retained-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs"]
+
+[[cell]]
+id = "reply-duplicate-publication"
+tranche = "guest-reply"
+boundary = "guest-reply"
+failure_window = "Reply apply or acknowledgement is replayed after guest publication has a winner."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:reply-duplicate-publication"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::publish_guest_reply_with_apply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["backend-receipt-digest", "guest-task", "vm-generation", "descriptor-digest", "result-digest", "byte-range", "destination"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "The existing receipt is returned or replay is rejected; no second guest mutation, continuation wake, terminal receipt, or credit return occurs."
+before = { root = "root:any-nonfreed", obligation = "obligation:reply-applied-or-terminal", reverse_index = "reverse-index:winner-ticket", publication = "publication:one-semantic-reply", terminal = "terminal:none-or-winner", typed_credit = "typed-credit:guest-reply=1-or-returned" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-duplicate-reply", terminal = "terminal:typed-duplicate-or-existing-receipt", typed_credit = "typed-credit:guest-reply=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs"]
+
+[[cell]]
+id = "reply-vs-root-revoke"
+tranche = "guest-reply"
+boundary = "guest-reply"
+failure_window = "Root revoke races guest-reply preparation, mutation, or acknowledgement."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:reply-vs-root-revoke"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reconcile_guest_reply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["backend-receipt-digest", "guest-task", "vm-generation", "descriptor-digest", "result-digest", "byte-range", "destination"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "One ordered winner either publishes and acknowledges once or fences mutation and terminalizes; uncertain post-mutation state remains retained."
+before = { root = "root:open-or-revoking", obligation = "obligation:backend-outcome-or-reply-live", reverse_index = "reverse-index:reply-and-guest", publication = "publication:none-transitioning-or-applied", terminal = "terminal:none", typed_credit = "typed-credit:guest-reply=reserved-or-1" }
+after = { root = "root:open-with-reply-or-revoked", obligation = "obligation:terminal-or-retained", reverse_index = "reverse-index:removed-or-retained-ticket", publication = "publication:at-most-one-reply", terminal = "terminal:reply-revoke-or-retained-receipt", typed_credit = "typed-credit:guest-reply=returned-or-retained-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs"]
+
+[[cell]]
+id = "reply-vs-replacement-isolation"
+tranche = "guest-reply"
+boundary = "guest-reply"
+failure_window = "Reply publication races isolation of the failed service and authority transfer to its replacement."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:reply-vs-replacement-isolation"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reconcile_guest_reply"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["backend-receipt-digest", "guest-task", "vm-generation", "descriptor-digest", "result-digest", "byte-range", "destination", "replacement-generation"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "task-context-irqs-enabled"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Old and replacement bindings cannot both publish; isolation fences stale authority and replacement resumes only the original ticket."
+before = { root = "root:crashed-or-recovering", obligation = "obligation:reply-live-during-handoff", reverse_index = "reverse-index:ticket-and-current-binding", publication = "publication:none-or-transitioning", terminal = "terminal:none", typed_credit = "typed-credit:guest-reply=1" }
+after = { root = "root:recovering-open-or-revoked", obligation = "obligation:published-terminal-or-retained", reverse_index = "reverse-index:single-authorized-winner", publication = "publication:at-most-one-reply", terminal = "terminal:reply-isolation-or-retained-receipt", typed_credit = "typed-credit:guest-reply=returned-or-retained-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs"]
+
+[[cell]]
+id = "deadline-arm-failure"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "Raw timer arming fails after DeadlineSeries creation and before an active generation publishes."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-arm-failure"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::arm_deadline"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt"]
+cpu_requirement = "ordered-one-vcpu-plus-smp-refinement"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "not-allowed-before-external-mutation"
+expected_disposition = "Typed arm failure leaves no active ticket or callback authority and returns the reserved deadline credit."
+before = { root = "root:open", obligation = "obligation:deadline-series-idle", reverse_index = "reverse-index:no-active-ticket", publication = "publication:no-timer", terminal = "terminal:none", typed_credit = "typed-credit:deadline=available" }
+after = { root = "root:open-or-revoked", obligation = "obligation:arm-failed-series-idle", reverse_index = "reverse-index:no-active-ticket", publication = "publication:no-authorized-callback", terminal = "terminal:typed-arm-failure", typed_credit = "typed-credit:deadline=returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "deadline-success-vs-expiry"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "Operation success acknowledgement races expiry of the active deadline generation."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-success-vs-expiry"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::expire_or_cancel_deadline"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt", "callback-ticket"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Success or expiry has one winner; the loser observes terminal generation state and cannot start a duplicate retry or return credit twice."
+before = { root = "root:open-or-revoking", obligation = "obligation:deadline-generation-active", reverse_index = "reverse-index:active-ticket", publication = "publication:timer-armed", terminal = "terminal:none", typed_credit = "typed-credit:deadline=1" }
+after = { root = "root:open-retrying-or-revoked", obligation = "obligation:generation-terminal", reverse_index = "reverse-index:active-ticket-removed", publication = "publication:success-or-expiry-only", terminal = "terminal:single-winner-receipt", typed_credit = "typed-credit:deadline=returned-or-next-generation-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "deadline-cancel-vs-expiry"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "Cancellation races raw callback expiry for the same active generation."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-cancel-vs-expiry"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::expire_or_cancel_deadline"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt", "callback-ticket"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Cancel or expiry records one terminal winner; late callback matching cannot revive the generation or consume a replacement ticket."
+before = { root = "root:open-or-revoking", obligation = "obligation:deadline-generation-active", reverse_index = "reverse-index:active-ticket", publication = "publication:timer-armed", terminal = "terminal:none", typed_credit = "typed-credit:deadline=1" }
+after = { root = "root:open-retrying-or-revoked", obligation = "obligation:generation-terminal", reverse_index = "reverse-index:active-ticket-removed", publication = "publication:cancel-or-expiry-only", terminal = "terminal:single-winner-receipt", typed_credit = "typed-credit:deadline=returned-or-next-generation-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "deadline-lost-or-duplicate-callback"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "The active callback is lost or the raw timer reports the same ticket more than once."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-lost-or-duplicate-callback"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::expire_or_cancel_deadline"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt", "callback-ticket"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "raw-irq-tcb-ticket-match-required"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Watchdog or bounded reconciliation handles a lost callback; duplicate callback is idempotently rejected against the exact active or terminal ticket."
+before = { root = "root:open-or-recovering", obligation = "obligation:deadline-active-or-terminal", reverse_index = "reverse-index:exact-callback-ticket", publication = "publication:timer-armed-or-fired", terminal = "terminal:none-or-winner", typed_credit = "typed-credit:deadline=1-or-returned" }
+after = { root = "root:open-retrying-quarantined-or-revoked", obligation = "obligation:expired-cancelled-retained-or-exhausted", reverse_index = "reverse-index:one-active-or-none", publication = "publication:no-duplicate-expiry", terminal = "terminal:single-callback-disposition", typed_credit = "typed-credit:deadline=conserved" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "deadline-late-old-generation-callback"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "A callback from an old generation arrives after a newer generation becomes active."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-late-old-generation-callback"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::expire_or_cancel_deadline"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt", "callback-ticket"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "raw-irq-tcb-ticket-match-required"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "IRQ ticket matching rejects the old generation without expiring, cancelling, or consuming the current generation."
+before = { root = "root:open-or-recovering", obligation = "obligation:new-generation-active", reverse_index = "reverse-index:new-active-ticket", publication = "publication:new-timer-armed", terminal = "terminal:old-generation-recorded", typed_credit = "typed-credit:deadline=1-current" }
+after = { root = "root:unchanged", obligation = "obligation:new-generation-unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-old-generation-expiry", terminal = "terminal:typed-stale-callback-rejection", typed_credit = "typed-credit:deadline=1-current" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "deadline-crash-before-expiry-ack"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "The service crashes after raw expiry observation but before Registry acknowledgement."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-crash-before-expiry-ack"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::expire_or_cancel_deadline"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt", "callback-ticket"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The exact active ticket and observed callback remain recoverable; replacement acknowledges or retries without inventing another expiry."
+before = { root = "root:open-or-crashed", obligation = "obligation:callback-observed-unacknowledged", reverse_index = "reverse-index:active-ticket-and-observation", publication = "publication:raw-expiry-seen", terminal = "terminal:ack-pending", typed_credit = "typed-credit:deadline=1" }
+after = { root = "root:recovering-or-revoked", obligation = "obligation:expiry-replayable-or-retained", reverse_index = "reverse-index:ticket-discoverable", publication = "publication:one-semantic-expiry", terminal = "terminal:replacement-ack-or-retained", typed_credit = "typed-credit:deadline=1-retained-or-returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "deadline-replacement-retry"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "A replacement advances a retry generation after service crash."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-replacement-retry"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::advance_deadline_retry"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt", "callback-ticket", "replacement-generation"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Replacement binds the same DeadlineSeries, closes the prior generation, and arms at most one checked successor under bounded backoff."
+before = { root = "root:recovering", obligation = "obligation:prior-generation-terminal-or-retained", reverse_index = "reverse-index:series-and-prior-ticket", publication = "publication:no-successor-or-one-pending", terminal = "terminal:prior-disposition", typed_credit = "typed-credit:deadline=returned-or-retained-1;attempt=bounded" }
+after = { root = "root:recovering-open-or-quarantined", obligation = "obligation:one-successor-active-or-exhausted", reverse_index = "reverse-index:successor-ticket-or-none", publication = "publication:at-most-one-successor-timer", terminal = "terminal:retry-armed-retained-or-exhausted", typed_credit = "typed-credit:deadline=1-successor-or-retained-or-returned;attempt=advanced" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "deadline-revoke-active-generation"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "Root revoke races cancellation or expiry while one deadline generation is active."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-revoke-active-generation"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::expire_or_cancel_deadline"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt", "callback-ticket"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Revoke prevents successor arming and selects one cancelled, expired, or retained disposition for the active ticket."
+before = { root = "root:open-or-revoking", obligation = "obligation:deadline-generation-active", reverse_index = "reverse-index:active-ticket", publication = "publication:timer-armed", terminal = "terminal:none", typed_credit = "typed-credit:deadline=1" }
+after = { root = "root:revoked", obligation = "obligation:generation-terminal-or-retained", reverse_index = "reverse-index:removed-or-retained-ticket", publication = "publication:no-successor-timer", terminal = "terminal:cancel-expire-or-retained-receipt", typed_credit = "typed-credit:deadline=returned-or-retained-1" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "deadline-attempt-exhaustion"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "The bounded retry attempt limit is reached before the operation becomes safe or successful."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-attempt-exhaustion"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::advance_deadline_retry"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt"]
+cpu_requirement = "ordered-one-vcpu-plus-smp-refinement"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "No further generation arms; a typed exhausted and retained or quarantined receipt exposes the still-owned resources."
+before = { root = "root:open-recovering-or-revoking", obligation = "obligation:last-generation-terminal", reverse_index = "reverse-index:series-at-limit", publication = "publication:no-successor-yet", terminal = "terminal:last-attempt-recorded", typed_credit = "typed-credit:deadline=returned-or-retained;attempt=limit" }
+after = { root = "root:quarantined-or-revoked", obligation = "obligation:series-exhausted-retained", reverse_index = "reverse-index:retained-series-owner", publication = "publication:no-successor", terminal = "terminal:typed-attempt-exhausted", typed_credit = "typed-credit:deadline=retained-or-returned;attempt=exhausted" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "deadline-counter-exhaustion"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "Deadline generation or accounting counter would overflow while advancing a retry."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-counter-exhaustion"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::advance_deadline_retry"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt", "counter-value"]
+cpu_requirement = "ordered-one-vcpu-plus-smp-refinement"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "Checked arithmetic refuses wrap and produces a typed exhausted quarantine outcome with the last valid identity and credits retained."
+before = { root = "root:open-recovering-or-revoking", obligation = "obligation:last-valid-generation", reverse_index = "reverse-index:last-valid-ticket-or-series", publication = "publication:no-wrapped-generation", terminal = "terminal:none", typed_credit = "typed-credit:deadline=returned-or-retained;generation=max" }
+after = { root = "root:quarantined-or-revoked", obligation = "obligation:counter-exhausted-retained", reverse_index = "reverse-index:retained-series-owner", publication = "publication:no-wrapped-generation", terminal = "terminal:typed-counter-exhausted", typed_credit = "typed-credit:deadline=retained-or-returned;generation=exhausted" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "deadline-retained-pressure-backoff"
+tranche = "deadline-retry-generation"
+boundary = "timer-deadline"
+failure_window = "Retained reset or IOTLB owners create resource pressure while retry backoff advances."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:deadline-retained-pressure-backoff"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::advance_deadline_retry"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["deadline-purpose", "attempt-limit", "deadline-generation", "clock-basis", "deadline-bound", "attempt", "retained-owner-class"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "crosses-task-and-irq-context"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "Backpressure is typed and bounded; retained owners remain visible, no credit is borrowed, and exhaustion quarantines instead of spinning or panicking."
+before = { root = "root:open-recovering-or-revoking", obligation = "obligation:retry-series-with-retained-owners", reverse_index = "reverse-index:series-and-retained-owners", publication = "publication:bounded-backoff", terminal = "terminal:none", typed_credit = "typed-credit:deadline=1-or-available;retained-owner=bounded-count" }
+after = { root = "root:recovering-quarantined-or-revoked", obligation = "obligation:next-retry-retained-or-exhausted", reverse_index = "reverse-index:no-orphan-retained-owner", publication = "publication:bounded-next-arm-or-none", terminal = "terminal:backpressure-retained-or-exhausted", typed_credit = "typed-credit:deadline=conserved;retained-owner=conserved" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/cser/effect.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "fault-event-reservation-failure"
+tranche = "request-derived-page-fault"
+boundary = "page-fault"
+failure_window = "FaultEvent slot or service-fault-event credit reservation fails before the service task enters user mode."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:fault-event-reservation-failure"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::reserve_fault_event"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-instance", "vm-generation", "instruction-pointer", "fault-address", "fault-access-bits"]
+cpu_requirement = "ordered-one-vcpu-plus-smp-refinement"
+irq_requirement = "not-applicable"
+retained_disposition = "not-allowed-before-external-mutation"
+expected_disposition = "Task admission fails with a typed resource error; the service never enters user mode without its preallocated event authority."
+before = { root = "root:open-or-recovering", obligation = "obligation:task-work-reserved-fault-slot-absent", reverse_index = "reverse-index:task-lease-only", publication = "publication:not-entered-user-mode", terminal = "terminal:none", typed_credit = "typed-credit:service-fault-event=unavailable;task-admission=1" }
+after = { root = "root:open-recovering-or-revoked", obligation = "obligation:typed-admission-failure", reverse_index = "reverse-index:no-fault-event", publication = "publication:no-user-entry", terminal = "terminal:fault-slot-reservation-failure", typed_credit = "typed-credit:service-fault-event=unchanged;task-admission=returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "fault-wrong-task-binding-or-vm"
+tranche = "request-derived-page-fault"
+boundary = "page-fault"
+failure_window = "Exception return presents a task instance, lease, binding epoch, or VM generation that does not match the reserved FaultEvent."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:fault-wrong-task-binding-or-vm"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::disposition_service_fault"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-instance", "vm-generation", "instruction-pointer", "fault-address", "fault-access-bits"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "not-applicable"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Complete identity mismatch is isolated with a typed result and cannot crash the wrong service, consume its lease, or mint a receipt."
+before = { root = "root:open-or-recovering", obligation = "obligation:reserved-fault-event-for-exact-task", reverse_index = "reverse-index:exact-task-lease-and-vm", publication = "publication:no-fault-disposition", terminal = "terminal:none", typed_credit = "typed-credit:service-fault-event=1;task-admission=1" }
+after = { root = "root:unchanged", obligation = "obligation:legitimate-event-unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-wrong-service-crash", terminal = "terminal:typed-fault-identity-rejection", typed_credit = "typed-credit:service-fault-event=unchanged;task-admission=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "fault-duplicate-exception"
+tranche = "request-derived-page-fault"
+boundary = "page-fault"
+failure_window = "The same captured exception is delivered or dispositioned more than once."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:fault-duplicate-exception"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::disposition_service_fault"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-instance", "vm-generation", "instruction-pointer", "fault-address", "fault-access-bits", "fault-nonce"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "not-applicable"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Replay returns the existing receipt or typed duplicate rejection without a second task terminalization, domain crash, or credit return."
+before = { root = "root:any-nonfreed", obligation = "obligation:fault-captured-dispositioned-or-terminal", reverse_index = "reverse-index:fault-nonce-winner", publication = "publication:at-most-one-service-fault", terminal = "terminal:none-or-winner", typed_credit = "typed-credit:service-fault-event=1-or-returned;task-admission=1-or-returned" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-duplicate-crash", terminal = "terminal:typed-duplicate-or-existing-receipt", typed_credit = "typed-credit:service-fault-event=unchanged;task-admission=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "fault-crash-after-capture-before-disposition"
+tranche = "request-derived-page-fault"
+boundary = "page-fault"
+failure_window = "Kernel recovery path is interrupted after immutable fault capture but before Registry disposition and domain crash transition."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:fault-crash-after-capture-before-disposition"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::disposition_service_fault"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-instance", "vm-generation", "instruction-pointer", "fault-address", "fault-access-bits", "fault-nonce"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "not-applicable"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "The preallocated event remains discoverable by exact task lease; recovery resumes one atomic disposition rather than reconstructing from task ID."
+before = { root = "root:open-or-crashed", obligation = "obligation:fault-captured-undispositioned", reverse_index = "reverse-index:exact-task-and-fault-event", publication = "publication:no-service-fault-receipt", terminal = "terminal:task-lease-live", typed_credit = "typed-credit:service-fault-event=1;task-admission=1" }
+after = { root = "root:recovering-or-revoked", obligation = "obligation:disposition-replayable-or-retained", reverse_index = "reverse-index:event-discoverable", publication = "publication:at-most-one-fault-receipt", terminal = "terminal:resume-disposition-isolate-or-retained", typed_credit = "typed-credit:service-fault-event=1-retained-or-returned;task-admission=1-retained-or-returned" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "fault-revoke-vs-disposition"
+tranche = "request-derived-page-fault"
+boundary = "page-fault"
+failure_window = "Root revoke races the atomic fault disposition and service-domain crash transition."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:fault-revoke-vs-disposition"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::disposition_service_fault"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-instance", "vm-generation", "instruction-pointer", "fault-address", "fault-access-bits", "fault-nonce"]
+cpu_requirement = "controlled-two-and-four-vcpu-race"
+irq_requirement = "not-applicable"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "One ordered transition terminalizes the task lease and event, publishes at most one fault cause, and prevents post-revoke service authority."
+before = { root = "root:open-or-revoking", obligation = "obligation:fault-event-captured-or-pending", reverse_index = "reverse-index:task-lease-and-event", publication = "publication:no-fault-or-transitioning", terminal = "terminal:none", typed_credit = "typed-credit:service-fault-event=1;task-admission=1" }
+after = { root = "root:revoked-or-crashed", obligation = "obligation:terminal-or-retained", reverse_index = "reverse-index:removed-or-retained-event", publication = "publication:at-most-one-fault-receipt", terminal = "terminal:revoke-fault-or-retained-receipt", typed_credit = "typed-credit:service-fault-event=returned-or-retained;task-admission=returned-or-retained" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "fault-stale-replacement"
+tranche = "request-derived-page-fault"
+boundary = "page-fault"
+failure_window = "An exception from an isolated replacement generation arrives after a newer service binding is active."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:fault-stale-replacement"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::disposition_service_fault"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-instance", "vm-generation", "instruction-pointer", "fault-address", "fault-access-bits", "replacement-generation"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "not-applicable"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "The stale generation is isolated and rejected; it cannot crash the current replacement, consume its slot, or reuse a prior fault receipt."
+before = { root = "root:recovering-or-open", obligation = "obligation:current-task-and-fault-slot", reverse_index = "reverse-index:current-replacement-generation", publication = "publication:no-stale-fault", terminal = "terminal:old-task-isolated", typed_credit = "typed-credit:service-fault-event=1-current;task-admission=1-current" }
+after = { root = "root:unchanged", obligation = "obligation:current-generation-unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-stale-domain-crash", terminal = "terminal:typed-stale-replacement-rejection", typed_credit = "typed-credit:service-fault-event=unchanged;task-admission=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "fault-nested-or-unexpected-exception"
+tranche = "request-derived-page-fault"
+boundary = "page-fault"
+failure_window = "A nested, guest-originated, kernel-originated, or otherwise unsupported exception reaches the service-fault adapter."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:fault-nested-or-unexpected-exception"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::disposition_service_fault"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-instance", "vm-generation", "instruction-pointer", "fault-address", "fault-access-bits", "exception-class"]
+cpu_requirement = "ordered-one-vcpu-plus-smp-refinement"
+irq_requirement = "not-applicable"
+retained_disposition = "terminal-or-retained-single-winner"
+expected_disposition = "Supported profiles return typed isolation or quarantine instead of panic; unrelated roots and task leases remain untouched."
+before = { root = "root:open-recovering-or-absent", obligation = "obligation:fault-slot-current-or-no-matching-service", reverse_index = "reverse-index:matching-service-only", publication = "publication:no-service-fault-yet", terminal = "terminal:none", typed_credit = "typed-credit:service-fault-event=0-or-1;task-admission=0-or-1" }
+after = { root = "root:unchanged-isolated-or-quarantined", obligation = "obligation:typed-isolation-or-retained", reverse_index = "reverse-index:no-unrelated-mutation", publication = "publication:no-fabricated-service-fault", terminal = "terminal:unexpected-exception-isolation", typed_credit = "typed-credit:service-fault-event=conserved;task-admission=conserved" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "fault-counter-exhaustion"
+tranche = "request-derived-page-fault"
+boundary = "page-fault"
+failure_window = "Fault event, receipt, or domain-crash generation counter would overflow during disposition."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:fault-counter-exhaustion"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::disposition_service_fault"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-instance", "vm-generation", "instruction-pointer", "fault-address", "fault-access-bits", "counter-value"]
+cpu_requirement = "ordered-one-vcpu-plus-smp-refinement"
+irq_requirement = "not-applicable"
+retained_disposition = "required-until-explicit-reconciliation"
+expected_disposition = "Checked arithmetic refuses wrap and isolates the service with a typed exhausted, retained disposition rather than panicking or aliasing identity."
+before = { root = "root:open-or-recovering", obligation = "obligation:fault-event-last-valid-generation", reverse_index = "reverse-index:last-valid-event", publication = "publication:no-wrapped-receipt", terminal = "terminal:none", typed_credit = "typed-credit:service-fault-event=1;task-admission=1;generation=max" }
+after = { root = "root:quarantined-or-revoked", obligation = "obligation:counter-exhausted-retained", reverse_index = "reverse-index:retained-event-owner", publication = "publication:no-wrapped-receipt", terminal = "terminal:typed-counter-exhausted", typed_credit = "typed-credit:service-fault-event=1-retained;task-admission=1-retained;generation=exhausted" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]
+
+[[cell]]
+id = "fault-supervisor-replay-consumed-receipt"
+tranche = "request-derived-page-fault"
+boundary = "page-fault"
+failure_window = "Supervisor recovery replays a ServiceFaultReceipt that a previous recovery generation already consumed."
+evidence = "planned"
+current_boundary = "planned-contract-no-production-hook"
+target_injection_point = "prospective-hook:fault-supervisor-replay-consumed-receipt"
+production_symbols = ["kernel/nexus-ostd/src/cser/effect_registry.rs::EffectRegistry::consume_service_fault_receipt"]
+identity_base = "complete-obligation-identity-v1"
+identity_extensions = ["task-instance", "vm-generation", "fault-nonce", "fault-receipt-digest", "replacement-generation"]
+cpu_requirement = "service-supervisor-recovery-actors"
+irq_requirement = "not-applicable"
+retained_disposition = "typed-rejection-projection-unchanged"
+expected_disposition = "Receipt replay returns the existing consumption result or typed stale rejection without starting another replacement or transferring authority."
+before = { root = "root:recovering-open-or-quarantined", obligation = "obligation:fault-receipt-consumed", reverse_index = "reverse-index:receipt-to-recovery-winner", publication = "publication:at-most-one-replacement-generation", terminal = "terminal:receipt-consumption-recorded", typed_credit = "typed-credit:service-fault-event=returned-or-retained;task-admission=current-generation" }
+after = { root = "root:unchanged", obligation = "obligation:unchanged", reverse_index = "reverse-index:unchanged", publication = "publication:no-duplicate-replacement", terminal = "terminal:typed-consumed-receipt-rejection", typed_credit = "typed-credit:service-fault-event=unchanged;task-admission=unchanged" }
+source_paths = ["kernel/nexus-ostd/src/cser/effect_registry.rs", "kernel/nexus-ostd/src/lib.rs", "kernel/nexus-ostd/src/personality/linux_fs.rs", "patches/ostd-0.18.0-cser.patch"]

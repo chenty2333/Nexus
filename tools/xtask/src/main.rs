@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 mod catalog;
 mod causal_coverage;
+mod causal_fault_matrix;
 mod current_status;
 mod doctor;
 mod evidence;
@@ -191,6 +192,8 @@ fn doctor(root: &Path) -> Result<()> {
         .map_err(|error| format!("Stage 7B prior-art truth source: {error}"))?;
     let coverage = causal_coverage::validate(root)
         .map_err(|error| format!("production causal coverage: {error}"))?;
+    let causal_matrix = causal_fault_matrix::validate(root)
+        .map_err(|error| format!("additive causal fault matrix: {error}"))?;
     println!(
         "DOCTOR CATALOGS PASS oracles={oracle_count} scenarios={scenario_count} guest_sources={} guest_workloads={}",
         guest.sources, guest.workloads
@@ -210,6 +213,15 @@ fn doctor(root: &Path) -> Result<()> {
     println!(
         "DOCTOR CAUSAL COVERAGE PASS boundaries={} explicit_gaps={} overall={}",
         coverage.boundaries, coverage.uncovered_gaps, coverage.overall_status,
+    );
+    println!(
+        "DOCTOR CAUSAL FAULT MATRIX PASS cells={} planned={} source_mapped={} observed={} legacy_cells={} canonical_sha256={}",
+        causal_matrix.cells,
+        causal_matrix.planned,
+        causal_matrix.source_mapped,
+        causal_matrix.observed,
+        causal_matrix.legacy_cells,
+        causal_matrix.canonical_sha256,
     );
     Ok(())
 }
@@ -312,6 +324,19 @@ fn check(root: &Path) -> Result<()> {
         coverage.kernel_tcb_infrastructure,
         coverage.uncovered_gaps,
         coverage.overall_status,
+    );
+
+    section("validate additive causal falsification contract");
+    let causal_matrix = causal_fault_matrix::validate(root)
+        .map_err(|error| format!("additive causal fault matrix: {error}"))?;
+    println!(
+        "additive causal fault matrix: PASS ({} causal cells: {} planned, {} source-mapped, {} observed; legacy {} cells byte-frozen; canonical semantic sha256={})",
+        causal_matrix.cells,
+        causal_matrix.planned,
+        causal_matrix.source_mapped,
+        causal_matrix.observed,
+        causal_matrix.legacy_cells,
+        causal_matrix.canonical_sha256,
     );
 
     section("validate repository workflow surfaces");

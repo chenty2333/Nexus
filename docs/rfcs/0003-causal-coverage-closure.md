@@ -505,28 +505,55 @@ The existing
 replace, or advance any of those cells. In particular, its checked model rows
 must not be rewritten as production observations.
 
-Implementation work must add a separate machine-readable causal matrix, for
-example
+Implementation work adds the separate machine-readable causal matrix at
 `evaluation/production-identity/causal-fault-matrix.toml`. It is additive to
-the 35-cell matrix and initially records every new row as planned. Its families
-cover every failure window named in the seven tranches, including each boundary
-before external mutation, after external mutation but before acknowledgement,
-duplicate/replay, stale binding or generation, wrong identity, revoke/crash
-race, retry exhaustion, and retained-credit pressure.
+the 35-cell matrix and initially records exactly 66 new rows as planned, grouped
+by tranche as 8 queue/DMA preparation, 8 task admission, 11 filesystem service
+queue, 9 guest continuation, 10 guest reply, 11 deadline/retry generation, and
+9 request-derived page-fault rows. Its families cover every failure window
+named in the seven tranches, including each boundary before external mutation,
+after external mutation but before acknowledgement, duplicate/replay, stale
+binding or generation, wrong identity, revoke/crash race, retry exhaustion, and
+retained-credit pressure. The checked-in initial matrix is a prospective
+contract and carries no source-mapped or observed execution claim. Every
+prospective row therefore records
+`current_boundary = planned-contract-no-production-hook`, a unique prospective
+injection-point token, and one or more prospective
+`path::symbol` targets. The accompanying source paths are context files only:
+their existence does not prove that a target symbol, injection hook, shared
+production call path, or runtime observation exists.
+
+Promotion to `source-mapped` first requires a separate reviewed validator change
+that resolves the actual production symbol, verifies the concrete injection
+hook inside that boundary, and proves that the normal shared call path reaches
+it. Promotion to any observed state additionally requires execution evidence
+from that exact hook and production path. A prospective target is never itself
+a source or runtime claim.
+
+The validator freezes the complete parsed matrix with a canonical semantic
+SHA-256 computed over deterministic struct-and-sequence serialization. The
+digest is held outside the matrix so it is not self-referential. It covers the
+failure window, expected disposition, complete identity extensions, CPU and IRQ
+requirements, retained disposition, prospective targets, and all before/after
+projection values, while allowing comments and TOML layout to improve. Any
+semantic update requires an explicit review and digest update.
 
 The combined validator must:
 
 - continue to require the exact original 35-cell population;
 - require the exact new causal population and reject missing, duplicate,
   reordered, renamed, fabricated, or extra rows;
-- bind each causal row to a production source boundary and expected complete
-  semantic projection;
+- record a precise prospective source target for every planned causal row and,
+  before promotion, bind it to the verified actual production boundary and hook
+  with its expected complete semantic projection;
 - require before/after root, obligation, reverse-index, publication,
   terminalization, and per-class credit projections;
 - record CPU, IRQ state, task/binding generation, complete presented identity,
-  retained owners, and honest non-success disposition; and
+  retained owners, and honest non-success disposition;
 - distinguish model checked, source mapped, one-vCPU observed, and 2/4-vCPU
-  observed evidence.
+  observed evidence; and
+- reject well-formed semantic weakening, not merely missing fields, unknown
+  enum variants, or renamed rows.
 
 Passing unit tests, a reference provider, a deterministic state machine, source
 inspection, serial markers, or a hard-coded result table cannot promote a
