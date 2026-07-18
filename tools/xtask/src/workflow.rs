@@ -15,6 +15,8 @@ const TLA2TOOLS_LICENSE_SHA256: &str =
     "3fa3a845ce5eb7b9b3508701dc1aa4d084b6b2c27cbae8cd44d277d10ee411bf";
 const TLA2TOOLS_SHA256SUMS: &str =
     "33de7da9ce1b7fffb9d1c184021178dbb051747be48504e65c584c423721a32e  tla2tools-227f61b.jar\n";
+const ROOT_FRONTDOOR_SHA256: &str =
+    "7854983fb24c464e3ef7b1d110bc3f742ebbbbac60ed95d621fd3f09e2fee439";
 const TLA2TOOLS_LICENSE_PATHSPEC_EXCLUSION: &str =
     ":(exclude)third_party/tlaplus/1.8.0-227f61b/LICENSE.upstream";
 const TRANSITION_GATE_MANIFEST: &str = "crates/cser-transition-gates/Cargo.toml";
@@ -157,6 +159,7 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
     let pinned_actions = validate_pinned_actions(&workflow)?;
 
     let frontdoor = fs::read_to_string(root.join("x"))?;
+    validate_root_frontdoor_snapshot(&frontdoor)?;
     validate_full_verify_order(&frontdoor)?;
     validate_linked_worktree_git_mount(&frontdoor)?;
     validate_same_boot_acceptance_route(&frontdoor)?;
@@ -248,6 +251,17 @@ pub(crate) fn validate(root: &Path) -> Result<Summary> {
         shell_sources,
         pinned_actions,
     })
+}
+
+fn validate_root_frontdoor_snapshot(frontdoor: &str) -> Result<()> {
+    let observed = sha256(frontdoor.as_bytes());
+    if observed != ROOT_FRONTDOOR_SHA256 {
+        return Err(format!(
+            "root workflow differs from its reviewed snapshot: expected {ROOT_FRONTDOOR_SHA256}, got {observed}"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn validate_full_verify_order(frontdoor: &str) -> Result<()> {
@@ -1746,6 +1760,22 @@ mod tests {
         assert!(shell_source(Path::new("scripts/check.sh")));
         assert!(!shell_source(Path::new("src/lib.rs")));
         assert!(!shell_source(Path::new("guest/probe.S")));
+    }
+
+    #[test]
+    fn root_frontdoor_is_bound_to_the_reviewed_snapshot() {
+        let root = repository_root();
+        let frontdoor = fs::read_to_string(root.join("x")).expect("read root workflow");
+        validate_root_frontdoor_snapshot(&frontdoor).expect("reviewed root workflow snapshot");
+
+        for mutation in [
+            "\nensure_image() { image=nexus/cser-dev:constant; }\n",
+            "\nfunction ensure_image { image=nexus/cser-dev:constant; }\n",
+            "\n: compute_image_identity\n",
+        ] {
+            validate_root_frontdoor_snapshot(&format!("{frontdoor}{mutation}"))
+                .expect_err("any unreviewed root workflow mutation must fail");
+        }
     }
 
     #[test]
