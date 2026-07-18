@@ -22,7 +22,7 @@ the crate-root module API:
 - OSTD: `=0.18.0` from the crates.io archive with SHA-256
   `aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1`
 - canonical MPL-2.0 OSTD overlay: `patches/ostd-0.18.0-cser.patch`, SHA-256
-  `0950caa05bfa08467acd00a150246865af82b6ff7f0fc728a33ecf493ffb4912`
+  `6167dc681e8f5e53c20e2ef2ccc40fc1924c722bb9ca37cc4ba4f70ba49b71db`
 - virtio-drivers: `=0.13.0` from the crates.io archive with SHA-256
   `cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7`
 - canonical MIT split-publication overlay:
@@ -642,8 +642,23 @@ The primary kernel build now applies the repository-wide, hash-bound
 overlay is used by the Stage 5B experiment. It provides the ownership-carrying
 DMA begin/poll closure API and a configurable GSI mapping API, including
 I/O APIC polarity/trigger bits and a synchronized interrupt-remapping trigger
-mode. The kernel build checks positive application, clean reverse application,
-installed-source equivalence, and negative source mutations before compiling.
+mode. It also provides a monotonic task lifecycle: `Task::run` claims the
+created task once, terminal dequeue publishes exit, CPU switch-out publishes
+reaped, and the IRQ-enabled switch tail claims the observation before invoking
+the post-exit hook exactly once. A wake reservation gate closes before
+`exit_current` takes the runqueue and waits for every already-admitted enqueue
+to return, so `Waker::wake_up` cannot cross the terminal dequeue boundary. The
+default and Nexus schedulers' existing CPU-owner/runqueue serialization then
+deduplicates any wake admitted before the close. `Task::is_reaped()` observes
+the reaped-or-observed states; no arbitrary task-kill operation is added.
+
+An injected scheduler remains part of the kernel TCB: the OSTD API can fence
+`Task::run` and `Waker`, but it cannot stop a scheduler implementation from
+retaining an `Arc<Task>` and inserting it directly in violation of the
+`Scheduler` contract. The source oracle binds the lifecycle and wake-gate
+helper bodies, rejects additive bypasses, and runs an executable reservation
+interleaving model in addition to positive application, clean reverse
+application, installed-source equivalence, and negative source mutations.
 
 The same two build graphs reconstruct the exact virtio-drivers 0.13.0 archive
 and apply the canonical MIT split-publication overlay. It provides a linear,

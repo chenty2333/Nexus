@@ -22,6 +22,7 @@ ARG VIRTIO_DRIVERS_CRATE_URL=https://static.crates.io/crates/virtio-drivers/virt
 
 COPY --from=nexus-root kernel/nexus-ostd/src/cser/effect_registry.rs \
     kernel/nexus-ostd/src/cser/device_flight.rs \
+    kernel/nexus-ostd/src/cser/portal_v2.rs \
     /kernel/nexus-ostd/src/cser/
 COPY --from=nexus-root kernel/nexus-ostd/Cargo.toml \
     kernel/nexus-ostd/Cargo.lock \

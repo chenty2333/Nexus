@@ -32,6 +32,14 @@ with different bytes returns `Conflict`. Replay exhaustion returns
 entries never become reusable in the current session. Negotiation rejections
 and failures before mutation replay admission are not cached.
 
+Provider negotiation is dependency-closed. `EFFECT_COMPLETION` implies
+`OUTCOME_RECORDING`, which in turn implies `EFFECT_CLOSURE`; an offer that omits
+one of those advertised prerequisites is rejected. Register and prepare remain
+available to a core-closure-only provider, but `Commit` requires the full
+completion/outcome/closure chain. Consequently no successfully committed
+effect can be stranded solely because its negotiated session lacks an outcome
+or completion transition. `Complete` explicitly checks all three bits.
+
 `QueryAbi` and `Query*` IDs are ephemeral correlation IDs and their results are
 not replay-cached. They may be reused after a terminal response, but they may
 not collide with a durable negotiation or mutation ID. This keeps read-only
@@ -53,20 +61,44 @@ validated ABI request into one authoritative Registry operation:
 | Portal method | Required adapter responsibility |
 | --- | --- |
 | `create_scope` | Allocate a bounded scope and atomically install its identity, epochs, limits, and creation receipt. |
-| `register` | Validate scope authority and credits, then install immutable effect identity and ancestry. |
+| `register` | Validate scope authority and the explicit `Queue` or `Page` credit charge, then install immutable effect identity and ancestry. |
 | `prepare` | Enforce the registered-to-prepared transition and return the authoritative receipt. |
 | `commit` | Validate authority, binding, and domain revision before crossing the commit publication boundary. |
 | `record_outcome` | Attach one canonical committed outcome without duplicating backend work. |
 | `complete` | Consume the permitted terminal transition and release only owners proven safe to release. |
 | `revoke` | Freeze the authority epoch and return honest closure or retained-owner state. |
-| `query_scope` | Validate the explicit dispatcher session argument, then project the current bounded scope state from the Registry. |
-| `query_effect` | Validate the explicit dispatcher session argument, then project the current effect phase, outcome, receipt, and digests. |
+| `query_scope` | Validate the explicit dispatcher session argument, then project the current bounded scope state, including the raw provider-domain revision, from the Registry. |
+| `query_effect` | Validate the explicit dispatcher session argument, then project the current effect phase, holistic outcome `(kind, result, digest)`, receipt, and digests. |
 | `query_receipt` | Validate the explicit dispatcher session argument and project a typed, linearly consumed receipt. |
 
 The kernel portal should own the dispatcher session and replay storage for the
 lifetime it promises. Adapter methods remain responsible for lifecycle order,
 generation checks, ancestry, quotas, durable receipts, and all device or
 supervisor semantics.
+
+For the preview adapter, `max_effects` is a lifetime selector bound covering
+both live effects and their terminal records. `max_tombstones` separately caps
+how many of those records may be terminal at once. There is no tombstone
+retirement opcode in v2 yet, so exhausting either bound is permanent for that
+scope/session and returns typed backpressure before Registry mutation. Queue
+and page credits are distinct ledgers; capacity in one pool can never satisfy
+or mask exhaustion in the other.
+
+`RegisterEffectRequest` remains 112 bytes: the former four-byte reserved tail is
+now a two-byte `CreditKind` plus a two-byte zero-reserved tail. The assigned
+credit kinds are `Queue = 1` and `Page = 2`; zero and unassigned values fail
+closed. `AbiResponse` is 80 bytes and reports the endpoint's effective finite
+scope, effect-selector, per-scope effect/tombstone, typed-credit, receipt, and
+mutation-replay limits; the dispatcher clamps the backend report to its actual
+const-generic replay table. These effective limits may be smaller than the
+protocol request maxima. `ScopeObservation` is 120 bytes after adding `domain_revision`.
+`EffectObservation` is 216 bytes and carries an all-or-nothing outcome tuple,
+an optional terminal manifest digest, and exact request/state digest positions.
+The zero outcome discriminant requires zero result and digest. Completed
+observations require an outcome and reject `Indeterminate`; retained
+observations may honestly carry no outcome yet. A terminal manifest digest is
+optional because some terminal Registry records do not carry one, but a
+non-terminal observation may never expose one.
 
 ## Recovery limit
 
@@ -78,6 +110,8 @@ Registry records; they must not be inferred from the presence of query opcodes.
 ## Verification
 
 The contract tests pin framing, numeric discriminants, fixed sizes, golden wire
-vectors, malformed-body rejection, negotiation ordering, selected-capability
-checks, exact retry, conflicting retries, cached backend errors, lifecycle
-ordering, bounded replay pressure, and session mismatch behavior.
+vectors, phase/outcome/terminal matrices, partial-outcome rejection, exact
+digest offsets, the complete provider-capability subset matrix, malformed-body
+rejection, negotiation ordering, selected-capability checks, exact retry,
+conflicting retries, cached backend errors, lifecycle ordering, bounded replay
+pressure, and session mismatch behavior.

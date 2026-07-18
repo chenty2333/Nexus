@@ -84,6 +84,21 @@ image_key=$(sha256sum \
     "$repo_root/crates/nexus-ostd-virtio/src/pci.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/portal.rs" \
     "$repo_root/crates/nexus-ostd-virtio/src/production.rs" \
+    "$repo_root/crates/nexus-portal-abi/Cargo.toml" \
+    "$repo_root/crates/nexus-portal-abi/src/capability.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/digest.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/dispatcher.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/error.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/handle.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/lib.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/lifecycle.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/message.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/request.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/response.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/response/error.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/response/lifecycle.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/response/negotiation.rs" \
+    "$repo_root/crates/nexus-portal-abi/src/response/query.rs" \
     "$repo_root/patches/ostd-0.18.0-cser.patch" \
     "$repo_root/patches/virtio-drivers-0.13.0-cser.patch" \
     "$repo_root/patches/virtio-drivers-0.13.0-LICENSE-MIT" \
@@ -92,7 +107,8 @@ image_key=$(sha256sum \
     "$repo_root/tools/virtio/assert-cser-patch.sh" \
     "$repo_root/tools/virtio/assert-production-substrate.sh" \
     "$root/src/cser/effect_registry.rs" \
-    "$root/src/cser/device_flight.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+    "$root/src/cser/device_flight.rs" \
+    "$root/src/cser/portal_v2.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/nexus-ostd:$image_key"
 runner_base="$root/osdk-runner-base"
 runner_target="$root/target/osdk/nexus-kernel-run-base"
@@ -127,8 +143,10 @@ container() {
         -v "$repo_root:/repo:ro,z" \
         -v "$repo_root/crates/cser-transition-gates:/crates/cser-transition-gates:ro,z" \
         -v "$repo_root/crates/nexus-ostd-virtio:/crates/nexus-ostd-virtio:ro,z" \
+        -v "$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z" \
         --mount "type=bind,source=$root/src/cser/effect_registry.rs,target=/kernel/nexus-ostd/src/cser/effect_registry.rs,readonly" \
         --mount "type=bind,source=$root/src/cser/device_flight.rs,target=/kernel/nexus-ostd/src/cser/device_flight.rs,readonly" \
+        --mount "type=bind,source=$root/src/cser/portal_v2.rs,target=/kernel/nexus-ostd/src/cser/portal_v2.rs,readonly" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         --mount "type=bind,source=$root/userspace/personality/Cargo.lock,target=/work/userspace/personality/Cargo.lock,readonly" \
         -w /work \

@@ -179,6 +179,7 @@ fn create_scope_limits_and_reserved_fields_fail_closed() {
         (84, 0_u32),
         (84, MAX_EFFECTS_PER_SCOPE + 1),
         (88, 0),
+        (88, 2),
         (88, MAX_TOMBSTONES_PER_SCOPE + 1),
         (92, MAX_QUEUE_CREDITS_PER_SCOPE + 1),
         (96, MAX_PAGE_CREDITS_PER_SCOPE + 1),

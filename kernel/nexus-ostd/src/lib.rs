@@ -12,6 +12,11 @@ mod composition;
 mod effect;
 #[path = "cser/effect_registry.rs"]
 mod effect_registry;
+// The adapter is compiled into the kernel now, while its user/kernel transport
+// and persistent session owner land in later portal-v2 tranches.
+#[allow(dead_code)]
+#[path = "cser/portal_v2.rs"]
+mod portal_v2;
 // The shared semantic spine lands before its first filesystem/IRQ consumer.
 // Keep the temporary dead-code allowance at the module boundary so individual
 // state and transition APIs remain warning-clean while that migration proceeds.

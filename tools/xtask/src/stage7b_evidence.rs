@@ -1277,7 +1277,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .collect();
     if compact_source
         .matches(
-            "pub(crate)constfnindeterminate_after_reset(result:i64)->Self{Self{outcome:TerminalOutcome::IndeterminateAfterReset,result,causal_commit:None,}}",
+            "pub(crate)constfnindeterminate_after_reset(result:i64)->Self{Self{outcome:TerminalOutcome::IndeterminateAfterReset,result,causal_commit:None,manifest_digest:None,}}",
         )
         .count()
         != 1
@@ -4059,6 +4059,22 @@ mod tests {
         );
         assert_ne!(fake_indeterminate_terminal, source);
         assert!(validate_fault_registry_source_text(&fake_indeterminate_terminal).is_err());
+
+        let missing_indeterminate_digest = source.replacen(
+            "outcome: TerminalOutcome::IndeterminateAfterReset,\n            result,\n            causal_commit: None,\n            manifest_digest: None,",
+            "outcome: TerminalOutcome::IndeterminateAfterReset,\n            result,\n            causal_commit: None,",
+            1,
+        );
+        assert_ne!(missing_indeterminate_digest, source);
+        assert!(validate_fault_registry_source_text(&missing_indeterminate_digest).is_err());
+
+        let forged_indeterminate_digest = source.replacen(
+            "outcome: TerminalOutcome::IndeterminateAfterReset,\n            result,\n            causal_commit: None,\n            manifest_digest: None,",
+            "outcome: TerminalOutcome::IndeterminateAfterReset,\n            result,\n            causal_commit: None,\n            manifest_digest: Some([0xa5; 32]),",
+            1,
+        );
+        assert_ne!(forged_indeterminate_digest, source);
+        assert!(validate_fault_registry_source_text(&forged_indeterminate_digest).is_err());
 
         let generic_terminal = source.replacen(
             "authorized_device_enrollment != Some(enrollment.enrollment_sequence)",

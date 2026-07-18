@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use nexus_portal_abi::{
-    BASE_HEADER_SIZE, CapabilityOffer, CapabilityRequest, ClosureReceipt, ClosureStatus,
-    CommitEffectRequest, CompleteEffectRequest, CompletionDisposition, CreateScopeFlags,
-    CreateScopeRequest, Digest, EffectHandle, EffectObservation, EffectPhase, ErrorResponse,
-    HeaderFlags, LifecycleFlags, LifecycleReceipt, MAX_MESSAGE_SIZE, MessageHeader, MessageKind,
-    MutationContext, NegotiateRequest, Opcode, OutcomeKind, PortalBackend, PortalCapabilities,
-    PortalDispatcher, PortalErrorCode, PortalFailure, PrepareEffectRequest, ProviderCapabilities,
-    QueryAbiRequest, QueryEffectRequest, QueryReceiptRequest, QueryScopeRequest, ReceiptHandle,
-    ReceiptKind, ReceiptObservation, ReceiptStatus, RecordOutcomeRequest, RegisterEffectRequest,
-    RegisterFlags, RequestBody, ResponseBody, RetryClass, RevokeReason, RevokeScopeRequest,
-    ScopeCreatedResponse, ScopeHandle, ScopeObservation, ScopePhase, SessionHandle, decode_message,
-    encode_message,
+    AbiResponse, BASE_HEADER_SIZE, CapabilityOffer, CapabilityRequest, ClosureReceipt,
+    ClosureStatus, CommitEffectRequest, CompleteEffectRequest, CompletionDisposition,
+    CreateScopeFlags, CreateScopeRequest, CreditKind, Digest, EffectHandle, EffectObservation,
+    EffectOutcomeObservation, EffectPhase, ErrorResponse, HeaderFlags, LifecycleFlags,
+    LifecycleReceipt, MAX_MESSAGE_SIZE, MessageHeader, MessageKind, MutationContext,
+    NegotiateRequest, Opcode, OutcomeKind, PortalBackend, PortalCapabilities, PortalDispatcher,
+    PortalErrorCode, PortalFailure, PrepareEffectRequest, ProviderCapabilities, QueryAbiRequest,
+    QueryEffectRequest, QueryReceiptRequest, QueryScopeRequest, ReceiptHandle, ReceiptKind,
+    ReceiptObservation, ReceiptStatus, RecordOutcomeRequest, RegisterEffectRequest, RegisterFlags,
+    RequestBody, ResponseBody, RetryClass, RevokeReason, RevokeScopeRequest, ScopeCreatedResponse,
+    ScopeHandle, ScopeObservation, ScopePhase, SessionHandle, decode_message, encode_message,
 };
+use std::cell::Cell;
+use std::rc::Rc;
 
 fn digest(byte: u8) -> Digest {
     Digest::from_wire_bytes([byte; 32])
@@ -66,6 +68,7 @@ fn register_request(session: SessionHandle, digest_byte: u8) -> RegisterEffectRe
         EffectHandle::NULL,
         1,
         RegisterFlags::empty(),
+        CreditKind::Queue,
         1,
     )
     .unwrap()
@@ -187,10 +190,25 @@ struct CallCounts {
     query_receipt: u32,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CallProbe(Rc<Cell<CallCounts>>);
+
+impl CallProbe {
+    fn snapshot(&self) -> CallCounts {
+        self.0.get()
+    }
+
+    fn update(&self, update: impl FnOnce(&mut CallCounts)) {
+        let mut calls = self.snapshot();
+        update(&mut calls);
+        self.0.set(calls);
+    }
+}
+
 #[derive(Debug)]
 struct FakeBackend {
     phase: FakePhase,
-    calls: CallCounts,
+    calls: CallProbe,
     sequence: u64,
     authority_epoch: u64,
     binding_epoch: u64,
@@ -204,7 +222,7 @@ impl Default for FakeBackend {
     fn default() -> Self {
         Self {
             phase: FakePhase::Empty,
-            calls: CallCounts::default(),
+            calls: CallProbe::default(),
             sequence: 0,
             authority_epoch: 0,
             binding_epoch: 0,
@@ -217,6 +235,12 @@ impl Default for FakeBackend {
 }
 
 impl FakeBackend {
+    fn with_probe() -> (Self, CallProbe) {
+        let backend = Self::default();
+        let probe = backend.calls.clone();
+        (backend, probe)
+    }
+
     fn out_of_order() -> PortalFailure {
         PortalFailure::new(PortalErrorCode::OutOfOrder, RetryClass::AfterQuery, 0)
     }
@@ -256,7 +280,7 @@ impl PortalBackend for FakeBackend {
         &mut self,
         request: CreateScopeRequest,
     ) -> Result<ScopeCreatedResponse, PortalFailure> {
-        self.calls.create_scope += 1;
+        self.calls.update(|calls| calls.create_scope += 1);
         self.sequence += 1;
         self.authority_epoch = 1;
         self.binding_epoch = 1;
@@ -279,7 +303,7 @@ impl PortalBackend for FakeBackend {
         &mut self,
         request: RegisterEffectRequest,
     ) -> Result<LifecycleReceipt, PortalFailure> {
-        self.calls.register += 1;
+        self.calls.update(|calls| calls.register += 1);
         if self.phase != FakePhase::Empty {
             return Err(Self::out_of_order());
         }
@@ -297,7 +321,7 @@ impl PortalBackend for FakeBackend {
         &mut self,
         request: PrepareEffectRequest,
     ) -> Result<LifecycleReceipt, PortalFailure> {
-        self.calls.prepare += 1;
+        self.calls.update(|calls| calls.prepare += 1);
         if self.phase != FakePhase::Registered {
             return Err(Self::out_of_order());
         }
@@ -311,7 +335,7 @@ impl PortalBackend for FakeBackend {
     }
 
     fn commit(&mut self, request: CommitEffectRequest) -> Result<LifecycleReceipt, PortalFailure> {
-        self.calls.commit += 1;
+        self.calls.update(|calls| calls.commit += 1);
         if self.phase != FakePhase::Prepared {
             return Err(Self::out_of_order());
         }
@@ -328,7 +352,7 @@ impl PortalBackend for FakeBackend {
         &mut self,
         request: RecordOutcomeRequest,
     ) -> Result<LifecycleReceipt, PortalFailure> {
-        self.calls.record_outcome += 1;
+        self.calls.update(|calls| calls.record_outcome += 1);
         if self.phase != FakePhase::Committed {
             return Err(Self::out_of_order());
         }
@@ -346,7 +370,7 @@ impl PortalBackend for FakeBackend {
         &mut self,
         request: CompleteEffectRequest,
     ) -> Result<LifecycleReceipt, PortalFailure> {
-        self.calls.complete += 1;
+        self.calls.update(|calls| calls.complete += 1);
         if request.disposition() != CompletionDisposition::Completed
             || self.phase != FakePhase::OutcomeRecorded
         {
@@ -362,7 +386,7 @@ impl PortalBackend for FakeBackend {
     }
 
     fn revoke(&mut self, request: RevokeScopeRequest) -> Result<ClosureReceipt, PortalFailure> {
-        self.calls.revoke += 1;
+        self.calls.update(|calls| calls.revoke += 1);
         self.sequence += 1;
         Ok(ClosureReceipt::new(
             request.scope(),
@@ -386,7 +410,7 @@ impl PortalBackend for FakeBackend {
         portal_session: SessionHandle,
         request: QueryScopeRequest,
     ) -> Result<ScopeObservation, PortalFailure> {
-        self.calls.query_scope += 1;
+        self.calls.update(|calls| calls.query_scope += 1);
         assert_eq!(portal_session, session(0x41));
         if request.handle() != scope() {
             return Err(PortalFailure::new(
@@ -400,6 +424,7 @@ impl PortalBackend for FakeBackend {
             self.authority_epoch.max(1),
             self.binding_epoch.max(1),
             self.sequence.max(1),
+            self.sequence,
             ScopePhase::Active,
             u32::from(self.phase != FakePhase::Completed),
             0,
@@ -415,7 +440,7 @@ impl PortalBackend for FakeBackend {
         portal_session: SessionHandle,
         request: QueryEffectRequest,
     ) -> Result<EffectObservation, PortalFailure> {
-        self.calls.query_effect += 1;
+        self.calls.update(|calls| calls.query_effect += 1);
         assert_eq!(portal_session, session(0x41));
         if request.handle() != effect() || self.phase == FakePhase::Empty {
             return Err(PortalFailure::new(
@@ -439,7 +464,9 @@ impl PortalBackend for FakeBackend {
             self.binding_epoch,
             self.sequence,
             phase,
-            self.outcome_kind,
+            self.outcome_kind
+                .map(|kind| EffectOutcomeObservation::new(kind, 0, digest(0xa0)).unwrap()),
+            (phase == EffectPhase::Completed).then(|| digest(0xb0)),
             flags,
             self.latest_receipt,
             self.registration_digest,
@@ -453,7 +480,7 @@ impl PortalBackend for FakeBackend {
         portal_session: SessionHandle,
         request: QueryReceiptRequest,
     ) -> Result<ReceiptObservation, PortalFailure> {
-        self.calls.query_receipt += 1;
+        self.calls.update(|calls| calls.query_receipt += 1);
         assert_eq!(portal_session, session(0x41));
         if request.handle() != self.latest_receipt || self.latest_receipt.is_null() {
             return Err(PortalFailure::new(
@@ -479,8 +506,8 @@ impl PortalBackend for FakeBackend {
 #[test]
 fn mutation_is_blocked_before_negotiation_and_by_the_selected_capability_set() {
     let active_session = session(0x41);
-    let mut dispatcher =
-        PortalDispatcher::<_, 4>::new(offer(), active_session, FakeBackend::default()).unwrap();
+    let (backend, calls) = FakeBackend::with_probe();
+    let mut dispatcher = PortalDispatcher::<_, 4>::new(offer(), active_session, backend).unwrap();
     let register = register_request(active_session, 0x11);
 
     let before = send(&mut dispatcher, 2, &register);
@@ -488,7 +515,7 @@ fn mutation_is_blocked_before_negotiation_and_by_the_selected_capability_set() {
         failure(&before).code(),
         PortalErrorCode::NegotiationRequired
     );
-    assert_eq!(dispatcher.backend().calls.register, 0);
+    assert_eq!(calls.snapshot().register, 0);
     assert_eq!(dispatcher.replay_len(), 0);
 
     send(&mut dispatcher, 1, &query_only_negotiation());
@@ -497,7 +524,7 @@ fn mutation_is_blocked_before_negotiation_and_by_the_selected_capability_set() {
         failure(&unselected).code(),
         PortalErrorCode::CapabilityNotNegotiated
     );
-    assert_eq!(dispatcher.backend().calls.register, 0);
+    assert_eq!(calls.snapshot().register, 0);
     assert_eq!(dispatcher.replay_len(), 0);
 
     let query_collision = send(&mut dispatcher, 1, &QueryAbiRequest::new());
@@ -526,12 +553,87 @@ fn dispatcher_requires_the_bootstrap_capabilities_it_always_serves() {
             PortalErrorCode::MissingRequiredCapability,
         );
     }
+
+    assert_eq!(
+        PortalDispatcher::<_, 1>::new(
+            CapabilityOffer {
+                portal: PortalCapabilities::QUERY_ABI | PortalCapabilities::NEGOTIATE,
+                provider: ProviderCapabilities::EFFECT_COMPLETION,
+            },
+            session(0x41),
+            FakeBackend::default(),
+        )
+        .err()
+        .unwrap()
+        .code(),
+        PortalErrorCode::MissingRequiredCapability,
+    );
+
+    let error = PortalDispatcher::<_, 0>::new(offer(), session(0x41), FakeBackend::default())
+        .err()
+        .unwrap();
+    assert_eq!(error.code(), PortalErrorCode::LimitExceeded);
+    assert_eq!(error.offset(), 68);
+}
+
+#[test]
+fn query_abi_reports_the_dispatchers_effective_replay_capacity() {
+    let mut dispatcher =
+        PortalDispatcher::<_, 4>::new(offer(), session(0x41), FakeBackend::default()).unwrap();
+    let response = send(&mut dispatcher, 99, &QueryAbiRequest::new());
+    let message = decode_message(&response).unwrap();
+    assert_eq!(message.header.kind(), MessageKind::Response);
+    let abi = AbiResponse::decode_wire(message.body).unwrap();
+    assert_eq!(abi.offer(), offer());
+    assert_eq!(abi.limits().max_replay_entries(), 4);
+}
+
+#[test]
+fn core_closure_only_can_prepare_but_cannot_cross_the_commit_boundary() {
+    let active_session = session(0x41);
+    let (backend, calls) = FakeBackend::with_probe();
+    let mut dispatcher = PortalDispatcher::<_, 4>::new(offer(), active_session, backend).unwrap();
+    let closure_only = NegotiateRequest::new(CapabilityRequest {
+        requested_portal: PortalCapabilities::EFFECT_LIFECYCLE,
+        required_portal: PortalCapabilities::EFFECT_LIFECYCLE,
+        requested_provider: ProviderCapabilities::EFFECT_CLOSURE,
+        required_provider: ProviderCapabilities::EFFECT_CLOSURE,
+    });
+    send(&mut dispatcher, 1, &closure_only);
+    assert_eq!(
+        lifecycle(&send(
+            &mut dispatcher,
+            10,
+            &register_request(active_session, 0x11),
+        ))
+        .phase(),
+        EffectPhase::Registered,
+    );
+    assert_eq!(
+        lifecycle(&send(
+            &mut dispatcher,
+            11,
+            &prepare_request(active_session, 0x12),
+        ))
+        .phase(),
+        EffectPhase::Prepared,
+    );
+    assert_eq!(
+        failure(&send(
+            &mut dispatcher,
+            12,
+            &commit_request(active_session, 0x13),
+        ))
+        .code(),
+        PortalErrorCode::CapabilityNotNegotiated,
+    );
+    assert_eq!(calls.snapshot().commit, 0);
 }
 
 #[test]
 fn negotiation_exact_retry_is_stable_and_renegotiation_conflicts() {
-    let mut dispatcher =
-        PortalDispatcher::<_, 2>::new(offer(), session(0x41), FakeBackend::default()).unwrap();
+    let (backend, calls) = FakeBackend::with_probe();
+    let mut dispatcher = PortalDispatcher::<_, 2>::new(offer(), session(0x41), backend).unwrap();
     let request = full_negotiation();
     let first = send(&mut dispatcher, 1, &request);
     let retry = send(&mut dispatcher, 1, &request);
@@ -556,15 +658,15 @@ fn negotiation_exact_retry_is_stable_and_renegotiation_conflicts() {
         failure(&reused_for_mutation).code(),
         PortalErrorCode::Conflict
     );
-    assert_eq!(dispatcher.backend().calls.register, 0);
+    assert_eq!(calls.snapshot().register, 0);
     assert_eq!(dispatcher.replay_len(), 0);
 }
 
 #[test]
 fn exact_mutation_retry_is_byte_identical_and_changed_content_conflicts() {
     let active_session = session(0x41);
-    let mut dispatcher =
-        PortalDispatcher::<_, 4>::new(offer(), active_session, FakeBackend::default()).unwrap();
+    let (backend, calls) = FakeBackend::with_probe();
+    let mut dispatcher = PortalDispatcher::<_, 4>::new(offer(), active_session, backend).unwrap();
     send(&mut dispatcher, 1, &full_negotiation());
 
     let original = register_request(active_session, 0x11);
@@ -572,12 +674,12 @@ fn exact_mutation_retry_is_byte_identical_and_changed_content_conflicts() {
     let retry = send(&mut dispatcher, 10, &original);
     assert_eq!(first, retry);
     assert_eq!(lifecycle(&first).phase(), EffectPhase::Registered);
-    assert_eq!(dispatcher.backend().calls.register, 1);
+    assert_eq!(calls.snapshot().register, 1);
     assert_eq!(dispatcher.replay_len(), 1);
 
     let query_collision = send(&mut dispatcher, 10, &QueryEffectRequest::new(effect()));
     assert_eq!(failure(&query_collision).code(), PortalErrorCode::Conflict);
-    assert_eq!(dispatcher.backend().calls.query_effect, 0);
+    assert_eq!(calls.snapshot().query_effect, 0);
 
     let oversized_same_id = send_body(
         &mut dispatcher,
@@ -595,14 +697,14 @@ fn exact_mutation_retry_is_byte_identical_and_changed_content_conflicts() {
     assert_eq!(conflict.code(), PortalErrorCode::Conflict);
     assert_eq!(conflict.presented_digest(), digest(0x12));
     assert_eq!(conflict.existing_digest(), digest(0x11));
-    assert_eq!(dispatcher.backend().calls.register, 1);
+    assert_eq!(calls.snapshot().register, 1);
 }
 
 #[test]
 fn backend_ordering_error_is_cached_then_lifecycle_and_query_can_finish() {
     let active_session = session(0x41);
-    let mut dispatcher =
-        PortalDispatcher::<_, 8>::new(offer(), active_session, FakeBackend::default()).unwrap();
+    let (backend, calls) = FakeBackend::with_probe();
+    let mut dispatcher = PortalDispatcher::<_, 8>::new(offer(), active_session, backend).unwrap();
     send(&mut dispatcher, 1, &full_negotiation());
 
     assert_eq!(
@@ -638,7 +740,7 @@ fn backend_ordering_error_is_cached_then_lifecycle_and_query_can_finish() {
     let premature_retry = send(&mut dispatcher, 13, &premature_request);
     assert_eq!(premature, premature_retry);
     assert_eq!(failure(&premature).code(), PortalErrorCode::OutOfOrder);
-    assert_eq!(dispatcher.backend().calls.complete, 1);
+    assert_eq!(calls.snapshot().complete, 1);
 
     assert_eq!(
         lifecycle(&send(
@@ -668,15 +770,15 @@ fn backend_ordering_error_is_cached_then_lifecycle_and_query_can_finish() {
             .phase(),
         EffectPhase::Completed,
     );
-    assert_eq!(dispatcher.backend().calls.query_effect, 1);
-    assert_eq!(dispatcher.backend().calls.complete, 2);
+    assert_eq!(calls.snapshot().query_effect, 1);
+    assert_eq!(calls.snapshot().complete, 2);
 }
 
 #[test]
 fn wrong_session_is_a_cached_typed_failure_and_changed_retry_conflicts() {
     let active_session = session(0x41);
-    let mut dispatcher =
-        PortalDispatcher::<_, 2>::new(offer(), active_session, FakeBackend::default()).unwrap();
+    let (backend, calls) = FakeBackend::with_probe();
+    let mut dispatcher = PortalDispatcher::<_, 2>::new(offer(), active_session, backend).unwrap();
     send(&mut dispatcher, 1, &full_negotiation());
 
     let wrong = register_request(session(0x42), 0x11);
@@ -684,7 +786,7 @@ fn wrong_session_is_a_cached_typed_failure_and_changed_retry_conflicts() {
     let retry = send(&mut dispatcher, 10, &wrong);
     assert_eq!(first, retry);
     assert_eq!(failure(&first).code(), PortalErrorCode::InvalidSession);
-    assert_eq!(dispatcher.backend().calls.register, 0);
+    assert_eq!(calls.snapshot().register, 0);
     assert_eq!(dispatcher.replay_len(), 1);
 
     let corrected = register_request(active_session, 0x11);
@@ -692,14 +794,14 @@ fn wrong_session_is_a_cached_typed_failure_and_changed_retry_conflicts() {
         failure(&send(&mut dispatcher, 10, &corrected)).code(),
         PortalErrorCode::Conflict,
     );
-    assert_eq!(dispatcher.backend().calls.register, 0);
+    assert_eq!(calls.snapshot().register, 0);
 }
 
 #[test]
 fn replay_capacity_fails_closed_before_the_next_backend_mutation() {
     let active_session = session(0x41);
-    let mut dispatcher =
-        PortalDispatcher::<_, 1>::new(offer(), active_session, FakeBackend::default()).unwrap();
+    let (backend, calls) = FakeBackend::with_probe();
+    let mut dispatcher = PortalDispatcher::<_, 1>::new(offer(), active_session, backend).unwrap();
     send(&mut dispatcher, 1, &full_negotiation());
     send(&mut dispatcher, 10, &register_request(active_session, 0x11));
 
@@ -707,15 +809,15 @@ fn replay_capacity_fails_closed_before_the_next_backend_mutation() {
     let blocked_failure = failure(&blocked);
     assert_eq!(blocked_failure.code(), PortalErrorCode::Backpressure);
     assert_eq!(blocked_failure.retry(), RetryClass::NewSession);
-    assert_eq!(dispatcher.backend().calls.prepare, 0);
+    assert_eq!(calls.snapshot().prepare, 0);
     assert_eq!(dispatcher.replay_len(), 1);
 }
 
 #[test]
 fn scope_creation_queries_and_revoke_dispatch_to_bounded_response_types() {
     let active_session = session(0x41);
-    let mut dispatcher =
-        PortalDispatcher::<_, 2>::new(offer(), active_session, FakeBackend::default()).unwrap();
+    let (backend, calls) = FakeBackend::with_probe();
+    let mut dispatcher = PortalDispatcher::<_, 2>::new(offer(), active_session, backend).unwrap();
     send(&mut dispatcher, 1, &full_negotiation());
 
     let create = CreateScopeRequest::new(
@@ -774,35 +876,35 @@ fn scope_creation_queries_and_revoke_dispatch_to_bounded_response_types() {
         ClosureStatus::Closed,
     );
 
-    assert_eq!(dispatcher.backend().calls.create_scope, 1);
-    assert_eq!(dispatcher.backend().calls.query_scope, 1);
-    assert_eq!(dispatcher.backend().calls.query_receipt, 1);
-    assert_eq!(dispatcher.backend().calls.revoke, 1);
+    assert_eq!(calls.snapshot().create_scope, 1);
+    assert_eq!(calls.snapshot().query_scope, 1);
+    assert_eq!(calls.snapshot().query_receipt, 1);
+    assert_eq!(calls.snapshot().revoke, 1);
     assert_eq!(dispatcher.replay_len(), 2);
 }
 
 #[test]
 fn trusted_envelope_body_errors_are_typed_and_mutation_errors_are_replayed() {
     let active_session = session(0x41);
-    let mut dispatcher =
-        PortalDispatcher::<_, 2>::new(offer(), active_session, FakeBackend::default()).unwrap();
+    let (backend, calls) = FakeBackend::with_probe();
+    let mut dispatcher = PortalDispatcher::<_, 2>::new(offer(), active_session, backend).unwrap();
     send(&mut dispatcher, 1, &full_negotiation());
 
     let register = register_request(active_session, 0x31);
     let mut malformed = encode_request(10, &register);
-    malformed[BASE_HEADER_SIZE + 108] = 1;
+    malformed[BASE_HEADER_SIZE + 110] = 1;
     let mut output = vec![0; MAX_MESSAGE_SIZE];
     let length = dispatcher.dispatch(&malformed, &mut output).unwrap();
     output.truncate(length);
     assert_eq!(failure(&output).code(), PortalErrorCode::NonZeroTail);
-    assert_eq!(dispatcher.backend().calls.register, 0);
+    assert_eq!(calls.snapshot().register, 0);
     assert_eq!(dispatcher.replay_len(), 1);
 
     let mut retry_output = vec![0; MAX_MESSAGE_SIZE];
     let retry_length = dispatcher.dispatch(&malformed, &mut retry_output).unwrap();
     retry_output.truncate(retry_length);
     assert_eq!(output, retry_output);
-    assert_eq!(dispatcher.backend().calls.register, 0);
+    assert_eq!(calls.snapshot().register, 0);
 
     let corrected = send(&mut dispatcher, 10, &register);
     assert_eq!(failure(&corrected).code(), PortalErrorCode::Conflict);
@@ -826,5 +928,5 @@ fn trusted_envelope_body_errors_are_typed_and_mutation_errors_are_replayed() {
         failure(&query_output).code(),
         PortalErrorCode::BodySizeMismatch
     );
-    assert_eq!(dispatcher.backend().calls.query_scope, 0);
+    assert_eq!(calls.snapshot().query_scope, 0);
 }

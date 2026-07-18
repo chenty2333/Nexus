@@ -13,8 +13,10 @@ mod query;
 
 pub use error::{ErrorResponse, PortalFailure};
 pub use lifecycle::{ClosureReceipt, LifecycleReceipt, ScopeCreatedResponse};
-pub use negotiation::{AbiResponse, NegotiatedResponse};
-pub use query::{EffectObservation, ReceiptObservation, ScopeObservation};
+pub use negotiation::{AbiResponse, NegotiatedResponse, PortalLimits};
+pub use query::{
+    EffectObservation, EffectOutcomeObservation, ReceiptObservation, ScopeObservation,
+};
 
 /// Largest fixed request body admitted to the mutation replay cache.
 pub const MAX_MUTATION_BODY_SIZE: usize = 128;

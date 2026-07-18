@@ -17,8 +17,36 @@ use crate::{
     SessionHandle,
 };
 
-/// Maximum aggregate credit units requested by one effect registration.
+/// Maximum units from one typed pool requested by one effect registration.
 pub const MAX_CREDIT_UNITS_PER_EFFECT: u32 = 16_384;
+
+/// Scope credit pool charged by one effect registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum CreditKind {
+    /// Charge bounded queue/admission capacity.
+    Queue = 1,
+    /// Charge bounded page/frame capacity.
+    Page = 2,
+}
+
+impl CreditKind {
+    /// Returns the stable wire discriminant.
+    #[must_use]
+    pub const fn wire_value(self) -> u16 {
+        self as u16
+    }
+
+    /// Parses a stable wire discriminant.
+    #[must_use]
+    pub const fn from_wire_value(value: u16) -> Option<Self> {
+        match value {
+            1 => Some(Self::Queue),
+            2 => Some(Self::Page),
+            _ => None,
+        }
+    }
+}
 
 bitflags! {
     /// Effect policy fixed at registration.
@@ -231,7 +259,8 @@ struct WireRegisterEffectRequest {
     operation_class: U32<LittleEndian>,
     flags: U32<LittleEndian>,
     credit_units: U32<LittleEndian>,
-    reserved: U32<LittleEndian>,
+    credit_kind: U16<LittleEndian>,
+    reserved: U16<LittleEndian>,
 }
 
 const _: () = assert!(core::mem::size_of::<WireRegisterEffectRequest>() == 112);
@@ -245,6 +274,7 @@ pub struct RegisterEffectRequest {
     parent: EffectHandle,
     operation_class: u32,
     flags: RegisterFlags,
+    credit_kind: CreditKind,
     credit_units: u32,
 }
 
@@ -256,6 +286,7 @@ impl RegisterEffectRequest {
         parent: EffectHandle,
         operation_class: u32,
         flags: RegisterFlags,
+        credit_kind: CreditKind,
         credit_units: u32,
     ) -> Result<Self, PortalWireError> {
         let request = Self {
@@ -264,6 +295,7 @@ impl RegisterEffectRequest {
             parent,
             operation_class,
             flags,
+            credit_kind,
             credit_units,
         };
         request.validate()?;
@@ -300,7 +332,13 @@ impl RegisterEffectRequest {
         self.flags
     }
 
-    /// Returns the aggregate bounded credit charge.
+    /// Returns the scope credit pool charged by this effect.
+    #[must_use]
+    pub const fn credit_kind(self) -> CreditKind {
+        self.credit_kind
+    }
+
+    /// Returns the bounded charge from [`Self::credit_kind`].
     #[must_use]
     pub const fn credit_units(self) -> u32 {
         self.credit_units
@@ -338,16 +376,19 @@ impl RequestBody for RegisterEffectRequest {
         let raw = *WireRegisterEffectRequest::ref_from_bytes(input)
             .map_err(|_| PortalWireError::new(PortalErrorCode::BodySizeMismatch, input.len()))?;
         if raw.reserved.get() != 0 {
-            return Err(PortalWireError::new(PortalErrorCode::NonZeroTail, 108));
+            return Err(PortalWireError::new(PortalErrorCode::NonZeroTail, 110));
         }
         let flags = RegisterFlags::from_bits(raw.flags.get())
             .ok_or_else(|| PortalWireError::new(PortalErrorCode::UnknownFlags, 100))?;
+        let credit_kind = CreditKind::from_wire_value(raw.credit_kind.get())
+            .ok_or_else(|| PortalWireError::new(PortalErrorCode::InvalidEnum, 108))?;
         Self::new(
             raw.context.decode()?,
             ScopeHandle::from_wire_bytes(raw.scope),
             EffectHandle::from_wire_bytes(raw.parent),
             raw.operation_class.get(),
             flags,
+            credit_kind,
             raw.credit_units.get(),
         )
     }
@@ -362,7 +403,8 @@ impl RequestBody for RegisterEffectRequest {
             operation_class: U32::new(self.operation_class),
             flags: U32::new(self.flags.bits()),
             credit_units: U32::new(self.credit_units),
-            reserved: U32::new(0),
+            credit_kind: U16::new(self.credit_kind.wire_value()),
+            reserved: U16::new(0),
         };
         output.copy_from_slice(raw.as_bytes());
         Ok(())

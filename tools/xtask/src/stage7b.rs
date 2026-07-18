@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path};
+use syn::visit::Visit;
 
 const CONTRACT_PATH: &str = "evaluation/stage7b/contract.toml";
 const RACE_MAP_PATH: &str = "evaluation/stage7b/cser-races.toml";
@@ -2016,12 +2017,7 @@ fn validate_io_instance_source(gate: &str, portal: &str) -> Result<(), String> {
 }
 
 fn validate_scale_instrumentation_source(source: &str) -> Result<(), String> {
-    let begin = source_region(
-        source,
-        "    pub(crate) fn revoke_begin(",
-        "    pub(crate) fn revoke_targets(",
-        "EffectRegistry::revoke_begin",
-    )?;
+    validate_revoke_begin_index_move(source)?;
     let next = source_region(
         source,
         "    pub(crate) fn revoke_next(",
@@ -2071,23 +2067,11 @@ fn validate_scale_instrumentation_source(source: &str) -> Result<(), String> {
         "instrument_revoke_record_access",
     )?;
 
-    // This is deliberately a lexical boundary over the measured revoke
-    // functions and their known record-touching helpers. It pins direct record
-    // access to one instrumented helper; it is not a general Rust call-graph
-    // proof and must not be described as one.
-    let compact_begin: String = begin
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect();
-    if compact_begin.contains("self.effects")
-        || compact_begin.contains("instrument_revoke_record_access")
-    {
-        return Err(
-            "revoke_begin must move the closure index without visiting effect records".into(),
-        );
-    }
+    // The remaining measured functions still use a deliberately lexical
+    // boundary. Direct record access is pinned to the one instrumented helper;
+    // this is not a general Rust call-graph proof and must not be described as
+    // one.
     for (label, body) in [
-        ("revoke_begin", begin),
         ("revoke_next", next),
         ("stage_revoke_terminal", terminal),
         ("revoke_complete", complete),
@@ -2161,6 +2145,190 @@ fn validate_scale_instrumentation_source(source: &str) -> Result<(), String> {
         if projection.contains(&format!("{field}: 0")) {
             return Err(format!(
                 "revoke_work_projection hard-codes the {field} work metric"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct RevokeBeginMethodAudit {
+    effect_identifiers: usize,
+    self_aliases: usize,
+    self_arguments: usize,
+    self_method_calls: Vec<String>,
+    macros: Vec<(String, String)>,
+}
+
+impl<'ast> Visit<'ast> for RevokeBeginMethodAudit {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if ident == "effects" {
+            self.effect_identifiers += 1;
+        }
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if local
+            .init
+            .as_ref()
+            .is_some_and(|init| is_self_reference(&init.expr))
+        {
+            self.self_aliases += 1;
+        }
+        syn::visit::visit_local(self, local);
+    }
+
+    fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+        if is_self_reference(&assignment.right) {
+            self.self_aliases += 1;
+        }
+        syn::visit::visit_expr_assign(self, assignment);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        self.self_arguments += call
+            .args
+            .iter()
+            .filter(|argument| is_self_reference(argument))
+            .count();
+        syn::visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if is_self_reference(&call.receiver) {
+            self.self_method_calls.push(call.method.to_string());
+        }
+        self.self_arguments += call
+            .args
+            .iter()
+            .filter(|argument| is_self_reference(argument))
+            .count();
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_macro(&mut self, expression: &'ast syn::Macro) {
+        let name = expression
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .unwrap_or_default();
+        let tokens = expression
+            .tokens
+            .to_string()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        self.macros.push((name, tokens));
+        syn::visit::visit_macro(self, expression);
+    }
+}
+
+fn is_self_reference(expression: &syn::Expr) -> bool {
+    match expression {
+        syn::Expr::Path(path) => path.qself.is_none() && path.path.is_ident("self"),
+        syn::Expr::Reference(reference) => is_self_reference(&reference.expr),
+        syn::Expr::Paren(paren) => is_self_reference(&paren.expr),
+        syn::Expr::Group(group) => is_self_reference(&group.expr),
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+            is_self_reference(&unary.expr)
+        }
+        _ => false,
+    }
+}
+
+fn effect_registry_method<'a>(
+    syntax: &'a syn::File,
+    method_name: &str,
+) -> Result<&'a syn::ImplItemFn, String> {
+    let mut found = None;
+    for item in &syntax.items {
+        let syn::Item::Impl(implementation) = item else {
+            continue;
+        };
+        if implementation.trait_.is_some() {
+            continue;
+        }
+        let syn::Type::Path(self_type) = implementation.self_ty.as_ref() else {
+            continue;
+        };
+        if self_type
+            .path
+            .segments
+            .last()
+            .is_none_or(|segment| segment.ident != "EffectRegistry")
+        {
+            continue;
+        }
+        for item in &implementation.items {
+            let syn::ImplItem::Fn(method) = item else {
+                continue;
+            };
+            if method.sig.ident != method_name {
+                continue;
+            }
+            if found.replace(method).is_some() {
+                return Err(format!(
+                    "EffectRegistry::{method_name} must have one unique implementation"
+                ));
+            }
+        }
+    }
+    found.ok_or_else(|| format!("EffectRegistry::{method_name} is missing"))
+}
+
+fn validate_revoke_begin_index_move(source: &str) -> Result<(), String> {
+    let syntax = syn::parse_file(source)
+        .map_err(|error| format!("parse production Registry source for revoke_begin: {error}"))?;
+    let expected = [
+        (
+            "revoke_begin",
+            &["prepare_revoke_begin", "apply_revoke_begin"][..],
+            &[][..],
+        ),
+        (
+            "prepare_revoke_begin",
+            &["prepare_revoke_begin_from_revision"][..],
+            &[][..],
+        ),
+        (
+            "prepare_revoke_begin_from_revision",
+            &[][..],
+            &[(
+                "matches",
+                "root.publication,DevicePublicationProvenance::Publishing{..}",
+            )][..],
+        ),
+        (
+            "apply_revoke_begin",
+            &[][..],
+            &[("debug_assert_eq", "cohort.len(),selection.target_count")][..],
+        ),
+    ];
+
+    for (method_name, expected_self_calls, expected_macros) in expected {
+        let method = effect_registry_method(&syntax, method_name)?;
+        let mut audit = RevokeBeginMethodAudit::default();
+        audit.visit_block(&method.block);
+        let macros_match = audit.macros.len() == expected_macros.len()
+            && audit.macros.iter().zip(expected_macros).all(
+                |((actual_name, actual_tokens), (expected_name, expected_tokens))| {
+                    actual_name == expected_name && actual_tokens == expected_tokens
+                },
+            );
+        if audit.effect_identifiers != 0
+            || audit.self_aliases != 0
+            || audit.self_arguments != 0
+            || audit.self_method_calls != expected_self_calls
+            || !macros_match
+        {
+            return Err(format!(
+                "revoke_begin must move the closure index without visiting effect records ({method_name}: effect_identifiers={}, self_aliases={}, self_arguments={}, self_calls={:?}, macros={:?})",
+                audit.effect_identifiers,
+                audit.self_aliases,
+                audit.self_arguments,
+                audit.self_method_calls,
+                audit.macros,
             ));
         }
     }
@@ -2597,6 +2765,31 @@ mod tests {
         );
         assert_ne!(begin, source);
         assert!(validate_scale_instrumentation_source(&begin).is_err());
+
+        let indirect_begin = source.replacen(
+            "        map_handoff_gate(scope.handoff_gate.require_open())?;\n        let plan = self.prepare_revoke_begin(scope_key)?;",
+            "        map_handoff_gate(scope.handoff_gate.require_open())?;\n        let _untracked = self.visit_effect_records_for_stage7b();\n        let plan = self.prepare_revoke_begin(scope_key)?;",
+            1,
+        );
+        assert_ne!(indirect_begin, source);
+        let indirect_result = validate_scale_instrumentation_source(&indirect_begin);
+        assert!(indirect_result.is_err(), "{indirect_result:?}");
+
+        let string_only_begin = source.replacen(
+            "        let plan = self.prepare_revoke_begin(scope_key)?;\n        Ok(self.apply_revoke_begin(plan))",
+            "        let _forged = \"let plan = self.prepare_revoke_begin(scope_key)?; Ok(self.apply_revoke_begin(plan))\";\n        Err(RegistryError::InvalidState)",
+            1,
+        );
+        assert_ne!(string_only_begin, source);
+        assert!(validate_scale_instrumentation_source(&string_only_begin).is_err());
+
+        let comment_only_begin = source.replacen(
+            "        let plan = self.prepare_revoke_begin(scope_key)?;\n        Ok(self.apply_revoke_begin(plan))",
+            "        // let plan = self.prepare_revoke_begin(scope_key)?;\n        // Ok(self.apply_revoke_begin(plan))\n        Err(RegistryError::InvalidState)",
+            1,
+        );
+        assert_ne!(comment_only_begin, source);
+        assert!(validate_scale_instrumentation_source(&comment_only_begin).is_err());
 
         let global = source.replacen(
             "    ) -> Result<Option<RevokeEffect>, RegistryError> {\n        self.validate_revoke_selection(selection)?;",

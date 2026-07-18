@@ -95,6 +95,7 @@ name = "cser-transition-gates"
 version = "0.1.0"
 dependencies = [
  "loom",
+ "nexus-portal-abi",
 ]
 
 [[package]]

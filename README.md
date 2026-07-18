@@ -135,7 +135,7 @@ The exact tier contracts and claim discipline are kept in
 | `crates/cser-model/` | Independent `no_std + alloc` safe-Rust reference model |
 | `crates/cser-transition-gates/` | Production-transition-source Loom harnesses |
 | `crates/nexus-effect-peer/` | Frozen native-v1 logical effect peer and replay boundary |
-| `crates/nexus-portal-abi/` | `nexus.portal.v2` preview wire/dispatcher contract; not yet a kernel Registry adapter |
+| `crates/nexus-portal-abi/` | `nexus.portal.v2` preview wire/dispatcher contract, exercised by the session-local kernel Registry adapter; no user/kernel transport or persistent selector recovery yet |
 | `crates/nexus-supervisor/` | Bounded provider-neutral restart/recovery manager; not yet wired to OSTD task lifecycle |
 | `kernel/nexus-ostd/` | Maintained OSTD kernel prototype and bounded workload paths |
 | `experiments/ostd-virtio-cser-spike/` | Mediated VirtIO/reset/IOMMU component evidence |

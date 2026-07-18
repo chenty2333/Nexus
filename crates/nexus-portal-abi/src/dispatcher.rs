@@ -12,11 +12,11 @@ use crate::{
     CreateScopeRequest, Digest, EffectObservation, ErrorResponse, HeaderFlags, LifecycleReceipt,
     MAX_MUTATION_BODY_SIZE, MAX_RESPONSE_BODY_SIZE, MessageHeader, MessageKind, NegotiateRequest,
     NegotiatedCapabilities, NegotiatedResponse, Opcode, PortalCapabilities, PortalErrorCode,
-    PortalFailure, PortalWireError, PrepareEffectRequest, ProviderCapabilities, QueryAbiRequest,
-    QueryEffectRequest, QueryReceiptRequest, QueryScopeRequest, ReceiptObservation,
-    RecordOutcomeRequest, RegisterEffectRequest, RequestBody, ResponseBody, RetryClass,
-    RevokeScopeRequest, ScopeCreatedResponse, ScopeObservation, SessionHandle, decode_message,
-    encode_message, negotiate,
+    PortalFailure, PortalLimits, PortalWireError, PrepareEffectRequest, ProviderCapabilities,
+    QueryAbiRequest, QueryEffectRequest, QueryReceiptRequest, QueryScopeRequest,
+    ReceiptObservation, RecordOutcomeRequest, RegisterEffectRequest, RequestBody, ResponseBody,
+    RetryClass, RevokeScopeRequest, ScopeCreatedResponse, ScopeObservation, SessionHandle,
+    decode_message, encode_message, negotiate, provider_capability_closure,
 };
 
 /// Backend operations required by the portal-v2 dispatcher.
@@ -26,6 +26,15 @@ use crate::{
 /// called only after framing, body validation, successful negotiation,
 /// capability checks, session selection, and (for mutations) replay admission.
 pub trait PortalBackend {
+    /// Returns effective finite capacities for this backend instance.
+    ///
+    /// Backends with concrete selector tables should override the protocol
+    /// maxima. The dispatcher independently clamps replay capacity to its own
+    /// const-generic table.
+    fn portal_limits(&self) -> Result<PortalLimits, PortalWireError> {
+        Ok(PortalLimits::PROTOCOL_MAXIMA)
+    }
+
     /// Creates one bounded causal scope.
     fn create_scope(
         &mut self,
@@ -122,6 +131,7 @@ impl ReplayEntry {
 pub struct PortalDispatcher<B, const REPLAY_SLOTS: usize> {
     backend: B,
     offer: CapabilityOffer,
+    limits: PortalLimits,
     session: SessionHandle,
     negotiated: Option<NegotiatedCapabilities>,
     negotiation_request_id: u64,
@@ -144,6 +154,12 @@ impl<B: PortalBackend, const REPLAY_SLOTS: usize> PortalDispatcher<B, REPLAY_SLO
         {
             return Err(PortalWireError::new(PortalErrorCode::UnknownCapability, 0));
         }
+        if provider_capability_closure(offer.provider) != offer.provider {
+            return Err(PortalWireError::new(
+                PortalErrorCode::MissingRequiredCapability,
+                0,
+            ));
+        }
         let bootstrap = PortalCapabilities::QUERY_ABI | PortalCapabilities::NEGOTIATE;
         if !offer.portal.contains(bootstrap) {
             return Err(PortalWireError::new(
@@ -151,9 +167,14 @@ impl<B: PortalBackend, const REPLAY_SLOTS: usize> PortalDispatcher<B, REPLAY_SLO
                 0,
             ));
         }
+        let replay_capacity = u32::try_from(REPLAY_SLOTS).unwrap_or(u32::MAX);
+        let limits = backend
+            .portal_limits()?
+            .with_replay_capacity(replay_capacity)?;
         Ok(Self {
             backend,
             offer,
+            limits,
             session,
             negotiated: None,
             negotiation_request_id: 0,
@@ -168,22 +189,16 @@ impl<B: PortalBackend, const REPLAY_SLOTS: usize> PortalDispatcher<B, REPLAY_SLO
         self.negotiated
     }
 
+    /// Returns the effective limits advertised by QueryAbi.
+    #[must_use]
+    pub const fn limits(&self) -> PortalLimits {
+        self.limits
+    }
+
     /// Returns the number of permanently occupied replay slots.
     #[must_use]
     pub fn replay_len(&self) -> usize {
         self.replay.iter().filter(|entry| entry.occupied).count()
-    }
-
-    /// Returns a shared reference to the backend for inspection.
-    #[must_use]
-    pub const fn backend(&self) -> &B {
-        &self.backend
-    }
-
-    /// Consumes the dispatcher and returns its backend.
-    #[must_use]
-    pub fn into_backend(self) -> B {
-        self.backend
     }
 
     /// Decodes one complete request and emits one complete terminal response.
@@ -234,7 +249,8 @@ impl<B: PortalBackend, const REPLAY_SLOTS: usize> PortalDispatcher<B, REPLAY_SLO
                 if let Err(error) = QueryAbiRequest::decode_wire(message.body) {
                     return emit_wire_failure(opcode, request_id, error, output);
                 }
-                emit_success(opcode, request_id, &AbiResponse::new(self.offer), output)
+                let response = AbiResponse::with_limits(self.offer, self.limits)?;
+                emit_success(opcode, request_id, &response, output)
             }
             Opcode::Negotiate => self.dispatch_negotiate(request_id, message.body, output),
             opcode if opcode.is_mutation() => {
@@ -547,9 +563,15 @@ fn required_capabilities(opcode: Opcode) -> (PortalCapabilities, ProviderCapabil
             PortalCapabilities::CREATE_SCOPE,
             ProviderCapabilities::empty(),
         ),
-        Opcode::Register | Opcode::Prepare | Opcode::Commit => (
+        Opcode::Register | Opcode::Prepare => (
             PortalCapabilities::EFFECT_LIFECYCLE,
             ProviderCapabilities::EFFECT_CLOSURE,
+        ),
+        Opcode::Commit => (
+            PortalCapabilities::EFFECT_LIFECYCLE,
+            ProviderCapabilities::EFFECT_CLOSURE
+                | ProviderCapabilities::OUTCOME_RECORDING
+                | ProviderCapabilities::EFFECT_COMPLETION,
         ),
         Opcode::RecordOutcome => (
             PortalCapabilities::EFFECT_LIFECYCLE,
@@ -557,7 +579,9 @@ fn required_capabilities(opcode: Opcode) -> (PortalCapabilities, ProviderCapabil
         ),
         Opcode::Complete => (
             PortalCapabilities::EFFECT_LIFECYCLE,
-            ProviderCapabilities::EFFECT_CLOSURE | ProviderCapabilities::EFFECT_COMPLETION,
+            ProviderCapabilities::EFFECT_CLOSURE
+                | ProviderCapabilities::OUTCOME_RECORDING
+                | ProviderCapabilities::EFFECT_COMPLETION,
         ),
         Opcode::Revoke => (
             PortalCapabilities::REVOKE_SCOPE,
@@ -753,7 +777,9 @@ mod tests {
             (
                 Opcode::Commit,
                 PortalCapabilities::EFFECT_LIFECYCLE,
-                ProviderCapabilities::EFFECT_CLOSURE,
+                ProviderCapabilities::EFFECT_CLOSURE
+                    | ProviderCapabilities::OUTCOME_RECORDING
+                    | ProviderCapabilities::EFFECT_COMPLETION,
             ),
             (
                 Opcode::RecordOutcome,
@@ -763,7 +789,9 @@ mod tests {
             (
                 Opcode::Complete,
                 PortalCapabilities::EFFECT_LIFECYCLE,
-                ProviderCapabilities::EFFECT_CLOSURE | ProviderCapabilities::EFFECT_COMPLETION,
+                ProviderCapabilities::EFFECT_CLOSURE
+                    | ProviderCapabilities::OUTCOME_RECORDING
+                    | ProviderCapabilities::EFFECT_COMPLETION,
             ),
             (
                 Opcode::Revoke,

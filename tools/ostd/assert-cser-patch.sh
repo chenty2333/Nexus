@@ -2,7 +2,7 @@
 set -euo pipefail
 
 expected_archive_sha=aa160b3c09e0471f85f76a069e327b3df0bc60d5191b2ce3a64cc15cd62038e1
-expected_patch_sha=0950caa05bfa08467acd00a150246865af82b6ff7f0fc728a33ecf493ffb4912
+expected_patch_sha=6167dc681e8f5e53c20e2ef2ccc40fc1924c722bb9ca37cc4ba4f70ba49b71db
 archive=${NEXUS_OSTD_ARCHIVE:-/opt/nexus-source/ostd-0.18.0.crate}
 patched=${2:-${NEXUS_OSTD_PATCHED_ROOT:-/opt/nexus-ostd/ostd-0.18.0}}
 
@@ -181,6 +181,479 @@ assert_first_task_pre_irq_contract() {
     ' "$processor_source"
 }
 
+assert_task_exit_lifecycle_contract() {
+    local task_source=$1
+    local processor_source=$2
+    local scheduler_source=$3
+    local wait_source=$4
+
+    awk '
+        $0 == "static POST_TASK_EXIT_HANDLER: Once<fn(&Task)> = Once::new();" { handler_statics++ }
+        $0 == "pub fn inject_post_task_exit_handler(handler: fn(&Task)) {" { injection_apis++ }
+        $0 == "    POST_TASK_EXIT_HANDLER.call_once(|| handler);" { injection_installs++ }
+        $0 == "const TASK_LIFECYCLE_CREATED: u8 = 0;" { created_constants++ }
+        $0 == "const TASK_LIFECYCLE_STARTED: u8 = 1;" { started_constants++ }
+        $0 == "const TASK_LIFECYCLE_EXIT_DEQUEUED: u8 = 2;" { dequeued_constants++ }
+        $0 == "const TASK_LIFECYCLE_REAPED: u8 = 3;" { reaped_constants++ }
+        $0 == "const TASK_LIFECYCLE_OBSERVATION_CLAIMED: u8 = 4;" { claimed_constants++ }
+        $0 == "const WAKE_GATE_CLOSED: usize = 1 << (usize::BITS - 1);" { closed_constants++ }
+        $0 == "const WAKE_GATE_RESERVATION_MASK: usize = WAKE_GATE_CLOSED - 1;" { mask_constants++ }
+        $0 == "    exit_lifecycle: AtomicU8," { lifecycle_fields++ }
+        $0 == "    wake_gate: AtomicUsize," { wake_fields++ }
+        $0 == "            exit_lifecycle: AtomicU8::new(TASK_LIFECYCLE_CREATED)," { initializers++ }
+        $0 == "            wake_gate: AtomicUsize::new(0)," { wake_initializers++ }
+        /exit_dequeued: AtomicBool/ { legacy_fields++ }
+        /exit_lifecycle/ { lifecycle_mentions++ }
+        /wake_gate/ { wake_gate_mentions++ }
+        /\.compare_exchange\(/ { compare_exchanges++ }
+        /exit_lifecycle.*\.(store|swap|fetch_)/ { forbidden_writes++ }
+        $0 == "    pub fn run(self: &Arc<Self>) {" { in_run = 1; run_functions++ }
+        in_run && $0 == "        self.publish_started();" { start_calls++; start_line = NR }
+        in_run && $0 == "        scheduler::run_new_task(self.clone());" { enqueue_calls++; enqueue_line = NR }
+        in_run && $0 == "    }" { in_run = 0 }
+        END {
+            if (handler_statics != 1 || injection_apis != 1 || injection_installs != 1 ||
+                created_constants != 1 || started_constants != 1 ||
+                dequeued_constants != 1 || reaped_constants != 1 ||
+                claimed_constants != 1 || closed_constants != 1 || mask_constants != 1 ||
+                lifecycle_fields != 1 || wake_fields != 1 || initializers != 1 ||
+                wake_initializers != 1 || legacy_fields != 0 || lifecycle_mentions != 8 ||
+                wake_gate_mentions != 8 ||
+                compare_exchanges != 4 || forbidden_writes != 0 ||
+                run_functions != 1 || start_calls != 1 || enqueue_calls != 1 || in_run)
+                exit 1
+            exit !(start_line < enqueue_line)
+        }
+    ' "$task_source" || return 1
+
+    awk '
+        function need(line) {
+            if ((getline actual) <= 0 || actual != line) {
+                bad = 1
+                exit
+            }
+        }
+        $0 == "    pub(super) fn reserve_wake(&self) -> bool {" {
+            functions++
+            need("        if !self.is_started() {")
+            need("            return false;")
+            need("        }")
+            need("")
+            need("        let mut observed = self.wake_gate.load(Ordering::Acquire);")
+            need("        loop {")
+            need("            if observed & WAKE_GATE_CLOSED != 0")
+            need("                || observed & WAKE_GATE_RESERVATION_MASK == WAKE_GATE_RESERVATION_MASK")
+            need("            {")
+            need("                return false;")
+            need("            }")
+            need("            match self.wake_gate.compare_exchange_weak(")
+            need("                observed,")
+            need("                observed + 1,")
+            need("                Ordering::AcqRel,")
+            need("                Ordering::Acquire,")
+            need("            ) {")
+            need("                Ok(_) => return true,")
+            need("                Err(actual) => observed = actual,")
+            need("            }")
+            need("        }")
+            need("    }")
+        }
+        END { exit (bad || functions != 1) }
+    ' "$task_source" || return 1
+
+    awk '
+        function need(line) {
+            if ((getline actual) <= 0 || actual != line) {
+                bad = 1
+                exit
+            }
+        }
+        $0 == "    pub(super) fn release_wake(&self) {" {
+            functions++
+            need("        let previous = self.wake_gate.fetch_sub(1, Ordering::Release);")
+            need("        assert_ne!(")
+            need("            previous & WAKE_GATE_RESERVATION_MASK,")
+            need("            0,")
+            need("            \"wake reservation underflow\"")
+            need("        );")
+            need("    }")
+        }
+        END { exit (bad || functions != 1) }
+    ' "$task_source" || return 1
+
+    awk '
+        function need(line) {
+            if ((getline actual) <= 0 || actual != line) {
+                bad = 1
+                exit
+            }
+        }
+        $0 == "    pub(super) fn close_wake_gate(&self) {" {
+            functions++
+            need("        let previous = self.wake_gate.fetch_or(WAKE_GATE_CLOSED, Ordering::AcqRel);")
+            need("        assert_eq!(")
+            need("            previous & WAKE_GATE_CLOSED,")
+            need("            0,")
+            need("            \"task wake gate may only close once\"")
+            need("        );")
+            need("        while self.wake_gate.load(Ordering::Acquire) != WAKE_GATE_CLOSED {")
+            need("            core::hint::spin_loop();")
+            need("        }")
+            need("    }")
+        }
+        END { exit (bad || functions != 1) }
+    ' "$task_source" || return 1
+
+    awk '
+        function need(line) {
+            if ((getline actual) <= 0 || actual != line) {
+                bad = 1
+                exit
+            }
+        }
+        $0 == "    pub fn is_reaped(&self) -> bool {" {
+            functions++
+            need("        self.exit_lifecycle.load(Ordering::Acquire) >= TASK_LIFECYCLE_REAPED")
+            need("    }")
+        }
+        END { exit (bad || functions != 1) }
+    ' "$task_source" || return 1
+
+    awk '
+        function need(line) {
+            if ((getline actual) <= 0 || actual != line) {
+                bad = 1
+                exit
+            }
+        }
+        $0 == "    fn publish_started(&self) {" {
+            functions++
+            need("        self.exit_lifecycle")
+            need("            .compare_exchange(")
+            need("                TASK_LIFECYCLE_CREATED,")
+            need("                TASK_LIFECYCLE_STARTED,")
+            need("                Ordering::AcqRel,")
+            need("                Ordering::Acquire,")
+            need("            )")
+            need("            .expect(\"a task may only be started once\");")
+            need("    }")
+        }
+        END { exit (bad || functions != 1) }
+    ' "$task_source" || return 1
+
+    awk '
+        function need(line) {
+            if ((getline actual) <= 0 || actual != line) {
+                bad = 1
+                exit
+            }
+        }
+        $0 == "    pub(super) fn is_started(&self) -> bool {" {
+            functions++
+            need("        self.exit_lifecycle.load(Ordering::Acquire) == TASK_LIFECYCLE_STARTED")
+            need("    }")
+        }
+        END { exit (bad || functions != 1) }
+    ' "$task_source" || return 1
+
+    awk '
+        function need(line) {
+            if ((getline actual) <= 0 || actual != line) {
+                bad = 1
+                exit
+            }
+        }
+        $0 == "    pub(super) fn publish_exit_dequeued(&self) {" {
+            functions++
+            need("        self.exit_lifecycle")
+            need("            .compare_exchange(")
+            need("                TASK_LIFECYCLE_STARTED,")
+            need("                TASK_LIFECYCLE_EXIT_DEQUEUED,")
+            need("                Ordering::AcqRel,")
+            need("                Ordering::Acquire,")
+            need("            )")
+            need("            .expect(\"terminal dequeue requires a started task\");")
+            need("    }")
+        }
+        END { exit (bad || functions != 1) }
+    ' "$task_source" || return 1
+
+    awk '
+        function need(line) {
+            if ((getline actual) <= 0 || actual != line) {
+                bad = 1
+                exit
+            }
+        }
+        $0 == "    pub(super) fn publish_reaped(&self) {" {
+            functions++
+            need("        let publication = self.exit_lifecycle.compare_exchange(")
+            need("            TASK_LIFECYCLE_EXIT_DEQUEUED,")
+            need("            TASK_LIFECYCLE_REAPED,")
+            need("            Ordering::AcqRel,")
+            need("            Ordering::Acquire,")
+            need("        );")
+            need("        assert!(")
+            need("            publication.is_ok() || publication == Err(TASK_LIFECYCLE_STARTED),")
+            need("            \"switch tail observed an invalid task lifecycle\"")
+            need("        );")
+            need("    }")
+        }
+        END { exit (bad || functions != 1) }
+    ' "$task_source" || return 1
+
+    awk '
+        function need(line) {
+            if ((getline actual) <= 0 || actual != line) {
+                bad = 1
+                exit
+            }
+        }
+        $0 == "    pub(super) fn claim_exit_observation(&self) -> bool {" {
+            functions++
+            need("        self.exit_lifecycle")
+            need("            .compare_exchange(")
+            need("                TASK_LIFECYCLE_REAPED,")
+            need("                TASK_LIFECYCLE_OBSERVATION_CLAIMED,")
+            need("                Ordering::AcqRel,")
+            need("                Ordering::Acquire,")
+            need("            )")
+            need("            .is_ok()")
+            need("    }")
+        }
+        END { exit (bad || functions != 1) }
+    ' "$task_source" || return 1
+
+    if grep -Eq 'pub fn (kill|cancel|force_exit|terminate_task)\(' "$task_source"; then
+        return 1
+    fi
+
+    awk '
+        $0 == "pub(super) fn exit_current() -> ! {" { exit_functions++; in_exit = 1 }
+        in_exit && $0 == "    Task::current()" { current_queries++; current_query_line = NR }
+        in_exit && $0 == "        .expect(\"exit_current requires a current task\")" {
+            current_requires++; current_require_line = NR
+        }
+        /\.close_wake_gate\(\);/ {
+            total_gate_closes++
+            if (in_exit) { gate_closes++; gate_close_line = NR }
+        }
+        in_exit && /update_current\(UpdateFlags::Exit\)/ { updates++; update_line = NR }
+        in_exit && $0 == "            let current = local_rq.dequeue_current();" { dequeues++; dequeue_line = NR }
+        in_exit && $0 == "            if let Some(current) = current.as_ref() {" { guards++; guard_line = NR }
+        /current\.publish_exit_dequeued\(\);/ {
+            total_publications++
+            if (in_exit) { publications++; publication_line = NR }
+        }
+        in_exit && $0 == "/// Yields execution." { in_exit = 0 }
+        END {
+            if (exit_functions != 1 || current_queries != 1 || current_requires != 1 ||
+                gate_closes != 1 || total_gate_closes != 1 || updates != 1 || dequeues != 1 ||
+                guards != 1 || publications != 1 || total_publications != 1 || in_exit)
+                exit 1
+            exit !(current_query_line < current_require_line &&
+                   current_require_line < gate_close_line && gate_close_line < update_line &&
+                   update_line < dequeue_line && dequeue_line < guard_line &&
+                   guard_line < publication_line)
+        }
+    ' "$scheduler_source" || return 1
+
+    awk '
+        $0 == "pub(crate) fn unpark_target(runnable: Arc<Task>) -> bool {" { functions++; in_unpark = 1 }
+        in_unpark && $0 == "    if !runnable.reserve_wake() {" { reservations++; reserve_line = NR }
+        in_unpark && $0 == "        return false;" { rejects++; reject_line = NR }
+        in_unpark && /scheduler_singleton\(\)\.enqueue\(runnable\.clone\(\), EnqueueFlags::Wake\)/ {
+            wake_enqueues++; enqueue_line = NR
+        }
+        in_unpark && $0 == "    runnable.release_wake();" { releases++; release_line = NR }
+        in_unpark && $0 == "    true" { accepts++; accept_line = NR }
+        in_unpark && $0 == "}" { in_unpark = 0 }
+        END {
+            if (functions != 1 || reservations != 1 || rejects != 1 ||
+                wake_enqueues != 1 || releases != 1 || accepts != 1 || in_unpark)
+                exit 1
+            exit !(reserve_line < reject_line && reject_line < enqueue_line &&
+                   enqueue_line < release_line && release_line < accept_line)
+        }
+    ' "$scheduler_source" || return 1
+
+    awk '
+        $0 == "    /// dropped, or if the target task has begun terminal exit." {
+            terminal_exit_docs++
+        }
+        $0 == "    pub fn wake_up(&self) -> bool {" { functions++; in_wake = 1 }
+        in_wake && /self\.has_woken\.swap\(true, Ordering::Release\)/ { swaps++; swap_line = NR }
+        /scheduler::unpark_target\(self\.task\.clone\(\)\)/ {
+            total_unparks++
+            if (in_wake) { unpark_returns++; unpark_line = NR }
+        }
+        in_wake && $0 == "        scheduler::unpark_target(self.task.clone())" {
+            direct_returns++
+        }
+        in_wake && $0 == "    }" { in_wake = 0 }
+        END {
+            if (terminal_exit_docs != 1 || functions != 1 || swaps != 1 || unpark_returns != 1 ||
+                total_unparks != 1 || direct_returns != 1 || in_wake)
+                exit 1
+            exit !(swap_line < unpark_line)
+        }
+    ' "$wait_source" || return 1
+
+    awk '
+        /POST_TASK_EXIT_HANDLER/ { handler_mentions++ }
+        /prev_task\.publish_reaped\(\);/ { total_reap_publications++ }
+        /prev_task\.claim_exit_observation\(\)/ { total_observation_claims++ }
+        /handler\(prev_task\);/ { total_handler_calls++ }
+        /refusing to switch to a task after terminal dequeue/ { terminal_panics++ }
+        $0 == "pub(super) unsafe fn after_switching_to(tail_kind: SwitchTailKind) {" {
+            switch_tails++; in_tail = 1
+        }
+        in_tail && /let prev_task = unsafe \{ Arc::from_raw\(prev\) \};/ {
+            arc_recovers++; arc_recover_line = NR
+        }
+        in_tail && /prev_task\.switched_to_cpu\.store\(false, Ordering::Release\);/ {
+            cpu_releases++; cpu_release_line = NR
+        }
+        in_tail && /prev_task\.publish_reaped\(\);/ { reap_publications++; reap_publication_line = NR }
+        in_tail && $0 == "    crate::arch::irq::enable_local();" {
+            irq_enables++; irq_enable_line = NR; observation_window = 1
+        }
+        observation_window && /disable_local\(\)/ { observer_irq_disables++ }
+        in_tail && $0 == "    if let Some(prev_task) = prev.as_ref()" {
+            previous_borrows++; previous_borrow_line = NR
+        }
+        in_tail && $0 == "        && prev_task.is_reaped()" { reap_guards++; reap_guard_line = NR }
+        in_tail && $0 == "        && let Some(handler) = POST_TASK_EXIT_HANDLER.get()" {
+            handler_lookups++; handler_lookup_line = NR
+        }
+        in_tail && $0 == "        && prev_task.claim_exit_observation()" {
+            observation_claims++; observation_claim_line = NR
+        }
+        in_tail && $0 == "        handler(prev_task);" {
+            handler_calls++; handler_call_line = NR; observation_window = 0
+        }
+        in_tail && $0 == "    drop(prev);" { arc_drops++; arc_drop_line = NR; in_tail = 0 }
+        END {
+            if (handler_mentions != 2 || total_reap_publications != 1 ||
+                total_observation_claims != 1 || total_handler_calls != 1 ||
+                terminal_panics != 0 ||
+                switch_tails != 1 || arc_recovers != 1 || cpu_releases != 1 ||
+                reap_publications != 1 || irq_enables != 1 || observer_irq_disables != 0 ||
+                previous_borrows != 1 || reap_guards != 1 || handler_lookups != 1 ||
+                observation_claims != 1 || handler_calls != 1 || arc_drops != 1 || in_tail)
+                exit 1
+            exit !(arc_recover_line < cpu_release_line &&
+                   cpu_release_line < reap_publication_line &&
+                   reap_publication_line < irq_enable_line &&
+                   irq_enable_line < previous_borrow_line &&
+                   previous_borrow_line < reap_guard_line &&
+                   reap_guard_line < handler_lookup_line &&
+                   handler_lookup_line < observation_claim_line &&
+                   observation_claim_line < handler_call_line &&
+                   handler_call_line < arc_drop_line)
+        }
+    ' "$processor_source"
+}
+
+assert_wake_exit_race_model() {
+    local model_dir=$1
+    local model_source=$model_dir/wake-exit-race-model.rs
+    local model_bin=$model_dir/wake-exit-race-model
+
+    cat >"$model_source" <<'RUST'
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use std::thread;
+
+const CLOSED: usize = 1 << (usize::BITS - 1);
+const RESERVATION_MASK: usize = CLOSED - 1;
+
+struct WakeGate(AtomicUsize);
+
+impl WakeGate {
+    fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+
+    fn reserve(&self) -> bool {
+        let mut observed = self.0.load(Ordering::Acquire);
+        loop {
+            if observed & CLOSED != 0 || observed & RESERVATION_MASK == RESERVATION_MASK {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                observed,
+                observed + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    fn release(&self) {
+        let previous = self.0.fetch_sub(1, Ordering::Release);
+        assert_ne!(previous & RESERVATION_MASK, 0);
+    }
+
+    fn close(&self) {
+        assert_eq!(self.0.fetch_or(CLOSED, Ordering::AcqRel) & CLOSED, 0);
+        while self.0.load(Ordering::Acquire) != CLOSED {
+            thread::yield_now();
+        }
+    }
+}
+
+fn main() {
+    // Reservation linearizes first: close publishes CLOSED but cannot return
+    // until the admitted enqueue releases its reservation.
+    let gate = Arc::new(WakeGate::new());
+    assert!(gate.reserve());
+    let close_returned = Arc::new(AtomicBool::new(false));
+    let close_gate = gate.clone();
+    let close_returned_worker = close_returned.clone();
+    let closer = thread::spawn(move || {
+        close_gate.close();
+        close_returned_worker.store(true, Ordering::Release);
+    });
+    while gate.0.load(Ordering::Acquire) & CLOSED == 0 {
+        thread::yield_now();
+    }
+    assert!(!close_returned.load(Ordering::Acquire));
+    gate.release();
+    closer.join().unwrap();
+    assert!(close_returned.load(Ordering::Acquire));
+
+    // Close linearizes first: every later reservation is rejected.
+    let gate = WakeGate::new();
+    gate.close();
+    assert!(!gate.reserve());
+
+    // A reserver that read OPEN before close must lose its stale CAS after
+    // close publishes the high bit; it cannot enqueue on the stale read.
+    let gate = WakeGate::new();
+    let stale_open = gate.0.load(Ordering::Acquire);
+    gate.close();
+    assert_eq!(
+        gate.0.compare_exchange_weak(
+            stale_open,
+            stale_open + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ),
+        Err(CLOSED),
+    );
+}
+RUST
+
+    rustc --edition=2024 -O "$model_source" -o "$model_bin" || return 1
+    "$model_bin"
+}
+
 assert_callback_rearmed_timer_contract() {
     local apic_source=$1
     local timer_source=$2
@@ -336,10 +809,17 @@ diff -ru "$pristine/src" "$patched/src" >/dev/null \
 
 task_mod=$patched/src/task/mod.rs
 processor_source=$patched/src/task/processor.rs
+scheduler_source=$patched/src/task/scheduler/mod.rs
+wait_source=$patched/src/sync/wait.rs
 assert_first_task_entry_contract "$task_mod" \
     || fail 'first-task-entry handler is absent or outside the trampoline entry boundary'
 assert_first_task_pre_irq_contract "$task_mod" "$processor_source" \
     || fail 'first-task admission is not first-only, IRQ-off, and before local IRQ enable'
+assert_task_exit_lifecycle_contract \
+    "$task_mod" "$processor_source" "$scheduler_source" "$wait_source" \
+    || fail 'task lifecycle is not monotonic, replay-resistant, and exactly-once observed'
+assert_wake_exit_race_model "$tmp" \
+    || fail 'wake/exit reservation interleaving model failed'
 apic_timer_source=$patched/src/arch/x86/timer/apic.rs
 timer_source=$patched/src/arch/x86/timer/mod.rs
 trap_source=$patched/src/arch/x86/trap/mod.rs
@@ -457,6 +937,159 @@ awk '
 ' "$processor_source" >"$handler_enabled_irq"
 if assert_first_task_pre_irq_contract "$task_mod" "$handler_enabled_irq"; then
     fail 'first-task pre-IRQ oracle accepted a handler that returned with local IRQs enabled'
+fi
+
+early_relaxed_reap=$tmp/task-early-relaxed-reap.rs
+awk '
+    !added && $0 == "        self.exit_lifecycle.load(Ordering::Acquire) >= TASK_LIFECYCLE_REAPED" {
+        print "        if self.exit_lifecycle.load(Ordering::Relaxed) >= TASK_LIFECYCLE_EXIT_DEQUEUED {"
+        print "            return true;"
+        print "        }"
+        added = 1
+    }
+    { print }
+    END { if (!added) exit 2 }
+' "$task_mod" >"$early_relaxed_reap"
+if assert_task_exit_lifecycle_contract \
+    "$early_relaxed_reap" "$processor_source" "$scheduler_source" "$wait_source"; then
+    fail 'task-exit oracle accepted a relaxed early-true reap path'
+fi
+
+duplicate_exit_observer=$tmp/processor-duplicate-exit-observer.rs
+awk '
+    !added && $0 == "        handler(prev_task);" {
+        print
+        added = 1
+    }
+    { print }
+    END { if (!added) exit 2 }
+' "$processor_source" >"$duplicate_exit_observer"
+if assert_task_exit_lifecycle_contract \
+    "$task_mod" "$duplicate_exit_observer" "$scheduler_source" "$wait_source"; then
+    fail 'task-exit oracle accepted a duplicate handler call before the claimed call'
+fi
+
+redisabled_exit_observer=$tmp/processor-redisabled-exit-observer.rs
+awk '
+    { print }
+    !added && $0 == "    crate::arch::irq::enable_local();" {
+        print "    let _exit_observer_irq_guard = crate::irq::disable_local();"
+        added = 1
+    }
+    END { if (!added) exit 2 }
+' "$processor_source" >"$redisabled_exit_observer"
+if assert_task_exit_lifecycle_contract \
+    "$task_mod" "$redisabled_exit_observer" "$scheduler_source" "$wait_source"; then
+    fail 'task-exit oracle accepted local IRQ re-disable before observation'
+fi
+
+relaxed_lifecycle_writeback=$tmp/task-relaxed-lifecycle-writeback.rs
+awk '
+    { print }
+    !added && $0 == "            .expect(\"terminal dequeue requires a started task\");" {
+        print "        self.exit_lifecycle.store(TASK_LIFECYCLE_STARTED, Ordering::Relaxed);"
+        added = 1
+    }
+    END { if (!added) exit 2 }
+' "$task_mod" >"$relaxed_lifecycle_writeback"
+if assert_task_exit_lifecycle_contract \
+    "$relaxed_lifecycle_writeback" "$processor_source" "$scheduler_source" "$wait_source"; then
+    fail 'task-exit oracle accepted a relaxed writeback after lifecycle publication'
+fi
+
+missing_start_claim=$tmp/task-missing-start-claim.rs
+sed 's/self\.publish_started();/core::hint::spin_loop();/' \
+    "$task_mod" >"$missing_start_claim"
+if assert_task_exit_lifecycle_contract \
+    "$missing_start_claim" "$processor_source" "$scheduler_source" "$wait_source"; then
+    fail 'task-exit oracle accepted replayable Task::run admission'
+fi
+
+missing_exit_publication=$tmp/scheduler-missing-exit-publication.rs
+sed 's/current\.publish_exit_dequeued();/core::hint::spin_loop();/' \
+    "$scheduler_source" >"$missing_exit_publication"
+if assert_task_exit_lifecycle_contract \
+    "$task_mod" "$processor_source" "$missing_exit_publication" "$wait_source"; then
+    fail 'task-exit oracle accepted terminal dequeue without publication'
+fi
+
+missing_reap_publication=$tmp/processor-missing-reap-publication.rs
+sed 's/prev_task\.publish_reaped();/core::hint::spin_loop();/' \
+    "$processor_source" >"$missing_reap_publication"
+if assert_task_exit_lifecycle_contract \
+    "$task_mod" "$missing_reap_publication" "$scheduler_source" "$wait_source"; then
+    fail 'task-exit oracle accepted switch-out without a REAPED publication'
+fi
+
+missing_observation_claim=$tmp/processor-missing-observation-claim.rs
+sed 's/&& prev_task\.claim_exit_observation()/\&\& true/' \
+    "$processor_source" >"$missing_observation_claim"
+if assert_task_exit_lifecycle_contract \
+    "$task_mod" "$missing_observation_claim" "$scheduler_source" "$wait_source"; then
+    fail 'task-exit oracle accepted an unclaimed observer call'
+fi
+
+waker_ignores_rejection=$tmp/wait-waker-ignores-terminal-rejection.rs
+sed \
+    's/scheduler::unpark_target(self\.task\.clone())/scheduler::unpark_target(self.task.clone()); true/' \
+    "$wait_source" >"$waker_ignores_rejection"
+if assert_task_exit_lifecycle_contract \
+    "$task_mod" "$processor_source" "$scheduler_source" "$waker_ignores_rejection"; then
+    fail 'task-exit oracle accepted a waker that ignores terminal rejection'
+fi
+
+missing_wake_reservation=$tmp/scheduler-missing-wake-reservation.rs
+sed 's/if !runnable\.reserve_wake()/if !runnable.is_started()/' \
+    "$scheduler_source" >"$missing_wake_reservation"
+if assert_task_exit_lifecycle_contract \
+    "$task_mod" "$processor_source" "$missing_wake_reservation" "$wait_source"; then
+    fail 'task-exit oracle accepted wake enqueue without a reservation'
+fi
+
+missing_wake_release=$tmp/scheduler-missing-wake-release.rs
+sed 's/runnable\.release_wake();/core::hint::spin_loop();/' \
+    "$scheduler_source" >"$missing_wake_release"
+if assert_task_exit_lifecycle_contract \
+    "$task_mod" "$processor_source" "$missing_wake_release" "$wait_source"; then
+    fail 'task-exit oracle accepted an enqueue that leaked its wake reservation'
+fi
+
+missing_wake_gate_close=$tmp/scheduler-missing-wake-gate-close.rs
+sed 's/\.close_wake_gate();/.is_reaped();/' \
+    "$scheduler_source" >"$missing_wake_gate_close"
+if assert_task_exit_lifecycle_contract \
+    "$task_mod" "$processor_source" "$missing_wake_gate_close" "$wait_source"; then
+    fail 'task-exit oracle accepted dequeue before closing the wake gate'
+fi
+
+relaxed_wake_gate_close=$tmp/task-relaxed-wake-gate-close.rs
+sed \
+    's/fetch_or(WAKE_GATE_CLOSED, Ordering::AcqRel)/fetch_or(WAKE_GATE_CLOSED, Ordering::Relaxed)/' \
+    "$task_mod" >"$relaxed_wake_gate_close"
+if assert_task_exit_lifecycle_contract \
+    "$relaxed_wake_gate_close" "$processor_source" "$scheduler_source" "$wait_source"; then
+    fail 'task-exit oracle accepted a relaxed wake-gate close'
+fi
+
+pre_irq_exit_observer=$tmp/processor-pre-irq-exit-observer.rs
+awk '
+    $0 == "    crate::arch::irq::enable_local();" {
+        enable = $0
+        removed = 1
+        next
+    }
+    {
+        print
+        if (removed && !inserted && $0 == "        handler(prev_task);") {
+            print enable
+            inserted = 1
+        }
+    }
+    END { if (!removed || !inserted) exit 2 }
+' "$processor_source" >"$pre_irq_exit_observer"
+if assert_task_exit_lifecycle_contract \
+    "$task_mod" "$pre_irq_exit_observer" "$scheduler_source" "$wait_source"; then
+    fail 'task-exit oracle accepted an observer before normal IRQ-enabled task context'
 fi
 
 periodic_timer=$tmp/apic-periodic-timer.rs
@@ -639,4 +1272,4 @@ grep -Fq '.checked_add(1)' "$irq_line" \
 grep -Fq '.checked_sub(1)' "$irq_line" \
     || fail 'trigger-mode release does not check underflow'
 
-echo 'canonical OSTD CSER patch: PASS archive=pinned patch=hash-bound apply=true reverse=true first_task_pre_irq=post-schedule+guarded+preserved+first-only+before-irq pre_irq_mutations=7 first_task_entry=post-irq+before-func apic_timer=callback-rearmed-one-shot irq_tail=kernel+user dynamic_vector=true timer_mutations=8 dma_closure=true gsi=edge+level/high+low ioapic_bits=13+15 irte_tm_bit=4 legacy=edge-high'
+echo 'canonical OSTD CSER patch: PASS archive=pinned patch=hash-bound apply=true reverse=true first_task_pre_irq=post-schedule+guarded+preserved+first-only+before-irq pre_irq_mutations=7 first_task_entry=post-irq+before-func task_exit=created+started+dequeued+reaped+claimed wake_exit=reservation-gated+interleaving-modeled observer=irq-enabled+exactly-once+before-arc-drop exit_mutations=14 arbitrary_kill=false scheduler_tcb=true apic_timer=callback-rearmed-one-shot irq_tail=kernel+user dynamic_vector=true timer_mutations=8 dma_closure=true gsi=edge+level/high+low ioapic_bits=13+15 irte_tm_bit=4 legacy=edge-high'

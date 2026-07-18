@@ -1414,15 +1414,52 @@ diff --git a/src/arch/x86/trap/mod.rs b/src/arch/x86/trap/mod.rs
 +++ b/src/arch/x86/trap/mod.rs
 @@ -192,0 +193 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
 +            super::timer::complete_irq(f.trap_num as u8);
+diff --git a/src/sync/wait.rs b/src/sync/wait.rs
+--- a/src/sync/wait.rs
++++ b/src/sync/wait.rs
+@@ -256,2 +256,2 @@ impl Waker {
+-    /// waiter has already been woken by a previous call to the method, or if the waiter has been
+-    /// dropped.
++    /// waiter has already been woken by a previous call to the method, if the waiter has been
++    /// dropped, or if the target task has begun terminal exit.
+@@ -266,3 +266 @@ impl Waker {
+-        scheduler::unpark_target(self.task.clone());
+-
+-        true
++        scheduler::unpark_target(self.task.clone())
 diff --git a/src/task/mod.rs b/src/task/mod.rs
 --- a/src/task/mod.rs
 +++ b/src/task/mod.rs
-@@ -39,0 +40,4 @@ static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
+@@ -18 +18 @@ use core::{
+-    sync::atomic::AtomicBool,
++    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+@@ -39,0 +40,6 @@ static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
++static POST_TASK_EXIT_HANDLER: Once<fn(&Task)> = Once::new();
++
 +static FIRST_TASK_PRE_IRQ_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 +
 +static FIRST_TASK_ENTRY_HANDLER: Once<fn()> = Once::new();
 +
-@@ -51,0 +66,10 @@ pub fn inject_post_schedule_handler(handler: fn()) {
+@@ -41,0 +48,8 @@ static PRE_USER_RUN_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
++const TASK_LIFECYCLE_CREATED: u8 = 0;
++const TASK_LIFECYCLE_STARTED: u8 = 1;
++const TASK_LIFECYCLE_EXIT_DEQUEUED: u8 = 2;
++const TASK_LIFECYCLE_REAPED: u8 = 3;
++const TASK_LIFECYCLE_OBSERVATION_CLAIMED: u8 = 4;
++const WAKE_GATE_CLOSED: usize = 1 << (usize::BITS - 1);
++const WAKE_GATE_RESERVATION_MASK: usize = WAKE_GATE_CLOSED - 1;
++
+@@ -51,0 +66,20 @@ pub fn inject_post_schedule_handler(handler: fn()) {
++/// Injects an observation handler for completed task exits.
++///
++/// The handler runs once for each task after the task has been dequeued for
++/// exit and switched off its CPU, but before OSTD releases the switch tail's
++/// final temporary task reference. This API observes normal task completion;
++/// it does not request, force, or cancel a task exit.
++pub fn inject_post_task_exit_handler(handler: fn(&Task)) {
++    POST_TASK_EXIT_HANDLER.call_once(|| handler);
++}
++
 +/// Injects a first-switch handler that runs before local IRQs are enabled.
 +pub fn inject_first_task_pre_irq_handler(handler: fn(&DisabledLocalIrqGuard)) {
 +    FIRST_TASK_PRE_IRQ_HANDLER.call_once(|| handler);
@@ -1433,17 +1470,136 @@ diff --git a/src/task/mod.rs b/src/task/mod.rs
 +    FIRST_TASK_ENTRY_HANDLER.call_once(|| handler);
 +}
 +
-@@ -198 +215 @@ impl TaskOptions {
+@@ -89,0 +124,6 @@ pub struct Task {
++    /// Monotonic task lifecycle used to reject replay and claim exit observation.
++    exit_lifecycle: AtomicU8,
++
++    /// Closing bit plus the number of wake enqueues admitted before exit.
++    wake_gate: AtomicUsize,
++
+@@ -121,0 +162 @@ impl Task {
++        self.publish_started();
+@@ -133,0 +175,104 @@ impl Task {
++
++    /// Returns whether the task has completed its terminal CPU switch-out.
++    ///
++    /// A `true` result acquire-observes the monotonic `REAPED` publication.
++    /// It does not mean that all external [`Arc<Task>`] references have been
++    /// released.
++    pub fn is_reaped(&self) -> bool {
++        self.exit_lifecycle.load(Ordering::Acquire) >= TASK_LIFECYCLE_REAPED
++    }
++
++    fn publish_started(&self) {
++        self.exit_lifecycle
++            .compare_exchange(
++                TASK_LIFECYCLE_CREATED,
++                TASK_LIFECYCLE_STARTED,
++                Ordering::AcqRel,
++                Ordering::Acquire,
++            )
++            .expect("a task may only be started once");
++    }
++
++    pub(super) fn is_started(&self) -> bool {
++        self.exit_lifecycle.load(Ordering::Acquire) == TASK_LIFECYCLE_STARTED
++    }
++
++    pub(super) fn reserve_wake(&self) -> bool {
++        if !self.is_started() {
++            return false;
++        }
++
++        let mut observed = self.wake_gate.load(Ordering::Acquire);
++        loop {
++            if observed & WAKE_GATE_CLOSED != 0
++                || observed & WAKE_GATE_RESERVATION_MASK == WAKE_GATE_RESERVATION_MASK
++            {
++                return false;
++            }
++            match self.wake_gate.compare_exchange_weak(
++                observed,
++                observed + 1,
++                Ordering::AcqRel,
++                Ordering::Acquire,
++            ) {
++                Ok(_) => return true,
++                Err(actual) => observed = actual,
++            }
++        }
++    }
++
++    pub(super) fn release_wake(&self) {
++        let previous = self.wake_gate.fetch_sub(1, Ordering::Release);
++        assert_ne!(
++            previous & WAKE_GATE_RESERVATION_MASK,
++            0,
++            "wake reservation underflow"
++        );
++    }
++
++    pub(super) fn close_wake_gate(&self) {
++        let previous = self.wake_gate.fetch_or(WAKE_GATE_CLOSED, Ordering::AcqRel);
++        assert_eq!(
++            previous & WAKE_GATE_CLOSED,
++            0,
++            "task wake gate may only close once"
++        );
++        while self.wake_gate.load(Ordering::Acquire) != WAKE_GATE_CLOSED {
++            core::hint::spin_loop();
++        }
++    }
++
++    pub(super) fn publish_exit_dequeued(&self) {
++        self.exit_lifecycle
++            .compare_exchange(
++                TASK_LIFECYCLE_STARTED,
++                TASK_LIFECYCLE_EXIT_DEQUEUED,
++                Ordering::AcqRel,
++                Ordering::Acquire,
++            )
++            .expect("terminal dequeue requires a started task");
++    }
++
++    pub(super) fn publish_reaped(&self) {
++        let publication = self.exit_lifecycle.compare_exchange(
++            TASK_LIFECYCLE_EXIT_DEQUEUED,
++            TASK_LIFECYCLE_REAPED,
++            Ordering::AcqRel,
++            Ordering::Acquire,
++        );
++        assert!(
++            publication.is_ok() || publication == Err(TASK_LIFECYCLE_STARTED),
++            "switch tail observed an invalid task lifecycle"
++        );
++    }
++
++    pub(super) fn claim_exit_observation(&self) -> bool {
++        self.exit_lifecycle
++            .compare_exchange(
++                TASK_LIFECYCLE_REAPED,
++                TASK_LIFECYCLE_OBSERVATION_CLAIMED,
++                Ordering::AcqRel,
++                Ordering::Acquire,
++            )
++            .is_ok()
++    }
+@@ -198 +343,5 @@ impl TaskOptions {
 -            unsafe { processor::after_switching_to() };
 +            unsafe { processor::after_switching_to(processor::SwitchTailKind::FirstTask) };
-@@ -198,0 +216,4 @@ impl TaskOptions {
 +
 +            if let Some(handler) = FIRST_TASK_ENTRY_HANDLER.get() {
 +                handler();
 +            }
+@@ -245,0 +395,2 @@ impl TaskOptions {
++            exit_lifecycle: AtomicU8::new(TASK_LIFECYCLE_CREATED),
++            wake_gate: AtomicUsize::new(0),
 diff --git a/src/task/processor.rs b/src/task/processor.rs
 --- a/src/task/processor.rs
 +++ b/src/task/processor.rs
+@@ -6 +6 @@ use core::{ptr::NonNull, sync::atomic::Ordering};
+-use super::{POST_SCHEDULE_HANDLER, PRE_SCHEDULE_HANDLER, Task};
++use super::{POST_SCHEDULE_HANDLER, POST_TASK_EXIT_HANDLER, PRE_SCHEDULE_HANDLER, Task};
 @@ -21,0 +22,6 @@ cpu_local_cell! {
 +#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 +pub(super) enum SwitchTailKind {
@@ -1451,13 +1607,15 @@ diff --git a/src/task/processor.rs b/src/task/processor.rs
 +    ResumedTask,
 +}
 +
-@@ -92 +92 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
+@@ -92 +98 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
 -    unsafe { after_switching_to() };
 +    unsafe { after_switching_to(SwitchTailKind::ResumedTask) };
-@@ -119 +119 @@ pub(super) unsafe fn after_switching_to() {
+@@ -119 +125 @@ fn before_switching_to(next_task: &Task, irq_guard: &DisabledLocalIrqGuard) {
 -pub(super) unsafe fn after_switching_to() {
 +pub(super) unsafe fn after_switching_to(tail_kind: SwitchTailKind) {
-@@ -140,0 +141,15 @@ pub(super) unsafe fn after_switching_to() {
+@@ -131,0 +138 @@ pub(super) unsafe fn after_switching_to(tail_kind: SwitchTailKind) {
++        prev_task.publish_reaped();
+@@ -140,0 +148,15 @@ pub(super) unsafe fn after_switching_to(tail_kind: SwitchTailKind) {
 +    if tail_kind == SwitchTailKind::FirstTask {
 +        assert!(
 +            !crate::arch::irq::is_local_enabled(),
@@ -1473,6 +1631,44 @@ diff --git a/src/task/processor.rs b/src/task/processor.rs
 +        );
 +        core::mem::forget(admission_guard);
 +    }
+@@ -143,0 +166,10 @@ pub(super) unsafe fn after_switching_to(tail_kind: SwitchTailKind) {
++
++    // Notify from the new task's normal context, after the exited task is no
++    // longer marked as running and while this switch tail still owns its Arc.
++    if let Some(prev_task) = prev.as_ref()
++        && prev_task.is_reaped()
++        && let Some(handler) = POST_TASK_EXIT_HANDLER.get()
++        && prev_task.claim_exit_observation()
++    {
++        handler(prev_task);
++    }
+diff --git a/src/task/scheduler/mod.rs b/src/task/scheduler/mod.rs
+--- a/src/task/scheduler/mod.rs
++++ b/src/task/scheduler/mod.rs
+@@ -489,2 +489,7 @@ pub(crate) fn park_current<F>(has_unparked: F)
+-pub(crate) fn unpark_target(runnable: Arc<Task>) {
++pub(crate) fn unpark_target(runnable: Arc<Task>) -> bool {
++    if !runnable.reserve_wake() {
++        return false;
++    }
++
+-    let preempt_cpu = scheduler_singleton().enqueue(runnable, EnqueueFlags::Wake);
++    let preempt_cpu = scheduler_singleton().enqueue(runnable.clone(), EnqueueFlags::Wake);
++    runnable.release_wake();
+@@ -493,0 +499,2 @@ pub(crate) fn unpark_target(runnable: Arc<Task>) -> bool {
++
++    true
+@@ -525,0 +533,4 @@ pub(super) fn exit_current() -> ! {
++    Task::current()
++        .expect("exit_current requires a current task")
++        .close_wake_gate();
++
+@@ -532 +543,4 @@ pub(super) fn exit_current() -> ! {
+-            let _current = local_rq.dequeue_current();
++            let current = local_rq.dequeue_current();
++            if let Some(current) = current.as_ref() {
++                current.publish_exit_dequeued();
++            }
 diff --git a/src/timer/jiffies.rs b/src/timer/jiffies.rs
 --- a/src/timer/jiffies.rs
 +++ b/src/timer/jiffies.rs

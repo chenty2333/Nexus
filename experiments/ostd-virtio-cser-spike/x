@@ -61,7 +61,8 @@ image_key=$(sha256sum \
     "$repo_root/kernel/nexus-ostd/Cargo.toml" \
     "$repo_root/kernel/nexus-ostd/Cargo.lock" \
     "$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs" \
-    "$repo_root/kernel/nexus-ostd/src/cser/device_flight.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+    "$repo_root/kernel/nexus-ostd/src/cser/device_flight.rs" \
+    "$repo_root/kernel/nexus-ostd/src/cser/portal_v2.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/ostd-virtio-cser-spike:$image_key"
 runner_base="$root/osdk-runner-base"
 runner_target="$root/target/osdk/ostd-virtio-cser-spike-run-base"
@@ -95,6 +96,7 @@ container() {
         --mount "type=bind,source=$repo_root/kernel/nexus-ostd/Cargo.lock,target=/kernel/nexus-ostd/Cargo.lock,readonly" \
         --mount "type=bind,source=$repo_root/kernel/nexus-ostd/src/cser/effect_registry.rs,target=/kernel/nexus-ostd/src/cser/effect_registry.rs,readonly" \
         --mount "type=bind,source=$repo_root/kernel/nexus-ostd/src/cser/device_flight.rs,target=/kernel/nexus-ostd/src/cser/device_flight.rs,readonly" \
+        --mount "type=bind,source=$repo_root/kernel/nexus-ostd/src/cser/portal_v2.rs,target=/kernel/nexus-ostd/src/cser/portal_v2.rs,readonly" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         -w /work \
         "$image" \

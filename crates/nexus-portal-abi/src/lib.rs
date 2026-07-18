@@ -29,15 +29,16 @@ pub mod response;
 pub use capability::{
     BASE_PORTAL_CAPABILITIES, CapabilityNegotiationError, CapabilityOffer, CapabilityRequest,
     NegotiatedCapabilities, PortalCapabilities, ProviderCapabilities, negotiate, negotiate_then,
+    provider_capability_closure,
 };
 pub use digest::{DIGEST_SIZE, Digest};
 pub use dispatcher::{PortalBackend, PortalDispatcher};
 pub use error::{PortalErrorCode, PortalWireError};
 pub use handle::{EffectHandle, HANDLE_SIZE, ReceiptHandle, ScopeHandle, SessionHandle};
 pub use lifecycle::{
-    CommitEffectRequest, CompleteEffectRequest, CompletionDisposition, MAX_CREDIT_UNITS_PER_EFFECT,
-    MutationContext, OutcomeKind, PrepareEffectRequest, RecordOutcomeRequest,
-    RegisterEffectRequest, RegisterFlags, RevokeReason, RevokeScopeRequest,
+    CommitEffectRequest, CompleteEffectRequest, CompletionDisposition, CreditKind,
+    MAX_CREDIT_UNITS_PER_EFFECT, MutationContext, OutcomeKind, PrepareEffectRequest,
+    RecordOutcomeRequest, RegisterEffectRequest, RegisterFlags, RevokeReason, RevokeScopeRequest,
 };
 pub use message::{
     BASE_HEADER_SIZE, HEADER_MAGIC, HeaderFlags, MAX_BODY_SIZE, MAX_HEADER_SIZE, MAX_MESSAGE_SIZE,
@@ -50,8 +51,9 @@ pub use request::{
     QueryEffectRequest, QueryReceiptRequest, QueryScopeRequest, RequestBody,
 };
 pub use response::{
-    AbiResponse, ClosureReceipt, ClosureStatus, EffectObservation, EffectPhase, ErrorResponse,
-    LifecycleFlags, LifecycleReceipt, MAX_MUTATION_BODY_SIZE, MAX_RESPONSE_BODY_SIZE,
-    NegotiatedResponse, PortalFailure, ReceiptKind, ReceiptObservation, ReceiptStatus,
-    ResponseBody, RetryClass, ScopeCreatedResponse, ScopeObservation, ScopePhase,
+    AbiResponse, ClosureReceipt, ClosureStatus, EffectObservation, EffectOutcomeObservation,
+    EffectPhase, ErrorResponse, LifecycleFlags, LifecycleReceipt, MAX_MUTATION_BODY_SIZE,
+    MAX_RESPONSE_BODY_SIZE, NegotiatedResponse, PortalFailure, PortalLimits, ReceiptKind,
+    ReceiptObservation, ReceiptStatus, ResponseBody, RetryClass, ScopeCreatedResponse,
+    ScopeObservation, ScopePhase,
 };

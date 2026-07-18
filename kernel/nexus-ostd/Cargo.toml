@@ -16,6 +16,7 @@ virtio-cser-precommit-fault = ["virtio-cser-facade"]
 cser-transition-gates = { path = "../../crates/cser-transition-gates" }
 linux-raw-sys = { version = "=0.12.1", default-features = false, features = ["auxvec", "general", "net", "no_std"] }
 nexus-ostd-virtio = { path = "../../crates/nexus-ostd-virtio", optional = true }
+nexus-portal-abi = { path = "../../crates/nexus-portal-abi" }
 object = { version = "=0.39.1", default-features = false, features = ["elf", "read_core"] }
 ostd = { version = "=0.18.0" }
 spin = "=0.9.8"

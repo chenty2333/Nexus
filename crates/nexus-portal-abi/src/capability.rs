@@ -2,9 +2,11 @@
 
 //! Portal and effect-provider capability negotiation.
 //!
-//! The selected set is `offered & (requested | required)`.  Negotiation first
-//! rejects unknown bits and then rejects every missing required bit.  Optional
-//! unsupported bits are absent from the selected set.
+//! The selected portal set is `offered & (requested | required)`. Provider
+//! requests additionally expand to their transitive prerequisite closure.
+//! Negotiation first rejects unknown bits or an internally inconsistent offer,
+//! then rejects every missing required bit. Optional unsupported bits are
+//! absent from the selected set.
 
 use bitflags::bitflags;
 
@@ -37,11 +39,11 @@ bitflags! {
     /// Effect-provider capabilities visible through the portal boundary.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct ProviderCapabilities: u64 {
-        /// Register, prepare, commit, and drive scope-revoke closure.
+        /// Register, prepare, and drive scope-revoke closure.
         ///
-        /// Outcome recording and terminal effect completion are negotiated
-        /// separately so a provider cannot accidentally advertise them by
-        /// implementing only the core closure protocol.
+        /// Crossing the commit boundary additionally requires outcome recording
+        /// and terminal effect completion, so a core-only provider can stop or
+        /// revoke before commit without advertising post-commit behavior.
         const EFFECT_CLOSURE = 1 << 0;
         /// Execute the bounded logical-request provider profile.
         const LOGICAL_REQUEST = 1 << 1;
@@ -105,7 +107,7 @@ pub struct CapabilityNegotiationError {
     pub code: PortalErrorCode,
     /// Required portal operations not present in the offer.
     pub missing_portal: PortalCapabilities,
-    /// Required provider behaviors not present in the offer.
+    /// Required provider behaviors or offered prerequisites not present.
     pub missing_provider: ProviderCapabilities,
 }
 
@@ -117,10 +119,29 @@ fn has_unknown_provider(capabilities: ProviderCapabilities) -> bool {
     capabilities.bits() & !ProviderCapabilities::all().bits() != 0
 }
 
+/// Expands provider capabilities to their transitive prerequisite closure.
+///
+/// Terminal completion requires canonical outcome recording, and outcome
+/// recording requires the core effect-closure protocol. No other provider
+/// capability currently implies another one.
+#[must_use]
+pub fn provider_capability_closure(capabilities: ProviderCapabilities) -> ProviderCapabilities {
+    let mut closed = capabilities;
+    if closed.contains(ProviderCapabilities::EFFECT_COMPLETION) {
+        closed |= ProviderCapabilities::OUTCOME_RECORDING;
+    }
+    if closed.contains(ProviderCapabilities::OUTCOME_RECORDING) {
+        closed |= ProviderCapabilities::EFFECT_CLOSURE;
+    }
+    closed
+}
+
 /// Negotiates an offered/requested/required capability tuple without mutation.
 ///
-/// Required capabilities are checked first.  Unsupported optional capabilities
-/// are simply absent from the result.  Unknown bits fail closed.
+/// Provider offers must include every prerequisite of each advertised behavior.
+/// Requested and required provider sets are expanded to the same dependency
+/// closure before intersection. Unsupported optional capabilities are simply
+/// absent from the result. Unknown bits fail closed.
 pub fn negotiate(
     offer: CapabilityOffer,
     request: CapabilityRequest,
@@ -139,8 +160,11 @@ pub fn negotiate(
         });
     }
 
+    let requested_provider = provider_capability_closure(request.requested_provider);
+    let required_provider = provider_capability_closure(request.required_provider);
     let missing_portal = request.required_portal & !offer.portal;
-    let missing_provider = request.required_provider & !offer.provider;
+    let missing_offer_dependencies = provider_capability_closure(offer.provider) & !offer.provider;
+    let missing_provider = (required_provider & !offer.provider) | missing_offer_dependencies;
     if !missing_portal.is_empty() || !missing_provider.is_empty() {
         return Err(CapabilityNegotiationError {
             code: PortalErrorCode::MissingRequiredCapability,
@@ -151,7 +175,7 @@ pub fn negotiate(
 
     Ok(NegotiatedCapabilities {
         portal: offer.portal & (request.requested_portal | request.required_portal),
-        provider: offer.provider & (request.requested_provider | request.required_provider),
+        provider: offer.provider & (requested_provider | required_provider),
     })
 }
 

@@ -6,6 +6,10 @@ extern crate alloc;
 mod effect_registry;
 
 #[allow(dead_code)]
+#[path = "../../../kernel/nexus-ostd/src/cser/portal_v2.rs"]
+mod portal_v2;
+
+#[allow(dead_code)]
 #[path = "../../../kernel/nexus-ostd/src/cser/device_flight.rs"]
 mod device_flight;
 
@@ -17,4 +21,5 @@ mod device_flight;
 fn production_identity_chain_uses_one_registry_and_shared_ledger() {
     effect_registry::production_identity_registry_self_test();
     device_flight::retained_semantic_self_test();
+    portal_v2::production_portal_v2_self_test();
 }

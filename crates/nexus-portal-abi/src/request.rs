@@ -316,7 +316,10 @@ impl CreateScopeRequest {
         if self.max_effects == 0 || self.max_effects > MAX_EFFECTS_PER_SCOPE {
             return Err(PortalWireError::new(PortalErrorCode::LimitExceeded, 84));
         }
-        if self.max_tombstones == 0 || self.max_tombstones > MAX_TOMBSTONES_PER_SCOPE {
+        if self.max_tombstones == 0
+            || self.max_tombstones > MAX_TOMBSTONES_PER_SCOPE
+            || self.max_tombstones > self.max_effects
+        {
             return Err(PortalWireError::new(PortalErrorCode::LimitExceeded, 88));
         }
         if self.queue_credits > MAX_QUEUE_CREDITS_PER_SCOPE {

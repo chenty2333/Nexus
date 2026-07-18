@@ -328,6 +328,7 @@ dependencies = [
  "cser-transition-gates",
  "linux-raw-sys",
  "nexus-ostd-virtio",
+ "nexus-portal-abi",
  "object",
  "ostd",
  "spin",
@@ -342,6 +343,14 @@ dependencies = [
  "cser-transition-gates",
  "ostd",
  "virtio-drivers",
+ "zerocopy",
+]
+
+[[package]]
+name = "nexus-portal-abi"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.0",
  "zerocopy",
 ]
 

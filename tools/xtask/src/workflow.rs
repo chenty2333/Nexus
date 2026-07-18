@@ -76,7 +76,27 @@ const DEPENDENCY_CACHE_INPUTS: [(&str, &str); 10] = [
     (".cargo/config.toml", "/tmp/nexus-inputs/cargo-config.toml"),
 ];
 const PRODUCTION_REGISTRY_TEST: &str = "crates/cser-transition-gates/tests/production_registry.rs";
-const PRODUCTION_SOURCE_FILES: [&str; 2] = ["effect_registry.rs", "device_flight.rs"];
+const SHARED_PRODUCTION_SOURCE_FILES: [&str; 3] =
+    ["effect_registry.rs", "device_flight.rs", "portal_v2.rs"];
+const KERNEL_PRODUCTION_SOURCE_FILES: [&str; 3] =
+    ["effect_registry.rs", "device_flight.rs", "portal_v2.rs"];
+const PORTAL_ABI_IMAGE_INPUTS: [&str; 15] = [
+    "Cargo.toml",
+    "src/capability.rs",
+    "src/digest.rs",
+    "src/dispatcher.rs",
+    "src/error.rs",
+    "src/handle.rs",
+    "src/lib.rs",
+    "src/lifecycle.rs",
+    "src/message.rs",
+    "src/request.rs",
+    "src/response.rs",
+    "src/response/error.rs",
+    "src/response/lifecycle.rs",
+    "src/response/negotiation.rs",
+    "src/response/query.rs",
+];
 const VIRTIO_AUTHORITY_LOCK: &str = "kernel/nexus-ostd/osdk-runner-base/Cargo.lock";
 const VIRTIO_PRODUCTION_LOCKS: [&str; 5] = [
     "crates/nexus-ostd-virtio/Cargo.lock",
@@ -389,7 +409,7 @@ fn validate_image_identity_inputs(frontdoor: &str) -> Result<()> {
     }
     for declaration in ["build_image() {", "ensure_image() {"] {
         let caller = function_body(frontdoor, declaration)?;
-        let direct_calls = continued_shell_lines(caller)
+        let direct_calls = continued_shell_lines(caller)?
             .iter()
             .filter(|line| line.as_str() == "compute_image_identity")
             .count();
@@ -416,7 +436,7 @@ fn validate_image_identity_inputs(frontdoor: &str) -> Result<()> {
         pipeline,
         "image=\"nexus/cser-dev:$image_key\"".to_string(),
     ];
-    let actual = continued_shell_lines(body);
+    let actual = continued_shell_lines(body)?;
     if actual != expected {
         return Err(format!(
             "root image identity function is not the exact reviewed command sequence: expected {expected:?}, found {actual:?}"
@@ -427,7 +447,7 @@ fn validate_image_identity_inputs(frontdoor: &str) -> Result<()> {
 }
 
 fn validate_workspace_dependency_cache_inputs(dockerfile: &str) -> Result<()> {
-    let logical_lines = continued_shell_lines(dockerfile);
+    let logical_lines = continued_shell_lines(dockerfile)?;
     for (relative, cached) in DEPENDENCY_CACHE_INPUTS {
         let copy = format!("COPY {relative} {cached}");
         if logical_lines.iter().filter(|line| **line == copy).count() != 1 {
@@ -478,13 +498,19 @@ fn validate_workspace_dependency_cache_inputs(dockerfile: &str) -> Result<()> {
     Ok(())
 }
 
-fn continued_shell_lines(source: &str) -> Vec<String> {
+fn continued_shell_lines(source: &str) -> Result<Vec<String>> {
     let mut logical = Vec::new();
     let mut pending = String::new();
     for physical in source.lines() {
         let trimmed = physical.trim();
-        if trimmed.is_empty() || (pending.is_empty() && trimmed.starts_with('#')) {
+        if trimmed.is_empty() {
             continue;
+        }
+        if trimmed.starts_with('#') {
+            if pending.is_empty() {
+                continue;
+            }
+            return Err("comment inside a continued shell command is forbidden".into());
         }
         let continued = trimmed.ends_with('\\');
         let fragment = if continued {
@@ -504,17 +530,33 @@ fn continued_shell_lines(source: &str) -> Vec<String> {
     if !pending.is_empty() {
         logical.push(pending.split_whitespace().collect::<Vec<_>>().join(" "));
     }
-    logical
+    Ok(logical)
 }
 
 fn function_body<'a>(source: &'a str, declaration: &str) -> Result<&'a str> {
-    let (_, tail) = source
-        .split_once(declaration)
-        .ok_or_else(|| format!("workflow lacks function declaration: {declaration}"))?;
-    let (body, _) = tail
-        .split_once("\n}")
-        .ok_or_else(|| format!("workflow function is not terminated: {declaration}"))?;
-    Ok(body)
+    let mut declaration_ends = Vec::new();
+    let mut offset = 0_usize;
+    for line in source.split_inclusive('\n') {
+        if line.trim() == declaration {
+            declaration_ends.push(offset + line.len());
+        }
+        offset += line.len();
+    }
+    if declaration_ends.len() != 1 {
+        return Err(format!(
+            "workflow must contain exactly one active function declaration: {declaration}"
+        )
+        .into());
+    }
+    let body_start = declaration_ends[0];
+    let mut body_end = body_start;
+    for line in source[body_start..].split_inclusive('\n') {
+        if line.trim() == "}" {
+            return Ok(&source[body_start..body_end]);
+        }
+        body_end += line.len();
+    }
+    Err(format!("workflow function is not terminated: {declaration}").into())
 }
 
 fn validate_clean_contract(frontdoor: &str) -> Result<()> {
@@ -622,11 +664,145 @@ fn validate_cold_rebuild_contract(root: &Path, frontdoor: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_backend_source_pair(relative: &str, source: &str, source_root: &str) -> Result<()> {
-    for file in PRODUCTION_SOURCE_FILES {
+fn parse_sha256_image_inputs(command: &str) -> Result<Vec<String>> {
+    const PREFIX: &str = "image_key=$(sha256sum ";
+    const SUFFIX: &str = " | cut -d ' ' -f1 | sha256sum | cut -c1-16)";
+    let inputs = command
+        .strip_prefix(PREFIX)
+        .and_then(|command| command.strip_suffix(SUFFIX))
+        .ok_or("image identity command has a non-canonical pipeline")?;
+    let bytes = inputs.as_bytes();
+    let mut offset = 0_usize;
+    let mut parsed = Vec::new();
+    while offset < bytes.len() {
+        while bytes.get(offset) == Some(&b' ') {
+            offset += 1;
+        }
+        if offset == bytes.len() {
+            break;
+        }
+        if bytes.get(offset) != Some(&b'"') {
+            return Err(format!(
+                "image identity input is not one direct quoted path at byte {offset}"
+            )
+            .into());
+        }
+        offset += 1;
+        let start = offset;
+        while let Some(byte) = bytes.get(offset).copied() {
+            if byte == b'"' {
+                break;
+            }
+            if !(byte.is_ascii_alphanumeric() || matches!(byte, b'$' | b'_' | b'/' | b'.' | b'-')) {
+                return Err(
+                    format!("image identity path contains shell syntax at byte {offset}").into(),
+                );
+            }
+            offset += 1;
+        }
+        if bytes.get(offset) != Some(&b'"') {
+            return Err("unterminated image identity path".into());
+        }
+        let path = &inputs[start..offset];
+        if !(path.starts_with("$root/") || path.starts_with("$repo_root/")) {
+            return Err(format!("image identity input has an unbound path root: {path}").into());
+        }
+        parsed.push(path.to_string());
+        offset += 1;
+        if offset < bytes.len() && bytes[offset] != b' ' {
+            return Err(format!("image identity paths are not separated at byte {offset}").into());
+        }
+    }
+    if parsed.is_empty() {
+        return Err("image identity command has no inputs".into());
+    }
+    let unique = parsed.iter().collect::<BTreeSet<_>>();
+    if unique.len() != parsed.len() {
+        return Err("image identity command contains a duplicate input".into());
+    }
+    Ok(parsed)
+}
+
+fn validate_single_shell_command(command: &str) -> Result<()> {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    for byte in command.bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if byte == b'\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => match byte {
+                b'\\' => escaped = true,
+                b'"' => quote = Quote::None,
+                0x60 => return Err("shell command contains legacy substitution".into()),
+                _ => {}
+            },
+            Quote::None => match byte {
+                b'\\' => escaped = true,
+                b'\'' => quote = Quote::Single,
+                b'"' => quote = Quote::Double,
+                b';' | b'|' | b'&' | b'#' | b'<' | b'>' | 0x60 => {
+                    return Err("shell command contains an unreviewed control operator".into());
+                }
+                _ => {}
+            },
+        }
+    }
+    if escaped || quote != Quote::None {
+        return Err("shell command has an unterminated quote or escape".into());
+    }
+    Ok(())
+}
+
+fn validate_backend_source_pair(
+    relative: &str,
+    source: &str,
+    source_root: &str,
+    files: &[&str],
+) -> Result<()> {
+    let logical = continued_shell_lines(source)?;
+    let image_commands = logical
+        .iter()
+        .filter(|line| line.starts_with("image_key=$(sha256sum "))
+        .collect::<Vec<_>>();
+    if image_commands.len() != 1 {
+        return Err(format!("{relative} must have one canonical image identity command").into());
+    }
+    let image_inputs = parse_sha256_image_inputs(image_commands[0])?;
+    let container = function_body(source, "container() {")?;
+    let container_lines = continued_shell_lines(container)?;
+    let docker_runs = container_lines
+        .iter()
+        .filter(|line| line.starts_with("docker run --rm "))
+        .collect::<Vec<_>>();
+    if docker_runs.len() != 1 {
+        return Err(format!("{relative} must have one canonical container command").into());
+    }
+    validate_single_shell_command(docker_runs[0])?;
+    for file in files {
         let source_path = format!("{source_root}/{file}");
-        let mount_target = format!("target=/kernel/nexus-ostd/src/cser/{file},readonly");
-        if source.matches(&source_path).count() != 2 || !source.contains(&mount_target) {
+        let mount = format!(
+            "--mount \"type=bind,source={source_root}/{file},target=/kernel/nexus-ostd/src/cser/{file},readonly\""
+        );
+        if image_inputs
+            .iter()
+            .filter(|input| input.as_str() == source_path)
+            .count()
+            != 1
+            || docker_runs[0].matches(&mount).count() != 1
+        {
             return Err(format!(
                 "{relative} must hash and live-mount {file} as one production source pair"
             )
@@ -636,23 +812,101 @@ fn validate_backend_source_pair(relative: &str, source: &str, source_root: &str)
     Ok(())
 }
 
+fn validate_backend_docker_source_set(
+    relative: &str,
+    dockerfile: &str,
+    files: &[&str],
+) -> Result<()> {
+    let copy_prefix = match relative {
+        "kernel/nexus-ostd/Dockerfile" => "COPY ",
+        "experiments/ostd-virtio-cser-spike/Dockerfile" => "COPY --from=nexus-root ",
+        _ => return Err(format!("unknown production backend Dockerfile: {relative}").into()),
+    };
+    let sources = files
+        .iter()
+        .map(|file| format!("kernel/nexus-ostd/src/cser/{file}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let expected = format!("{copy_prefix}{sources} /kernel/nexus-ostd/src/cser/");
+    if continued_shell_lines(dockerfile)?
+        .iter()
+        .filter(|line| line.as_str() == expected)
+        .count()
+        != 1
+    {
+        return Err(format!(
+            "{relative} must explicitly bake the exact production Registry source set"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_portal_abi_image_binding(kernel: &str, kernel_dockerfile: &str) -> Result<()> {
+    let logical = continued_shell_lines(kernel)?;
+    let image_commands = logical
+        .iter()
+        .filter(|line| line.starts_with("image_key=$(sha256sum "))
+        .collect::<Vec<_>>();
+    if image_commands.len() != 1 {
+        return Err("kernel/nexus-ostd/x must have one canonical image identity command".into());
+    }
+    let image_inputs = parse_sha256_image_inputs(image_commands[0])?;
+    for relative in PORTAL_ABI_IMAGE_INPUTS {
+        let input = format!("$repo_root/crates/nexus-portal-abi/{relative}");
+        if image_inputs
+            .iter()
+            .filter(|candidate| candidate.as_str() == input)
+            .count()
+            != 1
+        {
+            return Err(format!(
+                "kernel/nexus-ostd/x must hash portal ABI input exactly once: {relative}"
+            )
+            .into());
+        }
+    }
+    let container = function_body(kernel, "container() {")?;
+    let container_lines = continued_shell_lines(container)?;
+    let docker_runs = container_lines
+        .iter()
+        .filter(|line| line.starts_with("docker run --rm "))
+        .collect::<Vec<_>>();
+    let portal_mount = r#"-v "$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z""#;
+    if docker_runs.len() != 1 {
+        return Err("kernel/nexus-ostd/x must have one canonical container command".into());
+    }
+    validate_single_shell_command(docker_runs[0])?;
+    if docker_runs[0].matches(portal_mount).count() != 1 {
+        return Err("kernel/nexus-ostd/x must live-mount the portal ABI exactly once".into());
+    }
+    if continued_shell_lines(kernel_dockerfile)?
+        .iter()
+        .filter(|line| *line == "COPY crates/nexus-portal-abi /crates/nexus-portal-abi")
+        .count()
+        != 1
+    {
+        return Err("kernel Dockerfile must bake the portal ABI exactly once".into());
+    }
+    Ok(())
+}
+
 fn validate_backend_source_binding(root: &Path) -> Result<()> {
-    for (relative, source_root) in [
-        ("kernel/nexus-ostd/x", "$root/src/cser"),
+    for (relative, source_root, files) in [
+        (
+            "kernel/nexus-ostd/x",
+            "$root/src/cser",
+            KERNEL_PRODUCTION_SOURCE_FILES.as_slice(),
+        ),
         (
             "experiments/ostd-virtio-cser-spike/x",
             "$repo_root/kernel/nexus-ostd/src/cser",
+            SHARED_PRODUCTION_SOURCE_FILES.as_slice(),
         ),
     ] {
         let source = fs::read_to_string(root.join(relative))?;
-        validate_backend_source_pair(relative, &source, source_root)?;
+        validate_backend_source_pair(relative, &source, source_root, files)?;
     }
-    let production_source_pair = [
-        "kernel/nexus-ostd/src/cser/effect_registry.rs",
-        "kernel/nexus-ostd/src/cser/device_flight.rs",
-        "/kernel/nexus-ostd/src/cser/",
-    ]
-    .join(" \\\n    ");
     let substrate_binding = [
         "/usr/local/bin/assert-production-virtio-substrate",
         "/crates/nexus-ostd-virtio/src/production.rs",
@@ -666,9 +920,13 @@ fn validate_backend_source_binding(root: &Path) -> Result<()> {
         "experiments/ostd-virtio-cser-spike/Dockerfile",
     ] {
         let dockerfile = fs::read_to_string(root.join(relative))?;
+        let production_files = if relative == "kernel/nexus-ostd/Dockerfile" {
+            KERNEL_PRODUCTION_SOURCE_FILES.as_slice()
+        } else {
+            SHARED_PRODUCTION_SOURCE_FILES.as_slice()
+        };
+        validate_backend_docker_source_set(relative, &dockerfile, production_files)?;
         for source in [
-            "effect_registry.rs",
-            "device_flight.rs",
             "/crates/nexus-ostd-virtio/src/production.rs",
             "/crates/nexus-ostd-virtio/src/lib.rs",
             "/crates/nexus-ostd-virtio/src/portal.rs",
@@ -679,12 +937,6 @@ fn validate_backend_source_binding(root: &Path) -> Result<()> {
                     format!("{relative} does not prime production source: {source}").into(),
                 );
             }
-        }
-        if !dockerfile.contains(&production_source_pair) {
-            return Err(format!(
-                "{relative} does not bake the Registry and device flight as one source pair"
-            )
-            .into());
         }
         if !dockerfile.contains(&substrate_binding) {
             return Err(format!(
@@ -730,7 +982,9 @@ fn validate_backend_source_binding(root: &Path) -> Result<()> {
     if !spike_assertion.contains(&spike_assertion_binding) {
         return Err("spike positive substrate gate lacks explicit PCI source binding".into());
     }
-    Ok(())
+    let kernel = fs::read_to_string(root.join("kernel/nexus-ostd/x"))?;
+    let kernel_dockerfile = fs::read_to_string(root.join("kernel/nexus-ostd/Dockerfile"))?;
+    validate_portal_abi_image_binding(&kernel, &kernel_dockerfile)
 }
 
 fn validate_transition_gate_route(root: &Path) -> Result<()> {
@@ -1061,19 +1315,151 @@ fn parse_direct_cargo_call(source: &str) -> std::result::Result<Vec<String>, Str
     Ok(arguments)
 }
 
+fn module_path(module: &syn::ItemMod) -> Result<String> {
+    if module
+        .attrs
+        .iter()
+        .any(|attribute| attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr"))
+    {
+        return Err(format!("module {} may not be conditionally compiled", module.ident).into());
+    }
+    let mut paths = module
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("path"));
+    let path = paths
+        .next()
+        .ok_or_else(|| format!("module {} lacks an exact path attribute", module.ident))?;
+    if paths.next().is_some() {
+        return Err(format!("module {} has duplicate path attributes", module.ident).into());
+    }
+    let syn::Meta::NameValue(name_value) = &path.meta else {
+        return Err(format!("module {} has a non-literal path attribute", module.ident).into());
+    };
+    let syn::Expr::Lit(expression) = &name_value.value else {
+        return Err(format!("module {} has a computed path attribute", module.ident).into());
+    };
+    let syn::Lit::Str(path) = &expression.lit else {
+        return Err(format!("module {} has a non-string path attribute", module.ident).into());
+    };
+    Ok(path.value())
+}
+
+fn direct_zero_argument_call(statement: &syn::Stmt) -> Option<String> {
+    let syn::Stmt::Expr(syn::Expr::Call(call), Some(_semicolon)) = statement else {
+        return None;
+    };
+    if !call.attrs.is_empty() || !call.args.is_empty() {
+        return None;
+    }
+    let syn::Expr::Path(function) = call.func.as_ref() else {
+        return None;
+    };
+    if function.qself.is_some() || function.path.leading_colon.is_some() {
+        return None;
+    }
+    let segments = function
+        .path
+        .segments
+        .iter()
+        .map(|segment| {
+            if matches!(segment.arguments, syn::PathArguments::None) {
+                Some(segment.ident.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(segments.join("::"))
+}
+
 fn validate_production_registry_gate(source: &str) -> Result<()> {
-    for required in [
-        "../../../kernel/nexus-ostd/src/cser/effect_registry.rs",
-        "../../../kernel/nexus-ostd/src/cser/device_flight.rs",
-        "effect_registry::production_identity_registry_self_test();",
-        "device_flight::retained_semantic_self_test();",
-    ] {
-        if !source.contains(required) {
+    let syntax = syn::parse_file(source)
+        .map_err(|error| format!("{PRODUCTION_REGISTRY_TEST} is not valid Rust source: {error}"))?;
+    let required_modules = [
+        (
+            "effect_registry",
+            "../../../kernel/nexus-ostd/src/cser/effect_registry.rs",
+        ),
+        (
+            "device_flight",
+            "../../../kernel/nexus-ostd/src/cser/device_flight.rs",
+        ),
+        (
+            "portal_v2",
+            "../../../kernel/nexus-ostd/src/cser/portal_v2.rs",
+        ),
+    ];
+    for (name, expected_path) in required_modules {
+        let modules = syntax
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Mod(module) if module.ident == name => Some(module),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if modules.len() != 1
+            || modules[0].content.is_some()
+            || module_path(modules[0])? != expected_path
+        {
             return Err(format!(
-                "{PRODUCTION_REGISTRY_TEST} does not bind both production self-tests: {required}"
+                "{PRODUCTION_REGISTRY_TEST} must bind module {name} exactly once to {expected_path}"
             )
             .into());
         }
+    }
+
+    let tests = syntax
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(function)
+                if function.sig.ident
+                    == "production_identity_chain_uses_one_registry_and_shared_ledger" =>
+            {
+                Some(function)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if tests.len() != 1
+        || !tests[0]
+            .attrs
+            .iter()
+            .any(|attribute| attribute.path().is_ident("test"))
+        || tests[0].attrs.iter().any(|attribute| {
+            attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+        })
+        || !tests[0].sig.inputs.is_empty()
+        || !matches!(tests[0].sig.output, syn::ReturnType::Default)
+    {
+        return Err(format!(
+            "{PRODUCTION_REGISTRY_TEST} must contain the exact zero-argument production test"
+        )
+        .into());
+    }
+    let calls = tests[0]
+        .block
+        .stmts
+        .iter()
+        .map(direct_zero_argument_call)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            format!(
+                "{PRODUCTION_REGISTRY_TEST} production test may contain only direct propagated self-test calls"
+            )
+        })?;
+    let expected = [
+        "effect_registry::production_identity_registry_self_test",
+        "device_flight::retained_semantic_self_test",
+        "portal_v2::production_portal_v2_self_test",
+    ];
+    if calls != expected {
+        return Err(format!(
+            "{PRODUCTION_REGISTRY_TEST} production test call sequence mismatch: {calls:?}"
+        )
+        .into());
     }
     Ok(())
 }
@@ -1800,6 +2186,17 @@ mod tests {
                 .to_string();
             assert!(error.contains(relative));
         }
+        let commented_input = frontdoor.replacen(
+            &format!("    \"$root/{}\" \\\n", IMAGE_IDENTITY_INPUTS[0]),
+            &format!("    # \"$root/{}\" \\\n", IMAGE_IDENTITY_INPUTS[0]),
+            1,
+        );
+        validate_image_identity_inputs(&commented_input)
+            .expect_err("an input inside a continued-command comment must be rejected");
+
+        let commented_declaration = frontdoor.replacen("build_image() {", "# build_image() {", 1);
+        validate_image_identity_inputs(&commented_declaration)
+            .expect_err("a function declaration retained only in a comment must be rejected");
 
         let reordered = frontdoor
             .replace(IMAGE_IDENTITY_INPUTS[0], "FIRST")
@@ -1928,6 +2325,95 @@ mod tests {
     }
 
     #[test]
+    fn virtio_spike_portal_source_is_hash_mounted_and_explicitly_baked() {
+        let root = repository_root();
+        let relative = "experiments/ostd-virtio-cser-spike/x";
+        let docker_relative = "experiments/ostd-virtio-cser-spike/Dockerfile";
+        let spike = fs::read_to_string(root.join(relative)).expect("read spike workflow");
+        let dockerfile =
+            fs::read_to_string(root.join(docker_relative)).expect("read spike Dockerfile");
+        let source_root = "$repo_root/kernel/nexus-ostd/src/cser";
+        validate_backend_source_pair(
+            relative,
+            &spike,
+            source_root,
+            &SHARED_PRODUCTION_SOURCE_FILES,
+        )
+        .expect("spike production source hash and live mounts");
+        validate_backend_docker_source_set(
+            docker_relative,
+            &dockerfile,
+            &SHARED_PRODUCTION_SOURCE_FILES,
+        )
+        .expect("spike explicit production source COPY");
+
+        let missing_hash = spike.replacen(
+            "$repo_root/kernel/nexus-ostd/src/cser/portal_v2.rs",
+            "removed-portal-v2-image-input",
+            1,
+        );
+        assert_ne!(missing_hash, spike);
+        validate_backend_source_pair(
+            relative,
+            &missing_hash,
+            source_root,
+            &SHARED_PRODUCTION_SOURCE_FILES,
+        )
+        .expect_err("portal_v2 must affect the spike image identity");
+
+        let missing_mount = spike.replacen(
+            "        --mount \"type=bind,source=$repo_root/kernel/nexus-ostd/src/cser/portal_v2.rs,target=/kernel/nexus-ostd/src/cser/portal_v2.rs,readonly\" \\\n",
+            "",
+            1,
+        );
+        assert_ne!(missing_mount, spike);
+        validate_backend_source_pair(
+            relative,
+            &missing_mount,
+            source_root,
+            &SHARED_PRODUCTION_SOURCE_FILES,
+        )
+        .expect_err("portal_v2 must be live-mounted into the spike container");
+
+        let missing_copy =
+            dockerfile.replacen("    kernel/nexus-ostd/src/cser/portal_v2.rs \\\n", "", 1);
+        assert_ne!(missing_copy, dockerfile);
+        validate_backend_docker_source_set(
+            docker_relative,
+            &missing_copy,
+            &SHARED_PRODUCTION_SOURCE_FILES,
+        )
+        .expect_err("portal_v2 must be explicitly copied into the cold spike image");
+        let comment_only_copy = format!(
+            "{missing_copy}\n# kernel/nexus-ostd/src/cser/portal_v2.rs retained only in a comment\n"
+        );
+        validate_backend_docker_source_set(
+            docker_relative,
+            &comment_only_copy,
+            &SHARED_PRODUCTION_SOURCE_FILES,
+        )
+        .expect_err("a portal_v2 comment must not satisfy the cold-image COPY");
+
+        let directory_copy = dockerfile.replacen(
+            concat!(
+                "COPY --from=nexus-root kernel/nexus-ostd/src/cser/effect_registry.rs \\\n",
+                "    kernel/nexus-ostd/src/cser/device_flight.rs \\\n",
+                "    kernel/nexus-ostd/src/cser/portal_v2.rs \\\n",
+                "    /kernel/nexus-ostd/src/cser/"
+            ),
+            "COPY --from=nexus-root kernel/nexus-ostd/src/cser/ /kernel/nexus-ostd/src/cser/",
+            1,
+        );
+        assert_ne!(directory_copy, dockerfile);
+        validate_backend_docker_source_set(
+            docker_relative,
+            &directory_copy,
+            &SHARED_PRODUCTION_SOURCE_FILES,
+        )
+        .expect_err("a directory COPY must not replace the explicit production source set");
+    }
+
+    #[test]
     fn production_build_surfaces_keep_cache_evidence_and_source_identity_separate() {
         let root = repository_root();
         let frontdoor = fs::read_to_string(root.join("x")).expect("read root workflow");
@@ -1978,40 +2464,152 @@ mod tests {
         validate_backend_source_binding(&root).expect("production source binding");
         validate_transition_gate_route(&root).expect("transition-gate CI route");
 
+        let kernel_source =
+            fs::read_to_string(root.join("kernel/nexus-ostd/x")).expect("read kernel workflow");
+        let kernel_dockerfile = fs::read_to_string(root.join("kernel/nexus-ostd/Dockerfile"))
+            .expect("read kernel Dockerfile");
+        validate_portal_abi_image_binding(&kernel_source, &kernel_dockerfile)
+            .expect("portal ABI image binding");
+        let early_exit_identity = kernel_source.replacen(
+            "    \"$root/Dockerfile\" \\\n",
+            "    \"$root/Dockerfile\" \\\n    ; exit 0; \\\n",
+            1,
+        );
+        validate_portal_abi_image_binding(&early_exit_identity, &kernel_dockerfile)
+            .expect_err("an early exit may not hide unhashed identity inputs");
+        let commented_container = kernel_source.replacen("container() {", "# container() {", 1);
+        validate_portal_abi_image_binding(&commented_container, &kernel_dockerfile)
+            .expect_err("a container declaration retained only in a comment must be rejected");
+        for relative in PORTAL_ABI_IMAGE_INPUTS {
+            let input = format!("$repo_root/crates/nexus-portal-abi/{relative}");
+            let missing = kernel_source.replacen(&input, "removed-portal-abi-input", 1);
+            validate_portal_abi_image_binding(&missing, &kernel_dockerfile)
+                .expect_err("every portal ABI source must affect the kernel image identity");
+            let commented = format!("{missing}\n# retained marker only: {input}\n");
+            validate_portal_abi_image_binding(&commented, &kernel_dockerfile)
+                .expect_err("a portal ABI input retained only in a comment must be rejected");
+            let in_command_comment = missing.replacen(
+                "image_key=$(sha256sum \\\n",
+                &format!("image_key=$(sha256sum \\\n    # \"{input}\" \\\n"),
+                1,
+            );
+            validate_portal_abi_image_binding(&in_command_comment, &kernel_dockerfile)
+                .expect_err("a portal ABI input in a continued-command comment must be rejected");
+        }
+        let missing_portal_mount = kernel_source.replacen(
+            r#"-v "$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z""#,
+            "removed-portal-abi-mount",
+            1,
+        );
+        validate_portal_abi_image_binding(&missing_portal_mount, &kernel_dockerfile)
+            .expect_err("the live kernel build must mount the portal ABI source");
+        let early_exit_container = kernel_source.replacen(
+            "        -v \"$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z\" \\\n",
+            "        ; exit 0; \\\n        -v \"$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z\" \\\n",
+            1,
+        );
+        validate_portal_abi_image_binding(&early_exit_container, &kernel_dockerfile)
+            .expect_err("an early exit may not bypass the live portal ABI mount");
+        let commented_portal_mount = format!(
+            "{missing_portal_mount}\n# retained marker only: -v \"$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z\"\n"
+        );
+        validate_portal_abi_image_binding(&commented_portal_mount, &kernel_dockerfile)
+            .expect_err("a portal ABI mount retained only in a comment must be rejected");
+        let missing_portal_copy = kernel_dockerfile.replacen(
+            "COPY crates/nexus-portal-abi /crates/nexus-portal-abi",
+            "COPY removed-portal-abi /crates/nexus-portal-abi",
+            1,
+        );
+        validate_portal_abi_image_binding(&kernel_source, &missing_portal_copy)
+            .expect_err("the cold kernel image must bake the portal ABI source");
+        let commented_portal_copy = format!(
+            "{missing_portal_copy}\n# COPY crates/nexus-portal-abi /crates/nexus-portal-abi\n"
+        );
+        validate_portal_abi_image_binding(&kernel_source, &commented_portal_copy)
+            .expect_err("a portal ABI COPY retained only in a comment must be rejected");
+
         let unsafe_default = frontdoor.replace("mode=${1:-cache}", "mode=${1:---all}");
         validate_clean_contract(&unsafe_default)
             .expect_err("evidence-deleting default clean must be rejected");
 
-        for (relative, source_root) in [
-            ("kernel/nexus-ostd/x", "$root/src/cser"),
+        for (relative, source_root, files) in [
+            (
+                "kernel/nexus-ostd/x",
+                "$root/src/cser",
+                KERNEL_PRODUCTION_SOURCE_FILES.as_slice(),
+            ),
             (
                 "experiments/ostd-virtio-cser-spike/x",
                 "$repo_root/kernel/nexus-ostd/src/cser",
+                SHARED_PRODUCTION_SOURCE_FILES.as_slice(),
             ),
         ] {
             let source = fs::read_to_string(root.join(relative)).expect("read backend workflow");
-            for file in PRODUCTION_SOURCE_FILES {
+            for file in files {
                 let source_path = format!("{source_root}/{file}");
                 let missing_hash = source.replacen(&source_path, "removed-production-source", 1);
-                validate_backend_source_pair(relative, &missing_hash, source_root)
+                validate_backend_source_pair(relative, &missing_hash, source_root, files)
                     .expect_err("missing source hash must be rejected");
+                let commented_hash =
+                    format!("{missing_hash}\n# retained marker only: {source_path}\n");
+                validate_backend_source_pair(relative, &commented_hash, source_root, files)
+                    .expect_err("a source hash retained only in a comment must be rejected");
 
                 let mount = format!("target=/kernel/nexus-ostd/src/cser/{file},readonly");
                 let missing_mount = source.replacen(&mount, "removed-production-mount", 1);
-                validate_backend_source_pair(relative, &missing_mount, source_root)
+                validate_backend_source_pair(relative, &missing_mount, source_root, files)
                     .expect_err("missing source mount must be rejected");
+                let commented_mount = format!("{missing_mount}\n# retained marker only: {mount}\n");
+                validate_backend_source_pair(relative, &commented_mount, source_root, files)
+                    .expect_err("a source mount retained only in a comment must be rejected");
             }
         }
 
         let production_registry =
             fs::read_to_string(root.join(PRODUCTION_REGISTRY_TEST)).expect("read registry gate");
+        let disabled_test = production_registry.replacen(
+            "#[test]\nfn production_identity_chain_uses_one_registry_and_shared_ledger()",
+            "#[test]\n#[cfg(any())]\nfn production_identity_chain_uses_one_registry_and_shared_ledger()",
+            1,
+        );
+        validate_production_registry_gate(&disabled_test)
+            .expect_err("a conditionally compiled-out production test must be rejected");
+        let conditional_module = production_registry.replacen(
+            "#[path = \"../../../kernel/nexus-ostd/src/cser/effect_registry.rs\"]",
+            "#[cfg(any())]\n#[path = \"../../../kernel/nexus-ostd/src/cser/effect_registry.rs\"]",
+            1,
+        );
+        validate_production_registry_gate(&conditional_module)
+            .expect_err("a conditionally compiled-out production module must be rejected");
         for required_call in [
             "effect_registry::production_identity_registry_self_test();",
             "device_flight::retained_semantic_self_test();",
+            "portal_v2::production_portal_v2_self_test();",
         ] {
             let missing = production_registry.replace(required_call, "removed_self_test();");
             validate_production_registry_gate(&missing)
                 .expect_err("missing production self-test call must be rejected");
+
+            let comment_only =
+                production_registry.replacen(required_call, &format!("// {required_call}"), 1);
+            validate_production_registry_gate(&comment_only)
+                .expect_err("a self-test name retained only in a comment must be rejected");
+
+            let string_only = production_registry.replacen(
+                required_call,
+                &format!("let _ = {required_call:?};"),
+                1,
+            );
+            validate_production_registry_gate(&string_only)
+                .expect_err("a self-test name retained only in a string must be rejected");
+
+            let disabled_call = production_registry.replacen(
+                required_call,
+                &format!("#[cfg(any())]\n    {required_call}"),
+                1,
+            );
+            validate_production_registry_gate(&disabled_call)
+                .expect_err("a conditionally compiled-out self-test call must be rejected");
         }
     }
 

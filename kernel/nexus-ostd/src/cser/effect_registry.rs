@@ -615,8 +615,58 @@ pub(crate) enum EffectPhase {
 }
 
 impl EffectPhase {
-    const fn is_terminal(self) -> bool {
+    pub(crate) const fn is_terminal(self) -> bool {
         matches!(self, Self::Terminal(_))
+    }
+}
+
+/// Provider-neutral classification of one canonical post-commit outcome.
+///
+/// This type deliberately does not depend on a transport ABI.  Kernel portal
+/// adapters translate their wire enum at the boundary and store the resulting
+/// record here so the Registry, rather than an adapter-local phase machine,
+/// remains authoritative for whether an outcome exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EffectOutcomeClass {
+    Data,
+    Error,
+    Indeterminate,
+}
+
+/// Canonical backend outcome attached exactly once after commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EffectOutcomeRecord {
+    class: EffectOutcomeClass,
+    result: i64,
+    digest: [u8; 32],
+}
+
+impl EffectOutcomeRecord {
+    pub(crate) fn new(
+        class: EffectOutcomeClass,
+        result: i64,
+        digest: [u8; 32],
+    ) -> Result<Self, RegistryError> {
+        if digest.iter().all(|byte| *byte == 0) {
+            return Err(RegistryError::InvalidState);
+        }
+        Ok(Self {
+            class,
+            result,
+            digest,
+        })
+    }
+
+    pub(crate) const fn class(self) -> EffectOutcomeClass {
+        self.class
+    }
+
+    pub(crate) const fn result(self) -> i64 {
+        self.result
+    }
+
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.digest
     }
 }
 
@@ -1274,6 +1324,7 @@ pub(crate) struct TerminalRequest {
     outcome: TerminalOutcome,
     result: i64,
     causal_commit: Option<CommitReceipt>,
+    manifest_digest: Option<[u8; 32]>,
 }
 
 impl TerminalRequest {
@@ -1282,6 +1333,7 @@ impl TerminalRequest {
             outcome: TerminalOutcome::Aborted,
             result,
             causal_commit: None,
+            manifest_digest: None,
         }
     }
 
@@ -1290,6 +1342,7 @@ impl TerminalRequest {
             outcome: TerminalOutcome::Completed,
             result,
             causal_commit: None,
+            manifest_digest: None,
         }
     }
 
@@ -1298,6 +1351,7 @@ impl TerminalRequest {
             outcome: TerminalOutcome::Completed,
             result,
             causal_commit: Some(causal_commit),
+            manifest_digest: None,
         }
     }
 
@@ -1306,7 +1360,22 @@ impl TerminalRequest {
             outcome: TerminalOutcome::IndeterminateAfterReset,
             result,
             causal_commit: None,
+            manifest_digest: None,
         }
+    }
+
+    /// Binds an opaque, non-zero canonical terminal manifest to this request.
+    ///
+    /// The Registry does not choose the caller's canonicalization or hash
+    /// algorithm. It stores these exact bytes in the authoritative terminal
+    /// receipt so a restarted portal/provider can compare the same manifest
+    /// without keeping a second terminal winner.
+    pub(crate) fn with_manifest_digest(mut self, digest: [u8; 32]) -> Result<Self, RegistryError> {
+        if digest.iter().all(|byte| *byte == 0) {
+            return Err(RegistryError::InvalidState);
+        }
+        self.manifest_digest = Some(digest);
+        Ok(self)
     }
 }
 
@@ -1317,6 +1386,7 @@ pub(crate) struct TerminalReceipt {
     result: i64,
     sequence: u64,
     causal_commit: Option<CommitReceipt>,
+    manifest_digest: Option<[u8; 32]>,
 }
 
 impl TerminalReceipt {
@@ -1334,6 +1404,10 @@ impl TerminalReceipt {
 
     pub(crate) const fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub(crate) const fn manifest_digest(&self) -> Option<[u8; 32]> {
+        self.manifest_digest
     }
 }
 
@@ -1449,6 +1523,8 @@ pub(crate) struct EffectView {
     pub(crate) descriptor: SyscallDescriptor,
     pub(crate) phase: EffectPhase,
     pub(crate) commit: Option<CommitReceipt>,
+    pub(crate) outcome: Option<EffectOutcomeRecord>,
+    pub(crate) outcome_required: bool,
     pub(crate) terminal: Option<TerminalReceipt>,
     pub(crate) publication_pending: bool,
 }
@@ -1483,6 +1559,8 @@ struct EffectRecord {
     credit_state: CreditState,
     publication_mode: PublicationMode,
     commit: Option<CommitReceipt>,
+    outcome: Option<EffectOutcomeRecord>,
+    outcome_required: bool,
     device_batch: Option<DeviceBatchMembership>,
     terminal: Option<TerminalReceipt>,
     pending_publication: Option<PublicationTicket>,
@@ -1772,6 +1850,8 @@ impl EffectRecord {
             descriptor: self.descriptor,
             phase: self.phase,
             commit: self.commit.clone(),
+            outcome: self.outcome,
+            outcome_required: self.outcome_required,
             terminal: self.terminal.clone(),
             publication_pending: self.pending_publication.is_some(),
         }
@@ -1914,6 +1994,9 @@ pub(crate) struct RecoveryEffectSummary {
     pub(crate) phase: EffectPhase,
     pub(crate) descriptor_digest: u64,
     pub(crate) commit_sequence: Option<u64>,
+    pub(crate) outcome_required: bool,
+    pub(crate) outcome: Option<EffectOutcomeRecord>,
+    pub(crate) terminal_manifest_digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1945,6 +2028,9 @@ pub(crate) struct RecoveryItem {
     pub(crate) descriptor: SyscallDescriptor,
     pub(crate) phase: EffectPhase,
     pub(crate) commit: Option<CommitReceipt>,
+    pub(crate) outcome_required: bool,
+    pub(crate) outcome: Option<EffectOutcomeRecord>,
+    pub(crate) terminal_manifest_digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2255,6 +2341,170 @@ impl EffectRegistry {
         }
     }
 
+    /// Builds a private transaction candidate containing only one scope and
+    /// its effects.  Unlike the evidence clone above, cost is independent of
+    /// unrelated tenants and history.
+    fn scope_transaction_candidate(&self, scope_key: ScopeKey) -> Result<Self, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?
+            .clone();
+        let effects = self
+            .effects
+            .iter()
+            .filter(|(_, record)| record.identity.scope == scope_key)
+            .map(|(key, record)| (*key, record.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let keys = effects.keys().copied().collect::<BTreeSet<_>>();
+
+        let by_scope = self
+            .by_scope
+            .get(&scope_key)
+            .cloned()
+            .map(|members| BTreeMap::from([(scope_key, members)]))
+            .unwrap_or_default();
+        let by_task = self
+            .by_task
+            .iter()
+            .filter_map(|(task, members)| {
+                let selected = members
+                    .intersection(&keys)
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                (!selected.is_empty()).then_some((*task, selected))
+            })
+            .collect();
+        let by_resource = self
+            .by_resource
+            .iter()
+            .filter_map(|(resource, members)| {
+                let selected = members
+                    .intersection(&keys)
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                (!selected.is_empty()).then_some((*resource, selected))
+            })
+            .collect();
+        let by_domain = self
+            .production
+            .by_domain
+            .iter()
+            .filter(|((scope, _), _)| *scope == scope_key)
+            .map(|(key, members)| (*key, members.clone()))
+            .collect();
+        let children_by_parent = self
+            .production
+            .children_by_parent
+            .iter()
+            .filter_map(|(parent, children)| {
+                if !keys.contains(parent) {
+                    return None;
+                }
+                let selected = children
+                    .intersection(&keys)
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                (!selected.is_empty()).then_some((*parent, selected))
+            })
+            .collect();
+        let leaves_by_scope = self
+            .production
+            .leaves_by_scope
+            .get(&scope_key)
+            .cloned()
+            .map(|members| BTreeMap::from([(scope_key, members)]))
+            .unwrap_or_default();
+
+        Ok(Self {
+            instance_id: self.instance_id,
+            device_publication_mode: self.device_publication_mode,
+            scopes: BTreeMap::from([(scope_key, scope)]),
+            effects,
+            by_scope,
+            by_task,
+            by_resource,
+            production: Box::new(ProductionIndexes {
+                by_domain,
+                children_by_parent,
+                leaves_by_scope,
+            }),
+            next_effect_id: self.next_effect_id,
+            next_nonce: self.next_nonce,
+            next_commit_sequence: self.next_commit_sequence,
+            next_device_enrollment_sequence: self.next_device_enrollment_sequence,
+            next_device_batch_sequence: self.next_device_batch_sequence,
+            next_device_closure_sequence: self.next_device_closure_sequence,
+            next_terminal_sequence: self.next_terminal_sequence,
+            next_publication_sequence: self.next_publication_sequence,
+            next_revoke_sequence: self.next_revoke_sequence,
+        })
+    }
+
+    /// Installs a successfully revoked single-scope transaction without any
+    /// allocation or fallible transition after live state begins to change.
+    fn install_revoked_scope_candidate(
+        &mut self,
+        scope_key: ScopeKey,
+        mut candidate: Self,
+    ) -> Result<(), RegistryError> {
+        let keys = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?
+            .closure_candidates
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let replacement_scope = candidate
+            .scopes
+            .remove(&scope_key)
+            .filter(|scope| scope.phase == ScopePhase::Revoked)
+            .ok_or(RegistryError::InvalidState)?;
+        let mut replacements = Vec::with_capacity(keys.len());
+        for key in &keys {
+            if !self.effects.contains_key(key) {
+                return Err(RegistryError::UnknownEffect);
+            }
+            let replacement = candidate
+                .effects
+                .remove(key)
+                .ok_or(RegistryError::UnknownEffect)?;
+            replacements.push((*key, replacement));
+        }
+
+        for key in &keys {
+            let record = &self.effects[key];
+            remove_index_member(&mut self.by_task, record.identity.task, *key);
+            for resource in &record.current_resources {
+                remove_index_member(&mut self.by_resource, *resource, *key);
+            }
+            if let Some(parent) = record.identity.parent {
+                remove_index_member(&mut self.production.children_by_parent, parent, *key);
+            }
+        }
+        self.by_scope.remove(&scope_key);
+        self.production
+            .by_domain
+            .retain(|(scope, _), _| *scope != scope_key);
+        self.production.leaves_by_scope.remove(&scope_key);
+        for key in &keys {
+            self.production.children_by_parent.remove(key);
+        }
+        for (key, replacement) in replacements {
+            if let Some(record) = self.effects.get_mut(&key) {
+                *record = replacement;
+            }
+        }
+        if let Some(scope) = self.scopes.get_mut(&scope_key) {
+            *scope = replacement_scope;
+        }
+        self.next_terminal_sequence = candidate.next_terminal_sequence;
+        self.next_publication_sequence = candidate.next_publication_sequence;
+        self.next_revoke_sequence = candidate.next_revoke_sequence;
+        Ok(())
+    }
+
     /// Clones a legacy composition candidate without duplicating device
     /// publication authority.
     ///
@@ -2493,7 +2743,32 @@ impl EffectRegistry {
         &mut self,
         request: RegisterRequest,
     ) -> Result<RegisteredEffect, RegistryError> {
-        self.register_in_domain(request, DomainKey::LEGACY, None, None)
+        self.register_in_domain(request, DomainKey::LEGACY, None, None, false)
+    }
+
+    /// Registers an effect in the legacy service domain while preserving one
+    /// already-authoritative parent identity.
+    ///
+    /// This is used by provider-neutral kernel portals whose wire contract has
+    /// effect ancestry but no service-domain selector.  The parent key is
+    /// resolved from an opaque Registry handle by the adapter; callers cannot
+    /// manufacture it from wire fields.
+    pub(crate) fn register_with_parent(
+        &mut self,
+        request: RegisterRequest,
+        parent: Option<EffectKey>,
+    ) -> Result<RegisteredEffect, RegistryError> {
+        self.register_in_domain(request, DomainKey::LEGACY, parent, None, false)
+    }
+
+    /// Registers a provider effect whose committed terminalization is blocked
+    /// until the Registry contains a determinate canonical outcome.
+    pub(crate) fn register_with_parent_requiring_outcome(
+        &mut self,
+        request: RegisterRequest,
+        parent: Option<EffectKey>,
+    ) -> Result<RegisteredEffect, RegistryError> {
+        self.register_in_domain(request, DomainKey::LEGACY, parent, None, true)
     }
 
     pub(crate) fn register_derived(
@@ -2503,7 +2778,7 @@ impl EffectRegistry {
         if request.domain == DomainKey::LEGACY {
             return Err(RegistryError::InvalidState);
         }
-        self.register_in_domain(request.request, request.domain, request.parent, None)
+        self.register_in_domain(request.request, request.domain, request.parent, None, false)
     }
 
     pub(crate) fn register_device_derived(
@@ -2520,6 +2795,7 @@ impl EffectRegistry {
             request.derived.domain,
             request.derived.parent,
             Some(request.device),
+            false,
         )
     }
 
@@ -2529,6 +2805,7 @@ impl EffectRegistry {
         domain: DomainKey,
         parent: Option<EffectKey>,
         device: Option<DeviceEnvelope>,
+        outcome_required: bool,
     ) -> Result<RegisteredEffect, RegistryError> {
         validate_generation(request.scope.generation)?;
         validate_generation(request.task.generation)?;
@@ -2673,6 +2950,8 @@ impl EffectRegistry {
             credit_state: CreditState::Held,
             publication_mode: request.publication,
             commit: None,
+            outcome: None,
+            outcome_required,
             device_batch: None,
             terminal: None,
             pending_publication: None,
@@ -2888,6 +3167,64 @@ impl EffectRegistry {
             .expect("one commit produces one outcome"))
     }
 
+    /// Atomically advances one provider-domain revision and commits one
+    /// prepared effect against that exact revision.
+    pub(crate) fn commit_after_domain_change(
+        &mut self,
+        sender: TaskKey,
+        handle: PortalHandle,
+        metadata: CommitMetadata,
+    ) -> Result<CommitOutcome, RegistryError> {
+        Ok(self
+            .commit_with_moves_inner(
+                sender,
+                &[(handle, metadata)],
+                &[],
+                Some(metadata.domain_revision),
+            )?
+            .pop()
+            .expect("one commit produces one outcome"))
+    }
+
+    /// Attaches one canonical backend outcome to an already committed effect.
+    ///
+    /// The outcome is Registry state, not adapter-local lifecycle state.  An
+    /// exact repeat is idempotent; any different class, result, or digest for
+    /// the same committed effect is a permanent commit conflict.  The scope
+    /// revision advances only for the first accepted record.
+    pub(crate) fn record_outcome(
+        &mut self,
+        sender: TaskKey,
+        handle: PortalHandle,
+        outcome: EffectOutcomeRecord,
+    ) -> Result<EffectOutcomeRecord, RegistryError> {
+        let effect = self.validate_portal(sender, handle)?;
+        let record = self.effects.get(&effect).unwrap();
+        if record.phase != EffectPhase::Committed {
+            return Err(RegistryError::InvalidState);
+        }
+        if let Some(existing) = record.outcome {
+            if existing == outcome {
+                return Ok(existing);
+            }
+            if existing.class() != EffectOutcomeClass::Indeterminate
+                || outcome.class() == EffectOutcomeClass::Indeterminate
+            {
+                return Err(RegistryError::CommitConflict);
+            }
+        }
+        let scope_key = record.identity.scope;
+        let next_scope_revision = self.scopes[&scope_key]
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::CounterOverflow)?;
+        self.effects.get_mut(&effect).unwrap().outcome = Some(outcome);
+        let scope = self.scopes.get_mut(&scope_key).unwrap();
+        scope.revision = next_scope_revision;
+        scope.invalidate_recovery_readiness();
+        Ok(outcome)
+    }
+
     /// Atomically commits a nonempty batch and migrates disjoint live effects
     /// between opaque current-resource indexes.
     ///
@@ -2901,6 +3238,16 @@ impl EffectRegistry {
         sender: TaskKey,
         commits: &[(PortalHandle, CommitMetadata)],
         moves: &[ResourceMove],
+    ) -> Result<Vec<CommitOutcome>, RegistryError> {
+        self.commit_with_moves_inner(sender, commits, moves, None)
+    }
+
+    fn commit_with_moves_inner(
+        &mut self,
+        sender: TaskKey,
+        commits: &[(PortalHandle, CommitMetadata)],
+        moves: &[ResourceMove],
+        domain_change: Option<u64>,
     ) -> Result<Vec<CommitOutcome>, RegistryError> {
         if commits.is_empty() {
             return Err(RegistryError::InvalidState);
@@ -2992,9 +3339,26 @@ impl EffectRegistry {
             .checked_add(count)
             .ok_or(RegistryError::CounterOverflow)?;
         let scope_key = scope_key.expect("nonempty commit batch has a scope");
+        let next_domain_revision = if let Some(presented) = domain_change {
+            let expected = self.scopes[&scope_key]
+                .domain_revision
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOverflow)?;
+            if presented != expected
+                || commits
+                    .iter()
+                    .any(|(_, metadata)| metadata.domain_revision != expected)
+            {
+                return Err(RegistryError::InvalidState);
+            }
+            Some(expected)
+        } else {
+            None
+        };
+        let revision_advance = if next_domain_revision.is_some() { 2 } else { 1 };
         let next_scope_revision = self.scopes[&scope_key]
             .revision
-            .checked_add(1)
+            .checked_add(revision_advance)
             .ok_or(RegistryError::CounterOverflow)?;
         let mut receipts = Vec::with_capacity(commits.len());
         for (offset, (handle, metadata)) in commits.iter().enumerate() {
@@ -3036,6 +3400,9 @@ impl EffectRegistry {
             record.commit = Some(receipt.clone());
         }
         let scope = self.scopes.get_mut(&scope_key).unwrap();
+        if let Some(domain_revision) = next_domain_revision {
+            scope.domain_revision = domain_revision;
+        }
         scope.revision = next_scope_revision;
         scope.invalidate_recovery_readiness();
         Ok(receipts.into_iter().map(CommitOutcome::Applied).collect())
@@ -5568,6 +5935,12 @@ impl EffectRegistry {
                 phase: record.phase,
                 descriptor_digest: record.descriptor.digest(),
                 commit_sequence: record.commit.as_ref().map(CommitReceipt::sequence),
+                outcome_required: record.outcome_required,
+                outcome: record.outcome,
+                terminal_manifest_digest: record
+                    .terminal
+                    .as_ref()
+                    .and_then(TerminalReceipt::manifest_digest),
             });
         }
         let snapshot = RecoverySnapshot {
@@ -5679,6 +6052,12 @@ impl EffectRegistry {
             descriptor: record.descriptor,
             phase: record.phase,
             commit: record.commit.clone(),
+            outcome_required: record.outcome_required,
+            outcome: record.outcome,
+            terminal_manifest_digest: record
+                .terminal
+                .as_ref()
+                .and_then(TerminalReceipt::manifest_digest),
         }))
     }
 
@@ -5852,6 +6231,12 @@ impl EffectRegistry {
                 phase: record.phase,
                 descriptor_digest: record.descriptor.digest(),
                 commit_sequence: record.commit.as_ref().map(CommitReceipt::sequence),
+                outcome_required: record.outcome_required,
+                outcome: record.outcome,
+                terminal_manifest_digest: record
+                    .terminal
+                    .as_ref()
+                    .and_then(TerminalReceipt::manifest_digest),
             });
         }
         let snapshot = DomainRecoverySnapshot {
@@ -5994,6 +6379,12 @@ impl EffectRegistry {
             descriptor: record.descriptor,
             phase: record.phase,
             commit: record.commit.clone(),
+            outcome_required: record.outcome_required,
+            outcome: record.outcome,
+            terminal_manifest_digest: record
+                .terminal
+                .as_ref()
+                .and_then(TerminalReceipt::manifest_digest),
         }))
     }
 
@@ -6598,6 +6989,70 @@ impl EffectRegistry {
         map_handoff_gate(scope.handoff_gate.require_open())?;
         let plan = self.prepare_revoke_begin(scope_key)?;
         Ok(self.apply_revoke_begin(plan))
+    }
+
+    /// Failure-atomically closes one non-device, non-publishing scope whose
+    /// committed effects all have determinate recorded outcomes.
+    ///
+    /// This is the bounded portal-v2 closure primitive.  It deliberately
+    /// rejects an indeterminate or missing committed outcome before freezing
+    /// authority: such work must remain queryable for a future reconcile path,
+    /// never be reported as closed.  The private candidate Registry is not an
+    /// authority clone exposed to callers; it is installed only after every
+    /// revoke transition and the final quiescence check succeed.
+    pub(crate) fn revoke_nonpublishing_with_recorded_outcomes(
+        &mut self,
+        scope_key: ScopeKey,
+    ) -> Result<RevokeSelection, RegistryError> {
+        let scope = self
+            .scopes
+            .get(&scope_key)
+            .ok_or(RegistryError::UnknownScope)?;
+        map_handoff_gate(scope.handoff_gate.require_open())?;
+        if scope.phase != ScopePhase::Active || scope.device_root.is_some() {
+            return Err(RegistryError::InvalidState);
+        }
+        for effect in &scope.closure_candidates {
+            let record = self
+                .effects
+                .get(effect)
+                .ok_or(RegistryError::UnknownEffect)?;
+            if record.publication_mode != PublicationMode::None {
+                return Err(RegistryError::PublicationPending);
+            }
+            if record.commit.is_some()
+                && !record
+                    .outcome
+                    .is_some_and(|outcome| outcome.class() != EffectOutcomeClass::Indeterminate)
+            {
+                return Err(RegistryError::NotQuiescent);
+            }
+        }
+
+        let mut candidate = self.scope_transaction_candidate(scope_key)?;
+        let selection = candidate.revoke_begin(scope_key)?;
+        while let Some(next) = candidate.revoke_next(&selection)? {
+            let terminal = match next.disposition {
+                RevokeDisposition::Abort => TerminalRequest::aborted(-125),
+                RevokeDisposition::Drain(_) => {
+                    let outcome = candidate
+                        .effects
+                        .get(&next.effect)
+                        .and_then(|record| record.outcome)
+                        .ok_or(RegistryError::NotQuiescent)?;
+                    TerminalRequest::completed(outcome.result())
+                        .with_manifest_digest(outcome.digest())?
+                }
+            };
+            let terminalization =
+                candidate.stage_revoke_terminal(&selection, next.effect, terminal)?;
+            if terminalization.publication.is_some() {
+                return Err(RegistryError::InvalidPublication);
+            }
+        }
+        candidate.revoke_complete(&selection)?;
+        self.install_revoked_scope_candidate(scope_key, candidate)?;
+        Ok(selection)
     }
 
     fn prepare_revoke_begin(&self, scope_key: ScopeKey) -> Result<RevokeBeginPlan, RegistryError> {
@@ -7431,6 +7886,13 @@ impl EffectRegistry {
             if !nonces.insert(record.nonce) {
                 return Err(RegistryError::Invariant("duplicate portal nonce"));
             }
+            if record.outcome.is_some_and(|outcome| {
+                record.commit.is_none() || outcome.digest().iter().all(|byte| *byte == 0)
+            }) {
+                return Err(RegistryError::Invariant(
+                    "canonical outcome lacks committed cause",
+                ));
+            }
 
             match record.phase {
                 EffectPhase::Registered | EffectPhase::Prepared => {
@@ -7443,6 +7905,7 @@ impl EffectRegistry {
                                 })
                         });
                     if record.commit.is_some()
+                        || record.outcome.is_some()
                         || record.device_batch.is_some()
                         || record.terminal.is_some()
                         || record.terminalizations != 0
@@ -7480,11 +7943,32 @@ impl EffectRegistry {
                     if outcome == TerminalOutcome::Aborted && record.commit.is_some() {
                         return Err(RegistryError::Invariant("committed effect aborted"));
                     }
+                    if outcome == TerminalOutcome::Aborted && record.outcome.is_some() {
+                        return Err(RegistryError::Invariant("aborted effect recorded outcome"));
+                    }
                     if outcome == TerminalOutcome::Completed
                         && record.commit.is_none()
                         && terminal.causal_commit.is_none()
                     {
                         return Err(RegistryError::Invariant("completion lacks commit cause"));
+                    }
+                    if outcome == TerminalOutcome::Completed
+                        && record.outcome.is_some_and(|recorded| {
+                            recorded.class() == EffectOutcomeClass::Indeterminate
+                                || recorded.result() != terminal.result
+                        })
+                    {
+                        return Err(RegistryError::Invariant(
+                            "completion conflicts with canonical outcome",
+                        ));
+                    }
+                    if outcome == TerminalOutcome::Completed
+                        && record.outcome_required
+                        && record.outcome.is_none()
+                    {
+                        return Err(RegistryError::Invariant(
+                            "required completion lacks canonical outcome",
+                        ));
                     }
                     if terminal.causal_commit.as_ref().is_some_and(|causal| {
                         !causal_commit_matches(
@@ -7505,6 +7989,16 @@ impl EffectRegistry {
                     {
                         return Err(RegistryError::Invariant(
                             "indeterminate terminal lacks committed device cause",
+                        ));
+                    }
+                    if outcome == TerminalOutcome::IndeterminateAfterReset
+                        && record.outcome.is_some_and(|recorded| {
+                            recorded.class() != EffectOutcomeClass::Indeterminate
+                                || recorded.result() != terminal.result
+                        })
+                    {
+                        return Err(RegistryError::Invariant(
+                            "indeterminate terminal conflicts with recorded outcome",
                         ));
                     }
                     match record.publication_mode {
@@ -7585,7 +8079,11 @@ impl EffectRegistry {
                 return Err(RegistryError::Invariant("commit receipt identity mismatch"));
             }
             if let Some(terminal) = &record.terminal
-                && (terminal.effect != *key || terminal.sequence == 0)
+                && (terminal.effect != *key
+                    || terminal.sequence == 0
+                    || terminal
+                        .manifest_digest
+                        .is_some_and(|digest| digest.iter().all(|byte| *byte == 0)))
             {
                 return Err(RegistryError::Invariant(
                     "terminal receipt identity mismatch",
@@ -8296,6 +8794,7 @@ impl EffectRegistry {
         let (
             phase,
             own_commit,
+            recorded_outcome,
             scope_key,
             identity,
             current_resources,
@@ -8311,6 +8810,7 @@ impl EffectRegistry {
             (
                 record.phase,
                 record.commit.clone(),
+                record.outcome,
                 record.identity.scope,
                 record.identity.clone(),
                 record.current_resources.clone(),
@@ -8356,11 +8856,26 @@ impl EffectRegistry {
                 }) {
                     return Err(RegistryError::CommitConflict);
                 }
+                if self.effects[&effect].outcome_required && recorded_outcome.is_none() {
+                    return Err(RegistryError::InvalidState);
+                }
+                if let Some(outcome) = recorded_outcome
+                    && (outcome.class() == EffectOutcomeClass::Indeterminate
+                        || outcome.result() != request.result)
+                {
+                    return Err(RegistryError::CommitConflict);
+                }
             }
             TerminalOutcome::IndeterminateAfterReset => {
                 if own_commit.is_none() || device_batch.is_none() || request.causal_commit.is_some()
                 {
                     return Err(RegistryError::InvalidState);
+                }
+                if let Some(outcome) = recorded_outcome
+                    && (outcome.class() != EffectOutcomeClass::Indeterminate
+                        || outcome.result() != request.result)
+                {
+                    return Err(RegistryError::CommitConflict);
                 }
             }
         }
@@ -8431,6 +8946,7 @@ impl EffectRegistry {
             result: request.result,
             sequence: terminal_sequence,
             causal_commit: request.causal_commit,
+            manifest_digest: request.manifest_digest,
         };
         let ticket = ticket_sequence.map(|ticket_sequence| PublicationTicket {
             effect,

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use nexus_portal_abi::{
-    CommitEffectRequest, CompleteEffectRequest, CompletionDisposition, Digest, EffectHandle,
-    MutationContext, Opcode, OutcomeKind, PortalErrorCode, PrepareEffectRequest,
+    CommitEffectRequest, CompleteEffectRequest, CompletionDisposition, CreditKind, Digest,
+    EffectHandle, MutationContext, Opcode, OutcomeKind, PortalErrorCode, PrepareEffectRequest,
     RecordOutcomeRequest, RegisterEffectRequest, RegisterFlags, RequestBody, RevokeReason,
     RevokeScopeRequest, ScopeHandle, SessionHandle,
 };
@@ -54,6 +54,7 @@ fn lifecycle_opcodes_sizes_and_exact_round_trips_are_frozen() {
         EffectHandle::from_wire_bytes([0x44; 16]),
         0x1122_3344,
         RegisterFlags::PUBLICATION_REQUIRED,
+        CreditKind::Page,
         5,
     )
     .unwrap();
@@ -78,6 +79,8 @@ fn lifecycle_opcodes_sizes_and_exact_round_trips_are_frozen() {
 
     assert_eq!(RegisterEffectRequest::OPCODE, Opcode::Register);
     assert_eq!(RegisterEffectRequest::WIRE_SIZE, 112);
+    assert_eq!(register.credit_kind(), CreditKind::Page);
+    assert_eq!(register.credit_units(), 5);
     assert_eq!(PrepareEffectRequest::OPCODE, Opcode::Prepare);
     assert_eq!(PrepareEffectRequest::WIRE_SIZE, 88);
     assert_eq!(CommitEffectRequest::OPCODE, Opcode::Commit);
@@ -119,6 +122,7 @@ fn register_request_has_one_exact_little_endian_golden_vector() {
         EffectHandle::from_wire_bytes([0x44; 16]),
         0x1122_3344,
         RegisterFlags::PUBLICATION_REQUIRED,
+        CreditKind::Page,
         5,
     )
     .unwrap();
@@ -135,13 +139,41 @@ fn register_request_has_one_exact_little_endian_golden_vector() {
         0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
         0x33, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
         0x44, 0x44, // operation class, flags, credit units, reserved
-        0x44, 0x33, 0x22, 0x11, 1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0,
+        0x44, 0x33, 0x22, 0x11, 1, 0, 0, 0, 5, 0, 0, 0, 2, 0, 0, 0,
     ];
     assert_eq!(output, expected);
 }
 
 #[test]
 fn reserved_unknown_enum_zero_digest_and_null_identity_fail_closed() {
+    let register = RegisterEffectRequest::new(
+        context(),
+        ScopeHandle::from_wire_bytes([0x33; 16]),
+        EffectHandle::NULL,
+        1,
+        RegisterFlags::empty(),
+        CreditKind::Queue,
+        1,
+    )
+    .unwrap();
+    let mut register_bytes = [0; RegisterEffectRequest::WIRE_SIZE];
+    register.encode_wire(&mut register_bytes).unwrap();
+    register_bytes[108..110].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert_eq!(
+        RegisterEffectRequest::decode_wire(&register_bytes)
+            .unwrap_err()
+            .code(),
+        PortalErrorCode::InvalidEnum,
+    );
+    register.encode_wire(&mut register_bytes).unwrap();
+    register_bytes[110] = 1;
+    assert_eq!(
+        RegisterEffectRequest::decode_wire(&register_bytes)
+            .unwrap_err()
+            .code(),
+        PortalErrorCode::NonZeroTail,
+    );
+
     let prepare = PrepareEffectRequest::new(context(), effect()).unwrap();
     let mut prepare_bytes = [0; PrepareEffectRequest::WIRE_SIZE];
     prepare.encode_wire(&mut prepare_bytes).unwrap();
@@ -204,6 +236,12 @@ fn reserved_unknown_enum_zero_digest_and_null_identity_fail_closed() {
 #[test]
 fn lifecycle_enum_discriminants_are_exhaustive() {
     for value in u16::MIN..=u16::MAX {
+        assert_eq!(
+            CreditKind::from_wire_value(value),
+            [CreditKind::Queue, CreditKind::Page]
+                .into_iter()
+                .find(|kind| kind.wire_value() == value),
+        );
         assert_eq!(
             OutcomeKind::from_wire_value(value),
             [
