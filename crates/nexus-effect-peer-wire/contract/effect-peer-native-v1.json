@@ -1,0 +1,51 @@
+{
+  "schema": "nexus.effect-peer.wire-freeze.v1",
+  "contract_id": "nexus-effect-peer-native-v1",
+  "status": "frozen",
+  "protocol_major": 1,
+  "transport": "bounded-json-lines-lf",
+  "canonical_encoding": "serde-struct-field-order-compact-json",
+  "request_schema": "nexus.effect-peer.request.v1",
+  "response_schema": "nexus.effect-peer.response.v1",
+  "receipt_schema": "nexus.effect-peer.native-receipt.v1",
+  "authentication_boundary": "sha256-integrity-only-not-authenticity",
+  "canonical_snapshot_sha256": "036bfa21c9c1359755d9cf9a8223e39b7ea1d4793bf4fa948efbf75c9fa52b08",
+  "operations": [
+    "initialize",
+    "register",
+    "prepare",
+    "commit",
+    "complete",
+    "acknowledge-publication",
+    "crash-service",
+    "rebind-service",
+    "freeze",
+    "abort-uncommitted",
+    "thaw",
+    "close-step",
+    "query",
+    "shutdown"
+  ],
+  "receipt_kinds": [
+    "initialized",
+    "effect-registered",
+    "effect-prepared",
+    "effect-committed",
+    "effect-completed",
+    "publication-acknowledged",
+    "service-crashed",
+    "service-rebound",
+    "admission-frozen",
+    "uncommitted-aborted",
+    "admission-thawed",
+    "closure-progress",
+    "handoff-query",
+    "shutdown"
+  ],
+  "change_policy": {
+    "additive_v1_changes_allowed": false,
+    "compatible_bugfixes": "preserve-all-frozen-v1-serde-shapes-and-semantics",
+    "new_capabilities": "new-major-version-or-explicit-versioned-extension",
+    "extension_requirement": "distinct-schema-identifiers-and-independent-freeze-contract"
+  }
+}
