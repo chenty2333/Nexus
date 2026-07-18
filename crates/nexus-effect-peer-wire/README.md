@@ -15,9 +15,21 @@ The package remains `publish = false`: it is not currently a crates.io API.
 Consumers must pin an exact Nexus Git revision or a future immutable release
 artifact and retain the corresponding source and license. Source files are
 MPL-2.0-covered; the repository license text is
-[`../../LICENSE-MPL-2.0`](../../LICENSE-MPL-2.0).
+[`../../LICENSE-MPL-2.0`](../../LICENSE-MPL-2.0). Extraction lineage and the
+current release gaps are recorded in [`PROVENANCE.md`](PROVENANCE.md).
 
 Native v1 is frozen. Compatibility-preserving implementation fixes may retain
 the same contract only when the canonical corpus and snapshot digest remain
 byte-identical. Any new operation, field, receipt kind, or semantic capability
 requires native v2 or an explicitly versioned extension.
+
+## Consumer verification
+
+The `frozen_v1` module exports the exact contract bytes, ordered request and
+response populations, canonical snapshot generator, and frozen digests. It is
+producer-owned conformance material, not runtime evidence or authentication.
+
+```sh
+cargo test --locked -p nexus-effect-peer-wire --all-targets
+cargo clippy --locked -p nexus-effect-peer-wire --all-targets -- -D warnings
+```
