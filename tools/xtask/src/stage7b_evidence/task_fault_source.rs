@@ -50,12 +50,16 @@ impl<'ast> Visit<'ast> for SourceAudit {
     }
 }
 
-pub(super) fn validate_and_count_registry_constructors(source: &str) -> Result<usize, String> {
+pub(super) fn count_registry_constructors(source: &str) -> Result<usize, String> {
     let syntax = syn::parse_file(source)
         .map_err(|error| format!("Stage 7B Registry source does not parse: {error}"))?;
-    let count = audit_file(&syntax).registry_constructors;
-    validate_task_fault_self_tests(&syntax)?;
-    Ok(count)
+    Ok(audit_file(&syntax).registry_constructors)
+}
+
+pub(super) fn validate_task_fault_self_tests_source(source: &str) -> Result<(), String> {
+    let syntax = syn::parse_file(source)
+        .map_err(|error| format!("Stage 7B task/fault evidence source does not parse: {error}"))?;
+    validate_task_fault_self_tests(&syntax)
 }
 
 fn canonical_path(path: &syn::Path) -> String {

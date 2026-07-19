@@ -3,12 +3,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod registry_source_set;
 mod task_fault_source;
 
 const INPUT: &str = "kernel/nexus-ostd/artifacts/stage7b-evaluation.log";
 const RUNTIME_METADATA: &str = "kernel/nexus-ostd/artifacts/stage7b-runtime-metadata.env";
 const EVALUATOR_SOURCE: &str = "kernel/nexus-ostd/src/evaluation/stage7b.rs";
-const FAULT_REGISTRY_SOURCE: &str = "kernel/nexus-ostd/src/cser/effect_registry.rs";
+const FAULT_REGISTRY_SOURCE: &str = registry_source_set::RegistryUnit::Authority.path();
 const KERNEL_SOURCE_DIRECTORY: &str = "kernel/nexus-ostd/src";
 const OUTPUT_DIRECTORY: &str = "target/verification/stage7b";
 const FAULT_OUTPUT: &str = "fault-matrix.jsonl";
@@ -566,11 +567,9 @@ fn validate_fault_sources(root: &Path) -> Result<(), String> {
     let source = read_regular(root, EVALUATOR_SOURCE, false)?.ok_or_else(|| {
         format!("required Stage 7B evaluator source is missing: {EVALUATOR_SOURCE}")
     })?;
-    let registry = read_regular(root, FAULT_REGISTRY_SOURCE, false)?.ok_or_else(|| {
-        format!("required Stage 7B fault Registry source is missing: {FAULT_REGISTRY_SOURCE}")
-    })?;
+    let registry = registry_source_set::RegistrySourceSet::read_current(root)?;
     validate_fault_evaluator_source_text(&source)?;
-    validate_fault_registry_source_text(&registry)?;
+    validate_fault_registry_source_set(&registry)?;
     validate_non_device_candidate_callers(root)
 }
 
@@ -649,21 +648,49 @@ fn validate_non_device_candidate_caller_counts(
     Ok(())
 }
 
+fn validate_fault_registry_source_set(
+    sources: &registry_source_set::RegistrySourceSet,
+) -> Result<(), String> {
+    registry_source_set::validate_source_set(sources)?;
+
+    let mut semantic_registry_constructors = 0usize;
+    let mut textual_registry_constructors = 0usize;
+    for (_, source) in sources.iter() {
+        semantic_registry_constructors = semantic_registry_constructors
+            .checked_add(task_fault_source::count_registry_constructors(source)?)
+            .ok_or_else(|| "Stage 7B Registry constructor population overflowed".to_owned())?;
+        textual_registry_constructors = textual_registry_constructors
+            .checked_add(source.matches("EffectRegistry::new()").count())
+            .ok_or_else(|| {
+                "Stage 7B textual Registry constructor population overflowed".to_owned()
+            })?;
+    }
+    if semantic_registry_constructors != 14 || textual_registry_constructors != 14 {
+        return Err(format!(
+            "Stage 7B Registry source-set constructor population drifted; hidden sidecars are forbidden (expected 14, observed semantic={semantic_registry_constructors} textual={textual_registry_constructors})"
+        ));
+    }
+
+    let task_fault_source = sources.source(registry_source_set::TASK_FAULT_EVIDENCE_UNIT)?;
+    task_fault_source::validate_task_fault_self_tests_source(task_fault_source)?;
+
+    let authority = sources.source(registry_source_set::RegistryUnit::Authority)?;
+    validate_fault_registry_authority_source_text(authority)
+}
+
+#[cfg(test)]
 fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
+    validate_fault_registry_source_set(&registry_source_set::RegistrySourceSet::from_authority(
+        source,
+    ))
+}
+
+fn validate_fault_registry_authority_source_text(source: &str) -> Result<(), String> {
     if source.contains("validate_device_replay_fence_candidate") {
         return Err(
             "production Registry must not retain the obsolete read-only replay-fence validator"
                 .into(),
         );
-    }
-
-    let registry_constructors =
-        task_fault_source::validate_and_count_registry_constructors(source)?;
-    let textual_registry_constructors = source.matches("EffectRegistry::new()").count();
-    if registry_constructors != 14 || textual_registry_constructors != 14 {
-        return Err(format!(
-            "Stage 7B Registry source constructor population drifted; hidden sidecars are forbidden (expected 14, observed semantic={registry_constructors} textual={textual_registry_constructors})"
-        ));
     }
     let publication_start = source
         .find("fn publication_ack_and_revoke_complete_self_test() {")
@@ -3624,6 +3651,10 @@ mod tests {
         include_str!("../../../kernel/nexus-ostd/src/cser/effect_registry.rs").into()
     }
 
+    fn checked_registry_source_set() -> registry_source_set::RegistrySourceSet {
+        registry_source_set::RegistrySourceSet::from_authority(&checked_registry_source())
+    }
+
     fn checked_non_device_candidate_callers() -> BTreeMap<String, usize> {
         BTreeMap::from([
             (FAULT_REGISTRY_SOURCE.to_owned(), 4usize),
@@ -3641,9 +3672,202 @@ mod tests {
     #[test]
     fn fault_source_gate_accepts_typed_receipt_projection_pipeline() {
         validate_fault_evaluator_source_text(&checked_evaluator_source()).unwrap();
-        validate_fault_registry_source_text(&checked_registry_source()).unwrap();
+        validate_fault_registry_source_set(&checked_registry_source_set()).unwrap();
         validate_non_device_candidate_caller_counts(&checked_non_device_candidate_callers())
             .unwrap();
+    }
+
+    #[test]
+    fn registry_source_set_rejects_checked_item_moved_between_units() {
+        let source = checked_registry_source();
+        let moved = source.replacen(
+            "pub(crate) struct Stage7bFaultBudget {",
+            "pub(crate) struct Stage7bFaultBudgetMoved {",
+            1,
+        );
+        assert_ne!(moved, source);
+        let sources = registry_source_set::RegistrySourceSet::for_test([
+            (registry_source_set::RegistryUnit::Authority, moved),
+            (
+                registry_source_set::RegistryUnit::Evidence,
+                "pub(crate) struct Stage7bFaultBudget;".to_owned(),
+            ),
+        ])
+        .unwrap();
+        let error = registry_source_set::validate_source_set(&sources).unwrap_err();
+        assert!(
+            error.contains("checked-item ownership drifted")
+                && error.contains("Stage7bFaultBudget"),
+            "moved item failed through the wrong source-set gate: {error}"
+        );
+    }
+
+    #[test]
+    fn registry_source_set_rejects_checked_item_duplicate_between_units() {
+        let sources = registry_source_set::RegistrySourceSet::for_test([
+            (
+                registry_source_set::RegistryUnit::Authority,
+                checked_registry_source(),
+            ),
+            (
+                registry_source_set::RegistryUnit::Evidence,
+                "pub(crate) struct Stage7bFaultBudget;".to_owned(),
+            ),
+        ])
+        .unwrap();
+        let error = registry_source_set::validate_source_set(&sources).unwrap_err();
+        assert!(
+            error.contains("checked-item ownership drifted")
+                && error.contains("Stage7bFaultBudget"),
+            "duplicate item failed through the wrong source-set gate: {error}"
+        );
+    }
+
+    #[test]
+    fn registry_source_set_rejects_duplicate_unit_coordinates() {
+        let error = registry_source_set::RegistrySourceSet::for_test([
+            (
+                registry_source_set::RegistryUnit::Authority,
+                checked_registry_source(),
+            ),
+            (
+                registry_source_set::RegistryUnit::Authority,
+                checked_registry_source(),
+            ),
+        ])
+        .unwrap_err();
+        assert!(error.contains("duplicates unit Authority"));
+    }
+
+    #[test]
+    fn registry_source_set_rejects_unapproved_authority_wrapper() {
+        let sources = registry_source_set::RegistrySourceSet::for_test([
+            (
+                registry_source_set::RegistryUnit::Authority,
+                checked_registry_source(),
+            ),
+            (
+                registry_source_set::RegistryUnit::Evidence,
+                "struct HiddenRegistryWrapper { inner: EffectRegistry }".to_owned(),
+            ),
+        ])
+        .unwrap();
+        let error = registry_source_set::validate_source_set(&sources).unwrap_err();
+        assert!(
+            error.contains("unapproved authority wrapper/holder")
+                && error.contains("HiddenRegistryWrapper.inner"),
+            "wrapper failed through the wrong source-set gate: {error}"
+        );
+    }
+
+    #[test]
+    fn registry_source_set_rejects_second_registry_and_cross_unit_clone_impl() {
+        let second = registry_source_set::RegistrySourceSet::for_test([
+            (
+                registry_source_set::RegistryUnit::Authority,
+                checked_registry_source(),
+            ),
+            (
+                registry_source_set::RegistryUnit::Core,
+                "struct EffectRegistry;".to_owned(),
+            ),
+        ])
+        .unwrap();
+        let second_error = registry_source_set::validate_source_set(&second).unwrap_err();
+        assert!(
+            second_error.contains("checked-item ownership drifted")
+                && second_error.contains("EffectRegistry"),
+            "second Registry failed through the wrong source-set gate: {second_error}"
+        );
+
+        let clone_impl = registry_source_set::RegistrySourceSet::for_test([
+            (
+                registry_source_set::RegistryUnit::Authority,
+                checked_registry_source(),
+            ),
+            (
+                registry_source_set::RegistryUnit::Core,
+                "impl Clone for EffectRegistry { fn clone(&self) -> Self { loop {} } }".to_owned(),
+            ),
+        ])
+        .unwrap();
+        let clone_error = registry_source_set::validate_source_set(&clone_impl).unwrap_err();
+        assert!(
+            clone_error.contains("must not implement Clone") && clone_error.contains("Core"),
+            "cross-unit Clone impl failed through the wrong source-set gate: {clone_error}"
+        );
+    }
+
+    #[test]
+    fn registry_source_set_never_concatenates_unit_parse_boundaries() {
+        let source = checked_registry_source();
+        let needle = "pub(crate) struct EffectRegistry";
+        let split = source.find(needle).unwrap() + "pub(crate) struct ".len();
+        let authority = source[..split].to_owned();
+        let evidence = source[split..].to_owned();
+        assert_eq!(format!("{authority}{evidence}"), source);
+        let sources = registry_source_set::RegistrySourceSet::for_test([
+            (registry_source_set::RegistryUnit::Authority, authority),
+            (registry_source_set::RegistryUnit::Evidence, evidence),
+        ])
+        .unwrap();
+        let error = registry_source_set::validate_source_set(&sources).unwrap_err();
+        assert!(
+            error.contains("does not parse independently") && error.contains("Authority"),
+            "split source failed through the wrong no-concatenation gate: {error}"
+        );
+    }
+
+    #[test]
+    fn registry_source_set_loader_rejects_unactivated_child_source() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nexus-stage7b-registry-source-set-inactive-{}-{nonce}",
+            std::process::id()
+        ));
+        let authority = root.join(FAULT_REGISTRY_SOURCE);
+        fs::create_dir_all(authority.parent().unwrap()).unwrap();
+        fs::write(&authority, checked_registry_source()).unwrap();
+        let evidence = root.join(registry_source_set::RegistryUnit::Evidence.path());
+        fs::create_dir_all(evidence.parent().unwrap()).unwrap();
+        fs::write(&evidence, "struct HiddenEvidence;").unwrap();
+
+        let error = registry_source_set::RegistrySourceSet::read_current(&root).unwrap_err();
+        assert!(
+            error.contains("inactive Stage 7B Registry unit") && error.contains("Evidence"),
+            "inactive child failed through the wrong source-set gate: {error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_source_set_loader_rejects_symlinked_authority() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nexus-stage7b-registry-source-set-symlink-{}-{nonce}",
+            std::process::id()
+        ));
+        let target = root.join("registry-target.rs");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&target, checked_registry_source()).unwrap();
+        let authority = root.join(FAULT_REGISTRY_SOURCE);
+        fs::create_dir_all(authority.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &authority).unwrap();
+
+        let error = registry_source_set::RegistrySourceSet::read_current(&root).unwrap_err();
+        assert!(
+            error.contains("not a regular non-symlink file")
+                && error.contains(FAULT_REGISTRY_SOURCE),
+            "symlink failed through the wrong source-set gate: {error}"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
