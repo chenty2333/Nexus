@@ -14,6 +14,37 @@ const SCALE_OUTPUT: &str = "scale.jsonl";
 const PERFORMANCE_OUTPUT: &str = "performance.json";
 const ORACLE_OUTPUT: &str = "oracle.log";
 
+// Production CSER sources deliberately resolve built-in derives and macros
+// through exact local sysroot aliases. Keep Stage 7B's textual evidence gate
+// just as strict by spelling those forms once and composing every checked
+// declaration/call from them.
+const CSER_CORE_DERIVE_DEBUG_EQ_PARTIAL_EQ: &str =
+    "#[derive(__cser_core::fmt::Debug, __cser_core::cmp::Eq, __cser_core::cmp::PartialEq)]";
+const CSER_CORE_DERIVE_CLONE_COPY_DEBUG_EQ_PARTIAL_EQ: &str = concat!(
+    "#[derive(\n",
+    "    __cser_core::clone::Clone,\n",
+    "    __cser_core::marker::Copy,\n",
+    "    __cser_core::fmt::Debug,\n",
+    "    __cser_core::cmp::Eq,\n",
+    "    __cser_core::cmp::PartialEq,\n",
+    ")]",
+);
+#[cfg(test)]
+const CSER_CORE_DERIVE_CLONE_DEBUG_EQ_PARTIAL_EQ: &str = concat!(
+    "#[derive(\n",
+    "    __cser_core::clone::Clone,\n",
+    "    __cser_core::fmt::Debug,\n",
+    "    __cser_core::cmp::Eq,\n",
+    "    __cser_core::cmp::PartialEq,\n",
+    ")]",
+);
+
+macro_rules! cser_core_macro {
+    ($name:literal, $tail:literal) => {
+        concat!("__cser_core::", $name, "!", $tail)
+    };
+}
+
 const FAULT_FIELDS: &[&str] = &[
     "id",
     "family",
@@ -651,19 +682,28 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
             .count()
             != 4
         || publication
-            .matches("assert_eq!(two_pending_applies.get(), 0);")
+            .matches(cser_core_macro!(
+                "assert_eq",
+                "(two_pending_applies.get(), 0);"
+            ))
             .count()
             != 1
         || publication
-            .matches("assert_eq!(wrong_applies.get(), 0);")
+            .matches(cser_core_macro!("assert_eq", "(wrong_applies.get(), 0);"))
             .count()
             != 1
         || publication
-            .matches("assert_eq!(overflow_applies.get(), 0);")
+            .matches(cser_core_macro!(
+                "assert_eq",
+                "(overflow_applies.get(), 0);"
+            ))
             .count()
             != 1
         || publication
-            .matches("assert_eq!(successful_applies.get(), 1);")
+            .matches(cser_core_macro!(
+                "assert_eq",
+                "(successful_applies.get(), 1);"
+            ))
             .count()
             != 1
     {
@@ -740,7 +780,10 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
             .matches("Err(RegistryError::CounterOverflow)")
             .count()
             != 4
-        || atomic.matches("assert_eq!(atomic, before);").count() != 4
+        || atomic
+            .matches(cser_core_macro!("assert_eq", "(atomic, before);"))
+            .count()
+            != 4
     {
         return Err(
             "Stage 7B Registry counter-overflow fixture must own exactly one implementation Registry and four failure-atomic rejection checks"
@@ -783,7 +826,10 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         ".adopt_domain(scope, FILESYSTEM_DOMAIN, filesystem_v2, recovery.handle)",
         "let selection = registry.revoke_begin(scope).unwrap();",
         "let next = registry.revoke_next(&selection).unwrap().unwrap();",
-        "assert!(registry.revoke_next(&selection).unwrap().is_none());",
+        cser_core_macro!(
+            "assert",
+            "(registry.revoke_next(&selection).unwrap().is_none());"
+        ),
     ] {
         if !production.contains(required) {
             return Err(format!(
@@ -839,7 +885,7 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
             .count()
             != 3
         || device
-            .matches("assert_eq!(hardware_calls.get(), 0);")
+            .matches(cser_core_macro!("assert_eq", "(hardware_calls.get(), 0);"))
             .count()
             != 2
         || device.matches("begin_unpublished_device_cancel(").count() != 4
@@ -913,7 +959,7 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "let fresh_close_commit_sequence = fresh_close.next_commit_sequence;",
         "let fresh_close_batch_sequence = fresh_close.next_device_batch_sequence;",
         "DeviceCloseOutcome::Applied {",
-        "assert_eq!(fresh_close_publications.get(), 1);",
+        cser_core_macro!("assert_eq", "(fresh_close_publications.get(), 1);"),
         "fresh_close_before.authority_epoch + 1",
         "fresh_close_before.revision + 3",
         "fresh_close_revoke_sequence + 1",
@@ -927,12 +973,12 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "rewritten_close.check_invariants().unwrap();",
         "let before_closing_recovery = fresh_close.clone();",
         "DeviceCloseOutcome::Recovered { receipt, selection }",
-        "assert_eq!(closing_recovery_publications.get(), 0);",
-        "assert_eq!(fresh_close, before_closing_recovery);",
+        cser_core_macro!("assert_eq", "(closing_recovery_publications.get(), 0);"),
+        cser_core_macro!("assert_eq", "(fresh_close, before_closing_recovery);"),
         "interrupted_close.revoke_begin(SCOPE)",
         "Err(RegistryError::DeviceClosurePending)",
         "forced_closing.begin_unpublished_device_cancel(&enrollment)",
-        "assert_eq!(forced_closing, forced_closing_before);",
+        cser_core_macro!("assert_eq", "(forced_closing, forced_closing_before);"),
         "let assert_published_close_error =",
         "Err(DeviceCloseError::Published { obligation, .. })",
         "obligation.operation(), Some(close_operation)",
@@ -947,8 +993,8 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "Some(fresh_close_receipt.batch_sequence())",
         "let assert_fresh_close_overflow = |candidate: &mut EffectRegistry| {",
         "Err(DeviceCloseError::Unpublished(",
-        "assert_eq!(publish_calls.get(), 0);",
-        "assert_eq!(*candidate, before);",
+        cser_core_macro!("assert_eq", "(publish_calls.get(), 0);"),
+        cser_core_macro!("assert_eq", "(*candidate, before);"),
         "close_revoke_overflow.next_revoke_sequence = u64::MAX;",
         "close_commit_overflow.next_commit_sequence = u64::MAX - 5;",
         "close_batch_overflow.next_device_batch_sequence = u64::MAX;",
@@ -962,8 +1008,8 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         ".revoke_complete(&fresh_close_selection)",
         "revoked_recovery.scope_projection(SCOPE).unwrap().phase,",
         "let before_revoked_recovery = revoked_recovery.clone();",
-        "assert_eq!(revoked_recovery_publications.get(), 0);",
-        "assert_eq!(revoked_recovery, before_revoked_recovery);",
+        cser_core_macro!("assert_eq", "(revoked_recovery_publications.get(), 0);"),
+        cser_core_macro!("assert_eq", "(revoked_recovery, before_revoked_recovery);"),
     ] {
         if !operation_close.contains(required) {
             return Err(format!(
@@ -974,7 +1020,7 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
     for required in [
         "let device_cohort = || {",
         "negative.register_device_derived_cohort(entries)",
-        "assert_eq!(negative, before, \"{label}\");",
+        cser_core_macro!("assert_eq", "(negative, before, \"{label}\");"),
         "\"middle credit\"",
         "\"middle resource\"",
         "\"middle ancestry\"",
@@ -985,40 +1031,49 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "\"duplicate slot\"",
         "\"missing slot\"",
         "counter_failure.next_effect_id = u64::MAX - 1;",
-        "assert_eq!(counter_failure, counter_before);",
+        cser_core_macro!("assert_eq", "(counter_failure, counter_before);"),
         "disabled_cohort.register_device_derived_cohort(device_cohort())",
-        "assert_eq!(disabled_cohort, disabled_cohort_before);",
-        "assert_eq!(registry.device_root_installed(SCOPE), Ok(false));",
+        cser_core_macro!("assert_eq", "(disabled_cohort, disabled_cohort_before);"),
+        cser_core_macro!(
+            "assert_eq",
+            "(registry.device_root_installed(SCOPE), Ok(false));"
+        ),
         "registry.device_root_installed(ScopeKey::new(0xdead, 1))",
         "let [block, dma_a, dma_b, dma_request] = registry",
         ".register_device_derived_cohort(device_cohort())",
-        "assert_eq!(registry.device_root_installed(SCOPE), Ok(true));",
-        "assert_eq!(dma.identity.parent(), Some(block.identity.effect()));",
+        cser_core_macro!(
+            "assert_eq",
+            "(registry.device_root_installed(SCOPE), Ok(true));"
+        ),
+        cser_core_macro!(
+            "assert_eq",
+            "(dma.identity.parent(), Some(block.identity.effect()));"
+        ),
         "let registered = [",
-        "assert_eq!(registry.effects_for_scope(SCOPE).len(), 6);",
-        "assert_eq!(prepared.commits().len(), 6);",
-        "assert_eq!(prepared.device_effects().len(), 4);",
+        cser_core_macro!("assert_eq", "(registry.effects_for_scope(SCOPE).len(), 6);"),
+        cser_core_macro!("assert_eq", "(prepared.commits().len(), 6);"),
+        cser_core_macro!("assert_eq", "(prepared.device_effects().len(), 4);"),
         "split.commit(PERSONALITY, syscall.handle, commits[0].1)",
         "Err(RegistryError::InvalidDeviceEnvelope)",
         "let assert_pending_precommit_error =",
         "candidate.close_pending_device_precommit_with_apply(SCOPE, |_| {",
-        "assert_eq!(compound_pending_hardware_calls.get(), 1);",
+        cser_core_macro!("assert_eq", "(compound_pending_hardware_calls.get(), 1);"),
         "compound_pending_before.revision + 3",
         "compound_pending_enrollment_sequence + 1",
         "let mut pending_retention_overflow = registry.clone();",
         "let mut pending_wrong_revoke_cohort = registry.clone();",
         "let cancel_enrollment = pending_cancel.freeze_pending_device_cancel(SCOPE).unwrap();",
-        "assert!(cancel_enrollment.cancel_only());",
+        cser_core_macro!("assert", "(cancel_enrollment.cancel_only());"),
         "let registered_enrollment = registered_cancel",
         ".freeze_pending_device_cancel(SCOPE)",
-        "assert!(registered_enrollment.cancel_only());",
-        "assert_eq!(registered_enrollment.effects().len(), 7);",
-        "assert_eq!(registered_closed, 7);",
+        cser_core_macro!("assert", "(registered_enrollment.cancel_only());"),
+        cser_core_macro!("assert_eq", "(registered_enrollment.effects().len(), 7);"),
+        cser_core_macro!("assert_eq", "(registered_closed, 7);"),
         "let enrollment = registry",
         ".enroll_device_batch(authority, &handles, device)",
         "let assert_enrolled_precommit_error =",
         "candidate.close_enrolled_device_precommit_with_apply(presented, |_| {",
-        "assert_eq!(compound_enrolled_hardware_calls.get(), 1);",
+        cser_core_macro!("assert_eq", "(compound_enrolled_hardware_calls.get(), 1);"),
         "compound_enrolled_before.revision + 2",
         "let mut enrolled_retention_overflow = registry.clone();",
         "let mut enrolled_wrong_revoke_cohort = registry.clone();",
@@ -1028,7 +1083,7 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "Err(RegistryError::StaleDeviceGeneration)",
         "retain_device_iotlb_timeout(&iotlb)",
         "stage_device_batch_terminal(",
-        "assert_eq!(closed.credits.retained, 0);",
+        cser_core_macro!("assert_eq", "(closed.credits.retained, 0);"),
         "Err(RegistryError::StaleDeviceGeneration)",
         "Err(RegistryError::InvalidBatchReceipt)",
         "Err(RegistryError::CounterOverflow)",
@@ -1045,16 +1100,22 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "let legacy_before = registry.clone();",
         "registry.commit_or_recover_device_close_with_apply(",
         "Err(DeviceCloseError::Published { obligation, error })",
-        "assert_eq!(obligation.operation(), None);",
-        "assert_eq!(obligation.phase(), ScopePhase::Active);",
-        "assert_eq!(obligation.revoke(), None);",
+        cser_core_macro!("assert_eq", "(obligation.operation(), None);"),
+        cser_core_macro!("assert_eq", "(obligation.phase(), ScopePhase::Active);"),
+        cser_core_macro!("assert_eq", "(obligation.revoke(), None);"),
         "legacy committed state was not an honest Published error",
-        "assert_eq!(legacy_publish_calls.get(), 0);",
-        "assert_eq!(*registry, legacy_before);",
+        cser_core_macro!("assert_eq", "(legacy_publish_calls.get(), 0);"),
+        cser_core_macro!("assert_eq", "(*registry, legacy_before);"),
         "wrong_completion_result.record_device_completion(&receipt, device, 512)",
         "Err(RegistryError::CommitConflict)",
-        "assert_eq!(wrong_completion_result, wrong_completion_before);",
-        "assert_eq!(completion.causal_root(), syscall.identity.effect());",
+        cser_core_macro!(
+            "assert_eq",
+            "(wrong_completion_result, wrong_completion_before);"
+        ),
+        cser_core_macro!(
+            "assert_eq",
+            "(completion.causal_root(), syscall.identity.effect());"
+        ),
         "let selection = registry.revoke_begin(SCOPE).unwrap();",
         "registry.validate_device_batch_receipt(&receipt).unwrap();",
     ] {
@@ -1112,44 +1173,48 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
             "Stage 7B fault Registry helper must own exactly one production Registry, observed {registries}"
         ));
     }
-    let expected_budget = concat!(
-        "#[derive(Debug, Eq, PartialEq)]\n",
-        "pub(crate) struct Stage7bFaultBudget {\n",
-        "    case: Stage7bFaultCase,\n",
-        "    instance_id: u64,\n",
-        "    registry: EffectRegistry,\n",
-        "    scope: ScopeKey,\n",
-        "    task: TaskKey,\n",
-        "    credit: CreditClass,\n",
-        "    bindings: BTreeSet<Stage7bFaultBinding>,\n",
-        "    commit_operations: usize,\n",
-        "    terminal_operations: usize,\n",
-        "}\n",
+    let expected_budget = format!(
+        "{CSER_CORE_DERIVE_DEBUG_EQ_PARTIAL_EQ}\n{}",
+        concat!(
+            "pub(crate) struct Stage7bFaultBudget {\n",
+            "    case: Stage7bFaultCase,\n",
+            "    instance_id: u64,\n",
+            "    registry: EffectRegistry,\n",
+            "    scope: ScopeKey,\n",
+            "    task: TaskKey,\n",
+            "    credit: CreditClass,\n",
+            "    bindings: BTreeSet<Stage7bFaultBinding>,\n",
+            "    commit_operations: usize,\n",
+            "    terminal_operations: usize,\n",
+            "}\n",
+        ),
     );
-    let expected_state = concat!(
-        "#[derive(Debug, Eq, PartialEq)]\n",
-        "pub(crate) struct Stage7bFaultBudgetState {\n",
-        "    case: Stage7bFaultCase,\n",
-        "    instance_id: u64,\n",
-        "    registry: EffectRegistry,\n",
-        "    scope: ScopeKey,\n",
-        "    task: TaskKey,\n",
-        "    credit: CreditClass,\n",
-        "    bindings: BTreeSet<Stage7bFaultBinding>,\n",
-        "    commit_operations: usize,\n",
-        "    terminal_operations: usize,\n",
-        "}\n",
+    let expected_state = format!(
+        "{CSER_CORE_DERIVE_DEBUG_EQ_PARTIAL_EQ}\n{}",
+        concat!(
+            "pub(crate) struct Stage7bFaultBudgetState {\n",
+            "    case: Stage7bFaultCase,\n",
+            "    instance_id: u64,\n",
+            "    registry: EffectRegistry,\n",
+            "    scope: ScopeKey,\n",
+            "    task: TaskKey,\n",
+            "    credit: CreditClass,\n",
+            "    bindings: BTreeSet<Stage7bFaultBinding>,\n",
+            "    commit_operations: usize,\n",
+            "    terminal_operations: usize,\n",
+            "}\n",
+        ),
     );
     if helper
         .matches("pub(crate) struct Stage7bFaultBudget {")
         .count()
         != 1
-        || !helper.contains(expected_budget)
+        || !helper.contains(&expected_budget)
         || helper
             .matches("pub(crate) struct Stage7bFaultBudgetState {")
             .count()
             != 1
-        || !helper.contains(expected_state)
+        || !helper.contains(&expected_state)
     {
         return Err(
             "Stage 7B fault budget and its failure-atomic snapshot must retain their exact complete field sets"
@@ -1191,8 +1256,9 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         .ok_or_else(|| {
             "Stage 7B fault Registry lacks phase-derived credit observation".to_owned()
         })?;
+    let observed_end_marker = format!("\n}}\n\n{CSER_CORE_DERIVE_DEBUG_EQ_PARTIAL_EQ}");
     let observed_end = helper[observed_start..]
-        .find("\n}\n\n#[derive(Debug, Eq, PartialEq)]")
+        .find(&observed_end_marker)
         .map(|offset| observed_start + offset)
         .ok_or_else(|| {
             "Stage 7B fault Registry credit observation boundary is missing".to_owned()
@@ -1257,11 +1323,11 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         "completion has invalid causal commit",
         "pub(crate) fn stage7b_causal_commit_self_test()",
         "TerminalRequest::completed_by(2, source_commit.clone())",
-        "assert_eq!(cross_scope, cross_scope_before);",
+        cser_core_macro!("assert_eq", "(cross_scope, cross_scope_before);"),
         "first_commit.registry_instance_id",
-        "assert_eq!(first_commit.scope, second_commit.scope);",
-        "assert_eq!(first, first_before);",
-        "assert_eq!(second, second_before);",
+        cser_core_macro!("assert_eq", "(first_commit.scope, second_commit.scope);"),
+        cser_core_macro!("assert_eq", "(first, first_before);"),
+        cser_core_macro!("assert_eq", "(second, second_before);"),
     ] {
         if !source.contains(required) {
             return Err(format!(
@@ -1291,9 +1357,14 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
-    if terminal_outcome
-        != "pub(crate)enumTerminalOutcome{Completed,IndeterminateAfterReset,Aborted,}#[derive(Clone,Copy,Debug,Eq,PartialEq)]"
-    {
+    let compact_terminal_derive: String = CSER_CORE_DERIVE_CLONE_COPY_DEBUG_EQ_PARTIAL_EQ
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let expected_terminal_outcome = format!(
+        "pub(crate)enumTerminalOutcome{{Completed,IndeterminateAfterReset,Aborted,}}{compact_terminal_derive}"
+    );
+    if terminal_outcome != expected_terminal_outcome {
         return Err(
             "TerminalOutcome must preserve exactly Completed, IndeterminateAfterReset, and Aborted"
                 .into(),
@@ -1418,10 +1489,9 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .find("    fn rewrite_registry_instance(")
         .map(|offset| projection_clone_start + offset)
         .ok_or_else(|| "Registry diagnostic projection boundary is unterminated".to_owned())?;
-    if source
-        .matches("#[derive(Debug, Eq, PartialEq)]\npub(crate) struct EffectRegistry {")
-        .count()
-        != 1
+    let exact_registry_declaration =
+        format!("{CSER_CORE_DERIVE_DEBUG_EQ_PARTIAL_EQ}\npub(crate) struct EffectRegistry {{");
+    if source.matches(&exact_registry_declaration).count() != 1
         || registry_impl
             .matches("    fn clone(&self) -> Self {")
             .count()
@@ -1460,6 +1530,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
+    let exact_operation_derive = format!("{CSER_CORE_DERIVE_CLONE_COPY_DEBUG_EQ_PARTIAL_EQ}\n");
     if operation_compact
         != concat!(
             "pub(crate)structDeviceCloseOperationId{",
@@ -1472,7 +1543,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
             "caller_nonce:u64,",
             "}"
         )
-        || !source[..operation_start].ends_with("#[derive(Clone, Copy, Debug, Eq, PartialEq)]\n")
+        || !source[..operation_start].ends_with(&exact_operation_derive)
     {
         return Err(
             "DeviceCloseOperationId must remain opaque, Copy, and exactly bound to Registry/enrollment/root/caller coordinates"
@@ -1757,7 +1828,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
     for required in [
         "let receipt = self.apply_device_batch(batch);",
         "let selection = self.apply_revoke_begin(revoke);",
-        "core::mem::replace(&mut root.publication, DevicePublicationProvenance::None);",
+        "__cser_core::mem::replace(&mut root.publication, DevicePublicationProvenance::None);",
         "DevicePublicationProvenance::Publishing {",
         "DevicePublicationProvenance::Applied {",
         "(receipt, selection)",
@@ -1775,7 +1846,9 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         .find("let selection = self.apply_revoke_begin(revoke);")
         .unwrap();
     let take_publishing = close_apply
-        .find("core::mem::replace(&mut root.publication, DevicePublicationProvenance::None);")
+        .find(
+            "__cser_core::mem::replace(&mut root.publication, DevicePublicationProvenance::None);",
+        )
         .unwrap();
     let mark_applied = close_apply
         .find("DevicePublicationProvenance::Applied {")
@@ -1807,7 +1880,10 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "metadata.result != authoritative.result",
         "record.commit.as_ref() != Some(authoritative)",
         "membership.sequence != stored.batch_sequence",
-        "matches!(scope.phase, ScopePhase::Closing | ScopePhase::Revoked)",
+        cser_core_macro!(
+            "matches",
+            "(scope.phase, ScopePhase::Closing | ScopePhase::Revoked)"
+        ),
         "Ok((stored.clone(), selection))",
     ] {
         if !close_recover.contains(required) {
@@ -1988,7 +2064,7 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
     }
     for required in [
         "self.next_revoke_sequence = next_revoke_sequence;",
-        "let cohort = core::mem::take(&mut scope.closure_candidates);",
+        "let cohort = __cser_core::mem::take(&mut scope.closure_candidates);",
         "let retired_recovery = scope.recovery.take();",
         "scope.authority_epoch = selection.authority_epoch;",
         "scope.phase = ScopePhase::Closing;",
@@ -2470,12 +2546,18 @@ fn validate_production_device_batch_source_text(source: &str) -> Result<(), Stri
         "let mut non_device_candidate = registry.clone_non_device_candidate().unwrap();",
         "non_device_candidate.kernel_root_authority(SCOPE, ROOT_OWNER)",
         "non_device_candidate.register_device_derived(DeviceDerivedRegisterRequest {",
-        "assert_eq!(non_device_candidate, non_device_before_registration);",
+        cser_core_macro!(
+            "assert_eq",
+            "(non_device_candidate, non_device_before_registration);"
+        ),
         "registry.clone_non_device_candidate(),",
         "disabled_enrollment.device_publication_mode =",
         "DevicePublicationMode::DisabledNonDeviceCandidate;",
         "disabled_enrollment.enroll_device_batch(authority, &handles, device)",
-        "assert_eq!(disabled_enrollment, disabled_enrollment_before);",
+        cser_core_macro!(
+            "assert_eq",
+            "(disabled_enrollment, disabled_enrollment_before);"
+        ),
         "pub(crate) fn enroll_device_batch(",
         "if self.scopes[&record.identity.scope].device_root.is_some() {",
         "return Err(RegistryError::InvalidDeviceEnvelope);",
@@ -3635,9 +3717,15 @@ mod tests {
         assert_ne!(forgeable_operation, source);
         assert!(validate_fault_registry_source_text(&forgeable_operation).is_err());
 
+        let copy_operation_declaration = format!(
+            "{CSER_CORE_DERIVE_CLONE_COPY_DEBUG_EQ_PARTIAL_EQ}\npub(crate) struct DeviceCloseOperationId {{"
+        );
+        let noncopy_operation_declaration = format!(
+            "{CSER_CORE_DERIVE_CLONE_DEBUG_EQ_PARTIAL_EQ}\npub(crate) struct DeviceCloseOperationId {{"
+        );
         let noncopy_operation = source.replacen(
-            "#[derive(Clone, Copy, Debug, Eq, PartialEq)]\npub(crate) struct DeviceCloseOperationId {",
-            "#[derive(Clone, Debug, Eq, PartialEq)]\npub(crate) struct DeviceCloseOperationId {",
+            &copy_operation_declaration,
+            &noncopy_operation_declaration,
             1,
         );
         assert_ne!(noncopy_operation, source);
@@ -3902,11 +3990,13 @@ mod tests {
         assert_ne!(public_inherent_registry_clone, source);
         assert!(validate_fault_registry_source_text(&public_inherent_registry_clone).is_err());
 
-        let trait_cloneable_registry = source.replacen(
-            "#[derive(Debug, Eq, PartialEq)]\npub(crate) struct EffectRegistry {",
-            "#[derive(Clone, Debug, Eq, PartialEq)]\npub(crate) struct EffectRegistry {",
-            1,
+        let registry_declaration =
+            format!("{CSER_CORE_DERIVE_DEBUG_EQ_PARTIAL_EQ}\npub(crate) struct EffectRegistry {{");
+        let cloneable_registry_declaration = format!(
+            "{CSER_CORE_DERIVE_CLONE_DEBUG_EQ_PARTIAL_EQ}\npub(crate) struct EffectRegistry {{"
         );
+        let trait_cloneable_registry =
+            source.replacen(&registry_declaration, &cloneable_registry_declaration, 1);
         assert_ne!(trait_cloneable_registry, source);
         assert!(validate_fault_registry_source_text(&trait_cloneable_registry).is_err());
 
@@ -3970,7 +4060,7 @@ mod tests {
 
         let post_swap_allocating_cohort_apply = source.replacen(
             "*self = candidate;\n        registered",
-            "*self = candidate;\n        let _late = alloc::vec![registered.len()];\n        registered",
+            "*self = candidate;\n        let _late = __cser_alloc::vec![registered.len()];\n        registered",
             1,
         );
         assert_ne!(post_swap_allocating_cohort_apply, source);
@@ -4038,8 +4128,8 @@ mod tests {
         assert!(validate_fault_registry_source_text(&missing_emergency_freeze).is_err());
 
         let missing_cancel_only_witness = source.replacen(
-            "assert!(cancel_enrollment.cancel_only());",
-            "assert_eq!(cancel_enrollment.effects().len(), 6);",
+            cser_core_macro!("assert", "(cancel_enrollment.cancel_only());"),
+            cser_core_macro!("assert_eq", "(cancel_enrollment.effects().len(), 6);"),
             1,
         );
         assert_ne!(missing_cancel_only_witness, source);
@@ -4053,7 +4143,7 @@ mod tests {
         let publishing_revoke_allowed = source.replacen(
             concat!(
                 "if scope.device_root.as_ref().is_some_and(|root| {\n",
-                "            matches!(\n",
+                "            __cser_core::matches!(\n",
                 "                root.publication,\n",
                 "                DevicePublicationProvenance::Publishing { .. }\n",
                 "            )\n",
