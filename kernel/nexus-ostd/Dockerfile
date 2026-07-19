@@ -62,10 +62,38 @@ RUN cargo test --manifest-path /opt/nexus-virtio/virtio-drivers-0.13.0/Cargo.tom
         --lib --no-default-features \
     && rm -rf /opt/nexus-virtio/virtio-drivers-0.13.0/target
 
-COPY kernel/nexus-ostd/src/cser/effect_registry.rs \
-    kernel/nexus-ostd/src/cser/device_flight.rs \
+COPY kernel/nexus-ostd/src/cser/device_flight.rs \
+    kernel/nexus-ostd/src/cser/effect_registry.rs \
     kernel/nexus-ostd/src/cser/portal_v2.rs \
     /kernel/nexus-ostd/src/cser/
+COPY kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs \
+    /kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/continuation.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/continuation.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/deadline.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/deadline.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/delayed.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/delayed.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/device.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/device.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/fault.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/fault.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/invariants.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/invariants.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/mod.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/mod.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/reply.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/reply.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/root.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/root.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/service.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/service.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/task.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/task.rs
+COPY kernel/nexus-ostd/src/cser/infrastructure/tests.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/tests.rs
+COPY kernel/nexus-ostd/cser-production-sources.txt \
+    /kernel/nexus-ostd/cser-production-sources.txt
 
 # cargo-osdk's -Zbuild-std and generated runner packages have dependencies that
 # a plain `cargo fetch --target` does not discover. Prime the real graph while

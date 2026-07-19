@@ -76,10 +76,9 @@ const DEPENDENCY_CACHE_INPUTS: [(&str, &str); 10] = [
     (".cargo/config.toml", "/tmp/nexus-inputs/cargo-config.toml"),
 ];
 const PRODUCTION_REGISTRY_TEST: &str = "crates/cser-transition-gates/tests/production_registry.rs";
-const SHARED_PRODUCTION_SOURCE_FILES: [&str; 3] =
-    ["effect_registry.rs", "device_flight.rs", "portal_v2.rs"];
-const KERNEL_PRODUCTION_SOURCE_FILES: [&str; 3] =
-    ["effect_registry.rs", "device_flight.rs", "portal_v2.rs"];
+const CSER_PRODUCTION_SOURCE_MANIFEST: &str = "kernel/nexus-ostd/cser-production-sources.txt";
+const CSER_SOURCE_ROOT: &str = "kernel/nexus-ostd/src/cser";
+const CSER_PRODUCTION_ROOTS: [&str; 3] = ["device_flight.rs", "effect_registry.rs", "portal_v2.rs"];
 const PORTAL_ABI_IMAGE_INPUTS: [&str; 15] = [
     "Cargo.toml",
     "src/capability.rs",
@@ -664,6 +663,508 @@ fn validate_cold_rebuild_contract(root: &Path, frontdoor: &str) -> Result<()> {
     Ok(())
 }
 
+fn require_plain_regular_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {label} at {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(format!(
+            "{label} must be a non-symlink regular file: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn require_plain_regular_file_below(root: &Path, relative: &Path, label: &str) -> Result<()> {
+    let canonical = canonical_relative_source_path(relative)?;
+    let root_metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("cannot inspect {label} root at {}: {error}", root.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+        return Err(format!(
+            "{label} root must be a non-symlink directory: {}",
+            root.display()
+        )
+        .into());
+    }
+    let components = Path::new(&canonical).components().collect::<Vec<_>>();
+    let mut current = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(format!("{label} path became non-canonical: {canonical}").into());
+        };
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| format!("cannot inspect {label} at {}: {error}", current.display()))?;
+        let is_last = index + 1 == components.len();
+        let valid_kind = if is_last {
+            metadata.file_type().is_file()
+        } else {
+            metadata.file_type().is_dir()
+        };
+        if metadata.file_type().is_symlink() || !valid_kind {
+            let expected = if is_last { "file" } else { "directory" };
+            return Err(format!(
+                "{label} path component must be a non-symlink {expected}: {}",
+                current.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn canonical_relative_source_path(path: &Path) -> Result<String> {
+    let raw = path.to_str().ok_or("CSER source path is not valid UTF-8")?;
+    if raw.starts_with("./") || raw.contains("/./") {
+        return Err(format!("CSER source path contains a current-directory alias: {raw}").into());
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(component) => {
+                let component = component
+                    .to_str()
+                    .ok_or("CSER source path is not valid UTF-8")?;
+                if component.is_empty() {
+                    return Err("CSER source path contains an empty component".into());
+                }
+                components.push(component);
+            }
+            _ => {
+                return Err(
+                    format!("CSER source path is not canonical: {}", path.display()).into(),
+                );
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err("CSER source path is empty".into());
+    }
+    Ok(components.join("/"))
+}
+
+fn external_module_relative_path(
+    source_relative: &Path,
+    module: &syn::ItemMod,
+    cser_root: &Path,
+) -> Result<PathBuf> {
+    let path_attributes = module
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("path"))
+        .collect::<Vec<_>>();
+    if path_attributes.len() > 1 {
+        return Err(format!(
+            "external module {} has multiple path attributes",
+            module.ident
+        )
+        .into());
+    }
+    let candidate = if let Some(path) = path_attributes.first() {
+        let syn::Meta::NameValue(name_value) = &path.meta else {
+            return Err(format!("module {} has a non-literal path attribute", module.ident).into());
+        };
+        let syn::Expr::Lit(expression) = &name_value.value else {
+            return Err(format!("module {} path is not a string literal", module.ident).into());
+        };
+        let syn::Lit::Str(path) = &expression.lit else {
+            return Err(format!("module {} path is not a string literal", module.ident).into());
+        };
+        source_relative
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(path.value())
+    } else {
+        let parent = source_relative.parent().unwrap_or_else(|| Path::new(""));
+        let module_base =
+            if source_relative.file_name().and_then(|name| name.to_str()) == Some("mod.rs") {
+                parent.to_path_buf()
+            } else {
+                let stem = source_relative
+                    .file_stem()
+                    .ok_or("external module owner has no file stem")?;
+                parent.join(stem)
+            };
+        let flat = module_base.join(format!("{}.rs", module.ident));
+        let nested = module_base.join(module.ident.to_string()).join("mod.rs");
+        let flat_exists = cser_root.join(&flat).exists();
+        let nested_exists = cser_root.join(&nested).exists();
+        match (flat_exists, nested_exists) {
+            (true, false) => flat,
+            (false, true) => nested,
+            (true, true) => {
+                return Err(format!(
+                    "external module {} has ambiguous flat and nested sources",
+                    module.ident
+                )
+                .into());
+            }
+            (false, false) => {
+                return Err(format!(
+                    "external module {} has no source below {}",
+                    module.ident,
+                    module_base.display()
+                )
+                .into());
+            }
+        }
+    };
+    canonical_relative_source_path(&candidate)?;
+    Ok(candidate)
+}
+
+fn validate_external_module_attributes(
+    source_relative: &Path,
+    module: &syn::ItemMod,
+) -> Result<()> {
+    let is_test_module =
+        source_relative == Path::new("infrastructure/mod.rs") && module.ident == "tests";
+    if is_test_module {
+        if module.attrs.len() != 1 || !module.attrs[0].path().is_ident("cfg") {
+            return Err("infrastructure tests module must retain only exact #[cfg(test)]".into());
+        }
+        let syn::Meta::List(cfg) = &module.attrs[0].meta else {
+            return Err("infrastructure tests module has malformed cfg".into());
+        };
+        if cfg.tokens.to_string() != "test" {
+            return Err("infrastructure tests module must use exact #[cfg(test)]".into());
+        }
+    } else {
+        for attribute in &module.attrs {
+            if !attribute.path().is_ident("path") {
+                return Err(format!(
+                    "production external module {} has an unaudited attribute {}",
+                    module.ident,
+                    attribute
+                        .path()
+                        .segments
+                        .last()
+                        .map_or_else(|| "<empty>".to_owned(), |segment| segment.ident.to_string())
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct CserSourceMacroAudit {
+    rejected: Option<String>,
+}
+
+fn audited_cser_macro_path(name: &str) -> bool {
+    matches!(
+        name,
+        "alloc::format"
+            | "alloc::vec"
+            | "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "matches"
+            | "panic"
+            | "unreachable"
+    )
+}
+
+fn macro_path_before_bang(tokens: &[proc_macro2::TokenTree], bang_index: usize) -> Option<String> {
+    let proc_macro2::TokenTree::Ident(last) = tokens.get(bang_index.checked_sub(1)?)? else {
+        return None;
+    };
+    let mut segments = vec![last.to_string()];
+    let mut cursor = bang_index - 1;
+    while cursor >= 3 {
+        let (
+            proc_macro2::TokenTree::Ident(previous),
+            proc_macro2::TokenTree::Punct(first_colon),
+            proc_macro2::TokenTree::Punct(second_colon),
+        ) = (
+            &tokens[cursor - 3],
+            &tokens[cursor - 2],
+            &tokens[cursor - 1],
+        )
+        else {
+            break;
+        };
+        if first_colon.as_char() != ':' || second_colon.as_char() != ':' {
+            break;
+        }
+        segments.push(previous.to_string());
+        cursor -= 3;
+    }
+    segments.reverse();
+    Some(segments.join("::"))
+}
+
+fn reject_unreviewed_nested_macro(tokens: proc_macro2::TokenStream) -> Option<String> {
+    let tokens = tokens.into_iter().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if let proc_macro2::TokenTree::Group(group) = token
+            && let Some(rejected) = reject_unreviewed_nested_macro(group.stream())
+        {
+            return Some(rejected);
+        }
+        let proc_macro2::TokenTree::Punct(punctuation) = token else {
+            continue;
+        };
+        if punctuation.as_char() != '!'
+            || !matches!(
+                tokens.get(index + 1),
+                Some(proc_macro2::TokenTree::Group(_))
+            )
+        {
+            continue;
+        }
+        let Some(name) = macro_path_before_bang(&tokens, index) else {
+            continue;
+        };
+        if !audited_cser_macro_path(&name) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+impl<'ast> syn::visit::Visit<'ast> for CserSourceMacroAudit {
+    fn visit_macro(&mut self, source_macro: &'ast syn::Macro) {
+        let name = if source_macro.path.leading_colon.is_some() {
+            None
+        } else {
+            Some(
+                source_macro
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            )
+        };
+        let allowed = name.as_deref().is_some_and(audited_cser_macro_path);
+        if !allowed && self.rejected.is_none() {
+            self.rejected = Some(name.unwrap_or_else(|| "<absolute macro path>".to_owned()));
+        }
+        if self.rejected.is_none() {
+            self.rejected = reject_unreviewed_nested_macro(source_macro.tokens.clone());
+        }
+        syn::visit::visit_macro(self, source_macro);
+    }
+}
+
+#[derive(Default)]
+struct NestedExternalModuleAudit {
+    item_depth: usize,
+    rejected: Option<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for NestedExternalModuleAudit {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if self.item_depth > 0
+            && let syn::Item::Mod(module) = item
+            && module.content.is_none()
+            && self.rejected.is_none()
+        {
+            self.rejected = Some(module.ident.to_string());
+        }
+        self.item_depth += 1;
+        syn::visit::visit_item(self, item);
+        self.item_depth -= 1;
+    }
+}
+
+fn reject_unbound_source_constructs(syntax: &syn::File, relative: &Path) -> Result<()> {
+    use syn::visit::Visit;
+
+    let mut audit = CserSourceMacroAudit::default();
+    audit.visit_file(syntax);
+    if let Some(rejected) = audit.rejected {
+        return Err(format!(
+            "CSER production source {} uses unaudited macro {rejected}!; include-style and dynamically generated source are forbidden",
+            relative.display()
+        )
+        .into());
+    }
+    let mut nested_modules = NestedExternalModuleAudit::default();
+    nested_modules.visit_file(syntax);
+    if let Some(rejected) = nested_modules.rejected {
+        return Err(format!(
+            "CSER production source {} may not load external module {rejected} below file scope",
+            relative.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn collect_external_modules_from_items(
+    cser_root: &Path,
+    source_relative: &Path,
+    items: &[syn::Item],
+    inside_inline_module: bool,
+    collected: &mut BTreeSet<String>,
+) -> Result<()> {
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        if let Some((_, inline_items)) = &module.content {
+            collect_external_modules_from_items(
+                cser_root,
+                source_relative,
+                inline_items,
+                true,
+                collected,
+            )?;
+            continue;
+        }
+        if inside_inline_module {
+            return Err(format!(
+                "CSER production source {} may not load external module {} from an inline module",
+                source_relative.display(),
+                module.ident
+            )
+            .into());
+        }
+        validate_external_module_attributes(source_relative, module)?;
+        let child = external_module_relative_path(source_relative, module, cser_root)?;
+        collect_external_module_closure(cser_root, &child, collected)?;
+    }
+    Ok(())
+}
+
+fn collect_external_module_closure(
+    cser_root: &Path,
+    relative: &Path,
+    collected: &mut BTreeSet<String>,
+) -> Result<()> {
+    let canonical = canonical_relative_source_path(relative)?;
+    if !collected.insert(canonical) {
+        return Ok(());
+    }
+    require_plain_regular_file_below(cser_root, relative, "CSER production source")?;
+    let path = cser_root.join(relative);
+    let source = fs::read_to_string(&path)?;
+    let syntax = syn::parse_file(&source)
+        .map_err(|error| format!("{} is not valid Rust source: {error}", path.display()))?;
+    reject_unbound_source_constructs(&syntax, relative)?;
+    collect_external_modules_from_items(cser_root, relative, &syntax.items, false, collected)
+}
+
+fn collect_rust_inventory(
+    cser_root: &Path,
+    directory: &Path,
+    collected: &mut BTreeSet<String>,
+) -> Result<()> {
+    let absolute = cser_root.join(directory);
+    let metadata = fs::symlink_metadata(&absolute)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(format!(
+            "CSER infrastructure path must be a non-symlink directory: {}",
+            absolute.display()
+        )
+        .into());
+    }
+    let mut entries = fs::read_dir(&absolute)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "CSER infrastructure inventory rejects symlink: {}",
+                entry.path().display()
+            )
+            .into());
+        }
+        let relative = directory.join(entry.file_name());
+        if file_type.is_dir() {
+            collect_rust_inventory(cser_root, &relative, collected)?;
+        } else if file_type.is_file()
+            && entry.path().extension().and_then(|value| value.to_str()) == Some("rs")
+        {
+            collected.insert(canonical_relative_source_path(&relative)?);
+        }
+    }
+    Ok(())
+}
+
+fn expected_cser_production_sources(root: &Path) -> Result<Vec<String>> {
+    let cser_root = root.join(CSER_SOURCE_ROOT);
+    let mut closure = BTreeSet::new();
+    for root_source in CSER_PRODUCTION_ROOTS {
+        collect_external_module_closure(&cser_root, Path::new(root_source), &mut closure)?;
+    }
+    let mut infrastructure_inventory = BTreeSet::new();
+    collect_rust_inventory(
+        &cser_root,
+        Path::new("infrastructure"),
+        &mut infrastructure_inventory,
+    )?;
+    let closure_infrastructure = closure
+        .iter()
+        .filter(|relative| relative.starts_with("infrastructure/"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if closure_infrastructure != infrastructure_inventory {
+        return Err(format!(
+            "CSER infrastructure module closure differs from its Rust inventory: closure={closure_infrastructure:?} inventory={infrastructure_inventory:?}"
+        )
+        .into());
+    }
+    Ok(closure.into_iter().collect())
+}
+
+fn validate_cser_production_manifest_text(
+    source: &str,
+    expected: &[String],
+) -> Result<Vec<String>> {
+    if !source.ends_with('\n') {
+        return Err("CSER production source manifest must end with one newline".into());
+    }
+    let entries = source
+        .lines()
+        .map(|line| canonical_relative_source_path(Path::new(line)))
+        .collect::<Result<Vec<_>>>()?;
+    if entries.iter().any(|entry| !entry.ends_with(".rs")) {
+        return Err("CSER production manifest may contain only Rust sources".into());
+    }
+    let unique = entries.iter().collect::<BTreeSet<_>>();
+    if unique.len() != entries.len() {
+        return Err("CSER production source manifest contains a duplicate".into());
+    }
+    let mut sorted = entries.clone();
+    sorted.sort();
+    if entries != sorted {
+        return Err("CSER production source manifest is not strictly sorted".into());
+    }
+    if entries != expected {
+        return Err(format!(
+            "CSER production source manifest differs from module closure: manifest={entries:?} expected={expected:?}"
+        )
+        .into());
+    }
+    Ok(entries)
+}
+
+fn cser_production_source_files(root: &Path) -> Result<Vec<String>> {
+    let manifest = root.join(CSER_PRODUCTION_SOURCE_MANIFEST);
+    require_plain_regular_file(&manifest, "CSER production source manifest")?;
+    let expected = expected_cser_production_sources(root)?;
+    let entries =
+        validate_cser_production_manifest_text(&fs::read_to_string(&manifest)?, &expected)?;
+    for relative in &entries {
+        require_plain_regular_file_below(
+            &root.join(CSER_SOURCE_ROOT),
+            Path::new(relative),
+            "manifest-bound CSER production source",
+        )?;
+    }
+    Ok(entries)
+}
+
 fn parse_sha256_image_inputs(command: &str) -> Result<Vec<String>> {
     const PREFIX: &str = "image_key=$(sha256sum ";
     const SUFFIX: &str = " | cut -d ' ' -f1 | sha256sum | cut -c1-16)";
@@ -693,7 +1194,12 @@ fn parse_sha256_image_inputs(command: &str) -> Result<Vec<String>> {
             if byte == b'"' {
                 break;
             }
-            if !(byte.is_ascii_alphanumeric() || matches!(byte, b'$' | b'_' | b'/' | b'.' | b'-')) {
+            if !(byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'$' | b'_' | b'/' | b'.' | b'-' | b'{' | b'}' | b'[' | b']' | b'@'
+                ))
+            {
                 return Err(
                     format!("image identity path contains shell syntax at byte {offset}").into(),
                 );
@@ -704,7 +1210,11 @@ fn parse_sha256_image_inputs(command: &str) -> Result<Vec<String>> {
             return Err("unterminated image identity path".into());
         }
         let path = &inputs[start..offset];
-        if !(path.starts_with("$root/") || path.starts_with("$repo_root/")) {
+        if !(path.starts_with("$root/")
+            || path.starts_with("$repo_root/")
+            || path == "$production_source_manifest"
+            || path == "${cser_source_hash_inputs[@]}")
+        {
             return Err(format!("image identity input has an unbound path root: {path}").into());
         }
         parsed.push(path.to_string());
@@ -770,9 +1280,46 @@ fn validate_backend_source_pair(
     relative: &str,
     source: &str,
     source_root: &str,
-    files: &[&str],
+    files: &[String],
 ) -> Result<()> {
     let logical = continued_shell_lines(source)?;
+    let active = logical.join("\n");
+    let expected_manifest_assignment = match relative {
+        "kernel/nexus-ostd/x" => {
+            r#"production_source_manifest="$root/cser-production-sources.txt""#
+        }
+        "experiments/ostd-virtio-cser-spike/x" => {
+            r#"production_source_manifest="$repo_root/kernel/nexus-ostd/cser-production-sources.txt""#
+        }
+        _ => return Err(format!("unknown production backend workflow: {relative}").into()),
+    };
+    for required in [
+        expected_manifest_assignment,
+        r#"if [[ ! -f $production_source_manifest || -L $production_source_manifest ]]; then"#,
+        r#"mapfile -t cser_production_sources <"$production_source_manifest""#,
+        r#"for relative in "${cser_production_sources[@]}"; do"#,
+        r#"$relative == ./* || $relative == *"/./"*"#,
+        &format!(r#"source_path="{source_root}/$relative""#),
+        r#"target_path="/kernel/nexus-ostd/src/cser/$relative""#,
+        r#"if [[ ! -f $source_path || -L $source_path ]]; then"#,
+        r#"cser_source_hash_inputs+=("$source_path")"#,
+        r#"cser_source_mount_args+=(--mount "type=bind,source=$source_path,target=$target_path,readonly")"#,
+    ] {
+        if active.matches(required).count() != 1 {
+            return Err(format!(
+                "{relative} lacks one canonical manifest-driven source step: {required}"
+            )
+            .into());
+        }
+    }
+    if active.matches("cser_source_hash_inputs").count() != 3
+        || active.matches("cser_source_mount_args").count() != 3
+    {
+        return Err(format!(
+            "{relative} must derive hash and mount arrays only once from the canonical manifest"
+        )
+        .into());
+    }
     let image_commands = logical
         .iter()
         .filter(|line| line.starts_with("image_key=$(sha256sum "))
@@ -781,6 +1328,31 @@ fn validate_backend_source_pair(
         return Err(format!("{relative} must have one canonical image identity command").into());
     }
     let image_inputs = parse_sha256_image_inputs(image_commands[0])?;
+    for expected in [
+        "$production_source_manifest",
+        "${cser_source_hash_inputs[@]}",
+    ] {
+        if image_inputs
+            .iter()
+            .filter(|input| input.as_str() == expected)
+            .count()
+            != 1
+        {
+            return Err(format!(
+                "{relative} must hash the manifest and its derived exact source array"
+            )
+            .into());
+        }
+    }
+    if image_inputs
+        .iter()
+        .any(|input| input.starts_with(&format!("{source_root}/")))
+    {
+        return Err(format!(
+            "{relative} must not append hidden literal CSER inputs outside the manifest array"
+        )
+        .into());
+    }
     let container = function_body(source, "container() {")?;
     let container_lines = continued_shell_lines(container)?;
     let docker_runs = container_lines
@@ -791,20 +1363,23 @@ fn validate_backend_source_pair(
         return Err(format!("{relative} must have one canonical container command").into());
     }
     validate_single_shell_command(docker_runs[0])?;
+    if docker_runs[0]
+        .matches(r#""${cser_source_mount_args[@]}""#)
+        .count()
+        != 1
+        || docker_runs[0].contains("target=/kernel/nexus-ostd/src/cser/")
+    {
+        return Err(format!(
+            "{relative} must mount only the exact manifest-derived CSER source array"
+        )
+        .into());
+    }
     for file in files {
         let source_path = format!("{source_root}/{file}");
-        let mount = format!(
-            "--mount \"type=bind,source={source_root}/{file},target=/kernel/nexus-ostd/src/cser/{file},readonly\""
-        );
-        if image_inputs
-            .iter()
-            .filter(|input| input.as_str() == source_path)
-            .count()
-            != 1
-            || docker_runs[0].matches(&mount).count() != 1
-        {
+        let target_path = format!("/kernel/nexus-ostd/src/cser/{file}");
+        if active.contains(&source_path) || docker_runs[0].contains(&target_path) {
             return Err(format!(
-                "{relative} must hash and live-mount {file} as one production source pair"
+                "{relative} duplicates manifest-owned source {file} outside the canonical loop"
             )
             .into());
         }
@@ -815,27 +1390,44 @@ fn validate_backend_source_pair(
 fn validate_backend_docker_source_set(
     relative: &str,
     dockerfile: &str,
-    files: &[&str],
+    files: &[String],
 ) -> Result<()> {
     let copy_prefix = match relative {
         "kernel/nexus-ostd/Dockerfile" => "COPY ",
         "experiments/ostd-virtio-cser-spike/Dockerfile" => "COPY --from=nexus-root ",
         _ => return Err(format!("unknown production backend Dockerfile: {relative}").into()),
     };
-    let sources = files
+    let logical = continued_shell_lines(dockerfile)?;
+    let flat_sources = files
         .iter()
+        .filter(|file| !file.contains('/'))
         .map(|file| format!("kernel/nexus-ostd/src/cser/{file}"))
         .collect::<Vec<_>>()
         .join(" ");
-    let expected = format!("{copy_prefix}{sources} /kernel/nexus-ostd/src/cser/");
-    if continued_shell_lines(dockerfile)?
+    let expected_flat = format!("{copy_prefix}{flat_sources} /kernel/nexus-ostd/src/cser/");
+    let mut expected = vec![expected_flat];
+    for file in files.iter().filter(|file| file.contains('/')) {
+        expected.push(format!(
+            "{copy_prefix}kernel/nexus-ostd/src/cser/{file} /kernel/nexus-ostd/src/cser/{file}"
+        ));
+    }
+    expected.push(format!(
+        "{copy_prefix}kernel/nexus-ostd/cser-production-sources.txt /kernel/nexus-ostd/cser-production-sources.txt"
+    ));
+    let actual = logical
         .iter()
-        .filter(|line| line.as_str() == expected)
-        .count()
-        != 1
-    {
+        .filter(|line| {
+            line.starts_with(copy_prefix)
+                && (line.contains("kernel/nexus-ostd/src/cser")
+                    || line.contains("/kernel/nexus-ostd/src/cser")
+                    || line.contains("kernel/nexus-ostd/cser-production-sources.txt")
+                    || line.contains("/kernel/nexus-ostd/cser-production-sources.txt"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if actual != expected {
         return Err(format!(
-            "{relative} must explicitly bake the exact production Registry source set"
+            "{relative} cold CSER COPY multiset differs from the canonical manifest: actual={actual:?} expected={expected:?}"
         )
         .into());
     }
@@ -892,20 +1484,16 @@ fn validate_portal_abi_image_binding(kernel: &str, kernel_dockerfile: &str) -> R
 }
 
 fn validate_backend_source_binding(root: &Path) -> Result<()> {
-    for (relative, source_root, files) in [
-        (
-            "kernel/nexus-ostd/x",
-            "$root/src/cser",
-            KERNEL_PRODUCTION_SOURCE_FILES.as_slice(),
-        ),
+    let production_files = cser_production_source_files(root)?;
+    for (relative, source_root) in [
+        ("kernel/nexus-ostd/x", "$root/src/cser"),
         (
             "experiments/ostd-virtio-cser-spike/x",
             "$repo_root/kernel/nexus-ostd/src/cser",
-            SHARED_PRODUCTION_SOURCE_FILES.as_slice(),
         ),
     ] {
         let source = fs::read_to_string(root.join(relative))?;
-        validate_backend_source_pair(relative, &source, source_root, files)?;
+        validate_backend_source_pair(relative, &source, source_root, &production_files)?;
     }
     let substrate_binding = [
         "/usr/local/bin/assert-production-virtio-substrate",
@@ -920,12 +1508,7 @@ fn validate_backend_source_binding(root: &Path) -> Result<()> {
         "experiments/ostd-virtio-cser-spike/Dockerfile",
     ] {
         let dockerfile = fs::read_to_string(root.join(relative))?;
-        let production_files = if relative == "kernel/nexus-ostd/Dockerfile" {
-            KERNEL_PRODUCTION_SOURCE_FILES.as_slice()
-        } else {
-            SHARED_PRODUCTION_SOURCE_FILES.as_slice()
-        };
-        validate_backend_docker_source_set(relative, &dockerfile, production_files)?;
+        validate_backend_docker_source_set(relative, &dockerfile, &production_files)?;
         for source in [
             "/crates/nexus-ostd-virtio/src/production.rs",
             "/crates/nexus-ostd-virtio/src/lib.rs",
@@ -2332,85 +2915,333 @@ mod tests {
         let spike = fs::read_to_string(root.join(relative)).expect("read spike workflow");
         let dockerfile =
             fs::read_to_string(root.join(docker_relative)).expect("read spike Dockerfile");
+        let production_files =
+            cser_production_source_files(&root).expect("canonical production source manifest");
         let source_root = "$repo_root/kernel/nexus-ostd/src/cser";
-        validate_backend_source_pair(
-            relative,
-            &spike,
-            source_root,
-            &SHARED_PRODUCTION_SOURCE_FILES,
-        )
-        .expect("spike production source hash and live mounts");
-        validate_backend_docker_source_set(
-            docker_relative,
-            &dockerfile,
-            &SHARED_PRODUCTION_SOURCE_FILES,
-        )
-        .expect("spike explicit production source COPY");
+        validate_backend_source_pair(relative, &spike, source_root, &production_files)
+            .expect("spike production source hash and live mounts");
+        validate_backend_docker_source_set(docker_relative, &dockerfile, &production_files)
+            .expect("spike explicit production source COPY");
 
         let missing_hash = spike.replacen(
-            "$repo_root/kernel/nexus-ostd/src/cser/portal_v2.rs",
-            "removed-portal-v2-image-input",
+            r#""${cser_source_hash_inputs[@]}""#,
+            "\"removed-production-source-array\"",
             1,
         );
         assert_ne!(missing_hash, spike);
-        validate_backend_source_pair(
-            relative,
-            &missing_hash,
-            source_root,
-            &SHARED_PRODUCTION_SOURCE_FILES,
-        )
-        .expect_err("portal_v2 must affect the spike image identity");
+        validate_backend_source_pair(relative, &missing_hash, source_root, &production_files)
+            .expect_err("the manifest-derived sources must affect spike image identity");
 
         let missing_mount = spike.replacen(
-            "        --mount \"type=bind,source=$repo_root/kernel/nexus-ostd/src/cser/portal_v2.rs,target=/kernel/nexus-ostd/src/cser/portal_v2.rs,readonly\" \\\n",
-            "",
+            r#""${cser_source_mount_args[@]}""#,
+            "\"removed-production-source-mount-array\"",
             1,
         );
         assert_ne!(missing_mount, spike);
-        validate_backend_source_pair(
-            relative,
-            &missing_mount,
-            source_root,
-            &SHARED_PRODUCTION_SOURCE_FILES,
-        )
-        .expect_err("portal_v2 must be live-mounted into the spike container");
+        validate_backend_source_pair(relative, &missing_mount, source_root, &production_files)
+            .expect_err("the manifest-derived sources must be mounted into the spike");
 
-        let missing_copy =
-            dockerfile.replacen("    kernel/nexus-ostd/src/cser/portal_v2.rs \\\n", "", 1);
-        assert_ne!(missing_copy, dockerfile);
-        validate_backend_docker_source_set(
-            docker_relative,
-            &missing_copy,
-            &SHARED_PRODUCTION_SOURCE_FILES,
-        )
-        .expect_err("portal_v2 must be explicitly copied into the cold spike image");
-        let comment_only_copy = format!(
-            "{missing_copy}\n# kernel/nexus-ostd/src/cser/portal_v2.rs retained only in a comment\n"
-        );
-        validate_backend_docker_source_set(
-            docker_relative,
-            &comment_only_copy,
-            &SHARED_PRODUCTION_SOURCE_FILES,
-        )
-        .expect_err("a portal_v2 comment must not satisfy the cold-image COPY");
-
-        let directory_copy = dockerfile.replacen(
-            concat!(
-                "COPY --from=nexus-root kernel/nexus-ostd/src/cser/effect_registry.rs \\\n",
-                "    kernel/nexus-ostd/src/cser/device_flight.rs \\\n",
-                "    kernel/nexus-ostd/src/cser/portal_v2.rs \\\n",
-                "    /kernel/nexus-ostd/src/cser/"
-            ),
-            "COPY --from=nexus-root kernel/nexus-ostd/src/cser/ /kernel/nexus-ostd/src/cser/",
+        let flattened_loop = spike.replacen(
+            r#"target_path="/kernel/nexus-ostd/src/cser/$relative""#,
+            r#"target_path="/kernel/nexus-ostd/src/cser/${relative##*/}""#,
             1,
         );
-        assert_ne!(directory_copy, dockerfile);
+        validate_backend_source_pair(relative, &flattened_loop, source_root, &production_files)
+            .expect_err("the manifest loop may not flatten nested source targets");
+
+        let appended_hidden = spike.replacen(
+            "image_key=$(sha256sum \\",
+            concat!(
+                "cser_source_hash_inputs+=(\"$repo_root/kernel/nexus-ostd/src/cser/hidden.rs\")\n",
+                "cser_source_mount_args+=(--mount ",
+                "\"type=bind,source=$repo_root/kernel/nexus-ostd/src/cser/hidden.rs,",
+                "target=/kernel/nexus-ostd/src/cser/hidden.rs,readonly\")\n",
+                "image_key=$(sha256sum \\"
+            ),
+            1,
+        );
+        validate_backend_source_pair(relative, &appended_hidden, source_root, &production_files)
+            .expect_err("post-loop hidden hash and mount array appends must be rejected");
+
+        let missing_copy = dockerfile.replacen(
+            concat!(
+                "COPY --from=nexus-root ",
+                "kernel/nexus-ostd/src/cser/infrastructure/deadline.rs \\\n",
+                "    /kernel/nexus-ostd/src/cser/infrastructure/deadline.rs\n"
+            ),
+            "",
+            1,
+        );
+        assert_ne!(missing_copy, dockerfile);
+        validate_backend_docker_source_set(docker_relative, &missing_copy, &production_files)
+            .expect_err(
+                "every infrastructure source must be explicitly copied into the cold image",
+            );
+        let comment_only_copy = format!(
+            "{missing_copy}\n# COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/deadline.rs /kernel/nexus-ostd/src/cser/infrastructure/deadline.rs\n"
+        );
+        validate_backend_docker_source_set(docker_relative, &comment_only_copy, &production_files)
+            .expect_err("a comment must not satisfy an infrastructure COPY");
+
+        let flattened_nested_copy = dockerfile.replacen(
+            "/kernel/nexus-ostd/src/cser/infrastructure/deadline.rs",
+            "/kernel/nexus-ostd/src/cser/deadline.rs",
+            1,
+        );
+        assert_ne!(flattened_nested_copy, dockerfile);
         validate_backend_docker_source_set(
             docker_relative,
-            &directory_copy,
-            &SHARED_PRODUCTION_SOURCE_FILES,
+            &flattened_nested_copy,
+            &production_files,
         )
-        .expect_err("a directory COPY must not replace the explicit production source set");
+        .expect_err("nested infrastructure paths may not be flattened");
+
+        let additive_directory_copy = dockerfile.replacen(
+            "COPY --from=nexus-root kernel/nexus-ostd/cser-production-sources.txt \\",
+            concat!(
+                "COPY --from=nexus-root kernel/nexus-ostd/src/cser/ ",
+                "/kernel/nexus-ostd/src/cser/\n",
+                "COPY --from=nexus-root kernel/nexus-ostd/cser-production-sources.txt \\"
+            ),
+            1,
+        );
+        assert_ne!(additive_directory_copy, dockerfile);
+        validate_backend_docker_source_set(
+            docker_relative,
+            &additive_directory_copy,
+            &production_files,
+        )
+        .expect_err("an additive directory COPY must not hide cold-image sources");
+
+        let additive_sidecar = dockerfile.replacen(
+            "COPY --from=nexus-root kernel/nexus-ostd/cser-production-sources.txt \\",
+            concat!(
+                "COPY --from=nexus-root hidden.rs ",
+                "/kernel/nexus-ostd/src/cser/infrastructure/hidden.rs\n",
+                "COPY --from=nexus-root kernel/nexus-ostd/cser-production-sources.txt \\"
+            ),
+            1,
+        );
+        validate_backend_docker_source_set(docker_relative, &additive_sidecar, &production_files)
+            .expect_err("an additive hidden sidecar COPY must be rejected");
+    }
+
+    #[test]
+    fn cser_production_manifest_and_cold_copies_are_exact_closed_sets() {
+        let root = repository_root();
+        let expected =
+            expected_cser_production_sources(&root).expect("discover production module closure");
+        let manifest_path = root.join(CSER_PRODUCTION_SOURCE_MANIFEST);
+        let manifest = fs::read_to_string(&manifest_path).expect("read production manifest");
+        let files = validate_cser_production_manifest_text(&manifest, &expected)
+            .expect("manifest equals production closure");
+        assert_eq!(
+            cser_production_source_files(&root).expect("validated source files"),
+            expected
+        );
+
+        for file in &files {
+            let missing = manifest.replacen(&format!("{file}\n"), "", 1);
+            assert_ne!(missing, manifest, "manifest mutation must remove {file}");
+            validate_cser_production_manifest_text(&missing, &expected)
+                .expect_err("every missing manifest entry must be rejected");
+        }
+
+        let flattened = manifest.replacen("infrastructure/deadline.rs\n", "deadline.rs\n", 1);
+        assert_ne!(flattened, manifest);
+        validate_cser_production_manifest_text(&flattened, &expected)
+            .expect_err("flattened manifest path must be rejected");
+
+        let extra = manifest.replacen(
+            "infrastructure/invariants.rs\n",
+            "infrastructure/hidden.rs\ninfrastructure/invariants.rs\n",
+            1,
+        );
+        assert_ne!(extra, manifest);
+        validate_cser_production_manifest_text(&extra, &expected)
+            .expect_err("extra hidden manifest source must be rejected");
+
+        let duplicate = manifest.replacen(
+            "infrastructure/invariants.rs\n",
+            "infrastructure/invariants.rs\ninfrastructure/invariants.rs\n",
+            1,
+        );
+        assert_ne!(duplicate, manifest);
+        validate_cser_production_manifest_text(&duplicate, &expected)
+            .expect_err("duplicate manifest source must be rejected");
+
+        for invalid in [
+            format!("# retained marker\n{manifest}"),
+            format!("../hidden.rs\n{manifest}"),
+            format!("./effect_registry.rs\n{manifest}"),
+            manifest.replacen(
+                "infrastructure/deadline.rs\n",
+                "infrastructure/./deadline.rs\n",
+                1,
+            ),
+        ] {
+            validate_cser_production_manifest_text(&invalid, &expected)
+                .expect_err("comments, traversal, and current-directory aliases must be rejected");
+        }
+
+        let mut hidden_inventory = expected.clone();
+        hidden_inventory.push("infrastructure/hidden.rs".to_owned());
+        hidden_inventory.sort();
+        validate_cser_production_manifest_text(&manifest, &hidden_inventory)
+            .expect_err("an orphan hidden infrastructure source must fail closure");
+
+        let hidden_module: syn::ItemMod =
+            syn::parse_str("#[cfg(any())] mod hidden;").expect("parse hidden module");
+        validate_external_module_attributes(Path::new("infrastructure/mod.rs"), &hidden_module)
+            .expect_err("a cfg-hidden production module must be rejected");
+        let tests_module: syn::ItemMod =
+            syn::parse_str("#[cfg(test)] mod tests;").expect("parse tests module");
+        validate_external_module_attributes(Path::new("infrastructure/mod.rs"), &tests_module)
+            .expect("the exact test-only infrastructure module remains in closure");
+        let cfg_attr_module: syn::ItemMod = syn::parse_str(
+            "#[path = \"child.rs\"]\n#[cfg_attr(any(), path = \"hidden.rs\")]\nmod child;",
+        )
+        .expect("parse cfg_attr path module");
+        validate_external_module_attributes(Path::new("effect_registry.rs"), &cfg_attr_module)
+            .expect_err("cfg_attr may not redirect an external production module");
+
+        for docker_relative in [
+            "kernel/nexus-ostd/Dockerfile",
+            "experiments/ostd-virtio-cser-spike/Dockerfile",
+        ] {
+            let dockerfile =
+                fs::read_to_string(root.join(docker_relative)).expect("read backend Dockerfile");
+            validate_backend_docker_source_set(docker_relative, &dockerfile, &files)
+                .expect("complete cold CSER source set");
+            for file in &files {
+                let source_path = format!("kernel/nexus-ostd/src/cser/{file}");
+                let missing =
+                    dockerfile.replacen(&source_path, "removed-cser-production-source", 1);
+                assert_ne!(
+                    missing, dockerfile,
+                    "Docker mutation must remove source {file}"
+                );
+                validate_backend_docker_source_set(docker_relative, &missing, &files)
+                    .expect_err("every missing Docker source entry must be rejected");
+            }
+            let missing_manifest = dockerfile.replacen(
+                "kernel/nexus-ostd/cser-production-sources.txt",
+                "removed-cser-production-source-manifest",
+                1,
+            );
+            assert_ne!(missing_manifest, dockerfile);
+            validate_backend_docker_source_set(docker_relative, &missing_manifest, &files)
+                .expect_err("cold image must retain the canonical source manifest");
+        }
+    }
+
+    #[test]
+    fn cser_source_closure_rejects_unbound_macro_and_inline_module_sources() {
+        let temporary = std::env::temp_dir().join(format!(
+            "nexus-cser-source-closure-mutations-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temporary);
+        fs::create_dir_all(&temporary).expect("create temporary CSER source root");
+        let root = temporary.as_path();
+        let source_path = root.join("effect_registry.rs");
+
+        let safe = concat!(
+            "pub fn safe(value: bool) {\n",
+            "    assert!(matches!(value, true | false));\n",
+            "    assert!(!value || 1 != 2);\n",
+            "}\n",
+        );
+        fs::write(&source_path, safe).expect("write safe source fixture");
+        let mut safe_closure = BTreeSet::new();
+        collect_external_module_closure(root, Path::new("effect_registry.rs"), &mut safe_closure)
+            .expect("audited non-source macros remain permitted");
+
+        for (name, mutation) in [
+            (
+                "inline external module",
+                format!("{safe}\nmod outer {{ mod hidden; }}\n"),
+            ),
+            (
+                "block-local external module",
+                format!("{safe}\npub fn hidden() {{ #[path = \"hidden.rs\"] mod hidden; }}\n"),
+            ),
+            (
+                "include item",
+                format!("{safe}\ninclude!(\"hidden.rs\");\n"),
+            ),
+            (
+                "nested include expression",
+                format!(
+                    "{safe}\npub fn hidden() -> bool {{ assert!(include!(\"hidden.rs\")); true }}\n"
+                ),
+            ),
+            (
+                "include string expression",
+                format!("{safe}\nconst HIDDEN: &str = include_str!(\"hidden.txt\");\n"),
+            ),
+            (
+                "include bytes expression",
+                format!("{safe}\nconst HIDDEN: &[u8] = include_bytes!(\"hidden.bin\");\n"),
+            ),
+            (
+                "dynamic item macro",
+                format!("{safe}\nmake_hidden_source!();\n"),
+            ),
+            (
+                "nested dynamic macro",
+                format!(
+                    "{safe}\npub fn hidden() -> bool {{ assert!(make_hidden_source!()); true }}\n"
+                ),
+            ),
+            (
+                "cfg_attr path redirect",
+                format!(
+                    "{safe}\n#[path = \"child.rs\"]\n#[cfg_attr(any(), path = \"hidden.rs\")]\nmod child;\n"
+                ),
+            ),
+        ] {
+            fs::write(&source_path, mutation)
+                .unwrap_or_else(|error| panic!("write {name} mutation: {error}"));
+            let mut closure = BTreeSet::new();
+            let result = collect_external_module_closure(
+                root,
+                Path::new("effect_registry.rs"),
+                &mut closure,
+            );
+            assert!(result.is_err(), "{name} mutation unexpectedly passed");
+        }
+
+        fs::remove_dir_all(&temporary).expect("remove temporary CSER source root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cser_source_binding_rejects_symlink_sources() {
+        use std::os::unix::fs::symlink;
+
+        let temporary =
+            std::env::temp_dir().join(format!("nexus-cser-source-binding-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temporary);
+        fs::create_dir_all(&temporary).expect("create temporary source directory");
+        let source = temporary.join("source.rs");
+        let alias = temporary.join("alias.rs");
+        fs::write(&source, "pub fn source() {}\n").expect("write temporary source");
+        symlink(&source, &alias).expect("create source symlink");
+        require_plain_regular_file(&source, "test source").expect("plain source accepted");
+        require_plain_regular_file(&alias, "test source")
+            .expect_err("source symlink must be rejected");
+
+        let source_root = temporary.join("source-root");
+        let target_directory = source_root.join("target");
+        let alias_directory = source_root.join("alias");
+        fs::create_dir_all(&target_directory).expect("create source target directory");
+        fs::write(target_directory.join("child.rs"), "pub fn child() {}\n")
+            .expect("write source below target directory");
+        symlink(&target_directory, &alias_directory).expect("create source directory symlink");
+        require_plain_regular_file_below(&source_root, Path::new("alias/child.rs"), "test source")
+            .expect_err("a symlinked source path component must be rejected");
+        fs::remove_dir_all(&temporary).expect("remove temporary source directory");
     }
 
     #[test]
@@ -2532,37 +3363,77 @@ mod tests {
         validate_clean_contract(&unsafe_default)
             .expect_err("evidence-deleting default clean must be rejected");
 
-        for (relative, source_root, files) in [
-            (
-                "kernel/nexus-ostd/x",
-                "$root/src/cser",
-                KERNEL_PRODUCTION_SOURCE_FILES.as_slice(),
-            ),
+        let production_files =
+            cser_production_source_files(&root).expect("canonical production source manifest");
+        for (relative, source_root) in [
+            ("kernel/nexus-ostd/x", "$root/src/cser"),
             (
                 "experiments/ostd-virtio-cser-spike/x",
                 "$repo_root/kernel/nexus-ostd/src/cser",
-                SHARED_PRODUCTION_SOURCE_FILES.as_slice(),
             ),
         ] {
             let source = fs::read_to_string(root.join(relative)).expect("read backend workflow");
-            for file in files {
-                let source_path = format!("{source_root}/{file}");
-                let missing_hash = source.replacen(&source_path, "removed-production-source", 1);
-                validate_backend_source_pair(relative, &missing_hash, source_root, files)
-                    .expect_err("missing source hash must be rejected");
-                let commented_hash =
-                    format!("{missing_hash}\n# retained marker only: {source_path}\n");
-                validate_backend_source_pair(relative, &commented_hash, source_root, files)
-                    .expect_err("a source hash retained only in a comment must be rejected");
+            validate_backend_source_pair(relative, &source, source_root, &production_files)
+                .expect("manifest-driven source binding");
 
-                let mount = format!("target=/kernel/nexus-ostd/src/cser/{file},readonly");
-                let missing_mount = source.replacen(&mount, "removed-production-mount", 1);
-                validate_backend_source_pair(relative, &missing_mount, source_root, files)
-                    .expect_err("missing source mount must be rejected");
-                let commented_mount = format!("{missing_mount}\n# retained marker only: {mount}\n");
-                validate_backend_source_pair(relative, &commented_mount, source_root, files)
-                    .expect_err("a source mount retained only in a comment must be rejected");
-            }
+            let manifest_symlink_bypass =
+                source.replacen(" || -L $production_source_manifest", "", 1);
+            assert_ne!(manifest_symlink_bypass, source);
+            validate_backend_source_pair(
+                relative,
+                &manifest_symlink_bypass,
+                source_root,
+                &production_files,
+            )
+            .expect_err("direct backend execution must reject a symlinked source manifest");
+
+            let source_symlink_bypass = source.replacen(" || -L $source_path", "", 1);
+            assert_ne!(source_symlink_bypass, source);
+            validate_backend_source_pair(
+                relative,
+                &source_symlink_bypass,
+                source_root,
+                &production_files,
+            )
+            .expect_err("direct backend execution must reject symlinked manifest sources");
+
+            let current_directory_alias_bypass =
+                source.replacen(r#" || $relative == ./* || $relative == *"/./"*"#, "", 1);
+            assert_ne!(current_directory_alias_bypass, source);
+            validate_backend_source_pair(
+                relative,
+                &current_directory_alias_bypass,
+                source_root,
+                &production_files,
+            )
+            .expect_err("direct backend execution must reject current-directory path aliases");
+
+            let missing_hash = source.replacen(
+                r#""${cser_source_hash_inputs[@]}""#,
+                "\"removed-production-hash-array\"",
+                1,
+            );
+            assert_ne!(missing_hash, source);
+            validate_backend_source_pair(relative, &missing_hash, source_root, &production_files)
+                .expect_err("missing manifest-derived source hash array must be rejected");
+
+            let missing_mount = source.replacen(
+                r#""${cser_source_mount_args[@]}""#,
+                "\"removed-production-mount-array\"",
+                1,
+            );
+            assert_ne!(missing_mount, source);
+            validate_backend_source_pair(relative, &missing_mount, source_root, &production_files)
+                .expect_err("missing manifest-derived source mount array must be rejected");
+
+            let flattened = source.replacen(
+                r#"target_path="/kernel/nexus-ostd/src/cser/$relative""#,
+                r#"target_path="/kernel/nexus-ostd/src/cser/${relative##*/}""#,
+                1,
+            );
+            assert_ne!(flattened, source);
+            validate_backend_source_pair(relative, &flattened, source_root, &production_files)
+                .expect_err("flattened manifest-derived target must be rejected");
         }
 
         let production_registry =

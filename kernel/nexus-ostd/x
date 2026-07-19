@@ -11,6 +11,40 @@ if [[ ${NEXUS_ROOT_LOCK_HELD:-0} != 1 ]]; then
 fi
 exec 9>"$kernel_lock"
 flock 9
+production_source_manifest="$root/cser-production-sources.txt"
+if [[ ! -f $production_source_manifest || -L $production_source_manifest ]]; then
+    echo "CSER production source manifest must be a non-symlink regular file: $production_source_manifest" >&2
+    exit 1
+fi
+mapfile -t cser_production_sources <"$production_source_manifest"
+declare -a cser_source_hash_inputs=()
+declare -a cser_source_mount_args=()
+previous_production_source=
+for relative in "${cser_production_sources[@]}"; do
+    if [[ ! $relative =~ ^[a-z0-9_./-]+\.rs$ ]] \
+        || [[ $relative == /* || $relative == ./* || $relative == *"/./"* ]] \
+        || [[ $relative == *".."* || $relative == *"//"* ]]; then
+        echo "invalid CSER production source path: $relative" >&2
+        exit 1
+    fi
+    if [[ -n $previous_production_source && ! $previous_production_source < $relative ]]; then
+        echo "CSER production source manifest is not strictly sorted: $relative" >&2
+        exit 1
+    fi
+    source_path="$root/src/cser/$relative"
+    target_path="/kernel/nexus-ostd/src/cser/$relative"
+    if [[ ! -f $source_path || -L $source_path ]]; then
+        echo "CSER production source must be a non-symlink regular file: $source_path" >&2
+        exit 1
+    fi
+    cser_source_hash_inputs+=("$source_path")
+    cser_source_mount_args+=(--mount "type=bind,source=$source_path,target=$target_path,readonly")
+    previous_production_source=$relative
+done
+if ((${#cser_production_sources[@]} == 0)); then
+    echo "CSER production source manifest is empty" >&2
+    exit 1
+fi
 # Hash only inputs consumed while building the pinned image. Runtime serial
 # oracles execute from the mounted worktree and must not force an image rebuild.
 image_key=$(sha256sum \
@@ -106,9 +140,8 @@ image_key=$(sha256sum \
     "$repo_root/tools/ostd/assert-cser-patch.sh" \
     "$repo_root/tools/virtio/assert-cser-patch.sh" \
     "$repo_root/tools/virtio/assert-production-substrate.sh" \
-    "$root/src/cser/effect_registry.rs" \
-    "$root/src/cser/device_flight.rs" \
-    "$root/src/cser/portal_v2.rs" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
+    "$production_source_manifest" \
+    "${cser_source_hash_inputs[@]}" | cut -d ' ' -f1 | sha256sum | cut -c1-16)
 image="nexus/nexus-ostd:$image_key"
 runner_base="$root/osdk-runner-base"
 runner_target="$root/target/osdk/nexus-kernel-run-base"
@@ -144,9 +177,7 @@ container() {
         -v "$repo_root/crates/cser-transition-gates:/crates/cser-transition-gates:ro,z" \
         -v "$repo_root/crates/nexus-ostd-virtio:/crates/nexus-ostd-virtio:ro,z" \
         -v "$repo_root/crates/nexus-portal-abi:/crates/nexus-portal-abi:ro,z" \
-        --mount "type=bind,source=$root/src/cser/effect_registry.rs,target=/kernel/nexus-ostd/src/cser/effect_registry.rs,readonly" \
-        --mount "type=bind,source=$root/src/cser/device_flight.rs,target=/kernel/nexus-ostd/src/cser/device_flight.rs,readonly" \
-        --mount "type=bind,source=$root/src/cser/portal_v2.rs,target=/kernel/nexus-ostd/src/cser/portal_v2.rs,readonly" \
+        "${cser_source_mount_args[@]}" \
         --mount "type=bind,source=$root/Cargo.lock,target=/work/Cargo.lock,readonly" \
         --mount "type=bind,source=$root/userspace/personality/Cargo.lock,target=/work/userspace/personality/Cargo.lock,readonly" \
         -w /work \

@@ -625,9 +625,9 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
     }
 
     let registry_constructors = source.matches("EffectRegistry::new()").count();
-    if registry_constructors != 11 {
+    if registry_constructors != 12 {
         return Err(format!(
-            "Stage 7B Registry source constructor population drifted; hidden sidecars are forbidden (expected 11, observed {registry_constructors})"
+            "Stage 7B Registry source constructor population drifted; hidden sidecars are forbidden (expected 12, observed {registry_constructors})"
         ));
     }
 
@@ -635,7 +635,7 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
         .find("fn publication_ack_and_revoke_complete_self_test() {")
         .ok_or_else(|| "Registry lacks combined publication/revoke self-test".to_owned())?;
     let publication_end = source[publication_start..]
-        .find("pub(crate) fn production_identity_registry_self_test() {")
+        .find("#[cfg(test)]\nfn combined_scope_candidate_self_test() {")
         .map(|offset| publication_start + offset)
         .ok_or_else(|| {
             "combined publication/revoke self-test boundary is unterminated".to_owned()
@@ -669,6 +669,30 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
     {
         return Err(
             "combined publication/revoke self-test must own one Registry and prove three prevalidation rejections plus one external apply"
+                .into(),
+        );
+    }
+
+    let combined_start = source
+        .find("#[cfg(test)]\nfn combined_scope_candidate_self_test() {")
+        .ok_or_else(|| "Registry lacks combined-scope candidate self-test".to_owned())?;
+    let combined_end = source[combined_start..]
+        .find("pub(crate) fn production_identity_registry_self_test() {")
+        .map(|offset| combined_start + offset)
+        .ok_or_else(|| "combined-scope candidate self-test boundary is unterminated".to_owned())?;
+    let combined = &source[combined_start..combined_end];
+    if combined.matches("EffectRegistry::new()").count() != 1
+        || combined
+            .matches("let mut registry = EffectRegistry::new();")
+            .count()
+            != 1
+        || combined
+            .matches("fn fixture() -> (EffectRegistry, EffectKey, EffectKey) {")
+            .count()
+            != 1
+    {
+        return Err(
+            "combined-scope candidate self-test must own one fixture-local authoritative Registry"
                 .into(),
         );
     }
@@ -739,6 +763,10 @@ fn validate_fault_registry_source_text(source: &str) -> Result<(), String> {
     if production.matches("EffectRegistry::new()").count() != 1
         || production
             .matches("let mut registry = EffectRegistry::new();")
+            .count()
+            != 1
+        || production
+            .matches("combined_scope_candidate_self_test();")
             .count()
             != 1
         || production.matches(".register_derived(").count() != 4
@@ -4347,6 +4375,24 @@ mod tests {
     #[test]
     fn fault_registry_gate_structurally_binds_all_self_test_registries() {
         let source = checked_registry_source();
+
+        let moved_combined = source
+            .replacen(
+                "fn fixture() -> (EffectRegistry, EffectKey, EffectKey) {\n        let mut registry = EffectRegistry::new();",
+                "fn fixture() -> (EffectRegistry, EffectKey, EffectKey) {\n        let mut registry = EffectRegistry::default();",
+                1,
+            )
+            .replacen(
+                "pub(crate) struct Stage7bFaultCredit {",
+                "fn hidden_combined_sidecar() -> EffectRegistry { EffectRegistry::new() }\n\npub(crate) struct Stage7bFaultCredit {",
+                1,
+            );
+        assert_eq!(
+            moved_combined.matches("EffectRegistry::new()").count(),
+            source.matches("EffectRegistry::new()").count(),
+            "mutation must preserve the global constructor count"
+        );
+        assert!(validate_fault_registry_source_text(&moved_combined).is_err());
 
         let moved_atomic = source
             .replacen(

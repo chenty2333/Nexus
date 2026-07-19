@@ -20,10 +20,38 @@ ARG OSTD_CRATE_URL=https://static.crates.io/crates/ostd/ostd-0.18.0.crate
 ARG VIRTIO_DRIVERS_CRATE_SHA256=cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7
 ARG VIRTIO_DRIVERS_CRATE_URL=https://static.crates.io/crates/virtio-drivers/virtio-drivers-0.13.0.crate
 
-COPY --from=nexus-root kernel/nexus-ostd/src/cser/effect_registry.rs \
-    kernel/nexus-ostd/src/cser/device_flight.rs \
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/device_flight.rs \
+    kernel/nexus-ostd/src/cser/effect_registry.rs \
     kernel/nexus-ostd/src/cser/portal_v2.rs \
     /kernel/nexus-ostd/src/cser/
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs \
+    /kernel/nexus-ostd/src/cser/effect_registry/root_lanes.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/continuation.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/continuation.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/deadline.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/deadline.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/delayed.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/delayed.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/device.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/device.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/fault.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/fault.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/invariants.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/invariants.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/mod.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/mod.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/reply.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/reply.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/root.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/root.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/service.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/service.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/task.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/task.rs
+COPY --from=nexus-root kernel/nexus-ostd/src/cser/infrastructure/tests.rs \
+    /kernel/nexus-ostd/src/cser/infrastructure/tests.rs
+COPY --from=nexus-root kernel/nexus-ostd/cser-production-sources.txt \
+    /kernel/nexus-ostd/cser-production-sources.txt
 COPY --from=nexus-root kernel/nexus-ostd/Cargo.toml \
     kernel/nexus-ostd/Cargo.lock \
     /kernel/nexus-ostd/

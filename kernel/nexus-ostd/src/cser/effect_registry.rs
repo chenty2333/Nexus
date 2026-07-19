@@ -24,6 +24,9 @@ use cser_transition_gates::handoff::{
     PrepareIntent,
 };
 
+#[path = "effect_registry/root_lanes.rs"]
+mod root_lanes;
+
 #[path = "infrastructure/mod.rs"]
 mod infrastructure;
 

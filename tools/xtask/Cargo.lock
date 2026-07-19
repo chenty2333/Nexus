@@ -101,6 +101,7 @@ name = "nexus-xtask"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "proc-macro2",
  "serde",
  "serde_json",
  "serde_yaml",
